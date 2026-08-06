@@ -1,8 +1,7 @@
-# warpweft
+# wefty
 
 Personal compute fabric for agent-built tools — deploy once, run on any machine you own.
 
-**warp** — fixed threads: always-on nodes (cloud, home server).
-**weft** — the moving thread: workloads that travel across machines.
+In weaving, the **weft** is the thread that moves back and forth across the loom's fixed warp threads. Your always-on nodes are the warp; wefty is what moves the workloads across them.
 
-Planning happens on the [issue tracker](https://github.com/Derek-X-Wang/warpweft/issues) via wayfinder map.
+Formerly named `warpweft`. Planning happens on the [issue tracker](https://github.com/Derek-X-Wang/wefty/issues) via wayfinder map.
