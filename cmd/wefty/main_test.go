@@ -128,6 +128,17 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	if logsOut.String() != "cli-output\n" || logsErr.String() != "cli-error\n" {
 		t.Fatalf("submitted logs stdout/stderr = %q/%q", logsOut.String(), logsErr.String())
 	}
+	var inspectOut bytes.Buffer
+	if err := execute(ctx, clients, true, []string{"inspect", submitted.RunID}, &inspectOut, &commandErr); err != nil {
+		t.Fatalf("inspect submitted run: %v", err)
+	}
+	var inspection runInspection
+	if err := json.Unmarshal(inspectOut.Bytes(), &inspection); err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Run.RunID != submitted.RunID || inspection.Run.Status != contract.RunSucceeded || len(inspection.Runs) != 1 {
+		t.Fatalf("run inspection = %#v", inspection)
+	}
 
 	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nprintf 'changed-on-disk\\n'\n"), 0o700); err != nil {
 		t.Fatal(err)

@@ -110,6 +110,7 @@ Commands:
   submit                     Submit a saved or inline workflow
   rerun RUN_ID               Create a new run from a stored snapshot
   logs RUN_ID [--follow]     Read or follow run logs
+  inspect RUN_ID             Show run lineage, envelopes, and gates
   drain NODE_ID              Gracefully drain a node
 
 Global flags:
