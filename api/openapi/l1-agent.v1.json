@@ -170,6 +170,7 @@
       "post": {
         "operationId": "appendAttemptLogs",
         "summary": "Append an idempotent batch of per-stream log events",
+        "description": "L1 is the sole owner of idempotency for (attempt_id, stream, sequence). Identical replay is acknowledged without duplication; conflicting replay or a sequence gap is rejected. Raw byte chunks are not scanned or decoded as lines.",
         "requestBody": {
           "required": true,
           "content": {
@@ -183,6 +184,7 @@
                   "events": {
                     "type": "array",
                     "minItems": 1,
+                    "maxItems": 256,
                     "items": { "$ref": "./common.v1.json#/components/schemas/LogEvent" }
                   }
                 }
@@ -192,7 +194,7 @@
         },
         "responses": {
           "200": {
-            "description": "Batch accepted or identically replayed. Ack sequences are per stream.",
+            "description": "Batch accepted or identically replayed. Ack sequences are per stream and are upload acknowledgements, not reader cursors.",
             "content": {
               "application/json": {
                 "schema": {

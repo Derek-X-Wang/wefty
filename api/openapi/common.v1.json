@@ -71,12 +71,12 @@
         "properties": {
           "attempt_id": { "type": "string" },
           "stream": { "enum": ["stdout", "stderr"] },
-          "sequence": { "type": "integer", "minimum": 0 },
+          "sequence": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
           "timestamp": { "type": "string", "format": "date-time" },
           "bytes": {
             "type": "string",
             "contentEncoding": "base64",
-            "description": "Raw bytes. Ordering is guaranteed per attempt and stream only."
+            "description": "One non-empty raw byte chunk, up to 4 MiB before base64 encoding. Chunks are not lines: values may exceed 64 KiB, end with a partial line, or contain invalid UTF-8. Ordering is guaranteed per attempt and stream only."
           }
         }
       },
@@ -97,7 +97,7 @@
       "LogPage": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["events"],
+        "required": ["events", "next_cursor"],
         "properties": {
           "events": {
             "type": "array",

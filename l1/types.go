@@ -85,3 +85,21 @@ type RenewalRequest struct {
 type HeartbeatRequest struct {
 	BootSessionID string `json:"boot_session_id"`
 }
+
+// AppendLogsRequest is one fenced, idempotent upload batch. Event identity is
+// the tuple (attempt_id, stream, sequence); the reader cursor is intentionally
+// absent because upload acknowledgements and polling position are separate
+// protocol concepts.
+type AppendLogsRequest struct {
+	FencingToken string              `json:"fencing_token"`
+	Events       []contract.LogEvent `json:"events"`
+}
+
+type AppendLogsResponse struct {
+	Acknowledged map[contract.LogStream]uint64 `json:"acknowledged"`
+}
+
+type LogPage struct {
+	Events     []contract.LogEvent `json:"events"`
+	NextCursor string              `json:"next_cursor,omitempty"`
+}
