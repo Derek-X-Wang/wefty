@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "run_id": "run_01JZK1",
+  "dispatch_key": "run_01JZK1:root",
+  "status": "pending",
+  "trigger": {
+    "type": "rerun",
+    "principal": "user:derek",
+    "source_run_id": "run_01JZK0"
+  },
+  "workflow": { "workflow_ref": "workflow://dogfood/v1" },
+  "params": { "issue": 26 },
+  "created_at": "2026-08-09T12:02:00Z",
+  "updated_at": "2026-08-09T12:02:00Z"
+}

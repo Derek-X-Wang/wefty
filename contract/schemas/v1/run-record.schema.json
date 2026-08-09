@@ -28,7 +28,7 @@
       "additionalProperties": false,
       "required": ["type", "principal"],
       "properties": {
-        "type": { "enum": ["manual", "chain"] },
+        "type": { "enum": ["manual", "chain", "rerun"] },
         "principal": { "type": "string", "minLength": 1 },
         "source_run_id": { "$ref": "#/$defs/id" }
       }
