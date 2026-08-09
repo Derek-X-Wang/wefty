@@ -159,6 +159,15 @@ const (
 	LogStderr LogStream = "stderr"
 )
 
+// ProcessResult is the mutually exclusive operating-system outcome of one
+// process execution. ExitCode is a pointer so a successful exit code of zero
+// remains present on the wire when omitempty is applied.
+type ProcessResult struct {
+	SpawnError string `json:"spawn_error,omitempty"`
+	ExitCode   *int   `json:"exit_code,omitempty"`
+	Signal     string `json:"signal,omitempty"`
+}
+
 // NodeRegistration intentionally has no tags field. Claim eligibility uses
 // authoritative tags obtained from Fabric identity/configuration.
 type NodeRegistration struct {

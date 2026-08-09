@@ -80,6 +80,20 @@
           }
         }
       },
+      "ProcessResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "spawn_error": { "type": "string" },
+          "exit_code": { "type": "integer" },
+          "signal": { "type": "string" }
+        },
+        "oneOf": [
+          { "required": ["spawn_error"] },
+          { "required": ["exit_code"] },
+          { "required": ["signal"] }
+        ]
+      },
       "LogPage": {
         "type": "object",
         "additionalProperties": false,

@@ -237,20 +237,7 @@
                 "properties": {
                   "fencing_token": { "type": "string" },
                   "idempotency_key": { "type": "string", "minLength": 1 },
-                  "result": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                      "spawn_error": { "type": "string" },
-                      "exit_code": { "type": "integer" },
-                      "signal": { "type": "string" }
-                    },
-                    "oneOf": [
-                      { "required": ["spawn_error"] },
-                      { "required": ["exit_code"] },
-                      { "required": ["signal"] }
-                    ]
-                  },
+                  "result": { "$ref": "./common.v1.json#/components/schemas/ProcessResult" },
                   "protocol_output_digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
                 }
               }
