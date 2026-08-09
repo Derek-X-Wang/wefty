@@ -306,6 +306,12 @@ func TestDispatchRecoveryCreatesExactlyOneL1JobAndPreservesScript(t *testing.T) 
 	if claim.Job.Spec.DispatchKey != before.DispatchKey {
 		t.Fatalf("dispatch key = %q, want %q", claim.Job.Spec.DispatchKey, before.DispatchKey)
 	}
+	if !reflect.DeepEqual(claim.Job.Spec.Execution.Executable.Interpreter, []string{"/bin/sh"}) || claim.Job.Spec.Execution.Executable.Mode != 0o755 {
+		t.Fatalf("claimed interpreter/mode = %v/%#o", claim.Job.Spec.Execution.Executable.Interpreter, claim.Job.Spec.Execution.Executable.Mode)
+	}
+	if claim.Job.Spec.Limits == nil || claim.Job.Spec.Limits.MaxRuntimeSeconds != 300 {
+		t.Fatalf("claimed limits = %+v", claim.Job.Spec.Limits)
+	}
 
 	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"}, nil)
 	if status != http.StatusNoContent {
@@ -348,6 +354,39 @@ func TestInlineScriptAndTriggerProvenanceAreImmutable(t *testing.T) {
 	}
 	if record.Workflow.InlineScript.Content != request.InlineScript.Content || record.Workflow.InlineScript.SHA256 != request.InlineScript.SHA256 {
 		t.Fatalf("stored inline script changed: %+v", record.Workflow.InlineScript)
+	}
+	if !reflect.DeepEqual(record.Tags, []string{"linux"}) || record.Limits == nil || record.Limits.MaxCost != 4.25 {
+		t.Fatalf("stored tags/limits = %v/%+v", record.Tags, record.Limits)
+	}
+	var envelopeSchema []byte
+	if err := h.l3Store.db.QueryRow(`SELECT envelope_schema_json FROM runs WHERE run_id=?`, accepted.RunID).Scan(&envelopeSchema); err != nil {
+		t.Fatal(err)
+	}
+	if !jsonEqual(envelopeSchema, request.EnvelopeSchema) {
+		t.Fatalf("stored envelope schema = %s, want %s", envelopeSchema, request.EnvelopeSchema)
+	}
+}
+
+func TestParentRunRecordsChainProvenance(t *testing.T) {
+	h := newIntegrationHarness(t)
+	parent := h.submit(inlineRunRequest("#!/bin/sh\necho parent\n"), "parent-run")
+	childRequest := inlineRunRequest("#!/bin/sh\necho child\n")
+	childRequest.ParentRunID = parent.RunID
+	child := h.submit(childRequest, "child-run")
+
+	record, err := h.l3Store.GetRun(context.Background(), child.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := h.l3Store.GetTrigger(context.Background(), child.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.ParentRunID != parent.RunID || record.Trigger.Type != "chain" || record.Trigger.SourceRunID != parent.RunID {
+		t.Fatalf("child record provenance = parent %q trigger %+v", record.ParentRunID, record.Trigger)
+	}
+	if provenance.Source != "chain" || provenance.SourceRunID != parent.RunID || provenance.Actor != h.callerUser {
+		t.Fatalf("child trigger row = %+v", provenance)
 	}
 }
 

@@ -23,8 +23,7 @@ type JobClient interface {
 
 // L1Client calls the L1 client protocol exclusively through Fabric.Dial.
 type L1Client struct {
-	client  *http.Client
-	address string
+	client *http.Client
 }
 
 func NewL1Client(f fabric.Fabric, address string) (*L1Client, error) {
@@ -37,7 +36,7 @@ func NewL1Client(f fabric.Fabric, address string) (*L1Client, error) {
 	transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return f.Dial(ctx, network, address)
 	}}
-	return &L1Client{client: &http.Client{Transport: transport}, address: address}, nil
+	return &L1Client{client: &http.Client{Transport: transport}}, nil
 }
 
 func (c *L1Client) CloseIdleConnections() { c.client.CloseIdleConnections() }

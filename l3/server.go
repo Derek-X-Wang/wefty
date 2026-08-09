@@ -55,8 +55,10 @@ func (s *Server) ListenAndServe(ctx context.Context, network, address string) er
 }
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
+	serveCtx, stopReconciler := context.WithCancel(ctx)
+	defer stopReconciler()
 	if s.reconciler != nil {
-		go func() { _ = s.reconciler.Run(ctx) }()
+		go func() { _ = s.reconciler.Run(serveCtx) }()
 	}
 	httpServer := &http.Server{Handler: s.handler}
 	stopped := make(chan struct{})

@@ -3,6 +3,7 @@ package l3
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -24,10 +25,10 @@ type Reconciler struct {
 
 func NewReconciler(store *Store, jobs JobClient, config ReconcilerConfig) (*Reconciler, error) {
 	if store == nil {
-		return nil, protocolError("invalid_request", "L3 store is required")
+		return nil, fmt.Errorf("l3: store is required")
 	}
 	if jobs == nil {
-		return nil, protocolError("invalid_request", "L1 job client is required")
+		return nil, fmt.Errorf("l3: L1 job client is required")
 	}
 	interval := config.Interval
 	if interval <= 0 {
