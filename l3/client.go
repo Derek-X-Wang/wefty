@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -19,6 +21,11 @@ import (
 type JobClient interface {
 	SubmitJob(context.Context, contract.JobSpec) (l1.Job, error)
 	GetJob(context.Context, string) (l1.Job, error)
+}
+
+// JobLogClient is the public L1 log-polling dependency of the L3 API.
+type JobLogClient interface {
+	GetJobLogs(context.Context, string, string, int) (l1.LogPage, error)
 }
 
 // L1Client calls the L1 client protocol exclusively through Fabric.Dial.
@@ -55,6 +62,18 @@ func (c *L1Client) GetJob(ctx context.Context, jobID string) (l1.Job, error) {
 		return l1.Job{}, err
 	}
 	return job, nil
+}
+
+func (c *L1Client) GetJobLogs(ctx context.Context, jobID, cursor string, limit int) (l1.LogPage, error) {
+	path := "/v1/jobs/" + jobID + "/logs?limit=" + strconv.Itoa(limit)
+	if cursor != "" {
+		path += "&cursor=" + url.QueryEscape(cursor)
+	}
+	var page l1.LogPage
+	if err := c.do(ctx, http.MethodGet, path, nil, &page, http.StatusOK); err != nil {
+		return l1.LogPage{}, err
+	}
+	return page, nil
 }
 
 func (c *L1Client) do(ctx context.Context, method, path string, body any, target any, success ...int) error {
@@ -101,3 +120,4 @@ func (c *L1Client) do(ctx context.Context, method, path string, body any, target
 }
 
 var _ JobClient = (*L1Client)(nil)
+var _ JobLogClient = (*L1Client)(nil)

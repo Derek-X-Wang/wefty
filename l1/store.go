@@ -260,6 +260,37 @@ func (s *Store) GetJob(ctx context.Context, jobID string) (Job, error) {
 	return job, nil
 }
 
+// ListNodes returns the operator-visible fleet in stable node ID order.
+func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT node_id FROM nodes ORDER BY node_id")
+	if err != nil {
+		return nil, internalError(err, "list node IDs")
+	}
+	defer rows.Close()
+
+	var nodeIDs []string
+	for rows.Next() {
+		var nodeID string
+		if err := rows.Scan(&nodeID); err != nil {
+			return nil, internalError(err, "scan node ID")
+		}
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate node IDs")
+	}
+
+	nodes := make([]Node, 0, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		node, err := getNode(ctx, s.db, nodeID)
+		if err != nil {
+			return nil, internalError(err, "read listed node")
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
+}
+
 // RegisterNode records a boot session and replaces its routing tags with the
 // canonical operator-configured set supplied by the server.
 func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, registration contract.NodeRegistration, authoritativeTags []string) (Node, error) {

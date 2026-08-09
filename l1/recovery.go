@@ -3,6 +3,7 @@ package l1
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -130,6 +131,41 @@ func (s *Store) DrainNode(ctx context.Context, identityNodeID, nodeID, bootSessi
 	node, err := getNode(ctx, s.db, nodeID)
 	if err != nil {
 		return Node{}, internalError(err, "read draining node")
+	}
+	return node, nil
+}
+
+// DrainNodeByOperator idempotently drains the current registration for a
+// stable node. Unlike the agent route, caller authorization comes from the L1
+// client protocol, so the operator does not need the node's boot session.
+func (s *Store) DrainNodeByOperator(ctx context.Context, nodeID string) (Node, error) {
+	if nodeID == "" {
+		return Node{}, protocolError(contract.ErrorInvalidRequest, "node_id is required")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET state=?
+		WHERE node_id=? AND state IN (?, ?, ?)`,
+		contract.NodeDraining, nodeID,
+		contract.NodeAlive, contract.NodeStale, contract.NodeDraining)
+	if err != nil {
+		return Node{}, internalError(err, "operator drain node")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return Node{}, internalError(err, "read operator node drain result")
+	}
+	if changed == 0 {
+		_, readErr := getNode(ctx, s.db, nodeID)
+		if errors.Is(readErr, sql.ErrNoRows) {
+			return Node{}, protocolError(contract.ErrorNotFound, "node %q was not found", nodeID)
+		}
+		if readErr != nil {
+			return Node{}, internalError(readErr, "read operator drain target")
+		}
+		return Node{}, protocolError(contract.ErrorConflict, "node %q state does not permit draining", nodeID)
+	}
+	node, err := getNode(ctx, s.db, nodeID)
+	if err != nil {
+		return Node{}, internalError(err, "read operator-draining node")
 	}
 	return node, nil
 }
