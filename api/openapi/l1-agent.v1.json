@@ -75,6 +75,44 @@
         }
       }
     },
+    "/v1/agent/nodes/{node_id}/drain": {
+      "parameters": [
+        { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "drainNode",
+        "summary": "Stop new claims while allowing active attempts to finish",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["boot_session_id"],
+                "properties": {
+                  "boot_session_id": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Node is draining; existing attempt authority remains valid.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Node" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
     "/v1/agent/jobs/claim": {
       "post": {
         "operationId": "claimJob",

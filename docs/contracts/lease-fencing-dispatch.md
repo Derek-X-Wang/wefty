@@ -48,6 +48,17 @@ transaction as the write. Validation order is:
 4. verify lease against the control-plane clock;
 5. apply the idempotent mutation.
 
+The default heartbeat cadence is 15 seconds. A node becomes `stale` after 45
+seconds without a heartbeat and `dead` after 2 minutes; both thresholds are
+evaluated from the injected control-plane clock. A stale node can heartbeat
+back to `alive`, while a dead node must register its boot session again.
+
+`POST /v1/agent/nodes/{node_id}/drain` changes an alive or stale boot session
+to `draining` idempotently. Draining nodes continue heartbeating and retain
+authority for attempts they already own, but cannot claim another job. On
+SIGINT or SIGTERM the agent invokes this verb, waits for its running attempt to
+upload completion, and exits; a second signal forces local cancellation.
+
 ## Lease expiry and fencing errors
 
 | Condition | HTTP | Error code | Retryable | Effect |

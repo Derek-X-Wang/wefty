@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -47,6 +48,7 @@ type Config struct {
 	Runner              ProcessRunner
 	OutputSinkFactory   OutputSinkFactory
 	Logf                func(string, ...any)
+	Clock               Clock
 }
 
 // Agent registers one boot session and serially executes claimed jobs while
@@ -60,6 +62,9 @@ type Agent struct {
 	runner            ProcessRunner
 	outputSinkFactory OutputSinkFactory
 	logf              func(string, ...any)
+	clock             Clock
+	drainOnce         sync.Once
+	drainRequested    chan struct{}
 }
 
 func New(config Config) (*Agent, error) {
@@ -85,8 +90,12 @@ func New(config Config) (*Agent, error) {
 		architecture = runtime.GOARCH
 	}
 	runner := config.Runner
+	clock := config.Clock
+	if clock == nil {
+		clock = systemClock{}
+	}
 	if runner == nil {
-		runner = processrunner.New(processrunner.Config{})
+		runner = processrunner.New(processrunner.Config{Clock: processClockAdapter{clock: clock}})
 	}
 	return &Agent{
 		client: client,
@@ -104,7 +113,16 @@ func New(config Config) (*Agent, error) {
 		runner:            runner,
 		outputSinkFactory: config.OutputSinkFactory,
 		logf:              config.Logf,
+		clock:             clock,
+		drainRequested:    make(chan struct{}),
 	}, nil
+}
+
+type processClockAdapter struct{ clock Clock }
+
+func (adapter processClockAdapter) Now() time.Time { return adapter.clock.Now() }
+func (adapter processClockAdapter) NewTimer(duration time.Duration) processrunner.Timer {
+	return adapter.clock.NewTimer(duration)
 }
 
 // Close releases idle protocol connections.
@@ -115,33 +133,52 @@ func (a *Agent) Register(ctx context.Context) (l1.Node, error) {
 	return a.client.Register(ctx, a.registration)
 }
 
+// Drain stops new claims locally and marks the current boot session draining
+// at the control plane. An attempt already executing is not canceled; Run
+// returns after that attempt has uploaded its fenced completion.
+func (a *Agent) Drain(ctx context.Context) (l1.Node, error) {
+	node, err := a.client.Drain(ctx, a.registration.NodeID, a.registration.BootSessionID)
+	a.drainOnce.Do(func() { close(a.drainRequested) })
+	return node, err
+}
+
 // Run registers and then serves claims until the context is canceled or the
 // control plane rejects a liveness or execution operation.
 func (a *Agent) Run(ctx context.Context) error {
-	if _, err := a.Register(ctx); err != nil {
+	runContext, stop := context.WithCancel(ctx)
+	defer stop()
+	if _, err := a.Register(runContext); err != nil {
 		return fmt.Errorf("agent: register node: %w", err)
 	}
+	if a.isDraining() {
+		if _, err := a.client.Drain(runContext, a.registration.NodeID, a.registration.BootSessionID); err != nil {
+			return fmt.Errorf("agent: drain node: %w", err)
+		}
+		return nil
+	}
 	heartbeatErrors := make(chan error, 1)
-	go a.heartbeatLoop(ctx, heartbeatErrors)
+	go a.heartbeatLoop(runContext, heartbeatErrors)
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runContext.Done():
+			return nil
+		case <-a.drainRequested:
 			return nil
 		case err := <-heartbeatErrors:
 			return err
 		default:
 		}
 
-		claim, err := a.client.Claim(ctx, a.registration.NodeID, a.registration.BootSessionID)
+		claim, err := a.client.Claim(runContext, a.registration.NodeID, a.registration.BootSessionID)
 		if err != nil {
-			if ctx.Err() != nil {
+			if runContext.Err() != nil || a.isDraining() {
 				return nil
 			}
 			return fmt.Errorf("agent: claim job: %w", err)
 		}
 		if claim == nil {
-			if err := wait(ctx, a.claimInterval, heartbeatErrors); err != nil {
+			if err := a.wait(runContext, a.claimInterval, heartbeatErrors); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return nil
 				}
@@ -149,8 +186,8 @@ func (a *Agent) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		if err := a.executeClaim(ctx, *claim); err != nil {
-			if ctx.Err() != nil {
+		if err := a.executeClaim(runContext, *claim); err != nil {
+			if runContext.Err() != nil {
 				return nil
 			}
 			return err
@@ -159,13 +196,13 @@ func (a *Agent) Run(ctx context.Context) error {
 }
 
 func (a *Agent) heartbeatLoop(ctx context.Context, failures chan<- error) {
-	ticker := time.NewTicker(a.heartbeatInterval)
-	defer ticker.Stop()
 	for {
+		timer := a.clock.NewTimer(a.heartbeatInterval)
 		select {
 		case <-ctx.Done():
+			stopTimer(timer)
 			return
-		case <-ticker.C:
+		case <-timer.C():
 			if _, err := a.client.Heartbeat(ctx, a.registration.NodeID, a.registration.BootSessionID); err != nil {
 				select {
 				case failures <- fmt.Errorf("agent: heartbeat: %w", err):
@@ -245,15 +282,13 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 func (a *Agent) renewalLoop(ctx context.Context, claim l1.Claim, failures chan<- error) {
 	lease := claim.Lease
 	for {
-		delay := renewalDelay(time.Now(), lease.LeaseExpires, a.renewalInterval)
-		timer := time.NewTimer(delay)
+		delay := renewalDelay(a.clock.Now(), lease.LeaseExpires, a.renewalInterval)
+		timer := a.clock.NewTimer(delay)
 		select {
 		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
+			stopTimer(timer)
 			return
-		case <-timer.C:
+		case <-timer.C():
 		}
 		renewed, err := a.client.Renew(ctx, claim.Job.JobID, lease.AttemptID, lease.FencingToken)
 		if err != nil {
@@ -282,16 +317,27 @@ func toL1Result(result contract.ProcessResult) l1.ProcessResult {
 	return l1.ProcessResult{SpawnError: result.SpawnError, ExitCode: result.ExitCode, Signal: result.Signal}
 }
 
-func wait(ctx context.Context, duration time.Duration, heartbeatErrors <-chan error) error {
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
+func (a *Agent) wait(ctx context.Context, duration time.Duration, heartbeatErrors <-chan error) error {
+	timer := a.clock.NewTimer(duration)
+	defer stopTimer(timer)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-a.drainRequested:
+		return context.Canceled
 	case err := <-heartbeatErrors:
 		return err
-	case <-timer.C:
+	case <-timer.C():
 		return nil
+	}
+}
+
+func (a *Agent) isDraining() bool {
+	select {
+	case <-a.drainRequested:
+		return true
+	default:
+		return false
 	}
 }
 

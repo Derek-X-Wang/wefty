@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -90,9 +91,34 @@ func run() error {
 		return err
 	}
 	defer nodeAgent.Close()
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	return nodeAgent.Run(ctx)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-signals:
+		}
+		drainContext, stopDrain := context.WithTimeout(context.Background(), 30*time.Second)
+		_, err := nodeAgent.Drain(drainContext)
+		stopDrain()
+		if err != nil {
+			log.Printf("wefty-agent: graceful drain failed: %v", err)
+			cancel()
+			return
+		}
+		select {
+		case <-ctx.Done():
+		case <-signals:
+			cancel()
+		}
+	}()
+	err = nodeAgent.Run(ctx)
+	cancel()
+	return err
 }
 
 func writeOutput(_ context.Context, event contract.LogEvent) error {
