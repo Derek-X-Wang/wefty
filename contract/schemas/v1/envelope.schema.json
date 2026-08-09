@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wefty.dev/schemas/v1/envelope.schema.json",
+  "title": "Wefty Step Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "envelope_id",
+    "idempotency_key",
+    "run_id",
+    "step_id",
+    "attempt_id",
+    "status",
+    "summary",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "envelope_id": { "$ref": "#/$defs/id" },
+    "idempotency_key": { "$ref": "#/$defs/id" },
+    "run_id": { "$ref": "#/$defs/id" },
+    "step_id": { "$ref": "#/$defs/id" },
+    "attempt_id": { "$ref": "#/$defs/id" },
+    "status": { "enum": ["succeeded", "failed", "partial"] },
+    "summary": { "type": "string", "minLength": 1 },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "uri"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "uri": { "type": "string", "minLength": 1 },
+          "media_type": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+        }
+      }
+    },
+    "notes_for_next_agent": { "type": "string" },
+    "extensions": {
+      "description": "Namespaced extension object for forward-compatible producer data.",
+      "type": "object",
+      "propertyNames": { "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$" },
+      "additionalProperties": true
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 255 }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wefty.dev/schemas/v1/gate-result.schema.json",
+  "title": "Wefty Gate Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "gate_id",
+    "idempotency_key",
+    "run_id",
+    "step_id",
+    "attempt_id",
+    "name",
+    "outcome",
+    "evaluated_at"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "gate_id": { "$ref": "#/$defs/id" },
+    "idempotency_key": { "$ref": "#/$defs/id" },
+    "run_id": { "$ref": "#/$defs/id" },
+    "step_id": { "$ref": "#/$defs/id" },
+    "attempt_id": { "$ref": "#/$defs/id" },
+    "name": { "type": "string", "minLength": 1 },
+    "outcome": { "enum": ["pass", "fail", "error", "skipped"] },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "value"],
+        "properties": {
+          "kind": { "type": "string", "minLength": 1 },
+          "value": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "evaluated_at": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 255 }
+  }
+}

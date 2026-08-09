@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wefty.dev/schemas/v1/run-record.schema.json",
+  "title": "Wefty Run Record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "dispatch_key",
+    "status",
+    "trigger",
+    "workflow",
+    "params",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "$ref": "#/$defs/id" },
+    "parent_run_id": { "$ref": "#/$defs/id" },
+    "dispatch_key": { "$ref": "#/$defs/id" },
+    "status": {
+      "enum": ["pending", "dispatching", "queued", "running", "awaiting-input", "succeeded", "failed"]
+    },
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "principal"],
+      "properties": {
+        "type": { "enum": ["manual", "chain"] },
+        "principal": { "type": "string", "minLength": 1 },
+        "source_run_id": { "$ref": "#/$defs/id" }
+      }
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workflow_ref": { "type": "string", "minLength": 1 },
+        "inline_script": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["content", "sha256"],
+          "properties": {
+            "content": { "type": "string", "minLength": 1 },
+            "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["workflow_ref"],
+          "not": {
+            "properties": { "inline_script": true },
+            "required": ["inline_script"]
+          }
+        },
+        {
+          "required": ["inline_script"],
+          "not": {
+            "properties": { "workflow_ref": true },
+            "required": ["workflow_ref"]
+          }
+        }
+      ]
+    },
+    "params": { "type": "object" },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]*$" },
+      "uniqueItems": true
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_runtime_seconds": { "type": "integer", "minimum": 1 },
+        "max_cost": { "type": "number", "minimum": 0 }
+      }
+    },
+    "envelopes": {
+      "type": "array",
+      "items": { "$ref": "envelope.schema.json" }
+    },
+    "gates": {
+      "type": "array",
+      "items": { "$ref": "gate-result.schema.json" }
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 255 }
+  }
+}

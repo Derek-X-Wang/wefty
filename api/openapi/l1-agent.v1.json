@@ -1,0 +1,283 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Wefty L1 agent protocol",
+    "version": "0.1.0-prerelease",
+    "description": "Fabric-authenticated node registration, liveness, claim, lease, log, and completion protocol."
+  },
+  "servers": [{ "url": "wefty://control-plane" }],
+  "security": [{ "fabricIdentity": [] }],
+  "paths": {
+    "/v1/agent/nodes/register": {
+      "post": {
+        "operationId": "registerNode",
+        "summary": "Register a stable node and per-boot session",
+        "description": "The request cannot self-report tags. The response includes authoritative tags derived from Fabric identity and operator configuration.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "./common.v1.json#/components/schemas/NodeRegistration" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Node boot session registered.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Node" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/v1/agent/nodes/{node_id}/heartbeat": {
+      "parameters": [
+        { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "heartbeatNode",
+        "summary": "Update node liveness without renewing job leases",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["boot_session_id"],
+                "properties": {
+                  "boot_session_id": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Node liveness updated.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Node" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/v1/agent/jobs/claim": {
+      "post": {
+        "operationId": "claimJob",
+        "summary": "Atomically claim one eligible queued job",
+        "description": "Eligibility uses authenticated authoritative tags. The request intentionally contains no tags.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["node_id", "boot_session_id"],
+                "properties": {
+                  "node_id": { "type": "string" },
+                  "boot_session_id": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Claim won; attempt, fence, and lease were created atomically.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["job", "lease"],
+                  "properties": {
+                    "job": { "$ref": "./common.v1.json#/components/schemas/Job" },
+                    "lease": { "$ref": "./common.v1.json#/components/schemas/AttemptLease" }
+                  }
+                }
+              }
+            }
+          },
+          "204": { "description": "No eligible queued job." },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/lease": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } },
+        { "name": "attempt_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "renewAttemptLease",
+        "summary": "Renew one attempt lease",
+        "description": "Distinct from node heartbeat. Stale fence, attempt mismatch, or expiry returns 409 without granting write authority.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["fencing_token"],
+                "properties": {
+                  "fencing_token": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Lease renewed.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/AttemptLease" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/logs": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } },
+        { "name": "attempt_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "appendAttemptLogs",
+        "summary": "Append an idempotent batch of per-stream log events",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["fencing_token", "events"],
+                "properties": {
+                  "fencing_token": { "type": "string" },
+                  "events": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "$ref": "./common.v1.json#/components/schemas/LogEvent" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Batch accepted or identically replayed. Ack sequences are per stream.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["acknowledged"],
+                  "properties": {
+                    "acknowledged": {
+                      "type": "object",
+                      "additionalProperties": { "type": "integer", "minimum": 0 },
+                      "example": { "stdout": 12, "stderr": 7 }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } },
+        { "name": "attempt_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "completeAttempt",
+        "summary": "Complete one attempt idempotently",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["fencing_token", "idempotency_key", "result"],
+                "properties": {
+                  "fencing_token": { "type": "string" },
+                  "idempotency_key": { "type": "string", "minLength": 1 },
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "spawn_error": { "type": "string" },
+                      "exit_code": { "type": "integer" },
+                      "signal": { "type": "string" }
+                    },
+                    "oneOf": [
+                      { "required": ["spawn_error"] },
+                      { "required": ["exit_code"] },
+                      { "required": ["signal"] }
+                    ]
+                  },
+                  "protocol_output_digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Completion accepted or identically replayed.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Job" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "fabricIdentity": { "$ref": "./common.v1.json#/components/securitySchemes/fabricIdentity" }
+    }
+  }
+}

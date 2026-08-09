@@ -1,0 +1,222 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Wefty shared protocol components",
+    "version": "0.1.0-prerelease"
+  },
+  "paths": {},
+  "components": {
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["error"],
+        "properties": {
+          "error": { "$ref": "#/components/schemas/Error" }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "message", "retryable"],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable error code."
+          },
+          "message": { "type": "string" },
+          "retryable": { "type": "boolean" },
+          "details": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "request_id": { "type": "string" }
+        }
+      },
+      "JobSpec": {
+        "$ref": "../../contract/schemas/v1/job-spec.schema.json"
+      },
+      "Job": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["job_id", "state", "spec", "created_at", "updated_at"],
+        "properties": {
+          "job_id": { "type": "string" },
+          "state": {
+            "enum": ["queued", "claimed", "running", "awaiting-input", "succeeded", "failed"]
+          },
+          "spec": { "$ref": "#/components/schemas/JobSpec" },
+          "current_attempt_id": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "AttemptLease": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["attempt_id", "fencing_token", "lease_expires_at"],
+        "properties": {
+          "attempt_id": { "type": "string" },
+          "fencing_token": {
+            "type": "string",
+            "description": "Opaque monotonically increasing per-job fence; never parse as a number."
+          },
+          "lease_expires_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "LogEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["attempt_id", "stream", "sequence", "timestamp", "bytes"],
+        "properties": {
+          "attempt_id": { "type": "string" },
+          "stream": { "enum": ["stdout", "stderr"] },
+          "sequence": { "type": "integer", "minimum": 0 },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "bytes": {
+            "type": "string",
+            "contentEncoding": "base64",
+            "description": "Raw bytes. Ordering is guaranteed per attempt and stream only."
+          }
+        }
+      },
+      "LogPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["events"],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/LogEvent" }
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "Opaque cursor; clients must not infer SQLite row IDs."
+          }
+        }
+      },
+      "NodeRegistration": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node_id", "boot_session_id", "os", "architecture", "agent_version"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "boot_session_id": { "type": "string" },
+          "os": { "type": "string" },
+          "architecture": { "type": "string" },
+          "agent_version": { "type": "string" },
+          "capabilities": {
+            "type": "object",
+            "additionalProperties": { "type": "boolean" }
+          }
+        },
+        "description": "No tags field is accepted. Authoritative tags come from authenticated Fabric identity and operator configuration."
+      },
+      "Node": {
+        "allOf": [
+          { "$ref": "#/components/schemas/NodeRegistration" },
+          {
+            "type": "object",
+            "required": ["state", "authoritative_tags", "last_heartbeat_at"],
+            "properties": {
+              "state": { "enum": ["alive", "stale", "draining", "dead"] },
+              "authoritative_tags": {
+                "type": "array",
+                "items": { "type": "string" },
+                "uniqueItems": true,
+                "readOnly": true
+              },
+              "last_heartbeat_at": { "type": "string", "format": "date-time" }
+            }
+          }
+        ]
+      },
+      "RunRecord": {
+        "$ref": "../../contract/schemas/v1/run-record.schema.json"
+      },
+      "Envelope": {
+        "$ref": "../../contract/schemas/v1/envelope.schema.json"
+      },
+      "GateResult": {
+        "$ref": "../../contract/schemas/v1/gate-result.schema.json"
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed or invalid request.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Authentication failed.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The authenticated principal is outside its scope.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Resource not found.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "State, fence, lease, dispatch key, or idempotency conflict.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "UnprocessableEntity": {
+        "description": "Syntactically valid contract data cannot be executed, such as an unsupported kind.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "NotImplemented": {
+        "description": "Reserved contract surface. Always returns code not_implemented and retryable false in v0.1.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "Internal": {
+        "description": "Unexpected server failure.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "fabricIdentity": {
+        "type": "mutualTLS",
+        "description": "Identity supplied by the selected Fabric implementation."
+      },
+      "runToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque scoped run token"
+      }
+    }
+  }
+}

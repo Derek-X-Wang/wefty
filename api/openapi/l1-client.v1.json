@@ -1,0 +1,181 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Wefty L1 client protocol",
+    "version": "0.1.0-prerelease",
+    "description": "Job submission and polling surface for callers. Agent-only mutation verbs are in l1-agent.v1.json."
+  },
+  "servers": [{ "url": "wefty://control-plane" }],
+  "security": [{ "runToken": [] }],
+  "paths": {
+    "/v1/jobs": {
+      "post": {
+        "operationId": "createJob",
+        "summary": "Create a job idempotently by dispatch key",
+        "description": "A new dispatch_key returns 201. An identical replay returns the original job with 200. Reuse with a different canonical request returns 409 dispatch_key_conflict.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "./common.v1.json#/components/schemas/JobSpec" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Identical dispatch-key replay; original job returned.",
+            "headers": {
+              "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Job" }
+              }
+            }
+          },
+          "201": {
+            "description": "Job created.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Job" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "422": { "$ref": "./common.v1.json#/components/responses/UnprocessableEntity" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "parameters": [
+        {
+          "name": "job_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "get": {
+        "operationId": "getJob",
+        "summary": "Read job status",
+        "responses": {
+          "200": {
+            "description": "Current job record.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Job" }
+              }
+            }
+          },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}/logs": {
+      "parameters": [
+        {
+          "name": "job_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "get": {
+        "operationId": "getJobLogs",
+        "summary": "Poll ordered job logs",
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor returned by the previous page.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Log page. Ordering is per attempt and stream only.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/LogPage" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}/prompt": {
+      "parameters": [
+        {
+          "name": "job_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "post": {
+        "operationId": "promptJob",
+        "summary": "Reserved warm-session prompt",
+        "description": "Reserved alongside awaiting-input; always returns 501 in v0.1.",
+        "x-wefty-implementation": "reserved",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["prompt", "idempotency_key"],
+                "properties": {
+                  "prompt": { "type": "string", "minLength": 1 },
+                  "idempotency_key": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "501": { "$ref": "./common.v1.json#/components/responses/NotImplemented" }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}/cancel": {
+      "parameters": [
+        {
+          "name": "job_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "post": {
+        "operationId": "cancelJob",
+        "summary": "Reserved job cancellation",
+        "description": "Always returns 501 in v0.1 and does not mutate job state.",
+        "x-wefty-implementation": "reserved",
+        "responses": {
+          "501": { "$ref": "./common.v1.json#/components/responses/NotImplemented" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "runToken": { "$ref": "./common.v1.json#/components/securitySchemes/runToken" }
+    }
+  }
+}

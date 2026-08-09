@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "run_01JZK0:future",
+  "kind": "future.microvm",
+  "execution": {
+    "executable": {
+      "inline_base64": "IyEvYmluL3NoCg==",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "interpreter": ["/bin/sh"],
+      "mode": 493
+    },
+    "argv": ["job.sh"],
+    "working_directory": "/workspace/wefty",
+    "handoff_directory": "/workspace/.wefty/handoff"
+  }
+}

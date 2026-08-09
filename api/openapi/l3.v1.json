@@ -1,0 +1,277 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Wefty L3 run-ledger API",
+    "version": "0.1.0-prerelease",
+    "description": "Caller run submission/polling and run-token-scoped workflow writes."
+  },
+  "servers": [{ "url": "wefty://run-ledger" }],
+  "paths": {
+    "/v1/runs": {
+      "post": {
+        "operationId": "createRun",
+        "summary": "Create a manual or child run",
+        "description": "workflow_ref and inline_script are mutually exclusive. The run row and dispatch intent commit atomically; L1 creation uses a stable dispatch key. max_cost is stored but not enforced in v0.1.",
+        "security": [{ "callerToken": [] }, { "runToken": [] }],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "minLength": 1 }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["params"],
+                "properties": {
+                  "workflow_ref": { "type": "string", "minLength": 1 },
+                  "inline_script": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["content", "sha256"],
+                    "properties": {
+                      "content": { "type": "string", "minLength": 1 },
+                      "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+                      "interpreter": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1
+                      },
+                      "mode": { "type": "integer", "minimum": 0, "maximum": 4095, "default": 493 }
+                    }
+                  },
+                  "params": { "type": "object" },
+                  "tags": {
+                    "type": "array",
+                    "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]*$" },
+                    "uniqueItems": true
+                  },
+                  "limits": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "max_runtime_seconds": { "type": "integer", "minimum": 1 },
+                      "max_cost": { "type": "number", "minimum": 0 }
+                    }
+                  },
+                  "envelope_schema": {
+                    "type": "object",
+                    "description": "Restricted JSON Schema dialect; remote references are forbidden."
+                  },
+                  "required_envelope": { "type": "boolean", "default": false },
+                  "parent_run_id": { "type": "string" }
+                },
+                "oneOf": [
+                  {
+                    "required": ["workflow_ref"],
+                    "not": {
+                      "properties": { "inline_script": true },
+                      "required": ["inline_script"]
+                    }
+                  },
+                  {
+                    "required": ["inline_script"],
+                    "not": {
+                      "properties": { "workflow_ref": true },
+                      "required": ["workflow_ref"]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Identical idempotency replay; original run returned.",
+            "headers": {
+              "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } }
+            },
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/RunAccepted" } }
+            }
+          },
+          "201": {
+            "description": "Run and dispatch intent created.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/RunAccepted" } }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound",
+            "description": "workflow_ref did not resolve."
+          },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "422": { "$ref": "./common.v1.json#/components/responses/UnprocessableEntity" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/runs/{run_id}": {
+      "parameters": [
+        { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "get": {
+        "operationId": "getRun",
+        "summary": "Read a run record",
+        "description": "Run tokens may read their own run and descendants, never siblings or ancestors.",
+        "security": [{ "callerToken": [] }, { "runToken": [] }],
+        "responses": {
+          "200": {
+            "description": "Run ledger record.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/RunRecord" }
+              }
+            }
+          },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/logs": {
+      "parameters": [
+        { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "get": {
+        "operationId": "getRunLogs",
+        "summary": "Poll the run's L1 logs",
+        "security": [{ "callerToken": [] }, { "runToken": [] }],
+        "parameters": [
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Log page.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/LogPage" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/envelopes": {
+      "parameters": [
+        { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "appendEnvelope",
+        "summary": "Append a validated, idempotent step envelope",
+        "description": "Only the run's attempt-bound run token may write. The base schema and caller-provided restricted schema both validate before append.",
+        "security": [{ "runToken": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "./common.v1.json#/components/schemas/Envelope" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Envelope appended.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Envelope" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/gates": {
+      "parameters": [
+        { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "appendGateResult",
+        "summary": "Append an idempotent workflow-evaluated gate result",
+        "description": "L3 stores gate outcomes; the workflow, not L3, evaluates the gate.",
+        "security": [{ "runToken": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "./common.v1.json#/components/schemas/GateResult" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Gate result appended.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/GateResult" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/cancel": {
+      "parameters": [
+        { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "cancelRun",
+        "summary": "Reserved run cancellation",
+        "description": "Always returns 501 in v0.1 and does not mutate run or job state.",
+        "security": [{ "callerToken": [] }, { "runToken": [] }],
+        "x-wefty-implementation": "reserved",
+        "responses": {
+          "501": { "$ref": "./common.v1.json#/components/responses/NotImplemented" }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "RunAccepted": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "status_url", "logs_url"],
+        "properties": {
+          "run_id": { "type": "string" },
+          "status_url": { "type": "string", "format": "uri" },
+          "logs_url": { "type": "string", "format": "uri" }
+        }
+      }
+    },
+    "securitySchemes": {
+      "callerToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "operator or CLI token"
+      },
+      "runToken": { "$ref": "./common.v1.json#/components/securitySchemes/runToken" }
+    }
+  }
+}

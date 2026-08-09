@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "gate_id": "gate_01JZK0",
+  "idempotency_key": "run_01JZK0:unit:1",
+  "run_id": "run_01JZK0",
+  "step_id": "implement",
+  "attempt_id": "attempt_01JZK0",
+  "name": "unit",
+  "outcome": "maybe",
+  "evaluated_at": "2026-08-09T12:05:00Z"
+}
