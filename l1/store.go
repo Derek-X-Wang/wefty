@@ -1,14 +1,18 @@
 package l1
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -17,6 +21,14 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	_ "modernc.org/sqlite"
+)
+
+const (
+	DefaultLogPageLimit   = 200
+	MaxLogPageLimit       = 1000
+	MaxLogBatchEvents     = 256
+	MaxLogEventBytes      = 4 << 20
+	MaxLogUploadBodyBytes = 20 << 20
 )
 
 type StoreOptions struct {
@@ -121,6 +133,23 @@ CREATE TABLE IF NOT EXISTS attempts (
   updated_ns INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS attempts_job ON attempts(job_id);
+CREATE TABLE IF NOT EXISTS log_events (
+  ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+  stream TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  timestamp_ns INTEGER NOT NULL,
+  bytes BLOB NOT NULL,
+  event_json BLOB NOT NULL,
+  UNIQUE(attempt_id, stream, sequence)
+);
+CREATE INDEX IF NOT EXISTS log_events_job_order ON log_events(job_id, ordinal);
+CREATE TABLE IF NOT EXISTS job_log_jsonl (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  jsonl BLOB NOT NULL
+);
+INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
@@ -176,6 +205,9 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON
 		// it after rolling this transaction back and preserve replay semantics.
 		_ = tx.Rollback()
 		return s.readConcurrentSubmit(ctx, spec.DispatchKey, requestHash, err)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO job_log_jsonl(job_id, jsonl) VALUES(?, ?)", job.JobID, []byte{}); err != nil {
+		return Job{}, false, internalError(err, "initialize authoritative job log")
 	}
 	for _, tag := range spec.RoutingTags {
 		if _, err := tx.ExecContext(ctx, "INSERT INTO job_tags(job_id, tag) VALUES(?, ?)", job.JobID, tag); err != nil {
@@ -414,6 +446,262 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 		return AttemptLease{}, internalError(err, "commit lease renewal")
 	}
 	return AttemptLease{AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: expires}, nil
+}
+
+// AppendLogs accepts a fenced batch and owns idempotency for log-event keys.
+// Identical event replays are acknowledged without changing either the row
+// store or the authoritative per-job JSONL. A conflicting replay is rejected.
+func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID string, request AppendLogsRequest) (AppendLogsResponse, error) {
+	if request.FencingToken == "" {
+		return AppendLogsResponse{}, protocolError(contract.ErrorInvalidRequest, "fencing_token is required")
+	}
+	if len(request.Events) == 0 || len(request.Events) > MaxLogBatchEvents {
+		return AppendLogsResponse{}, protocolError(contract.ErrorInvalidRequest, "events must contain between 1 and %d entries", MaxLogBatchEvents)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AppendLogsResponse{}, internalError(err, "begin log append")
+	}
+	defer tx.Rollback()
+	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
+	if err != nil {
+		return AppendLogsResponse{}, err
+	}
+	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
+		return AppendLogsResponse{}, err
+	}
+
+	type eventKey struct {
+		stream   contract.LogStream
+		sequence uint64
+	}
+	type preparedEvent struct {
+		event contract.LogEvent
+		raw   []byte
+	}
+	seen := make(map[eventKey][]byte, len(request.Events))
+	streams := make(map[contract.LogStream]struct{}, 2)
+	next := make(map[contract.LogStream]int64, 2)
+	acknowledged := make(map[contract.LogStream]uint64, 2)
+	newEvents := make([]preparedEvent, 0, len(request.Events))
+
+	for _, input := range request.Events {
+		event := input
+		if err := validateLogEvent(attemptID, event); err != nil {
+			return AppendLogsResponse{}, err
+		}
+		event.Timestamp = canonicalTime(event.Timestamp)
+		raw, err := json.Marshal(event)
+		if err != nil {
+			return AppendLogsResponse{}, internalError(err, "encode log event")
+		}
+		key := eventKey{stream: event.Stream, sequence: event.Sequence}
+		streams[event.Stream] = struct{}{}
+		if prior, ok := seen[key]; ok {
+			if !bytes.Equal(prior, raw) {
+				return AppendLogsResponse{}, protocolError(contract.ErrorIdempotencyConflict, "log event (%s, %d) conflicts within the batch", event.Stream, event.Sequence)
+			}
+			continue
+		}
+		seen[key] = raw
+
+		var stored []byte
+		err = tx.QueryRowContext(ctx, "SELECT event_json FROM log_events WHERE attempt_id=? AND stream=? AND sequence=?", attemptID, event.Stream, event.Sequence).Scan(&stored)
+		switch {
+		case err == nil:
+			if !bytes.Equal(stored, raw) {
+				return AppendLogsResponse{}, protocolError(contract.ErrorIdempotencyConflict, "log event (%s, %d) conflicts with the accepted event", event.Stream, event.Sequence)
+			}
+			acknowledged[event.Stream] = maxSequence(acknowledged[event.Stream], event.Sequence)
+			continue
+		case !errors.Is(err, sql.ErrNoRows):
+			return AppendLogsResponse{}, internalError(err, "read accepted log event")
+		}
+
+		expected, ok := next[event.Stream]
+		if !ok {
+			var maximum int64
+			if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence), -1) FROM log_events WHERE attempt_id=? AND stream=?", attemptID, event.Stream).Scan(&maximum); err != nil {
+				return AppendLogsResponse{}, internalError(err, "read log sequence acknowledgement")
+			}
+			expected = maximum + 1
+		}
+		if int64(event.Sequence) != expected {
+			return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "log stream %s expected sequence %d, got %d", event.Stream, expected, event.Sequence)
+		}
+		next[event.Stream] = expected + 1
+		acknowledged[event.Stream] = event.Sequence
+		newEvents = append(newEvents, preparedEvent{event: event, raw: raw})
+	}
+
+	// Terminal and expired attempts may replay already-accepted events, but
+	// they cannot append anything new.
+	if len(newEvents) == 0 {
+		if err := readLogAcknowledgements(ctx, tx, attemptID, streams, acknowledged); err != nil {
+			return AppendLogsResponse{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return AppendLogsResponse{}, internalError(err, "commit log replay")
+		}
+		return AppendLogsResponse{Acknowledged: acknowledged}, nil
+	}
+	now := canonicalTime(s.clock.Now())
+	if !now.Before(attempt.leaseExpires) {
+		if err := expireAttempt(ctx, tx, attempt, now); err != nil {
+			return AppendLogsResponse{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return AppendLogsResponse{}, internalError(err, "commit log append lease expiry")
+		}
+		return AppendLogsResponse{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
+	}
+	if attempt.state != contract.AttemptClaimed && attempt.state != contract.AttemptRunning && attempt.state != contract.AttemptAwaitingInput {
+		return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "attempt is terminal")
+	}
+
+	var appendedJSONL bytes.Buffer
+	for _, prepared := range newEvents {
+		event := prepared.event
+		if _, err := tx.ExecContext(ctx, `INSERT INTO log_events(job_id, attempt_id, stream, sequence, timestamp_ns, bytes, event_json)
+VALUES(?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence, event.Timestamp.UnixNano(), event.Bytes, prepared.raw); err != nil {
+			return AppendLogsResponse{}, internalError(err, "store log event")
+		}
+		appendedJSONL.Write(prepared.raw)
+		appendedJSONL.WriteByte('\n')
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE job_log_jsonl SET jsonl=jsonl || ? WHERE job_id=?", appendedJSONL.Bytes(), jobID); err != nil {
+		return AppendLogsResponse{}, internalError(err, "append authoritative job JSONL")
+	}
+	if attempt.state == contract.AttemptClaimed {
+		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=?, updated_ns=? WHERE attempt_id=?", contract.AttemptRunning, now.UnixNano(), attemptID); err != nil {
+			return AppendLogsResponse{}, internalError(err, "mark logging attempt running")
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?", contract.JobRunning, now.UnixNano(), jobID); err != nil {
+			return AppendLogsResponse{}, internalError(err, "mark logging job running")
+		}
+	}
+	if err := readLogAcknowledgements(ctx, tx, attemptID, streams, acknowledged); err != nil {
+		return AppendLogsResponse{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AppendLogsResponse{}, internalError(err, "commit log append")
+	}
+	return AppendLogsResponse{Acknowledged: acknowledged}, nil
+}
+
+func readLogAcknowledgements(ctx context.Context, q queryer, attemptID string, streams map[contract.LogStream]struct{}, acknowledgements map[contract.LogStream]uint64) error {
+	for stream := range streams {
+		var maximum int64
+		if err := q.QueryRowContext(ctx, "SELECT MAX(sequence) FROM log_events WHERE attempt_id=? AND stream=?", attemptID, stream).Scan(&maximum); err != nil {
+			return internalError(err, "read log acknowledgement")
+		}
+		acknowledgements[stream] = uint64(maximum)
+	}
+	return nil
+}
+
+// GetJobLogs returns one polling page after an opaque reader cursor. The
+// internal insertion ordinal is never exposed directly.
+func (s *Store) GetJobLogs(ctx context.Context, jobID, cursor string, limit int) (LogPage, error) {
+	if limit < 1 || limit > MaxLogPageLimit {
+		return LogPage{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxLogPageLimit)
+	}
+	if _, err := s.GetJob(ctx, jobID); err != nil {
+		return LogPage{}, err
+	}
+	after, err := decodeLogCursor(cursor)
+	if err != nil {
+		return LogPage{}, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT ordinal, event_json FROM log_events
+WHERE job_id=? AND ordinal>? ORDER BY ordinal LIMIT ?`, jobID, after, limit)
+	if err != nil {
+		return LogPage{}, internalError(err, "read job logs")
+	}
+	defer rows.Close()
+	page := LogPage{Events: []contract.LogEvent{}}
+	last := after
+	for rows.Next() {
+		var ordinal int64
+		var raw []byte
+		if err := rows.Scan(&ordinal, &raw); err != nil {
+			return LogPage{}, internalError(err, "scan job log")
+		}
+		var event contract.LogEvent
+		if err := json.Unmarshal(raw, &event); err != nil {
+			return LogPage{}, internalError(err, "decode authoritative log event")
+		}
+		page.Events = append(page.Events, event)
+		last = ordinal
+	}
+	if err := rows.Err(); err != nil {
+		return LogPage{}, internalError(err, "iterate job logs")
+	}
+	page.NextCursor = encodeLogCursor(last)
+	return page, nil
+}
+
+// RawJobLogJSONL returns the authoritative JSONL representation for a job.
+// Every line is the exact JSON object persisted alongside its indexed row.
+func (s *Store) RawJobLogJSONL(ctx context.Context, jobID string) ([]byte, error) {
+	var raw []byte
+	err := s.db.QueryRowContext(ctx, "SELECT jsonl FROM job_log_jsonl WHERE job_id=?", jobID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, protocolError(contract.ErrorNotFound, "job %q was not found", jobID)
+	}
+	if err != nil {
+		return nil, internalError(err, "read authoritative job JSONL")
+	}
+	return bytes.Clone(raw), nil
+}
+
+func validateLogEvent(attemptID string, event contract.LogEvent) error {
+	if event.AttemptID != attemptID {
+		return protocolError(contract.ErrorAttemptMismatch, "log event attempt_id does not match the request path")
+	}
+	if event.Stream != contract.LogStdout && event.Stream != contract.LogStderr {
+		return protocolError(contract.ErrorInvalidRequest, "log stream %q is invalid", event.Stream)
+	}
+	if event.Sequence > math.MaxInt64 {
+		return protocolError(contract.ErrorInvalidRequest, "log sequence exceeds the supported range")
+	}
+	if event.Timestamp.IsZero() {
+		return protocolError(contract.ErrorInvalidRequest, "log timestamp is required")
+	}
+	if len(event.Bytes) == 0 || len(event.Bytes) > MaxLogEventBytes {
+		return protocolError(contract.ErrorInvalidRequest, "log event bytes must contain between 1 and %d bytes", MaxLogEventBytes)
+	}
+	return nil
+}
+
+func maxSequence(left, right uint64) uint64 {
+	if right > left {
+		return right
+	}
+	return left
+}
+
+func encodeLogCursor(after int64) string {
+	payload := make([]byte, 9)
+	payload[0] = 1
+	binary.BigEndian.PutUint64(payload[1:], uint64(after))
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func decodeLogCursor(cursor string) (int64, error) {
+	if cursor == "" {
+		return 0, nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil || len(payload) != 9 || payload[0] != 1 {
+		return 0, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+	}
+	after := binary.BigEndian.Uint64(payload[1:])
+	if after > math.MaxInt64 {
+		return 0, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+	}
+	return int64(after), nil
 }
 
 func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, attemptID string, request CompletionRequest) (Job, error) {

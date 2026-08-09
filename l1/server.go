@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -109,6 +110,7 @@ func (s *Server) routes() http.Handler {
 	client := http.NewServeMux()
 	client.HandleFunc("POST /v1/jobs", s.createJob)
 	client.HandleFunc("GET /v1/jobs/{job_id}", s.getJob)
+	client.HandleFunc("GET /v1/jobs/{job_id}/logs", s.getJobLogs)
 	client.HandleFunc("POST /v1/jobs/{job_id}/prompt", s.notImplemented)
 	client.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.notImplemented)
 
@@ -117,6 +119,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/heartbeat", s.heartbeatNode)
 	agent.HandleFunc("POST /v1/agent/jobs/claim", s.claimJob)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/lease", s.renewLease)
+	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/logs", s.appendLogs)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete", s.completeAttempt)
 
 	root := http.NewServeMux()
@@ -177,6 +180,20 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) getJobLogs(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseLogLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	page, err := s.store.GetJobLogs(r.Context(), r.PathValue("job_id"), r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
@@ -243,6 +260,21 @@ func (s *Server) renewLease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, lease)
 }
 
+func (s *Server) appendLogs(w http.ResponseWriter, r *http.Request) {
+	var request AppendLogsRequest
+	if err := decodeJSONWithLimit(r, &request, MaxLogUploadBodyBytes); err != nil {
+		writeError(w, err)
+		return
+	}
+	identity := identityFromRequest(r)
+	response, err := s.store.AppendLogs(r.Context(), identity.NodeID, r.PathValue("job_id"), r.PathValue("attempt_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 func (s *Server) completeAttempt(w http.ResponseWriter, r *http.Request) {
 	var request CompletionRequest
 	if err := decodeJSON(r, &request); err != nil {
@@ -267,7 +299,11 @@ func (s *Server) notImplemented(w http.ResponseWriter, _ *http.Request) {
 }
 
 func decodeJSON(r *http.Request, target any) error {
-	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	return decodeJSONWithLimit(r, target, 1<<20)
+}
+
+func decodeJSONWithLimit(r *http.Request, target any, limit int64) error {
+	decoder := json.NewDecoder(io.LimitReader(r.Body, limit))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return protocolError(contract.ErrorInvalidRequest, "invalid JSON request: %v", err)
@@ -280,6 +316,17 @@ func decodeJSON(r *http.Request, target any) error {
 		return protocolError(contract.ErrorInvalidRequest, "invalid trailing JSON: %v", err)
 	}
 	return nil
+}
+
+func parseLogLimit(value string) (int, error) {
+	if value == "" {
+		return DefaultLogPageLimit, nil
+	}
+	limit, err := strconv.Atoi(value)
+	if err != nil || limit < 1 || limit > MaxLogPageLimit {
+		return 0, protocolError(contract.ErrorInvalidRequest, "limit must be an integer between 1 and %d", MaxLogPageLimit)
+	}
+	return limit, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
