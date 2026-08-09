@@ -766,6 +766,18 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &record.DispatchKey, &rec
 	return record, nil
 }
 
+func (s *Store) runJobID(ctx context.Context, runID string) (string, bool, error) {
+	var jobID sql.NullString
+	err := s.db.QueryRowContext(ctx, "SELECT l1_job_id FROM runs WHERE run_id=?", runID).Scan(&jobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
+	}
+	if err != nil {
+		return "", false, internalError(err, "read run job ID")
+	}
+	return jobID.String, jobID.Valid && jobID.String != "", nil
+}
+
 func (s *Store) GetTrigger(ctx context.Context, runID string) (TriggerProvenance, error) {
 	var provenance TriggerProvenance
 	var sourceRun sql.NullString

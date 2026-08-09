@@ -12,9 +12,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -73,7 +75,7 @@ func newIntegrationHarness(t *testing.T) *integrationHarness {
 		l1Store.Close()
 		t.Fatal(err)
 	}
-	l3Server, err := NewServer(ledgerFabric, l3Store, ServerConfig{})
+	l3Server, err := NewServer(ledgerFabric, l3Store, ServerConfig{Logs: l1Client})
 	if err != nil {
 		l1Client.CloseIdleConnections()
 		l3Store.Close()
@@ -536,6 +538,72 @@ func TestSavedWorkflowNotFoundAndRerunSnapshotReuse(t *testing.T) {
 		if claim.Job.Spec.Labels["run_id"] == rerun.RunID && claim.Job.Spec.Labels["handoff_owner_run_id"] != source.RunID {
 			t.Fatalf("rerun handoff owner label = %#v", claim.Job.Spec.Labels)
 		}
+	}
+}
+
+func TestRunLogsProxyL1OpaqueCursor(t *testing.T) {
+	h := newIntegrationHarness(t)
+	accepted := h.submit(inlineRunRequest("#!/bin/sh\nprintf 'one\\ntwo\\n'\n"), "run-logs")
+
+	status, _, body := h.do(h.caller, http.MethodGet, "/v1/runs/"+accepted.RunID+"/logs", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("pending logs status = %d body=%s", status, body)
+	}
+	var pending l1.LogPage
+	if err := json.Unmarshal(body, &pending); err != nil {
+		t.Fatal(err)
+	}
+	if len(pending.Events) != 0 {
+		t.Fatalf("pending logs = %#v, want empty", pending.Events)
+	}
+
+	reconciler, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	agent := h.agent()
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"}, nil)
+	if status != http.StatusOK {
+		t.Fatalf("claim status = %d body=%s", status, body)
+	}
+	var claim l1.Claim
+	if err := json.Unmarshal(body, &claim); err != nil {
+		t.Fatal(err)
+	}
+	logPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/logs", claim.Job.JobID, claim.Lease.AttemptID)
+	logs := l1.AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: []contract.LogEvent{
+		{AttemptID: claim.Lease.AttemptID, Stream: contract.LogStdout, Sequence: 0, Timestamp: time.Now().UTC(), Bytes: []byte("one\n")},
+		{AttemptID: claim.Lease.AttemptID, Stream: contract.LogStdout, Sequence: 1, Timestamp: time.Now().UTC(), Bytes: []byte("two\n")},
+	}}
+	status, _, body = h.do(agent, http.MethodPost, logPath, logs, nil)
+	if status != http.StatusOK {
+		t.Fatalf("append logs status = %d body=%s", status, body)
+	}
+
+	status, _, body = h.do(h.caller, http.MethodGet, "/v1/runs/"+accepted.RunID+"/logs?limit=1", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("first run logs status = %d body=%s", status, body)
+	}
+	var first l1.LogPage
+	if err := json.Unmarshal(body, &first); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Events) != 1 || string(first.Events[0].Bytes) != "one\n" || first.NextCursor == "" {
+		t.Fatalf("first run logs = %#v", first)
+	}
+	status, _, body = h.do(h.caller, http.MethodGet, "/v1/runs/"+accepted.RunID+"/logs?limit=1&cursor="+url.QueryEscape(first.NextCursor), nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("second run logs status = %d body=%s", status, body)
+	}
+	var second l1.LogPage
+	if err := json.Unmarshal(body, &second); err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Events) != 1 || string(second.Events[0].Bytes) != "two\n" || second.NextCursor == first.NextCursor {
+		t.Fatalf("second run logs = %#v", second)
 	}
 }
 

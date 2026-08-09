@@ -14,11 +14,13 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/l1"
 )
 
 type ServerConfig struct {
 	CallerPrincipalTag string
 	Reconciler         *Reconciler
+	Logs               JobLogClient
 }
 
 type Server struct {
@@ -26,6 +28,7 @@ type Server struct {
 	store              *Store
 	callerPrincipalTag string
 	reconciler         *Reconciler
+	logs               JobLogClient
 	handler            http.Handler
 }
 
@@ -40,7 +43,7 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	if tag == "" {
 		tag = DefaultCallerPrincipalTag
 	}
-	server := &Server{fabric: f, store: store, callerPrincipalTag: tag, reconciler: config.Reconciler}
+	server := &Server{fabric: f, store: store, callerPrincipalTag: tag, reconciler: config.Reconciler, logs: config.Logs}
 	server.handler = server.routes()
 	return server, nil
 }
@@ -85,6 +88,7 @@ func (s *Server) routes() http.Handler {
 	runs := http.NewServeMux()
 	runs.HandleFunc("POST /v1/runs", s.createRun)
 	runs.HandleFunc("GET /v1/runs/{run_id}", s.getRun)
+	runs.HandleFunc("GET /v1/runs/{run_id}/logs", s.getRunLogs)
 	runs.HandleFunc("POST /v1/runs/{run_id}/envelopes", s.inRunWriteNotImplemented)
 	runs.HandleFunc("POST /v1/runs/{run_id}/gates", s.inRunWriteNotImplemented)
 	runs.HandleFunc("POST /v1/runs/{run_id}/rerun", s.rerun)
@@ -214,6 +218,57 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, record)
+}
+
+func (s *Server) getRunLogs(w http.ResponseWriter, r *http.Request) {
+	if s.logs == nil {
+		writeError(w, internalError(errors.New("L1 log client is not configured"), "poll run logs"))
+		return
+	}
+	runID := r.PathValue("run_id")
+	if scope, ok := runTokenFromRequest(r); ok {
+		allowed, err := s.store.CanReadRun(r.Context(), scope.RunID, runID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if !allowed {
+			writeError(w, protocolError(contract.ErrorForbidden, "run token cannot read an ancestor or sibling run"))
+			return
+		}
+	}
+	limit, err := parseRunLogLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	jobID, dispatched, err := s.store.runJobID(r.Context(), runID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	cursor := r.URL.Query().Get("cursor")
+	if !dispatched {
+		writeJSON(w, http.StatusOK, l1.LogPage{Events: []contract.LogEvent{}, NextCursor: cursor})
+		return
+	}
+	page, err := s.logs.GetJobLogs(r.Context(), jobID, cursor, limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func parseRunLogLimit(value string) (int, error) {
+	if value == "" {
+		return l1.DefaultLogPageLimit, nil
+	}
+	limit, err := strconv.Atoi(value)
+	if err != nil || limit < 1 || limit > l1.MaxLogPageLimit {
+		return 0, protocolError(contract.ErrorInvalidRequest, "limit must be an integer between 1 and %d", l1.MaxLogPageLimit)
+	}
+	return limit, nil
 }
 
 func (s *Server) inRunWriteNotImplemented(w http.ResponseWriter, r *http.Request) {
