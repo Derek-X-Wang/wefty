@@ -92,6 +92,12 @@ func (c *Client) Renew(ctx context.Context, jobID, attemptID, fencingToken strin
 	return lease, err
 }
 
+func (c *Client) AppendLogs(ctx context.Context, jobID, attemptID string, request l1.AppendLogsRequest) (l1.AppendLogsResponse, error) {
+	var response l1.AppendLogsResponse
+	err := c.post(ctx, attemptPath(jobID, attemptID)+"/logs", request, &response)
+	return response, err
+}
+
 func (c *Client) Complete(ctx context.Context, jobID, attemptID string, request l1.CompletionRequest) (l1.Job, error) {
 	var job l1.Job
 	err := c.post(ctx, attemptPath(jobID, attemptID)+"/complete", request, &job)
