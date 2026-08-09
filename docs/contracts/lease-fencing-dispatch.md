@@ -18,6 +18,10 @@ to `claimed`. Exactly one concurrent claimant commits.
 The request contains node ID and boot-session ID but no routing tags. The
 control plane obtains tags from authenticated Fabric identity plus operator
 configuration. Nodes in `stale`, `dead`, or `draining` state cannot claim.
+The first registration binds the stable operator-facing node ID to the
+authenticated Fabric identity. Later boot sessions may replace that node row
+only from the same Fabric identity, so a transport-internal ID need not leak
+into node configuration and another peer cannot take over the stable ID.
 
 The successful claim returns all three write authorities:
 

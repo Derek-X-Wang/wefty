@@ -42,3 +42,25 @@ TS_AUTHKEY=tskey-auth-... go test -tags=tsnet_smoke ./... -run '^TestTSNetSmoke$
 Set `TS_CONTROL_URL` as well when testing against a non-default coordination
 server. The auth key must be reusable because the smoke test starts one client
 and one server, both ephemeral.
+
+## M1 node agent
+
+Run a localhost control plane and one real agent with authoritative routing
+tags configured only on the control plane:
+
+```sh
+go run ./cmd/wefty-l1 \
+  --fabric=plain --listen=127.0.0.1:8787 \
+  --db=wefty-l1.sqlite --node-tags=my-node=mac,arm64
+
+go run ./cmd/wefty-agent \
+  --fabric=plain --control-plane=127.0.0.1:8787 \
+  --node-id=my-node
+```
+
+The stable `--node-id` survives agent restarts; each process generates a new
+boot-session ID. Heartbeats and attempt lease renewals use independent
+cadences. For tsnet, also supply `--fabric-name`, `--state-dir`, and an auth key
+whose node identity has the `tag:wefty-agent` principal tag. The credentialed
+agent smoke remains env-gated by `TS_AUTHKEY` (and optionally
+`TS_AGENT_PRINCIPAL_TAG` when a tailnet uses a different tag).

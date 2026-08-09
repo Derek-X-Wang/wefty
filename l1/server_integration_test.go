@@ -377,6 +377,46 @@ func TestRegistrationRejectsSelfReportedTags(t *testing.T) {
 	}
 }
 
+func TestRegistrationKeepsOneStableNodeAcrossBootSessions(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{"stable-node": {"configured"}})
+	agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
+	intruder := h.client(fabric.Identity{NodeID: "other-fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
+
+	registration := contract.NodeRegistration{
+		NodeID: "stable-node", BootSessionID: "boot-1", OS: "linux", Architecture: "amd64", AgentVersion: "test",
+	}
+	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
+	if status != http.StatusOK {
+		t.Fatalf("first registration status = %d body=%s", status, body)
+	}
+	registration.BootSessionID = "boot-intruder"
+	status, _, body = h.do(intruder, http.MethodPost, "/v1/agent/nodes/register", registration)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+
+	registration.BootSessionID = "boot-2"
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
+	if status != http.StatusOK {
+		t.Fatalf("restart registration status = %d body=%s", status, body)
+	}
+	var restarted Node
+	if err := json.Unmarshal(body, &restarted); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.BootSessionID != "boot-2" || len(restarted.AuthoritativeTags) != 1 || restarted.AuthoritativeTags[0] != "configured" {
+		t.Fatalf("restarted node = %#v", restarted)
+	}
+
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/stable-node/heartbeat", HeartbeatRequest{BootSessionID: "boot-1"})
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+	var count int
+	if err := h.store.db.QueryRow("SELECT count(*) FROM nodes WHERE node_id=?", "stable-node").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("stable-node rows = %d, want 1", count)
+	}
+}
+
 func TestStoreUsesWAL(t *testing.T) {
 	h := newIntegrationHarness(t, nil)
 	var mode string

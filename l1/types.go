@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	DefaultClientPrincipalTag = "wefty:client"
-	DefaultAgentPrincipalTag  = "wefty:agent"
+	DefaultClientPrincipalTag = "tag:wefty-client"
+	DefaultAgentPrincipalTag  = "tag:wefty-agent"
 	DefaultLeaseDuration      = 30 * time.Second
 )
 
