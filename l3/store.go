@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 const defaultInlineMode uint32 = 0o755
 
 var tagPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:-]*$`)
+var workflowIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 
 // Store is the L3-owned SQLite ledger. It intentionally has no access to the
 // L1 database; the outbox crosses that boundary only through the L1 protocol.
@@ -98,6 +100,28 @@ CREATE TRIGGER IF NOT EXISTS run_scripts_no_update
 BEFORE UPDATE ON run_scripts BEGIN SELECT RAISE(ABORT, 'inline scripts are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS run_scripts_no_delete
 BEFORE DELETE ON run_scripts BEGIN SELECT RAISE(ABORT, 'inline scripts are immutable'); END;
+CREATE TABLE IF NOT EXISTS run_workflow_refs (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
+  workflow_ref TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS run_workflow_refs_no_update
+BEFORE UPDATE ON run_workflow_refs BEGIN SELECT RAISE(ABORT, 'resolved workflow refs are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS run_workflow_refs_no_delete
+BEFORE DELETE ON run_workflow_refs BEGIN SELECT RAISE(ABORT, 'resolved workflow refs are immutable'); END;
+CREATE TABLE IF NOT EXISTS workflow_versions (
+  workflow_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  content BLOB NOT NULL,
+  sha256 TEXT NOT NULL,
+  interpreter_json BLOB NOT NULL,
+  mode INTEGER NOT NULL,
+  created_ns INTEGER NOT NULL,
+  PRIMARY KEY(workflow_id, version)
+);
+CREATE TRIGGER IF NOT EXISTS workflow_versions_no_update
+BEFORE UPDATE ON workflow_versions BEGIN SELECT RAISE(ABORT, 'workflow versions are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS workflow_versions_no_delete
+BEFORE DELETE ON workflow_versions BEGIN SELECT RAISE(ABORT, 'workflow versions are immutable'); END;
 CREATE TABLE IF NOT EXISTS run_triggers (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
   actor TEXT NOT NULL,
@@ -127,6 +151,142 @@ CREATE INDEX IF NOT EXISTS dispatch_outbox_pending ON dispatch_outbox(dispatched
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+type workflowSnapshot struct {
+	Content     []byte
+	SHA256      string
+	Interpreter []string
+	Mode        uint32
+}
+
+// CreateWorkflowVersion appends an immutable version and assigns the next
+// monotonically increasing version number for the workflow.
+func (s *Store) CreateWorkflowVersion(ctx context.Context, workflowID string, input WorkflowVersionInput) (WorkflowVersion, error) {
+	workflowID, err := normalizeWorkflowID(workflowID)
+	if err != nil {
+		return WorkflowVersion{}, err
+	}
+	mode, err := normalizeScript(input.Content, input.SHA256, input.Interpreter, input.Mode, "workflow version")
+	if err != nil {
+		return WorkflowVersion{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return WorkflowVersion{}, internalError(err, "begin workflow version creation")
+	}
+	defer tx.Rollback()
+	var version int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) + 1 FROM workflow_versions WHERE workflow_id=?`, workflowID).Scan(&version); err != nil {
+		return WorkflowVersion{}, internalError(err, "assign workflow version")
+	}
+	interpreterJSON, _ := json.Marshal(nonNilStrings(input.Interpreter))
+	now := canonicalTime(s.clock.Now())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_versions(workflow_id, version, content, sha256, interpreter_json, mode, created_ns) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+		workflowID, version, []byte(input.Content), input.SHA256, interpreterJSON, mode, now.UnixNano()); err != nil {
+		return WorkflowVersion{}, internalError(err, "store workflow version")
+	}
+	if err := tx.Commit(); err != nil {
+		return WorkflowVersion{}, internalError(err, "commit workflow version")
+	}
+	return s.GetWorkflowVersion(ctx, workflowID, version)
+}
+
+func (s *Store) GetWorkflowVersion(ctx context.Context, workflowID string, version int) (WorkflowVersion, error) {
+	workflowID, err := normalizeWorkflowID(workflowID)
+	if err != nil {
+		return WorkflowVersion{}, err
+	}
+	if version < 1 {
+		return WorkflowVersion{}, protocolError(contract.ErrorInvalidRequest, "workflow version must be at least 1")
+	}
+	var record WorkflowVersion
+	var content, interpreterJSON []byte
+	var createdNS int64
+	err = s.db.QueryRowContext(ctx, `SELECT content, sha256, interpreter_json, mode, created_ns FROM workflow_versions WHERE workflow_id=? AND version=?`, workflowID, version).
+		Scan(&content, &record.SHA256, &interpreterJSON, &record.Mode, &createdNS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WorkflowVersion{}, protocolError(contract.ErrorNotFound, "workflow %q version v%d was not found", workflowID, version)
+	}
+	if err != nil {
+		return WorkflowVersion{}, internalError(err, "read workflow version")
+	}
+	record.WorkflowID = workflowID
+	record.Version = version
+	record.WorkflowRef = pinnedWorkflowRef(workflowID, version)
+	record.Content = string(content)
+	if err := json.Unmarshal(interpreterJSON, &record.Interpreter); err != nil {
+		return WorkflowVersion{}, internalError(err, "decode workflow interpreter")
+	}
+	if record.Interpreter == nil {
+		record.Interpreter = []string{}
+	}
+	record.CreatedAt = time.Unix(0, createdNS).UTC()
+	return record, nil
+}
+
+func normalizeWorkflowID(workflowID string) (string, error) {
+	workflowID = strings.TrimSpace(workflowID)
+	if !workflowIDPattern.MatchString(workflowID) {
+		return "", protocolError(contract.ErrorInvalidRequest, "workflow_id %q is invalid", workflowID)
+	}
+	return workflowID, nil
+}
+
+func parseWorkflowRef(ref string) (workflowID string, version int, err error) {
+	const prefix = "workflow://"
+	if !strings.HasPrefix(ref, prefix) {
+		return "", 0, protocolError(contract.ErrorInvalidRequest, "workflow_ref must use workflow://<workflow_id> or workflow://<workflow_id>/v<version>")
+	}
+	parts := strings.Split(strings.TrimPrefix(ref, prefix), "/")
+	if len(parts) < 1 || len(parts) > 2 {
+		return "", 0, protocolError(contract.ErrorInvalidRequest, "workflow_ref must use workflow://<workflow_id> or workflow://<workflow_id>/v<version>")
+	}
+	workflowID, err = normalizeWorkflowID(parts[0])
+	if err != nil {
+		return "", 0, err
+	}
+	if len(parts) == 1 {
+		return workflowID, 0, nil
+	}
+	if len(parts[1]) < 2 || parts[1][0] != 'v' {
+		return "", 0, protocolError(contract.ErrorInvalidRequest, "workflow_ref version must use v<version>")
+	}
+	parsed, parseErr := strconv.Atoi(parts[1][1:])
+	if parseErr != nil || parsed < 1 || strconv.Itoa(parsed) != parts[1][1:] {
+		return "", 0, protocolError(contract.ErrorInvalidRequest, "workflow_ref version must use a positive integer")
+	}
+	return workflowID, parsed, nil
+}
+
+func pinnedWorkflowRef(workflowID string, version int) string {
+	return fmt.Sprintf("workflow://%s/v%d", workflowID, version)
+}
+
+func resolveWorkflowTx(ctx context.Context, tx *sql.Tx, ref string) (workflowSnapshot, string, error) {
+	workflowID, version, err := parseWorkflowRef(ref)
+	if err != nil {
+		return workflowSnapshot{}, "", err
+	}
+	var snapshot workflowSnapshot
+	var interpreterJSON []byte
+	if version == 0 {
+		err = tx.QueryRowContext(ctx, `SELECT version, content, sha256, interpreter_json, mode FROM workflow_versions WHERE workflow_id=? ORDER BY version DESC LIMIT 1`, workflowID).
+			Scan(&version, &snapshot.Content, &snapshot.SHA256, &interpreterJSON, &snapshot.Mode)
+	} else {
+		err = tx.QueryRowContext(ctx, `SELECT content, sha256, interpreter_json, mode FROM workflow_versions WHERE workflow_id=? AND version=?`, workflowID, version).
+			Scan(&snapshot.Content, &snapshot.SHA256, &interpreterJSON, &snapshot.Mode)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return workflowSnapshot{}, "", protocolError(contract.ErrorNotFound, "workflow_ref %q was not found", ref)
+	}
+	if err != nil {
+		return workflowSnapshot{}, "", internalError(err, "resolve workflow_ref")
+	}
+	if err := json.Unmarshal(interpreterJSON, &snapshot.Interpreter); err != nil {
+		return workflowSnapshot{}, "", internalError(err, "decode resolved workflow interpreter")
+	}
+	return snapshot, pinnedWorkflowRef(workflowID, version), nil
+}
 
 // CreateRun atomically commits the run, immutable script, trigger provenance,
 // and dispatch intent. The returned replay flag follows Idempotency-Key
@@ -165,6 +325,19 @@ func (s *Store) CreateRun(ctx context.Context, input CreateRunInput) (record con
 			return contract.RunRecord{}, false, internalError(err, "read parent run")
 		}
 	}
+	var snapshot workflowSnapshot
+	var workflowRef string
+	if input.Request.InlineScript != nil {
+		snapshot = workflowSnapshot{
+			Content: []byte(input.Request.InlineScript.Content), SHA256: input.Request.InlineScript.SHA256,
+			Interpreter: input.Request.InlineScript.Interpreter, Mode: mode,
+		}
+	} else {
+		snapshot, workflowRef, err = resolveWorkflowTx(ctx, tx, input.Request.WorkflowRef)
+		if err != nil {
+			return contract.RunRecord{}, false, err
+		}
+	}
 
 	runID := newID("run")
 	dispatchKey := "run:" + runID
@@ -182,11 +355,16 @@ VALUES(?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, input.Request
 	if err != nil {
 		return contract.RunRecord{}, false, internalError(err, "store run")
 	}
-	interpreterJSON, _ := json.Marshal(nonNilStrings(input.Request.InlineScript.Interpreter))
+	interpreterJSON, _ := json.Marshal(nonNilStrings(snapshot.Interpreter))
 	_, err = tx.ExecContext(ctx, `INSERT INTO run_scripts(run_id, content, sha256, interpreter_json, mode) VALUES(?, ?, ?, ?, ?)`,
-		runID, []byte(input.Request.InlineScript.Content), input.Request.InlineScript.SHA256, interpreterJSON, mode)
+		runID, snapshot.Content, snapshot.SHA256, interpreterJSON, snapshot.Mode)
 	if err != nil {
-		return contract.RunRecord{}, false, internalError(err, "store immutable inline script")
+		return contract.RunRecord{}, false, internalError(err, "store immutable run script snapshot")
+	}
+	if workflowRef != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO run_workflow_refs(run_id, workflow_ref) VALUES(?, ?)`, runID, workflowRef); err != nil {
+			return contract.RunRecord{}, false, internalError(err, "store pinned workflow ref")
+		}
 	}
 	source := "manual"
 	sourceRunID := ""
@@ -209,6 +387,99 @@ VALUES(?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, input.Request
 	return record, false, err
 }
 
+// CreateRerun creates a new run from an existing run's immutable script
+// snapshot and original inputs. It deliberately never resolves workflow_ref.
+func (s *Store) CreateRerun(ctx context.Context, input CreateRerunInput) (record contract.RunRecord, replayed bool, err error) {
+	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
+	input.Actor = strings.TrimSpace(input.Actor)
+	input.SourceRunID = strings.TrimSpace(input.SourceRunID)
+	if input.IdempotencyKey == "" || len(input.IdempotencyKey) > 255 {
+		return contract.RunRecord{}, false, protocolError(contract.ErrorInvalidRequest, "Idempotency-Key must be between 1 and 255 characters")
+	}
+	if input.Actor == "" {
+		return contract.RunRecord{}, false, protocolError(contract.ErrorUnauthorized, "authenticated actor is required")
+	}
+	if input.SourceRunID == "" {
+		return contract.RunRecord{}, false, protocolError(contract.ErrorInvalidRequest, "source run id is required")
+	}
+	hashInput, _ := json.Marshal(struct {
+		Actor   string `json:"actor"`
+		RerunOf string `json:"rerun_of"`
+	}{Actor: input.Actor, RerunOf: input.SourceRunID})
+	digest := sha256.Sum256(hashInput)
+	requestHash := hex.EncodeToString(digest[:])
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return contract.RunRecord{}, false, internalError(err, "begin rerun creation")
+	}
+	defer tx.Rollback()
+	var existingID, existingHash string
+	err = tx.QueryRowContext(ctx, "SELECT run_id, request_hash FROM runs WHERE idempotency_key=?", input.IdempotencyKey).Scan(&existingID, &existingHash)
+	if err == nil {
+		if existingHash != requestHash {
+			return contract.RunRecord{}, false, protocolError(contract.ErrorIdempotencyConflict, "idempotency key %q was already used with a different run", input.IdempotencyKey)
+		}
+		_ = tx.Rollback()
+		record, err := s.GetRun(ctx, existingID)
+		return record, true, err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return contract.RunRecord{}, false, internalError(err, "read rerun idempotency key")
+	}
+
+	var paramsJSON, tagsJSON, limitsJSON, envelopeSchemaJSON []byte
+	var requiredEnvelope bool
+	var snapshot workflowSnapshot
+	var interpreterJSON []byte
+	var workflowRef sql.NullString
+	err = tx.QueryRowContext(ctx, `
+SELECT r.params_json, r.tags_json, r.limits_json, r.envelope_schema_json, r.required_envelope,
+       s.content, s.sha256, s.interpreter_json, s.mode, w.workflow_ref
+FROM runs r JOIN run_scripts s ON s.run_id=r.run_id
+LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
+WHERE r.run_id=?`, input.SourceRunID).Scan(&paramsJSON, &tagsJSON, &limitsJSON, &envelopeSchemaJSON, &requiredEnvelope,
+		&snapshot.Content, &snapshot.SHA256, &interpreterJSON, &snapshot.Mode, &workflowRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		return contract.RunRecord{}, false, protocolError(contract.ErrorNotFound, "run %q was not found", input.SourceRunID)
+	}
+	if err != nil {
+		return contract.RunRecord{}, false, internalError(err, "read rerun source snapshot")
+	}
+
+	runID := newID("run")
+	dispatchKey := "run:" + runID
+	now := canonicalTime(s.clock.Now())
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO runs(run_id, parent_run_id, dispatch_key, idempotency_key, request_hash, status, params_json, tags_json, limits_json, envelope_schema_json, required_envelope, created_ns, updated_ns)
+VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, dispatchKey, input.IdempotencyKey, requestHash, contract.RunPending,
+		paramsJSON, tagsJSON, nullableBytes(limitsJSON), nullableBytes(envelopeSchemaJSON), requiredEnvelope, now.UnixNano(), now.UnixNano())
+	if err != nil {
+		return contract.RunRecord{}, false, internalError(err, "store rerun")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_scripts(run_id, content, sha256, interpreter_json, mode) VALUES(?, ?, ?, ?, ?)`,
+		runID, snapshot.Content, snapshot.SHA256, interpreterJSON, snapshot.Mode); err != nil {
+		return contract.RunRecord{}, false, internalError(err, "store rerun script snapshot")
+	}
+	if workflowRef.Valid {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO run_workflow_refs(run_id, workflow_ref) VALUES(?, ?)`, runID, workflowRef.String); err != nil {
+			return contract.RunRecord{}, false, internalError(err, "store rerun workflow ref")
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_triggers(run_id, actor, source, source_run_id, params_json, created_ns) VALUES(?, ?, 'rerun', ?, ?, ?)`,
+		runID, input.Actor, input.SourceRunID, paramsJSON, now.UnixNano()); err != nil {
+		return contract.RunRecord{}, false, internalError(err, "store rerun provenance")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO dispatch_outbox(run_id, dispatch_key) VALUES(?, ?)`, runID, dispatchKey); err != nil {
+		return contract.RunRecord{}, false, internalError(err, "store rerun dispatch intent")
+	}
+	if err := tx.Commit(); err != nil {
+		return contract.RunRecord{}, false, internalError(err, "commit rerun and dispatch intent")
+	}
+	record, err = s.GetRun(ctx, runID)
+	return record, false, err
+}
+
 func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, error) {
 	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
 	input.Actor = strings.TrimSpace(input.Actor)
@@ -219,34 +490,22 @@ func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, e
 		return input, "", 0, protocolError(contract.ErrorUnauthorized, "authenticated actor is required")
 	}
 	request := &input.Request
+	request.WorkflowRef = strings.TrimSpace(request.WorkflowRef)
 	if request.WorkflowRef != "" && request.InlineScript != nil {
 		return input, "", 0, protocolError(contract.ErrorInvalidRequest, "workflow_ref and inline_script are mutually exclusive")
 	}
-	if request.WorkflowRef != "" {
-		return input, "", 0, protocolError(contract.ErrorNotImplemented, "workflow_ref is reserved for saved workflows")
-	}
-	if request.InlineScript == nil {
+	if request.WorkflowRef == "" && request.InlineScript == nil {
 		return input, "", 0, protocolError(contract.ErrorInvalidRequest, "exactly one of workflow_ref or inline_script is required")
 	}
-	if request.InlineScript.Content == "" {
-		return input, "", 0, protocolError(contract.ErrorInvalidRequest, "inline_script.content must not be empty")
-	}
-	digest := sha256.Sum256([]byte(request.InlineScript.Content))
-	computed := hex.EncodeToString(digest[:])
-	if request.InlineScript.SHA256 != computed {
-		return input, "", 0, protocolError(contract.ErrorInvalidRequest, "inline_script.sha256 does not match content")
-	}
-	for _, part := range request.InlineScript.Interpreter {
-		if part == "" {
-			return input, "", 0, protocolError(contract.ErrorInvalidRequest, "inline_script.interpreter entries must not be empty")
+	mode := uint32(0)
+	var err error
+	if request.InlineScript != nil {
+		mode, err = normalizeScript(request.InlineScript.Content, request.InlineScript.SHA256, request.InlineScript.Interpreter, request.InlineScript.Mode, "inline_script")
+		if err != nil {
+			return input, "", 0, err
 		}
-	}
-	mode := defaultInlineMode
-	if request.InlineScript.Mode != nil {
-		mode = *request.InlineScript.Mode
-	}
-	if mode > 0o7777 {
-		return input, "", 0, protocolError(contract.ErrorInvalidRequest, "inline_script.mode exceeds 07777")
+	} else if _, _, err := parseWorkflowRef(request.WorkflowRef); err != nil {
+		return input, "", 0, err
 	}
 	params, err := canonicalObject(request.Params, true, "params")
 	if err != nil {
@@ -279,6 +538,30 @@ func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, e
 	}
 	hash := sha256.Sum256(encoded)
 	return input, hex.EncodeToString(hash[:]), mode, nil
+}
+
+func normalizeScript(content, suppliedSHA string, interpreter []string, suppliedMode *uint32, name string) (uint32, error) {
+	if content == "" {
+		return 0, protocolError(contract.ErrorInvalidRequest, "%s.content must not be empty", name)
+	}
+	digest := sha256.Sum256([]byte(content))
+	computed := hex.EncodeToString(digest[:])
+	if suppliedSHA != computed {
+		return 0, protocolError(contract.ErrorInvalidRequest, "%s.sha256 does not match content", name)
+	}
+	for _, part := range interpreter {
+		if part == "" {
+			return 0, protocolError(contract.ErrorInvalidRequest, "%s.interpreter entries must not be empty", name)
+		}
+	}
+	mode := defaultInlineMode
+	if suppliedMode != nil {
+		mode = *suppliedMode
+	}
+	if mode > 0o7777 {
+		return 0, protocolError(contract.ErrorInvalidRequest, "%s.mode exceeds 07777", name)
+	}
+	return mode, nil
 }
 
 func canonicalObject(raw json.RawMessage, required bool, name string) (json.RawMessage, error) {
@@ -321,7 +604,7 @@ func normalizeTags(tags []string) ([]string, error) {
 // script and trigger rows.
 func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, error) {
 	var record contract.RunRecord
-	var parent, sourceRun sql.NullString
+	var parent, sourceRun, workflowRef sql.NullString
 	var paramsJSON, tagsJSON []byte
 	var limitsJSON []byte
 	var content []byte
@@ -331,10 +614,12 @@ func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, e
 	err := s.db.QueryRowContext(ctx, `
 SELECT r.run_id, r.parent_run_id, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
        r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
-       s.content, s.sha256, t.actor, t.source, t.source_run_id
-FROM runs r JOIN run_scripts s ON s.run_id=r.run_id JOIN run_triggers t ON t.run_id=r.run_id
+       s.content, s.sha256, w.workflow_ref, t.actor, t.source, t.source_run_id
+FROM runs r JOIN run_scripts s ON s.run_id=r.run_id
+LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
+JOIN run_triggers t ON t.run_id=r.run_id
 WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
-		&createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &actor, &source, &sourceRun)
+		&createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &workflowRef, &actor, &source, &sourceRun)
 	if errors.Is(err, sql.ErrNoRows) {
 		return contract.RunRecord{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
 	}
@@ -357,7 +642,11 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &record.DispatchKey, &rec
 		}
 	}
 	record.Trigger = contract.Trigger{Type: source, Principal: actor, SourceRunID: sourceRun.String}
-	record.Workflow = contract.WorkflowSource{InlineScript: &contract.InlineScript{Content: string(content), SHA256: sha}}
+	if workflowRef.Valid {
+		record.Workflow = contract.WorkflowSource{WorkflowRef: workflowRef.String}
+	} else {
+		record.Workflow = contract.WorkflowSource{InlineScript: &contract.InlineScript{Content: string(content), SHA256: sha}}
+	}
 	record.CreatedAt = time.Unix(0, createdNS).UTC()
 	record.UpdatedAt = time.Unix(0, updatedNS).UTC()
 	if startedNS.Valid {
