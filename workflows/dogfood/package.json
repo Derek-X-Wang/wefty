@@ -1,0 +1,23 @@
+{
+  "name": "@wefty/dogfood-workflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/dogfood-workflow.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/dogfood-workflow.mjs --banner:js='#!/usr/bin/env node'",
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && go test . -run TestDogfoodWorkflowContractSmoke -count=1"
+  },
+  "dependencies": {
+    "@ai-hero/sandcastle": "0.12.0",
+    "@standard-schema/spec": "1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "25.5.0",
+    "esbuild": "0.27.3",
+    "eslint": "9.39.2",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.54.0"
+  }
+}
