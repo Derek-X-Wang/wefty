@@ -71,11 +71,5 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - name: Run credentialed tsnet smoke placeholder
-        run: |
-          if [[ -z "${TS_AUTHKEY}" ]]; then
-            echo "M0 placeholder: TS_AUTHKEY is unavailable; tsnet implementation arrives in M1."
-          else
-            echo "M0 placeholder: TS_AUTHKEY is wired; tsnet implementation arrives in M1."
-          fi
-          go test -tags=tsnet_smoke ./... -run '^TestTSNetSmoke$'
+      - name: Run credentialed tsnet smoke
+        run: go test -tags=tsnet_smoke ./... -run '^TestTSNetSmoke$'
