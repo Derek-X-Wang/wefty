@@ -68,12 +68,13 @@ func TestColdRerunWithHandoffFilesPinsOrFailsExplicitly(t *testing.T) {
 	if err := manager.prepare(claim.Job.Spec, "node-1"); err == nil || !strings.Contains(err.Error(), contract.StableNodeTagPrefix+"node-1") {
 		t.Fatalf("unpinned cold rerun error = %v, want explicit stable-node tag failure", err)
 	}
-	claim.Job.Spec.RoutingTags = append(claim.Job.Spec.RoutingTags, contract.StableNodeTagPrefix+"node-1")
-	if err := manager.prepare(claim.Job.Spec, "node-1"); err != nil {
+	rerun := handoffClaim("run_retry_2", path, []string{"linux", contract.StableNodeTagPrefix + "node-1"})
+	rerun.Job.Spec.Labels["handoff_owner_run_id"] = runID
+	if err := manager.prepare(rerun.Job.Spec, "node-1"); err != nil {
 		t.Fatalf("pinned cold rerun: %v", err)
 	}
 
-	if err := manager.finish(claim.Job.Spec, "node-1", false); err != nil {
+	if err := manager.finish(rerun.Job.Spec, "node-1", false); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(time.Hour)

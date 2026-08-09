@@ -66,3 +66,9 @@ authoritative tags for the node. An unpinned rerun, a rerun on a different
 stable node, an ownership mismatch, or an unmanaged pre-populated directory
 fails explicitly before process execution. No rerun silently receives an
 empty or unrelated handoff path.
+
+`POST /v1/runs/{run_id}/rerun` is the cold-rerun path and reuses the source
+run's handoff directory. L3 accepts it only when the source run has exactly one
+reserved stable-node tag, copies that tag to the rerun, and labels the L1 job
+with the source run as its handoff owner. A source run that was not pinned is
+rejected at rerun creation instead of dispatching a job with an unusable path.

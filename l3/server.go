@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -86,10 +87,16 @@ func (s *Server) routes() http.Handler {
 	runs.HandleFunc("GET /v1/runs/{run_id}", s.getRun)
 	runs.HandleFunc("POST /v1/runs/{run_id}/envelopes", s.inRunWriteNotImplemented)
 	runs.HandleFunc("POST /v1/runs/{run_id}/gates", s.inRunWriteNotImplemented)
+	runs.HandleFunc("POST /v1/runs/{run_id}/rerun", s.rerun)
+
+	workflows := http.NewServeMux()
+	workflows.HandleFunc("POST /v1/workflows/{workflow_id}/versions", s.createWorkflowVersion)
+	workflows.HandleFunc("GET /v1/workflows/{workflow_id}/versions/{version}", s.getWorkflowVersion)
 
 	root := http.NewServeMux()
 	root.Handle("/v1/runs", s.authenticateFabric(s.authorize(runs)))
 	root.Handle("/v1/runs/", s.authenticateFabric(s.authorize(runs)))
+	root.Handle("/v1/workflows/", s.authenticateFabric(s.authorize(s.requireCaller(workflows))))
 	return root
 }
 
@@ -128,6 +135,16 @@ func (s *Server) authorize(next http.Handler) http.Handler {
 		tags, err := normalizeTags(identity.Tags)
 		if err != nil || !slices.Contains(tags, s.callerPrincipalTag) {
 			writeError(w, protocolError(contract.ErrorForbidden, "fabric identity is not authorized for the L3 caller protocol"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) requireCaller(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := runTokenFromRequest(r); ok {
+			writeError(w, protocolError(contract.ErrorForbidden, "run tokens are not authorized for workflow administration"))
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -175,15 +192,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	status := http.StatusCreated
-	if replayed {
-		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
-	}
-	writeJSON(w, status, RunAccepted{
-		RunID: record.RunID, StatusURL: "/v1/runs/" + record.RunID,
-		LogsURL: "/v1/runs/" + record.RunID + "/logs",
-	})
+	writeRunAccepted(w, record, replayed)
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
@@ -218,6 +227,69 @@ func (s *Server) inRunWriteNotImplemented(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeError(w, protocolError(contract.ErrorNotImplemented, "envelope and gate storage is implemented in issue #28"))
+}
+
+func (s *Server) rerun(w http.ResponseWriter, r *http.Request) {
+	if _, ok := runTokenFromRequest(r); ok {
+		writeError(w, protocolError(contract.ErrorForbidden, "run tokens are not authorized to rerun terminal snapshots"))
+		return
+	}
+	identity := identityFromRequest(r)
+	record, replayed, err := s.store.CreateRerun(r.Context(), CreateRerunInput{
+		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+		Actor:          actorFromIdentity(identity),
+		SourceRunID:    r.PathValue("run_id"),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeRunAccepted(w, record, replayed)
+}
+
+func (s *Server) createWorkflowVersion(w http.ResponseWriter, r *http.Request) {
+	var input WorkflowVersionInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeError(w, err)
+		return
+	}
+	record, err := s.store.CreateWorkflowVersion(r.Context(), r.PathValue("workflow_id"), input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, record)
+}
+
+func (s *Server) getWorkflowVersion(w http.ResponseWriter, r *http.Request) {
+	versionPart := r.PathValue("version")
+	if len(versionPart) < 2 || versionPart[0] != 'v' {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "workflow version path must use v<version>"))
+		return
+	}
+	version, err := strconv.Atoi(versionPart[1:])
+	if err != nil || version < 1 || strconv.Itoa(version) != versionPart[1:] {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "workflow version path must use a positive integer"))
+		return
+	}
+	record, err := s.store.GetWorkflowVersion(r.Context(), r.PathValue("workflow_id"), version)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, record)
+}
+
+func writeRunAccepted(w http.ResponseWriter, record contract.RunRecord, replayed bool) {
+	status := http.StatusCreated
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, RunAccepted{
+		RunID: record.RunID, StatusURL: "/v1/runs/" + record.RunID,
+		LogsURL: "/v1/runs/" + record.RunID + "/logs",
+	})
 }
 
 func decodeJSON(r *http.Request, target any) error {

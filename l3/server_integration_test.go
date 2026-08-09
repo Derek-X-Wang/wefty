@@ -46,7 +46,9 @@ func newIntegrationHarness(t *testing.T) *integrationHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{"node-1": {"linux"}}})
+	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{
+		"node-1": {"linux", contract.StableNodeTagPrefix + "node-1"},
+	}})
 	if err != nil {
 		l1Store.Close()
 		t.Fatal(err)
@@ -173,6 +175,26 @@ func inlineRunRequest(content string) CreateRunRequest {
 		Limits:         &contract.RunLimits{MaxRuntimeSeconds: 300, MaxCost: 4.25},
 		EnvelopeSchema: json.RawMessage(`{"type":"object"}`),
 	}
+}
+
+func workflowVersionInput(content string) WorkflowVersionInput {
+	digest := sha256.Sum256([]byte(content))
+	return WorkflowVersionInput{
+		Content: content, SHA256: hex.EncodeToString(digest[:]), Interpreter: []string{"/bin/sh"},
+	}
+}
+
+func (h *integrationHarness) createWorkflowVersion(workflowID, content string) WorkflowVersion {
+	h.t.Helper()
+	status, _, body := h.do(h.caller, http.MethodPost, "/v1/workflows/"+workflowID+"/versions", workflowVersionInput(content), nil)
+	if status != http.StatusCreated {
+		h.t.Fatalf("create workflow version status = %d body=%s", status, body)
+	}
+	var version WorkflowVersion
+	if err := json.Unmarshal(body, &version); err != nil {
+		h.t.Fatal(err)
+	}
+	return version
 }
 
 func (h *integrationHarness) submit(request CreateRunRequest, idempotencyKey string) RunAccepted {
@@ -367,6 +389,165 @@ func TestInlineScriptAndTriggerProvenanceAreImmutable(t *testing.T) {
 	}
 }
 
+func TestSavedWorkflowVersionsAreImmutableAndRunsPinSnapshots(t *testing.T) {
+	h := newIntegrationHarness(t)
+	v1Content := "#!/bin/sh\necho workflow-v1\n"
+	v1 := h.createWorkflowVersion("dogfood", v1Content)
+	if v1.Version != 1 || v1.WorkflowRef != "workflow://dogfood/v1" || v1.Mode != 0o755 {
+		t.Fatalf("workflow v1 = %+v", v1)
+	}
+	status, _, body := h.do(h.caller, http.MethodGet, "/v1/workflows/dogfood/versions/v1", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("get workflow v1 status = %d body=%s", status, body)
+	}
+	var fetched WorkflowVersion
+	if err := json.Unmarshal(body, &fetched); err != nil {
+		t.Fatal(err)
+	}
+	if fetched.Content != v1Content || fetched.SHA256 != v1.SHA256 {
+		t.Fatalf("fetched workflow v1 = %+v", fetched)
+	}
+	if _, err := h.l3Store.db.Exec(`UPDATE workflow_versions SET content=? WHERE workflow_id=? AND version=?`, []byte("changed"), "dogfood", 1); err == nil {
+		t.Fatal("workflow version update succeeded; want immutable trigger rejection")
+	}
+	if _, err := h.l3Store.db.Exec(`DELETE FROM workflow_versions WHERE workflow_id=? AND version=?`, "dogfood", 1); err == nil {
+		t.Fatal("workflow version delete succeeded; want immutable trigger rejection")
+	}
+
+	runRequest := inlineRunRequest("unused")
+	runRequest.InlineScript = nil
+	runRequest.WorkflowRef = "workflow://dogfood"
+	accepted := h.submit(runRequest, "saved-workflow-run-v1")
+
+	v2Content := "#!/bin/sh\necho workflow-v2\n"
+	v2 := h.createWorkflowVersion("dogfood", v2Content)
+	if v2.Version != 2 || v2.WorkflowRef != "workflow://dogfood/v2" {
+		t.Fatalf("workflow v2 = %+v", v2)
+	}
+	record, err := h.l3Store.GetRun(context.Background(), accepted.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Workflow.WorkflowRef != v1.WorkflowRef || record.Workflow.InlineScript != nil {
+		t.Fatalf("run workflow source = %+v, want pinned %q", record.Workflow, v1.WorkflowRef)
+	}
+	var snapContent []byte
+	var snapSHA string
+	if err := h.l3Store.db.QueryRow(`SELECT content, sha256 FROM run_scripts WHERE run_id=?`, accepted.RunID).Scan(&snapContent, &snapSHA); err != nil {
+		t.Fatal(err)
+	}
+	if string(snapContent) != v1Content || snapSHA != v1.SHA256 {
+		t.Fatalf("run snapshot = %q/%q, want v1", snapContent, snapSHA)
+	}
+
+	pinned := runRequest
+	pinned.WorkflowRef = "workflow://dogfood/v1"
+	pinnedRun := h.submit(pinned, "saved-workflow-pinned-v1")
+	pinnedRecord, err := h.l3Store.GetRun(context.Background(), pinnedRun.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pinnedRecord.Workflow.WorkflowRef != v1.WorkflowRef {
+		t.Fatalf("explicitly pinned run ref = %q, want %q", pinnedRecord.Workflow.WorkflowRef, v1.WorkflowRef)
+	}
+}
+
+func TestSavedWorkflowNotFoundAndRerunSnapshotReuse(t *testing.T) {
+	h := newIntegrationHarness(t)
+	status, _, body := h.do(h.caller, http.MethodGet, "/v1/workflows/missing/versions/v1", nil, nil)
+	assertAPIError(t, status, body, http.StatusNotFound, contract.ErrorNotFound)
+
+	missing := inlineRunRequest("unused")
+	missing.InlineScript = nil
+	missing.WorkflowRef = "workflow://missing/v9"
+	status, _, body = h.do(h.caller, http.MethodPost, "/v1/runs", missing, http.Header{"Idempotency-Key": []string{"missing-workflow"}})
+	assertAPIError(t, status, body, http.StatusNotFound, contract.ErrorNotFound)
+
+	v1Content := "#!/bin/sh\necho rerun-v1\n"
+	v1 := h.createWorkflowVersion("rerunnable", v1Content)
+	request := inlineRunRequest("unused")
+	request.InlineScript = nil
+	request.WorkflowRef = "workflow://rerunnable"
+	request.Tags = append(request.Tags, contract.StableNodeTagPrefix+"node-1")
+	source := h.submit(request, "rerun-source")
+	h.createWorkflowVersion("rerunnable", "#!/bin/sh\necho rerun-v2\n")
+
+	status, headers, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+source.RunID+"/rerun", nil, http.Header{"Idempotency-Key": []string{"rerun-copy"}})
+	if status != http.StatusCreated {
+		t.Fatalf("rerun status = %d body=%s", status, body)
+	}
+	var rerun RunAccepted
+	if err := json.Unmarshal(body, &rerun); err != nil {
+		t.Fatal(err)
+	}
+	if rerun.RunID == source.RunID {
+		t.Fatal("rerun returned source run id; want a new run")
+	}
+	record, err := h.l3Store.GetRun(context.Background(), rerun.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Trigger.Type != "rerun" || record.Trigger.SourceRunID != source.RunID || record.Workflow.WorkflowRef != v1.WorkflowRef {
+		t.Fatalf("rerun record = trigger %+v workflow %+v", record.Trigger, record.Workflow)
+	}
+	if !jsonEqual(record.Params, request.Params) {
+		t.Fatalf("rerun params = %s, want %s", record.Params, request.Params)
+	}
+
+	status, replayHeaders, replayBody := h.do(h.caller, http.MethodPost, "/v1/runs/"+source.RunID+"/rerun", nil, http.Header{"Idempotency-Key": []string{"rerun-copy"}})
+	if status != http.StatusOK || replayHeaders.Get("Idempotency-Replayed") != "true" {
+		t.Fatalf("rerun replay status/header = %d/%q body=%s", status, replayHeaders.Get("Idempotency-Replayed"), replayBody)
+	}
+	var replay RunAccepted
+	if err := json.Unmarshal(replayBody, &replay); err != nil {
+		t.Fatal(err)
+	}
+	if replay.RunID != rerun.RunID || headers.Get("Idempotency-Replayed") != "" {
+		t.Fatalf("rerun replay id/header = %q/%q", replay.RunID, headers.Get("Idempotency-Replayed"))
+	}
+
+	reconciler, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	agent := h.agent()
+	for i := 0; i < 2; i++ {
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"}, nil)
+		if status != http.StatusOK {
+			t.Fatalf("claim %d status = %d body=%s", i, status, body)
+		}
+		var claim l1.Claim
+		if err := json.Unmarshal(body, &claim); err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(claim.Job.Spec.Execution.Executable.InlineBase64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(decoded) != v1Content || claim.Job.Spec.Execution.Executable.SHA256 != v1.SHA256 {
+			t.Fatalf("claim %d snapshot = %q/%q, want v1", i, decoded, claim.Job.Spec.Execution.Executable.SHA256)
+		}
+		if claim.Job.Spec.Execution.HandoffDirectory != filepath.Join(DefaultHandoffRoot, source.RunID) {
+			t.Fatalf("claim %d handoff directory = %q, want source-run directory", i, claim.Job.Spec.Execution.HandoffDirectory)
+		}
+		if claim.Job.Spec.Labels["run_id"] == rerun.RunID && claim.Job.Spec.Labels["handoff_owner_run_id"] != source.RunID {
+			t.Fatalf("rerun handoff owner label = %#v", claim.Job.Spec.Labels)
+		}
+	}
+}
+
+func TestRerunWithoutStableNodePinFailsExplicitly(t *testing.T) {
+	h := newIntegrationHarness(t)
+	source := h.submit(inlineRunRequest("#!/bin/sh\necho unpinned\n"), "rerun-unpinned-source")
+	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+source.RunID+"/rerun", nil, http.Header{
+		"Idempotency-Key": []string{"rerun-unpinned"},
+	})
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+}
+
 func TestParentRunRecordsChainProvenance(t *testing.T) {
 	h := newIntegrationHarness(t)
 	parent := h.submit(inlineRunRequest("#!/bin/sh\necho parent\n"), "parent-run")
@@ -468,10 +649,10 @@ func TestRunSubmissionValidationAndIdempotency(t *testing.T) {
 	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
 
 	refOnly := request
-	refOnly.WorkflowRef = "workflow/example@v1"
+	refOnly.WorkflowRef = "workflow://example/v1"
 	refOnly.InlineScript = nil
 	status, _, body = h.do(h.caller, http.MethodPost, "/v1/runs", refOnly, http.Header{"Idempotency-Key": []string{"run-ref"}})
-	assertAPIError(t, status, body, http.StatusNotImplemented, contract.ErrorNotImplemented)
+	assertAPIError(t, status, body, http.StatusNotFound, contract.ErrorNotFound)
 
 	badHash := request
 	badScript := *request.InlineScript

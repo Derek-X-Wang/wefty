@@ -39,6 +39,26 @@ type InlineScriptInput struct {
 	Mode        *uint32  `json:"mode,omitempty"`
 }
 
+// WorkflowVersionInput is the executable snapshot accepted when appending a
+// saved workflow version. Versions are assigned monotonically by the ledger.
+type WorkflowVersionInput struct {
+	Content     string   `json:"content"`
+	SHA256      string   `json:"sha256"`
+	Interpreter []string `json:"interpreter,omitempty"`
+	Mode        *uint32  `json:"mode,omitempty"`
+}
+
+type WorkflowVersion struct {
+	WorkflowID  string    `json:"workflow_id"`
+	Version     int       `json:"version"`
+	WorkflowRef string    `json:"workflow_ref"`
+	Content     string    `json:"content"`
+	SHA256      string    `json:"sha256"`
+	Interpreter []string  `json:"interpreter"`
+	Mode        uint32    `json:"mode"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type CreateRunRequest struct {
 	WorkflowRef      string              `json:"workflow_ref,omitempty"`
 	InlineScript     *InlineScriptInput  `json:"inline_script,omitempty"`
@@ -54,6 +74,12 @@ type CreateRunInput struct {
 	IdempotencyKey string
 	Actor          string
 	Request        CreateRunRequest
+}
+
+type CreateRerunInput struct {
+	IdempotencyKey string
+	Actor          string
+	SourceRunID    string
 }
 
 type RunAccepted struct {

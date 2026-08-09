@@ -43,7 +43,7 @@ func (m *handoffManager) prepare(spec contract.JobSpec, nodeID string) error {
 	if err := ensurePrivateDirectory(path); err != nil {
 		return err
 	}
-	runID := strings.TrimSpace(spec.Labels["run_id"])
+	runID := handoffOwnerRunID(spec)
 	if runID == "" || !m.manages(path, runID) {
 		return nil
 	}
@@ -80,7 +80,7 @@ func (m *handoffManager) prepare(spec contract.JobSpec, nodeID string) error {
 
 func (m *handoffManager) finish(spec contract.JobSpec, nodeID string, succeeded bool) error {
 	path := filepath.Clean(spec.Execution.HandoffDirectory)
-	runID := strings.TrimSpace(spec.Labels["run_id"])
+	runID := handoffOwnerRunID(spec)
 	if runID == "" || !m.manages(path, runID) {
 		return nil
 	}
@@ -129,6 +129,13 @@ func (m *handoffManager) cleanupExpired(except string) error {
 
 func (m *handoffManager) manages(path, runID string) bool {
 	return path == filepath.Join(m.root, runID)
+}
+
+func handoffOwnerRunID(spec contract.JobSpec) string {
+	if owner := strings.TrimSpace(spec.Labels["handoff_owner_run_id"]); owner != "" {
+		return owner
+	}
+	return strings.TrimSpace(spec.Labels["run_id"])
 }
 
 func ensurePrivateDirectory(path string) error {
