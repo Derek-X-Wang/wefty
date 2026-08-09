@@ -216,8 +216,8 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	if registration.NodeID == "" || registration.BootSessionID == "" || registration.OS == "" || registration.Architecture == "" || registration.AgentVersion == "" {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "node registration fields must be non-empty")
 	}
-	if identity.NodeID == "" || identity.NodeID != registration.NodeID {
-		return Node{}, protocolError(contract.ErrorForbidden, "authenticated node %q cannot register node %q", identity.NodeID, registration.NodeID)
+	if identity.NodeID == "" {
+		return Node{}, protocolError(contract.ErrorForbidden, "authenticated Fabric identity has no node ID")
 	}
 	tags := NormalizeTags(authoritativeTags)
 	for _, tag := range tags {
@@ -235,21 +235,28 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 		return Node{}, internalError(err, "begin node registration")
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 INSERT INTO nodes(node_id, identity_node_id, boot_session_id, os, architecture, agent_version, capabilities_json, state, last_heartbeat_ns)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(node_id) DO UPDATE SET
-  identity_node_id=excluded.identity_node_id,
   boot_session_id=excluded.boot_session_id,
   os=excluded.os,
   architecture=excluded.architecture,
   agent_version=excluded.agent_version,
   capabilities_json=excluded.capabilities_json,
   state=excluded.state,
-  last_heartbeat_ns=excluded.last_heartbeat_ns`, registration.NodeID, identity.NodeID, registration.BootSessionID,
+	last_heartbeat_ns=excluded.last_heartbeat_ns
+WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, identity.NodeID, registration.BootSessionID,
 		registration.OS, registration.Architecture, registration.AgentVersion, capabilities, contract.NodeAlive, now.UnixNano())
 	if err != nil {
 		return Node{}, internalError(err, "store node registration")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return Node{}, internalError(err, "read node registration result")
+	}
+	if changed == 0 {
+		return Node{}, protocolError(contract.ErrorForbidden, "stable node %q is bound to another Fabric identity", registration.NodeID)
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM node_tags WHERE node_id = ?", registration.NodeID); err != nil {
 		return Node{}, internalError(err, "replace node tags")
