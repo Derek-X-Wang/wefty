@@ -2,7 +2,6 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -262,33 +261,21 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 	if a.outputSinkFactory != nil {
 		sink = a.outputSinkFactory(claim)
 	}
-	sink = redactOutputSink(sink, claim.Job.Spec.Execution.SensitiveEnv)
-	return a.runner.Run(ctx, processrunner.Request{
+	redactingSink := newRedactingOutputSink(sink, claim.Job.Spec.Execution.SensitiveEnv)
+	if redactingSink != nil {
+		sink = redactingSink
+	}
+	result, runErr := a.runner.Run(ctx, processrunner.Request{
 		AttemptID: claim.Lease.AttemptID,
 		Execution: execution,
 		Limits:    claim.Job.Spec.Limits,
 	}, sink)
-}
-
-func redactOutputSink(sink processrunner.OutputSink, sensitive map[string]string) processrunner.OutputSink {
-	if sink == nil || len(sensitive) == 0 {
-		return sink
-	}
-	secrets := make([][]byte, 0, len(sensitive))
-	for _, value := range sensitive {
-		if value != "" {
-			secrets = append(secrets, []byte(value))
+	if redactingSink != nil {
+		if flushErr := redactingSink.Flush(ctx); flushErr != nil {
+			return result, errors.Join(runErr, fmt.Errorf("flush redacted output: %w", flushErr))
 		}
 	}
-	if len(secrets) == 0 {
-		return sink
-	}
-	return processrunner.OutputSinkFunc(func(ctx context.Context, event contract.LogEvent) error {
-		for _, secret := range secrets {
-			event.Bytes = bytes.ReplaceAll(event.Bytes, secret, []byte("[REDACTED]"))
-		}
-		return sink.WriteOutput(ctx, event)
-	})
+	return result, runErr
 }
 
 func (a *Agent) renewalLoop(ctx context.Context, claim l1.Claim, failures chan<- error) {

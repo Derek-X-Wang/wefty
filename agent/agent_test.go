@@ -203,7 +203,16 @@ func (emittingRunner) Run(ctx context.Context, request processrunner.Request, si
 	if err := sink.WriteOutput(ctx, contract.LogEvent{
 		AttemptID: request.AttemptID,
 		Stream:    contract.LogStdout,
-		Bytes:     []byte("before wrun_log_secret after"),
+		Sequence:  0,
+		Bytes:     []byte("before wrun_log_"),
+	}); err != nil {
+		return contract.ProcessResult{}, err
+	}
+	if err := sink.WriteOutput(ctx, contract.LogEvent{
+		AttemptID: request.AttemptID,
+		Stream:    contract.LogStdout,
+		Sequence:  1,
+		Bytes:     []byte("secret after"),
 	}); err != nil {
 		return contract.ProcessResult{}, err
 	}
