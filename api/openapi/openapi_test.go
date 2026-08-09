@@ -141,6 +141,30 @@ func TestL1RouteGroupsUseFabricIdentity(t *testing.T) {
 	}
 }
 
+func TestL3SavedWorkflowAndRerunRoutesArePublished(t *testing.T) {
+	t.Parallel()
+
+	doc := readObject(t, "l3.v1.json")
+	paths := object(t, doc["paths"], "paths")
+	for _, path := range []string{
+		"/v1/workflows/{workflow_id}/versions",
+		"/v1/workflows/{workflow_id}/versions/{version}",
+		"/v1/runs/{run_id}/rerun",
+	} {
+		if _, ok := paths[path]; !ok {
+			t.Errorf("missing saved-workflow route %s", path)
+		}
+	}
+
+	components := object(t, doc["components"], "components")
+	schemas := object(t, components["schemas"], "components.schemas")
+	for _, schema := range []string{"WorkflowVersionInput", "WorkflowVersion"} {
+		if _, ok := schemas[schema]; !ok {
+			t.Errorf("missing saved-workflow schema %s", schema)
+		}
+	}
+}
+
 func TestAllOpenAPIFilesAreJSON(t *testing.T) {
 	t.Parallel()
 
