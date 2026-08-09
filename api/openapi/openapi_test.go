@@ -109,6 +109,10 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 			t.Errorf("LogEvent missing required field %q", field)
 		}
 	}
+	processResult := object(t, schemas["ProcessResult"], "ProcessResult")
+	if len(processResult["oneOf"].([]any)) != 3 {
+		t.Fatal("ProcessResult must distinguish spawn error, exit code, and signal death")
+	}
 
 	nodeRegistration := object(t, schemas["NodeRegistration"], "NodeRegistration")
 	properties := object(t, nodeRegistration["properties"], "NodeRegistration.properties")
