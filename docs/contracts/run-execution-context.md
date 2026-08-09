@@ -7,8 +7,8 @@ aliases or depend on additional variables.
 | Variable | Visibility | Value |
 | --- | --- | --- |
 | `WEFTY_RUN_ID` | public | The L3 run ID. |
-| `WEFTY_L3_ENDPOINT` | public | The Fabric address of the L3 run ledger. |
-| `WEFTY_L1_ENDPOINT` | public | The Fabric address of the L1 control plane. |
+| `WEFTY_L3_ENDPOINT` | public | A job-local HTTP base URL for the L3 run ledger. |
+| `WEFTY_L1_ENDPOINT` | public | A job-local HTTP base URL for the L1 client read surface. |
 | `WEFTY_RUN_TOKEN` | sensitive | The opaque, attempt-bound credential for in-run L3 calls. |
 | `WEFTY_HANDOFF_DIR` | public | The run's node-local handoff directory. |
 
@@ -19,13 +19,21 @@ The node agent also replaces sensitive values with `[REDACTED]` before sending
 captured stdout or stderr to a log sink. Workflows must still avoid printing
 credentials intentionally.
 
+The node agent replaces internal `wefty://` service addresses with per-attempt
+`http://127.0.0.1` bridge URLs before starting the workflow process. The bridge
+is torn down with the attempt and forwards L3 calls through the agent's
+authenticated Fabric connection. Its L1 side exposes only client-protocol job
+status and log reads; claim, lease, log-ingest, and completion routes remain
+agent-internal. The bridge is transport only: callers must still send the run
+token, and no Fabric tag privilege is projected into the workflow process.
+
 ## Run-token authentication and scope
 
-In-run HTTP calls use `Authorization: Bearer <WEFTY_RUN_TOKEN>` over an
-authenticated Fabric connection. Fabric identity establishes the network
-peer; the run token supplies run authorization. A token never grants an L1
-client or agent principal, and Fabric identity alone never grants in-run write
-authority.
+In-run HTTP calls use `Authorization: Bearer <WEFTY_RUN_TOKEN>` against
+`WEFTY_L3_ENDPOINT`. The loopback bridge supplies the authenticated Fabric
+connection; the run token supplies run authorization. A token never grants an
+L1 client or agent principal, and Fabric identity alone never grants in-run
+write authority.
 
 A token is minted once when L3 first dispatches its run and is bound in the
 ledger to that run and dispatch attempt. L3 stores the SHA-256 token digest for
