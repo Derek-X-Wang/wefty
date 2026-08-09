@@ -100,6 +100,32 @@ type TriggerProvenance struct {
 	CreatedAt   time.Time       `json:"created_at"`
 }
 
+// ProtocolRejection is the immutable audit record for a rejected in-run
+// envelope or gate write. Rejected payloads never enter the accepted
+// envelope/gate tables, but remain explainable after the run fails.
+type ProtocolRejection struct {
+	RejectionID    string          `json:"rejection_id"`
+	RunID          string          `json:"run_id"`
+	Kind           string          `json:"kind"`
+	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	Body           json.RawMessage `json:"body"`
+	Reason         string          `json:"reason"`
+	CreatedAt      time.Time       `json:"created_at"`
+}
+
+type LineageEntry struct {
+	RunID       string            `json:"run_id"`
+	ParentRunID string            `json:"parent_run_id,omitempty"`
+	Status      contract.RunState `json:"status"`
+	Depth       int               `json:"depth"`
+}
+
+type RunLineage struct {
+	RunID       string         `json:"run_id"`
+	Ancestors   []LineageEntry `json:"ancestors"`
+	Descendants []LineageEntry `json:"descendants"`
+}
+
 type StoreOptions struct {
 	Clock         Clock
 	RunTokenGrace time.Duration

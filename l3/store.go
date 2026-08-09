@@ -158,6 +158,50 @@ CREATE TABLE IF NOT EXISTS run_tokens (
   minted_ns INTEGER NOT NULL,
   expires_ns INTEGER
 );
+CREATE TABLE IF NOT EXISTS envelopes (
+  envelope_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  idempotency_key TEXT NOT NULL,
+  body_hash TEXT NOT NULL,
+  body_json BLOB NOT NULL,
+  accepted_ns INTEGER NOT NULL,
+  UNIQUE(run_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS envelopes_by_run ON envelopes(run_id, accepted_ns, envelope_id);
+CREATE TRIGGER IF NOT EXISTS envelopes_no_update
+BEFORE UPDATE ON envelopes BEGIN SELECT RAISE(ABORT, 'envelopes are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS envelopes_no_delete
+BEFORE DELETE ON envelopes BEGIN SELECT RAISE(ABORT, 'envelopes are append-only'); END;
+CREATE TABLE IF NOT EXISTS gate_results (
+  gate_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  idempotency_key TEXT NOT NULL,
+  body_hash TEXT NOT NULL,
+  body_json BLOB NOT NULL,
+  accepted_ns INTEGER NOT NULL,
+  UNIQUE(run_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS gates_by_run ON gate_results(run_id, accepted_ns, gate_id);
+CREATE TRIGGER IF NOT EXISTS gate_results_no_update
+BEFORE UPDATE ON gate_results BEGIN SELECT RAISE(ABORT, 'gate results are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS gate_results_no_delete
+BEFORE DELETE ON gate_results BEGIN SELECT RAISE(ABORT, 'gate results are append-only'); END;
+CREATE TABLE IF NOT EXISTS protocol_rejections (
+  rejection_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+  kind TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  body_hash TEXT NOT NULL,
+  body_json BLOB NOT NULL,
+  reason TEXT NOT NULL,
+  created_ns INTEGER NOT NULL,
+  UNIQUE(run_id, kind, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS protocol_rejections_by_run ON protocol_rejections(run_id, created_ns, rejection_id);
+CREATE TRIGGER IF NOT EXISTS protocol_rejections_no_update
+BEFORE UPDATE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejections are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS protocol_rejections_no_delete
+BEFORE DELETE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejections are append-only'); END;
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l3: apply SQLite schema: %w", err)
@@ -623,6 +667,9 @@ func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, e
 		if err != nil {
 			return input, "", 0, err
 		}
+		if _, err := contract.CompileRestrictedSchema(request.EnvelopeSchema); err != nil {
+			return input, "", 0, protocolError(contract.ErrorInvalidRequest, "envelope_schema is not in the restricted dialect: %v", err)
+		}
 	}
 	request.Tags, err = normalizeTags(request.Tags)
 	if err != nil {
@@ -763,6 +810,14 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &record.DispatchKey, &rec
 		finished := time.Unix(0, finishedNS.Int64).UTC()
 		record.FinishedAt = &finished
 	}
+	record.Envelopes, err = s.ListEnvelopes(ctx, runID)
+	if err != nil {
+		return contract.RunRecord{}, err
+	}
+	record.Gates, err = s.ListGateResults(ctx, runID)
+	if err != nil {
+		return contract.RunRecord{}, err
+	}
 	return record, nil
 }
 
@@ -785,6 +840,351 @@ func (s *Store) GetTrigger(ctx context.Context, runID string) (TriggerProvenance
 	return provenance, nil
 }
 
+func (s *Store) GetLineage(ctx context.Context, runID string) (RunLineage, error) {
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM runs WHERE run_id=?`, runID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		return RunLineage{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
+	} else if err != nil {
+		return RunLineage{}, internalError(err, "read lineage target")
+	}
+	lineage := RunLineage{RunID: runID, Ancestors: []LineageEntry{}, Descendants: []LineageEntry{}}
+	ancestors, err := s.db.QueryContext(ctx, `
+WITH RECURSIVE ancestors(run_id, parent_run_id, status, depth) AS (
+  SELECT run_id, parent_run_id, status, 0 FROM runs WHERE run_id=?
+  UNION ALL
+  SELECT r.run_id, r.parent_run_id, r.status, a.depth + 1
+  FROM runs r JOIN ancestors a ON a.parent_run_id=r.run_id
+)
+SELECT run_id, COALESCE(parent_run_id, ''), status, depth
+FROM ancestors WHERE depth > 0 ORDER BY depth DESC, run_id`, runID)
+	if err != nil {
+		return RunLineage{}, internalError(err, "list run ancestors")
+	}
+	for ancestors.Next() {
+		var entry LineageEntry
+		if err := ancestors.Scan(&entry.RunID, &entry.ParentRunID, &entry.Status, &entry.Depth); err != nil {
+			ancestors.Close()
+			return RunLineage{}, internalError(err, "scan run ancestor")
+		}
+		lineage.Ancestors = append(lineage.Ancestors, entry)
+	}
+	if err := ancestors.Err(); err != nil {
+		ancestors.Close()
+		return RunLineage{}, internalError(err, "iterate run ancestors")
+	}
+	ancestors.Close()
+
+	descendants, err := s.db.QueryContext(ctx, `
+WITH RECURSIVE descendants(run_id, parent_run_id, status, depth) AS (
+  SELECT run_id, parent_run_id, status, 0 FROM runs WHERE run_id=?
+  UNION ALL
+  SELECT r.run_id, r.parent_run_id, r.status, d.depth + 1
+  FROM runs r JOIN descendants d ON r.parent_run_id=d.run_id
+)
+SELECT run_id, COALESCE(parent_run_id, ''), status, depth
+FROM descendants WHERE depth > 0 ORDER BY depth, run_id`, runID)
+	if err != nil {
+		return RunLineage{}, internalError(err, "list run descendants")
+	}
+	defer descendants.Close()
+	for descendants.Next() {
+		var entry LineageEntry
+		if err := descendants.Scan(&entry.RunID, &entry.ParentRunID, &entry.Status, &entry.Depth); err != nil {
+			return RunLineage{}, internalError(err, "scan run descendant")
+		}
+		lineage.Descendants = append(lineage.Descendants, entry)
+	}
+	if err := descendants.Err(); err != nil {
+		return RunLineage{}, internalError(err, "iterate run descendants")
+	}
+	return lineage, nil
+}
+
+// AppendEnvelope validates and appends an envelope for the token's own run.
+// Invalid protocol payloads are stored as rejections and fail the run before
+// the validation error is returned to the caller.
+func (s *Store) AppendEnvelope(ctx context.Context, scope RunTokenScope, raw json.RawMessage) (contract.Envelope, bool, error) {
+	canonical, hash, err := canonicalProtocolBody(raw)
+	if err != nil {
+		return contract.Envelope{}, false, err
+	}
+	var envelope contract.Envelope
+	validationErr := contract.ValidateEnvelopeJSON(canonical)
+	if validationErr == nil {
+		validationErr = json.Unmarshal(canonical, &envelope)
+	}
+	if validationErr == nil && envelope.RunID != scope.RunID {
+		validationErr = fmt.Errorf("run_id must match the authenticated run")
+	}
+	if validationErr == nil && envelope.AttemptID != scope.AttemptID {
+		validationErr = fmt.Errorf("attempt_id must match the authenticated run attempt")
+	}
+	if validationErr == nil {
+		var callerSchema []byte
+		err := s.db.QueryRowContext(ctx, `SELECT envelope_schema_json FROM runs WHERE run_id=?`, scope.RunID).Scan(&callerSchema)
+		if errors.Is(err, sql.ErrNoRows) {
+			return contract.Envelope{}, false, protocolError(contract.ErrorNotFound, "run %q was not found", scope.RunID)
+		}
+		if err != nil {
+			return contract.Envelope{}, false, internalError(err, "read caller envelope schema")
+		}
+		if len(callerSchema) > 0 {
+			compiled, err := contract.CompileRestrictedSchema(callerSchema)
+			if err != nil {
+				return contract.Envelope{}, false, internalError(err, "compile stored envelope schema")
+			}
+			validationErr = contract.ValidateRestrictedSchemaJSON(compiled, canonical)
+		}
+	}
+	if validationErr != nil {
+		reason := "envelope validation failed: " + validationErr.Error()
+		if err := s.rejectProtocolWrite(ctx, scope.RunID, "envelope", protocolIdempotencyKey(canonical, hash), canonical, hash, reason); err != nil {
+			return contract.Envelope{}, false, err
+		}
+		return contract.Envelope{}, false, protocolError(contract.ErrorInvalidRequest, "%s", reason)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return contract.Envelope{}, false, internalError(err, "begin envelope append")
+	}
+	defer tx.Rollback()
+	var existingHash string
+	var existingBody []byte
+	err = tx.QueryRowContext(ctx, `SELECT body_hash, body_json FROM envelopes WHERE run_id=? AND idempotency_key=?`, scope.RunID, envelope.IdempotencyKey).Scan(&existingHash, &existingBody)
+	if err == nil {
+		if existingHash != hash {
+			return contract.Envelope{}, false, protocolError(contract.ErrorIdempotencyConflict, "envelope idempotency key %q was already used with a different body", envelope.IdempotencyKey)
+		}
+		if err := json.Unmarshal(existingBody, &envelope); err != nil {
+			return contract.Envelope{}, false, internalError(err, "decode replayed envelope")
+		}
+		return envelope, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return contract.Envelope{}, false, internalError(err, "read envelope idempotency key")
+	}
+	var existingRunID string
+	if err := tx.QueryRowContext(ctx, `SELECT run_id FROM envelopes WHERE envelope_id=?`, envelope.EnvelopeID).Scan(&existingRunID); err == nil {
+		return contract.Envelope{}, false, protocolError(contract.ErrorIdempotencyConflict, "envelope_id %q already exists", envelope.EnvelopeID)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return contract.Envelope{}, false, internalError(err, "read envelope id")
+	}
+	now := canonicalTime(s.clock.Now())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO envelopes(envelope_id, run_id, idempotency_key, body_hash, body_json, accepted_ns) VALUES(?, ?, ?, ?, ?, ?)`,
+		envelope.EnvelopeID, scope.RunID, envelope.IdempotencyKey, hash, []byte(canonical), now.UnixNano()); err != nil {
+		return contract.Envelope{}, false, internalError(err, "append envelope")
+	}
+	if err := tx.Commit(); err != nil {
+		return contract.Envelope{}, false, internalError(err, "commit envelope append")
+	}
+	return envelope, false, nil
+}
+
+// AppendGateResult validates and appends a workflow-evaluated gate result.
+// A fail/error gate is an authoritative protocol failure for the run.
+func (s *Store) AppendGateResult(ctx context.Context, scope RunTokenScope, raw json.RawMessage) (contract.GateResult, bool, error) {
+	canonical, hash, err := canonicalProtocolBody(raw)
+	if err != nil {
+		return contract.GateResult{}, false, err
+	}
+	var gate contract.GateResult
+	validationErr := contract.ValidateGateResultJSON(canonical)
+	if validationErr == nil {
+		validationErr = json.Unmarshal(canonical, &gate)
+	}
+	if validationErr == nil && gate.RunID != scope.RunID {
+		validationErr = fmt.Errorf("run_id must match the authenticated run")
+	}
+	if validationErr == nil && gate.AttemptID != scope.AttemptID {
+		validationErr = fmt.Errorf("attempt_id must match the authenticated run attempt")
+	}
+	if validationErr != nil {
+		reason := "gate result validation failed: " + validationErr.Error()
+		if err := s.rejectProtocolWrite(ctx, scope.RunID, "gate", protocolIdempotencyKey(canonical, hash), canonical, hash, reason); err != nil {
+			return contract.GateResult{}, false, err
+		}
+		return contract.GateResult{}, false, protocolError(contract.ErrorInvalidRequest, "%s", reason)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return contract.GateResult{}, false, internalError(err, "begin gate result append")
+	}
+	defer tx.Rollback()
+	var existingHash string
+	var existingBody []byte
+	err = tx.QueryRowContext(ctx, `SELECT body_hash, body_json FROM gate_results WHERE run_id=? AND idempotency_key=?`, scope.RunID, gate.IdempotencyKey).Scan(&existingHash, &existingBody)
+	if err == nil {
+		if existingHash != hash {
+			return contract.GateResult{}, false, protocolError(contract.ErrorIdempotencyConflict, "gate idempotency key %q was already used with a different body", gate.IdempotencyKey)
+		}
+		if err := json.Unmarshal(existingBody, &gate); err != nil {
+			return contract.GateResult{}, false, internalError(err, "decode replayed gate result")
+		}
+		return gate, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return contract.GateResult{}, false, internalError(err, "read gate idempotency key")
+	}
+	var existingRunID string
+	if err := tx.QueryRowContext(ctx, `SELECT run_id FROM gate_results WHERE gate_id=?`, gate.GateID).Scan(&existingRunID); err == nil {
+		return contract.GateResult{}, false, protocolError(contract.ErrorIdempotencyConflict, "gate_id %q already exists", gate.GateID)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return contract.GateResult{}, false, internalError(err, "read gate id")
+	}
+	now := canonicalTime(s.clock.Now())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO gate_results(gate_id, run_id, idempotency_key, body_hash, body_json, accepted_ns) VALUES(?, ?, ?, ?, ?, ?)`,
+		gate.GateID, scope.RunID, gate.IdempotencyKey, hash, []byte(canonical), now.UnixNano()); err != nil {
+		return contract.GateResult{}, false, internalError(err, "append gate result")
+	}
+	if gate.Outcome == contract.GateFail || gate.Outcome == contract.GateError {
+		if err := failRunTx(ctx, tx, scope.RunID, now, s.tokenGrace); err != nil {
+			return contract.GateResult{}, false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return contract.GateResult{}, false, internalError(err, "commit gate result append")
+	}
+	return gate, false, nil
+}
+
+func (s *Store) ListEnvelopes(ctx context.Context, runID string) ([]contract.Envelope, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT body_json FROM envelopes WHERE run_id=? ORDER BY accepted_ns, envelope_id`, runID)
+	if err != nil {
+		return nil, internalError(err, "list envelopes")
+	}
+	defer rows.Close()
+	var values []contract.Envelope
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, internalError(err, "scan envelope")
+		}
+		var value contract.Envelope
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, internalError(err, "decode envelope")
+		}
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate envelopes")
+	}
+	return values, nil
+}
+
+func (s *Store) ListGateResults(ctx context.Context, runID string) ([]contract.GateResult, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT body_json FROM gate_results WHERE run_id=? ORDER BY accepted_ns, gate_id`, runID)
+	if err != nil {
+		return nil, internalError(err, "list gate results")
+	}
+	defer rows.Close()
+	var values []contract.GateResult
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, internalError(err, "scan gate result")
+		}
+		var value contract.GateResult
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, internalError(err, "decode gate result")
+		}
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate gate results")
+	}
+	return values, nil
+}
+
+func (s *Store) ListProtocolRejections(ctx context.Context, runID string) ([]ProtocolRejection, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT rejection_id, run_id, kind, idempotency_key, body_json, reason, created_ns FROM protocol_rejections WHERE run_id=? ORDER BY created_ns, rejection_id`, runID)
+	if err != nil {
+		return nil, internalError(err, "list protocol rejections")
+	}
+	defer rows.Close()
+	var values []ProtocolRejection
+	for rows.Next() {
+		var value ProtocolRejection
+		var body []byte
+		var createdNS int64
+		if err := rows.Scan(&value.RejectionID, &value.RunID, &value.Kind, &value.IdempotencyKey, &body, &value.Reason, &createdNS); err != nil {
+			return nil, internalError(err, "scan protocol rejection")
+		}
+		value.Body = append(json.RawMessage(nil), body...)
+		value.CreatedAt = time.Unix(0, createdNS).UTC()
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate protocol rejections")
+	}
+	return values, nil
+}
+
+func canonicalProtocolBody(raw json.RawMessage) (json.RawMessage, string, error) {
+	var value any
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return nil, "", protocolError(contract.ErrorInvalidRequest, "invalid protocol JSON: %v", err)
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return nil, "", internalError(err, "canonicalize protocol JSON")
+	}
+	digest := sha256.Sum256(canonical)
+	return canonical, hex.EncodeToString(digest[:]), nil
+}
+
+func protocolIdempotencyKey(raw json.RawMessage, hash string) string {
+	var identity struct {
+		IdempotencyKey string `json:"idempotency_key"`
+	}
+	if json.Unmarshal(raw, &identity) == nil && strings.TrimSpace(identity.IdempotencyKey) != "" {
+		return identity.IdempotencyKey
+	}
+	return "body:" + hash
+}
+
+func (s *Store) rejectProtocolWrite(ctx context.Context, runID, kind, idempotencyKey string, body json.RawMessage, hash, reason string) error {
+	now := canonicalTime(s.clock.Now())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin protocol rejection")
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO protocol_rejections(rejection_id, run_id, kind, idempotency_key, body_hash, body_json, reason, created_ns) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		newID("reject"), runID, kind, idempotencyKey, hash, []byte(body), reason, now.UnixNano()); err != nil {
+		return internalError(err, "store protocol rejection")
+	}
+	if err := failRunTx(ctx, tx, runID, now, s.tokenGrace); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return internalError(err, "commit protocol rejection")
+	}
+	return nil
+}
+
+func failRunTx(ctx context.Context, tx *sql.Tx, runID string, now time.Time, tokenGrace time.Duration) error {
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, updated_ns=?, started_ns=COALESCE(started_ns, ?), finished_ns=COALESCE(finished_ns, ?) WHERE run_id=? AND status NOT IN (?, ?)`,
+		contract.RunFailed, now.UnixNano(), now.UnixNano(), now.UnixNano(), runID, contract.RunSucceeded, contract.RunFailed)
+	if err != nil {
+		return internalError(err, "fail run protocol")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "read protocol failure result")
+	}
+	if changed == 1 {
+		expires := canonicalTime(now.Add(tokenGrace))
+		if _, err := tx.ExecContext(ctx, `UPDATE run_tokens SET expires_ns=COALESCE(expires_ns, ?) WHERE run_id=?`, expires.UnixNano(), runID); err != nil {
+			return internalError(err, "expire protocol-failed run token")
+		}
+	}
+	return nil
+}
+
 type dispatchIntent struct {
 	RunID          string
 	DispatchKey    string
@@ -805,7 +1205,7 @@ SELECT r.run_id, r.dispatch_key, COALESCE(r.parent_run_id, ''),
        s.content, s.sha256, s.interpreter_json, s.mode, r.tags_json, r.limits_json
 FROM dispatch_outbox o JOIN runs r ON r.run_id=o.run_id JOIN run_scripts s ON s.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
-WHERE o.dispatched_ns IS NULL ORDER BY r.created_ns, r.run_id`)
+WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?) ORDER BY r.created_ns, r.run_id`, contract.RunPending, contract.RunDispatching)
 	if err != nil {
 		return nil, internalError(err, "list pending dispatches")
 	}
@@ -893,7 +1293,16 @@ type projectedRun struct {
 }
 
 func (s *Store) activeProjectedRuns(ctx context.Context) ([]projectedRun, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT run_id, l1_job_id, status, required_envelope FROM runs WHERE l1_job_id IS NOT NULL AND status NOT IN (?, ?) ORDER BY created_ns, run_id`, contract.RunSucceeded, contract.RunFailed)
+	rows, err := s.db.QueryContext(ctx, `
+WITH RECURSIVE run_depth(run_id, depth) AS (
+  SELECT run_id, 0 FROM runs WHERE parent_run_id IS NULL
+  UNION ALL
+  SELECT r.run_id, d.depth + 1 FROM runs r JOIN run_depth d ON r.parent_run_id=d.run_id
+)
+SELECT r.run_id, r.l1_job_id, r.status, r.required_envelope
+FROM runs r JOIN run_depth d ON d.run_id=r.run_id
+WHERE r.l1_job_id IS NOT NULL AND r.status NOT IN (?, ?)
+ORDER BY d.depth DESC, r.created_ns, r.run_id`, contract.RunSucceeded, contract.RunFailed)
 	if err != nil {
 		return nil, internalError(err, "list runs for projection")
 	}
@@ -917,19 +1326,42 @@ func (s *Store) projectJobState(ctx context.Context, run projectedRun, jobState 
 	if err != nil || !change {
 		return err
 	}
-	if jobState == contract.JobSucceeded && run.RequiredEnvelope {
-		// Envelope writes land in a later M2 slice. Until one exists, the M0
-		// protocol rule deterministically fails a required-envelope run.
-		target = contract.RunFailed
-	}
 	now := canonicalTime(s.clock.Now())
-	started := target == contract.RunRunning || target == contract.RunAwaitingInput || target == contract.RunSucceeded || target == contract.RunFailed
-	finished := target == contract.RunSucceeded || target == contract.RunFailed
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return internalError(err, "begin run projection")
 	}
 	defer tx.Rollback()
+	if jobState == contract.JobSucceeded {
+		var acceptedEnvelopes, rejectedWrites, failedGates, activeChildren, failedChildren int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM envelopes WHERE run_id=?`, run.RunID).Scan(&acceptedEnvelopes); err != nil {
+			return internalError(err, "count accepted envelopes")
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM protocol_rejections WHERE run_id=?`, run.RunID).Scan(&rejectedWrites); err != nil {
+			return internalError(err, "count protocol rejections")
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM gate_results WHERE run_id=? AND json_extract(body_json, '$.outcome') IN ('fail', 'error')`, run.RunID).Scan(&failedGates); err != nil {
+			return internalError(err, "count failed gates")
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE parent_run_id=? AND status NOT IN (?, ?)`, run.RunID, contract.RunSucceeded, contract.RunFailed).Scan(&activeChildren); err != nil {
+			return internalError(err, "count active child runs")
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE parent_run_id=? AND status=?`, run.RunID, contract.RunFailed).Scan(&failedChildren); err != nil {
+			return internalError(err, "count failed child runs")
+		}
+		if rejectedWrites > 0 || failedGates > 0 || failedChildren > 0 || (run.RequiredEnvelope && acceptedEnvelopes == 0) {
+			target = contract.RunFailed
+		} else if activeChildren > 0 {
+			// The parent process has exited successfully, but its run remains
+			// non-terminal until every child lineage settles.
+			target = contract.RunRunning
+			if run.State == target {
+				return nil
+			}
+		}
+	}
+	started := target == contract.RunRunning || target == contract.RunAwaitingInput || target == contract.RunSucceeded || target == contract.RunFailed
+	finished := target == contract.RunSucceeded || target == contract.RunFailed
 	result, err := tx.ExecContext(ctx, `
 UPDATE runs SET status=?, updated_ns=?,
   started_ns=CASE WHEN ? THEN COALESCE(started_ns, ?) ELSE started_ns END,

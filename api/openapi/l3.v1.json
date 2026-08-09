@@ -132,7 +132,7 @@
                   },
                   "envelope_schema": {
                     "type": "object",
-                    "description": "Restricted JSON Schema dialect; remote references are forbidden."
+                    "description": "Restricted JSON Schema 2020-12 dialect. Local fragment references are allowed; remote references, dynamic references, vocabularies, and content decoders are forbidden."
                   },
                   "required_envelope": { "type": "boolean", "default": false },
                   "parent_run_id": { "type": "string" }
@@ -202,6 +202,28 @@
               "application/json": {
                 "schema": { "$ref": "./common.v1.json#/components/schemas/RunRecord" }
               }
+            }
+          },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/lineage": {
+      "parameters": [
+        { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "get": {
+        "operationId": "getRunLineage",
+        "summary": "Read ancestor and descendant run lineage",
+        "description": "Ancestors are root-first and descendants are depth-first. A run token receives only entries within its own descendant scope and cannot query an ancestor or sibling target.",
+        "security": [{ "callerToken": [] }, { "runToken": [] }],
+        "responses": {
+          "200": {
+            "description": "Queryable run lineage.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/RunLineage" } }
             }
           },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -285,7 +307,7 @@
       "post": {
         "operationId": "appendEnvelope",
         "summary": "Append a validated, idempotent step envelope",
-        "description": "Only the run's attempt-bound run token may write. The base schema and caller-provided restricted schema both validate before append.",
+        "description": "Only the run's attempt-bound run token may write. The base schema and caller-provided restricted schema both validate before append. Invalid writes are stored as immutable protocol rejections and fail the run.",
         "security": [{ "runToken": [] }],
         "requestBody": {
           "required": true,
@@ -296,6 +318,17 @@
           }
         },
         "responses": {
+          "200": {
+            "description": "Identical idempotency replay; the original envelope is returned.",
+            "headers": {
+              "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Envelope" }
+              }
+            }
+          },
           "201": {
             "description": "Envelope appended.",
             "content": {
@@ -319,7 +352,7 @@
       "post": {
         "operationId": "appendGateResult",
         "summary": "Append an idempotent workflow-evaluated gate result",
-        "description": "L3 stores gate outcomes; the workflow, not L3, evaluates the gate.",
+        "description": "L3 stores gate outcomes; the workflow, not L3, evaluates the gate. Invalid writes are stored as protocol rejections, and fail/error outcomes fail the run.",
         "security": [{ "runToken": [] }],
         "requestBody": {
           "required": true,
@@ -330,6 +363,17 @@
           }
         },
         "responses": {
+          "200": {
+            "description": "Identical idempotency replay; the original gate result is returned.",
+            "headers": {
+              "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/GateResult" }
+              }
+            }
+          },
           "201": {
             "description": "Gate result appended.",
             "content": {
@@ -407,6 +451,33 @@
           "run_id": { "type": "string" },
           "status_url": { "type": "string", "format": "uri" },
           "logs_url": { "type": "string", "format": "uri" }
+        }
+      },
+      "LineageEntry": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "status", "depth"],
+        "properties": {
+          "run_id": { "type": "string", "minLength": 1 },
+          "parent_run_id": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["pending", "dispatching", "queued", "running", "awaiting-input", "succeeded", "failed"] },
+          "depth": { "type": "integer", "minimum": 1 }
+        }
+      },
+      "RunLineage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "ancestors", "descendants"],
+        "properties": {
+          "run_id": { "type": "string", "minLength": 1 },
+          "ancestors": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/LineageEntry" }
+          },
+          "descendants": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/LineageEntry" }
+          }
         }
       }
     },

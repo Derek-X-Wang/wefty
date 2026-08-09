@@ -115,8 +115,14 @@ func TestRunTokenScopeDeniesSiblingAndAllowsOwnDescendant(t *testing.T) {
 		t.Fatalf("read descendant = %d body=%s", status, body)
 	}
 
-	status, _, body = h.do(workflow, http.MethodPost, "/v1/runs/"+parent.RunID+"/envelopes", nil, auth)
-	assertAPIError(t, status, body, http.StatusNotImplemented, contract.ErrorNotImplemented)
+	parentScope, err := h.l3Store.AuthenticateRunToken(context.Background(), parentToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, _, body = h.do(workflow, http.MethodPost, "/v1/runs/"+parent.RunID+"/envelopes", validEnvelope(parent.RunID, parentScope.AttemptID, "scope-parent-envelope"), auth)
+	if status != http.StatusCreated {
+		t.Fatalf("write own envelope = %d body=%s", status, body)
+	}
 	status, _, body = h.do(workflow, http.MethodPost, "/v1/runs/"+sibling.RunID+"/gates", nil, auth)
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
 
@@ -126,6 +132,24 @@ func TestRunTokenScopeDeniesSiblingAndAllowsOwnDescendant(t *testing.T) {
 		"Authorization":   []string{"Bearer " + parentToken},
 		"Idempotency-Key": []string{"scope-bad-child"},
 	})
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	childTokens := claimRunTokens(t, h, 1)
+	childToken := childTokens[child.RunID]
+	if childToken == "" {
+		t.Fatalf("missing child token in claims: %#v", childTokens)
+	}
+	childAuth := http.Header{"Authorization": []string{"Bearer " + childToken}}
+	status, _, body = h.do(workflow, http.MethodGet, "/v1/runs/"+parent.RunID, nil, childAuth)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+	status, _, body = h.do(workflow, http.MethodGet, "/v1/runs/"+sibling.RunID, nil, childAuth)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+	status, _, body = h.do(workflow, http.MethodGet, "/v1/runs/"+parent.RunID+"/lineage", nil, childAuth)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+	status, _, body = h.do(workflow, http.MethodPost, "/v1/runs/"+parent.RunID+"/envelopes", nil, childAuth)
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
 }
 

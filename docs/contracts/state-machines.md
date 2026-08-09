@@ -63,5 +63,9 @@ Node heartbeat updates node liveness only and does not renew attempt leases.
 Terminal job mapping is deterministic: `succeeded` maps to run `succeeded`
 only after required envelope validation; job `failed` maps to run `failed`.
 Exit zero with a missing or invalid required envelope maps to run `failed`.
+An exit-zero parent remains `running` while any child run is non-terminal; once
+all children settle, a failed child fails the parent and otherwise the parent's
+own envelope/gate checks determine its terminal state. This reconciliation is
+applied deepest-child-first so one pass can settle an already-terminal chain.
 Cancellation is reserved and returns `501`, so there is no cancellable or
 cancelled state in the v1 state table.

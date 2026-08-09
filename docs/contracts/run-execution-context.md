@@ -40,9 +40,25 @@ The scope is:
 - create only a direct child whose `parent_run_id` is the token's own run;
 - never read a sibling or ancestor, and never write another run.
 
-Envelope and gate storage is implemented by issue #28. Until then, an
-authorized own-run request reaches the reserved handler and returns
-`not_implemented`; an out-of-scope request is rejected first with `forbidden`.
+Envelope and gate writes carry their idempotency key in the versioned JSON
+body. L3 validates the full raw document, including `run_id`, `step_id`, and
+the attempt-bound `attempt_id`, before appending it to an immutable ledger
+table. An identical replay returns the original document; reusing a key or
+document ID with different content returns `idempotency_conflict`.
+
+Every envelope validates against both the v1 base envelope schema and the
+optional `envelope_schema` captured at run creation. Caller schemas use a
+restricted draft 2020-12 dialect: ordinary assertions/composition,
+`properties`, `$defs`, and local fragment `$ref` values are supported; remote
+or dynamic references, vocabularies, and content decoders are rejected when
+the run is created. A rejected envelope or gate is stored in the immutable
+protocol-rejection ledger and fails the run. Gate `fail` and `error` outcomes
+also fail the run; gate evaluation itself remains workflow-owned.
+
+`GET /v1/runs/{run_id}` includes accepted envelopes and gates. `GET
+/v1/runs/{run_id}/lineage` returns root-first ancestors and depth-ordered
+descendants. Run tokens receive only entries within their own descendant
+scope; an ancestor or sibling target is rejected before the query is served.
 
 An active run token has no wall-clock expiry. When its run becomes terminal,
 L3 atomically sets its expiry to the terminal timestamp plus five minutes.
