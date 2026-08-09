@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,9 +29,32 @@ func main() {
 		spawnChild()
 	case "sleep":
 		sleep()
+	case "paced-output":
+		pacedOutput()
+	case "raw-output":
+		rawOutput()
 	default:
 		fatalf("unknown mode %q", os.Args[1])
 	}
+}
+
+func pacedOutput() {
+	if len(os.Args) != 3 {
+		fatalf("paced-output mode requires milliseconds")
+	}
+	milliseconds, err := strconv.Atoi(os.Args[2])
+	if err != nil {
+		fatalf("parse paced-output duration: %v", err)
+	}
+	_, _ = os.Stdout.Write([]byte("first\n"))
+	time.Sleep(time.Duration(milliseconds) * time.Millisecond)
+	_, _ = os.Stdout.Write([]byte("second\n"))
+}
+
+func rawOutput() {
+	_, _ = os.Stdout.Write(bytes.Repeat([]byte{'x'}, 70*1024))
+	_, _ = os.Stdout.Write([]byte("partial-without-newline"))
+	_, _ = os.Stdout.Write([]byte{0xff, 0xfe, 0x00, '\n'})
 }
 
 func sleep() {

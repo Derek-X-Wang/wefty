@@ -20,6 +20,9 @@ const (
 	DefaultHeartbeatInterval = 15 * time.Second
 	DefaultClaimInterval     = time.Second
 	DefaultRenewalInterval   = 10 * time.Second
+	DefaultLogBatchSize      = 32
+	DefaultLogFlushInterval  = 100 * time.Millisecond
+	DefaultLogRetryInterval  = 100 * time.Millisecond
 )
 
 // ProcessRunner is the execution seam used by the node loop.
@@ -27,7 +30,8 @@ type ProcessRunner interface {
 	Run(context.Context, processrunner.Request, processrunner.OutputSink) (contract.ProcessResult, error)
 }
 
-// OutputSinkFactory creates an output destination for a claimed attempt.
+// OutputSinkFactory creates an optional local output destination for a claimed
+// attempt. The agent always uploads logs to L1 in addition to this sink.
 type OutputSinkFactory func(l1.Claim) processrunner.OutputSink
 
 // Config contains the stable node identity, per-process boot identity, and
@@ -44,6 +48,9 @@ type Config struct {
 	HeartbeatInterval   time.Duration
 	ClaimInterval       time.Duration
 	RenewalInterval     time.Duration
+	LogBatchSize        int
+	LogFlushInterval    time.Duration
+	LogRetryInterval    time.Duration
 	Runner              ProcessRunner
 	OutputSinkFactory   OutputSinkFactory
 	Logf                func(string, ...any)
@@ -57,6 +64,9 @@ type Agent struct {
 	heartbeatInterval time.Duration
 	claimInterval     time.Duration
 	renewalInterval   time.Duration
+	logBatchSize      int
+	logFlushInterval  time.Duration
+	logRetryInterval  time.Duration
 	runner            ProcessRunner
 	outputSinkFactory OutputSinkFactory
 	logf              func(string, ...any)
@@ -71,6 +81,9 @@ func New(config Config) (*Agent, error) {
 	}
 	if config.Version == "" {
 		return nil, errors.New("agent: version is required")
+	}
+	if config.LogBatchSize < 0 || config.LogBatchSize > l1.MaxLogBatchEvents {
+		return nil, fmt.Errorf("agent: log batch size must be between 1 and %d", l1.MaxLogBatchEvents)
 	}
 	client, err := NewClient(config.Fabric, config.ControlPlaneAddress)
 	if err != nil {
@@ -101,6 +114,9 @@ func New(config Config) (*Agent, error) {
 		heartbeatInterval: durationOrDefault(config.HeartbeatInterval, DefaultHeartbeatInterval),
 		claimInterval:     durationOrDefault(config.ClaimInterval, DefaultClaimInterval),
 		renewalInterval:   durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
+		logBatchSize:      intOrDefault(config.LogBatchSize, DefaultLogBatchSize),
+		logFlushInterval:  durationOrDefault(config.LogFlushInterval, DefaultLogFlushInterval),
+		logRetryInterval:  durationOrDefault(config.LogRetryInterval, DefaultLogRetryInterval),
 		runner:            runner,
 		outputSinkFactory: config.OutputSinkFactory,
 		logf:              config.Logf,
@@ -231,15 +247,28 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 		err := fmt.Errorf("runtime handler %q is not supported for process jobs", claim.Job.Spec.RuntimeHandler)
 		return contract.ProcessResult{SpawnError: err.Error()}, err
 	}
-	var sink processrunner.OutputSink
+	uploader := newBatchingLogSink(ctx, a.client, claim, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
+	var localSink processrunner.OutputSink
 	if a.outputSinkFactory != nil {
-		sink = a.outputSinkFactory(claim)
+		localSink = a.outputSinkFactory(claim)
 	}
-	return a.runner.Run(ctx, processrunner.Request{
+	sink := processrunner.OutputSink(uploader)
+	if localSink != nil {
+		sink = multiOutputSink{uploader, localSink}
+	}
+	result, runErr := a.runner.Run(ctx, processrunner.Request{
 		AttemptID: claim.Lease.AttemptID,
 		Execution: claim.Job.Spec.Execution,
 		Limits:    claim.Job.Spec.Limits,
 	}, sink)
+	flushErr := uploader.Close()
+	if runErr != nil {
+		return result, runErr
+	}
+	if flushErr != nil {
+		return result, fmt.Errorf("upload logs: %w", flushErr)
+	}
+	return result, nil
 }
 
 func (a *Agent) renewalLoop(ctx context.Context, claim l1.Claim, failures chan<- error) {
@@ -304,6 +333,13 @@ func NewBootSessionID() (string, error) {
 }
 
 func durationOrDefault(value, fallback time.Duration) time.Duration {
+	if value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func intOrDefault(value, fallback int) int {
 	if value <= 0 {
 		return fallback
 	}
