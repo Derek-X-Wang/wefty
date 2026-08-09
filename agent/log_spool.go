@@ -1,0 +1,283 @@
+package agent
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/l1"
+	_ "modernc.org/sqlite"
+)
+
+// ErrLogSpoolFull means the durable spool cannot accept more output without
+// exceeding its configured unacknowledged-payload budget. The caller must
+// stop the producer; output is never evicted or silently dropped.
+var ErrLogSpoolFull = errors.New("agent: log spool retention limit reached")
+
+type logSpoolAttempt struct {
+	jobID        string
+	attemptID    string
+	fencingToken string
+}
+
+type logSpool struct {
+	db       *sql.DB
+	maxBytes int64
+}
+
+func openLogSpool(directory, nodeID string, maxBytes int64) (*logSpool, error) {
+	if strings.TrimSpace(directory) == "" {
+		cacheDirectory, err := os.UserCacheDir()
+		if err != nil {
+			return nil, fmt.Errorf("agent: locate log spool directory: %w", err)
+		}
+		directory = filepath.Join(cacheDirectory, "wefty", "log-spool")
+	}
+	if maxBytes <= 0 {
+		return nil, errors.New("agent: log spool maximum bytes must be positive")
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return nil, fmt.Errorf("agent: create log spool directory: %w", err)
+	}
+	path := filepath.Join(directory, spoolFileName(nodeID))
+	query := make(url.Values)
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "synchronous(FULL)")
+	query.Set("_txlock", "immediate")
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("agent: open log spool: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	spool := &logSpool{db: db, maxBytes: maxBytes}
+	if err := spool.initialize(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return spool, nil
+}
+
+func spoolFileName(nodeID string) string {
+	var builder strings.Builder
+	for _, value := range nodeID {
+		if builder.Len() >= 48 {
+			break
+		}
+		if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || value == '-' || value == '_' {
+			builder.WriteRune(value)
+		} else {
+			builder.WriteByte('_')
+		}
+	}
+	if builder.Len() == 0 {
+		builder.WriteString("node")
+	}
+	digest := sha256.Sum256([]byte(nodeID))
+	return builder.String() + "-" + hex.EncodeToString(digest[:8]) + ".sqlite"
+}
+
+func (spool *logSpool) initialize(ctx context.Context) error {
+	var mode string
+	if err := spool.db.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
+		return fmt.Errorf("agent: enable log spool WAL: %w", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		return fmt.Errorf("agent: log spool did not enable WAL (mode %q)", mode)
+	}
+	const schema = `
+CREATE TABLE IF NOT EXISTS spool_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  fencing_token TEXT NOT NULL,
+  created_ns INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS spool_events (
+  ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+  attempt_id TEXT NOT NULL REFERENCES spool_attempts(attempt_id) ON DELETE CASCADE,
+  stream TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  timestamp_ns INTEGER NOT NULL,
+  bytes BLOB NOT NULL,
+  payload_bytes INTEGER NOT NULL,
+  UNIQUE(attempt_id, stream, sequence)
+);
+CREATE INDEX IF NOT EXISTS spool_events_upload ON spool_events(attempt_id, ordinal);
+CREATE TABLE IF NOT EXISTS spool_acknowledgements (
+  attempt_id TEXT NOT NULL REFERENCES spool_attempts(attempt_id) ON DELETE CASCADE,
+  stream TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  PRIMARY KEY(attempt_id, stream)
+);`
+	if _, err := spool.db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("agent: initialize log spool: %w", err)
+	}
+	return nil
+}
+
+func (spool *logSpool) Close() error { return spool.db.Close() }
+
+func (spool *logSpool) ensureAttempt(ctx context.Context, claim l1.Claim) error {
+	_, err := spool.db.ExecContext(ctx, `INSERT INTO spool_attempts(attempt_id, job_id, fencing_token, created_ns)
+VALUES(?, ?, ?, ?)
+ON CONFLICT(attempt_id) DO UPDATE SET job_id=excluded.job_id, fencing_token=excluded.fencing_token
+WHERE spool_attempts.job_id=excluded.job_id AND spool_attempts.fencing_token=excluded.fencing_token`,
+		claim.Lease.AttemptID, claim.Job.JobID, claim.Lease.FencingToken, claim.Job.CreatedAt.UTC().Round(0).UnixNano())
+	if err != nil {
+		return fmt.Errorf("agent: store log spool attempt: %w", err)
+	}
+	var jobID, fencingToken string
+	if err := spool.db.QueryRowContext(ctx, "SELECT job_id, fencing_token FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&jobID, &fencingToken); err != nil {
+		return fmt.Errorf("agent: verify log spool attempt: %w", err)
+	}
+	if jobID != claim.Job.JobID || fencingToken != claim.Lease.FencingToken {
+		return fmt.Errorf("agent: log spool attempt %q conflicts with stored authority", claim.Lease.AttemptID)
+	}
+	return nil
+}
+
+func (spool *logSpool) append(ctx context.Context, event contract.LogEvent) error {
+	if event.Sequence > math.MaxInt64 {
+		return fmt.Errorf("agent: log sequence %d exceeds durable spool range", event.Sequence)
+	}
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("agent: begin log spool append: %w", err)
+	}
+	defer tx.Rollback()
+	var storedTimestamp int64
+	var storedBytes []byte
+	err = tx.QueryRowContext(ctx, `SELECT timestamp_ns, bytes FROM spool_events
+WHERE attempt_id=? AND stream=? AND sequence=?`, event.AttemptID, event.Stream, event.Sequence).Scan(&storedTimestamp, &storedBytes)
+	if err == nil {
+		if storedTimestamp != event.Timestamp.UTC().Round(0).UnixNano() || !bytes.Equal(storedBytes, event.Bytes) {
+			return fmt.Errorf("agent: log event (%s, %d) conflicts with its durable spool record", event.Stream, event.Sequence)
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("agent: read log spool event: %w", err)
+	}
+	var used int64
+	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(SUM(payload_bytes), 0) FROM spool_events").Scan(&used); err != nil {
+		return fmt.Errorf("agent: measure log spool retention: %w", err)
+	}
+	if int64(len(event.Bytes)) > spool.maxBytes-used {
+		return fmt.Errorf("%w: %d bytes used, %d-byte event, %d-byte maximum", ErrLogSpoolFull, used, len(event.Bytes), spool.maxBytes)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO spool_events(attempt_id, stream, sequence, timestamp_ns, bytes, payload_bytes)
+VALUES(?, ?, ?, ?, ?, ?)`, event.AttemptID, event.Stream, event.Sequence, event.Timestamp.UTC().Round(0).UnixNano(), event.Bytes, len(event.Bytes))
+	if err != nil {
+		return fmt.Errorf("agent: append durable log event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("agent: commit durable log event: %w", err)
+	}
+	return nil
+}
+
+func (spool *logSpool) pendingCount(ctx context.Context, attemptID string) (int, error) {
+	var count int
+	if err := spool.db.QueryRowContext(ctx, "SELECT count(*) FROM spool_events WHERE attempt_id=?", attemptID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("agent: count pending log spool: %w", err)
+	}
+	return count, nil
+}
+
+func (spool *logSpool) pending(ctx context.Context, attemptID string, limit int) ([]contract.LogEvent, error) {
+	rows, err := spool.db.QueryContext(ctx, `SELECT stream, sequence, timestamp_ns, bytes
+FROM spool_events WHERE attempt_id=? ORDER BY ordinal LIMIT ?`, attemptID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("agent: read pending log spool: %w", err)
+	}
+	defer rows.Close()
+	events := make([]contract.LogEvent, 0, limit)
+	for rows.Next() {
+		var event contract.LogEvent
+		var sequence, timestamp int64
+		if err := rows.Scan(&event.Stream, &sequence, &timestamp, &event.Bytes); err != nil {
+			return nil, fmt.Errorf("agent: scan pending log spool: %w", err)
+		}
+		event.AttemptID = attemptID
+		event.Sequence = uint64(sequence)
+		event.Timestamp = time.Unix(0, timestamp).UTC()
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("agent: iterate pending log spool: %w", err)
+	}
+	return events, nil
+}
+
+func (spool *logSpool) acknowledge(ctx context.Context, attemptID string, acknowledged map[contract.LogStream]uint64) error {
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("agent: begin log spool acknowledgement: %w", err)
+	}
+	defer tx.Rollback()
+	for stream, sequence := range acknowledged {
+		if sequence > math.MaxInt64 {
+			return fmt.Errorf("agent: log acknowledgement %d exceeds durable spool range", sequence)
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO spool_acknowledgements(attempt_id, stream, sequence)
+VALUES(?, ?, ?)
+ON CONFLICT(attempt_id, stream) DO UPDATE SET sequence=MAX(sequence, excluded.sequence)`, attemptID, stream, sequence)
+		if err != nil {
+			return fmt.Errorf("agent: persist log acknowledgement: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM spool_events WHERE attempt_id=? AND stream=? AND sequence<=?", attemptID, stream, sequence); err != nil {
+			return fmt.Errorf("agent: release acknowledged log retention: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("agent: commit log spool acknowledgement: %w", err)
+	}
+	return nil
+}
+
+func (spool *logSpool) pendingAttempts(ctx context.Context) ([]logSpoolAttempt, error) {
+	rows, err := spool.db.QueryContext(ctx, `SELECT a.job_id, a.attempt_id, a.fencing_token
+FROM spool_attempts a WHERE EXISTS (SELECT 1 FROM spool_events e WHERE e.attempt_id=a.attempt_id)
+ORDER BY a.created_ns, a.attempt_id`)
+	if err != nil {
+		return nil, fmt.Errorf("agent: list pending log spool attempts: %w", err)
+	}
+	defer rows.Close()
+	var attempts []logSpoolAttempt
+	for rows.Next() {
+		var attempt logSpoolAttempt
+		if err := rows.Scan(&attempt.jobID, &attempt.attemptID, &attempt.fencingToken); err != nil {
+			return nil, fmt.Errorf("agent: scan pending log spool attempt: %w", err)
+		}
+		attempts = append(attempts, attempt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("agent: iterate pending log spool attempts: %w", err)
+	}
+	return attempts, nil
+}
+
+func (spool *logSpool) highWater(ctx context.Context, attemptID string, stream contract.LogStream) (uint64, bool, error) {
+	var sequence int64
+	err := spool.db.QueryRowContext(ctx, `SELECT sequence FROM spool_acknowledgements
+WHERE attempt_id=? AND stream=?`, attemptID, stream).Scan(&sequence)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("agent: read log acknowledgement high-water mark: %w", err)
+	}
+	return uint64(sequence), true, nil
+}

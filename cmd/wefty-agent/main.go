@@ -29,18 +29,20 @@ func main() {
 
 func run() error {
 	var (
-		fabricMode       = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
-		controlPlane     = flag.String("control-plane", "wefty://control-plane", "control-plane Fabric address")
-		nodeID           = flag.String("node-id", "", "stable operator-facing node ID")
-		fabricIdentityID = flag.String("plain-identity", "", "plain Fabric identity node ID (defaults to node-id)")
-		fabricName       = flag.String("fabric-name", "", "tsnet logical node name")
-		stateDirectory   = flag.String("state-dir", "", "tsnet state directory")
-		authKey          = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
-		controlURL       = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
-		ephemeral        = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
-		heartbeat        = flag.Duration("heartbeat-interval", agent.DefaultHeartbeatInterval, "node heartbeat interval")
-		claim            = flag.Duration("claim-interval", agent.DefaultClaimInterval, "idle claim polling interval")
-		renewal          = flag.Duration("renewal-interval", agent.DefaultRenewalInterval, "maximum attempt lease-renewal interval")
+		fabricMode        = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
+		controlPlane      = flag.String("control-plane", "wefty://control-plane", "control-plane Fabric address")
+		nodeID            = flag.String("node-id", "", "stable operator-facing node ID")
+		fabricIdentityID  = flag.String("plain-identity", "", "plain Fabric identity node ID (defaults to node-id)")
+		fabricName        = flag.String("fabric-name", "", "tsnet logical node name")
+		stateDirectory    = flag.String("state-dir", "", "tsnet state directory")
+		authKey           = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
+		controlURL        = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
+		ephemeral         = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
+		heartbeat         = flag.Duration("heartbeat-interval", agent.DefaultHeartbeatInterval, "node heartbeat interval")
+		claim             = flag.Duration("claim-interval", agent.DefaultClaimInterval, "idle claim polling interval")
+		renewal           = flag.Duration("renewal-interval", agent.DefaultRenewalInterval, "maximum attempt lease-renewal interval")
+		logSpoolDirectory = flag.String("log-spool-dir", "", "durable log spool directory (defaults to the user cache directory)")
+		logSpoolMaxBytes  = flag.Int64("log-spool-max-bytes", agent.DefaultLogSpoolMaxBytes, "maximum unacknowledged log payload bytes retained on disk")
 	)
 	flag.Parse()
 	if *nodeID == "" {
@@ -82,6 +84,8 @@ func run() error {
 		HeartbeatInterval:   *heartbeat,
 		ClaimInterval:       *claim,
 		RenewalInterval:     *renewal,
+		LogSpoolDirectory:   *logSpoolDirectory,
+		LogSpoolMaxBytes:    *logSpoolMaxBytes,
 		OutputSinkFactory: func(l1.Claim) processrunner.OutputSink {
 			return processrunner.OutputSinkFunc(writeOutput)
 		},

@@ -72,6 +72,7 @@ func TestTSNetSmoke(t *testing.T) {
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: serverName,
 		NodeID: stableNodeID, BootSessionID: "boot-" + suffix, Version: "tsnet-smoke",
+		LogSpoolDirectory: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)

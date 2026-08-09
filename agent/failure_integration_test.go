@@ -33,7 +33,7 @@ func TestPartitionedAgentLosesAuthorityWithoutSecondExecution(t *testing.T) {
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Clock: clock,
 		HeartbeatInterval: 5 * time.Minute, ClaimInterval: time.Minute, RenewalInterval: 10 * time.Second,
-		Runner: runner,
+		Runner: runner, LogSpoolDirectory: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -96,7 +96,7 @@ func TestAgentDrainFinishesRunningAttemptAndStopsClaiming(t *testing.T) {
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
 		HeartbeatInterval: time.Minute, ClaimInterval: time.Millisecond, RenewalInterval: 10 * time.Second,
-		Runner: runner,
+		Runner: runner, LogSpoolDirectory: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)

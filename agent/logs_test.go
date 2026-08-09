@@ -74,7 +74,15 @@ func TestBatchingLogSinkRetriesTheIdenticalBatch(t *testing.T) {
 		Job:   l1.Job{JobID: "job-batch"},
 		Lease: l1.AttemptLease{AttemptID: "attempt-batch", FencingToken: "fence-batch"},
 	}
-	sink := newBatchingLogSink(context.Background(), client, claim, systemClock{}, 3, time.Hour, time.Millisecond)
+	spool, err := openLogSpool(t.TempDir(), "node-batch", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close()
+	sink, err := newBatchingLogSink(context.Background(), client, claim, spool, systemClock{}, 3, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for sequence := range uint64(3) {
 		event := contract.LogEvent{
 			AttemptID: claim.Lease.AttemptID,

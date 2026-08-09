@@ -102,6 +102,7 @@ func TestNewBuildsRegistrationFromStableAndBootMetadata(t *testing.T) {
 		Fabric: participant, ControlPlaneAddress: "127.0.0.1:1",
 		NodeID: "stable-node", BootSessionID: "boot-session", Version: "v1.2.3",
 		OS: "test-os", Architecture: "test-arch",
+		LogSpoolDirectory: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -152,6 +153,7 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 		HeartbeatInterval:   5 * time.Second,
 		ClaimInterval:       10 * time.Millisecond,
 		RenewalInterval:     40 * time.Millisecond,
+		LogSpoolDirectory:   t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
