@@ -21,6 +21,7 @@ const (
 	DefaultHeartbeatInterval = 15 * time.Second
 	DefaultClaimInterval     = time.Second
 	DefaultRenewalInterval   = 10 * time.Second
+	DefaultHandoffRetention  = 24 * time.Hour
 )
 
 // ProcessRunner is the execution seam used by the node loop.
@@ -47,6 +48,8 @@ type Config struct {
 	RenewalInterval     time.Duration
 	Runner              ProcessRunner
 	OutputSinkFactory   OutputSinkFactory
+	HandoffRoot         string
+	HandoffRetention    time.Duration
 	Logf                func(string, ...any)
 }
 
@@ -60,6 +63,7 @@ type Agent struct {
 	renewalInterval   time.Duration
 	runner            ProcessRunner
 	outputSinkFactory OutputSinkFactory
+	handoffs          *handoffManager
 	logf              func(string, ...any)
 }
 
@@ -104,6 +108,7 @@ func New(config Config) (*Agent, error) {
 		renewalInterval:   durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
 		runner:            runner,
 		outputSinkFactory: config.OutputSinkFactory,
+		handoffs:          newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
 		logf:              config.Logf,
 	}, nil
 }
@@ -119,6 +124,11 @@ func (a *Agent) Register(ctx context.Context) (l1.Node, error) {
 // Run registers and then serves claims until the context is canceled or the
 // control plane rejects a liveness or execution operation.
 func (a *Agent) Run(ctx context.Context) error {
+	if a.handoffs != nil {
+		if err := a.handoffs.cleanupExpired(""); err != nil {
+			return fmt.Errorf("agent: clean expired handoff directories: %w", err)
+		}
+	}
 	if _, err := a.Register(ctx); err != nil {
 		return fmt.Errorf("agent: register node: %w", err)
 	}
@@ -221,6 +231,12 @@ func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) error {
 	if _, err := a.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request); err != nil {
 		return fmt.Errorf("agent: complete attempt: %w", err)
 	}
+	if a.handoffs != nil {
+		succeeded := outcome.err == nil && outcome.result.ExitCode != nil && *outcome.result.ExitCode == 0
+		if err := a.handoffs.finish(claim.Job.Spec, a.registration.NodeID, succeeded); err != nil {
+			return fmt.Errorf("agent: finish handoff lifecycle: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -231,6 +247,11 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 	if claim.Job.Spec.RuntimeHandler != "" {
 		err := fmt.Errorf("runtime handler %q is not supported for process jobs", claim.Job.Spec.RuntimeHandler)
 		return contract.ProcessResult{SpawnError: err.Error()}, err
+	}
+	if a.handoffs != nil {
+		if err := a.handoffs.prepare(claim.Job.Spec, a.registration.NodeID); err != nil {
+			return contract.ProcessResult{SpawnError: err.Error()}, err
+		}
 	}
 	var sink processrunner.OutputSink
 	if a.outputSinkFactory != nil {

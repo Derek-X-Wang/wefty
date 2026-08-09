@@ -10,11 +10,12 @@ const SchemaVersionV1 = 1
 // Run execution environment names are part of the v0.1 process contract.
 // Keep credentials in SensitiveEnv so public job projections can redact them.
 const (
-	EnvRunID      = "WEFTY_RUN_ID"
-	EnvL3Endpoint = "WEFTY_L3_ENDPOINT"
-	EnvL1Endpoint = "WEFTY_L1_ENDPOINT"
-	EnvRunToken   = "WEFTY_RUN_TOKEN"
-	EnvHandoffDir = "WEFTY_HANDOFF_DIR"
+	EnvRunID           = "WEFTY_RUN_ID"
+	EnvL3Endpoint      = "WEFTY_L3_ENDPOINT"
+	EnvL1Endpoint      = "WEFTY_L1_ENDPOINT"
+	EnvRunToken        = "WEFTY_RUN_TOKEN"
+	EnvHandoffDir      = "WEFTY_HANDOFF_DIR"
+	DefaultHandoffRoot = "/tmp/wefty/handoffs"
 
 	// StableNodeTagPrefix reserves the routing tag used when a cold rerun
 	// consumes node-local handoff files from an earlier execution.

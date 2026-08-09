@@ -12,7 +12,7 @@ const (
 	DefaultCallerPrincipalTag = "wefty:client"
 	DefaultL1Address          = "wefty://control-plane"
 	DefaultL3Address          = "wefty://run-ledger"
-	DefaultHandoffRoot        = "/tmp/wefty/handoffs"
+	DefaultHandoffRoot        = contract.DefaultHandoffRoot
 	DefaultRunTokenGrace      = 5 * time.Minute
 )
 
