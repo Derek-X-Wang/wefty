@@ -186,7 +186,7 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFromRequest(r)
-	node, err := s.store.RegisterNode(r.Context(), identity, registration, s.authoritativeNodeTags[identity.NodeID])
+	node, err := s.store.RegisterNode(r.Context(), identity, registration, s.authoritativeNodeTags[registration.NodeID])
 	if err != nil {
 		writeError(w, err)
 		return

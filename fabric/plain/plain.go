@@ -3,7 +3,10 @@ package plain
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -15,11 +18,15 @@ import (
 // Network isolates logical names and injected identities for a set of plain
 // Fabric instances. Tests should create a fresh Network to avoid shared state.
 type Network struct {
-	dialMu sync.Mutex
-	mu     sync.RWMutex
-	names  map[string]string
-	peers  map[string]fabric.Identity
+	mu    sync.RWMutex
+	names map[string]string
+	peers map[string]fabric.Identity
 }
+
+const (
+	identityMagic   = "WEFTYPLAIN1"
+	maxIdentitySize = 64 << 10
+)
 
 // NewNetwork creates an isolated localhost fabric network.
 func NewNetwork() *Network {
@@ -87,12 +94,12 @@ func (f *Fabric) Dial(ctx context.Context, network, address string) (net.Conn, e
 		return nil, err
 	}
 
-	// Accept waits on the same mutex. This makes identity registration visible
-	// before the server can receive the connection and call WhoIs.
-	f.network.dialMu.Lock()
-	defer f.network.dialMu.Unlock()
 	conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
 	if err != nil {
+		return nil, err
+	}
+	if err := writeIdentity(conn, f.identity); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 	key := conn.LocalAddr().String()
@@ -181,9 +188,14 @@ func (l *listener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	l.network.dialMu.Lock()
-	l.network.dialMu.Unlock()
-	return conn, nil
+	identity, err := readIdentity(conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	key := conn.RemoteAddr().String()
+	l.network.registerPeer(key, identity)
+	return &connWithIdentity{Conn: conn, network: l.network, key: key}, nil
 }
 
 func (l *listener) Close() error {
@@ -205,6 +217,49 @@ type connWithIdentity struct {
 func (c *connWithIdentity) Close() error {
 	c.once.Do(func() { c.network.unregisterPeer(c.key) })
 	return c.Conn.Close()
+}
+
+func writeIdentity(writer io.Writer, identity fabric.Identity) error {
+	payload, err := json.Marshal(identity)
+	if err != nil {
+		return fmt.Errorf("plain fabric: encode injected identity: %w", err)
+	}
+	if len(payload) > maxIdentitySize {
+		return fmt.Errorf("plain fabric: injected identity is too large")
+	}
+	header := make([]byte, len(identityMagic)+4)
+	copy(header, identityMagic)
+	binary.BigEndian.PutUint32(header[len(identityMagic):], uint32(len(payload)))
+	if _, err := writer.Write(header); err != nil {
+		return fmt.Errorf("plain fabric: write identity header: %w", err)
+	}
+	if _, err := writer.Write(payload); err != nil {
+		return fmt.Errorf("plain fabric: write identity: %w", err)
+	}
+	return nil
+}
+
+func readIdentity(reader io.Reader) (fabric.Identity, error) {
+	header := make([]byte, len(identityMagic)+4)
+	if _, err := io.ReadFull(reader, header); err != nil {
+		return fabric.Identity{}, fmt.Errorf("plain fabric: read identity header: %w", err)
+	}
+	if string(header[:len(identityMagic)]) != identityMagic {
+		return fabric.Identity{}, fmt.Errorf("plain fabric: invalid identity header")
+	}
+	size := binary.BigEndian.Uint32(header[len(identityMagic):])
+	if size > maxIdentitySize {
+		return fabric.Identity{}, fmt.Errorf("plain fabric: injected identity is too large")
+	}
+	payload := make([]byte, size)
+	if _, err := io.ReadFull(reader, payload); err != nil {
+		return fabric.Identity{}, fmt.Errorf("plain fabric: read identity: %w", err)
+	}
+	var identity fabric.Identity
+	if err := json.Unmarshal(payload, &identity); err != nil {
+		return fabric.Identity{}, fmt.Errorf("plain fabric: decode injected identity: %w", err)
+	}
+	return identity, nil
 }
 
 var _ fabric.Fabric = (*Fabric)(nil)

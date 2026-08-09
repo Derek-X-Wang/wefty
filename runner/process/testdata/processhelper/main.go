@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -25,9 +26,22 @@ func main() {
 		hang()
 	case "spawn-child":
 		spawnChild()
+	case "sleep":
+		sleep()
 	default:
 		fatalf("unknown mode %q", os.Args[1])
 	}
+}
+
+func sleep() {
+	if len(os.Args) != 3 {
+		fatalf("sleep mode requires milliseconds")
+	}
+	milliseconds, err := strconv.Atoi(os.Args[2])
+	if err != nil {
+		fatalf("parse sleep duration: %v", err)
+	}
+	time.Sleep(time.Duration(milliseconds) * time.Millisecond)
 }
 
 func exit() {
