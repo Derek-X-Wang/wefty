@@ -21,6 +21,9 @@ const (
 	DefaultClaimInterval     = time.Second
 	DefaultRenewalInterval   = 10 * time.Second
 	DefaultHandoffRetention  = 24 * time.Hour
+	DefaultLogBatchSize      = 32
+	DefaultLogFlushInterval  = 100 * time.Millisecond
+	DefaultLogRetryInterval  = 100 * time.Millisecond
 )
 
 // ProcessRunner is the execution seam used by the node loop.
@@ -28,7 +31,8 @@ type ProcessRunner interface {
 	Run(context.Context, processrunner.Request, processrunner.OutputSink) (contract.ProcessResult, error)
 }
 
-// OutputSinkFactory creates an output destination for a claimed attempt.
+// OutputSinkFactory creates an optional local output destination for a claimed
+// attempt. The agent always uploads logs to L1 in addition to this sink.
 type OutputSinkFactory func(l1.Claim) processrunner.OutputSink
 
 // Config contains the stable node identity, per-process boot identity, and
@@ -45,6 +49,9 @@ type Config struct {
 	HeartbeatInterval   time.Duration
 	ClaimInterval       time.Duration
 	RenewalInterval     time.Duration
+	LogBatchSize        int
+	LogFlushInterval    time.Duration
+	LogRetryInterval    time.Duration
 	Runner              ProcessRunner
 	OutputSinkFactory   OutputSinkFactory
 	HandoffRoot         string
@@ -60,6 +67,9 @@ type Agent struct {
 	heartbeatInterval time.Duration
 	claimInterval     time.Duration
 	renewalInterval   time.Duration
+	logBatchSize      int
+	logFlushInterval  time.Duration
+	logRetryInterval  time.Duration
 	runner            ProcessRunner
 	outputSinkFactory OutputSinkFactory
 	handoffs          *handoffManager
@@ -75,6 +85,9 @@ func New(config Config) (*Agent, error) {
 	}
 	if config.Version == "" {
 		return nil, errors.New("agent: version is required")
+	}
+	if config.LogBatchSize < 0 || config.LogBatchSize > l1.MaxLogBatchEvents {
+		return nil, fmt.Errorf("agent: log batch size must be between 1 and %d", l1.MaxLogBatchEvents)
 	}
 	client, err := NewClient(config.Fabric, config.ControlPlaneAddress)
 	if err != nil {
@@ -105,6 +118,9 @@ func New(config Config) (*Agent, error) {
 		heartbeatInterval: durationOrDefault(config.HeartbeatInterval, DefaultHeartbeatInterval),
 		claimInterval:     durationOrDefault(config.ClaimInterval, DefaultClaimInterval),
 		renewalInterval:   durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
+		logBatchSize:      intOrDefault(config.LogBatchSize, DefaultLogBatchSize),
+		logFlushInterval:  durationOrDefault(config.LogFlushInterval, DefaultLogFlushInterval),
+		logRetryInterval:  durationOrDefault(config.LogRetryInterval, DefaultLogRetryInterval),
 		runner:            runner,
 		outputSinkFactory: config.OutputSinkFactory,
 		handoffs:          newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
@@ -257,9 +273,24 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 		return contract.ProcessResult{SpawnError: err.Error()}, err
 	}
 	defer cleanupExecutable()
-	var sink processrunner.OutputSink
+	var uploader *batchingLogSink
+	var sinks multiOutputSink
+	if a.client != nil {
+		uploader = newBatchingLogSink(ctx, a.client, claim, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
+		sinks = append(sinks, uploader)
+	}
+	var localSink processrunner.OutputSink
 	if a.outputSinkFactory != nil {
-		sink = a.outputSinkFactory(claim)
+		localSink = a.outputSinkFactory(claim)
+	}
+	if localSink != nil {
+		sinks = append(sinks, localSink)
+	}
+	var sink processrunner.OutputSink
+	if len(sinks) == 1 {
+		sink = sinks[0]
+	} else if len(sinks) > 1 {
+		sink = sinks
 	}
 	redactingSink := newRedactingOutputSink(sink, claim.Job.Spec.Execution.SensitiveEnv)
 	if redactingSink != nil {
@@ -270,12 +301,21 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 		Execution: execution,
 		Limits:    claim.Job.Spec.Limits,
 	}, sink)
+	var outputErr error
 	if redactingSink != nil {
-		if flushErr := redactingSink.Flush(ctx); flushErr != nil {
-			return result, errors.Join(runErr, fmt.Errorf("flush redacted output: %w", flushErr))
-		}
+		outputErr = redactingSink.Flush(ctx)
 	}
-	return result, runErr
+	var uploadErr error
+	if uploader != nil {
+		uploadErr = uploader.Close()
+	}
+	if outputErr != nil {
+		outputErr = fmt.Errorf("flush redacted output: %w", outputErr)
+	}
+	if uploadErr != nil {
+		uploadErr = fmt.Errorf("upload logs: %w", uploadErr)
+	}
+	return result, errors.Join(runErr, outputErr, uploadErr)
 }
 
 func (a *Agent) renewalLoop(ctx context.Context, claim l1.Claim, failures chan<- error) {
@@ -340,6 +380,13 @@ func NewBootSessionID() (string, error) {
 }
 
 func durationOrDefault(value, fallback time.Duration) time.Duration {
+	if value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func intOrDefault(value, fallback int) int {
 	if value <= 0 {
 		return fallback
 	}
