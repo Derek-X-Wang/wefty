@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "envelope_id": "env_01JZK0",
+  "idempotency_key": "run_01JZK0:plan:1",
+  "run_id": "run_01JZK0",
+  "step_id": "plan",
+  "status": "succeeded",
+  "summary": "Attempt identity is required",
+  "created_at": "2026-08-09T12:00:00Z"
+}

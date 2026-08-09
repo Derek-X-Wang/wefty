@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wefty.dev/schemas/v1/job-spec.schema.json",
+  "title": "Wefty Job Spec v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "dispatch_key", "kind", "execution"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "dispatch_key": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "kind": {
+      "description": "Open workload kind. Unknown values are valid data and are rejected only by agents that cannot execute them.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "runtime_handler": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "routing_tags": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]*$" },
+      "uniqueItems": true
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executable", "argv", "working_directory", "handoff_directory"],
+      "properties": {
+        "executable": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "inline_base64": { "type": "string", "contentEncoding": "base64" },
+            "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "interpreter": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            },
+            "mode": { "type": "integer", "minimum": 0, "maximum": 4095 }
+          },
+          "oneOf": [
+            { "required": ["path"], "not": { "required": ["inline_base64"] } },
+            { "required": ["inline_base64", "sha256"], "not": { "required": ["path"] } }
+          ]
+        },
+        "argv": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "env": {
+          "$ref": "#/$defs/environment"
+        },
+        "sensitive_env": {
+          "description": "Environment values that must be redacted from logs and API responses.",
+          "$ref": "#/$defs/environment"
+        },
+        "working_directory": { "type": "string", "minLength": 1 },
+        "handoff_directory": { "type": "string", "minLength": 1 }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_runtime_seconds": { "type": "integer", "minimum": 1 },
+        "idle_timeout_seconds": { "type": "integer", "minimum": 1, "default": 600 },
+        "completion_timeout_seconds": { "type": "integer", "minimum": 1, "default": 60 }
+      }
+    }
+  },
+  "$defs": {
+    "environment": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}

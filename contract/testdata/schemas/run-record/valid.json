@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "run_id": "run_01JZK0",
+  "dispatch_key": "run_01JZK0:root",
+  "status": "running",
+  "trigger": { "type": "manual", "principal": "user:derek" },
+  "workflow": {
+    "inline_script": {
+      "content": "#!/bin/sh\necho hello\n",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "params": { "issue": 17 },
+  "tags": ["os:darwin"],
+  "limits": { "max_runtime_seconds": 7200, "max_cost": 0 },
+  "envelopes": [],
+  "gates": [],
+  "created_at": "2026-08-09T12:00:00Z",
+  "updated_at": "2026-08-09T12:01:00Z",
+  "started_at": "2026-08-09T12:01:00Z"
+}
