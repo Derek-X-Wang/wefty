@@ -13,24 +13,21 @@ import (
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
-type logWrite struct {
-	event    contract.LogEvent
-	accepted chan error
-}
-
 // batchingLogSink decouples process-pipe reads from timed network uploads.
-// One goroutine owns the pending batch, so concurrent stdout/stderr calls keep
-// the runner's per-stream order without claiming any cross-stream ordering.
+// Every WriteOutput is committed to the SQLite spool before it returns. One
+// uploader goroutine drains those durable records, so a crash after acceptance
+// can only cause an idempotent replay, never a missing event.
 type batchingLogSink struct {
 	ctx           context.Context
 	client        *Client
 	claim         l1.Claim
+	spool         *logSpool
 	clock         Clock
 	batchSize     int
 	flushInterval time.Duration
 	retryInterval time.Duration
 
-	writes        chan logWrite
+	wake          chan struct{}
 	closeRequests chan chan error
 	done          chan struct{}
 	errMu         sync.Mutex
@@ -39,35 +36,44 @@ type batchingLogSink struct {
 	closeErr      error
 }
 
-func newBatchingLogSink(ctx context.Context, client *Client, claim l1.Claim, clock Clock, batchSize int, flushInterval, retryInterval time.Duration) *batchingLogSink {
+func newBatchingLogSink(ctx context.Context, client *Client, claim l1.Claim, spool *logSpool, clock Clock, batchSize int, flushInterval, retryInterval time.Duration) (*batchingLogSink, error) {
+	if err := spool.ensureAttempt(ctx, claim); err != nil {
+		return nil, err
+	}
 	sink := &batchingLogSink{
-		ctx: ctx, client: client, claim: claim, clock: clock,
+		ctx: ctx, client: client, claim: claim, spool: spool, clock: clock,
 		batchSize: batchSize, flushInterval: flushInterval, retryInterval: retryInterval,
-		writes:        make(chan logWrite, batchSize),
+		wake:          make(chan struct{}, 1),
 		closeRequests: make(chan chan error),
 		done:          make(chan struct{}),
 	}
 	go sink.run()
-	return sink
+	return sink, nil
 }
 
 func (sink *batchingLogSink) WriteOutput(ctx context.Context, event contract.LogEvent) error {
-	request := logWrite{event: event, accepted: make(chan error, 1)}
 	select {
-	case sink.writes <- request:
 	case <-sink.done:
 		return sink.err()
 	case <-ctx.Done():
 		return ctx.Err()
+	default:
 	}
-	select {
-	case err := <-request.accepted:
+	if err := sink.spool.append(ctx, event); err != nil {
 		return err
-	case <-sink.done:
-		return sink.err()
-	case <-ctx.Done():
-		return ctx.Err()
 	}
+	pending, err := sink.spool.pendingCount(ctx, event.AttemptID)
+	if err != nil {
+		return err
+	}
+	if pending < sink.batchSize {
+		return nil
+	}
+	select {
+	case sink.wake <- struct{}{}:
+	default:
+	}
+	return nil
 }
 
 func (sink *batchingLogSink) Close() error {
@@ -90,33 +96,22 @@ func (sink *batchingLogSink) run() {
 	flushTimer := sink.clock.NewTimer(sink.flushInterval)
 	defer stopTimer(flushTimer)
 	defer close(sink.done)
-	pending := make([]contract.LogEvent, 0, sink.batchSize)
 
 	for {
 		select {
-		case write := <-sink.writes:
-			pending = append(pending, write.event)
-			write.accepted <- nil
-			if len(pending) >= sink.batchSize {
-				if err := sink.upload(pending); err != nil {
-					sink.setError(err)
-					return
-				}
-				pending = pending[:0]
-			}
-		case <-flushTimer.C():
-			if len(pending) == 0 {
-				flushTimer.Reset(sink.flushInterval)
-				continue
-			}
-			if err := sink.upload(pending); err != nil {
+		case <-sink.wake:
+			if err := sink.uploadAvailable(false); err != nil {
 				sink.setError(err)
 				return
 			}
-			pending = pending[:0]
+		case <-flushTimer.C():
+			if err := sink.uploadAvailable(false); err != nil {
+				sink.setError(err)
+				return
+			}
 			flushTimer.Reset(sink.flushInterval)
 		case response := <-sink.closeRequests:
-			err := sink.upload(pending)
+			err := sink.uploadAvailable(true)
 			if err != nil {
 				sink.setError(err)
 			}
@@ -125,6 +120,24 @@ func (sink *batchingLogSink) run() {
 		case <-sink.ctx.Done():
 			sink.setError(sink.ctx.Err())
 			return
+		}
+	}
+}
+
+func (sink *batchingLogSink) uploadAvailable(all bool) error {
+	for {
+		events, err := sink.spool.pending(sink.ctx, sink.claim.Lease.AttemptID, sink.batchSize)
+		if err != nil {
+			return err
+		}
+		if len(events) == 0 {
+			return nil
+		}
+		if err := sink.upload(events); err != nil {
+			return err
+		}
+		if !all || len(events) < sink.batchSize {
+			return nil
 		}
 	}
 }
@@ -138,7 +151,10 @@ func (sink *batchingLogSink) upload(events []contract.LogEvent) error {
 	for {
 		response, err := sink.client.AppendLogs(sink.ctx, sink.claim.Job.JobID, sink.claim.Lease.AttemptID, request)
 		if err == nil {
-			return validateLogAcknowledgement(batch, response.Acknowledged)
+			if err := validateLogAcknowledgement(batch, response.Acknowledged); err != nil {
+				return err
+			}
+			return sink.spool.acknowledge(sink.ctx, sink.claim.Lease.AttemptID, response.Acknowledged)
 		}
 		var protocolErr *ProtocolError
 		if errors.As(err, &protocolErr) && protocolErr.StatusCode < http.StatusInternalServerError {
@@ -170,6 +186,11 @@ func validateLogAcknowledgement(events []contract.LogEvent, acknowledged map[con
 		}
 	}
 	return nil
+}
+
+func retryableAgentProtocolError(err error) bool {
+	var protocolErr *ProtocolError
+	return !errors.As(err, &protocolErr) || protocolErr.StatusCode >= http.StatusInternalServerError
 }
 
 func (sink *batchingLogSink) setError(err error) {

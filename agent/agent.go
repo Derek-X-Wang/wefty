@@ -25,6 +25,7 @@ const (
 	DefaultLogBatchSize      = 32
 	DefaultLogFlushInterval  = 100 * time.Millisecond
 	DefaultLogRetryInterval  = 100 * time.Millisecond
+	DefaultLogSpoolMaxBytes  = 64 << 20
 )
 
 // ProcessRunner is the execution seam used by the node loop.
@@ -53,6 +54,8 @@ type Config struct {
 	LogBatchSize        int
 	LogFlushInterval    time.Duration
 	LogRetryInterval    time.Duration
+	LogSpoolDirectory   string
+	LogSpoolMaxBytes    int64
 	Runner              ProcessRunner
 	OutputSinkFactory   OutputSinkFactory
 	HandoffRoot         string
@@ -72,6 +75,7 @@ type Agent struct {
 	logBatchSize      int
 	logFlushInterval  time.Duration
 	logRetryInterval  time.Duration
+	logSpool          *logSpool
 	runner            ProcessRunner
 	outputSinkFactory OutputSinkFactory
 	handoffs          *handoffManager
@@ -94,6 +98,9 @@ func New(config Config) (*Agent, error) {
 	if config.LogBatchSize < 0 || config.LogBatchSize > l1.MaxLogBatchEvents {
 		return nil, fmt.Errorf("agent: log batch size must be between 1 and %d", l1.MaxLogBatchEvents)
 	}
+	if config.LogSpoolMaxBytes < 0 {
+		return nil, errors.New("agent: log spool maximum bytes cannot be negative")
+	}
 	client, err := NewClient(config.Fabric, config.ControlPlaneAddress)
 	if err != nil {
 		return nil, err
@@ -114,6 +121,11 @@ func New(config Config) (*Agent, error) {
 	if runner == nil {
 		runner = processrunner.New(processrunner.Config{Clock: processClockAdapter{clock: clock}})
 	}
+	spool, err := openLogSpool(config.LogSpoolDirectory, config.NodeID, int64OrDefault(config.LogSpoolMaxBytes, DefaultLogSpoolMaxBytes))
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
 	return &Agent{
 		client: client,
 		registration: contract.NodeRegistration{
@@ -130,6 +142,7 @@ func New(config Config) (*Agent, error) {
 		logBatchSize:      intOrDefault(config.LogBatchSize, DefaultLogBatchSize),
 		logFlushInterval:  durationOrDefault(config.LogFlushInterval, DefaultLogFlushInterval),
 		logRetryInterval:  durationOrDefault(config.LogRetryInterval, DefaultLogRetryInterval),
+		logSpool:          spool,
 		runner:            runner,
 		outputSinkFactory: config.OutputSinkFactory,
 		handoffs:          newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
@@ -147,7 +160,14 @@ func (adapter processClockAdapter) NewTimer(duration time.Duration) processrunne
 }
 
 // Close releases idle protocol connections.
-func (a *Agent) Close() { a.client.Close() }
+func (a *Agent) Close() {
+	a.client.Close()
+	if a.logSpool != nil {
+		if err := a.logSpool.Close(); err != nil {
+			a.log("close durable log spool: %v", err)
+		}
+	}
+}
 
 // Register starts or replaces the stable node's current boot session.
 func (a *Agent) Register(ctx context.Context) (l1.Node, error) {
@@ -173,6 +193,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	runContext, stop := context.WithCancel(ctx)
 	defer stop()
+	if err := a.recoverPendingLogs(runContext); err != nil {
+		if runContext.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("agent: recover durable logs: %w", err)
+	}
 	if _, err := a.Register(runContext); err != nil {
 		return fmt.Errorf("agent: register node: %w", err)
 	}
@@ -201,6 +227,15 @@ func (a *Agent) Run(ctx context.Context) error {
 			if runContext.Err() != nil || a.isDraining() {
 				return nil
 			}
+			if retryableAgentProtocolError(err) {
+				if waitErr := a.wait(runContext, a.claimInterval, heartbeatErrors); waitErr != nil {
+					if errors.Is(waitErr, context.Canceled) {
+						return nil
+					}
+					return waitErr
+				}
+				continue
+			}
 			return fmt.Errorf("agent: claim job: %w", err)
 		}
 		if claim == nil {
@@ -221,6 +256,30 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
+func (a *Agent) recoverPendingLogs(ctx context.Context) error {
+	if a.logSpool == nil {
+		return nil
+	}
+	attempts, err := a.logSpool.pendingAttempts(ctx)
+	if err != nil {
+		return err
+	}
+	for _, attempt := range attempts {
+		claim := l1.Claim{
+			Job:   l1.Job{JobID: attempt.jobID},
+			Lease: l1.AttemptLease{AttemptID: attempt.attemptID, FencingToken: attempt.fencingToken},
+		}
+		uploader, err := newBatchingLogSink(ctx, a.client, claim, a.logSpool, a.clock, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
+		if err != nil {
+			return err
+		}
+		if err := uploader.Close(); err != nil {
+			return fmt.Errorf("attempt %s: %w", attempt.attemptID, err)
+		}
+	}
+	return nil
+}
+
 func (a *Agent) heartbeatLoop(ctx context.Context, failures chan<- error) {
 	for {
 		timer := a.clock.NewTimer(a.heartbeatInterval)
@@ -230,6 +289,9 @@ func (a *Agent) heartbeatLoop(ctx context.Context, failures chan<- error) {
 			return
 		case <-timer.C():
 			if _, err := a.client.Heartbeat(ctx, a.registration.NodeID, a.registration.BootSessionID); err != nil {
+				if retryableAgentProtocolError(err) {
+					continue
+				}
 				select {
 				case failures <- fmt.Errorf("agent: heartbeat: %w", err):
 				default:
@@ -280,7 +342,7 @@ func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) error {
 		IdempotencyKey: "completion:" + claim.Lease.AttemptID,
 		Result:         toL1Result(outcome.result),
 	}
-	if _, err := a.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request); err != nil {
+	if err := a.completeWithRetry(ctx, claim, request); err != nil {
 		return fmt.Errorf("agent: complete attempt: %w", err)
 	}
 	if a.handoffs != nil {
@@ -290,6 +352,25 @@ func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) error {
 		}
 	}
 	return nil
+}
+
+func (a *Agent) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) error {
+	for {
+		if _, err := a.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request); err != nil {
+			if !retryableAgentProtocolError(err) {
+				return err
+			}
+			timer := a.clock.NewTimer(a.logRetryInterval)
+			select {
+			case <-ctx.Done():
+				stopTimer(timer)
+				return ctx.Err()
+			case <-timer.C():
+			}
+			continue
+		}
+		return nil
+	}
 }
 
 func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
@@ -313,7 +394,10 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 	var uploader *batchingLogSink
 	var sinks multiOutputSink
 	if a.client != nil {
-		uploader = newBatchingLogSink(ctx, a.client, claim, a.clock, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
+		uploader, err = newBatchingLogSink(ctx, a.client, claim, a.logSpool, a.clock, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
+		if err != nil {
+			return contract.ProcessResult{SpawnError: err.Error()}, err
+		}
 		sinks = append(sinks, uploader)
 	}
 	var localSink processrunner.OutputSink
@@ -357,9 +441,9 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 
 func (a *Agent) renewalLoop(ctx context.Context, claim l1.Claim, failures chan<- error) {
 	lease := claim.Lease
+	nextDelay := renewalDelay(a.clock.Now(), lease.LeaseExpires, a.renewalInterval)
 	for {
-		delay := renewalDelay(a.clock.Now(), lease.LeaseExpires, a.renewalInterval)
-		timer := a.clock.NewTimer(delay)
+		timer := a.clock.NewTimer(nextDelay)
 		select {
 		case <-ctx.Done():
 			stopTimer(timer)
@@ -368,6 +452,13 @@ func (a *Agent) renewalLoop(ctx context.Context, claim l1.Claim, failures chan<-
 		}
 		renewed, err := a.client.Renew(ctx, claim.Job.JobID, lease.AttemptID, lease.FencingToken)
 		if err != nil {
+			if retryableAgentProtocolError(err) {
+				remaining := lease.LeaseExpires.Sub(a.clock.Now())
+				if remaining > 0 {
+					nextDelay = min(a.logRetryInterval, remaining)
+					continue
+				}
+			}
 			select {
 			case failures <- err:
 			default:
@@ -375,6 +466,7 @@ func (a *Agent) renewalLoop(ctx context.Context, claim l1.Claim, failures chan<-
 			return
 		}
 		lease = renewed
+		nextDelay = renewalDelay(a.clock.Now(), lease.LeaseExpires, a.renewalInterval)
 	}
 }
 
@@ -433,6 +525,13 @@ func durationOrDefault(value, fallback time.Duration) time.Duration {
 }
 
 func intOrDefault(value, fallback int) int {
+	if value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func int64OrDefault(value, fallback int64) int64 {
 	if value <= 0 {
 		return fallback
 	}

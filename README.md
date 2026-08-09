@@ -62,7 +62,13 @@ The stable `--node-id` survives agent restarts; each process generates a new
 boot-session ID. Heartbeats and attempt lease renewals use independent
 cadences. SIGINT or SIGTERM starts a graceful drain: the node stops claiming,
 lets its current attempt complete, and exits; a second signal forces local
-cancellation. For tsnet, also supply `--fabric-name`, `--state-dir`, and an auth key
+cancellation. Output is synchronously retained in a per-node SQLite spool before
+the runner is allowed to continue. The spool resumes each original attempt from
+its persisted upload acknowledgement after reconnect or restart; polling cursors
+never affect this acknowledgement. `--log-spool-max-bytes` bounds unacknowledged
+payload retention (64 MiB by default). Reaching the bound stops and fails the
+producer explicitly—accepted records are never evicted or silently dropped.
+For tsnet, also supply `--fabric-name`, `--state-dir`, and an auth key
 whose node identity has the `tag:wefty-agent` principal tag. The credentialed
 agent smoke remains env-gated by `TS_AUTHKEY` (and optionally
 `TS_AGENT_PRINCIPAL_TAG` when a tailnet uses a different tag).
