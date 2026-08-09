@@ -113,6 +113,46 @@ func TestInjectedIdentityDrivesAuthorization(t *testing.T) {
 	}
 }
 
+func TestInjectedIdentityCrossesNetworkInstances(t *testing.T) {
+	serverNetwork := NewNetwork()
+	clientNetwork := NewNetwork()
+	server := serverNetwork.NewFabric(fabric.Identity{NodeID: "control-plane"})
+	clientIdentity := fabric.Identity{NodeID: "runner-cross-process", Tags: []string{"agent"}}
+	client := clientNetwork.NewFabric(clientIdentity)
+
+	ln, err := server.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			accepted <- err
+			return
+		}
+		defer conn.Close()
+		identity, err := server.WhoIs(context.Background(), conn.RemoteAddr().String())
+		if err == nil && (identity.NodeID != clientIdentity.NodeID || !slices.Equal(identity.Tags, clientIdentity.Tags)) {
+			err = fmt.Errorf("WhoIs() = %#v, want %#v", identity, clientIdentity)
+		}
+		accepted <- err
+	}()
+
+	conn, err := client.Dial(context.Background(), "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-accepted; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPlainRejectsNonLocalAddress(t *testing.T) {
 	f := NewNetwork().NewFabric(fabric.Identity{})
 	if _, err := f.Listen("tcp", "0.0.0.0:0"); err == nil {
