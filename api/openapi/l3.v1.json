@@ -223,7 +223,7 @@
       "post": {
         "operationId": "rerunRun",
         "summary": "Create a new run from a stored run snapshot",
-        "description": "Copies the source run's immutable executable bytes, SHA-256, interpreter, mode, params, tags, limits, and envelope requirements. Saved workflow refs are never re-resolved. Trigger provenance records rerun and the source run ID.",
+        "description": "Copies the source run's immutable executable bytes, SHA-256, interpreter, mode, params, tags, limits, and envelope requirements. Saved workflow refs are never re-resolved. Trigger provenance records rerun and the source run ID. The source must carry exactly one reserved wefty:node:<stable-node-id> tag; the rerun reuses its node-local handoff directory and otherwise fails explicitly.",
         "security": [{ "callerToken": [] }],
         "responses": {
           "200": {

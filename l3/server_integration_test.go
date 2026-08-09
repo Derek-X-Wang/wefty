@@ -46,7 +46,9 @@ func newIntegrationHarness(t *testing.T) *integrationHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{"node-1": {"linux"}}})
+	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{
+		"node-1": {"linux", contract.StableNodeTagPrefix + "node-1"},
+	}})
 	if err != nil {
 		l1Store.Close()
 		t.Fatal(err)
@@ -466,6 +468,7 @@ func TestSavedWorkflowNotFoundAndRerunSnapshotReuse(t *testing.T) {
 	request := inlineRunRequest("unused")
 	request.InlineScript = nil
 	request.WorkflowRef = "workflow://rerunnable"
+	request.Tags = append(request.Tags, contract.StableNodeTagPrefix+"node-1")
 	source := h.submit(request, "rerun-source")
 	h.createWorkflowVersion("rerunnable", "#!/bin/sh\necho rerun-v2\n")
 
@@ -527,7 +530,22 @@ func TestSavedWorkflowNotFoundAndRerunSnapshotReuse(t *testing.T) {
 		if string(decoded) != v1Content || claim.Job.Spec.Execution.Executable.SHA256 != v1.SHA256 {
 			t.Fatalf("claim %d snapshot = %q/%q, want v1", i, decoded, claim.Job.Spec.Execution.Executable.SHA256)
 		}
+		if claim.Job.Spec.Execution.HandoffDirectory != filepath.Join(DefaultHandoffRoot, source.RunID) {
+			t.Fatalf("claim %d handoff directory = %q, want source-run directory", i, claim.Job.Spec.Execution.HandoffDirectory)
+		}
+		if claim.Job.Spec.Labels["run_id"] == rerun.RunID && claim.Job.Spec.Labels["handoff_owner_run_id"] != source.RunID {
+			t.Fatalf("rerun handoff owner label = %#v", claim.Job.Spec.Labels)
+		}
 	}
+}
+
+func TestRerunWithoutStableNodePinFailsExplicitly(t *testing.T) {
+	h := newIntegrationHarness(t)
+	source := h.submit(inlineRunRequest("#!/bin/sh\necho unpinned\n"), "rerun-unpinned-source")
+	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+source.RunID+"/rerun", nil, http.Header{
+		"Idempotency-Key": []string{"rerun-unpinned"},
+	})
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
 }
 
 func TestParentRunRecordsChainProvenance(t *testing.T) {

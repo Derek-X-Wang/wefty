@@ -20,6 +20,7 @@ const (
 	DefaultHeartbeatInterval = 15 * time.Second
 	DefaultClaimInterval     = time.Second
 	DefaultRenewalInterval   = 10 * time.Second
+	DefaultHandoffRetention  = 24 * time.Hour
 	DefaultLogBatchSize      = 32
 	DefaultLogFlushInterval  = 100 * time.Millisecond
 	DefaultLogRetryInterval  = 100 * time.Millisecond
@@ -53,6 +54,8 @@ type Config struct {
 	LogRetryInterval    time.Duration
 	Runner              ProcessRunner
 	OutputSinkFactory   OutputSinkFactory
+	HandoffRoot         string
+	HandoffRetention    time.Duration
 	Logf                func(string, ...any)
 }
 
@@ -69,6 +72,7 @@ type Agent struct {
 	logRetryInterval  time.Duration
 	runner            ProcessRunner
 	outputSinkFactory OutputSinkFactory
+	handoffs          *handoffManager
 	logf              func(string, ...any)
 }
 
@@ -119,6 +123,7 @@ func New(config Config) (*Agent, error) {
 		logRetryInterval:  durationOrDefault(config.LogRetryInterval, DefaultLogRetryInterval),
 		runner:            runner,
 		outputSinkFactory: config.OutputSinkFactory,
+		handoffs:          newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
 		logf:              config.Logf,
 	}, nil
 }
@@ -134,6 +139,11 @@ func (a *Agent) Register(ctx context.Context) (l1.Node, error) {
 // Run registers and then serves claims until the context is canceled or the
 // control plane rejects a liveness or execution operation.
 func (a *Agent) Run(ctx context.Context) error {
+	if a.handoffs != nil {
+		if err := a.handoffs.cleanupExpired(""); err != nil {
+			return fmt.Errorf("agent: clean expired handoff directories: %w", err)
+		}
+	}
 	if _, err := a.Register(ctx); err != nil {
 		return fmt.Errorf("agent: register node: %w", err)
 	}
@@ -236,6 +246,12 @@ func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) error {
 	if _, err := a.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request); err != nil {
 		return fmt.Errorf("agent: complete attempt: %w", err)
 	}
+	if a.handoffs != nil {
+		succeeded := outcome.err == nil && outcome.result.ExitCode != nil && *outcome.result.ExitCode == 0
+		if err := a.handoffs.finish(claim.Job.Spec, a.registration.NodeID, succeeded); err != nil {
+			return fmt.Errorf("agent: finish handoff lifecycle: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -247,28 +263,59 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 		err := fmt.Errorf("runtime handler %q is not supported for process jobs", claim.Job.Spec.RuntimeHandler)
 		return contract.ProcessResult{SpawnError: err.Error()}, err
 	}
-	uploader := newBatchingLogSink(ctx, a.client, claim, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
+	if a.handoffs != nil {
+		if err := a.handoffs.prepare(claim.Job.Spec, a.registration.NodeID); err != nil {
+			return contract.ProcessResult{SpawnError: err.Error()}, err
+		}
+	}
+	execution, cleanupExecutable, err := materializeExecutable(claim.Job.Spec.Execution, claim.Lease.AttemptID)
+	if err != nil {
+		return contract.ProcessResult{SpawnError: err.Error()}, err
+	}
+	defer cleanupExecutable()
+	var uploader *batchingLogSink
+	var sinks multiOutputSink
+	if a.client != nil {
+		uploader = newBatchingLogSink(ctx, a.client, claim, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
+		sinks = append(sinks, uploader)
+	}
 	var localSink processrunner.OutputSink
 	if a.outputSinkFactory != nil {
 		localSink = a.outputSinkFactory(claim)
 	}
-	sink := processrunner.OutputSink(uploader)
 	if localSink != nil {
-		sink = multiOutputSink{uploader, localSink}
+		sinks = append(sinks, localSink)
+	}
+	var sink processrunner.OutputSink
+	if len(sinks) == 1 {
+		sink = sinks[0]
+	} else if len(sinks) > 1 {
+		sink = sinks
+	}
+	redactingSink := newRedactingOutputSink(sink, claim.Job.Spec.Execution.SensitiveEnv)
+	if redactingSink != nil {
+		sink = redactingSink
 	}
 	result, runErr := a.runner.Run(ctx, processrunner.Request{
 		AttemptID: claim.Lease.AttemptID,
-		Execution: claim.Job.Spec.Execution,
+		Execution: execution,
 		Limits:    claim.Job.Spec.Limits,
 	}, sink)
-	flushErr := uploader.Close()
-	if runErr != nil {
-		return result, runErr
+	var outputErr error
+	if redactingSink != nil {
+		outputErr = redactingSink.Flush(ctx)
 	}
-	if flushErr != nil {
-		return result, fmt.Errorf("upload logs: %w", flushErr)
+	var uploadErr error
+	if uploader != nil {
+		uploadErr = uploader.Close()
 	}
-	return result, nil
+	if outputErr != nil {
+		outputErr = fmt.Errorf("flush redacted output: %w", outputErr)
+	}
+	if uploadErr != nil {
+		uploadErr = fmt.Errorf("upload logs: %w", uploadErr)
+	}
+	return result, errors.Join(runErr, outputErr, uploadErr)
 }
 
 func (a *Agent) renewalLoop(ctx context.Context, claim l1.Claim, failures chan<- error) {

@@ -170,7 +170,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		w.Header().Set("Idempotency-Replayed", "true")
 	}
-	writeJSON(w, status, job)
+	writeJSON(w, status, redactJob(job))
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
@@ -179,7 +179,7 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	writeJSON(w, http.StatusOK, redactJob(job))
 }
 
 func (s *Server) getJobLogs(w http.ResponseWriter, r *http.Request) {
@@ -291,7 +291,12 @@ func (s *Server) completeAttempt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	writeJSON(w, http.StatusOK, redactJob(job))
+}
+
+func redactJob(job Job) Job {
+	job.Spec.Execution.SensitiveEnv = nil
+	return job
 }
 
 func (s *Server) notImplemented(w http.ResponseWriter, _ *http.Request) {
