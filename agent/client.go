@@ -70,6 +70,12 @@ func (c *Client) Heartbeat(ctx context.Context, nodeID, bootSessionID string) (l
 	return node, err
 }
 
+func (c *Client) Drain(ctx context.Context, nodeID, bootSessionID string) (l1.Node, error) {
+	var node l1.Node
+	err := c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/drain", l1.DrainRequest{BootSessionID: bootSessionID}, &node)
+	return node, err
+}
+
 func (c *Client) Claim(ctx context.Context, nodeID, bootSessionID string) (*l1.Claim, error) {
 	var claim l1.Claim
 	noContent, err := c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: nodeID, BootSessionID: bootSessionID}, &claim)

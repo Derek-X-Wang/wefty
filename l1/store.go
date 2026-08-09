@@ -32,15 +32,19 @@ const (
 )
 
 type StoreOptions struct {
-	Clock         Clock
-	LeaseDuration time.Duration
+	Clock          Clock
+	LeaseDuration  time.Duration
+	NodeStaleAfter time.Duration
+	NodeDeadAfter  time.Duration
 }
 
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
-	db            *sql.DB
-	clock         Clock
-	leaseDuration time.Duration
+	db             *sql.DB
+	clock          Clock
+	leaseDuration  time.Duration
+	nodeStaleAfter time.Duration
+	nodeDeadAfter  time.Duration
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
@@ -58,6 +62,17 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if leaseDuration <= 0 {
 		leaseDuration = DefaultLeaseDuration
 	}
+	nodeStaleAfter := options.NodeStaleAfter
+	if nodeStaleAfter <= 0 {
+		nodeStaleAfter = DefaultNodeStaleAfter
+	}
+	nodeDeadAfter := options.NodeDeadAfter
+	if nodeDeadAfter <= 0 {
+		nodeDeadAfter = DefaultNodeDeadAfter
+	}
+	if nodeDeadAfter <= nodeStaleAfter {
+		return nil, fmt.Errorf("l1: node dead threshold must exceed stale threshold")
+	}
 
 	query := make(url.Values)
 	query.Add("_pragma", "busy_timeout(5000)")
@@ -69,7 +84,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		return nil, fmt.Errorf("l1: open SQLite: %w", err)
 	}
 	db.SetMaxOpenConns(16)
-	store := &Store{db: db, clock: clock, leaseDuration: leaseDuration}
+	store := &Store{
+		db: db, clock: clock, leaseDuration: leaseDuration,
+		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter,
+	}
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -307,8 +325,11 @@ WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, id
 
 func (s *Store) HeartbeatNode(ctx context.Context, identityNodeID, nodeID, bootSessionID string) (Node, error) {
 	now := canonicalTime(s.clock.Now())
-	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET state=?, last_heartbeat_ns=?
-	WHERE node_id=? AND identity_node_id=? AND boot_session_id=? AND state IN (?, ?)`, contract.NodeAlive, now.UnixNano(), nodeID, identityNodeID, bootSessionID, contract.NodeAlive, contract.NodeStale)
+	result, err := s.db.ExecContext(ctx, `UPDATE nodes
+	SET state=CASE WHEN state IN (?, ?) THEN ? ELSE state END, last_heartbeat_ns=?
+	WHERE node_id=? AND identity_node_id=? AND boot_session_id=? AND state IN (?, ?, ?)`,
+		contract.NodeAlive, contract.NodeStale, contract.NodeAlive, now.UnixNano(), nodeID, identityNodeID, bootSessionID,
+		contract.NodeAlive, contract.NodeStale, contract.NodeDraining)
 	if err != nil {
 		return Node{}, internalError(err, "update node heartbeat")
 	}
@@ -338,7 +359,8 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 
 	var nodeState contract.NodeState
 	var storedIdentity, storedBoot string
-	err = tx.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state FROM nodes WHERE node_id=?", nodeID).Scan(&storedIdentity, &storedBoot, &nodeState)
+	var heartbeatNS int64
+	err = tx.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state, last_heartbeat_ns FROM nodes WHERE node_id=?", nodeID).Scan(&storedIdentity, &storedBoot, &nodeState, &heartbeatNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, protocolError(contract.ErrorConflict, "node %q is not registered", nodeID)
 	}
@@ -348,11 +370,18 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	if storedIdentity != identityNodeID || storedBoot != bootSessionID {
 		return nil, protocolError(contract.ErrorForbidden, "authenticated node does not own this registration")
 	}
+	now := canonicalTime(s.clock.Now())
+	nodeState, err = s.reconcileClaimingNode(ctx, tx, nodeID, nodeState, time.Unix(0, heartbeatNS).UTC(), now)
+	if err != nil {
+		return nil, err
+	}
 	if nodeState != contract.NodeAlive {
+		if err := tx.Commit(); err != nil {
+			return nil, internalError(err, "commit node liveness transition")
+		}
 		return nil, protocolError(contract.ErrorConflict, "node %q is not alive", nodeID)
 	}
 
-	now := canonicalTime(s.clock.Now())
 	leaseExpires := canonicalTime(now.Add(s.leaseDuration))
 	attemptID := newID("attempt")
 	var jobID string
@@ -425,6 +454,12 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 		return AttemptLease{}, err
 	}
 	now := canonicalTime(s.clock.Now())
+	if attempt.state == contract.AttemptLost && !now.Before(attempt.leaseExpires) {
+		return AttemptLease{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
+	}
+	if attempt.state != contract.AttemptClaimed && attempt.state != contract.AttemptRunning && attempt.state != contract.AttemptAwaitingInput {
+		return AttemptLease{}, protocolError(contract.ErrorConflict, "attempt is terminal")
+	}
 	if !now.Before(attempt.leaseExpires) {
 		if err := expireAttempt(ctx, tx, attempt, now); err != nil {
 			return AttemptLease{}, err
@@ -434,13 +469,19 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 		}
 		return AttemptLease{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
 	}
-	if attempt.state != contract.AttemptClaimed && attempt.state != contract.AttemptRunning && attempt.state != contract.AttemptAwaitingInput {
-		return AttemptLease{}, protocolError(contract.ErrorConflict, "attempt is terminal")
-	}
 	expires := canonicalTime(now.Add(s.leaseDuration))
-	_, err = tx.ExecContext(ctx, "UPDATE attempts SET lease_expires_ns=?, updated_ns=? WHERE attempt_id=?", expires.UnixNano(), now.UnixNano(), attemptID)
+	nextState := attempt.state
+	if attempt.state == contract.AttemptClaimed {
+		nextState = contract.AttemptRunning
+	}
+	_, err = tx.ExecContext(ctx, "UPDATE attempts SET state=?, lease_expires_ns=?, updated_ns=? WHERE attempt_id=?", nextState, expires.UnixNano(), now.UnixNano(), attemptID)
 	if err != nil {
 		return AttemptLease{}, internalError(err, "renew attempt lease")
+	}
+	if attempt.state == contract.AttemptClaimed {
+		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=? AND state=?", contract.JobRunning, now.UnixNano(), jobID, contract.JobClaimed); err != nil {
+			return AttemptLease{}, internalError(err, "acknowledge renewed job execution")
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return AttemptLease{}, internalError(err, "commit lease renewal")
@@ -832,11 +873,20 @@ func validateAttemptAuthority(identityNodeID, jobID, attemptID, fencingToken str
 }
 
 func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, now time.Time) error {
-	if attempt.state != contract.AttemptLost {
-		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=?, updated_ns=? WHERE attempt_id=?", contract.AttemptLost, now.UnixNano(), attempt.attemptID); err != nil {
-			return internalError(err, "mark attempt lost")
-		}
-		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?", contract.JobFailed, now.UnixNano(), attempt.jobID); err != nil {
+	result, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, updated_ns=?
+		WHERE attempt_id=? AND state IN (?, ?, ?)`, contract.AttemptLost, now.UnixNano(), attempt.attemptID,
+		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput)
+	if err != nil {
+		return internalError(err, "mark attempt lost")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "read attempt expiry result")
+	}
+	if changed > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=?
+			WHERE job_id=? AND current_attempt_id=? AND state IN (?, ?)`, contract.JobFailed, now.UnixNano(), attempt.jobID,
+			attempt.attemptID, contract.JobClaimed, contract.JobRunning); err != nil {
 			return internalError(err, "fail job after lease expiry")
 		}
 	}
