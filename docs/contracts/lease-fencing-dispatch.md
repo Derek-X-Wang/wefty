@@ -3,6 +3,11 @@
 This document fixes the concurrency and idempotency semantics used by the L1
 client protocol, L1 agent protocol, and L3 dispatch outbox.
 
+The client and agent protocols are separate Fabric-authenticated route groups.
+Configured Fabric identity tags grant the `client` or `agent` principal; a
+principal for one group cannot call the other. Run-token scoping remains an L3
+concern and does not replace the L1 Fabric principal boundary.
+
 ## Atomic claim and eligibility
 
 A claim is one SQLite transaction that selects a `queued` job whose normalized
