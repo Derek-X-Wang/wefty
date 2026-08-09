@@ -85,8 +85,9 @@ func (s *Server) routes() http.Handler {
 	runs := http.NewServeMux()
 	runs.HandleFunc("POST /v1/runs", s.createRun)
 	runs.HandleFunc("GET /v1/runs/{run_id}", s.getRun)
-	runs.HandleFunc("POST /v1/runs/{run_id}/envelopes", s.inRunWriteNotImplemented)
-	runs.HandleFunc("POST /v1/runs/{run_id}/gates", s.inRunWriteNotImplemented)
+	runs.HandleFunc("GET /v1/runs/{run_id}/lineage", s.getRunLineage)
+	runs.HandleFunc("POST /v1/runs/{run_id}/envelopes", s.appendEnvelope)
+	runs.HandleFunc("POST /v1/runs/{run_id}/gates", s.appendGateResult)
 	runs.HandleFunc("POST /v1/runs/{run_id}/rerun", s.rerun)
 
 	workflows := http.NewServeMux()
@@ -216,7 +217,54 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, record)
 }
 
-func (s *Server) inRunWriteNotImplemented(w http.ResponseWriter, r *http.Request) {
+func (s *Server) getRunLineage(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("run_id")
+	var scope RunTokenScope
+	var scoped bool
+	if scope, scoped = runTokenFromRequest(r); scoped {
+		allowed, err := s.store.CanReadRun(r.Context(), scope.RunID, runID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if !allowed {
+			writeError(w, protocolError(contract.ErrorForbidden, "run token cannot read an ancestor or sibling lineage"))
+			return
+		}
+	}
+	lineage, err := s.store.GetLineage(r.Context(), runID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if scoped {
+		lineage.Ancestors, err = s.filterVisibleLineage(r.Context(), scope.RunID, lineage.Ancestors)
+		if err == nil {
+			lineage.Descendants, err = s.filterVisibleLineage(r.Context(), scope.RunID, lineage.Descendants)
+		}
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, lineage)
+}
+
+func (s *Server) filterVisibleLineage(ctx context.Context, ownerRunID string, entries []LineageEntry) ([]LineageEntry, error) {
+	visible := make([]LineageEntry, 0, len(entries))
+	for _, entry := range entries {
+		allowed, err := s.store.CanReadRun(ctx, ownerRunID, entry.RunID)
+		if err != nil {
+			return nil, err
+		}
+		if allowed {
+			visible = append(visible, entry)
+		}
+	}
+	return visible, nil
+}
+
+func (s *Server) appendEnvelope(w http.ResponseWriter, r *http.Request) {
 	scope, ok := runTokenFromRequest(r)
 	if !ok {
 		writeError(w, protocolError(contract.ErrorForbidden, "a run token is required for in-run writes"))
@@ -226,7 +274,40 @@ func (s *Server) inRunWriteNotImplemented(w http.ResponseWriter, r *http.Request
 		writeError(w, protocolError(contract.ErrorForbidden, "run token may write only its own run"))
 		return
 	}
-	writeError(w, protocolError(contract.ErrorNotImplemented, "envelope and gate storage is implemented in issue #28"))
+	raw, err := decodeRawJSON(r)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	value, replayed, err := s.store.AppendEnvelope(r.Context(), scope, raw)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeProtocolAppend(w, value, replayed)
+}
+
+func (s *Server) appendGateResult(w http.ResponseWriter, r *http.Request) {
+	scope, ok := runTokenFromRequest(r)
+	if !ok {
+		writeError(w, protocolError(contract.ErrorForbidden, "a run token is required for in-run writes"))
+		return
+	}
+	if r.PathValue("run_id") != scope.RunID {
+		writeError(w, protocolError(contract.ErrorForbidden, "run token may write only its own run"))
+		return
+	}
+	raw, err := decodeRawJSON(r)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	value, replayed, err := s.store.AppendGateResult(r.Context(), scope, raw)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeProtocolAppend(w, value, replayed)
 }
 
 func (s *Server) rerun(w http.ResponseWriter, r *http.Request) {
@@ -306,6 +387,31 @@ func decodeJSON(r *http.Request, target any) error {
 		return protocolError(contract.ErrorInvalidRequest, "invalid trailing JSON: %v", err)
 	}
 	return nil
+}
+
+func decodeRawJSON(r *http.Request) (json.RawMessage, error) {
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 16<<20))
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		return nil, protocolError(contract.ErrorInvalidRequest, "invalid JSON request: %v", err)
+	}
+	err := decoder.Decode(&struct{}{})
+	if err == nil {
+		return nil, protocolError(contract.ErrorInvalidRequest, "request body must contain one JSON value")
+	}
+	if !errors.Is(err, io.EOF) {
+		return nil, protocolError(contract.ErrorInvalidRequest, "invalid trailing JSON: %v", err)
+	}
+	return raw, nil
+}
+
+func writeProtocolAppend(w http.ResponseWriter, value any, replayed bool) {
+	status := http.StatusCreated
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, value)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -165,6 +165,39 @@ func TestL3SavedWorkflowAndRerunRoutesArePublished(t *testing.T) {
 	}
 }
 
+func TestL3InRunProtocolRoutesAndReplayResponsesArePublished(t *testing.T) {
+	t.Parallel()
+
+	doc := readObject(t, "l3.v1.json")
+	paths := object(t, doc["paths"], "paths")
+	for _, path := range []string{
+		"/v1/runs/{run_id}/lineage",
+		"/v1/runs/{run_id}/envelopes",
+		"/v1/runs/{run_id}/gates",
+	} {
+		if _, ok := paths[path]; !ok {
+			t.Errorf("missing in-run protocol route %s", path)
+		}
+	}
+	for _, path := range []string{"/v1/runs/{run_id}/envelopes", "/v1/runs/{run_id}/gates"} {
+		operation := object(t, object(t, paths[path], path)["post"], path+".post")
+		responses := object(t, operation["responses"], path+".responses")
+		if _, ok := responses["200"]; !ok {
+			t.Errorf("%s does not publish idempotent replay response", path)
+		}
+		if _, ok := responses["201"]; !ok {
+			t.Errorf("%s does not publish append response", path)
+		}
+	}
+	components := object(t, doc["components"], "components")
+	schemas := object(t, components["schemas"], "components.schemas")
+	for _, schema := range []string{"LineageEntry", "RunLineage"} {
+		if _, ok := schemas[schema]; !ok {
+			t.Errorf("missing lineage schema %s", schema)
+		}
+	}
+}
+
 func TestAllOpenAPIFilesAreJSON(t *testing.T) {
 	t.Parallel()
 
