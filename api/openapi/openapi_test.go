@@ -121,6 +121,26 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	}
 }
 
+func TestL1RouteGroupsUseFabricIdentity(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"l1-client.v1.json", "l1-agent.v1.json"} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			doc := readObject(t, name)
+			security, ok := doc["security"].([]any)
+			if !ok || len(security) != 1 {
+				t.Fatalf("security = %#v, want one requirement", doc["security"])
+			}
+			requirement := object(t, security[0], "security[0]")
+			if _, ok := requirement["fabricIdentity"]; !ok {
+				t.Fatalf("security requirement = %#v, want fabricIdentity", requirement)
+			}
+		})
+	}
+}
+
 func TestAllOpenAPIFilesAreJSON(t *testing.T) {
 	t.Parallel()
 

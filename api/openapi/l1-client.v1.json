@@ -3,10 +3,10 @@
   "info": {
     "title": "Wefty L1 client protocol",
     "version": "0.1.0-prerelease",
-    "description": "Job submission and polling surface for callers. Agent-only mutation verbs are in l1-agent.v1.json."
+    "description": "Fabric-authenticated job submission and polling surface for client principals. Agent-only mutation verbs are in l1-agent.v1.json."
   },
   "servers": [{ "url": "wefty://control-plane" }],
-  "security": [{ "runToken": [] }],
+  "security": [{ "fabricIdentity": [] }],
   "paths": {
     "/v1/jobs": {
       "post": {
@@ -175,7 +175,7 @@
   },
   "components": {
     "securitySchemes": {
-      "runToken": { "$ref": "./common.v1.json#/components/securitySchemes/runToken" }
+      "fabricIdentity": { "$ref": "./common.v1.json#/components/securitySchemes/fabricIdentity" }
     }
   }
 }
