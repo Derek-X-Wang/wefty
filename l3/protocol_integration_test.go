@@ -149,6 +149,55 @@ func TestEnvelopeAndGateWritesAreAppendOnlyAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestProtocolWritesBindOmittedAttemptAndRejectExplicitMismatch(t *testing.T) {
+	h := newIntegrationHarness(t)
+	accepted := h.submit(inlineRunRequest("#!/bin/sh\nexit 0\n"), "protocol-attempt-binding")
+	claim := dispatchAndClaimRun(t, h, accepted.RunID)
+	scope, err := h.l3Store.AuthenticateRunToken(context.Background(), claim.Job.Spec.Execution.SensitiveEnv[contract.EnvRunToken])
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := h.client(fabric.Identity{NodeID: "workflow-node"}, DefaultL3Address)
+	auth := runAuthorization(claim)
+
+	envelope := protocolBodyWithoutAttempt(t, validEnvelope(accepted.RunID, scope.AttemptID, "bound-envelope"))
+	status, _, body := h.do(workflow, http.MethodPost, "/v1/runs/"+accepted.RunID+"/envelopes", envelope, auth)
+	if status != http.StatusCreated {
+		t.Fatalf("append envelope without attempt_id = %d body=%s", status, body)
+	}
+	var storedEnvelope contract.Envelope
+	if err := json.Unmarshal(body, &storedEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	if storedEnvelope.AttemptID != scope.AttemptID {
+		t.Fatalf("bound envelope attempt_id = %q, want %q", storedEnvelope.AttemptID, scope.AttemptID)
+	}
+
+	gate := protocolBodyWithoutAttempt(t, validGate(accepted.RunID, scope.AttemptID, "bound-gate"))
+	status, _, body = h.do(workflow, http.MethodPost, "/v1/runs/"+accepted.RunID+"/gates", gate, auth)
+	if status != http.StatusCreated {
+		t.Fatalf("append gate without attempt_id = %d body=%s", status, body)
+	}
+	var storedGate contract.GateResult
+	if err := json.Unmarshal(body, &storedGate); err != nil {
+		t.Fatal(err)
+	}
+	if storedGate.AttemptID != scope.AttemptID {
+		t.Fatalf("bound gate attempt_id = %q, want %q", storedGate.AttemptID, scope.AttemptID)
+	}
+
+	mismatch := validEnvelope(accepted.RunID, "attempt-other", "mismatched-envelope")
+	status, _, body = h.do(workflow, http.MethodPost, "/v1/runs/"+accepted.RunID+"/envelopes", mismatch, auth)
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+	rejections, err := h.l3Store.ListProtocolRejections(context.Background(), accepted.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rejections) != 0 {
+		t.Fatalf("attempt mismatch stored protocol rejections = %#v", rejections)
+	}
+}
+
 func TestCallerEnvelopeSchemaRejectsRemoteReferencesAtRunCreation(t *testing.T) {
 	h := newIntegrationHarness(t)
 	request := inlineRunRequest("#!/bin/sh\nexit 0\n")
@@ -290,6 +339,20 @@ func validGate(runID, attemptID, idempotencyKey string) contract.GateResult {
 		Outcome:        contract.GatePass,
 		EvaluatedAt:    protocolTestTime,
 	}
+}
+
+func protocolBodyWithoutAttempt(t *testing.T, value any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	delete(body, "attempt_id")
+	return body
 }
 
 func dispatchAndClaimRun(t *testing.T, h *integrationHarness, runID string) l1.Claim {

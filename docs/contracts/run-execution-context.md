@@ -41,10 +41,14 @@ The scope is:
 - never read a sibling or ancestor, and never write another run.
 
 Envelope and gate writes carry their idempotency key in the versioned JSON
-body. L3 validates the full raw document, including `run_id`, `step_id`, and
-the attempt-bound `attempt_id`, before appending it to an immutable ledger
-table. An identical replay returns the original document; reusing a key or
-document ID with different content returns `idempotency_conflict`.
+body. A request may omit `attempt_id`; L3 binds it from the authenticated,
+attempt-scoped run token before validation and stores the complete document.
+If a request supplies `attempt_id`, it must match the token or L3 returns a
+conflict without storing a protocol rejection. L3 then validates the complete
+document, including `run_id`, `step_id`, and bound `attempt_id`, before
+appending it to an immutable ledger table. An identical replay returns the
+original document; reusing a key or document ID with different content returns
+`idempotency_conflict`.
 
 Every envelope validates against both the v1 base envelope schema and the
 optional `envelope_schema` captured at run creation. Caller schemas use a
