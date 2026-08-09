@@ -31,7 +31,7 @@ func run() error {
 		controlPlane   = flag.String("control-plane", l3.DefaultL1Address, "L1 control-plane Fabric address")
 		databasePath   = flag.String("db", "wefty-l3.sqlite", "SQLite database path")
 		reconcileEvery = flag.Duration("reconcile-interval", l3.DefaultReconcileInterval, "dispatch and run-state reconciliation interval")
-		fabricName     = flag.String("fabric-name", "wefty-run-ledger", "tsnet logical node name")
+		fabricName     = flag.String("fabric-name", l3.DefaultL3Address, "tsnet logical node name")
 		stateDirectory = flag.String("state-dir", "", "tsnet state directory")
 		authKey        = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
 		controlURL     = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
