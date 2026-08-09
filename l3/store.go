@@ -568,7 +568,8 @@ func ProjectJobState(current contract.RunState, job contract.JobState) (contract
 		contract.RunRunning: 3, contract.RunAwaitingInput: 4,
 		contract.RunSucceeded: 5, contract.RunFailed: 5,
 	}
-	if target != contract.RunFailed && target != contract.RunSucceeded && rank[target] < rank[current] {
+	resuming := current == contract.RunAwaitingInput && target == contract.RunRunning
+	if !resuming && target != contract.RunFailed && target != contract.RunSucceeded && rank[target] < rank[current] {
 		return current, false, nil
 	}
 	return target, true, nil
