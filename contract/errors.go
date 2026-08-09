@@ -6,19 +6,20 @@ import "fmt"
 type ErrorCode string
 
 const (
-	ErrorInvalidRequest      ErrorCode = "invalid_request"
-	ErrorNotFound            ErrorCode = "not_found"
-	ErrorUnauthorized        ErrorCode = "unauthorized"
-	ErrorForbidden           ErrorCode = "forbidden"
-	ErrorConflict            ErrorCode = "conflict"
-	ErrorStaleFence          ErrorCode = "stale_fence"
-	ErrorLeaseExpired        ErrorCode = "lease_expired"
-	ErrorAttemptMismatch     ErrorCode = "attempt_mismatch"
-	ErrorDispatchKeyConflict ErrorCode = "dispatch_key_conflict"
-	ErrorIdempotencyConflict ErrorCode = "idempotency_conflict"
-	ErrorUnsupportedKind     ErrorCode = "unsupported_kind"
-	ErrorNotImplemented      ErrorCode = "not_implemented"
-	ErrorInternal            ErrorCode = "internal"
+	ErrorInvalidRequest            ErrorCode = "invalid_request"
+	ErrorNotFound                  ErrorCode = "not_found"
+	ErrorUnauthorized              ErrorCode = "unauthorized"
+	ErrorForbidden                 ErrorCode = "forbidden"
+	ErrorConflict                  ErrorCode = "conflict"
+	ErrorStaleFence                ErrorCode = "stale_fence"
+	ErrorLeaseExpired              ErrorCode = "lease_expired"
+	ErrorAttemptMismatch           ErrorCode = "attempt_mismatch"
+	ErrorDispatchKeyConflict       ErrorCode = "dispatch_key_conflict"
+	ErrorIdempotencyConflict       ErrorCode = "idempotency_conflict"
+	ErrorUnsupportedKind           ErrorCode = "unsupported_kind"
+	ErrorUnsupportedRuntimeHandler ErrorCode = "unsupported_runtime_handler"
+	ErrorNotImplemented            ErrorCode = "not_implemented"
+	ErrorInternal                  ErrorCode = "internal"
 )
 
 // APIError is the single error shape shared by every HTTP protocol.

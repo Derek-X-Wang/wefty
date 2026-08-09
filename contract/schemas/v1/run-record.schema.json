@@ -49,8 +49,20 @@
         }
       },
       "oneOf": [
-        { "required": ["workflow_ref"], "not": { "required": ["inline_script"] } },
-        { "required": ["inline_script"], "not": { "required": ["workflow_ref"] } }
+        {
+          "required": ["workflow_ref"],
+          "not": {
+            "properties": { "inline_script": true },
+            "required": ["inline_script"]
+          }
+        },
+        {
+          "required": ["inline_script"],
+          "not": {
+            "properties": { "workflow_ref": true },
+            "required": ["workflow_ref"]
+          }
+        }
       ]
     },
     "params": { "type": "object" },
@@ -69,11 +81,11 @@
     },
     "envelopes": {
       "type": "array",
-      "items": { "$ref": "https://wefty.dev/schemas/v1/envelope.schema.json" }
+      "items": { "$ref": "envelope.schema.json" }
     },
     "gates": {
       "type": "array",
-      "items": { "$ref": "https://wefty.dev/schemas/v1/gate-result.schema.json" }
+      "items": { "$ref": "gate-result.schema.json" }
     },
     "created_at": { "type": "string", "format": "date-time" },
     "updated_at": { "type": "string", "format": "date-time" },

@@ -44,8 +44,20 @@
             "mode": { "type": "integer", "minimum": 0, "maximum": 4095 }
           },
           "oneOf": [
-            { "required": ["path"], "not": { "required": ["inline_base64"] } },
-            { "required": ["inline_base64", "sha256"], "not": { "required": ["path"] } }
+            {
+              "required": ["path"],
+              "not": {
+                "properties": { "inline_base64": true },
+                "required": ["inline_base64"]
+              }
+            },
+            {
+              "required": ["inline_base64", "sha256"],
+              "not": {
+                "properties": { "path": true },
+                "required": ["path"]
+              }
+            }
           ]
         },
         "argv": {
