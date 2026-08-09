@@ -47,11 +47,16 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 		return err
 	}
 	for _, intent := range intents {
+		runToken, err := r.store.ensureRunToken(ctx, intent.RunID)
+		if err != nil {
+			passErrors = append(passErrors, err)
+			continue
+		}
 		if err := r.store.beginDispatch(ctx, intent.RunID); err != nil {
 			passErrors = append(passErrors, err)
 			continue
 		}
-		job, err := r.jobs.SubmitJob(ctx, intent.jobSpec())
+		job, err := r.jobs.SubmitJob(ctx, intent.jobSpec(runToken))
 		if err != nil {
 			if recordErr := r.store.recordDispatchError(ctx, intent.RunID, err); recordErr != nil {
 				passErrors = append(passErrors, errors.Join(err, recordErr))

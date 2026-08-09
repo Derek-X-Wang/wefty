@@ -12,6 +12,8 @@ const (
 	DefaultCallerPrincipalTag = "wefty:client"
 	DefaultL1Address          = "wefty://control-plane"
 	DefaultL3Address          = "wefty://run-ledger"
+	DefaultHandoffRoot        = "/tmp/wefty/handoffs"
+	DefaultRunTokenGrace      = 5 * time.Minute
 )
 
 // Clock supplies ledger timestamps so state projection can be tested without
@@ -73,5 +75,13 @@ type TriggerProvenance struct {
 }
 
 type StoreOptions struct {
-	Clock Clock
+	Clock         Clock
+	RunTokenGrace time.Duration
+}
+
+// RunTokenScope is the authenticated authority carried by an opaque run
+// token. AttemptID binds one minted credential to one dispatch execution.
+type RunTokenScope struct {
+	RunID     string
+	AttemptID string
 }

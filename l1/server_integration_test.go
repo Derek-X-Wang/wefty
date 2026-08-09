@@ -173,6 +173,44 @@ func validJobSpec(dispatchKey string, tags []string) contract.JobSpec {
 	}
 }
 
+func TestSensitiveEnvironmentIsRedactedFromClientJobAPIs(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
+	h.register(agent, "node-1")
+
+	spec := validJobSpec("sensitive-redaction", []string{"linux"})
+	spec.Execution.SensitiveEnv = map[string]string{contract.EnvRunToken: "wrun_top_secret"}
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
+	if status != http.StatusCreated || bytes.Contains(body, []byte("wrun_top_secret")) {
+		t.Fatalf("create response status/body = %d/%s; sensitive value must be redacted", status, body)
+	}
+	var created Job
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Spec.Execution.SensitiveEnv != nil {
+		t.Fatalf("create response sensitive_env = %#v, want omitted", created.Spec.Execution.SensitiveEnv)
+	}
+
+	status, _, body = h.do(client, http.MethodGet, "/v1/jobs/"+created.JobID, nil)
+	if status != http.StatusOK || bytes.Contains(body, []byte("wrun_top_secret")) {
+		t.Fatalf("get response status/body = %d/%s; sensitive value must be redacted", status, body)
+	}
+
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+	if status != http.StatusOK {
+		t.Fatalf("claim status = %d body=%s", status, body)
+	}
+	var claim Claim
+	if err := json.Unmarshal(body, &claim); err != nil {
+		t.Fatal(err)
+	}
+	if claim.Job.Spec.Execution.SensitiveEnv[contract.EnvRunToken] != "wrun_top_secret" {
+		t.Fatalf("claim sensitive_env = %#v, want agent-only token delivery", claim.Job.Spec.Execution.SensitiveEnv)
+	}
+}
+
 func TestConcurrentClaimsExactlyOneWinner(t *testing.T) {
 	const claimers = 12
 	nodeTags := make(map[string][]string, claimers)

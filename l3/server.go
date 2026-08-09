@@ -78,28 +78,26 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 }
 
 type identityContextKey struct{}
+type runTokenContextKey struct{}
 
 func (s *Server) routes() http.Handler {
 	runs := http.NewServeMux()
 	runs.HandleFunc("POST /v1/runs", s.createRun)
 	runs.HandleFunc("GET /v1/runs/{run_id}", s.getRun)
+	runs.HandleFunc("POST /v1/runs/{run_id}/envelopes", s.inRunWriteNotImplemented)
+	runs.HandleFunc("POST /v1/runs/{run_id}/gates", s.inRunWriteNotImplemented)
 
 	root := http.NewServeMux()
-	root.Handle("/v1/runs", s.authorize(runs))
-	root.Handle("/v1/runs/", s.authorize(runs))
+	root.Handle("/v1/runs", s.authenticateFabric(s.authorize(runs)))
+	root.Handle("/v1/runs/", s.authenticateFabric(s.authorize(runs)))
 	return root
 }
 
-func (s *Server) authorize(next http.Handler) http.Handler {
+func (s *Server) authenticateFabric(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		identity, err := s.fabric.WhoIs(r.Context(), r.RemoteAddr)
-		if err != nil {
+		if err != nil || (strings.TrimSpace(identity.NodeID) == "" && strings.TrimSpace(identity.User) == "") {
 			writeError(w, protocolError(contract.ErrorUnauthorized, "fabric identity could not be authenticated"))
-			return
-		}
-		tags, err := normalizeTags(identity.Tags)
-		if err != nil || !slices.Contains(tags, s.callerPrincipalTag) {
-			writeError(w, protocolError(contract.ErrorForbidden, "fabric identity is not authorized for the L3 caller protocol"))
 			return
 		}
 		ctx := context.WithValue(r.Context(), identityContextKey{}, identity)
@@ -107,9 +105,43 @@ func (s *Server) authorize(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) authorize(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+		if authorization != "" {
+			token, ok := strings.CutPrefix(authorization, "Bearer ")
+			if !ok || strings.TrimSpace(token) == "" || strings.ContainsAny(token, " \t\r\n") {
+				writeError(w, protocolError(contract.ErrorUnauthorized, "run token bearer authorization is malformed"))
+				return
+			}
+			scope, err := s.store.AuthenticateRunToken(r.Context(), token)
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			ctx := context.WithValue(r.Context(), runTokenContextKey{}, scope)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
+		identity := identityFromRequest(r)
+		tags, err := normalizeTags(identity.Tags)
+		if err != nil || !slices.Contains(tags, s.callerPrincipalTag) {
+			writeError(w, protocolError(contract.ErrorForbidden, "fabric identity is not authorized for the L3 caller protocol"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func identityFromRequest(r *http.Request) fabric.Identity {
 	identity, _ := r.Context().Value(identityContextKey{}).(fabric.Identity)
 	return identity
+}
+
+func runTokenFromRequest(r *http.Request) (RunTokenScope, bool) {
+	scope, ok := r.Context().Value(runTokenContextKey{}).(RunTokenScope)
+	return scope, ok
 }
 
 func actorFromIdentity(identity fabric.Identity) string {
@@ -126,9 +158,17 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFromRequest(r)
+	actor := actorFromIdentity(identity)
+	if scope, ok := runTokenFromRequest(r); ok {
+		if request.ParentRunID != scope.RunID {
+			writeError(w, protocolError(contract.ErrorForbidden, "run token may dispatch only a direct child of its own run"))
+			return
+		}
+		actor = "run:" + scope.RunID
+	}
 	record, replayed, err := s.store.CreateRun(r.Context(), CreateRunInput{
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
-		Actor:          actorFromIdentity(identity),
+		Actor:          actor,
 		Request:        request,
 	})
 	if err != nil {
@@ -147,12 +187,37 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
-	record, err := s.store.GetRun(r.Context(), r.PathValue("run_id"))
+	runID := r.PathValue("run_id")
+	if scope, ok := runTokenFromRequest(r); ok {
+		allowed, err := s.store.CanReadRun(r.Context(), scope.RunID, runID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if !allowed {
+			writeError(w, protocolError(contract.ErrorForbidden, "run token cannot read an ancestor or sibling run"))
+			return
+		}
+	}
+	record, err := s.store.GetRun(r.Context(), runID)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, record)
+}
+
+func (s *Server) inRunWriteNotImplemented(w http.ResponseWriter, r *http.Request) {
+	scope, ok := runTokenFromRequest(r)
+	if !ok {
+		writeError(w, protocolError(contract.ErrorForbidden, "a run token is required for in-run writes"))
+		return
+	}
+	if r.PathValue("run_id") != scope.RunID {
+		writeError(w, protocolError(contract.ErrorForbidden, "run token may write only its own run"))
+		return
+	}
+	writeError(w, protocolError(contract.ErrorNotImplemented, "envelope and gate storage is implemented in issue #28"))
 }
 
 func decodeJSON(r *http.Request, target any) error {

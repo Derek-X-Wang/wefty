@@ -7,6 +7,20 @@ import (
 
 const SchemaVersionV1 = 1
 
+// Run execution environment names are part of the v0.1 process contract.
+// Keep credentials in SensitiveEnv so public job projections can redact them.
+const (
+	EnvRunID      = "WEFTY_RUN_ID"
+	EnvL3Endpoint = "WEFTY_L3_ENDPOINT"
+	EnvL1Endpoint = "WEFTY_L1_ENDPOINT"
+	EnvRunToken   = "WEFTY_RUN_TOKEN"
+	EnvHandoffDir = "WEFTY_HANDOFF_DIR"
+
+	// StableNodeTagPrefix reserves the routing tag used when a cold rerun
+	// consumes node-local handoff files from an earlier execution.
+	StableNodeTagPrefix = "wefty:node:"
+)
+
 // JobSpec is the versioned, transport-neutral description of a one-shot job.
 // Kind is deliberately a string rather than a closed enum.
 type JobSpec struct {

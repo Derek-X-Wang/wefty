@@ -69,6 +69,33 @@ func TestRunProcessRejectsUnknownKind(t *testing.T) {
 	}
 }
 
+func TestRunProcessRedactsSensitiveEnvironmentFromLogEvents(t *testing.T) {
+	var payload []byte
+	a := &Agent{
+		runner: emittingRunner{},
+		outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
+			return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
+				payload = append(payload, event.Bytes...)
+				return nil
+			})
+		},
+	}
+	claim := l1.Claim{
+		Job: l1.Job{Spec: contract.JobSpec{
+			Kind:      "process",
+			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{contract.EnvRunToken: "wrun_log_secret"}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "attempt-redaction"},
+	}
+	result, err := a.runProcess(context.Background(), claim)
+	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("runProcess() = (%#v, %v)", result, err)
+	}
+	if got, want := string(payload), "before [REDACTED] after"; got != want {
+		t.Fatalf("redacted log payload = %q, want %q", got, want)
+	}
+}
+
 func TestNewBuildsRegistrationFromStableAndBootMetadata(t *testing.T) {
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
@@ -168,6 +195,20 @@ type panicRunner struct{}
 
 func (panicRunner) Run(context.Context, processrunner.Request, processrunner.OutputSink) (contract.ProcessResult, error) {
 	panic("unsupported kind reached process runner")
+}
+
+type emittingRunner struct{}
+
+func (emittingRunner) Run(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+	if err := sink.WriteOutput(ctx, contract.LogEvent{
+		AttemptID: request.AttemptID,
+		Stream:    contract.LogStdout,
+		Bytes:     []byte("before wrun_log_secret after"),
+	}); err != nil {
+		return contract.ProcessResult{}, err
+	}
+	exitCode := 0
+	return contract.ProcessResult{ExitCode: &exitCode}, nil
 }
 
 func waitForJobState(t *testing.T, store *l1.Store, jobID string, state contract.JobState, timeout time.Duration) l1.Job {

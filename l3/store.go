@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -27,8 +29,9 @@ var tagPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:-]*$`)
 // Store is the L3-owned SQLite ledger. It intentionally has no access to the
 // L1 database; the outbox crosses that boundary only through the L1 protocol.
 type Store struct {
-	db    *sql.DB
-	clock Clock
+	db         *sql.DB
+	clock      Clock
+	tokenGrace time.Duration
 }
 
 // OpenStore opens a file-backed SQLite ledger, enables WAL, and applies the L3
@@ -51,7 +54,11 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		return nil, fmt.Errorf("l3: open SQLite: %w", err)
 	}
 	db.SetMaxOpenConns(16)
-	store := &Store{db: db, clock: clock}
+	tokenGrace := options.RunTokenGrace
+	if tokenGrace <= 0 {
+		tokenGrace = DefaultRunTokenGrace
+	}
+	store := &Store{db: db, clock: clock, tokenGrace: tokenGrace}
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -115,15 +122,100 @@ CREATE TABLE IF NOT EXISTS dispatch_outbox (
   dispatch_key TEXT NOT NULL UNIQUE,
   job_id TEXT,
   attempt_count INTEGER NOT NULL DEFAULT 0,
+	  token_delivery TEXT,
   last_error TEXT,
   dispatched_ns INTEGER
 );
 CREATE INDEX IF NOT EXISTS dispatch_outbox_pending ON dispatch_outbox(dispatched_ns, run_id);
+CREATE TABLE IF NOT EXISTS run_tokens (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
+  attempt_id TEXT NOT NULL UNIQUE,
+  token_hash BLOB NOT NULL UNIQUE,
+  minted_ns INTEGER NOT NULL,
+  expires_ns INTEGER
+);
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l3: apply SQLite schema: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) ensureRunToken(ctx context.Context, runID string) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", internalError(err, "begin run token mint")
+	}
+	defer tx.Rollback()
+	var delivery sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT token_delivery FROM dispatch_outbox WHERE run_id=? AND dispatched_ns IS NULL`, runID).Scan(&delivery)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", protocolError(contract.ErrorConflict, "run %q has no pending dispatch", runID)
+	}
+	if err != nil {
+		return "", internalError(err, "read pending run token delivery")
+	}
+	if delivery.Valid && delivery.String != "" {
+		return delivery.String, nil
+	}
+	token := newToken()
+	digest := sha256.Sum256([]byte(token))
+	attemptID := newID("runattempt")
+	now := canonicalTime(s.clock.Now())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_tokens(run_id, attempt_id, token_hash, minted_ns) VALUES(?, ?, ?, ?)`, runID, attemptID, digest[:], now.UnixNano()); err != nil {
+		return "", internalError(err, "store run token hash")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET token_delivery=? WHERE run_id=? AND dispatched_ns IS NULL`, token, runID); err != nil {
+		return "", internalError(err, "stage run token delivery")
+	}
+	if err := tx.Commit(); err != nil {
+		return "", internalError(err, "commit run token mint")
+	}
+	return token, nil
+}
+
+// AuthenticateRunToken verifies an opaque token against its at-rest digest.
+// Active runs remain authorized; terminal runs retain authority only for the
+// configured grace interval.
+func (s *Store) AuthenticateRunToken(ctx context.Context, token string) (RunTokenScope, error) {
+	if token == "" {
+		return RunTokenScope{}, protocolError(contract.ErrorUnauthorized, "run token is required")
+	}
+	digest := sha256.Sum256([]byte(token))
+	var scope RunTokenScope
+	var storedHash []byte
+	var expiresNS sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT run_id, attempt_id, token_hash, expires_ns FROM run_tokens WHERE token_hash=?`, digest[:]).
+		Scan(&scope.RunID, &scope.AttemptID, &storedHash, &expiresNS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RunTokenScope{}, protocolError(contract.ErrorUnauthorized, "run token is invalid")
+	}
+	if err != nil {
+		return RunTokenScope{}, internalError(err, "authenticate run token")
+	}
+	if len(storedHash) != len(digest) || subtle.ConstantTimeCompare(storedHash, digest[:]) != 1 {
+		return RunTokenScope{}, protocolError(contract.ErrorUnauthorized, "run token is invalid")
+	}
+	if expiresNS.Valid && !canonicalTime(s.clock.Now()).Before(time.Unix(0, expiresNS.Int64).UTC()) {
+		return RunTokenScope{}, protocolError(contract.ErrorUnauthorized, "run token has expired")
+	}
+	return scope, nil
+}
+
+// CanReadRun reports whether target is the token's own run or a descendant.
+func (s *Store) CanReadRun(ctx context.Context, ownerRunID, targetRunID string) (bool, error) {
+	var allowed int
+	err := s.db.QueryRowContext(ctx, `
+WITH RECURSIVE descendants(run_id) AS (
+  SELECT run_id FROM runs WHERE run_id=?
+  UNION ALL
+  SELECT r.run_id FROM runs r JOIN descendants d ON r.parent_run_id=d.run_id
+)
+SELECT EXISTS(SELECT 1 FROM descendants WHERE run_id=?)`, ownerRunID, targetRunID).Scan(&allowed)
+	if err != nil {
+		return false, internalError(err, "authorize run lineage")
+	}
+	return allowed == 1, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -473,7 +565,7 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 		return internalError(err, "begin dispatch completion")
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL WHERE run_id=? AND dispatched_ns IS NULL`, jobID, now.UnixNano(), runID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, jobID, now.UnixNano(), runID); err != nil {
 		return internalError(err, "complete dispatch outbox")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE runs SET l1_job_id=?, status=?, updated_ns=? WHERE run_id=? AND status IN (?, ?)`,
@@ -526,13 +618,31 @@ func (s *Store) projectJobState(ctx context.Context, run projectedRun, jobState 
 	now := canonicalTime(s.clock.Now())
 	started := target == contract.RunRunning || target == contract.RunAwaitingInput || target == contract.RunSucceeded || target == contract.RunFailed
 	finished := target == contract.RunSucceeded || target == contract.RunFailed
-	_, err = s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin run projection")
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 UPDATE runs SET status=?, updated_ns=?,
   started_ns=CASE WHEN ? THEN COALESCE(started_ns, ?) ELSE started_ns END,
   finished_ns=CASE WHEN ? THEN ? ELSE finished_ns END
 WHERE run_id=? AND status=?`, target, now.UnixNano(), started, now.UnixNano(), finished, now.UnixNano(), run.RunID, run.State)
 	if err != nil {
 		return internalError(err, "project job state onto run")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "read run projection result")
+	}
+	if changed == 1 && finished {
+		expires := canonicalTime(now.Add(s.tokenGrace))
+		if _, err := tx.ExecContext(ctx, `UPDATE run_tokens SET expires_ns=COALESCE(expires_ns, ?) WHERE run_id=?`, expires.UnixNano(), run.RunID); err != nil {
+			return internalError(err, "expire terminal run token")
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return internalError(err, "commit run projection")
 	}
 	return nil
 }
@@ -575,8 +685,8 @@ func ProjectJobState(current contract.RunState, job contract.JobState) (contract
 	return target, true, nil
 }
 
-func (intent dispatchIntent) jobSpec() contract.JobSpec {
-	handoff := "/tmp/wefty/handoffs/" + intent.RunID
+func (intent dispatchIntent) jobSpec(runToken string) contract.JobSpec {
+	handoff := filepath.Join(DefaultHandoffRoot, intent.RunID)
 	labels := map[string]string{"run_id": intent.RunID}
 	if intent.ParentRunID != "" {
 		labels["parent_run_id"] = intent.ParentRunID
@@ -595,8 +705,12 @@ func (intent dispatchIntent) jobSpec() contract.JobSpec {
 				InlineBase64: encodeBase64(intent.Content), SHA256: intent.SHA256,
 				Interpreter: append([]string(nil), intent.Interpreter...), Mode: intent.Mode,
 			},
-			Argv:             []string{"wefty-inline-" + intent.RunID},
-			Env:              map[string]string{"WEFTY_RUN_ID": intent.RunID, "WEFTY_L1_ENDPOINT": DefaultL1Address, "WEFTY_L3_ENDPOINT": DefaultL3Address, "WEFTY_HANDOFF_DIR": handoff},
+			Argv: []string{"wefty-inline-" + intent.RunID},
+			Env: map[string]string{
+				contract.EnvRunID: intent.RunID, contract.EnvL1Endpoint: DefaultL1Address,
+				contract.EnvL3Endpoint: DefaultL3Address, contract.EnvHandoffDir: handoff,
+			},
+			SensitiveEnv:     map[string]string{contract.EnvRunToken: runToken},
 			WorkingDirectory: "/tmp",
 			HandoffDirectory: handoff,
 		},
@@ -633,4 +747,12 @@ func newID(prefix string) string {
 		panic(fmt.Sprintf("l3: crypto/rand: %v", err))
 	}
 	return prefix + "_" + hex.EncodeToString(random[:])
+}
+
+func newToken() string {
+	var random [32]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		panic(fmt.Sprintf("l3: crypto/rand: %v", err))
+	}
+	return "wrun_" + hex.EncodeToString(random[:])
 }
