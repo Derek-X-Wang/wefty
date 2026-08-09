@@ -7,11 +7,78 @@
   },
   "servers": [{ "url": "wefty://run-ledger" }],
   "paths": {
+    "/v1/workflows/{workflow_id}/versions": {
+      "parameters": [
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" }
+        }
+      ],
+      "post": {
+        "operationId": "createWorkflowVersion",
+        "summary": "Append an immutable saved workflow version",
+        "description": "The ledger assigns the next monotonically increasing version. Content, hash, interpreter, and mode cannot be updated or deleted after creation.",
+        "security": [{ "callerToken": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/WorkflowVersionInput" } }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Immutable workflow version created.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/WorkflowVersion" } }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/workflows/{workflow_id}/versions/{version}": {
+      "parameters": [
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" }
+        },
+        {
+          "name": "version",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string", "pattern": "^v[1-9][0-9]*$" }
+        }
+      ],
+      "get": {
+        "operationId": "getWorkflowVersion",
+        "summary": "Read one immutable saved workflow version",
+        "security": [{ "callerToken": [] }],
+        "responses": {
+          "200": {
+            "description": "Saved workflow version.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/WorkflowVersion" } }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+        }
+      }
+    },
     "/v1/runs": {
       "post": {
         "operationId": "createRun",
         "summary": "Create a manual or child run",
-        "description": "workflow_ref and inline_script are mutually exclusive. The run row and dispatch intent commit atomically; L1 creation uses a stable dispatch key. max_cost is stored but not enforced in v0.1.",
+        "description": "workflow_ref and inline_script are mutually exclusive. workflow://<id> resolves the latest version and workflow://<id>/vN resolves an explicit version; both are pinned and snapshotted onto the run before the run row and dispatch intent commit atomically. L1 creation uses a stable dispatch key. max_cost is stored but not enforced in v0.1.",
         "security": [{ "callerToken": [] }, { "runToken": [] }],
         "parameters": [
           {
@@ -30,7 +97,10 @@
                 "additionalProperties": false,
                 "required": ["params"],
                 "properties": {
-                  "workflow_ref": { "type": "string", "minLength": 1 },
+                  "workflow_ref": {
+                    "type": "string",
+                    "pattern": "^workflow://[a-z0-9][a-z0-9._-]{0,127}(/v[1-9][0-9]*)?$"
+                  },
                   "inline_script": {
                     "type": "object",
                     "additionalProperties": false,
@@ -137,6 +207,46 @@
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/rerun": {
+      "parameters": [
+        { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } },
+        {
+          "name": "Idempotency-Key",
+          "in": "header",
+          "required": true,
+          "schema": { "type": "string", "minLength": 1, "maxLength": 255 }
+        }
+      ],
+      "post": {
+        "operationId": "rerunRun",
+        "summary": "Create a new run from a stored run snapshot",
+        "description": "Copies the source run's immutable executable bytes, SHA-256, interpreter, mode, params, tags, limits, and envelope requirements. Saved workflow refs are never re-resolved. Trigger provenance records rerun and the source run ID.",
+        "security": [{ "callerToken": [] }],
+        "responses": {
+          "200": {
+            "description": "Identical idempotency replay; the previously created rerun is returned.",
+            "headers": {
+              "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } }
+            },
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/RunAccepted" } }
+            }
+          },
+          "201": {
+            "description": "New run and dispatch intent created from the stored snapshot.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/RunAccepted" } }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
         }
       }
     },
@@ -254,6 +364,41 @@
   },
   "components": {
     "schemas": {
+      "WorkflowVersionInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["content", "sha256"],
+        "properties": {
+          "content": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "interpreter": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "mode": { "type": "integer", "minimum": 0, "maximum": 4095, "default": 493 }
+        }
+      },
+      "WorkflowVersion": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["workflow_id", "version", "workflow_ref", "content", "sha256", "interpreter", "mode", "created_at"],
+        "properties": {
+          "workflow_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+          "version": { "type": "integer", "minimum": 1 },
+          "workflow_ref": {
+            "type": "string",
+            "pattern": "^workflow://[a-z0-9][a-z0-9._-]{0,127}/v[1-9][0-9]*$"
+          },
+          "content": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "interpreter": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "mode": { "type": "integer", "minimum": 0, "maximum": 4095 },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
       "RunAccepted": {
         "type": "object",
         "additionalProperties": false,
