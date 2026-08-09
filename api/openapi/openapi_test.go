@@ -181,6 +181,18 @@ func TestL3InRunProtocolRoutesAndReplayResponsesArePublished(t *testing.T) {
 	}
 	for _, path := range []string{"/v1/runs/{run_id}/envelopes", "/v1/runs/{run_id}/gates"} {
 		operation := object(t, object(t, paths[path], path)["post"], path+".post")
+		requestBody := object(t, operation["requestBody"], path+".requestBody")
+		content := object(t, requestBody["content"], path+".requestBody.content")
+		jsonContent := object(t, content["application/json"], path+".requestBody.content.application/json")
+		requestSchema := object(t, jsonContent["schema"], path+".requestBody.schema")
+		requestSchemaRef, _ := requestSchema["$ref"].(string)
+		requestSchemaName := strings.TrimPrefix(requestSchemaRef, "#/components/schemas/")
+		components := object(t, doc["components"], "components")
+		schemas := object(t, components["schemas"], "components.schemas")
+		writeSchema := object(t, schemas[requestSchemaName], requestSchemaName)
+		if stringSet(t, writeSchema["required"])["attempt_id"] {
+			t.Errorf("%s request requires attempt_id instead of binding it from the run token", path)
+		}
 		responses := object(t, operation["responses"], path+".responses")
 		if _, ok := responses["200"]; !ok {
 			t.Errorf("%s does not publish idempotent replay response", path)

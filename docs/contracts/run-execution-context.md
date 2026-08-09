@@ -7,8 +7,8 @@ aliases or depend on additional variables.
 | Variable | Visibility | Value |
 | --- | --- | --- |
 | `WEFTY_RUN_ID` | public | The L3 run ID. |
-| `WEFTY_L3_ENDPOINT` | public | The Fabric address of the L3 run ledger. |
-| `WEFTY_L1_ENDPOINT` | public | The Fabric address of the L1 control plane. |
+| `WEFTY_L3_ENDPOINT` | public | A job-local HTTP base URL for the L3 run ledger. |
+| `WEFTY_L1_ENDPOINT` | public | A job-local HTTP base URL for the L1 client read surface. |
 | `WEFTY_RUN_TOKEN` | sensitive | The opaque, attempt-bound credential for in-run L3 calls. |
 | `WEFTY_HANDOFF_DIR` | public | The run's node-local handoff directory. |
 
@@ -19,13 +19,21 @@ The node agent also replaces sensitive values with `[REDACTED]` before sending
 captured stdout or stderr to a log sink. Workflows must still avoid printing
 credentials intentionally.
 
+The node agent replaces internal `wefty://` service addresses with per-attempt
+`http://127.0.0.1` bridge URLs before starting the workflow process. The bridge
+is torn down with the attempt and forwards L3 calls through the agent's
+authenticated Fabric connection. Its L1 side exposes only client-protocol job
+status and log reads; claim, lease, log-ingest, and completion routes remain
+agent-internal. The bridge is transport only: callers must still send the run
+token, and no Fabric tag privilege is projected into the workflow process.
+
 ## Run-token authentication and scope
 
-In-run HTTP calls use `Authorization: Bearer <WEFTY_RUN_TOKEN>` over an
-authenticated Fabric connection. Fabric identity establishes the network
-peer; the run token supplies run authorization. A token never grants an L1
-client or agent principal, and Fabric identity alone never grants in-run write
-authority.
+In-run HTTP calls use `Authorization: Bearer <WEFTY_RUN_TOKEN>` against
+`WEFTY_L3_ENDPOINT`. The loopback bridge supplies the authenticated Fabric
+connection; the run token supplies run authorization. A token never grants an
+L1 client or agent principal, and Fabric identity alone never grants in-run
+write authority.
 
 A token is minted once when L3 first dispatches its run and is bound in the
 ledger to that run and dispatch attempt. L3 stores the SHA-256 token digest for
@@ -41,10 +49,14 @@ The scope is:
 - never read a sibling or ancestor, and never write another run.
 
 Envelope and gate writes carry their idempotency key in the versioned JSON
-body. L3 validates the full raw document, including `run_id`, `step_id`, and
-the attempt-bound `attempt_id`, before appending it to an immutable ledger
-table. An identical replay returns the original document; reusing a key or
-document ID with different content returns `idempotency_conflict`.
+body. A request may omit `attempt_id`; L3 binds it from the authenticated,
+attempt-scoped run token before validation and stores the complete document.
+If a request supplies `attempt_id`, it must match the token or L3 returns a
+conflict without storing a protocol rejection. L3 then validates the complete
+document, including `run_id`, `step_id`, and bound `attempt_id`, before
+appending it to an immutable ledger table. An identical replay returns the
+original document; reusing a key or document ID with different content returns
+`idempotency_conflict`.
 
 Every envelope validates against both the v1 base envelope schema and the
 optional `envelope_schema` captured at run creation. Caller schemas use a

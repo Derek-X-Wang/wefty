@@ -916,7 +916,7 @@ FROM descendants WHERE depth > 0 ORDER BY depth, run_id`, runID)
 // Invalid protocol payloads are stored as rejections and fail the run before
 // the validation error is returned to the caller.
 func (s *Store) AppendEnvelope(ctx context.Context, scope RunTokenScope, raw json.RawMessage) (contract.Envelope, bool, error) {
-	canonical, hash, err := canonicalProtocolBody(raw)
+	canonical, hash, err := canonicalProtocolBodyWithAttempt(raw, scope.AttemptID)
 	if err != nil {
 		return contract.Envelope{}, false, err
 	}
@@ -996,7 +996,7 @@ func (s *Store) AppendEnvelope(ctx context.Context, scope RunTokenScope, raw jso
 // AppendGateResult validates and appends a workflow-evaluated gate result.
 // A fail/error gate is an authoritative protocol failure for the run.
 func (s *Store) AppendGateResult(ctx context.Context, scope RunTokenScope, raw json.RawMessage) (contract.GateResult, bool, error) {
-	canonical, hash, err := canonicalProtocolBody(raw)
+	canonical, hash, err := canonicalProtocolBodyWithAttempt(raw, scope.AttemptID)
 	if err != nil {
 		return contract.GateResult{}, false, err
 	}
@@ -1139,6 +1139,32 @@ func canonicalProtocolBody(raw json.RawMessage) (json.RawMessage, string, error)
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil {
 		return nil, "", protocolError(contract.ErrorInvalidRequest, "invalid protocol JSON: %v", err)
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return nil, "", internalError(err, "canonicalize protocol JSON")
+	}
+	digest := sha256.Sum256(canonical)
+	return canonical, hex.EncodeToString(digest[:]), nil
+}
+
+// canonicalProtocolBodyWithAttempt binds an omitted attempt_id to the
+// authenticated run-token scope before validation and persistence. An
+// explicitly supplied attempt remains an assertion by the caller and must
+// match the token; it is never silently replaced.
+func canonicalProtocolBodyWithAttempt(raw json.RawMessage, attemptID string) (json.RawMessage, string, error) {
+	var value any
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return nil, "", protocolError(contract.ErrorInvalidRequest, "invalid protocol JSON: %v", err)
+	}
+	if object, ok := value.(map[string]any); ok {
+		if supplied, exists := object["attempt_id"]; !exists {
+			object["attempt_id"] = attemptID
+		} else if suppliedID, ok := supplied.(string); ok && suppliedID != attemptID {
+			return nil, "", protocolError(contract.ErrorConflict, "attempt_id must match the authenticated run attempt")
+		}
 	}
 	canonical, err := json.Marshal(value)
 	if err != nil {

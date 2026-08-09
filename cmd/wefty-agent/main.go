@@ -31,6 +31,7 @@ func run() error {
 	var (
 		fabricMode        = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
 		controlPlane      = flag.String("control-plane", "wefty://control-plane", "control-plane Fabric address")
+		runLedger         = flag.String("run-ledger", "wefty://run-ledger", "run-ledger Fabric address used by workflow jobs")
 		nodeID            = flag.String("node-id", "", "stable operator-facing node ID")
 		fabricIdentityID  = flag.String("plain-identity", "", "plain Fabric identity node ID (defaults to node-id)")
 		fabricName        = flag.String("fabric-name", "", "tsnet logical node name")
@@ -77,6 +78,7 @@ func run() error {
 	nodeAgent, err := agent.New(agent.Config{
 		Fabric:              participant,
 		ControlPlaneAddress: *controlPlane,
+		RunLedgerAddress:    *runLedger,
 		NodeID:              *nodeID,
 		BootSessionID:       bootSessionID,
 		Version:             version,

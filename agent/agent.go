@@ -42,6 +42,7 @@ type OutputSinkFactory func(l1.Claim) processrunner.OutputSink
 type Config struct {
 	Fabric              fabric.Fabric
 	ControlPlaneAddress string
+	RunLedgerAddress    string
 	NodeID              string
 	BootSessionID       string
 	Version             string
@@ -67,6 +68,9 @@ type Config struct {
 // Agent registers one boot session and serially executes claimed jobs while
 // node heartbeats and attempt lease renewals proceed on distinct schedules.
 type Agent struct {
+	fabric            fabric.Fabric
+	controlPlaneAddr  string
+	runLedgerAddr     string
 	client            *Client
 	registration      contract.NodeRegistration
 	heartbeatInterval time.Duration
@@ -127,7 +131,10 @@ func New(config Config) (*Agent, error) {
 		return nil, err
 	}
 	return &Agent{
-		client: client,
+		fabric:           config.Fabric,
+		controlPlaneAddr: config.ControlPlaneAddress,
+		runLedgerAddr:    stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
+		client:           client,
 		registration: contract.NodeRegistration{
 			NodeID:        config.NodeID,
 			BootSessionID: config.BootSessionID,
@@ -391,6 +398,16 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 		return contract.ProcessResult{SpawnError: err.Error()}, err
 	}
 	defer cleanupExecutable()
+	bridge, err := a.startWorkflowBridge(ctx, execution)
+	if err != nil {
+		return contract.ProcessResult{SpawnError: err.Error()}, err
+	}
+	if bridge != nil {
+		defer bridge.close()
+		execution.Env = cloneEnvironment(execution.Env)
+		execution.Env[contract.EnvL1Endpoint] = bridge.l1Endpoint
+		execution.Env[contract.EnvL3Endpoint] = bridge.l3Endpoint
+	}
 	var uploader *batchingLogSink
 	var sinks multiOutputSink
 	if a.client != nil {
@@ -437,6 +454,21 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 		uploadErr = fmt.Errorf("upload logs: %w", uploadErr)
 	}
 	return result, errors.Join(runErr, outputErr, uploadErr)
+}
+
+func stringOrDefault(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func cloneEnvironment(values map[string]string) map[string]string {
+	cloned := make(map[string]string, len(values))
+	for name, value := range values {
+		cloned[name] = value
+	}
+	return cloned
 }
 
 func (a *Agent) renewalLoop(ctx context.Context, claim l1.Claim, failures chan<- error) {

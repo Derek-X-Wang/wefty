@@ -30,6 +30,8 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 		return executeRerun(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "logs":
 		return executeLogs(ctx, clients, jsonOutput, args[1:], stdout, stderr)
+	case "inspect":
+		return executeInspect(ctx, clients, jsonOutput, args[1:], stdout)
 	case "drain":
 		return executeDrain(ctx, clients, jsonOutput, args[1:], stdout)
 	case "help", "-h", "--help":
@@ -38,6 +40,38 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 	default:
 		return usageError(fmt.Sprintf("unknown command %q", args[0]))
 	}
+}
+
+type runInspection struct {
+	Run     contract.RunRecord   `json:"run"`
+	Lineage l3.RunLineage        `json:"lineage"`
+	Runs    []contract.RunRecord `json:"runs"`
+}
+
+func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
+	if len(args) != 1 {
+		return usageError("usage: wefty inspect RUN_ID")
+	}
+	root, err := clients.getRun(ctx, args[0])
+	if err != nil {
+		return err
+	}
+	lineage, err := clients.getRunLineage(ctx, args[0])
+	if err != nil {
+		return err
+	}
+	inspection := runInspection{Run: root, Lineage: lineage, Runs: []contract.RunRecord{root}}
+	for _, descendant := range lineage.Descendants {
+		record, err := clients.getRun(ctx, descendant.RunID)
+		if err != nil {
+			return fmt.Errorf("read descendant %s: %w", descendant.RunID, err)
+		}
+		inspection.Runs = append(inspection.Runs, record)
+	}
+	if jsonOutput {
+		return writeJSON(stdout, inspection)
+	}
+	return writeRunInspection(stdout, inspection)
 }
 
 func executeNodes(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {

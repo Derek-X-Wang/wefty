@@ -88,6 +88,13 @@ func (c *apiClients) getRun(ctx context.Context, runID string) (contract.RunReco
 	return run, err
 }
 
+func (c *apiClients) getRunLineage(ctx context.Context, runID string) (l3.RunLineage, error) {
+	var lineage l3.RunLineage
+	path := "/v1/runs/" + url.PathEscape(runID) + "/lineage"
+	err := c.l3.do(ctx, http.MethodGet, path, nil, nil, &lineage, http.StatusOK)
+	return lineage, err
+}
+
 func (c *apiClients) getRunLogs(ctx context.Context, runID, cursor string, limit int) (l1.LogPage, error) {
 	query := url.Values{"limit": []string{strconv.Itoa(limit)}}
 	if cursor != "" {
