@@ -38,6 +38,11 @@ func Parse(address string) (Name, bool, error) {
 			return Name{}, true, fmt.Errorf("invalid control-plane address %q", address)
 		}
 		return Name{kind: "control-plane"}, true, nil
+	case "run-ledger":
+		if u.Path != "" && u.Path != "/" {
+			return Name{}, true, fmt.Errorf("invalid run-ledger address %q", address)
+		}
+		return Name{kind: "run-ledger"}, true, nil
 	case "node":
 		escapedID := strings.TrimPrefix(u.EscapedPath(), "/")
 		nodeID, err := url.PathUnescape(escapedID)
@@ -52,16 +57,18 @@ func Parse(address string) (Name, bool, error) {
 
 // String returns the canonical wefty address.
 func (n Name) String() string {
-	if n.kind == "control-plane" {
-		return "wefty://control-plane"
+	switch n.kind {
+	case "control-plane", "run-ledger":
+		return "wefty://" + n.kind
 	}
 	return "wefty://node/" + url.PathEscape(n.nodeID)
 }
 
 // Hostname returns the private transport hostname for a logical address.
 func (n Name) Hostname() string {
-	if n.kind == "control-plane" {
-		return "control-plane"
+	switch n.kind {
+	case "control-plane", "run-ledger":
+		return n.kind
 	}
 	sum := sha256.Sum256([]byte(n.nodeID))
 	return fmt.Sprintf("node-%x", sum[:8])
