@@ -65,4 +65,3 @@ only after required envelope validation; job `failed` maps to run `failed`.
 Exit zero with a missing or invalid required envelope maps to run `failed`.
 Cancellation is reserved and returns `501`, so there is no cancellable or
 cancelled state in the v1 state table.
-

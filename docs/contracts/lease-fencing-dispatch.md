@@ -86,4 +86,3 @@ unsupported_runtime_handler`.
 The awaiting-input prompt verbs and cancellation verbs are reserved. They
 return the shared error shape with HTTP `501`, code `not_implemented`, and
 `retryable=false`; they do not mutate state.
-
