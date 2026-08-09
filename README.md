@@ -60,7 +60,9 @@ go run ./cmd/wefty-agent \
 
 The stable `--node-id` survives agent restarts; each process generates a new
 boot-session ID. Heartbeats and attempt lease renewals use independent
-cadences. For tsnet, also supply `--fabric-name`, `--state-dir`, and an auth key
+cadences. SIGINT or SIGTERM starts a graceful drain: the node stops claiming,
+lets its current attempt complete, and exits; a second signal forces local
+cancellation. For tsnet, also supply `--fabric-name`, `--state-dir`, and an auth key
 whose node identity has the `tag:wefty-agent` principal tag. The credentialed
 agent smoke remains env-gated by `TS_AUTHKEY` (and optionally
 `TS_AGENT_PRINCIPAL_TAG` when a tailnet uses a different tag).

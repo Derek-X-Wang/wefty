@@ -25,6 +25,7 @@ type batchingLogSink struct {
 	ctx           context.Context
 	client        *Client
 	claim         l1.Claim
+	clock         Clock
 	batchSize     int
 	flushInterval time.Duration
 	retryInterval time.Duration
@@ -38,9 +39,9 @@ type batchingLogSink struct {
 	closeErr      error
 }
 
-func newBatchingLogSink(ctx context.Context, client *Client, claim l1.Claim, batchSize int, flushInterval, retryInterval time.Duration) *batchingLogSink {
+func newBatchingLogSink(ctx context.Context, client *Client, claim l1.Claim, clock Clock, batchSize int, flushInterval, retryInterval time.Duration) *batchingLogSink {
 	sink := &batchingLogSink{
-		ctx: ctx, client: client, claim: claim,
+		ctx: ctx, client: client, claim: claim, clock: clock,
 		batchSize: batchSize, flushInterval: flushInterval, retryInterval: retryInterval,
 		writes:        make(chan logWrite, batchSize),
 		closeRequests: make(chan chan error),
@@ -86,8 +87,8 @@ func (sink *batchingLogSink) Close() error {
 }
 
 func (sink *batchingLogSink) run() {
-	ticker := time.NewTicker(sink.flushInterval)
-	defer ticker.Stop()
+	flushTimer := sink.clock.NewTimer(sink.flushInterval)
+	defer stopTimer(flushTimer)
 	defer close(sink.done)
 	pending := make([]contract.LogEvent, 0, sink.batchSize)
 
@@ -103,8 +104,9 @@ func (sink *batchingLogSink) run() {
 				}
 				pending = pending[:0]
 			}
-		case <-ticker.C:
+		case <-flushTimer.C():
 			if len(pending) == 0 {
+				flushTimer.Reset(sink.flushInterval)
 				continue
 			}
 			if err := sink.upload(pending); err != nil {
@@ -112,6 +114,7 @@ func (sink *batchingLogSink) run() {
 				return
 			}
 			pending = pending[:0]
+			flushTimer.Reset(sink.flushInterval)
 		case response := <-sink.closeRequests:
 			err := sink.upload(pending)
 			if err != nil {
@@ -141,14 +144,12 @@ func (sink *batchingLogSink) upload(events []contract.LogEvent) error {
 		if errors.As(err, &protocolErr) && protocolErr.StatusCode < http.StatusInternalServerError {
 			return err
 		}
-		timer := time.NewTimer(sink.retryInterval)
+		timer := sink.clock.NewTimer(sink.retryInterval)
 		select {
 		case <-sink.ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
+			stopTimer(timer)
 			return sink.ctx.Err()
-		case <-timer.C:
+		case <-timer.C():
 		}
 	}
 }
