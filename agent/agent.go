@@ -253,6 +253,11 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 			return contract.ProcessResult{SpawnError: err.Error()}, err
 		}
 	}
+	execution, cleanupExecutable, err := materializeExecutable(claim.Job.Spec.Execution, claim.Lease.AttemptID)
+	if err != nil {
+		return contract.ProcessResult{SpawnError: err.Error()}, err
+	}
+	defer cleanupExecutable()
 	var sink processrunner.OutputSink
 	if a.outputSinkFactory != nil {
 		sink = a.outputSinkFactory(claim)
@@ -260,7 +265,7 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 	sink = redactOutputSink(sink, claim.Job.Spec.Execution.SensitiveEnv)
 	return a.runner.Run(ctx, processrunner.Request{
 		AttemptID: claim.Lease.AttemptID,
-		Execution: claim.Job.Spec.Execution,
+		Execution: execution,
 		Limits:    claim.Job.Spec.Limits,
 	}, sink)
 }

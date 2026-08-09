@@ -3,7 +3,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,6 +99,54 @@ func TestHandoffDirectoryRejectsSymlink(t *testing.T) {
 	err := manager.prepare(handoffClaim("run_symlink", path, nil).Job.Spec, "node-1")
 	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
 		t.Fatalf("symlink prepare error = %v", err)
+	}
+}
+
+func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "handoffs")
+	runID := "run_environment"
+	handoff := filepath.Join(root, runID)
+	token := "wrun_process_secret"
+	script := []byte("#!/bin/sh\nprintf '%s\\n' \"$WEFTY_RUN_ID\" \"$WEFTY_L3_ENDPOINT\" \"$WEFTY_L1_ENDPOINT\" \"$WEFTY_RUN_TOKEN\" \"$WEFTY_HANDOFF_DIR\"\n")
+	digest := sha256.Sum256(script)
+	var output bytes.Buffer
+	a := &Agent{
+		registration: contract.NodeRegistration{NodeID: "node-1"},
+		runner:       processrunner.New(processrunner.Config{}),
+		handoffs:     newHandoffManager(root, time.Hour),
+		outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
+			return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
+				if event.Stream == contract.LogStdout {
+					_, _ = output.Write(event.Bytes)
+				}
+				return nil
+			})
+		},
+	}
+	claim := handoffClaim(runID, handoff, nil)
+	claim.Job.Spec.Execution = contract.ExecutionSpec{
+		Executable: contract.ExecutableSpec{
+			InlineBase64: base64.StdEncoding.EncodeToString(script),
+			SHA256:       hex.EncodeToString(digest[:]),
+			Interpreter:  []string{"/bin/sh"},
+			Mode:         0o700,
+		},
+		Argv: []string{"wefty-inline-" + runID},
+		Env: map[string]string{
+			contract.EnvRunID: runID, contract.EnvL3Endpoint: "wefty://l3",
+			contract.EnvL1Endpoint: "wefty://l1", contract.EnvHandoffDir: handoff,
+		},
+		SensitiveEnv:     map[string]string{contract.EnvRunToken: token},
+		WorkingDirectory: t.TempDir(),
+		HandoffDirectory: handoff,
+	}
+	result, err := a.runProcess(context.Background(), claim)
+	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("runProcess() = (%#v, %v)", result, err)
+	}
+	want := runID + "\nwefty://l3\nwefty://l1\n[REDACTED]\n" + handoff + "\n"
+	if output.String() != want {
+		t.Fatalf("process environment output = %q, want %q", output.String(), want)
 	}
 }
 
