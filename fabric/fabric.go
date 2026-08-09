@@ -4,9 +4,14 @@ package fabric
 
 import (
 	"context"
+	"errors"
 	"net"
 	"time"
 )
+
+// ErrIdentityNotFound means the network could not authenticate the requested
+// remote address.
+var ErrIdentityNotFound = errors.New("fabric identity not found")
 
 type Fabric interface {
 	Listen(network, address string) (net.Listener, error)
