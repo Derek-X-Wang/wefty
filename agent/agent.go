@@ -284,7 +284,7 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 		err := fmt.Errorf("runtime handler %q is not supported for process jobs", claim.Job.Spec.RuntimeHandler)
 		return contract.ProcessResult{SpawnError: err.Error()}, err
 	}
-	uploader := newBatchingLogSink(ctx, a.client, claim, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
+	uploader := newBatchingLogSink(ctx, a.client, claim, a.clock, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
 	var localSink processrunner.OutputSink
 	if a.outputSinkFactory != nil {
 		localSink = a.outputSinkFactory(claim)

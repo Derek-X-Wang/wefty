@@ -24,6 +24,15 @@ func TestLeaseExpiryReaperFencesAttemptWithoutRequeue(t *testing.T) {
 	h.register(agent2, "node-2")
 	job := h.submit(client, "expiry-no-requeue", []string{"linux"})
 	claim := claimJob(t, h, agent1, "node-1")
+	logPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/logs", job.JobID, claim.Lease.AttemptID)
+	acceptedLog := AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: []contract.LogEvent{{
+		AttemptID: claim.Lease.AttemptID, Stream: contract.LogStdout, Sequence: 0,
+		Timestamp: h.clock.Now(), Bytes: []byte("accepted-before-expiry\n"),
+	}}}
+	status, _, body := h.do(agent1, http.MethodPost, logPath, acceptedLog)
+	if status != http.StatusOK {
+		t.Fatalf("initial log status = %d body=%s", status, body)
+	}
 
 	h.clock.Advance(30 * time.Second)
 	result, err := h.store.Reconcile(context.Background())
@@ -34,10 +43,27 @@ func TestLeaseExpiryReaperFencesAttemptWithoutRequeue(t *testing.T) {
 		t.Fatalf("expired attempts = %d, want 1", result.ExpiredAttempts)
 	}
 	assertJobAndAttemptState(t, h.store, job.JobID, claim.Lease.AttemptID, contract.JobFailed, contract.AttemptLost)
+	status, _, body = h.do(agent1, http.MethodPost, logPath, acceptedLog)
+	if status != http.StatusOK {
+		t.Fatalf("identical expired log replay status = %d body=%s", status, body)
+	}
+	lateLog := AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: []contract.LogEvent{{
+		AttemptID: claim.Lease.AttemptID, Stream: contract.LogStdout, Sequence: 1,
+		Timestamp: h.clock.Now(), Bytes: []byte("must-not-append\n"),
+	}}}
+	status, _, body = h.do(agent1, http.MethodPost, logPath, lateLog)
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorLeaseExpired)
+	var logRows int
+	if err := h.store.db.QueryRow("SELECT count(*) FROM log_events WHERE job_id=?", job.JobID).Scan(&logRows); err != nil {
+		t.Fatal(err)
+	}
+	if logRows != 1 {
+		t.Fatalf("log rows after expired append = %d, want 1", logRows)
+	}
 
 	completionPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", job.JobID, claim.Lease.AttemptID)
 	exitCode := 0
-	status, _, body := h.do(agent1, http.MethodPost, completionPath, CompletionRequest{
+	status, _, body = h.do(agent1, http.MethodPost, completionPath, CompletionRequest{
 		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "late-completion", Result: ProcessResult{ExitCode: &exitCode},
 	})
 	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorLeaseExpired)
@@ -165,10 +191,14 @@ func TestDrainStopsClaimsAndAllowsRunningAttemptToFinish(t *testing.T) {
 	first := h.submit(client, "drain-running", []string{"linux"})
 	second := h.submit(client, "drain-queued", []string{"linux"})
 	claim := claimJob(t, h, agent, "node-1")
-	if claim.Job.JobID != first.JobID {
-		t.Fatalf("claimed job = %q, want %q", claim.Job.JobID, first.JobID)
+	runningJobID := claim.Job.JobID
+	queuedJobID := first.JobID
+	if runningJobID == first.JobID {
+		queuedJobID = second.JobID
+	} else if runningJobID != second.JobID {
+		t.Fatalf("claimed unexpected job %q", runningJobID)
 	}
-	renewPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/lease", first.JobID, claim.Lease.AttemptID)
+	renewPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/lease", runningJobID, claim.Lease.AttemptID)
 	status, _, body := h.do(agent, http.MethodPost, renewPath, RenewalRequest{FencingToken: claim.Lease.FencingToken})
 	if status != http.StatusOK {
 		t.Fatalf("renew status = %d body=%s", status, body)
@@ -197,7 +227,7 @@ func TestDrainStopsClaimsAndAllowsRunningAttemptToFinish(t *testing.T) {
 	}
 
 	exitCode := 0
-	completionPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", first.JobID, claim.Lease.AttemptID)
+	completionPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", runningJobID, claim.Lease.AttemptID)
 	status, _, body = h.do(agent, http.MethodPost, completionPath, CompletionRequest{
 		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "drain-completion", Result: ProcessResult{ExitCode: &exitCode},
 	})
@@ -206,7 +236,7 @@ func TestDrainStopsClaimsAndAllowsRunningAttemptToFinish(t *testing.T) {
 	}
 	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
 	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
-	queued, err := h.store.GetJob(context.Background(), second.JobID)
+	queued, err := h.store.GetJob(context.Background(), queuedJobID)
 	if err != nil {
 		t.Fatal(err)
 	}
