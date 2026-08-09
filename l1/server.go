@@ -152,6 +152,8 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("GET /v1/jobs/{job_id}/logs", s.getJobLogs)
 	client.HandleFunc("POST /v1/jobs/{job_id}/prompt", s.notImplemented)
 	client.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.notImplemented)
+	client.HandleFunc("GET /v1/nodes", s.listNodes)
+	client.HandleFunc("POST /v1/nodes/{node_id}/drain", s.operatorDrainNode)
 
 	agent := http.NewServeMux()
 	agent.HandleFunc("POST /v1/agent/nodes/register", s.registerNode)
@@ -166,7 +168,31 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
 	root.Handle("/v1/jobs", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/jobs/", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/nodes", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/nodes/", s.authorize(clientPrincipal, client))
 	return root
+}
+
+func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.store.Reconcile(r.Context()); err != nil {
+		writeError(w, err)
+		return
+	}
+	nodes, err := s.store.ListNodes(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, NodeList{Nodes: nodes})
+}
+
+func (s *Server) operatorDrainNode(w http.ResponseWriter, r *http.Request) {
+	node, err := s.store.DrainNodeByOperator(r.Context(), r.PathValue("node_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, node)
 }
 
 func (s *Server) authorize(principal principal, next http.Handler) http.Handler {

@@ -399,6 +399,65 @@ func TestProtocolPrincipalsCannotCrossRouteGroups(t *testing.T) {
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
 }
 
+func TestClientListsNodeLivenessAndDrainsNode(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{
+		"alive-node": {"linux", "arm64"},
+		"stale-node": {"linux"},
+		"dead-node":  {"linux"},
+	})
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	deadAgent := h.client(fabric.Identity{NodeID: "dead-node", Tags: []string{DefaultAgentPrincipalTag}})
+	h.register(deadAgent, "dead-node")
+	h.clock.Advance(DefaultNodeDeadAfter - DefaultNodeStaleAfter)
+	staleAgent := h.client(fabric.Identity{NodeID: "stale-node", Tags: []string{DefaultAgentPrincipalTag}})
+	h.register(staleAgent, "stale-node")
+	h.clock.Advance(DefaultNodeStaleAfter)
+	aliveAgent := h.client(fabric.Identity{NodeID: "alive-node", Tags: []string{DefaultAgentPrincipalTag}})
+	h.register(aliveAgent, "alive-node")
+
+	status, _, body := h.do(client, http.MethodGet, "/v1/nodes", nil)
+	if status != http.StatusOK {
+		t.Fatalf("list nodes status = %d body=%s", status, body)
+	}
+	var listed NodeList
+	if err := json.Unmarshal(body, &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Nodes) != 3 {
+		t.Fatalf("listed nodes = %d, want 3: %s", len(listed.Nodes), body)
+	}
+	wantStates := []contract.NodeState{contract.NodeAlive, contract.NodeDead, contract.NodeStale}
+	for i, want := range wantStates {
+		if listed.Nodes[i].State != want {
+			t.Fatalf("node %q state = %q, want %q", listed.Nodes[i].NodeID, listed.Nodes[i].State, want)
+		}
+	}
+	if got := listed.Nodes[0].AuthoritativeTags; len(got) != 2 || got[0] != "arm64" || got[1] != "linux" {
+		t.Fatalf("alive tags = %v, want [arm64 linux]", got)
+	}
+	if listed.Nodes[0].AgentVersion != "test" {
+		t.Fatalf("alive agent version = %q, want test", listed.Nodes[0].AgentVersion)
+	}
+
+	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/alive-node/drain", nil)
+	if status != http.StatusOK {
+		t.Fatalf("operator drain status = %d body=%s", status, body)
+	}
+	var drained Node
+	if err := json.Unmarshal(body, &drained); err != nil {
+		t.Fatal(err)
+	}
+	if drained.State != contract.NodeDraining {
+		t.Fatalf("drained state = %q, want draining", drained.State)
+	}
+	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/alive-node/drain", nil)
+	if status != http.StatusOK {
+		t.Fatalf("operator drain replay status = %d body=%s", status, body)
+	}
+	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/missing/drain", nil)
+	assertAPIError(t, status, body, http.StatusNotFound, contract.ErrorNotFound)
+}
+
 func TestRegistrationRejectsSelfReportedTags(t *testing.T) {
 	h := newIntegrationHarness(t, map[string][]string{"node-1": {"configured"}})
 	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag, "self-claimed"}})

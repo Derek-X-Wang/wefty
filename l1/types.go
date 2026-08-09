@@ -61,6 +61,11 @@ type Node struct {
 	LastHeartbeatAt   time.Time          `json:"last_heartbeat_at"`
 }
 
+// NodeList is the L1 client representation of the operator-visible fleet.
+type NodeList struct {
+	Nodes []Node `json:"nodes"`
+}
+
 // ProcessResult matches the M0 completion contract. Pointer fields preserve
 // the distinction between an omitted exit code and exit code zero.
 type ProcessResult struct {

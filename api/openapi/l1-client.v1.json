@@ -118,6 +118,66 @@
         }
       }
     },
+    "/v1/nodes": {
+      "get": {
+        "operationId": "listNodes",
+        "summary": "List operator-visible nodes",
+        "description": "Returns every registered node after applying liveness thresholds. Results are ordered by stable node ID.",
+        "responses": {
+          "200": {
+            "description": "Current fleet state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["nodes"],
+                  "properties": {
+                    "nodes": {
+                      "type": "array",
+                      "items": { "$ref": "./common.v1.json#/components/schemas/Node" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/nodes/{node_id}/drain": {
+      "parameters": [
+        {
+          "name": "node_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "post": {
+        "operationId": "operatorDrainNode",
+        "summary": "Stop new claims on a node",
+        "description": "Idempotently marks the current stable-node registration draining while allowing active attempt authority to finish.",
+        "responses": {
+          "200": {
+            "description": "Node is draining.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Node" }
+              }
+            }
+          },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/jobs/{job_id}/prompt": {
       "parameters": [
         {
