@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -19,6 +20,7 @@ type ServerConfig struct {
 	ClientPrincipalTag    string
 	AgentPrincipalTag     string
 	AuthoritativeNodeTags map[string][]string
+	ReconcileInterval     time.Duration
 }
 
 // Server serves separate client and agent protocols over one Fabric listener.
@@ -30,6 +32,7 @@ type Server struct {
 	clientPrincipalTag    string
 	agentPrincipalTag     string
 	authoritativeNodeTags map[string][]string
+	reconcileInterval     time.Duration
 	handler               http.Handler
 }
 
@@ -49,10 +52,15 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	for nodeID, tags := range config.AuthoritativeNodeTags {
 		authoritativeTags[nodeID] = NormalizeTags(tags)
 	}
+	reconcileInterval := config.ReconcileInterval
+	if reconcileInterval <= 0 {
+		reconcileInterval = DefaultReconcileInterval
+	}
 	s := &Server{
 		fabric: f, store: store,
 		clientPrincipalTag: clientTag, agentPrincipalTag: agentTag,
 		authoritativeNodeTags: authoritativeTags,
+		reconcileInterval:     reconcileInterval,
 	}
 	s.handler = s.routes()
 	return s, nil
@@ -79,7 +87,32 @@ func (s *Server) ListenAndServe(ctx context.Context, network, address string) er
 
 // Serve runs the L1 HTTP protocols on an already-created Fabric listener.
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
+	if _, err := s.store.Reconcile(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("l1: initial recovery: %w", err)
+	}
 	httpServer := &http.Server{Handler: s.handler}
+	reconcileFailures := make(chan error, 1)
+	reconcileContext, stopReconcile := context.WithCancel(ctx)
+	defer stopReconcile()
+	go func() {
+		ticker := time.NewTicker(s.reconcileInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-reconcileContext.Done():
+				return
+			case <-ticker.C:
+				if _, err := s.store.Reconcile(reconcileContext); err != nil {
+					reconcileFailures <- err
+					_ = httpServer.Close()
+					return
+				}
+			}
+		}
+	}()
 	stopped := make(chan struct{})
 	go func() {
 		select {
@@ -89,7 +122,13 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		}
 	}()
 	err := httpServer.Serve(listener)
+	stopReconcile()
 	close(stopped)
+	select {
+	case reconcileErr := <-reconcileFailures:
+		return fmt.Errorf("l1: reconcile failure state: %w", reconcileErr)
+	default:
+	}
 	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
 		return nil
 	}
@@ -115,6 +154,7 @@ func (s *Server) routes() http.Handler {
 	agent := http.NewServeMux()
 	agent.HandleFunc("POST /v1/agent/nodes/register", s.registerNode)
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/heartbeat", s.heartbeatNode)
+	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/drain", s.drainNode)
 	agent.HandleFunc("POST /v1/agent/jobs/claim", s.claimJob)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/lease", s.renewLease)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete", s.completeAttempt)
@@ -202,6 +242,21 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 	}
 	identity := identityFromRequest(r)
 	node, err := s.store.HeartbeatNode(r.Context(), identity.NodeID, r.PathValue("node_id"), request.BootSessionID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, node)
+}
+
+func (s *Server) drainNode(w http.ResponseWriter, r *http.Request) {
+	var request DrainRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	identity := identityFromRequest(r)
+	node, err := s.store.DrainNode(r.Context(), identity.NodeID, r.PathValue("node_id"), request.BootSessionID)
 	if err != nil {
 		writeError(w, err)
 		return
