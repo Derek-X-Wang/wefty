@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	DefaultCallerPrincipalTag = "wefty:client"
+	DefaultCallerPrincipalTag = "tag:wefty-client"
 	DefaultL1Address          = "wefty://control-plane"
 	DefaultL3Address          = "wefty://run-ledger"
 	DefaultHandoffRoot        = contract.DefaultHandoffRoot

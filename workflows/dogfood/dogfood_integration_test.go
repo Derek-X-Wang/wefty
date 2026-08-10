@@ -170,8 +170,8 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 	}
 	wantSteps := []string{"plan", "implement", "review"}
 	for index, record := range records {
-		if record.Status != contract.RunSucceeded || len(record.Envelopes) != 1 || len(record.Gates) != 1 {
-			t.Fatalf("run %s protocol record = status %q envelopes %d gates %d", record.RunID, record.Status, len(record.Envelopes), len(record.Gates))
+		if record.Status != contract.RunSucceeded || record.NodeID != "dogfood-node" || len(record.Envelopes) != 1 || len(record.Gates) != 1 {
+			t.Fatalf("run %s protocol record = status %q node %q envelopes %d gates %d", record.RunID, record.Status, record.NodeID, len(record.Envelopes), len(record.Gates))
 		}
 		if record.Envelopes[0].StepID != wantSteps[index] || record.Gates[0].StepID != wantSteps[index] || record.Envelopes[0].AttemptID == "" || record.Gates[0].AttemptID == "" {
 			t.Fatalf("run %s protocol identities = envelope %#v gate %#v", record.RunID, record.Envelopes[0], record.Gates[0])

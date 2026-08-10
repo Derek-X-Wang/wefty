@@ -33,6 +33,7 @@ func (systemClock) Now() time.Time { return time.Now() }
 // Job is the L1 HTTP representation of a job.
 type Job struct {
 	JobID            string            `json:"job_id"`
+	NodeID           string            `json:"node_id,omitempty"`
 	State            contract.JobState `json:"state"`
 	Spec             contract.JobSpec  `json:"spec"`
 	CurrentAttemptID string            `json:"current_attempt_id,omitempty"`
@@ -67,11 +68,13 @@ type NodeList struct {
 }
 
 // ProcessResult matches the M0 completion contract. Pointer fields preserve
-// the distinction between an omitted exit code and exit code zero.
+// the distinction between an omitted exit code and exit code zero. OutputError
+// makes incomplete durable output a terminal failure rather than false success.
 type ProcessResult struct {
-	SpawnError string `json:"spawn_error,omitempty"`
-	ExitCode   *int   `json:"exit_code,omitempty"`
-	Signal     string `json:"signal,omitempty"`
+	SpawnError  string `json:"spawn_error,omitempty"`
+	OutputError string `json:"output_error,omitempty"`
+	ExitCode    *int   `json:"exit_code,omitempty"`
+	Signal      string `json:"signal,omitempty"`
 }
 
 type CompletionRequest struct {

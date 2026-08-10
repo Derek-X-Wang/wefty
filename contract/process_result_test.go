@@ -15,3 +15,13 @@ func TestProcessResultPreservesExitZero(t *testing.T) {
 		t.Fatalf("ProcessResult JSON = %s, want %s", got, want)
 	}
 }
+
+func TestProcessResultSerializesOutputFailure(t *testing.T) {
+	encoded, err := json.Marshal(ProcessResult{OutputError: "durable log flush failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(encoded), `{"output_error":"durable log flush failed"}`; got != want {
+		t.Fatalf("ProcessResult JSON = %s, want %s", got, want)
+	}
+}

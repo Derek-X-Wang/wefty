@@ -58,7 +58,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 		}
 		job, err := r.jobs.SubmitJob(ctx, intent.jobSpec(runToken))
 		if err != nil {
-			if recordErr := r.store.recordDispatchError(ctx, intent.RunID, err); recordErr != nil {
+			record := r.store.recordDispatchError
+			if !retryableDispatchError(err) {
+				record = r.store.failDispatch
+			}
+			if recordErr := record(ctx, intent.RunID, err); recordErr != nil {
 				passErrors = append(passErrors, errors.Join(err, recordErr))
 			} else {
 				passErrors = append(passErrors, err)
@@ -81,11 +85,25 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 			passErrors = append(passErrors, err)
 			continue
 		}
+		if err := r.store.recordRunNode(ctx, run.RunID, job.NodeID); err != nil {
+			passErrors = append(passErrors, err)
+			continue
+		}
 		if err := r.store.projectJobState(ctx, run, job.State); err != nil {
 			passErrors = append(passErrors, err)
 		}
 	}
 	return errors.Join(passErrors...)
+}
+
+func retryableDispatchError(err error) bool {
+	var dispatchErr *Error
+	if errors.As(err, &dispatchErr) {
+		return dispatchErr.Retryable
+	}
+	// Unknown failures include injected crashes and transport wrappers. They
+	// are ambiguous, so keep the stable dispatch key eligible for replay.
+	return true
 }
 
 // Run reconciles immediately and then on a fixed cadence until cancellation.

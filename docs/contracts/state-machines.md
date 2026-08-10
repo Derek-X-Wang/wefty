@@ -62,6 +62,9 @@ Node heartbeat updates node liveness only and does not renew attempt leases.
 
 Terminal job mapping is deterministic: `succeeded` maps to run `succeeded`
 only after required envelope validation; job `failed` maps to run `failed`.
+If polling first observes a succeeded job while its run is still `queued`, L3
+projects the run to `running` and then to `succeeded` on the next pass rather
+than inventing an unlisted `queued` to `succeeded` transition.
 Exit zero with a missing or invalid required envelope maps to run `failed`.
 An exit-zero parent remains `running` while any child run is non-terminal; once
 all children settle, a failed child fails the parent and otherwise the parent's

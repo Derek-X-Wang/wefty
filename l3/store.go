@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS runs (
   envelope_schema_json BLOB,
   required_envelope INTEGER NOT NULL DEFAULT 0,
   l1_job_id TEXT,
+  node_id TEXT,
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL,
   started_ns INTEGER,
@@ -206,7 +207,41 @@ BEFORE DELETE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejecti
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l3: apply SQLite schema: %w", err)
 	}
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "node_id", "TEXT"); err != nil {
+		return fmt.Errorf("l3: migrate run node attribution: %w", err)
+	}
 	return nil
+}
+
+func ensureSQLiteColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition)
+	return err
 }
 
 func (s *Store) ensureRunToken(ctx context.Context, runID string) (string, error) {
@@ -454,11 +489,14 @@ func (s *Store) CreateRun(ctx context.Context, input CreateRunInput) (record con
 		return contract.RunRecord{}, false, internalError(err, "read run idempotency key")
 	}
 	if input.Request.ParentRunID != "" {
-		var exists int
-		if err := tx.QueryRowContext(ctx, "SELECT 1 FROM runs WHERE run_id=?", input.Request.ParentRunID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		var parentStatus contract.RunState
+		if err := tx.QueryRowContext(ctx, "SELECT status FROM runs WHERE run_id=?", input.Request.ParentRunID).Scan(&parentStatus); errors.Is(err, sql.ErrNoRows) {
 			return contract.RunRecord{}, false, protocolError(contract.ErrorNotFound, "parent run %q was not found", input.Request.ParentRunID)
 		} else if err != nil {
 			return contract.RunRecord{}, false, internalError(err, "read parent run")
+		}
+		if parentStatus == contract.RunSucceeded || parentStatus == contract.RunFailed {
+			return contract.RunRecord{}, false, protocolError(contract.ErrorConflict, "parent run %q is terminal and cannot dispatch children", input.Request.ParentRunID)
 		}
 	}
 	var snapshot workflowSnapshot
@@ -757,7 +795,7 @@ func normalizeTags(tags []string) ([]string, error) {
 // script and trigger rows.
 func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, error) {
 	var record contract.RunRecord
-	var parent, sourceRun, workflowRef sql.NullString
+	var parent, nodeID, sourceRun, workflowRef sql.NullString
 	var paramsJSON, tagsJSON []byte
 	var limitsJSON []byte
 	var content []byte
@@ -765,13 +803,13 @@ func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, e
 	var createdNS, updatedNS int64
 	var startedNS, finishedNS sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `
-SELECT r.run_id, r.parent_run_id, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
+SELECT r.run_id, r.parent_run_id, r.node_id, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
        r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
        s.content, s.sha256, w.workflow_ref, t.actor, t.source, t.source_run_id
 FROM runs r JOIN run_scripts s ON s.run_id=r.run_id
 LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
-WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
+WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &nodeID, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
 		&createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &workflowRef, &actor, &source, &sourceRun)
 	if errors.Is(err, sql.ErrNoRows) {
 		return contract.RunRecord{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
@@ -781,6 +819,7 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &record.DispatchKey, &rec
 	}
 	record.SchemaVersion = contract.SchemaVersionV1
 	record.ParentRunID = parent.String
+	record.NodeID = nodeID.String
 	record.Params = append(json.RawMessage(nil), paramsJSON...)
 	if err := json.Unmarshal(tagsJSON, &record.Tags); err != nil {
 		return contract.RunRecord{}, internalError(err, "decode run tags")
@@ -1162,7 +1201,7 @@ func canonicalProtocolBodyWithAttempt(raw json.RawMessage, attemptID string) (js
 	if object, ok := value.(map[string]any); ok {
 		if supplied, exists := object["attempt_id"]; !exists {
 			object["attempt_id"] = attemptID
-		} else if suppliedID, ok := supplied.(string); ok && suppliedID != attemptID {
+		} else if suppliedID, ok := supplied.(string); !ok || suppliedID != attemptID {
 			return nil, "", protocolError(contract.ErrorConflict, "attempt_id must match the authenticated run attempt")
 		}
 	}
@@ -1303,6 +1342,25 @@ func (s *Store) recordDispatchError(ctx context.Context, runID string, dispatchE
 	return nil
 }
 
+func (s *Store) failDispatch(ctx context.Context, runID string, dispatchErr error) error {
+	now := canonicalTime(s.clock.Now())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin permanent dispatch failure")
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=?, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, dispatchErr.Error(), runID); err != nil {
+		return internalError(err, "record permanent dispatch error")
+	}
+	if err := failRunTx(ctx, tx, runID, now, s.tokenGrace); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return internalError(err, "commit permanent dispatch failure")
+	}
+	return nil
+}
+
 func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error {
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1424,6 +1482,17 @@ WHERE run_id=? AND status=?`, target, now.UnixNano(), started, now.UnixNano(), f
 	return nil
 }
 
+func (s *Store) recordRunNode(ctx context.Context, runID, nodeID string) error {
+	if nodeID == "" {
+		return nil
+	}
+	now := canonicalTime(s.clock.Now())
+	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET node_id=?, updated_ns=? WHERE run_id=? AND COALESCE(node_id, '')=''`, nodeID, now.UnixNano(), runID); err != nil {
+		return internalError(err, "record run node attribution")
+	}
+	return nil
+}
+
 // ProjectJobState implements the M0 job-to-run projection table. A claimed
 // job has not acknowledged execution yet, so the run remains queued.
 func ProjectJobState(current contract.RunState, job contract.JobState) (contract.RunState, bool, error) {
@@ -1439,7 +1508,14 @@ func ProjectJobState(current contract.RunState, job contract.JobState) (contract
 	case contract.JobAwaitingInput:
 		target = contract.RunAwaitingInput
 	case contract.JobSucceeded:
-		target = contract.RunSucceeded
+		if current == contract.RunQueued {
+			// Polling can miss L1's claimed/running states. Preserve the locked
+			// run transition table by projecting the observed success through
+			// running; the next reconciliation pass projects the terminal state.
+			target = contract.RunRunning
+		} else {
+			target = contract.RunSucceeded
+		}
 	case contract.JobFailed:
 		target = contract.RunFailed
 	default:
@@ -1491,8 +1567,8 @@ func (intent dispatchIntent) jobSpec(runToken string) contract.JobSpec {
 			},
 			Argv: []string{"wefty-inline-" + intent.RunID},
 			Env: map[string]string{
-				contract.EnvRunID: intent.RunID, contract.EnvL1Endpoint: DefaultL1Address,
-				contract.EnvL3Endpoint: DefaultL3Address, contract.EnvHandoffDir: handoff,
+				contract.EnvRunID: intent.RunID, contract.EnvL3Endpoint: DefaultL3Address,
+				contract.EnvHandoffDir: handoff,
 			},
 			SensitiveEnv:     map[string]string{contract.EnvRunToken: runToken},
 			WorkingDirectory: "/tmp",

@@ -3,7 +3,7 @@
   "info": {
     "title": "Wefty L3 run-ledger API",
     "version": "0.1.0-prerelease",
-    "description": "Caller run submission/polling and run-token-scoped workflow writes."
+    "description": "Caller run submission/polling and run-token-scoped workflow writes. Every request is Fabric-authenticated. Requests without a bearer run token additionally require the tag:wefty-client Fabric principal; bearer authorization is always interpreted as an opaque run token."
   },
   "servers": [{ "url": "wefty://run-ledger" }],
   "paths": {
@@ -20,7 +20,7 @@
         "operationId": "createWorkflowVersion",
         "summary": "Append an immutable saved workflow version",
         "description": "The ledger assigns the next monotonically increasing version. Content, hash, interpreter, and mode cannot be updated or deleted after creation.",
-        "security": [{ "callerToken": [] }],
+        "security": [{ "fabricIdentity": [] }],
         "requestBody": {
           "required": true,
           "content": {
@@ -59,7 +59,7 @@
       "get": {
         "operationId": "getWorkflowVersion",
         "summary": "Read one immutable saved workflow version",
-        "security": [{ "callerToken": [] }],
+        "security": [{ "fabricIdentity": [] }],
         "responses": {
           "200": {
             "description": "Saved workflow version.",
@@ -79,7 +79,7 @@
         "operationId": "createRun",
         "summary": "Create a manual or child run",
         "description": "workflow_ref and inline_script are mutually exclusive. workflow://<id> resolves the latest version and workflow://<id>/vN resolves an explicit version; both are pinned and snapshotted onto the run before the run row and dispatch intent commit atomically. L1 creation uses a stable dispatch key. max_cost is stored but not enforced in v0.1.",
-        "security": [{ "callerToken": [] }, { "runToken": [] }],
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
         "parameters": [
           {
             "name": "Idempotency-Key",
@@ -194,7 +194,7 @@
         "operationId": "getRun",
         "summary": "Read a run record",
         "description": "Run tokens may read their own run and descendants, never siblings or ancestors.",
-        "security": [{ "callerToken": [] }, { "runToken": [] }],
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
         "responses": {
           "200": {
             "description": "Run ledger record.",
@@ -218,7 +218,7 @@
         "operationId": "getRunLineage",
         "summary": "Read ancestor and descendant run lineage",
         "description": "Ancestors are root-first and descendants are depth-first. A run token receives only entries within its own descendant scope and cannot query an ancestor or sibling target.",
-        "security": [{ "callerToken": [] }, { "runToken": [] }],
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
         "responses": {
           "200": {
             "description": "Queryable run lineage.",
@@ -246,7 +246,7 @@
         "operationId": "rerunRun",
         "summary": "Create a new run from a stored run snapshot",
         "description": "Copies the source run's immutable executable bytes, SHA-256, interpreter, mode, params, tags, limits, and envelope requirements. Saved workflow refs are never re-resolved. Trigger provenance records rerun and the source run ID. The source must carry exactly one reserved wefty:node:<stable-node-id> tag; the rerun reuses its node-local handoff directory and otherwise fails explicitly.",
-        "security": [{ "callerToken": [] }],
+        "security": [{ "fabricIdentity": [] }],
         "responses": {
           "200": {
             "description": "Identical idempotency replay; the previously created rerun is returned.",
@@ -279,7 +279,7 @@
       "get": {
         "operationId": "getRunLogs",
         "summary": "Poll the run's L1 logs",
-        "security": [{ "callerToken": [] }, { "runToken": [] }],
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
         "parameters": [
           { "name": "cursor", "in": "query", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 } }
@@ -308,7 +308,7 @@
         "operationId": "appendEnvelope",
         "summary": "Append a validated, idempotent step envelope",
         "description": "Only the run's attempt-bound run token may write. The base schema and caller-provided restricted schema both validate before append. Invalid writes are stored as immutable protocol rejections and fail the run.",
-        "security": [{ "runToken": [] }],
+        "security": [{ "fabricIdentity": [], "runToken": [] }],
         "requestBody": {
           "required": true,
           "content": {
@@ -353,7 +353,7 @@
         "operationId": "appendGateResult",
         "summary": "Append an idempotent workflow-evaluated gate result",
         "description": "L3 stores gate outcomes; the workflow, not L3, evaluates the gate. Invalid writes are stored as protocol rejections, and fail/error outcomes fail the run.",
-        "security": [{ "runToken": [] }],
+        "security": [{ "fabricIdentity": [], "runToken": [] }],
         "requestBody": {
           "required": true,
           "content": {
@@ -398,7 +398,7 @@
         "operationId": "cancelRun",
         "summary": "Reserved run cancellation",
         "description": "Always returns 501 in v0.1 and does not mutate run or job state.",
-        "security": [{ "callerToken": [] }, { "runToken": [] }],
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
         "x-wefty-implementation": "reserved",
         "responses": {
           "501": { "$ref": "./common.v1.json#/components/responses/NotImplemented" }
@@ -548,11 +548,7 @@
       }
     },
     "securitySchemes": {
-      "callerToken": {
-        "type": "http",
-        "scheme": "bearer",
-        "bearerFormat": "operator or CLI token"
-      },
+      "fabricIdentity": { "$ref": "./common.v1.json#/components/securitySchemes/fabricIdentity" },
       "runToken": { "$ref": "./common.v1.json#/components/securitySchemes/runToken" }
     }
   }

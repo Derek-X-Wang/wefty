@@ -249,6 +249,18 @@ type loseSubmitResponseClient struct {
 	submitted l1.Job
 }
 
+type permanentSubmitErrorClient struct {
+	JobClient
+	runID string
+}
+
+func (c *permanentSubmitErrorClient) SubmitJob(ctx context.Context, spec contract.JobSpec) (l1.Job, error) {
+	if spec.Labels["run_id"] == c.runID {
+		return l1.Job{}, &Error{Code: contract.ErrorDispatchKeyConflict, Message: "dispatch key conflict", Retryable: false}
+	}
+	return c.JobClient.SubmitJob(ctx, spec)
+}
+
 func (c *loseSubmitResponseClient) SubmitJob(ctx context.Context, spec contract.JobSpec) (l1.Job, error) {
 	job, err := c.JobClient.SubmitJob(ctx, spec)
 	if err != nil {
@@ -347,6 +359,43 @@ func TestDispatchRecoveryCreatesExactlyOneL1JobAndPreservesScript(t *testing.T) 
 	}
 	if attempts != 2 {
 		t.Fatalf("dispatch attempts = %d, want 2", attempts)
+	}
+}
+
+func TestPermanentDispatchFailureFailsRunAndReleasesSucceededParent(t *testing.T) {
+	h := newIntegrationHarness(t)
+	parent := h.submit(inlineRunRequest("#!/bin/sh\nexit 0\n"), "permanent-parent")
+	parentClaim := dispatchAndClaimRun(t, h, parent.RunID)
+	completeClaim(t, h, parentClaim, 0, "complete-permanent-parent")
+
+	childRequest := inlineRunRequest("#!/bin/sh\nexit 0\n")
+	childRequest.ParentRunID = parent.RunID
+	child := h.submit(childRequest, "permanent-child")
+	client := &permanentSubmitErrorClient{JobClient: h.l1Client, runID: child.RunID}
+	reconciler, err := NewReconciler(h.l3Store, client, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ReconcileOnce(context.Background()); err == nil {
+		t.Fatal("permanent dispatch failure was not reported")
+	}
+	childRecord, err := h.l3Store.GetRun(context.Background(), child.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentRecord, err := h.l3Store.GetRun(context.Background(), parent.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childRecord.Status != contract.RunFailed || parentRecord.Status != contract.RunFailed {
+		t.Fatalf("permanent dispatch states child/parent = %q/%q, want failed/failed", childRecord.Status, parentRecord.Status)
+	}
+	var staged *string
+	if err := h.l3Store.db.QueryRow(`SELECT token_delivery FROM dispatch_outbox WHERE run_id=?`, child.RunID).Scan(&staged); err != nil {
+		t.Fatal(err)
+	}
+	if staged != nil {
+		t.Fatal("permanently failed dispatch retained staged run token")
 	}
 }
 
@@ -679,6 +728,11 @@ func TestJobTerminalStatesProjectOntoRun(t *testing.T) {
 			if err := reconciler.ReconcileOnce(context.Background()); err != nil {
 				t.Fatal(err)
 			}
+			if test.exitCode == 0 {
+				if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
 			record, err := h.l3Store.GetRun(context.Background(), accepted.RunID)
 			if err != nil {
 				t.Fatal(err)
@@ -745,7 +799,7 @@ func TestProjectJobStateMatrix(t *testing.T) {
 		{"resumed", contract.RunAwaitingInput, contract.JobRunning, contract.RunRunning, true},
 		{"succeeded", contract.RunRunning, contract.JobSucceeded, contract.RunSucceeded, true},
 		{"failed from queued", contract.RunQueued, contract.JobFailed, contract.RunFailed, true},
-		{"missed intermediate success", contract.RunQueued, contract.JobSucceeded, contract.RunSucceeded, true},
+		{"missed intermediate success passes through running", contract.RunQueued, contract.JobSucceeded, contract.RunRunning, true},
 		{"stale queued ignored", contract.RunRunning, contract.JobQueued, contract.RunRunning, false},
 		{"terminal unchanged", contract.RunSucceeded, contract.JobFailed, contract.RunSucceeded, false},
 	}
@@ -760,6 +814,13 @@ func TestProjectJobStateMatrix(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReservedCancelRouteReturnsNotImplemented(t *testing.T) {
+	h := newIntegrationHarness(t)
+	run := h.submit(inlineRunRequest("#!/bin/sh\nexit 0\n"), "cancel-reserved")
+	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
+	assertAPIError(t, status, body, http.StatusNotImplemented, contract.ErrorNotImplemented)
 }
 
 func TestL3StoreUsesWAL(t *testing.T) {

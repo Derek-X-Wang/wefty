@@ -59,6 +59,12 @@ authority for attempts they already own, but cannot claim another job. On
 SIGINT or SIGTERM the agent invokes this verb, waits for its running attempt to
 upload completion, and exits; a second signal forces local cancellation.
 
+Lease renewal continues after the subprocess exits while redacted output is
+flushed, durable logs are acknowledged, and the idempotent completion request
+is retrying. Renewal stops only after L1 accepts completion or the agent loses
+attempt authority. A redaction, spool, or uploader finalization failure is
+reported as `output_error`, never as a successful exit code.
+
 ## Lease expiry and fencing errors
 
 | Condition | HTTP | Error code | Retryable | Effect |

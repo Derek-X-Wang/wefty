@@ -12,7 +12,6 @@ const SchemaVersionV1 = 1
 const (
 	EnvRunID           = "WEFTY_RUN_ID"
 	EnvL3Endpoint      = "WEFTY_L3_ENDPOINT"
-	EnvL1Endpoint      = "WEFTY_L1_ENDPOINT"
 	EnvRunToken        = "WEFTY_RUN_TOKEN"
 	EnvHandoffDir      = "WEFTY_HANDOFF_DIR"
 	DefaultHandoffRoot = "/tmp/wefty/handoffs"
@@ -120,6 +119,7 @@ type Evidence struct {
 type RunRecord struct {
 	SchemaVersion int             `json:"schema_version"`
 	RunID         string          `json:"run_id"`
+	NodeID        string          `json:"node_id,omitempty"`
 	ParentRunID   string          `json:"parent_run_id,omitempty"`
 	DispatchKey   string          `json:"dispatch_key"`
 	Status        RunState        `json:"status"`
@@ -174,13 +174,15 @@ const (
 	LogStderr LogStream = "stderr"
 )
 
-// ProcessResult is the mutually exclusive operating-system outcome of one
-// process execution. ExitCode is a pointer so a successful exit code of zero
-// remains present on the wire when omitempty is applied.
+// ProcessResult is the mutually exclusive execution/finalization outcome of
+// one process. ExitCode is a pointer so a successful exit code of zero remains
+// present on the wire when omitempty is applied. OutputError supersedes an
+// otherwise-successful exit when durable output cannot be finalized.
 type ProcessResult struct {
-	SpawnError string `json:"spawn_error,omitempty"`
-	ExitCode   *int   `json:"exit_code,omitempty"`
-	Signal     string `json:"signal,omitempty"`
+	SpawnError  string `json:"spawn_error,omitempty"`
+	OutputError string `json:"output_error,omitempty"`
+	ExitCode    *int   `json:"exit_code,omitempty"`
+	Signal      string `json:"signal,omitempty"`
 }
 
 // NodeRegistration intentionally has no tags field. Claim eligibility uses

@@ -93,6 +93,7 @@ func (s *Server) routes() http.Handler {
 	runs.HandleFunc("POST /v1/runs/{run_id}/envelopes", s.appendEnvelope)
 	runs.HandleFunc("POST /v1/runs/{run_id}/gates", s.appendGateResult)
 	runs.HandleFunc("POST /v1/runs/{run_id}/rerun", s.rerun)
+	runs.HandleFunc("POST /v1/runs/{run_id}/cancel", s.notImplemented)
 
 	workflows := http.NewServeMux()
 	workflows.HandleFunc("POST /v1/workflows/{workflow_id}/versions", s.createWorkflowVersion)
@@ -381,6 +382,10 @@ func (s *Server) rerun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeRunAccepted(w, record, replayed)
+}
+
+func (s *Server) notImplemented(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, protocolError(contract.ErrorNotImplemented, "operation is reserved for a future version"))
 }
 
 func (s *Server) createWorkflowVersion(w http.ResponseWriter, r *http.Request) {

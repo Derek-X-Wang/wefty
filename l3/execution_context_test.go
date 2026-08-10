@@ -39,8 +39,8 @@ func TestDispatchDeliversExactRunEnvironmentAndStoresTokenHash(t *testing.T) {
 	}
 	handoff := filepath.Join(DefaultHandoffRoot, accepted.RunID)
 	wantPublic := map[string]string{
-		contract.EnvRunID: accepted.RunID, contract.EnvL1Endpoint: DefaultL1Address,
-		contract.EnvL3Endpoint: DefaultL3Address, contract.EnvHandoffDir: handoff,
+		contract.EnvRunID: accepted.RunID, contract.EnvL3Endpoint: DefaultL3Address,
+		contract.EnvHandoffDir: handoff,
 	}
 	if !reflect.DeepEqual(claim.Job.Spec.Execution.Env, wantPublic) {
 		t.Fatalf("public env = %#v, want %#v", claim.Job.Spec.Execution.Env, wantPublic)
@@ -221,6 +221,36 @@ func TestTerminalRunTokenGraceAndExpiry(t *testing.T) {
 	}
 }
 
+func TestTerminalRunTokenGraceRejectsNewChildDispatch(t *testing.T) {
+	h := newIntegrationHarness(t)
+	parent := h.submit(inlineRunRequest("#!/bin/sh\nexit 0\n"), "terminal-parent")
+	token, err := h.l3Store.ensureRunToken(context.Background(), parent.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.l3Store.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := failRunTx(context.Background(), tx, parent.RunID, time.Now().UTC(), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.l3Store.AuthenticateRunToken(context.Background(), token); err != nil {
+		t.Fatalf("terminal token should remain valid for final reads and writes: %v", err)
+	}
+	child := inlineRunRequest("#!/bin/sh\nexit 0\n")
+	child.ParentRunID = parent.RunID
+	workflow := h.client(fabric.Identity{NodeID: "workflow-node"}, DefaultL3Address)
+	status, _, body := h.do(workflow, http.MethodPost, "/v1/runs", child, http.Header{
+		"Authorization":   []string{"Bearer " + token},
+		"Idempotency-Key": []string{"terminal-child"},
+	})
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+}
+
 type mutableClock struct{ now time.Time }
 
 func (c *mutableClock) Now() time.Time { return c.now }
@@ -244,8 +274,8 @@ func claimRunTokens(t *testing.T, h *integrationHarness, count int) map[string]s
 }
 
 func TestRunEnvironmentConstantNames(t *testing.T) {
-	want := []string{"WEFTY_HANDOFF_DIR", "WEFTY_L1_ENDPOINT", "WEFTY_L3_ENDPOINT", "WEFTY_RUN_ID", "WEFTY_RUN_TOKEN"}
-	got := []string{contract.EnvHandoffDir, contract.EnvL1Endpoint, contract.EnvL3Endpoint, contract.EnvRunID, contract.EnvRunToken}
+	want := []string{"WEFTY_HANDOFF_DIR", "WEFTY_L3_ENDPOINT", "WEFTY_RUN_ID", "WEFTY_RUN_TOKEN"}
+	got := []string{contract.EnvHandoffDir, contract.EnvL3Endpoint, contract.EnvRunID, contract.EnvRunToken}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("run environment names = %q, want %q", got, want)
 	}

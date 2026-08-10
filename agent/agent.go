@@ -315,11 +315,17 @@ type runOutcome struct {
 }
 
 func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) error {
-	executionContext, cancelExecution := context.WithCancel(ctx)
+	attemptContext, cancelAttempt := context.WithCancel(ctx)
+	defer cancelAttempt()
+	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()
 
 	renewalErrors := make(chan error, 1)
-	go a.renewalLoop(executionContext, claim, renewalErrors)
+	renewalDone := make(chan struct{})
+	go func() {
+		defer close(renewalDone)
+		a.renewalLoop(attemptContext, claim, renewalErrors)
+	}()
 
 	completed := make(chan runOutcome, 1)
 	go func() {
@@ -330,12 +336,14 @@ func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) error {
 	var outcome runOutcome
 	select {
 	case <-ctx.Done():
-		cancelExecution()
+		cancelAttempt()
 		<-completed
+		<-renewalDone
 		return ctx.Err()
 	case err := <-renewalErrors:
-		cancelExecution()
+		cancelAttempt()
 		<-completed
+		<-renewalDone
 		return fmt.Errorf("agent: renew lease: %w", err)
 	case outcome = <-completed:
 		cancelExecution()
@@ -349,8 +357,28 @@ func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) error {
 		IdempotencyKey: "completion:" + claim.Lease.AttemptID,
 		Result:         toL1Result(outcome.result),
 	}
-	if err := a.completeWithRetry(ctx, claim, request); err != nil {
-		return fmt.Errorf("agent: complete attempt: %w", err)
+	completionDone := make(chan error, 1)
+	go func() { completionDone <- a.completeWithRetry(attemptContext, claim, request) }()
+	var completionErr error
+	select {
+	case completionErr = <-completionDone:
+		cancelAttempt()
+	case err := <-renewalErrors:
+		cancelAttempt()
+		completionErr = <-completionDone
+		<-renewalDone
+		if completionErr != nil {
+			return fmt.Errorf("agent: renew lease while completing: %w", err)
+		}
+	case <-ctx.Done():
+		cancelAttempt()
+		<-completionDone
+		<-renewalDone
+		return ctx.Err()
+	}
+	<-renewalDone
+	if completionErr != nil {
+		return fmt.Errorf("agent: complete attempt: %w", completionErr)
 	}
 	if a.handoffs != nil {
 		succeeded := outcome.err == nil && outcome.result.ExitCode != nil && *outcome.result.ExitCode == 0
@@ -405,7 +433,7 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 	if bridge != nil {
 		defer bridge.close()
 		execution.Env = cloneEnvironment(execution.Env)
-		execution.Env[contract.EnvL1Endpoint] = bridge.l1Endpoint
+		delete(execution.Env, "WEFTY_L1_ENDPOINT")
 		execution.Env[contract.EnvL3Endpoint] = bridge.l3Endpoint
 	}
 	var uploader *batchingLogSink
@@ -453,7 +481,11 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 	if uploadErr != nil {
 		uploadErr = fmt.Errorf("upload logs: %w", uploadErr)
 	}
-	return result, errors.Join(runErr, outputErr, uploadErr)
+	finalizationErr := errors.Join(outputErr, uploadErr)
+	if finalizationErr != nil {
+		result = contract.ProcessResult{OutputError: finalizationErr.Error()}
+	}
+	return result, errors.Join(runErr, finalizationErr)
 }
 
 func stringOrDefault(value, fallback string) string {
@@ -514,7 +546,7 @@ func renewalDelay(now, expires time.Time, configured time.Duration) time.Duratio
 }
 
 func toL1Result(result contract.ProcessResult) l1.ProcessResult {
-	return l1.ProcessResult{SpawnError: result.SpawnError, ExitCode: result.ExitCode, Signal: result.Signal}
+	return l1.ProcessResult{SpawnError: result.SpawnError, OutputError: result.OutputError, ExitCode: result.ExitCode, Signal: result.Signal}
 }
 
 func (a *Agent) wait(ctx context.Context, duration time.Duration, heartbeatErrors <-chan error) error {

@@ -110,8 +110,8 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 		}
 	}
 	processResult := object(t, schemas["ProcessResult"], "ProcessResult")
-	if len(processResult["oneOf"].([]any)) != 3 {
-		t.Fatal("ProcessResult must distinguish spawn error, exit code, and signal death")
+	if len(processResult["oneOf"].([]any)) != 4 {
+		t.Fatal("ProcessResult must distinguish spawn error, output failure, exit code, and signal death")
 	}
 
 	nodeRegistration := object(t, schemas["NodeRegistration"], "NodeRegistration")
@@ -138,6 +138,34 @@ func TestL1RouteGroupsUseFabricIdentity(t *testing.T) {
 				t.Fatalf("security requirement = %#v, want fabricIdentity", requirement)
 			}
 		})
+	}
+}
+
+func TestL3UsesFabricAuthenticationAndRunTokenAuthorization(t *testing.T) {
+	t.Parallel()
+	doc := readObject(t, "l3.v1.json")
+	components := object(t, doc["components"], "components")
+	schemes := object(t, components["securitySchemes"], "components.securitySchemes")
+	if _, exists := schemes["callerToken"]; exists {
+		t.Fatal("L3 advertises callerToken even though runtime has no caller bearer token")
+	}
+	if _, exists := schemes["fabricIdentity"]; !exists {
+		t.Fatal("L3 does not advertise mandatory Fabric authentication")
+	}
+	paths := object(t, doc["paths"], "paths")
+	for _, path := range []string{"/v1/runs/{run_id}/envelopes", "/v1/runs/{run_id}/gates"} {
+		operation := object(t, object(t, paths[path], path)["post"], path+".post")
+		security, ok := operation["security"].([]any)
+		if !ok || len(security) != 1 {
+			t.Fatalf("%s security = %#v, want one combined requirement", path, operation["security"])
+		}
+		requirement := object(t, security[0], path+".security[0]")
+		if _, ok := requirement["fabricIdentity"]; !ok {
+			t.Errorf("%s omits Fabric authentication", path)
+		}
+		if _, ok := requirement["runToken"]; !ok {
+			t.Errorf("%s omits bearer run-token authorization", path)
+		}
 	}
 }
 

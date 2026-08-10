@@ -1,19 +1,18 @@
 # Run execution context
 
 This document fixes the v0.1 contract delivered to an L3 workflow process.
-The five variable names below are stable API surface; clients must not invent
+The four variable names below are stable API surface; clients must not invent
 aliases or depend on additional variables.
 
 | Variable | Visibility | Value |
 | --- | --- | --- |
 | `WEFTY_RUN_ID` | public | The L3 run ID. |
 | `WEFTY_L3_ENDPOINT` | public | A job-local HTTP base URL for the L3 run ledger. |
-| `WEFTY_L1_ENDPOINT` | public | A job-local HTTP base URL for the L1 client read surface. |
 | `WEFTY_RUN_TOKEN` | sensitive | The opaque, attempt-bound credential for in-run L3 calls. |
 | `WEFTY_HANDOFF_DIR` | public | The run's node-local handoff directory. |
 
 L3 places `WEFTY_RUN_TOKEN` only in `ExecutionSpec.SensitiveEnv`; the other
-four variables are in `ExecutionSpec.Env`. L1 client job responses omit the
+three variables are in `ExecutionSpec.Env`. L1 client job responses omit the
 entire sensitive environment, while the authenticated agent claim retains it.
 The node agent also replaces sensitive values with `[REDACTED]` before sending
 captured stdout or stderr to a log sink. Workflows must still avoid printing
@@ -22,10 +21,11 @@ credentials intentionally.
 The node agent replaces internal `wefty://` service addresses with per-attempt
 `http://127.0.0.1` bridge URLs before starting the workflow process. The bridge
 is torn down with the attempt and forwards L3 calls through the agent's
-authenticated Fabric connection. Its L1 side exposes only client-protocol job
-status and log reads; claim, lease, log-ingest, and completion routes remain
-agent-internal. The bridge is transport only: callers must still send the run
-token, and no Fabric tag privilege is projected into the workflow process.
+authenticated Fabric connection. Run status, lineage, and log reads use L3's
+run-token-scoped endpoints. The bridge exposes no L1 routes, so the agent's
+Fabric identity cannot become an L1 client passthrough. The bridge is transport
+only: callers must still send the run token, and no Fabric tag privilege is
+projected into the workflow process.
 
 ## Run-token authentication and scope
 
@@ -75,7 +75,9 @@ scope; an ancestor or sibling target is rejected before the query is served.
 An active run token has no wall-clock expiry. When its run becomes terminal,
 L3 atomically sets its expiry to the terminal timestamp plus five minutes.
 Calls during that grace period remain valid so the workflow can finish final
-protocol writes. At the expiry instant and afterward, authentication fails.
+protocol writes and reads. Grace does not authorize new child dispatch: once a
+parent is terminal, `POST /v1/runs` with that parent is rejected. At the expiry
+instant and afterward, authentication fails.
 
 ## Node-local handoff lifecycle
 
