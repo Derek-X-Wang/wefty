@@ -93,6 +93,22 @@ func write(file *os.File) {
 			}
 			fmt.Fprintln(file, workingDirectory)
 		default:
+			if len(value) > 8 && value[:8] == "@repeat:" {
+				// @repeat:<unit>:<count> keeps huge payloads out of argv;
+				// Linux caps a single argument string at 128 KiB.
+				spec := value[8:]
+				separator := bytes.LastIndexByte([]byte(spec), ':')
+				if separator <= 0 {
+					fatalf("malformed repeat directive %q", value)
+				}
+				count, err := strconv.Atoi(spec[separator+1:])
+				if err != nil {
+					fatalf("parse repeat count: %v", err)
+				}
+				_, _ = file.Write(bytes.Repeat([]byte(spec[:separator]), count))
+				fmt.Fprintln(file)
+				continue
+			}
 			if len(value) > 5 && value[:5] == "@env:" {
 				fmt.Fprintln(file, os.Getenv(value[5:]))
 				continue

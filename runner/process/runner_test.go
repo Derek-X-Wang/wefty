@@ -91,7 +91,9 @@ func TestRunEmitsOrderedEventsForEachStream(t *testing.T) {
 			sink := newCollectingSink()
 			result, err := New(Config{}).Run(context.Background(), Request{
 				AttemptID: "attempt-ordered",
-				Execution: helperExecution(string(stream), payload),
+				// The payload rides a helper directive rather than argv:
+				// Linux rejects any single argument over 128 KiB (E2BIG).
+				Execution: helperExecution(string(stream), fmt.Sprintf("@repeat:%s-:24000", stream)),
 			}, sink)
 			if err != nil {
 				t.Fatalf("Run() error = %v", err)
