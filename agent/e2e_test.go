@@ -38,10 +38,14 @@ func TestAgentProcessEndToEndPlainFabric(t *testing.T) {
 			wantOutput:      "e2e-complete\n",
 		},
 		{
+			// The process (3s) outlives the original lease (1s) three times
+			// over, so success proves renewal. Margins are wide because this
+			// runs real processes over HTTP on shared CI runners; sub-second
+			// leases flake under scheduler pauses.
 			name:            "renew short lease during long process",
-			leaseDuration:   200 * time.Millisecond,
-			renewalInterval: 40 * time.Millisecond,
-			arguments:       []string{"processhelper", "sleep", "800"},
+			leaseDuration:   1 * time.Second,
+			renewalInterval: 100 * time.Millisecond,
+			arguments:       []string{"processhelper", "sleep", "3000"},
 		},
 	}
 	for _, test := range tests {

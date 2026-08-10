@@ -100,6 +100,15 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Require credential for trusted-repository tsnet lane
+        # Arm the lane by setting repository variable TSNET_SMOKE_REQUIRED=true
+        # once the TS_AUTHKEY secret is provisioned. Armed + missing secret
+        # fails loudly; unarmed the lane is a visible no-op, never a fake pass
+        # of credentialed tests.
+        if: vars.TSNET_SMOKE_REQUIRED == 'true'
         run: test -n "$TS_AUTHKEY" || { echo "TS_AUTHKEY is required for the trusted-repository tsnet lane" >&2; exit 1; }
       - name: Run credentialed tsnet smoke
+        if: vars.TSNET_SMOKE_REQUIRED == 'true'
         run: go test -tags=tsnet_smoke ./... -run '^TestTSNetSmoke$'
+      - name: Lane unarmed notice
+        if: vars.TSNET_SMOKE_REQUIRED != 'true'
+        run: echo "tsnet smoke lane is unarmed (set TSNET_SMOKE_REQUIRED=true after provisioning TS_AUTHKEY); no credentialed tests ran."
