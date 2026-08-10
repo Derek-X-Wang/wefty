@@ -23,7 +23,7 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	ledgerFabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger", Tags: []string{l1.DefaultClientPrincipalTag}})
 	operatorFabric := network.NewFabric(fabric.Identity{
-		NodeID: "operator", Tags: []string{l1.DefaultClientPrincipalTag, l3.DefaultCallerPrincipalTag},
+		NodeID: "operator", Tags: []string{l3.DefaultCallerPrincipalTag},
 	})
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 

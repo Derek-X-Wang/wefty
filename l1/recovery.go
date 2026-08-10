@@ -50,11 +50,11 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 			SELECT 1 FROM jobs j
 			WHERE j.job_id=attempts.job_id
 			AND j.current_attempt_id=attempts.attempt_id
-			AND j.state IN (?, ?)
+			AND j.state IN (?, ?, ?)
 		)
 		RETURNING attempt_id, job_id`, contract.AttemptLost, now.UnixNano(),
 		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput, now.UnixNano(),
-		contract.JobClaimed, contract.JobRunning)
+		contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput)
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "reap expired attempts")
 	}
@@ -76,8 +76,8 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	}
 	for _, attempt := range expired {
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=?
-			WHERE job_id=? AND current_attempt_id=? AND state IN (?, ?)`, contract.JobFailed, now.UnixNano(),
-			attempt.jobID, attempt.attemptID, contract.JobClaimed, contract.JobRunning); err != nil {
+			WHERE job_id=? AND current_attempt_id=? AND state IN (?, ?, ?)`, contract.JobFailed, now.UnixNano(),
+			attempt.jobID, attempt.attemptID, contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput); err != nil {
 			return ReconcileResult{}, internalError(err, "fail expired attempt's job")
 		}
 	}

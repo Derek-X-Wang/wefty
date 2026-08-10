@@ -10,7 +10,6 @@ type Step = "plan" | "implement" | "review";
 
 interface Context {
   runId: string;
-  l1Endpoint: string;
   l3Endpoint: string;
   runToken: string;
   handoffDir: string;
@@ -79,15 +78,11 @@ function requiredEnvironment(name: string): string {
 function loadContext(): Context {
   const context = {
     runId: requiredEnvironment("WEFTY_RUN_ID"),
-    l1Endpoint: requiredEnvironment("WEFTY_L1_ENDPOINT"),
     l3Endpoint: requiredEnvironment("WEFTY_L3_ENDPOINT"),
     runToken: requiredEnvironment("WEFTY_RUN_TOKEN"),
     handoffDir: requiredEnvironment("WEFTY_HANDOFF_DIR"),
   };
-  for (const [name, value] of [
-    ["WEFTY_L1_ENDPOINT", context.l1Endpoint],
-    ["WEFTY_L3_ENDPOINT", context.l3Endpoint],
-  ] as const) {
+  for (const [name, value] of [["WEFTY_L3_ENDPOINT", context.l3Endpoint]] as const) {
     const endpoint = new URL(value);
     if (endpoint.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)) {
       throw new Error(`${name} must be a job-local loopback HTTP URL`);
@@ -245,7 +240,7 @@ async function dispatchChild(
     inline_script: {
       content,
       sha256: sha256(content),
-      interpreter: [process.execPath],
+      interpreter: ["node"],
       mode: 0o755,
     },
     params: { ...params, step },

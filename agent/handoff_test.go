@@ -108,7 +108,7 @@ func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
 	runID := "run_environment"
 	handoff := filepath.Join(root, runID)
 	token := "wrun_process_secret"
-	script := []byte("#!/bin/sh\nprintf '%s\\n' \"$WEFTY_RUN_ID\" \"$WEFTY_L3_ENDPOINT\" \"$WEFTY_L1_ENDPOINT\" \"$WEFTY_RUN_TOKEN\" \"$WEFTY_HANDOFF_DIR\"\n")
+	script := []byte("#!/bin/sh\nprintf '%s\\n' \"$WEFTY_RUN_ID\" \"$WEFTY_L3_ENDPOINT\" \"${WEFTY_L1_ENDPOINT-unset}\" \"$WEFTY_RUN_TOKEN\" \"$WEFTY_HANDOFF_DIR\"\n")
 	digest := sha256.Sum256(script)
 	var output bytes.Buffer
 	a := &Agent{
@@ -134,8 +134,7 @@ func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
 		},
 		Argv: []string{"wefty-inline-" + runID},
 		Env: map[string]string{
-			contract.EnvRunID: runID, contract.EnvL3Endpoint: "wefty://l3",
-			contract.EnvL1Endpoint: "wefty://l1", contract.EnvHandoffDir: handoff,
+			contract.EnvRunID: runID, contract.EnvL3Endpoint: "wefty://l3", contract.EnvHandoffDir: handoff,
 		},
 		SensitiveEnv:     map[string]string{contract.EnvRunToken: token},
 		WorkingDirectory: t.TempDir(),
@@ -145,7 +144,7 @@ func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
 	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
 		t.Fatalf("runProcess() = (%#v, %v)", result, err)
 	}
-	want := runID + "\nwefty://l3\nwefty://l1\n[REDACTED]\n" + handoff + "\n"
+	want := runID + "\nwefty://l3\nunset\n[REDACTED]\n" + handoff + "\n"
 	if output.String() != want {
 		t.Fatalf("process environment output = %q, want %q", output.String(), want)
 	}

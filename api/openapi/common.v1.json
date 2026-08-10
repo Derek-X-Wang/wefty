@@ -42,6 +42,7 @@
         "required": ["job_id", "state", "spec", "created_at", "updated_at"],
         "properties": {
           "job_id": { "type": "string" },
+          "node_id": { "type": "string", "description": "Stable node ID for the current attempt, once claimed." },
           "state": {
             "enum": ["queued", "claimed", "running", "awaiting-input", "succeeded", "failed"]
           },
@@ -85,11 +86,16 @@
         "additionalProperties": false,
         "properties": {
           "spawn_error": { "type": "string" },
+          "output_error": {
+            "type": "string",
+            "description": "Output redaction, durable spooling, or upload finalization failed; the process exit code is not authoritative success."
+          },
           "exit_code": { "type": "integer" },
           "signal": { "type": "string" }
         },
         "oneOf": [
           { "required": ["spawn_error"] },
+          { "required": ["output_error"] },
           { "required": ["exit_code"] },
           { "required": ["signal"] }
         ]

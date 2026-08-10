@@ -11,7 +11,6 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
-	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
 
@@ -49,7 +48,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		Mode: options.fabricMode,
 		Identity: fabric.Identity{
 			NodeID: options.plainIdentity,
-			Tags:   []string{l1.DefaultClientPrincipalTag, l3.DefaultCallerPrincipalTag},
+			Tags:   []string{l3.DefaultCallerPrincipalTag},
 		},
 		Name:           options.fabricName,
 		StateDirectory: options.stateDirectory,

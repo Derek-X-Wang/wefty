@@ -464,7 +464,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, attemptID, jobID, nodeID, bootSessionID, con
 	}
 	return &Claim{
 		Job: Job{
-			JobID: jobID, State: contract.JobClaimed, Spec: spec, CurrentAttemptID: attemptID,
+			JobID: jobID, NodeID: nodeID, State: contract.JobClaimed, Spec: spec, CurrentAttemptID: attemptID,
 			CreatedAt: time.Unix(0, createdNS).UTC(), UpdatedAt: now,
 		},
 		Lease: AttemptLease{AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: leaseExpires},
@@ -916,8 +916,8 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 	}
 	if changed > 0 {
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=?
-			WHERE job_id=? AND current_attempt_id=? AND state IN (?, ?)`, contract.JobFailed, now.UnixNano(), attempt.jobID,
-			attempt.attemptID, contract.JobClaimed, contract.JobRunning); err != nil {
+			WHERE job_id=? AND current_attempt_id=? AND state IN (?, ?, ?)`, contract.JobFailed, now.UnixNano(), attempt.jobID,
+			attempt.attemptID, contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput); err != nil {
 			return internalError(err, "fail job after lease expiry")
 		}
 	}
@@ -965,6 +965,9 @@ func validateProcessResult(result ProcessResult) error {
 	if result.SpawnError != "" {
 		set++
 	}
+	if result.OutputError != "" {
+		set++
+	}
 	if result.ExitCode != nil {
 		set++
 	}
@@ -972,7 +975,7 @@ func validateProcessResult(result ProcessResult) error {
 		set++
 	}
 	if set != 1 {
-		return protocolError(contract.ErrorInvalidRequest, "result must contain exactly one of spawn_error, exit_code, or signal")
+		return protocolError(contract.ErrorInvalidRequest, "result must contain exactly one of spawn_error, output_error, exit_code, or signal")
 	}
 	return nil
 }
@@ -1008,8 +1011,10 @@ func getJobByDispatchKey(ctx context.Context, q queryer, dispatchKey string) (Jo
 	var currentAttempt sql.NullString
 	var createdNS, updatedNS int64
 	var requestHash string
-	err := q.QueryRowContext(ctx, `SELECT job_id, state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash
-FROM jobs WHERE dispatch_key=?`, dispatchKey).Scan(&job.JobID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash)
+	err := q.QueryRowContext(ctx, `SELECT job_id,
+COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
+state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash
+FROM jobs WHERE dispatch_key=?`, dispatchKey).Scan(&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash)
 	if err != nil {
 		return Job{}, "", err
 	}
@@ -1024,8 +1029,10 @@ func getJobByID(ctx context.Context, q queryer, jobID string) (Job, error) {
 	var specJSON []byte
 	var currentAttempt sql.NullString
 	var createdNS, updatedNS int64
-	err := q.QueryRowContext(ctx, `SELECT job_id, state, spec_json, current_attempt_id, created_ns, updated_ns
-FROM jobs WHERE job_id=?`, jobID).Scan(&job.JobID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS)
+	err := q.QueryRowContext(ctx, `SELECT job_id,
+COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
+state, spec_json, current_attempt_id, created_ns, updated_ns
+FROM jobs WHERE job_id=?`, jobID).Scan(&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS)
 	if err != nil {
 		return Job{}, err
 	}

@@ -89,6 +89,48 @@ func TestLeaseExpiryReaperFencesAttemptWithoutRequeue(t *testing.T) {
 	}
 }
 
+func TestOutputFailureCompletionFailsJob(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
+	h.register(agent, "node-1")
+	job := h.submit(client, "output-failure", []string{"linux"})
+	claim := claimJob(t, h, agent, "node-1")
+	path := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", job.JobID, claim.Lease.AttemptID)
+	status, _, body := h.do(agent, http.MethodPost, path, CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "output-failure",
+		Result: ProcessResult{OutputError: "durable log finalization failed"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("output-failure completion status = %d body=%s", status, body)
+	}
+	assertJobAndAttemptState(t, h.store, job.JobID, claim.Lease.AttemptID, contract.JobFailed, contract.AttemptFailed)
+}
+
+func TestReservedAwaitingInputLeaseExpiryFailsJobConsistently(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
+	h.register(agent, "node-1")
+	job := h.submit(client, "awaiting-input-expiry", []string{"linux"})
+	claim := claimJob(t, h, agent, "node-1")
+	if _, err := h.store.db.Exec(`UPDATE attempts SET state=? WHERE attempt_id=?`, contract.AttemptAwaitingInput, claim.Lease.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`UPDATE jobs SET state=? WHERE job_id=?`, contract.JobAwaitingInput, job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Advance(DefaultLeaseDuration)
+	result, err := h.store.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExpiredAttempts != 1 {
+		t.Fatalf("expired awaiting-input attempts = %d, want 1", result.ExpiredAttempts)
+	}
+	assertJobAndAttemptState(t, h.store, job.JobID, claim.Lease.AttemptID, contract.JobFailed, contract.AttemptLost)
+}
+
 func TestExpiryBoundarySerializesRenewalAndReaper(t *testing.T) {
 	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
 	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})

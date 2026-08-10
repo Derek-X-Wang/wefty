@@ -71,6 +71,9 @@ func TestExitZeroMissingRequiredEnvelopeFailsBlackBox(t *testing.T) {
 	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	record, err := h.l3Store.GetRun(context.Background(), accepted.RunID)
 	if err != nil {
 		t.Fatal(err)
@@ -140,6 +143,9 @@ func TestEnvelopeAndGateWritesAreAppendOnlyAndIdempotent(t *testing.T) {
 	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	record, err = h.l3Store.GetRun(context.Background(), accepted.RunID)
 	if err != nil {
 		t.Fatal(err)
@@ -195,6 +201,17 @@ func TestProtocolWritesBindOmittedAttemptAndRejectExplicitMismatch(t *testing.T)
 	}
 	if len(rejections) != 0 {
 		t.Fatalf("attempt mismatch stored protocol rejections = %#v", rejections)
+	}
+
+	for name, supplied := range map[string]any{
+		"null": nil, "number": 7, "array": []any{"attempt-other"}, "object": map[string]any{"id": scope.AttemptID},
+	} {
+		t.Run("non-string "+name, func(t *testing.T) {
+			body := protocolBodyWithoutAttempt(t, validEnvelope(accepted.RunID, scope.AttemptID, "non-string-"+name))
+			body["attempt_id"] = supplied
+			status, _, response := h.do(workflow, http.MethodPost, "/v1/runs/"+accepted.RunID+"/envelopes", body, auth)
+			assertAPIError(t, status, response, http.StatusConflict, contract.ErrorConflict)
+		})
 	}
 }
 
@@ -290,6 +307,11 @@ func TestLineageQueryChainProvenanceAndTerminalReconciliation(t *testing.T) {
 			if err := reconciler.ReconcileOnce(context.Background()); err != nil {
 				t.Fatal(err)
 			}
+			if tc.childExitCode == 0 {
+				if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
 			parentRecord, err := h.l3Store.GetRun(context.Background(), parent.RunID)
 			if err != nil {
 				t.Fatal(err)
@@ -301,6 +323,11 @@ func TestLineageQueryChainProvenanceAndTerminalReconciliation(t *testing.T) {
 			completeClaim(t, h, childClaim, tc.childExitCode, "complete-child-"+tc.name)
 			if err := reconciler.ReconcileOnce(context.Background()); err != nil {
 				t.Fatal(err)
+			}
+			if tc.childExitCode == 0 {
+				if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+					t.Fatal(err)
+				}
 			}
 			parentRecord, err = h.l3Store.GetRun(context.Background(), parent.RunID)
 			if err != nil {

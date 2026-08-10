@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -51,7 +52,12 @@ func materializeExecutable(execution contract.ExecutionSpec, attemptID string) (
 	if len(execution.Argv) > 1 {
 		arguments = append(arguments, execution.Argv[1:]...)
 	}
-	execution.Executable.Path = execution.Executable.Interpreter[0]
+	interpreterPath, err := exec.LookPath(execution.Executable.Interpreter[0])
+	if err != nil {
+		cleanup()
+		return contract.ExecutionSpec{}, func() {}, fmt.Errorf("resolve inline interpreter on agent node: %w", err)
+	}
+	execution.Executable.Path = interpreterPath
 	execution.Argv = arguments
 	return execution, cleanup, nil
 }
