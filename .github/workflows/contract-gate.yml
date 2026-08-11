@@ -2,7 +2,9 @@ name: contract-gate
 
 on:
   pull_request:
+    branches: [main]
   push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -87,28 +89,36 @@ jobs:
         working-directory: workflows/dogfood
         run: npm test
 
-  tsnet-smoke:
-    name: tsnet-smoke
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+  # The credentialed tsnet lane lives in tsnet-smoke.yml (push to main +
+  # weekly schedule, never pull_request) so every job in this PR-facing
+  # workflow is secretless by construction.
+  all-tests-pass:
+    name: all-tests-pass
+    needs:
+      - unit
+      - sqlite-integration
+      - mac-linux-runner
+      - dogfood-workflow
+    # always() so a failed dependency cannot skip this job — a skipped
+    # required check does not block merging. The step then fails closed
+    # unless every lane result is exactly "success".
+    if: ${{ always() }}
     runs-on: ubuntu-latest
-    env:
-      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Require credential for trusted-repository tsnet lane
-        # Arm the lane by setting repository variable TSNET_SMOKE_REQUIRED=true
-        # once the TS_AUTHKEY secret is provisioned. Armed + missing secret
-        # fails loudly; unarmed the lane is a visible no-op, never a fake pass
-        # of credentialed tests.
-        if: vars.TSNET_SMOKE_REQUIRED == 'true'
-        run: test -n "$TS_AUTHKEY" || { echo "TS_AUTHKEY is required for the trusted-repository tsnet lane" >&2; exit 1; }
-      - name: Run credentialed tsnet smoke
-        if: vars.TSNET_SMOKE_REQUIRED == 'true'
-        run: go test -tags=tsnet_smoke ./... -run '^TestTSNetSmoke$'
-      - name: Lane unarmed notice
-        if: vars.TSNET_SMOKE_REQUIRED != 'true'
-        run: echo "tsnet smoke lane is unarmed (set TSNET_SMOKE_REQUIRED=true after provisioning TS_AUTHKEY); no credentialed tests ran."
+      - name: Enforce required lane results
+        env:
+          UNIT_RESULT: ${{ needs.unit.result }}
+          SQLITE_RESULT: ${{ needs['sqlite-integration'].result }}
+          MAC_LINUX_RESULT: ${{ needs['mac-linux-runner'].result }}
+          DOGFOOD_RESULT: ${{ needs['dogfood-workflow'].result }}
+        run: |
+          set -eu
+          printf '%s\n' \
+            "unit=$UNIT_RESULT" \
+            "sqlite-integration=$SQLITE_RESULT" \
+            "mac-linux-runner=$MAC_LINUX_RESULT" \
+            "dogfood-workflow=$DOGFOOD_RESULT"
+          test "$UNIT_RESULT" = success
+          test "$SQLITE_RESULT" = success
+          test "$MAC_LINUX_RESULT" = success
+          test "$DOGFOOD_RESULT" = success

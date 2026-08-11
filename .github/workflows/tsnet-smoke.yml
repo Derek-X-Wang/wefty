@@ -1,0 +1,42 @@
+name: tsnet-smoke
+
+# Trusted-repository lane only: never runs on pull_request, so fork PRs are
+# structurally unable to reach the secret. Arm by setting the repository
+# variable TSNET_SMOKE_REQUIRED=true once the TS_AUTHKEY secret exists;
+# armed + missing secret fails loudly, unarmed is a visible no-op.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tsnet-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tsnet-smoke:
+    name: tsnet-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Require credential for trusted-repository tsnet lane
+        if: vars.TSNET_SMOKE_REQUIRED == 'true'
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: test -n "$TS_AUTHKEY" || { echo "TS_AUTHKEY is required for the trusted-repository tsnet lane" >&2; exit 1; }
+      - name: Run credentialed tsnet smoke
+        if: vars.TSNET_SMOKE_REQUIRED == 'true'
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: go test -tags=tsnet_smoke ./... -run '^TestTSNetSmoke$'
+      - name: Lane unarmed notice
+        if: vars.TSNET_SMOKE_REQUIRED != 'true'
+        run: echo "tsnet smoke lane is unarmed (set TSNET_SMOKE_REQUIRED=true after provisioning TS_AUTHKEY); no credentialed tests ran."
