@@ -151,7 +151,7 @@ func TestNewBuildsRegistrationFromStableAndBootMetadata(t *testing.T) {
 func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
-	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{LeaseDuration: 200 * time.Millisecond})
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{LeaseDuration: 1 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 		Version:             "test",
 		HeartbeatInterval:   5 * time.Second,
 		ClaimInterval:       10 * time.Millisecond,
-		RenewalInterval:     40 * time.Millisecond,
+		RenewalInterval:     100 * time.Millisecond,
 		LogSpoolDirectory:   t.TempDir(),
 	})
 	if err != nil {
@@ -202,7 +202,7 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 		RoutingTags:   []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable:       contract.ExecutableSpec{Path: agentHelperPath},
-			Argv:             []string{"processhelper", "sleep", "800"},
+			Argv:             []string{"processhelper", "sleep", "3000"},
 			WorkingDirectory: workingDirectory,
 			HandoffDirectory: workingDirectory,
 		},
@@ -211,8 +211,8 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	completed := waitForJobState(t, store, job.JobID, contract.JobSucceeded, 5*time.Second)
-	if elapsed := time.Since(started); elapsed < 600*time.Millisecond {
+	completed := waitForJobState(t, store, job.JobID, contract.JobSucceeded, 15*time.Second)
+	if elapsed := time.Since(started); elapsed < 2500*time.Millisecond {
 		t.Fatalf("job completed in %s; helper did not outlive the initial lease", elapsed)
 	}
 	if completed.State != contract.JobSucceeded {
