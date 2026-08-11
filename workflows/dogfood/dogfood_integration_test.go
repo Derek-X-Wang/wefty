@@ -43,7 +43,7 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 	}
 
 	targetRepo := initializeTargetRepository(t)
-	fakeBin, invocationLog := writeFakeAgents(t)
+	fakeBin, fakeHome, invocationLog := writeFakeAgents(t)
 	network := plain.NewNetwork()
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	ledgerFabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger", Tags: []string{l1.DefaultClientPrincipalTag}})
@@ -93,8 +93,9 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 	l1Done := serve(ctx, func() error { return l1Server.Serve(ctx, l1Listener) })
 	l3Done := serve(ctx, func() error { return l3Server.Serve(ctx, l3Listener) })
 
-	baseEnvironment := withoutEnvironment(os.Environ(), "PATH", "FAKE_AGENT_LOG")
+	baseEnvironment := withoutEnvironment(os.Environ(), "HOME", "PATH", "FAKE_AGENT_LOG")
 	baseEnvironment = append(baseEnvironment,
+		"HOME="+fakeHome,
 		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"FAKE_AGENT_LOG="+invocationLog,
 	)
@@ -188,7 +189,7 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(invocations), "claude\ncodex\nclaude\n"; got != want {
+	if got, want := string(invocations), "claude plan-work\nclaude plan-emit\ncodex implement-work\ncodex implement-emit\nclaude review-work\nclaude review-emit\n"; got != want {
 		t.Fatalf("fake agent invocations = %q, want %q", got, want)
 	}
 
@@ -212,34 +213,92 @@ func initializeTargetRepository(t *testing.T) string {
 	return repo
 }
 
-func writeFakeAgents(t *testing.T) (string, string) {
+func writeFakeAgents(t *testing.T) (string, string, string) {
 	t.Helper()
 	directory := t.TempDir()
+	home := t.TempDir()
 	logPath := filepath.Join(directory, "invocations.log")
 	claude := `#!/bin/sh
 prompt=$(cat)
-printf 'claude\n' >> "$FAKE_AGENT_LOG"
 case "$prompt" in
-  *'<review>'*) output='<review>PASS</review><promise>COMPLETE</promise>' ;;
-  *) output='<plan>Write a marker file, test it, and commit the change.</plan><promise>COMPLETE</promise>' ;;
+  *'Return exactly one <plan>'*)
+    phase='plan-emit'
+    session_id='fake-claude-plan'
+    expected_resume="$session_id"
+    output='<plan>Write a marker file, test it, and commit the change.</plan>'
+    ;;
+  *'Return exactly <review>'*)
+    phase='review-emit'
+    session_id='fake-claude-review'
+    expected_resume="$session_id"
+    output='<review>PASS</review>'
+    ;;
+  *'Cross-review branch'*)
+    phase='review-work'
+    session_id='fake-claude-review'
+    expected_resume=''
+    output='WEFTY_WORK_COMPLETE'
+    ;;
+  *)
+    phase='plan-work'
+    session_id='fake-claude-plan'
+    expected_resume=''
+    output='WEFTY_WORK_COMPLETE'
+    ;;
 esac
+resume=''
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = '--resume' ]; then resume="$argument"; fi
+  previous="$argument"
+done
+if [ "$resume" != "$expected_resume" ]; then
+  printf 'unexpected Claude resume session: got %s want %s\n' "$resume" "$expected_resume" >&2
+  exit 2
+fi
+mkdir -p "$HOME/.claude/projects/fake"
+printf '{"type":"session"}\n' > "$HOME/.claude/projects/fake/$session_id.jsonl"
+printf 'claude %s\n' "$phase" >> "$FAKE_AGENT_LOG"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$session_id"
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$output"
 printf '{"type":"result","result":"%s"}\n' "$output"
 `
 	codex := `#!/bin/sh
-cat >/dev/null
-printf 'codex\n' >> "$FAKE_AGENT_LOG"
-printf 'fake codex implementation\n' > dogfood-smoke.txt
-git add dogfood-smoke.txt
-git commit -m 'feat: add dogfood smoke marker' >/dev/null
-printf '{"type":"item.completed","item":{"type":"agent_message","text":"<promise>COMPLETE</promise>"}}\n'
+prompt=$(cat)
+session_id='fake-codex-implement'
+case "$prompt" in
+  *'<implementation>COMPLETE</implementation>'*)
+    phase='implement-emit'
+    if [ "$1" != 'exec' ] || [ "$2" != 'resume' ] || [ "$3" != "$session_id" ]; then
+      printf 'unexpected Codex resume arguments: %s\n' "$*" >&2
+      exit 2
+    fi
+    output='<implementation>COMPLETE</implementation>'
+    ;;
+  *)
+    phase='implement-work'
+    if [ "$1" != 'exec' ] || [ "$2" = 'resume' ]; then
+      printf 'unexpected initial Codex arguments: %s\n' "$*" >&2
+      exit 2
+    fi
+    printf 'fake codex implementation\n' > dogfood-smoke.txt
+    git add dogfood-smoke.txt
+    git commit -m 'feat: add dogfood smoke marker' >/dev/null
+    output='WEFTY_WORK_COMPLETE'
+    ;;
+esac
+mkdir -p "$HOME/.codex/sessions/fake"
+printf '{"type":"session_meta","payload":{"id":"%s"}}\n' "$session_id" > "$HOME/.codex/sessions/fake/rollout-test-$session_id.jsonl"
+printf 'codex %s\n' "$phase" >> "$FAKE_AGENT_LOG"
+printf '{"type":"thread.started","thread_id":"%s"}\n' "$session_id"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\n' "$output"
 `
 	for name, content := range map[string]string{"claude": claude, "codex": codex} {
 		if err := os.WriteFile(filepath.Join(directory, name), []byte(content), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return directory, logPath
+	return directory, home, logPath
 }
 
 func submitRun(t *testing.T, client *http.Client, input l3.CreateRunRequest) l3.RunAccepted {
