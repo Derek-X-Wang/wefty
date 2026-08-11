@@ -77,17 +77,21 @@ func writeRunInspection(writer io.Writer, inspection runInspection) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
+	detail := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(detail, "KIND\tRUN\tSTEP\tSTATUS/OUTCOME\tSUMMARY/NAME"); err != nil {
+		return err
+	}
 	for _, run := range inspection.Runs {
 		for _, envelope := range run.Envelopes {
-			if _, err := fmt.Fprintf(writer, "envelope\t%s\t%s\t%s\t%s\n", run.RunID, envelope.StepID, envelope.Status, envelope.Summary); err != nil {
+			if _, err := fmt.Fprintf(detail, "envelope\t%s\t%s\t%s\t%s\n", run.RunID, envelope.StepID, envelope.Status, envelope.Summary); err != nil {
 				return err
 			}
 		}
 		for _, gate := range run.Gates {
-			if _, err := fmt.Fprintf(writer, "gate\t%s\t%s\t%s\t%s\n", run.RunID, gate.StepID, gate.Outcome, gate.Name); err != nil {
+			if _, err := fmt.Fprintf(detail, "gate\t%s\t%s\t%s\t%s\n", run.RunID, gate.StepID, gate.Outcome, gate.Name); err != nil {
 				return err
 			}
 		}
 	}
-	return nil
+	return detail.Flush()
 }

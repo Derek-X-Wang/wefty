@@ -193,6 +193,49 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	}
 }
 
+func TestWriteRunInspectionTableFormat(t *testing.T) {
+	t.Parallel()
+
+	inspection := runInspection{
+		Run: contract.RunRecord{
+			RunID:  "run-aaa",
+			Status: contract.RunSucceeded,
+		},
+		Lineage: l3.RunLineage{RunID: "run-aaa"},
+		Runs: []contract.RunRecord{
+			{
+				RunID:  "run-aaa",
+				Status: contract.RunSucceeded,
+				Envelopes: []contract.Envelope{
+					{StepID: "plan", Status: "succeeded", Summary: "Claude produced the implementation plan"},
+				},
+				Gates: []contract.GateResult{
+					{StepID: "plan", Outcome: "pass", Name: "plan-produced"},
+				},
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := writeRunInspection(&buf, inspection); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+
+	if !strings.Contains(out, "RUN ID") || !strings.Contains(out, "STATUS") {
+		t.Errorf("run table header missing:\n%s", out)
+	}
+	if !strings.Contains(out, "KIND") || !strings.Contains(out, "STEP") {
+		t.Errorf("envelope/gate header missing:\n%s", out)
+	}
+	if !strings.Contains(out, "envelope") || !strings.Contains(out, "plan") {
+		t.Errorf("envelope row missing:\n%s", out)
+	}
+	if !strings.Contains(out, "gate") || !strings.Contains(out, "plan-produced") {
+		t.Errorf("gate row missing:\n%s", out)
+	}
+}
+
 func serveTestServer(_ context.Context, serve func() error) <-chan error {
 	done := make(chan error, 1)
 	go func() { done <- serve() }()
