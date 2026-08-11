@@ -1,74 +1,154 @@
 # wefty
 
-Personal compute fabric for agent-built tools — deploy once, run on any machine you own.
+[![CI](https://github.com/Derek-X-Wang/wefty/actions/workflows/contract-gate.yml/badge.svg)](https://github.com/Derek-X-Wang/wefty/actions/workflows/contract-gate.yml)
 
-**warp** — fixed threads: always-on nodes (cloud, home server).
-**weft** — the moving thread: workloads that travel across machines.
+Wefty is a personal compute fabric for scheduling AI agent work and other jobs
+across machines you own. A control plane and node agents turn Macs, Linux
+servers, and eventually provider capacity into one tag-routed job queue, while a
+workflow ledger records runs, logs, handoffs, and gates.
 
-Planning happens on the [issue tracker](https://github.com/Derek-X-Wang/wefty/issues) via wayfinder map.
+The brain stays home: the control plane, run ledger, state, and history always
+run on your machines, including cloud machines that you rent directly. Hosted
+agent systems put that brain in a service and send your code to it; wefty keeps
+the trust boundary inside your cluster. Future cloud services may provide
+connectivity or capacity, but they will not host the control plane.
 
-## M0 contracts and Fabric seam
+**Pre-release. Core loop implemented and CI-tested; v0.1 single-machine acceptance pending.**
 
-The repository contains the reviewable contracts plus the first production
-seam implementation:
+## Architecture at a glance
 
-- Go wire types and state tables in `contract/`
-- versioned JSON Schemas and valid/invalid fixtures in `contract/schemas/` and
-  `contract/testdata/`
-- the network abstraction and its localhost/tsnet implementations in `fabric/`
-- L1 client, L1 agent, and L3 OpenAPI documents in `api/openapi/`
-- concurrency and state-machine semantics in `docs/contracts/`
+| Layer | Role | What it does |
+| --- | --- | --- |
+| **L1: cluster** | Scheduling and execution | Runs the control plane and node agents, then routes jobs by tags through a pull-claim queue. |
+| **L2: connectors** | External capacity | Will present providers such as Daytona and Fly through the same scheduling model as owned machines. |
+| **L3: workflow ledger** | Runs and coordination | Stores workflows, run lineage, envelopes, gates, artifacts, and logs; submits all work through L1. |
 
-Callers address fabric services with `wefty://control-plane` and
-`wefty://node/<id>`; concrete transport names are resolved inside the selected
-implementation. Tests create an isolated `plain.Network` and inject one
-wefty-owned identity per participant so authorization paths remain active.
+All network access is isolated behind the Fabric seam. L3 never dispatches
+directly to nodes, and L1 remains the only job queue. See the
+[v1 design](docs/2026-08-06-wefty-v1-design.md) for the architecture and build
+order.
 
-Run the local contract gate with:
+## Quickstart: one machine, plain fabric
 
-```sh
-gofmt -w .
-go vet ./...
-go test ./...
-```
+This is the condensed v0.1 path. It runs the whole stack over localhost with no
+Tailscale dependency. The dogfood workflow invokes authenticated `claude` and
+`codex` CLIs and creates the branch named in the parameters, so start from a
+clean checkout and choose an unused branch name.
 
-The production fabric smoke test is isolated behind a build tag and skips when
-credentials are unavailable:
+Prerequisites: the Go version declared in `go.mod`, Node.js 22 or newer, npm,
+Git, `jq`, `claude`, and `codex`.
 
-```sh
-TS_AUTHKEY=tskey-auth-... go test -tags=tsnet_smoke ./... -run '^TestTSNetSmoke$'
-```
-
-Set `TS_CONTROL_URL` as well when testing against a non-default coordination
-server. The auth key must be reusable because the smoke test starts one client
-and one server, both ephemeral.
-
-## M1 node agent
-
-Run a localhost control plane and one real agent with authoritative routing
-tags configured only on the control plane:
+From the repository root, build the four Go binaries and the workflow:
 
 ```sh
-go run ./cmd/wefty-l1 \
-  --fabric=plain --listen=127.0.0.1:8787 \
-  --db=wefty-l1.sqlite --node-tags=my-node=mac,arm64
+export WEFTY_ROOT="$(git rev-parse --show-toplevel)"
+export WEFTY_STATE_ROOT="${TMPDIR:-/tmp}/wefty-quickstart"
+export WEFTY_L1_ADDR=127.0.0.1:42101
+export WEFTY_L3_ADDR=127.0.0.1:42102
 
-go run ./cmd/wefty-agent \
-  --fabric=plain --control-plane=127.0.0.1:8787 \
-  --node-id=my-node
+mkdir -p "$WEFTY_ROOT/.bin" "$WEFTY_STATE_ROOT"
+go build -o "$WEFTY_ROOT/.bin/wefty-l1" ./cmd/wefty-l1
+go build -o "$WEFTY_ROOT/.bin/wefty-l3" ./cmd/wefty-l3
+go build -o "$WEFTY_ROOT/.bin/wefty-agent" ./cmd/wefty-agent
+go build -o "$WEFTY_ROOT/.bin/wefty" ./cmd/wefty
+
+cd "$WEFTY_ROOT/workflows/dogfood"
+npm ci
+npm run build
 ```
 
-The stable `--node-id` survives agent restarts; each process generates a new
-boot-session ID. Heartbeats and attempt lease renewals use independent
-cadences. SIGINT or SIGTERM starts a graceful drain: the node stops claiming,
-lets its current attempt complete, and exits; a second signal forces local
-cancellation. Output is synchronously retained in a per-node SQLite spool before
-the runner is allowed to continue. The spool resumes each original attempt from
-its persisted upload acknowledgement after reconnect or restart; polling cursors
-never affect this acknowledgement. `--log-spool-max-bytes` bounds unacknowledged
-payload retention (64 MiB by default). Reaching the bound stops and fails the
-producer explicitly—accepted records are never evicted or silently dropped.
-For tsnet, also supply `--fabric-name`, `--state-dir`, and an auth key
-whose node identity has the `tag:wefty-agent` principal tag. The credentialed
-agent smoke remains env-gated by `TS_AUTHKEY` (and optionally
-`TS_AGENT_PRINCIPAL_TAG` when a tailnet uses a different tag).
+Export the same four variables in three terminals, then start one process in
+each.
+
+Terminal 1 — L1 control plane:
+
+```sh
+cd "$WEFTY_ROOT"
+./.bin/wefty-l1 \
+  --fabric=plain \
+  --listen="$WEFTY_L1_ADDR" \
+  --db="$WEFTY_STATE_ROOT/l1.sqlite" \
+  --node-tags=dogfood-local=mac,arm64,wefty:node:dogfood-local
+```
+
+Terminal 2 — L3 run ledger:
+
+```sh
+cd "$WEFTY_ROOT"
+./.bin/wefty-l3 \
+  --fabric=plain \
+  --listen="$WEFTY_L3_ADDR" \
+  --control-plane="$WEFTY_L1_ADDR" \
+  --db="$WEFTY_STATE_ROOT/l3.sqlite" \
+  --reconcile-interval=1s
+```
+
+Terminal 3 — node agent:
+
+```sh
+cd "$WEFTY_ROOT"
+mkdir -p "$WEFTY_STATE_ROOT/agent-logs"
+./.bin/wefty-agent \
+  --fabric=plain \
+  --control-plane="$WEFTY_L1_ADDR" \
+  --run-ledger="$WEFTY_L3_ADDR" \
+  --node-id=dogfood-local \
+  --log-spool-dir="$WEFTY_STATE_ROOT/agent-logs"
+```
+
+From another shell with the same variables, verify the node and submit a run:
+
+```sh
+cd "$WEFTY_ROOT"
+./.bin/wefty --l1="$WEFTY_L1_ADDR" --l3="$WEFTY_L3_ADDR" nodes list
+
+jq -n \
+  --arg task "Make one small, reviewable improvement; run focused tests and commit it." \
+  --arg repo "$WEFTY_ROOT" \
+  --arg package "$WEFTY_ROOT/workflows/dogfood" \
+  '{task:$task,repo_path:$repo,workflow_package_path:$package,base_branch:"main",branch:"wefty-quickstart"}' \
+  > /tmp/wefty-quickstart-params.json
+
+./.bin/wefty --l1="$WEFTY_L1_ADDR" --l3="$WEFTY_L3_ADDR" --json \
+  submit \
+  --script=workflows/dogfood/dist/dogfood-workflow.mjs \
+  --interpreter=node \
+  --params-file=/tmp/wefty-quickstart-params.json \
+  --tag=wefty:node:dogfood-local \
+  --required-envelope \
+  --max-runtime=7200
+```
+
+The full pass criteria and evidence commands are in the
+[dogfood acceptance guide](docs/acceptance/v0.1-dogfood.md).
+
+## CLI tour
+
+- `wefty nodes list` shows registered nodes, liveness, state, and tags.
+- `wefty submit` submits a saved workflow or inline script to the run ledger.
+- `wefty logs RUN_ID --follow` reads a run's logs until it settles.
+- `wefty rerun RUN_ID` creates a new run from the original stored snapshot.
+- `wefty drain NODE_ID` stops new claims on a node while current work finishes.
+
+Run `wefty help` for the complete command list and global flags.
+
+## Roadmap
+
+The next proof point is v0.1 acceptance of the single-machine plain-fabric
+dogfood loop. The build order then adds OCI workloads through containerd and
+Lima, followed by a Daytona sandbox connector and a Fly Machines node
+connector. These are pre-release milestones, not compatibility promises.
+
+## Project decisions and contributions
+
+The [v1 design](docs/2026-08-06-wefty-v1-design.md) is the architecture source,
+and accepted decisions live in [docs/adr](docs/adr/). See
+[CONTRIBUTING.md](CONTRIBUTING.md) before sending a change.
+
+## License and cloud boundary
+
+Wefty is licensed under Apache-2.0, and the cluster is free forever to run on
+user-owned machines. Optional paid cloud services may arrive later, beginning
+with relay networking and potentially adding capacity. Those services are
+plumbing around the open cluster; the control plane will never be hosted by
+them. See [ADR-0001](docs/adr/0001-the-brain-stays-home.md) for the boundary.
