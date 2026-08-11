@@ -357,7 +357,7 @@ async function runImplement(context: Context, record: RunRecord, params: Dogfood
     logging: { type: "stdout" },
     prompt: [
       "Implement the task using the approved plan below.",
-      `Run appropriate checks, commit all intended changes, and finish with the exact line ${WORK_COMPLETION_SIGNAL}.`,
+      `Run appropriate checks, commit all intended changes with a DCO sign-off (git commit -s; every commit needs a Signed-off-by trailer per CONTRIBUTING.md), and finish with the exact line ${WORK_COMPLETION_SIGNAL}.`,
       `Task: ${params.task}`,
       "",
       "Plan:",
@@ -413,7 +413,7 @@ async function runReview(context: Context, params: DogfoodParams): Promise<void>
     logging: { type: "stdout" },
     prompt: [
       `Cross-review branch ${branch} against ${params.base_branch ?? "main"}.`,
-      "Inspect correctness, scope, tests, and the original plan. Fix and commit worthwhile issues.",
+      "Inspect correctness, scope, tests, and the original plan. Verify every new commit carries a Signed-off-by trailer (CONTRIBUTING.md DCO rule); treat a missing trailer as a defect. Fix and commit worthwhile issues (with -s).",
       "Run appropriate verification and retain the final PASS or FAIL verdict in this session.",
       `When the review is complete, finish with the exact line ${WORK_COMPLETION_SIGNAL}.`,
       `Task: ${params.task}`,
