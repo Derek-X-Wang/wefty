@@ -2,6 +2,7 @@
   "name": "@wefty/dogfood-workflow",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "build": "esbuild src/dogfood-workflow.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/dogfood-workflow.mjs --banner:js='#!/usr/bin/env node'",
