@@ -8,6 +8,8 @@ import type * as NoSandbox from "@ai-hero/sandcastle/sandboxes/no-sandbox";
 
 type Step = "plan" | "implement" | "review";
 
+const WORK_COMPLETION_SIGNAL = "WEFTY_WORK_COMPLETE";
+
 interface Context {
   runId: string;
   l3Endpoint: string;
@@ -267,26 +269,62 @@ function workflowBranch(context: Context, params: DogfoodParams): string {
   return params.branch ?? `wefty/dogfood/${context.runId}`;
 }
 
+async function resumeForStringOutput(
+  sandcastle: typeof Sandcastle,
+  workResult: Sandcastle.RunResult,
+  name: string,
+  tag: string,
+  prompt: string,
+): Promise<string> {
+  const sessionId = workResult.iterations.at(-1)?.sessionId;
+  if (!sessionId || !workResult.resume) {
+    throw new Error(`${name} work phase did not capture a resumable agent session`);
+  }
+  console.log(`resuming ${name} session ${sessionId} for structured output`);
+  const emitResult = await workResult.resume(prompt, {
+    name: `${name}-emit`,
+    completionSignal: `<${tag}>`,
+    output: sandcastle.Output.string({ tag }),
+  });
+  // Sandcastle 0.12.0 returns output at runtime, but RunResult.resume()'s
+  // declaration does not preserve the structured-output return refinement.
+  if (!("output" in emitResult) || typeof emitResult.output !== "string") {
+    throw new Error(`${name} emit phase returned no structured output`);
+  }
+  return emitResult.output.trim();
+}
+
 async function runPlan(context: Context, record: RunRecord, params: DogfoodParams): Promise<void> {
   const { sandcastle, noSandbox } = await loadSandcastle(params);
-  const result = await sandcastle.run({
+  const workResult = await sandcastle.run({
     name: "dogfood-plan",
     cwd: params.repo_path,
     sandbox: noSandbox(),
     branchStrategy: { type: "head" },
-    agent: sandcastle.claudeCode(params.claude_model ?? "claude-sonnet-4-6", { captureSessions: false }),
-    maxIterations: 1,
+    agent: sandcastle.claudeCode(params.claude_model ?? "claude-sonnet-4-6", { captureSessions: true }),
+    maxIterations: 15,
+    completionSignal: WORK_COMPLETION_SIGNAL,
     logging: { type: "stdout" },
     prompt: [
       "Plan the coding task below without editing files.",
       "Inspect the repository and produce an implementation plan with verification steps.",
-      "Return the plan inside literal <plan> and </plan> tags.",
+      "Keep the final plan in this session for a follow-up formatting turn.",
+      `When the plan is complete, finish with the exact line ${WORK_COMPLETION_SIGNAL}.`,
       "",
       params.task,
     ].join("\n"),
-    output: sandcastle.Output.string({ tag: "plan" }),
   });
-  const plan = result.output.trim();
+  const plan = await resumeForStringOutput(
+    sandcastle,
+    workResult,
+    "dogfood-plan",
+    "plan",
+    [
+      "The planning work is complete. Do not inspect the repository or do more planning.",
+      "Emit the final plan already developed in this session now.",
+      "Return exactly one <plan>...</plan> block and nothing else.",
+    ].join("\n"),
+  );
   if (!plan) {
     throw new Error("Claude returned an empty plan");
   }
@@ -296,7 +334,7 @@ async function runPlan(context: Context, record: RunRecord, params: DogfoodParam
   await appendEnvelope(context, "plan", "succeeded", "Claude produced the implementation plan", {
     artifacts: [{ name: "plan", uri: pathToFileURL(planPath).href, media_type: "text/markdown", sha256: sha256(`${plan}\n`) }],
     notes: "The implementation child receives this plan in its immutable run params.",
-    extensions: { model: params.claude_model ?? "claude-sonnet-4-6" },
+    extensions: { model: params.claude_model ?? "claude-sonnet-4-6", structured_output: "session-resume" },
   });
   await appendGate(context, "plan", "plan-produced", "pass", [{ kind: "bytes", value: String(Buffer.byteLength(plan)) }]);
   await dispatchChild(context, record, "implement", { ...params, branch: workflowBranch(context, params), plan });
@@ -308,34 +346,55 @@ async function runImplement(context: Context, record: RunRecord, params: Dogfood
   }
   const { sandcastle, noSandbox } = await loadSandcastle(params);
   const branch = workflowBranch(context, params);
-  const result = await sandcastle.run({
+  const workResult = await sandcastle.run({
     name: "dogfood-implement",
     cwd: params.repo_path,
     sandbox: noSandbox(),
     branchStrategy: { type: "branch", branch },
-    agent: sandcastle.codex(params.codex_model ?? "gpt-5.4", { captureSessions: false }),
-    maxIterations: 1,
+    agent: sandcastle.codex(params.codex_model ?? "gpt-5.4", { captureSessions: true }),
+    maxIterations: 40,
+    completionSignal: WORK_COMPLETION_SIGNAL,
     logging: { type: "stdout" },
     prompt: [
       "Implement the task using the approved plan below.",
-      "Run appropriate checks, commit all intended changes, and finish with <promise>COMPLETE</promise>.",
+      `Run appropriate checks, commit all intended changes, and finish with the exact line ${WORK_COMPLETION_SIGNAL}.`,
       `Task: ${params.task}`,
       "",
       "Plan:",
       params.plan,
     ].join("\n"),
   });
-  const passed = result.commits.length > 0;
-  await appendEnvelope(context, "implement", passed ? "succeeded" : "failed", passed ? `Codex produced ${result.commits.length} commit(s)` : "Codex produced no commits", {
-    artifacts: result.commits.map((commit) => ({ name: "commit", uri: `git:${commit.sha}` })),
+  const completion = (
+    await resumeForStringOutput(
+      sandcastle,
+      workResult,
+      "dogfood-implement",
+      "implementation",
+      [
+        "The implementation work is complete. Do not inspect or edit the repository further.",
+        "Emit exactly <implementation>COMPLETE</implementation> if the task was implemented, verified, and committed.",
+        "Otherwise emit exactly <implementation>INCOMPLETE</implementation>.",
+      ].join("\n"),
+    )
+  ).toUpperCase();
+  const passed = workResult.commits.length > 0 && completion === "COMPLETE";
+  const summary =
+    workResult.commits.length === 0
+      ? "Codex produced no commits"
+      : completion === "COMPLETE"
+        ? `Codex produced ${workResult.commits.length} commit(s)`
+        : `Codex implementation verdict: ${completion || "empty"}`;
+  await appendEnvelope(context, "implement", passed ? "succeeded" : "failed", summary, {
+    artifacts: workResult.commits.map((commit) => ({ name: "commit", uri: `git:${commit.sha}` })),
     notes: `Review branch ${branch} against ${params.base_branch ?? "main"}.`,
-    extensions: { branch, model: params.codex_model ?? "gpt-5.4" },
+    extensions: { branch, completion, model: params.codex_model ?? "gpt-5.4", structured_output: "session-resume" },
   });
   await appendGate(context, "implement", "implementation-committed", passed ? "pass" : "fail", [
-    { kind: "commit-count", value: String(result.commits.length) },
+    { kind: "commit-count", value: String(workResult.commits.length) },
+    { kind: "structured-verdict", value: completion || "EMPTY" },
   ]);
   if (!passed) {
-    throw new ReportedFailure("implementation gate failed: no commits");
+    throw new ReportedFailure(`implementation gate failed: ${summary}`);
   }
   await dispatchChild(context, record, "review", { ...params, branch });
 }
@@ -343,31 +402,44 @@ async function runImplement(context: Context, record: RunRecord, params: Dogfood
 async function runReview(context: Context, params: DogfoodParams): Promise<void> {
   const { sandcastle, noSandbox } = await loadSandcastle(params);
   const branch = workflowBranch(context, params);
-  const result = await sandcastle.run({
+  const workResult = await sandcastle.run({
     name: "dogfood-review",
     cwd: params.repo_path,
     sandbox: noSandbox(),
     branchStrategy: { type: "branch", branch },
-    agent: sandcastle.claudeCode(params.claude_model ?? "claude-sonnet-4-6", { captureSessions: false }),
-    maxIterations: 1,
+    agent: sandcastle.claudeCode(params.claude_model ?? "claude-sonnet-4-6", { captureSessions: true }),
+    maxIterations: 20,
+    completionSignal: WORK_COMPLETION_SIGNAL,
     logging: { type: "stdout" },
     prompt: [
       `Cross-review branch ${branch} against ${params.base_branch ?? "main"}.`,
       "Inspect correctness, scope, tests, and the original plan. Fix and commit worthwhile issues.",
-      "Run appropriate verification. Return exactly <review>PASS</review> only when the branch is acceptable; otherwise return <review>FAIL</review>.",
+      "Run appropriate verification and retain the final PASS or FAIL verdict in this session.",
+      `When the review is complete, finish with the exact line ${WORK_COMPLETION_SIGNAL}.`,
       `Task: ${params.task}`,
       "",
       "Plan:",
       params.plan ?? "(plan unavailable)",
     ].join("\n"),
-    output: sandcastle.Output.string({ tag: "review" }),
   });
-  const verdict = result.output.trim().toUpperCase();
+  const verdict = (
+    await resumeForStringOutput(
+      sandcastle,
+      workResult,
+      "dogfood-review",
+      "review",
+      [
+        "The cross-review work is complete. Do not inspect or edit the repository further.",
+        "Emit the final verdict already reached in this session now.",
+        "Return exactly <review>PASS</review> or <review>FAIL</review>, and nothing else.",
+      ].join("\n"),
+    )
+  ).toUpperCase();
   const passed = verdict === "PASS";
   await appendEnvelope(context, "review", passed ? "succeeded" : "failed", passed ? "Claude cross-review passed" : `Claude cross-review verdict: ${verdict || "empty"}`, {
-    artifacts: result.commits.map((commit) => ({ name: "review-fix", uri: `git:${commit.sha}` })),
+    artifacts: workResult.commits.map((commit) => ({ name: "review-fix", uri: `git:${commit.sha}` })),
     notes: passed ? `Branch ${branch} is ready for human integration.` : `Branch ${branch} requires another cold run.`,
-    extensions: { branch, verdict, model: params.claude_model ?? "claude-sonnet-4-6" },
+    extensions: { branch, verdict, model: params.claude_model ?? "claude-sonnet-4-6", structured_output: "session-resume" },
   });
   await appendGate(context, "review", "cross-review", passed ? "pass" : "fail", [{ kind: "verdict", value: verdict || "EMPTY" }]);
   if (!passed) {
