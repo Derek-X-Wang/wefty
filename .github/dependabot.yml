@@ -11,6 +11,9 @@ updates:
     directory: /workflows/dogfood
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
     groups:
       dogfood-deps:
         patterns: ["*"]
