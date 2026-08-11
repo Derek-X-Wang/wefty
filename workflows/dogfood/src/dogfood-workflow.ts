@@ -275,7 +275,7 @@ async function runPlan(context: Context, record: RunRecord, params: DogfoodParam
     sandbox: noSandbox(),
     branchStrategy: { type: "head" },
     agent: sandcastle.claudeCode(params.claude_model ?? "claude-sonnet-4-6", { captureSessions: false }),
-    maxIterations: 15,
+    maxIterations: 1,
     logging: { type: "stdout" },
     prompt: [
       "Plan the coding task below without editing files.",
@@ -314,7 +314,7 @@ async function runImplement(context: Context, record: RunRecord, params: Dogfood
     sandbox: noSandbox(),
     branchStrategy: { type: "branch", branch },
     agent: sandcastle.codex(params.codex_model ?? "gpt-5.4", { captureSessions: false }),
-    maxIterations: 40,
+    maxIterations: 1,
     logging: { type: "stdout" },
     prompt: [
       "Implement the task using the approved plan below.",
@@ -349,7 +349,7 @@ async function runReview(context: Context, params: DogfoodParams): Promise<void>
     sandbox: noSandbox(),
     branchStrategy: { type: "branch", branch },
     agent: sandcastle.claudeCode(params.claude_model ?? "claude-sonnet-4-6", { captureSessions: false }),
-    maxIterations: 20,
+    maxIterations: 1,
     logging: { type: "stdout" },
     prompt: [
       `Cross-review branch ${branch} against ${params.base_branch ?? "main"}.`,
