@@ -23,7 +23,7 @@ const defaultServicePollInterval = time.Second
 
 func executeServices(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError("usage: wefty services create|list|status|start|stop|restart|logs|remove")
+		return usageError("usage: wefty services create|list|status|start|stop|restart|logs|remove|forget")
 	}
 	switch args[0] {
 	case "create":
@@ -42,6 +42,8 @@ func executeServices(ctx context.Context, clients *apiClients, jsonOutput bool, 
 		return executeServiceLogs(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "remove":
 		return executeServiceRemove(ctx, clients, jsonOutput, args[1:], stdout, stderr)
+	case "forget":
+		return executeServiceForget(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	default:
 		return usageError(fmt.Sprintf("unknown services command %q", args[0]))
 	}
@@ -281,7 +283,12 @@ func executeServiceRemove(
 	if pollInterval <= 0 {
 		return usageError("--poll-interval must be positive")
 	}
-	job, err := clients.removeService(ctx, flags.Arg(0))
+	jobID := flags.Arg(0)
+	prior, err := clients.getService(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	job, err := clients.removeService(ctx, jobID)
 	if err != nil {
 		return err
 	}
@@ -290,6 +297,34 @@ func executeServiceRemove(
 		if err != nil {
 			return err
 		}
+	}
+	return writeServiceResultWithWorkingDirectory(stdout, job, prior.Spec.Execution.WorkingDirectory, jsonOutput)
+}
+
+func executeServiceForget(
+	ctx context.Context,
+	clients *apiClients,
+	jsonOutput bool,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	args = moveFirstPositionalToEnd(args)
+	flags := flag.NewFlagSet("services forget", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var force bool
+	flags.BoolVar(&force, "force", false, "waive cleanup proof without cancelling the deletion directive")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return usageError("usage: wefty services forget JOB_ID --force")
+	}
+	if !force {
+		return usageError("services forget requires --force to waive cleanup verification")
+	}
+	job, err := clients.forceForgetService(ctx, flags.Arg(0))
+	if err != nil {
+		return err
 	}
 	return writeServiceResult(stdout, job, jsonOutput)
 }
