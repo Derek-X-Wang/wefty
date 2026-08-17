@@ -378,7 +378,7 @@ func TestTimeoutTerminatesThenKillsEntireProcessGroup(t *testing.T) {
 	waitForProcessGone(t, childPID)
 }
 
-func TestRunRejectsInvalidWorkingDirectoryBeforeSpawn(t *testing.T) {
+func TestRunPassesWorkingDirectoryStraightToProcessSpawn(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "not-a-directory")
 	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
@@ -391,8 +391,8 @@ func TestRunRejectsInvalidWorkingDirectoryBeforeSpawn(t *testing.T) {
 			WorkingDirectory: file,
 		},
 	}, nil)
-	if err == nil || result.SpawnError == nil {
-		t.Fatalf("Run() = (%#v, %v), want validation spawn error", result, err)
+	if err != nil || result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailureProcessSpawn {
+		t.Fatalf("Run() = (%#v, %v), want process spawn failure", result, err)
 	}
 }
 

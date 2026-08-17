@@ -65,13 +65,22 @@ func TestMain(main *testing.M) {
 }
 
 type acceptanceHarness struct {
-	client *http.Client
-	agent  *managedProcess
+	client             *http.Client
+	agent              *managedProcess
+	managedRoot        string
+	handoffRoot        string
+	workingDirectories map[string]string
 }
 
 func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 	t.Helper()
 	directory := t.TempDir()
+	resolvedDirectory, err := filepath.EvalSymlinks(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedRoot := filepath.Join(resolvedDirectory, "managed-state")
+	handoffRoot := filepath.Join(directory, "handoffs")
 	readyFile := filepath.Join(directory, "l1-ready.json")
 	controlPlane := newManagedProcess(t, controlPlanePath,
 		"--fabric=plain",
@@ -90,6 +99,8 @@ func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 		"--node-id=acceptance-node",
 		"--plain-identity=acceptance-agent",
 		"--log-spool-dir="+filepath.Join(directory, "agent-spool"),
+		"--managed-root="+managedRoot,
+		"--handoff-root="+handoffRoot,
 		"--heartbeat-interval=250ms",
 		"--claim-interval=10ms",
 		"--renewal-interval=100ms",
@@ -106,12 +117,19 @@ func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 		},
 	}}
 	t.Cleanup(client.CloseIdleConnections)
-	return &acceptanceHarness{client: client, agent: agentProcess}
+	return &acceptanceHarness{
+		client: client, agent: agentProcess,
+		managedRoot: managedRoot, handoffRoot: handoffRoot,
+		workingDirectories: make(map[string]string),
+	}
 }
 
 func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
 	t.Helper()
 	workingDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workingDirectory, "operator-owned"), []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	spec := contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   "service-acceptance-" + strconv.FormatInt(time.Now().UnixNano(), 10),
@@ -139,6 +157,7 @@ func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
 	if status != http.StatusCreated {
 		t.Fatalf("submit echo service status = %d body=%s", status, body)
 	}
+	h.workingDirectories[job.JobID] = workingDirectory
 	return job
 }
 

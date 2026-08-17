@@ -14,6 +14,7 @@ const (
 	EnvL3Endpoint      = "WEFTY_L3_ENDPOINT"
 	EnvRunToken        = "WEFTY_RUN_TOKEN"
 	EnvHandoffDir      = "WEFTY_HANDOFF_DIR"
+	EnvServiceDir      = "WEFTY_SERVICE_DIR"
 	DefaultHandoffRoot = "/tmp/wefty/handoffs"
 
 	// StableNodeTagPrefix reserves the routing tag used when a cold rerun
@@ -231,19 +232,20 @@ type SpawnFailure struct {
 type SpawnFailureCode string
 
 const (
-	SpawnFailureUnsupportedClass          SpawnFailureCode = "unsupported_class"
-	SpawnFailureUnsupportedKind           SpawnFailureCode = "unsupported_kind"
-	SpawnFailureUnsupportedRuntimeHandler SpawnFailureCode = "unsupported_runtime_handler"
-	SpawnFailureHandoffPreparation        SpawnFailureCode = "handoff_preparation_failed"
-	SpawnFailureExecutableMaterialization SpawnFailureCode = "executable_materialization_failed"
-	SpawnFailureWorkflowBridgeCreation    SpawnFailureCode = "workflow_bridge_creation_failed"
-	SpawnFailureLogSinkSetup              SpawnFailureCode = "log_sink_setup_failed"
-	SpawnFailureProcessRequest            SpawnFailureCode = "process_request_invalid"
-	SpawnFailureProcessGroupSetup         SpawnFailureCode = "process_group_setup_failed"
-	SpawnFailureProcessSpawn              SpawnFailureCode = "process_spawn_failed"
-	SpawnFailureProcessWait               SpawnFailureCode = "process_wait_failed"
-	SpawnFailurePublishedPortOccupied     SpawnFailureCode = "published_port_occupied"
-	SpawnFailureStartupReadinessTimeout   SpawnFailureCode = "startup_readiness_timeout"
+	SpawnFailureUnsupportedClass           SpawnFailureCode = "unsupported_class"
+	SpawnFailureUnsupportedKind            SpawnFailureCode = "unsupported_kind"
+	SpawnFailureUnsupportedRuntimeHandler  SpawnFailureCode = "unsupported_runtime_handler"
+	SpawnFailureManagedResourcePreparation SpawnFailureCode = "managed_resource_preparation_failed"
+	SpawnFailureHandoffPreparation         SpawnFailureCode = "handoff_preparation_failed"
+	SpawnFailureExecutableMaterialization  SpawnFailureCode = "executable_materialization_failed"
+	SpawnFailureWorkflowBridgeCreation     SpawnFailureCode = "workflow_bridge_creation_failed"
+	SpawnFailureLogSinkSetup               SpawnFailureCode = "log_sink_setup_failed"
+	SpawnFailureProcessRequest             SpawnFailureCode = "process_request_invalid"
+	SpawnFailureProcessGroupSetup          SpawnFailureCode = "process_group_setup_failed"
+	SpawnFailureProcessSpawn               SpawnFailureCode = "process_spawn_failed"
+	SpawnFailureProcessWait                SpawnFailureCode = "process_wait_failed"
+	SpawnFailurePublishedPortOccupied      SpawnFailureCode = "published_port_occupied"
+	SpawnFailureStartupReadinessTimeout    SpawnFailureCode = "startup_readiness_timeout"
 )
 
 // TerminationCause identifies who initiated a signal termination. A service

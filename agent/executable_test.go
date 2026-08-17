@@ -30,7 +30,7 @@ func TestMaterializeExecutableResolvesInterpreterOnAgentNode(t *testing.T) {
 			Mode:         0o700,
 		},
 		Argv: []string{"workflow"},
-	}, "attempt-interpreter")
+	}, "attempt-interpreter", "")
 	defer cleanup()
 	if err != nil {
 		t.Fatal(err)

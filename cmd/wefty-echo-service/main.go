@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const servicePortEnvironment = "WEFTY_SERVICE_PORT"
@@ -34,9 +36,13 @@ func run() error {
 	if err != nil || portNumber < 1 || portNumber > 65535 {
 		return fmt.Errorf("%s must be a TCP port number from 1 to 65535", servicePortEnvironment)
 	}
+	serviceDirectory := os.Getenv(contract.EnvServiceDir)
+	if serviceDirectory == "" {
+		return fmt.Errorf("%s is required", contract.EnvServiceDir)
+	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", healthHandler)
+	mux.HandleFunc("GET /healthz", healthHandler(serviceDirectory))
 	mux.HandleFunc("/echo", echoHandler)
 	server := &http.Server{
 		Addr:              net.JoinHostPort("127.0.0.1", strconv.Itoa(portNumber)),
@@ -67,12 +73,15 @@ func run() error {
 	return nil
 }
 
-func healthHandler(response http.ResponseWriter, _ *http.Request) {
-	response.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(response).Encode(struct {
-		PID int `json:"pid"`
-	}{PID: os.Getpid()}); err != nil {
-		log.Printf("wefty-echo-service: write health response: %v", err)
+func healthHandler(serviceDirectory string) http.HandlerFunc {
+	return func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(response).Encode(struct {
+			PID              int    `json:"pid"`
+			ServiceDirectory string `json:"service_directory"`
+		}{PID: os.Getpid(), ServiceDirectory: serviceDirectory}); err != nil {
+			log.Printf("wefty-echo-service: write health response: %v", err)
+		}
 	}
 }
 

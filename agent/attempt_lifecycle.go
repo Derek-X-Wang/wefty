@@ -44,6 +44,7 @@ type attemptLifecycleDependencies struct {
 	renewalInterval   time.Duration
 	completionRetry   time.Duration
 	outputSinkFactory OutputSinkFactory
+	managedResource   managedResourceManager
 	handoffs          *handoffManager
 	nodeID            string
 	workflowBridge    func(context.Context, contract.ExecutionSpec) (*workflowBridge, error)
@@ -247,6 +248,24 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 		err := fmt.Errorf("runtime handler %q is not supported for process jobs", claim.Job.Spec.RuntimeHandler)
 		return spawnFailure(contract.SpawnFailureUnsupportedRuntimeHandler, err), err
 	}
+	executionSpec := claim.Job.Spec.Execution
+	runtimeDirectory := ""
+	if claim.Job.Spec.Class == contract.JobClassService {
+		if lifecycle.dependencies.managedResource == nil {
+			err := errors.New("managed resource is not configured for service jobs")
+			return spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err
+		}
+		resource, cleanupResource, err := lifecycle.dependencies.managedResource.prepareAttempt(claim.Job.JobID, claim.Lease.AttemptID)
+		if err != nil {
+			return spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err
+		}
+		defer cleanupResource()
+		executionSpec.Env = cloneEnvironment(executionSpec.Env)
+		executionSpec.SensitiveEnv = cloneEnvironment(executionSpec.SensitiveEnv)
+		delete(executionSpec.SensitiveEnv, contract.EnvServiceDir)
+		executionSpec.Env[contract.EnvServiceDir] = resource.dataDirectory
+		runtimeDirectory = resource.runtimeDirectory
+	}
 	if lifecycle.dependencies.preflight != nil {
 		if failure := lifecycle.dependencies.preflight(claim); failure != nil {
 			return contract.ProcessResult{SpawnError: failure}, nil
@@ -257,7 +276,7 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 			return spawnFailure(contract.SpawnFailureHandoffPreparation, err), err
 		}
 	}
-	execution, cleanupExecutable, err := materializeExecutable(claim.Job.Spec.Execution, claim.Lease.AttemptID)
+	execution, cleanupExecutable, err := materializeExecutable(executionSpec, claim.Lease.AttemptID, runtimeDirectory)
 	if err != nil {
 		return spawnFailure(contract.SpawnFailureExecutableMaterialization, err), err
 	}
