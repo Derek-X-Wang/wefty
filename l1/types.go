@@ -42,6 +42,7 @@ type Job struct {
 	CurrentAttemptID string            `json:"current_attempt_id,omitempty"`
 	CreatedAt        time.Time         `json:"created_at"`
 	UpdatedAt        time.Time         `json:"updated_at"`
+	*ServiceJob
 }
 
 // AttemptLease is the authority returned by a successful claim or renewal.

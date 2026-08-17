@@ -207,6 +207,16 @@ func TestServiceJobSpecAcceptsPortlessExecutionWithoutHandoff(t *testing.T) {
 	if job.Spec.Class != contract.JobClassService || job.Spec.PublishedPort != nil || job.Spec.Restart != contract.RestartAlways {
 		t.Fatalf("persisted service spec = %#v", job.Spec)
 	}
+	if job.ServiceJob == nil || job.DesiredState != contract.ServiceDesiredRunning || job.RestartStreak != 0 {
+		t.Fatalf("persisted service metadata = %#v", job.ServiceJob)
+	}
+	var serviceRows int
+	if err := h.store.db.QueryRow("SELECT COUNT(*) FROM service_jobs WHERE job_id=?", job.JobID).Scan(&serviceRows); err != nil {
+		t.Fatal(err)
+	}
+	if serviceRows != 1 {
+		t.Fatalf("service_jobs rows for %s = %d, want 1", job.JobID, serviceRows)
+	}
 }
 
 func TestJobSpecClassValidationIsConditional(t *testing.T) {
