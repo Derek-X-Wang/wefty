@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/l3"
@@ -18,9 +20,27 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintf(os.Stderr, "wefty: %v\n", err)
+		writeCommandError(os.Stderr, err, hasJSONFlag(os.Args[1:]))
 		os.Exit(1)
 	}
+}
+
+func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
+	var responseErr *apiResponseError
+	if jsonOutput && errors.As(err, &responseErr) {
+		_ = writeJSON(writer, contract.ErrorResponse{Error: responseErr.APIError})
+		return
+	}
+	_, _ = fmt.Fprintf(writer, "wefty: %v\n", err)
+}
+
+func hasJSONFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "--json" {
+			return true
+		}
+	}
+	return false
 }
 
 type globalOptions struct {
@@ -109,7 +129,8 @@ Commands:
   submit                     Submit a saved or inline workflow
   rerun RUN_ID               Create a new run from a stored snapshot
   logs RUN_ID [--follow]     Read or follow run logs
-  inspect RUN_ID             Show run lineage, envelopes, and gates
+  inspect RUN_ID [--execution]
+                             Show run lineage, with optional L1 execution diagnostics
   drain NODE_ID              Gracefully drain a node
 
 Global flags:

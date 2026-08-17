@@ -40,12 +40,16 @@ type integrationHarness struct {
 }
 
 func newIntegrationHarness(t *testing.T) *integrationHarness {
+	return newIntegrationHarnessWithL1Options(t, l1.StoreOptions{})
+}
+
+func newIntegrationHarnessWithL1Options(t *testing.T, l1Options l1.StoreOptions) *integrationHarness {
 	t.Helper()
 	network := plain.NewNetwork()
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	ledgerFabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger", Tags: []string{l1.DefaultClientPrincipalTag}})
 
-	l1Store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{})
+	l1Store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1Options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +80,7 @@ func newIntegrationHarness(t *testing.T) *integrationHarness {
 		l1Store.Close()
 		t.Fatal(err)
 	}
-	l3Server, err := NewServer(ledgerFabric, l3Store, ServerConfig{Logs: l1Client})
+	l3Server, err := NewServer(ledgerFabric, l3Store, ServerConfig{Jobs: l1Client, Logs: l1Client})
 	if err != nil {
 		l1Client.CloseIdleConnections()
 		l3Store.Close()

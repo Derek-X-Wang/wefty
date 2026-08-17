@@ -338,6 +338,11 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	job.Attempts, err = s.store.ListJobAttempts(r.Context(), job.JobID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, redactJob(job))
 }
 

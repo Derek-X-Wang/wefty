@@ -132,6 +132,7 @@ type Evidence struct {
 type RunRecord struct {
 	SchemaVersion int             `json:"schema_version"`
 	RunID         string          `json:"run_id"`
+	L1JobID       string          `json:"l1_job_id,omitempty"`
 	NodeID        string          `json:"node_id,omitempty"`
 	ParentRunID   string          `json:"parent_run_id,omitempty"`
 	DispatchKey   string          `json:"dispatch_key"`

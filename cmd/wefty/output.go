@@ -93,5 +93,93 @@ func writeRunInspection(writer io.Writer, inspection runInspection) error {
 			}
 		}
 	}
-	return detail.Flush()
+	if err := detail.Flush(); err != nil {
+		return err
+	}
+	if inspection.Execution == nil {
+		return nil
+	}
+	return writeRunExecution(writer, *inspection.Execution)
+}
+
+func writeRunExecution(writer io.Writer, execution l3.RunExecution) error {
+	if _, err := fmt.Fprintln(writer, "\nEXECUTION"); err != nil {
+		return err
+	}
+	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(table, "L1 JOB ID\tDISPATCH ATTEMPTS\tDISPATCH ERROR"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(table, "%s\t%d\t%s\n", execution.L1JobID, execution.DispatchAttempts, formatAPIError(execution.DispatchError)); err != nil {
+		return err
+	}
+	if execution.Job == nil {
+		return table.Flush()
+	}
+	if _, err := fmt.Fprintln(table, "JOB STATE\tNODE\tCURRENT ATTEMPT"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(table, "%s\t%s\t%s\n", execution.Job.State, execution.Job.NodeID, execution.Job.CurrentAttemptID); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(table, "ATTEMPT ID\tNODE\tSTATE / EVIDENCE"); err != nil {
+		return err
+	}
+	for _, attempt := range execution.Job.Attempts {
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\n", attempt.AttemptID, attempt.NodeID, formatAttemptEvidence(attempt)); err != nil {
+			return err
+		}
+	}
+	return table.Flush()
+}
+
+func formatAPIError(apiError *contract.APIError) string {
+	if apiError == nil {
+		return ""
+	}
+	parts := []string{fmt.Sprintf("%s: %s", apiError.Code, apiError.Message), fmt.Sprintf("retryable=%t", apiError.Retryable)}
+	if apiError.RequestID != "" {
+		parts = append(parts, "request_id="+apiError.RequestID)
+	}
+	if len(apiError.Details) > 0 {
+		if details, err := json.Marshal(apiError.Details); err == nil {
+			parts = append(parts, "details="+string(details))
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+func formatAttemptEvidence(attempt l1.Attempt) string {
+	if attempt.LateResult != nil {
+		return string(attempt.State) + " — late evidence: " + formatLateResult(*attempt.LateResult)
+	}
+	if attempt.Result != nil {
+		return string(attempt.State) + " — " + formatProcessResult(*attempt.Result)
+	}
+	return string(attempt.State)
+}
+
+func formatLateResult(evidence l1.LateResultEvidence) string {
+	if evidence.Result != nil {
+		return formatProcessResult(*evidence.Result)
+	}
+	if evidence.Gap != nil {
+		return "unavailable (" + string(evidence.Gap.Reason) + ")"
+	}
+	return "unavailable"
+}
+
+func formatProcessResult(result l1.ProcessResult) string {
+	switch {
+	case result.ExitCode != nil:
+		return fmt.Sprintf("exit %d", *result.ExitCode)
+	case result.SpawnError != nil:
+		return fmt.Sprintf("spawn %s: %s", result.SpawnError.Code, result.SpawnError.Message)
+	case result.OutputError != "":
+		return "output error: " + result.OutputError
+	case result.Signal != "":
+		return fmt.Sprintf("signal %s (%s)", result.Signal, result.TerminationCause)
+	default:
+		return "unknown result"
+	}
 }

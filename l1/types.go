@@ -47,10 +47,26 @@ type Job struct {
 	// retain no executable or environment bytes.
 	Spec             contract.JobSpec `json:"spec,omitzero"`
 	CurrentAttemptID string           `json:"current_attempt_id,omitempty"`
+	Attempts         []Attempt        `json:"attempts,omitempty"`
 	CreatedAt        time.Time        `json:"created_at"`
 	UpdatedAt        time.Time        `json:"updated_at"`
 	*ServiceJob
 	Removal *ServiceRemoval `json:"removal,omitempty"`
+}
+
+// Attempt is the operator-safe execution summary for one retained attempt.
+// It deliberately omits the fencing token, boot session, and authority
+// generation: those grant or identify write authority rather than explain an
+// execution. Result and LateResult are mutually exclusive by contract.
+type Attempt struct {
+	AttemptID      string                `json:"attempt_id"`
+	NodeID         string                `json:"node_id"`
+	State          contract.AttemptState `json:"state"`
+	LeaseExpiresAt time.Time             `json:"lease_expires_at"`
+	Result         *ProcessResult        `json:"result,omitempty"`
+	LateResult     *LateResultEvidence   `json:"late_result,omitempty"`
+	CreatedAt      time.Time             `json:"created_at"`
+	UpdatedAt      time.Time             `json:"updated_at"`
 }
 
 // ServiceRemoval is the operator projection for an irreversible service

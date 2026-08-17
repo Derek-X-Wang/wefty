@@ -58,6 +58,11 @@
             "description": "Absent after removal finalizes; tombstones retain no executable or environment bytes."
           },
           "current_attempt_id": { "type": "string" },
+          "attempts": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Attempt" },
+            "description": "Retained operator-safe attempt summaries in chronological order. Write-authority fields are never exposed."
+          },
           "desired_state": {
             "enum": ["running", "stopped", "removed"],
             "description": "Service jobs only. Requested lifecycle target, distinct from observed state."
@@ -118,6 +123,43 @@
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" }
         }
+      },
+      "Attempt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["attempt_id", "node_id", "state", "lease_expires_at", "created_at", "updated_at"],
+        "properties": {
+          "attempt_id": { "type": "string" },
+          "node_id": { "type": "string" },
+          "state": { "enum": ["claimed", "running", "awaiting-input", "succeeded", "failed", "lost"] },
+          "lease_expires_at": { "type": "string", "format": "date-time" },
+          "result": { "$ref": "#/components/schemas/ProcessResult" },
+          "late_result": { "$ref": "#/components/schemas/LateResultEvidence" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "LateResultEvidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "late", "observed_at", "authority_lost_at"],
+        "properties": {
+          "kind": { "enum": ["observation", "gap"] },
+          "result": { "$ref": "#/components/schemas/ProcessResult" },
+          "gap": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reason"],
+            "properties": { "reason": { "const": "observation_window_expired" } }
+          },
+          "late": { "const": true },
+          "observed_at": { "type": "string", "format": "date-time" },
+          "authority_lost_at": { "type": "string", "format": "date-time" }
+        },
+        "oneOf": [
+          { "properties": { "kind": { "const": "observation" } }, "required": ["result"], "not": { "required": ["gap"] } },
+          { "properties": { "kind": { "const": "gap" } }, "required": ["gap"], "not": { "required": ["result"] } }
+        ]
       },
       "AttemptLease": {
         "type": "object",
