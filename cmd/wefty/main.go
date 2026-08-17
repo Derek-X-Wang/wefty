@@ -125,7 +125,8 @@ func removeBoolFlag(args []string, name string) ([]string, bool) {
 const rootUsage = `Usage: wefty [global flags] <command>
 
 Commands:
-  nodes list                 List node liveness and metadata
+  nodes list                 List node reachability, eligibility, and capacity
+  nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   services <verb>            Create and operate service-class jobs
     create|list|status|start|stop|restart|logs|remove
   submit                     Submit a saved or inline workflow
@@ -133,7 +134,7 @@ Commands:
   logs RUN_ID [--follow]     Read or follow run logs
   inspect RUN_ID [--execution]
                              Show run lineage, with optional L1 execution diagnostics
-  drain NODE_ID              Gracefully drain a node
+  drain NODE_ID              Disable new claims using the current intent revision
 
 Global flags:
   --fabric plain|tsnet

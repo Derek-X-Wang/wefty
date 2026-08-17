@@ -146,7 +146,8 @@ The full pass criteria and evidence commands are in the
 
 ## CLI tour
 
-- `wefty nodes list` shows registered nodes, liveness, state, and tags.
+- `wefty nodes list` shows reachability separately from claim eligibility, per-class slot occupancy, durable intent, and tags.
+- `wefty nodes set-claims NODE_ID --claims-enabled=false --intent-revision=REV --reason="maintenance"` records revision-guarded operator intent; the authenticated Fabric identity is recorded as the actor.
 - `wefty submit` submits a saved workflow or inline script to the run ledger.
 - `wefty logs RUN_ID --follow` reads a run's logs until it settles.
 - `wefty rerun RUN_ID` creates a new run from the original stored snapshot.
