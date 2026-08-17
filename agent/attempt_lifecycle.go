@@ -76,6 +76,11 @@ type runOutcome struct {
 	durabilityErr error
 }
 
+var (
+	errAttemptDirectiveStop    = errors.New("attempt directive: stop")
+	errAttemptDirectiveRestart = errors.New("attempt directive: restart")
+)
+
 type handoffLockResult struct {
 	unlock func()
 	err    error
@@ -145,7 +150,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		if claim.Job.Spec.Class == contract.JobClassOneShot {
 			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptRunning, nil)
 		}
-		result, err := lifecycle.runProcess(executionContext, claim)
+		result, err := lifecycle.runProcessContexts(executionContext, context.WithoutCancel(attemptContext), claim)
 		var durabilityErr error
 		if lifecycle.dependencies.outbox != nil {
 			durabilityErr = lifecycle.dependencies.outbox.storeCompletion(
@@ -159,11 +164,46 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	select {
 	case <-ctx.Done():
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, ctx.Err())
+		cancelExecution()
 		cancelAttempt(ctx.Err())
-		<-completed
+		outcome := <-completed
 		<-renewalDone
+		result := outcome.result
+		if result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
+			result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
+		}
+		request := l1.CompletionRequest{
+			FencingToken:   claim.Lease.FencingToken,
+			IdempotencyKey: "completion:" + claim.Lease.AttemptID,
+			Result:         toL1Result(result),
+		}
+		finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
+		defer cancelFinalization()
+		failure := lifecycle.completeWithRetry(finalizationContext, claim, request)
+		if failure.err != nil && protocolErrorCode(failure.err) != contract.ErrorLeaseExpired {
+			return failure.destination, fmt.Errorf("agent: shutdown completion: %w", failure.err)
+		}
 		return errorDestinationUnclassified, ctx.Err()
 	case failure := <-renewalErrors:
+		if errors.Is(failure.err, errAttemptDirectiveStop) || errors.Is(failure.err, errAttemptDirectiveRestart) {
+			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, failure.err)
+			cancelExecution()
+			cancelAttempt(failure.err)
+			outcome := <-completed
+			<-renewalDone
+			result := outcome.result
+			if result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
+				result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
+			}
+			request := l1.CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: toL1Result(result)}
+			finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
+			defer cancelFinalization()
+			completionFailure := lifecycle.completeWithRetry(finalizationContext, claim, request)
+			if completionFailure.err != nil {
+				return completionFailure.destination, fmt.Errorf("agent: directive completion: %w", completionFailure.err)
+			}
+			return errorDestinationUnclassified, nil
+		}
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, failure.err)
 		cancelAttempt(failure.err)
 		<-completed
@@ -204,7 +244,11 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		Result:         toL1Result(outcome.result),
 	}
 	completionDone := make(chan destinationError, 1)
-	go func() { completionDone <- lifecycle.completeWithRetry(attemptContext, claim, request) }()
+	completionContext := attemptContext
+	if cause := context.Cause(attemptContext); errors.Is(cause, errAttemptDirectiveStop) || errors.Is(cause, errAttemptDirectiveRestart) {
+		completionContext = context.WithoutCancel(attemptContext)
+	}
+	go func() { completionDone <- lifecycle.completeWithRetry(completionContext, claim, request) }()
 	var completionFailure destinationError
 	select {
 	case completionFailure = <-completionDone:
@@ -294,6 +338,10 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 }
 
 func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
+	return lifecycle.runProcessContexts(ctx, ctx, claim)
+}
+
+func (lifecycle *attemptLifecycle) runProcessContexts(ctx, finalizationContext context.Context, claim l1.Claim) (contract.ProcessResult, error) {
 	if err := contract.CheckWorkloadClass(claim.Job.Spec.Class); err != nil {
 		return spawnFailure(contract.SpawnFailureUnsupportedClass, err), err
 	}
@@ -383,7 +431,7 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 	var uploader *batchingLogSink
 	var sinks multiOutputSink
 	if lifecycle.dependencies.client != nil && lifecycle.dependencies.outbox != nil {
-		uploader, err = lifecycle.dependencies.outbox.newLogSink(ctx, lifecycle.dependencies.client, claim)
+		uploader, err = lifecycle.dependencies.outbox.newLogSink(finalizationContext, lifecycle.dependencies.client, claim)
 		if err != nil {
 			return spawnFailure(contract.SpawnFailureLogSinkSetup, err), err
 		}
@@ -463,7 +511,7 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 	}
 	var outputErr error
 	if redactingSink != nil {
-		outputErr = redactingSink.Flush(ctx)
+		outputErr = redactingSink.Flush(finalizationContext)
 	}
 	var uploadErr error
 	if uploader != nil {
@@ -528,7 +576,22 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 		lease = updated
 		authority = localAuthority{deadline: requestStarted.Add(updated.LeaseTTL)}
 		watch.Renewed(authority)
+		if updated.Directive == l1.AttemptDirectiveStop {
+			returnWithDirective(failures, errAttemptDirectiveStop)
+			return
+		}
+		if updated.Directive == l1.AttemptDirectiveRestart {
+			returnWithDirective(failures, errAttemptDirectiveRestart)
+			return
+		}
 		nextDelay = renewalDelay(authority.deadline.Sub(lifecycle.dependencies.clock.Now()), lifecycle.dependencies.renewalInterval)
+	}
+}
+
+func returnWithDirective(failures chan<- destinationError, directive error) {
+	select {
+	case failures <- destinationError{destination: errorDestinationUnclassified, err: directive}:
+	default:
 	}
 }
 
