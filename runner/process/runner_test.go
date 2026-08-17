@@ -201,6 +201,50 @@ func TestIdleTimeoutResetsOnOutputActivity(t *testing.T) {
 	}
 }
 
+func TestIgnoreIdlePolicyLeavesQuietProcessRunning(t *testing.T) {
+	clock := newFakeClock(time.Unix(1_500, 0))
+	sink := newCollectingSink()
+	runner := New(Config{
+		Clock:                clock,
+		IdleTimeout:          10 * time.Second,
+		TerminationGraceTime: 2 * time.Second,
+	})
+	finished := runAsync(runner, Request{
+		AttemptID:  "attempt-ignore-idle",
+		Execution:  helperExecution("hang"),
+		IdlePolicy: IgnoreIdle,
+		Limits:     &contract.JobLimits{MaxRuntimeSeconds: 120},
+	}, sink)
+
+	pid := eventPID(t, sink.Next(t))
+	clock.WaitForTimerCount(t, 1)
+	clock.WaitForActiveDeadline(t, time.Unix(1_620, 0))
+	clock.Advance(119 * time.Second)
+	assertStillRunning(t, finished)
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("quiet process is not alive after ignored idle deadline: %v", err)
+	}
+
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatalf("kill helper: %v", err)
+	}
+	outcome := awaitRun(t, finished)
+	if outcome.err != nil {
+		t.Fatalf("Run() error = %v", outcome.err)
+	}
+}
+
+func TestRunRejectsUnsupportedIdlePolicyBeforeSpawn(t *testing.T) {
+	result, err := New(Config{}).Run(context.Background(), Request{
+		AttemptID:  "attempt-invalid-idle-policy",
+		Execution:  helperExecution("exit", "0"),
+		IdlePolicy: IdlePolicy(2),
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "unsupported idle policy") || result.SpawnError == "" {
+		t.Fatalf("Run() = (%#v, %v), want idle policy validation error", result, err)
+	}
+}
+
 func TestCompletionTimeoutStartsOnSignal(t *testing.T) {
 	clock := newFakeClock(time.Unix(2_000, 0))
 	completion := make(chan struct{})
