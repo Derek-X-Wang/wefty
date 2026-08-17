@@ -17,6 +17,10 @@ type Fabric interface {
 	Listen(network, address string) (net.Listener, error)
 	Dial(ctx context.Context, network, address string) (net.Conn, error)
 	WhoIs(ctx context.Context, remoteAddress string) (Identity, error)
+	// ConnectHost returns the Fabric-owned hostname an operator can combine
+	// with a published port. It is presentation data only: callers must never
+	// use it for identity, authorization, or scheduling.
+	ConnectHost() string
 }
 
 type Provisioner interface {

@@ -119,6 +119,10 @@ func (f *Fabric) WhoIs(_ context.Context, remoteAddress string) (fabric.Identity
 	return identity, nil
 }
 
+// ConnectHost returns the loopback host backing published listeners in the
+// localhost-only Fabric.
+func (f *Fabric) ConnectHost() string { return "127.0.0.1" }
+
 func (n *Network) registerName(name, address string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()

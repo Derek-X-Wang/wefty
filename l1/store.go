@@ -163,7 +163,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   node_id TEXT PRIMARY KEY,
   identity_node_id TEXT NOT NULL,
   boot_session_id TEXT NOT NULL,
-	root_instance_id TEXT NOT NULL DEFAULT '',
+  connect_host TEXT NOT NULL DEFAULT '',
+  root_instance_id TEXT NOT NULL DEFAULT '',
   os TEXT NOT NULL,
   architecture TEXT NOT NULL,
   agent_version TEXT NOT NULL,
@@ -473,11 +474,12 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `
-INSERT INTO nodes(node_id, identity_node_id, boot_session_id, root_instance_id, os, architecture, agent_version, capabilities_json, state, last_heartbeat_ns, max_oneshot_slots, max_service_slots, authority_generation, claims_enabled)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+INSERT INTO nodes(node_id, identity_node_id, boot_session_id, connect_host, root_instance_id, os, architecture, agent_version, capabilities_json, state, last_heartbeat_ns, max_oneshot_slots, max_service_slots, authority_generation, claims_enabled)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
 ON CONFLICT(node_id) DO UPDATE SET
   boot_session_id=excluded.boot_session_id,
-	root_instance_id=excluded.root_instance_id,
+  connect_host=excluded.connect_host,
+  root_instance_id=excluded.root_instance_id,
   os=excluded.os,
   architecture=excluded.architecture,
   agent_version=excluded.agent_version,
@@ -487,7 +489,7 @@ ON CONFLICT(node_id) DO UPDATE SET
 	max_oneshot_slots=excluded.max_oneshot_slots,
 	max_service_slots=excluded.max_service_slots,
 	authority_generation=nodes.authority_generation+1
-WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, identity.NodeID, registration.BootSessionID, registration.RootInstanceID,
+WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, identity.NodeID, registration.BootSessionID, registration.ConnectHost, registration.RootInstanceID,
 		registration.OS, registration.Architecture, registration.AgentVersion, capabilities, contract.NodeAlive, now.UnixNano(),
 		policy.MaxOneshotSlots, policy.MaxServiceSlots, operatorExpected)
 	if err != nil {
@@ -519,12 +521,38 @@ WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, id
 }
 
 func (s *Store) HeartbeatNode(ctx context.Context, identityNodeID, nodeID, bootSessionID string) (Node, error) {
+	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, nil)
+}
+
+// HeartbeatNodeWithPolicy refreshes the effective configured capacities while
+// updating liveness, so an L1 restart with changed policy does not require the
+// long-running agent to replace its boot session merely to learn new limits.
+func (s *Store) HeartbeatNodeWithPolicy(ctx context.Context, identityNodeID, nodeID, bootSessionID string, policy NodePolicy) (Node, error) {
+	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, &policy)
+}
+
+func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootSessionID string, policy *NodePolicy) (Node, error) {
 	now := canonicalTime(s.clock.Now())
-	result, err := s.db.ExecContext(ctx, `UPDATE nodes
-	SET state=CASE WHEN state IN (?, ?) THEN ? ELSE state END, last_heartbeat_ns=?
-	WHERE node_id=? AND identity_node_id=? AND boot_session_id=? AND state IN (?, ?, ?)`,
-		contract.NodeAlive, contract.NodeStale, contract.NodeAlive, now.UnixNano(), nodeID, identityNodeID, bootSessionID,
-		contract.NodeAlive, contract.NodeStale, contract.NodeDraining)
+	if policy != nil && (policy.MaxOneshotSlots < 0 || policy.MaxServiceSlots < 0) {
+		return Node{}, protocolError(contract.ErrorInvalidRequest, "configured node slot limits must be non-negative")
+	}
+	var result sql.Result
+	var err error
+	if policy != nil {
+		result, err = s.db.ExecContext(ctx, `UPDATE nodes
+			SET state=CASE WHEN state IN (?, ?) THEN ? ELSE state END, last_heartbeat_ns=?,
+				max_oneshot_slots=?, max_service_slots=?
+			WHERE node_id=? AND identity_node_id=? AND boot_session_id=? AND state IN (?, ?, ?)`,
+			contract.NodeAlive, contract.NodeStale, contract.NodeAlive, now.UnixNano(),
+			policy.MaxOneshotSlots, policy.MaxServiceSlots, nodeID, identityNodeID, bootSessionID,
+			contract.NodeAlive, contract.NodeStale, contract.NodeDraining)
+	} else {
+		result, err = s.db.ExecContext(ctx, `UPDATE nodes
+			SET state=CASE WHEN state IN (?, ?) THEN ? ELSE state END, last_heartbeat_ns=?
+			WHERE node_id=? AND identity_node_id=? AND boot_session_id=? AND state IN (?, ?, ?)`,
+			contract.NodeAlive, contract.NodeStale, contract.NodeAlive, now.UnixNano(),
+			nodeID, identityNodeID, bootSessionID, contract.NodeAlive, contract.NodeStale, contract.NodeDraining)
+	}
 	if err != nil {
 		return Node{}, internalError(err, "update node heartbeat")
 	}
@@ -1867,9 +1895,9 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	var capabilitiesJSON []byte
 	var heartbeatNS int64
 	var intentUpdatedNS sql.NullInt64
-	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, root_instance_id, os, architecture, agent_version, capabilities_json, state, max_oneshot_slots, max_service_slots,
+	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, connect_host, root_instance_id, os, architecture, agent_version, capabilities_json, state, max_oneshot_slots, max_service_slots,
 	authority_generation, claims_enabled, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns
-	FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.RootInstanceID, &node.OS, &node.Architecture,
+	FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.ConnectHost, &node.RootInstanceID, &node.OS, &node.Architecture,
 		&node.AgentVersion, &capabilitiesJSON, &node.State, &node.MaxOneshotSlots, &node.MaxServiceSlots,
 		&node.AuthorityGeneration, &node.ClaimsEnabled, &node.IntentRevision, &node.IntentReason, &intentUpdatedNS,
 		&node.IntentActor, &heartbeatNS)
@@ -1883,7 +1911,6 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	if err != nil {
 		return Node{}, err
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var tag string
 		if err := rows.Scan(&tag); err != nil {
@@ -1892,6 +1919,10 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 		node.AuthoritativeTags = append(node.AuthoritativeTags, tag)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
+		return Node{}, err
+	}
+	if err := rows.Close(); err != nil {
 		return Node{}, err
 	}
 	if node.AuthoritativeTags == nil {
@@ -1902,6 +1933,23 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 		updatedAt := time.Unix(0, intentUpdatedNS.Int64).UTC()
 		node.IntentUpdatedAt = &updatedAt
 	}
+	if err := q.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM attempts one_shot_attempt
+		 WHERE one_shot_attempt.node_id=?
+		   AND one_shot_attempt.state IN (?, ?, ?)
+		   AND NOT EXISTS (SELECT 1 FROM service_jobs WHERE service_jobs.job_id=one_shot_attempt.job_id)),
+		(SELECT COUNT(*) FROM service_jobs occupied_service
+		 JOIN jobs occupied_job ON occupied_job.job_id=occupied_service.job_id
+		 WHERE occupied_service.bound_node_id=?
+		   AND ((occupied_job.state=? AND occupied_service.desired_state=?)
+		        OR occupied_job.state IN (?, ?, ?, ?, ?)))`,
+		nodeID, contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput,
+		nodeID, contract.JobQueued, contract.ServiceDesiredRunning, contract.JobClaimed, contract.JobRunning,
+		contract.JobStopping, contract.JobRemovalPending, contract.JobAgentCleaned,
+	).Scan(&node.OneshotOccupancy, &node.ServiceOccupancy); err != nil {
+		return Node{}, err
+	}
+	node.Overcommitted = node.OneshotOccupancy > node.MaxOneshotSlots || node.ServiceOccupancy > node.MaxServiceSlots
 	return node, nil
 }
 

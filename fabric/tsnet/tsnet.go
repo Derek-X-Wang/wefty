@@ -110,6 +110,10 @@ func (f *Fabric) WhoIs(ctx context.Context, remoteAddress string) (fabric.Identi
 	return identityFromWhoIs(who)
 }
 
+// ConnectHost returns the private tailnet hostname owned by this Fabric
+// implementation. The logical wefty name remains behind the seam.
+func (f *Fabric) ConnectHost() string { return f.localName.Hostname() }
+
 func (f *Fabric) localClient() (*local.Client, error) {
 	f.clientMu.Lock()
 	defer f.clientMu.Unlock()

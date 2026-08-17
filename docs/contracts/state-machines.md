@@ -61,6 +61,12 @@ binding itself remains durable. Reaching stopped never clears
 `current_attempt_id`, because an idempotent completion replay must still match
 the attempt that positively reaped the payload.
 
+Agent shutdown is an infrastructure interruption, not operator stop intent. A
+fenced shutdown completion therefore leaves desired state `running`, moves the
+service from `running` to `queued`, and leaves the restart streak unchanged.
+It must not use `stopping` or `stopped`, whose meaning is reserved for a
+durable operator request to stop the service.
+
 ## Attempt
 
 | State | Meaning | Allowed next states |
@@ -90,7 +96,9 @@ tags are authenticated Fabric/control-plane data, never node-reported state.
 Node heartbeat updates node liveness only and does not renew attempt leases.
 Operator claim intent is not a node state: it is durable across registration,
 may be changed while the node is dead, and does not revoke authority already
-bound into a live attempt.
+bound into a live attempt. The boot-session-scoped agent drain used for
+graceful process shutdown changes only liveness state; it never changes that
+operator intent.
 
 ## Run
 

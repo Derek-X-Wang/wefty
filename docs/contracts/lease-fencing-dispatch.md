@@ -103,8 +103,11 @@ The renewal response is also the attempt-scoped service-intent channel. Its
 optional `directive` is `stop` when the service's desired state is stopped,
 `restart` when a durable restart request targets the current attempt, and
 absent when no lifecycle change is requested. Node-scoped scheduling intent
-remains on the heartbeat response; it cannot conflict with this payload-scoped
-channel.
+remains on the heartbeat response, together with effective class capacities
+and standing removal directives; it cannot conflict with this payload-scoped
+channel. Heartbeat directives are deliverable even when the node owns no live
+attempt. The response also carries occupancy and an overcommitted marker for
+operator evidence, while admission remains enforced inside L1 transactions.
 
 Every renewal, publication mutation, and completion is authorized by the exact
 `(job_id, attempt_id, fencing_token)` tuple plus the attempt's boot session and
@@ -174,7 +177,11 @@ authority for attempts they already own, but cannot claim another job. On
 SIGINT or SIGTERM the agent invokes this verb, waits for both class loops to
 finish the resident attempt each is already waiting on, and exits. This is only
 a join around the pre-existing per-attempt wait; issue #88 owns service stop
-transitions, fenced shutdown completion, and forced-drain ordering.
+transitions, fenced shutdown completion, and forced-drain ordering. This route
+is session liveness, not operator intent: it leaves `claims_enabled` and every
+`intent_*` field untouched. A fenced service shutdown completion is an
+infrastructure interruption, so desired `running` projects back to `queued`
+with an unchanged restart streak rather than fabricating operator stop intent.
 
 Lease renewal continues after the subprocess exits while redacted output is
 flushed, durable logs are acknowledged, and the idempotent completion request
@@ -190,6 +197,10 @@ whether `ClaimJob` may win new work and is checked in that same transaction;
 Registration increments authority generation but never changes
 `claims_enabled`, `intent_revision`, `intent_reason`, `intent_updated_at`, or
 `intent_actor` on an existing row.
+
+`connect_host` is a Fabric-produced, non-authoritative registration fact used
+only to tell an operator which host to combine with a published port. It never
+participates in identity, authorization, tags, capacity, or claim eligibility.
 
 An operator intent write supplies the revision it observed and conflicts if the
 revision moved. The write is valid regardless of whether the node is alive,

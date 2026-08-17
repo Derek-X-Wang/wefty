@@ -257,6 +257,8 @@ func (*rejectPublishedListenerFabric) WhoIs(context.Context, string) (fabric.Ide
 	return fabric.Identity{}, errors.New("not implemented")
 }
 
+func (*rejectPublishedListenerFabric) ConnectHost() string { return "127.0.0.1" }
+
 type capturingStartedRunner struct{ request processrunner.Request }
 
 func (runner *capturingStartedRunner) Run(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {

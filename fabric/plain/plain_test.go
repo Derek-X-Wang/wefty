@@ -159,3 +159,10 @@ func TestPlainRejectsNonLocalAddress(t *testing.T) {
 		t.Fatal("Listen() accepted a non-loopback address")
 	}
 }
+
+func TestConnectHostProjectsPublishedLoopbackHost(t *testing.T) {
+	f := NewNetwork().NewFabric(fabric.Identity{NodeID: "node-1"})
+	if got := f.ConnectHost(); got != "127.0.0.1" {
+		t.Fatalf("ConnectHost() = %q, want 127.0.0.1", got)
+	}
+}

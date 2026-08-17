@@ -43,7 +43,8 @@
       ],
       "post": {
         "operationId": "heartbeatNode",
-        "summary": "Update node liveness without renewing job leases",
+        "summary": "Update liveness and receive node-scoped directives",
+        "description": "Boot-session-scoped and never authority-generation-fenced. The response carries durable claim intent, effective class capacities, and pending removal directives even when the node owns no attempt.",
         "requestBody": {
           "required": true,
           "content": {
@@ -61,10 +62,10 @@
         },
         "responses": {
           "200": {
-            "description": "Node liveness updated.",
+            "description": "Node liveness updated and the current node-scoped intent channel returned.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "./common.v1.json#/components/schemas/Node" }
+                "schema": { "$ref": "./common.v1.json#/components/schemas/HeartbeatResponse" }
               }
             }
           },
@@ -81,7 +82,8 @@
       ],
       "post": {
         "operationId": "drainNode",
-        "summary": "Stop new claims while allowing active attempts to finish",
+        "summary": "Drain this agent boot session for graceful shutdown",
+        "description": "Changes boot-session liveness to draining without mutating durable operator claim intent or fencing existing attempts. Fenced attempt completions continue through the ordinary completion route.",
         "requestBody": {
           "required": true,
           "content": {

@@ -2,6 +2,7 @@ package tsnet
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"tailscale.com/client/tailscale/apitype"
@@ -14,6 +15,17 @@ func TestNewRequiresWeftyName(t *testing.T) {
 	}
 	if _, err := New(Config{Name: "wefty://node/runner-1"}); err != nil {
 		t.Fatalf("New() rejected a wefty name: %v", err)
+	}
+}
+
+func TestConnectHostProjectsPrivateTransportHostname(t *testing.T) {
+	f, err := New(Config{Name: "wefty://node/runner-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := f.ConnectHost()
+	if got == "" || strings.Contains(got, "wefty://") || !strings.HasPrefix(got, "node-") {
+		t.Fatalf("ConnectHost() = %q, want a non-logical private hostname", got)
 	}
 }
 
