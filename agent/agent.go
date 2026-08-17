@@ -202,7 +202,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("agent: recover durable logs: %w", err)
 	}
 	return a.session.run(ctx, func(attemptContext context.Context, claim l1.Claim) (errorDestination, error) {
-		return errorDestinationUnclassified, a.executeClaim(attemptContext, claim)
+		return a.executeClaim(attemptContext, claim)
 	})
 }
 
@@ -213,7 +213,7 @@ func (a *Agent) recoverPendingLogs(ctx context.Context) error {
 	return a.outbox.recover(ctx, a.session.client)
 }
 
-func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) error {
+func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) (errorDestination, error) {
 	return a.newAttemptLifecycle().execute(ctx, claim)
 }
 
