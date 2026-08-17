@@ -914,6 +914,9 @@ func newSlotRefillRunner() *slotRefillRunner {
 }
 
 func (runner *slotRefillRunner) Run(ctx context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
 	release := make(chan struct{})
 	runner.mu.Lock()
 	runner.releases[request.AttemptID] = release
@@ -964,7 +967,10 @@ func newStubbornRunner() *stubbornRunner {
 	return &stubbornRunner{started: make(chan struct{}), canceled: make(chan struct{}), releaseC: make(chan struct{})}
 }
 
-func (runner *stubbornRunner) Run(ctx context.Context, _ processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+func (runner *stubbornRunner) Run(ctx context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
 	close(runner.started)
 	<-ctx.Done()
 	close(runner.canceled)
@@ -999,6 +1005,9 @@ func newResilienceRunner() *resilienceRunner {
 }
 
 func (runner *resilienceRunner) Run(ctx context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
 	runner.mu.Lock()
 	runner.starts[request.AttemptID]++
 	ordinal := len(runner.starts)
@@ -1046,7 +1055,10 @@ func newBlockingRunner() *blockingRunner {
 	return &blockingRunner{started: make(chan struct{}), releaseCh: make(chan struct{})}
 }
 
-func (runner *blockingRunner) Run(ctx context.Context, _ processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+func (runner *blockingRunner) Run(ctx context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
 	if runner.starts.Add(1) == 1 {
 		close(runner.started)
 	}

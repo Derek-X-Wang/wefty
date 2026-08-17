@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"runtime"
 	"sync"
 	"time"
@@ -277,24 +278,29 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		outputSinkFactory: a.outputSinkFactory, handoffs: a.handoffs,
 		managedResource: a.managedResource,
 		nodeID:          a.registration.NodeID, workflowBridge: a.startWorkflowBridge, logf: a.logf,
-		observer: a.observer, preflight: a.preflightPublishedPort,
+		observer: a.observer, reservePublishedPort: a.reservePublishedPort,
+		prepareServiceEndpoint: prepareProcessServiceEndpoint,
 	})
 }
 
-func (a *Agent) preflightPublishedPort(claim l1.Claim) *contract.SpawnFailure {
+func (a *Agent) reservePublishedPort(claim l1.Claim) (net.Listener, *contract.SpawnFailure) {
 	port := claim.Job.Spec.PublishedPort
-	if claim.Job.Spec.Class != contract.JobClassService || port == nil || a.fabric == nil {
-		return nil
+	if claim.Job.Spec.Class != contract.JobClassService || port == nil {
+		return nil, nil
+	}
+	if a.fabric == nil {
+		return nil, &contract.SpawnFailure{
+			Code: contract.SpawnFailureProcessRequest, Message: "Fabric is required for a portful service",
+		}
 	}
 	listener, err := a.fabric.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {
-		return &contract.SpawnFailure{
+		return nil, &contract.SpawnFailure{
 			Code:    contract.SpawnFailurePublishedPortOccupied,
-			Message: fmt.Sprintf("node %s published port %d is occupied", a.registration.NodeID, *port),
+			Message: fmt.Sprintf("node %s could not reserve Fabric published port %d", a.registration.NodeID, *port),
 		}
 	}
-	_ = listener.Close()
-	return nil
+	return listener, nil
 }
 
 // Status returns an agent-local lifecycle and occupancy snapshot. It does not

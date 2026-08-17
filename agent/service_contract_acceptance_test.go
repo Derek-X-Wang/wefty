@@ -118,6 +118,9 @@ type serviceContractRunner struct {
 }
 
 func (runner *serviceContractRunner) Run(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
 	runner.called = true
 	runner.calls++
 	runner.executablePath = request.Execution.Executable.Path

@@ -5,6 +5,7 @@ package serviceacceptance
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -22,15 +22,13 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-const servicePortEnvironment = "WEFTY_SERVICE_PORT"
-
 func TestServiceRestartsAfterSuccessfulProcessExit(t *testing.T) {
 	harness := newAcceptanceHarness(t)
 	port := reservePort(t)
 	job := harness.submitEchoService(t, port)
 
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	client := &http.Client{Timeout: 5 * time.Second}
+	baseURL := "http://published-service.invalid"
+	client := harness.publishedHTTPClient(t, port)
 	health := waitForHealth(t, client, baseURL, harness.agent)
 	running := harness.waitForJobState(t, job.JobID, contract.JobRunning, 5*time.Second)
 	if running.CurrentAttemptID == "" {
@@ -39,10 +37,13 @@ func TestServiceRestartsAfterSuccessfulProcessExit(t *testing.T) {
 	if health.PID == harness.agent.command.Process.Pid {
 		t.Fatalf("health PID = agent PID %d; payload was not a distinct child process", health.PID)
 	}
+	if health.ListeningPort <= 0 || health.ListeningPort == port {
+		t.Fatalf("payload listening port = %d, want injected backend distinct from published port %d", health.ListeningPort, port)
+	}
 	assertManagedServiceLayout(t, harness, running, health.ServiceDirectory)
 
 	assertEcho(t, client, baseURL, []byte("echo acceptance"))
-	assertGracefulShutdown(t, baseURL, health.PID, harness.agent)
+	assertGracefulShutdown(t, harness, port, health.PID, harness.agent)
 	restarted := waitForFreshRunningAttempt(t, harness, job.JobID, running.CurrentAttemptID, 5*time.Second)
 	restartedHealth := waitForHealth(t, client, baseURL, harness.agent)
 	if restartedHealth.PID == health.PID {
@@ -89,8 +90,8 @@ func TestGuardianReapsPayloadWhenAgentIsSIGKILLed(t *testing.T) {
 	port := reservePort(t)
 	job := harness.submitEchoService(t, port)
 
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	health := waitForHealth(t, &http.Client{Timeout: time.Second}, baseURL, harness.agent)
+	baseURL := "http://published-service.invalid"
+	health := waitForHealth(t, harness.publishedHTTPClient(t, port), baseURL, harness.agent)
 	harness.waitForJobState(t, job.JobID, contract.JobRunning, 5*time.Second)
 	started := time.Now()
 	harness.agent.kill(t)
@@ -108,59 +109,20 @@ func TestGuardianReapsPayloadWhenAgentIsSIGKILLed(t *testing.T) {
 	}
 }
 
-func TestPublishedPortPreflightLatchesFailureWithoutKillingOwner(t *testing.T) {
+func TestPortlessServiceSkipsReadinessAndKeepsRunning(t *testing.T) {
 	harness := newAcceptanceHarness(t)
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	job := harness.submitPortlessService(t)
+	running := harness.waitForJobState(t, job.JobID, contract.JobRunning, 5*time.Second)
+	if running.PublishedPort != nil || running.Ready != nil || running.CurrentAttemptID == "" {
+		t.Fatalf("portless projection = port %v ready %v attempt %q", running.PublishedPort, running.Ready, running.CurrentAttemptID)
 	}
-	defer listener.Close()
-	port := listener.Addr().(*net.TCPAddr).Port
-	job := harness.submitEchoService(t, port)
-	failed := harness.waitForJobState(t, job.JobID, contract.JobFailed, 5*time.Second)
-
-	var failure struct {
-		Code          contract.SpawnFailureCode `json:"code"`
-		NodeID        string                    `json:"node_id"`
-		PublishedPort int                       `json:"published_port"`
-	}
-	if err := json.Unmarshal(failed.LastFailure, &failure); err != nil {
-		t.Fatalf("decode last_failure %s: %v", failed.LastFailure, err)
-	}
-	if failure.Code != contract.SpawnFailurePublishedPortOccupied ||
-		failure.NodeID != "acceptance-node" || failure.PublishedPort != port {
-		t.Fatalf("last_failure = %#v, want occupied port with node and port", failure)
-	}
-	var failureFields map[string]json.RawMessage
-	if err := json.Unmarshal(failed.LastFailure, &failureFields); err != nil {
-		t.Fatal(err)
-	}
-	for field := range failureFields {
-		if strings.Contains(field, "owner") {
-			t.Fatalf("last_failure guessed an owner in field %q: %s", field, failed.LastFailure)
-		}
-	}
-	if failed.DesiredState != contract.ServiceDesiredRunning || failed.RestartStreak != 0 ||
-		failed.LifetimeRestartCount != 0 || failed.RestartPending(contract.JobFailed, time.Now()) {
-		t.Fatalf("failed service consumed restart budget or changed intent: %#v", failed.ServiceJob)
-	}
-	serviceRoot := filepath.Join(
-		harness.managedRoot, "agent", "nodes", managedroot.EncodeID("acceptance-node"),
-		"services", managedroot.EncodeID(job.JobID),
-	)
-	var ownership managedroot.OwnershipManifest
-	readJSONFile(t, filepath.Join(serviceRoot, managedroot.OwnershipManifestName), &ownership)
-	if ownership.JobID != job.JobID || ownership.RemovalGeneration != 1 {
-		t.Fatalf("failed service ownership manifest = %#v", ownership)
+	time.Sleep(750 * time.Millisecond)
+	stillRunning := harness.waitForJobState(t, job.JobID, contract.JobRunning, time.Second)
+	if stillRunning.CurrentAttemptID != running.CurrentAttemptID {
+		t.Fatalf("portless service restarted without process death: before %q after %q", running.CurrentAttemptID, stillRunning.CurrentAttemptID)
 	}
 	assertHandoffRootEmpty(t, harness.handoffRoot)
 	assertWorkingDirectoryUntouched(t, harness.workingDirectories[job.JobID])
-
-	connection, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
-	if err != nil {
-		t.Fatalf("published-port owner was disturbed: %v", err)
-	}
-	_ = connection.Close()
 }
 
 func reservePort(t *testing.T) int {
@@ -218,6 +180,7 @@ func waitForHealth(
 type serviceHealth struct {
 	PID              int    `json:"pid"`
 	ServiceDirectory string `json:"service_directory"`
+	ListeningPort    int    `json:"listening_port"`
 }
 
 func assertManagedServiceLayout(t *testing.T, harness *acceptanceHarness, job l1.Job, serviceDirectory string) {
@@ -309,12 +272,15 @@ func assertEcho(t *testing.T, client *http.Client, baseURL string, payload []byt
 
 func assertGracefulShutdown(
 	t *testing.T,
-	baseURL string,
+	harness *acceptanceHarness,
+	port int,
 	payloadPID int,
 	agent *managedProcess,
 ) {
 	t.Helper()
-	connection, err := net.DialTimeout("tcp", strings.TrimPrefix(baseURL, "http://"), 5*time.Second)
+	dialContext, cancelDial := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelDial()
+	connection, err := harness.dialPublished(dialContext, port)
 	if err != nil {
 		t.Fatalf("connect streaming echo request: %v", err)
 	}

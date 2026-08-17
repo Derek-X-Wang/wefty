@@ -25,11 +25,12 @@ func TestClassPoolsRunAtCapacityAndIsolateSiblings(t *testing.T) {
 	}
 
 	serviceClients := []*http.Client{
-		{Timeout: time.Second},
-		{Timeout: time.Second},
+		harness.publishedHTTPClient(t, ports[0]),
+		harness.publishedHTTPClient(t, ports[1]),
 	}
-	healthA := waitForHealth(t, serviceClients[0], fmt.Sprintf("http://127.0.0.1:%d", ports[0]), harness.agent)
-	healthB := waitForHealth(t, serviceClients[1], fmt.Sprintf("http://127.0.0.1:%d", ports[1]), harness.agent)
+	serviceURLs := []string{"http://service-a.invalid", "http://service-b.invalid"}
+	healthA := waitForHealth(t, serviceClients[0], serviceURLs[0], harness.agent)
+	healthB := waitForHealth(t, serviceClients[1], serviceURLs[1], harness.agent)
 	runningA := harness.waitForJobState(t, services[0].JobID, contract.JobRunning, 5*time.Second)
 	harness.waitForJobState(t, services[1].JobID, contract.JobRunning, 5*time.Second)
 	assertJobRemainsQueued(t, harness, services[2].JobID, 300*time.Millisecond)
@@ -43,16 +44,16 @@ func TestClassPoolsRunAtCapacityAndIsolateSiblings(t *testing.T) {
 	if err := syscall.Kill(healthA.PID, syscall.SIGKILL); err != nil {
 		t.Fatalf("kill first service payload: %v", err)
 	}
-	assertEcho(t, serviceClients[1], fmt.Sprintf("http://127.0.0.1:%d", ports[1]), []byte("sibling survived"))
+	assertEcho(t, serviceClients[1], serviceURLs[1], []byte("sibling survived"))
 	if harness.agent.exited() {
 		t.Fatalf("agent exited after one service payload was killed: %v\n%s", harness.agent.waitError(), harness.agent.outputString())
 	}
-	if current := waitForHealth(t, serviceClients[1], fmt.Sprintf("http://127.0.0.1:%d", ports[1]), harness.agent); current.PID != healthB.PID {
+	if current := waitForHealth(t, serviceClients[1], serviceURLs[1], harness.agent); current.PID != healthB.PID {
 		t.Fatalf("unaffected service PID = %d, want original sibling PID %d", current.PID, healthB.PID)
 	}
 
 	restarted := waitForFreshRunningAttempt(t, harness, services[0].JobID, runningA.CurrentAttemptID, 8*time.Second)
-	restartedHealth := waitForHealth(t, serviceClients[0], fmt.Sprintf("http://127.0.0.1:%d", ports[0]), harness.agent)
+	restartedHealth := waitForHealth(t, serviceClients[0], serviceURLs[0], harness.agent)
 	if restarted.CurrentAttemptID == runningA.CurrentAttemptID || restartedHealth.PID == healthA.PID {
 		t.Fatalf("killed service did not restart under a fresh attempt and payload: attempt=%q pid=%d", restarted.CurrentAttemptID, restartedHealth.PID)
 	}

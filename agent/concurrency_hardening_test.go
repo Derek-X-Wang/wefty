@@ -213,6 +213,9 @@ func assertSerialLogfContainsConcurrentCallers(t *testing.T) {
 type concurrencyOutputRunner struct{}
 
 func (concurrencyOutputRunner) Run(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
 	if err := sink.WriteOutput(ctx, contract.LogEvent{
 		AttemptID: request.AttemptID, Stream: contract.LogStdout, Bytes: []byte(request.AttemptID),
 	}); err != nil {

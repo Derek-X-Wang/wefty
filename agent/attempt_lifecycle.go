@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -36,21 +37,22 @@ func (disabledAttemptWatch) Check() error           { return nil }
 func (disabledAttemptWatch) Stop()                  {}
 
 type attemptLifecycleDependencies struct {
-	client            *Client
-	runner            ProcessRunner
-	outbox            *evidenceOutbox
-	watchdog          attemptWatchdog
-	clock             Clock
-	renewalInterval   time.Duration
-	completionRetry   time.Duration
-	outputSinkFactory OutputSinkFactory
-	managedResource   managedResourceManager
-	handoffs          *handoffManager
-	nodeID            string
-	workflowBridge    func(context.Context, contract.ExecutionSpec) (*workflowBridge, error)
-	logf              func(string, ...any)
-	observer          *lifecycleObserver
-	preflight         func(l1.Claim) *contract.SpawnFailure
+	client                 *Client
+	runner                 ProcessRunner
+	outbox                 *evidenceOutbox
+	watchdog               attemptWatchdog
+	clock                  Clock
+	renewalInterval        time.Duration
+	completionRetry        time.Duration
+	outputSinkFactory      OutputSinkFactory
+	managedResource        managedResourceManager
+	handoffs               *handoffManager
+	nodeID                 string
+	workflowBridge         func(context.Context, contract.ExecutionSpec) (*workflowBridge, error)
+	logf                   func(string, ...any)
+	observer               *lifecycleObserver
+	reservePublishedPort   func(l1.Claim) (net.Listener, *contract.SpawnFailure)
+	prepareServiceEndpoint func(context.Context) (serviceRuntimeEndpoint, error)
 }
 
 // attemptLifecycle owns one attempt from renewal startup through process/log
@@ -140,7 +142,9 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 
 	completed := make(chan runOutcome, 1)
 	go func() {
-		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptRunning, nil)
+		if claim.Job.Spec.Class == contract.JobClassOneShot {
+			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptRunning, nil)
+		}
 		result, err := lifecycle.runProcess(executionContext, claim)
 		var durabilityErr error
 		if lifecycle.dependencies.outbox != nil {
@@ -295,6 +299,9 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 	}
 	executionSpec := claim.Job.Spec.Execution
 	runtimeDirectory := ""
+	var publishedListener net.Listener
+	var endpoint serviceRuntimeEndpoint
+	portfulService := claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.PublishedPort != nil
 	if claim.Job.Spec.Class == contract.JobClassService {
 		if lifecycle.dependencies.managedResource == nil {
 			err := errors.New("managed resource is not configured for service jobs")
@@ -311,10 +318,37 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 		executionSpec.Env[contract.EnvServiceDir] = resource.dataDirectory
 		runtimeDirectory = resource.runtimeDirectory
 	}
-	if lifecycle.dependencies.preflight != nil {
-		if failure := lifecycle.dependencies.preflight(claim); failure != nil {
+	if portfulService {
+		if lifecycle.dependencies.reservePublishedPort == nil {
+			err := errors.New("published-port reservation is not configured")
+			return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+		}
+		var failure *contract.SpawnFailure
+		publishedListener, failure = lifecycle.dependencies.reservePublishedPort(claim)
+		if failure != nil {
 			return contract.ProcessResult{SpawnError: failure}, nil
 		}
+		if publishedListener == nil {
+			err := errors.New("published-port reservation returned no listener")
+			return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+		}
+		defer publishedListener.Close()
+		if lifecycle.dependencies.prepareServiceEndpoint == nil {
+			err := errors.New("service runtime endpoint adapter is not configured")
+			return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+		}
+		var err error
+		endpoint, err = lifecycle.dependencies.prepareServiceEndpoint(ctx)
+		if err != nil {
+			return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+		}
+		executionSpec.Env = cloneEnvironment(executionSpec.Env)
+		executionSpec.SensitiveEnv = cloneEnvironment(executionSpec.SensitiveEnv)
+		for name, value := range endpoint.environment {
+			delete(executionSpec.SensitiveEnv, name)
+			executionSpec.Env[name] = value
+		}
+		lifecycle.dependencies.observer.configurePortfulAttempt(claim.Lease.AttemptID)
 	}
 	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
 		if err := lifecycle.dependencies.handoffs.prepare(claim.Job.Spec, lifecycle.dependencies.nodeID); err != nil {
@@ -379,13 +413,29 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 	if claim.Job.Spec.Class == contract.JobClassService {
 		idlePolicy = processrunner.IgnoreIdle
 	}
-	result, runErr := lifecycle.dependencies.runner.Run(ctx, processrunner.Request{
+	request := processrunner.Request{
 		AttemptID:  claim.Lease.AttemptID,
 		Class:      claim.Job.Spec.Class,
 		Execution:  execution,
 		Limits:     claim.Job.Spec.Limits,
 		IdlePolicy: idlePolicy,
-	}, sink)
+	}
+	if claim.Job.Spec.Class == contract.JobClassService && !portfulService {
+		request.Started = func() {
+			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptRunning, nil)
+		}
+	}
+	var result contract.ProcessResult
+	var runErr error
+	if portfulService {
+		result, runErr = runPortfulService(ctx, lifecycle.dependencies.runner, request, sink, publishedListener, endpoint, serviceSupervisorConfig{
+			onReadiness: func(startupSatisfied, ready bool) {
+				lifecycle.dependencies.observer.setServiceReadiness(claim.Lease.AttemptID, startupSatisfied, ready)
+			},
+		})
+	} else {
+		result, runErr = lifecycle.dependencies.runner.Run(ctx, request, sink)
+	}
 	var outputErr error
 	if redactingSink != nil {
 		outputErr = redactingSink.Flush(ctx)

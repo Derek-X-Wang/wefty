@@ -15,6 +15,7 @@ const (
 	EnvRunToken        = "WEFTY_RUN_TOKEN"
 	EnvHandoffDir      = "WEFTY_HANDOFF_DIR"
 	EnvServiceDir      = "WEFTY_SERVICE_DIR"
+	EnvServicePort     = "WEFTY_SERVICE_PORT"
 	DefaultHandoffRoot = "/tmp/wefty/handoffs"
 
 	// StableNodeTagPrefix reserves the routing tag used when a cold rerun

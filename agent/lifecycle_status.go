@@ -29,6 +29,7 @@ type AttemptLifecycleState string
 const (
 	AttemptStarting   AttemptLifecycleState = "starting"
 	AttemptRunning    AttemptLifecycleState = "running"
+	AttemptServing    AttemptLifecycleState = "serving"
 	AttemptReaping    AttemptLifecycleState = "reaping"
 	AttemptFinalizing AttemptLifecycleState = "finalizing"
 )
@@ -55,6 +56,10 @@ type AttemptStatus struct {
 	Class     string                `json:"class"`
 	State     AttemptLifecycleState `json:"state"`
 	LastError string                `json:"last_error,omitempty"`
+	// StartupSatisfied and Ready apply only to portful service attempts. The
+	// former is monotonic; the latter follows current local forwarding.
+	StartupSatisfied *bool `json:"startup_satisfied,omitempty"`
+	Ready            *bool `json:"ready,omitempty"`
 }
 
 // Status is a point-in-time, process-local health projection. SessionBackoff
@@ -130,6 +135,49 @@ func (observer *lifecycleObserver) setAttempt(attemptID string, state AttemptLif
 		if err != nil {
 			status.LastError = err.Error()
 			observer.recordSemanticLocked(err)
+		}
+		observer.attempts[attemptID] = status
+	}
+	observer.mu.Unlock()
+}
+
+func (observer *lifecycleObserver) configurePortfulAttempt(attemptID string) {
+	if observer == nil {
+		return
+	}
+	observer.mu.Lock()
+	status, ok := observer.attempts[attemptID]
+	if ok {
+		startupSatisfied := false
+		ready := false
+		status.StartupSatisfied = &startupSatisfied
+		status.Ready = &ready
+		observer.attempts[attemptID] = status
+	}
+	observer.mu.Unlock()
+}
+
+func (observer *lifecycleObserver) setServiceReadiness(attemptID string, startupSatisfied, ready bool) {
+	if observer == nil {
+		return
+	}
+	observer.mu.Lock()
+	status, ok := observer.attempts[attemptID]
+	if ok {
+		if status.StartupSatisfied == nil {
+			initial := false
+			status.StartupSatisfied = &initial
+		}
+		if startupSatisfied && !*status.StartupSatisfied {
+			value := true
+			status.StartupSatisfied = &value
+		}
+		readyValue := ready
+		status.Ready = &readyValue
+		if ready {
+			status.State = AttemptServing
+		} else if *status.StartupSatisfied {
+			status.State = AttemptRunning
 		}
 		observer.attempts[attemptID] = status
 	}
