@@ -24,6 +24,26 @@ var JobTransitions = map[JobState][]JobState{
 	JobFailed:        {},
 }
 
+// ServiceJobTransitions is the observed-state machine for service-class jobs.
+// It is deliberately separate from JobTransitions: automatic requeue and
+// operator restart are service lifecycle semantics and must never make a
+// one-shot terminal state resumable.
+var ServiceJobTransitions = map[JobState][]JobState{
+	JobQueued:   {JobClaimed, JobStopped, JobFailed},
+	JobClaimed:  {JobRunning, JobStopping, JobQueued, JobFailed},
+	JobRunning:  {JobStopping, JobQueued, JobFailed},
+	JobStopping: {JobStopped, JobFailed},
+	JobStopped:  {JobQueued},
+	JobFailed:   {JobQueued},
+}
+
+type ServiceDesiredState string
+
+const (
+	ServiceDesiredRunning ServiceDesiredState = "running"
+	ServiceDesiredStopped ServiceDesiredState = "stopped"
+)
+
 type AttemptState string
 
 const (

@@ -8,6 +8,9 @@ func TestStateTransitionTablesCoverAllStates(t *testing.T) {
 	assertStates(t, JobTransitions, []JobState{
 		JobQueued, JobClaimed, JobRunning, JobStopping, JobStopped, JobAwaitingInput, JobSucceeded, JobFailed,
 	})
+	assertStates(t, ServiceJobTransitions, []JobState{
+		JobQueued, JobClaimed, JobRunning, JobStopping, JobStopped, JobFailed,
+	})
 	assertStates(t, AttemptTransitions, []AttemptState{
 		AttemptClaimed, AttemptRunning, AttemptAwaitingInput, AttemptSucceeded, AttemptFailed, AttemptLost,
 	})
@@ -33,6 +36,18 @@ func TestStateTransitionRules(t *testing.T) {
 	}
 	if CanTransition(JobTransitions, JobSucceeded, JobRunning) {
 		t.Fatal("succeeded job must be terminal")
+	}
+	if !CanTransition(ServiceJobTransitions, JobRunning, JobQueued) {
+		t.Fatal("running service must be able to requeue for restart")
+	}
+	if !CanTransition(ServiceJobTransitions, JobFailed, JobQueued) {
+		t.Fatal("failed service must be restartable by explicit operator intent")
+	}
+	if CanTransition(JobTransitions, JobRunning, JobQueued) || CanTransition(JobTransitions, JobFailed, JobQueued) {
+		t.Fatal("service restart transitions must not leak into the one-shot state machine")
+	}
+	if _, persisted := ServiceJobTransitions[JobState("restart-pending")]; persisted {
+		t.Fatal("restart-pending is a computed projection, not a persisted state")
 	}
 }
 

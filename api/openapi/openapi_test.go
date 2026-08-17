@@ -157,6 +157,16 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	if !spawnRequired["code"] || !spawnRequired["message"] {
 		t.Fatal("SpawnFailure must carry stable code and diagnostic message")
 	}
+	job := object(t, schemas["Job"], "Job")
+	jobProperties := object(t, job["properties"], "Job.properties")
+	for _, field := range []string{
+		"desired_state", "bound_node_id", "restart_streak", "lifetime_restart_count",
+		"next_restart_at", "published_port", "last_failure", "healthy_since_at", "published_attempt_id",
+	} {
+		if _, ok := jobProperties[field]; !ok {
+			t.Errorf("Job response missing service-only %s", field)
+		}
+	}
 
 	nodeRegistration := object(t, schemas["NodeRegistration"], "NodeRegistration")
 	properties := object(t, nodeRegistration["properties"], "NodeRegistration.properties")

@@ -304,6 +304,16 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON
 	if _, err := tx.ExecContext(ctx, "INSERT INTO job_log_jsonl(job_id, jsonl) VALUES(?, ?)", job.JobID, []byte{}); err != nil {
 		return Job{}, false, internalError(err, "initialize authoritative job log")
 	}
+	if spec.Class == contract.JobClassService {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO service_jobs(job_id, desired_state, published_port)
+			VALUES(?, ?, ?)`, job.JobID, contract.ServiceDesiredRunning, spec.PublishedPort); err != nil {
+			return Job{}, false, internalError(err, "initialize service job")
+		}
+		job.ServiceJob = &ServiceJob{
+			DesiredState:  contract.ServiceDesiredRunning,
+			PublishedPort: spec.PublishedPort,
+		}
+	}
 	for _, tag := range spec.RoutingTags {
 		if _, err := tx.ExecContext(ctx, "INSERT INTO job_tags(job_id, tag) VALUES(?, ?)", job.JobID, tag); err != nil {
 			return Job{}, false, internalError(err, "store job routing tags")
@@ -1330,14 +1340,21 @@ func getJobByDispatchKey(ctx context.Context, q queryer, dispatchKey string) (Jo
 	var currentAttempt sql.NullString
 	var createdNS, updatedNS int64
 	var requestHash string
-	err := q.QueryRowContext(ctx, `SELECT job_id,
+	var serviceColumns serviceJobColumns
+	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
-state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash
-FROM jobs WHERE dispatch_key=?`, dispatchKey).Scan(&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash)
+state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash,
+service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
+service_jobs.lifetime_restart_count, service_jobs.next_restart_at, service_jobs.published_port,
+service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id
+FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
+WHERE jobs.dispatch_key=?`, dispatchKey).Scan(append([]any{
+		&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash,
+	}, serviceColumns.scanDestinations()...)...)
 	if err != nil {
 		return Job{}, "", err
 	}
-	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS); err != nil {
+	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns); err != nil {
 		return Job{}, "", err
 	}
 	return job, requestHash, nil
@@ -1348,20 +1365,27 @@ func getJobByID(ctx context.Context, q queryer, jobID string) (Job, error) {
 	var specJSON []byte
 	var currentAttempt sql.NullString
 	var createdNS, updatedNS int64
-	err := q.QueryRowContext(ctx, `SELECT job_id,
+	var serviceColumns serviceJobColumns
+	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
-state, spec_json, current_attempt_id, created_ns, updated_ns
-FROM jobs WHERE job_id=?`, jobID).Scan(&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS)
+state, spec_json, current_attempt_id, created_ns, updated_ns,
+service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
+service_jobs.lifetime_restart_count, service_jobs.next_restart_at, service_jobs.published_port,
+service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id
+FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
+WHERE jobs.job_id=?`, jobID).Scan(append([]any{
+		&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS,
+	}, serviceColumns.scanDestinations()...)...)
 	if err != nil {
 		return Job{}, err
 	}
-	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS); err != nil {
+	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns); err != nil {
 		return Job{}, err
 	}
 	return job, nil
 }
 
-func populateJob(job *Job, specJSON []byte, currentAttempt sql.NullString, createdNS, updatedNS int64) error {
+func populateJob(job *Job, specJSON []byte, currentAttempt sql.NullString, createdNS, updatedNS int64, serviceColumns serviceJobColumns) error {
 	if err := json.Unmarshal(specJSON, &job.Spec); err != nil {
 		return err
 	}
@@ -1370,6 +1394,7 @@ func populateJob(job *Job, specJSON []byte, currentAttempt sql.NullString, creat
 	}
 	job.CreatedAt = time.Unix(0, createdNS).UTC()
 	job.UpdatedAt = time.Unix(0, updatedNS).UTC()
+	job.ServiceJob = serviceColumns.projection()
 	return nil
 }
 
