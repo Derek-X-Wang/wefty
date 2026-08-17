@@ -12,26 +12,28 @@ import (
 )
 
 type attemptWatchdog interface {
-	Start(context.Context, l1.AttemptLease) attemptWatch
+	Start(context.Context, localAuthority, context.CancelCauseFunc) attemptWatch
 }
 
 type attemptWatch interface {
-	Renewed(l1.AttemptLease)
+	Renewed(localAuthority)
 	Failures() <-chan error
+	Check() error
 	Stop()
 }
 
 type disabledAttemptWatchdog struct{}
 
-func (disabledAttemptWatchdog) Start(context.Context, l1.AttemptLease) attemptWatch {
+func (disabledAttemptWatchdog) Start(context.Context, localAuthority, context.CancelCauseFunc) attemptWatch {
 	return disabledAttemptWatch{}
 }
 
 type disabledAttemptWatch struct{}
 
-func (disabledAttemptWatch) Renewed(l1.AttemptLease) {}
-func (disabledAttemptWatch) Failures() <-chan error  { return nil }
-func (disabledAttemptWatch) Stop()                   {}
+func (disabledAttemptWatch) Renewed(localAuthority) {}
+func (disabledAttemptWatch) Failures() <-chan error { return nil }
+func (disabledAttemptWatch) Check() error           { return nil }
+func (disabledAttemptWatch) Stop()                  {}
 
 type attemptLifecycleDependencies struct {
 	client            *Client
@@ -46,6 +48,7 @@ type attemptLifecycleDependencies struct {
 	nodeID            string
 	workflowBridge    func(context.Context, contract.ExecutionSpec) (*workflowBridge, error)
 	logf              func(string, ...any)
+	observer          *lifecycleObserver
 }
 
 // attemptLifecycle owns one attempt from renewal startup through process/log
@@ -68,24 +71,29 @@ type runOutcome struct {
 	err    error
 }
 
-func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim) (errorDestination, error) {
-	attemptContext, cancelAttempt := context.WithCancel(ctx)
-	defer cancelAttempt()
+func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
+	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
+	defer cancelAttempt(nil)
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()
+	attemptID := claim.Lease.AttemptID
+	lifecycle.dependencies.observer.beginAttempt(attemptID, claim.Job.JobID, claim.Job.Spec.Class)
+	defer lifecycle.dependencies.observer.finishAttempt(attemptID)
 
-	watch := lifecycle.dependencies.watchdog.Start(attemptContext, claim.Lease)
+	authority := localAuthority{deadline: claimStarted.Add(claim.Lease.LeaseTTL)}
+	watch := lifecycle.dependencies.watchdog.Start(attemptContext, authority, cancelAttempt)
 	defer watch.Stop()
 
 	renewalErrors := make(chan destinationError, 1)
 	renewalDone := make(chan struct{})
 	go func() {
 		defer close(renewalDone)
-		lifecycle.renewalLoop(attemptContext, claim, renewalErrors, watch.Renewed)
+		lifecycle.renewalLoop(attemptContext, claim, authority, renewalErrors, watch)
 	}()
 
 	completed := make(chan runOutcome, 1)
 	go func() {
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptRunning, nil)
 		result, err := lifecycle.runProcess(executionContext, claim)
 		completed <- runOutcome{result: result, err: err}
 	}()
@@ -93,23 +101,32 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim) 
 	var outcome runOutcome
 	select {
 	case <-ctx.Done():
-		cancelAttempt()
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, ctx.Err())
+		cancelAttempt(ctx.Err())
 		<-completed
 		<-renewalDone
 		return errorDestinationUnclassified, ctx.Err()
 	case failure := <-renewalErrors:
-		cancelAttempt()
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, failure.err)
+		cancelAttempt(failure.err)
 		<-completed
 		<-renewalDone
 		return failure.destination, fmt.Errorf("agent: renew lease: %w", failure.err)
 	case err := <-watch.Failures():
-		cancelAttempt()
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, err)
+		cancelAttempt(err)
 		<-completed
 		<-renewalDone
-		return errorDestinationUnclassified, fmt.Errorf("agent: authority watchdog: %w", err)
+		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", err)
 	case outcome = <-completed:
 		cancelExecution()
 	}
+	if cause := context.Cause(attemptContext); errors.Is(cause, errAuthorityDeadlineExceeded) {
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
+		<-renewalDone
+		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", cause)
+	}
+	lifecycle.dependencies.observer.setAttempt(attemptID, AttemptFinalizing, outcome.err)
 
 	if outcome.err != nil {
 		lifecycle.log("attempt %s execution: %v", claim.Lease.AttemptID, outcome.err)
@@ -124,21 +141,32 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim) 
 	var completionFailure destinationError
 	select {
 	case completionFailure = <-completionDone:
-		cancelAttempt()
+		cancelAttempt(nil)
 	case renewalFailure := <-renewalErrors:
-		cancelAttempt()
+		cancelAttempt(renewalFailure.err)
 		completionFailure = <-completionDone
 		<-renewalDone
 		if completionFailure.err != nil {
 			return renewalFailure.destination, fmt.Errorf("agent: renew lease while completing: %w", renewalFailure.err)
 		}
+	case err := <-watch.Failures():
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, err)
+		cancelAttempt(err)
+		<-completionDone
+		<-renewalDone
+		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog while completing: %w", err)
 	case <-ctx.Done():
-		cancelAttempt()
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, ctx.Err())
+		cancelAttempt(ctx.Err())
 		<-completionDone
 		<-renewalDone
 		return errorDestinationUnclassified, ctx.Err()
 	}
 	<-renewalDone
+	if cause := context.Cause(attemptContext); errors.Is(cause, errAuthorityDeadlineExceeded) {
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
+		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog while completing: %w", cause)
+	}
 	if completionFailure.err != nil {
 		return completionFailure.destination, fmt.Errorf("agent: complete attempt: %w", completionFailure.err)
 	}
@@ -257,9 +285,9 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 	return result, errors.Join(runErr, finalizationErr)
 }
 
-func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Claim, failures chan<- destinationError, renewed func(l1.AttemptLease)) {
+func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Claim, authority localAuthority, failures chan<- destinationError, watch attemptWatch) {
 	lease := claim.Lease
-	nextDelay := renewalDelay(lifecycle.dependencies.clock.Now(), lease.LeaseExpires, lifecycle.dependencies.renewalInterval)
+	nextDelay := renewalDelay(authority.deadline.Sub(lifecycle.dependencies.clock.Now()), lifecycle.dependencies.renewalInterval)
 	for {
 		timer := lifecycle.dependencies.clock.NewTimer(nextDelay)
 		select {
@@ -268,15 +296,31 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 			return
 		case <-timer.C():
 		}
-		updated, err := lifecycle.dependencies.client.Renew(ctx, claim.Job.JobID, lease.AttemptID, lease.FencingToken)
+		if err := watch.Check(); err != nil {
+			return
+		}
+		requestStarted := lifecycle.dependencies.clock.Now()
+		remaining := authority.deadline.Sub(requestStarted)
+		if remaining <= 0 {
+			return
+		}
+		timeout := renewalRequestTimeout(remaining, lifecycle.dependencies.client.operationTimeout)
+		if timeout <= 0 {
+			return
+		}
+		renewContext, cancelRenew := context.WithTimeout(ctx, timeout)
+		updated, err := lifecycle.dependencies.client.Renew(renewContext, claim.Job.JobID, lease.AttemptID, lease.FencingToken)
+		cancelRenew()
 		if err != nil {
 			classification := classifyAgentProtocolError(err)
 			if classification.destination == errorDestinationTransient {
-				remaining := lease.LeaseExpires.Sub(lifecycle.dependencies.clock.Now())
+				remaining := authority.deadline.Sub(lifecycle.dependencies.clock.Now())
 				if remaining > 0 {
 					nextDelay = min(lifecycle.dependencies.completionRetry, remaining)
 					continue
 				}
+				_ = watch.Check()
+				return
 			}
 			select {
 			case failures <- destinationError{destination: classification.destination, err: err}:
@@ -285,8 +329,9 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 			return
 		}
 		lease = updated
-		renewed(lease)
-		nextDelay = renewalDelay(lifecycle.dependencies.clock.Now(), lease.LeaseExpires, lifecycle.dependencies.renewalInterval)
+		authority = localAuthority{deadline: requestStarted.Add(updated.LeaseTTL)}
+		watch.Renewed(authority)
+		nextDelay = renewalDelay(authority.deadline.Sub(lifecycle.dependencies.clock.Now()), lifecycle.dependencies.renewalInterval)
 	}
 }
 
@@ -300,8 +345,8 @@ func spawnFailure(code contract.SpawnFailureCode, err error) contract.ProcessRes
 	return contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: code, Message: err.Error()}}
 }
 
-func renewalDelay(now, expires time.Time, configured time.Duration) time.Duration {
-	halfRemaining := expires.Sub(now) / 2
+func renewalDelay(remaining, configured time.Duration) time.Duration {
+	halfRemaining := remaining / 2
 	if halfRemaining <= 0 {
 		return time.Millisecond
 	}
@@ -309,6 +354,17 @@ func renewalDelay(now, expires time.Time, configured time.Duration) time.Duratio
 		return configured
 	}
 	return halfRemaining
+}
+
+func renewalRequestTimeout(remaining, operationTimeout time.Duration) time.Duration {
+	timeout := remaining / 2
+	if operationTimeout < timeout {
+		timeout = operationTimeout
+	}
+	if timeout <= 0 {
+		return 0
+	}
+	return timeout
 }
 
 func toL1Result(result contract.ProcessResult) l1.ProcessResult {

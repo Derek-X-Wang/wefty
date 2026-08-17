@@ -34,6 +34,7 @@ type destinationErrorPolicy func(errorDestination, error) error
 // that destination propagates or absorbs the error.
 type classAdmissionGate interface {
 	execute(context.Context, attemptExecution, destinationErrorPolicy) (bool, error)
+	occupancy() ClassOccupancy
 }
 
 type admissionPolicy struct {
@@ -82,4 +83,10 @@ func (gate *admissionGate) release() {
 	gate.mu.Lock()
 	gate.occupied--
 	gate.mu.Unlock()
+}
+
+func (gate *admissionGate) occupancy() ClassOccupancy {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	return ClassOccupancy{Occupied: gate.occupied, Limit: gate.policy.limit}
 }
