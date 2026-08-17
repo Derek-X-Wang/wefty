@@ -119,6 +119,20 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	if _, selfReported := properties["tags"]; selfReported {
 		t.Fatal("NodeRegistration must not accept self-reported tags")
 	}
+	for _, field := range []string{"max_oneshot_slots", "max_service_slots"} {
+		if _, selfReported := properties[field]; selfReported {
+			t.Fatalf("NodeRegistration must not accept self-reported %s", field)
+		}
+	}
+	node := object(t, schemas["Node"], "Node")
+	nodeParts := node["allOf"].([]any)
+	nodeProjection := object(t, nodeParts[1], "Node.allOf[1]")
+	nodeProperties := object(t, nodeProjection["properties"], "Node.properties")
+	for _, field := range []string{"max_oneshot_slots", "max_service_slots"} {
+		if _, ok := nodeProperties[field]; !ok {
+			t.Errorf("Node response missing authoritative %s", field)
+		}
+	}
 }
 
 func TestL1RouteGroupsUseFabricIdentity(t *testing.T) {

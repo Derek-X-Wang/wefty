@@ -130,23 +130,34 @@
           "agent_version": { "type": "string" },
           "capabilities": {
             "type": "object",
-            "additionalProperties": { "type": "boolean" }
+            "additionalProperties": { "type": "boolean" },
+            "description": "Executable support only. max_oneshot_slots and max_service_slots are reserved control-plane policy keys and are rejected."
           }
         },
-        "description": "No tags field is accepted. Authoritative tags come from authenticated Fabric identity and operator configuration."
+        "description": "No tags or capacity fields are accepted. Eligibility policy comes from operator-owned control-plane configuration."
       },
       "Node": {
         "allOf": [
           { "$ref": "#/components/schemas/NodeRegistration" },
           {
             "type": "object",
-            "required": ["state", "authoritative_tags", "last_heartbeat_at"],
+            "required": ["state", "authoritative_tags", "max_oneshot_slots", "max_service_slots", "last_heartbeat_at"],
             "properties": {
               "state": { "enum": ["alive", "stale", "draining", "dead"] },
               "authoritative_tags": {
                 "type": "array",
                 "items": { "type": "string" },
                 "uniqueItems": true,
+                "readOnly": true
+              },
+              "max_oneshot_slots": {
+                "type": "integer",
+                "minimum": 0,
+                "readOnly": true
+              },
+              "max_service_slots": {
+                "type": "integer",
+                "minimum": 0,
                 "readOnly": true
               },
               "last_heartbeat_at": { "type": "string", "format": "date-time" }

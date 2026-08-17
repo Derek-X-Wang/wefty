@@ -14,6 +14,8 @@ const (
 	DefaultNodeStaleAfter     = 45 * time.Second
 	DefaultNodeDeadAfter      = 2 * time.Minute
 	DefaultReconcileInterval  = time.Second
+	DefaultMaxOneshotSlots    = 4
+	DefaultMaxServiceSlots    = 2
 )
 
 // Clock supplies all control-plane timestamps used by lease logic.
@@ -59,6 +61,8 @@ type Node struct {
 	contract.NodeRegistration
 	State             contract.NodeState `json:"state"`
 	AuthoritativeTags []string           `json:"authoritative_tags"`
+	MaxOneshotSlots   int                `json:"max_oneshot_slots"`
+	MaxServiceSlots   int                `json:"max_service_slots"`
 	LastHeartbeatAt   time.Time          `json:"last_heartbeat_at"`
 }
 

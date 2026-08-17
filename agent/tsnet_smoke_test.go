@@ -53,8 +53,8 @@ func TestTSNetSmoke(t *testing.T) {
 	defer store.Close()
 	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{
 		AgentPrincipalTag: agentPrincipalTag,
-		AuthoritativeNodeTags: map[string][]string{
-			stableNodeID: {"tsnet-smoke"},
+		NodePolicies: map[string]l1.NodePolicy{
+			stableNodeID: l1.DefaultNodePolicy("tsnet-smoke"),
 		},
 	})
 	if err != nil {

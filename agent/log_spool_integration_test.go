@@ -222,7 +222,7 @@ func startRestartableLogServer(t *testing.T, parent context.Context, serverFabri
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{"stable-node": {"linux"}}})
+	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"stable-node": l1.DefaultNodePolicy("linux")}})
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
@@ -250,7 +250,7 @@ func createClaimForDurableLogs(t *testing.T, store *l1.Store, clock Clock) l1.Cl
 	t.Helper()
 	_, err := store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-node"}, contract.NodeRegistration{
 		NodeID: "stable-node", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
-	}, []string{"linux"})
+	}, l1.DefaultNodePolicy("linux"))
 	if err != nil {
 		t.Fatal(err)
 	}

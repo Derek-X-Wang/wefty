@@ -18,23 +18,38 @@ import (
 )
 
 type ServerConfig struct {
-	ClientPrincipalTag    string
-	AgentPrincipalTag     string
-	AuthoritativeNodeTags map[string][]string
-	ReconcileInterval     time.Duration
+	ClientPrincipalTag string
+	AgentPrincipalTag  string
+	NodePolicies       map[string]NodePolicy
+	ReconcileInterval  time.Duration
+}
+
+// NodePolicy is authoritative control-plane configuration for one stable node.
+// Tags and the two class-scoped slot limits are never supplied by the agent.
+type NodePolicy struct {
+	Tags            []string
+	MaxOneshotSlots int
+	MaxServiceSlots int
+}
+
+// DefaultNodePolicy returns policy with the owner-selected class capacities.
+func DefaultNodePolicy(tags ...string) NodePolicy {
+	return NodePolicy{
+		Tags: tags, MaxOneshotSlots: DefaultMaxOneshotSlots, MaxServiceSlots: DefaultMaxServiceSlots,
+	}
 }
 
 // Server serves separate client and agent protocols over one Fabric listener.
-// Fabric identity tags select the protocol principal; configured node tags
-// select job eligibility.
+// Fabric identity tags select the protocol principal; configured node policy
+// controls job eligibility and class-scoped admission.
 type Server struct {
-	fabric                fabric.Fabric
-	store                 *Store
-	clientPrincipalTag    string
-	agentPrincipalTag     string
-	authoritativeNodeTags map[string][]string
-	reconcileInterval     time.Duration
-	handler               http.Handler
+	fabric             fabric.Fabric
+	store              *Store
+	clientPrincipalTag string
+	agentPrincipalTag  string
+	nodePolicies       map[string]NodePolicy
+	reconcileInterval  time.Duration
+	handler            http.Handler
 }
 
 func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, error) {
@@ -49,9 +64,16 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	if clientTag == agentTag {
 		return nil, fmt.Errorf("l1: client and agent principal tags must differ")
 	}
-	authoritativeTags := make(map[string][]string, len(config.AuthoritativeNodeTags))
-	for nodeID, tags := range config.AuthoritativeNodeTags {
-		authoritativeTags[nodeID] = NormalizeTags(tags)
+	nodePolicies := make(map[string]NodePolicy, len(config.NodePolicies))
+	for nodeID, policy := range config.NodePolicies {
+		if strings.TrimSpace(nodeID) == "" {
+			return nil, fmt.Errorf("l1: node policy has an empty stable node ID")
+		}
+		if policy.MaxOneshotSlots < 0 || policy.MaxServiceSlots < 0 {
+			return nil, fmt.Errorf("l1: node policy %q slot limits must be non-negative", nodeID)
+		}
+		policy.Tags = NormalizeTags(policy.Tags)
+		nodePolicies[nodeID] = policy
 	}
 	reconcileInterval := config.ReconcileInterval
 	if reconcileInterval <= 0 {
@@ -60,8 +82,8 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	s := &Server{
 		fabric: f, store: store,
 		clientPrincipalTag: clientTag, agentPrincipalTag: agentTag,
-		authoritativeNodeTags: authoritativeTags,
-		reconcileInterval:     reconcileInterval,
+		nodePolicies:      nodePolicies,
+		reconcileInterval: reconcileInterval,
 	}
 	s.handler = s.routes()
 	return s, nil
@@ -269,7 +291,11 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFromRequest(r)
-	node, err := s.store.RegisterNode(r.Context(), identity, registration, s.authoritativeNodeTags[registration.NodeID])
+	policy, configured := s.nodePolicies[registration.NodeID]
+	if !configured {
+		policy = NodePolicy{MaxOneshotSlots: DefaultMaxOneshotSlots, MaxServiceSlots: DefaultMaxServiceSlots}
+	}
+	node, err := s.store.RegisterNode(r.Context(), identity, registration, policy)
 	if err != nil {
 		writeError(w, err)
 		return

@@ -156,7 +156,7 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{"stable-node": {"linux"}}})
+	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"stable-node": l1.DefaultNodePolicy("linux")}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 		t.Fatal(err)
 	}
 	defer store.Close()
-	l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{"stable-node": {"linux"}}})
+	l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"stable-node": l1.DefaultNodePolicy("linux")}})
 	if err != nil {
 		t.Fatal(err)
 	}

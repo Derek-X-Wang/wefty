@@ -55,8 +55,8 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l1Store.Close()
-	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{
-		"dogfood-node": {"linux", contract.StableNodeTagPrefix + "dogfood-node"},
+	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
+		"dogfood-node": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"dogfood-node"),
 	}})
 	if err != nil {
 		t.Fatal(err)
