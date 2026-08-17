@@ -21,6 +21,13 @@ import (
 var version = "dev"
 
 func main() {
+	if processrunner.IsGuardianInvocation(os.Args) {
+		if err := processrunner.RunGuardianInvocation(os.Args); err != nil {
+			log.Printf("wefty-agent guardian: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
 	// Agent.Run's session supervisor absorbs protocol failures at their attempt
 	// or node-session destination. Only a pre-payload startup failure or a local
 	// invariant failure escapes to this process-level non-zero exit.
@@ -31,6 +38,10 @@ func main() {
 }
 
 func run() error {
+	agentExecutable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate wefty-agent executable: %w", err)
+	}
 	var (
 		fabricMode        = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
 		controlPlane      = flag.String("control-plane", "wefty://control-plane", "control-plane Fabric address")
@@ -91,6 +102,7 @@ func run() error {
 		RenewalInterval:     *renewal,
 		LogSpoolDirectory:   *logSpoolDirectory,
 		LogSpoolMaxBytes:    *logSpoolMaxBytes,
+		GuardianExecutable:  agentExecutable,
 		OutputSinkFactory: func(l1.Claim) processrunner.OutputSink {
 			return processrunner.OutputSinkFunc(writeOutput)
 		},

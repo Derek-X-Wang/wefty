@@ -21,7 +21,10 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-var helperPath string
+var (
+	helperPath        string
+	guardianAgentPath string
+)
 
 func TestMain(main *testing.M) {
 	directory, err := os.MkdirTemp("", "wefty-process-helper-")
@@ -31,13 +34,22 @@ func TestMain(main *testing.M) {
 	}
 
 	helperPath = filepath.Join(directory, "processhelper")
+	guardianAgentPath = filepath.Join(directory, "wefty-agent")
 	if runtime.GOOS == "windows" {
 		helperPath += ".exe"
+		guardianAgentPath += ".exe"
 	}
-	command := exec.Command("go", "build", "-o", helperPath, "./testdata/processhelper")
-	if output, buildErr := command.CombinedOutput(); buildErr != nil {
-		fmt.Fprintf(os.Stderr, "build process helper: %v\n%s", buildErr, output)
-		os.Exit(1)
+	for _, build := range []struct {
+		name, output, packagePath string
+	}{
+		{name: "process helper", output: helperPath, packagePath: "./testdata/processhelper"},
+		{name: "guardian agent", output: guardianAgentPath, packagePath: "../../cmd/wefty-agent"},
+	} {
+		command := exec.Command("go", "build", "-o", build.output, build.packagePath)
+		if output, buildErr := command.CombinedOutput(); buildErr != nil {
+			fmt.Fprintf(os.Stderr, "build %s: %v\n%s", build.name, buildErr, output)
+			os.Exit(1)
+		}
 	}
 
 	code := main.Run()
@@ -109,6 +121,27 @@ func TestRunEmitsOrderedEventsForEachStream(t *testing.T) {
 				t.Fatalf("joined output length = %d, want %d", len(got), len(want))
 			}
 		})
+	}
+}
+
+func TestServiceRunSelfExecsGuardianAndPreservesRawEvents(t *testing.T) {
+	sink := newCollectingSink()
+	result, err := New(Config{GuardianExecutable: guardianAgentPath}).Run(context.Background(), Request{
+		AttemptID:  "attempt-guardian-raw",
+		Class:      contract.JobClassService,
+		Execution:  helperExecution("raw-output"),
+		IdlePolicy: IgnoreIdle,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	assertExitCode(t, result, 0)
+	events := sink.Events()
+	assertOrderedStream(t, events, contract.LogStdout)
+	want := append(bytes.Repeat([]byte{'x'}, 70*1024), []byte("partial-without-newline")...)
+	want = append(want, 0xff, 0xfe, 0x00, '\n')
+	if got := joinStream(events, contract.LogStdout); !bytes.Equal(got, want) {
+		t.Fatalf("guardian stream length = %d, want exact %d raw bytes", len(got), len(want))
 	}
 }
 

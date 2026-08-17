@@ -49,6 +49,7 @@ type attemptLifecycleDependencies struct {
 	workflowBridge    func(context.Context, contract.ExecutionSpec) (*workflowBridge, error)
 	logf              func(string, ...any)
 	observer          *lifecycleObserver
+	preflight         func(l1.Claim) *contract.SpawnFailure
 }
 
 // attemptLifecycle owns one attempt from renewal startup through process/log
@@ -210,6 +211,11 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 		err := fmt.Errorf("runtime handler %q is not supported for process jobs", claim.Job.Spec.RuntimeHandler)
 		return spawnFailure(contract.SpawnFailureUnsupportedRuntimeHandler, err), err
 	}
+	if lifecycle.dependencies.preflight != nil {
+		if failure := lifecycle.dependencies.preflight(claim); failure != nil {
+			return contract.ProcessResult{SpawnError: failure}, nil
+		}
+	}
 	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
 		if err := lifecycle.dependencies.handoffs.prepare(claim.Job.Spec, lifecycle.dependencies.nodeID); err != nil {
 			return spawnFailure(contract.SpawnFailureHandoffPreparation, err), err
@@ -259,10 +265,16 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 	if redactingSink != nil {
 		sink = redactingSink
 	}
+	idlePolicy := processrunner.MonitorIdle
+	if claim.Job.Spec.Class == contract.JobClassService {
+		idlePolicy = processrunner.IgnoreIdle
+	}
 	result, runErr := lifecycle.dependencies.runner.Run(ctx, processrunner.Request{
-		AttemptID: claim.Lease.AttemptID,
-		Execution: execution,
-		Limits:    claim.Job.Spec.Limits,
+		AttemptID:  claim.Lease.AttemptID,
+		Class:      claim.Job.Spec.Class,
+		Execution:  execution,
+		Limits:     claim.Job.Spec.Limits,
+		IdlePolicy: idlePolicy,
 	}, sink)
 	var outputErr error
 	if redactingSink != nil {

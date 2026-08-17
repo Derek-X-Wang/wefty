@@ -119,9 +119,10 @@ func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
 		// The lane submits a genuine service-class spec: #59 made class
 		// required and exempted services from handoff_directory, so a spec
 		// carrying one would prove the wrong path ran (spec §4.4).
-		Class:       contract.JobClassService,
-		Restart:     contract.RestartAlways,
-		RoutingTags: []string{"service-acceptance"},
+		Class:         contract.JobClassService,
+		PublishedPort: &port,
+		Restart:       contract.RestartAlways,
+		RoutingTags:   []string{"service-acceptance"},
 		Execution: contract.ExecutionSpec{
 			Executable:       contract.ExecutableSpec{Path: echoServiceBinaryPath},
 			Argv:             []string{echoServiceBinaryPath},
@@ -288,6 +289,21 @@ func (process *managedProcess) stop(t *testing.T) {
 			t.Errorf("force-killed %s after shutdown timeout\n%s", process.command.Path, process.outputString())
 		}
 	})
+}
+
+func (process *managedProcess) kill(t *testing.T) {
+	t.Helper()
+	if process.command.Process == nil {
+		t.Fatal("cannot kill a process that was not started")
+	}
+	if err := process.command.Process.Kill(); err != nil && !process.exited() {
+		t.Fatalf("kill %s: %v", process.command.Path, err)
+	}
+	select {
+	case <-process.done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for killed process %s", process.command.Path)
+	}
 }
 
 func (process *managedProcess) exited() bool {

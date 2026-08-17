@@ -1123,6 +1123,11 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	if err != nil {
 		return Job{}, internalError(err, "complete job")
 	}
+	if request.Result.SpawnError != nil && request.Result.SpawnError.Code == contract.SpawnFailurePublishedPortOccupied {
+		if err := recordPublishedPortOccupied(ctx, tx, jobID, attempt.nodeID, *request.Result.SpawnError); err != nil {
+			return Job{}, err
+		}
+	}
 	job, err := getJobByID(ctx, tx, jobID)
 	if err != nil {
 		return Job{}, internalError(err, "read completed job")
@@ -1131,6 +1136,38 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 		return Job{}, internalError(err, "commit completion")
 	}
 	return job, nil
+}
+
+func recordPublishedPortOccupied(
+	ctx context.Context,
+	tx *sql.Tx,
+	jobID, nodeID string,
+	failure contract.SpawnFailure,
+) error {
+	var port int
+	err := tx.QueryRowContext(ctx, "SELECT published_port FROM service_jobs WHERE job_id=?", jobID).Scan(&port)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return internalError(err, "read occupied service port")
+	}
+	lastFailure, err := json.Marshal(struct {
+		Code          contract.SpawnFailureCode `json:"code"`
+		Message       string                    `json:"message"`
+		NodeID        string                    `json:"node_id"`
+		PublishedPort int                       `json:"published_port"`
+	}{
+		Code: failure.Code, Message: failure.Message, NodeID: nodeID, PublishedPort: port,
+	})
+	if err != nil {
+		return internalError(err, "encode occupied service port failure")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
+		SET last_failure=?, next_restart_at=NULL WHERE job_id=?`, lastFailure, jobID); err != nil {
+		return internalError(err, "record occupied service port failure")
+	}
+	return nil
 }
 
 type attemptAuthority struct {
