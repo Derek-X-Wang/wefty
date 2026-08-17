@@ -53,6 +53,7 @@ type agentSession struct {
 	capacityMu      sync.Mutex
 	poolTargets     map[workloadClass]int
 	capacityChanged chan struct{}
+	claimsEnabled   bool
 
 	claimMu       sync.Mutex
 	residentJobID map[string]struct{}
@@ -107,6 +108,7 @@ func newAgentSession(
 			workloadClassService: maxServiceSlots,
 		},
 		capacityChanged: make(chan struct{}, 1),
+		claimsEnabled:   true,
 		residentJobID:   make(map[string]struct{}),
 		drainRequested:  make(chan struct{}),
 	}
@@ -353,6 +355,12 @@ func (session *agentSession) claimClassLoop(
 		}
 
 		claimStarted := session.clock.Now()
+		if !session.claimsAllowed() {
+			if err := session.waitForClaimWork(ctx, retire, session.claimInterval); err != nil {
+				return destinationFromError(err)
+			}
+			continue
+		}
 		claim, admitted, err := session.claim(ctx, session.gates[gateKey], selector, serviceReservation)
 		if !admitted {
 			if err := session.waitForClaimWork(ctx, retire, session.claimInterval); err != nil {
@@ -496,6 +504,7 @@ func (session *agentSession) observeGrantedCapacity(node l1.Node) {
 	session.claimMu.Lock()
 	defer session.claimMu.Unlock()
 	session.capacityMu.Lock()
+	session.claimsEnabled = node.ClaimsEnabled
 	changed := false
 	for class, target := range targets {
 		if session.poolTargets[class] != target {
@@ -511,6 +520,12 @@ func (session *agentSession) observeGrantedCapacity(node l1.Node) {
 		default:
 		}
 	}
+}
+
+func (session *agentSession) claimsAllowed() bool {
+	session.capacityMu.Lock()
+	defer session.capacityMu.Unlock()
+	return session.claimsEnabled && !session.isDraining()
 }
 
 func (session *agentSession) poolTarget(class workloadClass) int {
