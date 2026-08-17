@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
-	"sync"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -65,28 +64,23 @@ type Config struct {
 	Clock               Clock
 }
 
-// Agent registers one boot session and serially executes claimed jobs while
-// node heartbeats and attempt lease renewals proceed on distinct schedules.
+// Agent owns process-lifetime resources and starts one control-plane session.
 type Agent struct {
-	fabric            fabric.Fabric
-	controlPlaneAddr  string
-	runLedgerAddr     string
-	client            *Client
-	registration      contract.NodeRegistration
-	heartbeatInterval time.Duration
-	claimInterval     time.Duration
-	renewalInterval   time.Duration
-	logBatchSize      int
-	logFlushInterval  time.Duration
-	logRetryInterval  time.Duration
+	fabric           fabric.Fabric
+	runLedgerAddr    string
+	registration     contract.NodeRegistration
+	renewalInterval  time.Duration
+	logRetryInterval time.Duration
+	session          *agentSession
+	outbox           *evidenceOutbox
+	// logSpool is a compatibility view used by existing package tests. The
+	// process-lifetime evidenceOutbox is its sole owner.
 	logSpool          *logSpool
 	runner            ProcessRunner
 	outputSinkFactory OutputSinkFactory
 	handoffs          *handoffManager
 	logf              func(string, ...any)
 	clock             Clock
-	drainOnce         sync.Once
-	drainRequested    chan struct{}
 }
 
 func New(config Config) (*Agent, error) {
@@ -125,37 +119,40 @@ func New(config Config) (*Agent, error) {
 	if runner == nil {
 		runner = processrunner.New(processrunner.Config{Clock: processClockAdapter{clock: clock}})
 	}
-	spool, err := openLogSpool(config.LogSpoolDirectory, config.NodeID, int64OrDefault(config.LogSpoolMaxBytes, DefaultLogSpoolMaxBytes))
+	registration := contract.NodeRegistration{
+		NodeID:        config.NodeID,
+		BootSessionID: config.BootSessionID,
+		OS:            osName,
+		Architecture:  architecture,
+		AgentVersion:  config.Version,
+		Capabilities:  cloneCapabilities(config.Capabilities),
+	}
+	heartbeatInterval := durationOrDefault(config.HeartbeatInterval, DefaultHeartbeatInterval)
+	claimInterval := durationOrDefault(config.ClaimInterval, DefaultClaimInterval)
+	logBatchSize := intOrDefault(config.LogBatchSize, DefaultLogBatchSize)
+	logFlushInterval := durationOrDefault(config.LogFlushInterval, DefaultLogFlushInterval)
+	logRetryInterval := durationOrDefault(config.LogRetryInterval, DefaultLogRetryInterval)
+	outbox, err := newEvidenceOutbox(
+		config.LogSpoolDirectory,
+		config.NodeID,
+		int64OrDefault(config.LogSpoolMaxBytes, DefaultLogSpoolMaxBytes),
+		clock,
+		logBatchSize,
+		logFlushInterval,
+		logRetryInterval,
+	)
 	if err != nil {
 		client.Close()
 		return nil, err
 	}
+	session := newAgentSession(client, registration, heartbeatInterval, claimInterval, clock)
 	return &Agent{
-		fabric:           config.Fabric,
-		controlPlaneAddr: config.ControlPlaneAddress,
-		runLedgerAddr:    stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
-		client:           client,
-		registration: contract.NodeRegistration{
-			NodeID:        config.NodeID,
-			BootSessionID: config.BootSessionID,
-			OS:            osName,
-			Architecture:  architecture,
-			AgentVersion:  config.Version,
-			Capabilities:  cloneCapabilities(config.Capabilities),
-		},
-		heartbeatInterval: durationOrDefault(config.HeartbeatInterval, DefaultHeartbeatInterval),
-		claimInterval:     durationOrDefault(config.ClaimInterval, DefaultClaimInterval),
-		renewalInterval:   durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
-		logBatchSize:      intOrDefault(config.LogBatchSize, DefaultLogBatchSize),
-		logFlushInterval:  durationOrDefault(config.LogFlushInterval, DefaultLogFlushInterval),
-		logRetryInterval:  durationOrDefault(config.LogRetryInterval, DefaultLogRetryInterval),
-		logSpool:          spool,
-		runner:            runner,
-		outputSinkFactory: config.OutputSinkFactory,
-		handoffs:          newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
-		logf:              config.Logf,
-		clock:             clock,
-		drainRequested:    make(chan struct{}),
+		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
+		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
+		logRetryInterval: logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
+		runner: runner, outputSinkFactory: config.OutputSinkFactory,
+		handoffs: newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
+		logf:     config.Logf, clock: clock,
 	}, nil
 }
 
@@ -168,9 +165,11 @@ func (adapter processClockAdapter) NewTimer(duration time.Duration) processrunne
 
 // Close releases idle protocol connections.
 func (a *Agent) Close() {
-	a.client.Close()
-	if a.logSpool != nil {
-		if err := a.logSpool.Close(); err != nil {
+	if a.session != nil {
+		a.session.close()
+	}
+	if a.outbox != nil {
+		if err := a.outbox.Close(); err != nil {
 			a.log("close durable log spool: %v", err)
 		}
 	}
@@ -178,16 +177,14 @@ func (a *Agent) Close() {
 
 // Register starts or replaces the stable node's current boot session.
 func (a *Agent) Register(ctx context.Context) (l1.Node, error) {
-	return a.client.Register(ctx, a.registration)
+	return a.session.register(ctx)
 }
 
 // Drain stops new claims locally and marks the current boot session draining
 // at the control plane. An attempt already executing is not canceled; Run
 // returns after that attempt has uploaded its fenced completion.
 func (a *Agent) Drain(ctx context.Context) (l1.Node, error) {
-	node, err := a.client.Drain(ctx, a.registration.NodeID, a.registration.BootSessionID)
-	a.drainOnce.Do(func() { close(a.drainRequested) })
-	return node, err
+	return a.session.drain(ctx)
 }
 
 // Run registers and then serves claims until the context is canceled or the
@@ -198,304 +195,46 @@ func (a *Agent) Run(ctx context.Context) error {
 			return fmt.Errorf("agent: clean expired handoff directories: %w", err)
 		}
 	}
-	runContext, stop := context.WithCancel(ctx)
-	defer stop()
-	if err := a.recoverPendingLogs(runContext); err != nil {
-		if runContext.Err() != nil {
+	if err := a.recoverPendingLogs(ctx); err != nil {
+		if ctx.Err() != nil {
 			return nil
 		}
 		return fmt.Errorf("agent: recover durable logs: %w", err)
 	}
-	if _, err := a.Register(runContext); err != nil {
-		return fmt.Errorf("agent: register node: %w", err)
-	}
-	if a.isDraining() {
-		if _, err := a.client.Drain(runContext, a.registration.NodeID, a.registration.BootSessionID); err != nil {
-			return fmt.Errorf("agent: drain node: %w", err)
-		}
-		return nil
-	}
-	heartbeatErrors := make(chan error, 1)
-	go a.heartbeatLoop(runContext, heartbeatErrors)
-
-	for {
-		select {
-		case <-runContext.Done():
-			return nil
-		case <-a.drainRequested:
-			return nil
-		case err := <-heartbeatErrors:
-			return err
-		default:
-		}
-
-		claim, err := a.client.Claim(runContext, a.registration.NodeID, a.registration.BootSessionID)
-		if err != nil {
-			if runContext.Err() != nil || a.isDraining() {
-				return nil
-			}
-			if retryableAgentProtocolError(err) {
-				if waitErr := a.wait(runContext, a.claimInterval, heartbeatErrors); waitErr != nil {
-					if errors.Is(waitErr, context.Canceled) {
-						return nil
-					}
-					return waitErr
-				}
-				continue
-			}
-			return fmt.Errorf("agent: claim job: %w", err)
-		}
-		if claim == nil {
-			if err := a.wait(runContext, a.claimInterval, heartbeatErrors); err != nil {
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				return err
-			}
-			continue
-		}
-		if err := a.executeClaim(runContext, *claim); err != nil {
-			if runContext.Err() != nil {
-				return nil
-			}
-			return err
-		}
-	}
+	return a.session.run(ctx, func(attemptContext context.Context, claim l1.Claim) (errorDestination, error) {
+		return errorDestinationUnclassified, a.executeClaim(attemptContext, claim)
+	})
 }
 
 func (a *Agent) recoverPendingLogs(ctx context.Context) error {
-	if a.logSpool == nil {
+	if a.outbox == nil || a.session == nil {
 		return nil
 	}
-	attempts, err := a.logSpool.pendingAttempts(ctx)
-	if err != nil {
-		return err
-	}
-	for _, attempt := range attempts {
-		claim := l1.Claim{
-			Job:   l1.Job{JobID: attempt.jobID},
-			Lease: l1.AttemptLease{AttemptID: attempt.attemptID, FencingToken: attempt.fencingToken},
-		}
-		uploader, err := newBatchingLogSink(ctx, a.client, claim, a.logSpool, a.clock, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
-		if err != nil {
-			return err
-		}
-		if err := uploader.Close(); err != nil {
-			return fmt.Errorf("attempt %s: %w", attempt.attemptID, err)
-		}
-	}
-	return nil
-}
-
-func (a *Agent) heartbeatLoop(ctx context.Context, failures chan<- error) {
-	for {
-		timer := a.clock.NewTimer(a.heartbeatInterval)
-		select {
-		case <-ctx.Done():
-			stopTimer(timer)
-			return
-		case <-timer.C():
-			if _, err := a.client.Heartbeat(ctx, a.registration.NodeID, a.registration.BootSessionID); err != nil {
-				if retryableAgentProtocolError(err) {
-					continue
-				}
-				select {
-				case failures <- fmt.Errorf("agent: heartbeat: %w", err):
-				default:
-				}
-				return
-			}
-		}
-	}
-}
-
-type runOutcome struct {
-	result contract.ProcessResult
-	err    error
+	return a.outbox.recover(ctx, a.session.client)
 }
 
 func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) error {
-	attemptContext, cancelAttempt := context.WithCancel(ctx)
-	defer cancelAttempt()
-	executionContext, cancelExecution := context.WithCancel(attemptContext)
-	defer cancelExecution()
-
-	renewalErrors := make(chan error, 1)
-	renewalDone := make(chan struct{})
-	go func() {
-		defer close(renewalDone)
-		a.renewalLoop(attemptContext, claim, renewalErrors)
-	}()
-
-	completed := make(chan runOutcome, 1)
-	go func() {
-		result, err := a.runProcess(executionContext, claim)
-		completed <- runOutcome{result: result, err: err}
-	}()
-
-	var outcome runOutcome
-	select {
-	case <-ctx.Done():
-		cancelAttempt()
-		<-completed
-		<-renewalDone
-		return ctx.Err()
-	case err := <-renewalErrors:
-		cancelAttempt()
-		<-completed
-		<-renewalDone
-		return fmt.Errorf("agent: renew lease: %w", err)
-	case outcome = <-completed:
-		cancelExecution()
-	}
-
-	if outcome.err != nil {
-		a.log("attempt %s execution: %v", claim.Lease.AttemptID, outcome.err)
-	}
-	request := l1.CompletionRequest{
-		FencingToken:   claim.Lease.FencingToken,
-		IdempotencyKey: "completion:" + claim.Lease.AttemptID,
-		Result:         toL1Result(outcome.result),
-	}
-	completionDone := make(chan error, 1)
-	go func() { completionDone <- a.completeWithRetry(attemptContext, claim, request) }()
-	var completionErr error
-	select {
-	case completionErr = <-completionDone:
-		cancelAttempt()
-	case err := <-renewalErrors:
-		cancelAttempt()
-		completionErr = <-completionDone
-		<-renewalDone
-		if completionErr != nil {
-			return fmt.Errorf("agent: renew lease while completing: %w", err)
-		}
-	case <-ctx.Done():
-		cancelAttempt()
-		<-completionDone
-		<-renewalDone
-		return ctx.Err()
-	}
-	<-renewalDone
-	if completionErr != nil {
-		return fmt.Errorf("agent: complete attempt: %w", completionErr)
-	}
-	if a.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
-		succeeded := outcome.err == nil && outcome.result.ExitCode != nil && *outcome.result.ExitCode == 0
-		if err := a.handoffs.finish(claim.Job.Spec, a.registration.NodeID, succeeded); err != nil {
-			return fmt.Errorf("agent: finish handoff lifecycle: %w", err)
-		}
-	}
-	return nil
-}
-
-func (a *Agent) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) error {
-	for {
-		if _, err := a.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request); err != nil {
-			if !retryableAgentProtocolError(err) {
-				return err
-			}
-			timer := a.clock.NewTimer(a.logRetryInterval)
-			select {
-			case <-ctx.Done():
-				stopTimer(timer)
-				return ctx.Err()
-			case <-timer.C():
-			}
-			continue
-		}
-		return nil
-	}
+	return a.newAttemptLifecycle().execute(ctx, claim)
 }
 
 func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
-	if err := contract.CheckWorkloadClass(claim.Job.Spec.Class); err != nil {
-		return spawnFailure(contract.SpawnFailureUnsupportedClass, err), err
-	}
-	if err := contract.CheckExecutableKind(claim.Job.Spec.Kind); err != nil {
-		return spawnFailure(contract.SpawnFailureUnsupportedKind, err), err
-	}
-	if claim.Job.Spec.RuntimeHandler != "" {
-		err := fmt.Errorf("runtime handler %q is not supported for process jobs", claim.Job.Spec.RuntimeHandler)
-		return spawnFailure(contract.SpawnFailureUnsupportedRuntimeHandler, err), err
-	}
-	if a.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
-		if err := a.handoffs.prepare(claim.Job.Spec, a.registration.NodeID); err != nil {
-			return spawnFailure(contract.SpawnFailureHandoffPreparation, err), err
-		}
-	}
-	execution, cleanupExecutable, err := materializeExecutable(claim.Job.Spec.Execution, claim.Lease.AttemptID)
-	if err != nil {
-		return spawnFailure(contract.SpawnFailureExecutableMaterialization, err), err
-	}
-	defer cleanupExecutable()
-	var bridge *workflowBridge
-	if claim.Job.Spec.Class == contract.JobClassOneShot {
-		bridge, err = a.startWorkflowBridge(ctx, execution)
-		if err != nil {
-			return spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, err), err
-		}
-	}
-	if bridge != nil {
-		defer bridge.close()
-		execution.Env = cloneEnvironment(execution.Env)
-		delete(execution.Env, "WEFTY_L1_ENDPOINT")
-		execution.Env[contract.EnvL3Endpoint] = bridge.l3Endpoint
-	}
-	var uploader *batchingLogSink
-	var sinks multiOutputSink
-	if a.client != nil {
-		uploader, err = newBatchingLogSink(ctx, a.client, claim, a.logSpool, a.clock, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
-		if err != nil {
-			return spawnFailure(contract.SpawnFailureLogSinkSetup, err), err
-		}
-		sinks = append(sinks, uploader)
-	}
-	var localSink processrunner.OutputSink
-	if a.outputSinkFactory != nil {
-		localSink = a.outputSinkFactory(claim)
-	}
-	if localSink != nil {
-		sinks = append(sinks, localSink)
-	}
-	var sink processrunner.OutputSink
-	if len(sinks) == 1 {
-		sink = sinks[0]
-	} else if len(sinks) > 1 {
-		sink = sinks
-	}
-	redactingSink := newRedactingOutputSink(sink, claim.Job.Spec.Execution.SensitiveEnv)
-	if redactingSink != nil {
-		sink = redactingSink
-	}
-	result, runErr := a.runner.Run(ctx, processrunner.Request{
-		AttemptID: claim.Lease.AttemptID,
-		Execution: execution,
-		Limits:    claim.Job.Spec.Limits,
-	}, sink)
-	var outputErr error
-	if redactingSink != nil {
-		outputErr = redactingSink.Flush(ctx)
-	}
-	var uploadErr error
-	if uploader != nil {
-		uploadErr = uploader.Close()
-	}
-	if outputErr != nil {
-		outputErr = fmt.Errorf("flush redacted output: %w", outputErr)
-	}
-	if uploadErr != nil {
-		uploadErr = fmt.Errorf("upload logs: %w", uploadErr)
-	}
-	finalizationErr := errors.Join(outputErr, uploadErr)
-	if finalizationErr != nil {
-		result = contract.ProcessResult{OutputError: finalizationErr.Error()}
-	}
-	return result, errors.Join(runErr, finalizationErr)
+	return a.newAttemptLifecycle().runProcess(ctx, claim)
 }
 
-func spawnFailure(code contract.SpawnFailureCode, err error) contract.ProcessResult {
-	return contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: code, Message: err.Error()}}
+func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
+	return newAttemptLifecycle(attemptLifecycleDependencies{
+		client: a.sessionClient(), runner: a.runner, outbox: a.outbox,
+		clock: a.clock, renewalInterval: a.renewalInterval, completionRetry: a.logRetryInterval,
+		outputSinkFactory: a.outputSinkFactory, handoffs: a.handoffs,
+		nodeID: a.registration.NodeID, workflowBridge: a.startWorkflowBridge, logf: a.logf,
+	})
+}
+
+func (a *Agent) sessionClient() *Client {
+	if a.session == nil {
+		return nil
+	}
+	return a.session.client
 }
 
 func stringOrDefault(value, fallback string) string {
@@ -511,79 +250,6 @@ func cloneEnvironment(values map[string]string) map[string]string {
 		cloned[name] = value
 	}
 	return cloned
-}
-
-func (a *Agent) renewalLoop(ctx context.Context, claim l1.Claim, failures chan<- error) {
-	lease := claim.Lease
-	nextDelay := renewalDelay(a.clock.Now(), lease.LeaseExpires, a.renewalInterval)
-	for {
-		timer := a.clock.NewTimer(nextDelay)
-		select {
-		case <-ctx.Done():
-			stopTimer(timer)
-			return
-		case <-timer.C():
-		}
-		renewed, err := a.client.Renew(ctx, claim.Job.JobID, lease.AttemptID, lease.FencingToken)
-		if err != nil {
-			if retryableAgentProtocolError(err) {
-				remaining := lease.LeaseExpires.Sub(a.clock.Now())
-				if remaining > 0 {
-					nextDelay = min(a.logRetryInterval, remaining)
-					continue
-				}
-			}
-			select {
-			case failures <- err:
-			default:
-			}
-			return
-		}
-		lease = renewed
-		nextDelay = renewalDelay(a.clock.Now(), lease.LeaseExpires, a.renewalInterval)
-	}
-}
-
-func renewalDelay(now, expires time.Time, configured time.Duration) time.Duration {
-	halfRemaining := expires.Sub(now) / 2
-	if halfRemaining <= 0 {
-		return time.Millisecond
-	}
-	if configured < halfRemaining {
-		return configured
-	}
-	return halfRemaining
-}
-
-func toL1Result(result contract.ProcessResult) l1.ProcessResult {
-	return l1.ProcessResult{
-		SpawnError: result.SpawnError, OutputError: result.OutputError, ExitCode: result.ExitCode,
-		Signal: result.Signal, TerminationCause: result.TerminationCause,
-	}
-}
-
-func (a *Agent) wait(ctx context.Context, duration time.Duration, heartbeatErrors <-chan error) error {
-	timer := a.clock.NewTimer(duration)
-	defer stopTimer(timer)
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-a.drainRequested:
-		return context.Canceled
-	case err := <-heartbeatErrors:
-		return err
-	case <-timer.C():
-		return nil
-	}
-}
-
-func (a *Agent) isDraining() bool {
-	select {
-	case <-a.drainRequested:
-		return true
-	default:
-		return false
-	}
 }
 
 func NewBootSessionID() (string, error) {
