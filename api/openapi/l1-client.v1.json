@@ -104,7 +104,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Log page from the authoritative per-job raw JSONL. Ordering is per attempt and stream only; next_cursor is unrelated to agent upload acknowledgements.",
+            "description": "Log page from authoritative event rows, with an aggregate service-retention marker when history was evicted. Ordering is per attempt and stream only; next_cursor is unrelated to agent upload acknowledgements.",
             "content": {
               "application/json": {
                 "schema": { "$ref": "./common.v1.json#/components/schemas/LogPage" }

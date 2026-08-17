@@ -159,6 +159,20 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 			t.Errorf("LogGap reason is missing %q", reason)
 		}
 	}
+	serviceTruncation := object(t, schemas["ServiceLogTruncation"], "ServiceLogTruncation")
+	truncationRequired := stringSet(t, serviceTruncation["required"])
+	for _, field := range []string{"bound_kind", "evicted_event_count", "evicted_byte_count", "evicted_through_ordinal", "earliest_retained_at", "updated_at"} {
+		if !truncationRequired[field] {
+			t.Errorf("ServiceLogTruncation missing required field %q", field)
+		}
+	}
+	truncationBound := object(t, object(t, serviceTruncation["properties"], "ServiceLogTruncation.properties")["bound_kind"], "ServiceLogTruncation.bound_kind")
+	truncationBounds := stringSet(t, truncationBound["enum"])
+	for _, bound := range []string{"bytes", "age"} {
+		if !truncationBounds[bound] {
+			t.Errorf("ServiceLogTruncation bound_kind is missing %q", bound)
+		}
+	}
 	processResult := object(t, schemas["ProcessResult"], "ProcessResult")
 	if len(processResult["oneOf"].([]any)) != 4 {
 		t.Fatal("ProcessResult must distinguish spawn error, output failure, exit code, and signal death")

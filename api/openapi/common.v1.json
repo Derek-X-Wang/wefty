@@ -151,6 +151,27 @@
         },
         "description": "One ordered raw chunk or gap declaration. Continuity and gap ranges are independent for stdout and stderr."
       },
+      "ServiceLogTruncation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["bound_kind", "evicted_event_count", "evicted_byte_count", "evicted_through_ordinal", "earliest_retained_at", "updated_at"],
+        "properties": {
+          "bound_kind": {
+            "enum": ["bytes", "age"],
+            "description": "The retention bound that most recently caused eviction."
+          },
+          "evicted_event_count": { "type": "integer", "minimum": 0 },
+          "evicted_byte_count": { "type": "integer", "minimum": 0 },
+          "evicted_through_ordinal": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Internal monotonic ordering watermark; clients must not use it as a reader cursor."
+          },
+          "earliest_retained_at": { "type": ["string", "null"], "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        },
+        "description": "One aggregate L1 history-truncation marker per service job. This is distinct from LogGap, which declares loss before L1 accepted evidence."
+      },
       "ProcessResult": {
         "type": "object",
         "additionalProperties": false,
@@ -203,7 +224,8 @@
           "next_cursor": {
             "type": "string",
             "description": "Opaque cursor; clients must not infer SQLite row IDs."
-          }
+          },
+          "truncation": { "$ref": "#/components/schemas/ServiceLogTruncation" }
         }
       },
       "NodeRegistration": {
