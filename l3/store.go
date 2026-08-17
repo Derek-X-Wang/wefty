@@ -1505,6 +1505,10 @@ func ProjectJobState(current contract.RunState, job contract.JobState) (contract
 		target = contract.RunQueued
 	case contract.JobRunning:
 		target = contract.RunRunning
+	case contract.JobStopping, contract.JobStopped:
+		// Service jobs have no L3 run, so their lifecycle-only states have no
+		// valid projection onto the one-shot run state machine.
+		return current, false, protocolError(contract.ErrorInvalidRequest, "service job state %q cannot project onto a run", job)
 	case contract.JobAwaitingInput:
 		target = contract.RunAwaitingInput
 	case contract.JobSucceeded:

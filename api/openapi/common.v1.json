@@ -44,7 +44,7 @@
           "job_id": { "type": "string" },
           "node_id": { "type": "string", "description": "Stable node ID for the current attempt, once claimed." },
           "state": {
-            "enum": ["queued", "claimed", "running", "awaiting-input", "succeeded", "failed"]
+            "enum": ["queued", "claimed", "running", "stopping", "stopped", "awaiting-input", "succeeded", "failed"]
           },
           "spec": { "$ref": "#/components/schemas/JobSpec" },
           "current_attempt_id": { "type": "string" },
