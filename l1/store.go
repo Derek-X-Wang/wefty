@@ -32,25 +32,29 @@ const (
 )
 
 type StoreOptions struct {
-	Clock                  Clock
-	Jitter                 func(time.Duration) time.Duration
-	LeaseDuration          time.Duration
-	LateEvidenceWindow     time.Duration
-	NodeStaleAfter         time.Duration
-	NodeDeadAfter          time.Duration
-	ServiceStabilityWindow time.Duration
+	Clock                    Clock
+	Jitter                   func(time.Duration) time.Duration
+	LeaseDuration            time.Duration
+	LateEvidenceWindow       time.Duration
+	NodeStaleAfter           time.Duration
+	NodeDeadAfter            time.Duration
+	ServiceStabilityWindow   time.Duration
+	ServiceLogRetentionBytes int64
+	ServiceLogRetentionAge   time.Duration
 }
 
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
-	db                     *sql.DB
-	clock                  Clock
-	restartJitter          func(time.Duration) time.Duration
-	leaseDuration          time.Duration
-	lateEvidenceWindow     time.Duration
-	nodeStaleAfter         time.Duration
-	nodeDeadAfter          time.Duration
-	serviceStabilityWindow time.Duration
+	db                       *sql.DB
+	clock                    Clock
+	restartJitter            func(time.Duration) time.Duration
+	leaseDuration            time.Duration
+	lateEvidenceWindow       time.Duration
+	nodeStaleAfter           time.Duration
+	nodeDeadAfter            time.Duration
+	serviceStabilityWindow   time.Duration
+	serviceLogRetentionBytes int64
+	serviceLogRetentionAge   time.Duration
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
@@ -91,6 +95,20 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if serviceStabilityWindow <= 0 {
 		serviceStabilityWindow = DefaultServiceStabilityWindow
 	}
+	serviceLogRetentionBytes := options.ServiceLogRetentionBytes
+	if serviceLogRetentionBytes < 0 {
+		return nil, fmt.Errorf("l1: service log retention bytes must be non-negative")
+	}
+	if serviceLogRetentionBytes == 0 {
+		serviceLogRetentionBytes = DefaultServiceLogRetentionBytes
+	}
+	serviceLogRetentionAge := options.ServiceLogRetentionAge
+	if serviceLogRetentionAge < 0 {
+		return nil, fmt.Errorf("l1: service log retention age must be non-negative")
+	}
+	if serviceLogRetentionAge == 0 {
+		serviceLogRetentionAge = DefaultServiceLogRetentionAge
+	}
 
 	query := make(url.Values)
 	query.Add("_pragma", "busy_timeout(5000)")
@@ -106,6 +124,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	store := &Store{
 		db: db, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
+		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
 	}
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
@@ -667,6 +686,9 @@ AND state=@job_queued
 		WHERE job_id=?`, nodeID, jobID); err != nil {
 		return nil, internalError(err, "begin service restart attempt")
 	}
+	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, internalError(err, "commit job claim")
 	}
@@ -858,8 +880,8 @@ WHERE service_jobs.job_id=?`, attemptID, jobID).Scan(&desiredState, &restartRequ
 
 // AppendLogs accepts a provenance-authenticated batch and owns idempotency for
 // log-event keys.
-// Identical event replays are acknowledged without changing either the row
-// store or the authoritative per-job JSONL. A conflicting replay is rejected.
+// Identical event replays are acknowledged without changing the authoritative
+// event rows. A conflicting replay is rejected.
 func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID string, request AppendLogsRequest) (AppendLogsResponse, error) {
 	if request.FencingToken == "" {
 		return AppendLogsResponse{}, protocolError(contract.ErrorInvalidRequest, "fencing_token is required")
@@ -980,7 +1002,6 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "attempt is terminal")
 	}
 
-	var appendedJSONL bytes.Buffer
 	for _, prepared := range newEvents {
 		event := prepared.event
 		storedBytes := event.Bytes
@@ -991,11 +1012,6 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence, prepared.endSequence, event.Timestamp.UnixNano(), storedBytes, prepared.raw); err != nil {
 			return AppendLogsResponse{}, internalError(err, "store log event")
 		}
-		appendedJSONL.Write(prepared.raw)
-		appendedJSONL.WriteByte('\n')
-	}
-	if _, err := tx.ExecContext(ctx, "UPDATE job_log_jsonl SET jsonl=jsonl || ? WHERE job_id=?", appendedJSONL.Bytes(), jobID); err != nil {
-		return AppendLogsResponse{}, internalError(err, "append authoritative job JSONL")
 	}
 	if attempt.state == contract.AttemptClaimed && hasAuthority {
 		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=?, updated_ns=? WHERE attempt_id=?", contract.AttemptRunning, now.UnixNano(), attemptID); err != nil {
@@ -1006,6 +1022,12 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 		}
 	}
 	if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
+		return AppendLogsResponse{}, err
+	}
+	if _, err := s.enforceServiceLogByteRetention(ctx, tx, jobID, now); err != nil {
+		return AppendLogsResponse{}, err
+	}
+	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
 		return AppendLogsResponse{}, err
 	}
 	if err := readLogAcknowledgements(ctx, tx, attemptID, streams, acknowledged); err != nil {
@@ -1066,21 +1088,37 @@ WHERE job_id=? AND ordinal>? ORDER BY ordinal LIMIT ?`, jobID, after, limit)
 		return LogPage{}, internalError(err, "iterate job logs")
 	}
 	page.NextCursor = encodeLogCursor(last)
+	page.Truncation, err = readServiceLogTruncation(ctx, s.db, jobID)
+	if err != nil {
+		return LogPage{}, err
+	}
 	return page, nil
 }
 
-// RawJobLogJSONL returns the authoritative JSONL representation for a job.
-// Every line is the exact JSON object persisted alongside its indexed row.
+// RawJobLogJSONL derives JSONL from the authoritative event rows. There is no
+// independently retained or append-rewritten raw-log blob.
 func (s *Store) RawJobLogJSONL(ctx context.Context, jobID string) ([]byte, error) {
-	var raw []byte
-	err := s.db.QueryRowContext(ctx, "SELECT jsonl FROM job_log_jsonl WHERE job_id=?", jobID).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, protocolError(contract.ErrorNotFound, "job %q was not found", jobID)
+	if _, err := s.GetJob(ctx, jobID); err != nil {
+		return nil, err
 	}
+	rows, err := s.db.QueryContext(ctx, "SELECT event_json FROM log_events WHERE job_id=? ORDER BY ordinal", jobID)
 	if err != nil {
-		return nil, internalError(err, "read authoritative job JSONL")
+		return nil, internalError(err, "read authoritative job log events for JSONL export")
 	}
-	return bytes.Clone(raw), nil
+	defer rows.Close()
+	var raw bytes.Buffer
+	for rows.Next() {
+		var eventJSON []byte
+		if err := rows.Scan(&eventJSON); err != nil {
+			return nil, internalError(err, "scan authoritative job log event for JSONL export")
+		}
+		raw.Write(eventJSON)
+		raw.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate authoritative job log events for JSONL export")
+	}
+	return raw.Bytes(), nil
 }
 
 func validateLogEvent(attemptID string, event contract.LogEvent) error {
@@ -1329,6 +1367,9 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 		if err := recordPublishedPortOccupied(ctx, tx, jobID, attempt.nodeID, *request.Result.SpawnError); err != nil {
 			return Job{}, err
 		}
+	}
+	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
+		return Job{}, err
 	}
 	job, err := getJobByID(ctx, tx, jobID, now)
 	if err != nil {

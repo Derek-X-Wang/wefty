@@ -121,6 +121,48 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	}
 	result.ExpiredAttempts = int64(len(expiredAttemptIDs))
 
+	serviceRows, err := tx.QueryContext(ctx, "SELECT job_id FROM service_jobs ORDER BY job_id")
+	if err != nil {
+		return ReconcileResult{}, internalError(err, "select services for log retention sweep")
+	}
+	var serviceJobIDs []string
+	for serviceRows.Next() {
+		var jobID string
+		if err := serviceRows.Scan(&jobID); err != nil {
+			serviceRows.Close()
+			return ReconcileResult{}, internalError(err, "scan service for log retention sweep")
+		}
+		serviceJobIDs = append(serviceJobIDs, jobID)
+	}
+	if err := serviceRows.Close(); err != nil {
+		return ReconcileResult{}, internalError(err, "close service log retention rows")
+	}
+	if err := serviceRows.Err(); err != nil {
+		return ReconcileResult{}, internalError(err, "iterate services for log retention sweep")
+	}
+	for _, jobID := range serviceJobIDs {
+		ageStats, err := s.enforceServiceLogAgeRetention(ctx, tx, jobID, now)
+		if err != nil {
+			return ReconcileResult{}, err
+		}
+		result.EvictedLogEvents += ageStats.events
+		result.EvictedLogBytes += ageStats.bytes
+		// Ingest is the mandatory byte-enforcement site. Reconciliation also
+		// applies it so a tighter configuration takes effect for an idle
+		// service after restart without waiting for another batch.
+		byteStats, err := s.enforceServiceLogByteRetention(ctx, tx, jobID, now)
+		if err != nil {
+			return ReconcileResult{}, err
+		}
+		result.EvictedLogEvents += byteStats.events
+		result.EvictedLogBytes += byteStats.bytes
+		pruned, err := pruneServiceAttemptSummaries(ctx, tx, jobID)
+		if err != nil {
+			return ReconcileResult{}, err
+		}
+		result.PrunedAttempts += pruned
+	}
+
 	if err := tx.Commit(); err != nil {
 		return ReconcileResult{}, internalError(err, "commit L1 reconciliation")
 	}

@@ -8,16 +8,19 @@ import (
 )
 
 const (
-	DefaultClientPrincipalTag     = "tag:wefty-client"
-	DefaultAgentPrincipalTag      = "tag:wefty-agent"
-	DefaultLeaseDuration          = 30 * time.Second
-	DefaultLateEvidenceWindow     = 48 * time.Hour
-	DefaultNodeStaleAfter         = 45 * time.Second
-	DefaultNodeDeadAfter          = 2 * time.Minute
-	DefaultReconcileInterval      = time.Second
-	DefaultServiceStabilityWindow = 2 * time.Minute
-	DefaultMaxOneshotSlots        = 4
-	DefaultMaxServiceSlots        = 2
+	DefaultClientPrincipalTag             = "tag:wefty-client"
+	DefaultAgentPrincipalTag              = "tag:wefty-agent"
+	DefaultLeaseDuration                  = 30 * time.Second
+	DefaultLateEvidenceWindow             = 48 * time.Hour
+	DefaultNodeStaleAfter                 = 45 * time.Second
+	DefaultNodeDeadAfter                  = 2 * time.Minute
+	DefaultReconcileInterval              = time.Second
+	DefaultServiceStabilityWindow         = 2 * time.Minute
+	DefaultServiceLogRetentionAge         = 7 * 24 * time.Hour
+	DefaultServiceLogRetentionBytes int64 = 32 << 20
+	DefaultServiceAttemptSummaries        = 32
+	DefaultMaxOneshotSlots                = 4
+	DefaultMaxServiceSlots                = 2
 )
 
 // Clock supplies all control-plane timestamps used by lease logic.
@@ -179,6 +182,9 @@ type ReconcileResult struct {
 	StaleNodes          int64 `json:"stale_nodes"`
 	DeadNodes           int64 `json:"dead_nodes"`
 	RestartStreakResets int64 `json:"restart_streak_resets"`
+	EvictedLogEvents    int64 `json:"evicted_log_events"`
+	EvictedLogBytes     int64 `json:"evicted_log_bytes"`
+	PrunedAttempts      int64 `json:"pruned_attempts"`
 }
 
 // AppendLogsRequest is one provenance-authenticated, idempotent upload batch.
@@ -195,6 +201,26 @@ type AppendLogsResponse struct {
 }
 
 type LogPage struct {
-	Events     []contract.LogEvent `json:"events"`
-	NextCursor string              `json:"next_cursor,omitempty"`
+	Events     []contract.LogEvent   `json:"events"`
+	NextCursor string                `json:"next_cursor,omitempty"`
+	Truncation *ServiceLogTruncation `json:"truncation,omitempty"`
 }
+
+// ServiceLogTruncation is L1's aggregate declaration that retained service
+// history was evicted. It is intentionally distinct from contract.LogGap,
+// which declares evidence lost before L1 accepted it.
+type ServiceLogTruncation struct {
+	BoundKind             ServiceLogRetentionBound `json:"bound_kind"`
+	EvictedEventCount     int64                    `json:"evicted_event_count"`
+	EvictedByteCount      int64                    `json:"evicted_byte_count"`
+	EvictedThroughOrdinal int64                    `json:"evicted_through_ordinal"`
+	EarliestRetainedAt    *time.Time               `json:"earliest_retained_at"`
+	UpdatedAt             time.Time                `json:"updated_at"`
+}
+
+type ServiceLogRetentionBound string
+
+const (
+	ServiceLogRetentionBytes ServiceLogRetentionBound = "bytes"
+	ServiceLogRetentionAge   ServiceLogRetentionBound = "age"
+)

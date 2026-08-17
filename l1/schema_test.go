@@ -75,6 +75,52 @@ func TestStoreConfiguresLateEvidenceWindowIndependently(t *testing.T) {
 	}
 }
 
+func TestStoreConfiguresBoundedServiceLogRetention(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		store, err := OpenStore(filepath.Join(t.TempDir(), "service-retention-default.sqlite"), StoreOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		if store.serviceLogRetentionBytes != DefaultServiceLogRetentionBytes || store.serviceLogRetentionAge != DefaultServiceLogRetentionAge {
+			t.Fatalf("service retention defaults = %d/%s, want %d/%s", store.serviceLogRetentionBytes,
+				store.serviceLogRetentionAge, DefaultServiceLogRetentionBytes, DefaultServiceLogRetentionAge)
+		}
+	})
+
+	t.Run("configured", func(t *testing.T) {
+		store, err := OpenStore(filepath.Join(t.TempDir(), "service-retention-configured.sqlite"), StoreOptions{
+			ServiceLogRetentionBytes: 1234,
+			ServiceLogRetentionAge:   36 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		if store.serviceLogRetentionBytes != 1234 || store.serviceLogRetentionAge != 36*time.Hour {
+			t.Fatalf("configured service retention = %d/%s", store.serviceLogRetentionBytes, store.serviceLogRetentionAge)
+		}
+	})
+
+	for _, test := range []struct {
+		name    string
+		options StoreOptions
+	}{
+		{name: "negative bytes", options: StoreOptions{ServiceLogRetentionBytes: -1}},
+		{name: "negative age", options: StoreOptions{ServiceLogRetentionAge: -time.Second}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := OpenStore(filepath.Join(t.TempDir(), "invalid-service-retention.sqlite"), test.options)
+			if store != nil {
+				store.Close()
+			}
+			if err == nil {
+				t.Fatal("negative service retention option succeeded")
+			}
+		})
+	}
+}
+
 func assertNonUniqueIndex(t *testing.T, store *Store, table, index string, wantColumns []string) {
 	t.Helper()
 	rows, err := store.db.QueryContext(context.Background(), fmt.Sprintf("PRAGMA index_list(%q)", table))
