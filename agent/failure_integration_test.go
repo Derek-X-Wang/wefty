@@ -287,14 +287,31 @@ func assertSilentRenewalHangCannotOutliveLocalAuthority(t *testing.T) {
 		cancel()
 		t.Fatal("silent renewal let the payload remain resident past local authority")
 	}
-	if _, err := store.Reconcile(context.Background()); err != nil {
-		cancel()
-		t.Fatal(err)
-	}
-	expired, err := store.GetJob(context.Background(), job.JobID)
-	if err != nil || expired.State != contract.JobFailed {
-		cancel()
-		t.Fatalf("silent-renewal job = state %q error %v, want failed", expired.State, err)
+	// The agent's local authority deadline is derived from the granted TTL
+	// measured at its own request start, so it is deliberately EARLIER than the
+	// server's lease expiry. The payload is therefore reaped before L1 will
+	// agree the lease is gone, and a single Reconcile can legitimately observe
+	// the attempt still claimed. Poll until the control plane catches up.
+	var expired l1.Job
+	reconcileDeadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := store.Reconcile(context.Background()); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		expired, err = store.GetJob(context.Background(), job.JobID)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		if expired.State == contract.JobFailed {
+			break
+		}
+		if time.Now().After(reconcileDeadline) {
+			cancel()
+			t.Fatalf("silent-renewal job = state %q, want failed", expired.State)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	select {
 	case err := <-done:
