@@ -176,7 +176,7 @@ func TestRunTokenRequiresFabricIdentityAndDoesNotReplaceFabricPrincipal(t *testi
 
 	l1Workflow := h.client(workflowIdentity, DefaultL1Address)
 	status, _, body = h.do(l1Workflow, http.MethodGet, "/v1/jobs/does-not-matter", nil, http.Header{"Authorization": []string{"Bearer " + token}})
-	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
 }
 
 func TestTerminalRunTokenGraceAndExpiry(t *testing.T) {

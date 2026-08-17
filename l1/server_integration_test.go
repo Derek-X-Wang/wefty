@@ -394,9 +394,9 @@ func TestProtocolPrincipalsCannotCrossRouteGroups(t *testing.T) {
 	registration := contract.NodeRegistration{NodeID: "node-1", BootSessionID: "boot", OS: "linux", Architecture: "arm64", AgentVersion: "test"}
 
 	status, _, body := h.do(client, http.MethodPost, "/v1/agent/nodes/register", registration)
-	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
 	status, _, body = h.do(agent, http.MethodPost, "/v1/jobs", validJobSpec("cross-route", nil))
-	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
 }
 
 func TestClientListsNodeLivenessAndDrainsNode(t *testing.T) {
@@ -488,7 +488,7 @@ func TestRegistrationKeepsOneStableNodeAcrossBootSessions(t *testing.T) {
 	}
 	registration.BootSessionID = "boot-intruder"
 	status, _, body = h.do(intruder, http.MethodPost, "/v1/agent/nodes/register", registration)
-	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorIdentityBound)
 
 	registration.BootSessionID = "boot-2"
 	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
@@ -504,7 +504,7 @@ func TestRegistrationKeepsOneStableNodeAcrossBootSessions(t *testing.T) {
 	}
 
 	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/stable-node/heartbeat", HeartbeatRequest{BootSessionID: "boot-1"})
-	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeSessionReplaced)
 	var count int
 	if err := h.store.db.QueryRow("SELECT count(*) FROM nodes WHERE node_id=?", "stable-node").Scan(&count); err != nil {
 		t.Fatal(err)
@@ -512,6 +512,100 @@ func TestRegistrationKeepsOneStableNodeAcrossBootSessions(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("stable-node rows = %d, want 1", count)
 	}
+}
+
+func TestSemanticAgentAuthorityErrors(t *testing.T) {
+	assertSemanticAgentAuthorityErrors(t)
+}
+
+func assertSemanticAgentAuthorityErrors(t *testing.T) {
+	t.Helper()
+
+	t.Run("principal forbidden", func(t *testing.T) {
+		h := newIntegrationHarness(t, nil)
+		client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+		status, _, body := h.do(client, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"})
+		assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
+	})
+
+	t.Run("identity bound", func(t *testing.T) {
+		h := newIntegrationHarness(t, nil)
+		owner := h.client(fabric.Identity{NodeID: "fabric-owner", Tags: []string{DefaultAgentPrincipalTag}})
+		intruder := h.client(fabric.Identity{NodeID: "fabric-intruder", Tags: []string{DefaultAgentPrincipalTag}})
+		h.register(owner, "stable-node")
+		registration := contract.NodeRegistration{
+			NodeID: "stable-node", BootSessionID: "boot-intruder", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		}
+		status, _, body := h.do(intruder, http.MethodPost, "/v1/agent/nodes/register", registration)
+		assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorIdentityBound)
+	})
+
+	t.Run("node not registered", func(t *testing.T) {
+		h := newIntegrationHarness(t, nil)
+		agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
+		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "missing-node", BootSessionID: "boot-missing"})
+		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeNotRegistered)
+	})
+
+	t.Run("node dead", func(t *testing.T) {
+		h := newIntegrationHarness(t, nil)
+		agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
+		h.register(agent, "node-1")
+		h.clock.Advance(DefaultNodeDeadAfter)
+		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDead)
+	})
+
+	t.Run("node draining", func(t *testing.T) {
+		h := newIntegrationHarness(t, nil)
+		agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
+		h.register(agent, "node-1")
+		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/drain", DrainRequest{BootSessionID: "boot-node-1"})
+		if status != http.StatusOK {
+			t.Fatalf("drain status = %d body=%s", status, body)
+		}
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDraining)
+	})
+
+	t.Run("node session replaced", func(t *testing.T) {
+		h := newIntegrationHarness(t, nil)
+		agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
+		h.register(agent, "node-1")
+		registration := contract.NodeRegistration{
+			NodeID: "node-1", BootSessionID: "boot-new", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		}
+		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
+		if status != http.StatusOK {
+			t.Fatalf("replacement registration status = %d body=%s", status, body)
+		}
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", HeartbeatRequest{BootSessionID: "boot-node-1"})
+		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeSessionReplaced)
+	})
+
+	t.Run("attempt scope", func(t *testing.T) {
+		h := newIntegrationHarness(t, nil)
+		client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+		owner := h.client(fabric.Identity{NodeID: "fabric-owner", Tags: []string{DefaultAgentPrincipalTag}})
+		intruder := h.client(fabric.Identity{NodeID: "fabric-intruder", Tags: []string{DefaultAgentPrincipalTag}})
+		h.register(owner, "node-1")
+		job := h.submit(client, "semantic-attempt-errors", nil)
+		status, _, body := h.do(owner, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+		if status != http.StatusOK {
+			t.Fatalf("claim status = %d body=%s", status, body)
+		}
+		var claim Claim
+		if err := json.Unmarshal(body, &claim); err != nil {
+			t.Fatal(err)
+		}
+
+		status, _, body = h.do(owner, http.MethodPost, "/v1/agent/jobs/"+job.JobID+"/attempts/missing-attempt/lease", RenewalRequest{FencingToken: claim.Lease.FencingToken})
+		assertAPIError(t, status, body, http.StatusNotFound, contract.ErrorAttemptNotFound)
+
+		renewPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/lease", job.JobID, claim.Lease.AttemptID)
+		status, _, body = h.do(intruder, http.MethodPost, renewPath, RenewalRequest{FencingToken: claim.Lease.FencingToken})
+		assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorAttemptNotOwned)
+	})
 }
 
 func TestStoreUsesWAL(t *testing.T) {
@@ -536,5 +630,8 @@ func assertAPIError(t *testing.T, status int, body []byte, wantStatus int, wantC
 	}
 	if response.Error.Code != wantCode {
 		t.Fatalf("error code = %q, want %q body=%s", response.Error.Code, wantCode, body)
+	}
+	if response.Error.Retryable {
+		t.Fatalf("error retryable = true, want false body=%s", body)
 	}
 }

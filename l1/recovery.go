@@ -126,13 +126,40 @@ func (s *Store) DrainNode(ctx context.Context, identityNodeID, nodeID, bootSessi
 		return Node{}, internalError(err, "read node drain result")
 	}
 	if changed == 0 {
-		return Node{}, protocolError(contract.ErrorConflict, "node identity, boot session, or state does not permit draining")
+		return Node{}, s.nodeSessionError(ctx, nodeID, identityNodeID, bootSessionID, "drain")
 	}
 	node, err := getNode(ctx, s.db, nodeID)
 	if err != nil {
 		return Node{}, internalError(err, "read draining node")
 	}
 	return node, nil
+}
+
+func (s *Store) nodeSessionError(ctx context.Context, nodeID, identityNodeID, bootSessionID, operation string) error {
+	var storedIdentity, storedBoot string
+	var state contract.NodeState
+	err := s.db.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state FROM nodes WHERE node_id=?", nodeID).
+		Scan(&storedIdentity, &storedBoot, &state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return protocolError(contract.ErrorNodeNotRegistered, "node %q is not registered", nodeID)
+	}
+	if err != nil {
+		return internalError(err, "classify node session")
+	}
+	if storedIdentity != identityNodeID {
+		return protocolError(contract.ErrorIdentityBound, "stable node %q is bound to another Fabric identity", nodeID)
+	}
+	if storedBoot != bootSessionID {
+		return protocolError(contract.ErrorNodeSessionReplaced, "node %q boot session has been replaced", nodeID)
+	}
+	switch state {
+	case contract.NodeDead:
+		return protocolError(contract.ErrorNodeDead, "node %q is dead", nodeID)
+	case contract.NodeDraining:
+		return protocolError(contract.ErrorNodeDraining, "node %q is draining", nodeID)
+	default:
+		return protocolError(contract.ErrorConflict, "node %q state does not permit %s", nodeID, operation)
+	}
 }
 
 // DrainNodeByOperator idempotently drains the current registration for a

@@ -25,7 +25,10 @@
             "description": "Stable machine-readable error code."
           },
           "message": { "type": "string" },
-          "retryable": { "type": "boolean" },
+          "retryable": {
+            "type": "boolean",
+            "description": "Advises whether repeating the same request may succeed. A known authority-loss code always governs the caller's reaction."
+          },
           "details": {
             "type": "object",
             "additionalProperties": true
