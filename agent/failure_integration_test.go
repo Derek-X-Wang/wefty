@@ -186,7 +186,7 @@ func createAgentTestJob(t *testing.T, store *l1.Store, dispatchKey string) l1.Jo
 	t.Helper()
 	directory := t.TempDir()
 	job, _, err := store.CreateJob(context.Background(), contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1, DispatchKey: dispatchKey, Kind: "process", RoutingTags: []string{"linux"},
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: dispatchKey, Kind: "process", Class: contract.JobClassOneShot, RoutingTags: []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"},
 			WorkingDirectory: directory, HandoffDirectory: directory,
@@ -215,7 +215,7 @@ func (runner *blockingRunner) Run(ctx context.Context, _ processrunner.Request, 
 	}
 	select {
 	case <-ctx.Done():
-		return contract.ProcessResult{Signal: "canceled"}, ctx.Err()
+		return contract.ProcessResult{Signal: "canceled", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
 	case <-runner.releaseCh:
 		exitCode := 0
 		return contract.ProcessResult{ExitCode: &exitCode}, nil

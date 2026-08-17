@@ -125,8 +125,11 @@ func TestRunDistinguishesProcessResults(t *testing.T) {
 		if err != nil {
 			t.Fatalf("spawn error returned as supervision error: %v", err)
 		}
-		if result.SpawnError == "" || result.ExitCode != nil || result.Signal != "" {
+		if result.SpawnError == nil || result.ExitCode != nil || result.Signal != "" {
 			t.Fatalf("result = %#v, want spawn error only", result)
+		}
+		if result.SpawnError.Code != contract.SpawnFailureProcessSpawn {
+			t.Fatalf("spawn failure code = %q, want %q", result.SpawnError.Code, contract.SpawnFailureProcessSpawn)
 		}
 	})
 
@@ -155,8 +158,11 @@ func TestRunDistinguishesProcessResults(t *testing.T) {
 		if outcome.err != nil {
 			t.Fatalf("Run() error = %v", outcome.err)
 		}
-		if outcome.result.Signal == "" || outcome.result.ExitCode != nil || outcome.result.SpawnError != "" {
+		if outcome.result.Signal == "" || outcome.result.ExitCode != nil || outcome.result.SpawnError != nil {
 			t.Fatalf("result = %#v, want signal only", outcome.result)
+		}
+		if outcome.result.TerminationCause != contract.TerminationCauseSpontaneous {
+			t.Fatalf("termination cause = %q, want %q", outcome.result.TerminationCause, contract.TerminationCauseSpontaneous)
 		}
 	})
 }
@@ -240,7 +246,7 @@ func TestRunRejectsUnsupportedIdlePolicyBeforeSpawn(t *testing.T) {
 		Execution:  helperExecution("exit", "0"),
 		IdlePolicy: IdlePolicy(2),
 	}, nil)
-	if err == nil || !strings.Contains(err.Error(), "unsupported idle policy") || result.SpawnError == "" {
+	if err == nil || !strings.Contains(err.Error(), "unsupported idle policy") || result.SpawnError == nil {
 		t.Fatalf("Run() = (%#v, %v), want idle policy validation error", result, err)
 	}
 }
@@ -352,7 +358,7 @@ func TestRunRejectsInvalidWorkingDirectoryBeforeSpawn(t *testing.T) {
 			WorkingDirectory: file,
 		},
 	}, nil)
-	if err == nil || result.SpawnError == "" {
+	if err == nil || result.SpawnError == nil {
 		t.Fatalf("Run() = (%#v, %v), want validation spawn error", result, err)
 	}
 }
@@ -369,7 +375,7 @@ func helperExecution(mode string, arguments ...string) contract.ExecutionSpec {
 
 func assertExitCode(t *testing.T, result contract.ProcessResult, want int) {
 	t.Helper()
-	if result.ExitCode == nil || *result.ExitCode != want || result.SpawnError != "" || result.Signal != "" {
+	if result.ExitCode == nil || *result.ExitCode != want || result.SpawnError != nil || result.Signal != "" {
 		t.Fatalf("result = %#v, want exit code %d only", result, want)
 	}
 }

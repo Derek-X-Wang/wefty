@@ -4,12 +4,18 @@
   "title": "Wefty Job Spec v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "dispatch_key", "kind", "execution"],
+  "required": ["schema_version", "dispatch_key", "kind", "class", "execution"],
   "properties": {
     "schema_version": { "const": 1 },
     "dispatch_key": { "type": "string", "minLength": 1, "maxLength": 255 },
     "kind": {
       "description": "Open workload kind. Unknown values are valid data and are rejected only by agents that cannot execute them.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "class": {
+      "description": "Open workload lifecycle class. Unknown values are valid data and are rejected only by agents that cannot execute them.",
       "type": "string",
       "minLength": 1,
       "maxLength": 128
@@ -27,7 +33,7 @@
     "execution": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["executable", "argv", "working_directory", "handoff_directory"],
+      "required": ["executable", "argv", "working_directory"],
       "properties": {
         "executable": {
           "type": "object",
@@ -84,8 +90,43 @@
         "idle_timeout_seconds": { "type": "integer", "minimum": 1, "default": 600 },
         "completion_timeout_seconds": { "type": "integer", "minimum": 1, "default": 60 }
       }
+    },
+    "published_port": {
+      "description": "Immutable Fabric-namespace port for a service, or null/absent for a portless service.",
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "restart": {
+      "description": "Declared service restart mode. v1 supports only always.",
+      "const": "always"
+    },
+    "max_restart_streak": {
+      "description": "Optional maximum consecutive restartable terminations; omission means unlimited.",
+      "type": "integer",
+      "minimum": 1
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "class": { "const": "one-shot" } },
+        "required": ["class"]
+      },
+      "then": {
+        "properties": {
+          "execution": { "required": ["handoff_directory"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "class": { "const": "service" } },
+        "required": ["class"]
+      },
+      "then": { "required": ["restart"] }
+    }
+  ],
   "$defs": {
     "environment": {
       "type": "object",

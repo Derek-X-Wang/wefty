@@ -25,3 +25,25 @@ func TestProcessResultSerializesOutputFailure(t *testing.T) {
 		t.Fatalf("ProcessResult JSON = %s, want %s", got, want)
 	}
 }
+
+func TestProcessResultSerializesCodedSpawnFailure(t *testing.T) {
+	encoded, err := json.Marshal(ProcessResult{SpawnError: &SpawnFailure{
+		Code: SpawnFailureExecutableMaterialization, Message: "digest mismatch",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(encoded), `{"spawn_error":{"code":"executable_materialization_failed","message":"digest mismatch"}}`; got != want {
+		t.Fatalf("ProcessResult JSON = %s, want %s", got, want)
+	}
+}
+
+func TestProcessResultSerializesTerminationCause(t *testing.T) {
+	encoded, err := json.Marshal(ProcessResult{Signal: "terminated", TerminationCause: TerminationCauseGuardian})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(encoded), `{"signal":"terminated","termination_cause":"guardian"}`; got != want {
+		t.Fatalf("ProcessResult JSON = %s, want %s", got, want)
+	}
+}

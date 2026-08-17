@@ -154,6 +154,7 @@ func handoffClaim(runID, path string, tags []string) l1.Claim {
 	return l1.Claim{
 		Job: l1.Job{Spec: contract.JobSpec{
 			Kind:        "process",
+			Class:       contract.JobClassOneShot,
 			RoutingTags: tags,
 			Labels:      map[string]string{"run_id": runID},
 			Execution: contract.ExecutionSpec{

@@ -25,6 +25,7 @@ const (
 	ErrorDispatchKeyConflict       ErrorCode = "dispatch_key_conflict"
 	ErrorIdempotencyConflict       ErrorCode = "idempotency_conflict"
 	ErrorUnsupportedKind           ErrorCode = "unsupported_kind"
+	ErrorUnsupportedClass          ErrorCode = "unsupported_class"
 	ErrorUnsupportedRuntimeHandler ErrorCode = "unsupported_runtime_handler"
 	ErrorNotImplemented            ErrorCode = "not_implemented"
 	ErrorInternal                  ErrorCode = "internal"
@@ -69,4 +70,29 @@ func CheckExecutableKind(kind string) error {
 	}
 
 	return &ExecutionError{Kind: kind}
+}
+
+// ClassExecutionError reports that an open workload class cannot be executed
+// by this version of the agent.
+type ClassExecutionError struct {
+	Class string
+}
+
+func (e *ClassExecutionError) Error() string {
+	return fmt.Sprintf("job class %q is not supported by this agent", e.Class)
+}
+
+func (e *ClassExecutionError) Code() ErrorCode {
+	return ErrorUnsupportedClass
+}
+
+// CheckWorkloadClass applies execution-layer support policy after an open job
+// class has been decoded. The current agent executes one-shot and service
+// process payloads; L1 remains responsible for service lifecycle policy.
+func CheckWorkloadClass(class string) error {
+	if class == JobClassOneShot || class == JobClassService {
+		return nil
+	}
+
+	return &ClassExecutionError{Class: class}
 }

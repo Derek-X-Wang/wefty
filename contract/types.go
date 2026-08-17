@@ -21,18 +21,29 @@ const (
 	StableNodeTagPrefix = "wefty:node:"
 )
 
-// JobSpec is the versioned, transport-neutral description of a one-shot job.
-// Kind is deliberately a string rather than a closed enum.
+// JobSpec is the versioned, transport-neutral description of a job. Kind and
+// Class are deliberately strings rather than closed enums: an agent decides
+// whether it can execute an otherwise-valid workload.
 type JobSpec struct {
-	SchemaVersion  int               `json:"schema_version"`
-	DispatchKey    string            `json:"dispatch_key"`
-	Kind           string            `json:"kind"`
-	RuntimeHandler string            `json:"runtime_handler,omitempty"`
-	RoutingTags    []string          `json:"routing_tags,omitempty"`
-	Execution      ExecutionSpec     `json:"execution"`
-	Limits         *JobLimits        `json:"limits,omitempty"`
-	Labels         map[string]string `json:"labels,omitempty"`
+	SchemaVersion    int               `json:"schema_version"`
+	DispatchKey      string            `json:"dispatch_key"`
+	Kind             string            `json:"kind"`
+	Class            string            `json:"class"`
+	PublishedPort    *int              `json:"published_port,omitempty"`
+	Restart          string            `json:"restart,omitempty"`
+	MaxRestartStreak *int              `json:"max_restart_streak,omitempty"`
+	RuntimeHandler   string            `json:"runtime_handler,omitempty"`
+	RoutingTags      []string          `json:"routing_tags,omitempty"`
+	Execution        ExecutionSpec     `json:"execution"`
+	Limits           *JobLimits        `json:"limits,omitempty"`
+	Labels           map[string]string `json:"labels,omitempty"`
 }
+
+const (
+	JobClassOneShot = "one-shot"
+	JobClassService = "service"
+	RestartAlways   = "always"
+)
 
 type ExecutionSpec struct {
 	Executable       ExecutableSpec    `json:"executable"`
@@ -40,7 +51,7 @@ type ExecutionSpec struct {
 	Env              map[string]string `json:"env,omitempty"`
 	SensitiveEnv     map[string]string `json:"sensitive_env,omitempty"`
 	WorkingDirectory string            `json:"working_directory"`
-	HandoffDirectory string            `json:"handoff_directory"`
+	HandoffDirectory string            `json:"handoff_directory,omitempty"`
 }
 
 // ExecutableSpec uses either a node-local path or inline bytes. Inline content
@@ -177,13 +188,51 @@ const (
 // ProcessResult is the mutually exclusive execution/finalization outcome of
 // one process. ExitCode is a pointer so a successful exit code of zero remains
 // present on the wire when omitempty is applied. OutputError supersedes an
-// otherwise-successful exit when durable output cannot be finalized.
+// otherwise-successful exit when durable output cannot be finalized. A signal
+// outcome always names its structured initiator in TerminationCause.
 type ProcessResult struct {
-	SpawnError  string `json:"spawn_error,omitempty"`
-	OutputError string `json:"output_error,omitempty"`
-	ExitCode    *int   `json:"exit_code,omitempty"`
-	Signal      string `json:"signal,omitempty"`
+	SpawnError       *SpawnFailure    `json:"spawn_error,omitempty"`
+	OutputError      string           `json:"output_error,omitempty"`
+	ExitCode         *int             `json:"exit_code,omitempty"`
+	Signal           string           `json:"signal,omitempty"`
+	TerminationCause TerminationCause `json:"termination_cause,omitempty"`
 }
+
+// SpawnFailure is a stable machine-readable pre-execution failure. Message is
+// diagnostic only; policy must key exclusively on Code.
+type SpawnFailure struct {
+	Code    SpawnFailureCode `json:"code"`
+	Message string           `json:"message"`
+}
+
+type SpawnFailureCode string
+
+const (
+	SpawnFailureUnsupportedClass          SpawnFailureCode = "unsupported_class"
+	SpawnFailureUnsupportedKind           SpawnFailureCode = "unsupported_kind"
+	SpawnFailureUnsupportedRuntimeHandler SpawnFailureCode = "unsupported_runtime_handler"
+	SpawnFailureHandoffPreparation        SpawnFailureCode = "handoff_preparation_failed"
+	SpawnFailureExecutableMaterialization SpawnFailureCode = "executable_materialization_failed"
+	SpawnFailureWorkflowBridgeCreation    SpawnFailureCode = "workflow_bridge_creation_failed"
+	SpawnFailureLogSinkSetup              SpawnFailureCode = "log_sink_setup_failed"
+	SpawnFailureProcessRequest            SpawnFailureCode = "process_request_invalid"
+	SpawnFailureProcessGroupSetup         SpawnFailureCode = "process_group_setup_failed"
+	SpawnFailureProcessSpawn              SpawnFailureCode = "process_spawn_failed"
+	SpawnFailureProcessWait               SpawnFailureCode = "process_wait_failed"
+	SpawnFailurePublishedPortOccupied     SpawnFailureCode = "published_port_occupied"
+	SpawnFailureStartupReadinessTimeout   SpawnFailureCode = "startup_readiness_timeout"
+)
+
+// TerminationCause identifies who initiated a signal termination. A service
+// policy may combine this with durable desired/node state, but must never infer
+// intent by parsing Signal or an error message.
+type TerminationCause string
+
+const (
+	TerminationCauseSpontaneous TerminationCause = "spontaneous"
+	TerminationCauseAgent       TerminationCause = "agent"
+	TerminationCauseGuardian    TerminationCause = "guardian"
+)
 
 // NodeRegistration intentionally has no tags field. Claim eligibility uses
 // authoritative tags obtained from Fabric identity/configuration.

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "service:echo",
+  "kind": "process",
+  "class": "service",
+  "published_port": null,
+  "restart": "always",
+  "max_restart_streak": 3,
+  "execution": {
+    "executable": { "path": "/usr/local/bin/wefty-echo-service" },
+    "argv": ["wefty-echo-service"],
+    "working_directory": "/workspace/wefty"
+  }
+}

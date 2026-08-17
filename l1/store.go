@@ -938,10 +938,10 @@ func validateJobSpec(spec *contract.JobSpec) error {
 	if spec.SchemaVersion != contract.SchemaVersionV1 {
 		return protocolError(contract.ErrorInvalidRequest, "schema_version must be %d", contract.SchemaVersionV1)
 	}
-	if strings.TrimSpace(spec.DispatchKey) == "" || strings.TrimSpace(spec.Kind) == "" {
-		return protocolError(contract.ErrorInvalidRequest, "dispatch_key and kind are required")
+	if strings.TrimSpace(spec.DispatchKey) == "" || strings.TrimSpace(spec.Kind) == "" || strings.TrimSpace(spec.Class) == "" {
+		return protocolError(contract.ErrorInvalidRequest, "dispatch_key, kind, and class are required")
 	}
-	if len(spec.DispatchKey) > 255 || len(spec.Kind) > 128 || len(spec.RuntimeHandler) > 128 {
+	if len(spec.DispatchKey) > 255 || len(spec.Kind) > 128 || len(spec.Class) > 128 || len(spec.RuntimeHandler) > 128 {
 		return protocolError(contract.ErrorInvalidRequest, "job identifier fields exceed contract limits")
 	}
 	if spec.Kind != "process" {
@@ -950,8 +950,22 @@ func validateJobSpec(spec *contract.JobSpec) error {
 	if spec.RuntimeHandler != "" {
 		return protocolError(contract.ErrorUnsupportedRuntimeHandler, "runtime_handler is not supported for process jobs")
 	}
-	if spec.Execution.WorkingDirectory == "" || spec.Execution.HandoffDirectory == "" || len(spec.Execution.Argv) == 0 {
-		return protocolError(contract.ErrorInvalidRequest, "execution argv and directories are required")
+	if spec.Execution.WorkingDirectory == "" || len(spec.Execution.Argv) == 0 {
+		return protocolError(contract.ErrorInvalidRequest, "execution argv and working_directory are required")
+	}
+	if spec.Class == contract.JobClassOneShot && spec.Execution.HandoffDirectory == "" {
+		return protocolError(contract.ErrorInvalidRequest, "one-shot execution handoff_directory is required")
+	}
+	if spec.Class == contract.JobClassService {
+		if spec.Restart != contract.RestartAlways {
+			return protocolError(contract.ErrorInvalidRequest, "service restart must be %q", contract.RestartAlways)
+		}
+		if spec.PublishedPort != nil && (*spec.PublishedPort < 1 || *spec.PublishedPort > 65535) {
+			return protocolError(contract.ErrorInvalidRequest, "published_port must be between 1 and 65535")
+		}
+		if spec.MaxRestartStreak != nil && *spec.MaxRestartStreak < 1 {
+			return protocolError(contract.ErrorInvalidRequest, "max_restart_streak must be at least 1")
+		}
 	}
 	if (spec.Execution.Executable.Path == "") == (spec.Execution.Executable.InlineBase64 == "") {
 		return protocolError(contract.ErrorInvalidRequest, "executable must contain exactly one of path or inline_base64")
@@ -972,8 +986,11 @@ func validateJobSpec(spec *contract.JobSpec) error {
 
 func validateProcessResult(result ProcessResult) error {
 	set := 0
-	if result.SpawnError != "" {
+	if result.SpawnError != nil {
 		set++
+		if result.SpawnError.Code == "" || strings.TrimSpace(result.SpawnError.Message) == "" {
+			return protocolError(contract.ErrorInvalidRequest, "spawn_error code and message are required")
+		}
 	}
 	if result.OutputError != "" {
 		set++
@@ -983,11 +1000,25 @@ func validateProcessResult(result ProcessResult) error {
 	}
 	if result.Signal != "" {
 		set++
+		if !validTerminationCause(result.TerminationCause) {
+			return protocolError(contract.ErrorInvalidRequest, "signal result requires a valid termination_cause")
+		}
+	} else if result.TerminationCause != "" {
+		return protocolError(contract.ErrorInvalidRequest, "termination_cause requires signal")
 	}
 	if set != 1 {
 		return protocolError(contract.ErrorInvalidRequest, "result must contain exactly one of spawn_error, output_error, exit_code, or signal")
 	}
 	return nil
+}
+
+func validTerminationCause(cause contract.TerminationCause) bool {
+	switch cause {
+	case contract.TerminationCauseSpontaneous, contract.TerminationCauseAgent, contract.TerminationCauseGuardian:
+		return true
+	default:
+		return false
+	}
 }
 
 func validSHA256(value string) bool {
