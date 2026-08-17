@@ -568,3 +568,29 @@ func newHTTPClient(participant fabric.Fabric, address string) *http.Client {
 		return participant.Dial(ctx, network, address)
 	}}}
 }
+
+func TestAgentRegistrationUsesFabricConnectHost(t *testing.T) {
+	assertAgentRegistrationUsesFabricConnectHost(t)
+}
+
+func assertAgentRegistrationUsesFabricConnectHost(t *testing.T) {
+	t.Helper()
+	network := plain.NewNetwork()
+	participant := network.NewFabric(fabric.Identity{NodeID: "node-connect-host"})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "node-connect-host", BootSessionID: "boot-connect-host", Version: "test",
+		LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: managedRoot,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nodeAgent.Close)
+	if got := nodeAgent.registration.ConnectHost; got != participant.ConnectHost() || got != "127.0.0.1" {
+		t.Fatalf("registration connect_host = %q, Fabric projected %q", got, participant.ConnectHost())
+	}
+}

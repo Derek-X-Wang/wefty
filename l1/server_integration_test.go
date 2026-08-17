@@ -40,6 +40,7 @@ type integrationHarness struct {
 	t       *testing.T
 	network *plain.Network
 	store   *Store
+	server  *Server
 	clock   *fakeClock
 	cancel  context.CancelFunc
 	served  chan error
@@ -85,7 +86,7 @@ func newIntegrationHarnessWithOptions(t *testing.T, options StoreOptions, polici
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &integrationHarness{t: t, network: network, store: store, clock: clock, cancel: cancel, served: make(chan error, 1)}
+	h := &integrationHarness{t: t, network: network, store: store, server: server, clock: clock, cancel: cancel, served: make(chan error, 1)}
 	go func() { h.served <- server.Serve(ctx, listener) }()
 	t.Cleanup(func() {
 		for _, client := range h.clients {

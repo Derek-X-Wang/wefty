@@ -155,13 +155,16 @@ type Claim struct {
 	Lease AttemptLease `json:"lease"`
 }
 
-// Node is the registered node record returned by the agent protocol.
+// Node is the node projection shared by the operator list and agent protocol.
 type Node struct {
 	contract.NodeRegistration
 	State               contract.NodeState `json:"state"`
 	AuthoritativeTags   []string           `json:"authoritative_tags"`
 	MaxOneshotSlots     int                `json:"max_oneshot_slots"`
 	MaxServiceSlots     int                `json:"max_service_slots"`
+	OneshotOccupancy    int                `json:"oneshot_occupancy"`
+	ServiceOccupancy    int                `json:"service_occupancy"`
+	Overcommitted       bool               `json:"overcommitted"`
 	AuthorityGeneration int64              `json:"authority_generation"`
 	ClaimsEnabled       bool               `json:"claims_enabled"`
 	IntentRevision      int64              `json:"intent_revision"`
@@ -169,6 +172,13 @@ type Node struct {
 	IntentUpdatedAt     *time.Time         `json:"intent_updated_at"`
 	IntentActor         string             `json:"intent_actor"`
 	LastHeartbeatAt     time.Time          `json:"last_heartbeat_at"`
+}
+
+// HeartbeatResponse is the boot-session-scoped node channel. Directives stay
+// off the operator-visible Node projection because they carry cleanup fences.
+type HeartbeatResponse struct {
+	Node
+	RemovalDirectives []RemovalDirective `json:"removal_directives"`
 }
 
 // NodeList is the L1 client representation of the operator-visible fleet.

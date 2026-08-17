@@ -146,6 +146,7 @@ func New(config Config) (*Agent, error) {
 	registration := contract.NodeRegistration{
 		NodeID:        config.NodeID,
 		BootSessionID: config.BootSessionID,
+		ConnectHost:   config.Fabric.ConnectHost(),
 		OS:            osName,
 		Architecture:  architecture,
 		AgentVersion:  config.Version,

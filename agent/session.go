@@ -420,7 +420,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			stopTimer(timer)
 			return
 		case <-timer.C():
-			node, err := session.client.Heartbeat(ctx, session.registration.NodeID, session.registration.BootSessionID)
+			response, err := session.client.Heartbeat(ctx, session.registration.NodeID, session.registration.BootSessionID)
 			if err != nil {
 				classification := classifyAgentProtocolError(err)
 				if classification.destination == errorDestinationTransient {
@@ -434,7 +434,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				}
 				return
 			}
-			session.observeGrantedCapacity(node)
+			session.observeGrantedCapacity(response.Node)
 			backoff.reset()
 			nextDelay = session.heartbeatInterval
 			session.markReady()

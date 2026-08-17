@@ -268,6 +268,10 @@ const (
 type NodeRegistration struct {
 	NodeID        string `json:"node_id"`
 	BootSessionID string `json:"boot_session_id"`
+	// ConnectHost is a Fabric-produced operator hint. It is deliberately
+	// non-authoritative and never participates in identity, authorization, or
+	// scheduling.
+	ConnectHost string `json:"connect_host,omitempty"`
 	// RootInstanceID identifies the agent-owned managed resource root for this
 	// stable node. It is a self-reported local-state fact, not scheduling or
 	// execution authority.

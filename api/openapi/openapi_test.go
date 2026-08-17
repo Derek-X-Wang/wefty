@@ -203,6 +203,9 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 
 	nodeRegistration := object(t, schemas["NodeRegistration"], "NodeRegistration")
 	properties := object(t, nodeRegistration["properties"], "NodeRegistration.properties")
+	if _, ok := properties["connect_host"]; !ok {
+		t.Fatal("NodeRegistration must carry the non-authoritative Fabric connect_host projection")
+	}
 	if _, selfReported := properties["tags"]; selfReported {
 		t.Fatal("NodeRegistration must not accept self-reported tags")
 	}
@@ -218,10 +221,18 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	for _, field := range []string{
 		"max_oneshot_slots", "max_service_slots", "authority_generation", "claims_enabled",
 		"intent_revision", "intent_reason", "intent_updated_at", "intent_actor",
+		"oneshot_occupancy", "service_occupancy", "overcommitted",
 	} {
 		if _, ok := nodeProperties[field]; !ok {
 			t.Errorf("Node response missing authoritative %s", field)
 		}
+	}
+	heartbeat := object(t, schemas["HeartbeatResponse"], "HeartbeatResponse")
+	heartbeatParts := heartbeat["allOf"].([]any)
+	heartbeatProjection := object(t, heartbeatParts[1], "HeartbeatResponse.allOf[1]")
+	heartbeatProperties := object(t, heartbeatProjection["properties"], "HeartbeatResponse.properties")
+	if _, ok := heartbeatProperties["removal_directives"]; !ok {
+		t.Error("HeartbeatResponse is missing removal_directives")
 	}
 
 	client := readObject(t, "l1-client.v1.json")

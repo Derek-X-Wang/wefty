@@ -39,6 +39,14 @@ func DefaultNodePolicy(tags ...string) NodePolicy {
 	}
 }
 
+func (s *Server) effectiveNodePolicy(nodeID string) (NodePolicy, bool) {
+	policy, configured := s.nodePolicies[nodeID]
+	if !configured {
+		policy = DefaultNodePolicy()
+	}
+	return policy, configured
+}
+
 // Server serves separate client and agent protocols over one Fabric listener.
 // Fabric identity tags select the protocol principal; configured node policy
 // controls job eligibility and class-scoped admission.
@@ -472,10 +480,7 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFromRequest(r)
-	policy, configured := s.nodePolicies[registration.NodeID]
-	if !configured {
-		policy = NodePolicy{MaxOneshotSlots: DefaultMaxOneshotSlots, MaxServiceSlots: DefaultMaxServiceSlots}
-	}
+	policy, configured := s.effectiveNodePolicy(registration.NodeID)
 	node, err := s.store.RegisterNode(r.Context(), identity, registration, policy, configured)
 	if err != nil {
 		writeError(w, err)
@@ -491,12 +496,19 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFromRequest(r)
-	node, err := s.store.HeartbeatNode(r.Context(), identity.NodeID, r.PathValue("node_id"), request.BootSessionID)
+	nodeID := r.PathValue("node_id")
+	policy, _ := s.effectiveNodePolicy(nodeID)
+	node, err := s.store.HeartbeatNodeWithPolicy(r.Context(), identity.NodeID, nodeID, request.BootSessionID, policy)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, node)
+	directives, err := s.store.ListNodeRemovalDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, RemovalDirectives: directives})
 }
 
 func (s *Server) drainNode(w http.ResponseWriter, r *http.Request) {

@@ -215,8 +215,8 @@ func (s *Store) ForceForgetService(ctx context.Context, jobID string) (Job, erro
 	return forgotten, nil
 }
 
-// ListNodeRemovalDirectives returns the standing cleanup work for the current
-// authenticated boot. A later ticket attaches this to the heartbeat response.
+// ListNodeRemovalDirectives returns the standing cleanup work carried on the
+// current authenticated boot's heartbeat response.
 func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, nodeID, bootSessionID string) ([]RemovalDirective, error) {
 	var storedIdentity, storedBoot string
 	err := s.db.QueryRowContext(ctx, `SELECT identity_node_id, boot_session_id FROM nodes WHERE node_id=?`, nodeID).

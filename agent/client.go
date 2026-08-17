@@ -82,10 +82,10 @@ func (c *Client) Register(ctx context.Context, registration contract.NodeRegistr
 	return node, err
 }
 
-func (c *Client) Heartbeat(ctx context.Context, nodeID, bootSessionID string) (l1.Node, error) {
-	var node l1.Node
-	err := c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/heartbeat", l1.HeartbeatRequest{BootSessionID: bootSessionID}, &node)
-	return node, err
+func (c *Client) Heartbeat(ctx context.Context, nodeID, bootSessionID string) (l1.HeartbeatResponse, error) {
+	var response l1.HeartbeatResponse
+	err := c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/heartbeat", l1.HeartbeatRequest{BootSessionID: bootSessionID}, &response)
+	return response, err
 }
 
 func (c *Client) Drain(ctx context.Context, nodeID, bootSessionID string) (l1.Node, error) {

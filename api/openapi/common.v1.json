@@ -318,6 +318,10 @@
         "properties": {
           "node_id": { "type": "string" },
           "boot_session_id": { "type": "string" },
+          "connect_host": {
+            "type": "string",
+            "description": "Fabric-produced hostname for combining with a published port. Descriptive only; never an identity, authorization, or scheduling input."
+          },
           "root_instance_id": {
             "type": "string",
             "description": "Self-reported identity of the node's current agent-owned managed resource root. Descriptive only; never an eligibility or scheduling input."
@@ -331,7 +335,19 @@
             "description": "Executable support only. max_oneshot_slots and max_service_slots are reserved control-plane policy keys and are rejected."
           }
         },
-        "description": "No tags or capacity fields are accepted. Eligibility policy comes from operator-owned control-plane configuration."
+        "description": "No tags or capacity fields are accepted. Eligibility policy comes from operator-owned control-plane configuration; connect_host is a non-authoritative Fabric projection."
+      },
+      "RemovalDirective": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["job_id", "bound_node_id", "removal_generation", "cleanup_fence", "root_instance_id"],
+        "properties": {
+          "job_id": { "type": "string" },
+          "bound_node_id": { "type": "string" },
+          "removal_generation": { "type": "integer", "minimum": 1 },
+          "cleanup_fence": { "type": "string", "minLength": 1 },
+          "root_instance_id": { "type": "string", "minLength": 1 }
+        }
       },
       "Node": {
         "allOf": [
@@ -340,6 +356,7 @@
             "type": "object",
             "required": [
               "state", "authoritative_tags", "max_oneshot_slots", "max_service_slots",
+              "oneshot_occupancy", "service_occupancy", "overcommitted",
               "authority_generation", "claims_enabled", "intent_revision", "intent_reason",
               "intent_updated_at", "intent_actor", "last_heartbeat_at"
             ],
@@ -360,6 +377,23 @@
                 "type": "integer",
                 "minimum": 0,
                 "readOnly": true
+              },
+              "oneshot_occupancy": {
+                "type": "integer",
+                "minimum": 0,
+                "readOnly": true,
+                "description": "Current one-shot slot occupancy from non-terminal one-shot attempts."
+              },
+              "service_occupancy": {
+                "type": "integer",
+                "minimum": 0,
+                "readOnly": true,
+                "description": "Current service slot occupancy from durable service bindings."
+              },
+              "overcommitted": {
+                "type": "boolean",
+                "readOnly": true,
+                "description": "True when either class occupancy exceeds its effective configured limit; resident workloads are not killed."
               },
               "authority_generation": {
                 "type": "integer",
@@ -385,6 +419,23 @@
               },
               "intent_actor": { "type": "string", "readOnly": true },
               "last_heartbeat_at": { "type": "string", "format": "date-time" }
+            }
+          }
+        ]
+      },
+      "HeartbeatResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/Node" },
+          {
+            "type": "object",
+            "required": ["removal_directives"],
+            "properties": {
+              "removal_directives": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/RemovalDirective" },
+                "readOnly": true,
+                "description": "Boot-session-scoped standing cleanup directives, including when no attempt is live."
+              }
             }
           }
         ]
