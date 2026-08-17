@@ -39,31 +39,32 @@ type OutputSinkFactory func(l1.Claim) processrunner.OutputSink
 // Config contains the stable node identity, per-process boot identity, and
 // independent heartbeat, claim, and lease-renewal cadences.
 type Config struct {
-	Fabric              fabric.Fabric
-	ControlPlaneAddress string
-	RunLedgerAddress    string
-	NodeID              string
-	BootSessionID       string
-	Version             string
-	OS                  string
-	Architecture        string
-	Capabilities        map[string]bool
-	HeartbeatInterval   time.Duration
-	ClaimInterval       time.Duration
-	RenewalInterval     time.Duration
-	OperationTimeout    time.Duration
-	LogBatchSize        int
-	LogFlushInterval    time.Duration
-	LogRetryInterval    time.Duration
-	LogSpoolDirectory   string
-	LogSpoolMaxBytes    int64
-	GuardianExecutable  string
-	Runner              ProcessRunner
-	OutputSinkFactory   OutputSinkFactory
-	HandoffRoot         string
-	HandoffRetention    time.Duration
-	Logf                func(string, ...any)
-	Clock               Clock
+	Fabric               fabric.Fabric
+	ControlPlaneAddress  string
+	RunLedgerAddress     string
+	NodeID               string
+	BootSessionID        string
+	Version              string
+	OS                   string
+	Architecture         string
+	Capabilities         map[string]bool
+	HeartbeatInterval    time.Duration
+	ClaimInterval        time.Duration
+	RenewalInterval      time.Duration
+	OperationTimeout     time.Duration
+	LogBatchSize         int
+	LogFlushInterval     time.Duration
+	LogRetryInterval     time.Duration
+	LogSpoolDirectory    string
+	LogSpoolMaxBytes     int64
+	ManagedRootDirectory string
+	GuardianExecutable   string
+	Runner               ProcessRunner
+	OutputSinkFactory    OutputSinkFactory
+	HandoffRoot          string
+	HandoffRetention     time.Duration
+	Logf                 func(string, ...any)
+	Clock                Clock
 }
 
 // Agent owns process-lifetime resources and starts one control-plane session.
@@ -79,6 +80,7 @@ type Agent struct {
 	// process-lifetime evidenceOutbox is its sole owner.
 	logSpool          *logSpool
 	runner            ProcessRunner
+	managedResource   managedResourceManager
 	outputSinkFactory OutputSinkFactory
 	handoffs          *handoffManager
 	logf              func(string, ...any)
@@ -124,6 +126,11 @@ func New(config Config) (*Agent, error) {
 			Clock: processClockAdapter{clock: clock}, GuardianExecutable: config.GuardianExecutable,
 		})
 	}
+	managedResource, err := initializeManagedResource(config.ManagedRootDirectory, config.NodeID, config.BootSessionID)
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
 	registration := contract.NodeRegistration{
 		NodeID:        config.NodeID,
 		BootSessionID: config.BootSessionID,
@@ -156,7 +163,7 @@ func New(config Config) (*Agent, error) {
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
 		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
 		logRetryInterval: logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
-		runner: runner, outputSinkFactory: config.OutputSinkFactory,
+		runner: runner, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
 		handoffs: newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
 		logf:     config.Logf, clock: clock, observer: observer,
 	}, nil
@@ -233,7 +240,8 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		watchdog: newAuthorityWatchdog(a.clock), clock: a.clock,
 		renewalInterval: a.renewalInterval, completionRetry: a.logRetryInterval,
 		outputSinkFactory: a.outputSinkFactory, handoffs: a.handoffs,
-		nodeID: a.registration.NodeID, workflowBridge: a.startWorkflowBridge, logf: a.logf,
+		managedResource: a.managedResource,
+		nodeID:          a.registration.NodeID, workflowBridge: a.startWorkflowBridge, logf: a.logf,
 		observer: a.observer, preflight: a.preflightPublishedPort,
 	})
 }

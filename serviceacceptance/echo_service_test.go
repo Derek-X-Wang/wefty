@@ -10,12 +10,16 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/agent/managedroot"
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/l1"
 )
 
 const servicePortEnvironment = "WEFTY_SERVICE_PORT"
@@ -35,10 +39,14 @@ func TestServiceStartsAndAnswers(t *testing.T) {
 	if health.PID == harness.agent.command.Process.Pid {
 		t.Fatalf("health PID = agent PID %d; payload was not a distinct child process", health.PID)
 	}
+	assertManagedServiceLayout(t, harness, running, health.ServiceDirectory)
 
 	assertEcho(t, client, baseURL, []byte("echo acceptance"))
 	assertGracefulShutdown(t, baseURL, health.PID, harness.agent)
 	harness.waitForJobState(t, job.JobID, contract.JobSucceeded, 5*time.Second)
+	assertAttemptScratchCleared(t, harness, running)
+	assertHandoffRootEmpty(t, harness.handoffRoot)
+	assertWorkingDirectoryUntouched(t, harness.workingDirectories[job.JobID])
 }
 
 func TestGuardianReapsPayloadWhenAgentIsSIGKILLed(t *testing.T) {
@@ -101,6 +109,17 @@ func TestPublishedPortPreflightLatchesFailureWithoutKillingOwner(t *testing.T) {
 		failed.LifetimeRestartCount != 0 || failed.RestartPending(contract.JobFailed, time.Now()) {
 		t.Fatalf("failed service consumed restart budget or changed intent: %#v", failed.ServiceJob)
 	}
+	serviceRoot := filepath.Join(
+		harness.managedRoot, "agent", "nodes", managedroot.EncodeID("acceptance-node"),
+		"services", managedroot.EncodeID(job.JobID),
+	)
+	var ownership managedroot.OwnershipManifest
+	readJSONFile(t, filepath.Join(serviceRoot, managedroot.OwnershipManifestName), &ownership)
+	if ownership.JobID != job.JobID || ownership.RemovalGeneration != 1 {
+		t.Fatalf("failed service ownership manifest = %#v", ownership)
+	}
+	assertHandoffRootEmpty(t, harness.handoffRoot)
+	assertWorkingDirectoryUntouched(t, harness.workingDirectories[job.JobID])
 
 	connection, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
 	if err != nil {
@@ -139,7 +158,7 @@ func waitForHealth(
 	client *http.Client,
 	baseURL string,
 	agent *managedProcess,
-) struct{ PID int } {
+) serviceHealth {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -148,7 +167,7 @@ func waitForHealth(
 		}
 		response, err := client.Get(baseURL + "/healthz")
 		if err == nil {
-			var health struct{ PID int }
+			var health serviceHealth
 			decodeErr := json.NewDecoder(response.Body).Decode(&health)
 			closeErr := response.Body.Close()
 			if response.StatusCode == http.StatusOK && decodeErr == nil && closeErr == nil {
@@ -158,7 +177,80 @@ func waitForHealth(
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("echo service did not become healthy on injected port\n%s", agent.outputString())
-	return struct{ PID int }{}
+	return serviceHealth{}
+}
+
+type serviceHealth struct {
+	PID              int    `json:"pid"`
+	ServiceDirectory string `json:"service_directory"`
+}
+
+func assertManagedServiceLayout(t *testing.T, harness *acceptanceHarness, job l1.Job, serviceDirectory string) {
+	t.Helper()
+	nodeRoot := filepath.Join(harness.managedRoot, "agent", "nodes", managedroot.EncodeID("acceptance-node"))
+	serviceRoot := filepath.Join(nodeRoot, "services", managedroot.EncodeID(job.JobID))
+	if serviceDirectory != filepath.Join(serviceRoot, "data") {
+		t.Fatalf("%s = %q, want managed data directory %q", contract.EnvServiceDir, serviceDirectory, filepath.Join(serviceRoot, "data"))
+	}
+	var rootManifest managedroot.RootManifest
+	readJSONFile(t, filepath.Join(nodeRoot, managedroot.RootManifestName), &rootManifest)
+	if rootManifest.NodeID != "acceptance-node" || rootManifest.RootInstanceID == "" {
+		t.Fatalf("root manifest = %#v", rootManifest)
+	}
+	var ownership managedroot.OwnershipManifest
+	readJSONFile(t, filepath.Join(serviceRoot, managedroot.OwnershipManifestName), &ownership)
+	if ownership.JobID != job.JobID || ownership.RemovalGeneration != 1 {
+		t.Fatalf("ownership manifest = %#v", ownership)
+	}
+	for _, path := range []string{
+		filepath.Join(serviceRoot, "data"), filepath.Join(serviceRoot, "attempts"), filepath.Join(serviceRoot, "runtime"),
+		filepath.Join(serviceRoot, "attempts", managedroot.EncodeID(job.CurrentAttemptID)),
+	} {
+		if info, err := os.Stat(path); err != nil || !info.IsDir() {
+			t.Fatalf("managed service directory %q = (%v, %v), want directory", path, info, err)
+		}
+	}
+}
+
+func assertAttemptScratchCleared(t *testing.T, harness *acceptanceHarness, job l1.Job) {
+	t.Helper()
+	path := filepath.Join(
+		harness.managedRoot, "agent", "nodes", managedroot.EncodeID("acceptance-node"),
+		"services", managedroot.EncodeID(job.JobID), "attempts", managedroot.EncodeID(job.CurrentAttemptID),
+	)
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("attempt scratch %q survived completion: %v", path, err)
+	}
+}
+
+func assertHandoffRootEmpty(t *testing.T, root string) {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("service created handoff entries: %#v", entries)
+	}
+}
+
+func assertWorkingDirectoryUntouched(t *testing.T, directory string) {
+	t.Helper()
+	payload, err := os.ReadFile(filepath.Join(directory, "operator-owned"))
+	if err != nil || string(payload) != "untouched" {
+		t.Fatalf("operator working directory changed: payload=%q err=%v", payload, err)
+	}
+}
+
+func readJSONFile(t *testing.T, path string, target any) {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(payload, target); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertEcho(t *testing.T, client *http.Client, baseURL string, payload []byte) {

@@ -12,7 +12,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-func materializeExecutable(execution contract.ExecutionSpec, attemptID string) (contract.ExecutionSpec, func(), error) {
+func materializeExecutable(execution contract.ExecutionSpec, attemptID, managedRuntimeDirectory string) (contract.ExecutionSpec, func(), error) {
 	if execution.Executable.InlineBase64 == "" {
 		return execution, func() {}, nil
 	}
@@ -24,7 +24,12 @@ func materializeExecutable(execution contract.ExecutionSpec, attemptID string) (
 	if hex.EncodeToString(digest[:]) != execution.Executable.SHA256 {
 		return contract.ExecutionSpec{}, func() {}, fmt.Errorf("inline executable SHA-256 does not match content")
 	}
-	directory, err := os.MkdirTemp("", "wefty-executable-"+attemptID+"-")
+	directory := managedRuntimeDirectory
+	if directory == "" {
+		directory, err = os.MkdirTemp("", "wefty-executable-"+attemptID+"-")
+	} else {
+		err = os.Mkdir(directory, 0o700)
+	}
 	if err != nil {
 		return contract.ExecutionSpec{}, func() {}, fmt.Errorf("create inline executable directory: %w", err)
 	}

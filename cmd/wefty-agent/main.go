@@ -42,6 +42,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("locate wefty-agent executable: %w", err)
 	}
+	managedRootDefault, err := agent.DefaultManagedRootDirectory()
+	if err != nil {
+		return err
+	}
 	var (
 		fabricMode        = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
 		controlPlane      = flag.String("control-plane", "wefty://control-plane", "control-plane Fabric address")
@@ -58,6 +62,8 @@ func run() error {
 		renewal           = flag.Duration("renewal-interval", agent.DefaultRenewalInterval, "maximum attempt lease-renewal interval")
 		logSpoolDirectory = flag.String("log-spool-dir", "", "durable log spool directory (defaults to the user cache directory)")
 		logSpoolMaxBytes  = flag.Int64("log-spool-max-bytes", agent.DefaultLogSpoolMaxBytes, "maximum unacknowledged log payload bytes retained on disk")
+		managedRoot       = flag.String("managed-root", managedRootDefault, "persistent state root for agent-managed service resources")
+		handoffRoot       = flag.String("handoff-root", contract.DefaultHandoffRoot, "agent-managed one-shot handoff root")
 	)
 	flag.Parse()
 	if *nodeID == "" {
@@ -90,19 +96,21 @@ func run() error {
 		return err
 	}
 	nodeAgent, err := agent.New(agent.Config{
-		Fabric:              participant,
-		ControlPlaneAddress: *controlPlane,
-		RunLedgerAddress:    *runLedger,
-		NodeID:              *nodeID,
-		BootSessionID:       bootSessionID,
-		Version:             version,
-		Capabilities:        map[string]bool{"process": true},
-		HeartbeatInterval:   *heartbeat,
-		ClaimInterval:       *claim,
-		RenewalInterval:     *renewal,
-		LogSpoolDirectory:   *logSpoolDirectory,
-		LogSpoolMaxBytes:    *logSpoolMaxBytes,
-		GuardianExecutable:  agentExecutable,
+		Fabric:               participant,
+		ControlPlaneAddress:  *controlPlane,
+		RunLedgerAddress:     *runLedger,
+		NodeID:               *nodeID,
+		BootSessionID:        bootSessionID,
+		Version:              version,
+		Capabilities:         map[string]bool{"process": true},
+		HeartbeatInterval:    *heartbeat,
+		ClaimInterval:        *claim,
+		RenewalInterval:      *renewal,
+		LogSpoolDirectory:    *logSpoolDirectory,
+		LogSpoolMaxBytes:     *logSpoolMaxBytes,
+		ManagedRootDirectory: *managedRoot,
+		GuardianExecutable:   agentExecutable,
+		HandoffRoot:          *handoffRoot,
 		OutputSinkFactory: func(l1.Claim) processrunner.OutputSink {
 			return processrunner.OutputSinkFunc(writeOutput)
 		},

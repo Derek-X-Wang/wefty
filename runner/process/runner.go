@@ -325,13 +325,6 @@ func validateRequest(ctx context.Context, request Request) error {
 	if request.IdlePolicy != MonitorIdle && request.IdlePolicy != IgnoreIdle {
 		return fmt.Errorf("unsupported idle policy %d", request.IdlePolicy)
 	}
-	info, err := os.Stat(request.Execution.WorkingDirectory)
-	if err != nil {
-		return fmt.Errorf("validate working directory: %w", err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("validate working directory: %q is not a directory", request.Execution.WorkingDirectory)
-	}
 	return nil
 }
 
