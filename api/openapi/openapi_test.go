@@ -102,6 +102,21 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	common := readObject(t, "common.v1.json")
 	components := object(t, common["components"], "components")
 	schemas := object(t, components["schemas"], "components.schemas")
+	attemptLease := object(t, schemas["AttemptLease"], "AttemptLease")
+	attemptLeaseRequired := stringSet(t, attemptLease["required"])
+	for _, field := range []string{"attempt_id", "fencing_token", "lease_expires_at", "lease_ttl"} {
+		if !attemptLeaseRequired[field] {
+			t.Errorf("AttemptLease missing required field %q", field)
+		}
+	}
+	attemptLeaseProperties := object(t, attemptLease["properties"], "AttemptLease.properties")
+	directive := object(t, attemptLeaseProperties["directive"], "AttemptLease.directive")
+	directiveValues := stringSet(t, directive["enum"])
+	for _, value := range []string{"stop", "restart"} {
+		if !directiveValues[value] {
+			t.Errorf("AttemptLease directive missing value %q", value)
+		}
+	}
 	logEvent := object(t, schemas["LogEvent"], "LogEvent")
 	required := stringSet(t, logEvent["required"])
 	for _, field := range []string{"attempt_id", "stream", "sequence", "timestamp", "bytes"} {

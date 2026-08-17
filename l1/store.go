@@ -562,7 +562,10 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, attemptID, jobID, nodeID, bootSessionID, con
 			JobID: jobID, NodeID: nodeID, State: contract.JobClaimed, Spec: spec, CurrentAttemptID: attemptID,
 			CreatedAt: time.Unix(0, createdNS).UTC(), UpdatedAt: now,
 		},
-		Lease: AttemptLease{AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: leaseExpires},
+		Lease: AttemptLease{
+			AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: leaseExpires,
+			LeaseTTL: leaseExpires.Sub(now),
+		},
 	}, nil
 }
 
@@ -595,6 +598,10 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 		}
 		return AttemptLease{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
 	}
+	directive, err := readAttemptDirective(ctx, tx, jobID, attemptID)
+	if err != nil {
+		return AttemptLease{}, err
+	}
 	expires := canonicalTime(now.Add(s.leaseDuration))
 	nextState := attempt.state
 	if attempt.state == contract.AttemptClaimed {
@@ -612,7 +619,38 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 	if err := tx.Commit(); err != nil {
 		return AttemptLease{}, internalError(err, "commit lease renewal")
 	}
-	return AttemptLease{AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: expires}, nil
+	return AttemptLease{
+		AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: expires,
+		LeaseTTL: expires.Sub(now), Directive: directive,
+	}, nil
+}
+
+func readAttemptDirective(ctx context.Context, tx *sql.Tx, jobID, attemptID string) (AttemptDirective, error) {
+	var desiredState string
+	var restartRequested bool
+	err := tx.QueryRowContext(ctx, `
+SELECT service_jobs.desired_state, EXISTS (
+  SELECT 1
+  FROM service_restart_requests
+  JOIN attempts ON attempts.attempt_id=?
+  WHERE service_restart_requests.job_id=service_jobs.job_id
+    AND service_restart_requests.created_ns >= attempts.created_ns
+)
+FROM service_jobs
+WHERE service_jobs.job_id=?`, attemptID, jobID).Scan(&desiredState, &restartRequested)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", internalError(err, "read attempt directive")
+	}
+	if desiredState == "stopped" {
+		return AttemptDirectiveStop, nil
+	}
+	if desiredState == "running" && restartRequested {
+		return AttemptDirectiveRestart, nil
+	}
+	return "", nil
 }
 
 // AppendLogs accepts a fenced batch and owns idempotency for log-event keys.

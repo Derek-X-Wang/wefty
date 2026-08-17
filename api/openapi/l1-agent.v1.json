@@ -167,7 +167,7 @@
       "post": {
         "operationId": "renewAttemptLease",
         "summary": "Renew one attempt lease",
-        "description": "Distinct from node heartbeat. Stale fence, attempt mismatch, or expiry returns 409 without granting write authority.",
+        "description": "Distinct from node heartbeat. A success returns a duration TTL and any attempt-scoped service directive; stale fence, attempt mismatch, or expiry returns 409 without granting write authority.",
         "requestBody": {
           "required": true,
           "content": {
@@ -185,7 +185,7 @@
         },
         "responses": {
           "200": {
-            "description": "Lease renewed.",
+            "description": "Lease renewed with a duration TTL and any stop or restart directive for this payload.",
             "content": {
               "application/json": {
                 "schema": { "$ref": "./common.v1.json#/components/schemas/AttemptLease" }

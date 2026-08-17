@@ -45,10 +45,21 @@ type Job struct {
 
 // AttemptLease is the authority returned by a successful claim or renewal.
 type AttemptLease struct {
-	AttemptID    string    `json:"attempt_id"`
-	FencingToken string    `json:"fencing_token"`
-	LeaseExpires time.Time `json:"lease_expires_at"`
+	AttemptID    string           `json:"attempt_id"`
+	FencingToken string           `json:"fencing_token"`
+	LeaseExpires time.Time        `json:"lease_expires_at"`
+	LeaseTTL     time.Duration    `json:"lease_ttl"`
+	Directive    AttemptDirective `json:"directive,omitempty"`
 }
+
+// AttemptDirective carries service intent to the currently fenced payload.
+// The empty value means no lifecycle change is requested.
+type AttemptDirective string
+
+const (
+	AttemptDirectiveStop    AttemptDirective = "stop"
+	AttemptDirectiveRestart AttemptDirective = "restart"
+)
 
 // Claim is returned when an eligible queued job is won.
 type Claim struct {
