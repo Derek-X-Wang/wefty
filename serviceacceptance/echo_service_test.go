@@ -41,6 +41,74 @@ func TestServiceStartsAndAnswers(t *testing.T) {
 	harness.waitForJobState(t, job.JobID, contract.JobSucceeded, 5*time.Second)
 }
 
+func TestGuardianReapsPayloadWhenAgentIsSIGKILLed(t *testing.T) {
+	harness := newAcceptanceHarness(t)
+	port := reservePort(t)
+	job := harness.submitEchoService(t, port)
+
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	health := waitForHealth(t, &http.Client{Timeout: time.Second}, baseURL, harness.agent)
+	harness.waitForJobState(t, job.JobID, contract.JobRunning, 5*time.Second)
+	started := time.Now()
+	harness.agent.kill(t)
+	waitForProcessAbsent(t, health.PID, 5*time.Second)
+	if elapsed := time.Since(started); elapsed >= 1*time.Second {
+		t.Fatalf("guardian reap took %s, want before the one-second lease expires", elapsed)
+	}
+
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("payload port remained occupied after agent SIGKILL: %v", err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPublishedPortPreflightLatchesFailureWithoutKillingOwner(t *testing.T) {
+	harness := newAcceptanceHarness(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	job := harness.submitEchoService(t, port)
+	failed := harness.waitForJobState(t, job.JobID, contract.JobFailed, 5*time.Second)
+
+	var failure struct {
+		Code          contract.SpawnFailureCode `json:"code"`
+		NodeID        string                    `json:"node_id"`
+		PublishedPort int                       `json:"published_port"`
+	}
+	if err := json.Unmarshal(failed.LastFailure, &failure); err != nil {
+		t.Fatalf("decode last_failure %s: %v", failed.LastFailure, err)
+	}
+	if failure.Code != contract.SpawnFailurePublishedPortOccupied ||
+		failure.NodeID != "acceptance-node" || failure.PublishedPort != port {
+		t.Fatalf("last_failure = %#v, want occupied port with node and port", failure)
+	}
+	var failureFields map[string]json.RawMessage
+	if err := json.Unmarshal(failed.LastFailure, &failureFields); err != nil {
+		t.Fatal(err)
+	}
+	for field := range failureFields {
+		if strings.Contains(field, "owner") {
+			t.Fatalf("last_failure guessed an owner in field %q: %s", field, failed.LastFailure)
+		}
+	}
+	if failed.DesiredState != contract.ServiceDesiredRunning || failed.RestartStreak != 0 ||
+		failed.LifetimeRestartCount != 0 || failed.RestartPending(contract.JobFailed, time.Now()) {
+		t.Fatalf("failed service consumed restart budget or changed intent: %#v", failed.ServiceJob)
+	}
+
+	connection, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("published-port owner was disturbed: %v", err)
+	}
+	_ = connection.Close()
+}
+
 func reservePort(t *testing.T) int {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -52,6 +120,18 @@ func reservePort(t *testing.T) int {
 		t.Fatalf("release backend port reservation: %v", err)
 	}
 	return port
+}
+
+func waitForProcessAbsent(t *testing.T, pid int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("payload PID %d survived agent SIGKILL", pid)
 }
 
 func waitForHealth(

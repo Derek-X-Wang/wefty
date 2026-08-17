@@ -57,6 +57,7 @@ type Config struct {
 	LogRetryInterval    time.Duration
 	LogSpoolDirectory   string
 	LogSpoolMaxBytes    int64
+	GuardianExecutable  string
 	Runner              ProcessRunner
 	OutputSinkFactory   OutputSinkFactory
 	HandoffRoot         string
@@ -119,7 +120,9 @@ func New(config Config) (*Agent, error) {
 		return nil, err
 	}
 	if runner == nil {
-		runner = processrunner.New(processrunner.Config{Clock: processClockAdapter{clock: clock}})
+		runner = processrunner.New(processrunner.Config{
+			Clock: processClockAdapter{clock: clock}, GuardianExecutable: config.GuardianExecutable,
+		})
 	}
 	registration := contract.NodeRegistration{
 		NodeID:        config.NodeID,
@@ -231,8 +234,24 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		renewalInterval: a.renewalInterval, completionRetry: a.logRetryInterval,
 		outputSinkFactory: a.outputSinkFactory, handoffs: a.handoffs,
 		nodeID: a.registration.NodeID, workflowBridge: a.startWorkflowBridge, logf: a.logf,
-		observer: a.observer,
+		observer: a.observer, preflight: a.preflightPublishedPort,
 	})
+}
+
+func (a *Agent) preflightPublishedPort(claim l1.Claim) *contract.SpawnFailure {
+	port := claim.Job.Spec.PublishedPort
+	if claim.Job.Spec.Class != contract.JobClassService || port == nil || a.fabric == nil {
+		return nil
+	}
+	listener, err := a.fabric.Listen("tcp", fmt.Sprintf(":%d", *port))
+	if err != nil {
+		return &contract.SpawnFailure{
+			Code:    contract.SpawnFailurePublishedPortOccupied,
+			Message: fmt.Sprintf("node %s published port %d is occupied", a.registration.NodeID, *port),
+		}
+	}
+	_ = listener.Close()
+	return nil
 }
 
 // Status returns an agent-local lifecycle and occupancy snapshot. It does not

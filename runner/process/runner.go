@@ -1,4 +1,4 @@
-// Package process executes native one-shot workloads without a shell.
+// Package process executes native workloads without a shell.
 package process
 
 import (
@@ -55,6 +55,7 @@ func (function OutputSinkFunc) WriteOutput(ctx context.Context, event contract.L
 // clock with the completion clock; a nil channel starts no completion clock.
 type Request struct {
 	AttemptID        string
+	Class            string
 	Execution        contract.ExecutionSpec
 	Limits           *contract.JobLimits
 	IdlePolicy       IdlePolicy
@@ -66,6 +67,7 @@ type Request struct {
 type Config struct {
 	Clock                Clock
 	BaseEnvironment      []string
+	GuardianExecutable   string
 	IdleTimeout          time.Duration
 	CompletionTimeout    time.Duration
 	TerminationGraceTime time.Duration
@@ -75,6 +77,7 @@ type Config struct {
 type Runner struct {
 	clock                Clock
 	baseEnvironment      []string
+	guardianExecutable   string
 	idleTimeout          time.Duration
 	completionTimeout    time.Duration
 	terminationGraceTime time.Duration
@@ -95,6 +98,7 @@ func New(config Config) *Runner {
 	return &Runner{
 		clock:                clock,
 		baseEnvironment:      append([]string(nil), baseEnvironment...),
+		guardianExecutable:   config.GuardianExecutable,
 		idleTimeout:          durationOrDefault(config.IdleTimeout, DefaultIdleTimeout),
 		completionTimeout:    durationOrDefault(config.CompletionTimeout, DefaultCompletionTimeout),
 		terminationGraceTime: durationOrDefault(config.TerminationGraceTime, DefaultTerminationGraceTime),
@@ -117,6 +121,9 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 	idleTimeout, completionTimeout, maxRuntime, err := runner.timeouts(request.Limits)
 	if err != nil {
 		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+	}
+	if request.Class == contract.JobClassService && runner.guardianExecutable != "" {
+		return runner.runGuarded(ctx, request, sink, idleTimeout, completionTimeout, maxRuntime)
 	}
 
 	command := &exec.Cmd{
