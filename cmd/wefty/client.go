@@ -69,6 +69,13 @@ func (c *apiClients) listNodes(ctx context.Context) (l1.NodeList, error) {
 	return result, err
 }
 
+func (c *apiClients) setNodeClaims(ctx context.Context, nodeID string, request l1.NodeIntentRequest) (l1.Node, error) {
+	var node l1.Node
+	path := "/v1/nodes/" + url.PathEscape(nodeID) + "/claims"
+	err := c.l1.do(ctx, http.MethodPost, path, request, nil, &node, http.StatusOK)
+	return node, err
+}
+
 func (c *apiClients) createService(ctx context.Context, spec contract.JobSpec) (l1.Job, error) {
 	var job l1.Job
 	err := c.l1.do(ctx, http.MethodPost, "/v1/jobs", spec, nil, &job, http.StatusCreated, http.StatusOK)

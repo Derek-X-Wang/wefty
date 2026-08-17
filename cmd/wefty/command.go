@@ -94,17 +94,70 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 }
 
 func executeNodes(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
-	if len(args) != 1 || args[0] != "list" {
-		return usageError("usage: wefty nodes list")
+	if len(args) == 1 && args[0] == "list" {
+		result, err := clients.listNodes(ctx)
+		if err != nil {
+			return err
+		}
+		if jsonOutput {
+			return writeJSON(stdout, result)
+		}
+		return writeNodesTable(stdout, result.Nodes)
 	}
-	result, err := clients.listNodes(ctx)
+	if len(args) > 0 && args[0] == "set-claims" {
+		return executeSetNodeClaims(ctx, clients, jsonOutput, args[1:], stdout)
+	}
+	return usageError("usage: wefty nodes list | wefty nodes set-claims NODE_ID --claims-enabled BOOL --intent-revision REVISION --reason REASON")
+}
+
+func executeSetNodeClaims(
+	ctx context.Context,
+	clients *apiClients,
+	jsonOutput bool,
+	args []string,
+	stdout io.Writer,
+) error {
+	args = moveFirstPositionalToEnd(args)
+	flags := flag.NewFlagSet("nodes set-claims", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	var claimsEnabled explicitBoolFlag
+	var intentRevision int64
+	var reason string
+	flags.Var(&claimsEnabled, "claims-enabled", "whether the node may claim new jobs (true or false)")
+	flags.Int64Var(&intentRevision, "intent-revision", 0, "intent revision observed in nodes list")
+	flags.StringVar(&reason, "reason", "", "operator reason recorded with the intent")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return usageError("usage: wefty nodes set-claims NODE_ID --claims-enabled BOOL --intent-revision REVISION --reason REASON")
+	}
+	seenRevision := false
+	flags.Visit(func(visited *flag.Flag) {
+		if visited.Name == "intent-revision" {
+			seenRevision = true
+		}
+	})
+	if !claimsEnabled.set {
+		return usageError("nodes set-claims requires --claims-enabled=true or --claims-enabled=false")
+	}
+	if !seenRevision || intentRevision < 0 {
+		return usageError("nodes set-claims requires a non-negative --intent-revision")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return usageError("nodes set-claims requires --reason")
+	}
+	node, err := clients.setNodeClaims(ctx, flags.Arg(0), l1.NodeIntentRequest{
+		ClaimsEnabled: claimsEnabled.value, IntentRevision: intentRevision, Reason: reason,
+	})
 	if err != nil {
 		return err
 	}
 	if jsonOutput {
-		return writeJSON(stdout, result)
+		return writeJSON(stdout, node)
 	}
-	return writeNodesTable(stdout, result.Nodes)
+	return writeNodesTable(stdout, []l1.Node{node})
 }
 
 func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
@@ -340,6 +393,28 @@ func (f *stringListFlag) Set(value string) error {
 }
 
 func (f *stringListFlag) String() string { return strings.Join(*f, ",") }
+
+type explicitBoolFlag struct {
+	value bool
+	set   bool
+}
+
+func (f *explicitBoolFlag) Set(value string) error {
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return errors.New("must be true or false")
+	}
+	f.value = parsed
+	f.set = true
+	return nil
+}
+
+func (f *explicitBoolFlag) String() string {
+	if !f.set {
+		return ""
+	}
+	return strconv.FormatBool(f.value)
+}
 
 type scriptMode struct{ value *uint32 }
 
