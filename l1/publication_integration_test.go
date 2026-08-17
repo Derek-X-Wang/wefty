@@ -206,7 +206,7 @@ func TestAttemptPublicationRejectsPortlessAndOmitsReadiness(t *testing.T) {
 func assertAttemptPublicationRejectsPortlessAndOmitsReadiness(t *testing.T) {
 	t.Helper()
 	fixture := newPublicationFixture(t, nil)
-	status, _, body := fixture.h.do(fixture.client, http.MethodGet, "/v1/jobs/"+fixture.job.JobID, nil)
+	status, _, body := fixture.h.do(fixture.client, http.MethodGet, "/v1/jobs/"+fixture.job.JobID+"?class=service", nil)
 	if status != http.StatusOK {
 		t.Fatalf("get portless service status = %d body=%s", status, body)
 	}
@@ -323,7 +323,7 @@ func publishFixture(t *testing.T, fixture publicationFixture) Job {
 
 func assertUnpublishedJob(t *testing.T, h *integrationHarness, client *http.Client, jobID string) {
 	t.Helper()
-	status, _, body := h.do(client, http.MethodGet, "/v1/jobs/"+jobID, nil)
+	status, _, body := h.do(client, http.MethodGet, "/v1/jobs/"+jobID+"?class=service", nil)
 	if status != http.StatusOK {
 		t.Fatalf("get unpublished job status = %d body=%s", status, body)
 	}
@@ -390,7 +390,7 @@ func assertOperatorReadyRequiresCurrentActiveAuthority(t *testing.T) {
 			fixture := newPublicationFixture(t, &port)
 			publishFixture(t, fixture)
 			test.mutate(t, fixture)
-			status, _, body := fixture.h.do(fixture.client, http.MethodGet, "/v1/jobs/"+fixture.job.JobID, nil)
+			status, _, body := fixture.h.do(fixture.client, http.MethodGet, "/v1/jobs/"+fixture.job.JobID+"?class=service", nil)
 			if status != http.StatusOK {
 				t.Fatalf("get job status = %d body=%s", status, body)
 			}

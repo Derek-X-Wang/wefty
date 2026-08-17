@@ -161,7 +161,7 @@ func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
 	return job
 }
 
-func (h *acceptanceHarness) waitForJobState(t *testing.T, jobID string, state contract.JobState, timeout time.Duration) l1.Job {
+func (h *acceptanceHarness) waitForJobState(t *testing.T, jobID, class string, state contract.JobState, timeout time.Duration) l1.Job {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -169,7 +169,11 @@ func (h *acceptanceHarness) waitForJobState(t *testing.T, jobID string, state co
 			t.Fatalf("agent exited while waiting for job %q: %v\n%s", state, h.agent.waitError(), h.agent.outputString())
 		}
 		var job l1.Job
-		status, body := h.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID, nil, &job)
+		path := "/v1/jobs/" + jobID
+		if class == contract.JobClassService {
+			path += "?class=service"
+		}
+		status, body := h.doJSON(t, http.MethodGet, path, nil, &job)
 		if status != http.StatusOK {
 			t.Fatalf("get job status = %d body=%s", status, body)
 		}

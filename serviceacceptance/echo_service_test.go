@@ -32,7 +32,7 @@ func TestServiceRestartsAfterSuccessfulProcessExit(t *testing.T) {
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	client := &http.Client{Timeout: 5 * time.Second}
 	health := waitForHealth(t, client, baseURL, harness.agent)
-	running := harness.waitForJobState(t, job.JobID, contract.JobRunning, 5*time.Second)
+	running := harness.waitForJobState(t, job.JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
 	if running.CurrentAttemptID == "" {
 		t.Fatal("running service has no attempt ID")
 	}
@@ -68,7 +68,7 @@ func waitForFreshRunningAttempt(t *testing.T, harness *acceptanceHarness, jobID,
 			t.Fatalf("agent exited while waiting for service restart: %v\n%s", harness.agent.waitError(), harness.agent.outputString())
 		}
 		var job l1.Job
-		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID, nil, &job)
+		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID+"?class=service", nil, &job)
 		if status != http.StatusOK {
 			t.Fatalf("get restarted service status = %d body=%s", status, body)
 		}
@@ -91,7 +91,7 @@ func TestGuardianReapsPayloadWhenAgentIsSIGKILLed(t *testing.T) {
 
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	health := waitForHealth(t, &http.Client{Timeout: time.Second}, baseURL, harness.agent)
-	harness.waitForJobState(t, job.JobID, contract.JobRunning, 5*time.Second)
+	harness.waitForJobState(t, job.JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
 	started := time.Now()
 	harness.agent.kill(t)
 	waitForProcessAbsent(t, health.PID, 5*time.Second)
@@ -117,7 +117,7 @@ func TestPublishedPortPreflightLatchesFailureWithoutKillingOwner(t *testing.T) {
 	defer listener.Close()
 	port := listener.Addr().(*net.TCPAddr).Port
 	job := harness.submitEchoService(t, port)
-	failed := harness.waitForJobState(t, job.JobID, contract.JobFailed, 5*time.Second)
+	failed := harness.waitForJobState(t, job.JobID, contract.JobClassService, contract.JobFailed, 5*time.Second)
 
 	var failure struct {
 		Code          contract.SpawnFailureCode `json:"code"`

@@ -41,7 +41,7 @@ func assertServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove", nil)
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove?class=service", nil)
 	if status != http.StatusAccepted {
 		t.Fatalf("remove status = %d body=%s", status, body)
 	}
@@ -116,7 +116,7 @@ func assertServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
 		directive.RootInstanceID != node.RootInstanceID || directive.CleanupFence == "" {
 		t.Fatalf("removal directive = %#v", directive)
 	}
-	status, _, repeatedBody := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove", nil)
+	status, _, repeatedBody := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove?class=service", nil)
 	if status != http.StatusAccepted {
 		t.Fatalf("repeated remove status = %d body=%s", status, repeatedBody)
 	}
@@ -232,7 +232,7 @@ func assertServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
 			tombstoneDispatchHash, tombstoneRequestHash, tombstoneCreated, tombstoneRequested, tombstoneRemoved,
 			tombstoneOutcome, tombstoneNode, tombstoneGeneration, tombstoneRoot, tombstoneAcknowledged)
 	}
-	status, _, body = h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove", nil)
+	status, _, body = h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove?class=service", nil)
 	if status != http.StatusAccepted {
 		t.Fatalf("already-removed replay = %d body=%s", status, body)
 	}
@@ -321,7 +321,7 @@ func assertServiceRemovalForceForgetLeavesDirectiveStanding(t *testing.T) {
 	job := submitRemovalService(t, h, client, removalServiceSpec("force-forget", nil))
 	claimRestartService(t, h, agent, node)
 
-	status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/forget", ForceForgetRequest{Force: true})
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/forget?class=service", ForceForgetRequest{Force: true})
 	if status != http.StatusOK {
 		t.Fatalf("force forget status = %d body=%s", status, body)
 	}
@@ -401,7 +401,7 @@ func assertServiceRemovalAcceptsEveryBoundServiceState(t *testing.T) {
 			if _, err := h.store.db.Exec(`UPDATE service_jobs SET desired_state=? WHERE job_id=?`, test.desired, job.JobID); err != nil {
 				t.Fatal(err)
 			}
-			status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove", nil)
+			status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove?class=service", nil)
 			if status != http.StatusAccepted {
 				t.Fatalf("remove from %s = %d body=%s", test.state, status, body)
 			}
@@ -421,7 +421,7 @@ func assertUnboundServiceRemovalFinalizesWithoutAgentAttestation(t *testing.T) {
 	h := newIntegrationHarness(t, nil)
 	client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
 	job := submitRemovalService(t, h, client, removalServiceSpec("remove-unbound", nil))
-	status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove", nil)
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove?class=service", nil)
 	if status != http.StatusAccepted {
 		t.Fatalf("unbound remove status = %d body=%s", status, body)
 	}
@@ -516,7 +516,7 @@ func TestServiceRemovalWALCheckpointRetriesBlockedReaders(t *testing.T) {
 		_ = conn.Close()
 		close(released)
 	}()
-	status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove", nil)
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/remove?class=service", nil)
 	if status != http.StatusAccepted {
 		t.Fatalf("remove with blocked reader = %d body=%s", status, body)
 	}

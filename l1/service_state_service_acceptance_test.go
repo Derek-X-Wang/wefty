@@ -39,8 +39,8 @@ func TestServiceAcceptanceStateMetadataAndSlotLifecycle(t *testing.T) {
 	if service.ServiceJob == nil || service.DesiredState != contract.ServiceDesiredRunning {
 		t.Fatalf("created service metadata = %#v", service.ServiceJob)
 	}
-	if service.PublishedPort == nil || *service.PublishedPort != port {
-		t.Fatalf("created service published_port = %v, want %d", service.PublishedPort, port)
+	if service.PublishedPort != nil || service.Spec.PublishedPort == nil || *service.Spec.PublishedPort != port || service.Ready == nil || *service.Ready {
+		t.Fatalf("created service publication/configuration = published %v spec %v ready %v", service.PublishedPort, service.Spec.PublishedPort, service.Ready)
 	}
 
 	oneshot := h.submit(client, "one-shot-without-service-state", []string{"one-shot-only"})

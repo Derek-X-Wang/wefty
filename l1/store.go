@@ -710,10 +710,22 @@ AND state=@job_queued
 		return nil, internalError(err, "atomically claim job")
 	}
 	fencingToken := strconv.FormatInt(fence, 10)
+	attemptCreatedNS := now.UnixNano()
+	var latestRestartNS sql.NullInt64
+	if err := tx.QueryRowContext(ctx, "SELECT MAX(created_ns) FROM service_restart_requests WHERE job_id=?", jobID).Scan(&latestRestartNS); err != nil {
+		return nil, internalError(err, "read latest service restart request")
+	}
+	// A restart request applies only to the attempt that existed when it was
+	// accepted. SQLite and injected clocks may return the same nanosecond for
+	// consecutive transactions, so make the fresh attempt strictly newer than
+	// every already-consumed request instead of relying on wall-clock progress.
+	if latestRestartNS.Valid && latestRestartNS.Int64 >= attemptCreatedNS {
+		attemptCreatedNS = latestRestartNS.Int64 + 1
+	}
 	_, err = tx.ExecContext(ctx, `
 	INSERT INTO attempts(attempt_id, job_id, node_id, boot_session_id, state, fencing_token, lease_expires_ns, authority_generation, created_ns, updated_ns)
 	VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, attemptID, jobID, nodeID, bootSessionID, contract.AttemptClaimed,
-		fencingToken, leaseExpires.UnixNano(), authorityGeneration, now.UnixNano(), now.UnixNano())
+		fencingToken, leaseExpires.UnixNano(), authorityGeneration, attemptCreatedNS, now.UnixNano())
 	if err != nil {
 		return nil, internalError(err, "create claimed attempt")
 	}

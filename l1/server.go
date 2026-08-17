@@ -170,8 +170,12 @@ type identityContextKey struct{}
 func (s *Server) routes() http.Handler {
 	client := http.NewServeMux()
 	client.HandleFunc("POST /v1/jobs", s.createJob)
+	client.HandleFunc("GET /v1/jobs", s.listJobs)
+	client.HandleFunc("GET /v1/jobs/{$}", s.listJobs)
 	client.HandleFunc("GET /v1/jobs/{job_id}", s.getJob)
 	client.HandleFunc("GET /v1/jobs/{job_id}/logs", s.getJobLogs)
+	client.HandleFunc("PUT /v1/jobs/{job_id}/desired-state", s.setServiceDesiredState)
+	client.HandleFunc("POST /v1/jobs/{job_id}/restart", s.restartService)
 	client.HandleFunc("POST /v1/jobs/{job_id}/remove", s.removeService)
 	client.HandleFunc("POST /v1/jobs/{job_id}/forget", s.forceForgetService)
 	client.HandleFunc("POST /v1/jobs/{job_id}/prompt", s.notImplemented)
@@ -286,7 +290,35 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		w.Header().Set("Idempotency-Replayed", "true")
 	}
+	if job.ServiceJob != nil || job.Removal != nil {
+		job, err = s.store.projectServiceJob(r.Context(), job)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+	}
 	writeJSON(w, status, redactJob(job))
+}
+
+func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
+	if err := requireServiceClass(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	page, err := s.store.ListServiceJobs(r.Context(), r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	for index := range page.Jobs {
+		page.Jobs[index] = redactJob(page.Jobs[index])
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
@@ -295,10 +327,30 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if err := validateJobRouteClass(r, job); err != nil {
+		writeError(w, err)
+		return
+	}
+	if job.ServiceJob != nil || job.Removal != nil {
+		job, err = s.store.projectServiceJob(r.Context(), job)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, redactJob(job))
 }
 
 func (s *Server) getJobLogs(w http.ResponseWriter, r *http.Request) {
+	job, err := s.store.GetJob(r.Context(), r.PathValue("job_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := validateJobRouteClass(r, job); err != nil {
+		writeError(w, err)
+		return
+	}
 	limit, err := parseLogLimit(r.URL.Query().Get("limit"))
 	if err != nil {
 		writeError(w, err)
@@ -312,8 +364,68 @@ func (s *Server) getJobLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, page)
 }
 
+func (s *Server) setServiceDesiredState(w http.ResponseWriter, r *http.Request) {
+	if err := requireServiceClass(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	var request ServiceDesiredStateRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	job, err := s.store.SetServiceDesiredState(r.Context(), r.PathValue("job_id"), request.DesiredState)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	job, err = s.store.projectServiceJob(r.Context(), job)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, redactJob(job))
+}
+
+func (s *Server) restartService(w http.ResponseWriter, r *http.Request) {
+	if err := requireServiceClass(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	var request ServiceRestartRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	job, replayed, err := s.store.RestartService(r.Context(), r.PathValue("job_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	job, err = s.store.projectServiceJob(r.Context(), job)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusAccepted
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, redactJob(job))
+}
+
 func (s *Server) removeService(w http.ResponseWriter, r *http.Request) {
+	if err := requireServiceClass(r); err != nil {
+		writeError(w, err)
+		return
+	}
 	job, err := s.store.RemoveService(r.Context(), r.PathValue("job_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	job, err = s.store.projectServiceJob(r.Context(), job)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -322,6 +434,10 @@ func (s *Server) removeService(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) forceForgetService(w http.ResponseWriter, r *http.Request) {
+	if err := requireServiceClass(r); err != nil {
+		writeError(w, err)
+		return
+	}
 	var request ForceForgetRequest
 	if err := decodeJSON(r, &request); err != nil {
 		writeError(w, err)
@@ -332,6 +448,11 @@ func (s *Server) forceForgetService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	job, err := s.store.ForceForgetService(r.Context(), r.PathValue("job_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	job, err = s.store.projectServiceJob(r.Context(), job)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -568,8 +689,16 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusInternalServerError
 	}
 	message := err.Error()
+	var details map[string]any
+	var protocolErr *Error
+	if errors.As(err, &protocolErr) {
+		details = protocolErr.Details
+	}
 	if code == contract.ErrorInternal {
 		message = "internal server error"
 	}
-	writeJSON(w, status, contract.ErrorResponse{Error: contract.APIError{Code: code, Message: message, Retryable: code == contract.ErrorInternal}})
+	writeJSON(w, status, contract.ErrorResponse{Error: contract.APIError{
+		Code: code, Message: message, Retryable: code == contract.ErrorInternal || code == contract.ErrorCapacityExhausted,
+		Details: details,
+	}})
 }

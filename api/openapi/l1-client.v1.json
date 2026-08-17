@@ -48,6 +48,38 @@
           "422": { "$ref": "./common.v1.json#/components/responses/UnprocessableEntity" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
         }
+      },
+      "get": {
+        "operationId": "listServiceJobs",
+        "summary": "List service-class jobs",
+        "description": "Returns active service jobs in stable creation/job-ID order. Bare collection reads are invalid; class=service is mechanically required.",
+        "parameters": [
+          { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } },
+          { "name": "cursor", "in": "query", "description": "Opaque cursor returned by the previous page.", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "One stable page of active service jobs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["jobs"],
+                  "properties": {
+                    "jobs": { "type": "array", "items": { "$ref": "./common.v1.json#/components/schemas/Job" } },
+                    "next_cursor": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
       }
     },
     "/v1/jobs/{job_id}": {
@@ -61,7 +93,10 @@
       ],
       "get": {
         "operationId": "getJob",
-        "summary": "Read job status",
+        "summary": "Read service job status",
+        "parameters": [
+          { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } }
+        ],
         "responses": {
           "200": {
             "description": "Current job record.",
@@ -71,6 +106,7 @@
               }
             }
           },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
@@ -90,6 +126,7 @@
         "operationId": "getJobLogs",
         "summary": "Poll ordered job logs",
         "parameters": [
+          { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } },
           {
             "name": "cursor",
             "in": "query",
@@ -118,6 +155,91 @@
         }
       }
     },
+    "/v1/jobs/{job_id}/desired-state": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "put": {
+        "operationId": "setServiceDesiredState",
+        "summary": "Start or stop a service by setting durable desired state",
+        "description": "The mutation is idempotent and asynchronous. Running does not disturb a healthy attempt; a latched failed service rejects start and requires restart.",
+        "parameters": [
+          { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["desired_state"],
+                "properties": {
+                  "desired_state": { "enum": ["running", "stopped"] }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Desired state accepted; observed state may still be converging.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}/restart": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "restartService",
+        "summary": "Explicitly restart a service under the same job identity",
+        "description": "Durably idempotent. Clears the failed latch, restart streak, last failure, and pending backoff, and directs any active attempt to stop before a fresh attempt is claimed.",
+        "parameters": [
+          { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["idempotency_key"],
+                "properties": {
+                  "idempotency_key": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Identical restart replay; no second restart was issued.",
+            "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } },
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } }
+          },
+          "202": {
+            "description": "Restart accepted.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/jobs/{job_id}/remove": {
       "parameters": [
         { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }
@@ -126,6 +248,9 @@
         "operationId": "removeService",
         "summary": "Irreversibly request service removal",
         "description": "Idempotent and asynchronous in every service state. The controller transaction revokes execution authority and scrubs SensitiveEnv plus controller logs before returning. A never-bound service finalizes immediately because no managed resource could exist.",
+        "parameters": [
+          { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } }
+        ],
         "responses": {
           "202": {
             "description": "Removal is pending agent attestation, or is already terminal.",
@@ -148,6 +273,9 @@
         "operationId": "forceForgetService",
         "summary": "Waive service cleanup verification",
         "description": "Permanently records forgotten_cleanup_unverified without cancelling the standing deletion directive and without invoking local deletion.",
+        "parameters": [
+          { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } }
+        ],
         "requestBody": {
           "required": true,
           "content": {

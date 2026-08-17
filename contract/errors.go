@@ -24,6 +24,7 @@ const (
 	ErrorAttemptMismatch           ErrorCode = "attempt_mismatch"
 	ErrorDispatchKeyConflict       ErrorCode = "dispatch_key_conflict"
 	ErrorIdempotencyConflict       ErrorCode = "idempotency_conflict"
+	ErrorCapacityExhausted         ErrorCode = "capacity_exhausted"
 	ErrorUnsupportedKind           ErrorCode = "unsupported_kind"
 	ErrorUnsupportedClass          ErrorCode = "unsupported_class"
 	ErrorUnsupportedRuntimeHandler ErrorCode = "unsupported_runtime_handler"

@@ -12,6 +12,7 @@ type Error struct {
 	Code    contract.ErrorCode
 	Message string
 	Cause   error
+	Details map[string]any
 }
 
 func (e *Error) Error() string {
@@ -25,6 +26,10 @@ func (e *Error) Unwrap() error { return e.Cause }
 
 func protocolError(code contract.ErrorCode, format string, args ...any) error {
 	return &Error{Code: code, Message: fmt.Sprintf(format, args...)}
+}
+
+func protocolErrorWithDetails(code contract.ErrorCode, details map[string]any, format string, args ...any) error {
+	return &Error{Code: code, Message: fmt.Sprintf(format, args...), Details: details}
 }
 
 func internalError(err error, message string) error {
