@@ -30,7 +30,7 @@ func TestServiceRestartsAfterSuccessfulProcessExit(t *testing.T) {
 	baseURL := "http://published-service.invalid"
 	client := harness.publishedHTTPClient(t, port)
 	health := waitForHealth(t, client, baseURL, harness.agent)
-	running := harness.waitForJobState(t, job.JobID, contract.JobRunning, 5*time.Second)
+	running := harness.waitForJobState(t, job.JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
 	if running.CurrentAttemptID == "" {
 		t.Fatal("running service has no attempt ID")
 	}
@@ -70,7 +70,7 @@ func waitForPublicationCleared(t *testing.T, harness *acceptanceHarness, jobID s
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		var job l1.Job
-		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID, nil, &job)
+		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID+"?class=service", nil, &job)
 		if status != http.StatusOK {
 			t.Fatalf("get withdrawn service status = %d body=%s", status, body)
 		}
@@ -90,7 +90,7 @@ func waitForFreshRunningAttempt(t *testing.T, harness *acceptanceHarness, jobID,
 			t.Fatalf("agent exited while waiting for service restart: %v\n%s", harness.agent.waitError(), harness.agent.outputString())
 		}
 		var job l1.Job
-		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID, nil, &job)
+		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID+"?class=service", nil, &job)
 		if status != http.StatusOK {
 			t.Fatalf("get restarted service status = %d body=%s", status, body)
 		}
@@ -113,7 +113,7 @@ func TestGuardianReapsPayloadWhenAgentIsSIGKILLed(t *testing.T) {
 
 	baseURL := "http://published-service.invalid"
 	health := waitForHealth(t, harness.publishedHTTPClient(t, port), baseURL, harness.agent)
-	harness.waitForJobState(t, job.JobID, contract.JobRunning, 5*time.Second)
+	harness.waitForJobState(t, job.JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
 	started := time.Now()
 	harness.agent.kill(t)
 	waitForProcessAbsent(t, health.PID, 5*time.Second)
@@ -133,12 +133,12 @@ func TestGuardianReapsPayloadWhenAgentIsSIGKILLed(t *testing.T) {
 func TestPortlessServiceSkipsReadinessAndKeepsRunning(t *testing.T) {
 	harness := newAcceptanceHarness(t)
 	job := harness.submitPortlessService(t)
-	running := harness.waitForJobState(t, job.JobID, contract.JobRunning, 5*time.Second)
+	running := harness.waitForJobState(t, job.JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
 	if running.PublishedPort != nil || running.Ready != nil || running.CurrentAttemptID == "" {
 		t.Fatalf("portless projection = port %v ready %v attempt %q", running.PublishedPort, running.Ready, running.CurrentAttemptID)
 	}
 	time.Sleep(750 * time.Millisecond)
-	stillRunning := harness.waitForJobState(t, job.JobID, contract.JobRunning, time.Second)
+	stillRunning := harness.waitForJobState(t, job.JobID, contract.JobClassService, contract.JobRunning, time.Second)
 	if stillRunning.CurrentAttemptID != running.CurrentAttemptID {
 		t.Fatalf("portless service restarted without process death: before %q after %q", running.CurrentAttemptID, stillRunning.CurrentAttemptID)
 	}
@@ -178,7 +178,10 @@ func waitForHealth(
 	agent *managedProcess,
 ) serviceHealth {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// A failure budget, not a success-path delay. The capacity tests start
+	// several real services and one-shots at once, and 5s was tight enough to
+	// lose to scheduler noise on a loaded runner.
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if agent.exited() {
 			t.Fatalf("agent exited before service became healthy: %v\n%s", agent.waitError(), agent.outputString())

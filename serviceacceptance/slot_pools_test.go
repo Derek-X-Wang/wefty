@@ -31,8 +31,8 @@ func TestClassPoolsRunAtCapacityAndIsolateSiblings(t *testing.T) {
 	serviceURLs := []string{"http://service-a.invalid", "http://service-b.invalid"}
 	healthA := waitForHealth(t, serviceClients[0], serviceURLs[0], harness.agent)
 	healthB := waitForHealth(t, serviceClients[1], serviceURLs[1], harness.agent)
-	runningA := harness.waitForJobState(t, services[0].JobID, contract.JobRunning, 5*time.Second)
-	harness.waitForJobState(t, services[1].JobID, contract.JobRunning, 5*time.Second)
+	runningA := harness.waitForJobState(t, services[0].JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
+	harness.waitForJobState(t, services[1].JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
 	assertJobRemainsQueued(t, harness, services[2].JobID, 300*time.Millisecond)
 
 	oneshots := make([]l1.Job, 0, 5)
@@ -60,7 +60,7 @@ func TestClassPoolsRunAtCapacityAndIsolateSiblings(t *testing.T) {
 	assertJobRemainsQueued(t, harness, services[2].JobID, 300*time.Millisecond)
 
 	for index, job := range oneshots {
-		harness.waitForJobState(t, job.JobID, contract.JobSucceeded, 8*time.Second)
+		harness.waitForJobState(t, job.JobID, contract.JobClassOneShot, contract.JobSucceeded, 8*time.Second)
 		output := harness.agent.outputString()
 		if !attributedOutputContains(output, job.JobID, fmt.Sprintf("oneshot-%d", index)) {
 			t.Fatalf("one-shot %s output was not visibly attributed\n%s", job.JobID, output)
@@ -139,7 +139,7 @@ func assertJobRemainsQueued(t *testing.T, harness *acceptanceHarness, jobID stri
 	deadline := time.Now().Add(duration)
 	for time.Now().Before(deadline) {
 		var job l1.Job
-		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID, nil, &job)
+		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID+"?class=service", nil, &job)
 		if status != http.StatusOK {
 			t.Fatalf("get queued job %s status = %d body=%s", jobID, status, body)
 		}

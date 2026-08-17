@@ -16,10 +16,14 @@ import (
 type ServiceJob struct {
 	DesiredState         contract.ServiceDesiredState `json:"desired_state"`
 	BoundNodeID          string                       `json:"bound_node_id,omitempty"`
+	NodeState            contract.NodeState           `json:"node_state,omitempty"`
+	SlotHeld             bool                         `json:"holds_slot"`
+	UnschedulableReason  string                       `json:"unschedulable_reason,omitempty"`
+	RestartSuppressed    string                       `json:"restart_suppressed_reason,omitempty"`
 	RestartStreak        int                          `json:"restart_streak"`
 	LifetimeRestartCount int                          `json:"lifetime_restart_count"`
 	NextRestartAt        *time.Time                   `json:"next_restart_at,omitempty"`
-	PublishedPort        *int                         `json:"published_port"`
+	PublishedPort        *int                         `json:"published_port,omitempty"`
 	Ready                *bool                        `json:"ready,omitempty"`
 	LastFailure          json.RawMessage              `json:"last_failure,omitempty"`
 	HealthySinceAt       *time.Time                   `json:"healthy_since_at,omitempty"`
@@ -65,9 +69,11 @@ func (columns serviceJobColumns) projection() *ServiceJob {
 	}
 	if columns.publishedPort.Valid {
 		value := int(columns.publishedPort.Int64)
-		service.PublishedPort = &value
 		ready := columns.ready.Valid && columns.ready.Bool
 		service.Ready = &ready
+		if ready {
+			service.PublishedPort = &value
+		}
 	}
 	if columns.lastFailure != nil {
 		service.LastFailure = json.RawMessage(columns.lastFailure)

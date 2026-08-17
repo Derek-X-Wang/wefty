@@ -189,8 +189,9 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	job := object(t, schemas["Job"], "Job")
 	jobProperties := object(t, job["properties"], "Job.properties")
 	for _, field := range []string{
-		"desired_state", "bound_node_id", "restart_streak", "lifetime_restart_count",
-		"next_restart_at", "published_port", "ready", "last_failure", "healthy_since_at",
+		"status", "desired_state", "bound_node_id", "node_state", "holds_slot", "unschedulable_reason",
+		"restart_suppressed_reason", "restart_streak", "lifetime_restart_count", "next_restart_at",
+		"published_port", "ready", "last_failure", "healthy_since_at",
 	} {
 		if _, ok := jobProperties[field]; !ok {
 			t.Errorf("Job response missing service-only %s", field)
@@ -227,6 +228,50 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	clientPaths := object(t, client["paths"], "paths")
 	if _, ok := clientPaths["/v1/nodes/{node_id}/claims"]; !ok {
 		t.Error("client protocol is missing the durable node-claims intent route")
+	}
+}
+
+func TestServiceOperatorRoutesRequireClassSelector(t *testing.T) {
+	t.Parallel()
+	doc := readObject(t, "l1-client.v1.json")
+	paths := object(t, doc["paths"], "paths")
+	operations := []struct {
+		path   string
+		method string
+	}{
+		{path: "/v1/jobs", method: "get"},
+		{path: "/v1/jobs/{job_id}", method: "get"},
+		{path: "/v1/jobs/{job_id}/logs", method: "get"},
+		{path: "/v1/jobs/{job_id}/desired-state", method: "put"},
+		{path: "/v1/jobs/{job_id}/restart", method: "post"},
+		{path: "/v1/jobs/{job_id}/remove", method: "post"},
+		{path: "/v1/jobs/{job_id}/forget", method: "post"},
+	}
+	for _, expected := range operations {
+		path := object(t, paths[expected.path], expected.path)
+		operation := object(t, path[expected.method], expected.path+"."+expected.method)
+		parameters, ok := operation["parameters"].([]any)
+		if !ok {
+			t.Fatalf("%s %s has no operation parameters", expected.method, expected.path)
+		}
+		found := false
+		for _, value := range parameters {
+			parameter := object(t, value, expected.path+" parameter")
+			if parameter["name"] != "class" {
+				continue
+			}
+			found = true
+			if parameter["required"] != true || parameter["in"] != "query" {
+				t.Fatalf("%s %s class selector = %#v", expected.method, expected.path, parameter)
+			}
+			schema := object(t, parameter["schema"], expected.path+" class schema")
+			if schema["const"] != "service" {
+				t.Fatalf("%s %s class const = %v", expected.method, expected.path, schema["const"])
+			}
+		}
+		if !found {
+			t.Fatalf("%s %s is missing class=service", expected.method, expected.path)
+		}
 	}
 }
 

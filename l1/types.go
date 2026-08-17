@@ -42,6 +42,7 @@ type Job struct {
 	JobID  string            `json:"job_id"`
 	NodeID string            `json:"node_id,omitempty"`
 	State  contract.JobState `json:"state"`
+	Status string            `json:"status,omitempty"`
 	// Spec is absent once removal has finalized because tombstones deliberately
 	// retain no executable or environment bytes.
 	Spec             contract.JobSpec `json:"spec,omitzero"`
@@ -94,6 +95,24 @@ type RemovalAcknowledgementRequest struct {
 
 type ForceForgetRequest struct {
 	Force bool `json:"force"`
+}
+
+// ServiceDesiredStateRequest is the single mutation behind operator start and
+// stop adapters. DesiredState is intent; callers must continue polling the
+// observed State/Status projection for completion.
+type ServiceDesiredStateRequest struct {
+	DesiredState contract.ServiceDesiredState `json:"desired_state"`
+}
+
+// ServiceRestartRequest gives an explicit restart its own durable replay key.
+type ServiceRestartRequest struct {
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+// JobList is one stable creation/job-ID ordered page of service jobs.
+type JobList struct {
+	Jobs       []Job  `json:"jobs"`
+	NextCursor string `json:"next_cursor,omitempty"`
 }
 
 // AttemptLease is the authority returned by a successful claim or renewal.

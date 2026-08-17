@@ -30,6 +30,7 @@ func TestWriteErrorPublishesTruthfulRetryability(t *testing.T) {
 		{name: "lease expired", err: protocolError(contract.ErrorLeaseExpired, "expired lease"), wantStatus: http.StatusConflict, wantCode: contract.ErrorLeaseExpired},
 		{name: "stale fence", err: protocolError(contract.ErrorStaleFence, "stale fence"), wantStatus: http.StatusConflict, wantCode: contract.ErrorStaleFence},
 		{name: "attempt mismatch", err: protocolError(contract.ErrorAttemptMismatch, "attempt mismatch"), wantStatus: http.StatusConflict, wantCode: contract.ErrorAttemptMismatch},
+		{name: "capacity exhausted", err: protocolErrorWithDetails(contract.ErrorCapacityExhausted, map[string]any{"node_id": "node-1", "occupancy": 2, "capacity": 2}, "full"), wantStatus: http.StatusConflict, wantCode: contract.ErrorCapacityExhausted, wantRetryable: true},
 	}
 
 	for _, test := range tests {

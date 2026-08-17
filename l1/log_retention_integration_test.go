@@ -323,7 +323,7 @@ func appendRetentionLogs(t *testing.T, h *integrationHarness, agent *http.Client
 
 func getRetentionPage(t *testing.T, h *integrationHarness, client *http.Client, jobID string) LogPage {
 	t.Helper()
-	status, _, body := h.do(client, http.MethodGet, "/v1/jobs/"+jobID+"/logs?limit=1000", nil)
+	status, _, body := h.do(client, http.MethodGet, "/v1/jobs/"+jobID+"/logs?class=service&limit=1000", nil)
 	if status != http.StatusOK {
 		t.Fatalf("get retained logs status = %d body=%s", status, body)
 	}

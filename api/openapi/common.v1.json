@@ -49,6 +49,10 @@
           "state": {
             "enum": ["queued", "claimed", "running", "stopping", "stopped", "awaiting-input", "succeeded", "failed", "removal_pending", "agent_cleaned", "removed_verified", "forgotten_cleanup_unverified"]
           },
+          "status": {
+            "type": "string",
+            "description": "Service jobs only. Computed operator projection; may be restart-pending or unschedulable while persisted state remains queued."
+          },
           "spec": {
             "$ref": "#/components/schemas/JobSpec",
             "description": "Absent after removal finalizes; tombstones retain no executable or environment bytes."
@@ -62,14 +66,30 @@
             "type": "string",
             "description": "Service jobs only. Durable service binding, retained independently of node_id."
           },
+          "node_state": {
+            "enum": ["alive", "stale", "draining", "dead"],
+            "description": "Service jobs only. Current liveness of the bound node."
+          },
+          "holds_slot": {
+            "type": "boolean",
+            "description": "Service jobs only. Whether the binding currently occupies one service slot."
+          },
+          "unschedulable_reason": {
+            "type": "string",
+            "description": "Present when computed status is unschedulable; names the placement or capacity fact preventing claim."
+          },
+          "restart_suppressed_reason": {
+            "type": "string",
+            "description": "Present when durable desired state or a failed latch suppresses automatic restart."
+          },
           "restart_streak": { "type": "integer", "minimum": 0 },
           "lifetime_restart_count": { "type": "integer", "minimum": 0 },
           "next_restart_at": { "type": "string", "format": "date-time" },
           "published_port": {
-            "type": ["integer", "null"],
+            "type": "integer",
             "minimum": 1,
             "maximum": 65535,
-            "description": "Service jobs only. Immutable Fabric-namespace port; null means the service is portless."
+            "description": "Service jobs only. Ready publication endpoint; absent unless ready is true. The immutable requested port remains in spec.published_port."
           },
           "ready": {
             "type": "boolean",
