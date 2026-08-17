@@ -121,6 +121,13 @@ func (c *apiClients) removeService(ctx context.Context, jobID string) (l1.Job, e
 	return job, err
 }
 
+func (c *apiClients) forceForgetService(ctx context.Context, jobID string) (l1.Job, error) {
+	var job l1.Job
+	path := "/v1/jobs/" + url.PathEscape(jobID) + "/forget?class=" + contract.JobClassService
+	err := c.l1.do(ctx, http.MethodPost, path, l1.ForceForgetRequest{Force: true}, nil, &job, http.StatusOK)
+	return job, err
+}
+
 func (c *apiClients) getServiceLogs(ctx context.Context, jobID, cursor string, limit int) (l1.LogPage, error) {
 	query := url.Values{
 		"class": []string{contract.JobClassService},

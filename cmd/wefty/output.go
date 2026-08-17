@@ -131,6 +131,23 @@ func serviceDisplayStatus(job l1.Job) string {
 
 func writeServiceResult(writer io.Writer, job l1.Job, jsonOutput bool) error {
 	service := newServiceOutput(job)
+	return writeServiceOutput(writer, service, jsonOutput)
+}
+
+func writeServiceResultWithWorkingDirectory(
+	writer io.Writer,
+	job l1.Job,
+	workingDirectory string,
+	jsonOutput bool,
+) error {
+	service := newServiceOutput(job)
+	if workingDirectory != "" {
+		service.WorkingDirectory = &workingDirectory
+	}
+	return writeServiceOutput(writer, service, jsonOutput)
+}
+
+func writeServiceOutput(writer io.Writer, service serviceOutput, jsonOutput bool) error {
 	if jsonOutput {
 		return writeJSON(writer, service)
 	}

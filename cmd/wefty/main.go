@@ -127,7 +127,7 @@ const rootUsage = `Usage: wefty [global flags] <command>
 Commands:
   nodes list                 List node liveness and metadata
   services <verb>            Create and operate service-class jobs
-    create|list|status|start|stop|restart|logs|remove
+    create|list|status|start|stop|restart|logs|remove|forget
   submit                     Submit a saved or inline workflow
   rerun RUN_ID               Create a new run from a stored snapshot
   logs RUN_ID [--follow]     Read or follow run logs

@@ -463,3 +463,104 @@ func TestServiceLogFollowEndsOnCancellation(t *testing.T) {
 		t.Fatalf("cancelled service follow = %v", err)
 	}
 }
+
+func TestServiceCLIRemoveAndForceForget(t *testing.T) {
+	assertServiceCLIRemoveAndForceForget(t)
+}
+
+func assertServiceCLIRemoveAndForceForget(t *testing.T) {
+	t.Helper()
+	harness := newServiceCLIHarness(t)
+	ctx := context.Background()
+	workingDirectory := t.TempDir()
+	sentinelPath := filepath.Join(workingDirectory, "operator-owned")
+	if err := os.WriteFile(sentinelPath, []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := harness.store.CreateJob(ctx, contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1,
+		DispatchKey:   "cli-remove-force-forget",
+		Kind:          "process",
+		Class:         contract.JobClassService,
+		Restart:       contract.RestartAlways,
+		RoutingTags:   []string{"remove-cli"},
+		Execution: contract.ExecutionSpec{
+			Executable:       contract.ExecutableSpec{Path: "/bin/sh"},
+			Argv:             []string{"/bin/sh", "-c", "sleep 60"},
+			WorkingDirectory: workingDirectory,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := fabric.Identity{NodeID: "remove-cli-fabric-node"}
+	node, err := harness.store.RegisterNode(ctx, identity, contract.NodeRegistration{
+		NodeID: "remove-cli-node", BootSessionID: "remove-cli-boot", RootInstanceID: "remove-cli-root",
+		OS: "linux", Architecture: "amd64", AgentVersion: "remove-cli-test",
+		Capabilities: map[string]bool{"process": true},
+	}, l1.NodePolicy{Tags: []string{"remove-cli"}, MaxOneshotSlots: 4, MaxServiceSlots: 2}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := harness.store.ClaimJob(ctx, identity.NodeID, node.NodeID, node.BootSessionID, contract.JobClassService)
+	if err != nil || claim == nil || claim.Job.JobID != job.JobID {
+		t.Fatalf("claim removal service = %#v, %v", claim, err)
+	}
+
+	removedOutput := runServiceCLI(t, ctx, harness.clients, false, "services", "remove", job.JobID)
+	managedDataPath := filepath.ToSlash(filepath.Join(
+		"<managed-root>", "agent", "nodes", managedroot.EncodeID(node.NodeID),
+		"services", managedroot.EncodeID(job.JobID), "data",
+	))
+	for _, expected := range []string{
+		string(contract.JobRemovalPending),
+		managedDataPath + " (deleted by remove)",
+		workingDirectory + " (external; never deleted)",
+	} {
+		if !bytes.Contains(removedOutput, []byte(expected)) {
+			t.Fatalf("remove output omitted %q: %s", expected, removedOutput)
+		}
+	}
+	if payload, readErr := os.ReadFile(sentinelPath); readErr != nil || string(payload) != "untouched" {
+		t.Fatalf("remove touched operator WorkingDirectory: payload=%q err=%v", payload, readErr)
+	}
+
+	replayed := runServiceCLI(t, ctx, harness.clients, true, "services", "remove", job.JobID)
+	var replayedRemoval map[string]any
+	if err := json.Unmarshal(replayed, &replayedRemoval); err != nil ||
+		replayedRemoval["state"] != string(contract.JobRemovalPending) {
+		t.Fatalf("idempotent remove = %#v, err=%v output=%s", replayedRemoval, err, replayed)
+	}
+	waitStarted := time.Now()
+	var waitOut, waitErr bytes.Buffer
+	err = execute(ctx, harness.clients, true, []string{
+		"services", "remove", job.JobID, "--wait", "30ms", "--poll-interval", "5ms",
+	}, &waitOut, &waitErr)
+	if err == nil || !strings.Contains(err.Error(), "timed out after 30ms") || time.Since(waitStarted) > time.Second {
+		t.Fatalf("bounded pending removal wait = %v after %s", err, time.Since(waitStarted))
+	}
+
+	var forgetOut, forgetErr bytes.Buffer
+	err = execute(ctx, harness.clients, true, []string{"services", "forget", job.JobID}, &forgetOut, &forgetErr)
+	if err == nil || !strings.Contains(err.Error(), "requires --force") {
+		t.Fatalf("forget without proof waiver = %v", err)
+	}
+	forgottenOutput := runServiceCLI(t, ctx, harness.clients, true, "services", "forget", job.JobID, "--force")
+	var forgotten map[string]any
+	if err := json.Unmarshal(forgottenOutput, &forgotten); err != nil ||
+		forgotten["state"] != string(contract.JobForgottenCleanupUnverified) ||
+		forgotten["status"] != "forgotten (cleanup unverified)" {
+		t.Fatalf("force forget = %#v, err=%v output=%s", forgotten, err, forgottenOutput)
+	}
+	statusOutput := runServiceCLI(t, ctx, harness.clients, false, "services", "status", job.JobID)
+	if !bytes.Contains(statusOutput, []byte("forgotten (cleanup unverified)")) {
+		t.Fatalf("force-forget warning was not permanently visible: %s", statusOutput)
+	}
+	directives, err := harness.store.ListNodeRemovalDirectives(ctx, identity.NodeID, node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 || directives[0].JobID != job.JobID {
+		t.Fatalf("force forget cancelled standing deletion directive: %#v, %v", directives, err)
+	}
+	if payload, readErr := os.ReadFile(sentinelPath); readErr != nil || string(payload) != "untouched" {
+		t.Fatalf("force forget invoked local deletion: payload=%q err=%v", payload, readErr)
+	}
+}
