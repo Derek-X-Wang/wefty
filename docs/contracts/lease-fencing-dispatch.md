@@ -100,9 +100,10 @@ absent when no lifecycle change is requested. Node-scoped scheduling intent
 remains on the heartbeat response; it cannot conflict with this payload-scoped
 channel.
 
-Every renewal and completion is authorized by the exact `(job_id, attempt_id,
-fencing_token)` tuple plus the attempt's boot session and authority generation,
-checked in the same transaction as the write. Validation order is:
+Every renewal, publication mutation, and completion is authorized by the exact
+`(job_id, attempt_id, fencing_token)` tuple plus the attempt's boot session and
+authority generation, checked in the same transaction as the write. Validation
+order is:
 
 1. authenticate Fabric identity and verify node ownership;
 2. match job and current attempt;
@@ -110,6 +111,14 @@ checked in the same transaction as the write. Validation order is:
 4. match the current boot session and authority generation;
 5. verify lease against the control-plane clock;
 6. apply the idempotent mutation.
+
+`PUT .../attempts/{attempt_id}/publication` carries an absolute `ready` boolean.
+L1 derives the immutable Fabric-namespace port from the stored service
+specification; the request cannot supply a port. Publication is applicable only
+to portful services, is not replayable after terminalization, and same-state
+requests are database no-ops. The operator-visible `ready` projection is true
+only while the stored publication references the current, active, unexpired
+attempt under the node's current boot session and authority generation.
 
 Log insertion records evidence rather than changing authority. It validates
 the original attempt's authenticated node, job, attempt ID, and per-attempt

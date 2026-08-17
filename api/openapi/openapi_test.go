@@ -91,12 +91,27 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	paths := object(t, doc["paths"], "paths")
 	for _, path := range []string{
 		"/v1/agent/jobs/{job_id}/attempts/{attempt_id}/lease",
+		"/v1/agent/jobs/{job_id}/attempts/{attempt_id}/publication",
 		"/v1/agent/jobs/{job_id}/attempts/{attempt_id}/logs",
 		"/v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete",
 	} {
 		if _, ok := paths[path]; !ok {
 			t.Errorf("missing fenced attempt route %s", path)
 		}
+	}
+	publicationPath := object(t, paths["/v1/agent/jobs/{job_id}/attempts/{attempt_id}/publication"], "publication path")
+	publication := object(t, publicationPath["put"], "publication PUT")
+	publicationBody := object(t, publication["requestBody"], "publication requestBody")
+	publicationContent := object(t, publicationBody["content"], "publication requestBody.content")
+	publicationMedia := object(t, publicationContent["application/json"], "publication request media type")
+	publicationSchema := object(t, publicationMedia["schema"], "publication request schema")
+	publicationRequired := stringSet(t, publicationSchema["required"])
+	if !publicationRequired["fencing_token"] || !publicationRequired["ready"] {
+		t.Fatal("publication request must require fencing_token and ready")
+	}
+	publicationProperties := object(t, publicationSchema["properties"], "publication request properties")
+	if _, arbitraryPort := publicationProperties["published_port"]; arbitraryPort {
+		t.Fatal("publication request must not accept an agent-supplied port")
 	}
 
 	common := readObject(t, "common.v1.json")
@@ -161,11 +176,14 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	jobProperties := object(t, job["properties"], "Job.properties")
 	for _, field := range []string{
 		"desired_state", "bound_node_id", "restart_streak", "lifetime_restart_count",
-		"next_restart_at", "published_port", "last_failure", "healthy_since_at", "published_attempt_id",
+		"next_restart_at", "published_port", "ready", "last_failure", "healthy_since_at",
 	} {
 		if _, ok := jobProperties[field]; !ok {
 			t.Errorf("Job response missing service-only %s", field)
 		}
+	}
+	if _, leaked := jobProperties["published_attempt_id"]; leaked {
+		t.Error("Job response exposes the internal publication marker instead of computed readiness")
 	}
 
 	nodeRegistration := object(t, schemas["NodeRegistration"], "NodeRegistration")

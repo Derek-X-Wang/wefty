@@ -148,6 +148,14 @@ type RenewalRequest struct {
 	FencingToken string `json:"fencing_token"`
 }
 
+// PublicationRequest carries an absolute publication state for one portful
+// service attempt. Ready is a pointer so the HTTP boundary can distinguish a
+// required false value from an omitted field.
+type PublicationRequest struct {
+	FencingToken string `json:"fencing_token"`
+	Ready        *bool  `json:"ready"`
+}
+
 type HeartbeatRequest struct {
 	BootSessionID string `json:"boot_session_id"`
 }
