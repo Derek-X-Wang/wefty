@@ -152,7 +152,8 @@ func doRequest(client *http.Client, method, path string, body any) (int, http.He
 func (h *integrationHarness) register(client *http.Client, nodeID string) Node {
 	h.t.Helper()
 	registration := contract.NodeRegistration{
-		NodeID: nodeID, BootSessionID: "boot-" + nodeID, OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		NodeID: nodeID, BootSessionID: "boot-" + nodeID, RootInstanceID: "root-" + nodeID,
+		OS: "linux", Architecture: "arm64", AgentVersion: "test",
 	}
 	status, _, body := h.do(client, http.MethodPost, "/v1/agent/nodes/register", registration)
 	if status != http.StatusOK {

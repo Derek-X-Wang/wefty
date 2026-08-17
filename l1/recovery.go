@@ -163,6 +163,35 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		result.PrunedAttempts += pruned
 	}
 
+	removalRows, err := tx.QueryContext(ctx, `SELECT job_id FROM service_removals
+		WHERE status=? OR (status=? AND agent_cleaned_ns IS NOT NULL)
+		ORDER BY requested_ns, job_id`, contract.JobAgentCleaned, contract.JobForgottenCleanupUnverified)
+	if err != nil {
+		return ReconcileResult{}, internalError(err, "select acknowledged service removals")
+	}
+	var removalJobIDs []string
+	for removalRows.Next() {
+		var jobID string
+		if err := removalRows.Scan(&jobID); err != nil {
+			removalRows.Close()
+			return ReconcileResult{}, internalError(err, "scan acknowledged service removal")
+		}
+		removalJobIDs = append(removalJobIDs, jobID)
+	}
+	if err := removalRows.Close(); err != nil {
+		return ReconcileResult{}, internalError(err, "close acknowledged service removals")
+	}
+	if err := removalRows.Err(); err != nil {
+		return ReconcileResult{}, internalError(err, "iterate acknowledged service removals")
+	}
+	for _, jobID := range removalJobIDs {
+		if _, finalized, err := finalizeServiceRemovalTx(ctx, tx, jobID, now); err != nil {
+			return ReconcileResult{}, err
+		} else if finalized {
+			result.FinalizedRemovals++
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return ReconcileResult{}, internalError(err, "commit L1 reconciliation")
 	}

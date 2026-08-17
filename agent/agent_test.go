@@ -248,11 +248,15 @@ func assertConsoleMirrorFailurePolicyByClass(t *testing.T) {
 
 func TestNewBuildsRegistrationFromStableAndBootMetadata(t *testing.T) {
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	resolvedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	nodeAgent, err := New(Config{
 		Fabric: participant, ControlPlaneAddress: "127.0.0.1:1",
 		NodeID: "stable-node", BootSessionID: "boot-session", Version: "v1.2.3",
 		OS: "test-os", Architecture: "test-arch",
-		LogSpoolDirectory: t.TempDir(),
+		LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: filepath.Join(resolvedRoot, "state"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -264,6 +268,9 @@ func TestNewBuildsRegistrationFromStableAndBootMetadata(t *testing.T) {
 	}
 	if len(got.Capabilities) != 1 || !got.Capabilities["process"] {
 		t.Fatalf("capabilities = %#v", got.Capabilities)
+	}
+	if got.RootInstanceID == "" {
+		t.Fatal("registration omitted the managed-root instance ID")
 	}
 }
 

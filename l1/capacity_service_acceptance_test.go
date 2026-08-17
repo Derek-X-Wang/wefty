@@ -25,7 +25,8 @@ func TestServiceAcceptanceCapacityIsControlPlanePolicy(t *testing.T) {
 	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
 
 	registration := contract.NodeRegistration{
-		NodeID: "capacity-node", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		NodeID: "capacity-node", BootSessionID: "boot-1", RootInstanceID: "root-instance-1",
+		OS: "linux", Architecture: "arm64", AgentVersion: "test",
 		Capabilities: map[string]bool{"process": true},
 	}
 	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
@@ -39,8 +40,21 @@ func TestServiceAcceptanceCapacityIsControlPlanePolicy(t *testing.T) {
 	if registered.MaxOneshotSlots != 2 || registered.MaxServiceSlots != 1 {
 		t.Fatalf("registration capacities = %d/%d, want 2/1", registered.MaxOneshotSlots, registered.MaxServiceSlots)
 	}
+	registration.BootSessionID = "boot-2"
+	registration.RootInstanceID = "root-instance-2"
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
+	if status != http.StatusOK {
+		t.Fatalf("replacement registration status = %d body=%s", status, body)
+	}
+	if err := json.Unmarshal(body, &registered); err != nil {
+		t.Fatal(err)
+	}
+	if registered.RootInstanceID != "root-instance-2" || registered.MaxOneshotSlots != 2 ||
+		registered.MaxServiceSlots != 1 || len(registered.AuthoritativeTags) != 1 || registered.AuthoritativeTags[0] != "linux" {
+		t.Fatalf("root fact changed eligibility projection: %#v", registered)
+	}
 
-	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/capacity-node/heartbeat", HeartbeatRequest{BootSessionID: "boot-1"})
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/capacity-node/heartbeat", HeartbeatRequest{BootSessionID: "boot-2"})
 	if status != http.StatusOK {
 		t.Fatalf("heartbeat status = %d body=%s", status, body)
 	}

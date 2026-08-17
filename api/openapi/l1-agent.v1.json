@@ -343,6 +343,48 @@
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
         }
       }
+    },
+    "/v1/agent/jobs/{job_id}/removal-acknowledgement": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "acknowledgeServiceRemoval",
+        "summary": "Attest that bound service cleanup completed",
+        "description": "Acknowledgement strictly follows local deletion. L1 validates Fabric identity, current boot session, bound node, generation, opaque cleanup fence, root-instance ID, idempotency key, and body hash in one transaction, then finalizes the tombstone in a separate crash-recoverable transaction.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["node_id", "boot_session_id", "removal_generation", "cleanup_fence", "root_instance_id", "idempotency_key"],
+                "properties": {
+                  "node_id": { "type": "string", "minLength": 1 },
+                  "boot_session_id": { "type": "string", "minLength": 1 },
+                  "removal_generation": { "type": "integer", "minimum": 1 },
+                  "cleanup_fence": { "type": "string", "minLength": 1 },
+                  "root_instance_id": { "type": "string", "minLength": 1 },
+                  "idempotency_key": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Deletion attestation accepted, identically replayed, or already finalized without mutation.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
     }
   },
   "components": {

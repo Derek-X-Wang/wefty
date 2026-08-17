@@ -24,8 +24,12 @@ func TestServiceSlotLifecycle(t *testing.T) {
 		{name: "claimed", service: boundRunning, state: contract.JobClaimed, want: true},
 		{name: "running", service: boundRunning, state: contract.JobRunning, want: true},
 		{name: "stopping", service: boundStopped, state: contract.JobStopping, want: true},
+		{name: "removal pending", service: boundRunning, state: contract.JobRemovalPending, want: true},
+		{name: "agent cleaned", service: boundRunning, state: contract.JobAgentCleaned, want: true},
 		{name: "stopped", service: boundStopped, state: contract.JobStopped},
 		{name: "latched failed", service: boundRunning, state: contract.JobFailed},
+		{name: "removed verified", service: boundRunning, state: contract.JobRemovedVerified},
+		{name: "force forgotten", service: boundRunning, state: contract.JobForgottenCleanupUnverified},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

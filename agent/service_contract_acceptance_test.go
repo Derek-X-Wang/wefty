@@ -30,6 +30,9 @@ func TestServiceAcceptanceAgentClassAndHandoffContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if resource.rootInstanceID() == "" {
+		t.Fatal("managed resource omitted its root-instance identity")
+	}
 	content := []byte("service executable")
 	digest := sha256.Sum256(content)
 	runner := &serviceContractRunner{t: t}

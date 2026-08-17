@@ -39,14 +39,61 @@ func (systemClock) Now() time.Time { return time.Now() }
 
 // Job is the L1 HTTP representation of a job.
 type Job struct {
-	JobID            string            `json:"job_id"`
-	NodeID           string            `json:"node_id,omitempty"`
-	State            contract.JobState `json:"state"`
-	Spec             contract.JobSpec  `json:"spec"`
-	CurrentAttemptID string            `json:"current_attempt_id,omitempty"`
-	CreatedAt        time.Time         `json:"created_at"`
-	UpdatedAt        time.Time         `json:"updated_at"`
+	JobID  string            `json:"job_id"`
+	NodeID string            `json:"node_id,omitempty"`
+	State  contract.JobState `json:"state"`
+	// Spec is absent once removal has finalized because tombstones deliberately
+	// retain no executable or environment bytes.
+	Spec             contract.JobSpec `json:"spec,omitzero"`
+	CurrentAttemptID string           `json:"current_attempt_id,omitempty"`
+	CreatedAt        time.Time        `json:"created_at"`
+	UpdatedAt        time.Time        `json:"updated_at"`
 	*ServiceJob
+	Removal *ServiceRemoval `json:"removal,omitempty"`
+}
+
+// ServiceRemoval is the operator projection for an irreversible service
+// removal. CleanupFence is intentionally absent: only the bound agent receives
+// that authority through RemovalDirective.
+type ServiceRemoval struct {
+	RemovalDesiredState   contract.ServiceDesiredState `json:"desired_state"`
+	RemovalBoundNodeID    string                       `json:"bound_node_id,omitempty"`
+	RemovalGeneration     uint64                       `json:"removal_generation"`
+	RemovalRequestedAt    time.Time                    `json:"removal_requested_at"`
+	RemovalOutcome        ServiceRemovalOutcome        `json:"removal_outcome,omitempty"`
+	RemovedAt             *time.Time                   `json:"removed_at,omitempty"`
+	CleanupAcknowledgedAt *time.Time                   `json:"cleanup_acknowledged_at,omitempty"`
+}
+
+type ServiceRemovalOutcome string
+
+const (
+	ServiceRemovalVerified  ServiceRemovalOutcome = "verified_removed"
+	ServiceRemovalForgotten ServiceRemovalOutcome = "force_forgotten"
+)
+
+// RemovalDirective is durable node-scoped cleanup authority. Unlike an
+// attempt lease, it has no expiry; only the node's current boot session may
+// act on it.
+type RemovalDirective struct {
+	JobID             string `json:"job_id"`
+	BoundNodeID       string `json:"bound_node_id"`
+	RemovalGeneration uint64 `json:"removal_generation"`
+	CleanupFence      string `json:"cleanup_fence"`
+	RootInstanceID    string `json:"root_instance_id"`
+}
+
+type RemovalAcknowledgementRequest struct {
+	NodeID            string `json:"node_id"`
+	BootSessionID     string `json:"boot_session_id"`
+	RemovalGeneration uint64 `json:"removal_generation"`
+	CleanupFence      string `json:"cleanup_fence"`
+	RootInstanceID    string `json:"root_instance_id"`
+	IdempotencyKey    string `json:"idempotency_key"`
+}
+
+type ForceForgetRequest struct {
+	Force bool `json:"force"`
 }
 
 // AttemptLease is the authority returned by a successful claim or renewal.
@@ -185,6 +232,7 @@ type ReconcileResult struct {
 	EvictedLogEvents    int64 `json:"evicted_log_events"`
 	EvictedLogBytes     int64 `json:"evicted_log_bytes"`
 	PrunedAttempts      int64 `json:"pruned_attempts"`
+	FinalizedRemovals   int64 `json:"finalized_removals"`
 }
 
 // AppendLogsRequest is one provenance-authenticated, idempotent upload batch.

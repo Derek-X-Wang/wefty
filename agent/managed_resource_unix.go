@@ -16,6 +16,10 @@ type processManagedResource struct {
 	root *managedroot.Manager
 }
 
+func (resource *processManagedResource) rootInstanceID() string {
+	return resource.root.Manifest().RootInstanceID
+}
+
 func initializeManagedResource(rootDirectory, nodeID, bootSessionID string) (managedResourceManager, error) {
 	if rootDirectory == "" {
 		return nil, nil
