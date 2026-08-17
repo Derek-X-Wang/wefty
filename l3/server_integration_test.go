@@ -25,17 +25,18 @@ import (
 )
 
 type integrationHarness struct {
-	t          *testing.T
-	network    *plain.Network
-	l1Store    *l1.Store
-	l3Store    *Store
-	l3Path     string
-	l1Client   *L1Client
-	caller     *http.Client
-	callerUser string
-	cancel     context.CancelFunc
-	served     []chan error
-	clients    []*http.Client
+	t           *testing.T
+	network     *plain.Network
+	l1Store     *l1.Store
+	l3Store     *Store
+	l3Path      string
+	l1Client    *L1Client
+	caller      *http.Client
+	agentClient *http.Client
+	callerUser  string
+	cancel      context.CancelFunc
+	served      []chan error
+	clients     []*http.Client
 }
 
 func newIntegrationHarness(t *testing.T) *integrationHarness {
@@ -155,6 +156,9 @@ func (h *integrationHarness) client(identity fabric.Identity, address string) *h
 }
 
 func (h *integrationHarness) agent() *http.Client {
+	if h.agentClient != nil {
+		return h.agentClient
+	}
 	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{l1.DefaultAgentPrincipalTag}}, DefaultL1Address)
 	registration := contract.NodeRegistration{
 		NodeID: "node-1", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
@@ -163,6 +167,7 @@ func (h *integrationHarness) agent() *http.Client {
 	if status != http.StatusOK {
 		h.t.Fatalf("register status = %d body=%s", status, body)
 	}
+	h.agentClient = agent
 	return agent
 }
 

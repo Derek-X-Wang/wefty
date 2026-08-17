@@ -60,9 +60,27 @@ func (c *apiClients) listNodes(ctx context.Context) (l1.NodeList, error) {
 }
 
 func (c *apiClients) drainNode(ctx context.Context, nodeID string) (l1.Node, error) {
+	nodes, err := c.listNodes(ctx)
+	if err != nil {
+		return l1.Node{}, err
+	}
+	var revision int64
+	found := false
+	for _, node := range nodes.Nodes {
+		if node.NodeID == nodeID {
+			revision = node.IntentRevision
+			found = true
+			break
+		}
+	}
+	if !found {
+		return l1.Node{}, fmt.Errorf("node %q was not found", nodeID)
+	}
 	var node l1.Node
 	path := "/v1/nodes/" + url.PathEscape(nodeID) + "/drain"
-	err := c.l1.do(ctx, http.MethodPost, path, nil, nil, &node, http.StatusOK)
+	err = c.l1.do(ctx, http.MethodPost, path, l1.NodeIntentRequest{
+		ClaimsEnabled: false, IntentRevision: revision, Reason: "operator requested drain",
+	}, nil, &node, http.StatusOK)
 	return node, err
 }
 

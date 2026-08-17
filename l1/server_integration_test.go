@@ -451,7 +451,9 @@ func TestClientListsNodeLivenessAndDrainsNode(t *testing.T) {
 		t.Fatalf("alive agent version = %q, want test", listed.Nodes[0].AgentVersion)
 	}
 
-	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/alive-node/drain", nil)
+	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/alive-node/drain", NodeIntentRequest{
+		ClaimsEnabled: false, IntentRevision: 0, Reason: "maintenance",
+	})
 	if status != http.StatusOK {
 		t.Fatalf("operator drain status = %d body=%s", status, body)
 	}
@@ -459,14 +461,16 @@ func TestClientListsNodeLivenessAndDrainsNode(t *testing.T) {
 	if err := json.Unmarshal(body, &drained); err != nil {
 		t.Fatal(err)
 	}
-	if drained.State != contract.NodeDraining {
-		t.Fatalf("drained state = %q, want draining", drained.State)
+	if drained.State != contract.NodeAlive || drained.ClaimsEnabled || drained.IntentRevision != 1 {
+		t.Fatalf("drained node = %#v, want alive with claims disabled at revision 1", drained)
 	}
-	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/alive-node/drain", nil)
-	if status != http.StatusOK {
-		t.Fatalf("operator drain replay status = %d body=%s", status, body)
-	}
-	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/missing/drain", nil)
+	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/alive-node/drain", NodeIntentRequest{
+		ClaimsEnabled: false, IntentRevision: 0, Reason: "stale replay",
+	})
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/missing/drain", NodeIntentRequest{
+		ClaimsEnabled: false, IntentRevision: 0, Reason: "maintenance",
+	})
 	assertAPIError(t, status, body, http.StatusNotFound, contract.ErrorNotFound)
 }
 
@@ -634,7 +638,7 @@ func assertSemanticAgentAuthorityErrors(t *testing.T) {
 	})
 
 	t.Run("attempt scope", func(t *testing.T) {
-		h := newIntegrationHarness(t, nil)
+		h := newIntegrationHarness(t, map[string][]string{"node-1": nil})
 		client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
 		owner := h.client(fabric.Identity{NodeID: "fabric-owner", Tags: []string{DefaultAgentPrincipalTag}})
 		intruder := h.client(fabric.Identity{NodeID: "fabric-intruder", Tags: []string{DefaultAgentPrincipalTag}})

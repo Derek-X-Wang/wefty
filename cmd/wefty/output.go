@@ -38,12 +38,12 @@ func writeAccepted(writer io.Writer, accepted l3.RunAccepted, jsonOutput bool) e
 
 func writeNodesTable(writer io.Writer, nodes []l1.Node) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "NODE ID\tSTATE\tOS/ARCH\tAGENT VERSION\tTAGS\tLAST HEARTBEAT"); err != nil {
+	if _, err := fmt.Fprintln(table, "NODE ID\tSTATE\tCLAIMS\tOS/ARCH\tAGENT VERSION\tTAGS\tLAST HEARTBEAT"); err != nil {
 		return err
 	}
 	for _, node := range nodes {
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s/%s\t%s\t%s\t%s\n",
-			node.NodeID, node.State, node.OS, node.Architecture, node.AgentVersion,
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%t\t%s/%s\t%s\t%s\t%s\n",
+			node.NodeID, node.State, node.ClaimsEnabled, node.OS, node.Architecture, node.AgentVersion,
 			strings.Join(node.AuthoritativeTags, ","), node.LastHeartbeatAt.Format("2006-01-02T15:04:05Z07:00")); err != nil {
 			return err
 		}

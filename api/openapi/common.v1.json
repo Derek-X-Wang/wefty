@@ -141,7 +141,11 @@
           { "$ref": "#/components/schemas/NodeRegistration" },
           {
             "type": "object",
-            "required": ["state", "authoritative_tags", "max_oneshot_slots", "max_service_slots", "last_heartbeat_at"],
+            "required": [
+              "state", "authoritative_tags", "max_oneshot_slots", "max_service_slots",
+              "authority_generation", "claims_enabled", "intent_revision", "intent_reason",
+              "intent_updated_at", "intent_actor", "last_heartbeat_at"
+            ],
             "properties": {
               "state": { "enum": ["alive", "stale", "draining", "dead"] },
               "authoritative_tags": {
@@ -160,6 +164,29 @@
                 "minimum": 0,
                 "readOnly": true
               },
+              "authority_generation": {
+                "type": "integer",
+                "minimum": 1,
+                "readOnly": true,
+                "description": "Monotonic registration generation bound into new attempts."
+              },
+              "claims_enabled": {
+                "type": "boolean",
+                "readOnly": true,
+                "description": "Durable operator intent controlling admission of new claims."
+              },
+              "intent_revision": {
+                "type": "integer",
+                "minimum": 0,
+                "readOnly": true
+              },
+              "intent_reason": { "type": "string", "readOnly": true },
+              "intent_updated_at": {
+                "type": ["string", "null"],
+                "format": "date-time",
+                "readOnly": true
+              },
+              "intent_actor": { "type": "string", "readOnly": true },
               "last_heartbeat_at": { "type": "string", "format": "date-time" }
             }
           }

@@ -71,7 +71,7 @@ func TestPartitionedAgentLosesAuthorityWithoutSecondExecution(t *testing.T) {
 
 	_, err = store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-node-2"}, contract.NodeRegistration{
 		NodeID: "node-2", BootSessionID: "boot-2", OS: "linux", Architecture: "arm64", AgentVersion: "test",
-	}, l1.DefaultNodePolicy("linux"))
+	}, l1.DefaultNodePolicy("linux"), true)
 	if err != nil {
 		t.Fatal(err)
 	}

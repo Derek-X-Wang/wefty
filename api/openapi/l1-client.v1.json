@@ -160,16 +160,81 @@
       "post": {
         "operationId": "operatorDrainNode",
         "summary": "Stop new claims on a node",
-        "description": "Idempotently marks the current stable-node registration draining while allowing active attempt authority to finish.",
+        "description": "Disables claims as durable operator intent while allowing active attempt authority to finish. The mutation is revision-guarded and is valid for dead nodes.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["claims_enabled", "intent_revision", "reason"],
+                "properties": {
+                  "claims_enabled": { "const": false },
+                  "intent_revision": { "type": "integer", "minimum": 0 },
+                  "reason": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Node is draining.",
+            "description": "Claims are durably disabled; liveness state is unchanged.",
             "content": {
               "application/json": {
                 "schema": { "$ref": "./common.v1.json#/components/schemas/Node" }
               }
             }
           },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/nodes/{node_id}/claims": {
+      "parameters": [
+        {
+          "name": "node_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "post": {
+        "operationId": "setNodeClaims",
+        "summary": "Set durable node claim intent",
+        "description": "Atomically enables or disables new claims when intent_revision matches. Liveness does not gate the write, and changing intent does not fence active attempts.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["claims_enabled", "intent_revision", "reason"],
+                "properties": {
+                  "claims_enabled": { "type": "boolean" },
+                  "intent_revision": { "type": "integer", "minimum": 0 },
+                  "reason": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated node intent and projection.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Node" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },

@@ -181,15 +181,15 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	if err := json.Unmarshal(drainOut.Bytes(), &drained); err != nil {
 		t.Fatal(err)
 	}
-	if drained.State != contract.NodeDraining {
-		t.Fatalf("drained state = %q", drained.State)
+	if drained.State != contract.NodeAlive || drained.ClaimsEnabled {
+		t.Fatalf("drained node = %#v", drained)
 	}
 	nodesOut.Reset()
 	if err := execute(ctx, clients, false, []string{"nodes", "list"}, &nodesOut, &commandErr); err != nil {
 		t.Fatalf("nodes list after drain: %v", err)
 	}
-	if !strings.Contains(nodesOut.String(), "draining") {
-		t.Fatalf("draining state not visible:\n%s", nodesOut.String())
+	if !strings.Contains(nodesOut.String(), "false") {
+		t.Fatalf("disabled claims intent not visible:\n%s", nodesOut.String())
 	}
 }
 
