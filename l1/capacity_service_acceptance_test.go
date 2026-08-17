@@ -59,4 +59,5 @@ func TestServiceAcceptanceClassScopedClaimAdmission(t *testing.T) {
 	assertConcurrentClassClaimsStopAtConfiguredCapacity(t)
 	assertServiceClaimEligibilityStaysInsideFIFOSelection(t)
 	assertBoundServiceRestartsWhileOneShotCapacityIsFull(t)
+	assertClaimExcludesJobsStillResidentInTheRequestingAgent(t)
 }

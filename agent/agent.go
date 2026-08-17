@@ -55,6 +55,8 @@ type Config struct {
 	HeartbeatInterval    time.Duration
 	ClaimInterval        time.Duration
 	RenewalInterval      time.Duration
+	MaxOneshotSlots      int
+	MaxServiceSlots      int
 	OperationTimeout     time.Duration
 	LogBatchSize         int
 	LogFlushInterval     time.Duration
@@ -109,6 +111,9 @@ func New(config Config) (*Agent, error) {
 	}
 	if config.LogSpoolMaxBytes < 0 {
 		return nil, errors.New("agent: log spool maximum bytes cannot be negative")
+	}
+	if config.MaxOneshotSlots < 0 || config.MaxServiceSlots < 0 {
+		return nil, errors.New("agent: local slot limits cannot be negative")
 	}
 	osName := config.OS
 	if osName == "" {
@@ -176,7 +181,11 @@ func New(config Config) (*Agent, error) {
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
-	session := newAgentSession(client, registration, heartbeatInterval, claimInterval, clock, observer, logf)
+	session := newAgentSession(
+		client, registration, heartbeatInterval, claimInterval, clock, observer, logf,
+		intOrDefault(config.MaxOneshotSlots, l1.DefaultMaxOneshotSlots),
+		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
+	)
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
 		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),

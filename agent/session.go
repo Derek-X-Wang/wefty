@@ -22,8 +22,17 @@ type workloadClass uint8
 const (
 	workloadClassOneShot workloadClass = iota
 	workloadClassService
-	prefactorClassLimit = 1
 )
+
+type classPool struct {
+	class    workloadClass
+	selector string
+}
+
+var classPools = []classPool{
+	{class: workloadClassOneShot, selector: contract.JobClassOneShot},
+	{class: workloadClassService, selector: contract.JobClassService},
+}
 
 type sessionAttemptExecution func(context.Context, l1.Claim, time.Time) (errorDestination, error)
 
@@ -38,7 +47,15 @@ type agentSession struct {
 	observer          *lifecycleObserver
 	routeError        destinationErrorPolicy
 	gates             map[workloadClass]classAdmissionGate
+	localLimits       map[workloadClass]int
 	logf              func(string, ...any)
+
+	capacityMu      sync.Mutex
+	poolTargets     map[workloadClass]int
+	capacityChanged chan struct{}
+
+	claimMu       sync.Mutex
+	residentJobID map[string]struct{}
 
 	drainOnce      sync.Once
 	drainRequested chan struct{}
@@ -58,7 +75,15 @@ type routedDestinationError struct {
 func (err *routedDestinationError) Error() string { return err.err.Error() }
 func (err *routedDestinationError) Unwrap() error { return err.err }
 
-func newAgentSession(client *Client, registration contract.NodeRegistration, heartbeatInterval, claimInterval time.Duration, clock Clock, observer *lifecycleObserver, logf func(string, ...any)) *agentSession {
+func newAgentSession(
+	client *Client,
+	registration contract.NodeRegistration,
+	heartbeatInterval, claimInterval time.Duration,
+	clock Clock,
+	observer *lifecycleObserver,
+	logf func(string, ...any),
+	maxOneshotSlots, maxServiceSlots int,
+) *agentSession {
 	return &agentSession{
 		client: client, registration: registration,
 		heartbeatInterval: heartbeatInterval, claimInterval: claimInterval,
@@ -70,10 +95,20 @@ func newAgentSession(client *Client, registration contract.NodeRegistration, hea
 			return &routedDestinationError{destination: destination, err: err}
 		},
 		gates: map[workloadClass]classAdmissionGate{
-			workloadClassOneShot: newAdmissionGate(prefactorClassLimit),
-			workloadClassService: newAdmissionGate(prefactorClassLimit),
+			workloadClassOneShot: newAdmissionGate(maxOneshotSlots),
+			workloadClassService: newAdmissionGate(maxServiceSlots),
 		},
-		drainRequested: make(chan struct{}),
+		localLimits: map[workloadClass]int{
+			workloadClassOneShot: maxOneshotSlots,
+			workloadClassService: maxServiceSlots,
+		},
+		poolTargets: map[workloadClass]int{
+			workloadClassOneShot: maxOneshotSlots,
+			workloadClassService: maxServiceSlots,
+		},
+		capacityChanged: make(chan struct{}, 1),
+		residentJobID:   make(map[string]struct{}),
+		drainRequested:  make(chan struct{}),
 	}
 }
 
@@ -84,7 +119,11 @@ func (session *agentSession) close() {
 }
 
 func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
-	return session.client.Register(ctx, session.registration)
+	node, err := session.client.Register(ctx, session.registration)
+	if err == nil {
+		session.observeGrantedCapacity(node)
+	}
+	return node, err
 }
 
 func (session *agentSession) drain(ctx context.Context) (l1.Node, error) {
@@ -174,70 +213,138 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 		defer close(heartbeatDone)
 		session.heartbeatLoop(sessionContext, heartbeatErrors)
 	}()
-	claimFailures := make(chan destinationError, 2)
-	claimLoopsDone := make(chan struct{}, 2)
-	for _, claimClass := range []struct {
-		gateKey  workloadClass
-		selector string
-	}{
-		{gateKey: workloadClassOneShot, selector: contract.JobClassOneShot},
-		{gateKey: workloadClassService, selector: contract.JobClassService},
-	} {
+	type claimWorker struct {
+		id       int
+		pool     classPool
+		retire   chan struct{}
+		retiring bool
+	}
+	type workerResult struct {
+		id      int
+		failure destinationError
+	}
+	workers := make(map[int]*claimWorker)
+	workerDone := make(chan workerResult)
+	nextWorkerID := 1
+	startWorker := func(pool classPool) {
+		worker := &claimWorker{id: nextWorkerID, pool: pool, retire: make(chan struct{})}
+		nextWorkerID++
+		workers[worker.id] = worker
 		go func() {
-			defer func() { claimLoopsDone <- struct{}{} }()
-			failure := session.claimClassLoop(sessionContext, claimClass.gateKey, claimClass.selector, execute)
-			if failure.err != nil {
-				claimFailures <- failure
+			workerDone <- workerResult{
+				id: worker.id,
+				failure: session.claimClassLoop(
+					sessionContext, worker.retire, worker.pool.class, worker.pool.selector, execute,
+				),
 			}
 		}()
 	}
-	claimLoopsRemaining := 2
+	reconcileWorkers := func() {
+		for _, pool := range classPools {
+			target := session.poolTarget(pool.class)
+			var available []*claimWorker
+			for _, worker := range workers {
+				if worker.pool.class == pool.class && !worker.retiring {
+					available = append(available, worker)
+				}
+			}
+			for len(available) < target {
+				startWorker(pool)
+				available = append(available, workers[nextWorkerID-1])
+			}
+			// A service worker that already established a binding remains the
+			// pull path for that reserved service across restart backoff. The
+			// lowered gate and L1 transaction refuse newcomers; retaining idle
+			// workers here prevents a capacity reduction from stranding a bound
+			// service that L1 explicitly permits to restart while overcommitted.
+			if pool.class == workloadClassService {
+				continue
+			}
+			for len(available) > target {
+				last := available[len(available)-1]
+				available = available[:len(available)-1]
+				last.retiring = true
+				close(last.retire)
+			}
+		}
+	}
+	reconcileWorkers()
 	defer func() {
 		stopSession()
 		<-heartbeatDone
-		for claimLoopsRemaining > 0 {
-			<-claimLoopsDone
-			claimLoopsRemaining--
+		for len(workers) > 0 {
+			result := <-workerDone
+			delete(workers, result.id)
 		}
 	}()
 
 	drainRequested := session.drainRequested
+	draining := false
 	for {
 		select {
 		case <-sessionContext.Done():
 			return destinationError{}
 		case <-drainRequested:
+			draining = true
 			session.observer.setSession(LifecycleDraining, 0, nil)
 			if session.logf != nil {
-				session.logf("agent: draining; waiting for %d class claim loops and their resident attempts", claimLoopsRemaining)
+				session.logf("agent: draining; waiting for %d class claim loops and their resident attempts", len(workers))
 			}
 			drainRequested = nil
-		case <-claimLoopsDone:
-			claimLoopsRemaining--
-			if claimLoopsRemaining == 0 {
+			if len(workers) == 0 {
 				return destinationError{}
 			}
+		case result := <-workerDone:
+			delete(workers, result.id)
+			// A claim RPC already in flight can race the L1 drain mutation and
+			// return node_draining before this select observes drainRequested.
+			// Local admission is nevertheless already closed, so join the other
+			// workers instead of letting that expected refusal cancel siblings.
+			if session.isDraining() {
+				draining = true
+				session.observer.setSession(LifecycleDraining, 0, nil)
+				if len(workers) == 0 {
+					return destinationError{}
+				}
+				continue
+			}
+			if result.failure.err != nil {
+				return result.failure
+			}
+			if draining {
+				if len(workers) == 0 {
+					return destinationError{}
+				}
+				continue
+			}
+			reconcileWorkers()
+		case <-session.capacityChanged:
+			if !draining {
+				reconcileWorkers()
+			}
 		case failure := <-heartbeatErrors:
-			return failure
-		case failure := <-claimFailures:
 			return failure
 		}
 	}
 }
 
 // claimClassLoop owns one blocking claim-execute-wait path for one fixed
-// workload class. Its admission gate remains the only execution-state owner;
-// #85 widens the number of loop instances after reading L1-granted capacity.
+// workload class. The gate remains only a policy and occupancy counter; #85
+// widens the number of loop instances after reading L1-granted capacity.
 func (session *agentSession) claimClassLoop(
 	ctx context.Context,
+	retire <-chan struct{},
 	gateKey workloadClass,
 	selector string,
 	execute sessionAttemptExecution,
 ) destinationError {
 	backoff := newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax)
+	serviceReservation := false
 	for {
 		select {
 		case <-ctx.Done():
+			return destinationError{}
+		case <-retire:
 			return destinationError{}
 		case <-session.drainRequested:
 			session.observer.setSession(LifecycleDraining, 0, nil)
@@ -246,65 +353,61 @@ func (session *agentSession) claimClassLoop(
 		}
 
 		claimStarted := session.clock.Now()
-		claim, err := session.client.Claim(ctx, session.registration.NodeID, session.registration.BootSessionID, selector)
-		if err != nil {
-			if ctx.Err() != nil || session.isDraining() {
-				return destinationError{}
-			}
-			classification := classifyAgentProtocolError(err)
-			if classification.destination == errorDestinationTransient {
-				delay := backoff.next()
-				session.observer.setSession(LifecycleRejoining, delay, err)
-				if waitErr := session.waitWithoutHeartbeat(ctx, delay); waitErr != nil {
-					return destinationFromError(waitErr)
-				}
-				continue
-			}
-			return destinationError{destination: classification.destination, err: fmt.Errorf("agent: claim %s job: %w", selector, err)}
-		}
-		backoff.reset()
-		session.markReady()
-		if claim == nil {
-			if err := session.waitWithoutHeartbeat(ctx, session.claimInterval); err != nil {
+		claim, admitted, err := session.claim(ctx, session.gates[gateKey], selector, serviceReservation)
+		if !admitted {
+			if err := session.waitForClaimWork(ctx, retire, session.claimInterval); err != nil {
 				return destinationFromError(err)
 			}
 			continue
 		}
-
-		attemptDone := make(chan error, 1)
-		session.attempts.Add(1)
-		go func(claim l1.Claim, started time.Time) {
-			defer session.attempts.Done()
-			admitted, err := session.gates[gateKey].execute(ctx, func(attemptContext context.Context) (errorDestination, error) {
-				return execute(attemptContext, claim, started)
-			}, session.routeError)
-			if !admitted && err == nil {
-				err = fmt.Errorf("agent: %s admission gate rejected a claimed attempt", selector)
+		if err != nil {
+			classification := classifyAgentProtocolError(err)
+			failure := destinationError{
+				destination: classification.destination,
+				err:         fmt.Errorf("agent: claim %s job: %w", selector, err),
 			}
-			attemptDone <- err
-		}(*claim, claimStarted)
-
-		draining := false
-		for {
-			select {
-			case <-ctx.Done():
-				<-attemptDone
-				return destinationError{}
-			case <-session.drainRequested:
-				draining = true
-				session.observer.setSession(LifecycleDraining, 0, nil)
-			case err := <-attemptDone:
-				if draining {
-					return destinationError{}
-				}
-				if err != nil {
-					return destinationFromError(err)
-				}
-				goto nextClaim
+			if failure.destination != errorDestinationTransient {
+				return failure
+			}
+			delay := backoff.next()
+			session.observer.setSession(LifecycleRejoining, delay, err)
+			if waitErr := session.waitForClaimWork(ctx, retire, delay); waitErr != nil {
+				return destinationFromError(waitErr)
+			}
+			continue
+		}
+		backoff.reset()
+		session.markReady()
+		if claim == nil {
+			if err := session.waitForClaimWork(ctx, retire, session.claimInterval); err != nil {
+				return destinationFromError(err)
+			}
+			continue
+		}
+		if gateKey == workloadClassService {
+			serviceReservation = true
+		}
+		session.attempts.Add(1)
+		destination, executeErr := session.executeResident(ctx, gateKey, *claim, claimStarted, execute)
+		if executeErr != nil {
+			if routed := session.routeError(destination, executeErr); routed != nil {
+				return destinationFromError(routed)
 			}
 		}
-	nextClaim:
 	}
+}
+
+func (session *agentSession) executeResident(
+	ctx context.Context,
+	gateKey workloadClass,
+	claim l1.Claim,
+	claimStarted time.Time,
+	execute sessionAttemptExecution,
+) (errorDestination, error) {
+	defer session.attempts.Done()
+	defer session.gates[gateKey].release()
+	defer session.releaseResidentJob(claim.Job.JobID)
+	return execute(ctx, claim, claimStarted)
 }
 
 func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- destinationError) {
@@ -317,7 +420,8 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			stopTimer(timer)
 			return
 		case <-timer.C():
-			if _, err := session.client.Heartbeat(ctx, session.registration.NodeID, session.registration.BootSessionID); err != nil {
+			node, err := session.client.Heartbeat(ctx, session.registration.NodeID, session.registration.BootSessionID)
+			if err != nil {
 				classification := classifyAgentProtocolError(err)
 				if classification.destination == errorDestinationTransient {
 					nextDelay = backoff.next()
@@ -330,10 +434,103 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				}
 				return
 			}
+			session.observeGrantedCapacity(node)
 			backoff.reset()
 			nextDelay = session.heartbeatInterval
 			session.markReady()
 		}
+	}
+}
+
+func (session *agentSession) claim(
+	ctx context.Context,
+	gate classAdmissionGate,
+	selector string,
+	serviceReservation bool,
+) (*l1.Claim, bool, error) {
+	// Serializing the claim snapshot with the winning response closes the only
+	// local race: a second worker cannot send a stale exclusion set after L1
+	// has requeued a job but before the first worker finishes local finalization.
+	session.claimMu.Lock()
+	defer session.claimMu.Unlock()
+	if !gate.canAcquire() && !serviceReservation {
+		return nil, false, nil
+	}
+	excluded := make([]string, 0, len(session.residentJobID))
+	for jobID := range session.residentJobID {
+		excluded = append(excluded, jobID)
+	}
+	claim, err := session.client.Claim(
+		ctx, session.registration.NodeID, session.registration.BootSessionID, selector, excluded...,
+	)
+	if err != nil || claim == nil {
+		return claim, true, err
+	}
+	if _, exists := session.residentJobID[claim.Job.JobID]; exists {
+		return nil, true, fmt.Errorf("agent: L1 returned locally resident job %q despite exclusion", claim.Job.JobID)
+	}
+	if !gate.tryAcquire() {
+		if !serviceReservation || selector != contract.JobClassService {
+			return nil, true, fmt.Errorf("agent: %s admission changed while claiming job %q", selector, claim.Job.JobID)
+		}
+		// L1 admits a service above the current limit only when its existing
+		// binding already holds the slot. Reflect that execution locally
+		// without treating the gate as the authority for service placement.
+		gate.acquireReserved()
+	}
+	session.residentJobID[claim.Job.JobID] = struct{}{}
+	return claim, true, nil
+}
+
+func (session *agentSession) releaseResidentJob(jobID string) {
+	session.claimMu.Lock()
+	delete(session.residentJobID, jobID)
+	session.claimMu.Unlock()
+}
+
+func (session *agentSession) observeGrantedCapacity(node l1.Node) {
+	targets := map[workloadClass]int{
+		workloadClassOneShot: min(session.localLimits[workloadClassOneShot], node.MaxOneshotSlots),
+		workloadClassService: min(session.localLimits[workloadClassService], node.MaxServiceSlots),
+	}
+	session.claimMu.Lock()
+	defer session.claimMu.Unlock()
+	session.capacityMu.Lock()
+	changed := false
+	for class, target := range targets {
+		if session.poolTargets[class] != target {
+			session.poolTargets[class] = target
+			session.gates[class].setLimit(target)
+			changed = true
+		}
+	}
+	session.capacityMu.Unlock()
+	if changed {
+		select {
+		case session.capacityChanged <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (session *agentSession) poolTarget(class workloadClass) int {
+	session.capacityMu.Lock()
+	defer session.capacityMu.Unlock()
+	return session.poolTargets[class]
+}
+
+func (session *agentSession) waitForClaimWork(ctx context.Context, retire <-chan struct{}, duration time.Duration) error {
+	timer := session.clock.NewTimer(duration)
+	defer stopTimer(timer)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-retire:
+		return context.Canceled
+	case <-session.drainRequested:
+		return context.Canceled
+	case <-timer.C():
+		return nil
 	}
 }
 

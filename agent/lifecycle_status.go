@@ -43,8 +43,9 @@ type SemanticError struct {
 
 // ClassOccupancy reports the local admission count for one workload class.
 type ClassOccupancy struct {
-	Occupied int `json:"occupied"`
-	Limit    int `json:"limit"`
+	Occupied      int  `json:"occupied"`
+	Limit         int  `json:"limit"`
+	Overcommitted bool `json:"overcommitted"`
 }
 
 // AttemptStatus is the agent-local projection of one resident attempt.

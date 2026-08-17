@@ -213,6 +213,51 @@ func TestBoundServiceRestartsWhileOneShotCapacityIsFull(t *testing.T) {
 	assertBoundServiceRestartsWhileOneShotCapacityIsFull(t)
 }
 
+func TestClaimExcludesJobsStillResidentInTheRequestingAgent(t *testing.T) {
+	assertClaimExcludesJobsStillResidentInTheRequestingAgent(t)
+}
+
+func assertClaimExcludesJobsStillResidentInTheRequestingAgent(t *testing.T) {
+	t.Helper()
+	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{
+		"node-1": {Tags: []string{"linux"}, MaxOneshotSlots: 2, MaxServiceSlots: 2},
+	})
+	client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
+	node := h.register(agent, "node-1")
+	older := submitRestartService(t, h, client, "locally-finalizing-older", []string{"linux"}, nil)
+	h.clock.Advance(time.Nanosecond)
+	younger := submitRestartService(t, h, client, "locally-finalizing-younger", []string{"linux"}, nil)
+
+	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{
+		NodeID: node.NodeID, BootSessionID: node.BootSessionID, Class: contract.JobClassService,
+		ExcludedJobIDs: []string{older.JobID},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("claim with local exclusion status = %d body=%s", status, body)
+	}
+	var claim Claim
+	if err := json.Unmarshal(body, &claim); err != nil {
+		t.Fatal(err)
+	}
+	if claim.Job.JobID != younger.JobID {
+		t.Fatalf("claim with older job excluded = %q, want younger %q", claim.Job.JobID, younger.JobID)
+	}
+	olderState, err := h.store.GetJob(context.Background(), older.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if olderState.State != contract.JobQueued {
+		t.Fatalf("excluded locally resident job state = %q, want queued and unclaimed", olderState.State)
+	}
+
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{
+		NodeID: node.NodeID, BootSessionID: node.BootSessionID, Class: contract.JobClassService,
+		ExcludedJobIDs: []string{""},
+	})
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+}
+
 func assertBoundServiceRestartsWhileOneShotCapacityIsFull(t *testing.T) {
 	t.Helper()
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{
