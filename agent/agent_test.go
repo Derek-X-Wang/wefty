@@ -184,6 +184,68 @@ func TestRunProcessReportsOutputFinalizationFailureInsteadOfExitZero(t *testing.
 	}
 }
 
+func TestConsoleMirrorFailurePolicyDependsOnWorkloadClass(t *testing.T) {
+	assertConsoleMirrorFailurePolicyByClass(t)
+}
+
+func assertConsoleMirrorFailurePolicyByClass(t *testing.T) {
+	t.Helper()
+	mirrorErr := errors.New("console unavailable")
+	// #83 made a managed resource mandatory for service jobs, so this test
+	// needs a real managed root to reach the console-mirror policy it is
+	// actually about.
+	// EvalSymlinks because the guardrails refuse a symlink anywhere in the
+	// managed ancestry, and macOS TempDir sits under /var -> /private/var.
+	resolvedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedResource, err := initializeManagedResource(resolvedRoot, "console-mirror-node", "boot-console-mirror")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAgent := func(logs *[]string) *Agent {
+		return &Agent{
+			runner:          emittingRunner{},
+			managedResource: managedResource,
+			outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
+				return processrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error { return mirrorErr })
+			},
+			logf: func(format string, values ...any) {
+				*logs = append(*logs, fmt.Sprintf(format, values...))
+			},
+		}
+	}
+	claim := l1.Claim{
+		Job: l1.Job{
+			JobID: "job-console-mirror",
+			Spec:  contract.JobSpec{Kind: "process", Class: contract.JobClassService},
+		},
+		Lease: l1.AttemptLease{AttemptID: "service-console-best-effort"},
+	}
+	var logs []string
+	result, err := newAgent(&logs).runProcess(context.Background(), claim)
+	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("service console failure runProcess() = (%#v, %v)", result, err)
+	}
+	if len(logs) == 0 || !strings.Contains(logs[0], mirrorErr.Error()) {
+		t.Fatalf("service console failure logs = %#v", logs)
+	}
+
+	claim.Job.Spec.Class = contract.JobClassOneShot
+	logs = nil
+	result, err = newAgent(&logs).runProcess(context.Background(), claim)
+	if !errors.Is(err, mirrorErr) {
+		t.Fatalf("one-shot console failure runProcess() error = %v, want %v", err, mirrorErr)
+	}
+	if result.ExitCode != nil {
+		t.Fatalf("one-shot console failure result = %#v, want producer stopped", result)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("one-shot console failure was downgraded: logs=%#v", logs)
+	}
+}
+
 func TestNewBuildsRegistrationFromStableAndBootMetadata(t *testing.T) {
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{

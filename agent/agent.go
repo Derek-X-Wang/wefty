@@ -17,14 +17,15 @@ import (
 )
 
 const (
-	DefaultHeartbeatInterval = 15 * time.Second
-	DefaultClaimInterval     = time.Second
-	DefaultRenewalInterval   = 10 * time.Second
-	DefaultHandoffRetention  = 24 * time.Hour
-	DefaultLogBatchSize      = 32
-	DefaultLogFlushInterval  = 100 * time.Millisecond
-	DefaultLogRetryInterval  = 100 * time.Millisecond
-	DefaultLogSpoolMaxBytes  = 64 << 20
+	DefaultHeartbeatInterval       = 15 * time.Second
+	DefaultClaimInterval           = time.Second
+	DefaultRenewalInterval         = 10 * time.Second
+	DefaultHandoffRetention        = 24 * time.Hour
+	DefaultLogBatchSize            = 32
+	DefaultLogFlushInterval        = 100 * time.Millisecond
+	DefaultLogRetryInterval        = 100 * time.Millisecond
+	DefaultLogSpoolMaxBytes        = 64 << 20
+	DefaultServiceLogSpoolMaxBytes = 32 << 20
 )
 
 // ProcessRunner is the execution seam used by the node loop.

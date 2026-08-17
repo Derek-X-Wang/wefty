@@ -61,7 +61,7 @@ func run() error {
 		claim             = flag.Duration("claim-interval", agent.DefaultClaimInterval, "idle claim polling interval")
 		renewal           = flag.Duration("renewal-interval", agent.DefaultRenewalInterval, "maximum attempt lease-renewal interval")
 		logSpoolDirectory = flag.String("log-spool-dir", "", "durable log spool directory (defaults to the user cache directory)")
-		logSpoolMaxBytes  = flag.Int64("log-spool-max-bytes", agent.DefaultLogSpoolMaxBytes, "maximum unacknowledged log payload bytes retained on disk")
+		logSpoolMaxBytes  = flag.Int64("log-spool-max-bytes", agent.DefaultLogSpoolMaxBytes, "maximum unacknowledged one-shot log payload bytes retained on disk (service logs use a 32 MiB ring)")
 		managedRoot       = flag.String("managed-root", managedRootDefault, "persistent state root for agent-managed service resources")
 		handoffRoot       = flag.String("handoff-root", contract.DefaultHandoffRoot, "agent-managed one-shot handoff root")
 	)

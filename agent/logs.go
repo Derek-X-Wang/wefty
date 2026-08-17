@@ -222,5 +222,18 @@ func (sinks multiOutputSink) WriteOutput(ctx context.Context, event contract.Log
 	return nil
 }
 
+type bestEffortOutputSink struct {
+	sink   processrunner.OutputSink
+	report func(error)
+}
+
+func (sink bestEffortOutputSink) WriteOutput(ctx context.Context, event contract.LogEvent) error {
+	if err := sink.sink.WriteOutput(ctx, event); err != nil && sink.report != nil {
+		sink.report(err)
+	}
+	return nil
+}
+
 var _ processrunner.OutputSink = (*batchingLogSink)(nil)
 var _ processrunner.OutputSink = multiOutputSink{}
+var _ processrunner.OutputSink = bestEffortOutputSink{}

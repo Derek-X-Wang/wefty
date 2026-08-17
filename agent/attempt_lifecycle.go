@@ -308,6 +308,16 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 		localSink = lifecycle.dependencies.outputSinkFactory(claim)
 	}
 	if localSink != nil {
+		if claim.Job.Spec.Class == contract.JobClassService {
+			localSink = bestEffortOutputSink{
+				sink: localSink,
+				report: func(err error) {
+					if lifecycle.dependencies.logf != nil {
+						lifecycle.dependencies.logf("service console mirror: %v", err)
+					}
+				},
+			}
+		}
 		sinks = append(sinks, localSink)
 	}
 	var sink processrunner.OutputSink

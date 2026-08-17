@@ -21,15 +21,16 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// ErrLogSpoolFull means the durable spool cannot accept more output without
-// exceeding its configured unacknowledged-payload budget. The caller must
-// stop the producer; output is never evicted or silently dropped.
+// ErrLogSpoolFull means the durable spool cannot accept more one-shot output
+// without exceeding the class-scoped unacknowledged-payload budget. The caller
+// must stop the producer; one-shot output is never evicted or silently dropped.
 var ErrLogSpoolFull = errors.New("agent: log spool retention limit reached")
 
 type logSpoolAttempt struct {
 	jobID        string
 	attemptID    string
 	fencingToken string
+	class        string
 }
 
 type durableSpoolEvent struct {
@@ -49,18 +50,23 @@ type incompleteEvidenceTombstone struct {
 }
 
 type logSpool struct {
-	db       *sql.DB
-	maxBytes int64
+	db              *sql.DB
+	maxOneShotBytes int64
+	maxServiceBytes int64
 }
 
-func openLogSpool(directory, nodeID string, maxBytes int64) (*logSpool, error) {
+func openLogSpool(directory, nodeID string, maxOneShotBytes int64) (*logSpool, error) {
+	return openLogSpoolWithBudgets(directory, nodeID, maxOneShotBytes, DefaultServiceLogSpoolMaxBytes)
+}
+
+func openLogSpoolWithBudgets(directory, nodeID string, maxOneShotBytes, maxServiceBytes int64) (*logSpool, error) {
 	var err error
 	directory, err = resolveLogSpoolDirectory(directory)
 	if err != nil {
 		return nil, err
 	}
-	if maxBytes <= 0 {
-		return nil, errors.New("agent: log spool maximum bytes must be positive")
+	if maxOneShotBytes <= 0 || maxServiceBytes <= 0 {
+		return nil, errors.New("agent: log spool class budgets must be positive")
 	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, fmt.Errorf("agent: create log spool directory: %w", err)
@@ -77,7 +83,7 @@ func openLogSpool(directory, nodeID string, maxBytes int64) (*logSpool, error) {
 		return nil, fmt.Errorf("agent: open log spool: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	spool := &logSpool{db: db, maxBytes: maxBytes}
+	spool := &logSpool{db: db, maxOneShotBytes: maxOneShotBytes, maxServiceBytes: maxServiceBytes}
 	if err := spool.initialize(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -128,6 +134,7 @@ CREATE TABLE IF NOT EXISTS spool_attempts (
   attempt_id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL,
   fencing_token TEXT NOT NULL,
+  class TEXT NOT NULL,
   created_ns INTEGER NOT NULL,
   result_json BLOB,
   finished_ns INTEGER,
@@ -161,19 +168,21 @@ CREATE TABLE IF NOT EXISTS spool_acknowledgements (
 func (spool *logSpool) Close() error { return spool.db.Close() }
 
 func (spool *logSpool) ensureAttempt(ctx context.Context, claim l1.Claim) error {
-	_, err := spool.db.ExecContext(ctx, `INSERT INTO spool_attempts(attempt_id, job_id, fencing_token, created_ns)
-VALUES(?, ?, ?, ?)
-ON CONFLICT(attempt_id) DO UPDATE SET job_id=excluded.job_id, fencing_token=excluded.fencing_token
-WHERE spool_attempts.job_id=excluded.job_id AND spool_attempts.fencing_token=excluded.fencing_token`,
-		claim.Lease.AttemptID, claim.Job.JobID, claim.Lease.FencingToken, claim.Job.CreatedAt.UTC().Round(0).UnixNano())
+	_, err := spool.db.ExecContext(ctx, `INSERT INTO spool_attempts(attempt_id, job_id, fencing_token, class, created_ns)
+VALUES(?, ?, ?, ?, ?)
+ON CONFLICT(attempt_id) DO UPDATE SET job_id=excluded.job_id, fencing_token=excluded.fencing_token, class=excluded.class
+WHERE spool_attempts.job_id=excluded.job_id
+  AND spool_attempts.fencing_token=excluded.fencing_token
+  AND spool_attempts.class=excluded.class`,
+		claim.Lease.AttemptID, claim.Job.JobID, claim.Lease.FencingToken, claim.Job.Spec.Class, claim.Job.CreatedAt.UTC().Round(0).UnixNano())
 	if err != nil {
 		return fmt.Errorf("agent: store log spool attempt: %w", err)
 	}
-	var jobID, fencingToken string
-	if err := spool.db.QueryRowContext(ctx, "SELECT job_id, fencing_token FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&jobID, &fencingToken); err != nil {
+	var jobID, fencingToken, class string
+	if err := spool.db.QueryRowContext(ctx, "SELECT job_id, fencing_token, class FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&jobID, &fencingToken, &class); err != nil {
 		return fmt.Errorf("agent: verify log spool attempt: %w", err)
 	}
-	if jobID != claim.Job.JobID || fencingToken != claim.Lease.FencingToken {
+	if jobID != claim.Job.JobID || fencingToken != claim.Lease.FencingToken || class != claim.Job.Spec.Class {
 		return fmt.Errorf("agent: log spool attempt %q conflicts with stored authority", claim.Lease.AttemptID)
 	}
 	return nil
@@ -188,20 +197,34 @@ func (spool *logSpool) append(ctx context.Context, event contract.LogEvent) erro
 		return fmt.Errorf("agent: begin log spool append: %w", err)
 	}
 	defer tx.Rollback()
-	gapJSON, err := json.Marshal(event.Gap)
+	var class string
+	if err := tx.QueryRowContext(ctx, "SELECT class FROM spool_attempts WHERE attempt_id=?", event.AttemptID).Scan(&class); err != nil {
+		return fmt.Errorf("agent: read log spool attempt class: %w", err)
+	}
+	storedEvent := event
+	if class == contract.JobClassService && storedEvent.Gap == nil && int64(len(storedEvent.Bytes)) > spool.maxServiceBytes {
+		storedEvent.Bytes = []byte{}
+		storedEvent.Gap = &contract.LogGap{
+			ThroughSequence: storedEvent.Sequence,
+			LostEventCount:  1,
+			LostByteCount:   uint64(len(event.Bytes)),
+			Reason:          contract.LogGapOversizedEvent,
+		}
+	}
+	gapJSON, err := json.Marshal(storedEvent.Gap)
 	if err != nil {
 		return fmt.Errorf("agent: encode log spool gap: %w", err)
 	}
-	if event.Gap == nil {
+	if storedEvent.Gap == nil {
 		gapJSON = nil
 	}
 	var storedTimestamp int64
 	var storedBytes, storedGap []byte
 	err = tx.QueryRowContext(ctx, `SELECT timestamp_ns, bytes, gap_json FROM spool_events
-WHERE attempt_id=? AND stream=? AND sequence=?`, event.AttemptID, event.Stream, event.Sequence).Scan(&storedTimestamp, &storedBytes, &storedGap)
+WHERE attempt_id=? AND stream=? AND sequence=?`, storedEvent.AttemptID, storedEvent.Stream, storedEvent.Sequence).Scan(&storedTimestamp, &storedBytes, &storedGap)
 	if err == nil {
-		if storedTimestamp != event.Timestamp.UTC().Round(0).UnixNano() || !bytes.Equal(storedBytes, event.Bytes) || !bytes.Equal(storedGap, gapJSON) {
-			return fmt.Errorf("agent: log event (%s, %d) conflicts with its durable spool record", event.Stream, event.Sequence)
+		if storedTimestamp != storedEvent.Timestamp.UTC().Round(0).UnixNano() || !bytes.Equal(storedBytes, storedEvent.Bytes) || !bytes.Equal(storedGap, gapJSON) {
+			return fmt.Errorf("agent: log event (%s, %d) conflicts with its durable spool record", storedEvent.Stream, storedEvent.Sequence)
 		}
 		return nil
 	}
@@ -209,19 +232,134 @@ WHERE attempt_id=? AND stream=? AND sequence=?`, event.AttemptID, event.Stream, 
 		return fmt.Errorf("agent: read log spool event: %w", err)
 	}
 	var used int64
-	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(SUM(payload_bytes), 0) FROM spool_events").Scan(&used); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(e.payload_bytes), 0)
+FROM spool_events e
+JOIN spool_attempts a ON a.attempt_id=e.attempt_id
+WHERE a.class=?`, class).Scan(&used); err != nil {
 		return fmt.Errorf("agent: measure log spool retention: %w", err)
 	}
-	if int64(len(event.Bytes)) > spool.maxBytes-used {
-		return fmt.Errorf("%w: %d bytes used, %d-byte event, %d-byte maximum", ErrLogSpoolFull, used, len(event.Bytes), spool.maxBytes)
+	payloadBytes := int64(len(storedEvent.Bytes))
+	switch class {
+	case contract.JobClassOneShot:
+		if payloadBytes > spool.maxOneShotBytes-used {
+			return fmt.Errorf("%w: %d one-shot bytes used, %d-byte event, %d-byte class maximum", ErrLogSpoolFull, used, payloadBytes, spool.maxOneShotBytes)
+		}
+	case contract.JobClassService:
+		if required := used + payloadBytes - spool.maxServiceBytes; required > 0 {
+			if err := spool.evictServicePrefix(ctx, tx, required); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("agent: unsupported log spool attempt class %q", class)
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO spool_events(attempt_id, stream, sequence, timestamp_ns, bytes, gap_json, payload_bytes)
-VALUES(?, ?, ?, ?, ?, ?, ?)`, event.AttemptID, event.Stream, event.Sequence, event.Timestamp.UTC().Round(0).UnixNano(), event.Bytes, gapJSON, len(event.Bytes))
+VALUES(?, ?, ?, ?, ?, ?, ?)`, storedEvent.AttemptID, storedEvent.Stream, storedEvent.Sequence, storedEvent.Timestamp.UTC().Round(0).UnixNano(), storedEvent.Bytes, gapJSON, payloadBytes)
 	if err != nil {
 		return fmt.Errorf("agent: append durable log event: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("agent: commit durable log event: %w", err)
+	}
+	return nil
+}
+
+type serviceEvictionEvent struct {
+	ordinal      int64
+	attemptID    string
+	stream       contract.LogStream
+	sequence     uint64
+	payloadBytes uint64
+}
+
+func (spool *logSpool) evictServicePrefix(ctx context.Context, tx *sql.Tx, required int64) error {
+	rows, err := tx.QueryContext(ctx, `SELECT e.ordinal, e.attempt_id, e.stream, e.sequence, e.payload_bytes
+FROM spool_events e
+JOIN spool_attempts a ON a.attempt_id=e.attempt_id
+WHERE a.class=? AND e.payload_bytes>0
+ORDER BY e.ordinal`, contract.JobClassService)
+	if err != nil {
+		return fmt.Errorf("agent: select service log eviction prefix: %w", err)
+	}
+	var candidates []serviceEvictionEvent
+	var released int64
+	for released < required && rows.Next() {
+		var candidate serviceEvictionEvent
+		var sequence int64
+		var payloadBytes int64
+		if err := rows.Scan(&candidate.ordinal, &candidate.attemptID, &candidate.stream, &sequence, &payloadBytes); err != nil {
+			rows.Close()
+			return fmt.Errorf("agent: scan service log eviction prefix: %w", err)
+		}
+		candidate.sequence = uint64(sequence)
+		candidate.payloadBytes = uint64(payloadBytes)
+		candidates = append(candidates, candidate)
+		released += payloadBytes
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("agent: iterate service log eviction prefix: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("agent: close service log eviction prefix: %w", err)
+	}
+	if released < required {
+		return fmt.Errorf("agent: service log spool cannot release %d bytes from %d bytes of retained payload", required, released)
+	}
+
+	type streamKey struct {
+		attemptID string
+		stream    contract.LogStream
+	}
+	byStream := make(map[streamKey][]serviceEvictionEvent)
+	var keyOrder []streamKey
+	for _, candidate := range candidates {
+		key := streamKey{attemptID: candidate.attemptID, stream: candidate.stream}
+		if _, present := byStream[key]; !present {
+			keyOrder = append(keyOrder, key)
+		}
+		byStream[key] = append(byStream[key], candidate)
+	}
+	for _, key := range keyOrder {
+		events := byStream[key]
+		for first := 0; first < len(events); {
+			last := first + 1
+			for last < len(events) && events[last].sequence == events[last-1].sequence+1 {
+				last++
+			}
+			if err := replaceEvictedServiceRun(ctx, tx, events[first:last]); err != nil {
+				return err
+			}
+			first = last
+		}
+	}
+	return nil
+}
+
+func replaceEvictedServiceRun(ctx context.Context, tx *sql.Tx, events []serviceEvictionEvent) error {
+	first := events[0]
+	last := events[len(events)-1]
+	var lostBytes uint64
+	for _, event := range events {
+		lostBytes += event.payloadBytes
+	}
+	gapJSON, err := json.Marshal(contract.LogGap{
+		ThroughSequence: last.sequence,
+		LostEventCount:  uint64(len(events)),
+		LostByteCount:   lostBytes,
+		Reason:          contract.LogGapSpoolEviction,
+	})
+	if err != nil {
+		return fmt.Errorf("agent: encode service log eviction gap: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE spool_events SET bytes=X'', gap_json=?, payload_bytes=0
+WHERE ordinal=? AND attempt_id=? AND stream=?`, gapJSON, first.ordinal, first.attemptID, first.stream); err != nil {
+		return fmt.Errorf("agent: store service log eviction gap: %w", err)
+	}
+	for _, event := range events[1:] {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM spool_events WHERE ordinal=? AND attempt_id=?", event.ordinal, event.attemptID); err != nil {
+			return fmt.Errorf("agent: release evicted service log payload: %w", err)
+		}
 	}
 	return nil
 }
@@ -308,7 +446,7 @@ ON CONFLICT(attempt_id, stream) DO UPDATE SET sequence=MAX(sequence, excluded.se
 }
 
 func (spool *logSpool) pendingAttempts(ctx context.Context) ([]logSpoolAttempt, error) {
-	rows, err := spool.db.QueryContext(ctx, `SELECT a.job_id, a.attempt_id, a.fencing_token
+	rows, err := spool.db.QueryContext(ctx, `SELECT a.job_id, a.attempt_id, a.fencing_token, a.class
 FROM spool_attempts a
 WHERE a.incomplete_json IS NULL
   AND (a.result_json IS NOT NULL OR EXISTS (SELECT 1 FROM spool_events e WHERE e.attempt_id=a.attempt_id))
@@ -320,7 +458,7 @@ ORDER BY a.created_ns, a.attempt_id`)
 	var attempts []logSpoolAttempt
 	for rows.Next() {
 		var attempt logSpoolAttempt
-		if err := rows.Scan(&attempt.jobID, &attempt.attemptID, &attempt.fencingToken); err != nil {
+		if err := rows.Scan(&attempt.jobID, &attempt.attemptID, &attempt.fencingToken, &attempt.class); err != nil {
 			return nil, fmt.Errorf("agent: scan pending log spool attempt: %w", err)
 		}
 		attempts = append(attempts, attempt)
