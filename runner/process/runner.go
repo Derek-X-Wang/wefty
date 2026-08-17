@@ -17,10 +17,13 @@ import (
 )
 
 const (
-	DefaultIdleTimeout          = 600 * time.Second
-	DefaultCompletionTimeout    = 60 * time.Second
-	DefaultTerminationGraceTime = 5 * time.Second
-	DefaultProcessReapTimeout   = 5 * time.Second
+	DefaultIdleTimeout              = 600 * time.Second
+	DefaultCompletionTimeout        = 60 * time.Second
+	DefaultTerminationGraceTime     = 5 * time.Second
+	DefaultProcessReapTimeout       = 5 * time.Second
+	DefaultStartupReadinessDeadline = 30 * time.Second
+	DefaultReadinessProbeInterval   = 250 * time.Millisecond
+	DefaultReadinessConnectTimeout  = 200 * time.Millisecond
 )
 
 var (
@@ -55,6 +58,9 @@ func (function OutputSinkFunc) WriteOutput(ctx context.Context, event contract.L
 // Request describes one native process execution. IdlePolicy controls the
 // initial idle clock. Closing or sending on CompletionSignal replaces any idle
 // clock with the completion clock; a nil channel starts no completion clock.
+// Started is called exactly once after the payload has spawned successfully and
+// guardian ownership, when configured, has been established. Runtime adapters
+// must not call it for a spawn failure.
 type Request struct {
 	AttemptID        string
 	Class            string
@@ -62,6 +68,11 @@ type Request struct {
 	Limits           *contract.JobLimits
 	IdlePolicy       IdlePolicy
 	CompletionSignal <-chan struct{}
+	Started          func()
+	// ServiceAddress is the process runtime's agent-local dial target. It is
+	// never persisted and is not the service's Fabric published address.
+	ServiceAddress   string
+	ReadinessChanged func(startupSatisfied, ready bool)
 }
 
 // Config holds process-runner dependencies and defaults. A nil Clock uses the
@@ -75,18 +86,24 @@ type Config struct {
 	TerminationGraceTime time.Duration
 	// ProcessReapTimeout bounds the final wait after SIGKILL so a missing
 	// process Wait result is reported instead of silently stranding a caller.
-	ProcessReapTimeout time.Duration
+	ProcessReapTimeout       time.Duration
+	StartupReadinessDeadline time.Duration
+	ReadinessProbeInterval   time.Duration
+	ReadinessConnectTimeout  time.Duration
 }
 
 // Runner executes kind=process workloads.
 type Runner struct {
-	clock                Clock
-	baseEnvironment      []string
-	guardianExecutable   string
-	idleTimeout          time.Duration
-	completionTimeout    time.Duration
-	terminationGraceTime time.Duration
-	processReapTimeout   time.Duration
+	clock                    Clock
+	baseEnvironment          []string
+	guardianExecutable       string
+	idleTimeout              time.Duration
+	completionTimeout        time.Duration
+	terminationGraceTime     time.Duration
+	processReapTimeout       time.Duration
+	startupReadinessDeadline time.Duration
+	readinessProbeInterval   time.Duration
+	readinessConnectTimeout  time.Duration
 }
 
 // New creates a process runner with defaults for every zero-valued duration.
@@ -102,13 +119,16 @@ func New(config Config) *Runner {
 	}
 
 	return &Runner{
-		clock:                clock,
-		baseEnvironment:      append([]string(nil), baseEnvironment...),
-		guardianExecutable:   config.GuardianExecutable,
-		idleTimeout:          durationOrDefault(config.IdleTimeout, DefaultIdleTimeout),
-		completionTimeout:    durationOrDefault(config.CompletionTimeout, DefaultCompletionTimeout),
-		terminationGraceTime: durationOrDefault(config.TerminationGraceTime, DefaultTerminationGraceTime),
-		processReapTimeout:   durationOrDefault(config.ProcessReapTimeout, DefaultProcessReapTimeout),
+		clock:                    clock,
+		baseEnvironment:          append([]string(nil), baseEnvironment...),
+		guardianExecutable:       config.GuardianExecutable,
+		idleTimeout:              durationOrDefault(config.IdleTimeout, DefaultIdleTimeout),
+		completionTimeout:        durationOrDefault(config.CompletionTimeout, DefaultCompletionTimeout),
+		terminationGraceTime:     durationOrDefault(config.TerminationGraceTime, DefaultTerminationGraceTime),
+		processReapTimeout:       durationOrDefault(config.ProcessReapTimeout, DefaultProcessReapTimeout),
+		startupReadinessDeadline: durationOrDefault(config.StartupReadinessDeadline, DefaultStartupReadinessDeadline),
+		readinessProbeInterval:   durationOrDefault(config.ReadinessProbeInterval, DefaultReadinessProbeInterval),
+		readinessConnectTimeout:  durationOrDefault(config.ReadinessConnectTimeout, DefaultReadinessConnectTimeout),
 	}
 }
 
@@ -122,6 +142,10 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 	}
 
 	if err := validateRequest(ctx, request); err != nil {
+		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+	}
+	if request.ServiceAddress != "" && runner.guardianExecutable == "" {
+		err := errors.New("process service readiness requires guardian supervision")
 		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
 	}
 
@@ -166,6 +190,9 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 
 	if err := command.Start(); err != nil {
 		return spawnFailure(contract.SpawnFailureProcessSpawn, err), nil
+	}
+	if request.Started != nil {
+		request.Started()
 	}
 
 	wait := make(chan waitResult, 1)

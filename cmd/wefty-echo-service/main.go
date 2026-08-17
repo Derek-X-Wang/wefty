@@ -18,8 +18,6 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-const servicePortEnvironment = "WEFTY_SERVICE_PORT"
-
 func main() {
 	if err := run(); err != nil {
 		log.Printf("wefty-echo-service: %v", err)
@@ -28,13 +26,19 @@ func main() {
 }
 
 func run() error {
-	port := os.Getenv(servicePortEnvironment)
+	if len(os.Args) == 2 && os.Args[1] == "--portless" {
+		return runPortless()
+	}
+	if len(os.Args) != 1 {
+		return errors.New("usage: wefty-echo-service [--portless]")
+	}
+	port := os.Getenv(contract.EnvServicePort)
 	if port == "" {
-		return fmt.Errorf("%s is required", servicePortEnvironment)
+		return fmt.Errorf("%s is required", contract.EnvServicePort)
 	}
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return fmt.Errorf("%s must be a TCP port number from 1 to 65535", servicePortEnvironment)
+		return fmt.Errorf("%s must be a TCP port number from 1 to 65535", contract.EnvServicePort)
 	}
 	serviceDirectory := os.Getenv(contract.EnvServiceDir)
 	if serviceDirectory == "" {
@@ -42,7 +46,7 @@ func run() error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", healthHandler(serviceDirectory))
+	mux.HandleFunc("GET /healthz", healthHandler(serviceDirectory, portNumber))
 	mux.HandleFunc("/echo", echoHandler)
 	server := &http.Server{
 		Addr:              net.JoinHostPort("127.0.0.1", strconv.Itoa(portNumber)),
@@ -73,13 +77,24 @@ func run() error {
 	return nil
 }
 
-func healthHandler(serviceDirectory string) http.HandlerFunc {
+func runPortless() error {
+	if os.Getenv(contract.EnvServiceDir) == "" {
+		return fmt.Errorf("%s is required", contract.EnvServiceDir)
+	}
+	shutdownSignal, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	<-shutdownSignal.Done()
+	return nil
+}
+
+func healthHandler(serviceDirectory string, listeningPort int) http.HandlerFunc {
 	return func(response http.ResponseWriter, _ *http.Request) {
 		response.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(response).Encode(struct {
 			PID              int    `json:"pid"`
 			ServiceDirectory string `json:"service_directory"`
-		}{PID: os.Getpid(), ServiceDirectory: serviceDirectory}); err != nil {
+			ListeningPort    int    `json:"listening_port"`
+		}{PID: os.Getpid(), ServiceDirectory: serviceDirectory, ListeningPort: listeningPort}); err != nil {
 			log.Printf("wefty-echo-service: write health response: %v", err)
 		}
 	}

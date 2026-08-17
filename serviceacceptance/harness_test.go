@@ -66,6 +66,7 @@ func TestMain(main *testing.M) {
 
 type acceptanceHarness struct {
 	client             *http.Client
+	publishedFabric    fabric.Fabric
 	agent              *managedProcess
 	managedRoot        string
 	handoffRoot        string
@@ -118,7 +119,7 @@ func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 	}}
 	t.Cleanup(client.CloseIdleConnections)
 	return &acceptanceHarness{
-		client: client, agent: agentProcess,
+		client: client, publishedFabric: plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "service-client"}), agent: agentProcess,
 		managedRoot: managedRoot, handoffRoot: handoffRoot,
 		workingDirectories: make(map[string]string),
 	}
@@ -144,7 +145,6 @@ func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
 		Execution: contract.ExecutionSpec{
 			Executable:       contract.ExecutableSpec{Path: echoServiceBinaryPath},
 			Argv:             []string{echoServiceBinaryPath},
-			Env:              map[string]string{servicePortEnvironment: strconv.Itoa(port)},
 			WorkingDirectory: workingDirectory,
 		},
 		Limits: &contract.JobLimits{
@@ -159,6 +159,51 @@ func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
 	}
 	h.workingDirectories[job.JobID] = workingDirectory
 	return job
+}
+
+func (h *acceptanceHarness) submitPortlessService(t *testing.T) l1.Job {
+	t.Helper()
+	workingDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workingDirectory, "operator-owned"), []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec := contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1,
+		DispatchKey:   "portless-service-acceptance-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+		Kind:          "process",
+		Class:         contract.JobClassService,
+		Restart:       contract.RestartAlways,
+		RoutingTags:   []string{"service-acceptance"},
+		Execution: contract.ExecutionSpec{
+			Executable:       contract.ExecutableSpec{Path: echoServiceBinaryPath},
+			Argv:             []string{echoServiceBinaryPath, "--portless"},
+			WorkingDirectory: workingDirectory,
+		},
+		Limits: &contract.JobLimits{MaxRuntimeSeconds: 30, IdleTimeoutSeconds: 30},
+	}
+	var job l1.Job
+	status, body := h.doJSON(t, http.MethodPost, "/v1/jobs", spec, &job)
+	if status != http.StatusCreated {
+		t.Fatalf("submit portless service status = %d body=%s", status, body)
+	}
+	h.workingDirectories[job.JobID] = workingDirectory
+	return job
+}
+
+func (h *acceptanceHarness) publishedHTTPClient(t *testing.T, port int) *http.Client {
+	t.Helper()
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return h.publishedFabric.Dial(ctx, network, address)
+		},
+	}}
+	t.Cleanup(client.CloseIdleConnections)
+	return client
+}
+
+func (h *acceptanceHarness) dialPublished(ctx context.Context, port int) (net.Conn, error) {
+	return h.publishedFabric.Dial(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 }
 
 func (h *acceptanceHarness) waitForJobState(t *testing.T, jobID string, state contract.JobState, timeout time.Duration) l1.Job {

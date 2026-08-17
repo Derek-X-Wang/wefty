@@ -173,6 +173,9 @@ type handoffAssertingRunner struct {
 
 func (r *handoffAssertingRunner) Run(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
 	r.t.Helper()
+	if request.Started != nil {
+		request.Started()
+	}
 	r.called = true
 	info, err := os.Stat(r.path)
 	if err != nil {

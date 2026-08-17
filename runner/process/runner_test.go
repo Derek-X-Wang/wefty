@@ -126,16 +126,23 @@ func TestRunEmitsOrderedEventsForEachStream(t *testing.T) {
 
 func TestServiceRunSelfExecsGuardianAndPreservesRawEvents(t *testing.T) {
 	sink := newCollectingSink()
+	started := make(chan struct{}, 1)
 	result, err := New(Config{GuardianExecutable: guardianAgentPath}).Run(context.Background(), Request{
 		AttemptID:  "attempt-guardian-raw",
 		Class:      contract.JobClassService,
 		Execution:  helperExecution("raw-output"),
 		IdlePolicy: IgnoreIdle,
+		Started:    func() { started <- struct{}{} },
 	}, sink)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	assertExitCode(t, result, 0)
+	select {
+	case <-started:
+	default:
+		t.Fatal("guarded runtime did not report successful payload spawn")
+	}
 	events := sink.Events()
 	assertOrderedStream(t, events, contract.LogStdout)
 	want := append(bytes.Repeat([]byte{'x'}, 70*1024), []byte("partial-without-newline")...)
@@ -146,7 +153,18 @@ func TestServiceRunSelfExecsGuardianAndPreservesRawEvents(t *testing.T) {
 }
 
 func TestRunDistinguishesProcessResults(t *testing.T) {
+	t.Run("service readiness without guardian", func(t *testing.T) {
+		result, err := New(Config{}).Run(context.Background(), Request{
+			AttemptID: "attempt-unguarded-service", Class: contract.JobClassService,
+			Execution: helperExecution("hang"), IdlePolicy: IgnoreIdle, ServiceAddress: "127.0.0.1:1",
+		}, nil)
+		if err == nil || result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailureProcessRequest {
+			t.Fatalf("unguarded service result = (%#v, %v), want process_request rejection", result, err)
+		}
+	})
+
 	t.Run("spawn error", func(t *testing.T) {
+		started := false
 		result, err := New(Config{}).Run(context.Background(), Request{
 			AttemptID: "attempt-spawn",
 			Execution: contract.ExecutionSpec{
@@ -154,6 +172,7 @@ func TestRunDistinguishesProcessResults(t *testing.T) {
 				Argv:             []string{"missing"},
 				WorkingDirectory: t.TempDir(),
 			},
+			Started: func() { started = true },
 		}, nil)
 		if err != nil {
 			t.Fatalf("spawn error returned as supervision error: %v", err)
@@ -163,6 +182,9 @@ func TestRunDistinguishesProcessResults(t *testing.T) {
 		}
 		if result.SpawnError.Code != contract.SpawnFailureProcessSpawn {
 			t.Fatalf("spawn failure code = %q, want %q", result.SpawnError.Code, contract.SpawnFailureProcessSpawn)
+		}
+		if started {
+			t.Fatal("runtime reported a successful spawn for a spawn failure")
 		}
 	})
 

@@ -498,6 +498,9 @@ func (panicRunner) Run(context.Context, processrunner.Request, processrunner.Out
 type emittingRunner struct{}
 
 func (emittingRunner) Run(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
 	if err := sink.WriteOutput(ctx, contract.LogEvent{
 		AttemptID: request.AttemptID,
 		Stream:    contract.LogStdout,
@@ -521,6 +524,9 @@ func (emittingRunner) Run(ctx context.Context, request processrunner.Request, si
 type bufferedOutputRunner struct{}
 
 func (bufferedOutputRunner) Run(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
 	if err := sink.WriteOutput(ctx, contract.LogEvent{
 		AttemptID: request.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("tail"),
 	}); err != nil {

@@ -18,10 +18,11 @@ const (
 type guardianMessageType string
 
 const (
-	guardianMessageStart   guardianMessageType = "start"
-	guardianMessageStop    guardianMessageType = "stop"
-	guardianMessageStarted guardianMessageType = "started"
-	guardianMessageExited  guardianMessageType = "exited"
+	guardianMessageStart     guardianMessageType = "start"
+	guardianMessageStop      guardianMessageType = "stop"
+	guardianMessageStarted   guardianMessageType = "started"
+	guardianMessageReadiness guardianMessageType = "readiness"
+	guardianMessageExited    guardianMessageType = "exited"
 )
 
 // guardianControlMessage is deliberately small and structured: it is the
@@ -33,18 +34,24 @@ type guardianControlMessage struct {
 }
 
 type guardianStart struct {
-	Path             string        `json:"path"`
-	Args             []string      `json:"args"`
-	Directory        string        `json:"directory"`
-	Environment      []string      `json:"environment"`
-	TerminationGrace time.Duration `json:"termination_grace"`
+	Path                     string        `json:"path"`
+	Args                     []string      `json:"args"`
+	Directory                string        `json:"directory"`
+	Environment              []string      `json:"environment"`
+	TerminationGrace         time.Duration `json:"termination_grace"`
+	ServiceAddress           string        `json:"service_address,omitempty"`
+	StartupReadinessDeadline time.Duration `json:"startup_readiness_deadline,omitempty"`
+	ReadinessProbeInterval   time.Duration `json:"readiness_probe_interval,omitempty"`
+	ReadinessConnectTimeout  time.Duration `json:"readiness_connect_timeout,omitempty"`
 }
 
 type guardianStatusMessage struct {
-	Type           guardianMessageType     `json:"type"`
-	PID            int                     `json:"pid,omitempty"`
-	ProcessGroupID int                     `json:"process_group_id,omitempty"`
-	Result         *contract.ProcessResult `json:"result,omitempty"`
+	Type             guardianMessageType     `json:"type"`
+	PID              int                     `json:"pid,omitempty"`
+	ProcessGroupID   int                     `json:"process_group_id,omitempty"`
+	Result           *contract.ProcessResult `json:"result,omitempty"`
+	StartupSatisfied bool                    `json:"startup_satisfied,omitempty"`
+	Ready            *bool                   `json:"ready,omitempty"`
 }
 
 // IsGuardianInvocation recognizes the private mode before normal flag parsing.
@@ -73,11 +80,15 @@ func decodeGuardianStatus(decoder *json.Decoder) (guardianStatusMessage, error) 
 	}
 	switch status.Type {
 	case guardianMessageStarted:
-		if status.PID <= 0 || status.ProcessGroupID <= 0 || status.Result != nil {
+		if status.PID <= 0 || status.ProcessGroupID <= 0 || status.Result != nil || status.Ready != nil {
 			return guardianStatusMessage{}, fmt.Errorf("invalid guardian started message")
 		}
+	case guardianMessageReadiness:
+		if status.PID != 0 || status.ProcessGroupID != 0 || status.Result != nil || !status.StartupSatisfied || status.Ready == nil {
+			return guardianStatusMessage{}, fmt.Errorf("invalid guardian readiness message")
+		}
 	case guardianMessageExited:
-		if status.PID != 0 || status.ProcessGroupID != 0 || status.Result == nil {
+		if status.PID != 0 || status.ProcessGroupID != 0 || status.Result == nil || status.Ready != nil {
 			return guardianStatusMessage{}, fmt.Errorf("invalid guardian exited message")
 		}
 	default:

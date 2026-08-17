@@ -94,7 +94,10 @@ func assertAttemptPersistsCompletionBeforeDelivery(t *testing.T) {
 
 type instantResultRunner struct{}
 
-func (instantResultRunner) Run(context.Context, processrunner.Request, processrunner.OutputSink) (contract.ProcessResult, error) {
+func (instantResultRunner) Run(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
 	exitCode := 0
 	return contract.ProcessResult{ExitCode: &exitCode}, nil
 }
