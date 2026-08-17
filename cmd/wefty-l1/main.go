@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -17,7 +18,9 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-type nodeTagsFlag map[string][]string
+type nodeTagsFlag struct {
+	policies map[string]l1.NodePolicy
+}
 
 func (values nodeTagsFlag) Set(value string) error {
 	nodeID, tags, found := strings.Cut(value, "=")
@@ -29,11 +32,45 @@ func (values nodeTagsFlag) Set(value string) error {
 	if tags != "" {
 		parsed = strings.Split(tags, ",")
 	}
-	values[nodeID] = parsed
+	policy := policyForNode(values.policies, nodeID)
+	policy.Tags = parsed
+	values.policies[nodeID] = policy
 	return nil
 }
 
 func (nodeTagsFlag) String() string { return "node-id=tag,tag" }
+
+type nodeSlotsFlag struct {
+	policies map[string]l1.NodePolicy
+	service  bool
+}
+
+func (values nodeSlotsFlag) Set(value string) error {
+	nodeID, rawSlots, found := strings.Cut(value, "=")
+	nodeID = strings.TrimSpace(nodeID)
+	slots, err := strconv.Atoi(strings.TrimSpace(rawSlots))
+	if !found || nodeID == "" || err != nil || slots < 0 {
+		return errors.New("node slot limits must use node-id=non-negative-integer syntax")
+	}
+	policy := policyForNode(values.policies, nodeID)
+	if values.service {
+		policy.MaxServiceSlots = slots
+	} else {
+		policy.MaxOneshotSlots = slots
+	}
+	values.policies[nodeID] = policy
+	return nil
+}
+
+func (values nodeSlotsFlag) String() string { return "node-id=slots" }
+
+func policyForNode(policies map[string]l1.NodePolicy, nodeID string) l1.NodePolicy {
+	policy, ok := policies[nodeID]
+	if !ok {
+		policy = l1.DefaultNodePolicy()
+	}
+	return policy
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -43,7 +80,7 @@ func main() {
 }
 
 func run() error {
-	nodeTags := make(nodeTagsFlag)
+	nodePolicies := make(map[string]l1.NodePolicy)
 	var (
 		fabricMode     = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
 		listenAddress  = flag.String("listen", "wefty://control-plane", "control-plane Fabric listen address")
@@ -56,7 +93,9 @@ func run() error {
 		ephemeral      = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
 		readyFile      = flag.String("ready-file", "", "write listener metadata after the server is ready")
 	)
-	flag.Var(nodeTags, "node-tags", "authoritative routing tags as node-id=tag,tag (repeatable)")
+	flag.Var(nodeTagsFlag{policies: nodePolicies}, "node-tags", "authoritative routing tags as node-id=tag,tag (repeatable)")
+	flag.Var(nodeSlotsFlag{policies: nodePolicies}, "node-max-oneshot-slots", "authoritative one-shot capacity as node-id=slots (repeatable)")
+	flag.Var(nodeSlotsFlag{policies: nodePolicies, service: true}, "node-max-service-slots", "authoritative service capacity as node-id=slots (repeatable)")
 	flag.Parse()
 
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
@@ -78,7 +117,7 @@ func run() error {
 		return err
 	}
 	defer store.Close()
-	server, err := l1.NewServer(participant, store, l1.ServerConfig{AuthoritativeNodeTags: nodeTags})
+	server, err := l1.NewServer(participant, store, l1.ServerConfig{NodePolicies: nodePolicies})
 	if err != nil {
 		return err
 	}

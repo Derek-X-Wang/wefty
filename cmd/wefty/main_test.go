@@ -32,8 +32,8 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l1Store.Close()
-	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{
-		"node-cli": {"linux", contract.StableNodeTagPrefix + "node-cli"},
+	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
+		"node-cli": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"node-cli"),
 	}})
 	if err != nil {
 		t.Fatal(err)

@@ -185,8 +185,10 @@ type ProcessResult struct {
 	Signal      string `json:"signal,omitempty"`
 }
 
-// NodeRegistration intentionally has no tags field. Claim eligibility uses
-// authoritative tags obtained from Fabric identity/configuration.
+// NodeRegistration intentionally has no tags or capacity fields. Claim
+// eligibility uses authoritative policy obtained from control-plane
+// configuration. Capabilities describes executable support and must not carry
+// max_oneshot_slots or max_service_slots.
 type NodeRegistration struct {
 	NodeID        string          `json:"node_id"`
 	BootSessionID string          `json:"boot_session_id"`

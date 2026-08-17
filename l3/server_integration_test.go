@@ -48,8 +48,8 @@ func newIntegrationHarness(t *testing.T) *integrationHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{
-		"node-1": {"linux", contract.StableNodeTagPrefix + "node-1"},
+	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
+		"node-1": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"node-1"),
 	}})
 	if err != nil {
 		l1Store.Close()

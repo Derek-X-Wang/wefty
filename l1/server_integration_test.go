@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -47,6 +48,17 @@ type integrationHarness struct {
 
 func newIntegrationHarness(t *testing.T, nodeTags map[string][]string) *integrationHarness {
 	t.Helper()
+	policies := make(map[string]NodePolicy, len(nodeTags))
+	for nodeID, tags := range nodeTags {
+		policies[nodeID] = NodePolicy{
+			Tags: tags, MaxOneshotSlots: DefaultMaxOneshotSlots, MaxServiceSlots: DefaultMaxServiceSlots,
+		}
+	}
+	return newIntegrationHarnessWithPolicies(t, policies)
+}
+
+func newIntegrationHarnessWithPolicies(t *testing.T, policies map[string]NodePolicy) *integrationHarness {
+	t.Helper()
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	clock := &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}
@@ -54,7 +66,7 @@ func newIntegrationHarness(t *testing.T, nodeTags map[string][]string) *integrat
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewServer(serverFabric, store, ServerConfig{AuthoritativeNodeTags: nodeTags})
+	server, err := NewServer(serverFabric, store, ServerConfig{NodePolicies: policies})
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
@@ -458,19 +470,57 @@ func TestClientListsNodeLivenessAndDrainsNode(t *testing.T) {
 	assertAPIError(t, status, body, http.StatusNotFound, contract.ErrorNotFound)
 }
 
-func TestRegistrationRejectsSelfReportedTags(t *testing.T) {
-	h := newIntegrationHarness(t, map[string][]string{"node-1": {"configured"}})
+func TestRegistrationRejectsSelfReportedEligibilityPolicy(t *testing.T) {
+	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{
+		"node-1": {Tags: []string{"configured"}, MaxOneshotSlots: 7, MaxServiceSlots: 3},
+	})
 	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag, "self-claimed"}})
-	body := map[string]any{
+	base := map[string]any{
 		"node_id": "node-1", "boot_session_id": "boot", "os": "linux", "architecture": "arm64", "agent_version": "test",
-		"tags": []string{"self-claimed"},
 	}
-	status, _, responseBody := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", body)
+	withTags := maps.Clone(base)
+	withTags["tags"] = []string{"self-claimed"}
+	status, _, responseBody := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", withTags)
+	assertAPIError(t, status, responseBody, http.StatusBadRequest, contract.ErrorInvalidRequest)
+
+	withCapacity := maps.Clone(base)
+	withCapacity["max_oneshot_slots"] = 99
+	withCapacity["max_service_slots"] = 99
+	status, _, responseBody = h.do(agent, http.MethodPost, "/v1/agent/nodes/register", withCapacity)
+	assertAPIError(t, status, responseBody, http.StatusBadRequest, contract.ErrorInvalidRequest)
+
+	withCapacityCapabilities := maps.Clone(base)
+	withCapacityCapabilities["capabilities"] = map[string]bool{
+		"process": true, "max_oneshot_slots": true, "max_service_slots": true,
+	}
+	status, _, responseBody = h.do(agent, http.MethodPost, "/v1/agent/nodes/register", withCapacityCapabilities)
 	assertAPIError(t, status, responseBody, http.StatusBadRequest, contract.ErrorInvalidRequest)
 
 	node := h.register(agent, "node-1")
 	if len(node.AuthoritativeTags) != 1 || node.AuthoritativeTags[0] != "configured" {
 		t.Fatalf("authoritative tags = %v, want [configured]", node.AuthoritativeTags)
+	}
+	if node.MaxOneshotSlots != 7 || node.MaxServiceSlots != 3 {
+		t.Fatalf("authoritative capacities = %d/%d, want 7/3", node.MaxOneshotSlots, node.MaxServiceSlots)
+	}
+
+	status, _, responseBody = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", HeartbeatRequest{BootSessionID: node.BootSessionID})
+	if status != http.StatusOK {
+		t.Fatalf("heartbeat status = %d body=%s", status, responseBody)
+	}
+	var heartbeat Node
+	if err := json.Unmarshal(responseBody, &heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	if heartbeat.MaxOneshotSlots != 7 || heartbeat.MaxServiceSlots != 3 {
+		t.Fatalf("heartbeat capacities = %d/%d, want 7/3", heartbeat.MaxOneshotSlots, heartbeat.MaxServiceSlots)
+	}
+	var storedOneshot, storedService int
+	if err := h.store.db.QueryRow("SELECT max_oneshot_slots, max_service_slots FROM nodes WHERE node_id=?", "node-1").Scan(&storedOneshot, &storedService); err != nil {
+		t.Fatal(err)
+	}
+	if storedOneshot != 7 || storedService != 3 {
+		t.Fatalf("stored capacities = %d/%d, want 7/3", storedOneshot, storedService)
 	}
 }
 

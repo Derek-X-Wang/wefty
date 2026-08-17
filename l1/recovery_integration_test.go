@@ -326,7 +326,7 @@ func TestControlPlaneRestartRecoversQueuedAndRunningJobs(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)}
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
-	config := ServerConfig{AuthoritativeNodeTags: map[string][]string{"node-1": {"linux"}}}
+	config := ServerConfig{NodePolicies: map[string]NodePolicy{"node-1": DefaultNodePolicy("linux")}}
 
 	start := func(store *Store) (context.CancelFunc, <-chan error) {
 		t.Helper()
