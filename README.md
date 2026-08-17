@@ -57,6 +57,17 @@ npm ci
 npm run build
 ```
 
+Pre-1.0 schema changes are applied only to newly created databases; there is
+no migration mechanism. If this state root came from an older checkout, stop
+the stack and delete the disposable L1 and agent-spool SQLite files (including
+their `-wal` and `-shm` sidecars) before restarting:
+
+```sh
+test -n "$WEFTY_STATE_ROOT"
+rm -f "$WEFTY_STATE_ROOT/l1.sqlite" "$WEFTY_STATE_ROOT/l1.sqlite-wal" "$WEFTY_STATE_ROOT/l1.sqlite-shm"
+find "$WEFTY_STATE_ROOT/agent-logs" -type f \( -name '*.sqlite' -o -name '*.sqlite-wal' -o -name '*.sqlite-shm' \) -delete 2>/dev/null || true
+```
+
 Export the same four variables in three terminals, then start one process in
 each.
 
@@ -68,7 +79,9 @@ cd "$WEFTY_ROOT"
   --fabric=plain \
   --listen="$WEFTY_L1_ADDR" \
   --db="$WEFTY_STATE_ROOT/l1.sqlite" \
-  --node-tags=dogfood-local=mac,arm64,wefty:node:dogfood-local
+  --node-tags=dogfood-local=mac,arm64,wefty:node:dogfood-local \
+  --node-max-oneshot-slots=dogfood-local=4 \
+  --node-max-service-slots=dogfood-local=2
 ```
 
 Terminal 2 — L3 run ledger:

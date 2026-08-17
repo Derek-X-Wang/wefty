@@ -133,6 +133,24 @@ unsupported_kind`. `runtime_handler` is schema-visible for future OCI security
 tiers, but a `process` job that sets it receives `422
 unsupported_runtime_handler`.
 
+Every job also declares the independent, required `class` lifecycle axis.
+`class` is an open string: L1 stores unknown values as valid data, and only an
+agent that cannot execute one reports `unsupported_class`. The known values are
+`one-shot` and `service`. L3 always constructs `one-shot` jobs explicitly.
+
+A service declares `restart: always`, may declare a positive
+`max_restart_streak`, and may carry a `published_port` in the inclusive range
+1–65535. A missing or null port means the service is portless. Services do not
+participate in the run handoff lifecycle, so `handoff_directory` is required
+only for `one-shot`; the agent never prepares or finishes a handoff path for a
+service.
+
+Process spawn failures carry a stable `{code, message}` object. The message is
+diagnostic only. L1 owns the restartability allowlist and treats every unknown
+or unlisted spawn failure code as terminal. Signal results also carry a closed
+`termination_cause` (`spontaneous`, `agent`, or `guardian`) naming the
+initiator; policy never parses a signal or error string to infer intent.
+
 The awaiting-input prompt verbs and cancellation verbs are reserved. They
 return the shared error shape with HTTP `501`, code `not_implemented`, and
 `retryable=false`; they do not mutate state.

@@ -77,6 +77,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	query := make(url.Values)
 	query.Add("_pragma", "busy_timeout(5000)")
 	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "secure_delete(1)")
 	query.Set("_txlock", "immediate")
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
 	db, err := sql.Open("sqlite", dsn)
@@ -130,7 +131,15 @@ CREATE TABLE IF NOT EXISTS nodes (
   agent_version TEXT NOT NULL,
   capabilities_json BLOB NOT NULL,
   state TEXT NOT NULL,
-  last_heartbeat_ns INTEGER NOT NULL
+  last_heartbeat_ns INTEGER NOT NULL,
+  max_oneshot_slots INTEGER NOT NULL CHECK(max_oneshot_slots >= 0),
+  max_service_slots INTEGER NOT NULL CHECK(max_service_slots >= 0),
+  authority_generation INTEGER NOT NULL DEFAULT 0 CHECK(authority_generation >= 0),
+  claims_enabled INTEGER NOT NULL DEFAULT 0 CHECK(claims_enabled IN (0, 1)),
+  intent_revision INTEGER NOT NULL DEFAULT 0 CHECK(intent_revision >= 0),
+  intent_reason TEXT NOT NULL DEFAULT '',
+  intent_updated_at INTEGER,
+  intent_actor TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS node_tags (
   node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
@@ -145,12 +154,38 @@ CREATE TABLE IF NOT EXISTS attempts (
   state TEXT NOT NULL,
   fencing_token TEXT NOT NULL,
   lease_expires_ns INTEGER NOT NULL,
+  authority_generation INTEGER NOT NULL DEFAULT 0 CHECK(authority_generation >= 0),
   completion_key TEXT,
   completion_hash TEXT,
+  result_json BLOB,
+  late_result_json BLOB,
+  late_result_observed_ns INTEGER,
+  late_result_authority_lost_ns INTEGER,
+  late_result_is_late INTEGER NOT NULL DEFAULT 0 CHECK(late_result_is_late IN (0, 1)),
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS attempts_job ON attempts(job_id);
+CREATE TABLE IF NOT EXISTS service_jobs (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped')),
+  bound_node_id TEXT REFERENCES nodes(node_id),
+  restart_streak INTEGER NOT NULL DEFAULT 0 CHECK(restart_streak >= 0),
+  lifetime_restart_count INTEGER NOT NULL DEFAULT 0 CHECK(lifetime_restart_count >= 0),
+  next_restart_at INTEGER,
+  published_port INTEGER CHECK(published_port BETWEEN 1 AND 65535),
+  last_failure BLOB,
+  healthy_since_ns INTEGER,
+  published_attempt_id TEXT REFERENCES attempts(attempt_id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS service_jobs_bound_desired ON service_jobs(bound_node_id, desired_state);
+CREATE TABLE IF NOT EXISTS service_restart_requests (
+  job_id TEXT NOT NULL REFERENCES service_jobs(job_id) ON DELETE CASCADE,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  created_ns INTEGER NOT NULL,
+  PRIMARY KEY(job_id, idempotency_key)
+);
 CREATE TABLE IF NOT EXISTS log_events (
   ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
@@ -163,9 +198,44 @@ CREATE TABLE IF NOT EXISTS log_events (
   UNIQUE(attempt_id, stream, sequence)
 );
 CREATE INDEX IF NOT EXISTS log_events_job_order ON log_events(job_id, ordinal);
+CREATE TABLE IF NOT EXISTS service_log_truncations (
+  job_id TEXT PRIMARY KEY REFERENCES service_jobs(job_id) ON DELETE CASCADE,
+  bound_kind TEXT NOT NULL CHECK(bound_kind IN ('bytes', 'age')),
+  evicted_event_count INTEGER NOT NULL CHECK(evicted_event_count >= 0),
+  evicted_byte_count INTEGER NOT NULL CHECK(evicted_byte_count >= 0),
+  evicted_through_ordinal INTEGER NOT NULL CHECK(evicted_through_ordinal >= 0),
+  earliest_retained_ns INTEGER,
+  updated_ns INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS job_log_jsonl (
   job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
   jsonl BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS service_removals (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  bound_node_id TEXT NOT NULL,
+  removal_generation INTEGER NOT NULL CHECK(removal_generation > 0),
+  cleanup_fence TEXT NOT NULL,
+  root_instance_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('removal_pending', 'agent_cleaned', 'removed_verified', 'forgotten_cleanup_unverified')),
+  requested_ns INTEGER NOT NULL,
+  cleanup_acknowledgement_key TEXT,
+  cleanup_acknowledgement_hash TEXT,
+  agent_cleaned_ns INTEGER,
+  removed_ns INTEGER
+);
+CREATE TABLE IF NOT EXISTS service_tombstones (
+  job_id TEXT PRIMARY KEY,
+  dispatch_key_hash TEXT NOT NULL UNIQUE,
+  request_hash TEXT NOT NULL,
+  created_ns INTEGER NOT NULL,
+  removal_requested_ns INTEGER NOT NULL,
+  removed_ns INTEGER NOT NULL,
+  outcome TEXT NOT NULL CHECK(outcome IN ('verified_removed', 'force_forgotten')),
+  last_bound_node_id TEXT NOT NULL,
+  removal_generation INTEGER NOT NULL CHECK(removal_generation > 0),
+  root_instance_id TEXT NOT NULL,
+  cleanup_acknowledged_ns INTEGER
 );
 INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 `
@@ -291,16 +361,25 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 	return nodes, nil
 }
 
-// RegisterNode records a boot session and replaces its routing tags with the
-// canonical operator-configured set supplied by the server.
-func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, registration contract.NodeRegistration, authoritativeTags []string) (Node, error) {
+// RegisterNode records a boot session and replaces its eligibility policy with
+// the canonical operator-configured policy supplied by the server.
+func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, registration contract.NodeRegistration, policy NodePolicy) (Node, error) {
 	if registration.NodeID == "" || registration.BootSessionID == "" || registration.OS == "" || registration.Architecture == "" || registration.AgentVersion == "" {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "node registration fields must be non-empty")
 	}
 	if identity.NodeID == "" {
 		return Node{}, protocolError(contract.ErrorPrincipalForbidden, "authenticated Fabric identity has no node ID")
 	}
-	tags := NormalizeTags(authoritativeTags)
+	if policy.MaxOneshotSlots < 0 || policy.MaxServiceSlots < 0 {
+		return Node{}, protocolError(contract.ErrorInvalidRequest, "configured node slot limits must be non-negative")
+	}
+	for capability := range registration.Capabilities {
+		switch strings.ToLower(strings.TrimSpace(capability)) {
+		case "max_oneshot_slots", "max_service_slots":
+			return Node{}, protocolError(contract.ErrorInvalidRequest, "node capacity is control-plane policy, not an agent capability")
+		}
+	}
+	tags := NormalizeTags(policy.Tags)
 	for _, tag := range tags {
 		if !validTag(tag) {
 			return Node{}, protocolError(contract.ErrorInvalidRequest, "configured node tag %q is invalid", tag)
@@ -317,8 +396,8 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `
-INSERT INTO nodes(node_id, identity_node_id, boot_session_id, os, architecture, agent_version, capabilities_json, state, last_heartbeat_ns)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO nodes(node_id, identity_node_id, boot_session_id, os, architecture, agent_version, capabilities_json, state, last_heartbeat_ns, max_oneshot_slots, max_service_slots)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(node_id) DO UPDATE SET
   boot_session_id=excluded.boot_session_id,
   os=excluded.os,
@@ -326,9 +405,12 @@ ON CONFLICT(node_id) DO UPDATE SET
   agent_version=excluded.agent_version,
   capabilities_json=excluded.capabilities_json,
   state=excluded.state,
-	last_heartbeat_ns=excluded.last_heartbeat_ns
+	last_heartbeat_ns=excluded.last_heartbeat_ns,
+	max_oneshot_slots=excluded.max_oneshot_slots,
+	max_service_slots=excluded.max_service_slots
 WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, identity.NodeID, registration.BootSessionID,
-		registration.OS, registration.Architecture, registration.AgentVersion, capabilities, contract.NodeAlive, now.UnixNano())
+		registration.OS, registration.Architecture, registration.AgentVersion, capabilities, contract.NodeAlive, now.UnixNano(),
+		policy.MaxOneshotSlots, policy.MaxServiceSlots)
 	if err != nil {
 		return Node{}, internalError(err, "store node registration")
 	}
@@ -351,7 +433,10 @@ WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, id
 		return Node{}, internalError(err, "commit node registration")
 	}
 	registration.Capabilities = nonNilCapabilities(registration.Capabilities)
-	return Node{NodeRegistration: registration, State: contract.NodeAlive, AuthoritativeTags: tags, LastHeartbeatAt: now}, nil
+	return Node{
+		NodeRegistration: registration, State: contract.NodeAlive, AuthoritativeTags: tags,
+		MaxOneshotSlots: policy.MaxOneshotSlots, MaxServiceSlots: policy.MaxServiceSlots, LastHeartbeatAt: now,
+	}, nil
 }
 
 func (s *Store) HeartbeatNode(ctx context.Context, identityNodeID, nodeID, bootSessionID string) (Node, error) {
@@ -938,10 +1023,10 @@ func validateJobSpec(spec *contract.JobSpec) error {
 	if spec.SchemaVersion != contract.SchemaVersionV1 {
 		return protocolError(contract.ErrorInvalidRequest, "schema_version must be %d", contract.SchemaVersionV1)
 	}
-	if strings.TrimSpace(spec.DispatchKey) == "" || strings.TrimSpace(spec.Kind) == "" {
-		return protocolError(contract.ErrorInvalidRequest, "dispatch_key and kind are required")
+	if strings.TrimSpace(spec.DispatchKey) == "" || strings.TrimSpace(spec.Kind) == "" || strings.TrimSpace(spec.Class) == "" {
+		return protocolError(contract.ErrorInvalidRequest, "dispatch_key, kind, and class are required")
 	}
-	if len(spec.DispatchKey) > 255 || len(spec.Kind) > 128 || len(spec.RuntimeHandler) > 128 {
+	if len(spec.DispatchKey) > 255 || len(spec.Kind) > 128 || len(spec.Class) > 128 || len(spec.RuntimeHandler) > 128 {
 		return protocolError(contract.ErrorInvalidRequest, "job identifier fields exceed contract limits")
 	}
 	if spec.Kind != "process" {
@@ -950,8 +1035,22 @@ func validateJobSpec(spec *contract.JobSpec) error {
 	if spec.RuntimeHandler != "" {
 		return protocolError(contract.ErrorUnsupportedRuntimeHandler, "runtime_handler is not supported for process jobs")
 	}
-	if spec.Execution.WorkingDirectory == "" || spec.Execution.HandoffDirectory == "" || len(spec.Execution.Argv) == 0 {
-		return protocolError(contract.ErrorInvalidRequest, "execution argv and directories are required")
+	if spec.Execution.WorkingDirectory == "" || len(spec.Execution.Argv) == 0 {
+		return protocolError(contract.ErrorInvalidRequest, "execution argv and working_directory are required")
+	}
+	if spec.Class == contract.JobClassOneShot && spec.Execution.HandoffDirectory == "" {
+		return protocolError(contract.ErrorInvalidRequest, "one-shot execution handoff_directory is required")
+	}
+	if spec.Class == contract.JobClassService {
+		if spec.Restart != contract.RestartAlways {
+			return protocolError(contract.ErrorInvalidRequest, "service restart must be %q", contract.RestartAlways)
+		}
+		if spec.PublishedPort != nil && (*spec.PublishedPort < 1 || *spec.PublishedPort > 65535) {
+			return protocolError(contract.ErrorInvalidRequest, "published_port must be between 1 and 65535")
+		}
+		if spec.MaxRestartStreak != nil && *spec.MaxRestartStreak < 1 {
+			return protocolError(contract.ErrorInvalidRequest, "max_restart_streak must be at least 1")
+		}
 	}
 	if (spec.Execution.Executable.Path == "") == (spec.Execution.Executable.InlineBase64 == "") {
 		return protocolError(contract.ErrorInvalidRequest, "executable must contain exactly one of path or inline_base64")
@@ -972,8 +1071,11 @@ func validateJobSpec(spec *contract.JobSpec) error {
 
 func validateProcessResult(result ProcessResult) error {
 	set := 0
-	if result.SpawnError != "" {
+	if result.SpawnError != nil {
 		set++
+		if result.SpawnError.Code == "" || strings.TrimSpace(result.SpawnError.Message) == "" {
+			return protocolError(contract.ErrorInvalidRequest, "spawn_error code and message are required")
+		}
 	}
 	if result.OutputError != "" {
 		set++
@@ -983,11 +1085,25 @@ func validateProcessResult(result ProcessResult) error {
 	}
 	if result.Signal != "" {
 		set++
+		if !validTerminationCause(result.TerminationCause) {
+			return protocolError(contract.ErrorInvalidRequest, "signal result requires a valid termination_cause")
+		}
+	} else if result.TerminationCause != "" {
+		return protocolError(contract.ErrorInvalidRequest, "termination_cause requires signal")
 	}
 	if set != 1 {
 		return protocolError(contract.ErrorInvalidRequest, "result must contain exactly one of spawn_error, output_error, exit_code, or signal")
 	}
 	return nil
+}
+
+func validTerminationCause(cause contract.TerminationCause) bool {
+	switch cause {
+	case contract.TerminationCauseSpontaneous, contract.TerminationCauseAgent, contract.TerminationCauseGuardian:
+		return true
+	default:
+		return false
+	}
 }
 
 func validSHA256(value string) bool {
@@ -1068,9 +1184,9 @@ func getNode(ctx context.Context, q *sql.DB, nodeID string) (Node, error) {
 	var node Node
 	var capabilitiesJSON []byte
 	var heartbeatNS int64
-	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, os, architecture, agent_version, capabilities_json, state, last_heartbeat_ns
+	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, os, architecture, agent_version, capabilities_json, state, max_oneshot_slots, max_service_slots, last_heartbeat_ns
 FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.OS, &node.Architecture,
-		&node.AgentVersion, &capabilitiesJSON, &node.State, &heartbeatNS)
+		&node.AgentVersion, &capabilitiesJSON, &node.State, &node.MaxOneshotSlots, &node.MaxServiceSlots, &heartbeatNS)
 	if err != nil {
 		return Node{}, err
 	}

@@ -113,11 +113,34 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	if len(processResult["oneOf"].([]any)) != 4 {
 		t.Fatal("ProcessResult must distinguish spawn error, output failure, exit code, and signal death")
 	}
+	processProperties := object(t, processResult["properties"], "ProcessResult.properties")
+	if _, ok := processProperties["termination_cause"]; !ok {
+		t.Fatal("ProcessResult must carry a structured termination cause")
+	}
+	spawnFailure := object(t, schemas["SpawnFailure"], "SpawnFailure")
+	spawnRequired := stringSet(t, spawnFailure["required"])
+	if !spawnRequired["code"] || !spawnRequired["message"] {
+		t.Fatal("SpawnFailure must carry stable code and diagnostic message")
+	}
 
 	nodeRegistration := object(t, schemas["NodeRegistration"], "NodeRegistration")
 	properties := object(t, nodeRegistration["properties"], "NodeRegistration.properties")
 	if _, selfReported := properties["tags"]; selfReported {
 		t.Fatal("NodeRegistration must not accept self-reported tags")
+	}
+	for _, field := range []string{"max_oneshot_slots", "max_service_slots"} {
+		if _, selfReported := properties[field]; selfReported {
+			t.Fatalf("NodeRegistration must not accept self-reported %s", field)
+		}
+	}
+	node := object(t, schemas["Node"], "Node")
+	nodeParts := node["allOf"].([]any)
+	nodeProjection := object(t, nodeParts[1], "Node.allOf[1]")
+	nodeProperties := object(t, nodeProjection["properties"], "Node.properties")
+	for _, field := range []string{"max_oneshot_slots", "max_service_slots"} {
+		if _, ok := nodeProperties[field]; !ok {
+			t.Errorf("Node response missing authoritative %s", field)
+		}
 	}
 }
 

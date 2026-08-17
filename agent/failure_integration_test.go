@@ -71,7 +71,7 @@ func TestPartitionedAgentLosesAuthorityWithoutSecondExecution(t *testing.T) {
 
 	_, err = store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-node-2"}, contract.NodeRegistration{
 		NodeID: "node-2", BootSessionID: "boot-2", OS: "linux", Architecture: "arm64", AgentVersion: "test",
-	}, []string{"linux"})
+	}, l1.DefaultNodePolicy("linux"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,11 @@ func startFailureServer(t *testing.T, network *plain.Network, clock l1.Clock, no
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{AuthoritativeNodeTags: nodeTags})
+	policies := make(map[string]l1.NodePolicy, len(nodeTags))
+	for nodeID, tags := range nodeTags {
+		policies[nodeID] = l1.DefaultNodePolicy(tags...)
+	}
+	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: policies})
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
@@ -186,7 +190,7 @@ func createAgentTestJob(t *testing.T, store *l1.Store, dispatchKey string) l1.Jo
 	t.Helper()
 	directory := t.TempDir()
 	job, _, err := store.CreateJob(context.Background(), contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1, DispatchKey: dispatchKey, Kind: "process", RoutingTags: []string{"linux"},
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: dispatchKey, Kind: "process", Class: contract.JobClassOneShot, RoutingTags: []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"},
 			WorkingDirectory: directory, HandoffDirectory: directory,
@@ -215,7 +219,7 @@ func (runner *blockingRunner) Run(ctx context.Context, _ processrunner.Request, 
 	}
 	select {
 	case <-ctx.Done():
-		return contract.ProcessResult{Signal: "canceled"}, ctx.Err()
+		return contract.ProcessResult{Signal: "canceled", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
 	case <-runner.releaseCh:
 		exitCode := 0
 		return contract.ProcessResult{ExitCode: &exitCode}, nil

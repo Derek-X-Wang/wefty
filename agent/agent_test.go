@@ -62,12 +62,12 @@ func TestMain(main *testing.M) {
 
 func TestRunProcessRejectsUnknownKind(t *testing.T) {
 	a := &Agent{runner: panicRunner{}}
-	result, err := a.runProcess(context.Background(), l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: "oci"}}})
+	result, err := a.runProcess(context.Background(), l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: "oci", Class: contract.JobClassOneShot}}})
 	var executionError *contract.ExecutionError
 	if !errors.As(err, &executionError) {
 		t.Fatalf("runProcess() error = %v, want ExecutionError", err)
 	}
-	if executionError.Code() != contract.ErrorUnsupportedKind || result.SpawnError == "" {
+	if executionError.Code() != contract.ErrorUnsupportedKind || result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailureUnsupportedKind {
 		t.Fatalf("error/result = %q/%#v", executionError.Code(), result)
 	}
 }
@@ -86,6 +86,7 @@ func TestRunProcessRedactsSensitiveEnvironmentFromLogEvents(t *testing.T) {
 	claim := l1.Claim{
 		Job: l1.Job{Spec: contract.JobSpec{
 			Kind:      "process",
+			Class:     contract.JobClassOneShot,
 			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{contract.EnvRunToken: "wrun_log_secret"}},
 		}},
 		Lease: l1.AttemptLease{AttemptID: "attempt-redaction"},
@@ -111,6 +112,7 @@ func TestRunProcessReportsOutputFinalizationFailureInsteadOfExitZero(t *testing.
 	claim := l1.Claim{
 		Job: l1.Job{Spec: contract.JobSpec{
 			Kind:      "process",
+			Class:     contract.JobClassOneShot,
 			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{contract.EnvRunToken: "long-secret-value"}},
 		}},
 		Lease: l1.AttemptLease{AttemptID: "attempt-output-finalization"},
@@ -156,7 +158,7 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{"stable-node": {"linux"}}})
+	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"stable-node": l1.DefaultNodePolicy("linux")}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +201,7 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   "short-lease",
 		Kind:          "process",
+		Class:         contract.JobClassOneShot,
 		RoutingTags:   []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable:       contract.ExecutableSpec{Path: agentHelperPath},
@@ -232,7 +235,7 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 		t.Fatal(err)
 	}
 	defer store.Close()
-	l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{"stable-node": {"linux"}}})
+	l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"stable-node": l1.DefaultNodePolicy("linux")}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +301,7 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 		t.Fatal(err)
 	}
 	job, _, err := store.CreateJob(context.Background(), contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "completion-retry", Kind: "process", RoutingTags: []string{"linux"},
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "completion-retry", Kind: "process", Class: contract.JobClassOneShot, RoutingTags: []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable: contract.ExecutableSpec{Path: truePath}, Argv: []string{"true"},
 			WorkingDirectory: directory, HandoffDirectory: directory,

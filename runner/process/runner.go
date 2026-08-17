@@ -111,12 +111,12 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 	}
 
 	if err := validateRequest(ctx, request); err != nil {
-		return contract.ProcessResult{SpawnError: err.Error()}, err
+		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
 	}
 
 	idleTimeout, completionTimeout, maxRuntime, err := runner.timeouts(request.Limits)
 	if err != nil {
-		return contract.ProcessResult{SpawnError: err.Error()}, err
+		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
 	}
 
 	command := &exec.Cmd{
@@ -126,7 +126,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 		Env:  buildEnvironment(runner.baseEnvironment, request.Execution.Env, request.Execution.SensitiveEnv),
 	}
 	if err := configureProcessGroup(command); err != nil {
-		return contract.ProcessResult{SpawnError: err.Error()}, err
+		return spawnFailure(contract.SpawnFailureProcessGroupSetup, err), err
 	}
 
 	activity := newActivityTracker(runner.clock.Now())
@@ -151,7 +151,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 	}
 
 	if err := command.Start(); err != nil {
-		return contract.ProcessResult{SpawnError: err.Error()}, nil
+		return spawnFailure(contract.SpawnFailureProcessSpawn, err), nil
 	}
 
 	wait := make(chan waitResult, 1)
@@ -184,7 +184,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 		select {
 		case outcome := <-wait:
 			runner.cleanupRemainingGroup(command.Process.Pid)
-			result := resultFromWait(outcome.err, outcome.state)
+			result := resultFromWait(outcome.err, outcome.state, contract.TerminationCauseSpontaneous)
 			if sinkErr := failure.Err(); sinkErr != nil {
 				return result, fmt.Errorf("output sink: %w", sinkErr)
 			}
@@ -197,7 +197,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 			remaining := activity.Remaining(runner.clock.Now(), idleTimeout)
 			if remaining <= 0 {
 				outcome := runner.terminateAndWait(command.Process.Pid, wait)
-				return resultFromWait(outcome.err, outcome.state), ErrIdleTimeout
+				return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), ErrIdleTimeout
 			}
 			resetTimer(idleTimer, remaining)
 
@@ -208,7 +208,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 				continue
 			}
 			outcome := runner.terminateAndWait(command.Process.Pid, wait)
-			return resultFromWait(outcome.err, outcome.state), ErrIdleTimeout
+			return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), ErrIdleTimeout
 
 		case <-completionSignal:
 			completionSignal = nil
@@ -220,21 +220,25 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 
 		case <-completionTimerChannel:
 			outcome := runner.terminateAndWait(command.Process.Pid, wait)
-			return resultFromWait(outcome.err, outcome.state), ErrCompletionTimeout
+			return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), ErrCompletionTimeout
 
 		case <-maxRuntimeChannel:
 			outcome := runner.terminateAndWait(command.Process.Pid, wait)
-			return resultFromWait(outcome.err, outcome.state), ErrMaxRuntime
+			return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), ErrMaxRuntime
 
 		case <-failure.Changed():
 			outcome := runner.terminateAndWait(command.Process.Pid, wait)
-			return resultFromWait(outcome.err, outcome.state), fmt.Errorf("output sink: %w", failure.Err())
+			return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), fmt.Errorf("output sink: %w", failure.Err())
 
 		case <-ctx.Done():
 			outcome := runner.terminateAndWait(command.Process.Pid, wait)
-			return resultFromWait(outcome.err, outcome.state), ctx.Err()
+			return resultFromWait(outcome.err, outcome.state, contract.TerminationCauseAgent), ctx.Err()
 		}
 	}
+}
+
+func spawnFailure(code contract.SpawnFailureCode, err error) contract.ProcessResult {
+	return contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: code, Message: err.Error()}}
 }
 
 func (runner *Runner) timeouts(limits *contract.JobLimits) (time.Duration, time.Duration, time.Duration, error) {

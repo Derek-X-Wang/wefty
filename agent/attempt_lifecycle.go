@@ -142,7 +142,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim) 
 	if completionErr != nil {
 		return fmt.Errorf("agent: complete attempt: %w", completionErr)
 	}
-	if lifecycle.dependencies.handoffs != nil {
+	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
 		succeeded := outcome.err == nil && outcome.result.ExitCode != nil && *outcome.result.ExitCode == 0
 		if err := lifecycle.dependencies.handoffs.finish(claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded); err != nil {
 			return fmt.Errorf("agent: finish handoff lifecycle: %w", err)
@@ -171,28 +171,31 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 }
 
 func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
+	if err := contract.CheckWorkloadClass(claim.Job.Spec.Class); err != nil {
+		return spawnFailure(contract.SpawnFailureUnsupportedClass, err), err
+	}
 	if err := contract.CheckExecutableKind(claim.Job.Spec.Kind); err != nil {
-		return contract.ProcessResult{SpawnError: err.Error()}, err
+		return spawnFailure(contract.SpawnFailureUnsupportedKind, err), err
 	}
 	if claim.Job.Spec.RuntimeHandler != "" {
 		err := fmt.Errorf("runtime handler %q is not supported for process jobs", claim.Job.Spec.RuntimeHandler)
-		return contract.ProcessResult{SpawnError: err.Error()}, err
+		return spawnFailure(contract.SpawnFailureUnsupportedRuntimeHandler, err), err
 	}
-	if lifecycle.dependencies.handoffs != nil {
+	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
 		if err := lifecycle.dependencies.handoffs.prepare(claim.Job.Spec, lifecycle.dependencies.nodeID); err != nil {
-			return contract.ProcessResult{SpawnError: err.Error()}, err
+			return spawnFailure(contract.SpawnFailureHandoffPreparation, err), err
 		}
 	}
 	execution, cleanupExecutable, err := materializeExecutable(claim.Job.Spec.Execution, claim.Lease.AttemptID)
 	if err != nil {
-		return contract.ProcessResult{SpawnError: err.Error()}, err
+		return spawnFailure(contract.SpawnFailureExecutableMaterialization, err), err
 	}
 	defer cleanupExecutable()
 	var bridge *workflowBridge
-	if lifecycle.dependencies.workflowBridge != nil {
+	if lifecycle.dependencies.workflowBridge != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
 		bridge, err = lifecycle.dependencies.workflowBridge(ctx, execution)
 		if err != nil {
-			return contract.ProcessResult{SpawnError: err.Error()}, err
+			return spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, err), err
 		}
 	}
 	if bridge != nil {
@@ -206,7 +209,7 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 	if lifecycle.dependencies.client != nil && lifecycle.dependencies.outbox != nil {
 		uploader, err = lifecycle.dependencies.outbox.newLogSink(ctx, lifecycle.dependencies.client, claim)
 		if err != nil {
-			return contract.ProcessResult{SpawnError: err.Error()}, err
+			return spawnFailure(contract.SpawnFailureLogSinkSetup, err), err
 		}
 		sinks = append(sinks, uploader)
 	}
@@ -291,6 +294,10 @@ func (lifecycle *attemptLifecycle) log(format string, args ...any) {
 	}
 }
 
+func spawnFailure(code contract.SpawnFailureCode, err error) contract.ProcessResult {
+	return contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: code, Message: err.Error()}}
+}
+
 func renewalDelay(now, expires time.Time, configured time.Duration) time.Duration {
 	halfRemaining := expires.Sub(now) / 2
 	if halfRemaining <= 0 {
@@ -303,5 +310,8 @@ func renewalDelay(now, expires time.Time, configured time.Duration) time.Duratio
 }
 
 func toL1Result(result contract.ProcessResult) l1.ProcessResult {
-	return l1.ProcessResult{SpawnError: result.SpawnError, OutputError: result.OutputError, ExitCode: result.ExitCode, Signal: result.Signal}
+	return l1.ProcessResult{
+		SpawnError: result.SpawnError, OutputError: result.OutputError, ExitCode: result.ExitCode,
+		Signal: result.Signal, TerminationCause: result.TerminationCause,
+	}
 }

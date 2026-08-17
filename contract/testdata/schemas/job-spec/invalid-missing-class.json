@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "missing:class",
+  "kind": "process",
+  "execution": {
+    "executable": { "path": "/usr/bin/true" },
+    "argv": ["true"],
+    "working_directory": "/tmp",
+    "handoff_directory": "/tmp/handoff"
+  }
+}

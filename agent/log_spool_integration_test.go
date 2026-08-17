@@ -89,7 +89,7 @@ func TestAgentCompletesWithoutDuplicateLogsAfterNetworkLossMidJob(t *testing.T) 
 	store, stopServer := startRestartableLogServer(t, ctx, serverFabric, databasePath, clock)
 	directory := t.TempDir()
 	job, _, err := store.CreateJob(ctx, contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "network-mid-job", Kind: "process", RoutingTags: []string{"linux"},
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "network-mid-job", Kind: "process", Class: contract.JobClassOneShot, RoutingTags: []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable: contract.ExecutableSpec{Path: agentHelperPath},
 			Argv:       []string{"processhelper", "paced-output", "200"}, WorkingDirectory: directory, HandoffDirectory: directory,
@@ -222,7 +222,7 @@ func startRestartableLogServer(t *testing.T, parent context.Context, serverFabri
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{AuthoritativeNodeTags: map[string][]string{"stable-node": {"linux"}}})
+	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"stable-node": l1.DefaultNodePolicy("linux")}})
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
@@ -250,13 +250,13 @@ func createClaimForDurableLogs(t *testing.T, store *l1.Store, clock Clock) l1.Cl
 	t.Helper()
 	_, err := store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-node"}, contract.NodeRegistration{
 		NodeID: "stable-node", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
-	}, []string{"linux"})
+	}, l1.DefaultNodePolicy("linux"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	directory := t.TempDir()
 	job, _, err := store.CreateJob(context.Background(), contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "durable-" + directory, Kind: "process", RoutingTags: []string{"linux"},
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "durable-" + directory, Kind: "process", Class: contract.JobClassOneShot, RoutingTags: []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"},
 			WorkingDirectory: directory, HandoffDirectory: directory,

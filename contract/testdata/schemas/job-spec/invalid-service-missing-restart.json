@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "service:missing-restart",
+  "kind": "process",
+  "class": "service",
+  "execution": {
+    "executable": { "path": "/usr/bin/true" },
+    "argv": ["true"],
+    "working_directory": "/tmp"
+  }
+}
