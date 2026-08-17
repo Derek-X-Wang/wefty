@@ -76,7 +76,12 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Run service acceptance suite
-        run: go test -tags=service_acceptance ./...
+        # -p 1 serializes package test binaries. This lane spawns real agent,
+        # control-plane, guardian and payload processes, and running those
+        # packages concurrently starves them on the slowest runner in the
+        # matrix — observed as TestTimeoutTerminatesThenKillsEntireProcessGroup
+        # timing out on macos-latest while passing in every other job.
+        run: go test -p 1 -tags=service_acceptance ./...
 
   dogfood-workflow:
     name: dogfood-workflow
