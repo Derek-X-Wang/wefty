@@ -31,6 +31,30 @@ The successful claim returns all three write authorities:
 - `lease_expires_at`: an RFC 3339 timestamp computed only from the injected
   control-plane clock.
 
+## Semantic authority errors
+
+Authority scope is carried by the error code, never inferred from an HTTP
+status or route. The same route can reject the Fabric principal before the
+handler or reject only one attempt inside the handler, and those failures
+require different reactions.
+
+| Condition | HTTP | Error code | Retryable |
+| --- | ---: | --- | --- |
+| Fabric identity lacks the route group's principal tag | 403 | `principal_forbidden` | false |
+| Stable node ID is bound to another Fabric identity | 403 | `identity_bound` | false |
+| Stable node ID has no registration | 409 | `node_not_registered` | false |
+| Registered node is dead | 409 | `node_dead` | false |
+| Registered node is draining | 409 | `node_draining` | false |
+| Boot session has been replaced | 409 | `node_session_replaced` | false |
+| Attempt ID does not exist | 404 | `attempt_not_found` | false |
+| Authenticated node does not own the attempt | 403 | `attempt_not_owned` | false |
+
+`retryable` is advisory for repeating the same request. It never overrides a
+known authority-loss code. An `internal` response is retryable because the
+same request may succeed after the server-side failure clears; semantic
+authority failures are not retryable because the caller must first lose or
+re-establish the corresponding authority.
+
 ## Renewal and heartbeat separation
 
 Attempt renewal is `POST .../attempts/{attempt_id}/lease` and requires the

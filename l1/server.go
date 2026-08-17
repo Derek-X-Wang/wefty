@@ -207,7 +207,7 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 			tag = s.agentPrincipalTag
 		}
 		if !slices.Contains(NormalizeTags(identity.Tags), tag) {
-			writeError(w, protocolError(contract.ErrorForbidden, "fabric identity is not authorized for this protocol"))
+			writeError(w, protocolError(contract.ErrorPrincipalForbidden, "fabric identity is not authorized for this protocol"))
 			return
 		}
 		ctx := context.WithValue(r.Context(), identityContextKey{}, identity)
@@ -429,9 +429,9 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 	case contract.ErrorUnauthorized:
 		status = http.StatusUnauthorized
-	case contract.ErrorForbidden:
+	case contract.ErrorForbidden, contract.ErrorPrincipalForbidden, contract.ErrorIdentityBound, contract.ErrorAttemptNotOwned:
 		status = http.StatusForbidden
-	case contract.ErrorNotFound:
+	case contract.ErrorNotFound, contract.ErrorAttemptNotFound:
 		status = http.StatusNotFound
 	case contract.ErrorUnsupportedKind, contract.ErrorUnsupportedRuntimeHandler:
 		status = http.StatusUnprocessableEntity
@@ -444,5 +444,5 @@ func writeError(w http.ResponseWriter, err error) {
 	if code == contract.ErrorInternal {
 		message = "internal server error"
 	}
-	writeJSON(w, status, contract.ErrorResponse{Error: contract.APIError{Code: code, Message: message, Retryable: false}})
+	writeJSON(w, status, contract.ErrorResponse{Error: contract.APIError{Code: code, Message: message, Retryable: code == contract.ErrorInternal}})
 }

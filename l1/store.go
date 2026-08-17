@@ -298,7 +298,7 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "node registration fields must be non-empty")
 	}
 	if identity.NodeID == "" {
-		return Node{}, protocolError(contract.ErrorForbidden, "authenticated Fabric identity has no node ID")
+		return Node{}, protocolError(contract.ErrorPrincipalForbidden, "authenticated Fabric identity has no node ID")
 	}
 	tags := NormalizeTags(authoritativeTags)
 	for _, tag := range tags {
@@ -337,7 +337,7 @@ WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, id
 		return Node{}, internalError(err, "read node registration result")
 	}
 	if changed == 0 {
-		return Node{}, protocolError(contract.ErrorForbidden, "stable node %q is bound to another Fabric identity", registration.NodeID)
+		return Node{}, protocolError(contract.ErrorIdentityBound, "stable node %q is bound to another Fabric identity", registration.NodeID)
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM node_tags WHERE node_id = ?", registration.NodeID); err != nil {
 		return Node{}, internalError(err, "replace node tags")
@@ -369,7 +369,7 @@ func (s *Store) HeartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 		return Node{}, internalError(err, "read heartbeat result")
 	}
 	if changed == 0 {
-		return Node{}, protocolError(contract.ErrorConflict, "node identity or boot session does not match")
+		return Node{}, s.nodeSessionError(ctx, nodeID, identityNodeID, bootSessionID, "heartbeat")
 	}
 	node, err := getNode(ctx, s.db, nodeID)
 	if err != nil {
@@ -393,13 +393,16 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	var heartbeatNS int64
 	err = tx.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state, last_heartbeat_ns FROM nodes WHERE node_id=?", nodeID).Scan(&storedIdentity, &storedBoot, &nodeState, &heartbeatNS)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, protocolError(contract.ErrorConflict, "node %q is not registered", nodeID)
+		return nil, protocolError(contract.ErrorNodeNotRegistered, "node %q is not registered", nodeID)
 	}
 	if err != nil {
 		return nil, internalError(err, "read claiming node")
 	}
-	if storedIdentity != identityNodeID || storedBoot != bootSessionID {
-		return nil, protocolError(contract.ErrorForbidden, "authenticated node does not own this registration")
+	if storedIdentity != identityNodeID {
+		return nil, protocolError(contract.ErrorIdentityBound, "stable node %q is bound to another Fabric identity", nodeID)
+	}
+	if storedBoot != bootSessionID {
+		return nil, protocolError(contract.ErrorNodeSessionReplaced, "node %q boot session has been replaced", nodeID)
 	}
 	now := canonicalTime(s.clock.Now())
 	nodeState, err = s.reconcileClaimingNode(ctx, tx, nodeID, nodeState, time.Unix(0, heartbeatNS).UTC(), now)
@@ -410,7 +413,14 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 		if err := tx.Commit(); err != nil {
 			return nil, internalError(err, "commit node liveness transition")
 		}
-		return nil, protocolError(contract.ErrorConflict, "node %q is not alive", nodeID)
+		switch nodeState {
+		case contract.NodeDead:
+			return nil, protocolError(contract.ErrorNodeDead, "node %q is dead", nodeID)
+		case contract.NodeDraining:
+			return nil, protocolError(contract.ErrorNodeDraining, "node %q is draining", nodeID)
+		default:
+			return nil, protocolError(contract.ErrorConflict, "node %q is not alive", nodeID)
+		}
 	}
 
 	leaseExpires := canonicalTime(now.Add(s.leaseDuration))
@@ -881,7 +891,7 @@ JOIN nodes n ON n.node_id=a.node_id
 WHERE a.attempt_id=?`, attemptID).Scan(&a.attemptID, &a.jobID, &a.nodeID, &a.identityNodeID, &a.state,
 		&a.fencingToken, &leaseNS, &a.currentAttempt, &a.completionKey, &a.completionHash)
 	if errors.Is(err, sql.ErrNoRows) {
-		return attemptAuthority{}, protocolError(contract.ErrorNotFound, "attempt %q was not found", attemptID)
+		return attemptAuthority{}, protocolError(contract.ErrorAttemptNotFound, "attempt %q was not found", attemptID)
 	}
 	if err != nil {
 		return attemptAuthority{}, internalError(err, "read attempt authority")
@@ -892,7 +902,7 @@ WHERE a.attempt_id=?`, attemptID).Scan(&a.attemptID, &a.jobID, &a.nodeID, &a.ide
 
 func validateAttemptAuthority(identityNodeID, jobID, attemptID, fencingToken string, a attemptAuthority) error {
 	if a.identityNodeID != identityNodeID {
-		return protocolError(contract.ErrorForbidden, "authenticated node does not own this attempt")
+		return protocolError(contract.ErrorAttemptNotOwned, "authenticated node does not own this attempt")
 	}
 	if a.jobID != jobID || !a.currentAttempt.Valid || a.currentAttempt.String != attemptID {
 		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's current attempt")

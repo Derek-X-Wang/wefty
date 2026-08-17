@@ -217,9 +217,9 @@ func TestStaleAndDeadNodesCannotClaim(t *testing.T) {
 		h.submit(client, "dead-claim", []string{"linux"})
 		h.clock.Advance(DefaultNodeDeadAfter)
 		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
-		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDead)
 		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", HeartbeatRequest{BootSessionID: "boot-node-1"})
-		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDead)
 		h.register(agent, "node-1")
 		claimJob(t, h, agent, "node-1")
 	})
@@ -277,7 +277,7 @@ func TestDrainStopsClaimsAndAllowsRunningAttemptToFinish(t *testing.T) {
 		t.Fatalf("complete while draining status = %d body=%s", status, body)
 	}
 	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
-	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDraining)
 	queued, err := h.store.GetJob(context.Background(), queuedJobID)
 	if err != nil {
 		t.Fatal(err)

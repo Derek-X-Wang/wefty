@@ -10,7 +10,15 @@ const (
 	ErrorNotFound                  ErrorCode = "not_found"
 	ErrorUnauthorized              ErrorCode = "unauthorized"
 	ErrorForbidden                 ErrorCode = "forbidden"
+	ErrorPrincipalForbidden        ErrorCode = "principal_forbidden"
+	ErrorIdentityBound             ErrorCode = "identity_bound"
 	ErrorConflict                  ErrorCode = "conflict"
+	ErrorNodeNotRegistered         ErrorCode = "node_not_registered"
+	ErrorNodeDead                  ErrorCode = "node_dead"
+	ErrorNodeDraining              ErrorCode = "node_draining"
+	ErrorNodeSessionReplaced       ErrorCode = "node_session_replaced"
+	ErrorAttemptNotFound           ErrorCode = "attempt_not_found"
+	ErrorAttemptNotOwned           ErrorCode = "attempt_not_owned"
 	ErrorStaleFence                ErrorCode = "stale_fence"
 	ErrorLeaseExpired              ErrorCode = "lease_expired"
 	ErrorAttemptMismatch           ErrorCode = "attempt_mismatch"
@@ -22,7 +30,9 @@ const (
 	ErrorInternal                  ErrorCode = "internal"
 )
 
-// APIError is the single error shape shared by every HTTP protocol.
+// APIError is the single error shape shared by every HTTP protocol. Retryable
+// advises whether repeating the same request may succeed; consumers must still
+// honor the authority scope expressed by a known Code.
 type APIError struct {
 	Code      ErrorCode      `json:"code"`
 	Message   string         `json:"message"`
