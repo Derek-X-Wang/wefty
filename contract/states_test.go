@@ -7,9 +7,11 @@ func TestStateTransitionTablesCoverAllStates(t *testing.T) {
 
 	assertStates(t, JobTransitions, []JobState{
 		JobQueued, JobClaimed, JobRunning, JobStopping, JobStopped, JobAwaitingInput, JobSucceeded, JobFailed,
+		JobRemovalPending, JobAgentCleaned, JobRemovedVerified, JobForgottenCleanupUnverified,
 	})
 	assertStates(t, ServiceJobTransitions, []JobState{
 		JobQueued, JobClaimed, JobRunning, JobStopping, JobStopped, JobFailed,
+		JobRemovalPending, JobAgentCleaned, JobRemovedVerified, JobForgottenCleanupUnverified,
 	})
 	assertStates(t, AttemptTransitions, []AttemptState{
 		AttemptClaimed, AttemptRunning, AttemptAwaitingInput, AttemptSucceeded, AttemptFailed, AttemptLost,
@@ -48,6 +50,11 @@ func TestStateTransitionRules(t *testing.T) {
 	}
 	if _, persisted := ServiceJobTransitions[JobState("restart-pending")]; persisted {
 		t.Fatal("restart-pending is a computed projection, not a persisted state")
+	}
+	if !CanTransition(ServiceJobTransitions, JobRunning, JobRemovalPending) ||
+		!CanTransition(ServiceJobTransitions, JobRemovalPending, JobAgentCleaned) ||
+		!CanTransition(ServiceJobTransitions, JobAgentCleaned, JobRemovedVerified) {
+		t.Fatal("service removal must preserve request, attestation, then finalization order")
 	}
 }
 

@@ -3,25 +3,33 @@ package contract
 type JobState string
 
 const (
-	JobQueued        JobState = "queued"
-	JobClaimed       JobState = "claimed"
-	JobRunning       JobState = "running"
-	JobStopping      JobState = "stopping"
-	JobStopped       JobState = "stopped"
-	JobAwaitingInput JobState = "awaiting-input"
-	JobSucceeded     JobState = "succeeded"
-	JobFailed        JobState = "failed"
+	JobQueued                     JobState = "queued"
+	JobClaimed                    JobState = "claimed"
+	JobRunning                    JobState = "running"
+	JobStopping                   JobState = "stopping"
+	JobStopped                    JobState = "stopped"
+	JobAwaitingInput              JobState = "awaiting-input"
+	JobSucceeded                  JobState = "succeeded"
+	JobFailed                     JobState = "failed"
+	JobRemovalPending             JobState = "removal_pending"
+	JobAgentCleaned               JobState = "agent_cleaned"
+	JobRemovedVerified            JobState = "removed_verified"
+	JobForgottenCleanupUnverified JobState = "forgotten_cleanup_unverified"
 )
 
 var JobTransitions = map[JobState][]JobState{
-	JobQueued:        {JobClaimed, JobFailed},
-	JobClaimed:       {JobRunning, JobFailed},
-	JobRunning:       {JobAwaitingInput, JobSucceeded, JobFailed},
-	JobStopping:      {},
-	JobStopped:       {},
-	JobAwaitingInput: {JobRunning, JobFailed},
-	JobSucceeded:     {},
-	JobFailed:        {},
+	JobQueued:                     {JobClaimed, JobFailed},
+	JobClaimed:                    {JobRunning, JobFailed},
+	JobRunning:                    {JobAwaitingInput, JobSucceeded, JobFailed},
+	JobStopping:                   {},
+	JobStopped:                    {},
+	JobAwaitingInput:              {JobRunning, JobFailed},
+	JobSucceeded:                  {},
+	JobFailed:                     {},
+	JobRemovalPending:             {},
+	JobAgentCleaned:               {},
+	JobRemovedVerified:            {},
+	JobForgottenCleanupUnverified: {},
 }
 
 // ServiceJobTransitions is the observed-state machine for service-class jobs.
@@ -29,12 +37,16 @@ var JobTransitions = map[JobState][]JobState{
 // operator restart are service lifecycle semantics and must never make a
 // one-shot terminal state resumable.
 var ServiceJobTransitions = map[JobState][]JobState{
-	JobQueued:   {JobClaimed, JobStopped, JobFailed},
-	JobClaimed:  {JobRunning, JobStopping, JobQueued, JobFailed},
-	JobRunning:  {JobStopping, JobQueued, JobFailed},
-	JobStopping: {JobStopped, JobFailed},
-	JobStopped:  {JobQueued},
-	JobFailed:   {JobQueued},
+	JobQueued:                     {JobClaimed, JobStopped, JobFailed, JobRemovalPending},
+	JobClaimed:                    {JobRunning, JobStopping, JobQueued, JobFailed, JobRemovalPending},
+	JobRunning:                    {JobStopping, JobQueued, JobFailed, JobRemovalPending},
+	JobStopping:                   {JobStopped, JobFailed, JobRemovalPending},
+	JobStopped:                    {JobQueued, JobRemovalPending},
+	JobFailed:                     {JobQueued, JobRemovalPending},
+	JobRemovalPending:             {JobAgentCleaned, JobForgottenCleanupUnverified},
+	JobAgentCleaned:               {JobRemovedVerified, JobForgottenCleanupUnverified},
+	JobRemovedVerified:            {},
+	JobForgottenCleanupUnverified: {},
 }
 
 type ServiceDesiredState string
@@ -42,6 +54,7 @@ type ServiceDesiredState string
 const (
 	ServiceDesiredRunning ServiceDesiredState = "running"
 	ServiceDesiredStopped ServiceDesiredState = "stopped"
+	ServiceDesiredRemoved ServiceDesiredState = "removed"
 )
 
 type AttemptState string

@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   node_id TEXT PRIMARY KEY,
   identity_node_id TEXT NOT NULL,
   boot_session_id TEXT NOT NULL,
+	root_instance_id TEXT NOT NULL DEFAULT '',
   os TEXT NOT NULL,
   architecture TEXT NOT NULL,
   agent_version TEXT NOT NULL,
@@ -315,6 +316,16 @@ func (s *Store) CreateJob(ctx context.Context, spec contract.JobSpec) (job Job, 
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, internalError(err, "read dispatch key")
 	}
+	tombstone, err := readServiceTombstoneByDispatchHash(ctx, tx, hashDispatchKey(spec.DispatchKey))
+	if err == nil {
+		if tombstone.requestHash != requestHash {
+			return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", spec.DispatchKey)
+		}
+		return tombstone.job(), true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Job{}, false, internalError(err, "read removed dispatch key")
+	}
 
 	job = Job{
 		JobID:     newID("job"),
@@ -363,7 +374,14 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON
 func (s *Store) readConcurrentSubmit(ctx context.Context, dispatchKey, requestHash string, insertErr error) (Job, bool, error) {
 	job, storedHash, err := getJobByDispatchKey(ctx, s.db, dispatchKey, canonicalTime(s.clock.Now()))
 	if err != nil {
-		return Job{}, false, internalError(insertErr, "store job")
+		tombstone, tombstoneErr := readServiceTombstoneByDispatchHash(ctx, s.db, hashDispatchKey(dispatchKey))
+		if tombstoneErr != nil {
+			return Job{}, false, internalError(insertErr, "store job")
+		}
+		if tombstone.requestHash != requestHash {
+			return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", dispatchKey)
+		}
+		return tombstone.job(), true, nil
 	}
 	if storedHash != requestHash {
 		return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", dispatchKey)
@@ -374,7 +392,14 @@ func (s *Store) readConcurrentSubmit(ctx context.Context, dispatchKey, requestHa
 func (s *Store) GetJob(ctx context.Context, jobID string) (Job, error) {
 	job, err := getJobByID(ctx, s.db, jobID, canonicalTime(s.clock.Now()))
 	if errors.Is(err, sql.ErrNoRows) {
-		return Job{}, protocolError(contract.ErrorNotFound, "job %q was not found", jobID)
+		tombstone, tombstoneErr := readServiceTombstoneByID(ctx, s.db, jobID)
+		if errors.Is(tombstoneErr, sql.ErrNoRows) {
+			return Job{}, protocolError(contract.ErrorNotFound, "job %q was not found", jobID)
+		}
+		if tombstoneErr != nil {
+			return Job{}, internalError(tombstoneErr, "read removed job")
+		}
+		return tombstone.job(), nil
 	}
 	if err != nil {
 		return Job{}, internalError(err, "read job")
@@ -448,10 +473,11 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `
-INSERT INTO nodes(node_id, identity_node_id, boot_session_id, os, architecture, agent_version, capabilities_json, state, last_heartbeat_ns, max_oneshot_slots, max_service_slots, authority_generation, claims_enabled)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+INSERT INTO nodes(node_id, identity_node_id, boot_session_id, root_instance_id, os, architecture, agent_version, capabilities_json, state, last_heartbeat_ns, max_oneshot_slots, max_service_slots, authority_generation, claims_enabled)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
 ON CONFLICT(node_id) DO UPDATE SET
   boot_session_id=excluded.boot_session_id,
+	root_instance_id=excluded.root_instance_id,
   os=excluded.os,
   architecture=excluded.architecture,
   agent_version=excluded.agent_version,
@@ -461,7 +487,7 @@ ON CONFLICT(node_id) DO UPDATE SET
 	max_oneshot_slots=excluded.max_oneshot_slots,
 	max_service_slots=excluded.max_service_slots,
 	authority_generation=nodes.authority_generation+1
-WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, identity.NodeID, registration.BootSessionID,
+WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, identity.NodeID, registration.BootSessionID, registration.RootInstanceID,
 		registration.OS, registration.Architecture, registration.AgentVersion, capabilities, contract.NodeAlive, now.UnixNano(),
 		policy.MaxOneshotSlots, policy.MaxServiceSlots, operatorExpected)
 	if err != nil {
@@ -624,7 +650,7 @@ WHERE job_id=(
 	            WHERE occupied_service.bound_node_id=@node_id
 	              AND (
 	                (occupied_job.state=@job_queued AND occupied_service.desired_state=@desired_running)
-	                OR occupied_job.state IN (@job_claimed, @job_running, @job_stopping)
+	                OR occupied_job.state IN (@job_claimed, @job_running, @job_stopping, @job_removal_pending, @job_agent_cleaned)
 	              )
 	          ) < (
 	            SELECT max_service_slots FROM nodes WHERE node_id=@node_id
@@ -668,6 +694,8 @@ AND state=@job_queued
 		sql.Named("attempt_awaiting_input", contract.AttemptAwaitingInput),
 		sql.Named("job_running", contract.JobRunning),
 		sql.Named("job_stopping", contract.JobStopping),
+		sql.Named("job_removal_pending", contract.JobRemovalPending),
+		sql.Named("job_agent_cleaned", contract.JobAgentCleaned),
 	}
 	claimArguments = append(claimArguments, exclusionArguments...)
 	err = tx.QueryRowContext(ctx, fmt.Sprintf(claimQuery, exclusionClause), claimArguments...).
@@ -930,6 +958,13 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return AppendLogsResponse{}, err
+	}
+	var removalExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM service_removals WHERE job_id=?)`, jobID).Scan(&removalExists); err != nil {
+		return AppendLogsResponse{}, internalError(err, "read service removal before log append")
+	}
+	if removalExists {
+		return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "service removal has revoked log authority")
 	}
 	if err := validateAttemptEvidence(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 		return AppendLogsResponse{}, err
@@ -1283,6 +1318,13 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return Job{}, err
+	}
+	var removalExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM service_removals WHERE job_id=?)`, jobID).Scan(&removalExists); err != nil {
+		return Job{}, internalError(err, "read service removal before completion")
+	}
+	if removalExists {
+		return Job{}, protocolError(contract.ErrorConflict, "service removal has revoked completion authority")
 	}
 	if err := validateAttemptEvidence(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 		return Job{}, err
@@ -1735,6 +1777,11 @@ WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql
 	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns); err != nil {
 		return Job{}, "", err
 	}
+	if removal, removalErr := readServiceRemoval(ctx, q, job.JobID); removalErr == nil {
+		applyServiceRemoval(&job, removal)
+	} else if !errors.Is(removalErr, sql.ErrNoRows) {
+		return Job{}, "", removalErr
+	}
 	return job, requestHash, nil
 }
 
@@ -1777,6 +1824,11 @@ WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_
 	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns); err != nil {
 		return Job{}, err
 	}
+	if removal, removalErr := readServiceRemoval(ctx, q, job.JobID); removalErr == nil {
+		applyServiceRemoval(&job, removal)
+	} else if !errors.Is(removalErr, sql.ErrNoRows) {
+		return Job{}, removalErr
+	}
 	return job, nil
 }
 
@@ -1803,9 +1855,9 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	var capabilitiesJSON []byte
 	var heartbeatNS int64
 	var intentUpdatedNS sql.NullInt64
-	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, os, architecture, agent_version, capabilities_json, state, max_oneshot_slots, max_service_slots,
+	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, root_instance_id, os, architecture, agent_version, capabilities_json, state, max_oneshot_slots, max_service_slots,
 	authority_generation, claims_enabled, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns
-	FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.OS, &node.Architecture,
+	FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.RootInstanceID, &node.OS, &node.Architecture,
 		&node.AgentVersion, &capabilitiesJSON, &node.State, &node.MaxOneshotSlots, &node.MaxServiceSlots,
 		&node.AuthorityGeneration, &node.ClaimsEnabled, &node.IntentRevision, &node.IntentReason, &intentUpdatedNS,
 		&node.IntentActor, &heartbeatNS)

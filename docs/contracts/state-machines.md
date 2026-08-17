@@ -39,10 +39,18 @@ resumable.
 | `stopping` | Stop intent is durable and termination of the live attempt is in progress. | `stopped`, `failed` |
 | `stopped` | Desired stopped and no live attempt remains. | `queued` through explicit operator start or restart only |
 | `failed` | Desired running is unsatisfiable, or quiescence cannot be confirmed. Latched. | `queued` through explicit operator restart only |
+| `removal_pending` | Desired removed is irreversible; attempt/start authority is revoked and cleanup is still awaiting bound-agent attestation. | `agent_cleaned`, `forgotten_cleanup_unverified` |
+| `agent_cleaned` | The current authenticated boot attested that deletion already completed. | `removed_verified`, `forgotten_cleanup_unverified` |
+| `removed_verified` | Remaining attempt/service rows were deleted and the verified tombstone was committed. Terminal. | none |
+| `forgotten_cleanup_unverified` | The operator waived proof. The deletion directive remains until a returning node cleans it, and the tombstone warning is permanent. Terminal operator outcome. | none |
 
 Legal desired/observed pairings are: desired `running` with `queued`,
 `claimed`, `running`, or `failed`; and desired `stopped` with `stopping`,
-`stopped`, or `failed`. `restart-pending` is never persisted. It is computed
+`stopped`, or `failed`. Desired `removed` is projected from the durable
+`service_removals` row with `removal_pending`, `agent_cleaned`,
+`removed_verified`, or `forgotten_cleanup_unverified`; the narrower
+`service_jobs.desired_state` column remains the pre-removal running/stopped
+state until final deletion. `restart-pending` is never persisted. It is computed
 when a service is `queued`, desired `running`, and its `next_restart_at` is in
 the future.
 

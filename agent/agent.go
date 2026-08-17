@@ -150,6 +150,9 @@ func New(config Config) (*Agent, error) {
 		AgentVersion:  config.Version,
 		Capabilities:  cloneCapabilities(config.Capabilities),
 	}
+	if managedResource != nil {
+		registration.RootInstanceID = managedResource.rootInstanceID()
+	}
 	heartbeatInterval := durationOrDefault(config.HeartbeatInterval, DefaultHeartbeatInterval)
 	claimInterval := durationOrDefault(config.ClaimInterval, DefaultClaimInterval)
 	logBatchSize := intOrDefault(config.LogBatchSize, DefaultLogBatchSize)

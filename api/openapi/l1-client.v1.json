@@ -118,6 +118,63 @@
         }
       }
     },
+    "/v1/jobs/{job_id}/remove": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "removeService",
+        "summary": "Irreversibly request service removal",
+        "description": "Idempotent and asynchronous in every service state. The controller transaction revokes execution authority and scrubs SensitiveEnv plus controller logs before returning. A never-bound service finalizes immediately because no managed resource could exist.",
+        "responses": {
+          "202": {
+            "description": "Removal is pending agent attestation, or is already terminal.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}/forget": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "forceForgetService",
+        "summary": "Waive service cleanup verification",
+        "description": "Permanently records forgotten_cleanup_unverified without cancelling the standing deletion directive and without invoking local deletion.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["force"],
+                "properties": { "force": { "const": true } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Cleanup proof waived; the unverified outcome is permanent.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/nodes": {
       "get": {
         "operationId": "listNodes",

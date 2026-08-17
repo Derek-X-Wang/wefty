@@ -124,6 +124,14 @@ func (c *Client) Complete(ctx context.Context, jobID, attemptID string, request 
 	return job, err
 }
 
+// AcknowledgeRemoval attests that local deletion has already completed. The
+// control plane never asks this client to inspect or delete a filesystem path.
+func (c *Client) AcknowledgeRemoval(ctx context.Context, jobID string, request l1.RemovalAcknowledgementRequest) (l1.Job, error) {
+	var job l1.Job
+	err := c.post(ctx, "/v1/agent/jobs/"+url.PathEscape(jobID)+"/removal-acknowledgement", request, &job)
+	return job, err
+}
+
 func attemptPath(jobID, attemptID string) string {
 	return "/v1/agent/jobs/" + url.PathEscape(jobID) + "/attempts/" + url.PathEscape(attemptID)
 }

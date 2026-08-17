@@ -50,6 +50,12 @@ claiming while a non-terminal attempt from another boot session remains. Lease
 expiry makes the old attempt terminal and clears that embargo without waiting
 for node death.
 
+Registration also reports the current managed-root instance ID. It is a
+self-reported fact about local agent state, like OS or agent version, and is
+stored only so a removal directive can name the root instance it was issued
+against. It never participates in tags, capacity, claim eligibility, or
+execution authority.
+
 The successful claim returns the write authority and both lease projections:
 
 - `attempt_id`: globally unique, immutable execution identity.
@@ -111,6 +117,18 @@ order is:
 4. match the current boot session and authority generation;
 5. verify lease against the control-plane clock;
 6. apply the idempotent mutation.
+
+Service removal uses deliberately longer-lived authority. The controller
+transaction revokes the current attempt and increments its fence, then creates
+one `service_removals` row keyed by job with a removal generation, opaque
+cleanup fence, bound stable node, and managed-root instance ID. This cleanup
+fence has no lease expiry: a later boot session under the same authenticated
+Fabric identity may resume the directive, while a replaced boot session may
+not acknowledge it. Acknowledgement is deletion attestation, never filesystem
+inspection by L1, and is accepted only after node, current boot session,
+generation, cleanup fence, root instance, idempotency key, and body hash match
+inside one transaction. Finalization then deletes attempt and service rows and
+commits the tombstone in a separate crash-recoverable transaction.
 
 `PUT .../attempts/{attempt_id}/publication` carries an absolute `ready` boolean.
 L1 derives the immutable Fabric-namespace port from the stored service

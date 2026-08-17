@@ -264,10 +264,14 @@ const (
 // configuration. Capabilities describes executable support and must not carry
 // max_oneshot_slots or max_service_slots.
 type NodeRegistration struct {
-	NodeID        string          `json:"node_id"`
-	BootSessionID string          `json:"boot_session_id"`
-	OS            string          `json:"os"`
-	Architecture  string          `json:"architecture"`
-	AgentVersion  string          `json:"agent_version"`
-	Capabilities  map[string]bool `json:"capabilities,omitempty"`
+	NodeID        string `json:"node_id"`
+	BootSessionID string `json:"boot_session_id"`
+	// RootInstanceID identifies the agent-owned managed resource root for this
+	// stable node. It is a self-reported local-state fact, not scheduling or
+	// execution authority.
+	RootInstanceID string          `json:"root_instance_id,omitempty"`
+	OS             string          `json:"os"`
+	Architecture   string          `json:"architecture"`
+	AgentVersion   string          `json:"agent_version"`
+	Capabilities   map[string]bool `json:"capabilities,omitempty"`
 }

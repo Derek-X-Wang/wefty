@@ -172,6 +172,8 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/jobs", s.createJob)
 	client.HandleFunc("GET /v1/jobs/{job_id}", s.getJob)
 	client.HandleFunc("GET /v1/jobs/{job_id}/logs", s.getJobLogs)
+	client.HandleFunc("POST /v1/jobs/{job_id}/remove", s.removeService)
+	client.HandleFunc("POST /v1/jobs/{job_id}/forget", s.forceForgetService)
 	client.HandleFunc("POST /v1/jobs/{job_id}/prompt", s.notImplemented)
 	client.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.notImplemented)
 	client.HandleFunc("GET /v1/nodes", s.listNodes)
@@ -187,6 +189,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("PUT /v1/agent/jobs/{job_id}/attempts/{attempt_id}/publication", s.setAttemptPublication)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/logs", s.appendLogs)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete", s.completeAttempt)
+	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/removal-acknowledgement", s.acknowledgeServiceRemoval)
 
 	root := http.NewServeMux()
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
@@ -307,6 +310,33 @@ func (s *Server) getJobLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) removeService(w http.ResponseWriter, r *http.Request) {
+	job, err := s.store.RemoveService(r.Context(), r.PathValue("job_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, redactJob(job))
+}
+
+func (s *Server) forceForgetService(w http.ResponseWriter, r *http.Request) {
+	var request ForceForgetRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	if !request.Force {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "forget requires force=true"))
+		return
+	}
+	job, err := s.store.ForceForgetService(r.Context(), r.PathValue("job_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, redactJob(job))
 }
 
 func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
@@ -447,6 +477,29 @@ func (s *Server) completeAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, redactJob(job))
+}
+
+func (s *Server) acknowledgeServiceRemoval(w http.ResponseWriter, r *http.Request) {
+	var request RemovalAcknowledgementRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	identity := identityFromRequest(r)
+	acknowledged, err := s.store.AcknowledgeServiceRemoval(r.Context(), identity.NodeID, r.PathValue("job_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	finalized, changed, err := s.store.FinalizeServiceRemoval(r.Context(), r.PathValue("job_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if changed || finalized.JobID != "" {
+		acknowledged = finalized
+	}
+	writeJSON(w, http.StatusOK, redactJob(acknowledged))
 }
 
 func redactJob(job Job) Job {

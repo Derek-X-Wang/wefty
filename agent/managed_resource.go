@@ -9,5 +9,6 @@ type managedResourceAttempt struct {
 // process-mode implementation uses a managed directory tree; a future OCI
 // implementation may instead prepare a container and its volumes.
 type managedResourceManager interface {
+	rootInstanceID() string
 	prepareAttempt(jobID, attemptID string) (managedResourceAttempt, func(), error)
 }
