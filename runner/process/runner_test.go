@@ -402,28 +402,29 @@ func TestTerminateAndWaitSurfacesStalledProcessWait(t *testing.T) {
 
 func assertTerminateAndWaitSurfacesStalledProcessWait(t *testing.T) {
 	t.Helper()
+	// The grace period is domain timing and stays on the injected clock. The
+	// reap bound is NOT: it bounds an OS-level wait, so it runs on real time
+	// and is configured short here rather than advanced by the test.
 	clock := newFakeClock(time.Unix(4_000, 0))
 	runner := New(Config{
-		Clock: clock, TerminationGraceTime: 2 * time.Second, ProcessReapTimeout: 3 * time.Second,
+		Clock: clock, TerminationGraceTime: 2 * time.Second, ProcessReapTimeout: 100 * time.Millisecond,
 	})
 	wait := make(chan waitResult)
 	done := make(chan waitResult, 1)
 	go func() { done <- runner.terminateAndWait(1<<30, wait) }()
 	clock.WaitForTimerCount(t, 1)
-	clock.Advance(2 * time.Second)
-	clock.WaitForTimerCount(t, 2)
 	select {
 	case outcome := <-done:
-		t.Fatalf("terminateAndWait returned before reap bound: %#v", outcome)
-	default:
+		t.Fatalf("terminateAndWait returned before the grace period elapsed: %#v", outcome)
+	case <-time.After(200 * time.Millisecond):
 	}
-	clock.Advance(3 * time.Second)
+	clock.Advance(2 * time.Second)
 	select {
 	case outcome := <-done:
 		if !errors.Is(outcome.err, ErrProcessReapTimeout) || outcome.state != nil {
 			t.Fatalf("terminateAndWait outcome = %#v, want explicit reap timeout", outcome)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("terminateAndWait silently stalled past reap bound")
 	}
 }

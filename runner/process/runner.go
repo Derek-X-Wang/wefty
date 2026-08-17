@@ -297,12 +297,17 @@ func (runner *Runner) terminateAndWait(processGroupID int, wait <-chan waitResul
 			if completed != nil {
 				return *completed
 			}
-			reapTimer := runner.clock.NewTimer(runner.processReapTimeout)
-			defer stopTimer(reapTimer)
+			// Deliberately a REAL timer, not the injected clock. This bounds
+			// an OS-level reap, not domain timing: the injected clock only
+			// advances when a test tells it to, so bounding this wait with it
+			// makes the bound unreachable exactly when the process is slow to
+			// be reaped — which is the only case it exists for.
+			reapTimer := time.NewTimer(runner.processReapTimeout)
+			defer reapTimer.Stop()
 			select {
 			case outcome := <-wait:
 				return outcome
-			case <-reapTimer.C():
+			case <-reapTimer.C:
 				return waitResult{err: ErrProcessReapTimeout}
 			}
 		}
