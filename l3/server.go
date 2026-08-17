@@ -20,6 +20,7 @@ import (
 type ServerConfig struct {
 	CallerPrincipalTag string
 	Reconciler         *Reconciler
+	Jobs               JobClient
 	Logs               JobLogClient
 }
 
@@ -28,6 +29,7 @@ type Server struct {
 	store              *Store
 	callerPrincipalTag string
 	reconciler         *Reconciler
+	jobs               JobClient
 	logs               JobLogClient
 	handler            http.Handler
 }
@@ -43,7 +45,11 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	if tag == "" {
 		tag = DefaultCallerPrincipalTag
 	}
-	server := &Server{fabric: f, store: store, callerPrincipalTag: tag, reconciler: config.Reconciler, logs: config.Logs}
+	jobs := config.Jobs
+	if jobs == nil && config.Reconciler != nil {
+		jobs = config.Reconciler.jobs
+	}
+	server := &Server{fabric: f, store: store, callerPrincipalTag: tag, reconciler: config.Reconciler, jobs: jobs, logs: config.Logs}
 	server.handler = server.routes()
 	return server, nil
 }
@@ -88,6 +94,7 @@ func (s *Server) routes() http.Handler {
 	runs := http.NewServeMux()
 	runs.HandleFunc("POST /v1/runs", s.createRun)
 	runs.HandleFunc("GET /v1/runs/{run_id}", s.getRun)
+	runs.HandleFunc("GET /v1/runs/{run_id}/execution", s.getRunExecution)
 	runs.HandleFunc("GET /v1/runs/{run_id}/lineage", s.getRunLineage)
 	runs.HandleFunc("GET /v1/runs/{run_id}/logs", s.getRunLogs)
 	runs.HandleFunc("POST /v1/runs/{run_id}/envelopes", s.appendEnvelope)
@@ -104,6 +111,40 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/runs/", s.authenticateFabric(s.authorize(runs)))
 	root.Handle("/v1/workflows/", s.authenticateFabric(s.authorize(s.requireCaller(workflows))))
 	return root
+}
+
+func (s *Server) getRunExecution(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("run_id")
+	if scope, ok := runTokenFromRequest(r); ok {
+		allowed, err := s.store.CanReadRun(r.Context(), scope.RunID, runID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if !allowed {
+			writeError(w, protocolError(contract.ErrorForbidden, "run token cannot read an ancestor or sibling run"))
+			return
+		}
+	}
+	projection, err := s.store.GetRunExecution(r.Context(), runID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if projection.L1JobID != "" {
+		if s.jobs == nil {
+			writeError(w, internalError(errors.New("L1 job client is not configured"), "inspect run execution"))
+			return
+		}
+		job, err := s.jobs.GetJob(r.Context(), projection.L1JobID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		job.Spec.Execution.SensitiveEnv = nil
+		projection.Job = &job
+	}
+	writeJSON(w, http.StatusOK, projection)
 }
 
 func (s *Server) authenticateFabric(next http.Handler) http.Handler {
@@ -481,7 +522,8 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func writeError(w http.ResponseWriter, err error) {
-	code, retryable := errorDetails(err)
+	apiError := apiErrorFrom(err)
+	code := apiError.Code
 	status := http.StatusConflict
 	switch code {
 	case contract.ErrorInvalidRequest:
@@ -497,9 +539,9 @@ func writeError(w http.ResponseWriter, err error) {
 	case contract.ErrorInternal:
 		status = http.StatusInternalServerError
 	}
-	message := err.Error()
 	if code == contract.ErrorInternal {
-		message = "internal server error"
+		apiError.Message = "internal server error"
+		apiError.Details = nil
 	}
-	writeJSON(w, status, contract.ErrorResponse{Error: contract.APIError{Code: code, Message: message, Retryable: retryable}})
+	writeJSON(w, status, contract.ErrorResponse{Error: apiError})
 }

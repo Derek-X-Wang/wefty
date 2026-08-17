@@ -115,7 +115,8 @@ func (c *L1Client) do(ctx context.Context, method, path string, body any, target
 	}
 	return &Error{
 		Code: responseError.Error.Code, Message: responseError.Error.Message,
-		Retryable: responseError.Error.Retryable,
+		Retryable: responseError.Error.Retryable, Details: responseError.Error.Details,
+		RequestID: responseError.Error.RequestID,
 	}
 }
 

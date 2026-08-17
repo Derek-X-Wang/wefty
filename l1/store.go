@@ -407,6 +407,49 @@ func (s *Store) GetJob(ctx context.Context, jobID string) (Job, error) {
 	return job, nil
 }
 
+// ListJobAttempts returns the retained execution summaries in chronological
+// order. Service retention may prune old empty summaries; a one-shot keeps its
+// sole attempt. Authority-bearing columns never cross this operator boundary.
+func (s *Store) ListJobAttempts(ctx context.Context, jobID string) ([]Attempt, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT attempt_id, node_id, state, lease_expires_ns,
+		result_json, late_result_json, created_ns, updated_ns
+		FROM attempts WHERE job_id=? ORDER BY created_ns, attempt_id`, jobID)
+	if err != nil {
+		return nil, internalError(err, "list job attempts")
+	}
+	defer rows.Close()
+	attempts := []Attempt{}
+	for rows.Next() {
+		var attempt Attempt
+		var resultJSON, lateResultJSON []byte
+		var leaseExpiresNS, createdNS, updatedNS int64
+		if err := rows.Scan(&attempt.AttemptID, &attempt.NodeID, &attempt.State, &leaseExpiresNS,
+			&resultJSON, &lateResultJSON, &createdNS, &updatedNS); err != nil {
+			return nil, internalError(err, "scan job attempt")
+		}
+		attempt.LeaseExpiresAt = time.Unix(0, leaseExpiresNS).UTC()
+		attempt.CreatedAt = time.Unix(0, createdNS).UTC()
+		attempt.UpdatedAt = time.Unix(0, updatedNS).UTC()
+		if len(resultJSON) > 0 {
+			attempt.Result = &ProcessResult{}
+			if err := json.Unmarshal(resultJSON, attempt.Result); err != nil {
+				return nil, internalError(err, "decode job attempt result")
+			}
+		}
+		if len(lateResultJSON) > 0 {
+			attempt.LateResult = &LateResultEvidence{}
+			if err := json.Unmarshal(lateResultJSON, attempt.LateResult); err != nil {
+				return nil, internalError(err, "decode job attempt late result")
+			}
+		}
+		attempts = append(attempts, attempt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate job attempts")
+	}
+	return attempts, nil
+}
+
 // ListNodes returns the operator-visible fleet in stable node ID order.
 func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 	rows, err := s.db.QueryContext(ctx, "SELECT node_id FROM nodes ORDER BY node_id")

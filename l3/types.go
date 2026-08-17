@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/l1"
 )
 
 const (
@@ -86,6 +87,17 @@ type RunAccepted struct {
 	RunID     string `json:"run_id"`
 	StatusURL string `json:"status_url"`
 	LogsURL   string `json:"logs_url"`
+}
+
+// RunExecution is the run-keyed diagnostic projection across the asynchronous
+// L3 dispatch and L1 execution seam. Job is the redacted L1 projection and is
+// absent until dispatch succeeds.
+type RunExecution struct {
+	RunID            string             `json:"run_id"`
+	L1JobID          string             `json:"l1_job_id,omitempty"`
+	DispatchAttempts int                `json:"dispatch_attempts"`
+	DispatchError    *contract.APIError `json:"dispatch_error,omitempty"`
+	Job              *l1.Job            `json:"job,omitempty"`
 }
 
 // TriggerProvenance is the immutable ledger row explaining why a run exists.

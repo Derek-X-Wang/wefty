@@ -129,15 +129,20 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 		t.Fatalf("submitted logs stdout/stderr = %q/%q", logsOut.String(), logsErr.String())
 	}
 	var inspectOut bytes.Buffer
-	if err := execute(ctx, clients, true, []string{"inspect", submitted.RunID}, &inspectOut, &commandErr); err != nil {
+	if err := execute(ctx, clients, true, []string{"inspect", submitted.RunID, "--execution"}, &inspectOut, &commandErr); err != nil {
 		t.Fatalf("inspect submitted run: %v", err)
 	}
 	var inspection runInspection
 	if err := json.Unmarshal(inspectOut.Bytes(), &inspection); err != nil {
 		t.Fatal(err)
 	}
-	if inspection.Run.RunID != submitted.RunID || inspection.Run.Status != contract.RunSucceeded || len(inspection.Runs) != 1 {
+	if inspection.Run.RunID != submitted.RunID || inspection.Run.L1JobID == "" || inspection.Run.Status != contract.RunSucceeded || len(inspection.Runs) != 1 {
 		t.Fatalf("run inspection = %#v", inspection)
+	}
+	if inspection.Execution == nil || inspection.Execution.L1JobID != inspection.Run.L1JobID || inspection.Execution.Job == nil ||
+		inspection.Execution.Job.JobID != inspection.Run.L1JobID || len(inspection.Execution.Job.Attempts) != 1 ||
+		inspection.Execution.Job.Spec.Execution.SensitiveEnv != nil {
+		t.Fatalf("execution inspection = %#v", inspection.Execution)
 	}
 
 	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nprintf 'changed-on-disk\\n'\n"), 0o700); err != nil {

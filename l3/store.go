@@ -795,7 +795,7 @@ func normalizeTags(tags []string) ([]string, error) {
 // script and trigger rows.
 func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, error) {
 	var record contract.RunRecord
-	var parent, nodeID, sourceRun, workflowRef sql.NullString
+	var parent, l1JobID, nodeID, sourceRun, workflowRef sql.NullString
 	var paramsJSON, tagsJSON []byte
 	var limitsJSON []byte
 	var content []byte
@@ -803,13 +803,13 @@ func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, e
 	var createdNS, updatedNS int64
 	var startedNS, finishedNS sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `
-SELECT r.run_id, r.parent_run_id, r.node_id, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
+SELECT r.run_id, r.parent_run_id, r.l1_job_id, r.node_id, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
        r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
        s.content, s.sha256, w.workflow_ref, t.actor, t.source, t.source_run_id
 FROM runs r JOIN run_scripts s ON s.run_id=r.run_id
 LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
-WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &nodeID, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
+WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
 		&createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &workflowRef, &actor, &source, &sourceRun)
 	if errors.Is(err, sql.ErrNoRows) {
 		return contract.RunRecord{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
@@ -819,6 +819,7 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &nodeID, &record.Dispatch
 	}
 	record.SchemaVersion = contract.SchemaVersionV1
 	record.ParentRunID = parent.String
+	record.L1JobID = l1JobID.String
 	record.NodeID = nodeID.String
 	record.Params = append(json.RawMessage(nil), paramsJSON...)
 	if err := json.Unmarshal(tagsJSON, &record.Tags); err != nil {
@@ -858,6 +859,31 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &nodeID, &record.Dispatch
 		return contract.RunRecord{}, err
 	}
 	return record, nil
+}
+
+// GetRunExecution returns the durable L3 half of the run-keyed execution
+// projection. The server resolves L1JobID through the L1 client when present.
+func (s *Store) GetRunExecution(ctx context.Context, runID string) (RunExecution, error) {
+	var projection RunExecution
+	var l1JobID sql.NullString
+	var dispatchErrorJSON []byte
+	err := s.db.QueryRowContext(ctx, `SELECT r.run_id, r.l1_job_id, o.attempt_count, o.last_error
+		FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).
+		Scan(&projection.RunID, &l1JobID, &projection.DispatchAttempts, &dispatchErrorJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RunExecution{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
+	}
+	if err != nil {
+		return RunExecution{}, internalError(err, "read run execution")
+	}
+	projection.L1JobID = l1JobID.String
+	if len(dispatchErrorJSON) > 0 {
+		projection.DispatchError = &contract.APIError{}
+		if err := json.Unmarshal(dispatchErrorJSON, projection.DispatchError); err != nil {
+			return RunExecution{}, internalError(err, "decode dispatch error")
+		}
+	}
+	return projection, nil
 }
 
 func (s *Store) runJobID(ctx context.Context, runID string) (string, bool, error) {
@@ -1335,7 +1361,11 @@ func (s *Store) beginDispatch(ctx context.Context, runID string) error {
 }
 
 func (s *Store) recordDispatchError(ctx context.Context, runID string, dispatchErr error) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=? AND dispatched_ns IS NULL`, dispatchErr.Error(), runID)
+	payload, err := json.Marshal(apiErrorFrom(dispatchErr))
+	if err != nil {
+		return internalError(err, "encode dispatch error")
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID)
 	if err != nil {
 		return internalError(err, "record dispatch error")
 	}
@@ -1349,7 +1379,11 @@ func (s *Store) failDispatch(ctx context.Context, runID string, dispatchErr erro
 		return internalError(err, "begin permanent dispatch failure")
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=?, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, dispatchErr.Error(), runID); err != nil {
+	payload, err := json.Marshal(apiErrorFrom(dispatchErr))
+	if err != nil {
+		return internalError(err, "encode permanent dispatch error")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=?, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID); err != nil {
 		return internalError(err, "record permanent dispatch error")
 	}
 	if err := failRunTx(ctx, tx, runID, now, s.tokenGrace); err != nil {

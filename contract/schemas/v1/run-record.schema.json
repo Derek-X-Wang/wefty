@@ -18,6 +18,7 @@
   "properties": {
     "schema_version": { "const": 1 },
     "run_id": { "$ref": "#/$defs/id" },
+    "l1_job_id": { "$ref": "#/$defs/id" },
     "node_id": { "$ref": "#/$defs/id" },
     "parent_run_id": { "$ref": "#/$defs/id" },
     "dispatch_key": { "$ref": "#/$defs/id" },

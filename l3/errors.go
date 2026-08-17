@@ -13,6 +13,8 @@ type Error struct {
 	Code      contract.ErrorCode
 	Message   string
 	Retryable bool
+	Details   map[string]any
+	RequestID string
 	Cause     error
 }
 
@@ -39,4 +41,15 @@ func errorDetails(err error) (contract.ErrorCode, bool) {
 		return protocolErr.Code, protocolErr.Retryable
 	}
 	return contract.ErrorInternal, false
+}
+
+func apiErrorFrom(err error) contract.APIError {
+	var protocolErr *Error
+	if errors.As(err, &protocolErr) {
+		return contract.APIError{
+			Code: protocolErr.Code, Message: protocolErr.Error(), Retryable: protocolErr.Retryable,
+			Details: protocolErr.Details, RequestID: protocolErr.RequestID,
+		}
+	}
+	return contract.APIError{Code: contract.ErrorInternal, Message: err.Error(), Retryable: true}
 }

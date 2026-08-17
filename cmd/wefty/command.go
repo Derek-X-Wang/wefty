@@ -43,20 +43,30 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 }
 
 type runInspection struct {
-	Run     contract.RunRecord   `json:"run"`
-	Lineage l3.RunLineage        `json:"lineage"`
-	Runs    []contract.RunRecord `json:"runs"`
+	Run       contract.RunRecord   `json:"run"`
+	Lineage   l3.RunLineage        `json:"lineage"`
+	Runs      []contract.RunRecord `json:"runs"`
+	Execution *l3.RunExecution     `json:"execution,omitempty"`
 }
 
 func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
-	if len(args) != 1 {
-		return usageError("usage: wefty inspect RUN_ID")
+	args = moveFirstPositionalToEnd(args)
+	flags := flag.NewFlagSet("inspect", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	var includeExecution bool
+	flags.BoolVar(&includeExecution, "execution", false, "include L1 execution diagnostics")
+	if err := flags.Parse(args); err != nil {
+		return err
 	}
-	root, err := clients.getRun(ctx, args[0])
+	if flags.NArg() != 1 {
+		return usageError("usage: wefty inspect RUN_ID [--execution]")
+	}
+	runID := flags.Arg(0)
+	root, err := clients.getRun(ctx, runID)
 	if err != nil {
 		return err
 	}
-	lineage, err := clients.getRunLineage(ctx, args[0])
+	lineage, err := clients.getRunLineage(ctx, runID)
 	if err != nil {
 		return err
 	}
@@ -67,6 +77,13 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 			return fmt.Errorf("read descendant %s: %w", descendant.RunID, err)
 		}
 		inspection.Runs = append(inspection.Runs, record)
+	}
+	if includeExecution {
+		execution, err := clients.getRunExecution(ctx, runID)
+		if err != nil {
+			return err
+		}
+		inspection.Execution = &execution
 	}
 	if jsonOutput {
 		return writeJSON(stdout, inspection)

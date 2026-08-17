@@ -232,6 +232,29 @@
         }
       }
     },
+    "/v1/runs/{run_id}/execution": {
+      "parameters": [
+        { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "get": {
+        "operationId": "getRunExecution",
+        "summary": "Inspect L1 execution through its owning run",
+        "description": "Projects durable L3 dispatch attempts and structured error together with the redacted L1 job and retained attempt evidence. The surface remains run-keyed and exposes no generic job namespace.",
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
+        "responses": {
+          "200": {
+            "description": "Cross-layer execution diagnostics.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/RunExecution" } }
+            }
+          },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/runs/{run_id}/rerun": {
       "parameters": [
         { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } },
@@ -451,6 +474,18 @@
           "run_id": { "type": "string" },
           "status_url": { "type": "string", "format": "uri" },
           "logs_url": { "type": "string", "format": "uri" }
+        }
+      },
+      "RunExecution": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "dispatch_attempts"],
+        "properties": {
+          "run_id": { "type": "string" },
+          "l1_job_id": { "type": "string" },
+          "dispatch_attempts": { "type": "integer", "minimum": 0 },
+          "dispatch_error": { "$ref": "./common.v1.json#/components/schemas/Error" },
+          "job": { "$ref": "./common.v1.json#/components/schemas/Job" }
         }
       },
       "EnvelopeWrite": {

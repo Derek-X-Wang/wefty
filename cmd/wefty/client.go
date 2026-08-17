@@ -28,6 +28,16 @@ type apiClient struct {
 	client *http.Client
 }
 
+type apiResponseError struct {
+	Service    string
+	StatusCode int
+	APIError   contract.APIError
+}
+
+func (e *apiResponseError) Error() string {
+	return formatAPIError(&e.APIError)
+}
+
 func newAPIClients(participant fabric.Fabric, l1Address, l3Address string) (*apiClients, error) {
 	if participant == nil {
 		return nil, fmt.Errorf("wefty: fabric is required")
@@ -106,6 +116,13 @@ func (c *apiClients) getRun(ctx context.Context, runID string) (contract.RunReco
 	return run, err
 }
 
+func (c *apiClients) getRunExecution(ctx context.Context, runID string) (l3.RunExecution, error) {
+	var execution l3.RunExecution
+	path := "/v1/runs/" + url.PathEscape(runID) + "/execution"
+	err := c.l3.do(ctx, http.MethodGet, path, nil, nil, &execution, http.StatusOK)
+	return execution, err
+}
+
 func (c *apiClients) getRunLineage(ctx context.Context, runID string) (l3.RunLineage, error) {
 	var lineage l3.RunLineage
 	path := "/v1/runs/" + url.PathEscape(runID) + "/lineage"
@@ -165,7 +182,7 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, heade
 	}
 	var responseError contract.ErrorResponse
 	if err := json.Unmarshal(responseBody, &responseError); err == nil && responseError.Error.Code != "" {
-		return fmt.Errorf("%s: %s", responseError.Error.Code, responseError.Error.Message)
+		return &apiResponseError{Service: c.name, StatusCode: response.StatusCode, APIError: responseError.Error}
 	}
 	return fmt.Errorf("%s returned HTTP %d", c.name, response.StatusCode)
 }
