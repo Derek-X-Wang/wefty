@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,7 +14,8 @@ import (
 const initialServiceRemovalGeneration uint64 = 1
 
 type processManagedResource struct {
-	root *managedroot.Manager
+	root          *managedroot.Manager
+	bootSessionID string
 }
 
 func (resource *processManagedResource) rootInstanceID() string {
@@ -30,7 +32,31 @@ func initializeManagedResource(rootDirectory, nodeID, bootSessionID string) (man
 	if err != nil {
 		return nil, fmt.Errorf("agent: initialize managed service root: %w", err)
 	}
-	return &processManagedResource{root: root}, nil
+	return &processManagedResource{root: root, bootSessionID: bootSessionID}, nil
+}
+
+func (resource *processManagedResource) remove(ctx context.Context, removal localRemoval) error {
+	return resource.root.Remove(ctx, managedroot.Removal{
+		JobID: removal.jobID, Generation: removal.generation,
+		RootInstanceID: removal.rootInstanceID, CleanupFence: removal.cleanupFence,
+		BootSessionID: resource.bootSessionID, ProcessTreeReaped: removal.processTreeReaped,
+	})
+}
+
+func (resource *processManagedResource) resumeRemovals(ctx context.Context) ([]localRemoval, error) {
+	resumed, err := resource.root.Resume(ctx)
+	if err != nil {
+		return nil, err
+	}
+	completed := make([]localRemoval, 0, len(resumed))
+	for _, removal := range resumed {
+		completed = append(completed, localRemoval{
+			jobID: removal.JobID, generation: removal.Generation,
+			rootInstanceID: removal.RootInstanceID, cleanupFence: removal.CleanupFence,
+			processTreeReaped: removal.ProcessTreeReaped,
+		})
+	}
+	return completed, nil
 }
 
 func (resource *processManagedResource) prepareAttempt(jobID, attemptID string) (managedResourceAttempt, func(), error) {

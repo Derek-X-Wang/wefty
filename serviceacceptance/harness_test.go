@@ -27,6 +27,7 @@ import (
 )
 
 var (
+	weftyBinaryPath       string
 	agentBinaryPath       string
 	controlPlanePath      string
 	echoServiceBinaryPath string
@@ -38,12 +39,14 @@ func TestMain(main *testing.M) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	weftyBinaryPath = filepath.Join(directory, "wefty")
 	agentBinaryPath = filepath.Join(directory, "wefty-agent")
 	controlPlanePath = filepath.Join(directory, "wefty-l1")
 	echoServiceBinaryPath = filepath.Join(directory, "wefty-echo-service")
 	for _, build := range []struct {
 		name, output, pkg string
 	}{
+		{name: "CLI", output: weftyBinaryPath, pkg: "./cmd/wefty"},
 		{name: "agent", output: agentBinaryPath, pkg: "./cmd/wefty-agent"},
 		{name: "control plane", output: controlPlanePath, pkg: "./cmd/wefty-l1"},
 		{name: "echo service", output: echoServiceBinaryPath, pkg: "./cmd/wefty-echo-service"},
@@ -65,12 +68,16 @@ func TestMain(main *testing.M) {
 }
 
 type acceptanceHarness struct {
-	client             *http.Client
-	publishedFabric    fabric.Fabric
-	agent              *managedProcess
-	managedRoot        string
-	handoffRoot        string
-	workingDirectories map[string]string
+	client              *http.Client
+	publishedFabric     fabric.Fabric
+	agent               *managedProcess
+	managedRoot         string
+	handoffRoot         string
+	l1Database          string
+	spoolDirectory      string
+	controlPlaneAddress string
+	workingDirectories  map[string]string
+	specs               map[string]contract.JobSpec
 }
 
 func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
@@ -82,11 +89,13 @@ func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 	}
 	managedRoot := filepath.Join(resolvedDirectory, "managed-state")
 	handoffRoot := filepath.Join(directory, "handoffs")
+	l1Database := filepath.Join(directory, "l1.sqlite")
+	spoolDirectory := filepath.Join(directory, "agent-spool")
 	readyFile := filepath.Join(directory, "l1-ready.json")
 	controlPlane := newManagedProcess(t, controlPlanePath,
 		"--fabric=plain",
 		"--listen=127.0.0.1:0",
-		"--db="+filepath.Join(directory, "l1.sqlite"),
+		"--db="+l1Database,
 		"--lease-duration=1s",
 		"--node-tags=acceptance-node=service-acceptance",
 		"--ready-file="+readyFile,
@@ -94,18 +103,7 @@ func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 	controlPlane.start(t)
 	address := waitForReadyAddress(t, readyFile, controlPlane, 10*time.Second)
 
-	agentProcess := newManagedProcess(t, agentBinaryPath,
-		"--fabric=plain",
-		"--control-plane="+address,
-		"--node-id=acceptance-node",
-		"--plain-identity=acceptance-agent",
-		"--log-spool-dir="+filepath.Join(directory, "agent-spool"),
-		"--managed-root="+managedRoot,
-		"--handoff-root="+handoffRoot,
-		"--heartbeat-interval=250ms",
-		"--claim-interval=10ms",
-		"--renewal-interval=100ms",
-	)
+	agentProcess := newAcceptanceAgentProcess(t, address, spoolDirectory, managedRoot, handoffRoot)
 	agentProcess.start(t)
 
 	clientFabric := plain.NewNetwork().NewFabric(fabric.Identity{
@@ -121,8 +119,32 @@ func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 	return &acceptanceHarness{
 		client: client, publishedFabric: plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "service-client"}), agent: agentProcess,
 		managedRoot: managedRoot, handoffRoot: handoffRoot,
+		l1Database: l1Database, spoolDirectory: spoolDirectory, controlPlaneAddress: address,
 		workingDirectories: make(map[string]string),
+		specs:              make(map[string]contract.JobSpec),
 	}
+}
+
+func newAcceptanceAgentProcess(t *testing.T, address, spoolDirectory, managedRoot, handoffRoot string) *managedProcess {
+	t.Helper()
+	return newManagedProcess(t, agentBinaryPath,
+		"--fabric=plain",
+		"--control-plane="+address,
+		"--node-id=acceptance-node",
+		"--plain-identity=acceptance-agent",
+		"--log-spool-dir="+spoolDirectory,
+		"--managed-root="+managedRoot,
+		"--handoff-root="+handoffRoot,
+		"--heartbeat-interval=250ms",
+		"--claim-interval=10ms",
+		"--renewal-interval=100ms",
+	)
+}
+
+func (h *acceptanceHarness) restartAgent(t *testing.T) {
+	t.Helper()
+	h.agent = newAcceptanceAgentProcess(t, h.controlPlaneAddress, h.spoolDirectory, h.managedRoot, h.handoffRoot)
+	h.agent.start(t)
 }
 
 func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
@@ -146,6 +168,9 @@ func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
 			Executable:       contract.ExecutableSpec{Path: echoServiceBinaryPath},
 			Argv:             []string{echoServiceBinaryPath},
 			WorkingDirectory: workingDirectory,
+			SensitiveEnv: map[string]string{
+				"SERVICE_ACCEPTANCE_SECRET": "remove-me-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+			},
 		},
 		Limits: &contract.JobLimits{
 			MaxRuntimeSeconds:  30,
@@ -158,6 +183,36 @@ func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
 		t.Fatalf("submit echo service status = %d body=%s", status, body)
 	}
 	h.workingDirectories[job.JobID] = workingDirectory
+	h.specs[job.JobID] = spec
+	return job
+}
+
+func (h *acceptanceHarness) submitFailedService(t *testing.T) l1.Job {
+	t.Helper()
+	workingDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workingDirectory, "operator-owned"), []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec := contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1,
+		DispatchKey:   "failed-service-acceptance-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+		Kind:          "process",
+		Class:         contract.JobClassService,
+		Restart:       contract.RestartAlways,
+		RoutingTags:   []string{"service-acceptance"},
+		Execution: contract.ExecutionSpec{
+			Executable:       contract.ExecutableSpec{Path: filepath.Join(workingDirectory, "missing-executable")},
+			Argv:             []string{filepath.Join(workingDirectory, "missing-executable")},
+			WorkingDirectory: workingDirectory,
+		},
+	}
+	var job l1.Job
+	status, body := h.doJSON(t, http.MethodPost, "/v1/jobs", spec, &job)
+	if status != http.StatusCreated {
+		t.Fatalf("submit failing service status = %d body=%s", status, body)
+	}
+	h.workingDirectories[job.JobID] = workingDirectory
+	h.specs[job.JobID] = spec
 	return job
 }
 

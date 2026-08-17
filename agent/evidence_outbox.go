@@ -53,6 +53,18 @@ func (outbox *evidenceOutbox) completionDelivered(ctx context.Context, attemptID
 	return outbox.spool.completionDelivered(ctx, attemptID)
 }
 
+func (outbox *evidenceOutbox) beginRemoval(ctx context.Context, removal localRemoval) error {
+	return outbox.spool.beginRemoval(ctx, removal, outbox.clock.Now())
+}
+
+func (outbox *evidenceOutbox) purgeJob(ctx context.Context, jobID string) error {
+	return outbox.spool.purgeJob(ctx, jobID)
+}
+
+func (outbox *evidenceOutbox) completeRemoval(ctx context.Context, removal localRemoval) error {
+	return outbox.spool.completeRemoval(ctx, removal)
+}
+
 // startRecovery starts the durable replay scan before registration without
 // waiting for any network call. Pending evidence is never a startup gate.
 func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client, report func(error)) {

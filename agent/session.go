@@ -55,12 +55,21 @@ type agentSession struct {
 	capacityChanged chan struct{}
 	claimsEnabled   bool
 
-	claimMu       sync.Mutex
-	residentJobID map[string]struct{}
+	claimMu         sync.Mutex
+	residentJobID   map[string]struct{}
+	resident        map[string]*residentAttempt
+	residentChanged chan struct{}
+	removals        *removalController
 
 	drainOnce      sync.Once
 	drainRequested chan struct{}
 	attempts       sync.WaitGroup
+}
+
+type residentAttempt struct {
+	class  string
+	cancel context.CancelCauseFunc
+	done   chan struct{}
 }
 
 type destinationError struct {
@@ -110,6 +119,8 @@ func newAgentSession(
 		capacityChanged: make(chan struct{}, 1),
 		claimsEnabled:   true,
 		residentJobID:   make(map[string]struct{}),
+		resident:        make(map[string]*residentAttempt),
+		residentChanged: make(chan struct{}, 1),
 		drainRequested:  make(chan struct{}),
 	}
 }
@@ -142,6 +153,9 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 	defer func() {
 		stop()
 		session.attempts.Wait()
+		if session.removals != nil {
+			session.removals.wait()
+		}
 	}()
 
 	backoff := newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax)
@@ -180,6 +194,11 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 		}
 		backoff.reset()
 		session.markReady()
+		if session.removals != nil {
+			if err := session.removals.resume(runContext); err != nil && runContext.Err() == nil && session.logf != nil {
+				session.logf("agent: resume service removals: %v", err)
+			}
+		}
 
 		failure := session.serveRegistered(runContext, execute)
 		if failure.err == nil {
@@ -412,10 +431,24 @@ func (session *agentSession) executeResident(
 	claimStarted time.Time,
 	execute sessionAttemptExecution,
 ) (errorDestination, error) {
+	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
+	resident := &residentAttempt{class: claim.Job.Spec.Class, cancel: cancelAttempt, done: make(chan struct{})}
+	session.claimMu.Lock()
+	session.resident[claim.Job.JobID] = resident
+	session.notifyResidentChangedLocked()
+	session.claimMu.Unlock()
+	defer cancelAttempt(nil)
 	defer session.attempts.Done()
 	defer session.gates[gateKey].release()
-	defer session.releaseResidentJob(claim.Job.JobID)
-	return execute(ctx, claim, claimStarted)
+	defer func() {
+		session.claimMu.Lock()
+		delete(session.resident, claim.Job.JobID)
+		delete(session.residentJobID, claim.Job.JobID)
+		close(resident.done)
+		session.notifyResidentChangedLocked()
+		session.claimMu.Unlock()
+	}()
+	return execute(attemptContext, claim, claimStarted)
 }
 
 func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- destinationError) {
@@ -443,6 +476,11 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				return
 			}
 			session.observeGrantedCapacity(response.Node)
+			if session.removals != nil {
+				for _, directive := range response.RemovalDirectives {
+					session.removals.enqueue(ctx, directive, failures)
+				}
+			}
 			backoff.reset()
 			nextDelay = session.heartbeatInterval
 			session.markReady()
@@ -490,10 +528,45 @@ func (session *agentSession) claim(
 	return claim, true, nil
 }
 
-func (session *agentSession) releaseResidentJob(jobID string) {
-	session.claimMu.Lock()
-	delete(session.residentJobID, jobID)
-	session.claimMu.Unlock()
+func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID string) error {
+	for {
+		session.claimMu.Lock()
+		resident, active := session.resident[jobID]
+		_, admitted := session.residentJobID[jobID]
+		if active {
+			if resident.class != contract.JobClassService {
+				session.claimMu.Unlock()
+				return fmt.Errorf("agent: removal target %q is not a resident service", jobID)
+			}
+			resident.cancel(errServiceRemovalRequested)
+			done := resident.done
+			session.claimMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-done:
+				return nil
+			}
+		}
+		if !admitted {
+			session.claimMu.Unlock()
+			return nil
+		}
+		changed := session.residentChanged
+		session.claimMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (session *agentSession) notifyResidentChangedLocked() {
+	select {
+	case session.residentChanged <- struct{}{}:
+	default:
+	}
 }
 
 func (session *agentSession) observeGrantedCapacity(node l1.Node) {

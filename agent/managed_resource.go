@@ -1,5 +1,7 @@
 package agent
 
+import "context"
+
 type managedResourceAttempt struct {
 	dataDirectory    string
 	runtimeDirectory string
@@ -11,4 +13,14 @@ type managedResourceAttempt struct {
 type managedResourceManager interface {
 	rootInstanceID() string
 	prepareAttempt(jobID, attemptID string) (managedResourceAttempt, func(), error)
+	remove(context.Context, localRemoval) error
+	resumeRemovals(context.Context) ([]localRemoval, error)
+}
+
+type localRemoval struct {
+	jobID             string
+	generation        uint64
+	rootInstanceID    string
+	cleanupFence      string
+	processTreeReaped bool
 }
