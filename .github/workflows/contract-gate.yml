@@ -62,6 +62,22 @@ jobs:
       - name: Run cross-platform runner and contract tests
         run: go test ./...
 
+  service-acceptance:
+    name: service-acceptance / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run service acceptance suite
+        run: go test -tags=service_acceptance ./...
+
   dogfood-workflow:
     name: dogfood-workflow
     runs-on: ubuntu-latest
@@ -98,6 +114,7 @@ jobs:
       - unit
       - sqlite-integration
       - mac-linux-runner
+      - service-acceptance
       - dogfood-workflow
     # always() so a failed dependency cannot skip this job — a skipped
     # required check does not block merging. The step then fails closed
@@ -110,6 +127,7 @@ jobs:
           UNIT_RESULT: ${{ needs.unit.result }}
           SQLITE_RESULT: ${{ needs['sqlite-integration'].result }}
           MAC_LINUX_RESULT: ${{ needs['mac-linux-runner'].result }}
+          SERVICE_ACCEPTANCE_RESULT: ${{ needs['service-acceptance'].result }}
           DOGFOOD_RESULT: ${{ needs['dogfood-workflow'].result }}
         run: |
           set -eu
@@ -117,8 +135,10 @@ jobs:
             "unit=$UNIT_RESULT" \
             "sqlite-integration=$SQLITE_RESULT" \
             "mac-linux-runner=$MAC_LINUX_RESULT" \
+            "service-acceptance=$SERVICE_ACCEPTANCE_RESULT" \
             "dogfood-workflow=$DOGFOOD_RESULT"
           test "$UNIT_RESULT" = success
           test "$SQLITE_RESULT" = success
           test "$MAC_LINUX_RESULT" = success
+          test "$SERVICE_ACCEPTANCE_RESULT" = success
           test "$DOGFOOD_RESULT" = success
