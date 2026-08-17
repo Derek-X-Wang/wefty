@@ -72,7 +72,10 @@ func runPortfulService(
 	endpoint serviceRuntimeEndpoint,
 	config serviceSupervisorConfig,
 ) (contract.ProcessResult, error) {
-	runContext, cancelRun := context.WithCancel(ctx)
+	// Keep the guardian execution context independent from the caller's
+	// cancellation long enough to withdraw local publication and close the
+	// Fabric listener first. The explicit ctx.Done arm below owns that order.
+	runContext, cancelRun := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelRun()
 	frontDoor := newServiceFrontDoor(listener, endpoint.dial, processrunner.DefaultReadinessConnectTimeout)
 	defer frontDoor.Close()
@@ -113,6 +116,13 @@ func runPortfulService(
 	}()
 
 	select {
+	case <-ctx.Done():
+		publication.Stop()
+		frontDoor.Close()
+		cancelRun()
+		outcome := <-outcomes
+		publicationErr := <-publicationDone
+		return outcome.result, errors.Join(outcome.err, publicationErr)
 	case outcome := <-outcomes:
 		publication.Stop()
 		if publicationErr := <-publicationDone; publicationErr != nil {

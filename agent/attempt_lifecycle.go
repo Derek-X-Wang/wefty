@@ -53,6 +53,7 @@ type attemptLifecycleDependencies struct {
 	observer               *lifecycleObserver
 	reservePublishedPort   func(l1.Claim) (net.Listener, *contract.SpawnFailure)
 	prepareServiceEndpoint func(context.Context) (serviceRuntimeEndpoint, error)
+	prepareAuthorityLoss   func(context.Context, string) error
 }
 
 // attemptLifecycle owns one attempt from renewal startup through process/log
@@ -163,11 +164,18 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	var outcome runOutcome
 	select {
 	case <-ctx.Done():
-		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, ctx.Err())
+		cause := context.Cause(ctx)
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
 		cancelExecution()
-		cancelAttempt(ctx.Err())
+		cancelAttempt(cause)
 		outcome := <-completed
 		<-renewalDone
+		if errors.Is(cause, errServiceRemovalRequested) {
+			// The removal controller persists its local removing record before
+			// canceling this context and waits here for the guardian's positive
+			// reap before it purges spool metadata or invokes managedroot.Remove.
+			return errorDestinationUnclassified, nil
+		}
 		result := outcome.result
 		if result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
 			result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
@@ -566,6 +574,12 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 				}
 				_ = watch.Check()
 				return
+			}
+			if classification.destination == errorDestinationAttemptAuthority &&
+				claim.Job.Spec.Class == contract.JobClassService && lifecycle.dependencies.prepareAuthorityLoss != nil {
+				if prepareErr := lifecycle.dependencies.prepareAuthorityLoss(ctx, claim.Job.JobID); prepareErr != nil {
+					lifecycle.log("prepare service %s authority loss for removal: %v", claim.Job.JobID, prepareErr)
+				}
 			}
 			select {
 			case failures <- destinationError{destination: classification.destination, err: err}:

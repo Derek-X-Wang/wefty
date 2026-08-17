@@ -158,6 +158,13 @@ CREATE TABLE IF NOT EXISTS spool_acknowledgements (
   stream TEXT NOT NULL,
   sequence INTEGER NOT NULL,
   PRIMARY KEY(attempt_id, stream)
+);
+CREATE TABLE IF NOT EXISTS spool_removals (
+  job_id TEXT PRIMARY KEY,
+  removal_generation INTEGER NOT NULL,
+  cleanup_fence TEXT NOT NULL,
+  root_instance_id TEXT NOT NULL,
+  started_ns INTEGER NOT NULL
 );`
 	if _, err := spool.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("agent: initialize log spool: %w", err)
@@ -166,6 +173,46 @@ CREATE TABLE IF NOT EXISTS spool_acknowledgements (
 }
 
 func (spool *logSpool) Close() error { return spool.db.Close() }
+
+func (spool *logSpool) beginRemoval(ctx context.Context, removal localRemoval, startedAt time.Time) error {
+	response, err := spool.db.ExecContext(ctx, `INSERT INTO spool_removals(
+job_id, removal_generation, cleanup_fence, root_instance_id, started_ns
+) VALUES(?, ?, ?, ?, ?)
+ON CONFLICT(job_id) DO NOTHING`, removal.jobID, removal.generation, removal.cleanupFence,
+		removal.rootInstanceID, startedAt.UTC().Round(0).UnixNano())
+	if err != nil {
+		return fmt.Errorf("agent: persist service removal intent: %w", err)
+	}
+	if _, err := response.RowsAffected(); err != nil {
+		return fmt.Errorf("agent: inspect service removal intent persistence: %w", err)
+	}
+	var generation uint64
+	var cleanupFence, rootInstanceID string
+	if err := spool.db.QueryRowContext(ctx, `SELECT removal_generation, cleanup_fence, root_instance_id
+FROM spool_removals WHERE job_id=?`, removal.jobID).Scan(&generation, &cleanupFence, &rootInstanceID); err != nil {
+		return fmt.Errorf("agent: verify service removal intent: %w", err)
+	}
+	if generation != removal.generation || cleanupFence != removal.cleanupFence || rootInstanceID != removal.rootInstanceID {
+		return fmt.Errorf("agent: service removal %q conflicts with locally persisted authority", removal.jobID)
+	}
+	return nil
+}
+
+func (spool *logSpool) purgeJob(ctx context.Context, jobID string) error {
+	if _, err := spool.db.ExecContext(ctx, "DELETE FROM spool_attempts WHERE job_id=?", jobID); err != nil {
+		return fmt.Errorf("agent: purge service spool metadata: %w", err)
+	}
+	return nil
+}
+
+func (spool *logSpool) completeRemoval(ctx context.Context, removal localRemoval) error {
+	if _, err := spool.db.ExecContext(ctx, `DELETE FROM spool_removals
+WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id=?`,
+		removal.jobID, removal.generation, removal.cleanupFence, removal.rootInstanceID); err != nil {
+		return fmt.Errorf("agent: release completed service removal intent: %w", err)
+	}
+	return nil
+}
 
 func (spool *logSpool) ensureAttempt(ctx context.Context, claim l1.Claim) error {
 	_, err := spool.db.ExecContext(ctx, `INSERT INTO spool_attempts(attempt_id, job_id, fencing_token, class, created_ns)

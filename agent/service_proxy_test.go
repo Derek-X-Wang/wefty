@@ -23,6 +23,59 @@ func TestPublishedPortFailureComesFromFabricNamespace(t *testing.T) {
 	assertPublishedPortFailureComesFromFabricNamespace(t)
 }
 
+func TestServiceCancellationClosesPublicationBeforeSignalingGuardian(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &cancellationOrderRunner{started: make(chan struct{}), listenerAddress: listener.Addr().String()}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, runErr := runPortfulService(
+			ctx,
+			runner,
+			processrunner.Request{},
+			nil,
+			listener,
+			serviceRuntimeEndpoint{dial: func(context.Context) (net.Conn, error) {
+				return nil, errors.New("backend should not be dialed")
+			}},
+			serviceSupervisorConfig{},
+		)
+		done <- runErr
+	}()
+	<-runner.started
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if runner.listenerWasOpen {
+		t.Fatal("guardian cancellation became visible before the Fabric listener closed")
+	}
+}
+
+type cancellationOrderRunner struct {
+	started         chan struct{}
+	listenerAddress string
+	listenerWasOpen bool
+}
+
+func (runner *cancellationOrderRunner) Run(
+	ctx context.Context,
+	_ processrunner.Request,
+	_ processrunner.OutputSink,
+) (contract.ProcessResult, error) {
+	close(runner.started)
+	<-ctx.Done()
+	connection, err := net.DialTimeout("tcp4", runner.listenerAddress, 100*time.Millisecond)
+	if err == nil {
+		runner.listenerWasOpen = true
+		_ = connection.Close()
+	}
+	return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseGuardian}, ctx.Err()
+}
+
 func assertPublishedPortFailureComesFromFabricNamespace(t *testing.T) {
 	t.Helper()
 	port := unusedHostPort(t)

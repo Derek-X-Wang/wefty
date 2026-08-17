@@ -191,6 +191,10 @@ func New(config Config) (*Agent, error) {
 		intOrDefault(config.MaxOneshotSlots, l1.DefaultMaxOneshotSlots),
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
+	session.removals = newRemovalController(
+		client, outbox, managedResource, session,
+		config.NodeID, config.BootSessionID, logf,
+	)
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
 		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
@@ -281,7 +285,15 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		nodeID:          a.registration.NodeID, workflowBridge: a.startWorkflowBridge, logf: a.logf,
 		observer: a.observer, reservePublishedPort: a.reservePublishedPort,
 		prepareServiceEndpoint: prepareProcessServiceEndpoint,
+		prepareAuthorityLoss:   a.prepareAuthorityLoss,
 	})
+}
+
+func (a *Agent) prepareAuthorityLoss(ctx context.Context, jobID string) error {
+	if a.session == nil || a.session.removals == nil {
+		return nil
+	}
+	return a.session.removals.prepareAuthorityLoss(ctx, jobID)
 }
 
 func (a *Agent) reservePublishedPort(claim l1.Claim) (net.Listener, *contract.SpawnFailure) {
