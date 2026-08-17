@@ -15,8 +15,8 @@ Control flow lives inside the workflow itself, never in the ledger.
 _Avoid_: pipeline, DAG, ADW, playbook
 
 **Run**:
-One ledgered execution — of a workflow or a plain job — with identity,
-envelopes, gates, logs, and a place in a lineage.
+One L3-ledgered execution — of a workflow or a non-workflow one-shot job —
+with identity, envelopes, gates, logs, and a place in a lineage.
 _Avoid_: session, execution, task
 
 **Step**:
@@ -47,8 +47,7 @@ _Avoid_: calling any future declarative layer a "workflow"
 ### Scheduling and execution (L1, the cluster)
 
 **Job**:
-The schedulable unit waiting in the cluster's queue, routed by subset tag
-matching.
+The L1 schedulable unit, routed to nodes by subset tag matching.
 _Avoid_: task, work item
 
 **Attempt**:
@@ -62,16 +61,27 @@ control-plane-assigned tags.
 _Avoid_: worker, host, machine (in scheduling contexts)
 
 **Workload**:
-What an attempt executes, described by two independent axes: **kind** — the
-isolation walls (`process`, `oci`, open for more) — and **class** — the
-lifecycle clock (`one-shot` today; `service` is a named future class).
-_Avoid_: conflating kind with class; "sandboxed" as a lifecycle word
+What a job asks a node to execute, described by two independent axes:
+**kind** — the isolation walls (`process`, `oci`, open for more) — and
+**class** — the lifecycle clock (`one-shot`, `service`).
+_Avoid_: conflating kind with class; "sandboxed" as a lifecycle word;
+treating `service` as a peer noun to Job
+
+**Guardian**:
+The agent-owned lifetime boundary for one service payload. It prevents the
+payload from outliving the agent boot session that launched it.
+_Avoid_: supervisor, babysitter, wrapper, shim
+
+**Desired state**:
+The requested lifecycle target for a service job (`running` or `stopped`),
+distinct from the job state that records what the control plane observes.
+_Avoid_: status, target status
 
 ### Placement and movement
 
 **Movable**:
-Work whose inputs live entirely in the ledger, so any tag-matching node can
-run or rerun it.
+Work whose placement policy may assign or reassign it to any tag-matching
+node because its inputs live entirely in the ledger.
 _Avoid_: stateless, floating
 
 **Pinned**:
@@ -79,6 +89,20 @@ Work that depends on node-local state (a worktree, a handoff directory) and
 therefore carries a node tag. Cross-node steps hand off through envelopes,
 never through local files.
 _Avoid_: sticky, affinity
+
+**Service binding**:
+The current placement relationship between a service job and one node. In
+v1 it is retained across payload restarts and admits no cross-node failover.
+_Avoid_: pin, affinity, ownership, permanent placement
+
+**Slot**:
+One unit of a node's configured admission capacity within one workload
+class. A one-shot slot is occupied by a live attempt; a service slot is
+occupied by a service binding, and is retained through restart backoff.
+Slots have no identity — occupancy is a count, never an assignment, and
+there is no slot ID and no slots table. Slots are never shared across
+classes.
+_Avoid_: lane, pool, worker, CPU, core, "execution path" as a countable noun
 
 **Fabric**:
 The network seam — transport, identity, naming, provisioning — behind which

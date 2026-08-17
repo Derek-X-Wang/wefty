@@ -6,7 +6,7 @@ func TestStateTransitionTablesCoverAllStates(t *testing.T) {
 	t.Parallel()
 
 	assertStates(t, JobTransitions, []JobState{
-		JobQueued, JobClaimed, JobRunning, JobAwaitingInput, JobSucceeded, JobFailed,
+		JobQueued, JobClaimed, JobRunning, JobStopping, JobStopped, JobAwaitingInput, JobSucceeded, JobFailed,
 	})
 	assertStates(t, AttemptTransitions, []AttemptState{
 		AttemptClaimed, AttemptRunning, AttemptAwaitingInput, AttemptSucceeded, AttemptFailed, AttemptLost,
