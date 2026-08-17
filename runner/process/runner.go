@@ -28,6 +28,15 @@ var (
 	ErrMaxRuntime        = errors.New("process maximum runtime exceeded")
 )
 
+// IdlePolicy controls whether a process is supervised for output inactivity.
+// Its zero value preserves the one-shot hang guard.
+type IdlePolicy uint8
+
+const (
+	MonitorIdle IdlePolicy = iota
+	IgnoreIdle
+)
+
 // OutputSink receives raw output events. Calls are serialized within a stream,
 // but stdout and stderr may call the sink concurrently.
 type OutputSink interface {
@@ -41,13 +50,14 @@ func (function OutputSinkFunc) WriteOutput(ctx context.Context, event contract.L
 	return function(ctx, event)
 }
 
-// Request describes one native process execution. Closing or sending on
-// CompletionSignal replaces the idle clock with the completion clock; a nil
-// channel leaves the runner in its idle-timeout phase until the process exits.
+// Request describes one native process execution. IdlePolicy controls the
+// initial idle clock. Closing or sending on CompletionSignal replaces any idle
+// clock with the completion clock; a nil channel starts no completion clock.
 type Request struct {
 	AttemptID        string
 	Execution        contract.ExecutionSpec
 	Limits           *contract.JobLimits
+	IdlePolicy       IdlePolicy
 	CompletionSignal <-chan struct{}
 }
 
@@ -150,9 +160,13 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 		wait <- waitResult{err: err, state: command.ProcessState}
 	}()
 
-	idleTimer := runner.clock.NewTimer(idleTimeout)
-	idleTimerChannel := idleTimer.C()
-	defer stopTimer(idleTimer)
+	var idleTimer Timer
+	var idleTimerChannel <-chan time.Time
+	if request.IdlePolicy == MonitorIdle {
+		idleTimer = runner.clock.NewTimer(idleTimeout)
+		idleTimerChannel = idleTimer.C()
+		defer stopTimer(idleTimer)
+	}
 
 	var maxRuntimeTimer Timer
 	var maxRuntimeChannel <-chan time.Time
@@ -296,6 +310,9 @@ func validateRequest(ctx context.Context, request Request) error {
 	}
 	if request.Execution.WorkingDirectory == "" {
 		return errors.New("process working directory is required")
+	}
+	if request.IdlePolicy != MonitorIdle && request.IdlePolicy != IgnoreIdle {
+		return fmt.Errorf("unsupported idle policy %d", request.IdlePolicy)
 	}
 	info, err := os.Stat(request.Execution.WorkingDirectory)
 	if err != nil {
