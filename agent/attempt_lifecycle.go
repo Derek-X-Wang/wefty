@@ -44,6 +44,7 @@ type attemptLifecycleDependencies struct {
 	clock                  Clock
 	renewalInterval        time.Duration
 	completionRetry        time.Duration
+	finalizationTimeout    time.Duration
 	outputSinkFactory      OutputSinkFactory
 	managedResource        managedResourceManager
 	handoffs               *handoffManager
@@ -68,6 +69,10 @@ func newAttemptLifecycle(dependencies attemptLifecycleDependencies) *attemptLife
 	if dependencies.watchdog == nil {
 		dependencies.watchdog = disabledAttemptWatchdog{}
 	}
+	// A zero finalization timeout would produce an already-expired context and
+	// silently fail every attempt's log setup, so it defaults rather than
+	// trusting each construction site to supply it.
+	dependencies.finalizationTimeout = durationOrDefault(dependencies.finalizationTimeout, DefaultFinalizationTimeout)
 	return &attemptLifecycle{dependencies: dependencies}
 }
 
@@ -146,12 +151,21 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 	}
 
+	// Uncancelable so a cancelled execution still flushes and uploads its final
+	// output, but BOUNDED: an unbounded finalization prevents the attempt from
+	// ever completing, which blocks agent drain and service removal forever
+	// rather than merely delaying them. Removal cancels it outright below.
+	finalizationContext, cancelFinalization := context.WithTimeout(
+		context.WithoutCancel(attemptContext), lifecycle.dependencies.finalizationTimeout,
+	)
+	defer cancelFinalization()
+
 	completed := make(chan runOutcome, 1)
 	go func() {
 		if claim.Job.Spec.Class == contract.JobClassOneShot {
 			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptRunning, nil)
 		}
-		result, err := lifecycle.runProcessContexts(executionContext, context.WithoutCancel(attemptContext), claim)
+		result, err := lifecycle.runProcessContexts(executionContext, finalizationContext, claim)
 		var durabilityErr error
 		if lifecycle.dependencies.outbox != nil {
 			durabilityErr = lifecycle.dependencies.outbox.storeCompletion(
@@ -168,6 +182,17 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
 		cancelExecution()
 		cancelAttempt(cause)
+		if errors.Is(cause, errServiceRemovalRequested) {
+			// L1 scrubbed this job's log rows in the same transaction that
+			// accepted the removal request, so its pending events can never be
+			// accepted again — the sequence-continuity check rejects them and
+			// that rejection classifies as transient, so the uploader would
+			// retry until the finalization bound expired. There is nothing to
+			// deliver to a control plane that has already deleted the
+			// destination; the events stay durable in the spool until the
+			// removal controller purges it.
+			cancelFinalization()
+		}
 		outcome := <-completed
 		<-renewalDone
 		if errors.Is(cause, errServiceRemovalRequested) {
@@ -214,12 +239,19 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, failure.err)
 		cancelAttempt(failure.err)
+		// Authority is gone, so L1 will not accept more of this attempt's
+		// output. Leaving finalization running would retry until its bound
+		// expired — and after a removal the rejection is a sequence conflict,
+		// which classifies as transient and retries indefinitely. The events
+		// stay durable in the spool either way.
+		cancelFinalization()
 		<-completed
 		<-renewalDone
 		return failure.destination, fmt.Errorf("agent: renew lease: %w", failure.err)
 	case err := <-watch.Failures():
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, err)
 		cancelAttempt(err)
+		cancelFinalization()
 		<-completed
 		<-renewalDone
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", err)

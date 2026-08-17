@@ -54,6 +54,8 @@ func run() error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	log.Printf("wefty-echo-service: starting payload pid=%d", os.Getpid())
+
 	shutdownSignal, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	shutdownDone := make(chan error, 1)

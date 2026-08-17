@@ -21,6 +21,14 @@ import (
 const (
 	DefaultOperationTimeout    = 10 * time.Second
 	DefaultMaxIdleConnsPerHost = 16
+
+	// DefaultFinalizationTimeout bounds the uncancelable finalization phase —
+	// the final redaction flush and log upload for one attempt. Larger than a
+	// single operation timeout because a flush may upload several batches with
+	// retries, and deliberately FINITE: an unbounded finalization prevents the
+	// attempt from ever completing, which blocks agent drain and service
+	// removal indefinitely rather than merely delaying them.
+	DefaultFinalizationTimeout = 30 * time.Second
 )
 
 // ProtocolError is an error response returned by the L1 agent protocol.
