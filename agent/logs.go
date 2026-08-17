@@ -172,8 +172,9 @@ func validateLogAcknowledgement(events []contract.LogEvent, acknowledged map[con
 	highest := make(map[contract.LogStream]uint64, 2)
 	seen := make(map[contract.LogStream]bool, 2)
 	for _, event := range events {
-		if !seen[event.Stream] || event.Sequence > highest[event.Stream] {
-			highest[event.Stream] = event.Sequence
+		endSequence := eventEndSequence(event)
+		if !seen[event.Stream] || endSequence > highest[event.Stream] {
+			highest[event.Stream] = endSequence
 			seen[event.Stream] = true
 		}
 	}
@@ -184,6 +185,13 @@ func validateLogAcknowledgement(events []contract.LogEvent, acknowledged map[con
 		}
 	}
 	return nil
+}
+
+func eventEndSequence(event contract.LogEvent) uint64 {
+	if event.Gap != nil {
+		return event.Gap.ThroughSequence
+	}
+	return event.Sequence
 }
 
 func (sink *batchingLogSink) setError(err error) {

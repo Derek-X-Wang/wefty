@@ -58,9 +58,11 @@ npm run build
 ```
 
 Pre-1.0 schema changes are applied only to newly created databases; there is
-no migration mechanism. If this state root came from an older checkout, stop
-the stack and delete the disposable L1 and agent-spool SQLite files (including
-their `-wal` and `-shm` sidecars) before restarting:
+no migration mechanism: L1 and the agent's durable evidence schema are edited
+in place, with no `ALTER TABLE` compatibility path. If this state root came
+from an older checkout, stop the stack and delete the disposable L1 and
+agent-spool SQLite files (including their `-wal` and `-shm` sidecars) before
+restarting:
 
 ```sh
 test -n "$WEFTY_STATE_ROOT"

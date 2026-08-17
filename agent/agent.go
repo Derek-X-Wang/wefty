@@ -83,6 +83,7 @@ type Agent struct {
 	logf              func(string, ...any)
 	clock             Clock
 	observer          *lifecycleObserver
+	nodeLock          nodeLock
 }
 
 func New(config Config) (*Agent, error) {
@@ -134,8 +135,18 @@ func New(config Config) (*Agent, error) {
 	logBatchSize := intOrDefault(config.LogBatchSize, DefaultLogBatchSize)
 	logFlushInterval := durationOrDefault(config.LogFlushInterval, DefaultLogFlushInterval)
 	logRetryInterval := durationOrDefault(config.LogRetryInterval, DefaultLogRetryInterval)
+	logSpoolDirectory, err := resolveLogSpoolDirectory(config.LogSpoolDirectory)
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
+	stableNodeLock, err := acquireNodeLock(logSpoolDirectory, config.NodeID)
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
 	outbox, err := newEvidenceOutbox(
-		config.LogSpoolDirectory,
+		logSpoolDirectory,
 		config.NodeID,
 		int64OrDefault(config.LogSpoolMaxBytes, DefaultLogSpoolMaxBytes),
 		clock,
@@ -144,6 +155,7 @@ func New(config Config) (*Agent, error) {
 		logRetryInterval,
 	)
 	if err != nil {
+		_ = stableNodeLock.Close()
 		client.Close()
 		return nil, err
 	}
@@ -156,6 +168,7 @@ func New(config Config) (*Agent, error) {
 		runner: runner, outputSinkFactory: config.OutputSinkFactory,
 		handoffs: newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
 		logf:     config.Logf, clock: clock, observer: observer,
+		nodeLock: stableNodeLock,
 	}, nil
 }
 
@@ -174,6 +187,11 @@ func (a *Agent) Close() {
 	if a.outbox != nil {
 		if err := a.outbox.Close(); err != nil {
 			a.log("close durable log spool: %v", err)
+		}
+	}
+	if a.nodeLock != nil {
+		if err := a.nodeLock.Close(); err != nil {
+			a.log("release stable-node lock: %v", err)
 		}
 	}
 }
@@ -198,11 +216,10 @@ func (a *Agent) Run(ctx context.Context) error {
 			return fmt.Errorf("agent: clean expired handoff directories: %w", err)
 		}
 	}
-	if err := a.recoverPendingLogs(ctx); err != nil {
-		if ctx.Err() != nil {
-			return nil
-		}
-		return fmt.Errorf("agent: recover durable logs: %w", err)
+	if a.outbox != nil && a.session != nil {
+		a.outbox.startRecovery(ctx, a.session.client, func(err error) {
+			a.log("recover durable evidence: %v", err)
+		})
 	}
 	return a.session.run(ctx, func(attemptContext context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
 		return a.executeClaim(attemptContext, claim, claimStarted)

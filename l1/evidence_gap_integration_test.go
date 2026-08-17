@@ -83,6 +83,25 @@ func assertEvidenceGapContract(t *testing.T) {
 		if status != http.StatusOK {
 			t.Fatalf("oversized-event gap status = %d body=%s", status, body)
 		}
+
+		status, _, body = h.do(agent, http.MethodPost, path, AppendLogsRequest{
+			FencingToken: claim.Lease.FencingToken,
+			Events: []contract.LogEvent{{
+				AttemptID: claim.Lease.AttemptID,
+				Stream:    contract.LogStdout,
+				Sequence:  4,
+				Timestamp: h.clock.Now(),
+				Gap: &contract.LogGap{
+					ThroughSequence: 4,
+					LostEventCount:  1,
+					LostByteCount:   128,
+					Reason:          contract.LogGapReplayRejected,
+				},
+			}},
+		})
+		if status != http.StatusOK {
+			t.Fatalf("replay-rejected gap status = %d body=%s", status, body)
+		}
 	})
 
 	t.Run("observation window expires before retention and records a gap", func(t *testing.T) {

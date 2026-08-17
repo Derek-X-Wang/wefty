@@ -67,8 +67,9 @@ func newAttemptLifecycle(dependencies attemptLifecycleDependencies) *attemptLife
 }
 
 type runOutcome struct {
-	result contract.ProcessResult
-	err    error
+	result        contract.ProcessResult
+	err           error
+	durabilityErr error
 }
 
 func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
@@ -79,6 +80,11 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	attemptID := claim.Lease.AttemptID
 	lifecycle.dependencies.observer.beginAttempt(attemptID, claim.Job.JobID, claim.Job.Spec.Class)
 	defer lifecycle.dependencies.observer.finishAttempt(attemptID)
+	if lifecycle.dependencies.outbox != nil {
+		if err := lifecycle.dependencies.outbox.ensureAttempt(attemptContext, claim); err != nil {
+			return errorDestinationUnclassified, fmt.Errorf("agent: persist attempt evidence identity: %w", err)
+		}
+	}
 
 	authority := localAuthority{deadline: claimStarted.Add(claim.Lease.LeaseTTL)}
 	watch := lifecycle.dependencies.watchdog.Start(attemptContext, authority, cancelAttempt)
@@ -95,7 +101,13 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	go func() {
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptRunning, nil)
 		result, err := lifecycle.runProcess(executionContext, claim)
-		completed <- runOutcome{result: result, err: err}
+		var durabilityErr error
+		if lifecycle.dependencies.outbox != nil {
+			durabilityErr = lifecycle.dependencies.outbox.storeCompletion(
+				context.WithoutCancel(attemptContext), attemptID, toL1Result(result), lifecycle.dependencies.clock.Now(),
+			)
+		}
+		completed <- runOutcome{result: result, err: err, durabilityErr: durabilityErr}
 	}()
 
 	var outcome runOutcome
@@ -127,6 +139,9 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", cause)
 	}
 	lifecycle.dependencies.observer.setAttempt(attemptID, AttemptFinalizing, outcome.err)
+	if outcome.durabilityErr != nil {
+		return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", outcome.durabilityErr)
+	}
 
 	if outcome.err != nil {
 		lifecycle.log("attempt %s execution: %v", claim.Lease.AttemptID, outcome.err)
@@ -182,8 +197,24 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) destinationError {
 	for {
 		if _, err := lifecycle.dependencies.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request); err != nil {
+			if protocolErrorCode(err) == contract.ErrorLeaseExpired {
+				if lifecycle.dependencies.outbox != nil {
+					if releaseErr := lifecycle.dependencies.outbox.completionDelivered(context.WithoutCancel(ctx), claim.Lease.AttemptID); releaseErr != nil {
+						return destinationError{destination: errorDestinationUnclassified, err: releaseErr}
+					}
+				}
+				return destinationError{destination: errorDestinationAttemptAuthority, err: err}
+			}
 			classification := classifyAgentProtocolError(err)
 			if classification.destination != errorDestinationTransient {
+				if classification.destination == errorDestinationAttemptAuthority && lifecycle.dependencies.outbox != nil {
+					if sealErr := lifecycle.dependencies.outbox.sealAttemptEvidence(
+						context.WithoutCancel(ctx), claim.Lease.AttemptID,
+						"attempt authority no longer accepts completion evidence", protocolErrorCode(err),
+					); sealErr != nil {
+						return destinationError{destination: errorDestinationUnclassified, err: errors.Join(err, sealErr)}
+					}
+				}
 				return destinationError{destination: classification.destination, err: err}
 			}
 			timer := lifecycle.dependencies.clock.NewTimer(lifecycle.dependencies.completionRetry)
@@ -194,6 +225,11 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 			case <-timer.C():
 			}
 			continue
+		}
+		if lifecycle.dependencies.outbox != nil {
+			if err := lifecycle.dependencies.outbox.completionDelivered(context.WithoutCancel(ctx), claim.Lease.AttemptID); err != nil {
+				return destinationError{destination: errorDestinationUnclassified, err: err}
+			}
 		}
 		return destinationError{}
 	}
