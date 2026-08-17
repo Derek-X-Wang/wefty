@@ -168,15 +168,37 @@ type RunLimits struct {
 	MaxCost           float64 `json:"max_cost,omitempty"`
 }
 
-// LogEvent is ordered within one attempt and stream. Bytes contains raw log
-// bytes and is base64 encoded by encoding/json.
+// LogEvent is ordered within one attempt and stream. Exactly one of Bytes or
+// Gap is present. Bytes is base64 encoded by encoding/json. A gap's Sequence
+// is the first lost sequence and ThroughSequence is the inclusive last one.
 type LogEvent struct {
 	AttemptID string    `json:"attempt_id"`
 	Stream    LogStream `json:"stream"`
 	Sequence  uint64    `json:"sequence"`
 	Timestamp time.Time `json:"timestamp"`
-	Bytes     []byte    `json:"bytes"`
+	Bytes     []byte    `json:"bytes,omitempty"`
+	Gap       *LogGap   `json:"gap,omitempty"`
 }
+
+// LogGap is an agent-side declaration that raw events in one stream are no
+// longer available. SourceEventSHA256 is set when L1 converts a received raw
+// event to a gap after the late-evidence observation window, preserving
+// idempotency without retaining the raw payload.
+type LogGap struct {
+	ThroughSequence   uint64       `json:"through_sequence"`
+	LostEventCount    uint64       `json:"lost_event_count"`
+	LostByteCount     uint64       `json:"lost_byte_count"`
+	Reason            LogGapReason `json:"reason"`
+	SourceEventSHA256 string       `json:"source_event_sha256,omitempty"`
+}
+
+type LogGapReason string
+
+const (
+	LogGapSpoolEviction             LogGapReason = "spool_eviction"
+	LogGapOversizedEvent            LogGapReason = "oversized_event"
+	LogGapLateEvidenceWindowExpired LogGapReason = "late_evidence_window_expired"
+)
 
 type LogStream string
 

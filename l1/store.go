@@ -32,19 +32,21 @@ const (
 )
 
 type StoreOptions struct {
-	Clock          Clock
-	LeaseDuration  time.Duration
-	NodeStaleAfter time.Duration
-	NodeDeadAfter  time.Duration
+	Clock              Clock
+	LeaseDuration      time.Duration
+	LateEvidenceWindow time.Duration
+	NodeStaleAfter     time.Duration
+	NodeDeadAfter      time.Duration
 }
 
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
-	db             *sql.DB
-	clock          Clock
-	leaseDuration  time.Duration
-	nodeStaleAfter time.Duration
-	nodeDeadAfter  time.Duration
+	db                 *sql.DB
+	clock              Clock
+	leaseDuration      time.Duration
+	lateEvidenceWindow time.Duration
+	nodeStaleAfter     time.Duration
+	nodeDeadAfter      time.Duration
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
@@ -61,6 +63,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	leaseDuration := options.LeaseDuration
 	if leaseDuration <= 0 {
 		leaseDuration = DefaultLeaseDuration
+	}
+	lateEvidenceWindow := options.LateEvidenceWindow
+	if lateEvidenceWindow <= 0 {
+		lateEvidenceWindow = DefaultLateEvidenceWindow
 	}
 	nodeStaleAfter := options.NodeStaleAfter
 	if nodeStaleAfter <= 0 {
@@ -86,7 +92,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	}
 	db.SetMaxOpenConns(16)
 	store := &Store{
-		db: db, clock: clock, leaseDuration: leaseDuration,
+		db: db, clock: clock, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter,
 	}
 	if err := store.initialize(context.Background()); err != nil {
@@ -192,6 +198,7 @@ CREATE TABLE IF NOT EXISTS log_events (
   attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE CASCADE,
   stream TEXT NOT NULL,
   sequence INTEGER NOT NULL,
+  sequence_end INTEGER NOT NULL,
   timestamp_ns INTEGER NOT NULL,
   bytes BLOB NOT NULL,
   event_json BLOB NOT NULL,
@@ -668,7 +675,8 @@ WHERE service_jobs.job_id=?`, attemptID, jobID).Scan(&desiredState, &restartRequ
 	return "", nil
 }
 
-// AppendLogs accepts a fenced batch and owns idempotency for log-event keys.
+// AppendLogs accepts a provenance-authenticated batch and owns idempotency for
+// log-event keys.
 // Identical event replays are acknowledged without changing either the row
 // store or the authoritative per-job JSONL. A conflicting replay is rejected.
 func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID string, request AppendLogsRequest) (AppendLogsResponse, error) {
@@ -692,14 +700,26 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		return AppendLogsResponse{}, err
 	}
 	hasAuthority := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt) == nil
+	now := canonicalTime(s.clock.Now())
+	if !now.Before(attempt.leaseExpires) {
+		if err := expireAttempt(ctx, tx, attempt, now); err != nil {
+			return AppendLogsResponse{}, err
+		}
+		if attempt.state == contract.AttemptClaimed || attempt.state == contract.AttemptRunning || attempt.state == contract.AttemptAwaitingInput {
+			attempt.state = contract.AttemptLost
+			attempt.updatedAt = now
+		}
+	}
+	lateWindowExpired := attempt.state == contract.AttemptLost && now.After(attempt.updatedAt.Add(s.lateEvidenceWindow))
 
 	type eventKey struct {
 		stream   contract.LogStream
 		sequence uint64
 	}
 	type preparedEvent struct {
-		event contract.LogEvent
-		raw   []byte
+		event       contract.LogEvent
+		endSequence uint64
+		raw         []byte
 	}
 	seen := make(map[eventKey][]byte, len(request.Events))
 	streams := make(map[contract.LogStream]struct{}, 2)
@@ -713,6 +733,13 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 			return AppendLogsResponse{}, err
 		}
 		event.Timestamp = canonicalTime(event.Timestamp)
+		originalRaw, err := json.Marshal(event)
+		if err != nil {
+			return AppendLogsResponse{}, internalError(err, "encode source log event")
+		}
+		if lateWindowExpired {
+			event = lateEvidenceGap(event, originalRaw)
+		}
 		raw, err := json.Marshal(event)
 		if err != nil {
 			return AppendLogsResponse{}, internalError(err, "encode log event")
@@ -731,7 +758,7 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		err = tx.QueryRowContext(ctx, "SELECT event_json FROM log_events WHERE attempt_id=? AND stream=? AND sequence=?", attemptID, event.Stream, event.Sequence).Scan(&stored)
 		switch {
 		case err == nil:
-			if !bytes.Equal(stored, raw) {
+			if !bytes.Equal(stored, originalRaw) && !bytes.Equal(stored, raw) {
 				return AppendLogsResponse{}, protocolError(contract.ErrorIdempotencyConflict, "log event (%s, %d) conflicts with the accepted event", event.Stream, event.Sequence)
 			}
 			acknowledged[event.Stream] = maxSequence(acknowledged[event.Stream], event.Sequence)
@@ -743,7 +770,7 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		expected, ok := next[event.Stream]
 		if !ok {
 			var maximum int64
-			if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence), -1) FROM log_events WHERE attempt_id=? AND stream=?", attemptID, event.Stream).Scan(&maximum); err != nil {
+			if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence_end), -1) FROM log_events WHERE attempt_id=? AND stream=?", attemptID, event.Stream).Scan(&maximum); err != nil {
 				return AppendLogsResponse{}, internalError(err, "read log sequence acknowledgement")
 			}
 			expected = maximum + 1
@@ -751,13 +778,13 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		if int64(event.Sequence) != expected {
 			return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "log stream %s expected sequence %d, got %d", event.Stream, expected, event.Sequence)
 		}
-		next[event.Stream] = expected + 1
-		acknowledged[event.Stream] = event.Sequence
-		newEvents = append(newEvents, preparedEvent{event: event, raw: raw})
+		endSequence := logEventEndSequence(event)
+		next[event.Stream] = int64(endSequence) + 1
+		acknowledged[event.Stream] = endSequence
+		newEvents = append(newEvents, preparedEvent{event: event, endSequence: endSequence, raw: raw})
 	}
 
-	// Terminal and expired attempts may replay already-accepted events, but
-	// they cannot append anything new.
+	// Already-accepted events remain replayable after authority loss.
 	if len(newEvents) == 0 {
 		if err := readLogAcknowledgements(ctx, tx, attemptID, streams, acknowledged); err != nil {
 			return AppendLogsResponse{}, err
@@ -767,25 +794,20 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		}
 		return AppendLogsResponse{Acknowledged: acknowledged}, nil
 	}
-	now := canonicalTime(s.clock.Now())
-	if !now.Before(attempt.leaseExpires) {
-		if err := expireAttempt(ctx, tx, attempt, now); err != nil {
-			return AppendLogsResponse{}, err
-		}
-		if err := tx.Commit(); err != nil {
-			return AppendLogsResponse{}, internalError(err, "commit log append lease expiry")
-		}
-		return AppendLogsResponse{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
-	}
-	if attempt.state != contract.AttemptClaimed && attempt.state != contract.AttemptRunning && attempt.state != contract.AttemptAwaitingInput {
+	if attempt.state == contract.AttemptLost {
+	} else if attempt.state != contract.AttemptClaimed && attempt.state != contract.AttemptRunning && attempt.state != contract.AttemptAwaitingInput {
 		return AppendLogsResponse{}, protocolError(contract.ErrorConflict, "attempt is terminal")
 	}
 
 	var appendedJSONL bytes.Buffer
 	for _, prepared := range newEvents {
 		event := prepared.event
-		if _, err := tx.ExecContext(ctx, `INSERT INTO log_events(job_id, attempt_id, stream, sequence, timestamp_ns, bytes, event_json)
-VALUES(?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence, event.Timestamp.UnixNano(), event.Bytes, prepared.raw); err != nil {
+		storedBytes := event.Bytes
+		if event.Gap != nil {
+			storedBytes = []byte{}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO log_events(job_id, attempt_id, stream, sequence, sequence_end, timestamp_ns, bytes, event_json)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence, prepared.endSequence, event.Timestamp.UnixNano(), storedBytes, prepared.raw); err != nil {
 			return AppendLogsResponse{}, internalError(err, "store log event")
 		}
 		appendedJSONL.Write(prepared.raw)
@@ -814,7 +836,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence, ev
 func readLogAcknowledgements(ctx context.Context, q queryer, attemptID string, streams map[contract.LogStream]struct{}, acknowledgements map[contract.LogStream]uint64) error {
 	for stream := range streams {
 		var maximum int64
-		if err := q.QueryRowContext(ctx, "SELECT MAX(sequence) FROM log_events WHERE attempt_id=? AND stream=?", attemptID, stream).Scan(&maximum); err != nil {
+		if err := q.QueryRowContext(ctx, "SELECT MAX(sequence_end) FROM log_events WHERE attempt_id=? AND stream=?", attemptID, stream).Scan(&maximum); err != nil {
 			return internalError(err, "read log acknowledgement")
 		}
 		acknowledgements[stream] = uint64(maximum)
@@ -884,16 +906,65 @@ func validateLogEvent(attemptID string, event contract.LogEvent) error {
 	if event.Stream != contract.LogStdout && event.Stream != contract.LogStderr {
 		return protocolError(contract.ErrorInvalidRequest, "log stream %q is invalid", event.Stream)
 	}
-	if event.Sequence > math.MaxInt64 {
+	if event.Sequence > math.MaxInt64 || (event.Gap != nil && event.Gap.ThroughSequence > math.MaxInt64) {
 		return protocolError(contract.ErrorInvalidRequest, "log sequence exceeds the supported range")
 	}
 	if event.Timestamp.IsZero() {
 		return protocolError(contract.ErrorInvalidRequest, "log timestamp is required")
 	}
-	if len(event.Bytes) == 0 || len(event.Bytes) > MaxLogEventBytes {
-		return protocolError(contract.ErrorInvalidRequest, "log event bytes must contain between 1 and %d bytes", MaxLogEventBytes)
+	if event.Gap == nil {
+		if len(event.Bytes) == 0 || len(event.Bytes) > MaxLogEventBytes {
+			return protocolError(contract.ErrorInvalidRequest, "log event bytes must contain between 1 and %d bytes", MaxLogEventBytes)
+		}
+		return nil
+	}
+	if len(event.Bytes) != 0 {
+		return protocolError(contract.ErrorInvalidRequest, "log event must contain exactly one of bytes or gap")
+	}
+	gap := event.Gap
+	if gap.ThroughSequence < event.Sequence || gap.LostEventCount != gap.ThroughSequence-event.Sequence+1 || gap.LostByteCount == 0 {
+		return protocolError(contract.ErrorInvalidRequest, "log gap range, event count, and byte count are inconsistent")
+	}
+	switch gap.Reason {
+	case contract.LogGapSpoolEviction, contract.LogGapOversizedEvent, contract.LogGapLateEvidenceWindowExpired:
+	default:
+		return protocolError(contract.ErrorInvalidRequest, "log gap reason %q is invalid", gap.Reason)
+	}
+	if gap.SourceEventSHA256 != "" && !validSHA256(gap.SourceEventSHA256) {
+		return protocolError(contract.ErrorInvalidRequest, "log gap source_event_sha256 is invalid")
+	}
+	if gap.Reason == contract.LogGapLateEvidenceWindowExpired && gap.SourceEventSHA256 == "" {
+		return protocolError(contract.ErrorInvalidRequest, "late-evidence log gap requires source_event_sha256")
 	}
 	return nil
+}
+
+func logEventEndSequence(event contract.LogEvent) uint64 {
+	if event.Gap != nil {
+		return event.Gap.ThroughSequence
+	}
+	return event.Sequence
+}
+
+func lateEvidenceGap(event contract.LogEvent, source []byte) contract.LogEvent {
+	lostEventCount := uint64(1)
+	lostByteCount := uint64(len(event.Bytes))
+	throughSequence := event.Sequence
+	if event.Gap != nil {
+		lostEventCount = event.Gap.LostEventCount
+		lostByteCount = event.Gap.LostByteCount
+		throughSequence = event.Gap.ThroughSequence
+	}
+	hash := sha256.Sum256(source)
+	event.Bytes = nil
+	event.Gap = &contract.LogGap{
+		ThroughSequence:   throughSequence,
+		LostEventCount:    lostEventCount,
+		LostByteCount:     lostByteCount,
+		Reason:            contract.LogGapLateEvidenceWindowExpired,
+		SourceEventSHA256: hex.EncodeToString(hash[:]),
+	}
+	return event
 }
 
 func maxSequence(left, right uint64) uint64 {
@@ -938,6 +1009,10 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	}
 	hash := sha256.Sum256(requestJSON)
 	completionHash := hex.EncodeToString(hash[:])
+	resultJSON, err := json.Marshal(request.Result)
+	if err != nil {
+		return Job{}, internalError(err, "encode process result")
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -948,12 +1023,28 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	if err != nil {
 		return Job{}, err
 	}
-	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
+	if err := validateAttemptEvidence(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 		return Job{}, err
+	}
+	now := canonicalTime(s.clock.Now())
+	if !now.Before(attempt.leaseExpires) && attempt.state != contract.AttemptLost {
+		if err := expireAttempt(ctx, tx, attempt, now); err != nil {
+			return Job{}, err
+		}
+		if attempt.state == contract.AttemptClaimed || attempt.state == contract.AttemptRunning || attempt.state == contract.AttemptAwaitingInput {
+			attempt.state = contract.AttemptLost
+			attempt.updatedAt = now
+		}
 	}
 	if attempt.completionKey.Valid {
 		if attempt.completionKey.String != request.IdempotencyKey || attempt.completionHash.String != completionHash {
 			return Job{}, protocolError(contract.ErrorIdempotencyConflict, "completion idempotency key or body conflicts with the accepted completion")
+		}
+		if attempt.state == contract.AttemptLost {
+			return Job{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
+		}
+		if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
+			return Job{}, err
 		}
 		job, err := getJobByID(ctx, tx, jobID)
 		if err != nil {
@@ -961,7 +1052,34 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 		}
 		return job, nil
 	}
-	now := canonicalTime(s.clock.Now())
+	if attempt.state == contract.AttemptLost {
+		lateEvidence := LateResultEvidence{
+			Kind: LateResultObservation, Result: &request.Result, Late: true,
+			ObservedAt: now, AuthorityLostAt: attempt.updatedAt,
+		}
+		if now.After(attempt.updatedAt.Add(s.lateEvidenceWindow)) {
+			lateEvidence.Kind = LateResultGapKind
+			lateEvidence.Result = nil
+			lateEvidence.Gap = &LateResultGap{Reason: LateResultGapObservationWindowExpired}
+		}
+		lateResultJSON, err := json.Marshal(lateEvidence)
+		if err != nil {
+			return Job{}, internalError(err, "encode late result evidence")
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE attempts SET completion_key=?, completion_hash=?, late_result_json=?,
+			late_result_observed_ns=?, late_result_authority_lost_ns=?, late_result_is_late=1 WHERE attempt_id=?`,
+			request.IdempotencyKey, completionHash, lateResultJSON, now.UnixNano(), attempt.updatedAt.UnixNano(), attemptID)
+		if err != nil {
+			return Job{}, internalError(err, "record late completion evidence")
+		}
+		if err := tx.Commit(); err != nil {
+			return Job{}, internalError(err, "commit late completion evidence")
+		}
+		return Job{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
+	}
+	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
+		return Job{}, err
+	}
 	if !now.Before(attempt.leaseExpires) {
 		if err := expireAttempt(ctx, tx, attempt, now); err != nil {
 			return Job{}, err
@@ -986,8 +1104,8 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 			return Job{}, internalError(err, "acknowledge job execution")
 		}
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE attempts SET state=?, completion_key=?, completion_hash=?, updated_ns=? WHERE attempt_id=?`,
-		finalAttemptState, request.IdempotencyKey, completionHash, now.UnixNano(), attemptID)
+	_, err = tx.ExecContext(ctx, `UPDATE attempts SET state=?, completion_key=?, completion_hash=?, result_json=?, updated_ns=? WHERE attempt_id=?`,
+		finalAttemptState, request.IdempotencyKey, completionHash, resultJSON, now.UnixNano(), attemptID)
 	if err != nil {
 		return Job{}, internalError(err, "complete attempt")
 	}
@@ -1017,6 +1135,7 @@ type attemptAuthority struct {
 	state                      contract.AttemptState
 	fencingToken               string
 	leaseExpires               time.Time
+	updatedAt                  time.Time
 	currentAttempt             sql.NullString
 	completionKey              sql.NullString
 	completionHash             sql.NullString
@@ -1024,17 +1143,17 @@ type attemptAuthority struct {
 
 func readAttemptAuthority(ctx context.Context, q queryer, attemptID string) (attemptAuthority, error) {
 	var a attemptAuthority
-	var leaseNS int64
+	var leaseNS, updatedNS int64
 	err := q.QueryRowContext(ctx, `
 	SELECT a.attempt_id, a.job_id, a.node_id, n.identity_node_id, a.boot_session_id, n.boot_session_id,
 	       a.authority_generation, n.authority_generation, a.state, a.fencing_token,
-	       a.lease_expires_ns, j.current_attempt_id, a.completion_key, a.completion_hash
+	       a.lease_expires_ns, a.updated_ns, j.current_attempt_id, a.completion_key, a.completion_hash
 FROM attempts a
 JOIN jobs j ON j.job_id=a.job_id
 JOIN nodes n ON n.node_id=a.node_id
 	WHERE a.attempt_id=?`, attemptID).Scan(&a.attemptID, &a.jobID, &a.nodeID, &a.identityNodeID,
 		&a.bootSessionID, &a.currentBootSessionID, &a.authorityGeneration, &a.currentAuthorityGeneration,
-		&a.state, &a.fencingToken, &leaseNS, &a.currentAttempt, &a.completionKey, &a.completionHash)
+		&a.state, &a.fencingToken, &leaseNS, &updatedNS, &a.currentAttempt, &a.completionKey, &a.completionHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return attemptAuthority{}, protocolError(contract.ErrorAttemptNotFound, "attempt %q was not found", attemptID)
 	}
@@ -1042,6 +1161,7 @@ JOIN nodes n ON n.node_id=a.node_id
 		return attemptAuthority{}, internalError(err, "read attempt authority")
 	}
 	a.leaseExpires = time.Unix(0, leaseNS).UTC()
+	a.updatedAt = time.Unix(0, updatedNS).UTC()
 	return a, nil
 }
 

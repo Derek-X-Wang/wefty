@@ -91,9 +91,27 @@ checked in the same transaction as the write. Validation order is:
 6. apply the idempotent mutation.
 
 Log insertion records evidence rather than changing authority. It validates
-the original attempt provenance and fence but is not generation-fenced. The
-claimed-to-running promotion inside a log append is authority-changing and is
-therefore skipped after registration replacement.
+the original attempt's authenticated node, job, attempt ID, and per-attempt
+fencing token, but is not gated by the current job attempt, authority
+generation, or lease validity. A `lost` attempt accepts new in-sequence events
+as non-authoritative observation for 48 hours after authority loss. After that
+explicit window, L1 replaces each received raw event with a truthful per-stream
+`late_evidence_window_expired` gap; the independent 7-day service-log retention
+age remains a storage bound and therefore binds later. Neither path changes the
+job verdict, attempt verdict, current attempt, or authority generation.
+
+The claimed-to-running promotion block inside a log append remains in place
+because it is authority-changing. It runs only while the attempt still has
+current boot-session, generation, current-attempt, and lease authority; late
+observation always skips it.
+
+A gap declaration uses `LogEvent.sequence` as the first lost sequence and
+`gap.through_sequence` as the inclusive last sequence. Gaps advance continuity
+only for their declared stream. Agent spool eviction sends `spool_eviction`; an
+event larger than the entire service spool budget is converted whole into one
+`oversized_event` gap rather than chunked or partially retained. L1-generated
+window gaps include the source event's SHA-256 so identical raw replay is
+acknowledged while a conflicting replay still fails.
 
 The default heartbeat cadence is 15 seconds. A node becomes `stale` after 45
 seconds without a heartbeat and `dead` after 2 minutes; both thresholds are
@@ -139,14 +157,27 @@ visible with claims disabled.
 | Same idempotency identity has a different body | 409 | `idempotency_conflict` | false | No mutation. |
 
 Expiry never creates another attempt and never requeues the job in v0.1. A
-partitioned worker may still be running non-idempotent work, so any later write
-from it receives `lease_expired` or `stale_fence` and cannot alter state.
+partitioned node may still be running non-idempotent work, so later
+authority-changing writes receive `lease_expired` or `stale_fence` and cannot
+alter state. Evidence writes follow the provenance-only rules above.
 
 Log idempotency is keyed by `(attempt_id, stream, sequence)`. The same bytes and
 timestamp are replay-safe; a different event at an existing key is an
 `idempotency_conflict`. Ordering is guaranteed independently for `stdout` and
-`stderr`. A completion replay is safe only when its process result and protocol
+`stderr`; a declared gap advances only its own stream through its inclusive end
+sequence. A completion replay is safe only when its process result and protocol
 output digest match the accepted completion.
+
+An accepted completion writes the exact `ProcessResult` into
+`attempts.result_json` in the same transaction that finalizes the attempt and
+job. A completion reported after lease loss still returns `lease_expired` and
+never changes either verdict. During the 48-hour late-evidence window,
+`late_result_json` contains a discriminated `observation` wrapper carrying the
+result, `late=true`, `observed_at`, and the authority-loss timestamp. After the
+window it contains one aggregate `gap` wrapper, updated idempotently, recording
+that a completion report arrived too late to retain; it never stores the
+reported result. Conflicting late results remain idempotency errors. Restart
+classification never reads `late_result_json`.
 
 ## Dispatch key
 

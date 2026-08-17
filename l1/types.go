@@ -11,6 +11,7 @@ const (
 	DefaultClientPrincipalTag = "tag:wefty-client"
 	DefaultAgentPrincipalTag  = "tag:wefty-agent"
 	DefaultLeaseDuration      = 30 * time.Second
+	DefaultLateEvidenceWindow = 48 * time.Hour
 	DefaultNodeStaleAfter     = 45 * time.Second
 	DefaultNodeDeadAfter      = 2 * time.Minute
 	DefaultReconcileInterval  = time.Second
@@ -107,6 +108,34 @@ type CompletionRequest struct {
 	ProtocolOutputHash string        `json:"protocol_output_digest,omitempty"`
 }
 
+// LateResultEvidence is the non-authoritative completion fact retained after
+// an attempt is lost. Kind explicitly distinguishes a retained ProcessResult
+// from an aggregate marker saying a report arrived outside the observation
+// window; consumers never infer the arm from null fields.
+type LateResultEvidence struct {
+	Kind            LateResultEvidenceKind `json:"kind"`
+	Result          *ProcessResult         `json:"result,omitempty"`
+	Gap             *LateResultGap         `json:"gap,omitempty"`
+	Late            bool                   `json:"late"`
+	ObservedAt      time.Time              `json:"observed_at"`
+	AuthorityLostAt time.Time              `json:"authority_lost_at"`
+}
+
+type LateResultEvidenceKind string
+
+const (
+	LateResultObservation LateResultEvidenceKind = "observation"
+	LateResultGapKind     LateResultEvidenceKind = "gap"
+)
+
+type LateResultGap struct {
+	Reason LateResultGapReason `json:"reason"`
+}
+
+type LateResultGapReason string
+
+const LateResultGapObservationWindowExpired LateResultGapReason = "observation_window_expired"
+
 type ClaimRequest struct {
 	NodeID        string `json:"node_id"`
 	BootSessionID string `json:"boot_session_id"`
@@ -140,10 +169,10 @@ type ReconcileResult struct {
 	DeadNodes       int64 `json:"dead_nodes"`
 }
 
-// AppendLogsRequest is one fenced, idempotent upload batch. Event identity is
-// the tuple (attempt_id, stream, sequence); the reader cursor is intentionally
-// absent because upload acknowledgements and polling position are separate
-// protocol concepts.
+// AppendLogsRequest is one provenance-authenticated, idempotent upload batch.
+// Event identity is the tuple (attempt_id, stream, sequence); the reader cursor
+// is intentionally absent because upload acknowledgements and polling position
+// are separate protocol concepts.
 type AppendLogsRequest struct {
 	FencingToken string              `json:"fencing_token"`
 	Events       []contract.LogEvent `json:"events"`

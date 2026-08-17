@@ -15,7 +15,12 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 )
 
-func TestLeaseExpiryReaperFencesAttemptWithoutRequeue(t *testing.T) {
+func TestLeaseExpiryRetainsPostAuthorityEvidenceWithoutRequeue(t *testing.T) {
+	assertDurablePostAuthorityEvidence(t)
+}
+
+func assertDurablePostAuthorityEvidence(t *testing.T) {
+	t.Helper()
 	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}, "node-2": {"linux"}})
 	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
 	agent1 := h.client(fabric.Identity{NodeID: "fabric-node-1", Tags: []string{DefaultAgentPrincipalTag}})
@@ -47,18 +52,68 @@ func TestLeaseExpiryReaperFencesAttemptWithoutRequeue(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("identical expired log replay status = %d body=%s", status, body)
 	}
+	type authoritySnapshot struct {
+		jobState                   contract.JobState
+		attemptState               contract.AttemptState
+		currentAttempt             string
+		attemptAuthorityGeneration int64
+		nodeAuthorityGeneration    int64
+	}
+	readAuthority := func() authoritySnapshot {
+		t.Helper()
+		var snapshot authoritySnapshot
+		if err := h.store.db.QueryRow(`SELECT j.state, a.state, j.current_attempt_id,
+			a.authority_generation, n.authority_generation
+			FROM jobs j JOIN attempts a ON a.attempt_id=j.current_attempt_id
+			JOIN nodes n ON n.node_id=a.node_id WHERE j.job_id=?`, job.JobID).Scan(
+			&snapshot.jobState, &snapshot.attemptState, &snapshot.currentAttempt,
+			&snapshot.attemptAuthorityGeneration, &snapshot.nodeAuthorityGeneration); err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
+	beforeObservation := readAuthority()
 	lateLog := AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: []contract.LogEvent{{
 		AttemptID: claim.Lease.AttemptID, Stream: contract.LogStdout, Sequence: 1,
-		Timestamp: h.clock.Now(), Bytes: []byte("must-not-append\n"),
+		Timestamp: h.clock.Now(), Bytes: []byte("accepted-after-authority-loss\n"),
 	}}}
+
+	rejected := AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: []contract.LogEvent{{
+		AttemptID: claim.Lease.AttemptID, Stream: contract.LogStdout, Sequence: 2,
+		Timestamp: h.clock.Now(), Bytes: []byte("rejected-provenance\n"),
+	}}}
+	wrongFence := rejected
+	wrongFence.FencingToken += "-stale"
+	status, _, body = h.do(agent1, http.MethodPost, logPath, wrongFence)
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorStaleFence)
+	status, _, body = h.do(agent2, http.MethodPost, logPath, rejected)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorAttemptNotOwned)
+	wrongJobPath := fmt.Sprintf("/v1/agent/jobs/%s-mismatch/attempts/%s/logs", job.JobID, claim.Lease.AttemptID)
+	status, _, body = h.do(agent1, http.MethodPost, wrongJobPath, rejected)
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorAttemptMismatch)
+	wrongSequence := rejected
+	wrongSequence.Events = []contract.LogEvent{{
+		AttemptID: claim.Lease.AttemptID, Stream: contract.LogStdout, Sequence: 3,
+		Timestamp: h.clock.Now(), Bytes: []byte("rejected-sequence\n"),
+	}}
+	status, _, body = h.do(agent1, http.MethodPost, logPath, wrongSequence)
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
+
+	// DELIBERATE CONTRACT INVERSION (#57 §8.4): a `lost` attempt with matching provenance and the next sequence accepts the event as observation; the row count grows
+	// Restoring the old assertion reintroduces the boot crash-loop, in which a machine that rebooted overnight cannot rejoin until a human deletes its spool file.
 	status, _, body = h.do(agent1, http.MethodPost, logPath, lateLog)
-	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorLeaseExpired)
+	if status != http.StatusOK {
+		t.Fatalf("lost-attempt observation status = %d body=%s", status, body)
+	}
 	var logRows int
 	if err := h.store.db.QueryRow("SELECT count(*) FROM log_events WHERE job_id=?", job.JobID).Scan(&logRows); err != nil {
 		t.Fatal(err)
 	}
-	if logRows != 1 {
-		t.Fatalf("log rows after expired append = %d, want 1", logRows)
+	if logRows != 2 {
+		t.Fatalf("log rows after lost-attempt observation = %d, want 2", logRows)
+	}
+	if afterObservation := readAuthority(); afterObservation != beforeObservation {
+		t.Fatalf("observation changed authority: before=%+v after=%+v", beforeObservation, afterObservation)
 	}
 
 	completionPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", job.JobID, claim.Lease.AttemptID)
@@ -67,6 +122,39 @@ func TestLeaseExpiryReaperFencesAttemptWithoutRequeue(t *testing.T) {
 		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "late-completion", Result: ProcessResult{ExitCode: &exitCode},
 	})
 	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorLeaseExpired)
+	var resultJSON, lateResultJSON []byte
+	var observedNS, authorityLostNS int64
+	var isLate bool
+	if err := h.store.db.QueryRow(`SELECT result_json, late_result_json, late_result_observed_ns,
+		late_result_authority_lost_ns, late_result_is_late FROM attempts WHERE attempt_id=?`, claim.Lease.AttemptID).
+		Scan(&resultJSON, &lateResultJSON, &observedNS, &authorityLostNS, &isLate); err != nil {
+		t.Fatal(err)
+	}
+	if resultJSON != nil {
+		t.Fatalf("late completion occupied authoritative result_json: %s", resultJSON)
+	}
+	var lateEvidence LateResultEvidence
+	if err := json.Unmarshal(lateResultJSON, &lateEvidence); err != nil {
+		t.Fatalf("decode late result evidence %q: %v", lateResultJSON, err)
+	}
+	if lateEvidence.Kind != LateResultObservation || !lateEvidence.Late || lateEvidence.Result == nil ||
+		lateEvidence.Result.ExitCode == nil || *lateEvidence.Result.ExitCode != 0 || lateEvidence.Gap != nil ||
+		!lateEvidence.ObservedAt.Equal(h.clock.Now()) || !lateEvidence.AuthorityLostAt.Equal(h.clock.Now()) {
+		t.Fatalf("late result evidence = %#v", lateEvidence)
+	}
+	if !isLate || observedNS != lateEvidence.ObservedAt.UnixNano() || authorityLostNS != lateEvidence.AuthorityLostAt.UnixNano() {
+		t.Fatalf("late result metadata = is_late:%t observed:%d lost:%d", isLate, observedNS, authorityLostNS)
+	}
+	status, _, body = h.do(agent1, http.MethodPost, completionPath, CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "late-completion", Result: ProcessResult{ExitCode: &exitCode},
+	})
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorLeaseExpired)
+	conflictingExitCode := 1
+	status, _, body = h.do(agent1, http.MethodPost, completionPath, CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "late-completion", Result: ProcessResult{ExitCode: &conflictingExitCode},
+	})
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorIdempotencyConflict)
+	assertJobAndAttemptState(t, h.store, job.JobID, claim.Lease.AttemptID, contract.JobFailed, contract.AttemptLost)
 
 	status, _, body = h.do(agent2, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-2", BootSessionID: "boot-node-2"})
 	if status != http.StatusNoContent {

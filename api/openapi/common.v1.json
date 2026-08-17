@@ -82,10 +82,38 @@
           }
         }
       },
+      "LogGap": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["through_sequence", "lost_event_count", "lost_byte_count", "reason"],
+        "properties": {
+          "through_sequence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9223372036854775807,
+            "description": "Inclusive last sequence covered by this per-stream gap. LogEvent.sequence is the first covered sequence."
+          },
+          "lost_event_count": { "type": "integer", "minimum": 1 },
+          "lost_byte_count": { "type": "integer", "minimum": 1 },
+          "reason": {
+            "enum": ["spool_eviction", "oversized_event", "late_evidence_window_expired"]
+          },
+          "source_event_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Present when L1 replaces an out-of-window event with a gap so exact replay remains distinguishable from conflicting payloads."
+          }
+        },
+        "description": "A truthful declaration that raw log events from exactly one stream are unavailable. A source event larger than the entire service spool budget is converted whole into one oversized_event gap; it is not partially retained or chunked at eviction time."
+      },
       "LogEvent": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["attempt_id", "stream", "sequence", "timestamp", "bytes"],
+        "required": ["attempt_id", "stream", "sequence", "timestamp"],
+        "oneOf": [
+          { "required": ["bytes"], "not": { "required": ["gap"] } },
+          { "required": ["gap"], "not": { "required": ["bytes"] } }
+        ],
         "properties": {
           "attempt_id": { "type": "string" },
           "stream": { "enum": ["stdout", "stderr"] },
@@ -95,8 +123,10 @@
             "type": "string",
             "contentEncoding": "base64",
             "description": "One non-empty raw byte chunk, up to 4 MiB before base64 encoding. Chunks are not lines: values may exceed 64 KiB, end with a partial line, or contain invalid UTF-8. Ordering is guaranteed per attempt and stream only."
-          }
-        }
+          },
+          "gap": { "$ref": "#/components/schemas/LogGap" }
+        },
+        "description": "One ordered raw chunk or gap declaration. Continuity and gap ranges are independent for stdout and stderr."
       },
       "ProcessResult": {
         "type": "object",

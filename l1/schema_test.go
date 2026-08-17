@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
@@ -16,6 +17,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 	defer store.Close()
 
 	wantColumns := map[string][]string{
+		"log_events": {"sequence_end"},
 		"nodes": {
 			"max_oneshot_slots", "max_service_slots", "authority_generation", "claims_enabled",
 			"intent_revision", "intent_reason", "intent_updated_at", "intent_actor",
@@ -59,6 +61,17 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 	}
 	if secureDelete != 1 {
 		t.Fatalf("secure_delete = %d, want 1", secureDelete)
+	}
+}
+
+func TestStoreConfiguresLateEvidenceWindowIndependently(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "late-window.sqlite"), StoreOptions{LateEvidenceWindow: 6 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if store.lateEvidenceWindow != 6*time.Hour {
+		t.Fatalf("late evidence window = %s, want 6h", store.lateEvidenceWindow)
 	}
 }
 

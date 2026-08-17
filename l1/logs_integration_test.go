@@ -176,7 +176,7 @@ func TestStaleFenceCannotAppendLogs(t *testing.T) {
 	path := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/logs", job.JobID, claim.Lease.AttemptID)
 	status, _, body := h.do(agentClient, http.MethodPost, path, AppendLogsRequest{
 		FencingToken: claim.Lease.FencingToken + "-stale",
-		Events:       []contract.LogEvent{logEvent(claim.Lease.AttemptID, contract.LogStdout, 0, []byte("must-not-append"))},
+		Events:       []contract.LogEvent{logEvent(claim.Lease.AttemptID, contract.LogStdout, 0, []byte("stale-fence-rejected"))},
 	})
 	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorStaleFence)
 	var count int
