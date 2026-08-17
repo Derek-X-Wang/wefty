@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -162,37 +163,51 @@ func (s *Store) nodeSessionError(ctx context.Context, nodeID, identityNodeID, bo
 	}
 }
 
-// DrainNodeByOperator idempotently drains the current registration for a
-// stable node. Unlike the agent route, caller authorization comes from the L1
-// client protocol, so the operator does not need the node's boot session.
-func (s *Store) DrainNodeByOperator(ctx context.Context, nodeID string) (Node, error) {
+// SetNodeClaimsByOperator conditionally changes durable operator intent. The
+// CAS is deliberately independent of node liveness so work can be forbidden
+// while a node is dead, without fencing attempts already in progress.
+func (s *Store) SetNodeClaimsByOperator(ctx context.Context, nodeID, actor string, request NodeIntentRequest) (Node, error) {
 	if nodeID == "" {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "node_id is required")
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET state=?
-		WHERE node_id=? AND state IN (?, ?, ?)`,
-		contract.NodeDraining, nodeID,
-		contract.NodeAlive, contract.NodeStale, contract.NodeDraining)
+	if request.IntentRevision < 0 {
+		return Node{}, protocolError(contract.ErrorInvalidRequest, "intent_revision must be non-negative")
+	}
+	if strings.TrimSpace(request.Reason) == "" || strings.TrimSpace(actor) == "" {
+		return Node{}, protocolError(contract.ErrorInvalidRequest, "intent reason and actor are required")
+	}
+	now := canonicalTime(s.clock.Now())
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Node{}, internalError(err, "operator drain node")
+		return Node{}, internalError(err, "begin operator intent mutation")
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE nodes
+		SET claims_enabled=?, intent_revision=intent_revision+1, intent_reason=?, intent_updated_at=?, intent_actor=?
+		WHERE node_id=? AND intent_revision=?`, request.ClaimsEnabled, strings.TrimSpace(request.Reason), now.UnixNano(), strings.TrimSpace(actor), nodeID, request.IntentRevision)
+	if err != nil {
+		return Node{}, internalError(err, "write operator node intent")
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		return Node{}, internalError(err, "read operator node drain result")
+		return Node{}, internalError(err, "read operator node intent result")
 	}
 	if changed == 0 {
-		_, readErr := getNode(ctx, s.db, nodeID)
+		_, readErr := getNode(ctx, tx, nodeID)
 		if errors.Is(readErr, sql.ErrNoRows) {
 			return Node{}, protocolError(contract.ErrorNotFound, "node %q was not found", nodeID)
 		}
 		if readErr != nil {
-			return Node{}, internalError(readErr, "read operator drain target")
+			return Node{}, internalError(readErr, "read operator intent target")
 		}
-		return Node{}, protocolError(contract.ErrorConflict, "node %q state does not permit draining", nodeID)
+		return Node{}, protocolError(contract.ErrorConflict, "node %q intent revision has changed", nodeID)
 	}
-	node, err := getNode(ctx, s.db, nodeID)
+	node, err := getNode(ctx, tx, nodeID)
 	if err != nil {
-		return Node{}, internalError(err, "read operator-draining node")
+		return Node{}, internalError(err, "read updated operator intent")
+	}
+	if err := tx.Commit(); err != nil {
+		return Node{}, internalError(err, "commit operator intent mutation")
 	}
 	return node, nil
 }

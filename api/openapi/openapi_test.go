@@ -152,10 +152,19 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	nodeParts := node["allOf"].([]any)
 	nodeProjection := object(t, nodeParts[1], "Node.allOf[1]")
 	nodeProperties := object(t, nodeProjection["properties"], "Node.properties")
-	for _, field := range []string{"max_oneshot_slots", "max_service_slots"} {
+	for _, field := range []string{
+		"max_oneshot_slots", "max_service_slots", "authority_generation", "claims_enabled",
+		"intent_revision", "intent_reason", "intent_updated_at", "intent_actor",
+	} {
 		if _, ok := nodeProperties[field]; !ok {
 			t.Errorf("Node response missing authoritative %s", field)
 		}
+	}
+
+	client := readObject(t, "l1-client.v1.json")
+	clientPaths := object(t, client["paths"], "paths")
+	if _, ok := clientPaths["/v1/nodes/{node_id}/claims"]; !ok {
+		t.Error("client protocol is missing the durable node-claims intent route")
 	}
 }
 

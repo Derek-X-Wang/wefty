@@ -363,7 +363,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 
 // RegisterNode records a boot session and replaces its eligibility policy with
 // the canonical operator-configured policy supplied by the server.
-func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, registration contract.NodeRegistration, policy NodePolicy) (Node, error) {
+func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, registration contract.NodeRegistration, policy NodePolicy, operatorExpected bool) (Node, error) {
 	if registration.NodeID == "" || registration.BootSessionID == "" || registration.OS == "" || registration.Architecture == "" || registration.AgentVersion == "" {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "node registration fields must be non-empty")
 	}
@@ -396,8 +396,8 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `
-INSERT INTO nodes(node_id, identity_node_id, boot_session_id, os, architecture, agent_version, capabilities_json, state, last_heartbeat_ns, max_oneshot_slots, max_service_slots)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO nodes(node_id, identity_node_id, boot_session_id, os, architecture, agent_version, capabilities_json, state, last_heartbeat_ns, max_oneshot_slots, max_service_slots, authority_generation, claims_enabled)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
 ON CONFLICT(node_id) DO UPDATE SET
   boot_session_id=excluded.boot_session_id,
   os=excluded.os,
@@ -407,10 +407,11 @@ ON CONFLICT(node_id) DO UPDATE SET
   state=excluded.state,
 	last_heartbeat_ns=excluded.last_heartbeat_ns,
 	max_oneshot_slots=excluded.max_oneshot_slots,
-	max_service_slots=excluded.max_service_slots
+	max_service_slots=excluded.max_service_slots,
+	authority_generation=nodes.authority_generation+1
 WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, identity.NodeID, registration.BootSessionID,
 		registration.OS, registration.Architecture, registration.AgentVersion, capabilities, contract.NodeAlive, now.UnixNano(),
-		policy.MaxOneshotSlots, policy.MaxServiceSlots)
+		policy.MaxOneshotSlots, policy.MaxServiceSlots, operatorExpected)
 	if err != nil {
 		return Node{}, internalError(err, "store node registration")
 	}
@@ -429,14 +430,14 @@ WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, id
 			return Node{}, internalError(err, "store node tag")
 		}
 	}
+	node, err := getNode(ctx, tx, registration.NodeID)
+	if err != nil {
+		return Node{}, internalError(err, "read registered node")
+	}
 	if err := tx.Commit(); err != nil {
 		return Node{}, internalError(err, "commit node registration")
 	}
-	registration.Capabilities = nonNilCapabilities(registration.Capabilities)
-	return Node{
-		NodeRegistration: registration, State: contract.NodeAlive, AuthoritativeTags: tags,
-		MaxOneshotSlots: policy.MaxOneshotSlots, MaxServiceSlots: policy.MaxServiceSlots, LastHeartbeatAt: now,
-	}, nil
+	return node, nil
 }
 
 func (s *Store) HeartbeatNode(ctx context.Context, identityNodeID, nodeID, bootSessionID string) (Node, error) {
@@ -476,7 +477,10 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	var nodeState contract.NodeState
 	var storedIdentity, storedBoot string
 	var heartbeatNS int64
-	err = tx.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state, last_heartbeat_ns FROM nodes WHERE node_id=?", nodeID).Scan(&storedIdentity, &storedBoot, &nodeState, &heartbeatNS)
+	var authorityGeneration int64
+	var claimsEnabled bool
+	err = tx.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state, last_heartbeat_ns, authority_generation, claims_enabled FROM nodes WHERE node_id=?", nodeID).
+		Scan(&storedIdentity, &storedBoot, &nodeState, &heartbeatNS, &authorityGeneration, &claimsEnabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, protocolError(contract.ErrorNodeNotRegistered, "node %q is not registered", nodeID)
 	}
@@ -507,6 +511,9 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 			return nil, protocolError(contract.ErrorConflict, "node %q is not alive", nodeID)
 		}
 	}
+	if !claimsEnabled {
+		return nil, protocolError(contract.ErrorNodeDraining, "node %q has claims disabled by operator intent", nodeID)
+	}
 
 	leaseExpires := canonicalTime(now.Add(s.leaseDuration))
 	attemptID := newID("attempt")
@@ -519,8 +526,14 @@ UPDATE jobs
 SET state=?, current_attempt_id=?, fence_counter=fence_counter+1, updated_ns=?
 WHERE job_id=(
   SELECT j.job_id FROM jobs j
-  WHERE j.state=?
-    AND NOT EXISTS (
+	  WHERE j.state=?
+	    AND NOT EXISTS (
+	      SELECT 1 FROM attempts prior
+	      WHERE prior.node_id=?
+	        AND prior.boot_session_id<>?
+	        AND prior.state IN (?, ?, ?)
+	    )
+	    AND NOT EXISTS (
       SELECT 1 FROM job_tags jt
       WHERE jt.job_id=j.job_id
         AND NOT EXISTS (
@@ -531,7 +544,9 @@ WHERE job_id=(
   LIMIT 1
 )
 AND state=?
-RETURNING job_id, spec_json, fence_counter, created_ns`, contract.JobClaimed, attemptID, now.UnixNano(), contract.JobQueued, nodeID, contract.JobQueued).
+	RETURNING job_id, spec_json, fence_counter, created_ns`, contract.JobClaimed, attemptID, now.UnixNano(), contract.JobQueued,
+		nodeID, bootSessionID, contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput,
+		nodeID, contract.JobQueued).
 		Scan(&jobID, &specJSON, &fence, &createdNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
@@ -544,9 +559,9 @@ RETURNING job_id, spec_json, fence_counter, created_ns`, contract.JobClaimed, at
 	}
 	fencingToken := strconv.FormatInt(fence, 10)
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO attempts(attempt_id, job_id, node_id, boot_session_id, state, fencing_token, lease_expires_ns, created_ns, updated_ns)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, attemptID, jobID, nodeID, bootSessionID, contract.AttemptClaimed,
-		fencingToken, leaseExpires.UnixNano(), now.UnixNano(), now.UnixNano())
+	INSERT INTO attempts(attempt_id, job_id, node_id, boot_session_id, state, fencing_token, lease_expires_ns, authority_generation, created_ns, updated_ns)
+	VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, attemptID, jobID, nodeID, bootSessionID, contract.AttemptClaimed,
+		fencingToken, leaseExpires.UnixNano(), authorityGeneration, now.UnixNano(), now.UnixNano())
 	if err != nil {
 		return nil, internalError(err, "create claimed attempt")
 	}
@@ -673,9 +688,10 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 	if err != nil {
 		return AppendLogsResponse{}, err
 	}
-	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
+	if err := validateAttemptEvidence(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 		return AppendLogsResponse{}, err
 	}
+	hasAuthority := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt) == nil
 
 	type eventKey struct {
 		stream   contract.LogStream
@@ -778,7 +794,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence, ev
 	if _, err := tx.ExecContext(ctx, "UPDATE job_log_jsonl SET jsonl=jsonl || ? WHERE job_id=?", appendedJSONL.Bytes(), jobID); err != nil {
 		return AppendLogsResponse{}, internalError(err, "append authoritative job JSONL")
 	}
-	if attempt.state == contract.AttemptClaimed {
+	if attempt.state == contract.AttemptClaimed && hasAuthority {
 		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=?, updated_ns=? WHERE attempt_id=?", contract.AttemptRunning, now.UnixNano(), attemptID); err != nil {
 			return AppendLogsResponse{}, internalError(err, "mark logging attempt running")
 		}
@@ -990,29 +1006,35 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 }
 
 type attemptAuthority struct {
-	attemptID      string
-	jobID          string
-	nodeID         string
-	identityNodeID string
-	state          contract.AttemptState
-	fencingToken   string
-	leaseExpires   time.Time
-	currentAttempt sql.NullString
-	completionKey  sql.NullString
-	completionHash sql.NullString
+	attemptID                  string
+	jobID                      string
+	nodeID                     string
+	identityNodeID             string
+	bootSessionID              string
+	currentBootSessionID       string
+	authorityGeneration        int64
+	currentAuthorityGeneration int64
+	state                      contract.AttemptState
+	fencingToken               string
+	leaseExpires               time.Time
+	currentAttempt             sql.NullString
+	completionKey              sql.NullString
+	completionHash             sql.NullString
 }
 
 func readAttemptAuthority(ctx context.Context, q queryer, attemptID string) (attemptAuthority, error) {
 	var a attemptAuthority
 	var leaseNS int64
 	err := q.QueryRowContext(ctx, `
-SELECT a.attempt_id, a.job_id, a.node_id, n.identity_node_id, a.state, a.fencing_token,
-       a.lease_expires_ns, j.current_attempt_id, a.completion_key, a.completion_hash
+	SELECT a.attempt_id, a.job_id, a.node_id, n.identity_node_id, a.boot_session_id, n.boot_session_id,
+	       a.authority_generation, n.authority_generation, a.state, a.fencing_token,
+	       a.lease_expires_ns, j.current_attempt_id, a.completion_key, a.completion_hash
 FROM attempts a
 JOIN jobs j ON j.job_id=a.job_id
 JOIN nodes n ON n.node_id=a.node_id
-WHERE a.attempt_id=?`, attemptID).Scan(&a.attemptID, &a.jobID, &a.nodeID, &a.identityNodeID, &a.state,
-		&a.fencingToken, &leaseNS, &a.currentAttempt, &a.completionKey, &a.completionHash)
+	WHERE a.attempt_id=?`, attemptID).Scan(&a.attemptID, &a.jobID, &a.nodeID, &a.identityNodeID,
+		&a.bootSessionID, &a.currentBootSessionID, &a.authorityGeneration, &a.currentAuthorityGeneration,
+		&a.state, &a.fencingToken, &leaseNS, &a.currentAttempt, &a.completionKey, &a.completionHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return attemptAuthority{}, protocolError(contract.ErrorAttemptNotFound, "attempt %q was not found", attemptID)
 	}
@@ -1024,11 +1046,24 @@ WHERE a.attempt_id=?`, attemptID).Scan(&a.attemptID, &a.jobID, &a.nodeID, &a.ide
 }
 
 func validateAttemptAuthority(identityNodeID, jobID, attemptID, fencingToken string, a attemptAuthority) error {
+	if err := validateAttemptEvidence(identityNodeID, jobID, attemptID, fencingToken, a); err != nil {
+		return err
+	}
+	if a.bootSessionID != a.currentBootSessionID || a.authorityGeneration != a.currentAuthorityGeneration {
+		return protocolError(contract.ErrorNodeSessionReplaced, "attempt authority belongs to a replaced node registration")
+	}
+	if !a.currentAttempt.Valid || a.currentAttempt.String != attemptID {
+		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's current attempt")
+	}
+	return nil
+}
+
+func validateAttemptEvidence(identityNodeID, jobID, attemptID, fencingToken string, a attemptAuthority) error {
 	if a.identityNodeID != identityNodeID {
 		return protocolError(contract.ErrorAttemptNotOwned, "authenticated node does not own this attempt")
 	}
-	if a.jobID != jobID || !a.currentAttempt.Valid || a.currentAttempt.String != attemptID {
-		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's current attempt")
+	if a.jobID != jobID || a.attemptID != attemptID {
+		return protocolError(contract.ErrorAttemptMismatch, "attempt does not match the request path")
 	}
 	if a.fencingToken != fencingToken {
 		return protocolError(contract.ErrorStaleFence, "fencing token is stale")
@@ -1218,13 +1253,22 @@ func populateJob(job *Job, specJSON []byte, currentAttempt sql.NullString, creat
 	return nil
 }
 
-func getNode(ctx context.Context, q *sql.DB, nodeID string) (Node, error) {
+type nodeQueryer interface {
+	queryer
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	var node Node
 	var capabilitiesJSON []byte
 	var heartbeatNS int64
-	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, os, architecture, agent_version, capabilities_json, state, max_oneshot_slots, max_service_slots, last_heartbeat_ns
-FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.OS, &node.Architecture,
-		&node.AgentVersion, &capabilitiesJSON, &node.State, &node.MaxOneshotSlots, &node.MaxServiceSlots, &heartbeatNS)
+	var intentUpdatedNS sql.NullInt64
+	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, os, architecture, agent_version, capabilities_json, state, max_oneshot_slots, max_service_slots,
+	authority_generation, claims_enabled, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns
+	FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.OS, &node.Architecture,
+		&node.AgentVersion, &capabilitiesJSON, &node.State, &node.MaxOneshotSlots, &node.MaxServiceSlots,
+		&node.AuthorityGeneration, &node.ClaimsEnabled, &node.IntentRevision, &node.IntentReason, &intentUpdatedNS,
+		&node.IntentActor, &heartbeatNS)
 	if err != nil {
 		return Node{}, err
 	}
@@ -1250,6 +1294,10 @@ FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &no
 		node.AuthoritativeTags = []string{}
 	}
 	node.LastHeartbeatAt = time.Unix(0, heartbeatNS).UTC()
+	if intentUpdatedNS.Valid {
+		updatedAt := time.Unix(0, intentUpdatedNS.Int64).UTC()
+		node.IntentUpdatedAt = &updatedAt
+	}
 	return node, nil
 }
 

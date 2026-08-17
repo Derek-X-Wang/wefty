@@ -38,15 +38,18 @@ append logs, or complete. An expired attempt becomes `lost` exactly once.
 
 | State | Meaning | Allowed next states |
 | --- | --- | --- |
-| `alive` | Heartbeats are within the alive threshold and new claims are allowed. | `stale`, `draining`, `dead` |
+| `alive` | Heartbeats are within the alive threshold. New claims additionally require durable `claims_enabled=true` intent. | `stale`, `draining`, `dead` |
 | `stale` | Heartbeats exceed the stale threshold; new claims are forbidden. | `alive`, `draining`, `dead` |
-| `draining` | Operator requested drain; existing attempts may finish, new claims are forbidden. | `dead` |
+| `draining` | The current boot session is shutting down; existing attempts may finish and new claims are forbidden. | `dead` |
 | `dead` | Heartbeats exceed the dead threshold or the boot session ended. | `alive` |
 
 Registration carries stable node ID and per-boot session ID. A `dead` node may
 become `alive` only through registration of the current boot session. Routing
 tags are authenticated Fabric/control-plane data, never node-reported state.
 Node heartbeat updates node liveness only and does not renew attempt leases.
+Operator claim intent is not a node state: it is durable across registration,
+may be changed while the node is dead, and does not revoke authority already
+bound into a live attempt.
 
 ## Run
 

@@ -70,11 +70,17 @@ type Claim struct {
 // Node is the registered node record returned by the agent protocol.
 type Node struct {
 	contract.NodeRegistration
-	State             contract.NodeState `json:"state"`
-	AuthoritativeTags []string           `json:"authoritative_tags"`
-	MaxOneshotSlots   int                `json:"max_oneshot_slots"`
-	MaxServiceSlots   int                `json:"max_service_slots"`
-	LastHeartbeatAt   time.Time          `json:"last_heartbeat_at"`
+	State               contract.NodeState `json:"state"`
+	AuthoritativeTags   []string           `json:"authoritative_tags"`
+	MaxOneshotSlots     int                `json:"max_oneshot_slots"`
+	MaxServiceSlots     int                `json:"max_service_slots"`
+	AuthorityGeneration int64              `json:"authority_generation"`
+	ClaimsEnabled       bool               `json:"claims_enabled"`
+	IntentRevision      int64              `json:"intent_revision"`
+	IntentReason        string             `json:"intent_reason"`
+	IntentUpdatedAt     *time.Time         `json:"intent_updated_at"`
+	IntentActor         string             `json:"intent_actor"`
+	LastHeartbeatAt     time.Time          `json:"last_heartbeat_at"`
 }
 
 // NodeList is the L1 client representation of the operator-visible fleet.
@@ -116,6 +122,14 @@ type HeartbeatRequest struct {
 
 type DrainRequest struct {
 	BootSessionID string `json:"boot_session_id"`
+}
+
+// NodeIntentRequest is an operator CAS over the durable claim-admission bit.
+// IntentRevision is the revision observed in the node projection.
+type NodeIntentRequest struct {
+	ClaimsEnabled  bool   `json:"claims_enabled"`
+	IntentRevision int64  `json:"intent_revision"`
+	Reason         string `json:"reason"`
 }
 
 // ReconcileResult reports the durable transitions won by one reconciliation

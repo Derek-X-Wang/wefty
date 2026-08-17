@@ -176,6 +176,7 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.notImplemented)
 	client.HandleFunc("GET /v1/nodes", s.listNodes)
 	client.HandleFunc("POST /v1/nodes/{node_id}/drain", s.operatorDrainNode)
+	client.HandleFunc("POST /v1/nodes/{node_id}/claims", s.setNodeClaims)
 
 	agent := http.NewServeMux()
 	agent.HandleFunc("POST /v1/agent/nodes/register", s.registerNode)
@@ -209,7 +210,30 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) operatorDrainNode(w http.ResponseWriter, r *http.Request) {
-	node, err := s.store.DrainNodeByOperator(r.Context(), r.PathValue("node_id"))
+	var request NodeIntentRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	if request.ClaimsEnabled {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "drain requires claims_enabled=false"))
+		return
+	}
+	s.writeNodeIntent(w, r, request)
+}
+
+func (s *Server) setNodeClaims(w http.ResponseWriter, r *http.Request) {
+	var request NodeIntentRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	s.writeNodeIntent(w, r, request)
+}
+
+func (s *Server) writeNodeIntent(w http.ResponseWriter, r *http.Request, request NodeIntentRequest) {
+	identity := identityFromRequest(r)
+	node, err := s.store.SetNodeClaimsByOperator(r.Context(), r.PathValue("node_id"), identity.NodeID, request)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -295,7 +319,7 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 	if !configured {
 		policy = NodePolicy{MaxOneshotSlots: DefaultMaxOneshotSlots, MaxServiceSlots: DefaultMaxServiceSlots}
 	}
-	node, err := s.store.RegisterNode(r.Context(), identity, registration, policy)
+	node, err := s.store.RegisterNode(r.Context(), identity, registration, policy, configured)
 	if err != nil {
 		writeError(w, err)
 		return

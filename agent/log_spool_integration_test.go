@@ -250,7 +250,7 @@ func createClaimForDurableLogs(t *testing.T, store *l1.Store, clock Clock) l1.Cl
 	t.Helper()
 	_, err := store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-node"}, contract.NodeRegistration{
 		NodeID: "stable-node", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
-	}, l1.DefaultNodePolicy("linux"))
+	}, l1.DefaultNodePolicy("linux"), true)
 	if err != nil {
 		t.Fatal(err)
 	}

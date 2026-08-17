@@ -10,10 +10,11 @@ concern and does not replace the L1 Fabric principal boundary.
 
 ## Atomic claim and eligibility
 
-A claim is one SQLite transaction that selects a `queued` job whose normalized
-routing tags are a subset of the authenticated node's authoritative tags,
-creates an attempt, assigns a new fence, establishes a lease, and moves the job
-to `claimed`. Exactly one concurrent claimant commits.
+A claim is one SQLite transaction that verifies durable operator intent permits
+claims, selects a `queued` job whose normalized routing tags are a subset of
+the authenticated node's authoritative tags, creates an attempt, assigns a new
+fence, establishes a lease, and moves the job to `claimed`. Exactly one
+concurrent claimant commits.
 
 The request contains node ID and boot-session ID but no routing tags. The
 control plane obtains tags from authenticated Fabric identity plus operator
@@ -21,7 +22,12 @@ configuration. Nodes in `stale`, `dead`, or `draining` state cannot claim.
 The first registration binds the stable operator-facing node ID to the
 authenticated Fabric identity. Later boot sessions may replace that node row
 only from the same Fabric identity, so a transport-internal ID need not leak
-into node configuration and another peer cannot take over the stable ID.
+into node configuration and another peer cannot take over the stable ID. Each
+successful registration increments `authority_generation`; a claim binds the
+current generation into its attempt. A replacement boot is embargoed from
+claiming while a non-terminal attempt from another boot session remains. Lease
+expiry makes the old attempt terminal and clears that embargo without waiting
+for node death.
 
 The successful claim returns the write authority and both lease projections:
 
@@ -73,15 +79,21 @@ absent when no lifecycle change is requested. Node-scoped scheduling intent
 remains on the heartbeat response; it cannot conflict with this payload-scoped
 channel.
 
-Every renewal, log upload, and completion is authorized by the exact
-`(job_id, attempt_id, fencing_token)` tuple and is checked in the same
-transaction as the write. Validation order is:
+Every renewal and completion is authorized by the exact `(job_id, attempt_id,
+fencing_token)` tuple plus the attempt's boot session and authority generation,
+checked in the same transaction as the write. Validation order is:
 
 1. authenticate Fabric identity and verify node ownership;
 2. match job and current attempt;
 3. match the current fencing token;
-4. verify lease against the control-plane clock;
-5. apply the idempotent mutation.
+4. match the current boot session and authority generation;
+5. verify lease against the control-plane clock;
+6. apply the idempotent mutation.
+
+Log insertion records evidence rather than changing authority. It validates
+the original attempt provenance and fence but is not generation-fenced. The
+claimed-to-running promotion inside a log append is authority-changing and is
+therefore skipped after registration replacement.
 
 The default heartbeat cadence is 15 seconds. A node becomes `stale` after 45
 seconds without a heartbeat and `dead` after 2 minutes; both thresholds are
@@ -99,6 +111,22 @@ flushed, durable logs are acknowledged, and the idempotent completion request
 is retrying. Renewal stops only after L1 accepts completion or the agent loses
 attempt authority. A redaction, spool, or uploader finalization failure is
 reported as `output_error`, never as a successful exit code.
+
+## Durable operator intent
+
+Node liveness and operator intent are independent. `claims_enabled` controls
+whether `ClaimJob` may win new work and is checked in that same transaction;
+`intent_revision` is a separate CAS counter and never fences a live attempt.
+Registration increments authority generation but never changes
+`claims_enabled`, `intent_revision`, `intent_reason`, `intent_updated_at`, or
+`intent_actor` on an existing row.
+
+An operator intent write supplies the revision it observed and conflicts if the
+revision moved. The write is valid regardless of whether the node is alive,
+stale, draining, or dead, so an operator can forbid work before a dead node
+rejoins. A first registration is claims-enabled only when its stable node ID is
+present in operator-owned node policy; an unexpected node is registered and
+visible with claims disabled.
 
 ## Lease expiry and fencing errors
 
