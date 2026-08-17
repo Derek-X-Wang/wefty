@@ -1,4 +1,4 @@
-//go:build service_acceptance
+//go:build service_acceptance && (darwin || linux)
 
 package serviceacceptance
 
@@ -10,70 +10,35 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const servicePortEnvironment = "WEFTY_SERVICE_PORT"
 
-func TestEchoService(t *testing.T) {
-	root := repositoryRoot(t)
-	binary := filepath.Join(t.TempDir(), "wefty-echo-service")
-	build := exec.Command("go", "build", "-o", binary, "./cmd/wefty-echo-service")
-	build.Dir = root
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build echo service: %v\n%s", err, output)
-	}
-
+func TestServiceStartsAndAnswers(t *testing.T) {
+	harness := newAcceptanceHarness(t)
 	port := reservePort(t)
-	var processOutput bytes.Buffer
-	command := exec.Command(binary)
-	for _, entry := range os.Environ() {
-		if !strings.HasPrefix(entry, servicePortEnvironment+"=") {
-			command.Env = append(command.Env, entry)
-		}
-	}
-	command.Env = append(command.Env, fmt.Sprintf("%s=%d", servicePortEnvironment, port))
-	command.Stdout = &processOutput
-	command.Stderr = &processOutput
-	if err := command.Start(); err != nil {
-		t.Fatalf("start echo service: %v", err)
-	}
-	waited := make(chan error, 1)
-	go func() { waited <- command.Wait() }()
-	processExited := false
-	t.Cleanup(func() {
-		if processExited {
-			return
-		}
-		_ = command.Process.Kill()
-		<-waited
-	})
+	job := harness.submitEchoService(t, port)
 
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	client := &http.Client{Timeout: 5 * time.Second}
-	health := waitForHealth(t, client, baseURL, command, waited, &processExited, &processOutput)
-	if health.PID != command.Process.Pid {
-		t.Fatalf("health PID = %d, process PID = %d", health.PID, command.Process.Pid)
+	health := waitForHealth(t, client, baseURL, harness.agent)
+	running := harness.waitForJobState(t, job.JobID, contract.JobRunning, 5*time.Second)
+	if running.CurrentAttemptID == "" {
+		t.Fatal("running service has no attempt ID")
+	}
+	if health.PID == harness.agent.command.Process.Pid {
+		t.Fatalf("health PID = agent PID %d; payload was not a distinct child process", health.PID)
 	}
 
 	assertEcho(t, client, baseURL, []byte("echo acceptance"))
-	assertGracefulShutdown(t, baseURL, command, waited, &processExited, &processOutput)
-}
-
-func repositoryRoot(t *testing.T) string {
-	t.Helper()
-	_, filename, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate acceptance test source")
-	}
-	return filepath.Dir(filepath.Dir(filename))
+	assertGracefulShutdown(t, baseURL, health.PID, harness.agent)
+	harness.waitForJobState(t, job.JobID, contract.JobSucceeded, 5*time.Second)
 }
 
 func reservePort(t *testing.T) int {
@@ -93,19 +58,13 @@ func waitForHealth(
 	t *testing.T,
 	client *http.Client,
 	baseURL string,
-	command *exec.Cmd,
-	waited <-chan error,
-	processExited *bool,
-	processOutput *bytes.Buffer,
+	agent *managedProcess,
 ) struct{ PID int } {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		select {
-		case err := <-waited:
-			*processExited = true
-			t.Fatalf("echo service exited before healthy: %v\n%s", err, processOutput.String())
-		default:
+		if agent.exited() {
+			t.Fatalf("agent exited before service became healthy: %v\n%s", agent.waitError(), agent.outputString())
 		}
 		response, err := client.Get(baseURL + "/healthz")
 		if err == nil {
@@ -118,7 +77,7 @@ func waitForHealth(
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("echo service did not become healthy on injected port; PID %d\n%s", command.Process.Pid, processOutput.String())
+	t.Fatalf("echo service did not become healthy on injected port\n%s", agent.outputString())
 	return struct{ PID int }{}
 }
 
@@ -144,10 +103,8 @@ func assertEcho(t *testing.T, client *http.Client, baseURL string, payload []byt
 func assertGracefulShutdown(
 	t *testing.T,
 	baseURL string,
-	command *exec.Cmd,
-	waited <-chan error,
-	processExited *bool,
-	processOutput *bytes.Buffer,
+	payloadPID int,
+	agent *managedProcess,
 ) {
 	t.Helper()
 	connection, err := net.DialTimeout("tcp", strings.TrimPrefix(baseURL, "http://"), 5*time.Second)
@@ -187,14 +144,15 @@ func assertGracefulShutdown(
 		t.Fatalf("first streaming echo segment = %q, want %q", actualFirst, first)
 	}
 
-	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := syscall.Kill(payloadPID, syscall.SIGTERM); err != nil {
 		t.Fatalf("send SIGTERM: %v", err)
 	}
-	select {
-	case err := <-waited:
-		*processExited = true
-		t.Fatalf("echo service exited before its in-flight request completed: %v\n%s", err, processOutput.String())
-	case <-time.After(250 * time.Millisecond):
+	time.Sleep(250 * time.Millisecond)
+	if err := syscall.Kill(payloadPID, 0); err != nil {
+		t.Fatalf("echo service exited before its in-flight request completed: %v\n%s", err, agent.outputString())
+	}
+	if agent.exited() {
+		t.Fatalf("agent exited while the service handled SIGTERM: %v\n%s", agent.waitError(), agent.outputString())
 	}
 
 	if _, err := connection.Write(second); err != nil {
@@ -208,13 +166,16 @@ func assertGracefulShutdown(
 		t.Fatalf("second streaming echo segment = %q, want %q", actualSecond, second)
 	}
 
-	select {
-	case err := <-waited:
-		*processExited = true
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		err := syscall.Kill(payloadPID, 0)
 		if err != nil {
-			t.Fatalf("echo service shutdown: %v\n%s", err, processOutput.String())
+			if err == syscall.ESRCH {
+				return
+			}
+			t.Fatalf("check echo service PID %d: %v", payloadPID, err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("echo service did not exit after graceful shutdown\n%s", processOutput.String())
+		time.Sleep(20 * time.Millisecond)
 	}
+	t.Fatalf("echo service PID %d did not exit after graceful shutdown\n%s", payloadPID, agent.outputString())
 }
