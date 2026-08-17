@@ -135,6 +135,10 @@ func TestServiceAcceptancePluralDrainJoinsAllResidentAttempts(t *testing.T) {
 	assertDrainJoinsEveryResidentOneShotAttempt(t)
 }
 
+func TestServiceAcceptancePluralDrainJoinsServicesAndOneShots(t *testing.T) {
+	assertPluralServiceDrainJoinsAll(t)
+}
+
 func successfulAttempt(context.Context) (errorDestination, error) {
 	return errorDestinationUnclassified, nil
 }

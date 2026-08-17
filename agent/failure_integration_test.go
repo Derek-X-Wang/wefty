@@ -836,6 +836,220 @@ func TestAgentDrainFinishesRunningAttemptAndStopsClaiming(t *testing.T) {
 	}
 }
 
+func TestAgentShutdownFencesAttemptForImmediateSuccessor(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
+	defer stopServer()
+	first := createAgentTestJob(t, store, "shutdown-fenced-first")
+	second := createAgentTestJob(t, store, "shutdown-fenced-successor")
+	runner := newBlockingRunner()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	firstAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- firstAgent.Run(ctx) }()
+	runner.waitStarted(t)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("first agent shutdown = %v", err)
+	}
+	firstAgent.Close()
+	state, err := store.GetJob(context.Background(), first.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.State != contract.JobFailed || state.CurrentAttemptID == "" {
+		t.Fatalf("shutdown completion state = %#v, want terminal attempt", state)
+	}
+
+	secondRunner := instantResultRunner{}
+	secondAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-2", Version: "test", Runner: secondRunner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondAgent.Close()
+	secondCtx, stopSecond := context.WithCancel(context.Background())
+	defer stopSecond()
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- secondAgent.Run(secondCtx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got, err := store.GetJob(context.Background(), second.JobID); err == nil && got.State == contract.JobSucceeded {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	stopSecond()
+	if err := <-secondDone; err != nil {
+		t.Fatalf("successor shutdown = %v", err)
+	}
+	if got, err := store.GetJob(context.Background(), second.JobID); err != nil || got.State != contract.JobSucceeded {
+		t.Fatalf("successor job = %q, err=%v, want succeeded", got.State, err)
+	}
+}
+
+func TestAgentShutdownFinalizationUploadsLogs(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
+	defer stopServer()
+	job := createAgentTestJob(t, store, "shutdown-finalization-logs")
+	runner := newLoggingBlockingRunner()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	attemptID := runner.waitStarted(t)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("agent shutdown = %v", err)
+	}
+	nodeAgent.Close()
+	page, err := store.GetJobLogs(context.Background(), job.JobID, "", l1.MaxLogPageLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 1 || string(page.Events[0].Bytes) != "shutdown evidence" || page.Events[0].AttemptID != attemptID {
+		t.Fatalf("shutdown logs = %#v, want one finalized event for %s", page.Events, attemptID)
+	}
+}
+
+func assertPluralServiceDrainJoinsAll(t *testing.T) {
+	t.Helper()
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServerWithPolicies(t, network, nil, map[string]l1.NodePolicy{"node-1": {Tags: []string{"linux"}, MaxOneshotSlots: 2, MaxServiceSlots: 2}})
+	defer stopServer()
+	for i := 0; i < 2; i++ {
+		createAgentTestJob(t, store, fmt.Sprintf("plural-drain-one-shot-%d", i))
+	}
+	for i := 0; i < 2; i++ {
+		if _, _, err := store.CreateJob(context.Background(), contract.JobSpec{SchemaVersion: contract.SchemaVersionV1, DispatchKey: fmt.Sprintf("plural-drain-service-%d", i), Kind: "process", Class: contract.JobClassService, Restart: contract.RestartAlways, RoutingTags: []string{"linux"}, Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"}, WorkingDirectory: t.TempDir()}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := newSlotRefillRunner()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Runner: runner, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), ClaimInterval: 5 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, RenewalInterval: 50 * time.Millisecond, MaxOneshotSlots: 2, MaxServiceSlots: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	attempts := make([]string, 0, 4)
+	for len(attempts) < 4 {
+		attempts = append(attempts, runner.waitStarted(t))
+	}
+	drainCtx, stopDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopDrain()
+	if _, err := nodeAgent.Drain(drainCtx); err != nil {
+		t.Fatal(err)
+	}
+	for _, attemptID := range attempts {
+		runner.release(attemptID)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("plural service drain = %v", err)
+	}
+	if got := len(nodeAgent.Status().Attempts); got != 0 {
+		t.Fatalf("resident attempts after plural drain = %d", got)
+	}
+}
+
+func TestAgentConsumesRenewalDirectivesWithoutDaemonExit(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
+	defer stopServer()
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, _, err := store.CreateJob(context.Background(), contract.JobSpec{SchemaVersion: contract.SchemaVersionV1, DispatchKey: "directive-service", Kind: "process", Class: contract.JobClassService, Restart: contract.RestartAlways, RoutingTags: []string{"linux"}, Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"}, WorkingDirectory: t.TempDir()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := newDirectiveRunner()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Runner: runner, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), RenewalInterval: 20 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, MaxServiceSlots: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	runner.waitStarted(t)
+	if _, _, err := store.RestartService(context.Background(), service.JobID, l1.ServiceRestartRequest{IdempotencyKey: "directive-restart"}); err != nil {
+		t.Fatal(err)
+	}
+	runner.waitCanceled(t)
+	// The restart directive must be consumed by this fresh attempt; its
+	// completion returns the service to queued/restart-pending without
+	// terminating the daemon.
+	if _, err := waitForFailureJobState(store, service.JobID, contract.JobQueued, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if status := nodeAgent.Status(); status.State == LifecycleQuarantined {
+		t.Fatal("restart directive quarantined daemon")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("directive daemon exit = %v", err)
+	}
+}
+
+func TestAgentHeartbeatClaimsDisabledStopsNewClaims(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
+	defer stopServer()
+	first := createAgentTestJob(t, store, "claims-disabled-running")
+	second := createAgentTestJob(t, store, "claims-disabled-queued")
+	runner := newBlockingRunner()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Runner: runner, LogSpoolDirectory: t.TempDir(), HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, MaxOneshotSlots: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	runner.waitStarted(t)
+	if _, err := store.SetNodeClaimsByOperator(context.Background(), "node-1", "operator", l1.NodeIntentRequest{ClaimsEnabled: false, IntentRevision: 0, Reason: "maintenance"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if runner.starts.Load() != 1 {
+		t.Fatalf("claims-disabled starts = %d, want one resident attempt", runner.starts.Load())
+	}
+	queued, err := store.GetJob(context.Background(), second.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.State != contract.JobQueued {
+		t.Fatalf("claims-disabled queued job state = %q", queued.State)
+	}
+	runner.release()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("claims-disabled daemon exit = %v", err)
+	}
+	_ = first
+}
+
 func startFailureServer(t *testing.T, network *plain.Network, clock l1.Clock, nodeTags map[string][]string) (*l1.Store, func()) {
 	t.Helper()
 	policies := make(map[string]l1.NodePolicy, len(nodeTags))
@@ -955,6 +1169,76 @@ type resilienceRunner struct {
 	starts   map[string]int
 	started  chan string
 	canceled chan string
+}
+
+type loggingBlockingRunner struct {
+	started  chan string
+	canceled chan struct{}
+}
+
+func newLoggingBlockingRunner() *loggingBlockingRunner {
+	return &loggingBlockingRunner{started: make(chan string, 1), canceled: make(chan struct{})}
+}
+
+func (runner *loggingBlockingRunner) Run(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
+	if err := sink.WriteOutput(ctx, contract.LogEvent{AttemptID: request.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("shutdown evidence")}); err != nil {
+		return contract.ProcessResult{}, err
+	}
+	runner.started <- request.AttemptID
+	<-ctx.Done()
+	close(runner.canceled)
+	return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
+}
+
+func (runner *loggingBlockingRunner) waitStarted(t *testing.T) string {
+	t.Helper()
+	select {
+	case attemptID := <-runner.started:
+		return attemptID
+	case <-time.After(5 * time.Second):
+		t.Fatal("logging runner did not start")
+		return ""
+	}
+}
+
+type directiveRunner struct {
+	started  chan struct{}
+	canceled chan struct{}
+}
+
+func newDirectiveRunner() *directiveRunner {
+	return &directiveRunner{started: make(chan struct{}, 4), canceled: make(chan struct{}, 4)}
+}
+
+func (runner *directiveRunner) Run(ctx context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
+	runner.started <- struct{}{}
+	<-ctx.Done()
+	runner.canceled <- struct{}{}
+	return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
+}
+
+func (runner *directiveRunner) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-runner.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("directive runner did not start")
+	}
+}
+
+func (runner *directiveRunner) waitCanceled(t *testing.T) {
+	t.Helper()
+	select {
+	case <-runner.canceled:
+	case <-time.After(15 * time.Second):
+		t.Fatal("directive did not cancel payload")
+	}
 }
 
 type stubbornRunner struct {
