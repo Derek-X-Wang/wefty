@@ -71,7 +71,7 @@ func TestBatchingLogSinkRetriesTheIdenticalBatch(t *testing.T) {
 	}
 	defer client.Close()
 	claim := l1.Claim{
-		Job:   l1.Job{JobID: "job-batch"},
+		Job:   l1.Job{JobID: "job-batch", Spec: contract.JobSpec{Class: contract.JobClassOneShot}},
 		Lease: l1.AttemptLease{AttemptID: "attempt-batch", FencingToken: "fence-batch"},
 	}
 	spool, err := openLogSpool(t.TempDir(), "node-batch", 1<<20)

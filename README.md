@@ -59,16 +59,23 @@ npm run build
 
 Pre-1.0 schema changes are applied only to newly created databases; there is
 no migration mechanism: L1 and the agent's durable evidence schema are edited
-in place, with no `ALTER TABLE` compatibility path. If this state root came
-from an older checkout, stop the stack and delete the disposable L1 and
-agent-spool SQLite files (including their `-wal` and `-shm` sidecars) before
-restarting:
+in place, with no `ALTER TABLE` compatibility path. In particular, spool
+attempts now persist workload class so the 64 MiB one-shot budget and 32 MiB
+service ring remain distinct after restart. If this state root came from an
+older checkout, stop the stack and delete the disposable L1 and agent-spool
+SQLite files (including their `-wal` and `-shm` sidecars) before restarting:
 
 ```sh
 test -n "$WEFTY_STATE_ROOT"
 rm -f "$WEFTY_STATE_ROOT/l1.sqlite" "$WEFTY_STATE_ROOT/l1.sqlite-wal" "$WEFTY_STATE_ROOT/l1.sqlite-shm"
 find "$WEFTY_STATE_ROOT/agent-logs" -type f \( -name '*.sqlite' -o -name '*.sqlite-wal' -o -name '*.sqlite-shm' \) -delete 2>/dev/null || true
 ```
+
+The spool budgets are per-class aggregates across the node, not per-attempt
+quotas: 64 MiB for never-evicted one-shot output plus a 32 MiB service ring.
+This bounds raw pending payload at 96 MiB, but it also means a noisy service
+can ring-evict a quiet service's unacknowledged bytes (recorded as gaps), and a
+noisy one-shot can exhaust the shared budget and fail a sibling's output sink.
 
 Export the same four variables in three terminals, then start one process in
 each.
