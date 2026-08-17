@@ -201,6 +201,48 @@
         }
       }
     },
+    "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/publication": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } },
+        { "name": "attempt_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "put": {
+        "operationId": "setAttemptPublication",
+        "summary": "Set absolute publication state for one portful service attempt",
+        "description": "L1 derives the immutable published port from the service specification. The mutation is authorized in fenced-write order, is not replayable after terminalization, and leaves the database untouched when the stored publication already equals the requested state.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["fencing_token", "ready"],
+                "properties": {
+                  "fencing_token": { "type": "string", "minLength": 1 },
+                  "ready": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Publication changed or was already in the requested state.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "./common.v1.json#/components/schemas/Job" }
+              }
+            }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
     "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/logs": {
       "parameters": [
         { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } },

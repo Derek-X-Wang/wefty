@@ -68,12 +68,12 @@
             "maximum": 65535,
             "description": "Service jobs only. Immutable Fabric-namespace port; null means the service is portless."
           },
+          "ready": {
+            "type": "boolean",
+            "description": "Portful service jobs only. True only while the current attempt has active authoritative publication; omitted for portless services."
+          },
           "last_failure": {},
           "healthy_since_at": { "type": "string", "format": "date-time" },
-          "published_attempt_id": {
-            "type": "string",
-            "description": "Current authoritative publication. Omitted while unpublished."
-          },
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" }
         }

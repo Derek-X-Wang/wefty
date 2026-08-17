@@ -279,13 +279,14 @@ func (s *Store) CreateJob(ctx context.Context, spec contract.JobSpec) (job Job, 
 	hash := sha256.Sum256(specJSON)
 	requestHash := hex.EncodeToString(hash[:])
 
+	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Job{}, false, internalError(err, "begin job creation")
 	}
 	defer tx.Rollback()
 
-	job, storedHash, err := getJobByDispatchKey(ctx, tx, spec.DispatchKey)
+	job, storedHash, err := getJobByDispatchKey(ctx, tx, spec.DispatchKey, now)
 	if err == nil {
 		if storedHash != requestHash {
 			return Job{}, false, protocolError(contract.ErrorDispatchKeyConflict, "dispatch key %q was already used with a different job", spec.DispatchKey)
@@ -296,7 +297,6 @@ func (s *Store) CreateJob(ctx context.Context, spec contract.JobSpec) (job Job, 
 		return Job{}, false, internalError(err, "read dispatch key")
 	}
 
-	now := canonicalTime(s.clock.Now())
 	job = Job{
 		JobID:     newID("job"),
 		State:     contract.JobQueued,
@@ -325,6 +325,10 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON
 			DesiredState:  contract.ServiceDesiredRunning,
 			PublishedPort: spec.PublishedPort,
 		}
+		if spec.PublishedPort != nil {
+			ready := false
+			job.Ready = &ready
+		}
 	}
 	for _, tag := range spec.RoutingTags {
 		if _, err := tx.ExecContext(ctx, "INSERT INTO job_tags(job_id, tag) VALUES(?, ?)", job.JobID, tag); err != nil {
@@ -338,7 +342,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON
 }
 
 func (s *Store) readConcurrentSubmit(ctx context.Context, dispatchKey, requestHash string, insertErr error) (Job, bool, error) {
-	job, storedHash, err := getJobByDispatchKey(ctx, s.db, dispatchKey)
+	job, storedHash, err := getJobByDispatchKey(ctx, s.db, dispatchKey, canonicalTime(s.clock.Now()))
 	if err != nil {
 		return Job{}, false, internalError(insertErr, "store job")
 	}
@@ -349,7 +353,7 @@ func (s *Store) readConcurrentSubmit(ctx context.Context, dispatchKey, requestHa
 }
 
 func (s *Store) GetJob(ctx context.Context, jobID string) (Job, error) {
-	job, err := getJobByID(ctx, s.db, jobID)
+	job, err := getJobByID(ctx, s.db, jobID, canonicalTime(s.clock.Now()))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, protocolError(contract.ErrorNotFound, "job %q was not found", jobID)
 	}
@@ -739,6 +743,89 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 		AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: expires,
 		LeaseTTL: expires.Sub(now), Directive: directive,
 	}, nil
+}
+
+// SetAttemptPublication applies the absolute publication state of one
+// authoritative portful service attempt. Unlike evidence writes, publication
+// is never replayable after authority or attempt lifecycle ends.
+func (s *Store) SetAttemptPublication(
+	ctx context.Context,
+	identityNodeID, jobID, attemptID string,
+	request PublicationRequest,
+) (Job, error) {
+	if request.FencingToken == "" || request.Ready == nil {
+		return Job{}, protocolError(contract.ErrorInvalidRequest, "fencing_token and ready are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Job{}, internalError(err, "begin publication mutation")
+	}
+	defer tx.Rollback()
+
+	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
+	if err != nil {
+		return Job{}, err
+	}
+	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
+		return Job{}, err
+	}
+	if attempt.state != contract.AttemptClaimed && attempt.state != contract.AttemptRunning && attempt.state != contract.AttemptAwaitingInput {
+		return Job{}, protocolError(contract.ErrorConflict, "attempt is terminal")
+	}
+
+	now := canonicalTime(s.clock.Now())
+	if !now.Before(attempt.leaseExpires) {
+		if err := expireAttempt(ctx, tx, attempt, now); err != nil {
+			return Job{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return Job{}, internalError(err, "commit publication lease expiry")
+		}
+		return Job{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
+	}
+
+	var publishedPort sql.NullInt64
+	err = tx.QueryRowContext(ctx, "SELECT published_port FROM service_jobs WHERE job_id=?", jobID).Scan(&publishedPort)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Job{}, protocolError(contract.ErrorConflict, "publication is not applicable to this job")
+	}
+	if err != nil {
+		return Job{}, internalError(err, "read service publication applicability")
+	}
+	if !publishedPort.Valid {
+		return Job{}, protocolError(contract.ErrorConflict, "publication is not applicable to this job")
+	}
+
+	var targetAttempt any
+	if *request.Ready {
+		targetAttempt = attemptID
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE service_jobs
+		SET published_attempt_id=?,
+			healthy_since_ns=CASE WHEN ? THEN COALESCE(healthy_since_ns, ?) ELSE NULL END
+		WHERE job_id=? AND published_attempt_id IS NOT ?`,
+		targetAttempt, *request.Ready, now.UnixNano(), jobID, targetAttempt)
+	if err != nil {
+		return Job{}, internalError(err, "write service publication")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return Job{}, internalError(err, "read service publication result")
+	}
+	if changed > 0 {
+		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET updated_ns=? WHERE job_id=?", now.UnixNano(), jobID); err != nil {
+			return Job{}, internalError(err, "timestamp service publication")
+		}
+	}
+
+	job, err := getJobByID(ctx, tx, jobID, now)
+	if err != nil {
+		return Job{}, internalError(err, "read published job")
+	}
+	if err := tx.Commit(); err != nil {
+		return Job{}, internalError(err, "commit publication mutation")
+	}
+	return job, nil
 }
 
 func readAttemptDirective(ctx context.Context, tx *sql.Tx, jobID, attemptID string) (AttemptDirective, error) {
@@ -1150,7 +1237,7 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 		if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 			return Job{}, err
 		}
-		job, err := getJobByID(ctx, tx, jobID)
+		job, err := getJobByID(ctx, tx, jobID, now)
 		if err != nil {
 			return Job{}, internalError(err, "read completed job replay")
 		}
@@ -1197,7 +1284,7 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 		return Job{}, protocolError(contract.ErrorConflict, "attempt is terminal")
 	}
 
-	jobBeforeCompletion, err := getJobByID(ctx, tx, jobID)
+	jobBeforeCompletion, err := getJobByID(ctx, tx, jobID, now)
 	if err != nil {
 		return Job{}, internalError(err, "read completing job policy")
 	}
@@ -1243,7 +1330,7 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 			return Job{}, err
 		}
 	}
-	job, err := getJobByID(ctx, tx, jobID)
+	job, err := getJobByID(ctx, tx, jobID, now)
 	if err != nil {
 		return Job{}, internalError(err, "read completed job")
 	}
@@ -1333,14 +1420,20 @@ JOIN nodes n ON n.node_id=a.node_id
 }
 
 func validateAttemptAuthority(identityNodeID, jobID, attemptID, fencingToken string, a attemptAuthority) error {
-	if err := validateAttemptEvidence(identityNodeID, jobID, attemptID, fencingToken, a); err != nil {
-		return err
+	if a.identityNodeID != identityNodeID {
+		return protocolError(contract.ErrorAttemptNotOwned, "authenticated node does not own this attempt")
 	}
-	if a.bootSessionID != a.currentBootSessionID || a.authorityGeneration != a.currentAuthorityGeneration {
-		return protocolError(contract.ErrorNodeSessionReplaced, "attempt authority belongs to a replaced node registration")
+	if a.jobID != jobID || a.attemptID != attemptID {
+		return protocolError(contract.ErrorAttemptMismatch, "attempt does not match the request path")
 	}
 	if !a.currentAttempt.Valid || a.currentAttempt.String != attemptID {
 		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's current attempt")
+	}
+	if a.fencingToken != fencingToken {
+		return protocolError(contract.ErrorStaleFence, "fencing token is stale")
+	}
+	if a.bootSessionID != a.currentBootSessionID || a.authorityGeneration != a.currentAuthorityGeneration {
+		return protocolError(contract.ErrorNodeSessionReplaced, "attempt authority belongs to a replaced node registration")
 	}
 	return nil
 }
@@ -1529,7 +1622,7 @@ type queryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func getJobByDispatchKey(ctx context.Context, q queryer, dispatchKey string) (Job, string, error) {
+func getJobByDispatchKey(ctx context.Context, q queryer, dispatchKey string, now time.Time) (Job, string, error) {
 	var job Job
 	var specJSON []byte
 	var currentAttempt sql.NullString
@@ -1541,9 +1634,26 @@ COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id)
 state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
 service_jobs.lifetime_restart_count, service_jobs.next_restart_at, service_jobs.published_port,
-service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id
+service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id,
+CASE
+	WHEN service_jobs.published_port IS NULL THEN NULL
+	WHEN service_jobs.published_attempt_id=jobs.current_attempt_id
+		AND jobs.state IN ('claimed', 'running')
+		AND EXISTS (
+			SELECT 1 FROM attempts publication_attempt
+			JOIN nodes publication_node ON publication_node.node_id=publication_attempt.node_id
+			WHERE publication_attempt.attempt_id=service_jobs.published_attempt_id
+				AND publication_attempt.job_id=jobs.job_id
+				AND publication_attempt.node_id=service_jobs.bound_node_id
+				AND publication_attempt.state IN ('claimed', 'running', 'awaiting-input')
+				AND publication_attempt.lease_expires_ns>@now_ns
+				AND publication_attempt.boot_session_id=publication_node.boot_session_id
+				AND publication_attempt.authority_generation=publication_node.authority_generation
+		)
+	THEN 1 ELSE 0
+END
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
-WHERE jobs.dispatch_key=?`, dispatchKey).Scan(append([]any{
+WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql.Named("dispatch_key", dispatchKey)).Scan(append([]any{
 		&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash,
 	}, serviceColumns.scanDestinations()...)...)
 	if err != nil {
@@ -1555,7 +1665,7 @@ WHERE jobs.dispatch_key=?`, dispatchKey).Scan(append([]any{
 	return job, requestHash, nil
 }
 
-func getJobByID(ctx context.Context, q queryer, jobID string) (Job, error) {
+func getJobByID(ctx context.Context, q queryer, jobID string, now time.Time) (Job, error) {
 	var job Job
 	var specJSON []byte
 	var currentAttempt sql.NullString
@@ -1566,9 +1676,26 @@ COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id)
 state, spec_json, current_attempt_id, created_ns, updated_ns,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
 service_jobs.lifetime_restart_count, service_jobs.next_restart_at, service_jobs.published_port,
-service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id
+service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id,
+CASE
+	WHEN service_jobs.published_port IS NULL THEN NULL
+	WHEN service_jobs.published_attempt_id=jobs.current_attempt_id
+		AND jobs.state IN ('claimed', 'running')
+		AND EXISTS (
+			SELECT 1 FROM attempts publication_attempt
+			JOIN nodes publication_node ON publication_node.node_id=publication_attempt.node_id
+			WHERE publication_attempt.attempt_id=service_jobs.published_attempt_id
+				AND publication_attempt.job_id=jobs.job_id
+				AND publication_attempt.node_id=service_jobs.bound_node_id
+				AND publication_attempt.state IN ('claimed', 'running', 'awaiting-input')
+				AND publication_attempt.lease_expires_ns>@now_ns
+				AND publication_attempt.boot_session_id=publication_node.boot_session_id
+				AND publication_attempt.authority_generation=publication_node.authority_generation
+		)
+	THEN 1 ELSE 0
+END
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
-WHERE jobs.job_id=?`, jobID).Scan(append([]any{
+WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_id", jobID)).Scan(append([]any{
 		&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS,
 	}, serviceColumns.scanDestinations()...)...)
 	if err != nil {

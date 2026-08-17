@@ -20,9 +20,10 @@ type ServiceJob struct {
 	LifetimeRestartCount int                          `json:"lifetime_restart_count"`
 	NextRestartAt        *time.Time                   `json:"next_restart_at,omitempty"`
 	PublishedPort        *int                         `json:"published_port"`
+	Ready                *bool                        `json:"ready,omitempty"`
 	LastFailure          json.RawMessage              `json:"last_failure,omitempty"`
 	HealthySinceAt       *time.Time                   `json:"healthy_since_at,omitempty"`
-	PublishedAttemptID   string                       `json:"published_attempt_id,omitempty"`
+	PublishedAttemptID   string                       `json:"-"`
 }
 
 type serviceJobColumns struct {
@@ -35,13 +36,14 @@ type serviceJobColumns struct {
 	lastFailure          []byte
 	healthySinceNS       sql.NullInt64
 	publishedAttemptID   sql.NullString
+	ready                sql.NullBool
 }
 
 func (columns *serviceJobColumns) scanDestinations() []any {
 	return []any{
 		&columns.desiredState, &columns.boundNodeID, &columns.restartStreak,
 		&columns.lifetimeRestartCount, &columns.nextRestartNS, &columns.publishedPort,
-		&columns.lastFailure, &columns.healthySinceNS, &columns.publishedAttemptID,
+		&columns.lastFailure, &columns.healthySinceNS, &columns.publishedAttemptID, &columns.ready,
 	}
 }
 
@@ -64,6 +66,8 @@ func (columns serviceJobColumns) projection() *ServiceJob {
 	if columns.publishedPort.Valid {
 		value := int(columns.publishedPort.Int64)
 		service.PublishedPort = &value
+		ready := columns.ready.Valid && columns.ready.Bool
+		service.Ready = &ready
 	}
 	if columns.lastFailure != nil {
 		service.LastFailure = json.RawMessage(columns.lastFailure)
@@ -149,7 +153,13 @@ func transitionServiceJob(
 	if !validServiceStatePair(desired, next) {
 		return protocolError(contract.ErrorConflict, "service desired state %q cannot pair with observed state %q", desired, next)
 	}
-	if _, err := tx.ExecContext(ctx, "UPDATE service_jobs SET desired_state=? WHERE job_id=?", desired, jobID); err != nil {
+	clearPublication := next == contract.JobQueued || next == contract.JobStopping ||
+		next == contract.JobStopped || next == contract.JobFailed
+	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
+		SET desired_state=?,
+			published_attempt_id=CASE WHEN ? THEN NULL ELSE published_attempt_id END,
+			healthy_since_ns=CASE WHEN ? THEN NULL ELSE healthy_since_ns END
+		WHERE job_id=?`, desired, clearPublication, clearPublication, jobID); err != nil {
 		return internalError(err, "update service desired state")
 	}
 	if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?", next, canonicalTime(now).UnixNano(), jobID); err != nil {
