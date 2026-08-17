@@ -82,17 +82,18 @@ func main() {
 func run() error {
 	nodePolicies := make(map[string]l1.NodePolicy)
 	var (
-		fabricMode         = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
-		listenAddress      = flag.String("listen", "wefty://control-plane", "control-plane Fabric listen address")
-		databasePath       = flag.String("db", "wefty-l1.sqlite", "SQLite database path")
-		leaseDuration      = flag.Duration("lease-duration", l1.DefaultLeaseDuration, "attempt lease duration")
-		lateEvidenceWindow = flag.Duration("late-evidence-window", l1.DefaultLateEvidenceWindow, "window for post-authority evidence observations")
-		fabricName         = flag.String("fabric-name", "wefty://control-plane", "tsnet logical service name")
-		stateDirectory     = flag.String("state-dir", "", "tsnet state directory")
-		authKey            = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
-		controlURL         = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
-		ephemeral          = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
-		readyFile          = flag.String("ready-file", "", "write listener metadata after the server is ready")
+		fabricMode             = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
+		listenAddress          = flag.String("listen", "wefty://control-plane", "control-plane Fabric listen address")
+		databasePath           = flag.String("db", "wefty-l1.sqlite", "SQLite database path")
+		leaseDuration          = flag.Duration("lease-duration", l1.DefaultLeaseDuration, "attempt lease duration")
+		lateEvidenceWindow     = flag.Duration("late-evidence-window", l1.DefaultLateEvidenceWindow, "window for post-authority evidence observations")
+		serviceStabilityWindow = flag.Duration("service-stability-window", l1.DefaultServiceStabilityWindow, "continuous service stability required to reset the restart streak")
+		fabricName             = flag.String("fabric-name", "wefty://control-plane", "tsnet logical service name")
+		stateDirectory         = flag.String("state-dir", "", "tsnet state directory")
+		authKey                = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
+		controlURL             = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
+		ephemeral              = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
+		readyFile              = flag.String("ready-file", "", "write listener metadata after the server is ready")
 	)
 	flag.Var(nodeTagsFlag{policies: nodePolicies}, "node-tags", "authoritative routing tags as node-id=tag,tag (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies}, "node-max-oneshot-slots", "authoritative one-shot capacity as node-id=slots (repeatable)")
@@ -114,8 +115,9 @@ func run() error {
 	}
 	defer closeFabric()
 	store, err := l1.OpenStore(*databasePath, l1.StoreOptions{
-		LeaseDuration:      *leaseDuration,
-		LateEvidenceWindow: *lateEvidenceWindow,
+		LeaseDuration:          *leaseDuration,
+		LateEvidenceWindow:     *lateEvidenceWindow,
+		ServiceStabilityWindow: *serviceStabilityWindow,
 	})
 	if err != nil {
 		return err

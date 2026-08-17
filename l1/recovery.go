@@ -44,30 +44,65 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "read stale-node result")
 	}
-
-	rows, err := tx.QueryContext(ctx, `UPDATE attempts SET state=?, updated_ns=?
-		WHERE state IN (?, ?, ?) AND lease_expires_ns<=?
-		AND EXISTS (
-			SELECT 1 FROM jobs j
-			WHERE j.job_id=attempts.job_id
-			AND j.current_attempt_id=attempts.attempt_id
-			AND j.state IN (?, ?, ?)
-		)
-		RETURNING attempt_id, job_id`, contract.AttemptLost, now.UnixNano(),
-		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput, now.UnixNano(),
-		contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput)
-	if err != nil {
-		return ReconcileResult{}, internalError(err, "reap expired attempts")
+	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET healthy_since_ns=NULL
+		WHERE healthy_since_ns IS NOT NULL
+			AND EXISTS (
+				SELECT 1 FROM jobs
+				JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
+				JOIN nodes ON nodes.node_id=attempts.node_id
+				WHERE jobs.job_id=service_jobs.job_id
+					AND service_jobs.bound_node_id=attempts.node_id
+					AND nodes.state<>?
+			)`, contract.NodeAlive); err != nil {
+		return ReconcileResult{}, internalError(err, "interrupt service stability on unavailable nodes")
 	}
-	type expiredAttempt struct{ attemptID, jobID string }
-	var expired []expiredAttempt
+
+	// Node liveness is resolved first at the same clock snapshot. In
+	// particular, a node that reaches the equal two-minute dead/stability
+	// boundary is dead and cannot reset a service's failure streak.
+	resets, err := tx.ExecContext(ctx, `UPDATE service_jobs SET restart_streak=0
+		WHERE restart_streak>0
+			AND desired_state=?
+			AND healthy_since_ns IS NOT NULL
+			AND healthy_since_ns<=?
+			AND EXISTS (
+				SELECT 1 FROM jobs
+				JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
+				JOIN nodes ON nodes.node_id=attempts.node_id
+				WHERE jobs.job_id=service_jobs.job_id
+					AND jobs.state=?
+					AND attempts.state=?
+					AND attempts.lease_expires_ns>?
+					AND nodes.state=?
+					AND service_jobs.bound_node_id=attempts.node_id
+			)`, contract.ServiceDesiredRunning, now.Add(-s.serviceStabilityWindow).UnixNano(),
+		contract.JobRunning, contract.AttemptRunning, now.UnixNano(), contract.NodeAlive)
+	if err != nil {
+		return ReconcileResult{}, internalError(err, "reset stable service restart streaks")
+	}
+	result.RestartStreakResets, err = resets.RowsAffected()
+	if err != nil {
+		return ReconcileResult{}, internalError(err, "read stable service reset result")
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT attempts.attempt_id
+		FROM attempts JOIN jobs ON jobs.job_id=attempts.job_id
+		WHERE attempts.state IN (?, ?, ?) AND attempts.lease_expires_ns<=?
+			AND jobs.current_attempt_id=attempts.attempt_id
+			AND jobs.state IN (?, ?, ?, ?)`,
+		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput, now.UnixNano(),
+		contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput, contract.JobStopping)
+	if err != nil {
+		return ReconcileResult{}, internalError(err, "select expired attempts")
+	}
+	var expiredAttemptIDs []string
 	for rows.Next() {
-		var attempt expiredAttempt
-		if err := rows.Scan(&attempt.attemptID, &attempt.jobID); err != nil {
+		var attemptID string
+		if err := rows.Scan(&attemptID); err != nil {
 			rows.Close()
 			return ReconcileResult{}, internalError(err, "read expired attempt")
 		}
-		expired = append(expired, attempt)
+		expiredAttemptIDs = append(expiredAttemptIDs, attemptID)
 	}
 	if err := rows.Close(); err != nil {
 		return ReconcileResult{}, internalError(err, "close expired-attempt rows")
@@ -75,14 +110,16 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	if err := rows.Err(); err != nil {
 		return ReconcileResult{}, internalError(err, "iterate expired attempts")
 	}
-	for _, attempt := range expired {
-		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=?
-			WHERE job_id=? AND current_attempt_id=? AND state IN (?, ?, ?)`, contract.JobFailed, now.UnixNano(),
-			attempt.jobID, attempt.attemptID, contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput); err != nil {
-			return ReconcileResult{}, internalError(err, "fail expired attempt's job")
+	for _, attemptID := range expiredAttemptIDs {
+		attempt, err := readAttemptAuthority(ctx, tx, attemptID)
+		if err != nil {
+			return ReconcileResult{}, err
+		}
+		if err := expireAttempt(ctx, tx, attempt, now); err != nil {
+			return ReconcileResult{}, err
 		}
 	}
-	result.ExpiredAttempts = int64(len(expired))
+	result.ExpiredAttempts = int64(len(expiredAttemptIDs))
 
 	if err := tx.Commit(); err != nil {
 		return ReconcileResult{}, internalError(err, "commit L1 reconciliation")

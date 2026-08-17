@@ -58,11 +58,19 @@ func newIntegrationHarness(t *testing.T, nodeTags map[string][]string) *integrat
 }
 
 func newIntegrationHarnessWithPolicies(t *testing.T, policies map[string]NodePolicy) *integrationHarness {
+	return newIntegrationHarnessWithOptions(t, StoreOptions{}, policies)
+}
+
+func newIntegrationHarnessWithOptions(t *testing.T, options StoreOptions, policies map[string]NodePolicy) *integrationHarness {
 	t.Helper()
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	clock := &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{Clock: clock, LeaseDuration: 30 * time.Second})
+	options.Clock = clock
+	if options.LeaseDuration <= 0 {
+		options.LeaseDuration = 30 * time.Second
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), options)
 	if err != nil {
 		t.Fatal(err)
 	}

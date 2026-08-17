@@ -8,15 +8,16 @@ import (
 )
 
 const (
-	DefaultClientPrincipalTag = "tag:wefty-client"
-	DefaultAgentPrincipalTag  = "tag:wefty-agent"
-	DefaultLeaseDuration      = 30 * time.Second
-	DefaultLateEvidenceWindow = 48 * time.Hour
-	DefaultNodeStaleAfter     = 45 * time.Second
-	DefaultNodeDeadAfter      = 2 * time.Minute
-	DefaultReconcileInterval  = time.Second
-	DefaultMaxOneshotSlots    = 4
-	DefaultMaxServiceSlots    = 2
+	DefaultClientPrincipalTag     = "tag:wefty-client"
+	DefaultAgentPrincipalTag      = "tag:wefty-agent"
+	DefaultLeaseDuration          = 30 * time.Second
+	DefaultLateEvidenceWindow     = 48 * time.Hour
+	DefaultNodeStaleAfter         = 45 * time.Second
+	DefaultNodeDeadAfter          = 2 * time.Minute
+	DefaultReconcileInterval      = time.Second
+	DefaultServiceStabilityWindow = 2 * time.Minute
+	DefaultMaxOneshotSlots        = 4
+	DefaultMaxServiceSlots        = 2
 )
 
 // Clock supplies all control-plane timestamps used by lease logic.
@@ -165,9 +166,10 @@ type NodeIntentRequest struct {
 // ReconcileResult reports the durable transitions won by one reconciliation
 // pass. Counts are useful for observability and deterministic tests.
 type ReconcileResult struct {
-	ExpiredAttempts int64 `json:"expired_attempts"`
-	StaleNodes      int64 `json:"stale_nodes"`
-	DeadNodes       int64 `json:"dead_nodes"`
+	ExpiredAttempts     int64 `json:"expired_attempts"`
+	StaleNodes          int64 `json:"stale_nodes"`
+	DeadNodes           int64 `json:"dead_nodes"`
+	RestartStreakResets int64 `json:"restart_streak_resets"`
 }
 
 // AppendLogsRequest is one provenance-authenticated, idempotent upload batch.

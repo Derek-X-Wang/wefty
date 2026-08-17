@@ -16,11 +16,12 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/l1"
 )
 
 const servicePortEnvironment = "WEFTY_SERVICE_PORT"
 
-func TestServiceStartsAndAnswers(t *testing.T) {
+func TestServiceRestartsAfterSuccessfulProcessExit(t *testing.T) {
 	harness := newAcceptanceHarness(t)
 	port := reservePort(t)
 	job := harness.submitEchoService(t, port)
@@ -38,7 +39,39 @@ func TestServiceStartsAndAnswers(t *testing.T) {
 
 	assertEcho(t, client, baseURL, []byte("echo acceptance"))
 	assertGracefulShutdown(t, baseURL, health.PID, harness.agent)
-	harness.waitForJobState(t, job.JobID, contract.JobSucceeded, 5*time.Second)
+	restarted := waitForFreshRunningAttempt(t, harness, job.JobID, running.CurrentAttemptID, 5*time.Second)
+	restartedHealth := waitForHealth(t, client, baseURL, harness.agent)
+	if restartedHealth.PID == health.PID {
+		t.Fatalf("service restart reused payload PID %d", health.PID)
+	}
+	if restarted.JobID != job.JobID {
+		t.Fatalf("service restart job ID = %q, want stable %q", restarted.JobID, job.JobID)
+	}
+	assertEcho(t, client, baseURL, []byte("echo after restart"))
+}
+
+func waitForFreshRunningAttempt(t *testing.T, harness *acceptanceHarness, jobID, previousAttemptID string, timeout time.Duration) l1.Job {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if harness.agent.exited() {
+			t.Fatalf("agent exited while waiting for service restart: %v\n%s", harness.agent.waitError(), harness.agent.outputString())
+		}
+		var job l1.Job
+		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID, nil, &job)
+		if status != http.StatusOK {
+			t.Fatalf("get restarted service status = %d body=%s", status, body)
+		}
+		if job.State == contract.JobFailed {
+			t.Fatalf("service latched failed while waiting for restart: %s\n%s", body, harness.agent.outputString())
+		}
+		if job.State == contract.JobRunning && job.CurrentAttemptID != "" && job.CurrentAttemptID != previousAttemptID {
+			return job
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for a fresh service attempt after %q\n%s", previousAttemptID, harness.agent.outputString())
+	return l1.Job{}
 }
 
 func TestGuardianReapsPayloadWhenAgentIsSIGKILLed(t *testing.T) {
