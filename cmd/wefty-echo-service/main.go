@@ -53,6 +53,7 @@ func run() error {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	log.Printf("wefty-echo-service: starting payload pid=%d", os.Getpid())
 
 	log.Printf("wefty-echo-service: starting payload pid=%d", os.Getpid())
 

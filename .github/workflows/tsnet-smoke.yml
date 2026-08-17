@@ -32,11 +32,11 @@ jobs:
         env:
           TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: test -n "$TS_AUTHKEY" || { echo "TS_AUTHKEY is required for the trusted-repository tsnet lane" >&2; exit 1; }
-      - name: Run credentialed tsnet smoke
+      - name: Run credentialed tsnet registration and service reachability smoke
         if: vars.TSNET_SMOKE_REQUIRED == 'true'
         env:
           TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-        run: go test -tags=tsnet_smoke ./... -run '^TestTSNetSmoke$'
+        run: go test -tags=tsnet_smoke ./... -run '^TestTSNet(Smoke|ServiceReachability)$'
       - name: Lane unarmed notice
         if: vars.TSNET_SMOKE_REQUIRED != 'true'
         run: echo "tsnet smoke lane is unarmed (set TSNET_SMOKE_REQUIRED=true after provisioning TS_AUTHKEY); no credentialed tests ran."
