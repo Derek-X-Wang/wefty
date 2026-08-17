@@ -119,7 +119,7 @@
           "lost_event_count": { "type": "integer", "minimum": 1 },
           "lost_byte_count": { "type": "integer", "minimum": 1 },
           "reason": {
-            "enum": ["spool_eviction", "oversized_event", "late_evidence_window_expired"]
+            "enum": ["spool_eviction", "oversized_event", "replay_rejected", "late_evidence_window_expired"]
           },
           "source_event_sha256": {
             "type": "string",

@@ -197,6 +197,7 @@ type LogGapReason string
 const (
 	LogGapSpoolEviction             LogGapReason = "spool_eviction"
 	LogGapOversizedEvent            LogGapReason = "oversized_event"
+	LogGapReplayRejected            LogGapReason = "replay_rejected"
 	LogGapLateEvidenceWindowExpired LogGapReason = "late_evidence_window_expired"
 )
 

@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -213,6 +215,116 @@ func TestAgentRestartRecoversOriginalAttemptSpool(t *testing.T) {
 	}
 	if len(replayed.Events) != 1 {
 		t.Fatalf("restart replay duplicated logs: %#v", replayed.Events)
+	}
+}
+
+func TestAgentBootDeliversDurableLateEvidenceWithoutCrashLoop(t *testing.T) {
+	assertAgentBootDeliversDurableLateEvidenceWithoutCrashLoop(t)
+}
+
+func assertAgentBootDeliversDurableLateEvidenceWithoutCrashLoop(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clock := newManualClock(time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC))
+	network := plain.NewNetwork()
+	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
+	databasePath := filepath.Join(t.TempDir(), "l1.sqlite")
+	store, stopServer := startRestartableLogServer(t, ctx, serverFabric, databasePath, clock)
+	defer stopServer()
+	claim := createClaimForDurableLogs(t, store, clock)
+
+	spoolDirectory := t.TempDir()
+	spool := openTestLogSpool(t, spoolDirectory, "stable-node", 1024)
+	if err := spool.ensureAttempt(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.append(ctx, spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, 0, "survived-crash")); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 0
+	if err := spool.storeCompletion(ctx, claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Minute)
+	if _, err := store.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	participant := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	restarted, err := New(Config{
+		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "stable-node", BootSessionID: "boot-2", Version: "test",
+		Clock: clock, LogSpoolDirectory: spoolDirectory, LogSpoolMaxBytes: 1024,
+		ClaimInterval: time.Second, LogRetryInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	runContext, stopRun := context.WithCancel(ctx)
+	runDone := make(chan error, 1)
+	go func() { runDone <- restarted.Run(runContext) }()
+
+	inspection, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inspection.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	var lateResultJSON []byte
+	for time.Now().Before(deadline) {
+		var bootSessionID string
+		var localRows int
+		lateErr := inspection.QueryRow("SELECT late_result_json FROM attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&lateResultJSON)
+		bootErr := inspection.QueryRow("SELECT boot_session_id FROM nodes WHERE node_id=?", "stable-node").Scan(&bootSessionID)
+		localErr := restarted.logSpool.db.QueryRow("SELECT COUNT(*) FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&localRows)
+		if lateErr == nil && bootErr == nil && localErr == nil && len(lateResultJSON) != 0 && bootSessionID == "boot-2" && localRows == 0 {
+			break
+		}
+		select {
+		case err := <-runDone:
+			t.Fatalf("agent exited during evidence recovery: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(lateResultJSON) == 0 {
+		t.Fatal("durable completion was not retained as late L1 evidence")
+	}
+	var lateResult l1.LateResultEvidence
+	if err := json.Unmarshal(lateResultJSON, &lateResult); err != nil {
+		t.Fatal(err)
+	}
+	if lateResult.Kind != l1.LateResultObservation || lateResult.Result == nil || lateResult.Result.ExitCode == nil || *lateResult.Result.ExitCode != 0 || !lateResult.Late {
+		t.Fatalf("late completion evidence = %#v", lateResult)
+	}
+	page, err := store.GetJobLogs(ctx, claim.Job.JobID, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 1 || string(page.Events[0].Bytes) != "survived-crash" {
+		t.Fatalf("late log observation = %#v", page.Events)
+	}
+	job, err := store.GetJob(ctx, claim.Job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != contract.JobFailed {
+		t.Fatalf("late exit zero changed job verdict to %q", job.State)
+	}
+
+	stopRun()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("agent Run() after cancellation = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent did not stop")
 	}
 }
 

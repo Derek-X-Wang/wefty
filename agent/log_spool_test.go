@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -100,6 +101,142 @@ func TestLogSpoolKeepsRestartedAttemptsSeparate(t *testing.T) {
 	}
 	if len(attempts) != 1 || attempts[0].attemptID != oldClaim.Lease.AttemptID {
 		t.Fatalf("recovery attempts = %#v, want only original attempt", attempts)
+	}
+}
+
+func TestLogSpoolPersistsFinalizedCompletionAcrossRestart(t *testing.T) {
+	directory := t.TempDir()
+	claim := spoolTestClaim("attempt-completion")
+	spool := openTestLogSpool(t, directory, "node-completion", 1024)
+	if err := spool.ensureAttempt(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 0
+	result := l1.ProcessResult{ExitCode: &exitCode}
+	finishedAt := time.Date(2026, 8, 17, 3, 4, 5, 6, time.UTC)
+	if err := spool.storeCompletion(context.Background(), claim.Lease.AttemptID, result, finishedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	spool = openTestLogSpool(t, directory, "node-completion", 1024)
+	defer spool.Close()
+	stored, storedFinishedAt, present, err := spool.completion(context.Background(), claim.Lease.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !present || stored.ExitCode == nil || *stored.ExitCode != 0 || !storedFinishedAt.Equal(finishedAt) {
+		t.Fatalf("durable completion = (%#v, %s, %t)", stored, storedFinishedAt, present)
+	}
+	attempts, err := spool.pendingAttempts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 || attempts[0].attemptID != claim.Lease.AttemptID {
+		t.Fatalf("completion recovery attempts = %#v", attempts)
+	}
+	if err := spool.completionDelivered(context.Background(), claim.Lease.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := spool.db.QueryRow("SELECT COUNT(*) FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("delivered completion retained %d attempt rows", count)
+	}
+}
+
+func TestLogSpoolReplacesRejectedRawReplayWithTruthfulGap(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "node-rejected", 1024)
+	defer spool.Close()
+	claim := spoolTestClaim("attempt-rejected")
+	if err := spool.ensureAttempt(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	for sequence, payload := range []string{"one", "two"} {
+		if err := spool.append(context.Background(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, uint64(sequence), payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	batch, err := spool.pendingBatch(context.Background(), claim.Lease.AttemptID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.replaceBatchWithReplayGaps(context.Background(), claim.Lease.AttemptID, batch); err != nil {
+		t.Fatal(err)
+	}
+	events, err := spool.pending(context.Background(), claim.Lease.AttemptID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Gap == nil {
+		t.Fatalf("replacement events = %#v", events)
+	}
+	gap := events[0].Gap
+	if gap.Reason != contract.LogGapReplayRejected || gap.ThroughSequence != 1 || gap.LostEventCount != 2 || gap.LostByteCount != 6 || len(events[0].Bytes) != 0 {
+		t.Fatalf("replacement gap = %#v", events[0])
+	}
+}
+
+func TestLogSpoolIncompleteTombstoneReleasesRawEvidence(t *testing.T) {
+	assertLogSpoolIncompleteTombstoneReleasesRawEvidence(t)
+}
+
+func assertLogSpoolIncompleteTombstoneReleasesRawEvidence(t *testing.T) {
+	t.Helper()
+	spool := openTestLogSpool(t, t.TempDir(), "node-incomplete", 1024)
+	defer spool.Close()
+	claim := spoolTestClaim("attempt-incomplete")
+	if err := spool.ensureAttempt(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	for sequence, payload := range []string{"one", "two"} {
+		if err := spool.append(context.Background(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, uint64(sequence), payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	batch, err := spool.pendingBatch(context.Background(), claim.Lease.AttemptID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.replaceBatchWithReplayGaps(context.Background(), claim.Lease.AttemptID, batch); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 0
+	finishedAt := time.Date(2026, 8, 17, 4, 5, 6, 0, time.UTC)
+	if err := spool.storeCompletion(context.Background(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, finishedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.sealIncomplete(context.Background(), claim.Lease.AttemptID, "attempt missing", contract.ErrorAttemptNotFound, finishedAt.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var eventCount int
+	var resultJSON, tombstoneJSON []byte
+	if err := spool.db.QueryRow(`SELECT
+  (SELECT COUNT(*) FROM spool_events WHERE attempt_id=spool_attempts.attempt_id),
+  result_json, incomplete_json
+FROM spool_attempts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&eventCount, &resultJSON, &tombstoneJSON); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 0 || len(resultJSON) != 0 {
+		t.Fatalf("sealed evidence retained raw payload: events=%d result=%q", eventCount, resultJSON)
+	}
+	var tombstone incompleteEvidenceTombstone
+	if err := json.Unmarshal(tombstoneJSON, &tombstone); err != nil {
+		t.Fatal(err)
+	}
+	if tombstone.Kind != "incomplete" || tombstone.ErrorCode != contract.ErrorAttemptNotFound || tombstone.LostEventCount != 2 || tombstone.LostByteCount != 6 || !tombstone.CompletionUndelivered || tombstone.FinishedAt == nil || !tombstone.FinishedAt.Equal(finishedAt) {
+		t.Fatalf("incomplete tombstone = %#v", tombstone)
+	}
+	attempts, err := spool.pendingAttempts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 0 {
+		t.Fatalf("sealed attempt remained replayable: %#v", attempts)
 	}
 }
 

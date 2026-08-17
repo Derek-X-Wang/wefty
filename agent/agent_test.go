@@ -60,6 +60,61 @@ func TestMain(main *testing.M) {
 	os.Exit(code)
 }
 
+func TestAgentTakesStableNodeLockBeforeOpeningSpool(t *testing.T) {
+	assertAgentTakesStableNodeLockBeforeOpeningSpool(t)
+}
+
+func assertAgentTakesStableNodeLockBeforeOpeningSpool(t *testing.T) {
+	t.Helper()
+	directory := t.TempDir()
+	network := plain.NewNetwork()
+	newAgent := func(bootSessionID string) (*Agent, error) {
+		return New(Config{
+			Fabric:              network.NewFabric(fabric.Identity{NodeID: "fabric-" + bootSessionID}),
+			ControlPlaneAddress: "wefty://control-plane",
+			NodeID:              "stable-node", BootSessionID: bootSessionID, Version: "test",
+			LogSpoolDirectory: directory,
+		})
+	}
+
+	first, err := newAgent("boot-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newAgent("boot-2")
+	if second != nil {
+		second.Close()
+		t.Fatal("second agent acquired the same stable-node lock")
+	}
+	if err == nil || !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("second New error = %v, want stable-node lock refusal", err)
+	}
+	claim := spoolTestClaim("attempt-takeover")
+	if err := first.logSpool.ensureAttempt(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.logSpool.append(context.Background(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, 0, "pending")); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+
+	restarted, err := newAgent("boot-3")
+	if err != nil {
+		t.Fatalf("lock did not release with the first agent: %v", err)
+	}
+	pending, err := restarted.logSpool.pending(context.Background(), claim.Lease.AttemptID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || string(pending[0].Bytes) != "pending" {
+		t.Fatalf("takeover changed pending evidence: %#v", pending)
+	}
+	if _, acknowledged, err := restarted.logSpool.highWater(context.Background(), claim.Lease.AttemptID, contract.LogStdout); err != nil || acknowledged {
+		t.Fatalf("takeover acknowledgement = (present=%t, err=%v), want absent", acknowledged, err)
+	}
+	restarted.Close()
+}
+
 func TestRunProcessRejectsUnknownKind(t *testing.T) {
 	a := &Agent{runner: panicRunner{}}
 	result, err := a.runProcess(context.Background(), l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: "oci", Class: contract.JobClassOneShot}}})

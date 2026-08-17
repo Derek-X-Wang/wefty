@@ -76,7 +76,7 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 		OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"process": true},
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 10 * time.Millisecond,
 		RenewalInterval: 50 * time.Millisecond, LogFlushInterval: 5 * time.Millisecond,
-		LogRetryInterval: 5 * time.Millisecond,
+		LogRetryInterval: 5 * time.Millisecond, LogSpoolDirectory: t.TempDir(),
 	})
 	if err != nil {
 		cancel()

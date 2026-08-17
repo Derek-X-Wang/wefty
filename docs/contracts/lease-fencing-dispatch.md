@@ -109,8 +109,10 @@ A gap declaration uses `LogEvent.sequence` as the first lost sequence and
 `gap.through_sequence` as the inclusive last sequence. Gaps advance continuity
 only for their declared stream. Agent spool eviction sends `spool_eviction`; an
 event larger than the entire service spool budget is converted whole into one
-`oversized_event` gap rather than chunked or partially retained. L1-generated
-window gaps include the source event's SHA-256 so identical raw replay is
+`oversized_event` gap rather than chunked or partially retained. A locally
+durable event that L1 permanently rejects while its attempt is still
+authoritative is replaced by a `replay_rejected` gap before replay continues.
+L1-generated window gaps include the source event's SHA-256 so identical raw replay is
 acknowledged while a conflicting replay still fails.
 
 The default heartbeat cadence is 15 seconds. A node becomes `stale` after 45
