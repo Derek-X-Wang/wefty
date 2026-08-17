@@ -198,6 +198,29 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	}
 }
 
+func TestAgentClaimRequiresFixedWorkloadClassSelector(t *testing.T) {
+	t.Parallel()
+
+	doc := readObject(t, "l1-agent.v1.json")
+	paths := object(t, doc["paths"], "paths")
+	claimPath := object(t, paths["/v1/agent/jobs/claim"], "claim path")
+	claimOperation := object(t, claimPath["post"], "claim operation")
+	requestBody := object(t, claimOperation["requestBody"], "claim requestBody")
+	content := object(t, requestBody["content"], "claim requestBody.content")
+	mediaType := object(t, content["application/json"], "claim request media type")
+	schema := object(t, mediaType["schema"], "claim request schema")
+	required := stringSet(t, schema["required"])
+	if !required["class"] {
+		t.Fatal("claim request does not require class")
+	}
+	properties := object(t, schema["properties"], "claim request properties")
+	class := object(t, properties["class"], "claim request class")
+	values := stringSet(t, class["enum"])
+	if !values["one-shot"] || !values["service"] || len(values) != 2 {
+		t.Fatalf("claim class values = %#v, want exactly one-shot and service", values)
+	}
+}
+
 func TestL1RouteGroupsUseFabricIdentity(t *testing.T) {
 	t.Parallel()
 

@@ -265,7 +265,7 @@ func createClaimForDurableLogs(t *testing.T, store *l1.Store, clock Clock) l1.Cl
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim, err := store.ClaimJob(context.Background(), "fabric-node", "stable-node", "boot-1")
+	claim, err := store.ClaimJob(context.Background(), "fabric-node", "stable-node", "boot-1", contract.JobClassOneShot)
 	if err != nil {
 		t.Fatal(err)
 	}

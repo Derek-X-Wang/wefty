@@ -493,10 +493,13 @@ func (s *Store) HeartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 	return node, nil
 }
 
-// ClaimJob atomically performs eligibility selection, fencing, attempt
-// creation, and lease establishment. Tag matching is part of the UPDATE that
-// wins the queued row, inside this transaction.
-func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessionID string) (*Claim, error) {
+// ClaimJob atomically performs class-scoped eligibility selection, capacity
+// admission, fencing, attempt creation, and lease establishment. Every
+// eligibility predicate is part of the UPDATE that wins the queued row.
+func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessionID, class string) (*Claim, error) {
+	if class != contract.JobClassOneShot && class != contract.JobClassService {
+		return nil, protocolError(contract.ErrorInvalidRequest, "claim class must be %q or %q", contract.JobClassOneShot, contract.JobClassService)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, internalError(err, "begin job claim")
@@ -550,38 +553,92 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	var specJSON []byte
 	var fence int64
 	var createdNS int64
+	// SQLite's immediate writer transaction serializes this count-then-insert.
+	// A Postgres adapter must instead lock the node row or retry serializable
+	// transactions so concurrent claims cannot over-admit either class.
 	err = tx.QueryRowContext(ctx, `
 UPDATE jobs
-SET state=?, current_attempt_id=?, fence_counter=fence_counter+1, updated_ns=?
+SET state=@job_claimed, current_attempt_id=@attempt_id, fence_counter=fence_counter+1, updated_ns=@now_ns
 WHERE job_id=(
-  SELECT j.job_id FROM jobs j
-	  WHERE j.state=?
-	    AND NOT EXISTS (
-	      SELECT 1 FROM service_jobs restartable_service
-	      WHERE restartable_service.job_id=j.job_id
-	        AND restartable_service.next_restart_at IS NOT NULL
-	        AND restartable_service.next_restart_at>?
+  SELECT j.job_id
+  FROM jobs j
+  LEFT JOIN service_jobs candidate_service ON candidate_service.job_id=j.job_id
+	  WHERE j.state=@job_queued
+	    AND (
+	      (
+	        @class='one-shot'
+	        AND candidate_service.job_id IS NULL
+	        AND (
+	          SELECT COUNT(*)
+	          FROM attempts active_oneshot
+	          WHERE active_oneshot.node_id=@node_id
+	            AND active_oneshot.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
+	            AND NOT EXISTS (
+	              SELECT 1 FROM service_jobs active_service
+	              WHERE active_service.job_id=active_oneshot.job_id
+	            )
+	        ) < (
+	          SELECT max_oneshot_slots FROM nodes WHERE node_id=@node_id
+	        )
+	      )
+	      OR
+	      (
+	        @class='service'
+	        AND candidate_service.job_id IS NOT NULL
+	        AND candidate_service.desired_state=@desired_running
+	        AND (candidate_service.bound_node_id IS NULL OR candidate_service.bound_node_id=@node_id)
+	        AND (candidate_service.next_restart_at IS NULL OR candidate_service.next_restart_at<=@now_ns)
+	        AND (
+	          candidate_service.bound_node_id=@node_id
+	          OR (
+	            SELECT COUNT(*)
+	            FROM service_jobs occupied_service
+	            JOIN jobs occupied_job ON occupied_job.job_id=occupied_service.job_id
+	            WHERE occupied_service.bound_node_id=@node_id
+	              AND (
+	                (occupied_job.state=@job_queued AND occupied_service.desired_state=@desired_running)
+	                OR occupied_job.state IN (@job_claimed, @job_running, @job_stopping)
+	              )
+	          ) < (
+	            SELECT max_service_slots FROM nodes WHERE node_id=@node_id
+	          )
+	        )
+	      )
 	    )
 	    AND NOT EXISTS (
 	      SELECT 1 FROM attempts prior
-	      WHERE prior.node_id=?
-	        AND prior.boot_session_id<>?
-	        AND prior.state IN (?, ?, ?)
+	      WHERE prior.node_id=@node_id
+	        AND prior.boot_session_id<>@boot_session_id
+	        AND prior.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
 	    )
 	    AND NOT EXISTS (
       SELECT 1 FROM job_tags jt
       WHERE jt.job_id=j.job_id
-        AND NOT EXISTS (
-          SELECT 1 FROM node_tags nt WHERE nt.node_id=? AND nt.tag=jt.tag
-        )
+	        AND NOT EXISTS (
+	          SELECT 1 FROM node_tags nt WHERE nt.node_id=@node_id AND nt.tag=jt.tag
+	        )
     )
-  ORDER BY j.created_ns, j.job_id
+  ORDER BY CASE
+	WHEN @class='service' AND candidate_service.bound_node_id=@node_id THEN 0
+	ELSE 1
+  END, j.created_ns, j.job_id
   LIMIT 1
 )
-AND state=?
-	RETURNING job_id, spec_json, fence_counter, created_ns`, contract.JobClaimed, attemptID, now.UnixNano(), contract.JobQueued, now.UnixNano(),
-		nodeID, bootSessionID, contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput,
-		nodeID, contract.JobQueued).
+AND state=@job_queued
+	RETURNING job_id, spec_json, fence_counter, created_ns`,
+		sql.Named("job_claimed", contract.JobClaimed),
+		sql.Named("attempt_id", attemptID),
+		sql.Named("now_ns", now.UnixNano()),
+		sql.Named("job_queued", contract.JobQueued),
+		sql.Named("class", class),
+		sql.Named("node_id", nodeID),
+		sql.Named("boot_session_id", bootSessionID),
+		sql.Named("desired_running", contract.ServiceDesiredRunning),
+		sql.Named("attempt_claimed", contract.AttemptClaimed),
+		sql.Named("attempt_running", contract.AttemptRunning),
+		sql.Named("attempt_awaiting_input", contract.AttemptAwaitingInput),
+		sql.Named("job_running", contract.JobRunning),
+		sql.Named("job_stopping", contract.JobStopping)).
 		Scan(&jobID, &specJSON, &fence, &createdNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
@@ -601,8 +658,9 @@ AND state=?
 		return nil, internalError(err, "create claimed attempt")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
-		SET next_restart_at=NULL, healthy_since_ns=NULL, published_attempt_id=NULL
-		WHERE job_id=?`, jobID); err != nil {
+		SET bound_node_id=COALESCE(bound_node_id, ?), next_restart_at=NULL,
+			healthy_since_ns=NULL, published_attempt_id=NULL
+		WHERE job_id=?`, nodeID, jobID); err != nil {
 		return nil, internalError(err, "begin service restart attempt")
 	}
 	if err := tx.Commit(); err != nil {

@@ -594,7 +594,7 @@ func assertServiceRestartableCompletionRequeuesWithPersistedBackoff(t *testing.T
 	}
 	assertAttemptState(t, h, first.Lease.AttemptID, contract.AttemptFailed)
 
-	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID})
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, Class: contract.JobClassService})
 	if status != http.StatusNoContent {
 		t.Fatalf("pre-due restart claim status = %d body=%s, want 204", status, body)
 	}
@@ -647,7 +647,7 @@ func submitRestartService(t *testing.T, h *integrationHarness, client *http.Clie
 
 func claimRestartService(t *testing.T, h *integrationHarness, agent *http.Client, node Node) Claim {
 	t.Helper()
-	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID})
+	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, Class: contract.JobClassService})
 	if status != http.StatusOK {
 		t.Fatalf("claim restart service status = %d body=%s", status, body)
 	}

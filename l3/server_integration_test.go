@@ -325,7 +325,7 @@ func TestDispatchRecoveryCreatesExactlyOneL1JobAndPreservesScript(t *testing.T) 
 	}
 
 	agent := h.agent()
-	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"}, nil)
+	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1", Class: contract.JobClassOneShot}, nil)
 	if status != http.StatusOK {
 		t.Fatalf("claim status = %d body=%s", status, body)
 	}
@@ -354,7 +354,7 @@ func TestDispatchRecoveryCreatesExactlyOneL1JobAndPreservesScript(t *testing.T) 
 		t.Fatalf("claimed limits = %+v", claim.Job.Spec.Limits)
 	}
 
-	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"}, nil)
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1", Class: contract.JobClassOneShot}, nil)
 	if status != http.StatusNoContent {
 		t.Fatalf("second claim status = %d, want 204 (no duplicate job), body=%s", status, body)
 	}
@@ -571,7 +571,7 @@ func TestSavedWorkflowNotFoundAndRerunSnapshotReuse(t *testing.T) {
 	}
 	agent := h.agent()
 	for i := 0; i < 2; i++ {
-		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"}, nil)
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1", Class: contract.JobClassOneShot}, nil)
 		if status != http.StatusOK {
 			t.Fatalf("claim %d status = %d body=%s", i, status, body)
 		}
@@ -619,7 +619,7 @@ func TestRunLogsProxyL1OpaqueCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent := h.agent()
-	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"}, nil)
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1", Class: contract.JobClassOneShot}, nil)
 	if status != http.StatusOK {
 		t.Fatalf("claim status = %d body=%s", status, body)
 	}
@@ -713,7 +713,7 @@ func TestJobTerminalStatesProjectOntoRun(t *testing.T) {
 				t.Fatal(err)
 			}
 			agent := h.agent()
-			status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"}, nil)
+			status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1", Class: contract.JobClassOneShot}, nil)
 			if status != http.StatusOK {
 				t.Fatalf("claim status = %d body=%s", status, body)
 			}

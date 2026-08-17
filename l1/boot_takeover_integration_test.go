@@ -22,7 +22,7 @@ func assertBootTakeoverFencesAuthorityWritesButRetainsEvidence(t *testing.T) {
 	h.register(agent, "node-1")
 	job := h.submit(client, "boot-takeover-fencing", nil)
 	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{
-		NodeID: "node-1", BootSessionID: "boot-node-1",
+		NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot,
 	})
 	if status != http.StatusOK {
 		t.Fatalf("claim status = %d body=%s", status, body)

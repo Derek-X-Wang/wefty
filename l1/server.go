@@ -363,8 +363,12 @@ func (s *Server) claimJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if request.Class != contract.JobClassOneShot && request.Class != contract.JobClassService {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "claim class must be %q or %q", contract.JobClassOneShot, contract.JobClassService))
+		return
+	}
 	identity := identityFromRequest(r)
-	claim, err := s.store.ClaimJob(r.Context(), identity.NodeID, request.NodeID, request.BootSessionID)
+	claim, err := s.store.ClaimJob(r.Context(), identity.NodeID, request.NodeID, request.BootSessionID, request.Class)
 	if err != nil {
 		writeError(w, err)
 		return

@@ -151,7 +151,7 @@ func New(config Config) (*Agent, error) {
 		return nil, err
 	}
 	observer := newLifecycleObserver(clock)
-	session := newAgentSession(client, registration, heartbeatInterval, claimInterval, clock, observer)
+	session := newAgentSession(client, registration, heartbeatInterval, claimInterval, clock, observer, config.Logf)
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
 		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
@@ -187,8 +187,8 @@ func (a *Agent) Register(ctx context.Context) (l1.Node, error) {
 }
 
 // Drain stops new claims locally and marks the current boot session draining
-// at the control plane. An attempt already executing is not canceled; Run
-// returns after that attempt has uploaded its fenced completion.
+// at the control plane. Attempts already executing are not canceled; Run
+// returns after both class loops finish their resident attempt, if any.
 func (a *Agent) Drain(ctx context.Context) (l1.Node, error) {
 	return a.session.drain(ctx)
 }

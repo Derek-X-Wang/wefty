@@ -284,7 +284,7 @@ func TestSensitiveEnvironmentIsRedactedFromClientJobAPIs(t *testing.T) {
 		t.Fatalf("get response status/body = %d/%s; sensitive value must be redacted", status, body)
 	}
 
-	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 	if status != http.StatusOK {
 		t.Fatalf("claim status = %d body=%s", status, body)
 	}
@@ -327,7 +327,7 @@ func TestConcurrentClaimsExactlyOneWinner(t *testing.T) {
 			ready.Done()
 			<-start
 			nodeID := fmt.Sprintf("node-%02d", i)
-			status, _, _, err := doRequest(agents[i], http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: nodeID, BootSessionID: "boot-" + nodeID})
+			status, _, _, err := doRequest(agents[i], http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: nodeID, BootSessionID: "boot-" + nodeID, Class: contract.JobClassOneShot})
 			results <- claimResult{status: status, err: err}
 		}(i)
 	}
@@ -359,7 +359,7 @@ func TestLeaseRenewalAndFencedCompletion(t *testing.T) {
 	h.register(agent, "node-1")
 	job := h.submit(client, "dispatch-fence", []string{"linux"})
 
-	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 	if status != http.StatusOK {
 		t.Fatalf("claim status = %d body=%s", status, body)
 	}
@@ -423,7 +423,7 @@ func assertLeaseTTLAndAttemptScopedDirectives(t *testing.T) {
 	h.register(agent, "node-1")
 	job := h.submit(client, "dispatch-lease-contract", []string{"linux"})
 
-	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 	if status != http.StatusOK {
 		t.Fatalf("claim status = %d body=%s", status, body)
 	}
@@ -540,7 +540,7 @@ func TestTagMatchingOverPlainFabric(t *testing.T) {
 				t.Fatalf("authoritative tags = %v, configured %v", node.AuthoritativeTags, test.nodeTags)
 			}
 			h.submit(client, "dispatch-tags", test.jobTags)
-			status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+			status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 			if status != test.want {
 				t.Fatalf("claim status = %d, want %d body=%s", status, test.want, body)
 			}
@@ -763,7 +763,7 @@ func assertSemanticAgentAuthorityErrors(t *testing.T) {
 	t.Run("principal forbidden", func(t *testing.T) {
 		h := newIntegrationHarness(t, nil)
 		client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
-		status, _, body := h.do(client, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"})
+		status, _, body := h.do(client, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1", Class: contract.JobClassOneShot})
 		assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
 	})
 
@@ -782,7 +782,7 @@ func assertSemanticAgentAuthorityErrors(t *testing.T) {
 	t.Run("node not registered", func(t *testing.T) {
 		h := newIntegrationHarness(t, nil)
 		agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
-		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "missing-node", BootSessionID: "boot-missing"})
+		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "missing-node", BootSessionID: "boot-missing", Class: contract.JobClassOneShot})
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeNotRegistered)
 	})
 
@@ -791,7 +791,7 @@ func assertSemanticAgentAuthorityErrors(t *testing.T) {
 		agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
 		h.register(agent, "node-1")
 		h.clock.Advance(DefaultNodeDeadAfter)
-		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDead)
 	})
 
@@ -803,7 +803,7 @@ func assertSemanticAgentAuthorityErrors(t *testing.T) {
 		if status != http.StatusOK {
 			t.Fatalf("drain status = %d body=%s", status, body)
 		}
-		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDraining)
 	})
 
@@ -829,7 +829,7 @@ func assertSemanticAgentAuthorityErrors(t *testing.T) {
 		intruder := h.client(fabric.Identity{NodeID: "fabric-intruder", Tags: []string{DefaultAgentPrincipalTag}})
 		h.register(owner, "node-1")
 		job := h.submit(client, "semantic-attempt-errors", nil)
-		status, _, body := h.do(owner, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+		status, _, body := h.do(owner, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 		if status != http.StatusOK {
 			t.Fatalf("claim status = %d body=%s", status, body)
 		}

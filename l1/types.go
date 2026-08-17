@@ -141,6 +141,7 @@ const LateResultGapObservationWindowExpired LateResultGapReason = "observation_w
 type ClaimRequest struct {
 	NodeID        string `json:"node_id"`
 	BootSessionID string `json:"boot_session_id"`
+	Class         string `json:"class"`
 }
 
 type RenewalRequest struct {

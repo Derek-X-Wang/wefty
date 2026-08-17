@@ -65,7 +65,7 @@ func TestServiceAcceptanceStateMetadataAndSlotLifecycle(t *testing.T) {
 	}
 	assertNonUniqueIndex(t, h.store, "service_jobs", "service_jobs_bound_desired", []string{"bound_node_id", "desired_state"})
 
-	claim, err := h.store.ClaimJob(context.Background(), "service-agent", "service-node", node.BootSessionID)
+	claim, err := h.store.ClaimJob(context.Background(), "service-agent", "service-node", node.BootSessionID, contract.JobClassService)
 	if err != nil {
 		t.Fatal(err)
 	}

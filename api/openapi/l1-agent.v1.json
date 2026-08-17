@@ -116,8 +116,8 @@
     "/v1/agent/jobs/claim": {
       "post": {
         "operationId": "claimJob",
-        "summary": "Atomically claim one eligible queued job",
-        "description": "Eligibility uses authenticated authoritative tags. The request intentionally contains no tags.",
+        "summary": "Atomically claim one eligible queued job in one workload class",
+        "description": "Eligibility, class capacity, and service binding are evaluated inside the claim transaction using authenticated authoritative node policy. The request intentionally contains no tags or capacity.",
         "requestBody": {
           "required": true,
           "content": {
@@ -125,10 +125,11 @@
               "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["node_id", "boot_session_id"],
+                "required": ["node_id", "boot_session_id", "class"],
                 "properties": {
                   "node_id": { "type": "string" },
-                  "boot_session_id": { "type": "string" }
+                  "boot_session_id": { "type": "string" },
+                  "class": { "type": "string", "enum": ["one-shot", "service"] }
                 }
               }
             }

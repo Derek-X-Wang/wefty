@@ -392,7 +392,7 @@ func dispatchAndClaimRun(t *testing.T, h *integrationHarness, runID string) l1.C
 		t.Fatal(err)
 	}
 	agent := h.agent()
-	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"}, nil)
+	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1", Class: contract.JobClassOneShot}, nil)
 	if status != http.StatusOK {
 		t.Fatalf("claim run %s = %d body=%s", runID, status, body)
 	}

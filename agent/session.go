@@ -38,6 +38,7 @@ type agentSession struct {
 	observer          *lifecycleObserver
 	routeError        destinationErrorPolicy
 	gates             map[workloadClass]classAdmissionGate
+	logf              func(string, ...any)
 
 	drainOnce      sync.Once
 	drainRequested chan struct{}
@@ -57,11 +58,11 @@ type routedDestinationError struct {
 func (err *routedDestinationError) Error() string { return err.err.Error() }
 func (err *routedDestinationError) Unwrap() error { return err.err }
 
-func newAgentSession(client *Client, registration contract.NodeRegistration, heartbeatInterval, claimInterval time.Duration, clock Clock, observer *lifecycleObserver) *agentSession {
+func newAgentSession(client *Client, registration contract.NodeRegistration, heartbeatInterval, claimInterval time.Duration, clock Clock, observer *lifecycleObserver, logf func(string, ...any)) *agentSession {
 	return &agentSession{
 		client: client, registration: registration,
 		heartbeatInterval: heartbeatInterval, claimInterval: claimInterval,
-		clock: clock, observer: observer,
+		clock: clock, observer: observer, logf: logf,
 		routeError: func(destination errorDestination, err error) error {
 			if destination == errorDestinationAttemptAuthority {
 				return nil
@@ -88,9 +89,8 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 
 func (session *agentSession) drain(ctx context.Context) (l1.Node, error) {
 	session.observer.setSession(LifecycleDraining, 0, nil)
-	node, err := session.client.Drain(ctx, session.registration.NodeID, session.registration.BootSessionID)
 	session.drainOnce.Do(func() { close(session.drainRequested) })
-	return node, err
+	return session.client.Drain(ctx, session.registration.NodeID, session.registration.BootSessionID)
 }
 
 // run is process-lifetime supervision. Protocol failures are acted on at the
@@ -140,7 +140,7 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 		backoff.reset()
 		session.markReady()
 
-		failure := session.serveRegistered(runContext, execute, backoff)
+		failure := session.serveRegistered(runContext, execute)
 		if failure.err == nil {
 			return nil
 		}
@@ -166,7 +166,7 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 	}
 }
 
-func (session *agentSession) serveRegistered(ctx context.Context, execute sessionAttemptExecution, backoff *sessionBackoff) destinationError {
+func (session *agentSession) serveRegistered(ctx context.Context, execute sessionAttemptExecution) destinationError {
 	sessionContext, stopSession := context.WithCancel(ctx)
 	heartbeatErrors := make(chan destinationError, 1)
 	heartbeatDone := make(chan struct{})
@@ -174,44 +174,98 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 		defer close(heartbeatDone)
 		session.heartbeatLoop(sessionContext, heartbeatErrors)
 	}()
+	claimFailures := make(chan destinationError, 2)
+	claimLoopsDone := make(chan struct{}, 2)
+	for _, claimClass := range []struct {
+		gateKey  workloadClass
+		selector string
+	}{
+		{gateKey: workloadClassOneShot, selector: contract.JobClassOneShot},
+		{gateKey: workloadClassService, selector: contract.JobClassService},
+	} {
+		go func() {
+			defer func() { claimLoopsDone <- struct{}{} }()
+			failure := session.claimClassLoop(sessionContext, claimClass.gateKey, claimClass.selector, execute)
+			if failure.err != nil {
+				claimFailures <- failure
+			}
+		}()
+	}
+	claimLoopsRemaining := 2
 	defer func() {
 		stopSession()
 		<-heartbeatDone
+		for claimLoopsRemaining > 0 {
+			<-claimLoopsDone
+			claimLoopsRemaining--
+		}
 	}()
 
+	drainRequested := session.drainRequested
 	for {
 		select {
 		case <-sessionContext.Done():
 			return destinationError{}
+		case <-drainRequested:
+			session.observer.setSession(LifecycleDraining, 0, nil)
+			if session.logf != nil {
+				session.logf("agent: draining; waiting for %d class claim loops and their resident attempts", claimLoopsRemaining)
+			}
+			drainRequested = nil
+		case <-claimLoopsDone:
+			claimLoopsRemaining--
+			if claimLoopsRemaining == 0 {
+				return destinationError{}
+			}
+		case failure := <-heartbeatErrors:
+			return failure
+		case failure := <-claimFailures:
+			return failure
+		}
+	}
+}
+
+// claimClassLoop owns one blocking claim-execute-wait path for one fixed
+// workload class. Its admission gate remains the only execution-state owner;
+// #85 widens the number of loop instances after reading L1-granted capacity.
+func (session *agentSession) claimClassLoop(
+	ctx context.Context,
+	gateKey workloadClass,
+	selector string,
+	execute sessionAttemptExecution,
+) destinationError {
+	backoff := newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax)
+	for {
+		select {
+		case <-ctx.Done():
+			return destinationError{}
 		case <-session.drainRequested:
 			session.observer.setSession(LifecycleDraining, 0, nil)
 			return destinationError{}
-		case failure := <-heartbeatErrors:
-			return failure
 		default:
 		}
 
 		claimStarted := session.clock.Now()
-		claim, err := session.client.Claim(sessionContext, session.registration.NodeID, session.registration.BootSessionID)
+		claim, err := session.client.Claim(ctx, session.registration.NodeID, session.registration.BootSessionID, selector)
 		if err != nil {
-			if sessionContext.Err() != nil || session.isDraining() {
+			if ctx.Err() != nil || session.isDraining() {
 				return destinationError{}
 			}
 			classification := classifyAgentProtocolError(err)
 			if classification.destination == errorDestinationTransient {
 				delay := backoff.next()
 				session.observer.setSession(LifecycleRejoining, delay, err)
-				if waitErr := session.wait(sessionContext, delay, heartbeatErrors); waitErr != nil {
+				if waitErr := session.waitWithoutHeartbeat(ctx, delay); waitErr != nil {
 					return destinationFromError(waitErr)
 				}
 				continue
 			}
-			return destinationError{destination: classification.destination, err: fmt.Errorf("agent: claim job: %w", err)}
+			return destinationError{destination: classification.destination, err: fmt.Errorf("agent: claim %s job: %w", selector, err)}
 		}
 		backoff.reset()
 		session.markReady()
 		if claim == nil {
-			if err := session.wait(sessionContext, session.claimInterval, heartbeatErrors); err != nil {
+			if err := session.waitWithoutHeartbeat(ctx, session.claimInterval); err != nil {
 				return destinationFromError(err)
 			}
 			continue
@@ -221,12 +275,11 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 		session.attempts.Add(1)
 		go func(claim l1.Claim, started time.Time) {
 			defer session.attempts.Done()
-			gate := session.gates[workloadClassFor(claim.Job.Spec.Class)]
-			admitted, err := gate.execute(sessionContext, func(attemptContext context.Context) (errorDestination, error) {
+			admitted, err := session.gates[gateKey].execute(ctx, func(attemptContext context.Context) (errorDestination, error) {
 				return execute(attemptContext, claim, started)
 			}, session.routeError)
 			if !admitted && err == nil {
-				err = errors.New("agent: one-shot admission gate rejected a claimed attempt")
+				err = fmt.Errorf("agent: %s admission gate rejected a claimed attempt", selector)
 			}
 			attemptDone <- err
 		}(*claim, claimStarted)
@@ -235,16 +288,11 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 		for {
 			select {
 			case <-ctx.Done():
-				stopSession()
 				<-attemptDone
 				return destinationError{}
 			case <-session.drainRequested:
 				draining = true
 				session.observer.setSession(LifecycleDraining, 0, nil)
-			case failure := <-heartbeatErrors:
-				stopSession()
-				<-attemptDone
-				return failure
 			case err := <-attemptDone:
 				if draining {
 					return destinationError{}
@@ -286,21 +334,6 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			nextDelay = session.heartbeatInterval
 			session.markReady()
 		}
-	}
-}
-
-func (session *agentSession) wait(ctx context.Context, duration time.Duration, heartbeatErrors <-chan destinationError) error {
-	timer := session.clock.NewTimer(duration)
-	defer stopTimer(timer)
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-session.drainRequested:
-		return context.Canceled
-	case failure := <-heartbeatErrors:
-		return &routedDestinationError{destination: failure.destination, err: failure.err}
-	case <-timer.C():
-		return nil
 	}
 }
 

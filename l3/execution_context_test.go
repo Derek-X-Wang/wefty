@@ -29,7 +29,7 @@ func TestDispatchDeliversExactRunEnvironmentAndStoresTokenHash(t *testing.T) {
 	}
 
 	agent := h.agent()
-	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"}, nil)
+	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1", Class: contract.JobClassOneShot}, nil)
 	if status != http.StatusOK {
 		t.Fatalf("claim status = %d body=%s", status, body)
 	}
@@ -260,7 +260,7 @@ func claimRunTokens(t *testing.T, h *integrationHarness, count int) map[string]s
 	agent := h.agent()
 	tokens := make(map[string]string, count)
 	for range count {
-		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1"}, nil)
+		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1", Class: contract.JobClassOneShot}, nil)
 		if status != http.StatusOK {
 			t.Fatalf("claim status = %d body=%s", status, body)
 		}

@@ -156,7 +156,7 @@ func assertDurablePostAuthorityEvidence(t *testing.T) {
 	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorIdempotencyConflict)
 	assertJobAndAttemptState(t, h.store, job.JobID, claim.Lease.AttemptID, contract.JobFailed, contract.AttemptLost)
 
-	status, _, body = h.do(agent2, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-2", BootSessionID: "boot-node-2"})
+	status, _, body = h.do(agent2, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-2", BootSessionID: "boot-node-2", Class: contract.JobClassOneShot})
 	if status != http.StatusNoContent {
 		t.Fatalf("second execution claim status = %d, want 204 body=%s", status, body)
 	}
@@ -279,7 +279,7 @@ func TestStaleAndDeadNodesCannotClaim(t *testing.T) {
 		h.submit(client, "stale-claim", []string{"linux"})
 		h.clock.Advance(DefaultNodeStaleAfter)
 
-		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
 		node, err := getNode(context.Background(), h.store.db, "node-1")
 		if err != nil {
@@ -304,7 +304,7 @@ func TestStaleAndDeadNodesCannotClaim(t *testing.T) {
 		h.register(agent, "node-1")
 		h.submit(client, "dead-claim", []string{"linux"})
 		h.clock.Advance(DefaultNodeDeadAfter)
-		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDead)
 		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", HeartbeatRequest{BootSessionID: "boot-node-1"})
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDead)
@@ -364,7 +364,7 @@ func TestDrainStopsClaimsAndAllowsRunningAttemptToFinish(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("complete while draining status = %d body=%s", status, body)
 	}
-	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDraining)
 	queued, err := h.store.GetJob(context.Background(), queuedJobID)
 	if err != nil {
@@ -499,7 +499,7 @@ func TestControlPlaneRestartRecoversQueuedAndRunningJobs(t *testing.T) {
 
 func claimJob(t *testing.T, h *integrationHarness, client *http.Client, nodeID string) Claim {
 	t.Helper()
-	status, _, body := h.do(client, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: nodeID, BootSessionID: "boot-" + nodeID})
+	status, _, body := h.do(client, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: nodeID, BootSessionID: "boot-" + nodeID, Class: contract.JobClassOneShot})
 	if status != http.StatusOK {
 		t.Fatalf("claim status = %d body=%s", status, body)
 	}
@@ -559,7 +559,7 @@ func submitOverHTTP(t *testing.T, client *http.Client, dispatchKey string) Job {
 
 func claimOverHTTP(t *testing.T, client *http.Client, nodeID, bootID string) Claim {
 	t.Helper()
-	status, _, body, err := doRequest(client, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: nodeID, BootSessionID: bootID})
+	status, _, body, err := doRequest(client, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: nodeID, BootSessionID: bootID, Class: contract.JobClassOneShot})
 	if err != nil {
 		t.Fatal(err)
 	}

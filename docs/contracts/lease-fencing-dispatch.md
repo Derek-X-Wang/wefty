@@ -12,13 +12,34 @@ concern and does not replace the L1 Fabric principal boundary.
 
 A claim is one SQLite transaction that verifies durable operator intent permits
 claims, selects a `queued` job whose normalized routing tags are a subset of
-the authenticated node's authoritative tags, creates an attempt, assigns a new
-fence, establishes a lease, and moves the job to `claimed`. Exactly one
-concurrent claimant commits.
+the authenticated node's authoritative tags and whose workload class has
+capacity, creates an attempt, assigns a new fence, establishes a lease, and
+moves the job to `claimed`. Exactly one concurrent claimant commits.
 
-The request contains node ID and boot-session ID but no routing tags. The
-control plane obtains tags from authenticated Fabric identity plus operator
-configuration. Nodes in `stale`, `dead`, or `draining` state cannot claim.
+The request contains node ID, boot-session ID, and a required fixed class
+selector (`one-shot` or `service`), but no routing tags or capacity. A one-shot
+claim excludes service rows and admits only while active one-shot attempts are
+below `max_oneshot_slots`. A service claim joins `service_jobs`, requires desired
+`running`, a binding absent or equal to the claiming node, and a due restart;
+an unbound candidate is admitted only while binding occupancy is below
+`max_service_slots`. An already-bound service passes the capacity predicate
+unconditionally because its binding is the slot it already holds. Due bindings
+sort before unbound candidates, while all node eligibility remains inside the
+selecting `WHERE` so an older ineligible row cannot head-of-line block. The
+first service claim binds the node in the same transaction.
+
+The agent issues one fixed claim loop per class. Each loop blocks on its own
+existing class admission gate, currently pinned to one resident attempt, so a
+service cannot prevent the one-shot loop from asking for work and vice versa.
+Issue #85 owns widening those loop counts to the L1-granted capacities,
+capacity negotiation, and per-job local-quiescence exclusion.
+
+The control plane obtains tags and capacity from authenticated Fabric identity
+plus operator configuration. Nodes in `stale`, `dead`, or `draining` state
+cannot claim. SQLite's immediate writer transaction serializes the
+count-then-insert; a future Postgres store must lock the node row or use
+serializable retry before relying on the same admission rule.
+
 The first registration binds the stable operator-facing node ID to the
 authenticated Fabric identity. Later boot sessions may replace that node row
 only from the same Fabric identity, so a transport-internal ID need not leak
@@ -121,8 +142,10 @@ back to `alive`, while a dead node must register its boot session again.
 `POST /v1/agent/nodes/{node_id}/drain` changes an alive or stale boot session
 to `draining` idempotently. Draining nodes continue heartbeating and retain
 authority for attempts they already own, but cannot claim another job. On
-SIGINT or SIGTERM the agent invokes this verb, waits for its running attempt to
-upload completion, and exits; a second signal forces local cancellation.
+SIGINT or SIGTERM the agent invokes this verb, waits for both class loops to
+finish the resident attempt each is already waiting on, and exits. This is only
+a join around the pre-existing per-attempt wait; issue #88 owns service stop
+transitions, fenced shutdown completion, and forced-drain ordering.
 
 Lease renewal continues after the subprocess exits while redacted output is
 flushed, durable logs are acknowledged, and the idempotent completion request
