@@ -2,6 +2,7 @@
   "schema_version": 1,
   "dispatch_key": "run_01JZK0:future",
   "kind": "future.microvm",
+  "class": "one-shot",
   "execution": {
     "executable": {
       "inline_base64": "IyEvYmluL3NoCg==",

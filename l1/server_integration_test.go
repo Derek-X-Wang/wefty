@@ -175,6 +175,7 @@ func validJobSpec(dispatchKey string, tags []string) contract.JobSpec {
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   dispatchKey,
 		Kind:          "process",
+		Class:         contract.JobClassOneShot,
 		RoutingTags:   tags,
 		Execution: contract.ExecutionSpec{
 			Executable:       contract.ExecutableSpec{Path: "/bin/echo"},
@@ -182,6 +183,61 @@ func validJobSpec(dispatchKey string, tags []string) contract.JobSpec {
 			WorkingDirectory: "/tmp",
 			HandoffDirectory: "/tmp/handoff",
 		},
+	}
+}
+
+func TestServiceJobSpecAcceptsPortlessExecutionWithoutHandoff(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	maxRestarts := 4
+	spec := validJobSpec("service-contract", nil)
+	spec.Class = contract.JobClassService
+	spec.Execution.HandoffDirectory = ""
+	spec.Restart = contract.RestartAlways
+	spec.MaxRestartStreak = &maxRestarts
+
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
+	if status != http.StatusCreated {
+		t.Fatalf("submit service status = %d body=%s", status, body)
+	}
+	var job Job
+	if err := json.Unmarshal(body, &job); err != nil {
+		t.Fatal(err)
+	}
+	if job.Spec.Class != contract.JobClassService || job.Spec.PublishedPort != nil || job.Spec.Restart != contract.RestartAlways {
+		t.Fatalf("persisted service spec = %#v", job.Spec)
+	}
+}
+
+func TestJobSpecClassValidationIsConditional(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+
+	tests := []struct {
+		name   string
+		mutate func(*contract.JobSpec)
+		want   int
+	}{
+		{name: "missing class", mutate: func(spec *contract.JobSpec) { spec.Class = "" }, want: http.StatusBadRequest},
+		{name: "one-shot missing handoff", mutate: func(spec *contract.JobSpec) { spec.Execution.HandoffDirectory = "" }, want: http.StatusBadRequest},
+		{name: "service missing restart", mutate: func(spec *contract.JobSpec) {
+			spec.Class = contract.JobClassService
+			spec.Execution.HandoffDirectory = ""
+		}, want: http.StatusBadRequest},
+		{name: "unknown open class", mutate: func(spec *contract.JobSpec) {
+			spec.Class = "scheduled"
+			spec.Execution.HandoffDirectory = ""
+		}, want: http.StatusCreated},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			spec := validJobSpec(fmt.Sprintf("class-validation-%d", index), nil)
+			test.mutate(&spec)
+			status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
+			if status != test.want {
+				t.Fatalf("submit status = %d, want %d body=%s", status, test.want, body)
+			}
+		})
 	}
 }
 

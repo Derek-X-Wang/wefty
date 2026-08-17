@@ -91,6 +91,7 @@ func TestAgentUploadsLongPartialAndInvalidUTF8Output(t *testing.T) {
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   "e2e-raw-" + fmt.Sprint(time.Now().UnixNano()),
 		Kind:          "process",
+		Class:         contract.JobClassOneShot,
 		RoutingTags:   []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable:       contract.ExecutableSpec{Path: agentHelperPath},
@@ -146,6 +147,7 @@ func TestAgentLogPollTailsRunningProcess(t *testing.T) {
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   "e2e-tail-" + fmt.Sprint(time.Now().UnixNano()),
 		Kind:          "process",
+		Class:         contract.JobClassOneShot,
 		RoutingTags:   []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable:       contract.ExecutableSpec{Path: agentHelperPath},
@@ -228,6 +230,7 @@ func runProcessE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, a
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   "e2e-" + fmt.Sprint(time.Now().UnixNano()),
 		Kind:          "process",
+		Class:         contract.JobClassOneShot,
 		RoutingTags:   []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable:       contract.ExecutableSpec{Path: agentHelperPath},

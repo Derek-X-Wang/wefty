@@ -17,10 +17,10 @@ func terminateProcessGroup(int) error       { return errUnsupportedPlatform }
 func killProcessGroup(int) error            { return errUnsupportedPlatform }
 func processGroupAlive(int) bool            { return false }
 
-func resultFromWait(waitErr error, state *os.ProcessState) contract.ProcessResult {
+func resultFromWait(waitErr error, state *os.ProcessState, _ contract.TerminationCause) contract.ProcessResult {
 	if state != nil {
 		exitCode := state.ExitCode()
 		return contract.ProcessResult{ExitCode: &exitCode}
 	}
-	return contract.ProcessResult{SpawnError: waitErr.Error()}
+	return spawnFailure(contract.SpawnFailureProcessWait, waitErr)
 }

@@ -2,6 +2,7 @@
   "schema_version": 1,
   "dispatch_key": "run_01JZK0:root",
   "kind": "process",
+  "class": "one-shot",
   "routing_tags": ["arch:arm64", "os:darwin"],
   "execution": {
     "executable": { "path": "/usr/bin/git" },

@@ -73,12 +73,14 @@ type NodeList struct {
 
 // ProcessResult matches the M0 completion contract. Pointer fields preserve
 // the distinction between an omitted exit code and exit code zero. OutputError
-// makes incomplete durable output a terminal failure rather than false success.
+// makes incomplete durable output a terminal failure rather than false success;
+// signal outcomes carry a structured termination initiator.
 type ProcessResult struct {
-	SpawnError  string `json:"spawn_error,omitempty"`
-	OutputError string `json:"output_error,omitempty"`
-	ExitCode    *int   `json:"exit_code,omitempty"`
-	Signal      string `json:"signal,omitempty"`
+	SpawnError       *contract.SpawnFailure    `json:"spawn_error,omitempty"`
+	OutputError      string                    `json:"output_error,omitempty"`
+	ExitCode         *int                      `json:"exit_code,omitempty"`
+	Signal           string                    `json:"signal,omitempty"`
+	TerminationCause contract.TerminationCause `json:"termination_cause,omitempty"`
 }
 
 type CompletionRequest struct {

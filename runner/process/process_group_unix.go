@@ -36,14 +36,14 @@ func ignoreMissingProcessGroup(err error) error {
 	return err
 }
 
-func resultFromWait(waitErr error, state *os.ProcessState) contract.ProcessResult {
+func resultFromWait(waitErr error, state *os.ProcessState, cause contract.TerminationCause) contract.ProcessResult {
 	if state != nil {
 		if waitStatus, ok := state.Sys().(syscall.WaitStatus); ok && waitStatus.Signaled() {
-			return contract.ProcessResult{Signal: waitStatus.Signal().String()}
+			return contract.ProcessResult{Signal: waitStatus.Signal().String(), TerminationCause: cause}
 		}
 		exitCode := state.ExitCode()
 		return contract.ProcessResult{ExitCode: &exitCode}
 	}
 
-	return contract.ProcessResult{SpawnError: waitErr.Error()}
+	return spawnFailure(contract.SpawnFailureProcessWait, waitErr)
 }

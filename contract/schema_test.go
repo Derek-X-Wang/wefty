@@ -61,6 +61,8 @@ func TestValidFixturesRoundTripThroughGoTypes(t *testing.T) {
 		new  func() any
 	}{
 		{"testdata/schemas/job-spec/valid-process.json", func() any { return new(JobSpec) }},
+		{"testdata/schemas/job-spec/valid-service.json", func() any { return new(JobSpec) }},
+		{"testdata/schemas/job-spec/valid-unknown-class.json", func() any { return new(JobSpec) }},
 		{"testdata/schemas/job-spec/valid-unknown-kind.json", func() any { return new(JobSpec) }},
 		{"testdata/schemas/envelope/valid.json", func() any { return new(Envelope) }},
 		{"testdata/schemas/gate-result/valid.json", func() any { return new(GateResult) }},
@@ -124,6 +126,31 @@ func TestUnknownKindParsesButExecutionRejects(t *testing.T) {
 	}
 }
 
+func TestUnknownClassParsesButExecutionRejects(t *testing.T) {
+	t.Parallel()
+
+	raw, err := contractFiles.ReadFile("testdata/schemas/job-spec/valid-unknown-class.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec JobSpec
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatalf("unknown class must decode: %v", err)
+	}
+	if spec.Class != "scheduled" {
+		t.Fatalf("class changed during decode: %q", spec.Class)
+	}
+
+	err = CheckWorkloadClass(spec.Class)
+	var executionErr *ClassExecutionError
+	if !errors.As(err, &executionErr) {
+		t.Fatalf("expected ClassExecutionError, got %v", err)
+	}
+	if executionErr.Code() != ErrorUnsupportedClass {
+		t.Fatalf("unexpected error code: %q", executionErr.Code())
+	}
+}
+
 func TestJobKindSchemaIsOpen(t *testing.T) {
 	t.Parallel()
 
@@ -136,6 +163,21 @@ func TestJobKindSchemaIsOpen(t *testing.T) {
 	kind := properties["kind"].(map[string]any)
 	if _, closed := kind["enum"]; closed {
 		t.Fatal("job kind must not use a closed JSON Schema enum")
+	}
+}
+
+func TestJobClassSchemaIsOpen(t *testing.T) {
+	t.Parallel()
+
+	doc := unmarshalJSONFile(t, "schemas/v1/job-spec.schema.json")
+	root := doc.(map[string]any)
+	properties := root["properties"].(map[string]any)
+	class := properties["class"].(map[string]any)
+	if _, closed := class["enum"]; closed {
+		t.Fatal("job class must not use a closed JSON Schema enum")
+	}
+	if _, closed := class["const"]; closed {
+		t.Fatal("job class must not use a JSON Schema const")
 	}
 }
 

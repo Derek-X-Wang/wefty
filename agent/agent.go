@@ -380,7 +380,7 @@ func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) error {
 	if completionErr != nil {
 		return fmt.Errorf("agent: complete attempt: %w", completionErr)
 	}
-	if a.handoffs != nil {
+	if a.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
 		succeeded := outcome.err == nil && outcome.result.ExitCode != nil && *outcome.result.ExitCode == 0
 		if err := a.handoffs.finish(claim.Job.Spec, a.registration.NodeID, succeeded); err != nil {
 			return fmt.Errorf("agent: finish handoff lifecycle: %w", err)
@@ -409,26 +409,32 @@ func (a *Agent) completeWithRetry(ctx context.Context, claim l1.Claim, request l
 }
 
 func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
+	if err := contract.CheckWorkloadClass(claim.Job.Spec.Class); err != nil {
+		return spawnFailure(contract.SpawnFailureUnsupportedClass, err), err
+	}
 	if err := contract.CheckExecutableKind(claim.Job.Spec.Kind); err != nil {
-		return contract.ProcessResult{SpawnError: err.Error()}, err
+		return spawnFailure(contract.SpawnFailureUnsupportedKind, err), err
 	}
 	if claim.Job.Spec.RuntimeHandler != "" {
 		err := fmt.Errorf("runtime handler %q is not supported for process jobs", claim.Job.Spec.RuntimeHandler)
-		return contract.ProcessResult{SpawnError: err.Error()}, err
+		return spawnFailure(contract.SpawnFailureUnsupportedRuntimeHandler, err), err
 	}
-	if a.handoffs != nil {
+	if a.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
 		if err := a.handoffs.prepare(claim.Job.Spec, a.registration.NodeID); err != nil {
-			return contract.ProcessResult{SpawnError: err.Error()}, err
+			return spawnFailure(contract.SpawnFailureHandoffPreparation, err), err
 		}
 	}
 	execution, cleanupExecutable, err := materializeExecutable(claim.Job.Spec.Execution, claim.Lease.AttemptID)
 	if err != nil {
-		return contract.ProcessResult{SpawnError: err.Error()}, err
+		return spawnFailure(contract.SpawnFailureExecutableMaterialization, err), err
 	}
 	defer cleanupExecutable()
-	bridge, err := a.startWorkflowBridge(ctx, execution)
-	if err != nil {
-		return contract.ProcessResult{SpawnError: err.Error()}, err
+	var bridge *workflowBridge
+	if claim.Job.Spec.Class == contract.JobClassOneShot {
+		bridge, err = a.startWorkflowBridge(ctx, execution)
+		if err != nil {
+			return spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, err), err
+		}
 	}
 	if bridge != nil {
 		defer bridge.close()
@@ -441,7 +447,7 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 	if a.client != nil {
 		uploader, err = newBatchingLogSink(ctx, a.client, claim, a.logSpool, a.clock, a.logBatchSize, a.logFlushInterval, a.logRetryInterval)
 		if err != nil {
-			return contract.ProcessResult{SpawnError: err.Error()}, err
+			return spawnFailure(contract.SpawnFailureLogSinkSetup, err), err
 		}
 		sinks = append(sinks, uploader)
 	}
@@ -486,6 +492,10 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 		result = contract.ProcessResult{OutputError: finalizationErr.Error()}
 	}
 	return result, errors.Join(runErr, finalizationErr)
+}
+
+func spawnFailure(code contract.SpawnFailureCode, err error) contract.ProcessResult {
+	return contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: code, Message: err.Error()}}
 }
 
 func stringOrDefault(value, fallback string) string {
@@ -546,7 +556,10 @@ func renewalDelay(now, expires time.Time, configured time.Duration) time.Duratio
 }
 
 func toL1Result(result contract.ProcessResult) l1.ProcessResult {
-	return l1.ProcessResult{SpawnError: result.SpawnError, OutputError: result.OutputError, ExitCode: result.ExitCode, Signal: result.Signal}
+	return l1.ProcessResult{
+		SpawnError: result.SpawnError, OutputError: result.OutputError, ExitCode: result.ExitCode,
+		Signal: result.Signal, TerminationCause: result.TerminationCause,
+	}
 }
 
 func (a *Agent) wait(ctx context.Context, duration time.Duration, heartbeatErrors <-chan error) error {

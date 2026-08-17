@@ -116,13 +116,17 @@ func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   "service-acceptance-" + strconv.FormatInt(time.Now().UnixNano(), 10),
 		Kind:          "process",
-		RoutingTags:   []string{"service-acceptance"},
+		// The lane submits a genuine service-class spec: #59 made class
+		// required and exempted services from handoff_directory, so a spec
+		// carrying one would prove the wrong path ran (spec §4.4).
+		Class:       contract.JobClassService,
+		Restart:     contract.RestartAlways,
+		RoutingTags: []string{"service-acceptance"},
 		Execution: contract.ExecutionSpec{
 			Executable:       contract.ExecutableSpec{Path: echoServiceBinaryPath},
 			Argv:             []string{echoServiceBinaryPath},
 			Env:              map[string]string{servicePortEnvironment: strconv.Itoa(port)},
 			WorkingDirectory: workingDirectory,
-			HandoffDirectory: workingDirectory,
 		},
 		Limits: &contract.JobLimits{
 			MaxRuntimeSeconds:  30,

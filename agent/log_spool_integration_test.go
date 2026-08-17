@@ -89,7 +89,7 @@ func TestAgentCompletesWithoutDuplicateLogsAfterNetworkLossMidJob(t *testing.T) 
 	store, stopServer := startRestartableLogServer(t, ctx, serverFabric, databasePath, clock)
 	directory := t.TempDir()
 	job, _, err := store.CreateJob(ctx, contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "network-mid-job", Kind: "process", RoutingTags: []string{"linux"},
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "network-mid-job", Kind: "process", Class: contract.JobClassOneShot, RoutingTags: []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable: contract.ExecutableSpec{Path: agentHelperPath},
 			Argv:       []string{"processhelper", "paced-output", "200"}, WorkingDirectory: directory, HandoffDirectory: directory,
@@ -256,7 +256,7 @@ func createClaimForDurableLogs(t *testing.T, store *l1.Store, clock Clock) l1.Cl
 	}
 	directory := t.TempDir()
 	job, _, err := store.CreateJob(context.Background(), contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "durable-" + directory, Kind: "process", RoutingTags: []string{"linux"},
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "durable-" + directory, Kind: "process", Class: contract.JobClassOneShot, RoutingTags: []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"},
 			WorkingDirectory: directory, HandoffDirectory: directory,

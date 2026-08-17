@@ -88,20 +88,41 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "spawn_error": { "type": "string" },
+          "spawn_error": { "$ref": "#/components/schemas/SpawnFailure" },
           "output_error": {
             "type": "string",
             "description": "Output redaction, durable spooling, or upload finalization failed; the process exit code is not authoritative success."
           },
           "exit_code": { "type": "integer" },
-          "signal": { "type": "string" }
+          "signal": { "type": "string" },
+          "termination_cause": {
+            "enum": ["spontaneous", "agent", "guardian"],
+            "description": "Structured initiator for a signal termination; never infer intent from signal or error strings."
+          }
+        },
+        "dependentRequired": {
+          "signal": ["termination_cause"],
+          "termination_cause": ["signal"]
         },
         "oneOf": [
           { "required": ["spawn_error"] },
           { "required": ["output_error"] },
           { "required": ["exit_code"] },
-          { "required": ["signal"] }
+          { "required": ["signal", "termination_cause"] }
         ]
+      },
+      "SpawnFailure": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "message"],
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable machine-readable spawn failure code. Unknown codes default to terminal service policy."
+          },
+          "message": { "type": "string", "minLength": 1 }
+        }
       },
       "LogPage": {
         "type": "object",
