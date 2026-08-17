@@ -25,9 +25,10 @@ import (
 )
 
 var (
-	agentHelperPath  string
-	agentBinaryPath  string
-	controlPlanePath string
+	agentHelperPath       string
+	agentBinaryPath       string
+	controlPlanePath      string
+	echoServiceBinaryPath string
 )
 
 func TestMain(main *testing.M) {
@@ -39,12 +40,14 @@ func TestMain(main *testing.M) {
 	agentHelperPath = filepath.Join(directory, "processhelper")
 	agentBinaryPath = filepath.Join(directory, "wefty-agent")
 	controlPlanePath = filepath.Join(directory, "wefty-l1")
+	echoServiceBinaryPath = filepath.Join(directory, "wefty-echo-service")
 	for _, build := range []struct {
 		name, output, pkg string
 	}{
 		{name: "process helper", output: agentHelperPath, pkg: "github.com/Derek-X-Wang/wefty/runner/process/testdata/processhelper"},
 		{name: "agent", output: agentBinaryPath, pkg: "github.com/Derek-X-Wang/wefty/cmd/wefty-agent"},
 		{name: "control plane", output: controlPlanePath, pkg: "github.com/Derek-X-Wang/wefty/cmd/wefty-l1"},
+		{name: "echo service", output: echoServiceBinaryPath, pkg: "github.com/Derek-X-Wang/wefty/cmd/wefty-echo-service"},
 	} {
 		command := exec.Command("go", "build", "-o", build.output, build.pkg)
 		if output, buildErr := command.CombinedOutput(); buildErr != nil {
