@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"sync"
 	"time"
 
@@ -156,8 +155,7 @@ func (sink *batchingLogSink) upload(events []contract.LogEvent) error {
 			}
 			return sink.spool.acknowledge(sink.ctx, sink.claim.Lease.AttemptID, response.Acknowledged)
 		}
-		var protocolErr *ProtocolError
-		if errors.As(err, &protocolErr) && protocolErr.StatusCode < http.StatusInternalServerError {
+		if classifyAgentProtocolError(err).destination != errorDestinationTransient {
 			return err
 		}
 		timer := sink.clock.NewTimer(sink.retryInterval)
@@ -186,11 +184,6 @@ func validateLogAcknowledgement(events []contract.LogEvent, acknowledged map[con
 		}
 	}
 	return nil
-}
-
-func retryableAgentProtocolError(err error) bool {
-	var protocolErr *ProtocolError
-	return !errors.As(err, &protocolErr) || protocolErr.StatusCode >= http.StatusInternalServerError
 }
 
 func (sink *batchingLogSink) setError(err error) {

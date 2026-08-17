@@ -6,9 +6,10 @@ import (
 )
 
 // errorDestination is the scope that decides whether a failed operation is
-// absorbed by its owner or propagated to the process-lifetime caller. The
-// classifier that assigns destinations lands separately; until then every
-// error is unclassified and the session preserves the existing propagation.
+// absorbed by its owner or propagated to the process-lifetime caller.
+// Protocol operations receive a code-keyed destination; local failures and
+// successful attempts remain unclassified. The session still preserves the
+// existing propagation policy until the resilience cutover wires reactions.
 type errorDestination uint8
 
 const (

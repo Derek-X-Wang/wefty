@@ -78,11 +78,11 @@ func (session *agentSession) run(ctx context.Context, execute func(context.Conte
 	}()
 
 	if _, err := session.register(runContext); err != nil {
-		return fmt.Errorf("agent: register node: %w", err)
+		return session.routeError(classifyAgentProtocolError(err).destination, fmt.Errorf("agent: register node: %w", err))
 	}
 	if session.isDraining() {
 		if _, err := session.client.Drain(runContext, session.registration.NodeID, session.registration.BootSessionID); err != nil {
-			return fmt.Errorf("agent: drain node: %w", err)
+			return session.routeError(classifyAgentProtocolError(err).destination, fmt.Errorf("agent: drain node: %w", err))
 		}
 		return nil
 	}
@@ -114,7 +114,8 @@ func (session *agentSession) run(ctx context.Context, execute func(context.Conte
 			if runContext.Err() != nil || session.isDraining() {
 				return nil
 			}
-			if retryableAgentProtocolError(err) {
+			classification := classifyAgentProtocolError(err)
+			if classification.destination == errorDestinationTransient {
 				if waitErr := session.wait(runContext, session.claimInterval, heartbeatErrors); waitErr != nil {
 					if errors.Is(waitErr, context.Canceled) {
 						return nil
@@ -123,7 +124,7 @@ func (session *agentSession) run(ctx context.Context, execute func(context.Conte
 				}
 				continue
 			}
-			return session.routeError(errorDestinationUnclassified, fmt.Errorf("agent: claim job: %w", err))
+			return session.routeError(classification.destination, fmt.Errorf("agent: claim job: %w", err))
 		}
 		if claim == nil {
 			if err := session.wait(runContext, session.claimInterval, heartbeatErrors); err != nil {
@@ -162,11 +163,12 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			return
 		case <-timer.C():
 			if _, err := session.client.Heartbeat(ctx, session.registration.NodeID, session.registration.BootSessionID); err != nil {
-				if retryableAgentProtocolError(err) {
+				classification := classifyAgentProtocolError(err)
+				if classification.destination == errorDestinationTransient {
 					continue
 				}
 				select {
-				case failures <- destinationError{destination: errorDestinationUnclassified, err: fmt.Errorf("agent: heartbeat: %w", err)}:
+				case failures <- destinationError{destination: classification.destination, err: fmt.Errorf("agent: heartbeat: %w", err)}:
 				default:
 				}
 				return

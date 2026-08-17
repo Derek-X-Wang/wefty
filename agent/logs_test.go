@@ -38,8 +38,8 @@ func TestBatchingLogSinkRetriesTheIdenticalBatch(t *testing.T) {
 		mu.Unlock()
 		if requestNumber == 1 {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal, Message: "try again", Retryable: true}})
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal, Message: "try again", Retryable: false}})
 			return
 		}
 		var request l1.AppendLogsRequest

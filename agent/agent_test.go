@@ -260,9 +260,9 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 			default:
 			}
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
+			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
-				Code: contract.ErrorInternal, Message: "completion temporarily unavailable", Retryable: true,
+				Code: contract.ErrorInternal, Message: "completion temporarily unavailable", Retryable: false,
 			}})
 			return
 		}
