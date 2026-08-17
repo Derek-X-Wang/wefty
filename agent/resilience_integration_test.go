@@ -118,7 +118,7 @@ func assertAgentQuarantineIsObservableAndNonTerminal(t *testing.T) {
 		cancel()
 		t.Fatalf("last semantic error = %#v, want principal_forbidden", status.LastSemanticError)
 	}
-	if len(status.Attempts) != 0 || status.OneShot.Occupied != 0 || status.OneShot.Limit != prefactorClassLimit {
+	if len(status.Attempts) != 0 || status.OneShot.Occupied != 0 || status.OneShot.Limit != l1.DefaultMaxOneshotSlots {
 		cancel()
 		t.Fatalf("quarantined occupancy = attempts %#v one-shot %#v", status.Attempts, status.OneShot)
 	}

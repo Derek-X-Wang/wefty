@@ -35,6 +35,11 @@ type destinationErrorPolicy func(errorDestination, error) error
 type classAdmissionGate interface {
 	execute(context.Context, attemptExecution, destinationErrorPolicy) (bool, error)
 	occupancy() ClassOccupancy
+	setLimit(int)
+	canAcquire() bool
+	tryAcquire() bool
+	acquireReserved()
+	release()
 }
 
 type admissionPolicy struct {
@@ -79,6 +84,21 @@ func (gate *admissionGate) tryAcquire() bool {
 	return true
 }
 
+func (gate *admissionGate) canAcquire() bool {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	return gate.policy.limit > 0 && gate.occupied < gate.policy.limit
+}
+
+// acquireReserved records work that L1 admitted from an already-reserved
+// service binding while the node is overcommitted. It never authorizes a new
+// binding: only L1 can distinguish that case inside its claim transaction.
+func (gate *admissionGate) acquireReserved() {
+	gate.mu.Lock()
+	gate.occupied++
+	gate.mu.Unlock()
+}
+
 func (gate *admissionGate) release() {
 	gate.mu.Lock()
 	gate.occupied--
@@ -88,5 +108,18 @@ func (gate *admissionGate) release() {
 func (gate *admissionGate) occupancy() ClassOccupancy {
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
-	return ClassOccupancy{Occupied: gate.occupied, Limit: gate.policy.limit}
+	return ClassOccupancy{
+		Occupied:      gate.occupied,
+		Limit:         gate.policy.limit,
+		Overcommitted: gate.occupied > gate.policy.limit,
+	}
+}
+
+// setLimit changes only future admission. A reduction below current
+// occupancy deliberately leaves admitted work alone; the gate remains closed
+// until enough attempts finish to bring occupancy below the new limit.
+func (gate *admissionGate) setLimit(limit int) {
+	gate.mu.Lock()
+	gate.policy.limit = max(limit, 0)
+	gate.mu.Unlock()
 }

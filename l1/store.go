@@ -496,9 +496,13 @@ func (s *Store) HeartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 // ClaimJob atomically performs class-scoped eligibility selection, capacity
 // admission, fencing, attempt creation, and lease establishment. Every
 // eligibility predicate is part of the UPDATE that wins the queued row.
-func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessionID, class string) (*Claim, error) {
+func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessionID, class string, excludedJobIDs ...string) (*Claim, error) {
 	if class != contract.JobClassOneShot && class != contract.JobClassService {
 		return nil, protocolError(contract.ErrorInvalidRequest, "claim class must be %q or %q", contract.JobClassOneShot, contract.JobClassService)
+	}
+	exclusionClause, exclusionArguments, err := claimExclusion(excludedJobIDs)
+	if err != nil {
+		return nil, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -556,7 +560,7 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	// SQLite's immediate writer transaction serializes this count-then-insert.
 	// A Postgres adapter must instead lock the node row or retry serializable
 	// transactions so concurrent claims cannot over-admit either class.
-	err = tx.QueryRowContext(ctx, `
+	claimQuery := `
 UPDATE jobs
 SET state=@job_claimed, current_attempt_id=@attempt_id, fence_counter=fence_counter+1, updated_ns=@now_ns
 WHERE job_id=(
@@ -611,6 +615,7 @@ WHERE job_id=(
 	        AND prior.boot_session_id<>@boot_session_id
 	        AND prior.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
 	    )
+	    %s
 	    AND NOT EXISTS (
       SELECT 1 FROM job_tags jt
       WHERE jt.job_id=j.job_id
@@ -625,7 +630,8 @@ WHERE job_id=(
   LIMIT 1
 )
 AND state=@job_queued
-	RETURNING job_id, spec_json, fence_counter, created_ns`,
+	RETURNING job_id, spec_json, fence_counter, created_ns`
+	claimArguments := []any{
 		sql.Named("job_claimed", contract.JobClaimed),
 		sql.Named("attempt_id", attemptID),
 		sql.Named("now_ns", now.UnixNano()),
@@ -638,7 +644,10 @@ AND state=@job_queued
 		sql.Named("attempt_running", contract.AttemptRunning),
 		sql.Named("attempt_awaiting_input", contract.AttemptAwaitingInput),
 		sql.Named("job_running", contract.JobRunning),
-		sql.Named("job_stopping", contract.JobStopping)).
+		sql.Named("job_stopping", contract.JobStopping),
+	}
+	claimArguments = append(claimArguments, exclusionArguments...)
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(claimQuery, exclusionClause), claimArguments...).
 		Scan(&jobID, &specJSON, &fence, &createdNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
@@ -680,6 +689,29 @@ AND state=@job_queued
 			LeaseTTL: leaseExpires.Sub(now),
 		},
 	}, nil
+}
+
+func claimExclusion(jobIDs []string) (string, []any, error) {
+	if len(jobIDs) == 0 {
+		return "", nil, nil
+	}
+	seen := make(map[string]struct{}, len(jobIDs))
+	placeholders := make([]string, 0, len(jobIDs))
+	arguments := make([]any, 0, len(jobIDs))
+	for _, jobID := range jobIDs {
+		jobID = strings.TrimSpace(jobID)
+		if jobID == "" {
+			return "", nil, protocolError(contract.ErrorInvalidRequest, "excluded job IDs cannot be empty")
+		}
+		if _, exists := seen[jobID]; exists {
+			continue
+		}
+		seen[jobID] = struct{}{}
+		name := fmt.Sprintf("excluded_job_%d", len(placeholders))
+		placeholders = append(placeholders, "@"+name)
+		arguments = append(arguments, sql.Named(name, jobID))
+	}
+	return "AND j.job_id NOT IN (" + strings.Join(placeholders, ", ") + ")", arguments, nil
 }
 
 func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID, fencingToken string) (AttemptLease, error) {

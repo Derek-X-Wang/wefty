@@ -120,26 +120,39 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 	}
 }
 
-func TestAgentClaimsOneAttemptPerClassConcurrently(t *testing.T) {
+func TestAgentFillsGrantedClassSlotsConcurrently(t *testing.T) {
+	assertAgentFillsGrantedClassSlotsConcurrently(t)
+}
+
+func assertAgentFillsGrantedClassSlotsConcurrently(t *testing.T) {
+	t.Helper()
 	network := plain.NewNetwork()
 	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
 	defer stopServer()
-	createAgentTestJob(t, store, "concurrent-one-shot")
-	serviceDirectory := t.TempDir()
-	if _, _, err := store.CreateJob(context.Background(), contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1,
-		DispatchKey:   "concurrent-service",
-		Kind:          "process",
-		Class:         contract.JobClassService,
-		Restart:       contract.RestartAlways,
-		RoutingTags:   []string{"linux"},
-		Execution: contract.ExecutionSpec{
-			Executable:       contract.ExecutableSpec{Path: "/bin/true"},
-			Argv:             []string{"true"},
-			WorkingDirectory: serviceDirectory,
-		},
-	}); err != nil {
-		t.Fatal(err)
+	var oneShots []l1.Job
+	for index := range l1.DefaultMaxOneshotSlots + 1 {
+		oneShots = append(oneShots, createAgentTestJob(t, store, fmt.Sprintf("concurrent-one-shot-%d", index)))
+	}
+	var services []l1.Job
+	for index := range l1.DefaultMaxServiceSlots + 1 {
+		serviceDirectory := t.TempDir()
+		service, _, err := store.CreateJob(context.Background(), contract.JobSpec{
+			SchemaVersion: contract.SchemaVersionV1,
+			DispatchKey:   fmt.Sprintf("concurrent-service-%d", index),
+			Kind:          "process",
+			Class:         contract.JobClassService,
+			Restart:       contract.RestartAlways,
+			RoutingTags:   []string{"linux"},
+			Execution: contract.ExecutionSpec{
+				Executable:       contract.ExecutableSpec{Path: "/bin/true"},
+				Argv:             []string{"true"},
+				WorkingDirectory: serviceDirectory,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		services = append(services, service)
 	}
 
 	runner := newBlockingRunner()
@@ -165,19 +178,40 @@ func TestAgentClaimsOneAttemptPerClassConcurrently(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
 
+	wantStarts := int32(l1.DefaultMaxOneshotSlots + l1.DefaultMaxServiceSlots)
 	deadline := time.Now().Add(5 * time.Second)
-	for runner.starts.Load() != 2 && time.Now().Before(deadline) {
+	for runner.starts.Load() != wantStarts && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if runner.starts.Load() != 2 {
+	if runner.starts.Load() != wantStarts {
 		cancel()
-		t.Fatalf("concurrent runner starts = %d, want one one-shot and one service", runner.starts.Load())
+		t.Fatalf("concurrent runner starts = %d, want %d class-scoped slots filled", runner.starts.Load(), wantStarts)
 	}
 	status := nodeAgent.Status()
-	if status.OneShot.Occupied != 1 || status.OneShot.Limit != prefactorClassLimit ||
-		status.Services.Occupied != 1 || status.Services.Limit != prefactorClassLimit {
+	if status.OneShot.Occupied != l1.DefaultMaxOneshotSlots || status.OneShot.Limit != l1.DefaultMaxOneshotSlots ||
+		status.Services.Occupied != l1.DefaultMaxServiceSlots || status.Services.Limit != l1.DefaultMaxServiceSlots ||
+		len(status.Attempts) != int(wantStarts) {
 		cancel()
-		t.Fatalf("class occupancy = one-shot %#v service %#v, want 1/1 each", status.OneShot, status.Services)
+		t.Fatalf("class occupancy = one-shot %#v service %#v attempts=%d", status.OneShot, status.Services, len(status.Attempts))
+	}
+	time.Sleep(100 * time.Millisecond)
+	if runner.starts.Load() != wantStarts {
+		cancel()
+		t.Fatalf("N+1th or M+1th payload started: starts=%d want=%d", runner.starts.Load(), wantStarts)
+	}
+	for class, job := range map[string]l1.Job{
+		contract.JobClassOneShot: oneShots[len(oneShots)-1],
+		contract.JobClassService: services[len(services)-1],
+	} {
+		queued, err := store.GetJob(context.Background(), job.JobID)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		if queued.State != contract.JobQueued {
+			cancel()
+			t.Fatalf("%s N+1th job state = %q, want visibly queued", class, queued.State)
+		}
 	}
 
 	cancel()
@@ -188,6 +222,306 @@ func TestAgentClaimsOneAttemptPerClassConcurrently(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("agent did not join both class loops after cancellation")
+	}
+}
+
+func TestAgentRefillsSlotAfterSiblingFinalization(t *testing.T) {
+	assertAgentRefillsSlotAfterSiblingFinalization(t)
+}
+
+func assertAgentRefillsSlotAfterSiblingFinalization(t *testing.T) {
+	t.Helper()
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
+	defer stopServer()
+	jobs := []l1.Job{
+		createAgentTestJob(t, store, "slot-refill-1"),
+		createAgentTestJob(t, store, "slot-refill-2"),
+		createAgentTestJob(t, store, "slot-refill-3"),
+	}
+	runner := newSlotRefillRunner()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		HeartbeatInterval: time.Second, ClaimInterval: time.Millisecond, RenewalInterval: 100 * time.Millisecond,
+		MaxOneshotSlots: 2, MaxServiceSlots: 1,
+		Runner: runner, LogSpoolDirectory: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+
+	firstAttempt := runner.waitStarted(t)
+	secondAttempt := runner.waitStarted(t)
+	if firstAttempt == secondAttempt {
+		cancel()
+		t.Fatalf("two local slots started the same attempt %q", firstAttempt)
+	}
+	queued, err := store.GetJob(context.Background(), jobs[2].JobID)
+	if err != nil || queued.State != contract.JobQueued {
+		cancel()
+		t.Fatalf("N+1th job before refill = state %q error %v, want queued", queued.State, err)
+	}
+	runner.release(firstAttempt)
+	refilledAttempt := runner.waitStarted(t)
+	if refilledAttempt == firstAttempt || refilledAttempt == secondAttempt {
+		cancel()
+		t.Fatalf("slot refill attempt = %q, want a fresh sibling", refilledAttempt)
+	}
+	completed, err := store.GetJob(context.Background(), jobs[0].JobID)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if completed.State != contract.JobSucceeded {
+		// Claim order is FIFO but the two initial worker goroutines may report
+		// starts in either order, so accept either of the first two jobs as the
+		// finalized sibling.
+		completed, err = store.GetJob(context.Background(), jobs[1].JobID)
+		if err != nil || completed.State != contract.JobSucceeded {
+			cancel()
+			t.Fatalf("released sibling finalization = state %q error %v", completed.State, err)
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("agent Run() after slot-refill cancellation = %v", err)
+	}
+}
+
+func TestAgentExcludesARequeuedJobUntilLocalFinalizationReturns(t *testing.T) {
+	assertAgentExcludesARequeuedJobUntilLocalFinalizationReturns(t)
+}
+
+func assertAgentExcludesARequeuedJobUntilLocalFinalizationReturns(t *testing.T) {
+	t.Helper()
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
+	defer stopServer()
+	workingDirectory := t.TempDir()
+	service, _, err := store.CreateJob(context.Background(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "local-quiescence", Kind: "process",
+		Class: contract.JobClassService, Restart: contract.RestartAlways, RoutingTags: []string{"linux"},
+		Execution: contract.ExecutionSpec{
+			Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"},
+			WorkingDirectory: workingDirectory,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	client, err := newClient(agentFabric, "wefty://control-plane", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	registration := contract.NodeRegistration{
+		NodeID: "node-1", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		Capabilities: map[string]bool{"process": true},
+	}
+	session := newAgentSession(
+		client, registration, time.Second, 10*time.Millisecond, systemClock{}, newLifecycleObserver(systemClock{}), nil, 0, 2,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	completionAccepted := make(chan struct{})
+	releaseFinalization := make(chan struct{})
+	secondAttempt := make(chan struct{})
+	var executions atomic.Int32
+	go func() {
+		done <- session.run(ctx, func(attemptContext context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
+			ordinal := executions.Add(1)
+			if ordinal == 1 {
+				exitCode := 1
+				_, completeErr := client.Complete(attemptContext, claim.Job.JobID, claim.Lease.AttemptID, l1.CompletionRequest{
+					FencingToken: claim.Lease.FencingToken, IdempotencyKey: "local-quiescence-first",
+					Result: l1.ProcessResult{ExitCode: &exitCode},
+				})
+				if completeErr != nil {
+					return errorDestinationUnclassified, completeErr
+				}
+				close(completionAccepted)
+				select {
+				case <-releaseFinalization:
+					return errorDestinationUnclassified, nil
+				case <-attemptContext.Done():
+					return errorDestinationUnclassified, nil
+				}
+			}
+			close(secondAttempt)
+			<-attemptContext.Done()
+			return errorDestinationUnclassified, nil
+		})
+	}()
+	select {
+	case <-completionAccepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first service completion was not accepted")
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("locally finalizing service executions = %d, want exactly one", got)
+	}
+	queued, err := store.GetJob(context.Background(), service.JobID)
+	if err != nil || queued.State != contract.JobQueued {
+		t.Fatalf("requeued service during local finalization = state %q error %v", queued.State, err)
+	}
+	close(releaseFinalization)
+	select {
+	case <-secondAttempt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("service was not reclaimable after local finalization returned")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("session after local-quiescence cancellation = %v", err)
+	}
+}
+
+func TestFailedCompletionLeavesSiblingAndSessionRunning(t *testing.T) {
+	assertFailedCompletionLeavesSiblingAndSessionRunning(t)
+}
+
+func assertFailedCompletionLeavesSiblingAndSessionRunning(t *testing.T) {
+	t.Helper()
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServerWithPolicies(t, network, nil, map[string]l1.NodePolicy{
+		"node-1": {Tags: []string{"linux"}, MaxOneshotSlots: 2, MaxServiceSlots: 1},
+	})
+	defer stopServer()
+	createAgentTestJob(t, store, "authority-loss-sibling-a")
+	createAgentTestJob(t, store, "authority-loss-sibling-b")
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	client, err := newClient(agentFabric, "wefty://control-plane", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	clock := systemClock{}
+	session := newAgentSession(
+		client,
+		contract.NodeRegistration{
+			NodeID: "node-1", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+			Capabilities: map[string]bool{"process": true},
+		},
+		time.Second,
+		time.Millisecond,
+		clock,
+		newLifecycleObserver(clock),
+		nil,
+		2,
+		1,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	firstFailed := make(chan struct{})
+	siblingStarted := make(chan struct{})
+	var executions atomic.Int32
+	go func() {
+		done <- session.run(ctx, func(attemptContext context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
+			if executions.Add(1) == 1 {
+				exitCode := 0
+				_, completionErr := client.Complete(attemptContext, claim.Job.JobID, claim.Lease.AttemptID, l1.CompletionRequest{
+					FencingToken: "deliberately-stale", IdempotencyKey: "sibling-scoped-completion-failure",
+					Result: l1.ProcessResult{ExitCode: &exitCode},
+				})
+				if completionErr == nil {
+					return errorDestinationUnclassified, errors.New("stale completion unexpectedly succeeded")
+				}
+				close(firstFailed)
+				return classifyAgentProtocolError(completionErr).destination, completionErr
+			}
+			close(siblingStarted)
+			<-attemptContext.Done()
+			return errorDestinationUnclassified, nil
+		})
+	}()
+	select {
+	case <-firstFailed:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("attempt completion did not fail")
+	}
+	select {
+	case <-siblingStarted:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("sibling attempt did not remain independently runnable")
+	}
+	select {
+	case err := <-done:
+		cancel()
+		t.Fatalf("failed completion terminated the session: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("session after sibling-isolation cancellation = %v", err)
+	}
+}
+
+func TestDrainJoinsEveryResidentOneShotAttempt(t *testing.T) {
+	assertDrainJoinsEveryResidentOneShotAttempt(t)
+}
+
+func assertDrainJoinsEveryResidentOneShotAttempt(t *testing.T) {
+	t.Helper()
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServerWithPolicies(t, network, nil, map[string]l1.NodePolicy{
+		"node-1": {Tags: []string{"linux"}, MaxOneshotSlots: 3, MaxServiceSlots: 1},
+	})
+	defer stopServer()
+	for index := range 3 {
+		createAgentTestJob(t, store, fmt.Sprintf("plural-drain-%d", index))
+	}
+	runner := newSlotRefillRunner()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		HeartbeatInterval: 100 * time.Millisecond, ClaimInterval: time.Millisecond, RenewalInterval: 100 * time.Millisecond,
+		MaxOneshotSlots: 3, MaxServiceSlots: 1,
+		Runner: runner, LogSpoolDirectory: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	attempts := []string{runner.waitStarted(t), runner.waitStarted(t), runner.waitStarted(t)}
+	drainContext, stopDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	_, err = nodeAgent.Drain(drainContext)
+	stopDrain()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, attemptID := range attempts {
+		runner.release(attemptID)
+		if index < len(attempts)-1 {
+			select {
+			case err := <-done:
+				t.Fatalf("drain returned after only %d/%d attempts finalized: %v", index+1, len(attempts), err)
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("plural drain returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("plural drain did not join every resident attempt")
 	}
 }
 
@@ -243,7 +577,7 @@ func assertSilentRenewalHangCannotOutliveLocalAuthority(t *testing.T) {
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
 		HeartbeatInterval: 5 * time.Minute, ClaimInterval: time.Minute,
 		RenewalInterval: 100 * time.Millisecond, OperationTimeout: 5 * time.Second,
-		Runner: runner, LogSpoolDirectory: t.TempDir(),
+		Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -258,9 +592,9 @@ func assertSilentRenewalHangCannotOutliveLocalAuthority(t *testing.T) {
 		cancel()
 		t.Fatalf("running attempt job = %q, want %q", runningAttempt.JobID, job.JobID)
 	}
-	if occupancy := nodeAgent.Status().OneShot; occupancy.Occupied != 1 || occupancy.Limit != prefactorClassLimit {
+	if occupancy := nodeAgent.Status().OneShot; occupancy.Occupied != 1 || occupancy.Limit != 1 {
 		cancel()
-		t.Fatalf("running one-shot occupancy = %#v, want 1/%d", occupancy, prefactorClassLimit)
+		t.Fatalf("running one-shot occupancy = %#v, want 1/1", occupancy)
 	}
 	select {
 	case <-renewalAccepted:
@@ -430,7 +764,7 @@ func TestAgentDrainFinishesRunningAttemptAndStopsClaiming(t *testing.T) {
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
 		HeartbeatInterval: time.Minute, ClaimInterval: time.Millisecond, RenewalInterval: 10 * time.Second,
-		Runner: runner, LogSpoolDirectory: t.TempDir(),
+		Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -487,6 +821,15 @@ func TestAgentDrainFinishesRunningAttemptAndStopsClaiming(t *testing.T) {
 
 func startFailureServer(t *testing.T, network *plain.Network, clock l1.Clock, nodeTags map[string][]string) (*l1.Store, func()) {
 	t.Helper()
+	policies := make(map[string]l1.NodePolicy, len(nodeTags))
+	for nodeID, tags := range nodeTags {
+		policies[nodeID] = l1.DefaultNodePolicy(tags...)
+	}
+	return startFailureServerWithPolicies(t, network, clock, policies)
+}
+
+func startFailureServerWithPolicies(t *testing.T, network *plain.Network, clock l1.Clock, policies map[string]l1.NodePolicy) (*l1.Store, func()) {
+	t.Helper()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	options := l1.StoreOptions{LeaseDuration: 30 * time.Second}
 	if clock != nil {
@@ -495,10 +838,6 @@ func startFailureServer(t *testing.T, network *plain.Network, clock l1.Clock, no
 	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "failure.sqlite"), options)
 	if err != nil {
 		t.Fatal(err)
-	}
-	policies := make(map[string]l1.NodePolicy, len(nodeTags))
-	for nodeID, tags := range nodeTags {
-		policies[nodeID] = l1.DefaultNodePolicy(tags...)
 	}
 	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: policies})
 	if err != nil {
@@ -545,6 +884,50 @@ type blockingRunner struct {
 	releaseOnce sync.Once
 	releaseCh   chan struct{}
 	starts      atomic.Int32
+}
+
+type slotRefillRunner struct {
+	mu       sync.Mutex
+	releases map[string]chan struct{}
+	started  chan string
+}
+
+func newSlotRefillRunner() *slotRefillRunner {
+	return &slotRefillRunner{releases: make(map[string]chan struct{}), started: make(chan string, 8)}
+}
+
+func (runner *slotRefillRunner) Run(ctx context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+	release := make(chan struct{})
+	runner.mu.Lock()
+	runner.releases[request.AttemptID] = release
+	runner.mu.Unlock()
+	runner.started <- request.AttemptID
+	select {
+	case <-ctx.Done():
+		return contract.ProcessResult{Signal: "canceled", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
+	case <-release:
+		exitCode := 0
+		return contract.ProcessResult{ExitCode: &exitCode}, nil
+	}
+}
+
+func (runner *slotRefillRunner) waitStarted(t *testing.T) string {
+	t.Helper()
+	select {
+	case attemptID := <-runner.started:
+		return attemptID
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for slot-refill attempt")
+		return ""
+	}
+}
+
+func (runner *slotRefillRunner) release(attemptID string) {
+	runner.mu.Lock()
+	release := runner.releases[attemptID]
+	delete(runner.releases, attemptID)
+	runner.mu.Unlock()
+	close(release)
 }
 
 type resilienceRunner struct {

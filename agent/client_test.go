@@ -14,7 +14,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-func TestClaimRequestsOneShotWork(t *testing.T) {
+func TestClaimRequestsOneShotWorkWithLocalJobExclusions(t *testing.T) {
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	listener, err := serverFabric.Listen("tcp", "wefty://control-plane")
@@ -45,13 +45,18 @@ func TestClaimRequestsOneShotWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	claim, err := client.Claim(context.Background(), "node-1", "boot-1", contract.JobClassOneShot)
+	claim, err := client.Claim(
+		context.Background(), "node-1", "boot-1", contract.JobClassOneShot, "job-finalizing-a", "job-finalizing-b",
+	)
 	if err != nil || claim != nil {
 		t.Fatalf("claim = %#v, err = %v, want empty successful claim", claim, err)
 	}
 	request := <-received
 	if request.Class != contract.JobClassOneShot {
 		t.Fatalf("claim class = %q, want %q", request.Class, contract.JobClassOneShot)
+	}
+	if len(request.ExcludedJobIDs) != 2 || request.ExcludedJobIDs[0] != "job-finalizing-a" || request.ExcludedJobIDs[1] != "job-finalizing-b" {
+		t.Fatalf("claim exclusions = %#v, want both locally finalizing jobs", request.ExcludedJobIDs)
 	}
 }
 

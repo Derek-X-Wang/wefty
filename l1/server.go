@@ -368,7 +368,9 @@ func (s *Server) claimJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFromRequest(r)
-	claim, err := s.store.ClaimJob(r.Context(), identity.NodeID, request.NodeID, request.BootSessionID, request.Class)
+	claim, err := s.store.ClaimJob(
+		r.Context(), identity.NodeID, request.NodeID, request.BootSessionID, request.Class, request.ExcludedJobIDs...,
+	)
 	if err != nil {
 		writeError(w, err)
 		return

@@ -7,11 +7,13 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-func TestServiceAcceptanceClassGatesAreIndependentCountersPinnedToOne(t *testing.T) {
-	oneShot := newAdmissionGate(prefactorClassLimit)
-	service := newAdmissionGate(prefactorClassLimit)
+func TestServiceAcceptanceClassGatesAreIndependentResizableCounters(t *testing.T) {
+	oneShot := newAdmissionGate(l1.DefaultMaxOneshotSlots)
+	service := newAdmissionGate(l1.DefaultMaxServiceSlots)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	done := make(chan error, 1)
@@ -37,8 +39,20 @@ func TestServiceAcceptanceClassGatesAreIndependentCountersPinnedToOne(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !admitted {
+		t.Fatal("second one-shot attempt was refused below the widened class limit")
+	}
+	oneShot.setLimit(1)
+	admitted, err = oneShot.execute(context.Background(), successfulAttempt, propagateDestinationError)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if admitted {
-		t.Fatal("second one-shot attempt was admitted while the class limit was occupied")
+		t.Fatal("N+1th one-shot attempt was admitted after the class limit was reduced to occupancy")
+	}
+	oneShot.setLimit(0)
+	if occupancy := oneShot.occupancy(); !occupancy.Overcommitted || occupancy.Occupied != 1 || occupancy.Limit != 0 {
+		t.Fatalf("reduced one-shot occupancy = %#v, want visible overcommit while the resident attempt drains", occupancy)
 	}
 
 	admitted, err = service.execute(context.Background(), successfulAttempt, propagateDestinationError)
@@ -59,6 +73,7 @@ func TestServiceAcceptanceClassGatesAreIndependentCountersPinnedToOne(t *testing
 		t.Fatal("one-shot gate did not release its admitted attempt")
 	}
 
+	oneShot.setLimit(1)
 	admitted, err = oneShot.execute(context.Background(), successfulAttempt, propagateDestinationError)
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +84,7 @@ func TestServiceAcceptanceClassGatesAreIndependentCountersPinnedToOne(t *testing
 }
 
 func TestServiceAcceptanceGateRoutesErrorsByDestination(t *testing.T) {
-	gate := newAdmissionGate(prefactorClassLimit)
+	gate := newAdmissionGate(1)
 	want := errors.New("attempt authority lost")
 	work := func(context.Context) (errorDestination, error) {
 		return errorDestinationAttemptAuthority, want
@@ -94,6 +109,30 @@ func TestServiceAcceptanceGateRoutesErrorsByDestination(t *testing.T) {
 	if !admitted || err != nil {
 		t.Fatalf("absorbed execution = (%t, %v), want (true, nil)", admitted, err)
 	}
+}
+
+func TestServiceAcceptanceAgentFillsBothGrantedClassPools(t *testing.T) {
+	assertAgentFillsGrantedClassSlotsConcurrently(t)
+}
+
+func TestServiceAcceptanceAgentRefillsFinalizedSlots(t *testing.T) {
+	assertAgentRefillsSlotAfterSiblingFinalization(t)
+}
+
+func TestServiceAcceptanceLocalQuiescenceIsPerJob(t *testing.T) {
+	assertAgentExcludesARequeuedJobUntilLocalFinalizationReturns(t)
+}
+
+func TestServiceAcceptanceHeartbeatResizesClassPools(t *testing.T) {
+	assertAgentResizesPoolFromHeartbeatGrantedCapacity(t)
+}
+
+func TestServiceAcceptanceFailedCompletionIsSiblingScoped(t *testing.T) {
+	assertFailedCompletionLeavesSiblingAndSessionRunning(t)
+}
+
+func TestServiceAcceptancePluralDrainJoinsAllResidentAttempts(t *testing.T) {
+	assertDrainJoinsEveryResidentOneShotAttempt(t)
 }
 
 func successfulAttempt(context.Context) (errorDestination, error) {
