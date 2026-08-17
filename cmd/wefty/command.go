@@ -24,6 +24,8 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 	switch args[0] {
 	case "nodes":
 		return executeNodes(ctx, clients, jsonOutput, args[1:], stdout)
+	case "services":
+		return executeServices(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "submit":
 		return executeSubmit(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "rerun":

@@ -59,6 +59,72 @@ func (c *apiClients) listNodes(ctx context.Context) (l1.NodeList, error) {
 	return result, err
 }
 
+func (c *apiClients) createService(ctx context.Context, spec contract.JobSpec) (l1.Job, error) {
+	var job l1.Job
+	err := c.l1.do(ctx, http.MethodPost, "/v1/jobs", spec, nil, &job, http.StatusCreated, http.StatusOK)
+	return job, err
+}
+
+func (c *apiClients) listServices(ctx context.Context, cursor string, limit int) (l1.JobList, error) {
+	query := url.Values{
+		"class": []string{contract.JobClassService},
+		"limit": []string{strconv.Itoa(limit)},
+	}
+	if cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	var result l1.JobList
+	err := c.l1.do(ctx, http.MethodGet, "/v1/jobs?"+query.Encode(), nil, nil, &result, http.StatusOK)
+	return result, err
+}
+
+func (c *apiClients) getService(ctx context.Context, jobID string) (l1.Job, error) {
+	var job l1.Job
+	path := "/v1/jobs/" + url.PathEscape(jobID) + "?class=" + contract.JobClassService
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &job, http.StatusOK)
+	return job, err
+}
+
+func (c *apiClients) setServiceDesiredState(
+	ctx context.Context,
+	jobID string,
+	desired contract.ServiceDesiredState,
+) (l1.Job, error) {
+	var job l1.Job
+	path := "/v1/jobs/" + url.PathEscape(jobID) + "/desired-state?class=" + contract.JobClassService
+	err := c.l1.do(ctx, http.MethodPut, path, l1.ServiceDesiredStateRequest{DesiredState: desired}, nil, &job, http.StatusAccepted)
+	return job, err
+}
+
+func (c *apiClients) restartService(ctx context.Context, jobID, idempotencyKey string) (l1.Job, error) {
+	var job l1.Job
+	path := "/v1/jobs/" + url.PathEscape(jobID) + "/restart?class=" + contract.JobClassService
+	err := c.l1.do(ctx, http.MethodPost, path, l1.ServiceRestartRequest{IdempotencyKey: idempotencyKey}, nil,
+		&job, http.StatusAccepted, http.StatusOK)
+	return job, err
+}
+
+func (c *apiClients) removeService(ctx context.Context, jobID string) (l1.Job, error) {
+	var job l1.Job
+	path := "/v1/jobs/" + url.PathEscape(jobID) + "/remove?class=" + contract.JobClassService
+	err := c.l1.do(ctx, http.MethodPost, path, nil, nil, &job, http.StatusAccepted)
+	return job, err
+}
+
+func (c *apiClients) getServiceLogs(ctx context.Context, jobID, cursor string, limit int) (l1.LogPage, error) {
+	query := url.Values{
+		"class": []string{contract.JobClassService},
+		"limit": []string{strconv.Itoa(limit)},
+	}
+	if cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	var page l1.LogPage
+	path := "/v1/jobs/" + url.PathEscape(jobID) + "/logs?" + query.Encode()
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &page, http.StatusOK)
+	return page, err
+}
+
 func (c *apiClients) drainNode(ctx context.Context, nodeID string) (l1.Node, error) {
 	nodes, err := c.listNodes(ctx)
 	if err != nil {
