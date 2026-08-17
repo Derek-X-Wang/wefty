@@ -208,7 +208,7 @@
       "post": {
         "operationId": "appendAttemptLogs",
         "summary": "Append an idempotent batch of per-stream log events",
-        "description": "L1 is the sole owner of idempotency for (attempt_id, stream, sequence). Identical replay is acknowledged without duplication; conflicting replay or a sequence gap is rejected. Raw byte chunks are not scanned or decoded as lines.",
+        "description": "L1 is the sole owner of idempotency for (attempt_id, stream, sequence). Identical replay is acknowledged without duplication; conflicting replay or an undeclared sequence gap is rejected. Raw byte chunks are not scanned or decoded as lines. Lost attempts accept in-sequence evidence by original job/node/attempt/fence provenance during the late-evidence window without changing verdict or authority; after that window raw events become truthful per-stream gap records.",
         "requestBody": {
           "required": true,
           "content": {

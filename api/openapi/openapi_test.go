@@ -119,9 +119,29 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	}
 	logEvent := object(t, schemas["LogEvent"], "LogEvent")
 	required := stringSet(t, logEvent["required"])
-	for _, field := range []string{"attempt_id", "stream", "sequence", "timestamp", "bytes"} {
+	for _, field := range []string{"attempt_id", "stream", "sequence", "timestamp"} {
 		if !required[field] {
 			t.Errorf("LogEvent missing required field %q", field)
+		}
+	}
+	if required["bytes"] {
+		t.Error("LogEvent globally requires bytes instead of selecting exactly one of bytes or gap")
+	}
+	if len(logEvent["oneOf"].([]any)) != 2 {
+		t.Fatal("LogEvent must select exactly one of raw bytes or a gap declaration")
+	}
+	logGap := object(t, schemas["LogGap"], "LogGap")
+	gapRequired := stringSet(t, logGap["required"])
+	for _, field := range []string{"through_sequence", "lost_event_count", "lost_byte_count", "reason"} {
+		if !gapRequired[field] {
+			t.Errorf("LogGap missing required field %q", field)
+		}
+	}
+	gapReason := object(t, object(t, logGap["properties"], "LogGap.properties")["reason"], "LogGap.reason")
+	gapReasons := stringSet(t, gapReason["enum"])
+	for _, reason := range []string{"spool_eviction", "oversized_event", "late_evidence_window_expired"} {
+		if !gapReasons[reason] {
+			t.Errorf("LogGap reason is missing %q", reason)
 		}
 	}
 	processResult := object(t, schemas["ProcessResult"], "ProcessResult")
