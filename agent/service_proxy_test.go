@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -102,8 +103,56 @@ func TestPostStartupProbeLossWithdrawsAndRecoversWithoutKilling(t *testing.T) {
 	assertPostStartupProbeLossWithdrawsAndRecoversWithoutKilling(t)
 }
 
+func TestPublicationAuthorityLossStopsAttemptThroughGuardian(t *testing.T) {
+	assertPublicationAuthorityLossStopsAttemptThroughGuardian(t)
+}
+
+func assertPublicationAuthorityLossStopsAttemptThroughGuardian(t *testing.T) {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &publicationAuthorityRunner{canceled: make(chan struct{})}
+	result, err := runPortfulService(
+		context.Background(),
+		runner,
+		processrunner.Request{AttemptID: "authority-loss", Class: contract.JobClassService},
+		nil,
+		listener,
+		serviceRuntimeEndpoint{
+			address: "127.0.0.1:1",
+			dial: func(context.Context) (net.Conn, error) {
+				return nil, errors.New("not reached")
+			},
+		},
+		serviceSupervisorConfig{
+			clock: systemClock{},
+			publish: func(context.Context, bool) error {
+				return &ProtocolError{
+					StatusCode: http.StatusConflict,
+					APIError:   contract.APIError{Code: contract.ErrorAttemptMismatch},
+				}
+			},
+		},
+	)
+	var routed *routedDestinationError
+	if !errors.As(err, &routed) || routed.destination != errorDestinationAttemptAuthority {
+		t.Fatalf("publication authority error = %v, want attempt-authority", err)
+	}
+	if result.TerminationCause != contract.TerminationCauseGuardian {
+		t.Fatalf("termination cause = %q, want guardian", result.TerminationCause)
+	}
+	select {
+	case <-runner.canceled:
+	default:
+		t.Fatal("publication authority loss did not cancel the guardian-owned attempt")
+	}
+}
+
 func assertPostStartupProbeLossWithdrawsAndRecoversWithoutKilling(t *testing.T) {
 	t.Helper()
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -129,6 +178,7 @@ func assertPostStartupProbeLossWithdrawsAndRecoversWithoutKilling(t *testing.T) 
 				},
 			},
 			serviceSupervisorConfig{
+				clock: clock,
 				onReadiness: func(startupSatisfied, ready bool) {
 					states <- readinessState{startupSatisfied: startupSatisfied, ready: ready}
 				},
@@ -142,7 +192,7 @@ func assertPostStartupProbeLossWithdrawsAndRecoversWithoutKilling(t *testing.T) 
 	if !first.startupSatisfied || !first.ready {
 		t.Fatalf("first local probe state = %#v, want startup satisfied and ready", first)
 	}
-	assertPublishedEcho(t, listener.Addr().String(), true)
+	waitForPublishedEcho(t, listener.Addr().String(), true)
 
 	runner.publishReadiness(t, false)
 	lost := waitReadinessState(t, states)
@@ -161,7 +211,10 @@ func assertPostStartupProbeLossWithdrawsAndRecoversWithoutKilling(t *testing.T) 
 	if !recovered.startupSatisfied || !recovered.ready {
 		t.Fatalf("recovered readiness state = %#v, want republished local forwarding", recovered)
 	}
-	assertPublishedEcho(t, listener.Addr().String(), true)
+	assertPublishedEcho(t, listener.Addr().String(), false)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultPublicationRecoveryWindow))
+	clock.Advance(DefaultPublicationRecoveryWindow)
+	waitForPublishedEcho(t, listener.Addr().String(), true)
 	close(runner.release)
 	outcome := waitServiceOutcome(t, finished)
 	if outcome.err != nil || outcome.result.ExitCode == nil || *outcome.result.ExitCode != 0 {
@@ -221,6 +274,26 @@ type readinessRunner struct {
 	readiness chan bool
 	release   chan struct{}
 	startOnce sync.Once
+}
+
+type publicationAuthorityRunner struct {
+	canceled chan struct{}
+}
+
+func (runner *publicationAuthorityRunner) Run(
+	ctx context.Context,
+	request processrunner.Request,
+	_ processrunner.OutputSink,
+) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
+	request.ReadinessChanged(true, true)
+	<-ctx.Done()
+	close(runner.canceled)
+	return contract.ProcessResult{
+		Signal: "terminated", TerminationCause: contract.TerminationCauseGuardian,
+	}, ctx.Err()
 }
 
 func newReadinessRunner() *readinessRunner {
@@ -292,6 +365,33 @@ func assertPublishedEcho(t *testing.T, address string, wantForwarded bool) {
 	if forwarded != wantForwarded {
 		t.Fatalf("published forwarding = %v (read error %v), want %v", forwarded, err, wantForwarded)
 	}
+}
+
+func waitForPublishedEcho(t *testing.T, address string, wantForwarded bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if publishedEchoForwarded(address) == wantForwarded {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("published forwarding did not become %v", wantForwarded)
+}
+
+func publishedEchoForwarded(address string) bool {
+	connection, err := net.DialTimeout("tcp4", address, 50*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, err := connection.Write([]byte{'x'}); err != nil {
+		return false
+	}
+	buffer := make([]byte, 1)
+	_, err = connection.Read(buffer)
+	return err == nil && buffer[0] == 'x'
 }
 
 func (runner *readinessRunner) waitStarted(t *testing.T) {

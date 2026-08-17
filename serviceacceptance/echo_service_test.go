@@ -34,6 +34,9 @@ func TestServiceRestartsAfterSuccessfulProcessExit(t *testing.T) {
 	if running.CurrentAttemptID == "" {
 		t.Fatal("running service has no attempt ID")
 	}
+	if running.Ready == nil || !*running.Ready {
+		t.Fatalf("reachable service publication = %v, want ready=true", running.Ready)
+	}
 	if health.PID == harness.agent.command.Process.Pid {
 		t.Fatalf("health PID = agent PID %d; payload was not a distinct child process", health.PID)
 	}
@@ -44,6 +47,7 @@ func TestServiceRestartsAfterSuccessfulProcessExit(t *testing.T) {
 
 	assertEcho(t, client, baseURL, []byte("echo acceptance"))
 	assertGracefulShutdown(t, harness, port, health.PID, harness.agent)
+	waitForPublicationCleared(t, harness, job.JobID, 5*time.Second)
 	restarted := waitForFreshRunningAttempt(t, harness, job.JobID, running.CurrentAttemptID, 5*time.Second)
 	restartedHealth := waitForHealth(t, client, baseURL, harness.agent)
 	if restartedHealth.PID == health.PID {
@@ -59,6 +63,23 @@ func TestServiceRestartsAfterSuccessfulProcessExit(t *testing.T) {
 	assertAttemptScratchCleared(t, harness, running)
 	assertHandoffRootEmpty(t, harness.handoffRoot)
 	assertWorkingDirectoryUntouched(t, harness.workingDirectories[job.JobID])
+}
+
+func waitForPublicationCleared(t *testing.T, harness *acceptanceHarness, jobID string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var job l1.Job
+		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID, nil, &job)
+		if status != http.StatusOK {
+			t.Fatalf("get withdrawn service status = %d body=%s", status, body)
+		}
+		if job.Ready != nil && !*job.Ready {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for payload death to clear publication for %q", jobID)
 }
 
 func waitForFreshRunningAttempt(t *testing.T, harness *acceptanceHarness, jobID, previousAttemptID string, timeout time.Duration) l1.Job {

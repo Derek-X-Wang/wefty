@@ -53,7 +53,12 @@ type serviceRunOutcome struct {
 }
 
 type serviceSupervisorConfig struct {
-	onReadiness func(startupSatisfied, ready bool)
+	clock                     Clock
+	publicationRecoveryWindow time.Duration
+	publicationRetryInterval  time.Duration
+	publish                   publicationRequest
+	onReadiness               func(startupSatisfied, ready bool)
+	onForwarding              func(ready bool)
 }
 
 // runPortfulService owns the Fabric front door while the process runtime and
@@ -72,16 +77,33 @@ func runPortfulService(
 	frontDoor := newServiceFrontDoor(listener, endpoint.dial, processrunner.DefaultReadinessConnectTimeout)
 	defer frontDoor.Close()
 	go frontDoor.Serve(runContext)
+	publication := newPublicationController(
+		config.clock,
+		config.publicationRecoveryWindow,
+		config.publicationRetryInterval,
+		config.publish,
+		func(ready bool) {
+			frontDoor.SetForwarding(ready)
+			if config.onForwarding != nil {
+				config.onForwarding(ready)
+			}
+		},
+	)
+	publicationDone := make(chan error, 1)
+	go func() { publicationDone <- publication.Run(runContext) }()
 
 	request.ServiceAddress = endpoint.address
 	priorReadiness := request.ReadinessChanged
 	request.ReadinessChanged = func(startupSatisfied, ready bool) {
-		frontDoor.SetForwarding(ready)
+		if ready && config.onReadiness != nil {
+			config.onReadiness(startupSatisfied, ready)
+		}
+		publication.Observe(ready)
+		if !ready && config.onReadiness != nil {
+			config.onReadiness(startupSatisfied, ready)
+		}
 		if priorReadiness != nil {
 			priorReadiness(startupSatisfied, ready)
-		}
-		if config.onReadiness != nil {
-			config.onReadiness(startupSatisfied, ready)
 		}
 	}
 	outcomes := make(chan serviceRunOutcome, 1)
@@ -92,9 +114,25 @@ func runPortfulService(
 
 	select {
 	case outcome := <-outcomes:
+		publication.Stop()
+		if publicationErr := <-publicationDone; publicationErr != nil {
+			return outcome.result, errors.Join(outcome.err, publicationErr)
+		}
 		return outcome.result, outcome.err
-	case err := <-frontDoor.Errors():
+	case publicationErr := <-publicationDone:
+		if publicationErr == nil {
+			cancelRun()
+			outcome := <-outcomes
+			return outcome.result, outcome.err
+		}
+		publication.Stop()
 		cancelRun()
+		outcome := <-outcomes
+		return outcome.result, errors.Join(outcome.err, publicationErr)
+	case err := <-frontDoor.Errors():
+		publication.Stop()
+		cancelRun()
+		<-publicationDone
 		<-outcomes
 		return spawnFailure(contract.SpawnFailureProcessWait, err), err
 	}

@@ -132,6 +132,63 @@ func TestClientTransportSupportsConcurrentAttemptTraffic(t *testing.T) {
 	assertClientTransportSupportsConcurrentAttemptTraffic(t)
 }
 
+func TestClientSendsAbsolutePublicationWithPut(t *testing.T) {
+	network := plain.NewNetwork()
+	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
+	listener, err := serverFabric.Listen("tcp", "wefty://control-plane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan l1.PublicationRequest, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPut {
+			t.Errorf("publication method = %q, want PUT", request.Method)
+		}
+		if request.URL.EscapedPath() != "/v1/agent/jobs/job%2Fone/attempts/attempt%2Fone/publication" {
+			t.Errorf("publication path = %q", request.URL.EscapedPath())
+		}
+		var publication l1.PublicationRequest
+		if err := json.NewDecoder(request.Body).Decode(&publication); err != nil {
+			t.Errorf("decode publication request: %v", err)
+		}
+		received <- publication
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{}`))
+	})}
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(listener) }()
+	defer func() {
+		_ = server.Close()
+		if err := <-served; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("serve publication request: %v", err)
+		}
+	}()
+
+	client, err := newClient(
+		network.NewFabric(fabric.Identity{NodeID: "agent"}),
+		"wefty://control-plane",
+		time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ready := true
+	_, err = client.SetAttemptPublication(
+		context.Background(),
+		"job/one",
+		"attempt/one",
+		l1.PublicationRequest{FencingToken: "fence-one", Ready: &ready},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := <-received
+	if request.FencingToken != "fence-one" || request.Ready == nil || !*request.Ready {
+		t.Fatalf("publication request = %#v, want absolute ready=true", request)
+	}
+}
+
 func assertClientTransportSupportsConcurrentAttemptTraffic(t *testing.T) {
 	t.Helper()
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})

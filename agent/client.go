@@ -124,6 +124,19 @@ func (c *Client) Complete(ctx context.Context, jobID, attemptID string, request 
 	return job, err
 }
 
+// SetAttemptPublication sends an absolute publication state for one attempt.
+// Serialization and same-state suppression belong to the attempt-local
+// publication controller, not this transport method.
+func (c *Client) SetAttemptPublication(
+	ctx context.Context,
+	jobID, attemptID string,
+	request l1.PublicationRequest,
+) (l1.Job, error) {
+	var job l1.Job
+	err := c.request(ctx, http.MethodPut, attemptPath(jobID, attemptID)+"/publication", request, &job)
+	return job, err
+}
+
 // AcknowledgeRemoval attests that local deletion has already completed. The
 // control plane never asks this client to inspect or delete a filesystem path.
 func (c *Client) AcknowledgeRemoval(ctx context.Context, jobID string, request l1.RemovalAcknowledgementRequest) (l1.Job, error) {
@@ -137,18 +150,26 @@ func attemptPath(jobID, attemptID string) string {
 }
 
 func (c *Client) post(ctx context.Context, path string, body, target any) error {
-	_, err := c.postAllowNoContent(ctx, path, body, target)
+	return c.request(ctx, http.MethodPost, path, body, target)
+}
+
+func (c *Client) request(ctx context.Context, method, path string, body, target any) error {
+	_, err := c.requestAllowNoContent(ctx, method, path, body, target)
 	return err
 }
 
 func (c *Client) postAllowNoContent(ctx context.Context, path string, body, target any) (bool, error) {
+	return c.requestAllowNoContent(ctx, http.MethodPost, path, body, target)
+}
+
+func (c *Client) requestAllowNoContent(ctx context.Context, method, path string, body, target any) (bool, error) {
 	requestContext, cancel := c.boundedContext(ctx)
 	defer cancel()
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return false, fmt.Errorf("agent: encode request: %w", err)
 	}
-	request, err := http.NewRequestWithContext(requestContext, http.MethodPost, c.baseURL+path, bytes.NewReader(payload))
+	request, err := http.NewRequestWithContext(requestContext, method, c.baseURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return false, fmt.Errorf("agent: build request: %w", err)
 	}
