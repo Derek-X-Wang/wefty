@@ -469,7 +469,10 @@ func (sink *collectingSink) Next(t *testing.T) contract.LogEvent {
 	select {
 	case event := <-sink.next:
 		return event
-	case <-time.After(5 * time.Second):
+	// A failure budget, not a success-path delay: it costs nothing when the
+	// test passes, and 5s was too tight on a loaded shared macOS runner once
+	// the guardian tests started spawning real processes alongside these.
+	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for process output")
 		return contract.LogEvent{}
 	}
@@ -494,7 +497,7 @@ func awaitRun(t *testing.T, finished <-chan runOutcome) runOutcome {
 	select {
 	case outcome := <-finished:
 		return outcome
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for runner")
 		return runOutcome{}
 	}
