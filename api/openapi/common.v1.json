@@ -58,14 +58,28 @@
       "AttemptLease": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["attempt_id", "fencing_token", "lease_expires_at"],
+        "required": ["attempt_id", "fencing_token", "lease_expires_at", "lease_ttl"],
         "properties": {
           "attempt_id": { "type": "string" },
           "fencing_token": {
             "type": "string",
             "description": "Opaque monotonically increasing per-job fence; never parse as a number."
           },
-          "lease_expires_at": { "type": "string", "format": "date-time" }
+          "lease_expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Compatibility wall-clock expiry. Agents use lease_ttl after the resilience cutover."
+          },
+          "lease_ttl": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "Granted lease duration in nanoseconds. The agent measures it from its monotonic request start, without comparing clocks."
+          },
+          "directive": {
+            "enum": ["stop", "restart"],
+            "description": "Attempt-scoped service intent. Omission means no lifecycle change is requested."
+          }
         }
       },
       "LogEvent": {

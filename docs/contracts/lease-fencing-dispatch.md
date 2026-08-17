@@ -23,13 +23,17 @@ authenticated Fabric identity. Later boot sessions may replace that node row
 only from the same Fabric identity, so a transport-internal ID need not leak
 into node configuration and another peer cannot take over the stable ID.
 
-The successful claim returns all three write authorities:
+The successful claim returns the write authority and both lease projections:
 
 - `attempt_id`: globally unique, immutable execution identity.
 - `fencing_token`: opaque, monotonically increasing for the job and compared by
   the control plane. Clients must not parse it as a number.
+- `lease_ttl`: the granted duration in nanoseconds. An agent establishes its
+  local authority deadline from its monotonic request start plus this duration;
+  it never compares the control-plane clock with its own clock.
 - `lease_expires_at`: an RFC 3339 timestamp computed only from the injected
-  control-plane clock.
+  control-plane clock. This compatibility field remains until the agent
+  resilience cutover is complete.
 
 ## Semantic authority errors
 
@@ -61,6 +65,13 @@ Attempt renewal is `POST .../attempts/{attempt_id}/lease` and requires the
 matching fencing token. It extends only that attempt's lease. Node heartbeat is
 a distinct verb and changes only node liveness; a healthy heartbeat never
 keeps a job lease alive, and lease renewal never makes a stale node alive.
+
+The renewal response is also the attempt-scoped service-intent channel. Its
+optional `directive` is `stop` when the service's desired state is stopped,
+`restart` when a durable restart request targets the current attempt, and
+absent when no lifecycle change is requested. Node-scoped scheduling intent
+remains on the heartbeat response; it cannot conflict with this payload-scoped
+channel.
 
 Every renewal, log upload, and completion is authorized by the exact
 `(job_id, attempt_id, fencing_token)` tuple and is checked in the same

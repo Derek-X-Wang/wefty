@@ -312,6 +312,12 @@ func TestLeaseRenewalAndFencedCompletion(t *testing.T) {
 	if !renewed.LeaseExpires.After(claim.Lease.LeaseExpires) {
 		t.Fatalf("renewed expiry %s did not extend %s", renewed.LeaseExpires, claim.Lease.LeaseExpires)
 	}
+	if claim.Lease.LeaseTTL != 30*time.Second || renewed.LeaseTTL != 30*time.Second {
+		t.Fatalf("lease TTLs = %s and %s, want 30s", claim.Lease.LeaseTTL, renewed.LeaseTTL)
+	}
+	if renewed.Directive != "" {
+		t.Fatalf("one-shot renewal directive = %q, want none", renewed.Directive)
+	}
 
 	completion := CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion-1", Result: ProcessResult{ExitCode: &exitCode}}
 	status, _, body = h.do(agent, http.MethodPost, completionPath, completion)
@@ -328,6 +334,111 @@ func TestLeaseRenewalAndFencedCompletion(t *testing.T) {
 	status, _, body = h.do(agent, http.MethodPost, completionPath, completion)
 	if status != http.StatusOK {
 		t.Fatalf("completion replay status = %d body=%s", status, body)
+	}
+}
+
+func TestLeaseTTLAndAttemptScopedDirectives(t *testing.T) {
+	assertLeaseTTLAndAttemptScopedDirectives(t)
+}
+
+func assertLeaseTTLAndAttemptScopedDirectives(t *testing.T) {
+	t.Helper()
+	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
+	h.register(agent, "node-1")
+	job := h.submit(client, "dispatch-lease-contract", []string{"linux"})
+
+	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+	if status != http.StatusOK {
+		t.Fatalf("claim status = %d body=%s", status, body)
+	}
+	var claim Claim
+	if err := json.Unmarshal(body, &claim); err != nil {
+		t.Fatal(err)
+	}
+	assertLeaseContract(t, body, claim.Lease, 30*time.Second, "")
+
+	renewPath := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/lease", job.JobID, claim.Lease.AttemptID)
+	renew := func(wantDirective AttemptDirective) {
+		t.Helper()
+		h.clock.Advance(time.Second)
+		status, _, body := h.do(agent, http.MethodPost, renewPath, RenewalRequest{FencingToken: claim.Lease.FencingToken})
+		if status != http.StatusOK {
+			t.Fatalf("renew status = %d body=%s", status, body)
+		}
+		var lease AttemptLease
+		if err := json.Unmarshal(body, &lease); err != nil {
+			t.Fatal(err)
+		}
+		assertLeaseContract(t, body, lease, 30*time.Second, wantDirective)
+	}
+
+	renew("")
+
+	// The desired-state and restart routes land in later tickets. Seed their
+	// durable result directly so this ticket's acceptance stays at the L1 HTTP
+	// seam while covering the renewal response that agents actually consume.
+	tx, err := h.store.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO service_jobs(job_id, desired_state, bound_node_id) VALUES(?, 'stopped', ?)", job.JobID, "node-1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	renew(AttemptDirectiveStop)
+
+	tx, err = h.store.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("UPDATE service_jobs SET desired_state='running' WHERE job_id=?", job.JobID); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO service_restart_requests(job_id, idempotency_key, request_hash, created_ns)
+VALUES(?, 'restart-1', 'restart-hash-1', ?)`, job.JobID, h.clock.Now().UnixNano()); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	renew(AttemptDirectiveRestart)
+}
+
+func assertLeaseContract(t *testing.T, body []byte, lease AttemptLease, wantTTL time.Duration, wantDirective AttemptDirective) {
+	t.Helper()
+	if lease.LeaseExpires.IsZero() {
+		t.Fatal("lease_expires_at compatibility field is absent")
+	}
+	if lease.LeaseTTL != wantTTL {
+		t.Fatalf("lease_ttl = %s, want %s", lease.LeaseTTL, wantTTL)
+	}
+	if lease.Directive != wantDirective {
+		t.Fatalf("directive = %q, want %q", lease.Directive, wantDirective)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if nested, ok := wire["lease"]; ok {
+		if err := json.Unmarshal(nested, &wire); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, field := range []string{"lease_expires_at", "lease_ttl"} {
+		if _, ok := wire[field]; !ok {
+			t.Fatalf("wire response is missing %q: %s", field, body)
+		}
+	}
+	_, hasDirective := wire["directive"]
+	if (wantDirective != "") != hasDirective {
+		t.Fatalf("directive presence = %t, want %t: %s", hasDirective, wantDirective != "", body)
 	}
 }
 
