@@ -79,3 +79,20 @@ func TestRenewalRequestTimeoutIsStrictlyInsideAuthority(t *testing.T) {
 		}
 	}
 }
+
+func TestClientTransportSupportsConcurrentAttemptTraffic(t *testing.T) {
+	assertClientTransportSupportsConcurrentAttemptTraffic(t)
+}
+
+func assertClientTransportSupportsConcurrentAttemptTraffic(t *testing.T) {
+	t.Helper()
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
+	client, err := NewClient(participant, "wefty://control-plane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if got := client.transport.MaxIdleConnsPerHost; got != DefaultMaxIdleConnsPerHost || got <= http.DefaultMaxIdleConnsPerHost {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want raised concurrent-attempt pool %d", got, DefaultMaxIdleConnsPerHost)
+	}
+}

@@ -74,6 +74,11 @@ type runOutcome struct {
 	durabilityErr error
 }
 
+type handoffLockResult struct {
+	unlock func()
+	err    error
+}
+
 func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
 	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
 	defer cancelAttempt(nil)
@@ -98,6 +103,40 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		defer close(renewalDone)
 		lifecycle.renewalLoop(attemptContext, claim, authority, renewalErrors, watch)
 	}()
+
+	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
+		locked := make(chan handoffLockResult, 1)
+		go func() {
+			unlock, err := lifecycle.dependencies.handoffs.lock(attemptContext, claim.Job.Spec)
+			locked <- handoffLockResult{unlock: unlock, err: err}
+		}()
+		select {
+		case result := <-locked:
+			if result.err != nil {
+				<-renewalDone
+				if errors.Is(result.err, errAuthorityDeadlineExceeded) {
+					return errorDestinationAttemptAuthority, fmt.Errorf("agent: acquire handoff path: %w", result.err)
+				}
+				return errorDestinationUnclassified, fmt.Errorf("agent: acquire handoff path: %w", result.err)
+			}
+			defer result.unlock()
+		case failure := <-renewalErrors:
+			cancelAttempt(failure.err)
+			releaseHandoffLock(<-locked)
+			<-renewalDone
+			return failure.destination, fmt.Errorf("agent: renew lease while acquiring handoff path: %w", failure.err)
+		case err := <-watch.Failures():
+			cancelAttempt(err)
+			releaseHandoffLock(<-locked)
+			<-renewalDone
+			return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog while acquiring handoff path: %w", err)
+		case <-ctx.Done():
+			cancelAttempt(ctx.Err())
+			releaseHandoffLock(<-locked)
+			<-renewalDone
+			return errorDestinationUnclassified, ctx.Err()
+		}
+	}
 
 	completed := make(chan runOutcome, 1)
 	go func() {
@@ -194,6 +233,12 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 	}
 	return errorDestinationUnclassified, nil
+}
+
+func releaseHandoffLock(result handoffLockResult) {
+	if result.unlock != nil {
+		result.unlock()
+	}
 }
 
 func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) destinationError {

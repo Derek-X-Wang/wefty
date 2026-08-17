@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -20,6 +22,13 @@ type handoffManager struct {
 	root      string
 	retention time.Duration
 	now       func() time.Time
+	mu        sync.Mutex
+	paths     map[string]*handoffPathLock
+}
+
+type handoffPathLock struct {
+	token chan struct{}
+	refs  int
 }
 
 type handoffMarker struct {
@@ -32,7 +41,50 @@ func newHandoffManager(root string, retention time.Duration) *handoffManager {
 	if strings.TrimSpace(root) == "" {
 		root = contract.DefaultHandoffRoot
 	}
-	return &handoffManager{root: filepath.Clean(root), retention: retention, now: time.Now}
+	return &handoffManager{
+		root: filepath.Clean(root), retention: retention, now: time.Now,
+		paths: make(map[string]*handoffPathLock),
+	}
+}
+
+// lock holds exclusive ownership of one handoff path across the complete
+// prepare, execution, completion, and finish lifecycle. Per-call locking is
+// insufficient because finish may remove the directory another attempt uses.
+func (m *handoffManager) lock(ctx context.Context, spec contract.JobSpec) (func(), error) {
+	path := filepath.Clean(spec.Execution.HandoffDirectory)
+	m.mu.Lock()
+	pathLock := m.paths[path]
+	if pathLock == nil {
+		pathLock = &handoffPathLock{token: make(chan struct{}, 1)}
+		pathLock.token <- struct{}{}
+		m.paths[path] = pathLock
+	}
+	pathLock.refs++
+	m.mu.Unlock()
+
+	if err := context.Cause(ctx); err != nil {
+		m.releasePathReference(path, pathLock)
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		m.releasePathReference(path, pathLock)
+		return nil, context.Cause(ctx)
+	case <-pathLock.token:
+	}
+	return func() {
+		pathLock.token <- struct{}{}
+		m.releasePathReference(path, pathLock)
+	}, nil
+}
+
+func (m *handoffManager) releasePathReference(path string, pathLock *handoffPathLock) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pathLock.refs--
+	if pathLock.refs == 0 {
+		delete(m.paths, path)
+	}
 }
 
 func (m *handoffManager) prepare(spec contract.JobSpec, nodeID string) error {

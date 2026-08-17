@@ -51,3 +51,7 @@ func TestServiceAcceptanceQuietProcessIgnoresIdleAndHonorsMaxRuntime(t *testing.
 		t.Fatalf("result = %#v, want signal death", outcome.result)
 	}
 }
+
+func TestServiceAcceptanceStalledProcessWaitIsSurfaced(t *testing.T) {
+	assertTerminateAndWaitSurfacesStalledProcessWait(t)
+}

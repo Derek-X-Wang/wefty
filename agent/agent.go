@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -33,7 +34,9 @@ type ProcessRunner interface {
 }
 
 // OutputSinkFactory creates an optional local output destination for a claimed
-// attempt. The agent always uploads logs to L1 in addition to this sink.
+// attempt. It may be invoked concurrently and must return an attempt-isolated
+// sink or a sink that internally synchronizes shared state. The agent always
+// uploads logs to L1 in addition to this sink.
 type OutputSinkFactory func(l1.Claim) processrunner.OutputSink
 
 // Config contains the stable node identity, per-process boot identity, and
@@ -63,8 +66,9 @@ type Config struct {
 	OutputSinkFactory    OutputSinkFactory
 	HandoffRoot          string
 	HandoffRetention     time.Duration
-	Logf                 func(string, ...any)
-	Clock                Clock
+	// Logf need not be goroutine-safe. Agent serializes calls made through it.
+	Logf  func(string, ...any)
+	Clock Clock
 }
 
 // Agent owns process-lifetime resources and starts one control-plane session.
@@ -170,6 +174,7 @@ func New(config Config) (*Agent, error) {
 		return nil, err
 	}
 	observer := newLifecycleObserver(clock)
+	logf := serialLogf(config.Logf)
 	session := newAgentSession(client, registration, heartbeatInterval, claimInterval, clock, observer)
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
@@ -177,7 +182,7 @@ func New(config Config) (*Agent, error) {
 		logRetryInterval: logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runner: runner, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
 		handoffs: newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
-		logf:     config.Logf, clock: clock, observer: observer,
+		logf:     logf, clock: clock, observer: observer,
 		nodeLock: stableNodeLock,
 	}, nil
 }
@@ -351,6 +356,18 @@ func cloneCapabilities(capabilities map[string]bool) map[string]bool {
 		cloned[capability] = enabled
 	}
 	return cloned
+}
+
+func serialLogf(logf func(string, ...any)) func(string, ...any) {
+	if logf == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	return func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		logf(format, args...)
+	}
 }
 
 func (a *Agent) log(format string, args ...any) {
