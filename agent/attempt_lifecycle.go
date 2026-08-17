@@ -178,6 +178,13 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	case outcome = <-completed:
 		cancelExecution()
 	}
+	var routed *routedDestinationError
+	if errors.As(outcome.err, &routed) && routed.destination != errorDestinationUnclassified {
+		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, outcome.err)
+		cancelAttempt(outcome.err)
+		<-renewalDone
+		return routed.destination, outcome.err
+	}
 	if cause := context.Cause(attemptContext); errors.Is(cause, errAuthorityDeadlineExceeded) {
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
 		<-renewalDone
@@ -428,11 +435,29 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 	var result contract.ProcessResult
 	var runErr error
 	if portfulService {
-		result, runErr = runPortfulService(ctx, lifecycle.dependencies.runner, request, sink, publishedListener, endpoint, serviceSupervisorConfig{
+		config := serviceSupervisorConfig{
+			clock: lifecycle.dependencies.clock,
 			onReadiness: func(startupSatisfied, ready bool) {
-				lifecycle.dependencies.observer.setServiceReadiness(claim.Lease.AttemptID, startupSatisfied, ready)
+				lifecycle.dependencies.observer.setServiceReadiness(claim.Lease.AttemptID, startupSatisfied, false)
 			},
-		})
+			onForwarding: func(ready bool) {
+				lifecycle.dependencies.observer.setServiceReadiness(claim.Lease.AttemptID, true, ready)
+			},
+		}
+		if lifecycle.dependencies.client != nil {
+			config.publish = func(ctx context.Context, ready bool) error {
+				_, err := lifecycle.dependencies.client.SetAttemptPublication(
+					ctx,
+					claim.Job.JobID,
+					claim.Lease.AttemptID,
+					l1.PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready},
+				)
+				return err
+			}
+		}
+		result, runErr = runPortfulService(
+			ctx, lifecycle.dependencies.runner, request, sink, publishedListener, endpoint, config,
+		)
 	} else {
 		result, runErr = lifecycle.dependencies.runner.Run(ctx, request, sink)
 	}

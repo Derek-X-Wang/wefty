@@ -15,3 +15,10 @@ func TestServiceAcceptancePortlessSkipsReachabilityMachinery(t *testing.T) {
 func TestServiceAcceptanceReadinessLossNeverKills(t *testing.T) {
 	assertPostStartupProbeLossWithdrawsAndRecoversWithoutKilling(t)
 }
+
+func TestServiceAcceptancePublicationWriteControl(t *testing.T) {
+	assertPublicationControllerSerializesAbsoluteStateWithAsymmetricHysteresis(t)
+	assertPublicationControllerNeverHasTwoRequestsInFlight(t)
+	assertPublicationControllerRetriesTransientAndStopsOnAuthorityLoss(t)
+	assertPublicationAuthorityLossStopsAttemptThroughGuardian(t)
+}
