@@ -18,10 +18,18 @@ type Timer interface {
 
 type systemClock struct{}
 
-func (systemClock) Now() time.Time { return time.Now() }
+func (systemClock) Now() time.Time     { return time.Now() }
+func (systemClock) WallNow() time.Time { return time.Now().Round(0) }
 
 func (systemClock) NewTimer(duration time.Duration) Timer {
 	return &systemTimer{timer: time.NewTimer(duration)}
+}
+
+func wallNow(clock Clock) time.Time {
+	if source, ok := clock.(interface{ WallNow() time.Time }); ok {
+		return source.WallNow()
+	}
+	return clock.Now().Round(0)
 }
 
 type systemTimer struct{ timer *time.Timer }

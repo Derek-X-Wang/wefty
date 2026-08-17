@@ -21,6 +21,9 @@ import (
 var version = "dev"
 
 func main() {
+	// Agent.Run's session supervisor absorbs protocol failures at their attempt
+	// or node-session destination. Only a pre-payload startup failure or a local
+	// invariant failure escapes to this process-level non-zero exit.
 	if err := run(); err != nil {
 		log.Printf("wefty-agent: %v", err)
 		os.Exit(1)

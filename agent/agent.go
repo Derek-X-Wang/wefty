@@ -51,6 +51,7 @@ type Config struct {
 	HeartbeatInterval   time.Duration
 	ClaimInterval       time.Duration
 	RenewalInterval     time.Duration
+	OperationTimeout    time.Duration
 	LogBatchSize        int
 	LogFlushInterval    time.Duration
 	LogRetryInterval    time.Duration
@@ -81,6 +82,7 @@ type Agent struct {
 	handoffs          *handoffManager
 	logf              func(string, ...any)
 	clock             Clock
+	observer          *lifecycleObserver
 }
 
 func New(config Config) (*Agent, error) {
@@ -99,10 +101,6 @@ func New(config Config) (*Agent, error) {
 	if config.LogSpoolMaxBytes < 0 {
 		return nil, errors.New("agent: log spool maximum bytes cannot be negative")
 	}
-	client, err := NewClient(config.Fabric, config.ControlPlaneAddress)
-	if err != nil {
-		return nil, err
-	}
 	osName := config.OS
 	if osName == "" {
 		osName = runtime.GOOS
@@ -115,6 +113,10 @@ func New(config Config) (*Agent, error) {
 	clock := config.Clock
 	if clock == nil {
 		clock = systemClock{}
+	}
+	client, err := newClient(config.Fabric, config.ControlPlaneAddress, durationOrDefault(config.OperationTimeout, DefaultOperationTimeout))
+	if err != nil {
+		return nil, err
 	}
 	if runner == nil {
 		runner = processrunner.New(processrunner.Config{Clock: processClockAdapter{clock: clock}})
@@ -145,14 +147,15 @@ func New(config Config) (*Agent, error) {
 		client.Close()
 		return nil, err
 	}
-	session := newAgentSession(client, registration, heartbeatInterval, claimInterval, clock)
+	observer := newLifecycleObserver(clock)
+	session := newAgentSession(client, registration, heartbeatInterval, claimInterval, clock, observer)
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
 		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
 		logRetryInterval: logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runner: runner, outputSinkFactory: config.OutputSinkFactory,
 		handoffs: newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
-		logf:     config.Logf, clock: clock,
+		logf:     config.Logf, clock: clock, observer: observer,
 	}, nil
 }
 
@@ -201,8 +204,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		return fmt.Errorf("agent: recover durable logs: %w", err)
 	}
-	return a.session.run(ctx, func(attemptContext context.Context, claim l1.Claim) (errorDestination, error) {
-		return a.executeClaim(attemptContext, claim)
+	return a.session.run(ctx, func(attemptContext context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
+		return a.executeClaim(attemptContext, claim, claimStarted)
 	})
 }
 
@@ -213,8 +216,8 @@ func (a *Agent) recoverPendingLogs(ctx context.Context) error {
 	return a.outbox.recover(ctx, a.session.client)
 }
 
-func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim) (errorDestination, error) {
-	return a.newAttemptLifecycle().execute(ctx, claim)
+func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
+	return a.newAttemptLifecycle().execute(ctx, claim, claimStarted)
 }
 
 func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
@@ -224,10 +227,24 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 	return newAttemptLifecycle(attemptLifecycleDependencies{
 		client: a.sessionClient(), runner: a.runner, outbox: a.outbox,
-		clock: a.clock, renewalInterval: a.renewalInterval, completionRetry: a.logRetryInterval,
+		watchdog: newAuthorityWatchdog(a.clock), clock: a.clock,
+		renewalInterval: a.renewalInterval, completionRetry: a.logRetryInterval,
 		outputSinkFactory: a.outputSinkFactory, handoffs: a.handoffs,
 		nodeID: a.registration.NodeID, workflowBridge: a.startWorkflowBridge, logf: a.logf,
+		observer: a.observer,
 	})
+}
+
+// Status returns an agent-local lifecycle and occupancy snapshot. It does not
+// mutate or reinterpret the control plane's contract.NodeState.
+func (a *Agent) Status() Status {
+	if a == nil || a.observer == nil || a.session == nil {
+		return Status{Attempts: map[string]AttemptStatus{}}
+	}
+	return a.observer.snapshot(
+		a.session.gates[workloadClassOneShot].occupancy(),
+		a.session.gates[workloadClassService].occupancy(),
+	)
 }
 
 func (a *Agent) sessionClient() *Client {

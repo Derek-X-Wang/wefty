@@ -11,11 +11,14 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
+
+const DefaultOperationTimeout = 10 * time.Second
 
 // ProtocolError is an error response returned by the L1 agent protocol.
 type ProtocolError struct {
@@ -29,19 +32,27 @@ func (e *ProtocolError) Error() string {
 
 // Client calls the Fabric-authenticated L1 agent protocol.
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	transport  *http.Transport
+	baseURL          string
+	httpClient       *http.Client
+	transport        *http.Transport
+	operationTimeout time.Duration
 }
 
 // NewClient creates a client whose HTTP connections are obtained exclusively
 // through the Fabric seam.
 func NewClient(f fabric.Fabric, controlPlaneAddress string) (*Client, error) {
+	return newClient(f, controlPlaneAddress, DefaultOperationTimeout)
+}
+
+func newClient(f fabric.Fabric, controlPlaneAddress string, operationTimeout time.Duration) (*Client, error) {
 	if f == nil {
 		return nil, errors.New("agent: fabric is required")
 	}
 	if strings.TrimSpace(controlPlaneAddress) == "" {
 		return nil, errors.New("agent: control-plane address is required")
+	}
+	if operationTimeout <= 0 {
+		return nil, errors.New("agent: operation timeout must be positive")
 	}
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -49,9 +60,12 @@ func NewClient(f fabric.Fabric, controlPlaneAddress string) (*Client, error) {
 		},
 	}
 	return &Client{
-		baseURL:    "http://control-plane.invalid",
-		httpClient: &http.Client{Transport: transport},
-		transport:  transport,
+		baseURL: "http://control-plane.invalid",
+		httpClient: &http.Client{
+			Transport: transport,
+			Timeout:   operationTimeout,
+		},
+		transport: transport, operationTimeout: operationTimeout,
 	}, nil
 }
 
@@ -114,11 +128,13 @@ func (c *Client) post(ctx context.Context, path string, body, target any) error 
 }
 
 func (c *Client) postAllowNoContent(ctx context.Context, path string, body, target any) (bool, error) {
+	requestContext, cancel := c.boundedContext(ctx)
+	defer cancel()
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return false, fmt.Errorf("agent: encode request: %w", err)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(payload))
+	request, err := http.NewRequestWithContext(requestContext, http.MethodPost, c.baseURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return false, fmt.Errorf("agent: build request: %w", err)
 	}
@@ -139,6 +155,13 @@ func (c *Client) postAllowNoContent(ctx context.Context, path string, body, targ
 		return false, fmt.Errorf("agent: decode L1 response: %w", err)
 	}
 	return false, nil
+}
+
+func (c *Client) boundedContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= c.operationTimeout {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, c.operationTimeout)
 }
 
 func decodeProtocolError(response *http.Response) error {
