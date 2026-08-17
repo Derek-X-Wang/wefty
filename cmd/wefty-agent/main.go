@@ -4,9 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -111,8 +113,8 @@ func run() error {
 		ManagedRootDirectory: *managedRoot,
 		GuardianExecutable:   agentExecutable,
 		HandoffRoot:          *handoffRoot,
-		OutputSinkFactory: func(l1.Claim) processrunner.OutputSink {
-			return processrunner.OutputSinkFunc(writeOutput)
+		OutputSinkFactory: func(claim l1.Claim) processrunner.OutputSink {
+			return newConsoleOutputSink(os.Stdout, os.Stderr, claim)
 		},
 		Logf: log.Printf,
 	})
@@ -150,11 +152,20 @@ func run() error {
 	return err
 }
 
-func writeOutput(_ context.Context, event contract.LogEvent) error {
-	writer := os.Stdout
-	if event.Stream == contract.LogStderr {
-		writer = os.Stderr
-	}
-	_, err := writer.Write(event.Bytes)
-	return err
+var consoleOutputMu sync.Mutex
+
+func newConsoleOutputSink(stdout, stderr io.Writer, claim l1.Claim) processrunner.OutputSink {
+	return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
+		writer := stdout
+		if event.Stream == contract.LogStderr {
+			writer = stderr
+		}
+		consoleOutputMu.Lock()
+		defer consoleOutputMu.Unlock()
+		if _, err := fmt.Fprintf(writer, "[job=%s attempt=%s stream=%s] ", claim.Job.JobID, claim.Lease.AttemptID, event.Stream); err != nil {
+			return err
+		}
+		_, err := writer.Write(event.Bytes)
+		return err
+	})
 }

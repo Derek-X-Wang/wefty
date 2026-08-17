@@ -396,6 +396,38 @@ func TestRunPassesWorkingDirectoryStraightToProcessSpawn(t *testing.T) {
 	}
 }
 
+func TestTerminateAndWaitSurfacesStalledProcessWait(t *testing.T) {
+	assertTerminateAndWaitSurfacesStalledProcessWait(t)
+}
+
+func assertTerminateAndWaitSurfacesStalledProcessWait(t *testing.T) {
+	t.Helper()
+	clock := newFakeClock(time.Unix(4_000, 0))
+	runner := New(Config{
+		Clock: clock, TerminationGraceTime: 2 * time.Second, ProcessReapTimeout: 3 * time.Second,
+	})
+	wait := make(chan waitResult)
+	done := make(chan waitResult, 1)
+	go func() { done <- runner.terminateAndWait(1<<30, wait) }()
+	clock.WaitForTimerCount(t, 1)
+	clock.Advance(2 * time.Second)
+	clock.WaitForTimerCount(t, 2)
+	select {
+	case outcome := <-done:
+		t.Fatalf("terminateAndWait returned before reap bound: %#v", outcome)
+	default:
+	}
+	clock.Advance(3 * time.Second)
+	select {
+	case outcome := <-done:
+		if !errors.Is(outcome.err, ErrProcessReapTimeout) || outcome.state != nil {
+			t.Fatalf("terminateAndWait outcome = %#v, want explicit reap timeout", outcome)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminateAndWait silently stalled past reap bound")
+	}
+}
+
 func helperExecution(mode string, arguments ...string) contract.ExecutionSpec {
 	argv := []string{"process-helper", mode}
 	argv = append(argv, arguments...)

@@ -20,12 +20,14 @@ const (
 	DefaultIdleTimeout          = 600 * time.Second
 	DefaultCompletionTimeout    = 60 * time.Second
 	DefaultTerminationGraceTime = 5 * time.Second
+	DefaultProcessReapTimeout   = 5 * time.Second
 )
 
 var (
-	ErrIdleTimeout       = errors.New("process idle timeout exceeded")
-	ErrCompletionTimeout = errors.New("process completion timeout exceeded")
-	ErrMaxRuntime        = errors.New("process maximum runtime exceeded")
+	ErrIdleTimeout        = errors.New("process idle timeout exceeded")
+	ErrCompletionTimeout  = errors.New("process completion timeout exceeded")
+	ErrMaxRuntime         = errors.New("process maximum runtime exceeded")
+	ErrProcessReapTimeout = errors.New("process did not report exit after SIGKILL")
 )
 
 // IdlePolicy controls whether a process is supervised for output inactivity.
@@ -71,6 +73,9 @@ type Config struct {
 	IdleTimeout          time.Duration
 	CompletionTimeout    time.Duration
 	TerminationGraceTime time.Duration
+	// ProcessReapTimeout bounds the final wait after SIGKILL so a missing
+	// process Wait result is reported instead of silently stranding a caller.
+	ProcessReapTimeout time.Duration
 }
 
 // Runner executes kind=process workloads.
@@ -81,6 +86,7 @@ type Runner struct {
 	idleTimeout          time.Duration
 	completionTimeout    time.Duration
 	terminationGraceTime time.Duration
+	processReapTimeout   time.Duration
 }
 
 // New creates a process runner with defaults for every zero-valued duration.
@@ -102,6 +108,7 @@ func New(config Config) *Runner {
 		idleTimeout:          durationOrDefault(config.IdleTimeout, DefaultIdleTimeout),
 		completionTimeout:    durationOrDefault(config.CompletionTimeout, DefaultCompletionTimeout),
 		terminationGraceTime: durationOrDefault(config.TerminationGraceTime, DefaultTerminationGraceTime),
+		processReapTimeout:   durationOrDefault(config.ProcessReapTimeout, DefaultProcessReapTimeout),
 	}
 }
 
@@ -290,7 +297,14 @@ func (runner *Runner) terminateAndWait(processGroupID int, wait <-chan waitResul
 			if completed != nil {
 				return *completed
 			}
-			return <-wait
+			reapTimer := runner.clock.NewTimer(runner.processReapTimeout)
+			defer stopTimer(reapTimer)
+			select {
+			case outcome := <-wait:
+				return outcome
+			case <-reapTimer.C():
+				return waitResult{err: ErrProcessReapTimeout}
+			}
 		}
 	}
 }

@@ -18,7 +18,10 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-const DefaultOperationTimeout = 10 * time.Second
+const (
+	DefaultOperationTimeout    = 10 * time.Second
+	DefaultMaxIdleConnsPerHost = 16
+)
 
 // ProtocolError is an error response returned by the L1 agent protocol.
 type ProtocolError struct {
@@ -55,6 +58,7 @@ func newClient(f fabric.Fabric, controlPlaneAddress string, operationTimeout tim
 		return nil, errors.New("agent: operation timeout must be positive")
 	}
 	transport := &http.Transport{
+		MaxIdleConnsPerHost: DefaultMaxIdleConnsPerHost,
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return f.Dial(ctx, network, controlPlaneAddress)
 		},
