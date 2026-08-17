@@ -32,21 +32,25 @@ const (
 )
 
 type StoreOptions struct {
-	Clock              Clock
-	LeaseDuration      time.Duration
-	LateEvidenceWindow time.Duration
-	NodeStaleAfter     time.Duration
-	NodeDeadAfter      time.Duration
+	Clock                  Clock
+	Jitter                 func(time.Duration) time.Duration
+	LeaseDuration          time.Duration
+	LateEvidenceWindow     time.Duration
+	NodeStaleAfter         time.Duration
+	NodeDeadAfter          time.Duration
+	ServiceStabilityWindow time.Duration
 }
 
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
-	db                 *sql.DB
-	clock              Clock
-	leaseDuration      time.Duration
-	lateEvidenceWindow time.Duration
-	nodeStaleAfter     time.Duration
-	nodeDeadAfter      time.Duration
+	db                     *sql.DB
+	clock                  Clock
+	restartJitter          func(time.Duration) time.Duration
+	leaseDuration          time.Duration
+	lateEvidenceWindow     time.Duration
+	nodeStaleAfter         time.Duration
+	nodeDeadAfter          time.Duration
+	serviceStabilityWindow time.Duration
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
@@ -64,6 +68,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if leaseDuration <= 0 {
 		leaseDuration = DefaultLeaseDuration
 	}
+	restartJitter := options.Jitter
+	if restartJitter == nil {
+		restartJitter = defaultRestartJitter
+	}
 	lateEvidenceWindow := options.LateEvidenceWindow
 	if lateEvidenceWindow <= 0 {
 		lateEvidenceWindow = DefaultLateEvidenceWindow
@@ -79,6 +87,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if nodeDeadAfter <= nodeStaleAfter {
 		return nil, fmt.Errorf("l1: node dead threshold must exceed stale threshold")
 	}
+	serviceStabilityWindow := options.ServiceStabilityWindow
+	if serviceStabilityWindow <= 0 {
+		serviceStabilityWindow = DefaultServiceStabilityWindow
+	}
 
 	query := make(url.Values)
 	query.Add("_pragma", "busy_timeout(5000)")
@@ -92,8 +104,8 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	}
 	db.SetMaxOpenConns(16)
 	store := &Store{
-		db: db, clock: clock, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
-		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter,
+		db: db, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
+		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 	}
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
@@ -545,6 +557,12 @@ WHERE job_id=(
   SELECT j.job_id FROM jobs j
 	  WHERE j.state=?
 	    AND NOT EXISTS (
+	      SELECT 1 FROM service_jobs restartable_service
+	      WHERE restartable_service.job_id=j.job_id
+	        AND restartable_service.next_restart_at IS NOT NULL
+	        AND restartable_service.next_restart_at>?
+	    )
+	    AND NOT EXISTS (
 	      SELECT 1 FROM attempts prior
 	      WHERE prior.node_id=?
 	        AND prior.boot_session_id<>?
@@ -561,7 +579,7 @@ WHERE job_id=(
   LIMIT 1
 )
 AND state=?
-	RETURNING job_id, spec_json, fence_counter, created_ns`, contract.JobClaimed, attemptID, now.UnixNano(), contract.JobQueued,
+	RETURNING job_id, spec_json, fence_counter, created_ns`, contract.JobClaimed, attemptID, now.UnixNano(), contract.JobQueued, now.UnixNano(),
 		nodeID, bootSessionID, contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput,
 		nodeID, contract.JobQueued).
 		Scan(&jobID, &specJSON, &fence, &createdNS)
@@ -581,6 +599,11 @@ AND state=?
 		fencingToken, leaseExpires.UnixNano(), authorityGeneration, now.UnixNano(), now.UnixNano())
 	if err != nil {
 		return nil, internalError(err, "create claimed attempt")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
+		SET next_restart_at=NULL, healthy_since_ns=NULL, published_attempt_id=NULL
+		WHERE job_id=?`, jobID); err != nil {
+		return nil, internalError(err, "begin service restart attempt")
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, internalError(err, "commit job claim")
@@ -647,6 +670,9 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=? AND state=?", contract.JobRunning, now.UnixNano(), jobID, contract.JobClaimed); err != nil {
 			return AttemptLease{}, internalError(err, "acknowledge renewed job execution")
 		}
+	}
+	if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
+		return AttemptLease{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return AttemptLease{}, internalError(err, "commit lease renewal")
@@ -833,6 +859,9 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?", contract.JobRunning, now.UnixNano(), jobID); err != nil {
 			return AppendLogsResponse{}, internalError(err, "mark logging job running")
 		}
+	}
+	if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
+		return AppendLogsResponse{}, err
 	}
 	if err := readLogAcknowledgements(ctx, tx, attemptID, streams, acknowledged); err != nil {
 		return AppendLogsResponse{}, err
@@ -1023,6 +1052,13 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	if err != nil {
 		return Job{}, internalError(err, "encode process result")
 	}
+	lastFailureJSON := resultJSON
+	if request.Result.SpawnError != nil {
+		lastFailureJSON, err = json.Marshal(request.Result.SpawnError)
+		if err != nil {
+			return Job{}, internalError(err, "encode service spawn failure")
+		}
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1103,10 +1139,21 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 		return Job{}, protocolError(contract.ErrorConflict, "attempt is terminal")
 	}
 
+	jobBeforeCompletion, err := getJobByID(ctx, tx, jobID)
+	if err != nil {
+		return Job{}, internalError(err, "read completing job policy")
+	}
 	finalJobState, finalAttemptState := completionStates(request.Result)
+	var servicePolicy *serviceCompletionPolicy
+	if jobBeforeCompletion.ServiceJob != nil {
+		policy := s.classifyServiceCompletion(jobBeforeCompletion, request.Result, lastFailureJSON, now)
+		servicePolicy = &policy
+		finalJobState = policy.jobState
+		finalAttemptState = policy.attemptState
+	}
 	// Successful completion passes through running inside the same transaction
 	// so it respects the M0 state table without exposing an extra protocol verb.
-	if finalJobState == contract.JobSucceeded && attempt.state == contract.AttemptClaimed {
+	if finalAttemptState == contract.AttemptSucceeded && attempt.state == contract.AttemptClaimed {
 		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=? WHERE attempt_id=?", contract.AttemptRunning, attemptID); err != nil {
 			return Job{}, internalError(err, "acknowledge attempt execution")
 		}
@@ -1122,6 +1169,16 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	_, err = tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?", finalJobState, now.UnixNano(), jobID)
 	if err != nil {
 		return Job{}, internalError(err, "complete job")
+	}
+	if servicePolicy != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
+			SET restart_streak=?, lifetime_restart_count=?, next_restart_at=?,
+				last_failure=CASE WHEN ? THEN ? ELSE last_failure END,
+				healthy_since_ns=NULL, published_attempt_id=NULL
+			WHERE job_id=?`, servicePolicy.restartStreak, servicePolicy.lifetimeRestartCount,
+			servicePolicy.nextRestartNS, servicePolicy.updateLastFailure, servicePolicy.lastFailure, jobID); err != nil {
+			return Job{}, internalError(err, "apply service completion policy")
+		}
 	}
 	job, err := getJobByID(ctx, tx, jobID)
 	if err != nil {
@@ -1213,10 +1270,39 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 		return internalError(err, "read attempt expiry result")
 	}
 	if changed > 0 {
+		var jobState contract.JobState
+		var desiredState sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT jobs.state, service_jobs.desired_state
+			FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
+			WHERE jobs.job_id=? AND jobs.current_attempt_id=?`, attempt.jobID, attempt.attemptID).
+			Scan(&jobState, &desiredState)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return internalError(err, "read job after lease expiry")
+		}
+
+		nextState := contract.JobFailed
+		if desiredState.Valid && contract.ServiceDesiredState(desiredState.String) == contract.ServiceDesiredRunning &&
+			(jobState == contract.JobClaimed || jobState == contract.JobRunning) {
+			nextState = contract.JobQueued
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=?
-			WHERE job_id=? AND current_attempt_id=? AND state IN (?, ?, ?)`, contract.JobFailed, now.UnixNano(), attempt.jobID,
-			attempt.attemptID, contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput); err != nil {
-			return internalError(err, "fail job after lease expiry")
+			WHERE job_id=? AND current_attempt_id=?`, nextState, now.UnixNano(), attempt.jobID, attempt.attemptID); err != nil {
+			return internalError(err, "transition job after lease expiry")
+		}
+		if desiredState.Valid {
+			lifetimeIncrement := 0
+			if nextState == contract.JobQueued {
+				lifetimeIncrement = 1
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
+				SET lifetime_restart_count=lifetime_restart_count+?, next_restart_at=NULL,
+					healthy_since_ns=NULL, published_attempt_id=NULL
+				WHERE job_id=?`, lifetimeIncrement, attempt.jobID); err != nil {
+				return internalError(err, "clear service authority after lease expiry")
+			}
 		}
 	}
 	return nil
@@ -1328,6 +1414,15 @@ func completionStates(result ProcessResult) (contract.JobState, contract.Attempt
 		return contract.JobSucceeded, contract.AttemptSucceeded
 	}
 	return contract.JobFailed, contract.AttemptFailed
+}
+
+func markPortlessServiceStable(ctx context.Context, tx *sql.Tx, jobID string, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
+		SET healthy_since_ns=COALESCE(healthy_since_ns, ?)
+		WHERE job_id=? AND published_port IS NULL`, now.UnixNano(), jobID); err != nil {
+		return internalError(err, "record portless service stability")
+	}
+	return nil
 }
 
 type queryer interface {

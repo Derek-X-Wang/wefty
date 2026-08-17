@@ -152,14 +152,19 @@ visible with claims disabled.
 | --- | ---: | --- | --- | --- |
 | Attempt ID is not the job's current attempt | 409 | `attempt_mismatch` | false | No mutation. |
 | Fence is not current | 409 | `stale_fence` | false | No mutation. The stale worker must stop writing. |
-| Lease is expired | 409 | `lease_expired` | false | Attempt becomes terminal `lost` and job becomes terminal `failed` exactly once. |
+| Lease is expired | 409 | `lease_expired` | false | Attempt becomes terminal `lost` exactly once. A one-shot job fails; a desired-running service job requeues without incrementing its streak. |
 | Same idempotency identity and same body is replayed | original success | none | n/a | Return the original result; do not duplicate logs or completion. |
 | Same idempotency identity has a different body | 409 | `idempotency_conflict` | false | No mutation. |
 
-Expiry never creates another attempt and never requeues the job in v0.1. A
-partitioned node may still be running non-idempotent work, so later
-authority-changing writes receive `lease_expired` or `stale_fence` and cannot
-alter state. Evidence writes follow the provenance-only rules above.
+Expiry never creates another attempt. A desired-running service job becomes
+eligible for its bound node again, while the ordinary atomic claim transaction
+is the only operation that can mint the fresh attempt ID and incremented fence.
+The expired attempt remains `lost`, `current_attempt_id` remains available for
+completion replay until a later claim wins, and the restart streak is frozen
+because lease loss is infrastructure suppression. One-shot jobs still fail
+terminally. A partitioned node may still be running non-idempotent work, so
+later authority-changing writes receive `lease_expired` or `stale_fence` and
+cannot alter state. Evidence writes follow the provenance-only rules above.
 
 Log idempotency is keyed by `(attempt_id, stream, sequence)`. The same bytes and
 timestamp are replay-safe; a different event at an existing key is an

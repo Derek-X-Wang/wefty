@@ -17,10 +17,13 @@ invalid. State changes and their required side effects commit atomically.
 | `succeeded` | Completion was accepted with a successful process result and required protocol outputs. Terminal. | none |
 | `failed` | Execution, lease, or workflow protocol failed. Terminal; v0.1 never automatically requeues. | none |
 
-An active attempt whose lease expires transitions to `lost` while its job
-transitions to `failed` in the same transaction. The job does not itself use a
-`lost` state because `lost` describes what is known about one execution
-attempt, while the job's scheduling outcome is failure.
+An active one-shot attempt whose lease expires transitions to `lost` while its
+job transitions to `failed` in the same transaction. A service attempt still
+becomes terminal `lost`, but a desired-running service job re-enters `queued`
+without changing its restart streak; the atomic claim path alone may create a
+fresh attempt and fence. A stopping service whose quiescence cannot be
+confirmed latches `failed`. The job does not itself use a `lost` state because
+`lost` describes what is known about one execution attempt.
 
 ## Service job
 
@@ -59,7 +62,7 @@ the attempt that positively reaped the payload.
 | `awaiting-input` | Reserved live attempt awaiting a future prompt verb. | `running`, `failed`, `lost` |
 | `succeeded` | A matching, in-lease completion was accepted. Terminal. | none |
 | `failed` | A matching, in-lease failure was accepted. Terminal. | none |
-| `lost` | The control plane's clock observed lease expiry. Terminal; never requeued in v0.1. | none |
+| `lost` | The control plane's clock observed lease expiry. Terminal; a desired-running service may requeue its containing job, never this attempt. | none |
 
 Only the current `(job_id, attempt_id, fencing_token)` tuple may renew a lease,
 append logs, or complete. An expired attempt becomes `lost` exactly once.
