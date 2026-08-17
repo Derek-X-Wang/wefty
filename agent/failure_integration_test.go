@@ -101,7 +101,7 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondClaim, err := store.ClaimJob(context.Background(), "fabric-node-2", "node-2", "boot-2")
+	secondClaim, err := store.ClaimJob(context.Background(), "fabric-node-2", "node-2", "boot-2", contract.JobClassOneShot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +117,77 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("agent did not return after outer cancellation")
+	}
+}
+
+func TestAgentClaimsOneAttemptPerClassConcurrently(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
+	defer stopServer()
+	createAgentTestJob(t, store, "concurrent-one-shot")
+	serviceDirectory := t.TempDir()
+	if _, _, err := store.CreateJob(context.Background(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1,
+		DispatchKey:   "concurrent-service",
+		Kind:          "process",
+		Class:         contract.JobClassService,
+		Restart:       contract.RestartAlways,
+		RoutingTags:   []string{"linux"},
+		Execution: contract.ExecutionSpec{
+			Executable:       contract.ExecutableSpec{Path: "/bin/true"},
+			Argv:             []string{"true"},
+			WorkingDirectory: serviceDirectory,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := newBlockingRunner()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node-1", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	// #83 made a managed resource mandatory for service jobs, and the #64
+	// guardrails refuse a symlink anywhere in the managed ancestry — macOS
+	// TempDir lives under /var -> /private/var.
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		HeartbeatInterval: time.Second, ClaimInterval: 10 * time.Millisecond, RenewalInterval: 100 * time.Millisecond,
+		Runner: runner, LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: managedRoot,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for runner.starts.Load() != 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if runner.starts.Load() != 2 {
+		cancel()
+		t.Fatalf("concurrent runner starts = %d, want one one-shot and one service", runner.starts.Load())
+	}
+	status := nodeAgent.Status()
+	if status.OneShot.Occupied != 1 || status.OneShot.Limit != prefactorClassLimit ||
+		status.Services.Occupied != 1 || status.Services.Limit != prefactorClassLimit {
+		cancel()
+		t.Fatalf("class occupancy = one-shot %#v service %#v, want 1/1 each", status.OneShot, status.Services)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("agent Run() after cancellation = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent did not join both class loops after cancellation")
 	}
 }
 

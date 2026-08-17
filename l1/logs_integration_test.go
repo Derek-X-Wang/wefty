@@ -190,7 +190,7 @@ func TestStaleFenceCannotAppendLogs(t *testing.T) {
 
 func claimForLogs(t *testing.T, h *integrationHarness, agentClient *http.Client, jobID string) Claim {
 	t.Helper()
-	status, _, body := h.do(agentClient, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1"})
+	status, _, body := h.do(agentClient, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 	if status != http.StatusOK {
 		t.Fatalf("claim status = %d body=%s", status, body)
 	}

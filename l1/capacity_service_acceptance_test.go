@@ -52,3 +52,11 @@ func TestServiceAcceptanceCapacityIsControlPlanePolicy(t *testing.T) {
 		t.Fatalf("heartbeat capacities = %d/%d, want 2/1", heartbeat.MaxOneshotSlots, heartbeat.MaxServiceSlots)
 	}
 }
+
+func TestServiceAcceptanceClassScopedClaimAdmission(t *testing.T) {
+	assertClaimRequiresClassSelector(t)
+	assertClaimSelectorsSeparateWorkloadClasses(t)
+	assertConcurrentClassClaimsStopAtConfiguredCapacity(t)
+	assertServiceClaimEligibilityStaysInsideFIFOSelection(t)
+	assertBoundServiceRestartsWhileOneShotCapacityIsFull(t)
+}

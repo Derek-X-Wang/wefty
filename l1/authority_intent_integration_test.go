@@ -63,7 +63,7 @@ func assertClaimTimeAuthorityAndIntent(t *testing.T) {
 			t.Fatalf("first registration status = %d body=%s", status, body)
 		}
 		firstJob := h.submit(client, "authority-first", []string{"linux"})
-		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "stable-node", BootSessionID: "boot-1"})
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "stable-node", BootSessionID: "boot-1", Class: contract.JobClassOneShot})
 		if status != http.StatusOK {
 			t.Fatalf("first claim status = %d body=%s", status, body)
 		}
@@ -78,7 +78,7 @@ func assertClaimTimeAuthorityAndIntent(t *testing.T) {
 			t.Fatalf("replacement registration status = %d body=%s", status, body)
 		}
 		h.submit(client, "authority-second", []string{"linux"})
-		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "stable-node", BootSessionID: "boot-2"})
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "stable-node", BootSessionID: "boot-2", Class: contract.JobClassOneShot})
 		if status != http.StatusNoContent {
 			t.Fatalf("embargoed claim status = %d, want 204 body=%s", status, body)
 		}
@@ -124,7 +124,7 @@ func assertClaimTimeAuthorityAndIntent(t *testing.T) {
 		if _, err := h.store.Reconcile(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "stable-node", BootSessionID: "boot-2"})
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "stable-node", BootSessionID: "boot-2", Class: contract.JobClassOneShot})
 		if status != http.StatusOK {
 			t.Fatalf("post-expiry claim status = %d body=%s", status, body)
 		}
@@ -143,7 +143,7 @@ func assertClaimTimeAuthorityAndIntent(t *testing.T) {
 		}
 		h.submit(operator, "unexpected-disabled", []string{"unexpected-only"})
 		status, _, body := h.do(unexpectedAgent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{
-			NodeID: "unexpected-node", BootSessionID: "boot-unexpected-node",
+			NodeID: "unexpected-node", BootSessionID: "boot-unexpected-node", Class: contract.JobClassOneShot,
 		})
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDraining)
 
@@ -170,13 +170,13 @@ func assertClaimTimeAuthorityAndIntent(t *testing.T) {
 		if status != http.StatusOK {
 			t.Fatalf("disabled-node re-registration status = %d body=%s", status, body)
 		}
-		status, _, body = h.do(expectedAgent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "expected-node", BootSessionID: "boot-rejoined"})
+		status, _, body = h.do(expectedAgent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "expected-node", BootSessionID: "boot-rejoined", Class: contract.JobClassOneShot})
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDraining)
 
 		liveAgent := h.client(fabric.Identity{NodeID: "fabric-live", Tags: []string{DefaultAgentPrincipalTag}})
 		live := h.register(liveAgent, "live-node")
 		liveJob := h.submit(operator, "intent-does-not-fence", []string{"linux"})
-		status, _, body = h.do(liveAgent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "live-node", BootSessionID: live.BootSessionID})
+		status, _, body = h.do(liveAgent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "live-node", BootSessionID: live.BootSessionID, Class: contract.JobClassOneShot})
 		if status != http.StatusOK {
 			t.Fatalf("live claim status = %d body=%s", status, body)
 		}
