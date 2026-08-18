@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,7 +20,10 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-const defaultServicePollInterval = time.Second
+const (
+	defaultServicePollInterval    = time.Second
+	inlineServiceScriptLimitError = "script exceeds the 1 MiB inline limit; services take a small launcher script, not a binary"
+)
 
 func executeServices(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
@@ -128,6 +132,13 @@ func executeServiceCreate(
 	}
 	if mode.value != nil {
 		spec.Execution.Executable.Mode = *mode.value
+	}
+	requestBody, err := json.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("encode service create request: %w", err)
+	}
+	if len(requestBody) > l1.MaxRequestBodyBytes {
+		return usageError(inlineServiceScriptLimitError)
 	}
 	job, err := clients.createService(ctx, spec)
 	if err != nil {
