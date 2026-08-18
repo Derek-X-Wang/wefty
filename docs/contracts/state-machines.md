@@ -67,6 +67,18 @@ service from `running` to `queued`, and leaves the restart streak unchanged.
 It must not use `stopping` or `stopped`, whose meaning is reserved for a
 durable operator request to stop the service.
 
+Service completion policy classifies the payload result independently from
+log finalization. Its finalization-related classifier rows are explicit:
+
+| Completion fact | Service treatment | Restart streak |
+| --- | --- | ---: |
+| Genuine `output_error` (corruption, disk, redaction, or uploader failure) | Latch `failed`, even when the payload exit would otherwise be restartable. | unchanged |
+| Expected service-spool capacity eviction | Not a termination cause; it never produces `output_error` or reaches the classifier. | n/a |
+
+The finalization timeout begins only after the payload returns; payload uptime
+can never consume that bound. Finalization remains uncancelable by ordinary
+execution cancellation, but authority loss and removal cancel it immediately.
+
 ## Attempt
 
 | State | Meaning | Allowed next states |

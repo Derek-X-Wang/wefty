@@ -70,8 +70,8 @@ func newAttemptLifecycle(dependencies attemptLifecycleDependencies) *attemptLife
 		dependencies.watchdog = disabledAttemptWatchdog{}
 	}
 	// A zero finalization timeout would produce an already-expired context and
-	// silently fail every attempt's log setup, so it defaults rather than
-	// trusting each construction site to supply it.
+	// fail every attempt's final log flush, so it defaults rather than trusting
+	// each construction site to supply it.
 	dependencies.finalizationTimeout = durationOrDefault(dependencies.finalizationTimeout, DefaultFinalizationTimeout)
 	return &attemptLifecycle{dependencies: dependencies}
 }
@@ -80,6 +80,42 @@ type runOutcome struct {
 	result        contract.ProcessResult
 	err           error
 	durabilityErr error
+}
+
+// attemptFinalization keeps log delivery alive after execution cancellation,
+// but does not start its timeout until the payload has actually returned and
+// finalization begins. cancel remains available to authority-loss and removal
+// paths, where L1 can no longer accept the attempt's pending evidence.
+type attemptFinalization struct {
+	context context.Context
+	cancel  context.CancelCauseFunc
+	timeout time.Duration
+}
+
+func newAttemptFinalization(parent context.Context, timeout time.Duration) *attemptFinalization {
+	finalizationContext, cancel := context.WithCancelCause(context.WithoutCancel(parent))
+	return &attemptFinalization{context: finalizationContext, cancel: cancel, timeout: timeout}
+}
+
+func (finalization *attemptFinalization) begin() (context.Context, func()) {
+	boundedContext, cancelBound := context.WithTimeout(finalization.context, finalization.timeout)
+	stopPropagation := context.AfterFunc(boundedContext, func() {
+		// A log upload may already be retrying on the attempt-long context.
+		// Propagate the finalization deadline so that operation is bounded too.
+		finalization.cancel(context.Cause(boundedContext))
+	})
+	return boundedContext, func() {
+		if cause := context.Cause(boundedContext); cause != nil && stopPropagation() {
+			// CloseContext may observe the deadline before AfterFunc runs. Make
+			// cancellation of an upload already using the base context synchronous.
+			finalization.cancel(cause)
+		}
+		cancelBound()
+	}
+}
+
+func (finalization *attemptFinalization) stop() {
+	finalization.cancel(context.Canceled)
 }
 
 var (
@@ -151,21 +187,19 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 	}
 
-	// Uncancelable so a cancelled execution still flushes and uploads its final
-	// output, but BOUNDED: an unbounded finalization prevents the attempt from
-	// ever completing, which blocks agent drain and service removal forever
-	// rather than merely delaying them. Removal cancels it outright below.
-	finalizationContext, cancelFinalization := context.WithTimeout(
-		context.WithoutCancel(attemptContext), lifecycle.dependencies.finalizationTimeout,
-	)
-	defer cancelFinalization()
+	// The attempt-long context is uncancelable by execution shutdown so final
+	// output can still be flushed. Its timeout is deliberately not attached
+	// yet: payload uptime is not part of the finalization phase. Authority loss
+	// and removal can still cancel this context outright below.
+	finalization := newAttemptFinalization(attemptContext, lifecycle.dependencies.finalizationTimeout)
+	defer finalization.stop()
 
 	completed := make(chan runOutcome, 1)
 	go func() {
 		if claim.Job.Spec.Class == contract.JobClassOneShot {
 			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptRunning, nil)
 		}
-		result, err := lifecycle.runProcessContexts(executionContext, finalizationContext, claim)
+		result, err := lifecycle.runProcessContexts(executionContext, finalization, claim)
 		var durabilityErr error
 		if lifecycle.dependencies.outbox != nil {
 			durabilityErr = lifecycle.dependencies.outbox.storeCompletion(
@@ -191,7 +225,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			// deliver to a control plane that has already deleted the
 			// destination; the events stay durable in the spool until the
 			// removal controller purges it.
-			cancelFinalization()
+			finalization.stop()
 		}
 		outcome := <-completed
 		<-renewalDone
@@ -244,14 +278,14 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		// expired — and after a removal the rejection is a sequence conflict,
 		// which classifies as transient and retries indefinitely. The events
 		// stay durable in the spool either way.
-		cancelFinalization()
+		finalization.stop()
 		<-completed
 		<-renewalDone
 		return failure.destination, fmt.Errorf("agent: renew lease: %w", failure.err)
 	case err := <-watch.Failures():
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, err)
 		cancelAttempt(err)
-		cancelFinalization()
+		finalization.stop()
 		<-completed
 		<-renewalDone
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", err)
@@ -378,10 +412,12 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 }
 
 func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
-	return lifecycle.runProcessContexts(ctx, ctx, claim)
+	finalization := newAttemptFinalization(ctx, lifecycle.dependencies.finalizationTimeout)
+	defer finalization.stop()
+	return lifecycle.runProcessContexts(ctx, finalization, claim)
 }
 
-func (lifecycle *attemptLifecycle) runProcessContexts(ctx, finalizationContext context.Context, claim l1.Claim) (contract.ProcessResult, error) {
+func (lifecycle *attemptLifecycle) runProcessContexts(ctx context.Context, finalization *attemptFinalization, claim l1.Claim) (contract.ProcessResult, error) {
 	if err := contract.CheckWorkloadClass(claim.Job.Spec.Class); err != nil {
 		return spawnFailure(contract.SpawnFailureUnsupportedClass, err), err
 	}
@@ -471,7 +507,7 @@ func (lifecycle *attemptLifecycle) runProcessContexts(ctx, finalizationContext c
 	var uploader *batchingLogSink
 	var sinks multiOutputSink
 	if lifecycle.dependencies.client != nil && lifecycle.dependencies.outbox != nil {
-		uploader, err = lifecycle.dependencies.outbox.newLogSink(finalizationContext, lifecycle.dependencies.client, claim)
+		uploader, err = lifecycle.dependencies.outbox.newLogSink(finalization.context, lifecycle.dependencies.client, claim)
 		if err != nil {
 			return spawnFailure(contract.SpawnFailureLogSinkSetup, err), err
 		}
@@ -549,13 +585,15 @@ func (lifecycle *attemptLifecycle) runProcessContexts(ctx, finalizationContext c
 	} else {
 		result, runErr = lifecycle.dependencies.runner.Run(ctx, request, sink)
 	}
+	finalizationContext, cancelFinalization := finalization.begin()
+	defer cancelFinalization()
 	var outputErr error
 	if redactingSink != nil {
 		outputErr = redactingSink.Flush(finalizationContext)
 	}
 	var uploadErr error
 	if uploader != nil {
-		uploadErr = uploader.Close()
+		uploadErr = uploader.CloseContext(finalizationContext)
 	}
 	if outputErr != nil {
 		outputErr = fmt.Errorf("flush redacted output: %w", outputErr)

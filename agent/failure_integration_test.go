@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -920,6 +921,91 @@ func TestAgentShutdownFinalizationUploadsLogs(t *testing.T) {
 	}
 }
 
+func TestFinalizationTimeoutStartsAfterServicePayloadStops(t *testing.T) {
+	assertFinalizationTimeoutStartsAfterServicePayloadStops(t)
+}
+
+func assertFinalizationTimeoutStartsAfterServicePayloadStops(t *testing.T) {
+	t.Helper()
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
+	defer stopServer()
+	workingDirectory := t.TempDir()
+	service, _, err := store.CreateJob(context.Background(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1,
+		DispatchKey:   "finalization-anchor-service",
+		Kind:          "process",
+		Class:         contract.JobClassService,
+		Restart:       contract.RestartAlways,
+		RoutingTags:   []string{"linux"},
+		Execution: contract.ExecutionSpec{
+			Executable:       contract.ExecutableSpec{Path: "/bin/true"},
+			Argv:             []string{"true"},
+			WorkingDirectory: workingDirectory,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalizationTimeout := 50 * time.Millisecond
+	runner := newFinalizationAnchorRunner()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		ClaimInterval: 5 * time.Millisecond, RenewalInterval: time.Second,
+		FinalizationTimeout: finalizationTimeout, LogBatchSize: 8, LogFlushInterval: time.Hour,
+		Runner: runner, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	attemptID := runner.waitStarted(t)
+
+	// This is the production failure shape in compressed time: payload uptime
+	// exceeds the whole finalization budget before the payload crashes.
+	time.Sleep(3 * finalizationTimeout)
+	runner.kill()
+	requeued, err := waitForFailureJobState(store, service.JobID, contract.JobQueued, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failure l1.ProcessResult
+	if err := json.Unmarshal(requeued.LastFailure, &failure); err != nil {
+		t.Fatalf("decode last_failure: %v", err)
+	}
+	if failure.OutputError != "" || failure.Signal != "killed" ||
+		requeued.RestartStreak != 1 || requeued.NextRestartAt == nil || !requeued.RestartPending(requeued.State, time.Now()) {
+		t.Fatalf("service after crash = %#v, want restart-pending without output_error", requeued)
+	}
+	page, err := store.GetJobLogs(context.Background(), service.JobID, "", l1.MaxLogPageLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 1 || page.Events[0].AttemptID != attemptID || string(page.Events[0].Bytes) != "final service event" {
+		t.Fatalf("finalized service logs = %#v, want final event for %s", page.Events, attemptID)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("agent shutdown = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent did not stop after finalization-anchor assertion")
+	}
+}
+
 func assertPluralServiceDrainJoinsAll(t *testing.T) {
 	t.Helper()
 	network := plain.NewNetwork()
@@ -1174,6 +1260,49 @@ type resilienceRunner struct {
 type loggingBlockingRunner struct {
 	started  chan string
 	canceled chan struct{}
+}
+
+type finalizationAnchorRunner struct {
+	started chan string
+	killed  chan struct{}
+	once    sync.Once
+}
+
+func newFinalizationAnchorRunner() *finalizationAnchorRunner {
+	return &finalizationAnchorRunner{started: make(chan string, 1), killed: make(chan struct{})}
+}
+
+func (runner *finalizationAnchorRunner) Run(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
+	runner.started <- request.AttemptID
+	select {
+	case <-ctx.Done():
+		return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
+	case <-runner.killed:
+	}
+	if err := sink.WriteOutput(ctx, contract.LogEvent{
+		AttemptID: request.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("final service event"),
+	}); err != nil {
+		return contract.ProcessResult{}, err
+	}
+	return contract.ProcessResult{Signal: "killed", TerminationCause: contract.TerminationCauseSpontaneous}, nil
+}
+
+func (runner *finalizationAnchorRunner) waitStarted(t *testing.T) string {
+	t.Helper()
+	select {
+	case attemptID := <-runner.started:
+		return attemptID
+	case <-time.After(5 * time.Second):
+		t.Fatal("finalization-anchor service did not start")
+		return ""
+	}
+}
+
+func (runner *finalizationAnchorRunner) kill() {
+	runner.once.Do(func() { close(runner.killed) })
 }
 
 func newLoggingBlockingRunner() *loggingBlockingRunner {
