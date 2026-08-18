@@ -17,6 +17,10 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 )
 
+// MaxRequestBodyBytes is the JSON body limit shared by ordinary L1 routes and
+// clients that need to reject requests which cannot cross that boundary.
+const MaxRequestBodyBytes = 1 << 20
+
 type ServerConfig struct {
 	ClientPrincipalTag string
 	AgentPrincipalTag  string
@@ -650,7 +654,7 @@ func (s *Server) notImplemented(w http.ResponseWriter, _ *http.Request) {
 }
 
 func decodeJSON(r *http.Request, target any) error {
-	return decodeJSONWithLimit(r, target, 1<<20)
+	return decodeJSONWithLimit(r, target, MaxRequestBodyBytes)
 }
 
 func decodeJSONWithLimit(r *http.Request, target any, limit int64) error {

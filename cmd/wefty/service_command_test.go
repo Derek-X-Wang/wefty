@@ -23,6 +23,25 @@ func TestServiceCLIContractOverJobKeyedL1Routes(t *testing.T) {
 	assertServiceCLIContractOverJobKeyedL1Routes(t)
 }
 
+func TestServiceCreateRejectsBinarySizedInlineScript(t *testing.T) {
+	scriptPath := filepath.Join(t.TempDir(), "service-binary")
+	// Base64 expands this sub-1 MiB file beyond L1's JSON request limit.
+	if err := os.WriteFile(scriptPath, make([]byte, l1.MaxRequestBodyBytes*3/4), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := executeServiceCreate(
+		context.Background(), nil, true, []string{"--script", scriptPath}, &stdout, &stderr,
+	)
+	if err == nil || err.Error() != inlineServiceScriptLimitError {
+		t.Fatalf("oversized service script error = %v, want %q", err, inlineServiceScriptLimitError)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("oversized service script wrote output: %q", stdout.String())
+	}
+}
+
 func assertServiceCLIContractOverJobKeyedL1Routes(t *testing.T) {
 	t.Helper()
 	harness := newServiceCLIHarness(t)
