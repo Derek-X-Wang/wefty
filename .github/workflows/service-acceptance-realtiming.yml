@@ -1,0 +1,46 @@
+name: service-acceptance-realtiming
+
+# Evidence lane only: production clocks make this too slow for pull requests.
+# It is intentionally absent from contract-gate's all-tests-pass aggregation.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "47 7 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: service-acceptance-realtiming-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  service-acceptance-realtiming:
+    name: service-acceptance-realtiming / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run service acceptance at production timings
+        env:
+          WEFTY_REALTIME_EVIDENCE_DIR: ${{ runner.temp }}/service-acceptance-realtiming
+        run: |
+          mkdir -p "$WEFTY_REALTIME_EVIDENCE_DIR"
+          printf 'commit=%s\nrunner=%s\n' "$GITHUB_SHA" "$RUNNER_NAME" > "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
+          go version >> "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
+          go test -count=1 -p 1 -timeout=30m -v -tags=service_acceptance_realtiming ./...
+      - name: Upload service acceptance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: service-acceptance-realtiming-${{ matrix.os }}-${{ github.sha }}
+          path: ${{ runner.temp }}/service-acceptance-realtiming
+          if-no-files-found: error

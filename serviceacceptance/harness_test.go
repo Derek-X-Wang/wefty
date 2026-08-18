@@ -1,4 +1,4 @@
-//go:build service_acceptance && (darwin || linux)
+//go:build (service_acceptance || service_acceptance_realtiming) && (darwin || linux)
 
 package serviceacceptance
 
@@ -71,22 +71,41 @@ type acceptanceHarness struct {
 	client              *http.Client
 	publishedFabric     fabric.Fabric
 	agent               *managedProcess
+	agents              []*managedProcess
+	controlPlane        *managedProcess
 	managedRoot         string
 	handoffRoot         string
 	l1Database          string
 	spoolDirectory      string
 	controlPlaneAddress string
 	agentArguments      []string
+	productionTimings   bool
 	workingDirectories  map[string]string
 	specs               map[string]contract.JobSpec
 }
 
 func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
-	return newAcceptanceHarnessWithAgentArguments(t)
+	return newAcceptanceHarnessWithOptions(t, acceptanceHarnessOptions{leaseDuration: time.Second})
 }
 
 func newAcceptanceHarnessWithAgentArguments(t *testing.T, agentArguments ...string) *acceptanceHarness {
+	return newAcceptanceHarnessWithOptions(t, acceptanceHarnessOptions{
+		leaseDuration:  time.Second,
+		agentArguments: agentArguments,
+	})
+}
+
+type acceptanceHarnessOptions struct {
+	leaseDuration     time.Duration
+	productionTimings bool
+	agentArguments    []string
+}
+
+func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOptions) *acceptanceHarness {
 	t.Helper()
+	if options.leaseDuration <= 0 {
+		t.Fatal("acceptance lease duration must be positive")
+	}
 	directory := t.TempDir()
 	resolvedDirectory, err := filepath.EvalSymlinks(directory)
 	if err != nil {
@@ -101,14 +120,18 @@ func newAcceptanceHarnessWithAgentArguments(t *testing.T, agentArguments ...stri
 		"--fabric=plain",
 		"--listen=127.0.0.1:0",
 		"--db="+l1Database,
-		"--lease-duration=1s",
+		"--lease-duration="+options.leaseDuration.String(),
 		"--node-tags=acceptance-node=service-acceptance",
+		"--node-max-oneshot-slots=acceptance-node=4",
+		"--node-max-service-slots=acceptance-node=2",
 		"--ready-file="+readyFile,
 	)
 	controlPlane.start(t)
 	address := waitForReadyAddress(t, readyFile, controlPlane, 10*time.Second)
 
-	agentProcess := newAcceptanceAgentProcess(t, address, spoolDirectory, managedRoot, handoffRoot, agentArguments...)
+	agentProcess := newAcceptanceAgentProcess(
+		t, address, spoolDirectory, managedRoot, handoffRoot, options.productionTimings, options.agentArguments...,
+	)
 	agentProcess.start(t)
 
 	clientFabric := plain.NewNetwork().NewFabric(fabric.Identity{
@@ -123,15 +146,22 @@ func newAcceptanceHarnessWithAgentArguments(t *testing.T, agentArguments ...stri
 	t.Cleanup(client.CloseIdleConnections)
 	return &acceptanceHarness{
 		client: client, publishedFabric: plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "service-client"}), agent: agentProcess,
+		agents: []*managedProcess{agentProcess}, controlPlane: controlPlane,
 		managedRoot: managedRoot, handoffRoot: handoffRoot,
 		l1Database: l1Database, spoolDirectory: spoolDirectory, controlPlaneAddress: address,
-		agentArguments:     append([]string(nil), agentArguments...),
+		agentArguments:     append([]string(nil), options.agentArguments...),
+		productionTimings:  options.productionTimings,
 		workingDirectories: make(map[string]string),
 		specs:              make(map[string]contract.JobSpec),
 	}
 }
 
-func newAcceptanceAgentProcess(t *testing.T, address, spoolDirectory, managedRoot, handoffRoot string, additionalArguments ...string) *managedProcess {
+func newAcceptanceAgentProcess(
+	t *testing.T,
+	address, spoolDirectory, managedRoot, handoffRoot string,
+	productionTimings bool,
+	additionalArguments ...string,
+) *managedProcess {
 	t.Helper()
 	arguments := []string{
 		"--fabric=plain",
@@ -141,9 +171,13 @@ func newAcceptanceAgentProcess(t *testing.T, address, spoolDirectory, managedRoo
 		"--log-spool-dir=" + spoolDirectory,
 		"--managed-root=" + managedRoot,
 		"--handoff-root=" + handoffRoot,
-		"--heartbeat-interval=250ms",
-		"--claim-interval=10ms",
-		"--renewal-interval=100ms",
+	}
+	if !productionTimings {
+		arguments = append(arguments,
+			"--heartbeat-interval=250ms",
+			"--claim-interval=10ms",
+			"--renewal-interval=100ms",
+		)
 	}
 	arguments = append(arguments, additionalArguments...)
 	return newManagedProcess(t, agentBinaryPath, arguments...)
@@ -151,11 +185,26 @@ func newAcceptanceAgentProcess(t *testing.T, address, spoolDirectory, managedRoo
 
 func (h *acceptanceHarness) restartAgent(t *testing.T) {
 	t.Helper()
-	h.agent = newAcceptanceAgentProcess(t, h.controlPlaneAddress, h.spoolDirectory, h.managedRoot, h.handoffRoot, h.agentArguments...)
+	h.agent = newAcceptanceAgentProcess(
+		t, h.controlPlaneAddress, h.spoolDirectory, h.managedRoot, h.handoffRoot,
+		h.productionTimings, h.agentArguments...,
+	)
+	h.agents = append(h.agents, h.agent)
 	h.agent.start(t)
 }
 
 func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
+	job, _ := h.submitEchoServiceWithDispatchKey(
+		t, port, "service-acceptance-"+strconv.FormatInt(time.Now().UnixNano(), 10),
+	)
+	return job
+}
+
+func (h *acceptanceHarness) submitEchoServiceWithDispatchKey(
+	t *testing.T,
+	port int,
+	dispatchKey string,
+) (l1.Job, []byte) {
 	t.Helper()
 	workingDirectory := t.TempDir()
 	if err := os.WriteFile(filepath.Join(workingDirectory, "operator-owned"), []byte("untouched"), 0o600); err != nil {
@@ -163,7 +212,7 @@ func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
 	}
 	spec := contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
-		DispatchKey:   "service-acceptance-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+		DispatchKey:   dispatchKey,
 		Kind:          "process",
 		// The lane submits a genuine service-class spec: #59 made class
 		// required and exempted services from handoff_directory, so a spec
@@ -192,7 +241,7 @@ func (h *acceptanceHarness) submitEchoService(t *testing.T, port int) l1.Job {
 	}
 	h.workingDirectories[job.JobID] = workingDirectory
 	h.specs[job.JobID] = spec
-	return job
+	return job, body
 }
 
 func (h *acceptanceHarness) submitFailedService(t *testing.T) l1.Job {

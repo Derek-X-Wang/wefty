@@ -1,4 +1,4 @@
-//go:build service_acceptance && (darwin || linux)
+//go:build (service_acceptance || service_acceptance_realtiming) && (darwin || linux)
 
 package serviceacceptance
 
