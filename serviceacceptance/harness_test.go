@@ -76,11 +76,16 @@ type acceptanceHarness struct {
 	l1Database          string
 	spoolDirectory      string
 	controlPlaneAddress string
+	agentArguments      []string
 	workingDirectories  map[string]string
 	specs               map[string]contract.JobSpec
 }
 
 func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
+	return newAcceptanceHarnessWithAgentArguments(t)
+}
+
+func newAcceptanceHarnessWithAgentArguments(t *testing.T, agentArguments ...string) *acceptanceHarness {
 	t.Helper()
 	directory := t.TempDir()
 	resolvedDirectory, err := filepath.EvalSymlinks(directory)
@@ -103,7 +108,7 @@ func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 	controlPlane.start(t)
 	address := waitForReadyAddress(t, readyFile, controlPlane, 10*time.Second)
 
-	agentProcess := newAcceptanceAgentProcess(t, address, spoolDirectory, managedRoot, handoffRoot)
+	agentProcess := newAcceptanceAgentProcess(t, address, spoolDirectory, managedRoot, handoffRoot, agentArguments...)
 	agentProcess.start(t)
 
 	clientFabric := plain.NewNetwork().NewFabric(fabric.Identity{
@@ -120,30 +125,33 @@ func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 		client: client, publishedFabric: plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "service-client"}), agent: agentProcess,
 		managedRoot: managedRoot, handoffRoot: handoffRoot,
 		l1Database: l1Database, spoolDirectory: spoolDirectory, controlPlaneAddress: address,
+		agentArguments:     append([]string(nil), agentArguments...),
 		workingDirectories: make(map[string]string),
 		specs:              make(map[string]contract.JobSpec),
 	}
 }
 
-func newAcceptanceAgentProcess(t *testing.T, address, spoolDirectory, managedRoot, handoffRoot string) *managedProcess {
+func newAcceptanceAgentProcess(t *testing.T, address, spoolDirectory, managedRoot, handoffRoot string, additionalArguments ...string) *managedProcess {
 	t.Helper()
-	return newManagedProcess(t, agentBinaryPath,
+	arguments := []string{
 		"--fabric=plain",
-		"--control-plane="+address,
+		"--control-plane=" + address,
 		"--node-id=acceptance-node",
 		"--plain-identity=acceptance-agent",
-		"--log-spool-dir="+spoolDirectory,
-		"--managed-root="+managedRoot,
-		"--handoff-root="+handoffRoot,
+		"--log-spool-dir=" + spoolDirectory,
+		"--managed-root=" + managedRoot,
+		"--handoff-root=" + handoffRoot,
 		"--heartbeat-interval=250ms",
 		"--claim-interval=10ms",
 		"--renewal-interval=100ms",
-	)
+	}
+	arguments = append(arguments, additionalArguments...)
+	return newManagedProcess(t, agentBinaryPath, arguments...)
 }
 
 func (h *acceptanceHarness) restartAgent(t *testing.T) {
 	t.Helper()
-	h.agent = newAcceptanceAgentProcess(t, h.controlPlaneAddress, h.spoolDirectory, h.managedRoot, h.handoffRoot)
+	h.agent = newAcceptanceAgentProcess(t, h.controlPlaneAddress, h.spoolDirectory, h.managedRoot, h.handoffRoot, h.agentArguments...)
 	h.agent.start(t)
 }
 

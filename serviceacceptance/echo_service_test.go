@@ -65,6 +65,77 @@ func TestServiceRestartsAfterSuccessfulProcessExit(t *testing.T) {
 	assertWorkingDirectoryUntouched(t, harness.workingDirectories[job.JobID])
 }
 
+func TestServiceCrashAfterFinalizationBudgetRestarts(t *testing.T) {
+	const finalizationTimeout = 100 * time.Millisecond
+	harness := newAcceptanceHarnessWithAgentArguments(t, "--finalization-timeout="+finalizationTimeout.String())
+	port := reservePort(t)
+	job := harness.submitEchoService(t, port)
+	health := waitForHealth(t, harness.publishedHTTPClient(t, port), "http://published-service.invalid", harness.agent)
+	running := harness.waitForJobState(t, job.JobID, contract.JobClassService, contract.JobRunning, 5*time.Second)
+
+	// Hold the real payload beyond the complete finalization allowance. The
+	// allowance must still be fresh when SIGKILL starts finalization.
+	time.Sleep(3 * finalizationTimeout)
+	if err := syscall.Kill(health.PID, syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL payload: %v", err)
+	}
+	waitForProcessAbsent(t, health.PID, 5*time.Second)
+	restartPending := waitForServiceStatus(t, harness, job.JobID, "restart-pending", 5*time.Second)
+	if restartPending.State != contract.JobQueued || restartPending.RestartStreak != 1 || restartPending.NextRestartAt == nil {
+		t.Fatalf("service after payload SIGKILL = %#v, want restart-pending", restartPending)
+	}
+	var failure l1.ProcessResult
+	if err := json.Unmarshal(restartPending.LastFailure, &failure); err != nil {
+		t.Fatalf("decode last_failure: %v", err)
+	}
+	if failure.OutputError != "" || failure.Signal == "" {
+		t.Fatalf("service failure = %#v, want spontaneous signal without output_error", failure)
+	}
+
+	var logs l1.LogPage
+	status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+job.JobID+"/logs?class=service&limit=100", nil, &logs)
+	if status != http.StatusOK {
+		t.Fatalf("get finalized service logs status = %d body=%s", status, body)
+	}
+	foundAttemptEvent := false
+	for _, event := range logs.Events {
+		if event.AttemptID == running.CurrentAttemptID {
+			foundAttemptEvent = true
+			break
+		}
+	}
+	if !foundAttemptEvent {
+		t.Fatalf("service logs omitted durable events for attempt %q: %#v", running.CurrentAttemptID, logs.Events)
+	}
+	if restarted := waitForFreshRunningAttempt(t, harness, job.JobID, running.CurrentAttemptID, 5*time.Second); restarted.JobID != job.JobID {
+		t.Fatalf("restarted service job ID = %q, want %q", restarted.JobID, job.JobID)
+	}
+}
+
+func waitForServiceStatus(t *testing.T, harness *acceptanceHarness, jobID, wantStatus string, timeout time.Duration) l1.Job {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if harness.agent.exited() {
+			t.Fatalf("agent exited while waiting for service status %q: %v\n%s", wantStatus, harness.agent.waitError(), harness.agent.outputString())
+		}
+		var job l1.Job
+		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID+"?class=service", nil, &job)
+		if status != http.StatusOK {
+			t.Fatalf("get service status = %d body=%s", status, body)
+		}
+		if job.State == contract.JobFailed {
+			t.Fatalf("service latched failed while waiting for %q: %s\n%s", wantStatus, body, harness.agent.outputString())
+		}
+		if job.Status == wantStatus {
+			return job
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for service %q status %q\n%s", jobID, wantStatus, harness.agent.outputString())
+	return l1.Job{}
+}
+
 func waitForPublicationCleared(t *testing.T, harness *acceptanceHarness, jobID string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

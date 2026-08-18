@@ -27,12 +27,17 @@ type batchingLogSink struct {
 	retryInterval time.Duration
 
 	wake          chan struct{}
-	closeRequests chan chan error
+	closeRequests chan logSinkCloseRequest
 	done          chan struct{}
 	errMu         sync.Mutex
 	terminalErr   error
 	closeOnce     sync.Once
 	closeErr      error
+}
+
+type logSinkCloseRequest struct {
+	context  context.Context
+	response chan error
 }
 
 func newBatchingLogSink(ctx context.Context, client *Client, claim l1.Claim, spool *logSpool, clock Clock, batchSize int, flushInterval, retryInterval time.Duration) (*batchingLogSink, error) {
@@ -43,7 +48,7 @@ func newBatchingLogSink(ctx context.Context, client *Client, claim l1.Claim, spo
 		ctx: ctx, client: client, claim: claim, spool: spool, clock: clock,
 		batchSize: batchSize, flushInterval: flushInterval, retryInterval: retryInterval,
 		wake:          make(chan struct{}, 1),
-		closeRequests: make(chan chan error),
+		closeRequests: make(chan logSinkCloseRequest),
 		done:          make(chan struct{}),
 	}
 	go sink.run()
@@ -76,14 +81,22 @@ func (sink *batchingLogSink) WriteOutput(ctx context.Context, event contract.Log
 }
 
 func (sink *batchingLogSink) Close() error {
+	return sink.CloseContext(sink.ctx)
+}
+
+// CloseContext flushes every pending event under the caller's finalization
+// bound. Periodic uploads use the attempt-long sink context instead.
+func (sink *batchingLogSink) CloseContext(ctx context.Context) error {
 	sink.closeOnce.Do(func() {
 		response := make(chan error, 1)
 		select {
-		case sink.closeRequests <- response:
+		case sink.closeRequests <- logSinkCloseRequest{context: ctx, response: response}:
 			// Once the run loop receives the close request it always publishes
 			// the flush result before exiting, so prefer that exact result over
 			// racing the done channel.
 			sink.closeErr = <-response
+		case <-ctx.Done():
+			sink.closeErr = context.Cause(ctx)
 		case <-sink.done:
 			sink.closeErr = sink.err()
 		}
@@ -109,30 +122,34 @@ func (sink *batchingLogSink) run() {
 				return
 			}
 			flushTimer.Reset(sink.flushInterval)
-		case response := <-sink.closeRequests:
-			err := sink.uploadAvailable(true)
+		case request := <-sink.closeRequests:
+			err := sink.uploadAvailableContext(request.context, true)
 			if err != nil {
 				sink.setError(err)
 			}
-			response <- err
+			request.response <- err
 			return
 		case <-sink.ctx.Done():
-			sink.setError(sink.ctx.Err())
+			sink.setError(context.Cause(sink.ctx))
 			return
 		}
 	}
 }
 
 func (sink *batchingLogSink) uploadAvailable(all bool) error {
+	return sink.uploadAvailableContext(sink.ctx, all)
+}
+
+func (sink *batchingLogSink) uploadAvailableContext(ctx context.Context, all bool) error {
 	for {
-		events, err := sink.spool.pending(sink.ctx, sink.claim.Lease.AttemptID, sink.batchSize)
+		events, err := sink.spool.pending(ctx, sink.claim.Lease.AttemptID, sink.batchSize)
 		if err != nil {
 			return err
 		}
 		if len(events) == 0 {
 			return nil
 		}
-		if err := sink.upload(events); err != nil {
+		if err := sink.uploadContext(ctx, events); err != nil {
 			return err
 		}
 		if !all || len(events) < sink.batchSize {
@@ -142,27 +159,31 @@ func (sink *batchingLogSink) uploadAvailable(all bool) error {
 }
 
 func (sink *batchingLogSink) upload(events []contract.LogEvent) error {
+	return sink.uploadContext(sink.ctx, events)
+}
+
+func (sink *batchingLogSink) uploadContext(ctx context.Context, events []contract.LogEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
 	batch := append([]contract.LogEvent(nil), events...)
 	request := l1.AppendLogsRequest{FencingToken: sink.claim.Lease.FencingToken, Events: batch}
 	for {
-		response, err := sink.client.AppendLogs(sink.ctx, sink.claim.Job.JobID, sink.claim.Lease.AttemptID, request)
+		response, err := sink.client.AppendLogs(ctx, sink.claim.Job.JobID, sink.claim.Lease.AttemptID, request)
 		if err == nil {
 			if err := validateLogAcknowledgement(batch, response.Acknowledged); err != nil {
 				return err
 			}
-			return sink.spool.acknowledge(sink.ctx, sink.claim.Lease.AttemptID, response.Acknowledged)
+			return sink.spool.acknowledge(ctx, sink.claim.Lease.AttemptID, response.Acknowledged)
 		}
 		if classifyAgentProtocolError(err).destination != errorDestinationTransient {
 			return err
 		}
 		timer := sink.clock.NewTimer(sink.retryInterval)
 		select {
-		case <-sink.ctx.Done():
+		case <-ctx.Done():
 			stopTimer(timer)
-			return sink.ctx.Err()
+			return context.Cause(ctx)
 		case <-timer.C():
 		}
 	}

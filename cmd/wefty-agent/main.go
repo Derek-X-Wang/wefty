@@ -62,6 +62,7 @@ func run() error {
 		heartbeat         = flag.Duration("heartbeat-interval", agent.DefaultHeartbeatInterval, "node heartbeat interval")
 		claim             = flag.Duration("claim-interval", agent.DefaultClaimInterval, "idle claim polling interval")
 		renewal           = flag.Duration("renewal-interval", agent.DefaultRenewalInterval, "maximum attempt lease-renewal interval")
+		finalization      = flag.Duration("finalization-timeout", agent.DefaultFinalizationTimeout, "maximum final log flush and upload duration after a payload exits")
 		maxOneshotSlots   = flag.Int("max-oneshot-slots", l1.DefaultMaxOneshotSlots, "local ceiling for concurrent one-shot attempts")
 		maxServiceSlots   = flag.Int("max-service-slots", l1.DefaultMaxServiceSlots, "local ceiling for concurrent service attempts")
 		logSpoolDirectory = flag.String("log-spool-dir", "", "durable log spool directory (defaults to the user cache directory)")
@@ -110,6 +111,7 @@ func run() error {
 		HeartbeatInterval:    *heartbeat,
 		ClaimInterval:        *claim,
 		RenewalInterval:      *renewal,
+		FinalizationTimeout:  *finalization,
 		MaxOneshotSlots:      *maxOneshotSlots,
 		MaxServiceSlots:      *maxServiceSlots,
 		LogSpoolDirectory:    *logSpoolDirectory,

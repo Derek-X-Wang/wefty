@@ -59,6 +59,7 @@ type Config struct {
 	MaxOneshotSlots      int
 	MaxServiceSlots      int
 	OperationTimeout     time.Duration
+	FinalizationTimeout  time.Duration
 	LogBatchSize         int
 	LogFlushInterval     time.Duration
 	LogRetryInterval     time.Duration
@@ -77,13 +78,14 @@ type Config struct {
 
 // Agent owns process-lifetime resources and starts one control-plane session.
 type Agent struct {
-	fabric           fabric.Fabric
-	runLedgerAddr    string
-	registration     contract.NodeRegistration
-	renewalInterval  time.Duration
-	logRetryInterval time.Duration
-	session          *agentSession
-	outbox           *evidenceOutbox
+	fabric              fabric.Fabric
+	runLedgerAddr       string
+	registration        contract.NodeRegistration
+	renewalInterval     time.Duration
+	finalizationTimeout time.Duration
+	logRetryInterval    time.Duration
+	session             *agentSession
+	outbox              *evidenceOutbox
 	// logSpool is a compatibility view used by existing package tests. The
 	// process-lifetime evidenceOutbox is its sole owner.
 	logSpool          *logSpool
@@ -198,7 +200,8 @@ func New(config Config) (*Agent, error) {
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
 		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
-		logRetryInterval: logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
+		finalizationTimeout: durationOrDefault(config.FinalizationTimeout, DefaultFinalizationTimeout),
+		logRetryInterval:    logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runner: runner, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
 		handoffs: newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
 		logf:     logf, clock: clock, observer: observer,
@@ -280,7 +283,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		client: a.sessionClient(), runner: a.runner, outbox: a.outbox,
 		watchdog: newAuthorityWatchdog(a.clock), clock: a.clock,
 		renewalInterval: a.renewalInterval, completionRetry: a.logRetryInterval,
-		finalizationTimeout: DefaultFinalizationTimeout,
+		finalizationTimeout: a.finalizationTimeout,
 		outputSinkFactory:   a.outputSinkFactory, handoffs: a.handoffs,
 		managedResource: a.managedResource,
 		nodeID:          a.registration.NodeID, workflowBridge: a.startWorkflowBridge, logf: a.logf,
