@@ -55,6 +55,49 @@ func TestServiceCancellationClosesPublicationBeforeSignalingGuardian(t *testing.
 	}
 }
 
+func TestPublishedListenerFailureHasDedicatedCode(t *testing.T) {
+	listener := &failedAcceptListener{err: errors.New("listener failed")}
+	runner := &publicationAuthorityRunner{canceled: make(chan struct{})}
+	result, err := runPortfulService(
+		context.Background(),
+		runner,
+		processrunner.Request{AttemptID: "published-listener-failure", Class: contract.JobClassService},
+		nil,
+		listener,
+		serviceRuntimeEndpoint{
+			address: "127.0.0.1:1",
+			dial: func(context.Context) (net.Conn, error) {
+				return nil, errors.New("not reached")
+			},
+		},
+		serviceSupervisorConfig{},
+	)
+	if err == nil {
+		t.Fatal("published listener failure returned nil error")
+	}
+	if result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailurePublishedListener {
+		t.Fatalf("published listener result = %#v, want dedicated failure code", result)
+	}
+	select {
+	case <-runner.canceled:
+	default:
+		t.Fatal("published listener failure did not stop the guardian-owned payload")
+	}
+}
+
+type failedAcceptListener struct {
+	err error
+}
+
+func (listener *failedAcceptListener) Accept() (net.Conn, error) { return nil, listener.err }
+func (*failedAcceptListener) Close() error                       { return nil }
+func (*failedAcceptListener) Addr() net.Addr                     { return failedAcceptAddr("failed") }
+
+type failedAcceptAddr string
+
+func (address failedAcceptAddr) Network() string { return "test" }
+func (address failedAcceptAddr) String() string  { return string(address) }
+
 type cancellationOrderRunner struct {
 	started         chan struct{}
 	listenerAddress string

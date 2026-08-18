@@ -247,6 +247,7 @@ const (
 	SpawnFailureProcessSpawn               SpawnFailureCode = "process_spawn_failed"
 	SpawnFailureProcessWait                SpawnFailureCode = "process_wait_failed"
 	SpawnFailurePublishedPortOccupied      SpawnFailureCode = "published_port_occupied"
+	SpawnFailurePublishedListener          SpawnFailureCode = "published_listener_failed"
 	SpawnFailureStartupReadinessTimeout    SpawnFailureCode = "startup_readiness_timeout"
 )
 

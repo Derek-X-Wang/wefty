@@ -21,6 +21,44 @@ func TestServiceCompletionClassification(t *testing.T) {
 	assertServiceCompletionClassification(t)
 }
 
+func TestPublishedListenerFailureRequeuesWithoutLatching(t *testing.T) {
+	assertPublishedListenerFailureRequeuesWithoutLatching(t)
+}
+
+func assertPublishedListenerFailureRequeuesWithoutLatching(t *testing.T) {
+	t.Helper()
+	maximumOne := 1
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{
+		Jitter: func(delay time.Duration) time.Duration { return delay },
+	}, map[string]NodePolicy{"service-node": DefaultNodePolicy("service")})
+	client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
+	node := h.register(agent, "service-node")
+	job := submitRestartService(t, h, client, "published-listener-failure", []string{"service"}, &maximumOne)
+	first := claimRestartService(t, h, agent, node)
+
+	path := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", job.JobID, first.Lease.AttemptID)
+	status, _, body := h.do(agent, http.MethodPost, path, CompletionRequest{
+		FencingToken:   first.Lease.FencingToken,
+		IdempotencyKey: "published-listener-failure",
+		Result: ProcessResult{SpawnError: &contract.SpawnFailure{
+			Code: contract.SpawnFailurePublishedListener, Message: "Fabric published listener stopped accepting connections",
+		}},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("front-door completion status = %d body=%s", status, body)
+	}
+
+	requeued := getRestartService(t, h, job.JobID)
+	if requeued.State != contract.JobQueued || requeued.RestartStreak != 0 || requeued.LifetimeRestartCount != 1 || requeued.NextRestartAt != nil {
+		t.Fatalf("front-door failure service state/streak/lifetime/backoff = %q/%d/%d/%v, want queued/0/1/nil", requeued.State, requeued.RestartStreak, requeued.LifetimeRestartCount, requeued.NextRestartAt)
+	}
+	second := claimRestartService(t, h, agent, node)
+	if second.Lease.AttemptID == first.Lease.AttemptID || second.Lease.FencingToken == first.Lease.FencingToken {
+		t.Fatalf("front-door recovery reused attempt authority: first=%#v second=%#v", first.Lease, second.Lease)
+	}
+}
+
 func assertServiceCompletionClassification(t *testing.T) {
 	t.Helper()
 	exitZero := 0
@@ -42,6 +80,7 @@ func assertServiceCompletionClassification(t *testing.T) {
 		{name: "nonzero exit restarts", result: ProcessResult{ExitCode: &exitOne}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantStreak: 1, wantLifetimeRestarts: 1, wantBackoff: true, wantFailure: true},
 		{name: "spontaneous signal restarts", result: ProcessResult{Signal: "killed", TerminationCause: contract.TerminationCauseSpontaneous}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantStreak: 1, wantLifetimeRestarts: 1, wantBackoff: true, wantFailure: true},
 		{name: "startup readiness timeout is whitelisted", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureStartupReadinessTimeout, Message: "backend never accepted"}}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantStreak: 1, wantLifetimeRestarts: 1, wantBackoff: true, wantFailure: true, wantFailureCode: contract.SpawnFailureStartupReadinessTimeout},
+		{name: "published listener failure is infrastructure", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailurePublishedListener, Message: "listener failed"}}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantLifetimeRestarts: 1},
 		{name: "deterministic spawn failure latches", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureProcessSpawn, Message: "executable missing"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailureProcessSpawn},
 		{name: "unknown spawn failure defaults terminal", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureCode("future_spawn_failure"), Message: "unknown"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailureCode("future_spawn_failure")},
 		{name: "published port occupied latches", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailurePublishedPortOccupied, Message: "port 8080 occupied"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailurePublishedPortOccupied},

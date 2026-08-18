@@ -13,6 +13,10 @@ func TestServiceAcceptanceCompletionClassificationAndCappedBackoff(t *testing.T)
 	assertServiceBackoffUsesPinnedSequenceAndEffectiveLeaseCap(t)
 }
 
+func TestServiceAcceptancePublishedListenerFailureRequeuesWithoutLatching(t *testing.T) {
+	assertPublishedListenerFailureRequeuesWithoutLatching(t)
+}
+
 func TestServiceAcceptanceClassAwareExpiryAtBothSites(t *testing.T) {
 	assertServiceLeaseExpiryRequeuesWithoutChangingStreak(t)
 	assertStoppedServiceLeaseExpiryLatchesWhenQuiescenceIsUnconfirmed(t)
