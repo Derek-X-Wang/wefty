@@ -144,7 +144,7 @@ func runPortfulService(
 		cancelRun()
 		<-publicationDone
 		<-outcomes
-		return spawnFailure(contract.SpawnFailureProcessWait, err), err
+		return spawnFailure(contract.SpawnFailurePublishedListener, err), err
 	}
 }
 

@@ -13,18 +13,30 @@ const (
 	minimumServiceRestartDelay = 500 * time.Millisecond
 )
 
-// restartableSpawnFailureCodes is deliberately owned by L1: agents report
+type spawnFailureClassification uint8
+
+const (
+	spawnFailureTerminal spawnFailureClassification = iota
+	spawnFailureRestartable
+	spawnFailureInfrastructure
+)
+
+// spawnFailureClassifications is deliberately owned by L1: agents report
 // facts, while the durable control plane owns restart policy. Unknown codes
-// and every code absent from this allowlist are terminal.
-var restartableSpawnFailureCodes = map[contract.SpawnFailureCode]struct{}{
-	contract.SpawnFailureStartupReadinessTimeout: {},
+// and every code absent from this table are terminal.
+var spawnFailureClassifications = map[contract.SpawnFailureCode]spawnFailureClassification{
+	contract.SpawnFailureStartupReadinessTimeout: spawnFailureRestartable,
+	contract.SpawnFailurePublishedListener:       spawnFailureInfrastructure,
+}
+
+func classifySpawnFailure(code contract.SpawnFailureCode) spawnFailureClassification {
+	return spawnFailureClassifications[code]
 }
 
 // IsRestartableSpawnFailure reports whether service policy may retry a coded
 // pre-execution failure. It is fail-closed for unknown future codes.
 func IsRestartableSpawnFailure(code contract.SpawnFailureCode) bool {
-	_, ok := restartableSpawnFailureCodes[code]
-	return ok
+	return classifySpawnFailure(code) == spawnFailureRestartable
 }
 
 // defaultRestartJitter draws uniformly from 80% through 120% of the nominal
@@ -101,7 +113,12 @@ func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, lastFai
 	infrastructure := false
 	switch {
 	case result.SpawnError != nil:
-		restartable = IsRestartableSpawnFailure(result.SpawnError.Code)
+		switch classifySpawnFailure(result.SpawnError.Code) {
+		case spawnFailureRestartable:
+			restartable = true
+		case spawnFailureInfrastructure:
+			infrastructure = true
+		}
 	case result.OutputError != "":
 		// Genuine output failures are terminal. Expected service spool eviction
 		// never reaches this mapper.

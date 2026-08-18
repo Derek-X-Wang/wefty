@@ -6,17 +6,20 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-func TestSpawnFailureRetryabilityDefaultsTerminal(t *testing.T) {
+func TestSpawnFailureClassificationDefaultsTerminal(t *testing.T) {
 	if !IsRestartableSpawnFailure(contract.SpawnFailureStartupReadinessTimeout) {
 		t.Fatal("startup readiness timeout must be restartable")
+	}
+	if got := classifySpawnFailure(contract.SpawnFailurePublishedListener); got != spawnFailureInfrastructure {
+		t.Fatalf("published listener classification = %d, want infrastructure", got)
 	}
 	for _, code := range []contract.SpawnFailureCode{
 		contract.SpawnFailureProcessSpawn,
 		contract.SpawnFailurePublishedPortOccupied,
 		contract.SpawnFailureCode("future_unknown_failure"),
 	} {
-		if IsRestartableSpawnFailure(code) {
-			t.Fatalf("spawn failure %q must default terminal", code)
+		if got := classifySpawnFailure(code); got != spawnFailureTerminal {
+			t.Fatalf("spawn failure %q classification = %d, want terminal", code, got)
 		}
 	}
 }

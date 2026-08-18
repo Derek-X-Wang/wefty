@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 )
@@ -150,6 +152,63 @@ func TestInjectedIdentityCrossesNetworkInstances(t *testing.T) {
 	}
 	if err := <-accepted; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGarbageConnectionDoesNotStopListenerAccepting(t *testing.T) {
+	network := NewNetwork()
+	server := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
+	clientIdentity := fabric.Identity{NodeID: "runner-after-garbage", Tags: []string{"agent"}}
+	client := network.NewFabric(clientIdentity)
+
+	ln, err := server.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	type acceptResult struct {
+		connection net.Conn
+		err        error
+	}
+	accepted := make(chan acceptResult, 1)
+	go func() {
+		connection, acceptErr := ln.Accept()
+		accepted <- acceptResult{connection: connection, err: acceptErr}
+	}()
+
+	garbage, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(garbage, "not-a-wefty-identity-header"); err != nil {
+		t.Fatal(err)
+	}
+	if err := garbage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	valid, err := client.Dial(context.Background(), "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer valid.Close()
+
+	select {
+	case result := <-accepted:
+		if result.err != nil {
+			t.Fatalf("Accept() returned a per-connection identity error: %v", result.err)
+		}
+		defer result.connection.Close()
+		identity, err := server.WhoIs(context.Background(), result.connection.RemoteAddr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if identity.NodeID != clientIdentity.NodeID || !slices.Equal(identity.Tags, clientIdentity.Tags) {
+			t.Fatalf("WhoIs() = %#v, want %#v", identity, clientIdentity)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener did not accept a valid connection after garbage input")
 	}
 }
 

@@ -188,18 +188,20 @@ type listener struct {
 }
 
 func (l *listener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		identity, err := readIdentity(conn)
+		if err != nil {
+			_ = conn.Close()
+			continue
+		}
+		key := conn.RemoteAddr().String()
+		l.network.registerPeer(key, identity)
+		return &connWithIdentity{Conn: conn, network: l.network, key: key}, nil
 	}
-	identity, err := readIdentity(conn)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	key := conn.RemoteAddr().String()
-	l.network.registerPeer(key, identity)
-	return &connWithIdentity{Conn: conn, network: l.network, key: key}, nil
 }
 
 func (l *listener) Close() error {
