@@ -1,0 +1,47 @@
+minimumLimaVersion: 2.2.0
+
+base:
+- template:_images/ubuntu-lts
+- template:_default/mounts
+
+vmType: vz
+cpus: 4
+memory: 4GiB
+disk: 24GiB
+mountType: virtiofs
+
+mounts:
+- location: "/Users/derekxwang/orca/workspaces/wefty/wefty-104-lima-prototype/prototype/lima-containerd/shared"
+  mountPoint: "/mnt/wefty-proto"
+  writable: true
+
+containerd:
+  system: true
+  user: false
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    install -d -m 0777 /var/lib/wefty-proto/logs
+    install -m 0755 /Users/derekxwang/orca/workspaces/wefty/wefty-104-lima-prototype/prototype/lima-containerd/wefty-log-split /usr/local/bin/wefty-log-split
+    timeout 120 bash -c 'until test -S /run/containerd/containerd.sock; do sleep 1; done'
+    chmod 0666 /run/containerd/containerd.sock
+
+probes:
+- script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    test -r /run/containerd/containerd.sock
+    test -w /run/containerd/containerd.sock
+    touch /mnt/wefty-proto/.lima-write-probe
+    rm /mnt/wefty-proto/.lima-write-probe
+
+portForwards:
+- guestSocket: "/run/containerd/containerd.sock"
+  hostSocket: "{{.Dir}}/sock/containerd.sock"
+
+message: |
+  Forwarded containerd socket: {{.Dir}}/sock/containerd.sock
+  Writable host mount: /mnt/wefty-proto
