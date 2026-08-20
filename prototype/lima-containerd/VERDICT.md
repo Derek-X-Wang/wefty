@@ -1,7 +1,9 @@
 # Verdict: macOS host → Lima containerd over a forwarded Unix socket
 
-Date: 2026-08-20  
-Issue: [#104](https://github.com/Derek-X-Wang/wefty/issues/104)  
+Date: 2026-08-20
+
+Issue: [#104](https://github.com/Derek-X-Wang/wefty/issues/104)
+
 Prototype asset: [`prototype/lima-containerd`](https://github.com/Derek-X-Wang/wefty/tree/prototype/104-lima-containerd/prototype/lima-containerd)
 
 ## Decision
