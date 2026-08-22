@@ -28,6 +28,104 @@ import (
 
 const realTimingEvidenceEnvironment = "WEFTY_REALTIME_EVIDENCE_DIR"
 
+func TestOCIPrestartRuntimeUnavailablePersistsWallClockBackoffAtProductionTimings(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "oci-realtime.sqlite")
+	store, err := l1.OpenStore(databasePath, l1.StoreOptions{
+		LeaseDuration: l1.DefaultLeaseDuration,
+		Jitter:        func(delay time.Duration) time.Duration { return delay },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close realtime OCI store: %v", err)
+		}
+	})
+	processSpec := contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "realtime-oci-prestart", Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+		Execution: contract.ExecutionSpec{
+			Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"},
+			WorkingDirectory: "/tmp", HandoffDirectory: "/tmp/handoff",
+		},
+	}
+	job, _, err := store.CreateJob(context.Background(), processSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ociSpec := contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: processSpec.DispatchKey, Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+		RuntimeHandler: "io.containerd.runc.v2",
+		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "ghcr.io/example/tool:latest"}}},
+	}
+	if err := contract.ValidateJobSpec(ociSpec); err != nil {
+		t.Fatal(err)
+	}
+	rawSpec, err := json.Marshal(ociSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	// TODO(#135): the public create gate remains process-only until
+	// capability-aware claiming lands; patch only the validated fixture spec.
+	if _, err := database.Exec(`UPDATE jobs SET spec_json=? WHERE job_id=?`, rawSpec, job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	registration := contract.NodeRegistration{
+		NodeID: "oci-realtime-node", BootSessionID: "oci-realtime-boot", OS: "linux", Architecture: runtime.GOARCH, AgentVersion: "acceptance",
+	}
+	if _, err := store.RegisterNode(context.Background(), fabric.Identity{NodeID: "oci-realtime-agent"}, registration, l1.DefaultNodePolicy(), true); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.ClaimJob(context.Background(), "oci-realtime-agent", registration.NodeID, registration.BootSessionID, contract.JobClassOneShot)
+	if err != nil || first == nil {
+		t.Fatalf("first OCI claim = %#v err %v", first, err)
+	}
+	if first.Lease.LeaseTTL != l1.DefaultLeaseDuration {
+		t.Fatalf("lease TTL = %s, want production %s", first.Lease.LeaseTTL, l1.DefaultLeaseDuration)
+	}
+	requeued, err := store.CompleteAttempt(context.Background(), "oci-realtime-agent", job.JobID, first.Lease.AttemptID, l1.CompletionRequest{
+		FencingToken: first.Lease.FencingToken, IdempotencyKey: "realtime-runtime-unavailable",
+		Result: l1.ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureRuntimeUnavailable, Message: "engine unavailable"}},
+	})
+	if err != nil || requeued.State != contract.JobQueued || requeued.CurrentAttemptID != "" || requeued.NodeID != "" {
+		t.Fatalf("pre-start requeue = %#v err %v", requeued, err)
+	}
+	var nextRetryNS int64
+	if err := database.QueryRow(`SELECT prestart_next_retry_at_ns FROM jobs WHERE job_id=?`, job.JobID).Scan(&nextRetryNS); err != nil {
+		t.Fatal(err)
+	}
+	if immediate, err := store.ClaimJob(context.Background(), "oci-realtime-agent", registration.NodeID, registration.BootSessionID, contract.JobClassOneShot); err != nil || immediate != nil {
+		t.Fatalf("claim before persisted backoff = %#v err %v", immediate, err)
+	}
+	waitStarted := time.Now()
+	deadline := time.Now().Add(2 * time.Second)
+	var second *l1.Claim
+	for time.Now().Before(deadline) {
+		second, err = store.ClaimJob(context.Background(), "oci-realtime-agent", registration.NodeID, registration.BootSessionID, contract.JobClassOneShot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if second != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if second == nil {
+		t.Fatal("OCI job was not claimable after persisted backoff")
+	}
+	if nowNS := time.Now().UnixNano(); nowNS < nextRetryNS {
+		t.Fatalf("second claim at %d preceded persisted due time %d", nowNS, nextRetryNS)
+	}
+	if elapsed := time.Since(waitStarted); elapsed < 900*time.Millisecond {
+		t.Fatalf("wall-clock backoff = %s, want approximately one second", elapsed)
+	}
+}
+
 func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	assertProductionTimingDefaults(t)
 	evidence := newRealTimingEvidence(t)

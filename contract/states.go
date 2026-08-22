@@ -17,9 +17,11 @@ const (
 	JobForgottenCleanupUnverified JobState = "forgotten_cleanup_unverified"
 )
 
+// JobTransitions includes claimed -> queued for the OCI one-shot pre-start
+// loss path. L1's prestartRequeue predicate enforces that kind-specific rule.
 var JobTransitions = map[JobState][]JobState{
 	JobQueued:                     {JobClaimed, JobFailed},
-	JobClaimed:                    {JobRunning, JobFailed},
+	JobClaimed:                    {JobRunning, JobQueued, JobFailed},
 	JobRunning:                    {JobAwaitingInput, JobSucceeded, JobFailed},
 	JobStopping:                   {},
 	JobStopped:                    {},

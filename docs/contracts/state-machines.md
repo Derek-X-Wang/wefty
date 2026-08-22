@@ -9,13 +9,24 @@ invalid. State changes and their required side effects commit atomically.
 | State | Meaning | Allowed next states |
 | --- | --- | --- |
 | `queued` | Available for an eligible alive node to claim. | `claimed`, `failed` |
-| `claimed` | An attempt and fence were created; execution has not been acknowledged. | `running`, `failed` |
+| `claimed` | An attempt and fence were created; execution has not been acknowledged. | `running`, `queued`, `failed` |
 | `running` | The active attempt is executing. | `awaiting-input`, `succeeded`, `failed` |
 | `stopping` | Service-only state, unreachable in the one-shot transition table. | none |
 | `stopped` | Service-only state, unreachable in the one-shot transition table. | none |
 | `awaiting-input` | Reserved warm-session state; observable but not enterable through a v0.1 API implementation. | `running`, `failed` |
 | `succeeded` | Completion was accepted with a successful process result and required protocol outputs. Terminal. | none |
 | `failed` | Execution, lease, or workflow protocol failed. Terminal; v0.1 never automatically requeues. | none |
+
+For `kind=oci`, `claimed → queued` is allowed only when fenced completion
+records pre-`Started` `runtime_unavailable`. The old attempt becomes terminal
+`failed` in the same transaction, retains its evidence, and cannot be resumed;
+the next ordinary claim creates a fresh attempt and fence after the persisted
+backoff. Exhausting the job's single pre-start infrastructure deadline instead
+moves it to `failed`.
+
+Infrastructure requeues persist a jittered due time rather than becoming
+immediately claimable. The `runtime_unavailable` infrastructure classification
+is OCI-only; the same code on a process service defaults terminal.
 
 An active one-shot attempt whose lease expires transitions to `lost` while its
 job transitions to `failed` in the same transaction. A service attempt still
@@ -92,6 +103,9 @@ execution cancellation, but authority loss and removal cancel it immediately.
 
 Only the current `(job_id, attempt_id, fencing_token)` tuple may renew a lease,
 append logs, or complete. An expired attempt becomes `lost` exactly once.
+For `kind=oci`, only the fenced, idempotent `Started` acknowledgement may move
+`claimed → running`; renewal, log insertion, and completion never synthesize
+that transition.
 
 ## Node
 

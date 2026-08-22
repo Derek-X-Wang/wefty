@@ -371,16 +371,23 @@ func formatLateResult(evidence l1.LateResultEvidence) string {
 }
 
 func formatProcessResult(result l1.ProcessResult) string {
+	var summary string
 	switch {
 	case result.ExitCode != nil:
-		return fmt.Sprintf("exit %d", *result.ExitCode)
+		summary = fmt.Sprintf("exit %d", *result.ExitCode)
 	case result.SpawnError != nil:
-		return fmt.Sprintf("spawn %s: %s", result.SpawnError.Code, result.SpawnError.Message)
+		summary = fmt.Sprintf("spawn %s: %s", result.SpawnError.Code, result.SpawnError.Message)
+	case result.RuntimeFailure != nil:
+		summary = fmt.Sprintf("runtime %s: %s", result.RuntimeFailure.Code, result.RuntimeFailure.Message)
 	case result.OutputError != "":
-		return "output error: " + result.OutputError
+		summary = "output error: " + result.OutputError
 	case result.Signal != "":
-		return fmt.Sprintf("signal %s (%s)", result.Signal, result.TerminationCause)
+		summary = fmt.Sprintf("signal %s (%s)", result.Signal, result.TerminationCause)
 	default:
-		return "unknown result"
+		summary = "unknown result"
 	}
+	if result.OOM {
+		summary += " [oom]"
+	}
+	return summary
 }

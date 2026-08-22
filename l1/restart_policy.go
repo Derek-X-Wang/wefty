@@ -13,30 +13,57 @@ const (
 	minimumServiceRestartDelay = 500 * time.Millisecond
 )
 
-type spawnFailureClassification uint8
+type failureClassification uint8
 
 const (
-	spawnFailureTerminal spawnFailureClassification = iota
-	spawnFailureRestartable
-	spawnFailureInfrastructure
+	failureTerminal failureClassification = iota
+	failureRestartable
+	failureInfrastructure
 )
 
-// spawnFailureClassifications is deliberately owned by L1: agents report
+// failureClassifications is deliberately owned by L1: agents report
 // facts, while the durable control plane owns restart policy. Unknown codes
 // and every code absent from this table are terminal.
-var spawnFailureClassifications = map[contract.SpawnFailureCode]spawnFailureClassification{
-	contract.SpawnFailureStartupReadinessTimeout: spawnFailureRestartable,
-	contract.SpawnFailurePublishedListener:       spawnFailureInfrastructure,
+var failureClassifications = map[contract.SpawnFailureCode]failureClassification{
+	contract.SpawnFailureStartupReadinessTimeout: failureRestartable,
+	contract.SpawnFailurePublishedListener:       failureInfrastructure,
+	contract.SpawnFailureRuntimeUnavailable:      failureInfrastructure,
 }
 
-func classifySpawnFailure(code contract.SpawnFailureCode) spawnFailureClassification {
-	return spawnFailureClassifications[code]
+var runtimeFailureClassifications = map[contract.RuntimeFailureCode]failureClassification{
+	contract.RuntimeFailureUnavailable: failureInfrastructure,
+}
+
+func classifySpawnFailure(code contract.SpawnFailureCode) failureClassification {
+	return failureClassifications[code]
 }
 
 // IsRestartableSpawnFailure reports whether service policy may retry a coded
 // pre-execution failure. It is fail-closed for unknown future codes.
 func IsRestartableSpawnFailure(code contract.SpawnFailureCode) bool {
-	return classifySpawnFailure(code) == spawnFailureRestartable
+	return classifySpawnFailure(code) == failureRestartable
+}
+
+func classifyRuntimeFailure(code contract.RuntimeFailureCode) failureClassification {
+	return runtimeFailureClassifications[code]
+}
+
+func prestartRetryDelay(retryCount int, jitter func(time.Duration) time.Duration) time.Duration {
+	if retryCount < 1 {
+		retryCount = 1
+	}
+	delay := time.Second
+	for i := 1; i < retryCount && delay < maxServiceRestartDelay; i++ {
+		delay *= 2
+		if delay > maxServiceRestartDelay {
+			delay = maxServiceRestartDelay
+		}
+	}
+	delay = jitter(delay)
+	if delay > maxServiceRestartDelay {
+		return maxServiceRestartDelay
+	}
+	return delay
 }
 
 // defaultRestartJitter draws uniformly from 80% through 120% of the nominal
@@ -113,10 +140,14 @@ func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, lastFai
 	infrastructure := false
 	switch {
 	case result.SpawnError != nil:
-		switch classifySpawnFailure(result.SpawnError.Code) {
-		case spawnFailureRestartable:
+		classification := classifySpawnFailure(result.SpawnError.Code)
+		if result.SpawnError.Code == contract.SpawnFailureRuntimeUnavailable && job.Spec.Kind != contract.JobKindOCI {
+			classification = failureTerminal
+		}
+		switch classification {
+		case failureRestartable:
 			restartable = true
-		case spawnFailureInfrastructure:
+		case failureInfrastructure:
 			infrastructure = true
 		}
 	case result.OutputError != "":
@@ -130,11 +161,17 @@ func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, lastFai
 		} else {
 			infrastructure = true
 		}
+	case result.RuntimeFailure != nil:
+		infrastructure = job.Spec.Kind == contract.JobKindOCI &&
+			classifyRuntimeFailure(result.RuntimeFailure.Code) == failureInfrastructure
 	}
 
 	if infrastructure {
 		policy.jobState = contract.JobQueued
 		policy.lifetimeRestartCount++
+		nextRestart := now.Add(prestartRetryDelay(policy.lifetimeRestartCount, s.restartJitter))
+		nextRestartNS := nextRestart.UnixNano()
+		policy.nextRestartNS = &nextRestartNS
 		return policy
 	}
 	if !restartable {

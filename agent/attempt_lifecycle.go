@@ -713,7 +713,7 @@ func renewalRequestTimeout(remaining, operationTimeout time.Duration) time.Durat
 
 func toL1Result(result contract.ProcessResult) l1.ProcessResult {
 	return l1.ProcessResult{
-		SpawnError: result.SpawnError, OutputError: result.OutputError, ExitCode: result.ExitCode,
-		Signal: result.Signal, TerminationCause: result.TerminationCause,
+		SpawnError: result.SpawnError, RuntimeFailure: result.RuntimeFailure, OutputError: result.OutputError, ExitCode: result.ExitCode,
+		Signal: result.Signal, TerminationCause: result.TerminationCause, OOM: result.OOM,
 	}
 }

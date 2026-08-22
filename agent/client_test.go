@@ -189,6 +189,83 @@ func TestClientSendsAbsolutePublicationWithPut(t *testing.T) {
 	}
 }
 
+func TestClientObserveAttemptImageRoundTrip(t *testing.T) {
+	received := make(chan l1.ImageObservationRequest, 1)
+	client := newRoundTripClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPut || request.URL.EscapedPath() != "/v1/agent/jobs/job-one/attempts/attempt-one/image" {
+			t.Errorf("image request = %s %s", request.Method, request.URL.EscapedPath())
+		}
+		var observation l1.ImageObservationRequest
+		if err := json.NewDecoder(request.Body).Decode(&observation); err != nil {
+			t.Errorf("decode image observation: %v", err)
+		}
+		received <- observation
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"job_id":"job-one","state":"claimed"}`))
+	}))
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	want := l1.ImageObservationRequest{
+		FencingToken: "fence-one", SubmittedReference: "ghcr.io/example/tool:latest", TopLevelDigest: digest,
+		TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json", PlatformManifestDigest: digest,
+		Platform: l1.OCIPlatform{OS: "linux", Architecture: "arm64"}, RuntimeHandler: "io.containerd.runc.v2", Snapshotter: "overlayfs",
+	}
+	job, err := client.ObserveAttemptImage(context.Background(), "job-one", "attempt-one", want)
+	if err != nil || job.JobID != "job-one" || job.State != contract.JobClaimed {
+		t.Fatalf("image round trip = %#v err %v", job, err)
+	}
+	if got := <-received; got.FencingToken != want.FencingToken || got.TopLevelDigest != want.TopLevelDigest || got.Platform != want.Platform {
+		t.Fatalf("image request = %#v, want %#v", got, want)
+	}
+}
+
+func TestClientStartAttemptRoundTrip(t *testing.T) {
+	received := make(chan l1.StartedRequest, 1)
+	client := newRoundTripClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.EscapedPath() != "/v1/agent/jobs/job-one/attempts/attempt-one/started" {
+			t.Errorf("Started request = %s %s", request.Method, request.URL.EscapedPath())
+		}
+		var started l1.StartedRequest
+		if err := json.NewDecoder(request.Body).Decode(&started); err != nil {
+			t.Errorf("decode Started request: %v", err)
+		}
+		received <- started
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"job_id":"job-one","state":"running"}`))
+	}))
+	want := l1.StartedRequest{FencingToken: "fence-one"}
+	job, err := client.StartAttempt(context.Background(), "job-one", "attempt-one", want)
+	if err != nil || job.JobID != "job-one" || job.State != contract.JobRunning {
+		t.Fatalf("Started round trip = %#v err %v", job, err)
+	}
+	if got := <-received; got != want {
+		t.Fatalf("Started request = %#v, want %#v", got, want)
+	}
+}
+
+func newRoundTripClient(t *testing.T, handler http.Handler) *Client {
+	t.Helper()
+	network := plain.NewNetwork()
+	listener, err := network.NewFabric(fabric.Identity{NodeID: "control-plane"}).Listen("tcp", "wefty://control-plane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: handler}
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		if err := <-served; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("serve round trip: %v", err)
+		}
+	})
+	client, err := newClient(network.NewFabric(fabric.Identity{NodeID: "agent"}), "wefty://control-plane", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	return client
+}
+
 func assertClientTransportSupportsConcurrentAttemptTraffic(t *testing.T) {
 	t.Helper()
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})

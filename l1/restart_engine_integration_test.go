@@ -50,9 +50,12 @@ func assertPublishedListenerFailureRequeuesWithoutLatching(t *testing.T) {
 	}
 
 	requeued := getRestartService(t, h, job.JobID)
-	if requeued.State != contract.JobQueued || requeued.RestartStreak != 0 || requeued.LifetimeRestartCount != 1 || requeued.NextRestartAt != nil {
-		t.Fatalf("front-door failure service state/streak/lifetime/backoff = %q/%d/%d/%v, want queued/0/1/nil", requeued.State, requeued.RestartStreak, requeued.LifetimeRestartCount, requeued.NextRestartAt)
+	wantRestart := h.clock.Now().Add(time.Second)
+	if requeued.State != contract.JobQueued || requeued.RestartStreak != 0 || requeued.LifetimeRestartCount != 1 ||
+		requeued.NextRestartAt == nil || !requeued.NextRestartAt.Equal(wantRestart) {
+		t.Fatalf("front-door failure service state/streak/lifetime/backoff = %q/%d/%d/%v, want queued/0/1/%s", requeued.State, requeued.RestartStreak, requeued.LifetimeRestartCount, requeued.NextRestartAt, wantRestart)
 	}
+	h.clock.Advance(time.Second)
 	second := claimRestartService(t, h, agent, node)
 	if second.Lease.AttemptID == first.Lease.AttemptID || second.Lease.FencingToken == first.Lease.FencingToken {
 		t.Fatalf("front-door recovery reused attempt authority: first=%#v second=%#v", first.Lease, second.Lease)
@@ -80,12 +83,14 @@ func assertServiceCompletionClassification(t *testing.T) {
 		{name: "nonzero exit restarts", result: ProcessResult{ExitCode: &exitOne}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantStreak: 1, wantLifetimeRestarts: 1, wantBackoff: true, wantFailure: true},
 		{name: "spontaneous signal restarts", result: ProcessResult{Signal: "killed", TerminationCause: contract.TerminationCauseSpontaneous}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantStreak: 1, wantLifetimeRestarts: 1, wantBackoff: true, wantFailure: true},
 		{name: "startup readiness timeout is whitelisted", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureStartupReadinessTimeout, Message: "backend never accepted"}}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantStreak: 1, wantLifetimeRestarts: 1, wantBackoff: true, wantFailure: true, wantFailureCode: contract.SpawnFailureStartupReadinessTimeout},
-		{name: "published listener failure is infrastructure", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailurePublishedListener, Message: "listener failed"}}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantLifetimeRestarts: 1},
+		{name: "published listener failure is infrastructure", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailurePublishedListener, Message: "listener failed"}}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantLifetimeRestarts: 1, wantBackoff: true},
+		{name: "process runtime unavailable is terminal", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureRuntimeUnavailable, Message: "unexpected process code"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailureRuntimeUnavailable},
+		{name: "process runtime failure is terminal", result: ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "unexpected process runtime arm"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true},
 		{name: "deterministic spawn failure latches", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureProcessSpawn, Message: "executable missing"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailureProcessSpawn},
 		{name: "unknown spawn failure defaults terminal", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureCode("future_spawn_failure"), Message: "unknown"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailureCode("future_spawn_failure")},
 		{name: "published port occupied latches", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailurePublishedPortOccupied, Message: "port 8080 occupied"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailurePublishedPortOccupied},
 		{name: "genuine output error latches", result: ProcessResult{OutputError: "SQLite corruption"}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true},
-		{name: "guardian termination is infrastructure", result: ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseGuardian}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantLifetimeRestarts: 1},
+		{name: "guardian termination is infrastructure", result: ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseGuardian}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantLifetimeRestarts: 1, wantBackoff: true},
 		{name: "configured streak maximum latches on first countable termination", result: ProcessResult{ExitCode: &exitOne}, maximum: &maximumOne, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantStreak: 1, wantFailure: true},
 	}
 

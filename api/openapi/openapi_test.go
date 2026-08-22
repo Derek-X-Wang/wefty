@@ -196,12 +196,40 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 		}
 	}
 	processResult := object(t, schemas["ProcessResult"], "ProcessResult")
-	if len(processResult["oneOf"].([]any)) != 4 {
-		t.Fatal("ProcessResult must distinguish spawn error, output failure, exit code, and signal death")
+	if len(processResult["oneOf"].([]any)) != 5 {
+		t.Fatal("ProcessResult must distinguish spawn error, runtime failure, output failure, exit code, and signal death")
 	}
 	processProperties := object(t, processResult["properties"], "ProcessResult.properties")
 	if _, ok := processProperties["termination_cause"]; !ok {
 		t.Fatal("ProcessResult must carry a structured termination cause")
+	}
+	if _, ok := processProperties["oom"]; !ok {
+		t.Fatal("ProcessResult must carry additive OOM evidence")
+	}
+	for _, field := range []string{"output_error", "signal"} {
+		property := object(t, processProperties[field], "ProcessResult."+field)
+		if property["minLength"] != float64(1) {
+			t.Errorf("ProcessResult.%s minLength = %v, want 1", field, property["minLength"])
+		}
+	}
+	imagePath := object(t, paths["/v1/agent/jobs/{job_id}/attempts/{attempt_id}/image"], "image path")
+	imageOperation := object(t, imagePath["put"], "image PUT")
+	imageBody := object(t, imageOperation["requestBody"], "image requestBody")
+	imageContent := object(t, imageBody["content"], "image requestBody.content")
+	imageMedia := object(t, imageContent["application/json"], "image request media type")
+	imageSchema := object(t, imageMedia["schema"], "image request schema")
+	imageProperties := object(t, imageSchema["properties"], "image request properties")
+	indexDigest := object(t, imageProperties["index_digest"], "image index_digest")
+	types := stringSet(t, indexDigest["type"])
+	if !types["string"] || !types["null"] {
+		t.Fatalf("image index_digest types = %v, want string and null", indexDigest["type"])
+	}
+	evidence := object(t, schemas["OCIImageEvidence"], "OCIImageEvidence")
+	evidenceProperties := object(t, evidence["properties"], "OCIImageEvidence.properties")
+	evidenceIndexDigest := object(t, evidenceProperties["index_digest"], "OCIImageEvidence.index_digest")
+	evidenceTypes := stringSet(t, evidenceIndexDigest["type"])
+	if types["string"] != evidenceTypes["string"] || types["null"] != evidenceTypes["null"] {
+		t.Fatalf("image request index_digest types %v disagree with evidence types %v", indexDigest["type"], evidenceIndexDigest["type"])
 	}
 	spawnFailure := object(t, schemas["SpawnFailure"], "SpawnFailure")
 	spawnRequired := stringSet(t, spawnFailure["required"])

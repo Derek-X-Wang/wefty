@@ -120,6 +120,18 @@ func (c *Client) Renew(ctx context.Context, jobID, attemptID, fencingToken strin
 	return lease, err
 }
 
+func (c *Client) ObserveAttemptImage(ctx context.Context, jobID, attemptID string, request l1.ImageObservationRequest) (l1.Job, error) {
+	var job l1.Job
+	err := c.request(ctx, http.MethodPut, attemptPath(jobID, attemptID)+"/image", request, &job)
+	return job, err
+}
+
+func (c *Client) StartAttempt(ctx context.Context, jobID, attemptID string, request l1.StartedRequest) (l1.Job, error) {
+	var job l1.Job
+	err := c.post(ctx, attemptPath(jobID, attemptID)+"/started", request, &job)
+	return job, err
+}
+
 func (c *Client) AppendLogs(ctx context.Context, jobID, attemptID string, request l1.AppendLogsRequest) (l1.AppendLogsResponse, error) {
 	var response l1.AppendLogsResponse
 	err := c.post(ctx, attemptPath(jobID, attemptID)+"/logs", request, &response)
