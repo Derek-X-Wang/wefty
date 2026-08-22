@@ -37,7 +37,8 @@
         }
       },
       "JobSpec": {
-        "$ref": "../../contract/schemas/v1/job-spec.schema.json"
+        "$ref": "../../contract/schemas/v1/job-spec.schema.json",
+        "description": "Open-kind workload contract. kind=process uses the flat process execution fields; kind=oci uses execution.oci while env and sensitive_env remain shared."
       },
       "Job": {
         "type": "object",

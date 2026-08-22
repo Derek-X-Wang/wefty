@@ -265,11 +265,33 @@ job and one recorded run-to-job association.
 
 ## Workload support and reserved operations
 
-JSON Schema and Go decoding accept every non-empty job `kind`. Execution policy
-then accepts `process` in v0.1 and rejects `oci` or any unknown kind with `422
-unsupported_kind`. `runtime_handler` is schema-visible for future OCI security
-tiers, but a `process` job that sets it receives `422
-unsupported_runtime_handler`.
+JSON Schema and `contract.ValidateJobSpec` accept every non-empty job `kind` and
+apply the same asymmetric arm rules. `kind=process` retains the flat
+`execution.executable`, `argv`, host `working_directory`, and one-shot
+`handoff_directory`; it forbids `execution.oci`. `kind=oci` requires
+`execution.oci` and forbids every flat process field. An unknown kind remains
+valid open-kind data but cannot reuse the OCI arm.
+
+The OCI arm carries image reference and optional digest, an optional full-vector
+argv replacement, optional container working directory, operator mounts, and
+optional cgroup-v2 hard limits. Only an initial one-shot submission may omit its
+digest; every other OCI class requires one. A digest, when present, is exactly
+`sha256:` plus 64 lowercase hexadecimal characters, and the provenance
+reference is a lowercase OCI distribution repository plus optional tag that
+never embeds `@digest`. A mount source is a normalized absolute path other than
+root, while symlink and allowed-root checks remain node-side; any mounted job
+must carry exactly one `wefty:node:*` routing tag. A non-empty `runtime_handler`
+is valid only outside the process arm; a process job that sets one continues to
+receive `422 unsupported_runtime_handler`.
+
+Environment names on both process and OCI arms follow the portable
+`[A-Za-z_][A-Za-z0-9_]*` grammar before L1 accepts the job.
+
+Runtime support remains separate from wire validity. Until capability-aware OCI
+claiming lands in Ticket 3 (#135), L1 returns `422 unsupported_kind` for every
+non-process job so today's process-only agents cannot claim it. After that
+interim gate is removed, an agent without an adapter for a structurally valid
+kind reports `unsupported_kind`.
 
 Every job also declares the independent, required `class` lifecycle axis.
 `class` is an open string: L1 stores unknown values as valid data, and only an

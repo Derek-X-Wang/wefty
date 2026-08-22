@@ -48,6 +48,25 @@ type ErrorResponse struct {
 	Error APIError `json:"error"`
 }
 
+// JobSpecValidationError carries the stable protocol code for a structurally
+// invalid job specification across every construction surface.
+type JobSpecValidationError struct {
+	code    ErrorCode
+	message string
+}
+
+func (e *JobSpecValidationError) Error() string { return e.message }
+
+func (e *JobSpecValidationError) Code() ErrorCode { return e.code }
+
+func invalidJobSpecf(format string, args ...any) error {
+	return &JobSpecValidationError{code: ErrorInvalidRequest, message: fmt.Sprintf(format, args...)}
+}
+
+func unsupportedRuntimeHandlerf(format string, args ...any) error {
+	return &JobSpecValidationError{code: ErrorUnsupportedRuntimeHandler, message: fmt.Sprintf(format, args...)}
+}
+
 // ExecutionError reports that a syntactically valid job cannot be executed by
 // this version of the agent.
 type ExecutionError struct {
@@ -66,7 +85,7 @@ func (e *ExecutionError) Code() ErrorCode {
 // kind has been decoded. The schema and Go types intentionally accept any
 // non-empty kind; v0.1 agents execute only process jobs.
 func CheckExecutableKind(kind string) error {
-	if kind == "process" {
+	if kind == JobKindProcess {
 		return nil
 	}
 

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:reserved-names",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": {
+    "env": {
+      "WEFTY_HANDOFF_DIR": "/operator-value-is-stripped",
+      "WEFTY_SERVICE_DIR": "/operator-value-is-stripped",
+      "WEFTY_SERVICE_PORT": "1",
+      "WEFTY_L3_ENDPOINT": "http://operator-value-is-stripped"
+    },
+    "sensitive_env": {
+      "WEFTY_RUN_TOKEN": "operator-value-is-stripped"
+    },
+    "oci": { "image": { "reference": "alpine:latest" } }
+  }
+}

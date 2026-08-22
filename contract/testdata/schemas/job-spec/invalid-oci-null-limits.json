@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:null-limits",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": {
+    "oci": { "image": { "reference": "alpine:latest" }, "limits": null }
+  }
+}

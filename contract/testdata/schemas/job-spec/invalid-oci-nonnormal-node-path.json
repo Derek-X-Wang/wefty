@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:nonnormal-node-path",
+  "kind": "oci",
+  "class": "one-shot",
+  "routing_tags": ["wefty:node:linux-a"],
+  "execution": {
+    "oci": {
+      "image": { "reference": "alpine:latest" },
+      "mounts": [{ "node_path": "/srv/../input", "container_path": "/input" }]
+    }
+  }
+}

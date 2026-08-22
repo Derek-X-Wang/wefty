@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:mount-two-node-tags",
+  "kind": "oci",
+  "class": "one-shot",
+  "routing_tags": ["wefty:node:linux-a", "wefty:node:linux-b"],
+  "execution": {
+    "oci": {
+      "image": { "reference": "alpine:latest" },
+      "mounts": [{ "node_path": "/srv/input", "container_path": "/input" }]
+    }
+  }
+}

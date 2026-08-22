@@ -1596,7 +1596,7 @@ func (intent dispatchIntent) jobSpec(runToken string) contract.JobSpec {
 	return contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   intent.DispatchKey,
-		Kind:          "process",
+		Kind:          contract.JobKindProcess,
 		Class:         contract.JobClassOneShot,
 		RoutingTags:   append([]string(nil), intent.Tags...),
 		Execution: contract.ExecutionSpec{

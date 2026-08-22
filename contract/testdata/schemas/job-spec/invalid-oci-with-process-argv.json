@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:with-process-argv",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": {
+    "argv": ["true"],
+    "oci": { "image": { "reference": "alpine:latest" } }
+  }
+}

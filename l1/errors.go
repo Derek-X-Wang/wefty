@@ -41,5 +41,9 @@ func errorCode(err error) contract.ErrorCode {
 	if errors.As(err, &protocolErr) {
 		return protocolErr.Code
 	}
+	var coded interface{ Code() contract.ErrorCode }
+	if errors.As(err, &coded) {
+		return coded.Code()
+	}
 	return contract.ErrorInternal
 }

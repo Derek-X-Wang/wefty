@@ -289,10 +289,12 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // CreateJob creates a job or returns the identical dispatch-key replay.
 func (s *Store) CreateJob(ctx context.Context, spec contract.JobSpec) (job Job, replayed bool, err error) {
+	// Preserve the v1 submission contract: L1 canonicalizes routing tags before
+	// structural validation and persistence.
+	spec.RoutingTags = NormalizeTags(spec.RoutingTags)
 	if err := validateJobSpec(&spec); err != nil {
 		return Job{}, false, err
 	}
-	spec.RoutingTags = NormalizeTags(spec.RoutingTags)
 	specJSON, err := json.Marshal(spec)
 	if err != nil {
 		return Job{}, false, internalError(err, "encode job specification")
@@ -1700,51 +1702,13 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 }
 
 func validateJobSpec(spec *contract.JobSpec) error {
-	if spec.SchemaVersion != contract.SchemaVersionV1 {
-		return protocolError(contract.ErrorInvalidRequest, "schema_version must be %d", contract.SchemaVersionV1)
+	// TODO(#135): remove this interim gate when Ticket 3 adds capability-aware
+	// OCI requirements and prevents process-only agents from claiming OCI jobs.
+	if spec.Kind != contract.JobKindProcess {
+		return protocolError(contract.ErrorUnsupportedKind, "job kind %q is not supported by L1 yet", spec.Kind)
 	}
-	if strings.TrimSpace(spec.DispatchKey) == "" || strings.TrimSpace(spec.Kind) == "" || strings.TrimSpace(spec.Class) == "" {
-		return protocolError(contract.ErrorInvalidRequest, "dispatch_key, kind, and class are required")
-	}
-	if len(spec.DispatchKey) > 255 || len(spec.Kind) > 128 || len(spec.Class) > 128 || len(spec.RuntimeHandler) > 128 {
-		return protocolError(contract.ErrorInvalidRequest, "job identifier fields exceed contract limits")
-	}
-	if spec.Kind != "process" {
-		return protocolError(contract.ErrorUnsupportedKind, "job kind %q is not supported", spec.Kind)
-	}
-	if spec.RuntimeHandler != "" {
-		return protocolError(contract.ErrorUnsupportedRuntimeHandler, "runtime_handler is not supported for process jobs")
-	}
-	if spec.Execution.WorkingDirectory == "" || len(spec.Execution.Argv) == 0 {
-		return protocolError(contract.ErrorInvalidRequest, "execution argv and working_directory are required")
-	}
-	if spec.Class == contract.JobClassOneShot && spec.Execution.HandoffDirectory == "" {
-		return protocolError(contract.ErrorInvalidRequest, "one-shot execution handoff_directory is required")
-	}
-	if spec.Class == contract.JobClassService {
-		if spec.Restart != contract.RestartAlways {
-			return protocolError(contract.ErrorInvalidRequest, "service restart must be %q", contract.RestartAlways)
-		}
-		if spec.PublishedPort != nil && (*spec.PublishedPort < 1 || *spec.PublishedPort > 65535) {
-			return protocolError(contract.ErrorInvalidRequest, "published_port must be between 1 and 65535")
-		}
-		if spec.MaxRestartStreak != nil && *spec.MaxRestartStreak < 1 {
-			return protocolError(contract.ErrorInvalidRequest, "max_restart_streak must be at least 1")
-		}
-	}
-	if (spec.Execution.Executable.Path == "") == (spec.Execution.Executable.InlineBase64 == "") {
-		return protocolError(contract.ErrorInvalidRequest, "executable must contain exactly one of path or inline_base64")
-	}
-	if spec.Execution.Executable.InlineBase64 != "" && !validSHA256(spec.Execution.Executable.SHA256) {
-		return protocolError(contract.ErrorInvalidRequest, "inline executable requires a lowercase SHA-256 digest")
-	}
-	if spec.Execution.Executable.Mode > 4095 {
-		return protocolError(contract.ErrorInvalidRequest, "executable mode exceeds 07777")
-	}
-	for _, tag := range NormalizeTags(spec.RoutingTags) {
-		if !validTag(tag) {
-			return protocolError(contract.ErrorInvalidRequest, "routing tag %q is invalid", tag)
-		}
+	if err := contract.ValidateJobSpec(*spec); err != nil {
+		return protocolError(errorCode(err), "%v", err)
 	}
 	return nil
 }

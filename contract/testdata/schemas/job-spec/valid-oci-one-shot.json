@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:one-shot",
+  "kind": "oci",
+  "class": "one-shot",
+  "runtime_handler": "io.containerd.runc.v2",
+  "routing_tags": ["wefty:node:linux-a"],
+  "execution": {
+    "env": { "WEFTY_CUSTOM": "tenant-defined" },
+    "sensitive_env": { "API_TOKEN": "secret" },
+    "oci": {
+      "image": { "reference": "ghcr.io/example/tool:latest" },
+      "argv": ["tool", "run"],
+      "working_directory": "/workspace",
+      "mounts": [
+        {
+          "node_path": "/srv/wefty/input",
+          "container_path": "/input",
+          "read_only": true
+        }
+      ],
+      "limits": { "memory_bytes": 536870912, "cpu_millicores": 750 }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "process:handler",
+  "kind": "process",
+  "class": "one-shot",
+  "runtime_handler": "io.containerd.runc.v2",
+  "execution": {
+    "executable": { "path": "/usr/bin/true" },
+    "argv": ["true"],
+    "working_directory": "/tmp",
+    "handoff_directory": "/tmp/handoff"
+  }
+}

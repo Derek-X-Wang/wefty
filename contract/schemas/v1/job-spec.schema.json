@@ -7,20 +7,22 @@
   "required": ["schema_version", "dispatch_key", "kind", "class", "execution"],
   "properties": {
     "schema_version": { "const": 1 },
-    "dispatch_key": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "dispatch_key": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S" },
     "kind": {
       "description": "Open workload kind. Unknown values are valid data and are rejected only by agents that cannot execute them.",
       "type": "string",
       "minLength": 1,
-      "maxLength": 128
+      "maxLength": 128,
+      "pattern": "\\S"
     },
     "class": {
       "description": "Open workload lifecycle class. Unknown values are valid data and are rejected only by agents that cannot execute them.",
       "type": "string",
       "minLength": 1,
-      "maxLength": 128
+      "maxLength": 128,
+      "pattern": "\\S"
     },
-    "runtime_handler": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "runtime_handler": { "type": "string", "maxLength": 128 },
     "routing_tags": {
       "type": "array",
       "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]*$" },
@@ -33,7 +35,6 @@
     "execution": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["executable", "argv", "working_directory"],
       "properties": {
         "executable": {
           "type": "object",
@@ -79,7 +80,8 @@
           "$ref": "#/$defs/environment"
         },
         "working_directory": { "type": "string", "minLength": 1 },
-        "handoff_directory": { "type": "string", "minLength": 1 }
+        "handoff_directory": { "type": "string", "minLength": 1 },
+        "oci": { "$ref": "#/$defs/ociExecution" }
       }
     },
     "limits": {
@@ -110,8 +112,52 @@
   "allOf": [
     {
       "if": {
-        "properties": { "class": { "const": "one-shot" } },
-        "required": ["class"]
+        "properties": { "kind": { "const": "process" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "execution": {
+            "required": ["executable", "argv", "working_directory"],
+            "not": { "required": ["oci"] }
+          },
+          "runtime_handler": { "const": "" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "oci" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "execution": {
+            "required": ["oci"],
+            "not": {
+              "anyOf": [
+                { "required": ["executable"] },
+                { "required": ["argv"] },
+                { "required": ["working_directory"] },
+                { "required": ["handoff_directory"] }
+              ]
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "execution": { "not": { "required": ["oci"] } }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": { "const": "process" },
+          "class": { "const": "one-shot" }
+        },
+        "required": ["kind", "class"]
       },
       "then": {
         "properties": {
@@ -125,6 +171,55 @@
         "required": ["class"]
       },
       "then": { "required": ["restart"] }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": { "const": "oci" },
+          "class": { "not": { "const": "one-shot" } }
+        },
+        "required": ["kind", "class"]
+      },
+      "then": {
+        "properties": {
+          "execution": {
+            "properties": {
+              "oci": {
+                "properties": {
+                  "image": { "required": ["digest"] }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": { "const": "oci" },
+          "execution": {
+            "properties": {
+              "oci": {
+                "properties": { "mounts": { "minItems": 1 } },
+                "required": ["mounts"]
+              }
+            },
+            "required": ["oci"]
+          }
+        },
+        "required": ["kind", "execution"]
+      },
+      "then": {
+        "required": ["routing_tags"],
+        "properties": {
+          "routing_tags": {
+            "contains": { "type": "string", "pattern": "^wefty:node:[a-z0-9][a-z0-9._:-]*$" },
+            "minContains": 1,
+            "maxContains": 1
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -132,6 +227,82 @@
       "type": "object",
       "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
       "additionalProperties": { "type": "string" }
+    },
+    "containerPath": {
+      "type": "string",
+      "pattern": "^/",
+      "not": { "pattern": "(^|/)\\.\\.?(/|$)|//|.+/$" }
+    },
+    "nodePath": {
+      "type": "string",
+      "pattern": "^/",
+      "not": { "pattern": "^/$|(^|/)\\.\\.?(/|$)|//|.+/$" }
+    },
+    "mountContainerPath": {
+      "allOf": [
+        { "$ref": "#/$defs/containerPath" },
+        {
+          "not": {
+            "anyOf": [
+              { "enum": ["/", "/wefty", "/wefty/handoff", "/wefty/service"] },
+              { "pattern": "^/wefty/(handoff|service)/" }
+            ]
+          }
+        }
+      ]
+    },
+    "ociExecution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image"],
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference"],
+          "properties": {
+            "reference": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "pattern": "^([a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]+)?/)?[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*(/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*)*(:[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?$"
+            },
+            "digest": {
+              "type": "string",
+              "pattern": "^sha256:[a-f0-9]{64}$"
+            }
+          }
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "contains": { "type": "string", "minLength": 1 },
+          "items": { "type": "string" }
+        },
+        "working_directory": { "$ref": "#/$defs/containerPath" },
+        "mounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["node_path", "container_path"],
+            "properties": {
+              "node_path": { "$ref": "#/$defs/nodePath" },
+              "container_path": { "$ref": "#/$defs/mountContainerPath" },
+              "read_only": { "type": "boolean" }
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "memory_bytes": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+            "cpu_millicores": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 }
+          }
+        }
+      }
     }
   }
 }

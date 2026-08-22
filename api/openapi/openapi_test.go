@@ -53,6 +53,28 @@ func TestProtocolDocumentsUseSharedErrorShape(t *testing.T) {
 	}
 }
 
+func TestOpenAPIJobSpecPublishesOCIArm(t *testing.T) {
+	t.Parallel()
+
+	common := readObject(t, "common.v1.json")
+	components := object(t, common["components"], "components")
+	schemas := object(t, components["schemas"], "components.schemas")
+	jobSpec := object(t, schemas["JobSpec"], "JobSpec")
+	if jobSpec["$ref"] != "../../contract/schemas/v1/job-spec.schema.json" {
+		t.Fatalf("JobSpec schema ref = %v", jobSpec["$ref"])
+	}
+	description, _ := jobSpec["description"].(string)
+	if !strings.Contains(description, "execution.oci") {
+		t.Fatalf("JobSpec description does not publish the OCI arm: %q", description)
+	}
+
+	contractSchema := readObject(t, filepath.Join("..", "..", "contract", "schemas", "v1", "job-spec.schema.json"))
+	definitions := object(t, contractSchema["$defs"], "$defs")
+	if _, present := definitions["ociExecution"]; !present {
+		t.Fatal("OpenAPI-referenced JobSpec schema has no OCI execution definition")
+	}
+}
+
 func TestReservedRoutesExplicitlyReturn501(t *testing.T) {
 	t.Parallel()
 

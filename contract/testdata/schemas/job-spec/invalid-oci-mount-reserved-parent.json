@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:mount-reserved-parent",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": {
+    "oci": {
+      "image": { "reference": "alpine:latest" },
+      "mounts": [{ "node_path": "/srv/input", "container_path": "/wefty" }]
+    }
+  }
+}
