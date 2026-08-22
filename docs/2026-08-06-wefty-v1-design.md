@@ -4,6 +4,10 @@
 **Status:** Locked — all decision tickets closed; no open decision blocks implementation planning.
 **Wayfinder map:** [#1](https://github.com/Derek-X-Wang/wefty/issues/1) · Research base: [deep research synthesis](research/2026-08-06-deep-research-synthesis.md)
 
+## Amendments (2026-08-22) — [#105](https://github.com/Derek-X-Wang/wefty/issues/105)
+
+This document remains the historical v1 design record. Inline amendment callouts identify later ratified changes and link to their current decision authority.
+
 ---
 
 ## 1. Overview
@@ -83,7 +87,13 @@ Rationale: the fleet's Macs always go through a VM anyway, so embedding (youki/l
 
 - **Lima v2.2+, vz driver, containerd template** — the only v1 Mac OCI backend.
 - **Headless autostart (node bootstrap):** `limactl autostart enable --condition=boot <instance>` — installs a root LaunchDaemon; the VM survives reboot with no login (verified in Lima v2.2.0, [#2](https://github.com/Derek-X-Wang/wefty/issues/2); `limactl start-at-login` is deprecated).
+
+> **Amended:** [#113](https://github.com/Derek-X-Wang/wefty/issues/113) supersedes this autostart mechanism; headless return is proven by [#128](https://github.com/Derek-X-Wang/wefty/issues/128)'s lane, not assumed.
+
 - **Host-agent → in-VM containerd transport:** Lima's forwarded containerd unix socket on the host; the agent dials it with the containerd Go client. No custom vsock plumbing, no tsnet inside the VM. Revisit only if socket forwarding proves unreliable in practice.
+
+> **Amended:** [#104](https://github.com/Derek-X-Wang/wefty/issues/104) proved the premise, but [#111](https://github.com/Derek-X-Wang/wefty/issues/111) supersedes the production transport shape.
+
 - **OrbStack not offered:** proprietary, per-user lifecycle, Docker-API-shaped (conflicts with the containerd contract), non-commercial free tier.
 - Apple `container` and gVisor: deferred — see §5.
 
@@ -94,6 +104,9 @@ L1 owns the **only job queue** in the system. Windmill-style semantics: node age
 #### Job lifecycle
 
 - **One-shot jobs only** through v1; service/scheduled job classes wait for a real need. The control plane itself is not an L1 job in v1 ([#14](https://github.com/Derek-X-Wang/wefty/issues/14)).
+
+> **Amended:** The service workload class shipped in v0.2; see [spec #57](https://github.com/Derek-X-Wang/wefty/issues/57).
+
 - Hang detection: idle (600s) / completion (60s) timeouts adopted into the L1 job model (stolen from sandcastle, [#9](https://github.com/Derek-X-Wang/wefty/issues/9)).
 - **Reserved, unimplemented:** an **`awaiting-input`** lifecycle state plus a `POST /jobs/{id}/prompt` verb — the warm-session-retry seam. A job could stay alive and be re-promptable after a gate failure instead of cold-restarting. Documented in the API shape, not built in v1 ([#7](https://github.com/Derek-X-Wang/wefty/issues/7), [#12](https://github.com/Derek-X-Wang/wefty/issues/12)).
 - Logs: poll-only rowid-style live tail; raw jsonl authoritative; streaming later ([#12](https://github.com/Derek-X-Wang/wefty/issues/12)).
@@ -248,6 +261,8 @@ From M4 the implement/review steps can land on Daytona capacity instead — same
 | **M4 — Daytona connector** | Proves the sandbox-provider contract; script may switch to sandcastle's Daytona provider. |
 | **M5 — Fly connector** | Converged agent image + reconciler/reaper — structurally last (depends on a mature agent). Webhook trigger last. |
 
+> **Amended:** Cron left M3 for a future effort; see [map #101](https://github.com/Derek-X-Wang/wefty/issues/101).
+
 UI: none until post-M4 (CLI + API + polled logs; capacity view and saved filters are the first UI).
 
 **Accepted trust call:** Codex-written code runs **unsandboxed** as `kind=process` on owned Macs until M3/M4. This is the existing daily status quo (Claude Code + yolo-mode Codex already run natively on these machines) — M2 formalizes existing risk without adding new risk. Sandboxing arrives M3/M4; gVisor tier later (fog).
@@ -274,6 +289,8 @@ UI: none until post-M4 (CLI + API + polled logs; capacity view and saved filters
 | **Postgres substrate** | SQLite. | Upgrade when the control plane goes multi-process ([#12](https://github.com/Derek-X-Wang/wefty/issues/12)). |
 | **Docker-socket engine adapters** | containerd only. | Secondary adapters later, never canonical ([#4](https://github.com/Derek-X-Wang/wefty/issues/4)). |
 | **Declarative workflow layer / UI** | Script + CLI/API only. | Can grow on the same contracts later ([#7](https://github.com/Derek-X-Wang/wefty/issues/7), [#14](https://github.com/Derek-X-Wang/wefty/issues/14)). |
+
+> **Amended:** The service workload class shipped early in v0.2; see Amendments.
 
 ---
 
