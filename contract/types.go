@@ -394,11 +394,25 @@ const (
 // outcome always names its structured initiator in TerminationCause.
 type ProcessResult struct {
 	SpawnError       *SpawnFailure    `json:"spawn_error,omitempty"`
+	RuntimeFailure   *RuntimeFailure  `json:"runtime_failure,omitempty"`
 	OutputError      string           `json:"output_error,omitempty"`
 	ExitCode         *int             `json:"exit_code,omitempty"`
 	Signal           string           `json:"signal,omitempty"`
 	TerminationCause TerminationCause `json:"termination_cause,omitempty"`
+	OOM              bool             `json:"oom,omitempty"`
 }
+
+// RuntimeFailure is stable machine-readable evidence that the runtime or
+// helper disappeared after execution was authoritatively acknowledged.
+// Message is diagnostic only; policy must key exclusively on Code.
+type RuntimeFailure struct {
+	Code    RuntimeFailureCode `json:"code"`
+	Message string             `json:"message"`
+}
+
+type RuntimeFailureCode string
+
+const RuntimeFailureUnavailable RuntimeFailureCode = "runtime_unavailable"
 
 // SpawnFailure is a stable machine-readable pre-execution failure. Message is
 // diagnostic only; policy must key exclusively on Code.
@@ -425,6 +439,12 @@ const (
 	SpawnFailurePublishedPortOccupied      SpawnFailureCode = "published_port_occupied"
 	SpawnFailurePublishedListener          SpawnFailureCode = "published_listener_failed"
 	SpawnFailureStartupReadinessTimeout    SpawnFailureCode = "startup_readiness_timeout"
+	SpawnFailureRuntimeUnavailable         SpawnFailureCode = "runtime_unavailable"
+	SpawnFailureImageUnavailable           SpawnFailureCode = "image_unavailable"
+	SpawnFailureImageNotFound              SpawnFailureCode = "image_not_found"
+	SpawnFailureImageManifestInvalid       SpawnFailureCode = "image_manifest_invalid"
+	SpawnFailureImagePlatformUnsupported   SpawnFailureCode = "image_platform_unsupported"
+	SpawnFailureOCISpecRejected            SpawnFailureCode = "oci_spec_rejected"
 )
 
 // TerminationCause identifies who initiated a signal termination. A service

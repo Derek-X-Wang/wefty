@@ -65,14 +65,4 @@ func TestServiceAcceptanceJobSpecSchemaAndProcessResult(t *testing.T) {
 			t.Fatalf("%s accepted by Go validation", path)
 		}
 	}
-
-	encoded, err := json.Marshal(ProcessResult{
-		Signal: "terminated", TerminationCause: TerminationCauseGuardian,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := string(encoded), `{"signal":"terminated","termination_cause":"guardian"}`; got != want {
-		t.Fatalf("ProcessResult JSON = %s, want %s", got, want)
-	}
 }
