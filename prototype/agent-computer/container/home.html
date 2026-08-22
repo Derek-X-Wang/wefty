@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>wefty agent computer #118</title>
+  <style>
+    body { background: #102030; color: #f4f7fb; font: 28px system-ui; margin: 48px; }
+    input { font: inherit; width: 80%; padding: 12px; }
+    small { color: #a8c5e8; }
+  </style>
+</head>
+<body>
+  <h1>wefty agent computer #118</h1>
+  <p>This browser and profile live inside the guest.</p>
+  <input id="marker" autofocus placeholder="Type through the control stream">
+  <p><small id="saved">No browser marker saved yet.</small></p>
+  <script>
+    const marker = document.querySelector('#marker');
+    const saved = document.querySelector('#saved');
+    marker.value = localStorage.getItem('wefty-marker') || '';
+    const render = () => {
+      localStorage.setItem('wefty-marker', marker.value);
+      saved.textContent = marker.value ? `Saved: ${marker.value}` : 'No browser marker saved yet.';
+    };
+    marker.addEventListener('input', render);
+    marker.focus();
+    render();
+  </script>
+</body>
+</html>

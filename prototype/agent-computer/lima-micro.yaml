@@ -1,0 +1,44 @@
+minimumLimaVersion: 2.2.0
+
+base:
+- template:_images/ubuntu-lts
+- template:_default/mounts
+
+vmType: vz
+cpus: 3
+memory: 3GiB
+disk: 24GiB
+mountType: virtiofs
+
+containerd:
+  system: true
+  user: false
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    install -d -m 0700 /var/lib/wefty-agent-computer/profiles
+    install -d -m 0755 /var/lib/wefty-agent-computer/evidence
+    timeout 120 bash -c 'until test -S /run/containerd/containerd.sock; do sleep 1; done'
+
+probes:
+- script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    test -S /run/containerd/containerd.sock
+    test -d /var/lib/wefty-agent-computer/profiles
+
+portForwards:
+- guestPort: 6080
+  hostPort: 17080
+  hostIP: 127.0.0.1
+- guestPort: 6081
+  hostPort: 17081
+  hostIP: 127.0.0.1
+
+message: |
+  Per-computer micro-VM topology for ticket #118.
+  The VM itself is the computer boundary; the desktop payload remains containerized
+  only so both candidates exercise an identical browser/streaming workload.
