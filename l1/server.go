@@ -202,6 +202,8 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/drain", s.drainNode)
 	agent.HandleFunc("POST /v1/agent/jobs/claim", s.claimJob)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/lease", s.renewLease)
+	agent.HandleFunc("PUT /v1/agent/jobs/{job_id}/attempts/{attempt_id}/image", s.observeAttemptImage)
+	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/started", s.startAttempt)
 	agent.HandleFunc("PUT /v1/agent/jobs/{job_id}/attempts/{attempt_id}/publication", s.setAttemptPublication)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/logs", s.appendLogs)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete", s.completeAttempt)
@@ -568,6 +570,36 @@ func (s *Server) renewLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, lease)
+}
+
+func (s *Server) observeAttemptImage(w http.ResponseWriter, r *http.Request) {
+	var request ImageObservationRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	identity := identityFromRequest(r)
+	job, err := s.store.ObserveAttemptImage(r.Context(), identity.NodeID, r.PathValue("job_id"), r.PathValue("attempt_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, redactJob(job))
+}
+
+func (s *Server) startAttempt(w http.ResponseWriter, r *http.Request) {
+	var request StartedRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	identity := identityFromRequest(r)
+	job, err := s.store.StartAttempt(r.Context(), identity.NodeID, r.PathValue("job_id"), r.PathValue("attempt_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, redactJob(job))
 }
 
 func (s *Server) setAttemptPublication(w http.ResponseWriter, r *http.Request) {

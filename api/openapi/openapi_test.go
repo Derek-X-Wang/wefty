@@ -196,12 +196,15 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 		}
 	}
 	processResult := object(t, schemas["ProcessResult"], "ProcessResult")
-	if len(processResult["oneOf"].([]any)) != 4 {
-		t.Fatal("ProcessResult must distinguish spawn error, output failure, exit code, and signal death")
+	if len(processResult["oneOf"].([]any)) != 5 {
+		t.Fatal("ProcessResult must distinguish spawn error, runtime failure, output failure, exit code, and signal death")
 	}
 	processProperties := object(t, processResult["properties"], "ProcessResult.properties")
 	if _, ok := processProperties["termination_cause"]; !ok {
 		t.Fatal("ProcessResult must carry a structured termination cause")
+	}
+	if _, ok := processProperties["oom"]; !ok {
+		t.Fatal("ProcessResult must carry additive OOM evidence")
 	}
 	spawnFailure := object(t, schemas["SpawnFailure"], "SpawnFailure")
 	spawnRequired := stringSet(t, spawnFailure["required"])

@@ -251,6 +251,66 @@
         }
       }
     },
+    "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/image": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } },
+        { "name": "attempt_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "put": {
+        "operationId": "observeAttemptImage",
+        "summary": "Record one fenced, write-once OCI image observation",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["fencing_token", "submitted_reference", "top_level_digest", "top_level_media_type", "platform_manifest_digest", "platform", "runtime_handler", "snapshotter"],
+            "properties": {
+              "fencing_token": { "type": "string", "minLength": 1 },
+              "submitted_reference": { "type": "string", "minLength": 1 },
+              "top_level_digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+              "top_level_media_type": { "type": "string", "minLength": 1 },
+              "index_digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+              "platform_manifest_digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+              "platform": { "$ref": "./common.v1.json#/components/schemas/OCIPlatformEvidence" },
+              "runtime_handler": { "type": "string", "minLength": 1 },
+              "snapshotter": { "type": "string", "minLength": 1 }
+            }
+          } } }
+        },
+        "responses": {
+          "200": { "description": "Observation accepted or identically replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/started": {
+      "parameters": [
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } },
+        { "name": "attempt_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "startAttempt",
+        "summary": "Acknowledge authoritative OCI Started idempotently",
+        "description": "This is the sole claimed-to-running transition for OCI attempts.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false, "required": ["fencing_token"],
+          "properties": { "fencing_token": { "type": "string", "minLength": 1 } }
+        } } } },
+        "responses": {
+          "200": { "description": "Started accepted or identically replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
     "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/logs": {
       "parameters": [
         { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } },

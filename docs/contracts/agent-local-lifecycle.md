@@ -25,7 +25,9 @@ semantic code.
 The `attempts` map is keyed by attempt ID. Each entry carries job ID, workload
 class, local state, and its last error:
 
-- `starting`: admitted locally but the runner has not begun;
+- `starting`: admitted locally but the payload has not begun; for `kind=oci`
+  this includes image resolution, pull/import, unpack, spec construction, and
+  `Wait` registration before the helper's authoritative `Started` event;
 - `running`: the payload and its authority watchdog are resident;
 - `reaping`: authority or outer cancellation was issued and the agent is
   waiting for the runner to prove the payload is gone;

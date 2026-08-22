@@ -8,19 +8,20 @@ import (
 )
 
 const (
-	DefaultClientPrincipalTag             = "tag:wefty-client"
-	DefaultAgentPrincipalTag              = "tag:wefty-agent"
-	DefaultLeaseDuration                  = 30 * time.Second
-	DefaultLateEvidenceWindow             = 48 * time.Hour
-	DefaultNodeStaleAfter                 = 45 * time.Second
-	DefaultNodeDeadAfter                  = 2 * time.Minute
-	DefaultReconcileInterval              = time.Second
-	DefaultServiceStabilityWindow         = 2 * time.Minute
-	DefaultServiceLogRetentionAge         = 7 * 24 * time.Hour
-	DefaultServiceLogRetentionBytes int64 = 32 << 20
-	DefaultServiceAttemptSummaries        = 32
-	DefaultMaxOneshotSlots                = 4
-	DefaultMaxServiceSlots                = 2
+	DefaultClientPrincipalTag                 = "tag:wefty-client"
+	DefaultAgentPrincipalTag                  = "tag:wefty-agent"
+	DefaultLeaseDuration                      = 30 * time.Second
+	DefaultLateEvidenceWindow                 = 48 * time.Hour
+	DefaultNodeStaleAfter                     = 45 * time.Second
+	DefaultNodeDeadAfter                      = 2 * time.Minute
+	DefaultReconcileInterval                  = time.Second
+	DefaultServiceStabilityWindow             = 2 * time.Minute
+	DefaultServiceLogRetentionAge             = 7 * 24 * time.Hour
+	DefaultServiceLogRetentionBytes     int64 = 32 << 20
+	DefaultServiceAttemptSummaries            = 32
+	DefaultMaxOneshotSlots                    = 4
+	DefaultMaxServiceSlots                    = 2
+	DefaultPrestartInfrastructureBudget       = 10 * time.Minute
 )
 
 // Clock supplies all control-plane timestamps used by lease logic.
@@ -65,6 +66,7 @@ type Attempt struct {
 	LeaseExpiresAt time.Time             `json:"lease_expires_at"`
 	Result         *ProcessResult        `json:"result,omitempty"`
 	LateResult     *LateResultEvidence   `json:"late_result,omitempty"`
+	Image          *OCIImageEvidence     `json:"image,omitempty"`
 	CreatedAt      time.Time             `json:"created_at"`
 	UpdatedAt      time.Time             `json:"updated_at"`
 }
@@ -192,10 +194,49 @@ type NodeList struct {
 // signal outcomes carry a structured termination initiator.
 type ProcessResult struct {
 	SpawnError       *contract.SpawnFailure    `json:"spawn_error,omitempty"`
+	RuntimeFailure   *contract.RuntimeFailure  `json:"runtime_failure,omitempty"`
 	OutputError      string                    `json:"output_error,omitempty"`
 	ExitCode         *int                      `json:"exit_code,omitempty"`
 	Signal           string                    `json:"signal,omitempty"`
 	TerminationCause contract.TerminationCause `json:"termination_cause,omitempty"`
+	OOM              bool                      `json:"oom,omitempty"`
+}
+
+// OCIImageEvidence is the fenced image and runtime identity observed before
+// an OCI attempt starts. ResolvedAt and StartedAt use the L1 clock.
+type OCIImageEvidence struct {
+	SubmittedReference     string      `json:"submitted_reference"`
+	TopLevelDigest         string      `json:"top_level_digest"`
+	TopLevelMediaType      string      `json:"top_level_media_type"`
+	IndexDigest            *string     `json:"index_digest"`
+	PlatformManifestDigest string      `json:"platform_manifest_digest"`
+	Platform               OCIPlatform `json:"platform"`
+	RuntimeHandler         string      `json:"runtime_handler"`
+	Snapshotter            string      `json:"snapshotter"`
+	ResolvedAt             time.Time   `json:"resolved_at"`
+	StartedAt              *time.Time  `json:"started_at,omitempty"`
+}
+
+type OCIPlatform struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	Variant      string `json:"variant,omitempty"`
+}
+
+type ImageObservationRequest struct {
+	FencingToken           string      `json:"fencing_token"`
+	SubmittedReference     string      `json:"submitted_reference"`
+	TopLevelDigest         string      `json:"top_level_digest"`
+	TopLevelMediaType      string      `json:"top_level_media_type"`
+	IndexDigest            *string     `json:"index_digest,omitempty"`
+	PlatformManifestDigest string      `json:"platform_manifest_digest"`
+	Platform               OCIPlatform `json:"platform"`
+	RuntimeHandler         string      `json:"runtime_handler"`
+	Snapshotter            string      `json:"snapshotter"`
+}
+
+type StartedRequest struct {
+	FencingToken string `json:"fencing_token"`
 }
 
 type CompletionRequest struct {

@@ -48,6 +48,9 @@ func TestStateTransitionRules(t *testing.T) {
 	if CanTransition(JobTransitions, JobRunning, JobQueued) || CanTransition(JobTransitions, JobFailed, JobQueued) {
 		t.Fatal("service restart transitions must not leak into the one-shot state machine")
 	}
+	if !CanTransition(JobTransitions, JobClaimed, JobQueued) {
+		t.Fatal("claimed one-shot must be able to requeue after pre-Started infrastructure loss")
+	}
 	if _, persisted := ServiceJobTransitions[JobState("restart-pending")]; persisted {
 		t.Fatal("restart-pending is a computed projection, not a persisted state")
 	}

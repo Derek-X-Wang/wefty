@@ -75,4 +75,13 @@ func TestServiceAcceptanceJobSpecSchemaAndProcessResult(t *testing.T) {
 	if got, want := string(encoded), `{"signal":"terminated","termination_cause":"guardian"}`; got != want {
 		t.Fatalf("ProcessResult JSON = %s, want %s", got, want)
 	}
+	encoded, err = json.Marshal(ProcessResult{
+		RuntimeFailure: &RuntimeFailure{Code: RuntimeFailureUnavailable, Message: "engine lost"}, OOM: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(encoded), `{"runtime_failure":{"code":"runtime_unavailable","message":"engine lost"},"oom":true}`; got != want {
+		t.Fatalf("OCI ProcessResult JSON = %s, want %s", got, want)
+	}
 }
