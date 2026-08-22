@@ -287,6 +287,15 @@ receive `422 unsupported_runtime_handler`.
 Environment names on both process and OCI arms follow the portable
 `[A-Za-z_][A-Za-z0-9_]*` grammar before L1 accepts the job.
 
+The operator CLI keeps image work in the existing command families. `submit`
+accepts exactly one of a saved Workflow, inline script, or image. `services
+create` accepts script or image, resolves an unpinned public image reference by
+registry manifest `HEAD`, and sends the returned top-level
+`Docker-Content-Digest`; L1 validates the service digest before applying its
+temporary OCI-support gate. Repeatable mounts require `--node` or exactly one
+explicit stable-node routing tag at the CLI, and the same Pinned invariant is
+rechecked independently by L3 and L1.
+
 Runtime support remains separate from wire validity. Until capability-aware OCI
 claiming lands in Ticket 3 (#135), L1 returns `422 unsupported_kind` for every
 non-process job so today's process-only agents cannot claim it. After that

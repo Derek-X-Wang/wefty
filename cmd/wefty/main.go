@@ -129,7 +129,7 @@ Commands:
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   services <verb>            Create and operate service-class jobs
     create|list|status|start|stop|restart|logs|remove|forget
-  submit                     Submit a saved or inline workflow
+  submit                     Submit a saved, inline-script, or image workflow
   rerun RUN_ID               Create a new run from a stored snapshot
   logs RUN_ID [--follow]     Read or follow run logs
   inspect RUN_ID [--execution]

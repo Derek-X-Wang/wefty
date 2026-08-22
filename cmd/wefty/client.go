@@ -19,8 +19,9 @@ import (
 )
 
 type apiClients struct {
-	l1 *apiClient
-	l3 *apiClient
+	l1     *apiClient
+	l3     *apiClient
+	images imageDigestResolver
 }
 
 type apiClient struct {
@@ -46,8 +47,9 @@ func newAPIClients(participant fabric.Fabric, l1Address, l3Address string) (*api
 		return nil, fmt.Errorf("wefty: L1 and L3 addresses are required")
 	}
 	return &apiClients{
-		l1: newAPIClient("L1", participant, l1Address),
-		l3: newAPIClient("L3", participant, l3Address),
+		l1:     newAPIClient("L1", participant, l1Address),
+		l3:     newAPIClient("L3", participant, l3Address),
+		images: newRegistryResolver(nil),
 	}, nil
 }
 

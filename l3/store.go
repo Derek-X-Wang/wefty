@@ -108,6 +108,14 @@ CREATE TRIGGER IF NOT EXISTS run_scripts_no_update
 BEFORE UPDATE ON run_scripts BEGIN SELECT RAISE(ABORT, 'inline scripts are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS run_scripts_no_delete
 BEFORE DELETE ON run_scripts BEGIN SELECT RAISE(ABORT, 'inline scripts are immutable'); END;
+CREATE TABLE IF NOT EXISTS run_images (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
+  program_json BLOB NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS run_images_no_update
+BEFORE UPDATE ON run_images BEGIN SELECT RAISE(ABORT, 'image programs are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS run_images_no_delete
+BEFORE DELETE ON run_images BEGIN SELECT RAISE(ABORT, 'image programs are immutable'); END;
 CREATE TABLE IF NOT EXISTS run_workflow_refs (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
   workflow_ref TEXT NOT NULL
@@ -130,6 +138,17 @@ CREATE TRIGGER IF NOT EXISTS workflow_versions_no_update
 BEFORE UPDATE ON workflow_versions BEGIN SELECT RAISE(ABORT, 'workflow versions are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS workflow_versions_no_delete
 BEFORE DELETE ON workflow_versions BEGIN SELECT RAISE(ABORT, 'workflow versions are immutable'); END;
+CREATE TABLE IF NOT EXISTS workflow_image_versions (
+  workflow_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  program_json BLOB NOT NULL,
+  created_ns INTEGER NOT NULL,
+  PRIMARY KEY(workflow_id, version)
+);
+CREATE TRIGGER IF NOT EXISTS workflow_image_versions_no_update
+BEFORE UPDATE ON workflow_image_versions BEGIN SELECT RAISE(ABORT, 'workflow image versions are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS workflow_image_versions_no_delete
+BEFORE DELETE ON workflow_image_versions BEGIN SELECT RAISE(ABORT, 'workflow image versions are immutable'); END;
 CREATE TABLE IF NOT EXISTS run_triggers (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
   actor TEXT NOT NULL,
@@ -328,6 +347,7 @@ type workflowSnapshot struct {
 	SHA256      string
 	Interpreter []string
 	Mode        uint32
+	Image       *contract.ImageProgram
 }
 
 // CreateWorkflowVersion appends an immutable version and assigns the next
@@ -337,9 +357,24 @@ func (s *Store) CreateWorkflowVersion(ctx context.Context, workflowID string, in
 	if err != nil {
 		return WorkflowVersion{}, err
 	}
-	mode, err := normalizeScript(input.Content, input.SHA256, input.Interpreter, input.Mode, "workflow version")
-	if err != nil {
-		return WorkflowVersion{}, err
+	hasScript := input.Content != "" || input.SHA256 != "" || len(input.Interpreter) > 0 || input.Mode != nil
+	if hasScript == (input.Image != nil) {
+		return WorkflowVersion{}, protocolError(contract.ErrorInvalidRequest, "workflow version requires exactly one script or image program")
+	}
+	mode := uint32(0)
+	if hasScript {
+		mode, err = normalizeScript(input.Content, input.SHA256, input.Interpreter, input.Mode, "workflow version")
+		if err != nil {
+			return WorkflowVersion{}, err
+		}
+	} else {
+		validationTags := []string(nil)
+		if len(input.Image.Mounts) > 0 {
+			validationTags = []string{contract.StableNodeTagPrefix + "saved-workflow"}
+		}
+		if err := contract.ValidateImageProgram(*input.Image, contract.JobClassService, validationTags); err != nil {
+			return WorkflowVersion{}, protocolError(contract.ErrorInvalidRequest, "image program: %v", err)
+		}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -347,14 +382,29 @@ func (s *Store) CreateWorkflowVersion(ctx context.Context, workflowID string, in
 	}
 	defer tx.Rollback()
 	var version int
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) + 1 FROM workflow_versions WHERE workflow_id=?`, workflowID).Scan(&version); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) + 1 FROM (
+SELECT version FROM workflow_versions WHERE workflow_id=?
+UNION ALL
+SELECT version FROM workflow_image_versions WHERE workflow_id=?
+)`, workflowID, workflowID).Scan(&version); err != nil {
 		return WorkflowVersion{}, internalError(err, "assign workflow version")
 	}
-	interpreterJSON, _ := json.Marshal(nonNilStrings(input.Interpreter))
 	now := canonicalTime(s.clock.Now())
-	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_versions(workflow_id, version, content, sha256, interpreter_json, mode, created_ns) VALUES(?, ?, ?, ?, ?, ?, ?)`,
-		workflowID, version, []byte(input.Content), input.SHA256, interpreterJSON, mode, now.UnixNano()); err != nil {
-		return WorkflowVersion{}, internalError(err, "store workflow version")
+	if hasScript {
+		interpreterJSON, _ := json.Marshal(nonNilStrings(input.Interpreter))
+		if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_versions(workflow_id, version, content, sha256, interpreter_json, mode, created_ns) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+			workflowID, version, []byte(input.Content), input.SHA256, interpreterJSON, mode, now.UnixNano()); err != nil {
+			return WorkflowVersion{}, internalError(err, "store workflow version")
+		}
+	} else {
+		programJSON, err := json.Marshal(input.Image)
+		if err != nil {
+			return WorkflowVersion{}, internalError(err, "encode workflow image program")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_image_versions(workflow_id, version, program_json, created_ns) VALUES(?, ?, ?, ?)`,
+			workflowID, version, programJSON, now.UnixNano()); err != nil {
+			return WorkflowVersion{}, internalError(err, "store workflow image version")
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return WorkflowVersion{}, internalError(err, "commit workflow version")
@@ -375,21 +425,34 @@ func (s *Store) GetWorkflowVersion(ctx context.Context, workflowID string, versi
 	var createdNS int64
 	err = s.db.QueryRowContext(ctx, `SELECT content, sha256, interpreter_json, mode, created_ns FROM workflow_versions WHERE workflow_id=? AND version=?`, workflowID, version).
 		Scan(&content, &record.SHA256, &interpreterJSON, &record.Mode, &createdNS)
-	if errors.Is(err, sql.ErrNoRows) {
-		return WorkflowVersion{}, protocolError(contract.ErrorNotFound, "workflow %q version v%d was not found", workflowID, version)
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return WorkflowVersion{}, internalError(err, "read workflow version")
 	}
 	record.WorkflowID = workflowID
 	record.Version = version
 	record.WorkflowRef = pinnedWorkflowRef(workflowID, version)
-	record.Content = string(content)
-	if err := json.Unmarshal(interpreterJSON, &record.Interpreter); err != nil {
-		return WorkflowVersion{}, internalError(err, "decode workflow interpreter")
-	}
-	if record.Interpreter == nil {
-		record.Interpreter = []string{}
+	if err == nil {
+		record.Content = string(content)
+		if err := json.Unmarshal(interpreterJSON, &record.Interpreter); err != nil {
+			return WorkflowVersion{}, internalError(err, "decode workflow interpreter")
+		}
+		if record.Interpreter == nil {
+			record.Interpreter = []string{}
+		}
+	} else {
+		var programJSON []byte
+		err = s.db.QueryRowContext(ctx, `SELECT program_json, created_ns FROM workflow_image_versions WHERE workflow_id=? AND version=?`, workflowID, version).
+			Scan(&programJSON, &createdNS)
+		if errors.Is(err, sql.ErrNoRows) {
+			return WorkflowVersion{}, protocolError(contract.ErrorNotFound, "workflow %q version v%d was not found", workflowID, version)
+		}
+		if err != nil {
+			return WorkflowVersion{}, internalError(err, "read workflow image version")
+		}
+		record.Image = &contract.ImageProgram{}
+		if err := json.Unmarshal(programJSON, record.Image); err != nil {
+			return WorkflowVersion{}, internalError(err, "decode workflow image program")
+		}
 	}
 	record.CreatedAt = time.Unix(0, createdNS).UTC()
 	return record, nil
@@ -438,25 +501,56 @@ func resolveWorkflowTx(ctx context.Context, tx *sql.Tx, ref string) (workflowSna
 	if err != nil {
 		return workflowSnapshot{}, "", err
 	}
-	var snapshot workflowSnapshot
-	var interpreterJSON []byte
 	if version == 0 {
-		err = tx.QueryRowContext(ctx, `SELECT version, content, sha256, interpreter_json, mode FROM workflow_versions WHERE workflow_id=? ORDER BY version DESC LIMIT 1`, workflowID).
-			Scan(&version, &snapshot.Content, &snapshot.SHA256, &interpreterJSON, &snapshot.Mode)
-	} else {
-		err = tx.QueryRowContext(ctx, `SELECT content, sha256, interpreter_json, mode FROM workflow_versions WHERE workflow_id=? AND version=?`, workflowID, version).
-			Scan(&snapshot.Content, &snapshot.SHA256, &interpreterJSON, &snapshot.Mode)
+		err = tx.QueryRowContext(ctx, `SELECT version FROM (
+SELECT version FROM workflow_versions WHERE workflow_id=?
+UNION ALL
+SELECT version FROM workflow_image_versions WHERE workflow_id=?
+) ORDER BY version DESC LIMIT 1`, workflowID, workflowID).Scan(&version)
+		if errors.Is(err, sql.ErrNoRows) {
+			return workflowSnapshot{}, "", protocolError(contract.ErrorNotFound, "workflow_ref %q was not found", ref)
+		}
+		if err != nil {
+			return workflowSnapshot{}, "", internalError(err, "resolve workflow_ref version")
+		}
 	}
+	snapshot, err := readWorkflowSnapshotTx(ctx, tx, workflowID, version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return workflowSnapshot{}, "", protocolError(contract.ErrorNotFound, "workflow_ref %q was not found", ref)
 	}
 	if err != nil {
-		return workflowSnapshot{}, "", internalError(err, "resolve workflow_ref")
-	}
-	if err := json.Unmarshal(interpreterJSON, &snapshot.Interpreter); err != nil {
-		return workflowSnapshot{}, "", internalError(err, "decode resolved workflow interpreter")
+		return workflowSnapshot{}, "", err
 	}
 	return snapshot, pinnedWorkflowRef(workflowID, version), nil
+}
+
+func readWorkflowSnapshotTx(ctx context.Context, tx *sql.Tx, workflowID string, version int) (workflowSnapshot, error) {
+	var snapshot workflowSnapshot
+	var interpreterJSON []byte
+	err := tx.QueryRowContext(ctx, `SELECT content, sha256, interpreter_json, mode FROM workflow_versions WHERE workflow_id=? AND version=?`, workflowID, version).
+		Scan(&snapshot.Content, &snapshot.SHA256, &interpreterJSON, &snapshot.Mode)
+	if err == nil {
+		if err := json.Unmarshal(interpreterJSON, &snapshot.Interpreter); err != nil {
+			return workflowSnapshot{}, internalError(err, "decode resolved workflow interpreter")
+		}
+		return snapshot, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return workflowSnapshot{}, internalError(err, "resolve workflow_ref")
+	}
+	var programJSON []byte
+	err = tx.QueryRowContext(ctx, `SELECT program_json FROM workflow_image_versions WHERE workflow_id=? AND version=?`, workflowID, version).Scan(&programJSON)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return workflowSnapshot{}, sql.ErrNoRows
+		}
+		return workflowSnapshot{}, internalError(err, "resolve workflow image_ref")
+	}
+	snapshot.Image = &contract.ImageProgram{}
+	if err := json.Unmarshal(programJSON, snapshot.Image); err != nil {
+		return workflowSnapshot{}, internalError(err, "decode resolved workflow image program")
+	}
+	return snapshot, nil
 }
 
 // CreateRun atomically commits the run, immutable script, trigger provenance,
@@ -506,10 +600,17 @@ func (s *Store) CreateRun(ctx context.Context, input CreateRunInput) (record con
 			Content: []byte(input.Request.InlineScript.Content), SHA256: input.Request.InlineScript.SHA256,
 			Interpreter: input.Request.InlineScript.Interpreter, Mode: mode,
 		}
+	} else if input.Request.Image != nil {
+		snapshot.Image = input.Request.Image
 	} else {
 		snapshot, workflowRef, err = resolveWorkflowTx(ctx, tx, input.Request.WorkflowRef)
 		if err != nil {
 			return contract.RunRecord{}, false, err
+		}
+	}
+	if snapshot.Image != nil {
+		if err := contract.ValidateImageProgram(*snapshot.Image, contract.JobClassOneShot, input.Request.Tags); err != nil {
+			return contract.RunRecord{}, false, protocolError(contract.ErrorInvalidRequest, "image program: %v", err)
 		}
 	}
 
@@ -529,11 +630,21 @@ VALUES(?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, input.Request
 	if err != nil {
 		return contract.RunRecord{}, false, internalError(err, "store run")
 	}
-	interpreterJSON, _ := json.Marshal(nonNilStrings(snapshot.Interpreter))
-	_, err = tx.ExecContext(ctx, `INSERT INTO run_scripts(run_id, content, sha256, interpreter_json, mode) VALUES(?, ?, ?, ?, ?)`,
-		runID, snapshot.Content, snapshot.SHA256, interpreterJSON, snapshot.Mode)
-	if err != nil {
-		return contract.RunRecord{}, false, internalError(err, "store immutable run script snapshot")
+	if snapshot.Image == nil {
+		interpreterJSON, _ := json.Marshal(nonNilStrings(snapshot.Interpreter))
+		_, err = tx.ExecContext(ctx, `INSERT INTO run_scripts(run_id, content, sha256, interpreter_json, mode) VALUES(?, ?, ?, ?, ?)`,
+			runID, snapshot.Content, snapshot.SHA256, interpreterJSON, snapshot.Mode)
+		if err != nil {
+			return contract.RunRecord{}, false, internalError(err, "store immutable run script snapshot")
+		}
+	} else {
+		programJSON, err := json.Marshal(snapshot.Image)
+		if err != nil {
+			return contract.RunRecord{}, false, internalError(err, "encode immutable run image snapshot")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO run_images(run_id, program_json) VALUES(?, ?)`, runID, programJSON); err != nil {
+			return contract.RunRecord{}, false, internalError(err, "store immutable run image snapshot")
+		}
 	}
 	if workflowRef != "" {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO run_workflow_refs(run_id, workflow_ref) VALUES(?, ?)`, runID, workflowRef); err != nil {
@@ -605,20 +716,37 @@ func (s *Store) CreateRerun(ctx context.Context, input CreateRerunInput) (record
 	var paramsJSON, tagsJSON, limitsJSON, envelopeSchemaJSON []byte
 	var requiredEnvelope bool
 	var snapshot workflowSnapshot
-	var interpreterJSON []byte
+	var content, interpreterJSON, imageJSON []byte
+	var sha sql.NullString
+	var mode sql.NullInt64
 	var workflowRef sql.NullString
 	err = tx.QueryRowContext(ctx, `
 SELECT r.params_json, r.tags_json, r.limits_json, r.envelope_schema_json, r.required_envelope,
-       s.content, s.sha256, s.interpreter_json, s.mode, w.workflow_ref
-FROM runs r JOIN run_scripts s ON s.run_id=r.run_id
+       s.content, s.sha256, s.interpreter_json, s.mode, i.program_json, w.workflow_ref
+FROM runs r LEFT JOIN run_scripts s ON s.run_id=r.run_id
+LEFT JOIN run_images i ON i.run_id=r.run_id
 LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
 WHERE r.run_id=?`, input.SourceRunID).Scan(&paramsJSON, &tagsJSON, &limitsJSON, &envelopeSchemaJSON, &requiredEnvelope,
-		&snapshot.Content, &snapshot.SHA256, &interpreterJSON, &snapshot.Mode, &workflowRef)
+		&content, &sha, &interpreterJSON, &mode, &imageJSON, &workflowRef)
 	if errors.Is(err, sql.ErrNoRows) {
 		return contract.RunRecord{}, false, protocolError(contract.ErrorNotFound, "run %q was not found", input.SourceRunID)
 	}
 	if err != nil {
 		return contract.RunRecord{}, false, internalError(err, "read rerun source snapshot")
+	}
+	if len(imageJSON) > 0 {
+		snapshot.Image = &contract.ImageProgram{}
+		if err := json.Unmarshal(imageJSON, snapshot.Image); err != nil {
+			return contract.RunRecord{}, false, internalError(err, "decode rerun image snapshot")
+		}
+		if snapshot.Image.Digest == nil {
+			return contract.RunRecord{}, false, protocolError(contract.ErrorNoResolvedImageSnapshot,
+				"run %q has no resolved image snapshot", input.SourceRunID)
+		}
+	} else {
+		snapshot.Content = content
+		snapshot.SHA256 = sha.String
+		snapshot.Mode = uint32(mode.Int64)
 	}
 	var sourceTags []string
 	if err := json.Unmarshal(tagsJSON, &sourceTags); err != nil {
@@ -645,9 +773,15 @@ VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, dispatchKey, input.Ide
 	if err != nil {
 		return contract.RunRecord{}, false, internalError(err, "store rerun")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO run_scripts(run_id, content, sha256, interpreter_json, mode) VALUES(?, ?, ?, ?, ?)`,
-		runID, snapshot.Content, snapshot.SHA256, interpreterJSON, snapshot.Mode); err != nil {
-		return contract.RunRecord{}, false, internalError(err, "store rerun script snapshot")
+	if snapshot.Image == nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO run_scripts(run_id, content, sha256, interpreter_json, mode) VALUES(?, ?, ?, ?, ?)`,
+			runID, snapshot.Content, snapshot.SHA256, interpreterJSON, snapshot.Mode); err != nil {
+			return contract.RunRecord{}, false, internalError(err, "store rerun script snapshot")
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO run_images(run_id, program_json) VALUES(?, ?)`, runID, imageJSON); err != nil {
+			return contract.RunRecord{}, false, internalError(err, "store rerun image snapshot")
+		}
 	}
 	if workflowRef.Valid {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO run_workflow_refs(run_id, workflow_ref) VALUES(?, ?)`, runID, workflowRef.String); err != nil {
@@ -679,11 +813,18 @@ func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, e
 	}
 	request := &input.Request
 	request.WorkflowRef = strings.TrimSpace(request.WorkflowRef)
-	if request.WorkflowRef != "" && request.InlineScript != nil {
-		return input, "", 0, protocolError(contract.ErrorInvalidRequest, "workflow_ref and inline_script are mutually exclusive")
+	sources := 0
+	if request.WorkflowRef != "" {
+		sources++
 	}
-	if request.WorkflowRef == "" && request.InlineScript == nil {
-		return input, "", 0, protocolError(contract.ErrorInvalidRequest, "exactly one of workflow_ref or inline_script is required")
+	if request.InlineScript != nil {
+		sources++
+	}
+	if request.Image != nil {
+		sources++
+	}
+	if sources != 1 {
+		return input, "", 0, protocolError(contract.ErrorInvalidRequest, "exactly one of workflow_ref, inline_script, or image is required")
 	}
 	mode := uint32(0)
 	var err error
@@ -692,8 +833,10 @@ func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, e
 		if err != nil {
 			return input, "", 0, err
 		}
-	} else if _, _, err := parseWorkflowRef(request.WorkflowRef); err != nil {
-		return input, "", 0, err
+	} else if request.WorkflowRef != "" {
+		if _, _, err := parseWorkflowRef(request.WorkflowRef); err != nil {
+			return input, "", 0, err
+		}
 	}
 	params, err := canonicalObject(request.Params, true, "params")
 	if err != nil {
@@ -712,6 +855,11 @@ func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, e
 	request.Tags, err = normalizeTags(request.Tags)
 	if err != nil {
 		return input, "", 0, err
+	}
+	if request.Image != nil {
+		if err := contract.ValidateImageProgram(*request.Image, contract.JobClassOneShot, request.Tags); err != nil {
+			return input, "", 0, protocolError(contract.ErrorInvalidRequest, "image program: %v", err)
+		}
 	}
 	if request.Limits != nil {
 		if request.Limits.MaxRuntimeSeconds < 0 || request.Limits.MaxCost < 0 {
@@ -791,26 +939,28 @@ func normalizeTags(tags []string) ([]string, error) {
 	return normalized, nil
 }
 
-// GetRun returns the public contract record reconstructed from immutable
-// script and trigger rows.
+// GetRun returns the public contract record reconstructed from its immutable
+// typed program and trigger rows.
 func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, error) {
 	var record contract.RunRecord
 	var parent, l1JobID, nodeID, sourceRun, workflowRef sql.NullString
 	var paramsJSON, tagsJSON []byte
 	var limitsJSON []byte
-	var content []byte
-	var actor, source, sha string
+	var content, imageJSON []byte
+	var actor, source string
+	var sha sql.NullString
 	var createdNS, updatedNS int64
 	var startedNS, finishedNS sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `
 SELECT r.run_id, r.parent_run_id, r.l1_job_id, r.node_id, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
        r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
-       s.content, s.sha256, w.workflow_ref, t.actor, t.source, t.source_run_id
-FROM runs r JOIN run_scripts s ON s.run_id=r.run_id
+       s.content, s.sha256, i.program_json, w.workflow_ref, t.actor, t.source, t.source_run_id
+FROM runs r LEFT JOIN run_scripts s ON s.run_id=r.run_id
+LEFT JOIN run_images i ON i.run_id=r.run_id
 LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
 WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
-		&createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &workflowRef, &actor, &source, &sourceRun)
+		&createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &imageJSON, &workflowRef, &actor, &source, &sourceRun)
 	if errors.Is(err, sql.ErrNoRows) {
 		return contract.RunRecord{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
 	}
@@ -837,8 +987,13 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &recor
 	record.Trigger = contract.Trigger{Type: source, Principal: actor, SourceRunID: sourceRun.String}
 	if workflowRef.Valid {
 		record.Workflow = contract.WorkflowSource{WorkflowRef: workflowRef.String}
+	} else if len(imageJSON) > 0 {
+		record.Workflow.Image = &contract.ImageProgram{}
+		if err := json.Unmarshal(imageJSON, record.Workflow.Image); err != nil {
+			return contract.RunRecord{}, internalError(err, "decode run image snapshot")
+		}
 	} else {
-		record.Workflow = contract.WorkflowSource{InlineScript: &contract.InlineScript{Content: string(content), SHA256: sha}}
+		record.Workflow = contract.WorkflowSource{InlineScript: &contract.InlineScript{Content: string(content), SHA256: sha.String}}
 	}
 	record.CreatedAt = time.Unix(0, createdNS).UTC()
 	record.UpdatedAt = time.Unix(0, updatedNS).UTC()
@@ -1297,6 +1452,7 @@ type dispatchIntent struct {
 	SHA256         string
 	Interpreter    []string
 	Mode           uint32
+	Image          *contract.ImageProgram
 	Tags           []string
 	Limits         *contract.RunLimits
 }
@@ -1305,8 +1461,9 @@ func (s *Store) pendingDispatches(ctx context.Context) ([]dispatchIntent, error)
 	rows, err := s.db.QueryContext(ctx, `
 SELECT r.run_id, r.dispatch_key, COALESCE(r.parent_run_id, ''),
        CASE WHEN t.source='rerun' THEN t.source_run_id ELSE r.run_id END,
-       s.content, s.sha256, s.interpreter_json, s.mode, r.tags_json, r.limits_json
-FROM dispatch_outbox o JOIN runs r ON r.run_id=o.run_id JOIN run_scripts s ON s.run_id=r.run_id
+       s.content, s.sha256, s.interpreter_json, s.mode, i.program_json, r.tags_json, r.limits_json
+FROM dispatch_outbox o JOIN runs r ON r.run_id=o.run_id LEFT JOIN run_scripts s ON s.run_id=r.run_id
+LEFT JOIN run_images i ON i.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
 WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?) ORDER BY r.created_ns, r.run_id`, contract.RunPending, contract.RunDispatching)
 	if err != nil {
@@ -1316,12 +1473,24 @@ WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?) ORDER BY r.created_ns, r.ru
 	var intents []dispatchIntent
 	for rows.Next() {
 		var intent dispatchIntent
-		var interpreterJSON, tagsJSON, limitsJSON []byte
-		if err := rows.Scan(&intent.RunID, &intent.DispatchKey, &intent.ParentRunID, &intent.HandoffOwnerID, &intent.Content, &intent.SHA256, &interpreterJSON, &intent.Mode, &tagsJSON, &limitsJSON); err != nil {
+		var content, interpreterJSON, imageJSON, tagsJSON, limitsJSON []byte
+		var sha sql.NullString
+		var mode sql.NullInt64
+		if err := rows.Scan(&intent.RunID, &intent.DispatchKey, &intent.ParentRunID, &intent.HandoffOwnerID, &content, &sha, &interpreterJSON, &mode, &imageJSON, &tagsJSON, &limitsJSON); err != nil {
 			return nil, internalError(err, "scan pending dispatch")
 		}
-		if err := json.Unmarshal(interpreterJSON, &intent.Interpreter); err != nil {
-			return nil, internalError(err, "decode dispatch interpreter")
+		if len(imageJSON) > 0 {
+			intent.Image = &contract.ImageProgram{}
+			if err := json.Unmarshal(imageJSON, intent.Image); err != nil {
+				return nil, internalError(err, "decode dispatch image program")
+			}
+		} else {
+			intent.Content = content
+			intent.SHA256 = sha.String
+			intent.Mode = uint32(mode.Int64)
+			if err := json.Unmarshal(interpreterJSON, &intent.Interpreter); err != nil {
+				return nil, internalError(err, "decode dispatch interpreter")
+			}
 		}
 		if err := json.Unmarshal(tagsJSON, &intent.Tags); err != nil {
 			return nil, internalError(err, "decode dispatch tags")
@@ -1593,6 +1762,36 @@ func (intent dispatchIntent) jobSpec(runToken string) contract.JobSpec {
 	if intent.Limits != nil && intent.Limits.MaxRuntimeSeconds > 0 {
 		limits = &contract.JobLimits{MaxRuntimeSeconds: intent.Limits.MaxRuntimeSeconds}
 	}
+	if intent.Image != nil {
+		program := intent.Image
+		return contract.JobSpec{
+			SchemaVersion:  contract.SchemaVersionV1,
+			DispatchKey:    intent.DispatchKey,
+			Kind:           contract.JobKindOCI,
+			Class:          contract.JobClassOneShot,
+			RuntimeHandler: program.RuntimeHandler,
+			RoutingTags:    append([]string(nil), intent.Tags...),
+			Execution: contract.ExecutionSpec{
+				Env: map[string]string{
+					contract.EnvRunID: intent.RunID, contract.EnvL3Endpoint: DefaultL3Address,
+					contract.EnvHandoffDir: contract.OCIContainerHandoffDirectory,
+				},
+				SensitiveEnv: map[string]string{contract.EnvRunToken: runToken},
+				OCI: &contract.OCIExecutionSpec{
+					Image: contract.OCIImageSpec{
+						Reference: program.Reference,
+						Digest:    cloneStringPointer(program.Digest),
+					},
+					Argv:             append([]string(nil), program.Argv...),
+					WorkingDirectory: cloneStringPointer(program.WorkingDirectory),
+					Mounts:           append([]contract.OCIMount(nil), program.Mounts...),
+					Limits:           cloneOCILimits(program.Limits),
+				},
+			},
+			Limits: limits,
+			Labels: labels,
+		}
+	}
 	return contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   intent.DispatchKey,
@@ -1616,6 +1815,32 @@ func (intent dispatchIntent) jobSpec(runToken string) contract.JobSpec {
 		Limits: limits,
 		Labels: labels,
 	}
+}
+
+func cloneStringPointer(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneOCILimits(value *contract.OCILimits) *contract.OCILimits {
+	if value == nil {
+		return nil
+	}
+	return &contract.OCILimits{
+		MemoryBytes:   cloneInt64Pointer(value.MemoryBytes),
+		CPUMillicores: cloneInt64Pointer(value.CPUMillicores),
+	}
+}
+
+func cloneInt64Pointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func encodeBase64(content []byte) string {

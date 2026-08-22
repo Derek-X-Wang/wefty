@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -258,6 +259,30 @@ type loseSubmitResponseClient struct {
 	submitted l1.Job
 }
 
+type recordingJobClient struct {
+	specs []contract.JobSpec
+	jobs  map[string]l1.Job
+}
+
+func (c *recordingJobClient) SubmitJob(_ context.Context, spec contract.JobSpec) (l1.Job, error) {
+	if c.jobs == nil {
+		c.jobs = make(map[string]l1.Job)
+	}
+	jobID := fmt.Sprintf("job-image-%d", len(c.specs)+1)
+	job := l1.Job{JobID: jobID, State: contract.JobQueued, Spec: spec}
+	c.specs = append(c.specs, spec)
+	c.jobs[jobID] = job
+	return job, nil
+}
+
+func (c *recordingJobClient) GetJob(_ context.Context, jobID string) (l1.Job, error) {
+	job, ok := c.jobs[jobID]
+	if !ok {
+		return l1.Job{}, errors.New("job not found")
+	}
+	return job, nil
+}
+
 type permanentSubmitErrorClient struct {
 	JobClient
 	runID string
@@ -446,6 +471,136 @@ func TestInlineScriptAndTriggerProvenanceAreImmutable(t *testing.T) {
 	}
 	if !jsonEqual(envelopeSchema, request.EnvelopeSchema) {
 		t.Fatalf("stored envelope schema = %s, want %s", envelopeSchema, request.EnvelopeSchema)
+	}
+}
+
+func TestImageProgramGoldenSnapshotDispatchAndRerun(t *testing.T) {
+	h := newIntegrationHarness(t)
+	digest := "sha256:" + strings.Repeat("a", 64)
+	workingDirectory := "/workspace/project"
+	memoryBytes := int64(536870912)
+	cpuMillicores := int64(750)
+	program := &contract.ImageProgram{
+		Reference:        "ghcr.io/example/agent:v3",
+		Digest:           &digest,
+		Argv:             []string{"agent", "--work", "ticket-134"},
+		WorkingDirectory: &workingDirectory,
+		Mounts: []contract.OCIMount{
+			{NodePath: "/srv/source", ContainerPath: "/workspace/source"},
+			{NodePath: "/srv/config", ContainerPath: "/workspace/config", ReadOnly: true},
+		},
+		Limits:         &contract.OCILimits{MemoryBytes: &memoryBytes, CPUMillicores: &cpuMillicores},
+		RuntimeHandler: "io.containerd.runc.v2",
+	}
+	request := CreateRunRequest{
+		Image: program, Params: json.RawMessage(`{"ticket":134}`),
+		Tags: []string{"linux", contract.StableNodeTagPrefix + "node-1"},
+	}
+	source := h.submit(request, "image-golden-source")
+	record, err := h.l3Store.GetRun(context.Background(), source.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(record.Workflow.Image, program) {
+		t.Fatalf("stored image snapshot = %#v, want %#v", record.Workflow.Image, program)
+	}
+	if _, err := h.l3Store.db.Exec(`UPDATE run_images SET program_json='{}' WHERE run_id=?`, source.RunID); err == nil {
+		t.Fatal("image program update succeeded; want immutable snapshot rejection")
+	}
+
+	jobs := &recordingJobClient{}
+	reconciler, err := NewReconciler(h.l3Store, jobs, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.specs) != 1 {
+		t.Fatalf("image dispatch count = %d, want 1", len(jobs.specs))
+	}
+	assertDispatchedImageProgram(t, jobs.specs[0], *program)
+
+	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+source.RunID+"/rerun", nil,
+		http.Header{"Idempotency-Key": []string{"image-golden-rerun"}})
+	if status != http.StatusCreated {
+		t.Fatalf("image rerun status = %d body=%s", status, body)
+	}
+	var rerun RunAccepted
+	if err := json.Unmarshal(body, &rerun); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.specs) != 2 {
+		t.Fatalf("image rerun dispatch count = %d, want 2", len(jobs.specs))
+	}
+	assertDispatchedImageProgram(t, jobs.specs[1], *program)
+	if !reflect.DeepEqual(jobs.specs[0].Execution.OCI, jobs.specs[1].Execution.OCI) ||
+		jobs.specs[0].RuntimeHandler != jobs.specs[1].RuntimeHandler {
+		t.Fatalf("rerun changed image program:\nsource=%#v\nrerun=%#v", jobs.specs[0], jobs.specs[1])
+	}
+}
+
+func assertDispatchedImageProgram(t *testing.T, spec contract.JobSpec, want contract.ImageProgram) {
+	t.Helper()
+	if spec.Kind != contract.JobKindOCI || spec.Class != contract.JobClassOneShot || spec.Execution.OCI == nil {
+		t.Fatalf("dispatched image job axes = %#v", spec)
+	}
+	got := contract.ImageProgram{
+		Reference:        spec.Execution.OCI.Image.Reference,
+		Digest:           spec.Execution.OCI.Image.Digest,
+		Argv:             spec.Execution.OCI.Argv,
+		WorkingDirectory: spec.Execution.OCI.WorkingDirectory,
+		Mounts:           spec.Execution.OCI.Mounts,
+		Limits:           spec.Execution.OCI.Limits,
+		RuntimeHandler:   spec.RuntimeHandler,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("dispatched image program = %#v, want %#v", got, want)
+	}
+}
+
+func TestImageProgramAPISourcePinningDigestAndSavedWorkflowRules(t *testing.T) {
+	h := newIntegrationHarness(t)
+	digest := "sha256:" + strings.Repeat("b", 64)
+	image := &contract.ImageProgram{Reference: "ghcr.io/example/tool:latest", Digest: &digest}
+	script := inlineRunRequest("#!/bin/sh\nexit 0\n").InlineScript
+
+	request := CreateRunRequest{Image: image, InlineScript: script, Params: json.RawMessage(`{}`)}
+	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs", request,
+		http.Header{"Idempotency-Key": []string{"image-exclusive"}})
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+
+	mounted := *image
+	mounted.Mounts = []contract.OCIMount{{NodePath: "/srv/source", ContainerPath: "/source"}}
+	request = CreateRunRequest{Image: &mounted, Params: json.RawMessage(`{}`), Tags: []string{"linux"}}
+	status, _, body = h.do(h.caller, http.MethodPost, "/v1/runs", request,
+		http.Header{"Idempotency-Key": []string{"image-unpinned"}})
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+
+	missingDigest := &contract.ImageProgram{Reference: "ghcr.io/example/tool:moving"}
+	request = CreateRunRequest{Image: missingDigest, Params: json.RawMessage(`{}`), Tags: []string{contract.StableNodeTagPrefix + "node-1"}}
+	source := h.submit(request, "image-unresolved-source")
+	status, _, body = h.do(h.caller, http.MethodPost, "/v1/runs/"+source.RunID+"/rerun", nil,
+		http.Header{"Idempotency-Key": []string{"image-unresolved-rerun"}})
+	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNoResolvedImageSnapshot)
+
+	status, _, body = h.do(h.caller, http.MethodPost, "/v1/workflows/image-workflow/versions",
+		WorkflowVersionInput{Image: missingDigest}, nil)
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+	status, _, body = h.do(h.caller, http.MethodPost, "/v1/workflows/image-workflow/versions",
+		WorkflowVersionInput{Image: image}, nil)
+	if status != http.StatusCreated {
+		t.Fatalf("create saved image workflow status = %d body=%s", status, body)
+	}
+	var version WorkflowVersion
+	if err := json.Unmarshal(body, &version); err != nil {
+		t.Fatal(err)
+	}
+	if version.Version != 1 || version.WorkflowRef != "workflow://image-workflow/v1" || !reflect.DeepEqual(version.Image, image) {
+		t.Fatalf("saved image workflow = %#v, want complete image snapshot", version)
 	}
 }
 

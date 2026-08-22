@@ -136,6 +136,7 @@ func TestValidFixturesRoundTripThroughGoTypes(t *testing.T) {
 		{"testdata/schemas/envelope/valid.json", func() any { return new(Envelope) }},
 		{"testdata/schemas/gate-result/valid.json", func() any { return new(GateResult) }},
 		{"testdata/schemas/run-record/valid.json", func() any { return new(RunRecord) }},
+		{"testdata/schemas/run-record/valid-image.json", func() any { return new(RunRecord) }},
 	}
 
 	for _, tc := range cases {

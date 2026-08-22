@@ -84,6 +84,40 @@ func ValidateJobSpec(spec JobSpec) error {
 	return nil
 }
 
+// ValidateImageProgram applies the same structural rules as an L1 OCI job to
+// an L3 image snapshot. Class controls the digest requirement; tags enforce
+// the Pinned invariant for operator mounts.
+func ValidateImageProgram(program ImageProgram, class string, tags []string) error {
+	oci := &OCIExecutionSpec{
+		Image: OCIImageSpec{
+			Reference:  program.Reference,
+			Digest:     program.Digest,
+			digestNull: program.digestNull,
+		},
+		Argv:             program.Argv,
+		WorkingDirectory: program.WorkingDirectory,
+		Mounts:           program.Mounts,
+		Limits:           program.Limits,
+		argvNull:         program.argvNull,
+		workingDirNull:   program.workingDirNull,
+		mountsNull:       program.mountsNull,
+		limitsNull:       program.limitsNull,
+	}
+	spec := JobSpec{
+		SchemaVersion:  SchemaVersionV1,
+		DispatchKey:    "validate:image-program",
+		Kind:           JobKindOCI,
+		Class:          class,
+		RuntimeHandler: program.RuntimeHandler,
+		RoutingTags:    tags,
+		Execution:      ExecutionSpec{OCI: oci},
+	}
+	if class == JobClassService {
+		spec.Restart = RestartAlways
+	}
+	return ValidateJobSpec(spec)
+}
+
 func validateProcessExecution(spec JobSpec) error {
 	if spec.RuntimeHandler != "" {
 		return unsupportedRuntimeHandlerf("runtime_handler is not supported for process jobs")
