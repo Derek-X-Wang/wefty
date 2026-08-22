@@ -10,7 +10,7 @@ func TestValidateJobSpecReturnsTypedRuntimeHandlerError(t *testing.T) {
 
 	spec := validProcessJobSpecForValidation()
 	spec.RuntimeHandler = "io.containerd.runc.v2"
-	err := ValidateJobSpec(spec)
+	err := ValidateJobSpec(&spec)
 	var coded interface{ Code() ErrorCode }
 	if !errors.As(err, &coded) {
 		t.Fatalf("ValidateJobSpec() error = %T %v, want typed contract error", err, err)
@@ -25,8 +25,27 @@ func TestValidateProcessEnvironmentNames(t *testing.T) {
 
 	spec := validProcessJobSpecForValidation()
 	spec.Execution.Env = map[string]string{"INVALID-NAME": "value"}
-	if err := ValidateJobSpec(spec); err == nil {
+	if err := ValidateJobSpec(&spec); err == nil {
 		t.Fatal("ValidateJobSpec() accepted an invalid process environment name")
+	}
+}
+
+func TestValidateJobSpecNormalizesExecutionIdentifiers(t *testing.T) {
+	spec := JobSpec{
+		SchemaVersion:  SchemaVersionV1,
+		DispatchKey:    "normalize-identifiers",
+		Kind:           " OCI ",
+		Class:          JobClassOneShot,
+		RuntimeHandler: " IO.CONTAINERD.RUNSC.V1 ",
+		Execution: ExecutionSpec{OCI: &OCIExecutionSpec{
+			Image: OCIImageSpec{Reference: "alpine:latest"},
+		}},
+	}
+	if err := ValidateJobSpec(&spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.Kind != JobKindOCI || spec.RuntimeHandler != "io.containerd.runsc.v1" {
+		t.Fatalf("normalized identifiers = kind %q handler %q", spec.Kind, spec.RuntimeHandler)
 	}
 }
 

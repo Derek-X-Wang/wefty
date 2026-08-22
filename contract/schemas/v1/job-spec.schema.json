@@ -13,7 +13,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "pattern": "\\S"
+      "pattern": "^\\s*\\S+\\s*$"
     },
     "class": {
       "description": "Open workload lifecycle class. Unknown values are valid data and are rejected only by agents that cannot execute them.",
@@ -22,7 +22,7 @@
       "maxLength": 128,
       "pattern": "\\S"
     },
-    "runtime_handler": { "type": "string", "maxLength": 128 },
+    "runtime_handler": { "type": "string", "maxLength": 128, "pattern": "^\\s*(?:\\S+)?\\s*$" },
     "routing_tags": {
       "type": "array",
       "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]*$" },
@@ -112,7 +112,7 @@
   "allOf": [
     {
       "if": {
-        "properties": { "kind": { "const": "process" } },
+        "properties": { "kind": { "pattern": "^\\s*[Pp][Rr][Oo][Cc][Ee][Ss][Ss]\\s*$" } },
         "required": ["kind"]
       },
       "then": {
@@ -121,13 +121,13 @@
             "required": ["executable", "argv", "working_directory"],
             "not": { "required": ["oci"] }
           },
-          "runtime_handler": { "const": "" }
+          "runtime_handler": { "pattern": "^\\s*$" }
         }
       }
     },
     {
       "if": {
-        "properties": { "kind": { "const": "oci" } },
+        "properties": { "kind": { "pattern": "^\\s*[Oo][Cc][Ii]\\s*$" } },
         "required": ["kind"]
       },
       "then": {

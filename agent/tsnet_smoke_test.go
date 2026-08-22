@@ -166,7 +166,7 @@ func TestTSNetServiceReachability(t *testing.T) {
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: serverName,
 		NodeID: stableNodeID, BootSessionID: "boot-" + suffix, Version: "tsnet-service-smoke",
-		Capabilities:      map[string]bool{"process": true},
+		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 5 * time.Second, ClaimInterval: 100 * time.Millisecond,
 		RenewalInterval: 5 * time.Second, LogSpoolDirectory: t.TempDir(),
 		ManagedRootDirectory: t.TempDir(), GuardianExecutable: agentBinaryPath,

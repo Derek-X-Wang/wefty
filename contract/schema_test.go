@@ -160,7 +160,7 @@ func assertJobSpecValidatorsAgree(t *testing.T, schema *jsonschema.Schema, raw [
 	var spec JobSpec
 	goErr := decoder.Decode(&spec)
 	if goErr == nil {
-		goErr = ValidateJobSpec(spec)
+		goErr = ValidateJobSpec(&spec)
 	}
 	if (schemaErr == nil) != (goErr == nil) {
 		t.Fatalf("schema and Go validation disagree:\nschema: %v\nGo: %v\ninstance: %s", schemaErr, goErr, raw)

@@ -102,7 +102,7 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 	nodeAgent, err := agent.New(agent.Config{
 		Fabric: agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
 		NodeID: "dogfood-node", BootSessionID: "boot-dogfood", Version: "contract-smoke",
-		OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"process": true},
+		OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true},
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 10 * time.Millisecond,
 		RenewalInterval: 50 * time.Millisecond, LogFlushInterval: 5 * time.Millisecond, LogRetryInterval: 5 * time.Millisecond,
 		LogSpoolDirectory: t.TempDir(),

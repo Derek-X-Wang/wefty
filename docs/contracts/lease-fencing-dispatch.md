@@ -12,9 +12,27 @@ concern and does not replace the L1 Fabric principal boundary.
 
 A claim is one SQLite transaction that verifies durable operator intent permits
 claims, selects a `queued` job whose normalized routing tags are a subset of
-the authenticated node's authoritative tags and whose workload class has
-capacity, creates an attempt, assigns a new fence, establishes a lease, and
-moves the job to `claimed`. Exactly one concurrent claimant commits.
+the authenticated node's authoritative tags, whose persisted execution
+requirements are a subset of the node's capabilities advertised at
+registration, and whose workload class has capacity; it then creates an attempt, assigns a new
+fence, establishes a lease, and moves the job to `claimed`. Exactly one
+concurrent claimant commits.
+
+L1 derives and transactionally persists `RequiredCapabilities(JobSpec)` when it
+creates the job. The normalized set always contains `kind:<name>`, additionally
+contains `runtime_handler:<name>` for a non-empty handler, and contains
+`cgroup_v2` when OCI memory or CPU limits request kernel enforcement. The
+winning claim mutation anti-joins these rows against capability entries whose
+registration-advertised value is true. That set is boot-scoped until #136 adds
+heartbeat capability revisions. The same persisted requirements and shared
+comparison module drive operator unschedulability diagnostics for both job
+classes; claim and diagnostic paths never reconstruct requirements from JSON
+independently.
+
+Capabilities express eligibility only. One-shot and service slots remain the
+independent, class-scoped capacity mechanism; capability keys never create,
+name, or increase slots. `apparmor` may be advertised as observed hardening but
+is not an M3 job requirement.
 
 The request contains node ID, boot-session ID, and a required fixed class
 selector (`one-shot` or `service`), but no routing tags or capacity. A one-shot
@@ -332,16 +350,20 @@ registry manifest `HEAD`, and sends the returned top-level
 dispatch identity is derived after resolution from the submitted reference and
 resolved digest, so a moved tag creates a new service while repeated resolution
 to the same digest replays the same identity. L1 validates the service digest
-before applying its temporary OCI-support gate. Repeatable mounts require
-`--node` or exactly one explicit stable-node routing tag at the CLI, and the
-same Pinned invariant is rechecked independently by L3 and L1; `--node` is
+before persisting the job and its execution requirements. Repeatable mounts
+require `--node` or exactly one explicit stable-node routing tag at the CLI,
+and the same Pinned invariant is rechecked independently by L3 and L1; `--node` is
 rejected for non-image submissions.
 
-Runtime support remains separate from wire validity. Until capability-aware OCI
-claiming lands in Ticket 3 (#135), L1 returns `422 unsupported_kind` for every
-non-process job so today's process-only agents cannot claim it. After that
-interim gate is removed, an agent without an adapter for a structurally valid
-kind reports `unsupported_kind`.
+Runtime support remains separate from wire validity. L1 accepts every
+structurally valid open kind, trims and lowercases `kind` and `runtime_handler`,
+and persists its `kind:<name>` requirement. A job stays queued while no
+tag-eligible node advertises that capability, and diagnostics name the missing
+capability for either class. During M3, registration normalizes the legacy bare
+`process` capability to `kind:process`; upgrading L1 before agents is therefore
+safe, and the legacy key remains accepted until M4. An agent that advertises a
+kind but has no matching local adapter reports `unsupported_kind`; correct capability
+advertisement prevents that mismatch from becoming ordinary placement.
 
 Every job also declares the independent, required `class` lifecycle axis.
 `class` is an open string: L1 stores unknown values as valid data, and only an

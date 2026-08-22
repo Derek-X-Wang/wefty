@@ -52,7 +52,7 @@
           },
           "status": {
             "type": "string",
-            "description": "Service jobs only. Computed operator projection; may be restart-pending or unschedulable while persisted state remains queued."
+            "description": "Computed operator projection. Either class may be unschedulable while persisted state remains queued; restart-pending is service-only."
           },
           "spec": {
             "$ref": "#/components/schemas/JobSpec",
@@ -82,7 +82,7 @@
           },
           "unschedulable_reason": {
             "type": "string",
-            "description": "Present when computed status is unschedulable; names the placement or capacity fact preventing claim."
+            "description": "Present for either class when execution capabilities prevent claim; service jobs may additionally name binding, liveness, intent, routing, or capacity facts."
           },
           "restart_suppressed_reason": {
             "type": "string",
@@ -381,10 +381,10 @@
           "capabilities": {
             "type": "object",
             "additionalProperties": { "type": "boolean" },
-            "description": "Executable support only. max_oneshot_slots and max_service_slots are reserved control-plane policy keys and are rejected."
+            "description": "Node-advertised execution facts such as kind:process, kind:oci, runtime_handler:<name>, and cgroup_v2. Operators separately own routing tags and class-scoped capacity; max_oneshot_slots and max_service_slots are reserved control-plane policy keys and are rejected."
           }
         },
-        "description": "No tags or capacity fields are accepted. Eligibility policy comes from operator-owned control-plane configuration; connect_host is a non-authoritative Fabric projection."
+        "description": "No tags or capacity fields are accepted. Operators own routing tags and class-scoped slot policy; the node advertises execution capabilities. connect_host is a non-authoritative Fabric projection."
       },
       "RemovalDirective": {
         "type": "object",

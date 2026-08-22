@@ -42,6 +42,7 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Clock: clock,
+		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 5 * time.Minute, ClaimInterval: time.Minute, RenewalInterval: 10 * time.Second,
 		Runner: runner, LogSpoolDirectory: t.TempDir(), Logf: t.Logf,
 	})
@@ -98,6 +99,7 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 
 	_, err = store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-node-2"}, contract.NodeRegistration{
 		NodeID: "node-2", BootSessionID: "boot-2", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true},
 	}, l1.DefaultNodePolicy("linux"), true)
 	if err != nil {
 		t.Fatal(err)
@@ -168,6 +170,7 @@ func assertAgentFillsGrantedClassSlotsConcurrently(t *testing.T) {
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: time.Second, ClaimInterval: 10 * time.Millisecond, RenewalInterval: 100 * time.Millisecond,
 		Runner: runner, LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: managedRoot,
 	})
@@ -245,6 +248,7 @@ func assertAgentRefillsSlotAfterSiblingFinalization(t *testing.T) {
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: time.Second, ClaimInterval: time.Millisecond, RenewalInterval: 100 * time.Millisecond,
 		MaxOneshotSlots: 2, MaxServiceSlots: 1,
 		Runner: runner, LogSpoolDirectory: t.TempDir(),
@@ -324,7 +328,7 @@ func assertAgentExcludesARequeuedJobUntilLocalFinalizationReturns(t *testing.T) 
 	defer client.Close()
 	registration := contract.NodeRegistration{
 		NodeID: "node-1", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
-		Capabilities: map[string]bool{"process": true},
+		Capabilities: map[string]bool{"kind:process": true},
 	}
 	session := newAgentSession(
 		client, registration, time.Second, 10*time.Millisecond, systemClock{}, newLifecycleObserver(systemClock{}), nil, 0, 2,
@@ -410,7 +414,7 @@ func assertFailedCompletionLeavesSiblingAndSessionRunning(t *testing.T) {
 		client,
 		contract.NodeRegistration{
 			NodeID: "node-1", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
-			Capabilities: map[string]bool{"process": true},
+			Capabilities: map[string]bool{"kind:process": true},
 		},
 		time.Second,
 		time.Millisecond,
@@ -487,6 +491,7 @@ func assertDrainJoinsEveryResidentOneShotAttempt(t *testing.T) {
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 100 * time.Millisecond, ClaimInterval: time.Millisecond, RenewalInterval: 100 * time.Millisecond,
 		MaxOneshotSlots: 3, MaxServiceSlots: 1,
 		Runner: runner, LogSpoolDirectory: t.TempDir(),
@@ -576,6 +581,7 @@ func assertSilentRenewalHangCannotOutliveLocalAuthority(t *testing.T) {
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 5 * time.Minute, ClaimInterval: time.Minute,
 		RenewalInterval: 100 * time.Millisecond, OperationTimeout: 5 * time.Second,
 		Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
@@ -707,6 +713,7 @@ func assertUnreapedPayloadStaysVisibleWithoutKillingDaemon(t *testing.T) {
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Clock: clock,
+		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 5 * time.Minute, ClaimInterval: time.Minute, RenewalInterval: 10 * time.Second,
 		Runner: runner, LogSpoolDirectory: t.TempDir(),
 	})
@@ -781,6 +788,7 @@ func TestAgentDrainFinishesRunningAttemptAndStopsClaiming(t *testing.T) {
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: time.Minute, ClaimInterval: time.Millisecond, RenewalInterval: 10 * time.Second,
 		Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
 	})
@@ -845,7 +853,7 @@ func TestAgentShutdownFencesAttemptForImmediateSuccessor(t *testing.T) {
 	second := createAgentTestJob(t, store, "shutdown-fenced-successor")
 	runner := newBlockingRunner()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	firstAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
+	firstAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -867,7 +875,7 @@ func TestAgentShutdownFencesAttemptForImmediateSuccessor(t *testing.T) {
 	}
 
 	secondRunner := instantResultRunner{}
-	secondAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-2", Version: "test", Runner: secondRunner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
+	secondAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-2", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: secondRunner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -899,7 +907,7 @@ func TestAgentShutdownFinalizationUploadsLogs(t *testing.T) {
 	job := createAgentTestJob(t, store, "shutdown-finalization-logs")
 	runner := newLoggingBlockingRunner()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -957,6 +965,7 @@ func assertFinalizationTimeoutStartsAfterServicePayloadStops(t *testing.T) {
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		Capabilities:  map[string]bool{"kind:process": true},
 		ClaimInterval: 5 * time.Millisecond, RenewalInterval: time.Second,
 		FinalizationTimeout: finalizationTimeout, LogBatchSize: 8, LogFlushInterval: time.Hour,
 		Runner: runner, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
@@ -1025,7 +1034,7 @@ func assertPluralServiceDrainJoinsAll(t *testing.T) {
 	}
 	runner := newSlotRefillRunner()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Runner: runner, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), ClaimInterval: 5 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, RenewalInterval: 50 * time.Millisecond, MaxOneshotSlots: 2, MaxServiceSlots: 2})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: runner, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), ClaimInterval: 5 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, RenewalInterval: 50 * time.Millisecond, MaxOneshotSlots: 2, MaxServiceSlots: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1068,7 +1077,7 @@ func TestAgentConsumesRenewalDirectivesWithoutDaemonExit(t *testing.T) {
 	}
 	runner := newDirectiveRunner()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Runner: runner, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), RenewalInterval: 20 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, MaxServiceSlots: 1})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: runner, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), RenewalInterval: 20 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, MaxServiceSlots: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1104,7 +1113,7 @@ func TestAgentHeartbeatClaimsDisabledStopsNewClaims(t *testing.T) {
 	second := createAgentTestJob(t, store, "claims-disabled-queued")
 	runner := newBlockingRunner()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Runner: runner, LogSpoolDirectory: t.TempDir(), HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, MaxOneshotSlots: 1})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: runner, LogSpoolDirectory: t.TempDir(), HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, MaxOneshotSlots: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

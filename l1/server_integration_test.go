@@ -152,10 +152,15 @@ func doRequest(client *http.Client, method, path string, body any) (int, http.He
 }
 
 func (h *integrationHarness) register(client *http.Client, nodeID string) Node {
+	return h.registerWithCapabilities(client, nodeID, map[string]bool{"kind:process": true})
+}
+
+func (h *integrationHarness) registerWithCapabilities(client *http.Client, nodeID string, capabilities map[string]bool) Node {
 	h.t.Helper()
 	registration := contract.NodeRegistration{
 		NodeID: nodeID, BootSessionID: "boot-" + nodeID, RootInstanceID: "root-" + nodeID,
 		OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		Capabilities: capabilities,
 	}
 	status, _, body := h.do(client, http.MethodPost, "/v1/agent/nodes/register", registration)
 	if status != http.StatusOK {
@@ -197,7 +202,7 @@ func validJobSpec(dispatchKey string, tags []string) contract.JobSpec {
 	}
 }
 
-func TestL1RejectsOCIUntilCapabilityAwareClaimingLands(t *testing.T) {
+func TestL1AcceptsOCIForCapabilityAwareClaiming(t *testing.T) {
 	h := newIntegrationHarness(t, nil)
 	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
 	spec := contract.JobSpec{
@@ -213,15 +218,15 @@ func TestL1RejectsOCIUntilCapabilityAwareClaimingLands(t *testing.T) {
 	}
 
 	status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
-	if status != http.StatusUnprocessableEntity {
-		t.Fatalf("submit OCI job status = %d, want %d body=%s", status, http.StatusUnprocessableEntity, body)
+	if status != http.StatusCreated {
+		t.Fatalf("submit OCI job status = %d, want %d body=%s", status, http.StatusCreated, body)
 	}
-	var response contract.ErrorResponse
-	if err := json.Unmarshal(body, &response); err != nil {
+	var job Job
+	if err := json.Unmarshal(body, &job); err != nil {
 		t.Fatal(err)
 	}
-	if response.Error.Code != contract.ErrorUnsupportedKind {
-		t.Fatalf("submit OCI job error code = %q, want %q body=%s", response.Error.Code, contract.ErrorUnsupportedKind, body)
+	if job.State != contract.JobQueued || job.Spec.Kind != contract.JobKindOCI {
+		t.Fatalf("submitted OCI job = %#v", job)
 	}
 }
 
@@ -757,7 +762,7 @@ func TestRegistrationRejectsSelfReportedEligibilityPolicy(t *testing.T) {
 
 	withCapacityCapabilities := maps.Clone(base)
 	withCapacityCapabilities["capabilities"] = map[string]bool{
-		"process": true, "max_oneshot_slots": true, "max_service_slots": true,
+		"kind:process": true, "max_oneshot_slots": true, "max_service_slots": true,
 	}
 	status, _, responseBody = h.do(agent, http.MethodPost, "/v1/agent/nodes/register", withCapacityCapabilities)
 	assertAPIError(t, status, responseBody, http.StatusBadRequest, contract.ErrorInvalidRequest)

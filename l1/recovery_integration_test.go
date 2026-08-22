@@ -532,6 +532,7 @@ func registerOverHTTP(t *testing.T, client *http.Client, nodeID, bootID string) 
 	t.Helper()
 	status, _, body, err := doRequest(client, http.MethodPost, "/v1/agent/nodes/register", contract.NodeRegistration{
 		NodeID: nodeID, BootSessionID: bootID, OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true},
 	})
 	if err != nil {
 		t.Fatal(err)

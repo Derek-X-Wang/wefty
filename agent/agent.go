@@ -44,14 +44,15 @@ type OutputSinkFactory func(l1.Claim) processrunner.OutputSink
 // Config contains the stable node identity, per-process boot identity, and
 // independent heartbeat, claim, and lease-renewal cadences.
 type Config struct {
-	Fabric               fabric.Fabric
-	ControlPlaneAddress  string
-	RunLedgerAddress     string
-	NodeID               string
-	BootSessionID        string
-	Version              string
-	OS                   string
-	Architecture         string
+	Fabric              fabric.Fabric
+	ControlPlaneAddress string
+	RunLedgerAddress    string
+	NodeID              string
+	BootSessionID       string
+	Version             string
+	OS                  string
+	Architecture        string
+	// Capabilities is the complete advertised execution set; nil advertises none.
 	Capabilities         map[string]bool
 	HeartbeatInterval    time.Duration
 	ClaimInterval        time.Duration
@@ -384,9 +385,6 @@ func int64OrDefault(value, fallback int64) int64 {
 }
 
 func cloneCapabilities(capabilities map[string]bool) map[string]bool {
-	if capabilities == nil {
-		return map[string]bool{"process": true}
-	}
 	cloned := make(map[string]bool, len(capabilities))
 	for capability, enabled := range capabilities {
 		cloned[capability] = enabled

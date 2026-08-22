@@ -4,6 +4,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -11,10 +12,14 @@ const ociImageReferencePattern = `^([a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-
 
 var ociImageReferenceRE = regexp.MustCompile(ociImageReferencePattern)
 
-// ValidateJobSpec applies the structural v1 JobSpec contract independently of
-// any caller-side JSON Schema validation. Kind and class remain open strings;
-// the known process and OCI arms receive their kind-specific validation here.
-func ValidateJobSpec(spec JobSpec) error {
+// ValidateJobSpec normalizes kind and runtime_handler in place, then applies
+// the structural v1 JobSpec contract independently of caller-side JSON Schema
+// validation. Kind and class remain open strings; the known process and OCI
+// arms receive their kind-specific validation here.
+func ValidateJobSpec(spec *JobSpec) error {
+	if spec == nil {
+		return invalidJobSpecf("job spec is required")
+	}
 	if spec.SchemaVersion != SchemaVersionV1 {
 		return invalidJobSpecf("schema_version must be %d", SchemaVersionV1)
 	}
@@ -24,6 +29,11 @@ func ValidateJobSpec(spec JobSpec) error {
 	if utf8.RuneCountInString(spec.DispatchKey) > 255 || utf8.RuneCountInString(spec.Kind) > 128 ||
 		utf8.RuneCountInString(spec.Class) > 128 || utf8.RuneCountInString(spec.RuntimeHandler) > 128 {
 		return invalidJobSpecf("job identifier fields exceed contract limits")
+	}
+	spec.Kind = strings.ToLower(strings.TrimSpace(spec.Kind))
+	spec.RuntimeHandler = strings.ToLower(strings.TrimSpace(spec.RuntimeHandler))
+	if strings.IndexFunc(spec.Kind, unicode.IsSpace) >= 0 || strings.IndexFunc(spec.RuntimeHandler, unicode.IsSpace) >= 0 {
+		return invalidJobSpecf("kind and runtime_handler cannot contain whitespace")
 	}
 	if err := validateEnvironment(spec.Execution.Env); err != nil {
 		return invalidJobSpecf("execution env: %v", err)
@@ -112,7 +122,7 @@ func ValidateImageProgram(program ImageProgram, class string) error {
 	if utf8.RuneCountInString(spec.RuntimeHandler) > 128 {
 		return invalidJobSpecf("runtime_handler exceeds contract limits")
 	}
-	return validateOCIExecution(spec)
+	return validateOCIExecution(&spec)
 }
 
 // ValidatePinnedRouting enforces the placement half of the image contract.
@@ -134,7 +144,7 @@ func ValidatePinnedRouting(program ImageProgram, tags []string) error {
 	return nil
 }
 
-func validateProcessExecution(spec JobSpec) error {
+func validateProcessExecution(spec *JobSpec) error {
 	if spec.RuntimeHandler != "" {
 		return unsupportedRuntimeHandlerf("runtime_handler is not supported for process jobs")
 	}
@@ -159,7 +169,7 @@ func validateProcessExecution(spec JobSpec) error {
 	return nil
 }
 
-func validateOCIExecution(spec JobSpec) error {
+func validateOCIExecution(spec *JobSpec) error {
 	if spec.Execution.OCI == nil {
 		return invalidJobSpecf("execution.oci is required for OCI jobs")
 	}

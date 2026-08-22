@@ -105,6 +105,7 @@ func TestAgentCompletesWithoutDuplicateLogsAfterNetworkLossMidJob(t *testing.T) 
 	nodeAgent, err := New(Config{
 		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "stable-node", BootSessionID: "boot-network", Version: "test", Clock: clock,
+		Capabilities:  map[string]bool{"kind:process": true},
 		ClaimInterval: time.Second, LogBatchSize: 1, LogRetryInterval: 5 * time.Millisecond,
 		LogSpoolDirectory: t.TempDir(), LogSpoolMaxBytes: 1024,
 		OutputSinkFactory: func(l1.Claim) processrunner.OutputSink {
@@ -362,6 +363,7 @@ func createClaimForDurableLogs(t *testing.T, store *l1.Store, clock Clock) l1.Cl
 	t.Helper()
 	_, err := store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-node"}, contract.NodeRegistration{
 		NodeID: "stable-node", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true},
 	}, l1.DefaultNodePolicy("linux"), true)
 	if err != nil {
 		t.Fatal(err)

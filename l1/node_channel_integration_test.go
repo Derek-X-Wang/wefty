@@ -24,6 +24,7 @@ func assertHeartbeatIsTheNodeDirectiveAndCapacityChannel(t *testing.T) {
 	registration := contract.NodeRegistration{
 		NodeID: "node-1", BootSessionID: "boot-1", ConnectHost: "node-channel.example.test",
 		RootInstanceID: "root-node-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true},
 	}
 	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
 	if status != http.StatusOK {

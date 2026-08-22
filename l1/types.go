@@ -46,11 +46,12 @@ type Job struct {
 	Status string            `json:"status,omitempty"`
 	// Spec is absent once removal has finalized because tombstones deliberately
 	// retain no executable or environment bytes.
-	Spec             contract.JobSpec `json:"spec,omitzero"`
-	CurrentAttemptID string           `json:"current_attempt_id,omitempty"`
-	Attempts         []Attempt        `json:"attempts,omitempty"`
-	CreatedAt        time.Time        `json:"created_at"`
-	UpdatedAt        time.Time        `json:"updated_at"`
+	Spec                contract.JobSpec `json:"spec,omitzero"`
+	CurrentAttemptID    string           `json:"current_attempt_id,omitempty"`
+	Attempts            []Attempt        `json:"attempts,omitempty"`
+	UnschedulableReason string           `json:"unschedulable_reason,omitempty"`
+	CreatedAt           time.Time        `json:"created_at"`
+	UpdatedAt           time.Time        `json:"updated_at"`
 	*ServiceJob
 	Removal *ServiceRemoval `json:"removal,omitempty"`
 }

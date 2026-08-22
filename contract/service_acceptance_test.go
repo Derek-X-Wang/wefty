@@ -27,7 +27,7 @@ func TestServiceAcceptanceJobSpecSchemaAndProcessResult(t *testing.T) {
 		if err := json.Unmarshal(raw, &spec); err != nil {
 			t.Fatal(err)
 		}
-		if err := ValidateJobSpec(spec); err != nil {
+		if err := ValidateJobSpec(&spec); err != nil {
 			t.Fatalf("%s rejected by Go validation: %v", path, err)
 		}
 	}
@@ -61,7 +61,7 @@ func TestServiceAcceptanceJobSpecSchemaAndProcessResult(t *testing.T) {
 		if err := json.Unmarshal(raw, &spec); err != nil {
 			t.Fatal(err)
 		}
-		if err := ValidateJobSpec(spec); err == nil {
+		if err := ValidateJobSpec(&spec); err == nil {
 			t.Fatalf("%s accepted by Go validation", path)
 		}
 	}

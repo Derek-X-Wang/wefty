@@ -498,10 +498,11 @@ const (
 	TerminationCauseGuardian    TerminationCause = "guardian"
 )
 
-// NodeRegistration intentionally has no tags or capacity fields. Claim
-// eligibility uses authoritative policy obtained from control-plane
-// configuration. Capabilities describes executable support and must not carry
-// max_oneshot_slots or max_service_slots.
+// NodeRegistration intentionally has no tags or capacity fields: operators own
+// routing tags and class-scoped slot policy in the control plane. Capabilities
+// are node-advertised execution facts such as kind:process, kind:oci,
+// runtime_handler:<name>, and cgroup_v2; they must not carry max_oneshot_slots
+// or max_service_slots.
 type NodeRegistration struct {
 	NodeID        string `json:"node_id"`
 	BootSessionID string `json:"boot_session_id"`

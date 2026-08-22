@@ -107,7 +107,7 @@ func run() error {
 		NodeID:               *nodeID,
 		BootSessionID:        bootSessionID,
 		Version:              version,
-		Capabilities:         map[string]bool{"process": true},
+		Capabilities:         map[string]bool{"kind:process": true},
 		HeartbeatInterval:    *heartbeat,
 		ClaimInterval:        *claim,
 		RenewalInterval:      *renewal,
