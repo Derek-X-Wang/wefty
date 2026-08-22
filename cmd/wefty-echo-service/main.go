@@ -9,9 +9,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,11 +29,14 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) == 2 && os.Args[1] == "--once" {
+		return runOnce(http.DefaultClient, os.Stdout, os.Stderr)
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--portless" {
 		return runPortless()
 	}
 	if len(os.Args) != 1 {
-		return errors.New("usage: wefty-echo-service [--portless]")
+		return errors.New("usage: wefty-echo-service [--once|--portless]")
 	}
 	port := os.Getenv(contract.EnvServicePort)
 	if port == "" {
@@ -55,8 +61,6 @@ func run() error {
 	}
 	log.Printf("wefty-echo-service: starting payload pid=%d", os.Getpid())
 
-	log.Printf("wefty-echo-service: starting payload pid=%d", os.Getpid())
-
 	shutdownSignal, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	shutdownDone := make(chan error, 1)
@@ -76,6 +80,51 @@ func run() error {
 	}
 	if err := <-shutdownDone; err != nil {
 		return fmt.Errorf("shut down HTTP server: %w", err)
+	}
+	return nil
+}
+
+func runOnce(client *http.Client, stdout, stderr io.Writer) error {
+	handoffDirectory := os.Getenv(contract.EnvHandoffDir)
+	endpoint := strings.TrimRight(os.Getenv(contract.EnvL3Endpoint), "/")
+	runToken := os.Getenv(contract.EnvRunToken)
+	runID := os.Getenv(contract.EnvRunID)
+	for name, value := range map[string]string{
+		contract.EnvHandoffDir: handoffDirectory,
+		contract.EnvL3Endpoint: endpoint,
+		contract.EnvRunToken:   runToken,
+		contract.EnvRunID:      runID,
+	} {
+		if value == "" {
+			return fmt.Errorf("%s is required", name)
+		}
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	markerPath := filepath.Join(handoffDirectory, "wefty-echo-once.txt")
+	if err := os.WriteFile(markerPath, []byte("wefty echo one-shot handoff\n"), 0o600); err != nil {
+		return fmt.Errorf("write one-shot handoff: %w", err)
+	}
+	request, err := http.NewRequest(http.MethodGet, endpoint+"/v1/runs/"+url.PathEscape(runID), nil)
+	if err != nil {
+		return fmt.Errorf("create L3 bridge request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+runToken)
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("call L3 bridge: %w", err)
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("L3 bridge returned HTTP %d", response.StatusCode)
+	}
+	if _, err := fmt.Fprintln(stdout, "wefty-echo-once-stdout"); err != nil {
+		return fmt.Errorf("write stdout marker: %w", err)
+	}
+	if _, err := fmt.Fprintln(stderr, "wefty-echo-once-stderr"); err != nil {
+		return fmt.Errorf("write stderr marker: %w", err)
 	}
 	return nil
 }

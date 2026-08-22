@@ -66,7 +66,9 @@ func executeServiceCreate(
 	var mode scriptMode
 	var tags, interpreters stringListFlag
 	var publishedPort optionalPortFlag
+	var imageFlags imageFlagSet
 	flags.StringVar(&scriptPath, "script", "", "service script file")
+	imageFlags.bind(flags)
 	flags.Var(&interpreters, "interpreter", "inline script interpreter argv entry (repeatable)")
 	flags.Var(&mode, "mode", "inline script mode, such as 0755")
 	flags.Var(&tags, "tag", "routing tag (repeatable)")
@@ -78,49 +80,63 @@ func executeServiceCreate(
 	if flags.NArg() != 0 {
 		return usageError("services create does not accept positional arguments")
 	}
-	if strings.TrimSpace(scriptPath) == "" {
-		return usageError("services create requires --script")
+	if (strings.TrimSpace(scriptPath) == "") == (strings.TrimSpace(imageFlags.reference) == "") {
+		return usageError("services create requires exactly one of --script or --image")
 	}
-
-	content, err := os.ReadFile(scriptPath)
-	if err != nil {
-		return fmt.Errorf("read service script: %w", err)
+	if imageFlags.reference == "" && imageFlags.nonRoutingOptionsSet() {
+		return usageError("--argv, --working-directory, --mount, image limits, and --runtime-handler require --image")
 	}
-	if len(content) == 0 {
-		return usageError("service script must not be empty")
+	if imageFlags.reference != "" && (len(interpreters) > 0 || mode.value != nil) {
+		return usageError("--interpreter and --mode apply only to --script")
 	}
-	canonicalScriptPath, err := filepath.Abs(scriptPath)
-	if err != nil {
-		return fmt.Errorf("resolve service script path: %w", err)
+	var err error
+	if idempotencyKey != "" {
+		idempotencyKey, err = validateIdempotencyKey(idempotencyKey)
+		if err != nil {
+			return err
+		}
 	}
-	if resolved, resolveErr := filepath.EvalSymlinks(canonicalScriptPath); resolveErr == nil {
-		canonicalScriptPath = resolved
-	}
-	workingDirectory, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("read working directory: %w", err)
-	}
-	if idempotencyKey == "" {
-		idempotencyKey = serviceDispatchKey(canonicalScriptPath)
-	} else if idempotencyKey, err = validateIdempotencyKey(idempotencyKey); err != nil {
-		return err
-	}
-
-	digest := sha256.Sum256(content)
 	var port *int
 	if publishedPort.set {
 		value := publishedPort.value
 		port = &value
 	}
+	resolvedTags, err := pinnedImageTags(tags, imageFlags.nodeID, len(imageFlags.mounts) > 0)
+	if err != nil {
+		return err
+	}
 	spec := contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
-		DispatchKey:   idempotencyKey,
-		Kind:          contract.JobKindProcess,
 		Class:         contract.JobClassService,
 		PublishedPort: port,
 		Restart:       contract.RestartAlways,
-		RoutingTags:   append([]string(nil), tags...),
-		Execution: contract.ExecutionSpec{
+		RoutingTags:   append([]string(nil), resolvedTags...),
+	}
+	if scriptPath != "" {
+		content, err := os.ReadFile(scriptPath)
+		if err != nil {
+			return fmt.Errorf("read service script: %w", err)
+		}
+		if len(content) == 0 {
+			return usageError("service script must not be empty")
+		}
+		canonicalScriptPath, err := filepath.Abs(scriptPath)
+		if err != nil {
+			return fmt.Errorf("resolve service script path: %w", err)
+		}
+		if resolved, resolveErr := filepath.EvalSymlinks(canonicalScriptPath); resolveErr == nil {
+			canonicalScriptPath = resolved
+		}
+		workingDirectory, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("read working directory: %w", err)
+		}
+		if idempotencyKey == "" {
+			idempotencyKey = serviceDispatchKey(canonicalScriptPath)
+		}
+		digest := sha256.Sum256(content)
+		spec.Kind = contract.JobKindProcess
+		spec.Execution = contract.ExecutionSpec{
 			Executable: contract.ExecutableSpec{
 				InlineBase64: base64.StdEncoding.EncodeToString(content),
 				SHA256:       hex.EncodeToString(digest[:]),
@@ -128,11 +144,50 @@ func executeServiceCreate(
 			},
 			Argv:             []string{"wefty-service-" + filepath.Base(canonicalScriptPath)},
 			WorkingDirectory: workingDirectory,
-		},
+		}
+		if mode.value != nil {
+			spec.Execution.Executable.Mode = *mode.value
+		}
+	} else {
+		program, tags, err := imageFlags.programAndTags(tags, contract.JobClassOneShot)
+		if err != nil {
+			return err
+		}
+		if program.Digest == nil {
+			resolver := clients.images
+			if resolver == nil {
+				resolver = newRegistryResolver(nil)
+			}
+			digest, err := resolver.ResolveDigest(ctx, program.Reference)
+			if err != nil {
+				return fmt.Errorf("resolve service image: %w", err)
+			}
+			program.Digest = &digest
+		}
+		if err := contract.ValidateImageProgram(*program, contract.JobClassService, l1NormalizedTags(tags)); err != nil {
+			return usageError(fmt.Sprintf("invalid service image program: %v", err))
+		}
+		if idempotencyKey == "" {
+			idempotencyKey = serviceDispatchKey("image:" + imageFlags.reference)
+		}
+		spec.Kind = contract.JobKindOCI
+		spec.RuntimeHandler = program.RuntimeHandler
+		spec.RoutingTags = append([]string(nil), tags...)
+		spec.Execution.OCI = &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{
+				Reference: program.Reference,
+				Digest:    program.Digest,
+			},
+			Argv:             append([]string(nil), program.Argv...),
+			WorkingDirectory: program.WorkingDirectory,
+			Mounts:           append([]contract.OCIMount(nil), program.Mounts...),
+			Limits:           program.Limits,
+		}
 	}
-	if mode.value != nil {
-		spec.Execution.Executable.Mode = *mode.value
+	if idempotencyKey, err = validateIdempotencyKey(idempotencyKey); err != nil {
+		return err
 	}
+	spec.DispatchKey = idempotencyKey
 	requestBody, err := json.Marshal(spec)
 	if err != nil {
 		return fmt.Errorf("encode service create request: %w", err)

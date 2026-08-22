@@ -115,3 +115,22 @@ run's handoff directory. L3 accepts it only when the source run has exactly one
 reserved stable-node tag, copies that tag to the rerun, and labels the L1 job
 with the source run as its handoff owner. A source run that was not pinned is
 rejected at rerun creation instead of dispatching a job with an unusable path.
+
+## Immutable program snapshots
+
+`POST /v1/runs` accepts exactly one program source: `workflow_ref`,
+`inline_script`, or `image`. An image snapshot contains the submitted
+reference, optional initial one-shot digest, argv replacement, container
+working directory, mounts, cgroup-v2 limits, and runtime handler. L3 stores the
+typed arm in an update- and delete-protected row and copies every field into the
+OCI L1 job without applying image defaults. Saved Workflow image versions use
+the same arm but require a digest before the immutable version is accepted.
+
+An operator mount makes the run Pinned. L3 requires exactly one
+`wefty:node:<stable-node-id>` routing tag whenever an image snapshot has a
+mount, independently of CLI enforcement. A digest-bearing image rerun copies
+the source snapshot and tags unchanged and never contacts a registry. A source
+whose initial one-shot failed before its digest was observed is rejected before
+the new run is created with `no_resolved_image_snapshot`; the later
+attempt-observation contract is the only authority allowed to supply that
+write-once resolution.

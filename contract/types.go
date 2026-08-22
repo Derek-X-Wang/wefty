@@ -335,11 +335,51 @@ type Trigger struct {
 type WorkflowSource struct {
 	WorkflowRef  string        `json:"workflow_ref,omitempty"`
 	InlineScript *InlineScript `json:"inline_script,omitempty"`
+	Image        *ImageProgram `json:"image,omitempty"`
 }
 
 type InlineScript struct {
 	Content string `json:"content"`
 	SHA256  string `json:"sha256"`
+}
+
+// ImageProgram is the immutable L3 program arm for kind=oci work. It keeps
+// the submitted reference as provenance while copying every operator-selected
+// execution field unchanged into L1 on dispatch and rerun.
+type ImageProgram struct {
+	Reference        string     `json:"reference"`
+	Digest           *string    `json:"digest,omitempty"`
+	Argv             []string   `json:"argv,omitempty"`
+	WorkingDirectory *string    `json:"working_directory,omitempty"`
+	Mounts           []OCIMount `json:"mounts,omitempty"`
+	Limits           *OCILimits `json:"limits,omitempty"`
+	RuntimeHandler   string     `json:"runtime_handler,omitempty"`
+	digestNull       bool
+	argvNull         bool
+	workingDirNull   bool
+	mountsNull       bool
+	limitsNull       bool
+}
+
+// UnmarshalJSON preserves explicit nulls so L3's Go validation agrees with
+// its OpenAPI surface instead of silently defaulting malformed snapshots.
+func (p *ImageProgram) UnmarshalJSON(data []byte) error {
+	type wire ImageProgram
+	var decoded wire
+	if err := decodeJSONStrict(data, &decoded); err != nil {
+		return err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	*p = ImageProgram(decoded)
+	p.digestNull = rawJSONNull(members["digest"])
+	p.argvNull = rawJSONNull(members["argv"])
+	p.workingDirNull = rawJSONNull(members["working_directory"])
+	p.mountsNull = rawJSONNull(members["mounts"])
+	p.limitsNull = rawJSONNull(members["limits"])
+	return nil
 }
 
 type RunLimits struct {

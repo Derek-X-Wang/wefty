@@ -28,6 +28,7 @@ const (
 	ErrorUnsupportedKind           ErrorCode = "unsupported_kind"
 	ErrorUnsupportedClass          ErrorCode = "unsupported_class"
 	ErrorUnsupportedRuntimeHandler ErrorCode = "unsupported_runtime_handler"
+	ErrorNoResolvedImageSnapshot   ErrorCode = "no_resolved_image_snapshot"
 	ErrorNotImplemented            ErrorCode = "not_implemented"
 	ErrorInternal                  ErrorCode = "internal"
 )
