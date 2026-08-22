@@ -19,7 +19,7 @@ const (
 
 var JobTransitions = map[JobState][]JobState{
 	JobQueued:                     {JobClaimed, JobFailed},
-	JobClaimed:                    {JobRunning, JobFailed},
+	JobClaimed:                    {JobRunning, JobQueued, JobFailed},
 	JobRunning:                    {JobAwaitingInput, JobSucceeded, JobFailed},
 	JobStopping:                   {},
 	JobStopped:                    {},

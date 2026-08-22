@@ -47,4 +47,12 @@ func TestServiceAcceptanceJobSpecAndFailurePolicy(t *testing.T) {
 	if err := validateProcessResult(ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseGuardian}); err != nil {
 		t.Fatalf("structured guardian termination rejected: %v", err)
 	}
+	if err := validateProcessResult(ProcessResult{RuntimeFailure: &contract.RuntimeFailure{
+		Code: contract.RuntimeFailureUnavailable, Message: "engine lost",
+	}, OOM: true}); err != nil {
+		t.Fatalf("runtime failure with additive OOM rejected: %v", err)
+	}
+	if got := classifyRuntimeFailure(contract.RuntimeFailureCode("unknown")); got != spawnFailureTerminal {
+		t.Fatalf("unknown runtime failure classification = %d, want terminal", got)
+	}
 }

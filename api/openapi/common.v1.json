@@ -136,6 +136,7 @@
           "lease_expires_at": { "type": "string", "format": "date-time" },
           "result": { "$ref": "#/components/schemas/ProcessResult" },
           "late_result": { "$ref": "#/components/schemas/LateResultEvidence" },
+          "image": { "$ref": "#/components/schemas/OCIImageEvidence" },
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" }
         }
@@ -261,6 +262,7 @@
         "additionalProperties": false,
         "properties": {
           "spawn_error": { "$ref": "#/components/schemas/SpawnFailure" },
+          "runtime_failure": { "$ref": "#/components/schemas/RuntimeFailure" },
           "output_error": {
             "type": "string",
             "description": "Output redaction, durable spooling, or upload finalization failed; the process exit code is not authoritative success."
@@ -270,6 +272,10 @@
           "termination_cause": {
             "enum": ["spontaneous", "agent", "guardian"],
             "description": "Structured initiator for a signal termination; never infer intent from signal or error strings."
+          },
+          "oom": {
+            "type": "boolean",
+            "description": "Additive runtime evidence. It does not select a primary result arm and is never inferred from exit 137."
           }
         },
         "dependentRequired": {
@@ -278,6 +284,7 @@
         },
         "oneOf": [
           { "required": ["spawn_error"] },
+          { "required": ["runtime_failure"] },
           { "required": ["output_error"] },
           { "required": ["exit_code"] },
           { "required": ["signal", "termination_cause"] }
@@ -294,6 +301,46 @@
             "description": "Stable machine-readable spawn failure code. Unknown codes default to terminal service policy."
           },
           "message": { "type": "string", "minLength": 1 }
+        }
+      },
+      "RuntimeFailure": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "message"],
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable post-Started runtime failure code. Unknown codes default terminal."
+          },
+          "message": { "type": "string", "minLength": 1 }
+        }
+      },
+      "OCIPlatformEvidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["os", "architecture"],
+        "properties": {
+          "os": { "type": "string", "minLength": 1 },
+          "architecture": { "type": "string", "minLength": 1 },
+          "variant": { "type": "string" }
+        }
+      },
+      "OCIImageEvidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["submitted_reference", "top_level_digest", "top_level_media_type", "index_digest", "platform_manifest_digest", "platform", "runtime_handler", "snapshotter", "resolved_at"],
+        "properties": {
+          "submitted_reference": { "type": "string", "minLength": 1 },
+          "top_level_digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+          "top_level_media_type": { "type": "string", "minLength": 1 },
+          "index_digest": { "type": ["string", "null"], "pattern": "^sha256:[a-f0-9]{64}$" },
+          "platform_manifest_digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+          "platform": { "$ref": "#/components/schemas/OCIPlatformEvidence" },
+          "runtime_handler": { "type": "string", "minLength": 1 },
+          "snapshotter": { "type": "string", "minLength": 1 },
+          "resolved_at": { "type": "string", "format": "date-time" },
+          "started_at": { "type": "string", "format": "date-time" }
         }
       },
       "LogPage": {

@@ -27,6 +27,11 @@ const (
 var spawnFailureClassifications = map[contract.SpawnFailureCode]spawnFailureClassification{
 	contract.SpawnFailureStartupReadinessTimeout: spawnFailureRestartable,
 	contract.SpawnFailurePublishedListener:       spawnFailureInfrastructure,
+	contract.SpawnFailureRuntimeUnavailable:      spawnFailureInfrastructure,
+}
+
+var runtimeFailureClassifications = map[contract.RuntimeFailureCode]spawnFailureClassification{
+	contract.RuntimeFailureUnavailable: spawnFailureInfrastructure,
 }
 
 func classifySpawnFailure(code contract.SpawnFailureCode) spawnFailureClassification {
@@ -37,6 +42,24 @@ func classifySpawnFailure(code contract.SpawnFailureCode) spawnFailureClassifica
 // pre-execution failure. It is fail-closed for unknown future codes.
 func IsRestartableSpawnFailure(code contract.SpawnFailureCode) bool {
 	return classifySpawnFailure(code) == spawnFailureRestartable
+}
+
+func classifyRuntimeFailure(code contract.RuntimeFailureCode) spawnFailureClassification {
+	return runtimeFailureClassifications[code]
+}
+
+func prestartRetryDelay(retryCount int) time.Duration {
+	if retryCount < 1 {
+		retryCount = 1
+	}
+	delay := time.Second
+	for i := 1; i < retryCount && delay < maxServiceRestartDelay; i++ {
+		delay *= 2
+		if delay > maxServiceRestartDelay {
+			delay = maxServiceRestartDelay
+		}
+	}
+	return delay
 }
 
 // defaultRestartJitter draws uniformly from 80% through 120% of the nominal
@@ -130,6 +153,8 @@ func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, lastFai
 		} else {
 			infrastructure = true
 		}
+	case result.RuntimeFailure != nil:
+		infrastructure = classifyRuntimeFailure(result.RuntimeFailure.Code) == spawnFailureInfrastructure
 	}
 
 	if infrastructure {

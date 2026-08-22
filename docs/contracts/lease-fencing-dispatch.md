@@ -152,9 +152,10 @@ age remains a storage bound and therefore binds later. Neither path changes the
 job verdict, attempt verdict, current attempt, or authority generation.
 
 The claimed-to-running promotion block inside a log append remains in place
-because it is authority-changing. It runs only while the attempt still has
-current boot-session, generation, current-attempt, and lease authority; late
-observation always skips it.
+for `kind=process` because it is authority-changing. It runs only while the
+attempt still has current boot-session, generation, current-attempt, and lease
+authority; late observation always skips it. `kind=oci` log insertion never
+promotes: only `Started` does.
 
 A gap declaration uses `LogEvent.sequence` as the first lost sequence and
 `gap.through_sequence` as the inclusive last sequence. Gaps advance continuity
@@ -188,6 +189,36 @@ flushed, durable logs are acknowledged, and the idempotent completion request
 is retrying. Renewal stops only after L1 accepts completion or the agent loses
 attempt authority. A redaction, spool, or uploader finalization failure is
 reported as `output_error`, never as a successful exit code.
+
+For `kind=process`, first renewal retains the legacy claimed-to-running
+acknowledgement. For `kind=oci`, renewal changes only the lease and directive;
+it never acknowledges execution or starts the portless-service stability
+clock. Successful completion likewise never supplies a missing OCI `Started`.
+
+## OCI image, start, and pre-start retry truth
+
+`PUT .../attempts/{attempt_id}/image` is fenced by the complete current
+attempt authority tuple and is write-once. It records submitted reference,
+top-level digest and media type, optional index digest, platform manifest
+digest, canonical runtime platform including variant, effective runtime
+handler, explicit snapshotter, and the L1-clock `resolved_at`. Identical replay
+is a no-op; a changed identity is `idempotency_conflict`. The observation must
+precede `Started` and a pinned job digest must match it.
+
+`POST .../attempts/{attempt_id}/started` is fenced and idempotent. It requires
+the accepted image observation, records `started_at` from the L1 clock, and is
+the sole `claimed → running` transition for OCI jobs and attempts. A stale
+fence, replaced session, expired lease, terminal attempt, or missing image
+observation cannot start authority.
+
+A one-shot OCI completion with pre-start `runtime_unavailable` terminalizes
+the old attempt and stores its exact result while atomically moving the job
+`claimed → queued`. The first claim fixes one pre-start infrastructure deadline
+(ten minutes by default, Store-configurable); retry count and capped exponential
+backoff are persisted on the job and survive L1 restart. An identical
+completion replay cannot increment the count or mint work. If the next backoff
+would cross the deadline, the job fails terminally. The ordinary claim path is
+still the only path that mints the next attempt and fence.
 
 ## Durable operator intent
 
@@ -310,6 +341,12 @@ diagnostic only. L1 owns the restartability allowlist and treats every unknown
 or unlisted spawn failure code as terminal. Signal results also carry a closed
 `termination_cause` (`spontaneous`, `agent`, or `guardian`) naming the
 initiator; policy never parses a signal or error string to infer intent.
+
+`ProcessResult` has exactly one primary arm: `spawn_error`, `runtime_failure`,
+`output_error`, `exit_code`, or `signal`. `runtime_failure {code,message}` is
+post-`Started` helper/engine-loss evidence; unknown or unlisted codes are
+terminal. OOM is an additive boolean fact, never another primary arm and never
+inferred from exit 137. A signal still requires exactly one termination cause.
 
 The awaiting-input prompt verbs and cancellation verbs are reserved. They
 return the shared error shape with HTTP `501`, code `not_implemented`, and

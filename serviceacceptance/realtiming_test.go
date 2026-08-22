@@ -28,6 +28,18 @@ import (
 
 const realTimingEvidenceEnvironment = "WEFTY_REALTIME_EVIDENCE_DIR"
 
+func TestOCIResultContractInRealtimeLane(t *testing.T) {
+	encoded, err := json.Marshal(contract.ProcessResult{
+		RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "engine lost"}, OOM: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(encoded), `{"runtime_failure":{"code":"runtime_unavailable","message":"engine lost"},"oom":true}`; got != want {
+		t.Fatalf("OCI ProcessResult JSON = %s, want %s", got, want)
+	}
+}
+
 func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	assertProductionTimingDefaults(t)
 	evidence := newRealTimingEvidence(t)
