@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:with-process-cwd",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": {
+    "working_directory": "/tmp",
+    "oci": { "image": { "reference": "alpine:latest" } }
+  }
+}

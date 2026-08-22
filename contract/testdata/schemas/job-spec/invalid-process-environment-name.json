@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "process:invalid-env",
+  "kind": "process",
+  "class": "one-shot",
+  "execution": {
+    "executable": { "path": "/usr/bin/true" },
+    "argv": ["true"],
+    "env": { "INVALID-NAME": "value" },
+    "working_directory": "/tmp",
+    "handoff_directory": "/tmp/handoff"
+  }
+}

@@ -196,6 +196,53 @@ func validJobSpec(dispatchKey string, tags []string) contract.JobSpec {
 	}
 }
 
+func TestL1RejectsOCIUntilCapabilityAwareClaimingLands(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	spec := contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1,
+		DispatchKey:   "oci-contract",
+		Kind:          contract.JobKindOCI,
+		Class:         contract.JobClassOneShot,
+		Execution: contract.ExecutionSpec{
+			OCI: &contract.OCIExecutionSpec{
+				Image: contract.OCIImageSpec{Reference: "ghcr.io/example/tool:latest"},
+			},
+		},
+	}
+
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("submit OCI job status = %d, want %d body=%s", status, http.StatusUnprocessableEntity, body)
+	}
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error.Code != contract.ErrorUnsupportedKind {
+		t.Fatalf("submit OCI job error code = %q, want %q body=%s", response.Error.Code, contract.ErrorUnsupportedKind, body)
+	}
+}
+
+func TestL1ReturnsTypedUnsupportedRuntimeHandler(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	spec := validJobSpec("process-runtime-handler", nil)
+	spec.RuntimeHandler = "io.containerd.runc.v2"
+
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("submit process job status = %d, want %d body=%s", status, http.StatusUnprocessableEntity, body)
+	}
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error.Code != contract.ErrorUnsupportedRuntimeHandler {
+		t.Fatalf("submit process job error code = %q, want %q body=%s", response.Error.Code, contract.ErrorUnsupportedRuntimeHandler, body)
+	}
+}
+
 func TestServiceJobSpecAcceptsPortlessExecutionWithoutHandoff(t *testing.T) {
 	h := newIntegrationHarness(t, nil)
 	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})

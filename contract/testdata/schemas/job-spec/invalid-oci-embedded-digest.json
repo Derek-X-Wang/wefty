@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:embedded-digest",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": {
+    "oci": {
+      "image": {
+        "reference": "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  }
+}

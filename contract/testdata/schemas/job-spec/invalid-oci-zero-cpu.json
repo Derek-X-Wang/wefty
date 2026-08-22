@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:zero-cpu",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": {
+    "oci": {
+      "image": { "reference": "alpine:latest" },
+      "limits": { "cpu_millicores": 0 }
+    }
+  }
+}

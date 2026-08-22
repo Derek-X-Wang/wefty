@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:image-uppercase",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": { "oci": { "image": { "reference": "Alpine:LATEST" } } }
+}

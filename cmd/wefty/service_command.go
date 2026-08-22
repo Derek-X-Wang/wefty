@@ -115,7 +115,7 @@ func executeServiceCreate(
 	spec := contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   idempotencyKey,
-		Kind:          "process",
+		Kind:          contract.JobKindProcess,
 		Class:         contract.JobClassService,
 		PublishedPort: port,
 		Restart:       contract.RestartAlways,

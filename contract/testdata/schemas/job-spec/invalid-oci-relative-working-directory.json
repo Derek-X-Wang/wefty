@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:relative-cwd",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": {
+    "oci": {
+      "image": { "reference": "alpine:latest" },
+      "working_directory": "workspace"
+    }
+  }
+}

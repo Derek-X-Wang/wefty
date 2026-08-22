@@ -1,27 +1,44 @@
 package contract
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"time"
 )
 
 const SchemaVersionV1 = 1
 
-// Run execution environment names are part of the v0.1 process contract.
-// Keep credentials in SensitiveEnv so public job projections can redact them.
+// Run execution environment names are shared wire-contract vocabulary. Keep
+// credentials in SensitiveEnv so public job projections can redact them.
 const (
-	EnvRunID           = "WEFTY_RUN_ID"
-	EnvL3Endpoint      = "WEFTY_L3_ENDPOINT"
-	EnvRunToken        = "WEFTY_RUN_TOKEN"
-	EnvHandoffDir      = "WEFTY_HANDOFF_DIR"
-	EnvServiceDir      = "WEFTY_SERVICE_DIR"
-	EnvServicePort     = "WEFTY_SERVICE_PORT"
-	DefaultHandoffRoot = "/tmp/wefty/handoffs"
+	EnvRunID                     = "WEFTY_RUN_ID"
+	EnvL3Endpoint                = "WEFTY_L3_ENDPOINT"
+	EnvRunToken                  = "WEFTY_RUN_TOKEN"
+	EnvHandoffDir                = "WEFTY_HANDOFF_DIR"
+	EnvServiceDir                = "WEFTY_SERVICE_DIR"
+	EnvServicePort               = "WEFTY_SERVICE_PORT"
+	DefaultHandoffRoot           = "/tmp/wefty/handoffs"
+	OCIContainerHandoffDirectory = "/wefty/handoff"
+	OCIContainerServiceDirectory = "/wefty/service"
 
 	// StableNodeTagPrefix reserves the routing tag used when a cold rerun
 	// consumes node-local handoff files from an earlier execution.
 	StableNodeTagPrefix = "wefty:node:"
 )
+
+// IsOCIReservedEnvironmentName reports whether name is one of the exact M3
+// values that an OCI runtime strips before injecting authoritative values.
+// Other tenant-defined WEFTY_* names are deliberately not reserved.
+func IsOCIReservedEnvironmentName(name string) bool {
+	switch name {
+	case EnvHandoffDir, EnvServiceDir, EnvServicePort, EnvL3Endpoint, EnvRunToken:
+		return true
+	default:
+		return false
+	}
+}
 
 // JobSpec is the versioned, transport-neutral description of a job. Kind and
 // Class are deliberately strings rather than closed enums: an agent decides
@@ -42,18 +59,177 @@ type JobSpec struct {
 }
 
 const (
+	JobKindProcess = "process"
+	JobKindOCI     = "oci"
+
 	JobClassOneShot = "one-shot"
 	JobClassService = "service"
 	RestartAlways   = "always"
 )
 
 type ExecutionSpec struct {
-	Executable       ExecutableSpec    `json:"executable"`
-	Argv             []string          `json:"argv"`
+	Executable       ExecutableSpec    `json:"executable,omitzero"`
+	Argv             []string          `json:"argv,omitzero"`
 	Env              map[string]string `json:"env,omitempty"`
 	SensitiveEnv     map[string]string `json:"sensitive_env,omitempty"`
-	WorkingDirectory string            `json:"working_directory"`
+	WorkingDirectory string            `json:"working_directory,omitzero"`
 	HandoffDirectory string            `json:"handoff_directory,omitempty"`
+	OCI              *OCIExecutionSpec `json:"oci,omitempty"`
+	executableSet    bool
+	argvSet          bool
+	workingDirSet    bool
+	handoffDirSet    bool
+	ociSet           bool
+}
+
+// UnmarshalJSON records wire presence for the asymmetric process and OCI arms.
+// A present null or zero-valued member is still present and therefore cannot
+// evade a cross-arm prohibition.
+func (s *ExecutionSpec) UnmarshalJSON(data []byte) error {
+	type wire ExecutionSpec
+	var decoded wire
+	if err := decodeJSONStrict(data, &decoded); err != nil {
+		return err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	*s = ExecutionSpec(decoded)
+	_, s.executableSet = members["executable"]
+	_, s.argvSet = members["argv"]
+	_, s.workingDirSet = members["working_directory"]
+	_, s.handoffDirSet = members["handoff_directory"]
+	_, s.ociSet = members["oci"]
+	return nil
+}
+
+// OCIExecutionSpec is the container payload arm selected by kind=oci. Env and
+// SensitiveEnv remain on ExecutionSpec because they are shared by every kind.
+type OCIExecutionSpec struct {
+	Image            OCIImageSpec `json:"image"`
+	Argv             []string     `json:"argv,omitempty"`
+	WorkingDirectory *string      `json:"working_directory,omitempty"`
+	Mounts           []OCIMount   `json:"mounts,omitempty"`
+	Limits           *OCILimits   `json:"limits,omitempty"`
+	argvNull         bool
+	workingDirNull   bool
+	mountsNull       bool
+	limitsNull       bool
+}
+
+// UnmarshalJSON preserves explicit nulls on optional OCI fields so the Go
+// validator enforces the same absent-versus-null contract as JSON Schema.
+func (s *OCIExecutionSpec) UnmarshalJSON(data []byte) error {
+	type wire OCIExecutionSpec
+	var decoded wire
+	if err := decodeJSONStrict(data, &decoded); err != nil {
+		return err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	*s = OCIExecutionSpec(decoded)
+	s.argvNull = rawJSONNull(members["argv"])
+	s.workingDirNull = rawJSONNull(members["working_directory"])
+	s.mountsNull = rawJSONNull(members["mounts"])
+	s.limitsNull = rawJSONNull(members["limits"])
+	return nil
+}
+
+// OCIImageSpec keeps the submitted reference as provenance while Digest, when
+// present, freezes the registry object that the runtime will execute.
+type OCIImageSpec struct {
+	Reference  string  `json:"reference"`
+	Digest     *string `json:"digest,omitempty"`
+	digestNull bool
+}
+
+// UnmarshalJSON preserves the distinction between an absent optional digest
+// and an explicit JSON null so Go validation matches the JSON Schema surface.
+func (s *OCIImageSpec) UnmarshalJSON(data []byte) error {
+	type wire OCIImageSpec
+	var decoded wire
+	if err := decodeJSONStrict(data, &decoded); err != nil {
+		return err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	*s = OCIImageSpec(decoded)
+	if rawJSONNull(members["digest"]) {
+		s.digestNull = true
+	}
+	return nil
+}
+
+func rawJSONNull(raw json.RawMessage) bool {
+	return string(raw) == "null"
+}
+
+type OCIMount struct {
+	NodePath      string `json:"node_path"`
+	ContainerPath string `json:"container_path"`
+	ReadOnly      bool   `json:"read_only,omitempty"`
+	readOnlyNull  bool
+}
+
+func (m *OCIMount) UnmarshalJSON(data []byte) error {
+	type wire OCIMount
+	var decoded wire
+	if err := decodeJSONStrict(data, &decoded); err != nil {
+		return err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	*m = OCIMount(decoded)
+	m.readOnlyNull = rawJSONNull(members["read_only"])
+	return nil
+}
+
+// OCILimits are optional cgroup-v2 hard limits. Each pointer distinguishes an
+// absent, uncapped limit from an explicitly invalid zero value on the wire.
+type OCILimits struct {
+	MemoryBytes   *int64 `json:"memory_bytes,omitempty"`
+	CPUMillicores *int64 `json:"cpu_millicores,omitempty"`
+	memoryNull    bool
+	cpuNull       bool
+}
+
+func (l *OCILimits) UnmarshalJSON(data []byte) error {
+	type wire OCILimits
+	var decoded wire
+	if err := decodeJSONStrict(data, &decoded); err != nil {
+		return err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	*l = OCILimits(decoded)
+	l.memoryNull = rawJSONNull(members["memory_bytes"])
+	l.cpuNull = rawJSONNull(members["cpu_millicores"])
+	return nil
+}
+
+func decodeJSONStrict(data []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("json: multiple values")
+		}
+		return err
+	}
+	return nil
 }
 
 // ExecutableSpec uses either a node-local path or inline bytes. Inline content

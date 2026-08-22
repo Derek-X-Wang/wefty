@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "process:with-oci",
+  "kind": "process",
+  "class": "one-shot",
+  "execution": {
+    "executable": { "path": "/usr/bin/true" },
+    "argv": ["true"],
+    "working_directory": "/tmp",
+    "handoff_directory": "/tmp/handoff",
+    "oci": { "image": { "reference": "alpine:latest" } }
+  }
+}

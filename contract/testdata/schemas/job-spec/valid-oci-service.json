@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:service",
+  "kind": "oci",
+  "class": "service",
+  "restart": "always",
+  "execution": {
+    "oci": {
+      "image": {
+        "reference": "ghcr.io/example/service:v1",
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  }
+}

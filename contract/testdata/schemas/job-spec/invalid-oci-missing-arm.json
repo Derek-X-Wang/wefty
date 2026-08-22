@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:missing-arm",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": {}
+}
