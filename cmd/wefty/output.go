@@ -106,15 +106,19 @@ func newServiceOutput(job l1.Job) serviceOutput {
 		managedDataPath = &value
 	}
 	var workingDirectory *string
+	workingDirectoryPolicy := "external; never deleted"
 	if job.Spec.Execution.WorkingDirectory != "" {
 		value := job.Spec.Execution.WorkingDirectory
 		workingDirectory = &value
+	} else if job.Spec.Execution.OCI != nil {
+		workingDirectory = job.Spec.Execution.OCI.WorkingDirectory
+		workingDirectoryPolicy = "container path; image default when absent"
 	}
 	return serviceOutput{
 		Job: job, Status: serviceDisplayStatus(job), DesiredState: desired,
 		BoundNodeID: boundNodeID, Ready: job.Ready,
 		ManagedDataPath: managedDataPath, WorkingDirectory: workingDirectory,
-		WorkingDirectoryPolicy: "external; never deleted",
+		WorkingDirectoryPolicy: workingDirectoryPolicy,
 	}
 }
 

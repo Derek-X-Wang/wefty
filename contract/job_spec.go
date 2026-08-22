@@ -71,15 +71,65 @@ func ValidateJobSpec(spec JobSpec) error {
 		}
 	}
 	if spec.Kind == JobKindOCI && spec.Execution.OCI != nil && len(spec.Execution.OCI.Mounts) > 0 {
-		nodeTags := 0
-		for _, tag := range normalizedTags {
-			if strings.HasPrefix(tag, StableNodeTagPrefix) && len(tag) > len(StableNodeTagPrefix) {
-				nodeTags++
-			}
+		program := ImageProgram{Mounts: spec.Execution.OCI.Mounts}
+		if err := ValidatePinnedRouting(program, normalizedTags); err != nil {
+			return err
 		}
-		if nodeTags != 1 {
-			return invalidJobSpecf("OCI jobs with mounts require exactly one stable-node routing tag %q", StableNodeTagPrefix+"<stable-node-id>")
+	}
+	return nil
+}
+
+// ValidateImageProgram applies the same structural rules as an L1 OCI job to
+// an L3 image snapshot. Class controls the digest requirement; routing is
+// validated separately because saved Workflow versions have no placement.
+func ValidateImageProgram(program ImageProgram, class string) error {
+	oci := &OCIExecutionSpec{
+		Image: OCIImageSpec{
+			Reference:  program.Reference,
+			Digest:     program.Digest,
+			digestNull: program.digestNull,
+		},
+		Argv:             program.Argv,
+		WorkingDirectory: program.WorkingDirectory,
+		Mounts:           program.Mounts,
+		Limits:           program.Limits,
+		argvNull:         program.argvNull,
+		workingDirNull:   program.workingDirNull,
+		mountsNull:       program.mountsNull,
+		limitsNull:       program.limitsNull,
+	}
+	spec := JobSpec{
+		SchemaVersion:  SchemaVersionV1,
+		DispatchKey:    "validate:image-program",
+		Kind:           JobKindOCI,
+		Class:          class,
+		RuntimeHandler: program.RuntimeHandler,
+		Execution:      ExecutionSpec{OCI: oci},
+	}
+	if class == JobClassService {
+		spec.Restart = RestartAlways
+	}
+	if utf8.RuneCountInString(spec.RuntimeHandler) > 128 {
+		return invalidJobSpecf("runtime_handler exceeds contract limits")
+	}
+	return validateOCIExecution(spec)
+}
+
+// ValidatePinnedRouting enforces the placement half of the image contract.
+// Operator mounts are meaningful only on exactly one stable node.
+func ValidatePinnedRouting(program ImageProgram, tags []string) error {
+	if len(program.Mounts) == 0 {
+		return nil
+	}
+	nodeTags := 0
+	for _, tag := range tags {
+		tag = strings.ToLower(strings.TrimSpace(tag))
+		if strings.HasPrefix(tag, StableNodeTagPrefix) && len(tag) > len(StableNodeTagPrefix) {
+			nodeTags++
 		}
+	}
+	if nodeTags != 1 {
+		return invalidJobSpecf("OCI jobs with mounts require exactly one stable-node routing tag %q", StableNodeTagPrefix+"<stable-node-id>")
 	}
 	return nil
 }

@@ -2004,13 +2004,13 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 }
 
 func validateJobSpec(spec *contract.JobSpec) error {
+	if err := contract.ValidateJobSpec(*spec); err != nil {
+		return protocolError(errorCode(err), "%v", err)
+	}
 	// TODO(#135): remove this interim gate when Ticket 3 adds capability-aware
 	// OCI requirements and prevents process-only agents from claiming OCI jobs.
 	if spec.Kind != contract.JobKindProcess {
 		return protocolError(contract.ErrorUnsupportedKind, "job kind %q is not supported by L1 yet", spec.Kind)
-	}
-	if err := contract.ValidateJobSpec(*spec); err != nil {
-		return protocolError(errorCode(err), "%v", err)
 	}
 	return nil
 }

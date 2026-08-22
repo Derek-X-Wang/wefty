@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -21,6 +22,13 @@ import (
 type JobClient interface {
 	SubmitJob(context.Context, contract.JobSpec) (l1.Job, error)
 	GetJob(context.Context, string) (l1.Job, error)
+}
+
+// JobImageEvidenceClient is the L1 result-ingestion seam for tag-only image
+// runs. It remains separate from JobClient so tests and alternate L1 clients
+// can implement the evidence projection independently.
+type JobImageEvidenceClient interface {
+	GetJobImageEvidence(context.Context, string) ([]AttemptImageEvidence, error)
 }
 
 // JobLogClient is the public L1 log-polling dependency of the L3 API.
@@ -62,6 +70,42 @@ func (c *L1Client) GetJob(ctx context.Context, jobID string) (l1.Job, error) {
 		return l1.Job{}, err
 	}
 	return job, nil
+}
+
+func (c *L1Client) GetJobImageEvidence(ctx context.Context, jobID string) ([]AttemptImageEvidence, error) {
+	// TODO(#143): replace this compatibility projection with the typed L1
+	// attempt-evidence API once its contract is available on main.
+	var projection struct {
+		Attempts []struct {
+			AttemptID string `json:"attempt_id"`
+			Image     *struct {
+				SubmittedReference     string    `json:"submitted_reference"`
+				TopLevelDigest         string    `json:"top_level_digest"`
+				PlatformManifestDigest string    `json:"platform_manifest_digest"`
+				ResolvedAt             time.Time `json:"resolved_at"`
+			} `json:"image,omitempty"`
+		} `json:"attempts"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/v1/jobs/"+jobID, nil, &projection, http.StatusOK); err != nil {
+		return nil, err
+	}
+	evidence := make([]AttemptImageEvidence, 0, len(projection.Attempts))
+	for _, attempt := range projection.Attempts {
+		if attempt.Image == nil {
+			continue
+		}
+		var platformDigest *string
+		if attempt.Image.PlatformManifestDigest != "" {
+			value := attempt.Image.PlatformManifestDigest
+			platformDigest = &value
+		}
+		evidence = append(evidence, AttemptImageEvidence{
+			AttemptID: attempt.AttemptID, SubmittedReference: attempt.Image.SubmittedReference,
+			TopLevelDigest: attempt.Image.TopLevelDigest, PlatformDigest: platformDigest,
+			ObservedAt: attempt.Image.ResolvedAt,
+		})
+	}
+	return evidence, nil
 }
 
 func (c *L1Client) GetJobLogs(ctx context.Context, jobID, cursor string, limit int) (l1.LogPage, error) {
@@ -121,4 +165,5 @@ func (c *L1Client) do(ctx context.Context, method, path string, body any, target
 }
 
 var _ JobClient = (*L1Client)(nil)
+var _ JobImageEvidenceClient = (*L1Client)(nil)
 var _ JobLogClient = (*L1Client)(nil)

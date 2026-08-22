@@ -98,6 +98,54 @@ func TestJobSpecSchemaAndGoValidationAgree(t *testing.T) {
 	}
 }
 
+func TestImageProgramSchemaAndGoValidationAgree(t *testing.T) {
+	t.Parallel()
+
+	schema := compileSchemas(t)["run-record"]
+	cases := map[string]string{
+		"complete valid program":       `{"reference":"ghcr.io/example/tool:v1","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","argv":["","run"],"working_directory":"/","mounts":[{"node_path":"/srv/input","container_path":"/input","read_only":false}],"limits":{"memory_bytes":1,"cpu_millicores":1},"runtime_handler":""}`,
+		"argv all empty":               `{"reference":"alpine:latest","argv":[""]}`,
+		"trailing working directory":   `{"reference":"alpine:latest","working_directory":"/workspace/"}`,
+		"dot working directory":        `{"reference":"alpine:latest","working_directory":"/workspace/../tmp"}`,
+		"root node mount":              `{"reference":"alpine:latest","mounts":[{"node_path":"/","container_path":"/input"}]}`,
+		"reserved mount target":        `{"reference":"alpine:latest","mounts":[{"node_path":"/srv/input","container_path":"/wefty/handoff/result"}]}`,
+		"empty limits":                 `{"reference":"alpine:latest","limits":{}}`,
+		"limit beyond int64":           `{"reference":"alpine:latest","limits":{"memory_bytes":9223372036854775808}}`,
+		"explicit null optional field": `{"reference":"alpine:latest","working_directory":null}`,
+		"unknown member":               `{"reference":"alpine:latest","future":true}`,
+	}
+	cases["reference too long"] = `{"reference":"` + strings.Repeat("a", 2049) + `"}`
+	for name, imageRaw := range cases {
+		name, imageRaw := name, imageRaw
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			assertImageProgramValidatorsAgree(t, schema, []byte(imageRaw))
+		})
+	}
+}
+
+func assertImageProgramValidatorsAgree(t *testing.T, schema *jsonschema.Schema, imageRaw []byte) {
+	t.Helper()
+
+	recordRaw := []byte(fmt.Sprintf(`{"schema_version":1,"run_id":"run_image","dispatch_key":"run:image","status":"pending","trigger":{"type":"manual","principal":"tester"},"workflow":{"image":%s},"params":{},"tags":["wefty:node:node-a"],"created_at":"2026-08-22T12:00:00Z","updated_at":"2026-08-22T12:00:00Z"}`, imageRaw))
+	instance, schemaDecodeErr := jsonschema.UnmarshalJSON(bytes.NewReader(recordRaw))
+	schemaErr := schemaDecodeErr
+	if schemaErr == nil {
+		schemaErr = schema.Validate(instance)
+	}
+	var program ImageProgram
+	goErr := json.Unmarshal(imageRaw, &program)
+	if goErr == nil {
+		goErr = ValidateImageProgram(program, JobClassOneShot)
+	}
+	if goErr == nil {
+		goErr = ValidatePinnedRouting(program, []string{StableNodeTagPrefix + "node-a"})
+	}
+	if (schemaErr == nil) != (goErr == nil) {
+		t.Fatalf("schema and Go validation disagree:\nschema: %v\nGo: %v\nimage: %s", schemaErr, goErr, imageRaw)
+	}
+}
+
 func assertJobSpecValidatorsAgree(t *testing.T, schema *jsonschema.Schema, raw []byte) {
 	t.Helper()
 
@@ -136,6 +184,7 @@ func TestValidFixturesRoundTripThroughGoTypes(t *testing.T) {
 		{"testdata/schemas/envelope/valid.json", func() any { return new(Envelope) }},
 		{"testdata/schemas/gate-result/valid.json", func() any { return new(GateResult) }},
 		{"testdata/schemas/run-record/valid.json", func() any { return new(RunRecord) }},
+		{"testdata/schemas/run-record/valid-image.json", func() any { return new(RunRecord) }},
 	}
 
 	for _, tc := range cases {

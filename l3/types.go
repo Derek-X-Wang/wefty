@@ -43,32 +43,60 @@ type InlineScriptInput struct {
 // WorkflowVersionInput is the executable snapshot accepted when appending a
 // saved workflow version. Versions are assigned monotonically by the ledger.
 type WorkflowVersionInput struct {
-	Content     string   `json:"content"`
-	SHA256      string   `json:"sha256"`
-	Interpreter []string `json:"interpreter,omitempty"`
-	Mode        *uint32  `json:"mode,omitempty"`
+	Content     string                 `json:"content,omitempty"`
+	SHA256      string                 `json:"sha256,omitempty"`
+	Interpreter []string               `json:"interpreter,omitempty"`
+	Mode        *uint32                `json:"mode,omitempty"`
+	Image       *contract.ImageProgram `json:"image,omitempty"`
 }
 
 type WorkflowVersion struct {
-	WorkflowID  string    `json:"workflow_id"`
-	Version     int       `json:"version"`
-	WorkflowRef string    `json:"workflow_ref"`
-	Content     string    `json:"content"`
-	SHA256      string    `json:"sha256"`
-	Interpreter []string  `json:"interpreter"`
-	Mode        uint32    `json:"mode"`
-	CreatedAt   time.Time `json:"created_at"`
+	WorkflowID  string                 `json:"workflow_id"`
+	Version     int                    `json:"version"`
+	WorkflowRef string                 `json:"workflow_ref"`
+	Content     string                 `json:"content"`
+	SHA256      string                 `json:"sha256"`
+	Interpreter []string               `json:"interpreter,omitempty"`
+	Mode        uint32                 `json:"mode,omitempty"`
+	Image       *contract.ImageProgram `json:"image,omitempty"`
+	CreatedAt   time.Time              `json:"created_at"`
+}
+
+// MarshalJSON keeps saved Workflow versions discriminated on the wire while
+// preserving the existing flat script representation.
+func (v WorkflowVersion) MarshalJSON() ([]byte, error) {
+	type common struct {
+		WorkflowID  string    `json:"workflow_id"`
+		Version     int       `json:"version"`
+		WorkflowRef string    `json:"workflow_ref"`
+		CreatedAt   time.Time `json:"created_at"`
+	}
+	base := common{WorkflowID: v.WorkflowID, Version: v.Version, WorkflowRef: v.WorkflowRef, CreatedAt: v.CreatedAt}
+	if v.Image != nil {
+		return json.Marshal(struct {
+			common
+			Image *contract.ImageProgram `json:"image"`
+		}{common: base, Image: v.Image})
+	}
+	return json.Marshal(struct {
+		common
+		Content     string   `json:"content"`
+		SHA256      string   `json:"sha256"`
+		Interpreter []string `json:"interpreter"`
+		Mode        uint32   `json:"mode"`
+	}{common: base, Content: v.Content, SHA256: v.SHA256, Interpreter: nonNilStrings(v.Interpreter), Mode: v.Mode})
 }
 
 type CreateRunRequest struct {
-	WorkflowRef      string              `json:"workflow_ref,omitempty"`
-	InlineScript     *InlineScriptInput  `json:"inline_script,omitempty"`
-	Params           json.RawMessage     `json:"params"`
-	Tags             []string            `json:"tags,omitempty"`
-	Limits           *contract.RunLimits `json:"limits,omitempty"`
-	EnvelopeSchema   json.RawMessage     `json:"envelope_schema,omitempty"`
-	RequiredEnvelope bool                `json:"required_envelope,omitempty"`
-	ParentRunID      string              `json:"parent_run_id,omitempty"`
+	WorkflowRef      string                 `json:"workflow_ref,omitempty"`
+	InlineScript     *InlineScriptInput     `json:"inline_script,omitempty"`
+	Image            *contract.ImageProgram `json:"image,omitempty"`
+	Params           json.RawMessage        `json:"params"`
+	Tags             []string               `json:"tags,omitempty"`
+	Limits           *contract.RunLimits    `json:"limits,omitempty"`
+	EnvelopeSchema   json.RawMessage        `json:"envelope_schema,omitempty"`
+	RequiredEnvelope bool                   `json:"required_envelope,omitempty"`
+	ParentRunID      string                 `json:"parent_run_id,omitempty"`
 }
 
 type CreateRunInput struct {
@@ -98,6 +126,17 @@ type RunExecution struct {
 	DispatchAttempts int                `json:"dispatch_attempts"`
 	DispatchError    *contract.APIError `json:"dispatch_error,omitempty"`
 	Job              *l1.Job            `json:"job,omitempty"`
+}
+
+// AttemptImageEvidence is the accepted L1 observation needed to freeze a
+// tag-only run before a cold rerun. It intentionally carries only identity,
+// observation time, and provenance needed by the L3 snapshot ledger.
+type AttemptImageEvidence struct {
+	AttemptID          string
+	SubmittedReference string
+	TopLevelDigest     string
+	PlatformDigest     *string
+	ObservedAt         time.Time
 }
 
 // TriggerProvenance is the immutable ledger row explaining why a run exists.
