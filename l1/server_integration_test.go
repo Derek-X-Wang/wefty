@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -221,6 +222,33 @@ func TestL1RejectsOCIUntilCapabilityAwareClaimingLands(t *testing.T) {
 	}
 	if response.Error.Code != contract.ErrorUnsupportedKind {
 		t.Fatalf("submit OCI job error code = %q, want %q body=%s", response.Error.Code, contract.ErrorUnsupportedKind, body)
+	}
+}
+
+func TestL1RequiresServiceImageDigestBeforeRuntimeSupportCheck(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
+	spec := contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1,
+		DispatchKey:   "oci-service-without-digest",
+		Kind:          contract.JobKindOCI,
+		Class:         contract.JobClassService,
+		Restart:       contract.RestartAlways,
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "ghcr.io/example/tool:latest"},
+		}},
+	}
+
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
+	if status != http.StatusBadRequest {
+		t.Fatalf("submit unresolved OCI service status = %d, want %d body=%s", status, http.StatusBadRequest, body)
+	}
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error.Code != contract.ErrorInvalidRequest || !strings.Contains(response.Error.Message, "image digest") {
+		t.Fatalf("unresolved OCI service error = %#v", response.Error)
 	}
 }
 

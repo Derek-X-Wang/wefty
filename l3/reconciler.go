@@ -5,13 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const DefaultReconcileInterval = time.Second
 
 type ReconcilerConfig struct {
-	Interval time.Duration
-	OnError  func(error)
+	Interval      time.Duration
+	OnError       func(error)
+	ImageEvidence JobImageEvidenceClient
 }
 
 // Reconciler drains durable dispatch intents and projects L1 job states. It is
@@ -19,6 +22,7 @@ type ReconcilerConfig struct {
 type Reconciler struct {
 	store    *Store
 	jobs     JobClient
+	images   JobImageEvidenceClient
 	interval time.Duration
 	onError  func(error)
 }
@@ -34,7 +38,11 @@ func NewReconciler(store *Store, jobs JobClient, config ReconcilerConfig) (*Reco
 	if interval <= 0 {
 		interval = DefaultReconcileInterval
 	}
-	return &Reconciler{store: store, jobs: jobs, interval: interval, onError: config.OnError}, nil
+	images := config.ImageEvidence
+	if images == nil {
+		images, _ = jobs.(JobImageEvidenceClient)
+	}
+	return &Reconciler{store: store, jobs: jobs, images: images, interval: interval, onError: config.OnError}, nil
 }
 
 // ReconcileOnce makes one complete pass over every outstanding dispatch and
@@ -84,6 +92,28 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 		if err != nil {
 			passErrors = append(passErrors, err)
 			continue
+		}
+		if r.images != nil && (job.State == contract.JobSucceeded || job.State == contract.JobFailed) {
+			evidence, err := r.images.GetJobImageEvidence(ctx, run.JobID)
+			if err != nil {
+				passErrors = append(passErrors, err)
+				continue
+			}
+			ingestionFailed := false
+			for _, observation := range evidence {
+				recorded, err := r.store.recordRunImageResolution(ctx, run.RunID, observation)
+				if err != nil {
+					passErrors = append(passErrors, err)
+					ingestionFailed = true
+					break
+				}
+				if recorded {
+					break
+				}
+			}
+			if ingestionFailed {
+				continue
+			}
 		}
 		if err := r.store.recordRunNode(ctx, run.RunID, job.NodeID); err != nil {
 			passErrors = append(passErrors, err)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -72,6 +73,49 @@ func TestOpenAPIJobSpecPublishesOCIArm(t *testing.T) {
 	definitions := object(t, contractSchema["$defs"], "$defs")
 	if _, present := definitions["ociExecution"]; !present {
 		t.Fatal("OpenAPI-referenced JobSpec schema has no OCI execution definition")
+	}
+}
+
+func TestL3ImageProgramPublishesJobSpecOCIConstraints(t *testing.T) {
+	t.Parallel()
+
+	l3Document := readObject(t, "l3.v1.json")
+	l3Schemas := object(t, object(t, l3Document["components"], "components")["schemas"], "components.schemas")
+	l3Image := object(t, l3Schemas["ImageProgram"], "ImageProgram")
+	l3Properties := object(t, l3Image["properties"], "ImageProgram.properties")
+
+	jobDocument := readObject(t, filepath.Join("..", "..", "contract", "schemas", "v1", "job-spec.schema.json"))
+	jobDefinitions := object(t, jobDocument["$defs"], "$defs")
+	jobOCI := object(t, jobDefinitions["ociExecution"], "ociExecution")
+	jobOCIProperties := object(t, jobOCI["properties"], "ociExecution.properties")
+	jobImageProperties := object(t, object(t, jobOCIProperties["image"], "ociExecution.image")["properties"], "ociExecution.image.properties")
+	jobProperties := object(t, jobDocument["properties"], "job-spec.properties")
+
+	for _, field := range []string{"reference"} {
+		if !reflect.DeepEqual(l3Properties[field], jobImageProperties[field]) {
+			t.Fatalf("L3 ImageProgram.%s differs from JobSpec OCI image constraint", field)
+		}
+	}
+	for _, field := range []string{"argv", "limits"} {
+		if !reflect.DeepEqual(l3Properties[field], jobOCIProperties[field]) {
+			t.Fatalf("L3 ImageProgram.%s differs from JobSpec OCI constraint", field)
+		}
+	}
+	if !reflect.DeepEqual(l3Properties["runtime_handler"], jobProperties["runtime_handler"]) {
+		t.Fatal("L3 ImageProgram.runtime_handler differs from JobSpec constraint")
+	}
+	for l3Name, jobName := range map[string]string{
+		"OCIContainerPath": "containerPath",
+		"OCINodePath":      "nodePath",
+	} {
+		if !reflect.DeepEqual(l3Schemas[l3Name], jobDefinitions[jobName]) {
+			t.Fatalf("L3 %s differs from JobSpec %s", l3Name, jobName)
+		}
+	}
+	l3MountPath := object(t, l3Schemas["OCIMountContainerPath"], "OCIMountContainerPath")["allOf"].([]any)
+	jobMountPath := object(t, jobDefinitions["mountContainerPath"], "mountContainerPath")["allOf"].([]any)
+	if !reflect.DeepEqual(l3MountPath[1], jobMountPath[1]) {
+		t.Fatal("L3 reserved mount-target exclusions differ from JobSpec")
 	}
 }
 

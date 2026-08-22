@@ -169,8 +169,10 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	var requiredEnvelope bool
 	var mode scriptMode
 	var tags, interpreters stringListFlag
+	var imageFlags imageFlagSet
 	flags.StringVar(&workflowRef, "workflow-ref", "", "saved workflow reference")
 	flags.StringVar(&scriptPath, "script", "", "inline script file")
+	imageFlags.bind(flags)
 	flags.StringVar(&params, "params", "", "params JSON object")
 	flags.StringVar(&paramsFile, "params-file", "", "file containing params JSON")
 	flags.Var(&tags, "tag", "routing tag (repeatable)")
@@ -188,8 +190,23 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	if flags.NArg() != 0 {
 		return usageError("submit does not accept positional arguments")
 	}
-	if (workflowRef == "") == (scriptPath == "") {
-		return usageError("submit requires exactly one of --workflow-ref or --script")
+	sources := 0
+	for _, present := range []bool{workflowRef != "", scriptPath != "", imageFlags.reference != ""} {
+		if present {
+			sources++
+		}
+	}
+	if sources != 1 {
+		return usageError("submit requires exactly one of --workflow-ref, --script, or --image")
+	}
+	if imageFlags.reference == "" && imageFlags.nonRoutingOptionsSet() {
+		return usageError("--argv, --working-directory, --mount, image limits, and --runtime-handler require --image")
+	}
+	if imageFlags.reference == "" && strings.TrimSpace(imageFlags.nodeID) != "" {
+		return usageError("--node requires --image")
+	}
+	if imageFlags.reference != "" && (len(interpreters) > 0 || mode.value != nil) {
+		return usageError("--interpreter and --mode apply only to --script")
 	}
 	paramsJSON, err := readJSONObject(params, paramsFile, true)
 	if err != nil {
@@ -199,8 +216,12 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	if err != nil {
 		return fmt.Errorf("envelope schema: %w", err)
 	}
+	image, resolvedTags, err := imageFlags.programAndTags(tags, contract.JobClassOneShot)
+	if err != nil {
+		return err
+	}
 	request := l3.CreateRunRequest{
-		WorkflowRef: workflowRef, Params: paramsJSON, Tags: tags,
+		WorkflowRef: workflowRef, Image: image, Params: paramsJSON, Tags: resolvedTags,
 		EnvelopeSchema: envelopeJSON, RequiredEnvelope: requiredEnvelope,
 	}
 	if maxRuntime < 0 || maxCost < 0 {
