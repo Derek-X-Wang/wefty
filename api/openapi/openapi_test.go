@@ -65,14 +65,21 @@ func TestOpenAPIJobSpecPublishesOCIArm(t *testing.T) {
 		t.Fatalf("JobSpec schema ref = %v", jobSpec["$ref"])
 	}
 	description, _ := jobSpec["description"].(string)
-	if !strings.Contains(description, "execution.oci") {
-		t.Fatalf("JobSpec description does not publish the OCI arm: %q", description)
+	if !strings.Contains(description, "execution.oci") || !strings.Contains(description, "computer") {
+		t.Fatalf("JobSpec description does not publish the OCI Computer trait: %q", description)
 	}
 
 	contractSchema := readObject(t, filepath.Join("..", "..", "contract", "schemas", "v1", "job-spec.schema.json"))
 	definitions := object(t, contractSchema["$defs"], "$defs")
 	if _, present := definitions["ociExecution"]; !present {
 		t.Fatal("OpenAPI-referenced JobSpec schema has no OCI execution definition")
+	}
+	computer := object(t, definitions["ociComputer"], "ociComputer")
+	computerProperties := object(t, computer["properties"], "ociComputer.properties")
+	for _, field := range []string{"display", "disk_bytes"} {
+		if _, present := computerProperties[field]; !present {
+			t.Errorf("OpenAPI-referenced Computer trait is missing %q", field)
+		}
 	}
 }
 

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:computer-port",
+  "kind": "oci",
+  "class": "service",
+  "restart": "always",
+  "published_port": 8080,
+  "routing_tags": ["wefty:node:computer-a"],
+  "execution": {
+    "oci": {
+      "image": {
+        "reference": "ghcr.io/example/computer:v1",
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "limits": { "memory_bytes": 1 },
+      "computer": {
+        "display": { "protocol": "rfb-websocket-v1" },
+        "disk_bytes": 1
+      }
+    }
+  }
+}

@@ -8,10 +8,13 @@
       "WEFTY_HANDOFF_DIR": "/operator-value-is-stripped",
       "WEFTY_SERVICE_DIR": "/operator-value-is-stripped",
       "WEFTY_SERVICE_PORT": "1",
-      "WEFTY_L3_ENDPOINT": "http://operator-value-is-stripped"
+      "WEFTY_L3_ENDPOINT": "http://operator-value-is-stripped",
+      "WEFTY_COMPUTER_VIEW_PORT": "1",
+      "WEFTY_COMPUTER_CONTROL_PORT": "2"
     },
     "sensitive_env": {
-      "WEFTY_RUN_TOKEN": "operator-value-is-stripped"
+      "WEFTY_RUN_TOKEN": "operator-value-is-stripped",
+      "WEFTY_COMPUTER_TOKEN": "operator-value-is-stripped"
     },
     "oci": { "image": { "reference": "alpine:latest" } }
   }

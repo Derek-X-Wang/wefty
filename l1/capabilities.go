@@ -16,6 +16,7 @@ const (
 	capabilityKindPrefix           = "kind:"
 	capabilityRuntimeHandlerPrefix = "runtime_handler:"
 	capabilityCgroupV2             = "cgroup_v2"
+	capabilityComputer             = "computer"
 	maxNodeCapabilities            = 128
 	maxMissingCapabilities         = 128
 	maxCapabilityNameBytes         = 128
@@ -151,6 +152,7 @@ func sameCapabilityObservation(incoming storedCapabilityObservation, capabilitie
 func isOCIProbeCapability(capability string) bool {
 	capability = strings.ToLower(strings.TrimSpace(capability))
 	return capability == "kind:oci" || capability == "cgroup_v2" || capability == "apparmor" ||
+		capability == capabilityComputer ||
 		strings.HasPrefix(capability, capabilityRuntimeHandlerPrefix)
 }
 
@@ -165,6 +167,9 @@ func RequiredCapabilities(spec contract.JobSpec) []string {
 	if spec.Execution.OCI != nil && spec.Execution.OCI.Limits != nil &&
 		(spec.Execution.OCI.Limits.MemoryBytes != nil || spec.Execution.OCI.Limits.CPUMillicores != nil) {
 		required = append(required, capabilityCgroupV2)
+	}
+	if spec.Execution.OCI != nil && spec.Execution.OCI.Computer != nil {
+		required = append(required, capabilityComputer)
 	}
 	sort.Strings(required)
 	return required

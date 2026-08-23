@@ -80,9 +80,12 @@ func ValidateJobSpec(spec *JobSpec) error {
 			return invalidJobSpecf("max_restart_streak must be at least 1")
 		}
 	}
-	if spec.Kind == JobKindOCI && spec.Execution.OCI != nil && len(spec.Execution.OCI.Mounts) > 0 {
-		program := ImageProgram{Mounts: spec.Execution.OCI.Mounts}
-		if err := ValidatePinnedRouting(program, normalizedTags); err != nil {
+	if RequiresPinnedPlacement(*spec) {
+		message := "OCI jobs with mounts require exactly one stable-node routing tag"
+		if spec.Execution.OCI.Computer != nil {
+			message = "Pinned OCI jobs require exactly one stable-node routing tag"
+		}
+		if err := validatePinnedRouting(true, normalizedTags, message); err != nil {
 			return err
 		}
 	}
@@ -125,10 +128,23 @@ func ValidateImageProgram(program ImageProgram, class string) error {
 	return validateOCIExecution(&spec)
 }
 
-// ValidatePinnedRouting enforces the placement half of the image contract.
-// Operator mounts are meaningful only on exactly one stable node.
+// ValidatePinnedRouting is the ImageProgram-only placement validator. An
+// ImageProgram deliberately cannot carry the Computer trait, so only its
+// operator mounts can require exactly one stable node here.
 func ValidatePinnedRouting(program ImageProgram, tags []string) error {
-	if len(program.Mounts) == 0 {
+	return validatePinnedRouting(len(program.Mounts) > 0, tags, "OCI jobs with mounts require exactly one stable-node routing tag")
+}
+
+// RequiresPinnedPlacement reports whether an L1 JobSpec depends on Node-local
+// state. Operator mounts and the Computer trait share this one placement
+// predicate; neither introduces a scheduling axis.
+func RequiresPinnedPlacement(spec JobSpec) bool {
+	return spec.Kind == JobKindOCI && spec.Execution.OCI != nil &&
+		(len(spec.Execution.OCI.Mounts) > 0 || spec.Execution.OCI.Computer != nil)
+}
+
+func validatePinnedRouting(required bool, tags []string, message string) error {
+	if !required {
 		return nil
 	}
 	nodeTags := 0
@@ -139,7 +155,7 @@ func ValidatePinnedRouting(program ImageProgram, tags []string) error {
 		}
 	}
 	if nodeTags != 1 {
-		return invalidJobSpecf("OCI jobs with mounts require exactly one stable-node routing tag %q", StableNodeTagPrefix+"<stable-node-id>")
+		return invalidJobSpecf("%s %q", message, StableNodeTagPrefix+"<stable-node-id>")
 	}
 	return nil
 }
@@ -179,7 +195,7 @@ func validateOCIExecution(spec *JobSpec) error {
 		return invalidJobSpecf("OCI jobs forbid process execution fields")
 	}
 	oci := spec.Execution.OCI
-	if oci.argvNull || oci.workingDirNull || oci.mountsNull || oci.limitsNull {
+	if oci.argvNull || oci.workingDirNull || oci.mountsNull || oci.limitsNull || oci.computerNull {
 		return invalidJobSpecf("optional OCI execution fields cannot be null")
 	}
 	if utf8.RuneCountInString(oci.Image.Reference) > 2048 || !ociImageReferenceRE.MatchString(oci.Image.Reference) {
@@ -228,6 +244,23 @@ func validateOCIExecution(spec *JobSpec) error {
 		}
 		if oci.Limits.CPUMillicores != nil && *oci.Limits.CPUMillicores < 1 {
 			return invalidJobSpecf("OCI cpu_millicores must be positive")
+		}
+	}
+	if oci.Computer != nil {
+		if spec.Class != JobClassService {
+			return invalidJobSpecf("OCI computer trait requires class %q", JobClassService)
+		}
+		if spec.PublishedPort != nil || spec.publishedPortSet {
+			return invalidJobSpecf("published_port is forbidden for the OCI computer trait")
+		}
+		if oci.Computer.Display.Protocol != ComputerDisplayProtocolRFBWebSocketV1 {
+			return invalidJobSpecf("OCI computer display protocol must be %q", ComputerDisplayProtocolRFBWebSocketV1)
+		}
+		if oci.Computer.DiskBytes < 1 {
+			return invalidJobSpecf("OCI computer disk_bytes must be positive")
+		}
+		if oci.Limits == nil || oci.Limits.MemoryBytes == nil || *oci.Limits.MemoryBytes < 1 {
+			return invalidJobSpecf("OCI computer trait requires positive explicit memory_bytes")
 		}
 	}
 	return nil

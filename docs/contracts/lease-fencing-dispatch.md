@@ -22,11 +22,12 @@ L1 derives and transactionally persists `RequiredCapabilities(JobSpec)` when it
 creates the job. The normalized set always contains `kind:<name>`, additionally
 contains `runtime_handler:<name>` for a non-empty handler, and contains
 `cgroup_v2` when OCI memory or CPU limits request kernel enforcement. The
-winning claim mutation anti-joins these rows against capability entries whose
-current full-set observation has value true. The same persisted requirements
-and shared comparison module drive operator unschedulability diagnostics for
-both job classes; claim and diagnostic paths never reconstruct requirements
-from JSON independently.
+`execution.oci.computer` trait additionally requires the non-numeric
+`computer` capability. The winning claim mutation anti-joins these rows against
+capability entries whose current full-set observation has value true. The same
+persisted requirements and shared comparison module drive operator
+unschedulability diagnostics for both job classes; claim and diagnostic paths
+never reconstruct requirements from JSON independently.
 
 Registration and every current-agent heartbeat carry the complete capability
 set plus a Capability revision, observation time, bounded missing-capability
@@ -345,14 +346,15 @@ apply the same asymmetric arm rules. `kind=process` retains the flat
 valid open-kind data but cannot reuse the OCI arm.
 
 The OCI arm carries image reference and optional digest, an optional full-vector
-argv replacement, optional container working directory, operator mounts, and
-optional cgroup-v2 hard limits. Only an initial one-shot submission may omit its
-digest; every other OCI class requires one. A digest, when present, is exactly
+argv replacement, optional container working directory, operator mounts,
+optional cgroup-v2 hard limits, and an optional Computer trait. Only an initial
+one-shot submission may omit its digest; every other OCI class requires one. A digest, when present, is exactly
 `sha256:` plus 64 lowercase hexadecimal characters, and the provenance
 reference is a lowercase OCI distribution repository plus optional tag that
 never embeds `@digest`. A mount source is a normalized absolute path other than
-root, while symlink and allowed-root checks remain node-side; any mounted job
-must carry exactly one `wefty:node:*` routing tag. A non-empty `runtime_handler`
+root, while symlink and allowed-root checks remain node-side. A Job requires
+Pinned placement when it has an operator mount or the Computer trait, and must
+then carry exactly one `wefty:node:*` routing tag. A non-empty `runtime_handler`
 is valid only outside the process arm; a process job that sets one continues to
 receive `422 unsupported_runtime_handler`.
 
@@ -389,10 +391,17 @@ agent that cannot execute one reports `unsupported_class`. The known values are
 
 A service declares `restart: always`, may declare a positive
 `max_restart_streak`, and may carry a `published_port` in the inclusive range
-1–65535. A missing or null port means the service is portless. Services do not
-participate in the run handoff lifecycle, so `handoff_directory` is required
-only for `one-shot`; the agent never prepares or finishes a handoff path for a
-service.
+1–65535. A missing or null port means the service is portless. A Computer is a
+digest-pinned OCI service Job with `display.protocol=rfb-websocket-v1`, positive
+`disk_bytes`, and positive explicit OCI `memory_bytes`; it forbids the
+`published_port` member because later Computer publication uses named display
+endpoints. OCI `disk_bytes`, `memory_bytes`, and `cpu_millicores` use JSON
+Schema integer semantics: decimal and exponent spellings are accepted only
+when mathematically integral and within signed 64-bit range. It adds no kind,
+class, desired state, attempt state, capacity slot,
+or numeric capability. Services do not participate in the run handoff
+lifecycle, so `handoff_directory` is required only for `one-shot`; the agent
+never prepares or finishes a handoff path for a service.
 
 Process spawn failures carry a stable `{code, message}` object. The message is
 diagnostic only. L1 owns the restartability allowlist and treats every unknown
