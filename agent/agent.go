@@ -20,6 +20,7 @@ import (
 
 const (
 	DefaultHeartbeatInterval       = 15 * time.Second
+	DefaultCapabilityProbeTimeout  = 10 * time.Second
 	DefaultClaimInterval           = time.Second
 	DefaultRenewalInterval         = 10 * time.Second
 	DefaultHandoffRetention        = 24 * time.Hour
@@ -53,25 +54,30 @@ type Config struct {
 	OS                  string
 	Architecture        string
 	// Capabilities is the complete advertised execution set; nil advertises none.
-	Capabilities         map[string]bool
-	HeartbeatInterval    time.Duration
-	ClaimInterval        time.Duration
-	RenewalInterval      time.Duration
-	MaxOneshotSlots      int
-	MaxServiceSlots      int
-	OperationTimeout     time.Duration
-	FinalizationTimeout  time.Duration
-	LogBatchSize         int
-	LogFlushInterval     time.Duration
-	LogRetryInterval     time.Duration
-	LogSpoolDirectory    string
-	LogSpoolMaxBytes     int64
-	ManagedRootDirectory string
-	GuardianExecutable   string
-	Runner               ProcessRunner
-	OutputSinkFactory    OutputSinkFactory
-	HandoffRoot          string
-	HandoffRetention     time.Duration
+	Capabilities map[string]bool
+	// CapabilityProbe earns and continuously revalidates OCI-related
+	// capabilities. The real runtime adapter is supplied by later M3 tickets.
+	CapabilityProbe CapabilityProbe
+	// CapabilityProbeTimeout bounds one functional probe. Zero uses ten seconds.
+	CapabilityProbeTimeout time.Duration
+	HeartbeatInterval      time.Duration
+	ClaimInterval          time.Duration
+	RenewalInterval        time.Duration
+	MaxOneshotSlots        int
+	MaxServiceSlots        int
+	OperationTimeout       time.Duration
+	FinalizationTimeout    time.Duration
+	LogBatchSize           int
+	LogFlushInterval       time.Duration
+	LogRetryInterval       time.Duration
+	LogSpoolDirectory      string
+	LogSpoolMaxBytes       int64
+	ManagedRootDirectory   string
+	GuardianExecutable     string
+	Runner                 ProcessRunner
+	OutputSinkFactory      OutputSinkFactory
+	HandoffRoot            string
+	HandoffRetention       time.Duration
 	// Logf need not be goroutine-safe. Agent serializes calls made through it.
 	Logf  func(string, ...any)
 	Clock Clock
@@ -97,6 +103,7 @@ type Agent struct {
 	logf              func(string, ...any)
 	clock             Clock
 	observer          *lifecycleObserver
+	capabilities      *capabilityState
 	nodeLock          nodeLock
 }
 
@@ -189,8 +196,10 @@ func New(config Config) (*Agent, error) {
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
+	capabilities := newCapabilityState(config.Capabilities, config.CapabilityProbe, clock, config.CapabilityProbeTimeout)
+	registration = applyCapabilityObservation(registration, capabilities.snapshot())
 	session := newAgentSession(
-		client, registration, heartbeatInterval, claimInterval, clock, observer, logf,
+		client, registration, capabilities, heartbeatInterval, claimInterval, clock, observer, logf,
 		intOrDefault(config.MaxOneshotSlots, l1.DefaultMaxOneshotSlots),
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
@@ -205,7 +214,7 @@ func New(config Config) (*Agent, error) {
 		logRetryInterval:    logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
 		runner: runner, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
 		handoffs: newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
-		logf:     logf, clock: clock, observer: observer,
+		logf:     logf, clock: clock, observer: observer, capabilities: capabilities,
 		nodeLock: stableNodeLock,
 	}, nil
 }
@@ -280,6 +289,10 @@ func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.Proces
 }
 
 func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
+	var allowsStart func(contract.JobSpec) bool
+	if a.capabilities != nil {
+		allowsStart = a.capabilities.allows
+	}
 	return newAttemptLifecycle(attemptLifecycleDependencies{
 		client: a.sessionClient(), runner: a.runner, outbox: a.outbox,
 		watchdog: newAuthorityWatchdog(a.clock), clock: a.clock,
@@ -291,6 +304,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		observer: a.observer, reservePublishedPort: a.reservePublishedPort,
 		prepareServiceEndpoint: prepareProcessServiceEndpoint,
 		prepareAuthorityLoss:   a.prepareAuthorityLoss,
+		allowsStart:            allowsStart,
 	})
 }
 
@@ -331,6 +345,24 @@ func (a *Agent) Status() Status {
 		a.session.gates[workloadClassOneShot].occupancy(),
 		a.session.gates[workloadClassService].occupancy(),
 	)
+}
+
+// CapabilitySnapshot returns the same immutable observation used by local
+// admission, registration, and heartbeat publication.
+func (a *Agent) CapabilitySnapshot() CapabilitySnapshot {
+	if a == nil || a.capabilities == nil {
+		return CapabilitySnapshot{}
+	}
+	return a.capabilities.capabilitySnapshot()
+}
+
+// ProbeCapabilities records an event-triggered probe observation. A failed
+// probe is applied before its diagnostic error is returned.
+func (a *Agent) ProbeCapabilities(ctx context.Context) error {
+	if a == nil || a.capabilities == nil {
+		return nil
+	}
+	return a.capabilities.refresh(ctx)
 }
 
 func (a *Agent) sessionClient() *Client {

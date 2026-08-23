@@ -119,7 +119,9 @@ that transition.
 Registration carries stable node ID and per-boot session ID. A `dead` node may
 become `alive` only through registration of the current boot session. Routing
 tags are authenticated Fabric/control-plane data, never node-reported state.
-Node heartbeat updates node liveness only and does not renew attempt leases.
+Node heartbeat updates node liveness and may atomically replace the current
+boot's full capability observation with a higher Capability revision; it does
+not renew attempt leases.
 Operator claim intent is not a node state: it is durable across registration,
 may be changed while the node is dead, and does not revoke authority already
 bound into a live attempt. The boot-session-scoped agent drain used for

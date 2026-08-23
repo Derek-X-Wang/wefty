@@ -62,6 +62,7 @@ func TestOCIPrestartRuntimeUnavailablePersistsWallClockBackoffAtProductionTiming
 			"kind:oci":                              true,
 			"runtime_handler:io.containerd.runc.v2": true,
 		},
+		CapabilityRevision: 1, CapabilityObservedAt: time.Now().UTC(), MissingCapabilities: []string{},
 	}
 	if _, err := store.RegisterNode(context.Background(), fabric.Identity{NodeID: "oci-realtime-agent"}, registration, l1.DefaultNodePolicy(), true); err != nil {
 		t.Fatal(err)

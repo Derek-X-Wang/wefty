@@ -235,7 +235,7 @@ func (s *Store) DrainNode(ctx context.Context, identityNodeID, nodeID, bootSessi
 		return Node{}, internalError(err, "read node drain result")
 	}
 	if changed == 0 {
-		return Node{}, s.nodeSessionError(ctx, nodeID, identityNodeID, bootSessionID, "drain")
+		return Node{}, s.nodeSessionError(ctx, s.db, nodeID, identityNodeID, bootSessionID, "drain")
 	}
 	node, err := getNode(ctx, s.db, nodeID)
 	if err != nil {
@@ -244,10 +244,10 @@ func (s *Store) DrainNode(ctx context.Context, identityNodeID, nodeID, bootSessi
 	return node, nil
 }
 
-func (s *Store) nodeSessionError(ctx context.Context, nodeID, identityNodeID, bootSessionID, operation string) error {
+func (s *Store) nodeSessionError(ctx context.Context, q nodeQueryer, nodeID, identityNodeID, bootSessionID, operation string) error {
 	var storedIdentity, storedBoot string
 	var state contract.NodeState
-	err := s.db.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state FROM nodes WHERE node_id=?", nodeID).
+	err := q.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state FROM nodes WHERE node_id=?", nodeID).
 		Scan(&storedIdentity, &storedBoot, &state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return protocolError(contract.ErrorNodeNotRegistered, "node %q is not registered", nodeID)

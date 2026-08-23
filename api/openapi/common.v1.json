@@ -363,7 +363,10 @@
       "NodeRegistration": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["node_id", "boot_session_id", "os", "architecture", "agent_version"],
+        "required": [
+          "node_id", "boot_session_id", "os", "architecture", "agent_version",
+          "capabilities", "capability_revision", "capability_observed_at", "missing_capabilities"
+        ],
         "properties": {
           "node_id": { "type": "string" },
           "boot_session_id": { "type": "string" },
@@ -380,11 +383,35 @@
           "agent_version": { "type": "string" },
           "capabilities": {
             "type": "object",
+            "maxProperties": 128,
+            "propertyNames": { "minLength": 1, "maxLength": 128 },
             "additionalProperties": { "type": "boolean" },
             "description": "Node-advertised execution facts such as kind:process, kind:oci, runtime_handler:<name>, and cgroup_v2. Operators separately own routing tags and class-scoped capacity; max_oneshot_slots and max_service_slots are reserved control-plane policy keys and are rejected."
+          },
+          "capability_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Boot-scoped monotonic revision over the complete capability observation."
+          },
+          "capability_observed_at": { "type": "string", "format": "date-time" },
+          "missing_capabilities": {
+            "type": "array",
+            "maxItems": 128,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "capability_reason_code": {
+            "type": "string",
+            "enum": [
+              "oci_intent_disabled", "prerequisite_missing", "runtime_version_unsupported",
+              "helper_unreachable", "helper_version_mismatch", "helper_handshake_failed",
+              "boot_sweep_failed", "probe_failed", "lima_stopped", "lima_broken",
+              "lima_start_timeout", "template_restart_required", "template_recreate_required",
+              "mount_root_unavailable", "local_permission_denied"
+            ]
           }
         },
-        "description": "No tags or capacity fields are accepted. Operators own routing tags and class-scoped slot policy; the node advertises execution capabilities. connect_host is a non-authoritative Fabric projection."
+        "description": "No tags or capacity fields are accepted. Operators own routing tags and class-scoped slot policy; the node advertises one complete boot-revisioned execution capability observation. connect_host is a non-authoritative Fabric projection."
       },
       "RemovalDirective": {
         "type": "object",

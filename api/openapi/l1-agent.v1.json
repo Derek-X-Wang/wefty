@@ -43,8 +43,8 @@
       ],
       "post": {
         "operationId": "heartbeatNode",
-        "summary": "Update liveness and receive node-scoped directives",
-        "description": "Boot-session-scoped and never authority-generation-fenced. The response carries durable claim intent, effective class capacities, and pending removal directives even when the node owns no attempt.",
+        "summary": "Update liveness and capabilities, then receive node-scoped directives",
+        "description": "Boot-session-scoped and never attempt-authority-generation-fenced. Capability replacement, liveness, and effective capacity commit atomically without changing durable claim intent. The response carries claim intent, effective class capacities, and pending removal directives even when the node owns no attempt.",
         "requestBody": {
           "required": true,
           "content": {
@@ -52,9 +52,36 @@
               "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["boot_session_id"],
+                "required": [
+                  "boot_session_id", "capabilities", "capability_revision",
+                  "capability_observed_at", "missing_capabilities"
+                ],
                 "properties": {
-                  "boot_session_id": { "type": "string" }
+                  "boot_session_id": { "type": "string" },
+                  "capabilities": {
+                    "type": "object",
+                    "maxProperties": 128,
+                    "propertyNames": { "minLength": 1, "maxLength": 128 },
+                    "additionalProperties": { "type": "boolean" }
+                  },
+                  "capability_revision": { "type": "integer", "minimum": 1 },
+                  "capability_observed_at": { "type": "string", "format": "date-time" },
+                  "missing_capabilities": {
+                    "type": "array",
+                    "maxItems": 128,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+                  },
+                  "capability_reason_code": {
+                    "type": "string",
+                    "enum": [
+                      "oci_intent_disabled", "prerequisite_missing", "runtime_version_unsupported",
+                      "helper_unreachable", "helper_version_mismatch", "helper_handshake_failed",
+                      "boot_sweep_failed", "probe_failed", "lima_stopped", "lima_broken",
+                      "lima_start_timeout", "template_restart_required", "template_recreate_required",
+                      "mount_root_unavailable", "local_permission_denied"
+                    ]
+                  }
                 }
               }
             }

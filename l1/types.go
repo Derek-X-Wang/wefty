@@ -295,7 +295,12 @@ type PublicationRequest struct {
 }
 
 type HeartbeatRequest struct {
-	BootSessionID string `json:"boot_session_id"`
+	BootSessionID        string                        `json:"boot_session_id"`
+	Capabilities         map[string]bool               `json:"capabilities"`
+	CapabilityRevision   int64                         `json:"capability_revision"`
+	CapabilityObservedAt time.Time                     `json:"capability_observed_at"`
+	MissingCapabilities  []string                      `json:"missing_capabilities"`
+	CapabilityReasonCode contract.CapabilityReasonCode `json:"capability_reason_code,omitempty"`
 }
 
 type DrainRequest struct {

@@ -1,11 +1,13 @@
 package l1
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
@@ -14,7 +16,143 @@ const (
 	capabilityKindPrefix           = "kind:"
 	capabilityRuntimeHandlerPrefix = "runtime_handler:"
 	capabilityCgroupV2             = "cgroup_v2"
+	maxNodeCapabilities            = 128
+	maxMissingCapabilities         = 128
+	maxCapabilityNameBytes         = 128
 )
+
+type storedCapabilityObservation struct {
+	observation      contract.CapabilityObservation
+	capabilitiesJSON []byte
+	missingJSON      []byte
+}
+
+func canonicalCapabilityObservation(observation contract.CapabilityObservation) (storedCapabilityObservation, error) {
+	if observation.Revision < 1 {
+		return storedCapabilityObservation{}, protocolError(contract.ErrorInvalidRequest, "capability revision must be positive")
+	}
+	if observation.ObservedAt.IsZero() {
+		return storedCapabilityObservation{}, protocolError(contract.ErrorInvalidRequest, "capability observation time is required")
+	}
+	if len(observation.Capabilities) > maxNodeCapabilities {
+		return storedCapabilityObservation{}, protocolError(contract.ErrorInvalidRequest, "capability set exceeds %d entries", maxNodeCapabilities)
+	}
+	capabilities := make(map[string]bool, len(observation.Capabilities))
+	for raw, enabled := range observation.Capabilities {
+		capability := strings.ToLower(strings.TrimSpace(raw))
+		if capability == "" || len(capability) > maxCapabilityNameBytes {
+			return storedCapabilityObservation{}, protocolError(contract.ErrorInvalidRequest, "capability names must contain 1-%d bytes", maxCapabilityNameBytes)
+		}
+		if previous, exists := capabilities[capability]; exists && previous != enabled {
+			return storedCapabilityObservation{}, protocolError(contract.ErrorInvalidRequest, "capability %q has conflicting normalized values", capability)
+		}
+		capabilities[capability] = enabled
+	}
+	capabilities = normalizeRegistrationCapabilities(capabilities)
+
+	if len(observation.MissingCapabilities) > maxMissingCapabilities {
+		return storedCapabilityObservation{}, protocolError(contract.ErrorInvalidRequest, "missing capability set exceeds %d entries", maxMissingCapabilities)
+	}
+	missingSet := make(map[string]struct{}, len(observation.MissingCapabilities))
+	for _, raw := range observation.MissingCapabilities {
+		capability := strings.ToLower(strings.TrimSpace(raw))
+		if capability == "" || len(capability) > maxCapabilityNameBytes {
+			return storedCapabilityObservation{}, protocolError(contract.ErrorInvalidRequest, "missing capability names must contain 1-%d bytes", maxCapabilityNameBytes)
+		}
+		if capabilities[capability] {
+			return storedCapabilityObservation{}, protocolError(contract.ErrorInvalidRequest, "capability %q cannot be both advertised and missing", capability)
+		}
+		missingSet[capability] = struct{}{}
+	}
+	missing := make([]string, 0, len(missingSet))
+	for capability := range missingSet {
+		missing = append(missing, capability)
+	}
+	sort.Strings(missing)
+	if len(missing) == 0 && observation.ReasonCode != "" {
+		return storedCapabilityObservation{}, protocolError(contract.ErrorInvalidRequest, "capability reason requires at least one missing capability")
+	}
+	if len(missing) > 0 {
+		if !observation.ReasonCode.Valid() {
+			return storedCapabilityObservation{}, protocolError(contract.ErrorInvalidRequest, "missing capabilities require a stable reason code")
+		}
+	}
+
+	observation.Capabilities = capabilities
+	observation.MissingCapabilities = missing
+	observation.ObservedAt = canonicalTime(observation.ObservedAt)
+	capabilitiesJSON, err := json.Marshal(capabilities)
+	if err != nil {
+		return storedCapabilityObservation{}, internalError(err, "encode node capabilities")
+	}
+	missingJSON, err := json.Marshal(missing)
+	if err != nil {
+		return storedCapabilityObservation{}, internalError(err, "encode missing node capabilities")
+	}
+	return storedCapabilityObservation{observation: observation, capabilitiesJSON: capabilitiesJSON, missingJSON: missingJSON}, nil
+}
+
+func legacyCapabilityObservation(capabilities map[string]bool, now time.Time) contract.CapabilityObservation {
+	legacyCapabilities := make(map[string]bool, len(capabilities))
+	for capability, enabled := range capabilities {
+		capability = strings.ToLower(strings.TrimSpace(capability))
+		if capability != "" && !isOCIProbeCapability(capability) {
+			legacyCapabilities[capability] = enabled
+		}
+	}
+	return contract.CapabilityObservation{
+		Revision: 1, Capabilities: legacyCapabilities, ObservedAt: canonicalTime(now), MissingCapabilities: []string{},
+	}
+}
+
+func registrationCapabilityObservation(registration contract.NodeRegistration) contract.CapabilityObservation {
+	return contract.CapabilityObservation{
+		Revision: registration.CapabilityRevision, Capabilities: registration.Capabilities,
+		ObservedAt: registration.CapabilityObservedAt, MissingCapabilities: registration.MissingCapabilities,
+		ReasonCode: registration.CapabilityReasonCode,
+	}
+}
+
+func heartbeatCapabilityObservation(request HeartbeatRequest) contract.CapabilityObservation {
+	return contract.CapabilityObservation{
+		Revision: request.CapabilityRevision, Capabilities: request.Capabilities,
+		ObservedAt: request.CapabilityObservedAt, MissingCapabilities: request.MissingCapabilities,
+		ReasonCode: request.CapabilityReasonCode,
+	}
+}
+
+type capabilityObservationDecision uint8
+
+const (
+	capabilityObservationStale capabilityObservationDecision = iota
+	capabilityObservationReplay
+	capabilityObservationReplace
+)
+
+func decideCapabilityObservation(incoming storedCapabilityObservation, capabilitiesJSON []byte, revision int64, missingJSON []byte, reason contract.CapabilityReasonCode) (capabilityObservationDecision, error) {
+	switch {
+	case incoming.observation.Revision < revision:
+		return capabilityObservationStale, nil
+	case incoming.observation.Revision > revision:
+		return capabilityObservationReplace, nil
+	case !sameCapabilityObservation(incoming, capabilitiesJSON, revision, missingJSON, reason):
+		return capabilityObservationStale, protocolError(contract.ErrorConflict, "capability revision %d was already observed with different content", revision)
+	default:
+		return capabilityObservationReplay, nil
+	}
+}
+
+func sameCapabilityObservation(incoming storedCapabilityObservation, capabilitiesJSON []byte, revision int64, missingJSON []byte, reason contract.CapabilityReasonCode) bool {
+	return incoming.observation.Revision == revision &&
+		incoming.observation.ReasonCode == reason &&
+		bytes.Equal(incoming.capabilitiesJSON, capabilitiesJSON) && bytes.Equal(incoming.missingJSON, missingJSON)
+}
+
+func isOCIProbeCapability(capability string) bool {
+	capability = strings.ToLower(strings.TrimSpace(capability))
+	return capability == "kind:oci" || capability == "cgroup_v2" || capability == "apparmor" ||
+		strings.HasPrefix(capability, capabilityRuntimeHandlerPrefix)
+}
 
 // RequiredCapabilities derives the normalized execution eligibility set for
 // a job. Capacity remains class-scoped and deliberately does not enter this
@@ -91,7 +229,7 @@ func (s *Store) projectQueuedJobCapabilities(ctx context.Context, job Job) (Job,
 }
 
 // MissingCapabilities compares one normalized requirement set with a node's
-// registration-advertised execution facts. Ticket #136 adds live revisions.
+// current full-set capability observation.
 func MissingCapabilities(required []string, advertised map[string]bool) []string {
 	missing := make([]string, 0, len(required))
 	for _, capability := range required {

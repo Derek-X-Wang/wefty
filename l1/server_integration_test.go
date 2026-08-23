@@ -157,10 +157,14 @@ func (h *integrationHarness) register(client *http.Client, nodeID string) Node {
 
 func (h *integrationHarness) registerWithCapabilities(client *http.Client, nodeID string, capabilities map[string]bool) Node {
 	h.t.Helper()
+	revision := int64(1)
+	if current, err := getNode(context.Background(), h.store.db, nodeID); err == nil && current.BootSessionID == "boot-"+nodeID {
+		revision = current.CapabilityRevision + 1
+	}
 	registration := contract.NodeRegistration{
 		NodeID: nodeID, BootSessionID: "boot-" + nodeID, RootInstanceID: "root-" + nodeID,
 		OS: "linux", Architecture: "arm64", AgentVersion: "test",
-		Capabilities: capabilities,
+		Capabilities: capabilities, CapabilityRevision: revision, CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
 	}
 	status, _, body := h.do(client, http.MethodPost, "/v1/agent/nodes/register", registration)
 	if status != http.StatusOK {
@@ -171,6 +175,18 @@ func (h *integrationHarness) registerWithCapabilities(client *http.Client, nodeI
 		h.t.Fatal(err)
 	}
 	return node
+}
+
+func heartbeatRequestForNode(node Node) HeartbeatRequest {
+	return heartbeatRequestForBoot(node, node.BootSessionID)
+}
+
+func heartbeatRequestForBoot(node Node, bootSessionID string) HeartbeatRequest {
+	return HeartbeatRequest{
+		BootSessionID: bootSessionID, Capabilities: node.Capabilities, CapabilityRevision: node.CapabilityRevision,
+		CapabilityObservedAt: node.CapabilityObservedAt, MissingCapabilities: node.MissingCapabilities,
+		CapabilityReasonCode: node.CapabilityReasonCode,
+	}
 }
 
 func (h *integrationHarness) submit(client *http.Client, dispatchKey string, tags []string) Job {
@@ -670,7 +686,11 @@ func TestProtocolPrincipalsCannotCrossRouteGroups(t *testing.T) {
 	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
 	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
 	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
-	registration := contract.NodeRegistration{NodeID: "node-1", BootSessionID: "boot", OS: "linux", Architecture: "arm64", AgentVersion: "test"}
+	registration := contract.NodeRegistration{
+		NodeID: "node-1", BootSessionID: "boot", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: 1,
+		CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
+	}
 
 	status, _, body := h.do(client, http.MethodPost, "/v1/agent/nodes/register", registration)
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
@@ -775,7 +795,7 @@ func TestRegistrationRejectsSelfReportedEligibilityPolicy(t *testing.T) {
 		t.Fatalf("authoritative capacities = %d/%d, want 7/3", node.MaxOneshotSlots, node.MaxServiceSlots)
 	}
 
-	status, _, responseBody = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", HeartbeatRequest{BootSessionID: node.BootSessionID})
+	status, _, responseBody = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", heartbeatRequestForNode(node))
 	if status != http.StatusOK {
 		t.Fatalf("heartbeat status = %d body=%s", status, responseBody)
 	}
@@ -802,6 +822,8 @@ func TestRegistrationKeepsOneStableNodeAcrossBootSessions(t *testing.T) {
 
 	registration := contract.NodeRegistration{
 		NodeID: "stable-node", BootSessionID: "boot-1", OS: "linux", Architecture: "amd64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: 1,
+		CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
 	}
 	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
 	if status != http.StatusOK {
@@ -824,7 +846,7 @@ func TestRegistrationKeepsOneStableNodeAcrossBootSessions(t *testing.T) {
 		t.Fatalf("restarted node = %#v", restarted)
 	}
 
-	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/stable-node/heartbeat", HeartbeatRequest{BootSessionID: "boot-1"})
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/stable-node/heartbeat", heartbeatRequestForBoot(restarted, "boot-1"))
 	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeSessionReplaced)
 	var count int
 	if err := h.store.db.QueryRow("SELECT count(*) FROM nodes WHERE node_id=?", "stable-node").Scan(&count); err != nil {
@@ -856,6 +878,8 @@ func assertSemanticAgentAuthorityErrors(t *testing.T) {
 		h.register(owner, "stable-node")
 		registration := contract.NodeRegistration{
 			NodeID: "stable-node", BootSessionID: "boot-intruder", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+			Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: 1,
+			CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
 		}
 		status, _, body := h.do(intruder, http.MethodPost, "/v1/agent/nodes/register", registration)
 		assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorIdentityBound)
@@ -895,12 +919,18 @@ func assertSemanticAgentAuthorityErrors(t *testing.T) {
 		h.register(agent, "node-1")
 		registration := contract.NodeRegistration{
 			NodeID: "node-1", BootSessionID: "boot-new", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+			Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: 1,
+			CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
 		}
 		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
 		if status != http.StatusOK {
 			t.Fatalf("replacement registration status = %d body=%s", status, body)
 		}
-		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", HeartbeatRequest{BootSessionID: "boot-node-1"})
+		var replaced Node
+		if err := json.Unmarshal(body, &replaced); err != nil {
+			t.Fatal(err)
+		}
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", heartbeatRequestForBoot(replaced, "boot-node-1"))
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeSessionReplaced)
 	})
 

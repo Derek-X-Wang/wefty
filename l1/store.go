@@ -184,6 +184,10 @@ CREATE TABLE IF NOT EXISTS nodes (
   architecture TEXT NOT NULL,
   agent_version TEXT NOT NULL,
   capabilities_json BLOB NOT NULL,
+  capability_revision INTEGER NOT NULL DEFAULT 1 CHECK(capability_revision >= 1),
+  capability_observed_ns INTEGER NOT NULL DEFAULT 0,
+  missing_capabilities_json BLOB NOT NULL DEFAULT '[]',
+  capability_reason_code TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL,
   last_heartbeat_ns INTEGER NOT NULL,
   max_oneshot_slots INTEGER NOT NULL CHECK(max_oneshot_slots >= 0),
@@ -532,51 +536,98 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 			return Node{}, protocolError(contract.ErrorInvalidRequest, "node capacity is control-plane policy, not an agent capability")
 		}
 	}
-	registration.Capabilities = normalizeRegistrationCapabilities(registration.Capabilities)
 	tags := NormalizeTags(policy.Tags)
 	for _, tag := range tags {
 		if !validTag(tag) {
 			return Node{}, protocolError(contract.ErrorInvalidRequest, "configured node tag %q is invalid", tag)
 		}
 	}
-	capabilities, err := json.Marshal(nonNilCapabilities(registration.Capabilities))
-	if err != nil {
-		return Node{}, internalError(err, "encode node capabilities")
-	}
 	now := canonicalTime(s.clock.Now())
+	legacyObservation := registration.CapabilityRevision == 0
+	if legacyObservation {
+		observation := legacyCapabilityObservation(registration.Capabilities, now)
+		registration.Capabilities = observation.Capabilities
+		registration.CapabilityRevision = observation.Revision
+		registration.CapabilityObservedAt = observation.ObservedAt
+		registration.MissingCapabilities = observation.MissingCapabilities
+	}
+	incoming, err := canonicalCapabilityObservation(registrationCapabilityObservation(registration))
+	if err != nil {
+		return Node{}, err
+	}
+	registration.Capabilities = incoming.observation.Capabilities
+	registration.CapabilityRevision = incoming.observation.Revision
+	registration.CapabilityObservedAt = incoming.observation.ObservedAt
+	registration.MissingCapabilities = incoming.observation.MissingCapabilities
+	registration.CapabilityReasonCode = incoming.observation.ReasonCode
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Node{}, internalError(err, "begin node registration")
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `
-INSERT INTO nodes(node_id, identity_node_id, boot_session_id, connect_host, root_instance_id, os, architecture, agent_version, capabilities_json, state, last_heartbeat_ns, max_oneshot_slots, max_service_slots, authority_generation, claims_enabled)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-ON CONFLICT(node_id) DO UPDATE SET
-  boot_session_id=excluded.boot_session_id,
-  connect_host=excluded.connect_host,
-  root_instance_id=excluded.root_instance_id,
-  os=excluded.os,
-  architecture=excluded.architecture,
-  agent_version=excluded.agent_version,
-  capabilities_json=excluded.capabilities_json,
-  state=excluded.state,
-	last_heartbeat_ns=excluded.last_heartbeat_ns,
-	max_oneshot_slots=excluded.max_oneshot_slots,
-	max_service_slots=excluded.max_service_slots,
-	authority_generation=nodes.authority_generation+1
-WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, identity.NodeID, registration.BootSessionID, registration.ConnectHost, registration.RootInstanceID,
-		registration.OS, registration.Architecture, registration.AgentVersion, capabilities, contract.NodeAlive, now.UnixNano(),
-		policy.MaxOneshotSlots, policy.MaxServiceSlots, operatorExpected)
+	var storedIdentity, storedBoot string
+	var storedCapabilitiesJSON, storedMissingJSON []byte
+	var storedRevision, storedObservedNS int64
+	var storedReason contract.CapabilityReasonCode
+	readErr := tx.QueryRowContext(ctx, `SELECT identity_node_id, boot_session_id, capabilities_json,
+		capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code
+		FROM nodes WHERE node_id=?`, registration.NodeID).Scan(
+		&storedIdentity, &storedBoot, &storedCapabilitiesJSON, &storedRevision, &storedObservedNS, &storedMissingJSON, &storedReason,
+	)
+	replaceCapabilities := true
+	advanceCapabilityObservedAt := false
+	switch {
+	case errors.Is(readErr, sql.ErrNoRows):
+		_, err = tx.ExecContext(ctx, `INSERT INTO nodes(
+			node_id, identity_node_id, boot_session_id, connect_host, root_instance_id, os, architecture, agent_version,
+			capabilities_json, capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code,
+			state, last_heartbeat_ns, max_oneshot_slots, max_service_slots, authority_generation, claims_enabled
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+			registration.NodeID, identity.NodeID, registration.BootSessionID, registration.ConnectHost, registration.RootInstanceID,
+			registration.OS, registration.Architecture, registration.AgentVersion,
+			incoming.capabilitiesJSON, incoming.observation.Revision, incoming.observation.ObservedAt.UnixNano(), incoming.missingJSON, incoming.observation.ReasonCode,
+			contract.NodeAlive, now.UnixNano(), policy.MaxOneshotSlots, policy.MaxServiceSlots, operatorExpected)
+	case readErr != nil:
+		return Node{}, internalError(readErr, "read existing node registration")
+	case storedIdentity != identity.NodeID:
+		return Node{}, protocolError(contract.ErrorIdentityBound, "stable node %q is bound to another Fabric identity", registration.NodeID)
+	default:
+		if storedBoot == registration.BootSessionID {
+			if legacyObservation {
+				replaceCapabilities = false
+			} else {
+				decision, decisionErr := decideCapabilityObservation(incoming, storedCapabilitiesJSON, storedRevision, storedMissingJSON, storedReason)
+				if decisionErr != nil {
+					return Node{}, decisionErr
+				}
+				replaceCapabilities = decision == capabilityObservationReplace
+				advanceCapabilityObservedAt = decision == capabilityObservationReplay && incoming.observation.ObservedAt.UnixNano() > storedObservedNS
+			}
+		}
+		if replaceCapabilities {
+			_, err = tx.ExecContext(ctx, `UPDATE nodes SET boot_session_id=?, connect_host=?, root_instance_id=?, os=?, architecture=?, agent_version=?,
+				capabilities_json=?, capability_revision=?, capability_observed_ns=?, missing_capabilities_json=?, capability_reason_code=?,
+				state=?, last_heartbeat_ns=?, max_oneshot_slots=?, max_service_slots=?, authority_generation=authority_generation+1
+				WHERE node_id=?`, registration.BootSessionID, registration.ConnectHost, registration.RootInstanceID, registration.OS,
+				registration.Architecture, registration.AgentVersion, incoming.capabilitiesJSON, incoming.observation.Revision,
+				incoming.observation.ObservedAt.UnixNano(), incoming.missingJSON, incoming.observation.ReasonCode, contract.NodeAlive,
+				now.UnixNano(), policy.MaxOneshotSlots, policy.MaxServiceSlots, registration.NodeID)
+		} else if advanceCapabilityObservedAt {
+			_, err = tx.ExecContext(ctx, `UPDATE nodes SET boot_session_id=?, connect_host=?, root_instance_id=?, os=?, architecture=?, agent_version=?,
+				capability_observed_ns=?, state=?, last_heartbeat_ns=?, max_oneshot_slots=?, max_service_slots=?, authority_generation=authority_generation+1
+				WHERE node_id=?`, registration.BootSessionID, registration.ConnectHost, registration.RootInstanceID, registration.OS,
+				registration.Architecture, registration.AgentVersion, incoming.observation.ObservedAt.UnixNano(), contract.NodeAlive,
+				now.UnixNano(), policy.MaxOneshotSlots, policy.MaxServiceSlots, registration.NodeID)
+		} else {
+			_, err = tx.ExecContext(ctx, `UPDATE nodes SET boot_session_id=?, connect_host=?, root_instance_id=?, os=?, architecture=?, agent_version=?,
+				state=?, last_heartbeat_ns=?, max_oneshot_slots=?, max_service_slots=?, authority_generation=authority_generation+1
+				WHERE node_id=?`, registration.BootSessionID, registration.ConnectHost, registration.RootInstanceID, registration.OS,
+				registration.Architecture, registration.AgentVersion, contract.NodeAlive, now.UnixNano(), policy.MaxOneshotSlots,
+				policy.MaxServiceSlots, registration.NodeID)
+		}
+	}
 	if err != nil {
 		return Node{}, internalError(err, "store node registration")
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return Node{}, internalError(err, "read node registration result")
-	}
-	if changed == 0 {
-		return Node{}, protocolError(contract.ErrorIdentityBound, "stable node %q is bound to another Fabric identity", registration.NodeID)
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM node_tags WHERE node_id = ?", registration.NodeID); err != nil {
 		return Node{}, internalError(err, "replace node tags")
@@ -596,52 +647,103 @@ WHERE nodes.identity_node_id=excluded.identity_node_id`, registration.NodeID, id
 	return node, nil
 }
 
+// HeartbeatNode is retained for store tests that exercise liveness without the
+// live agent protocol's required capability observation.
 func (s *Store) HeartbeatNode(ctx context.Context, identityNodeID, nodeID, bootSessionID string) (Node, error) {
-	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, nil)
+	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, nil, nil)
 }
 
-// HeartbeatNodeWithPolicy refreshes the effective configured capacities while
-// updating liveness, so an L1 restart with changed policy does not require the
-// long-running agent to replace its boot session merely to learn new limits.
+// HeartbeatNodeWithPolicy is retained for tests that refresh effective policy
+// without going through the live agent protocol's required observation.
 func (s *Store) HeartbeatNodeWithPolicy(ctx context.Context, identityNodeID, nodeID, bootSessionID string, policy NodePolicy) (Node, error) {
-	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, &policy)
+	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, nil, &policy)
 }
 
-func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootSessionID string, policy *NodePolicy) (Node, error) {
+// HeartbeatNodeWithCapabilityObservation atomically applies one complete
+// capability observation with liveness and configured capacity refresh.
+func (s *Store) HeartbeatNodeWithCapabilityObservation(ctx context.Context, identityNodeID, nodeID, bootSessionID string, observation contract.CapabilityObservation, policy NodePolicy) (Node, error) {
+	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, &observation, &policy)
+}
+
+func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootSessionID string, observation *contract.CapabilityObservation, policy *NodePolicy) (Node, error) {
 	now := canonicalTime(s.clock.Now())
 	if policy != nil && (policy.MaxOneshotSlots < 0 || policy.MaxServiceSlots < 0) {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "configured node slot limits must be non-negative")
 	}
-	var result sql.Result
-	var err error
-	if policy != nil {
-		result, err = s.db.ExecContext(ctx, `UPDATE nodes
-			SET state=CASE WHEN state IN (?, ?) THEN ? ELSE state END, last_heartbeat_ns=?,
-				max_oneshot_slots=?, max_service_slots=?
-			WHERE node_id=? AND identity_node_id=? AND boot_session_id=? AND state IN (?, ?, ?)`,
-			contract.NodeAlive, contract.NodeStale, contract.NodeAlive, now.UnixNano(),
-			policy.MaxOneshotSlots, policy.MaxServiceSlots, nodeID, identityNodeID, bootSessionID,
-			contract.NodeAlive, contract.NodeStale, contract.NodeDraining)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Node{}, internalError(err, "begin node heartbeat")
+	}
+	defer tx.Rollback()
+	var storedIdentity, storedBoot string
+	var storedState contract.NodeState
+	var storedCapabilitiesJSON, storedMissingJSON []byte
+	var storedRevision, storedObservedNS int64
+	var storedReason contract.CapabilityReasonCode
+	if err := tx.QueryRowContext(ctx, `SELECT identity_node_id, boot_session_id, state, capabilities_json,
+		capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code
+		FROM nodes WHERE node_id=?`, nodeID).Scan(&storedIdentity, &storedBoot, &storedState, &storedCapabilitiesJSON,
+		&storedRevision, &storedObservedNS, &storedMissingJSON, &storedReason); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Node{}, protocolError(contract.ErrorNodeNotRegistered, "node %q is not registered", nodeID)
+		}
+		return Node{}, internalError(err, "read heartbeating node session")
+	}
+	if storedIdentity != identityNodeID || storedBoot != bootSessionID ||
+		(storedState != contract.NodeAlive && storedState != contract.NodeStale && storedState != contract.NodeDraining) {
+		return Node{}, s.nodeSessionError(ctx, tx, nodeID, identityNodeID, bootSessionID, "heartbeat")
+	}
+	var incoming storedCapabilityObservation
+	replaceCapabilities := false
+	advanceCapabilityObservedAt := false
+	if observation != nil {
+		incoming, err = canonicalCapabilityObservation(*observation)
+		if err != nil {
+			return Node{}, err
+		}
+		decision, decisionErr := decideCapabilityObservation(incoming, storedCapabilitiesJSON, storedRevision, storedMissingJSON, storedReason)
+		if decisionErr != nil {
+			return Node{}, decisionErr
+		}
+		replaceCapabilities = decision == capabilityObservationReplace
+		advanceCapabilityObservedAt = decision == capabilityObservationReplay && incoming.observation.ObservedAt.UnixNano() > storedObservedNS
+	}
+	state := storedState
+	if storedState == contract.NodeAlive || storedState == contract.NodeStale {
+		state = contract.NodeAlive
+	}
+	if replaceCapabilities && policy != nil {
+		_, err = tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_heartbeat_ns=?, max_oneshot_slots=?, max_service_slots=?,
+			capabilities_json=?, capability_revision=?, capability_observed_ns=?, missing_capabilities_json=?, capability_reason_code=? WHERE node_id=?`,
+			state, now.UnixNano(), policy.MaxOneshotSlots, policy.MaxServiceSlots, incoming.capabilitiesJSON, incoming.observation.Revision,
+			incoming.observation.ObservedAt.UnixNano(), incoming.missingJSON, incoming.observation.ReasonCode, nodeID)
+	} else if replaceCapabilities {
+		_, err = tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_heartbeat_ns=?, capabilities_json=?, capability_revision=?,
+			capability_observed_ns=?, missing_capabilities_json=?, capability_reason_code=? WHERE node_id=?`, state, now.UnixNano(),
+			incoming.capabilitiesJSON, incoming.observation.Revision, incoming.observation.ObservedAt.UnixNano(), incoming.missingJSON,
+			incoming.observation.ReasonCode, nodeID)
+	} else if advanceCapabilityObservedAt && policy != nil {
+		_, err = tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_heartbeat_ns=?, max_oneshot_slots=?, max_service_slots=?,
+			capability_observed_ns=? WHERE node_id=?`, state, now.UnixNano(), policy.MaxOneshotSlots, policy.MaxServiceSlots,
+			incoming.observation.ObservedAt.UnixNano(), nodeID)
+	} else if advanceCapabilityObservedAt {
+		_, err = tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_heartbeat_ns=?, capability_observed_ns=? WHERE node_id=?`,
+			state, now.UnixNano(), incoming.observation.ObservedAt.UnixNano(), nodeID)
+	} else if policy != nil {
+		_, err = tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_heartbeat_ns=?, max_oneshot_slots=?, max_service_slots=? WHERE node_id=?`,
+			state, now.UnixNano(), policy.MaxOneshotSlots, policy.MaxServiceSlots, nodeID)
 	} else {
-		result, err = s.db.ExecContext(ctx, `UPDATE nodes
-			SET state=CASE WHEN state IN (?, ?) THEN ? ELSE state END, last_heartbeat_ns=?
-			WHERE node_id=? AND identity_node_id=? AND boot_session_id=? AND state IN (?, ?, ?)`,
-			contract.NodeAlive, contract.NodeStale, contract.NodeAlive, now.UnixNano(),
-			nodeID, identityNodeID, bootSessionID, contract.NodeAlive, contract.NodeStale, contract.NodeDraining)
+		_, err = tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_heartbeat_ns=? WHERE node_id=?`, state, now.UnixNano(), nodeID)
 	}
 	if err != nil {
 		return Node{}, internalError(err, "update node heartbeat")
 	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return Node{}, internalError(err, "read heartbeat result")
-	}
-	if changed == 0 {
-		return Node{}, s.nodeSessionError(ctx, nodeID, identityNodeID, bootSessionID, "heartbeat")
-	}
-	node, err := getNode(ctx, s.db, nodeID)
+	node, err := getNode(ctx, tx, nodeID)
 	if err != nil {
 		return Node{}, internalError(err, "read heartbeating node")
+	}
+	if err := tx.Commit(); err != nil {
+		return Node{}, internalError(err, "commit node heartbeat")
 	}
 	return node, nil
 }
@@ -2223,13 +2325,15 @@ type nodeQueryer interface {
 
 func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	var node Node
-	var capabilitiesJSON []byte
-	var heartbeatNS int64
+	var capabilitiesJSON, missingCapabilitiesJSON []byte
+	var heartbeatNS, capabilityObservedNS int64
 	var intentUpdatedNS sql.NullInt64
-	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, connect_host, root_instance_id, os, architecture, agent_version, capabilities_json, state, max_oneshot_slots, max_service_slots,
+	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, connect_host, root_instance_id, os, architecture, agent_version, capabilities_json,
+	capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code, state, max_oneshot_slots, max_service_slots,
 	authority_generation, claims_enabled, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns
 	FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.ConnectHost, &node.RootInstanceID, &node.OS, &node.Architecture,
-		&node.AgentVersion, &capabilitiesJSON, &node.State, &node.MaxOneshotSlots, &node.MaxServiceSlots,
+		&node.AgentVersion, &capabilitiesJSON, &node.CapabilityRevision, &capabilityObservedNS, &missingCapabilitiesJSON,
+		&node.CapabilityReasonCode, &node.State, &node.MaxOneshotSlots, &node.MaxServiceSlots,
 		&node.AuthorityGeneration, &node.ClaimsEnabled, &node.IntentRevision, &node.IntentReason, &intentUpdatedNS,
 		&node.IntentActor, &heartbeatNS)
 	if err != nil {
@@ -2238,6 +2342,10 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	if err := json.Unmarshal(capabilitiesJSON, &node.Capabilities); err != nil {
 		return Node{}, err
 	}
+	if err := json.Unmarshal(missingCapabilitiesJSON, &node.MissingCapabilities); err != nil {
+		return Node{}, err
+	}
+	node.CapabilityObservedAt = time.Unix(0, capabilityObservedNS).UTC()
 	rows, err := q.QueryContext(ctx, "SELECT tag FROM node_tags WHERE node_id=? ORDER BY tag", nodeID)
 	if err != nil {
 		return Node{}, err
@@ -2282,13 +2390,6 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	}
 	node.Overcommitted = node.OneshotOccupancy > node.MaxOneshotSlots || node.ServiceOccupancy > node.MaxServiceSlots
 	return node, nil
-}
-
-func nonNilCapabilities(capabilities map[string]bool) map[string]bool {
-	if capabilities == nil {
-		return map[string]bool{}
-	}
-	return capabilities
 }
 
 func normalizeRegistrationCapabilities(capabilities map[string]bool) map[string]bool {

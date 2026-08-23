@@ -288,7 +288,7 @@ func TestStaleAndDeadNodesCannotClaim(t *testing.T) {
 		if node.State != contract.NodeStale {
 			t.Fatalf("node state = %q, want stale", node.State)
 		}
-		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", HeartbeatRequest{BootSessionID: "boot-node-1"})
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", heartbeatRequestForNode(node))
 		if status != http.StatusOK {
 			t.Fatalf("heartbeat status = %d body=%s", status, body)
 		}
@@ -301,12 +301,12 @@ func TestStaleAndDeadNodesCannotClaim(t *testing.T) {
 		h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
 		client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
 		agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
-		h.register(agent, "node-1")
+		node := h.register(agent, "node-1")
 		h.submit(client, "dead-claim", []string{"linux"})
 		h.clock.Advance(DefaultNodeDeadAfter)
 		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDead)
-		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", HeartbeatRequest{BootSessionID: "boot-node-1"})
+		status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", heartbeatRequestForNode(node))
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDead)
 		h.register(agent, "node-1")
 		claimJob(t, h, agent, "node-1")
@@ -317,7 +317,7 @@ func TestDrainStopsClaimsAndAllowsRunningAttemptToFinish(t *testing.T) {
 	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
 	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
 	agent := h.client(fabric.Identity{NodeID: "fabric-node", Tags: []string{DefaultAgentPrincipalTag}})
-	h.register(agent, "node-1")
+	node := h.register(agent, "node-1")
 	first := h.submit(client, "drain-running", []string{"linux"})
 	second := h.submit(client, "drain-queued", []string{"linux"})
 	claim := claimJob(t, h, agent, "node-1")
@@ -345,7 +345,7 @@ func TestDrainStopsClaimsAndAllowsRunningAttemptToFinish(t *testing.T) {
 	if draining.State != contract.NodeDraining {
 		t.Fatalf("drain state = %q, want draining", draining.State)
 	}
-	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", HeartbeatRequest{BootSessionID: "boot-node-1"})
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", heartbeatRequestForNode(node))
 	if status != http.StatusOK {
 		t.Fatalf("draining heartbeat status = %d body=%s", status, body)
 	}
@@ -532,7 +532,8 @@ func registerOverHTTP(t *testing.T, client *http.Client, nodeID, bootID string) 
 	t.Helper()
 	status, _, body, err := doRequest(client, http.MethodPost, "/v1/agent/nodes/register", contract.NodeRegistration{
 		NodeID: nodeID, BootSessionID: bootID, OS: "linux", Architecture: "arm64", AgentVersion: "test",
-		Capabilities: map[string]bool{"kind:process": true},
+		Capabilities:       map[string]bool{"kind:process": true},
+		CapabilityRevision: 1, CapabilityObservedAt: time.Now().UTC(), MissingCapabilities: []string{},
 	})
 	if err != nil {
 		t.Fatal(err)

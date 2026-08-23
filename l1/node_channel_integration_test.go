@@ -24,7 +24,8 @@ func assertHeartbeatIsTheNodeDirectiveAndCapacityChannel(t *testing.T) {
 	registration := contract.NodeRegistration{
 		NodeID: "node-1", BootSessionID: "boot-1", ConnectHost: "node-channel.example.test",
 		RootInstanceID: "root-node-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
-		Capabilities: map[string]bool{"kind:process": true},
+		Capabilities:       map[string]bool{"kind:process": true},
+		CapabilityRevision: 1, CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
 	}
 	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
 	if status != http.StatusOK {
@@ -77,7 +78,7 @@ func assertHeartbeatIsTheNodeDirectiveAndCapacityChannel(t *testing.T) {
 	h.server.nodePolicies["node-1"] = NodePolicy{
 		Tags: []string{"node-channel"}, MaxOneshotSlots: 1, MaxServiceSlots: 1,
 	}
-	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", HeartbeatRequest{BootSessionID: "boot-1"})
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", heartbeatRequestForNode(node))
 	if status != http.StatusOK {
 		t.Fatalf("heartbeat status = %d body=%s", status, body)
 	}
@@ -149,7 +150,7 @@ func assertHeartbeatIsTheNodeDirectiveAndCapacityChannel(t *testing.T) {
 		rejoined.IntentReason != disabled.IntentReason || rejoined.ConnectHost != registration.ConnectHost {
 		t.Fatalf("re-registration lost liveness/intent/connect projection: %#v", rejoined)
 	}
-	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", HeartbeatRequest{BootSessionID: "boot-2"})
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/node-1/heartbeat", heartbeatRequestForNode(rejoined))
 	if status != http.StatusOK {
 		t.Fatalf("rejoined heartbeat status = %d body=%s", status, body)
 	}

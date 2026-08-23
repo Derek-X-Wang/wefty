@@ -481,6 +481,10 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if registration.CapabilityRevision < 1 {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "capability revision must be positive"))
+		return
+	}
 	identity := identityFromRequest(r)
 	policy, configured := s.effectiveNodePolicy(registration.NodeID)
 	node, err := s.store.RegisterNode(r.Context(), identity, registration, policy, configured)
@@ -500,7 +504,9 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 	identity := identityFromRequest(r)
 	nodeID := r.PathValue("node_id")
 	policy, _ := s.effectiveNodePolicy(nodeID)
-	node, err := s.store.HeartbeatNodeWithPolicy(r.Context(), identity.NodeID, nodeID, request.BootSessionID, policy)
+	node, err := s.store.HeartbeatNodeWithCapabilityObservation(
+		r.Context(), identity.NodeID, nodeID, request.BootSessionID, heartbeatCapabilityObservation(request), policy,
+	)
 	if err != nil {
 		writeError(w, err)
 		return
