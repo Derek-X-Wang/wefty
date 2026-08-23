@@ -49,6 +49,7 @@ type agentSession struct {
 	gates             map[workloadClass]classAdmissionGate
 	localLimits       map[workloadClass]int
 	logf              func(string, ...any)
+	capabilities      *capabilityState
 
 	capacityMu      sync.Mutex
 	poolTargets     map[workloadClass]int
@@ -88,16 +89,17 @@ func (err *routedDestinationError) Unwrap() error { return err.err }
 func newAgentSession(
 	client *Client,
 	registration contract.NodeRegistration,
+	capabilities *capabilityState,
 	heartbeatInterval, claimInterval time.Duration,
 	clock Clock,
 	observer *lifecycleObserver,
 	logf func(string, ...any),
 	maxOneshotSlots, maxServiceSlots int,
 ) *agentSession {
-	return &agentSession{
+	session := &agentSession{
 		client: client, registration: registration,
 		heartbeatInterval: heartbeatInterval, claimInterval: claimInterval,
-		clock: clock, observer: observer, logf: logf,
+		clock: clock, observer: observer, logf: logf, capabilities: capabilities,
 		routeError: func(destination errorDestination, err error) error {
 			if destination == errorDestinationAttemptAuthority {
 				return nil
@@ -123,6 +125,7 @@ func newAgentSession(
 		residentChanged: make(chan struct{}, 1),
 		drainRequested:  make(chan struct{}),
 	}
+	return session
 }
 
 func (session *agentSession) close() {
@@ -132,11 +135,21 @@ func (session *agentSession) close() {
 }
 
 func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
-	node, err := session.client.Register(ctx, session.registration)
+	if err := session.capabilities.refresh(ctx); err != nil && session.logf != nil {
+		session.logf("agent: capability probe before registration: %v", err)
+	}
+	registration := applyCapabilityObservation(session.registration, session.capabilities.snapshot())
+	node, err := session.client.Register(ctx, registration)
 	if err == nil {
+		session.capabilities.acknowledge(node)
 		session.observeGrantedCapacity(node)
 	}
 	return node, err
+}
+
+func (session *agentSession) heartbeat(ctx context.Context) (l1.HeartbeatResponse, error) {
+	observation := session.capabilities.snapshot()
+	return session.client.Heartbeat(ctx, session.registration.NodeID, heartbeatRequest(session.registration.BootSessionID, observation))
 }
 
 func (session *agentSession) drain(ctx context.Context) (l1.Node, error) {
@@ -461,7 +474,10 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			stopTimer(timer)
 			return
 		case <-timer.C():
-			response, err := session.client.Heartbeat(ctx, session.registration.NodeID, session.registration.BootSessionID)
+			if err := session.capabilities.refresh(ctx); err != nil && session.logf != nil {
+				session.logf("agent: capability probe before heartbeat: %v", err)
+			}
+			response, err := session.heartbeat(ctx)
 			if err != nil {
 				classification := classifyAgentProtocolError(err)
 				if classification.destination == errorDestinationTransient {
@@ -475,6 +491,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				}
 				return
 			}
+			session.capabilities.acknowledge(response.Node)
 			session.observeGrantedCapacity(response.Node)
 			if session.removals != nil {
 				for _, directive := range response.RemovalDirectives {
@@ -499,6 +516,9 @@ func (session *agentSession) claim(
 	// has requeued a job but before the first worker finishes local finalization.
 	session.claimMu.Lock()
 	defer session.claimMu.Unlock()
+	if !session.capabilities.allowsClaim() {
+		return nil, false, nil
+	}
 	if !gate.canAcquire() && !serviceReservation {
 		return nil, false, nil
 	}

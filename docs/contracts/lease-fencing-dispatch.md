@@ -23,11 +23,26 @@ creates the job. The normalized set always contains `kind:<name>`, additionally
 contains `runtime_handler:<name>` for a non-empty handler, and contains
 `cgroup_v2` when OCI memory or CPU limits request kernel enforcement. The
 winning claim mutation anti-joins these rows against capability entries whose
-registration-advertised value is true. That set is boot-scoped until #136 adds
-heartbeat capability revisions. The same persisted requirements and shared
-comparison module drive operator unschedulability diagnostics for both job
-classes; claim and diagnostic paths never reconstruct requirements from JSON
-independently.
+current full-set observation has value true. The same persisted requirements
+and shared comparison module drive operator unschedulability diagnostics for
+both job classes; claim and diagnostic paths never reconstruct requirements
+from JSON independently.
+
+Registration and every current-agent heartbeat carry the complete capability
+set plus a Capability revision, observation time, bounded missing-capability
+set, and one stable reason code. The revision namespace is scoped by
+`boot_session_id`: a replacement boot may begin again at revision one. Within
+one boot, a higher revision atomically replaces the complete observation; an
+equal identical set/reason observation is replay and may advance its observed
+time; an equal changed set or reason conflicts; and a lower observation may
+refresh liveness and effective capacity but cannot change capability state or
+metadata. Re-registration of the same boot follows the same rule, so a startup
+snapshot cannot overwrite a later probe. Live HTTP registration requires a
+positive revision. The in-process legacy revision-zero compatibility path
+normalizes non-OCI capabilities only and strips every OCI-probe-owned key, so
+legacy metadata cannot mint OCI authority. Capability replacement, liveness,
+and capacity refresh commit in one transaction and never mutate
+`claims_enabled` or another durable intent field.
 
 Capabilities express eligibility only. One-shot and service slots remain the
 independent, class-scoped capacity mechanism; capability keys never create,
@@ -114,8 +129,10 @@ re-establish the corresponding authority.
 
 Attempt renewal is `POST .../attempts/{attempt_id}/lease` and requires the
 matching fencing token. It extends only that attempt's lease. Node heartbeat is
-a distinct verb and changes only node liveness; a healthy heartbeat never
-keeps a job lease alive, and lease renewal never makes a stale node alive.
+a distinct verb: it updates node liveness and may atomically apply the
+revisioned capability observation and effective capacity, but a healthy
+heartbeat never keeps a job lease alive, and lease renewal never makes a stale
+node alive.
 
 The renewal response is also the attempt-scoped service-intent channel. Its
 optional `directive` is `stop` when the service's desired state is stopped,

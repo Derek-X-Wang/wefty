@@ -142,7 +142,7 @@ func (controller *removalController) prepareAuthorityLoss(ctx context.Context, j
 	if controller == nil || controller.outbox == nil {
 		return nil
 	}
-	response, err := controller.client.Heartbeat(ctx, controller.nodeID, controller.bootSessionID)
+	response, err := controller.session.heartbeat(ctx)
 	if err != nil {
 		return err
 	}

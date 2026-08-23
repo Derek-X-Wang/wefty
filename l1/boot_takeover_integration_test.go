@@ -34,6 +34,8 @@ func assertBootTakeoverFencesAuthorityWritesButRetainsEvidence(t *testing.T) {
 
 	replacement := contract.NodeRegistration{
 		NodeID: "node-1", BootSessionID: "boot-new", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: 1,
+		CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
 	}
 	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/register", replacement)
 	if status != http.StatusOK {

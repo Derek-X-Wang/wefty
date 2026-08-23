@@ -498,6 +498,63 @@ const (
 	TerminationCauseGuardian    TerminationCause = "guardian"
 )
 
+// CapabilityReasonCode is the bounded, sanitized explanation for a node's
+// missing execution capabilities. Detailed probe diagnostics remain local to
+// the agent; this closed vocabulary is safe to retain in L1.
+type CapabilityReasonCode string
+
+const (
+	CapabilityReasonOCIIntentDisabled         CapabilityReasonCode = "oci_intent_disabled"
+	CapabilityReasonPrerequisiteMissing       CapabilityReasonCode = "prerequisite_missing"
+	CapabilityReasonRuntimeVersionUnsupported CapabilityReasonCode = "runtime_version_unsupported"
+	CapabilityReasonHelperUnreachable         CapabilityReasonCode = "helper_unreachable"
+	CapabilityReasonHelperVersionMismatch     CapabilityReasonCode = "helper_version_mismatch"
+	CapabilityReasonHelperHandshakeFailed     CapabilityReasonCode = "helper_handshake_failed"
+	CapabilityReasonBootSweepFailed           CapabilityReasonCode = "boot_sweep_failed"
+	CapabilityReasonProbeFailed               CapabilityReasonCode = "probe_failed"
+	CapabilityReasonLimaStopped               CapabilityReasonCode = "lima_stopped"
+	CapabilityReasonLimaBroken                CapabilityReasonCode = "lima_broken"
+	CapabilityReasonLimaStartTimeout          CapabilityReasonCode = "lima_start_timeout"
+	CapabilityReasonTemplateRestartRequired   CapabilityReasonCode = "template_restart_required"
+	CapabilityReasonTemplateRecreateRequired  CapabilityReasonCode = "template_recreate_required"
+	CapabilityReasonMountRootUnavailable      CapabilityReasonCode = "mount_root_unavailable"
+	CapabilityReasonLocalPermissionDenied     CapabilityReasonCode = "local_permission_denied"
+)
+
+func (code CapabilityReasonCode) Valid() bool {
+	switch code {
+	case CapabilityReasonOCIIntentDisabled,
+		CapabilityReasonPrerequisiteMissing,
+		CapabilityReasonRuntimeVersionUnsupported,
+		CapabilityReasonHelperUnreachable,
+		CapabilityReasonHelperVersionMismatch,
+		CapabilityReasonHelperHandshakeFailed,
+		CapabilityReasonBootSweepFailed,
+		CapabilityReasonProbeFailed,
+		CapabilityReasonLimaStopped,
+		CapabilityReasonLimaBroken,
+		CapabilityReasonLimaStartTimeout,
+		CapabilityReasonTemplateRestartRequired,
+		CapabilityReasonTemplateRecreateRequired,
+		CapabilityReasonMountRootUnavailable,
+		CapabilityReasonLocalPermissionDenied:
+		return true
+	default:
+		return false
+	}
+}
+
+// CapabilityObservation is one immutable, boot-scoped observation of the
+// node's complete execution eligibility set. A higher Revision replaces the
+// complete observation; the same revision is replayable only unchanged.
+type CapabilityObservation struct {
+	Revision            int64                `json:"capability_revision"`
+	Capabilities        map[string]bool      `json:"capabilities"`
+	ObservedAt          time.Time            `json:"capability_observed_at"`
+	MissingCapabilities []string             `json:"missing_capabilities"`
+	ReasonCode          CapabilityReasonCode `json:"capability_reason_code,omitempty"`
+}
+
 // NodeRegistration intentionally has no tags or capacity fields: operators own
 // routing tags and class-scoped slot policy in the control plane. Capabilities
 // are node-advertised execution facts such as kind:process, kind:oci,
@@ -513,9 +570,13 @@ type NodeRegistration struct {
 	// RootInstanceID identifies the agent-owned managed resource root for this
 	// stable node. It is a self-reported local-state fact, not scheduling or
 	// execution authority.
-	RootInstanceID string          `json:"root_instance_id,omitempty"`
-	OS             string          `json:"os"`
-	Architecture   string          `json:"architecture"`
-	AgentVersion   string          `json:"agent_version"`
-	Capabilities   map[string]bool `json:"capabilities,omitempty"`
+	RootInstanceID       string               `json:"root_instance_id,omitempty"`
+	OS                   string               `json:"os"`
+	Architecture         string               `json:"architecture"`
+	AgentVersion         string               `json:"agent_version"`
+	Capabilities         map[string]bool      `json:"capabilities"`
+	CapabilityRevision   int64                `json:"capability_revision"`
+	CapabilityObservedAt time.Time            `json:"capability_observed_at"`
+	MissingCapabilities  []string             `json:"missing_capabilities"`
+	CapabilityReasonCode CapabilityReasonCode `json:"capability_reason_code,omitempty"`
 }

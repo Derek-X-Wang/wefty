@@ -46,6 +46,11 @@ _Avoid_: calling any future declarative layer a "workflow"
 
 ### Scheduling and execution (L1, the cluster)
 
+**Capability revision**:
+A boot-scoped monotonic revision over a node's complete observed capability
+set. Only a higher revision can replace the set within that boot session.
+_Avoid_: capability version, feature flag, health generation
+
 **Job**:
 The L1 schedulable unit, routed to nodes by subset tag matching.
 _Avoid_: task, work item

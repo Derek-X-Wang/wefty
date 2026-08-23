@@ -61,9 +61,11 @@ func assertAgentResizesPoolFromHeartbeatGrantedCapacity(t *testing.T) {
 	}
 	defer client.Close()
 	clock := systemClock{}
+	registration := contract.NodeRegistration{NodeID: "node-1", BootSessionID: "boot-1", AgentVersion: "test"}
 	session := newAgentSession(
 		client,
-		contract.NodeRegistration{NodeID: "node-1", BootSessionID: "boot-1", AgentVersion: "test"},
+		registration,
+		newCapabilityState(registration.Capabilities, nil, clock, 0),
 		5*time.Millisecond,
 		time.Second,
 		clock,

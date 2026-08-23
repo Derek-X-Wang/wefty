@@ -20,6 +20,35 @@ healthy idle process. `last_semantic_error` retains the most recent L1 error
 code, message, and local observation time; transport errors do not invent a
 semantic code.
 
+## Capability observation and local admission
+
+One synchronized agent-owned snapshot contains the complete advertised
+capability set, its boot-scoped Capability revision, local observation time,
+missing capabilities, and one stable sanitized reason code. Registration,
+heartbeat, removal-authority recovery, event-triggered probes, local start
+admission, and future doctor output all read this module; none retains a
+startup-captured capability set.
+
+The OCI functional-probe interface supplies OCI-related observations while the
+configured base set retains independent capabilities such as `kind:process`.
+Configured OCI-related keys are always removed: only a successful functional
+probe can earn them. Each probe has a ten-second default deadline and adapter
+cancellation; timeout records `probe_failed` without blocking the heartbeat
+loop. A failed probe commits a restrictive local snapshot before returning its
+diagnostic error: every OCI-related badge is removed and local OCI start
+admission fails immediately. New claim RPCs pause until registration or a
+heartbeat acknowledges that restrictive revision, while resident attempts are
+untouched. The next successful heartbeat publishes that same full snapshot.
+Recovery requires another successful probe and a higher revision.
+
+The Capability revision advances only when the canonical capability set,
+missing set, or stable reason changes. Repeated identical probes retain the
+revision while advancing observation time; the local snapshot separately
+records the latest completed-probe time for doctor age. Probe detail remains
+local; only the stable reason code and bounded missing set cross into L1.
+Capability observation and its publication barrier are independent of durable
+`claims_enabled` intent.
+
 ## Attempts and occupancy
 
 The `attempts` map is keyed by attempt ID. Each entry carries job ID, workload

@@ -336,6 +336,35 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	}
 }
 
+func TestAgentProtocolCarriesFullCapabilityObservations(t *testing.T) {
+	t.Parallel()
+
+	common := readObject(t, "common.v1.json")
+	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
+	registration := object(t, schemas["NodeRegistration"], "NodeRegistration")
+	registrationRequired := stringSet(t, registration["required"])
+	for _, field := range []string{"capabilities", "capability_revision", "capability_observed_at", "missing_capabilities"} {
+		if !registrationRequired[field] {
+			t.Errorf("NodeRegistration does not require %q", field)
+		}
+	}
+
+	document := readObject(t, "l1-agent.v1.json")
+	paths := object(t, document["paths"], "paths")
+	heartbeatPath := object(t, paths["/v1/agent/nodes/{node_id}/heartbeat"], "heartbeat path")
+	heartbeat := object(t, heartbeatPath["post"], "heartbeat POST")
+	requestBody := object(t, heartbeat["requestBody"], "heartbeat requestBody")
+	content := object(t, requestBody["content"], "heartbeat requestBody.content")
+	media := object(t, content["application/json"], "heartbeat request media type")
+	schema := object(t, media["schema"], "heartbeat request schema")
+	required := stringSet(t, schema["required"])
+	for _, field := range []string{"boot_session_id", "capabilities", "capability_revision", "capability_observed_at", "missing_capabilities"} {
+		if !required[field] {
+			t.Errorf("heartbeat request does not require %q", field)
+		}
+	}
+}
+
 func TestServiceOperatorRoutesRequireClassSelector(t *testing.T) {
 	t.Parallel()
 	doc := readObject(t, "l1-client.v1.json")

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -19,7 +20,8 @@ func TestServiceAcceptanceCapacityIsControlPlanePolicy(t *testing.T) {
 
 	selfReported := map[string]any{
 		"node_id": "capacity-node", "boot_session_id": "boot-1", "os": "linux", "architecture": "arm64", "agent_version": "test",
-		"capabilities": map[string]bool{"kind:process": true, "max_service_slots": true},
+		"capabilities":        map[string]bool{"kind:process": true, "max_service_slots": true},
+		"capability_revision": 1, "capability_observed_at": time.Now().UTC(), "missing_capabilities": []string{},
 	}
 	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", selfReported)
 	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
@@ -27,7 +29,8 @@ func TestServiceAcceptanceCapacityIsControlPlanePolicy(t *testing.T) {
 	registration := contract.NodeRegistration{
 		NodeID: "capacity-node", BootSessionID: "boot-1", RootInstanceID: "root-instance-1",
 		OS: "linux", Architecture: "arm64", AgentVersion: "test",
-		Capabilities: map[string]bool{"kind:process": true},
+		Capabilities:       map[string]bool{"kind:process": true},
+		CapabilityRevision: 1, CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
 	}
 	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
 	if status != http.StatusOK {
@@ -54,7 +57,7 @@ func TestServiceAcceptanceCapacityIsControlPlanePolicy(t *testing.T) {
 		t.Fatalf("root fact changed eligibility projection: %#v", registered)
 	}
 
-	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/capacity-node/heartbeat", HeartbeatRequest{BootSessionID: "boot-2"})
+	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/capacity-node/heartbeat", heartbeatRequestForNode(registered))
 	if status != http.StatusOK {
 		t.Fatalf("heartbeat status = %d body=%s", status, body)
 	}

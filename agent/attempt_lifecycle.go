@@ -55,6 +55,7 @@ type attemptLifecycleDependencies struct {
 	reservePublishedPort   func(l1.Claim) (net.Listener, *contract.SpawnFailure)
 	prepareServiceEndpoint func(context.Context) (serviceRuntimeEndpoint, error)
 	prepareAuthorityLoss   func(context.Context, string) error
+	allowsStart            func(contract.JobSpec) bool
 }
 
 // attemptLifecycle owns one attempt from renewal startup through process/log
@@ -420,6 +421,11 @@ func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Clai
 func (lifecycle *attemptLifecycle) runProcessContexts(ctx context.Context, finalization *attemptFinalization, claim l1.Claim) (contract.ProcessResult, error) {
 	if err := contract.CheckWorkloadClass(claim.Job.Spec.Class); err != nil {
 		return spawnFailure(contract.SpawnFailureUnsupportedClass, err), err
+	}
+	if lifecycle.dependencies.allowsStart != nil && !lifecycle.dependencies.allowsStart(claim.Job.Spec) {
+		return contract.ProcessResult{SpawnError: &contract.SpawnFailure{
+			Code: contract.SpawnFailureRuntimeUnavailable, Message: "local capability observation suppresses this workload start",
+		}}, nil
 	}
 	if err := contract.CheckExecutableKind(claim.Job.Spec.Kind); err != nil {
 		return spawnFailure(contract.SpawnFailureUnsupportedKind, err), err

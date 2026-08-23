@@ -22,6 +22,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 		"nodes": {
 			"max_oneshot_slots", "max_service_slots", "authority_generation", "claims_enabled",
 			"intent_revision", "intent_reason", "intent_updated_at", "intent_actor", "root_instance_id", "connect_host",
+			"capability_revision", "capability_observed_ns", "missing_capabilities_json", "capability_reason_code",
 		},
 		"attempts": {
 			"authority_generation", "result_json", "late_result_json", "late_result_observed_ns",

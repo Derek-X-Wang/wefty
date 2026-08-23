@@ -67,7 +67,13 @@ func TestLegacyProcessCapabilityRemainsClaimEligible(t *testing.T) {
 	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{
 		"legacy": {MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	})
-	legacy := registerCapabilityNode(t, h, "legacy", map[string]bool{"process": true})
+	legacy, err := h.store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-legacy"}, contract.NodeRegistration{
+		NodeID: "legacy", BootSessionID: "boot-legacy", OS: "linux", Architecture: "amd64", AgentVersion: "test",
+		Capabilities: map[string]bool{"process": true},
+	}, NodePolicy{MaxOneshotSlots: 1, MaxServiceSlots: 1}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !legacy.Capabilities["kind:process"] || legacy.Capabilities["process"] {
 		t.Fatalf("registered capabilities = %#v, want canonical kind:process only", legacy.Capabilities)
 	}
@@ -324,6 +330,7 @@ func registerCapabilityNode(t *testing.T, h *integrationHarness, nodeID string, 
 	node, err := h.store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-" + nodeID}, contract.NodeRegistration{
 		NodeID: nodeID, BootSessionID: "boot-" + nodeID, RootInstanceID: "root-" + nodeID,
 		OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: capabilities,
+		CapabilityRevision: 1, CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
 	}, NodePolicy{MaxOneshotSlots: 1, MaxServiceSlots: 1}, true)
 	if err != nil {
 		t.Fatal(err)
