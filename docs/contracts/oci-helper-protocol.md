@@ -109,6 +109,96 @@ EOF or client cancellation on any operation connection cancels its engine
 context. `EnsureImage` is content-addressed and does not take the attempt-create
 side of the sweep gate.
 
+## Guest-side runtime-spec construction
+
+`Run.workload` carries only the closed program inputs the agent owns: immutable
+image digest, optional full argv and working-directory replacements, separate
+public and sensitive operator environment, helper-managed reserved environment,
+enumerated managed volumes, operator mounts, and optional memory/CPU limits.
+The helper-managed list may contain only the exact five reserved names. A
+reserved name arriving defensively in either operator list is stripped rather
+than winning authority. Image
+configuration, image-rootfs user/group databases, guest architecture/kernel
+facts, resolver and hosts files, translated Lima mount paths, namespace/device
+policy, and OCI JSON never cross from the agent.
+
+The privileged adapter constructs `wefty-v1` from containerd v2.3.4's generated
+Linux baseline, then replaces every security-sensitive field explicitly. It
+resolves the image `USER` and supplemental groups from the pinned guest rootfs;
+sets the fixed capability sets, `noNewPrivileges`, containerd default seccomp,
+private PID/IPC/UTS/mount/cgroup namespaces, shared networking, deny-all device
+policy plus the six permitted pseudo-devices, masked/read-only proc paths, a
+read-only `/sys/fs/cgroup` cgroup mount, and writable rootfs; and serializes
+cgroup-v2 memory/CPU limits when present. A memory limit also sets OCI swap to
+the same value, producing `memory.swap.max=0` on cgroup v2 rather than leaving a
+swap escape. `Resources.Pids` remains absent in M3; the missing PID limit is a
+known profile gap, not an implicit default. The
+runtime handler, snapshotter, and containerd namespace are fixed at
+`io.containerd.runc.v2`, `overlayfs`, and `wefty`.
+
+Capability parity is exact: bounding, permitted, and effective contain the 12
+allowed capabilities; inheritable and ambient are explicit empty arrays. The
+latter two, plus `root.readonly=false`, are emitted by the canonical
+`RuntimeSpecDocument` rather than disappearing through runtime-spec's ordinary
+`omitempty` serialization. Its JSON number round-trip retains 64-bit limits,
+and its containerd `Any` carries those canonical bytes unchanged. The raw Go
+spec builder is private so the engine cannot accidentally choose lossy plain
+JSON serialization.
+
+Environment construction is image environment, then public operator
+environment, sensitive operator environment, and authoritative reserved
+environment. Every reserved name is removed from all first three layers before
+the final layer is applied; the host helper environment is never inherited.
+Golden review redacts sensitive values deterministically without changing the
+runtime document. `/etc/resolv.conf` and `/etc/hosts` are
+explicit read-only private bind mounts from helper-managed files. Their
+targets, the fixed `/proc`, `/dev`, `/sys`, and `/run` hierarchies, and
+`/wefty/handoff` and `/wefty/service` are helper-reserved mount targets.
+
+Wire validation is lexical only. The engine translates every operator source
+inside the helper (identity on native Linux; preconfigured shared-root mapping
+for Lima), then performs guest filesystem validation. Validation resolves each
+component through retained `os.OpenRoot`/open-at descriptors, rejects symlinks,
+and retains the allowed-root and leaf identities with the canonical document.
+The engine obtains `ContainerdSpec` immediately before mounting; that mandatory
+handoff revalidates every identity, and the explicit `RevalidateMounts` hook is
+also available to #141. A path swap after construction is rejected. The selected source must be a strict
+descendant of a configured allowed root and the leaf must be a regular file or
+directory; sockets, devices, FIFOs, roots, and nonexistent paths fail closed.
+Bind propagation is private, and a read-only mount uses a recursive read-only
+bind. Nested operator targets are sorted parent-before-child so input order
+cannot shadow a child silently. Managed sources undergo the same checks beneath
+the helper-managed root but are not delegated operator paths.
+
+The baseline `RLIMIT_NOFILE` soft/hard value of 1024 remains containerd's pinned
+default and is an explicit M3 decision; raising it needs workload evidence and
+a profile amendment. Opportunistic AppArmor names use the closed
+`[A-Za-z0-9][A-Za-z0-9_.-]{0,127}` shape. The `ociVersion` remains the linked
+runtime-spec v1.3.0 used by containerd v2.3.4 and the runc v2 shim targeted by
+#141; it is not versioned independently.
+
+The serialized fixtures under
+`runner/ocihelper/testdata/containerd-v2.3.4/` are the review boundary for
+native Linux amd64, Lima Linux arm64, service mounts/environment, default-root,
+numeric-user, and unlimited-resource inputs. The Linux-only oracle also compares
+each architecture's seccomp fixture with the real containerd generator after
+final capabilities are applied. Regenerate complete fixtures only in their
+matching Linux architecture with:
+
+```sh
+UPDATE_OCI_PROFILE_GOLDENS=1 go test ./runner/ocihelper \
+  -run 'TestRuntimeSpecGoldens/(amd64|arm64)' -count=1
+```
+
+The builder also checks the linked containerd module version against the
+fixture version. A containerd patch change therefore fails until the baseline,
+architecture-specific seccomp profile, and complete serialized specs are
+regenerated and reviewed together.
+
+Profile-construction rejection crosses helper RPC as `oci_spec_rejected` and
+maps to the existing agent `SpawnFailureOCISpecRejected`; it is never collapsed
+into the ambiguous `engine_failure` bucket.
+
 ## Deterministic identities and serialization
 
 The helper hashes the complete attempt authority tuple with SHA-256 and uses
