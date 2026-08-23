@@ -9,6 +9,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -38,7 +39,7 @@ func (disabledAttemptWatch) Stop()                  {}
 
 type attemptLifecycleDependencies struct {
 	client                 *Client
-	runner                 ProcessRunner
+	runtimes               workloadRuntimeSet
 	outbox                 *evidenceOutbox
 	watchdog               attemptWatchdog
 	clock                  Clock
@@ -49,6 +50,7 @@ type attemptLifecycleDependencies struct {
 	managedResource        managedResourceManager
 	handoffs               *handoffManager
 	nodeID                 string
+	bootSessionID          string
 	workflowBridge         func(context.Context, contract.ExecutionSpec) (*workflowBridge, error)
 	logf                   func(string, ...any)
 	observer               *lifecycleObserver
@@ -56,6 +58,7 @@ type attemptLifecycleDependencies struct {
 	prepareServiceEndpoint func(context.Context) (serviceRuntimeEndpoint, error)
 	prepareAuthorityLoss   func(context.Context, string) error
 	allowsStart            func(contract.JobSpec) bool
+	runtimeReaped          func(string, workloadrunner.ReapReceipt, error)
 }
 
 // attemptLifecycle owns one attempt from renewal startup through process/log
@@ -99,7 +102,10 @@ func newAttemptFinalization(parent context.Context, timeout time.Duration) *atte
 }
 
 func (finalization *attemptFinalization) begin() (context.Context, func()) {
-	boundedContext, cancelBound := context.WithTimeout(finalization.context, finalization.timeout)
+	// The bounded finalization anchor must remain usable for runtime reaping
+	// even when removal or authority loss canceled the upload context. Existing
+	// uploads still observe finalization.context cancellation directly.
+	boundedContext, cancelBound := context.WithTimeout(context.WithoutCancel(finalization.context), finalization.timeout)
 	stopPropagation := context.AfterFunc(boundedContext, func() {
 		// A log upload may already be retrying on the attempt-long context.
 		// Propagate the finalization deadline so that operation is bounded too.
@@ -123,11 +129,6 @@ var (
 	errAttemptDirectiveStop    = errors.New("attempt directive: stop")
 	errAttemptDirectiveRestart = errors.New("attempt directive: restart")
 )
-
-type handoffLockResult struct {
-	unlock func()
-	err    error
-}
 
 func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
 	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
@@ -154,40 +155,6 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		lifecycle.renewalLoop(attemptContext, claim, authority, renewalErrors, watch)
 	}()
 
-	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
-		locked := make(chan handoffLockResult, 1)
-		go func() {
-			unlock, err := lifecycle.dependencies.handoffs.lock(attemptContext, claim.Job.Spec)
-			locked <- handoffLockResult{unlock: unlock, err: err}
-		}()
-		select {
-		case result := <-locked:
-			if result.err != nil {
-				<-renewalDone
-				if errors.Is(result.err, errAuthorityDeadlineExceeded) {
-					return errorDestinationAttemptAuthority, fmt.Errorf("agent: acquire handoff path: %w", result.err)
-				}
-				return errorDestinationUnclassified, fmt.Errorf("agent: acquire handoff path: %w", result.err)
-			}
-			defer result.unlock()
-		case failure := <-renewalErrors:
-			cancelAttempt(failure.err)
-			releaseHandoffLock(<-locked)
-			<-renewalDone
-			return failure.destination, fmt.Errorf("agent: renew lease while acquiring handoff path: %w", failure.err)
-		case err := <-watch.Failures():
-			cancelAttempt(err)
-			releaseHandoffLock(<-locked)
-			<-renewalDone
-			return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog while acquiring handoff path: %w", err)
-		case <-ctx.Done():
-			cancelAttempt(ctx.Err())
-			releaseHandoffLock(<-locked)
-			<-renewalDone
-			return errorDestinationUnclassified, ctx.Err()
-		}
-	}
-
 	// The attempt-long context is uncancelable by execution shutdown so final
 	// output can still be flushed. Its timeout is deliberately not attached
 	// yet: payload uptime is not part of the finalization phase. Authority loss
@@ -195,12 +162,20 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	finalization := newAttemptFinalization(attemptContext, lifecycle.dependencies.finalizationTimeout)
 	defer finalization.stop()
 
+	var handoffUnlock func()
+	defer func() {
+		if handoffUnlock != nil {
+			handoffUnlock()
+		}
+	}()
 	completed := make(chan runOutcome, 1)
 	go func() {
 		if claim.Job.Spec.Class == contract.JobClassOneShot {
 			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptRunning, nil)
 		}
-		result, err := lifecycle.runProcessContexts(executionContext, finalization, claim)
+		result, err := lifecycle.runWorkloadContexts(executionContext, finalization, claim, func(unlock func()) {
+			handoffUnlock = unlock
+		})
 		var durabilityErr error
 		if lifecycle.dependencies.outbox != nil {
 			durabilityErr = lifecycle.dependencies.outbox.storeCompletion(
@@ -365,12 +340,6 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	return errorDestinationUnclassified, nil
 }
 
-func releaseHandoffLock(result handoffLockResult) {
-	if result.unlock != nil {
-		result.unlock()
-	}
-}
-
 func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) destinationError {
 	for {
 		if _, err := lifecycle.dependencies.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request); err != nil {
@@ -412,13 +381,18 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 	}
 }
 
-func (lifecycle *attemptLifecycle) runProcess(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
+func (lifecycle *attemptLifecycle) runWorkload(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
 	finalization := newAttemptFinalization(ctx, lifecycle.dependencies.finalizationTimeout)
 	defer finalization.stop()
-	return lifecycle.runProcessContexts(ctx, finalization, claim)
+	return lifecycle.runWorkloadContexts(ctx, finalization, claim, nil)
 }
 
-func (lifecycle *attemptLifecycle) runProcessContexts(ctx context.Context, finalization *attemptFinalization, claim l1.Claim) (contract.ProcessResult, error) {
+func (lifecycle *attemptLifecycle) runWorkloadContexts(
+	ctx context.Context,
+	finalization *attemptFinalization,
+	claim l1.Claim,
+	retainHandoffLock func(func()),
+) (contract.ProcessResult, error) {
 	if err := contract.CheckWorkloadClass(claim.Job.Spec.Class); err != nil {
 		return spawnFailure(contract.SpawnFailureUnsupportedClass, err), err
 	}
@@ -427,57 +401,136 @@ func (lifecycle *attemptLifecycle) runProcessContexts(ctx context.Context, final
 			Code: contract.SpawnFailureRuntimeUnavailable, Message: "local capability observation suppresses this workload start",
 		}}, nil
 	}
-	if err := contract.CheckExecutableKind(claim.Job.Spec.Kind); err != nil {
+	runtimeAdapter, found := lifecycle.dependencies.runtimes.selectKind(claim.Job.Spec.Kind)
+	if !found {
+		err := &contract.ExecutionError{Kind: claim.Job.Spec.Kind}
 		return spawnFailure(contract.SpawnFailureUnsupportedKind, err), err
 	}
-	if claim.Job.Spec.RuntimeHandler != "" {
-		err := fmt.Errorf("runtime handler %q is not supported for process jobs", claim.Job.Spec.RuntimeHandler)
-		return spawnFailure(contract.SpawnFailureUnsupportedRuntimeHandler, err), err
+	authority := workloadrunner.AttemptAuthority{
+		NodeID: lifecycle.dependencies.nodeID, BootSessionID: lifecycle.dependencies.bootSessionID,
+		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
 	}
-	executionSpec := claim.Job.Spec.Execution
-	runtimeDirectory := ""
+	idlePolicy := workloadrunner.MonitorIdle
+	if claim.Job.Spec.Class == contract.JobClassService {
+		idlePolicy = workloadrunner.IgnoreIdle
+	}
+	request := workloadrunner.Request{
+		Authority: authority, RuntimeHandler: claim.Job.Spec.RuntimeHandler,
+		Execution: claim.Job.Spec.Execution, Limits: claim.Job.Spec.Limits,
+		IdlePolicy: idlePolicy,
+	}
+	if claim.Job.Spec.Class == contract.JobClassService {
+		request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+	}
+	portfulService := claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.PublishedPort != nil
+	if claim.Job.Spec.Class == contract.JobClassService && !portfulService {
+		request.Started = func() {
+			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptRunning, nil)
+		}
+	}
+	admission, preflightResult, preflightErr := runtimeAdapter.Preflight(ctx, request)
+	if admission.Release != nil {
+		defer admission.Release()
+	}
+	request = admission.Request
+	var uploader *batchingLogSink
+	var redactingSink *redactingOutputSink
+	var managedResources workloadrunner.ManagedResources
+	finish := func(result contract.ProcessResult, runErr error) (contract.ProcessResult, error) {
+		finalizationContext, cancelFinalization := finalization.begin()
+		defer cancelFinalization()
+		reapReceipt, reapErr := runtimeAdapter.ReapAndVerify(finalizationContext, workloadrunner.ReapRequest{
+			Authority: authority, ManagedResources: managedResources,
+		})
+		if reapErr == nil && !reapReceipt.RuntimeQuiesced {
+			reapErr = errors.New("workload runtime did not verify quiescence")
+		}
+		if reapErr == nil && reapReceipt.Evidence == "" {
+			reapErr = errors.New("workload runtime reap receipt has no evidence kind")
+		}
+		if lifecycle.dependencies.runtimeReaped != nil {
+			lifecycle.dependencies.runtimeReaped(claim.Job.JobID, reapReceipt, reapErr)
+		}
+		if reapErr != nil {
+			reapErr = fmt.Errorf("reap and verify workload runtime: %w", reapErr)
+		}
+		var outputErr error
+		if redactingSink != nil {
+			outputErr = redactingSink.Flush(finalizationContext)
+		}
+		var uploadErr error
+		if uploader != nil {
+			uploadErr = uploader.CloseContext(finalizationContext)
+		}
+		if outputErr != nil {
+			outputErr = fmt.Errorf("flush redacted output: %w", outputErr)
+		}
+		if uploadErr != nil {
+			uploadErr = fmt.Errorf("upload logs: %w", uploadErr)
+		}
+		finalizationErr := errors.Join(reapErr, outputErr, uploadErr)
+		if finalizationErr != nil {
+			result = contract.ProcessResult{OutputError: finalizationErr.Error()}
+		}
+		return result, errors.Join(runErr, finalizationErr)
+	}
+	if preflightErr != nil {
+		return finish(preflightResult.Outcome, preflightErr)
+	}
+	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
+		unlock, err := lifecycle.dependencies.handoffs.lock(ctx, claim.Job.Spec)
+		if err != nil {
+			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
+		}
+		if retainHandoffLock != nil {
+			retainHandoffLock(unlock)
+		} else {
+			defer unlock()
+		}
+	}
+	executionSpec := request.Execution
 	var publishedListener net.Listener
 	var endpoint serviceRuntimeEndpoint
-	portfulService := claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.PublishedPort != nil
 	if claim.Job.Spec.Class == contract.JobClassService {
 		if lifecycle.dependencies.managedResource == nil {
 			err := errors.New("managed resource is not configured for service jobs")
-			return spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err
+			return finish(spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err)
 		}
 		resource, cleanupResource, err := lifecycle.dependencies.managedResource.prepareAttempt(claim.Job.JobID, claim.Lease.AttemptID)
 		if err != nil {
-			return spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err
+			return finish(spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err)
 		}
 		defer cleanupResource()
+		managedResources = resource
+		request.ManagedResources = resource
 		executionSpec.Env = cloneEnvironment(executionSpec.Env)
 		executionSpec.SensitiveEnv = cloneEnvironment(executionSpec.SensitiveEnv)
 		delete(executionSpec.SensitiveEnv, contract.EnvServiceDir)
 		executionSpec.Env[contract.EnvServiceDir] = resource.dataDirectory
-		runtimeDirectory = resource.runtimeDirectory
 	}
 	if portfulService {
 		if lifecycle.dependencies.reservePublishedPort == nil {
 			err := errors.New("published-port reservation is not configured")
-			return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
 		}
 		var failure *contract.SpawnFailure
 		publishedListener, failure = lifecycle.dependencies.reservePublishedPort(claim)
 		if failure != nil {
-			return contract.ProcessResult{SpawnError: failure}, nil
+			return finish(contract.ProcessResult{SpawnError: failure}, nil)
 		}
 		if publishedListener == nil {
 			err := errors.New("published-port reservation returned no listener")
-			return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
 		}
 		defer publishedListener.Close()
 		if lifecycle.dependencies.prepareServiceEndpoint == nil {
 			err := errors.New("service runtime endpoint adapter is not configured")
-			return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
 		}
 		var err error
 		endpoint, err = lifecycle.dependencies.prepareServiceEndpoint(ctx)
 		if err != nil {
-			return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
 		}
 		executionSpec.Env = cloneEnvironment(executionSpec.Env)
 		executionSpec.SensitiveEnv = cloneEnvironment(executionSpec.SensitiveEnv)
@@ -489,33 +542,28 @@ func (lifecycle *attemptLifecycle) runProcessContexts(ctx context.Context, final
 	}
 	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
 		if err := lifecycle.dependencies.handoffs.prepare(claim.Job.Spec, lifecycle.dependencies.nodeID); err != nil {
-			return spawnFailure(contract.SpawnFailureHandoffPreparation, err), err
+			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
 	}
-	execution, cleanupExecutable, err := materializeExecutable(executionSpec, claim.Lease.AttemptID, runtimeDirectory)
-	if err != nil {
-		return spawnFailure(contract.SpawnFailureExecutableMaterialization, err), err
-	}
-	defer cleanupExecutable()
+	var err error
 	var bridge *workflowBridge
 	if lifecycle.dependencies.workflowBridge != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
-		bridge, err = lifecycle.dependencies.workflowBridge(ctx, execution)
+		bridge, err = lifecycle.dependencies.workflowBridge(ctx, executionSpec)
 		if err != nil {
-			return spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, err), err
+			return finish(spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, err), err)
 		}
 	}
 	if bridge != nil {
 		defer bridge.close()
-		execution.Env = cloneEnvironment(execution.Env)
-		delete(execution.Env, "WEFTY_L1_ENDPOINT")
-		execution.Env[contract.EnvL3Endpoint] = bridge.l3Endpoint
+		executionSpec.Env = cloneEnvironment(executionSpec.Env)
+		delete(executionSpec.Env, "WEFTY_L1_ENDPOINT")
+		executionSpec.Env[contract.EnvL3Endpoint] = bridge.l3Endpoint
 	}
-	var uploader *batchingLogSink
 	var sinks multiOutputSink
 	if lifecycle.dependencies.client != nil && lifecycle.dependencies.outbox != nil {
 		uploader, err = lifecycle.dependencies.outbox.newLogSink(finalization.context, lifecycle.dependencies.client, claim)
 		if err != nil {
-			return spawnFailure(contract.SpawnFailureLogSinkSetup, err), err
+			return finish(spawnFailure(contract.SpawnFailureLogSinkSetup, err), err)
 		}
 		sinks = append(sinks, uploader)
 	}
@@ -542,26 +590,11 @@ func (lifecycle *attemptLifecycle) runProcessContexts(ctx context.Context, final
 	} else if len(sinks) > 1 {
 		sink = sinks
 	}
-	redactingSink := newRedactingOutputSink(sink, claim.Job.Spec.Execution.SensitiveEnv)
+	redactingSink = newRedactingOutputSink(sink, claim.Job.Spec.Execution.SensitiveEnv)
 	if redactingSink != nil {
 		sink = redactingSink
 	}
-	idlePolicy := processrunner.MonitorIdle
-	if claim.Job.Spec.Class == contract.JobClassService {
-		idlePolicy = processrunner.IgnoreIdle
-	}
-	request := processrunner.Request{
-		AttemptID:  claim.Lease.AttemptID,
-		Class:      claim.Job.Spec.Class,
-		Execution:  execution,
-		Limits:     claim.Job.Spec.Limits,
-		IdlePolicy: idlePolicy,
-	}
-	if claim.Job.Spec.Class == contract.JobClassService && !portfulService {
-		request.Started = func() {
-			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptRunning, nil)
-		}
-	}
+	request.Execution = executionSpec
 	var result contract.ProcessResult
 	var runErr error
 	if portfulService {
@@ -586,32 +619,13 @@ func (lifecycle *attemptLifecycle) runProcessContexts(ctx context.Context, final
 			}
 		}
 		result, runErr = runPortfulService(
-			ctx, lifecycle.dependencies.runner, request, sink, publishedListener, endpoint, config,
+			ctx, runtimeAdapter, request, sink, publishedListener, endpoint, config,
 		)
 	} else {
-		result, runErr = lifecycle.dependencies.runner.Run(ctx, request, sink)
+		runtimeResult, err := runtimeAdapter.Run(ctx, request, sink)
+		result, runErr = runtimeResult.Outcome, err
 	}
-	finalizationContext, cancelFinalization := finalization.begin()
-	defer cancelFinalization()
-	var outputErr error
-	if redactingSink != nil {
-		outputErr = redactingSink.Flush(finalizationContext)
-	}
-	var uploadErr error
-	if uploader != nil {
-		uploadErr = uploader.CloseContext(finalizationContext)
-	}
-	if outputErr != nil {
-		outputErr = fmt.Errorf("flush redacted output: %w", outputErr)
-	}
-	if uploadErr != nil {
-		uploadErr = fmt.Errorf("upload logs: %w", uploadErr)
-	}
-	finalizationErr := errors.Join(outputErr, uploadErr)
-	if finalizationErr != nil {
-		result = contract.ProcessResult{OutputError: finalizationErr.Error()}
-	}
-	return result, errors.Join(runErr, finalizationErr)
+	return finish(result, runErr)
 }
 
 func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Claim, authority localAuthority, failures chan<- destinationError, watch attemptWatch) {

@@ -246,6 +246,9 @@ func runDeletionGuardrailMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if got := newBoot.PreviousBootSessionID(); got != "boot-a" {
+			t.Fatalf("previous boot session = %q, want boot-a", got)
+		}
 		if err := fixture.manager.Remove(context.Background(), fixture.removal); !errors.Is(err, ErrStaleBootSession) {
 			t.Fatalf("old boot Remove() error = %v, want %v", err, ErrStaleBootSession)
 		}

@@ -60,7 +60,7 @@ func assertAttemptPersistsCompletionBeforeDelivery(t *testing.T) {
 		},
 	}
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
-		client: client, runner: instantResultRunner{}, outbox: outbox,
+		client: client, runtimes: testRuntimeSet(instantResultRunner{}), outbox: outbox,
 		clock: systemClock{}, renewalInterval: 10 * time.Second, completionRetry: time.Millisecond,
 		observer: newLifecycleObserver(systemClock{}),
 	})

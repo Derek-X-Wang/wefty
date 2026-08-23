@@ -120,13 +120,13 @@ func TestLocalCapabilityAdmissionPreventsRunnerStart(t *testing.T) {
 	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, systemClock{}, 0)
 	runner := &countingProcessRunner{}
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
-		runner: runner, clock: systemClock{}, allowsStart: state.allows,
+		runtimes: testRuntimeSet(runner), clock: systemClock{}, allowsStart: state.allows,
 	})
 	claim := l1.Claim{Job: l1.Job{Spec: contract.JobSpec{
 		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example/probe"}}},
 	}}}
-	result, err := lifecycle.runProcess(context.Background(), claim)
+	result, err := lifecycle.runWorkload(context.Background(), claim)
 	if err != nil {
 		t.Fatal(err)
 	}

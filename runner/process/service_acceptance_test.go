@@ -73,7 +73,7 @@ func TestServiceAcceptanceGuardianOwnsStartupTimeoutRace(t *testing.T) {
 		StartupReadinessDeadline: 150 * time.Millisecond,
 		ReadinessProbeInterval:   20 * time.Millisecond, ReadinessConnectTimeout: 10 * time.Millisecond,
 	}).Run(context.Background(), Request{
-		AttemptID: "startup-timeout-arbiter", Class: contract.JobClassService,
+		AttemptID: "startup-timeout-arbiter", Guarded: true,
 		Execution: helperExecution("hang"), IdlePolicy: IgnoreIdle,
 		ServiceAddress: serviceAddress, Started: func() { started <- struct{}{} },
 	}, nil)
@@ -106,7 +106,7 @@ func TestServiceAcceptanceProcessExitWinsBeforeStartupDeadline(t *testing.T) {
 		StartupReadinessDeadline: 500 * time.Millisecond,
 		ReadinessProbeInterval:   20 * time.Millisecond, ReadinessConnectTimeout: 10 * time.Millisecond,
 	}).Run(context.Background(), Request{
-		AttemptID: "startup-exit-arbiter", Class: contract.JobClassService,
+		AttemptID: "startup-exit-arbiter", Guarded: true,
 		Execution: helperExecution("exit", "7"), IdlePolicy: IgnoreIdle, ServiceAddress: serviceAddress,
 	}, nil)
 	if err != nil {
@@ -129,7 +129,7 @@ func TestServiceAcceptanceProbeNeverKillsAfterStartup(t *testing.T) {
 		ReadinessProbeInterval:   20 * time.Millisecond, ReadinessConnectTimeout: 10 * time.Millisecond,
 	})
 	request := Request{
-		AttemptID: "readiness-recovery", Class: contract.JobClassService,
+		AttemptID: "readiness-recovery", Guarded: true,
 		Execution: helperExecution("hang"), IdlePolicy: IgnoreIdle, ServiceAddress: address,
 		ReadinessChanged: func(startupSatisfied, ready bool) {
 			if !startupSatisfied {

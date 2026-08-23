@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -65,9 +66,9 @@ type serviceSupervisorConfig struct {
 // guardian own backend probing and the startup race.
 func runPortfulService(
 	ctx context.Context,
-	runner ProcessRunner,
-	request processrunner.Request,
-	sink processrunner.OutputSink,
+	runtimeAdapter WorkloadRuntime,
+	request workloadrunner.Request,
+	sink workloadrunner.OutputSink,
 	listener net.Listener,
 	endpoint serviceRuntimeEndpoint,
 	config serviceSupervisorConfig,
@@ -111,8 +112,8 @@ func runPortfulService(
 	}
 	outcomes := make(chan serviceRunOutcome, 1)
 	go func() {
-		result, err := runner.Run(runContext, request, sink)
-		outcomes <- serviceRunOutcome{result: result, err: err}
+		result, err := runtimeAdapter.Run(runContext, request, sink)
+		outcomes <- serviceRunOutcome{result: result.Outcome, err: err}
 	}()
 
 	select {

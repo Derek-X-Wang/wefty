@@ -27,13 +27,13 @@ func TestHandoffDirectoryExistsPrivatelyBeforeExecutionAndCleansOnSuccess(t *tes
 	runner := &handoffAssertingRunner{t: t, path: path}
 	a := &Agent{
 		registration: contract.NodeRegistration{NodeID: "node-1"},
-		runner:       runner,
+		runtimes:     testRuntimeSet(runner),
 		handoffs:     manager,
 	}
 	claim := handoffClaim(runID, path, nil)
-	result, err := a.runProcess(context.Background(), claim)
+	result, err := a.runWorkload(context.Background(), claim)
 	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || !runner.called {
-		t.Fatalf("runProcess() = (%#v, %v), called=%v", result, err, runner.called)
+		t.Fatalf("runWorkload() = (%#v, %v), called=%v", result, err, runner.called)
 	}
 	markerInfo, err := os.Stat(filepath.Join(path, handoffMarkerName))
 	if err != nil {
@@ -113,7 +113,7 @@ func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
 	var output bytes.Buffer
 	a := &Agent{
 		registration: contract.NodeRegistration{NodeID: "node-1"},
-		runner:       processrunner.New(processrunner.Config{}),
+		runtimes:     testRuntimeSet(processrunner.New(processrunner.Config{})),
 		handoffs:     newHandoffManager(root, time.Hour),
 		outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
 			return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
@@ -140,9 +140,9 @@ func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
 		WorkingDirectory: t.TempDir(),
 		HandoffDirectory: handoff,
 	}
-	result, err := a.runProcess(context.Background(), claim)
+	result, err := a.runWorkload(context.Background(), claim)
 	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
-		t.Fatalf("runProcess() = (%#v, %v)", result, err)
+		t.Fatalf("runWorkload() = (%#v, %v)", result, err)
 	}
 	want := runID + "\nwefty://l3\nunset\n[REDACTED]\n" + handoff + "\n"
 	if output.String() != want {

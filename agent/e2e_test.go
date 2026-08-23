@@ -50,7 +50,7 @@ func TestAgentProcessEndToEndPlainFabric(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			runProcessE2E(t, test.leaseDuration, test.renewalInterval, test.arguments, test.wantOutput)
+			runWorkloadE2E(t, test.leaseDuration, test.renewalInterval, test.arguments, test.wantOutput)
 		})
 	}
 }
@@ -189,7 +189,7 @@ func TestAgentLogPollTailsRunningProcess(t *testing.T) {
 	server.stop(t)
 }
 
-func runProcessE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, arguments []string, wantOutput string) {
+func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, arguments []string, wantOutput string) {
 	t.Helper()
 	directory := t.TempDir()
 	readyFile := filepath.Join(directory, "ready.json")

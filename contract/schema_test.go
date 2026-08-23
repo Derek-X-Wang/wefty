@@ -301,7 +301,7 @@ func TestOCIReservedEnvironmentNamesAreExact(t *testing.T) {
 	}
 }
 
-func TestUnknownKindParsesButExecutionRejects(t *testing.T) {
+func TestUnknownKindParses(t *testing.T) {
 	t.Parallel()
 
 	raw, err := contractFiles.ReadFile("testdata/schemas/job-spec/valid-unknown-kind.json")
@@ -316,14 +316,6 @@ func TestUnknownKindParsesButExecutionRejects(t *testing.T) {
 		t.Fatalf("kind changed during decode: %q", spec.Kind)
 	}
 
-	err = CheckExecutableKind(spec.Kind)
-	var executionErr *ExecutionError
-	if !errors.As(err, &executionErr) {
-		t.Fatalf("expected ExecutionError, got %v", err)
-	}
-	if executionErr.Code() != ErrorUnsupportedKind {
-		t.Fatalf("unexpected error code: %q", executionErr.Code())
-	}
 }
 
 func TestUnknownClassParsesButExecutionRejects(t *testing.T) {

@@ -129,7 +129,7 @@ func TestServiceRunSelfExecsGuardianAndPreservesRawEvents(t *testing.T) {
 	started := make(chan struct{}, 1)
 	result, err := New(Config{GuardianExecutable: guardianAgentPath}).Run(context.Background(), Request{
 		AttemptID:  "attempt-guardian-raw",
-		Class:      contract.JobClassService,
+		Guarded:    true,
 		Execution:  helperExecution("raw-output"),
 		IdlePolicy: IgnoreIdle,
 		Started:    func() { started <- struct{}{} },
@@ -155,7 +155,7 @@ func TestServiceRunSelfExecsGuardianAndPreservesRawEvents(t *testing.T) {
 func TestRunDistinguishesProcessResults(t *testing.T) {
 	t.Run("service readiness without guardian", func(t *testing.T) {
 		result, err := New(Config{}).Run(context.Background(), Request{
-			AttemptID: "attempt-unguarded-service", Class: contract.JobClassService,
+			AttemptID: "attempt-unguarded-service", Guarded: true,
 			Execution: helperExecution("hang"), IdlePolicy: IgnoreIdle, ServiceAddress: "127.0.0.1:1",
 		}, nil)
 		if err == nil || result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailureProcessRequest {

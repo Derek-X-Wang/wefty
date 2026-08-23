@@ -121,7 +121,7 @@ func assertOutputSinkFactorySupportsConcurrentAttemptIsolation(t *testing.T) {
 			return nil
 		})
 	}
-	a := &Agent{runner: concurrencyOutputRunner{}, outputSinkFactory: factory}
+	a := &Agent{runtimes: testRuntimeSet(concurrencyOutputRunner{}), outputSinkFactory: factory}
 	done := make(chan error, 2)
 	for index := 1; index <= 2; index++ {
 		attemptID := fmt.Sprintf("attempt-%d", index)
@@ -132,7 +132,7 @@ func assertOutputSinkFactorySupportsConcurrentAttemptIsolation(t *testing.T) {
 			Lease: l1.AttemptLease{AttemptID: attemptID},
 		}
 		go func() {
-			_, err := a.runProcess(context.Background(), claim)
+			_, err := a.runWorkload(context.Background(), claim)
 			done <- err
 		}()
 	}

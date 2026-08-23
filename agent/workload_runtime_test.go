@@ -1,0 +1,208 @@
+package agent
+
+import (
+	"context"
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
+)
+
+func testProcessRuntime(executor processrunner.Executor) WorkloadRuntime {
+	return processrunner.NewAdapter(executor)
+}
+
+func testRuntimeSet(executor processrunner.Executor) workloadRuntimeSet {
+	return workloadRuntimeSet{"process": testProcessRuntime(executor)}
+}
+
+func workloadRequest(attemptID string) workloadrunner.Request {
+	return workloadrunner.Request{
+		Authority:        workloadrunner.AttemptAuthority{AttemptID: attemptID},
+		LifetimeBoundary: workloadrunner.AgentBootLifetime,
+	}
+}
+
+func TestWorkloadRuntimeRequiresPositiveReapVerification(t *testing.T) {
+	runtime := &reapRefusingRuntime{}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{"future.microvm": runtime},
+		clock:    systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
+	})
+	claim := l1.Claim{
+		Job:   l1.Job{JobID: "future-job", Spec: contract.JobSpec{Kind: "future.microvm", Class: contract.JobClassOneShot}},
+		Lease: l1.AttemptLease{AttemptID: "future-attempt", FencingToken: "fence-1"},
+	}
+	result, err := lifecycle.runWorkload(context.Background(), claim)
+	if err == nil || !strings.Contains(err.Error(), "did not verify quiescence") {
+		t.Fatalf("unverified runtime result = (%#v, %v), want quiescence failure", result, err)
+	}
+	if result.OutputError == "" || result.ExitCode != nil || result.SpawnError != nil || result.RuntimeFailure != nil || result.Signal != "" {
+		t.Fatalf("unverified runtime result = %#v, want only output_error", result)
+	}
+	if runtime.runCalls != 1 || runtime.reapCalls != 1 {
+		t.Fatalf("runtime calls = run %d reap %d, want one each", runtime.runCalls, runtime.reapCalls)
+	}
+	if got := runtime.request.Authority; got.NodeID != "node-1" || got.BootSessionID != "boot-1" ||
+		got.JobID != "future-job" || got.AttemptID != "future-attempt" || got.FencingToken != "fence-1" {
+		t.Fatalf("runtime authority = %#v", got)
+	}
+	if runtime.request.LifetimeBoundary != workloadrunner.CallerLifetime || runtime.request.IdlePolicy != workloadrunner.MonitorIdle {
+		t.Fatalf("one-shot mechanical policy = lifetime %d idle %d", runtime.request.LifetimeBoundary, runtime.request.IdlePolicy)
+	}
+}
+
+func TestWorkloadRuntimeReapUsesFinalizationContext(t *testing.T) {
+	adapter := &finalizationContextRuntime{}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{"future.microvm": adapter}, clock: systemClock{},
+		nodeID: "node-1", bootSessionID: "boot-1",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "job-finalization-context", Spec: contract.JobSpec{
+			Kind: "future.microvm", Class: contract.JobClassOneShot,
+		}},
+		Lease: l1.AttemptLease{AttemptID: "attempt-finalization-context", FencingToken: "fence-1"},
+	}
+	result, err := lifecycle.runWorkload(ctx, claim)
+	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("workload with canceled execution context = (%#v, %v)", result, err)
+	}
+	if adapter.reapContextErr != nil {
+		t.Fatalf("reap context inherited execution cancellation: %v", adapter.reapContextErr)
+	}
+}
+
+func TestProcessPreflightRejectsBeforeAgentResourceAcquisition(t *testing.T) {
+	publishedPort := 8080
+	tests := []struct {
+		name string
+		spec contract.JobSpec
+		code contract.SpawnFailureCode
+	}{
+		{
+			name: "process runtime handler", code: contract.SpawnFailureUnsupportedRuntimeHandler,
+			spec: contract.JobSpec{
+				Kind: contract.JobKindProcess, Class: contract.JobClassService,
+				RuntimeHandler: "runc", PublishedPort: &publishedPort,
+			},
+		},
+		{
+			name: "inline executable materialization", code: contract.SpawnFailureExecutableMaterialization,
+			spec: contract.JobSpec{Kind: contract.JobKindProcess, Class: contract.JobClassOneShot, Execution: contract.ExecutionSpec{
+				Executable:       contract.ExecutableSpec{InlineBase64: "%%%", SHA256: strings.Repeat("0", 64)},
+				HandoffDirectory: filepath.Join(t.TempDir(), "handoff"),
+			}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executor := &preflightExecutor{}
+			managed := &preflightManagedResource{}
+			var portReservations, bridges, sinks int
+			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+				runtimes: workloadRuntimeSet{contract.JobKindProcess: processrunner.NewAdapter(executor)},
+				clock:    systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
+				managedResource: managed, handoffs: newHandoffManager(t.TempDir(), 0),
+				reservePublishedPort: func(l1.Claim) (net.Listener, *contract.SpawnFailure) {
+					portReservations++
+					return nil, nil
+				},
+				workflowBridge: func(context.Context, contract.ExecutionSpec) (*workflowBridge, error) {
+					bridges++
+					return nil, errors.New("must not create workflow bridge")
+				},
+				outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
+					sinks++
+					return nil
+				},
+			})
+			claim := l1.Claim{
+				Job:   l1.Job{JobID: "job-preflight", Spec: test.spec},
+				Lease: l1.AttemptLease{AttemptID: "attempt-preflight", FencingToken: "fence-preflight"},
+			}
+			result, err := lifecycle.runWorkload(context.Background(), claim)
+			if err == nil || result.SpawnError == nil || result.SpawnError.Code != test.code {
+				t.Fatalf("preflight result = (%#v, %v), want %s", result, err, test.code)
+			}
+			if executor.calls != 0 || managed.calls != 0 || portReservations != 0 || bridges != 0 || sinks != 0 {
+				t.Fatalf("preflight rejection side effects = executor %d managed %d ports %d bridges %d sinks %d",
+					executor.calls, managed.calls, portReservations, bridges, sinks)
+			}
+			if _, statErr := os.Stat(test.spec.Execution.HandoffDirectory); test.spec.Execution.HandoffDirectory != "" && !os.IsNotExist(statErr) {
+				t.Fatalf("preflight rejection created handoff path: %v", statErr)
+			}
+		})
+	}
+}
+
+type reapRefusingRuntime struct {
+	runCalls  int
+	reapCalls int
+	request   workloadrunner.Request
+}
+
+func (adapter *reapRefusingRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (runtime *reapRefusingRuntime) Run(_ context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	runtime.runCalls++
+	runtime.request = request
+	exitCode := 0
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+}
+
+func (runtime *reapRefusingRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	runtime.reapCalls++
+	return workloadrunner.ReapReceipt{}, nil
+}
+
+type finalizationContextRuntime struct {
+	reapContextErr error
+}
+
+func (adapter *finalizationContextRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (*finalizationContextRuntime) Run(context.Context, workloadrunner.Request, workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	exitCode := 0
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+}
+
+func (adapter *finalizationContextRuntime) ReapAndVerify(ctx context.Context, _ workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	adapter.reapContextErr = ctx.Err()
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, adapter.reapContextErr
+}
+
+type preflightExecutor struct{ calls int }
+
+func (executor *preflightExecutor) Run(context.Context, processrunner.Request, processrunner.OutputSink) (contract.ProcessResult, error) {
+	executor.calls++
+	return contract.ProcessResult{}, nil
+}
+
+type preflightManagedResource struct{ calls int }
+
+func (*preflightManagedResource) rootInstanceID() string { return "root-preflight" }
+
+func (resource *preflightManagedResource) prepareAttempt(string, string) (managedResourceAttempt, func(), error) {
+	resource.calls++
+	return managedResourceAttempt{}, func() {}, nil
+}
+
+func (*preflightManagedResource) remove(context.Context, localRemoval) error { return nil }
+
+func (*preflightManagedResource) resumeRemovals(context.Context) ([]localRemoval, error) {
+	return nil, nil
+}

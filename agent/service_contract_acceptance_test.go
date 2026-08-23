@@ -37,7 +37,7 @@ func TestServiceAcceptanceAgentClassAndHandoffContract(t *testing.T) {
 	digest := sha256.Sum256(content)
 	runner := &serviceContractRunner{t: t}
 	agent := &Agent{
-		runner:          runner,
+		runtimes:        testRuntimeSet(runner),
 		managedResource: resource,
 		handoffs:        newHandoffManager(t.TempDir(), DefaultHandoffRetention),
 	}
@@ -65,16 +65,19 @@ func TestServiceAcceptanceAgentClassAndHandoffContract(t *testing.T) {
 		Lease: l1.AttemptLease{AttemptID: "service-contract-attempt"},
 	}
 	beforeTemp := executableTempDirectories(t, claim.Lease.AttemptID)
-	result, err := agent.runProcess(context.Background(), claim)
+	result, err := agent.runWorkload(context.Background(), claim)
 	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || !runner.called {
-		t.Fatalf("service runProcess() = (%#v, %v), runner called=%v", result, err, runner.called)
+		t.Fatalf("service runWorkload() = (%#v, %v), runner called=%v", result, err, runner.called)
 	}
 	paths := servicePaths(t, stateRoot, claim.Job.JobID)
 	if runner.serviceDirectory != paths.Data {
 		t.Fatalf("payload %s = %q, want %q", contract.EnvServiceDir, runner.serviceDirectory, paths.Data)
 	}
-	if !pathWithin(runner.executablePath, paths.Runtime) {
-		t.Fatalf("inline executable = %q, want under managed runtime %q", runner.executablePath, paths.Runtime)
+	if pathWithin(runner.executablePath, paths.Root) {
+		t.Fatalf("adapter-owned inline executable = %q, must not enter generic managed root %q", runner.executablePath, paths.Root)
+	}
+	if _, err := os.Stat(runner.executablePath); !os.IsNotExist(err) {
+		t.Fatalf("adapter-owned inline executable survived completion: %v", err)
 	}
 	if payload, err := os.ReadFile(operatorFile); err != nil || string(payload) != "untouched" {
 		t.Fatalf("working directory changed: payload=%q err=%v", payload, err)
@@ -90,9 +93,9 @@ func TestServiceAcceptanceAgentClassAndHandoffContract(t *testing.T) {
 	}
 	agent.managedResource = restartedResource
 	claim.Lease.AttemptID = "service-contract-restart"
-	result, err = agent.runProcess(context.Background(), claim)
+	result, err = agent.runWorkload(context.Background(), claim)
 	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || runner.calls != 2 {
-		t.Fatalf("restarted service runProcess() = (%#v, %v), calls=%d", result, err, runner.calls)
+		t.Fatalf("restarted service runWorkload() = (%#v, %v), calls=%d", result, err, runner.calls)
 	}
 	assertDirectoryEmpty(t, paths.Attempts)
 	assertDirectoryEmpty(t, paths.Runtime)
@@ -103,9 +106,9 @@ func TestServiceAcceptanceAgentClassAndHandoffContract(t *testing.T) {
 	}
 
 	claim.Job.Spec.Class = "scheduled"
-	result, err = agent.runProcess(context.Background(), claim)
+	result, err = agent.runWorkload(context.Background(), claim)
 	if err == nil || result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailureUnsupportedClass {
-		t.Fatalf("unknown-class runProcess() = (%#v, %v)", result, err)
+		t.Fatalf("unknown-class runWorkload() = (%#v, %v)", result, err)
 	}
 }
 

@@ -118,22 +118,39 @@ func assertAgentTakesStableNodeLockBeforeOpeningSpool(t *testing.T) {
 	restarted.Close()
 }
 
-func TestRunProcessRejectsUnknownKind(t *testing.T) {
-	a := &Agent{runner: panicRunner{}}
-	result, err := a.runProcess(context.Background(), l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: "oci", Class: contract.JobClassOneShot}}})
+func TestMissingWorkloadRuntimeDoesNotAffectProcessSibling(t *testing.T) {
+	process := &countingProcessRunner{}
+	a := &Agent{
+		runtimes: testRuntimeSet(process),
+		capabilities: newCapabilityState(map[string]bool{
+			"kind:process": true, "kind:future.microvm": true,
+		}, nil, systemClock{}, 0),
+	}
+	result, err := a.runWorkload(context.Background(), l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: "future.microvm", Class: contract.JobClassOneShot}}})
 	var executionError *contract.ExecutionError
 	if !errors.As(err, &executionError) {
-		t.Fatalf("runProcess() error = %v, want ExecutionError", err)
+		t.Fatalf("runWorkload() error = %v, want ExecutionError", err)
 	}
 	if executionError.Code() != contract.ErrorUnsupportedKind || result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailureUnsupportedKind {
 		t.Fatalf("error/result = %q/%#v", executionError.Code(), result)
 	}
+	if process.calls != 0 {
+		t.Fatalf("missing future adapter called process sibling %d times", process.calls)
+	}
+	sibling := l1.Claim{
+		Job:   l1.Job{JobID: "process-sibling", Spec: contract.JobSpec{Kind: contract.JobKindProcess, Class: contract.JobClassOneShot}},
+		Lease: l1.AttemptLease{AttemptID: "process-sibling-attempt"},
+	}
+	result, err = a.runWorkload(context.Background(), sibling)
+	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || process.calls != 1 {
+		t.Fatalf("process sibling after missing adapter = (%#v, %v), calls=%d", result, err, process.calls)
+	}
 }
 
-func TestRunProcessRedactsSensitiveEnvironmentFromLogEvents(t *testing.T) {
+func TestRunWorkloadRedactsSensitiveEnvironmentFromLogEvents(t *testing.T) {
 	var payload []byte
 	a := &Agent{
-		runner: emittingRunner{},
+		runtimes: testRuntimeSet(emittingRunner{}),
 		outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
 			return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
 				payload = append(payload, event.Bytes...)
@@ -149,18 +166,18 @@ func TestRunProcessRedactsSensitiveEnvironmentFromLogEvents(t *testing.T) {
 		}},
 		Lease: l1.AttemptLease{AttemptID: "attempt-redaction"},
 	}
-	result, err := a.runProcess(context.Background(), claim)
+	result, err := a.runWorkload(context.Background(), claim)
 	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
-		t.Fatalf("runProcess() = (%#v, %v)", result, err)
+		t.Fatalf("runWorkload() = (%#v, %v)", result, err)
 	}
 	if got, want := string(payload), "before [REDACTED] after"; got != want {
 		t.Fatalf("redacted log payload = %q, want %q", got, want)
 	}
 }
 
-func TestRunProcessReportsOutputFinalizationFailureInsteadOfExitZero(t *testing.T) {
+func TestRunWorkloadReportsOutputFinalizationFailureInsteadOfExitZero(t *testing.T) {
 	a := &Agent{
-		runner: bufferedOutputRunner{},
+		runtimes: testRuntimeSet(bufferedOutputRunner{}),
 		outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
 			return processrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error {
 				return errors.New("durable output unavailable")
@@ -175,12 +192,12 @@ func TestRunProcessReportsOutputFinalizationFailureInsteadOfExitZero(t *testing.
 		}},
 		Lease: l1.AttemptLease{AttemptID: "attempt-output-finalization"},
 	}
-	result, err := a.runProcess(context.Background(), claim)
+	result, err := a.runWorkload(context.Background(), claim)
 	if err == nil || !strings.Contains(err.Error(), "flush redacted output") {
-		t.Fatalf("runProcess error = %v, want redaction flush failure", err)
+		t.Fatalf("runWorkload error = %v, want redaction flush failure", err)
 	}
 	if result.OutputError == "" || result.ExitCode != nil {
-		t.Fatalf("runProcess result = %#v, want only output_error", result)
+		t.Fatalf("runWorkload result = %#v, want only output_error", result)
 	}
 	if completed := toL1Result(result); completed.OutputError == "" || completed.ExitCode != nil {
 		t.Fatalf("L1 completion result = %#v, want output failure", completed)
@@ -209,7 +226,7 @@ func assertConsoleMirrorFailurePolicyByClass(t *testing.T) {
 	}
 	newAgent := func(logs *[]string) *Agent {
 		return &Agent{
-			runner:          emittingRunner{},
+			runtimes:        testRuntimeSet(emittingRunner{}),
 			managedResource: managedResource,
 			outputSinkFactory: func(l1.Claim) processrunner.OutputSink {
 				return processrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error { return mirrorErr })
@@ -227,9 +244,9 @@ func assertConsoleMirrorFailurePolicyByClass(t *testing.T) {
 		Lease: l1.AttemptLease{AttemptID: "service-console-best-effort"},
 	}
 	var logs []string
-	result, err := newAgent(&logs).runProcess(context.Background(), claim)
+	result, err := newAgent(&logs).runWorkload(context.Background(), claim)
 	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
-		t.Fatalf("service console failure runProcess() = (%#v, %v)", result, err)
+		t.Fatalf("service console failure runWorkload() = (%#v, %v)", result, err)
 	}
 	if len(logs) == 0 || !strings.Contains(logs[0], mirrorErr.Error()) {
 		t.Fatalf("service console failure logs = %#v", logs)
@@ -237,9 +254,9 @@ func assertConsoleMirrorFailurePolicyByClass(t *testing.T) {
 
 	claim.Job.Spec.Class = contract.JobClassOneShot
 	logs = nil
-	result, err = newAgent(&logs).runProcess(context.Background(), claim)
+	result, err = newAgent(&logs).runWorkload(context.Background(), claim)
 	if !errors.Is(err, mirrorErr) {
-		t.Fatalf("one-shot console failure runProcess() error = %v, want %v", err, mirrorErr)
+		t.Fatalf("one-shot console failure runWorkload() error = %v, want %v", err, mirrorErr)
 	}
 	if result.ExitCode != nil {
 		t.Fatalf("one-shot console failure result = %#v, want producer stopped", result)

@@ -1,6 +1,6 @@
 //go:build darwin || linux
 
-package agent
+package process
 
 import (
 	"crypto/sha256"
@@ -30,7 +30,7 @@ func TestMaterializeExecutableResolvesInterpreterOnAgentNode(t *testing.T) {
 			Mode:         0o700,
 		},
 		Argv: []string{"workflow"},
-	}, "attempt-interpreter", "")
+	}, "attempt-interpreter")
 	defer cleanup()
 	if err != nil {
 		t.Fatal(err)
