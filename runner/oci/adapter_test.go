@@ -185,6 +185,87 @@ func TestAdapterHonorsRetryAfterWithinOneImageBudget(t *testing.T) {
 	}
 }
 
+func TestAdapterPumpsConstrainedMacHostBridgeFallback(t *testing.T) {
+	engine := &adapterTestEngine{
+		watch:          ocihelper.WatchResponse{ExitCode: intPointer(0)},
+		bridgeExchange: make(chan error, 1),
+	}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Execution.Env = map[string]string{contract.EnvL3Endpoint: "http://127.0.0.1:43100/l3"}
+	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+	request.HostBridgeDial = func(context.Context) (net.Conn, error) {
+		adapterSide, bridgeSide := net.Pipe()
+		go func() {
+			defer bridgeSide.Close()
+			payload := make([]byte, len("guest-request"))
+			if _, err := io.ReadFull(bridgeSide, payload); err != nil || string(payload) != "guest-request" {
+				return
+			}
+			_, _ = bridgeSide.Write([]byte("host-response"))
+		}()
+		return adapterSide, nil
+	}
+	result, err := adapter.Run(t.Context(), request, nil)
+	if err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+		t.Fatalf("fallback result=%+v err=%v", result, err)
+	}
+	engine.mu.Lock()
+	requested := engine.lastRun.EnableHostBridgeFallback
+	engine.mu.Unlock()
+	if !requested {
+		t.Fatal("adapter did not explicitly request helper fallback authority")
+	}
+}
+
+func TestWorkloadInputMakesWeftyBridgeAndTokenHelperAuthoritative(t *testing.T) {
+	request := adapterTestRequest()
+	request.Execution.Env = map[string]string{
+		"PUBLIC": "value", contract.EnvL3Endpoint: "http://host.lima.internal:43100/l3",
+	}
+	request.Execution.SensitiveEnv = map[string]string{
+		contract.EnvRunToken: "secret-token", contract.EnvL3Endpoint: "http://sensitive-precedence/l3", "OPERATOR_SECRET": "secret-value",
+	}
+	input := workloadInput(request)
+	if len(input.Environment) != 1 || input.Environment[0].Name != "PUBLIC" ||
+		len(input.SensitiveEnvironment) != 1 || input.SensitiveEnvironment[0].Name != "OPERATOR_SECRET" {
+		t.Fatalf("operator environment was not separated: public=%+v sensitive=%+v", input.Environment, input.SensitiveEnvironment)
+	}
+	reserved := make(map[string]string)
+	for _, variable := range input.ReservedEnvironment {
+		reserved[variable.Name] = variable.Value
+	}
+	if reserved[contract.EnvL3Endpoint] != "http://sensitive-precedence/l3" || reserved[contract.EnvRunToken] != "secret-token" || len(reserved) != 2 {
+		t.Fatalf("reserved environment = %+v", reserved)
+	}
+}
+
+func TestPortfulRunTransfersExactAuthorityEndpoint(t *testing.T) {
+	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.AttemptPortRequired = true
+	var endpoint workloadrunner.AttemptEndpoint
+	request.AttemptEndpointReady = func(value workloadrunner.AttemptEndpoint) error { endpoint = value; return nil }
+	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+	result, err := adapter.Run(t.Context(), request, nil)
+	if err != nil || result.Outcome.ExitCode == nil {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if endpoint.Port != 42424 || endpoint.Dial == nil {
+		t.Fatalf("endpoint = %+v", endpoint)
+	}
+	engine.mu.Lock()
+	allocated := engine.lastRun.AllocateAttemptPort
+	engine.mu.Unlock()
+	if !allocated {
+		t.Fatal("adapter did not request helper attempt-port authority")
+	}
+}
+
 func TestAdapterImageBudgetExhaustionIsPermanentAndBounded(t *testing.T) {
 	engine := &adapterTestEngine{ensureErrors: []error{ocihelper.NewImageMechanicsError(ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureNetwork, TopLevelDigest: adapterTestDigest}, errors.New("temporary DNS"))}}
 	adapter, closeAdapter := startAdapterTestServerWithPolicy(t, engine, ImagePolicy{
@@ -321,6 +402,8 @@ type adapterTestEngine struct {
 	responseDigest string
 	ensureEntered  chan struct{}
 	releaseEnsure  chan struct{}
+	lastRun        ocihelper.RunRequest
+	bridgeExchange chan error
 }
 
 func (engine *adapterTestEngine) EnsureImage(_ context.Context, request ocihelper.EnsureImageRequest, archive io.Reader, emit func(ocihelper.EnsureImageEvent) error) error {
@@ -355,18 +438,33 @@ func (engine *adapterTestEngine) EnsureImage(_ context.Context, request ocihelpe
 	}
 	return emit(ocihelper.EnsureImageEvent{Kind: ocihelper.ImageComplete, Result: &ocihelper.EnsureImageResponse{TopLevelDigest: digest, PlatformDigest: digest}})
 }
-func (engine *adapterTestEngine) Run(context.Context, ocihelper.RunRequest) (ocihelper.RunResponse, error) {
+func (engine *adapterTestEngine) Run(_ context.Context, request ocihelper.RunRequest) (ocihelper.RunResponse, error) {
+	engine.mu.Lock()
+	engine.lastRun = request
+	engine.mu.Unlock()
 	if engine.runErr != nil {
 		return ocihelper.RunResponse{}, engine.runErr
 	}
-	return ocihelper.RunResponse{Started: true, Image: &ocihelper.ImageEvidence{
+	response := ocihelper.RunResponse{Started: true, Image: &ocihelper.ImageEvidence{
 		SubmittedReference: "example.invalid/image", TopLevelDigest: adapterTestDigest, TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json",
 		PlatformManifestDigest: adapterTestDigest, Platform: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"},
 		RuntimeHandler: ocihelper.DefaultRuntimeHandler, Snapshotter: ocihelper.DefaultSnapshotter,
-	}}, nil
+	}}
+	if request.EnableHostBridgeFallback {
+		response.HostBridgeReady = true
+	}
+	if request.AllocateAttemptPort {
+		response.AttemptPort = 42424
+	}
+	return response, nil
 }
 func (*adapterTestEngine) Signal(context.Context, ocihelper.SignalRequest) error { return nil }
 func (engine *adapterTestEngine) Watch(_ context.Context, _ ocihelper.WatchRequest, emit func(ocihelper.WatchEvent) error) error {
+	if engine.bridgeExchange != nil {
+		if err := <-engine.bridgeExchange; err != nil {
+			return err
+		}
+	}
 	if err := emit(ocihelper.WatchEvent{Kind: ocihelper.WatchProgress, Log: &ocihelper.LogFrame{Stream: "stdout", Sequence: 0, Bytes: []byte("frame"), Checksum: "9dff50df08c635815f4b19da10f756605a34a79a48d4ba48712782502975a70e"}}); err != nil {
 		return err
 	}
@@ -387,8 +485,20 @@ func (*adapterTestEngine) Sweep(context.Context, ocihelper.SweepRequest) (ocihel
 func (*adapterTestEngine) DialAttemptPort(context.Context, ocihelper.DialAttemptPortRequest, io.ReadWriteCloser) error {
 	return errors.New("unsupported")
 }
-func (*adapterTestEngine) DialHostBridge(context.Context, ocihelper.DialHostBridgeRequest, io.ReadWriteCloser) error {
-	return errors.New("unsupported")
+func (engine *adapterTestEngine) DialHostBridge(_ context.Context, _ ocihelper.DialHostBridgeRequest, stream io.ReadWriteCloser) error {
+	if engine.bridgeExchange == nil {
+		return errors.New("unsupported")
+	}
+	_, err := stream.Write([]byte("guest-request"))
+	if err == nil {
+		payload := make([]byte, len("host-response"))
+		_, err = io.ReadFull(stream, payload)
+		if err == nil && string(payload) != "host-response" {
+			err = errors.New("unexpected host bridge response")
+		}
+	}
+	engine.bridgeExchange <- err
+	return err
 }
 func (*adapterTestEngine) ReapAttempt(context.Context, ocihelper.AttemptAuthority) error { return nil }
 func (*adapterTestEngine) ReapSession(context.Context, ocihelper.SessionIdentity) error  { return nil }

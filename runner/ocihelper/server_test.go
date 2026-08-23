@@ -502,6 +502,7 @@ func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
 	requireSweep(t, session)
 	authority := testAuthority()
 	request := testRunRequest(authority, time.Second)
+	request.AllocateAttemptPort = true
 	request.EnableHostBridgeFallback = true
 	run, err := session.Run(t.Context(), request)
 	if err != nil {
@@ -949,13 +950,46 @@ func TestStaleCapabilityRejectedAfterHelperRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	lost := make(chan error, 1)
+	stale.SetLossHandler(func(err error) { lost <- err })
 	stopFirst()
 	secondClient, stopSecond := startTestServer(t, newFakeEngine(), ServerConfig{})
 	defer stopSecond()
 	stale.client.Dial = secondClient.Dial
 	_, err = stale.Verify(t.Context(), VerifyRequest{Scope: VerifyNamespace})
 	assertRPCCode(t, err, CodeSessionStale)
+	select {
+	case <-lost:
+	default:
+		t.Fatal("replacement response returned before withdrawing old session authority")
+	}
+	if stale.HealthError() == nil {
+		t.Fatal("replacement did not invalidate the old session")
+	}
 	_ = stale.Close()
+}
+
+func TestOperationTransportFailureSynchronouslyInvalidatesSession(t *testing.T) {
+	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{})
+	defer stop()
+	client.disableHeartbeatPump = true
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	lost := make(chan error, 1)
+	session.SetLossHandler(func(err error) { lost <- err })
+	client.Dial = func(context.Context) (net.Conn, error) { return nil, errors.New("forward replaced") }
+	err = session.Signal(t.Context(), SignalRequest{Authority: testAuthority(), Signal: SignalTERM})
+	if err == nil {
+		t.Fatal("transport failure was accepted")
+	}
+	select {
+	case <-lost:
+	default:
+		t.Fatal("transport failure returned before session authority was withdrawn")
+	}
 }
 
 func TestSessionReapJoinsEveryOperationBeforeExclusiveReap(t *testing.T) {

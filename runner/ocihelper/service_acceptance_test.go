@@ -21,6 +21,7 @@ func TestServiceAcceptanceHelperAuthorityFailsClosed(t *testing.T) {
 	requireSweep(t, session)
 	engine.setRunResponse(RunResponse{Started: true, AttemptPort: 42101, HostBridgeReady: true})
 	request := testRunRequest(authority, 2*time.Second)
+	request.AllocateAttemptPort = true
 	request.EnableHostBridgeFallback = true
 	run, err := session.Run(t.Context(), request)
 	if err != nil {

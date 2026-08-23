@@ -5,10 +5,24 @@ package runner
 import (
 	"context"
 	"errors"
+	"net"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
+
+// WorkflowBridgeBinding is a process-local listener binding. OCI on Lima can
+// advertise the discovered guest-visible host gateway, or request the narrow
+// helper fallback when binding that exact address fails.
+type WorkflowBridgeBinding struct {
+	Listener           net.Listener
+	AdvertiseHost      string
+	HostBridgeFallback bool
+}
+
+type WorkflowBridgeBinder interface {
+	Bind(context.Context) (WorkflowBridgeBinding, error)
+}
 
 // IdlePolicy controls whether a workload is supervised for output inactivity.
 // Its zero value preserves the one-shot hang guard.
@@ -61,6 +75,13 @@ type OCIImageObservation struct {
 // workload class or depend on host paths hidden behind the handle.
 type ManagedResources any
 
+// AttemptEndpoint is an adapter-owned, exact-authority service endpoint. Its
+// dial function never accepts an arbitrary address or port.
+type AttemptEndpoint struct {
+	Port uint16
+	Dial func(context.Context) (net.Conn, error)
+}
+
 // Request contains the mechanics needed by any workload runtime. Kind and
 // class are intentionally absent: kind selected the adapter already, while
 // class-specific lifecycle policy was compiled into these fields by the agent.
@@ -85,6 +106,14 @@ type Request struct {
 	// adapter must reap the task when this callback fails.
 	OCIStarted     func(context.Context, OCIImageObservation) error
 	InitialDeadman time.Duration
+	// HostBridgeDial is set only for Lima's bind-failure reverse-tunnel path.
+	// It dials the host-local run bridge and never accepts an arbitrary target.
+	HostBridgeDial func(context.Context) (net.Conn, error)
+	// AttemptPortRequired asks an OCI runtime to allocate the payload endpoint.
+	// AttemptEndpointReady transfers its exact-authority dialer to the local
+	// service front-door seam without exposing guest networking.
+	AttemptPortRequired  bool
+	AttemptEndpointReady func(AttemptEndpoint) error
 	// TODO(#147): replace this process TCP backend with an adapter-supplied,
 	// opaque dial endpoint.
 	ServiceAddress   string

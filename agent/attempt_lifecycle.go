@@ -58,7 +58,7 @@ type attemptLifecycleDependencies struct {
 	handoffs               *handoffManager
 	nodeID                 string
 	bootSessionID          string
-	workflowBridge         func(context.Context, contract.ExecutionSpec) (*workflowBridge, error)
+	workflowBridge         func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error)
 	logf                   func(string, ...any)
 	observer               *lifecycleObserver
 	reservePublishedPort   func(l1.Claim) (net.Listener, *contract.SpawnFailure)
@@ -466,6 +466,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		request.LifetimeBoundary = workloadrunner.AgentBootLifetime
 	}
 	portfulService := claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.PublishedPort != nil
+	var ociEndpointLatch *runtimeEndpointLatch
+	if portfulService && claim.Job.Spec.Kind == contract.JobKindOCI {
+		ociEndpointLatch = newRuntimeEndpointLatch()
+		request.AttemptPortRequired = true
+		request.AttemptEndpointReady = ociEndpointLatch.publish
+	}
 	if claim.Job.Spec.Class == contract.JobClassService && !portfulService {
 		request.Started = func() {
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptRunning, nil)
@@ -566,14 +572,18 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
 		}
 		defer publishedListener.Close()
-		if lifecycle.dependencies.prepareServiceEndpoint == nil {
+		if claim.Job.Spec.Kind != contract.JobKindOCI && lifecycle.dependencies.prepareServiceEndpoint == nil {
 			err := errors.New("service runtime endpoint adapter is not configured")
 			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
 		}
-		var err error
-		endpoint, err = lifecycle.dependencies.prepareServiceEndpoint(ctx)
-		if err != nil {
-			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
+		if claim.Job.Spec.Kind == contract.JobKindOCI {
+			endpoint = ociEndpointLatch.endpoint()
+		} else {
+			var err error
+			endpoint, err = lifecycle.dependencies.prepareServiceEndpoint(ctx)
+			if err != nil {
+				return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
+			}
 		}
 		executionSpec.Env = cloneEnvironment(executionSpec.Env)
 		executionSpec.SensitiveEnv = cloneEnvironment(executionSpec.SensitiveEnv)
@@ -591,7 +601,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	var err error
 	var bridge *workflowBridge
 	if lifecycle.dependencies.workflowBridge != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
-		bridge, err = lifecycle.dependencies.workflowBridge(ctx, executionSpec)
+		bridge, err = lifecycle.dependencies.workflowBridge(ctx, claim.Job.Spec.Kind, executionSpec)
 		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, err), err)
 		}
@@ -601,6 +611,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		executionSpec.Env = cloneEnvironment(executionSpec.Env)
 		delete(executionSpec.Env, "WEFTY_L1_ENDPOINT")
 		executionSpec.Env[contract.EnvL3Endpoint] = bridge.l3Endpoint
+		if bridge.hostBridgeFallback {
+			request.HostBridgeDial = bridge.dial
+		}
 	}
 	var sinks multiOutputSink
 	if lifecycle.dependencies.client != nil && lifecycle.dependencies.outbox != nil {

@@ -7,6 +7,22 @@ workload-class lifecycle policy crosses this protocol. The Linux and Lima
 transports both present a Unix stream socket; the raw containerd socket remains
 root-only and is never forwarded.
 
+On Mac, the Lima 2.2 `vz` template enables only rootful containerd with the
+`overlayfs` snapshotter, maps one explicit operator-owned host root to
+`/mnt/wefty-host`, and forwards only `/run/wefty/oci-helper.sock` into the
+operator-owned instance `sock/` directory. A first-match `proto:any` ignore
+rule disables Lima's dynamic TCP and UDP forwarding. The helper translates a
+host operator-mount source lexically beneath the configured host root and then
+performs the ordinary descriptor-based guest validation beneath the mapped
+guest root; the root itself and any escape remain invalid.
+
+The host client dials the current forwarded-socket inode on every connection.
+Transient absence or refusal while Lima replaces the forward is retried only
+within the caller's deadline. A replaced inode is a new VM transport epoch,
+never continuing helper-session authority: the old control stream fails,
+capability publication becomes restrictive, and recovery must reacquire a new
+helper generation and repeat the complete boot sweep barrier.
+
 ## Handshake and peer authority
 
 Every connection captures kernel Unix peer credentials before reading protocol
@@ -130,7 +146,7 @@ heartbeats.
 | RPC | Scope and result |
 | --- | --- |
 | `EnsureImage` | Session-authorized, typed progress/result stream on a dedicated connection. Registry mode resolves only a public reference, pins the returned top-level digest, pulls into the fixed namespace, and unpacks the admitted runtime platform. Archive mode receives an OCI-layout tar stream, recomputes every blob digest, validates descriptor sizes and reachability, admits exactly the runtime platform, and imports/unpacks it. Both modes return the same top-level and platform-manifest digests; no containerd type, private registry credential, or retry policy crosses the boundary. |
-| `Run` | Exact attempt authority, initial deadman, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started` with helper-observed image evidence; optional service transport fields remain reserved. |
+| `Run` | Exact attempt authority, initial deadman, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started` with helper-observed image evidence. An explicit attempt-port request allocates from the helper-owned reserved range and injects the authoritative loopback port; an explicit Mac bridge-fallback request creates a separate guest loopback listener and capability. |
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. |
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only. A positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments; only then does the server tombstone authorization. |
@@ -138,6 +154,15 @@ heartbeats.
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly the port returned by that live attempt's `Run`; never a general guest dialer. |
 | `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the Mac bind-failure fallback and the helper issued that attempt's separate bridge capability. It never accepts an arbitrary host address or port. |
+
+`DialAttemptPort` terminates inside the guest at `127.0.0.1:<allocated-port>`.
+The helper holds a kernel listener through runtime-spec construction, transfers
+it directly into payload start, and retains the logical allocation until
+independent absence verification; failed verification cannot recycle the port.
+`DialHostBridge` pairs one authorized host
+stream with one accepted connection on that attempt's helper-owned guest
+listener; the host agent dials only its already-created loopback run bridge.
+Neither direction accepts a caller-supplied network destination.
 
 Stream RPCs use a JSON authorization response followed by a one-byte client
 acknowledgement before raw bytes begin. This keeps JSON decoder read-ahead from

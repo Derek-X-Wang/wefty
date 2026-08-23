@@ -312,6 +312,7 @@ type WorkloadLimits struct {
 type RunRequest struct {
 	Authority                AttemptAuthority `json:"authority"`
 	InitialDeadman           time.Duration    `json:"initial_deadman"`
+	AllocateAttemptPort      bool             `json:"allocate_attempt_port,omitempty"`
 	EnableHostBridgeFallback bool             `json:"enable_host_bridge_fallback,omitempty"`
 	Workload                 WorkloadInput    `json:"workload"`
 	// Resources is helper-derived after decoding. It cannot be supplied over

@@ -7,25 +7,36 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 const workflowBridgeCloseTimeout = 2 * time.Second
 
 type workflowBridge struct {
-	l3Endpoint string
-	listener   net.Listener
-	server     *http.Server
-	l3         *http.Transport
+	l3Endpoint         string
+	listener           net.Listener
+	server             *http.Server
+	l3                 *http.Transport
+	hostBridgeFallback bool
+	dial               func(context.Context) (net.Conn, error)
 }
 
-func (a *Agent) startWorkflowBridge(ctx context.Context, execution contract.ExecutionSpec) (*workflowBridge, error) {
+func (a *Agent) startWorkflowBridge(ctx context.Context, kind string, execution contract.ExecutionSpec) (*workflowBridge, error) {
 	if a.fabric == nil || execution.Env[contract.EnvL3Endpoint] == "" {
 		return nil, nil
+	}
+	if kind == contract.JobKindOCI && a.ociBridgeBinder != nil {
+		binding, err := a.ociBridgeBinder.Bind(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return newWorkflowBridgeWithBinding(ctx, a.fabric, a.runLedgerAddr, binding)
 	}
 	return newWorkflowBridge(ctx, a.fabric, a.runLedgerAddr)
 }
@@ -35,18 +46,38 @@ func newWorkflowBridge(ctx context.Context, participant fabric.Fabric, l3Address
 	if err != nil {
 		return nil, err
 	}
+	return newWorkflowBridgeWithBinding(ctx, participant, l3Address, workloadrunner.WorkflowBridgeBinding{
+		Listener: listener, AdvertiseHost: "127.0.0.1",
+	})
+}
+
+func newWorkflowBridgeWithBinding(ctx context.Context, participant fabric.Fabric, l3Address string, binding workloadrunner.WorkflowBridgeBinding) (*workflowBridge, error) {
+	if binding.Listener == nil || binding.AdvertiseHost == "" {
+		return nil, errors.New("workflow bridge binding is incomplete")
+	}
+	tcpAddress, ok := binding.Listener.Addr().(*net.TCPAddr)
+	if !ok || tcpAddress.Port <= 0 {
+		_ = binding.Listener.Close()
+		return nil, errors.New("workflow bridge binding is not TCP")
+	}
+	dialer := &net.Dialer{}
+	dialAddress := binding.Listener.Addr().String()
 	bridge := &workflowBridge{
-		listener: listener,
-		l3:       workflowBridgeTransport(participant, l3Address),
+		listener:           binding.Listener,
+		l3:                 workflowBridgeTransport(participant, l3Address),
+		hostBridgeFallback: binding.HostBridgeFallback,
+		dial: func(ctx context.Context) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp", dialAddress)
+		},
 	}
 	l3Proxy := workflowReverseProxy(bridge.l3, "/l3")
 	mux := http.NewServeMux()
 	mux.Handle("/l3/", l3Proxy)
 	bridge.server = &http.Server{Handler: mux, BaseContext: func(net.Listener) context.Context { return ctx }}
-	baseURL := "http://" + listener.Addr().String()
+	baseURL := "http://" + net.JoinHostPort(binding.AdvertiseHost, strconv.Itoa(tcpAddress.Port))
 	bridge.l3Endpoint = baseURL + "/l3"
 	go func() {
-		_ = bridge.server.Serve(listener)
+		_ = bridge.server.Serve(binding.Listener)
 	}()
 	return bridge, nil
 }

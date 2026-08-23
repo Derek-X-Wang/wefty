@@ -594,6 +594,9 @@ func (session *serverSession) completeAttempt(request RunRequest, attempt *serve
 	if response.HostBridgeReady && !request.EnableHostBridgeFallback {
 		return &RPCError{Code: CodeEngineFailure, Message: "engine enabled an unrequested host bridge fallback"}
 	}
+	if (response.AttemptPort != 0) != request.AllocateAttemptPort {
+		return &RPCError{Code: CodeEngineFailure, Message: "engine attempt-port allocation did not match the request"}
+	}
 	bridgeCapability := ""
 	var err error
 	if response.HostBridgeReady {
