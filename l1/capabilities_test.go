@@ -49,6 +49,11 @@ func TestRequiredCapabilitiesDerivesNormalizedEligibility(t *testing.T) {
 			}},
 			want: []string{"cgroup_v2", "kind:oci"},
 		},
+		{
+			name: "computer trait",
+			spec: computerCapabilityJobSpec("computer-capability"),
+			want: []string{"cgroup_v2", "computer", "kind:oci"},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got := RequiredCapabilities(test.spec)
@@ -89,6 +94,34 @@ func TestLegacyProcessCapabilityRemainsClaimEligible(t *testing.T) {
 	}
 	if claim == nil || claim.Job.JobID != job.JobID {
 		t.Fatalf("legacy process claim = %#v, want job %q", claim, job.JobID)
+	}
+}
+
+func TestLegacyComputerCapabilityCannotClaimComputer(t *testing.T) {
+	tags := []string{contract.StableNodeTagPrefix + "computer-node"}
+	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{
+		"legacy": {Tags: tags, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	})
+	legacy, err := h.store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-legacy"}, contract.NodeRegistration{
+		NodeID: "legacy", BootSessionID: "boot-legacy", OS: "linux", Architecture: "amd64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true},
+	}, NodePolicy{Tags: tags, MaxOneshotSlots: 1, MaxServiceSlots: 1}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Capabilities["computer"] {
+		t.Fatalf("legacy capabilities retained unobserved computer probe: %#v", legacy.Capabilities)
+	}
+	job, _, err := h.store.CreateJob(context.Background(), computerCapabilityJobSpec("legacy-computer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := h.store.ClaimJob(context.Background(), "fabric-legacy", legacy.NodeID, legacy.BootSessionID, contract.JobClassService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim != nil {
+		t.Fatalf("legacy node claimed Computer job %q without a revisioned computer observation", job.JobID)
 	}
 }
 
@@ -165,18 +198,28 @@ func assertClaimRequiresAdvertisedCapabilities(t *testing.T) {
 			class: contract.JobClassOneShot, missingCapability: "cgroup_v2",
 		},
 		{
+			name: "computer trait", spec: computerCapabilityJobSpec("computer-claim"),
+			incapable: map[string]bool{"kind:oci": true, "cgroup_v2": true},
+			capable:   map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true},
+			class:     contract.JobClassService, missingCapability: "computer",
+		},
+		{
 			name: "open kind", spec: capabilityJobSpec("future-kind", "future-isolation", contract.JobClassOneShot, "", nil),
 			incapable: map[string]bool{"kind:process": true}, capable: map[string]bool{"kind:future-isolation": true},
 			class: contract.JobClassOneShot, missingCapability: "kind:future-isolation",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			tags := []string(nil)
+			if contract.RequiresPinnedPlacement(test.spec) {
+				tags = append(tags, test.spec.RoutingTags...)
+			}
 			h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{
-				"incapable": {MaxOneshotSlots: 1, MaxServiceSlots: 1},
-				"capable":   {MaxOneshotSlots: 1, MaxServiceSlots: 1},
+				"incapable": {Tags: tags, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+				"capable":   {Tags: tags, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 			})
-			incapable := registerCapabilityNode(t, h, "incapable", test.incapable)
-			capable := registerCapabilityNode(t, h, "capable", test.capable)
+			incapable := registerCapabilityNodeWithTags(t, h, "incapable", test.incapable, tags)
+			capable := registerCapabilityNodeWithTags(t, h, "capable", test.capable, tags)
 
 			job, _, err := h.store.CreateJob(context.Background(), test.spec)
 			if err != nil {
@@ -326,12 +369,16 @@ func assertConcurrentClaimsCannotBypassCapabilities(t *testing.T) {
 }
 
 func registerCapabilityNode(t *testing.T, h *integrationHarness, nodeID string, capabilities map[string]bool) Node {
+	return registerCapabilityNodeWithTags(t, h, nodeID, capabilities, nil)
+}
+
+func registerCapabilityNodeWithTags(t *testing.T, h *integrationHarness, nodeID string, capabilities map[string]bool, tags []string) Node {
 	t.Helper()
 	node, err := h.store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-" + nodeID}, contract.NodeRegistration{
 		NodeID: nodeID, BootSessionID: "boot-" + nodeID, RootInstanceID: "root-" + nodeID,
 		OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: capabilities,
 		CapabilityRevision: 1, CapabilityObservedAt: h.clock.Now(), MissingCapabilities: []string{},
-	}, NodePolicy{MaxOneshotSlots: 1, MaxServiceSlots: 1}, true)
+	}, NodePolicy{Tags: tags, MaxOneshotSlots: 1, MaxServiceSlots: 1}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,4 +427,16 @@ func capabilityJobSpec(dispatchKey, kind, class, runtimeHandler string, limits *
 		RuntimeHandler: runtimeHandler,
 		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: image, Limits: limits}},
 	}
+}
+
+func computerCapabilityJobSpec(dispatchKey string) contract.JobSpec {
+	memoryBytes := int64(64 << 20)
+	diskBytes := int64(1 << 30)
+	spec := capabilityJobSpec(dispatchKey, contract.JobKindOCI, contract.JobClassService, "", &contract.OCILimits{MemoryBytes: &memoryBytes})
+	spec.RoutingTags = []string{contract.StableNodeTagPrefix + "computer-node"}
+	spec.Execution.OCI.Computer = &contract.OCIComputerSpec{
+		Display:   contract.OCIComputerDisplaySpec{Protocol: contract.ComputerDisplayProtocolRFBWebSocketV1},
+		DiskBytes: diskBytes,
+	}
+	return spec
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"time"
 )
 
@@ -19,6 +20,9 @@ const (
 	EnvHandoffDir                = "WEFTY_HANDOFF_DIR"
 	EnvServiceDir                = "WEFTY_SERVICE_DIR"
 	EnvServicePort               = "WEFTY_SERVICE_PORT"
+	EnvComputerToken             = "WEFTY_COMPUTER_TOKEN"
+	EnvComputerViewPort          = "WEFTY_COMPUTER_VIEW_PORT"
+	EnvComputerControlPort       = "WEFTY_COMPUTER_CONTROL_PORT"
 	DefaultHandoffRoot           = "/tmp/wefty/handoffs"
 	OCIContainerHandoffDirectory = "/wefty/handoff"
 	OCIContainerServiceDirectory = "/wefty/service"
@@ -28,16 +32,28 @@ const (
 	StableNodeTagPrefix = "wefty:node:"
 )
 
-// IsOCIReservedEnvironmentName reports whether name is one of the exact M3
-// values that an OCI runtime strips before injecting authoritative values.
+var ociReservedEnvironmentNames = [...]string{
+	EnvHandoffDir,
+	EnvServiceDir,
+	EnvServicePort,
+	EnvL3Endpoint,
+	EnvRunToken,
+	EnvComputerToken,
+	EnvComputerViewPort,
+	EnvComputerControlPort,
+}
+
+// IsOCIReservedEnvironmentName reports whether name is one of the exact
+// ratified values that an OCI runtime strips before injecting authoritative
+// values.
 // Other tenant-defined WEFTY_* names are deliberately not reserved.
 func IsOCIReservedEnvironmentName(name string) bool {
-	switch name {
-	case EnvHandoffDir, EnvServiceDir, EnvServicePort, EnvL3Endpoint, EnvRunToken:
-		return true
-	default:
-		return false
+	for _, reserved := range ociReservedEnvironmentNames {
+		if name == reserved {
+			return true
+		}
 	}
+	return false
 }
 
 // JobSpec is the versioned, transport-neutral description of a job. Kind and
@@ -56,6 +72,25 @@ type JobSpec struct {
 	Execution        ExecutionSpec     `json:"execution"`
 	Limits           *JobLimits        `json:"limits,omitempty"`
 	Labels           map[string]string `json:"labels,omitempty"`
+	publishedPortSet bool
+}
+
+// UnmarshalJSON records whether published_port appeared on the wire. Plain
+// services retain their historical null-or-absent contract, while the
+// Computer trait forbids the member itself, including an explicit null.
+func (s *JobSpec) UnmarshalJSON(data []byte) error {
+	type wire JobSpec
+	var decoded wire
+	if err := decodeJSONStrict(data, &decoded); err != nil {
+		return err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	*s = JobSpec(decoded)
+	_, s.publishedPortSet = members["published_port"]
+	return nil
 }
 
 const (
@@ -107,15 +142,17 @@ func (s *ExecutionSpec) UnmarshalJSON(data []byte) error {
 // OCIExecutionSpec is the container payload arm selected by kind=oci. Env and
 // SensitiveEnv remain on ExecutionSpec because they are shared by every kind.
 type OCIExecutionSpec struct {
-	Image            OCIImageSpec `json:"image"`
-	Argv             []string     `json:"argv,omitempty"`
-	WorkingDirectory *string      `json:"working_directory,omitempty"`
-	Mounts           []OCIMount   `json:"mounts,omitempty"`
-	Limits           *OCILimits   `json:"limits,omitempty"`
+	Image            OCIImageSpec     `json:"image"`
+	Argv             []string         `json:"argv,omitempty"`
+	WorkingDirectory *string          `json:"working_directory,omitempty"`
+	Mounts           []OCIMount       `json:"mounts,omitempty"`
+	Limits           *OCILimits       `json:"limits,omitempty"`
+	Computer         *OCIComputerSpec `json:"computer,omitempty"`
 	argvNull         bool
 	workingDirNull   bool
 	mountsNull       bool
 	limitsNull       bool
+	computerNull     bool
 }
 
 // UnmarshalJSON preserves explicit nulls on optional OCI fields so the Go
@@ -135,6 +172,54 @@ func (s *OCIExecutionSpec) UnmarshalJSON(data []byte) error {
 	s.workingDirNull = rawJSONNull(members["working_directory"])
 	s.mountsNull = rawJSONNull(members["mounts"])
 	s.limitsNull = rawJSONNull(members["limits"])
+	s.computerNull = rawJSONNull(members["computer"])
+	return nil
+}
+
+// ComputerDisplayProtocol is the closed display transport vocabulary for the
+// OCI Computer trait.
+type ComputerDisplayProtocol string
+
+const ComputerDisplayProtocolRFBWebSocketV1 ComputerDisplayProtocol = "rfb-websocket-v1"
+
+// OCIComputerSpec is the optional Computer trait on an OCI service Job. Its
+// presence changes neither workload kind nor lifecycle class.
+type OCIComputerSpec struct {
+	Display   OCIComputerDisplaySpec `json:"display"`
+	DiskBytes int64                  `json:"disk_bytes"`
+}
+
+func (s *OCIComputerSpec) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		Display   OCIComputerDisplaySpec `json:"display"`
+		DiskBytes json.RawMessage        `json:"disk_bytes"`
+	}
+	var decoded wire
+	if err := decodeJSONStrict(data, &decoded); err != nil {
+		return err
+	}
+	*s = OCIComputerSpec{Display: decoded.Display}
+	if len(decoded.DiskBytes) > 0 {
+		diskBytes, err := decodeJSONInt64(decoded.DiskBytes)
+		if err != nil {
+			return fmt.Errorf("disk_bytes: %w", err)
+		}
+		s.DiskBytes = diskBytes
+	}
+	return nil
+}
+
+type OCIComputerDisplaySpec struct {
+	Protocol ComputerDisplayProtocol `json:"protocol"`
+}
+
+func (s *OCIComputerDisplaySpec) UnmarshalJSON(data []byte) error {
+	type wire OCIComputerDisplaySpec
+	var decoded wire
+	if err := decodeJSONStrict(data, &decoded); err != nil {
+		return err
+	}
+	*s = OCIComputerDisplaySpec(decoded)
 	return nil
 }
 
@@ -201,19 +286,65 @@ type OCILimits struct {
 }
 
 func (l *OCILimits) UnmarshalJSON(data []byte) error {
-	type wire OCILimits
+	type wire struct {
+		MemoryBytes   json.RawMessage `json:"memory_bytes"`
+		CPUMillicores json.RawMessage `json:"cpu_millicores"`
+	}
 	var decoded wire
 	if err := decodeJSONStrict(data, &decoded); err != nil {
 		return err
 	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(data, &members); err != nil {
-		return err
+	*l = OCILimits{}
+	if len(decoded.MemoryBytes) > 0 {
+		if rawJSONNull(decoded.MemoryBytes) {
+			l.memoryNull = true
+		} else {
+			memoryBytes, err := decodeJSONInt64(decoded.MemoryBytes)
+			if err != nil {
+				return fmt.Errorf("memory_bytes: %w", err)
+			}
+			l.MemoryBytes = &memoryBytes
+		}
 	}
-	*l = OCILimits(decoded)
-	l.memoryNull = rawJSONNull(members["memory_bytes"])
-	l.cpuNull = rawJSONNull(members["cpu_millicores"])
+	if len(decoded.CPUMillicores) > 0 {
+		if rawJSONNull(decoded.CPUMillicores) {
+			l.cpuNull = true
+		} else {
+			cpuMillicores, err := decodeJSONInt64(decoded.CPUMillicores)
+			if err != nil {
+				return fmt.Errorf("cpu_millicores: %w", err)
+			}
+			l.CPUMillicores = &cpuMillicores
+		}
+	}
 	return nil
+}
+
+// decodeJSONInt64 accepts every JSON number that denotes a mathematically
+// integral int64 value, independent of decimal or exponent notation.
+func decodeJSONInt64(raw json.RawMessage) (int64, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return 0, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return 0, fmt.Errorf("json: multiple values")
+		}
+		return 0, err
+	}
+	number, ok := value.(json.Number)
+	if !ok {
+		return 0, fmt.Errorf("must be a JSON number")
+	}
+	rational, ok := new(big.Rat).SetString(number.String())
+	if !ok || !rational.IsInt() || !rational.Num().IsInt64() {
+		return 0, fmt.Errorf("must be an integral int64")
+	}
+	return rational.Num().Int64(), nil
 }
 
 func decodeJSONStrict(data []byte, value any) error {

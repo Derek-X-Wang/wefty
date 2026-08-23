@@ -11,6 +11,7 @@ func TestServiceAcceptanceJobSpecSchemaAndProcessResult(t *testing.T) {
 	schema := compileSchemas(t)["job-spec"]
 	for _, path := range []string{
 		"testdata/schemas/job-spec/valid-oci-one-shot.json",
+		"testdata/schemas/job-spec/valid-oci-computer.json",
 		"testdata/schemas/job-spec/valid-oci-reserved-environment-names.json",
 		"testdata/schemas/job-spec/valid-oci-service.json",
 		"testdata/schemas/job-spec/valid-service.json",
@@ -34,6 +35,9 @@ func TestServiceAcceptanceJobSpecSchemaAndProcessResult(t *testing.T) {
 	for _, path := range []string{
 		"testdata/schemas/job-spec/invalid-missing-class.json",
 		"testdata/schemas/job-spec/invalid-oci-image-reference-uppercase-repository.json",
+		"testdata/schemas/job-spec/invalid-oci-computer-null.json",
+		"testdata/schemas/job-spec/invalid-oci-computer-protocol.json",
+		"testdata/schemas/job-spec/invalid-oci-computer-published-port.json",
 		"testdata/schemas/job-spec/invalid-oci-missing-arm.json",
 		"testdata/schemas/job-spec/invalid-oci-mount-handoff-target.json",
 		"testdata/schemas/job-spec/invalid-oci-mount-missing-node-tag.json",

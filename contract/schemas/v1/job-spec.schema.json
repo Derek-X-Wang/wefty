@@ -197,18 +197,22 @@
     {
       "if": {
         "properties": {
-          "kind": { "const": "oci" },
           "execution": {
             "properties": {
               "oci": {
-                "properties": { "mounts": { "minItems": 1 } },
-                "required": ["mounts"]
+                "anyOf": [
+                  {
+                    "properties": { "mounts": { "minItems": 1 } },
+                    "required": ["mounts"]
+                  },
+                  { "required": ["computer"] }
+                ]
               }
             },
             "required": ["oci"]
           }
         },
-        "required": ["kind", "execution"]
+        "required": ["execution"]
       },
       "then": {
         "required": ["routing_tags"],
@@ -219,6 +223,36 @@
             "maxContains": 1
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "execution": {
+            "properties": {
+              "oci": { "required": ["computer"] }
+            },
+            "required": ["oci"]
+          }
+        },
+        "required": ["execution"]
+      },
+      "then": {
+        "properties": {
+          "class": { "const": "service" },
+          "execution": {
+            "properties": {
+              "oci": {
+                "required": ["limits"],
+                "properties": {
+                  "image": { "required": ["digest"] },
+                  "limits": { "required": ["memory_bytes"] }
+                }
+              }
+            }
+          }
+        },
+        "not": { "required": ["published_port"] }
       }
     }
   ],
@@ -250,6 +284,26 @@
           }
         }
       ]
+    },
+    "ociComputer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["display", "disk_bytes"],
+      "properties": {
+        "display": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["protocol"],
+          "properties": {
+            "protocol": { "const": "rfb-websocket-v1" }
+          }
+        },
+        "disk_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        }
+      }
     },
     "ociExecution": {
       "type": "object",
@@ -301,7 +355,8 @@
             "memory_bytes": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
             "cpu_millicores": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 }
           }
-        }
+        },
+        "computer": { "$ref": "#/$defs/ociComputer" }
       }
     }
   }

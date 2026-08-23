@@ -27,13 +27,15 @@ Fabric identity cannot become an L1 client passthrough. The bridge is transport
 only: callers must still send the run token, and no Fabric tag privilege is
 projected into the workflow process.
 
-For `kind=oci`, the exact M3 reserved-name set is `WEFTY_HANDOFF_DIR`,
-`WEFTY_SERVICE_DIR`, `WEFTY_SERVICE_PORT`, `WEFTY_L3_ENDPOINT`, and
-`WEFTY_RUN_TOKEN`. The runtime strips those names from image and operator
-environment before injecting authoritative attempt-local values; another
-tenant-defined `WEFTY_*` name is not reserved implicitly. `WEFTY_RUN_ID`
-remains part of the existing process run context but is not added to the M3 OCI
-reserved set.
+For `kind=oci`, the exact reserved-name set is `WEFTY_HANDOFF_DIR`,
+`WEFTY_SERVICE_DIR`, `WEFTY_SERVICE_PORT`, `WEFTY_L3_ENDPOINT`,
+`WEFTY_RUN_TOKEN`, `WEFTY_COMPUTER_TOKEN`, `WEFTY_COMPUTER_VIEW_PORT`, and
+`WEFTY_COMPUTER_CONTROL_PORT`. The runtime strips those names from image and
+operator environment before authoritative attempt-local injection; another
+tenant-defined `WEFTY_*` name is not reserved implicitly. This contract
+amendment reserves the three Computer names but does not yet inject them.
+`WEFTY_RUN_ID` remains part of the existing process run context but is not
+added to the OCI reserved set.
 
 OCI one-shot handoff data is mounted at `/wefty/handoff`, and OCI service data
 at `/wefty/service`. An operator mount target must be disjoint from both after
