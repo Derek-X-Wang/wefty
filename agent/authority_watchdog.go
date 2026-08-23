@@ -121,7 +121,7 @@ func (watch *authorityWatch) checkLocked(now, wall time.Time) error {
 
 func (watch *authorityWatch) fail(err error) {
 	watch.failOnce.Do(func() {
-		watch.failures <- err
 		watch.cancelPayload(err)
+		watch.failures <- err
 	})
 }

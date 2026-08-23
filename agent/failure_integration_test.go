@@ -1013,7 +1013,10 @@ func assertFinalizationTimeoutStartsAfterServicePayloadStops(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	finalizationTimeout := 50 * time.Millisecond
+	// Race instrumentation can consume tens of milliseconds inside the real
+	// SQLite/Fabric finalization path; retain the same compressed-time shape with
+	// enough margin to test the anchor instead of scheduler latency.
+	finalizationTimeout := 2 * time.Second
 	runner := newFinalizationAnchorRunner()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
@@ -1037,6 +1040,12 @@ func assertFinalizationTimeoutStartsAfterServicePayloadStops(t *testing.T) {
 	// This is the production failure shape in compressed time: payload uptime
 	// exceeds the whole finalization budget before the payload crashes.
 	time.Sleep(3 * finalizationTimeout)
+	// Keep the restart-pending state observable under race instrumentation. A
+	// draining node renews its resident service but cannot reclaim it after the
+	// crash and race past the queued assertion.
+	if _, err := nodeAgent.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	runner.kill()
 	requeued, err := waitForFailureJobState(store, service.JobID, contract.JobQueued, 5*time.Second)
 	if err != nil {

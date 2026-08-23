@@ -3,7 +3,10 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -162,10 +166,10 @@ func TestHungCapabilityProbeTimesOutWithoutStoppingHeartbeats(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
 	initial := waitForAgentNode(t, store, "node-timeout", func(node l1.Node) bool {
-		return node.CapabilityRevision == 2 && node.Capabilities["kind:oci"]
+		return node.CapabilityRevision >= 3 && node.Capabilities["kind:oci"]
 	})
 	withdrawn := waitForAgentNode(t, store, "node-timeout", func(node l1.Node) bool {
-		return node.CapabilityRevision == 3 && !node.Capabilities["kind:oci"]
+		return node.CapabilityRevision > initial.CapabilityRevision && !node.Capabilities["kind:oci"]
 	})
 	if !withdrawn.LastHeartbeatAt.After(initial.LastHeartbeatAt) {
 		t.Fatalf("timeout heartbeat did not advance liveness: initial %#v withdrawn %#v", initial, withdrawn)
@@ -198,9 +202,9 @@ func TestRestrictiveCapabilityTransitionPausesClaimsUntilPublished(t *testing.T)
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
 	waitForAgentNode(t, store, "node-barrier", func(node l1.Node) bool {
-		return node.CapabilityRevision == 2 && node.Capabilities["kind:oci"]
+		return node.CapabilityRevision >= 3 && node.Capabilities["kind:oci"]
 	})
-	if err := nodeAgent.ProbeCapabilities(context.Background()); err == nil {
+	if err := nodeAgent.RecoverOCIRuntimeCapabilities(context.Background()); err == nil {
 		t.Fatal("restrictive event probe returned no error")
 	}
 	job, _, err := store.CreateJob(context.Background(), testOCIJobSpec("capability-publication-barrier"))
@@ -216,7 +220,7 @@ func TestRestrictiveCapabilityTransitionPausesClaimsUntilPublished(t *testing.T)
 		t.Fatalf("unpublished withdrawal burned attempts = %#v", attempts)
 	}
 	waitForAgentNode(t, store, "node-barrier", func(node l1.Node) bool {
-		return node.CapabilityRevision == 3 && !node.Capabilities["kind:oci"]
+		return node.CapabilityRevision >= 4 && !node.Capabilities["kind:oci"]
 	})
 	cancel()
 	if err := <-done; err != nil {
@@ -233,7 +237,7 @@ func TestNilProbeCannotAdvertiseOCI(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
-	node := waitForAgentNode(t, store, "node-unprobed", func(node l1.Node) bool { return node.CapabilityRevision == 1 })
+	node := waitForAgentNode(t, store, "node-unprobed", func(node l1.Node) bool { return node.CapabilityRevision >= 2 })
 	if node.Capabilities["kind:oci"] || !node.Capabilities["kind:process"] || nodeAgent.capabilities.allows(testOCIJobSpec("nil-probe-local")) {
 		t.Fatalf("nil-probe capability state = node %#v local %#v", node, nodeAgent.CapabilitySnapshot())
 	}
@@ -241,6 +245,451 @@ func TestNilProbeCannotAdvertiseOCI(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("nil-probe agent run: %v", err)
 	}
+}
+
+func TestAgentRefusesOCIProbeWithoutBootBarrier(t *testing.T) {
+	_, err := New(Config{
+		NodeID: "node", BootSessionID: "boot", Version: "test",
+		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+		}),
+	})
+	if err == nil || err.Error() != "agent: OCI capability probe requires a boot barrier" {
+		t.Fatalf("agent construction error = %v", err)
+	}
+}
+
+func TestOCIBootBarrierOrdersRemovalProbePublicationAndClaims(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-boot-barrier": nil})
+	defer stopServer()
+	job, _, err := store.CreateJob(context.Background(), testOCIJobSpec("boot-barrier-order"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var eventMu sync.Mutex
+	var events []string
+	record := func(event string) {
+		eventMu.Lock()
+		events = append(events, event)
+		eventMu.Unlock()
+	}
+	barrier := &recordingOCIBootBarrier{ensure: func(context.Context) error {
+		record("sweep-verify")
+		return nil
+	}}
+	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		record("probe")
+		nodes, err := store.ListNodes(context.Background())
+		if err != nil {
+			t.Errorf("list nodes during probe: %v", err)
+			return CapabilityProbeResult{}, err
+		}
+		if len(nodes) != 1 || nodes[0].Capabilities["kind:oci"] {
+			t.Errorf("pre-probe L1 capability publication = %#v", nodes)
+			return CapabilityProbeResult{}, errors.New("OCI capability published before probe")
+		}
+		attempts, err := store.ListJobAttempts(context.Background(), job.JobID)
+		if err != nil {
+			t.Errorf("list attempts during probe: %v", err)
+			return CapabilityProbeResult{}, err
+		}
+		if len(attempts) != 0 {
+			t.Errorf("OCI claim preceded functional probe: %#v", attempts)
+			return CapabilityProbeResult{}, errors.New("OCI claim preceded functional probe")
+		}
+		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+	})
+	nodeAgent := newBootBarrierTestAgent(t, network, "node-boot-barrier", barrier, probe)
+	defer nodeAgent.Close()
+	nodeAgent.session.removals = &removalController{managed: &recordingResumeResource{resume: func() {
+		record("resume-removals")
+		nodes, err := store.ListNodes(context.Background())
+		if err != nil {
+			t.Errorf("list nodes during removal resume: %v", err)
+			return
+		}
+		if len(nodes) != 1 || nodes[0].Capabilities["kind:oci"] {
+			t.Errorf("pre-removal L1 capability publication = %#v", nodes)
+		}
+		attempts, err := store.ListJobAttempts(context.Background(), job.JobID)
+		if err != nil {
+			t.Errorf("list attempts during removal resume: %v", err)
+			return
+		}
+		if len(attempts) != 0 {
+			t.Errorf("OCI claim preceded pending-removal resume: %#v", attempts)
+		}
+	}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	waitForAgentNode(t, store, "node-boot-barrier", func(node l1.Node) bool {
+		return node.CapabilityRevision >= 2 && node.Capabilities["kind:oci"]
+	})
+	eventMu.Lock()
+	gotEvents := append([]string(nil), events...)
+	eventMu.Unlock()
+	if want := []string{"sweep-verify", "resume-removals", "probe"}; !reflect.DeepEqual(gotEvents, want) {
+		t.Fatalf("OCI boot ordering = %v, want %v", gotEvents, want)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReusedBootAtomicallySupersedesHighRevisionOCIBadge(t *testing.T) {
+	const nodeID = "node-reused-high-revision"
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{nodeID: nil})
+	defer stopServer()
+	seeded, err := store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-" + nodeID}, contract.NodeRegistration{
+		NodeID: nodeID, BootSessionID: "boot-reused", RootInstanceID: "stale-root",
+		OS: "linux", Architecture: "amd64", AgentVersion: "stale",
+		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityRevision: 9,
+		CapabilityObservedAt: time.Now().UTC(), MissingCapabilities: []string{},
+	}, l1.DefaultNodePolicy(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.CreateJob(context.Background(), testOCIJobSpec("reused-high-revision"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &recordingOCIBootBarrier{ensure: func(context.Context) error {
+		nodes, listErr := store.ListNodes(context.Background())
+		if listErr != nil {
+			return listErr
+		}
+		if len(nodes) != 1 || nodes[0].CapabilityRevision != 10 || nodes[0].Capabilities["kind:oci"] {
+			return fmt.Errorf("stale OCI badge was not atomically superseded before sweep: %#v", nodes)
+		}
+		attempts, listErr := store.ListJobAttempts(context.Background(), job.JobID)
+		if listErr != nil {
+			return listErr
+		}
+		if len(attempts) != 0 {
+			return fmt.Errorf("stale capability minted a claim before sweep: %#v", attempts)
+		}
+		return nil
+	}}
+	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+	})
+	nodeAgent := newBootBarrierTestAgent(t, network, nodeID, barrier, probe)
+	defer nodeAgent.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	node := waitForAgentNode(t, store, nodeID, func(node l1.Node) bool {
+		return node.CapabilityRevision == 11 && node.Capabilities["kind:oci"]
+	})
+	if node.AuthorityGeneration != seeded.AuthorityGeneration+1 {
+		t.Fatalf("registration authority generation = %d, want one bump from %d", node.AuthorityGeneration, seeded.AuthorityGeneration)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFailedOCIBootSweepPublishesNoBadgeAndMintsNoClaim(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-sweep-failed": nil})
+	defer stopServer()
+	probeCalled := false
+	barrier := &recordingOCIBootBarrier{ensure: func(context.Context) error {
+		return errors.New("runtime residue remains")
+	}}
+	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		probeCalled = true
+		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+	})
+	nodeAgent := newBootBarrierTestAgent(t, network, "node-sweep-failed", barrier, probe)
+	defer nodeAgent.Close()
+	removalResumed := make(chan struct{}, 1)
+	nodeAgent.session.removals = &removalController{managed: &recordingResumeResource{resume: func() {
+		removalResumed <- struct{}{}
+	}}}
+	job, _, err := store.CreateJob(context.Background(), testOCIJobSpec("boot-sweep-failed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	node := waitForAgentNode(t, store, "node-sweep-failed", func(node l1.Node) bool {
+		return node.CapabilityRevision >= 2 && node.CapabilityReasonCode == contract.CapabilityReasonBootSweepFailed
+	})
+	if node.Capabilities["kind:oci"] || probeCalled {
+		t.Fatalf("failed sweep capability state = node %#v probe_called=%t", node, probeCalled)
+	}
+	select {
+	case <-removalResumed:
+	case <-time.After(time.Second):
+		t.Fatal("failed OCI barrier stranded process-service removal resumption")
+	}
+	time.Sleep(50 * time.Millisecond)
+	attempts, err := store.ListJobAttempts(context.Background(), job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 0 {
+		t.Fatalf("failed sweep minted OCI attempts: %#v", attempts)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHelperLossAtBarrierStagesKeepsPoisedOCIClaimUnminted(t *testing.T) {
+	stages := []string{"after-ensure", "during-removals", "during-probe", "before-publication"}
+	for _, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			nodeID := "node-loss-" + stage
+			network := plain.NewNetwork()
+			store, stopServer := startFailureServer(t, network, nil, map[string][]string{nodeID: nil})
+			defer stopServer()
+			barrier := &stageLossBarrier{}
+			if stage == "after-ensure" {
+				barrier.loseAfterEnsure = true
+			}
+			if stage == "before-publication" {
+				barrier.loseAtGenerationCall = 2
+			}
+			probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+				if stage == "during-probe" {
+					barrier.lose(errors.New("helper died during probe"))
+				}
+				return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+			})
+			nodeAgent := newBootBarrierTestAgent(t, network, nodeID, barrier, probe)
+			defer nodeAgent.Close()
+			resumed := make(chan struct{}, 1)
+			nodeAgent.session.removals = &removalController{managed: &recordingResumeResource{resume: func() {
+				select {
+				case resumed <- struct{}{}:
+				default:
+				}
+				if stage == "during-removals" {
+					barrier.lose(errors.New("helper died during removal recovery"))
+				}
+			}}}
+			job, _, err := store.CreateJob(context.Background(), testOCIJobSpec("poised-"+stage))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- nodeAgent.Run(ctx) }()
+			node := waitForAgentNode(t, store, nodeID, func(node l1.Node) bool { return node.CapabilityRevision >= 2 })
+			select {
+			case <-resumed:
+			case <-time.After(time.Second):
+				t.Fatalf("removals did not resume after %s helper loss: %#v", stage, node)
+			}
+			deadline := time.Now().Add(time.Second)
+			for nodeAgent.CapabilitySnapshot().Capabilities["kind:oci"] && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if nodeAgent.CapabilitySnapshot().Capabilities["kind:oci"] {
+				t.Fatalf("helper loss at %s did not synchronously withdraw local OCI", stage)
+			}
+			minimumRestrictiveRevision := int64(2)
+			if stage == "before-publication" {
+				minimumRestrictiveRevision = 3
+			}
+			node = waitForAgentNode(t, store, nodeID, func(node l1.Node) bool {
+				return node.CapabilityRevision >= minimumRestrictiveRevision && !node.Capabilities["kind:oci"] &&
+					node.CapabilityReasonCode == contract.CapabilityReasonBootSweepFailed
+			})
+			time.Sleep(25 * time.Millisecond)
+			attempts, err := store.ListJobAttempts(context.Background(), job.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(attempts) != 0 {
+				t.Fatalf("helper loss at %s minted poised OCI claim: %#v", stage, attempts)
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+type recordingOCIBootBarrier struct {
+	mu     sync.Mutex
+	ready  bool
+	ensure func(context.Context) error
+	loss   func(ocihelper.HelperSession, error)
+}
+
+type readyOCIBootBarrier struct{}
+
+type stageLossBarrier struct {
+	mu                   sync.Mutex
+	ready                bool
+	unavailable          bool
+	generationCalls      int
+	loseAfterEnsure      bool
+	loseAtGenerationCall int
+	loss                 func(ocihelper.HelperSession, error)
+}
+
+func (barrier *stageLossBarrier) Ready() bool {
+	_, ok := barrier.Generation()
+	return ok
+}
+func (barrier *stageLossBarrier) Ensure(context.Context) error {
+	barrier.mu.Lock()
+	if barrier.unavailable {
+		barrier.mu.Unlock()
+		return errors.New("helper remains unavailable after injected loss")
+	}
+	barrier.ready = true
+	lose := barrier.loseAfterEnsure
+	barrier.mu.Unlock()
+	if lose {
+		barrier.lose(errors.New("helper died after ensure"))
+	}
+	return nil
+}
+func (barrier *stageLossBarrier) Generation() (ocihelper.HelperSession, bool) {
+	barrier.mu.Lock()
+	barrier.generationCalls++
+	call := barrier.generationCalls
+	ready := barrier.ready
+	lose := barrier.loseAtGenerationCall == call
+	handler := barrier.loss
+	if lose {
+		barrier.ready = false
+		barrier.unavailable = true
+	}
+	barrier.mu.Unlock()
+	if lose && ready && handler != nil {
+		// The helper is already lost before Generation returns its stale read.
+		// Deliver the synchronous production callback asynchronously here only
+		// because the caller deliberately holds the claim-publication lock.
+		go handler(ocihelper.HelperSession{HelperInstanceID: "stage-loss", SessionGeneration: 1}, errors.New("helper died before publication"))
+	}
+	return ocihelper.HelperSession{HelperInstanceID: "stage-loss", SessionGeneration: 1}, ready
+}
+func (barrier *stageLossBarrier) SweepReceipt() (ocihelper.VerifiedSweepReceipt, bool) {
+	generation, ok := barrier.Generation()
+	return ocihelper.VerifiedSweepReceipt{SweepEpoch: "stage-loss", HelperSession: generation}, ok
+}
+func (barrier *stageLossBarrier) SetLossHandler(handler func(ocihelper.HelperSession, error)) {
+	barrier.mu.Lock()
+	barrier.loss = handler
+	barrier.mu.Unlock()
+}
+func (barrier *stageLossBarrier) Close() error { return nil }
+func (barrier *stageLossBarrier) lose(err error) {
+	barrier.mu.Lock()
+	wasReady := barrier.ready
+	barrier.ready = false
+	barrier.unavailable = true
+	handler := barrier.loss
+	barrier.mu.Unlock()
+	if wasReady && handler != nil {
+		handler(ocihelper.HelperSession{HelperInstanceID: "stage-loss", SessionGeneration: 1}, err)
+	}
+}
+
+func (readyOCIBootBarrier) Ready() bool                  { return true }
+func (readyOCIBootBarrier) Ensure(context.Context) error { return nil }
+func (readyOCIBootBarrier) Generation() (ocihelper.HelperSession, bool) {
+	return ocihelper.HelperSession{HelperInstanceID: "ready", SessionGeneration: 1}, true
+}
+func (readyOCIBootBarrier) SweepReceipt() (ocihelper.VerifiedSweepReceipt, bool) {
+	generation, _ := (readyOCIBootBarrier{}).Generation()
+	return ocihelper.VerifiedSweepReceipt{SweepEpoch: "ready", HelperSession: generation}, true
+}
+func (readyOCIBootBarrier) SetLossHandler(func(ocihelper.HelperSession, error)) {}
+func (readyOCIBootBarrier) Close() error                                        { return nil }
+
+func (barrier *recordingOCIBootBarrier) Ready() bool {
+	barrier.mu.Lock()
+	defer barrier.mu.Unlock()
+	return barrier.ready
+}
+
+func (barrier *recordingOCIBootBarrier) Ensure(ctx context.Context) error {
+	barrier.mu.Lock()
+	if barrier.ready {
+		barrier.mu.Unlock()
+		return nil
+	}
+	barrier.mu.Unlock()
+	err := barrier.ensure(ctx)
+	if err == nil {
+		barrier.mu.Lock()
+		barrier.ready = true
+		barrier.mu.Unlock()
+	}
+	return err
+}
+
+func (barrier *recordingOCIBootBarrier) Generation() (ocihelper.HelperSession, bool) {
+	barrier.mu.Lock()
+	defer barrier.mu.Unlock()
+	return ocihelper.HelperSession{HelperInstanceID: "recording", SessionGeneration: 1}, barrier.ready
+}
+
+func (barrier *recordingOCIBootBarrier) SweepReceipt() (ocihelper.VerifiedSweepReceipt, bool) {
+	generation, ok := barrier.Generation()
+	return ocihelper.VerifiedSweepReceipt{SweepEpoch: "recording", HelperSession: generation}, ok
+}
+
+func (barrier *recordingOCIBootBarrier) SetLossHandler(handler func(ocihelper.HelperSession, error)) {
+	barrier.mu.Lock()
+	barrier.loss = handler
+	barrier.mu.Unlock()
+}
+
+func (barrier *recordingOCIBootBarrier) Close() error { return nil }
+
+type recordingResumeResource struct{ resume func() }
+
+func (*recordingResumeResource) rootInstanceID() string { return "root" }
+func (*recordingResumeResource) prepareAttempt(string, string) (managedResourceAttempt, func(), error) {
+	return managedResourceAttempt{}, func() {}, nil
+}
+func (*recordingResumeResource) remove(context.Context, localRemoval) error { return nil }
+func (resource *recordingResumeResource) resumeRemovals(context.Context) ([]localRemoval, error) {
+	resource.resume()
+	return nil, nil
+}
+
+func newBootBarrierTestAgent(
+	t *testing.T,
+	network *plain.Network,
+	nodeID string,
+	barrier OCIBootBarrier,
+	probe CapabilityProbe,
+) *Agent {
+	t.Helper()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-" + nodeID, Tags: []string{l1.DefaultAgentPrincipalTag}})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: nodeID, BootSessionID: "boot-reused",
+		Version: "test", OS: "linux", Architecture: "amd64",
+		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe,
+		OCIBootBarrier: barrier, HeartbeatInterval: time.Hour, ClaimInterval: 250 * time.Millisecond,
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return nodeAgent
 }
 
 func newCapabilityTestAgent(t *testing.T, network *plain.Network, nodeID string, probe CapabilityProbe, heartbeatInterval, probeTimeout time.Duration) *Agent {
@@ -254,6 +703,7 @@ func newCapabilityTestAgent(t *testing.T, network *plain.Network, nodeID string,
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: nodeID, BootSessionID: "boot-" + nodeID,
 		Version: "test", OS: "linux", Architecture: "amd64",
 		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe,
+		OCIBootBarrier:         readyOCIBootBarrier{},
 		CapabilityProbeTimeout: probeTimeout, HeartbeatInterval: heartbeatInterval, ClaimInterval: 5 * time.Millisecond,
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
 	})
@@ -320,7 +770,8 @@ func assertAgentPublishesProbeWithdrawalByNextSuccessfulHeartbeat(t *testing.T) 
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1",
 		Version: "test", OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true},
-		CapabilityProbe: probe, HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: time.Second,
+		CapabilityProbe: probe, OCIBootBarrier: readyOCIBootBarrier{},
+		HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: time.Second,
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
 	})
 	if err != nil {
@@ -337,8 +788,12 @@ func assertAgentPublishesProbeWithdrawalByNextSuccessfulHeartbeat(t *testing.T) 
 	case <-time.After(5 * time.Second):
 		t.Fatal("heartbeat probe did not fail")
 	}
+	deadline := time.Now().Add(5 * time.Second)
+	for nodeAgent.CapabilitySnapshot().Capabilities["kind:oci"] && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if snapshot := nodeAgent.CapabilitySnapshot(); snapshot.Capabilities["kind:oci"] {
-		t.Fatalf("failed probe left local OCI admission enabled: %#v", snapshot)
+		t.Fatalf("failed probe did not withdraw local OCI admission: %#v", snapshot)
 	}
 	waitForNodeCapability(t, store, false, 3)
 	cancel()

@@ -15,34 +15,7 @@ import (
 const helperChildEnvironment = "WEFTY_OCI_HELPER_CHILD"
 
 func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
-	directory, err := os.MkdirTemp("", "wefty-oci-child-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(directory)
-	socketPath := filepath.Join(directory, "helper.sock")
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	unixListener := listener.(*net.UnixListener)
-	unixListener.SetUnlinkOnClose(false)
-	listenerFile, err := unixListener.File()
-	if err != nil {
-		t.Fatal(err)
-	}
-	command := exec.Command(os.Args[0], "-test.run=^TestRealtimeOCIHelperChildProcess$")
-	command.Env = append(os.Environ(), helperChildEnvironment+"=1")
-	command.ExtraFiles = []*os.File{listenerFile}
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
-	}
-	_ = listenerFile.Close()
-	_ = listener.Close()
-	t.Cleanup(func() {
-		_ = command.Process.Kill()
-		_ = command.Wait()
-	})
+	socketPath := startRealtimeHelperChild(t)
 
 	client := NewUnixClient(socketPath, "realtime-fake-checksum")
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -56,6 +29,13 @@ func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
 	defer session.Close()
 	if _, err := session.Sweep(ctx, SweepRequest{}); err != nil {
 		t.Fatal(err)
+	}
+	verification, err := session.Verify(ctx, VerifyRequest{Scope: VerifyNamespace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.Absent {
+		t.Fatal("namespace residue remained after sweep")
 	}
 	if err := session.EnsureImage(ctx, EnsureImageRequest{Reference: "example.invalid/probe", Digest: "sha256:probe"}, nil); err != nil {
 		t.Fatal(err)
@@ -80,6 +60,39 @@ func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
 	if _, err := session.Delete(ctx, DeleteRequest{Authority: authority}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func startRealtimeHelperChild(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("", "wefty-oci-child-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(directory, "helper.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unixListener := listener.(*net.UnixListener)
+	unixListener.SetUnlinkOnClose(false)
+	listenerFile, err := unixListener.File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestRealtimeOCIHelperChildProcess$")
+	command.Env = append(os.Environ(), helperChildEnvironment+"=1")
+	command.ExtraFiles = []*os.File{listenerFile}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_ = listenerFile.Close()
+	_ = listener.Close()
+	t.Cleanup(func() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		_ = os.RemoveAll(directory)
+	})
+	return socketPath
 }
 
 func TestRealtimeOCIHelperChildProcess(t *testing.T) {

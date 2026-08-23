@@ -11,6 +11,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 const (
@@ -51,6 +52,7 @@ type agentSession struct {
 	localLimits       map[workloadClass]int
 	logf              func(string, ...any)
 	capabilities      *capabilityState
+	ociBootBarrier    OCIBootBarrier
 
 	capacityMu      sync.Mutex
 	poolTargets     map[workloadClass]int
@@ -147,10 +149,59 @@ func (session *agentSession) close() {
 }
 
 func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
-	if err := session.capabilities.refresh(ctx); err != nil && session.logf != nil {
-		session.logf("agent: capability probe before registration: %v", err)
+	if session.ociBootBarrier == nil {
+		if err := session.capabilities.refresh(ctx); err != nil && session.logf != nil {
+			session.logf("agent: capability probe before registration: %v", err)
+		}
+		return session.publishRegistration(ctx)
 	}
+
+	// Establish node authority first, but only with a restrictive observation.
+	// The returned L1 projection is the atomic same-boot revision oracle.
+	session.capabilities.suppressOCI(
+		contract.CapabilityReasonBootSweepFailed,
+		errors.New("OCI helper session requires a boot sweep"),
+	)
+	node, err := session.publishRegistration(ctx)
+	if err != nil {
+		return l1.Node{}, err
+	}
+	if err := session.capabilities.adoptRestrictive(node); err != nil {
+		return l1.Node{}, err
+	}
+
+	barrierErr := session.ociBootBarrier.Ensure(ctx)
+	// ADR-0002 removal recovery is independent of OCI readiness and always runs
+	// once registration authority and its restrictive N+1 are published.
+	removalErr := session.resumePendingRemovals(ctx)
+	if barrierErr != nil || removalErr != nil {
+		if session.logf != nil {
+			if barrierErr != nil {
+				session.logf("agent: OCI boot barrier before registration: %v", barrierErr)
+			}
+			if removalErr != nil {
+				session.logf("agent: resume pending removals before registration: %v", removalErr)
+			}
+		}
+		return node, nil
+	}
+	generation, ok := session.ociBootBarrier.Generation()
+	if !ok {
+		session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, errors.New("OCI helper session lost after removal recovery"))
+		return session.publishCapabilityHeartbeat(ctx, nil)
+	}
+	if err := session.capabilities.refresh(ctx); err != nil {
+		if session.logf != nil {
+			session.logf("agent: OCI functional probe before publication: %v", err)
+		}
+		return session.publishCapabilityHeartbeat(ctx, nil)
+	}
+	return session.publishCapabilityHeartbeat(ctx, &generation)
+}
+
+func (session *agentSession) publishRegistration(ctx context.Context) (l1.Node, error) {
 	registration := applyCapabilityObservation(session.registration, session.capabilities.snapshot())
+	registration.SupersedeCapabilityRevision = session.ociBootBarrier != nil
 	node, err := session.client.Register(ctx, registration)
 	if err == nil {
 		session.capabilities.acknowledge(node)
@@ -159,9 +210,100 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	return node, err
 }
 
+func (session *agentSession) resumePendingRemovals(ctx context.Context) error {
+	if session.removals != nil {
+		if err := session.removals.resume(ctx); err != nil {
+			session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, err)
+			return err
+		}
+	}
+	return nil
+}
+
+// recoverOCIRuntime publishes a restrictive observation before reacquiring a
+// lost helper generation, then performs the event-path removal resume and
+// functional probe. Ordinary healthy heartbeats do not scan removals.
+func (session *agentSession) recoverOCIRuntime(ctx context.Context) (ocihelper.HelperSession, error) {
+	if session.ociBootBarrier == nil {
+		return ocihelper.HelperSession{}, session.capabilities.refresh(ctx)
+	}
+	session.capabilities.suppressOCI(
+		contract.CapabilityReasonBootSweepFailed,
+		errors.New("OCI helper session requires a new boot sweep"),
+	)
+	if _, err := session.publishCapabilityHeartbeat(ctx, nil); err != nil {
+		return ocihelper.HelperSession{}, err
+	}
+	barrierErr := session.ociBootBarrier.Ensure(ctx)
+	removalErr := session.resumePendingRemovals(ctx)
+	if barrierErr != nil {
+		return ocihelper.HelperSession{}, barrierErr
+	}
+	if removalErr != nil {
+		return ocihelper.HelperSession{}, removalErr
+	}
+	generation, ok := session.ociBootBarrier.Generation()
+	if !ok {
+		return ocihelper.HelperSession{}, errors.New("OCI helper session lost after boot sweep")
+	}
+	if err := session.capabilities.refresh(ctx); err != nil {
+		return generation, err
+	}
+	if current, stillReady := session.ociBootBarrier.Generation(); !stillReady || current != generation {
+		err := errors.New("OCI helper session changed before capability publication")
+		session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, err)
+		return ocihelper.HelperSession{}, err
+	}
+	return generation, nil
+}
+
 func (session *agentSession) heartbeat(ctx context.Context) (l1.HeartbeatResponse, error) {
 	observation := session.capabilities.snapshot()
 	return session.client.Heartbeat(ctx, session.registration.NodeID, heartbeatRequest(session.registration.BootSessionID, observation))
+}
+
+func (session *agentSession) publishCapabilityHeartbeat(ctx context.Context, pinned *ocihelper.HelperSession) (l1.Node, error) {
+	response, err := session.publishCapabilityHeartbeatResponse(ctx, pinned)
+	return response.Node, err
+}
+
+func (session *agentSession) publishCapabilityHeartbeatResponse(ctx context.Context, pinned *ocihelper.HelperSession) (l1.HeartbeatResponse, error) {
+	session.capabilities.claimPublication.Lock()
+	defer session.capabilities.claimPublication.Unlock()
+	observation := session.capabilities.snapshot()
+	if pinned != nil {
+		current, ok := session.ociBootBarrier.Generation()
+		if !ok || current != *pinned {
+			return l1.HeartbeatResponse{}, errors.New("OCI helper session changed before positive capability publication")
+		}
+	}
+	response, err := session.client.Heartbeat(
+		ctx,
+		session.registration.NodeID,
+		heartbeatRequest(session.registration.BootSessionID, observation),
+	)
+	if err == nil && pinned != nil {
+		current, ok := session.ociBootBarrier.Generation()
+		if !ok || current != *pinned {
+			lossErr := errors.New("OCI helper session changed during positive capability publication")
+			session.capabilities.suppressOCILocked(contract.CapabilityReasonBootSweepFailed, lossErr)
+			restrictive := session.capabilities.snapshot()
+			restrictiveResponse, restrictiveErr := session.client.Heartbeat(
+				ctx,
+				session.registration.NodeID,
+				heartbeatRequest(session.registration.BootSessionID, restrictive),
+			)
+			if restrictiveErr != nil {
+				return restrictiveResponse, errors.Join(lossErr, restrictiveErr)
+			}
+			session.capabilities.acknowledge(restrictiveResponse.Node)
+			return restrictiveResponse, lossErr
+		}
+	}
+	if err == nil {
+		session.capabilities.acknowledge(response.Node)
+	}
+	return response, err
 }
 
 func (session *agentSession) drain(ctx context.Context) (l1.Node, error) {
@@ -219,7 +361,7 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 		}
 		backoff.reset()
 		session.markReady()
-		if session.removals != nil {
+		if session.removals != nil && session.ociBootBarrier == nil {
 			if err := session.removals.resume(runContext); err != nil && runContext.Err() == nil && session.logf != nil {
 				session.logf("agent: resume service removals: %v", err)
 			}
@@ -493,11 +635,31 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			stopTimer(timer)
 			return
 		case <-timer.C():
-			if err := session.capabilities.refresh(ctx); err != nil && session.logf != nil {
-				session.logf("agent: capability probe before heartbeat: %v", err)
+			var pinned *ocihelper.HelperSession
+			if session.ociBootBarrier == nil {
+				if err := session.capabilities.refresh(ctx); err != nil && session.logf != nil {
+					session.logf("agent: capability probe before heartbeat: %v", err)
+				}
+			} else if generation, ready := session.ociBootBarrier.Generation(); ready {
+				pinned = &generation
+				if err := session.capabilities.refresh(ctx); err != nil && session.logf != nil {
+					session.logf("agent: OCI capability probe before heartbeat: %v", err)
+				}
+			} else {
+				generation, recoverErr := session.recoverOCIRuntime(ctx)
+				if recoverErr != nil {
+					if session.logf != nil {
+						session.logf("agent: OCI barrier recovery before heartbeat: %v", recoverErr)
+					}
+				} else {
+					pinned = &generation
+				}
 			}
-			response, err := session.heartbeat(ctx)
+			response, err := session.publishCapabilityHeartbeatResponse(ctx, pinned)
 			if err != nil {
+				if pinned != nil {
+					session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, err)
+				}
 				classification := classifyAgentProtocolError(err)
 				if classification.destination == errorDestinationTransient {
 					nextDelay = backoff.next()
@@ -510,7 +672,6 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				}
 				return
 			}
-			session.capabilities.acknowledge(response.Node)
 			session.observeGrantedCapacity(response.Node)
 			if session.removals != nil {
 				for _, directive := range response.RemovalDirectives {

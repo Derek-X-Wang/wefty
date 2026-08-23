@@ -91,8 +91,18 @@ type AcquireSessionResponse struct {
 	HelperVersion         string        `json:"helper_version"`
 	HelperChecksum        string        `json:"helper_checksum"`
 	SessionCapability     string        `json:"session_capability"`
+	HelperInstanceID      string        `json:"helper_instance_id"`
+	SessionGeneration     uint64        `json:"session_generation"`
 	HeartbeatTimeout      time.Duration `json:"heartbeat_timeout"`
 	MaximumAttemptDeadman time.Duration `json:"maximum_attempt_deadman"`
+	ReapTimeout           time.Duration `json:"reap_timeout"`
+}
+
+// HelperSession identifies one opaque helper process/session generation
+// without exposing its bearer capability.
+type HelperSession struct {
+	HelperInstanceID  string `json:"helper_instance_id"`
+	SessionGeneration uint64 `json:"session_generation"`
 }
 
 type SessionIdentity struct {
@@ -142,11 +152,16 @@ func (authority AttemptAuthority) key() string {
 // resource. The digest keeps operator-provided identifiers out of runtime
 // names while labels retain the complete authority tuple for verification.
 type ResourceIdentity struct {
-	LeaseID     string            `json:"lease_id"`
-	SnapshotID  string            `json:"snapshot_id"`
-	ContainerID string            `json:"container_id"`
-	TaskID      string            `json:"task_id"`
-	Labels      map[string]string `json:"labels"`
+	LeaseID                string            `json:"lease_id"`
+	SnapshotID             string            `json:"snapshot_id"`
+	ContainerID            string            `json:"container_id"`
+	TaskID                 string            `json:"task_id"`
+	ShimID                 string            `json:"shim_id"`
+	CgroupID               string            `json:"cgroup_id"`
+	LogSegmentDirectory    string            `json:"log_segment_directory"`
+	HandoffVolumeDirectory string            `json:"handoff_volume_directory"`
+	ServiceVolumeDirectory string            `json:"service_volume_directory"`
+	Labels                 map[string]string `json:"labels"`
 }
 
 func DeterministicResourceIdentity(authority AttemptAuthority) (ResourceIdentity, error) {
@@ -158,6 +173,10 @@ func DeterministicResourceIdentity(authority AttemptAuthority) (ResourceIdentity
 	return ResourceIdentity{
 		LeaseID: "wefty-lease-" + suffix, SnapshotID: "wefty-snapshot-" + suffix,
 		ContainerID: "wefty-container-" + suffix, TaskID: "wefty-task-" + suffix,
+		ShimID: "wefty-shim-" + suffix, CgroupID: "wefty-cgroup-" + suffix,
+		LogSegmentDirectory:    "wefty-log-segments-" + suffix,
+		HandoffVolumeDirectory: "wefty-handoff-volume-" + suffix,
+		ServiceVolumeDirectory: "wefty-service-volume-" + suffix,
 		Labels: map[string]string{
 			"io.wefty/node_id": authority.NodeID, "io.wefty/job_id": authority.JobID,
 			"io.wefty/attempt_id": authority.AttemptID, "io.wefty/fencing_token": authority.FencingToken,
@@ -259,6 +278,10 @@ type RunRequest struct {
 	InitialDeadman           time.Duration    `json:"initial_deadman"`
 	EnableHostBridgeFallback bool             `json:"enable_host_bridge_fallback,omitempty"`
 	Workload                 WorkloadInput    `json:"workload"`
+	// Resources is helper-derived after decoding. It cannot be supplied over
+	// the wire, so the engine always receives the deterministic names and full
+	// labels before it creates the lease or any dependent resource.
+	Resources ResourceIdentity `json:"-"`
 }
 
 type RunResponse struct {
@@ -325,15 +348,55 @@ type VerifyRequest struct {
 }
 
 type VerifyResponse struct {
-	Absent bool `json:"absent"`
+	Absent    bool              `json:"absent"`
+	Inventory ResourceInventory `json:"inventory"`
 }
 
-// SweepRequest carries mechanics, not policy. Ticket #139 owns selection and
-// boot-barrier ordering; this protocol only serializes the operation.
+// SweepRequest is intentionally empty: the boot barrier always sweeps the
+// complete wefty namespace, so no caller-supplied selection policy exists.
 type SweepRequest struct{}
 
 type SweepResponse struct {
-	Removed int `json:"removed"`
+	SweepEpoch            string                  `json:"sweep_epoch"`
+	Removed               int                     `json:"removed"`
+	PriorBootSessionsSeen []string                `json:"prior_boot_sessions_seen"`
+	Inventory             ResourceInventory       `json:"inventory"`
+	Attempts              []SweptAttemptAuthority `json:"attempts"`
+}
+
+// ResourceInventory is the engine's complete, class-separated namespace
+// observation. Empty slices are retained in receipts so every inventory class
+// is explicitly verified, rather than inferred from a total count.
+type ResourceInventory struct {
+	Leases         []string `json:"leases"`
+	Snapshots      []string `json:"snapshots"`
+	Containers     []string `json:"containers"`
+	Tasks          []string `json:"tasks"`
+	Shims          []string `json:"shims"`
+	Cgroups        []string `json:"cgroups"`
+	LogSegments    []string `json:"log_segments"`
+	ManagedVolumes []string `json:"managed_volumes"`
+}
+
+// SweptAttemptAuthority is the immutable removal-validation subset recovered
+// from labels while sweeping. PriorBootSessionID is the owning boot observed
+// on the swept resource; it is never rewritten to the acquiring boot.
+type SweptAttemptAuthority struct {
+	RemovalGeneration  string `json:"removal_generation"`
+	AttemptID          string `json:"attempt_id"`
+	FencingToken       string `json:"fencing_token"`
+	PriorBootSessionID string `json:"prior_boot_session_id"`
+}
+
+// VerifiedSweepReceipt joins the engine's sweep inventory with an independent
+// empty namespace observation and the exact helper session that performed it.
+type VerifiedSweepReceipt struct {
+	SweepEpoch            string                  `json:"sweep_epoch"`
+	HelperSession         HelperSession           `json:"helper_session"`
+	PriorBootSessionsSeen []string                `json:"prior_boot_sessions_seen"`
+	SweptInventory        ResourceInventory       `json:"swept_inventory"`
+	VerifiedInventory     ResourceInventory       `json:"verified_inventory"`
+	Attempts              []SweptAttemptAuthority `json:"attempts"`
 }
 
 type DialAttemptPortRequest struct {

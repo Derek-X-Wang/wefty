@@ -12,6 +12,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 // CapabilityProbe exercises the local OCI runtime path. Capabilities contains
@@ -20,6 +21,18 @@ import (
 // error withdraws every OCI-related capability before the error is reported.
 type CapabilityProbe interface {
 	Probe(context.Context) (CapabilityProbeResult, error)
+}
+
+// OCIBootBarrier proves that a helper session exclusively owns an empty wefty
+// runtime namespace. Ready is process-local admission state; L1 publication
+// remains ordered by agentSession after pending removals and the probe.
+type OCIBootBarrier interface {
+	Ready() bool
+	Ensure(context.Context) error
+	Generation() (ocihelper.HelperSession, bool)
+	SweepReceipt() (ocihelper.VerifiedSweepReceipt, bool)
+	SetLossHandler(func(ocihelper.HelperSession, error))
+	Close() error
 }
 
 // CapabilityProbeResult is the bounded, publishable portion of a functional
@@ -116,12 +129,37 @@ func (state *capabilityState) refresh(ctx context.Context) error {
 	return probeErr
 }
 
+func (state *capabilityState) suppressOCI(reason contract.CapabilityReasonCode, err error) {
+	if state == nil {
+		return
+	}
+	state.claimPublication.Lock()
+	defer state.claimPublication.Unlock()
+	state.suppressOCILocked(reason, err)
+}
+
+// suppressOCILocked records a restrictive observation while the caller holds
+// claimPublication for a larger publication transaction.
+func (state *capabilityState) suppressOCILocked(reason contract.CapabilityReasonCode, err error) {
+	if state == nil {
+		return
+	}
+	if err == nil {
+		err = errors.New("OCI runtime is not admitted")
+	}
+	state.recordLocked(CapabilityProbeResult{ReasonCode: reason}, err)
+}
+
 func (state *capabilityState) record(result CapabilityProbeResult, probeErr error) {
 	// Linearize a completed observation after every claim RPC that began under
 	// the prior snapshot. Once a restrictive refresh returns, no stale in-flight
 	// claim can consume work created behind its publication barrier.
 	state.claimPublication.Lock()
 	defer state.claimPublication.Unlock()
+	state.recordLocked(result, probeErr)
+}
+
+func (state *capabilityState) recordLocked(result CapabilityProbeResult, probeErr error) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	capabilities := cloneCapabilities(state.base)
@@ -169,15 +207,38 @@ func (state *capabilityState) record(result CapabilityProbeResult, probeErr erro
 	if !maps.Equal(state.current.Capabilities, capabilities) ||
 		!slices.Equal(state.current.MissingCapabilities, missingCapabilities) || state.current.ReasonCode != reason {
 		revision++
-		if withdrawsOCICapability(state.current.Capabilities, capabilities) {
-			state.pendingPublicationRevision = revision
-		}
+		state.pendingPublicationRevision = revision
 	}
 	state.current = contract.CapabilityObservation{
 		Revision: revision, Capabilities: capabilities,
 		ObservedAt: now, MissingCapabilities: missingCapabilities, ReasonCode: reason,
 	}
 	state.lastProbeAt = now
+}
+
+// adoptRestrictive learns the authoritative N+1 that L1 assigned atomically
+// while registering this barrier-bound session.
+func (state *capabilityState) adoptRestrictive(node l1.Node) error {
+	if state == nil {
+		return nil
+	}
+	if node.Capabilities["kind:oci"] || !slices.Contains(node.MissingCapabilities, "kind:oci") ||
+		node.CapabilityReasonCode != contract.CapabilityReasonBootSweepFailed {
+		return errors.New("L1 did not atomically publish the restrictive OCI boot-sweep observation")
+	}
+	state.claimPublication.Lock()
+	defer state.claimPublication.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.current = contract.CapabilityObservation{
+		Revision:            node.CapabilityRevision,
+		Capabilities:        cloneCapabilities(node.Capabilities),
+		ObservedAt:          node.CapabilityObservedAt,
+		MissingCapabilities: append([]string(nil), node.MissingCapabilities...),
+		ReasonCode:          node.CapabilityReasonCode,
+	}
+	state.pendingPublicationRevision = 0
+	return nil
 }
 
 func (state *capabilityState) beginClaim() func() {
@@ -277,15 +338,6 @@ func normalizeConfiguredCapabilities(configured map[string]bool) map[string]bool
 		delete(normalized, "process")
 	}
 	return normalized
-}
-
-func withdrawsOCICapability(previous, current map[string]bool) bool {
-	for capability, enabled := range previous {
-		if enabled && isOCIProbeCapability(capability) && !current[capability] {
-			return true
-		}
-	}
-	return false
 }
 
 func normalizeCapabilityReason(reason contract.CapabilityReasonCode) contract.CapabilityReasonCode {

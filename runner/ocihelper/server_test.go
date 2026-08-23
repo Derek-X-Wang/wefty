@@ -3,10 +3,12 @@ package ocihelper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,7 +26,10 @@ func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.LeaseID != second.LeaseID || first.ContainerID != second.ContainerID || first.TaskID != second.TaskID || first.SnapshotID != second.SnapshotID {
+	if first.LeaseID != second.LeaseID || first.ContainerID != second.ContainerID || first.TaskID != second.TaskID ||
+		first.SnapshotID != second.SnapshotID || first.ShimID != second.ShimID || first.CgroupID != second.CgroupID ||
+		first.LogSegmentDirectory != second.LogSegmentDirectory || first.HandoffVolumeDirectory != second.HandoffVolumeDirectory ||
+		first.ServiceVolumeDirectory != second.ServiceVolumeDirectory {
 		t.Fatalf("deterministic identity changed: first=%+v second=%+v", first, second)
 	}
 	if len(first.Labels) != 7 || first.Labels["io.wefty/fencing_token"] != authority.FencingToken || first.Labels["io.wefty/removal_generation"] != authority.RemovalGeneration {
@@ -38,6 +43,283 @@ func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	}
 	if different.LeaseID == first.LeaseID {
 		t.Fatal("a new fence reused the prior deterministic identity")
+	}
+}
+
+func TestEngineReceivesHelperDerivedResourcePlanBeforeRun(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	authority := testAuthority()
+	if _, err := session.Run(t.Context(), testRunRequest(authority, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	engine.mu.Lock()
+	request := engine.lastRunRequest
+	engine.mu.Unlock()
+	want, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Resources.LeaseID != want.LeaseID || request.Resources.SnapshotID != want.SnapshotID ||
+		request.Resources.ContainerID != want.ContainerID || request.Resources.TaskID != want.TaskID ||
+		request.Resources.ShimID != want.ShimID || request.Resources.CgroupID != want.CgroupID ||
+		request.Resources.LogSegmentDirectory != want.LogSegmentDirectory ||
+		request.Resources.HandoffVolumeDirectory != want.HandoffVolumeDirectory ||
+		request.Resources.ServiceVolumeDirectory != want.ServiceVolumeDirectory ||
+		len(request.Resources.Labels) != len(want.Labels) {
+		t.Fatalf("engine resource plan = %#v, want %#v", request.Resources, want)
+	}
+	for label, value := range want.Labels {
+		if request.Resources.Labels[label] != value {
+			t.Fatalf("engine resource label %q = %q, want %q", label, request.Resources.Labels[label], value)
+		}
+	}
+}
+
+func TestBootBarrierSweepsVerifiesAndRetriesExclusiveTakeover(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: time.Second, ReapTimeout: 2 * time.Second})
+	defer stop()
+	incumbent, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := incumbent.Handshake().ReapTimeout; got != 2*time.Second {
+		t.Fatalf("advertised reap timeout = %s, want 2s", got)
+	}
+	incumbentGeneration := incumbent.Handshake().SessionGeneration
+	requireSweep(t, incumbent)
+
+	clock := &observedClock{manualClock: newManualClock(time.Unix(1_000, 0)), timerCreated: make(chan struct{}, 8)}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{Clock: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer barrier.Close()
+	if barrier.Ready() {
+		t.Fatal("unprepared barrier reported ready")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- barrier.Ensure(ctx) }()
+	<-clock.timerCreated
+	select {
+	case err := <-done:
+		t.Fatalf("exclusive takeover crossed live incumbent: %v", err)
+	default:
+	}
+	readyRead := make(chan bool, 1)
+	go func() { readyRead <- barrier.Ready() }()
+	select {
+	case ready := <-readyRead:
+		if ready {
+			t.Fatal("barrier reported ready during takeover")
+		}
+	case <-time.After(75 * time.Millisecond):
+		t.Fatal("Ready blocked behind takeover retry")
+	}
+	if err := incumbent.Close(); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(defaultTakeoverRetryInterval)
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+			goto takeoverComplete
+		case <-clock.timerCreated:
+			clock.Advance(defaultTakeoverRetryInterval)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+takeoverComplete:
+	if !barrier.Ready() {
+		t.Fatal("successful sweep and verification did not make barrier ready")
+	}
+	receipt, ok := barrier.SweepReceipt()
+	if !ok || receipt.SweepEpoch == "" || receipt.HelperSession.HelperInstanceID == "" || receipt.HelperSession.SessionGeneration == 0 {
+		t.Fatalf("verified sweep receipt = %#v, ok=%t", receipt, ok)
+	}
+	if receipt.HelperSession.SessionGeneration <= incumbentGeneration {
+		t.Fatalf("takeover generation = %d, want newer than %d", receipt.HelperSession.SessionGeneration, incumbentGeneration)
+	}
+	receipt.PriorBootSessionsSeen = append(receipt.PriorBootSessionsSeen, "mutated")
+	retained, ok := barrier.SweepReceipt()
+	if !ok || len(retained.PriorBootSessionsSeen) != 0 {
+		t.Fatalf("barrier receipt was mutable through caller copy: %#v", retained)
+	}
+	before := engine.methods()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := engine.methods(); !equalStrings(got, before) {
+		t.Fatalf("idempotent barrier repeated engine operations: before=%v after=%v", before, got)
+	}
+}
+
+func TestBootBarrierRefusesResidueAndNeverExposesSession(t *testing.T) {
+	engine := newFakeEngine()
+	engine.verifyResponses = []VerifyResponse{{Absent: true}, {Absent: false}}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	barrier, err := NewBootBarrier(client, testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := barrier.Ensure(t.Context()); err == nil {
+		t.Fatal("barrier accepted residue after sweep")
+	}
+	if barrier.Ready() {
+		t.Fatal("failed verification made barrier ready")
+	}
+	if _, err := barrier.Session(); err == nil {
+		t.Fatal("failed verification exposed a helper session")
+	}
+}
+
+func TestBootBarrierInspectsIndependentNamespaceInventory(t *testing.T) {
+	engine := newFakeEngine()
+	engine.verifyResponses = []VerifyResponse{{Absent: true}, {
+		Absent: true, Inventory: ResourceInventory{Leases: []string{"wefty-lease-unlabelled"}},
+	}}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	barrier, err := NewBootBarrier(client, testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := barrier.Ensure(t.Context()); err == nil {
+		t.Fatal("barrier trusted absent=true despite independently inventoried residue")
+	}
+}
+
+func TestHelperRestartSweepsAndVerifiesBeforeAcceptingSession(t *testing.T) {
+	engine := newFakeEngine()
+	engine.sweepEntered = make(chan struct{})
+	engine.releaseSweep = make(chan struct{})
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	opened := make(chan error, 1)
+	go func() {
+		session, err := client.OpenSession(t.Context(), testSessionRequest())
+		if session != nil {
+			_ = session.Close()
+		}
+		opened <- err
+	}()
+	<-engine.sweepEntered
+	select {
+	case err := <-opened:
+		t.Fatalf("helper accepted a session before startup sweep completed: %v", err)
+	case <-time.After(75 * time.Millisecond):
+	}
+	close(engine.releaseSweep)
+	if err := <-opened; err != nil {
+		t.Fatal(err)
+	}
+	if got := engine.methods(); !equalStrings(got, []string{"Sweep", "Verify"}) {
+		t.Fatalf("helper startup barrier operations = %v", got)
+	}
+}
+
+func TestHelperStartupResidueFailsServeBeforeSessionAuthority(t *testing.T) {
+	engine := newFakeEngine()
+	engine.verifyResponses = []VerifyResponse{{Absent: false}}
+	server, err := NewServer(engine, ServerConfig{
+		HelperChecksum: "checksum-test", AllowedUIDs: []uint32{uint32(os.Getuid())},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp("", "wefty-oci-startup-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	listener, err := net.Listen("unix", filepath.Join(directory, "helper.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = server.Serve(t.Context(), listener)
+	if err == nil || err.Error() != "startup verify OCI runtime namespace: residue remains after sweep" {
+		t.Fatalf("helper startup error = %v", err)
+	}
+	if got := engine.methods(); !equalStrings(got, []string{"Sweep", "Verify"}) {
+		t.Fatalf("failed helper startup operations = %v", got)
+	}
+}
+
+func TestCrashAtEveryCreateBoundaryIsSweptBeforeReusedBootSession(t *testing.T) {
+	for boundary := 1; boundary <= 10; boundary++ {
+		t.Run(fmt.Sprintf("boundary-%d", boundary), func(t *testing.T) {
+			engine := newCrashBoundaryEngine(boundary)
+			client, stop := startTestServer(t, engine, ServerConfig{})
+			barrier, err := NewBootBarrier(client, testSessionRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := barrier.Ensure(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			session, err := barrier.Session()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = session.Run(t.Context(), testRunRequest(testAuthority(), time.Second))
+			if err == nil {
+				t.Fatal("simulated helper crash returned Started evidence")
+			}
+			var rpcErr *RPCError
+			if errors.As(err, &rpcErr) && rpcErr.Code != CodeEngineFailure {
+				t.Fatalf("crashed helper Run error = %v", err)
+			}
+			if engine.residueCount() != boundary {
+				t.Fatalf("crash residue count = %d, want %d", engine.residueCount(), boundary)
+			}
+			_ = barrier.Close()
+			stop()
+
+			engine = engine.restartAfterCrash()
+			restartedClient, stopRestarted := startTestServer(t, engine, ServerConfig{})
+			defer stopRestarted()
+			restarted, err := NewBootBarrier(restartedClient, testSessionRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restarted.Close()
+			if err := restarted.Ensure(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			receipt, ok := restarted.SweepReceipt()
+			if !ok || len(receipt.PriorBootSessionsSeen) != 1 || len(receipt.Attempts) != 1 ||
+				receipt.Attempts[0].AttemptID != testAuthority().AttemptID || inventoryEmpty(receipt.SweptInventory) {
+				t.Fatalf("restarted barrier receipt = %#v, ok=%t", receipt, ok)
+			}
+			if engine.residueCount() != 0 {
+				t.Fatalf("reused boot session retained %d stale resources", engine.residueCount())
+			}
+			restartedSession, err := restarted.Session()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := restartedSession.Run(t.Context(), testRunRequest(testAuthority(), time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if engine.duplicateStarts() != 0 {
+				t.Fatalf("reused boot adopted or overlapped %d survivor executions", engine.duplicateStarts())
+			}
+		})
 	}
 }
 
@@ -286,7 +568,11 @@ func TestAllNarrowRPCsReachFakeEngineWithoutContainerdTypes(t *testing.T) {
 	if _, err := session.Sweep(t.Context(), SweepRequest{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := engine.methods(); !equalStrings(got, []string{"Sweep", "EnsureImage", "Run", "Signal", "Watch", "Verify", "Delete", "Sweep"}) {
+	if got := engine.methods(); !equalStrings(got, []string{
+		"Sweep", "Verify", // helper restart barrier
+		"Sweep", "Verify", // exclusive agent-session barrier
+		"EnsureImage", "Run", "Signal", "Watch", "Verify", "Delete", "Sweep",
+	}) {
 		t.Fatalf("fake engine methods = %v", got)
 	}
 }
@@ -372,7 +658,7 @@ func TestRunDefersOperatorMountFilesystemValidationUntilGuestTranslation(t *test
 	}
 }
 
-func TestSweepBlocksSubsequentRunUntilItCompletes(t *testing.T) {
+func TestSweepEmbargoesRunUntilNamespaceVerificationCompletes(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})
 	defer stop()
@@ -401,15 +687,52 @@ func TestSweepBlocksSubsequentRunUntilItCompletes(t *testing.T) {
 	}()
 	select {
 	case err := <-runDone:
-		t.Fatalf("Run crossed active Sweep: %v", err)
+		assertRPCCode(t, err, CodeSweepRequired)
 	case <-time.After(75 * time.Millisecond):
+		t.Fatal("Run remained admitted while a replacement sweep was active")
 	}
 	close(releaseSweep)
 	if err := <-sweepDone; err != nil {
 		t.Fatal(err)
 	}
-	if err := <-runDone; err != nil {
+	verification, err := session.Verify(t.Context(), VerifyRequest{Scope: VerifyNamespace})
+	if err != nil || !verification.Absent {
+		t.Fatalf("post-sweep verification = %#v, err=%v", verification, err)
+	}
+	if _, err := session.Run(t.Context(), testRunRequest(testAuthority(), time.Second)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPreadmittedRunRechecksSweepBarrierUnderCreationLock(t *testing.T) {
+	engine := newFakeEngine()
+	runPoised := make(chan struct{})
+	releaseRun := make(chan struct{})
+	client, stop := startTestServer(t, engine, ServerConfig{beforeRunCreateLock: func() {
+		close(runPoised)
+		<-releaseRun
+	}})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, runErr := session.Run(t.Context(), testRunRequest(testAuthority(), time.Second))
+		runDone <- runErr
+	}()
+	<-runPoised
+	if _, err := session.Sweep(t.Context(), SweepRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseRun)
+	assertRPCCode(t, <-runDone, CodeSweepRequired)
+	if engine.runCount() != 0 {
+		t.Fatal("pre-admitted Run crossed a newly unverified sweep boundary")
 	}
 }
 
@@ -566,6 +889,13 @@ func requireSweep(t *testing.T, session *Session) {
 	if _, err := session.Sweep(t.Context(), SweepRequest{}); err != nil {
 		t.Fatal(err)
 	}
+	verification, err := session.Verify(t.Context(), VerifyRequest{Scope: VerifyNamespace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.Absent {
+		t.Fatal("namespace residue remained after required sweep")
+	}
 }
 
 func testSessionRequest() AcquireSessionRequest {
@@ -652,19 +982,168 @@ func assertStreamPayload(t *testing.T, connection net.Conn, expected string) {
 }
 
 type fakeEngine struct {
-	mu             sync.Mutex
-	calls          []string
-	sessionReaps   []SessionIdentity
-	attemptReaps   []AttemptAuthority
-	runResponse    RunResponse
-	runErr         error
-	runEntered     chan struct{}
-	releaseRun     chan struct{}
-	sweepEntered   chan struct{}
-	releaseSweep   chan struct{}
-	signalEntered  chan struct{}
-	releaseSignal  chan struct{}
-	sessionReapErr error
+	mu              sync.Mutex
+	calls           []string
+	sessionReaps    []SessionIdentity
+	attemptReaps    []AttemptAuthority
+	runResponse     RunResponse
+	lastRunRequest  RunRequest
+	runErr          error
+	runEntered      chan struct{}
+	releaseRun      chan struct{}
+	sweepEntered    chan struct{}
+	releaseSweep    chan struct{}
+	signalEntered   chan struct{}
+	releaseSignal   chan struct{}
+	sessionReapErr  error
+	verifyResponses []VerifyResponse
+}
+
+type crashBoundaryEngine struct {
+	*fakeEngine
+	stateMu       sync.Mutex
+	crashAfter    int
+	residues      map[string]struct{}
+	live          map[string]struct{}
+	duplicateRuns int
+	lastAuthority AttemptAuthority
+}
+
+func newCrashBoundaryEngine(crashAfter int) *crashBoundaryEngine {
+	return &crashBoundaryEngine{
+		fakeEngine: newFakeEngine(), crashAfter: crashAfter,
+		residues: make(map[string]struct{}), live: make(map[string]struct{}),
+	}
+}
+
+func (engine *crashBoundaryEngine) Run(_ context.Context, request RunRequest) (RunResponse, error) {
+	engine.record("Run")
+	resources := request.Resources
+	steps := []string{
+		resources.LeaseID, // intentionally discoverable before labels are applied
+		resources.SnapshotID, resources.ContainerID, resources.TaskID,
+		resources.ShimID, resources.CgroupID, resources.LogSegmentDirectory,
+		resources.HandoffVolumeDirectory, resources.ServiceVolumeDirectory,
+		"started:" + resources.TaskID,
+	}
+	if resources.LeaseID == "" || len(resources.Labels) != 7 {
+		return RunResponse{}, errors.New("helper-derived lease and labels were unavailable before create")
+	}
+	engine.stateMu.Lock()
+	defer engine.stateMu.Unlock()
+	engine.lastAuthority = request.Authority
+	for index, resource := range steps {
+		engine.residues[resource] = struct{}{}
+		if index == len(steps)-1 {
+			if _, exists := engine.live[resources.TaskID]; exists {
+				engine.duplicateRuns++
+			}
+			engine.live[resources.TaskID] = struct{}{}
+		}
+		if engine.crashAfter == index+1 {
+			return RunResponse{}, errors.New("simulated helper crash after create boundary")
+		}
+	}
+	return RunResponse{Started: true}, nil
+}
+
+func (engine *crashBoundaryEngine) Sweep(context.Context, SweepRequest) (SweepResponse, error) {
+	engine.record("Sweep")
+	engine.stateMu.Lock()
+	removed := len(engine.residues)
+	inventory := engine.inventoryLocked()
+	authority := engine.lastAuthority
+	clear(engine.residues)
+	clear(engine.live)
+	engine.stateMu.Unlock()
+	response := SweepResponse{SweepEpoch: "fake-sweep", Removed: removed, Inventory: inventory}
+	if removed != 0 && authority.AttemptID != "" {
+		response.PriorBootSessionsSeen = []string{authority.BootSessionID}
+		response.Attempts = []SweptAttemptAuthority{{
+			RemovalGeneration: authority.RemovalGeneration, AttemptID: authority.AttemptID,
+			FencingToken: authority.FencingToken, PriorBootSessionID: authority.BootSessionID,
+		}}
+	}
+	return response, nil
+}
+
+func (engine *crashBoundaryEngine) Verify(context.Context, VerifyRequest) (VerifyResponse, error) {
+	engine.record("Verify")
+	engine.stateMu.Lock()
+	inventory := engine.inventoryLocked()
+	absent := inventoryEmpty(inventory)
+	engine.stateMu.Unlock()
+	return VerifyResponse{Absent: absent, Inventory: inventory}, nil
+}
+
+func (engine *crashBoundaryEngine) inventoryLocked() ResourceInventory {
+	var inventory ResourceInventory
+	for residue := range engine.residues {
+		switch {
+		case strings.HasPrefix(residue, "wefty-lease-"):
+			inventory.Leases = append(inventory.Leases, residue)
+		case strings.HasPrefix(residue, "wefty-snapshot-"):
+			inventory.Snapshots = append(inventory.Snapshots, residue)
+		case strings.HasPrefix(residue, "wefty-container-"):
+			inventory.Containers = append(inventory.Containers, residue)
+		case strings.HasPrefix(residue, "wefty-task-"):
+			inventory.Tasks = append(inventory.Tasks, residue)
+		case strings.HasPrefix(residue, "wefty-shim-"):
+			inventory.Shims = append(inventory.Shims, residue)
+		case strings.HasPrefix(residue, "wefty-cgroup-"):
+			inventory.Cgroups = append(inventory.Cgroups, residue)
+		case strings.HasPrefix(residue, "wefty-log-segments-"):
+			inventory.LogSegments = append(inventory.LogSegments, residue)
+		case strings.HasPrefix(residue, "wefty-handoff-volume-"), strings.HasPrefix(residue, "wefty-service-volume-"):
+			inventory.ManagedVolumes = append(inventory.ManagedVolumes, residue)
+		}
+	}
+	return inventory
+}
+
+func (engine *crashBoundaryEngine) ReapAttempt(context.Context, AttemptAuthority) error {
+	return errors.New("simulated helper crash prevented attempt reap")
+}
+
+func (engine *crashBoundaryEngine) ReapSession(context.Context, SessionIdentity) error {
+	engine.stateMu.Lock()
+	defer engine.stateMu.Unlock()
+	if engine.crashAfter == 0 {
+		clear(engine.residues)
+		clear(engine.live)
+		return nil
+	}
+	if len(engine.residues) != 0 {
+		return errors.New("simulated crashed session retained residue")
+	}
+	return nil
+}
+
+func (engine *crashBoundaryEngine) restartAfterCrash() *crashBoundaryEngine {
+	engine.stateMu.Lock()
+	defer engine.stateMu.Unlock()
+	restarted := newCrashBoundaryEngine(0)
+	restarted.duplicateRuns = engine.duplicateRuns
+	restarted.lastAuthority = engine.lastAuthority
+	for residue := range engine.residues {
+		restarted.residues[residue] = struct{}{}
+	}
+	for task := range engine.live {
+		restarted.live[task] = struct{}{}
+	}
+	return restarted
+}
+
+func (engine *crashBoundaryEngine) residueCount() int {
+	engine.stateMu.Lock()
+	defer engine.stateMu.Unlock()
+	return len(engine.residues)
+}
+
+func (engine *crashBoundaryEngine) duplicateStarts() int {
+	engine.stateMu.Lock()
+	defer engine.stateMu.Unlock()
+	return engine.duplicateRuns
 }
 
 func newFakeEngine() *fakeEngine { return &fakeEngine{runResponse: RunResponse{Started: true}} }
@@ -685,9 +1164,10 @@ func (engine *fakeEngine) EnsureImage(_ context.Context, _ EnsureImageRequest, e
 	engine.record("EnsureImage")
 	return emit(EnsureImageEvent{Kind: ImageComplete, Result: &EnsureImageResponse{TopLevelDigest: "sha256:top", PlatformDigest: "sha256:platform"}})
 }
-func (engine *fakeEngine) Run(context.Context, RunRequest) (RunResponse, error) {
+func (engine *fakeEngine) Run(_ context.Context, request RunRequest) (RunResponse, error) {
 	engine.record("Run")
 	engine.mu.Lock()
+	engine.lastRunRequest = request
 	runEntered := engine.runEntered
 	releaseRun := engine.releaseRun
 	response := engine.runResponse
@@ -722,6 +1202,13 @@ func (engine *fakeEngine) Delete(context.Context, DeleteRequest) (DeleteResponse
 }
 func (engine *fakeEngine) Verify(context.Context, VerifyRequest) (VerifyResponse, error) {
 	engine.record("Verify")
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if len(engine.verifyResponses) > 0 {
+		response := engine.verifyResponses[0]
+		engine.verifyResponses = engine.verifyResponses[1:]
+		return response, nil
+	}
 	return VerifyResponse{Absent: true}, nil
 }
 func (engine *fakeEngine) Sweep(context.Context, SweepRequest) (SweepResponse, error) {
@@ -776,6 +1263,18 @@ func (engine *fakeEngine) attemptReapCount() int {
 	return len(engine.attemptReaps)
 }
 
+func (engine *fakeEngine) runCount() int {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	count := 0
+	for _, call := range engine.calls {
+		if call == "Run" {
+			count++
+		}
+	}
+	return count
+}
+
 func equalStrings(left, right []string) bool {
 	if len(left) != len(right) {
 		return false
@@ -799,6 +1298,17 @@ type manualTimer struct {
 	channel  chan time.Time
 	deadline time.Time
 	active   bool
+}
+
+type observedClock struct {
+	*manualClock
+	timerCreated chan struct{}
+}
+
+func (clock *observedClock) NewTimerAt(deadline time.Time) Timer {
+	timer := clock.manualClock.NewTimerAt(deadline)
+	clock.timerCreated <- struct{}{}
+	return timer
 }
 
 func newManualClock(now time.Time) *manualClock {
