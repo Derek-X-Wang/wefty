@@ -74,7 +74,10 @@ type Config struct {
 	// by default and may be replaced through this map. A capability may be
 	// advertised without a matching local adapter, in which case local
 	// admission fails closed.
-	WorkloadRuntimes  map[string]WorkloadRuntime
+	WorkloadRuntimes map[string]WorkloadRuntime
+	// AttemptDeadman queues successful OCI L1 renewals to the helper session.
+	// Nil is the no-helper-session mode.
+	AttemptDeadman    AttemptDeadmanRenewer
 	OutputSinkFactory OutputSinkFactory
 	HandoffRoot       string
 	HandoffRetention  time.Duration
@@ -104,6 +107,7 @@ type Agent struct {
 	clock             Clock
 	observer          *lifecycleObserver
 	capabilities      *capabilityState
+	attemptDeadman    AttemptDeadmanRenewer
 	nodeLock          nodeLock
 }
 
@@ -234,7 +238,8 @@ func New(config Config) (*Agent, error) {
 		runtimes: runtimes, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
 		handoffs: newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
 		logf:     logf, clock: clock, observer: observer, capabilities: capabilities,
-		nodeLock: stableNodeLock,
+		attemptDeadman: config.AttemptDeadman,
+		nodeLock:       stableNodeLock,
 	}, nil
 }
 
@@ -326,6 +331,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		prepareAuthorityLoss:   a.prepareAuthorityLoss,
 		allowsStart:            allowsStart,
 		runtimeReaped:          a.recordRuntimeReap,
+		attemptDeadman:         a.attemptDeadman,
 	})
 }
 

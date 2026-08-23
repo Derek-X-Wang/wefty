@@ -1,0 +1,366 @@
+// Package ocihelper defines the narrow, versioned protocol between an
+// unprivileged node agent and the privileged OCI helper. It deliberately does
+// not expose containerd types or a general network proxy.
+package ocihelper
+
+import (
+	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+)
+
+const (
+	// ProtocolVersion is the only wire major accepted by this implementation.
+	ProtocolVersion = 1
+	InvocationArg   = "__wefty_oci_helper"
+	// MaxFrameBytes bounds every decoded request, response, and stream event.
+	MaxFrameBytes = 1 << 20
+)
+
+type Method string
+
+const (
+	MethodAcquireSession  Method = "AcquireSession"
+	MethodHeartbeat       Method = "Heartbeat"
+	MethodEnsureImage     Method = "EnsureImage"
+	MethodRun             Method = "Run"
+	MethodSignal          Method = "Signal"
+	MethodWatch           Method = "Watch"
+	MethodDelete          Method = "Delete"
+	MethodVerify          Method = "Verify"
+	MethodSweep           Method = "Sweep"
+	MethodDialAttemptPort Method = "DialAttemptPort"
+	MethodDialHostBridge  Method = "DialHostBridge"
+)
+
+type ErrorCode string
+
+const (
+	CodeInvalidRequest       ErrorCode = "invalid_request"
+	CodePeerUnauthenticated  ErrorCode = "peer_unauthenticated"
+	CodeVersionMismatch      ErrorCode = "version_mismatch"
+	CodeChecksumMismatch     ErrorCode = "checksum_mismatch"
+	CodeSessionBusy          ErrorCode = "session_busy"
+	CodeSessionStale         ErrorCode = "session_stale"
+	CodeUnauthorizedAttempt  ErrorCode = "unauthorized_attempt"
+	CodeUnauthorizedPort     ErrorCode = "unauthorized_port"
+	CodeUnauthorizedBridge   ErrorCode = "unauthorized_bridge"
+	CodeEngineFailure        ErrorCode = "engine_failure"
+	CodeUnsupportedOperation ErrorCode = "unsupported_operation"
+	CodeSweepRequired        ErrorCode = "sweep_required"
+)
+
+// RPCError is safe to cross the private protocol. Engine detail remains local.
+type RPCError struct {
+	Code    ErrorCode `json:"code"`
+	Message string    `json:"message"`
+}
+
+func (err *RPCError) Error() string {
+	if err == nil {
+		return ""
+	}
+	return fmt.Sprintf("oci helper %s: %s", err.Code, err.Message)
+}
+
+type frame struct {
+	Version           int             `json:"version"`
+	Method            Method          `json:"method,omitempty"`
+	SessionCapability string          `json:"session_capability,omitempty"`
+	Body              json.RawMessage `json:"body,omitempty"`
+	OK                bool            `json:"ok,omitempty"`
+	Error             *RPCError       `json:"error,omitempty"`
+}
+
+type AcquireSessionRequest struct {
+	NodeID                 string `json:"node_id"`
+	BootSessionID          string `json:"boot_session_id"`
+	ExpectedHelperChecksum string `json:"expected_helper_checksum,omitempty"`
+}
+
+type AcquireSessionResponse struct {
+	ProtocolVersion       int           `json:"protocol_version"`
+	HelperVersion         string        `json:"helper_version"`
+	HelperChecksum        string        `json:"helper_checksum"`
+	SessionCapability     string        `json:"session_capability"`
+	HeartbeatTimeout      time.Duration `json:"heartbeat_timeout"`
+	MaximumAttemptDeadman time.Duration `json:"maximum_attempt_deadman"`
+}
+
+type SessionIdentity struct {
+	NodeID        string `json:"node_id"`
+	BootSessionID string `json:"boot_session_id"`
+}
+
+// AttemptAuthority is the complete helper-side authorization tuple. Class is
+// carried only as an immutable resource label; it never selects mechanics.
+type AttemptAuthority struct {
+	NodeID            string `json:"node_id"`
+	JobID             string `json:"job_id"`
+	AttemptID         string `json:"attempt_id"`
+	FencingToken      string `json:"fencing_token"`
+	BootSessionID     string `json:"boot_session_id"`
+	Class             string `json:"class"`
+	RemovalGeneration string `json:"removal_generation"`
+}
+
+func (authority AttemptAuthority) validate() error {
+	values := []struct {
+		name  string
+		value string
+	}{
+		{"node_id", authority.NodeID}, {"job_id", authority.JobID},
+		{"attempt_id", authority.AttemptID}, {"fencing_token", authority.FencingToken},
+		{"boot_session_id", authority.BootSessionID}, {"class", authority.Class},
+		{"removal_generation", authority.RemovalGeneration},
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value.value) == "" {
+			return fmt.Errorf("attempt authority requires %s", value.name)
+		}
+	}
+	return nil
+}
+
+func (authority AttemptAuthority) key() string {
+	return strings.Join([]string{
+		authority.NodeID, authority.JobID, authority.AttemptID,
+		authority.FencingToken, authority.BootSessionID,
+		authority.Class, authority.RemovalGeneration,
+	}, "\x00")
+}
+
+// ResourceIdentity deterministically names and labels every per-attempt
+// resource. The digest keeps operator-provided identifiers out of runtime
+// names while labels retain the complete authority tuple for verification.
+type ResourceIdentity struct {
+	LeaseID     string            `json:"lease_id"`
+	SnapshotID  string            `json:"snapshot_id"`
+	ContainerID string            `json:"container_id"`
+	TaskID      string            `json:"task_id"`
+	Labels      map[string]string `json:"labels"`
+}
+
+func DeterministicResourceIdentity(authority AttemptAuthority) (ResourceIdentity, error) {
+	if err := authority.validate(); err != nil {
+		return ResourceIdentity{}, err
+	}
+	digest := sha256.Sum256([]byte(authority.key()))
+	suffix := hex.EncodeToString(digest[:16])
+	return ResourceIdentity{
+		LeaseID: "wefty-lease-" + suffix, SnapshotID: "wefty-snapshot-" + suffix,
+		ContainerID: "wefty-container-" + suffix, TaskID: "wefty-task-" + suffix,
+		Labels: map[string]string{
+			"io.wefty/node_id": authority.NodeID, "io.wefty/job_id": authority.JobID,
+			"io.wefty/attempt_id": authority.AttemptID, "io.wefty/fencing_token": authority.FencingToken,
+			"io.wefty/boot_session_id": authority.BootSessionID, "io.wefty/class": authority.Class,
+			"io.wefty/removal_generation": authority.RemovalGeneration,
+		},
+	}, nil
+}
+
+type DeadmanRenewal struct {
+	Authority AttemptAuthority `json:"authority"`
+	TTL       time.Duration    `json:"ttl"`
+}
+
+type HeartbeatRequest struct {
+	Sequence        uint64           `json:"sequence"`
+	RenewedAttempts []DeadmanRenewal `json:"renewed_attempts,omitempty"`
+}
+
+type EnsureImageRequest struct {
+	Reference string `json:"reference"`
+	Digest    string `json:"digest"`
+}
+
+type EnsureImageResponse struct {
+	TopLevelDigest string `json:"top_level_digest"`
+	PlatformDigest string `json:"platform_digest"`
+}
+
+type ImageEventKind string
+
+const (
+	ImageProgress ImageEventKind = "progress"
+	ImageComplete ImageEventKind = "complete"
+)
+
+// EnsureImageEvent is a closed stream event. Exactly one of Progress or
+// Result is populated according to Kind.
+type EnsureImageEvent struct {
+	Kind     ImageEventKind       `json:"kind"`
+	Progress *ImageProgressEvent  `json:"progress,omitempty"`
+	Result   *EnsureImageResponse `json:"result,omitempty"`
+}
+
+type ImageProgressEvent struct {
+	Status    string `json:"status"`
+	Completed int64  `json:"completed,omitempty"`
+	Total     int64  `json:"total,omitempty"`
+}
+
+type EnvironmentVariable struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type ManagedVolumeKind string
+
+const (
+	ManagedVolumeHandoff     ManagedVolumeKind = "handoff"
+	ManagedVolumeServiceData ManagedVolumeKind = "service_data"
+	ManagedVolumeLogSegments ManagedVolumeKind = "log_segments"
+)
+
+type ManagedVolumeDescriptor struct {
+	Kind     ManagedVolumeKind `json:"kind"`
+	ReadOnly bool              `json:"read_only,omitempty"`
+}
+
+type OperatorMount struct {
+	NodePath      string `json:"node_path"`
+	ContainerPath string `json:"container_path"`
+	ReadOnly      bool   `json:"read_only,omitempty"`
+}
+
+// WorkloadInput contains only the closed, validated inputs from which the
+// privileged helper constructs its runtime spec. A caller cannot supply OCI
+// JSON, namespaces, privileges, devices, or other runtime mechanics.
+type WorkloadInput struct {
+	ImageDigest      string                    `json:"image_digest"`
+	Argv             []string                  `json:"argv"`
+	WorkingDirectory string                    `json:"working_directory,omitempty"`
+	Environment      []EnvironmentVariable     `json:"environment,omitempty"`
+	ManagedVolumes   []ManagedVolumeDescriptor `json:"managed_volumes,omitempty"`
+	OperatorMounts   []OperatorMount           `json:"operator_mounts,omitempty"`
+}
+
+type RunRequest struct {
+	Authority                AttemptAuthority `json:"authority"`
+	InitialDeadman           time.Duration    `json:"initial_deadman"`
+	EnableHostBridgeFallback bool             `json:"enable_host_bridge_fallback,omitempty"`
+	Workload                 WorkloadInput    `json:"workload"`
+}
+
+type RunResponse struct {
+	Started          bool   `json:"started"`
+	AttemptPort      uint16 `json:"attempt_port,omitempty"`
+	HostBridgeReady  bool   `json:"host_bridge_ready,omitempty"`
+	BridgeCapability string `json:"bridge_capability,omitempty"`
+}
+
+type SignalRequest struct {
+	Authority AttemptAuthority `json:"authority"`
+	Signal    Signal           `json:"signal"`
+}
+
+type Signal string
+
+const (
+	SignalTERM Signal = "TERM"
+	SignalKILL Signal = "KILL"
+)
+
+type WatchRequest struct {
+	Authority AttemptAuthority `json:"authority"`
+}
+
+type WatchResponse struct {
+	ExitCode       *int   `json:"exit_code,omitempty"`
+	Signal         Signal `json:"signal,omitempty"`
+	OutOfMemory    bool   `json:"out_of_memory,omitempty"`
+	RuntimeFailure string `json:"runtime_failure,omitempty"`
+}
+
+type WatchEventKind string
+
+const (
+	WatchProgress WatchEventKind = "progress"
+	WatchComplete WatchEventKind = "complete"
+)
+
+type WatchEvent struct {
+	Kind   WatchEventKind `json:"kind"`
+	Status string         `json:"status,omitempty"`
+	Result *WatchResponse `json:"result,omitempty"`
+}
+
+type DeleteRequest struct {
+	Authority AttemptAuthority `json:"authority"`
+}
+
+type DeleteResponse struct {
+	Deleted bool `json:"deleted"`
+}
+
+type VerifyScope string
+
+const (
+	VerifyAttempt   VerifyScope = "attempt"
+	VerifyNamespace VerifyScope = "namespace"
+)
+
+type VerifyRequest struct {
+	Scope     VerifyScope       `json:"scope"`
+	Authority *AttemptAuthority `json:"authority,omitempty"`
+}
+
+type VerifyResponse struct {
+	Absent bool `json:"absent"`
+}
+
+// SweepRequest carries mechanics, not policy. Ticket #139 owns selection and
+// boot-barrier ordering; this protocol only serializes the operation.
+type SweepRequest struct{}
+
+type SweepResponse struct {
+	Removed int `json:"removed"`
+}
+
+type DialAttemptPortRequest struct {
+	Authority AttemptAuthority `json:"authority"`
+	Port      uint16           `json:"port"`
+}
+
+type DialHostBridgeRequest struct {
+	Authority        AttemptAuthority `json:"authority"`
+	BridgeCapability string           `json:"bridge_capability"`
+}
+
+func marshalBody(value any) (json.RawMessage, error) {
+	if value == nil {
+		return nil, nil
+	}
+	return json.Marshal(value)
+}
+
+func decodeBody(raw json.RawMessage, target any) error {
+	if len(raw) == 0 {
+		return errors.New("request body is required")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("request body contains trailing data")
+	}
+	return nil
+}
+
+func randomCapability() (string, error) {
+	value := make([]byte, 32)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value), nil
+}

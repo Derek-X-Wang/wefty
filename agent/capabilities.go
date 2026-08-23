@@ -43,6 +43,7 @@ type CapabilitySnapshot struct {
 // result from being assigned a newer revision after a more recent event.
 type capabilityState struct {
 	mu                         sync.RWMutex
+	claimPublication           sync.RWMutex
 	probeMu                    sync.Mutex
 	probeActive                bool
 	clock                      Clock
@@ -116,6 +117,11 @@ func (state *capabilityState) refresh(ctx context.Context) error {
 }
 
 func (state *capabilityState) record(result CapabilityProbeResult, probeErr error) {
+	// Linearize a completed observation after every claim RPC that began under
+	// the prior snapshot. Once a restrictive refresh returns, no stale in-flight
+	// claim can consume work created behind its publication barrier.
+	state.claimPublication.Lock()
+	defer state.claimPublication.Unlock()
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	capabilities := cloneCapabilities(state.base)
@@ -172,6 +178,14 @@ func (state *capabilityState) record(result CapabilityProbeResult, probeErr erro
 		ObservedAt: now, MissingCapabilities: missingCapabilities, ReasonCode: reason,
 	}
 	state.lastProbeAt = now
+}
+
+func (state *capabilityState) beginClaim() func() {
+	if state == nil {
+		return func() {}
+	}
+	state.claimPublication.RLock()
+	return state.claimPublication.RUnlock
 }
 
 func (state *capabilityState) snapshot() contract.CapabilityObservation {
