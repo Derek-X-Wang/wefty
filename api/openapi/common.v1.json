@@ -204,7 +204,7 @@
           "lost_event_count": { "type": "integer", "minimum": 1 },
           "lost_byte_count": { "type": "integer", "minimum": 1 },
           "reason": {
-            "enum": ["spool_eviction", "oversized_event", "replay_rejected", "late_evidence_window_expired"]
+            "enum": ["spool_eviction", "oversized_event", "replay_rejected", "late_evidence_window_expired", "logger_source_incomplete"]
           },
           "source_event_sha256": {
             "type": "string",
@@ -277,6 +277,10 @@
           "oom": {
             "type": "boolean",
             "description": "Additive runtime evidence. It does not select a primary result arm and is never inferred from exit 137."
+          },
+          "log_evidence_incomplete": {
+            "type": "boolean",
+            "description": "Additive evidence that a helper log segment was lost, corrupt, or truncated. The real terminal arm remains authoritative."
           }
         },
         "dependentRequired": {

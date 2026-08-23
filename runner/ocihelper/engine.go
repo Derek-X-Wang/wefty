@@ -3,11 +3,35 @@ package ocihelper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"time"
 )
 
-// Engine is the helper-internal mechanics seam. A containerd adapter will
-// implement it in a later ticket; no containerd request or type crosses RPC.
+const DefaultContainerdAddress = "/run/containerd/containerd.sock"
+
+// NativeEngineConfig contains only host-side helper configuration. The agent
+// never supplies these values over the helper protocol.
+type NativeEngineConfig struct {
+	Address             string
+	LoggerExecutable    string
+	RuntimeRoot         string
+	ContainerdStateRoot string
+	CgroupRoot          string
+	ResolverPath        string
+	HostsPath           string
+	AllowedMountRoots   []string
+	LogSealTimeout      time.Duration
+}
+
+// GuardianReaper preserves the helper deadman's signal initiator when the
+// concrete engine can obtain a real task signal-delivery acknowledgement.
+type GuardianReaper interface {
+	ReapAttemptAsGuardian(context.Context, AttemptAuthority) error
+}
+
+// Engine is the helper-internal mechanics seam. No containerd request or type
+// crosses RPC.
 type Engine interface {
 	EnsureImage(context.Context, EnsureImageRequest, func(EnsureImageEvent) error) error
 	Run(context.Context, RunRequest) (RunResponse, error)
@@ -22,11 +46,20 @@ type Engine interface {
 	ReapSession(context.Context, SessionIdentity) error
 }
 
-// UnavailableEngine keeps the private helper mode fail-closed until the native
-// containerd adapter lands. Tests supply a fake through RunInvocation.
+// UnavailableEngine keeps the private helper mode fail-closed on unsupported
+// hosts. Tests also use it when no real engine is required.
 type UnavailableEngine struct{}
 
 var errEngineUnavailable = errors.New("OCI engine adapter is not installed")
+
+// ImageUnavailableError separates missing/corrupt/unpacked local content from
+// loss of the containerd engine. Registry delivery remains outside this ticket.
+type ImageUnavailableError struct{ err error }
+
+func (failure *ImageUnavailableError) Error() string {
+	return fmt.Sprintf("OCI image unavailable: %v", failure.err)
+}
+func (failure *ImageUnavailableError) Unwrap() error { return failure.err }
 
 func (UnavailableEngine) EnsureImage(context.Context, EnsureImageRequest, func(EnsureImageEvent) error) error {
 	return errEngineUnavailable

@@ -111,6 +111,30 @@ func (operation *sessionOperation) monitorEOF() {
 	}()
 }
 
+func (operation *sessionOperation) monitorAcknowledgements() <-chan error {
+	acknowledged := make(chan error)
+	go func() {
+		defer close(acknowledged)
+		var value [1]byte
+		for {
+			_, err := io.ReadFull(operation.conn, value[:])
+			if err == nil && value[0] != 1 {
+				err = errors.New("invalid OCI watch acknowledgement")
+			}
+			select {
+			case acknowledged <- err:
+			case <-operation.ctx.Done():
+				return
+			}
+			if err != nil {
+				operation.cancel()
+				return
+			}
+		}
+	}()
+	return acknowledged
+}
+
 type serverSession struct {
 	server     *Server
 	identity   SessionIdentity
@@ -614,7 +638,7 @@ func (session *serverSession) watchAttempt(attempt *serverAttempt) {
 				resetTimerAt(timer, deadline)
 				continue
 			}
-			if err := session.reapAttempt(attempt, false); err != nil {
+			if err := session.reapAttempt(attempt, false, true); err != nil {
 				go session.invalidate("attempt deadman reap failed")
 			}
 			return
@@ -622,7 +646,7 @@ func (session *serverSession) watchAttempt(attempt *serverAttempt) {
 	}
 }
 
-func (session *serverSession) reapAttempt(attempt *serverAttempt, createGateHeld bool) error {
+func (session *serverSession) reapAttempt(attempt *serverAttempt, createGateHeld, guardian bool) error {
 	session.mu.Lock()
 	if session.closed {
 		session.mu.Unlock()
@@ -651,7 +675,16 @@ func (session *serverSession) reapAttempt(attempt *serverAttempt, createGateHeld
 		defer session.server.createSweep.RUnlock()
 	}
 	ctx, cancel := session.server.reapContext()
-	err := session.server.engine.ReapAttempt(ctx, attempt.authority)
+	var err error
+	if guardian {
+		if reaper, ok := session.server.engine.(GuardianReaper); ok {
+			err = reaper.ReapAttemptAsGuardian(ctx, attempt.authority)
+		} else {
+			err = session.server.engine.ReapAttempt(ctx, attempt.authority)
+		}
+	} else {
+		err = session.server.engine.ReapAttempt(ctx, attempt.authority)
+	}
 	cancel()
 	session.mu.Lock()
 	attempt.state = attemptTombstoned
@@ -751,17 +784,20 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			}
 		}
 		if err != nil {
-			reapErr := session.reapAttempt(attempt, true)
+			reapErr := session.reapAttempt(attempt, true, false)
 			server.createSweep.RUnlock()
 			if reapErr != nil {
 				go session.invalidate("ambiguous Run reap failed")
 			}
 			var rpcErr *RPCError
 			var specRejection *RuntimeSpecRejectionError
+			var imageUnavailable *ImageUnavailableError
 			if errors.As(err, &rpcErr) {
 				_ = writeRPCError(wire, rpcErr)
 			} else if errors.As(err, &specRejection) {
 				_ = writeFailure(wire, CodeOCISpecRejected, "OCI runtime spec was rejected")
+			} else if errors.As(err, &imageUnavailable) {
+				_ = writeFailure(wire, CodeImageUnavailable, "pinned local OCI image is unavailable")
 			} else {
 				_ = writeFailure(wire, CodeEngineFailure, "OCI engine operation failed")
 			}
@@ -769,7 +805,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		writeErr := writeSuccess(wire, response)
 		if writeErr != nil {
-			reapErr := session.reapAttempt(attempt, true)
+			reapErr := session.reapAttempt(attempt, true, false)
 			if reapErr != nil {
 				go session.invalidate("undeliverable Run evidence reap failed")
 			}
@@ -791,12 +827,20 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if !decodeRequest(wire, request.Body, &body) || !authorizeRequest(wire, session, body.Authority) {
 			return
 		}
-		operation.monitorEOF()
+		acknowledged := operation.monitorAcknowledgements()
 		err := server.engine.Watch(operation.ctx, body, func(event WatchEvent) error {
 			if err := validateWatchEvent(event); err != nil {
 				return err
 			}
-			return writeSuccess(wire, event)
+			if err := writeSuccess(wire, event); err != nil {
+				return err
+			}
+			select {
+			case err := <-acknowledged:
+				return err
+			case <-operation.ctx.Done():
+				return operation.ctx.Err()
+			}
 		})
 		writeStreamResult(wire, err)
 	case MethodDelete:
@@ -812,7 +856,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		operation.monitorEOF()
 		response, err := server.engine.Delete(operation.ctx, body)
 		if err == nil && response.Deleted {
-			err = session.reapAttempt(attempt, false)
+			err = session.reapAttempt(attempt, false, false)
 		}
 		_ = writeEngineResponse(wire, response, err)
 	case MethodVerify:
@@ -979,7 +1023,12 @@ func writeEngineResponse(connection *framedConn, response any, err error) error 
 
 func writeStreamResult(connection *framedConn, err error) {
 	if err != nil {
-		_ = writeFailure(connection, CodeEngineFailure, "OCI engine operation failed")
+		var imageUnavailable *ImageUnavailableError
+		if errors.As(err, &imageUnavailable) {
+			_ = writeFailure(connection, CodeImageUnavailable, "pinned local OCI image is unavailable")
+		} else {
+			_ = writeFailure(connection, CodeEngineFailure, "OCI engine operation failed")
+		}
 		return
 	}
 	_ = connection.write(frame{Version: ProtocolVersion, OK: true})

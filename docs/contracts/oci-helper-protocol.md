@@ -26,7 +26,8 @@ the client uses that advertised timeout for sweep and verification.
 
 Wire major `1` is carried on every request and response. A different major is
 rejected as `version_mismatch` before dispatch. `AcquireSession` also carries
-the agent's expected helper checksum when one is installed; a mismatch is
+the agent's required expected helper checksum; an empty expectation fails
+closed and a mismatch is
 `checksum_mismatch`. The response returns the helper version/checksum and the
 negotiated deadlines, but the opaque session capability remains process-local
 and must never enter logs, argv, evidence, or operator output.
@@ -128,11 +129,11 @@ heartbeats.
 
 | RPC | Scope and result |
 | --- | --- |
-| `EnsureImage` | Session-authorized, typed progress/result stream on a dedicated connection. Reference and digest enter; no containerd client or retry policy crosses the boundary. |
-| `Run` | Exact attempt authority, initial deadman, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Returns authoritative `Started`, the optional allocated attempt port, and an optional helper-issued Mac fallback bridge capability. |
+| `EnsureImage` | Session-authorized, typed progress/result stream on a dedicated connection. In #141 it is a probe-only verifier/unpacker for an already-preloaded immutable image; registry delivery remains #142. Reference and digest enter; no containerd client or retry policy crosses the boundary. |
+| `Run` | Exact attempt authority, initial deadman, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started` with helper-observed image evidence; optional service transport fields remain reserved. |
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. |
-| `Watch` | Exact live attempt; emits typed progress and structured result events on a dedicated connection. |
-| `Delete` | Exact live attempt only. A positive deletion tombstones its authorization for the remainder of the session. |
+| `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
+| `Delete` | Exact live attempt only. A positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments; only then does the server tombstone authorization. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly the port returned by that live attempt's `Run`; never a general guest dialer. |
@@ -253,6 +254,22 @@ io.wefty/class
 io.wefty/removal_generation
 ```
 
+The native Linux engine uses containerd namespace `wefty`, runtime handler
+`io.containerd.runc.v2`, and snapshotter `overlayfs`. It creates the labelled
+attempt lease first, prepares the writable snapshot under that lease, stores
+the canonical `wefty-v1` spec, creates the task with a `binary-v2` logger, and
+registers `Task.Wait` before calling `Task.Start`. The logger writes `WLF1`
+frames containing per-stream sequence, length, SHA-256, and bytes, followed by
+a per-stream pipe-EOF seal. `Watch` tails both append-only segments while the
+task runs and retains each segment until the corresponding events have been
+acknowledged into the agent's `OutputSink`. A corrupt, missing, or truncated
+record emits an exact gap when its discarded byte extent is known and always
+emits an incomplete seal; finalization is anchored on logger pipe EOF or that
+explicit incomplete seal, never file-size stability. The adapter
+persists helper-observed image identity and performs the fenced L1 `Started`
+mutation before it exposes local running state; a rejected acknowledgement
+kills and deletes the already-started task.
+
 `Run` takes the create side of one helper-wide gate; `Sweep` and namespace
 verification take its exclusive side. `Run` rechecks the verified bit only
 after acquiring its read side and reserves its attempt under that lock. Every
@@ -266,10 +283,18 @@ per-attempt lease first; its deterministic `wefty-lease-` name makes the
 create-before-label crash window independently discoverable. It then creates
 and labels every dependent resource under that lease (§5.2). Sweep and
 verification enumerate every resource class rather than trusting labels or a
-single total. Ticket #140 fills in the fixed isolation profile used for helper-side
-runtime-spec construction; the unprivileged agent never supplies OCI
-runtime-spec material. The later runtime ticket also owns the containerd
-adapter, logs, and real task lifecycle; packaging owns installed units and
+single total. All seven authority labels must reconstruct the deterministic
+identity exactly; unexpected containerd resources in namespace `wefty`, shim
+bundle entries under containerd's runtime-v2 state root, and cgroups found by a
+recursive scan of the configured cgroup hierarchy make absence verification
+fail. Filesystem and deletion errors are fatal except verified `NotFound`.
+Whole-namespace session reaping relies on the exclusive one-agent-per-node
+helper-session assumption, while volume deletion is scoped to identities
+recovered from swept attempts and never removes the whole `volumes/` tree.
+Ticket #140 supplies the fixed isolation profile used for
+helper-side runtime-spec construction; the unprivileged agent never supplies
+OCI runtime-spec material. This native adapter owns containerd mechanics, logs,
+and the real one-shot task lifecycle; packaging still owns installed units and
 socket activation.
 
 ## Agent-side client responsibilities
@@ -281,4 +306,16 @@ path and only when the returned directive is empty; failed, timed-out, stale,
 `stop`, and `restart` responses never refresh the helper deadman. The pump uses
 separate operation connections for image/watch streams so backpressure cannot
 starve session authority, and it locally verifies the returned helper checksum
-against the installed expectation before exposing the session.
+against a non-empty installed expectation before exposing the session.
+
+Prior-boot removal consumes a matching sweep attempt once. The match includes
+node, job, class, prior boot, attempt, fence, and removal generation, and the
+positive receipt is bound to both the sweep epoch and helper generation.
+
+When native OCI is configured, the production agent opens a boot barrier and
+installs the OCI adapter as one unit. It advertises `kind:oci`, `cgroup_v2`, and
+the runc-v2 handler only after a pinned local `/bin/true` probe creates, starts,
+waits for, and verifies deletion of a real task inside the ten-second probe
+deadline. The same probe runs through the existing startup and heartbeat
+capability refresh loop. Successful L1 renewals are mapped to the exact helper
+attempt tuple and queued on that session's heartbeat pump.

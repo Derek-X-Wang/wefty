@@ -181,7 +181,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	}()
 	completed := make(chan runOutcome, 1)
 	go func() {
-		if claim.Job.Spec.Class == contract.JobClassOneShot {
+		if claim.Job.Spec.Class == contract.JobClassOneShot && claim.Job.Spec.Kind != contract.JobKindOCI {
 			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptRunning, nil)
 		}
 		result, err := lifecycle.runWorkloadContexts(executionContext, finalization, claim, func(unlock func()) {
@@ -420,6 +420,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	authority := workloadrunner.AttemptAuthority{
 		NodeID: lifecycle.dependencies.nodeID, BootSessionID: lifecycle.dependencies.bootSessionID,
 		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
+		WorkloadClass: claim.Job.Spec.Class, RemovalGeneration: "attempt",
 	}
 	idlePolicy := workloadrunner.MonitorIdle
 	if claim.Job.Spec.Class == contract.JobClassService {
@@ -428,7 +429,32 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	request := workloadrunner.Request{
 		Authority: authority, RuntimeHandler: claim.Job.Spec.RuntimeHandler,
 		Execution: claim.Job.Spec.Execution, Limits: claim.Job.Spec.Limits,
-		IdlePolicy: idlePolicy,
+		IdlePolicy: idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
+	}
+	if claim.Job.Spec.Kind == contract.JobKindOCI {
+		request.OCIStarted = func(startContext context.Context, observation workloadrunner.OCIImageObservation) error {
+			if lifecycle.dependencies.client == nil {
+				return errors.New("OCI Started acknowledgement requires an L1 client")
+			}
+			_, err := lifecycle.dependencies.client.ObserveAttemptImage(startContext, claim.Job.JobID, claim.Lease.AttemptID, l1.ImageObservationRequest{
+				FencingToken:           claim.Lease.FencingToken,
+				SubmittedReference:     observation.SubmittedReference,
+				TopLevelDigest:         observation.TopLevelDigest,
+				TopLevelMediaType:      observation.TopLevelMediaType,
+				IndexDigest:            observation.IndexDigest,
+				PlatformManifestDigest: observation.PlatformManifestDigest,
+				Platform:               l1.OCIPlatform{OS: observation.PlatformOS, Architecture: observation.PlatformArchitecture, Variant: observation.PlatformVariant},
+				RuntimeHandler:         observation.RuntimeHandler, Snapshotter: observation.Snapshotter,
+			})
+			if err != nil {
+				return fmt.Errorf("record OCI image observation: %w", err)
+			}
+			if _, err := lifecycle.dependencies.client.StartAttempt(startContext, claim.Job.JobID, claim.Lease.AttemptID, l1.StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
+				return fmt.Errorf("acknowledge OCI Started: %w", err)
+			}
+			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptRunning, nil)
+			return nil
+		}
 	}
 	if claim.Job.Spec.Class == contract.JobClassService {
 		request.LifetimeBoundary = workloadrunner.AgentBootLifetime
@@ -759,6 +785,6 @@ func renewalRequestTimeout(remaining, operationTimeout time.Duration) time.Durat
 func toL1Result(result contract.ProcessResult) l1.ProcessResult {
 	return l1.ProcessResult{
 		SpawnError: result.SpawnError, RuntimeFailure: result.RuntimeFailure, OutputError: result.OutputError, ExitCode: result.ExitCode,
-		Signal: result.Signal, TerminationCause: result.TerminationCause, OOM: result.OOM,
+		Signal: result.Signal, TerminationCause: result.TerminationCause, OOM: result.OOM, LogEvidenceIncomplete: result.LogEvidenceIncomplete,
 	}
 }

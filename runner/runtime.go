@@ -4,6 +4,8 @@ package runner
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
@@ -34,6 +36,25 @@ type AttemptAuthority struct {
 	JobID         string
 	AttemptID     string
 	FencingToken  string
+	// WorkloadClass is carried only as immutable runtime-resource evidence. It
+	// never selects the adapter or its mechanics.
+	WorkloadClass     string
+	RemovalGeneration string
+}
+
+// OCIImageObservation is the helper-observed identity that must be stored
+// before authoritative OCI start can be acknowledged.
+type OCIImageObservation struct {
+	SubmittedReference     string
+	TopLevelDigest         string
+	TopLevelMediaType      string
+	IndexDigest            *string
+	PlatformManifestDigest string
+	PlatformOS             string
+	PlatformArchitecture   string
+	PlatformVariant        string
+	RuntimeHandler         string
+	Snapshotter            string
 }
 
 // ManagedResources is an opaque agent-owned handle. Adapters must not infer
@@ -53,6 +74,11 @@ type Request struct {
 	IdlePolicy       IdlePolicy
 	CompletionSignal <-chan struct{}
 	Started          func()
+	// OCIStarted hands helper-observed image identity to the agent, which
+	// persists it and then performs the fenced L1 Started mutation. The helper
+	// adapter must reap the task when this callback fails.
+	OCIStarted     func(context.Context, OCIImageObservation) error
+	InitialDeadman time.Duration
 	// TODO(#147): replace this process TCP backend with an adapter-supplied,
 	// opaque dial endpoint.
 	ServiceAddress   string
@@ -84,14 +110,21 @@ type ReapEvidence string
 const (
 	ReapEvidenceAttempt           ReapEvidence = "attempt"
 	ReapEvidencePriorBootGuardian ReapEvidence = "prior_boot_guardian"
+	ReapEvidencePriorBootOCISweep ReapEvidence = "prior_boot_oci_sweep"
 )
 
 // ReapReceipt is positive evidence that runtime-owned workload state is gone.
 type ReapReceipt struct {
-	RuntimeQuiesced bool
-	Evidence        ReapEvidence
-	BootSessionID   string
+	RuntimeQuiesced  bool
+	Evidence         ReapEvidence
+	BootSessionID    string
+	SweepEpoch       string
+	HelperGeneration uint64
 }
+
+// ErrPriorBootEvidenceUnavailable lets the agent try the other kind-specific
+// reaper without treating absence of OCI sweep evidence as positive proof.
+var ErrPriorBootEvidenceUnavailable = errors.New("prior-boot runtime evidence is unavailable")
 
 // PriorBootReapRequest asks a runtime to verify the boot boundary for a
 // service whose attempt was owned by an earlier agent boot.

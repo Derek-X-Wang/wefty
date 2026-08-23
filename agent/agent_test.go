@@ -204,6 +204,14 @@ func TestRunWorkloadReportsOutputFinalizationFailureInsteadOfExitZero(t *testing
 	}
 }
 
+func TestToL1ResultPreservesIncompleteOCILogEvidence(t *testing.T) {
+	exitCode := 7
+	result := toL1Result(contract.ProcessResult{ExitCode: &exitCode, LogEvidenceIncomplete: true})
+	if result.ExitCode == nil || *result.ExitCode != exitCode || !result.LogEvidenceIncomplete {
+		t.Fatalf("L1 completion result = %#v", result)
+	}
+}
+
 func TestConsoleMirrorFailurePolicyDependsOnWorkloadClass(t *testing.T) {
 	assertConsoleMirrorFailurePolicyByClass(t)
 }

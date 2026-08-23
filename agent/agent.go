@@ -225,15 +225,31 @@ func New(config Config) (*Agent, error) {
 		})
 	}
 	if resource, ok := managedResource.(*processManagedResource); ok && resource.previousBootSessionID != "" {
-		if adapter, found := runtimes.selectKind(contract.JobKindProcess); found {
-			if reaper, ok := adapter.(workloadrunner.PriorBootReaper); ok {
-				session.reapPriorBoot = func(ctx context.Context, jobID string) (workloadrunner.ReapReceipt, error) {
-					return reaper.ReapPriorBoot(ctx, workloadrunner.PriorBootReapRequest{
-						NodeID: config.NodeID, JobID: jobID,
-						PriorBootSessionID:   resource.previousBootSessionID,
-						CurrentBootSessionID: config.BootSessionID,
-					})
+		var priorBootReapers []workloadrunner.PriorBootReaper
+		for _, kind := range []string{contract.JobKindOCI, contract.JobKindProcess} {
+			if adapter, found := runtimes.selectKind(kind); found {
+				if reaper, supported := adapter.(workloadrunner.PriorBootReaper); supported {
+					priorBootReapers = append(priorBootReapers, reaper)
 				}
+			}
+		}
+		if len(priorBootReapers) > 0 {
+			session.reapPriorBoot = func(ctx context.Context, jobID string) (workloadrunner.ReapReceipt, error) {
+				request := workloadrunner.PriorBootReapRequest{NodeID: config.NodeID, JobID: jobID, PriorBootSessionID: resource.previousBootSessionID, CurrentBootSessionID: config.BootSessionID}
+				var failures []error
+				for _, reaper := range priorBootReapers {
+					receipt, reapErr := reaper.ReapPriorBoot(ctx, request)
+					if reapErr == nil {
+						return receipt, nil
+					}
+					if !errors.Is(reapErr, workloadrunner.ErrPriorBootEvidenceUnavailable) {
+						failures = append(failures, reapErr)
+					}
+				}
+				if len(failures) > 0 {
+					return workloadrunner.ReapReceipt{}, errors.Join(failures...)
+				}
+				return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
 			}
 		}
 	}

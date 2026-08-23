@@ -1674,7 +1674,7 @@ func validateLogEvent(attemptID string, event contract.LogEvent) error {
 		return protocolError(contract.ErrorInvalidRequest, "log gap range, event count, and byte count are inconsistent")
 	}
 	switch gap.Reason {
-	case contract.LogGapSpoolEviction, contract.LogGapOversizedEvent, contract.LogGapReplayRejected, contract.LogGapLateEvidenceWindowExpired:
+	case contract.LogGapSpoolEviction, contract.LogGapOversizedEvent, contract.LogGapReplayRejected, contract.LogGapLateEvidenceWindowExpired, contract.LogGapLoggerSourceIncomplete:
 	default:
 		return protocolError(contract.ErrorInvalidRequest, "log gap reason %q is invalid", gap.Reason)
 	}
@@ -2079,8 +2079,8 @@ func validateOCICompletionPhase(attempt attemptAuthority, result ProcessResult) 
 		return nil
 	}
 	if !attempt.startedNS.Valid {
-		if result.SpawnError == nil || result.OOM {
-			return protocolError(contract.ErrorConflict, "pre-Started OCI completion requires a sole spawn_error without OOM evidence")
+		if result.SpawnError == nil || result.OOM || result.LogEvidenceIncomplete {
+			return protocolError(contract.ErrorConflict, "pre-Started OCI completion requires a sole spawn_error without additive runtime evidence")
 		}
 		return nil
 	}

@@ -194,13 +194,14 @@ type NodeList struct {
 // makes incomplete durable output a terminal failure rather than false success;
 // signal outcomes carry a structured termination initiator.
 type ProcessResult struct {
-	SpawnError       *contract.SpawnFailure    `json:"spawn_error,omitempty"`
-	RuntimeFailure   *contract.RuntimeFailure  `json:"runtime_failure,omitempty"`
-	OutputError      string                    `json:"output_error,omitempty"`
-	ExitCode         *int                      `json:"exit_code,omitempty"`
-	Signal           string                    `json:"signal,omitempty"`
-	TerminationCause contract.TerminationCause `json:"termination_cause,omitempty"`
-	OOM              bool                      `json:"oom,omitempty"`
+	SpawnError            *contract.SpawnFailure    `json:"spawn_error,omitempty"`
+	RuntimeFailure        *contract.RuntimeFailure  `json:"runtime_failure,omitempty"`
+	OutputError           string                    `json:"output_error,omitempty"`
+	ExitCode              *int                      `json:"exit_code,omitempty"`
+	Signal                string                    `json:"signal,omitempty"`
+	TerminationCause      contract.TerminationCause `json:"termination_cause,omitempty"`
+	OOM                   bool                      `json:"oom,omitempty"`
+	LogEvidenceIncomplete bool                      `json:"log_evidence_incomplete,omitempty"`
 }
 
 // OCIImageEvidence is the fenced image and runtime identity observed before

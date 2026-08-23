@@ -202,7 +202,8 @@ promotes: only `Started` does.
 
 A gap declaration uses `LogEvent.sequence` as the first lost sequence and
 `gap.through_sequence` as the inclusive last sequence. Gaps advance continuity
-only for their declared stream. Agent spool eviction sends `spool_eviction`; an
+only for their declared stream. A truncated or corrupt helper segment sends
+`logger_source_incomplete`; agent spool eviction sends `spool_eviction`; an
 event larger than the entire service spool budget is converted whole into one
 `oversized_event` gap rather than chunked or partially retained. A locally
 durable event that L1 permanently rejects while its attempt is still
@@ -419,8 +420,9 @@ initiator; policy never parses a signal or error string to infer intent.
 `ProcessResult` has exactly one primary arm: `spawn_error`, `runtime_failure`,
 `output_error`, `exit_code`, or `signal`. `runtime_failure {code,message}` is
 post-`Started` helper/engine-loss evidence; unknown or unlisted codes are
-terminal. OOM is an additive boolean fact, never another primary arm and never
-inferred from exit 137. A signal still requires exactly one termination cause.
+terminal. OOM and `log_evidence_incomplete` are additive boolean facts, never
+another primary arm; OOM is never inferred from exit 137, and log corruption
+never replaces a real exit result. A signal still requires exactly one termination cause.
 For OCI, L1 validates that arm against durable `started_at` before accepting
 authoritative or late evidence: pre-start accepts only a sole `spawn_error`
 without OOM, while post-start rejects `spawn_error`.

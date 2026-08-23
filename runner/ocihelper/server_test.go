@@ -372,6 +372,21 @@ func TestClientVerifiesReturnedChecksumLocally(t *testing.T) {
 	assertRPCCode(t, err, CodeChecksumMismatch)
 }
 
+func TestClientRequiresChecksumBeforeDial(t *testing.T) {
+	dialed := false
+	client := &Client{Dial: func(context.Context) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("unexpected dial")
+	}}
+	_, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err == nil || !strings.Contains(err.Error(), "checksum verification is required") {
+		t.Fatalf("OpenSession error = %v, want checksum refusal", err)
+	}
+	if dialed {
+		t.Fatal("client dialed helper before requiring a checksum")
+	}
+}
+
 func TestExclusiveSessionEOFAndHeartbeatBlackholeFailClosed(t *testing.T) {
 	engine := newFakeEngine()
 	clock := newManualClock(time.Unix(10_000, 0))
@@ -453,6 +468,24 @@ func TestHeartbeatRefreshesOnlyExactLiveAttemptDeadman(t *testing.T) {
 		err = session.flushHeartbeat(t.Context())
 	}
 	assertRPCCode(t, err, CodeUnauthorizedAttempt)
+}
+
+func TestAttemptDeadmanUsesGuardianReaper(t *testing.T) {
+	engine := &guardianRecordingEngine{fakeEngine: newFakeEngine()}
+	clock := newManualClock(time.Unix(25_000, 0))
+	client, stop := startTestServer(t, engine, ServerConfig{Clock: clock, HeartbeatTimeout: time.Hour, MaximumAttemptDeadman: time.Minute})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	if _, err := session.Run(t.Context(), testRunRequest(testAuthority(), time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	waitFor(t, time.Second, func() bool { return engine.guardianCount() == 1 }, "guardian deadman reap")
 }
 
 func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
@@ -865,6 +898,37 @@ func TestSessionReapJoinsEveryOperationBeforeExclusiveReap(t *testing.T) {
 	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 1 }, "joined session reap")
 }
 
+func TestControlLossCancelsBlockedWatchBeforeSessionReap(t *testing.T) {
+	engine := &blockingWatchEngine{fakeEngine: newFakeEngine(), entered: make(chan struct{})}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireSweep(t, session)
+	if _, err := session.Run(t.Context(), testRunRequest(testAuthority(), time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	watchDone := make(chan error, 1)
+	go func() {
+		watchDone <- session.Watch(context.Background(), WatchRequest{Authority: testAuthority()}, nil)
+	}()
+	<-engine.entered
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-watchDone:
+		if err == nil {
+			t.Fatal("control-loss Watch returned success")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("control loss deadlocked blocked Watch")
+	}
+	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 1 }, "session reap after Watch cancellation")
+}
+
 func pointerTo[T any](value T) *T { return &value }
 
 func testAuthority() AttemptAuthority {
@@ -997,6 +1061,36 @@ type fakeEngine struct {
 	releaseSignal   chan struct{}
 	sessionReapErr  error
 	verifyResponses []VerifyResponse
+}
+
+type blockingWatchEngine struct {
+	*fakeEngine
+	entered chan struct{}
+}
+
+type guardianRecordingEngine struct {
+	*fakeEngine
+	guardianMu sync.Mutex
+	guardians  int
+}
+
+func (engine *guardianRecordingEngine) ReapAttemptAsGuardian(ctx context.Context, authority AttemptAuthority) error {
+	engine.guardianMu.Lock()
+	engine.guardians++
+	engine.guardianMu.Unlock()
+	return engine.fakeEngine.ReapAttempt(ctx, authority)
+}
+
+func (engine *guardianRecordingEngine) guardianCount() int {
+	engine.guardianMu.Lock()
+	defer engine.guardianMu.Unlock()
+	return engine.guardians
+}
+
+func (engine *blockingWatchEngine) Watch(ctx context.Context, _ WatchRequest, _ func(WatchEvent) error) error {
+	close(engine.entered)
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 type crashBoundaryEngine struct {
