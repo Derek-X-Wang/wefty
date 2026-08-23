@@ -382,6 +382,10 @@ func TestTimeoutTerminatesThenKillsEntireProcessGroup(t *testing.T) {
 	}, sink)
 
 	childPID := eventPID(t, sink.Next(t))
+	// The PID event is delivered from inside the output writer. Let that real
+	// OS/process boundary return before advancing the injected idle clock, so
+	// termination cannot overtake the writer that proves signal delivery.
+	time.Sleep(50 * time.Millisecond)
 	clock.WaitForTimerCount(t, 1)
 	clock.Advance(10 * time.Second)
 	if event := sink.Next(t); !bytes.Contains(event.Bytes, []byte("term")) {

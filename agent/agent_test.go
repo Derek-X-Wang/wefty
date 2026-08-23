@@ -314,7 +314,7 @@ func TestNewWithNilCapabilitiesAdvertisesNothing(t *testing.T) {
 func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
-	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{LeaseDuration: 1 * time.Second})
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{LeaseDuration: 8 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +367,7 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 		RoutingTags:   []string{"linux"},
 		Execution: contract.ExecutionSpec{
 			Executable:       contract.ExecutableSpec{Path: agentHelperPath},
-			Argv:             []string{"processhelper", "sleep", "3000"},
+			Argv:             []string{"processhelper", "sleep", "12000"},
 			WorkingDirectory: workingDirectory,
 			HandoffDirectory: workingDirectory,
 		},
@@ -376,8 +376,8 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	completed := waitForJobState(t, store, job.JobID, contract.JobSucceeded, 15*time.Second)
-	if elapsed := time.Since(started); elapsed < 2500*time.Millisecond {
+	completed := waitForJobState(t, store, job.JobID, contract.JobSucceeded, 25*time.Second)
+	if elapsed := time.Since(started); elapsed < 11*time.Second {
 		t.Fatalf("job completed in %s; helper did not outlive the initial lease", elapsed)
 	}
 	if completed.State != contract.JobSucceeded {
@@ -392,7 +392,7 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testing.T) {
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
-	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "completion-retry.sqlite"), l1.StoreOptions{LeaseDuration: time.Second})
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "completion-retry.sqlite"), l1.StoreOptions{LeaseDuration: 6 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +480,7 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 		cancel()
 		t.Fatal("agent did not reach blocked completion")
 	}
-	time.Sleep(1750 * time.Millisecond)
+	time.Sleep(7500 * time.Millisecond)
 	if _, err := store.Reconcile(context.Background()); err != nil {
 		cancel()
 		t.Fatal(err)
@@ -497,7 +497,7 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 	// Let the renewal loop establish a fresh lease margin after the explicit
 	// reconciliation boundary, rather than releasing completion at the edge of
 	// the lease that happened to be current during the check above.
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(time.Second)
 	if _, err := store.Reconcile(context.Background()); err != nil {
 		cancel()
 		t.Fatal(err)

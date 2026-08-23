@@ -16,6 +16,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -56,20 +57,23 @@ type Config struct {
 	CapabilityProbe CapabilityProbe
 	// CapabilityProbeTimeout bounds one functional probe. Zero uses ten seconds.
 	CapabilityProbeTimeout time.Duration
-	HeartbeatInterval      time.Duration
-	ClaimInterval          time.Duration
-	RenewalInterval        time.Duration
-	MaxOneshotSlots        int
-	MaxServiceSlots        int
-	OperationTimeout       time.Duration
-	FinalizationTimeout    time.Duration
-	LogBatchSize           int
-	LogFlushInterval       time.Duration
-	LogRetryInterval       time.Duration
-	LogSpoolDirectory      string
-	LogSpoolMaxBytes       int64
-	ManagedRootDirectory   string
-	GuardianExecutable     string
+	// OCIBootBarrier must prove exclusive sweep and namespace absence before
+	// the functional probe can earn OCI capability publication.
+	OCIBootBarrier       OCIBootBarrier
+	HeartbeatInterval    time.Duration
+	ClaimInterval        time.Duration
+	RenewalInterval      time.Duration
+	MaxOneshotSlots      int
+	MaxServiceSlots      int
+	OperationTimeout     time.Duration
+	FinalizationTimeout  time.Duration
+	LogBatchSize         int
+	LogFlushInterval     time.Duration
+	LogRetryInterval     time.Duration
+	LogSpoolDirectory    string
+	LogSpoolMaxBytes     int64
+	ManagedRootDirectory string
+	GuardianExecutable   string
 	// WorkloadRuntimes supplies open kind adapters. kind=process is installed
 	// by default and may be replaced through this map. A capability may be
 	// advertised without a matching local adapter, in which case local
@@ -129,6 +133,9 @@ func New(config Config) (*Agent, error) {
 	}
 	if config.MaxOneshotSlots < 0 || config.MaxServiceSlots < 0 {
 		return nil, errors.New("agent: local slot limits cannot be negative")
+	}
+	if config.CapabilityProbe != nil && config.OCIBootBarrier == nil {
+		return nil, errors.New("agent: OCI capability probe requires a boot barrier")
 	}
 	osName := config.OS
 	if osName == "" {
@@ -211,12 +218,16 @@ func New(config Config) (*Agent, error) {
 		intOrDefault(config.MaxOneshotSlots, l1.DefaultMaxOneshotSlots),
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
+	session.ociBootBarrier = config.OCIBootBarrier
+	if session.ociBootBarrier != nil {
+		session.ociBootBarrier.SetLossHandler(func(_ ocihelper.HelperSession, lossErr error) {
+			capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, lossErr)
+		})
+	}
 	if resource, ok := managedResource.(*processManagedResource); ok && resource.previousBootSessionID != "" {
 		if adapter, found := runtimes.selectKind(contract.JobKindProcess); found {
 			if reaper, ok := adapter.(workloadrunner.PriorBootReaper); ok {
 				session.reapPriorBoot = func(ctx context.Context, jobID string) (workloadrunner.ReapReceipt, error) {
-					// TODO(#139): the OCI boot-sweep receipt plugs into this same
-					// runtime-neutral path when the OCI adapter exists.
 					return reaper.ReapPriorBoot(ctx, workloadrunner.PriorBootReapRequest{
 						NodeID: config.NodeID, JobID: jobID,
 						PriorBootSessionID:   resource.previousBootSessionID,
@@ -263,6 +274,13 @@ func (a *Agent) Close() {
 	if a.nodeLock != nil {
 		if err := a.nodeLock.Close(); err != nil {
 			a.log("release stable-node lock: %v", err)
+		}
+	}
+	if a.session != nil {
+		if a.session.ociBootBarrier != nil {
+			if err := a.session.ociBootBarrier.Close(); err != nil {
+				a.log("close OCI boot barrier: %v", err)
+			}
 		}
 	}
 }
@@ -389,13 +407,31 @@ func (a *Agent) CapabilitySnapshot() CapabilitySnapshot {
 	return a.capabilities.capabilitySnapshot()
 }
 
-// ProbeCapabilities records an event-triggered probe observation. A failed
-// probe is applied before its diagnostic error is returned.
-func (a *Agent) ProbeCapabilities(ctx context.Context) error {
-	if a == nil || a.capabilities == nil {
+// RecoverOCIRuntimeCapabilities performs the full event-triggered OCI recovery
+// transaction: restrictive publication, barrier takeover, removal resumption,
+// functional probe, generation recheck, and positive publication.
+func (a *Agent) RecoverOCIRuntimeCapabilities(ctx context.Context) error {
+	if a == nil || a.capabilities == nil || a.session == nil {
 		return nil
 	}
-	return a.capabilities.refresh(ctx)
+	if a.session.ociBootBarrier == nil {
+		return a.capabilities.refresh(ctx)
+	}
+	generation, err := a.session.recoverOCIRuntime(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = a.session.publishCapabilityHeartbeat(ctx, &generation)
+	return err
+}
+
+// OCISweepReceipt returns a defensive copy of the currently pinned verified
+// sweep proof for runtime adapters and removal validation.
+func (a *Agent) OCISweepReceipt() (ocihelper.VerifiedSweepReceipt, bool) {
+	if a == nil || a.session == nil || a.session.ociBootBarrier == nil {
+		return ocihelper.VerifiedSweepReceipt{}, false
+	}
+	return a.session.ociBootBarrier.SweepReceipt()
 }
 
 func (a *Agent) sessionClient() *Client {

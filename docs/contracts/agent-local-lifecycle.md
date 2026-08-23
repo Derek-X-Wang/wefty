@@ -52,6 +52,28 @@ local; only the stable reason code and bounded missing set cross into L1.
 Capability observation and its publication barrier are independent of durable
 `claims_enabled` intent.
 
+An OCI functional probe cannot be configured without an OCI boot barrier and
+cannot run directly. Registration carries a restrictive boot-sweep observation
+and asks L1 to atomically assign stored same-boot revision `N+1`; the response
+therefore both establishes node authority and removes a stale badge without a
+second registration or authority-generation bump. Pending process-service
+removal resumption runs unconditionally after that registration, even if helper
+takeover, sweep, or verification failed. Only OCI probing and positive
+publication depend on a successful barrier.
+
+The successful path pins the opaque helper process/session generation across
+sweep, verification, removal resumption, and probe, rechecks it while holding
+the claim-publication lock immediately before and after the `N+2` heartbeat,
+and opens claims only after L1 acknowledges that revision. If the generation
+changes during that heartbeat, the same locked transaction publishes a newer
+restrictive revision before claim admission can reopen. Helper heartbeat-pump
+loss synchronously records a newer restrictive local revision behind the same lock;
+new claim RPCs then remain paused until that restriction is published. A helper
+bounce publishes the restriction before reacquisition and runs removal recovery
+on that event path; ordinary healthy heartbeats probe without rescanning the
+filesystem. `boot_sweep_failed` is the bounded L1 reason for an incomplete
+sweep/verify/removal-resume barrier, while detailed errors remain local.
+
 ## Workload runtime selection
 
 The agent selects exactly one `WorkloadRuntime` by the job's open `kind` after
@@ -78,9 +100,9 @@ full-authority `attempt` evidence. When a removal directive first reaches a
 returning node after an offline agent boot, the process adapter may instead
 issue `prior_boot_guardian`: the prior boot differs from its configured current
 boot and Guardian's disconnect contract reaped that boot's guarded payloads.
-Same-boot removal never falls back to this proof. Ticket #139 supplies the OCI
-equivalent from its boot sweep, while #150 persists removal receipts across
-mid-removal crashes.
+Same-boot removal never falls back to this proof. The OCI boot barrier supplies
+the equivalent namespace sweep evidence to the OCI adapter, while #150 persists
+removal receipts across mid-removal crashes.
 
 For `kind=process`, `Run` already waits for process or Guardian reaping, so the
 receipt verifies that blocking return contract. Inline executable decoding,

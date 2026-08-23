@@ -36,17 +36,20 @@ type Session struct {
 	controlWire *framedConn
 	response    AcquireSessionResponse
 
-	controlMu  sync.Mutex
-	queueMu    sync.Mutex
-	pending    map[string]pendingRenewal
-	queueToken uint64
-	sequence   uint64
-	queued     chan struct{}
-	pumpCtx    context.Context
-	pumpCancel context.CancelFunc
-	pumpDone   chan struct{}
-	pumpErr    error
-	closeOnce  sync.Once
+	controlMu   sync.Mutex
+	queueMu     sync.Mutex
+	pending     map[string]pendingRenewal
+	queueToken  uint64
+	sequence    uint64
+	queued      chan struct{}
+	pumpCtx     context.Context
+	pumpCancel  context.CancelFunc
+	pumpDone    chan struct{}
+	pumpErr     error
+	lossHandler func(error)
+	closed      bool
+	closeOnce   sync.Once
+	lossOnce    sync.Once
 }
 
 func (client *Client) protocolVersion() int {
@@ -89,7 +92,8 @@ func (client *Client) OpenSession(ctx context.Context, request AcquireSessionReq
 		return nil, err
 	}
 	_ = connection.SetDeadline(time.Time{})
-	if response.ProtocolVersion != client.protocolVersion() || response.SessionCapability == "" {
+	if response.ProtocolVersion != client.protocolVersion() || response.SessionCapability == "" ||
+		response.HelperInstanceID == "" || response.SessionGeneration == 0 || response.ReapTimeout <= 0 {
 		_ = connection.Close()
 		return nil, errors.New("OCI helper returned an invalid handshake")
 	}
@@ -126,11 +130,45 @@ func (session *Session) Close() error {
 	}
 	var err error
 	session.closeOnce.Do(func() {
+		session.queueMu.Lock()
+		session.closed = true
+		session.queueMu.Unlock()
 		session.pumpCancel()
 		err = session.control.Close()
 		<-session.pumpDone
 	})
 	return err
+}
+
+// HealthError reports whether the exclusive helper session can still be used.
+// A disabled heartbeat pump is a test-only mode and remains healthy until
+// Close; production sessions fail here as soon as their pump loses authority.
+func (session *Session) HealthError() error {
+	if session == nil {
+		return errors.New("OCI helper session is unavailable")
+	}
+	session.queueMu.Lock()
+	defer session.queueMu.Unlock()
+	if session.closed {
+		return errors.New("OCI helper session is closed")
+	}
+	return session.pumpErr
+}
+
+// SetLossHandler installs the callback run synchronously by the heartbeat
+// pump after helper authority is known lost and before the pump exits.
+func (session *Session) SetLossHandler(handler func(error)) {
+	if session == nil {
+		return
+	}
+	session.queueMu.Lock()
+	session.lossHandler = handler
+	lossErr := session.pumpErr
+	closed := session.closed
+	session.queueMu.Unlock()
+	if handler != nil && lossErr != nil && !closed {
+		handler(lossErr)
+	}
 }
 
 // QueueAttemptRenewal records successful L1 lease evidence for the heartbeat
@@ -184,9 +222,7 @@ func (session *Session) heartbeatPump() {
 		err := session.flushHeartbeat(ctx)
 		cancel()
 		if err != nil {
-			session.queueMu.Lock()
-			session.pumpErr = err
-			session.queueMu.Unlock()
+			session.markLost(err)
 			_ = session.control.Close()
 			return
 		}
@@ -312,7 +348,9 @@ func (session *Session) call(ctx context.Context, method Method, request, respon
 		return err
 	}
 	defer connection.Close()
-	return decodeResponse(wire, response)
+	err = decodeResponse(wire, response)
+	session.markStaleResponse(err)
+	return err
 }
 
 func (session *Session) stream(ctx context.Context, method Method, request any, receive func(*framedConn, frame) error) error {
@@ -330,6 +368,7 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 			return &RPCError{Code: CodeVersionMismatch, Message: "helper response used an unsupported version"}
 		}
 		if response.Error != nil {
+			session.markStaleResponse(response.Error)
 			return response.Error
 		}
 		if !response.OK {
@@ -350,6 +389,7 @@ func (session *Session) openStream(ctx context.Context, method Method, request a
 		return nil, err
 	}
 	if err := decodeResponse(wire, &struct{}{}); err != nil {
+		session.markStaleResponse(err)
 		_ = connection.Close()
 		return nil, err
 	}
@@ -362,6 +402,33 @@ func (session *Session) openStream(ctx context.Context, method Method, request a
 		return nil, err
 	}
 	return connection, nil
+}
+
+func (session *Session) markStaleResponse(err error) {
+	var rpcErr *RPCError
+	if errors.As(err, &rpcErr) && rpcErr.Code == CodeSessionStale {
+		session.markLost(err)
+	}
+}
+
+func (session *Session) markLost(err error) {
+	if session == nil || err == nil {
+		return
+	}
+	session.lossOnce.Do(func() {
+		session.queueMu.Lock()
+		if session.closed {
+			session.queueMu.Unlock()
+			return
+		}
+		session.pumpErr = err
+		handler := session.lossHandler
+		session.queueMu.Unlock()
+		if handler != nil {
+			handler(err)
+		}
+		_ = session.control.Close()
+	})
 }
 
 func (session *Session) dialRequest(ctx context.Context, method Method, request any) (net.Conn, *framedConn, error) {

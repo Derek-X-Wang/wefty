@@ -710,4 +710,9 @@ type NodeRegistration struct {
 	CapabilityObservedAt time.Time            `json:"capability_observed_at"`
 	MissingCapabilities  []string             `json:"missing_capabilities"`
 	CapabilityReasonCode CapabilityReasonCode `json:"capability_reason_code,omitempty"`
+	// SupersedeCapabilityRevision asks L1 to atomically assign stored N+1 to
+	// this restrictive same-boot observation. It is reserved for a runtime
+	// authority barrier that must revoke stale advertised capability before it
+	// can learn the stored revision.
+	SupersedeCapabilityRevision bool `json:"supersede_capability_revision,omitempty"`
 }

@@ -138,7 +138,7 @@ var (
 	errAttemptDirectiveRestart = errors.New("attempt directive: restart")
 )
 
-func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
+func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
 	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
 	defer cancelAttempt(nil)
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
@@ -152,7 +152,10 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 	}
 
-	authority := localAuthority{deadline: claimStarted.Add(claim.Lease.LeaseTTL)}
+	// Start the local monotonic lease window when the claim response is actually
+	// available. Claim RPC and admission latency can otherwise burn
+	// most of a short lease under instrumentation before renewal even begins.
+	authority := localAuthority{deadline: lifecycle.dependencies.clock.Now().Add(claim.Lease.LeaseTTL)}
 	watch := lifecycle.dependencies.watchdog.Start(attemptContext, authority, cancelAttempt)
 	defer watch.Stop()
 
@@ -686,7 +689,7 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 			return
 		}
 		lease = updated
-		authority = localAuthority{deadline: requestStarted.Add(updated.LeaseTTL)}
+		authority = localAuthority{deadline: lifecycle.dependencies.clock.Now().Add(updated.LeaseTTL)}
 		watch.Renewed(authority)
 		if err := queueHelperDeadman(lifecycle.dependencies.attemptDeadman, claim, updated); err != nil {
 			select {

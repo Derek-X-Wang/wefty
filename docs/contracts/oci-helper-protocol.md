@@ -19,7 +19,10 @@ its configured UID allowlist and binds the session to the kernel credential.
 Linux `SO_PEERCRED.gid` is only the process primary GID, so it is deliberately
 not treated as proof of supplementary `wefty-oci` membership. A connection
 that lacks a Unix credential or an allowed UID receives
-`peer_unauthenticated` and cannot mint a session capability.
+`peer_unauthenticated` and cannot mint a session capability. A successful
+handshake also returns a non-secret helper-instance ID, a monotonically
+increasing process-local session generation, and the configured reap timeout;
+the client uses that advertised timeout for sweep and verification.
 
 Wire major `1` is carried on every request and response. A different major is
 rejected as `version_mismatch` before dispatch. `AcquireSession` also carries
@@ -56,6 +59,39 @@ then calls the engine's boot-session reap. A new session is not issued until
 that reap succeeds. If reap fails, the listener closes and `Serve` fails so
 socket activation can start a fresh helper and boot sweep; the failed process
 never restores authority or remains indefinitely `session_busy`.
+
+## Boot sweep barrier
+
+Helper process startup takes the exclusive create/sweep gate, sweeps every
+resource in the `wefty` namespace, and verifies namespace absence before the
+listener accepts a session. Startup failure terminates `Serve`; it never leaves
+a helper accepting authority against unverified runtime state.
+
+Every acquired agent session repeats that proof. Its admission state begins
+unswept, a successful `Sweep` records only a pending verification, and only a
+subsequent namespace `Verify` returning `absent=true` opens OCI operations for
+that session. Sweep readiness is never inherited from an earlier session, even
+when node and boot-session IDs are textually identical. A failed or negative
+verification keeps every engine operation other than `Sweep` and namespace
+`Verify` behind `sweep_required`.
+
+The client-side boot barrier waits for an incumbent session's monotonic
+heartbeat deadline and reap rather than preempting it, then acquires exclusive
+authority and performs sweep plus verification. It reuses that proof only while
+the acquired session remains healthy; replacement authority always repeats the
+whole barrier and never adopts a survivor. Helper startup and client takeover
+are bounded by the configured reap deadline and the caller's earlier deadline.
+The takeover retry timer uses the injected helper clock. The heartbeat pump
+notifies the barrier synchronously when control authority is lost.
+
+Successful verification produces an immutable receipt retained by the client
+barrier. It names the sweep epoch and helper process/session generation and
+copies the prior boot sessions, class-separated swept inventory, independent
+post-sweep inventory, and recovered `(removal_generation, attempt_id,
+fencing_token, prior_boot_session_id)` tuples. A helper-startup sweep is folded
+into the first session receipt so evidence is not discarded before session
+acquisition. This is evidence for the later runtime/removal adapter; this
+protocol ticket does not itself persist a deletion manifest or removal receipt.
 
 ## Attempt authority and deadmen
 
@@ -98,7 +134,7 @@ heartbeats.
 | `Watch` | Exact live attempt; emits typed progress and structured result events on a dedicated connection. |
 | `Delete` | Exact live attempt only. A positive deletion tombstones its authorization for the remainder of the session. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
-| `Sweep` | Authenticated session only. The RPC supplies mechanics; ticket #139 owns what and when to sweep. |
+| `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly the port returned by that live attempt's `Run`; never a general guest dialer. |
 | `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the Mac bind-failure fallback and the helper issued that attempt's separate bridge capability. It never accepts an arbitrary host address or port. |
 
@@ -202,8 +238,10 @@ into the ambiguous `engine_failure` bucket.
 ## Deterministic identities and serialization
 
 The helper hashes the complete attempt authority tuple with SHA-256 and uses
-the first 128 bits to derive deterministic `wefty-{lease,snapshot,container,task}`
-names. Every enumerable resource carries the unabridged labels:
+the first 128 bits to derive deterministic names for the lease, snapshot,
+container, task, shim, cgroup, log-segment directory, handoff volume directory,
+and service-data volume directory. Every label-capable resource carries the
+unabridged labels:
 
 ```text
 io.wefty/node_id
@@ -215,17 +253,24 @@ io.wefty/class
 io.wefty/removal_generation
 ```
 
-`Run` takes the create side of one helper-wide gate; `Sweep` takes its exclusive
-side. Every engine operation except `Sweep` and namespace `Verify` fails with
-`sweep_required` until one sweep has succeeded in the current helper process.
-No attempt creation can cross a sweep boundary. Within `Run`, the helper-side
-adapter must create and label the per-attempt containerd lease before any other
-resource (§5.2). The later boot-barrier ticket owns sweep selection, survivor
-policy, and capability publication. Ticket #140 fills in the fixed isolation
-profile used for helper-side runtime-spec construction; the unprivileged agent
-never supplies OCI runtime-spec material. The later runtime ticket also owns
-the containerd adapter, logs, and real task lifecycle; packaging owns installed
-units and socket activation.
+`Run` takes the create side of one helper-wide gate; `Sweep` and namespace
+verification take its exclusive side. `Run` rechecks the verified bit only
+after acquiring its read side and reserves its attempt under that lock. Every
+engine operation except `Sweep` and namespace `Verify` fails with
+`sweep_required` until sweep plus absence verification have succeeded for the
+current session. No attempt creation can cross a sweep boundary. Before calling
+the engine, the helper derives the complete deterministic resource identity and
+labels and places them in the engine-only request field; wire callers cannot
+supply or override them. The containerd adapter must create and label the
+per-attempt lease first; its deterministic `wefty-lease-` name makes the
+create-before-label crash window independently discoverable. It then creates
+and labels every dependent resource under that lease (§5.2). Sweep and
+verification enumerate every resource class rather than trusting labels or a
+single total. Ticket #140 fills in the fixed isolation profile used for helper-side
+runtime-spec construction; the unprivileged agent never supplies OCI
+runtime-spec material. The later runtime ticket also owns the containerd
+adapter, logs, and real task lifecycle; packaging owns installed units and
+socket activation.
 
 ## Agent-side client responsibilities
 

@@ -45,6 +45,13 @@ legacy metadata cannot mint OCI authority. Capability replacement, liveness,
 and capacity refresh commit in one transaction and never mutate
 `claims_enabled` or another durable intent field.
 
+A barrier-bound registration may request an atomic restrictive supersede. L1
+accepts it only for `boot_sweep_failed` without `kind:oci`; for a stored
+same-text boot revision `N`, the registration transaction writes `N+1` and
+returns that authoritative observation. The agent adopts it, so startup uses
+one registration and increments `authority_generation` exactly once; a later
+positive probe is published by heartbeat at `N+2`.
+
 Capabilities express eligibility only. One-shot and service slots remain the
 independent, class-scoped capacity mechanism; capability keys never create,
 name, or increase slots. `apparmor` may be advertised as observed hardening but

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -560,6 +561,12 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	registration.CapabilityObservedAt = incoming.observation.ObservedAt
 	registration.MissingCapabilities = incoming.observation.MissingCapabilities
 	registration.CapabilityReasonCode = incoming.observation.ReasonCode
+	if registration.SupersedeCapabilityRevision &&
+		(incoming.observation.Capabilities["kind:oci"] ||
+			!slices.Contains(incoming.observation.MissingCapabilities, "kind:oci") ||
+			incoming.observation.ReasonCode != contract.CapabilityReasonBootSweepFailed) {
+		return Node{}, protocolError(contract.ErrorInvalidRequest, "capability supersede requires a restrictive boot-sweep observation")
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Node{}, internalError(err, "begin node registration")
@@ -593,7 +600,14 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 		return Node{}, protocolError(contract.ErrorIdentityBound, "stable node %q is bound to another Fabric identity", registration.NodeID)
 	default:
 		if storedBoot == registration.BootSessionID {
-			if legacyObservation {
+			if registration.SupersedeCapabilityRevision {
+				incoming.observation.Revision = storedRevision + 1
+				incoming, err = canonicalCapabilityObservation(incoming.observation)
+				if err != nil {
+					return Node{}, err
+				}
+				replaceCapabilities = true
+			} else if legacyObservation {
 				replaceCapabilities = false
 			} else {
 				decision, decisionErr := decideCapabilityObservation(incoming, storedCapabilitiesJSON, storedRevision, storedMissingJSON, storedReason)

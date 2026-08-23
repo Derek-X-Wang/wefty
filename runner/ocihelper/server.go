@@ -37,21 +37,24 @@ type ServerConfig struct {
 	AllowedUIDs           []uint32
 	AllowedMountRoots     []string
 	Clock                 Clock
+	beforeRunCreateLock   func()
 }
 
 type Server struct {
 	engine      Engine
 	config      ServerConfig
+	instanceID  string
 	createSweep sync.RWMutex
 	connections chan struct{}
 
-	sessionMu sync.Mutex
-	active    *serverSession
-	swept     bool
-	listener  net.Listener
-	serveCtx  context.Context
-	fatalErr  error
-	fatalOnce sync.Once
+	sessionMu             sync.Mutex
+	active                *serverSession
+	listener              net.Listener
+	serveCtx              context.Context
+	fatalErr              error
+	fatalOnce             sync.Once
+	nextSessionGeneration uint64
+	startupSweep          *SweepResponse
 }
 
 type attemptState string
@@ -125,6 +128,9 @@ type serverSession struct {
 	operations        map[*sessionOperation]struct{}
 	internalReaps     sync.WaitGroup
 	invalidateOnce    sync.Once
+	sweepPending      bool
+	sweepVerified     bool
+	sweepResponse     SweepResponse
 }
 
 func NewServer(engine Engine, config ServerConfig) (*Server, error) {
@@ -154,8 +160,13 @@ func NewServer(engine Engine, config ServerConfig) (*Server, error) {
 	}
 	config.AllowedUIDs = slices.Clone(config.AllowedUIDs)
 	config.AllowedMountRoots = slices.Clone(config.AllowedMountRoots)
+	instanceID, err := randomCapability()
+	if err != nil {
+		return nil, errors.New("generate OCI helper instance ID")
+	}
 	return &Server{
 		engine: engine, config: config,
+		instanceID:  instanceID,
 		connections: make(chan struct{}, config.ConnectionLimit),
 	}, nil
 }
@@ -163,6 +174,13 @@ func NewServer(engine Engine, config ServerConfig) (*Server, error) {
 func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if listener == nil {
 		return errors.New("OCI helper listener is required")
+	}
+	// A restarted helper has no trustworthy in-memory session history. Sweep
+	// and verify before accepting even the first session; each acquired session
+	// must then repeat the same barrier before OCI operations are admitted.
+	if err := server.sweepAndVerifyStartup(ctx); err != nil {
+		_ = listener.Close()
+		return err
 	}
 	server.sessionMu.Lock()
 	server.listener = listener
@@ -202,6 +220,32 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 			_ = connection.Close()
 		}
 	}
+}
+
+func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
+	server.createSweep.Lock()
+	defer server.createSweep.Unlock()
+	sweepContext, cancel := context.WithTimeout(ctx, server.config.ReapTimeout)
+	defer cancel()
+	sweep, err := server.engine.Sweep(sweepContext, SweepRequest{})
+	if err != nil {
+		return fmt.Errorf("startup sweep OCI runtime namespace: %w", err)
+	}
+	sweep.SweepEpoch, err = randomCapability()
+	if err != nil {
+		return errors.New("startup sweep OCI runtime namespace: generate sweep epoch")
+	}
+	verification, err := server.engine.Verify(sweepContext, VerifyRequest{Scope: VerifyNamespace})
+	if err != nil {
+		return fmt.Errorf("startup verify OCI runtime namespace: %w", err)
+	}
+	if !verification.Absent || !inventoryEmpty(verification.Inventory) {
+		return errors.New("startup verify OCI runtime namespace: residue remains after sweep")
+	}
+	server.sessionMu.Lock()
+	server.startupSweep = &sweep
+	server.sessionMu.Unlock()
+	return nil
 }
 
 func (server *Server) fail(err error) {
@@ -277,24 +321,28 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 		return
 	}
 	now := server.config.Clock.Now()
-	session := &serverSession{
-		server: server, identity: SessionIdentity{NodeID: body.NodeID, BootSessionID: body.BootSessionID},
-		peerKey: peer.authorityKey(), capability: capability, control: connection,
-		heartbeatDeadline: now.Add(server.config.HeartbeatTimeout), heartbeatChanged: make(chan struct{}, 1),
-		done: make(chan struct{}), attempts: make(map[string]*serverAttempt), operations: make(map[*sessionOperation]struct{}),
-	}
 	server.sessionMu.Lock()
 	if server.active != nil {
 		server.sessionMu.Unlock()
 		_ = writeFailure(wire, CodeSessionBusy, "an OCI helper session already owns this helper")
 		return
 	}
+	server.nextSessionGeneration++
+	generation := server.nextSessionGeneration
+	session := &serverSession{
+		server: server, identity: SessionIdentity{NodeID: body.NodeID, BootSessionID: body.BootSessionID},
+		peerKey: peer.authorityKey(), capability: capability, control: connection,
+		heartbeatDeadline: now.Add(server.config.HeartbeatTimeout), heartbeatChanged: make(chan struct{}, 1),
+		done: make(chan struct{}), attempts: make(map[string]*serverAttempt), operations: make(map[*sessionOperation]struct{}),
+	}
 	server.active = session
 	server.sessionMu.Unlock()
 	response := AcquireSessionResponse{
 		ProtocolVersion: ProtocolVersion, HelperVersion: server.config.HelperVersion,
 		HelperChecksum: server.config.HelperChecksum, SessionCapability: capability,
+		HelperInstanceID: server.instanceID, SessionGeneration: generation,
 		HeartbeatTimeout: server.config.HeartbeatTimeout, MaximumAttemptDeadman: server.config.MaximumAttemptDeadman,
+		ReapTimeout: server.config.ReapTimeout,
 	}
 	if err := writeSuccess(wire, response); err != nil {
 		session.invalidate("session handshake response failed")
@@ -533,7 +581,7 @@ func (session *serverSession) completeAttempt(request RunRequest, attempt *serve
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.closed || session.attempts[request.Authority.key()] != attempt || attempt.state != attemptStarting {
-		return &RPCError{Code: CodeSessionStale, Message: "attempt authority expired while starting"}
+		return &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt authority expired while starting"}
 	}
 	attempt.port = response.AttemptPort
 	attempt.bridgeCapability = bridgeCapability
@@ -629,14 +677,14 @@ func (session *serverSession) authorizeAttempt(authority AttemptAuthority) (*ser
 	return attempt, nil
 }
 
-func (server *Server) sweepRequired(method Method) bool {
+func (session *serverSession) sweepRequired(method Method) bool {
 	switch method {
 	case MethodAcquireSession, MethodSweep, MethodVerify:
 		return false
 	case MethodEnsureImage, MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDialAttemptPort, MethodDialHostBridge:
-		server.sessionMu.Lock()
-		defer server.sessionMu.Unlock()
-		return !server.swept
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return !session.sweepVerified
 	default:
 		return false
 	}
@@ -644,8 +692,8 @@ func (server *Server) sweepRequired(method Method) bool {
 
 func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, request frame) {
 	session := operation.session
-	if server.sweepRequired(request.Method) {
-		_ = writeFailure(wire, CodeSweepRequired, "a boot sweep must succeed before OCI operations")
+	if session.sweepRequired(request.Method) {
+		_ = writeFailure(wire, CodeSweepRequired, "boot sweep and namespace verification must succeed before OCI operations")
 		return
 	}
 	switch request.Method {
@@ -671,19 +719,30 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			_ = writeFailure(wire, CodeUnauthorizedAttempt, "Run authority is outside this helper session")
 			return
 		}
-		if _, err := DeterministicResourceIdentity(body.Authority); err != nil {
+		resources, err := DeterministicResourceIdentity(body.Authority)
+		if err != nil {
 			_ = writeFailure(wire, CodeInvalidRequest, err.Error())
+			return
+		}
+		body.Resources = resources
+		if server.config.beforeRunCreateLock != nil {
+			server.config.beforeRunCreateLock()
+		}
+		server.createSweep.RLock()
+		if session.sweepRequired(MethodRun) {
+			server.createSweep.RUnlock()
+			_ = writeFailure(wire, CodeSweepRequired, "boot sweep and namespace verification must succeed before OCI operations")
 			return
 		}
 		runContext, runCancel := context.WithCancel(operation.ctx)
 		attempt, rpcErr := session.reserveAttempt(body, runCancel)
 		if rpcErr != nil {
 			runCancel()
+			server.createSweep.RUnlock()
 			_ = writeRPCError(wire, rpcErr)
 			return
 		}
 		operation.monitorEOF()
-		server.createSweep.RLock()
 		response, err := server.engine.Run(runContext, body)
 		runCancel()
 		if err == nil {
@@ -770,7 +829,22 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
+		if body.Scope == VerifyNamespace {
+			server.createSweep.Lock()
+		}
 		response, err := server.engine.Verify(operation.ctx, body)
+		if err == nil && body.Scope == VerifyNamespace && response.Absent && inventoryEmpty(response.Inventory) {
+			session.mu.Lock()
+			if session.sweepPending {
+				session.sweepPending = false
+				session.sweepVerified = true
+				session.sweepResponse = SweepResponse{}
+			}
+			session.mu.Unlock()
+		}
+		if body.Scope == VerifyNamespace {
+			server.createSweep.Unlock()
+		}
 		_ = writeEngineResponse(wire, response, err)
 	case MethodSweep:
 		var body SweepRequest
@@ -779,11 +853,37 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		server.createSweep.Lock()
+		session.mu.Lock()
+		carriedSweep := session.sweepResponse
+		session.sweepPending = false
+		session.sweepVerified = false
+		session.sweepResponse = SweepResponse{}
+		session.mu.Unlock()
 		response, err := server.engine.Sweep(operation.ctx, body)
 		if err == nil {
+			response.SweepEpoch, err = randomCapability()
+		}
+		if err == nil {
+			if carriedSweep.SweepEpoch != "" {
+				response.Removed += carriedSweep.Removed
+				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, carriedSweep.PriorBootSessionsSeen...)
+				response.Inventory = mergeResourceInventory(response.Inventory, carriedSweep.Inventory)
+				response.Attempts = append(response.Attempts, carriedSweep.Attempts...)
+			}
 			server.sessionMu.Lock()
-			server.swept = true
+			startup := server.startupSweep
+			server.startupSweep = nil
 			server.sessionMu.Unlock()
+			if startup != nil {
+				response.Removed += startup.Removed
+				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, startup.PriorBootSessionsSeen...)
+				response.Inventory = mergeResourceInventory(response.Inventory, startup.Inventory)
+				response.Attempts = append(response.Attempts, startup.Attempts...)
+			}
+			session.mu.Lock()
+			session.sweepPending = true
+			session.sweepResponse = response
+			session.mu.Unlock()
 		}
 		server.createSweep.Unlock()
 		_ = writeEngineResponse(wire, response, err)
@@ -818,6 +918,18 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 	default:
 		_ = writeFailure(wire, CodeUnsupportedOperation, "unknown OCI helper method")
 	}
+}
+
+func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {
+	left.Leases = append(left.Leases, right.Leases...)
+	left.Snapshots = append(left.Snapshots, right.Snapshots...)
+	left.Containers = append(left.Containers, right.Containers...)
+	left.Tasks = append(left.Tasks, right.Tasks...)
+	left.Shims = append(left.Shims, right.Shims...)
+	left.Cgroups = append(left.Cgroups, right.Cgroups...)
+	left.LogSegments = append(left.LogSegments, right.LogSegments...)
+	left.ManagedVolumes = append(left.ManagedVolumes, right.ManagedVolumes...)
+	return left
 }
 
 type operationStream struct {
