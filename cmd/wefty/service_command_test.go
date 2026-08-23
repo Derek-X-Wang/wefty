@@ -179,7 +179,7 @@ func assertServiceCLIContractOverJobKeyedL1Routes(t *testing.T) {
 	node, err := harness.store.RegisterNode(ctx, nodeIdentity, contract.NodeRegistration{
 		NodeID: "service-node", BootSessionID: "boot-service-cli", RootInstanceID: "root-service-cli",
 		OS: "linux", Architecture: "amd64", AgentVersion: "service-cli-test",
-		Capabilities: map[string]bool{"process": true},
+		Capabilities: map[string]bool{"kind:process": true},
 	}, l1.NodePolicy{Tags: []string{"service-cli"}, MaxOneshotSlots: 4, MaxServiceSlots: 2}, true)
 	if err != nil {
 		t.Fatal(err)
@@ -516,7 +516,7 @@ func assertServiceCLIRemoveAndForceForget(t *testing.T) {
 	node, err := harness.store.RegisterNode(ctx, identity, contract.NodeRegistration{
 		NodeID: "remove-cli-node", BootSessionID: "remove-cli-boot", RootInstanceID: "remove-cli-root",
 		OS: "linux", Architecture: "amd64", AgentVersion: "remove-cli-test",
-		Capabilities: map[string]bool{"process": true},
+		Capabilities: map[string]bool{"kind:process": true},
 	}, l1.NodePolicy{Tags: []string{"remove-cli"}, MaxOneshotSlots: 4, MaxServiceSlots: 2}, true)
 	if err != nil {
 		t.Fatal(err)

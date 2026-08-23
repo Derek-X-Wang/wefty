@@ -356,6 +356,14 @@ func ensureBoundServiceCapacity(ctx context.Context, tx *sql.Tx, job Job) error 
 	return nil
 }
 
+func (s *Store) projectJob(ctx context.Context, job Job) (Job, error) {
+	if job.ServiceJob != nil || job.Removal != nil {
+		return s.projectServiceJob(ctx, job)
+	}
+	job.Status = string(job.State)
+	return s.projectQueuedJobCapabilities(ctx, job)
+}
+
 func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 	if job.Removal != nil {
 		job.Status = string(job.State)
@@ -383,22 +391,42 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 			service.RestartSuppressed = "failure is latched; use restart"
 		}
 	}
+	if job.Status != "restart-pending" {
+		var err error
+		job, err = s.projectQueuedJobCapabilities(ctx, job)
+		if err != nil {
+			return Job{}, err
+		}
+	}
 	if service.BoundNodeID != "" {
 		var claimsEnabled bool
-		err := s.db.QueryRowContext(ctx, "SELECT state, claims_enabled FROM nodes WHERE node_id=?", service.BoundNodeID).
-			Scan(&service.NodeState, &claimsEnabled)
+		var capabilitiesJSON []byte
+		err := s.db.QueryRowContext(ctx, "SELECT state, claims_enabled, capabilities_json FROM nodes WHERE node_id=?", service.BoundNodeID).
+			Scan(&service.NodeState, &claimsEnabled, &capabilitiesJSON)
 		if errors.Is(err, sql.ErrNoRows) {
 			if job.State == contract.JobQueued && job.Status != "restart-pending" {
-				service.UnschedulableReason = fmt.Sprintf("bound node %q is not registered", service.BoundNodeID)
+				job.UnschedulableReason = fmt.Sprintf("bound node %q is not registered", service.BoundNodeID)
 			}
 		} else if err != nil {
 			return Job{}, internalError(err, "read bound node projection")
 		} else if job.State == contract.JobQueued && job.Status != "restart-pending" {
 			switch {
 			case service.NodeState != contract.NodeAlive:
-				service.UnschedulableReason = fmt.Sprintf("bound node %q is %s", service.BoundNodeID, service.NodeState)
+				job.UnschedulableReason = fmt.Sprintf("bound node %q is %s", service.BoundNodeID, service.NodeState)
 			case !claimsEnabled:
-				service.UnschedulableReason = fmt.Sprintf("bound node %q has claims disabled", service.BoundNodeID)
+				job.UnschedulableReason = fmt.Sprintf("bound node %q has claims disabled", service.BoundNodeID)
+			default:
+				var advertised map[string]bool
+				if err := json.Unmarshal(capabilitiesJSON, &advertised); err != nil {
+					return Job{}, internalError(err, "decode bound node capabilities")
+				}
+				required, err := storedRequiredCapabilities(ctx, s.db, job.JobID)
+				if err != nil {
+					return Job{}, internalError(err, "read required job capabilities")
+				}
+				if missing := MissingCapabilities(required, advertised); len(missing) > 0 {
+					job.UnschedulableReason = fmt.Sprintf("bound node %q is missing capabilities: %s", service.BoundNodeID, strings.Join(missing, ", "))
+				}
 			}
 		}
 	} else if job.State == contract.JobQueued && job.Status != "restart-pending" {
@@ -406,17 +434,21 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 		if err != nil {
 			return Job{}, err
 		}
-		service.UnschedulableReason = reason
+		job.UnschedulableReason = reason
 	}
-	if service.UnschedulableReason != "" {
+	if job.UnschedulableReason != "" {
 		job.Status = "unschedulable"
 	}
 	return job, nil
 }
 
 func (s *Store) unboundServiceUnschedulableReason(ctx context.Context, jobID string) (string, error) {
+	required, err := storedRequiredCapabilities(ctx, s.db, jobID)
+	if err != nil {
+		return "", internalError(err, "read required job capabilities")
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT nodes.node_id, nodes.state, nodes.claims_enabled,
-		nodes.max_service_slots,
+		nodes.capabilities_json, nodes.max_service_slots,
 		(SELECT COUNT(*) FROM service_jobs occupied_service
 		 JOIN jobs occupied_job ON occupied_job.job_id=occupied_service.job_id
 		 WHERE occupied_service.bound_node_id=nodes.node_id
@@ -440,21 +472,43 @@ func (s *Store) unboundServiceUnschedulableReason(ctx context.Context, jobID str
 	eligible := 0
 	capacityReasons := []string{}
 	ineligibleReasons := []string{}
+	missingRequirements := []string{}
+	seenMissing := map[string]struct{}{}
+	nonCapabilityIneligible := 0
 	for rows.Next() {
 		var nodeID string
 		var state contract.NodeState
 		var claimsEnabled bool
+		var capabilitiesJSON []byte
 		var capacity, occupancy int
-		if err := rows.Scan(&nodeID, &state, &claimsEnabled, &capacity, &occupancy); err != nil {
+		if err := rows.Scan(&nodeID, &state, &claimsEnabled, &capabilitiesJSON, &capacity, &occupancy); err != nil {
 			return "", internalError(err, "scan service placement candidate")
 		}
 		matched++
 		if state != contract.NodeAlive {
 			ineligibleReasons = append(ineligibleReasons, fmt.Sprintf("%s is %s", nodeID, state))
+			nonCapabilityIneligible++
 			continue
 		}
 		if !claimsEnabled {
 			ineligibleReasons = append(ineligibleReasons, fmt.Sprintf("%s has claims disabled", nodeID))
+			nonCapabilityIneligible++
+			continue
+		}
+		var advertised map[string]bool
+		if err := json.Unmarshal(capabilitiesJSON, &advertised); err != nil {
+			return "", internalError(err, "decode service placement capabilities")
+		}
+		missing := MissingCapabilities(required, advertised)
+		if len(missing) > 0 {
+			ineligibleReasons = append(ineligibleReasons, fmt.Sprintf("%s is missing capabilities: %s", nodeID, strings.Join(missing, ", ")))
+			for _, capability := range missing {
+				if _, seen := seenMissing[capability]; seen {
+					continue
+				}
+				seenMissing[capability] = struct{}{}
+				missingRequirements = append(missingRequirements, capability)
+			}
 			continue
 		}
 		eligible++
@@ -470,6 +524,9 @@ func (s *Store) unboundServiceUnschedulableReason(ctx context.Context, jobID str
 		return "no registered node matches the service routing tags", nil
 	}
 	if eligible == 0 {
+		if len(missingRequirements) > 0 && nonCapabilityIneligible == 0 {
+			return "no tag-eligible node advertises required capabilities: " + strings.Join(missingRequirements, ", "), nil
+		}
 		return "no tag-eligible node accepts claims: " + strings.Join(ineligibleReasons, "; "), nil
 	}
 	return "service capacity exhausted: " + strings.Join(capacityReasons, "; "), nil

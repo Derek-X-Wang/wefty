@@ -304,12 +304,10 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		w.Header().Set("Idempotency-Replayed", "true")
 	}
-	if job.ServiceJob != nil || job.Removal != nil {
-		job, err = s.store.projectServiceJob(r.Context(), job)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
+	job, err = s.store.projectJob(r.Context(), job)
+	if err != nil {
+		writeError(w, err)
+		return
 	}
 	writeJSON(w, status, redactJob(job))
 }
@@ -345,12 +343,10 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if job.ServiceJob != nil || job.Removal != nil {
-		job, err = s.store.projectServiceJob(r.Context(), job)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
+	job, err = s.store.projectJob(r.Context(), job)
+	if err != nil {
+		writeError(w, err)
+		return
 	}
 	job.Attempts, err = s.store.ListJobAttempts(r.Context(), job.JobID)
 	if err != nil {

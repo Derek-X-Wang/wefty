@@ -42,26 +42,12 @@ func TestOCIPrestartRuntimeUnavailablePersistsWallClockBackoffAtProductionTiming
 			t.Errorf("close realtime OCI store: %v", err)
 		}
 	})
-	processSpec := contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "realtime-oci-prestart", Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
-		Execution: contract.ExecutionSpec{
-			Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"},
-			WorkingDirectory: "/tmp", HandoffDirectory: "/tmp/handoff",
-		},
-	}
-	job, _, err := store.CreateJob(context.Background(), processSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
 	ociSpec := contract.JobSpec{
-		SchemaVersion: contract.SchemaVersionV1, DispatchKey: processSpec.DispatchKey, Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "realtime-oci-prestart", Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
 		RuntimeHandler: "io.containerd.runc.v2",
 		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "ghcr.io/example/tool:latest"}}},
 	}
-	if err := contract.ValidateJobSpec(ociSpec); err != nil {
-		t.Fatal(err)
-	}
-	rawSpec, err := json.Marshal(ociSpec)
+	job, _, err := store.CreateJob(context.Background(), ociSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,13 +56,12 @@ func TestOCIPrestartRuntimeUnavailablePersistsWallClockBackoffAtProductionTiming
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	// TODO(#135): the public create gate remains process-only until
-	// capability-aware claiming lands; patch only the validated fixture spec.
-	if _, err := database.Exec(`UPDATE jobs SET spec_json=? WHERE job_id=?`, rawSpec, job.JobID); err != nil {
-		t.Fatal(err)
-	}
 	registration := contract.NodeRegistration{
 		NodeID: "oci-realtime-node", BootSessionID: "oci-realtime-boot", OS: "linux", Architecture: runtime.GOARCH, AgentVersion: "acceptance",
+		Capabilities: map[string]bool{
+			"kind:oci":                              true,
+			"runtime_handler:io.containerd.runc.v2": true,
+		},
 	}
 	if _, err := store.RegisterNode(context.Background(), fabric.Identity{NodeID: "oci-realtime-agent"}, registration, l1.DefaultNodePolicy(), true); err != nil {
 		t.Fatal(err)

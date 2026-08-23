@@ -192,7 +192,7 @@ func (h *nodeCLIHarness) registerNode(t *testing.T, nodeID, tag string, policy l
 	node, err := h.store.RegisterNode(context.Background(), identity, contract.NodeRegistration{
 		NodeID: nodeID, BootSessionID: "boot-" + nodeID, RootInstanceID: "root-" + nodeID,
 		OS: "linux", Architecture: "arm64", AgentVersion: "node-cli-test",
-		Capabilities: map[string]bool{"process": true},
+		Capabilities: map[string]bool{"kind:process": true},
 	}, policy, true)
 	if err != nil {
 		t.Fatal(err)

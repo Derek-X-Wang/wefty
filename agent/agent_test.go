@@ -259,6 +259,7 @@ func TestNewBuildsRegistrationFromStableAndBootMetadata(t *testing.T) {
 		Fabric: participant, ControlPlaneAddress: "127.0.0.1:1",
 		NodeID: "stable-node", BootSessionID: "boot-session", Version: "v1.2.3",
 		OS: "test-os", Architecture: "test-arch",
+		Capabilities:      map[string]bool{"kind:process": true},
 		LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: filepath.Join(resolvedRoot, "state"),
 	})
 	if err != nil {
@@ -269,11 +270,27 @@ func TestNewBuildsRegistrationFromStableAndBootMetadata(t *testing.T) {
 	if got.NodeID != "stable-node" || got.BootSessionID != "boot-session" || got.OS != "test-os" || got.Architecture != "test-arch" || got.AgentVersion != "v1.2.3" {
 		t.Fatalf("registration = %#v", got)
 	}
-	if len(got.Capabilities) != 1 || !got.Capabilities["process"] {
+	if len(got.Capabilities) != 1 || !got.Capabilities["kind:process"] {
 		t.Fatalf("capabilities = %#v", got.Capabilities)
 	}
 	if got.RootInstanceID == "" {
 		t.Fatal("registration omitted the managed-root instance ID")
+	}
+}
+
+func TestNewWithNilCapabilitiesAdvertisesNothing(t *testing.T) {
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	nodeAgent, err := New(Config{
+		Fabric: participant, ControlPlaneAddress: "127.0.0.1:1",
+		NodeID: "stable-node", BootSessionID: "boot-session", Version: "test",
+		LogSpoolDirectory: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	if len(nodeAgent.registration.Capabilities) != 0 {
+		t.Fatalf("nil capabilities advertised %#v, want empty set", nodeAgent.registration.Capabilities)
 	}
 }
 
@@ -310,6 +327,7 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 		NodeID:              "stable-node",
 		BootSessionID:       "boot-renewal",
 		Version:             "test",
+		Capabilities:        map[string]bool{"kind:process": true},
 		HeartbeatInterval:   5 * time.Second,
 		ClaimInterval:       10 * time.Millisecond,
 		RenewalInterval:     100 * time.Millisecond,
@@ -409,6 +427,7 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "stable-node", BootSessionID: "boot-completion-retry", Version: "test",
+		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: time.Second, ClaimInterval: 5 * time.Millisecond,
 		RenewalInterval: 200 * time.Millisecond, LogRetryInterval: 50 * time.Millisecond,
 		LogSpoolDirectory: t.TempDir(),

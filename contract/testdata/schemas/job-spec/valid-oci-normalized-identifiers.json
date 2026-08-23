@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:normalized-identifiers",
+  "kind": " OCI ",
+  "class": "one-shot",
+  "runtime_handler": " IO.CONTAINERD.RUNSC.V1 ",
+  "execution": {
+    "oci": {
+      "image": {
+        "reference": "alpine:latest"
+      }
+    }
+  }
+}

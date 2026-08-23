@@ -315,21 +315,14 @@ func TestOCIResultArmsAndTransitions(t *testing.T) {
 func registerOCIFixtureNode(t *testing.T, h *integrationHarness) {
 	t.Helper()
 	agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
-	h.register(agent, "node-1")
+	h.registerWithCapabilities(agent, "node-1", map[string]bool{
+		"kind:oci":                              true,
+		"runtime_handler:io.containerd.runc.v2": true,
+	})
 }
 
 func createOCIFixtureJob(t *testing.T, h *integrationHarness, dispatchKey, class string) Job {
 	t.Helper()
-	processSpec := validJobSpec(dispatchKey, nil)
-	processSpec.Class = class
-	if class == contract.JobClassService {
-		processSpec.Execution.HandoffDirectory = ""
-		processSpec.Restart = contract.RestartAlways
-	}
-	job, _, err := h.store.CreateJob(context.Background(), processSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
 	digest := testTopDigest
 	image := contract.OCIImageSpec{Reference: "ghcr.io/example/tool:latest"}
 	if class == contract.JobClassService {
@@ -337,22 +330,16 @@ func createOCIFixtureJob(t *testing.T, h *integrationHarness, dispatchKey, class
 	}
 	ociSpec := contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1, DispatchKey: dispatchKey, Kind: contract.JobKindOCI, Class: class,
-		Restart: processSpec.Restart, RuntimeHandler: "io.containerd.runc.v2",
-		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: image}},
+		RuntimeHandler: "io.containerd.runc.v2",
+		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: image}},
 	}
-	if err := contract.ValidateJobSpec(ociSpec); err != nil {
+	if class == contract.JobClassService {
+		ociSpec.Restart = contract.RestartAlways
+	}
+	if err := contract.ValidateJobSpec(&ociSpec); err != nil {
 		t.Fatalf("OCI fixture does not satisfy the public contract: %v", err)
 	}
-	raw, err := json.Marshal(ociSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// TODO(#135): CreateJob deliberately rejects OCI until capability-aware
-	// claiming lands, so this fixture patches only the already-validated spec.
-	if _, err := h.store.db.Exec(`UPDATE jobs SET spec_json=? WHERE job_id=?`, raw, job.JobID); err != nil {
-		t.Fatal(err)
-	}
-	job, err = h.store.GetJob(context.Background(), job.JobID)
+	job, _, err := h.store.CreateJob(context.Background(), ociSpec)
 	if err != nil {
 		t.Fatal(err)
 	}

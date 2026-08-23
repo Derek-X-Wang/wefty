@@ -155,12 +155,21 @@ func waitForAgentLifecycle(t *testing.T, nodeAgent *Agent, want LifecycleState) 
 
 func assertAttemptStatus(t *testing.T, nodeAgent *Agent, state AttemptLifecycleState) AttemptStatus {
 	t.Helper()
-	status := nodeAgent.Status()
-	for _, attempt := range status.Attempts {
-		if attempt.State == state {
-			return attempt
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		status := nodeAgent.Status()
+		for _, attempt := range status.Attempts {
+			if attempt.State == state {
+				return attempt
+			}
+		}
+		select {
+		case <-time.After(time.Millisecond):
+		case <-t.Context().Done():
+			t.Fatal(t.Context().Err())
 		}
 	}
+	status := nodeAgent.Status()
 	t.Fatalf("attempt states = %#v, want %q", status.Attempts, state)
 	return AttemptStatus{}
 }

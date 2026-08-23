@@ -8,7 +8,7 @@ invalid. State changes and their required side effects commit atomically.
 
 | State | Meaning | Allowed next states |
 | --- | --- | --- |
-| `queued` | Available for an eligible alive node to claim. | `claimed`, `failed` |
+| `queued` | Available for an alive node whose tags, capabilities, intent, class, and slots satisfy the atomic claim predicates. | `claimed`, `failed` |
 | `claimed` | An attempt and fence were created; execution has not been acknowledged. | `running`, `queued`, `failed` |
 | `running` | The active attempt is executing. | `awaiting-input`, `succeeded`, `failed` |
 | `stopping` | Service-only state, unreachable in the one-shot transition table. | none |

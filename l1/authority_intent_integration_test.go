@@ -57,6 +57,7 @@ func assertClaimTimeAuthorityAndIntent(t *testing.T) {
 
 		registration := contract.NodeRegistration{
 			NodeID: "stable-node", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+			Capabilities: map[string]bool{"kind:process": true},
 		}
 		status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
 		if status != http.StatusOK {

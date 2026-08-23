@@ -19,7 +19,7 @@ func TestServiceAcceptanceCapacityIsControlPlanePolicy(t *testing.T) {
 
 	selfReported := map[string]any{
 		"node_id": "capacity-node", "boot_session_id": "boot-1", "os": "linux", "architecture": "arm64", "agent_version": "test",
-		"capabilities": map[string]bool{"process": true, "max_service_slots": true},
+		"capabilities": map[string]bool{"kind:process": true, "max_service_slots": true},
 	}
 	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", selfReported)
 	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
@@ -27,7 +27,7 @@ func TestServiceAcceptanceCapacityIsControlPlanePolicy(t *testing.T) {
 	registration := contract.NodeRegistration{
 		NodeID: "capacity-node", BootSessionID: "boot-1", RootInstanceID: "root-instance-1",
 		OS: "linux", Architecture: "arm64", AgentVersion: "test",
-		Capabilities: map[string]bool{"process": true},
+		Capabilities: map[string]bool{"kind:process": true},
 	}
 	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration)
 	if status != http.StatusOK {

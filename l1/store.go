@@ -169,6 +169,11 @@ CREATE TABLE IF NOT EXISTS job_tags (
   tag TEXT NOT NULL,
   PRIMARY KEY (job_id, tag)
 );
+CREATE TABLE IF NOT EXISTS job_required_capabilities (
+  job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+  capability TEXT NOT NULL,
+  PRIMARY KEY (job_id, capability)
+);
 CREATE TABLE IF NOT EXISTS nodes (
   node_id TEXT PRIMARY KEY,
   identity_node_id TEXT NOT NULL,
@@ -308,6 +313,7 @@ func (s *Store) CreateJob(ctx context.Context, spec contract.JobSpec) (job Job, 
 	if err := validateJobSpec(&spec); err != nil {
 		return Job{}, false, err
 	}
+	requiredCapabilities := RequiredCapabilities(spec)
 	specJSON, err := json.Marshal(spec)
 	if err != nil {
 		return Job{}, false, internalError(err, "encode job specification")
@@ -361,6 +367,11 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON
 	}
 	if _, err := tx.ExecContext(ctx, "INSERT INTO job_log_jsonl(job_id, jsonl) VALUES(?, ?)", job.JobID, []byte{}); err != nil {
 		return Job{}, false, internalError(err, "initialize authoritative job log")
+	}
+	for _, capability := range requiredCapabilities {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO job_required_capabilities(job_id, capability) VALUES(?, ?)", job.JobID, capability); err != nil {
+			return Job{}, false, internalError(err, "store required job capability")
+		}
 	}
 	if spec.Class == contract.JobClassService {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO service_jobs(job_id, desired_state, published_port)
@@ -521,6 +532,7 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 			return Node{}, protocolError(contract.ErrorInvalidRequest, "node capacity is control-plane policy, not an agent capability")
 		}
 	}
+	registration.Capabilities = normalizeRegistrationCapabilities(registration.Capabilities)
 	tags := NormalizeTags(policy.Tags)
 	for _, tag := range tags {
 		if !validTag(tag) {
@@ -765,6 +777,15 @@ WHERE job_id=(
 	          SELECT 1 FROM node_tags nt WHERE nt.node_id=@node_id AND nt.tag=jt.tag
 	        )
     )
+	    AND NOT EXISTS (
+	      SELECT 1 FROM job_required_capabilities required
+	      WHERE required.job_id=j.job_id
+	        AND NOT EXISTS (
+	          SELECT 1
+	          FROM json_each(CAST((SELECT capabilities_json FROM nodes WHERE node_id=@node_id) AS TEXT)) advertised
+	          WHERE advertised.key=required.capability AND advertised.value=1
+	        )
+	    )
   ORDER BY CASE
 	WHEN @class='service' AND candidate_service.bound_node_id=@node_id THEN 0
 	ELSE 1
@@ -2004,13 +2025,8 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 }
 
 func validateJobSpec(spec *contract.JobSpec) error {
-	if err := contract.ValidateJobSpec(*spec); err != nil {
+	if err := contract.ValidateJobSpec(spec); err != nil {
 		return protocolError(errorCode(err), "%v", err)
-	}
-	// TODO(#135): remove this interim gate when Ticket 3 adds capability-aware
-	// OCI requirements and prevents process-only agents from claiming OCI jobs.
-	if spec.Kind != contract.JobKindProcess {
-		return protocolError(contract.ErrorUnsupportedKind, "job kind %q is not supported by L1 yet", spec.Kind)
 	}
 	return nil
 }
@@ -2273,6 +2289,20 @@ func nonNilCapabilities(capabilities map[string]bool) map[string]bool {
 		return map[string]bool{}
 	}
 	return capabilities
+}
+
+func normalizeRegistrationCapabilities(capabilities map[string]bool) map[string]bool {
+	normalized := make(map[string]bool, len(capabilities))
+	for capability, enabled := range capabilities {
+		normalized[capability] = enabled
+	}
+	if legacyProcess, ok := normalized["process"]; ok {
+		if _, canonical := normalized["kind:process"]; !canonical {
+			normalized["kind:process"] = legacyProcess
+		}
+		delete(normalized, "process")
+	}
+	return normalized
 }
 
 func canonicalTime(value time.Time) time.Time { return value.UTC().Round(0) }

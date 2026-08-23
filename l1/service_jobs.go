@@ -18,7 +18,6 @@ type ServiceJob struct {
 	BoundNodeID          string                       `json:"bound_node_id,omitempty"`
 	NodeState            contract.NodeState           `json:"node_state,omitempty"`
 	SlotHeld             bool                         `json:"holds_slot"`
-	UnschedulableReason  string                       `json:"unschedulable_reason,omitempty"`
 	RestartSuppressed    string                       `json:"restart_suppressed_reason,omitempty"`
 	RestartStreak        int                          `json:"restart_streak"`
 	LifetimeRestartCount int                          `json:"lifetime_restart_count"`

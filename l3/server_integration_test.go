@@ -167,6 +167,7 @@ func (h *integrationHarness) agent() *http.Client {
 	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{l1.DefaultAgentPrincipalTag}}, DefaultL1Address)
 	registration := contract.NodeRegistration{
 		NodeID: "node-1", BootSessionID: "boot-1", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true},
 	}
 	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/nodes/register", registration, nil)
 	if status != http.StatusOK {
