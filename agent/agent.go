@@ -81,10 +81,13 @@ type Config struct {
 	WorkloadRuntimes map[string]WorkloadRuntime
 	// AttemptDeadman queues successful OCI L1 renewals to the helper session.
 	// Nil is the no-helper-session mode.
-	AttemptDeadman    AttemptDeadmanRenewer
-	OutputSinkFactory OutputSinkFactory
-	HandoffRoot       string
-	HandoffRetention  time.Duration
+	AttemptDeadman AttemptDeadmanRenewer
+	// OCIWorkflowBridgeBinder binds the guest-visible host bridge for Lima.
+	// Nil preserves the native loopback bridge used by process and Linux OCI.
+	OCIWorkflowBridgeBinder workloadrunner.WorkflowBridgeBinder
+	OutputSinkFactory       OutputSinkFactory
+	HandoffRoot             string
+	HandoffRetention        time.Duration
 	// Logf need not be goroutine-safe. Agent serializes calls made through it.
 	Logf  func(string, ...any)
 	Clock Clock
@@ -112,6 +115,7 @@ type Agent struct {
 	observer          *lifecycleObserver
 	capabilities      *capabilityState
 	attemptDeadman    AttemptDeadmanRenewer
+	ociBridgeBinder   workloadrunner.WorkflowBridgeBinder
 	nodeLock          nodeLock
 }
 
@@ -265,8 +269,9 @@ func New(config Config) (*Agent, error) {
 		runtimes: runtimes, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
 		handoffs: newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
 		logf:     logf, clock: clock, observer: observer, capabilities: capabilities,
-		attemptDeadman: config.AttemptDeadman,
-		nodeLock:       stableNodeLock,
+		attemptDeadman:  config.AttemptDeadman,
+		ociBridgeBinder: config.OCIWorkflowBridgeBinder,
+		nodeLock:        stableNodeLock,
 	}, nil
 }
 

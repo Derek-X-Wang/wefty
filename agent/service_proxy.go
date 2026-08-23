@@ -25,6 +25,49 @@ type serviceRuntimeEndpoint struct {
 	dial        func(context.Context) (net.Conn, error)
 }
 
+type runtimeEndpointLatch struct {
+	ready chan struct{}
+	once  sync.Once
+	mu    sync.RWMutex
+	value workloadrunner.AttemptEndpoint
+}
+
+func newRuntimeEndpointLatch() *runtimeEndpointLatch {
+	return &runtimeEndpointLatch{ready: make(chan struct{})}
+}
+
+func (latch *runtimeEndpointLatch) publish(endpoint workloadrunner.AttemptEndpoint) error {
+	if endpoint.Port == 0 || endpoint.Dial == nil {
+		return errors.New("runtime supplied an invalid attempt endpoint")
+	}
+	published := false
+	latch.once.Do(func() {
+		latch.mu.Lock()
+		latch.value = endpoint
+		latch.mu.Unlock()
+		close(latch.ready)
+		published = true
+	})
+	if !published {
+		return errors.New("runtime supplied the attempt endpoint more than once")
+	}
+	return nil
+}
+
+func (latch *runtimeEndpointLatch) endpoint() serviceRuntimeEndpoint {
+	return serviceRuntimeEndpoint{dial: func(ctx context.Context) (net.Conn, error) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-latch.ready:
+		}
+		latch.mu.RLock()
+		dial := latch.value.Dial
+		latch.mu.RUnlock()
+		return dial(ctx)
+	}}
+}
+
 func prepareProcessServiceEndpoint(ctx context.Context) (serviceRuntimeEndpoint, error) {
 	if err := ctx.Err(); err != nil {
 		return serviceRuntimeEndpoint{}, err

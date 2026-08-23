@@ -13,15 +13,20 @@ const DefaultContainerdAddress = "/run/containerd/containerd.sock"
 // NativeEngineConfig contains only host-side helper configuration. The agent
 // never supplies these values over the helper protocol.
 type NativeEngineConfig struct {
-	Address             string
-	LoggerExecutable    string
-	RuntimeRoot         string
-	ContainerdStateRoot string
-	CgroupRoot          string
-	ResolverPath        string
-	HostsPath           string
-	AllowedMountRoots   []string
-	LogSealTimeout      time.Duration
+	Address                string
+	LoggerExecutable       string
+	RuntimeRoot            string
+	ContainerdStateRoot    string
+	CgroupRoot             string
+	ResolverPath           string
+	HostsPath              string
+	AllowedMountRoots      []string
+	HostMountRoot          string
+	GuestMountRoot         string
+	AttemptPortMin         uint16
+	AttemptPortMax         uint16
+	AttemptPortBindTimeout time.Duration
+	LogSealTimeout         time.Duration
 }
 
 // GuardianReaper preserves the helper deadman's signal initiator when the

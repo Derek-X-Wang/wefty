@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	limarunner "github.com/Derek-X-Wang/wefty/runner/lima"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -52,13 +54,19 @@ func main() {
 		runtimeRoot := helperFlags.String("oci-runtime-root", "/var/lib/wefty/oci", "root helper OCI runtime state root")
 		var allowedMountRoots repeatedStringFlag
 		helperFlags.Var(&allowedMountRoots, "oci-allowed-mount-root", "operator bind-mount root allowed by the helper (repeatable)")
+		hostMountRoot := helperFlags.String("oci-lima-host-mount-root", "", "macOS operator mount root translated into the Lima guest")
+		guestMountRoot := helperFlags.String("oci-lima-guest-mount-root", "", "Lima guest mount root corresponding to --oci-lima-host-mount-root")
 		if err := helperFlags.Parse(os.Args[2:]); err != nil {
 			log.Printf("wefty-agent OCI helper flags: %v", err)
 			os.Exit(2)
 		}
 		helperContext, stopHelper := signal.NotifyContext(context.TODO(), os.Interrupt, syscall.SIGTERM)
 		defer stopHelper()
-		engine, closeEngine, err := ocihelper.OpenNativeEngine(ocihelper.NativeEngineConfig{Address: *containerdAddress, ContainerdStateRoot: *containerdStateRoot, RuntimeRoot: *runtimeRoot, AllowedMountRoots: allowedMountRoots})
+		engine, closeEngine, err := ocihelper.OpenNativeEngine(ocihelper.NativeEngineConfig{
+			Address: *containerdAddress, ContainerdStateRoot: *containerdStateRoot,
+			RuntimeRoot: *runtimeRoot, AllowedMountRoots: allowedMountRoots,
+			HostMountRoot: *hostMountRoot, GuestMountRoot: *guestMountRoot,
+		})
 		if err != nil {
 			log.Printf("wefty-agent OCI helper engine: %v", err)
 			os.Exit(1)
@@ -128,6 +136,8 @@ func run() error {
 		ociProbeImage     = flag.String("oci-probe-image", "", "preloaded local OCI probe image reference")
 		ociProbeDigest    = flag.String("oci-probe-digest", "", "immutable digest of the preloaded local OCI probe image")
 		ociImageBudget    = flag.Duration("oci-image-budget", ocirunner.DefaultImageBudget, "total resolve, pull/import, unpack, and shared-operation wait budget")
+		ociLimaInstance   = flag.String("oci-lima-instance", limarunner.DefaultInstanceName, "Lima instance carrying the private OCI helper on macOS")
+		ociLimaMountRoot  = flag.String("oci-lima-host-mount-root", "", "macOS host mount root validated before Lima helper RPCs")
 	)
 	flag.Parse()
 	if *nodeID == "" {
@@ -170,18 +180,36 @@ func run() error {
 	var bootBarrier *ocihelper.BootBarrier
 	var capabilityProbe agent.CapabilityProbe
 	var deadman agent.AttemptDeadmanRenewer
+	var ociBridgeBinder workloadrunner.WorkflowBridgeBinder
 	if *ociHelperSocket != "" {
 		if *ociProbeImage == "" || *ociProbeDigest == "" {
 			return fmt.Errorf("--oci-probe-image and --oci-probe-digest are required with --oci-helper-socket")
 		}
+		if runtime.GOOS == "darwin" && *ociLimaMountRoot == "" {
+			return errors.New("--oci-lima-host-mount-root is required with the Lima OCI helper")
+		}
 		client := ocihelper.NewUnixClient(*ociHelperSocket, *ociHelperChecksum)
+		var limaDialer *limarunner.EpochSocketDialer
+		if runtime.GOOS == "darwin" {
+			client, limaDialer = limarunner.NewHelperClient(*ociHelperSocket, *ociHelperChecksum)
+		}
 		bootBarrier, err = ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{
 			NodeID: *nodeID, BootSessionID: bootSessionID, ExpectedHelperChecksum: *ociHelperChecksum,
 		})
 		if err != nil {
 			return err
 		}
-		adapter := ocirunner.NewAdapterWithPolicy(bootBarrier, ocirunner.ImagePolicy{Budget: *ociImageBudget})
+		var adapterOptions []ocirunner.Option
+		if runtime.GOOS == "darwin" {
+			adapterOptions = append(adapterOptions, ocirunner.WithHostMountRoot(*ociLimaMountRoot))
+		}
+		adapter := ocirunner.NewAdapterWithPolicy(bootBarrier, ocirunner.ImagePolicy{Budget: *ociImageBudget}, adapterOptions...)
+		if runtime.GOOS == "darwin" {
+			binder := limarunner.NewBridgeBinder(*ociLimaInstance)
+			binder.Transport = limaDialer
+			binder.Epoch = bootBarrier
+			ociBridgeBinder = binder
+		}
 		runtimes[contract.JobKindOCI] = adapter
 		capabilities["kind:oci"] = true
 		capabilities["runtime_handler:"+ocihelper.DefaultRuntimeHandler] = true
@@ -193,28 +221,29 @@ func run() error {
 		deadman = ociAttemptDeadman{barrier: bootBarrier, nodeID: *nodeID, bootSessionID: bootSessionID}
 	}
 	nodeAgent, err := agent.New(agent.Config{
-		Fabric:               participant,
-		ControlPlaneAddress:  *controlPlane,
-		RunLedgerAddress:     *runLedger,
-		NodeID:               *nodeID,
-		BootSessionID:        bootSessionID,
-		Version:              version,
-		Capabilities:         capabilities,
-		CapabilityProbe:      capabilityProbe,
-		OCIBootBarrier:       bootBarrier,
-		WorkloadRuntimes:     runtimes,
-		AttemptDeadman:       deadman,
-		HeartbeatInterval:    *heartbeat,
-		ClaimInterval:        *claim,
-		RenewalInterval:      *renewal,
-		FinalizationTimeout:  *finalization,
-		MaxOneshotSlots:      *maxOneshotSlots,
-		MaxServiceSlots:      *maxServiceSlots,
-		LogSpoolDirectory:    *logSpoolDirectory,
-		LogSpoolMaxBytes:     *logSpoolMaxBytes,
-		ManagedRootDirectory: *managedRoot,
-		GuardianExecutable:   agentExecutable,
-		HandoffRoot:          *handoffRoot,
+		Fabric:                  participant,
+		ControlPlaneAddress:     *controlPlane,
+		RunLedgerAddress:        *runLedger,
+		NodeID:                  *nodeID,
+		BootSessionID:           bootSessionID,
+		Version:                 version,
+		Capabilities:            capabilities,
+		CapabilityProbe:         capabilityProbe,
+		OCIBootBarrier:          bootBarrier,
+		WorkloadRuntimes:        runtimes,
+		AttemptDeadman:          deadman,
+		OCIWorkflowBridgeBinder: ociBridgeBinder,
+		HeartbeatInterval:       *heartbeat,
+		ClaimInterval:           *claim,
+		RenewalInterval:         *renewal,
+		FinalizationTimeout:     *finalization,
+		MaxOneshotSlots:         *maxOneshotSlots,
+		MaxServiceSlots:         *maxServiceSlots,
+		LogSpoolDirectory:       *logSpoolDirectory,
+		LogSpoolMaxBytes:        *logSpoolMaxBytes,
+		ManagedRootDirectory:    *managedRoot,
+		GuardianExecutable:      agentExecutable,
+		HandoffRoot:             *handoffRoot,
 		OutputSinkFactory: func(claim l1.Claim) processrunner.OutputSink {
 			return newConsoleOutputSink(os.Stdout, os.Stderr, claim)
 		},

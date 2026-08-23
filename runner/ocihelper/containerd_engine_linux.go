@@ -3,6 +3,7 @@
 package ocihelper
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -24,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	eventtypes "github.com/containerd/containerd/api/events"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
@@ -64,6 +66,9 @@ type containerdAttempt struct {
 	signalCause     string
 	deleted         bool
 	logAcknowledged map[string]uint64
+	hostBridge      net.Listener
+	attemptPort     uint16
+	attemptPortHold net.Listener
 	mu              sync.Mutex
 }
 
@@ -77,7 +82,14 @@ type ContainerdEngine struct {
 	activeLeases    map[string]struct{}
 	mu              sync.Mutex
 	attempts        map[string]*containerdAttempt
+	ports           map[uint16]string
+	nextPort        uint16
 }
+
+const (
+	defaultAttemptPortMin uint16 = 42000
+	defaultAttemptPortMax uint16 = 42999
+)
 
 func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	if config.Address == "" {
@@ -94,6 +106,18 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	}
 	if config.LogSealTimeout <= 0 {
 		config.LogSealTimeout = 5 * time.Second
+	}
+	if config.AttemptPortMin == 0 {
+		config.AttemptPortMin = defaultAttemptPortMin
+	}
+	if config.AttemptPortMax == 0 {
+		config.AttemptPortMax = defaultAttemptPortMax
+	}
+	if config.AttemptPortBindTimeout <= 0 {
+		config.AttemptPortBindTimeout = 5 * time.Second
+	}
+	if config.AttemptPortMin > config.AttemptPortMax {
+		return nil, errors.New("OCI attempt port range is invalid")
 	}
 	copyResolver := config.ResolverPath == ""
 	copyHosts := config.HostsPath == ""
@@ -112,6 +136,28 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	}
 	if !filepath.IsAbs(config.LoggerExecutable) || !filepath.IsAbs(config.RuntimeRoot) {
 		return nil, errors.New("containerd engine logger and runtime root must be absolute")
+	}
+	if (config.HostMountRoot == "") != (config.GuestMountRoot == "") {
+		return nil, errors.New("Lima host and guest mount roots must be configured together")
+	}
+	if config.HostMountRoot != "" {
+		if !filepath.IsAbs(config.HostMountRoot) || !filepath.IsAbs(config.GuestMountRoot) ||
+			filepath.Clean(config.HostMountRoot) == string(filepath.Separator) || filepath.Clean(config.GuestMountRoot) == string(filepath.Separator) {
+			return nil, errors.New("Lima host and guest mount roots must be absolute non-root paths")
+		}
+		config.HostMountRoot = filepath.Clean(config.HostMountRoot)
+		config.GuestMountRoot = filepath.Clean(config.GuestMountRoot)
+		allowed := false
+		for _, root := range config.AllowedMountRoots {
+			cleanRoot := filepath.Clean(root)
+			if config.GuestMountRoot == cleanRoot || strings.HasPrefix(config.GuestMountRoot, cleanRoot+string(filepath.Separator)) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return nil, errors.New("Lima guest mount root must be inside an allowed mount root")
+		}
 	}
 	if filepath.Clean(config.RuntimeRoot) == string(filepath.Separator) {
 		return nil, errors.New("containerd engine runtime root must not be filesystem root")
@@ -133,7 +179,11 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect containerd: %w", err)
 	}
-	return &ContainerdEngine{client: client, config: config, imageOperations: newImageOperationGroup(), activeSpools: make(map[string]struct{}), activeLeases: make(map[string]struct{}), attempts: make(map[string]*containerdAttempt)}, nil
+	return &ContainerdEngine{
+		client: client, config: config, imageOperations: newImageOperationGroup(),
+		activeSpools: make(map[string]struct{}), activeLeases: make(map[string]struct{}), attempts: make(map[string]*containerdAttempt),
+		ports: make(map[uint16]string), nextPort: config.AttemptPortMin,
+	}, nil
 }
 
 func copyManagedNetworkFile(source, target string) error {
@@ -558,13 +608,43 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	}
 	leaseContext := leases.WithLease(ctx, lease.ID)
 	created := true
+	var hostBridge net.Listener
+	var attemptPort uint16
+	var attemptPortHold net.Listener
 	defer func() {
 		if runErr != nil && created {
+			if hostBridge != nil {
+				_ = hostBridge.Close()
+			}
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			defer cancel()
 			runErr = errors.Join(runErr, engine.deleteResources(cleanupCtx, request.Authority, request.Resources))
+			verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
+			runErr = errors.Join(runErr, verifyErr)
+			if verifyErr == nil && verification.Absent {
+				engine.releaseVerifiedAttempt(request.Authority.key())
+			}
 		}
 	}()
+	if request.AllocateAttemptPort {
+		attemptPort, attemptPortHold, err = engine.reserveAttemptPort(request.Authority.key())
+		if err != nil {
+			return RunResponse{}, err
+		}
+		request.Workload.ReservedEnvironment = setReservedEnvironment(
+			request.Workload.ReservedEnvironment, contract.EnvServicePort, fmt.Sprint(attemptPort),
+		)
+	}
+	if request.EnableHostBridgeFallback {
+		hostBridge, err = net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			return RunResponse{}, fmt.Errorf("reserve constrained guest-to-host bridge: %w", err)
+		}
+		request.Workload.ReservedEnvironment, err = fallbackBridgeEnvironment(request.Workload.ReservedEnvironment, hostBridge.Addr())
+		if err != nil {
+			return RunResponse{}, err
+		}
+	}
 
 	image, evidence, err := engine.localImage(leaseContext, request.Workload.ImageReference, request.Workload.ImageDigest)
 	if err != nil {
@@ -596,7 +676,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		if managedErr != nil {
 			return managedErr
 		}
-		operatorSources, translateErr := TranslateOperatorMountSources(request.Workload, IdentityOperatorMountSource)
+		operatorSources, translateErr := TranslateOperatorMountSources(request.Workload, engine.translateOperatorMountSource)
 		if translateErr != nil {
 			return translateErr
 		}
@@ -646,7 +726,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		attemptCancel()
 		return RunResponse{}, fmt.Errorf("register task Wait before Start: %w", err)
 	}
-	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, container: container, task: task, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64)}
+	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, container: container, task: task, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, attemptPort: attemptPort, attemptPortHold: attemptPortHold}
 	engine.watchOOM(attempt)
 	engine.mu.Lock()
 	engine.attempts[request.Authority.key()] = attempt
@@ -655,11 +735,187 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if err := document.RevalidateMounts(); err != nil {
 		return RunResponse{}, &RuntimeSpecRejectionError{err: err}
 	}
+	// Transfer the kernel reservation directly into Start. The logical
+	// authority remains retained until independently verified deletion.
+	if attemptPortHold != nil {
+		if err := attemptPortHold.Close(); err != nil {
+			return RunResponse{}, fmt.Errorf("transfer attempt port reservation: %w", err)
+		}
+		attemptPortHold = nil
+		attempt.mu.Lock()
+		attempt.attemptPortHold = nil
+		attempt.mu.Unlock()
+	}
 	if err := task.Start(leaseContext); err != nil {
 		return RunResponse{}, fmt.Errorf("start runc v2 task: %w", err)
 	}
+	if attemptPort != 0 {
+		bindContext, cancelBind := context.WithTimeout(leaseContext, engine.config.AttemptPortBindTimeout)
+		err = engine.waitAttemptPortOwnership(bindContext, request.Resources.CgroupID, attemptPort)
+		cancelBind()
+		if err != nil {
+			return RunResponse{}, fmt.Errorf("verify payload attempt-port ownership: %w", err)
+		}
+	}
 	created = false
-	return RunResponse{Started: true, Image: &evidence}, nil
+	return RunResponse{Started: true, Image: &evidence, AttemptPort: attemptPort, HostBridgeReady: hostBridge != nil}, nil
+}
+
+func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cgroupID string, port uint16) error {
+	for {
+		inode, found, err := loopbackListenInode(port)
+		if err != nil {
+			return err
+		}
+		if found {
+			owned, err := cgroupOwnsSocket(filepath.Join(engine.config.CgroupRoot, cgroupID, "cgroup.procs"), inode)
+			if err != nil {
+				return err
+			}
+			if !owned {
+				return errors.New("allocated port was bound by a process outside the attempt cgroup")
+			}
+			return nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func loopbackListenInode(port uint16) (string, bool, error) {
+	file, err := os.Open("/proc/net/tcp")
+	if err != nil {
+		return "", false, err
+	}
+	defer file.Close()
+	want := fmt.Sprintf("0100007F:%04X", port)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) > 9 && fields[1] == want && fields[3] == "0A" {
+			return fields[9], true, nil
+		}
+	}
+	return "", false, scanner.Err()
+}
+
+func cgroupOwnsSocket(procsPath, inode string) (bool, error) {
+	payload, err := os.ReadFile(procsPath)
+	if err != nil {
+		return false, err
+	}
+	want := "socket:[" + inode + "]"
+	for _, field := range strings.Fields(string(payload)) {
+		if _, err := strconv.Atoi(field); err != nil {
+			return false, fmt.Errorf("invalid cgroup pid %q", field)
+		}
+		entries, err := os.ReadDir(filepath.Join("/proc", field, "fd"))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return false, err
+		}
+		for _, entry := range entries {
+			target, err := os.Readlink(filepath.Join("/proc", field, "fd", entry.Name()))
+			if err == nil && target == want {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func setReservedEnvironment(environment []EnvironmentVariable, name, value string) []EnvironmentVariable {
+	result := append([]EnvironmentVariable(nil), environment...)
+	for index := range result {
+		if result[index].Name == name {
+			result[index].Value = value
+			return result
+		}
+	}
+	return append(result, EnvironmentVariable{Name: name, Value: value})
+}
+
+func (engine *ContainerdEngine) reserveAttemptPort(authorityKey string) (uint16, net.Listener, error) {
+	width := int(engine.config.AttemptPortMax-engine.config.AttemptPortMin) + 1
+	for count := 0; count < width; count++ {
+		engine.mu.Lock()
+		port := engine.nextPort
+		engine.nextPort++
+		if engine.nextPort > engine.config.AttemptPortMax || engine.nextPort < engine.config.AttemptPortMin {
+			engine.nextPort = engine.config.AttemptPortMin
+		}
+		_, occupied := engine.ports[port]
+		if !occupied {
+			engine.ports[port] = authorityKey
+		}
+		engine.mu.Unlock()
+		if occupied {
+			continue
+		}
+		probe, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(port)))
+		if err == nil {
+			return port, probe, nil
+		}
+		engine.releaseAttemptPort(port, authorityKey)
+	}
+	return 0, nil, errors.New("OCI attempt port range is exhausted")
+}
+
+func (engine *ContainerdEngine) releaseAttemptPort(port uint16, authorityKey string) {
+	if port == 0 {
+		return
+	}
+	engine.mu.Lock()
+	if engine.ports[port] == authorityKey {
+		delete(engine.ports, port)
+	}
+	engine.mu.Unlock()
+}
+
+func (engine *ContainerdEngine) translateOperatorMountSource(source string) (string, error) {
+	if engine.config.HostMountRoot == "" {
+		return IdentityOperatorMountSource(source)
+	}
+	clean := filepath.Clean(source)
+	relative, err := filepath.Rel(engine.config.HostMountRoot, clean)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", errors.New("operator mount source is outside the configured Lima host mount root")
+	}
+	translated := filepath.Join(engine.config.GuestMountRoot, relative)
+	if translated == engine.config.GuestMountRoot || !strings.HasPrefix(translated, engine.config.GuestMountRoot+string(filepath.Separator)) {
+		return "", errors.New("operator mount source translation escaped the configured Lima guest mount root")
+	}
+	return translated, nil
+}
+
+func fallbackBridgeEnvironment(environment []EnvironmentVariable, address net.Addr) ([]EnvironmentVariable, error) {
+	index := -1
+	var endpoint *url.URL
+	for position, variable := range environment {
+		if variable.Name != contract.EnvL3Endpoint {
+			continue
+		}
+		parsed, err := url.Parse(variable.Value)
+		if err != nil || parsed.Scheme != "http" || parsed.Host == "" {
+			return nil, errors.New("Lima host bridge fallback requires a valid HTTP WEFTY_L3_ENDPOINT")
+		}
+		index, endpoint = position, parsed
+		break
+	}
+	if index < 0 {
+		return nil, errors.New("Lima host bridge fallback requires WEFTY_L3_ENDPOINT")
+	}
+	endpoint.Host = address.String()
+	result := append([]EnvironmentVariable(nil), environment...)
+	result[index].Value = endpoint.String()
+	return result, nil
 }
 
 func (engine *ContainerdEngine) Signal(ctx context.Context, request SignalRequest) error {
@@ -805,6 +1061,7 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 		deleteErr := engine.deleteResources(cleanupCtx, request.Authority, resources)
 		verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
 		if deleteErr == nil && verifyErr == nil && verification.Absent {
+			engine.releaseVerifiedAttempt(request.Authority.key())
 			return DeleteResponse{Deleted: true}, nil
 		}
 		lastErr = errors.Join(deleteErr, verifyErr)
@@ -873,7 +1130,11 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 		}
 		inventory = filterInventory(inventory, resources)
 	}
-	return VerifyResponse{Absent: inventoryEmpty(inventory), Inventory: inventory}, nil
+	absent := inventoryEmpty(inventory)
+	if absent && request.Scope == VerifyNamespace {
+		engine.releaseVerifiedNamespace()
+	}
+	return VerifyResponse{Absent: absent, Inventory: inventory}, nil
 }
 
 func (engine *ContainerdEngine) Sweep(ctx context.Context, _ SweepRequest) (SweepResponse, error) {
@@ -889,6 +1150,10 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, _ SweepRequest) (Swee
 		attempt.mu.Lock()
 		if attempt.oomCancel != nil {
 			attempt.oomCancel()
+		}
+		if attempt.hostBridge != nil {
+			_ = attempt.hostBridge.Close()
+			attempt.hostBridge = nil
 		}
 		attempt.mu.Unlock()
 	}
@@ -1030,9 +1295,6 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 			}
 		}
 	}
-	engine.mu.Lock()
-	engine.attempts = make(map[string]*containerdAttempt)
-	engine.mu.Unlock()
 	priorList := mapKeys(prior)
 	attemptList := make([]SweptAttemptAuthority, 0, len(attempts))
 	for _, attempt := range attempts {
@@ -1042,11 +1304,46 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 	return SweepResponse{Removed: inventoryCount(inventory), PriorBootSessionsSeen: priorList, Inventory: inventory, Attempts: attemptList}, nil
 }
 
-func (engine *ContainerdEngine) DialAttemptPort(context.Context, DialAttemptPortRequest, io.ReadWriteCloser) error {
-	return errEngineUnavailable
+func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
+	dialer := &net.Dialer{}
+	backend, err := dialer.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(request.Port)))
+	if err != nil {
+		return fmt.Errorf("dial attempt loopback port: %w", err)
+	}
+	defer backend.Close()
+	return Relay(ctx, stream, backend)
 }
-func (engine *ContainerdEngine) DialHostBridge(context.Context, DialHostBridgeRequest, io.ReadWriteCloser) error {
-	return errEngineUnavailable
+func (engine *ContainerdEngine) DialHostBridge(ctx context.Context, request DialHostBridgeRequest, stream io.ReadWriteCloser) error {
+	attempt, err := engine.attempt(request.Authority)
+	if err != nil {
+		return err
+	}
+	attempt.mu.Lock()
+	listener, ok := attempt.hostBridge.(*net.TCPListener)
+	attempt.mu.Unlock()
+	if !ok || listener == nil {
+		return errors.New("attempt has no guest-to-host bridge fallback")
+	}
+	var guest net.Conn
+	for guest == nil {
+		if err := listener.SetDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+			return err
+		}
+		guest, err = listener.Accept()
+		if err == nil {
+			break
+		}
+		var timeout net.Error
+		if !errors.As(err, &timeout) || !timeout.Timeout() {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	_ = listener.SetDeadline(time.Time{})
+	defer guest.Close()
+	return Relay(ctx, stream, guest)
 }
 
 func (engine *ContainerdEngine) attempt(authority AttemptAuthority) (*containerdAttempt, error) {
@@ -1069,6 +1366,16 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 		if attempt.cancel != nil {
 			attempt.cancel()
 		}
+		attempt.mu.Lock()
+		if attempt.hostBridge != nil {
+			_ = attempt.hostBridge.Close()
+			attempt.hostBridge = nil
+		}
+		if attempt.attemptPortHold != nil {
+			_ = attempt.attemptPortHold.Close()
+			attempt.attemptPortHold = nil
+		}
+		attempt.mu.Unlock()
 		if attempt.oomCancel != nil {
 			attempt.oomCancel()
 		}
@@ -1111,10 +1418,40 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 			failures = append(failures, err)
 		}
 	}
-	engine.mu.Lock()
-	delete(engine.attempts, authority.key())
-	engine.mu.Unlock()
 	return errors.Join(failures...)
+}
+
+func (engine *ContainerdEngine) releaseVerifiedAttempt(authorityKey string) {
+	engine.mu.Lock()
+	attempt := engine.attempts[authorityKey]
+	delete(engine.attempts, authorityKey)
+	if attempt != nil {
+		attempt.mu.Lock()
+		if attempt.attemptPortHold != nil {
+			_ = attempt.attemptPortHold.Close()
+			attempt.attemptPortHold = nil
+		}
+		attempt.mu.Unlock()
+	}
+	if attempt != nil && engine.ports[attempt.attemptPort] == authorityKey {
+		delete(engine.ports, attempt.attemptPort)
+	}
+	engine.mu.Unlock()
+}
+
+func (engine *ContainerdEngine) releaseVerifiedNamespace() {
+	engine.mu.Lock()
+	for _, attempt := range engine.attempts {
+		attempt.mu.Lock()
+		if attempt.attemptPortHold != nil {
+			_ = attempt.attemptPortHold.Close()
+		}
+		attempt.mu.Unlock()
+	}
+	engine.attempts = make(map[string]*containerdAttempt)
+	engine.ports = make(map[uint16]string)
+	engine.nextPort = engine.config.AttemptPortMin
+	engine.mu.Unlock()
 }
 
 func (engine *ContainerdEngine) localImage(ctx context.Context, reference, immutableDigest string) (containerd.Image, ImageEvidence, error) {

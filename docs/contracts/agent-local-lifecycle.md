@@ -95,6 +95,15 @@ adapter then returns a structured attempt outcome and implements
 receipt after `Run` returns and treats its absence as an `output_error`
 finalization failure before durable completion is stored.
 
+For a Mac OCI one-shot that needs the run bridge, the agent asks Lima itself to
+resolve `host.lima.internal`, binds only that discovered guest-visible host
+address, and injects the hostname plus the allocated port. It never binds a
+wildcard or uses a fixed gateway address. Only failure to bind the successfully
+discovered address selects the helper fallback: the host bridge stays on
+loopback, `Run` explicitly requests fallback authority, and the OCI adapter
+pumps attempt-capability streams from the helper into that one existing bridge.
+Discovery failure is a start failure, not permission to broaden the listener.
+
 A receipt names its evidence kind. Same-boot process attempts use consumed,
 full-authority `attempt` evidence. When a removal directive first reaches a
 returning node after an offline agent boot, the process adapter may instead
@@ -110,9 +119,11 @@ digest validation, interpreter resolution, materialization, and cleanup are
 owned by the process adapter; the agent lifecycle never materializes a
 kind-specific executable.
 
-`ServiceAddress` remains a known process-specific field in the otherwise
-runtime-neutral request. Ticket #147 replaces it with an adapter-supplied
-opaque dial endpoint; managed-resource handles are already opaque here.
+`ServiceAddress` remains only for the process readiness guardian. A portful OCI
+request instead asks its adapter for an `AttemptEndpoint`: the helper allocates
+the guest loopback port and the adapter returns an exact-authority dial closure.
+Ticket #147 consumes that closure for OCI readiness; the local service front
+door already remains ignorant of guest addresses.
 
 ## Attempts and occupancy
 

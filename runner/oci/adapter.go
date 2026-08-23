@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"sort"
 	"sync"
 	"time"
@@ -29,10 +31,18 @@ type Adapter struct {
 	mu                    sync.Mutex
 	consumedSweepEvidence map[string]struct{}
 	runEntered            map[workloadrunner.AttemptAuthority]bool
+	hostMountRoot         string
+	mountGuards           map[string]*ocihelper.HostMountGuard
 }
 
-func NewAdapter(sessions SessionSource) *Adapter {
-	return NewAdapterWithPolicy(sessions, ImagePolicy{})
+type Option func(*Adapter)
+
+func WithHostMountRoot(root string) Option {
+	return func(adapter *Adapter) { adapter.hostMountRoot = root }
+}
+
+func NewAdapter(sessions SessionSource, options ...Option) *Adapter {
+	return NewAdapterWithPolicy(sessions, ImagePolicy{}, options...)
 }
 
 const DefaultImageBudget = 10 * time.Minute
@@ -47,7 +57,7 @@ type ImagePolicy struct {
 	Sleep          func(context.Context, time.Duration) error
 }
 
-func NewAdapterWithPolicy(sessions SessionSource, policy ImagePolicy) *Adapter {
+func NewAdapterWithPolicy(sessions SessionSource, policy ImagePolicy, options ...Option) *Adapter {
 	if policy.Budget <= 0 {
 		policy.Budget = DefaultImageBudget
 	}
@@ -60,7 +70,11 @@ func NewAdapterWithPolicy(sessions SessionSource, policy ImagePolicy) *Adapter {
 	if policy.Sleep == nil {
 		policy.Sleep = sleepContext
 	}
-	return &Adapter{sessions: sessions, imagePolicy: policy, consumedSweepEvidence: make(map[string]struct{}), runEntered: make(map[workloadrunner.AttemptAuthority]bool)}
+	adapter := &Adapter{sessions: sessions, imagePolicy: policy, consumedSweepEvidence: make(map[string]struct{}), runEntered: make(map[workloadrunner.AttemptAuthority]bool), mountGuards: make(map[string]*ocihelper.HostMountGuard)}
+	for _, option := range options {
+		option(adapter)
+	}
+	return adapter
 }
 
 // LoadImage is the agent-side offline-import seam used by the node-local
@@ -104,6 +118,19 @@ func (adapter *Adapter) LoadImage(ctx context.Context, reference string, archive
 		return ocihelper.EnsureImageResponse{}, errors.New("OCI helper completed image import without immutable digests")
 	}
 	return response, nil
+}
+
+// DialAttemptPort exposes the helper's exact-authority host-to-guest stream to
+// the agent-side readiness/front-door seam. It is never a general guest dialer.
+func (adapter *Adapter) DialAttemptPort(ctx context.Context, authority workloadrunner.AttemptAuthority, port uint16) (net.Conn, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return nil, errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return nil, err
+	}
+	return session.DialAttemptPort(ctx, ocihelper.DialAttemptPortRequest{Authority: HelperAuthority(authority), Port: port})
 }
 
 type sweepReceiptSource interface {
@@ -186,9 +213,6 @@ func (adapter *Adapter) Preflight(_ context.Context, request workloadrunner.Requ
 		request.Authority.AttemptID == "" || request.Authority.FencingToken == "" || request.Authority.WorkloadClass == "" || request.Authority.RemovalGeneration == "" {
 		return failedAdmission(admission, contract.SpawnFailureProcessRequest, errors.New("OCI runtime authority is incomplete"))
 	}
-	if request.Authority.WorkloadClass != contract.JobClassOneShot {
-		return failedAdmission(admission, contract.SpawnFailureProcessRequest, errors.New("native OCI service lifecycle is not installed"))
-	}
 	if request.Execution.OCI == nil {
 		return failedAdmission(admission, contract.SpawnFailureProcessRequest, errors.New("OCI execution arm is required"))
 	}
@@ -200,6 +224,31 @@ func (adapter *Adapter) Preflight(_ context.Context, request workloadrunner.Requ
 	}
 	if request.InitialDeadman <= 0 {
 		return failedAdmission(admission, contract.SpawnFailureProcessRequest, errors.New("OCI initial deadman is required"))
+	}
+	if len(request.Execution.OCI.Mounts) > 0 && adapter.hostMountRoot != "" {
+		paths := make([]string, 0, len(request.Execution.OCI.Mounts))
+		for _, mount := range request.Execution.OCI.Mounts {
+			paths = append(paths, mount.NodePath)
+		}
+		guard, err := ocihelper.OpenHostMountGuard(paths, adapter.hostMountRoot)
+		if err != nil {
+			return failedAdmission(admission, contract.SpawnFailureProcessRequest, fmt.Errorf("validate Lima host mount sources: %w", err))
+		}
+		key := adapterAuthorityKey(request.Authority)
+		adapter.mu.Lock()
+		adapter.mountGuards[key] = guard
+		adapter.mu.Unlock()
+		admission.Release = func() {
+			adapter.mu.Lock()
+			if adapter.mountGuards[key] == guard {
+				delete(adapter.mountGuards, key)
+			}
+			adapter.mu.Unlock()
+			_ = guard.Close()
+		}
+	}
+	if request.AttemptPortRequired && request.AttemptEndpointReady == nil {
+		return failedAdmission(admission, contract.SpawnFailureProcessRequest, errors.New("OCI attempt endpoint callback is required for portful work"))
 	}
 	return admission, workloadrunner.Result{}, nil
 }
@@ -233,10 +282,20 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	execution.Image.Digest = &image.TopLevelDigest
 	request.Execution.OCI = &execution
 	authority := HelperAuthority(request.Authority)
+	adapter.mu.Lock()
+	guard := adapter.mountGuards[adapterAuthorityKey(request.Authority)]
+	adapter.mu.Unlock()
+	if guard != nil {
+		if err := guard.Revalidate(); err != nil {
+			return spawnResult(contract.SpawnFailureProcessRequest, err), err
+		}
+	}
 	adapter.markRunEntered(request.Authority, true)
 	runResponse, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: authority, InitialDeadman: request.InitialDeadman,
-		Workload: workloadInput(request),
+		AllocateAttemptPort:      request.AttemptPortRequired,
+		EnableHostBridgeFallback: request.HostBridgeDial != nil,
+		Workload:                 workloadInput(request),
 	})
 	if err != nil {
 		if failure := ocihelper.SpawnFailureForRunError(err); failure != nil {
@@ -246,6 +305,30 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	}
 	if runResponse.Image == nil {
 		err := errors.New("OCI helper Started response omitted image evidence")
+		_ = reapAfterFailedStart(session, authority)
+		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+	}
+	if request.HostBridgeDial != nil && (!runResponse.HostBridgeReady || runResponse.BridgeCapability == "") {
+		err := errors.New("OCI helper omitted the requested host bridge fallback authority")
+		_ = reapAfterFailedStart(session, authority)
+		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+	}
+	if request.AttemptPortRequired {
+		if runResponse.AttemptPort == 0 {
+			err := errors.New("OCI helper omitted the requested attempt port")
+			_ = reapAfterFailedStart(session, authority)
+			return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+		}
+		port := runResponse.AttemptPort
+		endpoint := workloadrunner.AttemptEndpoint{Port: port, Dial: func(dialContext context.Context) (net.Conn, error) {
+			return adapter.DialAttemptPort(dialContext, request.Authority, port)
+		}}
+		if err := request.AttemptEndpointReady(endpoint); err != nil {
+			_ = reapAfterFailedStart(session, authority)
+			return spawnResult(contract.SpawnFailureProcessRequest, err), err
+		}
+	} else if runResponse.AttemptPort != 0 {
+		err := errors.New("OCI helper returned an unrequested attempt port")
 		_ = reapAfterFailedStart(session, authority)
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
@@ -260,23 +343,44 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	}
 
 	var completion *ocihelper.WatchResponse
-	err = session.Watch(ctx, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
-		if event.Log != nil && sink != nil {
-			logEvent := contract.LogEvent{
-				AttemptID: request.Authority.AttemptID, Stream: contract.LogStream(event.Log.Stream),
-				Sequence: event.Log.Sequence, Timestamp: time.Now().UTC(), Bytes: event.Log.Bytes,
+	watchDone := make(chan error, 1)
+	go func() {
+		watchDone <- session.Watch(ctx, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
+			if event.Log != nil && sink != nil {
+				logEvent := contract.LogEvent{
+					AttemptID: request.Authority.AttemptID, Stream: contract.LogStream(event.Log.Stream),
+					Sequence: event.Log.Sequence, Timestamp: time.Now().UTC(), Bytes: event.Log.Bytes,
+				}
+				if event.Log.Gap != nil {
+					logEvent.Gap = &contract.LogGap{ThroughSequence: event.Log.Gap.ThroughSequence, LostEventCount: event.Log.Gap.LostEventCount, LostByteCount: event.Log.Gap.LostByteCount, Reason: contract.LogGapLoggerSourceIncomplete}
+				}
+				return sink.WriteOutput(ctx, logEvent)
 			}
-			if event.Log.Gap != nil {
-				logEvent.Gap = &contract.LogGap{ThroughSequence: event.Log.Gap.ThroughSequence, LostEventCount: event.Log.Gap.LostEventCount, LostByteCount: event.Log.Gap.LostByteCount, Reason: contract.LogGapLoggerSourceIncomplete}
+			if event.Result != nil {
+				copy := *event.Result
+				completion = &copy
 			}
-			return sink.WriteOutput(ctx, logEvent)
+			return nil
+		})
+	}()
+	if request.HostBridgeDial != nil {
+		bridgeContext, cancelBridge := context.WithCancel(ctx)
+		const bridgeConcurrency = 4
+		bridgeDone := make(chan struct{}, bridgeConcurrency)
+		for range bridgeConcurrency {
+			go func() {
+				pumpHostBridge(bridgeContext, session, authority, runResponse.BridgeCapability, request.HostBridgeDial)
+				bridgeDone <- struct{}{}
+			}()
 		}
-		if event.Result != nil {
-			copy := *event.Result
-			completion = &copy
+		err = <-watchDone
+		cancelBridge()
+		for range bridgeConcurrency {
+			<-bridgeDone
 		}
-		return nil
-	})
+	} else {
+		err = <-watchDone
+	}
 	if err != nil {
 		return runtimeFailure(err), err
 	}
@@ -420,6 +524,60 @@ func sleepContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
+func pumpHostBridge(
+	ctx context.Context,
+	session *ocihelper.Session,
+	authority ocihelper.AttemptAuthority,
+	capability string,
+	dialHost func(context.Context) (net.Conn, error),
+) {
+	for {
+		helper, err := session.DialHostBridge(ctx, ocihelper.DialHostBridgeRequest{Authority: authority, BridgeCapability: capability})
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("OCI host bridge connection retry: open constrained helper stream: %v", err)
+			if !waitBridgeRetry(ctx) {
+				return
+			}
+			continue
+		}
+		host, err := dialHost(ctx)
+		if err != nil {
+			_ = helper.Close()
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("OCI host bridge connection retry: dial host-local bridge: %v", err)
+			if !waitBridgeRetry(ctx) {
+				return
+			}
+			continue
+		}
+		err = ocihelper.Relay(ctx, helper, host)
+		_ = helper.Close()
+		_ = host.Close()
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			log.Printf("OCI host bridge connection retry: relay: %v", err)
+		}
+	}
+}
+
+func waitBridgeRetry(ctx context.Context) bool {
+	timer := time.NewTimer(25 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
 	adapter.mu.Lock()
 	entered, tracked := adapter.runEntered[request.Authority]
@@ -494,6 +652,10 @@ func HelperAuthority(authority workloadrunner.AttemptAuthority) ocihelper.Attemp
 	}
 }
 
+func adapterAuthorityKey(authority workloadrunner.AttemptAuthority) string {
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", authority.NodeID, authority.BootSessionID, authority.JobID, authority.AttemptID, authority.FencingToken, authority.WorkloadClass, authority.RemovalGeneration)
+}
+
 func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 	execution := request.Execution.OCI
 	digest := ""
@@ -504,10 +666,21 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 	if execution.WorkingDirectory != nil {
 		workingDirectory = *execution.WorkingDirectory
 	}
+	public, reservedPublic := splitEnvironment(request.Execution.Env)
+	sensitive, reservedSensitive := splitEnvironment(request.Execution.SensitiveEnv)
+	reservedValues := make(map[string]string, len(reservedPublic)+len(reservedSensitive))
+	for _, variable := range reservedPublic {
+		reservedValues[variable.Name] = variable.Value
+	}
+	// SensitiveEnv has the same precedence it has for non-reserved variables.
+	for _, variable := range reservedSensitive {
+		reservedValues[variable.Name] = variable.Value
+	}
+	reserved := environment(reservedValues)
 	input := ocihelper.WorkloadInput{
 		ImageReference: execution.Image.Reference, ImageDigest: digest,
 		Argv: append([]string(nil), execution.Argv...), WorkingDirectory: workingDirectory,
-		Environment: environment(request.Execution.Env), SensitiveEnvironment: environment(request.Execution.SensitiveEnv),
+		Environment: public, SensitiveEnvironment: sensitive, ReservedEnvironment: reserved,
 	}
 	for _, mount := range execution.Mounts {
 		input.OperatorMounts = append(input.OperatorMounts, ocihelper.OperatorMount{NodePath: mount.NodePath, ContainerPath: mount.ContainerPath, ReadOnly: mount.ReadOnly})
@@ -521,6 +694,19 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 		}
 	}
 	return input
+}
+
+func splitEnvironment(values map[string]string) ([]ocihelper.EnvironmentVariable, []ocihelper.EnvironmentVariable) {
+	public := make(map[string]string, len(values))
+	reserved := make(map[string]string)
+	for name, value := range values {
+		if contract.IsOCIReservedEnvironmentName(name) {
+			reserved[name] = value
+		} else {
+			public[name] = value
+		}
+	}
+	return environment(public), environment(reserved)
 }
 
 func environment(values map[string]string) []ocihelper.EnvironmentVariable {

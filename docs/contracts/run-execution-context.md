@@ -27,6 +27,16 @@ Fabric identity cannot become an L1 client passthrough. The bridge is transport
 only: callers must still send the run token, and no Fabric tag privilege is
 projected into the workflow process.
 
+Linux and process workloads receive the loopback bridge URL. A Mac OCI
+workload receives `host.lima.internal:<port>` after the agent discovers and
+binds that Lima gateway surface. If that exact bind fails, the helper replaces
+the reserved endpoint with its attempt-local guest loopback listener and the
+agent carries connections through the separately authorized `DialHostBridge`
+stream. Lima's filled ignore rule explicitly uses `guestIP: 0.0.0.0` with
+`guestIPMustBeZero: false`, ports 1-65535, and `proto: any`, so it matches both
+loopback and wildcard guest listeners rather than creating an ambient host
+door. No form exposes the bridge on a host wildcard or embeds a fixed gateway.
+
 For `kind=oci`, the exact reserved-name set is `WEFTY_HANDOFF_DIR`,
 `WEFTY_SERVICE_DIR`, `WEFTY_SERVICE_PORT`, `WEFTY_L3_ENDPOINT`,
 `WEFTY_RUN_TOKEN`, `WEFTY_COMPUTER_TOKEN`, `WEFTY_COMPUTER_VIEW_PORT`, and

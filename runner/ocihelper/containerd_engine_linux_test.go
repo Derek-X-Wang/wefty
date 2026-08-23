@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -392,4 +393,189 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)
+}
+
+func TestLimaOperatorMountTranslationStaysWithinConfiguredRoots(t *testing.T) {
+	engine := &ContainerdEngine{config: NativeEngineConfig{HostMountRoot: "/Users/operator/wefty", GuestMountRoot: "/mnt/wefty-host"}}
+	translated, err := engine.translateOperatorMountSource("/Users/operator/wefty/project/data")
+	if err != nil || translated != "/mnt/wefty-host/project/data" {
+		t.Fatalf("translated source = %q, %v", translated, err)
+	}
+	for _, source := range []string{"/Users/operator/wefty", "/Users/operator/other", "/Users/operator/wefty/../escape"} {
+		if _, err := engine.translateOperatorMountSource(source); err == nil {
+			t.Fatalf("accepted unsafe host mount source %q", source)
+		}
+	}
+}
+
+func TestNewContainerdEngineRejectsGuestMountRootOutsideAllowedRoots(t *testing.T) {
+	_, err := NewContainerdEngine(NativeEngineConfig{
+		RuntimeRoot: t.TempDir(), HostMountRoot: "/Users/operator/wefty",
+		GuestMountRoot: "/mnt/wefty-host", AllowedMountRoots: []string{"/srv/wefty"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "inside an allowed mount root") {
+		t.Fatalf("constructor error = %v", err)
+	}
+}
+
+func TestDialAttemptPortProxiesOnlyTheRequestedLoopbackPort(t *testing.T) {
+	backend, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	backendPort := uint16(backend.Addr().(*net.TCPAddr).Port)
+	backendDone := make(chan error, 1)
+	go func() {
+		connection, err := backend.Accept()
+		if err != nil {
+			backendDone <- err
+			return
+		}
+		defer connection.Close()
+		payload := make([]byte, 4)
+		if _, err := io.ReadFull(connection, payload); err == nil && string(payload) != "ping" {
+			err = io.ErrUnexpectedEOF
+		}
+		if err == nil {
+			_, err = connection.Write([]byte("pong"))
+		}
+		backendDone <- err
+	}()
+	client, helper := net.Pipe()
+	engineDone := make(chan error, 1)
+	go func() {
+		engine := &ContainerdEngine{}
+		engineDone <- engine.DialAttemptPort(t.Context(), DialAttemptPortRequest{Port: backendPort}, helper)
+	}()
+	if _, err := client.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, 4)
+	if _, err := io.ReadFull(client, response); err != nil || string(response) != "pong" {
+		t.Fatalf("attempt-port response = %q, %v", response, err)
+	}
+	_ = client.Close()
+	if err := <-backendDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-engineDone; err != nil && err != context.Canceled {
+		t.Fatal(err)
+	}
+}
+
+func TestAttemptPortAllocationRemainsAttemptScopedUntilRelease(t *testing.T) {
+	probe, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint16(probe.Addr().(*net.TCPAddr).Port)
+	probe.Close()
+	engine := &ContainerdEngine{
+		config: NativeEngineConfig{AttemptPortMin: port, AttemptPortMax: port},
+		ports:  make(map[uint16]string), nextPort: port,
+	}
+	allocated, hold, err := engine.reserveAttemptPort("attempt-a")
+	if err != nil || allocated != port {
+		t.Fatalf("first allocation = %d, %v", allocated, err)
+	}
+	if _, _, err := engine.reserveAttemptPort("attempt-b"); err == nil {
+		t.Fatal("allocated one reserved port to two attempts")
+	}
+	engine.releaseAttemptPort(port, "attempt-b")
+	if _, _, err := engine.reserveAttemptPort("attempt-b"); err == nil {
+		t.Fatal("wrong attempt released another attempt's port")
+	}
+	_ = hold.Close()
+	engine.releaseAttemptPort(port, "attempt-a")
+	if allocated, hold, err := engine.reserveAttemptPort("attempt-b"); err != nil || allocated != port {
+		t.Fatalf("allocation after exact release = %d, %v", allocated, err)
+	} else {
+		_ = hold.Close()
+	}
+}
+
+func TestResidualVerificationRetainsPortAgainstConcurrentAllocation(t *testing.T) {
+	probe, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint16(probe.Addr().(*net.TCPAddr).Port)
+	_ = probe.Close()
+	engine := &ContainerdEngine{config: NativeEngineConfig{AttemptPortMin: port, AttemptPortMax: port}, attempts: make(map[string]*containerdAttempt), ports: make(map[uint16]string), nextPort: port}
+	allocated, hold, err := engine.reserveAttemptPort("attempt-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.attempts["attempt-a"] = &containerdAttempt{attemptPort: allocated, attemptPortHold: hold}
+	// Forced residual verification means releaseVerifiedAttempt is deliberately
+	// not called. Both logical and kernel ownership must remain unavailable.
+	if _, _, err := engine.reserveAttemptPort("attempt-b"); err == nil {
+		t.Fatal("residual verification recycled a live attempt port")
+	}
+	engine.releaseVerifiedAttempt("attempt-a")
+	if _, nextHold, err := engine.reserveAttemptPort("attempt-b"); err != nil {
+		t.Fatalf("verified absence did not release port: %v", err)
+	} else {
+		_ = nextHold.Close()
+	}
+}
+
+func TestAttemptPortRejectsAdversarialBindOutsidePayloadCgroup(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+	cgroupRoot := t.TempDir()
+	cgroupID := "attempt-cgroup"
+	if err := os.Mkdir(filepath.Join(cgroupRoot, cgroupID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupRoot, cgroupID, "cgroup.procs"), []byte("99999999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{CgroupRoot: cgroupRoot}}
+	err = engine.waitAttemptPortOwnership(t.Context(), cgroupID, port)
+	if err == nil || !strings.Contains(err.Error(), "outside the attempt cgroup") {
+		t.Fatalf("adversarial bind error = %v", err)
+	}
+}
+
+func TestDialHostBridgePairsOnlyTheAttemptsGuestListener(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := AttemptAuthority{NodeID: "node", JobID: "job", AttemptID: "attempt", FencingToken: "fence", BootSessionID: "boot", Class: "one-shot", RemovalGeneration: "attempt"}
+	engine := &ContainerdEngine{attempts: map[string]*containerdAttempt{authority.key(): {authority: authority, hostBridge: listener}}}
+	host, helper := net.Pipe()
+	engineDone := make(chan error, 1)
+	go func() {
+		engineDone <- engine.DialHostBridge(t.Context(), DialHostBridgeRequest{Authority: authority}, helper)
+	}()
+	guest, err := net.Dial("tcp4", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guest.Write([]byte("guest")); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 5)
+	if _, err := io.ReadFull(host, payload); err != nil || string(payload) != "guest" {
+		t.Fatalf("host payload = %q, %v", payload, err)
+	}
+	if _, err := host.Write([]byte("host")); err != nil {
+		t.Fatal(err)
+	}
+	payload = make([]byte, 4)
+	if _, err := io.ReadFull(guest, payload); err != nil || string(payload) != "host" {
+		t.Fatalf("guest payload = %q, %v", payload, err)
+	}
+	_ = guest.Close()
+	_ = host.Close()
+	if err := <-engineDone; err != nil && err != context.Canceled {
+		t.Fatal(err)
+	}
 }
