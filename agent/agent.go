@@ -15,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -30,11 +31,6 @@ const (
 	DefaultLogSpoolMaxBytes        = 64 << 20
 	DefaultServiceLogSpoolMaxBytes = 32 << 20
 )
-
-// ProcessRunner is the execution seam used by the node loop.
-type ProcessRunner interface {
-	Run(context.Context, processrunner.Request, processrunner.OutputSink) (contract.ProcessResult, error)
-}
 
 // OutputSinkFactory creates an optional local output destination for a claimed
 // attempt. It may be invoked concurrently and must return an attempt-isolated
@@ -74,10 +70,14 @@ type Config struct {
 	LogSpoolMaxBytes       int64
 	ManagedRootDirectory   string
 	GuardianExecutable     string
-	Runner                 ProcessRunner
-	OutputSinkFactory      OutputSinkFactory
-	HandoffRoot            string
-	HandoffRetention       time.Duration
+	// WorkloadRuntimes supplies open kind adapters. kind=process is installed
+	// by default and may be replaced through this map. A capability may be
+	// advertised without a matching local adapter, in which case local
+	// admission fails closed.
+	WorkloadRuntimes  map[string]WorkloadRuntime
+	OutputSinkFactory OutputSinkFactory
+	HandoffRoot       string
+	HandoffRetention  time.Duration
 	// Logf need not be goroutine-safe. Agent serializes calls made through it.
 	Logf  func(string, ...any)
 	Clock Clock
@@ -96,7 +96,7 @@ type Agent struct {
 	// logSpool is a compatibility view used by existing package tests. The
 	// process-lifetime evidenceOutbox is its sole owner.
 	logSpool          *logSpool
-	runner            ProcessRunner
+	runtimes          workloadRuntimeSet
 	managedResource   managedResourceManager
 	outputSinkFactory OutputSinkFactory
 	handoffs          *handoffManager
@@ -134,7 +134,6 @@ func New(config Config) (*Agent, error) {
 	if architecture == "" {
 		architecture = runtime.GOARCH
 	}
-	runner := config.Runner
 	clock := config.Clock
 	if clock == nil {
 		clock = systemClock{}
@@ -143,10 +142,15 @@ func New(config Config) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	if runner == nil {
-		runner = processrunner.New(processrunner.Config{
+	runtimes, err := newWorkloadRuntimeSet(config.WorkloadRuntimes)
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
+	if _, configured := runtimes.selectKind(contract.JobKindProcess); !configured {
+		runtimes[contract.JobKindProcess] = processrunner.NewAdapterForBoot(processrunner.New(processrunner.Config{
 			Clock: processClockAdapter{clock: clock}, GuardianExecutable: config.GuardianExecutable,
-		})
+		}), config.BootSessionID)
 	}
 	managedResource, err := initializeManagedResource(config.ManagedRootDirectory, config.NodeID, config.BootSessionID)
 	if err != nil {
@@ -203,6 +207,21 @@ func New(config Config) (*Agent, error) {
 		intOrDefault(config.MaxOneshotSlots, l1.DefaultMaxOneshotSlots),
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
+	if resource, ok := managedResource.(*processManagedResource); ok && resource.previousBootSessionID != "" {
+		if adapter, found := runtimes.selectKind(contract.JobKindProcess); found {
+			if reaper, ok := adapter.(workloadrunner.PriorBootReaper); ok {
+				session.reapPriorBoot = func(ctx context.Context, jobID string) (workloadrunner.ReapReceipt, error) {
+					// TODO(#139): the OCI boot-sweep receipt plugs into this same
+					// runtime-neutral path when the OCI adapter exists.
+					return reaper.ReapPriorBoot(ctx, workloadrunner.PriorBootReapRequest{
+						NodeID: config.NodeID, JobID: jobID,
+						PriorBootSessionID:   resource.previousBootSessionID,
+						CurrentBootSessionID: config.BootSessionID,
+					})
+				}
+			}
+		}
+	}
 	session.removals = newRemovalController(
 		client, outbox, managedResource, session,
 		config.NodeID, config.BootSessionID, logf,
@@ -212,7 +231,7 @@ func New(config Config) (*Agent, error) {
 		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
 		finalizationTimeout: durationOrDefault(config.FinalizationTimeout, DefaultFinalizationTimeout),
 		logRetryInterval:    logRetryInterval, session: session, outbox: outbox, logSpool: outbox.spool,
-		runner: runner, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
+		runtimes: runtimes, managedResource: managedResource, outputSinkFactory: config.OutputSinkFactory,
 		handoffs: newHandoffManager(config.HandoffRoot, durationOrDefault(config.HandoffRetention, DefaultHandoffRetention)),
 		logf:     logf, clock: clock, observer: observer, capabilities: capabilities,
 		nodeLock: stableNodeLock,
@@ -284,8 +303,8 @@ func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim, claimStarted t
 	return a.newAttemptLifecycle().execute(ctx, claim, claimStarted)
 }
 
-func (a *Agent) runProcess(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
-	return a.newAttemptLifecycle().runProcess(ctx, claim)
+func (a *Agent) runWorkload(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
+	return a.newAttemptLifecycle().runWorkload(ctx, claim)
 }
 
 func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
@@ -294,18 +313,26 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		allowsStart = a.capabilities.allows
 	}
 	return newAttemptLifecycle(attemptLifecycleDependencies{
-		client: a.sessionClient(), runner: a.runner, outbox: a.outbox,
+		client: a.sessionClient(), runtimes: a.runtimes, outbox: a.outbox,
 		watchdog: newAuthorityWatchdog(a.clock), clock: a.clock,
 		renewalInterval: a.renewalInterval, completionRetry: a.logRetryInterval,
 		finalizationTimeout: a.finalizationTimeout,
 		outputSinkFactory:   a.outputSinkFactory, handoffs: a.handoffs,
 		managedResource: a.managedResource,
-		nodeID:          a.registration.NodeID, workflowBridge: a.startWorkflowBridge, logf: a.logf,
+		nodeID:          a.registration.NodeID, bootSessionID: a.registration.BootSessionID,
+		workflowBridge: a.startWorkflowBridge, logf: a.logf,
 		observer: a.observer, reservePublishedPort: a.reservePublishedPort,
 		prepareServiceEndpoint: prepareProcessServiceEndpoint,
 		prepareAuthorityLoss:   a.prepareAuthorityLoss,
 		allowsStart:            allowsStart,
+		runtimeReaped:          a.recordRuntimeReap,
 	})
+}
+
+func (a *Agent) recordRuntimeReap(jobID string, receipt workloadrunner.ReapReceipt, err error) {
+	if a.session != nil {
+		a.session.recordRuntimeReap(jobID, receipt, err)
+	}
 }
 
 func (a *Agent) prepareAuthorityLoss(ctx context.Context, jobID string) error {

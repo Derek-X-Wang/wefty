@@ -106,7 +106,9 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 10 * time.Millisecond,
 		RenewalInterval: 50 * time.Millisecond, LogFlushInterval: 5 * time.Millisecond, LogRetryInterval: 5 * time.Millisecond,
 		LogSpoolDirectory: t.TempDir(),
-		Runner:            processrunner.New(processrunner.Config{BaseEnvironment: baseEnvironment}),
+		WorkloadRuntimes: map[string]agent.WorkloadRuntime{
+			contract.JobKindProcess: processrunner.NewAdapter(processrunner.New(processrunner.Config{BaseEnvironment: baseEnvironment})),
+		},
 	})
 	if err != nil {
 		cancel()

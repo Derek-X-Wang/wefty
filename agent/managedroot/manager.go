@@ -58,10 +58,11 @@ type mountIdentity struct {
 }
 
 type Manager struct {
-	root          string
-	nodeID        string
-	bootSessionID string
-	manifest      RootManifest
+	root                  string
+	nodeID                string
+	bootSessionID         string
+	previousBootSessionID string
+	manifest              RootManifest
 
 	checkpoint      func(Checkpoint) error
 	mountIdentityFD func(int) (mountIdentity, error)
@@ -109,6 +110,11 @@ func Initialize(config Config) (*Manager, error) {
 	if err := ensureLayoutDirectories(nodeFD, rootMount); err != nil {
 		return nil, err
 	}
+	if !created {
+		if err := manager.capturePreviousBootAt(nodeFD); err != nil {
+			return nil, err
+		}
+	}
 	if err := manager.activateBootAt(nodeFD); err != nil {
 		return nil, err
 	}
@@ -143,6 +149,9 @@ func Open(config Config) (*Manager, error) {
 	}
 	manager.manifest = manifest
 	if err := verifyLayoutDirectories(nodeFD, rootMount); err != nil {
+		return nil, err
+	}
+	if err := manager.capturePreviousBootAt(nodeFD); err != nil {
 		return nil, err
 	}
 	if err := manager.activateBootAt(nodeFD); err != nil {
@@ -197,6 +206,10 @@ func sameCleanPath(left, right string) bool {
 func (m *Manager) Manifest() RootManifest { return m.manifest }
 
 func (m *Manager) BootSessionID() string { return m.bootSessionID }
+
+// PreviousBootSessionID returns the durable boot that owned the managed root
+// before this manager activated its current boot.
+func (m *Manager) PreviousBootSessionID() string { return m.previousBootSessionID }
 
 func (m *Manager) NodePath() string {
 	return filepath.Join(m.root, agentDirectory, nodesDirectory, EncodeID(m.nodeID))
@@ -682,6 +695,18 @@ func (m *Manager) activateBootAt(nodeFD int) error {
 	return writeJSONAtomicAt(nodeFD, activeBootName, activeBoot{
 		Version: 1, RootInstanceID: m.manifest.RootInstanceID, BootSessionID: m.bootSessionID,
 	}, true)
+}
+
+func (m *Manager) capturePreviousBootAt(nodeFD int) error {
+	var previous activeBoot
+	if err := readJSONAt(nodeFD, activeBootName, &previous); err != nil {
+		return fmt.Errorf("read previous active boot: %w", err)
+	}
+	if previous.Version != 1 || previous.RootInstanceID != m.manifest.RootInstanceID || previous.BootSessionID == "" {
+		return fmt.Errorf("%w: previous active boot is invalid", ErrStaleBootSession)
+	}
+	m.previousBootSessionID = previous.BootSessionID
+	return nil
 }
 
 func (m *Manager) verifyActiveBootAt(nodeFD int) error {

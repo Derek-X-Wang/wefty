@@ -82,17 +82,6 @@ func (e *ExecutionError) Code() ErrorCode {
 	return ErrorUnsupportedKind
 }
 
-// CheckExecutableKind applies execution-layer support policy after an open job
-// kind has been decoded. The schema and Go types intentionally accept any
-// non-empty kind; v0.1 agents execute only process jobs.
-func CheckExecutableKind(kind string) error {
-	if kind == JobKindProcess {
-		return nil
-	}
-
-	return &ExecutionError{Kind: kind}
-}
-
 // ClassExecutionError reports that an open workload class cannot be executed
 // by this version of the agent.
 type ClassExecutionError struct {

@@ -34,8 +34,8 @@ func TestServiceCancellationClosesPublicationBeforeSignalingGuardian(t *testing.
 	go func() {
 		_, runErr := runPortfulService(
 			ctx,
-			runner,
-			processrunner.Request{},
+			testProcessRuntime(runner),
+			workloadRequest("cancellation-order"),
 			nil,
 			listener,
 			serviceRuntimeEndpoint{dial: func(context.Context) (net.Conn, error) {
@@ -60,8 +60,8 @@ func TestPublishedListenerFailureHasDedicatedCode(t *testing.T) {
 	runner := &publicationAuthorityRunner{canceled: make(chan struct{})}
 	result, err := runPortfulService(
 		context.Background(),
-		runner,
-		processrunner.Request{AttemptID: "published-listener-failure", Class: contract.JobClassService},
+		testProcessRuntime(runner),
+		workloadRequest("published-listener-failure"),
 		nil,
 		listener,
 		serviceRuntimeEndpoint{
@@ -166,7 +166,7 @@ func assertPortlessServiceSkipsFabricProxyProbeAndDeadline(t *testing.T) {
 	}
 	runner := &capturingStartedRunner{}
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
-		runner: runner, managedResource: resource, clock: systemClock{}, observer: newLifecycleObserver(systemClock{}),
+		runtimes: testRuntimeSet(runner), managedResource: resource, clock: systemClock{}, observer: newLifecycleObserver(systemClock{}),
 		reservePublishedPort: func(l1.Claim) (net.Listener, *contract.SpawnFailure) {
 			t.Fatal("portless service called Fabric.Listen")
 			return nil, nil
@@ -186,12 +186,15 @@ func assertPortlessServiceSkipsFabricProxyProbeAndDeadline(t *testing.T) {
 		}},
 		Lease: l1.AttemptLease{AttemptID: "portless-attempt"},
 	}
-	result, err := lifecycle.runProcess(context.Background(), claim)
+	result, err := lifecycle.runWorkload(context.Background(), claim)
 	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
-		t.Fatalf("portless runProcess() = (%#v, %v)", result, err)
+		t.Fatalf("portless runWorkload() = (%#v, %v)", result, err)
 	}
 	if _, exists := runner.request.Execution.Env[contract.EnvServicePort]; exists {
 		t.Fatalf("portless request received %s", contract.EnvServicePort)
+	}
+	if !runner.request.Guarded {
+		t.Fatal("service lifecycle policy did not request the process Guardian boundary")
 	}
 }
 
@@ -212,8 +215,8 @@ func assertPublicationAuthorityLossStopsAttemptThroughGuardian(t *testing.T) {
 	runner := &publicationAuthorityRunner{canceled: make(chan struct{})}
 	result, err := runPortfulService(
 		context.Background(),
-		runner,
-		processrunner.Request{AttemptID: "authority-loss", Class: contract.JobClassService},
+		testProcessRuntime(runner),
+		workloadRequest("authority-loss"),
 		nil,
 		listener,
 		serviceRuntimeEndpoint{
@@ -266,8 +269,8 @@ func assertPostStartupProbeLossWithdrawsAndRecoversWithoutKilling(t *testing.T) 
 	finished := make(chan serviceRunOutcome, 1)
 	go func() {
 		result, err := runPortfulService(
-			context.Background(), runner,
-			processrunner.Request{AttemptID: "readiness-recovery", Class: contract.JobClassService}, nil,
+			context.Background(), testProcessRuntime(runner),
+			workloadRequest("readiness-recovery"), nil,
 			listener, serviceRuntimeEndpoint{
 				address: backend.Addr().String(), dial: func(ctx context.Context) (net.Conn, error) {
 					return dialer.DialContext(ctx, "tcp4", backend.Addr().String())

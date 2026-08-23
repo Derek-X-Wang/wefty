@@ -14,8 +14,9 @@ import (
 const initialServiceRemovalGeneration uint64 = 1
 
 type processManagedResource struct {
-	root          *managedroot.Manager
-	bootSessionID string
+	root                  *managedroot.Manager
+	bootSessionID         string
+	previousBootSessionID string
 }
 
 func (resource *processManagedResource) rootInstanceID() string {
@@ -32,7 +33,10 @@ func initializeManagedResource(rootDirectory, nodeID, bootSessionID string) (man
 	if err != nil {
 		return nil, fmt.Errorf("agent: initialize managed service root: %w", err)
 	}
-	return &processManagedResource{root: root, bootSessionID: bootSessionID}, nil
+	return &processManagedResource{
+		root: root, bootSessionID: bootSessionID,
+		previousBootSessionID: root.PreviousBootSessionID(),
+	}, nil
 }
 
 func (resource *processManagedResource) remove(ctx context.Context, removal localRemoval) error {

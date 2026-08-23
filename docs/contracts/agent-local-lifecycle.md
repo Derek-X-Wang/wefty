@@ -49,6 +49,46 @@ local; only the stable reason code and bounded missing set cross into L1.
 Capability observation and its publication barrier are independent of durable
 `claims_enabled` intent.
 
+## Workload runtime selection
+
+The agent selects exactly one `WorkloadRuntime` by the job's open `kind` after
+the shared local-capability admission check. Workload `class` never selects or
+enters that adapter. Instead, the agent compiles class-specific policy into
+runtime-neutral mechanics such as idle monitoring, the required lifetime
+boundary, managed resources, and started/readiness hooks.
+
+Capability eligibility and local implementation are separate fail-closed
+checks. L1 leaves an unknown kind unschedulable until a node advertises its
+`kind:<name>` capability. If a claimed job names a capability for which this
+agent process has no matching adapter, only that attempt is refused as an
+unsupported kind; process and other adapter siblings continue normally.
+
+Every adapter preflights its request before the agent acquires managed service
+resources, published ports, workflow bridges, handoffs, or log sinks. The
+adapter then returns a structured attempt outcome and implements
+`ReapAndVerify`. The attempt lifecycle requests a positive `runtimeQuiesced`
+receipt after `Run` returns and treats its absence as an `output_error`
+finalization failure before durable completion is stored.
+
+A receipt names its evidence kind. Same-boot process attempts use consumed,
+full-authority `attempt` evidence. When a removal directive first reaches a
+returning node after an offline agent boot, the process adapter may instead
+issue `prior_boot_guardian`: the prior boot differs from its configured current
+boot and Guardian's disconnect contract reaped that boot's guarded payloads.
+Same-boot removal never falls back to this proof. Ticket #139 supplies the OCI
+equivalent from its boot sweep, while #150 persists removal receipts across
+mid-removal crashes.
+
+For `kind=process`, `Run` already waits for process or Guardian reaping, so the
+receipt verifies that blocking return contract. Inline executable decoding,
+digest validation, interpreter resolution, materialization, and cleanup are
+owned by the process adapter; the agent lifecycle never materializes a
+kind-specific executable.
+
+`ServiceAddress` remains a known process-specific field in the otherwise
+runtime-neutral request. Ticket #147 replaces it with an adapter-supplied
+opaque dial endpoint; managed-resource handles are already opaque here.
+
 ## Attempts and occupancy
 
 The `attempts` map is keyed by attempt ID. Each entry carries job ID, workload

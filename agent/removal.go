@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 var errServiceRemovalRequested = errors.New("service removal requested")
@@ -26,7 +27,8 @@ type removalController struct {
 	bootSessionID  string
 	logf           func(string, ...any)
 	beginRemoval   func(context.Context, localRemoval) error
-	reapService    func(context.Context, string) error
+	reapService    func(context.Context, string) (workloadrunner.ReapReceipt, error)
+	clearReap      func(string)
 	purgeJob       func(context.Context, string) error
 	removeResource func(context.Context, localRemoval) error
 	ackRemoval     func(context.Context, localRemoval) error
@@ -57,6 +59,7 @@ func newRemovalController(
 	}
 	if session != nil {
 		controller.reapService = session.reapServiceForRemoval
+		controller.clearReap = session.clearRuntimeReap
 	}
 	if managed != nil {
 		controller.removeResource = managed.remove
@@ -117,9 +120,15 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	if err := controller.beginRemoval(ctx, removal); err != nil {
 		return err
 	}
-	if err := controller.reapService(ctx, directive.JobID); err != nil {
+	receipt, err := controller.reapService(ctx, directive.JobID)
+	if err != nil {
 		return err
 	}
+	if !receipt.RuntimeQuiesced || receipt.Evidence == "" {
+		return fmt.Errorf("service %q removal has no positive runtime reap receipt", directive.JobID)
+	}
+	// TODO(#150): persist the runtime receipt in the removal record. Until then,
+	// the legacy boolean remains the crash-resume compatibility marker only.
 	removal.processTreeReaped = true
 	if err := controller.purgeJob(ctx, directive.JobID); err != nil {
 		return err
@@ -130,7 +139,13 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	if err := controller.ackRemoval(ctx, removal); err != nil {
 		return err
 	}
-	return controller.finishRemoval(ctx, removal)
+	if err := controller.finishRemoval(ctx, removal); err != nil {
+		return err
+	}
+	if controller.clearReap != nil {
+		controller.clearReap(directive.JobID)
+	}
+	return nil
 }
 
 // prepareAuthorityLoss closes the renewal-vs-heartbeat race for a running

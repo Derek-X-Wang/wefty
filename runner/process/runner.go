@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 const (
@@ -33,27 +34,19 @@ var (
 	ErrProcessReapTimeout = errors.New("process did not report exit after SIGKILL")
 )
 
-// IdlePolicy controls whether a process is supervised for output inactivity.
-// Its zero value preserves the one-shot hang guard.
-type IdlePolicy uint8
+type IdlePolicy = workloadrunner.IdlePolicy
 
 const (
-	MonitorIdle IdlePolicy = iota
-	IgnoreIdle
+	MonitorIdle = workloadrunner.MonitorIdle
+	IgnoreIdle  = workloadrunner.IgnoreIdle
 )
 
 // OutputSink receives raw output events. Calls are serialized within a stream,
 // but stdout and stderr may call the sink concurrently.
-type OutputSink interface {
-	WriteOutput(context.Context, contract.LogEvent) error
-}
+type OutputSink = workloadrunner.OutputSink
 
 // OutputSinkFunc adapts a function into an OutputSink.
-type OutputSinkFunc func(context.Context, contract.LogEvent) error
-
-func (function OutputSinkFunc) WriteOutput(ctx context.Context, event contract.LogEvent) error {
-	return function(ctx, event)
-}
+type OutputSinkFunc = workloadrunner.OutputSinkFunc
 
 // Request describes one native process execution. IdlePolicy controls the
 // initial idle clock. Closing or sending on CompletionSignal replaces any idle
@@ -63,7 +56,6 @@ func (function OutputSinkFunc) WriteOutput(ctx context.Context, event contract.L
 // must not call it for a spawn failure.
 type Request struct {
 	AttemptID        string
-	Class            string
 	Execution        contract.ExecutionSpec
 	Limits           *contract.JobLimits
 	IdlePolicy       IdlePolicy
@@ -73,6 +65,9 @@ type Request struct {
 	// never persisted and is not the service's Fabric published address.
 	ServiceAddress   string
 	ReadinessChanged func(startupSatisfied, ready bool)
+	// Guarded requests preserve the payload across the agent/Guardian process
+	// boundary so loss of the agent boot still reaps it.
+	Guarded bool
 }
 
 // Config holds process-runner dependencies and defaults. A nil Clock uses the
@@ -153,7 +148,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 	if err != nil {
 		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
 	}
-	if request.Class == contract.JobClassService && runner.guardianExecutable != "" {
+	if request.Guarded && runner.guardianExecutable != "" {
 		return runner.runGuarded(ctx, request, sink, idleTimeout, completionTimeout, maxRuntime)
 	}
 

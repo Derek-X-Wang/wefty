@@ -22,6 +22,57 @@ import (
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
+func TestReapRefusalCannotCompleteExitZeroAttemptSuccessfully(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
+	defer stopServer()
+	directory := t.TempDir()
+	job, _, err := store.CreateJob(context.Background(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "reap-refusal",
+		Kind: contract.JobKindProcess, Class: contract.JobClassOneShot, RoutingTags: []string{"linux"},
+		Execution: contract.ExecutionSpec{
+			Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"},
+			WorkingDirectory: directory, HandoffDirectory: directory,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
+		Capabilities:      map[string]bool{"kind:process": true},
+		WorkloadRuntimes:  map[string]WorkloadRuntime{contract.JobKindProcess: &reapRefusingRuntime{}},
+		LogSpoolDirectory: t.TempDir(), ClaimInterval: 5 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	completed, err := waitForFailureJobState(store, job.JobID, contract.JobFailed, 5*time.Second)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	attempts, err := store.ListJobAttempts(context.Background(), completed.JobID)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 || attempts[0].Result == nil || attempts[0].Result.OutputError == "" || attempts[0].Result.ExitCode != nil {
+		cancel()
+		t.Fatalf("reap-refused completion = %#v attempts=%#v, want failed attempt with only output_error", completed, attempts)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("agent shutdown: %v", err)
+	}
+}
+
 // DELIBERATE CONTRACT INVERSION (#57 §8.1): `Run` remains pending after attempt-authority loss, the payload is stopped and reaped, and the agent claims a fresh job after rejoining; `Run` returns cleanly only after outer-context cancellation
 // Restoring the old assertion reintroduces the cascade where one control-plane blip kills the daemon and the guardian then reaps every payload on the machine.
 func TestPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
@@ -44,7 +95,7 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Clock: clock,
 		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 5 * time.Minute, ClaimInterval: time.Minute, RenewalInterval: 10 * time.Second,
-		Runner: runner, LogSpoolDirectory: t.TempDir(), Logf: t.Logf,
+		WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(), Logf: t.Logf,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +223,7 @@ func assertAgentFillsGrantedClassSlotsConcurrently(t *testing.T) {
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
 		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: time.Second, ClaimInterval: 10 * time.Millisecond, RenewalInterval: 100 * time.Millisecond,
-		Runner: runner, LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: managedRoot,
+		WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: managedRoot,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -251,7 +302,7 @@ func assertAgentRefillsSlotAfterSiblingFinalization(t *testing.T) {
 		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: time.Second, ClaimInterval: time.Millisecond, RenewalInterval: 100 * time.Millisecond,
 		MaxOneshotSlots: 2, MaxServiceSlots: 1,
-		Runner: runner, LogSpoolDirectory: t.TempDir(),
+		WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -497,7 +548,7 @@ func assertDrainJoinsEveryResidentOneShotAttempt(t *testing.T) {
 		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 100 * time.Millisecond, ClaimInterval: time.Millisecond, RenewalInterval: 100 * time.Millisecond,
 		MaxOneshotSlots: 3, MaxServiceSlots: 1,
-		Runner: runner, LogSpoolDirectory: t.TempDir(),
+		WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -587,7 +638,7 @@ func assertSilentRenewalHangCannotOutliveLocalAuthority(t *testing.T) {
 		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 5 * time.Minute, ClaimInterval: time.Minute,
 		RenewalInterval: 100 * time.Millisecond, OperationTimeout: 5 * time.Second,
-		Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
+		WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -718,7 +769,7 @@ func assertUnreapedPayloadStaysVisibleWithoutKillingDaemon(t *testing.T) {
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Clock: clock,
 		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 5 * time.Minute, ClaimInterval: time.Minute, RenewalInterval: 10 * time.Second,
-		Runner: runner, LogSpoolDirectory: t.TempDir(),
+		WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -793,7 +844,7 @@ func TestAgentDrainFinishesRunningAttemptAndStopsClaiming(t *testing.T) {
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
 		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: time.Minute, ClaimInterval: time.Millisecond, RenewalInterval: 10 * time.Second,
-		Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
+		WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -856,7 +907,7 @@ func TestAgentShutdownFencesAttemptForImmediateSuccessor(t *testing.T) {
 	second := createAgentTestJob(t, store, "shutdown-fenced-successor")
 	runner := newBlockingRunner()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	firstAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
+	firstAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -878,7 +929,7 @@ func TestAgentShutdownFencesAttemptForImmediateSuccessor(t *testing.T) {
 	}
 
 	secondRunner := instantResultRunner{}
-	secondAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-2", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: secondRunner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
+	secondAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-2", Version: "test", Capabilities: map[string]bool{"kind:process": true}, WorkloadRuntimes: testRuntimeSet(secondRunner), LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -910,7 +961,7 @@ func TestAgentShutdownFinalizationUploadsLogs(t *testing.T) {
 	job := createAgentTestJob(t, store, "shutdown-finalization-logs")
 	runner := newLoggingBlockingRunner()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: runner, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -971,7 +1022,7 @@ func assertFinalizationTimeoutStartsAfterServicePayloadStops(t *testing.T) {
 		Capabilities:  map[string]bool{"kind:process": true},
 		ClaimInterval: 5 * time.Millisecond, RenewalInterval: time.Second,
 		FinalizationTimeout: finalizationTimeout, LogBatchSize: 8, LogFlushInterval: time.Hour,
-		Runner: runner, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
+		WorkloadRuntimes: testRuntimeSet(runner), ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1037,7 +1088,7 @@ func assertPluralServiceDrainJoinsAll(t *testing.T) {
 	}
 	runner := newSlotRefillRunner()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: runner, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), ClaimInterval: 5 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, RenewalInterval: 50 * time.Millisecond, MaxOneshotSlots: 2, MaxServiceSlots: 2})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, WorkloadRuntimes: testRuntimeSet(runner), ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), ClaimInterval: 5 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, RenewalInterval: 50 * time.Millisecond, MaxOneshotSlots: 2, MaxServiceSlots: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1080,7 +1131,7 @@ func TestAgentConsumesRenewalDirectivesWithoutDaemonExit(t *testing.T) {
 	}
 	runner := newDirectiveRunner()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: runner, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), RenewalInterval: 20 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, MaxServiceSlots: 1})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, WorkloadRuntimes: testRuntimeSet(runner), ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), RenewalInterval: 20 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, MaxServiceSlots: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1116,7 +1167,7 @@ func TestAgentHeartbeatClaimsDisabledStopsNewClaims(t *testing.T) {
 	second := createAgentTestJob(t, store, "claims-disabled-queued")
 	runner := newBlockingRunner()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, Runner: runner, LogSpoolDirectory: t.TempDir(), HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, MaxOneshotSlots: 1})
+	nodeAgent, err := New(Config{Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Capabilities: map[string]bool{"kind:process": true}, WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(), HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, MaxOneshotSlots: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

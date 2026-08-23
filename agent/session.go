@@ -10,6 +10,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 const (
@@ -59,7 +60,10 @@ type agentSession struct {
 	claimMu         sync.Mutex
 	residentJobID   map[string]struct{}
 	resident        map[string]*residentAttempt
+	serviceReaps    map[string]runtimeReapOutcome
+	serviceBoots    map[string]string
 	residentChanged chan struct{}
+	reapPriorBoot   func(context.Context, string) (workloadrunner.ReapReceipt, error)
 	removals        *removalController
 
 	drainOnce      sync.Once
@@ -68,9 +72,15 @@ type agentSession struct {
 }
 
 type residentAttempt struct {
-	class  string
-	cancel context.CancelCauseFunc
-	done   chan struct{}
+	class         string
+	cancel        context.CancelCauseFunc
+	done          chan struct{}
+	runtimeReaped chan runtimeReapOutcome
+}
+
+type runtimeReapOutcome struct {
+	receipt workloadrunner.ReapReceipt
+	err     error
 }
 
 type destinationError struct {
@@ -122,6 +132,8 @@ func newAgentSession(
 		claimsEnabled:   true,
 		residentJobID:   make(map[string]struct{}),
 		resident:        make(map[string]*residentAttempt),
+		serviceReaps:    make(map[string]runtimeReapOutcome),
+		serviceBoots:    make(map[string]string),
 		residentChanged: make(chan struct{}, 1),
 		drainRequested:  make(chan struct{}),
 	}
@@ -445,8 +457,15 @@ func (session *agentSession) executeResident(
 	execute sessionAttemptExecution,
 ) (errorDestination, error) {
 	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
-	resident := &residentAttempt{class: claim.Job.Spec.Class, cancel: cancelAttempt, done: make(chan struct{})}
+	resident := &residentAttempt{
+		class: claim.Job.Spec.Class, cancel: cancelAttempt,
+		done: make(chan struct{}), runtimeReaped: make(chan runtimeReapOutcome, 1),
+	}
 	session.claimMu.Lock()
+	if claim.Job.Spec.Class == contract.JobClassService {
+		delete(session.serviceReaps, claim.Job.JobID)
+		session.serviceBoots[claim.Job.JobID] = session.registration.BootSessionID
+	}
 	session.resident[claim.Job.JobID] = resident
 	session.notifyResidentChangedLocked()
 	session.claimMu.Unlock()
@@ -548,7 +567,7 @@ func (session *agentSession) claim(
 	return claim, true, nil
 }
 
-func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID string) error {
+func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID string) (workloadrunner.ReapReceipt, error) {
 	for {
 		session.claimMu.Lock()
 		resident, active := session.resident[jobID]
@@ -556,30 +575,85 @@ func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID st
 		if active {
 			if resident.class != contract.JobClassService {
 				session.claimMu.Unlock()
-				return fmt.Errorf("agent: removal target %q is not a resident service", jobID)
+				return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: removal target %q is not a resident service", jobID)
 			}
 			resident.cancel(errServiceRemovalRequested)
 			done := resident.done
+			reaped := resident.runtimeReaped
 			session.claimMu.Unlock()
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return workloadrunner.ReapReceipt{}, ctx.Err()
+			case outcome := <-reaped:
+				select {
+				case <-ctx.Done():
+					return workloadrunner.ReapReceipt{}, ctx.Err()
+				case <-done:
+				}
+				return verifiedRuntimeReap(jobID, outcome)
 			case <-done:
-				return nil
+				continue
 			}
 		}
 		if !admitted {
+			outcome, found := session.serviceReaps[jobID]
+			serviceBoot := session.serviceBoots[jobID]
+			priorBootReap := session.reapPriorBoot
 			session.claimMu.Unlock()
-			return nil
+			if found {
+				return verifiedRuntimeReap(jobID, outcome)
+			}
+			if serviceBoot == session.registration.BootSessionID || priorBootReap == nil {
+				return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: service %q has no runtime reap receipt", jobID)
+			}
+			receipt, err := priorBootReap(ctx, jobID)
+			return verifiedRuntimeReap(jobID, runtimeReapOutcome{receipt: receipt, err: err})
 		}
 		changed := session.residentChanged
 		session.claimMu.Unlock()
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return workloadrunner.ReapReceipt{}, ctx.Err()
 		case <-changed:
 		}
 	}
+}
+
+func (session *agentSession) recordRuntimeReap(jobID string, receipt workloadrunner.ReapReceipt, err error) {
+	session.claimMu.Lock()
+	defer session.claimMu.Unlock()
+	outcome := runtimeReapOutcome{receipt: receipt, err: err}
+	resident, active := session.resident[jobID]
+	if active && resident.class == contract.JobClassService {
+		if session.serviceReaps == nil {
+			session.serviceReaps = make(map[string]runtimeReapOutcome)
+		}
+		session.serviceReaps[jobID] = outcome
+		select {
+		case resident.runtimeReaped <- outcome:
+		default:
+		}
+	}
+}
+
+func (session *agentSession) clearRuntimeReap(jobID string) {
+	session.claimMu.Lock()
+	delete(session.serviceReaps, jobID)
+	delete(session.serviceBoots, jobID)
+	session.claimMu.Unlock()
+}
+
+func verifiedRuntimeReap(jobID string, outcome runtimeReapOutcome) (workloadrunner.ReapReceipt, error) {
+	if outcome.err != nil {
+		return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: service %q runtime reap: %w", jobID, outcome.err)
+	}
+	if !outcome.receipt.RuntimeQuiesced {
+		return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: service %q runtime did not verify quiescence", jobID)
+	}
+	if outcome.receipt.Evidence == "" {
+		return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: service %q runtime receipt has no evidence kind", jobID)
+	}
+	return outcome.receipt, nil
 }
 
 func (session *agentSession) notifyResidentChangedLocked() {
