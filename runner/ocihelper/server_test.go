@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
@@ -56,6 +58,25 @@ func TestWrongVersionAndPeerFailBeforeSessionAuthority(t *testing.T) {
 	assertRPCCode(t, err, CodePeerUnauthenticated)
 	if engine.sessionReapCount() != 0 {
 		t.Fatal("an unauthenticated peer minted session authority")
+	}
+}
+
+func TestRuntimeSpecRejectionSurvivesHelperAndAgentMapping(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runErr = &RuntimeSpecRejectionError{err: errors.New("invalid translated mount")}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	_, err = session.Run(t.Context(), testRunRequest(testAuthority(), time.Second))
+	assertRPCCode(t, err, CodeOCISpecRejected)
+	failure := SpawnFailureForRunError(err)
+	if failure == nil || failure.Code != contract.SpawnFailureOCISpecRejected {
+		t.Fatalf("agent spawn failure = %#v", failure)
 	}
 }
 
@@ -283,7 +304,7 @@ func TestSweepGateAndClosedWorkloadValidation(t *testing.T) {
 	assertRPCCode(t, err, CodeSweepRequired)
 	requireSweep(t, session)
 	request := testRunRequest(testAuthority(), time.Second)
-	request.Workload.OperatorMounts = []OperatorMount{{NodePath: "/operator/data", ContainerPath: "/data"}}
+	request.Workload.OperatorMounts = []OperatorMount{{NodePath: "relative", ContainerPath: "/data"}}
 	_, err = session.Run(t.Context(), request)
 	assertRPCCode(t, err, CodeInvalidRequest)
 	request = testRunRequest(testAuthority(), 2*time.Minute)
@@ -291,8 +312,11 @@ func TestSweepGateAndClosedWorkloadValidation(t *testing.T) {
 	assertRPCCode(t, err, CodeInvalidRequest)
 }
 
-func TestOperatorMountValidatorResolvesAllowedRootsAndSymlinks(t *testing.T) {
-	root := t.TempDir()
+func TestOperatorMountValidatorRejectsSymlinksAndNonFilesystemTrees(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	allowedDirectory := filepath.Join(root, "allowed")
 	if err := os.Mkdir(allowedDirectory, 0o700); err != nil {
 		t.Fatal(err)
@@ -300,7 +324,10 @@ func TestOperatorMountValidatorResolvesAllowedRootsAndSymlinks(t *testing.T) {
 	if !withinAllowedRoot(allowedDirectory, []string{root}) {
 		t.Fatal("existing path under configured root was rejected")
 	}
-	outside := t.TempDir()
+	outside, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	link := filepath.Join(root, "escape")
 	if err := os.Symlink(outside, link); err != nil {
 		t.Fatal(err)
@@ -310,6 +337,38 @@ func TestOperatorMountValidatorResolvesAllowedRootsAndSymlinks(t *testing.T) {
 	}
 	if withinAllowedRoot(allowedDirectory, nil) {
 		t.Fatal("operator mount was accepted without configured roots")
+	}
+	insideLink := filepath.Join(root, "inside-link")
+	if err := os.Symlink(allowedDirectory, insideLink); err != nil {
+		t.Fatal(err)
+	}
+	if withinAllowedRoot(insideLink, []string{root}) {
+		t.Fatal("symlink within the configured root was accepted")
+	}
+	if withinAllowedRoot(root, []string{root}) {
+		t.Fatal("the configured root itself was accepted as a delegated subtree")
+	}
+	if withinAllowedRoot("/dev/null", []string{"/dev"}) {
+		t.Fatal("device node was accepted as an operator mount source")
+	}
+}
+
+func TestRunDefersOperatorMountFilesystemValidationUntilGuestTranslation(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{AllowedMountRoots: []string{t.TempDir()}})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.Workload.OperatorMounts = []OperatorMount{{
+		NodePath: "/host/path-not-visible-in-the-linux-guest", ContainerPath: "/workspace/input",
+	}}
+	if _, err := session.Run(t.Context(), request); err != nil {
+		t.Fatalf("wire validation touched the untranslated host path: %v", err)
 	}
 }
 
@@ -598,6 +657,7 @@ type fakeEngine struct {
 	sessionReaps   []SessionIdentity
 	attemptReaps   []AttemptAuthority
 	runResponse    RunResponse
+	runErr         error
 	runEntered     chan struct{}
 	releaseRun     chan struct{}
 	sweepEntered   chan struct{}
@@ -631,12 +691,13 @@ func (engine *fakeEngine) Run(context.Context, RunRequest) (RunResponse, error) 
 	runEntered := engine.runEntered
 	releaseRun := engine.releaseRun
 	response := engine.runResponse
+	runErr := engine.runErr
 	engine.mu.Unlock()
 	if runEntered != nil {
 		close(runEntered)
 		<-releaseRun
 	}
-	return response, nil
+	return response, runErr
 }
 func (engine *fakeEngine) Signal(context.Context, SignalRequest) error {
 	engine.record("Signal")

@@ -52,6 +52,7 @@ const (
 	CodeUnauthorizedAttempt  ErrorCode = "unauthorized_attempt"
 	CodeUnauthorizedPort     ErrorCode = "unauthorized_port"
 	CodeUnauthorizedBridge   ErrorCode = "unauthorized_bridge"
+	CodeOCISpecRejected      ErrorCode = "oci_spec_rejected"
 	CodeEngineFailure        ErrorCode = "engine_failure"
 	CodeUnsupportedOperation ErrorCode = "unsupported_operation"
 	CodeSweepRequired        ErrorCode = "sweep_required"
@@ -235,12 +236,22 @@ type OperatorMount struct {
 // privileged helper constructs its runtime spec. A caller cannot supply OCI
 // JSON, namespaces, privileges, devices, or other runtime mechanics.
 type WorkloadInput struct {
-	ImageDigest      string                    `json:"image_digest"`
-	Argv             []string                  `json:"argv"`
-	WorkingDirectory string                    `json:"working_directory,omitempty"`
-	Environment      []EnvironmentVariable     `json:"environment,omitempty"`
-	ManagedVolumes   []ManagedVolumeDescriptor `json:"managed_volumes,omitempty"`
-	OperatorMounts   []OperatorMount           `json:"operator_mounts,omitempty"`
+	ImageDigest          string                    `json:"image_digest"`
+	Argv                 []string                  `json:"argv,omitempty"`
+	WorkingDirectory     string                    `json:"working_directory,omitempty"`
+	Environment          []EnvironmentVariable     `json:"environment,omitempty"`
+	SensitiveEnvironment []EnvironmentVariable     `json:"sensitive_environment,omitempty"`
+	ReservedEnvironment  []EnvironmentVariable     `json:"reserved_environment,omitempty"`
+	ManagedVolumes       []ManagedVolumeDescriptor `json:"managed_volumes,omitempty"`
+	OperatorMounts       []OperatorMount           `json:"operator_mounts,omitempty"`
+	Limits               WorkloadLimits            `json:"limits,omitempty"`
+}
+
+// WorkloadLimits are cgroup-v2 hard limits. Zero means the corresponding
+// limit is absent; a negative value is always invalid.
+type WorkloadLimits struct {
+	MemoryBytes   int64 `json:"memory_bytes,omitempty"`
+	CPUMillicores int64 `json:"cpu_millicores,omitempty"`
 }
 
 type RunRequest struct {

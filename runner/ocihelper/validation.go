@@ -3,6 +3,7 @@ package ocihelper
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -17,39 +18,59 @@ var (
 )
 
 func validateWorkload(input WorkloadInput, allowedMountRoots []string) error {
+	return validateWorkloadWithSource(input, allowedMountRoots, validateMountSource)
+}
+
+func validateWorkloadWithSource(input WorkloadInput, allowedMountRoots []string, validateSource func(string, []string, bool) error) error {
+	if err := validateWorkloadWire(input); err != nil {
+		return err
+	}
+	for _, mount := range input.OperatorMounts {
+		if err := validateSource(mount.NodePath, allowedMountRoots, false); err != nil {
+			return fmt.Errorf("operator mount source %q is not permitted: %w", mount.NodePath, err)
+		}
+	}
+	return nil
+}
+
+// validateWorkloadWire validates only closed protocol data. Filesystem
+// authority is checked after the helper translates node paths into its guest
+// view; doing it here would reject every non-identity Lima translation.
+func validateWorkloadWire(input WorkloadInput) error {
 	if !digestPattern.MatchString(input.ImageDigest) {
 		return errors.New("workload image must be an immutable sha256 digest")
 	}
-	if len(input.Argv) == 0 {
-		return errors.New("workload argv must not be empty")
-	}
-	hasNonEmptyArgument := false
-	for _, argument := range input.Argv {
-		if strings.IndexByte(argument, 0) >= 0 {
-			return errors.New("workload argv contains NUL")
+	if input.Argv != nil {
+		if len(input.Argv) == 0 {
+			return errors.New("workload argv override must not be empty")
 		}
-		if argument != "" {
-			hasNonEmptyArgument = true
+		hasNonEmptyArgument := false
+		for _, argument := range input.Argv {
+			if strings.IndexByte(argument, 0) >= 0 {
+				return errors.New("workload argv contains NUL")
+			}
+			if argument != "" {
+				hasNonEmptyArgument = true
+			}
 		}
-	}
-	if !hasNonEmptyArgument {
-		return errors.New("workload argv must contain a non-empty argument")
+		if !hasNonEmptyArgument {
+			return errors.New("workload argv override must contain a non-empty argument")
+		}
 	}
 	if input.WorkingDirectory != "" && !validContainerPath(input.WorkingDirectory) {
 		return errors.New("working directory must be a clean absolute container path")
 	}
-	seenEnvironment := make(map[string]struct{}, len(input.Environment))
-	for _, variable := range input.Environment {
-		if !envNamePattern.MatchString(variable.Name) || contract.IsOCIReservedEnvironmentName(variable.Name) {
-			return fmt.Errorf("environment variable %q is not permitted", variable.Name)
-		}
-		if _, exists := seenEnvironment[variable.Name]; exists {
-			return fmt.Errorf("environment variable %q is duplicated", variable.Name)
-		}
-		seenEnvironment[variable.Name] = struct{}{}
-		if strings.IndexByte(variable.Value, 0) >= 0 {
-			return fmt.Errorf("environment variable %q contains NUL", variable.Name)
-		}
+	if err := validateEnvironmentLayer("environment", input.Environment, false); err != nil {
+		return err
+	}
+	if err := validateEnvironmentLayer("sensitive environment", input.SensitiveEnvironment, false); err != nil {
+		return err
+	}
+	if err := validateEnvironmentLayer("reserved environment", input.ReservedEnvironment, true); err != nil {
+		return err
+	}
+	if input.Limits.MemoryBytes < 0 || input.Limits.CPUMillicores < 0 {
+		return errors.New("workload limits must not be negative")
 	}
 	seenManagedKinds := make(map[ManagedVolumeKind]struct{}, len(input.ManagedVolumes))
 	seenVolumes := make(map[string]struct{}, len(input.OperatorMounts))
@@ -65,6 +86,9 @@ func validateWorkload(input WorkloadInput, allowedMountRoots []string) error {
 		seenManagedKinds[volume.Kind] = struct{}{}
 	}
 	for _, mount := range input.OperatorMounts {
+		if !validMountSourcePath(mount.NodePath) {
+			return errors.New("operator mount source must be a clean absolute non-root path")
+		}
 		if !validContainerPath(mount.ContainerPath) {
 			return errors.New("operator mount target must be a clean absolute container path")
 		}
@@ -75,15 +99,41 @@ func validateWorkload(input WorkloadInput, allowedMountRoots []string) error {
 			return fmt.Errorf("container mount target %q is duplicated", mount.ContainerPath)
 		}
 		seenVolumes[mount.ContainerPath] = struct{}{}
-		if !withinAllowedRoot(mount.NodePath, allowedMountRoots) {
-			return fmt.Errorf("operator mount source %q is outside configured roots", mount.NodePath)
+	}
+	return nil
+}
+
+func validateEnvironmentLayer(layerName string, environment []EnvironmentVariable, reservedOnly bool) error {
+	seen := make(map[string]struct{}, len(environment))
+	for _, variable := range environment {
+		if !envNamePattern.MatchString(variable.Name) {
+			return fmt.Errorf("%s variable %q is invalid", layerName, variable.Name)
+		}
+		if reservedOnly && !contract.IsOCIReservedEnvironmentName(variable.Name) {
+			return fmt.Errorf("reserved environment variable %q is not helper-managed", variable.Name)
+		}
+		if _, exists := seen[variable.Name]; exists {
+			return fmt.Errorf("%s variable %q is duplicated", layerName, variable.Name)
+		}
+		seen[variable.Name] = struct{}{}
+		if strings.IndexByte(variable.Value, 0) >= 0 {
+			return fmt.Errorf("%s variable %q contains NUL", layerName, variable.Name)
 		}
 	}
 	return nil
 }
 
 func conflictsWithReservedMount(target string) bool {
-	for _, reserved := range []string{contract.OCIContainerHandoffDirectory, contract.OCIContainerServiceDirectory} {
+	for _, reserved := range []string{
+		contract.OCIContainerHandoffDirectory,
+		contract.OCIContainerServiceDirectory,
+		"/proc",
+		"/dev",
+		"/sys",
+		"/run",
+		"/etc/hosts",
+		"/etc/resolv.conf",
+	} {
 		if target == reserved || strings.HasPrefix(target, reserved+"/") || strings.HasPrefix(reserved, target+"/") {
 			return true
 		}
@@ -95,28 +145,40 @@ func validContainerPath(value string) bool {
 	return strings.HasPrefix(value, "/") && value != "/" && path.Clean(value) == value
 }
 
+func validMountSourcePath(value string) bool {
+	return filepath.IsAbs(value) && filepath.Clean(value) == value && value != string(filepath.Separator)
+}
+
 func withinAllowedRoot(value string, roots []string) bool {
-	if !filepath.IsAbs(value) || filepath.Clean(value) != value || len(roots) == 0 {
-		return false
-	}
-	resolvedValue, err := filepath.EvalSymlinks(value)
+	return validateMountSource(value, roots, false) == nil
+}
+
+func validateMountSource(value string, roots []string, regularFileOnly bool) error {
+	source, err := openValidatedMountSource(value, roots, regularFileOnly)
 	if err != nil {
-		return false
+		return err
 	}
-	for _, root := range roots {
-		if !filepath.IsAbs(root) || filepath.Clean(root) != root {
+	return source.close()
+}
+
+func rejectSymlinkComponents(value string) error {
+	volume := filepath.VolumeName(value)
+	remainder := strings.TrimPrefix(value, volume)
+	current := volume + string(filepath.Separator)
+	for _, component := range strings.Split(strings.TrimPrefix(remainder, string(filepath.Separator)), string(filepath.Separator)) {
+		if component == "" {
 			continue
 		}
-		resolvedRoot, err := filepath.EvalSymlinks(root)
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
 		if err != nil {
-			continue
+			return err
 		}
-		relative, err := filepath.Rel(resolvedRoot, resolvedValue)
-		if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			return true
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("path component %q is a symlink", current)
 		}
 	}
-	return false
+	return nil
 }
 
 func validateEnsureImageEvent(event EnsureImageEvent) error {

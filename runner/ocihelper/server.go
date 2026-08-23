@@ -492,7 +492,7 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 	if request.InitialDeadman <= 0 || request.InitialDeadman > session.server.config.MaximumAttemptDeadman {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: "initial attempt deadman is outside helper bounds"}
 	}
-	if err := validateWorkload(request.Workload, session.server.config.AllowedMountRoots); err != nil {
+	if err := validateWorkloadWire(request.Workload); err != nil {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
 	}
 	attempt := &serverAttempt{
@@ -697,8 +697,12 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			if reapErr != nil {
 				go session.invalidate("ambiguous Run reap failed")
 			}
-			if rpcErr, ok := err.(*RPCError); ok {
+			var rpcErr *RPCError
+			var specRejection *RuntimeSpecRejectionError
+			if errors.As(err, &rpcErr) {
 				_ = writeRPCError(wire, rpcErr)
+			} else if errors.As(err, &specRejection) {
+				_ = writeFailure(wire, CodeOCISpecRejected, "OCI runtime spec was rejected")
 			} else {
 				_ = writeFailure(wire, CodeEngineFailure, "OCI engine operation failed")
 			}
