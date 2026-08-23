@@ -1,6 +1,8 @@
 package ocihelper
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -200,12 +202,54 @@ func validateEnsureImageEvent(event EnsureImageEvent) error {
 func validateWatchEvent(event WatchEvent) error {
 	switch event.Kind {
 	case WatchProgress:
-		if event.Status == "" || event.Result != nil {
+		present := 0
+		if event.Status != "" {
+			present++
+		}
+		if event.Log != nil {
+			present++
+		}
+		if event.Seal != nil {
+			present++
+		}
+		if event.Result != nil || present != 1 {
 			return errors.New("invalid watch progress event")
 		}
+		if event.Log != nil {
+			if event.Log.Stream != "stdout" && event.Log.Stream != "stderr" {
+				return errors.New("invalid watch log frame")
+			}
+			if event.Log.Gap == nil {
+				checksum := sha256.Sum256(event.Log.Bytes)
+				if event.Log.Checksum != hex.EncodeToString(checksum[:]) {
+					return errors.New("invalid watch log frame")
+				}
+			} else if len(event.Log.Bytes) != 0 || event.Log.Checksum != "" || event.Log.Gap.LostEventCount == 0 || event.Log.Gap.LostByteCount == 0 || event.Log.Gap.ThroughSequence < event.Log.Sequence || event.Log.Gap.Reason != "logger_source_incomplete" {
+				return errors.New("invalid watch log gap")
+			}
+		}
+		if event.Seal != nil {
+			if (event.Seal.Stream != "stdout" && event.Seal.Stream != "stderr") || (event.Seal.Complete && event.Seal.Reason != "") || (!event.Seal.Complete && event.Seal.Reason == "") {
+				return errors.New("invalid watch log seal")
+			}
+		}
 	case WatchComplete:
-		if event.Status != "" || event.Result == nil {
+		if event.Status != "" || event.Log != nil || event.Seal != nil || event.Result == nil {
 			return errors.New("invalid watch completion event")
+		}
+		result := event.Result
+		primary := 0
+		if result.ExitCode != nil {
+			primary++
+		}
+		if result.Signal != "" {
+			primary++
+		}
+		if result.RuntimeFailure != "" {
+			primary++
+		}
+		if primary != 1 || (result.Signal == "") != (result.TerminationCause == "") {
+			return errors.New("watch completion must contain exactly one result arm")
 		}
 	default:
 		return errors.New("unknown watch event kind")

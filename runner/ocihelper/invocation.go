@@ -9,12 +9,40 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 )
 
 const helperListenerFD = 3
 
+const AllowedUIDsEnvironment = "WEFTY_OCI_HELPER_ALLOWED_UIDS"
+
 func IsInvocation(arguments []string) bool {
 	return len(arguments) > 1 && arguments[1] == InvocationArg
+}
+
+// AllowedPeerUIDs parses the root-helper installation's comma-separated UID
+// allowlist. An absent value retains the single-user development behavior.
+func AllowedPeerUIDs(value string, fallback uint32) ([]uint32, error) {
+	if strings.TrimSpace(value) == "" {
+		return []uint32{fallback}, nil
+	}
+	parts := strings.Split(value, ",")
+	result := make([]uint32, 0, len(parts))
+	seen := make(map[uint32]struct{}, len(parts))
+	for _, part := range parts {
+		parsed, err := strconv.ParseUint(strings.TrimSpace(part), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("parse allowed OCI helper UID %q: %w", part, err)
+		}
+		uid := uint32(parsed)
+		if _, exists := seen[uid]; exists {
+			continue
+		}
+		seen[uid] = struct{}{}
+		result = append(result, uid)
+	}
+	return result, nil
 }
 
 // RunInvocation serves the inherited listener used by the private helper

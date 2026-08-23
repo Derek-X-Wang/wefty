@@ -3,6 +3,7 @@ name: service-acceptance-realtiming
 # Evidence lane only: production clocks make this too slow for pull requests.
 # It is intentionally absent from contract-gate's all-tests-pass aggregation.
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   schedule:
@@ -29,11 +30,140 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      - name: Provision pinned Linux OCI engine and probe
+        if: runner.os == 'Linux'
+        env:
+          CONTAINERD_VERSION: 2.3.4
+          RUNC_VERSION: 1.5.1
+          PROBE_REFERENCE: docker.io/library/busybox@sha256:1487d0af5f52b4ba31c7e465126ee2123fe3f2305d638e7827681e7cf6c83d5e
+          PROBE_DIGEST: sha256:1487d0af5f52b4ba31c7e465126ee2123fe3f2305d638e7827681e7cf6c83d5e
+        run: |
+          curl --fail --location --retry 5 --output containerd.tar.gz "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz"
+          curl --fail --location --retry 5 --output containerd.sha256 "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz.sha256sum"
+          sed -i "s/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz/containerd.tar.gz/" containerd.sha256
+          sha256sum --check containerd.sha256
+          sudo tar --extract --gzip --file containerd.tar.gz --directory /usr/local
+          curl --fail --location --retry 5 --output runc.amd64 "https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.amd64"
+          curl --fail --location --retry 5 --output runc.sha256sum "https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.sha256sum"
+          grep ' runc.amd64$' runc.sha256sum | sha256sum --check
+          sudo install --mode=0755 runc.amd64 /usr/local/sbin/runc
+          sudo modprobe overlay
+          grep -qw overlay /proc/filesystems
+          sudo install --directory --mode=0700 /var/lib/wefty-containerd /run/wefty-containerd /var/lib/wefty/oci
+          sudo tee /etc/systemd/system/wefty-test-containerd.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Wefty realtiming pinned containerd
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/containerd --address /run/wefty-containerd/containerd.sock --root /var/lib/wefty-containerd/root --state /run/wefty-containerd/state
+          Restart=no
+          KillMode=control-group
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl start wefty-test-containerd.service
+          for _ in $(seq 1 60); do
+            if sudo /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock version >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          sudo /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock version
+          sudo chmod 0600 /run/wefty-containerd/containerd.sock
+          sudo /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock --namespace wefty images pull --platform linux/amd64 "$PROBE_REFERENCE"
+          go build -o /tmp/wefty-agent-oci-realtiming ./cmd/wefty-agent
+          sudo install --owner=root --group=root --mode=0755 /tmp/wefty-agent-oci-realtiming /usr/local/libexec/wefty-agent-oci-realtiming
+          HELPER_CHECKSUM="sha256:$(sha256sum /tmp/wefty-agent-oci-realtiming | cut -d' ' -f1)"
+          AGENT_UID="$(id -u)"
+          AGENT_GROUP="$(id -gn)"
+          sudo install --directory --owner=root --group="$AGENT_GROUP" --mode=0750 /run/wefty-oci-helper
+          sudo tee /etc/systemd/system/wefty-oci-helper-realtiming.socket >/dev/null <<UNIT
+          [Unit]
+          Description=Wefty OCI helper realtiming socket
+          [Socket]
+          ListenStream=/run/wefty-oci-helper/helper.sock
+          SocketMode=0660
+          SocketUser=root
+          SocketGroup=$AGENT_GROUP
+          RemoveOnStop=true
+          [Install]
+          WantedBy=sockets.target
+          UNIT
+          sudo tee /etc/systemd/system/wefty-oci-helper-realtiming.service >/dev/null <<UNIT
+          [Unit]
+          Description=Wefty OCI helper realtiming service
+          After=wefty-test-containerd.service
+          [Service]
+          Type=simple
+          Environment=WEFTY_OCI_HELPER_ALLOWED_UIDS=$AGENT_UID
+          ExecStart=/usr/local/libexec/wefty-agent-oci-realtiming __wefty_oci_helper --oci-containerd-address /run/wefty-containerd/containerd.sock --oci-containerd-state-root /run/wefty-containerd/state --oci-runtime-root /var/lib/wefty/oci
+          User=root
+          Group=root
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl start wefty-oci-helper-realtiming.socket
+          for _ in $(seq 1 60); do
+            if [ -S /run/wefty-oci-helper/helper.sock ]; then break; fi
+            sleep 1
+          done
+          test -S /run/wefty-oci-helper/helper.sock
+          sudo install --directory --mode=0777 /tmp/wefty-oci-faults
+          sudo mkfifo /tmp/wefty-oci-faults/control
+          sudo chmod 0666 /tmp/wefty-oci-faults/control
+          sudo tee /usr/local/libexec/wefty-oci-fault-supervisor >/dev/null <<'SCRIPT'
+          #!/bin/sh
+          set -eu
+          while true; do
+            if IFS= read -r action < /tmp/wefty-oci-faults/control; then
+              case "$action" in
+                kill-shim)
+                  pid="$(pgrep -f 'containerd-shim-runc-v2.*-namespace wefty' | head -n 1)"
+                  test -n "$pid"
+                  kill -KILL "$pid"
+                  ;;
+                stop-containerd)
+                  systemctl stop wefty-test-containerd.service
+                  ;;
+                start-containerd)
+                  systemctl start wefty-test-containerd.service
+                  for _ in $(seq 1 60); do
+                    if /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock version >/dev/null 2>&1; then break; fi
+                    sleep 1
+                  done
+                  /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock version >/dev/null
+                  chmod 0600 /run/wefty-containerd/containerd.sock
+                  ;;
+                *) exit 64 ;;
+              esac
+              touch "/tmp/wefty-oci-faults/$action.done"
+            fi
+          done
+          SCRIPT
+          sudo chmod 0755 /usr/local/libexec/wefty-oci-fault-supervisor
+          sudo sh -c 'nohup /usr/local/libexec/wefty-oci-fault-supervisor >/tmp/wefty-oci-fault-supervisor.log 2>&1 &'
+          {
+            /usr/local/bin/containerd --version
+            /usr/local/sbin/runc --version
+            grep -w overlay /proc/filesystems
+            sudo stat --format='raw_socket_mode=%a raw_socket_owner=%U:%G' /run/wefty-containerd/containerd.sock
+            printf 'probe_reference=%s\nprobe_digest=%s\n' "$PROBE_REFERENCE" "$PROBE_DIGEST"
+          } > /tmp/wefty-oci-provision.txt
+          {
+            printf 'WEFTY_OCI_CONTAINERD_ADDRESS=%s\n' /run/wefty-containerd/containerd.sock
+            printf 'WEFTY_OCI_HELPER_SOCKET=%s\n' /run/wefty-oci-helper/helper.sock
+            printf 'WEFTY_OCI_HELPER_CHECKSUM=%s\n' "$HELPER_CHECKSUM"
+            printf 'WEFTY_OCI_PROBE_REFERENCE=%s\n' "$PROBE_REFERENCE"
+            printf 'WEFTY_OCI_PROBE_DIGEST=%s\n' "$PROBE_DIGEST"
+            printf 'WEFTY_OCI_FAULT_FIFO=%s\n' /tmp/wefty-oci-faults/control
+            printf 'WEFTY_OCI_FAULT_DIR=%s\n' /tmp/wefty-oci-faults
+          } >> "$GITHUB_ENV"
       - name: Run service acceptance at production timings
         env:
           WEFTY_REALTIME_EVIDENCE_DIR: ${{ runner.temp }}/service-acceptance-realtiming
         run: |
           mkdir -p "$WEFTY_REALTIME_EVIDENCE_DIR"
+          if [ -f /tmp/wefty-oci-provision.txt ]; then
+            cp /tmp/wefty-oci-provision.txt "$WEFTY_REALTIME_EVIDENCE_DIR/"
+          fi
           printf 'commit=%s\nrunner=%s\n' "$GITHUB_SHA" "$RUNNER_NAME" > "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
           go version >> "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
           go test -count=1 -p 1 -timeout=30m -v -tags=service_acceptance_realtiming ./...

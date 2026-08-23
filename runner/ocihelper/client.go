@@ -60,6 +60,9 @@ func (client *Client) protocolVersion() int {
 }
 
 func (client *Client) OpenSession(ctx context.Context, request AcquireSessionRequest) (*Session, error) {
+	if client == nil || client.ExpectedChecksum == "" {
+		return nil, errors.New("OCI helper checksum verification is required")
+	}
 	if client == nil || client.Dial == nil {
 		return nil, errors.New("OCI helper client dialer is required")
 	}
@@ -275,7 +278,7 @@ type pendingRenewal struct {
 }
 
 func (session *Session) EnsureImage(ctx context.Context, request EnsureImageRequest, receive func(EnsureImageEvent) error) error {
-	return session.stream(ctx, MethodEnsureImage, request, func(wire *framedConn, raw frame) error {
+	return session.stream(ctx, MethodEnsureImage, request, false, func(wire *framedConn, raw frame) error {
 		var event EnsureImageEvent
 		if err := decodeBody(raw.Body, &event); err != nil {
 			return err
@@ -301,7 +304,7 @@ func (session *Session) Signal(ctx context.Context, request SignalRequest) error
 }
 
 func (session *Session) Watch(ctx context.Context, request WatchRequest, receive func(WatchEvent) error) error {
-	return session.stream(ctx, MethodWatch, request, func(wire *framedConn, raw frame) error {
+	return session.stream(ctx, MethodWatch, request, true, func(wire *framedConn, raw frame) error {
 		var event WatchEvent
 		if err := decodeBody(raw.Body, &event); err != nil {
 			return err
@@ -353,7 +356,7 @@ func (session *Session) call(ctx context.Context, method Method, request, respon
 	return err
 }
 
-func (session *Session) stream(ctx context.Context, method Method, request any, receive func(*framedConn, frame) error) error {
+func (session *Session) stream(ctx context.Context, method Method, request any, acknowledge bool, receive func(*framedConn, frame) error) error {
 	connection, wire, err := session.dialRequest(ctx, method, request)
 	if err != nil {
 		return err
@@ -379,6 +382,11 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 		}
 		if err := receive(wire, response); err != nil {
 			return err
+		}
+		if acknowledge {
+			if err := writeAll(connection, []byte{1}); err != nil {
+				return fmt.Errorf("acknowledge OCI helper stream event: %w", err)
+			}
 		}
 	}
 }

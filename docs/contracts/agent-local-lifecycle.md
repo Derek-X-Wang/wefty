@@ -153,3 +153,12 @@ refreshes an attempt's helper deadman only after the matching L1 lease renewal
 succeeds. Agent-helper control EOF, a helper-clock heartbeat blackhole, or an
 expired per-attempt deadman therefore reaps runtime-owned state independently
 of the agent's own authority watchdog.
+
+An OCI claim remains L1 `Claimed` while the helper creates the task. The helper
+registers `Wait`, starts runc-v2, and returns `Started` plus image evidence; the
+agent first persists that evidence with `ObserveAttemptImage`, then performs
+the fenced L1 `StartAttempt`, and only after both succeed marks its local
+observer running. Lease renewal, log append, and completion remain incapable of
+implicitly promoting the attempt. If either authoritative mutation is refused,
+the adapter kills and verifies deletion of the real task before returning a
+spawn failure.

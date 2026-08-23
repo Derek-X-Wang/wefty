@@ -190,10 +190,17 @@ func (rejection *RuntimeSpecRejectionError) Unwrap() error { return rejection.er
 // agent/runtime seam without teaching the agent about containerd errors.
 func SpawnFailureForRunError(err error) *contract.SpawnFailure {
 	var rpcErr *RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeOCISpecRejected {
+	if !errors.As(err, &rpcErr) {
 		return nil
 	}
-	return &contract.SpawnFailure{Code: contract.SpawnFailureOCISpecRejected, Message: rpcErr.Message}
+	switch rpcErr.Code {
+	case CodeOCISpecRejected:
+		return &contract.SpawnFailure{Code: contract.SpawnFailureOCISpecRejected, Message: rpcErr.Message}
+	case CodeImageUnavailable:
+		return &contract.SpawnFailure{Code: contract.SpawnFailureImageUnavailable, Message: rpcErr.Message}
+	default:
+		return nil
+	}
 }
 
 // BuildRuntimeSpec constructs and canonically serializes the complete wefty

@@ -549,6 +549,7 @@ const (
 	LogGapOversizedEvent            LogGapReason = "oversized_event"
 	LogGapReplayRejected            LogGapReason = "replay_rejected"
 	LogGapLateEvidenceWindowExpired LogGapReason = "late_evidence_window_expired"
+	LogGapLoggerSourceIncomplete    LogGapReason = "logger_source_incomplete"
 )
 
 type LogStream string
@@ -562,15 +563,18 @@ const (
 // one process. ExitCode is a pointer so a successful exit code of zero remains
 // present on the wire when omitempty is applied. OutputError supersedes an
 // otherwise-successful exit when durable output cannot be finalized. A signal
-// outcome always names its structured initiator in TerminationCause.
+// outcome always names its structured initiator in TerminationCause. OOM and
+// LogEvidenceIncomplete are additive evidence and never replace the primary
+// terminal arm.
 type ProcessResult struct {
-	SpawnError       *SpawnFailure    `json:"spawn_error,omitempty"`
-	RuntimeFailure   *RuntimeFailure  `json:"runtime_failure,omitempty"`
-	OutputError      string           `json:"output_error,omitempty"`
-	ExitCode         *int             `json:"exit_code,omitempty"`
-	Signal           string           `json:"signal,omitempty"`
-	TerminationCause TerminationCause `json:"termination_cause,omitempty"`
-	OOM              bool             `json:"oom,omitempty"`
+	SpawnError            *SpawnFailure    `json:"spawn_error,omitempty"`
+	RuntimeFailure        *RuntimeFailure  `json:"runtime_failure,omitempty"`
+	OutputError           string           `json:"output_error,omitempty"`
+	ExitCode              *int             `json:"exit_code,omitempty"`
+	Signal                string           `json:"signal,omitempty"`
+	TerminationCause      TerminationCause `json:"termination_cause,omitempty"`
+	OOM                   bool             `json:"oom,omitempty"`
+	LogEvidenceIncomplete bool             `json:"log_evidence_incomplete,omitempty"`
 }
 
 // RuntimeFailure is stable machine-readable evidence that the runtime or

@@ -227,7 +227,7 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	}
 	gapReason := object(t, object(t, logGap["properties"], "LogGap.properties")["reason"], "LogGap.reason")
 	gapReasons := stringSet(t, gapReason["enum"])
-	for _, reason := range []string{"spool_eviction", "oversized_event", "replay_rejected", "late_evidence_window_expired"} {
+	for _, reason := range []string{"spool_eviction", "oversized_event", "replay_rejected", "late_evidence_window_expired", "logger_source_incomplete"} {
 		if !gapReasons[reason] {
 			t.Errorf("LogGap reason is missing %q", reason)
 		}
