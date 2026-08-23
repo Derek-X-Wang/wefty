@@ -23,6 +23,23 @@ never continuing helper-session authority: the old control stream fails,
 capability publication becomes restrictive, and recovery must reacquire a new
 helper generation and repeat the complete boot sweep barrier.
 
+Mac bootstrap copies the matching Linux build to the stable guest path
+`/usr/local/libexec/wefty-agent` and installs a root systemd service plus socket
+unit. It stops both units before a version replacement; no unused checksum
+sidecar is installed because the authenticated handshake is the checksum
+authority. The socket unit creates
+`/run/wefty/oci-helper.sock` as exactly `0660 root:wefty-oci`; the Lima guest
+user is added to that group, while the service runs the private helper mode as
+root with a narrow UID allowlist. When setup adds that supplementary group for
+the first time, it performs one ordinary stop/start so Lima's guest agent picks
+up membership; an already-member rerun does not restart the VM. The host
+verifies socket ownership, protocol major, helper version, and checksum
+through the forwarded helper before installing the host LaunchDaemon. It then
+imports the immutable probe archive
+through the helper API, verifies the top-level digest, and runs the ordinary
+functional create/start/wait/delete probe. No bootstrap command forwards or
+uses the raw containerd socket from the host.
+
 ## Handshake and peer authority
 
 Every connection captures kernel Unix peer credentials before reading protocol

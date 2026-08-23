@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,7 +10,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,6 +43,13 @@ func (values *repeatedStringFlag) Set(value string) error {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == limarunner.BootstrapInvocationArg {
+		if err := runMacBootstrap(os.Args[2:]); err != nil {
+			log.Printf("wefty-agent Mac bootstrap: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if ocihelper.IsLoggerInvocation(os.Args) {
 		if err := ocihelper.RunLoggerInvocation(os.Args); err != nil {
 			log.Printf("wefty-agent OCI logger: %v", err)
@@ -101,6 +111,155 @@ func main() {
 	}
 }
 
+func runMacBootstrap(arguments []string) error {
+	if runtime.GOOS != "darwin" {
+		return errors.New("Mac bootstrap is available only on macOS")
+	}
+	flags := flag.NewFlagSet(limarunner.BootstrapInvocationArg, flag.ContinueOnError)
+	var agentArguments repeatedStringFlag
+	flags.Var(&agentArguments, "agent-arg", "secret-free wefty-agent argument installed in the LaunchDaemon (repeatable)")
+	operatorUser := flags.String("operator-user", "", "operator user that owns the agent and Lima instance")
+	operatorHome := flags.String("operator-home", "", "absolute operator HOME")
+	limaHome := flags.String("lima-home", "", "absolute operator LIMA_HOME")
+	workingDirectory := flags.String("working-directory", "", "absolute agent working directory")
+	agentPath := flags.String("agent-path", "", "absolute installed macOS wefty-agent path")
+	linuxHelper := flags.String("linux-helper", "", "absolute matching Linux wefty-agent build")
+	helperChecksum := flags.String("helper-checksum", "", "sha256 checksum of the Linux helper build")
+	guestUser := flags.String("guest-user", "", "Lima guest user authorized for the helper socket")
+	guestUID := flags.Uint("guest-uid", 0, "Lima guest UID authorized by the helper")
+	probeArchive := flags.String("probe-archive", "", "absolute pinned probe OCI archive")
+	probeReference := flags.String("probe-reference", "", "probe image reference")
+	probeDigest := flags.String("probe-digest", "", "probe image top-level digest")
+	nodeID := flags.String("node-id", "", "stable node ID used by the bootstrap probe")
+	hostMountRoot := flags.String("host-mount-root", "", "absolute configured Lima operator mount root")
+	instance := flags.String("lima-instance", limarunner.DefaultInstanceName, "Lima instance")
+	limactl := flags.String("limactl", "limactl", "absolute or PATH-resolved limactl executable")
+	factsPath := flags.String("minimal-doctor-facts", "", "absolute #128 facts JSON path")
+	intentPath := flags.String("intent-file", "", "absolute read-only durable OCI intent file")
+	stdoutPath := flags.String("stdout-path", "", "absolute LaunchDaemon stdout log path")
+	stderrPath := flags.String("stderr-path", "", "absolute LaunchDaemon stderr log path")
+	remove := flags.Bool("remove", false, "remove the interim Mac bootstrap idempotently and emit JSON evidence")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || !*remove && (*guestUID == 0 || uint64(*guestUID) > uint64(^uint32(0))) {
+		return errors.New("Mac bootstrap requires named flags and a positive --guest-uid")
+	}
+	if *intentPath == "" && filepath.IsAbs(*limaHome) {
+		*intentPath = filepath.Join(*limaHome, "wefty-oci-intent.json")
+	}
+	if *remove {
+		return removeMacBootstrap(*instance, *limactl, *factsPath, *intentPath)
+	}
+	for _, argument := range agentArguments {
+		for _, reserved := range []string{
+			"--node-id", "--oci-helper-socket", "--oci-helper-checksum", "--oci-probe-image", "--oci-probe-digest",
+			"--oci-lima-instance", "--oci-lima-host-mount-root", "--oci-minimal-doctor-facts", "--oci-intent-file",
+		} {
+			if argument == reserved || strings.HasPrefix(argument, reserved+"=") {
+				return fmt.Errorf("--agent-arg must not override bootstrap-owned %s", reserved)
+			}
+		}
+	}
+	helperSocket, err := limarunner.HelperSocketPath(*limaHome, *instance)
+	if err != nil {
+		return err
+	}
+	if !filepath.IsAbs(*factsPath) {
+		return errors.New("--minimal-doctor-facts must be absolute")
+	}
+	if !filepath.IsAbs(*intentPath) {
+		return errors.New("--intent-file must be absolute")
+	}
+	bootstrapID, err := agent.NewBootSessionID()
+	if err != nil {
+		return err
+	}
+	guestConfig := limarunner.GuestHelperInstallConfig{
+		Instance: *instance, Limactl: *limactl, GuestUser: *guestUser, GuestUID: uint32(*guestUID),
+		HelperBinary: *linuxHelper, ExpectedVersion: version, ExpectedChecksum: *helperChecksum,
+		HostMountRoot: *hostMountRoot, HelperSocket: helperSocket,
+		ProbeArchive: *probeArchive, ProbeReference: *probeReference, ProbeDigest: *probeDigest,
+		NodeID: *nodeID, BootSessionID: bootstrapID,
+	}
+	if err := limarunner.ValidateGuestHelperInstall(guestConfig); err != nil {
+		return err
+	}
+	installedArguments := append([]string(nil), agentArguments...)
+	installedArguments = append(installedArguments,
+		"--node-id="+*nodeID,
+		"--oci-helper-socket="+helperSocket,
+		"--oci-helper-checksum="+*helperChecksum,
+		"--oci-probe-image="+*probeReference,
+		"--oci-probe-digest="+*probeDigest,
+		"--oci-lima-instance="+*instance,
+		"--oci-lima-host-mount-root="+*hostMountRoot,
+		"--oci-minimal-doctor-facts="+*factsPath,
+		"--oci-intent-file="+*intentPath,
+	)
+	launchConfig := limarunner.LaunchDaemonConfig{
+		AgentPath: *agentPath, Arguments: installedArguments, OperatorUser: *operatorUser,
+		Home: *operatorHome, LimaHome: *limaHome, PATH: limarunner.DefaultLaunchPATH,
+		WorkingDirectory: *workingDirectory, StandardOutPath: *stdoutPath, StandardErrorPath: *stderrPath,
+	}
+	if err := limarunner.ValidateLaunchDaemonInstall(launchConfig); err != nil {
+		return err
+	}
+	if _, err := limarunner.InitializeOCIIntent(*intentPath, time.Now()); err != nil {
+		return err
+	}
+	supervisor, err := limarunner.NewSupervisor(limarunner.SupervisorConfig{
+		Instance: *instance, Limactl: *limactl, Intent: limarunner.FileIntentSource{Path: *intentPath},
+	})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	if err := supervisor.Ensure(ctx); err != nil {
+		return fmt.Errorf("prepare Lima for bootstrap: %w", err)
+	}
+	if err := limarunner.InstallGuestHelper(ctx, guestConfig); err != nil {
+		return err
+	}
+	return limarunner.InstallLaunchDaemon(ctx, launchConfig)
+}
+
+type macBootstrapRemovalEvidence struct {
+	Unit         limarunner.LaunchDaemonRemovalEvidence `json:"unit"`
+	GuestHelper  limarunner.GuestHelperRemovalEvidence  `json:"guest_helper"`
+	FactsAbsent  bool                                   `json:"facts_absent"`
+	IntentAbsent bool                                   `json:"intent_absent"`
+}
+
+func removeMacBootstrap(instance, limactl, factsPath, intentPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	evidence := macBootstrapRemovalEvidence{}
+	unit, unitErr := limarunner.RemoveLaunchDaemon(ctx)
+	evidence.Unit = unit
+	helper, helperErr := limarunner.RemoveGuestHelper(ctx, limarunner.GuestHelperRemovalConfig{Instance: instance, Limactl: limactl})
+	evidence.GuestHelper = helper
+	removeLocal := func(path string) (bool, error) {
+		if path == "" {
+			return true, nil
+		}
+		if !filepath.IsAbs(path) {
+			return false, errors.New("bootstrap removal paths must be absolute")
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+		_, err := os.Stat(path)
+		return errors.Is(err, os.ErrNotExist), nil
+	}
+	var factsErr, intentErr error
+	evidence.FactsAbsent, factsErr = removeLocal(factsPath)
+	evidence.IntentAbsent, intentErr = removeLocal(intentPath)
+	encodeErr := json.NewEncoder(os.Stdout).Encode(evidence)
+	return errors.Join(unitErr, helperErr, factsErr, intentErr, encodeErr)
+}
+
 func run() error {
 	agentExecutable, err := os.Executable()
 	if err != nil {
@@ -138,6 +297,8 @@ func run() error {
 		ociImageBudget    = flag.Duration("oci-image-budget", ocirunner.DefaultImageBudget, "total resolve, pull/import, unpack, and shared-operation wait budget")
 		ociLimaInstance   = flag.String("oci-lima-instance", limarunner.DefaultInstanceName, "Lima instance carrying the private OCI helper on macOS")
 		ociLimaMountRoot  = flag.String("oci-lima-host-mount-root", "", "macOS host mount root validated before Lima helper RPCs")
+		ociDoctorFacts    = flag.String("oci-minimal-doctor-facts", "", "absolute path for the bounded Mac bootstrap facts JSON")
+		ociIntentFile     = flag.String("oci-intent-file", "", "absolute read-only durable OCI intent file; missing disables OCI")
 	)
 	flag.Parse()
 	if *nodeID == "" {
@@ -148,6 +309,9 @@ func run() error {
 	}
 	if *ociImageBudget <= 0 {
 		return fmt.Errorf("--oci-image-budget must be positive")
+	}
+	if *ociIntentFile != "" && !filepath.IsAbs(*ociIntentFile) {
+		return errors.New("--oci-intent-file must be absolute when set")
 	}
 	identityID := *fabricIdentityID
 	if identityID == "" {
@@ -178,9 +342,12 @@ func run() error {
 	capabilities := map[string]bool{"kind:process": true}
 	runtimes := make(map[string]workloadrunner.WorkloadRuntime)
 	var bootBarrier *ocihelper.BootBarrier
+	var agentBootBarrier agent.OCIBootBarrier
 	var capabilityProbe agent.CapabilityProbe
 	var deadman agent.AttemptDeadmanRenewer
 	var ociBridgeBinder workloadrunner.WorkflowBridgeBinder
+	var limaSupervisor *limarunner.Supervisor
+	var supervisedBootBarrier *limarunner.SupervisedBootBarrier
 	if *ociHelperSocket != "" {
 		if *ociProbeImage == "" || *ociProbeDigest == "" {
 			return fmt.Errorf("--oci-probe-image and --oci-probe-digest are required with --oci-helper-socket")
@@ -198,6 +365,18 @@ func run() error {
 		})
 		if err != nil {
 			return err
+		}
+		agentBootBarrier = bootBarrier
+		if runtime.GOOS == "darwin" {
+			limaSupervisor, err = limarunner.NewSupervisor(limarunner.SupervisorConfig{
+				Instance: *ociLimaInstance,
+				Intent:   limarunner.FileIntentSource{Path: *ociIntentFile},
+			})
+			if err != nil {
+				return err
+			}
+			supervisedBootBarrier = &limarunner.SupervisedBootBarrier{Supervisor: limaSupervisor, Barrier: bootBarrier}
+			agentBootBarrier = supervisedBootBarrier
 		}
 		var adapterOptions []ocirunner.Option
 		if runtime.GOOS == "darwin" {
@@ -229,7 +408,7 @@ func run() error {
 		Version:                 version,
 		Capabilities:            capabilities,
 		CapabilityProbe:         capabilityProbe,
-		OCIBootBarrier:          bootBarrier,
+		OCIBootBarrier:          agentBootBarrier,
 		WorkloadRuntimes:        runtimes,
 		AttemptDeadman:          deadman,
 		OCIWorkflowBridgeBinder: ociBridgeBinder,
@@ -255,6 +434,18 @@ func run() error {
 	defer nodeAgent.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if supervisedBootBarrier != nil {
+		go supervisedBootBarrier.Run(ctx, nodeAgent.RecoverOCIRuntimeCapabilities)
+	}
+	if *ociDoctorFacts != "" {
+		if runtime.GOOS != "darwin" || limaSupervisor == nil || bootBarrier == nil {
+			return errors.New("--oci-minimal-doctor-facts requires the macOS Lima OCI helper")
+		}
+		if !filepath.IsAbs(*ociDoctorFacts) {
+			return errors.New("--oci-minimal-doctor-facts must be absolute")
+		}
+		go writeMinimalDoctorFactsLoop(ctx, *ociDoctorFacts, nodeAgent, limaSupervisor, bootBarrier, log.Printf)
+	}
 	signals := make(chan os.Signal, 2)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
@@ -321,6 +512,47 @@ func (probe ociCapabilityProbe) Probe(ctx context.Context) (agent.CapabilityProb
 type ociAttemptDeadman struct {
 	barrier               *ocihelper.BootBarrier
 	nodeID, bootSessionID string
+}
+
+func writeMinimalDoctorFactsLoop(
+	ctx context.Context,
+	path string,
+	nodeAgent *agent.Agent,
+	supervisor *limarunner.Supervisor,
+	barrier *ocihelper.BootBarrier,
+	logf func(string, ...any),
+) {
+	write := func() {
+		var handshake *ocihelper.AcquireSessionResponse
+		if session, err := barrier.Session(); err == nil {
+			value := session.Handshake()
+			handshake = &value
+		}
+		snapshot := nodeAgent.CapabilitySnapshot()
+		unitState := limarunner.UnitStateUnmanaged
+		if os.Getenv("WEFTY_LAUNCH_UNIT") == limarunner.LaunchDaemonLabel {
+			unitState = limarunner.UnitStateLaunchedByUnit
+		}
+		facts := limarunner.BuildMinimalDoctorFacts(
+			unitState, supervisor.Facts(), handshake, snapshot.CapabilityObservation,
+			snapshot.LastProbeAt, time.Now(),
+		)
+		if err := limarunner.WriteMinimalDoctorFacts(path, facts); err != nil && logf != nil {
+			logf("wefty-agent: write minimal doctor facts: %v", err)
+		}
+	}
+	write()
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			write()
+			return
+		case <-ticker.C:
+			write()
+		}
+	}
 }
 
 func (renewer ociAttemptDeadman) QueueSuccessfulRenewal(claim l1.Claim, ttl time.Duration) error {

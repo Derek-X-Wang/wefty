@@ -340,6 +340,83 @@ func TestOCIBootBarrierOrdersRemovalProbePublicationAndClaims(t *testing.T) {
 	}
 }
 
+func TestProcessOnlyAgentRegistersWithoutCapabilitySupersede(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-process-only": nil})
+	defer stopServer()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node-process-only", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-process-only", BootSessionID: "boot-process-only",
+		Version: "test", OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true},
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	node, err := nodeAgent.Register(t.Context())
+	if err != nil {
+		t.Fatalf("process-only registration was treated as OCI supersede: %v", err)
+	}
+	if !node.Capabilities["kind:process"] || node.Capabilities["kind:oci"] || node.CapabilityRevision != 1 || node.CapabilityReasonCode != "" {
+		t.Fatalf("process-only node = %+v", node)
+	}
+	nodes, err := store.ListNodes(t.Context())
+	if err != nil || len(nodes) != 1 {
+		t.Fatalf("stored process-only node = %+v, %v", nodes, err)
+	}
+}
+
+func TestSpecializedBarrierReasonPublishesRestrictiveThenReearnsAfterEnsureAndProbe(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-lima-broken": nil})
+	defer stopServer()
+	var events []string
+	barrier := &recordingOCIBootBarrier{
+		reason:     contract.CapabilityReasonLimaBroken,
+		invalidate: func() { events = append(events, "invalidate") },
+		ensure: func(context.Context) error {
+			events = append(events, "ensure-failed")
+			return errors.New("Lima is Broken")
+		},
+	}
+	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		events = append(events, "probe")
+		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+	})
+	nodeAgent := newBootBarrierTestAgent(t, network, "node-lima-broken", barrier, probe)
+	defer nodeAgent.Close()
+	node, err := nodeAgent.Register(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Capabilities["kind:oci"] || node.CapabilityReasonCode != contract.CapabilityReasonLimaBroken || !reflect.DeepEqual(events, []string{"ensure-failed"}) {
+		t.Fatalf("restrictive specialized registration = node=%+v events=%v", node, events)
+	}
+	barrier.mu.Lock()
+	barrier.ensure = func(context.Context) error {
+		events = append(events, "ensure-succeeded")
+		return nil
+	}
+	barrier.mu.Unlock()
+	if err := nodeAgent.RecoverOCIRuntimeCapabilities(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"ensure-failed", "invalidate", "ensure-succeeded", "probe"}) {
+		t.Fatalf("republication ordering = %v", events)
+	}
+	node = waitForAgentNode(t, store, "node-lima-broken", func(node l1.Node) bool {
+		return node.Capabilities["kind:oci"] && node.CapabilityReasonCode == ""
+	})
+	if node.CapabilityRevision < 3 {
+		t.Fatalf("positive republication did not follow restrictive observation: %+v", node)
+	}
+}
+
 func TestReusedBootAtomicallySupersedesHighRevisionOCIBadge(t *testing.T) {
 	const nodeID = "node-reused-high-revision"
 	network := plain.NewNetwork()
@@ -523,10 +600,12 @@ func TestHelperLossAtBarrierStagesKeepsPoisedOCIClaimUnminted(t *testing.T) {
 }
 
 type recordingOCIBootBarrier struct {
-	mu     sync.Mutex
-	ready  bool
-	ensure func(context.Context) error
-	loss   func(ocihelper.HelperSession, error)
+	mu         sync.Mutex
+	ready      bool
+	ensure     func(context.Context) error
+	loss       func(ocihelper.HelperSession, error)
+	reason     contract.CapabilityReasonCode
+	invalidate func()
 }
 
 type readyOCIBootBarrier struct{}
@@ -625,14 +704,31 @@ func (barrier *recordingOCIBootBarrier) Ensure(ctx context.Context) error {
 		barrier.mu.Unlock()
 		return nil
 	}
+	ensure := barrier.ensure
 	barrier.mu.Unlock()
-	err := barrier.ensure(ctx)
+	err := ensure(ctx)
 	if err == nil {
 		barrier.mu.Lock()
 		barrier.ready = true
 		barrier.mu.Unlock()
 	}
 	return err
+}
+
+func (barrier *recordingOCIBootBarrier) CapabilityReasonCode() contract.CapabilityReasonCode {
+	barrier.mu.Lock()
+	defer barrier.mu.Unlock()
+	return barrier.reason
+}
+
+func (barrier *recordingOCIBootBarrier) Invalidate() {
+	barrier.mu.Lock()
+	barrier.ready = false
+	invalidate := barrier.invalidate
+	barrier.mu.Unlock()
+	if invalidate != nil {
+		invalidate()
+	}
 }
 
 func (barrier *recordingOCIBootBarrier) Generation() (ocihelper.HelperSession, bool) {

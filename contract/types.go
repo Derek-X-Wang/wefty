@@ -679,6 +679,31 @@ func (code CapabilityReasonCode) Valid() bool {
 	}
 }
 
+// ValidOCIRestriction reports whether code can explain an observation that
+// has atomically withdrawn kind:oci during registration or recovery.
+func (code CapabilityReasonCode) ValidOCIRestriction() bool {
+	switch code {
+	case CapabilityReasonOCIIntentDisabled,
+		CapabilityReasonPrerequisiteMissing,
+		CapabilityReasonRuntimeVersionUnsupported,
+		CapabilityReasonHelperUnreachable,
+		CapabilityReasonHelperVersionMismatch,
+		CapabilityReasonHelperHandshakeFailed,
+		CapabilityReasonBootSweepFailed,
+		CapabilityReasonProbeFailed,
+		CapabilityReasonLimaStopped,
+		CapabilityReasonLimaBroken,
+		CapabilityReasonLimaStartTimeout,
+		CapabilityReasonTemplateRestartRequired,
+		CapabilityReasonTemplateRecreateRequired,
+		CapabilityReasonMountRootUnavailable,
+		CapabilityReasonLocalPermissionDenied:
+		return true
+	default:
+		return false
+	}
+}
+
 // CapabilityObservation is one immutable, boot-scoped observation of the
 // node's complete execution eligibility set. A higher Revision replaces the
 // complete observation; the same revision is replayable only unchanged.

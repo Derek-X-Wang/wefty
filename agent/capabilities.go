@@ -35,6 +35,23 @@ type OCIBootBarrier interface {
 	Close() error
 }
 
+type ociBootBarrierReasoner interface {
+	CapabilityReasonCode() contract.CapabilityReasonCode
+}
+
+type ociBootBarrierInvalidator interface {
+	Invalidate()
+}
+
+func ociBootBarrierReason(barrier OCIBootBarrier) contract.CapabilityReasonCode {
+	if reasoner, ok := barrier.(ociBootBarrierReasoner); ok {
+		if reason := reasoner.CapabilityReasonCode(); reason.Valid() {
+			return reason
+		}
+	}
+	return contract.CapabilityReasonBootSweepFailed
+}
+
 // CapabilityProbeResult is the bounded, publishable portion of a functional
 // probe. Diagnostic detail belongs in the returned error and remains local.
 type CapabilityProbeResult struct {
@@ -223,8 +240,8 @@ func (state *capabilityState) adoptRestrictive(node l1.Node) error {
 		return nil
 	}
 	if node.Capabilities["kind:oci"] || !slices.Contains(node.MissingCapabilities, "kind:oci") ||
-		node.CapabilityReasonCode != contract.CapabilityReasonBootSweepFailed {
-		return errors.New("L1 did not atomically publish the restrictive OCI boot-sweep observation")
+		!node.CapabilityReasonCode.ValidOCIRestriction() {
+		return errors.New("L1 did not atomically publish the restrictive OCI observation")
 	}
 	state.claimPublication.Lock()
 	defer state.claimPublication.Unlock()

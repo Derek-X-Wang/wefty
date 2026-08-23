@@ -564,8 +564,8 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	if registration.SupersedeCapabilityRevision &&
 		(incoming.observation.Capabilities["kind:oci"] ||
 			!slices.Contains(incoming.observation.MissingCapabilities, "kind:oci") ||
-			incoming.observation.ReasonCode != contract.CapabilityReasonBootSweepFailed) {
-		return Node{}, protocolError(contract.ErrorInvalidRequest, "capability supersede requires a restrictive boot-sweep observation")
+			!incoming.observation.ReasonCode.ValidOCIRestriction()) {
+		return Node{}, protocolError(contract.ErrorInvalidRequest, "capability supersede requires a restrictive OCI observation")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
