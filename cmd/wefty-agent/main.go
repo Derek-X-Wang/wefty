@@ -17,12 +17,24 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
 var version = "dev"
 
 func main() {
+	if ocihelper.IsInvocation(os.Args) {
+		helperContext, stopHelper := signal.NotifyContext(context.TODO(), os.Interrupt, syscall.SIGTERM)
+		defer stopHelper()
+		if err := ocihelper.RunInvocation(helperContext, os.Args, ocihelper.UnavailableEngine{}, ocihelper.ServerConfig{
+			HelperVersion: version, AllowedUIDs: []uint32{uint32(os.Getuid())},
+		}); err != nil {
+			log.Printf("wefty-agent OCI helper: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if processrunner.IsGuardianInvocation(os.Args) {
 		if err := processrunner.RunGuardianInvocation(os.Args); err != nil {
 			log.Printf("wefty-agent guardian: %v", err)

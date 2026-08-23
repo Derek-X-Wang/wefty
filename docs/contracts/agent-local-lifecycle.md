@@ -38,8 +38,11 @@ loop. A failed probe commits a restrictive local snapshot before returning its
 diagnostic error: every OCI-related badge is removed and local OCI start
 admission fails immediately. New claim RPCs pause until registration or a
 heartbeat acknowledges that restrictive revision, while resident attempts are
-untouched. The next successful heartbeat publishes that same full snapshot.
-Recovery requires another successful probe and a higher revision.
+untouched. Completing a restrictive observation is serialized after every
+claim begun under the preceding snapshot, so an older in-flight claim cannot
+consume work created after the observation returns. The next successful
+heartbeat publishes that same full snapshot. Recovery requires another
+successful probe and a higher revision.
 
 The Capability revision advances only when the canonical capability set,
 missing set, or stable reason changes. Repeated identical probes retain the
@@ -121,3 +124,10 @@ The watchdog also compares wall-clock progress with the remaining monotonic
 lease. A suspend gap that consumes the remainder cancels the attempt before
 the renewal loop can issue another request. Every L1 operation is bounded, and
 each renewal timeout is strictly shorter than the remaining local authority.
+
+For `kind=oci`, the privileged helper provides the Guardian-equivalent second
+boundary described in [OCI helper protocol](oci-helper-protocol.md). The agent
+refreshes an attempt's helper deadman only after the matching L1 lease renewal
+succeeds. Agent-helper control EOF, a helper-clock heartbeat blackhole, or an
+expired per-attempt deadman therefore reaps runtime-owned state independently
+of the agent's own authority watchdog.

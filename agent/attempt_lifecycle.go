@@ -24,6 +24,13 @@ type attemptWatch interface {
 	Stop()
 }
 
+// AttemptDeadmanRenewer is the optional agent-to-OCI-helper renewal hook. Its
+// implementation queues evidence into the helper client's heartbeat pump; it
+// must never perform an independent L1 renewal.
+type AttemptDeadmanRenewer interface {
+	QueueSuccessfulRenewal(l1.Claim, time.Duration) error
+}
+
 type disabledAttemptWatchdog struct{}
 
 func (disabledAttemptWatchdog) Start(context.Context, localAuthority, context.CancelCauseFunc) attemptWatch {
@@ -59,6 +66,7 @@ type attemptLifecycleDependencies struct {
 	prepareAuthorityLoss   func(context.Context, string) error
 	allowsStart            func(contract.JobSpec) bool
 	runtimeReaped          func(string, workloadrunner.ReapReceipt, error)
+	attemptDeadman         AttemptDeadmanRenewer
 }
 
 // attemptLifecycle owns one attempt from renewal startup through process/log
@@ -680,6 +688,13 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 		lease = updated
 		authority = localAuthority{deadline: requestStarted.Add(updated.LeaseTTL)}
 		watch.Renewed(authority)
+		if err := queueHelperDeadman(lifecycle.dependencies.attemptDeadman, claim, updated); err != nil {
+			select {
+			case failures <- destinationError{destination: errorDestinationAttemptAuthority, err: err}:
+			default:
+			}
+			return
+		}
 		if updated.Directive == l1.AttemptDirectiveStop {
 			returnWithDirective(failures, errAttemptDirectiveStop)
 			return
@@ -690,6 +705,13 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 		}
 		nextDelay = renewalDelay(authority.deadline.Sub(lifecycle.dependencies.clock.Now()), lifecycle.dependencies.renewalInterval)
 	}
+}
+
+func queueHelperDeadman(renewer AttemptDeadmanRenewer, claim l1.Claim, lease l1.AttemptLease) error {
+	if renewer == nil || claim.Job.Spec.Kind != contract.JobKindOCI || lease.Directive != "" {
+		return nil
+	}
+	return renewer.QueueSuccessfulRenewal(claim, lease.LeaseTTL)
 }
 
 func returnWithDirective(failures chan<- destinationError, directive error) {

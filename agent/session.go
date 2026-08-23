@@ -535,6 +535,8 @@ func (session *agentSession) claim(
 	// has requeued a job but before the first worker finishes local finalization.
 	session.claimMu.Lock()
 	defer session.claimMu.Unlock()
+	endCapabilityClaim := session.capabilities.beginClaim()
+	defer endCapabilityClaim()
 	if !session.capabilities.allowsClaim() {
 		return nil, false, nil
 	}
