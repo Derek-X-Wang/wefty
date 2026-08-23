@@ -4,6 +4,7 @@ package ocihelper_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -37,7 +38,8 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	helperChecksum := os.Getenv("WEFTY_OCI_HELPER_CHECKSUM")
 	reference := os.Getenv("WEFTY_OCI_PROBE_REFERENCE")
 	digest := os.Getenv("WEFTY_OCI_PROBE_DIGEST")
-	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" {
+	archivePath := os.Getenv("WEFTY_OCI_PROBE_ARCHIVE")
+	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" {
 		t.Fatal("Linux OCI realtiming provisioning is incomplete")
 	}
 	if os.Geteuid() == 0 {
@@ -59,12 +61,16 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer barrier.Close()
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
 	defer cancel()
 	if err := barrier.Ensure(ctx); err != nil {
 		t.Fatal(err)
 	}
 	adapter := ocirunner.NewAdapter(barrier)
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
 	probeStarted := time.Now()
 	if err := adapter.Probe(ctx, "native-node", "native-boot", reference, digest, l1.DefaultLeaseDuration); err != nil {
 		t.Fatal(err)
@@ -73,6 +79,63 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if probeElapsed > 10*time.Second {
 		t.Fatalf("production functional probe took %s, want at most 10s", probeElapsed)
 	}
+
+	// Pull and offline import each start from an empty containerd root. The
+	// second row also rejects all registry HTTPS so the tar stream is the only
+	// possible source of the imported bytes.
+	requestRootFault(t, "reset-containerd")
+	var pulled ocihelper.EnsureImageResponse
+	err = session.EnsureImage(ctx, ocihelper.EnsureImageRequest{
+		Reference: reference, Digest: digest, Source: ocihelper.ImageSourceRegistry,
+		OperationTimeout: 2 * time.Minute,
+	}, func(event ocihelper.EnsureImageEvent) error {
+		if event.Result != nil {
+			pulled = *event.Result
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestRootFault(t, "reset-containerd")
+	requestRootFault(t, "disable-registry")
+	registryDisabled := true
+	t.Cleanup(func() {
+		if registryDisabled {
+			requestRootFault(t, "enable-registry")
+		}
+	})
+	archive, err := os.Open(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var imported ocihelper.EnsureImageResponse
+	importErr := session.ImportImage(ctx, ocihelper.EnsureImageRequest{
+		Reference: reference, Digest: digest, Source: ocihelper.ImageSourceArchive,
+		OperationTimeout: 2 * time.Minute,
+	}, archive, func(event ocihelper.EnsureImageEvent) error {
+		if event.Result != nil {
+			imported = *event.Result
+		}
+		return nil
+	})
+	closeErr := archive.Close()
+	if importErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(importErr, closeErr))
+	}
+	if pulled != imported || pulled.TopLevelDigest != digest || pulled.PlatformDigest == "" {
+		t.Fatalf("pull/import evidence differs: pull=%+v import=%+v", pulled, imported)
+	}
+	importRun := nativeAdapterRequest(reference, imported.TopLevelDigest, "import-run", []string{"/bin/true"})
+	importRun.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+	if result, err := adapter.Run(ctx, importRun, workloadrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error { return nil })); err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+		t.Fatalf("imported image run result=%+v err=%v", result, err)
+	}
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: importRun.Authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("imported image cleanup receipt=%+v err=%v", receipt, err)
+	}
+	requestRootFault(t, "enable-registry")
+	registryDisabled = false
 
 	liveRequest := nativeAdapterRequest(reference, digest, "live-logs", []string{"/bin/sh", "-c", "printf live-before-exit; sleep 2; exit 0"})
 	liveRequest.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
@@ -132,10 +195,6 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatalf("verified cleanup receipt=%+v err=%v", receipt, err)
 	}
 
-	session, err := barrier.Session()
-	if err != nil {
-		t.Fatal(err)
-	}
 	signalAuthority := nativeAuthority("signal")
 	if _, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: signalAuthority, InitialDeadman: l1.DefaultLeaseDuration,
@@ -261,7 +320,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatalf("namespace cleanup verification=%+v err=%v", verification, err)
 	}
 	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}

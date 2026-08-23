@@ -11,11 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,12 +31,17 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	remoteerrors "github.com/containerd/containerd/v2/core/remotes/errors"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	"github.com/containerd/typeurl/v2"
+	distributionref "github.com/distribution/reference"
+	digest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sys/unix"
@@ -60,10 +68,15 @@ type containerdAttempt struct {
 }
 
 type ContainerdEngine struct {
-	client   *containerd.Client
-	config   NativeEngineConfig
-	mu       sync.Mutex
-	attempts map[string]*containerdAttempt
+	client          *containerd.Client
+	config          NativeEngineConfig
+	imageOperations *imageOperationGroup
+	imageNameMu     sync.Mutex
+	imageResourceMu sync.Mutex
+	activeSpools    map[string]struct{}
+	activeLeases    map[string]struct{}
+	mu              sync.Mutex
+	attempts        map[string]*containerdAttempt
 }
 
 func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
@@ -120,7 +133,7 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect containerd: %w", err)
 	}
-	return &ContainerdEngine{client: client, config: config, attempts: make(map[string]*containerdAttempt)}, nil
+	return &ContainerdEngine{client: client, config: config, imageOperations: newImageOperationGroup(), activeSpools: make(map[string]struct{}), activeLeases: make(map[string]struct{}), attempts: make(map[string]*containerdAttempt)}, nil
 }
 
 func copyManagedNetworkFile(source, target string) error {
@@ -154,6 +167,7 @@ func (engine *ContainerdEngine) Close() error {
 	if engine == nil || engine.client == nil {
 		return nil
 	}
+	_ = engine.imageOperations.CancelAll(context.Background())
 	return engine.client.Close()
 }
 
@@ -161,17 +175,376 @@ func engineContext(ctx context.Context) context.Context {
 	return namespaces.WithNamespace(ctx, ContainerdNamespace)
 }
 
-func (engine *ContainerdEngine) EnsureImage(ctx context.Context, request EnsureImageRequest, emit func(EnsureImageEvent) error) error {
-	// Ticket #142 owns registry delivery. This method is deliberately only a
-	// probe-preload verifier: the immutable image must already be local.
-	image, evidence, err := engine.localImage(engineContext(ctx), request.Reference, request.Digest)
+func (engine *ContainerdEngine) EnsureImage(ctx context.Context, request EnsureImageRequest, archive io.Reader, emit func(EnsureImageEvent) error) error {
+	timeout := request.OperationTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	operationContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	source := request.Source
+	if source == "" {
+		source = ImageSourceRegistry
+	}
+	if source == ImageSourceArchive {
+		var spoolPath string
+		inspection, err := inspectOCIArchiveWithSpool(operationContext, engine.config.RuntimeRoot, archive, request.Reference, request.Digest, func(directory string) (*os.File, error) {
+			engine.imageResourceMu.Lock()
+			defer engine.imageResourceMu.Unlock()
+			file, createErr := os.CreateTemp(directory, "wefty-image-*.tar")
+			if createErr == nil {
+				spoolPath = file.Name()
+				engine.activeSpools[spoolPath] = struct{}{}
+			}
+			return file, createErr
+		})
+		defer func() {
+			engine.imageResourceMu.Lock()
+			delete(engine.activeSpools, spoolPath)
+			engine.imageResourceMu.Unlock()
+		}()
+		if err != nil {
+			var pathError *os.PathError
+			var networkError net.Error
+			switch {
+			case errors.Is(err, syscall.ENOSPC), errors.As(err, &pathError):
+				return imageMechanicsError(ImageFailureResourceExhausted, "", err)
+			case errors.As(err, &networkError), errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+				return imageMechanicsError(ImageFailureNetwork, "", err)
+			}
+			return imageMechanicsError(ImageFailureManifestRejected, "", err)
+		}
+		defer os.Remove(inspection.Path)
+		if err := emit(EnsureImageEvent{Kind: ImageProgress, Progress: &ImageProgressEvent{Status: "resolved", TopLevelDigest: inspection.TopLevel.Digest.String()}}); err != nil {
+			return err
+		}
+		response, err := engine.importImage(operationContext, inspection, timeout)
+		if err != nil {
+			return err
+		}
+		return emit(EnsureImageEvent{Kind: ImageComplete, Result: &response})
+	}
+
+	reference, topLevelDigest, err := engine.resolvePublicImage(operationContext, request.Reference, request.Digest)
 	if err != nil {
 		return err
 	}
-	if err := image.Unpack(engineContext(ctx), DefaultSnapshotter); err != nil && !errdefs.IsAlreadyExists(err) {
-		return &ImageUnavailableError{err: fmt.Errorf("unpack pinned local probe image: %w", err)}
+	if err := emit(EnsureImageEvent{Kind: ImageProgress, Progress: &ImageProgressEvent{Status: "resolved", TopLevelDigest: topLevelDigest}}); err != nil {
+		return err
 	}
-	return emit(EnsureImageEvent{Kind: ImageComplete, Result: &EnsureImageResponse{TopLevelDigest: evidence.TopLevelDigest, PlatformDigest: evidence.PlatformManifestDigest}})
+	key := imageOperationKey{Namespace: ContainerdNamespace, Digest: topLevelDigest, Platform: platforms.DefaultString(), Snapshotter: DefaultSnapshotter}
+	response, err := engine.imageOperations.Do(operationContext, key, timeout, func(operationContext context.Context) (EnsureImageResponse, error) {
+		return engine.pullPublicImage(operationContext, reference, topLevelDigest, key)
+	})
+	if err != nil {
+		var mechanics *ImageMechanicsError
+		if errors.As(err, &mechanics) && mechanics.Fact.TopLevelDigest == "" {
+			fact := mechanics.Fact
+			fact.TopLevelDigest = topLevelDigest
+			return &ImageMechanicsError{Fact: fact, err: mechanics.err}
+		}
+		return err
+	}
+	return emit(EnsureImageEvent{Kind: ImageComplete, Result: &response})
+}
+
+func (engine *ContainerdEngine) resolvePublicImage(ctx context.Context, rawReference, expectedDigest string) (string, string, error) {
+	named, err := distributionref.ParseNormalizedNamed(rawReference)
+	if err != nil {
+		return "", "", imageMechanicsError(ImageFailureManifestRejected, "", err)
+	}
+	if _, ok := named.(distributionref.Digested); ok {
+		return "", "", imageMechanicsError(ImageFailureManifestRejected, "", errors.New("registry image reference must not contain a digest"))
+	}
+	named = distributionref.TagNameOnly(named)
+	if expectedDigest != "" {
+		if err := digest.Digest(expectedDigest).Validate(); err != nil {
+			return "", "", imageMechanicsError(ImageFailureManifestRejected, "", err)
+		}
+		// A prior successful resolution is immutable policy input. Do not
+		// resolve the mutable tag again on agent retry; Pull verifies the
+		// pinned descriptor while fetching it by digest.
+		return named.String(), expectedDigest, nil
+	}
+	tracker := &retryAfterTracker{}
+	_, descriptor, err := publicResolver(tracker).Resolve(engineContext(ctx), named.String())
+	if err != nil {
+		return "", "", classifyRegistryError(err, tracker.Delay(), expectedDigest)
+	}
+	if err := validateResolvedImageDescriptor(descriptor); err != nil {
+		return "", "", err
+	}
+	resolved := descriptor.Digest.String()
+	return named.String(), resolved, nil
+}
+
+func validateResolvedImageDescriptor(descriptor ocispec.Descriptor) error {
+	if !images.IsManifestType(descriptor.MediaType) && !images.IsIndexType(descriptor.MediaType) {
+		return imageMechanicsError(ImageFailureManifestRejected, descriptor.Digest.String(), errors.New("registry resolved an unsupported image media type"))
+	}
+	return nil
+}
+
+func (engine *ContainerdEngine) pullPublicImage(ctx context.Context, reference, topLevelDigest string, key imageOperationKey) (EnsureImageResponse, error) {
+	operationContext, release, err := engine.imageOperationLease(engineContext(ctx), key)
+	if err != nil {
+		return EnsureImageResponse{}, classifyImageOperationError(err, topLevelDigest)
+	}
+	defer release()
+	if image, evidence, localErr := engine.localImage(operationContext, reference, topLevelDigest); localErr == nil {
+		if unpackErr := image.Unpack(operationContext, DefaultSnapshotter); unpackErr != nil && !errdefs.IsAlreadyExists(unpackErr) {
+			return EnsureImageResponse{}, classifyImageOperationError(unpackErr, topLevelDigest)
+		}
+		return EnsureImageResponse{TopLevelDigest: evidence.TopLevelDigest, PlatformDigest: evidence.PlatformManifestDigest}, nil
+	} else if !isLocalImageNotFound(localErr) {
+		return EnsureImageResponse{}, classifyImageOperationError(localErr, topLevelDigest)
+	}
+	tracker := &retryAfterTracker{}
+	_, err = engine.client.Pull(operationContext, reference+"@"+topLevelDigest,
+		containerd.WithResolver(publicResolver(tracker)),
+		containerd.WithPlatformMatcher(platforms.DefaultStrict()),
+		containerd.WithPullUnpack,
+		containerd.WithPullSnapshotter(DefaultSnapshotter),
+	)
+	if err != nil {
+		return EnsureImageResponse{}, classifyRegistryError(err, tracker.Delay(), topLevelDigest)
+	}
+	_, evidence, err := engine.localImage(operationContext, reference, topLevelDigest)
+	if err != nil {
+		return EnsureImageResponse{}, classifyImageOperationError(err, topLevelDigest)
+	}
+	return EnsureImageResponse{TopLevelDigest: evidence.TopLevelDigest, PlatformDigest: evidence.PlatformManifestDigest}, nil
+}
+
+func isLocalImageNotFound(err error) bool {
+	var unavailable *ImageUnavailableError
+	return errors.As(err, &unavailable) && errdefs.IsNotFound(unavailable.err)
+}
+
+func (engine *ContainerdEngine) importImage(ctx context.Context, inspection ociArchiveInspection, timeout time.Duration) (EnsureImageResponse, error) {
+	key := imageOperationKey{Namespace: ContainerdNamespace, Digest: inspection.TopLevel.Digest.String(), Platform: platforms.Format(inspection.Platform), Snapshotter: DefaultSnapshotter}
+	response, err := engine.imageOperations.DoPrepared(ctx, key, timeout, func() (func(context.Context) (EnsureImageResponse, error), func(), error) {
+		file, openErr := os.Open(inspection.Path)
+		if openErr != nil {
+			return nil, nil, imageMechanicsError(ImageFailureUnavailable, inspection.TopLevel.Digest.String(), openErr)
+		}
+		return func(operationContext context.Context) (EnsureImageResponse, error) {
+			return engine.importImageContent(operationContext, inspection, key, file)
+		}, func() { _ = file.Close() }, nil
+	})
+	if err != nil {
+		return EnsureImageResponse{}, err
+	}
+	if err := engine.bindImportedImage(engineContext(ctx), inspection.Reference, inspection.TopLevel); err != nil {
+		return EnsureImageResponse{}, err
+	}
+	return response, nil
+}
+
+func (engine *ContainerdEngine) importImageContent(ctx context.Context, inspection ociArchiveInspection, key imageOperationKey, file io.Reader) (EnsureImageResponse, error) {
+	operationContext, release, err := engine.imageOperationLease(engineContext(ctx), key)
+	if err != nil {
+		return EnsureImageResponse{}, classifyImageOperationError(err, inspection.TopLevel.Digest.String())
+	}
+	defer release()
+	internalReference := "wefty.local/import@" + inspection.TopLevel.Digest.String()
+	if _, err := engine.client.Import(operationContext, file,
+		containerd.WithImportPlatform(platforms.DefaultStrict()),
+		containerd.WithImageRefTranslator(func(string) string { return internalReference }),
+	); err != nil {
+		return EnsureImageResponse{}, classifyImageOperationError(err, inspection.TopLevel.Digest.String())
+	}
+	image, evidence, err := engine.localImage(operationContext, inspection.Reference, inspection.TopLevel.Digest.String())
+	if err != nil {
+		return EnsureImageResponse{}, classifyImageOperationError(err, inspection.TopLevel.Digest.String())
+	}
+	if err := image.Unpack(operationContext, DefaultSnapshotter); err != nil && !errdefs.IsAlreadyExists(err) {
+		return EnsureImageResponse{}, classifyImageOperationError(err, inspection.TopLevel.Digest.String())
+	}
+	return EnsureImageResponse{TopLevelDigest: evidence.TopLevelDigest, PlatformDigest: evidence.PlatformManifestDigest}, nil
+}
+
+func (engine *ContainerdEngine) bindImportedImage(ctx context.Context, reference string, target ocispec.Descriptor) error {
+	engine.imageNameMu.Lock()
+	defer engine.imageNameMu.Unlock()
+	existing, err := engine.client.ImageService().Get(ctx, reference)
+	if err == nil {
+		if existing.Target.Digest != target.Digest {
+			return imageMechanicsError(ImageFailureManifestRejected, target.Digest.String(), errors.New("OCI image name already identifies different bytes"))
+		}
+		return nil
+	}
+	if !errdefs.IsNotFound(err) {
+		return classifyImageOperationError(err, target.Digest.String())
+	}
+	if _, err := engine.client.ImageService().Create(ctx, images.Image{Name: reference, Target: target}); err != nil {
+		if !errdefs.IsAlreadyExists(err) {
+			return classifyImageOperationError(err, target.Digest.String())
+		}
+		existing, err = engine.client.ImageService().Get(ctx, reference)
+		if err != nil || existing.Target.Digest != target.Digest {
+			return imageMechanicsError(ImageFailureManifestRejected, target.Digest.String(), errors.New("OCI image name already identifies different bytes"))
+		}
+	}
+	return nil
+}
+
+func (engine *ContainerdEngine) imageOperationLease(ctx context.Context, key imageOperationKey) (context.Context, func(), error) {
+	hash := sha256.Sum256([]byte(key.Namespace + "\x00" + key.Digest + "\x00" + key.Platform + "\x00" + key.Snapshotter))
+	engine.imageResourceMu.Lock()
+	lease, err := engine.client.LeasesService().Create(ctx, leases.WithID("wefty-image-op-"+hex.EncodeToString(hash[:16])))
+	if err != nil {
+		engine.imageResourceMu.Unlock()
+		return ctx, func() {}, err
+	}
+	engine.activeLeases[lease.ID] = struct{}{}
+	engine.imageResourceMu.Unlock()
+	leaseContext := leases.WithLease(ctx, lease.ID)
+	return leaseContext, func() {
+		// TODO(#143, #144): per-waiter attempt/binding pins must attach
+		// before successful singleflight waiters release this operation lease.
+		cleanupContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = engine.client.LeasesService().Delete(cleanupContext, lease)
+		engine.imageResourceMu.Lock()
+		delete(engine.activeLeases, lease.ID)
+		engine.imageResourceMu.Unlock()
+	}, nil
+}
+
+func publicResolver(tracker *retryAfterTracker) remotes.Resolver {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport.IdleConnTimeout = 90 * time.Second
+	return docker.NewResolver(docker.ResolverOptions{Client: &http.Client{Transport: retryAfterTransport{base: transport, tracker: tracker}}})
+}
+
+type retryAfterTracker struct {
+	mu    sync.Mutex
+	delay time.Duration
+}
+
+func (tracker *retryAfterTracker) Observe(header string, now time.Time) {
+	delay := parseRetryAfter(header, now)
+	tracker.mu.Lock()
+	if delay > tracker.delay {
+		tracker.delay = delay
+	}
+	tracker.mu.Unlock()
+}
+
+func (tracker *retryAfterTracker) Delay() time.Duration {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return tracker.delay
+}
+
+type retryAfterTransport struct {
+	base    http.RoundTripper
+	tracker *retryAfterTracker
+}
+
+func (transport retryAfterTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := transport.base.RoundTrip(request)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		// Hide net.Error from containerd's mechanics-level retry loop. The
+		// agent receives the typed transient result and owns all retry timing.
+		return nil, &registryTransportError{err: err}
+	}
+	if response != nil && (response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500) {
+		transport.tracker.Observe(response.Header.Get("Retry-After"), time.Now())
+		if response.Body != nil {
+			_ = response.Body.Close()
+		}
+		return nil, &registryStatusError{statusCode: response.StatusCode}
+	}
+	return response, err
+}
+
+type registryStatusError struct{ statusCode int }
+
+func (failure *registryStatusError) Error() string {
+	return "registry returned a transient HTTP status"
+}
+
+type registryTransportError struct{ err error }
+
+func (failure *registryTransportError) Error() string { return failure.err.Error() }
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil && when.After(now) {
+		return when.Sub(now)
+	}
+	return 0
+}
+
+func classifyRegistryError(err error, retryAfter time.Duration, resolvedDigest string) error {
+	if err == nil {
+		return nil
+	}
+	var statusFailure *registryStatusError
+	if errors.As(err, &statusFailure) {
+		return &ImageMechanicsError{Fact: ImageFailureFact{Kind: ImageFailureHTTP, HTTPStatus: statusFailure.statusCode, RetryAfter: retryAfter, TopLevelDigest: resolvedDigest}, err: err}
+	}
+	var transportFailure *registryTransportError
+	if errors.As(err, &transportFailure) {
+		return &ImageMechanicsError{Fact: ImageFailureFact{Kind: ImageFailureNetwork, RetryAfter: retryAfter, TopLevelDigest: resolvedDigest}, err: err}
+	}
+	var unexpected remoteerrors.ErrUnexpectedStatus
+	if errors.As(err, &unexpected) {
+		if unexpected.StatusCode == http.StatusBadRequest || unexpected.StatusCode == http.StatusNotAcceptable || unexpected.StatusCode == http.StatusUnprocessableEntity {
+			return imageMechanicsError(ImageFailureManifestRejected, resolvedDigest, err)
+		}
+		return &ImageMechanicsError{Fact: ImageFailureFact{Kind: ImageFailureHTTP, HTTPStatus: unexpected.StatusCode, RetryAfter: retryAfter, TopLevelDigest: resolvedDigest}, err: err}
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "unsupported media type") || strings.Contains(message, "unexpected media type") {
+		return imageMechanicsError(ImageFailureManifestRejected, resolvedDigest, err)
+	}
+	var networkError net.Error
+	var dnsError *net.DNSError
+	if errors.As(err, &dnsError) || errors.As(err, &networkError) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) {
+		return &ImageMechanicsError{Fact: ImageFailureFact{Kind: ImageFailureNetwork, RetryAfter: retryAfter, TopLevelDigest: resolvedDigest}, err: err}
+	}
+	if errdefs.IsNotFound(err) {
+		return &ImageMechanicsError{Fact: ImageFailureFact{Kind: ImageFailureHTTP, HTTPStatus: http.StatusNotFound, TopLevelDigest: resolvedDigest}, err: err}
+	}
+	return classifyImageOperationError(err, resolvedDigest)
+}
+
+func classifyImageOperationError(err error, resolvedDigest string) error {
+	if err == nil {
+		return nil
+	}
+	var mechanics *ImageMechanicsError
+	if errors.As(err, &mechanics) {
+		if mechanics.Fact.TopLevelDigest == "" {
+			fact := mechanics.Fact
+			fact.TopLevelDigest = resolvedDigest
+			return &ImageMechanicsError{Fact: fact, err: mechanics.err}
+		}
+		return mechanics
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return imageMechanicsError(ImageFailureNetwork, resolvedDigest, err)
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "no match for platform") || strings.Contains(message, "no manifest for") || strings.Contains(message, "platform does not match") {
+		return imageMechanicsError(ImageFailurePlatformMismatch, resolvedDigest, err)
+	}
+	if errdefs.IsUnavailable(err) || strings.Contains(message, "transport is closing") || strings.Contains(message, "connection refused") {
+		return imageMechanicsError(ImageFailureEngineLoss, resolvedDigest, err)
+	}
+	if errors.Is(err, syscall.ENOSPC) || strings.Contains(message, "resource exhausted") || strings.Contains(message, "no space left") || strings.Contains(message, "snapshotter") {
+		return imageMechanicsError(ImageFailureResourceExhausted, resolvedDigest, err)
+	}
+	return imageMechanicsError(ImageFailureUnavailable, resolvedDigest, err)
 }
 
 func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ RunResponse, runErr error) {
@@ -457,6 +830,9 @@ func (engine *ContainerdEngine) ReapAttempt(ctx context.Context, authority Attem
 }
 
 func (engine *ContainerdEngine) ReapSession(ctx context.Context, _ SessionIdentity) error {
+	if err := engine.imageOperations.CancelAll(ctx); err != nil {
+		return err
+	}
 	engine.mu.Lock()
 	attempts := make([]*containerdAttempt, 0, len(engine.attempts))
 	for _, attempt := range engine.attempts {
@@ -502,6 +878,9 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 
 func (engine *ContainerdEngine) Sweep(ctx context.Context, _ SweepRequest) (SweepResponse, error) {
 	ctx = engineContext(ctx)
+	if err := engine.sweepImageSpools(); err != nil {
+		return SweepResponse{}, err
+	}
 	engine.mu.Lock()
 	for _, attempt := range engine.attempts {
 		if attempt.cancel != nil {
@@ -552,6 +931,30 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, _ SweepRequest) (Swee
 			return SweepResponse{}, err
 		}
 	}
+	return engine.finishSweep(ctx, inventory, prior, attempts)
+}
+
+func (engine *ContainerdEngine) sweepImageSpools() error {
+	engine.imageResourceMu.Lock()
+	defer engine.imageResourceMu.Unlock()
+	imports := filepath.Join(engine.config.RuntimeRoot, "imports")
+	entries, readErr := os.ReadDir(imports)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	for _, entry := range entries {
+		spool := filepath.Join(imports, entry.Name())
+		if _, live := engine.activeSpools[spool]; live {
+			continue
+		}
+		if err := os.RemoveAll(spool); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory ResourceInventory, prior map[string]struct{}, attempts map[string]SweptAttemptAuthority) (SweepResponse, error) {
 	snapshotter := engine.client.SnapshotService(DefaultSnapshotter)
 	var snapshotNames []string
 	if err := snapshotter.Walk(ctx, func(_ context.Context, info snapshots.Info) error {
@@ -581,6 +984,18 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, _ SweepRequest) (Swee
 		return SweepResponse{}, err
 	}
 	for _, lease := range leaseList {
+		if strings.HasPrefix(lease.ID, "wefty-image-op-") {
+			engine.imageResourceMu.Lock()
+			_, live := engine.activeLeases[lease.ID]
+			engine.imageResourceMu.Unlock()
+			if live {
+				continue
+			}
+			if err := engine.client.LeasesService().Delete(ctx, lease); err != nil && !errdefs.IsNotFound(err) {
+				return SweepResponse{}, err
+			}
+			continue
+		}
 		if strings.HasPrefix(lease.ID, "wefty-lease-") {
 			authority, labelErr := authorityFromLabels(lease.Labels)
 			if labelErr != nil {
@@ -731,29 +1146,47 @@ func (engine *ContainerdEngine) localImage(ctx context.Context, reference, immut
 }
 
 func selectedManifest(ctx context.Context, store content.Store, target ocispec.Descriptor) (ocispec.Descriptor, ocispec.Platform, error) {
+	runtimeMatcher := platforms.DefaultStrict()
 	if images.IsManifestType(target.MediaType) {
-		manifest, err := images.Manifest(ctx, store, target, platforms.Default())
+		manifest, err := images.Manifest(ctx, store, target, runtimeMatcher)
 		if err != nil {
 			return ocispec.Descriptor{}, ocispec.Platform{}, err
 		}
 		platform, err := images.ConfigPlatform(ctx, store, manifest.Config)
-		return target, platform, err
+		if err != nil {
+			return ocispec.Descriptor{}, ocispec.Platform{}, err
+		}
+		if !runtimeMatcher.Match(platform) || (target.Platform != nil && !platforms.OnlyStrict(platforms.Normalize(*target.Platform)).Match(platform)) {
+			return ocispec.Descriptor{}, ocispec.Platform{}, imageMechanicsError(ImageFailurePlatformMismatch, target.Digest.String(), errors.New("image manifest config platform does not match its descriptor or runtime platform"))
+		}
+		return target, platform, nil
 	}
 	children, err := images.Children(ctx, store, target)
 	if err != nil {
 		return ocispec.Descriptor{}, ocispec.Platform{}, err
 	}
-	matcher := platforms.Default()
 	for _, child := range children {
-		if child.Platform != nil && matcher.Match(*child.Platform) {
-			return child, *child.Platform, nil
+		if !images.IsManifestType(child.MediaType) || (child.Platform != nil && !runtimeMatcher.Match(*child.Platform)) {
+			continue
 		}
+		manifest, manifestErr := images.Manifest(ctx, store, child, runtimeMatcher)
+		if manifestErr != nil {
+			return ocispec.Descriptor{}, ocispec.Platform{}, manifestErr
+		}
+		platform, platformErr := images.ConfigPlatform(ctx, store, manifest.Config)
+		if platformErr != nil {
+			return ocispec.Descriptor{}, ocispec.Platform{}, platformErr
+		}
+		if !runtimeMatcher.Match(platform) || (child.Platform != nil && !platforms.OnlyStrict(platforms.Normalize(*child.Platform)).Match(platform)) {
+			return ocispec.Descriptor{}, ocispec.Platform{}, imageMechanicsError(ImageFailurePlatformMismatch, child.Digest.String(), errors.New("image index descriptor platform does not match its manifest config"))
+		}
+		return child, platform, nil
 	}
-	return ocispec.Descriptor{}, ocispec.Platform{}, errors.New("pinned image has no manifest for the runtime platform")
+	return ocispec.Descriptor{}, ocispec.Platform{}, imageMechanicsError(ImageFailurePlatformMismatch, target.Digest.String(), errors.New("pinned image has no manifest for the runtime platform"))
 }
 
 func readImageRuntimeConfig(ctx context.Context, store content.Store, image containerd.Image) (ImageRuntimeConfig, error) {
-	manifest, err := images.Manifest(ctx, store, image.Target(), platforms.Default())
+	manifest, err := images.Manifest(ctx, store, image.Target(), platforms.DefaultStrict())
 	if err != nil {
 		return ImageRuntimeConfig{}, err
 	}

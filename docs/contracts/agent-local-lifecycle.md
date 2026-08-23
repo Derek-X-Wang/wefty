@@ -119,9 +119,12 @@ opaque dial endpoint; managed-resource handles are already opaque here.
 The `attempts` map is keyed by attempt ID. Each entry carries job ID, workload
 class, local state, and its last error:
 
-- `starting`: admitted locally but the payload has not begun; for `kind=oci`
-  this includes image resolution, pull/import, unpack, spec construction, and
-  `Wait` registration before the helper's authoritative `Started` event;
+- `starting`: admitted locally but the payload has not begun. For `kind=oci`,
+  this covers both the interval before image delivery and the later spec
+  construction plus `Wait` registration;
+- `pulling`: `kind=oci` image resolution, pull/import, unpack, or shared-
+  operation wait is in progress. The payload has not begun and L1 remains
+  `Claimed`;
 - `running`: the payload and its authority watchdog are resident;
 - `reaping`: authority or outer cancellation was issued and the agent is
   waiting for the runner to prove the payload is gone;
@@ -134,6 +137,27 @@ unreaped payload safe. Completed attempt entries are removed.
 
 `one_shot` and `services` report independent occupied/limit pairs. They are
 local admission counts, not slot identities and not L1 state.
+
+Image delivery is one agent-owned policy window, defaulting to ten minutes and
+tunable with `--oci-image-budget`. The deadline includes public resolution,
+pull or import, unpack, and waiting on an existing singleflight operation.
+Transient network, DNS, registry 5xx, and 429 failures retry with capped
+exponential backoff and a longer in-budget `Retry-After`; permanent not-found,
+invalid-manifest/archive, and unsupported-platform results fail immediately.
+The helper reports only sanitized mechanics facts (HTTP status, network/DNS,
+platform mismatch, engine loss, resource exhaustion, manifest rejection, and
+`Retry-After`); this agent policy is the sole classification table.
+Budget exhaustion is terminal `image_unavailable`, the three permanent
+classes retain their matching spawn codes, and engine/session loss is
+infrastructure `runtime_unavailable`. L1 remains `Claimed` throughout local
+`pulling` and can become `Started` only through the existing image-observation
+then fenced-start sequence below. Service restart policy explicitly treats all
+four image spawn classifications as terminal.
+
+When delivery fails before the helper `Run` RPC is entered, the OCI adapter
+returns positive `no_runtime_resources` reap evidence without calling helper
+`Delete`. Finalization therefore preserves the image/runtime spawn code instead
+of replacing it with `output_error` merely because no attempt was ever created.
 
 ## Authority clock
 

@@ -129,7 +129,7 @@ heartbeats.
 
 | RPC | Scope and result |
 | --- | --- |
-| `EnsureImage` | Session-authorized, typed progress/result stream on a dedicated connection. In #141 it is a probe-only verifier/unpacker for an already-preloaded immutable image; registry delivery remains #142. Reference and digest enter; no containerd client or retry policy crosses the boundary. |
+| `EnsureImage` | Session-authorized, typed progress/result stream on a dedicated connection. Registry mode resolves only a public reference, pins the returned top-level digest, pulls into the fixed namespace, and unpacks the admitted runtime platform. Archive mode receives an OCI-layout tar stream, recomputes every blob digest, validates descriptor sizes and reachability, admits exactly the runtime platform, and imports/unpacks it. Both modes return the same top-level and platform-manifest digests; no containerd type, private registry credential, or retry policy crosses the boundary. |
 | `Run` | Exact attempt authority, initial deadman, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started` with helper-observed image evidence; optional service transport fields remain reserved. |
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. |
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
@@ -145,6 +145,35 @@ consuming stream payload. Authorization is complete before success is sent.
 EOF or client cancellation on any operation connection cancels its engine
 context. `EnsureImage` is content-addressed and does not take the attempt-create
 side of the sweep gate.
+
+Archive-mode `EnsureImage` sends its ordinary authorization frame before the
+client half-closes a deadline-bound raw OCI tar stream. The helper spools that
+stream under its private runtime root under the operation deadline and a hard
+16 GiB total-byte bound; cancellation closes the transport and the client-side
+upload source. It validates path safety, `oci-layout`,
+`index.json`, every descriptor reachable for the admitted platform, every
+declared size, and each recomputed `sha256` before containerd sees it. Bounded,
+canonical regular extension files permitted by the OCI image-layout spec
+(including containerd's Docker-compatible `manifest.json`) are ignored; paths
+under `blobs/` must remain canonical `sha256` content paths. Containerd's
+canonical image-name annotation takes precedence over a short OCI ref-name
+when archive provenance is compared with the submitted public reference.
+Same-digest/name replay is idempotent; a name already bound to different bytes fails as
+`image_manifest_invalid`.
+
+Resolve, pull/import, and unpack are helper mechanics. Failures expose only a
+closed sanitized mechanics fact: registry HTTP status, network/DNS, platform
+mismatch, engine loss, resource exhaustion, manifest rejection, optional
+`Retry-After`, and any resolved digest. Total timing, retryability, and durable
+spawn classification remain agent policy. A delivery operation is singleflight by fixed
+namespace, top-level digest, admitted platform, and snapshotter, and holds a
+short-lived content lease while containerd works. Canceling the first waiter
+does not cancel the shared operation; helper-session loss cancels and joins all
+operations. Sweep removes stale operation leases and archive spools but skips
+resources registered to live image operations. Per-waiter attempt and binding
+pin attachment before shared-lease release is deferred to #143 and #144.
+Error detail remains local and a resolved digest is retained across agent
+retries.
 
 ## Guest-side runtime-spec construction
 

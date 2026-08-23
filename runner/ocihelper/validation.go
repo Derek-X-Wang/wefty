@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	distributionref "github.com/distribution/reference"
 )
 
 var (
@@ -186,15 +187,48 @@ func rejectSymlinkComponents(value string) error {
 func validateEnsureImageEvent(event EnsureImageEvent) error {
 	switch event.Kind {
 	case ImageProgress:
-		if event.Progress == nil || event.Result != nil || event.Progress.Completed < 0 || event.Progress.Total < 0 || event.Progress.Completed > event.Progress.Total {
+		if event.Progress == nil || event.Result != nil || event.Progress.Status == "" || event.Progress.Completed < 0 || event.Progress.Total < 0 || event.Progress.Completed > event.Progress.Total ||
+			(event.Progress.TopLevelDigest != "" && !digestPattern.MatchString(event.Progress.TopLevelDigest)) {
 			return errors.New("invalid image progress event")
 		}
 	case ImageComplete:
-		if event.Progress != nil || event.Result == nil || event.Result.TopLevelDigest == "" || event.Result.PlatformDigest == "" {
+		if event.Progress != nil || event.Result == nil || !digestPattern.MatchString(event.Result.TopLevelDigest) || !digestPattern.MatchString(event.Result.PlatformDigest) {
 			return errors.New("invalid image completion event")
 		}
 	default:
 		return errors.New("unknown image event kind")
+	}
+	return nil
+}
+
+func validateEnsureImageRequest(request EnsureImageRequest) error {
+	source := request.Source
+	if source == "" {
+		source = ImageSourceRegistry
+	}
+	if request.Digest != "" && !digestPattern.MatchString(request.Digest) {
+		return errors.New("image digest must be sha256 plus 64 lowercase hexadecimal characters")
+	}
+	if request.OperationTimeout < 0 {
+		return errors.New("image operation timeout must not be negative")
+	}
+	switch source {
+	case ImageSourceRegistry:
+		if strings.TrimSpace(request.Reference) == "" {
+			return errors.New("registry image reference is required")
+		}
+		named, err := distributionref.ParseNormalizedNamed(request.Reference)
+		if err != nil {
+			return errors.New("registry image reference is invalid")
+		}
+		if _, ok := named.(distributionref.Digested); ok {
+			return errors.New("registry image reference must not contain a digest")
+		}
+	case ImageSourceArchive:
+		// Archive names and expected digests are optional: the verified OCI
+		// layout is authoritative and returns both selected digests.
+	default:
+		return fmt.Errorf("image source %q is unsupported", source)
 	}
 	return nil
 }

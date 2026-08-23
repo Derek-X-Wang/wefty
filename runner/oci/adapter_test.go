@@ -1,6 +1,7 @@
 package oci
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -36,6 +37,31 @@ func TestAdapterRequiresAuthoritativeStartedBeforeLocalPromotion(t *testing.T) {
 	engine.mu.Unlock()
 	if deletes == 0 {
 		t.Fatal("failed Started acknowledgement did not reap the real task")
+	}
+}
+
+func TestAdapterLoadImageUsesAgentBudgetAndReturnsDigests(t *testing.T) {
+	engine := &adapterTestEngine{}
+	adapter, closeAdapter := startAdapterTestServerWithPolicy(t, engine, ImagePolicy{Budget: 3 * time.Second})
+	defer closeAdapter()
+	result, err := adapter.LoadImage(t.Context(), "registry.invalid/offline:test", bytes.NewReader([]byte("archive")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TopLevelDigest != adapterTestDigest || result.PlatformDigest != adapterTestDigest || engine.ensureCalls != 1 {
+		t.Fatalf("load-image result=%+v calls=%d", result, engine.ensureCalls)
+	}
+}
+
+func TestAdapterRejectsHelperDigestDifferentFromPinnedRequest(t *testing.T) {
+	other := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	engine := &adapterTestEngine{responseDigest: other}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	result, err := adapter.Run(t.Context(), request, nil)
+	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureImageManifestInvalid {
+		t.Fatalf("digest mismatch outcome = (%+v, %v)", result.Outcome, err)
 	}
 }
 
@@ -134,16 +160,200 @@ func TestAdapterPreservesImageUnavailableAsPermanentSpawnEvidence(t *testing.T) 
 	}
 }
 
-type adapterTestEngine struct {
-	mu           sync.Mutex
-	watch        ocihelper.WatchResponse
-	deletes      int
-	refuseDelete bool
-	runErr       error
+func TestAdapterHonorsRetryAfterWithinOneImageBudget(t *testing.T) {
+	engine := &adapterTestEngine{ensureErrors: []error{
+		ocihelper.NewImageMechanicsError(ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureHTTP, HTTPStatus: 429, RetryAfter: 2 * time.Second, TopLevelDigest: adapterTestDigest}, errors.New("rate limited")),
+		nil,
+	}, watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
+	adapter, closeAdapter := startAdapterTestServerWithPolicy(t, engine, ImagePolicy{
+		Budget: time.Minute,
+		Sleep: func(_ context.Context, delay time.Duration) error {
+			if delay != 2*time.Second {
+				t.Fatalf("retry delay = %s, want Retry-After 2s", delay)
+			}
+			return nil
+		},
+	})
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+	if _, err := adapter.Run(t.Context(), request, nil); err != nil {
+		t.Fatal(err)
+	}
+	if engine.ensureCalls != 2 {
+		t.Fatalf("EnsureImage calls = %d, want 2", engine.ensureCalls)
+	}
 }
 
-func (*adapterTestEngine) EnsureImage(context.Context, ocihelper.EnsureImageRequest, func(ocihelper.EnsureImageEvent) error) error {
-	return nil
+func TestAdapterImageBudgetExhaustionIsPermanentAndBounded(t *testing.T) {
+	engine := &adapterTestEngine{ensureErrors: []error{ocihelper.NewImageMechanicsError(ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureNetwork, TopLevelDigest: adapterTestDigest}, errors.New("temporary DNS"))}}
+	adapter, closeAdapter := startAdapterTestServerWithPolicy(t, engine, ImagePolicy{
+		Budget: 5 * time.Millisecond,
+		Sleep: func(ctx context.Context, _ time.Duration) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	defer closeAdapter()
+	result, err := adapter.Run(t.Context(), adapterTestRequest(), nil)
+	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureImageUnavailable {
+		t.Fatalf("budget outcome=%+v err=%v", result.Outcome, err)
+	}
+	if engine.ensureCalls != 1 {
+		t.Fatalf("budget exhaustion EnsureImage calls = %d, want 1", engine.ensureCalls)
+	}
+}
+
+func TestAdapterPermanentImageErrorsFailFast(t *testing.T) {
+	tests := []struct {
+		name string
+		fact ocihelper.ImageFailureFact
+		want contract.SpawnFailureCode
+	}{
+		{name: "not found", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureHTTP, HTTPStatus: 404}, want: contract.SpawnFailureImageNotFound},
+		{name: "unauthorized", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureHTTP, HTTPStatus: 401}, want: contract.SpawnFailureImageUnavailable},
+		{name: "invalid manifest", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureManifestRejected}, want: contract.SpawnFailureImageManifestInvalid},
+		{name: "unsupported platform", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailurePlatformMismatch}, want: contract.SpawnFailureImagePlatformUnsupported},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.fact.TopLevelDigest = adapterTestDigest
+			engine := &adapterTestEngine{ensureErrors: []error{ocihelper.NewImageMechanicsError(test.fact, errors.New(test.name))}}
+			adapter, closeAdapter := startAdapterTestServer(t, engine)
+			defer closeAdapter()
+			result, err := adapter.Run(t.Context(), adapterTestRequest(), nil)
+			if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != test.want {
+				t.Fatalf("outcome=%+v err=%v", result.Outcome, err)
+			}
+			if engine.ensureCalls != 1 {
+				t.Fatalf("EnsureImage calls = %d, want fail-fast 1", engine.ensureCalls)
+			}
+		})
+	}
+}
+
+func TestAgentOwnsImageMechanicsClassificationTable(t *testing.T) {
+	tests := []struct {
+		name      string
+		fact      ocihelper.ImageFailureFact
+		want      contract.SpawnFailureCode
+		transient bool
+	}{
+		{name: "network", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureNetwork}, want: contract.SpawnFailureImageUnavailable, transient: true},
+		{name: "503", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureHTTP, HTTPStatus: 503}, want: contract.SpawnFailureImageUnavailable, transient: true},
+		{name: "429", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureHTTP, HTTPStatus: 429}, want: contract.SpawnFailureImageUnavailable, transient: true},
+		{name: "404", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureHTTP, HTTPStatus: 404}, want: contract.SpawnFailureImageNotFound},
+		{name: "401", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureHTTP, HTTPStatus: 401}, want: contract.SpawnFailureImageUnavailable},
+		{name: "manifest rejected", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureManifestRejected}, want: contract.SpawnFailureImageManifestInvalid},
+		{name: "platform mismatch", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailurePlatformMismatch}, want: contract.SpawnFailureImagePlatformUnsupported},
+		{name: "engine loss", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureEngineLoss}, want: contract.SpawnFailureRuntimeUnavailable},
+		{name: "resource exhausted", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureResourceExhausted}, want: contract.SpawnFailureRuntimeUnavailable},
+		{name: "unknown", fact: ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureUnavailable}, want: contract.SpawnFailureImageUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			classification := classifyImageFailure(&ocihelper.RPCError{Code: ocihelper.CodeImageUnavailable, ImageFailure: &test.fact})
+			if classification.code != test.want || classification.transient != test.transient {
+				t.Fatalf("classification = %+v, want code=%s transient=%t", classification, test.want, test.transient)
+			}
+		})
+	}
+}
+
+func TestAdapterEngineLossMidPullFailsFast(t *testing.T) {
+	engine := &adapterTestEngine{
+		ensureErrors:  []error{ocihelper.NewImageMechanicsError(ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureEngineLoss, TopLevelDigest: adapterTestDigest}, errors.New("containerd stopped"))},
+		ensureEntered: make(chan struct{}), releaseEnsure: make(chan struct{}),
+	}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	type outcome struct {
+		result workloadrunner.Result
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := adapter.Run(t.Context(), adapterTestRequest(), nil)
+		done <- outcome{result: result, err: err}
+	}()
+	<-engine.ensureEntered
+	close(engine.releaseEnsure)
+	finished := <-done
+	if finished.err == nil || finished.result.Outcome.SpawnError == nil || finished.result.Outcome.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable {
+		t.Fatalf("engine-loss outcome=%+v err=%v", finished.result.Outcome, finished.err)
+	}
+	if engine.ensureCalls != 1 {
+		t.Fatalf("engine loss retried EnsureImage %d times", engine.ensureCalls)
+	}
+}
+
+func TestAdapterPreRunImageFailureHasPositiveNoRuntimeReapEvidence(t *testing.T) {
+	engine := &adapterTestEngine{ensureErrors: []error{ocihelper.NewImageMechanicsError(
+		ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureHTTP, HTTPStatus: 404}, errors.New("missing"),
+	)}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+	if _, _, err := adapter.Preflight(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.Run(t.Context(), request, nil); err == nil {
+		t.Fatal("image delivery unexpectedly succeeded")
+	}
+	receipt, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
+	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime {
+		t.Fatalf("pre-Run reap receipt = (%+v, %v)", receipt, err)
+	}
+	if engine.deletes != 0 {
+		t.Fatalf("pre-Run failure called helper Delete %d times", engine.deletes)
+	}
+}
+
+type adapterTestEngine struct {
+	mu             sync.Mutex
+	watch          ocihelper.WatchResponse
+	deletes        int
+	refuseDelete   bool
+	runErr         error
+	ensureErrors   []error
+	ensureCalls    int
+	responseDigest string
+	ensureEntered  chan struct{}
+	releaseEnsure  chan struct{}
+}
+
+func (engine *adapterTestEngine) EnsureImage(_ context.Context, request ocihelper.EnsureImageRequest, archive io.Reader, emit func(ocihelper.EnsureImageEvent) error) error {
+	engine.mu.Lock()
+	call := engine.ensureCalls
+	engine.ensureCalls++
+	var ensureErr error
+	if call < len(engine.ensureErrors) {
+		ensureErr = engine.ensureErrors[call]
+	}
+	ensureEntered := engine.ensureEntered
+	releaseEnsure := engine.releaseEnsure
+	engine.mu.Unlock()
+	if ensureEntered != nil {
+		close(ensureEntered)
+		<-releaseEnsure
+	}
+	if archive != nil {
+		if _, err := io.Copy(io.Discard, archive); err != nil {
+			return err
+		}
+	}
+	if ensureErr != nil {
+		return ensureErr
+	}
+	digest := request.Digest
+	if engine.responseDigest != "" {
+		digest = engine.responseDigest
+	}
+	if digest == "" {
+		digest = adapterTestDigest
+	}
+	return emit(ocihelper.EnsureImageEvent{Kind: ocihelper.ImageComplete, Result: &ocihelper.EnsureImageResponse{TopLevelDigest: digest, PlatformDigest: digest}})
 }
 func (engine *adapterTestEngine) Run(context.Context, ocihelper.RunRequest) (ocihelper.RunResponse, error) {
 	if engine.runErr != nil {
@@ -184,6 +394,10 @@ func (*adapterTestEngine) ReapAttempt(context.Context, ocihelper.AttemptAuthorit
 func (*adapterTestEngine) ReapSession(context.Context, ocihelper.SessionIdentity) error  { return nil }
 
 func startAdapterTestServer(t *testing.T, engine ocihelper.Engine) (*Adapter, func()) {
+	return startAdapterTestServerWithPolicy(t, engine, ImagePolicy{})
+}
+
+func startAdapterTestServerWithPolicy(t *testing.T, engine ocihelper.Engine, policy ImagePolicy) (*Adapter, func()) {
 	t.Helper()
 	directory, err := os.MkdirTemp("", "woci-")
 	if err != nil {
@@ -210,7 +424,7 @@ func startAdapterTestServer(t *testing.T, engine ocihelper.Engine) (*Adapter, fu
 	if err := barrier.Ensure(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	return NewAdapter(barrier), func() { _ = barrier.Close(); cancel(); _ = listener.Close(); <-done }
+	return NewAdapterWithPolicy(barrier, policy), func() { _ = barrier.Close(); cancel(); _ = listener.Close(); <-done }
 }
 
 func adapterTestRequest() workloadrunner.Request {

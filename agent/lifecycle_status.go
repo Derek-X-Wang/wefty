@@ -28,6 +28,7 @@ type AttemptLifecycleState string
 
 const (
 	AttemptStarting   AttemptLifecycleState = "starting"
+	AttemptPulling    AttemptLifecycleState = "pulling"
 	AttemptRunning    AttemptLifecycleState = "running"
 	AttemptServing    AttemptLifecycleState = "serving"
 	AttemptReaping    AttemptLifecycleState = "reaping"

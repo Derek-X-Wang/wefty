@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -278,6 +279,9 @@ type pendingRenewal struct {
 }
 
 func (session *Session) EnsureImage(ctx context.Context, request EnsureImageRequest, receive func(EnsureImageEvent) error) error {
+	if request.Source == "" {
+		request.Source = ImageSourceRegistry
+	}
 	return session.stream(ctx, MethodEnsureImage, request, false, func(wire *framedConn, raw frame) error {
 		var event EnsureImageEvent
 		if err := decodeBody(raw.Body, &event); err != nil {
@@ -291,6 +295,89 @@ func (session *Session) EnsureImage(ctx context.Context, request EnsureImageRequ
 		}
 		return nil
 	})
+}
+
+// ImportImage streams one verified OCI image-layout archive into the helper.
+// The raw bytes never enter a JSON frame or an argv/path supplied to root.
+func (session *Session) ImportImage(ctx context.Context, request EnsureImageRequest, archive io.Reader, receive func(EnsureImageEvent) error) error {
+	if archive == nil {
+		return errors.New("OCI image archive reader is required")
+	}
+	request.Source = ImageSourceArchive
+	connection, wire, err := session.dialRequest(ctx, MethodEnsureImage, request)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	if err := decodeResponse(wire, &struct{}{}); err != nil {
+		session.markStaleResponse(err)
+		return err
+	}
+	copyDone := make(chan error, 1)
+	var closeSource sync.Once
+	closeArchive := func() {
+		closeSource.Do(func() {
+			if closer, ok := archive.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		})
+	}
+	stopSourceCancellation := context.AfterFunc(ctx, closeArchive)
+	defer stopSourceCancellation()
+	go func() {
+		_, copyErr := io.Copy(connection, archive)
+		if closeErr := closeWrite(connection); copyErr == nil {
+			copyErr = closeErr
+		}
+		copyDone <- copyErr
+	}()
+	streamErr := session.receiveImageEvents(wire, receive)
+	if streamErr != nil {
+		_ = connection.Close()
+		closeArchive()
+	}
+	copyErr := <-copyDone
+	if streamErr != nil {
+		return streamErr
+	}
+	if copyErr != nil {
+		return fmt.Errorf("stream OCI image archive: %w", copyErr)
+	}
+	return nil
+}
+
+func (session *Session) receiveImageEvents(wire *framedConn, receive func(EnsureImageEvent) error) error {
+	for {
+		var response frame
+		if err := wire.read(&response); err != nil {
+			return fmt.Errorf("receive OCI helper image stream: %w", err)
+		}
+		if response.Version != session.client.protocolVersion() {
+			return &RPCError{Code: CodeVersionMismatch, Message: "helper response used an unsupported version"}
+		}
+		if response.Error != nil {
+			session.markStaleResponse(response.Error)
+			return response.Error
+		}
+		if !response.OK {
+			return errors.New("OCI helper returned neither success nor error")
+		}
+		if len(response.Body) == 0 {
+			return nil
+		}
+		var event EnsureImageEvent
+		if err := decodeBody(response.Body, &event); err != nil {
+			return err
+		}
+		if err := validateEnsureImageEvent(event); err != nil {
+			return err
+		}
+		if receive != nil {
+			if err := receive(event); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func (session *Session) Run(ctx context.Context, request RunRequest) (RunResponse, error) {
@@ -472,6 +559,17 @@ func (session *Session) dialRequest(ctx context.Context, method Method, request 
 type clientOperationConn struct {
 	net.Conn
 	stop func() bool
+}
+
+func closeWrite(connection net.Conn) error {
+	if half, ok := connection.(interface{ CloseWrite() error }); ok {
+		return half.CloseWrite()
+	}
+	return errors.New("OCI helper transport does not support a write half-close")
+}
+
+func (connection *clientOperationConn) CloseWrite() error {
+	return closeWrite(connection.Conn)
 }
 
 func (connection *clientOperationConn) Close() error {

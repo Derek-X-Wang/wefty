@@ -25,9 +25,13 @@ const (
 // facts, while the durable control plane owns restart policy. Unknown codes
 // and every code absent from this table are terminal.
 var failureClassifications = map[contract.SpawnFailureCode]failureClassification{
-	contract.SpawnFailureStartupReadinessTimeout: failureRestartable,
-	contract.SpawnFailurePublishedListener:       failureInfrastructure,
-	contract.SpawnFailureRuntimeUnavailable:      failureInfrastructure,
+	contract.SpawnFailureStartupReadinessTimeout:  failureRestartable,
+	contract.SpawnFailurePublishedListener:        failureInfrastructure,
+	contract.SpawnFailureRuntimeUnavailable:       failureInfrastructure,
+	contract.SpawnFailureImageUnavailable:         failureTerminal,
+	contract.SpawnFailureImageNotFound:            failureTerminal,
+	contract.SpawnFailureImageManifestInvalid:     failureTerminal,
+	contract.SpawnFailureImagePlatformUnsupported: failureTerminal,
 }
 
 var runtimeFailureClassifications = map[contract.RuntimeFailureCode]failureClassification{

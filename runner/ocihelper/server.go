@@ -735,14 +735,34 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if !decodeRequest(wire, request.Body, &body) {
 			return
 		}
-		operation.monitorEOF()
-		err := server.engine.EnsureImage(operation.ctx, body, func(event EnsureImageEvent) error {
+		if err := validateEnsureImageRequest(body); err != nil {
+			_ = writeFailure(wire, CodeInvalidRequest, err.Error())
+			return
+		}
+		var archive io.Reader
+		if body.Source == ImageSourceArchive {
+			timeout := body.OperationTimeout
+			if timeout <= 0 {
+				timeout = 10 * time.Minute
+			}
+			if err := operation.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+				_ = writeFailure(wire, CodeEngineFailure, "bound OCI archive upload deadline")
+				return
+			}
+			if err := writeSuccess(wire, struct{}{}); err != nil {
+				return
+			}
+			archive = operation.conn
+		} else {
+			operation.monitorEOF()
+		}
+		err := server.engine.EnsureImage(operation.ctx, body, archive, func(event EnsureImageEvent) error {
 			if err := validateEnsureImageEvent(event); err != nil {
 				return err
 			}
 			return writeSuccess(wire, event)
 		})
-		writeStreamResult(wire, err)
+		writeImageStreamResult(wire, err)
 	case MethodRun:
 		var body RunRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1023,11 +1043,28 @@ func writeEngineResponse(connection *framedConn, response any, err error) error 
 
 func writeStreamResult(connection *framedConn, err error) {
 	if err != nil {
+		_ = writeFailure(connection, CodeEngineFailure, "OCI engine operation failed")
+		return
+	}
+	_ = connection.write(frame{Version: ProtocolVersion, OK: true})
+}
+
+func writeImageStreamResult(connection *framedConn, err error) {
+	if err != nil {
+		var mechanics *ImageMechanicsError
 		var imageUnavailable *ImageUnavailableError
-		if errors.As(err, &imageUnavailable) {
-			_ = writeFailure(connection, CodeImageUnavailable, "pinned local OCI image is unavailable")
+		if errors.As(err, &mechanics) {
+			fact := mechanics.Fact
+			if fact.RetryAfter < 0 {
+				fact.RetryAfter = 0
+			}
+			_ = writeRPCError(connection, &RPCError{Code: CodeImageUnavailable, Message: "OCI image delivery failed", ImageFailure: &fact})
+		} else if errors.As(err, &imageUnavailable) {
+			fact := ImageFailureFact{Kind: ImageFailureUnavailable}
+			_ = writeRPCError(connection, &RPCError{Code: CodeImageUnavailable, Message: "pinned local OCI image is unavailable", ImageFailure: &fact})
 		} else {
-			_ = writeFailure(connection, CodeEngineFailure, "OCI engine operation failed")
+			fact := ImageFailureFact{Kind: ImageFailureUnavailable}
+			_ = writeRPCError(connection, &RPCError{Code: CodeImageUnavailable, Message: "OCI image delivery failed", ImageFailure: &fact})
 		}
 		return
 	}

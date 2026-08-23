@@ -33,7 +33,7 @@ type GuardianReaper interface {
 // Engine is the helper-internal mechanics seam. No containerd request or type
 // crosses RPC.
 type Engine interface {
-	EnsureImage(context.Context, EnsureImageRequest, func(EnsureImageEvent) error) error
+	EnsureImage(context.Context, EnsureImageRequest, io.Reader, func(EnsureImageEvent) error) error
 	Run(context.Context, RunRequest) (RunResponse, error)
 	Signal(context.Context, SignalRequest) error
 	Watch(context.Context, WatchRequest, func(WatchEvent) error) error
@@ -53,7 +53,7 @@ type UnavailableEngine struct{}
 var errEngineUnavailable = errors.New("OCI engine adapter is not installed")
 
 // ImageUnavailableError separates missing/corrupt/unpacked local content from
-// loss of the containerd engine. Registry delivery remains outside this ticket.
+// loss of the containerd engine.
 type ImageUnavailableError struct{ err error }
 
 func (failure *ImageUnavailableError) Error() string {
@@ -61,8 +61,28 @@ func (failure *ImageUnavailableError) Error() string {
 }
 func (failure *ImageUnavailableError) Unwrap() error { return failure.err }
 
-func (UnavailableEngine) EnsureImage(context.Context, EnsureImageRequest, func(EnsureImageEvent) error) error {
-	return errEngineUnavailable
+// ImageMechanicsError carries only a sanitized observation across the helper
+// boundary. It deliberately contains no retry or L1 classification policy.
+type ImageMechanicsError struct {
+	Fact ImageFailureFact
+	err  error
+}
+
+func (failure *ImageMechanicsError) Error() string {
+	return fmt.Sprintf("OCI image delivery mechanics %s: %v", failure.Fact.Kind, failure.err)
+}
+func (failure *ImageMechanicsError) Unwrap() error { return failure.err }
+
+func NewImageMechanicsError(fact ImageFailureFact, err error) error {
+	return &ImageMechanicsError{Fact: fact, err: err}
+}
+
+func imageMechanicsError(kind ImageFailureKind, digest string, err error) error {
+	return &ImageMechanicsError{Fact: ImageFailureFact{Kind: kind, TopLevelDigest: digest}, err: err}
+}
+
+func (UnavailableEngine) EnsureImage(context.Context, EnsureImageRequest, io.Reader, func(EnsureImageEvent) error) error {
+	return &ImageMechanicsError{Fact: ImageFailureFact{Kind: ImageFailureEngineLoss}, err: errEngineUnavailable}
 }
 func (UnavailableEngine) Run(context.Context, RunRequest) (RunResponse, error) {
 	return RunResponse{}, errEngineUnavailable

@@ -74,6 +74,12 @@ type Request struct {
 	IdlePolicy       IdlePolicy
 	CompletionSignal <-chan struct{}
 	Started          func()
+	// OCIImagePulling exposes the agent-local preparation phase. It never
+	// mutates L1 state or starts payload/runtime clocks.
+	OCIImagePulling func()
+	// OCIImageReady returns the local observer to starting while the helper
+	// constructs the runtime. L1 still remains Claimed.
+	OCIImageReady func()
 	// OCIStarted hands helper-observed image identity to the agent, which
 	// persists it and then performs the fenced L1 Started mutation. The helper
 	// adapter must reap the task when this callback fails.
@@ -109,6 +115,7 @@ type ReapEvidence string
 
 const (
 	ReapEvidenceAttempt           ReapEvidence = "attempt"
+	ReapEvidenceNoRuntime         ReapEvidence = "no_runtime_resources"
 	ReapEvidencePriorBootGuardian ReapEvidence = "prior_boot_guardian"
 	ReapEvidencePriorBootOCISweep ReapEvidence = "prior_boot_oci_sweep"
 )

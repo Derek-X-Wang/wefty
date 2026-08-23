@@ -432,6 +432,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		IdlePolicy: idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
 	}
 	if claim.Job.Spec.Kind == contract.JobKindOCI {
+		request.OCIImagePulling = func() {
+			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptPulling, nil)
+		}
+		request.OCIImageReady = func() {
+			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptStarting, nil)
+		}
 		request.OCIStarted = func(startContext context.Context, observation workloadrunner.OCIImageObservation) error {
 			if lifecycle.dependencies.client == nil {
 				return errors.New("OCI Started acknowledgement requires an L1 client")

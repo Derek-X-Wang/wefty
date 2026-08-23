@@ -1,6 +1,7 @@
 package ocihelper
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -409,7 +410,7 @@ func TestExclusiveSessionEOFAndHeartbeatBlackholeFailClosed(t *testing.T) {
 	}
 	clock.Advance(time.Second)
 	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 2 }, "heartbeat blackhole reap")
-	err = second.EnsureImage(t.Context(), EnsureImageRequest{Reference: "example.invalid/probe", Digest: "sha256:test"}, nil)
+	err = second.EnsureImage(t.Context(), EnsureImageRequest{Reference: "example.invalid/probe", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil)
 	assertRPCCode(t, err, CodeSessionStale)
 }
 
@@ -579,7 +580,7 @@ func TestAllNarrowRPCsReachFakeEngineWithoutContainerdTypes(t *testing.T) {
 	}
 	defer session.Close()
 	requireSweep(t, session)
-	if err := session.EnsureImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", Digest: "sha256:digest"}, nil); err != nil {
+	if err := session.EnsureImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	authority := testAuthority()
@@ -610,6 +611,79 @@ func TestAllNarrowRPCsReachFakeEngineWithoutContainerdTypes(t *testing.T) {
 	}
 }
 
+func TestImportImageStreamsArchiveAfterAuthorization(t *testing.T) {
+	engine := &archiveCaptureEngine{fakeEngine: newFakeEngine()}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	payload := []byte("opaque-oci-archive")
+	var result EnsureImageResponse
+	err = session.ImportImage(t.Context(), EnsureImageRequest{
+		Reference: "registry.invalid/app", Source: ImageSourceArchive, OperationTimeout: time.Minute,
+	}, bytes.NewReader(payload), func(event EnsureImageEvent) error {
+		if event.Result != nil {
+			result = *event.Result
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(engine.archive, payload) || result.TopLevelDigest == "" || result.PlatformDigest == "" {
+		t.Fatalf("archive=%q result=%+v", engine.archive, result)
+	}
+}
+
+func TestImportImageClosesBlockedUploadSourceWhenHelperRejects(t *testing.T) {
+	reader := newBlockedArchiveReader()
+	engine := &rejectBlockedArchiveEngine{fakeEngine: newFakeEngine(), entered: reader.entered}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	err = session.ImportImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", OperationTimeout: time.Minute}, reader, nil)
+	if err == nil {
+		t.Fatal("helper rejection unexpectedly succeeded")
+	}
+	select {
+	case <-reader.closed:
+	case <-time.After(time.Second):
+		t.Fatal("helper rejection did not close and unblock the archive source")
+	}
+}
+
+func TestImportImageOperationTimeoutBoundsBlockedSpoolRead(t *testing.T) {
+	reader := newBlockedArchiveReader()
+	engine := &archiveCaptureEngine{fakeEngine: newFakeEngine()}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	started := time.Now()
+	err = session.ImportImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", OperationTimeout: 20 * time.Millisecond}, reader, nil)
+	if err == nil || time.Since(started) > time.Second {
+		t.Fatalf("blocked spool deadline = (%v, %s)", err, time.Since(started))
+	}
+	select {
+	case <-reader.closed:
+	case <-time.After(time.Second):
+		t.Fatal("spool deadline did not close the blocked upload source")
+	}
+}
+
 func TestSweepGateAndClosedWorkloadValidation(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{MaximumAttemptDeadman: time.Minute})
@@ -628,6 +702,23 @@ func TestSweepGateAndClosedWorkloadValidation(t *testing.T) {
 	assertRPCCode(t, err, CodeInvalidRequest)
 	request = testRunRequest(testAuthority(), 2*time.Minute)
 	_, err = session.Run(t.Context(), request)
+	assertRPCCode(t, err, CodeInvalidRequest)
+}
+
+func TestEnsureImageRejectsEmbeddedDigestReference(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	err = session.EnsureImage(t.Context(), EnsureImageRequest{
+		Reference: "registry.invalid/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Digest:    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}, nil)
 	assertRPCCode(t, err, CodeInvalidRequest)
 }
 
@@ -1242,6 +1333,61 @@ func (engine *crashBoundaryEngine) duplicateStarts() int {
 
 func newFakeEngine() *fakeEngine { return &fakeEngine{runResponse: RunResponse{Started: true}} }
 
+type archiveCaptureEngine struct {
+	*fakeEngine
+	archive []byte
+}
+
+type rejectBlockedArchiveEngine struct {
+	*fakeEngine
+	entered <-chan struct{}
+}
+
+func (engine *rejectBlockedArchiveEngine) EnsureImage(context.Context, EnsureImageRequest, io.Reader, func(EnsureImageEvent) error) error {
+	<-engine.entered
+	return NewImageMechanicsError(ImageFailureFact{Kind: ImageFailureManifestRejected}, errors.New("archive rejected"))
+}
+
+type blockedArchiveReader struct {
+	entered chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func newBlockedArchiveReader() *blockedArchiveReader {
+	return &blockedArchiveReader{entered: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (reader *blockedArchiveReader) Read([]byte) (int, error) {
+	reader.once.Do(func() { close(reader.entered) })
+	<-reader.closed
+	return 0, errors.New("archive source closed")
+}
+
+func (reader *blockedArchiveReader) Close() error {
+	select {
+	case <-reader.closed:
+	default:
+		close(reader.closed)
+	}
+	return nil
+}
+
+func (engine *archiveCaptureEngine) EnsureImage(_ context.Context, request EnsureImageRequest, archive io.Reader, emit func(EnsureImageEvent) error) error {
+	if request.Source != ImageSourceArchive || archive == nil {
+		return errors.New("archive import was not delivered as an archive stream")
+	}
+	payload, err := io.ReadAll(archive)
+	if err != nil {
+		return err
+	}
+	engine.archive = payload
+	return emit(EnsureImageEvent{Kind: ImageComplete, Result: &EnsureImageResponse{
+		TopLevelDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		PlatformDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}})
+}
+
 func (engine *fakeEngine) setRunResponse(response RunResponse) {
 	engine.mu.Lock()
 	engine.runResponse = response
@@ -1254,9 +1400,9 @@ func (engine *fakeEngine) record(method string) {
 	engine.mu.Unlock()
 }
 
-func (engine *fakeEngine) EnsureImage(_ context.Context, _ EnsureImageRequest, emit func(EnsureImageEvent) error) error {
+func (engine *fakeEngine) EnsureImage(_ context.Context, _ EnsureImageRequest, _ io.Reader, emit func(EnsureImageEvent) error) error {
 	engine.record("EnsureImage")
-	return emit(EnsureImageEvent{Kind: ImageComplete, Result: &EnsureImageResponse{TopLevelDigest: "sha256:top", PlatformDigest: "sha256:platform"}})
+	return emit(EnsureImageEvent{Kind: ImageComplete, Result: &EnsureImageResponse{TopLevelDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PlatformDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}})
 }
 func (engine *fakeEngine) Run(_ context.Context, request RunRequest) (RunResponse, error) {
 	engine.record("Run")

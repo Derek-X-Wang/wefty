@@ -29,6 +29,10 @@ func TestSpawnFailureClassificationDefaultsTerminal(t *testing.T) {
 	for _, code := range []contract.SpawnFailureCode{
 		contract.SpawnFailureProcessSpawn,
 		contract.SpawnFailurePublishedPortOccupied,
+		contract.SpawnFailureImageUnavailable,
+		contract.SpawnFailureImageNotFound,
+		contract.SpawnFailureImageManifestInvalid,
+		contract.SpawnFailureImagePlatformUnsupported,
 		contract.SpawnFailureCode("future_unknown_failure"),
 	} {
 		if got := classifySpawnFailure(code); got != failureTerminal {
