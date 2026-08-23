@@ -127,6 +127,7 @@ func run() error {
 		ociHelperChecksum = flag.String("oci-helper-checksum", "", "expected OCI helper binary checksum")
 		ociProbeImage     = flag.String("oci-probe-image", "", "preloaded local OCI probe image reference")
 		ociProbeDigest    = flag.String("oci-probe-digest", "", "immutable digest of the preloaded local OCI probe image")
+		ociImageBudget    = flag.Duration("oci-image-budget", ocirunner.DefaultImageBudget, "total resolve, pull/import, unpack, and shared-operation wait budget")
 	)
 	flag.Parse()
 	if *nodeID == "" {
@@ -134,6 +135,9 @@ func run() error {
 	}
 	if *ociHelperSocket != "" && *ociHelperChecksum == "" {
 		return fmt.Errorf("--oci-helper-checksum is required with --oci-helper-socket")
+	}
+	if *ociImageBudget <= 0 {
+		return fmt.Errorf("--oci-image-budget must be positive")
 	}
 	identityID := *fabricIdentityID
 	if identityID == "" {
@@ -177,7 +181,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		adapter := ocirunner.NewAdapter(bootBarrier)
+		adapter := ocirunner.NewAdapterWithPolicy(bootBarrier, ocirunner.ImagePolicy{Budget: *ociImageBudget})
 		runtimes[contract.JobKindOCI] = adapter
 		capabilities["kind:oci"] = true
 		capabilities["runtime_handler:"+ocihelper.DefaultRuntimeHandler] = true

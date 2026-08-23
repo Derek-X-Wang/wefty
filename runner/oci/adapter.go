@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"sync"
 	"time"
@@ -24,12 +25,85 @@ type SessionSource interface {
 
 type Adapter struct {
 	sessions              SessionSource
+	imagePolicy           ImagePolicy
 	mu                    sync.Mutex
 	consumedSweepEvidence map[string]struct{}
+	runEntered            map[workloadrunner.AttemptAuthority]bool
 }
 
 func NewAdapter(sessions SessionSource) *Adapter {
-	return &Adapter{sessions: sessions, consumedSweepEvidence: make(map[string]struct{})}
+	return NewAdapterWithPolicy(sessions, ImagePolicy{})
+}
+
+const DefaultImageBudget = 10 * time.Minute
+
+// ImagePolicy is agent-owned policy around narrow helper mechanics. The
+// helper never chooses retries, backoff, Retry-After treatment, or this total
+// resolve/fetch/unpack/wait budget.
+type ImagePolicy struct {
+	Budget         time.Duration
+	InitialBackoff time.Duration
+	MaximumBackoff time.Duration
+	Sleep          func(context.Context, time.Duration) error
+}
+
+func NewAdapterWithPolicy(sessions SessionSource, policy ImagePolicy) *Adapter {
+	if policy.Budget <= 0 {
+		policy.Budget = DefaultImageBudget
+	}
+	if policy.InitialBackoff <= 0 {
+		policy.InitialBackoff = time.Second
+	}
+	if policy.MaximumBackoff <= 0 {
+		policy.MaximumBackoff = 30 * time.Second
+	}
+	if policy.Sleep == nil {
+		policy.Sleep = sleepContext
+	}
+	return &Adapter{sessions: sessions, imagePolicy: policy, consumedSweepEvidence: make(map[string]struct{}), runEntered: make(map[workloadrunner.AttemptAuthority]bool)}
+}
+
+// LoadImage is the agent-side offline-import seam used by the node-local
+// operator control plane. The agent owns the same total policy budget while
+// the helper exclusively validates and imports archive mechanics.
+// TODO(#153): expose this seam through the operator-only local control socket.
+func (adapter *Adapter) LoadImage(ctx context.Context, reference string, archive io.Reader) (ocihelper.EnsureImageResponse, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return ocihelper.EnsureImageResponse{}, errors.New("OCI helper session is not configured")
+	}
+	if archive == nil {
+		return ocihelper.EnsureImageResponse{}, errors.New("OCI image archive reader is required")
+	}
+	budgetContext, cancel := context.WithTimeout(ctx, adapter.imagePolicy.Budget)
+	defer cancel()
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return ocihelper.EnsureImageResponse{}, err
+	}
+	deadline, _ := budgetContext.Deadline()
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return ocihelper.EnsureImageResponse{}, errors.New("OCI image import budget exhausted")
+	}
+	var response ocihelper.EnsureImageResponse
+	err = session.ImportImage(budgetContext, ocihelper.EnsureImageRequest{
+		Reference: reference, Source: ocihelper.ImageSourceArchive, OperationTimeout: remaining,
+	}, archive, func(event ocihelper.EnsureImageEvent) error {
+		if event.Result != nil {
+			response = *event.Result
+		}
+		return nil
+	})
+	if err != nil {
+		if budgetContext.Err() != nil {
+			return ocihelper.EnsureImageResponse{}, errors.New("OCI image import budget exhausted")
+		}
+		return ocihelper.EnsureImageResponse{}, err
+	}
+	if response.TopLevelDigest == "" || response.PlatformDigest == "" {
+		return ocihelper.EnsureImageResponse{}, errors.New("OCI helper completed image import without immutable digests")
+	}
+	return response, nil
 }
 
 type sweepReceiptSource interface {
@@ -103,6 +177,7 @@ func (adapter *Adapter) Probe(ctx context.Context, nodeID, bootSessionID, refere
 }
 
 func (adapter *Adapter) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	adapter.markRunEntered(request.Authority, false)
 	admission := workloadrunner.Admission{Request: request, Release: func() {}}
 	if adapter == nil || adapter.sessions == nil {
 		return failedAdmission(admission, contract.SpawnFailureRuntimeUnavailable, errors.New("OCI helper session is not configured"))
@@ -116,9 +191,6 @@ func (adapter *Adapter) Preflight(_ context.Context, request workloadrunner.Requ
 	}
 	if request.Execution.OCI == nil {
 		return failedAdmission(admission, contract.SpawnFailureProcessRequest, errors.New("OCI execution arm is required"))
-	}
-	if request.Execution.OCI.Image.Digest == nil || *request.Execution.OCI.Image.Digest == "" {
-		return failedAdmission(admission, contract.SpawnFailureImageUnavailable, errors.New("OCI lifecycle requires a locally resolved immutable image digest"))
 	}
 	if request.RuntimeHandler != "" && request.RuntimeHandler != ocihelper.DefaultRuntimeHandler {
 		return failedAdmission(admission, contract.SpawnFailureUnsupportedRuntimeHandler, fmt.Errorf("OCI runtime handler %q is unavailable", request.RuntimeHandler))
@@ -137,11 +209,31 @@ func failedAdmission(admission workloadrunner.Admission, code contract.SpawnFail
 }
 
 func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	adapter.markRunEntered(request.Authority, false)
 	session, err := adapter.sessions.Session()
 	if err != nil {
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
+	if request.OCIImagePulling != nil {
+		request.OCIImagePulling()
+	}
+	digest := ""
+	if request.Execution.OCI.Image.Digest != nil {
+		digest = *request.Execution.OCI.Image.Digest
+	}
+	image, failure, err := adapter.ensureImage(ctx, session, request.Execution.OCI.Image.Reference, digest)
+	if err != nil {
+		return workloadrunner.Result{Outcome: contract.ProcessResult{SpawnError: failure}}, err
+	}
+	if request.OCIImageReady != nil {
+		request.OCIImageReady()
+	}
+	execution := *request.Execution.OCI
+	execution.Image = request.Execution.OCI.Image
+	execution.Image.Digest = &image.TopLevelDigest
+	request.Execution.OCI = &execution
 	authority := HelperAuthority(request.Authority)
+	adapter.markRunEntered(request.Authority, true)
 	runResponse, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: authority, InitialDeadman: request.InitialDeadman,
 		Workload: workloadInput(request),
@@ -195,7 +287,147 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	return workloadrunner.Result{Outcome: processResult(*completion)}, nil
 }
 
+func (adapter *Adapter) ensureImage(ctx context.Context, session *ocihelper.Session, reference, digest string) (ocihelper.EnsureImageResponse, *contract.SpawnFailure, error) {
+	requestedDigest := digest
+	budgetContext, cancel := context.WithTimeout(ctx, adapter.imagePolicy.Budget)
+	defer cancel()
+	deadline, _ := budgetContext.Deadline()
+	backoff := adapter.imagePolicy.InitialBackoff
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			err := errors.New("OCI image delivery budget exhausted")
+			return ocihelper.EnsureImageResponse{}, imageSpawnFailure(contract.SpawnFailureImageUnavailable, err), err
+		}
+		var response ocihelper.EnsureImageResponse
+		err := session.EnsureImage(budgetContext, ocihelper.EnsureImageRequest{
+			Reference: reference, Digest: digest, Source: ocihelper.ImageSourceRegistry, OperationTimeout: remaining,
+		}, func(event ocihelper.EnsureImageEvent) error {
+			if event.Progress != nil && event.Progress.TopLevelDigest != "" {
+				digest = event.Progress.TopLevelDigest
+			}
+			if event.Result != nil {
+				response = *event.Result
+			}
+			return nil
+		})
+		if err == nil {
+			if response.TopLevelDigest == "" || response.PlatformDigest == "" {
+				err = errors.New("OCI helper completed image delivery without immutable digests")
+				return ocihelper.EnsureImageResponse{}, imageSpawnFailure(contract.SpawnFailureImageUnavailable, err), err
+			}
+			expectedDigest := digest
+			if requestedDigest != "" {
+				expectedDigest = requestedDigest
+			}
+			if expectedDigest != "" && response.TopLevelDigest != expectedDigest {
+				err = errors.New("OCI helper returned a top-level digest different from the pinned request")
+				return ocihelper.EnsureImageResponse{}, imageSpawnFailure(contract.SpawnFailureImageManifestInvalid, err), err
+			}
+			return response, nil, nil
+		}
+		var rpcErr *ocihelper.RPCError
+		if !errors.As(err, &rpcErr) {
+			if budgetContext.Err() != nil {
+				budgetErr := errors.New("OCI image delivery budget exhausted")
+				return ocihelper.EnsureImageResponse{}, imageSpawnFailure(contract.SpawnFailureImageUnavailable, budgetErr), budgetErr
+			}
+			return ocihelper.EnsureImageResponse{}, imageSpawnFailure(contract.SpawnFailureRuntimeUnavailable, err), err
+		}
+		if rpcErr.ImageFailure != nil && rpcErr.ImageFailure.TopLevelDigest != "" {
+			digest = rpcErr.ImageFailure.TopLevelDigest
+		}
+		classification := classifyImageFailure(rpcErr)
+		if classification.transient {
+			delay := backoff
+			if classification.retryAfter > delay {
+				delay = classification.retryAfter
+			}
+			remaining = time.Until(deadline)
+			if delay >= remaining {
+				budgetErr := errors.New("OCI image delivery budget exhausted")
+				return ocihelper.EnsureImageResponse{}, imageSpawnFailure(contract.SpawnFailureImageUnavailable, budgetErr), budgetErr
+			}
+			if sleepErr := adapter.imagePolicy.Sleep(budgetContext, delay); sleepErr != nil {
+				budgetErr := errors.New("OCI image delivery budget exhausted")
+				return ocihelper.EnsureImageResponse{}, imageSpawnFailure(contract.SpawnFailureImageUnavailable, budgetErr), budgetErr
+			}
+			backoff *= 2
+			if backoff > adapter.imagePolicy.MaximumBackoff {
+				backoff = adapter.imagePolicy.MaximumBackoff
+			}
+			continue
+		}
+		return ocihelper.EnsureImageResponse{}, imageSpawnFailure(classification.code, err), err
+	}
+}
+
+type imageFailureClassification struct {
+	code       contract.SpawnFailureCode
+	transient  bool
+	retryAfter time.Duration
+}
+
+func classifyImageFailure(rpcErr *ocihelper.RPCError) imageFailureClassification {
+	fallback := imageFailureClassification{code: contract.SpawnFailureImageUnavailable}
+	if rpcErr == nil {
+		return fallback
+	}
+	if rpcErr.Code == ocihelper.CodeSessionStale || rpcErr.Code == ocihelper.CodeSweepRequired {
+		return imageFailureClassification{code: contract.SpawnFailureRuntimeUnavailable}
+	}
+	fact := rpcErr.ImageFailure
+	if fact == nil {
+		return fallback
+	}
+	switch fact.Kind {
+	case ocihelper.ImageFailureNetwork:
+		return imageFailureClassification{code: contract.SpawnFailureImageUnavailable, transient: true, retryAfter: fact.RetryAfter}
+	case ocihelper.ImageFailureHTTP:
+		switch {
+		case fact.HTTPStatus == 404:
+			return imageFailureClassification{code: contract.SpawnFailureImageNotFound}
+		case fact.HTTPStatus == 429 || fact.HTTPStatus >= 500:
+			return imageFailureClassification{code: contract.SpawnFailureImageUnavailable, transient: true, retryAfter: fact.RetryAfter}
+		case fact.HTTPStatus == 400 || fact.HTTPStatus == 406 || fact.HTTPStatus == 415 || fact.HTTPStatus == 422:
+			return imageFailureClassification{code: contract.SpawnFailureImageManifestInvalid}
+		default:
+			return fallback
+		}
+	case ocihelper.ImageFailurePlatformMismatch:
+		return imageFailureClassification{code: contract.SpawnFailureImagePlatformUnsupported}
+	case ocihelper.ImageFailureEngineLoss, ocihelper.ImageFailureResourceExhausted:
+		return imageFailureClassification{code: contract.SpawnFailureRuntimeUnavailable}
+	case ocihelper.ImageFailureManifestRejected:
+		return imageFailureClassification{code: contract.SpawnFailureImageManifestInvalid}
+	default:
+		return fallback
+	}
+}
+
+func imageSpawnFailure(code contract.SpawnFailureCode, err error) *contract.SpawnFailure {
+	return &contract.SpawnFailure{Code: code, Message: err.Error()}
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	adapter.mu.Lock()
+	entered, tracked := adapter.runEntered[request.Authority]
+	delete(adapter.runEntered, request.Authority)
+	adapter.mu.Unlock()
+	if tracked && !entered {
+		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime, BootSessionID: request.Authority.BootSessionID}, nil
+	}
 	session, err := adapter.sessions.Session()
 	if err != nil {
 		return workloadrunner.ReapReceipt{}, err
@@ -209,6 +441,15 @@ func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunne
 		return workloadrunner.ReapReceipt{}, errors.New("OCI helper Delete did not positively verify attempt absence")
 	}
 	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt, BootSessionID: request.Authority.BootSessionID}, nil
+}
+
+func (adapter *Adapter) markRunEntered(authority workloadrunner.AttemptAuthority, entered bool) {
+	if adapter == nil {
+		return
+	}
+	adapter.mu.Lock()
+	adapter.runEntered[authority] = entered
+	adapter.mu.Unlock()
 }
 
 func (adapter *Adapter) ReapPriorBoot(_ context.Context, request workloadrunner.PriorBootReapRequest) (workloadrunner.ReapReceipt, error) {

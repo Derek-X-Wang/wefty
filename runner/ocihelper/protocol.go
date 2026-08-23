@@ -61,9 +61,31 @@ const (
 
 // RPCError is safe to cross the private protocol. Engine detail remains local.
 type RPCError struct {
-	Code    ErrorCode `json:"code"`
-	Message string    `json:"message"`
+	Code         ErrorCode         `json:"code"`
+	Message      string            `json:"message"`
+	ImageFailure *ImageFailureFact `json:"image_failure,omitempty"`
 }
+
+// ImageFailureFact is sanitized mechanics evidence. The helper reports only
+// what it observed; retry and terminal classification remain agent policy.
+type ImageFailureFact struct {
+	Kind           ImageFailureKind `json:"kind"`
+	HTTPStatus     int              `json:"http_status,omitempty"`
+	RetryAfter     time.Duration    `json:"retry_after,omitempty"`
+	TopLevelDigest string           `json:"top_level_digest,omitempty"`
+}
+
+type ImageFailureKind string
+
+const (
+	ImageFailureHTTP              ImageFailureKind = "http_status"
+	ImageFailureNetwork           ImageFailureKind = "network"
+	ImageFailurePlatformMismatch  ImageFailureKind = "platform_mismatch"
+	ImageFailureEngineLoss        ImageFailureKind = "engine_loss"
+	ImageFailureResourceExhausted ImageFailureKind = "resource_exhausted"
+	ImageFailureManifestRejected  ImageFailureKind = "manifest_rejected"
+	ImageFailureUnavailable       ImageFailureKind = "unavailable"
+)
 
 func (err *RPCError) Error() string {
 	if err == nil {
@@ -198,9 +220,20 @@ type HeartbeatRequest struct {
 }
 
 type EnsureImageRequest struct {
-	Reference string `json:"reference"`
-	Digest    string `json:"digest"`
+	Reference        string        `json:"reference"`
+	Digest           string        `json:"digest"`
+	Source           ImageSource   `json:"source,omitempty"`
+	OperationTimeout time.Duration `json:"operation_timeout,omitempty"`
 }
+
+// ImageSource selects one closed delivery mechanism. Empty retains the wire-v1
+// registry default for callers compiled before offline import landed.
+type ImageSource string
+
+const (
+	ImageSourceRegistry ImageSource = "registry"
+	ImageSourceArchive  ImageSource = "archive"
+)
 
 type EnsureImageResponse struct {
 	TopLevelDigest string `json:"top_level_digest"`
@@ -223,9 +256,10 @@ type EnsureImageEvent struct {
 }
 
 type ImageProgressEvent struct {
-	Status    string `json:"status"`
-	Completed int64  `json:"completed,omitempty"`
-	Total     int64  `json:"total,omitempty"`
+	Status         string `json:"status"`
+	Completed      int64  `json:"completed,omitempty"`
+	Total          int64  `json:"total,omitempty"`
+	TopLevelDigest string `json:"top_level_digest,omitempty"`
 }
 
 type EnvironmentVariable struct {

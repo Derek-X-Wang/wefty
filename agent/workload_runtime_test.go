@@ -82,6 +82,75 @@ func TestWorkloadRuntimeReapUsesFinalizationContext(t *testing.T) {
 	}
 }
 
+func TestOCIImageDeliveryUsesLocalPullingStateBeforeStartedCallback(t *testing.T) {
+	observer := newLifecycleObserver(systemClock{})
+	observer.beginAttempt("oci-attempt", "oci-job", contract.JobClassOneShot)
+	adapter := &pullingObservationRuntime{observer: observer}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindOCI: adapter}, observer: observer,
+		clock: systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
+	})
+	claim := l1.Claim{
+		Job:   l1.Job{JobID: "oci-job", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot}},
+		Lease: l1.AttemptLease{AttemptID: "oci-attempt", FencingToken: "fence-1"},
+	}
+	result, err := lifecycle.runWorkload(t.Context(), claim)
+	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("OCI pulling observation result=(%+v, %v)", result, err)
+	}
+	if adapter.observed != AttemptPulling {
+		t.Fatalf("local state during image delivery = %q, want pulling", adapter.observed)
+	}
+	if !adapter.startedCallbackPresent {
+		t.Fatal("OCI Started callback was not retained after local pulling observation")
+	}
+	if adapter.afterPull != AttemptStarting {
+		t.Fatalf("local state after image delivery = %q, want starting", adapter.afterPull)
+	}
+}
+
+func TestOCIImageFailuresSurviveFullLifecycleFinalization(t *testing.T) {
+	codes := []contract.SpawnFailureCode{
+		contract.SpawnFailureImageUnavailable,
+		contract.SpawnFailureImageNotFound,
+		contract.SpawnFailureImageManifestInvalid,
+		contract.SpawnFailureImagePlatformUnsupported,
+		contract.SpawnFailureRuntimeUnavailable,
+	}
+	for _, code := range codes {
+		t.Run(string(code), func(t *testing.T) {
+			runtime := &preRunFailureRuntime{code: code}
+			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+				runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, observer: newLifecycleObserver(systemClock{}),
+				clock: systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
+			})
+			claim := l1.Claim{
+				Job:   l1.Job{JobID: "oci-failure", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot}},
+				Lease: l1.AttemptLease{AttemptID: "attempt-failure", FencingToken: "fence-1"},
+			}
+			result, err := lifecycle.runWorkload(t.Context(), claim)
+			if err == nil || result.SpawnError == nil || result.SpawnError.Code != code || result.OutputError != "" {
+				t.Fatalf("full lifecycle outcome = (%+v, %v), want %s without output_error", result, err, code)
+			}
+		})
+	}
+}
+
+type preRunFailureRuntime struct{ code contract.SpawnFailureCode }
+
+func (runtime *preRunFailureRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (runtime *preRunFailureRuntime) Run(context.Context, workloadrunner.Request, workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	err := errors.New("delivery failed before runtime creation")
+	return workloadrunner.Result{Outcome: contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: runtime.code, Message: err.Error()}}}, err
+}
+
+func (*preRunFailureRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime}, nil
+}
+
 func TestProcessPreflightRejectsBeforeAgentResourceAcquisition(t *testing.T) {
 	publishedPort := 8080
 	tests := []struct {
@@ -169,6 +238,31 @@ func (runtime *reapRefusingRuntime) ReapAndVerify(context.Context, workloadrunne
 
 type finalizationContextRuntime struct {
 	reapContextErr error
+}
+
+type pullingObservationRuntime struct {
+	observer               *lifecycleObserver
+	observed               AttemptLifecycleState
+	afterPull              AttemptLifecycleState
+	startedCallbackPresent bool
+}
+
+func (runtime *pullingObservationRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (runtime *pullingObservationRuntime) Run(_ context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	request.OCIImagePulling()
+	runtime.observed = runtime.observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).Attempts[request.Authority.AttemptID].State
+	request.OCIImageReady()
+	runtime.afterPull = runtime.observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).Attempts[request.Authority.AttemptID].State
+	runtime.startedCallbackPresent = request.OCIStarted != nil
+	exitCode := 0
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+}
+
+func (*pullingObservationRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
 }
 
 func (adapter *finalizationContextRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
