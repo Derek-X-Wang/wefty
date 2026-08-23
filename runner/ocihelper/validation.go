@@ -192,13 +192,25 @@ func validateEnsureImageEvent(event EnsureImageEvent) error {
 			return errors.New("invalid image progress event")
 		}
 	case ImageComplete:
-		if event.Progress != nil || event.Result == nil || !digestPattern.MatchString(event.Result.TopLevelDigest) || !digestPattern.MatchString(event.Result.PlatformDigest) {
+		if event.Progress != nil || event.Result == nil || !digestPattern.MatchString(event.Result.TopLevelDigest) || !digestPattern.MatchString(event.Result.PlatformDigest) ||
+			!validImageEvidence(event.Result.Evidence) || event.Result.Evidence.TopLevelDigest != event.Result.TopLevelDigest ||
+			event.Result.Evidence.PlatformManifestDigest != event.Result.PlatformDigest {
 			return errors.New("invalid image completion event")
 		}
 	default:
 		return errors.New("unknown image event kind")
 	}
 	return nil
+}
+
+func validImageEvidence(evidence ImageEvidence) bool {
+	if strings.TrimSpace(evidence.SubmittedReference) == "" || strings.TrimSpace(evidence.TopLevelMediaType) == "" ||
+		strings.TrimSpace(evidence.Platform.OS) == "" || strings.TrimSpace(evidence.Platform.Architecture) == "" ||
+		strings.TrimSpace(evidence.RuntimeHandler) == "" || strings.TrimSpace(evidence.Snapshotter) == "" ||
+		!digestPattern.MatchString(evidence.TopLevelDigest) || !digestPattern.MatchString(evidence.PlatformManifestDigest) {
+		return false
+	}
+	return evidence.IndexDigest == nil || digestPattern.MatchString(*evidence.IndexDigest)
 }
 
 func validateEnsureImageRequest(request EnsureImageRequest) error {
@@ -211,6 +223,12 @@ func validateEnsureImageRequest(request EnsureImageRequest) error {
 	}
 	if request.OperationTimeout < 0 {
 		return errors.New("image operation timeout must not be negative")
+	}
+	if strings.TrimSpace(request.Platform.OS) == "" || strings.TrimSpace(request.Platform.Architecture) == "" ||
+		request.Platform.OS != strings.ToLower(strings.TrimSpace(request.Platform.OS)) ||
+		request.Platform.Architecture != strings.ToLower(strings.TrimSpace(request.Platform.Architecture)) ||
+		request.Platform.Variant != strings.ToLower(strings.TrimSpace(request.Platform.Variant)) {
+		return errors.New("image platform must be canonical and include os and architecture")
 	}
 	switch source {
 	case ImageSourceRegistry:

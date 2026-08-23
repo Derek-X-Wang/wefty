@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -94,6 +95,8 @@ func TestOCIImageDeliveryUsesLocalPullingStateBeforeStartedCallback(t *testing.T
 		Job:   l1.Job{JobID: "oci-job", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot}},
 		Lease: l1.AttemptLease{AttemptID: "oci-attempt", FencingToken: "fence-1"},
 	}
+	deadline := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	claim.PrestartDeadline = &deadline
 	result, err := lifecycle.runWorkload(t.Context(), claim)
 	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
 		t.Fatalf("OCI pulling observation result=(%+v, %v)", result, err)
@@ -103,6 +106,9 @@ func TestOCIImageDeliveryUsesLocalPullingStateBeforeStartedCallback(t *testing.T
 	}
 	if !adapter.startedCallbackPresent {
 		t.Fatal("OCI Started callback was not retained after local pulling observation")
+	}
+	if !adapter.resolvedCallbackPresent || !adapter.imageDeadline.Equal(deadline) {
+		t.Fatalf("OCI resolution authority = callback %t deadline %s, want %s", adapter.resolvedCallbackPresent, adapter.imageDeadline, deadline)
 	}
 	if adapter.afterPull != AttemptStarting {
 		t.Fatalf("local state after image delivery = %q, want starting", adapter.afterPull)
@@ -241,10 +247,12 @@ type finalizationContextRuntime struct {
 }
 
 type pullingObservationRuntime struct {
-	observer               *lifecycleObserver
-	observed               AttemptLifecycleState
-	afterPull              AttemptLifecycleState
-	startedCallbackPresent bool
+	observer                *lifecycleObserver
+	observed                AttemptLifecycleState
+	afterPull               AttemptLifecycleState
+	startedCallbackPresent  bool
+	resolvedCallbackPresent bool
+	imageDeadline           time.Time
 }
 
 func (runtime *pullingObservationRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
@@ -257,6 +265,8 @@ func (runtime *pullingObservationRuntime) Run(_ context.Context, request workloa
 	request.OCIImageReady()
 	runtime.afterPull = runtime.observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).Attempts[request.Authority.AttemptID].State
 	runtime.startedCallbackPresent = request.OCIStarted != nil
+	runtime.resolvedCallbackPresent = request.OCIImageResolved != nil
+	runtime.imageDeadline = request.OCIImageDeadline
 	exitCode := 0
 	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
 }

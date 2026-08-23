@@ -641,6 +641,17 @@ func TestTagOnlyImageResolutionFreezesRerunWithoutReresolution(t *testing.T) {
 	if !reflect.DeepEqual(rerunRecord.Workflow.Image, &want) {
 		t.Fatalf("resolved rerun program = %#v, want %#v", rerunRecord.Workflow.Image, &want)
 	}
+	var rerunTopLevel, rerunPlatform, rerunSourceAttempt string
+	var rerunObservedNS int64
+	if err := h.l3Store.db.QueryRow(`SELECT top_level_digest, platform_digest, observed_ns, source_attempt
+		FROM run_image_resolutions WHERE run_id=?`, rerun.RunID).Scan(
+		&rerunTopLevel, &rerunPlatform, &rerunObservedNS, &rerunSourceAttempt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if rerunTopLevel != digestA || rerunPlatform != platformDigest || rerunObservedNS != observedAt.UnixNano() || rerunSourceAttempt != "attempt-a" {
+		t.Fatalf("copied rerun resolution = %q/%q/%d/%q", rerunTopLevel, rerunPlatform, rerunObservedNS, rerunSourceAttempt)
+	}
 	jobs.rejectEvidence = true
 	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
 		t.Fatalf("rerun consulted image evidence: %v", err)

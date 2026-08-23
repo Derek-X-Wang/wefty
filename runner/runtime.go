@@ -71,6 +71,13 @@ type OCIImageObservation struct {
 	Snapshotter            string
 }
 
+// OCIObservationRefusal distinguishes an authoritative L1 protocol refusal
+// from transport or server unavailability while persisting pre-Run evidence.
+type OCIObservationRefusal struct{ Err error }
+
+func (refusal *OCIObservationRefusal) Error() string { return refusal.Err.Error() }
+func (refusal *OCIObservationRefusal) Unwrap() error { return refusal.Err }
+
 // ManagedResources is an opaque agent-owned handle. Adapters must not infer
 // workload class or depend on host paths hidden behind the handle.
 type ManagedResources any
@@ -101,11 +108,16 @@ type Request struct {
 	// OCIImageReady returns the local observer to starting while the helper
 	// constructs the runtime. L1 still remains Claimed.
 	OCIImageReady func()
-	// OCIStarted hands helper-observed image identity to the agent, which
-	// persists it and then performs the fenced L1 Started mutation. The helper
-	// adapter must reap the task when this callback fails.
-	OCIStarted     func(context.Context, OCIImageObservation) error
-	InitialDeadman time.Duration
+	// OCIImageResolved persists the helper-observed immutable identity before
+	// runtime resource creation. A later attempt receives the same identity
+	// and therefore never resolves the submitted tag again.
+	OCIImageResolved func(context.Context, OCIImageObservation) error
+	// OCIStarted replays helper-observed identity after task start and then
+	// performs the fenced L1 Started mutation. The helper adapter must reap the
+	// task when this callback fails.
+	OCIStarted       func(context.Context, OCIImageObservation) error
+	OCIImageDeadline time.Time
+	InitialDeadman   time.Duration
 	// HostBridgeDial is set only for Lima's bind-failure reverse-tunnel path.
 	// It dials the host-local run bridge and never accepts an arbitrary target.
 	HostBridgeDial func(context.Context) (net.Conn, error)

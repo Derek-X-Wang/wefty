@@ -84,6 +84,10 @@
             "type": "string",
             "description": "Present for either class when execution capabilities prevent claim; service jobs may additionally name binding, liveness, intent, routing, or capacity facts."
           },
+          "failure_reason": {
+            "type": "string",
+            "description": "Present when L1 terminalized a job without minting a new attempt, such as expiry of a persisted pre-start infrastructure budget while awaiting scheduling."
+          },
           "restart_suppressed_reason": {
             "type": "string",
             "description": "Present when durable desired state or a failed latch suppresses automatic restart."

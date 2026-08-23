@@ -87,6 +87,7 @@ func run() error {
 		databasePath             = flag.String("db", "wefty-l1.sqlite", "SQLite database path")
 		leaseDuration            = flag.Duration("lease-duration", l1.DefaultLeaseDuration, "attempt lease duration")
 		lateEvidenceWindow       = flag.Duration("late-evidence-window", l1.DefaultLateEvidenceWindow, "window for post-authority evidence observations")
+		prestartBudget           = flag.Duration("prestart-infrastructure-budget", l1.DefaultPrestartInfrastructureBudget, "one job-level OCI pre-start retry budget")
 		serviceStabilityWindow   = flag.Duration("service-stability-window", l1.DefaultServiceStabilityWindow, "continuous service stability required to reset the restart streak")
 		serviceLogRetentionBytes = flag.Int64("service-log-retention-bytes", l1.DefaultServiceLogRetentionBytes, "maximum retained raw log payload per active service")
 		serviceLogRetentionAge   = flag.Duration("service-log-retention-age", l1.DefaultServiceLogRetentionAge, "maximum retained service log age")
@@ -117,11 +118,12 @@ func run() error {
 	}
 	defer closeFabric()
 	store, err := l1.OpenStore(*databasePath, l1.StoreOptions{
-		LeaseDuration:            *leaseDuration,
-		LateEvidenceWindow:       *lateEvidenceWindow,
-		ServiceStabilityWindow:   *serviceStabilityWindow,
-		ServiceLogRetentionBytes: *serviceLogRetentionBytes,
-		ServiceLogRetentionAge:   *serviceLogRetentionAge,
+		LeaseDuration:                *leaseDuration,
+		LateEvidenceWindow:           *lateEvidenceWindow,
+		PrestartInfrastructureBudget: *prestartBudget,
+		ServiceStabilityWindow:       *serviceStabilityWindow,
+		ServiceLogRetentionBytes:     *serviceLogRetentionBytes,
+		ServiceLogRetentionAge:       *serviceLogRetentionAge,
 	})
 	if err != nil {
 		return err

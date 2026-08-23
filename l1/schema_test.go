@@ -17,6 +17,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 	defer store.Close()
 
 	wantColumns := map[string][]string{
+		"jobs":                      {"image_resolution_json", "image_resolution_hash", "prestart_budget_deadline_ns", "prestart_terminal_reason"},
 		"log_events":                {"sequence_end"},
 		"job_required_capabilities": {"job_id", "capability"},
 		"nodes": {

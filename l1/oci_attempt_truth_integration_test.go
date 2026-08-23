@@ -150,6 +150,7 @@ func TestOCIAttemptRequiresStartedForRunning(t *testing.T) {
 	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, claim.Lease.AttemptID, observation); err != nil {
 		t.Fatal(err)
 	}
+	h.clock.Advance(time.Nanosecond)
 	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, claim.Lease.AttemptID, observation); err != nil {
 		t.Fatalf("identical image replay: %v", err)
 	}
@@ -177,6 +178,21 @@ func TestOCIAttemptRequiresStartedForRunning(t *testing.T) {
 		attempts[0].Image.Platform.OS != "linux" || attempts[0].Image.TopLevelDigest != testTopDigest {
 		t.Fatalf("image/start evidence = %#v", attempts[0].Image)
 	}
+	if !attempts[0].Image.ResolvedAt.Before(*attempts[0].Image.StartedAt) {
+		t.Fatalf("image evidence order = resolved %s started %s", attempts[0].Image.ResolvedAt, *attempts[0].Image.StartedAt)
+	}
+	operator := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+	status, _, body := h.do(operator, http.MethodGet, "/v1/jobs/"+job.JobID, nil)
+	var projected Job
+	if status != http.StatusOK {
+		t.Fatalf("operator job projection status = %d body=%s", status, body)
+	}
+	if err := json.Unmarshal(body, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if len(projected.Attempts) != 1 || projected.Attempts[0].Image == nil || projected.Attempts[0].Image.TopLevelDigest != testTopDigest {
+		t.Fatalf("HTTP attempts[].image projection = %#v", projected.Attempts)
+	}
 	completed, err := h.store.CompleteAttempt(context.Background(), "agent", job.JobID, claim.Lease.AttemptID, CompletionRequest{
 		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion-after-started", Result: ProcessResult{ExitCode: &exitZero},
 	})
@@ -199,9 +215,17 @@ func TestOCIPrestartRuntimeLossRequeuesOnceAndExhaustsBudget(t *testing.T) {
 	registerOCIFixtureNode(t, h)
 	job := createOCIFixtureJob(t, h, "oci-prestart-budget", contract.JobClassOneShot)
 	first := claimOCIFixture(t, h, contract.JobClassOneShot)
+	if first.PrestartDeadline == nil {
+		t.Fatal("first OCI claim omitted its persisted pre-start deadline")
+	}
 	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, first.Lease.AttemptID, testImageObservation(first.Lease.FencingToken)); err != nil {
 		t.Fatal(err)
 	}
+	firstAttempts, err := h.store.ListJobAttempts(context.Background(), job.JobID)
+	if err != nil || len(firstAttempts) != 1 || firstAttempts[0].Image == nil {
+		t.Fatalf("first resolution evidence = %#v err %v", firstAttempts, err)
+	}
+	resolvedAt := firstAttempts[0].Image.ResolvedAt
 	request := CompletionRequest{
 		FencingToken: first.Lease.FencingToken, IdempotencyKey: "runtime-loss-1",
 		Result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureRuntimeUnavailable, Message: "engine unavailable"}},
@@ -232,10 +256,31 @@ func TestOCIPrestartRuntimeLossRequeuesOnceAndExhaustsBudget(t *testing.T) {
 
 	h.clock.Advance(time.Second)
 	second := claimOCIFixture(t, h, contract.JobClassOneShot)
+	if second.PrestartDeadline == nil || !second.PrestartDeadline.Equal(*first.PrestartDeadline) {
+		t.Fatalf("pre-start deadline changed across retry: first %v second %v", first.PrestartDeadline, second.PrestartDeadline)
+	}
+	if second.Job.Spec.Execution.OCI.Image.Digest == nil || *second.Job.Spec.Execution.OCI.Image.Digest != testTopDigest {
+		t.Fatalf("retry claim did not carry pinned top-level digest: %#v", second.Job.Spec.Execution.OCI.Image)
+	}
+	secondAttempts, err := h.store.ListJobAttempts(context.Background(), job.JobID)
+	if err != nil || len(secondAttempts) != 2 || secondAttempts[1].Image != nil {
+		t.Fatalf("fresh retry should await per-attempt image evidence = %#v err %v", secondAttempts, err)
+	}
 	refloated := testImageObservation(second.Lease.FencingToken)
 	refloated.TopLevelDigest = testRefloatedDigest
 	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, second.Lease.AttemptID, refloated); errorCode(err) != contract.ErrorIdempotencyConflict {
 		t.Fatalf("re-floated job image observation = %v, want idempotency conflict", err)
+	}
+	retryObservation := testImageObservation(second.Lease.FencingToken)
+	retryObservation.Platform = OCIPlatform{OS: "linux", Architecture: "amd64"}
+	retryObservation.PlatformManifestDigest = testRefloatedDigest
+	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, second.Lease.AttemptID, retryObservation); err != nil {
+		t.Fatalf("cross-architecture retry with frozen top-level identity: %v", err)
+	}
+	secondAttempts, err = h.store.ListJobAttempts(context.Background(), job.JobID)
+	if err != nil || secondAttempts[1].Image == nil || secondAttempts[1].Image.TopLevelDigest != testTopDigest ||
+		secondAttempts[1].Image.Platform.Architecture != "amd64" || !secondAttempts[1].Image.ResolvedAt.Equal(resolvedAt) {
+		t.Fatalf("cross-architecture attempt evidence = %#v err %v", secondAttempts, err)
 	}
 	secondRequest := CompletionRequest{
 		FencingToken: second.Lease.FencingToken, IdempotencyKey: "runtime-loss-2",
@@ -248,6 +293,14 @@ func TestOCIPrestartRuntimeLossRequeuesOnceAndExhaustsBudget(t *testing.T) {
 	if _, err := h.store.CompleteAttempt(context.Background(), "agent", job.JobID, first.Lease.AttemptID, request); errorCode(err) != contract.ErrorAttemptMismatch {
 		t.Fatalf("superseded retry error = %v, want attempt mismatch", err)
 	}
+	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, first.Lease.AttemptID, testImageObservation(first.Lease.FencingToken)); err != nil {
+		t.Fatalf("lost-response image replay after requeue: %v", err)
+	}
+	changedReplay := testImageObservation(first.Lease.FencingToken)
+	changedReplay.Snapshotter = "changed"
+	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, first.Lease.AttemptID, changedReplay); errorCode(err) != contract.ErrorIdempotencyConflict {
+		t.Fatalf("changed image replay after requeue = %v, want idempotency conflict", err)
+	}
 	attempts, err := h.store.ListJobAttempts(context.Background(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
@@ -255,6 +308,31 @@ func TestOCIPrestartRuntimeLossRequeuesOnceAndExhaustsBudget(t *testing.T) {
 	if len(attempts) != 2 || attempts[0].State != contract.AttemptFailed || attempts[1].State != contract.AttemptFailed ||
 		attempts[0].Result == nil || attempts[0].Result.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable {
 		t.Fatalf("terminal attempt evidence = %#v", attempts)
+	}
+}
+
+func TestOCIPrestartBudgetExpiryTerminalizesWithoutDeadClaim(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{
+		PrestartInfrastructureBudget: 2 * time.Second,
+		Jitter:                       func(delay time.Duration) time.Duration { return delay },
+	}, map[string]NodePolicy{"node-1": DefaultNodePolicy()})
+	registerOCIFixtureNode(t, h)
+	job := createOCIFixtureJob(t, h, "oci-prestart-scheduling-gap", contract.JobClassOneShot)
+	claim := claimOCIFixture(t, h, contract.JobClassOneShot)
+	if _, err := h.store.CompleteAttempt(context.Background(), "agent", job.JobID, claim.Lease.AttemptID, CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "runtime-loss",
+		Result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureRuntimeUnavailable, Message: "helper unavailable"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Advance(3 * time.Second)
+	if deadClaim, err := h.store.ClaimJob(context.Background(), "agent", "node-1", "boot-node-1", contract.JobClassOneShot); err != nil || deadClaim != nil {
+		t.Fatalf("claim after persisted budget deadline = %#v err %v", deadClaim, err)
+	}
+	failed, err := h.store.GetJob(context.Background(), job.JobID)
+	if err != nil || failed.State != contract.JobFailed || failed.CurrentAttemptID != "" ||
+		failed.FailureReason != "pre-start infrastructure budget expired while awaiting scheduling" {
+		t.Fatalf("expired scheduling-gap job = %#v err %v", failed, err)
 	}
 }
 
@@ -287,6 +365,45 @@ func TestOCIServiceRuntimeFailureClassifierDefaultsTerminal(t *testing.T) {
 				t.Fatalf("completion = %#v err %v, want %s with unchanged streak", completed, err, test.want)
 			}
 		})
+	}
+}
+
+func TestOCIServiceRestartPreservesDigestAndResolutionTime(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{Jitter: func(delay time.Duration) time.Duration { return delay }}, map[string]NodePolicy{"node-1": DefaultNodePolicy()})
+	registerOCIFixtureNode(t, h)
+	job := createOCIFixtureJob(t, h, "oci-service-image-restart", contract.JobClassService)
+	first := claimOCIFixture(t, h, contract.JobClassService)
+	firstObservation := testImageObservation(first.Lease.FencingToken)
+	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, first.Lease.AttemptID, firstObservation); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Advance(time.Nanosecond)
+	if _, err := h.store.StartAttempt(context.Background(), "agent", job.JobID, first.Lease.AttemptID, StartedRequest{FencingToken: first.Lease.FencingToken}); err != nil {
+		t.Fatal(err)
+	}
+	firstAttempts, err := h.store.ListJobAttempts(context.Background(), job.JobID)
+	if err != nil || firstAttempts[0].Image == nil {
+		t.Fatalf("first service image = %#v err %v", firstAttempts, err)
+	}
+	resolvedAt := firstAttempts[0].Image.ResolvedAt
+	if _, err := h.store.CompleteAttempt(context.Background(), "agent", job.JobID, first.Lease.AttemptID, CompletionRequest{
+		FencingToken: first.Lease.FencingToken, IdempotencyKey: "service-runtime-loss",
+		Result: ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "helper restarted"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Advance(time.Second)
+	second := claimOCIFixture(t, h, contract.JobClassService)
+	if second.Job.Spec.Execution.OCI.Image.Digest == nil || *second.Job.Spec.Execution.OCI.Image.Digest != testTopDigest {
+		t.Fatalf("service restart claim image = %#v", second.Job.Spec.Execution.OCI.Image)
+	}
+	secondObservation := testImageObservation(second.Lease.FencingToken)
+	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, second.Lease.AttemptID, secondObservation); err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := h.store.ListJobAttempts(context.Background(), job.JobID)
+	if err != nil || len(attempts) != 2 || attempts[1].Image == nil || attempts[1].Image.TopLevelDigest != testTopDigest || !attempts[1].Image.ResolvedAt.Equal(resolvedAt) {
+		t.Fatalf("service restart image evidence = %#v err %v", attempts, err)
 	}
 }
 

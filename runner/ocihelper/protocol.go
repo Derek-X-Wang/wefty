@@ -222,6 +222,7 @@ type HeartbeatRequest struct {
 type EnsureImageRequest struct {
 	Reference        string        `json:"reference"`
 	Digest           string        `json:"digest"`
+	Platform         OCIPlatform   `json:"platform"`
 	Source           ImageSource   `json:"source,omitempty"`
 	OperationTimeout time.Duration `json:"operation_timeout,omitempty"`
 }
@@ -236,8 +237,9 @@ const (
 )
 
 type EnsureImageResponse struct {
-	TopLevelDigest string `json:"top_level_digest"`
-	PlatformDigest string `json:"platform_digest"`
+	TopLevelDigest string        `json:"top_level_digest"`
+	PlatformDigest string        `json:"platform_digest"`
+	Evidence       ImageEvidence `json:"evidence"`
 }
 
 type ImageEventKind string

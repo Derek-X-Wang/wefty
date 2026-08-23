@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,7 @@ type Adapter struct {
 	mu                    sync.Mutex
 	consumedSweepEvidence map[string]struct{}
 	runEntered            map[workloadrunner.AttemptAuthority]bool
+	probePlatforms        map[ocihelper.HelperSession]ocihelper.OCIPlatform
 	hostMountRoot         string
 	mountGuards           map[string]*ocihelper.HostMountGuard
 }
@@ -70,7 +72,7 @@ func NewAdapterWithPolicy(sessions SessionSource, policy ImagePolicy, options ..
 	if policy.Sleep == nil {
 		policy.Sleep = sleepContext
 	}
-	adapter := &Adapter{sessions: sessions, imagePolicy: policy, consumedSweepEvidence: make(map[string]struct{}), runEntered: make(map[workloadrunner.AttemptAuthority]bool), mountGuards: make(map[string]*ocihelper.HostMountGuard)}
+	adapter := &Adapter{sessions: sessions, imagePolicy: policy, consumedSweepEvidence: make(map[string]struct{}), runEntered: make(map[workloadrunner.AttemptAuthority]bool), probePlatforms: make(map[ocihelper.HelperSession]ocihelper.OCIPlatform), mountGuards: make(map[string]*ocihelper.HostMountGuard)}
 	for _, option := range options {
 		option(adapter)
 	}
@@ -94,6 +96,10 @@ func (adapter *Adapter) LoadImage(ctx context.Context, reference string, archive
 	if err != nil {
 		return ocihelper.EnsureImageResponse{}, err
 	}
+	probePlatform, ok := adapter.probePlatform(session)
+	if !ok {
+		return ocihelper.EnsureImageResponse{}, errors.New("current OCI helper generation has no successful probe platform")
+	}
 	deadline, _ := budgetContext.Deadline()
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
@@ -101,7 +107,7 @@ func (adapter *Adapter) LoadImage(ctx context.Context, reference string, archive
 	}
 	var response ocihelper.EnsureImageResponse
 	err = session.ImportImage(budgetContext, ocihelper.EnsureImageRequest{
-		Reference: reference, Source: ocihelper.ImageSourceArchive, OperationTimeout: remaining,
+		Reference: reference, Platform: probePlatform, Source: ocihelper.ImageSourceArchive, OperationTimeout: remaining,
 	}, archive, func(event ocihelper.EnsureImageEvent) error {
 		if event.Result != nil {
 			response = *event.Result
@@ -179,6 +185,10 @@ func (adapter *Adapter) Probe(ctx context.Context, nodeID, bootSessionID, refere
 	if !response.Started || response.Image == nil {
 		return errors.New("OCI functional probe did not receive truthful Started evidence")
 	}
+	platform, err := canonicalProbePlatform(response.Image.Platform)
+	if err != nil {
+		return err
+	}
 	var completion *ocihelper.WatchResponse
 	if err := session.Watch(ctx, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
 		if event.Result != nil {
@@ -199,8 +209,35 @@ func (adapter *Adapter) Probe(ctx context.Context, nodeID, bootSessionID, refere
 	if !deleted.Deleted {
 		return errors.New("OCI functional probe cleanup was not verified")
 	}
+	adapter.mu.Lock()
+	adapter.probePlatforms[helperSession(session)] = platform
+	adapter.mu.Unlock()
 	cleanupNeeded = false
 	return nil
+}
+
+func canonicalProbePlatform(platform ocihelper.OCIPlatform) (ocihelper.OCIPlatform, error) {
+	canonical := ocihelper.OCIPlatform{
+		OS:           strings.ToLower(strings.TrimSpace(platform.OS)),
+		Architecture: strings.ToLower(strings.TrimSpace(platform.Architecture)),
+		Variant:      strings.ToLower(strings.TrimSpace(platform.Variant)),
+	}
+	if canonical.OS == "" || canonical.Architecture == "" || canonical != platform {
+		return ocihelper.OCIPlatform{}, errors.New("OCI functional probe returned a non-canonical platform")
+	}
+	return canonical, nil
+}
+
+func helperSession(session *ocihelper.Session) ocihelper.HelperSession {
+	handshake := session.Handshake()
+	return ocihelper.HelperSession{HelperInstanceID: handshake.HelperInstanceID, SessionGeneration: handshake.SessionGeneration}
+}
+
+func (adapter *Adapter) probePlatform(session *ocihelper.Session) (ocihelper.OCIPlatform, bool) {
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	platform, ok := adapter.probePlatforms[helperSession(session)]
+	return platform, ok
 }
 
 func (adapter *Adapter) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
@@ -221,6 +258,9 @@ func (adapter *Adapter) Preflight(_ context.Context, request workloadrunner.Requ
 	}
 	if request.OCIStarted == nil {
 		return failedAdmission(admission, contract.SpawnFailureProcessRequest, errors.New("OCI Started acknowledgement hook is required"))
+	}
+	if request.OCIImageResolved == nil {
+		return failedAdmission(admission, contract.SpawnFailureProcessRequest, errors.New("OCI image resolution hook is required"))
 	}
 	if request.InitialDeadman <= 0 {
 		return failedAdmission(admission, contract.SpawnFailureProcessRequest, errors.New("OCI initial deadman is required"))
@@ -266,13 +306,30 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	if request.OCIImagePulling != nil {
 		request.OCIImagePulling()
 	}
+	probePlatform, ok := adapter.probePlatform(session)
+	if !ok {
+		err := errors.New("current OCI helper generation has no successful probe platform")
+		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+	}
 	digest := ""
 	if request.Execution.OCI.Image.Digest != nil {
 		digest = *request.Execution.OCI.Image.Digest
 	}
-	image, failure, err := adapter.ensureImage(ctx, session, request.Execution.OCI.Image.Reference, digest)
+	image, failure, err := adapter.ensureImage(ctx, session, request.Execution.OCI.Image.Reference, digest, probePlatform, request.OCIImageDeadline)
 	if err != nil {
 		return workloadrunner.Result{Outcome: contract.ProcessResult{SpawnError: failure}}, err
+	}
+	image.Evidence.SubmittedReference = request.Execution.OCI.Image.Reference
+	if image.Evidence.Platform != probePlatform {
+		err := errors.New("OCI image selection differs from the current probe platform")
+		return spawnResult(contract.SpawnFailureImagePlatformUnsupported, err), err
+	}
+	if err := request.OCIImageResolved(ctx, imageObservation(image.Evidence)); err != nil {
+		var refusal *workloadrunner.OCIObservationRefusal
+		if errors.As(err, &refusal) {
+			return spawnResult(contract.SpawnFailureProcessRequest, err), err
+		}
+		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
 	if request.OCIImageReady != nil {
 		request.OCIImageReady()
@@ -307,6 +364,11 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		err := errors.New("OCI helper Started response omitted image evidence")
 		_ = reapAfterFailedStart(session, authority)
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+	}
+	if runResponse.Image.Platform != probePlatform {
+		err := errors.New("OCI Started evidence differs from the current probe platform")
+		_ = reapAfterFailedStart(session, authority)
+		return spawnResult(contract.SpawnFailureProcessRequest, err), err
 	}
 	if request.HostBridgeDial != nil && (!runResponse.HostBridgeReady || runResponse.BridgeCapability == "") {
 		err := errors.New("OCI helper omitted the requested host bridge fallback authority")
@@ -391,11 +453,15 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	return workloadrunner.Result{Outcome: processResult(*completion)}, nil
 }
 
-func (adapter *Adapter) ensureImage(ctx context.Context, session *ocihelper.Session, reference, digest string) (ocihelper.EnsureImageResponse, *contract.SpawnFailure, error) {
+func (adapter *Adapter) ensureImage(ctx context.Context, session *ocihelper.Session, reference, digest string, platform ocihelper.OCIPlatform, persistedDeadline time.Time) (ocihelper.EnsureImageResponse, *contract.SpawnFailure, error) {
 	requestedDigest := digest
-	budgetContext, cancel := context.WithTimeout(ctx, adapter.imagePolicy.Budget)
+	deadline := time.Now().Add(adapter.imagePolicy.Budget)
+	if !persistedDeadline.IsZero() && persistedDeadline.Before(deadline) {
+		deadline = persistedDeadline
+	}
+	budgetContext, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	deadline, _ := budgetContext.Deadline()
+	deadline, _ = budgetContext.Deadline()
 	backoff := adapter.imagePolicy.InitialBackoff
 	for {
 		remaining := time.Until(deadline)
@@ -405,7 +471,7 @@ func (adapter *Adapter) ensureImage(ctx context.Context, session *ocihelper.Sess
 		}
 		var response ocihelper.EnsureImageResponse
 		err := session.EnsureImage(budgetContext, ocihelper.EnsureImageRequest{
-			Reference: reference, Digest: digest, Source: ocihelper.ImageSourceRegistry, OperationTimeout: remaining,
+			Reference: reference, Digest: digest, Platform: platform, Source: ocihelper.ImageSourceRegistry, OperationTimeout: remaining,
 		}, func(event ocihelper.EnsureImageEvent) error {
 			if event.Progress != nil && event.Progress.TopLevelDigest != "" {
 				digest = event.Progress.TopLevelDigest

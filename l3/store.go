@@ -734,6 +734,13 @@ func (s *Store) CreateRerun(ctx context.Context, input CreateRerunInput) (record
 	var sha sql.NullString
 	var mode sql.NullInt64
 	var workflowRef sql.NullString
+	var inheritedImageResolution struct {
+		present       bool
+		topLevel      string
+		platform      sql.NullString
+		observedNS    int64
+		sourceAttempt string
+	}
 	err = tx.QueryRowContext(ctx, `
 SELECT r.params_json, r.tags_json, r.limits_json, r.envelope_schema_json, r.required_envelope,
        s.content, s.sha256, s.interpreter_json, s.mode, i.program_json, w.workflow_ref
@@ -753,17 +760,22 @@ WHERE r.run_id=?`, input.SourceRunID).Scan(&paramsJSON, &tagsJSON, &limitsJSON, 
 		if err := json.Unmarshal(imageJSON, snapshot.Image); err != nil {
 			return contract.RunRecord{}, false, internalError(err, "decode rerun image snapshot")
 		}
+		err := tx.QueryRowContext(ctx, `SELECT top_level_digest, platform_digest, observed_ns, source_attempt
+			FROM run_image_resolutions WHERE run_id=?`, input.SourceRunID).Scan(
+			&inheritedImageResolution.topLevel, &inheritedImageResolution.platform,
+			&inheritedImageResolution.observedNS, &inheritedImageResolution.sourceAttempt,
+		)
+		if err == nil {
+			inheritedImageResolution.present = true
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return contract.RunRecord{}, false, internalError(err, "read rerun image resolution")
+		}
 		if snapshot.Image.Digest == nil {
-			var resolvedDigest string
-			err := tx.QueryRowContext(ctx, `SELECT top_level_digest FROM run_image_resolutions WHERE run_id=?`, input.SourceRunID).Scan(&resolvedDigest)
-			if errors.Is(err, sql.ErrNoRows) {
+			if !inheritedImageResolution.present {
 				return contract.RunRecord{}, false, protocolError(contract.ErrorNoResolvedImageSnapshot,
 					"run %q has no resolved image snapshot", input.SourceRunID)
 			}
-			if err != nil {
-				return contract.RunRecord{}, false, internalError(err, "read rerun image resolution")
-			}
-			snapshot.Image.Digest = &resolvedDigest
+			snapshot.Image.Digest = &inheritedImageResolution.topLevel
 			imageJSON, err = json.Marshal(snapshot.Image)
 			if err != nil {
 				return contract.RunRecord{}, false, internalError(err, "encode resolved rerun image snapshot")
@@ -807,6 +819,17 @@ VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, dispatchKey, input.Ide
 	} else {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO run_images(run_id, program_json) VALUES(?, ?)`, runID, imageJSON); err != nil {
 			return contract.RunRecord{}, false, internalError(err, "store rerun image snapshot")
+		}
+		if inheritedImageResolution.present {
+			var platform any
+			if inheritedImageResolution.platform.Valid {
+				platform = inheritedImageResolution.platform.String
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO run_image_resolutions(run_id, top_level_digest, platform_digest, observed_ns, source_attempt)
+				VALUES(?, ?, ?, ?, ?)`, runID, inheritedImageResolution.topLevel, platform,
+				inheritedImageResolution.observedNS, inheritedImageResolution.sourceAttempt); err != nil {
+				return contract.RunRecord{}, false, internalError(err, "copy rerun image resolution")
+			}
 		}
 	}
 	if workflowRef.Valid {

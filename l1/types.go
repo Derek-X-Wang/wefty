@@ -50,6 +50,7 @@ type Job struct {
 	CurrentAttemptID    string           `json:"current_attempt_id,omitempty"`
 	Attempts            []Attempt        `json:"attempts,omitempty"`
 	UnschedulableReason string           `json:"unschedulable_reason,omitempty"`
+	FailureReason       string           `json:"failure_reason,omitempty"`
 	CreatedAt           time.Time        `json:"created_at"`
 	UpdatedAt           time.Time        `json:"updated_at"`
 	*ServiceJob
@@ -154,8 +155,9 @@ const (
 
 // Claim is returned when an eligible queued job is won.
 type Claim struct {
-	Job   Job          `json:"job"`
-	Lease AttemptLease `json:"lease"`
+	Job              Job          `json:"job"`
+	Lease            AttemptLease `json:"lease"`
+	PrestartDeadline *time.Time   `json:"prestart_deadline,omitempty"`
 }
 
 // Node is the node projection shared by the operator list and agent protocol.

@@ -9,12 +9,15 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
@@ -87,6 +90,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	var pulled ocihelper.EnsureImageResponse
 	err = session.EnsureImage(ctx, ocihelper.EnsureImageRequest{
 		Reference: reference, Digest: digest, Source: ocihelper.ImageSourceRegistry,
+		Platform:         ocihelper.OCIPlatform{OS: "linux", Architecture: runtime.GOARCH},
 		OperationTimeout: 2 * time.Minute,
 	}, func(event ocihelper.EnsureImageEvent) error {
 		if event.Result != nil {
@@ -112,6 +116,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	var imported ocihelper.EnsureImageResponse
 	importErr := session.ImportImage(ctx, ocihelper.EnsureImageRequest{
 		Reference: reference, Digest: digest, Source: ocihelper.ImageSourceArchive,
+		Platform:         ocihelper.OCIPlatform{OS: "linux", Architecture: runtime.GOARCH},
 		OperationTimeout: 2 * time.Minute,
 	}, archive, func(event ocihelper.EnsureImageEvent) error {
 		if event.Result != nil {
@@ -123,7 +128,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if importErr != nil || closeErr != nil {
 		t.Fatal(errors.Join(importErr, closeErr))
 	}
-	if pulled != imported || pulled.TopLevelDigest != digest || pulled.PlatformDigest == "" {
+	if !reflect.DeepEqual(pulled, imported) || pulled.TopLevelDigest != digest || pulled.PlatformDigest == "" {
 		t.Fatalf("pull/import evidence differs: pull=%+v import=%+v", pulled, imported)
 	}
 	importRun := nativeAdapterRequest(reference, imported.TopLevelDigest, "import-run", []string{"/bin/true"})
@@ -136,6 +141,11 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	}
 	requestRootFault(t, "enable-registry")
 	registryDisabled = false
+	refloat := newRefloatRegistry(t, archivePath)
+	exerciseNativeLinuxPrestartRequeue(t, ctx, adapter, refloat.reference(), refloat.originalDigest(), refloat.moveTag)
+	if requests := refloat.observedTagRequests(); requests != 1 {
+		t.Fatalf("mutable tag was resolved %d times, want exactly the initial resolution", requests)
+	}
 
 	liveRequest := nativeAdapterRequest(reference, digest, "live-logs", []string{"/bin/sh", "-c", "printf live-before-exit; sleep 2; exit 0"})
 	liveRequest.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
@@ -320,10 +330,151 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatalf("namespace cleanup verification=%+v err=%v", verification, err)
 	}
 	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, reference, expectedDigest string, afterResolution func()) {
+	t.Helper()
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "native-prestart.sqlite"), l1.StoreOptions{
+		Jitter: func(time.Duration) time.Duration { return 10 * time.Millisecond },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	registration := contract.NodeRegistration{
+		NodeID: "native-node", BootSessionID: "native-boot", OS: "linux", Architecture: "amd64", AgentVersion: "realtiming",
+		Capabilities: map[string]bool{
+			"kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true,
+		},
+		CapabilityRevision: 1, CapabilityObservedAt: time.Now().UTC(), MissingCapabilities: []string{},
+	}
+	if _, err := store.RegisterNode(ctx, fabric.Identity{NodeID: "native-agent"}, registration, l1.DefaultNodePolicy(), true); err != nil {
+		t.Fatal(err)
+	}
+	spec := contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "native-prestart-requeue", Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+		RuntimeHandler: ocihelper.DefaultRuntimeHandler,
+		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: reference}, Argv: []string{"/bin/true"}}},
+	}
+	job, _, err := store.CreateJob(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := claimNativeOCI(t, ctx, store, registration)
+	if first.Job.Spec.Execution.OCI.Image.Digest != nil {
+		t.Fatalf("initial realtiming claim unexpectedly pinned before resolution: %+v", first.Job.Spec.Execution.OCI.Image)
+	}
+	firstRequest := nativeL1AdapterRequest(first)
+	firstRequest.OCIImageResolved = func(callbackContext context.Context, observation workloadrunner.OCIImageObservation) error {
+		if _, err := store.ObserveAttemptImage(callbackContext, "native-agent", job.JobID, first.Lease.AttemptID, nativeImageObservation(first.Lease.FencingToken, observation)); err != nil {
+			return err
+		}
+		afterResolution()
+		requestRootFault(t, "stop-containerd")
+		return nil
+	}
+	firstRequest.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
+		return errors.New("pre-start engine loss unexpectedly reached Started")
+	}
+	firstResult, firstRunErr := adapter.Run(ctx, firstRequest, nil)
+	requestRootFault(t, "start-containerd")
+	if firstRunErr == nil || firstResult.Outcome.SpawnError == nil || firstResult.Outcome.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable {
+		t.Fatalf("pre-start engine loss = result %+v err %v", firstResult.Outcome, firstRunErr)
+	}
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: firstRequest.Authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("pre-start cleanup = receipt %+v err %v", receipt, err)
+	}
+	requeued, err := store.CompleteAttempt(ctx, "native-agent", job.JobID, first.Lease.AttemptID, l1.CompletionRequest{
+		FencingToken: first.Lease.FencingToken, IdempotencyKey: "native-prestart-loss", Result: l1.ProcessResult(firstResult.Outcome),
+	})
+	if err != nil || requeued.State != contract.JobQueued {
+		t.Fatalf("pre-start completion requeue = job %+v err %v", requeued, err)
+	}
+
+	var second *l1.Claim
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		second, err = store.ClaimJob(ctx, "native-agent", registration.NodeID, registration.BootSessionID, contract.JobClassOneShot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if second != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if second == nil || second.Job.Spec.Execution.OCI.Image.Digest == nil || *second.Job.Spec.Execution.OCI.Image.Digest != expectedDigest ||
+		second.PrestartDeadline == nil || first.PrestartDeadline == nil || !second.PrestartDeadline.Equal(*first.PrestartDeadline) {
+		t.Fatalf("digest-pinned second claim = %+v", second)
+	}
+	secondRequest := nativeL1AdapterRequest(second)
+	secondRequest.OCIImageResolved = func(callbackContext context.Context, observation workloadrunner.OCIImageObservation) error {
+		_, err := store.ObserveAttemptImage(callbackContext, "native-agent", job.JobID, second.Lease.AttemptID, nativeImageObservation(second.Lease.FencingToken, observation))
+		return err
+	}
+	secondRequest.OCIStarted = func(callbackContext context.Context, observation workloadrunner.OCIImageObservation) error {
+		if _, err := store.ObserveAttemptImage(callbackContext, "native-agent", job.JobID, second.Lease.AttemptID, nativeImageObservation(second.Lease.FencingToken, observation)); err != nil {
+			return err
+		}
+		_, err := store.StartAttempt(callbackContext, "native-agent", job.JobID, second.Lease.AttemptID, l1.StartedRequest{FencingToken: second.Lease.FencingToken})
+		return err
+	}
+	secondResult, err := adapter.Run(ctx, secondRequest, nil)
+	if err != nil || secondResult.Outcome.ExitCode == nil || *secondResult.Outcome.ExitCode != 0 {
+		t.Fatalf("digest-pinned retry = result %+v err %v", secondResult.Outcome, err)
+	}
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: secondRequest.Authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("retry cleanup = receipt %+v err %v", receipt, err)
+	}
+	completed, err := store.CompleteAttempt(ctx, "native-agent", job.JobID, second.Lease.AttemptID, l1.CompletionRequest{
+		FencingToken: second.Lease.FencingToken, IdempotencyKey: "native-retry-success", Result: l1.ProcessResult(secondResult.Outcome),
+	})
+	if err != nil || completed.State != contract.JobSucceeded {
+		t.Fatalf("retry completion = job %+v err %v", completed, err)
+	}
+	attempts, err := store.ListJobAttempts(ctx, job.JobID)
+	if err != nil || len(attempts) != 2 || attempts[0].Image == nil || attempts[1].Image == nil ||
+		attempts[0].Image.TopLevelDigest != expectedDigest || attempts[1].Image.TopLevelDigest != expectedDigest ||
+		attempts[0].Image.StartedAt != nil || attempts[1].Image.StartedAt == nil ||
+		!attempts[1].Image.ResolvedAt.Before(*attempts[1].Image.StartedAt) {
+		t.Fatalf("pre-start retry evidence = %+v err %v", attempts, err)
+	}
+}
+
+func claimNativeOCI(t *testing.T, ctx context.Context, store *l1.Store, registration contract.NodeRegistration) *l1.Claim {
+	t.Helper()
+	claim, err := store.ClaimJob(ctx, "native-agent", registration.NodeID, registration.BootSessionID, contract.JobClassOneShot)
+	if err != nil || claim == nil {
+		t.Fatalf("native OCI claim = %+v err %v", claim, err)
+	}
+	return claim
+}
+
+func nativeL1AdapterRequest(claim *l1.Claim) workloadrunner.Request {
+	return workloadrunner.Request{
+		Authority: workloadrunner.AttemptAuthority{
+			NodeID: claim.Job.NodeID, BootSessionID: "native-boot", JobID: claim.Job.JobID,
+			AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
+			WorkloadClass: contract.JobClassOneShot, RemovalGeneration: "attempt",
+		},
+		RuntimeHandler: claim.Job.Spec.RuntimeHandler, Execution: claim.Job.Spec.Execution,
+		Limits: claim.Job.Spec.Limits, InitialDeadman: claim.Lease.LeaseTTL,
+		OCIImageDeadline: *claim.PrestartDeadline,
+	}
+}
+
+func nativeImageObservation(fence string, observation workloadrunner.OCIImageObservation) l1.ImageObservationRequest {
+	return l1.ImageObservationRequest{
+		FencingToken: fence, SubmittedReference: observation.SubmittedReference,
+		TopLevelDigest: observation.TopLevelDigest, TopLevelMediaType: observation.TopLevelMediaType,
+		IndexDigest: observation.IndexDigest, PlatformManifestDigest: observation.PlatformManifestDigest,
+		Platform:       l1.OCIPlatform{OS: observation.PlatformOS, Architecture: observation.PlatformArchitecture, Variant: observation.PlatformVariant},
+		RuntimeHandler: observation.RuntimeHandler, Snapshotter: observation.Snapshotter,
 	}
 }
 
@@ -368,7 +519,8 @@ func nativeAdapterRequest(reference, digest, suffix string, argv []string) workl
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
 			Image: contract.OCIImageSpec{Reference: reference, Digest: &digest}, Argv: argv,
 		}},
-		InitialDeadman: l1.DefaultLeaseDuration,
+		InitialDeadman:   l1.DefaultLeaseDuration,
+		OCIImageResolved: func(context.Context, workloadrunner.OCIImageObservation) error { return nil },
 	}
 }
 

@@ -40,6 +40,53 @@ func TestAdapterRequiresAuthoritativeStartedBeforeLocalPromotion(t *testing.T) {
 	}
 }
 
+func TestAdapterPersistsResolutionBeforePrestartRunFailure(t *testing.T) {
+	engine := &adapterTestEngine{runErr: errors.New("containerd stopped before task start")}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Execution.OCI.Image.Digest = nil
+	var resolved workloadrunner.OCIImageObservation
+	request.OCIImageResolved = func(_ context.Context, observation workloadrunner.OCIImageObservation) error {
+		resolved = observation
+		return nil
+	}
+	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
+		t.Fatal("pre-start Run failure reached Started")
+		return nil
+	}
+	result, err := adapter.Run(t.Context(), request, nil)
+	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable {
+		t.Fatalf("pre-start failure outcome = (%+v, %v)", result.Outcome, err)
+	}
+	if resolved.TopLevelDigest != adapterTestDigest || resolved.PlatformManifestDigest != adapterTestDigest {
+		t.Fatalf("pre-Run resolution evidence = %+v", resolved)
+	}
+}
+
+func TestAdapterClassifiesPreRunObservationFailure(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want contract.SpawnFailureCode
+	}{
+		{name: "protocol refusal", err: &workloadrunner.OCIObservationRefusal{Err: errors.New("stale fence")}, want: contract.SpawnFailureProcessRequest},
+		{name: "transport unavailable", err: errors.New("L1 connection reset"), want: contract.SpawnFailureRuntimeUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine := &adapterTestEngine{}
+			adapter, closeAdapter := startAdapterTestServer(t, engine)
+			defer closeAdapter()
+			request := adapterTestRequest()
+			request.OCIImageResolved = func(context.Context, workloadrunner.OCIImageObservation) error { return test.err }
+			result, err := adapter.Run(t.Context(), request, nil)
+			if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != test.want {
+				t.Fatalf("observation failure = (%+v, %v), want %s", result.Outcome, err, test.want)
+			}
+		})
+	}
+}
+
 func TestAdapterLoadImageUsesAgentBudgetAndReturnsDigests(t *testing.T) {
 	engine := &adapterTestEngine{}
 	adapter, closeAdapter := startAdapterTestServerWithPolicy(t, engine, ImagePolicy{Budget: 3 * time.Second})
@@ -62,6 +109,36 @@ func TestAdapterRejectsHelperDigestDifferentFromPinnedRequest(t *testing.T) {
 	result, err := adapter.Run(t.Context(), request, nil)
 	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureImageManifestInvalid {
 		t.Fatalf("digest mismatch outcome = (%+v, %v)", result.Outcome, err)
+	}
+}
+
+func TestAdapterBindsImageSelectionToCurrentProbePlatform(t *testing.T) {
+	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	if _, err := adapter.Run(t.Context(), adapterTestRequest(), nil); err != nil {
+		t.Fatal(err)
+	}
+	engine.mu.Lock()
+	platform := engine.lastEnsure.Platform
+	engine.mu.Unlock()
+	if platform != (ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}) {
+		t.Fatalf("EnsureImage platform = %+v, want successful probe platform", platform)
+	}
+}
+
+func TestAdapterRejectsImageEvidenceOutsideProbePlatform(t *testing.T) {
+	engine := &adapterTestEngine{responsePlatform: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.OCIImageResolved = func(context.Context, workloadrunner.OCIImageObservation) error {
+		t.Fatal("mismatched first-binding evidence reached L1")
+		return nil
+	}
+	result, err := adapter.Run(t.Context(), request, nil)
+	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureImagePlatformUnsupported {
+		t.Fatalf("platform mismatch = (%+v, %v)", result.Outcome, err)
 	}
 }
 
@@ -392,22 +469,25 @@ func TestAdapterPreRunImageFailureHasPositiveNoRuntimeReapEvidence(t *testing.T)
 }
 
 type adapterTestEngine struct {
-	mu             sync.Mutex
-	watch          ocihelper.WatchResponse
-	deletes        int
-	refuseDelete   bool
-	runErr         error
-	ensureErrors   []error
-	ensureCalls    int
-	responseDigest string
-	ensureEntered  chan struct{}
-	releaseEnsure  chan struct{}
-	lastRun        ocihelper.RunRequest
-	bridgeExchange chan error
+	mu               sync.Mutex
+	watch            ocihelper.WatchResponse
+	deletes          int
+	refuseDelete     bool
+	runErr           error
+	ensureErrors     []error
+	ensureCalls      int
+	responseDigest   string
+	responsePlatform ocihelper.OCIPlatform
+	ensureEntered    chan struct{}
+	releaseEnsure    chan struct{}
+	lastRun          ocihelper.RunRequest
+	lastEnsure       ocihelper.EnsureImageRequest
+	bridgeExchange   chan error
 }
 
 func (engine *adapterTestEngine) EnsureImage(_ context.Context, request ocihelper.EnsureImageRequest, archive io.Reader, emit func(ocihelper.EnsureImageEvent) error) error {
 	engine.mu.Lock()
+	engine.lastEnsure = request
 	call := engine.ensureCalls
 	engine.ensureCalls++
 	var ensureErr error
@@ -436,7 +516,13 @@ func (engine *adapterTestEngine) EnsureImage(_ context.Context, request ocihelpe
 	if digest == "" {
 		digest = adapterTestDigest
 	}
-	return emit(ocihelper.EnsureImageEvent{Kind: ocihelper.ImageComplete, Result: &ocihelper.EnsureImageResponse{TopLevelDigest: digest, PlatformDigest: digest}})
+	evidence := adapterTestImageEvidence(digest)
+	if engine.responsePlatform.OS != "" {
+		evidence.Platform = engine.responsePlatform
+	}
+	return emit(ocihelper.EnsureImageEvent{Kind: ocihelper.ImageComplete, Result: &ocihelper.EnsureImageResponse{
+		TopLevelDigest: digest, PlatformDigest: digest, Evidence: evidence,
+	}})
 }
 func (engine *adapterTestEngine) Run(_ context.Context, request ocihelper.RunRequest) (ocihelper.RunResponse, error) {
 	engine.mu.Lock()
@@ -534,16 +620,33 @@ func startAdapterTestServerWithPolicy(t *testing.T, engine ocihelper.Engine, pol
 	if err := barrier.Ensure(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	return NewAdapterWithPolicy(barrier, policy), func() { _ = barrier.Close(); cancel(); _ = listener.Close(); <-done }
+	adapter := NewAdapterWithPolicy(barrier, policy)
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.probePlatforms[helperSession(session)] = ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}
+	return adapter, func() { _ = barrier.Close(); cancel(); _ = listener.Close(); <-done }
 }
 
 func adapterTestRequest() workloadrunner.Request {
 	digest := adapterTestDigest
 	return workloadrunner.Request{
-		Authority:      workloadrunner.AttemptAuthority{NodeID: "node", BootSessionID: "boot", JobID: "job", AttemptID: "attempt", FencingToken: "fence", WorkloadClass: "one-shot", RemovalGeneration: "attempt"},
-		RuntimeHandler: ocihelper.DefaultRuntimeHandler,
-		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example.invalid/image", Digest: &digest}, Argv: []string{"/bin/true"}}},
-		InitialDeadman: time.Second,
+		Authority:        workloadrunner.AttemptAuthority{NodeID: "node", BootSessionID: "boot", JobID: "job", AttemptID: "attempt", FencingToken: "fence", WorkloadClass: "one-shot", RemovalGeneration: "attempt"},
+		RuntimeHandler:   ocihelper.DefaultRuntimeHandler,
+		Execution:        contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example.invalid/image", Digest: &digest}, Argv: []string{"/bin/true"}}},
+		InitialDeadman:   time.Second,
+		OCIImageResolved: func(context.Context, workloadrunner.OCIImageObservation) error { return nil },
+		OCIStarted:       func(context.Context, workloadrunner.OCIImageObservation) error { return nil },
+	}
+}
+
+func adapterTestImageEvidence(digest string) ocihelper.ImageEvidence {
+	return ocihelper.ImageEvidence{
+		SubmittedReference: "example.invalid/image", TopLevelDigest: digest,
+		TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json", PlatformManifestDigest: digest,
+		Platform:       ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"},
+		RuntimeHandler: ocihelper.DefaultRuntimeHandler, Snapshotter: ocihelper.DefaultSnapshotter,
 	}
 }
 

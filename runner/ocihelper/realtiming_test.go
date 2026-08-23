@@ -37,7 +37,7 @@ func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
 	if !verification.Absent {
 		t.Fatal("namespace residue remained after sweep")
 	}
-	if err := session.EnsureImage(ctx, EnsureImageRequest{Reference: "example.invalid/probe", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil); err != nil {
+	if err := session.EnsureImage(ctx, EnsureImageRequest{Reference: "example.invalid/probe", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Platform: testImagePlatform}, nil); err != nil {
 		t.Fatal(err)
 	}
 	authority := AttemptAuthority{

@@ -146,6 +146,7 @@ tag-only one-shot, L3 ingests the first accepted L1 attempt image observation
 when it projects the attempt result and records `run_id`, top-level digest,
 optional platform digest, observation time, and source attempt in an immutable
 `run_image_resolutions` row. A rerun adds that recorded top-level digest to its
-new immutable image snapshot and copies every other program field unchanged;
-later observations and tag movement cannot replace it. If no accepted
+new immutable image snapshot, copies the complete top-level/platform resolution
+record and every other program field unchanged, and dispatches by the frozen
+top-level digest; later observations and tag movement cannot replace it. If no accepted
 observation exists, rerun creation fails with `no_resolved_image_snapshot`.
