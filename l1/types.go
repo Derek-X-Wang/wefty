@@ -259,11 +259,24 @@ type StartedRequest struct {
 }
 
 type CompletionRequest struct {
-	FencingToken       string        `json:"fencing_token"`
-	IdempotencyKey     string        `json:"idempotency_key"`
-	Result             ProcessResult `json:"result"`
-	ProtocolOutputHash string        `json:"protocol_output_digest,omitempty"`
+	FencingToken              string                    `json:"fencing_token"`
+	IdempotencyKey            string                    `json:"idempotency_key"`
+	Result                    ProcessResult             `json:"result"`
+	RuntimeQuiescenceEvidence RuntimeQuiescenceEvidence `json:"runtime_quiescence_evidence,omitempty"`
+	ProtocolOutputHash        string                    `json:"protocol_output_digest,omitempty"`
 }
+
+// RuntimeQuiescenceEvidence names the positive runtime authority that proved
+// attempt resources absent before completion. An omitted value is not proof.
+type RuntimeQuiescenceEvidence string
+
+const (
+	RuntimeQuiescenceAttempt           RuntimeQuiescenceEvidence = "attempt"
+	RuntimeQuiescenceNoRuntime         RuntimeQuiescenceEvidence = "no_runtime_resources"
+	RuntimeQuiescenceOCISweep          RuntimeQuiescenceEvidence = "oci_sweep"
+	RuntimeQuiescencePriorBootGuardian RuntimeQuiescenceEvidence = "prior_boot_guardian"
+	RuntimeQuiescencePriorBootOCISweep RuntimeQuiescenceEvidence = "prior_boot_oci_sweep"
+)
 
 // LateResultEvidence is the non-authoritative completion fact retained after
 // an attempt is lost. Kind explicitly distinguishes a retained ProcessResult

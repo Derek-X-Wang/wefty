@@ -94,6 +94,15 @@ that reap succeeds. If reap fails, the listener closes and `Serve` fails so
 socket activation can start a fresh helper and boot sweep; the failed process
 never restores authority or remains indefinitely `session_busy`.
 
+The client boundary exposes runtime loss as a typed error only for an active
+session's transport disappearance, `session_stale`, `engine_failure`, or an
+explicit image `engine_loss` fact. Caller cancellation, deadlines owned by the
+caller, `sweep_required`, validation/policy refusals, digest disagreement, and
+unknown agent errors never manufacture runtime-loss evidence. A stop-specific
+Signal deadline is runtime loss because the independently bounded helper RPC
+could not be reached; by contrast, KILL sent without an observed exit is a
+failed quiescence proof and does not authorize a namespace sweep.
+
 ## Boot sweep barrier
 
 Helper process startup takes the exclusive create/sweep gate, sweeps every
@@ -185,6 +194,15 @@ independent absence verification; failed verification cannot recycle the port.
 stream with one accepted connection on that attempt's helper-owned guest
 listener; the host agent dials only its already-created loopback run bridge.
 Neither direction accepts a caller-supplied network destination.
+
+For service stop, the agent keeps `Watch` independent from execution-context
+cancellation, sends `TERM`, waits the configured grace, and escalates to
+`KILL`; the helper never chooses that policy. A helper/session or engine-loss
+fact causes the agent to embargo OCI claims and establish a new verified sweep
+before replacement. The OCI adapter accepts that sweep as same-boot quiescence
+only when the recovered attempt's complete node/job/removal-generation/
+attempt/fence/boot/class tuple matches, the verified namespace inventory is
+empty, and that receipt has not already been consumed.
 
 Stream RPCs use a JSON authorization response followed by a one-byte client
 acknowledgement before raw bytes begin. This keeps JSON decoder read-ahead from

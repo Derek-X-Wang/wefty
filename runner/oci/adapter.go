@@ -32,6 +32,7 @@ type Adapter struct {
 	imagePolicy           ImagePolicy
 	mu                    sync.Mutex
 	consumedRuntimeSweeps map[runtimeSweepEvidenceKey]struct{}
+	consumedSameBootSweep map[sameBootSweepEvidenceKey]struct{}
 	consumedPriorSweeps   map[priorBootSweepEvidenceKey]struct{}
 	runEntered            map[workloadrunner.AttemptAuthority]runEntry
 	probePlatforms        map[ocihelper.HelperSession]ocihelper.OCIPlatform
@@ -62,6 +63,11 @@ type runtimeSweepEvidenceKey struct {
 	epoch     string
 	helper    ocihelper.HelperSession
 	authority workloadrunner.AttemptAuthority
+}
+
+type sameBootSweepEvidenceKey struct {
+	sweepEpoch string
+	authority  workloadrunner.AttemptAuthority
 }
 
 type priorBootSweepEvidenceKey struct {
@@ -150,6 +156,7 @@ func NewAdapterWithPolicy(sessions SessionSource, policy ImagePolicy, options ..
 	adapter := &Adapter{
 		sessions: sessions, imagePolicy: policy, pinLedger: newMemoryBindingPinLedger(), cacheMaxBytes: ocihelper.DefaultImageCacheMaxBytes,
 		consumedRuntimeSweeps: make(map[runtimeSweepEvidenceKey]struct{}),
+		consumedSameBootSweep: make(map[sameBootSweepEvidenceKey]struct{}),
 		consumedPriorSweeps:   make(map[priorBootSweepEvidenceKey]struct{}),
 		runEntered:            make(map[workloadrunner.AttemptAuthority]runEntry),
 		probePlatforms:        make(map[ocihelper.HelperSession]ocihelper.OCIPlatform),
@@ -506,8 +513,13 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	adapter.trackRun(request.Authority, runEntry{})
 	session, imageSweepReceipt, err := adapter.sessions.ExecutionSnapshot()
 	if err != nil {
+		if requiresOCIRuntimeRecovery(err) && (request.LifetimeBoundary == workloadrunner.AgentBootLifetime || ctx.Err() == nil) {
+			reportOCIRuntimeUnavailable(request, ocihelper.HelperSession{})
+		}
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
+	runtimeGeneration := helperSession(session)
+	adapter.markAttemptGeneration(request.Authority, runtimeGeneration)
 	if request.OCIImagePulling != nil {
 		request.OCIImagePulling()
 	}
@@ -572,6 +584,9 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	}
 	image, failure, err := adapter.ensureImage(ctx, session, request.Execution.OCI.Image.Reference, digest, probePlatform, request.OCIImageDeadline, pin)
 	if err != nil {
+		if requiresOCIRuntimeRecovery(err) && (request.LifetimeBoundary == workloadrunner.AgentBootLifetime || ctx.Err() == nil) {
+			reportOCIRuntimeUnavailable(request, runtimeGeneration)
+		}
 		return workloadrunner.Result{Outcome: contract.ProcessResult{SpawnError: failure}}, err
 	}
 	adapter.markAttemptPinAttached(request.Authority, sweepBaseline{epoch: imageSweepReceipt.SweepEpoch, helper: imageSweepReceipt.HelperSession})
@@ -635,6 +650,9 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		if failure := ocihelper.SpawnFailureForRunError(err); failure != nil {
 			return workloadrunner.Result{Outcome: contract.ProcessResult{SpawnError: failure}}, err
 		}
+		if requiresOCIRuntimeRecovery(err) && (request.LifetimeBoundary == workloadrunner.AgentBootLifetime || ctx.Err() == nil) {
+			reportOCIRuntimeUnavailable(request, runtimeGeneration)
+		}
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
 	if runResponse.Image == nil {
@@ -689,10 +707,16 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		request.Started()
 	}
 
+	watchParent := ctx
+	if request.LifetimeBoundary == workloadrunner.AgentBootLifetime {
+		watchParent = context.WithoutCancel(ctx)
+	}
+	watchContext, cancelWatch := context.WithCancel(watchParent)
+	defer cancelWatch()
 	var completion *ocihelper.WatchResponse
 	watchDone := make(chan error, 1)
 	go func() {
-		watchDone <- session.Watch(ctx, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
+		watchDone <- session.Watch(watchContext, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
 			if event.Log != nil && sink != nil {
 				logEvent := contract.LogEvent{
 					AttemptID: request.Authority.AttemptID, Stream: contract.LogStream(event.Log.Stream),
@@ -701,7 +725,10 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 				if event.Log.Gap != nil {
 					logEvent.Gap = &contract.LogGap{ThroughSequence: event.Log.Gap.ThroughSequence, LostEventCount: event.Log.Gap.LostEventCount, LostByteCount: event.Log.Gap.LostByteCount, Reason: contract.LogGapLoggerSourceIncomplete}
 				}
-				return sink.WriteOutput(ctx, logEvent)
+				if err := sink.WriteOutput(watchContext, logEvent); err != nil {
+					return &outputSinkError{err: err}
+				}
+				return nil
 			}
 			if event.Result != nil {
 				copy := *event.Result
@@ -710,6 +737,17 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 			return nil
 		})
 	}()
+	waitForWatch := func() error {
+		if request.LifetimeBoundary != workloadrunner.AgentBootLifetime {
+			return <-watchDone
+		}
+		select {
+		case watchErr := <-watchDone:
+			return watchErr
+		case <-ctx.Done():
+			return terminateAndWait(ctx, session, authority, request.TerminationGrace, watchDone)
+		}
+	}
 	if request.HostBridgeDial != nil {
 		bridgeContext, cancelBridge := context.WithCancel(ctx)
 		const bridgeConcurrency = 4
@@ -720,22 +758,122 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 				bridgeDone <- struct{}{}
 			}()
 		}
-		err = <-watchDone
+		err = waitForWatch()
 		cancelBridge()
 		for range bridgeConcurrency {
 			<-bridgeDone
 		}
 	} else {
-		err = <-watchDone
+		err = waitForWatch()
 	}
 	if err != nil {
+		if requiresOCIRuntimeRecovery(err) && (request.LifetimeBoundary == workloadrunner.AgentBootLifetime || ctx.Err() == nil) {
+			reportOCIRuntimeUnavailable(request, runtimeGeneration)
+		}
 		return runtimeFailure(err), err
 	}
 	if completion == nil {
 		err := errors.New("OCI helper Watch ended without a completion result")
 		return runtimeFailure(err), err
 	}
-	return workloadrunner.Result{Outcome: processResult(*completion)}, nil
+	result = workloadrunner.Result{Outcome: processResult(*completion)}
+	if completion.RuntimeFailure != "" {
+		reportOCIRuntimeUnavailable(request, runtimeGeneration)
+	}
+	return result, nil
+}
+
+type outputSinkError struct{ err error }
+
+func (failure *outputSinkError) Error() string { return failure.err.Error() }
+func (failure *outputSinkError) Unwrap() error { return failure.err }
+
+func requiresOCIRuntimeRecovery(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var sinkFailure *outputSinkError
+	if errors.As(err, &sinkFailure) {
+		return false
+	}
+	var runtimeLoss *ocihelper.RuntimeLossError
+	return errors.As(err, &runtimeLoss)
+}
+
+func reportOCIRuntimeUnavailable(request workloadrunner.Request, generation ocihelper.HelperSession) {
+	if request.OCIRuntimeUnavailable == nil {
+		return
+	}
+	request.OCIRuntimeUnavailable(workloadrunner.RuntimeGeneration{
+		InstanceID: generation.HelperInstanceID, Generation: generation.SessionGeneration,
+	})
+}
+
+const (
+	defaultTerminationGrace  = 5 * time.Second
+	terminationSignalTimeout = time.Second
+)
+
+func terminateAndWait(
+	ctx context.Context,
+	session *ocihelper.Session,
+	authority ocihelper.AttemptAuthority,
+	grace time.Duration,
+	watchDone <-chan error,
+) error {
+	if grace <= 0 {
+		grace = defaultTerminationGrace
+	}
+	watchResult := func(wait time.Duration) (error, bool) {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case err := <-watchDone:
+			return err, true
+		case <-timer.C:
+			return nil, false
+		}
+	}
+	signal := func(value ocihelper.Signal) error {
+		signalContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminationSignalTimeout)
+		defer cancel()
+		err := session.Signal(signalContext, ocihelper.SignalRequest{Authority: authority, Signal: value})
+		if errors.Is(signalContext.Err(), context.DeadlineExceeded) {
+			return &ocihelper.RuntimeLossError{Cause: err}
+		}
+		return err
+	}
+
+	select {
+	case err := <-watchDone:
+		return err
+	default:
+	}
+	termErr := signal(ocihelper.SignalTERM)
+	if termErr == nil {
+		if err, done := watchResult(grace); done {
+			return err
+		}
+	} else {
+		select {
+		case err := <-watchDone:
+			return err
+		default:
+		}
+	}
+	killErr := signal(ocihelper.SignalKILL)
+	if killErr != nil {
+		select {
+		case err := <-watchDone:
+			return err
+		default:
+			return errors.Join(termErr, killErr)
+		}
+	}
+	if err, done := watchResult(grace); done {
+		return err
+	}
+	return errors.New("OCI helper Watch did not confirm exit after KILL")
 }
 
 func helperRunDefinitivelyRejected(err error) bool {
@@ -947,6 +1085,10 @@ func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunne
 	adapter.mu.Lock()
 	entry, tracked := adapter.runEntered[request.Authority]
 	adapter.mu.Unlock()
+	if receipt, ok := adapter.reapFromMatchingSweep(request.Authority); ok {
+		adapter.consumeRunEntry(request.Authority)
+		return receipt, nil
+	}
 	if tracked && !entry.entered {
 		if entry.attemptPinAttached {
 			if err := adapter.releaseAttemptImagePin(ctx, request.Authority, entry.sweep); err != nil {
@@ -956,72 +1098,50 @@ func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunne
 		adapter.consumeRunEntry(request.Authority)
 		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime, BootSessionID: request.Authority.BootSessionID}, nil
 	}
-	for {
-		session, receipt, snapshotErr := adapter.sessions.ExecutionSnapshot()
-		if snapshotErr == nil {
-			deleted, deleteErr := session.Delete(ctx, ocihelper.DeleteRequest{Authority: HelperAuthority(request.Authority)})
-			if deleteErr == nil {
-				if !deleted.Deleted {
-					return workloadrunner.ReapReceipt{}, errors.New("OCI helper Delete did not positively verify attempt absence")
-				}
-				adapter.consumeRunEntry(request.Authority)
-				return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt, BootSessionID: request.Authority.BootSessionID}, nil
-			}
-			var rpcErr *ocihelper.RPCError
-			if !tracked {
-				return workloadrunner.ReapReceipt{}, deleteErr
-			}
-			if errors.As(deleteErr, &rpcErr) {
-				if rpcErr.Code == ocihelper.CodeAttemptOutsideSession {
-					if replacement, ok := adapter.reapFromReplacementSweep(request.Authority, entry.sweep, receipt); ok {
-						adapter.consumeRunEntry(request.Authority)
-						return replacement, nil
-					}
-				} else if rpcErr.Code == ocihelper.CodeUnauthorizedAttempt || rpcErr.Code == ocihelper.CodeInvalidRequest {
-					return workloadrunner.ReapReceipt{}, deleteErr
-				}
-			}
-		}
-		if !tracked {
-			return workloadrunner.ReapReceipt{}, snapshotErr
-		}
-		timer := time.NewTimer(25 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return workloadrunner.ReapReceipt{}, errors.Join(snapshotErr, ctx.Err())
-		case <-timer.C:
-		}
+	session, receipt, err := adapter.sessions.ExecutionSnapshot()
+	if err != nil {
+		return workloadrunner.ReapReceipt{}, reapRuntimeLoss(entry.sweep.helper, err)
 	}
+	deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: HelperAuthority(request.Authority)})
+	if err != nil {
+		var rpcErr *ocihelper.RPCError
+		if tracked && errors.As(err, &rpcErr) && rpcErr.Code == ocihelper.CodeAttemptOutsideSession {
+			if replacement, ok := adapter.reapFromReplacementSweep(request.Authority, entry.sweep, receipt); ok {
+				adapter.consumeRunEntry(request.Authority)
+				return replacement, nil
+			}
+		}
+		if requiresOCIRuntimeRecovery(err) {
+			return workloadrunner.ReapReceipt{}, reapRuntimeLoss(entry.sweep.helper, err)
+		}
+		return workloadrunner.ReapReceipt{}, err
+	}
+	if !deleted.Deleted {
+		return workloadrunner.ReapReceipt{}, errors.New("OCI helper Delete did not positively verify attempt absence")
+	}
+	adapter.consumeRunEntry(request.Authority)
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt, BootSessionID: request.Authority.BootSessionID}, nil
 }
 
 func (adapter *Adapter) releaseAttemptImagePin(ctx context.Context, authority workloadrunner.AttemptAuthority, previous sweepBaseline) error {
-	for {
-		session, receipt, snapshotErr := adapter.sessions.ExecutionSnapshot()
-		if snapshotErr == nil {
-			releaseErr := session.ReleaseAttemptImagePin(ctx, HelperAuthority(authority))
-			if releaseErr == nil {
-				return nil
-			}
-			var rpcErr *ocihelper.RPCError
-			if errors.As(releaseErr, &rpcErr) {
-				if rpcErr.Code == ocihelper.CodeAttemptOutsideSession {
-					if _, ok := adapter.reapFromReplacementSweep(authority, previous, receipt); ok {
-						return nil
-					}
-				} else if rpcErr.Code == ocihelper.CodeUnauthorizedAttempt || rpcErr.Code == ocihelper.CodeInvalidRequest {
-					return releaseErr
-				}
-			}
-		}
-		timer := time.NewTimer(25 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return errors.Join(snapshotErr, ctx.Err())
-		case <-timer.C:
+	session, receipt, err := adapter.sessions.ExecutionSnapshot()
+	if err != nil {
+		return reapRuntimeLoss(previous.helper, err)
+	}
+	err = session.ReleaseAttemptImagePin(ctx, HelperAuthority(authority))
+	if err == nil {
+		return nil
+	}
+	var rpcErr *ocihelper.RPCError
+	if errors.As(err, &rpcErr) && rpcErr.Code == ocihelper.CodeAttemptOutsideSession {
+		if _, ok := adapter.reapFromReplacementSweep(authority, previous, receipt); ok {
+			return nil
 		}
 	}
+	if requiresOCIRuntimeRecovery(err) {
+		return reapRuntimeLoss(previous.helper, err)
+	}
+	return err
 }
 
 func (adapter *Adapter) trackRun(authority workloadrunner.AttemptAuthority, entry runEntry) {
@@ -1046,6 +1166,62 @@ func (adapter *Adapter) markRunRejected(authority workloadrunner.AttemptAuthorit
 	entry.entered = false
 	adapter.runEntered[authority] = entry
 	adapter.mu.Unlock()
+}
+
+func (adapter *Adapter) markAttemptGeneration(authority workloadrunner.AttemptAuthority, generation ocihelper.HelperSession) {
+	adapter.mu.Lock()
+	entry := adapter.runEntered[authority]
+	if entry.sweep.helper == (ocihelper.HelperSession{}) {
+		entry.sweep.helper = generation
+	}
+	adapter.runEntered[authority] = entry
+	adapter.mu.Unlock()
+}
+
+func reapRuntimeLoss(generation ocihelper.HelperSession, err error) error {
+	return &workloadrunner.RuntimeLossError{
+		Generation: workloadrunner.RuntimeGeneration{InstanceID: generation.HelperInstanceID, Generation: generation.SessionGeneration},
+		Err:        err,
+	}
+}
+
+func (adapter *Adapter) reapFromMatchingSweep(authority workloadrunner.AttemptAuthority) (workloadrunner.ReapReceipt, bool) {
+	source, ok := adapter.sessions.(sweepReceiptSource)
+	if !ok {
+		return workloadrunner.ReapReceipt{}, false
+	}
+	receipt, ok := source.SweepReceipt()
+	if !ok || receipt.SweepEpoch == "" || receipt.HelperSession.HelperInstanceID == "" || receipt.HelperSession.SessionGeneration == 0 || !ocihelper.InventoryEmpty(receipt.VerifiedInventory) {
+		return workloadrunner.ReapReceipt{}, false
+	}
+	found := false
+	for _, attempt := range receipt.Attempts {
+		if attempt.NodeID == authority.NodeID &&
+			attempt.JobID == authority.JobID &&
+			attempt.RemovalGeneration == authority.RemovalGeneration &&
+			attempt.AttemptID == authority.AttemptID &&
+			attempt.FencingToken == authority.FencingToken &&
+			attempt.PriorBootSessionID == authority.BootSessionID &&
+			attempt.Class == authority.WorkloadClass {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return workloadrunner.ReapReceipt{}, false
+	}
+	key := sameBootSweepEvidenceKey{sweepEpoch: receipt.SweepEpoch, authority: authority}
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	if _, consumed := adapter.consumedSameBootSweep[key]; consumed {
+		return workloadrunner.ReapReceipt{}, false
+	}
+	adapter.consumedSameBootSweep[key] = struct{}{}
+	return workloadrunner.ReapReceipt{
+		RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceOCISweep,
+		BootSessionID: authority.BootSessionID, SweepEpoch: receipt.SweepEpoch,
+		HelperGeneration: receipt.HelperSession.SessionGeneration,
+	}, true
 }
 
 func (adapter *Adapter) markAttemptPinAttached(authority workloadrunner.AttemptAuthority, sweep sweepBaseline) {

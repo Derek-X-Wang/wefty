@@ -236,7 +236,8 @@ func assertServiceCLIContractOverJobKeyedL1Routes(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 		_, completeErr := harness.store.CompleteAttempt(ctx, nodeIdentity.NodeID, createdID.JobID, firstClaim.Lease.AttemptID, l1.CompletionRequest{
 			FencingToken: firstClaim.Lease.FencingToken, IdempotencyKey: "cli-stop-first",
-			Result: l1.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent},
+			Result:                    l1.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent},
+			RuntimeQuiescenceEvidence: l1.RuntimeQuiescenceAttempt,
 		})
 		completionResult <- completeErr
 	}()

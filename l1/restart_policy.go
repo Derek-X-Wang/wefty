@@ -128,7 +128,7 @@ type serviceCompletionPolicy struct {
 	updateLastFailure    bool
 }
 
-func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, lastFailureJSON []byte, now time.Time) serviceCompletionPolicy {
+func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, quiescenceEvidence RuntimeQuiescenceEvidence, lastFailureJSON []byte, now time.Time) serviceCompletionPolicy {
 	policy := serviceCompletionPolicy{
 		jobState:             contract.JobFailed,
 		attemptState:         completionStatesAttempt(result),
@@ -136,6 +136,11 @@ func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, lastFai
 		lifetimeRestartCount: job.LifetimeRestartCount,
 	}
 	if job.DesiredState == contract.ServiceDesiredStopped || job.State == contract.JobStopping {
+		if !validRuntimeQuiescenceEvidence(quiescenceEvidence) {
+			policy.lastFailure = lastFailureJSON
+			policy.updateLastFailure = true
+			return policy
+		}
 		policy.jobState = contract.JobStopped
 		return policy
 	}
@@ -196,6 +201,16 @@ func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, lastFai
 	nextRestartNS := nextRestart.UnixNano()
 	policy.nextRestartNS = &nextRestartNS
 	return policy
+}
+
+func validRuntimeQuiescenceEvidence(evidence RuntimeQuiescenceEvidence) bool {
+	switch evidence {
+	case RuntimeQuiescenceAttempt, RuntimeQuiescenceNoRuntime, RuntimeQuiescenceOCISweep,
+		RuntimeQuiescencePriorBootGuardian, RuntimeQuiescencePriorBootOCISweep:
+		return true
+	default:
+		return false
+	}
 }
 
 func completionStatesAttempt(result ProcessResult) contract.AttemptState {

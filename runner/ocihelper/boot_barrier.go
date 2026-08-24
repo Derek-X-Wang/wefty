@@ -148,7 +148,7 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("verify OCI runtime namespace: %w", err)
 	}
-	if !verification.Absent || !inventoryEmpty(verification.Inventory) {
+	if !verification.Absent || !InventoryEmpty(verification.Inventory) {
 		return errors.New("verify OCI runtime namespace: residue remains after sweep")
 	}
 	receipt := VerifiedSweepReceipt{
@@ -274,7 +274,8 @@ func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {
 	return inventory
 }
 
-func inventoryEmpty(inventory ResourceInventory) bool {
+// InventoryEmpty reports whether every runtime-owned namespace class is absent.
+func InventoryEmpty(inventory ResourceInventory) bool {
 	return len(inventory.Leases)+len(inventory.Snapshots)+len(inventory.Containers)+len(inventory.Tasks)+
 		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ManagedVolumes) == 0
 }

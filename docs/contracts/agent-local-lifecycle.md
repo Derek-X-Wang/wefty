@@ -182,6 +182,34 @@ typed receipt is valid for one-shot and service attempts when their lifecycle
 reaches this adapter seam. Service publication, data, and removal policy remain
 owned by the service tickets.
 
+For an agent-boot-lifetime OCI service, execution cancellation first withdraws
+publication and closes the Fabric front door. The OCI adapter then keeps the
+helper `Watch` stream alive, sends `TERM`, waits the agent-compiled five-second
+grace, sends `KILL` if the task has not exited, and waits for the structured
+terminal result. `Delete` must subsequently verify task, container, snapshot,
+lease, cgroup, shim, and log absence before L1 may observe `stopped`.
+
+Helper/session or engine loss takes a different positive-proof path. The OCI
+adapter invokes the agent recovery hook only for helper/engine evidence, never
+for an L1 image-observation transport failure. Recovery immediately suppresses
+OCI admission, publishes the restrictive capability observation, invalidates
+the helper generation, and completes the boot sweep before the attempt can
+finish. `ReapAndVerify` may consume that same-boot sweep once only when its
+complete attempt authority matches and the independently verified namespace
+inventory is empty. Replacement claims remain embargoed until the ordinary
+capability publication handshake acknowledges the recovered generation.
+Concurrent attempts that observed the same lost generation serialize recovery;
+after one establishes a newer sweep, siblings consume that proof instead of
+invalidating the recovered generation again.
+
+The recovery hook first closes local OCI admission synchronously under the
+claim/publication fence; heartbeat, invalidation, sweep, probe, and positive
+republish remain serialized finalization work. The hook substitutes the helper
+generation captured when it was armed if session acquisition failed before an
+adapter could report a generation. A typed loss returned by `ReapAndVerify`
+uses the same embargo and a separately bounded recovery before one retry or an
+exact sweep receipt; absent positive quiescence remains a failed stop latch.
+
 For a Mac OCI one-shot that needs the run bridge, the agent asks Lima itself to
 resolve `host.lima.internal`, binds only that discovered guest-visible host
 address, and injects the hostname plus the allocated port. It never binds a
@@ -197,7 +225,9 @@ returning node after an offline agent boot, the process adapter may instead
 issue `prior_boot_guardian`: the prior boot differs from its configured current
 boot and Guardian's disconnect contract reaped that boot's guarded payloads.
 Same-boot removal never falls back to this proof. The OCI boot barrier supplies
-the equivalent namespace sweep evidence to the OCI adapter, while #150 persists
+the equivalent namespace sweep evidence to the OCI adapter. Same-boot helper
+recovery names evidence `oci_sweep`; prior-agent-boot removal names
+`prior_boot_oci_sweep`. Both receipts are single-use, while #150 persists
 removal receipts across mid-removal crashes.
 
 For `kind=process`, `Run` already waits for process or Guardian reaping, so the

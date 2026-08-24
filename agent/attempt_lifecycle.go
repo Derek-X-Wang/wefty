@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -65,6 +66,9 @@ type attemptLifecycleDependencies struct {
 	prepareServiceEndpoint func(context.Context) (serviceRuntimeEndpoint, error)
 	prepareAuthorityLoss   func(context.Context, string) error
 	allowsStart            func(contract.JobSpec) bool
+	currentOCIGeneration   func() (workloadrunner.RuntimeGeneration, bool)
+	embargoOCIRuntime      func(workloadrunner.RuntimeGeneration)
+	recoverOCIRuntime      func(context.Context, workloadrunner.RuntimeGeneration) error
 	runtimeReaped          func(string, workloadrunner.ReapReceipt, error)
 	attemptDeadman         AttemptDeadmanRenewer
 }
@@ -90,8 +94,38 @@ func newAttemptLifecycle(dependencies attemptLifecycleDependencies) *attemptLife
 
 type runOutcome struct {
 	result        contract.ProcessResult
+	reapEvidence  workloadrunner.ReapEvidence
 	err           error
 	durabilityErr error
+}
+
+// ociRuntimeLossLatch is written by the adapter Run goroutine and read during
+// finalization. It also substitutes the generation captured when the hook was
+// armed if session acquisition failed before the adapter could report one.
+type ociRuntimeLossLatch struct {
+	mu       sync.Mutex
+	armed    workloadrunner.RuntimeGeneration
+	observed *workloadrunner.RuntimeGeneration
+}
+
+func (latch *ociRuntimeLossLatch) record(generation workloadrunner.RuntimeGeneration) workloadrunner.RuntimeGeneration {
+	latch.mu.Lock()
+	defer latch.mu.Unlock()
+	if generation.InstanceID == "" || generation.Generation == 0 {
+		generation = latch.armed
+	}
+	copy := generation
+	latch.observed = &copy
+	return generation
+}
+
+func (latch *ociRuntimeLossLatch) load() (workloadrunner.RuntimeGeneration, bool) {
+	latch.mu.Lock()
+	defer latch.mu.Unlock()
+	if latch.observed == nil {
+		return workloadrunner.RuntimeGeneration{}, false
+	}
+	return *latch.observed, true
 }
 
 // attemptFinalization keeps log delivery alive after execution cancellation,
@@ -137,6 +171,8 @@ var (
 	errAttemptDirectiveStop    = errors.New("attempt directive: stop")
 	errAttemptDirectiveRestart = errors.New("attempt directive: restart")
 )
+
+const ociRuntimeRecoveryTimeout = 10 * time.Second
 
 func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
 	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
@@ -184,16 +220,17 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		if claim.Job.Spec.Class == contract.JobClassOneShot && claim.Job.Spec.Kind != contract.JobKindOCI {
 			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptRunning, nil)
 		}
-		result, err := lifecycle.runWorkloadContexts(executionContext, finalization, claim, func(unlock func()) {
+		var reapEvidence workloadrunner.ReapEvidence
+		result, err := lifecycle.runWorkloadContexts(executionContext, finalization, claim, &reapEvidence, func(unlock func()) {
 			handoffUnlock = unlock
 		})
 		var durabilityErr error
 		if lifecycle.dependencies.outbox != nil {
 			durabilityErr = lifecycle.dependencies.outbox.storeCompletion(
-				context.WithoutCancel(attemptContext), attemptID, toL1Result(result), lifecycle.dependencies.clock.Now(),
+				context.WithoutCancel(attemptContext), attemptID, toL1Result(result), lifecycle.dependencies.clock.Now(), toL1QuiescenceEvidence(reapEvidence),
 			)
 		}
-		completed <- runOutcome{result: result, err: err, durabilityErr: durabilityErr}
+		completed <- runOutcome{result: result, reapEvidence: reapEvidence, err: err, durabilityErr: durabilityErr}
 	}()
 
 	var outcome runOutcome
@@ -227,9 +264,8 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
 		}
 		request := l1.CompletionRequest{
-			FencingToken:   claim.Lease.FencingToken,
-			IdempotencyKey: "completion:" + claim.Lease.AttemptID,
-			Result:         toL1Result(result),
+			FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
+			Result: toL1Result(result), RuntimeQuiescenceEvidence: toL1QuiescenceEvidence(outcome.reapEvidence),
 		}
 		finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 		defer cancelFinalization()
@@ -249,7 +285,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			if result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
 				result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
 			}
-			request := l1.CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: toL1Result(result)}
+			request := l1.CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: toL1Result(result), RuntimeQuiescenceEvidence: toL1QuiescenceEvidence(outcome.reapEvidence)}
 			finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 			defer cancelFinalization()
 			completionFailure := lifecycle.completeWithRetry(finalizationContext, claim, request)
@@ -300,9 +336,8 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		lifecycle.log("attempt %s execution: %v", claim.Lease.AttemptID, outcome.err)
 	}
 	request := l1.CompletionRequest{
-		FencingToken:   claim.Lease.FencingToken,
-		IdempotencyKey: "completion:" + claim.Lease.AttemptID,
-		Result:         toL1Result(outcome.result),
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
+		Result: toL1Result(outcome.result), RuntimeQuiescenceEvidence: toL1QuiescenceEvidence(outcome.reapEvidence),
 	}
 	completionDone := make(chan destinationError, 1)
 	completionContext := attemptContext
@@ -413,13 +448,14 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 func (lifecycle *attemptLifecycle) runWorkload(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
 	finalization := newAttemptFinalization(ctx, lifecycle.dependencies.finalizationTimeout)
 	defer finalization.stop()
-	return lifecycle.runWorkloadContexts(ctx, finalization, claim, nil)
+	return lifecycle.runWorkloadContexts(ctx, finalization, claim, nil, nil)
 }
 
 func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	ctx context.Context,
 	finalization *attemptFinalization,
 	claim l1.Claim,
+	reapEvidence *workloadrunner.ReapEvidence,
 	retainHandoffLock func(func()),
 ) (contract.ProcessResult, error) {
 	if err := contract.CheckWorkloadClass(claim.Job.Spec.Class); err != nil {
@@ -446,7 +482,13 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		ManagedVolumes: runtimeManagedVolumes(claim.Job.Spec),
 		IdlePolicy:     idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
 	}
+	var ociRuntimeLoss ociRuntimeLossLatch
 	if claim.Job.Spec.Kind == contract.JobKindOCI {
+		if lifecycle.dependencies.currentOCIGeneration != nil {
+			if generation, ok := lifecycle.dependencies.currentOCIGeneration(); ok {
+				ociRuntimeLoss.armed = generation
+			}
+		}
 		request.OCIImageDeadline = time.Time{}
 		if claim.PrestartDeadline != nil {
 			request.OCIImageDeadline = *claim.PrestartDeadline
@@ -456,6 +498,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		request.OCIImageReady = func() {
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptStarting, nil)
+		}
+		request.OCIRuntimeUnavailable = func(generation workloadrunner.RuntimeGeneration) {
+			generation = ociRuntimeLoss.record(generation)
+			if lifecycle.dependencies.embargoOCIRuntime != nil {
+				lifecycle.dependencies.embargoOCIRuntime(generation)
+			}
 		}
 		observeImage := func(startContext context.Context, observation workloadrunner.OCIImageObservation) error {
 			if lifecycle.dependencies.client == nil {
@@ -494,6 +542,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	}
 	if claim.Job.Spec.Class == contract.JobClassService {
 		request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+		request.TerminationGrace = processrunner.DefaultTerminationGraceTime
 	}
 	portfulService := claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.PublishedPort != nil
 	var ociEndpointLatch *runtimeEndpointLatch
@@ -516,16 +565,51 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	var redactingSink *redactingOutputSink
 	var managedResources workloadrunner.ManagedResources
 	finish := func(result contract.ProcessResult, runErr error) (contract.ProcessResult, error) {
+		var recoveryErr error
+		recoverRuntime := func(generation workloadrunner.RuntimeGeneration) {
+			if lifecycle.dependencies.recoverOCIRuntime == nil {
+				return
+			}
+			recoveryContext, cancelRecovery := context.WithTimeout(context.WithoutCancel(finalization.context), ociRuntimeRecoveryTimeout)
+			defer cancelRecovery()
+			if err := lifecycle.dependencies.recoverOCIRuntime(recoveryContext, generation); err != nil {
+				recoveryErr = errors.Join(recoveryErr, fmt.Errorf("recover OCI runtime: %w", err))
+				if lifecycle.dependencies.logf != nil {
+					lifecycle.dependencies.logf("agent: OCI runtime recovery before attempt completion: %v", err)
+				}
+			}
+		}
+		if generation, lost := ociRuntimeLoss.load(); lost {
+			recoverRuntime(generation)
+		}
 		finalizationContext, cancelFinalization := finalization.begin()
-		defer cancelFinalization()
 		reapReceipt, reapErr := runtimeAdapter.ReapAndVerify(finalizationContext, workloadrunner.ReapRequest{
 			Authority: authority, ManagedResources: managedResources,
 		})
+		var reapLoss *workloadrunner.RuntimeLossError
+		if errors.As(reapErr, &reapLoss) {
+			cancelFinalization()
+			generation := ociRuntimeLoss.record(reapLoss.Generation)
+			if lifecycle.dependencies.embargoOCIRuntime != nil {
+				lifecycle.dependencies.embargoOCIRuntime(generation)
+			}
+			recoverRuntime(generation)
+			if recoveryErr == nil {
+				finalizationContext, cancelFinalization = finalization.begin()
+				reapReceipt, reapErr = runtimeAdapter.ReapAndVerify(finalizationContext, workloadrunner.ReapRequest{
+					Authority: authority, ManagedResources: managedResources,
+				})
+			}
+		}
+		defer cancelFinalization()
 		if reapErr == nil && !reapReceipt.RuntimeQuiesced {
 			reapErr = errors.New("workload runtime did not verify quiescence")
 		}
 		if reapErr == nil && reapReceipt.Evidence == "" {
 			reapErr = errors.New("workload runtime reap receipt has no evidence kind")
+		}
+		if reapErr == nil && reapEvidence != nil {
+			*reapEvidence = reapReceipt.Evidence
 		}
 		if lifecycle.dependencies.runtimeReaped != nil {
 			lifecycle.dependencies.runtimeReaped(claim.Job.JobID, reapReceipt, reapErr)
@@ -547,9 +631,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if uploadErr != nil {
 			uploadErr = fmt.Errorf("upload logs: %w", uploadErr)
 		}
-		finalizationErr := errors.Join(reapErr, outputErr, uploadErr)
+		finalizationErr := errors.Join(recoveryErr, reapErr, outputErr, uploadErr)
 		if finalizationErr != nil {
-			result = contract.ProcessResult{OutputError: finalizationErr.Error()}
+			if result.RuntimeFailure == nil {
+				result = contract.ProcessResult{OutputError: finalizationErr.Error()}
+			}
 		}
 		return result, errors.Join(runErr, finalizationErr)
 	}
@@ -859,4 +945,8 @@ func toL1Result(result contract.ProcessResult) l1.ProcessResult {
 		SpawnError: result.SpawnError, RuntimeFailure: result.RuntimeFailure, OutputError: result.OutputError, ExitCode: result.ExitCode,
 		Signal: result.Signal, TerminationCause: result.TerminationCause, OOM: result.OOM, LogEvidenceIncomplete: result.LogEvidenceIncomplete,
 	}
+}
+
+func toL1QuiescenceEvidence(evidence workloadrunner.ReapEvidence) l1.RuntimeQuiescenceEvidence {
+	return l1.RuntimeQuiescenceEvidence(evidence)
 }

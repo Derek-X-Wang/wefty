@@ -381,9 +381,9 @@ func TestPlannedServiceStopCompletesWithoutRestart(t *testing.T) {
 	}
 	path := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", job.JobID, claim.Lease.AttemptID)
 	status, _, body := h.do(agent, http.MethodPost, path, CompletionRequest{
-		FencingToken:   claim.Lease.FencingToken,
-		IdempotencyKey: "planned-stop",
-		Result:         ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseGuardian},
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "planned-stop",
+		Result:                    ProcessResult{OutputError: "upload logs: object store unavailable"},
+		RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt,
 	})
 	if status != http.StatusOK {
 		t.Fatalf("planned stop completion status = %d body=%s", status, body)
@@ -395,6 +395,54 @@ func TestPlannedServiceStopCompletesWithoutRestart(t *testing.T) {
 	if stopped.CurrentAttemptID != claim.Lease.AttemptID {
 		t.Fatalf("stopped current attempt = %q, want replayable %q", stopped.CurrentAttemptID, claim.Lease.AttemptID)
 	}
+}
+
+func TestPlannedServiceStopLatchesWhenRuntimeQuiescenceFails(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
+		"service-node": DefaultNodePolicy("service"),
+	})
+	client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
+	node := h.registerWithCapabilities(agent, "service-node", map[string]bool{"kind:oci": true})
+	spec := capabilityJobSpec("planned-stop-unverified", contract.JobKindOCI, contract.JobClassService, "", nil)
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
+	if status != http.StatusCreated {
+		t.Fatalf("submit OCI stop-latch service status = %d body=%s", status, body)
+	}
+	var job Job
+	if err := json.Unmarshal(body, &job); err != nil {
+		t.Fatal(err)
+	}
+	claim := claimRestartService(t, h, agent, node)
+	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, claim.Lease.AttemptID, testImageObservation(claim.Lease.FencingToken)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.StartAttempt(context.Background(), "agent", job.JobID, claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec("UPDATE service_jobs SET desired_state=?, bound_node_id=? WHERE job_id=?", contract.ServiceDesiredStopped, node.NodeID, job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec("UPDATE jobs SET state=? WHERE job_id=?", contract.JobStopping, job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", job.JobID, claim.Lease.AttemptID)
+	status, _, body = h.do(agent, http.MethodPost, path, CompletionRequest{
+		FencingToken:   claim.Lease.FencingToken,
+		IdempotencyKey: "planned-stop-unverified",
+		Result:         ProcessResult{OutputError: "reap and verify OCI runtime: helper sweep unavailable"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("unverified stop completion status = %d body=%s", status, body)
+	}
+	failed := getRestartService(t, h, job.JobID)
+	if failed.State != contract.JobFailed || failed.DesiredState != contract.ServiceDesiredStopped || failed.HoldsSlot(failed.State) || failed.LastFailure == nil {
+		t.Fatalf("unverified stop service = %#v", failed)
+	}
+	if failed.BoundNodeID != node.NodeID || failed.Spec.Execution.OCI == nil || failed.Spec.Execution.OCI.Image.Digest == nil || *failed.Spec.Execution.OCI.Image.Digest != testTopDigest {
+		t.Fatalf("unverified stop lost binding or digest pin = %#v", failed)
+	}
+	assertAttemptState(t, h, claim.Lease.AttemptID, contract.AttemptFailed)
 }
 
 func TestServiceStabilityWindowUsesDurableTimestampAndAliveNode(t *testing.T) {

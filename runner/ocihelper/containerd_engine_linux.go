@@ -1234,7 +1234,7 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 		}
 		inventory = filterInventory(inventory, resources)
 	}
-	absent := inventoryEmpty(inventory)
+	absent := InventoryEmpty(inventory)
 	if absent && request.Scope == VerifyNamespace {
 		engine.releaseVerifiedNamespace()
 	}

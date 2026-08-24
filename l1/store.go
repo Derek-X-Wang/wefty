@@ -1844,6 +1844,9 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	if err := validateProcessResult(request.Result); err != nil {
 		return Job{}, err
 	}
+	if request.RuntimeQuiescenceEvidence != "" && !validRuntimeQuiescenceEvidence(request.RuntimeQuiescenceEvidence) {
+		return Job{}, protocolError(contract.ErrorInvalidRequest, "runtime_quiescence_evidence is not recognized")
+	}
 	requestJSON, err := json.Marshal(request)
 	if err != nil {
 		return Job{}, internalError(err, "encode completion")
@@ -1958,7 +1961,7 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	finalJobState, finalAttemptState := completionStates(request.Result)
 	var servicePolicy *serviceCompletionPolicy
 	if jobBeforeCompletion.ServiceJob != nil {
-		policy := s.classifyServiceCompletion(jobBeforeCompletion, request.Result, lastFailureJSON, now)
+		policy := s.classifyServiceCompletion(jobBeforeCompletion, request.Result, request.RuntimeQuiescenceEvidence, lastFailureJSON, now)
 		servicePolicy = &policy
 		finalJobState = policy.jobState
 		finalAttemptState = policy.attemptState

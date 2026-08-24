@@ -54,6 +54,7 @@ type agentSession struct {
 	capabilities      *capabilityState
 	ociBootBarrier    OCIBootBarrier
 	ociImagePins      workloadrunner.OCIImagePinRuntime
+	ociRecoveryMu     sync.Mutex
 
 	capacityMu      sync.Mutex
 	poolTargets     map[workloadClass]int
@@ -205,7 +206,14 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 		session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, errors.New("OCI helper session lost after removal recovery"))
 		return session.publishCapabilityHeartbeat(ctx, nil)
 	}
-	if err := session.capabilities.refresh(ctx); err != nil {
+	confirmed, confirmedOK := session.ociBootBarrier.Generation()
+	if !confirmedOK || confirmed != generation {
+		session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, errors.New("OCI helper session changed before functional probe"))
+		return session.publishCapabilityHeartbeat(ctx, nil)
+	}
+	if err := session.capabilities.refreshValidated(ctx, func() error {
+		return session.validateOCIGeneration(generation)
+	}); err != nil {
 		if session.logf != nil {
 			session.logf("agent: OCI functional probe before publication: %v", err)
 		}
@@ -278,6 +286,47 @@ func (session *agentSession) resumePendingRemovals(ctx context.Context) error {
 // reconciliation, and the functional probe. Ordinary healthy heartbeats do
 // not scan removals.
 func (session *agentSession) recoverOCIRuntime(ctx context.Context) (ocihelper.HelperSession, error) {
+	if err := lockMutexContext(ctx, &session.ociRecoveryMu); err != nil {
+		return ocihelper.HelperSession{}, err
+	}
+	defer session.ociRecoveryMu.Unlock()
+	return session.recoverOCIRuntimeLocked(ctx)
+}
+
+func (session *agentSession) recoverOCIRuntimeAfterLoss(ctx context.Context, observed workloadrunner.RuntimeGeneration) error {
+	if err := lockMutexContext(ctx, &session.ociRecoveryMu); err != nil {
+		return err
+	}
+	defer session.ociRecoveryMu.Unlock()
+	if observed.InstanceID != "" && observed.Generation != 0 && session.ociBootBarrier != nil {
+		current, ready := session.ociBootBarrier.Generation()
+		if ready && (current.HelperInstanceID != observed.InstanceID || current.SessionGeneration != observed.Generation) {
+			return nil
+		}
+	}
+	_, err := session.recoverOCIRuntimeLocked(ctx)
+	return err
+}
+
+func lockMutexContext(ctx context.Context, mutex *sync.Mutex) error {
+	if mutex.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if mutex.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
+func (session *agentSession) recoverOCIRuntimeLocked(ctx context.Context) (ocihelper.HelperSession, error) {
 	if session.ociBootBarrier == nil {
 		return ocihelper.HelperSession{}, session.capabilities.refresh(ctx)
 	}
@@ -310,7 +359,13 @@ func (session *agentSession) recoverOCIRuntime(ctx context.Context) (ocihelper.H
 	if !ok {
 		return ocihelper.HelperSession{}, errors.New("OCI helper session lost after boot sweep")
 	}
-	if err := session.capabilities.refresh(ctx); err != nil {
+	confirmed, confirmedOK := session.ociBootBarrier.Generation()
+	if !confirmedOK || confirmed != generation {
+		return ocihelper.HelperSession{}, errors.New("OCI helper session changed before functional probe")
+	}
+	if err := session.capabilities.refreshValidated(ctx, func() error {
+		return session.validateOCIGeneration(generation)
+	}); err != nil {
 		return generation, err
 	}
 	if current, stillReady := session.ociBootBarrier.Generation(); !stillReady || current != generation {
@@ -319,6 +374,15 @@ func (session *agentSession) recoverOCIRuntime(ctx context.Context) (ocihelper.H
 		return ocihelper.HelperSession{}, err
 	}
 	return generation, nil
+}
+
+func (session *agentSession) validateOCIGeneration(expected ocihelper.HelperSession) error {
+	current, ok := session.ociBootBarrier.Generation()
+	confirmed, confirmedOK := session.ociBootBarrier.Generation()
+	if !ok || current != expected || !confirmedOK || confirmed != current {
+		return errors.New("OCI helper session changed during functional probe")
+	}
+	return nil
 }
 
 func (session *agentSession) heartbeat(ctx context.Context) (l1.HeartbeatResponse, error) {
@@ -337,8 +401,11 @@ func (session *agentSession) publishCapabilityHeartbeatResponse(ctx context.Cont
 	observation := session.capabilities.snapshot()
 	if pinned != nil {
 		current, ok := session.ociBootBarrier.Generation()
-		if !ok || current != *pinned {
-			return l1.HeartbeatResponse{}, errors.New("OCI helper session changed before positive capability publication")
+		confirmed, confirmedOK := session.ociBootBarrier.Generation()
+		if !ok || current != *pinned || !confirmedOK || confirmed != current {
+			lossErr := errors.New("OCI helper session changed before positive capability publication")
+			session.capabilities.suppressOCILocked(contract.CapabilityReasonBootSweepFailed, lossErr)
+			return l1.HeartbeatResponse{}, lossErr
 		}
 	}
 	response, err := session.client.Heartbeat(
@@ -706,7 +773,9 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				}
 			} else if generation, ready := session.ociBootBarrier.Generation(); ready {
 				pinned = &generation
-				if err := session.capabilities.refresh(ctx); err != nil && session.logf != nil {
+				if err := session.capabilities.refreshValidated(ctx, func() error {
+					return session.validateOCIGeneration(generation)
+				}); err != nil && session.logf != nil {
 					session.logf("agent: OCI capability probe before heartbeat: %v", err)
 				}
 			} else {

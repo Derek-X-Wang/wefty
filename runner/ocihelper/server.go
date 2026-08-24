@@ -266,7 +266,7 @@ func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("startup verify OCI runtime namespace: %w", err)
 	}
-	if !verification.Absent || !inventoryEmpty(verification.Inventory) {
+	if !verification.Absent || !InventoryEmpty(verification.Inventory) {
 		return errors.New("startup verify OCI runtime namespace: residue remains after sweep")
 	}
 	server.sessionMu.Lock()
@@ -1047,7 +1047,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			server.createSweep.Lock()
 		}
 		response, err := server.engine.Verify(operation.ctx, body)
-		if err == nil && body.Scope == VerifyNamespace && response.Absent && inventoryEmpty(response.Inventory) {
+		if err == nil && body.Scope == VerifyNamespace && response.Absent && InventoryEmpty(response.Inventory) {
 			session.mu.Lock()
 			if session.sweepPending {
 				session.sweepPending = false
