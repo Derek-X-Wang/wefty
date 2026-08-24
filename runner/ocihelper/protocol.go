@@ -29,17 +29,21 @@ const (
 type Method string
 
 const (
-	MethodAcquireSession  Method = "AcquireSession"
-	MethodHeartbeat       Method = "Heartbeat"
-	MethodEnsureImage     Method = "EnsureImage"
-	MethodRun             Method = "Run"
-	MethodSignal          Method = "Signal"
-	MethodWatch           Method = "Watch"
-	MethodDelete          Method = "Delete"
-	MethodVerify          Method = "Verify"
-	MethodSweep           Method = "Sweep"
-	MethodDialAttemptPort Method = "DialAttemptPort"
-	MethodDialHostBridge  Method = "DialHostBridge"
+	MethodAcquireSession     Method = "AcquireSession"
+	MethodHeartbeat          Method = "Heartbeat"
+	MethodEnsureImage        Method = "EnsureImage"
+	MethodReconcileImagePins Method = "ReconcileImagePins"
+	MethodReleaseImagePin    Method = "ReleaseImagePin"
+	MethodReleaseAttemptPin  Method = "ReleaseAttemptImagePin"
+	MethodImageCacheStatus   Method = "ImageCacheStatus"
+	MethodRun                Method = "Run"
+	MethodSignal             Method = "Signal"
+	MethodWatch              Method = "Watch"
+	MethodDelete             Method = "Delete"
+	MethodVerify             Method = "Verify"
+	MethodSweep              Method = "Sweep"
+	MethodDialAttemptPort    Method = "DialAttemptPort"
+	MethodDialHostBridge     Method = "DialHostBridge"
 )
 
 // attemptPortBackendReady is emitted only after the helper has connected the
@@ -231,6 +235,56 @@ type EnsureImageRequest struct {
 	Platform         OCIPlatform   `json:"platform"`
 	Source           ImageSource   `json:"source,omitempty"`
 	OperationTimeout time.Duration `json:"operation_timeout,omitempty"`
+	Pin              *ImagePin     `json:"pin,omitempty"`
+}
+
+const DefaultImageCacheMaxBytes int64 = 16 << 30
+
+// ImagePin is one exact cache hold. Attempt authority is boot-scoped while a
+// service binding is keyed durably by JobID and reconstructed after boot.
+type ImagePin struct {
+	Authority AttemptAuthority `json:"authority"`
+	Binding   bool             `json:"binding,omitempty"`
+}
+
+type BindingImagePin struct {
+	JobID       string      `json:"job_id"`
+	Reference   string      `json:"reference"`
+	Digest      string      `json:"digest"`
+	Platform    OCIPlatform `json:"platform"`
+	Snapshotter string      `json:"snapshotter"`
+}
+
+type ReconcileImagePinsRequest struct {
+	Bindings      []BindingImagePin `json:"bindings"`
+	ProbeDigests  []string          `json:"probe_digests"`
+	CacheMaxBytes int64             `json:"cache_max_bytes"`
+}
+
+type ReconcileImagePinsResponse struct {
+	MissingDigests []string `json:"missing_digests,omitempty"`
+}
+
+type ReleaseImagePinRequest struct {
+	JobID string `json:"job_id"`
+}
+
+type ReleaseAttemptImagePinRequest struct {
+	Authority AttemptAuthority `json:"authority"`
+}
+
+type ImageCacheEviction struct {
+	Digest    string    `json:"digest"`
+	Reason    string    `json:"reason"`
+	Bytes     int64     `json:"bytes"`
+	EvictedAt time.Time `json:"evicted_at"`
+}
+
+type ImageCacheStatus struct {
+	Bytes        int64               `json:"bytes"`
+	CapBytes     int64               `json:"cap_bytes"`
+	LastEviction *ImageCacheEviction `json:"last_eviction,omitempty"`
+	LastError    string              `json:"last_error,omitempty"`
 }
 
 // ImageSource selects one closed delivery mechanism. Empty retains the wire-v1

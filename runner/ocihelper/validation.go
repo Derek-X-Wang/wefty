@@ -224,6 +224,14 @@ func validateEnsureImageRequest(request EnsureImageRequest) error {
 	if request.OperationTimeout < 0 {
 		return errors.New("image operation timeout must not be negative")
 	}
+	if request.Pin != nil {
+		if err := request.Pin.Authority.validate(); err != nil {
+			return err
+		}
+		if request.Pin.Binding && request.Pin.Authority.Class != "service" {
+			return errors.New("binding image pins require service-class authority")
+		}
+	}
 	if strings.TrimSpace(request.Platform.OS) == "" || strings.TrimSpace(request.Platform.Architecture) == "" ||
 		request.Platform.OS != strings.ToLower(strings.TrimSpace(request.Platform.OS)) ||
 		request.Platform.Architecture != strings.ToLower(strings.TrimSpace(request.Platform.Architecture)) ||

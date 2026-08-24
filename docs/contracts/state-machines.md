@@ -65,12 +65,18 @@ state until final deletion. `restart-pending` is never persisted. It is computed
 when a service is `queued`, desired `running`, and its `next_restart_at` is in
 the future.
 
-A service binding is also its service-slot reservation. A bound service holds
+A service binding is also its service-slot reservation and, for `kind=oci`, a
+durable node-local image pin. A bound service holds
 the slot while queued for restart, claimed, running, or stopping. It releases
 the slot only after reaching stopped, latched failed, or verified removal; the
 binding itself remains durable. Reaching stopped never clears
 `current_attempt_id`, because an idempotent completion replay must still match
 the attempt that positively reaped the payload.
+
+Verified OCI removal releases the binding image pin only after runtime and
+managed service data are positively absent and before cleanup acknowledgement.
+Releasing the pin does not delete the evictable cache entry; ordinary periodic
+cache pressure remains the only later deletion policy.
 
 Agent shutdown is an infrastructure interruption, not operator stop intent. A
 fenced shutdown completion therefore leaves desired state `running`, moves the

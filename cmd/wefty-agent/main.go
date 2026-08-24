@@ -270,35 +270,36 @@ func run() error {
 		return err
 	}
 	var (
-		fabricMode        = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
-		controlPlane      = flag.String("control-plane", "wefty://control-plane", "control-plane Fabric address")
-		runLedger         = flag.String("run-ledger", "wefty://run-ledger", "run-ledger Fabric address used by workflow jobs")
-		nodeID            = flag.String("node-id", "", "stable operator-facing node ID")
-		fabricIdentityID  = flag.String("plain-identity", "", "plain Fabric identity node ID (defaults to node-id)")
-		fabricName        = flag.String("fabric-name", "", "tsnet logical node name")
-		stateDirectory    = flag.String("state-dir", "", "tsnet state directory")
-		authKey           = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
-		controlURL        = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
-		ephemeral         = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
-		heartbeat         = flag.Duration("heartbeat-interval", agent.DefaultHeartbeatInterval, "node heartbeat interval")
-		claim             = flag.Duration("claim-interval", agent.DefaultClaimInterval, "idle claim polling interval")
-		renewal           = flag.Duration("renewal-interval", agent.DefaultRenewalInterval, "maximum attempt lease-renewal interval")
-		finalization      = flag.Duration("finalization-timeout", agent.DefaultFinalizationTimeout, "maximum final log flush and upload duration after a payload exits")
-		maxOneshotSlots   = flag.Int("max-oneshot-slots", l1.DefaultMaxOneshotSlots, "local ceiling for concurrent one-shot attempts")
-		maxServiceSlots   = flag.Int("max-service-slots", l1.DefaultMaxServiceSlots, "local ceiling for concurrent service attempts")
-		logSpoolDirectory = flag.String("log-spool-dir", "", "durable log spool directory (defaults to the user cache directory)")
-		logSpoolMaxBytes  = flag.Int64("log-spool-max-bytes", agent.DefaultLogSpoolMaxBytes, "maximum unacknowledged one-shot log payload bytes retained on disk (service logs use a 32 MiB ring)")
-		managedRoot       = flag.String("managed-root", managedRootDefault, "persistent state root for agent-managed service resources")
-		handoffRoot       = flag.String("handoff-root", contract.DefaultHandoffRoot, "agent-managed one-shot handoff root")
-		ociHelperSocket   = flag.String("oci-helper-socket", "", "private OCI helper Unix socket; empty disables OCI")
-		ociHelperChecksum = flag.String("oci-helper-checksum", "", "expected OCI helper binary checksum")
-		ociProbeImage     = flag.String("oci-probe-image", "", "preloaded local OCI probe image reference")
-		ociProbeDigest    = flag.String("oci-probe-digest", "", "immutable digest of the preloaded local OCI probe image")
-		ociImageBudget    = flag.Duration("oci-image-budget", ocirunner.DefaultImageBudget, "total resolve, pull/import, unpack, and shared-operation wait budget")
-		ociLimaInstance   = flag.String("oci-lima-instance", limarunner.DefaultInstanceName, "Lima instance carrying the private OCI helper on macOS")
-		ociLimaMountRoot  = flag.String("oci-lima-host-mount-root", "", "macOS host mount root validated before Lima helper RPCs")
-		ociDoctorFacts    = flag.String("oci-minimal-doctor-facts", "", "absolute path for the bounded Mac bootstrap facts JSON")
-		ociIntentFile     = flag.String("oci-intent-file", "", "absolute read-only durable OCI intent file; missing disables OCI")
+		fabricMode            = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
+		controlPlane          = flag.String("control-plane", "wefty://control-plane", "control-plane Fabric address")
+		runLedger             = flag.String("run-ledger", "wefty://run-ledger", "run-ledger Fabric address used by workflow jobs")
+		nodeID                = flag.String("node-id", "", "stable operator-facing node ID")
+		fabricIdentityID      = flag.String("plain-identity", "", "plain Fabric identity node ID (defaults to node-id)")
+		fabricName            = flag.String("fabric-name", "", "tsnet logical node name")
+		stateDirectory        = flag.String("state-dir", "", "tsnet state directory")
+		authKey               = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
+		controlURL            = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
+		ephemeral             = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
+		heartbeat             = flag.Duration("heartbeat-interval", agent.DefaultHeartbeatInterval, "node heartbeat interval")
+		claim                 = flag.Duration("claim-interval", agent.DefaultClaimInterval, "idle claim polling interval")
+		renewal               = flag.Duration("renewal-interval", agent.DefaultRenewalInterval, "maximum attempt lease-renewal interval")
+		finalization          = flag.Duration("finalization-timeout", agent.DefaultFinalizationTimeout, "maximum final log flush and upload duration after a payload exits")
+		maxOneshotSlots       = flag.Int("max-oneshot-slots", l1.DefaultMaxOneshotSlots, "local ceiling for concurrent one-shot attempts")
+		maxServiceSlots       = flag.Int("max-service-slots", l1.DefaultMaxServiceSlots, "local ceiling for concurrent service attempts")
+		logSpoolDirectory     = flag.String("log-spool-dir", "", "durable log spool directory (defaults to the user cache directory)")
+		logSpoolMaxBytes      = flag.Int64("log-spool-max-bytes", agent.DefaultLogSpoolMaxBytes, "maximum unacknowledged one-shot log payload bytes retained on disk (service logs use a 32 MiB ring)")
+		managedRoot           = flag.String("managed-root", managedRootDefault, "persistent state root for agent-managed service resources")
+		handoffRoot           = flag.String("handoff-root", contract.DefaultHandoffRoot, "agent-managed one-shot handoff root")
+		ociHelperSocket       = flag.String("oci-helper-socket", "", "private OCI helper Unix socket; empty disables OCI")
+		ociHelperChecksum     = flag.String("oci-helper-checksum", "", "expected OCI helper binary checksum")
+		ociProbeImage         = flag.String("oci-probe-image", "", "preloaded local OCI probe image reference")
+		ociProbeDigest        = flag.String("oci-probe-digest", "", "immutable digest of the preloaded local OCI probe image")
+		ociImageBudget        = flag.Duration("oci-image-budget", ocirunner.DefaultImageBudget, "total resolve, pull/import, unpack, and shared-operation wait budget")
+		ociImageCacheMaxBytes = flag.Int64("oci-image-cache-max-bytes", ocihelper.DefaultImageCacheMaxBytes, "maximum containerd content-store bytes retained in the wefty namespace")
+		ociLimaInstance       = flag.String("oci-lima-instance", limarunner.DefaultInstanceName, "Lima instance carrying the private OCI helper on macOS")
+		ociLimaMountRoot      = flag.String("oci-lima-host-mount-root", "", "macOS host mount root validated before Lima helper RPCs")
+		ociDoctorFacts        = flag.String("oci-minimal-doctor-facts", "", "absolute path for the bounded Mac bootstrap facts JSON")
+		ociIntentFile         = flag.String("oci-intent-file", "", "absolute read-only durable OCI intent file; missing disables OCI")
 	)
 	flag.Parse()
 	if *nodeID == "" {
@@ -312,6 +313,9 @@ func run() error {
 	}
 	if *ociIntentFile != "" && !filepath.IsAbs(*ociIntentFile) {
 		return errors.New("--oci-intent-file must be absolute when set")
+	}
+	if *ociImageCacheMaxBytes <= 0 {
+		return fmt.Errorf("--oci-image-cache-max-bytes must be positive")
 	}
 	identityID := *fabricIdentityID
 	if identityID == "" {
@@ -379,6 +383,7 @@ func run() error {
 			agentBootBarrier = supervisedBootBarrier
 		}
 		var adapterOptions []ocirunner.Option
+		adapterOptions = append(adapterOptions, ocirunner.WithImageCache(*ociImageCacheMaxBytes, *ociProbeDigest))
 		if runtime.GOOS == "darwin" {
 			adapterOptions = append(adapterOptions, ocirunner.WithHostMountRoot(*ociLimaMountRoot))
 		}

@@ -63,6 +63,13 @@ func TestAdapterPersistsResolutionBeforePrestartRunFailure(t *testing.T) {
 	if resolved.TopLevelDigest != adapterTestDigest || resolved.PlatformManifestDigest != adapterTestDigest {
 		t.Fatalf("pre-Run resolution evidence = %+v", resolved)
 	}
+	receipt, reapErr := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
+	if reapErr != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime {
+		t.Fatalf("pre-Run helper failure reap = (%+v, %v)", receipt, reapErr)
+	}
+	if engine.deletes != 1 {
+		t.Fatalf("pre-Run helper failure pin releases = %d, want 1", engine.deletes)
+	}
 }
 
 func TestAdapterClassifiesPreRunObservationFailure(t *testing.T) {
@@ -475,21 +482,177 @@ func TestAdapterPreRunImageFailureHasPositiveNoRuntimeReapEvidence(t *testing.T)
 	}
 }
 
+func TestAdapterReleasesAttachedAttemptPinAfterPreRunAbandonment(t *testing.T) {
+	engine := &adapterTestEngine{}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.OCIImageResolved = func(context.Context, workloadrunner.OCIImageObservation) error {
+		return &workloadrunner.OCIObservationRefusal{Err: errors.New("stale fence")}
+	}
+	if _, err := adapter.Run(t.Context(), request, nil); err == nil {
+		t.Fatal("observation refusal unexpectedly ran")
+	}
+	receipt, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
+	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime {
+		t.Fatalf("pre-Run pin reap = (%+v, %v)", receipt, err)
+	}
+	if engine.deletes != 1 {
+		t.Fatalf("pre-Run attached pin release calls = %d, want 1", engine.deletes)
+	}
+}
+
+func TestReleaseBindingPinWithoutLedgerRowDoesNotAcquireHelper(t *testing.T) {
+	adapter := NewAdapter(&failingSessionSource{})
+	if err := adapter.ReleaseOCIImageBindingPin(t.Context(), "process-job"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAdapterReconciliationAutomaticallyRedeliversEveryMissingBinding(t *testing.T) {
+	engine := &adapterTestEngine{missingUntilEnsure: true}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	pin := workloadrunner.OCIImageBindingPin{
+		JobID: "service-a", Reference: "example.invalid/image", Digest: adapterTestDigest,
+		PlatformOS: "linux", PlatformArchitecture: "amd64", Snapshotter: ocihelper.DefaultSnapshotter,
+	}
+	if _, created, err := adapter.pinLedger.PutOCIImageBindingPin(t.Context(), pin); err != nil || !created {
+		t.Fatalf("persist binding pin = created %t err %v", created, err)
+	}
+	failures, err := adapter.ReconcileOCIImagePins(t.Context(), func(context.Context, string) (bool, error) { return true, nil })
+	if err != nil || len(failures) != 0 {
+		t.Fatalf("automatic redelivery = failures %+v err %v", failures, err)
+	}
+	if engine.ensureCalls != 1 || engine.reconcileCalls != 2 {
+		t.Fatalf("automatic redelivery calls ensure=%d reconcile=%d", engine.ensureCalls, engine.reconcileCalls)
+	}
+}
+
+func TestAdapterReconciliationReportsEveryBindingWhoseBudgetedRedeliveryFails(t *testing.T) {
+	missing := ocihelper.NewImageMechanicsError(ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureHTTP, HTTPStatus: 404, TopLevelDigest: adapterTestDigest}, errors.New("missing"))
+	engine := &adapterTestEngine{missingUntilEnsure: true, ensureErrors: []error{missing, missing}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	for _, jobID := range []string{"service-a", "service-b"} {
+		pin := workloadrunner.OCIImageBindingPin{
+			JobID: jobID, Reference: "example.invalid/image", Digest: adapterTestDigest,
+			PlatformOS: "linux", PlatformArchitecture: "amd64", Snapshotter: ocihelper.DefaultSnapshotter,
+		}
+		if _, _, err := adapter.pinLedger.PutOCIImageBindingPin(t.Context(), pin); err != nil {
+			t.Fatal(err)
+		}
+	}
+	failures, err := adapter.ReconcileOCIImagePins(t.Context(), func(context.Context, string) (bool, error) { return true, nil })
+	if err != nil || len(failures) != 2 || engine.ensureCalls != 2 {
+		t.Fatalf("failed redeliveries = failures %+v calls %d err %v", failures, engine.ensureCalls, err)
+	}
+	for _, failure := range failures {
+		if failure.Failure.Code != contract.SpawnFailureImageNotFound {
+			t.Fatalf("redelivery failure = %+v", failure)
+		}
+	}
+}
+
+func TestAdapterReconciliationDropsLedgerRowsWithoutPositiveBindingProof(t *testing.T) {
+	engine := &adapterTestEngine{}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	pin := workloadrunner.OCIImageBindingPin{JobID: "stale", Reference: "example.invalid/image", Digest: adapterTestDigest, PlatformOS: "linux", PlatformArchitecture: "amd64", Snapshotter: ocihelper.DefaultSnapshotter}
+	if _, _, err := adapter.pinLedger.PutOCIImageBindingPin(t.Context(), pin); err != nil {
+		t.Fatal(err)
+	}
+	if failures, err := adapter.ReconcileOCIImagePins(t.Context(), func(context.Context, string) (bool, error) { return false, nil }); err != nil || len(failures) != 0 {
+		t.Fatalf("stale binding reconciliation = failures %+v err %v", failures, err)
+	}
+	pins, err := adapter.pinLedger.ListOCIImageBindingPins(t.Context())
+	if err != nil || len(pins) != 0 {
+		t.Fatalf("stale ledger rows = %+v err %v", pins, err)
+	}
+}
+
+func TestServiceTerminalDeliveryFailureRemovesNewBindingLedgerRow(t *testing.T) {
+	engine := &adapterTestEngine{ensureErrors: []error{ocihelper.NewImageMechanicsError(
+		ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureHTTP, HTTPStatus: 404, TopLevelDigest: adapterTestDigest}, errors.New("missing"),
+	)}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	if _, err := adapter.Run(t.Context(), request, nil); err == nil {
+		t.Fatal("terminal service delivery unexpectedly succeeded")
+	}
+	pins, err := adapter.pinLedger.ListOCIImageBindingPins(t.Context())
+	if err != nil || len(pins) != 0 {
+		t.Fatalf("terminal delivery retained binding rows %+v err=%v", pins, err)
+	}
+}
+
+func TestServiceRestartRejectsChangedProbePlatformWithoutMutatingFirstBinding(t *testing.T) {
+	engine := &adapterTestEngine{}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	pin := workloadrunner.OCIImageBindingPin{
+		JobID: "job", Reference: "example.invalid/image", Digest: adapterTestDigest,
+		PlatformOS: "linux", PlatformArchitecture: "arm64", Snapshotter: ocihelper.DefaultSnapshotter,
+	}
+	if _, _, err := adapter.pinLedger.PutOCIImageBindingPin(t.Context(), pin); err != nil {
+		t.Fatal(err)
+	}
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	result, err := adapter.Run(t.Context(), request, nil)
+	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureImagePlatformUnsupported {
+		t.Fatalf("first-binding platform mismatch = (%+v, %v)", result.Outcome, err)
+	}
+	pins, listErr := adapter.pinLedger.ListOCIImageBindingPins(t.Context())
+	if listErr != nil || len(pins) != 1 || pins[0] != pin {
+		t.Fatalf("first binding mutated = %+v err=%v", pins, listErr)
+	}
+}
+
 type adapterTestEngine struct {
-	mu               sync.Mutex
-	watch            ocihelper.WatchResponse
-	deletes          int
-	refuseDelete     bool
-	runErr           error
-	ensureErrors     []error
-	ensureCalls      int
-	responseDigest   string
-	responsePlatform ocihelper.OCIPlatform
-	ensureEntered    chan struct{}
-	releaseEnsure    chan struct{}
-	lastRun          ocihelper.RunRequest
-	lastEnsure       ocihelper.EnsureImageRequest
-	bridgeExchange   chan error
+	mu                 sync.Mutex
+	watch              ocihelper.WatchResponse
+	deletes            int
+	refuseDelete       bool
+	runErr             error
+	ensureErrors       []error
+	ensureCalls        int
+	responseDigest     string
+	responsePlatform   ocihelper.OCIPlatform
+	ensureEntered      chan struct{}
+	releaseEnsure      chan struct{}
+	lastRun            ocihelper.RunRequest
+	lastEnsure         ocihelper.EnsureImageRequest
+	bridgeExchange     chan error
+	missingUntilEnsure bool
+	reconcileCalls     int
+}
+
+func (engine *adapterTestEngine) ReconcileImagePins(_ context.Context, request ocihelper.ReconcileImagePinsRequest) (ocihelper.ReconcileImagePinsResponse, error) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.reconcileCalls++
+	if engine.missingUntilEnsure && engine.ensureCalls == 0 && len(request.Bindings) != 0 {
+		return ocihelper.ReconcileImagePinsResponse{MissingDigests: []string{request.Bindings[0].Digest}}, nil
+	}
+	return ocihelper.ReconcileImagePinsResponse{}, nil
+}
+
+func (*adapterTestEngine) ReleaseImagePin(context.Context, ocihelper.ReleaseImagePinRequest) error {
+	return nil
+}
+
+func (engine *adapterTestEngine) ReleaseAttemptImagePin(context.Context, ocihelper.ReleaseAttemptImagePinRequest) error {
+	engine.mu.Lock()
+	engine.deletes++
+	engine.mu.Unlock()
+	return nil
+}
+
+func (*adapterTestEngine) ImageCacheStatus(context.Context) (ocihelper.ImageCacheStatus, error) {
+	return ocihelper.ImageCacheStatus{}, nil
 }
 
 func (engine *adapterTestEngine) EnsureImage(_ context.Context, request ocihelper.EnsureImageRequest, archive io.Reader, emit func(ocihelper.EnsureImageEvent) error) error {
@@ -665,6 +828,12 @@ func intPointer(value int) *int { return &value }
 
 type adapterReceiptSource struct {
 	receipt ocihelper.VerifiedSweepReceipt
+}
+
+type failingSessionSource struct{}
+
+func (*failingSessionSource) Session() (*ocihelper.Session, error) {
+	return nil, errors.New("helper session must not be acquired")
 }
 
 func (*adapterReceiptSource) Session() (*ocihelper.Session, error) { return nil, errors.New("unused") }

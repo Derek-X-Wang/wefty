@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/leases"
 	contentlocal "github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/containerd/platforms"
 	digest "github.com/opencontainers/go-digest"
@@ -597,12 +598,58 @@ func TestResidualVerificationRetainsPortAgainstConcurrentAllocation(t *testing.T
 	if _, _, err := engine.reserveAttemptPort("attempt-b"); err == nil {
 		t.Fatal("residual verification recycled a live attempt port")
 	}
-	engine.releaseVerifiedAttempt("attempt-a")
+	if err := engine.releaseVerifiedAttempt(t.Context(), "attempt-a"); err != nil {
+		t.Fatal(err)
+	}
 	if _, nextHold, err := engine.reserveAttemptPort("attempt-b"); err != nil {
 		t.Fatalf("verified absence did not release port: %v", err)
 	} else {
 		_ = nextHold.Close()
 	}
+}
+
+func TestVerifiedAttemptPropagatesPinDeletionAndRetainsRetryState(t *testing.T) {
+	key := testImageOperationKey("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	manager := &failingImageLeaseDeletionManager{err: errors.New("containerd lease delete failed")}
+	engine := &ContainerdEngine{
+		imageLeaseDeletes: manager,
+		attemptImagePins:  map[string]imageOperationKey{"attempt-a": key},
+		attempts:          map[string]*containerdAttempt{"attempt-a": {}},
+		ports:             map[uint16]string{},
+	}
+	err := engine.releaseVerifiedAttempt(t.Context(), "attempt-a")
+	if err == nil || !strings.Contains(err.Error(), "containerd lease delete failed") {
+		t.Fatalf("release error = %v", err)
+	}
+	if _, retained := engine.attemptImagePins["attempt-a"]; !retained {
+		t.Fatal("failed lease deletion discarded retryable attempt pin state")
+	}
+	if _, retained := engine.attempts["attempt-a"]; retained {
+		t.Fatal("verified runtime state was retained with independent image-pin failure")
+	}
+	if !manager.sawDeadline {
+		t.Fatal("attempt image-pin deletion was not bounded")
+	}
+}
+
+func TestStructLiteralEngineCloseIsNilChannelSafeAndIdempotent(t *testing.T) {
+	engine := &ContainerdEngine{imageOperations: newImageOperationGroup()}
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type failingImageLeaseDeletionManager struct {
+	err         error
+	sawDeadline bool
+}
+
+func (manager *failingImageLeaseDeletionManager) Delete(ctx context.Context, _ leases.Lease, _ ...leases.DeleteOpt) error {
+	_, manager.sawDeadline = ctx.Deadline()
+	return manager.err
 }
 
 func TestAttemptPortRejectsAdversarialBindOutsidePayloadCgroup(t *testing.T) {

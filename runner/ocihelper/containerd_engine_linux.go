@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -73,17 +74,29 @@ type containerdAttempt struct {
 }
 
 type ContainerdEngine struct {
-	client          *containerd.Client
-	config          NativeEngineConfig
-	imageOperations *imageOperationGroup
-	imageNameMu     sync.Mutex
-	imageResourceMu sync.Mutex
-	activeSpools    map[string]struct{}
-	activeLeases    map[string]struct{}
-	mu              sync.Mutex
-	attempts        map[string]*containerdAttempt
-	ports           map[uint16]string
-	nextPort        uint16
+	client            *containerd.Client
+	imageLeaseDeletes imageLeaseDeletionManager
+	config            NativeEngineConfig
+	imageOperations   *imageOperationGroup
+	imageNameMu       sync.Mutex
+	imageContentMu    sync.Mutex
+	imageResourceMu   sync.Mutex
+	activeSpools      map[string]struct{}
+	activeLeases      map[string]struct{}
+	attemptImagePins  map[string]imageOperationKey
+	bindingImagePins  map[string]imageOperationKey
+	probeDigests      map[string]struct{}
+	cache             *imageCacheLedger
+	cacheMaxBytes     int64
+	cacheReady        bool
+	cacheStop         chan struct{}
+	cacheDone         chan struct{}
+	closeOnce         sync.Once
+	closeErr          error
+	mu                sync.Mutex
+	attempts          map[string]*containerdAttempt
+	ports             map[uint16]string
+	nextPort          uint16
 }
 
 const (
@@ -179,11 +192,22 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect containerd: %w", err)
 	}
-	return &ContainerdEngine{
-		client: client, config: config, imageOperations: newImageOperationGroup(),
-		activeSpools: make(map[string]struct{}), activeLeases: make(map[string]struct{}), attempts: make(map[string]*containerdAttempt),
-		ports: make(map[uint16]string), nextPort: config.AttemptPortMin,
-	}, nil
+	cache, err := openImageCacheLedger(config.RuntimeRoot)
+	if err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("open OCI image cache ledger: %w", err)
+	}
+	engine := &ContainerdEngine{
+		client: client, imageLeaseDeletes: client.LeasesService(), config: config, imageOperations: newImageOperationGroup(),
+		activeSpools: make(map[string]struct{}), activeLeases: make(map[string]struct{}),
+		attemptImagePins: make(map[string]imageOperationKey), bindingImagePins: make(map[string]imageOperationKey), probeDigests: make(map[string]struct{}),
+		cache: cache, cacheMaxBytes: DefaultImageCacheMaxBytes,
+		cacheStop: make(chan struct{}), cacheDone: make(chan struct{}),
+		attempts: make(map[string]*containerdAttempt),
+		ports:    make(map[uint16]string), nextPort: config.AttemptPortMin,
+	}
+	go engine.imageCacheLoop()
+	return engine, nil
 }
 
 func copyManagedNetworkFile(source, target string) error {
@@ -214,11 +238,24 @@ func OpenNativeEngine(config NativeEngineConfig) (Engine, io.Closer, error) {
 }
 
 func (engine *ContainerdEngine) Close() error {
-	if engine == nil || engine.client == nil {
+	if engine == nil {
 		return nil
 	}
-	_ = engine.imageOperations.CancelAll(context.Background())
-	return engine.client.Close()
+	engine.closeOnce.Do(func() {
+		if engine.imageOperations != nil {
+			engine.closeErr = errors.Join(engine.closeErr, engine.imageOperations.CancelAll(context.Background()))
+		}
+		if engine.cacheStop != nil {
+			close(engine.cacheStop)
+		}
+		if engine.cacheDone != nil {
+			<-engine.cacheDone
+		}
+		if engine.client != nil {
+			engine.closeErr = errors.Join(engine.closeErr, engine.client.Close())
+		}
+	})
+	return engine.closeErr
 }
 
 func engineContext(ctx context.Context) context.Context {
@@ -272,7 +309,7 @@ func (engine *ContainerdEngine) EnsureImage(ctx context.Context, request EnsureI
 		if err := emit(EnsureImageEvent{Kind: ImageProgress, Progress: &ImageProgressEvent{Status: "resolved", TopLevelDigest: inspection.TopLevel.Digest.String()}}); err != nil {
 			return err
 		}
-		response, err := engine.importImage(operationContext, inspection, timeout)
+		response, err := engine.importImage(operationContext, request, inspection, timeout)
 		if err != nil {
 			return err
 		}
@@ -287,8 +324,18 @@ func (engine *ContainerdEngine) EnsureImage(ctx context.Context, request EnsureI
 		return err
 	}
 	key := imageOperationKey{Namespace: ContainerdNamespace, Digest: topLevelDigest, Platform: platformKey, Snapshotter: DefaultSnapshotter}
-	response, err := engine.imageOperations.Do(operationContext, key, timeout, func(operationContext context.Context) (EnsureImageResponse, error) {
-		return engine.pullPublicImage(operationContext, reference, topLevelDigest, key, platformMatcher)
+	response, err := engine.imageOperations.DoPreparedWithAttach(operationContext, key, timeout, func(prepareContext context.Context) (func(context.Context) (EnsureImageResponse, error), func(), error) {
+		leaseContext, release, leaseErr := engine.imageOperationLease(engineContext(prepareContext), key)
+		if leaseErr != nil {
+			return nil, nil, leaseErr
+		}
+		return func(context.Context) (EnsureImageResponse, error) {
+			engine.imageContentMu.Lock()
+			defer engine.imageContentMu.Unlock()
+			return engine.pullPublicImage(leaseContext, reference, topLevelDigest, platformMatcher)
+		}, release, nil
+	}, func(attachContext context.Context, result EnsureImageResponse) error {
+		return engine.attachImageHolds(engineContext(attachContext), request, key, result.Evidence)
 	})
 	if err != nil {
 		var mechanics *ImageMechanicsError
@@ -298,6 +345,14 @@ func (engine *ContainerdEngine) EnsureImage(ctx context.Context, request EnsureI
 			return &ImageMechanicsError{Fact: fact, err: mechanics.err}
 		}
 		return err
+	}
+	if err := engine.recordCacheUse(key, response.Evidence, false); err != nil {
+		engine.recordCacheError(err)
+		log.Printf("OCI image cache post-delivery bookkeeping: %v", err)
+	}
+	if err := engine.enforceImageCache(context.WithoutCancel(ctx), "post_pull"); err != nil {
+		engine.recordCacheError(err)
+		log.Printf("OCI image cache post-delivery enforcement: %v", err)
 	}
 	return emit(EnsureImageEvent{Kind: ImageComplete, Result: &response})
 }
@@ -339,14 +394,9 @@ func validateResolvedImageDescriptor(descriptor ocispec.Descriptor) error {
 	return nil
 }
 
-func (engine *ContainerdEngine) pullPublicImage(ctx context.Context, reference, topLevelDigest string, key imageOperationKey, matcher platforms.MatchComparer) (EnsureImageResponse, error) {
-	operationContext, release, err := engine.imageOperationLease(engineContext(ctx), key)
-	if err != nil {
-		return EnsureImageResponse{}, classifyImageOperationError(err, topLevelDigest)
-	}
-	defer release()
-	if image, evidence, localErr := engine.localImageForPlatform(operationContext, reference, topLevelDigest, matcher); localErr == nil {
-		if unpackErr := image.Unpack(operationContext, DefaultSnapshotter); unpackErr != nil && !errdefs.IsAlreadyExists(unpackErr) {
+func (engine *ContainerdEngine) pullPublicImage(ctx context.Context, reference, topLevelDigest string, matcher platforms.MatchComparer) (EnsureImageResponse, error) {
+	if image, evidence, localErr := engine.localImageForPlatform(ctx, reference, topLevelDigest, matcher); localErr == nil {
+		if unpackErr := image.Unpack(ctx, DefaultSnapshotter); unpackErr != nil && !errdefs.IsAlreadyExists(unpackErr) {
 			return EnsureImageResponse{}, classifyImageOperationError(unpackErr, topLevelDigest)
 		}
 		return ensureImageResponse(evidence), nil
@@ -354,7 +404,7 @@ func (engine *ContainerdEngine) pullPublicImage(ctx context.Context, reference, 
 		return EnsureImageResponse{}, classifyImageOperationError(localErr, topLevelDigest)
 	}
 	tracker := &retryAfterTracker{}
-	_, err = engine.client.Pull(operationContext, reference+"@"+topLevelDigest,
+	_, err := engine.client.Pull(ctx, reference+"@"+topLevelDigest,
 		containerd.WithResolver(publicResolver(tracker)),
 		containerd.WithPlatformMatcher(matcher),
 		containerd.WithPullUnpack,
@@ -363,7 +413,7 @@ func (engine *ContainerdEngine) pullPublicImage(ctx context.Context, reference, 
 	if err != nil {
 		return EnsureImageResponse{}, classifyRegistryError(err, tracker.Delay(), topLevelDigest)
 	}
-	_, evidence, err := engine.localImageForPlatform(operationContext, reference, topLevelDigest, matcher)
+	_, evidence, err := engine.localImageForPlatform(ctx, reference, topLevelDigest, matcher)
 	if err != nil {
 		return EnsureImageResponse{}, classifyImageOperationError(err, topLevelDigest)
 	}
@@ -375,16 +425,25 @@ func isLocalImageNotFound(err error) bool {
 	return errors.As(err, &unavailable) && errdefs.IsNotFound(unavailable.err)
 }
 
-func (engine *ContainerdEngine) importImage(ctx context.Context, inspection ociArchiveInspection, timeout time.Duration) (EnsureImageResponse, error) {
+func (engine *ContainerdEngine) importImage(ctx context.Context, request EnsureImageRequest, inspection ociArchiveInspection, timeout time.Duration) (EnsureImageResponse, error) {
 	key := imageOperationKey{Namespace: ContainerdNamespace, Digest: inspection.TopLevel.Digest.String(), Platform: platforms.Format(inspection.Platform), Snapshotter: DefaultSnapshotter}
-	response, err := engine.imageOperations.DoPrepared(ctx, key, timeout, func() (func(context.Context) (EnsureImageResponse, error), func(), error) {
+	response, err := engine.imageOperations.DoPreparedWithAttach(ctx, key, timeout, func(prepareContext context.Context) (func(context.Context) (EnsureImageResponse, error), func(), error) {
 		file, openErr := os.Open(inspection.Path)
 		if openErr != nil {
 			return nil, nil, imageMechanicsError(ImageFailureUnavailable, inspection.TopLevel.Digest.String(), openErr)
 		}
-		return func(operationContext context.Context) (EnsureImageResponse, error) {
-			return engine.importImageContent(operationContext, inspection, key, file)
-		}, func() { _ = file.Close() }, nil
+		leaseContext, release, leaseErr := engine.imageOperationLease(engineContext(prepareContext), key)
+		if leaseErr != nil {
+			_ = file.Close()
+			return nil, nil, leaseErr
+		}
+		return func(context.Context) (EnsureImageResponse, error) {
+			engine.imageContentMu.Lock()
+			defer engine.imageContentMu.Unlock()
+			return engine.importImageContent(leaseContext, inspection, file)
+		}, func() { _ = file.Close(); release() }, nil
+	}, func(attachContext context.Context, result EnsureImageResponse) error {
+		return engine.attachImageHolds(engineContext(attachContext), request, key, result.Evidence)
 	})
 	if err != nil {
 		return EnsureImageResponse{}, err
@@ -392,28 +451,31 @@ func (engine *ContainerdEngine) importImage(ctx context.Context, inspection ociA
 	if err := engine.bindImportedImage(engineContext(ctx), inspection.Reference, inspection.TopLevel); err != nil {
 		return EnsureImageResponse{}, err
 	}
+	if err := engine.recordCacheUse(key, response.Evidence, true); err != nil {
+		engine.recordCacheError(err)
+		log.Printf("OCI image cache offline-import bookkeeping: %v", err)
+	}
+	if err := engine.enforceImageCache(context.WithoutCancel(ctx), "post_import"); err != nil {
+		engine.recordCacheError(err)
+		log.Printf("OCI image cache offline-import enforcement: %v", err)
+	}
 	return response, nil
 }
 
-func (engine *ContainerdEngine) importImageContent(ctx context.Context, inspection ociArchiveInspection, key imageOperationKey, file io.Reader) (EnsureImageResponse, error) {
-	operationContext, release, err := engine.imageOperationLease(engineContext(ctx), key)
-	if err != nil {
-		return EnsureImageResponse{}, classifyImageOperationError(err, inspection.TopLevel.Digest.String())
-	}
-	defer release()
+func (engine *ContainerdEngine) importImageContent(ctx context.Context, inspection ociArchiveInspection, file io.Reader) (EnsureImageResponse, error) {
 	internalReference := "wefty.local/import@" + inspection.TopLevel.Digest.String()
 	matcher := platforms.OnlyStrict(platforms.Normalize(inspection.Platform))
-	if _, err := engine.client.Import(operationContext, file,
+	if _, err := engine.client.Import(ctx, file,
 		containerd.WithImportPlatform(matcher),
 		containerd.WithImageRefTranslator(func(string) string { return internalReference }),
 	); err != nil {
 		return EnsureImageResponse{}, classifyImageOperationError(err, inspection.TopLevel.Digest.String())
 	}
-	image, evidence, err := engine.localImageForPlatform(operationContext, inspection.Reference, inspection.TopLevel.Digest.String(), matcher)
+	image, evidence, err := engine.localImageForPlatform(ctx, inspection.Reference, inspection.TopLevel.Digest.String(), matcher)
 	if err != nil {
 		return EnsureImageResponse{}, classifyImageOperationError(err, inspection.TopLevel.Digest.String())
 	}
-	if err := image.Unpack(operationContext, DefaultSnapshotter); err != nil && !errdefs.IsAlreadyExists(err) {
+	if err := image.Unpack(ctx, DefaultSnapshotter); err != nil && !errdefs.IsAlreadyExists(err) {
 		return EnsureImageResponse{}, classifyImageOperationError(err, inspection.TopLevel.Digest.String())
 	}
 	return ensureImageResponse(evidence), nil
@@ -464,8 +526,6 @@ func (engine *ContainerdEngine) imageOperationLease(ctx context.Context, key ima
 	engine.imageResourceMu.Unlock()
 	leaseContext := leases.WithLease(ctx, lease.ID)
 	return leaseContext, func() {
-		// TODO(#144): per-waiter attempt/binding pins must attach
-		// before successful singleflight waiters release this operation lease.
 		cleanupContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
 		_ = engine.client.LeasesService().Delete(cleanupContext, lease)
@@ -638,7 +698,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
 			runErr = errors.Join(runErr, verifyErr)
 			if verifyErr == nil && verification.Absent {
-				engine.releaseVerifiedAttempt(request.Authority.key())
+				runErr = errors.Join(runErr, engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()))
 				for _, port := range endpoints {
 					engine.releaseAttemptPort(port, request.Authority.key())
 				}
@@ -1077,10 +1137,14 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 		deleteErr := engine.deleteResources(cleanupCtx, request.Authority, resources)
 		verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
 		if deleteErr == nil && verifyErr == nil && verification.Absent {
-			engine.releaseVerifiedAttempt(request.Authority.key())
-			return DeleteResponse{Deleted: true}, nil
+			if releaseErr := engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()); releaseErr == nil {
+				return DeleteResponse{Deleted: true}, nil
+			} else {
+				lastErr = releaseErr
+			}
+		} else {
+			lastErr = errors.Join(deleteErr, verifyErr)
 		}
-		lastErr = errors.Join(deleteErr, verifyErr)
 		if lastErr == nil {
 			lastErr = fmt.Errorf("attempt resources remain after delete: %+v", verification.Inventory)
 		}
@@ -1265,7 +1329,7 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 		return SweepResponse{}, err
 	}
 	for _, lease := range leaseList {
-		if strings.HasPrefix(lease.ID, "wefty-image-op-") {
+		if strings.HasPrefix(lease.ID, "wefty-image-") {
 			engine.imageResourceMu.Lock()
 			_, live := engine.activeLeases[lease.ID]
 			engine.imageResourceMu.Unlock()
@@ -1448,7 +1512,36 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 	return errors.Join(failures...)
 }
 
-func (engine *ContainerdEngine) releaseVerifiedAttempt(authorityKey string) {
+func (engine *ContainerdEngine) releaseVerifiedAttempt(ctx context.Context, authorityKey string) error {
+	pinErr := engine.releaseAttemptImagePin(ctx, authorityKey)
+	engine.releaseAttemptRuntimeState(authorityKey)
+	return pinErr
+}
+
+func (engine *ContainerdEngine) releaseAttemptImagePin(ctx context.Context, authorityKey string) error {
+	engine.imageResourceMu.Lock()
+	_, pinned := engine.attemptImagePins[authorityKey]
+	leaseManager := engine.imageLeaseDeletes
+	engine.imageResourceMu.Unlock()
+	if !pinned {
+		return nil
+	}
+	if leaseManager == nil {
+		return errors.New("attempt image-pin lease manager is unavailable")
+	}
+	deleteContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	err := leaseManager.Delete(engineContext(deleteContext), leases.Lease{ID: imageHoldLeaseID("attempt", authorityKey)}, leases.SynchronousDelete)
+	if err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("release attempt image pin: %w", err)
+	}
+	engine.imageResourceMu.Lock()
+	delete(engine.attemptImagePins, authorityKey)
+	engine.imageResourceMu.Unlock()
+	return nil
+}
+
+func (engine *ContainerdEngine) releaseAttemptRuntimeState(authorityKey string) {
 	engine.mu.Lock()
 	attempt := engine.attempts[authorityKey]
 	delete(engine.attempts, authorityKey)
@@ -1471,6 +1564,11 @@ func (engine *ContainerdEngine) releaseVerifiedAttempt(authorityKey string) {
 }
 
 func (engine *ContainerdEngine) releaseVerifiedNamespace() {
+	engine.imageResourceMu.Lock()
+	engine.attemptImagePins = make(map[string]imageOperationKey)
+	engine.bindingImagePins = make(map[string]imageOperationKey)
+	engine.cacheReady = false
+	engine.imageResourceMu.Unlock()
 	engine.mu.Lock()
 	for _, attempt := range engine.attempts {
 		attempt.mu.Lock()

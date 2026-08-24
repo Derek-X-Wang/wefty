@@ -279,3 +279,37 @@ completion remain incapable of implicitly promoting the attempt. If the
 pre-Run observation is refused, no runtime resource is created; if either
 post-start mutation is refused, the adapter kills and verifies deletion of the
 real task before returning a spawn failure.
+
+Image lifetime is represented by four different holds rather than one
+overloaded reference count. The helper owns the short operation lease around
+pull/import/unpack, a boot-scoped attempt pin, a service-binding pin, and the
+evictable cache record. Every successful singleflight waiter attaches its own
+attempt pin (and service-binding pin for service-class work) before the shared
+operation lease can be released. Attempt reaping releases only the attempt pin;
+service stop/restart retains the binding pin.
+
+Before a service-class image operation starts, the agent commits the binding's
+reference, top-level digest, canonical runtime platform, and snapshotter to its
+FULL-synchronous local SQLite ledger using insert-or-compare: the first binding
+identity is immutable, and a later probe-platform mismatch fails the service
+rather than rewriting it. A newly inserted row is removed if its delivery
+terminally fails.
+
+Boot keeps OCI publication restrictive and reuses its restrictive heartbeat's
+removal directives. For every ledger row the agent obtains positive current L1
+service-binding proof; cold-empty L1 state is not proof, so unbound rows are
+deleted. The remaining ledger is sent as an absolute helper reconciliation.
+Every missing digest after an external cache wipe is automatically redelivered
+under ordinary agent image policy, followed by a second helper reconciliation
+that attaches recovered leases. Exhaustion latches the affected service and
+leaves eviction disabled. Verified
+removal releases the helper binding hold and then the local ledger row after
+runtime/data absence proof but before L1 acknowledgement; it never requests an
+image deletion.
+
+If a waiter attached its attempt pin but execution is abandoned before helper
+`Run` (platform mismatch, observation refusal, mount revalidation, or another
+pre-Run failure), `ReapAndVerify` invokes the helper's exact-authority
+idempotent pre-Run pin release. A successful helper `Run` response disarms that
+path; a helper `Run` error leaves it armed. Ordinary verified attempt deletion
+then owns both runtime cleanup and attempt-pin release after successful entry.

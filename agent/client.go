@@ -113,6 +113,22 @@ func (c *Client) Claim(ctx context.Context, nodeID, bootSessionID, class string,
 	return &claim, nil
 }
 
+func (c *Client) ProveServiceBinding(ctx context.Context, nodeID, bootSessionID, jobID string) (bool, error) {
+	var response l1.ServiceBindingProofResponse
+	err := c.post(ctx, "/v1/agent/jobs/"+url.PathEscape(jobID)+"/service-binding-proof", l1.ServiceBindingProofRequest{
+		NodeID: nodeID, BootSessionID: bootSessionID,
+	}, &response)
+	return response.Bound, err
+}
+
+func (c *Client) LatchServiceImageReconciliationFailure(ctx context.Context, nodeID, bootSessionID, jobID string, failure contract.SpawnFailure) (l1.Job, error) {
+	var job l1.Job
+	err := c.post(ctx, "/v1/agent/jobs/"+url.PathEscape(jobID)+"/image-reconciliation-failure", l1.ServiceImageReconciliationFailureRequest{
+		NodeID: nodeID, BootSessionID: bootSessionID, Failure: failure,
+	}, &job)
+	return job, err
+}
+
 func (c *Client) Renew(ctx context.Context, jobID, attemptID, fencingToken string) (l1.AttemptLease, error) {
 	var lease l1.AttemptLease
 	path := attemptPath(jobID, attemptID) + "/lease"
