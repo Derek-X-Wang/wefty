@@ -48,6 +48,7 @@ type memoryBindingPinLedger struct {
 type attemptPinState struct {
 	attached   bool
 	runEntered bool
+	sweepEpoch string
 }
 
 func newMemoryBindingPinLedger() *memoryBindingPinLedger {
@@ -905,6 +906,11 @@ func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunne
 	authority := HelperAuthority(request.Authority)
 	deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: authority})
 	if err != nil {
+		if tracked {
+			if receipt, sweepErr := adapter.reapFromReplacementSweep(request.Authority, state.sweepEpoch, err); sweepErr == nil {
+				return receipt, nil
+			}
+		}
 		return workloadrunner.ReapReceipt{}, err
 	}
 	if !deleted.Deleted {
@@ -932,7 +938,15 @@ func (adapter *Adapter) trackAttemptPin(authority workloadrunner.AttemptAuthorit
 		return
 	}
 	adapter.mu.Lock()
-	adapter.attemptPins[authority] = attemptPinState{}
+	if _, exists := adapter.attemptPins[authority]; !exists {
+		state := attemptPinState{}
+		if source, ok := adapter.sessions.(sweepReceiptSource); ok {
+			if receipt, receiptOK := source.SweepReceipt(); receiptOK {
+				state.sweepEpoch = receipt.SweepEpoch
+			}
+		}
+		adapter.attemptPins[authority] = state
+	}
 	adapter.mu.Unlock()
 }
 
@@ -942,6 +956,34 @@ func (adapter *Adapter) markAttemptPinAttached(authority workloadrunner.AttemptA
 	state.attached = true
 	adapter.attemptPins[authority] = state
 	adapter.mu.Unlock()
+}
+
+func (adapter *Adapter) reapFromReplacementSweep(authority workloadrunner.AttemptAuthority, previousEpoch string, deleteErr error) (workloadrunner.ReapReceipt, error) {
+	var rpcErr *ocihelper.RPCError
+	if previousEpoch == "" || !errors.As(deleteErr, &rpcErr) || rpcErr.Code != ocihelper.CodeUnauthorizedAttempt {
+		return workloadrunner.ReapReceipt{}, deleteErr
+	}
+	source, ok := adapter.sessions.(sweepReceiptSource)
+	if !ok {
+		return workloadrunner.ReapReceipt{}, deleteErr
+	}
+	receipt, ok := source.SweepReceipt()
+	if !ok || receipt.SweepEpoch == "" || receipt.SweepEpoch == previousEpoch ||
+		receipt.HelperSession.HelperInstanceID == "" || receipt.HelperSession.SessionGeneration == 0 {
+		return workloadrunner.ReapReceipt{}, deleteErr
+	}
+	key := fmt.Sprintf("runtime\x00%s\x00%s\x00%d\x00%s", receipt.SweepEpoch, receipt.HelperSession.HelperInstanceID, receipt.HelperSession.SessionGeneration, adapterAuthorityKey(authority))
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	if _, consumed := adapter.consumedSweepEvidence[key]; consumed {
+		return workloadrunner.ReapReceipt{}, deleteErr
+	}
+	adapter.consumedSweepEvidence[key] = struct{}{}
+	return workloadrunner.ReapReceipt{
+		RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceOCIRuntimeSweep,
+		BootSessionID: authority.BootSessionID, SweepEpoch: receipt.SweepEpoch,
+		HelperGeneration: receipt.HelperSession.SessionGeneration,
+	}, nil
 }
 
 func (adapter *Adapter) ReapPriorBoot(_ context.Context, request workloadrunner.PriorBootReapRequest) (workloadrunner.ReapReceipt, error) {

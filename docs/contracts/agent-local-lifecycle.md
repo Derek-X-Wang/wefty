@@ -157,6 +157,14 @@ positive reap receipt covers deletion and absence with the other OCI runtime
 resources. The payload sees only the reserved container path, never the
 helper source path.
 
+If helper or engine loss invalidates the attempt session, the adapter records
+the verified sweep epoch that preceded entry into `Run`. Attempt-local
+`unauthorized_attempt` after recovery is positive quiescence only when the
+current boot barrier carries a different, non-empty sweep epoch and helper
+generation; that replacement receipt is consumed once for the exact tracked
+attempt. The pre-run sweep, an unchanged epoch, and an untracked authority can
+never substitute for attempt cleanup.
+
 For a Mac OCI one-shot that needs the run bridge, the agent asks Lima itself to
 resolve `host.lima.internal`, binds only that discovered guest-visible host
 address, and injects the hostname plus the allocated port. It never binds a

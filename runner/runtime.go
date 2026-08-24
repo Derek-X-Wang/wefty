@@ -194,6 +194,7 @@ const (
 	ReapEvidenceNoRuntime         ReapEvidence = "no_runtime_resources"
 	ReapEvidencePriorBootGuardian ReapEvidence = "prior_boot_guardian"
 	ReapEvidencePriorBootOCISweep ReapEvidence = "prior_boot_oci_sweep"
+	ReapEvidenceOCIRuntimeSweep   ReapEvidence = "oci_runtime_sweep"
 )
 
 // ReapReceipt is positive evidence that runtime-owned workload state is gone.

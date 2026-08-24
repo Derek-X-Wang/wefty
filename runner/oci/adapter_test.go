@@ -180,6 +180,28 @@ func TestAdapterConsumesMatchingPriorBootSweepEvidenceOnce(t *testing.T) {
 	}
 }
 
+func TestAdapterConsumesOnlyNewerRuntimeSweepAfterSessionLoss(t *testing.T) {
+	authority := adapterTestRequest().Authority
+	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
+		SweepEpoch: "sweep-before-run", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-1", SessionGeneration: 7},
+	}}
+	adapter := NewAdapter(source)
+	unauthorized := &ocihelper.RPCError{Code: ocihelper.CodeUnauthorizedAttempt, Message: "attempt was swept"}
+	if _, err := adapter.reapFromReplacementSweep(authority, "sweep-before-run", unauthorized); err == nil {
+		t.Fatal("pre-run sweep produced attempt quiescence evidence")
+	}
+	source.receipt.SweepEpoch = "sweep-after-loss"
+	source.receipt.HelperSession.SessionGeneration = 8
+	receipt, err := adapter.reapFromReplacementSweep(authority, "sweep-before-run", unauthorized)
+	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceOCIRuntimeSweep ||
+		receipt.SweepEpoch != "sweep-after-loss" || receipt.HelperGeneration != 8 {
+		t.Fatalf("replacement sweep receipt = %+v err=%v", receipt, err)
+	}
+	if _, err := adapter.reapFromReplacementSweep(authority, "sweep-before-run", unauthorized); err == nil {
+		t.Fatal("replacement sweep receipt was reusable")
+	}
+}
+
 func TestAdapterMapsLogsExitSignalOOMAndRuntimeLoss(t *testing.T) {
 	tests := []struct {
 		name  string
