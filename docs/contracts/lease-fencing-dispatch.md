@@ -46,7 +46,8 @@ and capacity refresh commit in one transaction and never mutate
 `claims_enabled` or another durable intent field.
 
 A barrier-bound registration may request an atomic restrictive supersede. L1
-accepts it only for `boot_sweep_failed` without `kind:oci`; for a stored
+accepts it only when `kind:oci` is absent and missing with a member of the
+closed OCI-restriction reason set; for a stored
 same-text boot revision `N`, the registration transaction writes `N+1` and
 returns that authoritative observation. The agent adopts it, so startup uses
 one registration and increments `authority_generation` exactly once; a later

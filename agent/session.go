@@ -159,7 +159,7 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	// Establish node authority first, but only with a restrictive observation.
 	// The returned L1 projection is the atomic same-boot revision oracle.
 	session.capabilities.suppressOCI(
-		contract.CapabilityReasonBootSweepFailed,
+		ociBootBarrierReason(session.ociBootBarrier),
 		errors.New("OCI helper session requires a boot sweep"),
 	)
 	node, err := session.publishRegistration(ctx)
@@ -171,6 +171,9 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	}
 
 	barrierErr := session.ociBootBarrier.Ensure(ctx)
+	if barrierErr != nil {
+		session.capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), barrierErr)
+	}
 	// ADR-0002 removal recovery is independent of OCI readiness and always runs
 	// once registration authority and its restrictive N+1 are published.
 	removalErr := session.resumePendingRemovals(ctx)
@@ -227,14 +230,20 @@ func (session *agentSession) recoverOCIRuntime(ctx context.Context) (ocihelper.H
 	if session.ociBootBarrier == nil {
 		return ocihelper.HelperSession{}, session.capabilities.refresh(ctx)
 	}
+	if invalidator, ok := session.ociBootBarrier.(ociBootBarrierInvalidator); ok {
+		invalidator.Invalidate()
+	}
 	session.capabilities.suppressOCI(
-		contract.CapabilityReasonBootSweepFailed,
+		ociBootBarrierReason(session.ociBootBarrier),
 		errors.New("OCI helper session requires a new boot sweep"),
 	)
 	if _, err := session.publishCapabilityHeartbeat(ctx, nil); err != nil {
 		return ocihelper.HelperSession{}, err
 	}
 	barrierErr := session.ociBootBarrier.Ensure(ctx)
+	if barrierErr != nil {
+		session.capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), barrierErr)
+	}
 	removalErr := session.resumePendingRemovals(ctx)
 	if barrierErr != nil {
 		return ocihelper.HelperSession{}, barrierErr

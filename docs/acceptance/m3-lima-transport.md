@@ -20,9 +20,22 @@ and raw environment dumps must never enter the artifact.
   `wget`/`nc`, and distinct stdout/stderr markers;
 - one temporary host operator-mount root dedicated to this run.
 
-Do not install an autostart or agent boot unit in this ticket. Start the helper
-under the attended terminal's socket activator and record that later tickets
-still own installed units and automatic supervision.
+Ticket #152 adds the minimum installed boot topology consumed by this lane.
+Build the candidate macOS agent, its matching Linux/arm64 helper, and the
+Linux/arm64 probe OCI archive before running the private bootstrap mode. Pass
+secret-free agent arguments only; tsnet must use persisted state rather than
+an auth key in the plist or process arguments.
+
+The private `__wefty_mac_bootstrap` mode is an interim acceptance/setup seam,
+not the general `wefty node setup-oci` or doctor UI owned by later tickets. It
+requires explicit operator/home/Lima/work/log paths, the helper checksum,
+guest user and UID, probe reference/digest/archive, node ID, mount root, and
+repeatable `--agent-arg` values. `--intent-file` is optional and defaults under
+`LIMA_HOME`; bootstrap creates its initial enabled marker only when absent. It
+starts the existing configured instance,
+installs and verifies the helper and probe, then installs and starts the system
+LaunchDaemon. Record the complete command with credential values omitted from
+the artifact.
 
 ## Template and permissions
 
@@ -58,6 +71,47 @@ listeners inside the guest, first on `127.0.0.1:<port>` and then on
 the host's non-loopback addresses failing for each listener while the same
 marker succeeds from `limactl shell`; stop each listener before continuing.
 Record both addresses as `false` in the row's `dynamic_listeners` map.
+
+## Installed boot topology
+
+Before bootstrap, run `limactl autostart disable wefty-oci` if Lima autostart
+was ever enabled. Bootstrap fails closed while any
+`/Library/LaunchDaemons/io.lima-vm.daemon.*.plist`, system/user LaunchAgent, or
+loaded `io.lima-vm.autostart.*` user/gui unit remains; it never installs a
+second VM supervisor. After bootstrap, capture all of these facts:
+
+- `dev.wefty.agent` is loaded in the system launchd domain with `UserName` set
+  to the operator, absolute program/log/working paths, `RunAtLoad`, throttled
+  `KeepAlive`, and explicit `HOME`, `LIMA_HOME`, `USER`, `LOGNAME`, and `PATH`;
+- no `io.lima-vm.daemon.*` or `io.lima-vm.autostart.*` unit exists in system,
+  user, or gui domains, and the agent is the only process that invokes
+  lifecycle-changing `limactl start` or `stop --force` commands;
+- the installed Linux helper checksum equals the candidate receipt, its
+  handshake reports the candidate version and protocol major, the guest socket
+  is exactly `0660 root:wefty-oci`, and raw containerd remains unforwarded;
+- first-time guest group installation performs one ordinary VM stop/start so
+  the Lima guest agent picks up `wefty-oci`; an already-member rerun does not;
+- the probe archive imports to the recorded top-level digest through the helper
+  API and the functional create/start/wait/delete probe succeeds.
+
+Capture the atomic minimal-facts JSON named by
+`--oci-minimal-doctor-facts`. It contains only schema version, observation
+time, unit, Lima/helper/probe state, capability revision, and a stable
+sanitized reason code. It must contain no raw error, helper session capability,
+credential, or environment dump. The unit state is `launched_by_unit`, state
+values use the closed contract vocabulary, and unchanged content is not
+rewritten more frequently than the 20-second observation floor.
+
+Exercise supervision twice from a clean process-only baseline. With an enabled
+intent-file revision, stop Lima and require `stopped -> running`; inject or
+observe `Broken` and require `broken -> stopped -> running` through one bounded
+`stop --force`/capped-backoff repair. Persist a higher disabled intent-file
+revision, stop Lima, and require it to remain stopped with no recovery mutation;
+if the attended harness cannot safely write that fixture, emit structured
+NOT-RUN for `stopped_disabled_no_recovery`. During each
+outage, prove the same agent process remains alive, process work remains
+available, OCI capability is withdrawn with a higher revision, and OCI returns
+only after the helper handshake, boot sweep, and real probe.
 
 ## Runtime matrix
 
@@ -141,7 +195,22 @@ It must contain PASS evidence for `template_permissions`, `probe`,
 `task_logs_delete`, `mount_validation`, `host_to_guest`,
 `guest_to_host_primary`, `guest_to_host_fallback`, `helper_loss`, `vm_loss`,
 `sweep_before_recovery`, `dynamic_forwarding_disabled`, and
-`raw_containerd_denied`. Fold it into the tagged lane with:
+`raw_containerd_denied`.
+
+Ticket #152 additionally requires PASS rows for `launch_daemon`,
+`no_lima_autostart`, `helper_install_permissions`,
+`stopped_enabled_recovery`, `stopped_disabled_no_recovery`,
+`broken_enabled_recovery`, `process_only_degradation`, and `minimal_doctor`.
+The recovery rows include `oci_enabled` and exact `lima_states`; the permission
+row includes `socket_mode`, `socket_owner`, and `socket_group`; the launch rows
+include `launch_units`; and the doctor row embeds the redacted minimal snapshot.
+
+After capture, run the same private bootstrap with `--remove`, instance,
+`limactl`, facts, and intent paths. Preserve its JSON evidence and require the
+host unit, guest helper binary/socket/service, facts, and intent marker to be
+absent. A second removal must report the same absence without failing.
+
+Fold the complete artifact into the tagged lane with:
 
 ```sh
 WEFTY_LIMA_ACCEPTANCE_ARTIFACT=/absolute/path/to/redacted-receipt.json \

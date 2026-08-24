@@ -53,7 +53,7 @@ Capability observation and its publication barrier are independent of durable
 `claims_enabled` intent.
 
 An OCI functional probe cannot be configured without an OCI boot barrier and
-cannot run directly. Registration carries a restrictive boot-sweep observation
+cannot run directly. Registration carries a restrictive OCI observation
 and asks L1 to atomically assign stored same-boot revision `N+1`; the response
 therefore both establishes node authority and removes a stale badge without a
 second registration or authority-generation bump. Pending process-service
@@ -73,6 +73,59 @@ bounce publishes the restriction before reacquisition and runs removal recovery
 on that event path; ordinary healthy heartbeats probe without rescanning the
 filesystem. `boot_sweep_failed` is the bounded L1 reason for an incomplete
 sweep/verify/removal-resume barrier, while detailed errors remain local.
+Before a Mac reaches that helper barrier, the supervised wrapper may instead
+publish any closed OCI restriction, including `oci_intent_disabled`,
+`lima_stopped`, `lima_broken`, or `lima_start_timeout`; L1 validates the actual
+restrictive shape (`kind:oci` absent and missing) plus that reason before an
+atomic registration supersede, and the same claim barrier applies.
+
+## Mac boot supervision
+
+The macOS agent process is the only Lima supervisor. Its system LaunchDaemon
+label is `dev.wefty.agent`; launchd runs it as the operator user with absolute
+program, working, and log paths plus explicit `HOME`, `LIMA_HOME`, `USER`,
+`LOGNAME`, and `PATH`. The plist contains no Fabric credential, and a competing
+`io.lima-vm.daemon.*` system unit or `io.lima-vm.autostart.*` system/user/gui
+login unit makes installation fail before mutation.
+The system unit uses `RunAtLoad`, throttled `KeepAlive`, and the system launchd
+domain, so OCI failure cannot turn into a process-killing launchd loop.
+
+Lima supervision reads an injected, read-only revisioned OCI-intent source.
+Missing, unreadable, or malformed state is disabled. Explicit bootstrap creates
+the initial enabled marker only when no marker exists and preserves an existing
+disabled marker; Ticket #153 owns all later writes and CAS. The supervisor
+rechecks intent after every inspection and lifecycle command. Disable wins an
+intervening start or repair, leaves Lima stopped and OCI restrictive, and a
+revision change fails closed for the next cycle. While enabled, `Stopped`
+permits one bounded `limactl start`; `Broken` permits one bounded `stop --force`
+followed by capped-backoff starts within an overall deadline. Failure leaves the same
+agent process and `kind:process` capability available while OCI stays
+restrictive; a successful start still must pass helper handshake, complete
+boot sweep, removal resumption, and the functional probe before publication.
+
+One shared cycle lock covers supervisor inspection/mutation and the helper boot
+barrier, so the watchdog cannot force-stop Lima during sweep. Recovery retires
+the old helper generation, publishes the restrictive revision, then performs
+Lima recovery, handshake/sweep, probe, and pinned positive publication. Every
+`limactl` call has a command deadline and the complete inspection/start/helper
+readiness cycle has one recovery deadline. Expiry force-stops once and leaves a
+capped-backoff retry for the next cycle, including a Running VM whose helper
+never becomes ready.
+
+The interim installer has an idempotent inverse: unload/remove the host unit,
+stop/disable and remove the guest helper socket/service/binary, reload guest
+systemd, remove the minimal facts and intent marker, and emit structured
+absence evidence. Guest version replacement stops the helper socket and service
+before overwriting the binary.
+
+The #128 bootstrap facts file is an atomic operator-readable JSON snapshot,
+not a control socket or general doctor UI. It contains only schema version,
+observation time, launch unit, Lima/helper/probe state, Capability revision,
+and one stable reason code. Unit/helper/probe/instance states are closed types;
+`unit.state=launched_by_unit` is derived from the installed launch environment.
+The writer checks for content changes and polls no faster than 20 seconds. It
+never contains a raw command error, path detail,
+environment dump, credential, or opaque helper session capability.
 
 ## Workload runtime selection
 

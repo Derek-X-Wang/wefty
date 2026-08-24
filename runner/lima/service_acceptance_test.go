@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -25,15 +27,24 @@ type attendedArtifact struct {
 }
 
 type attendedResult struct {
-	Status              string            `json:"status"`
-	SessionID           string            `json:"session_id"`
-	Command             []string          `json:"command"`
-	ExitCode            int               `json:"exit_code"`
-	HelperGenerations   []uint64          `json:"helper_generations"`
-	CapabilityRevisions []int64           `json:"capability_revisions"`
-	Inventories         []json.RawMessage `json:"inventories"`
-	RoundTrip           bool              `json:"round_trip"`
-	DynamicListeners    map[string]bool   `json:"dynamic_listeners"`
+	Status              string              `json:"status"`
+	Reason              string              `json:"reason,omitempty"`
+	SessionID           string              `json:"session_id"`
+	Command             []string            `json:"command"`
+	ExitCode            int                 `json:"exit_code"`
+	HelperGenerations   []uint64            `json:"helper_generations"`
+	CapabilityRevisions []int64             `json:"capability_revisions"`
+	Inventories         []json.RawMessage   `json:"inventories"`
+	RoundTrip           bool                `json:"round_trip"`
+	DynamicListeners    map[string]bool     `json:"dynamic_listeners"`
+	LaunchUnits         []string            `json:"launch_units,omitempty"`
+	LimaStates          []InstanceState     `json:"lima_states,omitempty"`
+	OCIEnabled          *bool               `json:"oci_enabled,omitempty"`
+	ProcessAvailable    bool                `json:"process_available,omitempty"`
+	SocketMode          string              `json:"socket_mode,omitempty"`
+	SocketOwner         string              `json:"socket_owner,omitempty"`
+	SocketGroup         string              `json:"socket_group,omitempty"`
+	MinimalDoctor       *MinimalDoctorFacts `json:"minimal_doctor,omitempty"`
 }
 
 func TestServiceAcceptanceLimaTemplateValidatesWithInstalledLima(t *testing.T) {
@@ -169,9 +180,18 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 		"host_to_guest", "guest_to_host_primary", "guest_to_host_fallback",
 		"helper_loss", "vm_loss", "sweep_before_recovery",
 		"dynamic_forwarding_disabled", "raw_containerd_denied",
+		"launch_daemon", "no_lima_autostart", "helper_install_permissions",
+		"stopped_enabled_recovery", "stopped_disabled_no_recovery", "broken_enabled_recovery",
+		"process_only_degradation", "minimal_doctor",
 	}
 	for _, name := range required {
 		row, ok := artifact.Rows[name]
+		if name == "stopped_disabled_no_recovery" && ok && row.Status == "NOT-RUN" {
+			if strings.TrimSpace(row.Reason) == "" {
+				t.Fatalf("attended artifact row %q has an unsanitized empty NOT-RUN reason", name)
+			}
+			continue
+		}
 		if !ok || row.Status != "PASS" || row.SessionID != artifact.SessionID || len(row.Command) == 0 || row.ExitCode != 0 {
 			t.Fatalf("attended artifact row %q = %+v, present=%t; destination success requires PASS evidence", name, row, ok)
 		}
@@ -188,5 +208,45 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 		if len(row.HelperGenerations) < 2 || len(row.CapabilityRevisions) < 2 || len(row.Inventories) < 2 {
 			t.Fatalf("row %s lacks generation/revision/inventory transition evidence", name)
 		}
+	}
+	launch := artifact.Rows["launch_daemon"]
+	if !slices.Contains(launch.LaunchUnits, LaunchDaemonLabel) {
+		t.Fatalf("launch receipt omitted %s: %+v", LaunchDaemonLabel, launch)
+	}
+	for _, unit := range artifact.Rows["no_lima_autostart"].LaunchUnits {
+		if strings.HasPrefix(unit, "io.lima-vm.daemon.") || strings.HasPrefix(unit, "io.lima-vm.autostart.") {
+			t.Fatalf("competing Lima autostart unit present: %s", unit)
+		}
+	}
+	permissions := artifact.Rows["helper_install_permissions"]
+	if permissions.SocketMode != "0660" || permissions.SocketOwner != "root" || permissions.SocketGroup != "wefty-oci" {
+		t.Fatalf("helper permission receipt = %+v", permissions)
+	}
+	assertStateSequence(t, artifact.Rows["stopped_enabled_recovery"], InstanceStopped, InstanceRunning)
+	disabled := artifact.Rows["stopped_disabled_no_recovery"]
+	if disabled.Status == "PASS" && (disabled.OCIEnabled == nil || *disabled.OCIEnabled || !slices.Equal(disabled.LimaStates, []InstanceState{InstanceStopped})) {
+		t.Fatalf("disabled recovery receipt = %+v", disabled)
+	}
+	assertStateSequence(t, artifact.Rows["broken_enabled_recovery"], InstanceBroken, InstanceStopped, InstanceRunning)
+	degraded := artifact.Rows["process_only_degradation"]
+	if !degraded.ProcessAvailable || len(degraded.CapabilityRevisions) == 0 {
+		t.Fatalf("process-only degradation receipt = %+v", degraded)
+	}
+	doctor := artifact.Rows["minimal_doctor"].MinimalDoctor
+	if doctor == nil || doctor.Version != MinimalDoctorFactsVersion || doctor.Unit.Label != LaunchDaemonLabel || doctor.Unit.State != UnitStateLaunchedByUnit ||
+		doctor.CapabilityRevision <= 0 || doctor.Lima.Instance != DefaultInstanceName ||
+		!doctor.Lima.State.Valid() || !doctor.Helper.State.Valid() || !doctor.Probe.State.Valid() ||
+		(!doctor.ReasonCode.Valid() && doctor.ReasonCode != "") {
+		t.Fatalf("minimal doctor receipt = %+v", doctor)
+	}
+}
+
+func assertStateSequence(t *testing.T, row attendedResult, want ...InstanceState) {
+	t.Helper()
+	if !slices.Equal(row.LimaStates, want) {
+		t.Fatalf("Lima state sequence = %v, want %v", row.LimaStates, want)
+	}
+	if row.OCIEnabled == nil || !*row.OCIEnabled {
+		t.Fatalf("enabled recovery row lacks enabled intent: %+v", row)
 	}
 }

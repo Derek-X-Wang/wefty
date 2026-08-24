@@ -46,8 +46,8 @@ func AllowedPeerUIDs(value string, fallback uint32) ([]uint32, error) {
 }
 
 // RunInvocation serves the inherited listener used by the private helper
-// mode. Socket activation and installed units are intentionally left to the
-// packaging ticket.
+// mode. Mac socket activation is installed by the narrow Lima bootstrap;
+// Linux unit installation remains owned by Ticket #153.
 func RunInvocation(ctx context.Context, arguments []string, engine Engine, config ServerConfig) error {
 	if len(arguments) != 2 || arguments[1] != InvocationArg {
 		return errors.New("invalid OCI helper invocation")

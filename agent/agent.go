@@ -225,7 +225,7 @@ func New(config Config) (*Agent, error) {
 	session.ociBootBarrier = config.OCIBootBarrier
 	if session.ociBootBarrier != nil {
 		session.ociBootBarrier.SetLossHandler(func(_ ocihelper.HelperSession, lossErr error) {
-			capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, lossErr)
+			capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), lossErr)
 		})
 	}
 	if resource, ok := managedResource.(*processManagedResource); ok && resource.previousBootSessionID != "" {

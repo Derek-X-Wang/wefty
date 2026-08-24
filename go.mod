@@ -16,6 +16,7 @@ require (
 	golang.org/x/sys v0.47.0
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
 	gopkg.in/yaml.v3 v3.0.1
+	howett.net/plist v1.0.0
 	modernc.org/sqlite v1.56.0
 	tailscale.com v1.102.2
 )
