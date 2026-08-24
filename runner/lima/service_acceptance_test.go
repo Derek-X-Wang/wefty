@@ -45,6 +45,12 @@ type attendedResult struct {
 	SocketOwner         string              `json:"socket_owner,omitempty"`
 	SocketGroup         string              `json:"socket_group,omitempty"`
 	MinimalDoctor       *MinimalDoctorFacts `json:"minimal_doctor,omitempty"`
+	AttemptIDs          []string            `json:"attempt_ids"`
+	TopLevelDigests     []string            `json:"top_level_digests"`
+	PlatformDigests     []string            `json:"platform_digests"`
+	PayloadExecutions   int                 `json:"payload_executions"`
+	StdoutMarkers       []string            `json:"stdout_markers"`
+	StderrMarkers       []string            `json:"stderr_markers"`
 }
 
 var requiredAttendedRows = []string{
@@ -57,6 +63,8 @@ var requiredAttendedRows = []string{
 	"launch_daemon", "no_lima_autostart", "helper_install_permissions",
 	"stopped_enabled_recovery", "stopped_disabled_no_recovery", "broken_enabled_recovery",
 	"process_only_degradation", "minimal_doctor",
+	"oci_oneshot_run", "oci_oneshot_prestarted_loss",
+	"oci_oneshot_poststarted_loss", "oci_oneshot_rerun_identity",
 }
 
 func missingRequiredAttendedRow(rows map[string]attendedResult) string {
@@ -214,6 +222,30 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 	if !artifact.Rows["guest_to_host_primary"].RoundTrip {
 		t.Fatal("gateway row lacks a real guest round trip")
 	}
+	oneshot := artifact.Rows["oci_oneshot_run"]
+	if !oneshot.RoundTrip || oneshot.PayloadExecutions != 1 || len(oneshot.AttemptIDs) != 1 ||
+		!sameNonEmptyStrings(oneshot.TopLevelDigests) || !sameNonEmptyStrings(oneshot.PlatformDigests) ||
+		!containsString(oneshot.StdoutMarkers, "wefty-echo-once-stdout") ||
+		!containsString(oneshot.StderrMarkers, "wefty-echo-once-stderr") {
+		t.Fatalf("ordinary OCI one-shot row lacks bridge/digest/single-execution evidence: %+v", oneshot)
+	}
+	prestarted := artifact.Rows["oci_oneshot_prestarted_loss"]
+	if !prestarted.RoundTrip || prestarted.PayloadExecutions != 1 || len(prestarted.AttemptIDs) != 2 ||
+		prestarted.AttemptIDs[0] == prestarted.AttemptIDs[1] ||
+		!sameNonEmptyStrings(prestarted.TopLevelDigests) || !sameNonEmptyStrings(prestarted.PlatformDigests) {
+		t.Fatalf("pre-Started loss row lacks one requeue without duplicate payload execution: %+v", prestarted)
+	}
+	poststarted := artifact.Rows["oci_oneshot_poststarted_loss"]
+	if poststarted.PayloadExecutions != 1 || len(poststarted.AttemptIDs) != 1 ||
+		!sameNonEmptyStrings(poststarted.TopLevelDigests) || !sameNonEmptyStrings(poststarted.PlatformDigests) {
+		t.Fatalf("post-Started loss row lacks one terminal payload execution: %+v", poststarted)
+	}
+	rerun := artifact.Rows["oci_oneshot_rerun_identity"]
+	if !rerun.RoundTrip || rerun.PayloadExecutions != 2 || len(rerun.AttemptIDs) != 2 ||
+		rerun.AttemptIDs[0] == rerun.AttemptIDs[1] ||
+		!sameNonEmptyStrings(rerun.TopLevelDigests) || !sameNonEmptyStrings(rerun.PlatformDigests) {
+		t.Fatalf("OCI rerun row lacks frozen identity and distinct execution evidence: %+v", rerun)
+	}
 	dynamic := artifact.Rows["dynamic_forwarding_disabled"].DynamicListeners
 	if dynamic["127.0.0.1"] || dynamic["0.0.0.0"] || len(dynamic) != 2 {
 		t.Fatal("dynamic forwarding receipt lacks both unreachable listener proofs")
@@ -283,4 +315,25 @@ func assertStateSequence(t *testing.T, row attendedResult, want ...InstanceState
 	if row.OCIEnabled == nil || !*row.OCIEnabled {
 		t.Fatalf("enabled recovery row lacks enabled intent: %+v", row)
 	}
+}
+
+func sameNonEmptyStrings(values []string) bool {
+	if len(values) == 0 || values[0] == "" {
+		return false
+	}
+	for _, value := range values[1:] {
+		if value != values[0] {
+			return false
+		}
+	}
+	return true
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

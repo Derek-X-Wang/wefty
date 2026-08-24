@@ -304,6 +304,30 @@ func TestAdapterPumpsConstrainedMacHostBridgeFallback(t *testing.T) {
 	}
 }
 
+func TestWorkloadInputAddsHandoffOnlyForOneshot(t *testing.T) {
+	request := workloadrunner.Request{
+		Authority: workloadrunner.AttemptAuthority{WorkloadClass: contract.JobClassOneShot},
+		Execution: contract.ExecutionSpec{
+			Env: map[string]string{contract.EnvHandoffDir: contract.OCIContainerHandoffDirectory},
+			OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "ghcr.io/example/echo:latest"}},
+		},
+	}
+	input := workloadInput(request)
+	if len(input.ManagedVolumes) != 1 || input.ManagedVolumes[0].Kind != ocihelper.ManagedVolumeHandoff {
+		t.Fatalf("one-shot managed volumes = %+v, want handoff", input.ManagedVolumes)
+	}
+	if len(input.ReservedEnvironment) != 1 || input.ReservedEnvironment[0].Name != contract.EnvHandoffDir ||
+		input.ReservedEnvironment[0].Value != contract.OCIContainerHandoffDirectory {
+		t.Fatalf("one-shot reserved environment = %+v", input.ReservedEnvironment)
+	}
+
+	request.Authority.WorkloadClass = contract.JobClassService
+	input = workloadInput(request)
+	if len(input.ManagedVolumes) != 0 {
+		t.Fatalf("service managed volumes = %+v, want no one-shot handoff", input.ManagedVolumes)
+	}
+}
+
 func TestWorkloadInputMakesWeftyBridgeAndTokenHelperAuthoritative(t *testing.T) {
 	request := adapterTestRequest()
 	request.Execution.Env = map[string]string{

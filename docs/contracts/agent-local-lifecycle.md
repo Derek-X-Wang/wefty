@@ -148,6 +148,15 @@ adapter then returns a structured attempt outcome and implements
 receipt after `Run` returns and treats its absence as an `output_error`
 finalization failure before durable completion is stored.
 
+The generic agent handoff manager remains the owner of process one-shot host
+directories. An OCI one-shot does not reinterpret the forbidden flat
+`execution.handoff_directory`: after `kind=oci` selects the adapter, the
+adapter declares exactly one helper-managed `handoff` volume. The helper
+creates and mounts that attempt-owned source at `/wefty/handoff`, and its
+positive reap receipt covers deletion and absence with the other OCI runtime
+resources. The payload sees only the reserved container path, never the
+helper source path.
+
 For a Mac OCI one-shot that needs the run bridge, the agent asks Lima itself to
 resolve `host.lima.internal`, binds only that discovered guest-visible host
 address, and injects the hostname plus the allocated port. It never binds a

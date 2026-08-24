@@ -1016,6 +1016,9 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 		Argv: append([]string(nil), execution.Argv...), WorkingDirectory: workingDirectory,
 		Environment: public, SensitiveEnvironment: sensitive, ReservedEnvironment: reserved,
 	}
+	if request.Authority.WorkloadClass == contract.JobClassOneShot {
+		input.ManagedVolumes = append(input.ManagedVolumes, ocihelper.ManagedVolumeDescriptor{Kind: ocihelper.ManagedVolumeHandoff})
+	}
 	for _, mount := range execution.Mounts {
 		input.OperatorMounts = append(input.OperatorMounts, ocihelper.OperatorMount{NodePath: mount.NodePath, ContainerPath: mount.ContainerPath, ReadOnly: mount.ReadOnly})
 	}

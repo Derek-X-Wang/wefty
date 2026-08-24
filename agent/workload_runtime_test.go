@@ -142,6 +142,42 @@ func TestOCIImageFailuresSurviveFullLifecycleFinalization(t *testing.T) {
 	}
 }
 
+func TestOCIOneshotDelegatesHandoffToRuntime(t *testing.T) {
+	runtime := &captureRuntime{}
+	handoffRoot := t.TempDir()
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime},
+		handoffs: newHandoffManager(handoffRoot, time.Hour),
+		observer: newLifecycleObserver(systemClock{}),
+		clock:    systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
+	})
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "oci-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+			Execution: contract.ExecutionSpec{
+				Env: map[string]string{contract.EnvHandoffDir: contract.OCIContainerHandoffDirectory},
+				OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "ghcr.io/example/echo:latest"}},
+			},
+			Labels: map[string]string{"run_id": "run-oci"},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "oci-attempt", FencingToken: "fence-1", LeaseTTL: time.Minute},
+	}
+	result, err := lifecycle.runWorkload(t.Context(), claim)
+	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("OCI one-shot result = (%+v, %v)", result, err)
+	}
+	if got := runtime.request.Execution.Env[contract.EnvHandoffDir]; got != contract.OCIContainerHandoffDirectory {
+		t.Fatalf("OCI handoff environment = %q, want %q", got, contract.OCIContainerHandoffDirectory)
+	}
+	entries, err := os.ReadDir(handoffRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("agent created host handoff paths for OCI: %v", entries)
+	}
+}
+
 type preRunFailureRuntime struct{ code contract.SpawnFailureCode }
 
 func (runtime *preRunFailureRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
@@ -224,6 +260,24 @@ type reapRefusingRuntime struct {
 	runCalls  int
 	reapCalls int
 	request   workloadrunner.Request
+}
+
+type captureRuntime struct {
+	request workloadrunner.Request
+}
+
+func (runtime *captureRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (runtime *captureRuntime) Run(_ context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	runtime.request = request
+	exitCode := 0
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+}
+
+func (*captureRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
 }
 
 func (adapter *reapRefusingRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {

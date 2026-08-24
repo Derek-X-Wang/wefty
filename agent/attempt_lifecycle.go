@@ -342,7 +342,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	if completionFailure.err != nil {
 		return completionFailure.destination, fmt.Errorf("agent: complete attempt: %w", completionFailure.err)
 	}
-	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
+	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot && claim.Job.Spec.Kind != contract.JobKindOCI {
 		succeeded := outcome.err == nil && outcome.result.ExitCode != nil && *outcome.result.ExitCode == 0
 		if err := lifecycle.dependencies.handoffs.finish(claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
@@ -541,7 +541,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	if preflightErr != nil {
 		return finish(preflightResult.Outcome, preflightErr)
 	}
-	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
+	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot && claim.Job.Spec.Kind != contract.JobKindOCI {
 		unlock, err := lifecycle.dependencies.handoffs.lock(ctx, claim.Job.Spec)
 		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
@@ -612,7 +612,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		lifecycle.dependencies.observer.configurePortfulAttempt(claim.Lease.AttemptID)
 	}
-	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
+	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot && claim.Job.Spec.Kind != contract.JobKindOCI {
 		if err := lifecycle.dependencies.handoffs.prepare(claim.Job.Spec, lifecycle.dependencies.nodeID); err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}

@@ -74,7 +74,10 @@ jobs:
           sudo chmod 0644 /tmp/wefty-probe.oci.tar
           PROBE_NAME="${PROBE_REFERENCE%@*}"
           go build -o /tmp/wefty-agent-oci-realtiming ./cmd/wefty-agent
+          CGO_ENABLED=0 go build -o /tmp/wefty-echo-service-realtiming ./cmd/wefty-echo-service
           sudo install --owner=root --group=root --mode=0755 /tmp/wefty-agent-oci-realtiming /usr/local/libexec/wefty-agent-oci-realtiming
+          sudo install --directory --owner=root --group=root --mode=0755 /tmp/wefty-acceptance
+          sudo install --owner=root --group=root --mode=0755 /tmp/wefty-echo-service-realtiming /tmp/wefty-acceptance/wefty-echo-service
           HELPER_CHECKSUM="sha256:$(sha256sum /tmp/wefty-agent-oci-realtiming | cut -d' ' -f1)"
           AGENT_UID="$(id -u)"
           AGENT_GROUP="$(id -gn)"
@@ -98,7 +101,7 @@ jobs:
           [Service]
           Type=simple
           Environment=WEFTY_OCI_HELPER_ALLOWED_UIDS=$AGENT_UID
-          ExecStart=/usr/local/libexec/wefty-agent-oci-realtiming __wefty_oci_helper --oci-containerd-address /run/wefty-containerd/containerd.sock --oci-containerd-state-root /run/wefty-containerd/state --oci-runtime-root /var/lib/wefty/oci
+          ExecStart=/usr/local/libexec/wefty-agent-oci-realtiming __wefty_oci_helper --oci-containerd-address /run/wefty-containerd/containerd.sock --oci-containerd-state-root /run/wefty-containerd/state --oci-runtime-root /var/lib/wefty/oci --oci-allowed-mount-root /tmp/wefty-acceptance
           User=root
           Group=root
           UNIT
@@ -174,6 +177,7 @@ jobs:
             printf 'WEFTY_OCI_PROBE_REFERENCE=%s\n' "$PROBE_NAME"
             printf 'WEFTY_OCI_PROBE_DIGEST=%s\n' "$PROBE_DIGEST"
             printf 'WEFTY_OCI_PROBE_ARCHIVE=%s\n' /tmp/wefty-probe.oci.tar
+            printf 'WEFTY_OCI_ECHO_BINARY=%s\n' /tmp/wefty-acceptance/wefty-echo-service
             printf 'WEFTY_OCI_FAULT_FIFO=%s\n' /tmp/wefty-oci-faults/control
             printf 'WEFTY_OCI_FAULT_DIR=%s\n' /tmp/wefty-oci-faults
           } >> "$GITHUB_ENV"

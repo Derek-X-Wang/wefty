@@ -264,9 +264,12 @@ retries.
 image digest, optional full argv and working-directory replacements, separate
 public and sensitive operator environment, helper-managed reserved environment,
 enumerated managed volumes, operator mounts, and optional memory/CPU limits.
-The helper-managed list may contain only the exact five reserved names. A
-reserved name arriving defensively in either operator list is stripped rather
-than winning authority. Image
+The managed-volume list is closed to `handoff`, `service_data`, and
+`log_segments`; `kind=oci`, `class=one-shot` selects exactly one `handoff`
+descriptor, whose helper-owned source is mounted at `/wefty/handoff`. The
+reserved environment list is closed to the names in the run-execution-context
+contract. A reserved name arriving defensively in either operator list is
+stripped rather than winning authority. Image
 configuration, image-rootfs user/group databases, guest architecture/kernel
 facts, resolver and hosts files, translated Lima mount paths, namespace/device
 policy, and OCI JSON never cross from the agent.

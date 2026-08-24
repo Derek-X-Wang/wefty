@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -42,7 +45,8 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	reference := os.Getenv("WEFTY_OCI_PROBE_REFERENCE")
 	digest := os.Getenv("WEFTY_OCI_PROBE_DIGEST")
 	archivePath := os.Getenv("WEFTY_OCI_PROBE_ARCHIVE")
-	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" {
+	echoBinary := os.Getenv("WEFTY_OCI_ECHO_BINARY")
+	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoBinary == "" {
 		t.Fatal("Linux OCI realtiming provisioning is incomplete")
 	}
 	if os.Geteuid() == 0 {
@@ -284,6 +288,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if releasedEviction.Bytes <= 0 {
 		t.Fatalf("released attempt eviction record = %+v", releasedEviction)
 	}
+	exerciseNativeLinuxOneshotContract(t, ctx, adapter, reference, digest, echoBinary)
 
 	liveRequest := nativeAdapterRequest(reference, digest, "live-logs", []string{"/bin/sh", "-c", "printf live-before-exit; sleep 2; exit 0"})
 	liveRequest.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
@@ -468,10 +473,66 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatalf("namespace cleanup verification=%+v err=%v", verification, err)
 	}
 	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\noneshot_handoff=true\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func exerciseNativeLinuxOneshotContract(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, reference, digest, echoBinary string) {
+	t.Helper()
+	const token = "native-one-shot-token"
+	var bridgeCalls atomic.Int32
+	bridge := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		bridgeCalls.Add(1)
+		if request.Method != http.MethodGet || request.URL.Path != "/v1/runs/native-one-shot" ||
+			request.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("one-shot bridge request = %s %s authorization=%q", request.Method, request.URL.Path, request.Header.Get("Authorization"))
+			response.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer bridge.Close()
+
+	// Ticket #156 owns publishing the echo image. Until that artifact exists,
+	// execute the candidate binary from this commit in the pinned probe image
+	// through the same validated operator-mount path used by image programs.
+	request := nativeAdapterRequest(reference, digest, "one-shot-contract", []string{"/usr/local/bin/wefty-echo-service", "--once"})
+	request.Execution.OCI.Mounts = []contract.OCIMount{{
+		NodePath: echoBinary, ContainerPath: "/usr/local/bin/wefty-echo-service", ReadOnly: true,
+	}}
+	request.Execution.Env = map[string]string{
+		contract.EnvRunID: "native-one-shot", contract.EnvL3Endpoint: bridge.URL,
+		contract.EnvHandoffDir: contract.OCIContainerHandoffDirectory,
+	}
+	request.Execution.SensitiveEnv = map[string]string{contract.EnvRunToken: token}
+	started := 0
+	request.OCIStarted = func(_ context.Context, observation workloadrunner.OCIImageObservation) error {
+		started++
+		if observation.TopLevelDigest != digest || observation.PlatformManifestDigest == "" {
+			return fmt.Errorf("one-shot image evidence = %+v", observation)
+		}
+		return nil
+	}
+	var logs []contract.LogEvent
+	result, err := adapter.Run(ctx, request, workloadrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
+		logs = append(logs, event)
+		return nil
+	}))
+	if err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+		t.Fatalf("native one-shot contract result=%+v err=%v", result.Outcome, err)
+	}
+	if started != 1 || bridgeCalls.Load() != 1 {
+		t.Fatalf("native one-shot started=%d bridge_calls=%d, want exactly one each", started, bridgeCalls.Load())
+	}
+	if !containsLog(logs, contract.LogStdout, "wefty-echo-once-stdout\n") ||
+		!containsLog(logs, contract.LogStderr, "wefty-echo-once-stderr\n") {
+		t.Fatalf("native one-shot streams = %+v", logs)
+	}
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: request.Authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("native one-shot cleanup receipt=%+v err=%v", receipt, err)
 	}
 }
 
