@@ -582,6 +582,7 @@ func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapt
 	}
 	firstResult, firstRunErr := adapter.Run(ctx, firstRequest, nil)
 	requestRootFault(t, "start-containerd")
+	recoverRuntime()
 	if firstRunErr == nil || firstResult.Outcome.SpawnError == nil || firstResult.Outcome.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable {
 		t.Fatalf("pre-start engine loss = result %+v err %v", firstResult.Outcome, firstRunErr)
 	}
