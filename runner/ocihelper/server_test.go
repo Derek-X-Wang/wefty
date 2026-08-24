@@ -515,10 +515,12 @@ func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
 	}
 	_, err = session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Port: 42002})
 	assertRPCCode(t, err, CodeUnauthorizedPort)
-	port, err := session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Port: 42001})
+	dialContext, cancelDial := context.WithCancel(t.Context())
+	port, err := session.DialAttemptPort(dialContext, DialAttemptPortRequest{Authority: authority, Port: 42001})
 	if err != nil {
 		t.Fatal(err)
 	}
+	cancelDial()
 	assertStreamPayload(t, port, "attempt-port")
 
 	_, err = session.DialHostBridge(t.Context(), DialHostBridgeRequest{Authority: authority, BridgeCapability: "wrong"})
@@ -1520,7 +1522,7 @@ func (engine *fakeEngine) Sweep(context.Context, SweepRequest) (SweepResponse, e
 }
 func (engine *fakeEngine) DialAttemptPort(_ context.Context, _ DialAttemptPortRequest, stream io.ReadWriteCloser) error {
 	engine.record("DialAttemptPort")
-	_, err := io.WriteString(stream, "attempt-port")
+	_, err := stream.Write(append([]byte{attemptPortBackendReady}, []byte("attempt-port")...))
 	return err
 }
 func (engine *fakeEngine) DialHostBridge(_ context.Context, _ DialHostBridgeRequest, stream io.ReadWriteCloser) error {

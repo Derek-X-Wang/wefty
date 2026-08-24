@@ -425,11 +425,11 @@ func (session *Session) Sweep(ctx context.Context, request SweepRequest) (SweepR
 }
 
 func (session *Session) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest) (net.Conn, error) {
-	return session.openStream(ctx, MethodDialAttemptPort, request)
+	return session.openStream(ctx, MethodDialAttemptPort, request, attemptPortBackendReady)
 }
 
 func (session *Session) DialHostBridge(ctx context.Context, request DialHostBridgeRequest) (net.Conn, error) {
-	return session.openStream(ctx, MethodDialHostBridge, request)
+	return session.openStream(ctx, MethodDialHostBridge, request, 0)
 }
 
 func (session *Session) call(ctx context.Context, method Method, request, response any) error {
@@ -480,7 +480,7 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 	}
 }
 
-func (session *Session) openStream(ctx context.Context, method Method, request any) (net.Conn, error) {
+func (session *Session) openStream(ctx context.Context, method Method, request any, readyMarker byte) (net.Conn, error) {
 	connection, wire, err := session.dialRequest(ctx, method, request)
 	if err != nil {
 		return nil, err
@@ -496,9 +496,23 @@ func (session *Session) openStream(ctx context.Context, method Method, request a
 		session.markOperationFailure(ctx, err)
 		return nil, err
 	}
+	if readyMarker != 0 {
+		var marker [1]byte
+		if _, err := io.ReadFull(connection, marker[:]); err != nil {
+			_ = connection.Close()
+			return nil, fmt.Errorf("await OCI helper stream backend: %w", err)
+		}
+		if marker[0] != readyMarker {
+			_ = connection.Close()
+			return nil, errors.New("OCI helper stream returned an invalid backend-ready marker")
+		}
+	}
 	if err := connection.SetDeadline(time.Time{}); err != nil {
 		_ = connection.Close()
 		return nil, err
+	}
+	if operation, ok := connection.(*clientOperationConn); ok {
+		operation.detachContext()
 	}
 	return connection, nil
 }
@@ -580,6 +594,11 @@ func (session *Session) dialRequest(ctx context.Context, method Method, request 
 type clientOperationConn struct {
 	net.Conn
 	stop func() bool
+}
+
+func (connection *clientOperationConn) detachContext() {
+	connection.stop()
+	connection.stop = func() bool { return false }
 }
 
 func closeWrite(connection net.Conn) error {

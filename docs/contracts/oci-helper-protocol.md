@@ -169,10 +169,14 @@ heartbeats.
 | `Delete` | Exact live attempt only. A positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments; only then does the server tombstone authorization. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
-| `DialAttemptPort` | Bidirectional host-to-guest stream for exactly the port returned by that live attempt's `Run`; never a general guest dialer. |
+| `DialAttemptPort` | Bidirectional host-to-guest stream for exactly the port returned by that live attempt's `Run`; success is withheld until the helper has connected that backend, and the returned stream outlives cancellation of its dial context. It is never a general guest dialer. |
 | `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the Mac bind-failure fallback and the helper issued that attempt's separate bridge capability. It never accepts an arbitrary host address or port. |
 
 `DialAttemptPort` terminates inside the guest at `127.0.0.1:<allocated-port>`.
+The helper emits an internal backend-ready marker only after that connection is
+established, and the client consumes it before returning the opaque stream.
+This makes an agent-side connect probe cover the payload, helper session, and
+tunnel rather than merely the helper's authorization check.
 The helper holds a kernel listener through runtime-spec construction, transfers
 it directly into payload start, and retains the logical allocation until
 independent absence verification; failed verification cannot recycle the port.

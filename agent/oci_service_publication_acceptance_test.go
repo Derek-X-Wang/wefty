@@ -161,9 +161,12 @@ func startNativeOCIService(
 	endpoint := latch.endpoint()
 	service := &nativeOCIService{
 		requestAuthority: request.Authority, done: make(chan serviceRunOutcome, 1), address: address,
-		client: &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return callerFabric.Dial(ctx, "tcp", address)
-		}}},
+		client: &http.Client{
+			Timeout: time.Second,
+			Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return callerFabric.Dial(ctx, "tcp", address)
+			}},
+		},
 	}
 	service.tunnelAvailable.Store(tunnelInitiallyAvailable)
 	originalDial := endpoint.dial

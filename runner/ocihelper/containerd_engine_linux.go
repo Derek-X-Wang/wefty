@@ -1324,6 +1324,9 @@ func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request Dia
 		return fmt.Errorf("dial attempt loopback port: %w", err)
 	}
 	defer backend.Close()
+	if _, err := stream.Write([]byte{attemptPortBackendReady}); err != nil {
+		return fmt.Errorf("confirm attempt loopback connection: %w", err)
+	}
 	return Relay(ctx, stream, backend)
 }
 func (engine *ContainerdEngine) DialHostBridge(ctx context.Context, request DialHostBridgeRequest, stream io.ReadWriteCloser) error {

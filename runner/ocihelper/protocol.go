@@ -40,6 +40,10 @@ const (
 	MethodDialHostBridge  Method = "DialHostBridge"
 )
 
+// attemptPortBackendReady is emitted only after the helper has connected the
+// authorized stream to the payload's exact attempt-local loopback port.
+const attemptPortBackendReady byte = 1
+
 type ErrorCode string
 
 const (

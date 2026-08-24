@@ -449,6 +449,10 @@ func TestDialAttemptPortProxiesOnlyTheRequestedLoopbackPort(t *testing.T) {
 		engine := &ContainerdEngine{}
 		engineDone <- engine.DialAttemptPort(t.Context(), DialAttemptPortRequest{Port: backendPort}, helper)
 	}()
+	ready := make([]byte, 1)
+	if _, err := io.ReadFull(client, ready); err != nil || ready[0] != attemptPortBackendReady {
+		t.Fatalf("attempt-port backend readiness = %v, %v", ready, err)
+	}
 	if _, err := client.Write([]byte("ping")); err != nil {
 		t.Fatal(err)
 	}
