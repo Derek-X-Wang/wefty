@@ -46,8 +46,7 @@ func TestServiceRestartsAfterSuccessfulProcessExit(t *testing.T) {
 	assertManagedServiceLayout(t, harness, running, health.ServiceDirectory)
 
 	assertEcho(t, client, baseURL, []byte("echo acceptance"))
-	assertGracefulShutdown(t, harness, port, health.PID, harness.agent)
-	waitForPublicationCleared(t, harness, job.JobID, 5*time.Second)
+	assertGracefulShutdown(t, harness, job.JobID, port, health.PID, harness.agent)
 	restarted := waitForFreshRunningAttempt(t, harness, job.JobID, running.CurrentAttemptID, 5*time.Second)
 	restartedHealth := waitForHealth(t, client, baseURL, harness.agent)
 	if restartedHealth.PID == health.PID {
@@ -368,6 +367,7 @@ func assertEcho(t *testing.T, client *http.Client, baseURL string, payload []byt
 func assertGracefulShutdown(
 	t *testing.T,
 	harness *acceptanceHarness,
+	jobID string,
 	port int,
 	payloadPID int,
 	agent *managedProcess,
@@ -415,23 +415,20 @@ func assertGracefulShutdown(
 	if err := syscall.Kill(payloadPID, syscall.SIGTERM); err != nil {
 		t.Fatalf("send SIGTERM: %v", err)
 	}
-	time.Sleep(250 * time.Millisecond)
-	if err := syscall.Kill(payloadPID, 0); err != nil {
-		t.Fatalf("echo service exited before its in-flight request completed: %v\n%s", err, agent.outputString())
-	}
+	waitForPublicationCleared(t, harness, jobID, 5*time.Second)
 	if agent.exited() {
 		t.Fatalf("agent exited while the service handled SIGTERM: %v\n%s", agent.waitError(), agent.outputString())
 	}
 
-	if _, err := connection.Write(second); err != nil {
-		t.Fatalf("write second streaming echo segment after SIGTERM: %v", err)
-	}
-	actualSecond, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read streaming echo response after SIGTERM: %v", err)
-	}
-	if !bytes.Equal(actualSecond, second) {
-		t.Fatalf("second streaming echo segment = %q, want %q", actualSecond, second)
+	// Once the payload closes its listener, readiness withdrawal must sever
+	// established front-door tunnels before the clear publication completes.
+	// The backend still receives the close and can finish graceful shutdown;
+	// callers must reconnect to the replacement attempt instead of draining a
+	// connection whose publication authority has been withdrawn.
+	_, writeErr := connection.Write(second)
+	_, readErr := io.ReadAll(response.Body)
+	if writeErr == nil && readErr == nil {
+		t.Fatal("streaming tunnel survived service readiness withdrawal")
 	}
 
 	deadline := time.Now().Add(5 * time.Second)

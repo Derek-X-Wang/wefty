@@ -449,6 +449,10 @@ func TestDialAttemptPortProxiesOnlyTheRequestedLoopbackPort(t *testing.T) {
 		engine := &ContainerdEngine{}
 		engineDone <- engine.DialAttemptPort(t.Context(), DialAttemptPortRequest{Port: backendPort}, helper)
 	}()
+	ready := make([]byte, 1)
+	if _, err := io.ReadFull(client, ready); err != nil || ready[0] != attemptPortBackendReady {
+		t.Fatalf("attempt-port backend readiness = %v, %v", ready, err)
+	}
 	if _, err := client.Write([]byte("ping")); err != nil {
 		t.Fatal(err)
 	}
@@ -463,6 +467,82 @@ func TestDialAttemptPortProxiesOnlyTheRequestedLoopbackPort(t *testing.T) {
 	if err := <-engineDone; err != nil && err != context.Canceled {
 		t.Fatal(err)
 	}
+}
+
+func TestDialAttemptPortAllowsClientHalfCloseBeforeFullResponse(t *testing.T) {
+	backend, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	backendPort := uint16(backend.Addr().(*net.TCPAddr).Port)
+	requestEOF := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	go func() {
+		connection, acceptErr := backend.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		_, _ = io.ReadAll(connection)
+		close(requestEOF)
+		<-releaseResponse
+		_, _ = io.WriteString(connection, "full-response-after-request-eof")
+	}()
+
+	client, helper := tcpConnectionPair(t)
+	defer client.Close()
+	defer helper.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	engineDone := make(chan error, 1)
+	go func() {
+		engine := &ContainerdEngine{}
+		engineDone <- engine.DialAttemptPort(ctx, DialAttemptPortRequest{Port: backendPort}, &operationStream{Conn: helper, cancel: cancel})
+	}()
+	var marker [1]byte
+	if _, err := io.ReadFull(client, marker[:]); err != nil || marker[0] != attemptPortBackendReady {
+		t.Fatalf("backend marker = %v, %v", marker, err)
+	}
+	if _, err := io.WriteString(client, "request"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	<-requestEOF
+	select {
+	case <-ctx.Done():
+		t.Fatal("request EOF cancelled the helper tunnel before the response")
+	default:
+	}
+	close(releaseResponse)
+	response, err := io.ReadAll(client)
+	if err != nil || string(response) != "full-response-after-request-eof" {
+		t.Fatalf("response = %q, %v", response, err)
+	}
+	if err := <-engineDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func tcpConnectionPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan *net.TCPConn, 1)
+	go func() {
+		connection, _ := listener.AcceptTCP()
+		accepted <- connection
+	}()
+	client, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, <-accepted
 }
 
 func TestAttemptPortAllocationRemainsAttemptScopedUntilRelease(t *testing.T) {
@@ -508,7 +588,10 @@ func TestResidualVerificationRetainsPortAgainstConcurrentAllocation(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine.attempts["attempt-a"] = &containerdAttempt{attemptPort: allocated, attemptPortHold: hold}
+	engine.attempts["attempt-a"] = &containerdAttempt{
+		endpoints:     map[string]uint16{"service": allocated},
+		endpointHolds: map[string]net.Listener{"service": hold},
+	}
 	// Forced residual verification means releaseVerifiedAttempt is deliberately
 	// not called. Both logical and kernel ownership must remain unavailable.
 	if _, _, err := engine.reserveAttemptPort("attempt-b"); err == nil {

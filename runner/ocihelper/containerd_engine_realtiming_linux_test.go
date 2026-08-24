@@ -142,9 +142,13 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	requestRootFault(t, "enable-registry")
 	registryDisabled = false
 	refloat := newRefloatRegistry(t, archivePath)
-	exerciseNativeLinuxPrestartRequeue(t, ctx, adapter, refloat.reference(), refloat.originalDigest(), refloat.moveTag)
+	exerciseNativeLinuxPrestartRequeue(t, ctx, adapter, barrier, reference, digest, refloat.reference(), refloat.originalDigest(), refloat.moveTag)
 	if requests := refloat.observedTagRequests(); requests != 1 {
 		t.Fatalf("mutable tag was resolved %d times, want exactly the initial resolution", requests)
+	}
+	session, err = barrier.Session()
+	if err != nil {
+		t.Fatalf("load recovered helper session: %v", err)
 	}
 
 	liveRequest := nativeAdapterRequest(reference, digest, "live-logs", []string{"/bin/sh", "-c", "printf live-before-exit; sleep 2; exit 0"})
@@ -337,7 +341,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	}
 }
 
-func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, reference, expectedDigest string, afterResolution func()) {
+func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, barrier *ocihelper.BootBarrier, probeReference, probeDigest, reference, expectedDigest string, afterResolution func()) {
 	t.Helper()
 	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "native-prestart.sqlite"), l1.StoreOptions{
 		Jitter: func(time.Duration) time.Duration { return 10 * time.Millisecond },
@@ -386,8 +390,14 @@ func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapt
 	if firstRunErr == nil || firstResult.Outcome.SpawnError == nil || firstResult.Outcome.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable {
 		t.Fatalf("pre-start engine loss = result %+v err %v", firstResult.Outcome, firstRunErr)
 	}
-	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: firstRequest.Authority}); err != nil || !receipt.RuntimeQuiesced {
-		t.Fatalf("pre-start cleanup = receipt %+v err %v", receipt, err)
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatalf("re-establish boot barrier after pre-start engine loss: %v", err)
+	}
+	if err := adapter.Probe(ctx, firstRequest.Authority.NodeID, firstRequest.Authority.BootSessionID, probeReference, probeDigest, l1.DefaultLeaseDuration); err != nil {
+		t.Fatalf("re-probe after pre-start engine loss: %v", err)
+	}
+	if sweep, ok := barrier.SweepReceipt(); !ok || sweep.SweepEpoch == "" || sweep.HelperSession.SessionGeneration == 0 {
+		t.Fatalf("pre-start recovery omitted verified sweep evidence: %+v", sweep)
 	}
 	requeued, err := store.CompleteAttempt(ctx, "native-agent", job.JobID, first.Lease.AttemptID, l1.CompletionRequest{
 		FencingToken: first.Lease.FencingToken, IdempotencyKey: "native-prestart-loss", Result: l1.ProcessResult(firstResult.Outcome),

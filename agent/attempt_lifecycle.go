@@ -484,7 +484,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	var ociEndpointLatch *runtimeEndpointLatch
 	if portfulService && claim.Job.Spec.Kind == contract.JobKindOCI {
 		ociEndpointLatch = newRuntimeEndpointLatch()
-		request.AttemptPortRequired = true
+		request.AttemptEndpoints = []string{workloadrunner.AttemptEndpointService}
 		request.AttemptEndpointReady = ociEndpointLatch.publish
 	}
 	if claim.Job.Spec.Class == contract.JobClassService && !portfulService {
@@ -570,7 +570,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		executionSpec.Env = cloneEnvironment(executionSpec.Env)
 		executionSpec.SensitiveEnv = cloneEnvironment(executionSpec.SensitiveEnv)
 		delete(executionSpec.SensitiveEnv, contract.EnvServiceDir)
-		executionSpec.Env[contract.EnvServiceDir] = resource.dataDirectory
+		serviceDirectory := resource.dataDirectory
+		if claim.Job.Spec.Kind == contract.JobKindOCI {
+			serviceDirectory = contract.OCIContainerServiceDirectory
+		}
+		executionSpec.Env[contract.EnvServiceDir] = serviceDirectory
 	}
 	if portfulService {
 		if lifecycle.dependencies.reservePublishedPort == nil {
@@ -592,7 +596,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
 		}
 		if claim.Job.Spec.Kind == contract.JobKindOCI {
-			endpoint = ociEndpointLatch.endpoint()
+			endpoint = ociEndpointLatch.endpoint(workloadrunner.AttemptEndpointService)
 		} else {
 			var err error
 			endpoint, err = lifecycle.dependencies.prepareServiceEndpoint(ctx)

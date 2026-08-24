@@ -47,6 +47,27 @@ type attendedResult struct {
 	MinimalDoctor       *MinimalDoctorFacts `json:"minimal_doctor,omitempty"`
 }
 
+var requiredAttendedRows = []string{
+	"template_permissions", "probe", "task_logs_delete", "mount_validation",
+	"host_to_guest", "guest_to_host_primary", "guest_to_host_fallback",
+	"helper_loss", "vm_loss", "sweep_before_recovery",
+	"dynamic_forwarding_disabled", "raw_containerd_denied",
+	"service_health_echo", "service_startup_timeout", "service_withdrawal_republication",
+	"service_port_collision", "service_portless_started",
+	"launch_daemon", "no_lima_autostart", "helper_install_permissions",
+	"stopped_enabled_recovery", "stopped_disabled_no_recovery", "broken_enabled_recovery",
+	"process_only_degradation", "minimal_doctor",
+}
+
+func missingRequiredAttendedRow(rows map[string]attendedResult) string {
+	for _, name := range requiredAttendedRows {
+		if _, ok := rows[name]; !ok {
+			return name
+		}
+	}
+	return ""
+}
+
 func TestServiceAcceptanceLimaTemplateValidatesWithInstalledLima(t *testing.T) {
 	limactl, err := exec.LookPath("limactl")
 	if err != nil {
@@ -175,16 +196,10 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 	if artifact.SessionID == "" || len(artifact.Versions) == 0 {
 		t.Fatal("attended artifact omitted session or tool versions")
 	}
-	required := []string{
-		"template_permissions", "probe", "task_logs_delete", "mount_validation",
-		"host_to_guest", "guest_to_host_primary", "guest_to_host_fallback",
-		"helper_loss", "vm_loss", "sweep_before_recovery",
-		"dynamic_forwarding_disabled", "raw_containerd_denied",
-		"launch_daemon", "no_lima_autostart", "helper_install_permissions",
-		"stopped_enabled_recovery", "stopped_disabled_no_recovery", "broken_enabled_recovery",
-		"process_only_degradation", "minimal_doctor",
+	if missing := missingRequiredAttendedRow(artifact.Rows); missing != "" {
+		t.Fatalf("attended artifact omitted required row %q", missing)
 	}
-	for _, name := range required {
+	for _, name := range requiredAttendedRows {
 		row, ok := artifact.Rows[name]
 		if name == "stopped_disabled_no_recovery" && ok && row.Status == "NOT-RUN" {
 			if strings.TrimSpace(row.Reason) == "" {
@@ -238,6 +253,25 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 		!doctor.Lima.State.Valid() || !doctor.Helper.State.Valid() || !doctor.Probe.State.Valid() ||
 		(!doctor.ReasonCode.Valid() && doctor.ReasonCode != "") {
 		t.Fatalf("minimal doctor receipt = %+v", doctor)
+	}
+}
+
+func TestServiceAcceptanceAttendedArtifactRejectsMissingServiceRows(t *testing.T) {
+	rows := make(map[string]attendedResult, len(requiredAttendedRows))
+	for _, name := range requiredAttendedRows {
+		rows[name] = attendedResult{}
+	}
+	for _, name := range []string{
+		"service_health_echo", "service_startup_timeout", "service_withdrawal_republication",
+		"service_port_collision", "service_portless_started",
+	} {
+		t.Run(name, func(t *testing.T) {
+			delete(rows, name)
+			if missing := missingRequiredAttendedRow(rows); missing != name {
+				t.Fatalf("missing row = %q, want %q", missing, name)
+			}
+			rows[name] = attendedResult{}
+		})
 	}
 }
 

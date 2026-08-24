@@ -425,11 +425,11 @@ func (session *Session) Sweep(ctx context.Context, request SweepRequest) (SweepR
 }
 
 func (session *Session) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest) (net.Conn, error) {
-	return session.openStream(ctx, MethodDialAttemptPort, request)
+	return session.openStream(ctx, MethodDialAttemptPort, request, attemptPortBackendReady, true)
 }
 
 func (session *Session) DialHostBridge(ctx context.Context, request DialHostBridgeRequest) (net.Conn, error) {
-	return session.openStream(ctx, MethodDialHostBridge, request)
+	return session.openStream(ctx, MethodDialHostBridge, request, 0, false)
 }
 
 func (session *Session) call(ctx context.Context, method Method, request, response any) error {
@@ -480,7 +480,7 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 	}
 }
 
-func (session *Session) openStream(ctx context.Context, method Method, request any) (net.Conn, error) {
+func (session *Session) openStream(ctx context.Context, method Method, request any, readyMarker byte, detachSuccessful bool) (net.Conn, error) {
 	connection, wire, err := session.dialRequest(ctx, method, request)
 	if err != nil {
 		return nil, err
@@ -496,12 +496,44 @@ func (session *Session) openStream(ctx context.Context, method Method, request a
 		session.markOperationFailure(ctx, err)
 		return nil, err
 	}
+	if readyMarker != 0 {
+		var marker [1]byte
+		if _, err := io.ReadFull(connection, marker[:]); err != nil {
+			_ = connection.Close()
+			err = fmt.Errorf("await OCI helper stream backend: %w", err)
+			session.markOperationFailure(ctx, err)
+			return nil, err
+		}
+		if marker[0] != readyMarker {
+			_ = connection.Close()
+			return nil, errors.New("OCI helper stream returned an invalid backend-ready marker")
+		}
+	}
 	if err := connection.SetDeadline(time.Time{}); err != nil {
 		_ = connection.Close()
 		return nil, err
 	}
+	if detachSuccessful {
+		operation, ok := connection.(*clientOperationConn)
+		if !ok {
+			_ = connection.Close()
+			return nil, errors.New("OCI helper stream operation wrapper is missing")
+		}
+		if err := operation.detachSetupContext(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return connection, nil
 }
+
+// StreamSetupCancelledError means cancellation won the race with detaching a
+// successfully authorized attempt-port stream from its setup context.
+type StreamSetupCancelledError struct{ Cause error }
+
+func (err *StreamSetupCancelledError) Error() string {
+	return "OCI helper stream setup was cancelled: " + err.Cause.Error()
+}
+func (err *StreamSetupCancelledError) Unwrap() error { return err.Cause }
 
 func (session *Session) markStaleResponse(err error) {
 	var rpcErr *RPCError
@@ -580,6 +612,18 @@ func (session *Session) dialRequest(ctx context.Context, method Method, request 
 type clientOperationConn struct {
 	net.Conn
 	stop func() bool
+}
+
+func (connection *clientOperationConn) detachSetupContext(ctx context.Context) error {
+	if connection.stop() {
+		return nil
+	}
+	_ = connection.Close()
+	cause := ctx.Err()
+	if cause == nil {
+		cause = context.Canceled
+	}
+	return &StreamSetupCancelledError{Cause: cause}
 }
 
 func closeWrite(connection net.Conn) error {

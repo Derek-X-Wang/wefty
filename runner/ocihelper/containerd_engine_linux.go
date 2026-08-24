@@ -67,8 +67,8 @@ type containerdAttempt struct {
 	deleted         bool
 	logAcknowledged map[string]uint64
 	hostBridge      net.Listener
-	attemptPort     uint16
-	attemptPortHold net.Listener
+	endpoints       map[string]uint16
+	endpointHolds   map[string]net.Listener
 	mu              sync.Mutex
 }
 
@@ -622,12 +622,15 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	leaseContext := leases.WithLease(ctx, lease.ID)
 	created := true
 	var hostBridge net.Listener
-	var attemptPort uint16
-	var attemptPortHold net.Listener
+	endpoints := make(map[string]uint16, len(request.AllocateEndpoints))
+	endpointHolds := make(map[string]net.Listener, len(request.AllocateEndpoints))
 	defer func() {
 		if runErr != nil && created {
 			if hostBridge != nil {
 				_ = hostBridge.Close()
+			}
+			for _, hold := range endpointHolds {
+				_ = hold.Close()
 			}
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			defer cancel()
@@ -636,16 +639,24 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			runErr = errors.Join(runErr, verifyErr)
 			if verifyErr == nil && verification.Absent {
 				engine.releaseVerifiedAttempt(request.Authority.key())
+				for _, port := range endpoints {
+					engine.releaseAttemptPort(port, request.Authority.key())
+				}
 			}
 		}
 	}()
-	if request.AllocateAttemptPort {
-		attemptPort, attemptPortHold, err = engine.reserveAttemptPort(request.Authority.key())
+	for _, name := range request.AllocateEndpoints {
+		port, hold, reserveErr := engine.reserveAttemptPort(request.Authority.key())
+		err = reserveErr
 		if err != nil {
 			return RunResponse{}, err
 		}
+		endpoints[name] = port
+		endpointHolds[name] = hold
+	}
+	if servicePort := endpoints["service"]; servicePort != 0 {
 		request.Workload.ReservedEnvironment = setReservedEnvironment(
-			request.Workload.ReservedEnvironment, contract.EnvServicePort, fmt.Sprint(attemptPort),
+			request.Workload.ReservedEnvironment, contract.EnvServicePort, fmt.Sprint(servicePort),
 		)
 	}
 	if request.EnableHostBridgeFallback {
@@ -739,7 +750,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		attemptCancel()
 		return RunResponse{}, fmt.Errorf("register task Wait before Start: %w", err)
 	}
-	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, container: container, task: task, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, attemptPort: attemptPort, attemptPortHold: attemptPortHold}
+	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, container: container, task: task, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds}
 	engine.watchOOM(attempt)
 	engine.mu.Lock()
 	engine.attempts[request.Authority.key()] = attempt
@@ -750,28 +761,20 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	}
 	// Transfer the kernel reservation directly into Start. The logical
 	// authority remains retained until independently verified deletion.
-	if attemptPortHold != nil {
-		if err := attemptPortHold.Close(); err != nil {
-			return RunResponse{}, fmt.Errorf("transfer attempt port reservation: %w", err)
+	for name, hold := range endpointHolds {
+		if err := hold.Close(); err != nil {
+			return RunResponse{}, fmt.Errorf("transfer attempt endpoint %q reservation: %w", name, err)
 		}
-		attemptPortHold = nil
+		delete(endpointHolds, name)
 		attempt.mu.Lock()
-		attempt.attemptPortHold = nil
+		delete(attempt.endpointHolds, name)
 		attempt.mu.Unlock()
 	}
 	if err := task.Start(leaseContext); err != nil {
 		return RunResponse{}, fmt.Errorf("start runc v2 task: %w", err)
 	}
-	if attemptPort != 0 {
-		bindContext, cancelBind := context.WithTimeout(leaseContext, engine.config.AttemptPortBindTimeout)
-		err = engine.waitAttemptPortOwnership(bindContext, request.Resources.CgroupID, attemptPort)
-		cancelBind()
-		if err != nil {
-			return RunResponse{}, fmt.Errorf("verify payload attempt-port ownership: %w", err)
-		}
-	}
 	created = false
-	return RunResponse{Started: true, Image: &evidence, AttemptPort: attemptPort, HostBridgeReady: hostBridge != nil}, nil
+	return RunResponse{Started: true, Image: &evidence, Endpoints: endpoints, HostBridgeReady: hostBridge != nil}, nil
 }
 
 func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cgroupID string, port uint16) error {
@@ -1318,12 +1321,23 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 }
 
 func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
+	if request.CgroupID != "" {
+		bindContext, cancelBind := context.WithTimeout(ctx, engine.config.AttemptPortBindTimeout)
+		err := engine.waitAttemptPortOwnership(bindContext, request.CgroupID, request.Port)
+		cancelBind()
+		if err != nil {
+			return fmt.Errorf("verify payload attempt endpoint ownership: %w", err)
+		}
+	}
 	dialer := &net.Dialer{}
 	backend, err := dialer.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(request.Port)))
 	if err != nil {
 		return fmt.Errorf("dial attempt loopback port: %w", err)
 	}
 	defer backend.Close()
+	if _, err := stream.Write([]byte{attemptPortBackendReady}); err != nil {
+		return fmt.Errorf("confirm attempt loopback connection: %w", err)
+	}
 	return Relay(ctx, stream, backend)
 }
 func (engine *ContainerdEngine) DialHostBridge(ctx context.Context, request DialHostBridgeRequest, stream io.ReadWriteCloser) error {
@@ -1384,9 +1398,9 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 			_ = attempt.hostBridge.Close()
 			attempt.hostBridge = nil
 		}
-		if attempt.attemptPortHold != nil {
-			_ = attempt.attemptPortHold.Close()
-			attempt.attemptPortHold = nil
+		for name, hold := range attempt.endpointHolds {
+			_ = hold.Close()
+			delete(attempt.endpointHolds, name)
 		}
 		attempt.mu.Unlock()
 		if attempt.oomCancel != nil {
@@ -1440,14 +1454,18 @@ func (engine *ContainerdEngine) releaseVerifiedAttempt(authorityKey string) {
 	delete(engine.attempts, authorityKey)
 	if attempt != nil {
 		attempt.mu.Lock()
-		if attempt.attemptPortHold != nil {
-			_ = attempt.attemptPortHold.Close()
-			attempt.attemptPortHold = nil
+		for name, hold := range attempt.endpointHolds {
+			_ = hold.Close()
+			delete(attempt.endpointHolds, name)
 		}
 		attempt.mu.Unlock()
 	}
-	if attempt != nil && engine.ports[attempt.attemptPort] == authorityKey {
-		delete(engine.ports, attempt.attemptPort)
+	if attempt != nil {
+		for _, port := range attempt.endpoints {
+			if engine.ports[port] == authorityKey {
+				delete(engine.ports, port)
+			}
+		}
 	}
 	engine.mu.Unlock()
 }
@@ -1456,8 +1474,8 @@ func (engine *ContainerdEngine) releaseVerifiedNamespace() {
 	engine.mu.Lock()
 	for _, attempt := range engine.attempts {
 		attempt.mu.Lock()
-		if attempt.attemptPortHold != nil {
-			_ = attempt.attemptPortHold.Close()
+		for _, hold := range attempt.endpointHolds {
+			_ = hold.Close()
 		}
 		attempt.mu.Unlock()
 	}

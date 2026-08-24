@@ -18,6 +18,8 @@ import (
 
 const (
 	// ProtocolVersion is the only wire major accepted by this implementation.
+	// The helper executable checksum pins the exact minor shape within this
+	// major, so an in-place wire change still fails closed at session setup.
 	ProtocolVersion = 1
 	InvocationArg   = "__wefty_oci_helper"
 	// MaxFrameBytes bounds every decoded request, response, and stream event.
@@ -39,6 +41,10 @@ const (
 	MethodDialAttemptPort Method = "DialAttemptPort"
 	MethodDialHostBridge  Method = "DialHostBridge"
 )
+
+// attemptPortBackendReady is emitted only after the helper has connected the
+// authorized stream to the payload's exact attempt-local loopback port.
+const attemptPortBackendReady byte = 1
 
 type ErrorCode string
 
@@ -314,7 +320,7 @@ type WorkloadLimits struct {
 type RunRequest struct {
 	Authority                AttemptAuthority `json:"authority"`
 	InitialDeadman           time.Duration    `json:"initial_deadman"`
-	AllocateAttemptPort      bool             `json:"allocate_attempt_port,omitempty"`
+	AllocateEndpoints        []string         `json:"allocate_endpoints,omitempty"`
 	EnableHostBridgeFallback bool             `json:"enable_host_bridge_fallback,omitempty"`
 	Workload                 WorkloadInput    `json:"workload"`
 	// Resources is helper-derived after decoding. It cannot be supplied over
@@ -324,11 +330,11 @@ type RunRequest struct {
 }
 
 type RunResponse struct {
-	Started          bool           `json:"started"`
-	Image            *ImageEvidence `json:"image,omitempty"`
-	AttemptPort      uint16         `json:"attempt_port,omitempty"`
-	HostBridgeReady  bool           `json:"host_bridge_ready,omitempty"`
-	BridgeCapability string         `json:"bridge_capability,omitempty"`
+	Started          bool              `json:"started"`
+	Image            *ImageEvidence    `json:"image,omitempty"`
+	Endpoints        map[string]uint16 `json:"endpoints,omitempty"`
+	HostBridgeReady  bool              `json:"host_bridge_ready,omitempty"`
+	BridgeCapability string            `json:"bridge_capability,omitempty"`
 }
 
 // ImageEvidence is produced from the local immutable image selected by the
@@ -494,7 +500,10 @@ type VerifiedSweepReceipt struct {
 
 type DialAttemptPortRequest struct {
 	Authority AttemptAuthority `json:"authority"`
-	Port      uint16           `json:"port"`
+	Name      string           `json:"name"`
+	// Port is helper-derived after authorization and never decoded from the wire.
+	Port     uint16 `json:"-"`
+	CgroupID string `json:"-"`
 }
 
 type DialHostBridgeRequest struct {

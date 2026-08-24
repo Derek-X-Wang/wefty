@@ -493,7 +493,7 @@ func TestAttemptDeadmanUsesGuardianReaper(t *testing.T) {
 
 func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
 	engine := newFakeEngine()
-	engine.setRunResponse(RunResponse{Started: true, AttemptPort: 42001, HostBridgeReady: true})
+	engine.setRunResponse(RunResponse{Started: true, Endpoints: map[string]uint16{"service": 42001}, HostBridgeReady: true})
 	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
 	defer stop()
 	session, err := client.OpenSession(t.Context(), testSessionRequest())
@@ -504,7 +504,7 @@ func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
 	requireSweep(t, session)
 	authority := testAuthority()
 	request := testRunRequest(authority, time.Second)
-	request.AllocateAttemptPort = true
+	request.AllocateEndpoints = []string{"service"}
 	request.EnableHostBridgeFallback = true
 	run, err := session.Run(t.Context(), request)
 	if err != nil {
@@ -513,12 +513,14 @@ func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
 	if run.BridgeCapability == "" {
 		t.Fatal("authorized Mac fallback did not receive an opaque bridge capability")
 	}
-	_, err = session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Port: 42002})
+	_, err = session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Name: "missing"})
 	assertRPCCode(t, err, CodeUnauthorizedPort)
-	port, err := session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Port: 42001})
+	dialContext, cancelDial := context.WithCancel(t.Context())
+	port, err := session.DialAttemptPort(dialContext, DialAttemptPortRequest{Authority: authority, Name: "service"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	cancelDial()
 	assertStreamPayload(t, port, "attempt-port")
 
 	_, err = session.DialHostBridge(t.Context(), DialHostBridgeRequest{Authority: authority, BridgeCapability: "wrong"})
@@ -528,6 +530,110 @@ func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertStreamPayload(t, bridge, "host-bridge")
+}
+
+func TestNamedEndpointAuthorizationResolvesOnlyTheRequestedName(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runResponse = RunResponse{Started: true, Endpoints: map[string]uint16{"view": 42011, "control": 42012}}
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.AllocateEndpoints = []string{"view", "control"}
+	if _, err := session.Run(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: request.Authority, Name: "control"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStreamPayload(t, stream, "attempt-port")
+	engine.mu.Lock()
+	dial := engine.lastDialAttemptRequest
+	engine.mu.Unlock()
+	if dial.Name != "control" || dial.Port != 42012 || dial.CgroupID == "" {
+		t.Fatalf("engine dial request = %+v", dial)
+	}
+}
+
+func TestAttemptPortMarkerFailureInvalidatesSession(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runResponse = RunResponse{Started: true, Endpoints: map[string]uint16{"service": 42001}}
+	engine.dialAttemptWithoutMarker = true
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.AllocateEndpoints = []string{"service"}
+	if _, err := session.Run(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: request.Authority, Name: "service"}); err == nil {
+		t.Fatal("attempt-port marker EOF returned nil error")
+	}
+	if err := session.HealthError(); err == nil {
+		t.Fatal("attempt-port marker transport failure did not invalidate the session")
+	}
+}
+
+func TestHostBridgeStreamRemainsCoupledToDialContext(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runResponse = RunResponse{Started: true, HostBridgeReady: true}
+	engine.dialHostBridgeRead = true
+	engine.dialHostBridgeDone = make(chan struct{})
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.EnableHostBridgeFallback = true
+	run, err := session.Run(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialContext, cancel := context.WithCancel(t.Context())
+	stream, err := session.DialHostBridge(dialContext, DialHostBridgeRequest{Authority: request.Authority, BridgeCapability: run.BridgeCapability})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	defer stream.Close()
+	select {
+	case <-engine.dialHostBridgeDone:
+	case <-time.After(time.Second):
+		t.Fatal("DialHostBridge cancellation did not clean up the engine stream")
+	}
+}
+
+func TestAttemptPortSetupCancellationReturnsTypedError(t *testing.T) {
+	client, server := net.Pipe()
+	ctx, cancel := context.WithCancel(t.Context())
+	operation := &clientOperationConn{Conn: client}
+	operation.stop = context.AfterFunc(ctx, func() { _ = client.Close() })
+	cancel()
+	_ = server.SetReadDeadline(time.Now().Add(time.Second))
+	var buffer [1]byte
+	_, _ = server.Read(buffer[:])
+	defer server.Close()
+	err := operation.detachSetupContext(ctx)
+	var cancelled *StreamSetupCancelledError
+	if !errors.As(err, &cancelled) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("setup cancellation error = %T %v", err, err)
+	}
 }
 
 func TestSweepSerializesAgainstAttemptCreation(t *testing.T) {
@@ -1174,21 +1280,25 @@ func assertStreamPayload(t *testing.T, connection net.Conn, expected string) {
 }
 
 type fakeEngine struct {
-	mu              sync.Mutex
-	calls           []string
-	sessionReaps    []SessionIdentity
-	attemptReaps    []AttemptAuthority
-	runResponse     RunResponse
-	lastRunRequest  RunRequest
-	runErr          error
-	runEntered      chan struct{}
-	releaseRun      chan struct{}
-	sweepEntered    chan struct{}
-	releaseSweep    chan struct{}
-	signalEntered   chan struct{}
-	releaseSignal   chan struct{}
-	sessionReapErr  error
-	verifyResponses []VerifyResponse
+	mu                       sync.Mutex
+	calls                    []string
+	sessionReaps             []SessionIdentity
+	attemptReaps             []AttemptAuthority
+	runResponse              RunResponse
+	lastRunRequest           RunRequest
+	runErr                   error
+	runEntered               chan struct{}
+	releaseRun               chan struct{}
+	sweepEntered             chan struct{}
+	releaseSweep             chan struct{}
+	signalEntered            chan struct{}
+	releaseSignal            chan struct{}
+	sessionReapErr           error
+	verifyResponses          []VerifyResponse
+	dialAttemptWithoutMarker bool
+	dialHostBridgeRead       bool
+	dialHostBridgeDone       chan struct{}
+	lastDialAttemptRequest   DialAttemptPortRequest
 }
 
 type blockingWatchEngine struct {
@@ -1518,13 +1628,24 @@ func (engine *fakeEngine) Sweep(context.Context, SweepRequest) (SweepResponse, e
 	engine.record("Sweep")
 	return SweepResponse{Removed: 1}, nil
 }
-func (engine *fakeEngine) DialAttemptPort(_ context.Context, _ DialAttemptPortRequest, stream io.ReadWriteCloser) error {
+func (engine *fakeEngine) DialAttemptPort(_ context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
 	engine.record("DialAttemptPort")
-	_, err := io.WriteString(stream, "attempt-port")
+	engine.mu.Lock()
+	engine.lastDialAttemptRequest = request
+	engine.mu.Unlock()
+	if engine.dialAttemptWithoutMarker {
+		return nil
+	}
+	_, err := stream.Write(append([]byte{attemptPortBackendReady}, []byte("attempt-port")...))
 	return err
 }
 func (engine *fakeEngine) DialHostBridge(_ context.Context, _ DialHostBridgeRequest, stream io.ReadWriteCloser) error {
 	engine.record("DialHostBridge")
+	if engine.dialHostBridgeRead {
+		_, err := io.Copy(io.Discard, stream)
+		close(engine.dialHostBridgeDone)
+		return err
+	}
 	_, err := io.WriteString(stream, "host-bridge")
 	return err
 }

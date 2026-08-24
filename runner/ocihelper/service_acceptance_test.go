@@ -19,9 +19,9 @@ func TestServiceAcceptanceHelperAuthorityFailsClosed(t *testing.T) {
 	}
 	authority := testAuthority()
 	requireSweep(t, session)
-	engine.setRunResponse(RunResponse{Started: true, AttemptPort: 42101, HostBridgeReady: true})
+	engine.setRunResponse(RunResponse{Started: true, Endpoints: map[string]uint16{"service": 42101}, HostBridgeReady: true})
 	request := testRunRequest(authority, 2*time.Second)
-	request.AllocateAttemptPort = true
+	request.AllocateEndpoints = []string{"service"}
 	request.EnableHostBridgeFallback = true
 	run, err := session.Run(t.Context(), request)
 	if err != nil {
@@ -30,7 +30,7 @@ func TestServiceAcceptanceHelperAuthorityFailsClosed(t *testing.T) {
 	if run.BridgeCapability == "" {
 		t.Fatal("Mac fallback did not receive attempt-scoped authority")
 	}
-	_, err = session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Port: 42102})
+	_, err = session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Name: "missing"})
 	assertRPCCode(t, err, CodeUnauthorizedPort)
 	_, err = session.DialHostBridge(t.Context(), DialHostBridgeRequest{Authority: authority, BridgeCapability: "not-authorized"})
 	assertRPCCode(t, err, CodeUnauthorizedBridge)

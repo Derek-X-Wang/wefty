@@ -126,9 +126,9 @@ func (adapter *Adapter) LoadImage(ctx context.Context, reference string, archive
 	return response, nil
 }
 
-// DialAttemptPort exposes the helper's exact-authority host-to-guest stream to
-// the agent-side readiness/front-door seam. It is never a general guest dialer.
-func (adapter *Adapter) DialAttemptPort(ctx context.Context, authority workloadrunner.AttemptAuthority, port uint16) (net.Conn, error) {
+// DialAttemptPort exposes one named exact-authority host-to-guest stream to the
+// agent-side readiness/front-door seam. It is never a general guest dialer.
+func (adapter *Adapter) DialAttemptPort(ctx context.Context, authority workloadrunner.AttemptAuthority, name string) (net.Conn, error) {
 	if adapter == nil || adapter.sessions == nil {
 		return nil, errors.New("OCI helper session is not configured")
 	}
@@ -136,7 +136,7 @@ func (adapter *Adapter) DialAttemptPort(ctx context.Context, authority workloadr
 	if err != nil {
 		return nil, err
 	}
-	return session.DialAttemptPort(ctx, ocihelper.DialAttemptPortRequest{Authority: HelperAuthority(authority), Port: port})
+	return session.DialAttemptPort(ctx, ocihelper.DialAttemptPortRequest{Authority: HelperAuthority(authority), Name: name})
 }
 
 type sweepReceiptSource interface {
@@ -287,7 +287,7 @@ func (adapter *Adapter) Preflight(_ context.Context, request workloadrunner.Requ
 			_ = guard.Close()
 		}
 	}
-	if request.AttemptPortRequired && request.AttemptEndpointReady == nil {
+	if len(request.AttemptEndpoints) > 0 && request.AttemptEndpointReady == nil {
 		return failedAdmission(admission, contract.SpawnFailureProcessRequest, errors.New("OCI attempt endpoint callback is required for portful work"))
 	}
 	return admission, workloadrunner.Result{}, nil
@@ -350,7 +350,7 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	adapter.markRunEntered(request.Authority, true)
 	runResponse, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: authority, InitialDeadman: request.InitialDeadman,
-		AllocateAttemptPort:      request.AttemptPortRequired,
+		AllocateEndpoints:        request.AttemptEndpoints,
 		EnableHostBridgeFallback: request.HostBridgeDial != nil,
 		Workload:                 workloadInput(request),
 	})
@@ -375,22 +375,30 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		_ = reapAfterFailedStart(session, authority)
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
-	if request.AttemptPortRequired {
-		if runResponse.AttemptPort == 0 {
-			err := errors.New("OCI helper omitted the requested attempt port")
+	if len(request.AttemptEndpoints) > 0 {
+		if len(runResponse.Endpoints) != len(request.AttemptEndpoints) {
+			err := errors.New("OCI helper omitted the requested attempt endpoints")
 			_ = reapAfterFailedStart(session, authority)
 			return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 		}
-		port := runResponse.AttemptPort
-		endpoint := workloadrunner.AttemptEndpoint{Port: port, Dial: func(dialContext context.Context) (net.Conn, error) {
-			return adapter.DialAttemptPort(dialContext, request.Authority, port)
-		}}
-		if err := request.AttemptEndpointReady(endpoint); err != nil {
-			_ = reapAfterFailedStart(session, authority)
-			return spawnResult(contract.SpawnFailureProcessRequest, err), err
+		for _, name := range request.AttemptEndpoints {
+			port := runResponse.Endpoints[name]
+			if port == 0 {
+				err := fmt.Errorf("OCI helper omitted requested attempt endpoint %q", name)
+				_ = reapAfterFailedStart(session, authority)
+				return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+			}
+			endpointName := name
+			endpoint := workloadrunner.AttemptEndpoint{Port: port, Dial: func(dialContext context.Context) (net.Conn, error) {
+				return adapter.DialAttemptPort(dialContext, request.Authority, endpointName)
+			}}
+			if err := request.AttemptEndpointReady(name, endpoint); err != nil {
+				_ = reapAfterFailedStart(session, authority)
+				return spawnResult(contract.SpawnFailureProcessRequest, err), err
+			}
 		}
-	} else if runResponse.AttemptPort != 0 {
-		err := errors.New("OCI helper returned an unrequested attempt port")
+	} else if len(runResponse.Endpoints) != 0 {
+		err := errors.New("OCI helper returned unrequested attempt endpoints")
 		_ = reapAfterFailedStart(session, authority)
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
