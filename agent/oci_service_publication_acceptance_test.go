@@ -150,7 +150,7 @@ func startNativeOCIService(
 	network := plain.NewNetwork()
 	frontDoorFabric := network.NewFabric(fabric.Identity{NodeID: "service-node-" + suffix})
 	callerFabric := network.NewFabric(fabric.Identity{NodeID: "service-caller-" + suffix})
-	address := "wefty://oci-service-" + suffix
+	address := "wefty://node/oci-service-" + suffix
 	listener, err := frontDoorFabric.Listen("tcp", address)
 	if err != nil {
 		t.Fatal(err)

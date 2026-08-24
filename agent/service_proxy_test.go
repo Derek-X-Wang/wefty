@@ -324,6 +324,7 @@ func TestOpaqueRuntimeTunnelLossWithdrawsAndRepublishesWithoutKilling(t *testing
 	available.Store(true)
 	runtime := &opaqueEndpointRuntime{release: make(chan struct{})}
 	dialer := &net.Dialer{}
+	readiness := make(chan bool, 4)
 	finished := make(chan serviceRunOutcome, 1)
 	go func() {
 		result, runErr := runPortfulService(
@@ -338,15 +339,22 @@ func TestOpaqueRuntimeTunnelLossWithdrawsAndRepublishesWithoutKilling(t *testing
 				clock: clock, startupReadinessDeadline: 10 * time.Second,
 				readinessProbeInterval: time.Second, readinessConnectTimeout: time.Second,
 				publicationRecoveryWindow: 10 * time.Second,
+				onReadiness:               func(_ bool, ready bool) { readiness <- ready },
 			},
 		)
 		finished <- serviceRunOutcome{result: result, err: runErr}
 	}()
 
 	waitForPublishedEcho(t, listener.Addr().String(), true)
+	if ready := waitReadinessState(t, readiness); !ready {
+		t.Fatal("opaque endpoint did not report initial readiness")
+	}
 	available.Store(false)
 	clock.waitForDeadline(t, clock.Now().Add(time.Second))
 	clock.Advance(time.Second)
+	if ready := waitReadinessState(t, readiness); ready {
+		t.Fatal("opaque endpoint did not report tunnel loss")
+	}
 	waitForPublishedEcho(t, listener.Addr().String(), false)
 	select {
 	case outcome := <-finished:
@@ -357,6 +365,9 @@ func TestOpaqueRuntimeTunnelLossWithdrawsAndRepublishesWithoutKilling(t *testing
 	available.Store(true)
 	clock.waitForDeadline(t, clock.Now().Add(time.Second))
 	clock.Advance(time.Second)
+	if ready := waitReadinessState(t, readiness); !ready {
+		t.Fatal("opaque endpoint did not report tunnel recovery")
+	}
 	clock.waitForDeadline(t, clock.Now().Add(10*time.Second))
 	clock.Advance(10 * time.Second)
 	waitForPublishedEcho(t, listener.Addr().String(), true)
