@@ -175,8 +175,19 @@ kind-specific executable.
 `ServiceAddress` remains only for the process readiness guardian. A portful OCI
 request instead asks its adapter for an `AttemptEndpoint`: the helper allocates
 the guest loopback port and the adapter returns an exact-authority dial closure.
-Ticket #147 consumes that closure for OCI readiness; the local service front
-door already remains ignorant of guest addresses.
+The agent starts the OCI readiness deadline only after the adapter reports
+`Started`, probes that closure, and gives the same closure to the local service
+front door. First readiness enables forwarding; later loss withdraws it without
+killing the payload, and sustained recovery republishes through the existing
+hysteresis. The front door remains ignorant of guest addresses. Portless OCI
+services request no endpoint or probe and become running at authoritative
+`Started`.
+
+OCI service environment contains only reserved container-visible values:
+`WEFTY_SERVICE_DIR=/wefty/service` for every service and the helper-allocated
+`WEFTY_SERVICE_PORT` only for a portful service. Agent and guest backing paths
+never enter the payload environment. Persistent service-volume mechanics remain
+separate from publication and are owned by #149.
 
 ## Attempts and occupancy
 

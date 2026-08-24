@@ -98,6 +98,9 @@ type serviceRunOutcome struct {
 
 type serviceSupervisorConfig struct {
 	clock                     Clock
+	startupReadinessDeadline  time.Duration
+	readinessProbeInterval    time.Duration
+	readinessConnectTimeout   time.Duration
 	publicationRecoveryWindow time.Duration
 	publicationRetryInterval  time.Duration
 	publish                   publicationRequest
@@ -139,9 +142,7 @@ func runPortfulService(
 	publicationDone := make(chan error, 1)
 	go func() { publicationDone <- publication.Run(runContext) }()
 
-	request.ServiceAddress = endpoint.address
-	priorReadiness := request.ReadinessChanged
-	request.ReadinessChanged = func(startupSatisfied, ready bool) {
+	readinessChanged := func(startupSatisfied, ready bool) {
 		if ready && config.onReadiness != nil {
 			config.onReadiness(startupSatisfied, ready)
 		}
@@ -149,9 +150,35 @@ func runPortfulService(
 		if !ready && config.onReadiness != nil {
 			config.onReadiness(startupSatisfied, ready)
 		}
+	}
+	priorReadiness := request.ReadinessChanged
+	request.ReadinessChanged = func(startupSatisfied, ready bool) {
+		readinessChanged(startupSatisfied, ready)
 		if priorReadiness != nil {
 			priorReadiness(startupSatisfied, ready)
 		}
+	}
+	request.ServiceAddress = endpoint.address
+	var readinessDone <-chan error
+	if endpoint.address == "" {
+		started := make(chan struct{})
+		var startedOnce sync.Once
+		priorStarted := request.Started
+		request.Started = func() {
+			if priorStarted != nil {
+				priorStarted()
+			}
+			startedOnce.Do(func() { close(started) })
+		}
+		result := make(chan error, 1)
+		go func() {
+			result <- monitorOpaqueServiceReadiness(
+				runContext, config.clock, started, endpoint.dial,
+				config.startupReadinessDeadline, config.readinessProbeInterval,
+				config.readinessConnectTimeout, readinessChanged,
+			)
+		}()
+		readinessDone = result
 	}
 	outcomes := make(chan serviceRunOutcome, 1)
 	go func() {
@@ -189,6 +216,87 @@ func runPortfulService(
 		<-publicationDone
 		<-outcomes
 		return spawnFailure(contract.SpawnFailurePublishedListener, err), err
+	case readinessErr := <-readinessDone:
+		if readinessErr == nil {
+			cancelRun()
+			outcome := <-outcomes
+			publication.Stop()
+			publicationErr := <-publicationDone
+			return outcome.result, errors.Join(outcome.err, publicationErr)
+		}
+		publication.Stop()
+		frontDoor.Close()
+		cancelRun()
+		outcome := <-outcomes
+		publicationErr := <-publicationDone
+		return spawnFailure(contract.SpawnFailureStartupReadinessTimeout, readinessErr), errors.Join(readinessErr, outcome.err, publicationErr)
+	}
+}
+
+func monitorOpaqueServiceReadiness(
+	ctx context.Context,
+	clock Clock,
+	started <-chan struct{},
+	dial func(context.Context) (net.Conn, error),
+	startupDeadline, probeInterval, connectTimeout time.Duration,
+	observe func(startupSatisfied, ready bool),
+) error {
+	if clock == nil {
+		clock = systemClock{}
+	}
+	startupDeadline = durationOrDefault(startupDeadline, processrunner.DefaultStartupReadinessDeadline)
+	probeInterval = durationOrDefault(probeInterval, processrunner.DefaultReadinessProbeInterval)
+	connectTimeout = durationOrDefault(connectTimeout, processrunner.DefaultReadinessConnectTimeout)
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-started:
+	}
+
+	deadline := clock.NewTimer(startupDeadline)
+	defer stopTimer(deadline)
+	var interval Timer
+	var intervalChannel <-chan time.Time
+	startupSatisfied := false
+	ready := false
+	for {
+		probeContext, cancelProbe := context.WithTimeout(ctx, connectTimeout)
+		connection, err := dial(probeContext)
+		cancelProbe()
+		nextReady := err == nil
+		if connection != nil {
+			_ = connection.Close()
+		}
+		if nextReady != ready {
+			ready = nextReady
+			if ready {
+				startupSatisfied = true
+				stopTimer(deadline)
+			}
+			observe(startupSatisfied, ready)
+		}
+		if interval == nil {
+			interval = clock.NewTimer(probeInterval)
+			defer stopTimer(interval)
+			intervalChannel = interval.C()
+		} else {
+			interval.Reset(probeInterval)
+		}
+		if startupSatisfied {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-intervalChannel:
+			}
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-deadline.C():
+			return errors.New("runtime-local service endpoint did not accept connections before the startup deadline")
+		case <-intervalChannel:
+		}
 	}
 }
 

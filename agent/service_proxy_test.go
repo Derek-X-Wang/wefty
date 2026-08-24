@@ -16,6 +16,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -154,6 +155,45 @@ func TestPortlessServiceSkipsFabricProxyProbeAndDeadline(t *testing.T) {
 	assertPortlessServiceSkipsFabricProxyProbeAndDeadline(t)
 }
 
+func TestPortlessOCIServiceReceivesOnlyReservedContainerDirectory(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource, err := initializeManagedResource(root, "portless-oci-node", "portless-oci-boot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &opaqueEndpointRuntime{release: make(chan struct{})}
+	close(runtime.release)
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, managedResource: resource,
+		clock: systemClock{}, observer: newLifecycleObserver(systemClock{}),
+		nodeID: "portless-oci-node", bootSessionID: "portless-oci-boot",
+	})
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "portless-oci-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindOCI, Class: contract.JobClassService,
+			Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+				Image: contract.OCIImageSpec{Reference: "example.invalid/portless:v1", Digest: &digest},
+				Argv:  []string{"/payload", "--portless"},
+			}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "portless-oci-attempt", FencingToken: "portless-oci-fence", LeaseTTL: time.Minute},
+	}
+	result, err := lifecycle.runWorkload(context.Background(), claim)
+	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("portless OCI runWorkload() = (%#v, %v)", result, err)
+	}
+	if got := runtime.request.Execution.Env[contract.EnvServiceDir]; got != contract.OCIContainerServiceDirectory {
+		t.Fatalf("%s = %q, want reserved container path %q", contract.EnvServiceDir, got, contract.OCIContainerServiceDirectory)
+	}
+	if _, exists := runtime.request.Execution.Env[contract.EnvServicePort]; exists {
+		t.Fatalf("portless OCI request received %s", contract.EnvServicePort)
+	}
+}
+
 func assertPortlessServiceSkipsFabricProxyProbeAndDeadline(t *testing.T) {
 	t.Helper()
 	root, err := filepath.EvalSymlinks(t.TempDir())
@@ -200,6 +240,131 @@ func assertPortlessServiceSkipsFabricProxyProbeAndDeadline(t *testing.T) {
 
 func TestPostStartupProbeLossWithdrawsAndRecoversWithoutKilling(t *testing.T) {
 	assertPostStartupProbeLossWithdrawsAndRecoversWithoutKilling(t)
+}
+
+func TestOpaqueRuntimeEndpointDrivesReadinessAndFabricForwarding(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	go serveTestEcho(backend)
+
+	runtime := &opaqueEndpointRuntime{release: make(chan struct{})}
+	dialer := &net.Dialer{}
+	finished := make(chan serviceRunOutcome, 1)
+	go func() {
+		result, runErr := runPortfulService(
+			context.Background(), runtime, workloadRequest("opaque-endpoint"), nil, listener,
+			serviceRuntimeEndpoint{dial: func(ctx context.Context) (net.Conn, error) {
+				return dialer.DialContext(ctx, "tcp4", backend.Addr().String())
+			}},
+			serviceSupervisorConfig{},
+		)
+		finished <- serviceRunOutcome{result: result, err: runErr}
+	}()
+
+	waitForPublishedEcho(t, listener.Addr().String(), true)
+	close(runtime.release)
+	outcome := waitServiceOutcome(t, finished)
+	if outcome.err != nil || outcome.result.ExitCode == nil || *outcome.result.ExitCode != 0 {
+		t.Fatalf("opaque endpoint outcome = (%#v, %v)", outcome.result, outcome.err)
+	}
+}
+
+func TestOpaqueRuntimeEndpointStartupTimeoutStopsUnpublishedPayload(t *testing.T) {
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &opaqueEndpointRuntime{release: make(chan struct{})}
+	finished := make(chan serviceRunOutcome, 1)
+	go func() {
+		result, runErr := runPortfulService(
+			context.Background(), runtime, workloadRequest("opaque-timeout"), nil, listener,
+			serviceRuntimeEndpoint{dial: func(context.Context) (net.Conn, error) {
+				return nil, errors.New("backend is not ready")
+			}},
+			serviceSupervisorConfig{
+				clock: clock, startupReadinessDeadline: 10 * time.Second,
+				readinessProbeInterval: time.Second, readinessConnectTimeout: time.Second,
+			},
+		)
+		finished <- serviceRunOutcome{result: result, err: runErr}
+	}()
+
+	clock.waitForDeadline(t, clock.Now().Add(10*time.Second))
+	clock.Advance(10 * time.Second)
+	outcome := waitServiceOutcome(t, finished)
+	if outcome.err == nil || outcome.result.SpawnError == nil || outcome.result.SpawnError.Code != contract.SpawnFailureStartupReadinessTimeout {
+		t.Fatalf("opaque startup timeout outcome = (%#v, %v)", outcome.result, outcome.err)
+	}
+	assertPublishedEcho(t, listener.Addr().String(), false)
+}
+
+func TestOpaqueRuntimeTunnelLossWithdrawsAndRepublishesWithoutKilling(t *testing.T) {
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	go serveTestEcho(backend)
+
+	var available atomic.Bool
+	available.Store(true)
+	runtime := &opaqueEndpointRuntime{release: make(chan struct{})}
+	dialer := &net.Dialer{}
+	finished := make(chan serviceRunOutcome, 1)
+	go func() {
+		result, runErr := runPortfulService(
+			context.Background(), runtime, workloadRequest("opaque-republication"), nil, listener,
+			serviceRuntimeEndpoint{dial: func(ctx context.Context) (net.Conn, error) {
+				if !available.Load() {
+					return nil, errors.New("helper tunnel unavailable")
+				}
+				return dialer.DialContext(ctx, "tcp4", backend.Addr().String())
+			}},
+			serviceSupervisorConfig{
+				clock: clock, startupReadinessDeadline: 10 * time.Second,
+				readinessProbeInterval: time.Second, readinessConnectTimeout: time.Second,
+				publicationRecoveryWindow: 10 * time.Second,
+			},
+		)
+		finished <- serviceRunOutcome{result: result, err: runErr}
+	}()
+
+	waitForPublishedEcho(t, listener.Addr().String(), true)
+	available.Store(false)
+	clock.waitForDeadline(t, clock.Now().Add(time.Second))
+	clock.Advance(time.Second)
+	waitForPublishedEcho(t, listener.Addr().String(), false)
+	select {
+	case outcome := <-finished:
+		t.Fatalf("tunnel loss killed payload: (%#v, %v)", outcome.result, outcome.err)
+	default:
+	}
+
+	available.Store(true)
+	clock.waitForDeadline(t, clock.Now().Add(time.Second))
+	clock.Advance(time.Second)
+	clock.waitForDeadline(t, clock.Now().Add(10*time.Second))
+	clock.Advance(10 * time.Second)
+	waitForPublishedEcho(t, listener.Addr().String(), true)
+	close(runtime.release)
+	outcome := waitServiceOutcome(t, finished)
+	if outcome.err != nil || outcome.result.ExitCode == nil || *outcome.result.ExitCode != 0 {
+		t.Fatalf("republished opaque endpoint outcome = (%#v, %v)", outcome.result, outcome.err)
+	}
 }
 
 func TestPublicationAuthorityLossStopsAttemptThroughGuardian(t *testing.T) {
@@ -359,6 +524,33 @@ func (*rejectPublishedListenerFabric) WhoIs(context.Context, string) (fabric.Ide
 func (*rejectPublishedListenerFabric) ConnectHost() string { return "127.0.0.1" }
 
 type capturingStartedRunner struct{ request processrunner.Request }
+
+type opaqueEndpointRuntime struct {
+	release chan struct{}
+	request workloadrunner.Request
+}
+
+func (runtime *opaqueEndpointRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (runtime *opaqueEndpointRuntime) Run(ctx context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	runtime.request = request
+	if request.Started != nil {
+		request.Started()
+	}
+	select {
+	case <-ctx.Done():
+		return workloadrunner.Result{}, ctx.Err()
+	case <-runtime.release:
+		exitCode := 0
+		return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+	}
+}
+
+func (*opaqueEndpointRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+}
 
 func (runner *capturingStartedRunner) Run(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
 	runner.request = request

@@ -1,6 +1,6 @@
-# M3 Lima transport attended acceptance
+# M3 Lima transport and service publication attended acceptance
 
-This is the owner-hardware lane for Ticket #145 and the Mac rows of the M3 OCI
+This is the owner-hardware lane for Tickets #145 and #147 and the Mac rows of the M3 OCI
 spec §9. It is deliberately absent from `service-acceptance-realtiming`: hosted
 macOS runners do not prove nested Lima `vz`. A run is PASS only when every row
 below has a captured command, exit code, and redacted receipt from the same
@@ -142,6 +142,23 @@ the helper instance/session generation before each row.
    and successful request through `DialHostBridge`; wrong capability and wrong
    attempt must fail. Discovery failure itself must fail start and must not
    select fallback.
+7. Service publication: export the attended helper socket/checksum and pinned
+   probe image reference/digest as `WEFTY_OCI_HELPER_SOCKET`,
+   `WEFTY_OCI_HELPER_CHECKSUM`, `WEFTY_OCI_PROBE_REFERENCE`, and
+   `WEFTY_OCI_PROBE_DIGEST`, then run:
+
+   ```sh
+   go test -tags=service_acceptance -run TestOCIServicePublicationThroughHelperTunnel -v ./agent
+   ```
+
+   Require health and request-body echo through the Fabric front door and the
+   helper's `DialAttemptPort` stream, an unpublished startup timeout, immediate
+   withdrawal followed by hysteresis-bounded republication, distinct backend
+   ports for concurrent attempts, and a portless payload that reports
+   authoritative `Started` without allocating an endpoint. Record
+   `WEFTY_SERVICE_DIR=/wefty/service` and the absence of guest or host backing
+   paths in the payload environment. Restart classification, stop quiescence,
+   and service-data persistence are not rows for Ticket #147.
 
 ## Loss and recovery order
 
@@ -195,7 +212,10 @@ It must contain PASS evidence for `template_permissions`, `probe`,
 `task_logs_delete`, `mount_validation`, `host_to_guest`,
 `guest_to_host_primary`, `guest_to_host_fallback`, `helper_loss`, `vm_loss`,
 `sweep_before_recovery`, `dynamic_forwarding_disabled`, and
-`raw_containerd_denied`.
+`raw_containerd_denied`. Ticket #147 additionally requires
+`service_health_echo`, `service_startup_timeout`,
+`service_withdrawal_republication`, `service_port_collision`, and
+`service_portless_started` from the same attended session.
 
 Ticket #152 additionally requires PASS rows for `launch_daemon`,
 `no_lima_autostart`, `helper_install_permissions`,
