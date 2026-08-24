@@ -151,19 +151,36 @@ finalization failure before durable completion is stored.
 The generic agent handoff manager remains the owner of process one-shot host
 directories. An OCI one-shot does not reinterpret the forbidden flat
 `execution.handoff_directory`: after `kind=oci` selects the adapter, the
-adapter declares exactly one helper-managed `handoff` volume. The helper
-creates and mounts that attempt-owned source at `/wefty/handoff`, and its
-positive reap receipt covers deletion and absence with the other OCI runtime
-resources. The payload sees only the reserved container path, never the
-helper source path.
+agent puts exactly one `handoff` requirement on the runtime request, keyed by
+the stable job or `handoff_owner_run_id`. The adapter passes that key opaquely
+to the helper and unconditionally makes `/wefty/handoff` the reserved guest
+value. Attempt reap preserves this helper-owned volume on failed or interrupted
+runs and refreshes its default 24-hour retry window when another attempt or
+rerun reuses it. Only after L1 accepts a successful completion does the agent
+ask the runtime to delete the volume and require a positive absence receipt.
+The payload sees only the reserved container path, never the helper source
+path. The named `usesAgentHandoffLifecycle` predicate positively selects only
+`kind=process`, `class=one-shot`; no negative kind gate can accidentally add a
+future runtime to the host-directory manager.
 
-If helper or engine loss invalidates the attempt session, the adapter records
-the verified sweep epoch that preceded entry into `Run`. Attempt-local
-`unauthorized_attempt` after recovery is positive quiescence only when the
-current boot barrier carries a different, non-empty sweep epoch and helper
-generation; that replacement receipt is consumed once for the exact tracked
-attempt. The pre-run sweep, an unchanged epoch, and an untracked authority can
-never substitute for attempt cleanup.
+Immediately before helper `Run`, the adapter atomically captures the session,
+verified sweep epoch, and helper instance/session generation, replacing any
+Preflight-era observation. If helper or engine loss invalidates that session,
+only `attempt_outside_session` can enter replacement-sweep recovery;
+`unauthorized_attempt` still means that the current session has no matching
+live attempt and is not cleanup proof. Recovery requires both a different
+sweep epoch and a different helper generation, plus an explicitly empty
+verified namespace inventory. That receipt is consumed once for the exact
+typed attempt-evidence key. A same-generation sweep, pre-run sweep, non-empty
+verification, and untracked authority can never substitute for attempt
+cleanup. The tracking entry remains present while the helper is unavailable,
+so finalization can consume recovery evidence before its deadline without
+replacing the original `runtime_unavailable` result with `output_error`.
+
+`ReapEvidenceOCIRuntimeSweep` is cross-cutting helper-loss evidence: the same
+typed receipt is valid for one-shot and service attempts when their lifecycle
+reaches this adapter seam. Service publication, data, and removal policy remain
+owned by the service tickets.
 
 For a Mac OCI one-shot that needs the run bridge, the agent asks Lima itself to
 resolve `host.lima.internal`, binds only that discovered guest-visible host

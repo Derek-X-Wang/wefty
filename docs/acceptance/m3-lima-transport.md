@@ -173,7 +173,9 @@ Record four rows:
 1. `oci_oneshot_run`: require the helper-owned `/wefty/handoff` mount, one
    authenticated run-scoped bridge request, distinct ordered stdout/stderr
    markers, exit zero, accepted top-level and Lima-platform digests, one
-   attempt ID, and exactly one payload execution.
+   attempt ID, and exactly one payload execution. Capture the exact
+   `wefty echo one-shot handoff\n` marker bytes before finalization, then prove
+   the helper-owned volume is absent only after L1 accepts success.
 2. `oci_oneshot_prestarted_loss`: stop the VM or helper after image evidence
    but before authoritative `Started`. Require the old attempt to terminalize,
    the job to requeue with its original absolute deadline and digest, a fresh
@@ -185,11 +187,13 @@ Record four rows:
 4. `oci_oneshot_rerun_identity`: explicitly rerun the completed first row.
    Require a fresh run/job/attempt, the identical top-level and platform
    digests, a second payload execution, and no tag resolution. The two
-   executions must have distinct attempt IDs.
+   executions must have distinct attempt IDs. Record the same opaque handoff
+   owner identity, exact marker bytes, and accepted-completion deletion proof.
 
 For every row, record the ordinary L3 run and L1 job projections, redacted
 reserved-name presence (never values), helper generation, attempts, digest
-arrays, payload-execution count, logs, and final residue inventory. A Mac/Lima
+arrays, payload-execution count, logs, exact handoff marker bytes,
+`handoff_absent_after_completion`, and final residue inventory. A Mac/Lima
 row is `NOT-RUN` unless this attended owner-hardware procedure actually
 executes it; hosted macOS does not satisfy the row.
 

@@ -100,8 +100,9 @@ type ContainerdEngine struct {
 }
 
 const (
-	defaultAttemptPortMin uint16 = 42000
-	defaultAttemptPortMax uint16 = 42999
+	defaultAttemptPortMin   uint16 = 42000
+	defaultAttemptPortMax   uint16 = 42999
+	defaultHandoffRetention        = 24 * time.Hour
 )
 
 func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
@@ -119,6 +120,9 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	}
 	if config.LogSealTimeout <= 0 {
 		config.LogSealTimeout = 5 * time.Second
+	}
+	if config.HandoffRetention <= 0 {
+		config.HandoffRetention = defaultHandoffRetention
 	}
 	if config.AttemptPortMin == 0 {
 		config.AttemptPortMin = defaultAttemptPortMin
@@ -1158,6 +1162,26 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 	}
 }
 
+func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
+	if request.Kind != ManagedVolumeHandoff {
+		return DeleteManagedVolumeResponse{}, fmt.Errorf("managed volume kind %q cannot be finalized", request.Kind)
+	}
+	name, err := DeterministicHandoffVolumeDirectory(request.OwnerKey)
+	if err != nil {
+		return DeleteManagedVolumeResponse{}, err
+	}
+	path := filepath.Join(engine.config.RuntimeRoot, "handoffs", name)
+	if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return DeleteManagedVolumeResponse{}, err
+	}
+	if _, err := os.Lstat(path); err == nil {
+		return DeleteManagedVolumeResponse{}, errors.New("handoff managed volume remains after deletion")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return DeleteManagedVolumeResponse{}, err
+	}
+	return DeleteManagedVolumeResponse{Deleted: true}, nil
+}
+
 func (engine *ContainerdEngine) ReapAttempt(ctx context.Context, authority AttemptAuthority) error {
 	resources, err := DeterministicResourceIdentity(authority)
 	if err != nil {
@@ -1219,6 +1243,9 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 
 func (engine *ContainerdEngine) Sweep(ctx context.Context, _ SweepRequest) (SweepResponse, error) {
 	ctx = engineContext(ctx)
+	if err := engine.cleanupExpiredHandoffs(time.Now()); err != nil {
+		return SweepResponse{}, err
+	}
 	if err := engine.sweepImageSpools(); err != nil {
 		return SweepResponse{}, err
 	}
@@ -1277,6 +1304,30 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, _ SweepRequest) (Swee
 		}
 	}
 	return engine.finishSweep(ctx, inventory, prior, attempts)
+}
+
+func (engine *ContainerdEngine) cleanupExpiredHandoffs(now time.Time) error {
+	root := filepath.Join(engine.config.RuntimeRoot, "handoffs")
+	entries, err := readDirectoryIfPresent(root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "wefty-handoff-volume-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if now.Sub(info.ModTime()) < engine.config.HandoffRetention {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (engine *ContainerdEngine) sweepImageSpools() error {
@@ -1367,6 +1418,8 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 		}
 		for _, path := range []string{
 			filepath.Join(engine.config.RuntimeRoot, "logs", identity.LogSegmentDirectory),
+			// M3 handoffs now live under the durable handoffs root. Sweep this
+			// legacy attempt-scoped location so upgrades do not strand residue.
 			filepath.Join(engine.config.RuntimeRoot, "volumes", identity.HandoffVolumeDirectory),
 			filepath.Join(engine.config.RuntimeRoot, "volumes", identity.ServiceVolumeDirectory),
 		} {
@@ -1502,7 +1555,6 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 	}
 	for _, path := range []string{
 		filepath.Join(engine.config.RuntimeRoot, "logs", resources.LogSegmentDirectory),
-		filepath.Join(engine.config.RuntimeRoot, "volumes", resources.HandoffVolumeDirectory),
 		filepath.Join(engine.config.RuntimeRoot, "volumes", resources.ServiceVolumeDirectory),
 	} {
 		if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1674,9 +1726,11 @@ func (engine *ContainerdEngine) managedVolumeSources(request RunRequest) (map[Ma
 	result := make(map[ManagedVolumeKind]string)
 	for _, volume := range request.Workload.ManagedVolumes {
 		name := ""
+		root := "volumes"
 		switch volume.Kind {
 		case ManagedVolumeHandoff:
 			name = request.Resources.HandoffVolumeDirectory
+			root = "handoffs"
 		case ManagedVolumeServiceData:
 			name = request.Resources.ServiceVolumeDirectory
 		case ManagedVolumeLogSegments:
@@ -1684,9 +1738,15 @@ func (engine *ContainerdEngine) managedVolumeSources(request RunRequest) (map[Ma
 		default:
 			return nil, fmt.Errorf("managed volume kind %q is unsupported", volume.Kind)
 		}
-		path := filepath.Join(engine.config.RuntimeRoot, "volumes", name)
+		path := filepath.Join(engine.config.RuntimeRoot, root, name)
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return nil, err
+		}
+		if volume.Kind == ManagedVolumeHandoff {
+			now := time.Now()
+			if err := os.Chtimes(path, now, now); err != nil {
+				return nil, err
+			}
 		}
 		result[volume.Kind] = path
 	}

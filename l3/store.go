@@ -796,7 +796,7 @@ WHERE r.run_id=?`, input.SourceRunID).Scan(&paramsJSON, &tagsJSON, &limitsJSON, 
 			stableNodeTags++
 		}
 	}
-	if stableNodeTags != 1 {
+	if snapshot.Image == nil && stableNodeTags != 1 {
 		return contract.RunRecord{}, false, protocolError(contract.ErrorInvalidRequest,
 			"cold rerun consuming node-local handoff files requires exactly one reserved stable-node tag %q", contract.StableNodeTagPrefix+"<stable-node-id>")
 	}

@@ -51,6 +51,8 @@ type attendedResult struct {
 	PayloadExecutions   int                 `json:"payload_executions"`
 	StdoutMarkers       []string            `json:"stdout_markers"`
 	StderrMarkers       []string            `json:"stderr_markers"`
+	HandoffMarkerBytes  []string            `json:"handoff_marker_bytes"`
+	HandoffAbsent       bool                `json:"handoff_absent_after_completion"`
 }
 
 var requiredAttendedRows = []string{
@@ -226,7 +228,8 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 	if !oneshot.RoundTrip || oneshot.PayloadExecutions != 1 || len(oneshot.AttemptIDs) != 1 ||
 		!sameNonEmptyStrings(oneshot.TopLevelDigests) || !sameNonEmptyStrings(oneshot.PlatformDigests) ||
 		!containsString(oneshot.StdoutMarkers, "wefty-echo-once-stdout") ||
-		!containsString(oneshot.StderrMarkers, "wefty-echo-once-stderr") {
+		!containsString(oneshot.StderrMarkers, "wefty-echo-once-stderr") ||
+		!containsString(oneshot.HandoffMarkerBytes, "wefty echo one-shot handoff\n") || !oneshot.HandoffAbsent {
 		t.Fatalf("ordinary OCI one-shot row lacks bridge/digest/single-execution evidence: %+v", oneshot)
 	}
 	prestarted := artifact.Rows["oci_oneshot_prestarted_loss"]
@@ -243,7 +246,8 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 	rerun := artifact.Rows["oci_oneshot_rerun_identity"]
 	if !rerun.RoundTrip || rerun.PayloadExecutions != 2 || len(rerun.AttemptIDs) != 2 ||
 		rerun.AttemptIDs[0] == rerun.AttemptIDs[1] ||
-		!sameNonEmptyStrings(rerun.TopLevelDigests) || !sameNonEmptyStrings(rerun.PlatformDigests) {
+		!sameNonEmptyStrings(rerun.TopLevelDigests) || !sameNonEmptyStrings(rerun.PlatformDigests) ||
+		!containsString(rerun.HandoffMarkerBytes, "wefty echo one-shot handoff\n") || !rerun.HandoffAbsent {
 		t.Fatalf("OCI rerun row lacks frozen identity and distinct execution evidence: %+v", rerun)
 	}
 	dynamic := artifact.Rows["dynamic_forwarding_disabled"].DynamicListeners

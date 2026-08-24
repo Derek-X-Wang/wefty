@@ -342,10 +342,28 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	if completionFailure.err != nil {
 		return completionFailure.destination, fmt.Errorf("agent: complete attempt: %w", completionFailure.err)
 	}
-	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot && claim.Job.Spec.Kind != contract.JobKindOCI {
-		succeeded := outcome.err == nil && outcome.result.ExitCode != nil && *outcome.result.ExitCode == 0
+	succeeded := outcome.err == nil && outcome.result.ExitCode != nil && *outcome.result.ExitCode == 0
+	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
 		if err := lifecycle.dependencies.handoffs.finish(claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)
+		}
+	}
+	if succeeded {
+		volumes := runtimeManagedVolumes(claim.Job.Spec)
+		if len(volumes) > 0 {
+			runtimeAdapter, found := lifecycle.dependencies.runtimes.selectKind(claim.Job.Spec.Kind)
+			finalizer, supported := runtimeAdapter.(workloadrunner.ManagedVolumeFinalizer)
+			if !found || !supported {
+				return errorDestinationUnclassified, errors.New("agent: OCI runtime does not support managed-volume finalization")
+			}
+			finalizationContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.finalizationTimeout)
+			defer cancel()
+			if err := finalizer.FinalizeManagedVolumes(finalizationContext, workloadrunner.ManagedVolumeFinalizationRequest{
+				Authority: workloadAuthority(lifecycle.dependencies.nodeID, lifecycle.dependencies.bootSessionID, claim),
+				Volumes:   volumes,
+			}); err != nil {
+				return errorDestinationUnclassified, fmt.Errorf("agent: finish runtime-managed handoff lifecycle: %w", err)
+			}
 		}
 	}
 	return errorDestinationUnclassified, nil
@@ -417,11 +435,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		err := &contract.ExecutionError{Kind: claim.Job.Spec.Kind}
 		return spawnFailure(contract.SpawnFailureUnsupportedKind, err), err
 	}
-	authority := workloadrunner.AttemptAuthority{
-		NodeID: lifecycle.dependencies.nodeID, BootSessionID: lifecycle.dependencies.bootSessionID,
-		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
-		WorkloadClass: claim.Job.Spec.Class, RemovalGeneration: "attempt",
-	}
+	authority := workloadAuthority(lifecycle.dependencies.nodeID, lifecycle.dependencies.bootSessionID, claim)
 	idlePolicy := workloadrunner.MonitorIdle
 	if claim.Job.Spec.Class == contract.JobClassService {
 		idlePolicy = workloadrunner.IgnoreIdle
@@ -429,7 +443,8 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	request := workloadrunner.Request{
 		Authority: authority, RuntimeHandler: claim.Job.Spec.RuntimeHandler,
 		Execution: claim.Job.Spec.Execution, Limits: claim.Job.Spec.Limits,
-		IdlePolicy: idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
+		ManagedVolumes: runtimeManagedVolumes(claim.Job.Spec),
+		IdlePolicy:     idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
 	}
 	if claim.Job.Spec.Kind == contract.JobKindOCI {
 		request.OCIImageDeadline = time.Time{}
@@ -541,7 +556,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	if preflightErr != nil {
 		return finish(preflightResult.Outcome, preflightErr)
 	}
-	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot && claim.Job.Spec.Kind != contract.JobKindOCI {
+	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
 		unlock, err := lifecycle.dependencies.handoffs.lock(ctx, claim.Job.Spec)
 		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
@@ -612,7 +627,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		lifecycle.dependencies.observer.configurePortfulAttempt(claim.Lease.AttemptID)
 	}
-	if lifecycle.dependencies.handoffs != nil && claim.Job.Spec.Class == contract.JobClassOneShot && claim.Job.Spec.Kind != contract.JobKindOCI {
+	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
 		if err := lifecycle.dependencies.handoffs.prepare(claim.Job.Spec, lifecycle.dependencies.nodeID); err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
@@ -701,6 +716,25 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		result, runErr = runtimeResult.Outcome, err
 	}
 	return finish(result, runErr)
+}
+
+func workloadAuthority(nodeID, bootSessionID string, claim l1.Claim) workloadrunner.AttemptAuthority {
+	return workloadrunner.AttemptAuthority{
+		NodeID: nodeID, BootSessionID: bootSessionID,
+		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
+		WorkloadClass: claim.Job.Spec.Class, RemovalGeneration: "attempt",
+	}
+}
+
+func usesAgentHandoffLifecycle(spec contract.JobSpec) bool {
+	return spec.Kind == contract.JobKindProcess && spec.Class == contract.JobClassOneShot
+}
+
+func runtimeManagedVolumes(spec contract.JobSpec) []workloadrunner.ManagedVolume {
+	if spec.Kind != contract.JobKindOCI || spec.Class != contract.JobClassOneShot {
+		return nil
+	}
+	return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: handoffOwnerRunID(spec)}}
 }
 
 func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Claim, authority localAuthority, failures chan<- destinationError, watch attemptWatch) {

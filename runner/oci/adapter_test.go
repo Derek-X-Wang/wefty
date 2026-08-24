@@ -180,24 +180,64 @@ func TestAdapterConsumesMatchingPriorBootSweepEvidenceOnce(t *testing.T) {
 	}
 }
 
-func TestAdapterConsumesOnlyNewerRuntimeSweepAfterSessionLoss(t *testing.T) {
-	authority := adapterTestRequest().Authority
-	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
-		SweepEpoch: "sweep-before-run", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-1", SessionGeneration: 7},
-	}}
-	adapter := NewAdapter(source)
-	unauthorized := &ocihelper.RPCError{Code: ocihelper.CodeUnauthorizedAttempt, Message: "attempt was swept"}
-	if _, err := adapter.reapFromReplacementSweep(authority, "sweep-before-run", unauthorized); err == nil {
-		t.Fatal("pre-run sweep produced attempt quiescence evidence")
+func TestAdapterRefreshesRunSweepBaselineAndRetainsItUntilRecovery(t *testing.T) {
+	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
+	adapter, barrier, source, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+	defer closeAdapter()
+	request := adapterTestRequest()
+	if _, _, err := adapter.Preflight(t.Context(), request); err != nil {
+		t.Fatal(err)
 	}
-	source.receipt.SweepEpoch = "sweep-after-loss"
-	source.receipt.HelperSession.SessionGeneration = 8
-	receipt, err := adapter.reapFromReplacementSweep(authority, "sweep-before-run", unauthorized)
+	preflightReceipt, ok := barrier.SweepReceipt()
+	if !ok {
+		t.Fatal("preflight helper sweep receipt is unavailable")
+	}
+	barrier.Invalidate()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	runSession, runReceipt, err := barrier.ExecutionSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runReceipt.HelperSession == preflightReceipt.HelperSession {
+		t.Fatal("Preflight to Run replacement did not change helper generation")
+	}
+	adapter.mu.Lock()
+	adapter.probePlatforms[helperSession(runSession)] = ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}
+	adapter.mu.Unlock()
+	if _, err := adapter.Run(t.Context(), request, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// A different sweep epoch from the same helper generation is not recovery
+	// proof. Reap times out and must retain the tracked attempt for a later
+	// replacement-sweep receipt.
+	sameGeneration := runReceipt
+	sameGeneration.SweepEpoch += "-later"
+	source.setUnavailable(sameGeneration)
+	reapContext, cancel := context.WithTimeout(t.Context(), 60*time.Millisecond)
+	_, err = adapter.ReapAndVerify(reapContext, workloadrunner.ReapRequest{Authority: request.Authority})
+	cancel()
+	if err == nil {
+		t.Fatal("same-generation sweep epoch produced quiescence evidence")
+	}
+
+	source.clearUnavailable()
+	barrier.Invalidate()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	replacement, ok := barrier.SweepReceipt()
+	if !ok {
+		t.Fatal("replacement helper sweep receipt is unavailable")
+	}
+	receipt, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
 	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceOCIRuntimeSweep ||
-		receipt.SweepEpoch != "sweep-after-loss" || receipt.HelperGeneration != 8 {
+		receipt.SweepEpoch != replacement.SweepEpoch || receipt.HelperGeneration != replacement.HelperSession.SessionGeneration {
 		t.Fatalf("replacement sweep receipt = %+v err=%v", receipt, err)
 	}
-	if _, err := adapter.reapFromReplacementSweep(authority, "sweep-before-run", unauthorized); err == nil {
+	if _, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority}); err == nil {
 		t.Fatal("replacement sweep receipt was reusable")
 	}
 }
@@ -328,14 +368,15 @@ func TestAdapterPumpsConstrainedMacHostBridgeFallback(t *testing.T) {
 
 func TestWorkloadInputAddsHandoffOnlyForOneshot(t *testing.T) {
 	request := workloadrunner.Request{
-		Authority: workloadrunner.AttemptAuthority{WorkloadClass: contract.JobClassOneShot},
+		Authority:      workloadrunner.AttemptAuthority{WorkloadClass: contract.JobClassOneShot},
+		ManagedVolumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: "run-1"}},
 		Execution: contract.ExecutionSpec{
-			Env: map[string]string{contract.EnvHandoffDir: contract.OCIContainerHandoffDirectory},
+			Env: map[string]string{contract.EnvHandoffDir: "/operator/pass-through"},
 			OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "ghcr.io/example/echo:latest"}},
 		},
 	}
 	input := workloadInput(request)
-	if len(input.ManagedVolumes) != 1 || input.ManagedVolumes[0].Kind != ocihelper.ManagedVolumeHandoff {
+	if len(input.ManagedVolumes) != 1 || input.ManagedVolumes[0].Kind != ocihelper.ManagedVolumeHandoff || input.ManagedVolumes[0].OwnerKey != "run-1" {
 		t.Fatalf("one-shot managed volumes = %+v, want handoff", input.ManagedVolumes)
 	}
 	if len(input.ReservedEnvironment) != 1 || input.ReservedEnvironment[0].Name != contract.EnvHandoffDir ||
@@ -343,7 +384,7 @@ func TestWorkloadInputAddsHandoffOnlyForOneshot(t *testing.T) {
 		t.Fatalf("one-shot reserved environment = %+v", input.ReservedEnvironment)
 	}
 
-	request.Authority.WorkloadClass = contract.JobClassService
+	request.ManagedVolumes = nil
 	input = workloadInput(request)
 	if len(input.ManagedVolumes) != 0 {
 		t.Fatalf("service managed volumes = %+v, want no one-shot handoff", input.ManagedVolumes)
@@ -778,6 +819,9 @@ func (engine *adapterTestEngine) Delete(context.Context, ocihelper.DeleteRequest
 	engine.mu.Unlock()
 	return ocihelper.DeleteResponse{Deleted: !engine.refuseDelete}, nil
 }
+func (*adapterTestEngine) DeleteManagedVolume(context.Context, ocihelper.DeleteManagedVolumeRequest) (ocihelper.DeleteManagedVolumeResponse, error) {
+	return ocihelper.DeleteManagedVolumeResponse{Deleted: true}, nil
+}
 func (*adapterTestEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
 	return ocihelper.VerifyResponse{Absent: true}, nil
 }
@@ -810,6 +854,11 @@ func startAdapterTestServer(t *testing.T, engine ocihelper.Engine) (*Adapter, fu
 }
 
 func startAdapterTestServerWithPolicy(t *testing.T, engine ocihelper.Engine, policy ImagePolicy) (*Adapter, func()) {
+	adapter, _, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, policy)
+	return adapter, closeAdapter
+}
+
+func startAdapterTestServerWithSnapshots(t *testing.T, engine ocihelper.Engine, policy ImagePolicy) (*Adapter, *ocihelper.BootBarrier, *adapterSnapshotSource, func()) {
 	t.Helper()
 	directory, err := os.MkdirTemp("", "woci-")
 	if err != nil {
@@ -836,13 +885,14 @@ func startAdapterTestServerWithPolicy(t *testing.T, engine ocihelper.Engine, pol
 	if err := barrier.Ensure(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	adapter := NewAdapterWithPolicy(barrier, policy)
+	source := &adapterSnapshotSource{barrier: barrier}
+	adapter := NewAdapterWithPolicy(source, policy)
 	session, err := barrier.Session()
 	if err != nil {
 		t.Fatal(err)
 	}
 	adapter.probePlatforms[helperSession(session)] = ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}
-	return adapter, func() { _ = barrier.Close(); cancel(); _ = listener.Close(); <-done }
+	return adapter, barrier, source, func() { _ = barrier.Close(); cancel(); _ = listener.Close(); <-done }
 }
 
 func adapterTestRequest() workloadrunner.Request {
@@ -882,7 +932,54 @@ func (*failingSessionSource) Session() (*ocihelper.Session, error) {
 	return nil, errors.New("helper session must not be acquired")
 }
 
+func (*failingSessionSource) ExecutionSnapshot() (*ocihelper.Session, ocihelper.VerifiedSweepReceipt, error) {
+	return nil, ocihelper.VerifiedSweepReceipt{}, errors.New("helper session must not be acquired")
+}
+
+type adapterSnapshotSource struct {
+	barrier  *ocihelper.BootBarrier
+	mu       sync.Mutex
+	override *ocihelper.VerifiedSweepReceipt
+}
+
+func (source *adapterSnapshotSource) Session() (*ocihelper.Session, error) {
+	return source.barrier.Session()
+}
+
+func (source *adapterSnapshotSource) ExecutionSnapshot() (*ocihelper.Session, ocihelper.VerifiedSweepReceipt, error) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if source.override != nil {
+		return nil, *source.override, errors.New("helper session unavailable during recovery")
+	}
+	return source.barrier.ExecutionSnapshot()
+}
+
+func (source *adapterSnapshotSource) SweepReceipt() (ocihelper.VerifiedSweepReceipt, bool) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if source.override != nil {
+		return *source.override, true
+	}
+	return source.barrier.SweepReceipt()
+}
+
+func (source *adapterSnapshotSource) setUnavailable(receipt ocihelper.VerifiedSweepReceipt) {
+	source.mu.Lock()
+	source.override = &receipt
+	source.mu.Unlock()
+}
+
+func (source *adapterSnapshotSource) clearUnavailable() {
+	source.mu.Lock()
+	source.override = nil
+	source.mu.Unlock()
+}
+
 func (*adapterReceiptSource) Session() (*ocihelper.Session, error) { return nil, errors.New("unused") }
+func (source *adapterReceiptSource) ExecutionSnapshot() (*ocihelper.Session, ocihelper.VerifiedSweepReceipt, error) {
+	return nil, source.receipt, errors.New("unused")
+}
 func (source *adapterReceiptSource) SweepReceipt() (ocihelper.VerifiedSweepReceipt, bool) {
 	return source.receipt, true
 }

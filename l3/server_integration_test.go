@@ -662,6 +662,47 @@ func TestTagOnlyImageResolutionFreezesRerunWithoutReresolution(t *testing.T) {
 	}
 }
 
+func TestUnpinnedImageRerunUsesFrozenDigestWithoutProcessHandoffGate(t *testing.T) {
+	h := newIntegrationHarness(t)
+	program := &contract.ImageProgram{Reference: "ghcr.io/example/echo:moving", Argv: []string{"echo", "once"}}
+	source := h.submit(CreateRunRequest{Image: program, Params: json.RawMessage(`{}`), Tags: []string{"linux"}}, "unpinned-image-rerun-source")
+	jobs := &recordingJobClient{imageEvidence: make(map[string][]AttemptImageEvidence)}
+	reconciler, err := NewReconciler(h.l3Store, jobs, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.specs) != 1 {
+		t.Fatalf("initial unpinned image dispatches = %d", len(jobs.specs))
+	}
+	digest := "sha256:" + strings.Repeat("e", 64)
+	jobID := "job-image-1"
+	job := jobs.jobs[jobID]
+	job.State = contract.JobSucceeded
+	jobs.jobs[jobID] = job
+	jobs.imageEvidence[jobID] = []AttemptImageEvidence{{
+		AttemptID: "attempt-unpinned", SubmittedReference: program.Reference,
+		TopLevelDigest: digest, ObservedAt: time.Date(2026, 8, 23, 20, 0, 0, 0, time.UTC),
+	}}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.l3Store.CreateRerun(context.Background(), CreateRerunInput{
+		IdempotencyKey: "unpinned-image-rerun", Actor: h.callerUser, SourceRunID: source.RunID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.specs) != 2 || len(jobs.specs[1].RoutingTags) != 1 || jobs.specs[1].RoutingTags[0] != "linux" ||
+		jobs.specs[1].Execution.OCI == nil || jobs.specs[1].Execution.OCI.Image.Digest == nil || *jobs.specs[1].Execution.OCI.Image.Digest != digest {
+		t.Fatalf("unpinned frozen rerun dispatch = %#v", jobs.specs)
+	}
+}
+
 func assertDispatchedImageProgram(t *testing.T, spec contract.JobSpec, want contract.ImageProgram) {
 	t.Helper()
 	if spec.Kind != contract.JobKindOCI || spec.Class != contract.JobClassOneShot || spec.Execution.OCI == nil {

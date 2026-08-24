@@ -87,6 +87,13 @@ func validateWorkloadWire(input WorkloadInput) error {
 			return fmt.Errorf("managed volume kind %q is duplicated", volume.Kind)
 		}
 		seenManagedKinds[volume.Kind] = struct{}{}
+		if volume.Kind == ManagedVolumeHandoff {
+			if volume.OwnerKey == "" || strings.TrimSpace(volume.OwnerKey) != volume.OwnerKey || len(volume.OwnerKey) > 255 || strings.IndexByte(volume.OwnerKey, 0) >= 0 {
+				return errors.New("handoff managed volume requires a bounded non-empty owner key")
+			}
+		} else if volume.OwnerKey != "" {
+			return fmt.Errorf("managed volume kind %q does not accept an owner key", volume.Kind)
+		}
 	}
 	for _, mount := range input.OperatorMounts {
 		if !validMountSourcePath(mount.NodePath) {

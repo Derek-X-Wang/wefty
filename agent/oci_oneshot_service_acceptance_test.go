@@ -82,7 +82,10 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 	go func() { served <- l1Server.Serve(ctx, l1Listener) }()
 	go func() { served <- l3Server.Serve(ctx, l3Listener) }()
 
-	runtime := &ociOneshotAcceptanceRuntime{}
+	runtime := &ociOneshotAcceptanceRuntime{
+		firstReapUnavailable: make(chan struct{}),
+		recoveryReady:        make(chan struct{}),
+	}
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -116,10 +119,16 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 			Argv:      []string{"wefty-echo-service", "--once"},
 		},
 		Params: json.RawMessage(`{"ticket":146}`),
-		Tags:   []string{"linux", contract.StableNodeTagPrefix + "node-1"},
+		Tags:   []string{"linux"},
 	}
 	var accepted l3.RunAccepted
 	doOCIOneshotJSON(t, caller, http.MethodPost, "/v1/runs", request, http.Header{"Idempotency-Key": []string{"oci-oneshot-acceptance"}}, http.StatusCreated, &accepted)
+	select {
+	case <-runtime.firstReapUnavailable:
+		close(runtime.recoveryReady)
+	case <-time.After(5 * time.Second):
+		t.Fatal("pre-start runtime loss did not reach reap while the helper session was unavailable")
+	}
 	original := waitForOCIOneshotRun(t, caller, accepted.RunID, contract.RunSucceeded, 10*time.Second)
 	if original.L1JobID == "" {
 		t.Fatalf("successful OCI run omitted L1 job identity: %+v", original)
@@ -148,6 +157,8 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 	runIDs := slices.Clone(runtime.runIDs)
 	requestDigests := slices.Clone(runtime.requestDigests)
 	bridgeRuns := slices.Clone(runtime.bridgeRuns)
+	volumeOwners := slices.Clone(runtime.volumeOwners)
+	finalizedOwners := slices.Clone(runtime.finalizedOwners)
 	runtime.mu.Unlock()
 	if runCalls != 3 || payloadStarts != 2 {
 		t.Fatalf("runtime calls=%d payload starts=%d, want one pre-start loss plus two unique starts", runCalls, payloadStarts)
@@ -166,6 +177,12 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 	if !slices.Equal(bridgeRuns, []string{accepted.RunID}) {
 		t.Fatalf("successful bridge calls = %v, want original run exactly once", bridgeRuns)
 	}
+	if !slices.Equal(volumeOwners, []string{accepted.RunID, accepted.RunID, accepted.RunID}) {
+		t.Fatalf("managed handoff owners = %v, want stable source-run identity across retry and rerun", volumeOwners)
+	}
+	if !slices.Equal(finalizedOwners, []string{accepted.RunID}) {
+		t.Fatalf("finalized handoff owners = %v, want deletion only after accepted success", finalizedOwners)
+	}
 
 	cancel()
 	if err := <-agentDone; err != nil {
@@ -179,14 +196,19 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 }
 
 type ociOneshotAcceptanceRuntime struct {
-	mu             sync.Mutex
-	runCalls       int
-	payloadStarts  int
-	attemptIDs     []string
-	jobIDs         []string
-	runIDs         []string
-	requestDigests []string
-	bridgeRuns     []string
+	mu                   sync.Mutex
+	runCalls             int
+	payloadStarts        int
+	attemptIDs           []string
+	jobIDs               []string
+	runIDs               []string
+	requestDigests       []string
+	bridgeRuns           []string
+	volumeOwners         []string
+	finalizedOwners      []string
+	reapCalls            int
+	firstReapUnavailable chan struct{}
+	recoveryReady        chan struct{}
 }
 
 func (runtime *ociOneshotAcceptanceRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
@@ -209,6 +231,11 @@ func (runtime *ociOneshotAcceptanceRuntime) Run(ctx context.Context, request wor
 		digest = *request.Execution.OCI.Image.Digest
 	}
 	runtime.requestDigests = append(runtime.requestDigests, digest)
+	if len(request.ManagedVolumes) != 1 || request.ManagedVolumes[0].Kind != workloadrunner.ManagedVolumeHandoff {
+		runtime.mu.Unlock()
+		return workloadrunner.Result{}, errors.New("OCI one-shot managed handoff descriptor is incomplete")
+	}
+	runtime.volumeOwners = append(runtime.volumeOwners, request.ManagedVolumes[0].OwnerKey)
 	runtime.mu.Unlock()
 
 	if request.Execution.Env[contract.EnvHandoffDir] != contract.OCIContainerHandoffDirectory ||
@@ -278,8 +305,34 @@ func (runtime *ociOneshotAcceptanceRuntime) Run(ctx context.Context, request wor
 	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
 }
 
-func (*ociOneshotAcceptanceRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+func (runtime *ociOneshotAcceptanceRuntime) ReapAndVerify(ctx context.Context, _ workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	runtime.mu.Lock()
+	runtime.reapCalls++
+	call := runtime.reapCalls
+	runtime.mu.Unlock()
+	if call == 1 {
+		close(runtime.firstReapUnavailable)
+		select {
+		case <-runtime.recoveryReady:
+		case <-ctx.Done():
+			return workloadrunner.ReapReceipt{}, ctx.Err()
+		}
+		return workloadrunner.ReapReceipt{
+			RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceOCIRuntimeSweep,
+			SweepEpoch: "replacement-sweep", HelperGeneration: 2,
+		}, nil
+	}
 	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+}
+
+func (runtime *ociOneshotAcceptanceRuntime) FinalizeManagedVolumes(_ context.Context, request workloadrunner.ManagedVolumeFinalizationRequest) error {
+	if len(request.Volumes) != 1 || request.Volumes[0].Kind != workloadrunner.ManagedVolumeHandoff || request.Volumes[0].OwnerKey == "" {
+		return errors.New("managed handoff finalization request is incomplete")
+	}
+	runtime.mu.Lock()
+	runtime.finalizedOwners = append(runtime.finalizedOwners, request.Volumes[0].OwnerKey)
+	runtime.mu.Unlock()
+	return nil
 }
 
 func doOCIOneshotJSON(t *testing.T, client *http.Client, method, path string, input any, headers http.Header, wantStatus int, output any) {

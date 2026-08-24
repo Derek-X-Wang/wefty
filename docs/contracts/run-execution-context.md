@@ -106,13 +106,21 @@ instant and afterward, authentication fails.
 
 ## Node-local handoff lifecycle
 
-L3 assigns `/tmp/wefty/handoffs/<run_id>` by default. Before execution, the
-node agent rejects symlinks and non-directories, creates the directory when it
-is absent, forces mode `0700`, and writes an ownership marker at mode `0600`.
-The directory is removed only after a successful process result has also been
-accepted by L1. Failed or interrupted executions retain it for the default
-24-hour retry window; agent startup removes expired direct children only when
-they carry a valid ownership marker.
+For `kind=process`, L3 assigns `/tmp/wefty/handoffs/<run_id>` by default. Before
+execution, the node agent rejects symlinks and non-directories, creates the
+directory when it is absent, forces mode `0700`, and writes an ownership marker
+at mode `0600`. For `kind=oci`, the agent instead requests a helper-owned
+managed volume keyed by the job's stable run ID or `handoff_owner_run_id`; the
+helper hashes that opaque key and mounts the resulting source at
+`/wefty/handoff`. Attempt IDs never enter the OCI handoff identity.
+
+Both forms are removed only after a successful result has also been accepted
+by L1. Failed or interrupted executions retain them for the default 24-hour
+retry window. Agent startup removes expired marked process directories; the
+helper boot sweep removes expired deterministic OCI handoff children while
+preserving unexpired handoff data outside the swept attempt namespace. A retry
+or rerun reuses the same owner identity, and helper attempt `Delete` never
+removes the retained handoff volume.
 
 Handoff files are node-local. If a cold rerun finds files in an existing
 managed directory, its job must include the reserved routing tag
@@ -122,11 +130,13 @@ stable node, an ownership mismatch, or an unmanaged pre-populated directory
 fails explicitly before process execution. No rerun silently receives an
 empty or unrelated handoff path.
 
-`POST /v1/runs/{run_id}/rerun` is the cold-rerun path and reuses the source
-run's handoff directory. L3 accepts it only when the source run has exactly one
-reserved stable-node tag, copies that tag to the rerun, and labels the L1 job
-with the source run as its handoff owner. A source run that was not pinned is
-rejected at rerun creation instead of dispatching a job with an unusable path.
+`POST /v1/runs/{run_id}/rerun` is the cold-rerun path and labels the L1 job
+with the source run as its handoff owner. A process source reuses its host
+handoff directory, so L3 accepts it only when the source run has exactly one
+reserved stable-node tag and copies that tag to the rerun. An image source
+reuses the helper-managed owner identity and its frozen image digest without
+inventing a process host path; L3 therefore does not impose the process-only
+stable-node-tag gate on an otherwise Movable image snapshot.
 
 ## Immutable program snapshots
 

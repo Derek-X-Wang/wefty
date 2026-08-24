@@ -330,6 +330,74 @@ func TestSweepSkipsSpoolOwnedByLiveImageOperation(t *testing.T) {
 	}
 }
 
+func TestHandoffRetentionRefreshesAndExpiresStableOwnerVolumes(t *testing.T) {
+	root := t.TempDir()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, HandoffRetention: time.Hour}}
+	name, err := DeterministicHandoffVolumeDirectory("run-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "handoffs", name)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := os.Chtimes(path, now.Add(-30*time.Minute), now.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.cleanupExpiredHandoffs(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("retry-window handoff was removed: %v", err)
+	}
+	if err := os.Chtimes(path, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.cleanupExpiredHandoffs(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired handoff remained: %v", err)
+	}
+}
+
+func TestOwnerKeyedHandoffBytesSurviveAttemptsUntilExplicitFinalization(t *testing.T) {
+	root := t.TempDir()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}}
+	name, err := DeterministicHandoffVolumeDirectory("run-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := RunRequest{
+		Resources: ResourceIdentity{HandoffVolumeDirectory: name},
+		Workload:  WorkloadInput{ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "run-owner"}}},
+	}
+	first, err := engine.managedVolumeSources(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(first[ManagedVolumeHandoff], "marker")
+	if err := os.WriteFile(marker, []byte("handoff bytes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := engine.managedVolumeSources(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(filepath.Join(second[ManagedVolumeHandoff], "marker"))
+	if err != nil || string(payload) != "handoff bytes\n" {
+		t.Fatalf("reused handoff marker = %q err=%v", payload, err)
+	}
+	deleted, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{Kind: ManagedVolumeHandoff, OwnerKey: "run-owner"})
+	if err != nil || !deleted.Deleted {
+		t.Fatalf("handoff finalization = %+v err=%v", deleted, err)
+	}
+	if _, err := os.Stat(first[ManagedVolumeHandoff]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("finalized handoff remains: %v", err)
+	}
+}
+
 func TestImageOperationMechanicsNeverClaimsUnknownErrorsAreInvalidManifests(t *testing.T) {
 	tests := []struct {
 		name string

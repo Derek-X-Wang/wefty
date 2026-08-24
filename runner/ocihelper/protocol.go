@@ -40,6 +40,7 @@ const (
 	MethodSignal             Method = "Signal"
 	MethodWatch              Method = "Watch"
 	MethodDelete             Method = "Delete"
+	MethodDeleteVolume       Method = "DeleteManagedVolume"
 	MethodVerify             Method = "Verify"
 	MethodSweep              Method = "Sweep"
 	MethodDialAttemptPort    Method = "DialAttemptPort"
@@ -53,20 +54,21 @@ const attemptPortBackendReady byte = 1
 type ErrorCode string
 
 const (
-	CodeInvalidRequest       ErrorCode = "invalid_request"
-	CodePeerUnauthenticated  ErrorCode = "peer_unauthenticated"
-	CodeVersionMismatch      ErrorCode = "version_mismatch"
-	CodeChecksumMismatch     ErrorCode = "checksum_mismatch"
-	CodeSessionBusy          ErrorCode = "session_busy"
-	CodeSessionStale         ErrorCode = "session_stale"
-	CodeUnauthorizedAttempt  ErrorCode = "unauthorized_attempt"
-	CodeUnauthorizedPort     ErrorCode = "unauthorized_port"
-	CodeUnauthorizedBridge   ErrorCode = "unauthorized_bridge"
-	CodeOCISpecRejected      ErrorCode = "oci_spec_rejected"
-	CodeImageUnavailable     ErrorCode = "image_unavailable"
-	CodeEngineFailure        ErrorCode = "engine_failure"
-	CodeUnsupportedOperation ErrorCode = "unsupported_operation"
-	CodeSweepRequired        ErrorCode = "sweep_required"
+	CodeInvalidRequest        ErrorCode = "invalid_request"
+	CodePeerUnauthenticated   ErrorCode = "peer_unauthenticated"
+	CodeVersionMismatch       ErrorCode = "version_mismatch"
+	CodeChecksumMismatch      ErrorCode = "checksum_mismatch"
+	CodeSessionBusy           ErrorCode = "session_busy"
+	CodeSessionStale          ErrorCode = "session_stale"
+	CodeUnauthorizedAttempt   ErrorCode = "unauthorized_attempt"
+	CodeAttemptOutsideSession ErrorCode = "attempt_outside_session"
+	CodeUnauthorizedPort      ErrorCode = "unauthorized_port"
+	CodeUnauthorizedBridge    ErrorCode = "unauthorized_bridge"
+	CodeOCISpecRejected       ErrorCode = "oci_spec_rejected"
+	CodeImageUnavailable      ErrorCode = "image_unavailable"
+	CodeEngineFailure         ErrorCode = "engine_failure"
+	CodeUnsupportedOperation  ErrorCode = "unsupported_operation"
+	CodeSweepRequired         ErrorCode = "sweep_required"
 )
 
 // RPCError is safe to cross the private protocol. Engine detail remains local.
@@ -219,6 +221,16 @@ func DeterministicResourceIdentity(authority AttemptAuthority) (ResourceIdentity
 	}, nil
 }
 
+// DeterministicHandoffVolumeDirectory maps the opaque stable owner identity to
+// a helper-owned name without exposing it in filesystem paths.
+func DeterministicHandoffVolumeDirectory(ownerKey string) (string, error) {
+	if ownerKey == "" || strings.TrimSpace(ownerKey) != ownerKey || len(ownerKey) > 255 || strings.IndexByte(ownerKey, 0) >= 0 {
+		return "", errors.New("handoff owner key must be bounded and non-empty")
+	}
+	digest := sha256.Sum256([]byte("handoff\x00" + ownerKey))
+	return "wefty-handoff-volume-" + hex.EncodeToString(digest[:16]), nil
+}
+
 type DeadmanRenewal struct {
 	Authority AttemptAuthority `json:"authority"`
 	TTL       time.Duration    `json:"ttl"`
@@ -339,6 +351,7 @@ const (
 
 type ManagedVolumeDescriptor struct {
 	Kind     ManagedVolumeKind `json:"kind"`
+	OwnerKey string            `json:"owner_key,omitempty"`
 	ReadOnly bool              `json:"read_only,omitempty"`
 }
 
@@ -482,6 +495,17 @@ type DeleteRequest struct {
 }
 
 type DeleteResponse struct {
+	Deleted bool `json:"deleted"`
+}
+
+// DeleteManagedVolumeRequest names durable helper-owned state independently
+// from an attempt. OwnerKey is an opaque stable handoff-owner identity.
+type DeleteManagedVolumeRequest struct {
+	Kind     ManagedVolumeKind `json:"kind"`
+	OwnerKey string            `json:"owner_key"`
+}
+
+type DeleteManagedVolumeResponse struct {
 	Deleted bool `json:"deleted"`
 }
 
