@@ -22,6 +22,7 @@ import (
 
 	"github.com/containerd/containerd/v2/core/content"
 	contentlocal "github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/platforms"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -294,7 +295,7 @@ func TestSelectedManifestRejectsWrongArchitectureAndMislabeledIndexes(t *testing
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, _, err := selectedManifest(ctx, store, test.target)
+			_, _, err := selectedManifest(ctx, store, test.target, platforms.DefaultStrict())
 			var mechanics *ImageMechanicsError
 			if !errors.As(err, &mechanics) || mechanics.Fact.Kind != ImageFailurePlatformMismatch {
 				t.Fatalf("platform selection error = %v", err)

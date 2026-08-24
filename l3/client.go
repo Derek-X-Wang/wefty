@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -73,24 +72,12 @@ func (c *L1Client) GetJob(ctx context.Context, jobID string) (l1.Job, error) {
 }
 
 func (c *L1Client) GetJobImageEvidence(ctx context.Context, jobID string) ([]AttemptImageEvidence, error) {
-	// TODO(#143): replace this compatibility projection with the typed L1
-	// attempt-evidence API once its contract is available on main.
-	var projection struct {
-		Attempts []struct {
-			AttemptID string `json:"attempt_id"`
-			Image     *struct {
-				SubmittedReference     string    `json:"submitted_reference"`
-				TopLevelDigest         string    `json:"top_level_digest"`
-				PlatformManifestDigest string    `json:"platform_manifest_digest"`
-				ResolvedAt             time.Time `json:"resolved_at"`
-			} `json:"image,omitempty"`
-		} `json:"attempts"`
-	}
-	if err := c.do(ctx, http.MethodGet, "/v1/jobs/"+jobID, nil, &projection, http.StatusOK); err != nil {
+	job, err := c.GetJob(ctx, jobID)
+	if err != nil {
 		return nil, err
 	}
-	evidence := make([]AttemptImageEvidence, 0, len(projection.Attempts))
-	for _, attempt := range projection.Attempts {
+	evidence := make([]AttemptImageEvidence, 0, len(job.Attempts))
+	for _, attempt := range job.Attempts {
 		if attempt.Image == nil {
 			continue
 		}

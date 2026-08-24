@@ -181,7 +181,12 @@
                   "required": ["job", "lease"],
                   "properties": {
                     "job": { "$ref": "./common.v1.json#/components/schemas/Job" },
-                    "lease": { "$ref": "./common.v1.json#/components/schemas/AttemptLease" }
+                    "lease": { "$ref": "./common.v1.json#/components/schemas/AttemptLease" },
+                    "prestart_deadline": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "One-shot OCI only. Absolute persisted deadline shared by every pre-Started attempt and used to clamp agent-owned image delivery policy."
+                    }
                   }
                 }
               }

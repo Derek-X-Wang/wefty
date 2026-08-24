@@ -241,19 +241,26 @@ clock. Successful completion likewise never supplies a missing OCI `Started`.
 
 ## OCI image, start, and pre-start retry truth
 
-`PUT .../attempts/{attempt_id}/image` is fenced by the complete current
-attempt authority tuple and is write-once. It records submitted reference,
+`PUT .../attempts/{attempt_id}/image` is fenced and write-once. The first
+accepted observation creates the job's immutable top-level resolution; each
+later claim returns that top-level digest in the claim's execution copy, while
+the fresh attempt records its own platform/runtime evidence with the original
+job `resolved_at`. The persisted JobSpec and dispatch hash remain unchanged.
+Attempt evidence records submitted reference,
 top-level digest and media type, optional index digest, platform manifest
 digest, canonical runtime platform including variant, effective runtime
-handler, explicit snapshotter, and the L1-clock `resolved_at`. Identical replay
-is a no-op; a changed identity is `idempotency_conflict`. The write-once hash
-covers only image/runtime identity, not the attempt fence. Until job-level
-copy-forward lands in #143, L1 also rejects a top-level digest that differs
-from any earlier observed attempt for the job. The observation must precede
-`Started` and a pinned job digest must match it.
+handler, explicit snapshotter, and the L1-clock `resolved_at`. The job-scoped
+write-once hash covers only top-level digest, optional index digest, and
+top-level media type; platform manifest, platform, runtime handler, and
+snapshotter remain attempt-local. Immutable attempt ownership and fence are
+authenticated before replay: an identical stored attempt hash succeeds even
+after authority advances, while changed replay is `idempotency_conflict`.
+Current authority, lease, and claimed state gate only the first write. A
+changed job-scoped identity is also `idempotency_conflict`, and a pinned job
+digest must match the observation.
 
 `POST .../attempts/{attempt_id}/started` is fenced and idempotent. It requires
-the accepted image observation, records `started_at` from the L1 clock, and is
+an accepted or copied image observation, records `started_at` from the L1 clock, and is
 the sole `claimed → running` transition for OCI jobs and attempts. A stale
 fence, replaced session, expired lease, terminal attempt, or missing image
 observation cannot start authority.
@@ -266,9 +273,14 @@ backoff, including its 80–120 percent jitter and 30-second cap, are persisted
 on the job and survive L1 restart. Requeue clears `current_attempt_id`, so a
 queued job projects no terminal node authority. An identical completion replay
 before the next claim cannot increment the count or mint work; after a new
-attempt is current, the old replay is an attempt mismatch. If the next backoff
+attempt is current, the old replay is an attempt mismatch. Every one-shot OCI
+claim carries that same absolute deadline; the agent clamps its image-delivery
+window to it instead of granting a fresh budget after requeue. If the next backoff
 would cross the deadline, the job fails terminally. The ordinary claim path is
 still the only path that mints the next attempt and fence.
+The claim predicate also excludes jobs at or beyond the absolute deadline and
+terminalizes an expired queued job with a scheduling-gap reason instead of
+issuing a dead claim.
 
 ## Durable operator intent
 

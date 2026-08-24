@@ -152,6 +152,10 @@ local admission counts, not slot identities and not L1 state.
 Image delivery is one agent-owned policy window, defaulting to ten minutes and
 tunable with `--oci-image-budget`. The deadline includes public resolution,
 pull or import, unpack, and waiting on an existing singleflight operation.
+For a one-shot, the claim's persisted absolute pre-start deadline clamps this
+window, so a requeued attempt never receives a fresh budget.
+The actual derived context deadline is re-read after applying the clamp so a
+shorter parent deadline also bounds every backoff and helper operation.
 Transient network, DNS, registry 5xx, and 429 failures retry with capped
 exponential backoff and a longer in-budget `Retry-After`; permanent not-found,
 invalid-manifest/archive, and unsupported-platform results fail immediately.
@@ -164,6 +168,13 @@ infrastructure `runtime_unavailable`. L1 remains `Claimed` throughout local
 `pulling` and can become `Started` only through the existing image-observation
 then fenced-start sequence below. Service restart policy explicitly treats all
 four image spawn classifications as terminal.
+
+Before image delivery, the adapter loads the canonical runtime platform saved
+by the successful functional probe for the current helper generation. It sends
+that platform through `EnsureImage`, keys shared image work by it, and rejects
+first-binding evidence for any other platform. An L1 4xx refusal of the pre-Run
+observation is terminal `process_request`; transport failure or L1 5xx is
+`runtime_unavailable` and remains eligible for the one-shot pre-start budget.
 
 When delivery fails before the helper `Run` RPC is entered, the OCI adapter
 returns positive `no_runtime_resources` reap evidence without calling helper
@@ -189,11 +200,13 @@ succeeds. Agent-helper control EOF, a helper-clock heartbeat blackhole, or an
 expired per-attempt deadman therefore reaps runtime-owned state independently
 of the agent's own authority watchdog.
 
-An OCI claim remains L1 `Claimed` while the helper creates the task. The helper
-registers `Wait`, starts runc-v2, and returns `Started` plus image evidence; the
-agent first persists that evidence with `ObserveAttemptImage`, then performs
-the fenced L1 `StartAttempt`, and only after both succeed marks its local
-observer running. Lease renewal, log append, and completion remain incapable of
-implicitly promoting the attempt. If either authoritative mutation is refused,
-the adapter kills and verifies deletion of the real task before returning a
-spawn failure.
+An OCI claim remains L1 `Claimed` while the helper resolves and ensures the
+image. Successful `EnsureImage` returns the complete immutable image evidence;
+the agent persists it before invoking helper `Run`. The helper then registers
+`Wait`, starts runc-v2, and returns `Started` plus the same image evidence. The
+agent replays the observation, performs fenced L1 `StartAttempt`, and only after
+both succeed marks its local observer running. Lease renewal, log append, and
+completion remain incapable of implicitly promoting the attempt. If the
+pre-Run observation is refused, no runtime resource is created; if either
+post-start mutation is refused, the adapter kills and verifies deletion of the
+real task before returning a spawn failure.

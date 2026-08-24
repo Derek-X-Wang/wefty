@@ -44,12 +44,16 @@ type archiveBlob struct {
 }
 
 func inspectOCIArchive(ctx context.Context, runtimeRoot string, source io.Reader, requestedReference string, requestedDigest string) (_ ociArchiveInspection, returnErr error) {
-	return inspectOCIArchiveWithSpool(ctx, runtimeRoot, source, requestedReference, requestedDigest, func(directory string) (*os.File, error) {
+	return inspectOCIArchiveWithSpoolForPlatform(ctx, runtimeRoot, source, requestedReference, requestedDigest, platforms.DefaultStrict(), func(directory string) (*os.File, error) {
 		return os.CreateTemp(directory, "wefty-image-*.tar")
 	})
 }
 
 func inspectOCIArchiveWithSpool(ctx context.Context, runtimeRoot string, source io.Reader, requestedReference string, requestedDigest string, createSpool func(string) (*os.File, error)) (_ ociArchiveInspection, returnErr error) {
+	return inspectOCIArchiveWithSpoolForPlatform(ctx, runtimeRoot, source, requestedReference, requestedDigest, platforms.DefaultStrict(), createSpool)
+}
+
+func inspectOCIArchiveWithSpoolForPlatform(ctx context.Context, runtimeRoot string, source io.Reader, requestedReference string, requestedDigest string, matcher platforms.MatchComparer, createSpool func(string) (*os.File, error)) (_ ociArchiveInspection, returnErr error) {
 	if source == nil {
 		return ociArchiveInspection{}, errors.New("OCI archive stream is required")
 	}
@@ -214,7 +218,7 @@ func inspectOCIArchiveWithSpool(ctx context.Context, runtimeRoot string, source 
 	if reference == "" {
 		return ociArchiveInspection{}, errors.New("OCI archive image reference is missing")
 	}
-	manifest, platform, err := selectArchiveManifest(top, blobs)
+	manifest, platform, err := selectArchiveManifest(top, blobs, matcher)
 	if err != nil {
 		return ociArchiveInspection{}, err
 	}
@@ -228,11 +232,11 @@ func readArchiveMetadata(reader io.Reader, size int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(reader, size))
 }
 
-func selectArchiveManifest(top ocispec.Descriptor, blobs map[digest.Digest]archiveBlob) (ocispec.Descriptor, ocispec.Platform, error) {
-	return selectArchivePlatform(top, blobs, 0)
+func selectArchiveManifest(top ocispec.Descriptor, blobs map[digest.Digest]archiveBlob, matcher platforms.MatchComparer) (ocispec.Descriptor, ocispec.Platform, error) {
+	return selectArchivePlatform(top, blobs, matcher, 0)
 }
 
-func selectArchivePlatform(top ocispec.Descriptor, blobs map[digest.Digest]archiveBlob, depth int) (ocispec.Descriptor, ocispec.Platform, error) {
+func selectArchivePlatform(top ocispec.Descriptor, blobs map[digest.Digest]archiveBlob, matcher platforms.MatchComparer, depth int) (ocispec.Descriptor, ocispec.Platform, error) {
 	if depth > 32 {
 		return ocispec.Descriptor{}, ocispec.Platform{}, errors.New("OCI archive image index nesting exceeds the helper bound")
 	}
@@ -240,7 +244,7 @@ func selectArchivePlatform(top ocispec.Descriptor, blobs map[digest.Digest]archi
 		return ocispec.Descriptor{}, ocispec.Platform{}, err
 	}
 	if images.IsManifestType(top.MediaType) {
-		platform, err := archiveManifestPlatform(top, blobs)
+		platform, err := archiveManifestPlatform(top, blobs, matcher)
 		return top, platform, err
 	}
 	if !images.IsIndexType(top.MediaType) {
@@ -250,12 +254,11 @@ func selectArchivePlatform(top ocispec.Descriptor, blobs map[digest.Digest]archi
 	if err := json.Unmarshal(blobs[top.Digest].payload, &index); err != nil || index.SchemaVersion != 2 {
 		return ocispec.Descriptor{}, ocispec.Platform{}, errors.New("OCI archive image index is invalid")
 	}
-	matcher := platforms.DefaultStrict()
 	for _, manifest := range index.Manifests {
 		if manifest.Platform != nil && !matcher.Match(*manifest.Platform) {
 			continue
 		}
-		selected, platform, err := selectArchivePlatform(manifest, blobs, depth+1)
+		selected, platform, err := selectArchivePlatform(manifest, blobs, matcher, depth+1)
 		if err == nil {
 			return selected, platform, nil
 		}
@@ -281,7 +284,7 @@ func normalizeArchiveReference(raw string, allowDigest bool) (string, error) {
 	return distributionref.TagNameOnly(named).String(), nil
 }
 
-func archiveManifestPlatform(descriptor ocispec.Descriptor, blobs map[digest.Digest]archiveBlob) (ocispec.Platform, error) {
+func archiveManifestPlatform(descriptor ocispec.Descriptor, blobs map[digest.Digest]archiveBlob, matcher platforms.MatchComparer) (ocispec.Platform, error) {
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(blobs[descriptor.Digest].payload, &manifest); err != nil || manifest.SchemaVersion != 2 {
 		return ocispec.Platform{}, errors.New("OCI archive image manifest is invalid")
@@ -305,7 +308,7 @@ func archiveManifestPlatform(descriptor ocispec.Descriptor, blobs map[digest.Dig
 		return ocispec.Platform{}, errors.New("OCI archive image config is invalid")
 	}
 	platform := ocispec.Platform{OS: image.OS, Architecture: image.Architecture, Variant: image.Variant}
-	if !platforms.DefaultStrict().Match(platform) {
+	if !matcher.Match(platform) {
 		return ocispec.Platform{}, imageMechanicsError(ImageFailurePlatformMismatch, descriptor.Digest.String(), errors.New("OCI archive image config does not match the runtime platform"))
 	}
 	return platform, nil

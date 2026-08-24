@@ -432,15 +432,19 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		IdlePolicy: idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
 	}
 	if claim.Job.Spec.Kind == contract.JobKindOCI {
+		request.OCIImageDeadline = time.Time{}
+		if claim.PrestartDeadline != nil {
+			request.OCIImageDeadline = *claim.PrestartDeadline
+		}
 		request.OCIImagePulling = func() {
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptPulling, nil)
 		}
 		request.OCIImageReady = func() {
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptStarting, nil)
 		}
-		request.OCIStarted = func(startContext context.Context, observation workloadrunner.OCIImageObservation) error {
+		observeImage := func(startContext context.Context, observation workloadrunner.OCIImageObservation) error {
 			if lifecycle.dependencies.client == nil {
-				return errors.New("OCI Started acknowledgement requires an L1 client")
+				return errors.New("OCI image observation requires an L1 client")
 			}
 			_, err := lifecycle.dependencies.client.ObserveAttemptImage(startContext, claim.Job.JobID, claim.Lease.AttemptID, l1.ImageObservationRequest{
 				FencingToken:           claim.Lease.FencingToken,
@@ -453,7 +457,18 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				RuntimeHandler:         observation.RuntimeHandler, Snapshotter: observation.Snapshotter,
 			})
 			if err != nil {
+				var protocolErr *ProtocolError
+				if errors.As(err, &protocolErr) && protocolErr.StatusCode >= 400 && protocolErr.StatusCode < 500 {
+					return &workloadrunner.OCIObservationRefusal{Err: fmt.Errorf("record OCI image observation: %w", err)}
+				}
 				return fmt.Errorf("record OCI image observation: %w", err)
+			}
+			return nil
+		}
+		request.OCIImageResolved = observeImage
+		request.OCIStarted = func(startContext context.Context, observation workloadrunner.OCIImageObservation) error {
+			if err := observeImage(startContext, observation); err != nil {
+				return err
 			}
 			if _, err := lifecycle.dependencies.client.StartAttempt(startContext, claim.Job.JobID, claim.Lease.AttemptID, l1.StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
 				return fmt.Errorf("acknowledge OCI Started: %w", err)

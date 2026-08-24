@@ -17,6 +17,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
+var testImagePlatform = OCIPlatform{OS: "linux", Architecture: "amd64"}
+
 func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	authority := testAuthority()
 	first, err := DeterministicResourceIdentity(authority)
@@ -410,7 +412,7 @@ func TestExclusiveSessionEOFAndHeartbeatBlackholeFailClosed(t *testing.T) {
 	}
 	clock.Advance(time.Second)
 	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 2 }, "heartbeat blackhole reap")
-	err = second.EnsureImage(t.Context(), EnsureImageRequest{Reference: "example.invalid/probe", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil)
+	err = second.EnsureImage(t.Context(), EnsureImageRequest{Reference: "example.invalid/probe", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Platform: testImagePlatform}, nil)
 	assertRPCCode(t, err, CodeSessionStale)
 }
 
@@ -581,7 +583,7 @@ func TestAllNarrowRPCsReachFakeEngineWithoutContainerdTypes(t *testing.T) {
 	}
 	defer session.Close()
 	requireSweep(t, session)
-	if err := session.EnsureImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil); err != nil {
+	if err := session.EnsureImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Platform: testImagePlatform}, nil); err != nil {
 		t.Fatal(err)
 	}
 	authority := testAuthority()
@@ -625,7 +627,7 @@ func TestImportImageStreamsArchiveAfterAuthorization(t *testing.T) {
 	payload := []byte("opaque-oci-archive")
 	var result EnsureImageResponse
 	err = session.ImportImage(t.Context(), EnsureImageRequest{
-		Reference: "registry.invalid/app", Source: ImageSourceArchive, OperationTimeout: time.Minute,
+		Reference: "registry.invalid/app", Platform: testImagePlatform, Source: ImageSourceArchive, OperationTimeout: time.Minute,
 	}, bytes.NewReader(payload), func(event EnsureImageEvent) error {
 		if event.Result != nil {
 			result = *event.Result
@@ -651,7 +653,7 @@ func TestImportImageClosesBlockedUploadSourceWhenHelperRejects(t *testing.T) {
 	}
 	defer session.Close()
 	requireSweep(t, session)
-	err = session.ImportImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", OperationTimeout: time.Minute}, reader, nil)
+	err = session.ImportImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", Platform: testImagePlatform, OperationTimeout: time.Minute}, reader, nil)
 	if err == nil {
 		t.Fatal("helper rejection unexpectedly succeeded")
 	}
@@ -674,7 +676,7 @@ func TestImportImageOperationTimeoutBoundsBlockedSpoolRead(t *testing.T) {
 	defer session.Close()
 	requireSweep(t, session)
 	started := time.Now()
-	err = session.ImportImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", OperationTimeout: 20 * time.Millisecond}, reader, nil)
+	err = session.ImportImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", Platform: testImagePlatform, OperationTimeout: 20 * time.Millisecond}, reader, nil)
 	if err == nil || time.Since(started) > time.Second {
 		t.Fatalf("blocked spool deadline = (%v, %s)", err, time.Since(started))
 	}
@@ -694,7 +696,7 @@ func TestSweepGateAndClosedWorkloadValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close()
-	err = session.EnsureImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app"}, nil)
+	err = session.EnsureImage(t.Context(), EnsureImageRequest{Reference: "registry.invalid/app", Platform: testImagePlatform}, nil)
 	assertRPCCode(t, err, CodeSweepRequired)
 	requireSweep(t, session)
 	request := testRunRequest(testAuthority(), time.Second)
@@ -719,6 +721,7 @@ func TestEnsureImageRejectsEmbeddedDigestReference(t *testing.T) {
 	err = session.EnsureImage(t.Context(), EnsureImageRequest{
 		Reference: "registry.invalid/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Digest:    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Platform:  testImagePlatform,
 	}, nil)
 	assertRPCCode(t, err, CodeInvalidRequest)
 }
@@ -1419,6 +1422,7 @@ func (engine *archiveCaptureEngine) EnsureImage(_ context.Context, request Ensur
 	return emit(EnsureImageEvent{Kind: ImageComplete, Result: &EnsureImageResponse{
 		TopLevelDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		PlatformDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		Evidence:       fakeEnsureImageEvidence(),
 	}})
 }
 
@@ -1436,7 +1440,22 @@ func (engine *fakeEngine) record(method string) {
 
 func (engine *fakeEngine) EnsureImage(_ context.Context, _ EnsureImageRequest, _ io.Reader, emit func(EnsureImageEvent) error) error {
 	engine.record("EnsureImage")
-	return emit(EnsureImageEvent{Kind: ImageComplete, Result: &EnsureImageResponse{TopLevelDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PlatformDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}})
+	return emit(EnsureImageEvent{Kind: ImageComplete, Result: &EnsureImageResponse{
+		TopLevelDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		PlatformDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		Evidence:       fakeEnsureImageEvidence(),
+	}})
+}
+
+func fakeEnsureImageEvidence() ImageEvidence {
+	return ImageEvidence{
+		SubmittedReference:     "registry.invalid/app",
+		TopLevelDigest:         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		TopLevelMediaType:      "application/vnd.oci.image.index.v1+json",
+		PlatformManifestDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		Platform:               OCIPlatform{OS: "linux", Architecture: "amd64"},
+		RuntimeHandler:         DefaultRuntimeHandler, Snapshotter: DefaultSnapshotter,
+	}
 }
 func (engine *fakeEngine) Run(_ context.Context, request RunRequest) (RunResponse, error) {
 	engine.record("Run")

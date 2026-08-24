@@ -161,6 +161,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   prestart_retry_count INTEGER NOT NULL DEFAULT 0 CHECK(prestart_retry_count >= 0),
   prestart_budget_deadline_ns INTEGER,
   prestart_next_retry_at_ns INTEGER,
+  prestart_terminal_reason TEXT,
+  image_resolution_json BLOB,
+  image_resolution_hash TEXT,
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL
 );
@@ -819,6 +822,18 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	if !claimsEnabled {
 		return nil, protocolError(contract.ErrorNodeDraining, "node %q has claims disabled by operator intent", nodeID)
 	}
+	if class == contract.JobClassOneShot {
+		if _, err := tx.ExecContext(ctx, `UPDATE jobs
+			SET state=?, current_attempt_id=NULL, prestart_next_retry_at_ns=NULL,
+				prestart_terminal_reason=?, updated_ns=?
+			WHERE state=? AND prestart_budget_deadline_ns IS NOT NULL
+				AND prestart_budget_deadline_ns<=?
+				AND NOT EXISTS (SELECT 1 FROM service_jobs WHERE service_jobs.job_id=jobs.job_id)`,
+			contract.JobFailed, "pre-start infrastructure budget expired while awaiting scheduling",
+			now.UnixNano(), contract.JobQueued, now.UnixNano()); err != nil {
+			return nil, internalError(err, "terminalize expired pre-start scheduling gap")
+		}
+	}
 
 	leaseExpires := canonicalTime(now.Add(s.leaseDuration))
 	attemptID := newID("attempt")
@@ -826,6 +841,8 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	var specJSON []byte
 	var fence int64
 	var createdNS int64
+	var imageResolutionJSON []byte
+	var prestartDeadlineNS sql.NullInt64
 	// SQLite's immediate writer transaction serializes this count-then-insert.
 	// A Postgres adapter must instead lock the node row or retry serializable
 	// transactions so concurrent claims cannot over-admit either class.
@@ -842,6 +859,7 @@ WHERE job_id=(
 	        @class='one-shot'
 	        AND candidate_service.job_id IS NULL
 	        AND (j.prestart_next_retry_at_ns IS NULL OR j.prestart_next_retry_at_ns<=@now_ns)
+	        AND (j.prestart_budget_deadline_ns IS NULL OR j.prestart_budget_deadline_ns>@now_ns)
 	        AND (
 	          SELECT COUNT(*)
 	          FROM attempts active_oneshot
@@ -909,7 +927,8 @@ WHERE job_id=(
   LIMIT 1
 )
 AND state=@job_queued
-	RETURNING job_id, spec_json, fence_counter, created_ns`
+	RETURNING job_id, spec_json, fence_counter, created_ns,
+	          image_resolution_json, prestart_budget_deadline_ns`
 	claimArguments := []any{
 		sql.Named("job_claimed", contract.JobClaimed),
 		sql.Named("attempt_id", attemptID),
@@ -929,7 +948,7 @@ AND state=@job_queued
 	}
 	claimArguments = append(claimArguments, exclusionArguments...)
 	err = tx.QueryRowContext(ctx, fmt.Sprintf(claimQuery, exclusionClause), claimArguments...).
-		Scan(&jobID, &specJSON, &fence, &createdNS)
+		Scan(&jobID, &specJSON, &fence, &createdNS, &imageResolutionJSON, &prestartDeadlineNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
 			return nil, internalError(err, "commit empty claim")
@@ -944,11 +963,27 @@ AND state=@job_queued
 		return nil, internalError(err, "decode claimed job")
 	}
 	if spec.Kind == contract.JobKindOCI && spec.Class == contract.JobClassOneShot {
+		if !prestartDeadlineNS.Valid {
+			prestartDeadlineNS = sql.NullInt64{Int64: now.Add(s.prestartInfrastructureBudget).UnixNano(), Valid: true}
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs
 			SET prestart_budget_deadline_ns=COALESCE(prestart_budget_deadline_ns, ?), prestart_next_retry_at_ns=NULL
-			WHERE job_id=?`, now.Add(s.prestartInfrastructureBudget).UnixNano(), jobID); err != nil {
+			WHERE job_id=?`, prestartDeadlineNS.Int64, jobID); err != nil {
 			return nil, internalError(err, "initialize pre-start infrastructure budget")
 		}
+	}
+	if len(imageResolutionJSON) > 0 {
+		var resolution jobImageResolution
+		if err := json.Unmarshal(imageResolutionJSON, &resolution); err != nil {
+			return nil, internalError(err, "decode claimed job image resolution")
+		}
+		if spec.Kind != contract.JobKindOCI || spec.Execution.OCI == nil {
+			return nil, internalError(errors.New("non-OCI job has image resolution"), "decode claimed job image resolution")
+		}
+		execution := *spec.Execution.OCI
+		execution.Image = spec.Execution.OCI.Image
+		execution.Image.Digest = &resolution.TopLevelDigest
+		spec.Execution.OCI = &execution
 	}
 	fencingToken := strconv.FormatInt(fence, 10)
 	attemptCreatedNS := now.UnixNano()
@@ -964,8 +999,9 @@ AND state=@job_queued
 		attemptCreatedNS = latestRestartNS.Int64 + 1
 	}
 	_, err = tx.ExecContext(ctx, `
-	INSERT INTO attempts(attempt_id, job_id, node_id, boot_session_id, state, fencing_token, lease_expires_ns, authority_generation, created_ns, updated_ns)
-	VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, attemptID, jobID, nodeID, bootSessionID, contract.AttemptClaimed,
+	INSERT INTO attempts(attempt_id, job_id, node_id, boot_session_id, state, fencing_token, lease_expires_ns, authority_generation,
+	                     image_observation_json, image_observation_hash, created_ns, updated_ns)
+	VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`, attemptID, jobID, nodeID, bootSessionID, contract.AttemptClaimed,
 		fencingToken, leaseExpires.UnixNano(), authorityGeneration, attemptCreatedNS, now.UnixNano())
 	if err != nil {
 		return nil, internalError(err, "create claimed attempt")
@@ -982,7 +1018,7 @@ AND state=@job_queued
 	if err := tx.Commit(); err != nil {
 		return nil, internalError(err, "commit job claim")
 	}
-	return &Claim{
+	claim := &Claim{
 		Job: Job{
 			JobID: jobID, NodeID: nodeID, State: contract.JobClaimed, Spec: spec, CurrentAttemptID: attemptID,
 			CreatedAt: time.Unix(0, createdNS).UTC(), UpdatedAt: now,
@@ -991,7 +1027,12 @@ AND state=@job_queued
 			AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: leaseExpires,
 			LeaseTTL: leaseExpires.Sub(now),
 		},
-	}, nil
+	}
+	if prestartDeadlineNS.Valid {
+		deadline := time.Unix(0, prestartDeadlineNS.Int64).UTC()
+		claim.PrestartDeadline = &deadline
+	}
+	return claim, nil
 }
 
 func claimExclusion(jobIDs []string) (string, []any, error) {
@@ -1091,6 +1132,12 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 	}
 	hash := sha256.Sum256(requestJSON)
 	observationHash := hex.EncodeToString(hash[:])
+	jobIdentityJSON, err := json.Marshal(jobImageIdentityFromRequest(request))
+	if err != nil {
+		return Job{}, internalError(err, "encode job image identity")
+	}
+	jobHash := sha256.Sum256(jobIdentityJSON)
+	jobObservationHash := hex.EncodeToString(jobHash[:])
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Job{}, internalError(err, "begin image observation")
@@ -1100,7 +1147,7 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 	if err != nil {
 		return Job{}, err
 	}
-	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
+	if err := validateAttemptEvidence(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 		return Job{}, err
 	}
 	if attempt.spec.Kind != contract.JobKindOCI || attempt.spec.Execution.OCI == nil {
@@ -1112,6 +1159,15 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 	if attempt.spec.Execution.OCI.Image.Digest != nil && request.TopLevelDigest != *attempt.spec.Execution.OCI.Image.Digest {
 		return Job{}, protocolError(contract.ErrorInvalidRequest, "top_level_digest does not match the pinned job digest")
 	}
+	if attempt.imageObservationHash.Valid {
+		if attempt.imageObservationHash.String != observationHash {
+			return Job{}, protocolError(contract.ErrorIdempotencyConflict, "image observation conflicts with the accepted identity")
+		}
+		return getJobByID(ctx, tx, jobID, canonicalTime(s.clock.Now()))
+	}
+	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
+		return Job{}, err
+	}
 	now := canonicalTime(s.clock.Now())
 	if !now.Before(attempt.leaseExpires) {
 		if err := expireAttempt(ctx, tx, attempt, now); err != nil {
@@ -1122,40 +1178,53 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 		}
 		return Job{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
 	}
-	if attempt.imageObservationHash.Valid {
-		if attempt.imageObservationHash.String != observationHash {
-			return Job{}, protocolError(contract.ErrorIdempotencyConflict, "image observation conflicts with the accepted identity")
-		}
-		return getJobByID(ctx, tx, jobID, now)
-	}
 	if attempt.state != contract.AttemptClaimed {
 		return Job{}, protocolError(contract.ErrorConflict, "image observation must precede Started")
 	}
-	var earlierObservationJSON []byte
-	err = tx.QueryRowContext(ctx, `SELECT image_observation_json FROM attempts
-		WHERE job_id=? AND attempt_id<>? AND image_observation_json IS NOT NULL
-		ORDER BY created_ns, attempt_id LIMIT 1`, jobID, attemptID).Scan(&earlierObservationJSON)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return Job{}, internalError(err, "read earlier job image observation")
+	if attempt.jobImageResolutionHash.Valid && attempt.jobImageResolutionHash.String != jobObservationHash {
+		return Job{}, protocolError(contract.ErrorIdempotencyConflict, "image observation conflicts with the job's resolved image identity")
 	}
-	if err == nil {
-		var earlier OCIImageEvidence
-		if err := json.Unmarshal(earlierObservationJSON, &earlier); err != nil {
-			return Job{}, internalError(err, "decode earlier job image observation")
+	resolvedAt := now
+	if attempt.jobImageResolutionHash.Valid {
+		var resolutionJSON []byte
+		if err := tx.QueryRowContext(ctx, `SELECT image_resolution_json FROM jobs WHERE job_id=?`, jobID).Scan(&resolutionJSON); err != nil {
+			return Job{}, internalError(err, "read job image resolution")
 		}
-		if earlier.TopLevelDigest != request.TopLevelDigest {
-			return Job{}, protocolError(contract.ErrorIdempotencyConflict, "top_level_digest conflicts with the job's resolved image")
+		var resolution jobImageResolution
+		if err := json.Unmarshal(resolutionJSON, &resolution); err != nil {
+			return Job{}, internalError(err, "decode job image resolution")
 		}
+		resolvedAt = resolution.ResolvedAt
 	}
 	evidence := OCIImageEvidence{
 		SubmittedReference: request.SubmittedReference, TopLevelDigest: request.TopLevelDigest,
 		TopLevelMediaType: request.TopLevelMediaType, IndexDigest: request.IndexDigest,
 		PlatformManifestDigest: request.PlatformManifestDigest, Platform: request.Platform,
-		RuntimeHandler: request.RuntimeHandler, Snapshotter: request.Snapshotter, ResolvedAt: now,
+		RuntimeHandler: request.RuntimeHandler, Snapshotter: request.Snapshotter, ResolvedAt: resolvedAt,
 	}
 	evidenceJSON, err := json.Marshal(evidence)
 	if err != nil {
 		return Job{}, internalError(err, "encode accepted image observation")
+	}
+	if !attempt.jobImageResolutionHash.Valid {
+		resolutionJSON, err := json.Marshal(jobImageResolution{
+			TopLevelDigest: request.TopLevelDigest, TopLevelMediaType: request.TopLevelMediaType,
+			IndexDigest: request.IndexDigest, ResolvedAt: resolvedAt,
+		})
+		if err != nil {
+			return Job{}, internalError(err, "encode job image resolution")
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE jobs SET image_resolution_json=?, image_resolution_hash=?
+			WHERE job_id=? AND image_resolution_hash IS NULL`, resolutionJSON, jobObservationHash, jobID)
+		if err != nil {
+			return Job{}, internalError(err, "store job image resolution")
+		}
+		if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+			if err != nil {
+				return Job{}, internalError(err, "confirm job image resolution")
+			}
+			return Job{}, protocolError(contract.ErrorIdempotencyConflict, "job image resolution was already accepted")
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE attempts SET image_observation_json=?, image_observation_hash=?, updated_ns=? WHERE attempt_id=?`,
 		evidenceJSON, observationHash, now.UnixNano(), attemptID); err != nil {
@@ -1180,6 +1249,26 @@ type imageObservationIdentity struct {
 	Platform               OCIPlatform `json:"platform"`
 	RuntimeHandler         string      `json:"runtime_handler"`
 	Snapshotter            string      `json:"snapshotter"`
+}
+
+type jobImageIdentity struct {
+	TopLevelDigest    string  `json:"top_level_digest"`
+	TopLevelMediaType string  `json:"top_level_media_type"`
+	IndexDigest       *string `json:"index_digest,omitempty"`
+}
+
+type jobImageResolution struct {
+	TopLevelDigest    string    `json:"top_level_digest"`
+	TopLevelMediaType string    `json:"top_level_media_type"`
+	IndexDigest       *string   `json:"index_digest,omitempty"`
+	ResolvedAt        time.Time `json:"resolved_at"`
+}
+
+func jobImageIdentityFromRequest(request ImageObservationRequest) jobImageIdentity {
+	return jobImageIdentity{
+		TopLevelDigest: request.TopLevelDigest, TopLevelMediaType: request.TopLevelMediaType,
+		IndexDigest: request.IndexDigest,
+	}
 }
 
 func imageObservationIdentityFromRequest(request ImageObservationRequest) imageObservationIdentity {
@@ -1234,13 +1323,17 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 	if err := json.Unmarshal(attempt.imageObservationJSON, &image); err != nil {
 		return Job{}, internalError(err, "decode image observation for Started")
 	}
-	image.StartedAt = &now
+	startedAt := now
+	if !startedAt.After(image.ResolvedAt) {
+		startedAt = image.ResolvedAt.Add(time.Nanosecond)
+	}
+	image.StartedAt = &startedAt
 	imageJSON, err := json.Marshal(image)
 	if err != nil {
 		return Job{}, internalError(err, "encode Started image evidence")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, started_ns=?, image_observation_json=?, updated_ns=? WHERE attempt_id=?`,
-		contract.AttemptRunning, now.UnixNano(), imageJSON, now.UnixNano(), attemptID); err != nil {
+		contract.AttemptRunning, startedAt.UnixNano(), imageJSON, now.UnixNano(), attemptID); err != nil {
 		return Job{}, internalError(err, "acknowledge Started attempt")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=? AND state=?`,
@@ -1888,7 +1981,9 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET prestart_retry_count=?, prestart_next_retry_at_ns=? WHERE job_id=?`, retryCount, nextRetryNS, jobID); err != nil {
 				return Job{}, internalError(err, "persist pre-start retry backoff")
 			}
-		} else if _, err := tx.ExecContext(ctx, `UPDATE jobs SET prestart_retry_count=?, prestart_next_retry_at_ns=NULL WHERE job_id=?`, retryCount, jobID); err != nil {
+		} else if _, err := tx.ExecContext(ctx, `UPDATE jobs SET prestart_retry_count=?, prestart_next_retry_at_ns=NULL,
+			prestart_terminal_reason=? WHERE job_id=?`, retryCount,
+			"pre-start infrastructure budget exhausted after runtime loss", jobID); err != nil {
 			return Job{}, internalError(err, "persist exhausted pre-start retry budget")
 		}
 	}
@@ -1999,6 +2094,7 @@ type attemptAuthority struct {
 	spec                       contract.JobSpec
 	imageObservationJSON       []byte
 	imageObservationHash       sql.NullString
+	jobImageResolutionHash     sql.NullString
 	startedNS                  sql.NullInt64
 }
 
@@ -2010,14 +2106,16 @@ func readAttemptAuthority(ctx context.Context, q queryer, attemptID string) (att
 	SELECT a.attempt_id, a.job_id, a.node_id, n.identity_node_id, a.boot_session_id, n.boot_session_id,
 	       a.authority_generation, n.authority_generation, a.state, a.fencing_token,
 	       a.lease_expires_ns, a.updated_ns, j.current_attempt_id, a.completion_key, a.completion_hash,
-	       j.spec_json, a.image_observation_json, a.image_observation_hash, a.started_ns
+	       j.spec_json, a.image_observation_json, a.image_observation_hash,
+	       j.image_resolution_hash, a.started_ns
 FROM attempts a
 JOIN jobs j ON j.job_id=a.job_id
 JOIN nodes n ON n.node_id=a.node_id
 	WHERE a.attempt_id=?`, attemptID).Scan(&a.attemptID, &a.jobID, &a.nodeID, &a.identityNodeID,
 		&a.bootSessionID, &a.currentBootSessionID, &a.authorityGeneration, &a.currentAuthorityGeneration,
 		&a.state, &a.fencingToken, &leaseNS, &updatedNS, &a.currentAttempt, &a.completionKey, &a.completionHash,
-		&specJSON, &a.imageObservationJSON, &a.imageObservationHash, &a.startedNS)
+		&specJSON, &a.imageObservationJSON, &a.imageObservationHash,
+		&a.jobImageResolutionHash, &a.startedNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return attemptAuthority{}, protocolError(contract.ErrorAttemptNotFound, "attempt %q was not found", attemptID)
 	}
@@ -2230,10 +2328,11 @@ func getJobByDispatchKey(ctx context.Context, q queryer, dispatchKey string, now
 	var currentAttempt sql.NullString
 	var createdNS, updatedNS int64
 	var requestHash string
+	var failureReason sql.NullString
 	var serviceColumns serviceJobColumns
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
-state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash,
+state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash, prestart_terminal_reason,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
 service_jobs.lifetime_restart_count, service_jobs.next_restart_at, service_jobs.published_port,
 service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id,
@@ -2256,13 +2355,16 @@ CASE
 END
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql.Named("dispatch_key", dispatchKey)).Scan(append([]any{
-		&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash,
+		&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash, &failureReason,
 	}, serviceColumns.scanDestinations()...)...)
 	if err != nil {
 		return Job{}, "", err
 	}
 	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns); err != nil {
 		return Job{}, "", err
+	}
+	if failureReason.Valid {
+		job.FailureReason = failureReason.String
 	}
 	if removal, removalErr := readServiceRemoval(ctx, q, job.JobID); removalErr == nil {
 		applyServiceRemoval(&job, removal)
@@ -2277,10 +2379,11 @@ func getJobByID(ctx context.Context, q queryer, jobID string, now time.Time) (Jo
 	var specJSON []byte
 	var currentAttempt sql.NullString
 	var createdNS, updatedNS int64
+	var failureReason sql.NullString
 	var serviceColumns serviceJobColumns
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
-state, spec_json, current_attempt_id, created_ns, updated_ns,
+state, spec_json, current_attempt_id, created_ns, updated_ns, prestart_terminal_reason,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
 service_jobs.lifetime_restart_count, service_jobs.next_restart_at, service_jobs.published_port,
 service_jobs.last_failure, service_jobs.healthy_since_ns, service_jobs.published_attempt_id,
@@ -2303,13 +2406,16 @@ CASE
 END
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_id", jobID)).Scan(append([]any{
-		&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS,
+		&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &failureReason,
 	}, serviceColumns.scanDestinations()...)...)
 	if err != nil {
 		return Job{}, err
 	}
 	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns); err != nil {
 		return Job{}, err
+	}
+	if failureReason.Valid {
+		job.FailureReason = failureReason.String
 	}
 	if removal, removalErr := readServiceRemoval(ctx, q, job.JobID); removalErr == nil {
 		applyServiceRemoval(&job, removal)
