@@ -131,8 +131,8 @@ the helper instance/session generation before each row.
    byte-identical and still exists.
 4. Host to guest: request one helper-allocated port, bind the payload only on
    guest loopback, and exchange distinct request/response markers through
-   `DialAttemptPort`. A different port and a different attempt tuple must return
-   typed authorization failures.
+   `DialAttemptPort` for the returned `service` endpoint name. A different name
+   and a different attempt tuple must return typed authorization failures.
 5. Guest to host primary: resolve `host.lima.internal` from inside the current
    guest, record the discovered address, bind only that address on macOS, and
    complete one authenticated run-bridge request. Prove no `0.0.0.0` listener

@@ -70,6 +70,56 @@ func TestEchoWithInjectedIdentity(t *testing.T) {
 	}
 }
 
+func TestConnectionForwardsWriteHalfClose(t *testing.T) {
+	network := NewNetwork()
+	server := network.NewFabric(fabric.Identity{NodeID: "server"})
+	client := network.NewFabric(fabric.Identity{NodeID: "client"})
+	listener, err := server.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		defer connection.Close()
+		request, readErr := io.ReadAll(connection)
+		if readErr == nil && string(request) != "request" {
+			readErr = fmt.Errorf("request = %q", request)
+		}
+		if readErr == nil {
+			_, readErr = io.WriteString(connection, "response")
+		}
+		serverDone <- readErr
+	}()
+	connection, err := client.Dial(t.Context(), "tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	half, ok := connection.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatalf("plain Fabric connection %T does not expose CloseWrite", connection)
+	}
+	if _, err := io.WriteString(connection, "request"); err != nil {
+		t.Fatal(err)
+	}
+	if err := half.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	response, err := io.ReadAll(connection)
+	if err != nil || string(response) != "response" {
+		t.Fatalf("response = %q, %v", response, err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestInjectedIdentityDrivesAuthorization(t *testing.T) {
 	network := NewNetwork()
 	server := network.NewFabric(fabric.Identity{NodeID: "control-plane"})

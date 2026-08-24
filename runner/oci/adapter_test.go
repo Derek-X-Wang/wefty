@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -324,9 +325,15 @@ func TestPortfulRunTransfersExactAuthorityEndpoint(t *testing.T) {
 	defer closeAdapter()
 	request := adapterTestRequest()
 	request.Authority.WorkloadClass = contract.JobClassService
-	request.AttemptPortRequired = true
+	request.AttemptEndpoints = []string{workloadrunner.AttemptEndpointService}
 	var endpoint workloadrunner.AttemptEndpoint
-	request.AttemptEndpointReady = func(value workloadrunner.AttemptEndpoint) error { endpoint = value; return nil }
+	request.AttemptEndpointReady = func(name string, value workloadrunner.AttemptEndpoint) error {
+		if name != workloadrunner.AttemptEndpointService {
+			t.Fatalf("endpoint name = %q", name)
+		}
+		endpoint = value
+		return nil
+	}
 	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
 	result, err := adapter.Run(t.Context(), request, nil)
 	if err != nil || result.Outcome.ExitCode == nil {
@@ -336,7 +343,7 @@ func TestPortfulRunTransfersExactAuthorityEndpoint(t *testing.T) {
 		t.Fatalf("endpoint = %+v", endpoint)
 	}
 	engine.mu.Lock()
-	allocated := engine.lastRun.AllocateAttemptPort
+	allocated := slices.Equal(engine.lastRun.AllocateEndpoints, []string{workloadrunner.AttemptEndpointService})
 	engine.mu.Unlock()
 	if !allocated {
 		t.Fatal("adapter did not request helper attempt-port authority")
@@ -539,8 +546,8 @@ func (engine *adapterTestEngine) Run(_ context.Context, request ocihelper.RunReq
 	if request.EnableHostBridgeFallback {
 		response.HostBridgeReady = true
 	}
-	if request.AllocateAttemptPort {
-		response.AttemptPort = 42424
+	if len(request.AllocateEndpoints) > 0 {
+		response.Endpoints = map[string]uint16{request.AllocateEndpoints[0]: 42424}
 	}
 	return response, nil
 }

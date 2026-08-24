@@ -89,6 +89,8 @@ type AttemptEndpoint struct {
 	Dial func(context.Context) (net.Conn, error)
 }
 
+const AttemptEndpointService = "service"
+
 // Request contains the mechanics needed by any workload runtime. Kind and
 // class are intentionally absent: kind selected the adapter already, while
 // class-specific lifecycle policy was compiled into these fields by the agent.
@@ -121,11 +123,11 @@ type Request struct {
 	// HostBridgeDial is set only for Lima's bind-failure reverse-tunnel path.
 	// It dials the host-local run bridge and never accepts an arbitrary target.
 	HostBridgeDial func(context.Context) (net.Conn, error)
-	// AttemptPortRequired asks an OCI runtime to allocate the payload endpoint.
-	// AttemptEndpointReady transfers its exact-authority dialer to the local
-	// service front-door seam without exposing guest networking.
-	AttemptPortRequired  bool
-	AttemptEndpointReady func(AttemptEndpoint) error
+	// AttemptEndpoints asks an OCI runtime to allocate a bounded named endpoint
+	// set. AttemptEndpointReady transfers each exact-authority dialer to the
+	// local service front-door seam without exposing guest networking.
+	AttemptEndpoints     []string
+	AttemptEndpointReady func(string, AttemptEndpoint) error
 	// TODO(#147): replace this process TCP backend with an adapter-supplied,
 	// opaque dial endpoint.
 	ServiceAddress   string

@@ -5,7 +5,6 @@ package agent
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -58,35 +57,38 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	primary := startNativeOCIService(t, ctx, adapter, reference, digest, "primary", true)
+	primary := startNativeOCIService(t, ctx, adapter, reference, digest, "primary", nil, true)
 	defer primary.stop(t, adapter)
-	if body := primary.request(t, http.MethodGet, "/healthz", nil); string(body) != "healthy\n" {
-		t.Fatalf("health response = %q", body)
+	healthOK := string(primary.request(t, http.MethodGet, "/healthz", nil)) == "healthy\n"
+	if !healthOK {
+		t.Fatal("health response did not traverse the Fabric and helper tunnel")
 	}
 	echo := []byte("echo-through-fabric-and-helper")
-	if body := primary.request(t, http.MethodPost, "/cgi-bin/echo", echo); !bytes.Equal(body, echo) {
-		t.Fatalf("echo response = %q, want %q", body, echo)
+	echoOK := bytes.Equal(primary.request(t, http.MethodPost, "/cgi-bin/echo", echo), echo)
+	if !echoOK {
+		t.Fatal("echo response did not traverse the Fabric and helper tunnel")
 	}
 
-	sibling := startNativeOCIService(t, ctx, adapter, reference, digest, "sibling", true)
-	if sibling.backendPort.Load() == primary.backendPort.Load() {
+	sibling := startNativeOCIService(t, ctx, adapter, reference, digest, "sibling", nil, true)
+	portCollisionAvoided := sibling.backendPort.Load() != primary.backendPort.Load()
+	if !portCollisionAvoided {
 		t.Fatalf("concurrent OCI services shared backend port %d", primary.backendPort.Load())
 	}
 	sibling.stop(t, adapter)
 
-	primary.tunnelAvailable.Store(false)
-	primary.waitReachable(t, false, 5*time.Second)
+	primary.triggerPayloadListenerRestart(t)
+	withdrawalObserved := primary.waitReachable(t, false, 5*time.Second)
 	select {
 	case outcome := <-primary.done:
 		t.Fatalf("helper-tunnel withdrawal killed payload: (%#v, %v)", outcome.result, outcome.err)
 	default:
 	}
-	primary.tunnelAvailable.Store(true)
-	primary.waitReachable(t, true, 5*time.Second)
+	republicationObserved := primary.waitReachable(t, true, 5*time.Second)
 
-	timedOut := startNativeOCIService(t, ctx, adapter, reference, digest, "startup-timeout", false)
+	timedOut := startNativeOCIService(t, ctx, adapter, reference, digest, "startup-timeout", []string{"/bin/sh", "-c", "sleep 600"}, false)
 	outcome := waitServiceOutcome(t, timedOut.done)
-	if outcome.err == nil || outcome.result.SpawnError == nil || outcome.result.SpawnError.Code != contract.SpawnFailureStartupReadinessTimeout {
+	startupTimedOut := outcome.err != nil && outcome.result.SpawnError != nil && outcome.result.SpawnError.Code == contract.SpawnFailureStartupReadinessTimeout
+	if !startupTimedOut {
 		t.Fatalf("OCI startup timeout = (%#v, %v)", outcome.result, outcome.err)
 	}
 	timedOut.reap(t, adapter)
@@ -100,7 +102,7 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 		portlessStarted <- struct{}{}
 		return nil
 	}
-	portless.AttemptEndpointReady = func(workloadrunner.AttemptEndpoint) error {
+	portless.AttemptEndpointReady = func(string, workloadrunner.AttemptEndpoint) error {
 		portlessEndpoint = true
 		return nil
 	}
@@ -113,7 +115,8 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	default:
 		t.Fatal("portless OCI service did not report authoritative Started")
 	}
-	if portlessEndpoint {
+	portlessOK := !portlessEndpoint
+	if !portlessOK {
 		t.Fatal("portless OCI service published an attempt endpoint")
 	}
 	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: portless.Authority}); err != nil || !receipt.RuntimeQuiesced {
@@ -121,7 +124,8 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	}
 
 	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-		evidence := fmt.Sprintf("platform=%s/%s\nhealth=true\necho=true\nstartup_timeout=true\nwithdrawal=true\nrepublication=true\nport_collision_avoided=true\nportless_started=true\nhelper_tunnel=true\n", runtime.GOOS, runtime.GOARCH)
+		helperTunnelOK := primary.backendPort.Load() != 0 && healthOK && echoOK
+		evidence := fmt.Sprintf("platform=%s/%s\nhealth=%t\necho=%t\nstartup_timeout=%t\nwithdrawal=%t\nrepublication=%t\nport_collision_avoided=%t\nportless_started=%t\nhelper_tunnel=%t\n", runtime.GOOS, runtime.GOARCH, healthOK, echoOK, startupTimedOut, withdrawalObserved, republicationObserved, portCollisionAvoided, portlessOK, helperTunnelOK)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-publication-"+runtime.GOOS+".txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -135,7 +139,6 @@ type nativeOCIService struct {
 	client           *http.Client
 	address          string
 	backendPort      atomic.Uint32
-	tunnelAvailable  atomic.Bool
 	reaped           atomic.Bool
 }
 
@@ -144,7 +147,8 @@ func startNativeOCIService(
 	parent context.Context,
 	adapter *ocirunner.Adapter,
 	reference, digest, suffix string,
-	tunnelInitiallyAvailable bool,
+	argv []string,
+	waitForReadiness bool,
 ) *nativeOCIService {
 	t.Helper()
 	network := plain.NewNetwork()
@@ -155,10 +159,13 @@ func startNativeOCIService(
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := nativeOCIServiceRequest(reference, digest, suffix, []string{"/bin/sh", "-c", nativeOCIHTTPServiceScript})
+	if argv == nil {
+		argv = []string{"/bin/sh", "-c", nativeOCIHTTPServiceScript}
+	}
+	request := nativeOCIServiceRequest(reference, digest, suffix, argv)
 	latch := newRuntimeEndpointLatch()
-	request.AttemptPortRequired = true
-	endpoint := latch.endpoint()
+	request.AttemptEndpoints = []string{workloadrunner.AttemptEndpointService}
+	endpoint := latch.endpoint(workloadrunner.AttemptEndpointService)
 	service := &nativeOCIService{
 		requestAuthority: request.Authority, done: make(chan serviceRunOutcome, 1), address: address,
 		client: &http.Client{
@@ -168,17 +175,9 @@ func startNativeOCIService(
 			}},
 		},
 	}
-	service.tunnelAvailable.Store(tunnelInitiallyAvailable)
-	originalDial := endpoint.dial
-	endpoint.dial = func(ctx context.Context) (net.Conn, error) {
-		if !service.tunnelAvailable.Load() {
-			return nil, errors.New("injected helper tunnel outage")
-		}
-		return originalDial(ctx)
-	}
-	request.AttemptEndpointReady = func(value workloadrunner.AttemptEndpoint) error {
+	request.AttemptEndpointReady = func(name string, value workloadrunner.AttemptEndpoint) error {
 		service.backendPort.Store(uint32(value.Port))
-		return latch.publish(value)
+		return latch.publish(name, value)
 	}
 	runContext, cancel := context.WithCancel(parent)
 	service.cancel = cancel
@@ -194,7 +193,7 @@ func startNativeOCIService(
 		)
 		service.done <- serviceRunOutcome{result: result, err: runErr}
 	}()
-	if tunnelInitiallyAvailable {
+	if waitForReadiness {
 		service.waitReachable(t, true, 15*time.Second)
 	}
 	return service
@@ -226,8 +225,23 @@ test "$WEFTY_SERVICE_DIR" = "/wefty/service" || exit 91
 mkdir -p /tmp/wefty-www/cgi-bin
 printf 'healthy\n' >/tmp/wefty-www/healthz
 printf '#!/bin/sh\nprintf "Content-Type: application/octet-stream\\r\\n\\r\\n"\ndd bs=1 count="${CONTENT_LENGTH:-0}" 2>/dev/null\n' >/tmp/wefty-www/cgi-bin/echo
+printf '#!/bin/sh\ntouch /tmp/wefty-listener-restart\nprintf "Status: 204 No Content\\r\\n\\r\\n"\n' >/tmp/wefty-www/cgi-bin/restart-listener
 chmod 0755 /tmp/wefty-www/cgi-bin/echo
-exec /bin/httpd -f -p "127.0.0.1:$WEFTY_SERVICE_PORT" -h /tmp/wefty-www
+chmod 0755 /tmp/wefty-www/cgi-bin/restart-listener
+while :; do
+  /bin/httpd -f -p "127.0.0.1:$WEFTY_SERVICE_PORT" -h /tmp/wefty-www &
+  server=$!
+  while kill -0 "$server" 2>/dev/null && test ! -f /tmp/wefty-listener-restart; do sleep 0.05; done
+  if test -f /tmp/wefty-listener-restart; then
+    kill "$server" 2>/dev/null || true
+    wait "$server" 2>/dev/null || true
+    sleep 1
+    rm -f /tmp/wefty-listener-restart
+  else
+    wait "$server"
+    exit $?
+  fi
+done
 `
 
 func (service *nativeOCIService) request(t *testing.T, method, path string, body []byte) []byte {
@@ -251,7 +265,20 @@ func (service *nativeOCIService) request(t *testing.T, method, path string, body
 	return payload
 }
 
-func (service *nativeOCIService) waitReachable(t *testing.T, want bool, timeout time.Duration) {
+func (service *nativeOCIService) triggerPayloadListenerRestart(t *testing.T) {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodGet, "http://service.invalid/cgi-bin/restart-listener", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, _ := service.client.Do(request)
+	if response != nil {
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+	}
+}
+
+func (service *nativeOCIService) waitReachable(t *testing.T, want bool, timeout time.Duration) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -266,11 +293,12 @@ func (service *nativeOCIService) waitReachable(t *testing.T, want bool, timeout 
 			_ = response.Body.Close()
 		}
 		if reachable == want {
-			return
+			return true
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("OCI service reachability did not become %v", want)
+	return false
 }
 
 func (service *nativeOCIService) stop(t *testing.T, adapter *ocirunner.Adapter) {

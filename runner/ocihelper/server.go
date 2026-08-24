@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"slices"
 	"sync"
@@ -69,7 +70,8 @@ const (
 type serverAttempt struct {
 	authority        AttemptAuthority
 	state            attemptState
-	port             uint16
+	endpoints        map[string]uint16
+	cgroupID         string
 	bridgeCapability string
 	deadline         time.Time
 	deadlineChanged  chan struct{}
@@ -567,6 +569,9 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 	if err := validateWorkloadWire(request.Workload); err != nil {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
 	}
+	if err := validateEndpointNames(request.AllocateEndpoints); err != nil {
+		return nil, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
+	}
 	attempt := &serverAttempt{
 		authority: request.Authority, state: attemptStarting,
 		deadline:        session.server.config.Clock.Now().Add(request.InitialDeadman),
@@ -587,6 +592,48 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 	return attempt, nil
 }
 
+const maximumAttemptEndpoints = 8
+
+func validateEndpointNames(names []string) error {
+	if len(names) > maximumAttemptEndpoints {
+		return fmt.Errorf("at most %d attempt endpoints may be allocated", maximumAttemptEndpoints)
+	}
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if len(name) == 0 || len(name) > 32 || name[0] < 'a' || name[0] > 'z' {
+			return errors.New("attempt endpoint names must start with a lowercase letter and contain at most 32 lowercase letters, digits, underscores, or hyphens")
+		}
+		for _, value := range name[1:] {
+			if (value < 'a' || value > 'z') && (value < '0' || value > '9') && value != '_' && value != '-' {
+				return errors.New("attempt endpoint names must start with a lowercase letter and contain at most 32 lowercase letters, digits, underscores, or hyphens")
+			}
+		}
+		if _, exists := seen[name]; exists {
+			return errors.New("attempt endpoint names must be unique")
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+func endpointAllocationMatches(requested []string, allocated map[string]uint16) bool {
+	if len(requested) != len(allocated) {
+		return false
+	}
+	ports := make(map[uint16]struct{}, len(allocated))
+	for _, name := range requested {
+		port := allocated[name]
+		if port == 0 {
+			return false
+		}
+		if _, duplicate := ports[port]; duplicate {
+			return false
+		}
+		ports[port] = struct{}{}
+	}
+	return true
+}
+
 func (session *serverSession) completeAttempt(request RunRequest, attempt *serverAttempt, response *RunResponse) *RPCError {
 	if !response.Started {
 		return &RPCError{Code: CodeEngineFailure, Message: "engine Run returned without authoritative Started evidence"}
@@ -594,8 +641,8 @@ func (session *serverSession) completeAttempt(request RunRequest, attempt *serve
 	if response.HostBridgeReady && !request.EnableHostBridgeFallback {
 		return &RPCError{Code: CodeEngineFailure, Message: "engine enabled an unrequested host bridge fallback"}
 	}
-	if (response.AttemptPort != 0) != request.AllocateAttemptPort {
-		return &RPCError{Code: CodeEngineFailure, Message: "engine attempt-port allocation did not match the request"}
+	if !endpointAllocationMatches(request.AllocateEndpoints, response.Endpoints) {
+		return &RPCError{Code: CodeEngineFailure, Message: "engine endpoint allocation did not match the request"}
 	}
 	bridgeCapability := ""
 	var err error
@@ -610,7 +657,8 @@ func (session *serverSession) completeAttempt(request RunRequest, attempt *serve
 	if session.closed || session.attempts[request.Authority.key()] != attempt || attempt.state != attemptStarting {
 		return &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt authority expired while starting"}
 	}
-	attempt.port = response.AttemptPort
+	attempt.endpoints = maps.Clone(response.Endpoints)
+	attempt.cgroupID = request.Resources.CgroupID
 	attempt.bridgeCapability = bridgeCapability
 	attempt.state = attemptLive
 	response.BridgeCapability = bridgeCapability
@@ -960,10 +1008,17 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		attempt, rpcErr := session.authorizeAttempt(body.Authority)
-		if rpcErr != nil || body.Port == 0 || body.Port != attempt.port {
-			_ = writeFailure(wire, CodeUnauthorizedPort, "port is not allocated to this live attempt")
+		if rpcErr != nil {
+			_ = writeRPCError(wire, rpcErr)
 			return
 		}
+		port := attempt.endpoints[body.Name]
+		if body.Name == "" || port == 0 {
+			_ = writeFailure(wire, CodeUnauthorizedPort, "endpoint is not allocated to this live attempt")
+			return
+		}
+		body.Port = port
+		body.CgroupID = attempt.cgroupID
 		if err := writeSuccess(wire, struct{}{}); err != nil || !readStreamAcknowledgement(operation.conn) {
 			return
 		}
@@ -1006,7 +1061,7 @@ type operationStream struct {
 
 func (stream *operationStream) Read(buffer []byte) (int, error) {
 	count, err := stream.Conn.Read(buffer)
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
 		stream.cancel()
 	}
 	return count, err
@@ -1018,6 +1073,13 @@ func (stream *operationStream) Write(buffer []byte) (int, error) {
 		stream.cancel()
 	}
 	return count, err
+}
+
+func (stream *operationStream) CloseWrite() error {
+	if half, ok := stream.Conn.(interface{ CloseWrite() error }); ok {
+		return half.CloseWrite()
+	}
+	return errors.New("OCI helper stream transport does not support a write half-close")
 }
 
 func authorizeRequest(connection *framedConn, session *serverSession, authority AttemptAuthority) bool {

@@ -163,13 +163,13 @@ heartbeats.
 | RPC | Scope and result |
 | --- | --- |
 | `EnsureImage` | Session-authorized, typed progress/result stream on a dedicated connection. The agent supplies the canonical platform retained from the successful probe for this helper generation; manifest selection and image singleflight are keyed by it. Registry mode resolves only a public reference, pins the returned top-level digest, pulls into the fixed namespace, and unpacks that platform. Archive mode receives an OCI-layout tar stream, recomputes every blob digest, validates descriptor sizes and reachability, admits exactly that platform, and imports/unpacks it. Both modes return the same complete image evidence used by `Run`, including top-level/platform digests, platform, runtime handler, and snapshotter; no containerd type, private registry credential, or retry policy crosses the boundary. |
-| `Run` | Exact attempt authority, initial deadman, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started` with helper-observed image evidence. An explicit attempt-port request allocates from the helper-owned reserved range and injects the authoritative loopback port; an explicit Mac bridge-fallback request creates a separate guest loopback listener and capability. |
+| `Run` | Exact attempt authority, initial deadman, a bounded requested endpoint-name list, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started` with helper-observed image evidence and a map from every requested endpoint name to its allocated loopback port. Today ordinary services request only `service`; the named map is the ratified wire shape for later `view` and `control` endpoints. An explicit Mac bridge-fallback request creates a separate guest loopback listener and capability. |
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. |
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only. A positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments; only then does the server tombstone authorization. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
-| `DialAttemptPort` | Bidirectional host-to-guest stream for exactly the port returned by that live attempt's `Run`; success is withheld until the helper has connected that backend, and the returned stream outlives cancellation of its dial context. It is never a general guest dialer. |
+| `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend, and only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
 | `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the Mac bind-failure fallback and the helper issued that attempt's separate bridge capability. It never accepts an arbitrary host address or port. |
 
 `DialAttemptPort` terminates inside the guest at `127.0.0.1:<allocated-port>`.
@@ -188,8 +188,10 @@ Neither direction accepts a caller-supplied network destination.
 Stream RPCs use a JSON authorization response followed by a one-byte client
 acknowledgement before raw bytes begin. This keeps JSON decoder read-ahead from
 consuming stream payload. Authorization is complete before success is sent.
-EOF or client cancellation on any operation connection cancels its engine
-context. `EnsureImage` is content-addressed and does not take the attempt-create
+Non-EOF stream errors and client cancellation cancel the engine context. A
+normal read EOF on a raw tunnel is a request-side half-close: it propagates
+`CloseWrite` and leaves the response direction alive. `EnsureImage` is
+content-addressed and does not take the attempt-create
 side of the sweep gate.
 
 Archive-mode `EnsureImage` sends its ordinary authorization frame before the

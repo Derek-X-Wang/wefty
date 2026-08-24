@@ -225,6 +225,13 @@ func (c *connWithIdentity) Close() error {
 	return c.Conn.Close()
 }
 
+func (c *connWithIdentity) CloseWrite() error {
+	if connection, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return connection.CloseWrite()
+	}
+	return fmt.Errorf("plain fabric: connection %T does not support CloseWrite", c.Conn)
+}
+
 func writeIdentity(writer io.Writer, identity fabric.Identity) error {
 	payload, err := json.Marshal(identity)
 	if err != nil {

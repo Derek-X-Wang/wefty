@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strconv"
 	"sync"
@@ -26,45 +27,58 @@ type serviceRuntimeEndpoint struct {
 }
 
 type runtimeEndpointLatch struct {
-	ready chan struct{}
-	once  sync.Once
-	mu    sync.RWMutex
-	value workloadrunner.AttemptEndpoint
+	mu     sync.Mutex
+	values map[string]workloadrunner.AttemptEndpoint
+	ready  map[string]chan struct{}
 }
 
 func newRuntimeEndpointLatch() *runtimeEndpointLatch {
-	return &runtimeEndpointLatch{ready: make(chan struct{})}
+	return &runtimeEndpointLatch{values: make(map[string]workloadrunner.AttemptEndpoint), ready: make(map[string]chan struct{})}
 }
 
-func (latch *runtimeEndpointLatch) publish(endpoint workloadrunner.AttemptEndpoint) error {
+func (latch *runtimeEndpointLatch) publish(name string, endpoint workloadrunner.AttemptEndpoint) error {
+	if name == "" {
+		return errors.New("runtime supplied an unnamed attempt endpoint")
+	}
 	if endpoint.Port == 0 || endpoint.Dial == nil {
 		return errors.New("runtime supplied an invalid attempt endpoint")
 	}
-	published := false
-	latch.once.Do(func() {
-		latch.mu.Lock()
-		latch.value = endpoint
-		latch.mu.Unlock()
-		close(latch.ready)
-		published = true
-	})
-	if !published {
-		return errors.New("runtime supplied the attempt endpoint more than once")
+	latch.mu.Lock()
+	defer latch.mu.Unlock()
+	if _, exists := latch.values[name]; exists {
+		return fmt.Errorf("runtime supplied attempt endpoint %q more than once", name)
 	}
+	latch.values[name] = endpoint
+	ready := latch.ready[name]
+	if ready == nil {
+		ready = make(chan struct{})
+		latch.ready[name] = ready
+	}
+	close(ready)
 	return nil
 }
 
-func (latch *runtimeEndpointLatch) endpoint() serviceRuntimeEndpoint {
+func (latch *runtimeEndpointLatch) endpoint(name string) serviceRuntimeEndpoint {
 	return serviceRuntimeEndpoint{dial: func(ctx context.Context) (net.Conn, error) {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-latch.ready:
+		latch.mu.Lock()
+		endpoint, exists := latch.values[name]
+		ready := latch.ready[name]
+		if ready == nil {
+			ready = make(chan struct{})
+			latch.ready[name] = ready
 		}
-		latch.mu.RLock()
-		dial := latch.value.Dial
-		latch.mu.RUnlock()
-		return dial(ctx)
+		latch.mu.Unlock()
+		if !exists {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-ready:
+			}
+			latch.mu.Lock()
+			endpoint = latch.values[name]
+			latch.mu.Unlock()
+		}
+		return endpoint.Dial(ctx)
 	}}
 }
 
@@ -96,6 +110,12 @@ type serviceRunOutcome struct {
 	err    error
 }
 
+type opaqueReadinessResult struct {
+	outcome    serviceRunOutcome
+	hasOutcome bool
+	err        error
+}
+
 type serviceSupervisorConfig struct {
 	clock                     Clock
 	startupReadinessDeadline  time.Duration
@@ -124,7 +144,7 @@ func runPortfulService(
 	// Fabric listener first. The explicit ctx.Done arm below owns that order.
 	runContext, cancelRun := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelRun()
-	frontDoor := newServiceFrontDoor(listener, endpoint.dial, processrunner.DefaultReadinessConnectTimeout)
+	frontDoor := newServiceFrontDoor(listener, endpoint.dial, durationOrDefault(config.readinessConnectTimeout, processrunner.DefaultReadinessConnectTimeout))
 	defer frontDoor.Close()
 	go frontDoor.Serve(runContext)
 	publication := newPublicationController(
@@ -159,9 +179,16 @@ func runPortfulService(
 		}
 	}
 	request.ServiceAddress = endpoint.address
-	var readinessDone <-chan error
+	var started chan struct{}
 	if endpoint.address == "" {
-		started := make(chan struct{})
+		if endpoint.dial == nil {
+			err := errors.New("opaque service runtime endpoint has no dial function")
+			publication.Stop()
+			cancelRun()
+			<-publicationDone
+			return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+		}
+		started = make(chan struct{})
 		var startedOnce sync.Once
 		priorStarted := request.Started
 		request.Started = func() {
@@ -170,31 +197,46 @@ func runPortfulService(
 			}
 			startedOnce.Do(func() { close(started) })
 		}
-		result := make(chan error, 1)
-		go func() {
-			result <- monitorOpaqueServiceReadiness(
-				runContext, config.clock, started, endpoint.dial,
-				config.startupReadinessDeadline, config.readinessProbeInterval,
-				config.readinessConnectTimeout, readinessChanged,
-			)
-		}()
-		readinessDone = result
 	}
 	outcomes := make(chan serviceRunOutcome, 1)
 	go func() {
 		result, err := runtimeAdapter.Run(runContext, request, sink)
 		outcomes <- serviceRunOutcome{result: result.Outcome, err: err}
 	}()
+	var readinessDone <-chan opaqueReadinessResult
+	runtimeOutcomes := (<-chan serviceRunOutcome)(outcomes)
+	if started != nil {
+		result := make(chan opaqueReadinessResult, 1)
+		go func() {
+			result <- monitorOpaqueServiceReadiness(
+				runContext, config.clock, started, endpoint.dial,
+				config.startupReadinessDeadline, config.readinessProbeInterval,
+				config.readinessConnectTimeout, readinessChanged, outcomes,
+			)
+		}()
+		readinessDone = result
+		runtimeOutcomes = nil
+	}
+	waitOutcome := func() serviceRunOutcome {
+		if readinessDone == nil {
+			return <-outcomes
+		}
+		result := <-readinessDone
+		if result.hasOutcome {
+			return result.outcome
+		}
+		return <-outcomes
+	}
 
 	select {
 	case <-ctx.Done():
 		publication.Stop()
 		frontDoor.Close()
 		cancelRun()
-		outcome := <-outcomes
+		outcome := waitOutcome()
 		publicationErr := <-publicationDone
 		return outcome.result, errors.Join(outcome.err, publicationErr)
-	case outcome := <-outcomes:
+	case outcome := <-runtimeOutcomes:
 		publication.Stop()
 		if publicationErr := <-publicationDone; publicationErr != nil {
 			return outcome.result, errors.Join(outcome.err, publicationErr)
@@ -208,28 +250,26 @@ func runPortfulService(
 		}
 		publication.Stop()
 		cancelRun()
-		outcome := <-outcomes
+		outcome := waitOutcome()
 		return outcome.result, errors.Join(outcome.err, publicationErr)
 	case err := <-frontDoor.Errors():
 		publication.Stop()
 		cancelRun()
 		<-publicationDone
-		<-outcomes
+		_ = waitOutcome()
 		return spawnFailure(contract.SpawnFailurePublishedListener, err), err
-	case readinessErr := <-readinessDone:
-		if readinessErr == nil {
-			cancelRun()
-			outcome := <-outcomes
+	case readiness := <-readinessDone:
+		if readiness.hasOutcome {
 			publication.Stop()
 			publicationErr := <-publicationDone
-			return outcome.result, errors.Join(outcome.err, publicationErr)
+			return readiness.outcome.result, errors.Join(readiness.outcome.err, publicationErr)
 		}
 		publication.Stop()
 		frontDoor.Close()
 		cancelRun()
 		outcome := <-outcomes
 		publicationErr := <-publicationDone
-		return spawnFailure(contract.SpawnFailureStartupReadinessTimeout, readinessErr), errors.Join(readinessErr, outcome.err, publicationErr)
+		return spawnFailure(contract.SpawnFailureStartupReadinessTimeout, readiness.err), errors.Join(readiness.err, outcome.err, publicationErr)
 	}
 }
 
@@ -240,7 +280,8 @@ func monitorOpaqueServiceReadiness(
 	dial func(context.Context) (net.Conn, error),
 	startupDeadline, probeInterval, connectTimeout time.Duration,
 	observe func(startupSatisfied, ready bool),
-) error {
+	outcomes <-chan serviceRunOutcome,
+) opaqueReadinessResult {
 	if clock == nil {
 		clock = systemClock{}
 	}
@@ -249,53 +290,102 @@ func monitorOpaqueServiceReadiness(
 	connectTimeout = durationOrDefault(connectTimeout, processrunner.DefaultReadinessConnectTimeout)
 	select {
 	case <-ctx.Done():
-		return nil
+		return opaqueReadinessResult{outcome: <-outcomes, hasOutcome: true}
+	case outcome := <-outcomes:
+		return opaqueReadinessResult{outcome: outcome, hasOutcome: true}
 	case <-started:
 	}
 
 	deadline := clock.NewTimer(startupDeadline)
 	defer stopTimer(deadline)
+	deadlineChannel := deadline.C()
 	var interval Timer
 	var intervalChannel <-chan time.Time
 	startupSatisfied := false
 	ready := false
+	type probeResult struct{ err error }
+	var probeDone <-chan probeResult
+	var cancelProbe context.CancelFunc
+	startProbe := func() {
+		probeContext, cancel := context.WithTimeout(ctx, connectTimeout)
+		cancelProbe = cancel
+		result := make(chan probeResult, 1)
+		probeDone = result
+		go func() {
+			connection, err := dial(probeContext)
+			if connection != nil {
+				_ = connection.Close()
+			}
+			result <- probeResult{err: err}
+		}()
+	}
+	consumeOutcome := func() (serviceRunOutcome, bool) {
+		select {
+		case outcome := <-outcomes:
+			return outcome, true
+		default:
+			return serviceRunOutcome{}, false
+		}
+	}
+	timeoutResult := func() opaqueReadinessResult {
+		if cancelProbe != nil {
+			cancelProbe()
+		}
+		if outcome, ok := consumeOutcome(); ok {
+			return opaqueReadinessResult{outcome: outcome, hasOutcome: true}
+		}
+		return opaqueReadinessResult{err: errors.New("runtime-local service endpoint did not accept connections before the startup deadline")}
+	}
+	startProbe()
 	for {
-		probeContext, cancelProbe := context.WithTimeout(ctx, connectTimeout)
-		connection, err := dial(probeContext)
-		cancelProbe()
-		nextReady := err == nil
-		if connection != nil {
-			_ = connection.Close()
-		}
-		if nextReady != ready {
-			ready = nextReady
-			if ready {
-				startupSatisfied = true
-				stopTimer(deadline)
-			}
-			observe(startupSatisfied, ready)
-		}
-		if interval == nil {
-			interval = clock.NewTimer(probeInterval)
-			defer stopTimer(interval)
-			intervalChannel = interval.C()
-		} else {
-			interval.Reset(probeInterval)
-		}
-		if startupSatisfied {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-intervalChannel:
-			}
-			continue
-		}
 		select {
 		case <-ctx.Done():
-			return nil
-		case <-deadline.C():
-			return errors.New("runtime-local service endpoint did not accept connections before the startup deadline")
+			if cancelProbe != nil {
+				cancelProbe()
+			}
+			return opaqueReadinessResult{outcome: <-outcomes, hasOutcome: true}
+		case outcome := <-outcomes:
+			if cancelProbe != nil {
+				cancelProbe()
+			}
+			return opaqueReadinessResult{outcome: outcome, hasOutcome: true}
+		case <-deadlineChannel:
+			return timeoutResult()
+		case probe := <-probeDone:
+			cancelProbe()
+			cancelProbe = nil
+			probeDone = nil
+			if outcome, ok := consumeOutcome(); ok {
+				return opaqueReadinessResult{outcome: outcome, hasOutcome: true}
+			}
+			if !startupSatisfied {
+				select {
+				case <-deadlineChannel:
+					return timeoutResult()
+				default:
+				}
+			}
+			nextReady := probe.err == nil
+			if nextReady != ready {
+				ready = nextReady
+				if ready {
+					startupSatisfied = true
+					stopTimer(deadline)
+					deadlineChannel = nil
+				}
+				observe(startupSatisfied, ready)
+			}
+			if interval == nil {
+				interval = clock.NewTimer(probeInterval)
+				defer stopTimer(interval)
+				intervalChannel = interval.C()
+			} else {
+				interval.Reset(probeInterval)
+				intervalChannel = interval.C()
+			}
 		case <-intervalChannel:
+			intervalChannel = nil
+			startProbe()
 		}
 	}
 }
@@ -352,6 +442,9 @@ func (frontDoor *serviceFrontDoor) SetForwarding(enabled bool) {
 		return
 	}
 	frontDoor.forwarding = enabled
+	if !enabled {
+		frontDoor.closeActiveLocked()
+	}
 }
 
 func (frontDoor *serviceFrontDoor) Close() {
@@ -397,10 +490,12 @@ func (frontDoor *serviceFrontDoor) forward(ctx context.Context, published net.Co
 	go func() {
 		defer copies.Done()
 		_, _ = io.Copy(backend, published)
+		closeServiceWrite(backend)
 	}()
 	go func() {
 		defer copies.Done()
 		_, _ = io.Copy(published, backend)
+		closeServiceWrite(published)
 	}()
 	copies.Wait()
 	_ = published.Close()
@@ -409,6 +504,19 @@ func (frontDoor *serviceFrontDoor) forward(ctx context.Context, published net.Co
 	frontDoor.mu.Lock()
 	delete(frontDoor.active, published)
 	frontDoor.mu.Unlock()
+}
+
+func closeServiceWrite(connection net.Conn) {
+	if half, ok := connection.(interface{ CloseWrite() error }); ok {
+		if err := half.CloseWrite(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Printf("service front door write-half close: %v", err)
+		}
+		return
+	}
+	log.Printf("service front door connection %T lacks CloseWrite; closing the full tunnel", connection)
+	if err := connection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Printf("service front door full-close fallback: %v", err)
+	}
 }
 
 func (frontDoor *serviceFrontDoor) closeActiveLocked() {
