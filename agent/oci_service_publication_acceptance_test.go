@@ -225,7 +225,7 @@ const nativeOCIHTTPServiceScript = `
 test "$WEFTY_SERVICE_DIR" = "/wefty/service" || exit 91
 mkdir -p /tmp/wefty-www/cgi-bin
 printf 'healthy\n' >/tmp/wefty-www/healthz
-printf '#!/bin/sh\nprintf "Content-Type: application/octet-stream\\r\\n\\r\\n"\ncat\n' >/tmp/wefty-www/cgi-bin/echo
+printf '#!/bin/sh\nprintf "Content-Type: application/octet-stream\\r\\n\\r\\n"\ndd bs=1 count="${CONTENT_LENGTH:-0}" 2>/dev/null\n' >/tmp/wefty-www/cgi-bin/echo
 chmod 0755 /tmp/wefty-www/cgi-bin/echo
 exec /bin/httpd -f -p "127.0.0.1:$WEFTY_SERVICE_PORT" -h /tmp/wefty-www
 `
