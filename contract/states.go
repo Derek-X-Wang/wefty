@@ -43,7 +43,7 @@ var ServiceJobTransitions = map[JobState][]JobState{
 	JobClaimed:                    {JobRunning, JobStopping, JobQueued, JobFailed, JobRemovalPending},
 	JobRunning:                    {JobStopping, JobQueued, JobFailed, JobRemovalPending},
 	JobStopping:                   {JobStopped, JobFailed, JobRemovalPending},
-	JobStopped:                    {JobQueued, JobRemovalPending},
+	JobStopped:                    {JobQueued, JobFailed, JobRemovalPending},
 	JobFailed:                     {JobQueued, JobRemovalPending},
 	JobRemovalPending:             {JobAgentCleaned, JobForgottenCleanupUnverified},
 	JobAgentCleaned:               {JobRemovedVerified, JobForgottenCleanupUnverified},

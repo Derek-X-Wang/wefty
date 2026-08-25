@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -765,7 +766,7 @@ func (session *serverSession) sweepRequired(method Method) bool {
 	switch method {
 	case MethodAcquireSession, MethodSweep, MethodVerify:
 		return false
-	case MethodEnsureImage, MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDialAttemptPort, MethodDialHostBridge:
+	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus, MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDialAttemptPort, MethodDialHostBridge:
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		return !session.sweepVerified
@@ -788,6 +789,10 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		if err := validateEnsureImageRequest(body); err != nil {
 			_ = writeFailure(wire, CodeInvalidRequest, err.Error())
+			return
+		}
+		if body.Pin != nil && (body.Pin.Authority.NodeID != session.identity.NodeID || body.Pin.Authority.BootSessionID != session.identity.BootSessionID) {
+			_ = writeFailure(wire, CodeUnauthorizedAttempt, "image pin authority is outside this helper session")
 			return
 		}
 		var archive io.Reader
@@ -814,6 +819,66 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return writeSuccess(wire, event)
 		})
 		writeImageStreamResult(wire, err)
+	case MethodReconcileImagePins:
+		var body ReconcileImagePinsRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if body.CacheMaxBytes <= 0 {
+			_ = writeFailure(wire, CodeInvalidRequest, "image cache maximum bytes must be positive")
+			return
+		}
+		cacheEngine, ok := server.engine.(ImageCacheEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "image cache policy is unavailable")
+			return
+		}
+		response, err := cacheEngine.ReconcileImagePins(operation.ctx, body)
+		_ = writeEngineResponse(wire, response, err)
+	case MethodReleaseImagePin:
+		var body ReleaseImagePinRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if strings.TrimSpace(body.JobID) == "" {
+			_ = writeFailure(wire, CodeInvalidRequest, "binding image pin job ID is required")
+			return
+		}
+		cacheEngine, ok := server.engine.(ImageCacheEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "image cache policy is unavailable")
+			return
+		}
+		err := cacheEngine.ReleaseImagePin(operation.ctx, body)
+		_ = writeEngineResponse(wire, struct{}{}, err)
+	case MethodReleaseAttemptPin:
+		var body ReleaseAttemptImagePinRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if err := body.Authority.validate(); err != nil || body.Authority.NodeID != session.identity.NodeID || body.Authority.BootSessionID != session.identity.BootSessionID {
+			_ = writeFailure(wire, CodeUnauthorizedAttempt, "attempt image pin authority is outside this helper session")
+			return
+		}
+		cacheEngine, ok := server.engine.(ImageCacheEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "image cache policy is unavailable")
+			return
+		}
+		err := cacheEngine.ReleaseAttemptImagePin(operation.ctx, body)
+		_ = writeEngineResponse(wire, struct{}{}, err)
+	case MethodImageCacheStatus:
+		var body struct{}
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		cacheEngine, ok := server.engine.(ImageCacheEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "image cache policy is unavailable")
+			return
+		}
+		response, err := cacheEngine.ImageCacheStatus(operation.ctx)
+		_ = writeEngineResponse(wire, response, err)
 	case MethodRun:
 		var body RunRequest
 		if !decodeRequest(wire, request.Body, &body) {

@@ -40,6 +40,10 @@ func TestRemovalControllerPersistsReapsDeletesThenAcknowledges(t *testing.T) {
 		stages = append(stages, "managedroot-remove")
 		return nil
 	}
+	controller.releaseImagePin = func(context.Context, string) error {
+		stages = append(stages, "release-image-pin")
+		return nil
+	}
 	controller.ackRemoval = func(context.Context, localRemoval) error {
 		stages = append(stages, "acknowledge")
 		return nil
@@ -53,7 +57,7 @@ func TestRemovalControllerPersistsReapsDeletesThenAcknowledges(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"persist", "withdraw-and-reap", "purge-spool", "managedroot-remove", "acknowledge", "release-local-record",
+		"persist", "withdraw-and-reap", "purge-spool", "managedroot-remove", "release-image-pin", "acknowledge", "release-local-record",
 	}
 	if !reflect.DeepEqual(stages, want) {
 		t.Fatalf("removal stages = %v, want %v", stages, want)
@@ -172,6 +176,10 @@ func TestRemovalControllerResumesQuarantinedDeletionBeforeAcknowledging(t *testi
 		stages = append(stages, "purge-spool")
 		return nil
 	}
+	controller.releaseImagePin = func(context.Context, string) error {
+		stages = append(stages, "release-image-pin")
+		return nil
+	}
 	controller.ackRemoval = func(context.Context, localRemoval) error {
 		stages = append(stages, "acknowledge")
 		return nil
@@ -186,7 +194,7 @@ func TestRemovalControllerResumesQuarantinedDeletionBeforeAcknowledging(t *testi
 	if !managed.resumed {
 		t.Fatal("managedroot.Resume was not invoked")
 	}
-	if want := []string{"purge-spool", "acknowledge", "release-local-record"}; !reflect.DeepEqual(stages, want) {
+	if want := []string{"purge-spool", "release-image-pin", "acknowledge", "release-local-record"}; !reflect.DeepEqual(stages, want) {
 		t.Fatalf("resumed removal stages = %v, want %v", stages, want)
 	}
 }

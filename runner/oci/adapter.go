@@ -31,16 +31,70 @@ type Adapter struct {
 	imagePolicy           ImagePolicy
 	mu                    sync.Mutex
 	consumedSweepEvidence map[string]struct{}
-	runEntered            map[workloadrunner.AttemptAuthority]bool
+	attemptPins           map[workloadrunner.AttemptAuthority]attemptPinState
 	probePlatforms        map[ocihelper.HelperSession]ocihelper.OCIPlatform
+	pinLedger             workloadrunner.OCIImageBindingPinLedger
+	cacheMaxBytes         int64
+	probeDigest           string
 	hostMountRoot         string
 	mountGuards           map[string]*ocihelper.HostMountGuard
+}
+
+type memoryBindingPinLedger struct {
+	mu   sync.Mutex
+	pins map[string]workloadrunner.OCIImageBindingPin
+}
+
+type attemptPinState struct {
+	attached   bool
+	runEntered bool
+}
+
+func newMemoryBindingPinLedger() *memoryBindingPinLedger {
+	return &memoryBindingPinLedger{pins: make(map[string]workloadrunner.OCIImageBindingPin)}
+}
+
+func (ledger *memoryBindingPinLedger) ListOCIImageBindingPins(context.Context) ([]workloadrunner.OCIImageBindingPin, error) {
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	pins := make([]workloadrunner.OCIImageBindingPin, 0, len(ledger.pins))
+	for _, pin := range ledger.pins {
+		pins = append(pins, pin)
+	}
+	return pins, nil
+}
+
+func (ledger *memoryBindingPinLedger) PutOCIImageBindingPin(_ context.Context, pin workloadrunner.OCIImageBindingPin) (workloadrunner.OCIImageBindingPin, bool, error) {
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if stored, ok := ledger.pins[pin.JobID]; ok {
+		if stored != pin {
+			return stored, false, fmt.Errorf("OCI binding pin for job %q conflicts with its first binding", pin.JobID)
+		}
+		return stored, false, nil
+	}
+	ledger.pins[pin.JobID] = pin
+	return pin, true, nil
+}
+
+func (ledger *memoryBindingPinLedger) DeleteOCIImageBindingPin(_ context.Context, jobID string) error {
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	delete(ledger.pins, jobID)
+	return nil
 }
 
 type Option func(*Adapter)
 
 func WithHostMountRoot(root string) Option {
 	return func(adapter *Adapter) { adapter.hostMountRoot = root }
+}
+
+func WithImageCache(maxBytes int64, probeDigest string) Option {
+	return func(adapter *Adapter) {
+		adapter.cacheMaxBytes = maxBytes
+		adapter.probeDigest = probeDigest
+	}
 }
 
 func NewAdapter(sessions SessionSource, options ...Option) *Adapter {
@@ -72,11 +126,134 @@ func NewAdapterWithPolicy(sessions SessionSource, policy ImagePolicy, options ..
 	if policy.Sleep == nil {
 		policy.Sleep = sleepContext
 	}
-	adapter := &Adapter{sessions: sessions, imagePolicy: policy, consumedSweepEvidence: make(map[string]struct{}), runEntered: make(map[workloadrunner.AttemptAuthority]bool), probePlatforms: make(map[ocihelper.HelperSession]ocihelper.OCIPlatform), mountGuards: make(map[string]*ocihelper.HostMountGuard)}
+	adapter := &Adapter{sessions: sessions, imagePolicy: policy, pinLedger: newMemoryBindingPinLedger(), cacheMaxBytes: ocihelper.DefaultImageCacheMaxBytes, consumedSweepEvidence: make(map[string]struct{}), attemptPins: make(map[workloadrunner.AttemptAuthority]attemptPinState), probePlatforms: make(map[ocihelper.HelperSession]ocihelper.OCIPlatform), mountGuards: make(map[string]*ocihelper.HostMountGuard)}
 	for _, option := range options {
 		option(adapter)
 	}
 	return adapter
+}
+
+func (adapter *Adapter) SetOCIImageBindingPinLedger(ledger workloadrunner.OCIImageBindingPinLedger) {
+	adapter.mu.Lock()
+	adapter.pinLedger = ledger
+	adapter.mu.Unlock()
+}
+
+func (adapter *Adapter) ReconcileOCIImagePins(ctx context.Context, prove workloadrunner.OCIImageBindingProof) ([]workloadrunner.OCIImagePinReconciliationFailure, error) {
+	adapter.mu.Lock()
+	ledger := adapter.pinLedger
+	cacheMaxBytes := adapter.cacheMaxBytes
+	probeDigest := adapter.probeDigest
+	adapter.mu.Unlock()
+	if ledger == nil {
+		return nil, errors.New("OCI binding pin ledger is unavailable")
+	}
+	pins, err := ledger.ListOCIImageBindingPins(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if prove == nil {
+		return nil, errors.New("positive L1 service-binding proof is required before OCI pin reconciliation")
+	}
+	currentPins := pins[:0]
+	for _, pin := range pins {
+		bound, proofErr := prove(ctx, pin.JobID)
+		if proofErr != nil {
+			return nil, fmt.Errorf("prove current L1 binding for %q: %w", pin.JobID, proofErr)
+		}
+		if !bound {
+			if err := ledger.DeleteOCIImageBindingPin(ctx, pin.JobID); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		currentPins = append(currentPins, pin)
+	}
+	pins = currentPins
+	bindings := make([]ocihelper.BindingImagePin, 0, len(pins))
+	for _, pin := range pins {
+		bindings = append(bindings, ocihelper.BindingImagePin{
+			JobID: pin.JobID, Reference: pin.Reference, Digest: pin.Digest,
+			Platform:    ocihelper.OCIPlatform{OS: pin.PlatformOS, Architecture: pin.PlatformArchitecture, Variant: pin.PlatformVariant},
+			Snapshotter: pin.Snapshotter,
+		})
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return nil, err
+	}
+	probeDigests := []string(nil)
+	if probeDigest != "" {
+		probeDigests = []string{probeDigest}
+	}
+	request := ocihelper.ReconcileImagePinsRequest{Bindings: bindings, ProbeDigests: probeDigests, CacheMaxBytes: cacheMaxBytes}
+	response, err := session.ReconcileImagePins(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	if len(response.MissingDigests) == 0 {
+		return nil, nil
+	}
+	missing := make(map[string]struct{}, len(response.MissingDigests))
+	for _, value := range response.MissingDigests {
+		missing[value] = struct{}{}
+	}
+	var failures []workloadrunner.OCIImagePinReconciliationFailure
+	for _, pin := range pins {
+		if _, ok := missing[pin.Digest]; !ok {
+			continue
+		}
+		platform := ocihelper.OCIPlatform{OS: pin.PlatformOS, Architecture: pin.PlatformArchitecture, Variant: pin.PlatformVariant}
+		_, failure, deliveryErr := adapter.ensureImage(ctx, session, pin.Reference, pin.Digest, platform, time.Time{}, nil)
+		if deliveryErr != nil {
+			if failure == nil {
+				failure = imageSpawnFailure(contract.SpawnFailureRuntimeUnavailable, deliveryErr)
+			}
+			failures = append(failures, workloadrunner.OCIImagePinReconciliationFailure{JobID: pin.JobID, Failure: *failure})
+		}
+	}
+	response, err = session.ReconcileImagePins(ctx, request)
+	if err != nil {
+		return failures, err
+	}
+	if len(response.MissingDigests) != 0 {
+		if len(failures) != 0 {
+			return failures, nil
+		}
+		return nil, fmt.Errorf("OCI binding pin reconciliation still reports missing digests: %s", strings.Join(response.MissingDigests, ", "))
+	}
+	return failures, nil
+}
+
+func (adapter *Adapter) ReleaseOCIImageBindingPin(ctx context.Context, jobID string) error {
+	adapter.mu.Lock()
+	ledger := adapter.pinLedger
+	adapter.mu.Unlock()
+	if ledger == nil {
+		return errors.New("OCI binding pin ledger is unavailable")
+	}
+	pins, err := ledger.ListOCIImageBindingPins(ctx)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, pin := range pins {
+		if pin.JobID == jobID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return err
+	}
+	if err := session.ReleaseImagePin(ctx, jobID); err != nil {
+		return err
+	}
+	return ledger.DeleteOCIImageBindingPin(ctx, jobID)
 }
 
 // LoadImage is the agent-side offline-import seam used by the node-local
@@ -241,7 +418,7 @@ func (adapter *Adapter) probePlatform(session *ocihelper.Session) (ocihelper.OCI
 }
 
 func (adapter *Adapter) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
-	adapter.markRunEntered(request.Authority, false)
+	adapter.trackAttemptPin(request.Authority)
 	admission := workloadrunner.Admission{Request: request, Release: func() {}}
 	if adapter == nil || adapter.sessions == nil {
 		return failedAdmission(admission, contract.SpawnFailureRuntimeUnavailable, errors.New("OCI helper session is not configured"))
@@ -297,8 +474,8 @@ func failedAdmission(admission workloadrunner.Admission, code contract.SpawnFail
 	return admission, workloadrunner.Result{Outcome: contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: code, Message: err.Error()}}}, err
 }
 
-func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
-	adapter.markRunEntered(request.Authority, false)
+func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (result workloadrunner.Result, runErr error) {
+	adapter.trackAttemptPin(request.Authority)
 	session, err := adapter.sessions.Session()
 	if err != nil {
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
@@ -315,10 +492,61 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	if request.Execution.OCI.Image.Digest != nil {
 		digest = *request.Execution.OCI.Image.Digest
 	}
-	image, failure, err := adapter.ensureImage(ctx, session, request.Execution.OCI.Image.Reference, digest, probePlatform, request.OCIImageDeadline)
+	pin := &ocihelper.ImagePin{Authority: HelperAuthority(request.Authority), Binding: request.Authority.WorkloadClass == contract.JobClassService}
+	bindingPinCreated := false
+	bindingDeliveryComplete := false
+	defer func() {
+		if pin.Binding && bindingPinCreated && !bindingDeliveryComplete {
+			adapter.mu.Lock()
+			ledger := adapter.pinLedger
+			adapter.mu.Unlock()
+			if ledger != nil {
+				if err := ledger.DeleteOCIImageBindingPin(context.WithoutCancel(ctx), request.Authority.JobID); err != nil {
+					runErr = errors.Join(runErr, fmt.Errorf("delete failed OCI binding-pin intent: %w", err))
+					if result.Outcome.SpawnError == nil {
+						result = spawnResult(contract.SpawnFailureRuntimeUnavailable, err)
+					}
+				}
+			}
+		}
+	}()
+	if pin.Binding {
+		adapter.mu.Lock()
+		ledger := adapter.pinLedger
+		adapter.mu.Unlock()
+		if ledger == nil {
+			err := errors.New("OCI binding pin ledger is unavailable")
+			return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+		}
+		if digest == "" {
+			err := errors.New("service binding image digest is required before delivery")
+			return spawnResult(contract.SpawnFailureProcessRequest, err), err
+		}
+		stored, created, err := ledger.PutOCIImageBindingPin(ctx, workloadrunner.OCIImageBindingPin{
+			JobID: request.Authority.JobID, Reference: request.Execution.OCI.Image.Reference, Digest: digest,
+			PlatformOS: probePlatform.OS, PlatformArchitecture: probePlatform.Architecture, PlatformVariant: probePlatform.Variant,
+			Snapshotter: ocihelper.DefaultSnapshotter,
+		})
+		if err != nil {
+			storedPlatform := ocihelper.OCIPlatform{OS: stored.PlatformOS, Architecture: stored.PlatformArchitecture, Variant: stored.PlatformVariant}
+			if stored.JobID == request.Authority.JobID && stored.Reference == request.Execution.OCI.Image.Reference && stored.Digest == digest && stored.Snapshotter == ocihelper.DefaultSnapshotter && storedPlatform != probePlatform {
+				platformErr := errors.New("service binding image platform differs from the current probed OCI runtime platform")
+				return spawnResult(contract.SpawnFailureImagePlatformUnsupported, platformErr), platformErr
+			}
+			return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+		}
+		bindingPinCreated = created
+		storedPlatform := ocihelper.OCIPlatform{OS: stored.PlatformOS, Architecture: stored.PlatformArchitecture, Variant: stored.PlatformVariant}
+		if storedPlatform != probePlatform {
+			err := errors.New("service binding image platform differs from the current probed OCI runtime platform")
+			return spawnResult(contract.SpawnFailureImagePlatformUnsupported, err), err
+		}
+	}
+	image, failure, err := adapter.ensureImage(ctx, session, request.Execution.OCI.Image.Reference, digest, probePlatform, request.OCIImageDeadline, pin)
 	if err != nil {
 		return workloadrunner.Result{Outcome: contract.ProcessResult{SpawnError: failure}}, err
 	}
+	adapter.markAttemptPinAttached(request.Authority)
 	image.Evidence.SubmittedReference = request.Execution.OCI.Image.Reference
 	if image.Evidence.Platform != probePlatform {
 		err := errors.New("OCI image selection differs from the current probe platform")
@@ -331,6 +559,7 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		}
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
+	bindingDeliveryComplete = true
 	if request.OCIImageReady != nil {
 		request.OCIImageReady()
 	}
@@ -347,7 +576,6 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 			return spawnResult(contract.SpawnFailureProcessRequest, err), err
 		}
 	}
-	adapter.markRunEntered(request.Authority, true)
 	runResponse, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: authority, InitialDeadman: request.InitialDeadman,
 		AllocateEndpoints:        request.AttemptEndpoints,
@@ -360,6 +588,7 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		}
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
+	adapter.markRunEntered(request.Authority, true)
 	if runResponse.Image == nil {
 		err := errors.New("OCI helper Started response omitted image evidence")
 		_ = reapAfterFailedStart(session, authority)
@@ -461,7 +690,7 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	return workloadrunner.Result{Outcome: processResult(*completion)}, nil
 }
 
-func (adapter *Adapter) ensureImage(ctx context.Context, session *ocihelper.Session, reference, digest string, platform ocihelper.OCIPlatform, persistedDeadline time.Time) (ocihelper.EnsureImageResponse, *contract.SpawnFailure, error) {
+func (adapter *Adapter) ensureImage(ctx context.Context, session *ocihelper.Session, reference, digest string, platform ocihelper.OCIPlatform, persistedDeadline time.Time, pin *ocihelper.ImagePin) (ocihelper.EnsureImageResponse, *contract.SpawnFailure, error) {
 	requestedDigest := digest
 	deadline := time.Now().Add(adapter.imagePolicy.Budget)
 	if !persistedDeadline.IsZero() && persistedDeadline.Before(deadline) {
@@ -479,7 +708,7 @@ func (adapter *Adapter) ensureImage(ctx context.Context, session *ocihelper.Sess
 		}
 		var response ocihelper.EnsureImageResponse
 		err := session.EnsureImage(budgetContext, ocihelper.EnsureImageRequest{
-			Reference: reference, Digest: digest, Platform: platform, Source: ocihelper.ImageSourceRegistry, OperationTimeout: remaining,
+			Reference: reference, Digest: digest, Platform: platform, Source: ocihelper.ImageSourceRegistry, OperationTimeout: remaining, Pin: pin,
 		}, func(event ocihelper.EnsureImageEvent) error {
 			if event.Progress != nil && event.Progress.TopLevelDigest != "" {
 				digest = event.Progress.TopLevelDigest
@@ -654,10 +883,19 @@ func waitBridgeRetry(ctx context.Context) bool {
 
 func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
 	adapter.mu.Lock()
-	entered, tracked := adapter.runEntered[request.Authority]
-	delete(adapter.runEntered, request.Authority)
+	state, tracked := adapter.attemptPins[request.Authority]
+	delete(adapter.attemptPins, request.Authority)
 	adapter.mu.Unlock()
-	if tracked && !entered {
+	if tracked && !state.runEntered {
+		if state.attached {
+			session, err := adapter.sessions.Session()
+			if err != nil {
+				return workloadrunner.ReapReceipt{}, err
+			}
+			if err := session.ReleaseAttemptImagePin(ctx, HelperAuthority(request.Authority)); err != nil {
+				return workloadrunner.ReapReceipt{}, err
+			}
+		}
 		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime, BootSessionID: request.Authority.BootSessionID}, nil
 	}
 	session, err := adapter.sessions.Session()
@@ -680,7 +918,29 @@ func (adapter *Adapter) markRunEntered(authority workloadrunner.AttemptAuthority
 		return
 	}
 	adapter.mu.Lock()
-	adapter.runEntered[authority] = entered
+	state := adapter.attemptPins[authority]
+	state.runEntered = entered
+	if entered {
+		state.attached = false
+	}
+	adapter.attemptPins[authority] = state
+	adapter.mu.Unlock()
+}
+
+func (adapter *Adapter) trackAttemptPin(authority workloadrunner.AttemptAuthority) {
+	if adapter == nil {
+		return
+	}
+	adapter.mu.Lock()
+	adapter.attemptPins[authority] = attemptPinState{}
+	adapter.mu.Unlock()
+}
+
+func (adapter *Adapter) markAttemptPinAttached(authority workloadrunner.AttemptAuthority) {
+	adapter.mu.Lock()
+	state := adapter.attemptPins[authority]
+	state.attached = true
+	adapter.attemptPins[authority] = state
 	adapter.mu.Unlock()
 }
 

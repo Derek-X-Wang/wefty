@@ -186,6 +186,21 @@ type HeartbeatResponse struct {
 	RemovalDirectives []RemovalDirective `json:"removal_directives"`
 }
 
+type ServiceBindingProofRequest struct {
+	NodeID        string `json:"node_id"`
+	BootSessionID string `json:"boot_session_id"`
+}
+
+type ServiceBindingProofResponse struct {
+	Bound bool `json:"bound"`
+}
+
+type ServiceImageReconciliationFailureRequest struct {
+	NodeID        string                `json:"node_id"`
+	BootSessionID string                `json:"boot_session_id"`
+	Failure       contract.SpawnFailure `json:"failure"`
+}
+
 // NodeList is the L1 client representation of the operator-visible fleet.
 type NodeList struct {
 	Nodes []Node `json:"nodes"`

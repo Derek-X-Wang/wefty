@@ -297,6 +297,26 @@ func (session *Session) EnsureImage(ctx context.Context, request EnsureImageRequ
 	})
 }
 
+func (session *Session) ReconcileImagePins(ctx context.Context, request ReconcileImagePinsRequest) (ReconcileImagePinsResponse, error) {
+	var response ReconcileImagePinsResponse
+	err := session.call(ctx, MethodReconcileImagePins, request, &response)
+	return response, err
+}
+
+func (session *Session) ReleaseImagePin(ctx context.Context, jobID string) error {
+	return session.call(ctx, MethodReleaseImagePin, ReleaseImagePinRequest{JobID: jobID}, &struct{}{})
+}
+
+func (session *Session) ReleaseAttemptImagePin(ctx context.Context, authority AttemptAuthority) error {
+	return session.call(ctx, MethodReleaseAttemptPin, ReleaseAttemptImagePinRequest{Authority: authority}, &struct{}{})
+}
+
+func (session *Session) ImageCacheStatus(ctx context.Context) (ImageCacheStatus, error) {
+	var response ImageCacheStatus
+	err := session.call(ctx, MethodImageCacheStatus, struct{}{}, &response)
+	return response, err
+}
+
 // ImportImage streams one verified OCI image-layout archive into the helper.
 // The raw bytes never enter a JSON frame or an argv/path supplied to root.
 func (session *Session) ImportImage(ctx context.Context, request EnsureImageRequest, archive io.Reader, receive func(EnsureImageEvent) error) error {

@@ -201,6 +201,8 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/heartbeat", s.heartbeatNode)
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/drain", s.drainNode)
 	agent.HandleFunc("POST /v1/agent/jobs/claim", s.claimJob)
+	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/service-binding-proof", s.proveServiceBinding)
+	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/image-reconciliation-failure", s.latchServiceImageReconciliationFailure)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/lease", s.renewLease)
 	agent.HandleFunc("PUT /v1/agent/jobs/{job_id}/attempts/{attempt_id}/image", s.observeAttemptImage)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/started", s.startAttempt)
@@ -216,6 +218,34 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/nodes", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes/", s.authorize(clientPrincipal, client))
 	return root
+}
+
+func (s *Server) proveServiceBinding(w http.ResponseWriter, r *http.Request) {
+	var request ServiceBindingProofRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	bound, err := s.store.ProveServiceBinding(r.Context(), identityFromRequest(r).NodeID, r.PathValue("job_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ServiceBindingProofResponse{Bound: bound})
+}
+
+func (s *Server) latchServiceImageReconciliationFailure(w http.ResponseWriter, r *http.Request) {
+	var request ServiceImageReconciliationFailureRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	job, err := s.store.LatchServiceImageReconciliationFailure(r.Context(), identityFromRequest(r).NodeID, r.PathValue("job_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, redactJob(job))
 }
 
 func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {

@@ -18,6 +18,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	_ "modernc.org/sqlite"
 )
 
@@ -164,8 +165,18 @@ CREATE TABLE IF NOT EXISTS spool_removals (
   removal_generation INTEGER NOT NULL,
   cleanup_fence TEXT NOT NULL,
   root_instance_id TEXT NOT NULL,
-  started_ns INTEGER NOT NULL
-);`
+	  started_ns INTEGER NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS oci_binding_pins (
+	  job_id TEXT PRIMARY KEY,
+	  reference TEXT NOT NULL,
+	  digest TEXT NOT NULL,
+	  platform_os TEXT NOT NULL,
+	  platform_architecture TEXT NOT NULL,
+	  platform_variant TEXT NOT NULL,
+	  snapshotter TEXT NOT NULL,
+	  updated_ns INTEGER NOT NULL
+	);`
 	if _, err := spool.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("agent: initialize log spool: %w", err)
 	}
@@ -173,6 +184,69 @@ CREATE TABLE IF NOT EXISTS spool_removals (
 }
 
 func (spool *logSpool) Close() error { return spool.db.Close() }
+
+func (spool *logSpool) ListOCIImageBindingPins(ctx context.Context) ([]workloadrunner.OCIImageBindingPin, error) {
+	rows, err := spool.db.QueryContext(ctx, `SELECT job_id, reference, digest, platform_os,
+platform_architecture, platform_variant, snapshotter FROM oci_binding_pins ORDER BY job_id`)
+	if err != nil {
+		return nil, fmt.Errorf("agent: list OCI binding pins: %w", err)
+	}
+	defer rows.Close()
+	var pins []workloadrunner.OCIImageBindingPin
+	for rows.Next() {
+		var pin workloadrunner.OCIImageBindingPin
+		if err := rows.Scan(&pin.JobID, &pin.Reference, &pin.Digest, &pin.PlatformOS, &pin.PlatformArchitecture, &pin.PlatformVariant, &pin.Snapshotter); err != nil {
+			return nil, fmt.Errorf("agent: scan OCI binding pin: %w", err)
+		}
+		pins = append(pins, pin)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("agent: iterate OCI binding pins: %w", err)
+	}
+	return pins, nil
+}
+
+func (spool *logSpool) PutOCIImageBindingPin(ctx context.Context, pin workloadrunner.OCIImageBindingPin) (workloadrunner.OCIImageBindingPin, bool, error) {
+	if pin.JobID == "" || pin.Reference == "" || pin.Digest == "" || pin.PlatformOS == "" || pin.PlatformArchitecture == "" || pin.Snapshotter == "" {
+		return workloadrunner.OCIImageBindingPin{}, false, errors.New("agent: OCI binding pin is incomplete")
+	}
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return workloadrunner.OCIImageBindingPin{}, false, fmt.Errorf("agent: begin OCI binding pin insert: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO oci_binding_pins(job_id, reference, digest,
+platform_os, platform_architecture, platform_variant, snapshotter, updated_ns)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		pin.JobID, pin.Reference, pin.Digest, pin.PlatformOS, pin.PlatformArchitecture, pin.PlatformVariant, pin.Snapshotter, time.Now().UTC().UnixNano())
+	if err != nil {
+		return workloadrunner.OCIImageBindingPin{}, false, fmt.Errorf("agent: persist OCI binding pin: %w", err)
+	}
+	var stored workloadrunner.OCIImageBindingPin
+	if err := tx.QueryRowContext(ctx, `SELECT job_id, reference, digest, platform_os,
+platform_architecture, platform_variant, snapshotter FROM oci_binding_pins WHERE job_id=?`, pin.JobID).
+		Scan(&stored.JobID, &stored.Reference, &stored.Digest, &stored.PlatformOS, &stored.PlatformArchitecture, &stored.PlatformVariant, &stored.Snapshotter); err != nil {
+		return workloadrunner.OCIImageBindingPin{}, false, fmt.Errorf("agent: read OCI binding pin after insert: %w", err)
+	}
+	createdRows, err := result.RowsAffected()
+	if err != nil {
+		return workloadrunner.OCIImageBindingPin{}, false, fmt.Errorf("agent: inspect OCI binding pin insert: %w", err)
+	}
+	if stored != pin {
+		return stored, false, fmt.Errorf("agent: OCI binding pin for job %q conflicts with its first binding", pin.JobID)
+	}
+	if err := tx.Commit(); err != nil {
+		return workloadrunner.OCIImageBindingPin{}, false, fmt.Errorf("agent: commit OCI binding pin insert: %w", err)
+	}
+	return stored, createdRows == 1, nil
+}
+
+func (spool *logSpool) DeleteOCIImageBindingPin(ctx context.Context, jobID string) error {
+	if _, err := spool.db.ExecContext(ctx, `DELETE FROM oci_binding_pins WHERE job_id=?`, jobID); err != nil {
+		return fmt.Errorf("agent: release OCI binding pin: %w", err)
+	}
+	return nil
+}
 
 func (spool *logSpool) beginRemoval(ctx context.Context, removal localRemoval, startedAt time.Time) error {
 	response, err := spool.db.ExecContext(ctx, `INSERT INTO spool_removals(

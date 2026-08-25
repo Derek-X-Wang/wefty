@@ -86,6 +86,35 @@ func (registry *refloatRegistry) reference() string {
 
 func (registry *refloatRegistry) originalDigest() string { return registry.original.Digest.String() }
 
+func (registry *refloatRegistry) addVariant(t *testing.T, label string) string {
+	t.Helper()
+	registry.mu.Lock()
+	payload := append([]byte(nil), registry.blobs[registry.original.Digest.String()]...)
+	mediaType := registry.mediaTypes[registry.original.Digest.String()]
+	registry.mu.Unlock()
+	var document map[string]any
+	if err := json.Unmarshal(payload, &document); err != nil {
+		t.Fatal(err)
+	}
+	annotations, _ := document["annotations"].(map[string]any)
+	if annotations == nil {
+		annotations = make(map[string]any)
+	}
+	annotations["dev.wefty.cache-variant"] = label
+	document["annotations"] = annotations
+	payload, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(payload)
+	value := "sha256:" + hex.EncodeToString(hash[:])
+	registry.mu.Lock()
+	registry.blobs[value] = payload
+	registry.mediaTypes[value] = mediaType
+	registry.mu.Unlock()
+	return value
+}
+
 func (registry *refloatRegistry) moveTag() {
 	payload := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","size":2},"layers":[]}`)
 	hash := sha256.Sum256(payload)

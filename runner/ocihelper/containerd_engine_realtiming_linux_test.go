@@ -101,7 +101,55 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// Real cache pressure uses three independently named top-level roots. The
+	// probe root stays protected while the two variants prove actual LRU order
+	// and one-record-with-real-bytes eviction evidence.
+	lruRegistry := newRefloatRegistry(t, archivePath)
+	olderDigest := lruRegistry.addVariant(t, "older")
+	newerDigest := lruRegistry.addVariant(t, "newer")
+	for _, value := range []string{olderDigest, newerDigest} {
+		if err := session.EnsureImage(ctx, ocihelper.EnsureImageRequest{
+			Reference: lruRegistry.reference(), Digest: value, Source: ocihelper.ImageSourceRegistry,
+			Platform: ocihelper.OCIPlatform{OS: "linux", Architecture: runtime.GOARCH}, OperationTimeout: 2 * time.Minute,
+		}, nil); err != nil {
+			t.Fatalf("pull LRU variant %s: %v", value, err)
+		}
+	}
+	lruRequest := ocihelper.ReconcileImagePinsRequest{ProbeDigests: []string{digest}, CacheMaxBytes: 1}
+	if _, err := session.ReconcileImagePins(ctx, lruRequest); err != nil {
+		t.Fatal(err)
+	}
+	firstEviction := waitForCacheEviction(t, ctx, session, "", olderDigest)
+	if firstEviction.Reason != "reconcile" || firstEviction.Bytes <= 0 {
+		t.Fatalf("first LRU eviction record = %+v", firstEviction)
+	}
+	if _, err := session.ReconcileImagePins(ctx, lruRequest); err != nil {
+		t.Fatal(err)
+	}
+	secondEviction := waitForCacheEviction(t, ctx, session, olderDigest, newerDigest)
+	if secondEviction.Reason != "reconcile" || secondEviction.Bytes <= 0 {
+		t.Fatalf("second LRU eviction record = %+v", secondEviction)
+	}
+
+	// Establish a durable service binding, wipe containerd behind the helper,
+	// and require adapter-owned reconciliation to repull and reattach it.
+	automaticBinding := nativeAdapterRequest(reference, digest, "automatic-repull", []string{"/bin/true"})
+	automaticBinding.Authority.WorkloadClass = contract.JobClassService
+	automaticBinding.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+	if _, err := adapter.Run(ctx, automaticBinding, nil); err != nil {
+		t.Fatal(err)
+	}
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: automaticBinding.Authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("automatic-repull seed cleanup = %+v err=%v", receipt, err)
+	}
 	requestRootFault(t, "reset-containerd")
+	if failures, err := adapter.ReconcileOCIImagePins(ctx, func(context.Context, string) (bool, error) { return true, nil }); err != nil || len(failures) != 0 {
+		t.Fatalf("automatic wipe/repull reconciliation = failures %+v err=%v", failures, err)
+	}
+	if err := adapter.ReleaseOCIImageBindingPin(ctx, automaticBinding.Authority.JobID); err != nil {
+		t.Fatal(err)
+	}
 	requestRootFault(t, "disable-registry")
 	registryDisabled := true
 	t.Cleanup(func() {
@@ -114,10 +162,24 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	var imported ocihelper.EnsureImageResponse
+	bindingAuthority := nativeAuthority("cache-binding")
+	bindingAuthority.Class = contract.JobClassService
+	reconcileRequest := ocihelper.ReconcileImagePinsRequest{
+		Bindings: []ocihelper.BindingImagePin{{
+			JobID: bindingAuthority.JobID, Reference: reference, Digest: digest,
+			Platform: ocihelper.OCIPlatform{OS: "linux", Architecture: runtime.GOARCH}, Snapshotter: ocihelper.DefaultSnapshotter,
+		}},
+		ProbeDigests: []string{digest}, CacheMaxBytes: 1,
+	}
+	wiped, err := session.ReconcileImagePins(ctx, reconcileRequest)
+	if err != nil || len(wiped.MissingDigests) != 1 || wiped.MissingDigests[0] != digest {
+		t.Fatalf("wiped-cache binding reconciliation = %+v err=%v", wiped, err)
+	}
 	importErr := session.ImportImage(ctx, ocihelper.EnsureImageRequest{
 		Reference: reference, Digest: digest, Source: ocihelper.ImageSourceArchive,
 		Platform:         ocihelper.OCIPlatform{OS: "linux", Architecture: runtime.GOARCH},
 		OperationTimeout: 2 * time.Minute,
+		Pin:              &ocihelper.ImagePin{Authority: bindingAuthority, Binding: true},
 	}, archive, func(event ocihelper.EnsureImageEvent) error {
 		if event.Result != nil {
 			imported = *event.Result
@@ -130,6 +192,30 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	}
 	if !reflect.DeepEqual(pulled, imported) || pulled.TopLevelDigest != digest || pulled.PlatformDigest == "" {
 		t.Fatalf("pull/import evidence differs: pull=%+v import=%+v", pulled, imported)
+	}
+	reconciled, err := session.ReconcileImagePins(ctx, reconcileRequest)
+	if err != nil || len(reconciled.MissingDigests) != 0 {
+		t.Fatalf("repulled binding reconciliation = %+v err=%v", reconciled, err)
+	}
+	pressure, err := session.ImageCacheStatus(ctx)
+	if err != nil || pressure.Bytes <= pressure.CapBytes {
+		t.Fatalf("cache pressure status = %+v err=%v", pressure, err)
+	}
+	if pressure.LastEviction != nil && pressure.LastEviction.Digest == digest {
+		t.Fatalf("probe/bound image was evicted under pressure: %+v", pressure.LastEviction)
+	}
+	if err := session.ReleaseImagePin(ctx, bindingAuthority.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.ReconcileImagePins(ctx, ocihelper.ReconcileImagePinsRequest{CacheMaxBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+	afterRelease, err := session.ImageCacheStatus(ctx)
+	if err != nil || afterRelease.Bytes == 0 {
+		t.Fatalf("binding release deleted cached content: %+v err=%v", afterRelease, err)
+	}
+	if afterRelease.LastEviction != nil && afterRelease.LastEviction.Digest == imported.TopLevelDigest {
+		t.Fatalf("durable operator import hold was evicted: %+v", afterRelease.LastEviction)
 	}
 	importRun := nativeAdapterRequest(reference, imported.TopLevelDigest, "import-run", []string{"/bin/true"})
 	importRun.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
@@ -149,6 +235,54 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	session, err = barrier.Session()
 	if err != nil {
 		t.Fatalf("load recovered helper session: %v", err)
+	}
+
+	activeDigest := lruRegistry.addVariant(t, "active-attempt")
+	activeRequest := nativeAdapterRequest(lruRegistry.reference(), activeDigest, "active-cache-pressure", []string{"/bin/sh", "-c", "printf active-cache-pressure; sleep 2"})
+	activeRequest.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+	activeLog := make(chan struct{}, 1)
+	activeDone := make(chan error, 1)
+	go func() {
+		_, runErr := adapter.Run(ctx, activeRequest, workloadrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
+			if strings.Contains(string(event.Bytes), "active-cache-pressure") {
+				select {
+				case activeLog <- struct{}{}:
+				default:
+				}
+			}
+			return nil
+		}))
+		activeDone <- runErr
+	}()
+	select {
+	case <-activeLog:
+	case err := <-activeDone:
+		t.Fatalf("active cache-pressure attempt ended early: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("active cache-pressure attempt did not start")
+	}
+	if _, err := session.ReconcileImagePins(ctx, ocihelper.ReconcileImagePinsRequest{CacheMaxBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+	activePressure, err := session.ImageCacheStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activePressure.LastEviction != nil && activePressure.LastEviction.Digest == activeDigest {
+		t.Fatalf("active attempt image was evicted under pressure: %+v", activePressure.LastEviction)
+	}
+	if err := <-activeDone; err != nil {
+		t.Fatal(err)
+	}
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: activeRequest.Authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("active cache-pressure cleanup = %+v err=%v", receipt, err)
+	}
+	if _, err := session.ReconcileImagePins(ctx, ocihelper.ReconcileImagePinsRequest{CacheMaxBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+	releasedEviction := waitForCacheEviction(t, ctx, session, newerDigest, activeDigest)
+	if releasedEviction.Bytes <= 0 {
+		t.Fatalf("released attempt eviction record = %+v", releasedEviction)
 	}
 
 	liveRequest := nativeAdapterRequest(reference, digest, "live-logs", []string{"/bin/sh", "-c", "printf live-before-exit; sleep 2; exit 0"})
@@ -508,6 +642,29 @@ func requestRootFault(t *testing.T, action string) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("root fault %s was not acknowledged", action)
+}
+
+func waitForCacheEviction(t *testing.T, ctx context.Context, session *ocihelper.Session, previousDigest, wantDigest string) ocihelper.ImageCacheEviction {
+	t.Helper()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		status, err := session.ImageCacheStatus(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.LastEviction != nil && status.LastEviction.Digest != previousDigest {
+			if status.LastEviction.Digest != wantDigest {
+				t.Fatalf("cache eviction digest = %s, want %s", status.LastEviction.Digest, wantDigest)
+			}
+			return *status.LastEviction
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for cache eviction %s: %v", wantDigest, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func nativeAuthority(suffix string) ocihelper.AttemptAuthority {

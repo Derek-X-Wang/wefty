@@ -53,6 +53,7 @@ type agentSession struct {
 	logf              func(string, ...any)
 	capabilities      *capabilityState
 	ociBootBarrier    OCIBootBarrier
+	ociImagePins      workloadrunner.OCIImagePinRuntime
 
 	capacityMu      sync.Mutex
 	poolTargets     map[workloadClass]int
@@ -169,6 +170,10 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	if err := session.capabilities.adoptRestrictive(node); err != nil {
 		return l1.Node{}, err
 	}
+	registrationHeartbeat, err := session.heartbeat(ctx)
+	if err != nil {
+		return l1.Node{}, err
+	}
 
 	barrierErr := session.ociBootBarrier.Ensure(ctx)
 	if barrierErr != nil {
@@ -176,14 +181,21 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	}
 	// ADR-0002 removal recovery is independent of OCI readiness and always runs
 	// once registration authority and its restrictive N+1 are published.
-	removalErr := session.resumePendingRemovals(ctx)
-	if barrierErr != nil || removalErr != nil {
+	removalErr := errors.Join(session.resumePendingRemovals(ctx), session.processRemovalDirectives(ctx, registrationHeartbeat.RemovalDirectives))
+	pinsErr := error(nil)
+	if barrierErr == nil && removalErr == nil {
+		pinsErr = session.reconcileOCIImagePins(ctx)
+	}
+	if barrierErr != nil || removalErr != nil || pinsErr != nil {
 		if session.logf != nil {
 			if barrierErr != nil {
 				session.logf("agent: OCI boot barrier before registration: %v", barrierErr)
 			}
 			if removalErr != nil {
 				session.logf("agent: resume pending removals before registration: %v", removalErr)
+			}
+			if pinsErr != nil {
+				session.logf("agent: reconcile OCI binding pins before registration: %v", pinsErr)
 			}
 		}
 		return node, nil
@@ -200,6 +212,44 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 		return session.publishCapabilityHeartbeat(ctx, nil)
 	}
 	return session.publishCapabilityHeartbeat(ctx, &generation)
+}
+
+func (session *agentSession) processRemovalDirectives(ctx context.Context, directives []l1.RemovalDirective) error {
+	if session.removals == nil {
+		return nil
+	}
+	var failures []error
+	for _, directive := range directives {
+		if err := session.removals.process(ctx, directive); err != nil {
+			failures = append(failures, fmt.Errorf("reconcile removed OCI binding %q: %w", directive.JobID, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (session *agentSession) reconcileOCIImagePins(ctx context.Context) error {
+	if session.ociImagePins == nil {
+		return nil
+	}
+	failures, err := session.ociImagePins.ReconcileOCIImagePins(ctx, func(proofContext context.Context, jobID string) (bool, error) {
+		return session.client.ProveServiceBinding(proofContext, session.registration.NodeID, session.registration.BootSessionID, jobID)
+	})
+	var latchErrors []error
+	for _, failure := range failures {
+		if _, latchErr := session.client.LatchServiceImageReconciliationFailure(ctx, session.registration.NodeID, session.registration.BootSessionID, failure.JobID, failure.Failure); latchErr != nil {
+			latchErrors = append(latchErrors, fmt.Errorf("latch service %q after image reconciliation failure: %w", failure.JobID, latchErr))
+		}
+	}
+	if err != nil || len(failures) != 0 || len(latchErrors) != 0 {
+		if invalidator, ok := session.ociBootBarrier.(ociBootBarrierInvalidator); ok {
+			invalidator.Invalidate()
+		}
+		if len(failures) != 0 {
+			latchErrors = append(latchErrors, fmt.Errorf("%d OCI service binding image deliveries failed", len(failures)))
+		}
+		return errors.Join(err, errors.Join(latchErrors...))
+	}
+	return nil
 }
 
 func (session *agentSession) publishRegistration(ctx context.Context) (l1.Node, error) {
@@ -224,8 +274,9 @@ func (session *agentSession) resumePendingRemovals(ctx context.Context) error {
 }
 
 // recoverOCIRuntime publishes a restrictive observation before reacquiring a
-// lost helper generation, then performs the event-path removal resume and
-// functional probe. Ordinary healthy heartbeats do not scan removals.
+// lost helper generation, then performs removal resume, binding-pin
+// reconciliation, and the functional probe. Ordinary healthy heartbeats do
+// not scan removals.
 func (session *agentSession) recoverOCIRuntime(ctx context.Context) (ocihelper.HelperSession, error) {
 	if session.ociBootBarrier == nil {
 		return ocihelper.HelperSession{}, session.capabilities.refresh(ctx)
@@ -237,19 +288,23 @@ func (session *agentSession) recoverOCIRuntime(ctx context.Context) (ocihelper.H
 		ociBootBarrierReason(session.ociBootBarrier),
 		errors.New("OCI helper session requires a new boot sweep"),
 	)
-	if _, err := session.publishCapabilityHeartbeat(ctx, nil); err != nil {
+	restrictiveResponse, err := session.publishCapabilityHeartbeatResponse(ctx, nil)
+	if err != nil {
 		return ocihelper.HelperSession{}, err
 	}
 	barrierErr := session.ociBootBarrier.Ensure(ctx)
 	if barrierErr != nil {
 		session.capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), barrierErr)
 	}
-	removalErr := session.resumePendingRemovals(ctx)
+	removalErr := errors.Join(session.resumePendingRemovals(ctx), session.processRemovalDirectives(ctx, restrictiveResponse.RemovalDirectives))
 	if barrierErr != nil {
 		return ocihelper.HelperSession{}, barrierErr
 	}
 	if removalErr != nil {
 		return ocihelper.HelperSession{}, removalErr
+	}
+	if err := session.reconcileOCIImagePins(ctx); err != nil {
+		return ocihelper.HelperSession{}, err
 	}
 	generation, ok := session.ociBootBarrier.Generation()
 	if !ok {

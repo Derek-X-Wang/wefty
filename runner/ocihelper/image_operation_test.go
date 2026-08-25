@@ -67,6 +67,33 @@ func TestImageOperationLeaderCancellationDoesNotCancelSharedWork(t *testing.T) {
 	}
 }
 
+func TestImageOperationReportsActiveKeysUntilSharedCleanup(t *testing.T) {
+	group := newImageOperationGroup()
+	key := testImageOperationKey("active-pressure")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := group.Do(t.Context(), key, time.Minute, func(context.Context) (EnsureImageResponse, error) {
+			close(started)
+			<-release
+			return EnsureImageResponse{}, nil
+		})
+		done <- err
+	}()
+	<-started
+	if _, active := group.ActiveKeys()[key]; !active {
+		t.Fatal("live delivery operation was absent from cache-pressure protection")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, active := group.ActiveKeys()[key]; active {
+		t.Fatal("completed delivery operation remained cache-pressure protected")
+	}
+}
+
 func TestImageOperationSessionCancellationIsBounded(t *testing.T) {
 	group := newImageOperationGroup()
 	started := make(chan struct{})
@@ -88,4 +115,57 @@ func TestImageOperationSessionCancellationIsBounded(t *testing.T) {
 	}
 	close(release)
 	<-done
+}
+
+func TestImageOperationAttachesEveryWaiterBeforeLeaseCleanup(t *testing.T) {
+	group := newImageOperationGroup()
+	key := testImageOperationKey("pins")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cleanup := make(chan struct{})
+	var attached atomic.Int32
+	prepare := func(context.Context) (func(context.Context) (EnsureImageResponse, error), func(), error) {
+		return func(context.Context) (EnsureImageResponse, error) {
+				close(started)
+				<-release
+				return EnsureImageResponse{TopLevelDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil
+			}, func() {
+				if got := attached.Load(); got != 2 {
+					t.Errorf("operation lease cleaned after %d attachments, want 2", got)
+				}
+				close(cleanup)
+			}, nil
+	}
+	done := make(chan error, 2)
+	go func() {
+		_, err := group.DoPreparedWithAttach(t.Context(), key, time.Minute, prepare, func(context.Context, EnsureImageResponse) error {
+			attached.Add(1)
+			return nil
+		})
+		done <- err
+	}()
+	<-started
+	go func() {
+		_, err := group.DoPreparedWithAttach(t.Context(), key, time.Minute, prepare, func(context.Context, EnsureImageResponse) error {
+			attached.Add(1)
+			return nil
+		})
+		done <- err
+	}()
+	for {
+		group.mu.Lock()
+		joined := group.flights[key] != nil && group.flights[key].waiters == 2
+		group.mu.Unlock()
+		if joined {
+			break
+		}
+		runtime.Gosched()
+	}
+	close(release)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	<-cleanup
 }

@@ -213,6 +213,13 @@ func New(config Config) (*Agent, error) {
 		client.Close()
 		return nil, err
 	}
+	var ociImagePins workloadrunner.OCIImagePinRuntime
+	if runtimeAdapter, configured := runtimes.selectKind(contract.JobKindOCI); configured {
+		if pinRuntime, supported := runtimeAdapter.(workloadrunner.OCIImagePinRuntime); supported {
+			pinRuntime.SetOCIImageBindingPinLedger(outbox.spool)
+			ociImagePins = pinRuntime
+		}
+	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
 	capabilities := newCapabilityState(config.Capabilities, config.CapabilityProbe, clock, config.CapabilityProbeTimeout)
@@ -223,6 +230,7 @@ func New(config Config) (*Agent, error) {
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
 	session.ociBootBarrier = config.OCIBootBarrier
+	session.ociImagePins = ociImagePins
 	if session.ociBootBarrier != nil {
 		session.ociBootBarrier.SetLossHandler(func(_ ocihelper.HelperSession, lossErr error) {
 			capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), lossErr)
@@ -261,6 +269,9 @@ func New(config Config) (*Agent, error) {
 		client, outbox, managedResource, session,
 		config.NodeID, config.BootSessionID, logf,
 	)
+	if ociImagePins != nil {
+		session.removals.releaseImagePin = ociImagePins.ReleaseOCIImageBindingPin
+	}
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
 		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),

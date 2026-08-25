@@ -51,6 +51,13 @@ type Engine interface {
 	ReapSession(context.Context, SessionIdentity) error
 }
 
+type ImageCacheEngine interface {
+	ReconcileImagePins(context.Context, ReconcileImagePinsRequest) (ReconcileImagePinsResponse, error)
+	ReleaseImagePin(context.Context, ReleaseImagePinRequest) error
+	ReleaseAttemptImagePin(context.Context, ReleaseAttemptImagePinRequest) error
+	ImageCacheStatus(context.Context) (ImageCacheStatus, error)
+}
+
 // UnavailableEngine keeps the private helper mode fail-closed on unsupported
 // hosts. Tests also use it when no real engine is required.
 type UnavailableEngine struct{}
@@ -88,6 +95,18 @@ func imageMechanicsError(kind ImageFailureKind, digest string, err error) error 
 
 func (UnavailableEngine) EnsureImage(context.Context, EnsureImageRequest, io.Reader, func(EnsureImageEvent) error) error {
 	return &ImageMechanicsError{Fact: ImageFailureFact{Kind: ImageFailureEngineLoss}, err: errEngineUnavailable}
+}
+func (UnavailableEngine) ReconcileImagePins(context.Context, ReconcileImagePinsRequest) (ReconcileImagePinsResponse, error) {
+	return ReconcileImagePinsResponse{}, errEngineUnavailable
+}
+func (UnavailableEngine) ReleaseImagePin(context.Context, ReleaseImagePinRequest) error {
+	return errEngineUnavailable
+}
+func (UnavailableEngine) ReleaseAttemptImagePin(context.Context, ReleaseAttemptImagePinRequest) error {
+	return errEngineUnavailable
+}
+func (UnavailableEngine) ImageCacheStatus(context.Context) (ImageCacheStatus, error) {
+	return ImageCacheStatus{}, errEngineUnavailable
 }
 func (UnavailableEngine) Run(context.Context, RunRequest) (RunResponse, error) {
 	return RunResponse{}, errEngineUnavailable

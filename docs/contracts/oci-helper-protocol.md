@@ -213,14 +213,48 @@ Resolve, pull/import, and unpack are helper mechanics. Failures expose only a
 closed sanitized mechanics fact: registry HTTP status, network/DNS, platform
 mismatch, engine loss, resource exhaustion, manifest rejection, optional
 `Retry-After`, and any resolved digest. Total timing, retryability, and durable
-spawn classification remain agent policy. A delivery operation is singleflight by fixed
-namespace, top-level digest, admitted platform, and snapshotter, and holds a
-short-lived content lease while containerd works. Canceling the first waiter
-does not cancel the shared operation; helper-session loss cancels and joins all
-operations. Sweep removes stale operation leases and archive spools but skips
-resources registered to live image operations. Per-waiter attempt and binding
-pin attachment before shared-lease release lands with bounded cache policy in
-#144; M3 has no evictor before that ticket.
+spawn classification remain agent policy. A delivery operation is singleflight
+by fixed namespace, top-level digest, admitted platform, and snapshotter, and
+holds a short-lived content lease while containerd works. Canceling the first
+waiter does not cancel the shared operation; helper-session loss cancels and
+joins all operations. Every successful waiter attaches the complete reachable
+content graph to its own deterministic attempt lease, and service waiters also
+attach a deterministic binding lease, before the operation lease is deleted.
+Sweep removes all stale image leases and archive spools while skipping only
+resources registered to a live operation.
+
+`ReconcileImagePins` is the absolute, session-authorized boot handoff of the
+agent's durable binding-pin ledger, configured probe digest, and positive cache
+ceiling. Until it succeeds, eviction is disabled. Missing content is returned
+as a digest-only fact for agent-budgeted redelivery; reconciliation does not
+contact a registry. The agent calls reconciliation again after redelivery so
+the helper attaches the recovered binding leases before enabling eviction.
+Failure to delete any stale helper lease fails reconciliation. Before enabling
+eviction, the helper also reconciles the durable cache ledger with positive
+containerd image/content inventory, pruning absent entries and seeding unknown
+image roots as oldest-unused.
+
+`ReleaseImagePin(job_id)` removes only a known binding lease and is idempotent.
+`ReleaseAttemptImagePin(authority)` is the exact-authority, idempotent pre-Run
+release used when successful image attachment is abandoned before `Run`; it
+does not require a live helper attempt. Both deletion paths are bounded and
+retain retryable pin state unless deletion succeeds or reports `NotFound`.
+`ImageCacheStatus` reports namespace content bytes, the applied cap, the last
+recorded eviction, and the last post-delivery bookkeeping/enforcement error for
+the later doctor surface.
+
+The fixed `wefty` namespace's content-store bytes are accounted directly.
+Successful image delivery refreshes a durable cache record. After delivery and
+once per minute, entries are considered oldest-unused-first; operation,
+attempt, binding, probe, and durable operator-import holds are ineligible.
+Candidate protection is revalidated immediately before deletion. Each bounded
+enforcement pass deletes every image name for at most one top-level digest with
+containerd synchronous garbage collection and then persists exactly one record
+containing its digest, reason, actual reclaimed bytes, and time. Reconciliation
+uses its own `reconcile` reason. Being over cap with only protected content is
+truthful saturation, not authority to evict it. Post-delivery cache-ledger or
+enforcement errors never turn successfully delivered image bytes into a spawn
+failure; status records the error and the periodic pass retries.
 Error detail remains local and a resolved digest is retained across agent
 retries.
 

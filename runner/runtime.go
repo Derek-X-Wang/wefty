@@ -71,6 +71,39 @@ type OCIImageObservation struct {
 	Snapshotter            string
 }
 
+// OCIImageBindingPin is the durable agent-local reconstruction record for a
+// service binding's restart-critical image hold.
+type OCIImageBindingPin struct {
+	JobID                string
+	Reference            string
+	Digest               string
+	PlatformOS           string
+	PlatformArchitecture string
+	PlatformVariant      string
+	Snapshotter          string
+}
+
+type OCIImageBindingPinLedger interface {
+	ListOCIImageBindingPins(context.Context) ([]OCIImageBindingPin, error)
+	PutOCIImageBindingPin(context.Context, OCIImageBindingPin) (stored OCIImageBindingPin, created bool, err error)
+	DeleteOCIImageBindingPin(context.Context, string) error
+}
+
+type OCIImageBindingProof func(context.Context, string) (bool, error)
+
+type OCIImagePinReconciliationFailure struct {
+	JobID   string
+	Failure contract.SpawnFailure
+}
+
+// OCIImagePinRuntime is implemented by the OCI adapter without exposing
+// helper/containerd types to the agent package.
+type OCIImagePinRuntime interface {
+	SetOCIImageBindingPinLedger(OCIImageBindingPinLedger)
+	ReconcileOCIImagePins(context.Context, OCIImageBindingProof) ([]OCIImagePinReconciliationFailure, error)
+	ReleaseOCIImageBindingPin(context.Context, string) error
+}
+
 // OCIObservationRefusal distinguishes an authoritative L1 protocol refusal
 // from transport or server unavailability while persisting pre-Run evidence.
 type OCIObservationRefusal struct{ Err error }

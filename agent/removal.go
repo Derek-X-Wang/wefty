@@ -19,20 +19,21 @@ var errServiceRemovalRequested = errors.New("service removal requested")
 // the ordering between durable local intent, process reaping, spool cleanup,
 // the guardrail call, and L1 attestation.
 type removalController struct {
-	client         *Client
-	outbox         *evidenceOutbox
-	managed        managedResourceManager
-	session        *agentSession
-	nodeID         string
-	bootSessionID  string
-	logf           func(string, ...any)
-	beginRemoval   func(context.Context, localRemoval) error
-	reapService    func(context.Context, string) (workloadrunner.ReapReceipt, error)
-	clearReap      func(string)
-	purgeJob       func(context.Context, string) error
-	removeResource func(context.Context, localRemoval) error
-	ackRemoval     func(context.Context, localRemoval) error
-	finishRemoval  func(context.Context, localRemoval) error
+	client          *Client
+	outbox          *evidenceOutbox
+	managed         managedResourceManager
+	session         *agentSession
+	nodeID          string
+	bootSessionID   string
+	logf            func(string, ...any)
+	beginRemoval    func(context.Context, localRemoval) error
+	reapService     func(context.Context, string) (workloadrunner.ReapReceipt, error)
+	clearReap       func(string)
+	purgeJob        func(context.Context, string) error
+	removeResource  func(context.Context, localRemoval) error
+	releaseImagePin func(context.Context, string) error
+	ackRemoval      func(context.Context, localRemoval) error
+	finishRemoval   func(context.Context, localRemoval) error
 
 	mu       sync.Mutex
 	inflight map[string]struct{}
@@ -136,6 +137,11 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	if err := controller.removeResource(ctx, removal); err != nil {
 		return fmt.Errorf("delete managed service resource: %w", err)
 	}
+	if controller.releaseImagePin != nil {
+		if err := controller.releaseImagePin(ctx, directive.JobID); err != nil {
+			return fmt.Errorf("release service binding image pin: %w", err)
+		}
+	}
 	if err := controller.ackRemoval(ctx, removal); err != nil {
 		return err
 	}
@@ -187,6 +193,11 @@ func (controller *removalController) resume(ctx context.Context) error {
 	for _, removal := range completed {
 		if err := controller.purgeJob(ctx, removal.jobID); err != nil {
 			return err
+		}
+		if controller.releaseImagePin != nil {
+			if err := controller.releaseImagePin(ctx, removal.jobID); err != nil {
+				return fmt.Errorf("release resumed service binding image pin: %w", err)
+			}
 		}
 		if err := controller.ackRemoval(ctx, removal); err != nil {
 			return err
