@@ -20,7 +20,13 @@ runtime_root="$(mktemp -d)"
 container_id=
 cleanup() {
   if [[ -n $container_id ]]; then docker stop --time 15 "$container_id" >/dev/null 2>&1 || true; fi
-  rm -rf -- "$runtime_root"
+  # The image deliberately runs as uid 12000, so persisted browser directories
+  # are not writable by the hosted runner. Restore traversal through the exact
+  # bind mount before asking the runner to remove its mktemp directory.
+  docker run --rm --platform "linux/$arch" --user 0:0 --entrypoint /bin/chmod \
+    --mount "type=bind,src=$runtime_root,dst=/cleanup" "$image" -R a+rwX /cleanup \
+    >/dev/null 2>&1 || true
+  rm -rf -- "$runtime_root" || true
 }
 trap cleanup EXIT
 install -d -m 0777 "$runtime_root/service"
