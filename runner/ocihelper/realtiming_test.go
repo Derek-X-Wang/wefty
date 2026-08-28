@@ -60,8 +60,8 @@ func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
 	if _, err := session.Delete(ctx, DeleteRequest{Authority: authority}); err != nil {
 		t.Fatal(err)
 	}
-	if !SupportsComputerProtocol(session.Handshake()) {
-		t.Fatal("real helper process did not negotiate Computer protocol semantics")
+	if got := session.Handshake().ProtocolVersion; got != ProtocolVersion {
+		t.Fatalf("real helper process protocol version = %d, want exact %d", got, ProtocolVersion)
 	}
 	computerAuthority := authority
 	computerAuthority.JobID = "realtime-computer-job"

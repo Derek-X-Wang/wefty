@@ -505,7 +505,6 @@ type ociCapabilityProbe struct {
 
 type ociCapabilityAdapter interface {
 	Probe(context.Context, string, string, string, string, time.Duration) error
-	HelperProtocolVersion() (int, error)
 }
 
 func (probe ociCapabilityProbe) Probe(ctx context.Context) (agent.CapabilityProbeResult, error) {
@@ -517,13 +516,11 @@ func (probe ociCapabilityProbe) Probe(ctx context.Context) (agent.CapabilityProb
 	capabilities := map[string]bool{
 		"kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true, "cgroup_v2": true,
 	}
-	protocolVersion, err := probe.adapter.HelperProtocolVersion()
-	if err != nil {
-		return agent.CapabilityProbeResult{MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonProbeFailed}, err
-	}
-	if protocolVersion >= ocihelper.ComputerProtocolVersion {
-		capabilities["computer"] = true
-	}
+	// OpenSession admits only the exact helper wire major. A successful OCI
+	// functional probe therefore proves the complete protocol-v2 Computer
+	// endpoint, control-state, and attachment bundle rather than a second,
+	// unreachable version comparison here.
+	capabilities["computer"] = true
 	return agent.CapabilityProbeResult{Capabilities: capabilities}, nil
 }
 

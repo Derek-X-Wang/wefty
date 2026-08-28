@@ -445,19 +445,6 @@ func helperSession(session *ocihelper.Session) ocihelper.HelperSession {
 	return ocihelper.HelperSession{HelperInstanceID: handshake.HelperInstanceID, SessionGeneration: handshake.SessionGeneration}
 }
 
-// HelperProtocolVersion returns the currently boot-barrier-pinned negotiated
-// version so capability derivation cannot trust static agent configuration.
-func (adapter *Adapter) HelperProtocolVersion() (int, error) {
-	if adapter == nil || adapter.sessions == nil {
-		return 0, errors.New("OCI helper session is not configured")
-	}
-	session, err := adapter.sessions.Session()
-	if err != nil {
-		return 0, err
-	}
-	return session.Handshake().ProtocolVersion, nil
-}
-
 func (adapter *Adapter) SetComputerControlState(ctx context.Context, authority workloadrunner.AttemptAuthority, humanDriving bool) error {
 	if adapter == nil || adapter.sessions == nil {
 		return errors.New("OCI helper session is not configured")
@@ -1557,3 +1544,4 @@ func reapAfterFailedStart(session *ocihelper.Session, authority ocihelper.Attemp
 
 var _ workloadrunner.WorkloadRuntime = (*Adapter)(nil)
 var _ workloadrunner.PriorBootReaper = (*Adapter)(nil)
+var _ workloadrunner.OCIComputerControlRuntime = (*Adapter)(nil)

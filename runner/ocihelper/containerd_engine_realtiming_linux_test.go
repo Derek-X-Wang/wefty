@@ -734,6 +734,7 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		len(receipt.SweptInventory.ComputerDiskLoops) == 0 || len(receipt.SweptInventory.ComputerAttachments) == 0 {
 		t.Fatalf("Computer helper-death sweep receipt = %+v present=%t", receipt, ok)
 	}
+	assertNativeComputerHostCleanup(t, first.Authority)
 	session, err = barrier.Session()
 	if err != nil {
 		t.Fatal(err)
@@ -760,7 +761,17 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	if deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: second.Authority}); err != nil || !deleted.Deleted {
 		t.Fatalf("real Computer attempt C reap = %+v err=%v", deleted, err)
 	}
+	assertNativeComputerHostCleanup(t, second.Authority)
 	return true
+}
+
+func assertNativeComputerHostCleanup(t *testing.T, authority ocihelper.AttemptAuthority) {
+	t.Helper()
+	identity, err := ocihelper.DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestRootFault(t, "assert-computer-clean:"+identity.LogSegmentDirectory)
 }
 
 type nativeServiceDataImage struct {
@@ -1343,7 +1354,9 @@ func requestRootFault(t *testing.T, action string) {
 		t.Fatal("Linux OCI root fault supervisor is not provisioned")
 	}
 	ack := filepath.Join(directory, action+".done")
+	failure := filepath.Join(directory, action+".failed")
 	_ = os.Remove(ack)
+	_ = os.Remove(failure)
 	if err := os.WriteFile(fifo, []byte(action+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1351,6 +1364,9 @@ func requestRootFault(t *testing.T, action string) {
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(ack); err == nil {
 			return
+		}
+		if payload, err := os.ReadFile(failure); err == nil {
+			t.Fatalf("root assertion %s failed: %s", action, payload)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}

@@ -47,8 +47,11 @@ func atomicWriteComputerControlState(controlDirectory string, humanDriving bool)
 				writeErr = closeErr
 			}
 		}
-		if removeErr := os.Remove(temporaryName); writeErr == nil && removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			writeErr = removeErr
+		if temporaryName != "" {
+			removeErr := os.Remove(temporaryName)
+			if writeErr == nil && removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				writeErr = removeErr
+			}
 		}
 	}()
 	if err := temporary.Chmod(0o444); err != nil {
@@ -67,13 +70,9 @@ func atomicWriteComputerControlState(controlDirectory string, humanDriving bool)
 	if err := os.Rename(temporaryName, filepath.Join(controlDirectory, computerControlFilename)); err != nil {
 		return fmt.Errorf("publish Computer control state: %w", err)
 	}
-	directory, err := os.Open(controlDirectory)
-	if err != nil {
-		return fmt.Errorf("open Computer control directory: %w", err)
-	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil {
-		return fmt.Errorf("sync Computer control directory: %w", err)
-	}
+	// Rename is deliberately the last fallible operation. Once the guest can
+	// observe the new boolean, this verb must report success: a post-publish
+	// error could otherwise leave a spurious human_driving=true signal.
+	temporaryName = ""
 	return nil
 }

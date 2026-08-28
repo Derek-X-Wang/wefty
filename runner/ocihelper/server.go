@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const (
@@ -576,6 +578,9 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
 	}
 	computer := workloadHasComputerDisk(request.Workload)
+	if computer && request.Authority.Class != contract.JobClassService {
+		return nil, &RPCError{Code: CodeInvalidRequest, Message: "Computer mechanics require service attempt authority"}
+	}
 	if err := validateRunEndpointContract(computer, request.AllocateEndpoints); err != nil {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
 	}

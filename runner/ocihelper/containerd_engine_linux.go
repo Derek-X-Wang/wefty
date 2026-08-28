@@ -2614,3 +2614,4 @@ func cgroupReportedOOM(cgroupRoot, cgroupID string) bool {
 }
 
 var _ Engine = (*ContainerdEngine)(nil)
+var _ ComputerControlEngine = (*ContainerdEngine)(nil)

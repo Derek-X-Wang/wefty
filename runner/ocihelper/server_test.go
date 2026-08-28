@@ -434,19 +434,22 @@ func TestCrashAtEveryCreateBoundaryIsSweptBeforeReusedBootSession(t *testing.T) 
 }
 
 func TestWrongVersionAndPeerFailBeforeSessionAuthority(t *testing.T) {
-	engine := newFakeEngine()
-	client, stop := startTestServer(t, engine, ServerConfig{})
-	client.Version = ProtocolVersion + 1
-	_, err := client.OpenSession(t.Context(), testSessionRequest())
-	assertRPCCode(t, err, CodeVersionMismatch)
-	stop()
-	if engine.sessionReapCount() != 0 {
-		t.Fatal("a rejected protocol version minted session authority")
+	for _, version := range []int{ComputerProtocolVersion - 1, ProtocolVersion + 1} {
+		engine := newFakeEngine()
+		client, stop := startTestServer(t, engine, ServerConfig{})
+		client.Version = version
+		_, err := client.OpenSession(t.Context(), testSessionRequest())
+		assertRPCCode(t, err, CodeVersionMismatch)
+		stop()
+		if engine.sessionReapCount() != 0 {
+			t.Fatalf("rejected protocol version %d minted session authority", version)
+		}
 	}
 
-	client, stop = startTestServer(t, engine, ServerConfig{AllowedUIDs: []uint32{uint32(os.Getuid() + 1)}})
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{AllowedUIDs: []uint32{uint32(os.Getuid() + 1)}})
 	defer stop()
-	_, err = client.OpenSession(t.Context(), testSessionRequest())
+	_, err := client.OpenSession(t.Context(), testSessionRequest())
 	assertRPCCode(t, err, CodePeerUnauthenticated)
 	if engine.sessionReapCount() != 0 {
 		t.Fatal("an unauthenticated peer minted session authority")
@@ -735,6 +738,17 @@ func TestComputerEndpointContractFailsClosed(t *testing.T) {
 		_, err := session.Run(t.Context(), request)
 		assertRPCCode(t, err, CodeInvalidRequest)
 	}
+	oneShot := testRunRequest(testAuthority(), time.Second)
+	oneShot.Workload.ManagedVolumes = testComputerManagedVolumes()
+	oneShot.AllocateEndpoints = []string{"view", "control"}
+	_, err = session.Run(t.Context(), oneShot)
+	assertRPCCode(t, err, CodeInvalidRequest)
+
+	ordinary := testRunRequest(testAuthority(), time.Second)
+	ordinary.Authority.AttemptID = "ordinary-invalid-endpoints"
+	ordinary.AllocateEndpoints = []string{"view", "control"}
+	_, err = session.Run(t.Context(), ordinary)
+	assertRPCCode(t, err, CodeInvalidRequest)
 	if engine.runCount() != 0 {
 		t.Fatal("invalid Computer endpoints entered the engine")
 	}

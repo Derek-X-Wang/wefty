@@ -9,36 +9,28 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
-	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 type capabilityProbeAdapterStub struct {
-	version int
-	err     error
+	err error
 }
 
 func (stub capabilityProbeAdapterStub) Probe(context.Context, string, string, string, string, time.Duration) error {
-	return nil
+	return stub.err
 }
 
-func (stub capabilityProbeAdapterStub) HelperProtocolVersion() (int, error) {
-	return stub.version, stub.err
-}
-
-func TestOCIProbeDerivesComputerOnlyFromSupportingHelperProtocol(t *testing.T) {
+func TestOCIProbePublishesComputerOnlyAfterExactHelperProbe(t *testing.T) {
 	for _, test := range []struct {
 		name         string
-		version      int
-		versionErr   error
+		probeErr     error
 		wantComputer bool
 		wantErr      bool
 	}{
-		{name: "unsupported helper", version: ocihelper.ComputerProtocolVersion - 1},
-		{name: "supporting helper", version: ocihelper.ComputerProtocolVersion, wantComputer: true},
-		{name: "lost helper", versionErr: errors.New("helper session lost"), wantErr: true},
+		{name: "supporting helper", wantComputer: true},
+		{name: "lost helper", probeErr: errors.New("helper session lost"), wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			probe := ociCapabilityProbe{adapter: capabilityProbeAdapterStub{version: test.version, err: test.versionErr}}
+			probe := ociCapabilityProbe{adapter: capabilityProbeAdapterStub{err: test.probeErr}}
 			result, err := probe.Probe(t.Context())
 			if (err != nil) != test.wantErr {
 				t.Fatalf("probe error = %v, want error %t", err, test.wantErr)

@@ -552,6 +552,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	portfulService := claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.PublishedPort != nil
 	var ociEndpointLatch *runtimeEndpointLatch
 	if endpoints := runtimeAttemptEndpoints(claim.Job.Spec); len(endpoints) > 0 {
+		// Ordinary service readiness consumes the service endpoint below. The
+		// Computer view/control pair is intentionally retained by this latch for
+		// the atomic rfb-websocket-v1 consumer owned by #123/#125.
 		ociEndpointLatch = newRuntimeEndpointLatch()
 		request.AttemptEndpoints = endpoints
 		request.AttemptEndpointReady = ociEndpointLatch.publish

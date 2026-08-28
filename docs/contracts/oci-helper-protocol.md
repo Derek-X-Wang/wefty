@@ -453,9 +453,10 @@ filesystem; Computer operator mounts are therefore required to be read-only.
 The helper also mounts a fresh attempt-local tmpfs outside the Computer disk,
 writes `driver.json` false before `Started`, and bind-mounts that directory
 read-only at the non-shadowable `/wefty/control` target. The file is mode 0444
-and each state replacement is a same-directory atomic rename followed by a
-directory sync, so the image sees only the two exact complete documents. The
-attempt log/resource cleanup path owns this tmpfs mount; attempt reap, session
+and each state replacement ends with a same-directory atomic rename, so the
+image sees only the two exact complete documents and the helper cannot report a
+post-publication failure. The attempt log/resource cleanup path owns this tmpfs
+mount; attempt reap, session
 loss, and boot sweep unmount and remove it without adding it to Computer
 Storage evidence.
 

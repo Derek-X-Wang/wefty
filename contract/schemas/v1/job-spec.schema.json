@@ -285,7 +285,7 @@
           "not": {
             "anyOf": [
               { "enum": ["/", "/wefty", "/wefty/handoff", "/wefty/service", "/wefty/control"] },
-              { "pattern": "^/wefty/(handoff|service)/" }
+              { "pattern": "^/wefty/(handoff|service|control)/" }
             ]
           }
         }

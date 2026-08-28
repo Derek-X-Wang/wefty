@@ -187,7 +187,8 @@ type SessionIdentity struct {
 }
 
 // AttemptAuthority is the complete helper-side authorization tuple. Class is
-// carried only as an immutable resource label; it never selects mechanics.
+// an immutable resource label and may only narrow admission for mechanics that
+// are valid for that class.
 type AttemptAuthority struct {
 	NodeID            string `json:"node_id"`
 	JobID             string `json:"job_id"`
@@ -693,12 +694,6 @@ type DialAttemptPortRequest struct {
 type DialHostBridgeRequest struct {
 	Authority        AttemptAuthority `json:"authority"`
 	BridgeCapability string           `json:"bridge_capability"`
-}
-
-// SupportsComputerProtocol reports only the negotiated wire-semantic fact.
-// Functional runtime probing and boot-scoped publication remain agent-owned.
-func SupportsComputerProtocol(handshake AcquireSessionResponse) bool {
-	return handshake.ProtocolVersion >= ComputerProtocolVersion
 }
 
 func marshalBody(value any) (json.RawMessage, error) {

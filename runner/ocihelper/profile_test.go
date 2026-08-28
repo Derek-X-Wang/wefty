@@ -199,7 +199,8 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 	controlReadOnly := false
 	for _, mount := range spec.Mounts {
 		if mount.Destination == contract.OCIContainerControlDirectory {
-			controlReadOnly = mount.Source == input.ComputerControlSource && slices.Contains(mount.Options, "rro")
+			controlReadOnly = mount.Source == input.ComputerControlSource && slices.Contains(mount.Options, "rro") &&
+				slices.Contains(mount.Options, "nosuid") && slices.Contains(mount.Options, "nodev") && slices.Contains(mount.Options, "noexec")
 		}
 		if size, expected := writable[mount.Destination]; expected {
 			bounded[mount.Destination] = mount.Destination == "/wefty/service" ||
