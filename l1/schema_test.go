@@ -105,6 +105,23 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = database.Exec(`PRAGMA foreign_keys=OFF;
+		INSERT INTO jobs(job_id, dispatch_key, request_hash, spec_json, state, created_ns, updated_ns)
+		VALUES('migration-job', 'computer:migration', 'hash', '{}', 'stopped', 100, 100);
+		INSERT INTO service_jobs(job_id, desired_state, bound_node_id, restart_streak, lifetime_restart_count)
+		VALUES('migration-job', 'stopped', NULL, 0, 0);
+		INSERT INTO computers(computer_id, name, placement_node_id, bound_node_id, grants_json,
+			storage_id, storage_generation, desired_state, intent_revision, applied_revision,
+			current_job_id, current_spec_revision, reconfiguration_phase, reconfiguration_revision,
+			created_ns, updated_ns)
+		VALUES('migration-computer', 'migration-name', 'migration-node', NULL,
+			'[{"user_id":"migration-user","permission":"control"}]', 'migration-storage', 1,
+			'stopped', 1, 1, 'migration-job', 1, 'stable', NULL, 100, 100);
+		INSERT INTO computer_job_projections(computer_id, job_id, spec_revision, current, created_ns)
+		VALUES('migration-computer', 'migration-job', 1, 1, 100);
+		INSERT INTO computer_intent_history(computer_id, intent_revision, operation, desired_state,
+			storage_id, storage_generation, job_id, spec_revision, actor, created_ns)
+		VALUES('migration-computer', 1, 'create', 'stopped', 'migration-storage', 1,
+			'migration-job', 1, 'migration-actor', 100);
 		CREATE TABLE computers_old_constraint (
 			computer_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, placement_node_id TEXT NOT NULL,
 			bound_node_id TEXT, grants_json BLOB NOT NULL, storage_id TEXT NOT NULL UNIQUE,
@@ -115,7 +132,8 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 			current_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id), current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
 			reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'removing')),
 			reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0), created_ns INTEGER NOT NULL, updated_ns INTEGER NOT NULL
-		);
+			);
+		INSERT INTO computers_old_constraint SELECT * FROM computers;
 		DROP TABLE computers;
 		ALTER TABLE computers_old_constraint RENAME TO computers;
 		CREATE INDEX computers_binding ON computers(bound_node_id, desired_state);
@@ -127,7 +145,8 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 			storage_id TEXT NOT NULL, storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
 			job_id TEXT NOT NULL REFERENCES jobs(job_id), spec_revision INTEGER NOT NULL CHECK(spec_revision > 0),
 			actor TEXT NOT NULL, created_ns INTEGER NOT NULL, PRIMARY KEY(computer_id, intent_revision)
-		);
+			);
+		INSERT INTO computer_intent_history_old_constraint SELECT * FROM computer_intent_history;
 		DROP TABLE computer_intent_history;
 		ALTER TABLE computer_intent_history_old_constraint RENAME TO computer_intent_history;
 		PRAGMA foreign_keys=ON;`)
@@ -149,6 +168,29 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 	}
 	if !strings.Contains(computersSQL, "'resetting'") || !strings.Contains(intentsSQL, "'reset'") {
 		t.Fatalf("reset constraints were not migrated: computers=%s intents=%s", computersSQL, intentsSQL)
+	}
+	var name, placement, grantsJSON, currentJob string
+	var intentRevision int64
+	if err := store.db.QueryRow(`SELECT name, placement_node_id, grants_json, current_job_id, intent_revision
+		FROM computers WHERE computer_id='migration-computer'`).Scan(&name, &placement, &grantsJSON, &currentJob, &intentRevision); err != nil {
+		t.Fatal(err)
+	}
+	if name != "migration-name" || placement != "migration-node" ||
+		grantsJSON != `[{"user_id":"migration-user","permission":"control"}]` ||
+		currentJob != "migration-job" || intentRevision != 1 {
+		t.Fatalf("migrated Computer authority = %q %q %s %q %d", name, placement, grantsJSON, currentJob, intentRevision)
+	}
+	var projectionCount, intentCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM computer_job_projections
+		WHERE computer_id='migration-computer' AND job_id='migration-job' AND current=1`).Scan(&projectionCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM computer_intent_history
+		WHERE computer_id='migration-computer' AND job_id='migration-job' AND operation='create' AND actor='migration-actor'`).Scan(&intentCount); err != nil {
+		t.Fatal(err)
+	}
+	if projectionCount != 1 || intentCount != 1 {
+		t.Fatalf("migrated projection/intent counts = %d/%d", projectionCount, intentCount)
 	}
 }
 

@@ -4,38 +4,33 @@ package ocihelper
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-const computerStorageResetManifestVersion = 1
-
+// computerStorageResetPhase is a crash-injection seam. The durable phase
+// record lives in the shared Computer disk manifest; reset does not introduce
+// a second quarantine manifest or proof system.
 type computerStorageResetPhase string
 
 const (
-	computerStorageResetPrepared    computerStorageResetPhase = "prepared"
-	computerStorageResetQuarantined computerStorageResetPhase = "quarantined"
-	computerStorageResetDeleted     computerStorageResetPhase = "deleted"
-	computerStorageResetVerified    computerStorageResetPhase = "verified"
+	computerStorageResetRetirementFenced computerStorageResetPhase = "retirement_fenced"
+	computerStorageResetManifestWritten  computerStorageResetPhase = "allocation_manifest_written"
+	computerStorageResetAllocated        computerStorageResetPhase = "allocated_and_formatted"
+	computerStorageResetImagePublished   computerStorageResetPhase = "image_published"
+	computerStorageResetVerified         computerStorageResetPhase = "verified"
 )
 
-type computerStorageResetManifest struct {
-	Version        int                           `json:"version"`
-	Storage        ComputerStorageReference      `json:"storage"`
-	NewGeneration  int64                         `json:"new_generation"`
-	Authority      ComputerStorageResetAuthority `json:"authority"`
-	QuarantineName string                        `json:"quarantine_name"`
-	Phase          computerStorageResetPhase     `json:"phase"`
-	Receipt        *ComputerStorageResetReceipt  `json:"receipt,omitempty"`
-}
-
 func sameComputerStorageResetAuthority(left, right ComputerStorageResetAuthority) bool {
-	return left.NodeID == right.NodeID && left.JobID == right.JobID &&
-		left.IntentRevision == right.IntentRevision && left.CleanupFence == right.CleanupFence
+	return left.NodeID == right.NodeID && left.RootInstanceID == right.RootInstanceID &&
+		left.JobID == right.JobID && left.IntentRevision == right.IntentRevision &&
+		left.CleanupFence == right.CleanupFence
 }
 
 func validResetDetachmentEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority ComputerStorageResetAuthority) bool {
@@ -54,50 +49,6 @@ func validResetDetachmentEvidence(evidence *computerDiskEvidence, storage Comput
 	}
 }
 
-func readComputerStorageResetManifest(path string) (computerStorageResetManifest, bool, error) {
-	payload, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return computerStorageResetManifest{}, false, nil
-	}
-	if err != nil {
-		return computerStorageResetManifest{}, false, err
-	}
-	var manifest computerStorageResetManifest
-	if err := json.Unmarshal(payload, &manifest); err != nil || manifest.Version != computerStorageResetManifestVersion {
-		return computerStorageResetManifest{}, false, errors.New("Computer Storage reset manifest is invalid")
-	}
-	return manifest, true, nil
-}
-
-func writeComputerStorageResetManifest(root, path string, manifest computerStorageResetManifest) error {
-	payload, err := json.Marshal(manifest)
-	if err != nil {
-		return err
-	}
-	payload = append(payload, '\n')
-	temporary, err := os.CreateTemp(root, ".storage-reset.tmp-")
-	if err != nil {
-		return err
-	}
-	name := temporary.Name()
-	defer os.Remove(name)
-	writeErr := temporary.Chmod(0o600)
-	if writeErr == nil {
-		_, writeErr = temporary.Write(payload)
-	}
-	if writeErr == nil {
-		writeErr = temporary.Sync()
-	}
-	writeErr = errors.Join(writeErr, temporary.Close())
-	if writeErr != nil {
-		return writeErr
-	}
-	if err := os.Rename(name, path); err != nil {
-		return err
-	}
-	return syncDirectory(root)
-}
-
 func (engine *ContainerdEngine) storageResetCheckpoint(phase computerStorageResetPhase) error {
 	if engine.storageResetHook == nil {
 		return nil
@@ -105,186 +56,226 @@ func (engine *ContainerdEngine) storageResetCheckpoint(phase computerStorageRese
 	return engine.storageResetHook(phase)
 }
 
-func (engine *ContainerdEngine) verifyResetGenerationAbsent(diskRoot, quarantine, mountPath string) error {
-	for _, path := range []string{diskRoot, quarantine, mountPath} {
-		if _, err := os.Lstat(path); err == nil {
-			return fmt.Errorf("Computer Storage reset left %s", filepath.Base(path))
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
+func openComputerDiskLock(root string) (*os.File, error) {
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, err
 	}
-	for _, root := range []string{diskRoot, quarantine} {
-		loops, err := engine.computerDiskSystem().loopsForRoot(root)
-		if err != nil {
-			return err
-		}
-		if len(loops) != 0 {
-			return errors.New("Computer Storage reset left a loop attachment")
-		}
+	lock, err := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = lock.Close()
+		return nil, errors.New("Computer Storage generation already has an attachment owner")
+	}
+	return lock, nil
 }
 
-func (engine *ContainerdEngine) ResetComputerStorage(_ context.Context, request ResetComputerStorageRequest) (ResetComputerStorageResponse, error) {
-	engine.storageResetMu.Lock()
-	defer engine.storageResetMu.Unlock()
-	if request.Storage.DiskBytes <= 0 || request.Storage.IntentRevision != request.Authority.IntentRevision || request.NewGeneration != request.Storage.StorageGeneration+1 ||
-		request.Authority.NodeID == "" || request.Authority.BootSessionID == "" || request.Authority.JobID == "" ||
-		request.Authority.HelperGeneration == 0 || request.Authority.IntentRevision < 1 || request.Authority.CleanupFence == "" {
-		return ResetComputerStorageResponse{}, errors.New("Computer Storage reset request is incomplete")
+func closeComputerDiskLock(lock *os.File) {
+	if lock == nil {
+		return
 	}
-	name, err := deterministicComputerDiskName(request.Storage)
+	_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	_ = lock.Close()
+}
+
+// fenceResetPredecessor takes the exact attachment flock before inspecting
+// detachment and writes the retirement fence before releasing it. A delayed
+// attach therefore either owns the lock first (and reset refuses) or observes
+// the durable fence after acquiring it; it can never resurrect the generation
+// after successor verification.
+func (engine *ContainerdEngine) fenceResetPredecessor(storage ComputerStorageReference, authority ComputerStorageResetAuthority) error {
+	name, err := deterministicComputerDiskName(storage)
 	if err != nil {
-		return ResetComputerStorageResponse{}, err
+		return err
 	}
-	resetRoot := filepath.Join(engine.config.RuntimeRoot, "computer-storage-resets")
-	quarantineRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine")
-	if err := os.MkdirAll(resetRoot, 0o700); err != nil {
-		return ResetComputerStorageResponse{}, err
-	}
-	if err := os.MkdirAll(quarantineRoot, 0o700); err != nil {
-		return ResetComputerStorageResponse{}, err
-	}
-	manifestPath := filepath.Join(resetRoot, name+".json")
-	quarantineName := name + "-reset-" + fmt.Sprint(request.Authority.IntentRevision)
-	manifest, present, err := readComputerStorageResetManifest(manifestPath)
+	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+	lock, err := openComputerDiskLock(diskRoot)
 	if err != nil {
-		return ResetComputerStorageResponse{}, err
+		return err
+	}
+	defer closeComputerDiskLock(lock)
+
+	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
+	if err != nil {
+		return err
 	}
 	if present {
-		if !sameComputerStorageIdentity(manifest.Storage, request.Storage) || manifest.NewGeneration != request.NewGeneration ||
-			!sameComputerStorageResetAuthority(manifest.Authority, request.Authority) || manifest.QuarantineName != quarantineName {
-			return ResetComputerStorageResponse{}, errors.New("Computer Storage generation already has a different reset authority")
+		if !sameComputerStorageIdentity(manifest.Storage, storage) || manifest.DiskImage != "disk.ext4" ||
+			manifest.MountDirectory != name || manifest.Attached != nil || manifest.Pending != nil {
+			return errors.New("Computer Storage reset lacks exact detached generation authority")
+		}
+		if manifest.Retirement != nil {
+			if !sameComputerStorageResetAuthority(*manifest.Retirement, authority) {
+				return errors.New("Computer Storage generation already has different retirement authority")
+			}
+			return nil
+		}
+		if _, imageErr := os.Lstat(filepath.Join(diskRoot, "disk.ext4")); imageErr == nil {
+			if !validResetDetachmentEvidence(manifest.PreviousDetachment, storage, authority) {
+				return errors.New("Computer Storage reset lacks exact detachment evidence")
+			}
+		} else if !errors.Is(imageErr, os.ErrNotExist) {
+			return imageErr
 		}
 	} else {
-		manifest = computerStorageResetManifest{Version: computerStorageResetManifestVersion, Storage: request.Storage,
-			NewGeneration: request.NewGeneration, Authority: request.Authority, QuarantineName: quarantineName,
-			Phase: computerStorageResetPrepared}
-		diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
-		diskManifest, diskPresent, readErr := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
-		if readErr != nil {
-			return ResetComputerStorageResponse{}, readErr
+		manifest = computerDiskManifest{Version: computerDiskManifestVersion, Storage: storage,
+			DiskImage: "disk.ext4", MountDirectory: name}
+	}
+	if _, mounted, err := engine.computerDiskSystem().mountedSource(filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)); err != nil {
+		return err
+	} else if mounted {
+		return errors.New("Computer Storage generation remains mounted during reset")
+	}
+	loops, err := engine.computerDiskSystem().loopsForRoot(diskRoot)
+	if err != nil {
+		return err
+	}
+	if len(loops) != 0 {
+		return errors.New("Computer Storage generation remains loop-attached during reset")
+	}
+	manifest.Retirement = &authority
+	if err := writeComputerDiskManifest(diskRoot, manifest); err != nil {
+		return err
+	}
+	return engine.storageResetCheckpoint(computerStorageResetRetirementFenced)
+}
+
+func resetInsufficientDiskError(root string, requested int64, err error) error {
+	if !errors.Is(err, syscall.ENOSPC) {
+		return err
+	}
+	var stat unix.Statfs_t
+	available := int64(0)
+	if statErr := unix.Statfs(root, &stat); statErr == nil {
+		const maxInt64 = int64(^uint64(0) >> 1)
+		if stat.Bsize > 0 && stat.Bavail <= uint64(maxInt64/stat.Bsize) {
+			available = int64(stat.Bavail) * stat.Bsize
 		}
-		if diskPresent {
-			if !sameComputerStorageIdentity(diskManifest.Storage, request.Storage) || diskManifest.Attached != nil ||
-				diskManifest.Pending != nil || !validResetDetachmentEvidence(diskManifest.PreviousDetachment, request.Storage, request.Authority) {
-				return ResetComputerStorageResponse{}, errors.New("Computer Storage reset lacks exact detached generation authority")
+	}
+	return &insufficientDiskError{RequestedBytes: requested, ObservedAvailableBytes: available, err: err}
+}
+
+func (engine *ContainerdEngine) prepareResetSuccessor(ctx context.Context, request ResetComputerStorageRequest) (ComputerStorageResetReceipt, error) {
+	storage := request.Storage
+	storage.StorageGeneration = request.NewGeneration
+	storage.IntentRevision = request.Authority.IntentRevision
+	name, err := deterministicComputerDiskName(storage)
+	if err != nil {
+		return ComputerStorageResetReceipt{}, err
+	}
+	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+	lock, err := openComputerDiskLock(diskRoot)
+	if err != nil {
+		return ComputerStorageResetReceipt{}, err
+	}
+	defer closeComputerDiskLock(lock)
+
+	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
+	if err != nil {
+		return ComputerStorageResetReceipt{}, err
+	}
+	if present {
+		if !sameComputerStorageIdentity(manifest.Storage, storage) || manifest.DiskImage != "disk.ext4" ||
+			manifest.MountDirectory != name || manifest.Attached != nil || manifest.Pending != nil ||
+			manifest.Retirement != nil || manifest.Preparation == nil ||
+			!sameComputerStorageResetAuthority(*manifest.Preparation, request.Authority) {
+			return ComputerStorageResetReceipt{}, errors.New("replacement Computer Storage has different preparation authority")
+		}
+		if manifest.PreparationReceipt != nil {
+			if err := verifyComputerDiskAllocation(filepath.Join(diskRoot, "disk.ext4"), storage.DiskBytes); err != nil {
+				return ComputerStorageResetReceipt{}, err
 			}
-		} else if _, statErr := os.Lstat(diskRoot); statErr == nil {
-			return ResetComputerStorageResponse{}, errors.New("Computer Storage reset found bytes without an authority manifest")
-		} else if !errors.Is(statErr, os.ErrNotExist) {
-			return ResetComputerStorageResponse{}, statErr
+			return *manifest.PreparationReceipt, nil
 		}
-		mountPath := filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)
-		if _, mounted, mountErr := engine.computerDiskSystem().mountedSource(mountPath); mountErr != nil {
-			return ResetComputerStorageResponse{}, mountErr
-		} else if mounted {
-			return ResetComputerStorageResponse{}, errors.New("Computer Storage generation remains mounted during reset")
+	} else {
+		manifest = computerDiskManifest{Version: computerDiskManifestVersion, Storage: storage,
+			DiskImage: "disk.ext4", MountDirectory: name, Preparation: &request.Authority}
+		if err := writeComputerDiskManifest(diskRoot, manifest); err != nil {
+			return ComputerStorageResetReceipt{}, err
 		}
-		loops, loopErr := engine.computerDiskSystem().loopsForRoot(diskRoot)
-		if loopErr != nil {
-			return ResetComputerStorageResponse{}, loopErr
-		}
-		if len(loops) != 0 {
-			return ResetComputerStorageResponse{}, errors.New("Computer Storage generation remains loop-attached during reset")
-		}
-		if err := writeComputerStorageResetManifest(resetRoot, manifestPath, manifest); err != nil {
-			return ResetComputerStorageResponse{}, err
-		}
-		if err := engine.storageResetCheckpoint(computerStorageResetPrepared); err != nil {
-			return ResetComputerStorageResponse{}, err
+		if err := engine.storageResetCheckpoint(computerStorageResetManifestWritten); err != nil {
+			return ComputerStorageResetReceipt{}, err
 		}
 	}
 
-	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
-	quarantine := filepath.Join(quarantineRoot, manifest.QuarantineName)
-	mountPath := filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)
-	if manifest.Phase == computerStorageResetPrepared {
-		_, diskErr := os.Lstat(diskRoot)
-		_, quarantineErr := os.Lstat(quarantine)
-		if diskErr == nil && quarantineErr == nil {
-			return ResetComputerStorageResponse{}, errors.New("Computer Storage reset found both current and quarantined bytes")
-		}
-		if diskErr == nil {
-			if err := os.Rename(diskRoot, quarantine); err != nil {
-				return ResetComputerStorageResponse{}, err
-			}
-			if err := syncDirectory(filepath.Dir(diskRoot)); err != nil {
-				return ResetComputerStorageResponse{}, err
-			}
-			if err := syncDirectory(quarantineRoot); err != nil {
-				return ResetComputerStorageResponse{}, err
-			}
-		} else if !errors.Is(diskErr, os.ErrNotExist) {
-			return ResetComputerStorageResponse{}, diskErr
-		} else if quarantineErr != nil && !errors.Is(quarantineErr, os.ErrNotExist) {
-			return ResetComputerStorageResponse{}, quarantineErr
-		}
-		manifest.Phase = computerStorageResetQuarantined
-		if err := writeComputerStorageResetManifest(resetRoot, manifestPath, manifest); err != nil {
-			return ResetComputerStorageResponse{}, err
-		}
-		if err := engine.storageResetCheckpoint(computerStorageResetQuarantined); err != nil {
-			return ResetComputerStorageResponse{}, err
-		}
-	}
-	if manifest.Phase == computerStorageResetQuarantined {
-		if _, mounted, err := engine.computerDiskSystem().mountedSource(mountPath); err != nil {
-			return ResetComputerStorageResponse{}, err
-		} else if mounted {
-			return ResetComputerStorageResponse{}, errors.New("Computer Storage generation remains mounted during reset deletion")
-		}
-		if err := os.RemoveAll(quarantine); err != nil {
-			return ResetComputerStorageResponse{}, err
-		}
-		if err := os.RemoveAll(mountPath); err != nil {
-			return ResetComputerStorageResponse{}, err
-		}
-		if err := syncDirectory(quarantineRoot); err != nil {
-			return ResetComputerStorageResponse{}, err
-		}
-		if err := syncDirectory(filepath.Dir(mountPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return ResetComputerStorageResponse{}, err
-		}
-		manifest.Phase = computerStorageResetDeleted
-		if err := writeComputerStorageResetManifest(resetRoot, manifestPath, manifest); err != nil {
-			return ResetComputerStorageResponse{}, err
-		}
-		if err := engine.storageResetCheckpoint(computerStorageResetDeleted); err != nil {
-			return ResetComputerStorageResponse{}, err
-		}
-	}
-	if manifest.Phase == computerStorageResetDeleted {
-		if err := engine.verifyResetGenerationAbsent(diskRoot, quarantine, mountPath); err != nil {
-			return ResetComputerStorageResponse{}, err
-		}
-		// A reset that resumes after a helper or boot restart keeps the same
-		// logical L1 authority, but the positive verification belongs to the
-		// helper generation that actually performed it. Persist that generation
-		// in the receipt so replay cannot change acknowledgement evidence.
-		manifest.Authority.BootSessionID = request.Authority.BootSessionID
-		manifest.Authority.HelperGeneration = request.Authority.HelperGeneration
-		receiptID, err := randomCapability()
+	imagePath := filepath.Join(diskRoot, "disk.ext4")
+	if _, err := os.Lstat(imagePath); errors.Is(err, os.ErrNotExist) {
+		temporary, err := os.CreateTemp(diskRoot, ".disk.ext4.tmp-")
 		if err != nil {
-			return ResetComputerStorageResponse{}, err
+			return ComputerStorageResetReceipt{}, err
 		}
-		manifest.Receipt = &ComputerStorageResetReceipt{Kind: "computer_storage_reset_verified", ReceiptID: receiptID,
-			ComputerID: request.Storage.ComputerID, StorageID: request.Storage.StorageID,
-			OldGeneration: request.Storage.StorageGeneration, NewGeneration: request.NewGeneration,
-			NodeID: request.Authority.NodeID, JobID: request.Authority.JobID,
-			IntentRevision: request.Authority.IntentRevision, CleanupFence: request.Authority.CleanupFence,
-			HelperGeneration: manifest.Authority.HelperGeneration}
-		manifest.Phase = computerStorageResetVerified
-		if err := writeComputerStorageResetManifest(resetRoot, manifestPath, manifest); err != nil {
-			return ResetComputerStorageResponse{}, err
+		temporaryPath := temporary.Name()
+		if closeErr := temporary.Close(); closeErr != nil {
+			_ = os.Remove(temporaryPath)
+			return ComputerStorageResetReceipt{}, closeErr
 		}
-		if err := engine.storageResetCheckpoint(computerStorageResetVerified); err != nil {
-			return ResetComputerStorageResponse{}, err
+		defer os.Remove(temporaryPath)
+		if err := engine.computerDiskSystem().allocateAndFormat(ctx, temporaryPath, storage.DiskBytes); err != nil {
+			return ComputerStorageResetReceipt{}, fmt.Errorf("fully allocate replacement Computer disk: %w",
+				resetInsufficientDiskError(diskRoot, storage.DiskBytes, err))
 		}
+		if err := engine.storageResetCheckpoint(computerStorageResetAllocated); err != nil {
+			return ComputerStorageResetReceipt{}, err
+		}
+		if err := os.Rename(temporaryPath, imagePath); err != nil {
+			return ComputerStorageResetReceipt{}, fmt.Errorf("publish replacement Computer disk image: %w", err)
+		}
+		if err := syncDirectory(diskRoot); err != nil {
+			return ComputerStorageResetReceipt{}, err
+		}
+		// The formerly unreachable rename -> phase-write crash boundary is now
+		// mutation-testable. The manifest already names the staging generation,
+		// so retry verifies the image and completes preparation.
+		if err := engine.storageResetCheckpoint(computerStorageResetImagePublished); err != nil {
+			return ComputerStorageResetReceipt{}, err
+		}
+	} else if err != nil {
+		return ComputerStorageResetReceipt{}, err
 	}
-	if manifest.Phase != computerStorageResetVerified || manifest.Receipt == nil ||
-		strings.TrimSpace(manifest.Receipt.ReceiptID) == "" {
-		return ResetComputerStorageResponse{}, errors.New("Computer Storage reset lacks positive verification")
+	if err := verifyComputerDiskAllocation(imagePath, storage.DiskBytes); err != nil {
+		return ComputerStorageResetReceipt{}, err
 	}
-	return ResetComputerStorageResponse{Verified: true, Receipt: *manifest.Receipt}, nil
+	receiptID, err := randomCapability()
+	if err != nil {
+		return ComputerStorageResetReceipt{}, err
+	}
+	receipt := ComputerStorageResetReceipt{Kind: "computer_storage_reset_verified", ReceiptID: receiptID,
+		ComputerID: storage.ComputerID, StorageID: storage.StorageID,
+		OldGeneration: request.Storage.StorageGeneration, NewGeneration: request.NewGeneration,
+		NodeID: request.Authority.NodeID, RootInstanceID: request.Authority.RootInstanceID,
+		JobID: request.Authority.JobID, IntentRevision: request.Authority.IntentRevision,
+		CleanupFence: request.Authority.CleanupFence, HelperGeneration: request.Authority.HelperGeneration}
+	manifest.Prepared = true
+	manifest.PreparationReceipt = &receipt
+	if err := writeComputerDiskManifest(diskRoot, manifest); err != nil {
+		return ComputerStorageResetReceipt{}, err
+	}
+	if err := engine.storageResetCheckpoint(computerStorageResetVerified); err != nil {
+		return ComputerStorageResetReceipt{}, err
+	}
+	return receipt, nil
+}
+
+// ResetComputerStorage prepares and verifies N+1 without deleting N. L1 first
+// publishes the verified successor; retirement then runs through the shared
+// managed-volume delete and removal-attestation path.
+func (engine *ContainerdEngine) ResetComputerStorage(ctx context.Context, request ResetComputerStorageRequest) (ResetComputerStorageResponse, error) {
+	engine.storageResetMu.Lock()
+	defer engine.storageResetMu.Unlock()
+	if request.Storage.DiskBytes <= 0 || request.Storage.IntentRevision != request.Authority.IntentRevision ||
+		request.NewGeneration != request.Storage.StorageGeneration+1 || request.Authority.NodeID == "" ||
+		request.Authority.BootSessionID == "" || request.Authority.RootInstanceID == "" ||
+		request.Authority.JobID == "" || request.Authority.HelperGeneration == 0 ||
+		request.Authority.IntentRevision < 1 || strings.TrimSpace(request.Authority.CleanupFence) == "" {
+		return ResetComputerStorageResponse{}, errors.New("Computer Storage reset request is incomplete")
+	}
+	if err := engine.fenceResetPredecessor(request.Storage, request.Authority); err != nil {
+		return ResetComputerStorageResponse{}, err
+	}
+	receipt, err := engine.prepareResetSuccessor(ctx, request)
+	if err != nil {
+		return ResetComputerStorageResponse{}, err
+	}
+	return ResetComputerStorageResponse{Verified: true, Receipt: receipt}, nil
 }

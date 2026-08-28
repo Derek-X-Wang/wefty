@@ -309,13 +309,14 @@ CREATE TABLE IF NOT EXISTS computer_storage_resets (
   storage_id TEXT NOT NULL,
   old_generation INTEGER NOT NULL CHECK(old_generation > 0),
   new_generation INTEGER NOT NULL CHECK(new_generation > old_generation),
-  disk_bytes INTEGER NOT NULL CHECK(disk_bytes > 0),
-  bound_node_id TEXT NOT NULL,
-  job_id TEXT NOT NULL REFERENCES jobs(job_id),
+	  disk_bytes INTEGER NOT NULL CHECK(disk_bytes > 0),
+	  bound_node_id TEXT NOT NULL,
+	  root_instance_id TEXT NOT NULL,
+	  job_id TEXT NOT NULL REFERENCES jobs(job_id),
   cleanup_fence TEXT NOT NULL,
   idempotency_key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('reserved', 'verified', 'published')),
+	  status TEXT NOT NULL CHECK(status IN ('reserved', 'prepared', 'published', 'retired', 'superseded')),
   verification_receipt_json BLOB,
   verification_receipt_hash TEXT,
   acknowledgement_key TEXT,
@@ -327,7 +328,7 @@ CREATE TABLE IF NOT EXISTS computer_storage_resets (
   UNIQUE(computer_id, idempotency_key)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_reset_active
-  ON computer_storage_resets(computer_id) WHERE status<>'published';
+	  ON computer_storage_resets(computer_id) WHERE status NOT IN ('retired', 'superseded');
 CREATE TABLE IF NOT EXISTS service_restart_requests (
   job_id TEXT NOT NULL REFERENCES service_jobs(job_id) ON DELETE CASCADE,
   idempotency_key TEXT NOT NULL,

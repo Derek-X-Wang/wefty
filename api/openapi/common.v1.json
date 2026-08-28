@@ -524,7 +524,18 @@
         },
         "description": "No tags or capacity fields are accepted. Operators own routing tags and class-scoped slot policy; the node advertises one complete boot-revisioned execution capability observation. connect_host is a non-authoritative Fabric projection."
       },
-      "RemovalDirective": {
+	  "ComputerStorageClaim": {
+		"type": "object",
+		"additionalProperties": false,
+		"required": ["computer_id", "storage_id", "storage_generation", "intent_revision"],
+		"properties": {
+		  "computer_id": { "type": "string", "minLength": 1 },
+		  "storage_id": { "type": "string", "minLength": 1 },
+		  "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+		  "intent_revision": { "type": "integer", "format": "int64", "minimum": 0 }
+		}
+	  },
+	  "RemovalDirective": {
         "type": "object",
         "additionalProperties": false,
         "required": ["job_id", "bound_node_id", "kind", "removal_generation", "cleanup_fence", "root_instance_id"],
@@ -534,26 +545,50 @@
           "kind": { "type": "string", "enum": ["process", "oci"] },
           "removal_generation": { "type": "integer", "minimum": 1 },
           "cleanup_fence": { "type": "string", "minLength": 1 },
-          "root_instance_id": { "type": "string", "minLength": 1 }
+          "root_instance_id": { "type": "string", "minLength": 1 },
+          "computer_storage": { "$ref": "#/components/schemas/ComputerStorageClaim" },
+          "computer_storage_generations": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["generations"],
+            "properties": {
+              "generations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["computer_id", "storage_id", "storage_generation", "disk_bytes"],
+                  "properties": {
+                    "computer_id": { "type": "string", "minLength": 1 },
+                    "storage_id": { "type": "string", "minLength": 1 },
+                    "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+                    "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 }
+                  }
+                }
+              }
+            }
+          }
         }
       },
       "ComputerStorageResetDirective": {
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "computer_id", "bound_node_id", "job_id", "intent_revision", "storage_id",
-          "old_generation", "new_generation", "disk_bytes", "cleanup_fence"
+          "computer_id", "bound_node_id", "root_instance_id", "job_id", "intent_revision", "storage_id",
+          "old_generation", "new_generation", "disk_bytes", "cleanup_fence", "phase"
         ],
         "properties": {
           "computer_id": { "type": "string", "minLength": 1 },
-          "bound_node_id": { "type": "string", "minLength": 1 },
+		  "bound_node_id": { "type": "string", "minLength": 1 },
+		  "root_instance_id": { "type": "string", "minLength": 1 },
           "job_id": { "type": "string", "minLength": 1 },
           "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
           "storage_id": { "type": "string", "minLength": 1 },
           "old_generation": { "type": "integer", "format": "int64", "minimum": 1 },
           "new_generation": { "type": "integer", "format": "int64", "minimum": 2 },
           "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
-          "cleanup_fence": { "type": "string", "minLength": 1 }
+		  "cleanup_fence": { "type": "string", "minLength": 1 },
+		  "phase": { "type": "string", "enum": ["reserved", "prepared", "published"] }
         }
       },
       "Node": {

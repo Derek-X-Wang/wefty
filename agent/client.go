@@ -187,6 +187,12 @@ func (c *Client) AcknowledgeComputerStorageReset(ctx context.Context, computerID
 	return computer, err
 }
 
+func (c *Client) AcknowledgeComputerStorageRetirement(ctx context.Context, computerID string, request l1.RemovalAcknowledgementRequest) (l1.Computer, error) {
+	var computer l1.Computer
+	err := c.post(ctx, "/v1/agent/computers/"+url.PathEscape(computerID)+"/storage-retirement-acknowledgement", request, &computer)
+	return computer, err
+}
+
 func attemptPath(jobID, attemptID string) string {
 	return "/v1/agent/jobs/" + url.PathEscape(jobID) + "/attempts/" + url.PathEscape(attemptID)
 }

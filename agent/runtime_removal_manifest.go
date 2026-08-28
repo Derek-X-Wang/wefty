@@ -483,16 +483,37 @@ func validateRuntimeRemovalAttestation(manifest runtimeRemovalManifest, attestat
 		strings.TrimSpace(attestation.RuntimeInstanceID) == "" || attestation.RuntimeGeneration == 0 || len(attestation.Attempts) == 0 {
 		return errors.New("agent: runtime removal requires a complete helper-generation absence attestation")
 	}
+	if len(attestation.Attempts) < len(manifest.Attempts) {
+		return errors.New("agent: runtime absence attestation omitted a frozen attempt")
+	}
 	wantAttempts, err := json.Marshal(manifest.Attempts)
 	if err != nil {
 		return err
 	}
-	gotAttempts, err := json.Marshal(attestation.Attempts)
+	gotAttempts, err := json.Marshal(attestation.Attempts[:len(manifest.Attempts)])
 	if err != nil || !bytes.Equal(wantAttempts, gotAttempts) {
 		return errors.New("agent: runtime absence attestation does not match the frozen attempt manifest")
 	}
-	want := make(map[workloadrunner.RuntimeRemovalResource]struct{})
+	computerID, storageID := "", ""
 	for _, attempt := range manifest.Attempts {
+		if attempt.ComputerStorage != nil {
+			computerID, storageID = attempt.ComputerStorage.ComputerID, attempt.ComputerStorage.StorageID
+			break
+		}
+	}
+	for _, attempt := range attestation.Attempts[len(manifest.Attempts):] {
+		if !attempt.StorageOnly || !validComputerStorage(attempt.ComputerStorage) {
+			return errors.New("agent: runtime absence attestation added a non-authoritative Storage manifest")
+		}
+		if computerID == "" {
+			computerID, storageID = attempt.ComputerStorage.ComputerID, attempt.ComputerStorage.StorageID
+		}
+		if attempt.ComputerStorage.ComputerID != computerID || attempt.ComputerStorage.StorageID != storageID {
+			return errors.New("agent: runtime absence attestation mixed Computer Storage authorities")
+		}
+	}
+	want := make(map[workloadrunner.RuntimeRemovalResource]struct{})
+	for _, attempt := range attestation.Attempts {
 		for _, resource := range attempt.RemovalResources() {
 			want[resource] = struct{}{}
 		}

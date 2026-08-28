@@ -181,7 +181,8 @@ func TestComputerStorageResetRequiresCurrentHelperGeneration(t *testing.T) {
 		Storage:       ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 2, DiskBytes: 8 << 30},
 		NewGeneration: 2,
 		Authority: ComputerStorageResetAuthority{NodeID: "node-1", BootSessionID: "boot-1",
-			HelperGeneration: session.Handshake().SessionGeneration + 1, JobID: "job-1", IntentRevision: 2, CleanupFence: "reset-fence"},
+			HelperGeneration: session.Handshake().SessionGeneration + 1, RootInstanceID: "managed-root-1",
+			JobID: "job-1", IntentRevision: 2, CleanupFence: "reset-fence"},
 	}
 	if _, err := session.ResetComputerStorage(t.Context(), request); err == nil {
 		t.Fatal("stale helper generation authorized Computer Storage reset")
@@ -1825,7 +1826,7 @@ func newFakeEngine() *fakeEngine { return &fakeEngine{runResponse: RunResponse{S
 
 func testComputerManagedVolumes() []ManagedVolumeDescriptor {
 	return []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
-		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 8 << 30,
+		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30,
 	}}}
 }
 
@@ -1978,7 +1979,8 @@ func (*fakeEngine) ResetComputerStorage(_ context.Context, request ResetComputer
 		Kind: "computer_storage_reset_verified", ReceiptID: "reset-receipt",
 		ComputerID: request.Storage.ComputerID, StorageID: request.Storage.StorageID,
 		OldGeneration: request.Storage.StorageGeneration, NewGeneration: request.NewGeneration,
-		NodeID: request.Authority.NodeID, JobID: request.Authority.JobID, IntentRevision: request.Authority.IntentRevision,
+		NodeID: request.Authority.NodeID, RootInstanceID: request.Authority.RootInstanceID,
+		JobID: request.Authority.JobID, IntentRevision: request.Authority.IntentRevision,
 		CleanupFence: request.Authority.CleanupFence, HelperGeneration: request.Authority.HelperGeneration,
 	}}, nil
 }

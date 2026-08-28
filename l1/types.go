@@ -97,13 +97,28 @@ const (
 // attempt lease, it has no expiry; only the node's current boot session may
 // act on it.
 type RemovalDirective struct {
-	JobID             string                `json:"job_id"`
-	BoundNodeID       string                `json:"bound_node_id"`
-	Kind              string                `json:"kind"`
-	RemovalGeneration uint64                `json:"removal_generation"`
-	CleanupFence      string                `json:"cleanup_fence"`
-	RootInstanceID    string                `json:"root_instance_id"`
-	ComputerStorage   *ComputerStorageClaim `json:"computer_storage,omitempty"`
+	JobID                      string                           `json:"job_id"`
+	BoundNodeID                string                           `json:"bound_node_id"`
+	Kind                       string                           `json:"kind"`
+	RemovalGeneration          uint64                           `json:"removal_generation"`
+	CleanupFence               string                           `json:"cleanup_fence"`
+	RootInstanceID             string                           `json:"root_instance_id"`
+	ComputerStorage            *ComputerStorageClaim            `json:"computer_storage,omitempty"`
+	ComputerStorageGenerations *ComputerStorageGenerationClaims `json:"computer_storage_generations,omitempty"`
+}
+
+type ComputerStorageGenerationClaims struct {
+	Generations []ComputerStorageGenerationClaim `json:"generations"`
+}
+
+// ComputerStorageGenerationClaim is Storage identity and allocation truth for
+// removal. IntentRevision is deliberately absent: it is mutable intent, not
+// part of (computer_id, storage_id, generation) identity.
+type ComputerStorageGenerationClaim struct {
+	ComputerID        string `json:"computer_id"`
+	StorageID         string `json:"storage_id"`
+	StorageGeneration int64  `json:"storage_generation"`
+	DiskBytes         int64  `json:"disk_bytes"`
 }
 
 type RemovalAcknowledgementRequest struct {

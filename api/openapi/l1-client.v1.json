@@ -470,7 +470,7 @@
       "post": {
         "operationId": "resetComputerStorage",
         "summary": "Reserve a new empty Storage generation",
-        "description": "Persists one CAS intent, stages generation+1, and quiesces the current Job. The old generation remains current until the bound agent positively verifies detach, quarantine, deletion, and absence; only then may L1 publish the replacement and restore the Computer's authoritative desired state.",
+        "description": "Stopped-only operation that persists one CAS intent and reserves generation+1 after capacity admission. The bound agent fences the detached predecessor, fully allocates and verifies the tracked successor, and L1 durably publishes it while keeping the Computer stopped; only then does shared removal delete and attest the predecessor.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": {

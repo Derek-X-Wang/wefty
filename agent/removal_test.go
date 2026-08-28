@@ -67,7 +67,8 @@ func TestRemovalControllerPersistsReapsDeletesThenAcknowledges(t *testing.T) {
 
 func TestComputerRemovalDeletesDiskBeforeAcknowledgement(t *testing.T) {
 	directive := l1.RemovalDirective{JobID: "computer-job", BoundNodeID: "node", Kind: contract.JobKindOCI, RemovalGeneration: 4, CleanupFence: "cleanup", RootInstanceID: "root",
-		ComputerStorage: &l1.ComputerStorageClaim{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2}}
+		ComputerStorage:            &l1.ComputerStorageClaim{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2},
+		ComputerStorageGenerations: &l1.ComputerStorageGenerationClaims{Generations: []l1.ComputerStorageGenerationClaim{{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30}}}}
 	var stages []string
 	storage := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30}
 	attempt := testRuntimeResourceManifest(directive.JobID, "legacy-attempt")
@@ -126,7 +127,8 @@ func TestComputerRemovalDeletesDiskBeforeAcknowledgement(t *testing.T) {
 			workloadrunner.RuntimeRemovalComputerDiskImage, workloadrunner.RuntimeRemovalComputerDiskAllocation,
 			workloadrunner.RuntimeRemovalComputerDiskQuota, workloadrunner.RuntimeRemovalComputerDiskManifest,
 			workloadrunner.RuntimeRemovalComputerDiskMount, workloadrunner.RuntimeRemovalComputerDiskLoop,
-			workloadrunner.RuntimeRemovalComputerAttachment,
+			workloadrunner.RuntimeRemovalComputerAttachment, workloadrunner.RuntimeRemovalComputerResetManifest,
+			workloadrunner.RuntimeRemovalComputerQuarantine,
 		} {
 			if !classes[class] {
 				t.Fatalf("Computer attestation omitted class %q: %+v", class, request.Attempts[0].RemovalResources())
@@ -135,6 +137,8 @@ func TestComputerRemovalDeletesDiskBeforeAcknowledgement(t *testing.T) {
 		if classes[workloadrunner.RuntimeRemovalServiceData] || classes[workloadrunner.RuntimeRemovalServiceDataRecord] {
 			t.Fatalf("Computer attestation included service-data classes: %+v", request.Attempts[0].RemovalResources())
 		}
+		manifest := runtimeRemovalManifest{Version: 1, JobID: request.JobID, RemovalGeneration: request.RemovalGeneration,
+			Attempts: request.Attempts}
 		return testRuntimeRemovalAttestation(manifest), nil
 	}
 	controller.ackRemoval = func(context.Context, localRemoval) error { stages = append(stages, "ack"); return nil }
@@ -185,6 +189,28 @@ func TestComputerRemovalResumesFromDurableAttestationWithoutRepeatingHelperDelet
 	}
 	if want := []string{"ack"}; !reflect.DeepEqual(stages, want) {
 		t.Fatalf("resumed Computer removal stages = %v, want %v", stages, want)
+	}
+}
+
+func TestComputerRemovalAcceptsHistoricalGenerationsAndIgnoresIntentRevisionIdentity(t *testing.T) {
+	manifest := runtimeRemovalManifest{Version: 1, JobID: "computer-job", RemovalGeneration: 1,
+		Attempts: []workloadrunner.RuntimeResourceManifest{
+			{ComputerStorage: &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30}},
+			{ComputerStorage: &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, IntentRevision: 4, DiskBytes: 8 << 30}},
+			{ComputerStorage: &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, IntentRevision: 7, DiskBytes: 8 << 30}},
+		}}
+	storages, err := removalComputerStorages(manifest, []l1.ComputerStorageGenerationClaim{
+		{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30},
+		{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30},
+		{ComputerID: "computer", StorageID: "storage", StorageGeneration: 3, DiskBytes: 8 << 30},
+	})
+	if err != nil || len(storages) != 3 {
+		t.Fatalf("historical Computer Storage identities = %+v err=%v", storages, err)
+	}
+	for index, generation := range []int64{1, 2, 3} {
+		if storages[index].StorageGeneration != generation {
+			t.Fatalf("generation[%d] = %+v", index, storages[index])
+		}
 	}
 }
 

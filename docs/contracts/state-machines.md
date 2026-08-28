@@ -121,18 +121,23 @@ materialized by an authority read or CAS. Every history actor is the
 authenticated Fabric identity, never a request-body claim; creation replay by
 a different actor conflicts even when the JobSpec bytes match.
 
-A Storage reset appends one `reset` intent, enters revision-fenced `resetting`,
-and creates exactly one `staging` generation at current generation plus one.
-The old generation remains `current` and the replacement remains unclaimable
-while the current Job is quiesced. The bound agent may advance the reset only
-with a helper receipt naming the exact Computer, Storage ID, old and new
-generations, Job, Node, reset revision, cleanup fence, and helper generation.
-L1 commits that verification before a separate publication transaction
-atomically changes old `current → retired`, staging `→ current`, advances
-`storage_generation` and `applied_revision`, and restores the authoritative
-Computer desired state on the same Job. A crash before publication repeats the
-standing directive; a crash after publication sees an idempotent terminal
-reset row. Neither path auto-resumes the old generation.
+A Storage reset is stopped-only: L1 refuses running, attached, already
+reconfiguring, or removed Computers and never performs an internal quiesce.
+Reservation appends one `reset` intent, admits successor capacity, enters
+revision-fenced `resetting`, and creates exactly one `staging` generation at
+current generation plus one. The helper takes the predecessor's attachment
+flock, revalidates detachment, durably fences stale attaches in the shared disk
+manifest, then fully allocates, formats, and verifies the successor. Its
+receipt binds the exact managed-root instance in addition to Computer, Storage,
+both generations, Job, Node, reset revision, cleanup fence, and helper
+generation. L1 durably records that receipt before a separate publication
+transaction changes old `current → retired`, staging `→ current`, and advances
+`storage_generation`; the same Job remains stopped and unclaimable. Only after
+publication does the agent retire predecessor bytes through the shared
+authority-bound disk deletion and assertion-derived removal attestation. That
+acknowledgement advances `applied_revision` and returns the Computer to
+`stable`. Removal may supersede any standing reset and deletes every recorded
+generation. No reset phase starts the Computer automatically.
 
 The current immutable Job mirrors Computer desired state only so it can reuse
 the ordinary service attempt state machine. Claim additionally joins the

@@ -74,14 +74,18 @@ on that event path; ordinary healthy heartbeats probe without rescanning the
 filesystem. `boot_sweep_failed` is the bounded L1 reason for an incomplete
 sweep/verify/removal-resume barrier, while detailed errors remain local.
 
-Computer Storage reset is standing heartbeat work, not attempt authority. The
-agent first asks the resident service lifecycle to reap, but never converts a
-missing local receipt into absence. It passes the exact reset directive to the
-OCI helper, whose same-boot detach or prior-boot sweep evidence gates
-quarantine/delete/verify. Only the helper-derived verified receipt is sent to
-L1. A crash at any node-local phase leaves the directive standing and the
-helper manifest resumes; a repeated receipt is idempotent, while a receipt for
-another revision or generation fails closed.
+Computer Storage reset is standing heartbeat work, not attempt authority, and
+L1 issues it only for an already-stopped Computer. The agent never quiesces or
+restarts the service. It passes the exact reset directive to the OCI helper;
+under the attachment flock the helper records a predecessor retirement fence,
+then allocates, formats, and verifies the successor. Only the helper-derived,
+managed-root-bound preparation receipt is sent to L1. Once L1 publishes the
+successor, the standing directive advances to predecessor retirement: the
+agent calls the shared authority-bound managed-volume deletion seam, requests
+the shared assertion-derived removal attestation over every deterministic disk
+row, validates that every row actually ran and passed, then sends the shared
+cleanup acknowledgement to L1. Crashes retry these idempotent phases; no phase
+starts the Computer.
 Before a Mac reaches that helper barrier, the supervised wrapper may instead
 publish any closed OCI restriction, including `oci_intent_disabled`,
 `lima_stopped`, `lima_broken`, or `lima_start_timeout`; L1 validates the actual

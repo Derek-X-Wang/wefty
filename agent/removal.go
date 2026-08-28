@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -157,7 +159,11 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 			found = true
 		}
 		if found {
-			return controller.continueRuntimeRemoval(ctx, removal, &runtimeRemoval, directive.ComputerStorage)
+			computerStorages, err := removalComputerStorages(runtimeRemoval.manifest, storageGenerationClaims(directive.ComputerStorageGenerations))
+			if err != nil {
+				return err
+			}
+			return controller.continueRuntimeRemoval(ctx, removal, &runtimeRemoval, computerStorages)
 		}
 	}
 	if removal.kind == contract.JobKindOCI {
@@ -173,10 +179,10 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	// Services created before runtime manifests were introduced retain the
 	// legacy boolean as their crash-resume compatibility marker.
 	removal.processTreeReaped = true
-	return controller.completeLocalRemoval(ctx, removal, nil, computerStorageFromClaim(directive.ComputerStorage))
+	return controller.completeLocalRemoval(ctx, removal, nil, computerStoragesFromClaims(storageGenerationClaims(directive.ComputerStorageGenerations)))
 }
 
-func (controller *removalController) completeLocalRemoval(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, computerStorage *workloadrunner.ComputerStorage) error {
+func (controller *removalController) completeLocalRemoval(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, computerStorages []*workloadrunner.ComputerStorage) error {
 	if err := controller.purgeJob(ctx, removal.jobID); err != nil {
 		return err
 	}
@@ -184,12 +190,16 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 		return fmt.Errorf("delete managed service resource: %w", err)
 	}
 	needsRuntimeProof := removal.kind == contract.JobKindOCI && (runtimeRemoval == nil || runtimeRemoval.phase != runtimeRemovalComplete)
-	if computerStorage != nil && needsRuntimeProof {
+	if len(computerStorages) != 0 && needsRuntimeProof {
 		if controller.finalizeVolumes == nil {
 			return errors.New("Computer removal requires OCI disk finalization")
 		}
+		volumes := make([]workloadrunner.ManagedVolume, 0, len(computerStorages))
+		for _, storage := range computerStorages {
+			volumes = append(volumes, workloadrunner.ManagedVolume{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage})
+		}
 		if err := controller.finalizeVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
-			Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: computerStorage}},
+			Volumes: volumes,
 			Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID, RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence},
 		}); err != nil {
 			return fmt.Errorf("delete Computer disk resource: %w", err)
@@ -204,10 +214,12 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 			if runtimeRemoval != nil {
 				attempts = runtimeRemoval.manifest.Attempts
 			}
+			attempts = addStorageOnlyRemovalManifests(attempts, computerStorages, controller.nodeID,
+				controller.bootSessionID, removal.jobID, removal.generation, removal.cleanupFence)
 			proofRequest := workloadrunner.RuntimeRemovalProofRequest{
 				NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID,
 				RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence,
-				ComputerStorage: computerStorage, Attempts: attempts,
+				Attempts: attempts,
 			}
 			if err := controller.deleteRuntimeData(ctx, proofRequest); err != nil {
 				return fmt.Errorf("delete OCI service data: %w", err)
@@ -216,9 +228,10 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 			if err != nil {
 				return fmt.Errorf("attest deleted OCI service resources: %w", err)
 			}
-			manifest := runtimeRemovalManifest{Version: 1, JobID: removal.jobID, RemovalGeneration: removal.generation, Attempts: attestation.Attempts}
+			manifest := runtimeRemovalManifest{Version: 1, JobID: removal.jobID, RemovalGeneration: removal.generation, Attempts: attempts}
 			if runtimeRemoval != nil {
 				manifest = runtimeRemoval.manifest
+				manifest.Attempts = attempts
 			}
 			if err := validateRuntimeRemovalAttestation(manifest, attestation); err != nil {
 				return err
@@ -274,12 +287,8 @@ func (controller *removalController) reconstructAndPersistRuntimeRemoval(ctx con
 	return record, nil
 }
 
-func (controller *removalController) continueRuntimeRemoval(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, claim *l1.ComputerStorageClaim) error {
-	computerStorage, err := removalComputerStorage(runtimeRemoval.manifest, claim)
-	if err != nil {
-		return err
-	}
-	if computerStorage != nil && removal.kind != contract.JobKindOCI {
+func (controller *removalController) continueRuntimeRemoval(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, computerStorages []*workloadrunner.ComputerStorage) error {
+	if len(computerStorages) != 0 && removal.kind != contract.JobKindOCI {
 		return errors.New("agent: frozen Computer removal inventory requires OCI workload kind")
 	}
 	switch runtimeRemoval.phase {
@@ -305,7 +314,7 @@ func (controller *removalController) continueRuntimeRemoval(ctx context.Context,
 		return fmt.Errorf("service %q runtime removal has invalid phase %q", removal.jobID, runtimeRemoval.phase)
 	}
 	removal.processTreeReaped = true
-	return controller.completeLocalRemoval(ctx, removal, runtimeRemoval, computerStorage)
+	return controller.completeLocalRemoval(ctx, removal, runtimeRemoval, computerStorages)
 }
 
 // prepareAuthorityLoss closes the renewal-vs-heartbeat race for a running
@@ -346,7 +355,17 @@ func (controller *removalController) resume(ctx context.Context) error {
 			return fmt.Errorf("resume runtime service removals: %w", err)
 		}
 		for _, record := range removals {
-			if err := controller.continueRuntimeRemoval(ctx, record.removal, &record, nil); err != nil {
+			computerStorages, err := removalComputerStorages(record.manifest, nil)
+			if err != nil {
+				return err
+			}
+			if len(computerStorages) != 0 && record.phase != runtimeRemovalComplete {
+				// Computer removal needs the authoritative generation inventory
+				// carried by the standing L1 directive. Heartbeat processing will
+				// resume it without guessing from historical attempts.
+				continue
+			}
+			if err := controller.continueRuntimeRemoval(ctx, record.removal, &record, computerStorages); err != nil {
 				return err
 			}
 		}
@@ -384,7 +403,16 @@ func (controller *removalController) resume(ctx context.Context) error {
 					return err
 				}
 			}
-			if err := controller.continueRuntimeRemoval(ctx, removal, &record, nil); err != nil {
+			computerStorages, err := removalComputerStorages(record.manifest, nil)
+			if err != nil {
+				return err
+			}
+			if len(computerStorages) != 0 && record.phase != runtimeRemovalComplete {
+				// The standing L1 directive carries every reserved generation.
+				// Do not guess a destructive subset during local-only resumption.
+				continue
+			}
+			if err := controller.continueRuntimeRemoval(ctx, removal, &record, computerStorages); err != nil {
 				return err
 			}
 			continue
@@ -407,12 +435,12 @@ func (controller *removalController) resume(ctx context.Context) error {
 	return nil
 }
 
-func removalComputerStorage(manifest runtimeRemovalManifest, claim *l1.ComputerStorageClaim) (*workloadrunner.ComputerStorage, error) {
-	var frozen *workloadrunner.ComputerStorage
+func removalComputerStorages(manifest runtimeRemovalManifest, claims []l1.ComputerStorageGenerationClaim) ([]*workloadrunner.ComputerStorage, error) {
+	byIdentity := make(map[string]*workloadrunner.ComputerStorage)
 	sawNonComputer := false
 	for _, attempt := range manifest.Attempts {
 		if attempt.ComputerStorage == nil {
-			if frozen != nil {
+			if len(byIdentity) != 0 {
 				return nil, errors.New("agent: frozen runtime removal manifest mixes Computer and service-data attempts")
 			}
 			sawNonComputer = true
@@ -421,32 +449,85 @@ func removalComputerStorage(manifest runtimeRemovalManifest, claim *l1.ComputerS
 		if sawNonComputer {
 			return nil, errors.New("agent: frozen runtime removal manifest mixes Computer and service-data attempts")
 		}
-		if frozen == nil {
-			storage := *attempt.ComputerStorage
-			frozen = &storage
+		key := fmt.Sprintf("%s\x00%s\x00%d", attempt.ComputerStorage.ComputerID,
+			attempt.ComputerStorage.StorageID, attempt.ComputerStorage.StorageGeneration)
+		if existing := byIdentity[key]; existing != nil {
+			if existing.DiskBytes != 0 && attempt.ComputerStorage.DiskBytes != 0 && existing.DiskBytes != attempt.ComputerStorage.DiskBytes {
+				return nil, errors.New("agent: frozen runtime removal manifest has conflicting Computer Storage allocation truth")
+			}
 			continue
 		}
-		if *frozen != *attempt.ComputerStorage {
-			return nil, errors.New("agent: frozen runtime removal manifest has conflicting Computer Storage identities")
+		storage := *attempt.ComputerStorage
+		byIdentity[key] = &storage
+	}
+	for _, claim := range claims {
+		key := fmt.Sprintf("%s\x00%s\x00%d", claim.ComputerID, claim.StorageID, claim.StorageGeneration)
+		if existing := byIdentity[key]; existing != nil {
+			if existing.DiskBytes != 0 && claim.DiskBytes != 0 && existing.DiskBytes != claim.DiskBytes {
+				return nil, errors.New("agent: Computer removal directive conflicts with frozen Storage allocation truth")
+			}
+			continue
 		}
+		byIdentity[key] = &workloadrunner.ComputerStorage{ComputerID: claim.ComputerID, StorageID: claim.StorageID,
+			StorageGeneration: claim.StorageGeneration, DiskBytes: claim.DiskBytes}
 	}
-	if claim == nil {
-		return frozen, nil
+	storages := make([]*workloadrunner.ComputerStorage, 0, len(byIdentity))
+	for _, storage := range byIdentity {
+		storages = append(storages, storage)
 	}
-	if frozen == nil || frozen.ComputerID != claim.ComputerID || frozen.StorageID != claim.StorageID || frozen.StorageGeneration != claim.StorageGeneration {
-		return nil, errors.New("agent: Computer removal directive does not match the frozen runtime manifest")
+	slices.SortFunc(storages, func(left, right *workloadrunner.ComputerStorage) int {
+		return cmp.Compare(left.StorageGeneration, right.StorageGeneration)
+	})
+	return storages, nil
+}
+
+func computerStoragesFromClaims(claims []l1.ComputerStorageGenerationClaim) []*workloadrunner.ComputerStorage {
+	storages := make([]*workloadrunner.ComputerStorage, 0, len(claims))
+	for _, claim := range claims {
+		storages = append(storages, &workloadrunner.ComputerStorage{ComputerID: claim.ComputerID,
+			StorageID: claim.StorageID, StorageGeneration: claim.StorageGeneration, DiskBytes: claim.DiskBytes})
 	}
-	return frozen, nil
+	return storages
 }
 
 func computerStorageFromClaim(claim *l1.ComputerStorageClaim) *workloadrunner.ComputerStorage {
 	if claim == nil {
 		return nil
 	}
-	return &workloadrunner.ComputerStorage{
-		ComputerID: claim.ComputerID, StorageID: claim.StorageID, StorageGeneration: claim.StorageGeneration,
-		IntentRevision: claim.IntentRevision,
+	return &workloadrunner.ComputerStorage{ComputerID: claim.ComputerID, StorageID: claim.StorageID,
+		StorageGeneration: claim.StorageGeneration}
+}
+
+func storageGenerationClaims(claims *l1.ComputerStorageGenerationClaims) []l1.ComputerStorageGenerationClaim {
+	if claims == nil {
+		return nil
 	}
+	return claims.Generations
+}
+
+func addStorageOnlyRemovalManifests(attempts []workloadrunner.RuntimeResourceManifest, storages []*workloadrunner.ComputerStorage,
+	nodeID, bootSessionID, jobID string, generation uint64, cleanupFence string) []workloadrunner.RuntimeResourceManifest {
+	result := slices.Clone(attempts)
+	seen := make(map[string]struct{})
+	for _, attempt := range attempts {
+		if attempt.ComputerStorage != nil {
+			seen[fmt.Sprintf("%s\x00%s\x00%d", attempt.ComputerStorage.ComputerID,
+				attempt.ComputerStorage.StorageID, attempt.ComputerStorage.StorageGeneration)] = struct{}{}
+		}
+	}
+	for _, storage := range storages {
+		key := fmt.Sprintf("%s\x00%s\x00%d", storage.ComputerID, storage.StorageID, storage.StorageGeneration)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		copy := *storage
+		result = append(result, workloadrunner.RuntimeResourceManifest{Version: 1, RuntimeKind: contract.JobKindOCI,
+			NodeID: nodeID, BootSessionID: bootSessionID, JobID: jobID,
+			AttemptID: fmt.Sprintf("storage-removal-%d", storage.StorageGeneration), FencingToken: cleanupFence,
+			WorkloadClass: contract.JobClassService, RemovalGeneration: fmt.Sprint(generation),
+			ComputerStorage: &copy, StorageOnly: true})
+	}
+	return result
 }
 
 func (controller *removalController) acknowledge(ctx context.Context, removal localRemoval) error {

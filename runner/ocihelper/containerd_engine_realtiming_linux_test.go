@@ -768,7 +768,8 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		Storage: resetStorage, NewGeneration: 2,
 		Authority: ocihelper.ComputerStorageResetAuthority{
 			NodeID: second.Authority.NodeID, BootSessionID: second.Authority.BootSessionID,
-			HelperGeneration: session.Handshake().SessionGeneration, JobID: second.Authority.JobID,
+			HelperGeneration: session.Handshake().SessionGeneration, RootInstanceID: "native-managed-root",
+			JobID:          second.Authority.JobID,
 			IntentRevision: 2, CleanupFence: "native-storage-reset",
 		},
 	})

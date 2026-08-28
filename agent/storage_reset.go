@@ -2,20 +2,24 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 type storageResetController struct {
-	client        *Client
-	session       *agentSession
-	resetter      workloadrunner.ComputerStorageResetter
-	nodeID        string
-	bootSessionID string
-	logf          func(string, ...any)
+	client               *Client
+	session              *agentSession
+	resetter             workloadrunner.ComputerStorageResetter
+	finalizeVolumes      func(context.Context, workloadrunner.ManagedVolumeFinalizationRequest) error
+	attestRuntimeRemoval func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error)
+	nodeID               string
+	bootSessionID        string
+	logf                 func(string, ...any)
 
 	mu       sync.Mutex
 	inflight map[string]struct{}
@@ -41,17 +45,14 @@ func (controller *storageResetController) process(ctx context.Context, directive
 	if directive.BoundNodeID != controller.nodeID {
 		return fmt.Errorf("Computer Storage reset belongs to node %q, not %q", directive.BoundNodeID, controller.nodeID)
 	}
-	// A local runtime reap is the fast same-boot path. The helper remains the
-	// authority: after an agent/helper restart its prior-boot sweep receipt can
-	// independently prove detachment.
-	if controller.session != nil {
-		_, _ = controller.session.reapServiceForRemoval(ctx, directive.JobID)
+	if directive.Phase == "published" {
+		return controller.retirePredecessor(ctx, directive)
 	}
 	receipt, err := controller.resetter.ResetComputerStorage(ctx, workloadrunner.ComputerStorageResetRequest{
 		Storage: workloadrunner.ComputerStorage{ComputerID: directive.ComputerID, StorageID: directive.StorageID,
 			StorageGeneration: directive.OldGeneration, IntentRevision: directive.IntentRevision, DiskBytes: directive.DiskBytes},
 		NewGeneration: directive.NewGeneration, NodeID: controller.nodeID, BootSessionID: controller.bootSessionID,
-		JobID: directive.JobID, IntentRevision: directive.IntentRevision, CleanupFence: directive.CleanupFence,
+		RootInstanceID: directive.RootInstanceID, JobID: directive.JobID, IntentRevision: directive.IntentRevision, CleanupFence: directive.CleanupFence,
 	})
 	if err != nil {
 		return err
@@ -60,17 +61,57 @@ func (controller *storageResetController) process(ctx context.Context, directive
 		NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, IdempotencyKey: receipt.ReceiptID,
 		Receipt: l1.ComputerStorageResetReceipt{Kind: receipt.Kind, ReceiptID: receipt.ReceiptID,
 			ComputerID: receipt.ComputerID, StorageID: receipt.StorageID, OldGeneration: receipt.OldGeneration,
-			NewGeneration: receipt.NewGeneration, NodeID: receipt.NodeID, JobID: receipt.JobID,
+			NewGeneration: receipt.NewGeneration, NodeID: receipt.NodeID, RootInstanceID: receipt.RootInstanceID, JobID: receipt.JobID,
 			IntentRevision: receipt.IntentRevision, CleanupFence: receipt.CleanupFence,
 			HelperGeneration: receipt.HelperGeneration},
 	})
 	if err != nil {
 		return err
 	}
-	if controller.session != nil {
-		controller.session.clearRuntimeReap(directive.JobID)
-	}
 	return nil
+}
+
+func (controller *storageResetController) retirePredecessor(ctx context.Context, directive l1.ComputerStorageResetDirective) error {
+	if controller.finalizeVolumes == nil || controller.attestRuntimeRemoval == nil {
+		return errors.New("Computer Storage retirement requires shared OCI deletion and attestation")
+	}
+	generation := uint64(directive.IntentRevision)
+	storage := &workloadrunner.ComputerStorage{ComputerID: directive.ComputerID, StorageID: directive.StorageID,
+		StorageGeneration: directive.OldGeneration, IntentRevision: directive.IntentRevision, DiskBytes: directive.DiskBytes}
+	if err := controller.finalizeVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
+		Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
+		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: controller.nodeID,
+			BootSessionID: controller.bootSessionID, JobID: directive.JobID,
+			RemovalGeneration: generation, CleanupFence: directive.CleanupFence},
+	}); err != nil {
+		return fmt.Errorf("delete reset predecessor through shared removal machinery: %w", err)
+	}
+	manifest := workloadrunner.RuntimeResourceManifest{
+		Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: controller.nodeID,
+		BootSessionID: controller.bootSessionID, JobID: directive.JobID,
+		AttemptID:    "storage-reset-" + fmt.Sprint(directive.IntentRevision),
+		FencingToken: directive.CleanupFence, WorkloadClass: contract.JobClassService,
+		RemovalGeneration: fmt.Sprint(generation), ComputerStorage: storage, StorageOnly: true,
+	}
+	attestation, err := controller.attestRuntimeRemoval(ctx, workloadrunner.RuntimeRemovalProofRequest{
+		JobID: directive.JobID, RemovalGeneration: generation,
+		Attempts: []workloadrunner.RuntimeResourceManifest{manifest},
+	})
+	if err != nil {
+		return fmt.Errorf("attest reset predecessor through shared removal machinery: %w", err)
+	}
+	if err := validateRuntimeRemovalAttestation(runtimeRemovalManifest{Version: 1, JobID: directive.JobID,
+		RemovalGeneration: generation, Attempts: []workloadrunner.RuntimeResourceManifest{manifest}}, attestation); err != nil {
+		return err
+	}
+	_, err = controller.client.AcknowledgeComputerStorageRetirement(ctx, directive.ComputerID, l1.RemovalAcknowledgementRequest{
+		NodeID: controller.nodeID, BootSessionID: controller.bootSessionID,
+		RemovalGeneration: generation, CleanupFence: directive.CleanupFence,
+		RootInstanceID: directive.RootInstanceID,
+		IdempotencyKey: removalAcknowledgementKey(localRemoval{jobID: directive.JobID, generation: generation,
+			cleanupFence: directive.CleanupFence, rootInstanceID: directive.RootInstanceID}, controller.bootSessionID),
+	})
+	return err
 }
 
 func (controller *storageResetController) enqueue(ctx context.Context, directive l1.ComputerStorageResetDirective, failures chan<- destinationError) {

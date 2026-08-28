@@ -364,8 +364,10 @@ func (adapter *Adapter) AttestRuntimeRemoval(ctx context.Context, request worklo
 				AttemptID: attempt.AttemptID, FencingToken: attempt.FencingToken,
 				WorkloadClass: attempt.WorkloadClass, RemovalGeneration: attempt.RemovalGeneration,
 			}),
-			HandoffVolume: attempt.HandoffVolume, ComputerStorage: computerStorage,
-			Resources: helperResources,
+			HandoffVolume:   attempt.HandoffVolume,
+			ComputerStorage: computerStorage,
+			StorageOnly:     attempt.StorageOnly,
+			Resources:       helperResources,
 		})
 	}
 	session, _, err := adapter.sessions.ExecutionSnapshot()
@@ -1622,7 +1624,7 @@ func (adapter *Adapter) ResetComputerStorage(ctx context.Context, request worklo
 			IntentRevision: request.Storage.IntentRevision, DiskBytes: request.Storage.DiskBytes},
 		NewGeneration: request.NewGeneration,
 		Authority: ocihelper.ComputerStorageResetAuthority{NodeID: request.NodeID, BootSessionID: request.BootSessionID,
-			HelperGeneration: handshake.SessionGeneration, JobID: request.JobID,
+			HelperGeneration: handshake.SessionGeneration, RootInstanceID: request.RootInstanceID, JobID: request.JobID,
 			IntentRevision: request.IntentRevision, CleanupFence: request.CleanupFence},
 	})
 	if err != nil {
@@ -1634,7 +1636,8 @@ func (adapter *Adapter) ResetComputerStorage(ctx context.Context, request worklo
 	return workloadrunner.ComputerStorageResetReceipt{Kind: response.Receipt.Kind, ReceiptID: response.Receipt.ReceiptID,
 		ComputerID: response.Receipt.ComputerID, StorageID: response.Receipt.StorageID,
 		OldGeneration: response.Receipt.OldGeneration, NewGeneration: response.Receipt.NewGeneration,
-		NodeID: response.Receipt.NodeID, JobID: response.Receipt.JobID, IntentRevision: response.Receipt.IntentRevision,
+		NodeID: response.Receipt.NodeID, RootInstanceID: response.Receipt.RootInstanceID,
+		JobID: response.Receipt.JobID, IntentRevision: response.Receipt.IntentRevision,
 		CleanupFence: response.Receipt.CleanupFence, HelperGeneration: response.Receipt.HelperGeneration}, nil
 }
 

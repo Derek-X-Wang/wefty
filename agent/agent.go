@@ -290,6 +290,10 @@ func New(config Config) (*Agent, error) {
 	}
 	session.storageResets = newStorageResetController(client, session, computerStorageResetter,
 		config.NodeID, config.BootSessionID, logf)
+	if session.storageResets != nil {
+		session.storageResets.finalizeVolumes = session.removals.finalizeVolumes
+		session.storageResets.attestRuntimeRemoval = session.removals.attestRuntimeRemoval
+	}
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
 		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),

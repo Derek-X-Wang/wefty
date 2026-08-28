@@ -105,6 +105,7 @@ type ContainerdEngine struct {
 	storageResetMu    sync.Mutex
 	diskSystem        computerDiskSystem
 	storageResetHook  func(computerStorageResetPhase) error
+	computerDiskHook  func(computerDiskCheckpoint) error
 }
 
 const (
@@ -1652,6 +1653,10 @@ func assertRemovalResourceAbsent(inventory ResourceInventory, resource RemovalRe
 	case RemovalResourceComputerAttachment:
 		computerClass = true
 		values = inventory.ComputerAttachments
+	case RemovalResourceComputerResetManifest:
+		values = inventory.ComputerResetManifests
+	case RemovalResourceComputerQuarantine:
+		values = inventory.ComputerQuarantines
 	default:
 		return fmt.Errorf("removal resource class %q is unsupported", resource.Class)
 	}
@@ -2663,7 +2668,7 @@ func (engine *ContainerdEngine) watchOOM(attempt *containerdAttempt) {
 }
 
 func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventory, error) {
-	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerDiskAnomalies: []string{}}
+	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerDiskAnomalies: []string{}}
 	leaseList, err := engine.client.LeasesService().List(ctx)
 	if err != nil {
 		return result, err
@@ -2773,6 +2778,8 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 	sort.Strings(result.ComputerDiskMounts)
 	sort.Strings(result.ComputerDiskLoops)
 	sort.Strings(result.ComputerAttachments)
+	sort.Strings(result.ComputerResetManifests)
+	sort.Strings(result.ComputerQuarantines)
 	sort.Strings(result.ComputerDiskAnomalies)
 	return result, nil
 }
@@ -2809,7 +2816,7 @@ func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInvento
 }
 
 func filterInventory(inventory ResourceInventory, resources ResourceIdentity, attachment *computerDiskAttachment) ResourceInventory {
-	filtered := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerDiskAnomalies: []string{}}
+	filtered := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerDiskAnomalies: []string{}}
 	for _, pair := range []struct {
 		values []string
 		target string
@@ -2826,7 +2833,7 @@ func filterInventory(inventory ResourceInventory, resources ResourceIdentity, at
 			values []string
 			target string
 			output *[]string
-		}{{inventory.ComputerDiskImages, attachment.name, &filtered.ComputerDiskImages}, {inventory.ComputerDiskAllocations, attachment.name, &filtered.ComputerDiskAllocations}, {inventory.ComputerDiskQuotas, attachment.name, &filtered.ComputerDiskQuotas}, {inventory.ComputerDiskManifests, attachment.name, &filtered.ComputerDiskManifests}, {inventory.ComputerDiskMounts, attachment.name, &filtered.ComputerDiskMounts}, {inventory.ComputerDiskLoops, attachment.name, &filtered.ComputerDiskLoops}, {inventory.ComputerAttachments, attachment.name, &filtered.ComputerAttachments}} {
+		}{{inventory.ComputerDiskImages, attachment.name, &filtered.ComputerDiskImages}, {inventory.ComputerDiskAllocations, attachment.name, &filtered.ComputerDiskAllocations}, {inventory.ComputerDiskQuotas, attachment.name, &filtered.ComputerDiskQuotas}, {inventory.ComputerDiskManifests, attachment.name, &filtered.ComputerDiskManifests}, {inventory.ComputerDiskMounts, attachment.name, &filtered.ComputerDiskMounts}, {inventory.ComputerDiskLoops, attachment.name, &filtered.ComputerDiskLoops}, {inventory.ComputerAttachments, attachment.name, &filtered.ComputerAttachments}, {inventory.ComputerResetManifests, attachment.name, &filtered.ComputerResetManifests}, {inventory.ComputerQuarantines, attachment.name, &filtered.ComputerQuarantines}} {
 			for _, value := range pair.values {
 				if value == pair.target {
 					*pair.output = append(*pair.output, value)
@@ -2893,7 +2900,7 @@ func mapKeys(values map[string]struct{}) []string {
 	return result
 }
 func inventoryCount(inventory ResourceInventory) int {
-	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments)
+	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) + len(inventory.ComputerQuarantines)
 }
 
 func kernelRelease() string {

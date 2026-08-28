@@ -220,6 +220,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete", s.completeAttempt)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/removal-acknowledgement", s.acknowledgeServiceRemoval)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-reset-acknowledgement", s.acknowledgeComputerStorageReset)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-retirement-acknowledgement", s.acknowledgeComputerStorageRetirement)
 
 	root := http.NewServeMux()
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
@@ -711,6 +712,21 @@ func (s *Server) acknowledgeComputerStorageReset(w http.ResponseWriter, r *http.
 		return
 	}
 	computer, err := s.store.AcknowledgeComputerStorageReset(r.Context(), identityFromRequest(r).NodeID,
+		r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, redactComputer(computer))
+}
+
+func (s *Server) acknowledgeComputerStorageRetirement(w http.ResponseWriter, r *http.Request) {
+	var request RemovalAcknowledgementRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	computer, err := s.store.AcknowledgeComputerStorageRetirement(r.Context(), identityFromRequest(r).NodeID,
 		r.PathValue("computer_id"), request)
 	if err != nil {
 		writeError(w, err)
