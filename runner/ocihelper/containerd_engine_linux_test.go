@@ -497,6 +497,18 @@ func TestServiceDataOwnerRecordRecoveryRows(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		var stale serviceVolumeOwnerRecord
+		if err := json.Unmarshal(before, &stale); err != nil {
+			t.Fatal(err)
+		}
+		stale.Inode++
+		stalePayload, err := json.Marshal(stale)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(record, stalePayload, 0o600); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.RemoveAll(path); err != nil {
 			t.Fatal(err)
 		}
@@ -510,8 +522,19 @@ func TestServiceDataOwnerRecordRecoveryRows(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if bytes.Equal(before, after) {
+		if bytes.Equal(stalePayload, after) {
 			t.Fatal("orphan owner record was not rebound to the fresh directory identity")
+		}
+		var rebound serviceVolumeOwnerRecord
+		var stat unix.Stat_t
+		if err := json.Unmarshal(after, &rebound); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Stat(path, &stat); err != nil {
+			t.Fatal(err)
+		}
+		if rebound.Device != uint64(stat.Dev) || rebound.Inode != stat.Ino || rebound.UID != uid || rebound.GID != gid {
+			t.Fatalf("rebound owner record = %+v, directory = %+v", rebound, stat)
 		}
 	})
 
