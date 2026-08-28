@@ -5,11 +5,12 @@
 # cannot silently select different toolchain or runtime bytes.
 ARG GO_IMAGE=docker.io/library/golang@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83
 ARG BUSYBOX_IMAGE=docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
+ARG SOURCE_DATE_EPOCH=0
 
 FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build
 ARG TARGETOS
 ARG TARGETARCH
-ARG SOURCE_DATE_EPOCH=0
+ARG SOURCE_DATE_EPOCH
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY contract/ ./contract/

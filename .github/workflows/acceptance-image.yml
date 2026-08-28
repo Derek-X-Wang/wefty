@@ -36,9 +36,11 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+            --build-arg SOURCE_DATE_EPOCH=0 \
             --file examples/oci-echo-service/Dockerfile \
             --output "type=oci,dest=$RUNNER_TEMP/acceptance-image-first.oci.tar" .
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+            --build-arg SOURCE_DATE_EPOCH=0 \
             --file examples/oci-echo-service/Dockerfile \
             --output "type=oci,dest=$RUNNER_TEMP/acceptance-image-second.oci.tar" .
       - name: Prove the selected platform manifest is reproducible
@@ -112,6 +114,7 @@ jobs:
           provenance: false
           sbom: false
           no-cache: true
+          build-args: SOURCE_DATE_EPOCH=0
       - name: Match the published index to both reproducible builds
         env:
           INDEX_DIGEST: ${{ steps.publish.outputs.digest }}
