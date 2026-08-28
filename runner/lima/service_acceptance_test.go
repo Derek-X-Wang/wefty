@@ -27,32 +27,37 @@ type attendedArtifact struct {
 }
 
 type attendedResult struct {
-	Status              string              `json:"status"`
-	Reason              string              `json:"reason,omitempty"`
-	SessionID           string              `json:"session_id"`
-	Command             []string            `json:"command"`
-	ExitCode            int                 `json:"exit_code"`
-	HelperGenerations   []uint64            `json:"helper_generations"`
-	CapabilityRevisions []int64             `json:"capability_revisions"`
-	Inventories         []json.RawMessage   `json:"inventories"`
-	RoundTrip           bool                `json:"round_trip"`
-	DynamicListeners    map[string]bool     `json:"dynamic_listeners"`
-	LaunchUnits         []string            `json:"launch_units,omitempty"`
-	LimaStates          []InstanceState     `json:"lima_states,omitempty"`
-	OCIEnabled          *bool               `json:"oci_enabled,omitempty"`
-	ProcessAvailable    bool                `json:"process_available,omitempty"`
-	SocketMode          string              `json:"socket_mode,omitempty"`
-	SocketOwner         string              `json:"socket_owner,omitempty"`
-	SocketGroup         string              `json:"socket_group,omitempty"`
-	MinimalDoctor       *MinimalDoctorFacts `json:"minimal_doctor,omitempty"`
-	AttemptIDs          []string            `json:"attempt_ids"`
-	TopLevelDigests     []string            `json:"top_level_digests"`
-	PlatformDigests     []string            `json:"platform_digests"`
-	PayloadExecutions   int                 `json:"payload_executions"`
-	StdoutMarkers       []string            `json:"stdout_markers"`
-	StderrMarkers       []string            `json:"stderr_markers"`
-	HandoffMarkerBytes  []string            `json:"handoff_marker_bytes"`
-	HandoffAbsent       bool                `json:"handoff_absent_after_completion"`
+	Status               string              `json:"status"`
+	Reason               string              `json:"reason,omitempty"`
+	SessionID            string              `json:"session_id"`
+	Command              []string            `json:"command"`
+	ExitCode             int                 `json:"exit_code"`
+	HelperGenerations    []uint64            `json:"helper_generations"`
+	CapabilityRevisions  []int64             `json:"capability_revisions"`
+	Inventories          []json.RawMessage   `json:"inventories"`
+	RoundTrip            bool                `json:"round_trip"`
+	DynamicListeners     map[string]bool     `json:"dynamic_listeners"`
+	LaunchUnits          []string            `json:"launch_units,omitempty"`
+	LimaStates           []InstanceState     `json:"lima_states,omitempty"`
+	OCIEnabled           *bool               `json:"oci_enabled,omitempty"`
+	ProcessAvailable     bool                `json:"process_available,omitempty"`
+	SocketMode           string              `json:"socket_mode,omitempty"`
+	SocketOwner          string              `json:"socket_owner,omitempty"`
+	SocketGroup          string              `json:"socket_group,omitempty"`
+	MinimalDoctor        *MinimalDoctorFacts `json:"minimal_doctor,omitempty"`
+	AttemptIDs           []string            `json:"attempt_ids"`
+	TopLevelDigests      []string            `json:"top_level_digests"`
+	PlatformDigests      []string            `json:"platform_digests"`
+	PayloadExecutions    int                 `json:"payload_executions"`
+	StdoutMarkers        []string            `json:"stdout_markers"`
+	StderrMarkers        []string            `json:"stderr_markers"`
+	HandoffMarkerBytes   []string            `json:"handoff_marker_bytes"`
+	HandoffAbsent        bool                `json:"handoff_absent_after_completion"`
+	ServiceOwners        []string            `json:"service_owners,omitempty"`
+	ServiceAttemptCounts []int               `json:"service_attempt_counts,omitempty"`
+	GuestNativeData      bool                `json:"guest_native_data,omitempty"`
+	VirtioFSData         *bool               `json:"virtiofs_data,omitempty"`
+	RootfsDiscarded      bool                `json:"rootfs_discarded,omitempty"`
 }
 
 var requiredAttendedRows = []string{
@@ -63,6 +68,7 @@ var requiredAttendedRows = []string{
 	"service_health_echo", "service_startup_timeout", "service_withdrawal_republication",
 	"service_port_collision", "service_portless_started",
 	"service_restart_fresh_attempt", "service_stop_start_capacity", "service_failed_quiescence",
+	"service_data_guest_native",
 	"launch_daemon", "no_lima_autostart", "helper_install_permissions",
 	"stopped_enabled_recovery", "stopped_disabled_no_recovery", "broken_enabled_recovery",
 	"process_only_degradation", "minimal_doctor",
@@ -261,6 +267,15 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 			t.Fatalf("row %s lacks generation/revision/inventory transition evidence", name)
 		}
 	}
+	serviceData := artifact.Rows["service_data_guest_native"]
+	for _, owner := range []string{"0:0", "13001:13002", "12001:12002"} {
+		if !slices.Contains(serviceData.ServiceOwners, owner) {
+			t.Fatalf("service data receipt omitted initialized owner %s: %+v", owner, serviceData)
+		}
+	}
+	if !slices.Equal(serviceData.ServiceAttemptCounts, []int{0, 1, 2}) || !serviceData.GuestNativeData || serviceData.VirtioFSData == nil || *serviceData.VirtioFSData || !serviceData.RootfsDiscarded {
+		t.Fatalf("service data receipt lacks restart/stop-start persistence and fresh-rootfs proof: %+v", serviceData)
+	}
 	launch := artifact.Rows["launch_daemon"]
 	if !slices.Contains(launch.LaunchUnits, LaunchDaemonLabel) {
 		t.Fatalf("launch receipt omitted %s: %+v", LaunchDaemonLabel, launch)
@@ -300,7 +315,7 @@ func TestServiceAcceptanceAttendedArtifactRejectsMissingServiceRows(t *testing.T
 	}
 	for _, name := range []string{
 		"service_health_echo", "service_startup_timeout", "service_withdrawal_republication",
-		"service_port_collision", "service_portless_started",
+		"service_port_collision", "service_portless_started", "service_data_guest_native",
 	} {
 		t.Run(name, func(t *testing.T) {
 			delete(rows, name)

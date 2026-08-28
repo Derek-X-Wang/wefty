@@ -559,7 +559,7 @@ func TestAdapterPumpsConstrainedMacHostBridgeFallback(t *testing.T) {
 	}
 }
 
-func TestWorkloadInputAddsHandoffOnlyForOneshot(t *testing.T) {
+func TestWorkloadInputMakesManagedVolumeMountsAuthoritative(t *testing.T) {
 	request := workloadrunner.Request{
 		Authority:      workloadrunner.AttemptAuthority{WorkloadClass: contract.JobClassOneShot},
 		ManagedVolumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: "run-1"}},
@@ -577,10 +577,16 @@ func TestWorkloadInputAddsHandoffOnlyForOneshot(t *testing.T) {
 		t.Fatalf("one-shot reserved environment = %+v", input.ReservedEnvironment)
 	}
 
-	request.ManagedVolumes = nil
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
+	request.Execution.Env = map[string]string{contract.EnvServiceDir: "/operator/pass-through"}
 	input = workloadInput(request)
-	if len(input.ManagedVolumes) != 0 {
-		t.Fatalf("service managed volumes = %+v, want no one-shot handoff", input.ManagedVolumes)
+	if len(input.ManagedVolumes) != 1 || input.ManagedVolumes[0].Kind != ocihelper.ManagedVolumeServiceData {
+		t.Fatalf("service managed volumes = %+v, want service data", input.ManagedVolumes)
+	}
+	if len(input.ReservedEnvironment) != 1 || input.ReservedEnvironment[0].Name != contract.EnvServiceDir ||
+		input.ReservedEnvironment[0].Value != contract.OCIContainerServiceDirectory {
+		t.Fatalf("service reserved environment = %+v", input.ReservedEnvironment)
 	}
 }
 
@@ -1151,7 +1157,7 @@ func adapterTestImageEvidence(digest string) ocihelper.ImageEvidence {
 }
 
 func emptyAdapterInventory() ocihelper.ResourceInventory {
-	return ocihelper.ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}}
+	return ocihelper.ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}}
 }
 
 func intPointer(value int) *int { return &value }

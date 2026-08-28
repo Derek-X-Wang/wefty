@@ -1,6 +1,6 @@
 # M3 Lima transport and service publication attended acceptance
 
-This is the owner-hardware lane for Tickets #145 and #147 and the Mac rows of the M3 OCI
+This is the owner-hardware lane for Tickets #145, #147, and #149 and the Mac rows of the M3 OCI
 spec §9. It is deliberately absent from `service-acceptance-realtiming`: hosted
 macOS runners do not prove nested Lima `vz`. A run is PASS only when every row
 below has a captured command, exit code, and redacted receipt from the same
@@ -157,8 +157,18 @@ the helper instance/session generation before each row.
    ports for concurrent attempts, and a portless payload that reports
    authoritative `Started` without allocating an endpoint. Record
    `WEFTY_SERVICE_DIR=/wefty/service` and the absence of guest or host backing
-   paths in the payload environment. Restart classification, stop quiescence,
-   and service-data persistence are not rows for Ticket #147.
+   paths in the payload environment.
+8. Service data: run root, numeric `13001:13002`, and named `wefty:wefty`
+   (`12001:12002`) image-user variants. For each, require `/wefty/service` to
+   begin with exactly that UID:GID and accept a payload write. For one stable
+   service job, record attempt counters `0,1,2` across crash restart and
+   stop→start while a marker outside `/wefty/service` is absent at the start of
+   every fresh attempt. Start a second service job on the same pinned digest;
+   require its service data to be empty while the original job remains
+   digest-pinned and retains its own counter. The helper-owned backing path must resolve inside the
+   Linux guest's native filesystem, remain absent from the Lima host mounts,
+   and never traverse virtiofs. Record these facts in the
+   `service_data_guest_native` row.
 
 ## Ordinary L3 OCI one-shot
 
@@ -258,6 +268,13 @@ It must contain PASS evidence for `template_permissions`, `probe`,
 `service_health_echo`, `service_startup_timeout`,
 `service_withdrawal_republication`, `service_port_collision`, and
 `service_portless_started` from the same attended session.
+
+Ticket #149 additionally requires `service_data_guest_native` with
+`service_owners` containing `0:0`, `13001:13002`, and `12001:12002`,
+`service_attempt_counts` exactly `[0,1,2]`, `guest_native_data=true`,
+`virtiofs_data=false`, and `rootfs_discarded=true` from the same attended
+session. A hosted macOS runner or a host-shared backing path is `NOT-RUN`, not
+PASS evidence.
 
 Ticket #152 additionally requires PASS rows for `launch_daemon`,
 `no_lima_autostart`, `helper_install_permissions`,

@@ -53,7 +53,11 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	archivePath := os.Getenv("WEFTY_OCI_PROBE_ARCHIVE")
 	echoReference := os.Getenv("WEFTY_OCI_ECHO_REFERENCE")
 	echoArchivePath := os.Getenv("WEFTY_OCI_ECHO_ARCHIVE")
-	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoArchivePath == "" {
+	numericReference := os.Getenv("WEFTY_OCI_SERVICE_NUMERIC_REFERENCE")
+	numericArchivePath := os.Getenv("WEFTY_OCI_SERVICE_NUMERIC_ARCHIVE")
+	namedReference := os.Getenv("WEFTY_OCI_SERVICE_NAMED_REFERENCE")
+	namedArchivePath := os.Getenv("WEFTY_OCI_SERVICE_NAMED_ARCHIVE")
+	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoArchivePath == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" {
 		t.Fatal("Linux OCI realtiming provisioning is incomplete")
 	}
 	if os.Geteuid() == 0 {
@@ -147,6 +151,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	// and require adapter-owned reconciliation to repull and reattach it.
 	automaticBinding := nativeAdapterRequest(reference, digest, "automatic-repull", []string{"/bin/true"})
 	automaticBinding.Authority.WorkloadClass = contract.JobClassService
+	automaticBinding.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 	automaticBinding.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
 	if _, err := adapter.Run(ctx, automaticBinding, nil); err != nil {
 		t.Fatal(err)
@@ -247,6 +252,13 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if importEchoErr != nil || closeEchoErr != nil {
 		t.Fatal(errors.Join(importEchoErr, closeEchoErr))
 	}
+	numericImage := loadNativeImageArchive(t, ctx, adapter, numericReference, numericArchivePath)
+	namedImage := loadNativeImageArchive(t, ctx, adapter, namedReference, namedArchivePath)
+	serviceDataEvidence := exerciseNativeLinuxServiceData(t, ctx, adapter, []nativeServiceDataImage{
+		{name: "root", reference: echoReference, digest: echoImage.TopLevelDigest, owner: "0:0"},
+		{name: "numeric", reference: numericReference, digest: numericImage.TopLevelDigest, owner: "13001:13002"},
+		{name: "named", reference: namedReference, digest: namedImage.TopLevelDigest, owner: "12001:12002"},
+	})
 	refloat := newRefloatRegistry(t, echoArchivePath)
 	exerciseNativeLinuxPrestartRequeue(t, ctx, adapter, refloat.reference(), refloat.originalDigest(), refloat.moveTag, func() {
 		barrier.Invalidate()
@@ -511,11 +523,112 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatalf("namespace cleanup verification=%+v err=%v", verification, err)
 	}
 	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration, handoffMarkerBytes)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
+}
+
+type nativeServiceDataImage struct {
+	name, reference, digest, owner string
+}
+
+type nativeServiceDataEvidence struct {
+	rootUser, numericUser, namedUser                        bool
+	restartPersistent, stopStartPersistent, rootfsDiscarded bool
+	sameDigestReplacementFresh                              bool
+}
+
+func loadNativeImageArchive(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, reference, archivePath string) ocihelper.EnsureImageResponse {
+	t.Helper()
+	archive, err := os.Open(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image, loadErr := adapter.LoadImage(ctx, reference, archive)
+	closeErr := archive.Close()
+	if loadErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(loadErr, closeErr))
+	}
+	return image
+}
+
+func exerciseNativeLinuxServiceData(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, images []nativeServiceDataImage) nativeServiceDataEvidence {
+	t.Helper()
+	evidence := nativeServiceDataEvidence{}
+	for _, image := range images {
+		jobID := "service-data-" + image.name
+		for attempt := 1; attempt <= 3; attempt++ {
+			script := fmt.Sprintf(`
+set -eu
+test "$(stat -c '%%u:%%g' /wefty/service)" = %q
+test ! -e /rootfs-attempt-marker
+prior=0
+if test -f /wefty/service/attempt-count; then prior="$(cat /wefty/service/attempt-count)"; fi
+test "$prior" -eq %d
+printf '%%d\n' %d > /wefty/service/attempt-count
+touch /rootfs-attempt-marker
+`, image.owner, attempt-1, attempt)
+			request := nativeAdapterRequest(image.reference, image.digest, fmt.Sprintf("%s-%d", jobID, attempt), []string{"/bin/sh", "-c", script})
+			request.Authority.JobID = jobID
+			request.Authority.WorkloadClass = contract.JobClassService
+			request.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
+			request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+			result, err := adapter.Run(ctx, request, nil)
+			if err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+				t.Fatalf("%s attempt %d service data result = %+v err=%v", image.name, attempt, result.Outcome, err)
+			}
+			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: request.Authority}); err != nil || !receipt.RuntimeQuiesced {
+				t.Fatalf("%s attempt %d cleanup = %+v err=%v", image.name, attempt, receipt, err)
+			}
+		}
+		switch image.name {
+		case "root":
+			evidence.rootUser = true
+		case "numeric":
+			evidence.numericUser = true
+		case "named":
+			evidence.namedUser = true
+		}
+		evidence.restartPersistent = true
+		evidence.stopStartPersistent = true
+		evidence.rootfsDiscarded = true
+		if image.name == "root" {
+			replacement := nativeAdapterRequest(image.reference, image.digest, jobID+"-replacement-1", []string{"/bin/sh", "-c", "set -eu; test ! -e /wefty/service/attempt-count; printf 'replacement\\n' > /wefty/service/replacement"})
+			replacement.Authority.JobID = jobID + "-replacement"
+			replacement.Authority.WorkloadClass = contract.JobClassService
+			replacement.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
+			replacement.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+			result, err := adapter.Run(ctx, replacement, nil)
+			if err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+				t.Fatalf("same-digest replacement service data result = %+v err=%v", result.Outcome, err)
+			}
+			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: replacement.Authority}); err != nil || !receipt.RuntimeQuiesced {
+				t.Fatalf("same-digest replacement cleanup = %+v err=%v", receipt, err)
+			}
+			original := nativeAdapterRequest(image.reference, image.digest, jobID+"-4", []string{"/bin/sh", "-c", "set -eu; test \"$(cat /wefty/service/attempt-count)\" -eq 3; test ! -e /wefty/service/replacement; printf '4\\n' > /wefty/service/attempt-count"})
+			original.Authority.JobID = jobID
+			original.Authority.WorkloadClass = contract.JobClassService
+			original.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
+			original.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+			result, err = adapter.Run(ctx, original, nil)
+			if err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+				t.Fatalf("original same-digest service after replacement = %+v err=%v", result.Outcome, err)
+			}
+			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: original.Authority}); err != nil || !receipt.RuntimeQuiesced {
+				t.Fatalf("original same-digest service cleanup = %+v err=%v", receipt, err)
+			}
+			evidence.sameDigestReplacementFresh = true
+			if err := adapter.ReleaseOCIImageBindingPin(ctx, replacement.Authority.JobID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := adapter.ReleaseOCIImageBindingPin(ctx, jobID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return evidence
 }
 
 func exerciseNativeLinuxOneshotContract(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, echoReference, echoDigest, probeReference, probeDigest string) bool {

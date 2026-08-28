@@ -147,7 +147,10 @@ type ManagedResources any
 // exposing helper paths or runtime mechanics.
 type ManagedVolumeKind string
 
-const ManagedVolumeHandoff ManagedVolumeKind = "handoff"
+const (
+	ManagedVolumeHandoff     ManagedVolumeKind = "handoff"
+	ManagedVolumeServiceData ManagedVolumeKind = "service_data"
+)
 
 // ManagedVolume identifies durable runtime-managed state. OwnerKey is stable
 // across attempts and reruns and is opaque to the runtime.

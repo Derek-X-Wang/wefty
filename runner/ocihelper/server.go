@@ -940,11 +940,14 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			}
 			var rpcErr *RPCError
 			var specRejection *RuntimeSpecRejectionError
+			var serviceDataRejection *ServiceDataRejectionError
 			var imageUnavailable *ImageUnavailableError
 			if errors.As(err, &rpcErr) {
 				_ = writeRPCError(wire, rpcErr)
 			} else if errors.As(err, &specRejection) {
 				_ = writeFailure(wire, CodeOCISpecRejected, "OCI runtime spec was rejected")
+			} else if errors.As(err, &serviceDataRejection) {
+				_ = writeFailure(wire, CodeOCISpecRejected, serviceDataRejection.Error())
 			} else if errors.As(err, &imageUnavailable) {
 				_ = writeFailure(wire, CodeImageUnavailable, "pinned local OCI image is unavailable")
 			} else {
@@ -1150,6 +1153,7 @@ func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {
 	left.Cgroups = append(left.Cgroups, right.Cgroups...)
 	left.LogSegments = append(left.LogSegments, right.LogSegments...)
 	left.ManagedVolumes = append(left.ManagedVolumes, right.ManagedVolumes...)
+	left.ManagedVolumeRecords = append(left.ManagedVolumeRecords, right.ManagedVolumeRecords...)
 	return left
 }
 
@@ -1200,6 +1204,10 @@ func decodeRequest(connection *framedConn, raw json.RawMessage, target any) bool
 
 func writeEngineResponse(connection *framedConn, response any, err error) error {
 	if err != nil {
+		var serviceDataRejection *ServiceDataRejectionError
+		if errors.As(err, &serviceDataRejection) {
+			return writeFailure(connection, CodeOCISpecRejected, serviceDataRejection.Error())
+		}
 		return writeFailure(connection, CodeEngineFailure, "OCI engine operation failed")
 	}
 	return writeSuccess(connection, response)

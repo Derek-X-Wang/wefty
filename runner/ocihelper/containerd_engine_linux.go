@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,6 +98,7 @@ type ContainerdEngine struct {
 	attempts          map[string]*containerdAttempt
 	ports             map[uint16]string
 	nextPort          uint16
+	serviceVolumeMu   sync.Mutex
 }
 
 const (
@@ -760,7 +762,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		if err := engine.refreshManagedNetworkFiles(); err != nil {
 			return err
 		}
-		managedSources, managedErr := engine.managedVolumeSources(request)
+		managedSources, freshServiceVolume, managedErr := engine.managedVolumeSources(request)
 		if managedErr != nil {
 			return managedErr
 		}
@@ -776,6 +778,21 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			ManagedRoot: engine.config.RuntimeRoot, AllowedMountRoots: engine.config.AllowedMountRoots,
 			ManagedVolumeSources: managedSources, OperatorMountSources: operatorSources,
 		})
+		if configErr == nil {
+			if servicePath, ok := managedSources[ManagedVolumeServiceData]; ok {
+				uid, gid, ownerErr := document.ProcessOwner()
+				if ownerErr != nil {
+					closeErr := document.Close()
+					document = nil
+					return errors.Join(ownerErr, closeErr)
+				}
+				if ownerErr = engine.initializeServiceVolume(servicePath, request.Resources.ServiceVolumeOwnerRecord, freshServiceVolume, uid, gid); ownerErr != nil {
+					closeErr := document.Close()
+					document = nil
+					return errors.Join(ownerErr, closeErr)
+				}
+			}
+		}
 		return configErr
 	})
 	if err != nil {
@@ -1140,7 +1157,11 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 	for {
 		deleteErr := engine.deleteResources(cleanupCtx, request.Authority, resources)
 		verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
-		if deleteErr == nil && verifyErr == nil && verification.Absent {
+		runtimeAbsent := verification.Absent
+		if request.Authority.Class == contract.JobClassService {
+			runtimeAbsent = InventoryEmpty(withoutServiceDataInventory(verification.Inventory))
+		}
+		if deleteErr == nil && verifyErr == nil && runtimeAbsent {
 			if releaseErr := engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()); releaseErr == nil {
 				return DeleteResponse{Deleted: true}, nil
 			} else {
@@ -1234,6 +1255,12 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 		}
 		inventory = filterInventory(inventory, resources)
 	}
+	// Service data is job-lifetime state, not boot-sweep residue. Attempt
+	// verification retains it so explicit job removal can positively observe
+	// the directory and owner record, while namespace quiescence projects it out.
+	if request.Scope == VerifyNamespace {
+		inventory = withoutServiceDataInventory(inventory)
+	}
 	absent := InventoryEmpty(inventory)
 	if absent && request.Scope == VerifyNamespace {
 		engine.releaseVerifiedNamespace()
@@ -1269,6 +1296,7 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, _ SweepRequest) (Swee
 	if err != nil {
 		return SweepResponse{}, err
 	}
+	inventory = withoutServiceDataInventory(inventory)
 	containersList, err := engine.client.Containers(ctx)
 	if err != nil {
 		return SweepResponse{}, err
@@ -1421,7 +1449,6 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 			// M3 handoffs now live under the durable handoffs root. Sweep this
 			// legacy attempt-scoped location so upgrades do not strand residue.
 			filepath.Join(engine.config.RuntimeRoot, "volumes", identity.HandoffVolumeDirectory),
-			filepath.Join(engine.config.RuntimeRoot, "volumes", identity.ServiceVolumeDirectory),
 		} {
 			if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return SweepResponse{}, err
@@ -1555,7 +1582,6 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 	}
 	for _, path := range []string{
 		filepath.Join(engine.config.RuntimeRoot, "logs", resources.LogSegmentDirectory),
-		filepath.Join(engine.config.RuntimeRoot, "volumes", resources.ServiceVolumeDirectory),
 	} {
 		if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			failures = append(failures, err)
@@ -1722,8 +1748,14 @@ func readImageRuntimeConfig(ctx context.Context, store content.Store, image cont
 	return ImageRuntimeConfig{User: config.Config.User, Environment: config.Config.Env, Entrypoint: config.Config.Entrypoint, Command: config.Config.Cmd, WorkingDirectory: config.Config.WorkingDir}, nil
 }
 
-func (engine *ContainerdEngine) managedVolumeSources(request RunRequest) (map[ManagedVolumeKind]string, error) {
+type serviceVolumeCreation struct {
+	device uint64
+	inode  uint64
+}
+
+func (engine *ContainerdEngine) managedVolumeSources(request RunRequest) (map[ManagedVolumeKind]string, *serviceVolumeCreation, error) {
 	result := make(map[ManagedVolumeKind]string)
+	var freshServiceVolume *serviceVolumeCreation
 	for _, volume := range request.Workload.ManagedVolumes {
 		name := ""
 		root := "volumes"
@@ -1733,24 +1765,175 @@ func (engine *ContainerdEngine) managedVolumeSources(request RunRequest) (map[Ma
 			root = "handoffs"
 		case ManagedVolumeServiceData:
 			name = request.Resources.ServiceVolumeDirectory
+			root = "service-data"
 		case ManagedVolumeLogSegments:
 			name = request.Resources.LogSegmentDirectory
 		default:
-			return nil, fmt.Errorf("managed volume kind %q is unsupported", volume.Kind)
+			return nil, nil, fmt.Errorf("managed volume kind %q is unsupported", volume.Kind)
 		}
 		path := filepath.Join(engine.config.RuntimeRoot, root, name)
-		if err := os.MkdirAll(path, 0o700); err != nil {
-			return nil, err
+		if volume.Kind == ManagedVolumeServiceData {
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				return nil, nil, err
+			}
+			if err := os.Mkdir(path, 0o700); err == nil {
+				freshServiceVolume, err = serviceVolumeCreationAt(path)
+				if err != nil {
+					return nil, nil, err
+				}
+			} else if !errors.Is(err, os.ErrExist) {
+				return nil, nil, err
+			}
+		} else if err := os.MkdirAll(path, 0o700); err != nil {
+			return nil, nil, err
 		}
 		if volume.Kind == ManagedVolumeHandoff {
 			now := time.Now()
 			if err := os.Chtimes(path, now, now); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		result[volume.Kind] = path
 	}
-	return result, nil
+	return result, freshServiceVolume, nil
+}
+
+type serviceVolumeOwnerRecord struct {
+	Version uint8  `json:"version"`
+	Device  uint64 `json:"device"`
+	Inode   uint64 `json:"inode"`
+	UID     uint32 `json:"uid"`
+	GID     uint32 `json:"gid"`
+}
+
+type serviceVolumeInitializationDecision struct {
+	chown       bool
+	writeRecord bool
+	rejection   string
+}
+
+func decideServiceVolumeInitialization(fresh, recordPresent, recordMatchesIdentity, recordMatchesOwner, actualMatchesOwner, directoryEmpty, actualRootOwned bool) serviceVolumeInitializationDecision {
+	if !fresh && recordPresent && (!recordMatchesIdentity || !recordMatchesOwner) {
+		return serviceVolumeInitializationDecision{rejection: "service data owner record and directory identity disagree"}
+	}
+	decision := serviceVolumeInitializationDecision{writeRecord: fresh || !recordPresent}
+	if actualMatchesOwner {
+		return decision
+	}
+	if !fresh && !(!recordPresent && directoryEmpty && actualRootOwned) {
+		return serviceVolumeInitializationDecision{rejection: "service data directory owner does not match the pinned image user"}
+	}
+	decision.chown = true
+	decision.writeRecord = true
+	return decision
+}
+
+func serviceVolumeCreationAt(path string) (*serviceVolumeCreation, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return nil, err
+	}
+	return &serviceVolumeCreation{device: uint64(stat.Dev), inode: stat.Ino}, nil
+}
+
+func (engine *ContainerdEngine) initializeServiceVolume(path, recordName string, fresh *serviceVolumeCreation, uid, gid uint32) error {
+	engine.serviceVolumeMu.Lock()
+	defer engine.serviceVolumeMu.Unlock()
+	if recordName == "" || filepath.Base(path)+".owner" != recordName {
+		return &ServiceDataRejectionError{Reason: "service data owner record does not match its resource identity", WantedUID: uid, WantedGID: gid}
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return &ServiceDataRejectionError{Reason: "service data volume is not a helper-owned directory", WantedUID: uid, WantedGID: gid, err: err}
+	}
+	defer file.Close()
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return fmt.Errorf("inspect service data volume descriptor: %w", err)
+	}
+	if fresh != nil && (fresh.device != uint64(stat.Dev) || fresh.inode != stat.Ino) {
+		return &ServiceDataRejectionError{Reason: "fresh service data directory identity changed before ownership initialization", ActualUID: stat.Uid, ActualGID: stat.Gid, WantedUID: uid, WantedGID: gid}
+	}
+	actualUID, actualGID := stat.Uid, stat.Gid
+	markerRoot := filepath.Join(engine.config.RuntimeRoot, "service-data-state")
+	if err := os.MkdirAll(markerRoot, 0o700); err != nil {
+		return fmt.Errorf("create service data state root: %w", err)
+	}
+	marker := filepath.Join(markerRoot, recordName)
+	var recorded serviceVolumeOwnerRecord
+	recordPresent := false
+	if payload, err := os.ReadFile(marker); err == nil {
+		if err := json.Unmarshal(payload, &recorded); err != nil || recorded.Version != 1 {
+			return &ServiceDataRejectionError{Reason: "service data owner record is invalid", ActualUID: actualUID, ActualGID: actualGID, WantedUID: uid, WantedGID: gid, err: err}
+		}
+		recordPresent = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read service data owner marker: %w", err)
+	}
+	recordMatchesIdentity := recordPresent && recorded.Device == uint64(stat.Dev) && recorded.Inode == stat.Ino
+	recordMatchesOwner := recordPresent && recorded.UID == uid && recorded.GID == gid
+	actualMatchesOwner := actualUID == uid && actualGID == gid
+	directoryEmpty := false
+	if !actualMatchesOwner {
+		_, readDirectoryErr := file.Readdirnames(1)
+		directoryEmpty = errors.Is(readDirectoryErr, io.EOF)
+		if readDirectoryErr != nil && !directoryEmpty {
+			return fmt.Errorf("inspect service data contents: %w", readDirectoryErr)
+		}
+	}
+	decision := decideServiceVolumeInitialization(fresh != nil, recordPresent, recordMatchesIdentity, recordMatchesOwner, actualMatchesOwner, directoryEmpty, actualUID == 0 && actualGID == 0)
+	if decision.rejection != "" {
+		return &ServiceDataRejectionError{Reason: decision.rejection, ActualUID: actualUID, ActualGID: actualGID, WantedUID: uid, WantedGID: gid}
+	}
+	if decision.chown {
+		if err := unix.Fchown(int(file.Fd()), int(uid), int(gid)); err != nil {
+			return fmt.Errorf("initialize service data owner %d:%d: %w", uid, gid, err)
+		}
+		actualUID, actualGID = uid, gid
+	}
+	want := serviceVolumeOwnerRecord{Version: 1, Device: uint64(stat.Dev), Inode: stat.Ino, UID: actualUID, GID: actualGID}
+	if !decision.writeRecord && recordPresent && recorded == want {
+		return nil
+	}
+	return writeAtomicDurableOwnerRecord(markerRoot, recordName, want)
+}
+
+func writeAtomicDurableOwnerRecord(root, name string, record serviceVolumeOwnerRecord) error {
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	temporary, err := os.CreateTemp(root, "."+name+".tmp-")
+	if err != nil {
+		return fmt.Errorf("create service data owner record: %w", err)
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	writeErr := temporary.Chmod(0o600)
+	if writeErr == nil {
+		_, writeErr = temporary.Write(payload)
+	}
+	if writeErr == nil {
+		writeErr = temporary.Sync()
+	}
+	writeErr = errors.Join(writeErr, temporary.Close())
+	if writeErr != nil {
+		return fmt.Errorf("write service data owner record: %w", writeErr)
+	}
+	if err := os.Rename(temporaryName, filepath.Join(root, name)); err != nil {
+		return fmt.Errorf("publish service data owner record: %w", err)
+	}
+	directory, err := os.Open(root)
+	if err != nil {
+		return fmt.Errorf("open service data state root: %w", err)
+	}
+	return errors.Join(directory.Sync(), directory.Close())
 }
 
 type staticLogIO struct{ config cio.Config }
@@ -1959,7 +2142,7 @@ func (engine *ContainerdEngine) watchOOM(attempt *containerdAttempt) {
 }
 
 func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventory, error) {
-	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}}
+	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}}
 	leaseList, err := engine.client.LeasesService().List(ctx)
 	if err != nil {
 		return result, err
@@ -2047,14 +2230,8 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 	}); err != nil {
 		return result, err
 	}
-	volumeEntries, err := readDirectoryIfPresent(filepath.Join(engine.config.RuntimeRoot, "volumes"))
-	if err != nil {
+	if err := inventoryManagedVolumeResources(engine.config.RuntimeRoot, &result); err != nil {
 		return result, err
-	}
-	for _, entry := range volumeEntries {
-		if strings.HasPrefix(entry.Name(), "wefty-handoff-volume-") || strings.HasPrefix(entry.Name(), "wefty-service-volume-") {
-			result.ManagedVolumes = append(result.ManagedVolumes, entry.Name())
-		}
 	}
 	sort.Strings(result.Leases)
 	sort.Strings(result.Snapshots)
@@ -2064,16 +2241,48 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 	sort.Strings(result.Cgroups)
 	sort.Strings(result.LogSegments)
 	sort.Strings(result.ManagedVolumes)
+	sort.Strings(result.ManagedVolumeRecords)
 	return result, nil
 }
 
+func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInventory) error {
+	volumeEntries, err := readDirectoryIfPresent(filepath.Join(runtimeRoot, "volumes"))
+	if err != nil {
+		return err
+	}
+	for _, entry := range volumeEntries {
+		if strings.HasPrefix(entry.Name(), "wefty-handoff-volume-") {
+			result.ManagedVolumes = append(result.ManagedVolumes, entry.Name())
+		}
+	}
+	serviceEntries, err := readDirectoryIfPresent(filepath.Join(runtimeRoot, "service-data"))
+	if err != nil {
+		return err
+	}
+	for _, entry := range serviceEntries {
+		if strings.HasPrefix(entry.Name(), "wefty-service-volume-") {
+			result.ManagedVolumes = append(result.ManagedVolumes, entry.Name())
+		}
+	}
+	ownerRecordEntries, err := readDirectoryIfPresent(filepath.Join(runtimeRoot, "service-data-state"))
+	if err != nil {
+		return err
+	}
+	for _, entry := range ownerRecordEntries {
+		if strings.HasPrefix(entry.Name(), "wefty-service-volume-") && strings.HasSuffix(entry.Name(), ".owner") {
+			result.ManagedVolumeRecords = append(result.ManagedVolumeRecords, entry.Name())
+		}
+	}
+	return nil
+}
+
 func filterInventory(inventory ResourceInventory, resources ResourceIdentity) ResourceInventory {
-	filtered := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}}
+	filtered := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}}
 	for _, pair := range []struct {
 		values []string
 		target string
 		output *[]string
-	}{{inventory.Leases, resources.LeaseID, &filtered.Leases}, {inventory.Snapshots, resources.SnapshotID, &filtered.Snapshots}, {inventory.Containers, resources.ContainerID, &filtered.Containers}, {inventory.Tasks, resources.ContainerID, &filtered.Tasks}, {inventory.Shims, resources.ContainerID, &filtered.Shims}, {inventory.Cgroups, resources.CgroupID, &filtered.Cgroups}, {inventory.LogSegments, resources.LogSegmentDirectory, &filtered.LogSegments}, {inventory.ManagedVolumes, resources.HandoffVolumeDirectory, &filtered.ManagedVolumes}, {inventory.ManagedVolumes, resources.ServiceVolumeDirectory, &filtered.ManagedVolumes}} {
+	}{{inventory.Leases, resources.LeaseID, &filtered.Leases}, {inventory.Snapshots, resources.SnapshotID, &filtered.Snapshots}, {inventory.Containers, resources.ContainerID, &filtered.Containers}, {inventory.Tasks, resources.ContainerID, &filtered.Tasks}, {inventory.Shims, resources.ContainerID, &filtered.Shims}, {inventory.Cgroups, resources.CgroupID, &filtered.Cgroups}, {inventory.LogSegments, resources.LogSegmentDirectory, &filtered.LogSegments}, {inventory.ManagedVolumes, resources.HandoffVolumeDirectory, &filtered.ManagedVolumes}, {inventory.ManagedVolumes, resources.ServiceVolumeDirectory, &filtered.ManagedVolumes}, {inventory.ManagedVolumeRecords, resources.ServiceVolumeOwnerRecord, &filtered.ManagedVolumeRecords}} {
 		for _, value := range pair.values {
 			if value == pair.target || (pair.target == resources.CgroupID && strings.Contains(value, pair.target)) {
 				*pair.output = append(*pair.output, value)
@@ -2081,6 +2290,14 @@ func filterInventory(inventory ResourceInventory, resources ResourceIdentity) Re
 		}
 	}
 	return filtered
+}
+
+func withoutServiceDataInventory(inventory ResourceInventory) ResourceInventory {
+	inventory.ManagedVolumes = slices.DeleteFunc(inventory.ManagedVolumes, func(name string) bool {
+		return strings.HasPrefix(name, "wefty-service-volume-")
+	})
+	inventory.ManagedVolumeRecords = []string{}
+	return inventory
 }
 
 func captureSweepAuthority(authority AttemptAuthority, prior map[string]struct{}, attempts map[string]SweptAttemptAuthority) {
@@ -2122,7 +2339,7 @@ func mapKeys(values map[string]struct{}) []string {
 	return result
 }
 func inventoryCount(inventory ResourceInventory) int {
-	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ManagedVolumes)
+	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords)
 }
 
 func kernelRelease() string {

@@ -136,8 +136,10 @@ type runtimeSpecDependencies struct {
 // revalidation immediately before handoff; callers close the document after
 // container creation consumes it.
 type RuntimeSpecDocument struct {
-	payload []byte
-	mounts  *retainedMountSources
+	payload  []byte
+	mounts   *retainedMountSources
+	ownerUID uint32
+	ownerGID uint32
 }
 
 func (document *RuntimeSpecDocument) JSON() []byte {
@@ -145,6 +147,16 @@ func (document *RuntimeSpecDocument) JSON() []byte {
 		return nil
 	}
 	return slices.Clone(document.payload)
+}
+
+// ProcessOwner returns the primary owner resolved while constructing the
+// runtime spec. Service data initialization consumes this exact result so
+// passwd/group resolution cannot drift between profile and volume setup.
+func (document *RuntimeSpecDocument) ProcessOwner() (uint32, uint32, error) {
+	if document == nil {
+		return 0, 0, errors.New("OCI runtime spec document is absent")
+	}
+	return document.ownerUID, document.ownerGID, nil
 }
 
 // ContainerdSpec first revalidates every retained mount identity, then returns
@@ -186,6 +198,21 @@ func (rejection *RuntimeSpecRejectionError) Error() string {
 
 func (rejection *RuntimeSpecRejectionError) Unwrap() error { return rejection.err }
 
+// ServiceDataRejectionError is a terminal helper rejection: retrying the same
+// pinned service cannot safely reconcile a directory/record owner conflict.
+type ServiceDataRejectionError struct {
+	Reason               string
+	ActualUID, ActualGID uint32
+	WantedUID, WantedGID uint32
+	err                  error
+}
+
+func (rejection *ServiceDataRejectionError) Error() string {
+	return fmt.Sprintf("service data rejected: %s (actual owner %d:%d, wanted %d:%d)", rejection.Reason, rejection.ActualUID, rejection.ActualGID, rejection.WantedUID, rejection.WantedGID)
+}
+
+func (rejection *ServiceDataRejectionError) Unwrap() error { return rejection.err }
+
 // SpawnFailureForRunError preserves a helper-side spec rejection at the
 // agent/runtime seam without teaching the agent about containerd errors.
 func SpawnFailureForRunError(err error) *contract.SpawnFailure {
@@ -223,7 +250,7 @@ func BuildRuntimeSpec(ctx context.Context, input RuntimeSpecInput) (*RuntimeSpec
 		_ = retained.close()
 		return nil, &RuntimeSpecRejectionError{err: err}
 	}
-	return &RuntimeSpecDocument{payload: payload, mounts: retained}, nil
+	return &RuntimeSpecDocument{payload: payload, mounts: retained, ownerUID: spec.Process.User.UID, ownerGID: spec.Process.User.GID}, nil
 }
 
 // marshalRuntimeSpec serializes the profile while retaining explicit empty

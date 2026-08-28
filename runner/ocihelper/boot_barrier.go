@@ -271,11 +271,12 @@ func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {
 	inventory.Cgroups = slices.Clone(inventory.Cgroups)
 	inventory.LogSegments = slices.Clone(inventory.LogSegments)
 	inventory.ManagedVolumes = slices.Clone(inventory.ManagedVolumes)
+	inventory.ManagedVolumeRecords = slices.Clone(inventory.ManagedVolumeRecords)
 	return inventory
 }
 
 // InventoryEmpty reports whether every runtime-owned namespace class is absent.
 func InventoryEmpty(inventory ResourceInventory) bool {
 	return len(inventory.Leases)+len(inventory.Snapshots)+len(inventory.Containers)+len(inventory.Tasks)+
-		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ManagedVolumes) == 0
+		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ManagedVolumes)+len(inventory.ManagedVolumeRecords) == 0
 }

@@ -82,6 +82,12 @@ The requested lifecycle target for a service job (`running` or `stopped`),
 distinct from the job state that records what the control plane observes.
 _Avoid_: status, target status
 
+**Service data volume**:
+The helper-owned, guest-native `/wefty/service` storage that belongs to one
+`class=service` job, survives that job's attempts, and is deleted with that
+service-class job.
+_Avoid_: working directory, bind mount, container writable layer, shared volume
+
 ### Placement and movement
 
 **Movable**:

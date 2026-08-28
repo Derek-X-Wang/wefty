@@ -88,6 +88,18 @@ jobs:
           docker buildx build --platform linux/amd64 --tag "$ECHO_REFERENCE" \
             --output type=oci,dest=/tmp/wefty-echo.oci.tar /tmp/wefty-echo-image
           chmod 0644 /tmp/wefty-echo.oci.tar
+          NUMERIC_REFERENCE="wefty.local/service-data-numeric:${GITHUB_SHA}"
+          NAMED_REFERENCE="wefty.local/service-data-named:${GITHUB_SHA}"
+          cp -R /tmp/wefty-echo-image /tmp/wefty-service-data-numeric
+          printf '%s\n' 'USER 13001:13002' >> /tmp/wefty-service-data-numeric/Dockerfile
+          docker buildx build --platform linux/amd64 --tag "$NUMERIC_REFERENCE" \
+            --output type=oci,dest=/tmp/wefty-service-data-numeric.oci.tar /tmp/wefty-service-data-numeric
+          cp -R /tmp/wefty-echo-image /tmp/wefty-service-data-named
+          sed -i '/ENTRYPOINT/i RUN printf "wefty:x:12001:12002:wefty:/nonexistent:/bin/sh\\n" >> /etc/passwd && printf "wefty:x:12002:\\n" >> /etc/group' /tmp/wefty-service-data-named/Dockerfile
+          printf '%s\n' 'USER wefty:wefty' >> /tmp/wefty-service-data-named/Dockerfile
+          docker buildx build --platform linux/amd64 --tag "$NAMED_REFERENCE" \
+            --output type=oci,dest=/tmp/wefty-service-data-named.oci.tar /tmp/wefty-service-data-named
+          chmod 0644 /tmp/wefty-service-data-numeric.oci.tar /tmp/wefty-service-data-named.oci.tar
           sudo install --owner=root --group=root --mode=0755 /tmp/wefty-agent-oci-realtiming /usr/local/libexec/wefty-agent-oci-realtiming
           HELPER_CHECKSUM="sha256:$(sha256sum /tmp/wefty-agent-oci-realtiming | cut -d' ' -f1)"
           AGENT_UID="$(id -u)"
@@ -190,6 +202,10 @@ jobs:
             printf 'WEFTY_OCI_PROBE_ARCHIVE=%s\n' /tmp/wefty-probe.oci.tar
             printf 'WEFTY_OCI_ECHO_REFERENCE=%s\n' "$ECHO_REFERENCE"
             printf 'WEFTY_OCI_ECHO_ARCHIVE=%s\n' /tmp/wefty-echo.oci.tar
+            printf 'WEFTY_OCI_SERVICE_NUMERIC_REFERENCE=%s\n' "$NUMERIC_REFERENCE"
+            printf 'WEFTY_OCI_SERVICE_NUMERIC_ARCHIVE=%s\n' /tmp/wefty-service-data-numeric.oci.tar
+            printf 'WEFTY_OCI_SERVICE_NAMED_REFERENCE=%s\n' "$NAMED_REFERENCE"
+            printf 'WEFTY_OCI_SERVICE_NAMED_ARCHIVE=%s\n' /tmp/wefty-service-data-named.oci.tar
             printf 'WEFTY_OCI_FAULT_FIFO=%s\n' /tmp/wefty-oci-faults/control
             printf 'WEFTY_OCI_FAULT_DIR=%s\n' /tmp/wefty-oci-faults
           } >> "$GITHUB_ENV"

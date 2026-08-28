@@ -1294,7 +1294,7 @@ func (adapter *Adapter) ReapPriorBoot(_ context.Context, request workloadrunner.
 
 func resourceInventoryEmpty(inventory ocihelper.ResourceInventory) bool {
 	return len(inventory.Leases)+len(inventory.Snapshots)+len(inventory.Containers)+len(inventory.Tasks)+
-		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ManagedVolumes) == 0
+		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ManagedVolumes)+len(inventory.ManagedVolumeRecords) == 0
 }
 
 // HelperAuthority maps the agent's complete fenced attempt tuple without
@@ -1365,6 +1365,12 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 			})
 			// The helper-owned descriptor is authority for the guest mount.
 			reservedValues[contract.EnvHandoffDir] = contract.OCIContainerHandoffDirectory
+		case workloadrunner.ManagedVolumeServiceData:
+			managedVolumes = append(managedVolumes, ocihelper.ManagedVolumeDescriptor{
+				Kind: ocihelper.ManagedVolumeServiceData,
+			})
+			// The helper-owned descriptor is authority for the guest mount.
+			reservedValues[contract.EnvServiceDir] = contract.OCIContainerServiceDirectory
 		}
 	}
 	reserved := environment(reservedValues)

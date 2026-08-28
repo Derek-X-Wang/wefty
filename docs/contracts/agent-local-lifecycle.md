@@ -254,9 +254,12 @@ services request no endpoint or probe and become running at authoritative
 OCI service environment contains only reserved container-visible values:
 `WEFTY_SERVICE_DIR=/wefty/service` for every service and the helper-allocated
 `WEFTY_SERVICE_PORT` only for a portful service. Agent and guest backing paths
-never enter the payload environment. For #147, `/wefty/service` is only the
-reserved container path and is not yet backed by a persistent mount; #149 owns
-creating and attaching the persistent service volume.
+never enter the payload environment. The agent compiles every OCI service into
+exactly one `service_data` managed-volume requirement. The helper derives its
+opaque backing identity from the stable job ID, initializes the fresh guest
+directory once to the pinned image's resolved UID:GID, and mounts it at the
+reserved path on every attempt. Attempt reap, restart, stop, and start retain
+that data while each attempt receives a fresh writable root snapshot.
 
 ## Attempts and occupancy
 

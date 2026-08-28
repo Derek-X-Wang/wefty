@@ -384,7 +384,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 	}
 	if succeeded {
-		volumes := runtimeManagedVolumes(claim.Job.Spec)
+		volumes := runtimeManagedVolumesForSuccessfulCompletion(claim.Job.Spec)
 		if len(volumes) > 0 {
 			runtimeAdapter, found := lifecycle.dependencies.runtimes.selectKind(claim.Job.Spec.Kind)
 			finalizer, supported := runtimeAdapter.(workloadrunner.ManagedVolumeFinalizer)
@@ -817,10 +817,24 @@ func usesAgentHandoffLifecycle(spec contract.JobSpec) bool {
 }
 
 func runtimeManagedVolumes(spec contract.JobSpec) []workloadrunner.ManagedVolume {
+	if spec.Kind != contract.JobKindOCI {
+		return nil
+	}
+	switch spec.Class {
+	case contract.JobClassOneShot:
+		return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: handoffOwnerRunID(spec)}}
+	case contract.JobClassService:
+		return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
+	default:
+		return nil
+	}
+}
+
+func runtimeManagedVolumesForSuccessfulCompletion(spec contract.JobSpec) []workloadrunner.ManagedVolume {
 	if spec.Kind != contract.JobKindOCI || spec.Class != contract.JobClassOneShot {
 		return nil
 	}
-	return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: handoffOwnerRunID(spec)}}
+	return runtimeManagedVolumes(spec)
 }
 
 func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Claim, authority localAuthority, failures chan<- destinationError, watch attemptWatch) {
