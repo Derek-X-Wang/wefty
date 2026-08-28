@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -83,6 +84,7 @@ type capabilityState struct {
 	current                    contract.CapabilityObservation
 	lastProbeAt                time.Time
 	pendingPublicationRevision int64
+	ociSuppressionSequence     atomic.Uint64
 }
 
 func newCapabilityState(configured map[string]bool, probe CapabilityProbe, clock Clock, timeout time.Duration) *capabilityState {
@@ -108,6 +110,14 @@ func newCapabilityState(configured map[string]bool, probe CapabilityProbe, clock
 // Callers therefore suppress local OCI starts even while heartbeat transport
 // is blocked or unavailable.
 func (state *capabilityState) refresh(ctx context.Context) error {
+	return state.refreshValidated(ctx, nil)
+}
+
+// refreshValidated records a successful probe only when validate still proves
+// the runtime identity while claim publication is fenced. This keeps the
+// positive observation private until a helper loss racing the probe has been
+// observed and converted to a restrictive result.
+func (state *capabilityState) refreshValidated(ctx context.Context, validate func() error) error {
 	if state == nil || state.probe == nil {
 		return nil
 	}
@@ -120,6 +130,7 @@ func (state *capabilityState) refresh(ctx context.Context) error {
 	}
 	state.probeActive = true
 	state.probeMu.Unlock()
+	suppressionSequence := state.ociSuppressionSequence.Load()
 	probeContext, cancel := context.WithTimeout(ctx, state.timeout)
 	type probeResult struct {
 		result CapabilityProbeResult
@@ -142,8 +153,7 @@ func (state *capabilityState) refresh(ctx context.Context) error {
 		probeErr = probeContext.Err()
 	}
 	cancel()
-	state.record(result, probeErr)
-	return probeErr
+	return state.recordProbeResult(suppressionSequence, result, probeErr, validate)
 }
 
 func (state *capabilityState) suppressOCI(reason contract.CapabilityReasonCode, err error) {
@@ -164,7 +174,33 @@ func (state *capabilityState) suppressOCILocked(reason contract.CapabilityReason
 	if err == nil {
 		err = errors.New("OCI runtime is not admitted")
 	}
+	state.ociSuppressionSequence.Add(1)
 	state.recordLocked(CapabilityProbeResult{ReasonCode: reason}, err)
+}
+
+// recordProbeResult discards a positive result that began before a concurrent
+// runtime-loss callback withdrew OCI admission. The callback is synchronous,
+// but the probe itself deliberately runs outside claimPublication, so this
+// sequence closes the otherwise possible stale-positive overwrite.
+func (state *capabilityState) recordProbeResult(
+	suppressionSequence uint64,
+	result CapabilityProbeResult,
+	probeErr error,
+	validate func() error,
+) error {
+	state.claimPublication.Lock()
+	defer state.claimPublication.Unlock()
+	if probeErr == nil && state.ociSuppressionSequence.Load() != suppressionSequence {
+		return errors.New("capability probe was superseded by OCI runtime suppression")
+	}
+	if probeErr == nil && validate != nil {
+		probeErr = validate()
+		if probeErr != nil {
+			result.ReasonCode = contract.CapabilityReasonBootSweepFailed
+		}
+	}
+	state.recordLocked(result, probeErr)
+	return probeErr
 }
 
 func (state *capabilityState) record(result CapabilityProbeResult, probeErr error) {

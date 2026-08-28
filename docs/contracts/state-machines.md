@@ -78,6 +78,15 @@ managed service data are positively absent and before cleanup acknowledgement.
 Releasing the pin does not delete the evictable cache entry; ordinary periodic
 cache pressure remains the only later deletion policy.
 
+`stopping → stopped` requires the agent's positive runtime-quiescence receipt.
+For OCI this is either exact-attempt verified deletion after TERM/grace/KILL or
+an exact-authority, independently empty helper-generation sweep. A completion
+without a recognized `runtime_quiescence_evidence` kind instead commits
+`stopping → failed`, retains desired `stopped`, records the failure, and
+releases the slot without claiming that runtime cleanup succeeded. Output or
+log-upload failure after positive quiescence remains an `output_error`, but it
+does not turn an already proven stop into a false quiescence latch.
+
 Agent shutdown is an infrastructure interruption, not operator stop intent. A
 fenced shutdown completion therefore leaves desired state `running`, moves the
 service from `running` to `queued`, and leaves the restart streak unchanged.

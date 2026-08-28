@@ -333,6 +333,7 @@ func completeOperatorAttempt(t *testing.T, h *integrationHarness, jobID string, 
 	t.Helper()
 	if _, err := h.store.CompleteAttempt(context.Background(), "fabric-service-node", jobID, attempt.AttemptID, CompletionRequest{
 		FencingToken: attempt.FencingToken, IdempotencyKey: key, Result: result,
+		RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt,
 	}); err != nil {
 		t.Fatal(err)
 	}

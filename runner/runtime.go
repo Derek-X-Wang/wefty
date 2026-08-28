@@ -104,6 +104,34 @@ type OCIImagePinRuntime interface {
 	ReleaseOCIImageBindingPin(context.Context, string) error
 }
 
+// RuntimeGeneration identifies the adapter generation that observed a runtime
+// loss without exposing kind-specific session types at the agent seam.
+type RuntimeGeneration struct {
+	InstanceID string
+	Generation uint64
+}
+
+// RuntimeLossError carries positive adapter evidence that a reap operation
+// lost the runtime generation whose resources it was trying to verify.
+type RuntimeLossError struct {
+	Generation RuntimeGeneration
+	Err        error
+}
+
+func (err *RuntimeLossError) Error() string {
+	if err == nil || err.Err == nil {
+		return "workload runtime lost during quiescence verification"
+	}
+	return "workload runtime lost during quiescence verification: " + err.Err.Error()
+}
+
+func (err *RuntimeLossError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Err
+}
+
 // OCIObservationRefusal distinguishes an authoritative L1 protocol refusal
 // from transport or server unavailability while persisting pre-Run evidence.
 type OCIObservationRefusal struct{ Err error }
@@ -148,6 +176,10 @@ type Request struct {
 	ManagedResources ManagedResources
 	ManagedVolumes   []ManagedVolume
 	LifetimeBoundary LifetimeBoundary
+	// TerminationGrace is the agent-compiled interval between TERM and KILL
+	// for runtimes whose lifetime is bound to the agent boot. It is ignored
+	// for caller-lifetime work.
+	TerminationGrace time.Duration
 	IdlePolicy       IdlePolicy
 	CompletionSignal <-chan struct{}
 	Started          func()
@@ -157,6 +189,10 @@ type Request struct {
 	// OCIImageReady returns the local observer to starting while the helper
 	// constructs the runtime. L1 still remains Claimed.
 	OCIImageReady func()
+	// OCIRuntimeUnavailable reports helper/session or engine loss to the agent.
+	// The agent performs recovery later under its finalization context. L1
+	// transport failures must not call this hook.
+	OCIRuntimeUnavailable func(RuntimeGeneration)
 	// OCIImageResolved persists the helper-observed immutable identity before
 	// runtime resource creation. A later attempt receives the same identity
 	// and therefore never resolves the submitted tag again.
@@ -206,6 +242,7 @@ type ReapEvidence string
 const (
 	ReapEvidenceAttempt           ReapEvidence = "attempt"
 	ReapEvidenceNoRuntime         ReapEvidence = "no_runtime_resources"
+	ReapEvidenceOCISweep          ReapEvidence = "oci_sweep"
 	ReapEvidencePriorBootGuardian ReapEvidence = "prior_boot_guardian"
 	ReapEvidencePriorBootOCISweep ReapEvidence = "prior_boot_oci_sweep"
 	ReapEvidenceOCIRuntimeSweep   ReapEvidence = "oci_runtime_sweep"

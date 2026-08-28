@@ -31,6 +31,12 @@ func workloadRequest(attemptID string) workloadrunner.Request {
 	}
 }
 
+func TestOCIRuntimeSweepMapsToL1QuiescenceContract(t *testing.T) {
+	if got := toL1QuiescenceEvidence(workloadrunner.ReapEvidenceOCIRuntimeSweep); got != l1.RuntimeQuiescenceOCISweep {
+		t.Fatalf("runtime sweep evidence mapped to %q, want %q", got, l1.RuntimeQuiescenceOCISweep)
+	}
+}
+
 func TestWorkloadRuntimeRequiresPositiveReapVerification(t *testing.T) {
 	runtime := &reapRefusingRuntime{}
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
@@ -176,6 +182,227 @@ func TestOCIOneshotDelegatesHandoffToRuntime(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("agent created host handoff paths for OCI: %v", entries)
 	}
+}
+
+func TestOCIRuntimeLossRecoversSweepBeforeReap(t *testing.T) {
+	tests := []struct {
+		name   string
+		result contract.ProcessResult
+	}{
+		{name: "pre-start helper loss", result: contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureRuntimeUnavailable, Message: "helper lost"}}},
+		{name: "post-start engine loss", result: contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "engine lost"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := &recoverySweepRuntime{result: test.result}
+			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+				runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, observer: newLifecycleObserver(systemClock{}),
+				clock: systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
+				recoverOCIRuntime: func(context.Context, workloadrunner.RuntimeGeneration) error {
+					runtime.recovered = true
+					return nil
+				},
+			})
+			claim := l1.Claim{
+				Job:   l1.Job{JobID: "oci-runtime-loss", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot}},
+				Lease: l1.AttemptLease{AttemptID: "attempt-runtime-loss", FencingToken: "fence-1"},
+			}
+			result, err := lifecycle.runWorkload(t.Context(), claim)
+			if err == nil || result.OutputError != "" || !runtime.recovered || !runtime.reapedAfterRecovery {
+				t.Fatalf("runtime-loss lifecycle = result %+v err %v recovered %t reaped-after %t", result, err, runtime.recovered, runtime.reapedAfterRecovery)
+			}
+		})
+	}
+}
+
+func TestOCIRuntimeLossReusesNewerSiblingSweep(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		reported workloadrunner.RuntimeGeneration
+	}{
+		{name: "reported generation", reported: workloadrunner.RuntimeGeneration{InstanceID: "lost-helper", Generation: 7}},
+		{name: "empty generation uses hook-arm snapshot"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalidations := 0
+			barrier := &recordingOCIBootBarrier{ready: true, invalidate: func() { invalidations++ }}
+			agent := &Agent{session: &agentSession{ociBootBarrier: barrier}}
+			latch := ociRuntimeLossLatch{armed: workloadrunner.RuntimeGeneration{InstanceID: "lost-helper", Generation: 7}}
+			observed := latch.record(test.reported)
+			err := agent.recoverOCIRuntimeAfterLoss(t.Context(), observed)
+			if err != nil || invalidations != 0 {
+				t.Fatalf("newer sibling sweep recovery = err %v invalidations %d observed %+v", err, invalidations, observed)
+			}
+		})
+	}
+}
+
+func TestOCIRuntimeLossEmbargoesSiblingBeforeRunReturns(t *testing.T) {
+	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, systemClock{}, 0)
+	state.record(CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil)
+	runtime := &pausingRuntimeLossRuntime{reported: make(chan struct{}), release: make(chan struct{})}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, observer: newLifecycleObserver(systemClock{}),
+		clock: systemClock{}, nodeID: "node-1", bootSessionID: "boot-1", allowsStart: state.allows,
+		embargoOCIRuntime: func(workloadrunner.RuntimeGeneration) {
+			state.suppressOCI(contract.CapabilityReasonBootSweepFailed, errors.New("runtime lost"))
+		},
+	})
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "oci-loss-embargo", Spec: contract.JobSpec{
+			Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+			Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example.invalid/image"}}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "attempt-loss-embargo", FencingToken: "fence-1"},
+	}
+	done := make(chan struct{})
+	go func() {
+		_, _ = lifecycle.runWorkload(t.Context(), claim)
+		close(done)
+	}()
+	<-runtime.reported
+	if state.allows(claim.Job.Spec) {
+		t.Fatal("sibling OCI admission remained open after runtime-loss callback")
+	}
+	close(runtime.release)
+	<-done
+}
+
+func TestOCIReapRuntimeLossEmbargoesBeforeRecoveryAndRetries(t *testing.T) {
+	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, systemClock{}, 0)
+	state.record(CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil)
+	runtime := &reapRuntimeLossRuntime{}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, observer: newLifecycleObserver(systemClock{}),
+		clock: systemClock{}, nodeID: "node-1", bootSessionID: "boot-1", allowsStart: state.allows,
+		embargoOCIRuntime: func(workloadrunner.RuntimeGeneration) {
+			state.suppressOCI(contract.CapabilityReasonBootSweepFailed, errors.New("runtime lost during reap"))
+		},
+		recoverOCIRuntime: func(context.Context, workloadrunner.RuntimeGeneration) error {
+			if state.allows(contract.JobSpec{Kind: contract.JobKindOCI}) {
+				return errors.New("replacement OCI claim remained admitted before recovery")
+			}
+			runtime.recovered = true
+			return nil
+		},
+	})
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "oci-reap-loss", Spec: contract.JobSpec{
+			Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+			Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example.invalid/image"}}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "attempt-reap-loss", FencingToken: "fence-1"},
+	}
+	result, err := lifecycle.runWorkload(t.Context(), claim)
+	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || runtime.reapCalls != 2 || !runtime.recovered {
+		t.Fatalf("reap-loss recovery = result %+v err %v calls %d recovered %t", result, err, runtime.reapCalls, runtime.recovered)
+	}
+}
+
+type reapRuntimeLossRuntime struct {
+	reapCalls int
+	recovered bool
+}
+
+func (runtime *reapRuntimeLossRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (*reapRuntimeLossRuntime) Run(context.Context, workloadrunner.Request, workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	exit := 0
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exit}}, nil
+}
+
+func (runtime *reapRuntimeLossRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	runtime.reapCalls++
+	if runtime.reapCalls == 1 {
+		return workloadrunner.ReapReceipt{}, &workloadrunner.RuntimeLossError{
+			Generation: workloadrunner.RuntimeGeneration{InstanceID: "helper-old", Generation: 7}, Err: errors.New("Delete lost engine"),
+		}
+	}
+	if !runtime.recovered {
+		return workloadrunner.ReapReceipt{}, errors.New("reap retried before recovery")
+	}
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceOCISweep}, nil
+}
+
+func TestOCIRuntimeFailureArmSurvivesRecoveryFailure(t *testing.T) {
+	runtime := &recoverySweepRuntime{result: contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{
+		Code: contract.RuntimeFailureUnavailable, Message: "engine lost",
+	}}}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, observer: newLifecycleObserver(systemClock{}),
+		clock: systemClock{}, nodeID: "node-1", bootSessionID: "boot-1",
+		recoverOCIRuntime: func(context.Context, workloadrunner.RuntimeGeneration) error {
+			return errors.New("recovery budget expired")
+		},
+	})
+	claim := l1.Claim{
+		Job:   l1.Job{JobID: "oci-runtime-failure-arm", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassOneShot}},
+		Lease: l1.AttemptLease{AttemptID: "attempt-runtime-failure-arm", FencingToken: "fence-1"},
+	}
+	result, err := lifecycle.runWorkload(t.Context(), claim)
+	if err == nil || result.RuntimeFailure == nil || result.RuntimeFailure.Code != contract.RuntimeFailureUnavailable || result.OutputError != "" {
+		t.Fatalf("recovery failure overwrote runtime arm = result %+v err %v", result, err)
+	}
+}
+
+func TestOCIRecoveryMutexAcquisitionHonorsContext(t *testing.T) {
+	session := &agentSession{}
+	session.ociRecoveryMu.Lock()
+	defer session.ociRecoveryMu.Unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := session.recoverOCIRuntime(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("context-aware OCI recovery lock = %v, want deadline", err)
+	}
+}
+
+type pausingRuntimeLossRuntime struct {
+	reported chan struct{}
+	release  chan struct{}
+}
+
+func (runtime *pausingRuntimeLossRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (runtime *pausingRuntimeLossRuntime) Run(_ context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	request.OCIRuntimeUnavailable(workloadrunner.RuntimeGeneration{})
+	close(runtime.reported)
+	<-runtime.release
+	err := errors.New("runtime lost")
+	return workloadrunner.Result{Outcome: contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: err.Error()}}}, err
+}
+
+func (*pausingRuntimeLossRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceOCISweep}, nil
+}
+
+type recoverySweepRuntime struct {
+	result              contract.ProcessResult
+	recovered           bool
+	reapedAfterRecovery bool
+}
+
+func (runtime *recoverySweepRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (runtime *recoverySweepRuntime) Run(_ context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	if request.OCIRuntimeUnavailable == nil {
+		return workloadrunner.Result{Outcome: runtime.result}, errors.New("OCI runtime recovery callback is absent")
+	}
+	request.OCIRuntimeUnavailable(workloadrunner.RuntimeGeneration{InstanceID: "helper-old", Generation: 7})
+	return workloadrunner.Result{Outcome: runtime.result}, errors.New("OCI runtime unavailable")
+}
+
+func (runtime *recoverySweepRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	runtime.reapedAfterRecovery = runtime.recovered
+	if !runtime.recovered {
+		return workloadrunner.ReapReceipt{}, errors.New("sweep embargo was not completed")
+	}
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceOCISweep}, nil
 }
 
 type preRunFailureRuntime struct{ code contract.SpawnFailureCode }

@@ -62,6 +62,7 @@ var requiredAttendedRows = []string{
 	"dynamic_forwarding_disabled", "raw_containerd_denied",
 	"service_health_echo", "service_startup_timeout", "service_withdrawal_republication",
 	"service_port_collision", "service_portless_started",
+	"service_restart_fresh_attempt", "service_stop_start_capacity", "service_failed_quiescence",
 	"launch_daemon", "no_lima_autostart", "helper_install_permissions",
 	"stopped_enabled_recovery", "stopped_disabled_no_recovery", "broken_enabled_recovery",
 	"process_only_degradation", "minimal_doctor",

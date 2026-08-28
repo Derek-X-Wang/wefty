@@ -106,6 +106,25 @@ func (err *RPCError) Error() string {
 	return fmt.Sprintf("oci helper %s: %s", err.Code, err.Message)
 }
 
+// RuntimeLossError is positive evidence that an operation lost the active
+// helper session or its engine. Callers must not infer node-wide runtime loss
+// from an arbitrary policy, validation, or cancellation error.
+type RuntimeLossError struct{ Cause error }
+
+func (err *RuntimeLossError) Error() string {
+	if err == nil || err.Cause == nil {
+		return "OCI helper runtime lost"
+	}
+	return "OCI helper runtime lost: " + err.Cause.Error()
+}
+
+func (err *RuntimeLossError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
+}
+
 type frame struct {
 	Version           int             `json:"version"`
 	Method            Method          `json:"method,omitempty"`

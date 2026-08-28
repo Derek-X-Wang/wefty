@@ -575,12 +575,8 @@ func TestHelperLossAtBarrierStagesKeepsPoisedOCIClaimUnminted(t *testing.T) {
 			if nodeAgent.CapabilitySnapshot().Capabilities["kind:oci"] {
 				t.Fatalf("helper loss at %s did not synchronously withdraw local OCI", stage)
 			}
-			minimumRestrictiveRevision := int64(2)
-			if stage == "before-publication" {
-				minimumRestrictiveRevision = 3
-			}
 			node = waitForAgentNode(t, store, nodeID, func(node l1.Node) bool {
-				return node.CapabilityRevision >= minimumRestrictiveRevision && !node.Capabilities["kind:oci"] &&
+				return node.CapabilityRevision >= 2 && !node.Capabilities["kind:oci"] &&
 					node.CapabilityReasonCode == contract.CapabilityReasonBootSweepFailed
 			})
 			time.Sleep(25 * time.Millisecond)

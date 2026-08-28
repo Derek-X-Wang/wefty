@@ -45,8 +45,8 @@ func (outbox *evidenceOutbox) ensureAttempt(ctx context.Context, claim l1.Claim)
 	return outbox.spool.ensureAttempt(ctx, claim)
 }
 
-func (outbox *evidenceOutbox) storeCompletion(ctx context.Context, attemptID string, result l1.ProcessResult, finishedAt time.Time) error {
-	return outbox.spool.storeCompletion(ctx, attemptID, result, finishedAt)
+func (outbox *evidenceOutbox) storeCompletion(ctx context.Context, attemptID string, result l1.ProcessResult, finishedAt time.Time, evidence ...l1.RuntimeQuiescenceEvidence) error {
+	return outbox.spool.storeCompletion(ctx, attemptID, result, finishedAt, evidence...)
 }
 
 func (outbox *evidenceOutbox) completionDelivered(ctx context.Context, attemptID string) error {
@@ -182,14 +182,13 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 }
 
 func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Client, attempt logSpoolAttempt) error {
-	result, _, present, err := outbox.spool.completion(ctx, attempt.attemptID)
+	result, evidence, _, present, err := outbox.spool.completionWithEvidence(ctx, attempt.attemptID)
 	if err != nil || !present {
 		return err
 	}
 	request := l1.CompletionRequest{
-		FencingToken:   attempt.fencingToken,
-		IdempotencyKey: "completion:" + attempt.attemptID,
-		Result:         result,
+		FencingToken: attempt.fencingToken, IdempotencyKey: "completion:" + attempt.attemptID,
+		Result: result, RuntimeQuiescenceEvidence: evidence,
 	}
 	for {
 		_, err := client.Complete(ctx, attempt.jobID, attempt.attemptID, request)

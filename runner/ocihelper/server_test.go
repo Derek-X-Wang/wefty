@@ -381,7 +381,7 @@ func TestCrashAtEveryCreateBoundaryIsSweptBeforeReusedBootSession(t *testing.T) 
 			}
 			receipt, ok := restarted.SweepReceipt()
 			if !ok || len(receipt.PriorBootSessionsSeen) != 1 || len(receipt.Attempts) != 1 ||
-				receipt.Attempts[0].AttemptID != testAuthority().AttemptID || inventoryEmpty(receipt.SweptInventory) {
+				receipt.Attempts[0].AttemptID != testAuthority().AttemptID || InventoryEmpty(receipt.SweptInventory) {
 				t.Fatalf("restarted barrier receipt = %#v, ok=%t", receipt, ok)
 			}
 			if engine.residueCount() != 0 {
@@ -1169,6 +1169,10 @@ func TestOperationTransportFailureSynchronouslyInvalidatesSession(t *testing.T) 
 	if err == nil {
 		t.Fatal("transport failure was accepted")
 	}
+	var runtimeLoss *RuntimeLossError
+	if !errors.As(err, &runtimeLoss) {
+		t.Fatalf("transport failure = %T %v, want typed runtime loss", err, err)
+	}
 	select {
 	case <-lost:
 	default:
@@ -1478,7 +1482,7 @@ func (engine *crashBoundaryEngine) Verify(context.Context, VerifyRequest) (Verif
 	engine.record("Verify")
 	engine.stateMu.Lock()
 	inventory := engine.inventoryLocked()
-	absent := inventoryEmpty(inventory)
+	absent := InventoryEmpty(inventory)
 	engine.stateMu.Unlock()
 	return VerifyResponse{Absent: absent, Inventory: inventory}, nil
 }

@@ -380,9 +380,37 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		prepareServiceEndpoint: prepareProcessServiceEndpoint,
 		prepareAuthorityLoss:   a.prepareAuthorityLoss,
 		allowsStart:            allowsStart,
+		currentOCIGeneration:   a.currentOCIRuntimeGeneration,
+		embargoOCIRuntime:      a.embargoOCIRuntimeLoss,
+		recoverOCIRuntime:      a.recoverOCIRuntimeAfterLoss,
 		runtimeReaped:          a.recordRuntimeReap,
 		attemptDeadman:         a.attemptDeadman,
 	})
+}
+
+func (a *Agent) currentOCIRuntimeGeneration() (workloadrunner.RuntimeGeneration, bool) {
+	if a.session == nil || a.session.ociBootBarrier == nil {
+		return workloadrunner.RuntimeGeneration{}, false
+	}
+	generation, ok := a.session.ociBootBarrier.Generation()
+	return workloadrunner.RuntimeGeneration{InstanceID: generation.HelperInstanceID, Generation: generation.SessionGeneration}, ok
+}
+
+func (a *Agent) embargoOCIRuntimeLoss(_ workloadrunner.RuntimeGeneration) {
+	capabilities := a.capabilities
+	if capabilities == nil && a.session != nil {
+		capabilities = a.session.capabilities
+	}
+	if capabilities != nil {
+		capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, errors.New("OCI helper runtime loss requires a new boot sweep"))
+	}
+}
+
+func (a *Agent) recoverOCIRuntimeAfterLoss(ctx context.Context, observed workloadrunner.RuntimeGeneration) error {
+	if a.session == nil {
+		return errors.New("OCI runtime recovery requires an agent session")
+	}
+	return a.session.recoverOCIRuntimeAfterLoss(ctx, observed)
 }
 
 func (a *Agent) recordRuntimeReap(jobID string, receipt workloadrunner.ReapReceipt, err error) {

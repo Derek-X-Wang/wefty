@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -46,6 +47,8 @@ func TestAdapterPersistsResolutionBeforePrestartRunFailure(t *testing.T) {
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
 	defer closeAdapter()
 	request := adapterTestRequest()
+	recoveries := 0
+	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
 	request.Execution.OCI.Image.Digest = nil
 	var resolved workloadrunner.OCIImageObservation
 	request.OCIImageResolved = func(_ context.Context, observation workloadrunner.OCIImageObservation) error {
@@ -64,11 +67,29 @@ func TestAdapterPersistsResolutionBeforePrestartRunFailure(t *testing.T) {
 		t.Fatalf("pre-Run resolution evidence = %+v", resolved)
 	}
 	receipt, reapErr := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
-	if reapErr != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime {
-		t.Fatalf("pre-Run helper failure reap = (%+v, %v)", receipt, reapErr)
+	var reapLoss *workloadrunner.RuntimeLossError
+	if !errors.As(reapErr, &reapLoss) || receipt.RuntimeQuiesced || reapLoss.Generation.InstanceID == "" || reapLoss.Generation.Generation == 0 {
+		t.Fatalf("pre-Run helper failure reap evidence = (%+v, %v)", receipt, reapErr)
 	}
-	if engine.deletes != 1 {
-		t.Fatalf("pre-Run helper failure pin releases = %d, want 1", engine.deletes)
+	if recoveries != 1 {
+		t.Fatalf("pre-Run helper loss recovery calls = %d, want 1", recoveries)
+	}
+}
+
+func TestAdapterReapSessionLossReturnsTypedEvidenceAndRetainsAttempt(t *testing.T) {
+	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	request := adapterTestRequest()
+	if result, err := adapter.Run(t.Context(), request, nil); err != nil || result.Outcome.ExitCode == nil {
+		t.Fatalf("run before reap loss = (%+v, %v)", result.Outcome, err)
+	}
+	closeAdapter()
+	for attempt := 1; attempt <= 2; attempt++ {
+		receipt, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
+		var loss *workloadrunner.RuntimeLossError
+		if !errors.As(err, &loss) || receipt.RuntimeQuiesced || loss.Generation.InstanceID == "" || loss.Generation.Generation == 0 {
+			t.Fatalf("reap loss attempt %d = receipt %+v err %v", attempt, receipt, err)
+		}
 	}
 }
 
@@ -86,6 +107,9 @@ func TestAdapterClassifiesPreRunObservationFailure(t *testing.T) {
 			adapter, closeAdapter := startAdapterTestServer(t, engine)
 			defer closeAdapter()
 			request := adapterTestRequest()
+			request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) {
+				t.Fatal("L1 observation failure triggered an OCI namespace sweep")
+			}
 			request.OCIImageResolved = func(context.Context, workloadrunner.OCIImageObservation) error { return test.err }
 			result, err := adapter.Run(t.Context(), request, nil)
 			if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != test.want {
@@ -114,9 +138,14 @@ func TestAdapterRejectsHelperDigestDifferentFromPinnedRequest(t *testing.T) {
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
 	defer closeAdapter()
 	request := adapterTestRequest()
+	recoveries := 0
+	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
 	result, err := adapter.Run(t.Context(), request, nil)
 	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureImageManifestInvalid {
 		t.Fatalf("digest mismatch outcome = (%+v, %v)", result.Outcome, err)
+	}
+	if recoveries != 0 {
+		t.Fatalf("digest mismatch recovery calls = %d, want 0", recoveries)
 	}
 }
 
@@ -242,11 +271,42 @@ func TestAdapterRefreshesRunSweepBaselineAndRetainsItUntilRecovery(t *testing.T)
 	}
 }
 
+func TestAdapterConsumesExactSameBootSweepEvidenceOnce(t *testing.T) {
+	authority := workloadrunner.AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "job", AttemptID: "attempt",
+		FencingToken: "fence", WorkloadClass: contract.JobClassService, RemovalGeneration: "remove-1",
+	}
+	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
+		SweepEpoch: "sweep-1", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-2", SessionGeneration: 8},
+		VerifiedInventory: emptyAdapterInventory(),
+		Attempts: []ocihelper.SweptAttemptAuthority{{
+			NodeID: authority.NodeID, JobID: authority.JobID, AttemptID: authority.AttemptID,
+			FencingToken: authority.FencingToken, PriorBootSessionID: authority.BootSessionID,
+			Class: authority.WorkloadClass, RemovalGeneration: authority.RemovalGeneration,
+		}},
+	}}
+	adapter := NewAdapter(source)
+	receipt, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: authority})
+	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceOCISweep || receipt.SweepEpoch != "sweep-1" || receipt.HelperGeneration != 8 {
+		t.Fatalf("same-boot sweep receipt=%+v err=%v", receipt, err)
+	}
+	if _, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: authority}); err == nil {
+		t.Fatal("reused same-boot sweep receipt as quiescence evidence")
+	}
+
+	mismatched := authority
+	mismatched.FencingToken = "other-fence"
+	if _, err := NewAdapter(source).ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: mismatched}); err == nil {
+		t.Fatal("mismatched sweep authority produced quiescence evidence")
+	}
+}
+
 func TestAdapterMapsLogsExitSignalOOMAndRuntimeLoss(t *testing.T) {
 	tests := []struct {
-		name  string
-		watch ocihelper.WatchResponse
-		check func(*testing.T, contract.ProcessResult)
+		name    string
+		watch   ocihelper.WatchResponse
+		recover bool
+		check   func(*testing.T, contract.ProcessResult)
 	}{
 		{name: "exit", watch: ocihelper.WatchResponse{ExitCode: intPointer(23)}, check: func(t *testing.T, result contract.ProcessResult) {
 			if result.ExitCode == nil || *result.ExitCode != 23 {
@@ -263,7 +323,7 @@ func TestAdapterMapsLogsExitSignalOOMAndRuntimeLoss(t *testing.T) {
 				t.Fatalf("OOM result = %+v", result)
 			}
 		}},
-		{name: "runtime-loss", watch: ocihelper.WatchResponse{RuntimeFailure: "shim connection lost"}, check: func(t *testing.T, result contract.ProcessResult) {
+		{name: "runtime-loss", watch: ocihelper.WatchResponse{RuntimeFailure: "shim connection lost"}, recover: true, check: func(t *testing.T, result contract.ProcessResult) {
 			if result.RuntimeFailure == nil || result.RuntimeFailure.Code != contract.RuntimeFailureUnavailable {
 				t.Fatalf("runtime loss = %+v", result)
 			}
@@ -275,6 +335,8 @@ func TestAdapterMapsLogsExitSignalOOMAndRuntimeLoss(t *testing.T) {
 			adapter, closeAdapter := startAdapterTestServer(t, engine)
 			defer closeAdapter()
 			request := adapterTestRequest()
+			recoveries := 0
+			request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
 			var started bool
 			request.OCIStarted = func(_ context.Context, evidence workloadrunner.OCIImageObservation) error {
 				if evidence.TopLevelDigest != adapterTestDigest {
@@ -292,7 +354,138 @@ func TestAdapterMapsLogsExitSignalOOMAndRuntimeLoss(t *testing.T) {
 				t.Fatalf("started=%v log=%+v", started, log)
 			}
 			test.check(t, result.Outcome)
+			if (recoveries == 1) != test.recover {
+				t.Fatalf("runtime recovery calls = %d, want recovery %t", recoveries, test.recover)
+			}
 		})
+	}
+}
+
+func TestAdapterServiceCancellationUsesTermBeforeKill(t *testing.T) {
+	type runOutcome struct {
+		result workloadrunner.Result
+		err    error
+	}
+	tests := []struct {
+		name       string
+		ignoreTERM bool
+		want       []ocihelper.Signal
+		wantResult string
+	}{
+		{name: "graceful term", want: []ocihelper.Signal{ocihelper.SignalTERM}, wantResult: "terminated"},
+		{name: "kill after grace", ignoreTERM: true, want: []ocihelper.Signal{ocihelper.SignalTERM, ocihelper.SignalKILL}, wantResult: "killed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			engine := &adapterTestEngine{watchSignals: make(chan ocihelper.Signal, 2), ignoreTERM: test.ignoreTERM}
+			adapter, closeAdapter := startAdapterTestServer(t, engine)
+			defer closeAdapter()
+			request := adapterTestRequest()
+			request.Authority.WorkloadClass = contract.JobClassService
+			request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+			request.TerminationGrace = 20 * time.Millisecond
+			started := make(chan struct{})
+			request.Started = func() { close(started) }
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan runOutcome, 1)
+			go func() {
+				result, err := adapter.Run(ctx, request, nil)
+				done <- runOutcome{result: result, err: err}
+			}()
+			<-started
+			cancel()
+			finished := <-done
+			if finished.err != nil || finished.result.Outcome.Signal != test.wantResult || finished.result.Outcome.TerminationCause != contract.TerminationCauseAgent {
+				t.Fatalf("cancellation outcome = (%+v, %v)", finished.result.Outcome, finished.err)
+			}
+			engine.mu.Lock()
+			got := slices.Clone(engine.signals)
+			engine.mu.Unlock()
+			if !slices.Equal(got, test.want) {
+				t.Fatalf("signals = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAdapterServiceUninterruptiblePayloadDoesNotReportRuntimeLoss(t *testing.T) {
+	engine := &adapterTestEngine{watchSignals: make(chan ocihelper.Signal, 2), ignoreTERM: true, ignoreKILL: true}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+	request.TerminationGrace = 10 * time.Millisecond
+	recoveries := 0
+	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
+	started := make(chan struct{})
+	request.Started = func() { close(started) }
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := adapter.Run(ctx, request, nil)
+		done <- err
+	}()
+	<-started
+	cancel()
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "did not confirm exit after KILL") {
+		t.Fatalf("uninterruptible service stop error = %v", err)
+	}
+	if recoveries != 0 {
+		t.Fatalf("uninterruptible payload triggered %d namespace recoveries", recoveries)
+	}
+}
+
+func TestAdapterServiceSignalDeadlineReportsRuntimeLoss(t *testing.T) {
+	engine := &adapterTestEngine{watchSignals: make(chan ocihelper.Signal, 2), blockSignal: true}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+	request.TerminationGrace = 10 * time.Millisecond
+	recoveries := 0
+	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
+	started := make(chan struct{})
+	request.Started = func() { close(started) }
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := adapter.Run(ctx, request, nil)
+		done <- err
+	}()
+	<-started
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("helper-unreachable service stop returned no error")
+	}
+	if recoveries != 1 {
+		t.Fatalf("helper-unreachable service stop recoveries = %d, want 1", recoveries)
+	}
+}
+
+func TestAdapterOneShotCancellationDoesNotReportRuntimeLoss(t *testing.T) {
+	engine := &adapterTestEngine{watchErrorOnCancel: true}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	recoveries := 0
+	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
+	started := make(chan struct{})
+	request.Started = func() { close(started) }
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := adapter.Run(ctx, request, nil)
+		done <- err
+	}()
+	<-started
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("cancelled one-shot Watch unexpectedly succeeded")
+	}
+	if recoveries != 0 {
+		t.Fatalf("cancelled one-shot recovery calls = %d, want 0", recoveries)
 	}
 }
 
@@ -454,12 +647,18 @@ func TestAdapterImageBudgetExhaustionIsPermanentAndBounded(t *testing.T) {
 		},
 	})
 	defer closeAdapter()
-	result, err := adapter.Run(t.Context(), adapterTestRequest(), nil)
+	request := adapterTestRequest()
+	recoveries := 0
+	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
+	result, err := adapter.Run(t.Context(), request, nil)
 	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureImageUnavailable {
 		t.Fatalf("budget outcome=%+v err=%v", result.Outcome, err)
 	}
 	if engine.ensureCalls != 1 {
 		t.Fatalf("budget exhaustion EnsureImage calls = %d, want 1", engine.ensureCalls)
+	}
+	if recoveries != 0 {
+		t.Fatalf("delivery budget recovery calls = %d, want 0", recoveries)
 	}
 }
 
@@ -531,8 +730,11 @@ func TestAdapterEngineLossMidPullFailsFast(t *testing.T) {
 		err    error
 	}
 	done := make(chan outcome, 1)
+	recoveries := 0
+	request := adapterTestRequest()
+	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
 	go func() {
-		result, err := adapter.Run(t.Context(), adapterTestRequest(), nil)
+		result, err := adapter.Run(t.Context(), request, nil)
 		done <- outcome{result: result, err: err}
 	}()
 	<-engine.ensureEntered
@@ -543,6 +745,9 @@ func TestAdapterEngineLossMidPullFailsFast(t *testing.T) {
 	}
 	if engine.ensureCalls != 1 {
 		t.Fatalf("engine loss retried EnsureImage %d times", engine.ensureCalls)
+	}
+	if recoveries != 1 {
+		t.Fatalf("engine loss recovery calls = %d, want 1", recoveries)
 	}
 }
 
@@ -715,6 +920,12 @@ type adapterTestEngine struct {
 	bridgeExchange     chan error
 	missingUntilEnsure bool
 	reconcileCalls     int
+	watchSignals       chan ocihelper.Signal
+	ignoreTERM         bool
+	ignoreKILL         bool
+	blockSignal        bool
+	signals            []ocihelper.Signal
+	watchErrorOnCancel bool
 }
 
 func (engine *adapterTestEngine) ReconcileImagePins(_ context.Context, request ocihelper.ReconcileImagePinsRequest) (ocihelper.ReconcileImagePinsResponse, error) {
@@ -801,8 +1012,23 @@ func (engine *adapterTestEngine) Run(_ context.Context, request ocihelper.RunReq
 	}
 	return response, nil
 }
-func (*adapterTestEngine) Signal(context.Context, ocihelper.SignalRequest) error { return nil }
-func (engine *adapterTestEngine) Watch(_ context.Context, _ ocihelper.WatchRequest, emit func(ocihelper.WatchEvent) error) error {
+func (engine *adapterTestEngine) Signal(ctx context.Context, request ocihelper.SignalRequest) error {
+	engine.mu.Lock()
+	engine.signals = append(engine.signals, request.Signal)
+	watchSignals := engine.watchSignals
+	ignore := request.Signal == ocihelper.SignalTERM && engine.ignoreTERM || request.Signal == ocihelper.SignalKILL && engine.ignoreKILL
+	block := engine.blockSignal
+	engine.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if watchSignals != nil && !ignore {
+		watchSignals <- request.Signal
+	}
+	return nil
+}
+func (engine *adapterTestEngine) Watch(ctx context.Context, _ ocihelper.WatchRequest, emit func(ocihelper.WatchEvent) error) error {
 	if engine.bridgeExchange != nil {
 		if err := <-engine.bridgeExchange; err != nil {
 			return err
@@ -810,6 +1036,14 @@ func (engine *adapterTestEngine) Watch(_ context.Context, _ ocihelper.WatchReque
 	}
 	if err := emit(ocihelper.WatchEvent{Kind: ocihelper.WatchProgress, Log: &ocihelper.LogFrame{Stream: "stdout", Sequence: 0, Bytes: []byte("frame"), Checksum: "9dff50df08c635815f4b19da10f756605a34a79a48d4ba48712782502975a70e"}}); err != nil {
 		return err
+	}
+	if engine.watchSignals != nil {
+		signal := <-engine.watchSignals
+		engine.watch = ocihelper.WatchResponse{Signal: signal, TerminationCause: "agent"}
+	}
+	if engine.watchErrorOnCancel {
+		<-ctx.Done()
+		return errors.New("use of closed network connection")
 	}
 	return emit(ocihelper.WatchEvent{Kind: ocihelper.WatchComplete, Result: &engine.watch})
 }

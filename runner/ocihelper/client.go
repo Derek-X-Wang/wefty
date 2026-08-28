@@ -226,7 +226,7 @@ func (session *Session) heartbeatPump() {
 		err := session.flushHeartbeat(ctx)
 		cancel()
 		if err != nil {
-			session.markLost(err)
+			session.markLost(runtimeLossError(err))
 			_ = session.control.Close()
 			return
 		}
@@ -330,8 +330,7 @@ func (session *Session) ImportImage(ctx context.Context, request EnsureImageRequ
 	}
 	defer connection.Close()
 	if err := decodeResponse(wire, &struct{}{}); err != nil {
-		session.markStaleResponse(err)
-		return err
+		return session.markOperationFailure(ctx, err)
 	}
 	copyDone := make(chan error, 1)
 	var closeSource sync.Once
@@ -351,7 +350,7 @@ func (session *Session) ImportImage(ctx context.Context, request EnsureImageRequ
 		}
 		copyDone <- copyErr
 	}()
-	streamErr := session.receiveImageEvents(wire, receive)
+	streamErr := session.receiveImageEvents(ctx, wire, receive)
 	if streamErr != nil {
 		_ = connection.Close()
 		closeArchive()
@@ -366,18 +365,18 @@ func (session *Session) ImportImage(ctx context.Context, request EnsureImageRequ
 	return nil
 }
 
-func (session *Session) receiveImageEvents(wire *framedConn, receive func(EnsureImageEvent) error) error {
+func (session *Session) receiveImageEvents(ctx context.Context, wire *framedConn, receive func(EnsureImageEvent) error) error {
 	for {
 		var response frame
 		if err := wire.read(&response); err != nil {
-			return fmt.Errorf("receive OCI helper image stream: %w", err)
+			err = fmt.Errorf("receive OCI helper image stream: %w", err)
+			return session.markOperationFailure(ctx, err)
 		}
 		if response.Version != session.client.protocolVersion() {
 			return &RPCError{Code: CodeVersionMismatch, Message: "helper response used an unsupported version"}
 		}
 		if response.Error != nil {
-			session.markStaleResponse(response.Error)
-			return response.Error
+			return session.markOperationFailure(ctx, response.Error)
 		}
 		if !response.OK {
 			return errors.New("OCI helper returned neither success nor error")
@@ -465,8 +464,7 @@ func (session *Session) call(ctx context.Context, method Method, request, respon
 	}
 	defer connection.Close()
 	err = decodeResponse(wire, response)
-	session.markOperationFailure(ctx, err)
-	return err
+	return session.markOperationFailure(ctx, err)
 }
 
 func (session *Session) stream(ctx context.Context, method Method, request any, acknowledge bool, receive func(*framedConn, frame) error) error {
@@ -479,15 +477,13 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 		var response frame
 		if err := wire.read(&response); err != nil {
 			err = fmt.Errorf("receive OCI helper stream: %w", err)
-			session.markOperationFailure(ctx, err)
-			return err
+			return session.markOperationFailure(ctx, err)
 		}
 		if response.Version != session.client.protocolVersion() {
 			return &RPCError{Code: CodeVersionMismatch, Message: "helper response used an unsupported version"}
 		}
 		if response.Error != nil {
-			session.markStaleResponse(response.Error)
-			return response.Error
+			return session.markOperationFailure(ctx, response.Error)
 		}
 		if !response.OK {
 			return errors.New("OCI helper returned neither success nor error")
@@ -500,7 +496,8 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 		}
 		if acknowledge {
 			if err := writeAll(connection, []byte{1}); err != nil {
-				return fmt.Errorf("acknowledge OCI helper stream event: %w", err)
+				err = fmt.Errorf("acknowledge OCI helper stream event: %w", err)
+				return session.markOperationFailure(ctx, err)
 			}
 		}
 	}
@@ -512,14 +509,14 @@ func (session *Session) openStream(ctx context.Context, method Method, request a
 		return nil, err
 	}
 	if err := decodeResponse(wire, &struct{}{}); err != nil {
-		session.markOperationFailure(ctx, err)
+		err = session.markOperationFailure(ctx, err)
 		_ = connection.Close()
 		return nil, err
 	}
 	if _, err := connection.Write([]byte{1}); err != nil {
 		_ = connection.Close()
 		err = fmt.Errorf("acknowledge OCI helper stream: %w", err)
-		session.markOperationFailure(ctx, err)
+		err = session.markOperationFailure(ctx, err)
 		return nil, err
 	}
 	if readyMarker != 0 {
@@ -527,7 +524,7 @@ func (session *Session) openStream(ctx context.Context, method Method, request a
 		if _, err := io.ReadFull(connection, marker[:]); err != nil {
 			_ = connection.Close()
 			err = fmt.Errorf("await OCI helper stream backend: %w", err)
-			session.markOperationFailure(ctx, err)
+			err = session.markOperationFailure(ctx, err)
 			return nil, err
 		}
 		if marker[0] != readyMarker {
@@ -561,26 +558,41 @@ func (err *StreamSetupCancelledError) Error() string {
 }
 func (err *StreamSetupCancelledError) Unwrap() error { return err.Cause }
 
-func (session *Session) markStaleResponse(err error) {
-	var rpcErr *RPCError
-	if errors.As(err, &rpcErr) && rpcErr.Code == CodeSessionStale {
-		session.markLost(err)
-	}
-}
-
 // markOperationFailure turns transport replacement/error into a synchronous
 // loss of session authority. Caller cancellation and ordinary helper RPC
 // refusals do not invalidate an otherwise healthy helper session.
-func (session *Session) markOperationFailure(ctx context.Context, err error) {
+func (session *Session) markOperationFailure(ctx context.Context, err error) error {
 	if err == nil {
-		return
+		return nil
 	}
-	session.markStaleResponse(err)
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
 	var rpcErr *RPCError
-	if errors.As(err, &rpcErr) || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return
+	if errors.As(err, &rpcErr) && !rpcErrorProvesRuntimeLoss(rpcErr) {
+		return err
 	}
-	session.markLost(err)
+	loss := runtimeLossError(err)
+	session.markLost(loss)
+	return loss
+}
+
+func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
+	if err == nil {
+		return false
+	}
+	if err.Code == CodeSessionStale || err.Code == CodeEngineFailure {
+		return true
+	}
+	return err.ImageFailure != nil && err.ImageFailure.Kind == ImageFailureEngineLoss
+}
+
+func runtimeLossError(err error) error {
+	var loss *RuntimeLossError
+	if errors.As(err, &loss) {
+		return err
+	}
+	return &RuntimeLossError{Cause: err}
 }
 
 func (session *Session) markLost(err error) {
@@ -610,15 +622,15 @@ func (session *Session) dialRequest(ctx context.Context, method Method, request 
 	connection, err := session.client.Dial(ctx)
 	if err != nil {
 		err = fmt.Errorf("dial OCI helper RPC: %w", err)
-		session.markOperationFailure(ctx, err)
-		return nil, nil, err
+		return nil, nil, session.markOperationFailure(ctx, err)
 	}
 	if err := applyContextDeadline(ctx, connection); err != nil {
 		_ = connection.Close()
 		return nil, nil, err
 	}
-	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
-	connection = &clientOperationConn{Conn: connection, stop: stop}
+	rawConnection := connection
+	stop := context.AfterFunc(ctx, func() { _ = rawConnection.Close() })
+	connection = &clientOperationConn{Conn: rawConnection, stop: stop}
 	body, err := marshalBody(request)
 	if err != nil {
 		_ = connection.Close()
@@ -630,7 +642,8 @@ func (session *Session) dialRequest(ctx context.Context, method Method, request 
 		SessionCapability: session.capability, Body: body,
 	}); err != nil {
 		_ = connection.Close()
-		return nil, nil, fmt.Errorf("send OCI helper %s: %w", method, err)
+		err = fmt.Errorf("send OCI helper %s: %w", method, err)
+		return nil, nil, session.markOperationFailure(ctx, err)
 	}
 	return connection, wire, nil
 }
