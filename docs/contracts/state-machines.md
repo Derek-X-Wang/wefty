@@ -273,6 +273,30 @@ acknowledgement without blocking heartbeat, registration, or watch.
 Session-bound control take-over and tenure arbitration remain separate
 contracts.
 
+The private Computer front door accepts only `GET /websockify` with exactly the
+`binary` WebSocket subprotocol. It authenticates every accepted connection with
+`Fabric.WhoIs`, acquires the authorization lease above, dials only the
+helper-returned `view` endpoint, upgrades the client, and durably records
+`session_open` before forwarding any bytes. A
+control-authorized admission retains a session-bound take capability but does
+not dial `control`; #179 owns invoking that capability and controller tenure.
+Text frames, client-supplied authority selectors, machine principals, stale
+policy, identity revalidation failure, downgrade/revocation, attempt authority
+loss, and the one-hour cap all close both relay legs. The authorization lease
+releases only after relay closure and a `session_close` upload has been
+attempted, preserving the revocation acknowledgement barrier.
+Until a front door is actively published, the Computer projection returns an
+explicitly null `display_endpoint`; it never guesses or publishes a placeholder
+URL.
+
+L1 stores the immutable take-over vocabulary `admission_denied`,
+`session_open`, `session_close`, `control_acquired`, `control_released`, and
+`admin_overrode`. Uploads are idempotent under `(attempt_id, event_id)` and
+authenticated by the attempt fence, but the durable row and response never
+contain that fence, display bytes, input data, or endpoint data. L1 derives the
+attempt authority generation; session events retain Fabric, person, device,
+authorized role, admitted mode, policy revision, time, session, and reason.
+
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:
 

@@ -325,6 +325,38 @@
         },
         "description": "Assertion-derived receipt emitted from installed memory only after every affected authorization lease releases."
       },
+      "ComputerTakeoverAuditEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["event_id", "kind", "computer_id", "job_id", "attempt_id", "occurred_at"],
+        "properties": {
+          "event_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "kind": { "enum": ["admission_denied", "session_open", "session_close", "control_acquired", "control_released", "admin_overrode"] },
+          "computer_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "job_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "attempt_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "session_id": { "type": "string", "maxLength": 255 },
+          "fabric_id": { "type": "string", "maxLength": 255 },
+          "user_id": { "type": "string", "maxLength": 255 },
+          "device_id": { "type": "string", "maxLength": 255 },
+          "authorized_role": { "enum": ["view", "control"] },
+          "admitted_mode": { "enum": ["view", "controller"] },
+          "policy_revision": { "type": "integer", "minimum": 1 },
+          "occurred_at": { "type": "string", "format": "date-time" },
+          "reason": { "type": "string", "maxLength": 255 },
+          "authority_generation": { "type": "integer", "minimum": 0, "readOnly": true }
+        },
+        "description": "Immutable identity/policy evidence only. Display data, input data, endpoints, and fencing tokens are forbidden. Every session opens in view; control events are reserved for the session-bound tenure contract."
+      },
+      "ComputerTakeoverAuditReceipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["event", "replayed"],
+        "properties": {
+          "event": { "$ref": "#/components/schemas/ComputerTakeoverAuditEvent" },
+          "replayed": { "type": "boolean" }
+        }
+      },
       "ComputerIntent": {
         "type": "object",
         "additionalProperties": false,
@@ -362,7 +394,7 @@
         "required": [
           "computer_id", "name", "placement_node_id", "grants", "storage_id", "storage_generation", "desired_disk_bytes",
           "desired_state", "intent_revision", "applied_revision", "current_job_id",
-          "current_spec_revision", "reconfiguration_phase", "current_job", "created_at", "updated_at"
+          "current_spec_revision", "reconfiguration_phase", "display_endpoint", "current_job", "created_at", "updated_at"
         ],
         "properties": {
           "computer_id": { "type": "string", "minLength": 1 },
@@ -386,6 +418,10 @@
           "current_spec_revision": { "type": "integer", "minimum": 1 },
           "reconfiguration_phase": { "enum": ["stable", "projecting", "resetting", "removing"] },
           "reconfiguration_revision": { "type": "integer", "minimum": 1 },
+          "display_endpoint": {
+            "type": ["string", "null"],
+            "description": "Private take-over front-door endpoint. Null until the admission module is active; never a placeholder URL."
+          },
           "current_job": { "$ref": "#/components/schemas/Job" },
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" }

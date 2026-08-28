@@ -488,6 +488,27 @@ CREATE TABLE IF NOT EXISTS computer_policy_installations (
   installed_ns INTEGER NOT NULL,
   PRIMARY KEY(node_id, boot_session_id, policy_generation)
 );
+CREATE TABLE IF NOT EXISTS computer_takeover_audit (
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+  event_id TEXT NOT NULL,
+  event_kind TEXT NOT NULL CHECK(event_kind IN ('admission_denied', 'session_open', 'session_close', 'control_acquired', 'control_released', 'admin_overrode')),
+  computer_id TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL,
+  fabric_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  authorized_role TEXT NOT NULL CHECK(authorized_role IN ('', 'view', 'control')),
+  admitted_mode TEXT NOT NULL CHECK(admitted_mode IN ('', 'view', 'controller')),
+  policy_revision INTEGER NOT NULL CHECK(policy_revision >= 0),
+  authority_generation INTEGER NOT NULL CHECK(authority_generation >= 0),
+  occurred_ns INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  PRIMARY KEY(attempt_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS computer_takeover_audit_computer_time
+  ON computer_takeover_audit(computer_id, occurred_ns, attempt_id, event_id);
 CREATE TABLE IF NOT EXISTS service_restart_requests (
   job_id TEXT NOT NULL REFERENCES service_jobs(job_id) ON DELETE CASCADE,
   idempotency_key TEXT NOT NULL,

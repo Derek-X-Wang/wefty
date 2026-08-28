@@ -188,6 +188,18 @@ func (c *Client) SetAttemptPublication(
 	return job, err
 }
 
+func (c *Client) AppendComputerTakeoverAudit(
+	ctx context.Context,
+	computerID, jobID, attemptID string,
+	request l1.ComputerTakeoverAuditRequest,
+) (l1.ComputerTakeoverAuditReceipt, error) {
+	var receipt l1.ComputerTakeoverAuditReceipt
+	path := "/v1/agent/computers/" + url.PathEscape(computerID) + "/jobs/" + url.PathEscape(jobID) +
+		"/attempts/" + url.PathEscape(attemptID) + "/takeover-audit"
+	err := c.post(ctx, path, request, &receipt)
+	return receipt, err
+}
+
 // AcknowledgeRemoval attests that local deletion has already completed. The
 // control plane never asks this client to inspect or delete a filesystem path.
 func (c *Client) AcknowledgeRemoval(ctx context.Context, jobID string, request l1.RemovalAcknowledgementRequest) (l1.Job, error) {

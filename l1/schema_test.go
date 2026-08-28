@@ -84,6 +84,11 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 		"computer_policy_installations": {
 			"node_id", "boot_session_id", "policy_generation", "policy_revision", "snapshot_digest", "installed_ns",
 		},
+		"computer_takeover_audit": {
+			"attempt_id", "event_id", "event_kind", "computer_id", "job_id", "session_id", "fabric_id",
+			"user_id", "device_id", "authorized_role", "admitted_mode", "policy_revision",
+			"authority_generation", "occurred_ns", "reason", "request_hash",
+		},
 		"service_restart_requests": {"job_id", "idempotency_key", "request_hash", "created_ns"},
 		"service_log_truncations": {
 			"job_id", "bound_kind", "evicted_event_count", "evicted_byte_count",

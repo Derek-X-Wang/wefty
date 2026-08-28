@@ -376,6 +376,54 @@ type PublicationRequest struct {
 	Ready        *bool  `json:"ready"`
 }
 
+// ComputerTakeoverAuditEventKind is the closed, immutable take-over evidence
+// vocabulary. Ticket #178 emits admission/session events; the control events
+// are reserved for the session-bound tenure implementation in #179.
+type ComputerTakeoverAuditEventKind string
+
+const (
+	ComputerTakeoverAdmissionDenied ComputerTakeoverAuditEventKind = "admission_denied"
+	ComputerTakeoverSessionOpen     ComputerTakeoverAuditEventKind = "session_open"
+	ComputerTakeoverSessionClose    ComputerTakeoverAuditEventKind = "session_close"
+	ComputerTakeoverControlAcquired ComputerTakeoverAuditEventKind = "control_acquired"
+	ComputerTakeoverControlReleased ComputerTakeoverAuditEventKind = "control_released"
+	ComputerTakeoverAdminOverrode   ComputerTakeoverAuditEventKind = "admin_overrode"
+)
+
+// ComputerTakeoverAuditEvent contains identity and policy evidence only. It
+// deliberately has no fencing token, display bytes, input data, or endpoint.
+type ComputerTakeoverAuditEvent struct {
+	EventID        string                         `json:"event_id"`
+	Kind           ComputerTakeoverAuditEventKind `json:"kind"`
+	ComputerID     string                         `json:"computer_id"`
+	JobID          string                         `json:"job_id"`
+	AttemptID      string                         `json:"attempt_id"`
+	SessionID      string                         `json:"session_id,omitempty"`
+	FabricID       string                         `json:"fabric_id,omitempty"`
+	UserID         string                         `json:"user_id,omitempty"`
+	DeviceID       string                         `json:"device_id,omitempty"`
+	AuthorizedRole ComputerGrantPermission        `json:"authorized_role,omitempty"`
+	AdmittedMode   string                         `json:"admitted_mode,omitempty"`
+	PolicyRevision int64                          `json:"policy_revision,omitempty"`
+	OccurredAt     time.Time                      `json:"occurred_at"`
+	Reason         string                         `json:"reason,omitempty"`
+	// AuthorityGeneration is derived by L1 from the fenced attempt and never
+	// accepted from the uploader.
+	AuthorityGeneration int64 `json:"authority_generation,omitempty"`
+}
+
+type ComputerTakeoverAuditRequest struct {
+	// FencingToken authenticates the upload but is never copied into the
+	// durable event or any operator response.
+	FencingToken string                     `json:"fencing_token"`
+	Event        ComputerTakeoverAuditEvent `json:"event"`
+}
+
+type ComputerTakeoverAuditReceipt struct {
+	Event    ComputerTakeoverAuditEvent `json:"event"`
+	Replayed bool                       `json:"replayed"`
+}
+
 type HeartbeatRequest struct {
 	BootSessionID        string                        `json:"boot_session_id"`
 	Capabilities         map[string]bool               `json:"capabilities"`

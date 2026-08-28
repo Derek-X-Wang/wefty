@@ -34,6 +34,9 @@ func TestComputerOperatorRoutesPreserveCASAndRedaction(t *testing.T) {
 	if containsJSONSecret(body, "never-publish") {
 		t.Fatalf("Computer response leaked SensitiveEnv: %s", body)
 	}
+	if !bytes.Contains(body, []byte(`"display_endpoint":null`)) {
+		t.Fatalf("inactive Computer response did not publish an explicit null display endpoint: %s", body)
+	}
 	var computer Computer
 	if err := json.Unmarshal(body, &computer); err != nil {
 		t.Fatal(err)

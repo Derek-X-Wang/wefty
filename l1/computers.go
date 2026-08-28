@@ -87,9 +87,12 @@ type Computer struct {
 	CurrentSpecRevision     int64                        `json:"current_spec_revision"`
 	ReconfigurationPhase    ComputerReconfigurationPhase `json:"reconfiguration_phase"`
 	ReconfigurationRevision *int64                       `json:"reconfiguration_revision,omitempty"`
-	CurrentJob              Job                          `json:"current_job"`
-	CreatedAt               time.Time                    `json:"created_at"`
-	UpdatedAt               time.Time                    `json:"updated_at"`
+	// DisplayEndpoint remains explicitly null until an active private
+	// take-over front door has been published. It is never a placeholder URL.
+	DisplayEndpoint *string   `json:"display_endpoint"`
+	CurrentJob      Job       `json:"current_job"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type CreateComputerRequest struct {
