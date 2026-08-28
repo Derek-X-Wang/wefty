@@ -506,6 +506,41 @@ type ComputerStorageResetRequest struct {
 
 type ComputerStorageResetReceipt = contract.ComputerStorageResetReceipt
 
+// ComputerBackupper owns the physical source-node copy mechanics behind the
+// runtime-neutral agent seam. L1 owns cap, intent, resume, and pruning policy.
+type ComputerBackupper interface {
+	CreateComputerBackup(context.Context, ComputerBackupRequest) (ComputerBackupCopyReceipt, error)
+	DeleteComputerBackupCopy(context.Context, ComputerBackupCopyRemovalRequest) (ComputerBackupCopyRemovalReceipt, error)
+}
+
+type ComputerBackupRequest struct {
+	BackupID          string
+	CopyID            string
+	Storage           ComputerStorage
+	NodeID            string
+	BootSessionID     string
+	RootInstanceID    string
+	JobID             string
+	OperationRevision int64
+	CleanupFence      string
+}
+
+type ComputerBackupCopyReceipt = contract.ComputerBackupCopyReceipt
+
+type ComputerBackupCopyRemovalRequest struct {
+	BackupID          string
+	CopyID            string
+	Storage           ComputerStorage
+	NodeID            string
+	BootSessionID     string
+	RootInstanceID    string
+	OperationRevision int64
+	CleanupFence      string
+	Superseded        bool
+}
+
+type ComputerBackupCopyRemovalReceipt = contract.ComputerBackupCopyRemovalReceipt
+
 // OutputSink receives raw output events. Calls may be concurrent across
 // streams, so implementations must provide any required synchronization.
 type OutputSink interface {

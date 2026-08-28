@@ -51,6 +51,8 @@ const (
 	MethodInventoryRemoval   Method = "InventoryRemoval"
 	MethodAttestRemoval      Method = "AttestRemoval"
 	MethodResetStorage       Method = "ResetComputerStorage"
+	MethodCreateBackup       Method = "CreateComputerBackup"
+	MethodDeleteBackup       Method = "DeleteComputerBackupCopy"
 	MethodVerify             Method = "Verify"
 	MethodSweep              Method = "Sweep"
 	MethodDialAttemptPort    Method = "DialAttemptPort"
@@ -973,6 +975,43 @@ type ComputerStorageResetReceipt = contract.ComputerStorageResetReceipt
 type ResetComputerStorageResponse struct {
 	Verified bool                        `json:"verified"`
 	Receipt  ComputerStorageResetReceipt `json:"receipt"`
+}
+
+type ComputerBackupAuthority struct {
+	NodeID            string `json:"node_id"`
+	BootSessionID     string `json:"boot_session_id"`
+	HelperGeneration  uint64 `json:"helper_generation"`
+	RootInstanceID    string `json:"root_instance_id"`
+	JobID             string `json:"job_id"`
+	OperationRevision int64  `json:"operation_revision"`
+	CleanupFence      string `json:"cleanup_fence"`
+}
+
+type CreateComputerBackupRequest struct {
+	BackupID  string                   `json:"backup_id"`
+	CopyID    string                   `json:"copy_id"`
+	Storage   ComputerStorageReference `json:"storage"`
+	Authority ComputerBackupAuthority  `json:"authority"`
+}
+
+type ComputerBackupCopyReceipt = contract.ComputerBackupCopyReceipt
+
+type CreateComputerBackupResponse struct {
+	Receipt ComputerBackupCopyReceipt `json:"receipt"`
+}
+
+type DeleteComputerBackupCopyRequest struct {
+	BackupID   string                   `json:"backup_id"`
+	CopyID     string                   `json:"copy_id"`
+	Storage    ComputerStorageReference `json:"storage"`
+	Authority  ComputerBackupAuthority  `json:"authority"`
+	Superseded bool                     `json:"superseded"`
+}
+
+type ComputerBackupCopyRemovalReceipt = contract.ComputerBackupCopyRemovalReceipt
+
+type DeleteComputerBackupCopyResponse struct {
+	Receipt ComputerBackupCopyRemovalReceipt `json:"receipt"`
 }
 
 type VerifyScope string

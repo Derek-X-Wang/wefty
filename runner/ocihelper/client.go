@@ -481,6 +481,18 @@ func (session *Session) ResetComputerStorage(ctx context.Context, request ResetC
 	return response, err
 }
 
+func (session *Session) CreateComputerBackup(ctx context.Context, request CreateComputerBackupRequest) (CreateComputerBackupResponse, error) {
+	var response CreateComputerBackupResponse
+	err := session.call(ctx, MethodCreateBackup, request, &response)
+	return response, err
+}
+
+func (session *Session) DeleteComputerBackupCopy(ctx context.Context, request DeleteComputerBackupCopyRequest) (DeleteComputerBackupCopyResponse, error) {
+	var response DeleteComputerBackupCopyResponse
+	err := session.call(ctx, MethodDeleteBackup, request, &response)
+	return response, err
+}
+
 func (session *Session) Verify(ctx context.Context, request VerifyRequest) (VerifyResponse, error) {
 	var response VerifyResponse
 	err := session.call(ctx, MethodVerify, request, &response)

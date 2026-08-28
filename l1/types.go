@@ -128,6 +128,11 @@ type RemovalDirective struct {
 	RootInstanceID             string                           `json:"root_instance_id"`
 	ComputerStorage            *ComputerStorageClaim            `json:"computer_storage,omitempty"`
 	ComputerStorageGenerations *ComputerStorageGenerationClaims `json:"computer_storage_generations,omitempty"`
+	ComputerBackupCopies       *ComputerBackupCopyClaims        `json:"computer_backup_copies,omitempty"`
+}
+
+type ComputerBackupCopyClaims struct {
+	Copies []ComputerBackupPruneDirective `json:"copies"`
 }
 
 type ComputerStorageGenerationClaims struct {
@@ -251,6 +256,8 @@ type HeartbeatResponse struct {
 	Node
 	RemovalDirectives      []RemovalDirective              `json:"removal_directives"`
 	StorageResetDirectives []ComputerStorageResetDirective `json:"storage_reset_directives"`
+	BackupDirectives       []ComputerBackupDirective       `json:"backup_directives"`
+	BackupPruneDirectives  []ComputerBackupPruneDirective  `json:"backup_prune_directives"`
 	ComputerPolicy         *ComputerPolicySnapshot         `json:"computer_policy,omitempty"`
 }
 

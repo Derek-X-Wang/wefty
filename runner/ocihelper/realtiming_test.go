@@ -68,6 +68,7 @@ func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
 	computerAuthority.AttemptID = "realtime-computer-attempt"
 	computerAuthority.Class = "service"
 	computerRequest := testRunRequest(computerAuthority, 5*time.Second)
+	computerRequest.Workload.Computer = true
 	computerRequest.Workload.ManagedVolumes = testComputerManagedVolumes()
 	computerRequest.AllocateEndpoints = []string{"view", "control"}
 	if _, err := session.Run(ctx, computerRequest); err != nil {
@@ -78,6 +79,19 @@ func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
 	}
 	if _, err := session.Delete(ctx, DeleteRequest{Authority: computerAuthority}); err != nil {
 		t.Fatal(err)
+	}
+	backupRequest := CreateComputerBackupRequest{BackupID: "realtime-backup", CopyID: "realtime-copy",
+		Storage: ComputerStorageReference{ComputerID: "realtime-computer", StorageID: "realtime-storage",
+			StorageGeneration: 1, IntentRevision: 2, DiskBytes: 8 << 30},
+		Authority: ComputerBackupAuthority{NodeID: "realtime-node", BootSessionID: "realtime-boot",
+			HelperGeneration: session.Handshake().SessionGeneration, RootInstanceID: "realtime-root",
+			JobID: "realtime-computer-job", OperationRevision: 2, CleanupFence: "realtime-backup-fence"}}
+	if _, err := session.CreateComputerBackup(ctx, backupRequest); err != nil {
+		t.Fatal(err)
+	}
+	backupRequest.Authority.CleanupFence = "realtime-prune-fence"
+	if removed, err := session.DeleteComputerBackupCopy(ctx, DeleteComputerBackupCopyRequest(backupRequest)); err != nil || !removed.Receipt.Absent {
+		t.Fatalf("real helper process Backup prune = %+v err=%v", removed, err)
 	}
 }
 

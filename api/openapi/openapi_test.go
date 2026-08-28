@@ -94,9 +94,12 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 		"/v1/computers/{computer_id}",
 		"/v1/computers/{computer_id}/intents",
 		"/v1/computers/{computer_id}/desired-state",
+		"/v1/computers/{computer_id}/backup-cap",
 		"/v1/computers/{computer_id}/restart",
 		"/v1/computers/{computer_id}/storage-reset",
 		"/v1/computers/{computer_id}/storage-generations",
+		"/v1/computers/{computer_id}/backups",
+		"/v1/computers/{computer_id}/backups/{backup_id}/prune",
 		"/v1/computers/{computer_id}/projections",
 		"/v1/computers/{computer_id}/remove",
 	} {
@@ -112,7 +115,7 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 	for _, field := range []string{
 		"computer_id", "storage_id", "storage_generation", "desired_disk_bytes", "desired_state", "intent_revision",
 		"applied_revision", "current_job_id", "current_spec_revision",
-		"reconfiguration_phase", "current_job",
+		"backup_cap", "reconfiguration_phase", "current_job",
 	} {
 		if !required[field] {
 			t.Errorf("Computer schema does not require %q", field)
@@ -131,6 +134,11 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 	if _, present := schemas["ComputerStorageGenerationList"]; !present {
 		t.Fatal("common schema is missing Computer Storage generation evidence")
 	}
+	for _, name := range []string{"StorageProvenance", "BackupCopy", "Backup", "BackupList", "ComputerBackupOperationOutcome", "ComputerBackupDirective", "ComputerBackupPruneDirective"} {
+		if _, present := schemas[name]; !present {
+			t.Errorf("common schema is missing %s", name)
+		}
+	}
 	createComputer := object(t, object(t, paths["/v1/computers"], "create Computer path")["post"], "create Computer")
 	requestBody := object(t, createComputer["requestBody"], "create Computer request body")
 	content := object(t, requestBody["content"], "create Computer content")
@@ -139,6 +147,45 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 	requestProperties := object(t, requestSchema["properties"], "create Computer request properties")
 	if _, forgeable := requestProperties["actor"]; forgeable {
 		t.Fatal("Computer actor must derive from authenticated Fabric identity")
+	}
+}
+
+func TestColdBackupContractsPublishAgentReceiptsAndStandingWork(t *testing.T) {
+	t.Parallel()
+	agent := readObject(t, "l1-agent.v1.json")
+	paths := object(t, agent["paths"], "agent paths")
+	for _, path := range []string{
+		"/v1/agent/computers/{computer_id}/backup-acknowledgement",
+		"/v1/agent/computers/{computer_id}/backup-prune-acknowledgement",
+	} {
+		if _, present := paths[path]; !present {
+			t.Errorf("L1 agent protocol is missing %s", path)
+		}
+	}
+	common := readObject(t, "common.v1.json")
+	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
+	heartbeat := object(t, schemas["HeartbeatResponse"], "HeartbeatResponse")
+	parts, ok := heartbeat["allOf"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("HeartbeatResponse allOf = %#v", heartbeat["allOf"])
+	}
+	projection := object(t, parts[1], "HeartbeatResponse channel")
+	properties := object(t, projection["properties"], "HeartbeatResponse properties")
+	for _, field := range []string{"backup_directives", "backup_prune_directives"} {
+		if _, present := properties[field]; !present {
+			t.Errorf("HeartbeatResponse is missing %s", field)
+		}
+	}
+	backup := object(t, schemas["Backup"], "Backup")
+	backupProperties := object(t, backup["properties"], "Backup properties")
+	encryption := object(t, backupProperties["encryption"], "Backup encryption")
+	if encryption["const"] != "none" {
+		t.Fatalf("Backup encryption = %#v, want none", encryption["const"])
+	}
+	outcome := object(t, schemas["ComputerBackupOperationOutcome"], "ComputerBackupOperationOutcome")
+	outcomeProperties := object(t, outcome["properties"], "ComputerBackupOperationOutcome properties")
+	if _, present := outcomeProperties["failure_code"]; !present {
+		t.Fatal("Computer Backup outcome omits typed failure_code")
 	}
 }
 

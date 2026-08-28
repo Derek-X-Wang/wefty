@@ -86,6 +86,17 @@ the shared assertion-derived removal attestation over every deterministic disk
 row, validates that every row actually ran and passed, then sends the shared
 cleanup acknowledgement to L1. Crashes retry these idempotent phases; no phase
 starts the Computer.
+
+Cold Backup create and prune are also standing heartbeat work, separate from
+attempt leases. L1 releases a create directive only after disruptive intent
+has stopped the current Job. The agent passes the exact Computer revision and
+`storage_id@generation` to the helper; it never fabricates a resume. The helper
+holds the Storage attachment fence while proving mount and loop absence,
+copying, and digesting. Only helper-derived success or positive-absence failure
+receipts reach L1. Prune removes only the deterministic Wefty-owned copy root
+and likewise requires a positive absence receipt. Composite Computer removal
+executes these copy directives before managed-root and disk cleanup, so a
+superseded staged copy cannot be stranded outside L1 tracking.
 Before a Mac reaches that helper barrier, the supervised wrapper may instead
 publish any closed OCI restriction, including `oci_intent_disabled`,
 `lima_stopped`, `lima_broken`, or `lima_start_timeout`; L1 validates the actual

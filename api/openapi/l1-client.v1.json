@@ -598,7 +598,8 @@
                 "required": ["name", "spec"],
                 "properties": {
                   "name": { "type": "string", "minLength": 1, "maxLength": 255 },
-                  "spec": { "$ref": "./common.v1.json#/components/schemas/JobSpec" }
+                  "spec": { "$ref": "./common.v1.json#/components/schemas/JobSpec" },
+                  "backup_cap": { "type": "integer", "format": "int64", "minimum": 0, "description": "Optional per-Computer override; zero disables Backup creation." }
                 }
               }
             }
@@ -693,6 +694,39 @@
             "description": "Intent accepted; current_job carries the distinct observed lifecycle state.",
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
           },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/backup-cap": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "put": {
+        "operationId": "setComputerBackupCap",
+        "summary": "Set the finite retained Backup cap under Computer intent and Storage CAS",
+        "description": "The cap is revisioned Computer intent. Zero disables new Backup creation; capacity pressure never auto-deletes an existing Backup.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["intent_revision", "storage_id", "storage_generation", "backup_cap"],
+            "properties": {
+              "intent_revision": { "type": "integer", "minimum": 1 },
+              "storage_id": { "type": "string", "minLength": 1 },
+              "storage_generation": { "type": "integer", "minimum": 1 },
+              "backup_cap": { "type": "integer", "format": "int64", "minimum": 0 }
+            }
+          } } }
+        },
+        "responses": {
+          "200": { "description": "Backup cap intent accepted and applied.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
@@ -799,6 +833,78 @@
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/backups": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "get": {
+        "operationId": "listComputerBackups",
+        "summary": "List immutable logical Backups and their managed source-node copy",
+        "responses": {
+          "200": { "description": "Backup records with Storage provenance and physical copy lifecycle.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/BackupList" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      },
+      "post": {
+        "operationId": "createComputerBackup",
+        "summary": "Create a fully allocated cold Backup under exact Computer and Storage authority",
+        "description": "This one disruptive intent auto-quiesces a running Computer, plans the source-node copy before bytes are written, publishes only after full allocation and digest verification, and resumes only unchanged desired-running intent. Stopped stays stopped and stop or remove wins races.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["intent_revision", "storage_id", "storage_generation", "idempotency_key"],
+          "properties": {
+            "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+            "storage_id": { "type": "string", "minLength": 1 },
+            "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Identical creation replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "202": { "description": "Backup intent planned; reconfiguration remains backing_up until the exact receipt is accepted.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/backups/{backup_id}/prune": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } },
+        { "name": "backup_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "pruneComputerBackup",
+        "summary": "Explicitly prune one managed Backup copy",
+        "description": "Capacity never auto-deletes a Backup. The immutable record becomes pruned only after an authority-bound positive absence receipt.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["intent_revision", "storage_id", "storage_generation", "idempotency_key"],
+          "properties": {
+            "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+            "storage_id": { "type": "string", "minLength": 1 },
+            "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Identical prune replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Backup" } } } },
+          "202": { "description": "Physical copy removal planned.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Backup" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
         }
       }

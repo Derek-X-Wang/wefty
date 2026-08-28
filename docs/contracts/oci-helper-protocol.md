@@ -7,6 +7,13 @@ workload-class lifecycle policy crosses this protocol. The Linux and Lima
 transports both present a Unix stream socket; the raw containerd socket remains
 root-only and is never forwarded.
 
+Computer Backup `copy.json` manifests durably record `encryption=none` before
+copy bytes are allocated. ENOSPC and digest-mismatch receipts set `CopyAbsent`
+only after a post-delete `lstat` observes the copy root absent. Composite
+Computer removal first syncs an operation-keyed supersession tombstone while
+holding the shared Backup mutex; a delayed create checks the tombstone before
+writing and fails closed.
+
 On Mac, the Lima 2.2 `vz` template enables only rootful containerd with the
 `overlayfs` snapshotter, maps one explicit operator-owned host root to
 `/mnt/wefty-host`, and forwards only `/run/wefty/oci-helper.sock` into the
@@ -563,6 +570,26 @@ boot, Job, removal-generation, and cleanup-fence authority to the helper. The
 helper requires a matching detached receipt, verifies mount and loop absence,
 deletes the image, manifest, and generation quota directory, and positively
 checks their absence before the agent may acknowledge `removed_verified`.
+
+`CreateComputerBackup` is narrow privileged mechanics for one source-node cold
+copy. Its authority binds Backup, copy, Computer, `storage_id@generation`,
+allocated size, Node, boot, root instance, Job, operation revision, cleanup
+fence, and helper generation. Before reading, the helper requires the exact
+source lock, an accepted detach receipt, and positive mount and loop absence.
+It writes a durable copy manifest before bytes, uses full allocation, copies
+under the attachment fence, compares source and destination SHA-256 digests,
+publishes by rename, and records `encryption=none`. Durable phases cover
+reserve, allocate, copy, digest, manifest, and publish so every injected crash
+resumes from a tracked manifest. ENOSPC or digest mismatch removes the copy
+root, positively checks absence, and returns only the corresponding failure
+receipt; it never modifies the source.
+
+`DeleteComputerBackupCopy` accepts new prune or composite-removal authority but
+requires any present manifest to match the exact copy, source Storage identity,
+Node, and root instance. It deletes only the deterministic Wefty-owned copy
+root and returns `computer_backup_copy_removed` only after positive absence.
+The helper does not choose retention, auto-delete, restore, clone, export,
+encryption, or replica policy.
 
 `AttestRemoval` accepts only an exact service Job/generation plus reconstructed
 attempt authorities and their deterministic resource rows, and is called after

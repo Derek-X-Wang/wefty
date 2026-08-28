@@ -61,6 +61,11 @@ type ComputerStorageResetEngine interface {
 	ResetComputerStorage(context.Context, ResetComputerStorageRequest) (ResetComputerStorageResponse, error)
 }
 
+type ComputerBackupEngine interface {
+	CreateComputerBackup(context.Context, CreateComputerBackupRequest) (CreateComputerBackupResponse, error)
+	DeleteComputerBackupCopy(context.Context, DeleteComputerBackupCopyRequest) (DeleteComputerBackupCopyResponse, error)
+}
+
 // Engine is the helper-internal mechanics seam. No containerd request or type
 // crosses RPC.
 type Engine interface {

@@ -91,6 +91,7 @@ func run() error {
 		serviceStabilityWindow   = flag.Duration("service-stability-window", l1.DefaultServiceStabilityWindow, "continuous service stability required to reset the restart streak")
 		serviceLogRetentionBytes = flag.Int64("service-log-retention-bytes", l1.DefaultServiceLogRetentionBytes, "maximum retained raw log payload per active service")
 		serviceLogRetentionAge   = flag.Duration("service-log-retention-age", l1.DefaultServiceLogRetentionAge, "maximum retained service log age")
+		computerBackupCap        = flag.Int64("computer-backup-cap", 0, "maximum retained cold Backups per Computer; 0 disables creation")
 		fabricName               = flag.String("fabric-name", "wefty://control-plane", "tsnet logical service name")
 		stateDirectory           = flag.String("state-dir", "", "tsnet state directory")
 		authKey                  = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
@@ -114,6 +115,7 @@ func run() error {
 		ServiceStabilityWindow:       *serviceStabilityWindow,
 		ServiceLogRetentionBytes:     *serviceLogRetentionBytes,
 		ServiceLogRetentionAge:       *serviceLogRetentionAge,
+		ComputerBackupCap:            *computerBackupCap,
 	}
 	if *initiateAdminBootstrap && *resetAdminPolicy {
 		return errors.New("-initiate-admin-bootstrap and -reset-admin-policy are mutually exclusive")

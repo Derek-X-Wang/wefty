@@ -81,39 +81,44 @@ type containerdAttempt struct {
 }
 
 type ContainerdEngine struct {
-	client               *containerd.Client
-	imageLeaseDeletes    imageLeaseDeletionManager
-	config               NativeEngineConfig
-	imageOperations      *imageOperationGroup
-	imageNameMu          sync.Mutex
-	imageContentMu       sync.Mutex
-	imageResourceMu      sync.Mutex
-	activeSpools         map[string]struct{}
-	activeLeases         map[string]struct{}
-	attemptImagePins     map[string]imageOperationKey
-	bindingImagePins     map[string]imageOperationKey
-	probeDigests         map[string]struct{}
-	cache                *imageCacheLedger
-	cacheMaxBytes        int64
-	cacheReady           bool
-	cacheStop            chan struct{}
-	cacheDone            chan struct{}
-	closeOnce            sync.Once
-	closeErr             error
-	mu                   sync.Mutex
-	attempts             map[string]*containerdAttempt
-	ports                map[uint16]string
-	nextPort             uint16
-	serviceVolumeMu      sync.Mutex
-	storageResetMu       sync.Mutex
-	diskSystem           computerDiskSystem
-	storageResetHook     func(computerStorageResetPhase) error
-	computerDiskHook     func(computerDiskCheckpoint) error
-	lastProfile          *ProfileReceipt
-	capacityMu           sync.Mutex
-	capacityReservations map[string]*capacityReservation
-	lastAdmission        *ResourceAdmissionReceipt
-	memoryFactsPath      string
+	client                    *containerd.Client
+	imageLeaseDeletes         imageLeaseDeletionManager
+	config                    NativeEngineConfig
+	imageOperations           *imageOperationGroup
+	imageNameMu               sync.Mutex
+	imageContentMu            sync.Mutex
+	imageResourceMu           sync.Mutex
+	activeSpools              map[string]struct{}
+	activeLeases              map[string]struct{}
+	attemptImagePins          map[string]imageOperationKey
+	bindingImagePins          map[string]imageOperationKey
+	probeDigests              map[string]struct{}
+	cache                     *imageCacheLedger
+	cacheMaxBytes             int64
+	cacheReady                bool
+	cacheStop                 chan struct{}
+	cacheDone                 chan struct{}
+	closeOnce                 sync.Once
+	closeErr                  error
+	mu                        sync.Mutex
+	attempts                  map[string]*containerdAttempt
+	ports                     map[uint16]string
+	nextPort                  uint16
+	serviceVolumeMu           sync.Mutex
+	storageResetMu            sync.Mutex
+	computerBackupMu          sync.Mutex
+	diskSystem                computerDiskSystem
+	storageResetHook          func(computerStorageResetPhase) error
+	computerBackupHook        func(computerBackupCheckpoint) error
+	computerBackupAllocate    func(string, int64) error
+	computerBackupCopyN       func(io.Writer, io.Reader, int64) (int64, error)
+	computerBackupRemovalHook func()
+	computerDiskHook          func(computerDiskCheckpoint) error
+	lastProfile               *ProfileReceipt
+	capacityMu                sync.Mutex
+	capacityReservations      map[string]*capacityReservation
+	lastAdmission             *ResourceAdmissionReceipt
+	memoryFactsPath           string
 }
 
 const (

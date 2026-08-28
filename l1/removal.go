@@ -300,6 +300,42 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 			if len(directive.ComputerStorageGenerations.Generations) == 0 {
 				return nil, internalError(errors.New("Computer removal has no Storage generations"), "list Computer Storage removal generations")
 			}
+			backupRows, backupErr := s.db.QueryContext(ctx, `SELECT p.backup_id, p.copy_id, p.computer_id,
+					b.source_storage_id, b.source_generation, b.allocated_size, bc.node_id, bc.root_instance_id,
+					p.intent_revision, p.cleanup_fence, 0
+				FROM computer_backup_prunes p
+				JOIN backups b ON b.backup_id=p.backup_id
+				JOIN backup_copies bc ON bc.copy_id=p.copy_id
+				WHERE p.computer_id=? AND p.status='planned' AND bc.phase='removal_pending'
+				UNION ALL
+				SELECT o.backup_id, o.copy_id, o.computer_id, o.source_storage_id,
+				o.source_generation, o.allocated_size, o.bound_node_id, o.root_instance_id,
+					o.operation_revision, o.cleanup_fence, 1
+				FROM computer_backup_operations o
+				WHERE o.computer_id=? AND o.status='superseded' AND o.acknowledgement_key IS NULL
+				ORDER BY copy_id`, computerID.String, computerID.String)
+			if backupErr != nil {
+				return nil, internalError(backupErr, "list Computer Backup copies for removal")
+			}
+			directive.ComputerBackupCopies = &ComputerBackupCopyClaims{Copies: []ComputerBackupPruneDirective{}}
+			for backupRows.Next() {
+				var copy ComputerBackupPruneDirective
+				if err := backupRows.Scan(&copy.BackupID, &copy.CopyID, &copy.ComputerID,
+					&copy.StorageID, &copy.StorageGeneration, &copy.AllocatedSize,
+					&copy.BoundNodeID, &copy.RootInstanceID, &copy.OperationRevision,
+					&copy.CleanupFence, &copy.Superseded); err != nil {
+					backupRows.Close()
+					return nil, internalError(err, "scan Computer Backup copy removal")
+				}
+				directive.ComputerBackupCopies.Copies = append(directive.ComputerBackupCopies.Copies, copy)
+			}
+			if err := backupRows.Err(); err != nil {
+				backupRows.Close()
+				return nil, internalError(err, "iterate Computer Backup copy removals")
+			}
+			if err := backupRows.Close(); err != nil {
+				return nil, internalError(err, "close Computer Backup copy removals")
+			}
 		}
 		directives = append(directives, directive)
 	}
@@ -379,6 +415,27 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 	}
 	if err := validateMutableAcknowledgement(ctx, tx, identityNodeID, request, removal); err != nil {
 		return Job{}, err
+	}
+	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
+		return Job{}, mapErr
+	} else if mapped {
+		var outstandingCopies, outstandingSuperseded int64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backup_copies bc
+			JOIN backups b ON b.backup_id=bc.backup_id
+			WHERE b.computer_id=? AND bc.phase<>'removed'`, computerID).Scan(&outstandingCopies); err != nil {
+			return Job{}, internalError(err, "count retained Computer Backup copies")
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM computer_backup_operations
+			WHERE computer_id=? AND status='superseded' AND acknowledgement_key IS NULL`, computerID).
+			Scan(&outstandingSuperseded); err != nil {
+			return Job{}, internalError(err, "count superseded Computer Backup copies")
+		}
+		if outstandingCopies != 0 || outstandingSuperseded != 0 {
+			return Job{}, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
+				"computer_id": computerID, "retained_backup_copies": outstandingCopies,
+				"unattested_superseded_copies": outstandingSuperseded,
+			}, "Computer removal requires positive absence for every Backup copy")
+		}
 	}
 	if removal.acknowledgementKey.Valid {
 		if removal.acknowledgementKey.String != request.IdempotencyKey ||

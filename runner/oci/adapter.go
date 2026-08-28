@@ -1706,6 +1706,63 @@ func (adapter *Adapter) ResetComputerStorage(ctx context.Context, request worklo
 		CleanupFence: response.Receipt.CleanupFence, HelperGeneration: response.Receipt.HelperGeneration}, nil
 }
 
+func (adapter *Adapter) CreateComputerBackup(ctx context.Context, request workloadrunner.ComputerBackupRequest) (workloadrunner.ComputerBackupCopyReceipt, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return workloadrunner.ComputerBackupCopyReceipt{}, errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return workloadrunner.ComputerBackupCopyReceipt{}, err
+	}
+	handshake := session.Handshake()
+	response, err := session.CreateComputerBackup(ctx, ocihelper.CreateComputerBackupRequest{
+		BackupID: request.BackupID, CopyID: request.CopyID,
+		Storage: ocihelper.ComputerStorageReference{ComputerID: request.Storage.ComputerID,
+			StorageID: request.Storage.StorageID, StorageGeneration: request.Storage.StorageGeneration,
+			IntentRevision: request.Storage.IntentRevision, DiskBytes: request.Storage.DiskBytes},
+		Authority: ocihelper.ComputerBackupAuthority{NodeID: request.NodeID, BootSessionID: request.BootSessionID,
+			HelperGeneration: handshake.SessionGeneration, RootInstanceID: request.RootInstanceID,
+			JobID: request.JobID, OperationRevision: request.OperationRevision, CleanupFence: request.CleanupFence},
+	})
+	if err != nil {
+		return workloadrunner.ComputerBackupCopyReceipt{}, err
+	}
+	if response.Receipt.ReceiptID == "" || response.Receipt.HelperGeneration == 0 ||
+		(response.Receipt.Kind != "computer_backup_copy_verified" && response.Receipt.Kind != "computer_backup_copy_failed_absent") {
+		return workloadrunner.ComputerBackupCopyReceipt{}, errors.New("OCI helper did not return assertion-derived Computer Backup evidence")
+	}
+	return response.Receipt, nil
+}
+
+func (adapter *Adapter) DeleteComputerBackupCopy(ctx context.Context, request workloadrunner.ComputerBackupCopyRemovalRequest) (workloadrunner.ComputerBackupCopyRemovalReceipt, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return workloadrunner.ComputerBackupCopyRemovalReceipt{}, errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return workloadrunner.ComputerBackupCopyRemovalReceipt{}, err
+	}
+	handshake := session.Handshake()
+	response, err := session.DeleteComputerBackupCopy(ctx, ocihelper.DeleteComputerBackupCopyRequest{
+		BackupID: request.BackupID, CopyID: request.CopyID,
+		Storage: ocihelper.ComputerStorageReference{ComputerID: request.Storage.ComputerID,
+			StorageID: request.Storage.StorageID, StorageGeneration: request.Storage.StorageGeneration,
+			IntentRevision: request.Storage.IntentRevision, DiskBytes: request.Storage.DiskBytes},
+		Authority: ocihelper.ComputerBackupAuthority{NodeID: request.NodeID, BootSessionID: request.BootSessionID,
+			HelperGeneration: handshake.SessionGeneration, RootInstanceID: request.RootInstanceID,
+			OperationRevision: request.OperationRevision, CleanupFence: request.CleanupFence},
+		Superseded: request.Superseded,
+	})
+	if err != nil {
+		return workloadrunner.ComputerBackupCopyRemovalReceipt{}, err
+	}
+	if response.Receipt.Kind != "computer_backup_copy_removed" || response.Receipt.ReceiptID == "" ||
+		!response.Receipt.Absent || response.Receipt.HelperGeneration == 0 {
+		return workloadrunner.ComputerBackupCopyRemovalReceipt{}, errors.New("OCI helper did not positively verify Backup copy absence")
+	}
+	return response.Receipt, nil
+}
+
 func adapterAuthorityKey(authority workloadrunner.AttemptAuthority) string {
 	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", authority.NodeID, authority.BootSessionID, authority.JobID, authority.AttemptID, authority.FencingToken, authority.WorkloadClass, authority.RemovalGeneration)
 }
