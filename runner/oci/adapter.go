@@ -1365,6 +1365,12 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 			})
 			// The helper-owned descriptor is authority for the guest mount.
 			reservedValues[contract.EnvHandoffDir] = contract.OCIContainerHandoffDirectory
+		case workloadrunner.ManagedVolumeServiceData:
+			managedVolumes = append(managedVolumes, ocihelper.ManagedVolumeDescriptor{
+				Kind: ocihelper.ManagedVolumeServiceData,
+			})
+			// The helper-owned descriptor is authority for the guest mount.
+			reservedValues[contract.EnvServiceDir] = contract.OCIContainerServiceDirectory
 		}
 	}
 	reserved := environment(reservedValues)

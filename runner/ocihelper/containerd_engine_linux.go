@@ -97,6 +97,7 @@ type ContainerdEngine struct {
 	attempts          map[string]*containerdAttempt
 	ports             map[uint16]string
 	nextPort          uint16
+	serviceVolumeMu   sync.Mutex
 }
 
 const (
@@ -760,7 +761,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		if err := engine.refreshManagedNetworkFiles(); err != nil {
 			return err
 		}
-		managedSources, managedErr := engine.managedVolumeSources(request)
+		managedSources, managedErr := engine.managedVolumeSourcesForImage(leaseContext, request, root, imageConfig)
 		if managedErr != nil {
 			return managedErr
 		}
@@ -1555,7 +1556,6 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 	}
 	for _, path := range []string{
 		filepath.Join(engine.config.RuntimeRoot, "logs", resources.LogSegmentDirectory),
-		filepath.Join(engine.config.RuntimeRoot, "volumes", resources.ServiceVolumeDirectory),
 	} {
 		if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			failures = append(failures, err)
@@ -1722,7 +1722,7 @@ func readImageRuntimeConfig(ctx context.Context, store content.Store, image cont
 	return ImageRuntimeConfig{User: config.Config.User, Environment: config.Config.Env, Entrypoint: config.Config.Entrypoint, Command: config.Config.Cmd, WorkingDirectory: config.Config.WorkingDir}, nil
 }
 
-func (engine *ContainerdEngine) managedVolumeSources(request RunRequest) (map[ManagedVolumeKind]string, error) {
+func (engine *ContainerdEngine) managedVolumeSourcesForImage(ctx context.Context, request RunRequest, rootfsPath string, image ImageRuntimeConfig) (map[ManagedVolumeKind]string, error) {
 	result := make(map[ManagedVolumeKind]string)
 	for _, volume := range request.Workload.ManagedVolumes {
 		name := ""
@@ -1733,13 +1733,22 @@ func (engine *ContainerdEngine) managedVolumeSources(request RunRequest) (map[Ma
 			root = "handoffs"
 		case ManagedVolumeServiceData:
 			name = request.Resources.ServiceVolumeDirectory
+			root = "service-data"
 		case ManagedVolumeLogSegments:
 			name = request.Resources.LogSegmentDirectory
 		default:
 			return nil, fmt.Errorf("managed volume kind %q is unsupported", volume.Kind)
 		}
 		path := filepath.Join(engine.config.RuntimeRoot, root, name)
-		if err := os.MkdirAll(path, 0o700); err != nil {
+		if volume.Kind == ManagedVolumeServiceData {
+			uid, gid, err := resolveImageOwner(ctx, rootfsPath, image.User)
+			if err != nil {
+				return nil, fmt.Errorf("resolve service data owner: %w", err)
+			}
+			if err := engine.initializeServiceVolume(path, uid, gid); err != nil {
+				return nil, err
+			}
+		} else if err := os.MkdirAll(path, 0o700); err != nil {
 			return nil, err
 		}
 		if volume.Kind == ManagedVolumeHandoff {
@@ -1751,6 +1760,45 @@ func (engine *ContainerdEngine) managedVolumeSources(request RunRequest) (map[Ma
 		result[volume.Kind] = path
 	}
 	return result, nil
+}
+
+func (engine *ContainerdEngine) initializeServiceVolume(path string, uid, gid uint32) error {
+	engine.serviceVolumeMu.Lock()
+	defer engine.serviceVolumeMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create service data root: %w", err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create service data volume: %w", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect service data volume: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("service data volume is not a helper-owned directory")
+	}
+	markerRoot := filepath.Join(engine.config.RuntimeRoot, "service-data-state")
+	if err := os.MkdirAll(markerRoot, 0o700); err != nil {
+		return fmt.Errorf("create service data state root: %w", err)
+	}
+	marker := filepath.Join(markerRoot, filepath.Base(path)+".owner")
+	want := fmt.Sprintf("%d:%d\n", uid, gid)
+	if payload, err := os.ReadFile(marker); err == nil {
+		if string(payload) != want {
+			return fmt.Errorf("service data owner marker is %q, want %q", strings.TrimSpace(string(payload)), strings.TrimSpace(want))
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read service data owner marker: %w", err)
+	}
+	if err := os.Chown(path, int(uid), int(gid)); err != nil {
+		return fmt.Errorf("initialize service data owner %d:%d: %w", uid, gid, err)
+	}
+	if err := os.WriteFile(marker, []byte(want), 0o600); err != nil {
+		return fmt.Errorf("record service data owner: %w", err)
+	}
+	return nil
 }
 
 type staticLogIO struct{ config cio.Config }

@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/leases"
 	contentlocal "github.com/containerd/containerd/v2/plugins/content/local"
@@ -373,7 +374,7 @@ func TestOwnerKeyedHandoffBytesSurviveAttemptsUntilExplicitFinalization(t *testi
 		Resources: ResourceIdentity{HandoffVolumeDirectory: name},
 		Workload:  WorkloadInput{ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "run-owner"}}},
 	}
-	first, err := engine.managedVolumeSources(request)
+	first, err := engine.managedVolumeSourcesForImage(t.Context(), request, "", ImageRuntimeConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +382,7 @@ func TestOwnerKeyedHandoffBytesSurviveAttemptsUntilExplicitFinalization(t *testi
 	if err := os.WriteFile(marker, []byte("handoff bytes\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	second, err := engine.managedVolumeSources(request)
+	second, err := engine.managedVolumeSourcesForImage(t.Context(), request, "", ImageRuntimeConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,6 +396,40 @@ func TestOwnerKeyedHandoffBytesSurviveAttemptsUntilExplicitFinalization(t *testi
 	}
 	if _, err := os.Stat(first[ManagedVolumeHandoff]); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("finalized handoff remains: %v", err)
+	}
+}
+
+func TestServiceDataVolumeInitializesOwnerOnlyOnce(t *testing.T) {
+	root := t.TempDir()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}}
+	resources, err := DeterministicResourceIdentity(AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "service-job", AttemptID: "attempt-1",
+		FencingToken: "fence-1", Class: contract.JobClassService, RemovalGeneration: "attempt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "service-data", resources.ServiceVolumeDirectory)
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	if err := engine.initializeServiceVolume(path, uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	var stat syscall.Stat_t
+	if err := syscall.Stat(path, &stat); err != nil || stat.Uid != uid || stat.Gid != gid {
+		t.Fatalf("service data owner = %d:%d err=%v, want %d:%d", stat.Uid, stat.Gid, err, uid, gid)
+	}
+	marker := filepath.Join(path, "retained")
+	if err := os.WriteFile(marker, []byte("service bytes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.initializeServiceVolume(path, uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	if payload, err := os.ReadFile(marker); err != nil || string(payload) != "service bytes\n" {
+		t.Fatalf("service data after repeated initialization = %q err=%v", payload, err)
+	}
+	if err := engine.initializeServiceVolume(path, uid+1, gid); err == nil {
+		t.Fatal("service data volume was re-owned for a different image identity")
 	}
 }
 

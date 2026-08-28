@@ -47,6 +47,17 @@ func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	if different.LeaseID == first.LeaseID {
 		t.Fatal("a new fence reused the prior deterministic identity")
 	}
+	if different.ServiceVolumeDirectory != first.ServiceVolumeDirectory {
+		t.Fatal("a new attempt changed the stable job-owned service volume identity")
+	}
+	changed.JobID = "job-2"
+	differentJob, err := DeterministicResourceIdentity(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if differentJob.ServiceVolumeDirectory == first.ServiceVolumeDirectory || strings.Contains(first.ServiceVolumeDirectory, authority.JobID) {
+		t.Fatal("service volume identity is not stable, opaque, and job-scoped")
+	}
 }
 
 func TestHandoffVolumeIdentityUsesStableOpaqueOwner(t *testing.T) {

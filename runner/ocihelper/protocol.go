@@ -202,9 +202,11 @@ func (authority AttemptAuthority) key() string {
 	}, "\x00")
 }
 
-// ResourceIdentity deterministically names and labels every per-attempt
-// resource. The digest keeps operator-provided identifiers out of runtime
-// names while labels retain the complete authority tuple for verification.
+// ResourceIdentity deterministically names and labels runtime resources. The
+// attempt tuple names ephemeral resources while the stable job ID names the
+// service data volume that survives attempts. Digests keep operator-provided
+// identifiers out of runtime names while labels retain the complete authority
+// tuple for verification.
 type ResourceIdentity struct {
 	LeaseID                string            `json:"lease_id"`
 	SnapshotID             string            `json:"snapshot_id"`
@@ -224,13 +226,17 @@ func DeterministicResourceIdentity(authority AttemptAuthority) (ResourceIdentity
 	}
 	digest := sha256.Sum256([]byte(authority.key()))
 	suffix := hex.EncodeToString(digest[:16])
+	serviceVolumeDirectory, err := DeterministicServiceVolumeDirectory(authority.JobID)
+	if err != nil {
+		return ResourceIdentity{}, err
+	}
 	return ResourceIdentity{
 		LeaseID: "wefty-lease-" + suffix, SnapshotID: "wefty-snapshot-" + suffix,
 		ContainerID: "wefty-container-" + suffix, TaskID: "wefty-task-" + suffix,
 		ShimID: "wefty-shim-" + suffix, CgroupID: "wefty-cgroup-" + suffix,
 		LogSegmentDirectory:    "wefty-log-segments-" + suffix,
 		HandoffVolumeDirectory: "wefty-handoff-volume-" + suffix,
-		ServiceVolumeDirectory: "wefty-service-volume-" + suffix,
+		ServiceVolumeDirectory: serviceVolumeDirectory,
 		Labels: map[string]string{
 			"io.wefty/node_id": authority.NodeID, "io.wefty/job_id": authority.JobID,
 			"io.wefty/attempt_id": authority.AttemptID, "io.wefty/fencing_token": authority.FencingToken,
@@ -238,6 +244,16 @@ func DeterministicResourceIdentity(authority AttemptAuthority) (ResourceIdentity
 			"io.wefty/removal_generation": authority.RemovalGeneration,
 		},
 	}, nil
+}
+
+// DeterministicServiceVolumeDirectory maps one stable service job identity to
+// helper-owned guest-native storage shared by that job's attempts only.
+func DeterministicServiceVolumeDirectory(jobID string) (string, error) {
+	if jobID == "" || strings.TrimSpace(jobID) != jobID || len(jobID) > 255 || strings.IndexByte(jobID, 0) >= 0 {
+		return "", errors.New("service data job ID must be bounded and non-empty")
+	}
+	digest := sha256.Sum256([]byte("service-data\x00" + jobID))
+	return "wefty-service-volume-" + hex.EncodeToString(digest[:16]), nil
 }
 
 // DeterministicHandoffVolumeDirectory maps the opaque stable owner identity to

@@ -377,10 +377,10 @@ into the ambiguous `engine_failure` bucket.
 
 The helper hashes the complete attempt authority tuple with SHA-256 and uses
 the first 128 bits to derive deterministic names for the lease, snapshot,
-container, task, shim, cgroup, log-segment directory, and service-data volume
-directory. It separately hashes the opaque stable handoff-owner key to derive
-the handoff volume directory, so a retry or explicit rerun never substitutes
-an attempt identity for handoff lineage. Every label-capable attempt resource carries the
+container, task, shim, cgroup, and log-segment directory. It separately hashes
+the stable service job ID to derive its service-data volume and the opaque
+stable handoff-owner key to derive the handoff volume directory, so neither
+durable identity can be replaced by an attempt identity. Every label-capable attempt resource carries the
 unabridged labels:
 
 ```text
@@ -402,6 +402,15 @@ expired direct children with the deterministic handoff prefix. The narrow
 directory and returns success only after a separate absence check. The agent
 calls it after accepted successful completion; future removal work may call the
 same closed operation but gains no general path deletion authority.
+
+Service-data volumes live under their own helper-owned guest-native durable
+root, outside the attempt inventory swept during boot takeover. Before the
+first mount, the helper resolves the image `USER` against the pinned rootfs,
+sets the new directory's primary UID:GID, and durably records that
+initialization. Later attempts require the same recorded owner and never
+re-chown existing data. Attempt `Delete`, session reap, and boot sweep preserve
+the directory; the separate removal-manifest contract owns its eventual
+deletion.
 
 The native Linux engine uses containerd namespace `wefty`, runtime handler
 `io.containerd.runc.v2`, and snapshotter `overlayfs`. It creates the labelled

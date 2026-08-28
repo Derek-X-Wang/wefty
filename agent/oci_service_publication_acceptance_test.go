@@ -184,7 +184,16 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 			RuntimeHandler: ocihelper.DefaultRuntimeHandler,
 			Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
 				Image: contract.OCIImageSpec{Reference: reference, Digest: &digest},
-				Argv:  []string{"/bin/sh", "-c", `trap 'exit 0' TERM; test -f "$WEFTY_SERVICE_DIR/restart-marker" || printf retained >"$WEFTY_SERVICE_DIR/restart-marker"; while :; do sleep 1; done`},
+				Argv: []string{"/bin/sh", "-c", `
+trap 'exit 0' TERM
+test ! -e /rootfs-attempt-marker || exit 92
+prior=0
+if test -f "$WEFTY_SERVICE_DIR/attempt-count"; then prior="$(cat "$WEFTY_SERVICE_DIR/attempt-count")"; fi
+printf 'service-data-prior=%s\n' "$prior"
+printf '%s\n' "$((prior + 1))" >"$WEFTY_SERVICE_DIR/attempt-count"
+touch /rootfs-attempt-marker
+while :; do sleep 1; done
+`},
 			}},
 		}
 	}
@@ -282,6 +291,21 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = waitNativeServiceState(t, store, primary.JobID, contract.JobStopped, 45*time.Second)
+	logs, err := store.GetJobLogs(t.Context(), primary.JobID, "", l1.MaxLogPageLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMarkers := map[string]bool{"service-data-prior=0\n": false, "service-data-prior=1\n": false, "service-data-prior=2\n": false}
+	for _, event := range logs.Events {
+		if _, ok := wantMarkers[string(event.Bytes)]; ok {
+			wantMarkers[string(event.Bytes)] = true
+		}
+	}
+	for marker, found := range wantMarkers {
+		if !found {
+			t.Fatalf("OCI service restart/stop-start logs omitted %q: %+v", marker, logs.Events)
+		}
+	}
 	cancelRun()
 	if err := <-runDone; err != nil {
 		t.Fatalf("L1/agent realtiming shutdown: %v", err)
@@ -414,6 +438,7 @@ func nativeOCIServiceRequest(reference, digest, suffix string, argv []string) wo
 			RemovalGeneration: "attempt",
 		},
 		RuntimeHandler: ocihelper.DefaultRuntimeHandler,
+		ManagedVolumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}},
 		Execution: contract.ExecutionSpec{
 			Env: map[string]string{contract.EnvServiceDir: contract.OCIContainerServiceDirectory},
 			OCI: &contract.OCIExecutionSpec{

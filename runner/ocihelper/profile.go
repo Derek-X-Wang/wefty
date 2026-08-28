@@ -474,6 +474,18 @@ func applyImageUser(ctx context.Context, spec *specs.Spec, rootfsPath, configure
 	return containerdoci.ApplyOpts(ctx, nil, container, spec, containerdoci.WithAdditionalGIDs(lookupUser))
 }
 
+// resolveImageOwner uses the same guest passwd/group resolution as profile
+// construction so service data is initialized for the exact user that runc
+// will execute. It deliberately returns only the primary UID:GID: supplemental
+// groups remain process credentials and never become volume ownership policy.
+func resolveImageOwner(ctx context.Context, rootfsPath, configuredUser string) (uint32, uint32, error) {
+	spec := &specs.Spec{Root: &specs.Root{}, Process: &specs.Process{}}
+	if err := applyImageUser(ctx, spec, rootfsPath, configuredUser); err != nil {
+		return 0, 0, err
+	}
+	return spec.Process.User.UID, spec.Process.User.GID, nil
+}
+
 func explicitIsolationCapabilities() *specs.LinuxCapabilities {
 	allowed := slices.Clone(isolationCapabilities)
 	return &specs.LinuxCapabilities{
