@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -655,6 +656,23 @@ func TestRuntimeManagedVolumesCompileClassPolicyBeforeOCIAdapter(t *testing.T) {
 	}
 	if volumes := runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: contract.JobKindProcess, Class: contract.JobClassService}}}); len(volumes) != 0 {
 		t.Fatalf("process managed volumes = %+v", volumes)
+	}
+}
+
+func TestRuntimeAttemptEndpointsCompileComputerRolesExactly(t *testing.T) {
+	port := 8080
+	computer := contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService, Execution: contract.ExecutionSpec{
+		OCI: &contract.OCIExecutionSpec{Computer: &contract.OCIComputerSpec{}},
+	}}
+	if endpoints := runtimeAttemptEndpoints(computer); !slices.Equal(endpoints, []string{workloadrunner.AttemptEndpointView, workloadrunner.AttemptEndpointControl}) {
+		t.Fatalf("Computer attempt endpoints = %v", endpoints)
+	}
+	service := contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService, PublishedPort: &port}
+	if endpoints := runtimeAttemptEndpoints(service); !slices.Equal(endpoints, []string{workloadrunner.AttemptEndpointService}) {
+		t.Fatalf("ordinary service endpoints = %v", endpoints)
+	}
+	if endpoints := runtimeAttemptEndpoints(contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService}); len(endpoints) != 0 {
+		t.Fatalf("portless service endpoints = %v", endpoints)
 	}
 }
 

@@ -26,6 +26,7 @@ const (
 	DefaultHandoffRoot           = "/tmp/wefty/handoffs"
 	OCIContainerHandoffDirectory = "/wefty/handoff"
 	OCIContainerServiceDirectory = "/wefty/service"
+	OCIContainerControlDirectory = "/wefty/control"
 
 	// StableNodeTagPrefix reserves the routing tag used when a cold rerun
 	// consumes node-local handoff files from an earlier execution.

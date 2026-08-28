@@ -814,6 +814,32 @@ func TestDialAttemptPortProxiesOnlyTheRequestedLoopbackPort(t *testing.T) {
 	}
 }
 
+func TestComputerEndpointEnvironmentOverridesReservedPortsAndOmitsServicePort(t *testing.T) {
+	environment, err := computerEndpointEnvironment([]EnvironmentVariable{
+		{Name: contract.EnvServiceDir, Value: contract.OCIContainerServiceDirectory},
+		{Name: contract.EnvServicePort, Value: "attacker-service"},
+		{Name: contract.EnvComputerViewPort, Value: "attacker-view"},
+		{Name: contract.EnvComputerControlPort, Value: "attacker-control"},
+	}, map[string]uint16{"view": 42111, "control": 42112})
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make(map[string]string, len(environment))
+	for _, variable := range environment {
+		values[variable.Name] = variable.Value
+	}
+	if values[contract.EnvComputerViewPort] != "42111" || values[contract.EnvComputerControlPort] != "42112" ||
+		values[contract.EnvServiceDir] != contract.OCIContainerServiceDirectory {
+		t.Fatalf("Computer reserved environment = %+v", values)
+	}
+	if _, present := values[contract.EnvServicePort]; present {
+		t.Fatalf("Computer retained WEFTY_SERVICE_PORT: %+v", values)
+	}
+	if _, err := computerEndpointEnvironment(nil, map[string]uint16{"view": 42111, "control": 42111}); err == nil {
+		t.Fatal("Computer accepted duplicate endpoint ports")
+	}
+}
+
 func TestDialAttemptPortAllowsClientHalfCloseBeforeFullResponse(t *testing.T) {
 	backend, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {

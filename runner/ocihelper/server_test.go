@@ -434,19 +434,22 @@ func TestCrashAtEveryCreateBoundaryIsSweptBeforeReusedBootSession(t *testing.T) 
 }
 
 func TestWrongVersionAndPeerFailBeforeSessionAuthority(t *testing.T) {
-	engine := newFakeEngine()
-	client, stop := startTestServer(t, engine, ServerConfig{})
-	client.Version = ProtocolVersion + 1
-	_, err := client.OpenSession(t.Context(), testSessionRequest())
-	assertRPCCode(t, err, CodeVersionMismatch)
-	stop()
-	if engine.sessionReapCount() != 0 {
-		t.Fatal("a rejected protocol version minted session authority")
+	for _, version := range []int{ComputerProtocolVersion - 1, ProtocolVersion + 1} {
+		engine := newFakeEngine()
+		client, stop := startTestServer(t, engine, ServerConfig{})
+		client.Version = version
+		_, err := client.OpenSession(t.Context(), testSessionRequest())
+		assertRPCCode(t, err, CodeVersionMismatch)
+		stop()
+		if engine.sessionReapCount() != 0 {
+			t.Fatalf("rejected protocol version %d minted session authority", version)
+		}
 	}
 
-	client, stop = startTestServer(t, engine, ServerConfig{AllowedUIDs: []uint32{uint32(os.Getuid() + 1)}})
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{AllowedUIDs: []uint32{uint32(os.Getuid() + 1)}})
 	defer stop()
-	_, err = client.OpenSession(t.Context(), testSessionRequest())
+	_, err := client.OpenSession(t.Context(), testSessionRequest())
 	assertRPCCode(t, err, CodePeerUnauthenticated)
 	if engine.sessionReapCount() != 0 {
 		t.Fatal("an unauthenticated peer minted session authority")
@@ -692,6 +695,8 @@ func TestNamedEndpointAuthorizationResolvesOnlyTheRequestedName(t *testing.T) {
 	defer session.Close()
 	requireSweep(t, session)
 	request := testRunRequest(testAuthority(), time.Second)
+	request.Authority.Class = contract.JobClassService
+	request.Workload.ManagedVolumes = testComputerManagedVolumes()
 	request.AllocateEndpoints = []string{"view", "control"}
 	if _, err := session.Run(t.Context(), request); err != nil {
 		t.Fatal(err)
@@ -706,6 +711,101 @@ func TestNamedEndpointAuthorizationResolvesOnlyTheRequestedName(t *testing.T) {
 	engine.mu.Unlock()
 	if dial.Name != "control" || dial.Port != 42012 || dial.CgroupID == "" {
 		t.Fatalf("engine dial request = %+v", dial)
+	}
+}
+
+func TestComputerEndpointContractFailsClosed(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	for _, endpoints := range [][]string{
+		nil,
+		{"view"},
+		{"view", "view"},
+		{"view", "service"},
+		{"view", "control", "unexpected"},
+	} {
+		request := testRunRequest(testAuthority(), time.Second)
+		request.Authority.Class = contract.JobClassService
+		request.Workload.ManagedVolumes = testComputerManagedVolumes()
+		request.AllocateEndpoints = endpoints
+		_, err := session.Run(t.Context(), request)
+		assertRPCCode(t, err, CodeInvalidRequest)
+	}
+	oneShot := testRunRequest(testAuthority(), time.Second)
+	oneShot.Workload.ManagedVolumes = testComputerManagedVolumes()
+	oneShot.AllocateEndpoints = []string{"view", "control"}
+	_, err = session.Run(t.Context(), oneShot)
+	assertRPCCode(t, err, CodeInvalidRequest)
+
+	ordinary := testRunRequest(testAuthority(), time.Second)
+	ordinary.Authority.AttemptID = "ordinary-invalid-endpoints"
+	ordinary.AllocateEndpoints = []string{"view", "control"}
+	_, err = session.Run(t.Context(), ordinary)
+	assertRPCCode(t, err, CodeInvalidRequest)
+	if engine.runCount() != 0 {
+		t.Fatal("invalid Computer endpoints entered the engine")
+	}
+}
+
+func TestComputerControlStateRequiresExactLiveComputerAuthority(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+
+	ordinary := testRunRequest(testAuthority(), time.Second)
+	if _, err := session.Run(t.Context(), ordinary); err != nil {
+		t.Fatal(err)
+	}
+	err = session.SetComputerControlState(t.Context(), SetComputerControlStateRequest{Authority: ordinary.Authority, HumanDriving: true})
+	assertRPCCode(t, err, CodeUnauthorizedAttempt)
+
+	computer := testRunRequest(testAuthority(), time.Second)
+	computer.Authority.AttemptID = "computer-attempt"
+	computer.Authority.Class = contract.JobClassService
+	computer.Workload.ManagedVolumes = testComputerManagedVolumes()
+	computer.AllocateEndpoints = []string{"view", "control"}
+	engine.setRunResponse(RunResponse{Started: true, Endpoints: map[string]uint16{"view": 42011, "control": 42012}})
+	if _, err := session.Run(t.Context(), computer); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SetComputerControlState(t.Context(), SetComputerControlStateRequest{Authority: computer.Authority, HumanDriving: true}); err != nil {
+		t.Fatal(err)
+	}
+	stale := computer.Authority
+	stale.FencingToken = "stale"
+	if err := session.SetComputerControlState(t.Context(), SetComputerControlStateRequest{Authority: stale}); err == nil {
+		t.Fatal("stale fence changed Computer control state")
+	}
+	oldBoot := computer.Authority
+	oldBoot.BootSessionID = "old-boot"
+	if err := session.SetComputerControlState(t.Context(), SetComputerControlStateRequest{Authority: oldBoot}); err == nil {
+		t.Fatal("old boot changed Computer control state")
+	}
+	deleted, err := session.Delete(t.Context(), DeleteRequest{Authority: computer.Authority})
+	if err != nil || !deleted.Deleted {
+		t.Fatalf("delete Computer attempt = %+v, err=%v", deleted, err)
+	}
+	if err := session.SetComputerControlState(t.Context(), SetComputerControlStateRequest{Authority: computer.Authority}); err == nil {
+		t.Fatal("reaped attempt changed Computer control state")
+	}
+	engine.mu.Lock()
+	writes := append([]SetComputerControlStateRequest(nil), engine.controlWrites...)
+	engine.mu.Unlock()
+	if len(writes) != 1 || writes[0].Authority != computer.Authority || !writes[0].HumanDriving {
+		t.Fatalf("engine Computer control writes = %+v", writes)
 	}
 }
 
@@ -1451,6 +1551,7 @@ type fakeEngine struct {
 	dialHostBridgeRead       bool
 	dialHostBridgeDone       chan struct{}
 	lastDialAttemptRequest   DialAttemptPortRequest
+	controlWrites            []SetComputerControlStateRequest
 }
 
 type blockingWatchEngine struct {
@@ -1636,6 +1737,12 @@ func (engine *crashBoundaryEngine) duplicateStarts() int {
 
 func newFakeEngine() *fakeEngine { return &fakeEngine{runResponse: RunResponse{Started: true}} }
 
+func testComputerManagedVolumes() []ManagedVolumeDescriptor {
+	return []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
+		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 8 << 30,
+	}}}
+}
+
 type archiveCaptureEngine struct {
 	*fakeEngine
 	archive []byte
@@ -1748,6 +1855,13 @@ func (engine *fakeEngine) Signal(context.Context, SignalRequest) error {
 		close(signalEntered)
 		<-releaseSignal
 	}
+	return nil
+}
+func (engine *fakeEngine) SetComputerControlState(_ context.Context, request SetComputerControlStateRequest) error {
+	engine.record("SetComputerControlState")
+	engine.mu.Lock()
+	engine.controlWrites = append(engine.controlWrites, request)
+	engine.mu.Unlock()
 	return nil
 }
 func (engine *fakeEngine) Watch(_ context.Context, _ WatchRequest, emit func(WatchEvent) error) error {

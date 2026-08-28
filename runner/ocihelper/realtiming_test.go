@@ -60,6 +60,25 @@ func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
 	if _, err := session.Delete(ctx, DeleteRequest{Authority: authority}); err != nil {
 		t.Fatal(err)
 	}
+	if got := session.Handshake().ProtocolVersion; got != ProtocolVersion {
+		t.Fatalf("real helper process protocol version = %d, want exact %d", got, ProtocolVersion)
+	}
+	computerAuthority := authority
+	computerAuthority.JobID = "realtime-computer-job"
+	computerAuthority.AttemptID = "realtime-computer-attempt"
+	computerAuthority.Class = "service"
+	computerRequest := testRunRequest(computerAuthority, 5*time.Second)
+	computerRequest.Workload.ManagedVolumes = testComputerManagedVolumes()
+	computerRequest.AllocateEndpoints = []string{"view", "control"}
+	if _, err := session.Run(ctx, computerRequest); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SetComputerControlState(ctx, SetComputerControlStateRequest{Authority: computerAuthority, HumanDriving: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Delete(ctx, DeleteRequest{Authority: computerAuthority}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func startRealtimeHelperChild(t *testing.T) string {
@@ -99,7 +118,7 @@ func TestRealtimeOCIHelperChildProcess(t *testing.T) {
 	if os.Getenv(helperChildEnvironment) != "1" {
 		return
 	}
-	engine := newFakeEngine()
+	engine := &realtimeFakeEngine{fakeEngine: newFakeEngine()}
 	if err := RunInvocation(context.Background(), []string{"wefty-agent", InvocationArg}, engine, ServerConfig{
 		HelperVersion: "realtime-fake", HelperChecksum: "realtime-fake-checksum",
 		HeartbeatTimeout: 10 * time.Second, MaximumAttemptDeadman: 10 * time.Second,
@@ -107,4 +126,18 @@ func TestRealtimeOCIHelperChildProcess(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type realtimeFakeEngine struct{ *fakeEngine }
+
+func (engine *realtimeFakeEngine) Run(ctx context.Context, request RunRequest) (RunResponse, error) {
+	response := RunResponse{Started: true}
+	if len(request.AllocateEndpoints) != 0 {
+		response.Endpoints = make(map[string]uint16, len(request.AllocateEndpoints))
+		for index, name := range request.AllocateEndpoints {
+			response.Endpoints[name] = uint16(42120 + index)
+		}
+	}
+	engine.setRunResponse(response)
+	return engine.fakeEngine.Run(ctx, request)
 }

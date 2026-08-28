@@ -445,6 +445,19 @@ func helperSession(session *ocihelper.Session) ocihelper.HelperSession {
 	return ocihelper.HelperSession{HelperInstanceID: handshake.HelperInstanceID, SessionGeneration: handshake.SessionGeneration}
 }
 
+func (adapter *Adapter) SetComputerControlState(ctx context.Context, authority workloadrunner.AttemptAuthority, humanDriving bool) error {
+	if adapter == nil || adapter.sessions == nil {
+		return errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return err
+	}
+	return session.SetComputerControlState(ctx, ocihelper.SetComputerControlStateRequest{
+		Authority: HelperAuthority(authority), HumanDriving: humanDriving,
+	})
+}
+
 func (adapter *Adapter) probePlatform(session *ocihelper.Session) (ocihelper.OCIPlatform, bool) {
 	adapter.mu.Lock()
 	defer adapter.mu.Unlock()
@@ -1531,3 +1544,4 @@ func reapAfterFailedStart(session *ocihelper.Session, authority ocihelper.Attemp
 
 var _ workloadrunner.WorkloadRuntime = (*Adapter)(nil)
 var _ workloadrunner.PriorBootReaper = (*Adapter)(nil)
+var _ workloadrunner.OCIComputerControlRuntime = (*Adapter)(nil)

@@ -634,7 +634,11 @@ func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, 
 		request := workloadrunner.Request{Authority: workloadrunner.AttemptAuthority{NodeID: registration.NodeID, BootSessionID: registration.BootSessionID, JobID: claim.Job.JobID,
 			AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken, WorkloadClass: contract.JobClassService, RemovalGeneration: "attempt"},
 			RuntimeHandler: claim.Job.Spec.RuntimeHandler, Execution: claim.Job.Spec.Execution, Limits: claim.Job.Spec.Limits, InitialDeadman: claim.Lease.LeaseTTL,
-			ManagedVolumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: &workloadrunner.ComputerStorage{ComputerID: claim.ComputerStorage.ComputerID, StorageID: claim.ComputerStorage.StorageID, StorageGeneration: claim.ComputerStorage.StorageGeneration, DiskBytes: claim.Job.Spec.Execution.OCI.Computer.DiskBytes}}}}
+			ManagedVolumes:   []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: &workloadrunner.ComputerStorage{ComputerID: claim.ComputerStorage.ComputerID, StorageID: claim.ComputerStorage.StorageID, StorageGeneration: claim.ComputerStorage.StorageGeneration, DiskBytes: claim.Job.Spec.Execution.OCI.Computer.DiskBytes}}},
+			AttemptEndpoints: []string{workloadrunner.AttemptEndpointView, workloadrunner.AttemptEndpointControl},
+			AttemptEndpointReady: func(string, workloadrunner.AttemptEndpoint) error {
+				return nil
+			}}
 		request.OCIImageResolved = func(callbackContext context.Context, observation workloadrunner.OCIImageObservation) error {
 			_, err := store.ObserveAttemptImage(callbackContext, "native-agent", claim.Job.JobID, claim.Lease.AttemptID, nativeImageObservation(claim.Lease.FencingToken, observation))
 			return err
@@ -698,6 +702,7 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		authority.Class = contract.JobClassService
 		return ocihelper.RunRequest{
 			Authority: authority, InitialDeadman: l1.DefaultLeaseDuration,
+			AllocateEndpoints: []string{"view", "control"},
 			Workload: ocihelper.WorkloadInput{
 				ImageReference: reference, ImageDigest: digest, Argv: argv,
 				ReservedEnvironment: []ocihelper.EnvironmentVariable{{Name: contract.EnvServiceDir, Value: contract.OCIContainerServiceDirectory}},
@@ -705,10 +710,14 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 			},
 		}
 	}
-	first := request("a", []string{"/bin/sh", "-c", "printf computer-disk-marker > /wefty/service/marker; exec sleep 60"})
+	first := request("a", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' && grep -q ' /wefty/control tmpfs ' /proc/mounts && test ! -w /wefty/control/driver.json || exit 18; for i in $(seq 1 50); do test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' && break; sleep .1; done; test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' || exit 19; printf computer-disk-marker > /wefty/service/marker; exec sleep 60`})
 	if _, err := session.Run(ctx, first); err != nil {
 		t.Fatal(err)
 	}
+	if err := session.SetComputerControlState(ctx, ocihelper.SetComputerControlStateRequest{Authority: first.Authority, HumanDriving: true}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second)
 	contender := request("b", []string{"/bin/true"})
 	if _, err := session.Run(ctx, contender); err == nil {
 		t.Fatal("real Computer attempt B attached while A owned the Storage generation")
@@ -725,11 +734,12 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		len(receipt.SweptInventory.ComputerDiskLoops) == 0 || len(receipt.SweptInventory.ComputerAttachments) == 0 {
 		t.Fatalf("Computer helper-death sweep receipt = %+v present=%t", receipt, ok)
 	}
+	assertNativeComputerHostCleanup(t, first.Authority)
 	session, err = barrier.Session()
 	if err != nil {
 		t.Fatal(err)
 	}
-	second := request("c", []string{"/bin/sh", "-c", "test \"$(cat /wefty/service/marker)\" = computer-disk-marker"})
+	second := request("c", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' && test "$(cat /wefty/service/marker)" = computer-disk-marker`})
 	if _, err := session.Run(ctx, second); err != nil {
 		t.Fatalf("real Computer attempt C did not consume A's reap receipt: %v", err)
 	}
@@ -751,7 +761,17 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	if deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: second.Authority}); err != nil || !deleted.Deleted {
 		t.Fatalf("real Computer attempt C reap = %+v err=%v", deleted, err)
 	}
+	assertNativeComputerHostCleanup(t, second.Authority)
 	return true
+}
+
+func assertNativeComputerHostCleanup(t *testing.T, authority ocihelper.AttemptAuthority) {
+	t.Helper()
+	identity, err := ocihelper.DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestRootFault(t, "assert-computer-clean:"+identity.LogSegmentDirectory)
 }
 
 type nativeServiceDataImage struct {
@@ -1334,7 +1354,9 @@ func requestRootFault(t *testing.T, action string) {
 		t.Fatal("Linux OCI root fault supervisor is not provisioned")
 	}
 	ack := filepath.Join(directory, action+".done")
+	failure := filepath.Join(directory, action+".failed")
 	_ = os.Remove(ack)
+	_ = os.Remove(failure)
 	if err := os.WriteFile(fifo, []byte(action+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1342,6 +1364,9 @@ func requestRootFault(t *testing.T, action string) {
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(ack); err == nil {
 			return
+		}
+		if payload, err := os.ReadFile(failure); err == nil {
+			t.Fatalf("root assertion %s failed: %s", action, payload)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}

@@ -53,6 +53,38 @@ func TestCapabilityRevisionChangesOnlyOnPublishableTransition(t *testing.T) {
 	}
 }
 
+func TestComputerCapabilityIsProbeOwnedAndRevisioned(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC))
+	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "computer": true}}, nil
+	})
+	state := newCapabilityState(map[string]bool{"kind:process": true, "computer": true}, probe, clock, 0)
+	if initial := state.snapshot(); initial.Capabilities["computer"] || initial.Revision != 1 {
+		t.Fatalf("unprobed Computer capability = %+v", initial)
+	}
+	if err := state.refresh(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	earned := state.snapshot()
+	if !earned.Capabilities["computer"] || earned.Revision != 2 {
+		t.Fatalf("earned Computer capability = %+v", earned)
+	}
+	clock.Advance(time.Second)
+	state.suppressOCI(contract.CapabilityReasonHelperUnreachable, errors.New("helper restarted"))
+	withdrawn := state.snapshot()
+	if withdrawn.Capabilities["computer"] || withdrawn.Revision != 3 {
+		t.Fatalf("withdrawn Computer capability = %+v", withdrawn)
+	}
+	clock.Advance(time.Second)
+	if err := state.refresh(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	recovered := state.snapshot()
+	if !recovered.Capabilities["computer"] || recovered.Revision != 4 {
+		t.Fatalf("fresh-boot Computer capability = %+v", recovered)
+	}
+}
+
 func TestLegacyConfiguredProcessCapabilityAllowsProcess(t *testing.T) {
 	state := newCapabilityState(map[string]bool{" Process ": true}, nil, systemClock{}, 0)
 	processSpec := contract.JobSpec{Kind: contract.JobKindProcess}

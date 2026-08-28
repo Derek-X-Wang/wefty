@@ -369,6 +369,7 @@ func (state *capabilityState) allows(spec contract.JobSpec) bool {
 func isOCIProbeCapability(capability string) bool {
 	capability = normalizeCapabilityName(capability)
 	return capability == "kind:oci" || capability == "cgroup_v2" || capability == "apparmor" ||
+		capability == "computer" ||
 		strings.HasPrefix(capability, "runtime_handler:")
 }
 

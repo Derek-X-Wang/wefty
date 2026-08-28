@@ -188,6 +188,14 @@ jobs:
                 enable-registry)
                   iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -j REJECT
                   ;;
+                assert-computer-clean:wefty-log-segments-*)
+                  name="${action#assert-computer-clean:}"
+                  path="/var/lib/wefty/oci/logs/$name"
+                  if grep -F " $path/control " /proc/mounts >/dev/null || test -e "$path"; then
+                    printf 'control mount or log directory remains at %s\n' "$path" > "/tmp/wefty-oci-faults/$action.failed"
+                    continue
+                  fi
+                  ;;
                 *) exit 64 ;;
               esac
               touch "/tmp/wefty-oci-faults/$action.done"

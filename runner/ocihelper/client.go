@@ -409,6 +409,10 @@ func (session *Session) Signal(ctx context.Context, request SignalRequest) error
 	return session.call(ctx, MethodSignal, request, &struct{}{})
 }
 
+func (session *Session) SetComputerControlState(ctx context.Context, request SetComputerControlStateRequest) error {
+	return session.call(ctx, MethodSetComputerControl, request, &struct{}{})
+}
+
 func (session *Session) Watch(ctx context.Context, request WatchRequest, receive func(WatchEvent) error) error {
 	return session.stream(ctx, MethodWatch, request, true, func(wire *framedConn, raw frame) error {
 		var event WatchEvent

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const (
@@ -74,6 +76,7 @@ type serverAttempt struct {
 	endpoints        map[string]uint16
 	cgroupID         string
 	bridgeCapability string
+	computer         bool
 	deadline         time.Time
 	deadlineChanged  chan struct{}
 	watchDone        chan struct{}
@@ -574,8 +577,16 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 	if err := validateEndpointNames(request.AllocateEndpoints); err != nil {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
 	}
+	computer := workloadHasComputerDisk(request.Workload)
+	if computer && request.Authority.Class != contract.JobClassService {
+		return nil, &RPCError{Code: CodeInvalidRequest, Message: "Computer mechanics require service attempt authority"}
+	}
+	if err := validateRunEndpointContract(computer, request.AllocateEndpoints); err != nil {
+		return nil, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
+	}
 	attempt := &serverAttempt{
 		authority: request.Authority, state: attemptStarting,
+		computer:        computer,
 		deadline:        session.server.config.Clock.Now().Add(request.InitialDeadman),
 		deadlineChanged: make(chan struct{}, 1), watchDone: make(chan struct{}), reaped: make(chan struct{}),
 		runCancel: runCancel,
@@ -616,6 +627,38 @@ func validateEndpointNames(names []string) error {
 		seen[name] = struct{}{}
 	}
 	return nil
+}
+
+func workloadHasComputerDisk(workload WorkloadInput) bool {
+	for _, volume := range workload.ManagedVolumes {
+		if volume.Kind == ManagedVolumeComputerDisk {
+			return true
+		}
+	}
+	return false
+}
+
+func validateRunEndpointContract(computer bool, names []string) error {
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		seen[name] = struct{}{}
+	}
+	if computer {
+		if len(names) != 2 {
+			return errors.New("Computer attempts require exactly the view and control endpoints")
+		}
+		if _, ok := seen["view"]; !ok {
+			return errors.New("Computer attempts require exactly the view and control endpoints")
+		}
+		if _, ok := seen["control"]; !ok {
+			return errors.New("Computer attempts require exactly the view and control endpoints")
+		}
+		return nil
+	}
+	if len(names) == 0 || (len(names) == 1 && names[0] == "service") {
+		return nil
+	}
+	return errors.New("ordinary attempts may allocate only the service endpoint")
 }
 
 func endpointAllocationMatches(requested []string, allocated map[string]uint16) bool {
@@ -770,7 +813,7 @@ func (session *serverSession) sweepRequired(method Method) bool {
 	switch method {
 	case MethodAcquireSession, MethodSweep, MethodVerify:
 		return false
-	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus, MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodDialAttemptPort, MethodDialHostBridge:
+	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus, MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl:
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		return !session.sweepVerified
@@ -978,6 +1021,27 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		_ = writeEngineResponse(wire, struct{}{}, server.engine.Signal(operation.ctx, body))
+	case MethodSetComputerControl:
+		var body SetComputerControlStateRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		attempt, rpcErr := session.authorizeAttempt(body.Authority)
+		if rpcErr != nil {
+			_ = writeRPCError(wire, rpcErr)
+			return
+		}
+		if !attempt.computer {
+			_ = writeFailure(wire, CodeUnauthorizedAttempt, "control state is not authorized for this live attempt")
+			return
+		}
+		engine, ok := server.engine.(ComputerControlEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "Computer control state is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		_ = writeEngineResponse(wire, struct{}{}, engine.SetComputerControlState(operation.ctx, body))
 	case MethodWatch:
 		var body WatchRequest
 		if !decodeRequest(wire, request.Body, &body) || !authorizeRequest(wire, session, body.Authority) {

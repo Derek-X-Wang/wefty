@@ -272,6 +272,14 @@ door remains ignorant of guest addresses. Portless OCI
 services request no endpoint or probe and become running at authoritative
 `Started`.
 
+A Computer request instead asks for exactly `view` and `control`. The helper
+protocol version that admits this request also carries the exact-authority
+`SetComputerControlState` verb and Computer-disk attachment semantics. Only a
+successful functional probe through such a negotiated version may add the
+boot-scoped `computer` capability; an unsupported helper major is not admitted
+by this agent and cannot satisfy a Computer claim. Display readiness and
+publication remain a separate consumer of the returned opaque endpoints.
+
 OCI service environment contains only reserved container-visible values:
 `WEFTY_SERVICE_DIR=/wefty/service` for every service and the helper-allocated
 `WEFTY_SERVICE_PORT` only for a portful service. Agent and guest backing paths
@@ -286,6 +294,9 @@ exact `computer_id` and `storage_id@generation`; the agent compiles
 `computer_disk` instead of `service_data` and copies the trait's positive
 `disk_bytes`. A Computer claim missing that joined Storage authority fails
 closed before runtime entry.
+The helper injects the two reserved Computer port values, omits
+`WEFTY_SERVICE_PORT`, and mounts its fresh attempt-local read-only
+`/wefty/control/driver.json` outside that Storage generation.
 
 ## Attempts and occupancy
 
