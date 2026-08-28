@@ -1259,6 +1259,29 @@ func TestAttemptPortRejectsAdversarialBindOutsidePayloadCgroup(t *testing.T) {
 	}
 }
 
+func TestPreparedMacFallbackRewritesEndpointOnlyWhenActivated(t *testing.T) {
+	original := []EnvironmentVariable{{Name: contract.EnvL3Endpoint, Value: "http://host.lima.internal:4242/l3"}}
+	address := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4343}
+	dormant, guestEndpoint, err := fallbackBridgeEnvironment(original, address, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dormant[0].Value != original[0].Value || guestEndpoint != "http://127.0.0.1:4343/l3" {
+		t.Fatalf("dormant fallback environment=%v guest=%q", dormant, guestEndpoint)
+	}
+	active, guestEndpoint, err := fallbackBridgeEnvironment(original, address, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active[0].Value != guestEndpoint || guestEndpoint != "http://127.0.0.1:4343/l3" {
+		t.Fatalf("active fallback environment=%v guest=%q", active, guestEndpoint)
+	}
+	defaultOff, guestEndpoint, err := fallbackBridgeEnvironment(nil, address, false)
+	if err != nil || len(defaultOff) != 0 || guestEndpoint == "" {
+		t.Fatalf("default-off dormant fallback environment=%v guest=%q err=%v", defaultOff, guestEndpoint, err)
+	}
+}
+
 func TestDialHostBridgePairsOnlyTheAttemptsGuestListener(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {

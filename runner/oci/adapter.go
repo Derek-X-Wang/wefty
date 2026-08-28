@@ -716,7 +716,7 @@ func (adapter *Adapter) SetComputerControlState(ctx context.Context, authority w
 	})
 }
 
-func (adapter *Adapter) SetComputerToken(ctx context.Context, authority workloadrunner.AttemptAuthority, token string) error {
+func (adapter *Adapter) SetComputerSubmission(ctx context.Context, authority workloadrunner.AttemptAuthority, token, endpoint string) error {
 	if adapter == nil || adapter.sessions == nil {
 		return errors.New("OCI helper session is not configured")
 	}
@@ -724,7 +724,7 @@ func (adapter *Adapter) SetComputerToken(ctx context.Context, authority workload
 	if err != nil {
 		return err
 	}
-	return session.SetComputerToken(ctx, ocihelper.SetComputerTokenRequest{Authority: HelperAuthority(authority), Token: token})
+	return session.SetComputerToken(ctx, ocihelper.SetComputerTokenRequest{Authority: HelperAuthority(authority), Token: token, L3Endpoint: endpoint})
 }
 
 func (adapter *Adapter) probePlatform(session *ocihelper.Session) (ocihelper.OCIPlatform, bool) {
@@ -960,9 +960,10 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	adapter.trackRun(request.Authority, entry)
 	runResponse, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: authority, InitialDeadman: request.InitialDeadman,
-		AllocateEndpoints:        request.AttemptEndpoints,
-		EnableHostBridgeFallback: request.HostBridgeDial != nil,
-		Workload:                 workloadInput(request),
+		AllocateEndpoints:          request.AttemptEndpoints,
+		EnableHostBridgeFallback:   request.HostBridgeDial != nil,
+		ActivateHostBridgeFallback: request.HostBridgeFallbackActive || (request.HostBridgeDial != nil && !contract.IsComputerExecution(request.Execution)),
+		Workload:                   workloadInput(request),
 	})
 	if err != nil {
 		if helperRunDefinitivelyRejected(err) {
@@ -998,6 +999,19 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		err := errors.New("OCI helper omitted the requested host bridge fallback authority")
 		_ = reapAfterFailedStart(session, authority)
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+	}
+	if request.HostBridgeDial != nil {
+		if runResponse.HostBridgeEndpoint == "" {
+			err := errors.New("OCI helper omitted the requested guest host bridge endpoint")
+			_ = reapAfterFailedStart(session, authority)
+			return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+		}
+		if request.HostBridgeEndpointReady != nil {
+			if err := request.HostBridgeEndpointReady(runResponse.HostBridgeEndpoint); err != nil {
+				_ = reapAfterFailedStart(session, authority)
+				return spawnResult(contract.SpawnFailureProcessRequest, err), err
+			}
+		}
 	}
 	if len(request.AttemptEndpoints) > 0 {
 		if len(runResponse.Endpoints) != len(request.AttemptEndpoints) {

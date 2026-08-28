@@ -24,6 +24,7 @@ type computerServiceConfig struct {
 	authorizer     *ComputerPolicyCache
 	auditor        computerTakeoverAuditor
 	computerTokens ComputerTokenMinter
+	computerBridge *computerAttemptBridgeController
 	submission     ComputerSubmissionAuthority
 	computerID     string
 	jobID          string
@@ -31,6 +32,122 @@ type computerServiceConfig struct {
 	fencingToken   string
 	dial           computerEndpointDial
 	publish        func(context.Context, bool, string) error
+}
+
+// computerAttemptBridgeController makes the transport follow Computer
+// submission authority. It owns no authorization decision: L3 remains the
+// only token authority and the helper publishes the paired token/endpoint.
+type computerAttemptBridgeController struct {
+	ctx       context.Context
+	start     func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error)
+	kind      string
+	execution contract.ExecutionSpec
+
+	mu            sync.Mutex
+	bridge        *workflowBridge
+	guestEndpoint string
+	changed       chan struct{}
+}
+
+func newComputerAttemptBridgeController(
+	ctx context.Context,
+	start func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error),
+	kind string,
+	execution contract.ExecutionSpec,
+) *computerAttemptBridgeController {
+	return &computerAttemptBridgeController{ctx: ctx, start: start, kind: kind, execution: execution, changed: make(chan struct{})}
+}
+
+func (controller *computerAttemptBridgeController) signalLocked() {
+	close(controller.changed)
+	controller.changed = make(chan struct{})
+}
+
+func (controller *computerAttemptBridgeController) enable(token string) (string, error) {
+	if controller == nil || controller.start == nil || token == "" {
+		return "", errors.New("Computer attempt bridge authority is incomplete")
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.bridge != nil {
+		return "", errors.New("Computer attempt bridge is already enabled")
+	}
+	execution := controller.execution
+	execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
+	execution.SensitiveEnv[contract.EnvComputerToken] = token
+	bridge, err := controller.start(controller.ctx, controller.kind, execution)
+	if err != nil {
+		return "", err
+	}
+	if bridge == nil || bridge.surface != workflowBridgeSurfaceComputer {
+		if bridge != nil {
+			_ = bridge.close()
+		}
+		return "", errors.New("Computer attempt bridge factory returned no Computer transport")
+	}
+	endpoint := bridge.l3Endpoint
+	if bridge.hostBridgeFallback && controller.guestEndpoint != "" {
+		endpoint = controller.guestEndpoint
+	}
+	controller.bridge = bridge
+	controller.signalLocked()
+	return endpoint, nil
+}
+
+func (controller *computerAttemptBridgeController) disable() error {
+	if controller == nil {
+		return nil
+	}
+	controller.mu.Lock()
+	bridge := controller.bridge
+	controller.bridge = nil
+	controller.signalLocked()
+	controller.mu.Unlock()
+	if bridge == nil {
+		return nil
+	}
+	return bridge.close()
+}
+
+func (controller *computerAttemptBridgeController) setGuestEndpoint(endpoint string) error {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "http" || parsed.Path != "/l3" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("helper returned an invalid Computer host bridge endpoint")
+	}
+	host, _, err := net.SplitHostPort(parsed.Host)
+	if err != nil || !net.ParseIP(host).IsLoopback() {
+		return errors.New("helper Computer host bridge endpoint is not loopback-scoped")
+	}
+	controller.mu.Lock()
+	controller.guestEndpoint = endpoint
+	controller.signalLocked()
+	controller.mu.Unlock()
+	return nil
+}
+
+func (controller *computerAttemptBridgeController) usesHostBridgeFallback() bool {
+	if controller == nil {
+		return false
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return controller.bridge != nil && controller.bridge.hostBridgeFallback
+}
+
+func (controller *computerAttemptBridgeController) dial(ctx context.Context) (net.Conn, error) {
+	for {
+		controller.mu.Lock()
+		bridge, changed := controller.bridge, controller.changed
+		controller.mu.Unlock()
+		if bridge != nil && bridge.hostBridgeFallback {
+			return bridge.dial(ctx)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
 }
 
 // runComputerService is the production owner of the private Computer front
@@ -163,7 +280,7 @@ func runComputerService(
 			case <-runtimeStarted:
 			}
 			tokenSyncErrors <- syncComputerTokenFile(runContext, controlRuntime, request.Authority,
-				config.computerTokens, config.computerID, config.attemptID, config.submission, initial, updates)
+				clock, config.computerTokens, config.computerBridge, config.computerID, config.attemptID, config.submission, initial, updates)
 		}()
 	}
 	defer stopTokenSync()
@@ -178,6 +295,7 @@ func runComputerService(
 	}()
 
 	stop := func(publicationFinished bool, publicationErr error) error {
+		bridgeErr := config.computerBridge.disable()
 		publication.Stop()
 		frontDoor.EndSessions(l1.ComputerTakeoverAttemptAuthorityLost)
 		frontDoor.SetReady(false)
@@ -189,7 +307,7 @@ func runComputerService(
 		if !publicationFinished {
 			publicationErr = <-publicationDone
 		}
-		return errors.Join(publicationErr, frontDoorErr)
+		return errors.Join(bridgeErr, publicationErr, frontDoorErr)
 	}
 	select {
 	case <-ctx.Done():
@@ -212,7 +330,9 @@ func runComputerService(
 		return spawnFailure(contract.SpawnFailurePublishedListener, serveErr), errors.Join(serveErr, outcome.err, stopErr)
 	case readinessErr := <-readinessErrors:
 		if readinessErr == nil {
-			return (<-outcomes).result, nil
+			stopErr := stop(false, nil)
+			outcome := <-outcomes
+			return outcome.result, errors.Join(outcome.err, stopErr)
 		}
 		stopErr := stop(false, nil)
 		outcome := <-outcomes
@@ -245,7 +365,9 @@ func syncComputerTokenFile(
 	ctx context.Context,
 	runtime workloadrunner.OCIComputerControlRuntime,
 	authority workloadrunner.AttemptAuthority,
+	clock Clock,
 	minter ComputerTokenMinter,
+	bridge *computerAttemptBridgeController,
 	computerID, attemptID string,
 	last ComputerSubmissionAuthority,
 	initial ComputerSubmissionAuthority,
@@ -256,8 +378,10 @@ func syncComputerTokenFile(
 			next.SubmitMaxInflight == last.SubmitMaxInflight {
 			return nil
 		}
-		if err := runtime.SetComputerToken(ctx, authority, ""); err != nil {
-			return fmt.Errorf("remove superseded Computer token file: %w", err)
+		bridgeErr := bridge.disable()
+		fileErr := runtime.SetComputerSubmission(ctx, authority, "", "")
+		if err := errors.Join(bridgeErr, fileErr); err != nil {
+			return fmt.Errorf("remove superseded Computer submission transport and files: %w", err)
 		}
 		last = next
 		if !next.Enabled {
@@ -270,12 +394,12 @@ func syncComputerTokenFile(
 			if err == nil {
 				break
 			}
-			timer := time.NewTimer(time.Duration(attempt+1) * 100 * time.Millisecond)
+			timer := clock.NewTimer(time.Duration(attempt+1) * 100 * time.Millisecond)
 			select {
 			case <-ctx.Done():
-				timer.Stop()
+				stopTimer(timer)
 				return nil
-			case <-timer.C:
+			case <-timer.C():
 			}
 		}
 		if err != nil {
@@ -285,8 +409,13 @@ func syncComputerTokenFile(
 			grant.SubmitIntentRevision != next.SubmitIntentRevision || grant.SubmitMaxInflight != next.SubmitMaxInflight {
 			return errors.New("re-minted Computer token grant is outside current submission authority")
 		}
-		if err := runtime.SetComputerToken(ctx, authority, grant.Token); err != nil {
-			return fmt.Errorf("publish re-minted Computer token file: %w", err)
+		endpoint, err := bridge.enable(grant.Token)
+		if err != nil {
+			return fmt.Errorf("start Computer attempt bridge: %w", err)
+		}
+		if err := runtime.SetComputerSubmission(ctx, authority, grant.Token, endpoint); err != nil {
+			_ = bridge.disable()
+			return fmt.Errorf("publish re-minted Computer submission files: %w", err)
 		}
 		return nil
 	}

@@ -579,6 +579,9 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 	if err := validateEndpointNames(request.AllocateEndpoints); err != nil {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
 	}
+	if request.ActivateHostBridgeFallback && !request.EnableHostBridgeFallback {
+		return nil, &RPCError{Code: CodeInvalidRequest, Message: "active host bridge fallback was not prepared"}
+	}
 	computer := request.Workload.Computer
 	if computer && request.Authority.Class != contract.JobClassService {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: "Computer mechanics require service attempt authority"}
@@ -682,6 +685,9 @@ func (session *serverSession) completeAttempt(request RunRequest, attempt *serve
 	response.StartedAt = response.StartedAt.UTC().Round(0)
 	if response.HostBridgeReady && !request.EnableHostBridgeFallback {
 		return &RPCError{Code: CodeEngineFailure, Message: "engine enabled an unrequested host bridge fallback"}
+	}
+	if response.HostBridgeReady != (response.HostBridgeEndpoint != "") {
+		return &RPCError{Code: CodeEngineFailure, Message: "engine host bridge endpoint evidence is inconsistent"}
 	}
 	if !endpointAllocationMatches(request.AllocateEndpoints, response.Endpoints) {
 		return &RPCError{Code: CodeEngineFailure, Message: "engine endpoint allocation did not match the request"}
@@ -812,7 +818,7 @@ func (session *serverSession) sweepRequired(method Method) bool {
 		return false
 	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus,
 		MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodInventoryRemoval, MethodAttestRemoval,
-		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl:
+		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken:
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		return !session.sweepVerified
@@ -1068,6 +1074,10 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		if !attempt.computer {
 			_ = writeFailure(wire, CodeUnauthorizedAttempt, "Computer token delivery is not authorized for this live attempt")
+			return
+		}
+		if (body.Token == "") != (body.L3Endpoint == "") {
+			_ = writeFailure(wire, CodeInvalidRequest, "Computer token and L3 endpoint must be published or removed together")
 			return
 		}
 		engine, ok := server.engine.(ComputerControlEngine)

@@ -55,6 +55,12 @@ mints the bearer after claim, keeps it only in memory, and passes it through a
 closed helper field. It never enters the Computer, JobSpec, L1 database,
 dispatch outbox, service directory, argv, logs, inspect output, or removal
 evidence.
+For a Computer, `WEFTY_L3_ENDPOINT` follows the same default-off boundary: no
+enabled submission intent means no bridge and no endpoint environment value.
+An enable at start supplies both environment values. A live enable instead
+publishes the fresh pass and endpoint through the paired 0400 control-tmpfs
+files `/wefty/control/computer-token` and `/wefty/control/l3-endpoint`; disable
+removes both and closes transport.
 `WEFTY_RUN_ID` remains part of the existing process run context but is not
 added to the OCI reserved set.
 
@@ -144,7 +150,11 @@ provenance (`computer_id`, `computer_attempt_id`,
 `computer_storage_generation`, and `submit_intent_revision`); callers cannot
 supply or override those fields. Descendants remain `chain`. Reads are limited
 to roots from the same Computer and current Storage generation plus their
-descendants. `GET /v1/computer/self` returns only Computer identity, Storage
+descendants. `GET /v1/runs?origin=computer:self` lists those roots with bounded
+cursor pagination; `include_descendants=true` expands through only those roots,
+and every returned Run is independently checked by `CanComputerReadRun`.
+Accepted Envelopes are included in `GET /v1/runs/{run_id}`; there is no separate
+Computer envelope-read route. `GET /v1/computer/self` returns only Computer identity, Storage
 generation, grant revision, and enumerated permissions. The pass cannot parent
 a submitted Run, append Envelopes or Gates, cancel, rerun, mutate Workflows or
 L1, administer grants, or see another Computer or an earlier generation.
@@ -153,8 +163,12 @@ L3 enforces the revisioned `submit_max_inflight` atomically across attempts
 and Storage generations, counting a root Lineage while any member is
 nonterminal. Idempotent replay remains accepted at the limit; new roots receive
 typed `submit_inflight_limit`. The guest bridge is transport-only defense in
-depth and never supplies provenance headers. Its route allowlist, reachability,
-and cancellation surface are owned by #184.
+depth and never supplies or trusts provenance headers. Its method/path
+allowlist exactly mirrors L3's Computer-token surface: self, self-scoped Run
+list, root submission, scoped Run read (including accepted Envelopes), lineage,
+and logs. It closes and cancels in-flight traffic at attempt cancellation,
+policy/lease/authority/helper loss, agent restart, reimage/reset, and removal;
+L3 revocation remains the authority and closure only removes reachability.
 
 Computer submission idempotency binds the stable principal (`ComputerID`) and
 normalized request only. Attempt, grant, Storage, intent, and L3 authority

@@ -348,7 +348,7 @@ const (
 // without exposing helper protocol or filesystem mechanics to the agent.
 type OCIComputerControlRuntime interface {
 	SetComputerControlState(context.Context, AttemptAuthority, bool) error
-	SetComputerToken(context.Context, AttemptAuthority, string) error
+	SetComputerSubmission(context.Context, AttemptAuthority, string, string) error
 }
 
 // Request contains the mechanics needed by any workload runtime. Kind and
@@ -395,6 +395,14 @@ type Request struct {
 	// HostBridgeDial is set only for Lima's bind-failure reverse-tunnel path.
 	// It dials the host-local run bridge and never accepts an arbitrary target.
 	HostBridgeDial func(context.Context) (net.Conn, error)
+	// HostBridgeFallbackActive selects the prepared helper listener as the
+	// start-time endpoint. Computer attempts may prepare it dormant so a later
+	// policy enable can still use the constrained fallback.
+	HostBridgeFallbackActive bool
+	// HostBridgeEndpointReady reports the helper-owned guest loopback endpoint
+	// for the constrained Lima fallback. It does not make the endpoint visible
+	// to the workload; the Computer authority lifecycle publishes it separately.
+	HostBridgeEndpointReady func(string) error
 	// AttemptEndpoints asks an OCI runtime to allocate a bounded named endpoint
 	// set. AttemptEndpointReady transfers each exact-authority dialer to the
 	// local service front-door seam without exposing guest networking.

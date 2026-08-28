@@ -761,6 +761,8 @@ func TestComputerTokenMintedIntoSensitiveClosedInputOnlyWhenEnabled(t *testing.T
 				t.Fatalf("default-off Computer minted %d pass(es)", minter.calls)
 			} else if _, exists := runtime.request.Execution.SensitiveEnv[contract.EnvComputerToken]; exists {
 				t.Fatalf("default-off Computer retained caller token: %v", runtime.request.Execution.SensitiveEnv)
+			} else if _, exists := runtime.request.Execution.Env[contract.EnvL3Endpoint]; exists {
+				t.Fatalf("default-off Computer received an L3 endpoint: %v", runtime.request.Execution.Env)
 			}
 		})
 	}
