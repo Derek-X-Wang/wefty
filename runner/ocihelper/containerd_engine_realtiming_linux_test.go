@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -96,6 +97,74 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	probeElapsed := time.Since(probeStarted)
 	if probeElapsed > 10*time.Second {
 		t.Fatalf("production functional probe took %s, want at most 10s", probeElapsed)
+	}
+
+	// Delete must accept the live owner-key-derived handoff name. It cannot be
+	// reconstructed from attempt authority, so this reaches the engine identity
+	// gate with the exact name retained by Run.
+	handoffAuthority := nativeAuthority("owner-key-delete")
+	const handoffOwner = "native-owner-key-delete"
+	if _, err := session.Run(ctx, ocihelper.RunRequest{
+		Authority: handoffAuthority, InitialDeadman: l1.DefaultLeaseDuration,
+		Workload: ocihelper.WorkloadInput{
+			ImageReference: reference, ImageDigest: digest, Argv: []string{"/bin/sh", "-c", "exit 0"},
+			ManagedVolumes: []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: handoffOwner}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Watch(ctx, ocihelper.WatchRequest{Authority: handoffAuthority}, func(ocihelper.WatchEvent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: handoffAuthority}); err != nil {
+		t.Fatalf("delete live owner-key handoff attempt: %v", err)
+	}
+	if _, err := session.DeleteManagedVolume(ctx, ocihelper.DeleteManagedVolumeRequest{Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: handoffOwner}); err != nil {
+		t.Fatal(err)
+	}
+
+	manifestRequest := nativeAdapterRequest(reference, digest, "manifest-inventory", []string{"/bin/sh", "-c", "exec sleep 60"})
+	manifestRequest.Authority.WorkloadClass = contract.JobClassService
+	manifestRequest.Authority.RemovalGeneration = fmt.Sprint(l1.InitialServiceRemovalGeneration)
+	manifestRequest.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
+	manifest, err := adapter.RemovalResourceManifest(manifestRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestAuthority := ocirunner.HelperAuthority(manifestRequest.Authority)
+	if _, err := session.Run(ctx, ocihelper.RunRequest{
+		Authority: manifestAuthority, InitialDeadman: l1.DefaultLeaseDuration,
+		Workload: ocihelper.WorkloadInput{
+			ImageReference: reference, ImageDigest: digest, Argv: []string{"/bin/sh", "-c", "exec sleep 60"},
+			ManagedVolumes: []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeServiceData}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	verification, err := session.Verify(ctx, ocihelper.VerifyRequest{Scope: ocihelper.VerifyAttempt, Authority: &manifestAuthority})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.TaskID != manifest.ContainerID || manifest.ShimID != manifest.ContainerID ||
+		!slices.Contains(verification.Inventory.Leases, manifest.LeaseID) ||
+		!slices.Contains(verification.Inventory.Snapshots, manifest.SnapshotID) ||
+		!slices.Contains(verification.Inventory.Containers, manifest.ContainerID) ||
+		!slices.Contains(verification.Inventory.Tasks, manifest.TaskID) ||
+		!slices.Contains(verification.Inventory.Shims, manifest.ShimID) ||
+		!slices.Contains(verification.Inventory.Cgroups, manifest.CgroupID) ||
+		!slices.Contains(verification.Inventory.LogSegments, manifest.LogSegmentDirectory) ||
+		!slices.Contains(verification.Inventory.ManagedVolumes, manifest.ServiceDataVolume) ||
+		!slices.Contains(verification.Inventory.ManagedVolumeRecords, manifest.ServiceDataOwnerRecord) {
+		t.Fatalf("frozen manifest does not match live helper inventory: manifest=%+v inventory=%+v", manifest, verification.Inventory)
+	}
+	if err := session.Signal(ctx, ocihelper.SignalRequest{Authority: manifestAuthority, Signal: ocihelper.SignalKILL}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Watch(ctx, ocihelper.WatchRequest{Authority: manifestAuthority}, func(ocihelper.WatchEvent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: manifestAuthority}); err != nil {
+		t.Fatal(err)
 	}
 
 	// Pull and offline import each start from an empty containerd root. The
@@ -518,7 +587,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	verification, err := session.Verify(ctx, ocihelper.VerifyRequest{Scope: ocihelper.VerifyNamespace})
+	verification, err = session.Verify(ctx, ocihelper.VerifyRequest{Scope: ocihelper.VerifyNamespace})
 	if err != nil || !verification.Absent {
 		t.Fatalf("namespace cleanup verification=%+v err=%v", verification, err)
 	}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 // evidenceOutbox owns durable evidence for the lifetime of the agent process.
@@ -55,6 +56,22 @@ func (outbox *evidenceOutbox) completionDelivered(ctx context.Context, attemptID
 
 func (outbox *evidenceOutbox) beginRemoval(ctx context.Context, removal localRemoval) error {
 	return outbox.spool.beginRemoval(ctx, removal, outbox.clock.Now())
+}
+
+func (outbox *evidenceOutbox) storeRuntimeResourceManifest(ctx context.Context, manifest workloadrunner.RuntimeResourceManifest) error {
+	return outbox.spool.storeRuntimeResourceManifest(ctx, manifest, outbox.clock.Now())
+}
+
+func (outbox *evidenceOutbox) runtimeRemoval(ctx context.Context, jobID string) (runtimeRemovalRecord, bool, error) {
+	return outbox.spool.runtimeRemoval(ctx, jobID)
+}
+
+func (outbox *evidenceOutbox) pendingRuntimeRemovals(ctx context.Context) ([]runtimeRemovalRecord, error) {
+	return outbox.spool.pendingRuntimeRemovals(ctx)
+}
+
+func (outbox *evidenceOutbox) recordRuntimeQuiesced(ctx context.Context, removal localRemoval, receipt workloadrunner.ReapReceipt) error {
+	return outbox.spool.recordRuntimeQuiesced(ctx, removal, receipt, outbox.clock.Now())
 }
 
 func (outbox *evidenceOutbox) purgeJob(ctx context.Context, jobID string) error {

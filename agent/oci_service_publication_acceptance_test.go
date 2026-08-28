@@ -5,6 +5,9 @@ package agent
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -163,9 +166,12 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 		t.Fatal("Linux OCI L1/agent service realtiming provisioning is incomplete")
 	}
 	var freshRestart, stopStart, saturation, retainedBinding bool
+	var removalManifestComplete, removalPending, removalEveryAttempt bool
+	var removalServiceDataVolume, removalServiceDataOwnerRecord bool
+	var removalCompleted, removalPriorBootSweep bool
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\n", freshRestart, stopStart, saturation, retainedBinding)
+			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalCompleted, removalPriorBootSweep)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-l1-agent-linux.txt"), []byte(payload), 0o600); err != nil {
 				t.Errorf("write OCI L1/agent evidence: %v", err)
 			}
@@ -209,6 +215,7 @@ while :; do sleep 1; done
 		t.Fatal(err)
 	}
 	adapter := ocirunner.NewAdapter(barrier)
+	spoolDirectory := t.TempDir()
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -226,7 +233,7 @@ while :; do sleep 1; done
 		}),
 		OCIBootBarrier: barrier, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: adapter},
 		AttemptDeadman:       nativeAcceptanceDeadman{barrier: barrier, nodeID: "native-service-node", bootSessionID: "native-service-boot"},
-		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: spoolDirectory, MaxServiceSlots: 1,
 		HeartbeatInterval: 2 * time.Second, ClaimInterval: 20 * time.Millisecond, RenewalInterval: 200 * time.Millisecond,
 		OperationTimeout: 5 * time.Second, FinalizationTimeout: 30 * time.Second, Logf: t.Logf,
 	})
@@ -234,7 +241,7 @@ while :; do sleep 1; done
 		_ = barrier.Close()
 		t.Fatal(err)
 	}
-	defer nodeAgent.Close()
+	defer func() { nodeAgent.Close() }()
 	runContext, cancelRun := context.WithCancel(t.Context())
 	runDone := make(chan error, 1)
 	go func() { runDone <- nodeAgent.Run(runContext) }()
@@ -287,10 +294,6 @@ while :; do sleep 1; done
 	if !stopStart {
 		t.Fatalf("stop/start did not reacquire a fresh attempt = stopped %+v started %+v", stopped, startedAgain)
 	}
-	if _, err := store.SetServiceDesiredState(t.Context(), primary.JobID, contract.ServiceDesiredStopped); err != nil {
-		t.Fatal(err)
-	}
-	_ = waitNativeServiceState(t, store, primary.JobID, contract.JobStopped, 45*time.Second)
 	logs, err := store.GetJobLogs(t.Context(), primary.JobID, "", l1.MaxLogPageLimit)
 	if err != nil {
 		t.Fatal(err)
@@ -306,10 +309,184 @@ while :; do sleep 1; done
 			t.Fatalf("OCI service restart/stop-start logs omitted %q: %+v", marker, logs.Events)
 		}
 	}
+	manifestCommitted := make(chan struct{}, 1)
+	nodeAgent.logSpool.runtimeRemovalCheckpoint = func(checkpoint runtimeRemovalCheckpoint) error {
+		if checkpoint != runtimeRemovalCheckpointAfterManifest {
+			return nil
+		}
+		select {
+		case manifestCommitted <- struct{}{}:
+		default:
+		}
+		return errInjectedRuntimeRemovalCrash
+	}
+	pending, err := store.RemoveService(t.Context(), primary.JobID)
+	if err != nil || pending.State != contract.JobRemovalPending {
+		t.Fatalf("running OCI removal entry = %+v err=%v", pending, err)
+	}
+	removalPending = pending.State == contract.JobRemovalPending
+	select {
+	case <-manifestCommitted:
+	case <-time.After(15 * time.Second):
+		t.Fatal("removal did not commit its frozen manifest before reap")
+	}
+	record := waitRuntimeRemovalManifestPhase(t, spoolDirectory, primary.JobID, runtimeRemovalPrepared, 15*time.Second)
+	wantRemovalAttempts := map[string]bool{startedAgain.CurrentAttemptID: false}
+	for _, attempt := range record.manifest.Attempts {
+		if _, expected := wantRemovalAttempts[attempt.AttemptID]; expected {
+			wantRemovalAttempts[attempt.AttemptID] = true
+		}
+	}
+	everyAttempt := len(record.manifest.Attempts) == len(wantRemovalAttempts)
+	for _, found := range wantRemovalAttempts {
+		everyAttempt = everyAttempt && found
+	}
+	serviceDataVolume := len(record.manifest.Attempts) > 0
+	serviceDataOwnerRecord := len(record.manifest.Attempts) > 0
+	for _, attempt := range record.manifest.Attempts {
+		serviceDataVolume = serviceDataVolume && attempt.ServiceDataVolume != ""
+		serviceDataOwnerRecord = serviceDataOwnerRecord && attempt.ServiceDataOwnerRecord != ""
+	}
+	if !removalPending {
+		t.Fatal("OCI removal never exposed removal_pending")
+	}
+	if !everyAttempt {
+		t.Fatalf("frozen OCI removal attempts = %+v, want current attempt %s", record.manifest.Attempts, startedAgain.CurrentAttemptID)
+	}
+	if !serviceDataVolume {
+		t.Fatalf("frozen OCI removal omitted service-data volume: %+v", record.manifest.Attempts)
+	}
+	if !serviceDataOwnerRecord {
+		t.Fatalf("frozen OCI removal omitted service-data owner record: %+v", record.manifest.Attempts)
+	}
+	removalEveryAttempt = everyAttempt
+	removalServiceDataVolume = serviceDataVolume
+	removalServiceDataOwnerRecord = serviceDataOwnerRecord
 	cancelRun()
 	if err := <-runDone; err != nil {
 		t.Fatalf("L1/agent realtiming shutdown: %v", err)
 	}
+	nodeAgent.Close()
+
+	restartBootID := "native-service-boot-removal-restart"
+	restartClient := ocihelper.NewUnixClient(helperSocket, helperChecksum)
+	restartClient.HeartbeatInterval = time.Second
+	restartBarrier, err := ocihelper.NewBootBarrier(restartClient, ocihelper.AcquireSessionRequest{NodeID: "native-service-node", BootSessionID: restartBootID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartAdapter := ocirunner.NewAdapter(restartBarrier)
+	nodeAgent, err = New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "native-service-node", BootSessionID: restartBootID, Version: "realtiming",
+		Capabilities: map[string]bool{"kind:process": true},
+		CapabilityProbe: capabilityProbeFunc(func(ctx context.Context) (CapabilityProbeResult, error) {
+			if err := restartAdapter.Probe(ctx, "native-service-node", restartBootID, reference, digest, l1.DefaultLeaseDuration); err != nil {
+				return CapabilityProbeResult{MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonProbeFailed}, err
+			}
+			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true}}, nil
+		}),
+		OCIBootBarrier: restartBarrier, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: restartAdapter},
+		AttemptDeadman:       nativeAcceptanceDeadman{barrier: restartBarrier, nodeID: "native-service-node", bootSessionID: restartBootID},
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: spoolDirectory, MaxServiceSlots: 1,
+		HeartbeatInterval: 2 * time.Second, ClaimInterval: 20 * time.Millisecond, RenewalInterval: 200 * time.Millisecond,
+		OperationTimeout: 5 * time.Second, FinalizationTimeout: 30 * time.Second, Logf: t.Logf,
+	})
+	if err != nil {
+		_ = restartBarrier.Close()
+		t.Fatal(err)
+	}
+	type completionEvidence struct {
+		record  runtimeRemovalRecord
+		receipt workloadrunner.ReapReceipt
+	}
+	completedEvidence := make(chan completionEvidence, 1)
+	recordQuiesced := nodeAgent.session.removals.recordRuntimeQuiesced
+	nodeAgent.session.removals.recordRuntimeQuiesced = func(ctx context.Context, removal localRemoval, receipt workloadrunner.ReapReceipt) error {
+		if err := recordQuiesced(ctx, removal, receipt); err != nil {
+			return err
+		}
+		stored, found, err := nodeAgent.logSpool.runtimeRemoval(ctx, removal.jobID)
+		if err != nil || !found {
+			return errors.Join(err, errors.New("completed runtime removal record disappeared before local cleanup"))
+		}
+		select {
+		case completedEvidence <- completionEvidence{record: stored, receipt: receipt}:
+		default:
+		}
+		return nil
+	}
+	restartContext, cancelRestart := context.WithCancel(t.Context())
+	defer cancelRestart()
+	restartDone := make(chan error, 1)
+	go func() { restartDone <- nodeAgent.Run(restartContext) }()
+	removed := waitNativeServiceState(t, store, primary.JobID, contract.JobRemovedVerified, 45*time.Second)
+	removalCompleted = removed.State == contract.JobRemovedVerified
+	if !removalCompleted {
+		t.Fatalf("OCI removal did not complete after restart: %+v", removed)
+	}
+	select {
+	case evidence := <-completedEvidence:
+		removalManifestComplete = evidence.record.phase == runtimeRemovalComplete && evidence.record.receipt.RuntimeQuiesced
+		if !removalManifestComplete {
+			t.Fatalf("runtime removal did not reach complete before legacy cleanup: %+v", evidence.record)
+		}
+		removalPriorBootSweep = evidence.receipt.Evidence == workloadrunner.ReapEvidencePriorBootOCISweep && evidence.receipt.BootSessionID != "" && evidence.receipt.SweepEpoch != "" && evidence.receipt.HelperGeneration != 0
+		if !removalPriorBootSweep {
+			t.Fatalf("restart did not use closed prior-boot OCI sweep evidence: %+v", evidence.receipt)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("removal completion omitted captured quiescence evidence")
+	}
+	cancelRestart()
+	if err := <-restartDone; err != nil {
+		t.Fatalf("restarted L1/agent realtiming shutdown: %v", err)
+	}
+}
+
+func waitRuntimeRemovalManifestPhase(t *testing.T, directory, jobID string, want runtimeRemovalPhase, timeout time.Duration) runtimeRemovalRecord {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		entries, err := os.ReadDir(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if filepath.Ext(entry.Name()) != ".sqlite" {
+				continue
+			}
+			database, err := sql.Open("sqlite", filepath.Join(directory, entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var manifestJSON, receiptJSON []byte
+			var phase runtimeRemovalPhase
+			err = database.QueryRow(`SELECT manifest_json, runtime_quiescence_json, phase
+FROM runtime_removal_manifests WHERE job_id=?`, jobID).Scan(&manifestJSON, &receiptJSON, &phase)
+			_ = database.Close()
+			if err == nil {
+				var record runtimeRemovalRecord
+				record.phase = phase
+				if err := json.Unmarshal(manifestJSON, &record.manifest); err != nil {
+					t.Fatal(err)
+				}
+				if len(receiptJSON) != 0 {
+					if err := json.Unmarshal(receiptJSON, &record.receipt); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if record.phase == want {
+					return record
+				}
+			} else if err != sql.ErrNoRows {
+				t.Fatal(err)
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("runtime removal manifest for %s did not reach %s", jobID, want)
+	return runtimeRemovalRecord{}
 }
 
 type nativeAcceptanceDeadman struct {
@@ -322,10 +499,14 @@ func (renewer nativeAcceptanceDeadman) QueueSuccessfulRenewal(claim l1.Claim, tt
 	if err != nil {
 		return err
 	}
+	removalGeneration := "attempt"
+	if claim.Job.Spec.Class == contract.JobClassService {
+		removalGeneration = fmt.Sprint(l1.InitialServiceRemovalGeneration)
+	}
 	return session.QueueAttemptRenewal(ocihelper.AttemptAuthority{
 		NodeID: renewer.nodeID, BootSessionID: renewer.bootSessionID, JobID: claim.Job.JobID,
 		AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
-		Class: claim.Job.Spec.Class, RemovalGeneration: "attempt",
+		Class: claim.Job.Spec.Class, RemovalGeneration: removalGeneration,
 	}, ttl)
 }
 
@@ -435,7 +616,7 @@ func nativeOCIServiceRequest(reference, digest, suffix string, argv []string) wo
 			NodeID: "service-publication-node", BootSessionID: "service-publication-boot",
 			JobID: "service-job-" + suffix, AttemptID: "service-attempt-" + suffix,
 			FencingToken: "service-fence-" + suffix, WorkloadClass: contract.JobClassService,
-			RemovalGeneration: "attempt",
+			RemovalGeneration: fmt.Sprint(l1.InitialServiceRemovalGeneration),
 		},
 		RuntimeHandler: ocihelper.DefaultRuntimeHandler,
 		ManagedVolumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}},

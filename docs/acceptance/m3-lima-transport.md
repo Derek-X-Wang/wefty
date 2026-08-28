@@ -1,6 +1,6 @@
 # M3 Lima transport and service publication attended acceptance
 
-This is the owner-hardware lane for Tickets #145, #147, and #149 and the Mac rows of the M3 OCI
+This is the owner-hardware lane for Tickets #145, #147, #149, and #150 and the Mac rows of the M3 OCI
 spec §9. It is deliberately absent from `service-acceptance-realtiming`: hosted
 macOS runners do not prove nested Lima `vz`. A run is PASS only when every row
 below has a captured command, exit code, and redacted receipt from the same
@@ -169,6 +169,18 @@ the helper instance/session generation before each row.
    Linux guest's native filesystem, remain absent from the Lima host mounts,
    and never traverse virtiofs. Record these facts in the
    `service_data_guest_native` row.
+9. Removal manifest: while the agent is offline, request removal of a bound OCI
+   service and observe L1 at exactly `removal_pending`. Return the same
+   node through the ordinary boot sweep barrier, then capture the immutable
+   job/removal-generation manifest with every attempt lease, task, container,
+   snapshot, shim, cgroup, framed-log directory, service-data volume, and its
+   owner record. Require the persisted positive prior-boot sweep receipt and
+   `prepared -> quarantined -> complete` phase history, then require the
+   existing completion path to reach `removed_verified`. Record the
+   guest-native inventories and phase facts in
+   `service_removal_manifest_offline`. Ticket #150 does not prove service-data
+   byte deletion or a new post-delete absence attestation; Ticket #151 owns
+   those additions.
 
 ## Ordinary L3 OCI one-shot
 
@@ -275,6 +287,13 @@ Ticket #149 additionally requires `service_data_guest_native` with
 `virtiofs_data=false`, and `rootfs_discarded=true` from the same attended
 session. A hosted macOS runner or a host-shared backing path is `NOT-RUN`, not
 PASS evidence.
+
+Ticket #150 additionally requires `service_removal_manifest_offline` with
+`removal_phase=complete`, `removal_pending_observed=true`,
+`removal_completed=true`, `runtime_quiesced=true`, and non-empty
+`resource_manifests` naming the service
+data directory and its owner record independently. Hosted macOS runners are
+`NOT-RUN`; they do not satisfy this owner-hardware row.
 
 Ticket #152 additionally requires PASS rows for `launch_daemon`,
 `no_lima_autostart`, `helper_install_permissions`,

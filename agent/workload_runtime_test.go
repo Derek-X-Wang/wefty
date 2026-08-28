@@ -483,6 +483,61 @@ func TestProcessPreflightRejectsBeforeAgentResourceAcquisition(t *testing.T) {
 	}
 }
 
+func TestOCIPreflightFailureDoesNotPersistRuntimeManifest(t *testing.T) {
+	outbox, err := newEvidenceOutbox(t.TempDir(), "preflight-node", 1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	runtime := &manifestPreflightFailureRuntime{}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, outbox: outbox,
+		clock: systemClock{}, nodeID: "preflight-node", bootSessionID: "preflight-boot",
+	})
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "preflight-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindOCI, Class: contract.JobClassService,
+		}},
+		Lease: l1.AttemptLease{AttemptID: "preflight-attempt", FencingToken: "preflight-fence"},
+	}
+	result, err := lifecycle.runWorkload(t.Context(), claim)
+	if err == nil || result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailureImageNotFound {
+		t.Fatalf("OCI preflight failure = (%+v, %v)", result, err)
+	}
+	if runtime.manifestCalls != 0 {
+		t.Fatalf("preflight failure derived %d removal manifests", runtime.manifestCalls)
+	}
+	var count int
+	if err := outbox.spool.db.QueryRow(`SELECT COUNT(*) FROM runtime_attempt_manifests WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("preflight failure persisted %d runtime manifests", count)
+	}
+}
+
+type manifestPreflightFailureRuntime struct{ manifestCalls int }
+
+func (*manifestPreflightFailureRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	err := errors.New("image does not exist")
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{
+		Outcome: contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureImageNotFound, Message: err.Error()}},
+	}, err
+}
+
+func (*manifestPreflightFailureRuntime) Run(context.Context, workloadrunner.Request, workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	panic("Run called after failed preflight")
+}
+
+func (*manifestPreflightFailureRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime}, nil
+}
+
+func (runtime *manifestPreflightFailureRuntime) RemovalResourceManifest(workloadrunner.Request) (workloadrunner.RuntimeResourceManifest, error) {
+	runtime.manifestCalls++
+	return workloadrunner.RuntimeResourceManifest{}, nil
+}
+
 type reapRefusingRuntime struct {
 	runCalls  int
 	reapCalls int

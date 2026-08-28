@@ -24,6 +24,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 var (
@@ -272,6 +273,52 @@ func (h *acceptanceHarness) submitFailedService(t *testing.T) l1.Job {
 	h.specs[job.JobID] = spec
 	return job
 }
+
+func (h *acceptanceHarness) submitBackoffService(t *testing.T) l1.Job {
+	return h.submitOCIExitService(t, "backoff", nil)
+}
+
+func (h *acceptanceHarness) submitFailedOCIService(t *testing.T) l1.Job {
+	maximum := 1
+	return h.submitOCIExitService(t, "failed", &maximum)
+}
+
+func (h *acceptanceHarness) submitOCIExitService(t *testing.T, suffix string, maxRestartStreak *int) l1.Job {
+	t.Helper()
+	workingDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workingDirectory, "operator-owned"), []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec := contract.JobSpec{
+		SchemaVersion:    contract.SchemaVersionV1,
+		DispatchKey:      suffix + "-oci-service-acceptance-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+		Kind:             contract.JobKindOCI,
+		Class:            contract.JobClassService,
+		Restart:          contract.RestartAlways,
+		MaxRestartStreak: maxRestartStreak,
+		RuntimeHandler:   ocihelper.DefaultRuntimeHandler,
+		RoutingTags:      []string{"service-acceptance"},
+		Execution: contract.ExecutionSpec{
+			OCI: &contract.OCIExecutionSpec{
+				Image: contract.OCIImageSpec{
+					Reference: os.Getenv("WEFTY_OCI_PROBE_REFERENCE"),
+					Digest:    stringPointer(os.Getenv("WEFTY_OCI_PROBE_DIGEST")),
+				},
+				Argv: []string{"/bin/sh", "-c", "exit 7"},
+			},
+		},
+	}
+	var job l1.Job
+	status, body := h.doJSON(t, http.MethodPost, "/v1/jobs", spec, &job)
+	if status != http.StatusCreated {
+		t.Fatalf("submit %s OCI service status = %d body=%s", suffix, status, body)
+	}
+	h.workingDirectories[job.JobID] = workingDirectory
+	h.specs[job.JobID] = spec
+	return job
+}
+
+func stringPointer(value string) *string { return &value }
 
 func (h *acceptanceHarness) submitPortlessService(t *testing.T) l1.Job {
 	t.Helper()

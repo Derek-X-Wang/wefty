@@ -54,6 +54,9 @@ type logSpool struct {
 	db              *sql.DB
 	maxOneShotBytes int64
 	maxServiceBytes int64
+	// runtimeRemovalCheckpoint is a test-only crash seam exercised at durable
+	// manifest state boundaries; production construction always leaves it nil.
+	runtimeRemovalCheckpoint func(runtimeRemovalCheckpoint) error
 }
 
 func openLogSpool(directory, nodeID string, maxOneShotBytes int64) (*logSpool, error) {
@@ -176,6 +179,35 @@ CREATE TABLE IF NOT EXISTS spool_removals (
 	  platform_variant TEXT NOT NULL,
 	  snapshotter TEXT NOT NULL,
 	  updated_ns INTEGER NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS runtime_attempt_manifests (
+	  attempt_id TEXT PRIMARY KEY,
+	  job_id TEXT NOT NULL,
+	  runtime_kind TEXT NOT NULL,
+	  removal_generation TEXT NOT NULL,
+	  manifest_json BLOB NOT NULL,
+	  created_ns INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS runtime_attempt_manifests_job
+	  ON runtime_attempt_manifests(job_id, attempt_id);
+	CREATE TABLE IF NOT EXISTS runtime_service_manifests (
+	  job_id TEXT PRIMARY KEY,
+	  attempt_id TEXT NOT NULL UNIQUE,
+	  removal_generation TEXT NOT NULL,
+	  manifest_json BLOB NOT NULL,
+	  created_ns INTEGER NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS runtime_removal_manifests (
+	  job_id TEXT PRIMARY KEY,
+	  removal_generation INTEGER NOT NULL,
+	  cleanup_fence TEXT NOT NULL,
+	  root_instance_id TEXT NOT NULL,
+	  manifest_json BLOB NOT NULL,
+	  runtime_quiescence_json BLOB,
+	  phase TEXT NOT NULL,
+	  prepared_ns INTEGER NOT NULL,
+	  quiesced_ns INTEGER,
+	  completed_ns INTEGER
 	);`
 	if _, err := spool.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("agent: initialize log spool: %w", err)
@@ -249,7 +281,12 @@ func (spool *logSpool) DeleteOCIImageBindingPin(ctx context.Context, jobID strin
 }
 
 func (spool *logSpool) beginRemoval(ctx context.Context, removal localRemoval, startedAt time.Time) error {
-	response, err := spool.db.ExecContext(ctx, `INSERT INTO spool_removals(
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("agent: begin service removal intent: %w", err)
+	}
+	defer tx.Rollback()
+	response, err := tx.ExecContext(ctx, `INSERT INTO spool_removals(
 job_id, removal_generation, cleanup_fence, root_instance_id, started_ns
 ) VALUES(?, ?, ?, ?, ?)
 ON CONFLICT(job_id) DO NOTHING`, removal.jobID, removal.generation, removal.cleanupFence,
@@ -262,12 +299,24 @@ ON CONFLICT(job_id) DO NOTHING`, removal.jobID, removal.generation, removal.clea
 	}
 	var generation uint64
 	var cleanupFence, rootInstanceID string
-	if err := spool.db.QueryRowContext(ctx, `SELECT removal_generation, cleanup_fence, root_instance_id
+	if err := tx.QueryRowContext(ctx, `SELECT removal_generation, cleanup_fence, root_instance_id
 FROM spool_removals WHERE job_id=?`, removal.jobID).Scan(&generation, &cleanupFence, &rootInstanceID); err != nil {
 		return fmt.Errorf("agent: verify service removal intent: %w", err)
 	}
 	if generation != removal.generation || cleanupFence != removal.cleanupFence || rootInstanceID != removal.rootInstanceID {
 		return fmt.Errorf("agent: service removal %q conflicts with locally persisted authority", removal.jobID)
+	}
+	frozen, err := spool.freezeRuntimeRemoval(ctx, tx, removal, startedAt)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("agent: commit service removal intent: %w", err)
+	}
+	if frozen && spool.runtimeRemovalCheckpoint != nil {
+		if err := spool.runtimeRemovalCheckpoint(runtimeRemovalCheckpointAfterManifest); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -280,10 +329,29 @@ func (spool *logSpool) purgeJob(ctx context.Context, jobID string) error {
 }
 
 func (spool *logSpool) completeRemoval(ctx context.Context, removal localRemoval) error {
-	if _, err := spool.db.ExecContext(ctx, `DELETE FROM spool_removals
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("agent: begin completed service removal release: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM spool_removals
 WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id=?`,
 		removal.jobID, removal.generation, removal.cleanupFence, removal.rootInstanceID); err != nil {
 		return fmt.Errorf("agent: release completed service removal intent: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM runtime_attempt_manifests WHERE job_id=?`, removal.jobID); err != nil {
+		return fmt.Errorf("agent: release runtime attempt manifests: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM runtime_service_manifests WHERE job_id=?`, removal.jobID); err != nil {
+		return fmt.Errorf("agent: release current runtime service manifest: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM runtime_removal_manifests
+WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id=?`,
+		removal.jobID, removal.generation, removal.cleanupFence, removal.rootInstanceID); err != nil {
+		return fmt.Errorf("agent: release runtime removal manifest: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("agent: commit completed service removal release: %w", err)
 	}
 	return nil
 }
@@ -659,6 +727,9 @@ func (spool *logSpool) completionDelivered(ctx context.Context, attemptID string
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts SET result_json=NULL, finished_ns=NULL WHERE attempt_id=?`, attemptID); err != nil {
 		return fmt.Errorf("agent: release delivered completion: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM runtime_attempt_manifests WHERE attempt_id=?`, attemptID); err != nil {
+		return fmt.Errorf("agent: prune delivered runtime attempt manifest: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM spool_attempts
 WHERE attempt_id=? AND result_json IS NULL AND incomplete_json IS NULL

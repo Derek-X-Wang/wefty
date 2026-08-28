@@ -115,9 +115,25 @@ func TestOCIPrestartRuntimeUnavailablePersistsWallClockBackoffAtProductionTiming
 func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	assertProductionTimingDefaults(t)
 	evidence := newRealTimingEvidence(t)
+	var agentArguments []string
+	if runtime.GOOS == "linux" {
+		for _, value := range []struct{ name, flag string }{
+			{"WEFTY_OCI_HELPER_SOCKET", "--oci-helper-socket="},
+			{"WEFTY_OCI_HELPER_CHECKSUM", "--oci-helper-checksum="},
+			{"WEFTY_OCI_PROBE_REFERENCE", "--oci-probe-image="},
+			{"WEFTY_OCI_PROBE_DIGEST", "--oci-probe-digest="},
+		} {
+			setting := os.Getenv(value.name)
+			if setting == "" {
+				t.Fatalf("Linux OCI removal acceptance requires %s", value.name)
+			}
+			agentArguments = append(agentArguments, value.flag+setting)
+		}
+	}
 	harness := newAcceptanceHarnessWithOptions(t, acceptanceHarnessOptions{
 		leaseDuration:     l1.DefaultLeaseDuration,
 		productionTimings: true,
+		agentArguments:    agentArguments,
 	})
 	t.Cleanup(func() {
 		evidence.recordProcessOutput("control-plane.log", harness.controlPlane)
@@ -292,13 +308,33 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	evidence.write("create-stopped-removal-replay.json", replayBody)
 	assertNoServiceResidue(t, harness, primary.JobID)
 
-	failed := harness.submitFailedService(t)
+	var failed l1.Job
+	if runtime.GOOS == "linux" {
+		failed = harness.submitFailedOCIService(t)
+	} else {
+		failed = harness.submitFailedService(t)
+	}
 	failedState := harness.waitForJobState(t, failed.JobID, contract.JobClassService, contract.JobFailed, 45*time.Second)
 	evidence.recordJSON("status-latched-failed.json", failedState)
+	if runtime.GOOS == "linux" {
+		assertCurrentRuntimeServiceManifest(t, harness.spoolDirectory, failed.JobID)
+	}
 	failedRemoval := runServiceCLI(t, harness, "services", "remove", failed.JobID, "--wait=90s")
 	evidence.write("remove-latched-failed.json", failedRemoval)
 	harness.waitForJobState(t, failed.JobID, contract.JobClassService, contract.JobRemovedVerified, 10*time.Second)
 	assertNoServiceResidue(t, harness, failed.JobID)
+
+	var backoff l1.Job
+	if runtime.GOOS == "linux" {
+		backoff = harness.submitBackoffService(t)
+		backoffState := waitForRestartPending(t, harness, backoff.JobID, 45*time.Second)
+		evidence.recordJSON("status-removal-from-backoff.json", backoffState)
+		assertCurrentRuntimeServiceManifest(t, harness.spoolDirectory, backoff.JobID)
+		backoffRemoval := runServiceCLI(t, harness, "services", "remove", backoff.JobID, "--wait=90s")
+		evidence.write("remove-backoff.json", backoffRemoval)
+		harness.waitForJobState(t, backoff.JobID, contract.JobClassService, contract.JobRemovedVerified, 10*time.Second)
+		assertNoServiceResidue(t, harness, backoff.JobID)
+	}
 
 	offline, offlineCreate := harness.submitEchoServiceWithDispatchKey(t, ports[3], "realtiming-offline")
 	evidence.write("create-offline.json", offlineCreate)
@@ -344,6 +380,9 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	assertNoServiceResidue(t, harness, offline.JobID)
 
 	allJobIDs := []string{primary.JobID, sibling.JobID, failed.JobID, offline.JobID}
+	if backoff.JobID != "" {
+		allJobIDs = append(allJobIDs, backoff.JobID)
+	}
 	for _, jobID := range allJobIDs {
 		assertWorkingDirectoryUntouched(t, harness.workingDirectories[jobID])
 		assertManagedServiceAbsent(t, harness, jobID)
@@ -673,13 +712,50 @@ func assertSpoolRowsAbsent(t *testing.T, spoolDirectory string, jobIDs []string)
 	}
 	defer database.Close()
 	for _, jobID := range jobIDs {
-		var attempts int
+		var attempts, runtimeAttempts, runtimeServices, runtimeRemovals int
 		if err := database.QueryRow(`SELECT COUNT(*) FROM spool_attempts WHERE job_id=?`, jobID).Scan(&attempts); err != nil {
 			t.Fatal(err)
 		}
 		if attempts != 0 {
 			t.Fatalf("service %q retained %d spool attempts", jobID, attempts)
 		}
+		for query, destination := range map[string]*int{
+			`SELECT COUNT(*) FROM runtime_attempt_manifests WHERE job_id=?`: &runtimeAttempts,
+			`SELECT COUNT(*) FROM runtime_service_manifests WHERE job_id=?`: &runtimeServices,
+			`SELECT COUNT(*) FROM runtime_removal_manifests WHERE job_id=?`: &runtimeRemovals,
+		} {
+			if err := database.QueryRow(query, jobID).Scan(destination); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if runtimeAttempts != 0 || runtimeServices != 0 || runtimeRemovals != 0 {
+			t.Fatalf("service %q retained runtime rows attempts=%d current=%d removals=%d", jobID, runtimeAttempts, runtimeServices, runtimeRemovals)
+		}
+	}
+}
+
+func assertCurrentRuntimeServiceManifest(t *testing.T, spoolDirectory, jobID string) {
+	t.Helper()
+	database, err := sql.Open("sqlite", findSpoolDatabase(t, spoolDirectory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var payload []byte
+	if err := database.QueryRow(`SELECT manifest_json FROM runtime_service_manifests WHERE job_id=?`, jobID).Scan(&payload); err != nil {
+		t.Fatalf("service %q has no bounded current runtime manifest: %v", jobID, err)
+	}
+	var manifest struct {
+		JobID                  string `json:"job_id"`
+		AttemptID              string `json:"attempt_id"`
+		ServiceDataVolume      string `json:"service_data_volume"`
+		ServiceDataOwnerRecord string `json:"service_data_owner_record"`
+	}
+	if err := json.Unmarshal(payload, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.JobID != jobID || manifest.AttemptID == "" || manifest.ServiceDataVolume == "" || manifest.ServiceDataOwnerRecord == "" {
+		t.Fatalf("service %q current runtime manifest is incomplete: %+v", jobID, manifest)
 	}
 }
 

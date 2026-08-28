@@ -291,9 +291,12 @@ func TestLogSpoolKeepsRestartedAttemptsSeparate(t *testing.T) {
 
 func TestLogSpoolPersistsFinalizedCompletionAcrossRestart(t *testing.T) {
 	directory := t.TempDir()
-	claim := spoolTestClaim("attempt-completion")
+	claim := serviceSpoolTestClaim("attempt-completion")
 	spool := openTestLogSpool(t, directory, "node-completion", 1024)
 	if err := spool.ensureAttempt(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.storeRuntimeResourceManifest(context.Background(), testRuntimeResourceManifest(claim.Job.JobID, claim.Lease.AttemptID), time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	exitCode := 0
@@ -331,6 +334,18 @@ func TestLogSpoolPersistsFinalizedCompletionAcrossRestart(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("delivered completion retained %d attempt rows", count)
+	}
+	if err := spool.db.QueryRow("SELECT COUNT(*) FROM runtime_attempt_manifests WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("delivered completion retained %d runtime manifest rows", count)
+	}
+	if err := spool.db.QueryRow("SELECT COUNT(*) FROM runtime_service_manifests WHERE job_id=?", claim.Job.JobID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("delivered service completion retained %d current service manifests, want one bounded removal source", count)
 	}
 }
 

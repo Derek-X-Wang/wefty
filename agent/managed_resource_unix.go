@@ -9,9 +9,8 @@ import (
 	"path/filepath"
 
 	"github.com/Derek-X-Wang/wefty/agent/managedroot"
+	"github.com/Derek-X-Wang/wefty/l1"
 )
-
-const initialServiceRemovalGeneration uint64 = 1
 
 type processManagedResource struct {
 	root                  *managedroot.Manager
@@ -64,7 +63,7 @@ func (resource *processManagedResource) resumeRemovals(ctx context.Context) ([]l
 }
 
 func (resource *processManagedResource) prepareAttempt(jobID, attemptID string) (managedResourceAttempt, func(), error) {
-	paths, err := resource.root.CreateService(jobID, initialServiceRemovalGeneration)
+	paths, err := resource.root.CreateService(jobID, l1.InitialServiceRemovalGeneration)
 	if err != nil {
 		return managedResourceAttempt{}, func() {}, fmt.Errorf("create service container: %w", err)
 	}
