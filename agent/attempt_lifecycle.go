@@ -948,5 +948,8 @@ func toL1Result(result contract.ProcessResult) l1.ProcessResult {
 }
 
 func toL1QuiescenceEvidence(evidence workloadrunner.ReapEvidence) l1.RuntimeQuiescenceEvidence {
+	if evidence == workloadrunner.ReapEvidenceOCIRuntimeSweep {
+		return l1.RuntimeQuiescenceOCISweep
+	}
 	return l1.RuntimeQuiescenceEvidence(evidence)
 }

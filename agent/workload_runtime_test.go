@@ -31,6 +31,12 @@ func workloadRequest(attemptID string) workloadrunner.Request {
 	}
 }
 
+func TestOCIRuntimeSweepMapsToL1QuiescenceContract(t *testing.T) {
+	if got := toL1QuiescenceEvidence(workloadrunner.ReapEvidenceOCIRuntimeSweep); got != l1.RuntimeQuiescenceOCISweep {
+		t.Fatalf("runtime sweep evidence mapped to %q, want %q", got, l1.RuntimeQuiescenceOCISweep)
+	}
+}
+
 func TestWorkloadRuntimeRequiresPositiveReapVerification(t *testing.T) {
 	runtime := &reapRefusingRuntime{}
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
