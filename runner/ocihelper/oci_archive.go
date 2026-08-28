@@ -67,8 +67,10 @@ func inspectOCIArchiveWithSpoolForPlatform(ctx context.Context, runtimeRoot stri
 	}
 	archivePath := file.Name()
 	defer func() {
-		if closeErr := file.Close(); returnErr == nil {
-			returnErr = closeErr
+		if file != nil {
+			if closeErr := file.Close(); returnErr == nil {
+				returnErr = closeErr
+			}
 		}
 		if returnErr != nil {
 			_ = os.Remove(archivePath)
@@ -222,7 +224,117 @@ func inspectOCIArchiveWithSpoolForPlatform(ctx context.Context, runtimeRoot stri
 	if err != nil {
 		return ociArchiveInspection{}, err
 	}
+	reachable, found, err := archiveReachableBlobs(top, manifest.Digest, blobs, 0)
+	if err != nil {
+		return ociArchiveInspection{}, err
+	}
+	if !found {
+		return ociArchiveInspection{}, errors.New("OCI archive selected manifest is not reachable from its top-level descriptor")
+	}
+	if err := filterOCIArchiveForPlatform(file, archivePath, reachable); err != nil {
+		return ociArchiveInspection{}, err
+	}
+	file = nil
 	return ociArchiveInspection{Path: archivePath, Reference: reference, TopLevel: top, Platform: platform, PlatformDigest: manifest.Digest}, nil
+}
+
+// archiveReachableBlobs returns the descriptor graph required to import one
+// selected platform while retaining the top-level identity. Multi-platform OCI
+// archives can contain large foreign-platform layers; those bytes must not
+// enter a node whose cache admission and pins account only for the selected
+// platform.
+func archiveReachableBlobs(descriptor ocispec.Descriptor, selected digest.Digest, blobs map[digest.Digest]archiveBlob, depth int) (map[digest.Digest]struct{}, bool, error) {
+	if depth > 32 {
+		return nil, false, errors.New("OCI archive image index nesting exceeds the helper bound")
+	}
+	if images.IsManifestType(descriptor.MediaType) {
+		if descriptor.Digest != selected {
+			return nil, false, nil
+		}
+		var manifest ocispec.Manifest
+		if err := json.Unmarshal(blobs[descriptor.Digest].payload, &manifest); err != nil {
+			return nil, false, errors.New("OCI archive image manifest is invalid")
+		}
+		reachable := map[digest.Digest]struct{}{descriptor.Digest: {}, manifest.Config.Digest: {}}
+		for _, layer := range manifest.Layers {
+			reachable[layer.Digest] = struct{}{}
+		}
+		return reachable, true, nil
+	}
+	if !images.IsIndexType(descriptor.MediaType) {
+		return nil, false, nil
+	}
+	var index ocispec.Index
+	if err := json.Unmarshal(blobs[descriptor.Digest].payload, &index); err != nil {
+		return nil, false, errors.New("OCI archive image index is invalid")
+	}
+	for _, child := range index.Manifests {
+		reachable, found, err := archiveReachableBlobs(child, selected, blobs, depth+1)
+		if err != nil {
+			return nil, false, err
+		}
+		if found {
+			reachable[descriptor.Digest] = struct{}{}
+			return reachable, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+func filterOCIArchiveForPlatform(source *os.File, archivePath string, reachable map[digest.Digest]struct{}) (returnErr error) {
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	filtered, err := os.CreateTemp(filepath.Dir(archivePath), "wefty-image-filtered-*.tar")
+	if err != nil {
+		return err
+	}
+	filteredPath := filtered.Name()
+	defer func() {
+		if returnErr != nil {
+			_ = os.Remove(filteredPath)
+		}
+	}()
+	writer := tar.NewWriter(filtered)
+	reader := tar.NewReader(source)
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("filter OCI archive: %w", err)
+		}
+		name := path.Clean(strings.TrimPrefix(header.Name, "./"))
+		keep := name == "oci-layout" || name == "index.json"
+		if strings.HasPrefix(name, "blobs/sha256/") {
+			_, keep = reachable[digest.Digest("sha256:"+path.Base(name))]
+		}
+		if !keep || header.FileInfo().IsDir() {
+			continue
+		}
+		copyHeader := *header
+		copyHeader.Name = name
+		if err := writer.WriteHeader(&copyHeader); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(writer, reader, header.Size); err != nil {
+			return err
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	if err := filtered.Close(); err != nil {
+		return err
+	}
+	if err := source.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(filteredPath, archivePath); err != nil {
+		return err
+	}
+	return nil
 }
 
 func readArchiveMetadata(reader io.Reader, size int64) ([]byte, error) {
