@@ -107,6 +107,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      # The only dynamic checkout is guarded to the branch-filtered workflow_run
+      # event; schedule/dispatch check out literal main, and the downloaded
+      # receipt is matched before any repository code executes. CodeQL does not
+      # model the mutually exclusive step guards across this multi-trigger job.
+      # codeql[actions/cache-poisoning/poisonable-step]
       - name: Provision pinned Linux OCI engine and probe
         if: runner.os == 'Linux'
         env:
