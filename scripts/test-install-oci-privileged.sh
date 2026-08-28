@@ -20,7 +20,7 @@ install -m 0755 /artifacts/wefty-agent /usr/local/libexec/wefty-agent
 printf 'probe archive fixture\n' >/tmp/wefty-probe.oci.tar
 bash /src/scripts/build-oci-install-manifest.sh \
   --helper /usr/local/libexec/wefty-agent \
-  --probe-reference wefty.local/probe:v1 \
+  --probe-reference wefty.local/probe \
   --probe-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --probe-archive /tmp/wefty-probe.oci.tar \
   --output /usr/local/share/wefty/oci/manifest.json >/dev/null
