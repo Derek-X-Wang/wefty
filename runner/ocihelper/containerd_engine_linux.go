@@ -1140,13 +1140,13 @@ func (engine *ContainerdEngine) ReapAttemptAsGuardian(ctx context.Context, autho
 }
 
 func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteRequest) (DeleteResponse, error) {
-	attempt, err := engine.attempt(request.Authority)
-	if err != nil && !errdefs.IsNotFound(err) {
-		return DeleteResponse{}, err
-	}
 	resources, identityErr := DeterministicResourceIdentity(request.Authority)
 	if identityErr != nil {
 		return DeleteResponse{}, identityErr
+	}
+	attempt, err := engine.attempt(request.Authority)
+	if err != nil && !errdefs.IsNotFound(err) {
+		return DeleteResponse{}, err
 	}
 	if attempt != nil {
 		resources = attempt.resources
@@ -1155,23 +1155,32 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 	defer cancel()
 	var lastErr error
 	for {
-		deleteErr := engine.deleteResources(cleanupCtx, request.Authority, resources)
-		verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
-		runtimeAbsent := verification.Absent
-		if request.Authority.Class == contract.JobClassService {
-			runtimeAbsent = InventoryEmpty(withoutServiceDataInventory(verification.Inventory))
-		}
-		if deleteErr == nil && verifyErr == nil && runtimeAbsent {
-			if releaseErr := engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()); releaseErr == nil {
-				return DeleteResponse{Deleted: true}, nil
+		// A missing in-memory attempt is not absence proof. Validate every
+		// label-capable resource that still occupies the deterministic manifest
+		// identity before any NotFound result can participate in deletion. Keep
+		// this inside the retry budget because containerd inspection is transient.
+		identityErr := engine.validateAttemptResourceIdentity(cleanupCtx, request.Authority, resources)
+		if identityErr == nil {
+			deleteErr := engine.deleteResources(cleanupCtx, request.Authority, resources)
+			verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
+			runtimeAbsent := verification.Absent
+			if request.Authority.Class == contract.JobClassService {
+				runtimeAbsent = InventoryEmpty(withoutServiceDataInventory(verification.Inventory))
+			}
+			if deleteErr == nil && verifyErr == nil && runtimeAbsent {
+				if releaseErr := engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()); releaseErr == nil {
+					return DeleteResponse{Deleted: true}, nil
+				} else {
+					lastErr = releaseErr
+				}
 			} else {
-				lastErr = releaseErr
+				lastErr = errors.Join(deleteErr, verifyErr)
+			}
+			if lastErr == nil {
+				lastErr = fmt.Errorf("attempt resources remain after delete: %+v", verification.Inventory)
 			}
 		} else {
-			lastErr = errors.Join(deleteErr, verifyErr)
-		}
-		if lastErr == nil {
-			lastErr = fmt.Errorf("attempt resources remain after delete: %+v", verification.Inventory)
+			lastErr = identityErr
 		}
 		timer := time.NewTimer(25 * time.Millisecond)
 		select {
@@ -1181,6 +1190,80 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 		case <-timer.C:
 		}
 	}
+}
+
+func (engine *ContainerdEngine) validateAttemptResourceIdentity(ctx context.Context, authority AttemptAuthority, resources ResourceIdentity) error {
+	expected, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		return err
+	}
+	// Handoff volumes are keyed by the stable owner key, not attempt
+	// authority. The authenticated Run request derived this live name before
+	// the engine retained it, so compare the remaining authority-derived names.
+	expected.HandoffVolumeDirectory = resources.HandoffVolumeDirectory
+	if !sameRuntimeResourceNames(resources, expected) {
+		return errors.New("attempt runtime resource names do not match fenced authority")
+	}
+	container, err := engine.client.LoadContainer(ctx, resources.ContainerID)
+	if err == nil {
+		info, infoErr := container.Info(ctx)
+		if infoErr != nil {
+			return fmt.Errorf("inspect container identity before deletion: %w", infoErr)
+		}
+		if err := validateRuntimeResourceLabels("container", info.ID, resources.ContainerID, info.Labels, authority); err != nil {
+			return err
+		}
+	} else if !errdefs.IsNotFound(err) {
+		return fmt.Errorf("load container identity before deletion: %w", err)
+	}
+
+	info, err := engine.client.SnapshotService(DefaultSnapshotter).Stat(ctx, resources.SnapshotID)
+	if err == nil {
+		if err := validateRuntimeResourceLabels("snapshot", info.Name, resources.SnapshotID, info.Labels, authority); err != nil {
+			return err
+		}
+	} else if !errdefs.IsNotFound(err) {
+		return fmt.Errorf("inspect snapshot identity before deletion: %w", err)
+	}
+
+	leaseList, err := engine.client.LeasesService().List(ctx, "id=="+resources.LeaseID)
+	if err != nil {
+		return fmt.Errorf("list lease identity before deletion: %w", err)
+	}
+	for _, lease := range leaseList {
+		if lease.ID != resources.LeaseID {
+			continue
+		}
+		if err := validateRuntimeResourceLabels("lease", lease.ID, resources.LeaseID, lease.Labels, authority); err != nil {
+			return err
+		}
+		break
+	}
+	return nil
+}
+
+func sameRuntimeResourceNames(left, right ResourceIdentity) bool {
+	return left.LeaseID == right.LeaseID && left.SnapshotID == right.SnapshotID &&
+		left.ContainerID == right.ContainerID && left.TaskID == right.TaskID &&
+		left.ShimID == right.ShimID && left.CgroupID == right.CgroupID &&
+		left.LogSegmentDirectory == right.LogSegmentDirectory &&
+		left.HandoffVolumeDirectory == right.HandoffVolumeDirectory &&
+		left.ServiceVolumeDirectory == right.ServiceVolumeDirectory &&
+		left.ServiceVolumeOwnerRecord == right.ServiceVolumeOwnerRecord
+}
+
+func validateRuntimeResourceLabels(kind, observedID, expectedID string, labels map[string]string, authority AttemptAuthority) error {
+	if observedID != expectedID {
+		return fmt.Errorf("%s %q does not match removal manifest identity %q", kind, observedID, expectedID)
+	}
+	observed, err := authorityFromLabels(labels)
+	if err != nil {
+		return fmt.Errorf("validate %s %s labels before deletion: %w", kind, observedID, err)
+	}
+	if observed.key() != authority.key() {
+		return fmt.Errorf("%s %s labels do not match removal authority", kind, observedID)
+	}
+	return nil
 }
 
 func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {

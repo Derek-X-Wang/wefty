@@ -19,21 +19,24 @@ var errServiceRemovalRequested = errors.New("service removal requested")
 // the ordering between durable local intent, process reaping, spool cleanup,
 // the guardrail call, and L1 attestation.
 type removalController struct {
-	client          *Client
-	outbox          *evidenceOutbox
-	managed         managedResourceManager
-	session         *agentSession
-	nodeID          string
-	bootSessionID   string
-	logf            func(string, ...any)
-	beginRemoval    func(context.Context, localRemoval) error
-	reapService     func(context.Context, string) (workloadrunner.ReapReceipt, error)
-	clearReap       func(string)
-	purgeJob        func(context.Context, string) error
-	removeResource  func(context.Context, localRemoval) error
-	releaseImagePin func(context.Context, string) error
-	ackRemoval      func(context.Context, localRemoval) error
-	finishRemoval   func(context.Context, localRemoval) error
+	client                *Client
+	outbox                *evidenceOutbox
+	managed               managedResourceManager
+	session               *agentSession
+	nodeID                string
+	bootSessionID         string
+	logf                  func(string, ...any)
+	beginRemoval          func(context.Context, localRemoval) error
+	loadRuntimeRemoval    func(context.Context, string) (runtimeRemovalRecord, bool, error)
+	listRuntimeRemovals   func(context.Context) ([]runtimeRemovalRecord, error)
+	recordRuntimeQuiesced func(context.Context, localRemoval, workloadrunner.ReapReceipt) error
+	reapService           func(context.Context, string) (workloadrunner.ReapReceipt, error)
+	clearReap             func(string)
+	purgeJob              func(context.Context, string) error
+	removeResource        func(context.Context, localRemoval) error
+	releaseImagePin       func(context.Context, string) error
+	ackRemoval            func(context.Context, localRemoval) error
+	finishRemoval         func(context.Context, localRemoval) error
 
 	mu       sync.Mutex
 	inflight map[string]struct{}
@@ -55,6 +58,9 @@ func newRemovalController(
 	}
 	if outbox != nil {
 		controller.beginRemoval = outbox.beginRemoval
+		controller.loadRuntimeRemoval = outbox.runtimeRemoval
+		controller.listRuntimeRemovals = outbox.pendingRuntimeRemovals
+		controller.recordRuntimeQuiesced = outbox.recordRuntimeQuiesced
 		controller.purgeJob = outbox.purgeJob
 		controller.finishRemoval = outbox.completeRemoval
 	}
@@ -121,6 +127,35 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	if err := controller.beginRemoval(ctx, removal); err != nil {
 		return err
 	}
+	if controller.loadRuntimeRemoval != nil {
+		runtimeRemoval, found, err := controller.loadRuntimeRemoval(ctx, removal.jobID)
+		if err != nil {
+			return err
+		}
+		if found {
+			switch runtimeRemoval.phase {
+			case runtimeRemovalComplete:
+				// Runtime preparation is complete; continue through the existing
+				// removal path so #150 remains additive to working cleanup.
+			case runtimeRemovalQuarantined:
+				if err := controller.recordRuntimeQuiesced(ctx, removal, runtimeRemoval.receipt); err != nil {
+					return err
+				}
+			case runtimeRemovalPrepared:
+				receipt, err := controller.reapService(ctx, directive.JobID)
+				if err != nil {
+					return err
+				}
+				if err := controller.recordRuntimeQuiesced(ctx, removal, receipt); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("service %q runtime removal has invalid phase %q", directive.JobID, runtimeRemoval.phase)
+			}
+			removal.processTreeReaped = true
+			return controller.completeLocalRemoval(ctx, removal)
+		}
+	}
 	receipt, err := controller.reapService(ctx, directive.JobID)
 	if err != nil {
 		return err
@@ -128,17 +163,21 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	if !receipt.RuntimeQuiesced || receipt.Evidence == "" {
 		return fmt.Errorf("service %q removal has no positive runtime reap receipt", directive.JobID)
 	}
-	// TODO(#150): persist the runtime receipt in the removal record. Until then,
-	// the legacy boolean remains the crash-resume compatibility marker only.
+	// Services created before runtime manifests were introduced retain the
+	// legacy boolean as their crash-resume compatibility marker.
 	removal.processTreeReaped = true
-	if err := controller.purgeJob(ctx, directive.JobID); err != nil {
+	return controller.completeLocalRemoval(ctx, removal)
+}
+
+func (controller *removalController) completeLocalRemoval(ctx context.Context, removal localRemoval) error {
+	if err := controller.purgeJob(ctx, removal.jobID); err != nil {
 		return err
 	}
 	if err := controller.removeResource(ctx, removal); err != nil {
 		return fmt.Errorf("delete managed service resource: %w", err)
 	}
 	if controller.releaseImagePin != nil {
-		if err := controller.releaseImagePin(ctx, directive.JobID); err != nil {
+		if err := controller.releaseImagePin(ctx, removal.jobID); err != nil {
 			return fmt.Errorf("release service binding image pin: %w", err)
 		}
 	}
@@ -149,7 +188,7 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 		return err
 	}
 	if controller.clearReap != nil {
-		controller.clearReap(directive.JobID)
+		controller.clearReap(removal.jobID)
 	}
 	return nil
 }
@@ -183,7 +222,44 @@ func (controller *removalController) prepareAuthorityLoss(ctx context.Context, j
 }
 
 func (controller *removalController) resume(ctx context.Context) error {
-	if controller == nil || controller.managed == nil {
+	if controller == nil {
+		return nil
+	}
+	if controller.listRuntimeRemovals != nil {
+		removals, err := controller.listRuntimeRemovals(ctx)
+		if err != nil {
+			return fmt.Errorf("resume runtime service removals: %w", err)
+		}
+		for _, record := range removals {
+			switch record.phase {
+			case runtimeRemovalComplete:
+				// Runtime quiescence is already durable; finish the legacy cleanup
+				// sequence and prune the complete record.
+			case runtimeRemovalQuarantined:
+				if err := controller.recordRuntimeQuiesced(ctx, record.removal, record.receipt); err != nil {
+					return err
+				}
+			case runtimeRemovalPrepared:
+				receipt, err := controller.reapService(ctx, record.removal.jobID)
+				if err != nil {
+					return err
+				}
+				if !receipt.RuntimeQuiesced || receipt.Evidence == "" {
+					return fmt.Errorf("service %q removal has no positive runtime reap receipt", record.removal.jobID)
+				}
+				if err := controller.recordRuntimeQuiesced(ctx, record.removal, receipt); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("service %q runtime removal has invalid phase %q", record.removal.jobID, record.phase)
+			}
+			record.removal.processTreeReaped = true
+			if err := controller.completeLocalRemoval(ctx, record.removal); err != nil {
+				return err
+			}
+		}
+	}
+	if controller.managed == nil {
 		return nil
 	}
 	completed, err := controller.managed.resumeRemovals(ctx)

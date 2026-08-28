@@ -122,6 +122,108 @@ func TestRemovalControllerBlocksWithoutPositiveRuntimeReceipt(t *testing.T) {
 	}
 }
 
+func TestRemovalControllerCompletesRuntimeManifestThenDeletesAndAcknowledges(t *testing.T) {
+	directive := l1.RemovalDirective{
+		JobID: "oci-service", BoundNodeID: "node", RemovalGeneration: 1,
+		CleanupFence: "fence", RootInstanceID: "root",
+	}
+	var stages []string
+	controller := &removalController{nodeID: directive.BoundNodeID}
+	controller.beginRemoval = func(context.Context, localRemoval) error {
+		stages = append(stages, "manifest")
+		return nil
+	}
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
+		return runtimeRemovalRecord{removal: testRuntimeRemoval(directive.JobID), phase: runtimeRemovalPrepared}, true, nil
+	}
+	controller.reapService = func(context.Context, string) (workloadrunner.ReapReceipt, error) {
+		stages = append(stages, "quiesce")
+		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+	}
+	controller.recordRuntimeQuiesced = func(context.Context, localRemoval, workloadrunner.ReapReceipt) error {
+		stages = append(stages, "complete-manifest")
+		return nil
+	}
+	controller.purgeJob = func(context.Context, string) error {
+		stages = append(stages, "purge-spool")
+		return nil
+	}
+	controller.removeResource = func(context.Context, localRemoval) error {
+		stages = append(stages, "remove-resource")
+		return nil
+	}
+	controller.releaseImagePin = func(context.Context, string) error {
+		stages = append(stages, "release-image-pin")
+		return nil
+	}
+	controller.ackRemoval = func(context.Context, localRemoval) error {
+		stages = append(stages, "acknowledge")
+		return nil
+	}
+	controller.finishRemoval = func(context.Context, localRemoval) error {
+		stages = append(stages, "finish-removal")
+		return nil
+	}
+
+	if err := controller.process(t.Context(), directive); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{
+		"manifest", "quiesce", "complete-manifest", "purge-spool", "remove-resource",
+		"release-image-pin", "acknowledge", "finish-removal",
+	}; !reflect.DeepEqual(stages, want) {
+		t.Fatalf("OCI removal preparation stages = %v, want %v", stages, want)
+	}
+}
+
+func TestRemovalControllerResumesEveryRuntimeManifestPhase(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		phase      runtimeRemovalPhase
+		wantReap   bool
+		wantRecord bool
+	}{
+		{name: "prepared", phase: runtimeRemovalPrepared, wantReap: true, wantRecord: true},
+		{name: "quarantined", phase: runtimeRemovalQuarantined, wantRecord: true},
+		{name: "complete", phase: runtimeRemovalComplete},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			removal := testRuntimeRemoval("resume-" + test.name)
+			receipt := workloadrunner.ReapReceipt{
+				RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidencePriorBootOCISweep,
+				BootSessionID: "prior-boot", SweepEpoch: "sweep-1", HelperGeneration: 1,
+			}
+			record := runtimeRemovalRecord{removal: removal, phase: test.phase}
+			if test.phase != runtimeRemovalPrepared {
+				record.receipt = receipt
+			}
+			reaped := false
+			recorded := false
+			controller := &removalController{managed: &resumedManagedResource{}}
+			controller.listRuntimeRemovals = func(context.Context) ([]runtimeRemovalRecord, error) { return []runtimeRemovalRecord{record}, nil }
+			controller.reapService = func(context.Context, string) (workloadrunner.ReapReceipt, error) {
+				reaped = true
+				return receipt, nil
+			}
+			controller.recordRuntimeQuiesced = func(context.Context, localRemoval, workloadrunner.ReapReceipt) error {
+				recorded = true
+				return nil
+			}
+			controller.purgeJob = func(context.Context, string) error { return nil }
+			controller.removeResource = func(context.Context, localRemoval) error { return nil }
+			controller.releaseImagePin = func(context.Context, string) error { return nil }
+			controller.ackRemoval = func(context.Context, localRemoval) error { return nil }
+			controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
+			if err := controller.resume(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if reaped != test.wantReap || recorded != test.wantRecord {
+				t.Fatalf("resume phase %s = reaped %t recorded %t, want %t/%t", test.phase, reaped, recorded, test.wantReap, test.wantRecord)
+			}
+		})
+	}
+}
+
 func TestSessionRoutesRuntimeReceiptIntoLiveRemoval(t *testing.T) {
 	resident := &residentAttempt{
 		class: contract.JobClassService, cancel: func(error) {},

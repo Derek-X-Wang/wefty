@@ -101,7 +101,7 @@ func TestServiceAcceptanceAgentClassAndHandoffContract(t *testing.T) {
 	assertDirectoryEmpty(t, paths.Runtime)
 	var ownership managedroot.OwnershipManifest
 	readJSON(t, filepath.Join(paths.Root, managedroot.OwnershipManifestName), &ownership)
-	if ownership.JobID != claim.Job.JobID || ownership.RemovalGeneration != initialServiceRemovalGeneration {
+	if ownership.JobID != claim.Job.JobID || ownership.RemovalGeneration != l1.InitialServiceRemovalGeneration {
 		t.Fatalf("ownership manifest = %#v", ownership)
 	}
 

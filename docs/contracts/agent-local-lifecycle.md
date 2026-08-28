@@ -230,6 +230,25 @@ recovery names evidence `oci_sweep`; prior-agent-boot removal names
 `prior_boot_oci_sweep`. Both receipts are single-use, while #150 persists
 removal receipts across mid-removal crashes.
 
+Before an OCI service attempt can enter helper `Run`, the agent persists its
+immutable fenced resource manifest in the FULL-synchronous local SQLite ledger.
+The manifest names the attempt lease, task, container, writable snapshot,
+shim, cgroup, framed-log directory, and the stable service-data directory plus
+its owner record. Operator bind source paths are excluded; their existing
+descriptor-backed guards remain held through runtime teardown and removal never
+traverses them.
+
+The first removal-intent write atomically snapshots every retained attempt row
+into one immutable job/removal-generation manifest. OCI removal then advances
+only `prepared` (manifest durable) → `quarantined` (positive
+`runtimeQuiesced` receipt durable) → `complete` (manifest preparation closed).
+Each transition is insert-or-compare and restart-resumable. `complete` is not
+cleanup attestation: the L1 Job remains `removal_pending`, and directory,
+spool, service-data, binding-pin deletion, plus `agent_cleaned` acknowledgement
+remain owned by the deletion-proof step. A named runtime resource is validated
+against its complete authority labels before a `NotFound` observation may
+participate in the compound absence proof.
+
 For `kind=process`, `Run` already waits for process or Guardian reaping, so the
 receipt verifies that blocking return contract. Inline executable decoding,
 digest validation, interpreter resolution, materialization, and cleanup are

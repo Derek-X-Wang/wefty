@@ -642,6 +642,22 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	if preflightErr != nil {
 		return finish(preflightResult.Outcome, preflightErr)
 	}
+	if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassService && lifecycle.dependencies.outbox != nil {
+		provider, supported := runtimeAdapter.(workloadrunner.RuntimeRemovalManifestProvider)
+		if !supported {
+			err := errors.New("OCI runtime does not provide removal manifests")
+			return finish(spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err)
+		}
+		manifest, err := provider.RemovalResourceManifest(request)
+		if err != nil {
+			err = fmt.Errorf("derive OCI removal resource manifest: %w", err)
+			return finish(spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err)
+		}
+		if err := lifecycle.dependencies.outbox.storeRuntimeResourceManifest(finalization.context, manifest); err != nil {
+			err = fmt.Errorf("persist OCI removal resource manifest: %w", err)
+			return finish(spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err)
+		}
+	}
 	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
 		unlock, err := lifecycle.dependencies.handoffs.lock(ctx, claim.Job.Spec)
 		if err != nil {
@@ -805,10 +821,14 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 }
 
 func workloadAuthority(nodeID, bootSessionID string, claim l1.Claim) workloadrunner.AttemptAuthority {
+	removalGeneration := "attempt"
+	if claim.Job.Spec.Class == contract.JobClassService {
+		removalGeneration = fmt.Sprint(l1.InitialServiceRemovalGeneration)
+	}
 	return workloadrunner.AttemptAuthority{
 		NodeID: nodeID, BootSessionID: bootSessionID,
 		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
-		WorkloadClass: claim.Job.Spec.Class, RemovalGeneration: "attempt",
+		WorkloadClass: claim.Job.Spec.Class, RemovalGeneration: removalGeneration,
 	}
 }
 

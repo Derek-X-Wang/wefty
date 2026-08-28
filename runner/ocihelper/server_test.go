@@ -39,6 +39,9 @@ func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	if len(first.Labels) != 7 || first.Labels["io.wefty/fencing_token"] != authority.FencingToken || first.Labels["io.wefty/removal_generation"] != authority.RemovalGeneration {
 		t.Fatalf("resource labels do not carry complete authority: %#v", first.Labels)
 	}
+	if first.TaskID != first.ContainerID || first.ShimID != first.ContainerID {
+		t.Fatalf("containerd task and shim identities must use container ID: %+v", first)
+	}
 	changed := authority
 	changed.FencingToken = "fence-2"
 	different, err := DeterministicResourceIdentity(changed)
@@ -1481,10 +1484,10 @@ func (engine *crashBoundaryEngine) Run(_ context.Context, request RunRequest) (R
 	engine.record("Run")
 	resources := request.Resources
 	steps := []string{
-		resources.LeaseID, // intentionally discoverable before labels are applied
-		resources.SnapshotID, resources.ContainerID, resources.TaskID,
-		resources.ShimID, resources.CgroupID, resources.LogSegmentDirectory,
-		resources.HandoffVolumeDirectory, resources.ServiceVolumeDirectory,
+		"lease:" + resources.LeaseID, // intentionally discoverable before labels are applied
+		"snapshot:" + resources.SnapshotID, "container:" + resources.ContainerID, "task:" + resources.TaskID,
+		"shim:" + resources.ShimID, "cgroup:" + resources.CgroupID, "log:" + resources.LogSegmentDirectory,
+		"volume:" + resources.HandoffVolumeDirectory, "volume:" + resources.ServiceVolumeDirectory,
 		"started:" + resources.TaskID,
 	}
 	if resources.LeaseID == "" || len(resources.Labels) != 7 {
@@ -1540,23 +1543,27 @@ func (engine *crashBoundaryEngine) Verify(context.Context, VerifyRequest) (Verif
 func (engine *crashBoundaryEngine) inventoryLocked() ResourceInventory {
 	var inventory ResourceInventory
 	for residue := range engine.residues {
-		switch {
-		case strings.HasPrefix(residue, "wefty-lease-"):
-			inventory.Leases = append(inventory.Leases, residue)
-		case strings.HasPrefix(residue, "wefty-snapshot-"):
-			inventory.Snapshots = append(inventory.Snapshots, residue)
-		case strings.HasPrefix(residue, "wefty-container-"):
-			inventory.Containers = append(inventory.Containers, residue)
-		case strings.HasPrefix(residue, "wefty-task-"):
-			inventory.Tasks = append(inventory.Tasks, residue)
-		case strings.HasPrefix(residue, "wefty-shim-"):
-			inventory.Shims = append(inventory.Shims, residue)
-		case strings.HasPrefix(residue, "wefty-cgroup-"):
-			inventory.Cgroups = append(inventory.Cgroups, residue)
-		case strings.HasPrefix(residue, "wefty-log-segments-"):
-			inventory.LogSegments = append(inventory.LogSegments, residue)
-		case strings.HasPrefix(residue, "wefty-handoff-volume-"), strings.HasPrefix(residue, "wefty-service-volume-"):
-			inventory.ManagedVolumes = append(inventory.ManagedVolumes, residue)
+		kind, name, found := strings.Cut(residue, ":")
+		if !found {
+			continue
+		}
+		switch kind {
+		case "lease":
+			inventory.Leases = append(inventory.Leases, name)
+		case "snapshot":
+			inventory.Snapshots = append(inventory.Snapshots, name)
+		case "container":
+			inventory.Containers = append(inventory.Containers, name)
+		case "task":
+			inventory.Tasks = append(inventory.Tasks, name)
+		case "shim":
+			inventory.Shims = append(inventory.Shims, name)
+		case "cgroup":
+			inventory.Cgroups = append(inventory.Cgroups, name)
+		case "log":
+			inventory.LogSegments = append(inventory.LogSegments, name)
+		case "volume":
+			inventory.ManagedVolumes = append(inventory.ManagedVolumes, name)
 		}
 	}
 	return inventory

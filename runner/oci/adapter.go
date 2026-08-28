@@ -505,6 +505,39 @@ func (adapter *Adapter) Preflight(_ context.Context, request workloadrunner.Requ
 	return admission, workloadrunner.Result{}, nil
 }
 
+// RemovalResourceManifest derives the complete helper-owned identity before
+// Run can create any resource. Host bind sources are intentionally excluded;
+// Preflight retains their descriptor-backed guards through attempt teardown.
+func (adapter *Adapter) RemovalResourceManifest(request workloadrunner.Request) (workloadrunner.RuntimeResourceManifest, error) {
+	identity, err := ocihelper.DeterministicResourceIdentity(HelperAuthority(request.Authority))
+	if err != nil {
+		return workloadrunner.RuntimeResourceManifest{}, err
+	}
+	manifest := workloadrunner.RuntimeResourceManifest{
+		Version: 1, RuntimeKind: contract.JobKindOCI,
+		NodeID: request.Authority.NodeID, BootSessionID: request.Authority.BootSessionID,
+		JobID: request.Authority.JobID, AttemptID: request.Authority.AttemptID,
+		FencingToken: request.Authority.FencingToken, WorkloadClass: request.Authority.WorkloadClass,
+		RemovalGeneration: request.Authority.RemovalGeneration,
+		LeaseID:           identity.LeaseID, TaskID: identity.TaskID, ContainerID: identity.ContainerID,
+		SnapshotID: identity.SnapshotID, ShimID: identity.ShimID, CgroupID: identity.CgroupID,
+		LogSegmentDirectory: identity.LogSegmentDirectory,
+	}
+	for _, volume := range request.ManagedVolumes {
+		switch volume.Kind {
+		case workloadrunner.ManagedVolumeHandoff:
+			manifest.HandoffVolume, err = ocihelper.DeterministicHandoffVolumeDirectory(volume.OwnerKey)
+			if err != nil {
+				return workloadrunner.RuntimeResourceManifest{}, err
+			}
+		case workloadrunner.ManagedVolumeServiceData:
+			manifest.ServiceDataVolume = identity.ServiceVolumeDirectory
+			manifest.ServiceDataOwnerRecord = identity.ServiceVolumeOwnerRecord
+		}
+	}
+	return manifest, nil
+}
+
 func failedAdmission(admission workloadrunner.Admission, code contract.SpawnFailureCode, err error) (workloadrunner.Admission, workloadrunner.Result, error) {
 	return admission, workloadrunner.Result{Outcome: contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: code, Message: err.Error()}}}, err
 }

@@ -27,37 +27,42 @@ type attendedArtifact struct {
 }
 
 type attendedResult struct {
-	Status               string              `json:"status"`
-	Reason               string              `json:"reason,omitempty"`
-	SessionID            string              `json:"session_id"`
-	Command              []string            `json:"command"`
-	ExitCode             int                 `json:"exit_code"`
-	HelperGenerations    []uint64            `json:"helper_generations"`
-	CapabilityRevisions  []int64             `json:"capability_revisions"`
-	Inventories          []json.RawMessage   `json:"inventories"`
-	RoundTrip            bool                `json:"round_trip"`
-	DynamicListeners     map[string]bool     `json:"dynamic_listeners"`
-	LaunchUnits          []string            `json:"launch_units,omitempty"`
-	LimaStates           []InstanceState     `json:"lima_states,omitempty"`
-	OCIEnabled           *bool               `json:"oci_enabled,omitempty"`
-	ProcessAvailable     bool                `json:"process_available,omitempty"`
-	SocketMode           string              `json:"socket_mode,omitempty"`
-	SocketOwner          string              `json:"socket_owner,omitempty"`
-	SocketGroup          string              `json:"socket_group,omitempty"`
-	MinimalDoctor        *MinimalDoctorFacts `json:"minimal_doctor,omitempty"`
-	AttemptIDs           []string            `json:"attempt_ids"`
-	TopLevelDigests      []string            `json:"top_level_digests"`
-	PlatformDigests      []string            `json:"platform_digests"`
-	PayloadExecutions    int                 `json:"payload_executions"`
-	StdoutMarkers        []string            `json:"stdout_markers"`
-	StderrMarkers        []string            `json:"stderr_markers"`
-	HandoffMarkerBytes   []string            `json:"handoff_marker_bytes"`
-	HandoffAbsent        bool                `json:"handoff_absent_after_completion"`
-	ServiceOwners        []string            `json:"service_owners,omitempty"`
-	ServiceAttemptCounts []int               `json:"service_attempt_counts,omitempty"`
-	GuestNativeData      bool                `json:"guest_native_data,omitempty"`
-	VirtioFSData         *bool               `json:"virtiofs_data,omitempty"`
-	RootfsDiscarded      bool                `json:"rootfs_discarded,omitempty"`
+	Status                 string              `json:"status"`
+	Reason                 string              `json:"reason,omitempty"`
+	SessionID              string              `json:"session_id"`
+	Command                []string            `json:"command"`
+	ExitCode               int                 `json:"exit_code"`
+	HelperGenerations      []uint64            `json:"helper_generations"`
+	CapabilityRevisions    []int64             `json:"capability_revisions"`
+	Inventories            []json.RawMessage   `json:"inventories"`
+	RoundTrip              bool                `json:"round_trip"`
+	DynamicListeners       map[string]bool     `json:"dynamic_listeners"`
+	LaunchUnits            []string            `json:"launch_units,omitempty"`
+	LimaStates             []InstanceState     `json:"lima_states,omitempty"`
+	OCIEnabled             *bool               `json:"oci_enabled,omitempty"`
+	ProcessAvailable       bool                `json:"process_available,omitempty"`
+	SocketMode             string              `json:"socket_mode,omitempty"`
+	SocketOwner            string              `json:"socket_owner,omitempty"`
+	SocketGroup            string              `json:"socket_group,omitempty"`
+	MinimalDoctor          *MinimalDoctorFacts `json:"minimal_doctor,omitempty"`
+	AttemptIDs             []string            `json:"attempt_ids"`
+	TopLevelDigests        []string            `json:"top_level_digests"`
+	PlatformDigests        []string            `json:"platform_digests"`
+	PayloadExecutions      int                 `json:"payload_executions"`
+	StdoutMarkers          []string            `json:"stdout_markers"`
+	StderrMarkers          []string            `json:"stderr_markers"`
+	HandoffMarkerBytes     []string            `json:"handoff_marker_bytes"`
+	HandoffAbsent          bool                `json:"handoff_absent_after_completion"`
+	ServiceOwners          []string            `json:"service_owners,omitempty"`
+	ServiceAttemptCounts   []int               `json:"service_attempt_counts,omitempty"`
+	GuestNativeData        bool                `json:"guest_native_data,omitempty"`
+	VirtioFSData           *bool               `json:"virtiofs_data,omitempty"`
+	RootfsDiscarded        bool                `json:"rootfs_discarded,omitempty"`
+	RemovalPhase           string              `json:"removal_phase,omitempty"`
+	RemovalPendingObserved bool                `json:"removal_pending_observed,omitempty"`
+	RemovalCompleted       bool                `json:"removal_completed,omitempty"`
+	RuntimeQuiesced        bool                `json:"runtime_quiesced,omitempty"`
+	ResourceManifests      []json.RawMessage   `json:"resource_manifests,omitempty"`
 }
 
 var requiredAttendedRows = []string{
@@ -68,7 +73,7 @@ var requiredAttendedRows = []string{
 	"service_health_echo", "service_startup_timeout", "service_withdrawal_republication",
 	"service_port_collision", "service_portless_started",
 	"service_restart_fresh_attempt", "service_stop_start_capacity", "service_failed_quiescence",
-	"service_data_guest_native",
+	"service_data_guest_native", "service_removal_manifest_offline",
 	"launch_daemon", "no_lima_autostart", "helper_install_permissions",
 	"stopped_enabled_recovery", "stopped_disabled_no_recovery", "broken_enabled_recovery",
 	"process_only_degradation", "minimal_doctor",
@@ -276,6 +281,33 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 	if !slices.Equal(serviceData.ServiceAttemptCounts, []int{0, 1, 2}) || !serviceData.GuestNativeData || serviceData.VirtioFSData == nil || *serviceData.VirtioFSData || !serviceData.RootfsDiscarded {
 		t.Fatalf("service data receipt lacks restart/stop-start persistence and fresh-rootfs proof: %+v", serviceData)
 	}
+	removal := artifact.Rows["service_removal_manifest_offline"]
+	if removal.RemovalPhase != "complete" || !removal.RemovalPendingObserved || !removal.RemovalCompleted || !removal.RuntimeQuiesced || len(removal.ResourceManifests) == 0 {
+		t.Fatalf("offline removal row lacks pending manifest/quiescence evidence: %+v", removal)
+	}
+	for index, payload := range removal.ResourceManifests {
+		var manifest struct {
+			JobID                  string `json:"job_id"`
+			AttemptID              string `json:"attempt_id"`
+			RemovalGeneration      string `json:"removal_generation"`
+			LeaseID                string `json:"lease_id"`
+			TaskID                 string `json:"task_id"`
+			ContainerID            string `json:"container_id"`
+			SnapshotID             string `json:"snapshot_id"`
+			ShimID                 string `json:"shim_id"`
+			CgroupID               string `json:"cgroup_id"`
+			LogSegmentDirectory    string `json:"log_segment_directory"`
+			ServiceDataVolume      string `json:"service_data_volume"`
+			ServiceDataOwnerRecord string `json:"service_data_owner_record"`
+		}
+		if err := json.Unmarshal(payload, &manifest); err != nil || manifest.JobID == "" || manifest.AttemptID == "" ||
+			manifest.RemovalGeneration == "" || manifest.LeaseID == "" || manifest.TaskID == "" ||
+			manifest.ContainerID == "" || manifest.SnapshotID == "" || manifest.ShimID == "" ||
+			manifest.CgroupID == "" || manifest.LogSegmentDirectory == "" || manifest.ServiceDataVolume == "" ||
+			manifest.ServiceDataOwnerRecord == "" {
+			t.Fatalf("offline removal resource manifest %d is incomplete: %s", index, payload)
+		}
+	}
 	launch := artifact.Rows["launch_daemon"]
 	if !slices.Contains(launch.LaunchUnits, LaunchDaemonLabel) {
 		t.Fatalf("launch receipt omitted %s: %+v", LaunchDaemonLabel, launch)
@@ -315,7 +347,7 @@ func TestServiceAcceptanceAttendedArtifactRejectsMissingServiceRows(t *testing.T
 	}
 	for _, name := range []string{
 		"service_health_echo", "service_startup_timeout", "service_withdrawal_republication",
-		"service_port_collision", "service_portless_started", "service_data_guest_native",
+		"service_port_collision", "service_portless_started", "service_data_guest_native", "service_removal_manifest_offline",
 	} {
 		t.Run(name, func(t *testing.T) {
 			delete(rows, name)

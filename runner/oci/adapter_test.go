@@ -3,6 +3,7 @@ package oci
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -20,6 +21,43 @@ import (
 )
 
 const adapterTestDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func TestRemovalResourceManifestNamesAllManagedResourcesWithoutBindSources(t *testing.T) {
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.Authority.RemovalGeneration = "1"
+	request.ManagedVolumes = []workloadrunner.ManagedVolume{
+		{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: "manifest-owner"},
+		{Kind: workloadrunner.ManagedVolumeServiceData},
+	}
+	request.Execution.OCI.Mounts = []contract.OCIMount{{NodePath: "/operator/secret/project", ContainerPath: "/workspace"}}
+	manifest, err := (&Adapter{}).RemovalResourceManifest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.RuntimeKind != contract.JobKindOCI || manifest.JobID != request.Authority.JobID ||
+		manifest.AttemptID != request.Authority.AttemptID || manifest.RemovalGeneration != "1" ||
+		manifest.LeaseID == "" || manifest.TaskID == "" || manifest.ContainerID == "" ||
+		manifest.SnapshotID == "" || manifest.ShimID == "" || manifest.CgroupID == "" ||
+		manifest.LogSegmentDirectory == "" || manifest.HandoffVolume == "" ||
+		manifest.ServiceDataVolume == "" || manifest.ServiceDataOwnerRecord == "" {
+		t.Fatalf("runtime removal manifest is incomplete: %+v", manifest)
+	}
+	wantHandoff, err := ocihelper.DeterministicHandoffVolumeDirectory("manifest-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.HandoffVolume != wantHandoff || manifest.TaskID != manifest.ContainerID || manifest.ShimID != manifest.ContainerID {
+		t.Fatalf("runtime removal manifest does not name live containerd identities: %+v", manifest)
+	}
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(payload, []byte("/operator/secret/project")) || bytes.Contains(payload, []byte("/workspace")) {
+		t.Fatalf("runtime removal manifest retained operator bind path: %s", payload)
+	}
+}
 
 func TestAdapterRequiresAuthoritativeStartedBeforeLocalPromotion(t *testing.T) {
 	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}

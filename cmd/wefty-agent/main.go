@@ -565,9 +565,13 @@ func (renewer ociAttemptDeadman) QueueSuccessfulRenewal(claim l1.Claim, ttl time
 	if err != nil {
 		return err
 	}
+	removalGeneration := "attempt"
+	if claim.Job.Spec.Class == contract.JobClassService {
+		removalGeneration = fmt.Sprint(l1.InitialServiceRemovalGeneration)
+	}
 	return session.QueueAttemptRenewal(ocihelper.AttemptAuthority{
 		NodeID: renewer.nodeID, BootSessionID: renewer.bootSessionID,
 		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
-		Class: claim.Job.Spec.Class, RemovalGeneration: "attempt",
+		Class: claim.Job.Spec.Class, RemovalGeneration: removalGeneration,
 	}, ttl)
 }

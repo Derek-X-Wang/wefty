@@ -61,6 +61,30 @@ func TestSegmentTailerMarksTruncatedFinalFrameIncomplete(t *testing.T) {
 	}
 }
 
+func TestRuntimeDeletionValidatesIdentityBeforeNotFound(t *testing.T) {
+	authority := testAuthority()
+	authority.Class = contract.JobClassService
+	authority.RemovalGeneration = "1"
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRuntimeResourceLabels("lease", resources.LeaseID, resources.LeaseID, resources.Labels, authority); err != nil {
+		t.Fatalf("matching resource identity was rejected: %v", err)
+	}
+	wrong := make(map[string]string, len(resources.Labels))
+	for name, value := range resources.Labels {
+		wrong[name] = value
+	}
+	wrong["io.wefty/job_id"] = "different-job"
+	if err := validateRuntimeResourceLabels("lease", resources.LeaseID, resources.LeaseID, wrong, authority); err == nil {
+		t.Fatal("mismatched resource authority reached the NotFound path")
+	}
+	if err := validateRuntimeResourceLabels("lease", "different-name", resources.LeaseID, resources.Labels, authority); err == nil {
+		t.Fatal("mismatched deterministic identity reached the NotFound path")
+	}
+}
+
 func TestAuthorityLabelsRequireTheFullTuple(t *testing.T) {
 	authority := AttemptAuthority{NodeID: "node", JobID: "job", AttemptID: "attempt", FencingToken: "fence", BootSessionID: "boot", Class: "one-shot", RemovalGeneration: "remove"}
 	resources, err := DeterministicResourceIdentity(authority)

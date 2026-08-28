@@ -236,10 +236,11 @@ func DeterministicResourceIdentity(authority AttemptAuthority) (ResourceIdentity
 		}
 		serviceVolumeOwnerRecord = serviceVolumeDirectory + ".owner"
 	}
+	containerID := "wefty-container-" + suffix
 	return ResourceIdentity{
 		LeaseID: "wefty-lease-" + suffix, SnapshotID: "wefty-snapshot-" + suffix,
-		ContainerID: "wefty-container-" + suffix, TaskID: "wefty-task-" + suffix,
-		ShimID: "wefty-shim-" + suffix, CgroupID: "wefty-cgroup-" + suffix,
+		ContainerID: containerID, TaskID: containerID,
+		ShimID: containerID, CgroupID: "wefty-cgroup-" + suffix,
 		LogSegmentDirectory:      "wefty-log-segments-" + suffix,
 		HandoffVolumeDirectory:   "wefty-handoff-volume-" + suffix,
 		ServiceVolumeDirectory:   serviceVolumeDirectory,

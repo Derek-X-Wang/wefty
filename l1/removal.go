@@ -28,6 +28,10 @@ type serviceRemovalRow struct {
 	acknowledgementHash sql.NullString
 }
 
+// InitialServiceRemovalGeneration is the first and currently only removal
+// generation for an immutable service Job.
+const InitialServiceRemovalGeneration uint64 = 1
+
 type serviceTombstoneRow struct {
 	jobID                 string
 	dispatchKeyHash       string
@@ -112,12 +116,11 @@ func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
 		return Job{}, err
 	}
 
-	const firstRemovalGeneration = uint64(1)
 	if !boundNodeID.Valid {
 		tombstone := serviceTombstoneRow{
 			jobID: jobID, dispatchKeyHash: hashDispatchKey(dispatchKey), requestHash: requestHash,
 			createdAt: time.Unix(0, createdNS).UTC(), removalRequestedAt: now, removedAt: now,
-			outcome: ServiceRemovalVerified, removalGeneration: firstRemovalGeneration,
+			outcome: ServiceRemovalVerified, removalGeneration: InitialServiceRemovalGeneration,
 		}
 		if err := deleteServiceRows(ctx, tx, jobID); err != nil {
 			return Job{}, err
@@ -138,7 +141,7 @@ func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
 			"bound node %q has no registered managed-root instance", boundNodeID.String)
 	}
 	removal := serviceRemovalRow{
-		boundNodeID: boundNodeID.String, generation: firstRemovalGeneration,
+		boundNodeID: boundNodeID.String, generation: InitialServiceRemovalGeneration,
 		cleanupFence: newID("cleanup"), rootInstanceID: rootInstanceID.String,
 		status: contract.JobRemovalPending, requestedAt: now,
 	}
