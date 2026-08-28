@@ -12,6 +12,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
@@ -42,6 +43,11 @@ func runComputerService(
 		err := errors.New("Computer service front door dependencies are incomplete")
 		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
 	}
+	controlRuntime, ok := runtimeAdapter.(workloadrunner.OCIComputerControlRuntime)
+	if !ok {
+		err := errors.New("Computer runtime does not expose the attempt-fenced control-state seam")
+		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+	}
 	listener, err := config.fabric.Listen("tcp", ":0")
 	if err != nil {
 		return spawnFailure(contract.SpawnFailurePublishedListener, err), fmt.Errorf("listen on private Fabric: %w", err)
@@ -63,6 +69,26 @@ func runComputerService(
 	if err != nil {
 		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
 	}
+	tenure, err := newControllerTenure(controllerTenureConfig{
+		authorityContext: runContext,
+		clock:            config.clock,
+		dial:             config.dial,
+		setControlState: func(signalContext context.Context, humanDriving bool) error {
+			return controlRuntime.SetComputerControlState(signalContext, request.Authority, humanDriving)
+		},
+		record: func(auditContext context.Context, event l1.ComputerTakeoverAuditEvent) (l1.ComputerTakeoverAuditReceipt, error) {
+			return config.auditor.AppendComputerTakeoverAudit(auditContext, config.computerID, config.jobID, config.attemptID,
+				l1.ComputerTakeoverAuditRequest{FencingToken: config.fencingToken, Event: event})
+		},
+		report: frontDoor.report,
+		onUnconfirmedClear: func(clearErr error) {
+			frontDoor.report(fmt.Errorf("Computer control signal could not be confirmed clear: %w", clearErr))
+		},
+	})
+	if err != nil {
+		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+	}
+	frontDoor.config.controlTenure = tenure
 	httpServer := &http.Server{Handler: frontDoor}
 	serverErrors := make(chan error, 1)
 	go func() {
@@ -84,13 +110,23 @@ func runComputerService(
 	go func() { publicationDone <- publication.Run(runContext) }()
 
 	started := make(chan struct{})
+	startupSignalErrors := make(chan error, 1)
 	var startedOnce sync.Once
 	priorStarted := request.Started
 	request.Started = func() {
-		if priorStarted != nil {
-			priorStarted()
-		}
-		startedOnce.Do(func() { close(started) })
+		startedOnce.Do(func() {
+			startupSignalContext, cancelStartupSignal := context.WithTimeout(context.WithoutCancel(runContext), controllerTenureFinalizationLimit)
+			err := controlRuntime.SetComputerControlState(startupSignalContext, request.Authority, false)
+			cancelStartupSignal()
+			if err != nil {
+				startupSignalErrors <- fmt.Errorf("initialize Computer control signal false: %w", err)
+				return
+			}
+			if priorStarted != nil {
+				priorStarted()
+			}
+			close(started)
+		})
 	}
 	outcomes := make(chan serviceRunOutcome, 1)
 	go func() {
@@ -102,46 +138,60 @@ func runComputerService(
 		readinessErrors <- monitorComputerReadiness(runContext, config.clock, started, config.dial, publication.Observe)
 	}()
 
-	stop := func() error {
+	stop := func(publicationFinished bool, publicationErr error) error {
 		publication.Stop()
+		frontDoor.EndSessions(l1.ComputerTakeoverAttemptAuthorityLost)
 		frontDoor.SetReady(false)
 		_ = listener.Close()
 		_ = httpServer.Close()
+		frontDoor.WaitForSessions()
+		frontDoorErr := frontDoor.takeErrors()
 		cancelRun()
-		return <-publicationDone
+		if !publicationFinished {
+			publicationErr = <-publicationDone
+		}
+		return errors.Join(publicationErr, frontDoorErr)
 	}
 	select {
 	case <-ctx.Done():
-		publicationErr := stop()
+		stopErr := stop(false, nil)
 		outcome := <-outcomes
-		return outcome.result, errors.Join(outcome.err, publicationErr)
+		return outcome.result, errors.Join(outcome.err, stopErr)
 	case outcome := <-outcomes:
-		publicationErr := stop()
-		return outcome.result, errors.Join(outcome.err, publicationErr)
+		stopErr := stop(false, nil)
+		return outcome.result, errors.Join(outcome.err, stopErr)
 	case publicationErr := <-publicationDone:
-		frontDoor.SetReady(false)
-		_ = listener.Close()
-		cancelRun()
+		stopErr := stop(true, publicationErr)
 		outcome := <-outcomes
-		return outcome.result, errors.Join(outcome.err, publicationErr)
+		return outcome.result, errors.Join(outcome.err, stopErr)
 	case serveErr := <-serverErrors:
 		if serveErr == nil {
 			serveErr = errors.New("private Computer front door stopped unexpectedly")
 		}
-		_ = stop()
+		stopErr := stop(false, nil)
 		outcome := <-outcomes
-		return spawnFailure(contract.SpawnFailurePublishedListener, serveErr), errors.Join(serveErr, outcome.err)
+		return spawnFailure(contract.SpawnFailurePublishedListener, serveErr), errors.Join(serveErr, outcome.err, stopErr)
 	case readinessErr := <-readinessErrors:
 		if readinessErr == nil {
 			return (<-outcomes).result, nil
 		}
-		_ = stop()
+		stopErr := stop(false, nil)
 		outcome := <-outcomes
 		var typed *computerReadinessError
 		if errors.As(readinessErr, &typed) {
-			return spawnFailure(typed.Code, typed), errors.Join(typed, outcome.err)
+			return spawnFailure(typed.Code, typed), errors.Join(typed, outcome.err, stopErr)
 		}
-		return spawnFailure(contract.SpawnFailureRuntimeUnavailable, readinessErr), errors.Join(readinessErr, outcome.err)
+		return spawnFailure(contract.SpawnFailureRuntimeUnavailable, readinessErr), errors.Join(readinessErr, outcome.err, stopErr)
+	case startupSignalErr := <-startupSignalErrors:
+		stopErr := stop(false, nil)
+		outcome := <-outcomes
+		return spawnFailure(contract.SpawnFailureRuntimeUnavailable, startupSignalErr), errors.Join(startupSignalErr, outcome.err, stopErr)
+	case <-frontDoor.Errors():
+		frontDoorErr := frontDoor.takeErrors()
+		stopErr := stop(false, nil)
+		outcome := <-outcomes
+		failure := fmt.Errorf("private Computer front door failed: %w", frontDoorErr)
+		return spawnFailure(contract.SpawnFailureRuntimeUnavailable, failure), errors.Join(failure, outcome.err, stopErr)
 	}
 }
 

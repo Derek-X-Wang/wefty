@@ -65,6 +65,32 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 		computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, stale); errorCode(err) != contract.ErrorStaleFence {
 		t.Fatalf("stale audit fence error = %v", err)
 	}
+	for _, controlEvent := range []ComputerTakeoverAuditEvent{
+		func() ComputerTakeoverAuditEvent {
+			value := event
+			value.EventID, value.Kind, value.AdmittedMode = "session-1:control:1:acquired", ComputerTakeoverControlAcquired, ComputerAdmittedController
+			return value
+		}(),
+		func() ComputerTakeoverAuditEvent {
+			value := event
+			value.EventID, value.Kind, value.AdmittedMode = "session-1:control:2:override", ComputerTakeoverAdminOverrode, ComputerAdmittedController
+			return value
+		}(),
+		func() ComputerTakeoverAuditEvent {
+			value := event
+			value.EventID, value.Kind, value.AdmittedMode = "session-1:control:2:released", ComputerTakeoverControlReleased, ComputerAdmittedController
+			value.Reason = ComputerTakeoverExplicitRelease
+			return value
+		}(),
+	} {
+		controlReceipt, err := h.store.AppendComputerTakeoverAudit(context.Background(), "fabric-computer-node",
+			computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID,
+			ComputerTakeoverAuditRequest{FencingToken: claim.Lease.FencingToken, Event: controlEvent})
+		if err != nil || controlReceipt.Event.Kind != controlEvent.Kind ||
+			controlReceipt.Event.AuthorityGeneration != node.AuthorityGeneration {
+			t.Fatalf("control audit receipt = %#v err=%v", controlReceipt, err)
+		}
+	}
 
 	var storedColumns string
 	rows, err := h.store.db.Query(`PRAGMA table_info(computer_takeover_audit)`)
@@ -87,7 +113,7 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 		}
 	}
 	var count int
-	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_takeover_audit WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&count); err != nil || count != 1 {
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_takeover_audit WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&count); err != nil || count != 4 {
 		t.Fatalf("durable audit row count = %d err=%v", count, err)
 	}
 
@@ -107,12 +133,12 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 	if _, err := h.store.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_takeover_audit WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&count); err != nil || count != 2 {
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_takeover_audit WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&count); err != nil || count != 5 {
 		t.Fatalf("attempt expiry removed immutable audit: count=%d err=%v", count, err)
 	}
 	h.clock.Advance(DefaultComputerTakeoverAuditRetentionAge + time.Second)
 	result, err := h.store.Reconcile(context.Background())
-	if err != nil || result.PrunedComputerTakeoverAuditEvents != 2 {
+	if err != nil || result.PrunedComputerTakeoverAuditEvents != 5 {
 		t.Fatalf("independent audit retention result=%#v err=%v", result, err)
 	}
 	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_takeover_audit`).Scan(&count); err != nil || count != 0 {

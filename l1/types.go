@@ -418,6 +418,10 @@ const (
 	ComputerTakeoverViewBackendClosed      ComputerTakeoverReason = "view_backend_closed"
 	ComputerTakeoverRevalidationFailed     ComputerTakeoverReason = "revalidation_failed"
 	ComputerTakeoverSessionCapExpired      ComputerTakeoverReason = "session_cap_expired"
+	ComputerTakeoverExplicitRelease        ComputerTakeoverReason = "explicit_release"
+	ComputerTakeoverControllerOverridden   ComputerTakeoverReason = "controller_overridden"
+	ComputerTakeoverControlBackendClosed   ComputerTakeoverReason = "control_backend_closed"
+	ComputerTakeoverControlBackendFailed   ComputerTakeoverReason = "control_backend_unavailable"
 )
 
 // ComputerTakeoverAuditEvent contains identity and policy evidence only. It

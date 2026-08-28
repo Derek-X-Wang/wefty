@@ -269,25 +269,39 @@ them, closing the lookup-versus-revocation race. The only admission seam
 atomically acquires such a lease, returns a type whose admission role is always
 `view`, and exposes `CanTake` separately; it releases only after both relay legs
 close. A dedicated bounded-wait loop reports pending drains and retries the
-acknowledgement without blocking heartbeat, registration, or watch.
-Session-bound control take-over and tenure arbitration remain separate
-contracts.
+acknowledgement without blocking heartbeat, registration, or watch. The
+authorization lease and the session-bound Controller-tenure capability remain
+separate contracts: policy permits a take, while process-local attempt-scoped
+tenure arbitrates the wheel.
 
 The private Computer front door accepts only `GET /websockify` with exactly the
 `binary` WebSocket subprotocol. It authenticates every accepted connection with
 `Fabric.WhoIs`, acquires the authorization lease above, dials only the
 helper-returned `view` endpoint, upgrades the client, and durably records
-`session_open` before forwarding any bytes. A
-control-authorized admission exposes only `CanTake`; the default sealed tenure
-returns typed `tenure_unavailable` and has no control dialer. #179 owns replacing
-that tenure and controller arbitration. The server never consults client
-headers for role, mode, backend, or control authority. Text frames, machine principals, stale
+`session_open` before forwarding any bytes. A control-authorized admission
+exposes only `CanTake` and a sealed capability bound to that live session.
+Explicit `take` asks the attempt-local Controller-tenure state machine to move
+from Free to Held; the first eligible session retains the wheel and another
+nonadministrator receives typed `controller_busy`. An administrator still
+begins as a viewer and overrides only through an explicit take: the old input
+leg is closed and observed before the replacement backend is dialed. The server
+never consults client headers for role, mode, backend, or control authority.
+Text frames, machine principals, stale
 policy, identity revalidation failure, downgrade/revocation, attempt authority
 loss, and the one-hour cap all close both relay legs. The authorization lease
 releases immediately after relay closure; the uncancelable `session_close`
 upload follows and cannot delay the revocation acknowledgement barrier. The RFB
 relay deliberately closes both legs when either copy reaches EOF instead of
 propagating TCP half-close through WebSocket framing.
+
+The exact helper-owned `driver.json` signal is set true before the first
+input-capable control dial. Explicit release, disconnect, revocation, cap
+expiry, or authority loss closes and observes that leg, records
+`control_released`, clears the signal, and returns tenure to Free. A successful
+human-to-human override leaves the signal true throughout; replacement-backend
+failure clears it and returns Free. If false cannot be confirmed, the front
+door is withdrawn and the attempt is reaped. Tenure is never restored after an
+agent restart and has no idle-release timer.
 
 The attempt lifecycle mounts this handler only through `Fabric.Listen("tcp",
 ":0")`; neither a LAN listener nor either raw guest/helper endpoint is

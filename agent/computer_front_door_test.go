@@ -19,9 +19,9 @@ import (
 )
 
 func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.T) {
-	frontDoor, cache, auditor, controlDials, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantControl)
+	_, cache, auditor, controlDials, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantControl)
 	defer server.Close()
-	connection := dialComputerFrontDoor(t, server.URL, nil)
+	connection, token := dialComputerFrontDoorWithToken(t, server.URL, nil)
 	defer connection.CloseNow()
 	messageType, banner, err := connection.Read(t.Context())
 	if err != nil || messageType != websocket.MessageBinary || string(banner) != "RFB 003.008\n" {
@@ -30,14 +30,8 @@ func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.
 	if controlDials.Load() != 0 {
 		t.Fatalf("control-authorized admission dialed control %d times", controlDials.Load())
 	}
-	handle := <-frontDoor.sessionHandles
-	if !handle.CanTake() {
-		t.Fatal("control-authorized session did not retain its narrow take capability")
-	}
-	controlConnection, takeErr := handle.dialControl(t.Context())
-	var tenureErr *ComputerTenureError
-	if controlConnection != nil || !errors.As(takeErr, &tenureErr) || tenureErr.Code != ComputerTenureUnavailable {
-		t.Fatalf("default control tenure = %#v err=%v", controlConnection, takeErr)
+	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusServiceUnavailable {
+		t.Fatalf("default control tenure status = %d", status)
 	}
 
 	now := cache.clock.Now().Add(time.Second)
@@ -72,31 +66,26 @@ func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.
 func TestComputerFrontDoorIgnoresClientAuthorityHeaders(t *testing.T) {
 	fixture, _, _, _, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantView)
 	defer server.Close()
-	connection := dialComputerFrontDoor(t, server.URL, http.Header{"X-Wefty-Take": []string{"control"}, "X-Wefty-Role": []string{"control"}})
+	connection, token := dialComputerFrontDoorWithToken(t, server.URL, http.Header{"X-Wefty-Take": []string{"control"}, "X-Wefty-Role": []string{"control"}})
 	defer connection.CloseNow()
 	if _, _, err := connection.Read(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	handle := <-fixture.sessionHandles
-	if handle.CanTake() || fixture.controlDials.Load() != 0 {
-		t.Fatalf("client headers changed authority: canTake=%t controlDials=%d", handle.CanTake(), fixture.controlDials.Load())
+	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusForbidden || fixture.controlDials.Load() != 0 {
+		t.Fatalf("client headers changed authority: status=%d controlDials=%d", status, fixture.controlDials.Load())
 	}
 }
 
 func TestComputerFrontDoorViewerCannotTakeControl(t *testing.T) {
-	frontDoor, _, _, controlDials, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantView)
+	_, _, _, controlDials, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantView)
 	defer server.Close()
-	connection := dialComputerFrontDoor(t, server.URL, nil)
+	connection, token := dialComputerFrontDoorWithToken(t, server.URL, nil)
 	defer connection.CloseNow()
 	if _, _, err := connection.Read(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	handle := <-frontDoor.sessionHandles
-	if handle.CanTake() {
-		t.Fatal("view-authorized session received a take capability")
-	}
-	if backend, err := handle.dialControl(t.Context()); err == nil || backend != nil {
-		t.Fatalf("viewer take = %#v err=%v", backend, err)
+	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusForbidden {
+		t.Fatalf("viewer take status = %d", status)
 	}
 	if controlDials.Load() != 0 {
 		t.Fatalf("viewer take refusal dialed control %d times", controlDials.Load())
@@ -364,13 +353,51 @@ func TestComputerFrontDoorRequiresDenyByDefaultConstruction(t *testing.T) {
 	}
 }
 
+func TestComputerFrontDoorRetriesAndRejectsUnassertedAuditReceipts(t *testing.T) {
+	fixture, _, auditor, _, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantView)
+	defer server.Close()
+	auditor.mu.Lock()
+	auditor.mismatchReceipt = true
+	auditor.mu.Unlock()
+	base := l1.ComputerTakeoverAuditEvent{
+		ComputerID: "computer-1", JobID: "job-1", AttemptID: "attempt-1", FabricID: "fabric-1",
+		UserID: "person-1", DeviceID: "device-1", AuthorizedRole: l1.ComputerGrantView,
+		AdmittedMode: l1.ComputerAdmittedView, PolicyRevision: 1,
+		OccurredAt: time.Date(2026, 8, 28, 5, 0, 0, 123, time.FixedZone("audit-local", -7*60*60)),
+	}
+	for _, kind := range []l1.ComputerTakeoverAuditEventKind{
+		l1.ComputerTakeoverAdmissionDenied, l1.ComputerTakeoverSessionOpen, l1.ComputerTakeoverSessionClose,
+	} {
+		before := len(auditor.snapshot())
+		event := base
+		event.EventID = "unasserted:" + string(kind)
+		event.Kind = kind
+		if kind == l1.ComputerTakeoverAdmissionDenied {
+			event.SessionID = ""
+			event.AdmittedMode = ""
+			event.Reason = l1.ComputerTakeoverUnauthorizedIdentity
+			event.EventCount = 1
+		} else {
+			event.SessionID = "session-1"
+			if kind == l1.ComputerTakeoverSessionClose {
+				event.Reason = l1.ComputerTakeoverClientClosed
+			}
+		}
+		if err := fixture.frontDoor.record(t.Context(), event); err == nil {
+			t.Fatalf("%s accepted an unasserted receipt", kind)
+		}
+		if attempts := len(auditor.snapshot()) - before; attempts != computerAuditAttempts {
+			t.Fatalf("%s attempts = %d, want %d", kind, attempts, computerAuditAttempts)
+		}
+	}
+}
+
 type computerFrontDoorTestFixture struct {
-	frontDoor      *computerFrontDoor
-	sessionHandles chan *computerSessionHandle
-	identity       *mutableWhoIsFabric
-	clock          *manualClock
-	viewDials      atomic.Int64
-	controlDials   atomic.Int64
+	frontDoor    *computerFrontDoor
+	identity     *mutableWhoIsFabric
+	clock        *manualClock
+	viewDials    atomic.Int64
+	controlDials atomic.Int64
 }
 
 func computerFrontDoorFixture(t *testing.T, permission l1.ComputerGrantPermission) (
@@ -398,7 +425,7 @@ func computerFrontDoorFixture(t *testing.T, permission l1.ComputerGrantPermissio
 	backend := newComputerBackend(t, computerBackendOptions{})
 	t.Cleanup(backend.Close)
 	auditor := &recordingComputerAuditor{}
-	fixture := &computerFrontDoorTestFixture{identity: identityFabric, clock: clock, sessionHandles: make(chan *computerSessionHandle, 1)}
+	fixture := &computerFrontDoorTestFixture{identity: identityFabric, clock: clock}
 	dial := func(ctx context.Context, name string) (net.Conn, error) {
 		switch name {
 		case workloadrunner.AttemptEndpointView:
@@ -414,7 +441,7 @@ func computerFrontDoorFixture(t *testing.T, permission l1.ComputerGrantPermissio
 	frontDoor, err := newComputerFrontDoor(computerFrontDoorConfig{
 		authorityContext: t.Context(), fabric: identityFabric, authorizer: cache, auditor: auditor, clock: clock,
 		computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1",
-		dial: dial, onSession: func(handle *computerSessionHandle) { fixture.sessionHandles <- handle },
+		dial: dial,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -427,7 +454,13 @@ func computerFrontDoorFixture(t *testing.T, permission l1.ComputerGrantPermissio
 
 func dialComputerFrontDoor(t *testing.T, serverURL string, headers http.Header) *websocket.Conn {
 	t.Helper()
-	connection, _, err := websocket.Dial(t.Context(), "ws"+serverURL[len("http"):]+computerWebSocketPath,
+	connection, _ := dialComputerFrontDoorWithToken(t, serverURL, headers)
+	return connection
+}
+
+func dialComputerFrontDoorWithToken(t *testing.T, serverURL string, headers http.Header) (*websocket.Conn, string) {
+	t.Helper()
+	connection, response, err := websocket.Dial(t.Context(), "ws"+serverURL[len("http"):]+computerWebSocketPath,
 		&websocket.DialOptions{Subprotocols: []string{computerWebSocketSubprotocol}, HTTPHeader: headers})
 	if err != nil {
 		t.Fatal(err)
@@ -435,7 +468,27 @@ func dialComputerFrontDoor(t *testing.T, serverURL string, headers http.Header) 
 	if connection.Subprotocol() != computerWebSocketSubprotocol {
 		t.Fatalf("front door subprotocol = %q", connection.Subprotocol())
 	}
-	return connection
+	token := response.Header.Get(computerControlTokenHeader)
+	if token == "" {
+		connection.CloseNow()
+		t.Fatal("front door omitted the session-bound control token")
+	}
+	return connection, token
+}
+
+func postComputerControl(t *testing.T, serverURL, path, token string) int {
+	t.Helper()
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, serverURL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(computerControlTokenHeader, token)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	return response.StatusCode
 }
 
 type mutableWhoIsFabric struct {
@@ -472,8 +525,9 @@ func (value *mutableWhoIsFabric) callCount() int {
 }
 
 type recordingComputerAuditor struct {
-	mu     sync.Mutex
-	events []l1.ComputerTakeoverAuditEvent
+	mu              sync.Mutex
+	events          []l1.ComputerTakeoverAuditEvent
+	mismatchReceipt bool
 }
 
 func (auditor *recordingComputerAuditor) AppendComputerTakeoverAudit(
@@ -482,7 +536,12 @@ func (auditor *recordingComputerAuditor) AppendComputerTakeoverAudit(
 	auditor.mu.Lock()
 	defer auditor.mu.Unlock()
 	auditor.events = append(auditor.events, request.Event)
-	return l1.ComputerTakeoverAuditReceipt{Event: request.Event}, nil
+	receiptEvent := request.Event
+	receiptEvent.AuthorityGeneration = 1
+	if auditor.mismatchReceipt {
+		receiptEvent.EventID += ":different"
+	}
+	return l1.ComputerTakeoverAuditReceipt{Event: receiptEvent}, nil
 }
 
 func (auditor *recordingComputerAuditor) snapshot() []l1.ComputerTakeoverAuditEvent {
@@ -509,6 +568,7 @@ type computerBackendOptions struct {
 	requiredPath string
 	subprotocol  string
 	textBanner   bool
+	echoPrefix   string
 }
 
 type computerBackendServer struct {
@@ -548,7 +608,7 @@ func newComputerBackend(t *testing.T, options computerBackendOptions) *computerB
 			if err != nil {
 				return
 			}
-			if err := connection.Write(request.Context(), kind, payload); err != nil {
+			if err := connection.Write(request.Context(), kind, append([]byte(options.echoPrefix), payload...)); err != nil {
 				return
 			}
 		}

@@ -343,11 +343,11 @@
           "admitted_mode": { "enum": ["view", "controller"] },
           "policy_revision": { "type": "integer", "minimum": 1 },
           "occurred_at": { "type": "string", "format": "date-time" },
-          "reason": { "enum": ["identity_unavailable", "invalid_request_path", "invalid_subprotocol", "unauthorized_identity", "attempt_authority_lost", "revoked", "view_backend_unavailable", "client_upgrade_failed", "client_closed", "view_backend_closed", "revalidation_failed", "session_cap_expired"] },
+          "reason": { "enum": ["identity_unavailable", "invalid_request_path", "invalid_subprotocol", "unauthorized_identity", "attempt_authority_lost", "revoked", "view_backend_unavailable", "client_upgrade_failed", "client_closed", "view_backend_closed", "revalidation_failed", "session_cap_expired", "explicit_release", "controller_overridden", "control_backend_closed", "control_backend_unavailable"] },
           "event_count": { "type": "integer", "minimum": 1 },
           "authority_generation": { "type": "integer", "minimum": 0, "readOnly": true }
         },
-        "description": "Immutable identity/policy evidence only. Display data, input data, endpoints, and fencing tokens are forbidden. Every session opens in view; control events are reserved for the session-bound tenure contract."
+        "description": "Immutable identity/policy evidence only. Display data, input data, endpoints, and fencing tokens are forbidden. Every session opens in view; controller events are emitted only by the session-bound Controller-tenure contract."
       },
       "ComputerTakeoverAuditReceipt": {
         "type": "object",

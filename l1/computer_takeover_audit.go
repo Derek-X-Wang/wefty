@@ -146,6 +146,13 @@ func validateComputerTakeoverAuditRequest(computerID, jobID, attemptID string, r
 		if request.Event.Kind == ComputerTakeoverSessionClose && request.Event.Reason == "" {
 			return protocolError(contract.ErrorInvalidRequest, "session_close requires a reason")
 		}
+		if (request.Event.Kind == ComputerTakeoverControlAcquired || request.Event.Kind == ComputerTakeoverControlReleased ||
+			request.Event.Kind == ComputerTakeoverAdminOverrode) && request.Event.AdmittedMode != ComputerAdmittedController {
+			return protocolError(contract.ErrorInvalidRequest, "control audit requires controller admitted mode")
+		}
+		if request.Event.Kind == ComputerTakeoverControlReleased && request.Event.Reason == "" {
+			return protocolError(contract.ErrorInvalidRequest, "control_released requires a reason")
+		}
 	default:
 		return protocolError(contract.ErrorInvalidRequest, "unknown Computer take-over audit event kind %q", request.Event.Kind)
 	}
@@ -162,7 +169,9 @@ func validComputerTakeoverReason(reason ComputerTakeoverReason) bool {
 		ComputerTakeoverAttemptAuthorityLost, ComputerTakeoverRevoked,
 		ComputerTakeoverViewBackendUnavailable, ComputerTakeoverClientUpgradeFailed,
 		ComputerTakeoverClientClosed, ComputerTakeoverViewBackendClosed,
-		ComputerTakeoverRevalidationFailed, ComputerTakeoverSessionCapExpired:
+		ComputerTakeoverRevalidationFailed, ComputerTakeoverSessionCapExpired,
+		ComputerTakeoverExplicitRelease, ComputerTakeoverControllerOverridden,
+		ComputerTakeoverControlBackendClosed, ComputerTakeoverControlBackendFailed:
 		return true
 	default:
 		return false

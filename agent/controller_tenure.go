@@ -1,0 +1,444 @@
+package agent
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/coder/websocket"
+)
+
+const (
+	controllerTenureFinalizationLimit = 30 * time.Second
+	controllerControlDialLimit        = 5 * time.Second
+)
+
+type controllerTenureConfig struct {
+	authorityContext   context.Context
+	clock              Clock
+	dial               computerEndpointDial
+	setControlState    func(context.Context, bool) error
+	record             func(context.Context, l1.ComputerTakeoverAuditEvent) (l1.ComputerTakeoverAuditReceipt, error)
+	report             func(error)
+	onUnconfirmedClear func(error)
+}
+
+// controllerTenure is process-local and attempt-scoped. Its mutex protects
+// only state transitions; helper, backend, relay, and L1 calls always happen
+// after the transition has been claimed and the mutex released.
+type controllerTenure struct {
+	config controllerTenureConfig
+	mu     sync.Mutex
+	next   uint64
+	live   map[string]controlTenureSession
+	held   *controllerHolder
+	op     *controllerOperation
+}
+
+type controllerHolder struct {
+	session controlTenureSession
+	serial  uint64
+	conn    *controllerConn
+}
+
+type controllerOperation struct {
+	sessionID string
+	context   context.Context
+	cancel    context.CancelFunc
+	done      chan struct{}
+	take      bool
+}
+
+func newControllerTenure(config controllerTenureConfig) (*controllerTenure, error) {
+	if config.authorityContext == nil || config.dial == nil || config.setControlState == nil || config.record == nil {
+		return nil, errors.New("agent: Controller tenure requires complete attempt authority, signal, dial, and audit seams")
+	}
+	if config.clock == nil {
+		config.clock = systemClock{}
+	}
+	return &controllerTenure{config: config, live: make(map[string]controlTenureSession)}, nil
+}
+
+func (*controllerTenure) controlTenure() {}
+
+func (tenure *controllerTenure) Register(session controlTenureSession) error {
+	if session.id == "" || session.context == nil || session.event.SessionID != session.id || session.event.ComputerID == "" ||
+		session.event.JobID == "" || session.event.AttemptID == "" {
+		return errors.New("agent: Controller tenure registration requires a live session-bound audit identity")
+	}
+	select {
+	case <-session.context.Done():
+		return &ComputerTenureError{Code: ComputerTenureSessionEnded}
+	default:
+	}
+	tenure.mu.Lock()
+	defer tenure.mu.Unlock()
+	if _, exists := tenure.live[session.id]; exists {
+		return errors.New("agent: Controller tenure session is already registered")
+	}
+	tenure.live[session.id] = session
+	go tenure.releaseWhenSessionEnds(session)
+	return nil
+}
+
+func (tenure *controllerTenure) releaseWhenSessionEnds(session controlTenureSession) {
+	<-session.context.Done()
+	ctx, cancel := context.WithTimeout(context.Background(), controllerTenureFinalizationLimit)
+	defer cancel()
+	if err := tenure.Release(ctx, session.id, computerSessionEndReason(session.context, l1.ComputerTakeoverAttemptAuthorityLost)); err != nil {
+		tenure.report(fmt.Errorf("release ended Computer control session: %w", err))
+	}
+}
+
+func (tenure *controllerTenure) Unregister(sessionID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), controllerTenureFinalizationLimit)
+	defer cancel()
+	if err := tenure.Release(ctx, sessionID, l1.ComputerTakeoverClientClosed); err != nil {
+		tenure.report(fmt.Errorf("release unregistered Computer control session: %w", err))
+	}
+	tenure.mu.Lock()
+	delete(tenure.live, sessionID)
+	tenure.mu.Unlock()
+}
+
+func (tenure *controllerTenure) Take(ctx context.Context, sessionID string) (net.Conn, error) {
+	session, prior, serial, operation, operationContext, err := tenure.beginTake(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer operation.cancel()
+
+	override := prior != nil
+	signalTrue := override
+	if override {
+		tenure.detachControl(prior)
+		if err := tenure.record(prior.session, prior.serial, l1.ComputerTakeoverControlReleased, l1.ComputerTakeoverControllerOverridden); err != nil {
+			return nil, tenure.failTake(operation, session, serial, override, signalTrue, false, err)
+		}
+	} else {
+		if err := tenure.config.setControlState(operationContext, true); err != nil {
+			tenure.finishOperation(operation, nil)
+			return nil, &ComputerTenureError{Code: ComputerTenureUnavailable, Err: fmt.Errorf("set driver signal true: %w", err)}
+		}
+		signalTrue = true
+	}
+
+	dialContext, cancelDial := context.WithTimeout(operationContext, controllerControlDialLimit)
+	connection, websocketConnection, _, dialErr := dialComputerBackendWithLifetime(
+		dialContext, session.context, tenure.config.dial, workloadrunner.AttemptEndpointControl,
+	)
+	cancelDial()
+	if dialErr != nil {
+		return nil, tenure.failTake(operation, session, serial, override, signalTrue, true,
+			fmt.Errorf("dial Computer control backend: %w", dialErr))
+	}
+	managed := newControllerConn(connection, websocketConnection, tenure, sessionID)
+
+	if override {
+		if err := tenure.record(session, serial, l1.ComputerTakeoverAdminOverrode, ""); err != nil {
+			managed.closeAndWait()
+			return nil, tenure.failTake(operation, session, serial, true, signalTrue, false, err)
+		}
+	}
+	if err := tenure.record(session, serial, l1.ComputerTakeoverControlAcquired, ""); err != nil {
+		managed.closeAndWait()
+		return nil, tenure.failTake(operation, session, serial, override, signalTrue, false, err)
+	}
+	if session.relay != nil {
+		if err := session.relay.activateControl(managed); err != nil {
+			managed.closeAndWait()
+			return nil, tenure.failTake(operation, session, serial, override, signalTrue, false, err)
+		}
+	}
+	if !tenure.finishOperation(operation, &controllerHolder{session: session, serial: serial, conn: managed}) {
+		tenure.detachControl(&controllerHolder{session: session, serial: serial, conn: managed})
+		return nil, tenure.failTake(operation, session, serial, override, signalTrue, false,
+			&ComputerTenureError{Code: ComputerTenureSessionEnded})
+	}
+	return managed, nil
+}
+
+func (tenure *controllerTenure) beginTake(
+	ctx context.Context,
+	sessionID string,
+) (controlTenureSession, *controllerHolder, uint64, *controllerOperation, context.Context, error) {
+	tenure.mu.Lock()
+	defer tenure.mu.Unlock()
+	session, ok := tenure.live[sessionID]
+	if !ok {
+		return controlTenureSession{}, nil, 0, nil, nil, &ComputerTenureError{Code: ComputerTenureSessionEnded}
+	}
+	if !session.canTake {
+		return controlTenureSession{}, nil, 0, nil, nil, &ComputerTenureError{Code: ComputerTenureUnauthorized}
+	}
+	select {
+	case <-session.context.Done():
+		return controlTenureSession{}, nil, 0, nil, nil, &ComputerTenureError{Code: ComputerTenureSessionEnded}
+	case <-tenure.config.authorityContext.Done():
+		return controlTenureSession{}, nil, 0, nil, nil, &ComputerTenureError{Code: ComputerTenureSessionEnded}
+	default:
+	}
+	if tenure.op != nil {
+		return controlTenureSession{}, nil, 0, nil, nil, &ComputerTenureError{Code: ComputerTenureBusy}
+	}
+	if tenure.held != nil && tenure.held.session.id == sessionID {
+		return controlTenureSession{}, nil, 0, nil, nil, &ComputerTenureError{Code: ComputerTenureAlreadyHeld}
+	}
+	prior := tenure.held
+	if prior != nil && !session.administrator {
+		return controlTenureSession{}, nil, 0, nil, nil, &ComputerTenureError{Code: ComputerTenureBusy}
+	}
+
+	operationContext, cancel := context.WithTimeout(session.context, controllerTenureFinalizationLimit)
+	stopCaller := context.AfterFunc(ctx, cancel)
+	operation := &controllerOperation{
+		sessionID: sessionID,
+		context:   operationContext,
+		cancel: func() {
+			stopCaller()
+			cancel()
+		},
+		done: make(chan struct{}),
+		take: true,
+	}
+	tenure.next++
+	serial := tenure.next
+	tenure.op = operation
+	if prior != nil {
+		// The override operation now owns the old input leg and truthful true
+		// signal. Releases for the old session must not wait behind its dial.
+		tenure.held = nil
+	}
+	return session, prior, serial, operation, operationContext, nil
+}
+
+func (tenure *controllerTenure) Release(ctx context.Context, sessionID string, reason l1.ComputerTakeoverReason) error {
+	for {
+		tenure.mu.Lock()
+		if tenure.op != nil {
+			operation := tenure.op
+			if operation.sessionID != sessionID {
+				tenure.mu.Unlock()
+				return nil
+			}
+			if operation.take {
+				operation.cancel()
+			}
+			done := operation.done
+			tenure.mu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return context.Cause(ctx)
+			}
+		}
+		if tenure.held == nil || tenure.held.session.id != sessionID {
+			tenure.mu.Unlock()
+			return nil
+		}
+		holder := tenure.held
+		operationContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), controllerTenureFinalizationLimit)
+		operation := &controllerOperation{sessionID: sessionID, context: operationContext, cancel: cancel, done: make(chan struct{})}
+		tenure.held = nil
+		tenure.op = operation
+		tenure.mu.Unlock()
+
+		tenure.detachControl(holder)
+		auditErr := tenure.record(holder.session, holder.serial, l1.ComputerTakeoverControlReleased, reason)
+		clearErr := tenure.clear(operationContext)
+		tenure.finishOperation(operation, nil)
+		cancel()
+		return errors.Join(auditErr, clearErr)
+	}
+}
+
+func (tenure *controllerTenure) releaseAfterBackendFailure(sessionID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), controllerTenureFinalizationLimit)
+	defer cancel()
+	if err := tenure.Release(ctx, sessionID, l1.ComputerTakeoverControlBackendClosed); err != nil {
+		tenure.report(fmt.Errorf("release failed Computer control backend: %w", err))
+	}
+}
+
+func (tenure *controllerTenure) failTake(
+	operation *controllerOperation,
+	session controlTenureSession,
+	serial uint64,
+	override bool,
+	signalTrue bool,
+	backendFailed bool,
+	failure error,
+) error {
+	if override && backendFailed {
+		if recordErr := tenure.record(session, serial, l1.ComputerTakeoverAdminOverrode, l1.ComputerTakeoverControlBackendFailed); recordErr != nil {
+			failure = errors.Join(failure, recordErr)
+		}
+	}
+	if signalTrue {
+		failure = errors.Join(failure, tenure.clear(context.Background()))
+	}
+	tenure.finishOperation(operation, nil)
+	return &ComputerTenureError{Code: ComputerTenureUnavailable, Err: failure}
+}
+
+func (tenure *controllerTenure) finishOperation(operation *controllerOperation, holder *controllerHolder) bool {
+	tenure.mu.Lock()
+	defer tenure.mu.Unlock()
+	if tenure.op != operation {
+		return false
+	}
+	if holder != nil {
+		select {
+		case <-operation.context.Done():
+			return false
+		case <-holder.session.context.Done():
+			return false
+		case <-tenure.config.authorityContext.Done():
+			return false
+		default:
+		}
+		tenure.held = holder
+	}
+	tenure.op = nil
+	close(operation.done)
+	return true
+}
+
+func (tenure *controllerTenure) detachControl(holder *controllerHolder) {
+	if holder.session.relay != nil {
+		holder.session.relay.deactivateControl(holder.conn)
+		return
+	}
+	holder.conn.closeAndWait()
+}
+
+func (tenure *controllerTenure) clear(parent context.Context) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), controllerTenureFinalizationLimit)
+	defer cancel()
+	if err := tenure.config.setControlState(ctx, false); err != nil {
+		failure := fmt.Errorf("clear driver signal: %w", err)
+		if tenure.config.onUnconfirmedClear != nil {
+			tenure.config.onUnconfirmedClear(failure)
+		}
+		return failure
+	}
+	return nil
+}
+
+func (tenure *controllerTenure) record(
+	session controlTenureSession,
+	serial uint64,
+	kind l1.ComputerTakeoverAuditEventKind,
+	reason l1.ComputerTakeoverReason,
+) error {
+	event := session.event
+	event.EventID = fmt.Sprintf("%s:control:%d:%s", session.id, serial, kind)
+	event.Kind = kind
+	event.AdmittedMode = l1.ComputerAdmittedController
+	event.OccurredAt = wallNow(tenure.config.clock).UTC().Round(0)
+	event.Reason = reason
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(session.context), controllerTenureFinalizationLimit)
+	defer cancel()
+	if err := appendAssertedComputerAudit(ctx, tenure.config.record, event); err != nil {
+		return fmt.Errorf("record %s: %w", kind, err)
+	}
+	return nil
+}
+
+func (tenure *controllerTenure) report(err error) {
+	if err != nil && tenure.config.report != nil {
+		tenure.config.report(err)
+	}
+}
+
+// controllerConn observes every in-flight backend operation before an
+// override or release may install a replacement input path.
+type controllerConn struct {
+	net.Conn
+	websocket *websocket.Conn
+	owner     *controllerTenure
+	sessionID string
+
+	mu          sync.Mutex
+	cond        *sync.Cond
+	active      int
+	closing     bool
+	failureOnce sync.Once
+}
+
+func newControllerConn(connection net.Conn, websocketConnection *websocket.Conn, owner *controllerTenure, sessionID string) *controllerConn {
+	managed := &controllerConn{Conn: connection, websocket: websocketConnection, owner: owner, sessionID: sessionID}
+	managed.cond = sync.NewCond(&managed.mu)
+	return managed
+}
+
+func (connection *controllerConn) begin() bool {
+	connection.mu.Lock()
+	defer connection.mu.Unlock()
+	if connection.closing {
+		return false
+	}
+	connection.active++
+	return true
+}
+
+func (connection *controllerConn) end(failed bool) {
+	connection.mu.Lock()
+	connection.active--
+	if connection.active == 0 {
+		connection.cond.Broadcast()
+	}
+	closing := connection.closing
+	connection.mu.Unlock()
+	if failed && !closing {
+		connection.failureOnce.Do(func() { go connection.owner.releaseAfterBackendFailure(connection.sessionID) })
+	}
+}
+
+func (connection *controllerConn) Read(buffer []byte) (int, error) {
+	if !connection.begin() {
+		return 0, net.ErrClosed
+	}
+	count, err := connection.Conn.Read(buffer)
+	connection.end(err != nil)
+	return count, err
+}
+
+func (connection *controllerConn) Write(buffer []byte) (int, error) {
+	if !connection.begin() {
+		return 0, net.ErrClosed
+	}
+	count, err := connection.Conn.Write(buffer)
+	connection.end(err != nil)
+	return count, err
+}
+
+func (connection *controllerConn) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), controllerTenureFinalizationLimit)
+	defer cancel()
+	return connection.owner.Release(ctx, connection.sessionID, l1.ComputerTakeoverExplicitRelease)
+}
+
+func (connection *controllerConn) closeAndWait() {
+	connection.mu.Lock()
+	if !connection.closing {
+		connection.closing = true
+		_ = connection.Conn.Close()
+		if connection.websocket != nil {
+			_ = connection.websocket.CloseNow()
+		}
+	}
+	for connection.active != 0 {
+		connection.cond.Wait()
+	}
+	connection.mu.Unlock()
+}
+
+var _ ControlTenure = (*controllerTenure)(nil)
+var _ net.Conn = (*controllerConn)(nil)
