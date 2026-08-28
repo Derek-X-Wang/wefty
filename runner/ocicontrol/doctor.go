@@ -17,14 +17,15 @@ import (
 )
 
 const (
-	DoctorVersion           = 1
-	DoctorUIDLimitation     = "process_kind_payload_uid_isolation_pending"
-	DoctorUIDIssue          = "https://github.com/Derek-X-Wang/wefty/issues/220"
-	DoctorLaunchUnmanaged   = "unmanaged"
-	DoctorRunbookPrefix     = RunbookPath + "#doctor-code-"
-	TestedLimaVersion       = "2.2.0"
-	TestedContainerdVersion = "2.3.4"
-	TestedRuncVersion       = "1.5.1"
+	DoctorVersion            = 1
+	DoctorUIDLimitation      = "process_kind_payload_uid_isolation_pending"
+	DoctorUIDIssue           = "https://github.com/Derek-X-Wang/wefty/issues/220"
+	DoctorLaunchUnmanaged    = "unmanaged"
+	DoctorRunbookPrefix      = RunbookPath + "#doctor-code-"
+	TestedContainerdVersion  = "2.3.4"
+	TestedRuncVersion        = "1.5.1"
+	MinimumContainerdVersion = "2.0.0"
+	MinimumRuncVersion       = "1.0.0"
 )
 
 type DiagnosticOutcome string
@@ -500,20 +501,26 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 	containerdRead := runtimeStatus.ContainerdRead.Outcome == ocihelper.DiagnosticReadOK || runtimeStatus.ContainerdRead.Outcome == "" && runtimeStatus.ContainerdVersion != ""
 	runcRead := runtimeStatus.RuncRead.Outcome == ocihelper.DiagnosticReadOK || runtimeStatus.RuncRead.Outcome == "" && runtimeStatus.RuncVersion != ""
 	versionsRan := runtimeStatus.ContainerdRead.Outcome != "" || runtimeStatus.RuncRead.Outcome != "" || containerdRead || runcRead
-	versionsOK := containerdRead && runcRead
-	outOfRange := versionsOK && !testedRuntimeVersions(runtimeStatus.ContainerdVersion, runtimeStatus.RuncVersion)
-	report.Versions = VersionFacts{Outcome: outcomeFor(versionsRan, versionsOK), Containerd: runtimeStatus.ContainerdVersion, Runc: runtimeStatus.RuncVersion, RuncSource: runtimeStatus.RuncVersionSource, OutsideTestedRange: outOfRange}
+	versionsRead := containerdRead && runcRead
+	versionsSupported := versionsRead && supportedRuntimeVersions(runtimeStatus.ContainerdVersion, runtimeStatus.RuncVersion)
+	outOfRange := versionsSupported && !testedRuntimeVersions(runtimeStatus.ContainerdVersion, runtimeStatus.RuncVersion)
+	report.Versions = VersionFacts{Outcome: outcomeFor(versionsRan, versionsSupported), Containerd: runtimeStatus.ContainerdVersion, Runc: runtimeStatus.RuncVersion, RuncSource: runtimeStatus.RuncVersionSource, OutsideTestedRange: outOfRange}
 	versionCode := "oci_runtime_versions_observed"
 	severity := DiagnosticSeverity("")
-	if !versionsOK {
+	reasonCode := contract.CapabilityReasonCode("")
+	if !versionsRead {
 		versionCode = "oci_runtime_versions_unavailable"
+	} else if !versionsSupported {
+		versionCode = "oci_runtime_versions_unsupported"
+		reasonCode = contract.CapabilityReasonRuntimeVersionUnsupported
+		severity = DiagnosticError
 	} else if outOfRange {
 		versionCode = "oci_runtime_versions_outside_tested_range"
 		severity = DiagnosticWarn
 	} else {
 		severity = DiagnosticInfo
 	}
-	report.Findings = append(report.Findings, finding("runtime-versions", diagnosticReceipt{ran: versionsRan, passed: versionsOK, code: versionCode, severity: severity, notRunCause: NotRunSourceUnavailable, detail: "containerd and runc version facts were read without gating capability"}))
+	report.Findings = append(report.Findings, finding("runtime-versions", diagnosticReceipt{ran: versionsRan, passed: versionsSupported, code: versionCode, severity: severity, reasonCode: reasonCode, notRunCause: NotRunSourceUnavailable, detail: "containerd and runc versions were compared with the supported minimums"}))
 
 	cacheRead := runtimeStatus.CacheRead.Outcome == ocihelper.DiagnosticReadOK || runtimeStatus.CacheRead.Outcome == "" && runtimeStatus.Cache.CapBytes > 0
 	cacheRan := runtimeStatus.CacheRead.Outcome != "" || cacheRead
@@ -659,6 +666,31 @@ func testedRuntimeVersions(containerdVersion, runcVersion string) bool {
 		strings.TrimPrefix(strings.TrimSpace(runcVersion), "v") == TestedRuncVersion
 }
 
+func supportedRuntimeVersions(containerdVersion, runcVersion string) bool {
+	containerdParts, containerdOK := numericVersion(containerdVersion)
+	minimumContainerd, minimumOK := numericVersion(MinimumContainerdVersion)
+	runcParts, runcOK := numericVersion(runcVersion)
+	minimumRunc, minimumRuncOK := numericVersion(MinimumRuncVersion)
+	return containerdOK && minimumOK && runcOK && minimumRuncOK &&
+		versionPartsAtLeast(containerdParts, minimumContainerd) && runcParts[0] == 1 && versionPartsAtLeast(runcParts, minimumRunc)
+}
+
+func numericVersion(value string) ([3]int, bool) {
+	var parts [3]int
+	value = strings.TrimPrefix(strings.TrimSpace(value), "v")
+	n, err := fmt.Sscanf(value, "%d.%d.%d", &parts[0], &parts[1], &parts[2])
+	return parts, err == nil && n == 3
+}
+
+func versionPartsAtLeast(actual, minimum [3]int) bool {
+	for index := range actual {
+		if actual[index] != minimum[index] {
+			return actual[index] > minimum[index]
+		}
+	}
+	return true
+}
+
 func cloneBoolMap(values map[string]bool) map[string]bool {
 	cloned := make(map[string]bool, len(values))
 	for key, value := range values {
@@ -691,7 +723,7 @@ func StableDoctorCodes() []string {
 		"oci_helper_not_read", "oci_helper_unreachable", "oci_helper_handshake_ok", "oci_helper_handshake_failed", "oci_helper_version_mismatch",
 		"oci_boot_sweep_not_recorded", "oci_boot_sweep_verified", "oci_boot_sweep_failed",
 		"oci_runtime_platform_not_run", "oci_runtime_platform_not_recorded", "oci_runtime_platform_observed",
-		"oci_runtime_versions_not_run", "oci_runtime_versions_unavailable", "oci_runtime_versions_observed", "oci_runtime_versions_outside_tested_range",
+		"oci_runtime_versions_not_run", "oci_runtime_versions_unavailable", "oci_runtime_versions_unsupported", "oci_runtime_versions_observed", "oci_runtime_versions_outside_tested_range",
 		"oci_cache_not_run", "oci_cache_status_unavailable", "oci_cache_within_bound", "oci_cache_over_bound", "oci_cache_eviction_failed",
 		"oci_mount_roots_not_run", "oci_mount_roots_unavailable", "oci_mount_roots_observed", "oci_mount_root_unavailable",
 		"oci_convergence_not_read", "oci_convergence_state_unavailable", "oci_convergence_desired_not_read",

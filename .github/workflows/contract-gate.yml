@@ -31,6 +31,8 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test ./...
+      - name: Exercise privileged OCI install and configure path
+        run: bash scripts/test-install-oci-privileged.sh
 
   sqlite-integration:
     name: sqlite-integration

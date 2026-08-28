@@ -143,7 +143,9 @@ func TestDoctorGoldenParityCoversEveryReasonAndL1MetadataTuple(t *testing.T) {
 		{contract.CapabilityReasonPrerequisiteMissing, direct, func(config *DoctorConfig) {
 			config.ReadSetupState = func(string) (SetupState, error) { return SetupState{}, os.ErrNotExist }
 		}},
-		{contract.CapabilityReasonRuntimeVersionUnsupported, passThrough, func(config *DoctorConfig) { setProbeReason(config, contract.CapabilityReasonRuntimeVersionUnsupported) }},
+		{contract.CapabilityReasonRuntimeVersionUnsupported, direct, func(config *DoctorConfig) {
+			mutateHelper(config, func(snapshot *HelperDoctorSnapshot) { snapshot.Runtime.ContainerdVersion = "1.7.0" })
+		}},
 		{contract.CapabilityReasonHelperUnreachable, direct, func(config *DoctorConfig) {
 			config.Helper = func(context.Context) (HelperDoctorSnapshot, error) {
 				return HelperDoctorSnapshot{}, errors.New("dial refused")
@@ -196,9 +198,6 @@ func TestDoctorGoldenParityCoversEveryReasonAndL1MetadataTuple(t *testing.T) {
 		for _, item := range report.Findings {
 			if item.ReasonCode == row.reason {
 				found = true
-			}
-			if row.reason == contract.CapabilityReasonRuntimeVersionUnsupported && item.Check == "runtime-versions" && item.Outcome == DiagnosticFailed {
-				t.Fatalf("advisory runtime version fact became a verdict: %+v", item)
 			}
 		}
 		if !found {
@@ -442,9 +441,27 @@ func TestTestedRuntimeVersionsMatchRealtimeWorkflowPins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantVersionSet := "WEFTY_OCI_TESTED_VERSIONS='lima=" + TestedLimaVersion + " containerd=" + TestedContainerdVersion + " runc=" + TestedRuncVersion + "'"
+	wantVersionSet := "WEFTY_OCI_TESTED_VERSIONS='lima=2.2.0 containerd=" + TestedContainerdVersion + " runc=" + TestedRuncVersion + "'"
 	if !bytes.Contains(versionsPayload, []byte(wantVersionSet)) {
 		t.Fatalf("installer tested-version set drifted from doctor constants: want %q", wantVersionSet)
+	}
+	wantMinimumSet := "WEFTY_OCI_MINIMUM_VERSIONS='lima=2.2.0 containerd=" + MinimumContainerdVersion + " runc=" + MinimumRuncVersion + "'"
+	if !bytes.Contains(versionsPayload, []byte(wantMinimumSet)) {
+		t.Fatalf("installer minimum-version set drifted from doctor enforcement: want %q", wantMinimumSet)
+	}
+	for document, minimums := range map[string][]string{
+		filepath.Join("..", "..", RunbookPath):                                  {"containerd 2.0", "runc 1.x"},
+		filepath.Join("..", "..", "docs", "specs", "2026-08-22-m3-oci-spec.md"): {"containerd ≥2.0", "runc 1.x"},
+	} {
+		payload, err := os.ReadFile(document)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, minimum := range minimums {
+			if !bytes.Contains(payload, []byte(minimum)) {
+				t.Fatalf("minimum policy drifted from %s: missing %q", document, minimum)
+			}
+		}
 	}
 	payload, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "service-acceptance-realtiming.yml"))
 	if err != nil {
@@ -462,7 +479,9 @@ func TestOCIPrerequisiteInstallerMatrix(t *testing.T) {
 	installer := filepath.Join(repositoryRoot, "scripts", "install-oci-deps.sh")
 	matrix := filepath.Join(repositoryRoot, "scripts", "test-install-oci-deps.sh")
 	if shellcheck, err := exec.LookPath("shellcheck"); err == nil {
-		command := exec.Command(shellcheck, installer, matrix)
+		command := exec.Command(shellcheck, installer, matrix,
+			filepath.Join(repositoryRoot, "scripts", "build-oci-install-manifest.sh"),
+			filepath.Join(repositoryRoot, "scripts", "test-install-oci-privileged.sh"))
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("shellcheck OCI prerequisite installer: %v\n%s", err, output)
 		}
@@ -478,7 +497,7 @@ func TestRuntimeVersionRangeIsAdvisoryAndHumanWriterDoesNotMutate(t *testing.T) 
 	config := healthyDoctorConfig(now, "")
 	mutateHelper(&config, func(snapshot *HelperDoctorSnapshot) {
 		snapshot.Runtime.ContainerdVersion = "9.9.9"
-		snapshot.Runtime.RuncVersion = "9.9.9"
+		snapshot.Runtime.RuncVersion = "1.9.9"
 	})
 	report := BuildDoctor(t.Context(), config)
 	report.Probe.MissingCapabilities = []string{"z-last", "a-first"}
@@ -496,6 +515,18 @@ func TestRuntimeVersionRangeIsAdvisoryAndHumanWriterDoesNotMutate(t *testing.T) 
 	}
 	if !slices.Equal(report.Probe.MissingCapabilities, before) {
 		t.Fatalf("human writer mutated caller slice: before=%v after=%v", before, report.Probe.MissingCapabilities)
+	}
+}
+
+func TestRuntimeVersionMinimumIsAHealthFailure(t *testing.T) {
+	config := healthyDoctorConfig(time.Date(2026, 8, 28, 22, 30, 0, 0, time.UTC), "")
+	mutateHelper(&config, func(snapshot *HelperDoctorSnapshot) {
+		snapshot.Runtime.ContainerdVersion = "1.7.27"
+	})
+	report := BuildDoctor(t.Context(), config)
+	item := findDoctorFinding(t, report, "runtime-versions")
+	if item.Outcome != DiagnosticFailed || item.Code != "oci_runtime_versions_unsupported" || item.ReasonCode != contract.CapabilityReasonRuntimeVersionUnsupported {
+		t.Fatalf("unsupported runtime finding = %+v", item)
 	}
 }
 

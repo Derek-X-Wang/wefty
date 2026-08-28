@@ -106,6 +106,7 @@ jobs:
           chmod 0644 /tmp/wefty-service-data-numeric.oci.tar /tmp/wefty-service-data-named.oci.tar
           sudo install --owner=root --group=root --mode=0755 /tmp/wefty-agent-oci-realtiming /usr/local/libexec/wefty-agent-oci-realtiming
           HELPER_CHECKSUM="sha256:$(sha256sum /tmp/wefty-agent-oci-realtiming | cut -d' ' -f1)"
+          scripts/build-oci-install-manifest.sh --helper /tmp/wefty-agent-oci-realtiming --probe-reference "$PROBE_REFERENCE" --probe-digest "$PROBE_DIGEST" --probe-archive /tmp/wefty-probe.oci.tar --output /tmp/wefty-release/share/wefty/oci/manifest.json
           AGENT_UID="$(id -u)"
           AGENT_GROUP="$(id -gn)"
           sudo install --directory --owner=root --group="$AGENT_GROUP" --mode=0750 /run/wefty-oci-helper

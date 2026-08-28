@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -122,18 +121,19 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &doctor); err != nil || doctor.Version != ocicontrol.DoctorVersion || doctor.Probe.Outcome != ocicontrol.DiagnosticFailed {
 		t.Fatalf("doctor output=%q decoded=%+v err=%v", stdout.String(), doctor, err)
 	}
-	if runtime.GOOS != "linux" {
-		stdout.Reset()
-		stderr.Reset()
-		if err := run(t.Context(), []string{
-			"--fabric=invalid-must-not-open", "--node-config=" + configPath, "--json", "node", "setup-oci",
-		}, &stdout, &stderr); err != nil {
-			t.Fatalf("setup-oci: %v stderr=%s", err, stderr.String())
-		}
-		var setup ocicontrol.SetupResponse
-		if err := json.Unmarshal(stdout.Bytes(), &setup); err != nil || !setup.Configured || setup.Convergence != ocicontrol.ConvergenceUnchanged || !setup.ProbePreloaded {
-			t.Fatalf("setup output=%q decoded=%+v err=%v", stdout.String(), setup, err)
-		}
+	stdout.Reset()
+	stderr.Reset()
+	setupClient, err := ocicontrol.NewClient(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executeLocalSetupOCI(t.Context(), setupClient, true, nil, &stdout, &stderr); err != nil {
+		t.Fatalf("setup-oci: %v stderr=%s", err, stderr.String())
+	}
+	setupClient.Close()
+	var setup ocicontrol.SetupResponse
+	if err := json.Unmarshal(stdout.Bytes(), &setup); err != nil || !setup.Configured || setup.Convergence != ocicontrol.ConvergenceUnchanged || !setup.ProbePreloaded {
+		t.Fatalf("setup output=%q decoded=%+v err=%v", stdout.String(), setup, err)
 	}
 	stdout.Reset()
 	stderr.Reset()
@@ -194,6 +194,8 @@ func TestOCINodeRunbookCommandsUseExercisedSurfaces(t *testing.T) {
 	want := map[string]bool{
 		"bash scripts/install-oci-deps.sh --dry-run": false,
 		"sudo bash scripts/install-oci-deps.sh":      false,
+		"scripts/build-oci-install-manifest.sh ":     false,
+		"sudo wefty node setup-oci":                  false,
 		"wefty node setup-oci":                       false,
 		"wefty node doctor":                          false,
 		"wefty node oci start":                       false,
@@ -214,10 +216,18 @@ func TestOCINodeRunbookCommandsUseExercisedSurfaces(t *testing.T) {
 		if !inShellBlock || strings.TrimSpace(line) == "" {
 			continue
 		}
-		if _, ok := want[line]; !ok {
+		normalized := strings.Join(strings.Fields(line), " ")
+		matched := ""
+		for command := range want {
+			if normalized == command || strings.HasSuffix(command, " ") && strings.HasPrefix(normalized, command) || command == "sudo wefty node setup-oci" && strings.HasPrefix(normalized, command+" ") {
+				matched = command
+				break
+			}
+		}
+		if matched == "" {
 			t.Fatalf("runbook shell command is not covered by the installer matrix or singular CLI acceptance: %q", line)
 		}
-		want[line] = true
+		want[matched] = true
 	}
 	for command, seen := range want {
 		if !seen {

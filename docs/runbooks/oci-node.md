@@ -7,9 +7,9 @@ This runbook reproduces the supported M3 `kind=oci` node setup without widening 
 | Node path | Minimum | Tested | Installer scope |
 |---|---|---|---|
 | macOS 13.5+ | Lima 2.2 with `vz` | Lima 2.2.0 | Homebrew `lima`; Homebrew itself is not installed |
-| Ubuntu 24.04 or 26.04 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.4, runc 1.5.1 | checksummed upstream release artifacts; no repository is added |
-| Debian 12 or 13 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.4, runc 1.5.1 | checksummed upstream release artifacts; no repository is added |
-| Fedora 43 or 44 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.4, runc 1.5.1 | checksummed upstream release artifacts; no repository is added |
+| Ubuntu 24.04 or 26.04 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.4, runc 1.5.1 | upstream artifacts verified against same-origin checksums; no repository is added |
+| Debian 12 or 13 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.4, runc 1.5.1 | upstream artifacts verified against same-origin checksums; no repository is added |
+| Fedora 43 or 44 | containerd 2.0, runc 1.x, overlayfs | containerd 2.3.4, runc 1.5.1 | upstream artifacts verified against same-origin checksums; no repository is added |
 
 Minimum-version failures and unknown platforms stop before mutation. A supported installed version outside the tested pin is preserved and reported as a warning. Preview the exact plan first:
 
@@ -23,16 +23,33 @@ Then run the installer from a reviewed checkout. Use `sudo` on Linux; do not use
 sudo bash scripts/install-oci-deps.sh
 ```
 
-The script prints the exact next two commands for the detected platform. It never starts containerd, Lima, the privileged helper, or the unprivileged agent.
+The Linux install stages the complete pinned containerd bundle under `/usr/local/lib/wefty/oci-runtime`, moves that directory into place as one unit, and publishes root-owned links in `/usr/local/bin`; runc uses the matching versioned directory and `/usr/local/sbin/runc`. A partial or conflicting managed install exits `65` until an operator reviews it and explicitly passes `--repair`. The script resolves privileged tools to absolute root-owned executables, preserves a `containerd.service` found anywhere in systemd's unit search path, and otherwise writes an inactive `/etc/systemd/system/containerd.service` with the resolved `ExecStart`, `Type=notify`, and `Restart=always`.
+
+Every written path, owner, and mode appears in the dry-run or completion receipt. To uninstall a wefty-managed runtime, first stop dependent wefty/containerd services, remove only the disclosed links and wefty-authored unit, then remove `/usr/local/lib/wefty/oci-runtime`; never remove a preserved packaged unit. Exit `0` means prerequisites are ready, `64` means invalid input/unsupported prerequisites before mutation, `65` requires explicit repair authority, and any other nonzero status means the operation did not complete and its receipt must be inspected before rerun. The script prints the platform-correct setup, service-convergence, then doctor order and never starts containerd, Lima, the helper, or the agent.
 
 ## Configure the installed node
 
-The installer and setup have deliberately separate authority. First install the wefty agent and immutable probe archive using the candidate revision's packaging procedure. On Linux, calculate the installed agent checksum and pass the operator user, probe reference, probe digest, and absolute probe archive to the privileged `setup-oci` flags. On macOS, the live operator-owned agent resolves the installed node configuration and performs setup through its `0700` control socket.
+The installer and setup have deliberately separate authority. A Linux release installs `wefty` in `bin`, the matching agent in `libexec`, and `share/wefty/oci/manifest.json` containing the helper checksum, probe reference/digest, and a relative probe archive path. Until #156/#157 own release assembly, produce the manifest from the exact helper and probe artifacts already built by the realtiming lane with this tested script invocation (replace the two digest variables with that lane's pinned values):
 
 ```sh
+scripts/build-oci-install-manifest.sh --helper /tmp/wefty-agent-oci-realtiming --probe-reference "$PROBE_REFERENCE" --probe-digest "$PROBE_DIGEST" --probe-archive /tmp/wefty-probe.oci.tar --output share/wefty/oci/manifest.json
+```
+
+With a normally installed release, Linux setup finds `<prefix>/share/wefty/oci/manifest.json` from the `wefty` executable and defaults all four artifact flags from it:
+
+```sh
+sudo wefty node setup-oci
 wefty node setup-oci
 wefty node doctor
 ```
+
+For unpackaged development artifacts, override all four values explicitly; partial overrides still default the missing values from `--install-manifest`:
+
+```sh
+sudo wefty node setup-oci --helper-checksum "$HELPER_CHECKSUM" --probe-reference "$PROBE_REFERENCE" --probe-digest "$PROBE_DIGEST" --probe-archive "$PROBE_ARCHIVE"
+```
+
+On macOS, the unprivileged `wefty node setup-oci` command talks to the live operator-owned agent through its `0700` control socket; do not use `sudo` there.
 
 Linux setup renders but does not execute `systemctl daemon-reload`, helper-socket enablement, agent enablement, and the required agent start or restart. Review the printed commands before running them. The root socket-activated helper is the only containerd client: its socket is `0660 root:wefty-oci`; the unprivileged agent receives `wefty-oci` as a supplementary group and never gets the raw containerd socket. A newly added group requires one agent restart; an unchanged rerun does not manufacture another restart.
 
@@ -208,6 +225,10 @@ Meaning: version reads lacked a helper dependency. Evidence: inspect helper outc
 ## doctor-code-oci-runtime-versions-unavailable
 
 Meaning: containerd or runc version introspection failed. Evidence: distinguish containerd runtime info from the setup-resolved absolute runc path. First action: repair that exact source. Escalation: attach sanitized read receipts and executable metadata.
+
+## doctor-code-oci-runtime-versions-unsupported
+
+Meaning: the recorded containerd or runc version is below the supported minimum, or runc is not 1.x. Evidence: compare the exact helper-reported versions with the single policy in `scripts/oci-tested-versions.env`. First action: install the supported prerequisite versions, then use the normal setup and intent recovery path. Escalation: attach doctor JSON and immutable runtime package provenance.
 
 ## doctor-code-oci-runtime-versions-observed
 
