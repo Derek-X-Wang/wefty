@@ -191,7 +191,6 @@ func TestServiceAcceptanceControllerTenureRealProcessAuthorityLoss(t *testing.T)
 	case <-time.After(5 * time.Second):
 		t.Fatal("real-process Controller authority did not expire")
 	}
-	waitForControllerFree(t, tenure)
 	readContext, cancelRead := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancelRead()
 	if _, _, err := connection.Read(readContext); err == nil {

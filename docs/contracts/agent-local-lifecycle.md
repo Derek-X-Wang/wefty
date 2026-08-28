@@ -375,6 +375,14 @@ boot-scoped `computer` capability; an unsupported helper major is not admitted
 by this agent and cannot satisfy a Computer claim. Display readiness and
 publication remain a separate consumer of the returned opaque endpoints.
 
+Take-over termination force-closes the client, `view`, and any active `control`
+WebSockets before invoking their handshake-capable `net.Conn` wrappers, so a
+peer close frame and goroutine scheduling cannot extend the authority boundary.
+The policy drain barrier is released when those sockets are closed. Controller
+signal clearing and asserted `control_released` then `session_close` audit
+finalization follow under independent bounds; neither delays the drain
+acknowledgement.
+
 OCI service environment contains only reserved container-visible values:
 `WEFTY_SERVICE_DIR=/wefty/service` for every service and the helper-allocated
 `WEFTY_SERVICE_PORT` only for a portful service. Agent and guest backing paths

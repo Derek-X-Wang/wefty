@@ -398,7 +398,8 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	default:
 	}
 
-	sessionContext, cancelSession := context.WithCancelCause(frontDoor.config.authorityContext)
+	sessionContext, cancelSession, stopAuthorityPropagation := newComputerSessionContext(frontDoor.config.authorityContext)
+	defer stopAuthorityPropagation()
 	defer cancelSession(nil)
 	backend, backendWebSocket, banner, err := dialComputerBackend(sessionContext, frontDoor.config.dial, workloadrunner.AttemptEndpointView)
 	if err != nil {
@@ -436,7 +437,7 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 		return
 	}
 
-	relay := newComputerSessionRelay(client, backend, backendWebSocket)
+	relay := newComputerSessionRelay(client, backend, clientWebSocket, backendWebSocket)
 	handle := &computerSessionHandle{id: sessionID, canTake: authorization.CanTake(), admin: authorization.IsAdministrator(), tenure: frontDoor.config.controlTenure, session: sessionContext}
 	if err := handle.tenure.Register(controlTenureSession{id: sessionID, context: sessionContext, canTake: handle.canTake,
 		administrator: handle.admin, event: baseEvent, relay: relay}); err != nil {
@@ -474,13 +475,27 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	relay.Start()
 
 	reason := frontDoor.waitForSessionEnd(sessionContext, request.RemoteAddr, identity, authorization, relay, admittedAt)
+	cancelSession(&computerSessionEnd{reason: reason})
+	relay.Close()
+	// A policy drain acknowledges the observable socket boundary. Durable
+	// control/session audit is finalized afterward and must not delay revocation.
+	release()
 	if err := handle.tenure.Release(context.WithoutCancel(request.Context()), sessionID, reason); err != nil {
 		frontDoor.report(fmt.Errorf("release Computer control tenure: %w", err))
 	}
-	cancelSession(&computerSessionEnd{reason: reason})
-	relay.Close()
-	release()
 	frontDoor.finishSession(request.Context(), baseEvent, reason)
+}
+
+// newComputerSessionContext translates generic parent cancellation into the
+// one attempt-authority reason before any relay lifetime observes it. Directly
+// parenting WithCancelCause would retain context.DeadlineExceeded and let a
+// concurrent backend EOF invent a different finalization reason.
+func newComputerSessionContext(authority context.Context) (context.Context, context.CancelCauseFunc, func() bool) {
+	ctx, cancel := context.WithCancelCause(context.WithoutCancel(authority))
+	stop := context.AfterFunc(authority, func() {
+		cancel(&computerSessionEnd{reason: l1.ComputerTakeoverAttemptAuthorityLost})
+	})
+	return ctx, cancel, stop
 }
 
 func (frontDoor *computerFrontDoor) waitForSessionEnd(
