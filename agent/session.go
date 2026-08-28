@@ -71,6 +71,8 @@ type agentSession struct {
 	reapPriorBoot   func(context.Context, string) (workloadrunner.ReapReceipt, error)
 	removals        *removalController
 	storageResets   *storageResetController
+	computerPolicy  *ComputerPolicyCache
+	computerAcks    *computerPolicyAckController
 
 	drainOnce      sync.Once
 	drainRequested chan struct{}
@@ -144,17 +146,25 @@ func newAgentSession(
 		serviceBoots:    make(map[string]string),
 		residentChanged: make(chan struct{}, 1),
 		drainRequested:  make(chan struct{}),
+		computerPolicy:  NewComputerPolicyCache(clock, registration.NodeID, registration.BootSessionID),
 	}
+	session.computerAcks = newComputerPolicyAckController(client, clock, logf)
 	return session
 }
 
 func (session *agentSession) close() {
+	if session != nil && session.computerPolicy != nil {
+		session.computerPolicy.Close()
+	}
 	if session != nil && session.client != nil {
 		session.client.Close()
 	}
 }
 
 func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
+	if session.computerPolicy != nil {
+		session.computerPolicy.Invalidate(ComputerPolicyWatchLost)
+	}
 	if session.ociBootBarrier == nil {
 		if err := session.capabilities.refresh(ctx); err != nil && session.logf != nil {
 			session.logf("agent: capability probe before registration: %v", err)
@@ -178,6 +188,12 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	registrationHeartbeat, err := session.heartbeat(ctx)
 	if err != nil {
 		return l1.Node{}, err
+	}
+	if err := session.installComputerPolicy(ctx, registrationHeartbeat.ComputerPolicy); err != nil {
+		session.computerPolicy.Invalidate(ComputerPolicyWatchLost)
+		if session.logf != nil {
+			session.logf("agent: Computer policy heartbeat bootstrap failed closed: %v", err)
+		}
 	}
 
 	barrierErr := session.ociBootBarrier.Ensure(ctx)
@@ -408,6 +424,20 @@ func (session *agentSession) heartbeat(ctx context.Context) (l1.HeartbeatRespons
 	return session.client.Heartbeat(ctx, session.registration.NodeID, heartbeatRequest(session.registration.BootSessionID, observation))
 }
 
+func (session *agentSession) installComputerPolicy(ctx context.Context, snapshot *l1.ComputerPolicySnapshot) error {
+	if snapshot == nil || session.computerPolicy == nil {
+		return nil
+	}
+	receipt, err := session.computerPolicy.Install(*snapshot)
+	if err != nil {
+		return err
+	}
+	if session.computerAcks != nil {
+		session.computerAcks.submit(receipt)
+	}
+	return nil
+}
+
 func (session *agentSession) publishCapabilityHeartbeat(ctx context.Context, pinned *ocihelper.HelperSession) (l1.Node, error) {
 	response, err := session.publishCapabilityHeartbeatResponse(ctx, pinned)
 	return response.Node, err
@@ -553,6 +583,16 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 		defer close(heartbeatDone)
 		session.heartbeatLoop(sessionContext, heartbeatErrors)
 	}()
+	policyWatchDone := make(chan struct{})
+	go func() {
+		defer close(policyWatchDone)
+		session.computerPolicyWatchLoop(sessionContext)
+	}()
+	policyAckDone := make(chan struct{})
+	go func() {
+		defer close(policyAckDone)
+		session.computerAcks.run(sessionContext)
+	}()
 	type claimWorker struct {
 		id       int
 		pool     classPool
@@ -612,6 +652,8 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 	defer func() {
 		stopSession()
 		<-heartbeatDone
+		<-policyWatchDone
+		<-policyAckDone
 		for len(workers) > 0 {
 			result := <-workerDone
 			delete(workers, result.id)
@@ -664,6 +706,38 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 			}
 		case failure := <-heartbeatErrors:
 			return failure
+		}
+	}
+}
+
+func (session *agentSession) computerPolicyWatchLoop(ctx context.Context) {
+	if session.computerPolicy == nil {
+		return
+	}
+	backoff := newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax)
+	for ctx.Err() == nil {
+		snapshot, err := session.client.WatchComputerPolicy(ctx, session.registration.NodeID,
+			session.registration.BootSessionID, session.computerPolicy.Revision())
+		if err == nil && snapshot != nil {
+			err = session.installComputerPolicy(ctx, snapshot)
+		}
+		if err == nil {
+			backoff.reset()
+			continue
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		session.computerPolicy.Invalidate(ComputerPolicyWatchLost)
+		if session.logf != nil {
+			session.logf("agent: Computer policy watch failed closed: %v", err)
+		}
+		timer := session.clock.NewTimer(backoff.next())
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return
+		case <-timer.C():
 		}
 	}
 }
@@ -914,6 +988,14 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				default:
 				}
 				return
+			}
+			if session.computerPolicy != nil && !session.computerPolicy.Valid() && response.ComputerPolicy != nil {
+				if policyErr := session.installComputerPolicy(ctx, response.ComputerPolicy); policyErr != nil {
+					session.computerPolicy.Invalidate(ComputerPolicyWatchLost)
+					if session.logf != nil {
+						session.logf("agent: Computer policy heartbeat bootstrap failed closed: %v", policyErr)
+					}
+				}
 			}
 			session.observeGrantedCapacity(response.Node)
 			if session.removals != nil {

@@ -193,6 +193,14 @@ data: L1 refuses person routes unless the operator explicitly enables
 `-allow-plain-person-identities`, and they must never be treated as production
 admin authority.
 
+Every successful person-route authentication records the stable
+`(FabricID, UserID)` plus latest device evidence in L1; `GET /v1/whoami` is the
+explicit touch route. A grant subject must have one of these authenticated
+person observations before receiving `view` or `control`. Machine principals
+are rejected before observation and are never inserted. Administrator
+membership remains exempt from this existence check so a misspelled bootstrap
+can still be recovered through the local reset path.
+
 The admin policy begins at revision zero with no administrators. The first
 administrator can be installed only by consuming a short-lived challenge that
 was initiated through local access to the L1 database; there is no network
@@ -211,16 +219,58 @@ observed policy revision. A stale revision, nonadministrator caller, missing
 member, duplicate member, or attempted final-admin removal changes no row.
 Membership is limited to 32 administrators. Nonadministrators may read only
 the current revision; the roster and audit stream require current admin
-authority. A local database-access-gated reset clears an unusable roster,
-advances the authority generation, reopens bootstrap, and records an immutable
-local-operator audit row with no fabricated person actor or subject.
+authority. A local database-access-gated reset writes durable `none` for every
+known grantee and administrator on every live Computer before it clears an
+unusable roster, advances the authority generation, reopens bootstrap, and
+records immutable local-operator audit with no fabricated person actor.
 
 Each accepted bootstrap/add/remove/reset advances the policy revision exactly
 once and commits the membership change plus one immutable audit row in the same
 transaction. Audit retains revision, operation, actor UserID, actor DeviceID,
 issuing Fabric IDs, subject UserID, actor kind, and L1 time; current membership
-remains bounded and person based. Per-Computer grants, Node distribution,
-endpoint admission, live revocation, and control arbitration are separate later
+remains bounded and person based.
+
+### Computer grant policy and live revocation
+
+Each Computer has a durable person grant of `none`, `view`, or `control`, keyed
+by `(computer_id, FabricID, UserID)`. Current administrators have effective
+`control` without a duplicate grant row. Only a current administrator may
+mutate a grant, and every accepted mutation requires the exact global policy
+revision, advances that revision once, and atomically records the new grant and
+an immutable actor-and-subject audit row. Idempotent replay returns the original
+result; stale revisions, machine grantees, and nonadministrator mutations make
+no policy change. Removing or resetting an administrator first writes durable
+`none` grants for that person on every Computer, so an older explicit grant can
+never reappear when the override disappears. Mutation defaults the subject
+FabricID to the current issuing Fabric, but an administrator can explicitly
+address, revoke, and delete an older-Fabric row. Such a row is never usable
+under a snapshot from the current issuer; current-Fabric revocation remains a
+durable `none`. Computer removal deletes all its grant rows.
+
+L1 issues only the Computers hosted by an authenticated Node as a bounded,
+short-lived policy snapshot bound to the issuing Fabric, current policy
+generation, Node ID, and boot session. Heartbeat may bootstrap an empty node
+cache, while a bounded long-poll watch carries subsequent revisions; the agent
+persists no copy. Ordinary nodes that have never hosted a Computer cause no
+policy-table writes, and a policy-bootstrap error never fails an otherwise
+successful heartbeat. Policy expiry, watch loss, generation change, revision
+regression, or an agent restart therefore fails closed. Cache invalidation
+never lowers the highest installed generation/revision, so no older heartbeat
+snapshot can reinstall access after watch loss. An installation
+acknowledgement is accepted only from the snapshot's current authenticated boot
+and cannot regress its installed revision.
+
+A downgrade or revoke is `pending` until the current hosting boot has installed
+that revision and every affected authorization lease has released. A
+replacement boot cannot complete it while an older boot still has an unexpired
+policy lease, unless that older boot already acknowledged the revision. The
+agent signals authorization leases while holding the same lock used to admit
+them, closing the lookup-versus-revocation race. The only admission seam
+atomically acquires such a lease, returns a type whose admission role is always
+`view`, and exposes `CanTake` separately; it releases only after both relay legs
+close. A dedicated bounded-wait loop reports pending drains and retries the
+acknowledgement without blocking heartbeat, registration, or watch.
+Session-bound control take-over and tenure arbitration remain separate
 contracts.
 
 Service completion policy classifies the payload result independently from

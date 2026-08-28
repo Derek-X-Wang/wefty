@@ -174,11 +174,19 @@ func TestMachinePrincipalRejectedFromEveryPersonRoute(t *testing.T) {
 		path   string
 		body   any
 	}{
+		{http.MethodGet, "/v1/whoami", nil},
 		{http.MethodPost, "/v1/admin-bootstrap", BootstrapAdminRequest{Nonce: "forged"}},
 		{http.MethodGet, "/v1/admin-policy", nil},
 		{http.MethodGet, "/v1/admin-policy/audit", nil},
 		{http.MethodPut, "/v1/admin-policy/admins/attacker", AdminPolicyMutationRequest{PolicyRevision: 1}},
 		{http.MethodDelete, "/v1/admin-policy/admins/attacker", AdminPolicyMutationRequest{PolicyRevision: 1}},
+		{http.MethodGet, "/v1/computers/computer-forged/grants", nil},
+		{http.MethodPut, "/v1/computers/computer-forged/grants/person-forged", ComputerGrantMutationRequest{
+			PolicyRevision: 1, Permission: ComputerGrantView, IdempotencyKey: "forged"}},
+		{http.MethodDelete, "/v1/computers/computer-forged/grants/person-forged", ComputerGrantDeleteRequest{
+			PolicyRevision: 1, FabricID: "fabric-old", IdempotencyKey: "forged-delete"}},
+		{http.MethodGet, "/v1/computers/computer-forged/grants/audit", nil},
+		{http.MethodGet, "/v1/computers/computer-forged/revocations/1", nil},
 	}
 	for _, row := range rows {
 		status, _, body := h.do(client, row.method, row.path, row.body)
@@ -190,6 +198,28 @@ func TestMachinePrincipalRejectedFromEveryPersonRoute(t *testing.T) {
 	})
 	status, _, body := h.do(machine, http.MethodGet, "/v1/admin-policy", nil)
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
+}
+
+func TestWhoAmIRecordsOnlyAuthenticatedPeople(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{}, nil)
+	identity := fabric.Identity{UserID: "person-alice", DeviceID: "device-a"}
+	client := h.client(identity)
+	status, _, body := h.do(client, http.MethodGet, "/v1/whoami", nil)
+	if status != http.StatusOK {
+		t.Fatalf("whoami status=%d body=%s", status, body)
+	}
+	var observed AuthenticatedPerson
+	if err := json.Unmarshal(body, &observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.UserID != identity.UserID || observed.DeviceID != identity.DeviceID || observed.FabricID == "" {
+		t.Fatalf("whoami observation = %#v", observed)
+	}
+	var count int
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM authenticated_people WHERE fabric_id=? AND user_id=?`,
+		observed.FabricID, observed.UserID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("authenticated person rows=%d err=%v", count, err)
+	}
 }
 
 func TestPlainFabricPersonRoutesRequireDevelopmentOverride(t *testing.T) {

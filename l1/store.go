@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -62,6 +63,8 @@ type Store struct {
 	prestartInfrastructureBudget time.Duration
 	adminBootstrapTTL            time.Duration
 	deploymentID                 string
+	policyChangeMu               sync.Mutex
+	policyChanged                chan struct{}
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
@@ -150,6 +153,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		prestartInfrastructureBudget: prestartInfrastructureBudget,
 		adminBootstrapTTL:            adminBootstrapTTL,
 		deploymentID:                 deploymentID,
+		policyChanged:                make(chan struct{}),
 	}
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
@@ -399,6 +403,13 @@ CREATE TABLE IF NOT EXISTS admins (
   added_ns INTEGER NOT NULL,
   PRIMARY KEY(fabric_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS authenticated_people (
+  fabric_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  last_device_id TEXT NOT NULL,
+  last_seen_ns INTEGER NOT NULL,
+  PRIMARY KEY(fabric_id, user_id)
+);
 CREATE TRIGGER IF NOT EXISTS admins_bounded_before_insert
 BEFORE INSERT ON admins WHEN (SELECT COUNT(*) FROM admins) >= 32
 BEGIN SELECT RAISE(ABORT, 'admin policy limit reached'); END;
@@ -420,6 +431,62 @@ CREATE TABLE IF NOT EXISTS admin_bootstrap_challenges (
   authority_generation INTEGER NOT NULL CHECK(authority_generation > 0),
   created_ns INTEGER NOT NULL,
   expires_ns INTEGER NOT NULL CHECK(expires_ns > created_ns)
+);
+CREATE TABLE IF NOT EXISTS computer_grants (
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  fabric_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  permission TEXT NOT NULL CHECK(permission IN ('none', 'view', 'control')),
+  policy_revision INTEGER NOT NULL CHECK(policy_revision > 0),
+  updated_ns INTEGER NOT NULL,
+  PRIMARY KEY(computer_id, fabric_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS computer_policy_audit (
+  policy_revision INTEGER NOT NULL CHECK(policy_revision > 0),
+  computer_id TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK(operation IN ('grant', 'grant_delete', 'admin_remove', 'admin_reset')),
+  actor_kind TEXT NOT NULL CHECK(actor_kind IN ('fabric_person', 'local_operator')),
+  actor_fabric_id TEXT NOT NULL,
+  actor_user_id TEXT NOT NULL,
+  actor_device_id TEXT NOT NULL,
+  subject_fabric_id TEXT NOT NULL,
+  subject_user_id TEXT NOT NULL,
+  previous_permission TEXT NOT NULL CHECK(previous_permission IN ('none', 'view', 'control')),
+  permission TEXT NOT NULL CHECK(permission IN ('none', 'view', 'control')),
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  created_ns INTEGER NOT NULL,
+  PRIMARY KEY(policy_revision, computer_id, subject_fabric_id, subject_user_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS computer_policy_audit_replay
+  ON computer_policy_audit(computer_id, idempotency_key) WHERE idempotency_key<>'';
+CREATE TABLE IF NOT EXISTS computer_policy_revocations (
+  policy_revision INTEGER NOT NULL CHECK(policy_revision > 0),
+  computer_id TEXT NOT NULL,
+  subject_fabric_id TEXT NOT NULL,
+  subject_user_id TEXT NOT NULL,
+  target_permission TEXT NOT NULL CHECK(target_permission IN ('none', 'view')),
+  created_ns INTEGER NOT NULL,
+  PRIMARY KEY(policy_revision, computer_id, subject_fabric_id, subject_user_id)
+);
+CREATE TABLE IF NOT EXISTS computer_policy_issued (
+  node_id TEXT NOT NULL,
+  boot_session_id TEXT NOT NULL,
+  policy_generation INTEGER NOT NULL CHECK(policy_generation > 0),
+  policy_revision INTEGER NOT NULL CHECK(policy_revision >= 0),
+  snapshot_digest TEXT NOT NULL,
+  expires_ns INTEGER NOT NULL,
+  issued_ns INTEGER NOT NULL,
+  PRIMARY KEY(node_id, boot_session_id, policy_generation, policy_revision, snapshot_digest)
+);
+CREATE TABLE IF NOT EXISTS computer_policy_installations (
+  node_id TEXT NOT NULL,
+  boot_session_id TEXT NOT NULL,
+  policy_generation INTEGER NOT NULL CHECK(policy_generation > 0),
+  policy_revision INTEGER NOT NULL CHECK(policy_revision >= 0),
+  snapshot_digest TEXT NOT NULL,
+  installed_ns INTEGER NOT NULL,
+  PRIMARY KEY(node_id, boot_session_id, policy_generation)
 );
 CREATE TABLE IF NOT EXISTS service_restart_requests (
   job_id TEXT NOT NULL REFERENCES service_jobs(job_id) ON DELETE CASCADE,

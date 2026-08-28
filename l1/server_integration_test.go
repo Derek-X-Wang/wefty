@@ -21,8 +21,16 @@ import (
 )
 
 type fakeClock struct {
-	mu  sync.Mutex
-	now time.Time
+	mu     sync.Mutex
+	now    time.Time
+	timers []*fakeClockTimer
+}
+
+type fakeClockTimer struct {
+	clock    *fakeClock
+	deadline time.Time
+	channel  chan time.Time
+	active   bool
 }
 
 func (c *fakeClock) Now() time.Time {
@@ -34,7 +42,51 @@ func (c *fakeClock) Now() time.Time {
 func (c *fakeClock) Advance(duration time.Duration) {
 	c.mu.Lock()
 	c.now = c.now.Add(duration)
+	now := c.now
+	var ready []*fakeClockTimer
+	for _, timer := range c.timers {
+		if timer.active && !timer.deadline.After(now) {
+			timer.active = false
+			ready = append(ready, timer)
+		}
+	}
 	c.mu.Unlock()
+	for _, timer := range ready {
+		timer.channel <- now
+	}
+}
+
+func (c *fakeClock) NewTimer(duration time.Duration) clockTimer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	timer := &fakeClockTimer{clock: c, deadline: c.now.Add(duration), channel: make(chan time.Time, 1), active: true}
+	c.timers = append(c.timers, timer)
+	return timer
+}
+
+func (timer *fakeClockTimer) C() <-chan time.Time { return timer.channel }
+
+func (timer *fakeClockTimer) Stop() bool {
+	timer.clock.mu.Lock()
+	defer timer.clock.mu.Unlock()
+	wasActive := timer.active
+	timer.active = false
+	return wasActive
+}
+
+func (c *fakeClock) waitForTimers(t *testing.T, count int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		got := len(c.timers)
+		c.mu.Unlock()
+		if got >= count {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("clock did not receive %d timer(s)", count)
 }
 
 type integrationHarness struct {

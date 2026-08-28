@@ -103,6 +103,44 @@
         }
       }
     },
+    "/v1/agent/nodes/{node_id}/computer-policy": {
+      "parameters": [
+        { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "boot_session_id", "in": "query", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "after_revision", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0 } }
+      ],
+      "get": {
+        "operationId": "watchComputerPolicy",
+        "summary": "Long-poll a fresh node/boot-bound Computer policy snapshot",
+        "description": "Returns immediately for a newer revision or policy topology change and otherwise renews the short freshness lease before expiry. The node must discard policy on watch loss, expiry, regression, or generation change.",
+        "responses": {
+          "200": { "description": "Fresh in-memory policy snapshot.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerPolicySnapshot" } } } },
+          "204": { "description": "This node has never hosted a Computer; ordinary service behavior is unchanged." },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/v1/agent/nodes/{node_id}/computer-policy-acknowledgement": {
+      "parameters": [
+        { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+      ],
+      "post": {
+        "operationId": "acknowledgeComputerPolicy",
+        "summary": "Acknowledge an issued snapshot after installation and session closure",
+        "description": "The receipt is derived from the installed in-memory snapshot. A dedicated retry loop sends it only after every authorization downgraded by this revision has released after closing both relay legs, without parking heartbeat or watch. A replacement boot does not complete revocation until any older boot policy lease expires or that boot already acknowledged the revision.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerPolicyInstallAcknowledgement" } } } },
+        "responses": {
+          "204": { "description": "Matching current-boot installation recorded." },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+        }
+      }
+    },
     "/v1/agent/nodes/{node_id}/drain": {
       "parameters": [
         { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string" } }
