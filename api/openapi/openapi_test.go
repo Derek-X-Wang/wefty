@@ -419,6 +419,9 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	if _, ok := processProperties["oom"]; !ok {
 		t.Fatal("ProcessResult must carry additive OOM evidence")
 	}
+	if _, ok := processProperties["disk_exhausted"]; !ok {
+		t.Fatal("ProcessResult must carry additive isolated-disk exhaustion evidence")
+	}
 	for _, field := range []string{"output_error", "signal"} {
 		property := object(t, processProperties[field], "ProcessResult."+field)
 		if property["minLength"] != float64(1) {

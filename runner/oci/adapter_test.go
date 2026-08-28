@@ -404,6 +404,11 @@ func TestAdapterMapsLogsExitSignalOOMAndRuntimeLoss(t *testing.T) {
 				t.Fatalf("OOM result = %+v", result)
 			}
 		}},
+		{name: "isolated disk exhausted", watch: ocihelper.WatchResponse{ExitCode: intPointer(1), DiskExhausted: true}, check: func(t *testing.T, result contract.ProcessResult) {
+			if !result.DiskExhausted || result.ExitCode == nil || *result.ExitCode != 1 {
+				t.Fatalf("disk exhaustion result = %+v", result)
+			}
+		}},
 		{name: "runtime-loss", watch: ocihelper.WatchResponse{RuntimeFailure: "shim connection lost"}, recover: true, check: func(t *testing.T, result contract.ProcessResult) {
 			if result.RuntimeFailure == nil || result.RuntimeFailure.Code != contract.RuntimeFailureUnavailable {
 				t.Fatalf("runtime loss = %+v", result)
@@ -869,6 +874,35 @@ func TestAdapterPreRunImageFailureHasPositiveNoRuntimeReapEvidence(t *testing.T)
 	}
 }
 
+func TestCapacityRefusalsAreDefinitiveBeforeRuntimeCreation(t *testing.T) {
+	for _, code := range []ocihelper.ErrorCode{ocihelper.CodeInsufficientMemory, ocihelper.CodeInsufficientDisk} {
+		if !helperRunDefinitivelyRejected(&ocihelper.RPCError{Code: code, Message: "capacity refused"}) {
+			t.Fatalf("capacity refusal %q would trigger a second helper Delete", code)
+		}
+	}
+}
+
+func TestTypedCapacityRefusalSurvivesAdapterFinalizationWithoutSecondDelete(t *testing.T) {
+	engine := &adapterTestEngine{runErr: &ocihelper.RPCError{
+		Code: ocihelper.CodeInsufficientMemory, Message: "capacity refused",
+		MemoryFailure: &ocihelper.MemoryFailureFact{RequestedBytes: 1 << 30, ObservedAvailableBytes: 0},
+	}, refuseDelete: true}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	result, err := adapter.Run(t.Context(), request, nil)
+	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureInsufficientMemory {
+		t.Fatalf("typed capacity result = %+v err=%v", result.Outcome, err)
+	}
+	receipt, reapErr := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
+	if reapErr != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime {
+		t.Fatalf("capacity refusal finalization = %+v err=%v", receipt, reapErr)
+	}
+	if engine.runtimeDeletes != 0 {
+		t.Fatalf("typed capacity refusal attempted %d second runtime deletes", engine.runtimeDeletes)
+	}
+}
+
 func TestAdapterReleasesAttachedAttemptPinAfterPreRunAbandonment(t *testing.T) {
 	engine := &adapterTestEngine{}
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
@@ -1002,6 +1036,7 @@ type adapterTestEngine struct {
 	mu                 sync.Mutex
 	watch              ocihelper.WatchResponse
 	deletes            int
+	runtimeDeletes     int
 	refuseDelete       bool
 	runErr             error
 	startedAt          time.Time
@@ -1157,6 +1192,7 @@ func (engine *adapterTestEngine) Watch(ctx context.Context, _ ocihelper.WatchReq
 func (engine *adapterTestEngine) Delete(context.Context, ocihelper.DeleteRequest) (ocihelper.DeleteResponse, error) {
 	engine.mu.Lock()
 	engine.deletes++
+	engine.runtimeDeletes++
 	engine.mu.Unlock()
 	return ocihelper.DeleteResponse{Deleted: !engine.refuseDelete}, nil
 }

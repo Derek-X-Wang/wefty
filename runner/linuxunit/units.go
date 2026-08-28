@@ -36,6 +36,8 @@ type Config struct {
 	ContainerdStateRoot string
 	RuntimeRoot         string
 	RuncExecutable      string
+	MemoryCapacityBytes int64
+	MemoryReserveBytes  int64
 }
 
 type Units struct {
@@ -58,6 +60,9 @@ func Render(config Config) (Units, error) {
 	if config.RuncExecutable != "" && (!filepath.IsAbs(config.RuncExecutable) || strings.ContainsAny(config.RuncExecutable, "\r\n")) {
 		return Units{}, errors.New("Linux runc executable must be an absolute single-line path")
 	}
+	if config.MemoryCapacityBytes < 0 || config.MemoryReserveBytes < 0 {
+		return Units{}, errors.New("Linux OCI memory capacity configuration must not be negative")
+	}
 	for _, argument := range config.AgentArguments {
 		lower := strings.ToLower(argument)
 		if strings.ContainsAny(argument, "\r\n") || strings.Contains(lower, "--auth-key") || strings.Contains(lower, "ts_authkey") {
@@ -70,6 +75,8 @@ func Render(config Config) (Units, error) {
 		"--oci-containerd-address=" + filepath.Clean(config.ContainerdAddress),
 		"--oci-containerd-state-root=" + filepath.Clean(config.ContainerdStateRoot),
 		"--oci-runtime-root=" + filepath.Clean(config.RuntimeRoot),
+		"--oci-memory-capacity-bytes=" + strconv.FormatInt(config.MemoryCapacityBytes, 10),
+		"--oci-memory-reserve-bytes=" + strconv.FormatInt(config.MemoryReserveBytes, 10),
 	}
 	if config.RuncExecutable != "" {
 		helperArguments = append(helperArguments, "--oci-runc-executable="+filepath.Clean(config.RuncExecutable))

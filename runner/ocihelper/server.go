@@ -996,6 +996,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			var rpcErr *RPCError
 			var specRejection *RuntimeSpecRejectionError
 			var serviceDataRejection *ServiceDataRejectionError
+			var insufficientMemory *insufficientMemoryError
 			var insufficientDisk *insufficientDiskError
 			var imageUnavailable *ImageUnavailableError
 			if errors.As(err, &rpcErr) {
@@ -1004,6 +1005,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				_ = writeFailure(wire, CodeOCISpecRejected, "OCI runtime spec was rejected")
 			} else if errors.As(err, &serviceDataRejection) {
 				_ = writeFailure(wire, CodeOCISpecRejected, serviceDataRejection.Error())
+			} else if errors.As(err, &insufficientMemory) {
+				_ = writeRPCError(wire, &RPCError{Code: CodeInsufficientMemory, Message: insufficientMemory.Error(), MemoryFailure: &MemoryFailureFact{RequestedBytes: insufficientMemory.RequestedBytes, ObservedAvailableBytes: insufficientMemory.ObservedAvailableBytes}})
 			} else if errors.As(err, &insufficientDisk) {
 				_ = writeRPCError(wire, &RPCError{Code: CodeInsufficientDisk, Message: insufficientDisk.Error(), DiskFailure: &DiskFailureFact{RequestedBytes: insufficientDisk.RequestedBytes, ObservedAvailableBytes: insufficientDisk.ObservedAvailableBytes}})
 			} else if errors.As(err, &imageUnavailable) {

@@ -77,6 +77,7 @@ const (
 	CodeUnauthorizedBridge    ErrorCode = "unauthorized_bridge"
 	CodeOCISpecRejected       ErrorCode = "oci_spec_rejected"
 	CodeImageUnavailable      ErrorCode = "image_unavailable"
+	CodeInsufficientMemory    ErrorCode = "insufficient_memory"
 	CodeInsufficientDisk      ErrorCode = "insufficient_disk"
 	CodeEngineFailure         ErrorCode = "engine_failure"
 	// CodeDiagnosticFailure is a read-only observation failure. It is never
@@ -88,10 +89,16 @@ const (
 
 // RPCError is safe to cross the private protocol. Engine detail remains local.
 type RPCError struct {
-	Code         ErrorCode         `json:"code"`
-	Message      string            `json:"message"`
-	ImageFailure *ImageFailureFact `json:"image_failure,omitempty"`
-	DiskFailure  *DiskFailureFact  `json:"disk_failure,omitempty"`
+	Code          ErrorCode          `json:"code"`
+	Message       string             `json:"message"`
+	ImageFailure  *ImageFailureFact  `json:"image_failure,omitempty"`
+	MemoryFailure *MemoryFailureFact `json:"memory_failure,omitempty"`
+	DiskFailure   *DiskFailureFact   `json:"disk_failure,omitempty"`
+}
+
+type MemoryFailureFact struct {
+	RequestedBytes         int64 `json:"requested_bytes"`
+	ObservedAvailableBytes int64 `json:"observed_available_bytes"`
 }
 
 type DiskFailureFact struct {
@@ -103,6 +110,15 @@ type insufficientDiskError struct {
 	RequestedBytes         int64
 	ObservedAvailableBytes int64
 	err                    error
+}
+
+type insufficientMemoryError struct {
+	RequestedBytes         int64
+	ObservedAvailableBytes int64
+}
+
+func (failure *insufficientMemoryError) Error() string {
+	return "insufficient memory capacity for workload cap"
 }
 
 func (failure *insufficientDiskError) Error() string {
@@ -415,18 +431,19 @@ type DiagnosticReadReceipt struct {
 // session capability, raw error, or mutation control and is safe to surface to
 // the operator-only node doctor.
 type DoctorStatus struct {
-	RuntimePlatform    OCIPlatform           `json:"runtime_platform"`
-	ContainerdVersion  string                `json:"containerd_version"`
-	ContainerdRead     DiagnosticReadReceipt `json:"containerd_read"`
-	RuncVersion        string                `json:"runc_version"`
-	RuncVersionSource  string                `json:"runc_version_source"`
-	RuncRead           DiagnosticReadReceipt `json:"runc_read"`
-	AllowedMountRoots  []string              `json:"allowed_mount_roots"`
-	MountRootsRead     DiagnosticReadReceipt `json:"mount_roots_read"`
-	Cache              ImageCacheStatus      `json:"cache"`
-	CacheRead          DiagnosticReadReceipt `json:"cache_read"`
-	CacheLastErrorCode string                `json:"cache_last_error_code,omitempty"`
-	LastProfile        *ProfileReceipt       `json:"last_profile,omitempty"`
+	RuntimePlatform    OCIPlatform               `json:"runtime_platform"`
+	ContainerdVersion  string                    `json:"containerd_version"`
+	ContainerdRead     DiagnosticReadReceipt     `json:"containerd_read"`
+	RuncVersion        string                    `json:"runc_version"`
+	RuncVersionSource  string                    `json:"runc_version_source"`
+	RuncRead           DiagnosticReadReceipt     `json:"runc_read"`
+	AllowedMountRoots  []string                  `json:"allowed_mount_roots"`
+	MountRootsRead     DiagnosticReadReceipt     `json:"mount_roots_read"`
+	Cache              ImageCacheStatus          `json:"cache"`
+	CacheRead          DiagnosticReadReceipt     `json:"cache_read"`
+	CacheLastErrorCode string                    `json:"cache_last_error_code,omitempty"`
+	LastProfile        *ProfileReceipt           `json:"last_profile,omitempty"`
+	LastAdmission      *ResourceAdmissionReceipt `json:"last_admission,omitempty"`
 }
 
 // ImageSource selects one closed delivery mechanism. Empty retains the wire-v1
@@ -546,13 +563,35 @@ type RunRequest struct {
 }
 
 type RunResponse struct {
-	Started          bool              `json:"started"`
-	StartedAt        time.Time         `json:"started_at"`
-	Image            *ImageEvidence    `json:"image,omitempty"`
-	Endpoints        map[string]uint16 `json:"endpoints,omitempty"`
-	HostBridgeReady  bool              `json:"host_bridge_ready,omitempty"`
-	BridgeCapability string            `json:"bridge_capability,omitempty"`
-	Profile          ProfileReceipt    `json:"profile"`
+	Started          bool                     `json:"started"`
+	StartedAt        time.Time                `json:"started_at"`
+	Image            *ImageEvidence           `json:"image,omitempty"`
+	Endpoints        map[string]uint16        `json:"endpoints,omitempty"`
+	HostBridgeReady  bool                     `json:"host_bridge_ready,omitempty"`
+	BridgeCapability string                   `json:"bridge_capability,omitempty"`
+	Profile          ProfileReceipt           `json:"profile"`
+	Admission        ResourceAdmissionReceipt `json:"admission"`
+}
+
+// ResourceAdmissionReceipt records the exact facts used for one atomic
+// newcomer decision. MemAvailable is observational and never gates admission.
+type ResourceAdmissionReceipt struct {
+	ObservedAt                 time.Time        `json:"observed_at"`
+	Admitted                   bool             `json:"admitted"`
+	FailureCode                ErrorCode        `json:"failure_code,omitempty"`
+	MemoryCapacityBytes        int64            `json:"memory_capacity_bytes"`
+	MemoryReserveBytes         int64            `json:"memory_reserve_bytes"`
+	MemoryCommittedBeforeBytes int64            `json:"memory_committed_before_bytes"`
+	RequestedMemoryBytes       int64            `json:"requested_memory_bytes"`
+	MemoryCommittedAfterBytes  int64            `json:"memory_committed_after_bytes"`
+	DiskCommittedBeforeBytes   int64            `json:"disk_committed_before_bytes"`
+	MemTotalBytes              int64            `json:"mem_total_bytes"`
+	MemAvailableBytes          int64            `json:"mem_available_bytes"`
+	RequestedDiskBytes         int64            `json:"requested_disk_bytes"`
+	DiskCommittedAfterBytes    int64            `json:"disk_committed_after_bytes"`
+	FilesystemAvailableBytes   int64            `json:"filesystem_available_bytes"`
+	ComputerTmpfsCeilingBytes  int64            `json:"computer_tmpfs_ceiling_bytes"`
+	Warnings                   []ProfileWarning `json:"warnings"`
 }
 
 type ProfileWarningCode string
@@ -577,6 +616,9 @@ type ProfileWarning struct {
 type ProfileReceipt struct {
 	Computer                  bool             `json:"computer"`
 	MemoryLimitBytes          int64            `json:"memory_limit_bytes"`
+	MemoryMaxBytes            int64            `json:"memory_max_bytes"`
+	MemoryOOMGroup            bool             `json:"memory_oom_group"`
+	MemorySwapMaxBytes        int64            `json:"memory_swap_max_bytes"`
 	ComputerTmpfsCeilingBytes int64            `json:"computer_tmpfs_ceiling_bytes"`
 	LargestTmpfsTarget        string           `json:"largest_tmpfs_target,omitempty"`
 	LargestTmpfsCeilingBytes  int64            `json:"largest_tmpfs_ceiling_bytes"`
@@ -628,6 +670,7 @@ type WatchResponse struct {
 	Signal                Signal `json:"signal,omitempty"`
 	TerminationCause      string `json:"termination_cause,omitempty"`
 	OutOfMemory           bool   `json:"out_of_memory,omitempty"`
+	DiskExhausted         bool   `json:"disk_exhausted,omitempty"`
 	RuntimeFailure        string `json:"runtime_failure,omitempty"`
 	LogEvidenceIncomplete bool   `json:"log_evidence_incomplete,omitempty"`
 }

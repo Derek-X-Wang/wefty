@@ -66,6 +66,8 @@ func main() {
 		containerdStateRoot := helperFlags.String("oci-containerd-state-root", "/run/containerd", "root helper containerd state root used for shim verification")
 		runtimeRoot := helperFlags.String("oci-runtime-root", "/var/lib/wefty/oci", "root helper OCI runtime state root")
 		runcExecutable := helperFlags.String("oci-runc-executable", "", "absolute setup-resolved runc executable; empty uses containerd runtime info")
+		memoryCapacityBytes := helperFlags.Int64("oci-memory-capacity-bytes", 0, "setup-configured Computer memory ceiling; zero records an unknown ceiling")
+		memoryReserveBytes := helperFlags.Int64("oci-memory-reserve-bytes", 0, "setup-configured infrastructure memory reserve")
 		var allowedMountRoots repeatedStringFlag
 		helperFlags.Var(&allowedMountRoots, "oci-allowed-mount-root", "operator bind-mount root allowed by the helper (repeatable)")
 		hostMountRoot := helperFlags.String("oci-lima-host-mount-root", "", "macOS operator mount root translated into the Lima guest")
@@ -80,6 +82,7 @@ func main() {
 			Address: *containerdAddress, ContainerdStateRoot: *containerdStateRoot,
 			RuntimeRoot: *runtimeRoot, RuncExecutable: *runcExecutable, AllowedMountRoots: allowedMountRoots,
 			HostMountRoot: *hostMountRoot, GuestMountRoot: *guestMountRoot,
+			MemoryCapacityBytes: *memoryCapacityBytes, MemoryReserveBytes: *memoryReserveBytes,
 		})
 		if err != nil {
 			log.Printf("wefty-agent OCI helper engine: %v", err)
@@ -143,6 +146,8 @@ func runMacBootstrap(arguments []string) error {
 	controlSocket := flags.String("control-socket", "", "absolute operator-only OCI control socket")
 	nodeConfig := flags.String("node-config", "", "absolute installed node configuration for singular CLI commands")
 	setupState := flags.String("setup-state", "", "absolute durable OCI setup convergence state")
+	memoryCapacityBytes := flags.Int64("memory-capacity-bytes", 0, "setup-converged Computer memory ceiling in bytes; zero uses 4 GiB")
+	memoryReserveBytes := flags.Int64("memory-reserve-bytes", 0, "setup-converged Lima infrastructure reserve in bytes; zero derives 25 percent of VM memory")
 	stdoutPath := flags.String("stdout-path", "", "absolute LaunchDaemon stdout log path")
 	stderrPath := flags.String("stderr-path", "", "absolute LaunchDaemon stderr log path")
 	remove := flags.Bool("remove", false, "remove the interim Mac bootstrap idempotently and emit JSON evidence")
@@ -171,7 +176,7 @@ func runMacBootstrap(arguments []string) error {
 		for _, reserved := range []string{
 			"--node-id", "--oci-helper-socket", "--oci-helper-checksum", "--oci-probe-image", "--oci-probe-digest",
 			"--oci-lima-instance", "--oci-lima-host-mount-root", "--oci-minimal-doctor-facts", "--oci-intent-file",
-			"--oci-control-socket", "--oci-probe-archive",
+			"--oci-control-socket", "--oci-probe-archive", "--oci-memory-capacity-bytes", "--oci-memory-reserve-bytes",
 			"--oci-setup-state",
 		} {
 			if argument == reserved || strings.HasPrefix(argument, reserved+"=") {
@@ -205,12 +210,28 @@ func runMacBootstrap(arguments []string) error {
 	if err != nil {
 		return err
 	}
+	defaultSizing, sizingErr := limarunner.HostDefaultSizing()
+	if sizingErr != nil {
+		return fmt.Errorf("resolve default Lima sizing for capacity setup: %w", sizingErr)
+	}
+	defaultCapacityBytes, defaultReserveBytes, err := limarunner.DefaultMacComputerCapacity(defaultSizing)
+	if err != nil {
+		return fmt.Errorf("resolve Computer capacity from default Lima sizing: %w", err)
+	}
+	if *memoryCapacityBytes == 0 {
+		*memoryCapacityBytes = defaultCapacityBytes
+	}
+	configuredReserveBytes := *memoryReserveBytes
+	if configuredReserveBytes == 0 {
+		configuredReserveBytes = defaultReserveBytes
+	}
 	guestConfig := limarunner.GuestHelperInstallConfig{
 		Instance: *instance, Limactl: *limactl, GuestUser: *guestUser, GuestUID: uint32(*guestUID),
 		HelperBinary: *linuxHelper, ExpectedVersion: version, ExpectedChecksum: *helperChecksum,
 		HostMountRoot: *hostMountRoot, HelperSocket: helperSocket,
 		ProbeArchive: *probeArchive, ProbeReference: *probeReference, ProbeDigest: *probeDigest,
 		NodeID: *nodeID, BootSessionID: bootstrapID,
+		MemoryCapacityBytes: *memoryCapacityBytes, MemoryReserveBytes: configuredReserveBytes,
 	}
 	if err := limarunner.ValidateGuestHelperInstall(guestConfig); err != nil {
 		return err
@@ -229,6 +250,8 @@ func runMacBootstrap(arguments []string) error {
 		"--oci-control-socket="+*controlSocket,
 		"--oci-probe-archive="+*probeArchive,
 		"--oci-setup-state="+*setupState,
+		"--oci-memory-capacity-bytes="+strconv.FormatInt(*memoryCapacityBytes, 10),
+		"--oci-memory-reserve-bytes="+strconv.FormatInt(configuredReserveBytes, 10),
 	)
 	launchConfig := limarunner.LaunchDaemonConfig{
 		AgentPath: *agentPath, Arguments: installedArguments, OperatorUser: *operatorUser,
@@ -361,6 +384,8 @@ func run() error {
 		ociControlSocket      = flag.String("oci-control-socket", "", "operator-only node-local OCI control socket")
 		ociProbeArchive       = flag.String("oci-probe-archive", "", "absolute immutable OCI archive used by setup-oci")
 		ociSetupState         = flag.String("oci-setup-state", "", "absolute durable OCI setup convergence state")
+		ociMemoryCapacity     = flag.Int64("oci-memory-capacity-bytes", 0, "setup-configured Computer memory ceiling used by the private helper")
+		ociMemoryReserve      = flag.Int64("oci-memory-reserve-bytes", 0, "setup-configured infrastructure memory reserve used by the private helper")
 	)
 	flag.Parse()
 	if *nodeID == "" {
@@ -383,6 +408,9 @@ func run() error {
 	}
 	if *ociSetupState != "" && !filepath.IsAbs(*ociSetupState) {
 		return errors.New("--oci-setup-state must be absolute when set")
+	}
+	if *ociMemoryCapacity < 0 || *ociMemoryReserve < 0 {
+		return errors.New("--oci-memory-capacity-bytes and --oci-memory-reserve-bytes must be nonnegative")
 	}
 	if *ociImageCacheMaxBytes <= 0 {
 		return fmt.Errorf("--oci-image-cache-max-bytes must be positive")
@@ -563,6 +591,7 @@ func run() error {
 				desired := ocicontrol.SetupState{
 					VMMemory: request.VMMemory, VMCPUs: request.VMCPUs, VMDisk: request.VMDisk,
 					VMType: "vz", HostMountRoot: *ociLimaMountRoot, ProbeDigest: *ociProbeDigest,
+					MemoryCapacityBytes: *ociMemoryCapacity, MemoryReserveBytes: *ociMemoryReserve,
 				}
 				current, stateErr := ocicontrol.ReadSetupState(*ociSetupState)
 				if stateErr == nil {

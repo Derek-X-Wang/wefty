@@ -79,35 +79,39 @@ type containerdAttempt struct {
 }
 
 type ContainerdEngine struct {
-	client            *containerd.Client
-	imageLeaseDeletes imageLeaseDeletionManager
-	config            NativeEngineConfig
-	imageOperations   *imageOperationGroup
-	imageNameMu       sync.Mutex
-	imageContentMu    sync.Mutex
-	imageResourceMu   sync.Mutex
-	activeSpools      map[string]struct{}
-	activeLeases      map[string]struct{}
-	attemptImagePins  map[string]imageOperationKey
-	bindingImagePins  map[string]imageOperationKey
-	probeDigests      map[string]struct{}
-	cache             *imageCacheLedger
-	cacheMaxBytes     int64
-	cacheReady        bool
-	cacheStop         chan struct{}
-	cacheDone         chan struct{}
-	closeOnce         sync.Once
-	closeErr          error
-	mu                sync.Mutex
-	attempts          map[string]*containerdAttempt
-	ports             map[uint16]string
-	nextPort          uint16
-	serviceVolumeMu   sync.Mutex
-	storageResetMu    sync.Mutex
-	diskSystem        computerDiskSystem
-	storageResetHook  func(computerStorageResetPhase) error
-	computerDiskHook  func(computerDiskCheckpoint) error
-	lastProfile       *ProfileReceipt
+	client               *containerd.Client
+	imageLeaseDeletes    imageLeaseDeletionManager
+	config               NativeEngineConfig
+	imageOperations      *imageOperationGroup
+	imageNameMu          sync.Mutex
+	imageContentMu       sync.Mutex
+	imageResourceMu      sync.Mutex
+	activeSpools         map[string]struct{}
+	activeLeases         map[string]struct{}
+	attemptImagePins     map[string]imageOperationKey
+	bindingImagePins     map[string]imageOperationKey
+	probeDigests         map[string]struct{}
+	cache                *imageCacheLedger
+	cacheMaxBytes        int64
+	cacheReady           bool
+	cacheStop            chan struct{}
+	cacheDone            chan struct{}
+	closeOnce            sync.Once
+	closeErr             error
+	mu                   sync.Mutex
+	attempts             map[string]*containerdAttempt
+	ports                map[uint16]string
+	nextPort             uint16
+	serviceVolumeMu      sync.Mutex
+	storageResetMu       sync.Mutex
+	diskSystem           computerDiskSystem
+	storageResetHook     func(computerStorageResetPhase) error
+	computerDiskHook     func(computerDiskCheckpoint) error
+	lastProfile          *ProfileReceipt
+	capacityMu           sync.Mutex
+	capacityReservations map[string]*capacityReservation
+	lastAdmission        *ResourceAdmissionReceipt
+	memoryFactsPath      string
 }
 
 const (
@@ -118,6 +122,12 @@ const (
 )
 
 func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
+	if config.MemoryCapacityBytes < 0 || config.MemoryReserveBytes < 0 {
+		return nil, errors.New("OCI memory capacity and reserve must not be negative")
+	}
+	if config.Clock == nil {
+		config.Clock = systemClock{}
+	}
 	if config.Address == "" {
 		config.Address = DefaultContainerdAddress
 	}
@@ -224,6 +234,8 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 		cacheStop: make(chan struct{}), cacheDone: make(chan struct{}),
 		attempts: make(map[string]*containerdAttempt),
 		ports:    make(map[uint16]string), nextPort: config.AttemptPortMin,
+		capacityReservations: make(map[string]*capacityReservation),
+		memoryFactsPath:      "/proc/meminfo",
 	}
 	go engine.imageCacheLoop()
 	return engine, nil
@@ -286,6 +298,13 @@ func (engine *ContainerdEngine) DoctorStatus(ctx context.Context) (DoctorStatus,
 		status.LastProfile = &receipt
 	}
 	engine.mu.Unlock()
+	engine.capacityMu.Lock()
+	if engine.lastAdmission != nil {
+		receipt := *engine.lastAdmission
+		receipt.Warnings = slices.Clone(receipt.Warnings)
+		status.LastAdmission = &receipt
+	}
+	engine.capacityMu.Unlock()
 	versionContext, cancelVersion := context.WithTimeout(ctx, doctorRuntimeReadTimeout)
 	version, err := engine.client.Version(versionContext)
 	cancelVersion()
@@ -764,8 +783,13 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if err := os.MkdirAll(engine.config.RuntimeRoot, 0o700); err != nil {
 		return RunResponse{}, err
 	}
+	admission, err := engine.admitResources(request)
+	if err != nil {
+		return RunResponse{}, err
+	}
 	lease, err := engine.client.LeasesService().Create(ctx, leases.WithID(request.Resources.LeaseID), leases.WithLabels(request.Resources.Labels))
 	if err != nil {
+		engine.releaseCapacityReservation(request.Authority.key())
 		return RunResponse{}, fmt.Errorf("create attempt lease: %w", err)
 	}
 	leaseContext := leases.WithLease(ctx, lease.ID)
@@ -775,6 +799,13 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	endpoints := make(map[string]uint16, len(request.AllocateEndpoints))
 	endpointHolds := make(map[string]net.Listener, len(request.AllocateEndpoints))
 	defer func() {
+		var insufficientDisk *insufficientDiskError
+		if errors.As(runErr, &insufficientDisk) {
+			engine.releaseCapacityReservation(request.Authority.key())
+			admission.MemoryCommittedAfterBytes = admission.MemoryCommittedBeforeBytes
+			admission.DiskCommittedAfterBytes = admission.DiskCommittedBeforeBytes
+			engine.recordAdmissionFailure(admission, CodeInsufficientDisk)
+		}
 		if runErr != nil && created {
 			if hostBridge != nil {
 				_ = hostBridge.Close()
@@ -886,6 +917,9 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			return managedErr
 		}
 		computerDisk = attachedDisk
+		if computerDisk != nil {
+			engine.markCapacityDiskMaterialized(request.Authority.JobID)
+		}
 		operatorSources, translateErr := TranslateOperatorMountSources(request.Workload, engine.translateOperatorMountSource)
 		if translateErr != nil {
 			return translateErr
@@ -930,9 +964,6 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if err != nil {
 		return RunResponse{}, &RuntimeSpecRejectionError{err: err}
 	}
-	engine.mu.Lock()
-	engine.lastProfile = &profile
-	engine.mu.Unlock()
 	spec, err := document.ContainerdSpec()
 	if err != nil {
 		return RunResponse{}, &RuntimeSpecRejectionError{err: err}
@@ -958,6 +989,18 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if err != nil {
 		return RunResponse{}, fmt.Errorf("create runc v2 task with binary-v2 logs: %w", err)
 	}
+	if computer {
+		memoryMax, oomGroup, swapMax, verifyErr := verifyComputerCgroupMemoryPolicy(engine.config.CgroupRoot, request.Resources.CgroupID, request.Workload.Limits.MemoryBytes)
+		profile.MemoryMaxBytes = memoryMax
+		profile.MemoryOOMGroup = oomGroup
+		profile.MemorySwapMaxBytes = swapMax
+		if verifyErr != nil {
+			return RunResponse{}, &RuntimeSpecRejectionError{err: verifyErr}
+		}
+	}
+	engine.mu.Lock()
+	engine.lastProfile = &profile
+	engine.mu.Unlock()
 	attemptContext, attemptCancel := context.WithCancel(leases.WithLease(engineContext(context.Background()), lease.ID))
 	wait, err := task.Wait(attemptContext)
 	if err != nil {
@@ -989,7 +1032,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	}
 	startedAt := time.Now().UTC().Round(0)
 	created = false
-	return RunResponse{Started: true, StartedAt: startedAt, Image: &evidence, Endpoints: endpoints, HostBridgeReady: hostBridge != nil, Profile: profile}, nil
+	return RunResponse{Started: true, StartedAt: startedAt, Image: &evidence, Endpoints: endpoints, HostBridgeReady: hostBridge != nil, Profile: profile, Admission: admission}, nil
 }
 
 func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cgroupID string, port uint16) error {
@@ -1259,6 +1302,9 @@ func (engine *ContainerdEngine) Watch(ctx context.Context, request WatchRequest,
 	if waitErr != nil {
 		return emit(WatchEvent{Kind: WatchComplete, Result: &WatchResponse{RuntimeFailure: waitErr.Error(), OutOfMemory: oom, LogEvidenceIncomplete: logIncomplete}})
 	}
+	// A post-hoc free-byte sample cannot prove that this attempt observed
+	// ENOSPC. Until a positive guest/runtime event is available, retain the
+	// filesystem sample only in the admission receipt and leave this fact absent.
 	result := &WatchResponse{OutOfMemory: oom, LogEvidenceIncomplete: logIncomplete}
 	// containerd ExitStatus exposes only a numeric code. Therefore 137/143 are
 	// plain exits unless this helper independently observed successful delivery
@@ -2207,6 +2253,7 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 func (engine *ContainerdEngine) releaseVerifiedAttempt(ctx context.Context, authorityKey string) error {
 	pinErr := engine.releaseAttemptImagePin(ctx, authorityKey)
 	engine.releaseAttemptRuntimeState(authorityKey)
+	engine.releaseCapacityReservation(authorityKey)
 	return pinErr
 }
 
@@ -2273,6 +2320,7 @@ func (engine *ContainerdEngine) releaseVerifiedNamespace() {
 	engine.ports = make(map[uint16]string)
 	engine.nextPort = engine.config.AttemptPortMin
 	engine.mu.Unlock()
+	engine.clearCapacityReservations()
 }
 
 func (engine *ContainerdEngine) localImage(ctx context.Context, reference, immutableDigest string) (containerd.Image, ImageEvidence, error) {

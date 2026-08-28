@@ -11,19 +11,21 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
 const (
-	DefaultInstanceName   = "wefty-oci"
-	GuestAllowedMountRoot = "/mnt/wefty-host"
-	GuestHelperSocket     = "/run/wefty/oci-helper.sock"
-	HostHelperSocketName  = "wefty-oci-helper.sock"
-	DefaultDisk           = "32GiB"
-	VMMemoryFlagName      = "vm-memory"
-	VMCPUsFlagName        = "vm-cpus"
-	VMDiskFlagName        = "vm-disk"
-	maximumDefaultMemory  = int64(4 << 30)
+	DefaultInstanceName    = "wefty-oci"
+	GuestAllowedMountRoot  = "/mnt/wefty-host"
+	GuestHelperSocket      = "/run/wefty/oci-helper.sock"
+	HostHelperSocketName   = "wefty-oci-helper.sock"
+	DefaultDisk            = "32GiB"
+	VMMemoryFlagName       = "vm-memory"
+	VMCPUsFlagName         = "vm-cpus"
+	VMDiskFlagName         = "vm-disk"
+	maximumDefaultMemory   = int64(4 << 30)
+	defaultComputerCeiling = int64(4 << 30)
 )
 
 var limaSizePattern = regexp.MustCompile(`^[1-9][0-9]*(?:[KMGT]iB|[kMGT]?B)$`)
@@ -41,6 +43,40 @@ func (sizing Sizing) Validate() error {
 		return errors.New("Lima sizing requires positive CPUs and explicit memory/disk byte quantities")
 	}
 	return nil
+}
+
+// ParseByteQuantity converts the explicit setup quantity grammar into bytes.
+// Admission receives this persisted setup result; the helper never derives its
+// own ceiling from a runtime memory observation.
+func ParseByteQuantity(value string) (int64, error) {
+	if !limaSizePattern.MatchString(value) {
+		return 0, errors.New("invalid explicit byte quantity")
+	}
+	units := []struct {
+		suffix     string
+		multiplier int64
+	}{
+		{suffix: "TiB", multiplier: 1 << 40},
+		{suffix: "GiB", multiplier: 1 << 30},
+		{suffix: "MiB", multiplier: 1 << 20},
+		{suffix: "KiB", multiplier: 1 << 10},
+		{suffix: "TB", multiplier: 1_000_000_000_000},
+		{suffix: "GB", multiplier: 1_000_000_000},
+		{suffix: "MB", multiplier: 1_000_000},
+		{suffix: "kB", multiplier: 1_000},
+		{suffix: "B", multiplier: 1},
+	}
+	for _, unit := range units {
+		if !strings.HasSuffix(value, unit.suffix) {
+			continue
+		}
+		count, err := strconv.ParseInt(strings.TrimSuffix(value, unit.suffix), 10, 64)
+		if err != nil || count > (1<<63-1)/unit.multiplier {
+			return 0, errors.New("explicit byte quantity overflows int64")
+		}
+		return count * unit.multiplier, nil
+	}
+	return 0, errors.New("invalid explicit byte quantity")
 }
 
 // SizingFlags provides the exact setup-facing flags consumed by the
@@ -97,6 +133,25 @@ func HostDefaultSizing() (Sizing, error) {
 		return Sizing{}, err
 	}
 	return DefaultSizing(memory, runtime.NumCPU())
+}
+
+// DefaultMacComputerCapacity materializes the shipped Computer admission
+// configuration from the setup-converged Lima sizing.
+func DefaultMacComputerCapacity(sizing Sizing) (capacityBytes, reserveBytes int64, err error) {
+	if err := sizing.Validate(); err != nil {
+		return 0, 0, err
+	}
+	vmMemoryBytes, err := ParseByteQuantity(sizing.Memory)
+	if err != nil {
+		return 0, 0, err
+	}
+	return defaultComputerCeiling, vmMemoryBytes / 4, nil
+}
+
+// HostPhysicalMemoryBytes exposes the setup-time node sizing fact. Runtime
+// admission never derives its ceiling from this value.
+func HostPhysicalMemoryBytes() (int64, error) {
+	return hostPhysicalMemoryBytes()
 }
 
 // TemplateConfig is the complete Ticket #145 Lima transport configuration.

@@ -409,20 +409,25 @@ func (engine *ContainerdEngine) ReleaseImagePin(ctx context.Context, request Rel
 		return errors.New("binding image pin job ID is required")
 	}
 	engine.imageResourceMu.Lock()
-	defer engine.imageResourceMu.Unlock()
 	if _, exists := engine.bindingImagePins[request.JobID]; !exists {
+		engine.imageResourceMu.Unlock()
+		engine.releaseJobCapacityReservation(request.JobID)
 		return nil
 	}
 	if engine.imageLeaseDeletes == nil {
+		engine.imageResourceMu.Unlock()
 		return errors.New("binding image-pin lease manager is unavailable")
 	}
 	deleteContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	err := engine.imageLeaseDeletes.Delete(engineContext(deleteContext), leases.Lease{ID: imageHoldLeaseID("binding", request.JobID)}, leases.SynchronousDelete)
 	if err != nil && !errdefs.IsNotFound(err) {
+		engine.imageResourceMu.Unlock()
 		return err
 	}
 	delete(engine.bindingImagePins, request.JobID)
+	engine.imageResourceMu.Unlock()
+	engine.releaseJobCapacityReservation(request.JobID)
 	return nil
 }
 

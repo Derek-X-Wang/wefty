@@ -2464,6 +2464,13 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	if err != nil {
 		return Job{}, internalError(err, "read completing job policy")
 	}
+	runtimeResourceFailure := terminalResourceFailure(jobBeforeCompletion, request.Result, attempt.nodeID)
+	if runtimeResourceFailure != nil {
+		lastFailureJSON, err = json.Marshal(runtimeResourceFailure)
+		if err != nil {
+			return Job{}, internalError(err, "encode runtime resource failure")
+		}
+	}
 	finalJobState, finalAttemptState := completionStates(request.Result)
 	var servicePolicy *serviceCompletionPolicy
 	if jobBeforeCompletion.ServiceJob != nil {
@@ -2534,15 +2541,21 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 			return Job{}, err
 		}
 	}
-	if request.Result.SpawnError != nil && request.Result.SpawnError.Code == contract.SpawnFailureInsufficientDisk {
+	if request.Result.SpawnError != nil && (request.Result.SpawnError.Code == contract.SpawnFailureInsufficientMemory ||
+		request.Result.SpawnError.Code == contract.SpawnFailureInsufficientDisk) {
 		failure := *request.Result.SpawnError
 		failure.NodeID = attempt.nodeID
 		lastFailure, marshalErr := json.Marshal(failure)
 		if marshalErr != nil {
-			return Job{}, internalError(marshalErr, "encode insufficient disk failure")
+			return Job{}, internalError(marshalErr, "encode insufficient resource failure")
 		}
 		if _, updateErr := tx.ExecContext(ctx, `UPDATE service_jobs SET last_failure=?, next_restart_at=NULL WHERE job_id=?`, lastFailure, jobID); updateErr != nil {
-			return Job{}, internalError(updateErr, "record insufficient disk failure")
+			return Job{}, internalError(updateErr, "record insufficient resource failure")
+		}
+	}
+	if runtimeResourceFailure != nil {
+		if _, updateErr := tx.ExecContext(ctx, `UPDATE service_jobs SET last_failure=?, next_restart_at=NULL WHERE job_id=?`, lastFailureJSON, jobID); updateErr != nil {
+			return Job{}, internalError(updateErr, "record runtime resource failure")
 		}
 	}
 	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
@@ -2697,13 +2710,32 @@ func validateOCICompletionPhase(attempt attemptAuthority, result ProcessResult) 
 		return nil
 	}
 	if !attempt.startedNS.Valid {
-		if result.SpawnError == nil || result.OOM || result.LogEvidenceIncomplete {
+		if result.SpawnError == nil || result.OOM || result.DiskExhausted || result.LogEvidenceIncomplete {
 			return protocolError(contract.ErrorConflict, "pre-Started OCI completion requires a sole spawn_error without additive runtime evidence")
 		}
 		return nil
 	}
 	if result.SpawnError != nil {
 		return protocolError(contract.ErrorConflict, "post-Started OCI completion cannot report spawn_error")
+	}
+	return nil
+}
+
+func terminalResourceFailure(job Job, result ProcessResult, nodeID string) *contract.SpawnFailure {
+	if job.Spec.Kind != contract.JobKindOCI || job.Spec.Execution.OCI == nil || job.Spec.Execution.OCI.Computer == nil {
+		return nil
+	}
+	if result.OOM {
+		requested := int64(0)
+		if job.Spec.Execution.OCI.Limits != nil && job.Spec.Execution.OCI.Limits.MemoryBytes != nil {
+			requested = *job.Spec.Execution.OCI.Limits.MemoryBytes
+		}
+		if requested > 0 {
+			return &contract.SpawnFailure{Code: contract.SpawnFailureInsufficientMemory, Message: "workload exceeded its enforced memory cap", NodeID: nodeID, RequestedBytes: requested, ObservedAvailableBytes: 0}
+		}
+	}
+	if result.DiskExhausted && job.Spec.Execution.OCI.Computer.DiskBytes > 0 {
+		return &contract.SpawnFailure{Code: contract.SpawnFailureInsufficientDisk, Message: "Computer exhausted its isolated disk budget", NodeID: nodeID, RequestedBytes: job.Spec.Execution.OCI.Computer.DiskBytes, ObservedAvailableBytes: 0}
 	}
 	return nil
 }
@@ -2771,6 +2803,13 @@ func validateProcessResult(result ProcessResult) error {
 		set++
 		if result.SpawnError.Code == "" || strings.TrimSpace(result.SpawnError.Message) == "" {
 			return protocolError(contract.ErrorInvalidRequest, "spawn_error code and message are required")
+		}
+		resourceFailure := result.SpawnError.Code == contract.SpawnFailureInsufficientMemory || result.SpawnError.Code == contract.SpawnFailureInsufficientDisk
+		if resourceFailure && (result.SpawnError.RequestedBytes <= 0 || result.SpawnError.ObservedAvailableBytes < 0 || result.SpawnError.NodeID != "") {
+			return protocolError(contract.ErrorInvalidRequest, "insufficient resource failures require positive requested_bytes, non-negative observed_available_bytes, and no caller-supplied node_id")
+		}
+		if !resourceFailure && (result.SpawnError.RequestedBytes != 0 || result.SpawnError.ObservedAvailableBytes != 0 || result.SpawnError.NodeID != "") {
+			return protocolError(contract.ErrorInvalidRequest, "resource facts are valid only for insufficient_memory or insufficient_disk")
 		}
 	}
 	if result.RuntimeFailure != nil {

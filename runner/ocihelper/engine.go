@@ -29,6 +29,9 @@ type NativeEngineConfig struct {
 	AttemptPortBindTimeout time.Duration
 	LogSealTimeout         time.Duration
 	HandoffRetention       time.Duration
+	MemoryCapacityBytes    int64
+	MemoryReserveBytes     int64
+	Clock                  Clock
 }
 
 // GuardianReaper preserves the helper deadman's signal initiator when the

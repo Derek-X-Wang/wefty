@@ -25,6 +25,45 @@ func TestPublishedListenerFailureRequeuesWithoutLatching(t *testing.T) {
 	assertPublishedListenerFailureRequeuesWithoutLatching(t)
 }
 
+func TestOrdinaryOCIServiceOOMEvidenceKeepsExitRestartPolicy(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{Jitter: func(delay time.Duration) time.Duration { return delay }}, map[string]NodePolicy{
+		"service-node": DefaultNodePolicy("service"),
+	})
+	client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
+	node := h.registerWithCapabilities(agent, "service-node", map[string]bool{"kind:oci": true})
+	spec := capabilityJobSpec("ordinary-oci-oom-exit-zero", contract.JobKindOCI, contract.JobClassService, "", nil)
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
+	if status != http.StatusCreated {
+		t.Fatalf("submit ordinary OCI service status = %d body=%s", status, body)
+	}
+	var job Job
+	if err := json.Unmarshal(body, &job); err != nil {
+		t.Fatal(err)
+	}
+	claim := claimRestartService(t, h, agent, node)
+	if _, err := h.store.ObserveAttemptImage(t.Context(), "agent", job.JobID, claim.Lease.AttemptID, testImageObservation(claim.Lease.FencingToken)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.StartAttempt(t.Context(), "agent", job.JobID, claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
+		t.Fatal(err)
+	}
+	exitZero := 0
+	completed, err := h.store.CompleteAttempt(t.Context(), "agent", job.JobID, claim.Lease.AttemptID, CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "ordinary-oci-oom-exit-zero",
+		Result: ProcessResult{ExitCode: &exitZero, OOM: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.State != contract.JobQueued || completed.RestartStreak != 1 || completed.NextRestartAt == nil {
+		t.Fatalf("ordinary OCI OOM evidence latched resource failure: %+v", completed)
+	}
+	if len(completed.LastFailure) == 0 || bytes.Contains(completed.LastFailure, []byte(contract.SpawnFailureInsufficientMemory)) {
+		t.Fatalf("ordinary OCI last_failure synthesized Computer latch: %s", completed.LastFailure)
+	}
+}
+
 func assertPublishedListenerFailureRequeuesWithoutLatching(t *testing.T) {
 	t.Helper()
 	maximumOne := 1
@@ -91,6 +130,7 @@ func assertServiceCompletionClassification(t *testing.T) {
 		{name: "unknown spawn failure defaults terminal", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureCode("future_spawn_failure"), Message: "unknown"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailureCode("future_spawn_failure")},
 		{name: "published port occupied latches", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailurePublishedPortOccupied, Message: "port 8080 occupied"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailurePublishedPortOccupied},
 		{name: "insufficient disk latches without restart accounting", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureInsufficientDisk, Message: "allocation failed", RequestedBytes: 8 << 30, ObservedAvailableBytes: 2 << 30}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailureInsufficientDisk, wantResourceFacts: true},
+		{name: "insufficient memory latches without restart accounting", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureInsufficientMemory, Message: "cap sum exceeded", RequestedBytes: 8 << 30, ObservedAvailableBytes: 2 << 30}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailureInsufficientMemory, wantResourceFacts: true},
 		{name: "genuine output error latches", result: ProcessResult{OutputError: "SQLite corruption"}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true},
 		{name: "guardian termination is infrastructure", result: ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseGuardian}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantLifetimeRestarts: 1, wantBackoff: true},
 		{name: "configured streak maximum latches on first countable termination", result: ProcessResult{ExitCode: &exitOne}, maximum: &maximumOne, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantStreak: 1, wantFailure: true},

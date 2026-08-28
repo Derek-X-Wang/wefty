@@ -165,7 +165,16 @@ image pin. Start performs the existing bound-node capacity check inside the
 same CAS transaction and reacquires one Slot exactly once. Explicit Computer
 restart is valid from stopped or latched failed, clears the ordinary service
 restart latch/policy state, and authorizes a fresh attempt without allowing a
-direct Job restart. Projection replacement records one `project` intent,
+direct Job restart. `insufficient_memory` and `insufficient_disk` are exact
+terminal latches: desired state remains `running`, `next_restart_at` is null,
+restart streak and lifetime restart count do not advance, publication and Slot
+occupancy are released, and binding, Storage charge, image pin, and grants are
+retained. They never enter the infrastructure retry allowlist; recovery needs
+changed resource facts plus this explicit Computer restart. Post-`Started`
+whole-cgroup OOM and a positively observed attempt-local ENOSPC event enter
+those same latches with the declared memory/disk cap as the bounded requested
+fact. Filesystem-free samples remain advisory; exit codes and error strings do
+not synthesize resource exhaustion. Projection replacement records one `project` intent,
 enters revision-fenced `projecting`, and internally drives the current Job to
 stopped without changing authoritative Computer desired state or appending a
 fabricated stop intent. Once positive quiescence lands, it retires the old

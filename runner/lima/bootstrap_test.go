@@ -211,7 +211,7 @@ func TestLaunchDaemonRemovalIsIdempotentAndVerified(t *testing.T) {
 }
 
 func TestGuestHelperUnitsPinSocketAuthorityAndPrivateMode(t *testing.T) {
-	config := GuestHelperInstallConfig{HostMountRoot: "/Users/operator/wefty-mounts", GuestUID: 501}
+	config := GuestHelperInstallConfig{HostMountRoot: "/Users/operator/wefty-mounts", GuestUID: 501, MemoryCapacityBytes: 4 << 30, MemoryReserveBytes: 1 << 30}
 	socket := string(renderGuestSocketUnit())
 	service := string(renderGuestServiceUnit(config))
 	for _, want := range []string{"ListenStream=/run/wefty/oci-helper.sock", "SocketUser=root", "SocketGroup=wefty-oci", "SocketMode=0660", "DirectoryMode=0755"} {
@@ -222,6 +222,7 @@ func TestGuestHelperUnitsPinSocketAuthorityAndPrivateMode(t *testing.T) {
 	for _, want := range []string{
 		"User=root", "Group=root", "WEFTY_OCI_HELPER_ALLOWED_UIDS=501", `"` + GuestHelperPath + `" "` + ocihelper.InvocationArg + `"`,
 		"--oci-allowed-mount-root=/mnt/wefty-host", "--oci-lima-host-mount-root=/Users/operator/wefty-mounts",
+		"--oci-memory-capacity-bytes=4294967296", "--oci-memory-reserve-bytes=1073741824",
 	} {
 		if !strings.Contains(service, want) {
 			t.Fatalf("service unit missing %q:\n%s", want, service)
@@ -473,5 +474,6 @@ func validGuestHelperInstallConfig(t *testing.T) GuestHelperInstallConfig {
 		HostMountRoot: "/Users/operator/wefty-mounts", HelperSocket: "/Users/operator/.lima/wefty-oci/sock/wefty-oci-helper.sock",
 		ProbeArchive: archive, ProbeReference: "example.invalid/probe", ProbeDigest: "sha256:" + strings.Repeat("a", 64),
 		NodeID: "node-mac", BootSessionID: "boot-mac",
+		MemoryCapacityBytes: 4 << 30, MemoryReserveBytes: 1 << 30,
 	}
 }

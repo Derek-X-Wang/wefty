@@ -141,6 +141,9 @@ type MountDoctorFacts struct {
 type ProfileDoctorFacts struct {
 	Outcome                   DiagnosticOutcome          `json:"outcome"`
 	MemoryLimitBytes          int64                      `json:"memory_limit_bytes"`
+	MemoryMaxBytes            int64                      `json:"memory_max_bytes"`
+	MemoryOOMGroup            bool                       `json:"memory_oom_group"`
+	MemorySwapMaxBytes        int64                      `json:"memory_swap_max_bytes"`
 	ComputerTmpfsCeilingBytes int64                      `json:"computer_tmpfs_ceiling_bytes"`
 	LargestTmpfsCeilingBytes  int64                      `json:"largest_tmpfs_ceiling_bytes"`
 	Warnings                  []ocihelper.ProfileWarning `json:"warnings"`
@@ -177,22 +180,23 @@ type DoctorLimitation struct {
 }
 
 type DoctorResponse struct {
-	Version         int                    `json:"version"`
-	ObservedAt      time.Time              `json:"observed_at"`
-	HostPlatform    PlatformFacts          `json:"host_platform"`
-	RuntimePlatform *PlatformFacts         `json:"runtime_platform,omitempty"`
-	Agent           AgentFacts             `json:"agent"`
-	Lima            LimaDoctorFacts        `json:"lima"`
-	Helper          HelperDoctorFacts      `json:"helper"`
-	Versions        VersionFacts           `json:"versions"`
-	Probe           ProbeDoctorFacts       `json:"probe"`
-	Intent          IntentDoctorFacts      `json:"intent"`
-	Cache           CacheDoctorFacts       `json:"cache"`
-	Mounts          MountDoctorFacts       `json:"mounts"`
-	Profile         ProfileDoctorFacts     `json:"profile"`
-	Convergence     ConvergenceDoctorFacts `json:"convergence"`
-	Findings        []DiagnosticFinding    `json:"findings"`
-	Limitations     []DoctorLimitation     `json:"limitations"`
+	Version           int                                 `json:"version"`
+	ObservedAt        time.Time                           `json:"observed_at"`
+	HostPlatform      PlatformFacts                       `json:"host_platform"`
+	RuntimePlatform   *PlatformFacts                      `json:"runtime_platform,omitempty"`
+	Agent             AgentFacts                          `json:"agent"`
+	Lima              LimaDoctorFacts                     `json:"lima"`
+	Helper            HelperDoctorFacts                   `json:"helper"`
+	Versions          VersionFacts                        `json:"versions"`
+	Probe             ProbeDoctorFacts                    `json:"probe"`
+	Intent            IntentDoctorFacts                   `json:"intent"`
+	Cache             CacheDoctorFacts                    `json:"cache"`
+	Mounts            MountDoctorFacts                    `json:"mounts"`
+	Profile           ProfileDoctorFacts                  `json:"profile"`
+	ResourceAdmission *ocihelper.ResourceAdmissionReceipt `json:"resource_admission,omitempty"`
+	Convergence       ConvergenceDoctorFacts              `json:"convergence"`
+	Findings          []DiagnosticFinding                 `json:"findings"`
+	Limitations       []DoctorLimitation                  `json:"limitations"`
 }
 
 type HelperDoctorSource func(context.Context) (HelperDoctorSnapshot, error)
@@ -550,6 +554,7 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 	} else {
 		profile := runtimeStatus.LastProfile
 		report.Profile = ProfileDoctorFacts{Outcome: DiagnosticOK, MemoryLimitBytes: profile.MemoryLimitBytes,
+			MemoryMaxBytes: profile.MemoryMaxBytes, MemoryOOMGroup: profile.MemoryOOMGroup, MemorySwapMaxBytes: profile.MemorySwapMaxBytes,
 			ComputerTmpfsCeilingBytes: profile.ComputerTmpfsCeilingBytes, LargestTmpfsCeilingBytes: profile.LargestTmpfsCeilingBytes,
 			Warnings: append([]ocihelper.ProfileWarning{}, profile.Warnings...)}
 		code := "oci_profile_tmpfs_ceilings_within_memory_limit"
@@ -561,6 +566,22 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 			detail = "tmpfs ceilings are caps rather than reservations; the last profile can reach its cgroup memory limit before those ceilings"
 		}
 		report.Findings = append(report.Findings, finding("profile-ceilings", diagnosticReceipt{ran: true, passed: true, code: code, severity: severity, detail: detail}))
+	}
+	if runtimeStatus.LastAdmission == nil {
+		report.Findings = append(report.Findings, finding("resource-admission", diagnosticReceipt{code: "oci_resource_admission_not_recorded", notRunCause: NotRunNoProbeReceipt, detail: "no atomic resource-admission receipt was recorded"}))
+	} else {
+		receipt := *runtimeStatus.LastAdmission
+		receipt.Warnings = append([]ocihelper.ProfileWarning{}, receipt.Warnings...)
+		report.ResourceAdmission = &receipt
+		code := "oci_resource_admission_admitted"
+		severity := DiagnosticInfo
+		detail := "the last atomic cap decision admitted the newcomer; timestamped memory/filesystem facts were read without forecasting fit"
+		if !receipt.Admitted {
+			code = "oci_resource_admission_refused"
+			severity = DiagnosticWarn
+			detail = "the last atomic cap decision refused the newcomer with a typed resource code; resident reservations were unchanged"
+		}
+		report.Findings = append(report.Findings, finding("resource-admission", diagnosticReceipt{ran: true, passed: receipt.Admitted, code: code, severity: severity, detail: detail}))
 	}
 
 	buildMountRoots(runtimeStatus, report)
@@ -578,13 +599,13 @@ func appendHelperDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
 }
 
 func appendRuntimeDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
-	for _, check := range []string{"runtime-platform", "runtime-versions", "cache", "profile-ceilings", "mount-roots"} {
+	for _, check := range []string{"runtime-platform", "runtime-versions", "cache", "profile-ceilings", "resource-admission", "mount-roots"} {
 		report.Findings = append(report.Findings, finding(check, diagnosticReceipt{code: "oci_" + strings.ReplaceAll(check, "-", "_") + "_not_run", notRunCause: cause, detail: "the dependent helper read did not run"}))
 	}
 }
 
 func appendMechanicsDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
-	for _, check := range []string{"runtime-versions", "cache", "profile-ceilings", "mount-roots"} {
+	for _, check := range []string{"runtime-versions", "cache", "profile-ceilings", "resource-admission", "mount-roots"} {
 		report.Findings = append(report.Findings, finding(check, diagnosticReceipt{code: "oci_" + strings.ReplaceAll(check, "-", "_") + "_not_run", notRunCause: cause, detail: "the dependent helper read did not run"}))
 	}
 }
@@ -754,6 +775,7 @@ func StableDoctorCodes() []string {
 		"oci_runtime_versions_not_run", "oci_runtime_versions_unavailable", "oci_runtime_versions_unsupported", "oci_runtime_versions_observed", "oci_runtime_versions_outside_tested_range",
 		"oci_cache_not_run", "oci_cache_status_unavailable", "oci_cache_within_bound", "oci_cache_over_bound", "oci_cache_eviction_failed",
 		"oci_profile_ceilings_not_run", "oci_profile_ceilings_not_recorded", "oci_profile_tmpfs_ceilings_within_memory_limit", "oci_profile_tmpfs_ceilings_exceed_memory_limit",
+		"oci_resource_admission_not_run", "oci_resource_admission_not_recorded", "oci_resource_admission_admitted", "oci_resource_admission_refused",
 		"oci_mount_roots_not_run", "oci_mount_roots_unavailable", "oci_mount_roots_observed", "oci_mount_root_unavailable",
 		"oci_convergence_not_read", "oci_convergence_state_unavailable", "oci_convergence_desired_not_read",
 		"oci_convergence_unchanged", "oci_convergence_live_safe", "oci_convergence_restart_required", "oci_convergence_recreate_required",
@@ -794,7 +816,7 @@ func (report DoctorResponse) Validate() error {
 		}
 		seen[item.Check] = struct{}{}
 	}
-	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake", "boot-sweep", "runtime-platform", "runtime-versions", "cache", "mount-roots", "convergence"} {
+	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake", "boot-sweep", "runtime-platform", "runtime-versions", "cache", "resource-admission", "mount-roots", "convergence"} {
 		if _, ok := seen[check]; !ok {
 			return fmt.Errorf("doctor finding %q is missing", check)
 		}
@@ -846,8 +868,15 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		fmt.Sprintf("HELPER\t%s protocol=%d version=%s checksum=%s instance=%s generation=%d", report.Helper.Outcome, report.Helper.ProtocolVersion, report.Helper.Version, report.Helper.Checksum, report.Helper.InstanceID, report.Helper.SessionGeneration),
 		fmt.Sprintf("RUNTIMES\t%s containerd=%s runc=%s runc_source=%s outside_tested_range=%t", report.Versions.Outcome, report.Versions.Containerd, report.Versions.Runc, report.Versions.RuncSource, report.Versions.OutsideTestedRange),
 		fmt.Sprintf("CACHE\t%s bytes=%d cap=%d within_bound=%t last_eviction=%s", report.Cache.Outcome, report.Cache.Bytes, report.Cache.CapBytes, report.Cache.WithinBound, lastEviction),
+		fmt.Sprintf("PROFILE\t%s memory_limit=%d memory_max=%d memory_oom_group=%t memory_swap_max=%d computer_tmpfs_ceiling=%d largest_tmpfs_ceiling=%d warnings=%d", report.Profile.Outcome, report.Profile.MemoryLimitBytes, report.Profile.MemoryMaxBytes, report.Profile.MemoryOOMGroup, report.Profile.MemorySwapMaxBytes, report.Profile.ComputerTmpfsCeilingBytes, report.Profile.LargestTmpfsCeilingBytes, len(report.Profile.Warnings)),
 		fmt.Sprintf("MOUNTS\t%s roots=%s", report.Mounts.Outcome, strings.Join(report.Mounts.AllowedRoots, ",")),
 		fmt.Sprintf("CONVERGENCE\t%s class=%s current={%s} desired={%s}", report.Convergence.Outcome, report.Convergence.Class, convergenceState, desiredConvergenceState),
+	}
+	if report.ResourceAdmission != nil {
+		admission := report.ResourceAdmission
+		lines = append(lines, fmt.Sprintf("RESOURCE ADMISSION\tobserved_at=%s admitted=%t failure_code=%s memory_capacity=%d memory_reserve=%d memory_committed_before=%d requested_memory=%d memory_committed_after=%d disk_committed_before=%d requested_disk=%d disk_committed_after=%d mem_total=%d mem_available=%d filesystem_available=%d computer_tmpfs_ceiling=%d warnings=%d", admission.ObservedAt.Format(time.RFC3339Nano), admission.Admitted, admission.FailureCode, admission.MemoryCapacityBytes, admission.MemoryReserveBytes, admission.MemoryCommittedBeforeBytes, admission.RequestedMemoryBytes, admission.MemoryCommittedAfterBytes, admission.DiskCommittedBeforeBytes, admission.RequestedDiskBytes, admission.DiskCommittedAfterBytes, admission.MemTotalBytes, admission.MemAvailableBytes, admission.FilesystemAvailableBytes, admission.ComputerTmpfsCeilingBytes, len(admission.Warnings)))
+	} else {
+		lines = append(lines, "RESOURCE ADMISSION\tNOT-RUN no receipt")
 	}
 	if report.Lima.Applicable {
 		lines = append(lines, fmt.Sprintf("LIMA\t%s instance=%s state=%s enabled=%t recovering=%t observed_at=%s repair_count=%d reason=%s", report.Lima.Outcome, report.Lima.Facts.Instance, report.Lima.Facts.State, report.Lima.Facts.Enabled, report.Lima.Facts.Recovering, report.Lima.Facts.ObservedAt.Format(time.RFC3339Nano), report.Lima.Facts.RepairCount, report.Lima.Facts.ReasonCode))

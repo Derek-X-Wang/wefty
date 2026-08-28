@@ -26,7 +26,7 @@ func TestRenderLinuxUnitsKeepsAgentUnprivilegedAndHelperNarrow(t *testing.T) {
 			t.Fatalf("agent unit missing %q:\n%s", want, agent)
 		}
 	}
-	for _, want := range []string{"User=root", "WEFTY_OCI_HELPER_ALLOWED_UIDS=1001", "__wefty_oci_helper", "--oci-allowed-mount-root=/srv/wefty", "--oci-runc-executable=/usr/local/sbin/runc"} {
+	for _, want := range []string{"User=root", "WEFTY_OCI_HELPER_ALLOWED_UIDS=1001", "__wefty_oci_helper", "--oci-allowed-mount-root=/srv/wefty", "--oci-runc-executable=/usr/local/sbin/runc", "--oci-memory-capacity-bytes=0", "--oci-memory-reserve-bytes=0"} {
 		if !strings.Contains(helper, want) {
 			t.Fatalf("helper unit missing %q:\n%s", want, helper)
 		}

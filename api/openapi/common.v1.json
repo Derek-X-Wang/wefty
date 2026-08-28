@@ -607,6 +607,10 @@
             "type": "boolean",
             "description": "Additive runtime evidence. It does not select a primary result arm and is never inferred from exit 137."
           },
+          "disk_exhausted": {
+            "type": "boolean",
+            "description": "Additive runtime evidence that the helper positively observed ENOSPC for this Computer attempt. It is absent when no authoritative write-budget or filesystem error event is available and is never inferred from free-byte samples, stderr, or an exit code."
+          },
           "log_evidence_incomplete": {
             "type": "boolean",
             "description": "Additive evidence that a helper log segment was lost, corrupt, or truncated. The real terminal arm remains authoritative."

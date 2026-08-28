@@ -135,6 +135,16 @@ is enforcement. The assertion-derived profile receipt and node doctor expose
 the exact ceiling/limit comparison as typed warnings; the production sizing
 OWNER-CALL remains open.
 
+The helper sets the Computer's whole-cgroup OOM policy and verifies the live
+cgroup before `Started`: `memory.max` equals the declared cap,
+`memory.oom.group=1`, and `memory.swap.max=0`. The successful profile receipt
+contains those read-back values. The separate atomic admission receipt records
+setup-configured capacity, declared memory/disk arithmetic, plus timestamped
+`MemTotal`, `MemAvailable`, and disk-root filesystem-free observations;
+`MemAvailable` and the 1600 MiB tmpfs ceiling remain warnings/facts and never
+reject admission. Disk-root free bytes participate only in the serialized
+preallocation decision and never prove post-`Started` exhaustion.
+
 ## Tenant `driver.json` consumer contract
 
 The image's tenant agent consumes read-only

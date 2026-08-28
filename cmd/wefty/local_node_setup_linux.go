@@ -48,6 +48,16 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 	if err != nil {
 		return true, err
 	}
+	hostMemoryBytes, err := lima.HostPhysicalMemoryBytes()
+	if err != nil {
+		return true, err
+	}
+	defaultReserveBytes := hostMemoryBytes / 4
+	if defaultReserveBytes > 1<<30 {
+		defaultReserveBytes = 1 << 30
+	}
+	memoryCapacityBytes := flags.Int64("memory-capacity-bytes", hostMemoryBytes, "configured Computer memory ceiling before reserve")
+	memoryReserveBytes := flags.Int64("memory-reserve-bytes", defaultReserveBytes, "configured infrastructure memory reserve")
 	sizing := lima.BindSizingFlags(flags, defaults)
 	if err := flags.Parse(args[1:]); err != nil {
 		return true, err
@@ -123,7 +133,8 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 	if err != nil {
 		return true, err
 	}
-	desired := ocicontrol.SetupState{VMMemory: resolved.Memory, VMCPUs: resolved.CPUs, VMDisk: resolved.Disk, VMType: "native", HostMountRoot: *allowedMountRoot, ProbeDigest: *probeDigest}
+	desired := ocicontrol.SetupState{VMMemory: resolved.Memory, VMCPUs: resolved.CPUs, VMDisk: resolved.Disk, VMType: "native", HostMountRoot: *allowedMountRoot, ProbeDigest: *probeDigest,
+		MemoryCapacityBytes: *memoryCapacityBytes, MemoryReserveBytes: *memoryReserveBytes}
 	class := ocicontrol.ConvergenceLiveSafe
 	if current, readErr := ocicontrol.ReadSetupState(*setupStatePath); readErr == nil {
 		class = ocicontrol.ClassifyConvergence(current, desired)
@@ -143,6 +154,7 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 		OperatorUID: uid, OperatorGID: gid, WorkingDirectory: *workingDirectory,
 		AllowedMountRoots: []string{*allowedMountRoot}, ContainerdAddress: "/run/containerd/containerd.sock",
 		ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci", RuncExecutable: executablePaths["runc"],
+		MemoryCapacityBytes: *memoryCapacityBytes, MemoryReserveBytes: *memoryReserveBytes,
 	}, linuxunit.ConfigurePaths{UnitDirectory: *unitDirectory, NodeConfig: nodeConfig, ControlSocket: controlSocket}, linuxunit.ExecRunner{})
 	if err != nil {
 		return true, err

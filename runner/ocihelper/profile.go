@@ -241,6 +241,13 @@ func SpawnFailureForRunError(err error) *contract.SpawnFailure {
 		return &contract.SpawnFailure{Code: contract.SpawnFailureOCISpecRejected, Message: rpcErr.Message}
 	case CodeImageUnavailable:
 		return &contract.SpawnFailure{Code: contract.SpawnFailureImageUnavailable, Message: rpcErr.Message}
+	case CodeInsufficientMemory:
+		failure := &contract.SpawnFailure{Code: contract.SpawnFailureInsufficientMemory, Message: rpcErr.Message}
+		if rpcErr.MemoryFailure != nil {
+			failure.RequestedBytes = rpcErr.MemoryFailure.RequestedBytes
+			failure.ObservedAvailableBytes = rpcErr.MemoryFailure.ObservedAvailableBytes
+		}
+		return failure
 	case CodeInsufficientDisk:
 		failure := &contract.SpawnFailure{Code: contract.SpawnFailureInsufficientDisk, Message: rpcErr.Message}
 		if rpcErr.DiskFailure != nil {
@@ -422,7 +429,7 @@ func buildRuntimeSpec(ctx context.Context, input RuntimeSpecInput, dependencies 
 	spec.Process.IOPriority = nil
 	spec.Process.ExecCPUAffinity = nil
 
-	resources, err := isolationResources(input.Workload.Limits)
+	resources, err := isolationResources(input.Workload.Limits, input.Workload.Computer)
 	if err != nil {
 		return nil, err
 	}
@@ -599,7 +606,7 @@ func isolationDevices() []specs.LinuxDevice {
 	}
 }
 
-func isolationResources(limits WorkloadLimits) (*specs.LinuxResources, error) {
+func isolationResources(limits WorkloadLimits, computer bool) (*specs.LinuxResources, error) {
 	// M3 deliberately leaves Resources.Pids absent; a PID limit remains a
 	// known profile gap rather than an invented default.
 	resources := &specs.LinuxResources{Devices: []specs.LinuxDeviceCgroup{{Allow: false, Access: "rwm"}}}
@@ -612,6 +619,9 @@ func isolationResources(limits WorkloadLimits) (*specs.LinuxResources, error) {
 	if limits.MemoryBytes > 0 {
 		memory, swap := limits.MemoryBytes, limits.MemoryBytes
 		resources.Memory = &specs.LinuxMemory{Limit: &memory, Swap: &swap}
+	}
+	if computer {
+		resources.Unified = map[string]string{"memory.oom.group": "1"}
 	}
 	if limits.CPUMillicores > 0 {
 		quotaPerMillicore := int64(defaultCPUPeriodMicroseconds / 1000)

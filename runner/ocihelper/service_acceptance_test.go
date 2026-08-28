@@ -58,6 +58,7 @@ func TestServiceAcceptanceComputerControlStateFailsClosed(t *testing.T) {
 	authority.Class = "service"
 	request := testRunRequest(authority, 2*time.Second)
 	request.Workload.Computer = true
+	request.Workload.Limits.MemoryBytes = 1 << 30
 	request.Workload.ManagedVolumes = testComputerManagedVolumes()
 	request.AllocateEndpoints = []string{"view", "control"}
 	if _, err := session.Run(t.Context(), request); err != nil {
