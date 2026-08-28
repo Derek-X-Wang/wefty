@@ -11,6 +11,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -74,6 +75,7 @@ type attemptLifecycleDependencies struct {
 	recoverOCIRuntime      func(context.Context, workloadrunner.RuntimeGeneration) error
 	runtimeReaped          func(string, workloadrunner.ReapReceipt, error)
 	attemptDeadman         AttemptDeadmanRenewer
+	computerTokens         ComputerTokenMinter
 }
 
 // attemptLifecycle owns one attempt from renewal startup through process/log
@@ -183,6 +185,19 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()
 	attemptID := claim.Lease.AttemptID
+	if claim.ComputerStorage != nil {
+		if revoker, ok := lifecycle.dependencies.computerTokens.(ComputerTokenRevoker); ok {
+			defer func() {
+				revokeContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultOperationTimeout)
+				defer cancel()
+				if err := revoker.RevokeComputerAttemptTokens(revokeContext, l3.ComputerAttemptTokenRevocationRequest{
+					ComputerID: claim.ComputerStorage.ComputerID, ComputerAttemptID: attemptID, Reason: "attempt_authority_lost",
+				}); err != nil {
+					lifecycle.log("revoke terminal Computer attempt token: %v", err)
+				}
+			}()
+		}
+	}
 	lifecycle.dependencies.observer.beginAttempt(attemptID, claim.Job.JobID, claim.Job.Spec.Class)
 	defer lifecycle.dependencies.observer.finishAttempt(attemptID)
 	if lifecycle.dependencies.outbox != nil {
@@ -578,6 +593,28 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	}
 	if computerService {
 		request.Execution = withoutComputerReservedOperatorEnvironment(request.Execution)
+		if claim.ComputerStorage.SubmitEnabled {
+			if lifecycle.dependencies.computerTokens == nil {
+				err := errors.New("Computer submission is enabled but the L3 token minter is unavailable")
+				return spawnFailure(contract.SpawnFailurePassUnavailable, err), err
+			}
+			grant, err := lifecycle.dependencies.computerTokens.MintComputerToken(ctx, l3.ComputerTokenMintRequest{
+				ComputerID: claim.ComputerStorage.ComputerID, ComputerAttemptID: claim.Lease.AttemptID,
+			})
+			if err != nil {
+				return spawnFailure(contract.SpawnFailurePassUnavailable, err), err
+			}
+			if grant.Token == "" || grant.ComputerID != claim.ComputerStorage.ComputerID ||
+				grant.ComputerAttemptID != claim.Lease.AttemptID ||
+				grant.ComputerStorageGeneration != claim.ComputerStorage.StorageGeneration ||
+				grant.SubmitIntentRevision != claim.ComputerStorage.SubmitIntentRevision ||
+				grant.SubmitMaxInflight != claim.ComputerStorage.SubmitMaxInflight {
+				err := errors.New("L3 returned a Computer token grant outside the claimed authority")
+				return spawnFailure(contract.SpawnFailurePassUnavailable, err), err
+			}
+			request.Execution.SensitiveEnv = cloneEnvironment(request.Execution.SensitiveEnv)
+			request.Execution.SensitiveEnv[contract.EnvComputerToken] = grant.Token
+		}
 	}
 	admission, preflightResult, preflightErr := runtimeAdapter.Preflight(ctx, request)
 	if admission.Release != nil {
@@ -805,7 +842,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	} else if len(sinks) > 1 {
 		sink = sinks
 	}
-	redactingSink = newRedactingOutputSink(sink, claim.Job.Spec.Execution.SensitiveEnv)
+	redactingSink = newRedactingOutputSink(sink, executionSpec.SensitiveEnv)
 	if redactingSink != nil {
 		sink = redactingSink
 	}
@@ -820,6 +857,10 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		result, runErr = runComputerService(ctx, runtimeAdapter, request, sink, computerServiceConfig{
 			clock: lifecycle.dependencies.clock, fabric: lifecycle.dependencies.fabric,
 			authorizer: lifecycle.dependencies.computerPolicy, auditor: lifecycle.dependencies.client,
+			computerTokens: lifecycle.dependencies.computerTokens,
+			submission: ComputerSubmissionAuthority{ComputerID: claim.ComputerStorage.ComputerID,
+				Enabled: claim.ComputerStorage.SubmitEnabled, SubmitIntentRevision: claim.ComputerStorage.SubmitIntentRevision,
+				SubmitMaxInflight: claim.ComputerStorage.SubmitMaxInflight, SubmitPolicyRevision: claim.ComputerStorage.SubmitPolicyRevision},
 			computerID: claim.ComputerStorage.ComputerID, jobID: claim.Job.JobID,
 			attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken,
 			dial: func(dialContext context.Context, endpointName string) (net.Conn, error) {

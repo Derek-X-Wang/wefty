@@ -34,6 +34,7 @@ const (
 	ErrorAdminBootstrapClosed      ErrorCode = "admin_bootstrap_closed"
 	ErrorFinalAdmin                ErrorCode = "final_admin"
 	ErrorCapacityExhausted         ErrorCode = "capacity_exhausted"
+	ErrorSubmitInflightLimit       ErrorCode = "submit_inflight_limit"
 	ErrorUnsupportedKind           ErrorCode = "unsupported_kind"
 	ErrorUnsupportedClass          ErrorCode = "unsupported_class"
 	ErrorUnsupportedRuntimeHandler ErrorCode = "unsupported_runtime_handler"

@@ -301,10 +301,14 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["computer_id", "grants"],
+              "required": ["computer_id", "grants", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "submit_policy_revision"],
               "properties": {
                 "computer_id": { "type": "string", "minLength": 1 },
-                "grants": { "type": "array", "items": { "$ref": "#/components/schemas/ComputerGrant" } }
+                "grants": { "type": "array", "items": { "$ref": "#/components/schemas/ComputerGrant" } },
+                "submit_enabled": { "type": "boolean" },
+                "submit_intent_revision": { "type": "integer", "minimum": 0 },
+                "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                "submit_policy_revision": { "type": "integer", "minimum": 0 }
               }
             }
           },
@@ -395,7 +399,8 @@
         "required": [
           "computer_id", "name", "placement_node_id", "grants", "storage_id", "storage_generation", "desired_disk_bytes",
           "desired_state", "intent_revision", "applied_revision", "current_job_id",
-          "current_spec_revision", "reconfiguration_phase", "display_endpoint", "current_job", "created_at", "updated_at"
+          "current_spec_revision", "reconfiguration_phase", "submit_enabled", "submit_intent_revision",
+          "submit_max_inflight", "submit_policy_revision", "display_endpoint", "current_job", "created_at", "updated_at"
         ],
         "properties": {
           "computer_id": { "type": "string", "minLength": 1 },
@@ -419,6 +424,10 @@
           "current_spec_revision": { "type": "integer", "minimum": 1 },
           "reconfiguration_phase": { "enum": ["stable", "projecting", "resetting", "removing"] },
           "reconfiguration_revision": { "type": "integer", "minimum": 1 },
+          "submit_enabled": { "type": "boolean", "default": false },
+          "submit_intent_revision": { "type": "integer", "minimum": 0 },
+          "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 20 },
+          "submit_policy_revision": { "type": "integer", "minimum": 0 },
           "display_endpoint": {
             "type": ["string", "null"],
             "description": "Private take-over front-door endpoint. Null until the admission module is active; never a placeholder URL."
@@ -756,12 +765,16 @@
 	  "ComputerStorageClaim": {
 		"type": "object",
 		"additionalProperties": false,
-		"required": ["computer_id", "storage_id", "storage_generation", "intent_revision"],
+		"required": ["computer_id", "storage_id", "storage_generation", "intent_revision", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "submit_policy_revision"],
 		"properties": {
 		  "computer_id": { "type": "string", "minLength": 1 },
 		  "storage_id": { "type": "string", "minLength": 1 },
 		  "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
-		  "intent_revision": { "type": "integer", "format": "int64", "minimum": 0 }
+		  "intent_revision": { "type": "integer", "format": "int64", "minimum": 0 },
+		  "submit_enabled": { "type": "boolean" },
+		  "submit_intent_revision": { "type": "integer", "format": "int64", "minimum": 0 },
+		  "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+		  "submit_policy_revision": { "type": "integer", "format": "int64", "minimum": 0 }
 		}
 	  },
 	  "RemovalDirective": {
@@ -1007,6 +1020,11 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "opaque scoped run token"
+      },
+      "computerToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque Computer pass"
       }
     }
   }

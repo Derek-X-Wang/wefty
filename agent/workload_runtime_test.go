@@ -13,6 +13,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -701,6 +702,88 @@ func TestComputerReservedOperatorEnvironmentIsStrippedBeforeAuthoritativeInjecti
 	}
 	if public[contract.EnvComputerViewPort] != "2" || sensitive[contract.EnvComputerToken] != "attacker" {
 		t.Fatal("reserved-environment stripping mutated the immutable Job projection")
+	}
+}
+
+type recordingComputerTokenMinter struct {
+	grant l3.ComputerTokenGrant
+	err   error
+	calls int
+}
+
+func (minter *recordingComputerTokenMinter) MintComputerToken(_ context.Context, _ l3.ComputerTokenMintRequest) (l3.ComputerTokenGrant, error) {
+	minter.calls++
+	return minter.grant, minter.err
+}
+
+type captureComputerPreflight struct{ request workloadrunner.Request }
+
+func (runtime *captureComputerPreflight) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	runtime.request = request
+	err := errors.New("stop after preflight")
+	return workloadrunner.Admission{Request: request}, workloadrunner.Result{Outcome: spawnFailure(contract.SpawnFailureProcessRequest, err)}, err
+}
+
+func (*captureComputerPreflight) Run(context.Context, workloadrunner.Request, workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	panic("Run must not follow failed preflight")
+}
+
+func (*captureComputerPreflight) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime}, nil
+}
+
+func TestComputerTokenMintedIntoSensitiveClosedInputOnlyWhenEnabled(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "default-off", true: "enabled"}[enabled], func(t *testing.T) {
+			runtime := &captureComputerPreflight{}
+			minter := &recordingComputerTokenMinter{grant: l3.ComputerTokenGrant{Token: "secret-computer-pass",
+				ComputerID: "computer-1", ComputerAttemptID: "attempt-1", ComputerStorageGeneration: 5,
+				SubmitIntentRevision: 2, HostNodeID: "node-1", SubmitMaxInflight: 20}}
+			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+				runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, clock: systemClock{},
+				nodeID: "node-1", bootSessionID: "boot-1", computerTokens: minter,
+				observer: newLifecycleObserver(systemClock{}),
+			})
+			claim := l1.Claim{Job: l1.Job{JobID: "computer-job", Spec: contract.JobSpec{
+				Kind: contract.JobKindOCI, Class: contract.JobClassService,
+				Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{contract.EnvComputerToken: "attacker"},
+					OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: "example.test/computer:latest"},
+						Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}}},
+			}}, Lease: l1.AttemptLease{AttemptID: "attempt-1", FencingToken: "fence-1", LeaseTTL: time.Second},
+				ComputerStorage: &l1.ComputerStorageClaim{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 5,
+					IntentRevision: 7, SubmitEnabled: enabled, SubmitIntentRevision: 2, SubmitMaxInflight: 20}}
+			_, _ = lifecycle.runWorkload(t.Context(), claim)
+			if enabled {
+				if minter.calls != 1 || runtime.request.Execution.SensitiveEnv[contract.EnvComputerToken] != "secret-computer-pass" {
+					t.Fatalf("enabled Computer pass: calls=%d env=%v", minter.calls, runtime.request.Execution.SensitiveEnv)
+				}
+			} else if minter.calls != 0 {
+				t.Fatalf("default-off Computer minted %d pass(es)", minter.calls)
+			} else if _, exists := runtime.request.Execution.SensitiveEnv[contract.EnvComputerToken]; exists {
+				t.Fatalf("default-off Computer retained caller token: %v", runtime.request.Execution.SensitiveEnv)
+			}
+		})
+	}
+}
+
+func TestComputerTokenMintFailureStopsBeforeRuntime(t *testing.T) {
+	runtime := &captureComputerPreflight{}
+	minter := &recordingComputerTokenMinter{err: errors.New("L3 unavailable")}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime},
+		clock: systemClock{}, nodeID: "node-1", bootSessionID: "boot-1", computerTokens: minter,
+		observer: newLifecycleObserver(systemClock{})})
+	claim := l1.Claim{Job: l1.Job{JobID: "computer-job", Spec: contract.JobSpec{Kind: contract.JobKindOCI,
+		Class: contract.JobClassService, Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.test/computer:latest"}, Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}}}}},
+		Lease: l1.AttemptLease{AttemptID: "attempt-1", FencingToken: "fence-1", LeaseTTL: time.Second},
+		ComputerStorage: &l1.ComputerStorageClaim{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 5,
+			SubmitEnabled: true, SubmitIntentRevision: 2, SubmitMaxInflight: 20}}
+	result, err := lifecycle.runWorkload(t.Context(), claim)
+	if err == nil || result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailurePassUnavailable || minter.calls != 1 {
+		t.Fatalf("mint failure = result %#v err %v calls %d", result, err, minter.calls)
+	}
+	if runtime.request.Authority.AttemptID != "" {
+		t.Fatal("runtime preflight ran after Computer token mint failure")
 	}
 }
 

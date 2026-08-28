@@ -26,17 +26,19 @@ func main() {
 
 func run() error {
 	var (
-		fabricMode     = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
-		listenAddress  = flag.String("listen", l3.DefaultL3Address, "run-ledger Fabric listen address")
-		controlPlane   = flag.String("control-plane", l3.DefaultL1Address, "L1 control-plane Fabric address")
-		databasePath   = flag.String("db", "wefty-l3.sqlite", "SQLite database path")
-		reconcileEvery = flag.Duration("reconcile-interval", l3.DefaultReconcileInterval, "dispatch and run-state reconciliation interval")
-		fabricName     = flag.String("fabric-name", l3.DefaultL3Address, "tsnet logical node name")
-		stateDirectory = flag.String("state-dir", "", "tsnet state directory")
-		authKey        = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
-		controlURL     = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
-		ephemeral      = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
-		readyFile      = flag.String("ready-file", "", "write listener metadata after the server is ready")
+		fabricMode                = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
+		listenAddress             = flag.String("listen", l3.DefaultL3Address, "run-ledger Fabric listen address")
+		controlPlane              = flag.String("control-plane", l3.DefaultL1Address, "L1 control-plane Fabric address")
+		databasePath              = flag.String("db", "wefty-l3.sqlite", "SQLite database path")
+		reconcileEvery            = flag.Duration("reconcile-interval", l3.DefaultReconcileInterval, "dispatch and run-state reconciliation interval")
+		fabricName                = flag.String("fabric-name", l3.DefaultL3Address, "tsnet logical node name")
+		stateDirectory            = flag.String("state-dir", "", "tsnet state directory")
+		authKey                   = flag.String("auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
+		controlURL                = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
+		ephemeral                 = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
+		readyFile                 = flag.String("ready-file", "", "write listener metadata after the server is ready")
+		controlPlaneNodeID        = flag.String("control-plane-node-id", "control-plane", "authenticated Fabric Node ID allowed to revoke Computer grants administratively")
+		computerAuthorityInstance = flag.String("computer-authority-instance", "default", "persisted L3 authority instance marker; change only for restore or promotion")
 	)
 	flag.Parse()
 	if *reconcileEvery <= 0 {
@@ -60,7 +62,7 @@ func run() error {
 		return err
 	}
 	defer closeFabric()
-	store, err := l3.OpenStore(*databasePath, l3.StoreOptions{})
+	store, err := l3.OpenStore(*databasePath, l3.StoreOptions{ComputerAuthorityInstanceID: *computerAuthorityInstance})
 	if err != nil {
 		return err
 	}
@@ -77,7 +79,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	server, err := l3.NewServer(participant, store, l3.ServerConfig{Reconciler: reconciler, Logs: l1Client})
+	server, err := l3.NewServer(participant, store, l3.ServerConfig{Reconciler: reconciler, Logs: l1Client,
+		ControlPlaneNodeID: *controlPlaneNodeID})
 	if err != nil {
 		return err
 	}

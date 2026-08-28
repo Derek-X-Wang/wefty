@@ -31,9 +31,10 @@ var workflowIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 // Store is the L3-owned SQLite ledger. It intentionally has no access to the
 // L1 database; the outbox crosses that boundary only through the L1 protocol.
 type Store struct {
-	db         *sql.DB
-	clock      Clock
-	tokenGrace time.Duration
+	db                          *sql.DB
+	clock                       Clock
+	tokenGrace                  time.Duration
+	computerAuthorityInstanceID string
 }
 
 // OpenStore opens a file-backed SQLite ledger, enables WAL, and applies the L3
@@ -60,7 +61,11 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if tokenGrace <= 0 {
 		tokenGrace = DefaultRunTokenGrace
 	}
-	store := &Store{db: db, clock: clock, tokenGrace: tokenGrace}
+	instanceID := strings.TrimSpace(options.ComputerAuthorityInstanceID)
+	if instanceID == "" {
+		instanceID = "default"
+	}
+	store := &Store{db: db, clock: clock, tokenGrace: tokenGrace, computerAuthorityInstanceID: instanceID}
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -174,6 +179,10 @@ CREATE TABLE IF NOT EXISTS run_triggers (
   actor TEXT NOT NULL,
   source TEXT NOT NULL,
   source_run_id TEXT,
+  computer_id TEXT,
+  computer_attempt_id TEXT,
+  computer_storage_generation INTEGER,
+  submit_intent_revision INTEGER,
   params_json BLOB NOT NULL,
   created_ns INTEGER NOT NULL
 );
@@ -198,6 +207,55 @@ CREATE TABLE IF NOT EXISTS run_tokens (
   minted_ns INTEGER NOT NULL,
   expires_ns INTEGER
 );
+CREATE TABLE IF NOT EXISTS computer_authority (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  authority_generation INTEGER NOT NULL CHECK(authority_generation >= 0),
+  grant_revision INTEGER NOT NULL CHECK(grant_revision >= 0),
+  instance_id TEXT NOT NULL DEFAULT '',
+  updated_ns INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO computer_authority(singleton, authority_generation, grant_revision, updated_ns)
+VALUES(1, 0, 0, 0);
+CREATE TABLE IF NOT EXISTS computer_token_grants (
+  grant_id TEXT PRIMARY KEY,
+  computer_id TEXT NOT NULL,
+  computer_attempt_id TEXT NOT NULL,
+  computer_storage_generation INTEGER NOT NULL CHECK(computer_storage_generation > 0),
+  submit_intent_revision INTEGER NOT NULL CHECK(submit_intent_revision > 0),
+  host_node_id TEXT NOT NULL,
+  l3_authority_generation INTEGER NOT NULL CHECK(l3_authority_generation > 0),
+  grant_revision INTEGER NOT NULL UNIQUE CHECK(grant_revision > 0),
+  submit_max_inflight INTEGER NOT NULL CHECK(submit_max_inflight > 0),
+  token_hash BLOB NOT NULL UNIQUE,
+  issued_ns INTEGER NOT NULL,
+  revoked_ns INTEGER,
+  revocation_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS computer_token_active_attempt
+  ON computer_token_grants(computer_id, computer_attempt_id) WHERE revoked_ns IS NULL;
+CREATE INDEX IF NOT EXISTS computer_token_active_host
+  ON computer_token_grants(host_node_id, computer_id, computer_attempt_id) WHERE revoked_ns IS NULL;
+CREATE TABLE IF NOT EXISTS computer_token_audit (
+  audit_id TEXT PRIMARY KEY,
+  grant_id TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK(operation IN ('issued', 'revoked')),
+  computer_id TEXT NOT NULL,
+  computer_attempt_id TEXT NOT NULL,
+  computer_storage_generation INTEGER NOT NULL CHECK(computer_storage_generation > 0),
+  submit_intent_revision INTEGER NOT NULL CHECK(submit_intent_revision > 0),
+  host_node_id TEXT NOT NULL,
+  l3_authority_generation INTEGER NOT NULL CHECK(l3_authority_generation > 0),
+  grant_revision INTEGER NOT NULL CHECK(grant_revision > 0),
+  submit_max_inflight INTEGER NOT NULL CHECK(submit_max_inflight > 0),
+  token_hash BLOB NOT NULL,
+  reason TEXT NOT NULL,
+  occurred_ns INTEGER NOT NULL,
+  UNIQUE(grant_id, operation)
+);
+CREATE TRIGGER IF NOT EXISTS computer_token_audit_no_update
+BEFORE UPDATE ON computer_token_audit BEGIN SELECT RAISE(ABORT, 'Computer token audit is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS computer_token_audit_no_delete
+BEFORE DELETE ON computer_token_audit BEGIN SELECT RAISE(ABORT, 'Computer token audit is immutable'); END;
 CREATE TABLE IF NOT EXISTS envelopes (
   envelope_id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
@@ -248,6 +306,26 @@ BEFORE DELETE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejecti
 	}
 	if err := ensureSQLiteColumn(ctx, s.db, "runs", "node_id", "TEXT"); err != nil {
 		return fmt.Errorf("l3: migrate run node attribution: %w", err)
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"computer_id", "TEXT"},
+		{"computer_attempt_id", "TEXT"},
+		{"computer_storage_generation", "INTEGER"},
+		{"submit_intent_revision", "INTEGER"},
+	} {
+		if err := ensureSQLiteColumn(ctx, s.db, "run_triggers", column.name, column.definition); err != nil {
+			return fmt.Errorf("l3: migrate Computer trigger provenance: %w", err)
+		}
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "computer_authority", "instance_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("l3: migrate Computer authority instance marker: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS run_triggers_computer_origin
+		ON run_triggers(source, computer_id, run_id)`); err != nil {
+		return fmt.Errorf("l3: index Computer trigger provenance: %w", err)
+	}
+	if err := s.adoptComputerAuthorityInstance(ctx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -593,6 +671,39 @@ func (s *Store) CreateRun(ctx context.Context, input CreateRunInput) (record con
 	if !errors.Is(err, sql.ErrNoRows) {
 		return contract.RunRecord{}, false, internalError(err, "read run idempotency key")
 	}
+	if input.ComputerScope != nil {
+		if input.VerifyComputerScope == nil {
+			return contract.RunRecord{}, false, protocolError(contract.ErrorUnauthorized, "Computer Run creation requires live scope verification")
+		}
+		if err := validateComputerGrantTx(ctx, tx, *input.ComputerScope); err != nil {
+			return contract.RunRecord{}, false, err
+		}
+		if err := input.VerifyComputerScope(ctx, *input.ComputerScope); err != nil {
+			return contract.RunRecord{}, false, err
+		}
+		if err := validateComputerGrantTx(ctx, tx, *input.ComputerScope); err != nil {
+			return contract.RunRecord{}, false, err
+		}
+		var inflight int
+		if err := tx.QueryRowContext(ctx, `WITH RECURSIVE computer_lineages(root_id, run_id) AS (
+			SELECT r.run_id, r.run_id FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
+			WHERE t.source='computer' AND t.computer_id=? AND r.parent_run_id IS NULL
+			UNION ALL
+			SELECT lineage.root_id, child.run_id FROM computer_lineages lineage
+			JOIN runs child ON child.parent_run_id=lineage.run_id
+		)
+		SELECT COUNT(DISTINCT lineage.root_id) FROM computer_lineages lineage
+		JOIN runs member ON member.run_id=lineage.run_id
+		WHERE member.status NOT IN (?, ?)`, input.ComputerScope.ComputerID, contract.RunSucceeded, contract.RunFailed).Scan(&inflight); err != nil {
+			return contract.RunRecord{}, false, internalError(err, "count Computer-submitted root Lineages")
+		}
+		if inflight >= input.ComputerScope.SubmitMaxInflight {
+			return contract.RunRecord{}, false, &Error{Code: contract.ErrorSubmitInflightLimit,
+				Retryable: true,
+				Message:   fmt.Sprintf("Computer %q has %d nonterminal root Lineages (limit %d)", input.ComputerScope.ComputerID, inflight, input.ComputerScope.SubmitMaxInflight),
+				Details:   map[string]any{"computer_id": input.ComputerScope.ComputerID, "count": inflight, "limit": input.ComputerScope.SubmitMaxInflight}}
+		}
+	}
 	if input.Request.ParentRunID != "" {
 		var parentStatus contract.RunState
 		if err := tx.QueryRowContext(ctx, "SELECT status FROM runs WHERE run_id=?", input.Request.ParentRunID).Scan(&parentStatus); errors.Is(err, sql.ErrNoRows) {
@@ -667,12 +778,23 @@ VALUES(?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, input.Request
 	}
 	source := "manual"
 	sourceRunID := ""
-	if input.Request.ParentRunID != "" {
+	var computerID, computerAttemptID any
+	var computerStorageGeneration, submitIntentRevision any
+	if input.ComputerScope != nil {
+		source = "computer"
+		computerID = input.ComputerScope.ComputerID
+		computerAttemptID = input.ComputerScope.ComputerAttemptID
+		computerStorageGeneration = input.ComputerScope.ComputerStorageGeneration
+		submitIntentRevision = input.ComputerScope.SubmitIntentRevision
+	} else if input.Request.ParentRunID != "" {
 		source = "chain"
 		sourceRunID = input.Request.ParentRunID
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO run_triggers(run_id, actor, source, source_run_id, params_json, created_ns) VALUES(?, ?, ?, NULLIF(?, ''), ?, ?)`,
-		runID, input.Actor, source, sourceRunID, []byte(input.Request.Params), now.UnixNano())
+	_, err = tx.ExecContext(ctx, `INSERT INTO run_triggers(
+		run_id, actor, source, source_run_id, computer_id, computer_attempt_id,
+		computer_storage_generation, submit_intent_revision, params_json, created_ns
+	) VALUES(?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?)`, runID, input.Actor, source, sourceRunID,
+		computerID, computerAttemptID, computerStorageGeneration, submitIntentRevision, []byte(input.Request.Params), now.UnixNano())
 	if err != nil {
 		return contract.RunRecord{}, false, internalError(err, "store trigger provenance")
 	}
@@ -923,6 +1045,20 @@ func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, e
 	if input.Actor == "" {
 		return input, "", 0, protocolError(contract.ErrorUnauthorized, "authenticated actor is required")
 	}
+	if input.ComputerScope != nil {
+		scope := input.ComputerScope
+		if scope.ComputerID == "" || scope.ComputerAttemptID == "" || scope.HostNodeID == "" ||
+			scope.ComputerStorageGeneration < 1 || scope.SubmitIntentRevision < 1 ||
+			scope.L3AuthorityGeneration < 1 || scope.GrantRevision < 1 || scope.SubmitMaxInflight < 1 {
+			return input, "", 0, protocolError(contract.ErrorUnauthorized, "Computer token scope is incomplete")
+		}
+		if input.Actor != "computer:"+scope.ComputerID {
+			return input, "", 0, protocolError(contract.ErrorForbidden, "Computer run principal is derived from its token scope")
+		}
+		if input.Request.ParentRunID != "" {
+			return input, "", 0, protocolError(contract.ErrorForbidden, "Computer tokens may submit only root Runs")
+		}
+	}
 	request := &input.Request
 	request.WorkflowRef = strings.TrimSpace(request.WorkflowRef)
 	sources := 0
@@ -1059,6 +1195,8 @@ func normalizeTags(tags []string) ([]string, error) {
 func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, error) {
 	var record contract.RunRecord
 	var parent, l1JobID, nodeID, sourceRun, workflowRef sql.NullString
+	var computerID, computerAttemptID sql.NullString
+	var computerStorageGeneration, submitIntentRevision sql.NullInt64
 	var paramsJSON, tagsJSON []byte
 	var limitsJSON []byte
 	var content, imageJSON []byte
@@ -1069,13 +1207,15 @@ func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, e
 	err := s.db.QueryRowContext(ctx, `
 SELECT r.run_id, r.parent_run_id, r.l1_job_id, r.node_id, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
        r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
-       s.content, s.sha256, i.program_json, w.workflow_ref, t.actor, t.source, t.source_run_id
+	       s.content, s.sha256, i.program_json, w.workflow_ref, t.actor, t.source, t.source_run_id,
+	       t.computer_id, t.computer_attempt_id, t.computer_storage_generation, t.submit_intent_revision
 FROM runs r LEFT JOIN run_scripts s ON s.run_id=r.run_id
 LEFT JOIN run_images i ON i.run_id=r.run_id
 LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
 WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
-		&createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &imageJSON, &workflowRef, &actor, &source, &sourceRun)
+		&createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &imageJSON, &workflowRef, &actor, &source, &sourceRun,
+		&computerID, &computerAttemptID, &computerStorageGeneration, &submitIntentRevision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return contract.RunRecord{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
 	}
@@ -1099,7 +1239,9 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &recor
 			return contract.RunRecord{}, internalError(err, "decode run limits")
 		}
 	}
-	record.Trigger = contract.Trigger{Type: source, Principal: actor, SourceRunID: sourceRun.String}
+	record.Trigger = contract.Trigger{Type: source, Principal: actor, SourceRunID: sourceRun.String,
+		ComputerID: computerID.String, ComputerAttemptID: computerAttemptID.String,
+		ComputerStorageGeneration: computerStorageGeneration.Int64, SubmitIntentRevision: submitIntentRevision.Int64}
 	if workflowRef.Valid {
 		record.Workflow = contract.WorkflowSource{WorkflowRef: workflowRef.String}
 	} else if len(imageJSON) > 0 {
@@ -1171,10 +1313,16 @@ func (s *Store) runJobID(ctx context.Context, runID string) (string, bool, error
 func (s *Store) GetTrigger(ctx context.Context, runID string) (TriggerProvenance, error) {
 	var provenance TriggerProvenance
 	var sourceRun sql.NullString
+	var computerID, computerAttemptID sql.NullString
+	var computerStorageGeneration, submitIntentRevision sql.NullInt64
 	var params []byte
 	var createdNS int64
-	err := s.db.QueryRowContext(ctx, `SELECT run_id, actor, source, source_run_id, params_json, created_ns FROM run_triggers WHERE run_id=?`, runID).
-		Scan(&provenance.RunID, &provenance.Actor, &provenance.Source, &sourceRun, &params, &createdNS)
+	err := s.db.QueryRowContext(ctx, `SELECT run_id, actor, source, source_run_id,
+computer_id, computer_attempt_id, computer_storage_generation, submit_intent_revision,
+params_json, created_ns FROM run_triggers WHERE run_id=?`, runID).
+		Scan(&provenance.RunID, &provenance.Actor, &provenance.Source, &sourceRun,
+			&computerID, &computerAttemptID, &computerStorageGeneration, &submitIntentRevision,
+			&params, &createdNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TriggerProvenance{}, protocolError(contract.ErrorNotFound, "trigger for run %q was not found", runID)
 	}
@@ -1182,6 +1330,10 @@ func (s *Store) GetTrigger(ctx context.Context, runID string) (TriggerProvenance
 		return TriggerProvenance{}, internalError(err, "read trigger provenance")
 	}
 	provenance.SourceRunID = sourceRun.String
+	provenance.ComputerID = computerID.String
+	provenance.ComputerAttemptID = computerAttemptID.String
+	provenance.ComputerStorageGeneration = computerStorageGeneration.Int64
+	provenance.SubmitIntentRevision = submitIntentRevision.Int64
 	provenance.Params = append(json.RawMessage(nil), params...)
 	provenance.CreatedAt = time.Unix(0, createdNS).UTC()
 	return provenance, nil

@@ -30,11 +30,28 @@ names remain ordinary tenant environment.
 | `WEFTY_COMPUTER_VIEW_PORT` | helper-allocated decimal loopback port | public |
 | `WEFTY_COMPUTER_CONTROL_PORT` | distinct helper-allocated decimal loopback port | public |
 | `WEFTY_SERVICE_PORT` | omitted | reserved but never injected for a Computer |
-| `WEFTY_COMPUTER_TOKEN` | no value in this contract | reserved sensitive name; later guest-authority work is the only injector |
+| `WEFTY_COMPUTER_TOKEN` | L3-minted live-attempt Computer pass when submission is enabled | sensitive; agent-memory to closed helper field only |
 
 The other reserved OCI names remain governed by the run-execution-context
 contract. In particular, a Computer never receives `WEFTY_RUN_TOKEN` merely
 because it is a Computer.
+
+Submission is disabled by default. When an administrator enables the
+revisioned submission intent, the agent must obtain an L3-verified pass bound
+to the exact Computer, attempt, Storage generation, submit-intent revision,
+host Node, and L3 authority generation before helper preflight. Mint failure
+is exact `pass_unavailable`; no token reaches the runtime. The attempt bridge
+and guest-visible `WEFTY_L3_ENDPOINT` remain the transport contract owned by
+#184 and do not change this credential provenance.
+
+The environment value is start-time delivery only. The helper also publishes
+the current pass at `/wefty/control/computer-token` so an administrator can
+enable submission during a live attempt. That file is atomically replaced,
+mode `0400`, and owned by the resolved image tenant uid/gid. Disable,
+revocation, or authority loss removes it; re-enable and policy changes publish
+a freshly minted pass. A tenant must reopen or watch the path and treat a
+missing file as submission disabled. The file remains attempt-local tmpfs and
+never enters `/wefty/service`, a JobSpec, logs, inspection, or removal evidence.
 
 `/wefty/service`, `/wefty/control`, and `/wefty/handoff` are non-shadowable.
 Operator mount targets equal to, above, or below any of them are rejected after

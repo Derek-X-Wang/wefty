@@ -100,6 +100,8 @@ func run() error {
 		initiateAdminBootstrap   = flag.Bool("initiate-admin-bootstrap", false, "create a short-lived local admin bootstrap challenge and exit")
 		resetAdminPolicy         = flag.Bool("reset-admin-policy", false, "locally clear the admin roster, reopen bootstrap, audit the reset, and exit")
 		allowPlainPersonIDs      = flag.Bool("allow-plain-person-identities", false, "DEVELOPMENT ONLY: allow self-asserted plain Fabric identities on person routes")
+		runLedgerAddress         = flag.String("run-ledger", l1.DefaultRunLedgerAddress, "L3 run-ledger Fabric address")
+		runLedgerNodeID          = flag.String("run-ledger-node-id", "run-ledger", "authenticated Fabric Node ID allowed to request Computer scope proofs")
 	)
 	flag.Var(nodeTagsFlag{policies: nodePolicies}, "node-tags", "authoritative routing tags as node-id=tag,tag (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies}, "node-max-oneshot-slots", "authoritative one-shot capacity as node-id=slots (repeatable)")
@@ -155,8 +157,14 @@ func run() error {
 		return err
 	}
 	defer store.Close()
+	computerTokenRevoker, err := l1.NewComputerTokenRevocationClient(participant, *runLedgerAddress)
+	if err != nil {
+		return err
+	}
+	defer computerTokenRevoker.CloseIdleConnections()
 	server, err := l1.NewServer(participant, store, l1.ServerConfig{
 		NodePolicies: nodePolicies, AllowSelfAssertedPersonIdentities: *allowPlainPersonIDs,
+		ComputerTokenRevoker: computerTokenRevoker, RunLedgerNodeID: *runLedgerNodeID,
 	})
 	if err != nil {
 		return err

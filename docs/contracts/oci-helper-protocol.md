@@ -188,6 +188,7 @@ heartbeats.
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend, and only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
 | `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the Mac bind-failure fallback and the helper issued that attempt's separate bridge capability. It never accepts an arbitrary host address or port. |
 | `SetComputerControlState` | Exact live Computer-attempt authority and one boolean enter. The helper atomically replaces the attempt-local `/wefty/control/driver.json` body with the exact version-1 false or true document; ordinary, stale, old-boot, and reaped attempts are refused. |
+| `SetComputerToken` | Exact live Computer-attempt authority and an opaque bearer enter. A non-empty bearer is atomically installed as attempt-local `/wefty/control/computer-token` with mode 0400 and the tenant process owner; an empty bearer removes the file. Ordinary, stale, old-boot, and reaped attempts are refused. |
 
 `DialAttemptPort` terminates inside the guest at `127.0.0.1:<allocated-port>`.
 The helper emits an internal backend-ready marker only after that connection is
@@ -297,9 +298,10 @@ source is mounted at `/wefty/handoff`. Presence of that descriptor makes the
 helper-reserved `WEFTY_HANDOFF_DIR=/wefty/handoff` value authoritative even if
 an operator or image layer supplied another value. The
 caller-supplied `reserved_environment` is always rejected at the privileged
-trust boundary, including `WEFTY_COMPUTER_TOKEN` until its dedicated minter
-lands. `WEFTY_L3_ENDPOINT` and `WEFTY_RUN_TOKEN` cross only through their
-closed public and sensitive minting fields; a reserved name in either generic
+trust boundary, including `WEFTY_COMPUTER_TOKEN`. `WEFTY_L3_ENDPOINT`,
+`WEFTY_RUN_TOKEN`, and the Computer-only `WEFTY_COMPUTER_TOKEN` cross only
+through their closed public or sensitive minting fields; a Computer token on
+an ordinary workload is rejected, and a reserved name in either generic
 operator list is rejected. The helper derives mount paths and endpoint ports
 from its own descriptors and allocation. Image
 configuration, image-rootfs user/group databases, guest architecture/kernel
@@ -503,11 +505,13 @@ The read-only root and fixed-size `/dev`, `/dev/shm`, `/run`, `/tmp`, and
 filesystem; Computer operator mounts are therefore required to be read-only.
 The helper also mounts a fresh attempt-local tmpfs outside the Computer disk,
 writes `driver.json` false before `Started`, and bind-mounts that directory
-read-only at the non-shadowable `/wefty/control` target. The file is mode 0444
-and each state replacement ends with a same-directory atomic rename, so the
-image sees only the two exact complete documents and the helper cannot report a
-post-publication failure. The attempt log/resource cleanup path owns this tmpfs
-mount; attempt reap, session
+read-only at the non-shadowable `/wefty/control` target. `driver.json` is mode
+0444. The optional `computer-token` is mode 0400 and owned by the tenant process
+identity; enabling submission installs or rotates it, while disabling or
+revoking submission removes it. Each replacement ends with a same-directory
+atomic rename, so the image sees only complete documents and the helper cannot
+report a post-publication failure. The attempt log/resource cleanup path owns
+this tmpfs mount; attempt reap, session
 loss, and boot sweep unmount and remove it without adding it to Computer
 Storage evidence.
 

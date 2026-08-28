@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -72,6 +73,55 @@ func TestComputerControlStateIsFreshExactReadableAndAtomic(t *testing.T) {
 	}
 	if _, err := prepareComputerControlDirectory(logDirectory, func(string) error { return nil }, func(string) error { return nil }); err == nil {
 		t.Fatal("fresh attempt preparation reused prior Computer control state")
+	}
+}
+
+func TestComputerTokenFileIsAtomicTenantOwnedAndRemovedOnDisable(t *testing.T) {
+	controlDirectory := t.TempDir()
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	if err := atomicWriteComputerToken(controlDirectory, "first-secret", uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(controlDirectory, computerTokenFilename)
+	assertComputerTokenFile(t, tokenPath, "first-secret", uid, gid)
+	if err := atomicWriteComputerToken(controlDirectory, "replacement-secret", uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	assertComputerTokenFile(t, tokenPath, "replacement-secret", uid, gid)
+	if err := atomicWriteComputerToken(controlDirectory, "", uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tokenPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("disabled Computer token file stat error = %v, want not exist", err)
+	}
+	entries, err := os.ReadDir(controlDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("Computer token update left residue: %+v", entries)
+	}
+}
+
+func assertComputerTokenFile(t *testing.T, path, want string, uid, gid uint32) {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(payload) != want {
+		t.Fatalf("computer-token = %q, want %q", payload, want)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o400 {
+		t.Fatalf("computer-token mode = %o, want 0400", info.Mode().Perm())
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uid || stat.Gid != gid {
+		t.Fatalf("computer-token owner = %#v, want uid=%d gid=%d", info.Sys(), uid, gid)
 	}
 }
 

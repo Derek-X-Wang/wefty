@@ -56,6 +56,7 @@ const (
 	MethodDialAttemptPort    Method = "DialAttemptPort"
 	MethodDialHostBridge     Method = "DialHostBridge"
 	MethodSetComputerControl Method = "SetComputerControlState"
+	MethodSetComputerToken   Method = "SetComputerToken"
 )
 
 // attemptPortBackendReady is emitted only after the helper has connected the
@@ -531,11 +532,12 @@ type WorkloadInput struct {
 	WorkingDirectory     string                `json:"working_directory,omitempty"`
 	Environment          []EnvironmentVariable `json:"environment,omitempty"`
 	SensitiveEnvironment []EnvironmentVariable `json:"sensitive_environment,omitempty"`
-	// L3Endpoint and RunToken are closed helper-minting inputs. Their values
+	// L3Endpoint, RunToken, and ComputerToken are closed helper-minting inputs. Their values
 	// become reserved environment only inside the privileged trust boundary;
 	// RunToken is deliberately separate so sensitive-only routing is explicit.
 	L3Endpoint           string                    `json:"l3_endpoint,omitempty"`
 	RunToken             string                    `json:"run_token,omitempty"`
+	ComputerToken        string                    `json:"computer_token,omitempty"`
 	ReservedEnvironment  []EnvironmentVariable     `json:"reserved_environment,omitempty"`
 	ManagedVolumes       []ManagedVolumeDescriptor `json:"managed_volumes,omitempty"`
 	OperatorMounts       []OperatorMount           `json:"operator_mounts,omitempty"`
@@ -652,6 +654,11 @@ type SignalRequest struct {
 type SetComputerControlStateRequest struct {
 	Authority    AttemptAuthority `json:"authority"`
 	HumanDriving bool             `json:"human_driving"`
+}
+
+type SetComputerTokenRequest struct {
+	Authority AttemptAuthority `json:"authority"`
+	Token     string           `json:"token,omitempty"`
 }
 
 type Signal string

@@ -19,19 +19,24 @@ import (
 
 type ServerConfig struct {
 	CallerPrincipalTag string
+	ControlPlaneNodeID string
 	Reconciler         *Reconciler
 	Jobs               JobClient
 	Logs               JobLogClient
+	ComputerGrants     ComputerGrantVerifier
 }
 
 type Server struct {
-	fabric             fabric.Fabric
-	store              *Store
-	callerPrincipalTag string
-	reconciler         *Reconciler
-	jobs               JobClient
-	logs               JobLogClient
-	handler            http.Handler
+	fabric              fabric.Fabric
+	store               *Store
+	callerPrincipalTag  string
+	controlPlaneNodeID  string
+	reconciler          *Reconciler
+	jobs                JobClient
+	logs                JobLogClient
+	computerGrants      ComputerGrantVerifier
+	filterRunVisibility func(context.Context, string, string) (bool, error)
+	handler             http.Handler
 }
 
 func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, error) {
@@ -45,11 +50,20 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	if tag == "" {
 		tag = DefaultCallerPrincipalTag
 	}
+	controlPlaneNodeID := strings.TrimSpace(config.ControlPlaneNodeID)
+	if controlPlaneNodeID == "" {
+		controlPlaneNodeID = "control-plane"
+	}
 	jobs := config.Jobs
 	if jobs == nil && config.Reconciler != nil {
 		jobs = config.Reconciler.jobs
 	}
-	server := &Server{fabric: f, store: store, callerPrincipalTag: tag, reconciler: config.Reconciler, jobs: jobs, logs: config.Logs}
+	computerGrants := config.ComputerGrants
+	if computerGrants == nil {
+		computerGrants, _ = jobs.(ComputerGrantVerifier)
+	}
+	server := &Server{fabric: f, store: store, callerPrincipalTag: tag, controlPlaneNodeID: controlPlaneNodeID,
+		reconciler: config.Reconciler, jobs: jobs, logs: config.Logs, computerGrants: computerGrants}
 	server.handler = server.routes()
 	return server, nil
 }
@@ -89,6 +103,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 
 type identityContextKey struct{}
 type runTokenContextKey struct{}
+type computerTokenContextKey struct{}
 
 func (s *Server) routes() http.Handler {
 	runs := http.NewServeMux()
@@ -107,6 +122,11 @@ func (s *Server) routes() http.Handler {
 	workflows.HandleFunc("GET /v1/workflows/{workflow_id}/versions/{version}", s.getWorkflowVersion)
 
 	root := http.NewServeMux()
+	root.Handle("/v1/computer-token/mint", s.authenticateFabric(http.HandlerFunc(s.mintComputerToken)))
+	root.Handle("/v1/computer-token/revoke", s.authenticateFabric(http.HandlerFunc(s.revokeComputerTokens)))
+	root.Handle("/v1/computer-token/revoke-attempt", s.authenticateFabric(http.HandlerFunc(s.revokeComputerAttemptTokens)))
+	root.Handle("/v1/computer-token/revoke-host", s.authenticateFabric(http.HandlerFunc(s.revokeHostComputerTokens)))
+	root.Handle("/v1/computer/self", s.authenticateFabric(s.authorize(http.HandlerFunc(s.getComputerSelf))))
 	root.Handle("/v1/runs", s.authenticateFabric(s.authorize(runs)))
 	root.Handle("/v1/runs/", s.authenticateFabric(s.authorize(runs)))
 	root.Handle("/v1/workflows/", s.authenticateFabric(s.authorize(s.requireCaller(workflows))))
@@ -125,6 +145,10 @@ func (s *Server) getRunExecution(w http.ResponseWriter, r *http.Request) {
 			writeError(w, protocolError(contract.ErrorForbidden, "run token cannot read an ancestor or sibling run"))
 			return
 		}
+	} else if scope, ok := computerTokenFromRequest(r); ok {
+		_ = scope
+		writeError(w, protocolError(contract.ErrorForbidden, "Computer tokens are not authorized to inspect Run execution"))
+		return
 	}
 	projection, err := s.store.GetRunExecution(r.Context(), runID)
 	if err != nil {
@@ -169,11 +193,34 @@ func (s *Server) authorize(next http.Handler) http.Handler {
 				return
 			}
 			scope, err := s.store.AuthenticateRunToken(r.Context(), token)
-			if err != nil {
+			if err == nil {
+				ctx := context.WithValue(r.Context(), runTokenContextKey{}, scope)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+			if code, _ := errorDetails(err); code != contract.ErrorUnauthorized {
 				writeError(w, err)
 				return
 			}
-			ctx := context.WithValue(r.Context(), runTokenContextKey{}, scope)
+			computerScope, computerErr := s.store.AuthenticateComputerToken(r.Context(), token)
+			if computerErr != nil {
+				if code, _ := errorDetails(computerErr); code != contract.ErrorUnauthorized {
+					writeError(w, computerErr)
+					return
+				}
+				writeError(w, protocolError(contract.ErrorUnauthorized, "bearer token is invalid"))
+				return
+			}
+			identity := identityFromRequest(r)
+			if strings.TrimSpace(identity.NodeID) == "" || identity.NodeID != computerScope.HostNodeID {
+				writeError(w, protocolError(contract.ErrorUnauthorized, "Computer token is bound to another Fabric node"))
+				return
+			}
+			if err := s.verifyComputerScope(r.Context(), computerScope, identity.NodeID); err != nil {
+				writeError(w, err)
+				return
+			}
+			ctx := context.WithValue(r.Context(), computerTokenContextKey{}, computerScope)
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
@@ -194,6 +241,10 @@ func (s *Server) requireCaller(next http.Handler) http.Handler {
 			writeError(w, protocolError(contract.ErrorForbidden, "run tokens are not authorized for workflow administration"))
 			return
 		}
+		if _, ok := computerTokenFromRequest(r); ok {
+			writeError(w, protocolError(contract.ErrorForbidden, "Computer tokens are not authorized for workflow administration"))
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -208,11 +259,150 @@ func runTokenFromRequest(r *http.Request) (RunTokenScope, bool) {
 	return scope, ok
 }
 
+func computerTokenFromRequest(r *http.Request) (ComputerTokenScope, bool) {
+	scope, ok := r.Context().Value(computerTokenContextKey{}).(ComputerTokenScope)
+	return scope, ok
+}
+
 func actorFromIdentity(identity fabric.Identity) string {
 	if strings.TrimSpace(identity.UserID) != "" {
 		return identity.UserID
 	}
 	return identity.NodeID
+}
+
+func (s *Server) mintComputerToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, protocolError(contract.ErrorNotFound, "route was not found"))
+		return
+	}
+	identity := identityFromRequest(r)
+	if strings.TrimSpace(identity.NodeID) == "" {
+		writeError(w, protocolError(contract.ErrorForbidden, "Computer token minting requires an authenticated Node agent"))
+		return
+	}
+	if s.computerGrants == nil {
+		writeError(w, internalError(errors.New("L1 Computer grant verifier is not configured"), "mint Computer token"))
+		return
+	}
+	var request ComputerTokenMintRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	proof, err := s.computerGrants.ProveComputerTokenScope(r.Context(), request.ComputerID, request.ComputerAttemptID, identity.NodeID, "")
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	grant, err := s.store.MintComputerToken(r.Context(), proof)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, grant)
+}
+
+func (s *Server) revokeComputerTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, protocolError(contract.ErrorNotFound, "route was not found"))
+		return
+	}
+	if identityFromRequest(r).NodeID != s.controlPlaneNodeID {
+		writeError(w, protocolError(contract.ErrorForbidden, "only the L1 control plane may revoke Computer grants administratively"))
+		return
+	}
+	var request ComputerTokenRevocationRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.store.RevokeComputerTokens(r.Context(), request); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) revokeComputerAttemptTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, protocolError(contract.ErrorNotFound, "route was not found"))
+		return
+	}
+	identity := identityFromRequest(r)
+	if strings.TrimSpace(identity.NodeID) == "" {
+		writeError(w, protocolError(contract.ErrorForbidden, "Computer attempt revocation requires an authenticated Node agent"))
+		return
+	}
+	var request ComputerAttemptTokenRevocationRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.store.RevokeComputerAttemptTokens(r.Context(), request.ComputerID, request.ComputerAttemptID, identity.NodeID, request.Reason); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) revokeHostComputerTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, protocolError(contract.ErrorNotFound, "route was not found"))
+		return
+	}
+	identity := identityFromRequest(r)
+	if strings.TrimSpace(identity.NodeID) == "" {
+		writeError(w, protocolError(contract.ErrorForbidden, "host revocation requires an authenticated Node agent"))
+		return
+	}
+	var request HostComputerTokenRevocationRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.store.RevokeHostComputerTokens(r.Context(), identity.NodeID, request.Reason); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) getComputerSelf(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, protocolError(contract.ErrorNotFound, "route was not found"))
+		return
+	}
+	scope, ok := computerTokenFromRequest(r)
+	if !ok {
+		writeError(w, protocolError(contract.ErrorForbidden, "a Computer token is required"))
+		return
+	}
+	writeJSON(w, http.StatusOK, s.store.ComputerSelf(scope))
+}
+
+func (s *Server) verifyComputerScope(ctx context.Context, scope ComputerTokenScope, hostIdentityNodeID string) error {
+	if s.computerGrants == nil {
+		return internalError(errors.New("L1 Computer grant verifier is not configured"), "verify Computer token scope")
+	}
+	proof, err := s.computerGrants.ProveComputerTokenScope(ctx, scope.ComputerID, scope.ComputerAttemptID, hostIdentityNodeID, "")
+	if err != nil {
+		code, _ := errorDetails(err)
+		switch code {
+		case contract.ErrorUnauthorized, contract.ErrorForbidden, contract.ErrorNotFound,
+			contract.ErrorConflict, contract.ErrorStalePolicyRevision:
+			return protocolError(contract.ErrorUnauthorized, "Computer token scope is no longer authoritative")
+		default:
+			return err
+		}
+	}
+	if proof.ComputerID != scope.ComputerID || proof.ComputerAttemptID != scope.ComputerAttemptID ||
+		proof.ComputerStorageGeneration != scope.ComputerStorageGeneration ||
+		proof.SubmitIntentRevision != scope.SubmitIntentRevision || proof.HostNodeID != scope.HostNodeID ||
+		proof.SubmitMaxInflight != scope.SubmitMaxInflight {
+		return protocolError(contract.ErrorUnauthorized, "Computer token scope is no longer authoritative")
+	}
+	return nil
 }
 
 func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
@@ -229,6 +419,24 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		actor = "run:" + scope.RunID
+	} else if scope, ok := computerTokenFromRequest(r); ok {
+		if request.ParentRunID != "" {
+			writeError(w, protocolError(contract.ErrorForbidden, "Computer tokens may submit only root Runs"))
+			return
+		}
+		actor = "computer:" + scope.ComputerID
+		record, replayed, err := s.store.CreateRun(r.Context(), CreateRunInput{
+			IdempotencyKey: r.Header.Get("Idempotency-Key"), Actor: actor, Request: request, ComputerScope: &scope,
+			VerifyComputerScope: func(ctx context.Context, current ComputerTokenScope) error {
+				return s.verifyComputerScope(ctx, current, identity.NodeID)
+			},
+		})
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeRunAccepted(w, record, replayed)
+		return
 	}
 	record, replayed, err := s.store.CreateRun(r.Context(), CreateRunInput{
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
@@ -254,6 +462,16 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 			writeError(w, protocolError(contract.ErrorForbidden, "run token cannot read an ancestor or sibling run"))
 			return
 		}
+	} else if scope, ok := computerTokenFromRequest(r); ok {
+		allowed, err := s.store.CanComputerReadRun(r.Context(), scope, runID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if !allowed {
+			writeError(w, protocolError(contract.ErrorForbidden, "Computer token cannot read a foreign or earlier-generation Run"))
+			return
+		}
 	}
 	record, err := s.store.GetRun(r.Context(), runID)
 	if err != nil {
@@ -277,6 +495,16 @@ func (s *Server) getRunLineage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, protocolError(contract.ErrorForbidden, "run token cannot read an ancestor or sibling lineage"))
 			return
 		}
+	} else if computerScope, computerScoped := computerTokenFromRequest(r); computerScoped {
+		allowed, err := s.store.CanComputerReadRun(r.Context(), computerScope, runID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if !allowed {
+			writeError(w, protocolError(contract.ErrorForbidden, "Computer token cannot read a foreign or earlier-generation Run Lineage"))
+			return
+		}
 	}
 	lineage, err := s.store.GetLineage(r.Context(), runID)
 	if err != nil {
@@ -288,10 +516,15 @@ func (s *Server) getRunLineage(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			lineage.Descendants, err = s.filterVisibleLineage(r.Context(), scope.RunID, lineage.Descendants)
 		}
-		if err != nil {
-			writeError(w, err)
-			return
+	} else if computerScope, ok := computerTokenFromRequest(r); ok {
+		lineage.Ancestors, err = s.filterComputerVisibleLineage(r.Context(), computerScope, lineage.Ancestors)
+		if err == nil {
+			lineage.Descendants, err = s.filterComputerVisibleLineage(r.Context(), computerScope, lineage.Descendants)
 		}
+	}
+	if err != nil {
+		writeError(w, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, lineage)
 }
@@ -310,6 +543,16 @@ func (s *Server) getRunLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		if !allowed {
 			writeError(w, protocolError(contract.ErrorForbidden, "run token cannot read an ancestor or sibling run"))
+			return
+		}
+	} else if scope, ok := computerTokenFromRequest(r); ok {
+		allowed, err := s.store.CanComputerReadRun(r.Context(), scope, runID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if !allowed {
+			writeError(w, protocolError(contract.ErrorForbidden, "Computer token cannot read foreign or earlier-generation logs"))
 			return
 		}
 	}
@@ -350,7 +593,25 @@ func parseRunLogLimit(value string) (int, error) {
 func (s *Server) filterVisibleLineage(ctx context.Context, ownerRunID string, entries []LineageEntry) ([]LineageEntry, error) {
 	visible := make([]LineageEntry, 0, len(entries))
 	for _, entry := range entries {
-		allowed, err := s.store.CanReadRun(ctx, ownerRunID, entry.RunID)
+		authorize := s.store.CanReadRun
+		if s.filterRunVisibility != nil {
+			authorize = s.filterRunVisibility
+		}
+		allowed, err := authorize(ctx, ownerRunID, entry.RunID)
+		if err != nil {
+			return nil, err
+		}
+		if allowed {
+			visible = append(visible, entry)
+		}
+	}
+	return visible, nil
+}
+
+func (s *Server) filterComputerVisibleLineage(ctx context.Context, scope ComputerTokenScope, entries []LineageEntry) ([]LineageEntry, error) {
+	visible := make([]LineageEntry, 0, len(entries))
+	for _, entry := range entries {
+		allowed, err := s.store.CanComputerReadRun(ctx, scope, entry.RunID)
 		if err != nil {
 			return nil, err
 		}
@@ -412,6 +673,10 @@ func (s *Server) rerun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocolError(contract.ErrorForbidden, "run tokens are not authorized to rerun terminal snapshots"))
 		return
 	}
+	if _, ok := computerTokenFromRequest(r); ok {
+		writeError(w, protocolError(contract.ErrorForbidden, "Computer tokens are not authorized to rerun terminal snapshots"))
+		return
+	}
 	identity := identityFromRequest(r)
 	record, replayed, err := s.store.CreateRerun(r.Context(), CreateRerunInput{
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
@@ -425,7 +690,11 @@ func (s *Server) rerun(w http.ResponseWriter, r *http.Request) {
 	writeRunAccepted(w, record, replayed)
 }
 
-func (s *Server) notImplemented(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) notImplemented(w http.ResponseWriter, r *http.Request) {
+	if _, ok := computerTokenFromRequest(r); ok {
+		writeError(w, protocolError(contract.ErrorForbidden, "Computer tokens are not authorized for this operation"))
+		return
+	}
 	writeError(w, protocolError(contract.ErrorNotImplemented, "operation is reserved for a future version"))
 }
 
@@ -538,6 +807,9 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusNotImplemented
 	case contract.ErrorInternal:
 		status = http.StatusInternalServerError
+		if apiError.Retryable {
+			status = http.StatusServiceUnavailable
+		}
 	}
 	if code == contract.ErrorInternal {
 		apiError.Message = "internal server error"

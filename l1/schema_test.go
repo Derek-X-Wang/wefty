@@ -39,7 +39,13 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 		"computers": {
 			"computer_id", "name", "placement_node_id", "bound_node_id", "grants_json", "storage_id",
 			"storage_generation", "desired_state", "intent_revision", "applied_revision", "current_job_id",
-			"current_spec_revision", "reconfiguration_phase", "reconfiguration_revision", "created_ns", "updated_ns",
+			"current_spec_revision", "reconfiguration_phase", "reconfiguration_revision", "submit_enabled",
+			"submit_intent_revision", "submit_max_inflight", "submit_policy_revision", "created_ns", "updated_ns",
+		},
+		"computer_submission_audit": {
+			"computer_id", "submit_intent_revision", "policy_revision", "actor_fabric_id", "actor_user_id",
+			"actor_device_id", "previous_enabled", "submit_enabled", "submit_max_inflight", "idempotency_key",
+			"request_hash", "created_ns",
 		},
 		"computer_job_projections": {
 			"computer_id", "job_id", "spec_revision", "current", "created_ns", "retired_ns",
@@ -165,7 +171,12 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 			reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'removing')),
 			reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0), created_ns INTEGER NOT NULL, updated_ns INTEGER NOT NULL
 			);
-		INSERT INTO computers_old_constraint SELECT * FROM computers;
+		INSERT INTO computers_old_constraint(computer_id, name, placement_node_id, bound_node_id, grants_json,
+			storage_id, storage_generation, desired_state, intent_revision, applied_revision, current_job_id,
+			current_spec_revision, reconfiguration_phase, reconfiguration_revision, created_ns, updated_ns)
+		SELECT computer_id, name, placement_node_id, bound_node_id, grants_json, storage_id,
+			storage_generation, desired_state, intent_revision, applied_revision, current_job_id,
+			current_spec_revision, reconfiguration_phase, reconfiguration_revision, created_ns, updated_ns FROM computers;
 		DROP TABLE computers;
 		ALTER TABLE computers_old_constraint RENAME TO computers;
 		CREATE INDEX computers_binding ON computers(bound_node_id, desired_state);

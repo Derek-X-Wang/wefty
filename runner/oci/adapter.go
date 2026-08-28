@@ -716,6 +716,17 @@ func (adapter *Adapter) SetComputerControlState(ctx context.Context, authority w
 	})
 }
 
+func (adapter *Adapter) SetComputerToken(ctx context.Context, authority workloadrunner.AttemptAuthority, token string) error {
+	if adapter == nil || adapter.sessions == nil {
+		return errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return err
+	}
+	return session.SetComputerToken(ctx, ocihelper.SetComputerTokenRequest{Authority: HelperAuthority(authority), Token: token})
+}
+
 func (adapter *Adapter) probePlatform(session *ocihelper.Session) (ocihelper.OCIPlatform, bool) {
 	adapter.mu.Lock()
 	defer adapter.mu.Unlock()
@@ -1751,6 +1762,9 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 	}
 	if value, ok := request.Execution.SensitiveEnv[contract.EnvRunToken]; ok && contract.IsOCISensitiveReservedEnvironmentName(contract.EnvRunToken) {
 		input.RunToken = value
+	}
+	if value, ok := request.Execution.SensitiveEnv[contract.EnvComputerToken]; ok && contract.IsOCISensitiveReservedEnvironmentName(contract.EnvComputerToken) {
+		input.ComputerToken = value
 	}
 	for _, mount := range execution.Mounts {
 		input.OperatorMounts = append(input.OperatorMounts, ocihelper.OperatorMount{NodePath: mount.NodePath, ContainerPath: mount.ContainerPath, ReadOnly: mount.ReadOnly})

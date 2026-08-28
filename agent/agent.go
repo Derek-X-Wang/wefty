@@ -15,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -85,9 +86,11 @@ type Config struct {
 	// OCIWorkflowBridgeBinder binds the guest-visible host bridge for Lima.
 	// Nil preserves the native loopback bridge used by process and Linux OCI.
 	OCIWorkflowBridgeBinder workloadrunner.WorkflowBridgeBinder
-	OutputSinkFactory       OutputSinkFactory
-	HandoffRoot             string
-	HandoffRetention        time.Duration
+	// ComputerTokenMinter may be injected for tests. Nil creates the Fabric-only L3 client.
+	ComputerTokenMinter ComputerTokenMinter
+	OutputSinkFactory   OutputSinkFactory
+	HandoffRoot         string
+	HandoffRetention    time.Duration
 	// Logf need not be goroutine-safe. Agent serializes calls made through it.
 	Logf  func(string, ...any)
 	Clock Clock
@@ -105,18 +108,20 @@ type Agent struct {
 	outbox              *evidenceOutbox
 	// logSpool is a compatibility view used by existing package tests. The
 	// process-lifetime evidenceOutbox is its sole owner.
-	logSpool          *logSpool
-	runtimes          workloadRuntimeSet
-	managedResource   managedResourceManager
-	outputSinkFactory OutputSinkFactory
-	handoffs          *handoffManager
-	logf              func(string, ...any)
-	clock             Clock
-	observer          *lifecycleObserver
-	capabilities      *capabilityState
-	attemptDeadman    AttemptDeadmanRenewer
-	ociBridgeBinder   workloadrunner.WorkflowBridgeBinder
-	nodeLock          nodeLock
+	logSpool            *logSpool
+	runtimes            workloadRuntimeSet
+	managedResource     managedResourceManager
+	outputSinkFactory   OutputSinkFactory
+	handoffs            *handoffManager
+	logf                func(string, ...any)
+	clock               Clock
+	observer            *lifecycleObserver
+	capabilities        *capabilityState
+	attemptDeadman      AttemptDeadmanRenewer
+	ociBridgeBinder     workloadrunner.WorkflowBridgeBinder
+	computerTokens      ComputerTokenMinter
+	computerTokenCloser interface{ Close() }
+	nodeLock            nodeLock
 }
 
 func New(config Config) (*Agent, error) {
@@ -157,6 +162,24 @@ func New(config Config) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
+	computerTokens := config.ComputerTokenMinter
+	var computerTokenCloser interface{ Close() }
+	if computerTokens == nil {
+		tokenClient, tokenErr := newComputerTokenClient(config.Fabric,
+			stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
+			durationOrDefault(config.OperationTimeout, DefaultOperationTimeout))
+		if tokenErr != nil {
+			client.Close()
+			return nil, tokenErr
+		}
+		computerTokens, computerTokenCloser = tokenClient, tokenClient
+	}
+	constructionSucceeded := false
+	defer func() {
+		if !constructionSucceeded && computerTokenCloser != nil {
+			computerTokenCloser.Close()
+		}
+	}()
 	runtimes, err := newWorkloadRuntimeSet(config.WorkloadRuntimes)
 	if err != nil {
 		client.Close()
@@ -294,6 +317,7 @@ func New(config Config) (*Agent, error) {
 		session.storageResets.finalizeVolumes = session.removals.finalizeVolumes
 		session.storageResets.attestRuntimeRemoval = session.removals.attestRuntimeRemoval
 	}
+	constructionSucceeded = true
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
 		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
@@ -304,7 +328,8 @@ func New(config Config) (*Agent, error) {
 		logf:     logf, clock: clock, observer: observer, capabilities: capabilities,
 		attemptDeadman:  config.AttemptDeadman,
 		ociBridgeBinder: config.OCIWorkflowBridgeBinder,
-		nodeLock:        stableNodeLock,
+		computerTokens:  computerTokens, computerTokenCloser: computerTokenCloser,
+		nodeLock: stableNodeLock,
 	}, nil
 }
 
@@ -319,6 +344,9 @@ func (adapter processClockAdapter) NewTimer(duration time.Duration) processrunne
 func (a *Agent) Close() {
 	if a.session != nil {
 		a.session.close()
+	}
+	if a.computerTokenCloser != nil {
+		a.computerTokenCloser.Close()
 	}
 	if a.outbox != nil {
 		if err := a.outbox.Close(); err != nil {
@@ -363,6 +391,11 @@ func (a *Agent) ComputerPolicy() *ComputerPolicyCache {
 // Run registers and then serves claims until the context is canceled or the
 // control plane rejects a liveness or execution operation.
 func (a *Agent) Run(ctx context.Context) error {
+	if revoker, ok := a.computerTokens.(ComputerTokenRevoker); ok {
+		if err := revoker.RevokeHostComputerTokens(ctx, l3.HostComputerTokenRevocationRequest{Reason: "agent_restart"}); err != nil && ctx.Err() == nil {
+			a.log("revoke prior-boot Computer tokens: %v", err)
+		}
+	}
 	if a.handoffs != nil {
 		if err := a.handoffs.cleanupExpired(""); err != nil {
 			return fmt.Errorf("agent: clean expired handoff directories: %w", err)
@@ -421,6 +454,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		recoverOCIRuntime:      a.recoverOCIRuntimeAfterLoss,
 		runtimeReaped:          a.recordRuntimeReap,
 		attemptDeadman:         a.attemptDeadman,
+		computerTokens:         a.computerTokens,
 	})
 }
 

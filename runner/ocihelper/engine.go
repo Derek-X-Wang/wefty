@@ -46,6 +46,7 @@ type ManagedVolumeEngine interface {
 
 type ComputerControlEngine interface {
 	SetComputerControlState(context.Context, SetComputerControlStateRequest) error
+	SetComputerToken(context.Context, SetComputerTokenRequest) error
 }
 
 type RemovalProofEngine interface {

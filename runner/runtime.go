@@ -348,6 +348,7 @@ const (
 // without exposing helper protocol or filesystem mechanics to the agent.
 type OCIComputerControlRuntime interface {
 	SetComputerControlState(context.Context, AttemptAuthority, bool) error
+	SetComputerToken(context.Context, AttemptAuthority, string) error
 }
 
 // Request contains the mechanics needed by any workload runtime. Kind and

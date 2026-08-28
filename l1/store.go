@@ -328,10 +328,34 @@ CREATE TABLE IF NOT EXISTS computers (
   current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
   reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'removing')),
   reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0),
+  submit_enabled INTEGER NOT NULL DEFAULT 0 CHECK(submit_enabled IN (0, 1)),
+  submit_intent_revision INTEGER NOT NULL DEFAULT 0 CHECK(submit_intent_revision >= 0),
+  submit_max_inflight INTEGER NOT NULL DEFAULT 20 CHECK(submit_max_inflight > 0),
+  submit_policy_revision INTEGER NOT NULL DEFAULT 0 CHECK(submit_policy_revision >= 0),
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS computers_binding ON computers(bound_node_id, desired_state);
+CREATE TABLE IF NOT EXISTS computer_submission_audit (
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  submit_intent_revision INTEGER NOT NULL CHECK(submit_intent_revision > 0),
+  policy_revision INTEGER NOT NULL CHECK(policy_revision > 0),
+  actor_fabric_id TEXT NOT NULL,
+  actor_user_id TEXT NOT NULL,
+  actor_device_id TEXT NOT NULL,
+  previous_enabled INTEGER NOT NULL CHECK(previous_enabled IN (0, 1)),
+  submit_enabled INTEGER NOT NULL CHECK(submit_enabled IN (0, 1)),
+  submit_max_inflight INTEGER NOT NULL CHECK(submit_max_inflight > 0),
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  created_ns INTEGER NOT NULL,
+  PRIMARY KEY(computer_id, submit_intent_revision),
+  UNIQUE(computer_id, idempotency_key)
+);
+CREATE TRIGGER IF NOT EXISTS computer_submission_audit_no_update
+BEFORE UPDATE ON computer_submission_audit BEGIN SELECT RAISE(ABORT, 'computer submission audit is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS computer_submission_audit_no_delete
+BEFORE DELETE ON computer_submission_audit BEGIN SELECT RAISE(ABORT, 'computer submission audit is immutable'); END;
 CREATE TABLE IF NOT EXISTS computer_job_projections (
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
   job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
@@ -590,6 +614,16 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	}
 	if err := s.migrateComputerResetConstraints(ctx); err != nil {
 		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"submit_enabled", "INTEGER NOT NULL DEFAULT 0 CHECK(submit_enabled IN (0, 1))"},
+		{"submit_intent_revision", "INTEGER NOT NULL DEFAULT 0 CHECK(submit_intent_revision >= 0)"},
+		{"submit_max_inflight", "INTEGER NOT NULL DEFAULT 20 CHECK(submit_max_inflight > 0)"},
+		{"submit_policy_revision", "INTEGER NOT NULL DEFAULT 0 CHECK(submit_policy_revision >= 0)"},
+	} {
+		if err := s.ensureColumn(ctx, "computers", column.name, column.definition); err != nil {
+			return err
+		}
 	}
 	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO computer_storage_generations(
 		computer_id, storage_id, storage_generation, disk_bytes, phase, created_ns
@@ -1472,9 +1506,12 @@ AND state=@job_queued
 				return nil, err
 			}
 			var storage ComputerStorageClaim
-			if err := tx.QueryRowContext(ctx, `SELECT computer_id, storage_id, storage_generation, intent_revision
+			if err := tx.QueryRowContext(ctx, `SELECT computer_id, storage_id, storage_generation, intent_revision,
+				submit_enabled, submit_intent_revision, submit_max_inflight, submit_policy_revision
 				FROM computers WHERE computer_id=? AND current_job_id=?`, computerID, jobID).
-				Scan(&storage.ComputerID, &storage.StorageID, &storage.StorageGeneration, &storage.IntentRevision); err != nil {
+				Scan(&storage.ComputerID, &storage.StorageID, &storage.StorageGeneration, &storage.IntentRevision,
+					&storage.SubmitEnabled, &storage.SubmitIntentRevision, &storage.SubmitMaxInflight,
+					&storage.SubmitPolicyRevision); err != nil {
 				return nil, internalError(err, "read claimed Computer Storage identity")
 			}
 			computerStorage = &storage
