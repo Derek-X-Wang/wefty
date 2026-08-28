@@ -243,6 +243,13 @@ func (tenure *controllerTenure) Release(ctx context.Context, sessionID string, r
 			return nil
 		}
 		holder := tenure.held
+		select {
+		case <-holder.session.context.Done():
+			// The session authority owns the release reason once it has ended,
+			// even when its lifetime closure is first observed as backend EOF.
+			reason = computerSessionEndReason(holder.session.context, reason)
+		default:
+		}
 		operationContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), controllerTenureFinalizationLimit)
 		operation := &controllerOperation{sessionID: sessionID, context: operationContext, cancel: cancel, done: make(chan struct{})}
 		tenure.held = nil

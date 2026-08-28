@@ -297,6 +297,25 @@ func TestControllerTenureControlLegOutlivesTakeActionButNotSession(t *testing.T)
 	}
 }
 
+func TestControllerTenureEndedSessionOwnsConcurrentBackendFailureReason(t *testing.T) {
+	fixture := newControllerTenureFixture(t)
+	sessionContext, endSession := context.WithCancelCause(t.Context())
+	session := fixture.session("driver", true, false, sessionContext)
+	backend, peer := net.Pipe()
+	defer peer.Close()
+	managed := newControllerConn(backend, nil, fixture.tenure, session.id)
+	fixture.tenure.held = &controllerHolder{session: session, serial: 1, conn: managed}
+	endSession(&computerSessionEnd{reason: l1.ComputerTakeoverAttemptAuthorityLost})
+
+	if err := fixture.tenure.Release(t.Context(), session.id, l1.ComputerTakeoverControlBackendClosed); err != nil {
+		t.Fatal(err)
+	}
+	events := fixture.eventSnapshot()
+	if len(events) != 1 || events[0].Kind != l1.ComputerTakeoverControlReleased || events[0].Reason != l1.ComputerTakeoverAttemptAuthorityLost {
+		t.Fatalf("ended-session backend release audit = %#v", events)
+	}
+}
+
 func TestControllerTenureAdminOverrideObservesOldLegAndPreservesTrueSignal(t *testing.T) {
 	fixture := newControllerTenureFixture(t)
 	first := fixture.register(t, "first", true, false)
