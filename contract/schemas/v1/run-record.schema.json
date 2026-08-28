@@ -30,10 +30,33 @@
       "additionalProperties": false,
       "required": ["type", "principal"],
       "properties": {
-        "type": { "enum": ["manual", "chain", "rerun"] },
+        "type": { "enum": ["manual", "chain", "rerun", "computer"] },
         "principal": { "type": "string", "minLength": 1 },
-        "source_run_id": { "$ref": "#/$defs/id" }
-      }
+        "source_run_id": { "$ref": "#/$defs/id" },
+        "computer_id": { "$ref": "#/$defs/id" },
+        "computer_attempt_id": { "$ref": "#/$defs/id" },
+        "computer_storage_generation": { "type": "integer", "minimum": 1 },
+        "submit_intent_revision": { "type": "integer", "minimum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "computer" } }, "required": ["type"] },
+          "then": {
+            "required": ["computer_id", "computer_attempt_id", "computer_storage_generation", "submit_intent_revision"],
+            "not": { "required": ["source_run_id"] }
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["computer_id"] },
+                { "required": ["computer_attempt_id"] },
+                { "required": ["computer_storage_generation"] },
+                { "required": ["submit_intent_revision"] }
+              ]
+            }
+          }
+        }
+      ]
     },
     "workflow": {
       "type": "object",

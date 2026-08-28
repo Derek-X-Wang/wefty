@@ -262,7 +262,7 @@ func policySnapshot(t *testing.T, issued time.Time, generation, revision int64, 
 	}
 	snapshot := l1.ComputerPolicySnapshot{PolicyGeneration: generation, PolicyRevision: revision,
 		IssuingFabricID: "fabric-one", NodeID: "node-1", BootSessionID: "boot-1", IssuedAt: issued, FreshUntil: issued.Add(10 * time.Minute),
-		Admins: admins, Computers: []l1.ComputerPolicyComputer{{ComputerID: "computer-1", Grants: grants}}}
+		Admins: admins, Computers: []l1.ComputerPolicyComputer{{ComputerID: "computer-1", Grants: grants, SubmitMaxInflight: l1.DefaultComputerSubmitMaxInflight}}}
 	if snapshot.Admins == nil {
 		snapshot.Admins = []l1.ComputerPolicyAdmin{}
 	}

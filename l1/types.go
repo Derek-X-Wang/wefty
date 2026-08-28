@@ -204,10 +204,26 @@ type Claim struct {
 // ComputerStorageClaim is the exact durable Storage identity a claimed
 // Computer projection may attach. It is absent for every ordinary Job.
 type ComputerStorageClaim struct {
-	ComputerID        string `json:"computer_id"`
-	StorageID         string `json:"storage_id"`
-	StorageGeneration int64  `json:"storage_generation"`
-	IntentRevision    int64  `json:"intent_revision"`
+	ComputerID           string `json:"computer_id"`
+	StorageID            string `json:"storage_id"`
+	StorageGeneration    int64  `json:"storage_generation"`
+	IntentRevision       int64  `json:"intent_revision"`
+	SubmitEnabled        bool   `json:"submit_enabled"`
+	SubmitIntentRevision int64  `json:"submit_intent_revision"`
+	SubmitMaxInflight    int    `json:"submit_max_inflight"`
+	SubmitPolicyRevision int64  `json:"submit_policy_revision"`
+}
+
+// ComputerTokenScopeProof is returned only after L1 has verified the exact
+// current Computer projection, attempt, Node, Storage generation, submission
+// intent, and installed grant-policy revision.
+type ComputerTokenScopeProof struct {
+	ComputerID                string `json:"computer_id"`
+	ComputerAttemptID         string `json:"computer_attempt_id"`
+	ComputerStorageGeneration int64  `json:"computer_storage_generation"`
+	SubmitIntentRevision      int64  `json:"submit_intent_revision"`
+	HostNodeID                string `json:"host_node_id"`
+	SubmitMaxInflight         int    `json:"submit_max_inflight"`
 }
 
 // Node is the node projection shared by the operator list and agent protocol.

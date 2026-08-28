@@ -77,8 +77,11 @@ func validateWorkloadWire(input WorkloadInput) error {
 			return err
 		}
 	}
-	if strings.IndexByte(input.L3Endpoint, 0) >= 0 || strings.IndexByte(input.RunToken, 0) >= 0 {
+	if strings.IndexByte(input.L3Endpoint, 0) >= 0 || strings.IndexByte(input.RunToken, 0) >= 0 || strings.IndexByte(input.ComputerToken, 0) >= 0 {
 		return errors.New("helper environment minting inputs contain NUL")
+	}
+	if input.ComputerToken != "" && !input.Computer {
+		return errors.New("Computer token requires a Computer workload")
 	}
 	if input.Limits.MemoryBytes < 0 || input.Limits.CPUMillicores < 0 {
 		return errors.New("workload limits must not be negative")

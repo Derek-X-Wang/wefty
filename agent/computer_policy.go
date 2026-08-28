@@ -108,6 +108,19 @@ type ComputerPolicyInstallReceipt struct {
 	SessionsClosed  <-chan struct{}
 }
 
+type ComputerSubmissionAuthority struct {
+	ComputerID           string
+	Enabled              bool
+	SubmitIntentRevision int64
+	SubmitMaxInflight    int
+	SubmitPolicyRevision int64
+}
+
+type computerSubmissionSubscription struct {
+	computerID string
+	updates    chan ComputerSubmissionAuthority
+}
+
 type computerPolicyDrainBarrier struct {
 	mu        sync.Mutex
 	remaining int
@@ -148,14 +161,67 @@ type ComputerPolicyCache struct {
 	highRevision   int64
 	installSerial  uint64
 	nextAuthID     uint64
+	nextSubmitID   uint64
 	authorizations map[uint64]*ComputerGrantAuthorization
+	submitWatchers map[uint64]computerSubmissionSubscription
 	closed         chan struct{}
 	closeOnce      sync.Once
 }
 
 func NewComputerPolicyCache(clock Clock, nodeID, bootSessionID string) *ComputerPolicyCache {
 	return &ComputerPolicyCache{clock: clock, nodeID: nodeID, bootSessionID: bootSessionID,
-		authorizations: make(map[uint64]*ComputerGrantAuthorization), closed: make(chan struct{})}
+		authorizations: make(map[uint64]*ComputerGrantAuthorization),
+		submitWatchers: make(map[uint64]computerSubmissionSubscription), closed: make(chan struct{})}
+}
+
+func (cache *ComputerPolicyCache) SubscribeComputerSubmission(computerID string) (ComputerSubmissionAuthority, <-chan ComputerSubmissionAuthority, func()) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	cache.expireIfNeededLocked()
+	cache.nextSubmitID++
+	id := cache.nextSubmitID
+	updates := make(chan ComputerSubmissionAuthority, 1)
+	cache.submitWatchers[id] = computerSubmissionSubscription{computerID: computerID, updates: updates}
+	current := cache.submissionAuthorityLocked(computerID)
+	return current, updates, func() {
+		cache.mu.Lock()
+		watcher, ok := cache.submitWatchers[id]
+		if ok {
+			delete(cache.submitWatchers, id)
+			close(watcher.updates)
+		}
+		cache.mu.Unlock()
+	}
+}
+
+func (cache *ComputerPolicyCache) submissionAuthorityLocked(computerID string) ComputerSubmissionAuthority {
+	authority := ComputerSubmissionAuthority{ComputerID: computerID}
+	if !cache.valid {
+		return authority
+	}
+	for _, computer := range cache.snapshot.Computers {
+		if computer.ComputerID == computerID {
+			return ComputerSubmissionAuthority{ComputerID: computerID, Enabled: computer.SubmitEnabled,
+				SubmitIntentRevision: computer.SubmitIntentRevision, SubmitMaxInflight: computer.SubmitMaxInflight,
+				SubmitPolicyRevision: computer.SubmitPolicyRevision}
+		}
+	}
+	return authority
+}
+
+func (cache *ComputerPolicyCache) notifyComputerSubmissionLocked() {
+	for _, watcher := range cache.submitWatchers {
+		next := cache.submissionAuthorityLocked(watcher.computerID)
+		select {
+		case watcher.updates <- next:
+		default:
+			select {
+			case <-watcher.updates:
+			default:
+			}
+			watcher.updates <- next
+		}
+	}
 }
 
 func (cache *ComputerPolicyCache) Revision() int64 {
@@ -291,6 +357,7 @@ func (cache *ComputerPolicyCache) Install(snapshot l1.ComputerPolicySnapshot) (C
 	cache.highGeneration = snapshot.PolicyGeneration
 	cache.highRevision = snapshot.PolicyRevision
 	cache.installSerial++
+	cache.notifyComputerSubmissionLocked()
 	serial := cache.installSerial
 	cache.scheduleExpiryLocked(serial, snapshot.FreshUntil)
 	return ComputerPolicyInstallReceipt{Acknowledgement: l1.ComputerPolicyInstallAcknowledgement{
@@ -312,24 +379,39 @@ func validateSameRevisionPolicy(current, next l1.ComputerPolicySnapshot) error {
 			return errors.New("agent: Computer policy changed administrators without a revision")
 		}
 	}
-	currentComputers := make(map[string]map[string]l1.ComputerGrantPermission, len(current.Computers))
+	type computerAuthority struct {
+		grants         map[string]l1.ComputerGrantPermission
+		enabled        bool
+		intentRevision int64
+		maxInflight    int
+		policyRevision int64
+	}
+	currentComputers := make(map[string]computerAuthority, len(current.Computers))
 	for _, computer := range current.Computers {
 		grants := make(map[string]l1.ComputerGrantPermission, len(computer.Grants))
 		for _, grant := range computer.Grants {
 			grants[grant.FabricID+"\x00"+grant.UserID] = grant.Permission
 		}
-		currentComputers[computer.ComputerID] = grants
+		currentComputers[computer.ComputerID] = computerAuthority{grants: grants, enabled: computer.SubmitEnabled,
+			intentRevision: computer.SubmitIntentRevision, maxInflight: computer.SubmitMaxInflight,
+			policyRevision: computer.SubmitPolicyRevision}
 	}
 	for _, computer := range next.Computers {
-		currentGrants, existed := currentComputers[computer.ComputerID]
+		currentAuthority, existed := currentComputers[computer.ComputerID]
 		if !existed {
 			continue
 		}
-		if len(currentGrants) != len(computer.Grants) {
+		if currentAuthority.enabled != computer.SubmitEnabled ||
+			currentAuthority.intentRevision != computer.SubmitIntentRevision ||
+			currentAuthority.maxInflight != computer.SubmitMaxInflight ||
+			currentAuthority.policyRevision != computer.SubmitPolicyRevision {
+			return errors.New("agent: Computer submission authority changed without a revision")
+		}
+		if len(currentAuthority.grants) != len(computer.Grants) {
 			return errors.New("agent: Computer grants changed without a revision")
 		}
 		for _, grant := range computer.Grants {
-			if currentGrants[grant.FabricID+"\x00"+grant.UserID] != grant.Permission {
+			if currentAuthority.grants[grant.FabricID+"\x00"+grant.UserID] != grant.Permission {
 				return errors.New("agent: Computer grants changed without a revision")
 			}
 		}
@@ -368,6 +450,7 @@ func (cache *ComputerPolicyCache) invalidateLocked(reason ComputerPolicyRevocati
 	}
 	cache.valid = false
 	cache.installSerial++
+	cache.notifyComputerSubmissionLocked()
 	for _, authorization := range cache.authorizations {
 		notifyAuthorization(authorization, ComputerPolicyRevocation{Reason: reason,
 			PolicyRevision: cache.snapshot.PolicyRevision, Permission: l1.ComputerGrantNone})
@@ -421,5 +504,11 @@ func (cache *ComputerPolicyCache) Close() {
 	cache.closeOnce.Do(func() {
 		close(cache.closed)
 		cache.Invalidate(ComputerPolicyWatchLost)
+		cache.mu.Lock()
+		for id, watcher := range cache.submitWatchers {
+			delete(cache.submitWatchers, id)
+			close(watcher.updates)
+		}
+		cache.mu.Unlock()
 	})
 }

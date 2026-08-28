@@ -2058,6 +2058,10 @@ func (engine *fakeEngine) SetComputerControlState(_ context.Context, request Set
 	engine.mu.Unlock()
 	return nil
 }
+func (engine *fakeEngine) SetComputerToken(_ context.Context, _ SetComputerTokenRequest) error {
+	engine.record("SetComputerToken")
+	return nil
+}
 func (engine *fakeEngine) Watch(_ context.Context, _ WatchRequest, emit func(WatchEvent) error) error {
 	engine.record("Watch")
 	exitCode := 0

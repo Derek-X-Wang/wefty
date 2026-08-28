@@ -683,6 +683,7 @@ func TestWorkloadInputMakesManagedVolumeMountsAuthoritative(t *testing.T) {
 
 func TestWorkloadInputMakesWeftyBridgeAndTokenHelperAuthoritative(t *testing.T) {
 	request := adapterTestRequest()
+	request.Execution.OCI.Computer = &contract.OCIComputerSpec{DiskBytes: 8 << 30}
 	request.Execution.Env = map[string]string{
 		"PUBLIC": "value", contract.EnvL3Endpoint: "http://host.lima.internal:43100/l3",
 		contract.EnvRunToken: "public-layer-attacker", contract.EnvComputerToken: "public-computer-attacker",
@@ -696,8 +697,10 @@ func TestWorkloadInputMakesWeftyBridgeAndTokenHelperAuthoritative(t *testing.T) 
 		len(input.SensitiveEnvironment) != 1 || input.SensitiveEnvironment[0].Name != "OPERATOR_SECRET" {
 		t.Fatalf("operator environment was not separated: public=%+v sensitive=%+v", input.Environment, input.SensitiveEnvironment)
 	}
-	if len(input.ReservedEnvironment) != 0 || input.L3Endpoint != "http://host.lima.internal:43100/l3" || input.RunToken != "secret-token" {
-		t.Fatalf("helper minting inputs: reserved=%+v l3=%q token=%q", input.ReservedEnvironment, input.L3Endpoint, input.RunToken)
+	if len(input.ReservedEnvironment) != 0 || input.L3Endpoint != "http://host.lima.internal:43100/l3" ||
+		input.RunToken != "secret-token" || input.ComputerToken != "unminted-computer-token" {
+		t.Fatalf("helper minting inputs: reserved=%+v l3=%q run=%q computer=%q", input.ReservedEnvironment,
+			input.L3Endpoint, input.RunToken, input.ComputerToken)
 	}
 }
 

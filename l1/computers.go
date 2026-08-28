@@ -87,6 +87,10 @@ type Computer struct {
 	CurrentSpecRevision     int64                        `json:"current_spec_revision"`
 	ReconfigurationPhase    ComputerReconfigurationPhase `json:"reconfiguration_phase"`
 	ReconfigurationRevision *int64                       `json:"reconfiguration_revision,omitempty"`
+	SubmitEnabled           bool                         `json:"submit_enabled"`
+	SubmitIntentRevision    int64                        `json:"submit_intent_revision"`
+	SubmitMaxInflight       int                          `json:"submit_max_inflight"`
+	SubmitPolicyRevision    int64                        `json:"submit_policy_revision"`
 	// DisplayEndpoint remains explicitly null until an active private
 	// take-over front door has been published. It is never a placeholder URL.
 	DisplayEndpoint *string   `json:"display_endpoint"`
@@ -400,6 +404,18 @@ func (s *Store) GetComputer(ctx context.Context, computerID string) (Computer, e
 	return computer, nil
 }
 
+func (s *Store) ComputerIDForJob(ctx context.Context, jobID string) (string, error) {
+	var computerID string
+	err := s.db.QueryRowContext(ctx, `SELECT computer_id FROM computer_job_projections WHERE job_id=?`, jobID).Scan(&computerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", internalError(err, "resolve Computer for Job")
+	}
+	return computerID, nil
+}
+
 func readComputerByJobID(ctx context.Context, q queryer, jobID string, now time.Time) (Computer, error) {
 	var computerID string
 	if err := q.QueryRowContext(ctx, `SELECT computer_id FROM computer_job_projections WHERE job_id=?`, jobID).Scan(&computerID); err != nil {
@@ -420,13 +436,15 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	err := q.QueryRowContext(ctx, `SELECT computer_id, name, placement_node_id, bound_node_id,
 		grants_json, storage_id, storage_generation, desired_state, intent_revision,
 		applied_revision, current_job_id, current_spec_revision, reconfiguration_phase,
-		reconfiguration_revision, created_ns, updated_ns
+		reconfiguration_revision, submit_enabled, submit_intent_revision, submit_max_inflight,
+		submit_policy_revision, created_ns, updated_ns
 		FROM computers WHERE computer_id=?`, computerID).Scan(
 		&computer.ComputerID, &computer.Name, &computer.PlacementNodeID, &boundNodeID,
 		&grantsJSON, &computer.StorageID, &computer.StorageGeneration, &computer.DesiredState,
 		&computer.IntentRevision, &computer.AppliedRevision, &computer.CurrentJobID,
 		&computer.CurrentSpecRevision, &computer.ReconfigurationPhase,
-		&reconfigurationRevision, &createdNS, &updatedNS)
+		&reconfigurationRevision, &computer.SubmitEnabled, &computer.SubmitIntentRevision,
+		&computer.SubmitMaxInflight, &computer.SubmitPolicyRevision, &createdNS, &updatedNS)
 	if err != nil {
 		return Computer{}, err
 	}

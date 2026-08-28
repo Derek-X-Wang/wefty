@@ -21,6 +21,69 @@
         }
       }
     },
+    "/v1/computers/{computer_id}/submission": {
+      "parameters": [{ "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
+      "put": {
+        "operationId": "mutateComputerSubmission",
+        "summary": "Enable, disable, or resize Computer Run submission",
+        "description": "Current administrators only. The revisioned intent defaults disabled with max 20. L3 revocation is committed before this operation reports success, and each accepted mutation advances the globally distributed policy revision.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["policy_revision", "submit_intent_revision", "submit_enabled", "submit_max_inflight", "idempotency_key"],
+          "properties": {
+            "policy_revision": { "type": "integer", "minimum": 1 },
+            "submit_intent_revision": { "type": "integer", "minimum": 0 },
+            "submit_enabled": { "type": "boolean" },
+            "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 20 },
+            "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 255 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Submission intent accepted or replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/token-scope-proof": {
+      "parameters": [{ "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
+      "post": {
+        "operationId": "proveComputerTokenScope",
+        "summary": "Prove the live L1 authority for one Computer attempt",
+        "description": "L3-only Fabric client seam. Proof requires the current projection, live lease, exact host Node and current installed submission-policy revision.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false, "required": ["computer_attempt_id"],
+          "properties": {
+            "computer_attempt_id": { "type": "string", "minLength": 1 },
+            "host_identity_node_id": { "type": "string", "minLength": 1, "description": "Authenticated agent Fabric Node identity used only while minting." },
+            "host_node_id": { "type": "string", "minLength": 1, "description": "Stable Node identity already bound into a grant, used only while revalidating." }
+          },
+          "oneOf": [
+            { "required": ["host_identity_node_id"], "not": { "required": ["host_node_id"] } },
+            { "required": ["host_node_id"], "not": { "required": ["host_identity_node_id"] } }
+          ]
+        } } } },
+        "responses": {
+          "200": { "description": "Authoritative current scope.", "content": { "application/json": { "schema": {
+            "type": "object", "additionalProperties": false,
+            "required": ["computer_id", "computer_attempt_id", "computer_storage_generation", "submit_intent_revision", "host_node_id", "submit_max_inflight"],
+            "properties": {
+              "computer_id": { "type": "string" }, "computer_attempt_id": { "type": "string" },
+              "computer_storage_generation": { "type": "integer", "minimum": 1 },
+              "submit_intent_revision": { "type": "integer", "minimum": 1 },
+              "host_node_id": { "type": "string" }, "submit_max_inflight": { "type": "integer", "minimum": 1 }
+            }
+          } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/jobs": {
       "post": {
         "operationId": "createJob",

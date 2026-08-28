@@ -431,6 +431,10 @@ func (session *Session) SetComputerControlState(ctx context.Context, request Set
 	return session.call(ctx, MethodSetComputerControl, request, &struct{}{})
 }
 
+func (session *Session) SetComputerToken(ctx context.Context, request SetComputerTokenRequest) error {
+	return session.call(ctx, MethodSetComputerToken, request, &struct{}{})
+}
+
 func (session *Session) Watch(ctx context.Context, request WatchRequest, receive func(WatchEvent) error) error {
 	return session.stream(ctx, MethodWatch, request, true, func(wire *framedConn, raw frame) error {
 		var event WatchEvent

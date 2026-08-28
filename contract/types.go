@@ -499,9 +499,13 @@ type RunRecord struct {
 }
 
 type Trigger struct {
-	Type        string `json:"type"`
-	Principal   string `json:"principal"`
-	SourceRunID string `json:"source_run_id,omitempty"`
+	Type                      string `json:"type"`
+	Principal                 string `json:"principal"`
+	SourceRunID               string `json:"source_run_id,omitempty"`
+	ComputerID                string `json:"computer_id,omitempty"`
+	ComputerAttemptID         string `json:"computer_attempt_id,omitempty"`
+	ComputerStorageGeneration int64  `json:"computer_storage_generation,omitempty"`
+	SubmitIntentRevision      int64  `json:"submit_intent_revision,omitempty"`
 }
 
 type WorkflowSource struct {
@@ -665,6 +669,7 @@ const (
 	SpawnFailureImagePlatformUnsupported   SpawnFailureCode = "image_platform_unsupported"
 	SpawnFailureOCISpecRejected            SpawnFailureCode = "oci_spec_rejected"
 	SpawnFailureInsufficientDisk           SpawnFailureCode = "insufficient_disk"
+	SpawnFailurePassUnavailable            SpawnFailureCode = "pass_unavailable"
 )
 
 // TerminationCause identifies who initiated a signal termination. A service

@@ -29,6 +29,8 @@ type ServerConfig struct {
 	AllowSelfAssertedPersonIdentities bool
 	ComputerPolicyFreshness           time.Duration
 	ComputerPolicyWatchWait           time.Duration
+	ComputerTokenRevoker              ComputerTokenRevoker
+	RunLedgerNodeID                   string
 }
 
 // NodePolicy is authoritative control-plane configuration for one stable node.
@@ -67,6 +69,8 @@ type Server struct {
 	allowPersonIdentities   bool
 	computerPolicyFreshness time.Duration
 	computerPolicyWatchWait time.Duration
+	computerTokenRevoker    ComputerTokenRevoker
+	runLedgerNodeID         string
 	handler                 http.Handler
 }
 
@@ -105,6 +109,10 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	if policyWatchWait <= 0 {
 		policyWatchWait = DefaultComputerPolicyWatchWait
 	}
+	runLedgerNodeID := strings.TrimSpace(config.RunLedgerNodeID)
+	if runLedgerNodeID == "" {
+		runLedgerNodeID = "run-ledger"
+	}
 	if policyFreshness <= policyWatchWait {
 		return nil, fmt.Errorf("l1: Computer policy freshness must exceed watch wait")
 	}
@@ -119,6 +127,8 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 		allowPersonIdentities:   personIdentitiesAllowed(f, config.AllowSelfAssertedPersonIdentities),
 		computerPolicyFreshness: policyFreshness,
 		computerPolicyWatchWait: policyWatchWait,
+		computerTokenRevoker:    config.ComputerTokenRevoker,
+		runLedgerNodeID:         runLedgerNodeID,
 	}
 	s.handler = s.routes()
 	return s, nil
@@ -230,6 +240,7 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("GET /v1/computers/{computer_id}/storage-generations", s.listComputerStorageGenerations)
 	client.HandleFunc("POST /v1/computers/{computer_id}/projections", s.installComputerProjection)
 	client.HandleFunc("POST /v1/computers/{computer_id}/remove", s.removeComputer)
+	client.HandleFunc("POST /v1/computers/{computer_id}/token-scope-proof", s.proveComputerTokenScope)
 	client.HandleFunc("GET /v1/nodes", s.listNodes)
 	client.HandleFunc("POST /v1/nodes/{node_id}/drain", s.operatorDrainNode)
 	client.HandleFunc("POST /v1/nodes/{node_id}/claims", s.setNodeClaims)
@@ -266,6 +277,7 @@ func (s *Server) routes() http.Handler {
 	person.HandleFunc("DELETE /v1/computers/{computer_id}/grants/{user_id}", s.deleteComputerGrant)
 	person.HandleFunc("GET /v1/computers/{computer_id}/grants/audit", s.listComputerPolicyAudit)
 	person.HandleFunc("GET /v1/computers/{computer_id}/revocations/{policy_revision}", s.getComputerPolicyRevocation)
+	person.HandleFunc("PUT /v1/computers/{computer_id}/submission", s.mutateComputerSubmission)
 
 	root := http.NewServeMux()
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
@@ -275,6 +287,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/computers/{computer_id}/grants", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/grants/", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/revocations/", s.authorize(personPrincipal, person))
+	root.Handle("/v1/computers/{computer_id}/submission", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes/", s.authorize(clientPrincipal, client))
@@ -297,6 +310,68 @@ func (s *Server) proveServiceBinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, ServiceBindingProofResponse{Bound: bound})
+}
+
+func (s *Server) proveComputerTokenScope(w http.ResponseWriter, r *http.Request) {
+	if identityFromRequest(r).NodeID != s.runLedgerNodeID {
+		writeError(w, protocolError(contract.ErrorForbidden, "only the L3 run ledger may request Computer token scope proof"))
+		return
+	}
+	var request struct {
+		ComputerAttemptID  string `json:"computer_attempt_id"`
+		HostIdentityNodeID string `json:"host_identity_node_id,omitempty"`
+		HostNodeID         string `json:"host_node_id,omitempty"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	proof, err := s.store.ProveComputerTokenScope(r.Context(), r.PathValue("computer_id"),
+		request.ComputerAttemptID, request.HostIdentityNodeID, request.HostNodeID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, proof)
+}
+
+func (s *Server) mutateComputerSubmission(w http.ResponseWriter, r *http.Request) {
+	var request ComputerSubmissionRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	identity := identityFromRequest(r)
+	computer, replayed, err := s.store.PrepareComputerSubmissionMutation(r.Context(), identity, r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if replayed {
+		w.Header().Set("Idempotent-Replay", "true")
+		writeJSON(w, http.StatusOK, computer)
+		return
+	}
+	if s.computerTokenRevoker == nil {
+		writeError(w, internalError(errors.New("L3 Computer token revoker is not configured"), "revoke Computer token grants"))
+		return
+	}
+	if err := s.computerTokenRevoker.RevokeComputerTokens(r.Context(), ComputerTokenRevocation{
+		ComputerID: computer.ComputerID, NewSubmitIntentRevision: computer.SubmitIntentRevision + 1,
+		Reason: "submission_intent_advanced",
+	}); err != nil {
+		writeError(w, internalError(err, "revoke Computer token grants before submission mutation"))
+		return
+	}
+	computer, replayed, err = s.store.MutateComputerSubmission(r.Context(), identity, computer.ComputerID, request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if replayed {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, http.StatusOK, computer)
 }
 
 func (s *Server) latchServiceImageReconciliationFailure(w http.ResponseWriter, r *http.Request) {
@@ -635,6 +710,12 @@ func (s *Server) setComputerDesiredState(w http.ResponseWriter, r *http.Request)
 		writeError(w, err)
 		return
 	}
+	if request.DesiredState == contract.ServiceDesiredStopped {
+		if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_stopped"); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusAccepted, redactComputer(computer))
 }
 
@@ -649,6 +730,12 @@ func (s *Server) restartComputer(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	if !replayed {
+		if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_restarted"); err != nil {
+			writeError(w, err)
+			return
+		}
 	}
 	status := http.StatusAccepted
 	if replayed {
@@ -669,6 +756,12 @@ func (s *Server) resetComputerStorage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	if !replayed {
+		if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "storage_generation_advanced"); err != nil {
+			writeError(w, err)
+			return
+		}
 	}
 	status := http.StatusAccepted
 	if replayed {
@@ -699,6 +792,10 @@ func (s *Server) installComputerProjection(w http.ResponseWriter, r *http.Reques
 		writeError(w, err)
 		return
 	}
+	if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_reimaged"); err != nil {
+		writeError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusAccepted, redactComputer(computer))
 }
 
@@ -714,7 +811,23 @@ func (s *Server) removeComputer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_removed"); err != nil {
+		writeError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusAccepted, redactComputer(computer))
+}
+
+func (s *Server) revokeComputerAuthority(ctx context.Context, computerID, reason string) error {
+	if s.computerTokenRevoker == nil {
+		return nil
+	}
+	if err := s.computerTokenRevoker.RevokeComputerTokens(ctx, ComputerTokenRevocation{
+		ComputerID: computerID, NewSubmitIntentRevision: 1, RevokeAll: true, Reason: reason,
+	}); err != nil {
+		return internalError(err, "revoke Computer token grants after authority loss")
+	}
+	return nil
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
@@ -1173,6 +1286,15 @@ func (s *Server) completeAttempt(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	if computerID, lookupErr := s.store.ComputerIDForJob(r.Context(), job.JobID); lookupErr != nil {
+		writeError(w, lookupErr)
+		return
+	} else if computerID != "" {
+		if revokeErr := s.revokeComputerAuthority(r.Context(), computerID, "attempt_terminal"); revokeErr != nil {
+			writeError(w, revokeErr)
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, redactJob(job))
 }

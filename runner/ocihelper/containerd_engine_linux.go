@@ -74,6 +74,8 @@ type containerdAttempt struct {
 	endpoints        map[string]uint16
 	endpointHolds    map[string]net.Listener
 	controlDirectory string
+	computerUID      uint32
+	computerGID      uint32
 	controlMu        sync.Mutex
 	mu               sync.Mutex
 }
@@ -824,6 +826,9 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if request.Workload.RunToken != "" && contract.IsOCISensitiveReservedEnvironmentName(contract.EnvRunToken) {
 		request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvRunToken, request.Workload.RunToken)
 	}
+	if computer && request.Workload.ComputerToken != "" && contract.IsOCISensitiveReservedEnvironmentName(contract.EnvComputerToken) {
+		request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvComputerToken, request.Workload.ComputerToken)
+	}
 	if servicePort := endpoints["service"]; servicePort != 0 {
 		request.Workload.ReservedEnvironment = setReservedEnvironment(
 			request.Workload.ReservedEnvironment, contract.EnvServicePort, fmt.Sprint(servicePort),
@@ -873,6 +878,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		}
 	}
 	var document *RuntimeSpecDocument
+	var computerUID, computerGID uint32
 	err = mount.WithTempMount(leaseContext, mounts, func(root string) error {
 		imageConfig, configErr := readImageRuntimeConfig(leaseContext, engine.client.ContentStore(), image)
 		if configErr != nil {
@@ -914,6 +920,14 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			}
 			if computerDisk != nil {
 				if ownerErr = initializeComputerDiskRoot(computerDisk, uid, gid); ownerErr != nil {
+					closeErr := document.Close()
+					document = nil
+					return errors.Join(ownerErr, closeErr)
+				}
+			}
+			if computer {
+				computerUID, computerGID = uid, gid
+				if ownerErr = atomicWriteComputerToken(controlDirectory, request.Workload.ComputerToken, uid, gid); ownerErr != nil {
 					closeErr := document.Close()
 					document = nil
 					return errors.Join(ownerErr, closeErr)
@@ -964,7 +978,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		attemptCancel()
 		return RunResponse{}, fmt.Errorf("register task Wait before Start: %w", err)
 	}
-	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, computerDisk: computerDisk, container: container, task: task, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory}
+	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, computerDisk: computerDisk, container: container, task: task, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID}
 	engine.watchOOM(attempt)
 	engine.mu.Lock()
 	engine.attempts[request.Authority.key()] = attempt
@@ -2089,6 +2103,22 @@ func (engine *ContainerdEngine) SetComputerControlState(_ context.Context, reque
 		return errors.New("attempt has no Computer control state")
 	}
 	return atomicWriteComputerControlState(attempt.controlDirectory, request.HumanDriving)
+}
+
+func (engine *ContainerdEngine) SetComputerToken(_ context.Context, request SetComputerTokenRequest) error {
+	if strings.IndexByte(request.Token, 0) >= 0 {
+		return errors.New("Computer token contains NUL")
+	}
+	attempt, err := engine.attempt(request.Authority)
+	if err != nil {
+		return err
+	}
+	attempt.controlMu.Lock()
+	defer attempt.controlMu.Unlock()
+	if attempt.controlDirectory == "" {
+		return errors.New("attempt has no Computer control state")
+	}
+	return atomicWriteComputerToken(attempt.controlDirectory, request.Token, attempt.computerUID, attempt.computerGID)
 }
 func (engine *ContainerdEngine) DialHostBridge(ctx context.Context, request DialHostBridgeRequest, stream io.ReadWriteCloser) error {
 	attempt, err := engine.attempt(request.Authority)

@@ -101,8 +101,12 @@ type ComputerPolicyAdmin struct {
 }
 
 type ComputerPolicyComputer struct {
-	ComputerID string          `json:"computer_id"`
-	Grants     []ComputerGrant `json:"grants"`
+	ComputerID           string          `json:"computer_id"`
+	Grants               []ComputerGrant `json:"grants"`
+	SubmitEnabled        bool            `json:"submit_enabled"`
+	SubmitIntentRevision int64           `json:"submit_intent_revision"`
+	SubmitMaxInflight    int             `json:"submit_max_inflight"`
+	SubmitPolicyRevision int64           `json:"submit_policy_revision"`
 }
 
 // ComputerPolicySnapshot is issued only to the authenticated agent for the
@@ -528,6 +532,11 @@ func ValidateComputerPolicySnapshot(snapshot ComputerPolicySnapshot) error {
 			return fmt.Errorf("duplicate Computer policy Computer at index %d", i)
 		}
 		computers[computer.ComputerID] = struct{}{}
+		if computer.SubmitIntentRevision < 0 || computer.SubmitMaxInflight < 1 || computer.SubmitMaxInflight > 1000 ||
+			computer.SubmitPolicyRevision < 0 || computer.SubmitPolicyRevision > snapshot.PolicyRevision ||
+			(computer.SubmitEnabled && (computer.SubmitIntentRevision < 1 || computer.SubmitPolicyRevision < 1)) {
+			return fmt.Errorf("invalid Computer submission authority at index %d", i)
+		}
 		grants := make(map[string]struct{}, len(computer.Grants))
 		for j, grant := range computer.Grants {
 			if strings.TrimSpace(grant.FabricID) == "" || strings.TrimSpace(grant.UserID) == "" ||
@@ -635,7 +644,14 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 		if err != nil {
 			return nil, internalError(err, "list snapshot Computer grants")
 		}
-		computers = append(computers, ComputerPolicyComputer{ComputerID: computerID, Grants: grants})
+		computer := ComputerPolicyComputer{ComputerID: computerID, Grants: grants}
+		if err := tx.QueryRowContext(ctx, `SELECT submit_enabled, submit_intent_revision,
+			submit_max_inflight, submit_policy_revision FROM computers WHERE computer_id=?`, computerID).
+			Scan(&computer.SubmitEnabled, &computer.SubmitIntentRevision, &computer.SubmitMaxInflight,
+				&computer.SubmitPolicyRevision); err != nil {
+			return nil, internalError(err, "read snapshot Computer submission policy")
+		}
+		computers = append(computers, computer)
 	}
 	snapshot := ComputerPolicySnapshot{PolicyGeneration: generation, PolicyRevision: revision, IssuingFabricID: issuingFabricID,
 		NodeID: nodeID, BootSessionID: bootSessionID, IssuedAt: now, FreshUntil: canonicalTime(now.Add(freshness)),

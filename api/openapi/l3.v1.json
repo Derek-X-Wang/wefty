@@ -3,10 +3,82 @@
   "info": {
     "title": "Wefty L3 run-ledger API",
     "version": "0.1.0-prerelease",
-    "description": "Caller run submission/polling and run-token-scoped workflow writes. Every request is Fabric-authenticated. Requests without a bearer run token additionally require the tag:wefty-client Fabric principal; bearer authorization is always interpreted as an opaque run token."
+    "description": "Caller run submission/polling, run-token-scoped workflow writes, and L3-authoritative Computer passes. Every request is Fabric-authenticated. Opaque bearer values are verified against the run-token and Computer-token ledgers; provenance never comes from transport headers."
   },
   "servers": [{ "url": "wefty://run-ledger" }],
   "paths": {
+    "/v1/computer-token/mint": {
+      "post": {
+        "operationId": "mintComputerToken",
+        "summary": "Mint one live-attempt Computer pass",
+        "description": "Agent-only closed seam. L3 derives host identity from Fabric, verifies the exact live L1 scope, stores only a SHA-256 digest, and revokes every prior grant for the Computer before returning the 256-bit bearer.",
+        "security": [{ "fabricIdentity": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerTokenMintRequest" } } } },
+        "responses": {
+          "201": { "description": "In-memory-only Computer pass.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerTokenGrant" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computer-token/revoke": {
+      "post": {
+        "operationId": "revokeComputerTokens",
+        "summary": "Revoke stale Computer passes before L1 reports an admin mutation",
+        "description": "Control-plane machine identity only. The immutable L3 grant audit advances before this request returns success.",
+        "security": [{ "fabricIdentity": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerTokenRevocationRequest" } } } },
+        "responses": {
+          "204": { "description": "Every older active grant is revoked." },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computer-token/revoke-attempt": {
+      "post": {
+        "operationId": "revokeComputerAttemptTokens",
+        "summary": "Revoke one attempt's Computer pass on authority loss",
+        "security": [{ "fabricIdentity": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerAttemptTokenRevocationRequest" } } } },
+        "responses": {
+          "204": { "description": "The exact host-bound attempt grant is revoked." },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/computer-token/revoke-host": {
+      "post": {
+        "operationId": "revokeHostComputerTokens",
+        "summary": "Revoke prior-boot Computer passes owned by the authenticated host",
+        "security": [{ "fabricIdentity": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HostComputerTokenRevocationRequest" } } } },
+        "responses": {
+          "204": { "description": "Every active grant owned by the authenticated host is revoked." },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/computer/self": {
+      "get": {
+        "operationId": "getComputerSelf",
+        "summary": "Return the minimal identity bound to the current Computer pass",
+        "security": [{ "fabricIdentity": [], "computerToken": [] }],
+        "responses": {
+          "200": { "description": "Bound identity, current Storage generation, grant revision, and permissions only.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerSelf" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }
+        }
+      }
+    },
     "/v1/workflows/{workflow_id}/versions": {
       "parameters": [
         {
@@ -79,7 +151,7 @@
         "operationId": "createRun",
         "summary": "Create a manual or child run",
         "description": "Exactly one of workflow_ref, inline_script, or image is required. workflow://<id> resolves the latest version and workflow://<id>/vN resolves an explicit version; every source is snapshotted onto the run before the run row and dispatch intent commit atomically. Image reruns reuse either the submitted digest or the write-once digest ingested from accepted L1 attempt evidence; they never resolve a tag again. L1 creation uses a stable dispatch key. max_cost is stored but not enforced in v0.1.",
-        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }, { "fabricIdentity": [], "computerToken": [] }],
         "parameters": [
           {
             "name": "Idempotency-Key",
@@ -208,7 +280,7 @@
         "operationId": "getRun",
         "summary": "Read a run record",
         "description": "Run tokens may read their own run and descendants, never siblings or ancestors.",
-        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }, { "fabricIdentity": [], "computerToken": [] }],
         "responses": {
           "200": {
             "description": "Run ledger record.",
@@ -232,7 +304,7 @@
         "operationId": "getRunLineage",
         "summary": "Read ancestor and descendant run lineage",
         "description": "Ancestors are root-first and descendants are depth-first. A run token receives only entries within its own descendant scope and cannot query an ancestor or sibling target.",
-        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }, { "fabricIdentity": [], "computerToken": [] }],
         "responses": {
           "200": {
             "description": "Queryable run lineage.",
@@ -316,7 +388,7 @@
       "get": {
         "operationId": "getRunLogs",
         "summary": "Poll the run's L1 logs",
-        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }, { "fabricIdentity": [], "computerToken": [] }],
         "parameters": [
           { "name": "cursor", "in": "query", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 } }
@@ -594,6 +666,56 @@
           "logs_url": { "type": "string", "format": "uri" }
         }
       },
+      "ComputerTokenMintRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["computer_id", "computer_attempt_id"],
+        "properties": { "computer_id": { "type": "string", "minLength": 1 }, "computer_attempt_id": { "type": "string", "minLength": 1 } }
+      },
+      "ComputerTokenGrant": {
+        "type": "object", "additionalProperties": false,
+        "required": ["token", "computer_id", "computer_attempt_id", "computer_storage_generation", "submit_intent_revision", "host_node_id", "l3_authority_generation", "grant_revision", "submit_max_inflight", "permissions"],
+        "properties": {
+          "token": { "type": "string", "readOnly": true, "pattern": "^wcomputer_[0-9a-f]{64}$" },
+          "computer_id": { "type": "string" }, "computer_attempt_id": { "type": "string" },
+          "computer_storage_generation": { "type": "integer", "minimum": 1 },
+          "submit_intent_revision": { "type": "integer", "minimum": 1 },
+          "host_node_id": { "type": "string" }, "l3_authority_generation": { "type": "integer", "minimum": 1 },
+          "grant_revision": { "type": "integer", "minimum": 1 }, "submit_max_inflight": { "type": "integer", "minimum": 1 },
+          "permissions": { "type": "array", "items": { "enum": ["observe", "submit"] }, "minItems": 2, "maxItems": 2, "uniqueItems": true }
+        }
+      },
+      "ComputerTokenRevocationRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["computer_id", "submit_intent_revision", "reason"],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 }, "submit_intent_revision": { "type": "integer", "minimum": 0 },
+          "revoke_all": { "type": "boolean", "default": false },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      },
+      "ComputerAttemptTokenRevocationRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["computer_id", "computer_attempt_id", "reason"],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 },
+          "computer_attempt_id": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      },
+      "HostComputerTokenRevocationRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["reason"],
+        "properties": { "reason": { "type": "string", "minLength": 1 } }
+      },
+      "ComputerSelf": {
+        "type": "object", "additionalProperties": false,
+        "required": ["computer_id", "computer_storage_generation", "grant_revision", "permissions"],
+        "properties": {
+          "computer_id": { "type": "string" }, "computer_storage_generation": { "type": "integer", "minimum": 1 },
+          "grant_revision": { "type": "integer", "minimum": 1 },
+          "permissions": { "type": "array", "items": { "enum": ["observe", "submit"] }, "uniqueItems": true }
+        }
+      },
       "RunExecution": {
         "type": "object",
         "additionalProperties": false,
@@ -703,6 +825,7 @@
     "securitySchemes": {
       "fabricIdentity": { "$ref": "./common.v1.json#/components/securitySchemes/fabricIdentity" },
       "runToken": { "$ref": "./common.v1.json#/components/securitySchemes/runToken" }
+      ,"computerToken": { "$ref": "./common.v1.json#/components/securitySchemes/computerToken" }
     }
   }
 }

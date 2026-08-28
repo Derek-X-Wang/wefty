@@ -1053,6 +1053,27 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		_ = writeEngineResponse(wire, struct{}{}, engine.SetComputerControlState(operation.ctx, body))
+	case MethodSetComputerToken:
+		var body SetComputerTokenRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		attempt, rpcErr := session.authorizeAttempt(body.Authority)
+		if rpcErr != nil {
+			_ = writeRPCError(wire, rpcErr)
+			return
+		}
+		if !attempt.computer {
+			_ = writeFailure(wire, CodeUnauthorizedAttempt, "Computer token delivery is not authorized for this live attempt")
+			return
+		}
+		engine, ok := server.engine.(ComputerControlEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "Computer token delivery is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		_ = writeEngineResponse(wire, struct{}{}, engine.SetComputerToken(operation.ctx, body))
 	case MethodWatch:
 		var body WatchRequest
 		if !decodeRequest(wire, request.Body, &body) || !authorizeRequest(wire, session, body.Authority) {

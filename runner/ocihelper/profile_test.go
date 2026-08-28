@@ -482,6 +482,7 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 		{name: "sensitive env NUL", mutate: func(input *WorkloadInput) {
 			input.SensitiveEnvironment = []EnvironmentVariable{{Name: "A", Value: "x\x00"}}
 		}},
+		{name: "Computer token on ordinary workload", mutate: func(input *WorkloadInput) { input.ComputerToken = "forged" }},
 		{name: "reserved env name", mutate: func(input *WorkloadInput) {
 			input.ReservedEnvironment = []EnvironmentVariable{{Name: "WEFTY_NOT_RESERVED"}}
 		}},

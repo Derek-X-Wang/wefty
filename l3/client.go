@@ -35,6 +35,10 @@ type JobLogClient interface {
 	GetJobLogs(context.Context, string, string, int) (l1.LogPage, error)
 }
 
+type ComputerGrantVerifier interface {
+	ProveComputerTokenScope(context.Context, string, string, string, string) (ComputerTokenScopeProof, error)
+}
+
 // L1Client calls the L1 client protocol exclusively through Fabric.Dial.
 type L1Client struct {
 	client *http.Client
@@ -107,6 +111,18 @@ func (c *L1Client) GetJobLogs(ctx context.Context, jobID, cursor string, limit i
 	return page, nil
 }
 
+func (c *L1Client) ProveComputerTokenScope(ctx context.Context, computerID, attemptID, hostIdentityNodeID, hostNodeID string) (ComputerTokenScopeProof, error) {
+	var proof l1.ComputerTokenScopeProof
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/token-scope-proof"
+	request := map[string]string{"computer_attempt_id": attemptID, "host_identity_node_id": hostIdentityNodeID, "host_node_id": hostNodeID}
+	if err := c.do(ctx, http.MethodPost, path, request, &proof, http.StatusOK); err != nil {
+		return ComputerTokenScopeProof{}, err
+	}
+	return ComputerTokenScopeProof{ComputerID: proof.ComputerID, ComputerAttemptID: proof.ComputerAttemptID,
+		ComputerStorageGeneration: proof.ComputerStorageGeneration, SubmitIntentRevision: proof.SubmitIntentRevision,
+		HostNodeID: proof.HostNodeID, SubmitMaxInflight: proof.SubmitMaxInflight}, nil
+}
+
 func (c *L1Client) do(ctx context.Context, method, path string, body any, target any, success ...int) error {
 	var reader io.Reader
 	if body != nil {
@@ -154,3 +170,4 @@ func (c *L1Client) do(ctx context.Context, method, path string, body any, target
 var _ JobClient = (*L1Client)(nil)
 var _ JobImageEvidenceClient = (*L1Client)(nil)
 var _ JobLogClient = (*L1Client)(nil)
+var _ ComputerGrantVerifier = (*L1Client)(nil)

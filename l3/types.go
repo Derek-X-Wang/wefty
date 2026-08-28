@@ -2,6 +2,7 @@
 package l3
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
@@ -10,11 +11,12 @@ import (
 )
 
 const (
-	DefaultCallerPrincipalTag = "tag:wefty-client"
-	DefaultL1Address          = "wefty://control-plane"
-	DefaultL3Address          = "wefty://run-ledger"
-	DefaultHandoffRoot        = contract.DefaultHandoffRoot
-	DefaultRunTokenGrace      = 5 * time.Minute
+	DefaultCallerPrincipalTag        = "tag:wefty-client"
+	DefaultL1Address                 = "wefty://control-plane"
+	DefaultL3Address                 = "wefty://run-ledger"
+	DefaultHandoffRoot               = contract.DefaultHandoffRoot
+	DefaultRunTokenGrace             = 5 * time.Minute
+	DefaultComputerSubmitMaxInflight = 20
 )
 
 // Clock supplies ledger timestamps so state projection can be tested without
@@ -103,6 +105,11 @@ type CreateRunInput struct {
 	IdempotencyKey string
 	Actor          string
 	Request        CreateRunRequest
+	ComputerScope  *ComputerTokenScope
+	// VerifyComputerScope is called after the immediate SQLite write transaction
+	// begins and before any Run row is committed. The caller must re-prove the
+	// exact live L1 attempt authority represented by ComputerScope.
+	VerifyComputerScope func(context.Context, ComputerTokenScope) error
 }
 
 type CreateRerunInput struct {
@@ -143,12 +150,16 @@ type AttemptImageEvidence struct {
 // Params is snapshotted separately from the run row so provenance remains
 // self-contained for future trigger types.
 type TriggerProvenance struct {
-	RunID       string          `json:"run_id"`
-	Actor       string          `json:"actor"`
-	Source      string          `json:"source"`
-	SourceRunID string          `json:"source_run_id,omitempty"`
-	Params      json.RawMessage `json:"params"`
-	CreatedAt   time.Time       `json:"created_at"`
+	RunID                     string          `json:"run_id"`
+	Actor                     string          `json:"actor"`
+	Source                    string          `json:"source"`
+	SourceRunID               string          `json:"source_run_id,omitempty"`
+	ComputerID                string          `json:"computer_id,omitempty"`
+	ComputerAttemptID         string          `json:"computer_attempt_id,omitempty"`
+	ComputerStorageGeneration int64           `json:"computer_storage_generation,omitempty"`
+	SubmitIntentRevision      int64           `json:"submit_intent_revision,omitempty"`
+	Params                    json.RawMessage `json:"params"`
+	CreatedAt                 time.Time       `json:"created_at"`
 }
 
 // ProtocolRejection is the immutable audit record for a rejected in-run
@@ -178,8 +189,9 @@ type RunLineage struct {
 }
 
 type StoreOptions struct {
-	Clock         Clock
-	RunTokenGrace time.Duration
+	Clock                       Clock
+	RunTokenGrace               time.Duration
+	ComputerAuthorityInstanceID string
 }
 
 // RunTokenScope is the authenticated authority carried by an opaque run
@@ -187,4 +199,78 @@ type StoreOptions struct {
 type RunTokenScope struct {
 	RunID     string
 	AttemptID string
+}
+
+type ComputerPermission string
+
+const (
+	ComputerPermissionSubmit  ComputerPermission = "submit"
+	ComputerPermissionObserve ComputerPermission = "observe"
+)
+
+// ComputerTokenScope is the complete L3-derived identity of one Computer
+// submission pass. No request header or run body may supply these fields.
+type ComputerTokenScope struct {
+	ComputerID                string
+	ComputerAttemptID         string
+	ComputerStorageGeneration int64
+	SubmitIntentRevision      int64
+	HostNodeID                string
+	L3AuthorityGeneration     int64
+	GrantRevision             int64
+	SubmitMaxInflight         int
+	Permissions               []ComputerPermission
+}
+
+type ComputerTokenMintRequest struct {
+	ComputerID        string `json:"computer_id"`
+	ComputerAttemptID string `json:"computer_attempt_id"`
+}
+
+type ComputerTokenGrant struct {
+	Token                     string               `json:"token"`
+	ComputerID                string               `json:"computer_id"`
+	ComputerAttemptID         string               `json:"computer_attempt_id"`
+	ComputerStorageGeneration int64                `json:"computer_storage_generation"`
+	SubmitIntentRevision      int64                `json:"submit_intent_revision"`
+	HostNodeID                string               `json:"host_node_id"`
+	L3AuthorityGeneration     int64                `json:"l3_authority_generation"`
+	GrantRevision             int64                `json:"grant_revision"`
+	SubmitMaxInflight         int                  `json:"submit_max_inflight"`
+	Permissions               []ComputerPermission `json:"permissions"`
+}
+
+type ComputerTokenRevocationRequest struct {
+	ComputerID           string `json:"computer_id"`
+	SubmitIntentRevision int64  `json:"submit_intent_revision"`
+	RevokeAll            bool   `json:"revoke_all,omitempty"`
+	Reason               string `json:"reason"`
+}
+
+type ComputerAttemptTokenRevocationRequest struct {
+	ComputerID        string `json:"computer_id"`
+	ComputerAttemptID string `json:"computer_attempt_id"`
+	Reason            string `json:"reason"`
+}
+
+type HostComputerTokenRevocationRequest struct {
+	Reason string `json:"reason"`
+}
+
+type ComputerSelf struct {
+	ComputerID                string               `json:"computer_id"`
+	ComputerStorageGeneration int64                `json:"computer_storage_generation"`
+	GrantRevision             int64                `json:"grant_revision"`
+	Permissions               []ComputerPermission `json:"permissions"`
+}
+
+// ComputerTokenScopeProof is the L1-authoritative fact L3 consumes before it
+// mints a pass. The host Node and attempt are verified, never caller asserted.
+type ComputerTokenScopeProof struct {
+	ComputerID                string `json:"computer_id"`
+	ComputerAttemptID         string `json:"computer_attempt_id"`
+	ComputerStorageGeneration int64  `json:"computer_storage_generation"`
+	SubmitIntentRevision      int64  `json:"submit_intent_revision"`
+	HostNodeID                string `json:"host_node_id"`
+	SubmitMaxInflight         int    `json:"submit_max_inflight"`
 }

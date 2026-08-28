@@ -477,6 +477,9 @@ type recordingComputerServiceFabric struct {
 func (runtime *opaqueEndpointRuntime) SetComputerControlState(context.Context, workloadrunner.AttemptAuthority, bool) error {
 	return nil
 }
+func (runtime *opaqueEndpointRuntime) SetComputerToken(context.Context, workloadrunner.AttemptAuthority, string) error {
+	return nil
+}
 
 type restartComputerRuntime struct {
 	*opaqueEndpointRuntime
@@ -508,6 +511,9 @@ func (runtime *restartComputerRuntime) SetComputerControlState(_ context.Context
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	runtime.signals = append(runtime.signals, value)
+	return nil
+}
+func (runtime *restartComputerRuntime) SetComputerToken(context.Context, workloadrunner.AttemptAuthority, string) error {
 	return nil
 }
 

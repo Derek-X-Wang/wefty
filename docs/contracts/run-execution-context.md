@@ -48,8 +48,13 @@ produce the authoritative attempt-local values; another
 tenant-defined `WEFTY_*` name is not reserved implicitly. For a Computer the
 helper injects the two public port values, strips and omits
 `WEFTY_SERVICE_PORT`, and preserves `WEFTY_SERVICE_DIR=/wefty/service`.
-`WEFTY_COMPUTER_TOKEN` is a sensitive reserved name but remains absent until
-the guest-authority contract has minted and verified an attempt credential.
+`WEFTY_COMPUTER_TOKEN` is a sensitive reserved name and is present only for a
+Computer whose revisioned submission intent is enabled and whose exact active
+attempt authority L3 has verified. The agent strips every image/Job value,
+mints the bearer after claim, keeps it only in memory, and passes it through a
+closed helper field. It never enters the Computer, JobSpec, L1 database,
+dispatch outbox, service directory, argv, logs, inspect output, or removal
+evidence.
 `WEFTY_RUN_ID` remains part of the existing process run context but is not
 added to the OCI reserved set.
 
@@ -110,6 +115,51 @@ Calls during that grace period remain valid so the workflow can finish final
 protocol writes and reads. Grace does not authorize new child dispatch: once a
 parent is terminal, `POST /v1/runs` with that parent is rejected. At the expiry
 instant and afterward, authentication fails.
+
+## Computer-pass authentication and scope
+
+A Computer pass is a distinct 256-bit bearer. L3 stores only its SHA-256
+digest and immutable issuance/revocation audit, binding it to Computer,
+attempt, current Storage generation, submit-intent revision, host Node, grant
+revision, and L3 authority generation. L3 revalidates the live L1 scope on
+every bearer request. L1 submission-intent mutation revokes older L3 grants
+before reporting success. The caller's authenticated Fabric Node must equal the
+grant's host binding on every request. An ordinary L3 process restart preserves
+the authority generation; only adopting a different persisted authority
+instance marker during restore or explicit promotion advances it and revokes
+older passes.
+
+`POST /v1/runs` rechecks the digest grant, revocation state, exact live L1
+attempt proof, and bound revisions after entering its immediate SQLite write
+transaction. Administrative revocation therefore serializes with the Run
+commit: whichever write acquires the fence first wins. A transient L1 proof
+failure returns unauthorized or service unavailable without mutating the
+grant. Definitive attempt, policy, Storage, Computer, host, helper, agent, or
+authority-generation loss performs explicit audited revocation. The agent may
+re-mint a fresh pass for the same live attempt after a policy change or bounded
+transient failure.
+
+The pass may create only root Runs. L3 derives immutable `computer` trigger
+provenance (`computer_id`, `computer_attempt_id`,
+`computer_storage_generation`, and `submit_intent_revision`); callers cannot
+supply or override those fields. Descendants remain `chain`. Reads are limited
+to roots from the same Computer and current Storage generation plus their
+descendants. `GET /v1/computer/self` returns only Computer identity, Storage
+generation, grant revision, and enumerated permissions. The pass cannot parent
+a submitted Run, append Envelopes or Gates, cancel, rerun, mutate Workflows or
+L1, administer grants, or see another Computer or an earlier generation.
+
+L3 enforces the revisioned `submit_max_inflight` atomically across attempts
+and Storage generations, counting a root Lineage while any member is
+nonterminal. Idempotent replay remains accepted at the limit; new roots receive
+typed `submit_inflight_limit`. The guest bridge is transport-only defense in
+depth and never supplies provenance headers. Its route allowlist, reachability,
+and cancellation surface are owned by #184.
+
+Computer submission idempotency binds the stable principal (`ComputerID`) and
+normalized request only. Attempt, grant, Storage, intent, and L3 authority
+generations remain commit-time fences, not request identity, so replay after a
+re-mint returns the original Run while another Computer conflicts.
 
 ## Node-local handoff lifecycle
 
