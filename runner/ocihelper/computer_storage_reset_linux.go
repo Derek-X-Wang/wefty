@@ -229,10 +229,21 @@ func (engine *ContainerdEngine) ResetComputerStorage(_ context.Context, request 
 		}
 	}
 	if manifest.Phase == computerStorageResetQuarantined {
+		if _, mounted, err := engine.computerDiskSystem().mountedSource(mountPath); err != nil {
+			return ResetComputerStorageResponse{}, err
+		} else if mounted {
+			return ResetComputerStorageResponse{}, errors.New("Computer Storage generation remains mounted during reset deletion")
+		}
 		if err := os.RemoveAll(quarantine); err != nil {
 			return ResetComputerStorageResponse{}, err
 		}
+		if err := os.RemoveAll(mountPath); err != nil {
+			return ResetComputerStorageResponse{}, err
+		}
 		if err := syncDirectory(quarantineRoot); err != nil {
+			return ResetComputerStorageResponse{}, err
+		}
+		if err := syncDirectory(filepath.Dir(mountPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return ResetComputerStorageResponse{}, err
 		}
 		manifest.Phase = computerStorageResetDeleted
