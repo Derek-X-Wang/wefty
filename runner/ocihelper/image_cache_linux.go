@@ -443,9 +443,13 @@ func (engine *ContainerdEngine) contentBytes(ctx context.Context) (int64, error)
 }
 
 func (engine *ContainerdEngine) ImageCacheStatus(ctx context.Context) (ImageCacheStatus, error) {
-	engine.imageContentMu.Lock()
+	if err := lockMutexContext(ctx, &engine.imageContentMu); err != nil {
+		return ImageCacheStatus{}, err
+	}
 	defer engine.imageContentMu.Unlock()
-	engine.imageResourceMu.Lock()
+	if err := lockMutexContext(ctx, &engine.imageResourceMu); err != nil {
+		return ImageCacheStatus{}, err
+	}
 	defer engine.imageResourceMu.Unlock()
 	bytes, err := engine.contentBytes(engineContext(ctx))
 	if err != nil {
@@ -459,6 +463,21 @@ func (engine *ContainerdEngine) ImageCacheStatus(ctx context.Context) (ImageCach
 		last = &copy
 	}
 	return ImageCacheStatus{Bytes: bytes, CapBytes: engine.cacheMaxBytes, LastEviction: last, LastError: engine.cache.LastError}, nil
+}
+
+func lockMutexContext(ctx context.Context, mutex *sync.Mutex) error {
+	for {
+		if mutex.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (engine *ContainerdEngine) enforceImageCache(ctx context.Context, reason string) error {

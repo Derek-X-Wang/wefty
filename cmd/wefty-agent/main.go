@@ -65,6 +65,7 @@ func main() {
 		containerdAddress := helperFlags.String("oci-containerd-address", ocihelper.DefaultContainerdAddress, "root helper containerd socket")
 		containerdStateRoot := helperFlags.String("oci-containerd-state-root", "/run/containerd", "root helper containerd state root used for shim verification")
 		runtimeRoot := helperFlags.String("oci-runtime-root", "/var/lib/wefty/oci", "root helper OCI runtime state root")
+		runcExecutable := helperFlags.String("oci-runc-executable", "", "absolute setup-resolved runc executable; empty uses containerd runtime info")
 		var allowedMountRoots repeatedStringFlag
 		helperFlags.Var(&allowedMountRoots, "oci-allowed-mount-root", "operator bind-mount root allowed by the helper (repeatable)")
 		hostMountRoot := helperFlags.String("oci-lima-host-mount-root", "", "macOS operator mount root translated into the Lima guest")
@@ -77,7 +78,7 @@ func main() {
 		defer stopHelper()
 		engine, closeEngine, err := ocihelper.OpenNativeEngine(ocihelper.NativeEngineConfig{
 			Address: *containerdAddress, ContainerdStateRoot: *containerdStateRoot,
-			RuntimeRoot: *runtimeRoot, AllowedMountRoots: allowedMountRoots,
+			RuntimeRoot: *runtimeRoot, RuncExecutable: *runcExecutable, AllowedMountRoots: allowedMountRoots,
 			HostMountRoot: *hostMountRoot, GuestMountRoot: *guestMountRoot,
 		})
 		if err != nil {
@@ -282,6 +283,7 @@ type macBootstrapRemovalEvidence struct {
 	ControlSocketAbsent bool                                   `json:"control_socket_absent"`
 	NodeConfigAbsent    bool                                   `json:"node_config_absent"`
 	SetupStateAbsent    bool                                   `json:"setup_state_absent"`
+	DesiredSetupAbsent  bool                                   `json:"desired_setup_state_absent"`
 }
 
 func removeMacBootstrap(instance, limactl, factsPath, intentPath, controlSocket, nodeConfig, setupState string) error {
@@ -305,14 +307,15 @@ func removeMacBootstrap(instance, limactl, factsPath, intentPath, controlSocket,
 		_, err := os.Stat(path)
 		return errors.Is(err, os.ErrNotExist), nil
 	}
-	var factsErr, intentErr, socketErr, configErr, setupErr error
+	var factsErr, intentErr, socketErr, configErr, setupErr, desiredSetupErr error
 	evidence.FactsAbsent, factsErr = removeLocal(factsPath)
 	evidence.IntentAbsent, intentErr = removeLocal(intentPath)
 	evidence.ControlSocketAbsent, socketErr = removeLocal(controlSocket)
 	evidence.NodeConfigAbsent, configErr = removeLocal(nodeConfig)
 	evidence.SetupStateAbsent, setupErr = removeLocal(setupState)
+	evidence.DesiredSetupAbsent, desiredSetupErr = removeLocal(ocicontrol.DesiredSetupStatePath(setupState))
 	encodeErr := json.NewEncoder(os.Stdout).Encode(evidence)
-	return errors.Join(unitErr, helperErr, factsErr, intentErr, socketErr, configErr, setupErr, encodeErr)
+	return errors.Join(unitErr, helperErr, factsErr, intentErr, socketErr, configErr, setupErr, desiredSetupErr, encodeErr)
 }
 
 func run() error {
@@ -581,6 +584,9 @@ func run() error {
 						return response, err
 					}
 				}
+				if err := ocicontrol.WriteSetupState(ocicontrol.DesiredSetupStatePath(*ociSetupState), desired); err != nil {
+					return response, err
+				}
 				response.Configured = true
 				if response.Convergence == ocicontrol.ConvergenceRestartRequired && !request.ApplyRestart {
 					response.ReasonCode = contract.CapabilityReasonTemplateRestartRequired
@@ -695,14 +701,12 @@ func doctorHelperSource(adapter *ocirunner.Adapter) ocicontrol.HelperDoctorSourc
 	}
 	return func(ctx context.Context) (ocicontrol.HelperDoctorSnapshot, error) {
 		status, err := adapter.DoctorStatus(ctx)
-		if err != nil {
-			return ocicontrol.HelperDoctorSnapshot{}, err
-		}
 		return ocicontrol.HelperDoctorSnapshot{
 			ProtocolVersion: status.ProtocolVersion, Version: status.HelperVersion,
 			Checksum: status.HelperChecksum, InstanceID: status.HelperInstanceID,
 			SessionGeneration: status.SessionGeneration, Runtime: status.Runtime,
-			RuntimePlatformRecorded: status.RuntimePlatformRecorded,
+			RuntimeError: err, RuntimePlatformRecorded: status.RuntimePlatformRecorded,
+			SweepReceipt: status.SweepReceipt, SweepReceiptRecorded: status.SweepReceiptRecorded,
 		}, nil
 	}
 }
@@ -790,7 +794,7 @@ func writeMinimalDoctorFactsLoop(
 		}
 		facts := limarunner.BuildMinimalDoctorFacts(
 			unitState, supervisor.Facts(), handshake, snapshot.CapabilityObservation,
-			snapshot.LastProbeAt, time.Now(),
+			snapshot.LastProbe, time.Now(),
 		)
 		if err := limarunner.WriteMinimalDoctorFacts(path, facts); err != nil && logf != nil {
 			logf("wefty-agent: write minimal doctor facts: %v", err)

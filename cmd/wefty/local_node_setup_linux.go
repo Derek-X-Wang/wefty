@@ -67,10 +67,13 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 			return missing(name)
 		}
 	}
+	executablePaths := make(map[string]string)
 	for _, executable := range []string{"containerd", "runc", "systemctl", "groupadd", "usermod", "getent", "id"} {
-		if _, err := exec.LookPath(executable); err != nil {
+		resolvedPath, err := exec.LookPath(executable)
+		if err != nil {
 			return missing(executable)
 		}
+		executablePaths[executable] = resolvedPath
 	}
 	operator, err := user.Lookup(*operatorUser)
 	if err != nil {
@@ -109,9 +112,12 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 		AgentPath: *agentPath, AgentArguments: agentArguments, OperatorUser: operator.Username, OperatorGroup: group.Name,
 		OperatorUID: uid, OperatorGID: gid, WorkingDirectory: *workingDirectory,
 		AllowedMountRoots: []string{*allowedMountRoot}, ContainerdAddress: "/run/containerd/containerd.sock",
-		ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci",
+		ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci", RuncExecutable: executablePaths["runc"],
 	}, linuxunit.ConfigurePaths{UnitDirectory: *unitDirectory, NodeConfig: nodeConfig, ControlSocket: controlSocket}, linuxunit.ExecRunner{})
 	if err != nil {
+		return true, err
+	}
+	if err := ocicontrol.WriteSetupState(ocicontrol.DesiredSetupStatePath(*setupStatePath), desired); err != nil {
 		return true, err
 	}
 	if err := ocicontrol.AuthorizeConvergence(class, *applyRestart, *recreate, 0); err != nil {

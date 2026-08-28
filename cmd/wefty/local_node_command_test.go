@@ -37,10 +37,11 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 				HostPlatform: ocicontrol.PlatformFacts{OS: "linux", Architecture: "amd64"},
 				AgentUser:    "operator", LaunchUnit: "wefty-agent.service",
 				CapabilitySnapshot: func() agent.CapabilitySnapshot {
+					probeAt := time.Now()
 					return agent.CapabilitySnapshot{CapabilityObservation: contract.CapabilityObservation{
 						Revision: 3, ObservedAt: time.Now(), Capabilities: map[string]bool{"kind:process": true},
 						MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonProbeFailed,
-					}, LastProbeAt: time.Now()}
+					}, LastProbe: &contract.CapabilityObservation{Revision: 3, ObservedAt: probeAt, Capabilities: map[string]bool{"kind:process": true}, MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonProbeFailed}}
 				},
 				Intent: func(context.Context) (lima.OCIIntent, error) {
 					return (lima.FileIntentSource{Path: intentPath}).ReadIntent(ctx)

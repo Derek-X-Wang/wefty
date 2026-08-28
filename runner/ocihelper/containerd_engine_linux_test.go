@@ -31,6 +31,29 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestContainerdEngineRejectsPATHResolvedRunc(t *testing.T) {
+	_, err := NewContainerdEngine(NativeEngineConfig{RuntimeRoot: t.TempDir(), RuncExecutable: "runc"})
+	if err == nil || !strings.Contains(err.Error(), "runc executable must be absolute") {
+		t.Fatalf("PATH-resolved runc = %v", err)
+	}
+}
+
+func TestDoctorCacheReadIsBoundedBehindPullLocks(t *testing.T) {
+	engine := &ContainerdEngine{}
+	engine.imageContentMu.Lock()
+	defer engine.imageContentMu.Unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := engine.ImageCacheStatus(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked cache read = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("blocked cache read was not bounded: %s", elapsed)
+	}
+}
+
 func TestSegmentTailerMarksTruncatedFinalFrameIncomplete(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "stdout.frames")
 	var complete bytes.Buffer

@@ -62,12 +62,12 @@ type CapabilityProbeResult struct {
 }
 
 // CapabilitySnapshot is the immutable agent-local capability view shared by
-// admission, publication, and future doctor output. LastProbeAt advances for
-// every completed probe even when the publishable observation is unchanged.
+// admission, publication, and future doctor output. LastProbe is written only
+// for a completed functional probe, never for a restrictive suppression.
 type CapabilitySnapshot struct {
 	contract.CapabilityObservation
-	LastProbeAt                time.Time `json:"last_probe_at,omitempty"`
-	PendingPublicationRevision int64     `json:"pending_publication_revision,omitempty"`
+	LastProbe                  *contract.CapabilityObservation `json:"last_probe,omitempty"`
+	PendingPublicationRevision int64                           `json:"pending_publication_revision"`
 }
 
 // capabilityState is the one process-wide source for registration, heartbeat,
@@ -83,7 +83,7 @@ type capabilityState struct {
 	timeout                    time.Duration
 	base                       map[string]bool
 	current                    contract.CapabilityObservation
-	lastProbeAt                time.Time
+	lastProbe                  *contract.CapabilityObservation
 	pendingPublicationRevision int64
 	ociSuppressionSequence     atomic.Uint64
 }
@@ -176,7 +176,7 @@ func (state *capabilityState) suppressOCILocked(reason contract.CapabilityReason
 		err = errors.New("OCI runtime is not admitted")
 	}
 	state.ociSuppressionSequence.Add(1)
-	state.recordLocked(CapabilityProbeResult{ReasonCode: reason}, err)
+	state.recordLocked(CapabilityProbeResult{ReasonCode: reason}, err, false)
 }
 
 // recordProbeResult discards a positive result that began before a concurrent
@@ -200,7 +200,7 @@ func (state *capabilityState) recordProbeResult(
 			result.ReasonCode = contract.CapabilityReasonBootSweepFailed
 		}
 	}
-	state.recordLocked(result, probeErr)
+	state.recordLocked(result, probeErr, true)
 	return probeErr
 }
 
@@ -210,10 +210,10 @@ func (state *capabilityState) record(result CapabilityProbeResult, probeErr erro
 	// claim can consume work created behind its publication barrier.
 	state.claimPublication.Lock()
 	defer state.claimPublication.Unlock()
-	state.recordLocked(result, probeErr)
+	state.recordLocked(result, probeErr, false)
 }
 
-func (state *capabilityState) recordLocked(result CapabilityProbeResult, probeErr error) {
+func (state *capabilityState) recordLocked(result CapabilityProbeResult, probeErr error, probeCompleted bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	capabilities := cloneCapabilities(state.base)
@@ -267,7 +267,10 @@ func (state *capabilityState) recordLocked(result CapabilityProbeResult, probeEr
 		Revision: revision, Capabilities: capabilities,
 		ObservedAt: now, MissingCapabilities: missingCapabilities, ReasonCode: reason,
 	}
-	state.lastProbeAt = now
+	if probeCompleted {
+		receipt := cloneCapabilityObservation(state.current)
+		state.lastProbe = &receipt
+	}
 }
 
 // adoptRestrictive learns the authoritative N+1 that L1 assigned atomically
@@ -320,10 +323,15 @@ func (state *capabilityState) capabilitySnapshot() CapabilitySnapshot {
 	}
 	state.mu.RLock()
 	defer state.mu.RUnlock()
-	return CapabilitySnapshot{
-		CapabilityObservation: cloneCapabilityObservation(state.current), LastProbeAt: state.lastProbeAt,
+	snapshot := CapabilitySnapshot{
+		CapabilityObservation:      cloneCapabilityObservation(state.current),
 		PendingPublicationRevision: state.pendingPublicationRevision,
 	}
+	if state.lastProbe != nil {
+		receipt := cloneCapabilityObservation(*state.lastProbe)
+		snapshot.LastProbe = &receipt
+	}
+	return snapshot
 }
 
 func cloneCapabilityObservation(observation contract.CapabilityObservation) contract.CapabilityObservation {

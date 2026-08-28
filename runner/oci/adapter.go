@@ -54,6 +54,8 @@ type DoctorStatus struct {
 	SessionGeneration       uint64
 	Runtime                 ocihelper.DoctorStatus
 	RuntimePlatformRecorded bool
+	SweepReceipt            ocihelper.VerifiedSweepReceipt
+	SweepReceiptRecorded    bool
 }
 
 func (adapter *Adapter) DoctorStatus(ctx context.Context) (DoctorStatus, error) {
@@ -65,22 +67,24 @@ func (adapter *Adapter) DoctorStatus(ctx context.Context) (DoctorStatus, error) 
 		return DoctorStatus{}, err
 	}
 	handshake := session.Handshake()
-	runtimeStatus, err := session.DoctorStatus(ctx)
-	if err != nil {
-		return DoctorStatus{}, err
+	status := DoctorStatus{
+		ProtocolVersion: handshake.ProtocolVersion, HelperVersion: handshake.HelperVersion,
+		HelperChecksum: handshake.HelperChecksum, HelperInstanceID: handshake.HelperInstanceID,
+		SessionGeneration: handshake.SessionGeneration,
 	}
+	if source, ok := adapter.sessions.(sweepReceiptSource); ok {
+		status.SweepReceipt, status.SweepReceiptRecorded = source.SweepReceipt()
+	}
+	runtimeStatus, runtimeErr := session.DoctorStatus(ctx)
 	probePlatform, platformRecorded := adapter.probePlatform(session)
 	if platformRecorded {
 		runtimeStatus.RuntimePlatform = probePlatform
 	} else {
 		runtimeStatus.RuntimePlatform = ocihelper.OCIPlatform{}
 	}
-	return DoctorStatus{
-		ProtocolVersion: handshake.ProtocolVersion, HelperVersion: handshake.HelperVersion,
-		HelperChecksum: handshake.HelperChecksum, HelperInstanceID: handshake.HelperInstanceID,
-		SessionGeneration: handshake.SessionGeneration, Runtime: runtimeStatus,
-		RuntimePlatformRecorded: platformRecorded,
-	}, nil
+	status.Runtime = runtimeStatus
+	status.RuntimePlatformRecorded = platformRecorded
+	return status, runtimeErr
 }
 
 type memoryBindingPinLedger struct {

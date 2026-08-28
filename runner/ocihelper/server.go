@@ -941,7 +941,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		response, err := doctorEngine.DoctorStatus(operation.ctx)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeDiagnosticResponse(wire, response, err)
 	case MethodRun:
 		var body RunRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1388,6 +1388,13 @@ func writeEngineResponse(connection *framedConn, response any, err error) error 
 			return writeFailure(connection, CodeOCISpecRejected, serviceDataRejection.Error())
 		}
 		return writeFailure(connection, CodeEngineFailure, "OCI engine operation failed")
+	}
+	return writeSuccess(connection, response)
+}
+
+func writeDiagnosticResponse(connection *framedConn, response any, err error) error {
+	if err != nil {
+		return writeFailure(connection, CodeDiagnosticFailure, "OCI diagnostic read failed")
 	}
 	return writeSuccess(connection, response)
 }

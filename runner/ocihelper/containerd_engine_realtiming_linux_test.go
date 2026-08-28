@@ -109,11 +109,12 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		HostPlatform: ocicontrol.PlatformFacts{OS: "linux", Architecture: runtime.GOARCH},
 		AgentUser:    fmt.Sprintf("uid:%d", os.Getuid()), LaunchUnit: "wefty-agent.service",
 		CapabilitySnapshot: func() agent.CapabilitySnapshot {
-			return agent.CapabilitySnapshot{CapabilityObservation: contract.CapabilityObservation{
+			observation := contract.CapabilityObservation{
 				Revision: 2, ObservedAt: doctorObservedAt, Capabilities: map[string]bool{
 					"kind:process": true, "kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true,
 				}, MissingCapabilities: []string{},
-			}, LastProbeAt: doctorObservedAt}
+			}
+			return agent.CapabilitySnapshot{CapabilityObservation: observation, LastProbe: &observation}
 		},
 		Intent: func(context.Context) (lima.OCIIntent, error) {
 			return lima.OCIIntent{Version: lima.OCIIntentVersion, Revision: 1, Enabled: true, UpdatedAt: doctorObservedAt}, nil
@@ -124,6 +125,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 				ProtocolVersion: status.ProtocolVersion, Version: status.HelperVersion, Checksum: status.HelperChecksum,
 				InstanceID: status.HelperInstanceID, SessionGeneration: status.SessionGeneration,
 				Runtime: status.Runtime, RuntimePlatformRecorded: status.RuntimePlatformRecorded,
+				SweepReceipt: status.SweepReceipt, SweepReceiptRecorded: status.SweepReceiptRecorded,
 			}, err
 		},
 		SetupStatePath: "/var/lib/wefty/oci-setup.json",

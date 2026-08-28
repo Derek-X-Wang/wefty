@@ -153,6 +153,16 @@ reason vocabulary and stable `docs/runbooks/oci-node.md#doctor-code-*` anchors.
 It also surfaces #220's process-payload UID-isolation limitation without
 claiming that operator peer credentials distinguish the shared UID.
 
+`NOT-RUN` is a first-class receipt: it carries no failure reason and instead
+names one closed `not_run_cause`. A helper diagnostic failure preserves the
+already-authenticated handshake and degrades only the reads that did not
+complete; diagnostic transport is never evidence for session loss, attempt
+reap, or capability withdrawal. Runtime versions are facts only. Difference
+from the pinned real-time CI versions is `WARN`/`outside_tested_range`, not a
+failed capability verdict. Doctor compares the applied setup-state receipt
+with the configure-only desired-state receipt; if either side is unavailable,
+it does not manufacture a convergence class.
+
 ## Durable OCI intent and node-local control
 
 The versioned OCI intent marker is the node-local operator decision, separate
@@ -166,6 +176,11 @@ writes the requested configuration/template or Linux units, and reports the
 resulting convergence class without recovering or starting OCI. The sole
 runtime exception is an explicit restart/recreate flag with zero live OCI
 attempts; `wefty node oci start` remains the ordinary start operation.
+Configure-only setup writes a separate desired-state receipt before returning
+a restart/recreate refusal. The applied receipt advances only after authorized
+convergence, so doctor derives unchanged, live-safe, restart-required, or
+recreate-required by comparing current with desired rather than echoing the
+last probe reason.
 
 Singular `wefty node` commands resolve the installed node configuration before
 Fabric initialization and use only the live agent's Unix control socket. Its

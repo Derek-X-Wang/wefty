@@ -40,12 +40,13 @@ func (state HelperState) Valid() bool {
 type ProbeState string
 
 const (
+	ProbeStateNotRun ProbeState = "not_run"
 	ProbeStateFailed ProbeState = "failed"
 	ProbeStatePassed ProbeState = "passed"
 )
 
 func (state ProbeState) Valid() bool {
-	return state == ProbeStateFailed || state == ProbeStatePassed
+	return state == ProbeStateNotRun || state == ProbeStateFailed || state == ProbeStatePassed
 }
 
 type UnitFacts struct {
@@ -55,7 +56,7 @@ type UnitFacts struct {
 
 type HelperFacts struct {
 	State           HelperState `json:"state"`
-	ProtocolVersion int         `json:"protocol_version,omitempty"`
+	ProtocolVersion int         `json:"protocol_version"`
 	Version         string      `json:"version,omitempty"`
 	Checksum        string      `json:"checksum,omitempty"`
 }
@@ -78,7 +79,7 @@ type MinimalDoctorFacts struct {
 	ReasonCode         contract.CapabilityReasonCode `json:"reason_code,omitempty"`
 }
 
-func BuildMinimalDoctorFacts(unitState UnitState, lima SupervisorFacts, handshake *ocihelper.AcquireSessionResponse, observation contract.CapabilityObservation, lastProbeAt, now time.Time) MinimalDoctorFacts {
+func BuildMinimalDoctorFacts(unitState UnitState, lima SupervisorFacts, handshake *ocihelper.AcquireSessionResponse, observation contract.CapabilityObservation, lastProbe *contract.CapabilityObservation, now time.Time) MinimalDoctorFacts {
 	observedAt := lima.ObservedAt
 	if observation.ObservedAt.After(observedAt) {
 		observedAt = observation.ObservedAt
@@ -89,12 +90,16 @@ func BuildMinimalDoctorFacts(unitState UnitState, lima SupervisorFacts, handshak
 	facts := MinimalDoctorFacts{
 		Version: MinimalDoctorFactsVersion, ObservedAt: observedAt.UTC().Round(0),
 		Unit: UnitFacts{Label: LaunchDaemonLabel, State: unitState}, Lima: lima,
-		Helper: HelperFacts{State: HelperStateUnavailable}, Probe: ProbeFacts{State: ProbeStateFailed},
+		Helper: HelperFacts{State: HelperStateUnavailable}, Probe: ProbeFacts{State: ProbeStateNotRun},
 		CapabilityRevision: observation.Revision, ReasonCode: observation.ReasonCode,
 	}
-	if !lastProbeAt.IsZero() {
-		probeAt := lastProbeAt.UTC().Round(0)
+	if lastProbe != nil && !lastProbe.ObservedAt.IsZero() {
+		probeAt := lastProbe.ObservedAt.UTC().Round(0)
 		facts.Probe.ObservedAt = &probeAt
+		facts.Probe.State = ProbeStateFailed
+		if lastProbe.Capabilities["kind:oci"] && lastProbe.ReasonCode == "" {
+			facts.Probe.State = ProbeStatePassed
+		}
 	}
 	if handshake != nil {
 		facts.Helper = HelperFacts{
@@ -102,14 +107,8 @@ func BuildMinimalDoctorFacts(unitState UnitState, lima SupervisorFacts, handshak
 			Version: handshake.HelperVersion, Checksum: handshake.HelperChecksum,
 		}
 	}
-	if observation.Capabilities["kind:oci"] && observation.ReasonCode == "" {
-		facts.Probe.State = ProbeStatePassed
-	}
 	if !facts.ReasonCode.Valid() {
 		facts.ReasonCode = lima.ReasonCode
-	}
-	if !facts.ReasonCode.Valid() && facts.Probe.State != ProbeStatePassed {
-		facts.ReasonCode = contract.CapabilityReasonProbeFailed
 	}
 	return facts
 }

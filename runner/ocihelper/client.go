@@ -319,8 +319,20 @@ func (session *Session) ImageCacheStatus(ctx context.Context) (ImageCacheStatus,
 
 func (session *Session) DoctorStatus(ctx context.Context) (DoctorStatus, error) {
 	var response DoctorStatus
-	err := session.call(ctx, MethodDoctorStatus, struct{}{}, &response)
+	err := session.diagnosticCall(ctx, MethodDoctorStatus, struct{}{}, &response)
 	return response, err
+}
+
+// diagnosticCall deliberately never marks the helper session lost. A doctor
+// transport or read failure proves only that this diagnostic did not complete;
+// it cannot cancel attempts or withdraw capability.
+func (session *Session) diagnosticCall(ctx context.Context, method Method, request, response any) error {
+	connection, wire, err := session.dialRequestInternal(ctx, method, request, false)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	return decodeResponse(wire, response)
 }
 
 // ImportImage streams one verified OCI image-layout archive into the helper.
@@ -644,13 +656,20 @@ func (session *Session) markLost(err error) {
 }
 
 func (session *Session) dialRequest(ctx context.Context, method Method, request any) (net.Conn, *framedConn, error) {
+	return session.dialRequestInternal(ctx, method, request, true)
+}
+
+func (session *Session) dialRequestInternal(ctx context.Context, method Method, request any, classifyTransportLoss bool) (net.Conn, *framedConn, error) {
 	if session == nil || session.client == nil || session.capability == "" {
 		return nil, nil, errors.New("OCI helper session is closed")
 	}
 	connection, err := session.client.Dial(ctx)
 	if err != nil {
 		err = fmt.Errorf("dial OCI helper RPC: %w", err)
-		return nil, nil, session.markOperationFailure(ctx, err)
+		if classifyTransportLoss {
+			err = session.markOperationFailure(ctx, err)
+		}
+		return nil, nil, err
 	}
 	if err := applyContextDeadline(ctx, connection); err != nil {
 		_ = connection.Close()
@@ -671,7 +690,10 @@ func (session *Session) dialRequest(ctx context.Context, method Method, request 
 	}); err != nil {
 		_ = connection.Close()
 		err = fmt.Errorf("send OCI helper %s: %w", method, err)
-		return nil, nil, session.markOperationFailure(ctx, err)
+		if classifyTransportLoss {
+			err = session.markOperationFailure(ctx, err)
+		}
+		return nil, nil, err
 	}
 	return connection, wire, nil
 }

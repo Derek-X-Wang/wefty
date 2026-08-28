@@ -16,7 +16,7 @@ import (
 
 const (
 	InstalledConfigVersion = 1
-	RunbookPath            = "docs/specs/2026-08-22-m3-oci-spec.md#81-installation-and-setup"
+	RunbookPath            = "docs/runbooks/oci-node.md"
 )
 
 type ConvergenceClass string

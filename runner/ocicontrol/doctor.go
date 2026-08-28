@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,10 +17,13 @@ import (
 )
 
 const (
-	DoctorVersion         = 1
-	DoctorUIDLimitation   = "process_kind_payload_uid_isolation_pending"
-	DoctorUIDIssue        = "https://github.com/Derek-X-Wang/wefty/issues/220"
-	DoctorLaunchUnmanaged = "unmanaged"
+	DoctorVersion           = 1
+	DoctorUIDLimitation     = "process_kind_payload_uid_isolation_pending"
+	DoctorUIDIssue          = "https://github.com/Derek-X-Wang/wefty/issues/220"
+	DoctorLaunchUnmanaged   = "unmanaged"
+	DoctorRunbookPrefix     = RunbookPath + "#doctor-code-"
+	TestedContainerdVersion = "2.3.4"
+	TestedRuncVersion       = "1.5.1"
 )
 
 type DiagnosticOutcome string
@@ -33,6 +36,40 @@ const (
 
 func (outcome DiagnosticOutcome) Valid() bool {
 	return outcome == DiagnosticOK || outcome == DiagnosticFailed || outcome == DiagnosticNotRun
+}
+
+type DiagnosticSeverity string
+
+const (
+	DiagnosticInfo  DiagnosticSeverity = "INFO"
+	DiagnosticWarn  DiagnosticSeverity = "WARN"
+	DiagnosticError DiagnosticSeverity = "ERROR"
+)
+
+func (severity DiagnosticSeverity) Valid() bool {
+	return severity == DiagnosticInfo || severity == DiagnosticWarn || severity == DiagnosticError
+}
+
+type NotRunCause string
+
+const (
+	NotRunSourceUnavailable  NotRunCause = "source_unavailable"
+	NotRunHelperUnreachable  NotRunCause = "helper_unreachable"
+	NotRunNotConfigured      NotRunCause = "not_configured"
+	NotRunNotApplicable      NotRunCause = "not_applicable"
+	NotRunNoProbeReceipt     NotRunCause = "no_probe_receipt"
+	NotRunDependencyMissing  NotRunCause = "dependency_unavailable"
+	NotRunDesiredUnavailable NotRunCause = "desired_unavailable"
+)
+
+func (cause NotRunCause) Valid() bool {
+	switch cause {
+	case NotRunSourceUnavailable, NotRunHelperUnreachable, NotRunNotConfigured, NotRunNotApplicable,
+		NotRunNoProbeReceipt, NotRunDependencyMissing, NotRunDesiredUnavailable:
+		return true
+	default:
+		return false
+	}
 }
 
 type PlatformFacts struct {
@@ -48,7 +85,7 @@ type AgentFacts struct {
 
 type HelperDoctorFacts struct {
 	Outcome           DiagnosticOutcome `json:"outcome"`
-	ProtocolVersion   int               `json:"protocol_version,omitempty"`
+	ProtocolVersion   int               `json:"protocol_version"`
 	Version           string            `json:"version,omitempty"`
 	Checksum          string            `json:"checksum,omitempty"`
 	InstanceID        string            `json:"instance_id,omitempty"`
@@ -56,11 +93,11 @@ type HelperDoctorFacts struct {
 }
 
 type VersionFacts struct {
-	Outcome           DiagnosticOutcome `json:"outcome"`
-	Containerd        string            `json:"containerd,omitempty"`
-	Runc              string            `json:"runc,omitempty"`
-	Supported         bool              `json:"supported"`
-	WithinTestedRange bool              `json:"within_tested_range"`
+	Outcome            DiagnosticOutcome `json:"outcome"`
+	Containerd         string            `json:"containerd,omitempty"`
+	Runc               string            `json:"runc,omitempty"`
+	RuncSource         string            `json:"runc_source,omitempty"`
+	OutsideTestedRange bool              `json:"outside_tested_range"`
 }
 
 type ProbeDoctorFacts struct {
@@ -68,26 +105,28 @@ type ProbeDoctorFacts struct {
 	Verdict                    string                        `json:"verdict"`
 	ObservedAt                 *time.Time                    `json:"observed_at,omitempty"`
 	AgeSeconds                 *int64                        `json:"age_seconds,omitempty"`
+	ProbeRevision              int64                         `json:"probe_revision"`
 	CapabilityRevision         int64                         `json:"capability_revision"`
-	PendingPublicationRevision int64                         `json:"pending_publication_revision,omitempty"`
+	PendingPublicationRevision int64                         `json:"pending_publication_revision"`
 	CapabilityObservedAt       time.Time                     `json:"capability_observed_at"`
 	Capabilities               map[string]bool               `json:"capabilities"`
 	MissingCapabilities        []string                      `json:"missing_capabilities"`
 	ReasonCode                 contract.CapabilityReasonCode `json:"reason_code,omitempty"`
+	CapabilityReasonCode       contract.CapabilityReasonCode `json:"capability_reason_code,omitempty"`
 }
 
 type IntentDoctorFacts struct {
 	Outcome   DiagnosticOutcome `json:"outcome"`
-	Version   int               `json:"version,omitempty"`
-	Revision  uint64            `json:"revision,omitempty"`
+	Version   int               `json:"version"`
+	Revision  uint64            `json:"revision"`
 	Enabled   bool              `json:"enabled"`
 	UpdatedAt *time.Time        `json:"updated_at,omitempty"`
 }
 
 type CacheDoctorFacts struct {
 	Outcome      DiagnosticOutcome             `json:"outcome"`
-	Bytes        int64                         `json:"bytes,omitempty"`
-	CapBytes     int64                         `json:"cap_bytes,omitempty"`
+	Bytes        int64                         `json:"bytes"`
+	CapBytes     int64                         `json:"cap_bytes"`
 	WithinBound  bool                          `json:"within_bound"`
 	LastEviction *ocihelper.ImageCacheEviction `json:"last_eviction,omitempty"`
 }
@@ -101,6 +140,7 @@ type ConvergenceDoctorFacts struct {
 	Outcome DiagnosticOutcome `json:"outcome"`
 	Class   ConvergenceClass  `json:"class,omitempty"`
 	State   *SetupState       `json:"state,omitempty"`
+	Desired *SetupState       `json:"desired,omitempty"`
 }
 
 type LimaDoctorFacts struct {
@@ -110,12 +150,14 @@ type LimaDoctorFacts struct {
 }
 
 type DiagnosticFinding struct {
-	Check      string                        `json:"check"`
-	Outcome    DiagnosticOutcome             `json:"outcome"`
-	Code       string                        `json:"code"`
-	ReasonCode contract.CapabilityReasonCode `json:"reason_code,omitempty"`
-	Detail     string                        `json:"detail"`
-	Runbook    string                        `json:"runbook"`
+	Check       string                        `json:"check"`
+	Outcome     DiagnosticOutcome             `json:"outcome"`
+	Severity    DiagnosticSeverity            `json:"severity"`
+	Code        string                        `json:"code"`
+	ReasonCode  contract.CapabilityReasonCode `json:"reason_code,omitempty"`
+	NotRunCause NotRunCause                   `json:"not_run_cause,omitempty"`
+	Detail      string                        `json:"detail"`
+	Runbook     string                        `json:"runbook"`
 }
 
 type DoctorLimitation struct {
@@ -151,28 +193,35 @@ type HelperDoctorSnapshot struct {
 	InstanceID              string
 	SessionGeneration       uint64
 	Runtime                 ocihelper.DoctorStatus
+	RuntimeError            error
 	RuntimePlatformRecorded bool
+	SweepReceipt            ocihelper.VerifiedSweepReceipt
+	SweepReceiptRecorded    bool
 }
 
 type DoctorConfig struct {
-	Clock              Clock
-	HostPlatform       PlatformFacts
-	AgentUser          string
-	LaunchUnit         string
-	CapabilitySnapshot func() agent.CapabilitySnapshot
-	Intent             func(context.Context) (lima.OCIIntent, error)
-	LimaFacts          func() lima.SupervisorFacts
-	Helper             HelperDoctorSource
-	SetupStatePath     string
-	ReadSetupState     func(string) (SetupState, error)
+	Clock                 Clock
+	HostPlatform          PlatformFacts
+	AgentUser             string
+	LaunchUnit            string
+	CapabilitySnapshot    func() agent.CapabilitySnapshot
+	Intent                func(context.Context) (lima.OCIIntent, error)
+	LimaFacts             func() lima.SupervisorFacts
+	Helper                HelperDoctorSource
+	SetupStatePath        string
+	ReadSetupState        func(string) (SetupState, error)
+	DesiredSetupStatePath string
+	ReadDesiredSetupState func(string) (SetupState, error)
 }
 
 type diagnosticReceipt struct {
-	ran        bool
-	passed     bool
-	code       string
-	reasonCode contract.CapabilityReasonCode
-	detail     string
+	ran         bool
+	passed      bool
+	code        string
+	reasonCode  contract.CapabilityReasonCode
+	notRunCause NotRunCause
+	severity    DiagnosticSeverity
+	detail      string
 }
 
 func finding(check string, receipt diagnosticReceipt) DiagnosticFinding {
@@ -186,19 +235,33 @@ func finding(check string, receipt diagnosticReceipt) DiagnosticFinding {
 	if code == "" {
 		code = "oci_" + strings.ReplaceAll(check, "-", "_")
 	}
+	severity := receipt.severity
+	if severity == "" {
+		severity = DiagnosticWarn
+		if outcome == DiagnosticOK {
+			severity = DiagnosticInfo
+		} else if outcome == DiagnosticFailed {
+			severity = DiagnosticError
+		}
+	}
+	reason := receipt.reasonCode
+	cause := receipt.notRunCause
+	if outcome == DiagnosticNotRun {
+		reason = ""
+		if !cause.Valid() {
+			cause = NotRunSourceUnavailable
+		}
+	} else {
+		cause = ""
+	}
 	return DiagnosticFinding{
-		Check: check, Outcome: outcome, Code: code, ReasonCode: receipt.reasonCode,
-		Detail: receipt.detail, Runbook: runbookFor(receipt.reasonCode, code),
+		Check: check, Outcome: outcome, Severity: severity, Code: code, ReasonCode: reason, NotRunCause: cause,
+		Detail: receipt.detail, Runbook: runbookFor(code),
 	}
 }
 
-func runbookFor(reason contract.CapabilityReasonCode, code string) string {
-	anchor := code
-	if reason.Valid() {
-		anchor = string(reason)
-	}
-	anchor = strings.ReplaceAll(anchor, "_", "-")
-	return "docs/runbooks/oci-node.md#doctor-code-" + anchor
+func runbookFor(code string) string {
+	return DoctorRunbookPrefix + strings.ReplaceAll(code, "_", "-")
 }
 
 func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
@@ -241,20 +304,24 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 	buildIntent(ctx, config, &report)
 	buildCapability(config, now, &report)
 	buildLima(config, &report)
-	buildHelper(ctx, config, &report)
 	buildConvergence(config, &report)
+	buildHelper(ctx, config, &report)
 	return report
 }
 
 func buildIntent(ctx context.Context, config DoctorConfig, report *DoctorResponse) {
 	if config.Intent == nil {
-		report.Findings = append(report.Findings, finding("intent", diagnosticReceipt{code: "oci_intent_not_read", reasonCode: contract.CapabilityReasonOCIIntentDisabled, detail: "durable OCI intent was not available to the doctor"}))
+		report.Findings = append(report.Findings, finding("intent", diagnosticReceipt{code: "oci_intent_not_read", notRunCause: NotRunSourceUnavailable, detail: "durable OCI intent was not available to the doctor"}))
 		return
 	}
 	intent, err := config.Intent(ctx)
-	if err != nil || intent.Version != lima.OCIIntentVersion || intent.Revision == 0 {
+	if err != nil {
+		report.Findings = append(report.Findings, finding("intent", diagnosticReceipt{code: "oci_intent_not_read", notRunCause: NotRunSourceUnavailable, detail: "durable OCI intent could not be read"}))
+		return
+	}
+	if intent.Version != lima.OCIIntentVersion || intent.Revision == 0 {
 		report.Intent.Outcome = DiagnosticFailed
-		report.Findings = append(report.Findings, finding("intent", diagnosticReceipt{ran: true, code: "oci_intent_unavailable", reasonCode: contract.CapabilityReasonOCIIntentDisabled, detail: "durable OCI intent is missing, unreadable, or malformed"}))
+		report.Findings = append(report.Findings, finding("intent", diagnosticReceipt{ran: true, code: "oci_intent_unavailable", reasonCode: contract.CapabilityReasonPrerequisiteMissing, detail: "durable OCI intent was read but is malformed"}))
 		return
 	}
 	updatedAt := intent.UpdatedAt.UTC().Round(0)
@@ -272,8 +339,9 @@ func buildIntent(ctx context.Context, config DoctorConfig, report *DoctorRespons
 
 func buildCapability(config DoctorConfig, now time.Time, report *DoctorResponse) {
 	if config.CapabilitySnapshot == nil {
-		report.Findings = append(report.Findings, finding("probe", diagnosticReceipt{code: "oci_probe_not_recorded", reasonCode: contract.CapabilityReasonProbeFailed, detail: "shared capability observation was unavailable"}))
-		report.Findings = append(report.Findings, finding("capability-revision", diagnosticReceipt{code: "oci_capability_revision_not_read", reasonCode: contract.CapabilityReasonProbeFailed, detail: "Capability revision was not read"}))
+		report.Findings = append(report.Findings, finding("probe", diagnosticReceipt{code: "oci_probe_not_recorded", notRunCause: NotRunSourceUnavailable, detail: "shared capability observation was unavailable"}))
+		report.Findings = append(report.Findings, finding("capability-observation", diagnosticReceipt{code: "oci_capability_observation_not_read", notRunCause: NotRunSourceUnavailable, detail: "shared capability observation was unavailable"}))
+		report.Findings = append(report.Findings, finding("capability-revision", diagnosticReceipt{code: "oci_capability_revision_not_read", notRunCause: NotRunSourceUnavailable, detail: "capability revision was not read"}))
 		return
 	}
 	snapshot := config.CapabilitySnapshot()
@@ -283,7 +351,7 @@ func buildCapability(config DoctorConfig, now time.Time, report *DoctorResponse)
 	report.Probe.CapabilityObservedAt = observation.ObservedAt.UTC().Round(0)
 	report.Probe.Capabilities = cloneBoolMap(observation.Capabilities)
 	report.Probe.MissingCapabilities = append([]string{}, observation.MissingCapabilities...)
-	report.Probe.ReasonCode = observation.ReasonCode
+	report.Probe.CapabilityReasonCode = observation.ReasonCode
 	validTuple := observation.Revision > 0 && !observation.ObservedAt.IsZero() &&
 		(len(observation.MissingCapabilities) == 0 && observation.ReasonCode == "" || len(observation.MissingCapabilities) > 0 && observation.ReasonCode.Valid())
 	revisionCurrent := validTuple && snapshot.PendingPublicationRevision == 0
@@ -297,13 +365,24 @@ func buildCapability(config DoctorConfig, now time.Time, report *DoctorResponse)
 		}
 	}
 	report.Findings = append(report.Findings, finding("capability-revision", diagnosticReceipt{ran: true, passed: revisionCurrent, code: code, reasonCode: reason, detail: "the complete L1 capability metadata tuple was read from shared agent state"}))
+	observationPassed := validTuple && observation.Capabilities["kind:oci"] && observation.ReasonCode == ""
+	observationReason := observation.ReasonCode
+	if !observationPassed && !observationReason.Valid() {
+		observationReason = contract.CapabilityReasonProbeFailed
+	}
+	observationCode := "oci_capability_observation_restricted"
+	if observationPassed {
+		observationCode = "oci_capability_observation_current"
+	}
+	report.Findings = append(report.Findings, finding("capability-observation", diagnosticReceipt{ran: true, passed: observationPassed, code: observationCode, reasonCode: observationReason, detail: "the current admission and L1 capability observation was read independently of the last probe receipt"}))
 
-	if snapshot.LastProbeAt.IsZero() {
+	if snapshot.LastProbe == nil || snapshot.LastProbe.ObservedAt.IsZero() {
 		report.Probe.Outcome = DiagnosticNotRun
-		report.Findings = append(report.Findings, finding("probe", diagnosticReceipt{code: "oci_probe_not_recorded", reasonCode: contract.CapabilityReasonProbeFailed, detail: "no completed functional probe is recorded"}))
+		report.Findings = append(report.Findings, finding("probe", diagnosticReceipt{code: "oci_probe_not_recorded", notRunCause: NotRunNoProbeReceipt, detail: "no completed functional probe receipt is recorded"}))
 		return
 	}
-	probeAt := snapshot.LastProbeAt.UTC().Round(0)
+	lastProbe := snapshot.LastProbe
+	probeAt := lastProbe.ObservedAt.UTC().Round(0)
 	age := now.Sub(probeAt) / time.Second
 	if age < 0 {
 		age = 0
@@ -311,13 +390,14 @@ func buildCapability(config DoctorConfig, now time.Time, report *DoctorResponse)
 	ageSeconds := int64(age)
 	report.Probe.ObservedAt = &probeAt
 	report.Probe.AgeSeconds = &ageSeconds
-	passed := observation.Capabilities["kind:oci"] && observation.ReasonCode == ""
+	report.Probe.ProbeRevision = lastProbe.Revision
+	passed := lastProbe.Capabilities["kind:oci"] && lastProbe.ReasonCode == ""
 	report.Probe.Outcome = outcomeFor(true, passed)
 	report.Probe.Verdict = "failed"
 	if passed {
 		report.Probe.Verdict = "passed"
 	}
-	reason = observation.ReasonCode
+	reason = lastProbe.ReasonCode
 	if !passed && !reason.Valid() {
 		reason = contract.CapabilityReasonProbeFailed
 	}
@@ -326,11 +406,11 @@ func buildCapability(config DoctorConfig, now time.Time, report *DoctorResponse)
 
 func buildLima(config DoctorConfig, report *DoctorResponse) {
 	if !report.Lima.Applicable {
-		report.Findings = append(report.Findings, finding("lima", diagnosticReceipt{code: "lima_not_applicable", detail: "Lima is not applicable to this host platform"}))
+		report.Findings = append(report.Findings, finding("lima", diagnosticReceipt{code: "oci_lima_not_applicable", notRunCause: NotRunNotApplicable, detail: "Lima is not applicable to this host platform"}))
 		return
 	}
 	if config.LimaFacts == nil {
-		report.Findings = append(report.Findings, finding("lima", diagnosticReceipt{code: "lima_not_observed", reasonCode: contract.CapabilityReasonLimaStopped, detail: "Lima supervisor facts were unavailable"}))
+		report.Findings = append(report.Findings, finding("lima", diagnosticReceipt{code: "oci_lima_not_observed", notRunCause: NotRunSourceUnavailable, detail: "Lima supervisor facts were unavailable"}))
 		return
 	}
 	facts := config.LimaFacts()
@@ -348,7 +428,7 @@ func buildLima(config DoctorConfig, report *DoctorResponse) {
 		}
 	}
 	report.Lima.Outcome = outcomeFor(true, passed)
-	report.Findings = append(report.Findings, finding("lima", diagnosticReceipt{ran: true, passed: passed, code: "lima_" + string(facts.State), reasonCode: reason, detail: "recorded Lima supervisor facts were read without inspection or recovery"}))
+	report.Findings = append(report.Findings, finding("lima", diagnosticReceipt{ran: true, passed: passed, code: "oci_lima_state", reasonCode: reason, detail: "recorded Lima supervisor facts were read without inspection or recovery"}))
 }
 
 func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorResponse) {
@@ -357,18 +437,23 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 		return
 	}
 	snapshot, err := config.Helper(ctx)
-	if err != nil {
+	if err != nil && snapshot.ProtocolVersion == 0 && snapshot.Version == "" && snapshot.InstanceID == "" {
 		report.Helper.Outcome = DiagnosticFailed
 		report.Findings = append(report.Findings, finding("helper-handshake", diagnosticReceipt{ran: true, code: "oci_helper_unreachable", reasonCode: contract.CapabilityReasonHelperUnreachable, detail: "the current helper session was absent or unreachable"}))
-		appendHelperDependentsNotRun(report, contract.CapabilityReasonHelperUnreachable)
+		appendHelperDependentsNotRun(report, NotRunHelperUnreachable)
 		return
 	}
 	validHandshake := snapshot.ProtocolVersion == ocihelper.ProtocolVersion && snapshot.Version != "" && snapshot.Checksum != "" && snapshot.InstanceID != "" && snapshot.SessionGeneration > 0
 	reason := contract.CapabilityReasonCode("")
 	code := "oci_helper_handshake_ok"
 	if !validHandshake {
-		reason = contract.CapabilityReasonHelperHandshakeFailed
-		code = "oci_helper_handshake_failed"
+		if snapshot.ProtocolVersion != 0 && snapshot.ProtocolVersion != ocihelper.ProtocolVersion {
+			reason = contract.CapabilityReasonHelperVersionMismatch
+			code = "oci_helper_version_mismatch"
+		} else {
+			reason = contract.CapabilityReasonHelperHandshakeFailed
+			code = "oci_helper_handshake_failed"
+		}
 	}
 	report.Helper = HelperDoctorFacts{
 		Outcome: outcomeFor(true, validHandshake), ProtocolVersion: snapshot.ProtocolVersion,
@@ -377,8 +462,18 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 	}
 	report.Findings = append(report.Findings, finding("helper-handshake", diagnosticReceipt{ran: true, passed: validHandshake, code: code, reasonCode: reason, detail: "the existing authenticated helper handshake was read; no session was acquired"}))
 	if !validHandshake {
-		appendHelperDependentsNotRun(report, reason)
+		appendHelperDependentsNotRun(report, NotRunDependencyMissing)
 		return
+	}
+
+	sweepOK := snapshot.SweepReceiptRecorded && snapshot.SweepReceipt.SweepEpoch != "" &&
+		snapshot.SweepReceipt.HelperSession.HelperInstanceID == snapshot.InstanceID &&
+		snapshot.SweepReceipt.HelperSession.SessionGeneration == snapshot.SessionGeneration &&
+		ocihelper.InventoryEmpty(snapshot.SweepReceipt.VerifiedInventory)
+	if snapshot.SweepReceiptRecorded {
+		report.Findings = append(report.Findings, finding("boot-sweep", diagnosticReceipt{ran: true, passed: sweepOK, code: map[bool]string{true: "oci_boot_sweep_verified", false: "oci_boot_sweep_failed"}[sweepOK], reasonCode: reasonUnless(sweepOK, contract.CapabilityReasonBootSweepFailed), detail: "the barrier-pinned namespace sweep receipt was checked without running a sweep"}))
+	} else {
+		report.Findings = append(report.Findings, finding("boot-sweep", diagnosticReceipt{code: "oci_boot_sweep_not_recorded", notRunCause: NotRunSourceUnavailable, detail: "no barrier-pinned namespace sweep receipt was available"}))
 	}
 
 	runtimeStatus := snapshot.Runtime
@@ -391,66 +486,144 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 	if snapshot.RuntimePlatformRecorded {
 		platformCode = "oci_runtime_platform_observed"
 	}
-	report.Findings = append(report.Findings, finding("runtime-platform", diagnosticReceipt{ran: snapshot.RuntimePlatformRecorded, passed: platformOK, code: platformCode, reasonCode: reasonUnless(platformOK, contract.CapabilityReasonProbeFailed), detail: "runtime platform was read from the recorded functional probe"}))
+	report.Findings = append(report.Findings, finding("runtime-platform", diagnosticReceipt{ran: snapshot.RuntimePlatformRecorded, passed: platformOK, code: platformCode, notRunCause: NotRunNoProbeReceipt, detail: "runtime platform was read from the recorded functional probe"}))
 
-	versionsOK := minimumRuntimeVersions(runtimeStatus.ContainerdVersion, runtimeStatus.RuncVersion)
-	testedRange := testedRuntimeVersions(runtimeStatus.ContainerdVersion, runtimeStatus.RuncVersion)
-	versionCode := "oci_runtime_versions_tested"
-	if versionsOK && !testedRange {
-		versionCode = "oci_runtime_versions_outside_tested_range"
-	} else if !versionsOK {
-		versionCode = "oci_runtime_version_unsupported"
+	if snapshot.RuntimeError == nil {
+		snapshot.RuntimeError = err
 	}
-	report.Versions = VersionFacts{Outcome: outcomeFor(true, versionsOK), Containerd: runtimeStatus.ContainerdVersion, Runc: runtimeStatus.RuncVersion, Supported: versionsOK, WithinTestedRange: testedRange}
-	report.Findings = append(report.Findings, finding("runtime-versions", diagnosticReceipt{ran: true, passed: versionsOK, code: versionCode, reasonCode: reasonUnless(versionsOK, contract.CapabilityReasonRuntimeVersionUnsupported), detail: "containerd and runc versions were read without starting a workload"}))
+	if snapshot.RuntimeError != nil {
+		appendMechanicsDependentsNotRun(report, NotRunSourceUnavailable)
+		return
+	}
 
+	containerdRead := runtimeStatus.ContainerdRead.Outcome == ocihelper.DiagnosticReadOK || runtimeStatus.ContainerdRead.Outcome == "" && runtimeStatus.ContainerdVersion != ""
+	runcRead := runtimeStatus.RuncRead.Outcome == ocihelper.DiagnosticReadOK || runtimeStatus.RuncRead.Outcome == "" && runtimeStatus.RuncVersion != ""
+	versionsRan := runtimeStatus.ContainerdRead.Outcome != "" || runtimeStatus.RuncRead.Outcome != "" || containerdRead || runcRead
+	versionsOK := containerdRead && runcRead
+	outOfRange := versionsOK && !testedRuntimeVersions(runtimeStatus.ContainerdVersion, runtimeStatus.RuncVersion)
+	report.Versions = VersionFacts{Outcome: outcomeFor(versionsRan, versionsOK), Containerd: runtimeStatus.ContainerdVersion, Runc: runtimeStatus.RuncVersion, RuncSource: runtimeStatus.RuncVersionSource, OutsideTestedRange: outOfRange}
+	versionCode := "oci_runtime_versions_observed"
+	severity := DiagnosticSeverity("")
+	if !versionsOK {
+		versionCode = "oci_runtime_versions_unavailable"
+	} else if outOfRange {
+		versionCode = "oci_runtime_versions_outside_tested_range"
+		severity = DiagnosticWarn
+	} else {
+		severity = DiagnosticInfo
+	}
+	report.Findings = append(report.Findings, finding("runtime-versions", diagnosticReceipt{ran: versionsRan, passed: versionsOK, code: versionCode, severity: severity, notRunCause: NotRunSourceUnavailable, detail: "containerd and runc version facts were read without gating capability"}))
+
+	cacheRead := runtimeStatus.CacheRead.Outcome == ocihelper.DiagnosticReadOK || runtimeStatus.CacheRead.Outcome == "" && runtimeStatus.Cache.CapBytes > 0
+	cacheRan := runtimeStatus.CacheRead.Outcome != "" || cacheRead
 	cache := runtimeStatus.Cache
-	cacheOK := cache.CapBytes > 0 && cache.Bytes >= 0 && cache.Bytes <= cache.CapBytes
-	report.Cache = CacheDoctorFacts{Outcome: outcomeFor(true, cacheOK), Bytes: cache.Bytes, CapBytes: cache.CapBytes, WithinBound: cacheOK, LastEviction: cache.LastEviction}
-	report.Findings = append(report.Findings, finding("cache", diagnosticReceipt{ran: true, passed: cacheOK, code: cacheCode(cacheOK), detail: "cache accounting was read without enforcing or evicting"}))
+	cacheOK := cacheRead && cache.CapBytes > 0 && cache.Bytes >= 0 && cache.Bytes <= cache.CapBytes && runtimeStatus.CacheLastErrorCode == ""
+	cacheCodeValue := cacheCode(cacheOK)
+	if runtimeStatus.CacheLastErrorCode != "" {
+		cacheCodeValue = "oci_cache_eviction_failed"
+	} else if !cacheRead {
+		cacheCodeValue = "oci_cache_status_unavailable"
+	}
+	report.Cache = CacheDoctorFacts{Outcome: outcomeFor(cacheRan, cacheOK), Bytes: cache.Bytes, CapBytes: cache.CapBytes, WithinBound: cacheOK, LastEviction: cache.LastEviction}
+	report.Findings = append(report.Findings, finding("cache", diagnosticReceipt{ran: cacheRan, passed: cacheOK, code: cacheCodeValue, notRunCause: NotRunSourceUnavailable, detail: "bounded cache accounting was read without enforcing or evicting"}))
 
-	roots := append([]string{}, runtimeStatus.AllowedMountRoots...)
-	sort.Strings(roots)
-	report.Mounts = MountDoctorFacts{Outcome: DiagnosticOK, AllowedRoots: roots}
-	report.Findings = append(report.Findings, finding("mount-roots", diagnosticReceipt{ran: true, passed: true, code: "oci_mount_roots_observed", detail: "the configured helper mount allowlist was read without path traversal"}))
+	buildMountRoots(runtimeStatus, report)
 }
 
 func appendHelperNotRun(report *DoctorResponse, detail string) {
-	report.Findings = append(report.Findings, finding("helper-handshake", diagnosticReceipt{code: "oci_helper_not_read", reasonCode: contract.CapabilityReasonHelperUnreachable, detail: detail}))
-	appendHelperDependentsNotRun(report, contract.CapabilityReasonHelperUnreachable)
+	report.Findings = append(report.Findings, finding("helper-handshake", diagnosticReceipt{code: "oci_helper_not_read", notRunCause: NotRunNotConfigured, detail: detail}))
+	report.Findings = append(report.Findings, finding("boot-sweep", diagnosticReceipt{code: "oci_boot_sweep_not_recorded", notRunCause: NotRunDependencyMissing, detail: "the helper handshake did not run"}))
+	appendRuntimeDependentsNotRun(report, NotRunDependencyMissing)
 }
 
-func appendHelperDependentsNotRun(report *DoctorResponse, reason contract.CapabilityReasonCode) {
+func appendHelperDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
+	report.Findings = append(report.Findings, finding("boot-sweep", diagnosticReceipt{code: "oci_boot_sweep_not_recorded", notRunCause: cause, detail: "the dependent helper receipt read did not run"}))
+	appendRuntimeDependentsNotRun(report, cause)
+}
+
+func appendRuntimeDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
 	for _, check := range []string{"runtime-platform", "runtime-versions", "cache", "mount-roots"} {
-		report.Findings = append(report.Findings, finding(check, diagnosticReceipt{code: "oci_" + strings.ReplaceAll(check, "-", "_") + "_not_run", reasonCode: reason, detail: "the dependent helper read did not run"}))
+		report.Findings = append(report.Findings, finding(check, diagnosticReceipt{code: "oci_" + strings.ReplaceAll(check, "-", "_") + "_not_run", notRunCause: cause, detail: "the dependent helper read did not run"}))
+	}
+}
+
+func appendMechanicsDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
+	for _, check := range []string{"runtime-versions", "cache", "mount-roots"} {
+		report.Findings = append(report.Findings, finding(check, diagnosticReceipt{code: "oci_" + strings.ReplaceAll(check, "-", "_") + "_not_run", notRunCause: cause, detail: "the dependent helper read did not run"}))
 	}
 }
 
 func buildConvergence(config DoctorConfig, report *DoctorResponse) {
 	if config.SetupStatePath == "" {
-		report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{code: "oci_convergence_not_read", reasonCode: contract.CapabilityReasonPrerequisiteMissing, detail: "durable setup convergence state was not configured"}))
+		report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{code: "oci_convergence_not_read", notRunCause: NotRunNotConfigured, detail: "durable setup convergence state was not configured"}))
 		return
 	}
 	read := config.ReadSetupState
 	if read == nil {
 		read = ReadSetupState
 	}
-	state, err := read(config.SetupStatePath)
+	current, err := read(config.SetupStatePath)
 	if err != nil {
 		report.Convergence.Outcome = DiagnosticFailed
 		report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{ran: true, code: "oci_convergence_state_unavailable", reasonCode: contract.CapabilityReasonPrerequisiteMissing, detail: "durable setup convergence state is missing, unreadable, or malformed"}))
 		return
 	}
-	class := ConvergenceUnchanged
-	reason := report.Probe.ReasonCode
-	if reason == contract.CapabilityReasonTemplateRestartRequired {
-		class = ConvergenceRestartRequired
-	} else if reason == contract.CapabilityReasonTemplateRecreateRequired {
-		class = ConvergenceRecreateRequired
+	report.Convergence.State = &current
+	desiredPath := config.DesiredSetupStatePath
+	if desiredPath == "" {
+		desiredPath = DesiredSetupStatePath(config.SetupStatePath)
 	}
+	readDesired := config.ReadDesiredSetupState
+	if readDesired == nil {
+		readDesired = read
+	}
+	if desiredPath == "" {
+		report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{code: "oci_convergence_desired_not_read", notRunCause: NotRunDesiredUnavailable, detail: "desired setup state was not configured"}))
+		return
+	}
+	desired, desiredErr := readDesired(desiredPath)
+	if desiredErr != nil {
+		report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{code: "oci_convergence_desired_not_read", notRunCause: NotRunDesiredUnavailable, detail: "desired setup state was unavailable"}))
+		return
+	}
+	report.Convergence.Desired = &desired
+	class := ClassifyConvergence(current, desired)
 	passed := class == ConvergenceUnchanged || class == ConvergenceLiveSafe
-	report.Convergence = ConvergenceDoctorFacts{Outcome: outcomeFor(true, passed), Class: class, State: &state}
-	report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{ran: true, passed: passed, code: "oci_convergence_" + string(class), reasonCode: reasonUnless(passed, reason), detail: "durable convergence state was read without applying it"}))
+	reason := contract.CapabilityReasonCode("")
+	if class == ConvergenceRestartRequired {
+		reason = contract.CapabilityReasonTemplateRestartRequired
+	} else if class == ConvergenceRecreateRequired {
+		reason = contract.CapabilityReasonTemplateRecreateRequired
+	}
+	report.Convergence.Outcome = outcomeFor(true, passed)
+	report.Convergence.Class = class
+	report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{ran: true, passed: passed, code: "oci_convergence_" + string(class), reasonCode: reason, detail: "current and desired durable setup states were compared without applying them"}))
+}
+
+func buildMountRoots(runtimeStatus ocihelper.DoctorStatus, report *DoctorResponse) {
+	rootsRead := runtimeStatus.MountRootsRead.Outcome == ocihelper.DiagnosticReadOK || runtimeStatus.MountRootsRead.Outcome == "" && runtimeStatus.AllowedMountRoots != nil
+	if !rootsRead {
+		report.Findings = append(report.Findings, finding("mount-roots", diagnosticReceipt{ran: runtimeStatus.MountRootsRead.Outcome != "", code: "oci_mount_roots_unavailable", notRunCause: NotRunSourceUnavailable, detail: "the configured helper mount allowlist was unavailable"}))
+		return
+	}
+	roots := append([]string{}, runtimeStatus.AllowedMountRoots...)
+	sort.Strings(roots)
+	report.Mounts.AllowedRoots = roots
+	if report.Convergence.State == nil {
+		report.Findings = append(report.Findings, finding("mount-roots", diagnosticReceipt{code: "oci_mount_roots_not_run", notRunCause: NotRunDependencyMissing, detail: "current setup mount root was unavailable for comparison"}))
+		return
+	}
+	hostRoot := filepath.Clean(report.Convergence.State.HostMountRoot)
+	matched := false
+	for _, root := range roots {
+		cleanRoot := filepath.Clean(root)
+		if hostRoot == cleanRoot || strings.HasPrefix(hostRoot, cleanRoot+string(filepath.Separator)) {
+			matched = true
+			break
+		}
+	}
+	report.Mounts.Outcome = outcomeFor(true, matched)
+	report.Findings = append(report.Findings, finding("mount-roots", diagnosticReceipt{ran: true, passed: matched, code: map[bool]string{true: "oci_mount_roots_observed", false: "oci_mount_root_unavailable"}[matched], reasonCode: reasonUnless(matched, contract.CapabilityReasonMountRootUnavailable), detail: "current setup mount root was compared with the helper allowlist"}))
 }
 
 func outcomeFor(ran, passed bool) DiagnosticOutcome {
@@ -480,40 +653,9 @@ func cacheCode(ok bool) string {
 	return "oci_cache_over_bound"
 }
 
-func minimumRuntimeVersions(containerdVersion, runcVersion string) bool {
-	containerdMajor, ok := versionMajor(containerdVersion)
-	if !ok || containerdMajor < 2 {
-		return false
-	}
-	runcMajor, ok := versionMajor(runcVersion)
-	return ok && runcMajor == 1
-}
-
 func testedRuntimeVersions(containerdVersion, runcVersion string) bool {
-	containerdMajor, containerdMinor, ok := versionMajorMinor(containerdVersion)
-	if !ok || containerdMajor != 2 || containerdMinor != 3 {
-		return false
-	}
-	runcMajor, runcMinor, ok := versionMajorMinor(runcVersion)
-	return ok && runcMajor == 1 && runcMinor == 5
-}
-
-func versionMajorMinor(value string) (int, int, bool) {
-	value = strings.TrimSpace(strings.TrimPrefix(value, "v"))
-	parts := strings.Split(value, ".")
-	if len(parts) < 2 {
-		return 0, 0, false
-	}
-	major, majorErr := strconv.Atoi(parts[0])
-	minor, minorErr := strconv.Atoi(parts[1])
-	return major, minor, majorErr == nil && minorErr == nil
-}
-
-func versionMajor(value string) (int, bool) {
-	value = strings.TrimSpace(strings.TrimPrefix(value, "v"))
-	majorText, _, _ := strings.Cut(value, ".")
-	major, err := strconv.Atoi(majorText)
-	return major, err == nil
+	return strings.TrimPrefix(strings.TrimSpace(containerdVersion), "v") == TestedContainerdVersion &&
+		strings.TrimPrefix(strings.TrimSpace(runcVersion), "v") == TestedRuncVersion
 }
 
 func cloneBoolMap(values map[string]bool) map[string]bool {
@@ -537,6 +679,25 @@ func StableDoctorReasonCodes() []contract.CapabilityReasonCode {
 	}
 }
 
+func StableDoctorCodes() []string {
+	return []string{
+		"oci_host_platform_observed", "oci_agent_user_observed",
+		"oci_intent_not_read", "oci_intent_unavailable", "oci_intent_enabled", "oci_intent_disabled",
+		"oci_capability_revision_not_read", "oci_capability_revision_current", "oci_capability_revision_pending",
+		"oci_capability_observation_not_read", "oci_capability_observation_current", "oci_capability_observation_restricted",
+		"oci_probe_not_recorded", "oci_probe_passed", "oci_probe_failed",
+		"oci_lima_not_applicable", "oci_lima_not_observed", "oci_lima_state",
+		"oci_helper_not_read", "oci_helper_unreachable", "oci_helper_handshake_ok", "oci_helper_handshake_failed", "oci_helper_version_mismatch",
+		"oci_boot_sweep_not_recorded", "oci_boot_sweep_verified", "oci_boot_sweep_failed",
+		"oci_runtime_platform_not_run", "oci_runtime_platform_not_recorded", "oci_runtime_platform_observed",
+		"oci_runtime_versions_not_run", "oci_runtime_versions_unavailable", "oci_runtime_versions_observed", "oci_runtime_versions_outside_tested_range",
+		"oci_cache_not_run", "oci_cache_status_unavailable", "oci_cache_within_bound", "oci_cache_over_bound", "oci_cache_eviction_failed",
+		"oci_mount_roots_not_run", "oci_mount_roots_unavailable", "oci_mount_roots_observed", "oci_mount_root_unavailable",
+		"oci_convergence_not_read", "oci_convergence_state_unavailable", "oci_convergence_desired_not_read",
+		"oci_convergence_unchanged", "oci_convergence_live_safe", "oci_convergence_restart_required", "oci_convergence_recreate_required",
+	}
+}
+
 func (report DoctorResponse) Validate() error {
 	if report.Version != DoctorVersion || report.ObservedAt.IsZero() || report.HostPlatform.OS == "" || report.HostPlatform.Architecture == "" {
 		return fmt.Errorf("invalid doctor header")
@@ -548,16 +709,30 @@ func (report DoctorResponse) Validate() error {
 		return fmt.Errorf("doctor UID-isolation limitation is missing")
 	}
 	seen := make(map[string]struct{}, len(report.Findings))
+	stableCodes := make(map[string]struct{}, len(StableDoctorCodes()))
+	for _, code := range StableDoctorCodes() {
+		stableCodes[code] = struct{}{}
+	}
 	for _, item := range report.Findings {
-		if item.Check == "" || !item.Outcome.Valid() || item.Code == "" || item.Detail == "" || !strings.HasPrefix(item.Runbook, "docs/runbooks/oci-node.md#doctor-code-") {
+		if item.Check == "" || !item.Outcome.Valid() || !item.Severity.Valid() || item.Code == "" || item.Detail == "" || !strings.HasPrefix(item.Runbook, DoctorRunbookPrefix) {
 			return fmt.Errorf("invalid doctor finding for %q", item.Check)
+		}
+		if _, ok := stableCodes[item.Code]; !ok {
+			return fmt.Errorf("doctor finding %q used undocumented code %q", item.Check, item.Code)
 		}
 		if item.ReasonCode != "" && !item.ReasonCode.Valid() {
 			return fmt.Errorf("invalid doctor reason %q", item.ReasonCode)
 		}
+		if item.Outcome == DiagnosticNotRun {
+			if item.ReasonCode != "" || !item.NotRunCause.Valid() {
+				return fmt.Errorf("NOT-RUN finding %q must carry only a closed not-run cause", item.Check)
+			}
+		} else if item.NotRunCause != "" {
+			return fmt.Errorf("executed finding %q carries a not-run cause", item.Check)
+		}
 		seen[item.Check] = struct{}{}
 	}
-	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "probe", "lima", "helper-handshake", "runtime-platform", "runtime-versions", "cache", "mount-roots", "convergence"} {
+	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake", "boot-sweep", "runtime-platform", "runtime-versions", "cache", "mount-roots", "convergence"} {
 		if _, ok := seen[check]; !ok {
 			return fmt.Errorf("doctor finding %q is missing", check)
 		}
@@ -593,6 +768,11 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		state := report.Convergence.State
 		convergenceState = fmt.Sprintf("memory=%s cpus=%d disk=%s vm_type=%s host_mount_root=%s probe_digest=%s", state.VMMemory, state.VMCPUs, state.VMDisk, state.VMType, state.HostMountRoot, state.ProbeDigest)
 	}
+	desiredConvergenceState := "NOT-RUN"
+	if report.Convergence.Desired != nil {
+		state := report.Convergence.Desired
+		desiredConvergenceState = fmt.Sprintf("memory=%s cpus=%d disk=%s vm_type=%s host_mount_root=%s probe_digest=%s", state.VMMemory, state.VMCPUs, state.VMDisk, state.VMType, state.HostMountRoot, state.ProbeDigest)
+	}
 	lines := []string{
 		fmt.Sprintf("WEFTY NODE DOCTOR v%d", report.Version),
 		fmt.Sprintf("OBSERVED AT\t%s", report.ObservedAt.Format(time.RFC3339Nano)),
@@ -600,12 +780,12 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		fmt.Sprintf("RUNTIME PLATFORM\t%s", platform),
 		fmt.Sprintf("AGENT\tuser=%s unit=%s", report.Agent.User, report.Agent.LaunchUnit),
 		fmt.Sprintf("INTENT\t%s enabled=%t revision=%d updated_at=%s", report.Intent.Outcome, report.Intent.Enabled, report.Intent.Revision, intentUpdated),
-		fmt.Sprintf("PROBE\t%s verdict=%s age=%s observed_at=%s capability_observed_at=%s revision=%d pending=%d reason=%s", report.Probe.Outcome, report.Probe.Verdict, probeAge, formatOptionalTime(report.Probe.ObservedAt), report.Probe.CapabilityObservedAt.Format(time.RFC3339Nano), report.Probe.CapabilityRevision, report.Probe.PendingPublicationRevision, report.Probe.ReasonCode),
+		fmt.Sprintf("PROBE\t%s verdict=%s age=%s observed_at=%s probe_revision=%d reason=%s capability_observed_at=%s capability_revision=%d pending=%d capability_reason=%s", report.Probe.Outcome, report.Probe.Verdict, probeAge, formatOptionalTime(report.Probe.ObservedAt), report.Probe.ProbeRevision, report.Probe.ReasonCode, report.Probe.CapabilityObservedAt.Format(time.RFC3339Nano), report.Probe.CapabilityRevision, report.Probe.PendingPublicationRevision, report.Probe.CapabilityReasonCode),
 		fmt.Sprintf("HELPER\t%s protocol=%d version=%s checksum=%s instance=%s generation=%d", report.Helper.Outcome, report.Helper.ProtocolVersion, report.Helper.Version, report.Helper.Checksum, report.Helper.InstanceID, report.Helper.SessionGeneration),
-		fmt.Sprintf("RUNTIMES\t%s containerd=%s runc=%s supported=%t within_tested_range=%t", report.Versions.Outcome, report.Versions.Containerd, report.Versions.Runc, report.Versions.Supported, report.Versions.WithinTestedRange),
+		fmt.Sprintf("RUNTIMES\t%s containerd=%s runc=%s runc_source=%s outside_tested_range=%t", report.Versions.Outcome, report.Versions.Containerd, report.Versions.Runc, report.Versions.RuncSource, report.Versions.OutsideTestedRange),
 		fmt.Sprintf("CACHE\t%s bytes=%d cap=%d within_bound=%t last_eviction=%s", report.Cache.Outcome, report.Cache.Bytes, report.Cache.CapBytes, report.Cache.WithinBound, lastEviction),
 		fmt.Sprintf("MOUNTS\t%s roots=%s", report.Mounts.Outcome, strings.Join(report.Mounts.AllowedRoots, ",")),
-		fmt.Sprintf("CONVERGENCE\t%s class=%s %s", report.Convergence.Outcome, report.Convergence.Class, convergenceState),
+		fmt.Sprintf("CONVERGENCE\t%s class=%s current={%s} desired={%s}", report.Convergence.Outcome, report.Convergence.Class, convergenceState, desiredConvergenceState),
 	}
 	if report.Lima.Applicable {
 		lines = append(lines, fmt.Sprintf("LIMA\t%s instance=%s state=%s enabled=%t recovering=%t observed_at=%s repair_count=%d reason=%s", report.Lima.Outcome, report.Lima.Facts.Instance, report.Lima.Facts.State, report.Lima.Facts.Enabled, report.Lima.Facts.Recovering, report.Lima.Facts.ObservedAt.Format(time.RFC3339Nano), report.Lima.Facts.RepairCount, report.Lima.Facts.ReasonCode))
@@ -613,15 +793,16 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		lines = append(lines, "LIMA\tNOT-RUN not applicable")
 	}
 	for _, item := range report.Findings {
-		lines = append(lines, fmt.Sprintf("CHECK %s\t%s code=%s reason=%s runbook=%s detail=%s", item.Check, item.Outcome, item.Code, item.ReasonCode, item.Runbook, item.Detail))
+		lines = append(lines, fmt.Sprintf("CHECK %s\t%s severity=%s code=%s reason=%s not_run_cause=%s runbook=%s detail=%s", item.Check, item.Outcome, item.Severity, item.Code, item.ReasonCode, item.NotRunCause, item.Runbook, item.Detail))
 	}
 	for _, limitation := range report.Limitations {
 		lines = append(lines, fmt.Sprintf("LIMITATION\tcode=%s issue=%s detail=%s", limitation.Code, limitation.Issue, limitation.Detail))
 	}
-	sort.Strings(report.Probe.MissingCapabilities)
+	missingCapabilities := append([]string(nil), report.Probe.MissingCapabilities...)
+	sort.Strings(missingCapabilities)
 	lines = append(lines,
 		fmt.Sprintf("CAPABILITIES\t%s", sortedEnabledCapabilities(report.Probe.Capabilities)),
-		fmt.Sprintf("MISSING CAPABILITIES\t%s", strings.Join(report.Probe.MissingCapabilities, ",")),
+		fmt.Sprintf("MISSING CAPABILITIES\t%s", strings.Join(missingCapabilities, ",")),
 	)
 	_, err := fmt.Fprintln(writer, strings.Join(lines, "\n"))
 	return err
