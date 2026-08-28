@@ -57,7 +57,7 @@ cannot run directly. Registration carries a restrictive OCI observation
 and asks L1 to atomically assign stored same-boot revision `N+1`; the response
 therefore both establishes node authority and removes a stale badge without a
 second registration or authority-generation bump. Pending process-service
-removal resumption runs unconditionally after that registration, even if helper
+removal and Computer Storage reset resumption run unconditionally after that registration, even if helper
 takeover, sweep, or verification failed. Only OCI probing and positive
 publication depend on a successful barrier.
 
@@ -73,6 +73,19 @@ bounce publishes the restriction before reacquisition and runs removal recovery
 on that event path; ordinary healthy heartbeats probe without rescanning the
 filesystem. `boot_sweep_failed` is the bounded L1 reason for an incomplete
 sweep/verify/removal-resume barrier, while detailed errors remain local.
+
+Computer Storage reset is standing heartbeat work, not attempt authority, and
+L1 issues it only for an already-stopped Computer. The agent never quiesces or
+restarts the service. It passes the exact reset directive to the OCI helper;
+under the attachment flock the helper records a predecessor retirement fence,
+then allocates, formats, and verifies the successor. Only the helper-derived,
+managed-root-bound preparation receipt is sent to L1. Once L1 publishes the
+successor, the standing directive advances to predecessor retirement: the
+agent calls the shared authority-bound managed-volume deletion seam, requests
+the shared assertion-derived removal attestation over every deterministic disk
+row, validates that every row actually ran and passed, then sends the shared
+cleanup acknowledgement to L1. Crashes retry these idempotent phases; no phase
+starts the Computer.
 Before a Mac reaches that helper barrier, the supervised wrapper may instead
 publish any closed OCI restriction, including `oci_intent_disabled`,
 `lima_stopped`, `lima_broken`, or `lima_start_timeout`; L1 validates the actual

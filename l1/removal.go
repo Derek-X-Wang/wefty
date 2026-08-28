@@ -277,7 +277,29 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 			if !computerID.Valid || !storageID.Valid || !storageGeneration.Valid || storageGeneration.Int64 < 1 {
 				return nil, internalError(errors.New("partial Computer Storage removal identity"), "scan service removal directive")
 			}
-			directive.ComputerStorage = &ComputerStorageClaim{ComputerID: computerID.String, StorageID: storageID.String, StorageGeneration: storageGeneration.Int64}
+			directive.ComputerStorage = &ComputerStorageClaim{ComputerID: computerID.String, StorageID: storageID.String,
+				StorageGeneration: storageGeneration.Int64}
+			directive.ComputerStorageGenerations = &ComputerStorageGenerationClaims{Generations: []ComputerStorageGenerationClaim{}}
+			generationRows, generationErr := s.db.QueryContext(ctx, `SELECT storage_id, storage_generation, disk_bytes
+				FROM computer_storage_generations WHERE computer_id=? ORDER BY storage_generation`, computerID.String)
+			if generationErr != nil {
+				return nil, internalError(generationErr, "list Computer Storage removal generations")
+			}
+			for generationRows.Next() {
+				var generation ComputerStorageGenerationClaim
+				generation.ComputerID = computerID.String
+				if err := generationRows.Scan(&generation.StorageID, &generation.StorageGeneration, &generation.DiskBytes); err != nil {
+					generationRows.Close()
+					return nil, internalError(err, "scan Computer Storage removal generation")
+				}
+				directive.ComputerStorageGenerations.Generations = append(directive.ComputerStorageGenerations.Generations, generation)
+			}
+			if err := generationRows.Close(); err != nil {
+				return nil, internalError(err, "close Computer Storage removal generations")
+			}
+			if len(directive.ComputerStorageGenerations.Generations) == 0 {
+				return nil, internalError(errors.New("Computer removal has no Storage generations"), "list Computer Storage removal generations")
+			}
 		}
 		directives = append(directives, directive)
 	}

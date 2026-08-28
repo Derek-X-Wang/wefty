@@ -647,7 +647,7 @@ func TestRuntimeManagedVolumesCompileClassPolicyBeforeOCIAdapter(t *testing.T) {
 		Job: l1.Job{Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService, Execution: contract.ExecutionSpec{
 			OCI: &contract.OCIExecutionSpec{Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}},
 		}}},
-		ComputerStorage: &l1.ComputerStorageClaim{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 3},
+		ComputerStorage: &l1.ComputerStorageClaim{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 3, IntentRevision: 4},
 	})
 	if len(computer) != 1 || computer[0].Kind != workloadrunner.ManagedVolumeComputerDisk || computer[0].ComputerStorage == nil ||
 		computer[0].ComputerStorage.ComputerID != "computer-1" || computer[0].ComputerStorage.StorageID != "storage-1" ||

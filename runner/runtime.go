@@ -172,6 +172,7 @@ type ComputerStorage struct {
 	ComputerID        string
 	StorageID         string
 	StorageGeneration int64
+	IntentRevision    int64
 	DiskBytes         int64
 }
 
@@ -200,6 +201,9 @@ type RuntimeResourceManifest struct {
 	ServiceDataVolume      string           `json:"service_data_volume,omitempty"`
 	ServiceDataOwnerRecord string           `json:"service_data_owner_record,omitempty"`
 	ComputerStorage        *ComputerStorage `json:"computer_storage,omitempty"`
+	// StorageOnly reuses the shared removal manifest for a reset predecessor
+	// after successor publication. No synthetic runtime rows are invented.
+	StorageOnly bool `json:"storage_only,omitempty"`
 }
 
 // RuntimeRemovalManifestProvider freezes deterministic resource names before
@@ -232,6 +236,8 @@ const (
 	RuntimeRemovalComputerDiskMount      RuntimeRemovalResourceClass = "computer_disk_mount"
 	RuntimeRemovalComputerDiskLoop       RuntimeRemovalResourceClass = "computer_disk_loop"
 	RuntimeRemovalComputerAttachment     RuntimeRemovalResourceClass = "computer_attachment"
+	RuntimeRemovalComputerResetManifest  RuntimeRemovalResourceClass = "computer_reset_manifest"
+	RuntimeRemovalComputerQuarantine     RuntimeRemovalResourceClass = "computer_quarantine"
 )
 
 type RuntimeRemovalResource struct {
@@ -243,17 +249,20 @@ type RuntimeRemovalResource struct {
 // New runtime-owned classes extend this one projection and the helper's
 // corresponding inventory registry; removal orchestration stays unchanged.
 func (manifest RuntimeResourceManifest) RemovalResources() []RuntimeRemovalResource {
-	resources := []RuntimeRemovalResource{
-		{Class: RuntimeRemovalLease, ID: manifest.LeaseID},
-		{Class: RuntimeRemovalSnapshot, ID: manifest.SnapshotID},
-		{Class: RuntimeRemovalContainer, ID: manifest.ContainerID},
-		{Class: RuntimeRemovalTask, ID: manifest.TaskID},
-		{Class: RuntimeRemovalShim, ID: manifest.ShimID},
-		{Class: RuntimeRemovalCgroup, ID: manifest.CgroupID},
-		{Class: RuntimeRemovalLogSegments, ID: manifest.LogSegmentDirectory},
-		{Class: RuntimeRemovalHandoffVolume, ID: manifest.HandoffVolume},
-		{Class: RuntimeRemovalServiceData, ID: manifest.ServiceDataVolume},
-		{Class: RuntimeRemovalServiceDataRecord, ID: manifest.ServiceDataOwnerRecord},
+	resources := []RuntimeRemovalResource{}
+	if !manifest.StorageOnly {
+		resources = append(resources,
+			RuntimeRemovalResource{Class: RuntimeRemovalLease, ID: manifest.LeaseID},
+			RuntimeRemovalResource{Class: RuntimeRemovalSnapshot, ID: manifest.SnapshotID},
+			RuntimeRemovalResource{Class: RuntimeRemovalContainer, ID: manifest.ContainerID},
+			RuntimeRemovalResource{Class: RuntimeRemovalTask, ID: manifest.TaskID},
+			RuntimeRemovalResource{Class: RuntimeRemovalShim, ID: manifest.ShimID},
+			RuntimeRemovalResource{Class: RuntimeRemovalCgroup, ID: manifest.CgroupID},
+			RuntimeRemovalResource{Class: RuntimeRemovalLogSegments, ID: manifest.LogSegmentDirectory},
+			RuntimeRemovalResource{Class: RuntimeRemovalHandoffVolume, ID: manifest.HandoffVolume},
+			RuntimeRemovalResource{Class: RuntimeRemovalServiceData, ID: manifest.ServiceDataVolume},
+			RuntimeRemovalResource{Class: RuntimeRemovalServiceDataRecord, ID: manifest.ServiceDataOwnerRecord},
+		)
 	}
 	if manifest.ComputerStorage != nil {
 		name := deterministicComputerDiskRemovalName(*manifest.ComputerStorage)
@@ -265,6 +274,8 @@ func (manifest RuntimeResourceManifest) RemovalResources() []RuntimeRemovalResou
 			RuntimeRemovalResource{Class: RuntimeRemovalComputerDiskMount, ID: name},
 			RuntimeRemovalResource{Class: RuntimeRemovalComputerDiskLoop, ID: name},
 			RuntimeRemovalResource{Class: RuntimeRemovalComputerAttachment, ID: name},
+			RuntimeRemovalResource{Class: RuntimeRemovalComputerResetManifest, ID: name},
+			RuntimeRemovalResource{Class: RuntimeRemovalComputerQuarantine, ID: name},
 		)
 	}
 	return slices.DeleteFunc(resources, func(resource RuntimeRemovalResource) bool { return resource.ID == "" })
@@ -470,6 +481,26 @@ type ManagedVolumeRemovalAuthority struct {
 	RemovalGeneration uint64
 	CleanupFence      string
 }
+
+// ComputerStorageResetter prepares one detached Computer Storage successor.
+// It fences the predecessor and fully allocates/verifies the successor without
+// deleting either generation; L1 publishes before shared removal retires N.
+type ComputerStorageResetter interface {
+	ResetComputerStorage(context.Context, ComputerStorageResetRequest) (ComputerStorageResetReceipt, error)
+}
+
+type ComputerStorageResetRequest struct {
+	Storage        ComputerStorage
+	NewGeneration  int64
+	NodeID         string
+	BootSessionID  string
+	RootInstanceID string
+	JobID          string
+	IntentRevision int64
+	CleanupFence   string
+}
+
+type ComputerStorageResetReceipt = contract.ComputerStorageResetReceipt
 
 // OutputSink receives raw output events. Calls may be concurrent across
 // streams, so implementations must provide any required synchronization.

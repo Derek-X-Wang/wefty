@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const (
@@ -47,6 +49,7 @@ const (
 	MethodDeleteVolume       Method = "DeleteManagedVolume"
 	MethodInventoryRemoval   Method = "InventoryRemoval"
 	MethodAttestRemoval      Method = "AttestRemoval"
+	MethodResetStorage       Method = "ResetComputerStorage"
 	MethodVerify             Method = "Verify"
 	MethodSweep              Method = "Sweep"
 	MethodDialAttemptPort    Method = "DialAttemptPort"
@@ -437,6 +440,7 @@ type ComputerStorageReference struct {
 	ComputerID        string `json:"computer_id"`
 	StorageID         string `json:"storage_id"`
 	StorageGeneration int64  `json:"storage_generation"`
+	IntentRevision    int64  `json:"intent_revision"`
 	DiskBytes         int64  `json:"disk_bytes"`
 }
 
@@ -639,6 +643,8 @@ const (
 	RemovalResourceComputerDiskMount      RemovalResourceClass = "computer_disk_mount"
 	RemovalResourceComputerDiskLoop       RemovalResourceClass = "computer_disk_loop"
 	RemovalResourceComputerAttachment     RemovalResourceClass = "computer_attachment"
+	RemovalResourceComputerResetManifest  RemovalResourceClass = "computer_reset_manifest"
+	RemovalResourceComputerQuarantine     RemovalResourceClass = "computer_quarantine"
 )
 
 type RemovalResource struct {
@@ -650,6 +656,7 @@ type RemovalAttemptManifest struct {
 	Authority       AttemptAuthority          `json:"authority"`
 	HandoffVolume   string                    `json:"handoff_volume,omitempty"`
 	ComputerStorage *ComputerStorageReference `json:"computer_storage,omitempty"`
+	StorageOnly     bool                      `json:"storage_only,omitempty"`
 	Resources       []RemovalResource         `json:"resources"`
 }
 
@@ -714,6 +721,8 @@ func ExpectedRemovalResources(identity ResourceIdentity, handoffVolume string, c
 				RemovalResource{Class: RemovalResourceComputerDiskMount, ID: name},
 				RemovalResource{Class: RemovalResourceComputerDiskLoop, ID: name},
 				RemovalResource{Class: RemovalResourceComputerAttachment, ID: name},
+				RemovalResource{Class: RemovalResourceComputerResetManifest, ID: name},
+				RemovalResource{Class: RemovalResourceComputerQuarantine, ID: name},
 			)
 		}
 	}
@@ -732,6 +741,27 @@ func expectedRemovalResources(identity ResourceIdentity, storage ...*ComputerSto
 		computerStorage = storage[0]
 	}
 	return ExpectedRemovalResources(identity, "", computerStorage)
+}
+
+func expectedComputerStorageRemovalResources(storage *ComputerStorageReference) []RemovalResource {
+	if storage == nil {
+		return nil
+	}
+	name, err := DeterministicComputerDiskName(*storage)
+	if err != nil {
+		return nil
+	}
+	return []RemovalResource{
+		{Class: RemovalResourceComputerDiskImage, ID: name},
+		{Class: RemovalResourceComputerDiskAllocation, ID: name},
+		{Class: RemovalResourceComputerDiskQuota, ID: name},
+		{Class: RemovalResourceComputerDiskManifest, ID: name},
+		{Class: RemovalResourceComputerDiskMount, ID: name},
+		{Class: RemovalResourceComputerDiskLoop, ID: name},
+		{Class: RemovalResourceComputerAttachment, ID: name},
+		{Class: RemovalResourceComputerResetManifest, ID: name},
+		{Class: RemovalResourceComputerQuarantine, ID: name},
+	}
 }
 
 func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) error {
@@ -760,6 +790,12 @@ func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) e
 			}
 		}
 		want := ExpectedRemovalResources(identity, attempt.HandoffVolume, attempt.ComputerStorage)
+		if attempt.StorageOnly {
+			if attempt.ComputerStorage == nil {
+				return errors.New("storage-only removal attestation requires Computer Storage")
+			}
+			want = expectedComputerStorageRemovalResources(attempt.ComputerStorage)
+		}
 		if len(attempt.Resources) != len(want) {
 			return errors.New("removal attestation resource inventory is incomplete")
 		}
@@ -781,6 +817,29 @@ func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) e
 		}
 	}
 	return nil
+}
+
+type ComputerStorageResetAuthority struct {
+	NodeID           string `json:"node_id"`
+	BootSessionID    string `json:"boot_session_id"`
+	HelperGeneration uint64 `json:"helper_generation"`
+	RootInstanceID   string `json:"root_instance_id"`
+	JobID            string `json:"job_id"`
+	IntentRevision   int64  `json:"intent_revision"`
+	CleanupFence     string `json:"cleanup_fence"`
+}
+
+type ResetComputerStorageRequest struct {
+	Storage       ComputerStorageReference      `json:"storage"`
+	NewGeneration int64                         `json:"new_generation"`
+	Authority     ComputerStorageResetAuthority `json:"authority"`
+}
+
+type ComputerStorageResetReceipt = contract.ComputerStorageResetReceipt
+
+type ResetComputerStorageResponse struct {
+	Verified bool                        `json:"verified"`
+	Receipt  ComputerStorageResetReceipt `json:"receipt"`
 }
 
 type VerifyScope string
@@ -836,6 +895,8 @@ type ResourceInventory struct {
 	ComputerDiskMounts      []string `json:"computer_disk_mounts"`
 	ComputerDiskLoops       []string `json:"computer_disk_loops"`
 	ComputerAttachments     []string `json:"computer_attachments"`
+	ComputerResetManifests  []string `json:"computer_reset_manifests"`
+	ComputerQuarantines     []string `json:"computer_quarantines"`
 	// ComputerDiskAnomalies are per-disk observations. They remain auditable
 	// without turning one durable disk's accounting drift into node-wide helper failure.
 	ComputerDiskAnomalies []string `json:"computer_disk_anomalies"`

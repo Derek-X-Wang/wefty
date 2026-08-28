@@ -22,6 +22,23 @@ import (
 
 const computerDiskManifestVersion = 1
 
+type computerDiskCheckpoint string
+
+const (
+	computerDiskManifestBeforeImage computerDiskCheckpoint = "manifest_before_image"
+	computerDiskImageBeforePhase    computerDiskCheckpoint = "image_before_phase"
+	computerDiskPendingBeforeAttach computerDiskCheckpoint = "pending_before_attach"
+	computerDiskAttachedBeforePhase computerDiskCheckpoint = "attached_before_phase"
+	computerDiskDetached            computerDiskCheckpoint = "detached"
+)
+
+func (engine *ContainerdEngine) computerDiskCheckpoint(checkpoint computerDiskCheckpoint) error {
+	if engine.computerDiskHook == nil {
+		return nil
+	}
+	return engine.computerDiskHook(checkpoint)
+}
+
 type computerDiskEvidence struct {
 	Kind              string `json:"kind"`
 	ReceiptID         string `json:"receipt_id"`
@@ -37,14 +54,18 @@ type computerDiskEvidence struct {
 }
 
 type computerDiskManifest struct {
-	Version            int                      `json:"version"`
-	Storage            ComputerStorageReference `json:"storage"`
-	DiskImage          string                   `json:"disk_image"`
-	MountDirectory     string                   `json:"mount_directory"`
-	LoopDevice         string                   `json:"loop_device,omitempty"`
-	Attached           *AttemptAuthority        `json:"attached,omitempty"`
-	Pending            *AttemptAuthority        `json:"pending,omitempty"`
-	PreviousDetachment *computerDiskEvidence    `json:"previous_detachment,omitempty"`
+	Version            int                            `json:"version"`
+	Storage            ComputerStorageReference       `json:"storage"`
+	DiskImage          string                         `json:"disk_image"`
+	MountDirectory     string                         `json:"mount_directory"`
+	Prepared           bool                           `json:"prepared,omitempty"`
+	Preparation        *ComputerStorageResetAuthority `json:"preparation,omitempty"`
+	PreparationReceipt *ComputerStorageResetReceipt   `json:"preparation_receipt,omitempty"`
+	Retirement         *ComputerStorageResetAuthority `json:"retirement,omitempty"`
+	LoopDevice         string                         `json:"loop_device,omitempty"`
+	Attached           *AttemptAuthority              `json:"attached,omitempty"`
+	Pending            *AttemptAuthority              `json:"pending,omitempty"`
+	PreviousDetachment *computerDiskEvidence          `json:"previous_detachment,omitempty"`
 }
 
 type computerDiskAttachment struct {
@@ -117,7 +138,7 @@ func (engine *ContainerdEngine) computerDiskSystem() computerDiskSystem {
 }
 
 func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage ComputerStorageReference, authority AttemptAuthority) (_ *computerDiskAttachment, err error) {
-	if storage.DiskBytes <= 0 {
+	if storage.DiskBytes <= 0 || storage.IntentRevision < 1 {
 		return nil, errors.New("Computer disk requires a positive allocation")
 	}
 	name, err := deterministicComputerDiskName(storage)
@@ -152,18 +173,43 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		if !sameComputerStorageIdentity(manifest.Storage, storage) || manifest.DiskImage != "disk.ext4" || manifest.MountDirectory != name {
 			return nil, errors.New("Computer disk manifest does not match its durable Storage identity")
 		}
+		if manifest.Retirement != nil {
+			return nil, errors.New("Computer Storage generation is fenced for retirement")
+		}
 		if manifest.Attached != nil {
 			return nil, errors.New("Computer Storage generation remains attached; lock disappearance is not detachment proof")
 		}
-		if !validComputerDiskEvidence(manifest.PreviousDetachment, storage, authority) {
+		if manifest.Pending != nil {
+			return nil, errors.New("Computer Storage generation has an unresolved pending attachment")
+		}
+		// An authority manifest with no attachment history is the durable first-
+		// allocation checkpoint. It may be resumed whether the image rename has
+		// happened or not. Once any detachment evidence exists, it must be exact;
+		// missing evidence never authorizes reuse of a previously attached disk.
+		if !manifest.Prepared && manifest.PreviousDetachment != nil &&
+			!validComputerDiskEvidence(manifest.PreviousDetachment, storage, authority) {
 			return nil, errors.New("Computer Storage generation lacks positive prior attachment detachment evidence")
+		}
+		if storage.IntentRevision < manifest.Storage.IntentRevision {
+			return nil, errors.New("Computer Storage attachment intent revision is stale")
 		}
 	}
 	imagePath := filepath.Join(diskRoot, "disk.ext4")
 	createdImage := false
 	if _, statErr := os.Lstat(imagePath); errors.Is(statErr, os.ErrNotExist) {
-		if present {
+		if present && (manifest.Attached != nil || manifest.Pending != nil || manifest.PreviousDetachment != nil || manifest.Prepared || manifest.Retirement != nil) {
 			return nil, errors.New("Computer disk image is missing for an existing manifest")
+		}
+		if !present {
+			manifest = computerDiskManifest{Version: computerDiskManifestVersion, Storage: storage,
+				DiskImage: "disk.ext4", MountDirectory: name}
+			if err = writeComputerDiskManifest(diskRoot, manifest); err != nil {
+				return nil, err
+			}
+			present = true
+			if err = engine.computerDiskCheckpoint(computerDiskManifestBeforeImage); err != nil {
+				return nil, err
+			}
 		}
 		temporary, createErr := os.CreateTemp(diskRoot, ".disk.ext4.tmp-")
 		if createErr != nil {
@@ -187,6 +233,7 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 				}
 				err = &insufficientDiskError{RequestedBytes: storage.DiskBytes, ObservedAvailableBytes: available, err: err}
 			}
+			_ = os.Remove(manifestPath)
 			return nil, fmt.Errorf("fully allocate Computer disk: %w", err)
 		}
 		if err = os.Rename(temporaryPath, imagePath); err != nil {
@@ -195,6 +242,9 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		createdImage = true
 		if err = syncDirectory(diskRoot); err != nil {
 			_ = os.Remove(imagePath)
+			return nil, err
+		}
+		if err = engine.computerDiskCheckpoint(computerDiskImageBeforePhase); err != nil {
 			return nil, err
 		}
 	} else if statErr != nil {
@@ -214,19 +264,25 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		return nil, errors.New("Computer disk image exists without an authority manifest")
 	}
 	if createdImage {
-		manifest = computerDiskManifest{
-			Version: computerDiskManifestVersion, Storage: storage, DiskImage: "disk.ext4", MountDirectory: name,
-			Pending: &authority,
-		}
+		manifest.Prepared = true
 		if err = writeComputerDiskManifest(diskRoot, manifest); err != nil {
 			_ = os.Remove(imagePath)
 			return nil, err
 		}
-	} else {
+	}
+	{
 		previousDetachment := manifest.PreviousDetachment
+		storage.DiskBytes = manifest.Storage.DiskBytes
+		manifest.Storage = storage
 		manifest.Pending = &authority
 		manifest.PreviousDetachment = nil
+		manifest.Prepared = false
+		manifest.Preparation = nil
+		manifest.PreparationReceipt = nil
 		if err = writeComputerDiskManifest(diskRoot, manifest); err != nil {
+			return nil, err
+		}
+		if err = engine.computerDiskCheckpoint(computerDiskPendingBeforeAttach); err != nil {
 			return nil, err
 		}
 		defer func() {
@@ -251,6 +307,10 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 			_ = os.Remove(imagePath)
 		}
 		return nil, fmt.Errorf("attach Computer disk: %w", err)
+	}
+	if err = engine.computerDiskCheckpoint(computerDiskAttachedBeforePhase); err != nil {
+		_ = engine.computerDiskSystem().detach(mountPath, loopDevice, imagePath)
+		return nil, err
 	}
 	attachment := &computerDiskAttachment{name: name, storage: manifest.Storage, imagePath: imagePath, mountPath: mountPath, loopDevice: loopDevice, authority: authority, lock: lock, fresh: createdImage}
 	manifest = computerDiskManifest{
@@ -297,14 +357,18 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 		return err
 	}
 	if present {
-		if !sameComputerStorageIdentity(manifest.Storage, storage) || manifest.Attached != nil || manifest.Pending != nil || manifest.PreviousDetachment == nil {
+		if !sameComputerStorageIdentity(manifest.Storage, storage) || manifest.Attached != nil || manifest.Pending != nil {
 			return errors.New("Computer disk deletion lacks exact detached manifest authority")
 		}
-		evidence := manifest.PreviousDetachment
-		if evidence.NodeID != removal.NodeID || evidence.JobID != removal.JobID || evidence.ComputerID != storage.ComputerID || evidence.StorageID != storage.StorageID || evidence.StorageGeneration != storage.StorageGeneration || evidence.ReceiptID == "" ||
-			!((evidence.Kind == computerDiskReapReceipt && evidence.BootSessionID == removal.BootSessionID && evidence.SweepEpoch == "") ||
-				(evidence.Kind == computerDiskSweepReceipt && evidence.BootSessionID != removal.BootSessionID && evidence.SweepEpoch != "")) {
-			return errors.New("Computer disk deletion receipt does not match removal authority")
+		if manifest.Retirement == nil && !manifest.Prepared && manifest.PreviousDetachment != nil {
+			evidence := manifest.PreviousDetachment
+			if evidence.NodeID != removal.NodeID || evidence.JobID != removal.JobID || evidence.ComputerID != storage.ComputerID || evidence.StorageID != storage.StorageID || evidence.StorageGeneration != storage.StorageGeneration || evidence.ReceiptID == "" ||
+				!((evidence.Kind == computerDiskReapReceipt && evidence.BootSessionID == removal.BootSessionID && evidence.SweepEpoch == "") ||
+					(evidence.Kind == computerDiskSweepReceipt && evidence.BootSessionID != removal.BootSessionID && evidence.SweepEpoch != "")) {
+				return errors.New("Computer disk deletion receipt does not match removal authority")
+			}
+		} else if manifest.Retirement == nil && !manifest.Prepared {
+			return errors.New("Computer disk deletion lacks detachment or staging authority")
 		}
 	} else if _, statErr := os.Lstat(diskRoot); statErr == nil {
 		return errors.New("Computer disk deletion found bytes without an authority manifest")
@@ -333,11 +397,41 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 	if err := os.Remove(mountPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	resetManifestPath := filepath.Join(engine.config.RuntimeRoot, "computer-storage-resets", name+".json")
+	if err := os.Remove(resetManifestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	quarantineRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine")
+	quarantines, err := readDirectoryIfPresent(quarantineRoot)
+	if err != nil {
+		return err
+	}
+	for _, entry := range quarantines {
+		if entry.Name() == name || strings.HasPrefix(entry.Name(), name+"-") {
+			if err := os.RemoveAll(filepath.Join(quarantineRoot, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
 	for _, path := range []string{diskRoot, imagePath, filepath.Join(diskRoot, "attachment.json"), mountPath} {
 		if _, err := os.Lstat(path); err == nil {
 			return fmt.Errorf("Computer disk removal left %s", filepath.Base(path))
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
+		}
+	}
+	if _, err := os.Lstat(resetManifestPath); err == nil {
+		return errors.New("Computer disk removal left reset manifest")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	quarantines, err = readDirectoryIfPresent(quarantineRoot)
+	if err != nil {
+		return err
+	}
+	for _, entry := range quarantines {
+		if entry.Name() == name || strings.HasPrefix(entry.Name(), name+"-") {
+			return errors.New("Computer disk removal left quarantine residue")
 		}
 	}
 	return nil
@@ -381,6 +475,9 @@ func (engine *ContainerdEngine) detachComputerDisk(attachment *computerDiskAttac
 	manifest.LoopDevice = ""
 	manifest.PreviousDetachment = &evidence
 	if err := writeComputerDiskManifest(diskRoot, manifest); err != nil {
+		return err
+	}
+	if err := engine.computerDiskCheckpoint(computerDiskDetached); err != nil {
 		return err
 	}
 	attachment.detached = true
@@ -762,6 +859,29 @@ func (engine *ContainerdEngine) inventoryComputerDiskResources(result *ResourceI
 	}
 	for name := range seenLoopOwners {
 		result.ComputerDiskLoops = append(result.ComputerDiskLoops, name)
+	}
+	resetEntries, err := readDirectoryIfPresent(filepath.Join(engine.config.RuntimeRoot, "computer-storage-resets"))
+	if err != nil {
+		return err
+	}
+	for _, entry := range resetEntries {
+		if strings.HasPrefix(entry.Name(), "wefty-computer-disk-") && strings.HasSuffix(entry.Name(), ".json") {
+			result.ComputerResetManifests = append(result.ComputerResetManifests, strings.TrimSuffix(entry.Name(), ".json"))
+		}
+	}
+	quarantineEntries, err := readDirectoryIfPresent(filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine"))
+	if err != nil {
+		return err
+	}
+	for _, entry := range quarantineEntries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "wefty-computer-disk-") {
+			continue
+		}
+		if base, _, found := strings.Cut(name, "-reset-"); found {
+			name = base
+		}
+		result.ComputerQuarantines = append(result.ComputerQuarantines, name)
 	}
 	return nil
 }

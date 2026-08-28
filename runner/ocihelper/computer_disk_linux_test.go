@@ -101,7 +101,7 @@ func (system *fakeComputerDiskSystem) loopsForRoot(root string) (map[string]stri
 }
 
 func testComputerStorage() ComputerStorageReference {
-	return ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 16 << 20}
+	return ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 16 << 20}
 }
 
 func testComputerAuthority(attempt, fence, boot string) AttemptAuthority {
@@ -128,6 +128,43 @@ func TestComputerDiskENOSPCLeavesNoPublishedResource(t *testing.T) {
 	}
 	if len(system.mounts) != 0 || len(system.loops) != 0 || system.allocationRuns != 1 {
 		t.Fatalf("failed allocation mechanics = runs %d mounts %v loops %v", system.allocationRuns, system.mounts, system.loops)
+	}
+}
+
+func TestComputerDiskResumesManifestBeforeImageAndImageBeforePhaseCrashes(t *testing.T) {
+	for _, checkpoint := range []computerDiskCheckpoint{computerDiskManifestBeforeImage, computerDiskImageBeforePhase} {
+		t.Run(string(checkpoint), func(t *testing.T) {
+			root := t.TempDir()
+			system := newFakeComputerDiskSystem()
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+			crash := errors.New("injected crash")
+			fired := false
+			engine.computerDiskHook = func(observed computerDiskCheckpoint) error {
+				if observed == checkpoint && !fired {
+					fired = true
+					return crash
+				}
+				return nil
+			}
+			if _, err := engine.attachComputerDisk(t.Context(), testComputerStorage(),
+				testComputerAuthority("attempt-a", "fence-a", "boot-a")); !errors.Is(err, crash) {
+				t.Fatalf("checkpoint %q error = %v", checkpoint, err)
+			}
+			name, _ := deterministicComputerDiskName(testComputerStorage())
+			diskRoot := filepath.Join(root, "computer-disks", name)
+			if _, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json")); err != nil || !present {
+				t.Fatalf("crash lost authority manifest: present=%t err=%v", present, err)
+			}
+			engine.computerDiskHook = nil
+			attachment, err := engine.attachComputerDisk(t.Context(), testComputerStorage(),
+				testComputerAuthority("attempt-a", "fence-a", "boot-a"))
+			if err != nil {
+				t.Fatalf("resume from %q: %v", checkpoint, err)
+			}
+			if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

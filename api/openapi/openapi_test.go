@@ -94,6 +94,8 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 		"/v1/computers/{computer_id}/intents",
 		"/v1/computers/{computer_id}/desired-state",
 		"/v1/computers/{computer_id}/restart",
+		"/v1/computers/{computer_id}/storage-reset",
+		"/v1/computers/{computer_id}/storage-generations",
 		"/v1/computers/{computer_id}/projections",
 		"/v1/computers/{computer_id}/remove",
 	} {
@@ -107,7 +109,7 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 	computer := object(t, schemas["Computer"], "Computer")
 	required := stringSet(t, computer["required"])
 	for _, field := range []string{
-		"computer_id", "storage_id", "storage_generation", "desired_state", "intent_revision",
+		"computer_id", "storage_id", "storage_generation", "desired_disk_bytes", "desired_state", "intent_revision",
 		"applied_revision", "current_job_id", "current_spec_revision",
 		"reconfiguration_phase", "current_job",
 	} {
@@ -124,6 +126,9 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 	}
 	if _, present := schemas["ComputerIntentList"]; !present {
 		t.Fatal("common schema is missing paginated ComputerIntentList")
+	}
+	if _, present := schemas["ComputerStorageGenerationList"]; !present {
+		t.Fatal("common schema is missing Computer Storage generation evidence")
 	}
 	createComputer := object(t, object(t, paths["/v1/computers"], "create Computer path")["post"], "create Computer")
 	requestBody := object(t, createComputer["requestBody"], "create Computer request body")
@@ -506,8 +511,49 @@ func TestAgentClaimCarriesExactComputerStorageIdentity(t *testing.T) {
 	properties := object(t, schema["properties"], "claim properties")
 	storage := object(t, properties["computer_storage"], "Computer Storage")
 	required := stringSet(t, storage["required"])
-	if !required["computer_id"] || !required["storage_id"] || !required["storage_generation"] || len(required) != 3 {
+	if !required["computer_id"] || !required["storage_id"] || !required["storage_generation"] || !required["intent_revision"] || len(required) != 4 {
 		t.Fatalf("Computer Storage required members = %#v", required)
+	}
+}
+
+func TestAgentPublishesComputerStorageResetReceiptSurface(t *testing.T) {
+	t.Parallel()
+	doc := readObject(t, "l1-agent.v1.json")
+	paths := object(t, doc["paths"], "paths")
+	if _, present := paths["/v1/agent/computers/{computer_id}/storage-reset-acknowledgement"]; !present {
+		t.Fatal("agent protocol is missing Computer Storage reset acknowledgement")
+	}
+	if _, present := paths["/v1/agent/computers/{computer_id}/storage-retirement-acknowledgement"]; !present {
+		t.Fatal("agent protocol is missing Computer Storage retirement acknowledgement")
+	}
+	common := readObject(t, "common.v1.json")
+	schemas := object(t, object(t, common["components"], "components")["schemas"], "schemas")
+	heartbeat := object(t, schemas["HeartbeatResponse"], "HeartbeatResponse")
+	allOf, ok := heartbeat["allOf"].([]any)
+	if !ok || len(allOf) != 2 {
+		t.Fatalf("HeartbeatResponse allOf = %#v", heartbeat["allOf"])
+	}
+	channel := object(t, allOf[1], "HeartbeatResponse channel")
+	required := stringSet(t, channel["required"])
+	if !required["storage_reset_directives"] {
+		t.Fatal("heartbeat does not require the standing Storage reset directive channel")
+	}
+	directive := object(t, schemas["ComputerStorageResetDirective"], "ComputerStorageResetDirective")
+	directiveRequired := stringSet(t, directive["required"])
+	if !directiveRequired["root_instance_id"] || !directiveRequired["phase"] {
+		t.Fatalf("Storage reset directive required members = %#v", directiveRequired)
+	}
+	resetPath := object(t, paths["/v1/agent/computers/{computer_id}/storage-reset-acknowledgement"], "Storage reset acknowledgement")
+	resetPost := object(t, resetPath["post"], "Storage reset acknowledgement POST")
+	resetBody := object(t, resetPost["requestBody"], "Storage reset acknowledgement request body")
+	resetContent := object(t, resetBody["content"], "Storage reset acknowledgement content")
+	resetMedia := object(t, resetContent["application/json"], "Storage reset acknowledgement media")
+	resetSchema := object(t, resetMedia["schema"], "Storage reset acknowledgement schema")
+	resetProperties := object(t, resetSchema["properties"], "Storage reset acknowledgement properties")
+	receipt := object(t, resetProperties["receipt"], "ComputerStorageResetReceipt")
+	receiptRequired := stringSet(t, receipt["required"])
+	if !receiptRequired["root_instance_id"] {
+		t.Fatalf("Storage reset receipt required members = %#v", receiptRequired)
 	}
 }
 

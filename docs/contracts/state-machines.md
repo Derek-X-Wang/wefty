@@ -108,7 +108,7 @@ Computer-trait Job is invalid at L1 construction time: it must be created in
 the same transaction as its Computer. `computer_id`, `storage_id`, and every
 successive `job_id` are distinct identities.
 
-Start, stop, restart, removal, and projection replacement require the exact observed
+Start, stop, restart, reset, removal, and projection replacement require the exact observed
 `intent_revision` and `storage_id@generation`. The transaction returns
 `stale_intent_revision` or `storage_reference_conflict` without changing any
 row when either precondition moved. An accepted no-change desired-state retry
@@ -120,6 +120,24 @@ History is read through a bounded revision-ordered page rather than being
 materialized by an authority read or CAS. Every history actor is the
 authenticated Fabric identity, never a request-body claim; creation replay by
 a different actor conflicts even when the JobSpec bytes match.
+
+A Storage reset is stopped-only: L1 refuses running, attached, already
+reconfiguring, or removed Computers and never performs an internal quiesce.
+Reservation appends one `reset` intent, admits successor capacity, enters
+revision-fenced `resetting`, and creates exactly one `staging` generation at
+current generation plus one. The helper takes the predecessor's attachment
+flock, revalidates detachment, durably fences stale attaches in the shared disk
+manifest, then fully allocates, formats, and verifies the successor. Its
+receipt binds the exact managed-root instance in addition to Computer, Storage,
+both generations, Job, Node, reset revision, cleanup fence, and helper
+generation. L1 durably records that receipt before a separate publication
+transaction changes old `current → retired`, staging `→ current`, and advances
+`storage_generation`; the same Job remains stopped and unclaimable. Only after
+publication does the agent retire predecessor bytes through the shared
+authority-bound disk deletion and assertion-derived removal attestation. That
+acknowledgement advances `applied_revision` and returns the Computer to
+`stable`. Removal may supersede any standing reset and deletes every recorded
+generation. No reset phase starts the Computer automatically.
 
 The current immutable Job mirrors Computer desired state only so it can reuse
 the ordinary service attempt state machine. Claim additionally joins the

@@ -859,7 +859,8 @@ func runtimeManagedVolumes(claim l1.Claim) []workloadrunner.ManagedVolume {
 			}
 			return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: &workloadrunner.ComputerStorage{
 				ComputerID: claim.ComputerStorage.ComputerID, StorageID: claim.ComputerStorage.StorageID,
-				StorageGeneration: claim.ComputerStorage.StorageGeneration, DiskBytes: spec.Execution.OCI.Computer.DiskBytes,
+				StorageGeneration: claim.ComputerStorage.StorageGeneration, IntentRevision: claim.ComputerStorage.IntentRevision,
+				DiskBytes: spec.Execution.OCI.Computer.DiskBytes,
 			}}}
 		}
 		return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}

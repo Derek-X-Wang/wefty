@@ -85,8 +85,8 @@ different identity; later stop/start/restart and projection-transfer
 transactions retain that binding while releasing or reacquiring only the
 identity-free Slot occupancy.
 
-The successful agent claim projects the exact current `computer_id` and
-`storage_id@generation` alongside the immutable Job. That Storage witness is
+The successful agent claim projects the exact current `computer_id`,
+`storage_id@generation`, and Computer intent revision alongside the immutable Job. That Storage witness is
 absent for ordinary Jobs and is the only identity the agent may pass to the
 helper's `computer_disk` attachment mechanic.
 

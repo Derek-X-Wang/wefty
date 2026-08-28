@@ -52,6 +52,10 @@ type RemovalInventoryEngine interface {
 	InventoryRemoval(context.Context, InventoryRemovalRequest) (InventoryRemovalResponse, error)
 }
 
+type ComputerStorageResetEngine interface {
+	ResetComputerStorage(context.Context, ResetComputerStorageRequest) (ResetComputerStorageResponse, error)
+}
+
 // Engine is the helper-internal mechanics seam. No containerd request or type
 // crosses RPC.
 type Engine interface {

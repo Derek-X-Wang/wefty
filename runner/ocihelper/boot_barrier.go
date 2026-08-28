@@ -279,6 +279,8 @@ func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {
 	inventory.ComputerDiskMounts = slices.Clone(inventory.ComputerDiskMounts)
 	inventory.ComputerDiskLoops = slices.Clone(inventory.ComputerDiskLoops)
 	inventory.ComputerAttachments = slices.Clone(inventory.ComputerAttachments)
+	inventory.ComputerResetManifests = slices.Clone(inventory.ComputerResetManifests)
+	inventory.ComputerQuarantines = slices.Clone(inventory.ComputerQuarantines)
 	inventory.ComputerDiskAnomalies = slices.Clone(inventory.ComputerDiskAnomalies)
 	return inventory
 }
@@ -287,5 +289,5 @@ func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {
 func InventoryEmpty(inventory ResourceInventory) bool {
 	return len(inventory.Leases)+len(inventory.Snapshots)+len(inventory.Containers)+len(inventory.Tasks)+
 		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ManagedVolumes)+len(inventory.ManagedVolumeRecords)+
-		len(inventory.ComputerDiskImages)+len(inventory.ComputerDiskAllocations)+len(inventory.ComputerDiskQuotas)+len(inventory.ComputerDiskManifests)+len(inventory.ComputerDiskMounts)+len(inventory.ComputerDiskLoops)+len(inventory.ComputerAttachments) == 0
+		len(inventory.ComputerDiskImages)+len(inventory.ComputerDiskAllocations)+len(inventory.ComputerDiskQuotas)+len(inventory.ComputerDiskManifests)+len(inventory.ComputerDiskMounts)+len(inventory.ComputerDiskLoops)+len(inventory.ComputerAttachments)+len(inventory.ComputerResetManifests)+len(inventory.ComputerQuarantines) == 0
 }

@@ -97,7 +97,7 @@ func validateWorkloadWire(input WorkloadInput) error {
 		if volume.Kind == ManagedVolumeComputerDisk {
 			storage := volume.ComputerStorage
 			if storage == nil || !boundedStorageID(storage.ComputerID) || !boundedStorageID(storage.StorageID) ||
-				storage.StorageGeneration < 1 || storage.DiskBytes <= 0 {
+				storage.StorageGeneration < 1 || storage.IntentRevision < 1 || storage.DiskBytes <= 0 {
 				return errors.New("computer disk requires a bounded durable Storage identity and positive allocation")
 			}
 		} else if volume.ComputerStorage != nil {

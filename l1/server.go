@@ -197,6 +197,8 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("GET /v1/computers/{computer_id}/intents", s.listComputerIntents)
 	client.HandleFunc("PUT /v1/computers/{computer_id}/desired-state", s.setComputerDesiredState)
 	client.HandleFunc("POST /v1/computers/{computer_id}/restart", s.restartComputer)
+	client.HandleFunc("POST /v1/computers/{computer_id}/storage-reset", s.resetComputerStorage)
+	client.HandleFunc("GET /v1/computers/{computer_id}/storage-generations", s.listComputerStorageGenerations)
 	client.HandleFunc("POST /v1/computers/{computer_id}/projections", s.installComputerProjection)
 	client.HandleFunc("POST /v1/computers/{computer_id}/remove", s.removeComputer)
 	client.HandleFunc("GET /v1/nodes", s.listNodes)
@@ -217,6 +219,8 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/logs", s.appendLogs)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete", s.completeAttempt)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/removal-acknowledgement", s.acknowledgeServiceRemoval)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-reset-acknowledgement", s.acknowledgeComputerStorageReset)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-retirement-acknowledgement", s.acknowledgeComputerStorageRetirement)
 
 	root := http.NewServeMux()
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
@@ -428,6 +432,35 @@ func (s *Server) restartComputer(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotency-Replayed", "true")
 	}
 	writeJSON(w, status, redactComputer(computer))
+}
+
+func (s *Server) resetComputerStorage(w http.ResponseWriter, r *http.Request) {
+	var request ComputerStorageResetRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	computer, replayed, err := s.store.BeginComputerStorageReset(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusAccepted
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, redactComputer(computer))
+}
+
+func (s *Server) listComputerStorageGenerations(w http.ResponseWriter, r *http.Request) {
+	generations, err := s.store.ListComputerStorageGenerations(r.Context(), r.PathValue("computer_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, generations)
 }
 
 func (s *Server) installComputerProjection(w http.ResponseWriter, r *http.Request) {
@@ -664,7 +697,42 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, RemovalDirectives: directives})
+	storageResets, err := s.store.ListNodeComputerStorageResetDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, RemovalDirectives: directives, StorageResetDirectives: storageResets})
+}
+
+func (s *Server) acknowledgeComputerStorageReset(w http.ResponseWriter, r *http.Request) {
+	var request ComputerStorageResetAcknowledgementRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	computer, err := s.store.AcknowledgeComputerStorageReset(r.Context(), identityFromRequest(r).NodeID,
+		r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, redactComputer(computer))
+}
+
+func (s *Server) acknowledgeComputerStorageRetirement(w http.ResponseWriter, r *http.Request) {
+	var request RemovalAcknowledgementRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	computer, err := s.store.AcknowledgeComputerStorageRetirement(r.Context(), identityFromRequest(r).NodeID,
+		r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, redactComputer(computer))
 }
 
 func (s *Server) drainNode(w http.ResponseWriter, r *http.Request) {

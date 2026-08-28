@@ -598,7 +598,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatalf("namespace cleanup verification=%+v err=%v", verification, err)
 	}
 	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_disk_exactly_one_and_persistent=%t\ncomputer_agent_restart_same_generation=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerDiskEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_agent_restart_same_generation=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerDiskEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -634,7 +634,7 @@ func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, 
 		request := workloadrunner.Request{Authority: workloadrunner.AttemptAuthority{NodeID: registration.NodeID, BootSessionID: registration.BootSessionID, JobID: claim.Job.JobID,
 			AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken, WorkloadClass: contract.JobClassService, RemovalGeneration: "attempt"},
 			RuntimeHandler: claim.Job.Spec.RuntimeHandler, Execution: claim.Job.Spec.Execution, Limits: claim.Job.Spec.Limits, InitialDeadman: claim.Lease.LeaseTTL,
-			ManagedVolumes:   []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: &workloadrunner.ComputerStorage{ComputerID: claim.ComputerStorage.ComputerID, StorageID: claim.ComputerStorage.StorageID, StorageGeneration: claim.ComputerStorage.StorageGeneration, DiskBytes: claim.Job.Spec.Execution.OCI.Computer.DiskBytes}}},
+			ManagedVolumes:   []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: &workloadrunner.ComputerStorage{ComputerID: claim.ComputerStorage.ComputerID, StorageID: claim.ComputerStorage.StorageID, StorageGeneration: claim.ComputerStorage.StorageGeneration, IntentRevision: claim.ComputerStorage.IntentRevision, DiskBytes: claim.Job.Spec.Execution.OCI.Computer.DiskBytes}}},
 			AttemptEndpoints: []string{workloadrunner.AttemptEndpointView, workloadrunner.AttemptEndpointControl},
 			AttemptEndpointReady: func(string, workloadrunner.AttemptEndpoint) error {
 				return nil
@@ -695,7 +695,7 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		t.Fatal(err)
 	}
 	storage := &ocihelper.ComputerStorageReference{
-		ComputerID: "native-computer", StorageID: "native-storage", StorageGeneration: 1, DiskBytes: 32 << 20,
+		ComputerID: "native-computer", StorageID: "native-storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 32 << 20,
 	}
 	request := func(suffix string, argv []string) ocihelper.RunRequest {
 		authority := nativeAuthority("computer-disk-" + suffix)
@@ -762,6 +762,45 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		t.Fatalf("real Computer attempt C reap = %+v err=%v", deleted, err)
 	}
 	assertNativeComputerHostCleanup(t, second.Authority)
+	resetStorage := *storage
+	resetStorage.IntentRevision = 2
+	reset, err := session.ResetComputerStorage(ctx, ocihelper.ResetComputerStorageRequest{
+		Storage: resetStorage, NewGeneration: 2,
+		Authority: ocihelper.ComputerStorageResetAuthority{
+			NodeID: second.Authority.NodeID, BootSessionID: second.Authority.BootSessionID,
+			HelperGeneration: session.Handshake().SessionGeneration, RootInstanceID: "native-managed-root",
+			JobID:          second.Authority.JobID,
+			IntentRevision: 2, CleanupFence: "native-storage-reset",
+		},
+	})
+	if err != nil || !reset.Verified || reset.Receipt.Kind != "computer_storage_reset_verified" ||
+		reset.Receipt.HelperGeneration != session.Handshake().SessionGeneration {
+		t.Fatalf("real Computer Storage reset = %+v err=%v", reset, err)
+	}
+	if _, err := session.Run(ctx, request("stale-after-reset", []string{"/bin/true"})); err == nil {
+		t.Fatal("real retired Computer Storage generation attached after reset")
+	}
+	storage.StorageGeneration = 2
+	storage.IntentRevision = 2
+	fresh := request("fresh-after-reset", []string{"/bin/sh", "-c", "test ! -e /wefty/service/marker"})
+	if _, err := session.Run(ctx, fresh); err != nil {
+		t.Fatalf("real empty Computer Storage generation did not attach: %v", err)
+	}
+	var freshResult *ocihelper.WatchResponse
+	if err := session.Watch(ctx, ocihelper.WatchRequest{Authority: fresh.Authority}, func(event ocihelper.WatchEvent) error {
+		if event.Result != nil {
+			freshResult = event.Result
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if freshResult == nil || freshResult.ExitCode == nil || *freshResult.ExitCode != 0 {
+		t.Fatalf("real reset generation retained old bytes: %+v", freshResult)
+	}
+	if deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: fresh.Authority}); err != nil || !deleted.Deleted {
+		t.Fatalf("real reset Computer cleanup = %+v err=%v", deleted, err)
+	}
 	return true
 }
 
