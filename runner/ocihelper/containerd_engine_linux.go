@@ -1246,10 +1246,10 @@ func fallbackBridgeEnvironment(environment []EnvironmentVariable, address net.Ad
 	if index < 0 {
 		return environment, endpoint.String(), nil
 	}
+	endpoint.Host = address.String()
 	if !activate {
 		return environment, endpoint.String(), nil
 	}
-	endpoint.Host = address.String()
 	result := append([]EnvironmentVariable(nil), environment...)
 	result[index].Value = endpoint.String()
 	return result, endpoint.String(), nil
