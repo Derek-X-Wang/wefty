@@ -441,6 +441,18 @@ func (session *Session) DeleteManagedVolume(ctx context.Context, request DeleteM
 	return response, err
 }
 
+func (session *Session) InventoryRemoval(ctx context.Context, request InventoryRemovalRequest) (InventoryRemovalResponse, error) {
+	var response InventoryRemovalResponse
+	err := session.call(ctx, MethodInventoryRemoval, request, &response)
+	return response, err
+}
+
+func (session *Session) AttestRemoval(ctx context.Context, request AttestRemovalRequest) (AttestRemovalResponse, error) {
+	var response AttestRemovalResponse
+	err := session.call(ctx, MethodAttestRemoval, request, &response)
+	return response, err
+}
+
 func (session *Session) Verify(ctx context.Context, request VerifyRequest) (VerifyResponse, error) {
 	var response VerifyResponse
 	err := session.call(ctx, MethodVerify, request, &response)

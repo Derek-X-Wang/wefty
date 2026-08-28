@@ -66,6 +66,10 @@ func (outbox *evidenceOutbox) runtimeRemoval(ctx context.Context, jobID string) 
 	return outbox.spool.runtimeRemoval(ctx, jobID)
 }
 
+func (outbox *evidenceOutbox) storeReconstructedRuntimeRemoval(ctx context.Context, removal localRemoval, attempts []workloadrunner.RuntimeResourceManifest) error {
+	return outbox.spool.storeReconstructedRuntimeRemoval(ctx, removal, attempts, outbox.clock.Now())
+}
+
 func (outbox *evidenceOutbox) pendingRuntimeRemovals(ctx context.Context) ([]runtimeRemovalRecord, error) {
 	return outbox.spool.pendingRuntimeRemovals(ctx)
 }
@@ -74,8 +78,16 @@ func (outbox *evidenceOutbox) recordRuntimeQuiesced(ctx context.Context, removal
 	return outbox.spool.recordRuntimeQuiesced(ctx, removal, receipt, outbox.clock.Now())
 }
 
+func (outbox *evidenceOutbox) recordRuntimeAttested(ctx context.Context, removal localRemoval, attestation workloadrunner.RuntimeRemovalAttestation) error {
+	return outbox.spool.recordRuntimeAttested(ctx, removal, attestation, outbox.clock.Now())
+}
+
 func (outbox *evidenceOutbox) purgeJob(ctx context.Context, jobID string) error {
 	return outbox.spool.purgeJob(ctx, jobID)
+}
+
+func (outbox *evidenceOutbox) removalIntent(ctx context.Context, jobID string) (localRemoval, bool, error) {
+	return outbox.spool.removalIntent(ctx, jobID)
 }
 
 func (outbox *evidenceOutbox) completeRemoval(ctx context.Context, removal localRemoval) error {

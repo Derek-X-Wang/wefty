@@ -63,6 +63,19 @@ type attendedResult struct {
 	RemovalCompleted       bool                `json:"removal_completed,omitempty"`
 	RuntimeQuiesced        bool                `json:"runtime_quiesced,omitempty"`
 	ResourceManifests      []json.RawMessage   `json:"resource_manifests,omitempty"`
+	PostDeleteAttestation  bool                `json:"post_delete_attestation,omitempty"`
+	ServiceDataBytesAbsent bool                `json:"service_data_bytes_absent,omitempty"`
+	OwnerRecordAbsent      bool                `json:"service_data_owner_record_absent,omitempty"`
+	DeleteAttestRestart    bool                `json:"delete_attest_restart_observed,omitempty"`
+	BindSourcesUntouched   bool                `json:"bind_sources_untouched,omitempty"`
+	ImageCacheRetained     bool                `json:"image_cache_retained,omitempty"`
+	RemovalAssertions      []removalAssertion  `json:"removal_assertions,omitempty"`
+}
+
+type removalAssertion struct {
+	Class  string `json:"class"`
+	ID     string `json:"id"`
+	Absent bool   `json:"absent"`
 }
 
 var requiredAttendedRows = []string{
@@ -282,9 +295,12 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 		t.Fatalf("service data receipt lacks restart/stop-start persistence and fresh-rootfs proof: %+v", serviceData)
 	}
 	removal := artifact.Rows["service_removal_manifest_offline"]
-	if removal.RemovalPhase != "complete" || !removal.RemovalPendingObserved || !removal.RemovalCompleted || !removal.RuntimeQuiesced || len(removal.ResourceManifests) == 0 {
+	if removal.RemovalPhase != "complete" || !removal.RemovalPendingObserved || !removal.RemovalCompleted || !removal.RuntimeQuiesced || len(removal.ResourceManifests) == 0 ||
+		!removal.PostDeleteAttestation || !removal.ServiceDataBytesAbsent || !removal.OwnerRecordAbsent || !removal.DeleteAttestRestart ||
+		!removal.BindSourcesUntouched || !removal.ImageCacheRetained {
 		t.Fatalf("offline removal row lacks pending manifest/quiescence evidence: %+v", removal)
 	}
+	expectedAssertions := make(map[string]struct{})
 	for index, payload := range removal.ResourceManifests {
 		var manifest struct {
 			JobID                  string `json:"job_id"`
@@ -307,6 +323,27 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 			manifest.ServiceDataOwnerRecord == "" {
 			t.Fatalf("offline removal resource manifest %d is incomplete: %s", index, payload)
 		}
+		for class, id := range map[string]string{
+			"lease": manifest.LeaseID, "task": manifest.TaskID, "container": manifest.ContainerID,
+			"snapshot": manifest.SnapshotID, "shim": manifest.ShimID, "cgroup": manifest.CgroupID,
+			"log_segments": manifest.LogSegmentDirectory, "service_data": manifest.ServiceDataVolume,
+			"service_data_owner_record": manifest.ServiceDataOwnerRecord,
+		} {
+			expectedAssertions[class+"\x00"+id] = struct{}{}
+		}
+	}
+	if len(removal.RemovalAssertions) != len(expectedAssertions) {
+		t.Fatalf("offline removal assertions did not cover every manifest row: %+v", removal.RemovalAssertions)
+	}
+	for _, assertion := range removal.RemovalAssertions {
+		key := assertion.Class + "\x00" + assertion.ID
+		if !assertion.Absent {
+			t.Fatalf("offline removal assertion did not pass: %+v", assertion)
+		}
+		if _, ok := expectedAssertions[key]; !ok {
+			t.Fatalf("offline removal asserted an unmanifested row: %+v", assertion)
+		}
+		delete(expectedAssertions, key)
 	}
 	launch := artifact.Rows["launch_daemon"]
 	if !slices.Contains(launch.LaunchUnits, LaunchDaemonLabel) {

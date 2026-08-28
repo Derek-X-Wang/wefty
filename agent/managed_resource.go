@@ -19,6 +19,7 @@ type managedResourceManager interface {
 
 type localRemoval struct {
 	jobID             string
+	kind              string
 	generation        uint64
 	rootInstanceID    string
 	cleanupFence      string

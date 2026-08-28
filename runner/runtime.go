@@ -4,8 +4,13 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -202,6 +207,117 @@ type RuntimeResourceManifest struct {
 // snapshots every attempt row when durable removal intent arrives.
 type RuntimeRemovalManifestProvider interface {
 	RemovalResourceManifest(Request) (RuntimeResourceManifest, error)
+}
+
+// RuntimeRemovalResourceClass names one independently inventoried residue
+// class. The list is intentionally data-driven so kind-specific runtimes can
+// extend their removal manifest without widening the agent lifecycle seam.
+type RuntimeRemovalResourceClass string
+
+const (
+	RuntimeRemovalLease                  RuntimeRemovalResourceClass = "lease"
+	RuntimeRemovalSnapshot               RuntimeRemovalResourceClass = "snapshot"
+	RuntimeRemovalContainer              RuntimeRemovalResourceClass = "container"
+	RuntimeRemovalTask                   RuntimeRemovalResourceClass = "task"
+	RuntimeRemovalShim                   RuntimeRemovalResourceClass = "shim"
+	RuntimeRemovalCgroup                 RuntimeRemovalResourceClass = "cgroup"
+	RuntimeRemovalLogSegments            RuntimeRemovalResourceClass = "log_segments"
+	RuntimeRemovalHandoffVolume          RuntimeRemovalResourceClass = "handoff_volume"
+	RuntimeRemovalServiceData            RuntimeRemovalResourceClass = "service_data"
+	RuntimeRemovalServiceDataRecord      RuntimeRemovalResourceClass = "service_data_owner_record"
+	RuntimeRemovalComputerDiskImage      RuntimeRemovalResourceClass = "computer_disk_image"
+	RuntimeRemovalComputerDiskAllocation RuntimeRemovalResourceClass = "computer_disk_allocation"
+	RuntimeRemovalComputerDiskQuota      RuntimeRemovalResourceClass = "computer_disk_quota"
+	RuntimeRemovalComputerDiskManifest   RuntimeRemovalResourceClass = "computer_disk_manifest"
+	RuntimeRemovalComputerDiskMount      RuntimeRemovalResourceClass = "computer_disk_mount"
+	RuntimeRemovalComputerDiskLoop       RuntimeRemovalResourceClass = "computer_disk_loop"
+	RuntimeRemovalComputerAttachment     RuntimeRemovalResourceClass = "computer_attachment"
+)
+
+type RuntimeRemovalResource struct {
+	Class RuntimeRemovalResourceClass `json:"class"`
+	ID    string                      `json:"id"`
+}
+
+// RemovalResources projects the manifest into independently asserted rows.
+// New runtime-owned classes extend this one projection and the helper's
+// corresponding inventory registry; removal orchestration stays unchanged.
+func (manifest RuntimeResourceManifest) RemovalResources() []RuntimeRemovalResource {
+	resources := []RuntimeRemovalResource{
+		{Class: RuntimeRemovalLease, ID: manifest.LeaseID},
+		{Class: RuntimeRemovalSnapshot, ID: manifest.SnapshotID},
+		{Class: RuntimeRemovalContainer, ID: manifest.ContainerID},
+		{Class: RuntimeRemovalTask, ID: manifest.TaskID},
+		{Class: RuntimeRemovalShim, ID: manifest.ShimID},
+		{Class: RuntimeRemovalCgroup, ID: manifest.CgroupID},
+		{Class: RuntimeRemovalLogSegments, ID: manifest.LogSegmentDirectory},
+		{Class: RuntimeRemovalHandoffVolume, ID: manifest.HandoffVolume},
+		{Class: RuntimeRemovalServiceData, ID: manifest.ServiceDataVolume},
+		{Class: RuntimeRemovalServiceDataRecord, ID: manifest.ServiceDataOwnerRecord},
+	}
+	if manifest.ComputerStorage != nil {
+		name := deterministicComputerDiskRemovalName(*manifest.ComputerStorage)
+		resources = append(resources,
+			RuntimeRemovalResource{Class: RuntimeRemovalComputerDiskImage, ID: name},
+			RuntimeRemovalResource{Class: RuntimeRemovalComputerDiskAllocation, ID: name},
+			RuntimeRemovalResource{Class: RuntimeRemovalComputerDiskQuota, ID: name},
+			RuntimeRemovalResource{Class: RuntimeRemovalComputerDiskManifest, ID: name},
+			RuntimeRemovalResource{Class: RuntimeRemovalComputerDiskMount, ID: name},
+			RuntimeRemovalResource{Class: RuntimeRemovalComputerDiskLoop, ID: name},
+			RuntimeRemovalResource{Class: RuntimeRemovalComputerAttachment, ID: name},
+		)
+	}
+	return slices.DeleteFunc(resources, func(resource RuntimeRemovalResource) bool { return resource.ID == "" })
+}
+
+func deterministicComputerDiskRemovalName(storage ComputerStorage) string {
+	if strings.TrimSpace(storage.ComputerID) == "" || strings.TrimSpace(storage.StorageID) == "" || storage.StorageGeneration < 1 {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(strings.Join([]string{
+		"computer-disk", storage.ComputerID, storage.StorageID, strconv.FormatInt(storage.StorageGeneration, 10),
+	}, "\x00")))
+	return "wefty-computer-disk-" + hex.EncodeToString(digest[:16])
+}
+
+type RuntimeRemovalProofRequest struct {
+	NodeID            string
+	BootSessionID     string
+	JobID             string
+	RemovalGeneration uint64
+	CleanupFence      string
+	ComputerStorage   *ComputerStorage
+	Attempts          []RuntimeResourceManifest
+}
+
+type RuntimeRemovalAssertion struct {
+	Class  RuntimeRemovalResourceClass `json:"class"`
+	ID     string                      `json:"id"`
+	Absent bool                        `json:"absent"`
+}
+
+// RuntimeRemovalAttestation is the assertion-derived post-delete receipt.
+// Attempts may be helper-reconstructed for legacy services that predate the
+// agent-local manifest ledger.
+type RuntimeRemovalAttestation struct {
+	Version           int                       `json:"version"`
+	JobID             string                    `json:"job_id"`
+	RemovalGeneration uint64                    `json:"removal_generation"`
+	RuntimeInstanceID string                    `json:"runtime_instance_id"`
+	RuntimeGeneration uint64                    `json:"runtime_generation"`
+	Attempts          []RuntimeResourceManifest `json:"attempts"`
+	Assertions        []RuntimeRemovalAssertion `json:"assertions"`
+}
+
+// RuntimeRemovalProofRuntime separates idempotent job-lifetime data deletion
+// from the assertion-derived absence receipt so a crash at that production
+// boundary safely retries deletion without inventing proof. It is optional
+// because process workloads remain under managedroot rather than the OCI
+// helper.
+type RuntimeRemovalProofRuntime interface {
+	ReconstructRuntimeRemoval(context.Context, RuntimeRemovalProofRequest) ([]RuntimeResourceManifest, error)
+	DeleteRuntimeRemovalData(context.Context, RuntimeRemovalProofRequest) error
+	AttestRuntimeRemoval(context.Context, RuntimeRemovalProofRequest) (RuntimeRemovalAttestation, error)
 }
 
 // AttemptEndpoint is an adapter-owned, exact-authority service endpoint. Its

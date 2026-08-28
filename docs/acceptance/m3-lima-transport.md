@@ -176,11 +176,10 @@ the helper instance/session generation before each row.
    snapshot, shim, cgroup, framed-log directory, service-data volume, and its
    owner record. Require the persisted positive prior-boot sweep receipt and
    `prepared -> quarantined -> complete` phase history, then require the
-   existing completion path to reach `removed_verified`. Record the
-   guest-native inventories and phase facts in
-   `service_removal_manifest_offline`. Ticket #150 does not prove service-data
-   byte deletion or a new post-delete absence attestation; Ticket #151 owns
-   those additions.
+   proof-gated completion path to delete the guest-native service-data bytes
+   and owner record, persist a helper-generation assertion for every manifest
+   row, and only then reach `removed_verified`. Record the guest-native
+   inventories and phase facts in `service_removal_manifest_offline`.
 
 ## Ordinary L3 OCI one-shot
 
@@ -294,6 +293,17 @@ Ticket #150 additionally requires `service_removal_manifest_offline` with
 `resource_manifests` naming the service
 data directory and its owner record independently. Hosted macOS runners are
 `NOT-RUN`; they do not satisfy this owner-hardware row.
+
+Ticket #151 additionally requires `post_delete_attestation=true`,
+`service_data_bytes_absent=true`, `service_data_owner_record_absent=true`, and
+one `absent=true` assertion for every class/identity in `resource_manifests`.
+The attended receipt must set `delete_attest_restart_observed=true` only after
+observing a real agent process restart at the helper-delete/attestation boundary
+without an early L1 acknowledgement. Injected callback errors may be recorded
+separately but do not prove a restart; hosted lanes record the restart row as
+`NOT-RUN`. The same receipt also carries bind-source byte/digest equality and
+the retained image-cache observation. A row that was skipped or could not be
+inventoried is a failure, never a synthesized PASS.
 
 Ticket #152 additionally requires PASS rows for `launch_daemon`,
 `no_lima_autostart`, `helper_install_permissions`,

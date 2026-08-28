@@ -425,6 +425,126 @@ func TestOwnerKeyedHandoffBytesSurviveAttemptsUntilExplicitFinalization(t *testi
 	}
 }
 
+func TestServiceDataDeletionRemovesBytesAndOwnerRecord(t *testing.T) {
+	root := t.TempDir()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}}
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "service-delete", AttemptID: "attempt",
+		FencingToken: "fence", Class: contract.JobClassService, RemovalGeneration: "1",
+	}
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume := filepath.Join(root, "service-data", resources.ServiceVolumeDirectory)
+	if err := os.MkdirAll(volume, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := serviceVolumeCreationAt(volume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.initializeServiceVolume(volume, resources.ServiceVolumeOwnerRecord, fresh, uint32(os.Getuid()), uint32(os.Getgid())); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(volume, "tenant-bytes"), []byte("delete me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removal := &ManagedVolumeRemovalAuthority{
+		NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID,
+		RemovalGeneration: 1, CleanupFence: "cleanup-fence",
+	}
+	response, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{Kind: ManagedVolumeServiceData, OwnerKey: authority.JobID, Removal: removal})
+	if err != nil || !response.Deleted {
+		t.Fatalf("service data deletion = %+v err=%v", response, err)
+	}
+	for _, path := range []string{volume, filepath.Join(root, "service-data-state", resources.ServiceVolumeOwnerRecord)} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("deleted service-data path %q remains: %v", path, err)
+		}
+	}
+	if _, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{Kind: ManagedVolumeServiceData, OwnerKey: authority.JobID, Removal: removal}); err != nil {
+		t.Fatalf("idempotent service data deletion: %v", err)
+	}
+}
+
+func TestServiceDataDeletionRequiresRemovalAuthority(t *testing.T) {
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: t.TempDir()}}
+	if _, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{Kind: ManagedVolumeServiceData, OwnerKey: "service-delete"}); err == nil {
+		t.Fatal("service data deletion without removal authority succeeded")
+	}
+}
+
+func TestRemovalReceiptRowsAreAssertionDerived(t *testing.T) {
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "service-attest", AttemptID: "attempt",
+		FencingToken: "fence", Class: contract.JobClassService, RemovalGeneration: "1",
+	}
+	identity, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := AttestRemovalRequest{
+		JobID: authority.JobID, RemovalGeneration: authority.RemovalGeneration,
+		Attempts: []RemovalAttemptManifest{{Authority: authority, Resources: expectedRemovalResources(identity)}},
+	}
+	residue := ResourceInventory{Tasks: []string{identity.TaskID}}
+	if response, err := attestRemovalInventory(residue, request); err == nil || len(response.Assertions) != 0 {
+		t.Fatalf("receipt recorded PASS with task residue: response=%+v err=%v", response, err)
+	}
+	response, err := attestRemovalInventory(ResourceInventory{}, request)
+	if err != nil || len(response.Assertions) != len(request.Attempts[0].Resources) {
+		t.Fatalf("complete removal assertions = %+v err=%v", response, err)
+	}
+	for _, assertion := range response.Assertions {
+		if !assertion.Absent {
+			t.Fatalf("executed assertion did not record absence: %+v", assertion)
+		}
+	}
+	invalid := request
+	invalid.Attempts = []RemovalAttemptManifest{{Authority: authority, Resources: append(slices.Clone(request.Attempts[0].Resources), RemovalResource{Class: "future-unverified", ID: "disk"})}}
+	if response, err := attestRemovalInventory(ResourceInventory{}, invalid); err == nil || len(response.Assertions) != 0 {
+		t.Fatalf("unexecuted future class recorded PASS: response=%+v err=%v", response, err)
+	}
+}
+
+func TestComputerRemovalReceiptAssertsEveryDiskInventoryClass(t *testing.T) {
+	authority := AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "computer-attest", AttemptID: "attempt",
+		FencingToken: "fence", Class: contract.JobClassService, RemovalGeneration: "1",
+	}
+	identity, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := &ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30}
+	resources := expectedRemovalResources(identity, storage)
+	request := AttestRemovalRequest{JobID: authority.JobID, RemovalGeneration: authority.RemovalGeneration,
+		Attempts: []RemovalAttemptManifest{{Authority: authority, ComputerStorage: storage, Resources: resources}}}
+	if err := validateAttestRemovalRequest(request, authority.NodeID); err != nil {
+		t.Fatalf("Computer removal manifest rejected: %v", err)
+	}
+	name, err := DeterministicComputerDiskName(*storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, residue := range []ResourceInventory{
+		{ComputerDiskImages: []string{name}}, {ComputerDiskAllocations: []string{name}},
+		{ComputerDiskQuotas: []string{name}}, {ComputerDiskManifests: []string{name}},
+		{ComputerDiskMounts: []string{name}}, {ComputerDiskLoops: []string{name}},
+		{ComputerAttachments: []string{name}},
+		{ComputerDiskAnomalies: []string{name + ":image_not_regular"}},
+	} {
+		if response, err := attestRemovalInventory(residue, request); err == nil || len(response.Assertions) != 0 {
+			t.Fatalf("Computer residue recorded PASS: inventory=%+v response=%+v err=%v", residue, response, err)
+		}
+	}
+	response, err := attestRemovalInventory(ResourceInventory{}, request)
+	if err != nil || len(response.Assertions) != len(resources) {
+		t.Fatalf("Computer absence receipt = %+v err=%v, want %d rows", response, err, len(resources))
+	}
+}
+
 func TestServiceDataVolumeInitializesOwnerOnlyOnce(t *testing.T) {
 	root := t.TempDir()
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}}
@@ -671,6 +791,27 @@ func TestServiceDataDirectoryAndOwnerRecordAreInventorySubjects(t *testing.T) {
 	filtered := filterInventory(inventory, resources, nil)
 	if !slices.Equal(filtered.ManagedVolumes, []string{resources.ServiceVolumeDirectory}) || !slices.Equal(filtered.ManagedVolumeRecords, []string{resources.ServiceVolumeOwnerRecord}) {
 		t.Fatalf("service data inventory = %+v, want directory and owner record", filtered)
+	}
+}
+
+func TestHandoffInventoryUsesDurableHandoffsRoot(t *testing.T) {
+	root := t.TempDir()
+	name, err := DeterministicHandoffVolumeDirectory("inventory-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "handoffs", name), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "volumes", "legacy-wrong-root"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inventory := ResourceInventory{ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}}
+	if err := inventoryManagedVolumeResources(root, &inventory); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(inventory.ManagedVolumes, []string{name}) {
+		t.Fatalf("managed volume inventory = %v, want durable handoff %q only", inventory.ManagedVolumes, name)
 	}
 }
 

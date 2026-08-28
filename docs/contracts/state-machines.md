@@ -74,9 +74,13 @@ binding itself remains durable. Reaching stopped never clears
 the attempt that positively reaped the payload.
 
 Verified OCI removal releases the binding image pin only after runtime and
-managed service data are positively absent and before cleanup acknowledgement.
-Releasing the pin does not delete the evictable cache entry; ordinary periodic
-cache pressure remains the only later deletion policy.
+managed service data are positively absent in a helper-generation receipt that
+contains one executed assertion for every frozen manifest row, and before
+cleanup acknowledgement. A missing, failed, or unknown resource-class row
+keeps the Job `removal_pending`; it can never reach `agent_cleaned` or
+`removed_verified`. Releasing the pin does not delete the evictable cache
+entry; ordinary periodic cache pressure remains the only later deletion
+policy.
 
 `stopping → stopped` requires the agent's positive runtime-quiescence receipt.
 For OCI this is either exact-attempt verified deletion after TERM/grace/KILL or

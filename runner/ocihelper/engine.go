@@ -44,6 +44,14 @@ type ComputerControlEngine interface {
 	SetComputerControlState(context.Context, SetComputerControlStateRequest) error
 }
 
+type RemovalProofEngine interface {
+	AttestRemoval(context.Context, AttestRemovalRequest) (AttestRemovalResponse, error)
+}
+
+type RemovalInventoryEngine interface {
+	InventoryRemoval(context.Context, InventoryRemovalRequest) (InventoryRemovalResponse, error)
+}
+
 // Engine is the helper-internal mechanics seam. No containerd request or type
 // crosses RPC.
 type Engine interface {

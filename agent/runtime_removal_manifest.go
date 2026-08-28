@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -42,9 +43,11 @@ type runtimeRemovalRecord struct {
 	removal     localRemoval
 	manifest    runtimeRemovalManifest
 	receipt     workloadrunner.ReapReceipt
+	attestation workloadrunner.RuntimeRemovalAttestation
 	phase       runtimeRemovalPhase
 	preparedAt  time.Time
 	quiescedAt  *time.Time
+	attestedAt  *time.Time
 	completedAt *time.Time
 }
 
@@ -199,9 +202,69 @@ FROM runtime_removal_manifests WHERE job_id=?`, removal.jobID).
 	return true, nil
 }
 
+// storeReconstructedRuntimeRemoval freezes helper-observed legacy inventory
+// before any reap or local/helper deletion. It uses the same immutable record
+// and phase machine as manifests captured before Run.
+func (spool *logSpool) storeReconstructedRuntimeRemoval(ctx context.Context, removal localRemoval, attempts []workloadrunner.RuntimeResourceManifest, preparedAt time.Time) error {
+	if removal.kind != contract.JobKindOCI || len(attempts) == 0 {
+		return errors.New("agent: reconstructed runtime removal requires OCI intent and helper-owned attempts")
+	}
+	slices.SortFunc(attempts, func(left, right workloadrunner.RuntimeResourceManifest) int {
+		return strings.Compare(left.AttemptID, right.AttemptID)
+	})
+	manifest := runtimeRemovalManifest{Version: 1, JobID: removal.jobID, RemovalGeneration: removal.generation, Attempts: attempts}
+	if !validRuntimeRemovalManifest(manifest) {
+		return errors.New("agent: reconstructed runtime removal manifest is incomplete")
+	}
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		return fmt.Errorf("agent: encode reconstructed runtime removal manifest: %w", err)
+	}
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("agent: begin reconstructed runtime removal persistence: %w", err)
+	}
+	defer tx.Rollback()
+	var storedKind string
+	var storedGeneration uint64
+	var storedFence, storedRoot string
+	if err := tx.QueryRowContext(ctx, `SELECT runtime_kind, removal_generation, cleanup_fence, root_instance_id
+FROM spool_removals WHERE job_id=?`, removal.jobID).Scan(&storedKind, &storedGeneration, &storedFence, &storedRoot); err != nil {
+		return fmt.Errorf("agent: verify reconstructed removal intent: %w", err)
+	}
+	if storedKind != removal.kind || storedGeneration != removal.generation || storedFence != removal.cleanupFence || storedRoot != removal.rootInstanceID {
+		return fmt.Errorf("agent: reconstructed runtime removal %q conflicts with durable authority", removal.jobID)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO runtime_removal_manifests(
+job_id, removal_generation, cleanup_fence, root_instance_id, manifest_json, phase, prepared_ns
+) VALUES(?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(job_id) DO NOTHING`, removal.jobID, removal.generation, removal.cleanupFence, removal.rootInstanceID,
+		payload, runtimeRemovalPrepared, preparedAt.UTC().Round(0).UnixNano()); err != nil {
+		return fmt.Errorf("agent: persist reconstructed runtime removal manifest: %w", err)
+	}
+	var persisted []byte
+	if err := tx.QueryRowContext(ctx, `SELECT manifest_json FROM runtime_removal_manifests
+WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id=?`, removal.jobID,
+		removal.generation, removal.cleanupFence, removal.rootInstanceID).Scan(&persisted); err != nil {
+		return fmt.Errorf("agent: read reconstructed runtime removal manifest: %w", err)
+	}
+	if !bytes.Equal(persisted, payload) {
+		return fmt.Errorf("agent: reconstructed runtime removal manifest for job %q conflicts with persisted inventory", removal.jobID)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("agent: commit reconstructed runtime removal manifest: %w", err)
+	}
+	if spool.runtimeRemovalCheckpoint != nil {
+		if err := spool.runtimeRemovalCheckpoint(runtimeRemovalCheckpointAfterManifest); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (spool *logSpool) runtimeRemoval(ctx context.Context, jobID string) (runtimeRemovalRecord, bool, error) {
 	row := spool.db.QueryRowContext(ctx, `SELECT removal_generation, cleanup_fence, root_instance_id,
-manifest_json, runtime_quiescence_json, phase, prepared_ns, quiesced_ns, completed_ns
+manifest_json, runtime_quiescence_json, absence_attestation_json, phase, prepared_ns, quiesced_ns, attested_ns, completed_ns
 FROM runtime_removal_manifests WHERE job_id=?`, jobID)
 	record, err := scanRuntimeRemoval(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -219,26 +282,36 @@ type rowScanner interface {
 
 func scanRuntimeRemoval(row rowScanner) (runtimeRemovalRecord, error) {
 	var record runtimeRemovalRecord
-	var manifestJSON, receiptJSON []byte
+	var manifestJSON, receiptJSON, attestationJSON []byte
 	var preparedNS int64
-	var quiescedNS, completedNS sql.NullInt64
+	var quiescedNS, attestedNS, completedNS sql.NullInt64
 	if err := row.Scan(&record.removal.generation, &record.removal.cleanupFence, &record.removal.rootInstanceID,
-		&manifestJSON, &receiptJSON, &record.phase, &preparedNS, &quiescedNS, &completedNS); err != nil {
+		&manifestJSON, &receiptJSON, &attestationJSON, &record.phase, &preparedNS, &quiescedNS, &attestedNS, &completedNS); err != nil {
 		return runtimeRemovalRecord{}, err
 	}
 	if err := json.Unmarshal(manifestJSON, &record.manifest); err != nil || !validRuntimeRemovalManifest(record.manifest) {
 		return runtimeRemovalRecord{}, errors.New("runtime removal manifest is corrupt")
 	}
 	record.removal.jobID = record.manifest.JobID
+	record.removal.kind = contract.JobKindOCI
 	record.preparedAt = time.Unix(0, preparedNS).UTC()
 	if len(receiptJSON) != 0 {
 		if err := json.Unmarshal(receiptJSON, &record.receipt); err != nil {
 			return runtimeRemovalRecord{}, errors.New("runtime quiescence receipt is corrupt")
 		}
 	}
+	if len(attestationJSON) != 0 {
+		if err := json.Unmarshal(attestationJSON, &record.attestation); err != nil {
+			return runtimeRemovalRecord{}, errors.New("runtime absence attestation is corrupt")
+		}
+	}
 	if quiescedNS.Valid {
 		value := time.Unix(0, quiescedNS.Int64).UTC()
 		record.quiescedAt = &value
+	}
+	if attestedNS.Valid {
+		value := time.Unix(0, attestedNS.Int64).UTC()
+		record.attestedAt = &value
 	}
 	if completedNS.Valid {
 		value := time.Unix(0, completedNS.Int64).UTC()
@@ -272,11 +345,11 @@ func validRuntimeRemovalRecord(record runtimeRemovalRecord) bool {
 	}
 	switch record.phase {
 	case runtimeRemovalPrepared:
-		return !record.receipt.RuntimeQuiesced && record.receipt.Evidence == "" && record.quiescedAt == nil && record.completedAt == nil
+		return !record.receipt.RuntimeQuiesced && record.receipt.Evidence == "" && record.attestation.Version == 0 && record.quiescedAt == nil && record.attestedAt == nil && record.completedAt == nil
 	case runtimeRemovalQuarantined:
-		return validateRuntimeReapReceipt(record.receipt) == nil && record.quiescedAt != nil && record.completedAt == nil
+		return validateRuntimeReapReceipt(record.receipt) == nil && record.attestation.Version == 0 && record.quiescedAt != nil && record.attestedAt == nil && record.completedAt == nil
 	case runtimeRemovalComplete:
-		return validateRuntimeReapReceipt(record.receipt) == nil && record.quiescedAt != nil && record.completedAt != nil
+		return validateRuntimeReapReceipt(record.receipt) == nil && validateRuntimeRemovalAttestation(record.manifest, record.attestation) == nil && record.quiescedAt != nil && record.attestedAt != nil && record.completedAt != nil
 	default:
 		return false
 	}
@@ -284,7 +357,7 @@ func validRuntimeRemovalRecord(record runtimeRemovalRecord) bool {
 
 func (spool *logSpool) pendingRuntimeRemovals(ctx context.Context) ([]runtimeRemovalRecord, error) {
 	rows, err := spool.db.QueryContext(ctx, `SELECT removal_generation, cleanup_fence, root_instance_id,
-manifest_json, runtime_quiescence_json, phase, prepared_ns, quiesced_ns, completed_ns
+manifest_json, runtime_quiescence_json, absence_attestation_json, phase, prepared_ns, quiesced_ns, attested_ns, completed_ns
 FROM runtime_removal_manifests WHERE phase IN (?, ?, ?) ORDER BY prepared_ns, job_id`,
 		runtimeRemovalPrepared, runtimeRemovalQuarantined, runtimeRemovalComplete)
 	if err != nil {
@@ -350,30 +423,95 @@ WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id
 	if err != nil || !bytes.Equal(storedReceipt, receiptJSON) {
 		return errors.New("agent: runtime quiescence receipt conflicts with persisted evidence")
 	}
-	if record.phase == runtimeRemovalComplete {
-		return nil
-	}
 	if record.phase != runtimeRemovalQuarantined {
 		return fmt.Errorf("agent: runtime removal %q has invalid phase %q", removal.jobID, record.phase)
 	}
-	result, err := spool.db.ExecContext(ctx, `UPDATE runtime_removal_manifests SET phase=?, completed_ns=?
+	return nil
+}
+
+func (spool *logSpool) recordRuntimeAttested(ctx context.Context, removal localRemoval, attestation workloadrunner.RuntimeRemovalAttestation, observedAt time.Time) error {
+	record, found, err := spool.runtimeRemoval(ctx, removal.jobID)
+	if err != nil {
+		return err
+	}
+	if !found || !sameLocalRemoval(record.removal, removal) {
+		return fmt.Errorf("agent: runtime removal %q has no matching frozen manifest", removal.jobID)
+	}
+	if err := validateRuntimeRemovalAttestation(record.manifest, attestation); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(attestation)
+	if err != nil {
+		return fmt.Errorf("agent: encode runtime absence attestation: %w", err)
+	}
+	if record.phase == runtimeRemovalComplete {
+		stored, marshalErr := json.Marshal(record.attestation)
+		if marshalErr != nil || !bytes.Equal(stored, payload) {
+			return errors.New("agent: runtime absence attestation conflicts with persisted evidence")
+		}
+		return nil
+	}
+	if record.phase != runtimeRemovalQuarantined {
+		return fmt.Errorf("agent: runtime removal %q cannot attest from phase %q", removal.jobID, record.phase)
+	}
+	observedNS := observedAt.UTC().Round(0).UnixNano()
+	result, err := spool.db.ExecContext(ctx, `UPDATE runtime_removal_manifests
+SET absence_attestation_json=?, phase=?, attested_ns=?, completed_ns=?
 WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id=? AND phase=?`,
-		runtimeRemovalComplete, observedAt.UTC().Round(0).UnixNano(), removal.jobID, removal.generation,
+		payload, runtimeRemovalComplete, observedNS, observedNS, removal.jobID, removal.generation,
 		removal.cleanupFence, removal.rootInstanceID, runtimeRemovalQuarantined)
 	if err != nil {
-		return fmt.Errorf("agent: complete runtime removal manifest: %w", err)
+		return fmt.Errorf("agent: persist runtime absence attestation: %w", err)
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("agent: inspect runtime removal completion: %w", err)
+		return fmt.Errorf("agent: inspect runtime absence attestation persistence: %w", err)
 	}
 	if changed != 1 {
-		return fmt.Errorf("agent: complete runtime removal manifest changed %d rows", changed)
+		return fmt.Errorf("agent: persist runtime absence attestation changed %d rows", changed)
 	}
 	if spool.runtimeRemovalCheckpoint != nil {
 		if err := spool.runtimeRemovalCheckpoint(runtimeRemovalCheckpointAfterComplete); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateRuntimeRemovalAttestation(manifest runtimeRemovalManifest, attestation workloadrunner.RuntimeRemovalAttestation) error {
+	if attestation.Version != 1 || attestation.JobID != manifest.JobID || attestation.RemovalGeneration != manifest.RemovalGeneration ||
+		strings.TrimSpace(attestation.RuntimeInstanceID) == "" || attestation.RuntimeGeneration == 0 || len(attestation.Attempts) == 0 {
+		return errors.New("agent: runtime removal requires a complete helper-generation absence attestation")
+	}
+	wantAttempts, err := json.Marshal(manifest.Attempts)
+	if err != nil {
+		return err
+	}
+	gotAttempts, err := json.Marshal(attestation.Attempts)
+	if err != nil || !bytes.Equal(wantAttempts, gotAttempts) {
+		return errors.New("agent: runtime absence attestation does not match the frozen attempt manifest")
+	}
+	want := make(map[workloadrunner.RuntimeRemovalResource]struct{})
+	for _, attempt := range manifest.Attempts {
+		for _, resource := range attempt.RemovalResources() {
+			want[resource] = struct{}{}
+		}
+	}
+	if len(attestation.Assertions) != len(want) {
+		return errors.New("agent: runtime absence attestation omitted a manifest resource class")
+	}
+	for _, assertion := range attestation.Assertions {
+		resource := workloadrunner.RuntimeRemovalResource{Class: assertion.Class, ID: assertion.ID}
+		if !assertion.Absent {
+			return fmt.Errorf("agent: runtime absence assertion %s/%s did not pass", assertion.Class, assertion.ID)
+		}
+		if _, exists := want[resource]; !exists {
+			return fmt.Errorf("agent: runtime absence attestation asserted an unmanifested resource %s/%s", assertion.Class, assertion.ID)
+		}
+		delete(want, resource)
+	}
+	if len(want) != 0 {
+		return errors.New("agent: runtime absence attestation did not execute every manifest assertion")
 	}
 	return nil
 }

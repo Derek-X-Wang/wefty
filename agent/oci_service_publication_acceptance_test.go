@@ -168,10 +168,10 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	var freshRestart, stopStart, saturation, retainedBinding bool
 	var removalManifestComplete, removalPending, removalEveryAttempt bool
 	var removalServiceDataVolume, removalServiceDataOwnerRecord bool
-	var removalCompleted, removalPriorBootSweep bool
+	var removalCompleted, removalPriorBootSweep, removalPostDeleteAttestation, removalDeleteAttestInjection bool
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalCompleted, removalPriorBootSweep)
+			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-l1-agent-linux.txt"), []byte(payload), 0o600); err != nil {
 				t.Errorf("write OCI L1/agent evidence: %v", err)
 			}
@@ -396,23 +396,42 @@ while :; do sleep 1; done
 		_ = restartBarrier.Close()
 		t.Fatal(err)
 	}
-	type completionEvidence struct {
-		record  runtimeRemovalRecord
-		receipt workloadrunner.ReapReceipt
+	quiescenceEvidence := make(chan workloadrunner.ReapReceipt, 1)
+	completedEvidence := make(chan runtimeRemovalRecord, 1)
+	var crashedBeforeAttestation atomic.Bool
+	attestRuntimeRemoval := nodeAgent.session.removals.attestRuntimeRemoval
+	nodeAgent.session.removals.attestRuntimeRemoval = func(ctx context.Context, request workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		if crashedBeforeAttestation.CompareAndSwap(false, true) {
+			return workloadrunner.RuntimeRemovalAttestation{}, errInjectedRuntimeRemovalCrash
+		}
+		return attestRuntimeRemoval(ctx, request)
 	}
-	completedEvidence := make(chan completionEvidence, 1)
 	recordQuiesced := nodeAgent.session.removals.recordRuntimeQuiesced
 	nodeAgent.session.removals.recordRuntimeQuiesced = func(ctx context.Context, removal localRemoval, receipt workloadrunner.ReapReceipt) error {
 		if err := recordQuiesced(ctx, removal, receipt); err != nil {
 			return err
 		}
-		stored, found, err := nodeAgent.logSpool.runtimeRemoval(ctx, removal.jobID)
+		select {
+		case quiescenceEvidence <- receipt:
+		default:
+		}
+		return nil
+	}
+	var crashedAfterAttestation atomic.Bool
+	nodeAgent.logSpool.runtimeRemovalCheckpoint = func(checkpoint runtimeRemovalCheckpoint) error {
+		if checkpoint != runtimeRemovalCheckpointAfterComplete {
+			return nil
+		}
+		stored, found, err := nodeAgent.logSpool.runtimeRemoval(t.Context(), primary.JobID)
 		if err != nil || !found {
-			return errors.Join(err, errors.New("completed runtime removal record disappeared before local cleanup"))
+			return errors.Join(err, errors.New("completed runtime removal record disappeared before acknowledgement"))
 		}
 		select {
-		case completedEvidence <- completionEvidence{record: stored, receipt: receipt}:
+		case completedEvidence <- stored:
 		default:
+		}
+		if crashedAfterAttestation.CompareAndSwap(false, true) {
+			return errInjectedRuntimeRemovalCrash
 		}
 		return nil
 	}
@@ -427,16 +446,29 @@ while :; do sleep 1; done
 	}
 	select {
 	case evidence := <-completedEvidence:
-		removalManifestComplete = evidence.record.phase == runtimeRemovalComplete && evidence.record.receipt.RuntimeQuiesced
+		removalManifestComplete = evidence.phase == runtimeRemovalComplete && evidence.receipt.RuntimeQuiesced && evidence.attestation.Version == 1
 		if !removalManifestComplete {
-			t.Fatalf("runtime removal did not reach complete before legacy cleanup: %+v", evidence.record)
+			t.Fatalf("runtime removal did not persist post-delete attestation before acknowledgement: %+v", evidence)
 		}
-		removalPriorBootSweep = evidence.receipt.Evidence == workloadrunner.ReapEvidencePriorBootOCISweep && evidence.receipt.BootSessionID != "" && evidence.receipt.SweepEpoch != "" && evidence.receipt.HelperGeneration != 0
+		if err := validateRuntimeRemovalAttestation(evidence.manifest, evidence.attestation); err != nil {
+			t.Fatalf("persisted removal attestation: %v", err)
+		}
+		removalPostDeleteAttestation = true
+		if !crashedBeforeAttestation.Load() || !crashedAfterAttestation.Load() {
+			t.Fatal("production-timing removal did not exercise both delete/attest crash boundaries")
+		}
+		removalDeleteAttestInjection = true
+	case <-time.After(15 * time.Second):
+		t.Fatal("removal completion omitted captured absence attestation")
+	}
+	select {
+	case receipt := <-quiescenceEvidence:
+		removalPriorBootSweep = receipt.Evidence == workloadrunner.ReapEvidencePriorBootOCISweep && receipt.BootSessionID != "" && receipt.SweepEpoch != "" && receipt.HelperGeneration != 0
 		if !removalPriorBootSweep {
-			t.Fatalf("restart did not use closed prior-boot OCI sweep evidence: %+v", evidence.receipt)
+			t.Fatalf("restart did not use closed prior-boot OCI sweep evidence: %+v", receipt)
 		}
 	case <-time.After(15 * time.Second):
-		t.Fatal("removal completion omitted captured quiescence evidence")
+		t.Fatal("removal completion omitted captured prior-boot quiescence evidence")
 	}
 	cancelRestart()
 	if err := <-restartDone; err != nil {

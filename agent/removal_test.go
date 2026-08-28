@@ -14,6 +14,7 @@ import (
 func TestRemovalControllerPersistsReapsDeletesThenAcknowledges(t *testing.T) {
 	directive := l1.RemovalDirective{
 		JobID: "service-remove-order", BoundNodeID: "node-remove-order",
+		Kind:              contract.JobKindProcess,
 		RemovalGeneration: 3, CleanupFence: "cleanup-fence", RootInstanceID: "root-instance",
 	}
 	var stages []string
@@ -65,14 +66,43 @@ func TestRemovalControllerPersistsReapsDeletesThenAcknowledges(t *testing.T) {
 }
 
 func TestComputerRemovalDeletesDiskBeforeAcknowledgement(t *testing.T) {
-	directive := l1.RemovalDirective{JobID: "computer-job", BoundNodeID: "node", RemovalGeneration: 4, CleanupFence: "cleanup", RootInstanceID: "root",
+	directive := l1.RemovalDirective{JobID: "computer-job", BoundNodeID: "node", Kind: contract.JobKindOCI, RemovalGeneration: 4, CleanupFence: "cleanup", RootInstanceID: "root",
 		ComputerStorage: &l1.ComputerStorageClaim{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2}}
 	var stages []string
+	storage := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30}
+	attempt := testRuntimeResourceManifest(directive.JobID, "legacy-attempt")
+	attempt.ServiceDataVolume = ""
+	attempt.ServiceDataOwnerRecord = ""
+	attempt.ComputerStorage = storage
+	manifest := runtimeRemovalManifest{Version: 1, JobID: directive.JobID, RemovalGeneration: directive.RemovalGeneration,
+		Attempts: []workloadrunner.RuntimeResourceManifest{attempt}}
+	var frozen bool
 	controller := &removalController{nodeID: "node", bootSessionID: "boot"}
 	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
-	controller.reapService = func(context.Context, string) (workloadrunner.ReapReceipt, error) {
-		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
+		if !frozen {
+			return runtimeRemovalRecord{}, false, nil
+		}
+		return runtimeRemovalRecord{removal: localRemoval{jobID: directive.JobID, kind: contract.JobKindOCI, generation: directive.RemovalGeneration, cleanupFence: directive.CleanupFence, rootInstanceID: directive.RootInstanceID}, manifest: manifest, phase: runtimeRemovalPrepared}, true, nil
 	}
+	controller.reconstructRuntime = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error) {
+		stages = append(stages, "scan")
+		return manifest.Attempts, nil
+	}
+	controller.persistRuntimeRemoval = func(_ context.Context, _ localRemoval, attempts []workloadrunner.RuntimeResourceManifest) error {
+		stages = append(stages, "freeze")
+		if !reflect.DeepEqual(attempts, manifest.Attempts) {
+			t.Fatalf("persisted Computer inventory = %+v", attempts)
+		}
+		frozen = true
+		return nil
+	}
+	controller.reapService = func(context.Context, string) (workloadrunner.ReapReceipt, error) {
+		stages = append(stages, "reap")
+		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt, BootSessionID: "boot"}, nil
+	}
+	controller.recordRuntimeQuiesced = func(context.Context, localRemoval, workloadrunner.ReapReceipt) error { return nil }
+	controller.recordRuntimeAttested = func(context.Context, localRemoval, workloadrunner.RuntimeRemovalAttestation) error { return nil }
 	controller.purgeJob = func(context.Context, string) error { return nil }
 	controller.removeResource = func(context.Context, localRemoval) error { stages = append(stages, "managed"); return nil }
 	controller.finalizeVolumes = func(_ context.Context, request workloadrunner.ManagedVolumeFinalizationRequest) error {
@@ -82,18 +112,57 @@ func TestComputerRemovalDeletesDiskBeforeAcknowledgement(t *testing.T) {
 		}
 		return nil
 	}
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error {
+		stages = append(stages, "delete-data")
+		return nil
+	}
+	controller.attestRuntimeRemoval = func(_ context.Context, request workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		stages = append(stages, "attest")
+		classes := make(map[workloadrunner.RuntimeRemovalResourceClass]bool)
+		for _, resource := range request.Attempts[0].RemovalResources() {
+			classes[resource.Class] = true
+		}
+		for _, class := range []workloadrunner.RuntimeRemovalResourceClass{
+			workloadrunner.RuntimeRemovalComputerDiskImage, workloadrunner.RuntimeRemovalComputerDiskAllocation,
+			workloadrunner.RuntimeRemovalComputerDiskQuota, workloadrunner.RuntimeRemovalComputerDiskManifest,
+			workloadrunner.RuntimeRemovalComputerDiskMount, workloadrunner.RuntimeRemovalComputerDiskLoop,
+			workloadrunner.RuntimeRemovalComputerAttachment,
+		} {
+			if !classes[class] {
+				t.Fatalf("Computer attestation omitted class %q: %+v", class, request.Attempts[0].RemovalResources())
+			}
+		}
+		if classes[workloadrunner.RuntimeRemovalServiceData] || classes[workloadrunner.RuntimeRemovalServiceDataRecord] {
+			t.Fatalf("Computer attestation included service-data classes: %+v", request.Attempts[0].RemovalResources())
+		}
+		return testRuntimeRemovalAttestation(manifest), nil
+	}
 	controller.ackRemoval = func(context.Context, localRemoval) error { stages = append(stages, "ack"); return nil }
 	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
 	if err := controller.process(t.Context(), directive); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"managed", "disk", "ack"}; !reflect.DeepEqual(stages, want) {
+	if want := []string{"scan", "freeze", "reap", "managed", "disk", "delete-data", "attest", "ack"}; !reflect.DeepEqual(stages, want) {
 		t.Fatalf("Computer removal stages = %v, want %v", stages, want)
 	}
 }
 
-func TestComputerRemovalResumesDiskDeletionFromFrozenManifest(t *testing.T) {
-	removal := localRemoval{jobID: "computer-job", generation: 4, cleanupFence: "cleanup", rootInstanceID: "root", processTreeReaped: true}
+func TestComputerRemovalRejectsNonOCIKind(t *testing.T) {
+	controller := &removalController{nodeID: "node"}
+	began := false
+	controller.beginRemoval = func(context.Context, localRemoval) error { began = true; return nil }
+	err := controller.process(t.Context(), l1.RemovalDirective{
+		JobID: "computer-job", BoundNodeID: "node", Kind: contract.JobKindProcess,
+		RemovalGeneration: 1, CleanupFence: "cleanup", RootInstanceID: "root",
+		ComputerStorage: &l1.ComputerStorageClaim{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1},
+	})
+	if err == nil || began {
+		t.Fatalf("Computer/process pairing = err %v began=%t", err, began)
+	}
+}
+
+func TestComputerRemovalResumesFromDurableAttestationWithoutRepeatingHelperDeletion(t *testing.T) {
+	removal := localRemoval{jobID: "computer-job", kind: contract.JobKindOCI, generation: 4, cleanupFence: "cleanup", rootInstanceID: "root", processTreeReaped: true}
 	storage := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30}
 	record := runtimeRemovalRecord{
 		removal: removal, phase: runtimeRemovalComplete,
@@ -106,19 +175,15 @@ func TestComputerRemovalResumesDiskDeletionFromFrozenManifest(t *testing.T) {
 	controller.purgeJob = func(context.Context, string) error { return nil }
 	controller.removeResource = func(context.Context, localRemoval) error { return nil }
 	controller.finalizeVolumes = func(_ context.Context, request workloadrunner.ManagedVolumeFinalizationRequest) error {
-		stages = append(stages, "disk")
-		if request.Removal == nil || request.Removal.BootSessionID != "new-boot" || len(request.Volumes) != 1 ||
-			request.Volumes[0].ComputerStorage == nil || *request.Volumes[0].ComputerStorage != *storage {
-			t.Fatalf("resumed Computer finalization request = %+v", request)
-		}
-		return nil
+		t.Fatalf("durably attested removal repeated Computer deletion: %+v", request)
+		return errors.New("unreachable")
 	}
 	controller.ackRemoval = func(context.Context, localRemoval) error { stages = append(stages, "ack"); return nil }
 	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
 	if err := controller.resume(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"disk", "ack"}; !reflect.DeepEqual(stages, want) {
+	if want := []string{"ack"}; !reflect.DeepEqual(stages, want) {
 		t.Fatalf("resumed Computer removal stages = %v, want %v", stages, want)
 	}
 }
@@ -140,7 +205,7 @@ func TestRemovalControllerNeverAcknowledgesFailedDeletion(t *testing.T) {
 	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
 
 	err := controller.process(context.Background(), l1.RemovalDirective{
-		JobID: "service", BoundNodeID: "node", RemovalGeneration: 1,
+		JobID: "service", BoundNodeID: "node", Kind: contract.JobKindProcess, RemovalGeneration: 1,
 		CleanupFence: "fence", RootInstanceID: "root",
 	})
 	if !errors.Is(err, errDelete) || acknowledged {
@@ -171,7 +236,7 @@ func TestRemovalControllerBlocksWithoutPositiveRuntimeReceipt(t *testing.T) {
 			controller.ackRemoval = func(context.Context, localRemoval) error { downstream = true; return nil }
 			controller.finishRemoval = func(context.Context, localRemoval) error { downstream = true; return nil }
 			err := controller.process(context.Background(), l1.RemovalDirective{
-				JobID: "service", BoundNodeID: "node", RemovalGeneration: 1,
+				JobID: "service", BoundNodeID: "node", Kind: contract.JobKindProcess, RemovalGeneration: 1,
 				CleanupFence: "fence", RootInstanceID: "root",
 			})
 			if err == nil || downstream {
@@ -183,7 +248,7 @@ func TestRemovalControllerBlocksWithoutPositiveRuntimeReceipt(t *testing.T) {
 
 func TestRemovalControllerCompletesRuntimeManifestThenDeletesAndAcknowledges(t *testing.T) {
 	directive := l1.RemovalDirective{
-		JobID: "oci-service", BoundNodeID: "node", RemovalGeneration: 1,
+		JobID: "oci-service", BoundNodeID: "node", Kind: contract.JobKindOCI, RemovalGeneration: 1,
 		CleanupFence: "fence", RootInstanceID: "root",
 	}
 	var stages []string
@@ -192,15 +257,28 @@ func TestRemovalControllerCompletesRuntimeManifestThenDeletesAndAcknowledges(t *
 		stages = append(stages, "manifest")
 		return nil
 	}
+	manifest := runtimeRemovalManifest{Version: 1, JobID: directive.JobID, RemovalGeneration: 1, Attempts: []workloadrunner.RuntimeResourceManifest{testRuntimeResourceManifest(directive.JobID, "attempt")}}
 	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
-		return runtimeRemovalRecord{removal: testRuntimeRemoval(directive.JobID), phase: runtimeRemovalPrepared}, true, nil
+		return runtimeRemovalRecord{removal: testRuntimeRemoval(directive.JobID), manifest: manifest, phase: runtimeRemovalPrepared}, true, nil
 	}
 	controller.reapService = func(context.Context, string) (workloadrunner.ReapReceipt, error) {
 		stages = append(stages, "quiesce")
 		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
 	}
 	controller.recordRuntimeQuiesced = func(context.Context, localRemoval, workloadrunner.ReapReceipt) error {
-		stages = append(stages, "complete-manifest")
+		stages = append(stages, "record-quiescence")
+		return nil
+	}
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error {
+		stages = append(stages, "delete-runtime-data")
+		return nil
+	}
+	controller.attestRuntimeRemoval = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		stages = append(stages, "delete-and-attest-runtime")
+		return testRuntimeRemovalAttestation(manifest), nil
+	}
+	controller.recordRuntimeAttested = func(context.Context, localRemoval, workloadrunner.RuntimeRemovalAttestation) error {
+		stages = append(stages, "record-attestation")
 		return nil
 	}
 	controller.purgeJob = func(context.Context, string) error {
@@ -228,7 +306,7 @@ func TestRemovalControllerCompletesRuntimeManifestThenDeletesAndAcknowledges(t *
 		t.Fatal(err)
 	}
 	if want := []string{
-		"manifest", "quiesce", "complete-manifest", "purge-spool", "remove-resource",
+		"manifest", "quiesce", "record-quiescence", "purge-spool", "remove-resource", "delete-runtime-data", "delete-and-attest-runtime", "record-attestation",
 		"release-image-pin", "acknowledge", "finish-removal",
 	}; !reflect.DeepEqual(stages, want) {
 		t.Fatalf("OCI removal preparation stages = %v, want %v", stages, want)
@@ -243,7 +321,7 @@ func TestRemovalControllerResumesEveryRuntimeManifestPhase(t *testing.T) {
 		wantRecord bool
 	}{
 		{name: "prepared", phase: runtimeRemovalPrepared, wantReap: true, wantRecord: true},
-		{name: "quarantined", phase: runtimeRemovalQuarantined, wantRecord: true},
+		{name: "quarantined", phase: runtimeRemovalQuarantined},
 		{name: "complete", phase: runtimeRemovalComplete},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -252,7 +330,8 @@ func TestRemovalControllerResumesEveryRuntimeManifestPhase(t *testing.T) {
 				RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidencePriorBootOCISweep,
 				BootSessionID: "prior-boot", SweepEpoch: "sweep-1", HelperGeneration: 1,
 			}
-			record := runtimeRemovalRecord{removal: removal, phase: test.phase}
+			manifest := runtimeRemovalManifest{Version: 1, JobID: removal.jobID, RemovalGeneration: removal.generation, Attempts: []workloadrunner.RuntimeResourceManifest{testRuntimeResourceManifest(removal.jobID, "attempt")}}
+			record := runtimeRemovalRecord{removal: removal, manifest: manifest, phase: test.phase}
 			if test.phase != runtimeRemovalPrepared {
 				record.receipt = receipt
 			}
@@ -268,6 +347,11 @@ func TestRemovalControllerResumesEveryRuntimeManifestPhase(t *testing.T) {
 				recorded = true
 				return nil
 			}
+			controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error { return nil }
+			controller.attestRuntimeRemoval = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+				return testRuntimeRemovalAttestation(manifest), nil
+			}
+			controller.recordRuntimeAttested = func(context.Context, localRemoval, workloadrunner.RuntimeRemovalAttestation) error { return nil }
 			controller.purgeJob = func(context.Context, string) error { return nil }
 			controller.removeResource = func(context.Context, localRemoval) error { return nil }
 			controller.releaseImagePin = func(context.Context, string) error { return nil }
@@ -280,6 +364,47 @@ func TestRemovalControllerResumesEveryRuntimeManifestPhase(t *testing.T) {
 				t.Fatalf("resume phase %s = reaped %t recorded %t, want %t/%t", test.phase, reaped, recorded, test.wantReap, test.wantRecord)
 			}
 		})
+	}
+}
+
+func TestRemovalControllerCrashBetweenHelperDeleteAndAttestationNeverAcknowledgesEarly(t *testing.T) {
+	directive := l1.RemovalDirective{
+		JobID: "oci-delete-crash", BoundNodeID: "node", Kind: contract.JobKindOCI,
+		RemovalGeneration: 1, CleanupFence: "fence", RootInstanceID: "root",
+	}
+	removal := testRuntimeRemoval(directive.JobID)
+	removal.cleanupFence = directive.CleanupFence
+	removal.rootInstanceID = directive.RootInstanceID
+	manifest := runtimeRemovalManifest{Version: 1, JobID: directive.JobID, RemovalGeneration: 1, Attempts: []workloadrunner.RuntimeResourceManifest{testRuntimeResourceManifest(directive.JobID, "attempt")}}
+	record := runtimeRemovalRecord{removal: removal, manifest: manifest, phase: runtimeRemovalQuarantined, receipt: workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt, BootSessionID: "boot"}}
+	acknowledged := false
+	proofCalls := 0
+	deleteCalls := 0
+	controller := &removalController{nodeID: directive.BoundNodeID}
+	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) { return record, true, nil }
+	controller.purgeJob = func(context.Context, string) error { return nil }
+	controller.removeResource = func(context.Context, localRemoval) error { return nil }
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error {
+		deleteCalls++
+		return nil
+	}
+	controller.attestRuntimeRemoval = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		proofCalls++
+		if proofCalls == 1 {
+			return workloadrunner.RuntimeRemovalAttestation{}, errInjectedRuntimeRemovalCrash
+		}
+		return testRuntimeRemovalAttestation(manifest), nil
+	}
+	controller.recordRuntimeAttested = func(context.Context, localRemoval, workloadrunner.RuntimeRemovalAttestation) error { return nil }
+	controller.releaseImagePin = func(context.Context, string) error { return nil }
+	controller.ackRemoval = func(context.Context, localRemoval) error { acknowledged = true; return nil }
+	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
+	if err := controller.process(t.Context(), directive); !errors.Is(err, errInjectedRuntimeRemovalCrash) || acknowledged {
+		t.Fatalf("delete/attest crash = err %v acknowledged=%t", err, acknowledged)
+	}
+	if err := controller.process(t.Context(), directive); err != nil || !acknowledged || proofCalls != 2 || deleteCalls != 2 {
+		t.Fatalf("delete/attest resume = err %v acknowledged=%t delete_calls=%d proof_calls=%d", err, acknowledged, deleteCalls, proofCalls)
 	}
 }
 
@@ -327,12 +452,13 @@ func TestReturningNodeRemovalUsesPriorBootGuardianReceipt(t *testing.T) {
 
 func TestRemovalControllerResumesQuarantinedDeletionBeforeAcknowledging(t *testing.T) {
 	removal := localRemoval{
-		jobID: "resumed-service", generation: 2, rootInstanceID: "root", cleanupFence: "fence",
+		jobID: "resumed-service", kind: contract.JobKindProcess, generation: 2, rootInstanceID: "root", cleanupFence: "fence",
 		processTreeReaped: true,
 	}
 	managed := &resumedManagedResource{completed: []localRemoval{removal}}
 	var stages []string
 	controller := &removalController{managed: managed}
+	controller.loadRemovalIntent = func(context.Context, string) (localRemoval, bool, error) { return removal, true, nil }
 	controller.purgeJob = func(context.Context, string) error {
 		stages = append(stages, "purge-spool")
 		return nil
@@ -357,6 +483,32 @@ func TestRemovalControllerResumesQuarantinedDeletionBeforeAcknowledging(t *testi
 	}
 	if want := []string{"purge-spool", "release-image-pin", "acknowledge", "release-local-record"}; !reflect.DeepEqual(stages, want) {
 		t.Fatalf("resumed removal stages = %v, want %v", stages, want)
+	}
+}
+
+func TestRemovalControllerSkipsCompletedManagedrootTombstoneWithoutIntent(t *testing.T) {
+	historical := localRemoval{jobID: "historical", processTreeReaped: true}
+	pending := localRemoval{jobID: "pending", kind: contract.JobKindProcess, generation: 2, rootInstanceID: "root", cleanupFence: "fence", processTreeReaped: true}
+	managed := &resumedManagedResource{completed: []localRemoval{historical, pending}}
+	var acknowledged []string
+	controller := &removalController{managed: managed}
+	controller.loadRemovalIntent = func(_ context.Context, jobID string) (localRemoval, bool, error) {
+		if jobID == historical.jobID {
+			return localRemoval{}, false, nil
+		}
+		return pending, true, nil
+	}
+	controller.purgeJob = func(context.Context, string) error { return nil }
+	controller.ackRemoval = func(_ context.Context, removal localRemoval) error {
+		acknowledged = append(acknowledged, removal.jobID)
+		return nil
+	}
+	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
+	if err := controller.resume(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{pending.jobID}; !reflect.DeepEqual(acknowledged, want) {
+		t.Fatalf("acknowledged removals = %v, want %v", acknowledged, want)
 	}
 }
 

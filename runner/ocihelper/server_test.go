@@ -193,6 +193,64 @@ func TestAttemptOutsideSessionIsDistinctFromNonLiveAttempt(t *testing.T) {
 	assertRPCCode(t, err, CodeUnauthorizedAttempt)
 }
 
+func TestRemovalAttestationRequiresExactNodeJobGenerationAndResourceInventory(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	authority := testAuthority()
+	authority.Class = contract.JobClassService
+	authority.RemovalGeneration = "1"
+	identity, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := AttestRemovalRequest{
+		JobID: authority.JobID, RemovalGeneration: authority.RemovalGeneration,
+		Attempts: []RemovalAttemptManifest{{Authority: authority, Resources: expectedRemovalResources(identity)}},
+	}
+	response, err := session.AttestRemoval(t.Context(), request)
+	if err != nil || len(response.Assertions) != len(request.Attempts[0].Resources) {
+		t.Fatalf("removal attestation = %+v err=%v", response, err)
+	}
+	handshake := session.Handshake()
+	if response.JobID != request.JobID || response.RemovalGeneration != request.RemovalGeneration ||
+		response.HelperSession.HelperInstanceID != handshake.HelperInstanceID ||
+		response.HelperSession.SessionGeneration != handshake.SessionGeneration {
+		t.Fatalf("removal attestation metadata = %+v, handshake=%+v", response, handshake)
+	}
+	request.Attempts[0].Resources[0].ID = "invented-resource"
+	_, err = session.AttestRemoval(t.Context(), request)
+	assertRPCCode(t, err, CodeInvalidRequest)
+}
+
+func TestServiceDataDeletionRequiresCurrentRemovalAuthority(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+
+	request := DeleteManagedVolumeRequest{Kind: ManagedVolumeServiceData, OwnerKey: "service-delete"}
+	_, err = session.DeleteManagedVolume(t.Context(), request)
+	assertRPCCode(t, err, CodeInvalidRequest)
+	request.Removal = &ManagedVolumeRemovalAuthority{
+		NodeID: "node-1", BootSessionID: "different-boot", JobID: request.OwnerKey,
+		RemovalGeneration: 1, CleanupFence: "cleanup-fence",
+	}
+	_, err = session.DeleteManagedVolume(t.Context(), request)
+	assertRPCCode(t, err, CodeInvalidRequest)
+}
+
 func TestBootBarrierSweepsVerifiesAndRetriesExclusiveTakeover(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: time.Second, ReapTimeout: 2 * time.Second})
@@ -1875,6 +1933,16 @@ func (engine *fakeEngine) Delete(context.Context, DeleteRequest) (DeleteResponse
 }
 func (*fakeEngine) DeleteManagedVolume(context.Context, DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
 	return DeleteManagedVolumeResponse{Deleted: true}, nil
+}
+func (engine *fakeEngine) AttestRemoval(_ context.Context, request AttestRemovalRequest) (AttestRemovalResponse, error) {
+	engine.record("AttestRemoval")
+	var assertions []RemovalAssertion
+	for _, attempt := range request.Attempts {
+		for _, resource := range attempt.Resources {
+			assertions = append(assertions, RemovalAssertion{Class: resource.Class, ID: resource.ID, Absent: true})
+		}
+	}
+	return AttestRemovalResponse{Assertions: assertions}, nil
 }
 func (engine *fakeEngine) Verify(context.Context, VerifyRequest) (VerifyResponse, error) {
 	engine.record("Verify")

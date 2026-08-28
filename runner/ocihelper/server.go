@@ -144,6 +144,7 @@ func (operation *sessionOperation) monitorAcknowledgements() <-chan error {
 type serverSession struct {
 	server     *Server
 	identity   SessionIdentity
+	helper     HelperSession
 	peerKey    string
 	capability string
 	control    net.Conn
@@ -362,6 +363,7 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 	generation := server.nextSessionGeneration
 	session := &serverSession{
 		server: server, identity: SessionIdentity{NodeID: body.NodeID, BootSessionID: body.BootSessionID},
+		helper:  HelperSession{HelperInstanceID: server.instanceID, SessionGeneration: generation},
 		peerKey: peer.authorityKey(), capability: capability, control: connection,
 		heartbeatDeadline: now.Add(server.config.HeartbeatTimeout), heartbeatChanged: make(chan struct{}, 1),
 		done: make(chan struct{}), attempts: make(map[string]*serverAttempt), operations: make(map[*sessionOperation]struct{}),
@@ -813,7 +815,9 @@ func (session *serverSession) sweepRequired(method Method) bool {
 	switch method {
 	case MethodAcquireSession, MethodSweep, MethodVerify:
 		return false
-	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus, MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl:
+	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus,
+		MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodInventoryRemoval, MethodAttestRemoval,
+		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl:
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		return !session.sweepVerified
@@ -1084,20 +1088,24 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if !decodeRequest(wire, request.Body, &body) {
 			return
 		}
+		var identityErr error
 		switch body.Kind {
 		case ManagedVolumeHandoff:
-			if _, err := DeterministicHandoffVolumeDirectory(body.OwnerKey); err != nil {
-				_ = writeFailure(wire, CodeInvalidRequest, err.Error())
-				return
+			_, identityErr = DeterministicHandoffVolumeDirectory(body.OwnerKey)
+		case ManagedVolumeServiceData:
+			_, identityErr = DeterministicServiceVolumeDirectory(body.OwnerKey)
+			if identityErr == nil && (body.Removal == nil || body.Removal.JobID != body.OwnerKey || !validCurrentRemovalAuthority(*body.Removal, session.identity)) {
+				identityErr = errors.New("complete current-session service-data removal authority is required")
 			}
 		case ManagedVolumeComputerDisk:
-			if body.ComputerStorage == nil || body.Removal == nil || body.Removal.NodeID != session.identity.NodeID || body.Removal.BootSessionID != session.identity.BootSessionID ||
-				body.Removal.JobID == "" || body.Removal.RemovalGeneration == 0 || body.Removal.CleanupFence == "" {
-				_ = writeFailure(wire, CodeInvalidRequest, "complete current-session Computer removal authority is required")
-				return
+			if body.ComputerStorage == nil || body.Removal == nil || !validCurrentRemovalAuthority(*body.Removal, session.identity) {
+				identityErr = errors.New("complete current-session Computer removal authority is required")
 			}
 		default:
-			_ = writeFailure(wire, CodeInvalidRequest, "managed-volume deletion kind is unsupported")
+			identityErr = fmt.Errorf("managed volume kind %q cannot be deleted", body.Kind)
+		}
+		if identityErr != nil {
+			_ = writeFailure(wire, CodeInvalidRequest, identityErr.Error())
 			return
 		}
 		engine, ok := server.engine.(ManagedVolumeEngine)
@@ -1107,6 +1115,50 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.DeleteManagedVolume(operation.ctx, body)
+		_ = writeEngineResponse(wire, response, err)
+	case MethodInventoryRemoval:
+		var body InventoryRemovalRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if !validCurrentRemovalAuthority(body.Removal, session.identity) {
+			_ = writeFailure(wire, CodeInvalidRequest, "complete current-session removal inventory authority is required")
+			return
+		}
+		engine, ok := server.engine.(RemovalInventoryEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "removal inventory is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.InventoryRemoval(operation.ctx, body)
+		if err == nil {
+			response.JobID = body.Removal.JobID
+			response.RemovalGeneration = body.Removal.RemovalGeneration
+			response.HelperSession = session.helper
+		}
+		_ = writeEngineResponse(wire, response, err)
+	case MethodAttestRemoval:
+		var body AttestRemovalRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if err := validateAttestRemovalRequest(body, session.identity.NodeID); err != nil {
+			_ = writeFailure(wire, CodeInvalidRequest, err.Error())
+			return
+		}
+		engine, ok := server.engine.(RemovalProofEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "removal attestation is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.AttestRemoval(operation.ctx, body)
+		if err == nil {
+			response.JobID = body.JobID
+			response.RemovalGeneration = body.RemovalGeneration
+			response.HelperSession = session.helper
+		}
 		_ = writeEngineResponse(wire, response, err)
 	case MethodVerify:
 		var body VerifyRequest
@@ -1221,6 +1273,11 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 	default:
 		_ = writeFailure(wire, CodeUnsupportedOperation, "unknown OCI helper method")
 	}
+}
+
+func validCurrentRemovalAuthority(removal ManagedVolumeRemovalAuthority, identity SessionIdentity) bool {
+	return removal.NodeID == identity.NodeID && removal.BootSessionID == identity.BootSessionID &&
+		strings.TrimSpace(removal.JobID) != "" && removal.RemovalGeneration > 0 && strings.TrimSpace(removal.CleanupFence) != ""
 }
 
 func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {

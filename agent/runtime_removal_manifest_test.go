@@ -61,6 +61,29 @@ func TestRuntimeRemovalManifestAcceptsComputerStorageInsteadOfPhantomServiceData
 	if err := validateRuntimeResourceManifest(manifest); err != nil {
 		t.Fatalf("Computer runtime manifest rejected: %v", err)
 	}
+	resources := manifest.RemovalResources()
+	computerClasses := map[workloadrunner.RuntimeRemovalResourceClass]bool{
+		workloadrunner.RuntimeRemovalComputerDiskImage: false, workloadrunner.RuntimeRemovalComputerDiskAllocation: false,
+		workloadrunner.RuntimeRemovalComputerDiskQuota: false, workloadrunner.RuntimeRemovalComputerDiskManifest: false,
+		workloadrunner.RuntimeRemovalComputerDiskMount: false, workloadrunner.RuntimeRemovalComputerDiskLoop: false,
+		workloadrunner.RuntimeRemovalComputerAttachment: false,
+	}
+	for _, resource := range resources {
+		if resource.Class == workloadrunner.RuntimeRemovalServiceData || resource.Class == workloadrunner.RuntimeRemovalServiceDataRecord {
+			t.Fatalf("Computer manifest projected phantom service data: %+v", resources)
+		}
+		if _, ok := computerClasses[resource.Class]; ok {
+			if resource.ID == "" {
+				t.Fatalf("Computer manifest projected an empty resource identity: %+v", resource)
+			}
+			computerClasses[resource.Class] = true
+		}
+	}
+	for class, present := range computerClasses {
+		if !present {
+			t.Fatalf("Computer manifest omitted removal class %q: %+v", class, resources)
+		}
+	}
 	manifest.ServiceDataVolume = "phantom"
 	manifest.ServiceDataOwnerRecord = "phantom.owner"
 	if err := validateRuntimeResourceManifest(manifest); err == nil {
@@ -123,7 +146,7 @@ func TestRuntimeRemovalManifestResumesCrashBoundaries(t *testing.T) {
 		}
 		return nil
 	}
-	if err := spool.recordRuntimeQuiesced(t.Context(), removal, receipt, createdAt.Add(3*time.Minute)); !errors.Is(err, errInjectedRuntimeRemovalCrash) {
+	if err := spool.recordRuntimeAttested(t.Context(), removal, testRuntimeRemovalAttestation(record.manifest), createdAt.Add(3*time.Minute)); !errors.Is(err, errInjectedRuntimeRemovalCrash) {
 		t.Fatalf("completion crash = %v", err)
 	}
 	if err := spool.Close(); err != nil {
@@ -266,8 +289,48 @@ func TestRuntimeRemovalFreezeRejectsCorruptAndGenerationMismatchedAttempts(t *te
 	}
 }
 
+func TestRuntimeRemovalAttestationRejectsUnexecutedAndFailedRows(t *testing.T) {
+	manifest := runtimeRemovalManifest{
+		Version: 1, JobID: "attestation-job", RemovalGeneration: 1,
+		Attempts: []workloadrunner.RuntimeResourceManifest{testRuntimeResourceManifest("attestation-job", "attempt")},
+	}
+	valid := testRuntimeRemovalAttestation(manifest)
+	if err := validateRuntimeRemovalAttestation(manifest, valid); err != nil {
+		t.Fatalf("valid attestation rejected: %v", err)
+	}
+	omitted := valid
+	omitted.Assertions = omitted.Assertions[:len(omitted.Assertions)-1]
+	if err := validateRuntimeRemovalAttestation(manifest, omitted); err == nil {
+		t.Fatal("attestation omitted an unexecuted manifest row")
+	}
+	failed := valid
+	failed.Assertions = append([]workloadrunner.RuntimeRemovalAssertion(nil), valid.Assertions...)
+	failed.Assertions[0].Absent = false
+	if err := validateRuntimeRemovalAttestation(manifest, failed); err == nil {
+		t.Fatal("attestation recorded a failed row as proof")
+	}
+}
+
 func testRuntimeRemoval(jobID string) localRemoval {
-	return localRemoval{jobID: jobID, generation: l1.InitialServiceRemovalGeneration, cleanupFence: "cleanup-fence", rootInstanceID: "root-instance"}
+	return localRemoval{jobID: jobID, kind: contract.JobKindOCI, generation: l1.InitialServiceRemovalGeneration, cleanupFence: "cleanup-fence", rootInstanceID: "root-instance"}
+}
+
+func testRuntimeRemovalAttestation(manifest runtimeRemovalManifest) workloadrunner.RuntimeRemovalAttestation {
+	seen := make(map[workloadrunner.RuntimeRemovalResource]struct{})
+	var assertions []workloadrunner.RuntimeRemovalAssertion
+	for _, attempt := range manifest.Attempts {
+		for _, resource := range attempt.RemovalResources() {
+			if _, exists := seen[resource]; exists {
+				continue
+			}
+			seen[resource] = struct{}{}
+			assertions = append(assertions, workloadrunner.RuntimeRemovalAssertion{Class: resource.Class, ID: resource.ID, Absent: true})
+		}
+	}
+	return workloadrunner.RuntimeRemovalAttestation{
+		Version: 1, JobID: manifest.JobID, RemovalGeneration: manifest.RemovalGeneration,
+		RuntimeInstanceID: "helper", RuntimeGeneration: 1, Attempts: manifest.Attempts, Assertions: assertions,
+	}
 }
 
 func testRuntimeResourceManifest(jobID, attemptID string) workloadrunner.RuntimeResourceManifest {

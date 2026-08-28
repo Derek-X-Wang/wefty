@@ -243,13 +243,21 @@ traverses them.
 The first removal-intent write atomically snapshots every retained attempt row
 into one immutable job/removal-generation manifest. OCI removal then advances
 only `prepared` (manifest durable) → `quarantined` (positive
-`runtimeQuiesced` receipt durable) → `complete` (manifest preparation closed).
-Each transition is insert-or-compare and restart-resumable. `complete` is not
-cleanup attestation: the L1 Job remains `removal_pending`, and directory,
-spool, service-data, binding-pin deletion, plus `agent_cleaned` acknowledgement
-remain owned by the deletion-proof step. A named runtime resource is validated
-against its complete authority labels before a `NotFound` observation may
-participate in the compound absence proof.
+`runtimeQuiesced` receipt durable) → `complete` (the helper-generation
+post-delete attestation is durable). Each transition is insert-or-compare and
+restart-resumable. Between `quarantined` and `complete`, the agent purges its
+spool, completes managed-root deletion, and asks the helper to delete the
+stable service-data directory and owner record. The helper then inventories
+every class and identity in the frozen manifest; the receipt contains only
+assertions that actually ran and observed absence. The binding image pin is
+released and L1 may observe `agent_cleaned` only after `complete`. A named
+runtime resource is validated against its complete authority labels before a
+`NotFound` observation may participate in the compound absence proof.
+
+For a legacy OCI service without an agent-local manifest, the adapter may
+reconstruct the exact attempt inventory only from a positive helper sweep
+receipt naming the same job and removal generation. No matching sweep evidence
+fails closed; it is never upgraded into an empty or verified manifest.
 
 For `kind=process`, `Run` already waits for process or Guardian reaping, so the
 receipt verifies that blocking return contract. Inline executable decoding,

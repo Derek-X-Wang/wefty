@@ -1005,6 +1005,10 @@ type adapterTestEngine struct {
 	blockSignal        bool
 	signals            []ocihelper.Signal
 	watchErrorOnCancel bool
+	inventoryRemoval   ocihelper.InventoryRemovalResponse
+	inventoryErr       error
+	attestRemoval      ocihelper.AttestRemovalResponse
+	attestErr          error
 }
 
 func (engine *adapterTestEngine) ReconcileImagePins(_ context.Context, request ocihelper.ReconcileImagePinsRequest) (ocihelper.ReconcileImagePinsResponse, error) {
@@ -1138,6 +1142,12 @@ func (engine *adapterTestEngine) Delete(context.Context, ocihelper.DeleteRequest
 func (*adapterTestEngine) DeleteManagedVolume(context.Context, ocihelper.DeleteManagedVolumeRequest) (ocihelper.DeleteManagedVolumeResponse, error) {
 	return ocihelper.DeleteManagedVolumeResponse{Deleted: true}, nil
 }
+func (engine *adapterTestEngine) InventoryRemoval(context.Context, ocihelper.InventoryRemovalRequest) (ocihelper.InventoryRemovalResponse, error) {
+	return engine.inventoryRemoval, engine.inventoryErr
+}
+func (engine *adapterTestEngine) AttestRemoval(context.Context, ocihelper.AttestRemovalRequest) (ocihelper.AttestRemovalResponse, error) {
+	return engine.attestRemoval, engine.attestErr
+}
 func (*adapterTestEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
 	return ocihelper.VerifyResponse{Absent: true}, nil
 }
@@ -1234,6 +1244,111 @@ func adapterTestImageEvidence(digest string) ocihelper.ImageEvidence {
 
 func emptyAdapterInventory() ocihelper.ResourceInventory {
 	return ocihelper.ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}}
+}
+
+func TestLegacyRemovalReconstructsFrozenInventoryFromCurrentHelperScan(t *testing.T) {
+	authority := ocihelper.AttemptAuthority{NodeID: "node", BootSessionID: "boot", JobID: "legacy-service", AttemptID: "attempt", FencingToken: "fence", Class: contract.JobClassService, RemovalGeneration: "1"}
+	identity, err := ocihelper.DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &adapterTestEngine{inventoryRemoval: ocihelper.InventoryRemovalResponse{Attempts: []ocihelper.RemovalAttemptManifest{{
+		Authority: authority, Resources: ocihelper.ExpectedRemovalResources(identity, "", nil),
+	}}}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := workloadrunner.RuntimeRemovalProofRequest{NodeID: "node", BootSessionID: "boot", JobID: "legacy-service", RemovalGeneration: 1, CleanupFence: "cleanup"}
+	attempts, err := adapter.ReconstructRuntimeRemoval(t.Context(), request)
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("reconstructed attempts = %+v err=%v", attempts, err)
+	}
+	manifest := attempts[0]
+	if manifest.RuntimeKind != contract.JobKindOCI || manifest.ServiceDataVolume == "" || manifest.ServiceDataOwnerRecord == "" || len(manifest.RemovalResources()) != 9 {
+		t.Fatalf("reconstructed manifest is incomplete: %+v", manifest)
+	}
+	engine.inventoryRemoval.Attempts = nil
+	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
+		t.Fatal("legacy service without matching sweep inventory was upgraded to verified removal")
+	}
+}
+
+func TestRemovalManifestRegistriesMatchHelperForEveryKind(t *testing.T) {
+	authority := ocihelper.AttemptAuthority{NodeID: "node", BootSessionID: "boot", JobID: "service", AttemptID: "attempt", FencingToken: "fence", Class: contract.JobClassService, RemovalGeneration: "1"}
+	identity, err := ocihelper.DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	computer := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30}
+	for _, test := range []struct {
+		name    string
+		handoff string
+		storage *workloadrunner.ComputerStorage
+	}{
+		{name: "service with handoff", handoff: "wefty-handoff-volume-owner"},
+		{name: "Computer", storage: computer},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := adapterRemovalManifest(authority, identity, test.handoff, test.storage)
+			var helperStorage *ocihelper.ComputerStorageReference
+			if test.storage != nil {
+				helperStorage = &ocihelper.ComputerStorageReference{
+					ComputerID: test.storage.ComputerID, StorageID: test.storage.StorageID,
+					StorageGeneration: test.storage.StorageGeneration, DiskBytes: test.storage.DiskBytes,
+				}
+			}
+			if helper := ocihelper.ExpectedRemovalResources(identity, test.handoff, helperStorage); !sameRemovalRegistries(manifest, helper) {
+				t.Fatalf("agent registry = %+v, helper registry = %+v", manifest.RemovalResources(), helper)
+			}
+		})
+	}
+}
+
+func TestAdapterRejectsShortForgedAndNegativeRemovalReceipts(t *testing.T) {
+	authority := ocihelper.AttemptAuthority{NodeID: "node", BootSessionID: "boot", JobID: "service", AttemptID: "attempt", FencingToken: "fence", Class: contract.JobClassService, RemovalGeneration: "1"}
+	identity, err := ocihelper.DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := adapterRemovalManifest(authority, identity, "", nil)
+	request := workloadrunner.RuntimeRemovalProofRequest{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "cleanup", Attempts: []workloadrunner.RuntimeResourceManifest{manifest}}
+	valid := make([]ocihelper.RemovalAssertion, 0, len(manifest.RemovalResources()))
+	for _, resource := range manifest.RemovalResources() {
+		valid = append(valid, ocihelper.RemovalAssertion{Class: ocihelper.RemovalResourceClass(resource.Class), ID: resource.ID, Absent: true})
+	}
+	for _, test := range []struct {
+		name       string
+		assertions []ocihelper.RemovalAssertion
+	}{
+		{name: "short", assertions: slices.Clone(valid[:len(valid)-1])},
+		{name: "negative", assertions: func() []ocihelper.RemovalAssertion { rows := slices.Clone(valid); rows[0].Absent = false; return rows }()},
+		{name: "forged", assertions: func() []ocihelper.RemovalAssertion { rows := slices.Clone(valid); rows[0].ID = "forged"; return rows }()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine := &adapterTestEngine{attestRemoval: ocihelper.AttestRemovalResponse{Assertions: test.assertions}}
+			adapter, closeAdapter := startAdapterTestServer(t, engine)
+			defer closeAdapter()
+			if receipt, err := adapter.AttestRuntimeRemoval(t.Context(), request); err == nil {
+				t.Fatalf("malformed helper receipt accepted: %+v", receipt)
+			}
+		})
+	}
+}
+
+func adapterRemovalManifest(authority ocihelper.AttemptAuthority, identity ocihelper.ResourceIdentity, handoff string, computer *workloadrunner.ComputerStorage) workloadrunner.RuntimeResourceManifest {
+	manifest := workloadrunner.RuntimeResourceManifest{
+		Version: 1, RuntimeKind: contract.JobKindOCI,
+		NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID,
+		AttemptID: authority.AttemptID, FencingToken: authority.FencingToken, WorkloadClass: authority.Class,
+		RemovalGeneration: authority.RemovalGeneration, LeaseID: identity.LeaseID, TaskID: identity.TaskID,
+		ContainerID: identity.ContainerID, SnapshotID: identity.SnapshotID, ShimID: identity.ShimID,
+		CgroupID: identity.CgroupID, LogSegmentDirectory: identity.LogSegmentDirectory, HandoffVolume: handoff,
+		ComputerStorage: computer,
+	}
+	if computer == nil {
+		manifest.ServiceDataVolume = identity.ServiceVolumeDirectory
+		manifest.ServiceDataOwnerRecord = identity.ServiceVolumeOwnerRecord
+	}
+	return manifest
 }
 
 func intPointer(value int) *int { return &value }

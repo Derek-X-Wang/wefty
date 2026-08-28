@@ -5,8 +5,6 @@ package ocihelper
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -108,13 +106,7 @@ func newComputerDiskEvidence(kind, sweepEpoch string, storage ComputerStorageRef
 type linuxComputerDiskSystem struct{}
 
 func deterministicComputerDiskName(storage ComputerStorageReference) (string, error) {
-	if !boundedStorageID(storage.ComputerID) || !boundedStorageID(storage.StorageID) || storage.StorageGeneration < 1 {
-		return "", errors.New("Computer disk requires a bounded durable Storage identity")
-	}
-	digest := sha256.Sum256([]byte(strings.Join([]string{
-		"computer-disk", storage.ComputerID, storage.StorageID, strconv.FormatInt(storage.StorageGeneration, 10),
-	}, "\x00")))
-	return "wefty-computer-disk-" + hex.EncodeToString(digest[:16]), nil
+	return DeterministicComputerDiskName(storage)
 }
 
 func (engine *ContainerdEngine) computerDiskSystem() computerDiskSystem {
@@ -757,8 +749,19 @@ func (engine *ContainerdEngine) inventoryComputerDiskResources(result *ResourceI
 	if err != nil {
 		return err
 	}
-	for loop := range loops {
-		result.ComputerDiskLoops = append(result.ComputerDiskLoops, loop)
+	seenLoopOwners := make(map[string]struct{})
+	for _, backing := range loops {
+		relative, relativeErr := filepath.Rel(diskRoot, backing)
+		if relativeErr != nil || relative == "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			continue
+		}
+		name := strings.Split(relative, string(filepath.Separator))[0]
+		if strings.HasPrefix(name, "wefty-computer-disk-") {
+			seenLoopOwners[name] = struct{}{}
+		}
+	}
+	for name := range seenLoopOwners {
+		result.ComputerDiskLoops = append(result.ComputerDiskLoops, name)
 	}
 	return nil
 }
