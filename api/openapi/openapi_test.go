@@ -492,6 +492,25 @@ func TestAgentClaimRequiresFixedWorkloadClassSelector(t *testing.T) {
 	}
 }
 
+func TestAgentClaimCarriesExactComputerStorageIdentity(t *testing.T) {
+	t.Parallel()
+	doc := readObject(t, "l1-agent.v1.json")
+	paths := object(t, doc["paths"], "paths")
+	claim := object(t, paths["/v1/agent/jobs/claim"], "claim path")
+	operation := object(t, claim["post"], "claim operation")
+	responses := object(t, operation["responses"], "claim responses")
+	ok := object(t, responses["200"], "claim 200")
+	content := object(t, ok["content"], "claim content")
+	media := object(t, content["application/json"], "claim media")
+	schema := object(t, media["schema"], "claim schema")
+	properties := object(t, schema["properties"], "claim properties")
+	storage := object(t, properties["computer_storage"], "Computer Storage")
+	required := stringSet(t, storage["required"])
+	if !required["computer_id"] || !required["storage_id"] || !required["storage_generation"] || len(required) != 3 {
+		t.Fatalf("Computer Storage required members = %#v", required)
+	}
+}
+
 func TestL1RouteGroupsUseFabricIdentity(t *testing.T) {
 	t.Parallel()
 

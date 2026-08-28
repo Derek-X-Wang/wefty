@@ -283,8 +283,8 @@ retries.
 image digest, optional full argv and working-directory replacements, separate
 public and sensitive operator environment, helper-managed reserved environment,
 enumerated managed volumes, operator mounts, and optional memory/CPU limits.
-The managed-volume list is closed to `handoff`, `service_data`, and
-`log_segments`; `kind=oci`, `class=one-shot` selects exactly one `handoff`
+The managed-volume list is closed to `handoff`, `service_data`,
+`computer_disk`, and `log_segments`; `kind=oci`, `class=one-shot` selects exactly one `handoff`
 descriptor carrying an opaque stable handoff-owner key, whose helper-owned
 source is mounted at `/wefty/handoff`. Presence of that descriptor makes the
 helper-reserved `WEFTY_HANDOFF_DIR=/wefty/handoff` value authoritative even if
@@ -302,7 +302,8 @@ resolves the image `USER` and supplemental groups from the pinned guest rootfs;
 sets the fixed capability sets, `noNewPrivileges`, containerd default seccomp,
 private PID/IPC/UTS/mount/cgroup namespaces, shared networking, deny-all device
 policy plus the six permitted pseudo-devices, masked/read-only proc paths, a
-read-only `/sys/fs/cgroup` cgroup mount, and writable rootfs; and serializes
+read-only `/sys/fs/cgroup` cgroup mount, and a writable rootfs for ordinary
+workloads or read-only rootfs for Computers; and serializes
 cgroup-v2 memory/CPU limits when present. A memory limit also sets OCI swap to
 the same value, producing `memory.swap.max=0` on cgroup v2 rather than leaving a
 swap escape. `Resources.Pids` remains absent in M3; the missing PID limit is a
@@ -312,7 +313,7 @@ runtime handler, snapshotter, and containerd namespace are fixed at
 
 Capability parity is exact: bounding, permitted, and effective contain the 12
 allowed capabilities; inheritable and ambient are explicit empty arrays. The
-latter two, plus `root.readonly=false`, are emitted by the canonical
+latter two, plus the explicit workload-trait-selected `root.readonly`, are emitted by the canonical
 `RuntimeSpecDocument` rather than disappearing through runtime-spec's ordinary
 `omitempty` serialization. Its JSON number round-trip retains 64-bit limits,
 and its containerd `Any` carries those canonical bytes unchanged. The raw Go
@@ -429,6 +430,46 @@ identity disagreement fails closed. Later attempts require the same owner and
 never re-chown existing data. Attempt `Delete`, session reap, and boot sweep
 preserve the directory; the separate removal-manifest contract owns its
 eventual deletion.
+
+A Computer replaces `service_data` with exactly one `computer_disk`
+descriptor carrying the L1-claimed `computer_id`, non-transferable
+`storage_id`, positive Storage generation, and current `disk_bytes` intent; no host
+path crosses RPC. The helper hashes Computer, Storage, and generation identity
+(not resizable size intent), fully
+allocates a staging image, formats ext4 with zero reserved blocks, and
+publishes the image only after allocation and formatting succeed. It attaches
+the image through one loop device and mounts that filesystem as the source of
+`/wefty/service`. `ENOSPC` before publication removes staging and leaves no
+image, loop, mount, or attachment manifest. The first attach records pending
+attempt authority before mounting; a crash before the attached manifest is
+published is recovered only by a prior-boot sweep receipt after mount and loop
+absence are proved.
+The read-only root and fixed-size `/dev`, `/dev/shm`, `/run`, `/tmp`, and
+`/var/tmp` tmpfs mounts leave the Computer disk as the only unbounded writable
+filesystem; Computer operator mounts are therefore required to be read-only.
+
+The helper holds an exclusive per-generation file lock for the attachment
+lifetime and durably records exact attempt/fence/boot authority beside the
+image, never inside tenant bytes. The manifest's attached state is authority:
+lock disappearance and helper death do not authorize another attach. Exact
+same-boot `Delete`/`ReapAndVerify` writes a single-use detachment receipt; boot
+sweep positively unmounts and detaches every helper-owned Computer disk,
+retains image bytes, and writes a receipt bound to its sweep epoch. The next
+attach consumes exactly one such receipt. Inventory separately enumerates disk
+images, verified full allocations, fixed filesystem quotas, manifests, mounts,
+loop devices, and live attachments; namespace quiescence projects out only
+durable images/allocations/quotas/manifests, never live attachment mechanics.
+The sweep receipt retains every observed Computer disk class while its
+post-sweep namespace verification projects only those durable classes out.
+The L1 claim's current `(computer_id, storage_id, generation)` is the attach
+identity. A later reset/reconfiguration contract must add an explicit claim
+revision/fence and reject stale-generation claims before this helper seam; the
+helper already rejects any manifest or receipt for a different generation.
+Computer removal carries the same exact Storage identity plus current node,
+boot, Job, removal-generation, and cleanup-fence authority to the helper. The
+helper requires a matching detached receipt, verifies mount and loop absence,
+deletes the image, manifest, and generation quota directory, and positively
+checks their absence before the agent may acknowledge `removed_verified`.
 
 The native Linux engine uses containerd namespace `wefty`, runtime handler
 `io.containerd.runc.v2`, and snapshotter `overlayfs`. It creates the labelled

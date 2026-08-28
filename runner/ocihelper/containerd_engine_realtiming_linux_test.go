@@ -328,6 +328,12 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		{name: "numeric", reference: numericReference, digest: numericImage.TopLevelDigest, owner: "13001:13002"},
 		{name: "named", reference: namedReference, digest: namedImage.TopLevelDigest, owner: "12001:12002"},
 	})
+	computerDiskEvidence := exerciseNativeLinuxComputerDisk(t, ctx, barrier, echoReference, echoImage.TopLevelDigest)
+	computerAgentRestartEvidence := exerciseNativeLinuxComputerAgentRestart(t, ctx, adapter, echoReference, echoImage.TopLevelDigest)
+	session, err = barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
 	refloat := newRefloatRegistry(t, echoArchivePath)
 	exerciseNativeLinuxPrestartRequeue(t, ctx, adapter, refloat.reference(), refloat.originalDigest(), refloat.moveTag, func() {
 		barrier.Invalidate()
@@ -592,11 +598,160 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatalf("namespace cleanup verification=%+v err=%v", verification, err)
 	}
 	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, handoffMarkerBytes)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_disk_exactly_one_and_persistent=%t\ncomputer_agent_restart_same_generation=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerDiskEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
+}
+
+func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, reference, digest string) bool {
+	t.Helper()
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "native-computer.sqlite"), l1.StoreOptions{LeaseDuration: 3 * time.Second, Jitter: func(time.Duration) time.Duration { return 10 * time.Millisecond }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	registration := contract.NodeRegistration{NodeID: "native-computer-node", BootSessionID: "native-boot", OS: "linux", Architecture: "amd64", AgentVersion: "realtiming",
+		Capabilities:       map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true},
+		CapabilityRevision: 1, CapabilityObservedAt: time.Now().UTC(), MissingCapabilities: []string{}}
+	policy := l1.NodePolicy{Tags: []string{contract.StableNodeTagPrefix + registration.NodeID}, MaxOneshotSlots: 1, MaxServiceSlots: 1}
+	if _, err := store.RegisterNode(ctx, fabric.Identity{NodeID: "native-agent"}, registration, policy, true); err != nil {
+		t.Fatal(err)
+	}
+	memory := int64(1 << 30)
+	digestCopy := digest
+	spec := contract.JobSpec{SchemaVersion: contract.SchemaVersionV1, DispatchKey: "native-computer-agent-restart", Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
+		RuntimeHandler: ocihelper.DefaultRuntimeHandler, RoutingTags: []string{contract.StableNodeTagPrefix + registration.NodeID},
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: reference, Digest: &digestCopy},
+			Argv:     []string{"/bin/sh", "-c", "if test -f /wefty/service/agent-restart-marker; then test \"$(cat /wefty/service/agent-restart-marker)\" = durable; else printf durable > /wefty/service/agent-restart-marker; exit 17; fi"},
+			Computer: &contract.OCIComputerSpec{Display: contract.OCIComputerDisplaySpec{Protocol: contract.ComputerDisplayProtocolRFBWebSocketV1}, DiskBytes: 32 << 20}, Limits: &contract.OCILimits{MemoryBytes: &memory}}}}
+	computer, _, err := store.CreateComputer(ctx, l1.CreateComputerRequest{Name: "native-agent-restart", Spec: spec, Actor: "realtiming"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(claim *l1.Claim) workloadrunner.Result {
+		request := workloadrunner.Request{Authority: workloadrunner.AttemptAuthority{NodeID: registration.NodeID, BootSessionID: registration.BootSessionID, JobID: claim.Job.JobID,
+			AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken, WorkloadClass: contract.JobClassService, RemovalGeneration: "attempt"},
+			RuntimeHandler: claim.Job.Spec.RuntimeHandler, Execution: claim.Job.Spec.Execution, Limits: claim.Job.Spec.Limits, InitialDeadman: claim.Lease.LeaseTTL,
+			ManagedVolumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: &workloadrunner.ComputerStorage{ComputerID: claim.ComputerStorage.ComputerID, StorageID: claim.ComputerStorage.StorageID, StorageGeneration: claim.ComputerStorage.StorageGeneration, DiskBytes: claim.Job.Spec.Execution.OCI.Computer.DiskBytes}}}}
+		request.OCIImageResolved = func(callbackContext context.Context, observation workloadrunner.OCIImageObservation) error {
+			_, err := store.ObserveAttemptImage(callbackContext, "native-agent", claim.Job.JobID, claim.Lease.AttemptID, nativeImageObservation(claim.Lease.FencingToken, observation))
+			return err
+		}
+		request.OCIStarted = func(callbackContext context.Context, _ workloadrunner.OCIImageObservation) error {
+			_, err := store.StartAttempt(callbackContext, "native-agent", claim.Job.JobID, claim.Lease.AttemptID, l1.StartedRequest{FencingToken: claim.Lease.FencingToken})
+			return err
+		}
+		result, runErr := adapter.Run(ctx, request, workloadrunner.OutputSinkFunc(func(context.Context, contract.LogEvent) error { return nil }))
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		if receipt, reapErr := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: request.Authority}); reapErr != nil || !receipt.RuntimeQuiesced {
+			t.Fatalf("Computer L1 adapter reap = %+v err=%v", receipt, reapErr)
+		}
+		if _, completeErr := store.CompleteAttempt(ctx, "native-agent", claim.Job.JobID, claim.Lease.AttemptID, l1.CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "complete-" + claim.Lease.AttemptID, Result: l1.ProcessResult(result.Outcome)}); completeErr != nil {
+			t.Fatal(completeErr)
+		}
+		return result
+	}
+	first, err := store.ClaimJob(ctx, "native-agent", registration.NodeID, registration.BootSessionID, contract.JobClassService)
+	if err != nil || first == nil || first.ComputerStorage == nil || first.Job.JobID != computer.CurrentJobID {
+		t.Fatalf("first Computer claim = %+v err=%v", first, err)
+	}
+	firstResult := run(first)
+	if firstResult.Outcome.ExitCode == nil || *firstResult.Outcome.ExitCode != 17 {
+		t.Fatalf("first Computer marker run = %+v", firstResult.Outcome)
+	}
+	var second *l1.Claim
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && second == nil {
+		second, err = store.ClaimJob(ctx, "native-agent", registration.NodeID, registration.BootSessionID, contract.JobClassService)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if second == nil {
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
+	if second == nil || second.ComputerStorage == nil || second.ComputerStorage.StorageGeneration != first.ComputerStorage.StorageGeneration {
+		t.Fatalf("same-generation Computer restart claim = %+v", second)
+	}
+	secondResult := run(second)
+	if secondResult.Outcome.ExitCode == nil || *secondResult.Outcome.ExitCode != 0 {
+		t.Fatalf("agent-restart marker was not retained = %+v", secondResult.Outcome)
+	}
+	return true
+}
+
+func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, reference, digest string) bool {
+	t.Helper()
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := &ocihelper.ComputerStorageReference{
+		ComputerID: "native-computer", StorageID: "native-storage", StorageGeneration: 1, DiskBytes: 32 << 20,
+	}
+	request := func(suffix string, argv []string) ocihelper.RunRequest {
+		authority := nativeAuthority("computer-disk-" + suffix)
+		authority.Class = contract.JobClassService
+		return ocihelper.RunRequest{
+			Authority: authority, InitialDeadman: l1.DefaultLeaseDuration,
+			Workload: ocihelper.WorkloadInput{
+				ImageReference: reference, ImageDigest: digest, Argv: argv,
+				ReservedEnvironment: []ocihelper.EnvironmentVariable{{Name: contract.EnvServiceDir, Value: contract.OCIContainerServiceDirectory}},
+				ManagedVolumes:      []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeComputerDisk, ComputerStorage: storage}},
+			},
+		}
+	}
+	first := request("a", []string{"/bin/sh", "-c", "printf computer-disk-marker > /wefty/service/marker; exec sleep 60"})
+	if _, err := session.Run(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	contender := request("b", []string{"/bin/true"})
+	if _, err := session.Run(ctx, contender); err == nil {
+		t.Fatal("real Computer attempt B attached while A owned the Storage generation")
+	}
+	requestRootFault(t, "kill-helper")
+	barrier.Invalidate()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatalf("Computer helper-death sweep failed: %v", err)
+	}
+	receipt, ok := barrier.SweepReceipt()
+	if !ok || !ocihelper.InventoryEmpty(receipt.VerifiedInventory) || len(receipt.SweptInventory.ComputerDiskImages) == 0 ||
+		len(receipt.SweptInventory.ComputerDiskAllocations) == 0 || len(receipt.SweptInventory.ComputerDiskQuotas) == 0 ||
+		len(receipt.SweptInventory.ComputerDiskManifests) == 0 || len(receipt.SweptInventory.ComputerDiskMounts) == 0 ||
+		len(receipt.SweptInventory.ComputerDiskLoops) == 0 || len(receipt.SweptInventory.ComputerAttachments) == 0 {
+		t.Fatalf("Computer helper-death sweep receipt = %+v present=%t", receipt, ok)
+	}
+	session, err = barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := request("c", []string{"/bin/sh", "-c", "test \"$(cat /wefty/service/marker)\" = computer-disk-marker"})
+	if _, err := session.Run(ctx, second); err != nil {
+		t.Fatalf("real Computer attempt C did not consume A's reap receipt: %v", err)
+	}
+	var result *ocihelper.WatchResponse
+	if err := session.Watch(ctx, ocihelper.WatchRequest{Authority: second.Authority}, func(event ocihelper.WatchEvent) error {
+		if event.Result != nil {
+			result = event.Result
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("real Computer persistent marker result = %+v", result)
+	}
+	if _, err := session.Run(ctx, request("d", []string{"/bin/true"})); err == nil {
+		t.Fatal("sweep receipt authorized more than one replacement Computer attach")
+	}
+	if deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: second.Authority}); err != nil || !deleted.Deleted {
+		t.Fatalf("real Computer attempt C reap = %+v err=%v", deleted, err)
+	}
+	return true
 }
 
 type nativeServiceDataImage struct {

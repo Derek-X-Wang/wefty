@@ -383,7 +383,10 @@
             "minLength": 1,
             "description": "Stable machine-readable spawn failure code. Unknown codes default to terminal service policy."
           },
-          "message": { "type": "string", "minLength": 1 }
+          "message": { "type": "string", "minLength": 1 },
+          "node_id": { "type": "string", "minLength": 1 },
+          "requested_bytes": { "type": "integer", "format": "int64", "minimum": 0 },
+          "observed_available_bytes": { "type": "integer", "format": "int64", "minimum": 0 }
         }
       },
       "RuntimeFailure": {

@@ -533,6 +533,12 @@ func (adapter *Adapter) RemovalResourceManifest(request workloadrunner.Request) 
 		case workloadrunner.ManagedVolumeServiceData:
 			manifest.ServiceDataVolume = identity.ServiceVolumeDirectory
 			manifest.ServiceDataOwnerRecord = identity.ServiceVolumeOwnerRecord
+		case workloadrunner.ManagedVolumeComputerDisk:
+			if volume.ComputerStorage == nil {
+				return workloadrunner.RuntimeResourceManifest{}, errors.New("Computer removal manifest requires Storage identity")
+			}
+			storage := *volume.ComputerStorage
+			manifest.ComputerStorage = &storage
 		}
 	}
 	return manifest, nil
@@ -1326,8 +1332,7 @@ func (adapter *Adapter) ReapPriorBoot(_ context.Context, request workloadrunner.
 }
 
 func resourceInventoryEmpty(inventory ocihelper.ResourceInventory) bool {
-	return len(inventory.Leases)+len(inventory.Snapshots)+len(inventory.Containers)+len(inventory.Tasks)+
-		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ManagedVolumes)+len(inventory.ManagedVolumeRecords) == 0
+	return ocihelper.InventoryEmpty(inventory)
 }
 
 // HelperAuthority maps the agent's complete fenced attempt tuple without
@@ -1349,12 +1354,24 @@ func (adapter *Adapter) FinalizeManagedVolumes(ctx context.Context, request work
 		return err
 	}
 	for _, volume := range request.Volumes {
-		if volume.Kind != workloadrunner.ManagedVolumeHandoff || strings.TrimSpace(volume.OwnerKey) == "" {
+		input := ocihelper.DeleteManagedVolumeRequest{}
+		switch volume.Kind {
+		case workloadrunner.ManagedVolumeHandoff:
+			if strings.TrimSpace(volume.OwnerKey) == "" {
+				return fmt.Errorf("unsupported runtime-managed volume finalization: %+v", volume)
+			}
+			input = ocihelper.DeleteManagedVolumeRequest{Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: volume.OwnerKey}
+		case workloadrunner.ManagedVolumeComputerDisk:
+			if volume.ComputerStorage == nil || request.Removal == nil {
+				return fmt.Errorf("Computer disk finalization requires Storage and removal authority")
+			}
+			input = ocihelper.DeleteManagedVolumeRequest{Kind: ocihelper.ManagedVolumeComputerDisk,
+				ComputerStorage: &ocihelper.ComputerStorageReference{ComputerID: volume.ComputerStorage.ComputerID, StorageID: volume.ComputerStorage.StorageID, StorageGeneration: volume.ComputerStorage.StorageGeneration},
+				Removal:         &ocihelper.ManagedVolumeRemovalAuthority{NodeID: request.Removal.NodeID, BootSessionID: request.Removal.BootSessionID, JobID: request.Removal.JobID, RemovalGeneration: request.Removal.RemovalGeneration, CleanupFence: request.Removal.CleanupFence}}
+		default:
 			return fmt.Errorf("unsupported runtime-managed volume finalization: %+v", volume)
 		}
-		response, err := session.DeleteManagedVolume(ctx, ocihelper.DeleteManagedVolumeRequest{
-			Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: volume.OwnerKey,
-		})
+		response, err := session.DeleteManagedVolume(ctx, input)
 		if err != nil {
 			return err
 		}
@@ -1403,6 +1420,18 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 				Kind: ocihelper.ManagedVolumeServiceData,
 			})
 			// The helper-owned descriptor is authority for the guest mount.
+			reservedValues[contract.EnvServiceDir] = contract.OCIContainerServiceDirectory
+		case workloadrunner.ManagedVolumeComputerDisk:
+			var storage *ocihelper.ComputerStorageReference
+			if volume.ComputerStorage != nil {
+				storage = &ocihelper.ComputerStorageReference{
+					ComputerID: volume.ComputerStorage.ComputerID, StorageID: volume.ComputerStorage.StorageID,
+					StorageGeneration: volume.ComputerStorage.StorageGeneration, DiskBytes: volume.ComputerStorage.DiskBytes,
+				}
+			}
+			managedVolumes = append(managedVolumes, ocihelper.ManagedVolumeDescriptor{
+				Kind: ocihelper.ManagedVolumeComputerDisk, ComputerStorage: storage,
+			})
 			reservedValues[contract.EnvServiceDir] = contract.OCIContainerServiceDirectory
 		}
 	}

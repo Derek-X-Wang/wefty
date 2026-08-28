@@ -216,6 +216,11 @@ func TestComputerIntentOwnsLifecycleAndSlot(t *testing.T) {
 	if claim == nil || claim.Job.JobID != computer.CurrentJobID {
 		t.Fatalf("Computer claim = %#v, want Job %q", claim, computer.CurrentJobID)
 	}
+	if claim.ComputerStorage == nil || claim.ComputerStorage.ComputerID != computer.ComputerID ||
+		claim.ComputerStorage.StorageID != computer.StorageID || claim.ComputerStorage.StorageGeneration != computer.StorageGeneration {
+		t.Fatalf("Computer claim Storage identity = %#v, want %s/%s@%d", claim.ComputerStorage,
+			computer.ComputerID, computer.StorageID, computer.StorageGeneration)
+	}
 	if _, err := h.store.ObserveAttemptImage(context.Background(), "fabric-computer-node", claim.Job.JobID,
 		claim.Lease.AttemptID, testImageObservation(claim.Lease.FencingToken)); err != nil {
 		t.Fatal(err)
@@ -679,7 +684,9 @@ func assertComputerRemovalDirectiveCompletionReleasesSlot(t *testing.T) {
 		t.Fatalf("pending Computer removal must retain Slot until cleanup: %#v binding=%q", removed.CurrentJob, removalBinding)
 	}
 	directives, err := h.store.ListNodeRemovalDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
-	if err != nil || len(directives) != 1 || directives[0].JobID != computer.CurrentJobID {
+	if err != nil || len(directives) != 1 || directives[0].JobID != computer.CurrentJobID || directives[0].ComputerStorage == nil ||
+		directives[0].ComputerStorage.ComputerID != computer.ComputerID || directives[0].ComputerStorage.StorageID != computer.StorageID ||
+		directives[0].ComputerStorage.StorageGeneration != computer.StorageGeneration {
 		t.Fatalf("Computer removal directives = %#v err=%v", directives, err)
 	}
 	directive := directives[0]

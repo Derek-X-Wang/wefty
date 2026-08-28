@@ -471,6 +471,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		err := &contract.ExecutionError{Kind: claim.Job.Spec.Kind}
 		return spawnFailure(contract.SpawnFailureUnsupportedKind, err), err
 	}
+	if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Execution.OCI != nil &&
+		claim.Job.Spec.Execution.OCI.Computer != nil && claim.ComputerStorage == nil {
+		err := errors.New("Computer claim is missing its durable Storage identity")
+		return spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err
+	}
 	authority := workloadAuthority(lifecycle.dependencies.nodeID, lifecycle.dependencies.bootSessionID, claim)
 	idlePolicy := workloadrunner.MonitorIdle
 	if claim.Job.Spec.Class == contract.JobClassService {
@@ -479,7 +484,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	request := workloadrunner.Request{
 		Authority: authority, RuntimeHandler: claim.Job.Spec.RuntimeHandler,
 		Execution: claim.Job.Spec.Execution, Limits: claim.Job.Spec.Limits,
-		ManagedVolumes: runtimeManagedVolumes(claim.Job.Spec),
+		ManagedVolumes: runtimeManagedVolumes(claim),
 		IdlePolicy:     idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
 	}
 	var ociRuntimeLoss ociRuntimeLossLatch
@@ -836,7 +841,8 @@ func usesAgentHandoffLifecycle(spec contract.JobSpec) bool {
 	return spec.Kind == contract.JobKindProcess && spec.Class == contract.JobClassOneShot
 }
 
-func runtimeManagedVolumes(spec contract.JobSpec) []workloadrunner.ManagedVolume {
+func runtimeManagedVolumes(claim l1.Claim) []workloadrunner.ManagedVolume {
+	spec := claim.Job.Spec
 	if spec.Kind != contract.JobKindOCI {
 		return nil
 	}
@@ -844,6 +850,15 @@ func runtimeManagedVolumes(spec contract.JobSpec) []workloadrunner.ManagedVolume
 	case contract.JobClassOneShot:
 		return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: handoffOwnerRunID(spec)}}
 	case contract.JobClassService:
+		if spec.Execution.OCI != nil && spec.Execution.OCI.Computer != nil {
+			if claim.ComputerStorage == nil {
+				return nil
+			}
+			return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: &workloadrunner.ComputerStorage{
+				ComputerID: claim.ComputerStorage.ComputerID, StorageID: claim.ComputerStorage.StorageID,
+				StorageGeneration: claim.ComputerStorage.StorageGeneration, DiskBytes: spec.Execution.OCI.Computer.DiskBytes,
+			}}}
+		}
 		return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 	default:
 		return nil
@@ -854,7 +869,7 @@ func runtimeManagedVolumesForSuccessfulCompletion(spec contract.JobSpec) []workl
 	if spec.Kind != contract.JobKindOCI || spec.Class != contract.JobClassOneShot {
 		return nil
 	}
-	return runtimeManagedVolumes(spec)
+	return runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: spec}})
 }
 
 func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Claim, authority localAuthority, failures chan<- destinationError, watch attemptWatch) {

@@ -97,11 +97,12 @@ const (
 // attempt lease, it has no expiry; only the node's current boot session may
 // act on it.
 type RemovalDirective struct {
-	JobID             string `json:"job_id"`
-	BoundNodeID       string `json:"bound_node_id"`
-	RemovalGeneration uint64 `json:"removal_generation"`
-	CleanupFence      string `json:"cleanup_fence"`
-	RootInstanceID    string `json:"root_instance_id"`
+	JobID             string                `json:"job_id"`
+	BoundNodeID       string                `json:"bound_node_id"`
+	RemovalGeneration uint64                `json:"removal_generation"`
+	CleanupFence      string                `json:"cleanup_fence"`
+	RootInstanceID    string                `json:"root_instance_id"`
+	ComputerStorage   *ComputerStorageClaim `json:"computer_storage,omitempty"`
 }
 
 type RemovalAcknowledgementRequest struct {
@@ -155,9 +156,18 @@ const (
 
 // Claim is returned when an eligible queued job is won.
 type Claim struct {
-	Job              Job          `json:"job"`
-	Lease            AttemptLease `json:"lease"`
-	PrestartDeadline *time.Time   `json:"prestart_deadline,omitempty"`
+	Job              Job                   `json:"job"`
+	Lease            AttemptLease          `json:"lease"`
+	PrestartDeadline *time.Time            `json:"prestart_deadline,omitempty"`
+	ComputerStorage  *ComputerStorageClaim `json:"computer_storage,omitempty"`
+}
+
+// ComputerStorageClaim is the exact durable Storage identity a claimed
+// Computer projection may attach. It is absent for every ordinary Job.
+type ComputerStorageClaim struct {
+	ComputerID        string `json:"computer_id"`
+	StorageID         string `json:"storage_id"`
+	StorageGeneration int64  `json:"storage_generation"`
 }
 
 // Node is the node projection shared by the operator list and agent protocol.

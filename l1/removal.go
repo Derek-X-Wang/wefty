@@ -243,10 +243,14 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 	if storedBoot != bootSessionID {
 		return nil, protocolError(contract.ErrorNodeSessionReplaced, "node %q boot session has been replaced", nodeID)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id, bound_node_id, removal_generation, cleanup_fence, root_instance_id
+	rows, err := s.db.QueryContext(ctx, `SELECT service_removals.job_id, service_removals.bound_node_id,
+		service_removals.removal_generation, service_removals.cleanup_fence, service_removals.root_instance_id,
+		computers.computer_id, computers.storage_id, computers.storage_generation
 		FROM service_removals
-		WHERE bound_node_id=? AND status IN (?, ?)
-		ORDER BY requested_ns, job_id`, nodeID, contract.JobRemovalPending, contract.JobForgottenCleanupUnverified)
+		LEFT JOIN computer_job_projections ON computer_job_projections.job_id=service_removals.job_id
+		LEFT JOIN computers ON computers.computer_id=computer_job_projections.computer_id
+		WHERE service_removals.bound_node_id=? AND service_removals.status IN (?, ?)
+		ORDER BY service_removals.requested_ns, service_removals.job_id`, nodeID, contract.JobRemovalPending, contract.JobForgottenCleanupUnverified)
 	if err != nil {
 		return nil, internalError(err, "list service removal directives")
 	}
@@ -254,9 +258,17 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 	directives := []RemovalDirective{}
 	for rows.Next() {
 		var directive RemovalDirective
+		var computerID, storageID sql.NullString
+		var storageGeneration sql.NullInt64
 		if err := rows.Scan(&directive.JobID, &directive.BoundNodeID, &directive.RemovalGeneration,
-			&directive.CleanupFence, &directive.RootInstanceID); err != nil {
+			&directive.CleanupFence, &directive.RootInstanceID, &computerID, &storageID, &storageGeneration); err != nil {
 			return nil, internalError(err, "scan service removal directive")
+		}
+		if computerID.Valid || storageID.Valid || storageGeneration.Valid {
+			if !computerID.Valid || !storageID.Valid || !storageGeneration.Valid || storageGeneration.Int64 < 1 {
+				return nil, internalError(errors.New("partial Computer Storage removal identity"), "scan service removal directive")
+			}
+			directive.ComputerStorage = &ComputerStorageClaim{ComputerID: computerID.String, StorageID: storageID.String, StorageGeneration: storageGeneration.Int64}
 		}
 		directives = append(directives, directive)
 	}

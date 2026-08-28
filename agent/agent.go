@@ -214,11 +214,13 @@ func New(config Config) (*Agent, error) {
 		return nil, err
 	}
 	var ociImagePins workloadrunner.OCIImagePinRuntime
+	var managedVolumeFinalizer workloadrunner.ManagedVolumeFinalizer
 	if runtimeAdapter, configured := runtimes.selectKind(contract.JobKindOCI); configured {
 		if pinRuntime, supported := runtimeAdapter.(workloadrunner.OCIImagePinRuntime); supported {
 			pinRuntime.SetOCIImageBindingPinLedger(outbox.spool)
 			ociImagePins = pinRuntime
 		}
+		managedVolumeFinalizer, _ = runtimeAdapter.(workloadrunner.ManagedVolumeFinalizer)
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
@@ -271,6 +273,9 @@ func New(config Config) (*Agent, error) {
 	)
 	if ociImagePins != nil {
 		session.removals.releaseImagePin = ociImagePins.ReleaseOCIImageBindingPin
+	}
+	if managedVolumeFinalizer != nil {
+		session.removals.finalizeVolumes = managedVolumeFinalizer.FinalizeManagedVolumes
 	}
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),

@@ -186,6 +186,17 @@
                       "type": "string",
                       "format": "date-time",
                       "description": "One-shot OCI only. Absolute persisted deadline shared by every pre-Started attempt and used to clamp agent-owned image delivery policy."
+                    },
+                    "computer_storage": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["computer_id", "storage_id", "storage_generation"],
+                      "properties": {
+                        "computer_id": { "type": "string", "minLength": 1 },
+                        "storage_id": { "type": "string", "minLength": 1 },
+                        "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 }
+                      },
+                      "description": "Computer claims only. Exact durable Storage identity authorized by the current immutable Job projection."
                     }
                   }
                 }
