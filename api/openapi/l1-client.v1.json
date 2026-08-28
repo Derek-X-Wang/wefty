@@ -12,7 +12,7 @@
       "post": {
         "operationId": "createJob",
         "summary": "Create a job idempotently by dispatch key",
-        "description": "A new dispatch_key returns 201. An identical replay returns the original job with 200. Reuse with a different canonical request returns 409 dispatch_key_conflict.",
+        "description": "A new dispatch_key returns 201. An identical replay returns the original job with 200. Reuse with a different canonical request returns 409 dispatch_key_conflict. A Computer-trait spec must use /v1/computers so the durable authority and first immutable Job are committed together; bare creation returns computer_resource_required.",
         "requestBody": {
           "required": true,
           "content": {
@@ -293,6 +293,237 @@
           "200": {
             "description": "Cleanup proof waived; the unverified outcome is permanent.",
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers": {
+      "post": {
+        "operationId": "createComputer",
+        "summary": "Create a durable Computer and its first immutable Job projection",
+        "description": "The JobSpec dispatch key makes creation idempotent. Computer identity, storage identity, desired state, authenticated Fabric actor, and intent history are committed atomically with the first Job; bare Computer-trait Job creation is rejected.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "spec"],
+                "properties": {
+                  "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+                  "spec": { "$ref": "./common.v1.json#/components/schemas/JobSpec" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Identical dispatch-key replay; the original Computer is returned.",
+            "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } },
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+          },
+          "201": {
+            "description": "Computer and initial Job projection created.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "get": {
+        "operationId": "getComputer",
+        "summary": "Read durable Computer intent and its current Job observation",
+        "responses": {
+          "200": {
+            "description": "Current Computer authority and observation.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+          },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/intents": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "get": {
+        "operationId": "listComputerIntents",
+        "summary": "Page immutable Computer intent history",
+        "description": "Actor identity is derived from the authenticated Fabric principal and cannot be supplied by the client.",
+        "parameters": [
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "One bounded intent-history page in revision order.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerIntentList" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/desired-state": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "put": {
+        "operationId": "setComputerDesiredState",
+        "summary": "Start or stop a Computer under intent and Storage CAS",
+        "description": "The Computer is the sole desired-state authority. A stale intent revision or storage reference is a typed conflict and performs no write.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["desired_state", "intent_revision", "storage_id", "storage_generation"],
+            "properties": {
+              "desired_state": { "enum": ["running", "stopped"] },
+              "intent_revision": { "type": "integer", "minimum": 1 },
+              "storage_id": { "type": "string", "minLength": 1 },
+              "storage_generation": { "type": "integer", "minimum": 1 }
+            }
+          } } }
+        },
+        "responses": {
+          "202": {
+            "description": "Intent accepted; current_job carries the distinct observed lifecycle state.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/restart": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "restartComputer",
+        "summary": "Restart a stopped or latched-failed Computer",
+        "description": "CAS-guarded and durably idempotent. The current immutable Job remains the observation, while the Computer authorizes a fresh attempt and retains binding, Storage identity, grants, and image pin.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["intent_revision", "storage_id", "storage_generation", "idempotency_key"],
+            "properties": {
+              "intent_revision": { "type": "integer", "minimum": 1 },
+              "storage_id": { "type": "string", "minLength": 1 },
+              "storage_generation": { "type": "integer", "minimum": 1 },
+              "idempotency_key": { "type": "string", "minLength": 1 }
+            }
+          } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Identical restart replay; no second intent or attempt was issued.",
+            "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } },
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+          },
+          "202": {
+            "description": "Restart intent accepted and applied to the current Job projection.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/projections": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "installComputerProjection",
+        "summary": "Install the next immutable Job projection",
+        "description": "One CAS intent stages the new Job. A running Computer enters projecting and internally quiesces its current observation without fabricating operator stop intent; repeating the same request after positive reap atomically transfers authority and advances applied_revision.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["intent_revision", "storage_id", "storage_generation", "spec"],
+            "properties": {
+              "intent_revision": { "type": "integer", "minimum": 1 },
+              "storage_id": { "type": "string", "minLength": 1 },
+              "storage_generation": { "type": "integer", "minimum": 1 },
+              "spec": { "$ref": "./common.v1.json#/components/schemas/JobSpec" }
+            }
+          } } }
+        },
+        "responses": {
+          "202": {
+            "description": "Projection intent accepted; phase and applied_revision show whether transfer is still waiting for quiescence.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/remove": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "removeComputer",
+        "summary": "Irreversibly foreclose a Computer's Jobs and attempts",
+        "description": "CAS-records removed intent, revokes live attempt authority, and prevents every existing or future Job projection from being claimed. A bound current Job enters the ordinary durable service-removal directive protocol so authenticated agent cleanup releases its Slot; composite Storage cleanup is a later contract layer.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["intent_revision", "storage_id", "storage_generation"],
+            "properties": {
+              "intent_revision": { "type": "integer", "minimum": 1 },
+              "storage_id": { "type": "string", "minLength": 1 },
+              "storage_generation": { "type": "integer", "minimum": 1 }
+            }
+          } } }
+        },
+        "responses": {
+          "202": {
+            "description": "Removal intent accepted and all Job start authority revoked.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },

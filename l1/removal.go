@@ -79,6 +79,13 @@ func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
 	if err != nil {
 		return Job{}, internalError(err, "read service removal target")
 	}
+	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
+		return Job{}, mapErr
+	} else if mapped {
+		return Job{}, protocolErrorWithDetails(contract.ErrorComputerResourceRequired,
+			map[string]any{"computer_id": computerID},
+			"Computer %q is the sole removal authority for Job %q", computerID, jobID)
+	}
 
 	if removal, removalErr := readServiceRemoval(ctx, tx, jobID); removalErr == nil {
 		job, readErr := getJobByID(ctx, tx, jobID, now)
@@ -298,6 +305,32 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 	if err != nil {
 		return Job{}, internalError(err, "read service removal acknowledgement")
 	}
+	if removal.status == contract.JobRemovedVerified {
+		// Computer removals retain their immutable Job and removal row instead
+		// of becoming an ordinary-service tombstone. Preserve acknowledgement
+		// replay across a later boot exactly as the tombstone path does, while
+		// still requiring the same stable Fabric identity and accepted body.
+		var storedIdentity string
+		if err := tx.QueryRowContext(ctx, `SELECT identity_node_id FROM nodes WHERE node_id=?`, removal.boundNodeID).
+			Scan(&storedIdentity); err != nil {
+			return Job{}, internalError(err, "read finalized Computer acknowledgement node")
+		}
+		if storedIdentity != identityNodeID || request.NodeID != removal.boundNodeID {
+			return Job{}, protocolError(contract.ErrorAttemptNotOwned,
+				"authenticated node does not own this finalized Computer removal")
+		}
+		if request.RemovalGeneration != removal.generation || request.RootInstanceID != removal.rootInstanceID ||
+			!removal.acknowledgementKey.Valid || removal.acknowledgementKey.String != request.IdempotencyKey ||
+			!removal.acknowledgementHash.Valid || removal.acknowledgementHash.String != bodyHash {
+			return Job{}, protocolError(contract.ErrorConflict,
+				"finalized Computer removal acknowledgement does not match the accepted request")
+		}
+		job, err := getJobByID(ctx, tx, jobID, now)
+		if err != nil {
+			return Job{}, internalError(err, "read finalized Computer acknowledgement replay")
+		}
+		return job, nil
+	}
 	if err := validateMutableAcknowledgement(ctx, tx, identityNodeID, request, removal); err != nil {
 		return Job{}, err
 	}
@@ -388,6 +421,35 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 		}
 		applyServiceRemoval(&job, removal)
 		return job, false, nil
+	}
+	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
+		return Job{}, false, mapErr
+	} else if mapped {
+		// A Computer keeps its immutable Job evidence and durable authority row.
+		// The ordinary removal directive still owns agent cleanup and Slot
+		// release; finalization records the terminal observation in place rather
+		// than deleting the Job into an ordinary-service tombstone.
+		if _, err := tx.ExecContext(ctx, `UPDATE service_removals SET status=?, removed_ns=? WHERE job_id=?`,
+			contract.JobRemovedVerified, now.UnixNano(), jobID); err != nil {
+			return Job{}, false, internalError(err, "finalize Computer removal directive")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?`,
+			contract.JobRemovedVerified, now.UnixNano(), jobID); err != nil {
+			return Job{}, false, internalError(err, "project verified Computer removal")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET desired_state=?, published_attempt_id=NULL,
+			healthy_since_ns=NULL, next_restart_at=NULL WHERE job_id=?`, contract.ServiceDesiredStopped, jobID); err != nil {
+			return Job{}, false, internalError(err, "release verified Computer removal Slot")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE computers SET updated_ns=? WHERE computer_id=?`,
+			now.UnixNano(), computerID); err != nil {
+			return Job{}, false, internalError(err, "timestamp verified Computer removal")
+		}
+		job, readErr := getJobByID(ctx, tx, jobID, now)
+		if readErr != nil {
+			return Job{}, false, internalError(readErr, "read finalized Computer removal")
+		}
+		return job, true, nil
 	}
 
 	var dispatchKey, requestHash string

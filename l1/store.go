@@ -244,6 +244,49 @@ CREATE TABLE IF NOT EXISTS service_jobs (
   published_attempt_id TEXT REFERENCES attempts(attempt_id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS service_jobs_bound_desired ON service_jobs(bound_node_id, desired_state);
+CREATE TABLE IF NOT EXISTS computers (
+  computer_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  placement_node_id TEXT NOT NULL,
+  bound_node_id TEXT,
+  grants_json BLOB NOT NULL,
+  storage_id TEXT NOT NULL UNIQUE,
+  storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+  desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
+  intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
+  applied_revision INTEGER NOT NULL CHECK(applied_revision >= 0 AND applied_revision <= intent_revision),
+  current_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
+  current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
+  reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'removing')),
+  reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0),
+  created_ns INTEGER NOT NULL,
+  updated_ns INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS computers_binding ON computers(bound_node_id, desired_state);
+CREATE TABLE IF NOT EXISTS computer_job_projections (
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
+  spec_revision INTEGER NOT NULL CHECK(spec_revision > 0),
+  current INTEGER NOT NULL CHECK(current IN (0, 1)),
+  created_ns INTEGER NOT NULL,
+  retired_ns INTEGER,
+  PRIMARY KEY(computer_id, spec_revision)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS computer_current_projection
+  ON computer_job_projections(computer_id) WHERE current=1;
+CREATE TABLE IF NOT EXISTS computer_intent_history (
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
+  operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project')),
+  desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
+  storage_id TEXT NOT NULL,
+  storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+  job_id TEXT NOT NULL REFERENCES jobs(job_id),
+  spec_revision INTEGER NOT NULL CHECK(spec_revision > 0),
+  actor TEXT NOT NULL,
+  created_ns INTEGER NOT NULL,
+  PRIMARY KEY(computer_id, intent_revision)
+);
 CREATE TABLE IF NOT EXISTS service_restart_requests (
   job_id TEXT NOT NULL REFERENCES service_jobs(job_id) ON DELETE CASCADE,
   idempotency_key TEXT NOT NULL,
@@ -320,6 +363,10 @@ func (s *Store) CreateJob(ctx context.Context, spec contract.JobSpec) (job Job, 
 	spec.RoutingTags = NormalizeTags(spec.RoutingTags)
 	if err := validateJobSpec(&spec); err != nil {
 		return Job{}, false, err
+	}
+	if isComputerSpec(spec) {
+		return Job{}, false, protocolError(contract.ErrorComputerResourceRequired,
+			"Computer trait Jobs must be created through the durable Computer resource")
 	}
 	requiredCapabilities := RequiredCapabilities(spec)
 	specJSON, err := json.Marshal(spec)
@@ -851,9 +898,18 @@ UPDATE jobs
 SET state=@job_claimed, current_attempt_id=@attempt_id, fence_counter=fence_counter+1, updated_ns=@now_ns
 WHERE job_id=(
   SELECT j.job_id
-  FROM jobs j
-  LEFT JOIN service_jobs candidate_service ON candidate_service.job_id=j.job_id
-	  WHERE j.state=@job_queued
+	  FROM jobs j
+	  LEFT JOIN service_jobs candidate_service ON candidate_service.job_id=j.job_id
+	  LEFT JOIN computer_job_projections candidate_projection ON candidate_projection.job_id=j.job_id
+	  LEFT JOIN computers candidate_computer ON candidate_computer.computer_id=candidate_projection.computer_id
+		  WHERE j.state=@job_queued
+		    AND (candidate_projection.job_id IS NULL OR (
+		      candidate_projection.current=1
+		      AND candidate_computer.current_job_id=j.job_id
+		      AND candidate_computer.desired_state=@desired_running
+		      AND candidate_computer.reconfiguration_phase='stable'
+		      AND candidate_computer.placement_node_id=@node_id
+		    ))
 	    AND (
 	      (
 	        @class='one-shot'
@@ -1006,11 +1062,32 @@ AND state=@job_queued
 	if err != nil {
 		return nil, internalError(err, "create claimed attempt")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
-		SET bound_node_id=COALESCE(bound_node_id, ?), next_restart_at=NULL,
-			healthy_since_ns=NULL, published_attempt_id=NULL
-		WHERE job_id=?`, nodeID, jobID); err != nil {
-		return nil, internalError(err, "begin service restart attempt")
+	if class == contract.JobClassService {
+		bindingResult, err := tx.ExecContext(ctx, `UPDATE service_jobs
+			SET bound_node_id=CASE WHEN bound_node_id IS NULL THEN ? ELSE bound_node_id END,
+				next_restart_at=NULL, healthy_since_ns=NULL, published_attempt_id=NULL
+			WHERE job_id=? AND (bound_node_id IS NULL OR bound_node_id=?)`, nodeID, jobID, nodeID)
+		if err != nil {
+			return nil, internalError(err, "begin service restart attempt")
+		}
+		if err := requireClaimBindingUpdate(bindingResult, "service Job", jobID, nodeID); err != nil {
+			return nil, err
+		}
+		if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
+			return nil, mapErr
+		} else if mapped {
+			bindingResult, err := tx.ExecContext(ctx, `UPDATE computers
+				SET bound_node_id=CASE WHEN bound_node_id IS NULL THEN ? ELSE bound_node_id END, updated_ns=?
+				WHERE computer_id=? AND current_job_id=? AND placement_node_id=?
+					AND (bound_node_id IS NULL OR bound_node_id=?)`,
+				nodeID, now.UnixNano(), computerID, jobID, nodeID, nodeID)
+			if err != nil {
+				return nil, internalError(err, "bind Computer service projection")
+			}
+			if err := requireClaimBindingUpdate(bindingResult, "Computer", computerID, nodeID); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
 		return nil, err
@@ -1033,6 +1110,18 @@ AND state=@job_queued
 		claim.PrestartDeadline = &deadline
 	}
 	return claim, nil
+}
+
+func requireClaimBindingUpdate(result sql.Result, resource, resourceID, nodeID string) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "read claimed binding result")
+	}
+	if affected != 1 {
+		return internalError(fmt.Errorf("%s %s binding or placement diverged from claiming node %s",
+			resource, resourceID, nodeID), "bind claimed service")
+	}
+	return nil
 }
 
 func claimExclusion(jobIDs []string) (string, []any, error) {

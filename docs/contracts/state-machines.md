@@ -93,6 +93,64 @@ service from `running` to `queued`, and leaves the restart streak unchanged.
 It must not use `stopping` or `stopped`, whose meaning is reserved for a
 durable operator request to stop the service.
 
+### Computer authority and immutable Job projections
+
+A Computer is the sole desired-state authority for every Computer-trait Job
+that projects it. The durable Computer row owns `computer_id`, name, Pinned
+placement, service binding, grants, `storage_id@generation`, desired state,
+`intent_revision`, immutable intent history, `applied_revision`, the current
+Job/spec revision, and its revision-fenced reconfiguration phase. A bare
+Computer-trait Job is invalid at L1 construction time: it must be created in
+the same transaction as its Computer. `computer_id`, `storage_id`, and every
+successive `job_id` are distinct identities.
+
+Start, stop, restart, removal, and projection replacement require the exact observed
+`intent_revision` and `storage_id@generation`. The transaction returns
+`stale_intent_revision` or `storage_reference_conflict` without changing any
+row when either precondition moved. An accepted no-change desired-state retry
+is a no-op, except that running against a latched-failed observation conflicts
+and directs the operator to Computer restart. A new intent appends exactly one
+immutable history row and advances `intent_revision`; `applied_revision`
+advances only when that intent has landed on the current Job projection.
+History is read through a bounded revision-ordered page rather than being
+materialized by an authority read or CAS. Every history actor is the
+authenticated Fabric identity, never a request-body claim; creation replay by
+a different actor conflicts even when the JobSpec bytes match.
+
+The current immutable Job mirrors Computer desired state only so it can reuse
+the ordinary service attempt state machine. Claim additionally joins the
+Computer authority: only the one current projection may win, and only while
+Computer desired state is `running`, reconfiguration phase is `stable`, and
+the claiming Node ID exactly equals the Computer's Pinned placement Node ID.
+Retired projections remain evidence but are permanently non-startable even if
+their service row is corrupted back to queued. Computer removal changes the
+durable desired state to `removed`, fences every mapped attempt, and moves the
+current Job to `removal_pending`; no later Job or attempt can be created. The
+ordinary durable service-removal directive carries current Job cleanup to the
+bound agent. Its authenticated acknowledgement finalizes the Job observation
+in place as `removed_verified` and releases Slot occupancy while retaining the
+Computer and immutable Job evidence. Composite Storage/resource deletion and
+the final Computer removal strength remain owned by the later Computer removal
+contract.
+
+The first successful claim copies the ordinary service binding to the Computer
+row. Stop follows the ordinary positive-quiescence transition and releases the
+identity-free Slot only after `stopped` (or a latched failure), while the
+Computer retains binding, storage identity and charge, grants, and the current
+image pin. Start performs the existing bound-node capacity check inside the
+same CAS transaction and reacquires one Slot exactly once. Explicit Computer
+restart is valid from stopped or latched failed, clears the ordinary service
+restart latch/policy state, and authorizes a fresh attempt without allowing a
+direct Job restart. Projection replacement records one `project` intent,
+enters revision-fenced `projecting`, and internally drives the current Job to
+stopped without changing authoritative Computer desired state or appending a
+fabricated stop intent. Once positive quiescence lands, it retires the old
+mapping, activates the staged immutable Job, transfers binding and any
+reacquired Slot atomically, advances `applied_revision`, and returns to
+`stable`; plain service Jobs keep their existing lifecycle and image-change
+semantics. Retired and staging projections are absent from the active service
+collection but remain addressable evidence.
+
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:
 

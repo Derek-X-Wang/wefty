@@ -70,6 +70,21 @@ sort before unbound candidates, while all node eligibility remains inside the
 selecting `WHERE` so an older ineligible row cannot head-of-line block. The
 first service claim binds the node in the same transaction.
 
+A Computer-trait service claim additionally joins its durable Computer and
+projection mapping. The mapping must be current, the Computer's
+`current_job_id` must match, Computer desired state must be `running`, and
+reconfiguration must be `stable`; the claiming Node ID must also equal the
+Computer's Pinned placement Node ID, independently of routing-tag eligibility.
+These predicates are inside the same claim
+transaction, so a retired Job, removed Computer, or superseded projection can
+never mint a fresh attempt even if its mirrored `service_jobs` row is stale or
+corrupted. The first winning claim records the same bound Node on both the
+current service Job and the Computer. Both writes require the absent-or-equal
+binding predicate and fail loudly on divergence instead of coalescing a stale
+different identity; later stop/start/restart and projection-transfer
+transactions retain that binding while releasing or reacquiring only the
+identity-free Slot occupancy.
+
 The agent issues one fixed claim loop per class. Each loop blocks on its own
 existing class admission gate, currently pinned to one resident attempt, so a
 service cannot prevent the one-shot loop from asking for work and vice versa.

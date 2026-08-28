@@ -83,6 +83,59 @@ func TestOpenAPIJobSpecPublishesOCIArm(t *testing.T) {
 	}
 }
 
+func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
+	t.Parallel()
+
+	client := readObject(t, "l1-client.v1.json")
+	paths := object(t, client["paths"], "paths")
+	for _, path := range []string{
+		"/v1/computers",
+		"/v1/computers/{computer_id}",
+		"/v1/computers/{computer_id}/intents",
+		"/v1/computers/{computer_id}/desired-state",
+		"/v1/computers/{computer_id}/restart",
+		"/v1/computers/{computer_id}/projections",
+		"/v1/computers/{computer_id}/remove",
+	} {
+		if _, present := paths[path]; !present {
+			t.Errorf("L1 client protocol is missing %s", path)
+		}
+	}
+
+	common := readObject(t, "common.v1.json")
+	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
+	computer := object(t, schemas["Computer"], "Computer")
+	required := stringSet(t, computer["required"])
+	for _, field := range []string{
+		"computer_id", "storage_id", "storage_generation", "desired_state", "intent_revision",
+		"applied_revision", "current_job_id", "current_spec_revision",
+		"reconfiguration_phase", "current_job",
+	} {
+		if !required[field] {
+			t.Errorf("Computer schema does not require %q", field)
+		}
+	}
+	properties := object(t, computer["properties"], "Computer.properties")
+	if _, present := properties["job_id"]; present {
+		t.Fatal("Computer schema conflates computer_id with job_id")
+	}
+	if _, embedded := properties["intent_history"]; embedded {
+		t.Fatal("Computer authority response must not materialize unbounded intent history")
+	}
+	if _, present := schemas["ComputerIntentList"]; !present {
+		t.Fatal("common schema is missing paginated ComputerIntentList")
+	}
+	createComputer := object(t, object(t, paths["/v1/computers"], "create Computer path")["post"], "create Computer")
+	requestBody := object(t, createComputer["requestBody"], "create Computer request body")
+	content := object(t, requestBody["content"], "create Computer content")
+	media := object(t, content["application/json"], "create Computer media")
+	requestSchema := object(t, media["schema"], "create Computer request schema")
+	requestProperties := object(t, requestSchema["properties"], "create Computer request properties")
+	if _, forgeable := requestProperties["actor"]; forgeable {
+		t.Fatal("Computer actor must derive from authenticated Fabric identity")
+	}
+}
+
 func TestL3ImageProgramPublishesJobSpecOCIConstraints(t *testing.T) {
 	t.Parallel()
 

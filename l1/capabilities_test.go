@@ -112,10 +112,13 @@ func TestLegacyComputerCapabilityCannotClaimComputer(t *testing.T) {
 	if legacy.Capabilities["computer"] {
 		t.Fatalf("legacy capabilities retained unobserved computer probe: %#v", legacy.Capabilities)
 	}
-	job, _, err := h.store.CreateJob(context.Background(), computerCapabilityJobSpec("legacy-computer"))
+	computer, _, err := h.store.CreateComputer(context.Background(), CreateComputerRequest{
+		Name: "legacy-computer", Spec: computerCapabilityJobSpec("legacy-computer"), Actor: "test",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	job := computer.CurrentJob
 	claim, err := h.store.ClaimJob(context.Background(), "fabric-legacy", legacy.NodeID, legacy.BootSessionID, contract.JobClassService)
 	if err != nil {
 		t.Fatal(err)
@@ -211,19 +214,33 @@ func assertClaimRequiresAdvertisedCapabilities(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			tags := []string(nil)
+			capableNodeID := "capable"
 			if contract.RequiresPinnedPlacement(test.spec) {
 				tags = append(tags, test.spec.RoutingTags...)
+				capableNodeID = "computer-node"
 			}
 			h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{
-				"incapable": {Tags: tags, MaxOneshotSlots: 1, MaxServiceSlots: 1},
-				"capable":   {Tags: tags, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+				"incapable":   {Tags: tags, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+				capableNodeID: {Tags: tags, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 			})
 			incapable := registerCapabilityNodeWithTags(t, h, "incapable", test.incapable, tags)
-			capable := registerCapabilityNodeWithTags(t, h, "capable", test.capable, tags)
+			capable := registerCapabilityNodeWithTags(t, h, capableNodeID, test.capable, tags)
 
-			job, _, err := h.store.CreateJob(context.Background(), test.spec)
-			if err != nil {
-				t.Fatal(err)
+			var job Job
+			if isComputerSpec(test.spec) {
+				computer, _, err := h.store.CreateComputer(context.Background(), CreateComputerRequest{
+					Name: test.spec.DispatchKey, Spec: test.spec, Actor: "test",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				job = computer.CurrentJob
+			} else {
+				created, _, err := h.store.CreateJob(context.Background(), test.spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				job = created
 			}
 			claim, err := h.store.ClaimJob(context.Background(), "fabric-incapable", incapable.NodeID, incapable.BootSessionID, test.class)
 			if err != nil {
@@ -240,7 +257,7 @@ func assertClaimRequiresAdvertisedCapabilities(t *testing.T) {
 				t.Fatalf("job state after incapable claim = %q, want queued", queued.State)
 			}
 
-			claim, err = h.store.ClaimJob(context.Background(), "fabric-capable", capable.NodeID, capable.BootSessionID, test.class)
+			claim, err = h.store.ClaimJob(context.Background(), "fabric-"+capableNodeID, capable.NodeID, capable.BootSessionID, test.class)
 			if err != nil {
 				t.Fatal(err)
 			}

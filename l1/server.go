@@ -192,6 +192,13 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/jobs/{job_id}/forget", s.forceForgetService)
 	client.HandleFunc("POST /v1/jobs/{job_id}/prompt", s.notImplemented)
 	client.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.notImplemented)
+	client.HandleFunc("POST /v1/computers", s.createComputer)
+	client.HandleFunc("GET /v1/computers/{computer_id}", s.getComputer)
+	client.HandleFunc("GET /v1/computers/{computer_id}/intents", s.listComputerIntents)
+	client.HandleFunc("PUT /v1/computers/{computer_id}/desired-state", s.setComputerDesiredState)
+	client.HandleFunc("POST /v1/computers/{computer_id}/restart", s.restartComputer)
+	client.HandleFunc("POST /v1/computers/{computer_id}/projections", s.installComputerProjection)
+	client.HandleFunc("POST /v1/computers/{computer_id}/remove", s.removeComputer)
 	client.HandleFunc("GET /v1/nodes", s.listNodes)
 	client.HandleFunc("POST /v1/nodes/{node_id}/drain", s.operatorDrainNode)
 	client.HandleFunc("POST /v1/nodes/{node_id}/claims", s.setNodeClaims)
@@ -215,6 +222,8 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
 	root.Handle("/v1/jobs", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/jobs/", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/computers", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/computers/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes/", s.authorize(clientPrincipal, client))
 	return root
@@ -340,6 +349,115 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, status, redactJob(job))
+}
+
+func (s *Server) createComputer(w http.ResponseWriter, r *http.Request) {
+	var request CreateComputerRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	computer, replayed, err := s.store.CreateComputer(r.Context(), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, redactComputer(computer))
+}
+
+func (s *Server) getComputer(w http.ResponseWriter, r *http.Request) {
+	computer, err := s.store.GetComputer(r.Context(), r.PathValue("computer_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, redactComputer(computer))
+}
+
+func (s *Server) listComputerIntents(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	page, err := s.store.ListComputerIntents(r.Context(), r.PathValue("computer_id"),
+		r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) setComputerDesiredState(w http.ResponseWriter, r *http.Request) {
+	var request ComputerDesiredStateRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	computer, err := s.store.SetComputerDesiredState(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, redactComputer(computer))
+}
+
+func (s *Server) restartComputer(w http.ResponseWriter, r *http.Request) {
+	var request ComputerRestartRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	computer, replayed, err := s.store.RestartComputer(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusAccepted
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, redactComputer(computer))
+}
+
+func (s *Server) installComputerProjection(w http.ResponseWriter, r *http.Request) {
+	var request ComputerProjectionRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	computer, err := s.store.InstallComputerProjection(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, redactComputer(computer))
+}
+
+func (s *Server) removeComputer(w http.ResponseWriter, r *http.Request) {
+	var request ComputerRemoveRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	computer, err := s.store.RemoveComputer(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, redactComputer(computer))
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
@@ -711,6 +829,11 @@ func (s *Server) acknowledgeServiceRemoval(w http.ResponseWriter, r *http.Reques
 func redactJob(job Job) Job {
 	job.Spec.Execution.SensitiveEnv = nil
 	return job
+}
+
+func redactComputer(computer Computer) Computer {
+	computer.CurrentJob = redactJob(computer.CurrentJob)
+	return computer
 }
 
 func (s *Server) notImplemented(w http.ResponseWriter, _ *http.Request) {

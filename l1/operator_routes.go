@@ -104,7 +104,9 @@ func (s *Store) ListServiceJobs(ctx context.Context, cursorValue string, limit i
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT jobs.job_id, jobs.created_ns
 		FROM jobs JOIN service_jobs ON service_jobs.job_id=jobs.job_id
-		WHERE jobs.created_ns>? OR (jobs.created_ns=? AND jobs.job_id>?)
+		LEFT JOIN computer_job_projections ON computer_job_projections.job_id=jobs.job_id
+		WHERE (jobs.created_ns>? OR (jobs.created_ns=? AND jobs.job_id>?))
+			AND (computer_job_projections.job_id IS NULL OR computer_job_projections.current=1)
 		ORDER BY jobs.created_ns, jobs.job_id LIMIT ?`, cursor.CreatedNS, cursor.CreatedNS, cursor.JobID, limit+1)
 	if err != nil {
 		return JobList{}, internalError(err, "list service job IDs")
@@ -168,6 +170,13 @@ func (s *Store) SetServiceDesiredState(ctx context.Context, jobID string, desire
 	}
 	if err != nil {
 		return Job{}, internalError(err, "read service desired-state target")
+	}
+	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
+		return Job{}, mapErr
+	} else if mapped {
+		return Job{}, protocolErrorWithDetails(contract.ErrorComputerResourceRequired,
+			map[string]any{"computer_id": computerID},
+			"Computer %q is the sole desired-state authority for Job %q", computerID, jobID)
 	}
 	if job.Removal != nil {
 		return Job{}, protocolError(contract.ErrorConflict, "service job %q is being removed", jobID)
@@ -260,6 +269,13 @@ func (s *Store) RestartService(ctx context.Context, jobID string, request Servic
 	}
 	if err != nil {
 		return Job{}, false, internalError(err, "read service restart target")
+	}
+	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
+		return Job{}, false, mapErr
+	} else if mapped {
+		return Job{}, false, protocolErrorWithDetails(contract.ErrorComputerResourceRequired,
+			map[string]any{"computer_id": computerID},
+			"Computer %q is the sole lifecycle authority for Job %q", computerID, jobID)
 	}
 	var storedHash string
 	err = tx.QueryRowContext(ctx, `SELECT request_hash FROM service_restart_requests
