@@ -249,7 +249,7 @@ func TestComputerFrontDoorSessionCapAndTextFramesCloseBothLegs(t *testing.T) {
 		if err == nil {
 			t.Fatal("front door accepted revalidation less frequent than once per minute")
 		}
-		config.revalidationInterval = time.Minute
+		config.revalidationInterval = 30 * time.Second
 		frontDoor, err = newComputerFrontDoor(config)
 		if err != nil {
 			t.Fatal(err)
@@ -264,8 +264,8 @@ func TestComputerFrontDoorSessionCapAndTextFramesCloseBothLegs(t *testing.T) {
 		}
 		identity.DeviceID = "different-device"
 		fixture.identity.set(identity, nil)
-		fixture.clock.waitForDeadline(t, fixture.clock.Now().Add(time.Minute))
-		fixture.clock.Advance(time.Minute)
+		fixture.clock.waitForDeadline(t, fixture.clock.Now().Add(30*time.Second))
+		fixture.clock.Advance(30 * time.Second)
 		waitComputerAuditKind(t, auditor, l1.ComputerTakeoverSessionClose)
 		events := auditor.snapshot()
 		if events[len(events)-1].Reason != l1.ComputerTakeoverRevalidationFailed {
