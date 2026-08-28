@@ -196,6 +196,41 @@ func TestComputerStorageResetRequiresCurrentHelperGeneration(t *testing.T) {
 	}
 }
 
+func TestComputerBackupRequiresCurrentSessionAndReturnsBoundReceipts(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := CreateComputerBackupRequest{BackupID: "backup-1", CopyID: "copy-1",
+		Storage: ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1",
+			StorageGeneration: 1, IntentRevision: 2, DiskBytes: 8 << 30},
+		Authority: ComputerBackupAuthority{NodeID: "node-1", BootSessionID: "boot-1",
+			HelperGeneration: session.Handshake().SessionGeneration + 1, RootInstanceID: "managed-root-1",
+			JobID: "job-1", OperationRevision: 2, CleanupFence: "backup-fence"}}
+	if _, err := session.CreateComputerBackup(t.Context(), request); err == nil {
+		t.Fatal("stale helper generation authorized Computer Backup")
+	} else {
+		assertRPCCode(t, err, CodeInvalidRequest)
+	}
+	request.Authority.HelperGeneration = session.Handshake().SessionGeneration
+	created, err := session.CreateComputerBackup(t.Context(), request)
+	if err != nil || created.Receipt.Kind != "computer_backup_copy_verified" ||
+		created.Receipt.CopyID != request.CopyID || created.Receipt.HelperGeneration != request.Authority.HelperGeneration {
+		t.Fatalf("current-session Backup = %+v err=%v", created, err)
+	}
+	request.Authority.CleanupFence = "prune-fence"
+	removed, err := session.DeleteComputerBackupCopy(t.Context(), DeleteComputerBackupCopyRequest(request))
+	if err != nil || removed.Receipt.Kind != "computer_backup_copy_removed" || !removed.Receipt.Absent ||
+		removed.Receipt.CleanupFence != "prune-fence" {
+		t.Fatalf("current-session Backup prune = %+v err=%v", removed, err)
+	}
+}
+
 func TestAttemptOutsideSessionIsDistinctFromNonLiveAttempt(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -2114,6 +2149,26 @@ func (*fakeEngine) ResetComputerStorage(_ context.Context, request ResetComputer
 		NodeID: request.Authority.NodeID, RootInstanceID: request.Authority.RootInstanceID,
 		JobID: request.Authority.JobID, IntentRevision: request.Authority.IntentRevision,
 		CleanupFence: request.Authority.CleanupFence, HelperGeneration: request.Authority.HelperGeneration,
+	}}, nil
+}
+func (*fakeEngine) CreateComputerBackup(_ context.Context, request CreateComputerBackupRequest) (CreateComputerBackupResponse, error) {
+	return CreateComputerBackupResponse{Receipt: ComputerBackupCopyReceipt{
+		Kind: "computer_backup_copy_verified", ReceiptID: "backup-receipt", BackupID: request.BackupID,
+		CopyID: request.CopyID, ComputerID: request.Storage.ComputerID, StorageID: request.Storage.StorageID,
+		StorageGeneration: request.Storage.StorageGeneration, NodeID: request.Authority.NodeID,
+		RootInstanceID: request.Authority.RootInstanceID, JobID: request.Authority.JobID,
+		OperationRevision: request.Authority.OperationRevision, CleanupFence: request.Authority.CleanupFence,
+		HelperGeneration: request.Authority.HelperGeneration, AllocatedSize: request.Storage.DiskBytes,
+		ContentDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Encryption: "none",
+	}}, nil
+}
+func (*fakeEngine) DeleteComputerBackupCopy(_ context.Context, request DeleteComputerBackupCopyRequest) (DeleteComputerBackupCopyResponse, error) {
+	return DeleteComputerBackupCopyResponse{Receipt: ComputerBackupCopyRemovalReceipt{
+		Kind: "computer_backup_copy_removed", ReceiptID: "backup-removal-receipt", BackupID: request.BackupID,
+		CopyID: request.CopyID, ComputerID: request.Storage.ComputerID, StorageID: request.Storage.StorageID,
+		StorageGeneration: request.Storage.StorageGeneration, NodeID: request.Authority.NodeID,
+		RootInstanceID: request.Authority.RootInstanceID, OperationRevision: request.Authority.OperationRevision,
+		CleanupFence: request.Authority.CleanupFence, HelperGeneration: request.Authority.HelperGeneration, Absent: true,
 	}}, nil
 }
 func (engine *fakeEngine) Verify(context.Context, VerifyRequest) (VerifyResponse, error) {

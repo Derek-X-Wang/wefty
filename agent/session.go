@@ -71,6 +71,7 @@ type agentSession struct {
 	reapPriorBoot   func(context.Context, string) (workloadrunner.ReapReceipt, error)
 	removals        *removalController
 	storageResets   *storageResetController
+	backups         *backupController
 	computerPolicy  *ComputerPolicyCache
 	computerAcks    *computerPolicyAckController
 
@@ -203,7 +204,9 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	// ADR-0002 removal recovery is independent of OCI readiness and always runs
 	// once registration authority and its restrictive N+1 are published.
 	removalErr := errors.Join(session.resumePendingRemovals(ctx), session.processRemovalDirectives(ctx, registrationHeartbeat.RemovalDirectives),
-		session.processStorageResetDirectives(ctx, registrationHeartbeat.StorageResetDirectives))
+		session.processStorageResetDirectives(ctx, registrationHeartbeat.StorageResetDirectives),
+		session.processBackupDirectives(ctx, registrationHeartbeat.BackupDirectives),
+		session.processBackupPruneDirectives(ctx, registrationHeartbeat.BackupPruneDirectives))
 	pinsErr := error(nil)
 	if barrierErr == nil && removalErr == nil {
 		pinsErr = session.reconcileOCIImagePins(ctx)
@@ -264,6 +267,32 @@ func (session *agentSession) processStorageResetDirectives(ctx context.Context, 
 	for _, directive := range directives {
 		if err := session.storageResets.process(ctx, directive); err != nil {
 			failures = append(failures, fmt.Errorf("reconcile Computer Storage reset %q: %w", directive.ComputerID, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (session *agentSession) processBackupDirectives(ctx context.Context, directives []l1.ComputerBackupDirective) error {
+	if session.backups == nil {
+		return nil
+	}
+	var failures []error
+	for _, directive := range directives {
+		if err := session.backups.processCreate(ctx, directive); err != nil {
+			failures = append(failures, fmt.Errorf("reconcile Computer Backup %q: %w", directive.CopyID, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (session *agentSession) processBackupPruneDirectives(ctx context.Context, directives []l1.ComputerBackupPruneDirective) error {
+	if session.backups == nil {
+		return nil
+	}
+	var failures []error
+	for _, directive := range directives {
+		if err := session.backups.processPrune(ctx, directive); err != nil {
+			failures = append(failures, fmt.Errorf("reconcile Backup prune %q: %w", directive.CopyID, err))
 		}
 	}
 	return errors.Join(failures...)
@@ -379,7 +408,11 @@ func (session *agentSession) recoverOCIRuntimeLocked(ctx context.Context) (ocihe
 	if barrierErr != nil {
 		session.capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), barrierErr)
 	}
-	removalErr := errors.Join(session.resumePendingRemovals(ctx), session.processRemovalDirectives(ctx, restrictiveResponse.RemovalDirectives))
+	removalErr := errors.Join(session.resumePendingRemovals(ctx),
+		session.processRemovalDirectives(ctx, restrictiveResponse.RemovalDirectives),
+		session.processStorageResetDirectives(ctx, restrictiveResponse.StorageResetDirectives),
+		session.processBackupDirectives(ctx, restrictiveResponse.BackupDirectives),
+		session.processBackupPruneDirectives(ctx, restrictiveResponse.BackupPruneDirectives))
 	if barrierErr != nil {
 		return ocihelper.HelperSession{}, barrierErr
 	}
@@ -501,6 +534,9 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 		session.attempts.Wait()
 		if session.removals != nil {
 			session.removals.wait()
+		}
+		if session.backups != nil {
+			session.backups.wait()
 		}
 		if session.storageResets != nil {
 			session.storageResets.wait()
@@ -1006,6 +1042,18 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			if session.storageResets != nil {
 				for _, directive := range response.StorageResetDirectives {
 					session.storageResets.enqueue(ctx, directive, failures)
+				}
+			}
+			if session.backups != nil {
+				for _, directive := range response.BackupDirectives {
+					directive := directive
+					session.backups.enqueue(ctx, "create\x00"+directive.CopyID,
+						func(runContext context.Context) error { return session.backups.processCreate(runContext, directive) }, failures)
+				}
+				for _, directive := range response.BackupPruneDirectives {
+					directive := directive
+					session.backups.enqueue(ctx, "prune\x00"+directive.CopyID,
+						func(runContext context.Context) error { return session.backups.processPrune(runContext, directive) }, failures)
 				}
 			}
 			backoff.reset()

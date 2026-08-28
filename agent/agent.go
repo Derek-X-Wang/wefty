@@ -240,6 +240,7 @@ func New(config Config) (*Agent, error) {
 	var managedVolumeFinalizer workloadrunner.ManagedVolumeFinalizer
 	var ociRemovalProof workloadrunner.RuntimeRemovalProofRuntime
 	var computerStorageResetter workloadrunner.ComputerStorageResetter
+	var computerBackupper workloadrunner.ComputerBackupper
 	if runtimeAdapter, configured := runtimes.selectKind(contract.JobKindOCI); configured {
 		if pinRuntime, supported := runtimeAdapter.(workloadrunner.OCIImagePinRuntime); supported {
 			pinRuntime.SetOCIImageBindingPinLedger(outbox.spool)
@@ -250,6 +251,7 @@ func New(config Config) (*Agent, error) {
 			ociRemovalProof = proofRuntime
 		}
 		computerStorageResetter, _ = runtimeAdapter.(workloadrunner.ComputerStorageResetter)
+		computerBackupper, _ = runtimeAdapter.(workloadrunner.ComputerBackupper)
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
@@ -316,6 +318,18 @@ func New(config Config) (*Agent, error) {
 	if session.storageResets != nil {
 		session.storageResets.finalizeVolumes = session.removals.finalizeVolumes
 		session.storageResets.attestRuntimeRemoval = session.removals.attestRuntimeRemoval
+	}
+	session.backups = newBackupController(client, computerBackupper, config.NodeID, config.BootSessionID,
+		registration.RootInstanceID, logf)
+	if session.backups != nil {
+		session.removals.removeBackupCopies = func(ctx context.Context, directives []l1.ComputerBackupPruneDirective) error {
+			for _, directive := range directives {
+				if err := session.backups.processPrune(ctx, directive); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 	}
 	constructionSucceeded = true
 	return &Agent{

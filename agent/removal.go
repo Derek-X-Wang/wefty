@@ -47,6 +47,7 @@ type removalController struct {
 	attestRuntimeRemoval  func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error)
 	ackRemoval            func(context.Context, localRemoval) error
 	finishRemoval         func(context.Context, localRemoval) error
+	removeBackupCopies    func(context.Context, []l1.ComputerBackupPruneDirective) error
 
 	mu       sync.Mutex
 	inflight map[string]struct{}
@@ -145,6 +146,14 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	// guardian. A crash after it leaves an unambiguous local removing record.
 	if err := controller.beginRemoval(ctx, removal); err != nil {
 		return err
+	}
+	if directive.ComputerBackupCopies != nil && len(directive.ComputerBackupCopies.Copies) != 0 {
+		if controller.removeBackupCopies == nil {
+			return errors.New("Computer removal requires Backup copy removal support")
+		}
+		if err := controller.removeBackupCopies(ctx, directive.ComputerBackupCopies.Copies); err != nil {
+			return fmt.Errorf("delete Computer Backup copies: %w", err)
+		}
 	}
 	if controller.loadRuntimeRemoval != nil {
 		runtimeRemoval, found, err := controller.loadRuntimeRemoval(ctx, removal.jobID)

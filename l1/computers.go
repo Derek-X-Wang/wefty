@@ -22,13 +22,14 @@ const initialComputerRevision int64 = 1
 type ComputerIntentOperation string
 
 const (
-	ComputerIntentCreate  ComputerIntentOperation = "create"
-	ComputerIntentStart   ComputerIntentOperation = "start"
-	ComputerIntentStop    ComputerIntentOperation = "stop"
-	ComputerIntentRestart ComputerIntentOperation = "restart"
-	ComputerIntentRemove  ComputerIntentOperation = "remove"
-	ComputerIntentProject ComputerIntentOperation = "project"
-	ComputerIntentReset   ComputerIntentOperation = "reset"
+	ComputerIntentCreate       ComputerIntentOperation = "create"
+	ComputerIntentStart        ComputerIntentOperation = "start"
+	ComputerIntentStop         ComputerIntentOperation = "stop"
+	ComputerIntentRestart      ComputerIntentOperation = "restart"
+	ComputerIntentRemove       ComputerIntentOperation = "remove"
+	ComputerIntentProject      ComputerIntentOperation = "project"
+	ComputerIntentReset        ComputerIntentOperation = "reset"
+	ComputerIntentBackupCreate ComputerIntentOperation = "backup_create"
 )
 
 type ComputerGrantPermission string
@@ -46,6 +47,7 @@ const (
 	ComputerReconfigurationProjecting ComputerReconfigurationPhase = "projecting"
 	ComputerReconfigurationRemoving   ComputerReconfigurationPhase = "removing"
 	ComputerReconfigurationResetting  ComputerReconfigurationPhase = "resetting"
+	ComputerReconfigurationBackingUp  ComputerReconfigurationPhase = "backing_up"
 )
 
 type ComputerGrant struct {
@@ -79,6 +81,7 @@ type Computer struct {
 	Grants                  []ComputerGrant              `json:"grants"`
 	StorageID               string                       `json:"storage_id"`
 	StorageGeneration       int64                        `json:"storage_generation"`
+	BackupCap               int64                        `json:"backup_cap"`
 	DesiredDiskBytes        int64                        `json:"desired_disk_bytes"`
 	DesiredState            contract.ServiceDesiredState `json:"desired_state"`
 	IntentRevision          int64                        `json:"intent_revision"`
@@ -100,9 +103,10 @@ type Computer struct {
 }
 
 type CreateComputerRequest struct {
-	Name  string           `json:"name"`
-	Spec  contract.JobSpec `json:"spec"`
-	Actor string           `json:"-"`
+	Name      string           `json:"name"`
+	Spec      contract.JobSpec `json:"spec"`
+	BackupCap *int64           `json:"backup_cap,omitempty"`
+	Actor     string           `json:"-"`
 }
 
 type ComputerMutationPrecondition struct {
@@ -204,6 +208,13 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	if err := validateComputerNameAndActor(request.Name, request.Actor); err != nil {
 		return Computer{}, false, err
 	}
+	backupCap := s.computerBackupCap
+	if request.BackupCap != nil {
+		backupCap = *request.BackupCap
+	}
+	if backupCap < 0 {
+		return Computer{}, false, protocolError(contract.ErrorInvalidRequest, "backup_cap must be non-negative")
+	}
 	request.Spec.RoutingTags = NormalizeTags(request.Spec.RoutingTags)
 	if err := validateJobSpec(&request.Spec); err != nil {
 		return Computer{}, false, err
@@ -239,7 +250,8 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 			computerErr = tx.QueryRowContext(ctx, `SELECT actor FROM computer_intent_history
 				WHERE computer_id=? AND intent_revision=?`, computer.ComputerID, initialComputerRevision).Scan(&creationActor)
 		}
-		if computerErr != nil || computer.Name != request.Name || creationActor != request.Actor {
+		capMismatch := request.BackupCap != nil && computer.BackupCap != *request.BackupCap
+		if computerErr != nil || computer.Name != request.Name || creationActor != request.Actor || capMismatch {
 			return Computer{}, false, protocolError(contract.ErrorDispatchKeyConflict,
 				"dispatch key %q does not identify this Computer", request.Spec.DispatchKey)
 		}
@@ -279,11 +291,11 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	storageID := newID("storage")
 	grantsJSON := []byte("[]")
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computers(
-		computer_id, name, placement_node_id, grants_json, storage_id, storage_generation,
+		computer_id, name, placement_node_id, grants_json, storage_id, storage_generation, backup_cap,
 		desired_state, intent_revision, applied_revision, current_job_id, current_spec_revision,
 		reconfiguration_phase, created_ns, updated_ns
-	) VALUES(?, ?, ?, ?, ?, 1, ?, 1, 1, ?, 1, ?, ?, ?)`,
-		computerID, request.Name, placementNodeID, grantsJSON, storageID,
+	) VALUES(?, ?, ?, ?, ?, 1, ?, ?, 1, 1, ?, 1, ?, ?, ?)`,
+		computerID, request.Name, placementNodeID, grantsJSON, storageID, backupCap,
 		contract.ServiceDesiredRunning, job.JobID, ComputerReconfigurationStable,
 		now.UnixNano(), now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "store Computer")
@@ -434,13 +446,13 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	var reconfigurationRevision sql.NullInt64
 	var createdNS, updatedNS int64
 	err := q.QueryRowContext(ctx, `SELECT computer_id, name, placement_node_id, bound_node_id,
-		grants_json, storage_id, storage_generation, desired_state, intent_revision,
+		grants_json, storage_id, storage_generation, backup_cap, desired_state, intent_revision,
 		applied_revision, current_job_id, current_spec_revision, reconfiguration_phase,
 		reconfiguration_revision, submit_enabled, submit_intent_revision, submit_max_inflight,
 		submit_policy_revision, created_ns, updated_ns
 		FROM computers WHERE computer_id=?`, computerID).Scan(
 		&computer.ComputerID, &computer.Name, &computer.PlacementNodeID, &boundNodeID,
-		&grantsJSON, &computer.StorageID, &computer.StorageGeneration, &computer.DesiredState,
+		&grantsJSON, &computer.StorageID, &computer.StorageGeneration, &computer.BackupCap, &computer.DesiredState,
 		&computer.IntentRevision, &computer.AppliedRevision, &computer.CurrentJobID,
 		&computer.CurrentSpecRevision, &computer.ReconfigurationPhase,
 		&reconfigurationRevision, &computer.SubmitEnabled, &computer.SubmitIntentRevision,
@@ -637,7 +649,9 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
 		return Computer{}, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
 	}
-	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
+	backupStopWins := computer.ReconfigurationPhase == ComputerReconfigurationBackingUp &&
+		request.DesiredState == contract.ServiceDesiredStopped
+	if computer.ReconfigurationPhase != ComputerReconfigurationStable && !backupStopWins {
 		return Computer{}, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
 	}
@@ -898,7 +912,8 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	}
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable &&
 		computer.ReconfigurationPhase != ComputerReconfigurationProjecting &&
-		computer.ReconfigurationPhase != ComputerReconfigurationResetting {
+		computer.ReconfigurationPhase != ComputerReconfigurationResetting &&
+		computer.ReconfigurationPhase != ComputerReconfigurationBackingUp {
 		return Computer{}, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
 	}
@@ -907,6 +922,12 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_resets SET status='superseded'
 			WHERE computer_id=? AND status IN ('reserved', 'prepared', 'published')`, computerID); err != nil {
 			return Computer{}, internalError(err, "supersede Computer Storage reset for removal")
+		}
+	}
+	if computer.ReconfigurationPhase == ComputerReconfigurationBackingUp {
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_backup_operations SET status='superseded'
+			WHERE computer_id=? AND status='planned'`, computerID); err != nil {
+			return Computer{}, internalError(err, "supersede Computer Backup for removal")
 		}
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET desired_state=?, intent_revision=?,
@@ -966,11 +987,33 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 			updated_ns=? WHERE job_id=?`, contract.JobRemovalPending, now.UnixNano(), computer.CurrentJobID); err != nil {
 			return Computer{}, internalError(err, "foreclose Computer Job")
 		}
+		cleanupFence := newID("cleanup")
 		if _, err := tx.ExecContext(ctx, `INSERT INTO service_removals(
 			job_id, bound_node_id, removal_generation, cleanup_fence, root_instance_id, status, requested_ns
-		) VALUES(?, ?, 1, ?, ?, ?, ?)`, computer.CurrentJobID, boundNodeID, newID("cleanup"),
+		) VALUES(?, ?, 1, ?, ?, ?, ?)`, computer.CurrentJobID, boundNodeID, cleanupFence,
 			rootInstanceID, contract.JobRemovalPending, now.UnixNano()); err != nil {
 			return Computer{}, internalError(err, "create durable Computer removal directive")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE backups SET status='pruning'
+			WHERE computer_id=? AND status='available'`, computerID); err != nil {
+			return Computer{}, internalError(err, "freeze Computer Backups for removal")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE backup_copies SET phase='removal_pending', cleanup_fence=?
+			WHERE backup_id IN (SELECT backup_id FROM backups WHERE computer_id=?) AND phase='published'`,
+			cleanupFence, computerID); err != nil {
+			return Computer{}, internalError(err, "freeze Computer Backup copies for removal")
+		}
+		// Composite Computer removal owns every retained physical copy. Preserve
+		// an already-planned operator prune, and plan the remaining copies before
+		// the node may delete bytes or acknowledge the service removal.
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO computer_backup_prunes(
+			computer_id, intent_revision, backup_id, copy_id, cleanup_fence,
+			idempotency_key, request_hash, actor, status, requested_ns
+		) SELECT ?, ?, b.backup_id, bc.copy_id, ?, 'remove:' || bc.copy_id, ?, ?, 'planned', ?
+			FROM backups b JOIN backup_copies bc ON bc.backup_id=b.backup_id
+			WHERE b.computer_id=? AND bc.phase='removal_pending'`, computerID, nextRevision,
+			cleanupFence, cleanupFence, request.Actor, now.UnixNano(), computerID); err != nil {
+			return Computer{}, internalError(err, "plan Computer Backup copy removal")
 		}
 	}
 	if err := markComputerIntentApplied(ctx, tx, computerID, nextRevision, now); err != nil {

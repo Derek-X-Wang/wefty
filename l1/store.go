@@ -47,6 +47,9 @@ type StoreOptions struct {
 	PrestartInfrastructureBudget      time.Duration
 	AdminBootstrapTTL                 time.Duration
 	ComputerTakeoverAuditRetentionAge time.Duration
+	// ComputerBackupCap is the explicit cluster default materialized onto each
+	// Computer at creation. Zero is the shipped fail-closed default.
+	ComputerBackupCap int64
 }
 
 // Store is the durable SQLite substrate for L1 queue operations.
@@ -64,6 +67,7 @@ type Store struct {
 	prestartInfrastructureBudget      time.Duration
 	adminBootstrapTTL                 time.Duration
 	computerTakeoverAuditRetentionAge time.Duration
+	computerBackupCap                 int64
 	deploymentID                      string
 	policyChangeMu                    sync.Mutex
 	policyChanged                     chan struct{}
@@ -139,6 +143,9 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if computerTakeoverAuditRetentionAge == 0 {
 		computerTakeoverAuditRetentionAge = DefaultComputerTakeoverAuditRetentionAge
 	}
+	if options.ComputerBackupCap < 0 {
+		return nil, fmt.Errorf("l1: Computer Backup cap must be non-negative")
+	}
 	deploymentID, err := loadOrCreateDeploymentID(path)
 	if err != nil {
 		return nil, err
@@ -162,6 +169,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		prestartInfrastructureBudget:      prestartInfrastructureBudget,
 		adminBootstrapTTL:                 adminBootstrapTTL,
 		computerTakeoverAuditRetentionAge: computerTakeoverAuditRetentionAge,
+		computerBackupCap:                 options.ComputerBackupCap,
 		deploymentID:                      deploymentID,
 		policyChanged:                     make(chan struct{}),
 	}
@@ -321,12 +329,13 @@ CREATE TABLE IF NOT EXISTS computers (
   grants_json BLOB NOT NULL,
   storage_id TEXT NOT NULL UNIQUE,
   storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+	backup_cap INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0),
   desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
   intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
   applied_revision INTEGER NOT NULL CHECK(applied_revision >= 0 AND applied_revision <= intent_revision),
   current_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
   current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
-  reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'removing')),
+  reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'backing_up', 'removing')),
   reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0),
   submit_enabled INTEGER NOT NULL DEFAULT 0 CHECK(submit_enabled IN (0, 1)),
   submit_intent_revision INTEGER NOT NULL DEFAULT 0 CHECK(submit_intent_revision >= 0),
@@ -370,7 +379,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS computer_current_projection
 CREATE TABLE IF NOT EXISTS computer_intent_history (
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
   intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
-  operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset')),
+  operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create')),
   desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
   storage_id TEXT NOT NULL,
   storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
@@ -422,6 +431,86 @@ CREATE TABLE IF NOT EXISTS computer_storage_resets (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_reset_active
 	  ON computer_storage_resets(computer_id) WHERE status NOT IN ('retired', 'superseded');
+CREATE TABLE IF NOT EXISTS computer_backup_operations (
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  operation_revision INTEGER NOT NULL CHECK(operation_revision > 0),
+  backup_id TEXT NOT NULL UNIQUE,
+  copy_id TEXT NOT NULL UNIQUE,
+  source_storage_id TEXT NOT NULL,
+  source_generation INTEGER NOT NULL CHECK(source_generation > 0),
+  allocated_size INTEGER NOT NULL CHECK(allocated_size > 0),
+  bound_node_id TEXT NOT NULL,
+  root_instance_id TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(job_id),
+  cleanup_fence TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('planned', 'published', 'failed', 'superseded')),
+  failure_code TEXT NOT NULL DEFAULT '',
+  resume_desired_running INTEGER NOT NULL CHECK(resume_desired_running IN (0, 1)),
+  receipt_json BLOB,
+  receipt_hash TEXT,
+  acknowledgement_key TEXT,
+  acknowledgement_hash TEXT,
+  requested_ns INTEGER NOT NULL,
+  completed_ns INTEGER,
+  PRIMARY KEY(computer_id, operation_revision),
+  UNIQUE(computer_id, idempotency_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS computer_backup_operation_active
+  ON computer_backup_operations(computer_id) WHERE status='planned';
+CREATE TABLE IF NOT EXISTS backups (
+  backup_id TEXT PRIMARY KEY,
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  source_storage_id TEXT NOT NULL,
+  source_generation INTEGER NOT NULL CHECK(source_generation > 0),
+  created_ns INTEGER NOT NULL,
+  allocated_size INTEGER NOT NULL CHECK(allocated_size > 0),
+  content_digest TEXT NOT NULL,
+  encryption TEXT NOT NULL CHECK(encryption='none'),
+  provenance_id TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL CHECK(status IN ('available', 'pruning', 'pruned')),
+  pruned_ns INTEGER
+);
+CREATE TABLE IF NOT EXISTS backup_copies (
+  copy_id TEXT PRIMARY KEY,
+  backup_id TEXT NOT NULL REFERENCES backups(backup_id),
+  node_id TEXT NOT NULL,
+  root_instance_id TEXT NOT NULL,
+  allocated_size INTEGER NOT NULL CHECK(allocated_size > 0),
+  content_digest TEXT NOT NULL,
+  phase TEXT NOT NULL CHECK(phase IN ('published', 'removal_pending', 'removed')),
+  cleanup_fence TEXT,
+  created_ns INTEGER NOT NULL,
+  removed_ns INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS backup_one_v1_copy ON backup_copies(backup_id) WHERE phase<>'removed';
+CREATE TABLE IF NOT EXISTS storage_provenance (
+  provenance_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK(kind='backup'),
+  source_storage_id TEXT NOT NULL,
+  source_generation INTEGER NOT NULL CHECK(source_generation > 0),
+  backup_id TEXT NOT NULL UNIQUE REFERENCES backups(backup_id),
+  created_ns INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS computer_backup_prunes (
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
+  backup_id TEXT NOT NULL REFERENCES backups(backup_id),
+  copy_id TEXT NOT NULL REFERENCES backup_copies(copy_id),
+  cleanup_fence TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('planned', 'removed', 'superseded')),
+  receipt_json BLOB,
+  acknowledgement_key TEXT,
+  acknowledgement_hash TEXT,
+  requested_ns INTEGER NOT NULL,
+  completed_ns INTEGER,
+  PRIMARY KEY(computer_id, backup_id),
+  UNIQUE(computer_id, idempotency_key)
+);
 CREATE TABLE IF NOT EXISTS admin_policy (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   revision INTEGER NOT NULL CHECK(revision >= 0),
@@ -612,6 +701,9 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "computers", "backup_cap", "INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0)"); err != nil {
+		return err
+	}
 	if err := s.migrateComputerResetConstraints(ctx); err != nil {
 		return err
 	}
@@ -680,8 +772,8 @@ func (s *Store) migrateComputerResetConstraints(ctx context.Context) error {
 	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_intent_history'`).Scan(&intentsSQL); err != nil {
 		return fmt.Errorf("l1: inspect Computer intent schema: %w", err)
 	}
-	migrateComputers := !strings.Contains(computersSQL, "'resetting'")
-	migrateIntents := !strings.Contains(intentsSQL, "'reset'")
+	migrateComputers := !strings.Contains(computersSQL, "'backing_up'")
+	migrateIntents := !strings.Contains(intentsSQL, "'backup_create'")
 	if !migrateComputers && !migrateIntents {
 		return nil
 	}
@@ -703,19 +795,28 @@ func (s *Store) migrateComputerResetConstraints(ctx context.Context) error {
 			grants_json BLOB NOT NULL,
 			storage_id TEXT NOT NULL UNIQUE,
 			storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+			backup_cap INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0),
 			desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
 			intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
 			applied_revision INTEGER NOT NULL CHECK(applied_revision >= 0 AND applied_revision <= intent_revision),
 			current_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
 			current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
-			reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'removing')),
+			reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'backing_up', 'removing')),
 			reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0),
 			created_ns INTEGER NOT NULL,
 			updated_ns INTEGER NOT NULL
 		)`); err != nil {
 			return fmt.Errorf("l1: create widened Computer schema: %w", err)
 		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO computers_reset_migration SELECT * FROM computers`); err != nil {
+		if _, err := transaction.ExecContext(ctx, `INSERT INTO computers_reset_migration(
+			computer_id, name, placement_node_id, bound_node_id, grants_json, storage_id,
+			storage_generation, backup_cap, desired_state, intent_revision, applied_revision,
+			current_job_id, current_spec_revision, reconfiguration_phase, reconfiguration_revision,
+			created_ns, updated_ns)
+			SELECT computer_id, name, placement_node_id, bound_node_id, grants_json, storage_id,
+			storage_generation, backup_cap, desired_state, intent_revision, applied_revision,
+			current_job_id, current_spec_revision, reconfiguration_phase, reconfiguration_revision,
+			created_ns, updated_ns FROM computers`); err != nil {
 			return fmt.Errorf("l1: copy Computer authority during migration: %w", err)
 		}
 		if _, err := transaction.ExecContext(ctx, `DROP TABLE computers`); err != nil {
@@ -732,7 +833,7 @@ func (s *Store) migrateComputerResetConstraints(ctx context.Context) error {
 		if _, err := transaction.ExecContext(ctx, `CREATE TABLE computer_intent_history_reset_migration (
 			computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
 			intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
-			operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset')),
+			operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create')),
 			desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
 			storage_id TEXT NOT NULL,
 			storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),

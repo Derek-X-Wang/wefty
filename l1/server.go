@@ -238,6 +238,9 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/computers/{computer_id}/restart", s.restartComputer)
 	client.HandleFunc("POST /v1/computers/{computer_id}/storage-reset", s.resetComputerStorage)
 	client.HandleFunc("GET /v1/computers/{computer_id}/storage-generations", s.listComputerStorageGenerations)
+	client.HandleFunc("POST /v1/computers/{computer_id}/backups", s.createComputerBackup)
+	client.HandleFunc("GET /v1/computers/{computer_id}/backups", s.listComputerBackups)
+	client.HandleFunc("POST /v1/computers/{computer_id}/backups/{backup_id}/prune", s.pruneComputerBackup)
 	client.HandleFunc("POST /v1/computers/{computer_id}/projections", s.installComputerProjection)
 	client.HandleFunc("POST /v1/computers/{computer_id}/remove", s.removeComputer)
 	client.HandleFunc("POST /v1/computers/{computer_id}/token-scope-proof", s.proveComputerTokenScope)
@@ -264,6 +267,8 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/removal-acknowledgement", s.acknowledgeServiceRemoval)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-reset-acknowledgement", s.acknowledgeComputerStorageReset)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-retirement-acknowledgement", s.acknowledgeComputerStorageRetirement)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/backup-acknowledgement", s.acknowledgeComputerBackup)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/backup-prune-acknowledgement", s.acknowledgeComputerBackupPrune)
 
 	person := http.NewServeMux()
 	person.HandleFunc("GET /v1/whoami", s.whoAmI)
@@ -780,6 +785,56 @@ func (s *Server) listComputerStorageGenerations(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, generations)
 }
 
+func (s *Server) createComputerBackup(w http.ResponseWriter, r *http.Request) {
+	var request ComputerBackupCreateRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	computer, replayed, err := s.store.BeginComputerBackup(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusAccepted
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, redactComputer(computer))
+}
+
+func (s *Server) listComputerBackups(w http.ResponseWriter, r *http.Request) {
+	backups, err := s.store.ListComputerBackups(r.Context(), r.PathValue("computer_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, backups)
+}
+
+func (s *Server) pruneComputerBackup(w http.ResponseWriter, r *http.Request) {
+	var request ComputerBackupPruneRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.BackupID = r.PathValue("backup_id")
+	request.Actor = identityFromRequest(r).NodeID
+	backup, replayed, err := s.store.BeginComputerBackupPrune(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusAccepted
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, backup)
+}
+
 func (s *Server) installComputerProjection(w http.ResponseWriter, r *http.Request) {
 	var request ComputerProjectionRequest
 	if err := decodeJSON(r, &request); err != nil {
@@ -1039,13 +1094,24 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	backups, err := s.store.ListNodeComputerBackupDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	backupPrunes, err := s.store.ListNodeComputerBackupPruneDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	computerPolicy, err := s.store.IssueComputerPolicySnapshot(r.Context(), identity.NodeID, identity.FabricID, nodeID,
 		request.BootSessionID, s.computerPolicyFreshness)
 	if err != nil {
 		computerPolicy = nil
 	}
 	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, RemovalDirectives: directives,
-		StorageResetDirectives: storageResets, ComputerPolicy: computerPolicy})
+		StorageResetDirectives: storageResets, BackupDirectives: backups,
+		BackupPruneDirectives: backupPrunes, ComputerPolicy: computerPolicy})
 }
 
 func (s *Server) watchComputerPolicy(w http.ResponseWriter, r *http.Request) {
@@ -1134,6 +1200,44 @@ func (s *Server) acknowledgeComputerStorageRetirement(w http.ResponseWriter, r *
 		return
 	}
 	writeJSON(w, http.StatusOK, redactComputer(computer))
+}
+
+func (s *Server) acknowledgeComputerBackup(w http.ResponseWriter, r *http.Request) {
+	var request ComputerBackupAcknowledgementRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	backup, computer, err := s.store.AcknowledgeComputerBackup(r.Context(), identityFromRequest(r).NodeID,
+		r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	response := ComputerBackupAcknowledgementResponse{Computer: redactComputer(computer)}
+	if backup.BackupID != "" {
+		response.Backup = &backup
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) acknowledgeComputerBackupPrune(w http.ResponseWriter, r *http.Request) {
+	var request ComputerBackupPruneAcknowledgementRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	backup, err := s.store.AcknowledgeComputerBackupPrune(r.Context(), identityFromRequest(r).NodeID,
+		r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if backup.BackupID == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, http.StatusOK, backup)
 }
 
 func (s *Server) drainNode(w http.ResponseWriter, r *http.Request) {

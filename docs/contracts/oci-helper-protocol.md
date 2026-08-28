@@ -564,6 +564,26 @@ helper requires a matching detached receipt, verifies mount and loop absence,
 deletes the image, manifest, and generation quota directory, and positively
 checks their absence before the agent may acknowledge `removed_verified`.
 
+`CreateComputerBackup` is narrow privileged mechanics for one source-node cold
+copy. Its authority binds Backup, copy, Computer, `storage_id@generation`,
+allocated size, Node, boot, root instance, Job, operation revision, cleanup
+fence, and helper generation. Before reading, the helper requires the exact
+source lock, an accepted detach receipt, and positive mount and loop absence.
+It writes a durable copy manifest before bytes, uses full allocation, copies
+under the attachment fence, compares source and destination SHA-256 digests,
+publishes by rename, and records `encryption=none`. Durable phases cover
+reserve, allocate, copy, digest, manifest, and publish so every injected crash
+resumes from a tracked manifest. ENOSPC or digest mismatch removes the copy
+root, positively checks absence, and returns only the corresponding failure
+receipt; it never modifies the source.
+
+`DeleteComputerBackupCopy` accepts new prune or composite-removal authority but
+requires any present manifest to match the exact copy, source Storage identity,
+Node, and root instance. It deletes only the deterministic Wefty-owned copy
+root and returns `computer_backup_copy_removed` only after positive absence.
+The helper does not choose retention, auto-delete, restore, clone, export,
+encryption, or replica policy.
+
 `AttestRemoval` accepts only an exact service Job/generation plus reconstructed
 attempt authorities and their deterministic resource rows, and is called after
 the separate idempotent `DeleteManagedVolume(service_data, job_id)` succeeds.

@@ -573,6 +573,80 @@
         }
       }
     },
+    "/v1/agent/computers/{computer_id}/backup-acknowledgement": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "acknowledgeComputerBackup",
+        "summary": "Publish a verified cold Backup or an assertion-derived absent failure",
+        "description": "The current authenticated node returns a helper receipt bound to the planned copy, source Storage generation, Node, root instance, Job, operation revision, and cleanup fence. Success requires full allocation, matching digest, and encryption=none; ENOSPC or digest mismatch requires positive copy absence.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
+          "properties": {
+            "node_id": { "type": "string", "minLength": 1 }, "boot_session_id": { "type": "string", "minLength": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 },
+            "receipt": {
+              "type": "object", "additionalProperties": false,
+              "required": ["kind", "receipt_id", "backup_id", "copy_id", "computer_id", "storage_id", "storage_generation", "node_id", "root_instance_id", "job_id", "operation_revision", "cleanup_fence", "helper_generation", "allocated_size", "encryption", "copy_absent"],
+              "properties": {
+                "kind": { "enum": ["computer_backup_copy_verified", "computer_backup_copy_failed_absent"] },
+                "receipt_id": { "type": "string", "minLength": 1 }, "backup_id": { "type": "string", "minLength": 1 }, "copy_id": { "type": "string", "minLength": 1 },
+                "computer_id": { "type": "string", "minLength": 1 }, "storage_id": { "type": "string", "minLength": 1 },
+                "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 }, "node_id": { "type": "string", "minLength": 1 },
+                "root_instance_id": { "type": "string", "minLength": 1 }, "job_id": { "type": "string", "minLength": 1 },
+                "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 }, "cleanup_fence": { "type": "string", "minLength": 1 },
+                "helper_generation": { "type": "integer", "minimum": 1 }, "allocated_size": { "type": "integer", "format": "int64", "minimum": 1 },
+                "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "encryption": { "const": "none" },
+                "failure_code": { "enum": ["insufficient_disk", "digest_mismatch"] }, "copy_absent": { "type": "boolean" }
+              }
+            }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Exact receipt accepted or replayed; logical Backup publication and unchanged-intent resume are atomic. backup is omitted for a positively absent ENOSPC or digest-mismatch failure.", "content": { "application/json": { "schema": { "type": "object", "required": ["computer"], "properties": { "backup": { "$ref": "./common.v1.json#/components/schemas/Backup" }, "computer": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/agent/computers/{computer_id}/backup-prune-acknowledgement": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "acknowledgeComputerBackupPrune",
+        "summary": "Attest positive absence of one managed Backup copy",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
+          "properties": {
+            "node_id": { "type": "string", "minLength": 1 }, "boot_session_id": { "type": "string", "minLength": 1 }, "idempotency_key": { "type": "string", "minLength": 1 },
+            "receipt": {
+              "type": "object", "additionalProperties": false,
+              "required": ["kind", "receipt_id", "backup_id", "copy_id", "computer_id", "storage_id", "storage_generation", "node_id", "root_instance_id", "operation_revision", "cleanup_fence", "helper_generation", "absent"],
+              "properties": {
+                "kind": { "const": "computer_backup_copy_removed" }, "receipt_id": { "type": "string", "minLength": 1 },
+                "backup_id": { "type": "string", "minLength": 1 }, "copy_id": { "type": "string", "minLength": 1 }, "computer_id": { "type": "string", "minLength": 1 },
+                "storage_id": { "type": "string", "minLength": 1 }, "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+                "node_id": { "type": "string", "minLength": 1 }, "root_instance_id": { "type": "string", "minLength": 1 },
+                "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 }, "cleanup_fence": { "type": "string", "minLength": 1 },
+                "helper_generation": { "type": "integer", "minimum": 1 }, "absent": { "const": true }
+              }
+            }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Copy absence accepted; the logical Backup is retained as a pruned record.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Backup" } } } },
+          "204": { "description": "A create superseded by Computer removal had no logical Backup; its planned physical copy is positively absent." },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/agent/computers/{computer_id}/storage-reset-acknowledgement": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }

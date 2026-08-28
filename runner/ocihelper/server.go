@@ -1212,6 +1212,40 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		operation.monitorEOF()
 		response, err := engine.ResetComputerStorage(operation.ctx, body)
 		_ = writeEngineResponse(wire, response, err)
+	case MethodCreateBackup:
+		var body CreateComputerBackupRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if !validComputerBackupRequest(body.BackupID, body.CopyID, body.Storage, body.Authority, session, true) {
+			_ = writeFailure(wire, CodeInvalidRequest, "complete current-session Computer Backup authority is required")
+			return
+		}
+		engine, ok := server.engine.(ComputerBackupEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "Computer Backup is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.CreateComputerBackup(operation.ctx, body)
+		_ = writeEngineResponse(wire, response, err)
+	case MethodDeleteBackup:
+		var body DeleteComputerBackupCopyRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if !validComputerBackupRequest(body.BackupID, body.CopyID, body.Storage, body.Authority, session, false) {
+			_ = writeFailure(wire, CodeInvalidRequest, "complete current-session Backup copy removal authority is required")
+			return
+		}
+		engine, ok := server.engine.(ComputerBackupEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "Computer Backup removal is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.DeleteComputerBackupCopy(operation.ctx, body)
+		_ = writeEngineResponse(wire, response, err)
 	case MethodVerify:
 		var body VerifyRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1325,6 +1359,16 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 	default:
 		_ = writeFailure(wire, CodeUnsupportedOperation, "unknown OCI helper method")
 	}
+}
+
+func validComputerBackupRequest(backupID, copyID string, storage ComputerStorageReference, authority ComputerBackupAuthority, session *serverSession, requireJob bool) bool {
+	return strings.TrimSpace(backupID) != "" && strings.TrimSpace(copyID) != "" &&
+		storage.ComputerID != "" && storage.StorageID != "" && storage.StorageGeneration > 0 &&
+		storage.DiskBytes > 0 && storage.IntentRevision == authority.OperationRevision &&
+		authority.NodeID == session.identity.NodeID && authority.BootSessionID == session.identity.BootSessionID &&
+		authority.HelperGeneration == session.helper.SessionGeneration && authority.HelperGeneration > 0 &&
+		authority.RootInstanceID != "" && (!requireJob || authority.JobID != "") && authority.OperationRevision > 0 &&
+		authority.CleanupFence != ""
 }
 
 func validCurrentRemovalAuthority(removal ManagedVolumeRemovalAuthority, identity SessionIdentity) bool {
