@@ -335,6 +335,14 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	if outcome.err != nil {
 		lifecycle.log("attempt %s execution: %v", claim.Lease.AttemptID, outcome.err)
 	}
+	if cause := context.Cause(attemptContext); errors.Is(cause, errOCIIntentDisabled) {
+		// Node-local OCI stop is not a workload failure or a service restart.
+		// Runtime reap has completed above; withholding completion lets the lease
+		// expire back to the existing binding without consuming restart budget,
+		// changing the pinned digest, or latching the service failed.
+		<-renewalDone
+		return errorDestinationUnclassified, nil
+	}
 	request := l1.CompletionRequest{
 		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
 		Result: toL1Result(outcome.result), RuntimeQuiescenceEvidence: toL1QuiescenceEvidence(outcome.reapEvidence),

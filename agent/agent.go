@@ -507,6 +507,51 @@ func (a *Agent) RecoverOCIRuntimeCapabilities(ctx context.Context) error {
 	return err
 }
 
+// StopOCIRuntime suppresses OCI admission immediately and joins resident OCI
+// attempts through their ordinary publication-withdrawal and runtime-reap
+// lifecycle. It deliberately leaves process attempts and process admission
+// untouched.
+func (a *Agent) StopOCIRuntime(ctx context.Context) error {
+	if a == nil || a.session == nil {
+		return errors.New("agent: OCI runtime control is unavailable")
+	}
+	return a.session.stopOCIRuntime(ctx)
+}
+
+// OCIRuntimeLive reports the already-earned, locally current OCI state used
+// to make an idempotent operator start a true no-op.
+func (a *Agent) OCIRuntimeLive() bool {
+	if a == nil || a.capabilities == nil {
+		return false
+	}
+	snapshot := a.capabilities.capabilitySnapshot()
+	if !snapshot.Capabilities[contract.JobKindOCI] && !snapshot.Capabilities["kind:oci"] {
+		return false
+	}
+	return a.session == nil || a.session.ociBootBarrier == nil || a.session.ociBootBarrier.Ready()
+}
+
+func (a *Agent) SuppressOCIRuntime(reason contract.CapabilityReasonCode, err error) {
+	if a != nil && a.capabilities != nil {
+		a.capabilities.suppressOCI(reason, err)
+	}
+}
+
+func (a *Agent) LiveOCIAttempts() int {
+	if a == nil || a.session == nil {
+		return 0
+	}
+	a.session.claimMu.Lock()
+	defer a.session.claimMu.Unlock()
+	count := 0
+	for _, kind := range a.session.residentKind {
+		if kind == contract.JobKindOCI {
+			count++
+		}
+	}
+	return count
+}
+
 // OCISweepReceipt returns a defensive copy of the currently pinned verified
 // sweep proof for runtime adapters and removal validation.
 func (a *Agent) OCISweepReceipt() (ocihelper.VerifiedSweepReceipt, bool) {

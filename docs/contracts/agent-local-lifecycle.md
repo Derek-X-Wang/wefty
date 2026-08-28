@@ -140,6 +140,52 @@ The writer checks for content changes and polls no faster than 20 seconds. It
 never contains a raw command error, path detail,
 environment dump, credential, or opaque helper session capability.
 
+## Durable OCI intent and node-local control
+
+The versioned OCI intent marker is the node-local operator decision, separate
+from L1 `claims_enabled` and Capability revision. Missing, unreadable, malformed,
+or zero-revision state is disabled. `setup-oci` creates revision 1 enabled only
+when the marker has never existed; every rerun preserves an existing disabled
+marker exactly. `oci start` and `oci stop` compare-and-swap the revision and
+fsync the replacement and its parent directory before any runtime effect.
+`setup-oci` is configure-only: it checks every prerequisite before mutation,
+writes the requested configuration/template or Linux units, and reports the
+resulting convergence class without recovering or starting OCI. The sole
+runtime exception is an explicit restart/recreate flag with zero live OCI
+attempts; `wefty node oci start` remains the ordinary start operation.
+
+Singular `wefty node` commands resolve the installed node configuration before
+Fabric initialization and use only the live agent's Unix control socket. Its
+private runtime directory is `0700`, its socket is `0600`, an active socket is never replaced,
+and a symlink or non-socket path fails closed. The server authenticates every
+accepted peer with `SO_PEERCRED` on Linux or `LOCAL_PEERCRED` on macOS and
+allows only the installed operator UID. Process-kind payloads currently share
+that UID with the agent; #220 owns the required payload UID isolation and this
+known pre-existing limitation grants no additional control authority. The agent is the sole writer of
+intent and runtime state. `load-image` streams an OCI archive through this
+surface to the existing helper-owned import/cache seam; it accepts no mutable
+reference override and returns only verified top-level and admitted-platform
+digests plus bounded evidence.
+
+Stop ordering is durable disable → restrictive local Capability observation →
+published-service withdrawal → attempt reap and positive runtime quiescence →
+Mac Lima stop. Durable disable and restrictive local admission prevent recovery
+during quiescence; only after positive reap receipts does the Mac path acquire
+the shared recovery-cycle lock for the VM stop. This avoids a lock inversion
+with attempt finalization while preventing the background watchdog from racing
+the final VM transition. Linux leaves containerd running. A failed
+post-persistence action never rolls the intent bit back. Start persists enabled,
+reacquires the helper, completes the boot barrier and probe, and only then
+publishes the positive Capability revision.
+
+Linux privileged `setup-oci` renders and writes one unprivileged `wefty-agent.service` with
+`SupplementaryGroups=wefty-oci` and one root socket-activated helper pair. The
+socket is exactly `0660 root:wefty-oci`; the helper UID allowlist names only the
+agent user. Setup creates the group, adds the user, writes installed node
+configuration, and prints the exact `systemctl` commands the operator runs; it
+never executes those commands itself. A newly added membership prints one
+agent restart, while an already-member rerun prints an idempotent start.
+
 ## Workload runtime selection
 
 The agent selects exactly one `WorkloadRuntime` by the job's open `kind` after

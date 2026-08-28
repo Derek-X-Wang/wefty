@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -35,8 +36,15 @@ type Sizing struct {
 	Disk   string
 }
 
-// SizingFlags provides the exact setup-facing flags without implementing the
-// setup/convergence command owned by Ticket #153.
+func (sizing Sizing) Validate() error {
+	if !limaSizePattern.MatchString(sizing.Memory) || !limaSizePattern.MatchString(sizing.Disk) || sizing.CPUs <= 0 {
+		return errors.New("Lima sizing requires positive CPUs and explicit memory/disk byte quantities")
+	}
+	return nil
+}
+
+// SizingFlags provides the exact setup-facing flags consumed by the
+// node-local setup/convergence command.
 type SizingFlags struct {
 	memory string
 	cpus   int
@@ -56,8 +64,8 @@ func (values *SizingFlags) Sizing() (Sizing, error) {
 		return Sizing{}, errors.New("Lima sizing flags are unavailable")
 	}
 	sizing := Sizing{Memory: values.memory, CPUs: values.cpus, Disk: values.disk}
-	if !limaSizePattern.MatchString(sizing.Memory) || !limaSizePattern.MatchString(sizing.Disk) || sizing.CPUs <= 0 {
-		return Sizing{}, errors.New("Lima sizing flags require positive CPUs and explicit memory/disk byte quantities")
+	if err := sizing.Validate(); err != nil {
+		return Sizing{}, err
 	}
 	return sizing, nil
 }
@@ -83,6 +91,14 @@ func DefaultSizing(hostMemoryBytes int64, logicalCPUs int) (Sizing, error) {
 	return Sizing{Memory: fmt.Sprintf("%dMiB", memory>>20), CPUs: cpus, Disk: DefaultDisk}, nil
 }
 
+func HostDefaultSizing() (Sizing, error) {
+	memory, err := hostPhysicalMemoryBytes()
+	if err != nil {
+		return Sizing{}, err
+	}
+	return DefaultSizing(memory, runtime.NumCPU())
+}
+
 // TemplateConfig is the complete Ticket #145 Lima transport configuration.
 // Helper installation and boot supervision remain owned by later tickets.
 type TemplateConfig struct {
@@ -94,11 +110,8 @@ func (config TemplateConfig) validate() error {
 	if runtime.GOOS == "windows" {
 		return errors.New("Lima templates are unavailable on Windows")
 	}
-	if !limaSizePattern.MatchString(config.Sizing.Memory) || !limaSizePattern.MatchString(config.Sizing.Disk) {
-		return errors.New("Lima memory and disk sizes must be explicit IEC/SI byte quantities")
-	}
-	if config.Sizing.CPUs <= 0 {
-		return errors.New("Lima CPU count must be positive")
+	if err := config.Sizing.Validate(); err != nil {
+		return err
 	}
 	if !filepath.IsAbs(config.HostAllowedMountRoot) || filepath.Clean(config.HostAllowedMountRoot) == string(filepath.Separator) {
 		return errors.New("Lima allowed mount root must be an absolute non-root path")
@@ -153,6 +166,41 @@ portForwards:
 `, config.Sizing.CPUs, quote(config.Sizing.Memory), quote(config.Sizing.Disk),
 		quote(filepath.Clean(config.HostAllowedMountRoot)), quote(GuestAllowedMountRoot), quote(GuestHelperSocket), HostHelperSocketName)
 	return []byte(template), nil
+}
+
+func WriteTemplate(path string, config TemplateConfig) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("Lima template path must be absolute")
+	}
+	payload, err := RenderTemplate(config)
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".wefty-lima-template-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(payload); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
 }
 
 // HelperSocketPath is the operator-owned 0700 instance socket directory used
