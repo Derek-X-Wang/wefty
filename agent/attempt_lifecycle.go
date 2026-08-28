@@ -796,7 +796,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	}
 	var err error
 	var bridge *workflowBridge
-	if lifecycle.dependencies.workflowBridge != nil && claim.Job.Spec.Class == contract.JobClassOneShot {
+	if lifecycle.dependencies.workflowBridge != nil && needsAttemptBridge(claim.Job.Spec.Class, executionSpec) {
 		bridge, err = lifecycle.dependencies.workflowBridge(ctx, claim.Job.Spec.Kind, executionSpec)
 		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, err), err)
@@ -857,7 +857,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		result, runErr = runComputerService(ctx, runtimeAdapter, request, sink, computerServiceConfig{
 			clock: lifecycle.dependencies.clock, fabric: lifecycle.dependencies.fabric,
 			authorizer: lifecycle.dependencies.computerPolicy, auditor: lifecycle.dependencies.client,
-			computerTokens: lifecycle.dependencies.computerTokens,
+			computerTokens: lifecycle.dependencies.computerTokens, computerBridge: bridge,
 			submission: ComputerSubmissionAuthority{ComputerID: claim.ComputerStorage.ComputerID,
 				Enabled: claim.ComputerStorage.SubmitEnabled, SubmitIntentRevision: claim.ComputerStorage.SubmitIntentRevision,
 				SubmitMaxInflight: claim.ComputerStorage.SubmitMaxInflight, SubmitPolicyRevision: claim.ComputerStorage.SubmitPolicyRevision},
@@ -904,6 +904,10 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		result, runErr = runtimeResult.Outcome, err
 	}
 	return finish(result, runErr)
+}
+
+func needsAttemptBridge(class string, execution contract.ExecutionSpec) bool {
+	return class == contract.JobClassOneShot || (class == contract.JobClassService && contract.IsComputerExecution(execution))
 }
 
 // withoutComputerReservedOperatorEnvironment removes every tenant-supplied

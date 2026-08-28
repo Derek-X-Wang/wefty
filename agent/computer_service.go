@@ -24,6 +24,7 @@ type computerServiceConfig struct {
 	authorizer     *ComputerPolicyCache
 	auditor        computerTakeoverAuditor
 	computerTokens ComputerTokenMinter
+	computerBridge *workflowBridge
 	submission     ComputerSubmissionAuthority
 	computerID     string
 	jobID          string
@@ -163,7 +164,7 @@ func runComputerService(
 			case <-runtimeStarted:
 			}
 			tokenSyncErrors <- syncComputerTokenFile(runContext, controlRuntime, request.Authority,
-				config.computerTokens, config.computerID, config.attemptID, config.submission, initial, updates)
+				clock, config.computerTokens, config.computerBridge, config.computerID, config.attemptID, config.submission, initial, updates)
 		}()
 	}
 	defer stopTokenSync()
@@ -245,7 +246,9 @@ func syncComputerTokenFile(
 	ctx context.Context,
 	runtime workloadrunner.OCIComputerControlRuntime,
 	authority workloadrunner.AttemptAuthority,
+	clock Clock,
 	minter ComputerTokenMinter,
+	bridge *workflowBridge,
 	computerID, attemptID string,
 	last ComputerSubmissionAuthority,
 	initial ComputerSubmissionAuthority,
@@ -256,6 +259,7 @@ func syncComputerTokenFile(
 			next.SubmitMaxInflight == last.SubmitMaxInflight {
 			return nil
 		}
+		bridge.setReachable(false)
 		if err := runtime.SetComputerToken(ctx, authority, ""); err != nil {
 			return fmt.Errorf("remove superseded Computer token file: %w", err)
 		}
@@ -270,12 +274,12 @@ func syncComputerTokenFile(
 			if err == nil {
 				break
 			}
-			timer := time.NewTimer(time.Duration(attempt+1) * 100 * time.Millisecond)
+			timer := clock.NewTimer(time.Duration(attempt+1) * 100 * time.Millisecond)
 			select {
 			case <-ctx.Done():
-				timer.Stop()
+				stopTimer(timer)
 				return nil
-			case <-timer.C:
+			case <-timer.C():
 			}
 		}
 		if err != nil {
@@ -288,6 +292,7 @@ func syncComputerTokenFile(
 		if err := runtime.SetComputerToken(ctx, authority, grant.Token); err != nil {
 			return fmt.Errorf("publish re-minted Computer token file: %w", err)
 		}
+		bridge.setReachable(true)
 		return nil
 	}
 	if err := apply(initial); err != nil {

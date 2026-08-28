@@ -32,8 +32,8 @@ func TestComputerSubmissionPolicyChangeRotatesAttemptTokenFile(t *testing.T) {
 	done := make(chan error, 1)
 	disabled := ComputerSubmissionAuthority{ComputerID: "computer-1", SubmitIntentRevision: 1, SubmitMaxInflight: 7}
 	go func() {
-		done <- syncComputerTokenFile(ctx, runtime, workloadrunner.AttemptAuthority{}, minter,
-			"computer-1", "attempt-1", disabled, disabled, updates)
+		done <- syncComputerTokenFile(ctx, runtime, workloadrunner.AttemptAuthority{}, systemClock{}, minter,
+			nil, "computer-1", "attempt-1", disabled, disabled, updates)
 	}()
 	updates <- ComputerSubmissionAuthority{ComputerID: "computer-1", Enabled: true, SubmitIntentRevision: 2, SubmitMaxInflight: 7}
 	assertTokenFileWrite(t, runtime.writes, "")
