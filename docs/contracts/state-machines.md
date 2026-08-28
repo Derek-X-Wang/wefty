@@ -177,29 +177,51 @@ collection but remain addressable evidence.
 
 ### Person identity and administrator policy
 
-Fabric WhoIs projects opaque stable `UserID` and `DeviceID` into wefty-owned
-types. Administrator membership is keyed only by `UserID`, so a login or
+Fabric WhoIs projects opaque stable `UserID`, `DeviceID`, and issuing
+`FabricID` into wefty-owned types. Administrator membership is keyed by
+`(FabricID, UserID)`, so repointing an L1 deployment to a different Fabric
+issuer cannot silently reinterpret existing authority. A login or
 display-name change cannot alter authority and two devices for one person share
 membership while retaining distinct device evidence. No display value, network
 hostname, or device ID is accepted as a person-policy key.
+
+A Fabric identity also records whether the peer is a machine principal.
+Machine principals, including identities carrying configured client or agent
+principal tags, are never persons even when their network provider reports an
+enrolling user. Plain Fabric person identities are self-asserted development
+data: L1 refuses person routes unless the operator explicitly enables
+`-allow-plain-person-identities`, and they must never be treated as production
+admin authority.
 
 The admin policy begins at revision zero with no administrators. The first
 administrator can be installed only by consuming a short-lived challenge that
 was initiated through local access to the L1 database; there is no network
 initiation route. The challenge is stored hashed, replacement invalidates the
 prior challenge, expiry denies redemption, and the first successful redemption
-permanently closes bootstrap. Fabric WhoIs supplies both the actor UserID and
-DeviceID at redemption; request data cannot supply either.
+closes bootstrap for that authority generation. The challenge is also bound to
+an L1 deployment identity stored separately from the database and to the
+authority generation, so a database copy cannot redeem a live nonce minted by
+another deployment. Restoring a pre-bootstrap database reopens bootstrap on
+that copy; this is inherent because the copy has no established administrator.
+Fabric WhoIs supplies the actor FabricID, UserID, and DeviceID at redemption;
+request data cannot supply them.
 
 Every later add or remove requires a current administrator and the exact
 observed policy revision. A stale revision, nonadministrator caller, missing
 member, duplicate member, or attempted final-admin removal changes no row.
-Each accepted bootstrap/add/remove advances the policy revision exactly once
-and commits the membership change plus one immutable audit row in the same
+Membership is limited to 32 administrators. Nonadministrators may read only
+the current revision; the roster and audit stream require current admin
+authority. A local database-access-gated reset clears an unusable roster,
+advances the authority generation, reopens bootstrap, and records an immutable
+local-operator audit row with no fabricated person actor or subject.
+
+Each accepted bootstrap/add/remove/reset advances the policy revision exactly
+once and commits the membership change plus one immutable audit row in the same
 transaction. Audit retains revision, operation, actor UserID, actor DeviceID,
-subject UserID, and L1 time; current membership remains bounded and person
-based. Per-Computer grants, Node distribution, endpoint admission, live
-revocation, and control arbitration are separate later contracts.
+issuing Fabric IDs, subject UserID, actor kind, and L1 time; current membership
+remains bounded and person based. Per-Computer grants, Node distribution,
+endpoint admission, live revocation, and control arbitration are separate later
+contracts.
 
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:

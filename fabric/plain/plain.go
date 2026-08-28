@@ -3,7 +3,9 @@ package plain
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,9 +20,10 @@ import (
 // Network isolates logical names and injected identities for a set of plain
 // Fabric instances. Tests should create a fresh Network to avoid shared state.
 type Network struct {
-	mu    sync.RWMutex
-	names map[string]string
-	peers map[string]fabric.Identity
+	mu       sync.RWMutex
+	names    map[string]string
+	peers    map[string]fabric.Identity
+	fabricID string
 }
 
 const (
@@ -30,9 +33,14 @@ const (
 
 // NewNetwork creates an isolated localhost fabric network.
 func NewNetwork() *Network {
+	identity := make([]byte, 32)
+	if _, err := rand.Read(identity); err != nil {
+		panic(fmt.Sprintf("plain fabric: generate network identity: %v", err))
+	}
 	return &Network{
-		names: make(map[string]string),
-		peers: make(map[string]fabric.Identity),
+		names:    make(map[string]string),
+		peers:    make(map[string]fabric.Identity),
+		fabricID: "plain-" + hex.EncodeToString(identity),
 	}
 }
 
@@ -116,7 +124,15 @@ func (f *Fabric) WhoIs(_ context.Context, remoteAddress string) (fabric.Identity
 		return fabric.Identity{}, fmt.Errorf("plain fabric: identity for %q: %w", remoteAddress, fabric.ErrIdentityNotFound)
 	}
 	identity.Tags = append([]string(nil), identity.Tags...)
+	identity.FabricID = f.network.fabricID
 	return identity, nil
+}
+
+// PersonIdentityTrust reports that plain identities are peer-supplied test/dev
+// data and must never be accepted for person authority without an explicit
+// development override at the server.
+func (f *Fabric) PersonIdentityTrust() fabric.PersonIdentityTrust {
+	return fabric.PersonIdentitySelfAsserted
 }
 
 // ConnectHost returns the loopback host backing published listeners in the
@@ -145,6 +161,7 @@ func (n *Network) resolveName(name string) (string, error) {
 
 func (n *Network) registerPeer(address string, identity fabric.Identity) {
 	identity.Tags = append([]string(nil), identity.Tags...)
+	identity.FabricID = n.fabricID
 	n.mu.Lock()
 	n.peers[address] = identity
 	n.mu.Unlock()

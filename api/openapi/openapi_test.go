@@ -161,8 +161,13 @@ func TestL1ClientPublishesPersonAdminBootstrapSurface(t *testing.T) {
 	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
 	policy := object(t, schemas["AdminPolicy"], "AdminPolicy")
 	required := stringSet(t, policy["required"])
-	if !required["revision"] || !required["admins"] {
+	if !required["revision"] || required["admins"] {
 		t.Fatalf("AdminPolicy required fields = %#v", required)
+	}
+	properties := object(t, policy["properties"], "AdminPolicy.properties")
+	admins := object(t, properties["admins"], "AdminPolicy.admins")
+	if admins["maxItems"] != float64(32) {
+		t.Fatalf("AdminPolicy.admins maxItems = %#v, want 32", admins["maxItems"])
 	}
 	adminPath := object(t, paths["/v1/admin-policy/admins/{user_id}"], "admin mutation path")
 	for _, method := range []string{"put", "delete"} {

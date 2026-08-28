@@ -64,6 +64,15 @@ func newIntegrationHarnessWithPolicies(t *testing.T, policies map[string]NodePol
 }
 
 func newIntegrationHarnessWithOptions(t *testing.T, options StoreOptions, policies map[string]NodePolicy) *integrationHarness {
+	return newIntegrationHarnessWithPersonIdentityMode(t, options, policies, true)
+}
+
+func newIntegrationHarnessWithPersonIdentityMode(
+	t *testing.T,
+	options StoreOptions,
+	policies map[string]NodePolicy,
+	allowSelfAsserted bool,
+) *integrationHarness {
 	t.Helper()
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
@@ -76,7 +85,9 @@ func newIntegrationHarnessWithOptions(t *testing.T, options StoreOptions, polici
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewServer(serverFabric, store, ServerConfig{NodePolicies: policies})
+	server, err := NewServer(serverFabric, store, ServerConfig{
+		NodePolicies: policies, AllowSelfAssertedPersonIdentities: allowSelfAsserted,
+	})
 	if err != nil {
 		store.Close()
 		t.Fatal(err)

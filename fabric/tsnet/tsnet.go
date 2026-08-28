@@ -5,6 +5,7 @@ package tsnet
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -32,11 +33,13 @@ type Config struct {
 
 // Fabric is an embedded production fabric node.
 type Fabric struct {
-	server    *tailscaletsnet.Server
-	localName naming.Name
+	server         *tailscaletsnet.Server
+	localName      naming.Name
+	coordinatorURL string
 
 	clientMu sync.Mutex
 	client   *local.Client
+	fabricID string
 }
 
 // New creates a tsnet-backed Fabric without starting it. The first Listen,
@@ -50,7 +53,8 @@ func New(config Config) (*Fabric, error) {
 		return nil, fmt.Errorf("tsnet fabric: Name %q is not a wefty logical name", config.Name)
 	}
 	return &Fabric{
-		localName: name,
+		localName:      name,
+		coordinatorURL: config.CoordinatorURL,
 		server: &tailscaletsnet.Server{
 			Dir:        config.StateDir,
 			Hostname:   name.Hostname(),
@@ -108,7 +112,16 @@ func (f *Fabric) WhoIs(ctx context.Context, remoteAddress string) (fabric.Identi
 		}
 		return fabric.Identity{}, err
 	}
-	return identityFromWhoIs(who)
+	fabricID, err := f.issuingFabricID(ctx, client)
+	if err != nil {
+		return fabric.Identity{}, err
+	}
+	return identityFromWhoIs(who, fabricID)
+}
+
+// PersonIdentityTrust reports that WhoIs authenticates person identity.
+func (f *Fabric) PersonIdentityTrust() fabric.PersonIdentityTrust {
+	return fabric.PersonIdentityAuthenticated
 }
 
 // ConnectHost returns the private tailnet hostname owned by this Fabric
@@ -129,18 +142,51 @@ func (f *Fabric) localClient() (*local.Client, error) {
 	return client, nil
 }
 
-func identityFromWhoIs(who *apitype.WhoIsResponse) (fabric.Identity, error) {
-	if who == nil || who.Node == nil || who.UserProfile == nil ||
-		who.Node.StableID == "" || who.UserProfile.ID == 0 {
+func (f *Fabric) issuingFabricID(ctx context.Context, client *local.Client) (string, error) {
+	f.clientMu.Lock()
+	defer f.clientMu.Unlock()
+	if f.fabricID != "" {
+		return f.fabricID, nil
+	}
+	status, err := client.Status(ctx)
+	if err != nil {
+		return "", fmt.Errorf("tsnet fabric: read issuing Fabric identity: %w", err)
+	}
+	if status.CurrentTailnet == nil || status.CurrentTailnet.MagicDNSSuffix == "" {
+		return "", errors.New("tsnet fabric: issuing Fabric identity is unavailable")
+	}
+	f.fabricID = coordinatorFabricID(f.coordinatorURL, status.CurrentTailnet.MagicDNSSuffix)
+	return f.fabricID, nil
+}
+
+func identityFromWhoIs(who *apitype.WhoIsResponse, fabricID string) (fabric.Identity, error) {
+	if who == nil || who.Node == nil || who.Node.StableID == "" {
 		return fabric.Identity{}, errors.New("tsnet fabric: WhoIs returned an incomplete identity")
 	}
-	return fabric.Identity{
-		NodeID:      string(who.Node.StableID),
-		UserID:      strconv.FormatInt(int64(who.UserProfile.ID), 10),
-		DeviceID:    string(who.Node.StableID),
-		DisplayName: who.UserProfile.DisplayName,
-		Tags:        append([]string(nil), who.Node.Tags...),
-	}, nil
+	identity := fabric.Identity{
+		NodeID:   string(who.Node.StableID),
+		DeviceID: string(who.Node.StableID),
+		FabricID: fabricID,
+		Tags:     append([]string(nil), who.Node.Tags...),
+	}
+	if who.Node.IsTagged() {
+		identity.Kind = fabric.IdentityKindMachine
+		return identity, nil
+	}
+	if who.UserProfile == nil || who.UserProfile.ID == 0 {
+		return fabric.Identity{}, errors.New("tsnet fabric: WhoIs returned an incomplete identity")
+	}
+	identity.UserID = strconv.FormatInt(int64(who.UserProfile.ID), 10)
+	identity.DisplayName = who.UserProfile.DisplayName
+	return identity, nil
+}
+
+func coordinatorFabricID(coordinatorURL, identityDomain string) string {
+	if coordinatorURL == "" {
+		coordinatorURL = "wefty-default-coordinator"
+	}
+	digest := sha256.Sum256([]byte(coordinatorURL + "\x00" + identityDomain))
+	return fmt.Sprintf("fabric-%x", digest[:])
 }
 
 // Close shuts down the embedded node and its listeners.

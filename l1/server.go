@@ -22,10 +22,11 @@ import (
 const MaxRequestBodyBytes = 1 << 20
 
 type ServerConfig struct {
-	ClientPrincipalTag string
-	AgentPrincipalTag  string
-	NodePolicies       map[string]NodePolicy
-	ReconcileInterval  time.Duration
+	ClientPrincipalTag                string
+	AgentPrincipalTag                 string
+	NodePolicies                      map[string]NodePolicy
+	ReconcileInterval                 time.Duration
+	AllowSelfAssertedPersonIdentities bool
 }
 
 // NodePolicy is authoritative control-plane configuration for one stable node.
@@ -55,13 +56,14 @@ func (s *Server) effectiveNodePolicy(nodeID string) (NodePolicy, bool) {
 // Fabric identity tags select the protocol principal; configured node policy
 // controls job eligibility and class-scoped admission.
 type Server struct {
-	fabric             fabric.Fabric
-	store              *Store
-	clientPrincipalTag string
-	agentPrincipalTag  string
-	nodePolicies       map[string]NodePolicy
-	reconcileInterval  time.Duration
-	handler            http.Handler
+	fabric                fabric.Fabric
+	store                 *Store
+	clientPrincipalTag    string
+	agentPrincipalTag     string
+	nodePolicies          map[string]NodePolicy
+	reconcileInterval     time.Duration
+	allowPersonIdentities bool
+	handler               http.Handler
 }
 
 func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, error) {
@@ -94,11 +96,17 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	s := &Server{
 		fabric: f, store: store,
 		clientPrincipalTag: clientTag, agentPrincipalTag: agentTag,
-		nodePolicies:      nodePolicies,
-		reconcileInterval: reconcileInterval,
+		nodePolicies:          nodePolicies,
+		reconcileInterval:     reconcileInterval,
+		allowPersonIdentities: personIdentitiesAllowed(f, config.AllowSelfAssertedPersonIdentities),
 	}
 	s.handler = s.routes()
 	return s, nil
+}
+
+func personIdentitiesAllowed(f fabric.Fabric, allowSelfAsserted bool) bool {
+	provider, ok := f.(fabric.PersonIdentityTrustProvider)
+	return ok && (provider.PersonIdentityTrust() == fabric.PersonIdentityAuthenticated || allowSelfAsserted)
 }
 
 func normalizePrincipalTag(tag, fallback string) string {
@@ -325,6 +333,18 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 			return
 		}
 		if principal == personPrincipal {
+			if !s.allowPersonIdentities {
+				writeError(w, protocolError(contract.ErrorPrincipalForbidden,
+					"this Fabric does not authenticate person identities"))
+				return
+			}
+			tags := NormalizeTags(identity.Tags)
+			if identity.Kind == fabric.IdentityKindMachine ||
+				slices.Contains(tags, s.clientPrincipalTag) || slices.Contains(tags, s.agentPrincipalTag) {
+				writeError(w, protocolError(contract.ErrorPrincipalForbidden,
+					"machine principals cannot use person protocols"))
+				return
+			}
 			if err := validatePersonIdentity(identity); err != nil {
 				writeError(w, err)
 				return
@@ -364,7 +384,7 @@ func (s *Server) bootstrapAdmin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getAdminPolicy(w http.ResponseWriter, r *http.Request) {
-	policy, err := s.store.GetAdminPolicy(r.Context())
+	policy, err := s.store.GetVisibleAdminPolicy(r.Context(), identityFromRequest(r))
 	if err != nil {
 		writeError(w, err)
 		return

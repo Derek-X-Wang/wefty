@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -60,6 +61,7 @@ type Store struct {
 	serviceLogRetentionAge       time.Duration
 	prestartInfrastructureBudget time.Duration
 	adminBootstrapTTL            time.Duration
+	deploymentID                 string
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
@@ -125,6 +127,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if adminBootstrapTTL == 0 {
 		adminBootstrapTTL = DefaultAdminBootstrapTTL
 	}
+	deploymentID, err := loadOrCreateDeploymentID(path)
+	if err != nil {
+		return nil, err
+	}
 
 	query := make(url.Values)
 	query.Add("_pragma", "busy_timeout(5000)")
@@ -143,12 +149,50 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
 		prestartInfrastructureBudget: prestartInfrastructureBudget,
 		adminBootstrapTTL:            adminBootstrapTTL,
+		deploymentID:                 deploymentID,
 	}
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return store, nil
+}
+
+func loadOrCreateDeploymentID(databasePath string) (string, error) {
+	path := databasePath + ".authority-instance"
+	value := make([]byte, 32)
+	if _, err := rand.Read(value); err != nil {
+		return "", fmt.Errorf("l1: generate authority instance identity: %w", err)
+	}
+	generated := hex.EncodeToString(value)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err == nil {
+		if _, err := file.WriteString(generated); err != nil {
+			_ = file.Close()
+			return "", fmt.Errorf("l1: write authority instance identity: %w", err)
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			return "", fmt.Errorf("l1: sync authority instance identity: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			return "", fmt.Errorf("l1: close authority instance identity: %w", err)
+		}
+		return generated, nil
+	}
+	if !errors.Is(err, os.ErrExist) {
+		return "", fmt.Errorf("l1: create authority instance identity: %w", err)
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("l1: read authority instance identity: %w", err)
+	}
+	identity := strings.TrimSpace(string(payload))
+	decoded, err := hex.DecodeString(identity)
+	if err != nil || len(decoded) != 32 {
+		return "", fmt.Errorf("l1: authority instance identity is invalid")
+	}
+	return identity, nil
 }
 
 func (s *Store) initialize(ctx context.Context) error {
@@ -342,25 +386,38 @@ CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_reset_active
 CREATE TABLE IF NOT EXISTS admin_policy (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   revision INTEGER NOT NULL CHECK(revision >= 0),
+  bootstrap_open INTEGER NOT NULL DEFAULT 1 CHECK(bootstrap_open IN (0, 1)),
+  authority_generation INTEGER NOT NULL DEFAULT 1 CHECK(authority_generation > 0),
   updated_ns INTEGER NOT NULL CHECK(updated_ns >= 0)
 );
-INSERT OR IGNORE INTO admin_policy(singleton, revision, updated_ns) VALUES(1, 0, 0);
+INSERT OR IGNORE INTO admin_policy(singleton, revision, bootstrap_open, authority_generation, updated_ns)
+VALUES(1, 0, 1, 1, 0);
 CREATE TABLE IF NOT EXISTS admins (
-  user_id TEXT PRIMARY KEY,
+  fabric_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
   added_revision INTEGER NOT NULL CHECK(added_revision > 0),
-  added_ns INTEGER NOT NULL
+  added_ns INTEGER NOT NULL,
+  PRIMARY KEY(fabric_id, user_id)
 );
+CREATE TRIGGER IF NOT EXISTS admins_bounded_before_insert
+BEFORE INSERT ON admins WHEN (SELECT COUNT(*) FROM admins) >= 32
+BEGIN SELECT RAISE(ABORT, 'admin policy limit reached'); END;
 CREATE TABLE IF NOT EXISTS admin_policy_audit (
   revision INTEGER PRIMARY KEY CHECK(revision > 0),
-  operation TEXT NOT NULL CHECK(operation IN ('bootstrap', 'add', 'remove')),
+  operation TEXT NOT NULL CHECK(operation IN ('bootstrap', 'add', 'remove', 'reset')),
+  actor_kind TEXT NOT NULL CHECK(actor_kind IN ('fabric_person', 'local_operator')),
+  actor_fabric_id TEXT NOT NULL,
   actor_user_id TEXT NOT NULL,
   actor_device_id TEXT NOT NULL,
+  subject_fabric_id TEXT NOT NULL,
   subject_user_id TEXT NOT NULL,
   created_ns INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS admin_bootstrap_challenges (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   nonce_hash TEXT NOT NULL UNIQUE,
+  deployment_hash TEXT NOT NULL,
+  authority_generation INTEGER NOT NULL CHECK(authority_generation > 0),
   created_ns INTEGER NOT NULL,
   expires_ns INTEGER NOT NULL CHECK(expires_ns > created_ns)
 );
@@ -2627,6 +2684,7 @@ func markPortlessServiceStable(ctx context.Context, tx *sql.Tx, jobID string, no
 
 type queryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
 func getJobByDispatchKey(ctx context.Context, q queryer, dispatchKey string, now time.Time) (Job, string, error) {

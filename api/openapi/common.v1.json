@@ -132,16 +132,19 @@
       "AdminPolicy": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["revision", "admins"],
+        "required": ["revision"],
         "properties": {
           "revision": { "type": "integer", "minimum": 0 },
           "admins": {
             "type": "array",
+            "maxItems": 32,
+            "description": "Present only for a current administrator.",
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["user_id", "added_revision", "added_at"],
+              "required": ["fabric_id", "user_id", "added_revision", "added_at"],
               "properties": {
+                "fabric_id": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "user_id": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "added_revision": { "type": "integer", "minimum": 1 },
                 "added_at": { "type": "string", "format": "date-time" }
@@ -149,18 +152,21 @@
             }
           }
         },
-        "description": "Current person-based administrator policy. Device identity is audit evidence, never membership."
+        "description": "Current bounded person-based administrator policy. Membership is scoped to the issuing Fabric; device identity is audit evidence, never membership."
       },
       "AdminPolicyAudit": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["revision", "operation", "actor_user_id", "actor_device_id", "subject_user_id", "created_at"],
+        "required": ["revision", "operation", "actor_kind", "actor_fabric_id", "actor_user_id", "actor_device_id", "subject_fabric_id", "subject_user_id", "created_at"],
         "properties": {
           "revision": { "type": "integer", "minimum": 1 },
-          "operation": { "enum": ["bootstrap", "add", "remove"] },
-          "actor_user_id": { "type": "string", "minLength": 1 },
-          "actor_device_id": { "type": "string", "minLength": 1 },
-          "subject_user_id": { "type": "string", "minLength": 1 },
+          "operation": { "enum": ["bootstrap", "add", "remove", "reset"] },
+          "actor_kind": { "enum": ["fabric_person", "local_operator"] },
+          "actor_fabric_id": { "type": "string" },
+          "actor_user_id": { "type": "string" },
+          "actor_device_id": { "type": "string" },
+          "subject_fabric_id": { "type": "string" },
+          "subject_user_id": { "type": "string" },
           "created_at": { "type": "string", "format": "date-time" }
         }
       },

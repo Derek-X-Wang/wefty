@@ -307,7 +307,7 @@
       "post": {
         "operationId": "bootstrapAdmin",
         "summary": "Consume a locally initiated challenge as the first administrator",
-        "description": "The challenge can be initiated only by a process with local L1 database access, is short-lived, stored hashed, and consumed once. The authenticated Fabric UserID becomes the administrator; DeviceID is retained only in audit.",
+        "description": "The challenge can be initiated only by a process with local L1 database access, is short-lived, stored hashed, bound to the L1 authority instance and generation, and consumed once. The authenticated Fabric UserID becomes the administrator; DeviceID is retained only in audit.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": {
@@ -331,6 +331,7 @@
       "get": {
         "operationId": "getAdminPolicy",
         "summary": "Read the current person-based administrator policy",
+        "description": "Every authenticated person receives the revision; only a current administrator receives the roster.",
         "responses": {
           "200": { "description": "Current bounded policy.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/AdminPolicy" } } } },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },

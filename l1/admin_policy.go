@@ -23,28 +23,41 @@ const (
 	AdminPolicyBootstrap AdminPolicyOperation = "bootstrap"
 	AdminPolicyAdd       AdminPolicyOperation = "add"
 	AdminPolicyRemove    AdminPolicyOperation = "remove"
+	AdminPolicyReset     AdminPolicyOperation = "reset"
+	MaxAdministrators                         = 32
+)
+
+type AdminPolicyActorKind string
+
+const (
+	AdminPolicyActorFabricPerson  AdminPolicyActorKind = "fabric_person"
+	AdminPolicyActorLocalOperator AdminPolicyActorKind = "local_operator"
 )
 
 // AdminPolicy is the bounded current person-based administrator policy.
 // Device evidence is deliberately retained only in immutable audit rows.
 type AdminPolicy struct {
 	Revision int64   `json:"revision"`
-	Admins   []Admin `json:"admins"`
+	Admins   []Admin `json:"admins,omitempty"`
 }
 
 type Admin struct {
+	FabricID      string    `json:"fabric_id"`
 	UserID        string    `json:"user_id"`
 	AddedRevision int64     `json:"added_revision"`
 	AddedAt       time.Time `json:"added_at"`
 }
 
 type AdminPolicyAudit struct {
-	Revision      int64                `json:"revision"`
-	Operation     AdminPolicyOperation `json:"operation"`
-	ActorUserID   string               `json:"actor_user_id"`
-	ActorDeviceID string               `json:"actor_device_id"`
-	SubjectUserID string               `json:"subject_user_id"`
-	CreatedAt     time.Time            `json:"created_at"`
+	Revision        int64                `json:"revision"`
+	Operation       AdminPolicyOperation `json:"operation"`
+	ActorKind       AdminPolicyActorKind `json:"actor_kind"`
+	ActorFabricID   string               `json:"actor_fabric_id"`
+	ActorUserID     string               `json:"actor_user_id"`
+	ActorDeviceID   string               `json:"actor_device_id"`
+	SubjectFabricID string               `json:"subject_fabric_id"`
+	SubjectUserID   string               `json:"subject_user_id"`
+	CreatedAt       time.Time            `json:"created_at"`
 }
 
 type AdminPolicyAuditList struct {
@@ -68,15 +81,17 @@ type AdminPolicyMutationRequest struct {
 }
 
 func validatePersonIdentity(identity fabric.Identity) error {
-	if strings.TrimSpace(identity.UserID) == "" || strings.TrimSpace(identity.DeviceID) == "" ||
+	if identity.Kind == fabric.IdentityKindMachine || strings.TrimSpace(identity.UserID) == "" ||
+		strings.TrimSpace(identity.DeviceID) == "" || strings.TrimSpace(identity.FabricID) == "" ||
 		identity.UserID != strings.TrimSpace(identity.UserID) ||
-		identity.DeviceID != strings.TrimSpace(identity.DeviceID) {
+		identity.DeviceID != strings.TrimSpace(identity.DeviceID) ||
+		identity.FabricID != strings.TrimSpace(identity.FabricID) {
 		return protocolError(contract.ErrorPersonIdentityRequired,
-			"fabric identity has no stable person and device IDs")
+			"fabric identity has no stable issuing Fabric, person, and device IDs")
 	}
-	if len(identity.UserID) > 255 || len(identity.DeviceID) > 255 {
+	if len(identity.UserID) > 255 || len(identity.DeviceID) > 255 || len(identity.FabricID) > 255 {
 		return protocolError(contract.ErrorPersonIdentityRequired,
-			"fabric person or device identity exceeds 255 bytes")
+			"fabric issuer, person, or device identity exceeds 255 bytes")
 	}
 	return nil
 }
@@ -89,8 +104,13 @@ func validateAdminUserID(userID string) (string, error) {
 	return userID, nil
 }
 
-func bootstrapNonceHash(nonce string) string {
-	sum := sha256.Sum256([]byte(nonce))
+func bootstrapNonceHash(nonce, deploymentID string, authorityGeneration int64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s", deploymentID, authorityGeneration, nonce)))
+	return hex.EncodeToString(sum[:])
+}
+
+func deploymentIDHash(deploymentID string) string {
+	sum := sha256.Sum256([]byte(deploymentID))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -110,20 +130,25 @@ func (s *Store) InitiateAdminBootstrap(ctx context.Context) (AdminBootstrapChall
 		return AdminBootstrapChallenge{}, internalError(err, "begin admin bootstrap initiation")
 	}
 	defer tx.Rollback()
-	var revision, adminCount int64
-	if err := tx.QueryRowContext(ctx, `SELECT revision, (SELECT COUNT(*) FROM admins)
-		FROM admin_policy WHERE singleton=1`).Scan(&revision, &adminCount); err != nil {
+	var bootstrapOpen bool
+	var authorityGeneration, adminCount int64
+	if err := tx.QueryRowContext(ctx, `SELECT bootstrap_open, authority_generation,
+		(SELECT COUNT(*) FROM admins) FROM admin_policy WHERE singleton=1`).
+		Scan(&bootstrapOpen, &authorityGeneration, &adminCount); err != nil {
 		return AdminBootstrapChallenge{}, internalError(err, "read admin bootstrap state")
 	}
-	if revision != 0 || adminCount != 0 {
+	if !bootstrapOpen || adminCount != 0 {
 		return AdminBootstrapChallenge{}, protocolError(contract.ErrorAdminBootstrapClosed,
-			"admin bootstrap is permanently closed")
+			"admin bootstrap is closed for the current authority generation")
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO admin_bootstrap_challenges(
-		singleton, nonce_hash, created_ns, expires_ns
-	) VALUES(1, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET
-		nonce_hash=excluded.nonce_hash, created_ns=excluded.created_ns, expires_ns=excluded.expires_ns`,
-		bootstrapNonceHash(nonce), now.UnixNano(), expiresAt.UnixNano()); err != nil {
+		singleton, nonce_hash, deployment_hash, authority_generation, created_ns, expires_ns
+	) VALUES(1, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET
+		nonce_hash=excluded.nonce_hash, deployment_hash=excluded.deployment_hash,
+		authority_generation=excluded.authority_generation,
+		created_ns=excluded.created_ns, expires_ns=excluded.expires_ns`,
+		bootstrapNonceHash(nonce, s.deploymentID, authorityGeneration), deploymentIDHash(s.deploymentID),
+		authorityGeneration, now.UnixNano(), expiresAt.UnixNano()); err != nil {
 		return AdminBootstrapChallenge{}, internalError(err, "store admin bootstrap challenge")
 	}
 	if err := tx.Commit(); err != nil {
@@ -148,18 +173,22 @@ func (s *Store) BootstrapAdmin(ctx context.Context, identity fabric.Identity, no
 		return AdminPolicy{}, internalError(err, "begin admin bootstrap")
 	}
 	defer tx.Rollback()
-	var revision, adminCount int64
-	if err := tx.QueryRowContext(ctx, `SELECT revision, (SELECT COUNT(*) FROM admins)
-		FROM admin_policy WHERE singleton=1`).Scan(&revision, &adminCount); err != nil {
+	var revision, authorityGeneration, adminCount int64
+	var bootstrapOpen bool
+	if err := tx.QueryRowContext(ctx, `SELECT revision, bootstrap_open, authority_generation,
+		(SELECT COUNT(*) FROM admins) FROM admin_policy WHERE singleton=1`).
+		Scan(&revision, &bootstrapOpen, &authorityGeneration, &adminCount); err != nil {
 		return AdminPolicy{}, internalError(err, "read admin policy")
 	}
-	if revision != 0 || adminCount != 0 {
+	if !bootstrapOpen || adminCount != 0 {
 		return AdminPolicy{}, protocolError(contract.ErrorAdminBootstrapClosed,
-			"admin bootstrap is permanently closed")
+			"admin bootstrap is closed for the current authority generation")
 	}
 	var expiresNS int64
 	challengeErr := tx.QueryRowContext(ctx, `SELECT expires_ns FROM admin_bootstrap_challenges
-		WHERE singleton=1 AND nonce_hash=?`, bootstrapNonceHash(nonce)).Scan(&expiresNS)
+		WHERE singleton=1 AND nonce_hash=? AND deployment_hash=? AND authority_generation=?`,
+		bootstrapNonceHash(nonce, s.deploymentID, authorityGeneration), deploymentIDHash(s.deploymentID),
+		authorityGeneration).Scan(&expiresNS)
 	if errors.Is(challengeErr, sql.ErrNoRows) || challengeErr == nil && expiresNS <= now.UnixNano() {
 		return AdminPolicy{}, protocolError(contract.ErrorAdminBootstrapInvalid,
 			"admin bootstrap challenge is invalid or expired")
@@ -167,8 +196,11 @@ func (s *Store) BootstrapAdmin(ctx context.Context, identity fabric.Identity, no
 	if challengeErr != nil {
 		return AdminPolicy{}, internalError(challengeErr, "read admin bootstrap challenge")
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE admin_policy SET revision=1, updated_ns=?
-		WHERE singleton=1 AND revision=0`, now.UnixNano())
+	nextRevision := revision + 1
+	result, err := tx.ExecContext(ctx, `UPDATE admin_policy
+		SET revision=?, bootstrap_open=0, updated_ns=?
+		WHERE singleton=1 AND revision=? AND bootstrap_open=1 AND authority_generation=?`,
+		nextRevision, now.UnixNano(), revision, authorityGeneration)
 	if err != nil {
 		return AdminPolicy{}, internalError(err, "advance bootstrapped admin policy")
 	}
@@ -178,13 +210,13 @@ func (s *Store) BootstrapAdmin(ctx context.Context, identity fabric.Identity, no
 	}
 	if affected != 1 {
 		return AdminPolicy{}, protocolError(contract.ErrorAdminBootstrapClosed,
-			"admin bootstrap is permanently closed")
+			"admin bootstrap is closed for the current authority generation")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO admins(user_id, added_revision, added_ns)
-		VALUES(?, 1, ?)`, identity.UserID, now.UnixNano()); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO admins(fabric_id, user_id, added_revision, added_ns)
+		VALUES(?, ?, ?, ?)`, identity.FabricID, identity.UserID, nextRevision, now.UnixNano()); err != nil {
 		return AdminPolicy{}, internalError(err, "store first admin")
 	}
-	if err := insertAdminPolicyAudit(ctx, tx, 1, AdminPolicyBootstrap, identity,
+	if err := insertAdminPolicyAudit(ctx, tx, nextRevision, AdminPolicyBootstrap, identity,
 		identity.UserID, now); err != nil {
 		return AdminPolicy{}, err
 	}
@@ -202,9 +234,49 @@ func (s *Store) BootstrapAdmin(ctx context.Context, identity fabric.Identity, no
 }
 
 func (s *Store) GetAdminPolicy(ctx context.Context) (AdminPolicy, error) {
-	policy, err := readAdminPolicy(ctx, s.db)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return AdminPolicy{}, internalError(err, "begin admin policy read")
+	}
+	defer tx.Rollback()
+	policy, err := readAdminPolicy(ctx, tx)
 	if err != nil {
 		return AdminPolicy{}, internalError(err, "read admin policy")
+	}
+	if err := tx.Commit(); err != nil {
+		return AdminPolicy{}, internalError(err, "commit admin policy read")
+	}
+	return policy, nil
+}
+
+// GetVisibleAdminPolicy returns the roster only to a current administrator;
+// every authenticated person may observe the revision needed for change
+// detection without learning membership.
+func (s *Store) GetVisibleAdminPolicy(ctx context.Context, identity fabric.Identity) (AdminPolicy, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return AdminPolicy{}, internalError(err, "begin visible admin policy read")
+	}
+	defer tx.Rollback()
+	var revision int64
+	if err := tx.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&revision); err != nil {
+		return AdminPolicy{}, internalError(err, "read admin policy revision")
+	}
+	if err := requireCurrentAdmin(ctx, tx, identity); err != nil {
+		if errorCode(err) == contract.ErrorAdminRequired {
+			if err := tx.Commit(); err != nil {
+				return AdminPolicy{}, internalError(err, "commit redacted admin policy read")
+			}
+			return AdminPolicy{Revision: revision}, nil
+		}
+		return AdminPolicy{}, err
+	}
+	policy, err := readAdminPolicy(ctx, tx)
+	if err != nil {
+		return AdminPolicy{}, internalError(err, "read visible admin policy")
+	}
+	if err := tx.Commit(); err != nil {
+		return AdminPolicy{}, internalError(err, "commit visible admin policy read")
 	}
 	return policy, nil
 }
@@ -214,15 +286,8 @@ func readAdminPolicy(ctx context.Context, q queryer) (AdminPolicy, error) {
 	if err := q.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&policy.Revision); err != nil {
 		return AdminPolicy{}, err
 	}
-	type rowsQueryer interface {
-		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-	}
-	rowsSource, ok := q.(rowsQueryer)
-	if !ok {
-		return AdminPolicy{}, fmt.Errorf("query source cannot list admins")
-	}
-	rows, err := rowsSource.QueryContext(ctx, `SELECT user_id, added_revision, added_ns
-		FROM admins ORDER BY user_id`)
+	rows, err := q.QueryContext(ctx, `SELECT fabric_id, user_id, added_revision, added_ns
+		FROM admins ORDER BY fabric_id, user_id`)
 	if err != nil {
 		return AdminPolicy{}, err
 	}
@@ -231,7 +296,7 @@ func readAdminPolicy(ctx context.Context, q queryer) (AdminPolicy, error) {
 	for rows.Next() {
 		var admin Admin
 		var addedNS int64
-		if err := rows.Scan(&admin.UserID, &admin.AddedRevision, &addedNS); err != nil {
+		if err := rows.Scan(&admin.FabricID, &admin.UserID, &admin.AddedRevision, &addedNS); err != nil {
 			return AdminPolicy{}, err
 		}
 		admin.AddedAt = time.Unix(0, addedNS).UTC()
@@ -245,8 +310,8 @@ func requireCurrentAdmin(ctx context.Context, q queryer, identity fabric.Identit
 		return err
 	}
 	var current bool
-	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE user_id=?)`,
-		identity.UserID).Scan(&current); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
+		identity.FabricID, identity.UserID).Scan(&current); err != nil {
 		return internalError(err, "read current admin")
 	}
 	if !current {
@@ -318,7 +383,8 @@ func (s *Store) mutateAdmin(
 		return AdminPolicy{}, err
 	}
 	var exists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE user_id=?)`, userID).Scan(&exists); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
+		identity.FabricID, userID).Scan(&exists); err != nil {
 		return AdminPolicy{}, internalError(err, "read admin membership")
 	}
 	nextRevision := revision + 1
@@ -328,8 +394,16 @@ func (s *Store) mutateAdmin(
 			return AdminPolicy{}, protocolError(contract.ErrorConflict,
 				"person %q is already an administrator", userID)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO admins(user_id, added_revision, added_ns)
-			VALUES(?, ?, ?)`, userID, nextRevision, now.UnixNano()); err != nil {
+		var count int64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM admins`).Scan(&count); err != nil {
+			return AdminPolicy{}, internalError(err, "count administrators")
+		}
+		if count >= MaxAdministrators {
+			return AdminPolicy{}, protocolError(contract.ErrorCapacityExhausted,
+				"admin policy is limited to %d members", MaxAdministrators)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO admins(fabric_id, user_id, added_revision, added_ns)
+			VALUES(?, ?, ?, ?)`, identity.FabricID, userID, nextRevision, now.UnixNano()); err != nil {
 			return AdminPolicy{}, internalError(err, "add administrator")
 		}
 	case AdminPolicyRemove:
@@ -345,7 +419,8 @@ func (s *Store) mutateAdmin(
 			return AdminPolicy{}, protocolError(contract.ErrorFinalAdmin,
 				"the final administrator cannot be removed")
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM admins WHERE user_id=?`, userID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM admins WHERE fabric_id=? AND user_id=?`,
+			identity.FabricID, userID); err != nil {
 			return AdminPolicy{}, internalError(err, "remove administrator")
 		}
 	default:
@@ -388,12 +463,58 @@ func insertAdminPolicyAudit(
 	now time.Time,
 ) error {
 	if _, err := tx.ExecContext(ctx, `INSERT INTO admin_policy_audit(
-		revision, operation, actor_user_id, actor_device_id, subject_user_id, created_ns
-	) VALUES(?, ?, ?, ?, ?, ?)`, revision, operation, identity.UserID, identity.DeviceID,
+		revision, operation, actor_kind, actor_fabric_id, actor_user_id, actor_device_id,
+		subject_fabric_id, subject_user_id, created_ns
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, revision, operation, AdminPolicyActorFabricPerson,
+		identity.FabricID, identity.UserID, identity.DeviceID, identity.FabricID,
 		subjectUserID, now.UnixNano()); err != nil {
 		return internalError(err, "append admin policy audit")
 	}
 	return nil
+}
+
+// ResetAdminPolicy is a local recovery operation for an unusable roster. It
+// advances the durable policy and authority generation, clears membership and
+// live challenges, reopens bootstrap, and appends an audit row atomically.
+func (s *Store) ResetAdminPolicy(ctx context.Context) (AdminPolicy, error) {
+	now := canonicalTime(s.clock.Now())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AdminPolicy{}, internalError(err, "begin admin policy reset")
+	}
+	defer tx.Rollback()
+	var revision, authorityGeneration int64
+	if err := tx.QueryRowContext(ctx, `SELECT revision, authority_generation
+		FROM admin_policy WHERE singleton=1`).Scan(&revision, &authorityGeneration); err != nil {
+		return AdminPolicy{}, internalError(err, "read admin policy reset state")
+	}
+	nextRevision := revision + 1
+	if _, err := tx.ExecContext(ctx, `DELETE FROM admins`); err != nil {
+		return AdminPolicy{}, internalError(err, "clear administrators")
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM admin_bootstrap_challenges`); err != nil {
+		return AdminPolicy{}, internalError(err, "clear admin bootstrap challenge")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE admin_policy SET revision=?, bootstrap_open=1,
+		authority_generation=?, updated_ns=? WHERE singleton=1 AND revision=?`,
+		nextRevision, authorityGeneration+1, now.UnixNano(), revision); err != nil {
+		return AdminPolicy{}, internalError(err, "advance reset admin policy")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO admin_policy_audit(
+		revision, operation, actor_kind, actor_fabric_id, actor_user_id, actor_device_id,
+		subject_fabric_id, subject_user_id, created_ns
+	) VALUES(?, ?, ?, '', '', '', '', '', ?)`, nextRevision, AdminPolicyReset,
+		AdminPolicyActorLocalOperator, now.UnixNano()); err != nil {
+		return AdminPolicy{}, internalError(err, "append admin policy reset audit")
+	}
+	policy, err := readAdminPolicy(ctx, tx)
+	if err != nil {
+		return AdminPolicy{}, internalError(err, "read reset admin policy")
+	}
+	if err := tx.Commit(); err != nil {
+		return AdminPolicy{}, internalError(err, "commit admin policy reset")
+	}
+	return policy, nil
 }
 
 func encodeAdminAuditCursor(revision int64) string {
@@ -432,8 +553,8 @@ func (s *Store) ListAdminPolicyAudit(
 	if err := requireCurrentAdmin(ctx, s.db, identity); err != nil {
 		return AdminPolicyAuditList{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT revision, operation, actor_user_id,
-		actor_device_id, subject_user_id, created_ns FROM admin_policy_audit
+	rows, err := s.db.QueryContext(ctx, `SELECT revision, operation, actor_kind, actor_fabric_id,
+		actor_user_id, actor_device_id, subject_fabric_id, subject_user_id, created_ns FROM admin_policy_audit
 		WHERE revision>? ORDER BY revision LIMIT ?`, afterRevision, limit+1)
 	if err != nil {
 		return AdminPolicyAuditList{}, internalError(err, "list admin policy audit")
@@ -443,8 +564,9 @@ func (s *Store) ListAdminPolicyAudit(
 	for rows.Next() {
 		var entry AdminPolicyAudit
 		var createdNS int64
-		if err := rows.Scan(&entry.Revision, &entry.Operation, &entry.ActorUserID,
-			&entry.ActorDeviceID, &entry.SubjectUserID, &createdNS); err != nil {
+		if err := rows.Scan(&entry.Revision, &entry.Operation, &entry.ActorKind,
+			&entry.ActorFabricID, &entry.ActorUserID, &entry.ActorDeviceID,
+			&entry.SubjectFabricID, &entry.SubjectUserID, &createdNS); err != nil {
 			return AdminPolicyAuditList{}, internalError(err, "scan admin policy audit")
 		}
 		entry.CreatedAt = time.Unix(0, createdNS).UTC()

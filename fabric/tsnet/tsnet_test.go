@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Derek-X-Wang/wefty/fabric"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
 )
@@ -30,6 +31,14 @@ func TestConnectHostProjectsPrivateTransportHostname(t *testing.T) {
 	}
 }
 
+func TestCoordinatorIdentityScopesFabricIdentity(t *testing.T) {
+	first := coordinatorFabricID("https://issuer.invalid", "identity-domain-one")
+	second := coordinatorFabricID("https://issuer.invalid", "identity-domain-two")
+	if first == "" || second == "" || first == second || strings.Contains(first, "identity-domain-one") {
+		t.Fatalf("Fabric identities = %q / %q", first, second)
+	}
+}
+
 func TestIdentityTranslation(t *testing.T) {
 	who := &apitype.WhoIsResponse{
 		Node: &tailcfg.Node{
@@ -40,18 +49,21 @@ func TestIdentityTranslation(t *testing.T) {
 		UserProfile: &tailcfg.UserProfile{ID: 42, LoginName: "agent@example.com", DisplayName: "Agent"},
 	}
 
-	identity, err := identityFromWhoIs(who)
+	identity, err := identityFromWhoIs(who, "fabric-one")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if identity.NodeID != "stable-node-id" {
 		t.Errorf("NodeID = %q, want stable-node-id", identity.NodeID)
 	}
-	if identity.UserID != "42" || identity.DeviceID != "stable-node-id" {
-		t.Errorf("person/device identity = %q/%q, want 42/stable-node-id", identity.UserID, identity.DeviceID)
+	if identity.UserID != "" || identity.DeviceID != "stable-node-id" || identity.FabricID != "fabric-one" {
+		t.Errorf("machine identity = %#v", identity)
 	}
-	if identity.DisplayName != "Agent" {
-		t.Errorf("DisplayName = %q, want Agent", identity.DisplayName)
+	if identity.Kind != fabric.IdentityKindMachine {
+		t.Errorf("Kind = %q, want machine", identity.Kind)
+	}
+	if identity.DisplayName != "" {
+		t.Errorf("machine DisplayName = %q, want blank", identity.DisplayName)
 	}
 	if !slices.Equal(identity.Tags, []string{"tag:agent", "tag:linux"}) {
 		t.Errorf("Tags = %v", identity.Tags)
@@ -74,11 +86,11 @@ func TestIdentityTranslationIgnoresLoginRenameAndDeviceName(t *testing.T) {
 		Node:        &tailcfg.Node{StableID: "device-1", Name: "new-name.example.ts.net."},
 		UserProfile: &tailcfg.UserProfile{ID: 42, LoginName: "new@example.test", DisplayName: "New"},
 	}
-	first, err := identityFromWhoIs(base)
+	first, err := identityFromWhoIs(base, "fabric-one")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := identityFromWhoIs(renamed)
+	second, err := identityFromWhoIs(renamed, "fabric-one")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +109,7 @@ func TestIdentityTranslationRejectsIncompleteResponse(t *testing.T) {
 		{Node: &tailcfg.Node{}, UserProfile: &tailcfg.UserProfile{ID: 42}},
 	}
 	for _, fixture := range fixtures {
-		if _, err := identityFromWhoIs(fixture); err == nil {
+		if _, err := identityFromWhoIs(fixture, "fabric-one"); err == nil {
 			t.Fatalf("identityFromWhoIs() accepted an incomplete response: %#v", fixture)
 		}
 	}

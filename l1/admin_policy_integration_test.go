@@ -3,7 +3,10 @@ package l1
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -29,8 +32,11 @@ func assertAdminBootstrapAndPolicyContract(t *testing.T) {
 		NodeID: "plain-node-b", UserID: "person-mallory", DeviceID: "device-b", DisplayName: "Mallory",
 	})
 	incomplete := h.client(fabric.Identity{NodeID: "plain-node-a", Tags: []string{DefaultClientPrincipalTag}})
+	incompletePerson := h.client(fabric.Identity{NodeID: "plain-node-person"})
 
 	status, _, body := h.do(incomplete, http.MethodGet, "/v1/admin-policy", nil)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
+	status, _, body = h.do(incompletePerson, http.MethodGet, "/v1/admin-policy", nil)
 	assertAPIError(t, status, body, http.StatusUnauthorized, contract.ErrorPersonIdentityRequired)
 	status, _, body = h.do(adminDeviceOne, http.MethodPost, "/v1/admin-bootstrap", BootstrapAdminRequest{Nonce: "remote-first-caller"})
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorAdminBootstrapInvalid)
@@ -43,7 +49,7 @@ func assertAdminBootstrapAndPolicyContract(t *testing.T) {
 	if err := h.store.db.QueryRow(`SELECT nonce_hash FROM admin_bootstrap_challenges WHERE singleton=1`).Scan(&storedNonceHash); err != nil {
 		t.Fatal(err)
 	}
-	if storedNonceHash == challenge.Nonce || storedNonceHash != bootstrapNonceHash(challenge.Nonce) {
+	if storedNonceHash == challenge.Nonce || storedNonceHash != bootstrapNonceHash(challenge.Nonce, h.store.deploymentID, 1) {
 		t.Fatal("bootstrap challenge was not stored only as its hash")
 	}
 	status, _, body = h.do(adminDeviceOne, http.MethodPost, "/v1/admin-bootstrap", map[string]any{
@@ -67,6 +73,10 @@ func assertAdminBootstrapAndPolicyContract(t *testing.T) {
 	status, _, body = h.do(otherPersonSameDevice, http.MethodPut,
 		"/v1/admin-policy/admins/person-bob", AdminPolicyMutationRequest{PolicyRevision: policy.Revision})
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorAdminRequired)
+	status, _, body = h.do(otherPersonSameDevice, http.MethodGet, "/v1/admin-policy", nil)
+	if status != http.StatusOK || string(body) != "{\"revision\":1}\n" {
+		t.Fatalf("nonadmin policy = status %d body=%s", status, body)
+	}
 	status, _, body = h.do(adminDeviceTwo, http.MethodPut,
 		"/v1/admin-policy/admins/person-bob", map[string]any{
 			"policy_revision": policy.Revision, "actor_device_id": "forged-device",
@@ -152,6 +162,43 @@ func assertAdminBootstrapAndPolicyContract(t *testing.T) {
 	t.Logf("assertion-derived admin policy receipt: %s", encodedReceipt)
 }
 
+func TestMachinePrincipalRejectedFromEveryPersonRoute(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{}, nil)
+	identity := fabric.Identity{
+		NodeID: "agent-node", UserID: "enroller-person", DeviceID: "agent-device",
+		Tags: []string{DefaultAgentPrincipalTag},
+	}
+	client := h.client(identity)
+	rows := []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{http.MethodPost, "/v1/admin-bootstrap", BootstrapAdminRequest{Nonce: "forged"}},
+		{http.MethodGet, "/v1/admin-policy", nil},
+		{http.MethodGet, "/v1/admin-policy/audit", nil},
+		{http.MethodPut, "/v1/admin-policy/admins/attacker", AdminPolicyMutationRequest{PolicyRevision: 1}},
+		{http.MethodDelete, "/v1/admin-policy/admins/attacker", AdminPolicyMutationRequest{PolicyRevision: 1}},
+	}
+	for _, row := range rows {
+		status, _, body := h.do(client, row.method, row.path, row.body)
+		assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
+	}
+	machine := h.client(fabric.Identity{
+		NodeID: "machine-node", UserID: "enroller-person", DeviceID: "machine-device",
+		Kind: fabric.IdentityKindMachine,
+	})
+	status, _, body := h.do(machine, http.MethodGet, "/v1/admin-policy", nil)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
+}
+
+func TestPlainFabricPersonRoutesRequireDevelopmentOverride(t *testing.T) {
+	h := newIntegrationHarnessWithPersonIdentityMode(t, StoreOptions{}, nil, false)
+	client := h.client(fabric.Identity{UserID: "person-alice", DeviceID: "device-a"})
+	status, _, body := h.do(client, http.MethodGet, "/v1/admin-policy", nil)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
+}
+
 func assertAdminPolicyRevisionAndAuditCount(t *testing.T, h *integrationHarness, revision, rows int64) {
 	t.Helper()
 	var gotRevision, gotRows int64
@@ -168,7 +215,7 @@ func assertAdminPolicyRevisionAndAuditCount(t *testing.T, h *integrationHarness,
 
 func TestAdminBootstrapChallengeExpiryAndReplacement(t *testing.T) {
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{AdminBootstrapTTL: time.Minute}, nil)
-	identity := fabric.Identity{UserID: "person-alice", DeviceID: "device-a"}
+	identity := fabric.Identity{FabricID: "fabric-one", UserID: "person-alice", DeviceID: "device-a"}
 	first, err := h.store.InitiateAdminBootstrap(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +239,7 @@ func TestAdminBootstrapChallengeExpiryAndReplacement(t *testing.T) {
 
 func TestAdminPolicyConcurrentCASHasOneAuditWinner(t *testing.T) {
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{}, nil)
-	identity := fabric.Identity{UserID: "person-alice", DeviceID: "device-a"}
+	identity := fabric.Identity{FabricID: "fabric-one", UserID: "person-alice", DeviceID: "device-a"}
 	challenge, err := h.store.InitiateAdminBootstrap(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -231,4 +278,129 @@ func TestAdminPolicyConcurrentCASHasOneAuditWinner(t *testing.T) {
 		t.Fatalf("concurrent CAS outcomes = wins %d stale %d", wins, stale)
 	}
 	assertAdminPolicyRevisionAndAuditCount(t, h, 2, 2)
+}
+
+func TestAdminAuthorityIsScopedToIssuingFabric(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{}, nil)
+	admin := fabric.Identity{FabricID: "fabric-one", UserID: "person-alice", DeviceID: "device-a"}
+	challenge, err := h.store.InitiateAdminBootstrap(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := h.store.BootstrapAdmin(context.Background(), admin, challenge.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repointed := admin
+	repointed.FabricID = "fabric-two"
+	if _, err := h.store.AddAdmin(context.Background(), repointed, "person-bob", policy.Revision); errorCode(err) != contract.ErrorAdminRequired {
+		t.Fatalf("repointed Fabric mutation error = %v, want %q", err, contract.ErrorAdminRequired)
+	}
+}
+
+func TestAdminPolicyBoundAndAuditFailureRollback(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{}, nil)
+	identity := fabric.Identity{FabricID: "fabric-one", UserID: "person-alice", DeviceID: "device-a"}
+	challenge, err := h.store.InitiateAdminBootstrap(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := h.store.BootstrapAdmin(context.Background(), identity, challenge.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`CREATE TRIGGER fail_add_audit BEFORE INSERT ON admin_policy_audit
+		WHEN NEW.operation='add' BEGIN SELECT RAISE(ABORT, 'forced audit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.AddAdmin(context.Background(), identity, "person-bob", policy.Revision); errorCode(err) != contract.ErrorInternal {
+		t.Fatalf("audit failure error = %v, want internal", err)
+	}
+	assertAdminPolicyRevisionAndAuditCount(t, h, 1, 1)
+	current, err := h.store.GetAdminPolicy(context.Background())
+	if err != nil || len(current.Admins) != 1 {
+		t.Fatalf("audit failure changed membership = %#v err=%v", current, err)
+	}
+	if _, err := h.store.db.Exec(`DROP TRIGGER fail_add_audit`); err != nil {
+		t.Fatal(err)
+	}
+	for index := 2; index <= MaxAdministrators; index++ {
+		current, err = h.store.AddAdmin(context.Background(), identity,
+			fmt.Sprintf("person-%02d", index), current.Revision)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.store.AddAdmin(context.Background(), identity, "person-over-limit", current.Revision); errorCode(err) != contract.ErrorCapacityExhausted {
+		t.Fatalf("over-limit error = %v, want %q", err, contract.ErrorCapacityExhausted)
+	}
+	if _, err := h.store.db.Exec(`INSERT INTO admins(fabric_id, user_id, added_revision, added_ns)
+		VALUES('other-fabric', 'schema-bypass', 999, 0)`); err == nil {
+		t.Fatal("admins schema admitted a thirty-third member")
+	}
+}
+
+func TestLocalAdminResetReopensBootstrapAndIsAudited(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{}, nil)
+	typo := fabric.Identity{FabricID: "fabric-one", UserID: "typo-person", DeviceID: "device-a"}
+	challenge, err := h.store.InitiateAdminBootstrap(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.BootstrapAdmin(context.Background(), typo, challenge.Nonce); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := h.store.ResetAdminPolicy(context.Background())
+	if err != nil || reset.Revision != 2 || len(reset.Admins) != 0 {
+		t.Fatalf("reset policy = %#v err=%v", reset, err)
+	}
+	nextChallenge, err := h.store.InitiateAdminBootstrap(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	correct := fabric.Identity{FabricID: "fabric-one", UserID: "person-alice", DeviceID: "device-b"}
+	policy, err := h.store.BootstrapAdmin(context.Background(), correct, nextChallenge.Nonce)
+	if err != nil || policy.Revision != 3 || len(policy.Admins) != 1 {
+		t.Fatalf("post-reset bootstrap = %#v err=%v", policy, err)
+	}
+	var operation AdminPolicyOperation
+	if err := h.store.db.QueryRow(`SELECT operation FROM admin_policy_audit WHERE revision=2`).Scan(&operation); err != nil {
+		t.Fatal(err)
+	}
+	if operation != AdminPolicyReset {
+		t.Fatalf("reset audit operation = %q", operation)
+	}
+}
+
+func TestBootstrapChallengeCannotRedeemFromClonedDatabase(t *testing.T) {
+	directory := t.TempDir()
+	sourcePath := filepath.Join(directory, "source.sqlite")
+	source, err := OpenStore(sourcePath, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	challenge, err := source.InitiateAdminBootstrap(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clonePath := filepath.Join(directory, "clone.sqlite")
+	if err := os.WriteFile(clonePath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clone, err := OpenStore(clonePath, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clone.Close()
+	identity := fabric.Identity{FabricID: "fabric-one", UserID: "person-alice", DeviceID: "device-a"}
+	if _, err := clone.BootstrapAdmin(context.Background(), identity, challenge.Nonce); errorCode(err) != contract.ErrorAdminBootstrapInvalid {
+		t.Fatalf("cloned challenge error = %v, want %q", err, contract.ErrorAdminBootstrapInvalid)
+	}
 }
