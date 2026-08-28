@@ -86,6 +86,11 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if strings.Contains(string(buildBytes), "secrets.") || strings.Contains(marshalJob(t, build.Jobs["reproducible-platform-build"]), "github.token") {
 		t.Fatal("PR-callable image build must not consume github.token")
 	}
+	for _, required := range []string{"Dry-run digest-only release manifest assembly", "scripts/build-oci-install-manifest.sh", "--probe-reference \"$IMAGE_NAME\"", "synthetic_digest=", ".probe_reference == $reference", ".probe_digest == $digest"} {
+		if !strings.Contains(string(buildBytes), required) {
+			t.Fatalf("PR-callable image build does not exercise release manifest assembly %q", required)
+		}
+	}
 
 	called := gate.Jobs["acceptance-image"]
 	if called.Uses != "./.github/workflows/acceptance-image-build.yml" {

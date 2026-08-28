@@ -98,6 +98,22 @@ jobs:
           jq -n --arg platform "$PLATFORM" --arg digest "$platform_digest" --argjson e_machine "$machine" \
             '{platform: $platform, digest: $digest, executed: true, health: true, echo: true, elf_e_machine: $e_machine}' \
             > "$evidence/${ARCH}-runtime.json"
+      - name: Dry-run digest-only release manifest assembly
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/acceptance-image-release-linux-$ARCH"
+          mkdir -p "$root/libexec" "$root/share/wefty/oci"
+          CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -trimpath -buildvcs=false -ldflags='-buildid=' \
+            -o "$root/libexec/wefty-agent" ./cmd/wefty-agent
+          synthetic_digest="sha256:$(printf 'a%.0s' {1..64})"
+          scripts/build-oci-install-manifest.sh --helper "$root/libexec/wefty-agent" --probe-reference "$IMAGE_NAME" \
+            --probe-digest "$synthetic_digest" --probe-archive "$RUNNER_TEMP/acceptance-image.oci.tar" \
+            --output "$root/share/wefty/oci/manifest.json"
+          jq -e --arg reference "$IMAGE_NAME" --arg digest "$synthetic_digest" '
+            .probe_reference == $reference and .probe_digest == $digest
+          ' "$root/share/wefty/oci/manifest.json"
       - name: Upload reproducibility and runtime evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
