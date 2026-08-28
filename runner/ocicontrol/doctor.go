@@ -22,6 +22,7 @@ const (
 	DoctorUIDIssue          = "https://github.com/Derek-X-Wang/wefty/issues/220"
 	DoctorLaunchUnmanaged   = "unmanaged"
 	DoctorRunbookPrefix     = RunbookPath + "#doctor-code-"
+	TestedLimaVersion       = "2.2.0"
 	TestedContainerdVersion = "2.3.4"
 	TestedRuncVersion       = "1.5.1"
 )

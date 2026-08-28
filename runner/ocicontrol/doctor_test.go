@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -437,6 +438,14 @@ func TestEveryDoctorCodeHasResolvableRunbookHeading(t *testing.T) {
 }
 
 func TestTestedRuntimeVersionsMatchRealtimeWorkflowPins(t *testing.T) {
+	versionsPayload, err := os.ReadFile(filepath.Join("..", "..", "scripts", "oci-tested-versions.env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantVersionSet := "WEFTY_OCI_TESTED_VERSIONS='lima=" + TestedLimaVersion + " containerd=" + TestedContainerdVersion + " runc=" + TestedRuncVersion + "'"
+	if !bytes.Contains(versionsPayload, []byte(wantVersionSet)) {
+		t.Fatalf("installer tested-version set drifted from doctor constants: want %q", wantVersionSet)
+	}
 	payload, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "service-acceptance-realtiming.yml"))
 	if err != nil {
 		t.Fatal(err)
@@ -445,6 +454,22 @@ func TestTestedRuntimeVersionsMatchRealtimeWorkflowPins(t *testing.T) {
 		if !bytes.Contains(payload, []byte(pin)) {
 			t.Fatalf("tested runtime constant drifted from workflow pin %q", pin)
 		}
+	}
+}
+
+func TestOCIPrerequisiteInstallerMatrix(t *testing.T) {
+	repositoryRoot := filepath.Join("..", "..")
+	installer := filepath.Join(repositoryRoot, "scripts", "install-oci-deps.sh")
+	matrix := filepath.Join(repositoryRoot, "scripts", "test-install-oci-deps.sh")
+	if shellcheck, err := exec.LookPath("shellcheck"); err == nil {
+		command := exec.Command(shellcheck, installer, matrix)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("shellcheck OCI prerequisite installer: %v\n%s", err, output)
+		}
+	}
+	command := exec.Command("bash", matrix)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("OCI prerequisite installer matrix: %v\n%s", err, output)
 	}
 }
 

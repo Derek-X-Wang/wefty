@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -58,6 +59,14 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 		},
 		IntentFunc: func(ctx context.Context) (lima.OCIIntent, error) {
 			return (lima.FileIntentSource{Path: intentPath}).ReadIntent(ctx)
+		},
+		SetupFunc: func(ctx context.Context, request ocicontrol.SetupRequest) (ocicontrol.SetupResponse, error) {
+			intent, err := (lima.FileIntentSource{Path: intentPath}).ReadIntent(ctx)
+			return ocicontrol.SetupResponse{Configured: true, Intent: intent, Convergence: ocicontrol.ConvergenceUnchanged, ProbePreloaded: true}, err
+		},
+		StartFunc: func(_ context.Context, request ocicontrol.IntentMutationRequest) (ocicontrol.IntentResponse, error) {
+			intent, err := lima.SetOCIIntent(context.Background(), intentPath, request.ExpectedRevision, true, time.Now())
+			return ocicontrol.IntentResponse{Intent: intent, CapabilityPublished: err == nil}, err
 		},
 		StopFunc: func(_ context.Context, request ocicontrol.IntentMutationRequest) (ocicontrol.IntentResponse, error) {
 			intent, err := lima.SetOCIIntent(context.Background(), intentPath, request.ExpectedRevision, false, time.Now())
@@ -115,6 +124,17 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	if err := run(t.Context(), []string{
+		"--fabric=invalid-must-not-open", "--node-config=" + configPath, "--json", "node", "setup-oci",
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("setup-oci: %v stderr=%s", err, stderr.String())
+	}
+	var setup ocicontrol.SetupResponse
+	if err := json.Unmarshal(stdout.Bytes(), &setup); err != nil || !setup.Configured || setup.Convergence != ocicontrol.ConvergenceUnchanged || !setup.ProbePreloaded {
+		t.Fatalf("setup output=%q decoded=%+v err=%v", stdout.String(), setup, err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if err := run(t.Context(), []string{
 		"--fabric=invalid-must-not-open", "--node-config=" + configPath,
 		"node", "load-image", archivePath,
 	}, &stdout, &stderr); err != nil {
@@ -139,6 +159,18 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &stopped); err != nil || stopped.Intent.Enabled || !stopped.RuntimeQuiesced {
 		t.Fatalf("stop output=%q decoded=%+v err=%v", stdout.String(), stopped, err)
 	}
+	stdout.Reset()
+	stderr.Reset()
+	if err := run(t.Context(), []string{
+		"--fabric=invalid-must-not-open", "--node-config=" + configPath, "--json",
+		"node", "oci", "start",
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("oci start: %v stderr=%s", err, stderr.String())
+	}
+	var started ocicontrol.IntentResponse
+	if err := json.Unmarshal(stdout.Bytes(), &started); err != nil || !started.Intent.Enabled || !started.CapabilityPublished {
+		t.Fatalf("start output=%q decoded=%+v err=%v", stdout.String(), started, err)
+	}
 
 	cancel()
 	select {
@@ -148,5 +180,45 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("control server did not stop")
+	}
+}
+
+func TestOCINodeRunbookCommandsUseExercisedSurfaces(t *testing.T) {
+	payload, err := os.ReadFile(filepath.Join("..", "..", ocicontrol.RunbookPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{
+		"bash scripts/install-oci-deps.sh --dry-run": false,
+		"sudo bash scripts/install-oci-deps.sh":      false,
+		"wefty node setup-oci":                       false,
+		"wefty node doctor":                          false,
+		"wefty node oci start":                       false,
+		"wefty node oci stop":                        false,
+		"wefty node load-image FILE":                 false,
+		"wefty --json node doctor":                   false,
+	}
+	inShellBlock := false
+	for _, line := range strings.Split(string(payload), "\n") {
+		switch line {
+		case "```sh":
+			inShellBlock = true
+			continue
+		case "```":
+			inShellBlock = false
+			continue
+		}
+		if !inShellBlock || strings.TrimSpace(line) == "" {
+			continue
+		}
+		if _, ok := want[line]; !ok {
+			t.Fatalf("runbook shell command is not covered by the installer matrix or singular CLI acceptance: %q", line)
+		}
+		want[line] = true
+	}
+	for command, seen := range want {
+		if !seen {
+			t.Fatalf("checked runbook command is missing: %q", command)
+		}
 	}
 }
