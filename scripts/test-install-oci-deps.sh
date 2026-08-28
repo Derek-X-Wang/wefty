@@ -45,7 +45,7 @@ root="$(mktemp -d "${TMPDIR:-/tmp}/wefty-manifest-test.XXXXXX")"
 trap 'rm -rf -- "$root"' EXIT
 printf 'helper' >"$root/helper"
 printf 'probe' >"$root/probe.oci.tar"
-bash "$manifest_builder" --helper "$root/helper" --probe-reference wefty.local/probe:v1 --probe-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --probe-archive "$root/probe.oci.tar" --output "$root/share/wefty/oci/manifest.json" >/dev/null
+bash "$manifest_builder" --helper "$root/helper" --probe-reference wefty.local/probe --probe-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --probe-archive "$root/probe.oci.tar" --output "$root/share/wefty/oci/manifest.json" >/dev/null
 grep -Fq '"helper_checksum": "sha256:' "$root/share/wefty/oci/manifest.json" || fail "manifest helper checksum missing"
 grep -Fq '"probe_archive_path": "probe.oci.tar"' "$root/share/wefty/oci/manifest.json" || fail "manifest archive is not relocatable"
 

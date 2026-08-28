@@ -12,7 +12,7 @@ func TestOCIInstallManifestDefaultsAndRelativeArchive(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	payload := `{"version":1,"helper_checksum":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","probe_reference":"wefty.local/probe:v1","probe_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","probe_archive_path":"probe.oci.tar"}`
+	payload := `{"version":1,"helper_checksum":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","probe_reference":"wefty.local/probe","probe_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","probe_archive_path":"probe.oci.tar"}`
 	if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestOCIInstallManifestDefaultsAndRelativeArchive(t *testing.T) {
 func TestOCIInstallManifestRejectsUnknownOrMalformedValues(t *testing.T) {
 	for name, payload := range map[string]string{
 		"unknown": `{\"version\":1,\"unknown\":true}`,
-		"digest":  `{"version":1,"helper_checksum":"sha256:no","probe_reference":"probe:v1","probe_digest":"sha256:no","probe_archive_path":"probe.tar"}`,
+		"digest":  `{"version":1,"helper_checksum":"sha256:no","probe_reference":"probe","probe_digest":"sha256:no","probe_archive_path":"probe.tar"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "manifest.json")

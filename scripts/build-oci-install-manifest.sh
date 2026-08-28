@@ -6,6 +6,11 @@ probe_reference=
 probe_digest=
 probe_archive=
 output=
+# Bracketed IPv6 registry hosts are deliberately out of scope: this builder uses a JSON-safe-first subset, not full distribution grammar, while the reader remains permissive by design.
+probe_name_component='[A-Za-z0-9][A-Za-z0-9._-]*'
+probe_reference_pattern="^${probe_name_component}(/${probe_name_component})*$"
+probe_port_reference_pattern="^${probe_name_component}:[0-9]+(/${probe_name_component})+$"
+archive_name_pattern='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 
 usage() {
   printf '%s\n' 'usage: scripts/build-oci-install-manifest.sh --helper FILE --probe-reference REF --probe-digest sha256:HEX --probe-archive FILE --output FILE'
@@ -26,7 +31,7 @@ done
 
 [[ -f $helper && -f $probe_archive && -n $output ]] || { usage >&2; exit 64; }
 [[ $probe_digest =~ ^sha256:[0-9a-f]{64}$ ]] || { printf 'invalid probe digest\n' >&2; exit 64; }
-[[ -n $probe_reference && $probe_reference != *'"'* && $probe_reference != *$'\r'* && $probe_reference != *$'\n'* ]] || { printf 'invalid probe reference\n' >&2; exit 64; }
+[[ $probe_reference =~ $probe_reference_pattern || $probe_reference =~ $probe_port_reference_pattern ]] || { printf 'invalid probe reference (repository name only; no tag or digest)\n' >&2; exit 64; }
 
 if command -v sha256sum >/dev/null 2>&1; then
   helper_digest="$(sha256sum "$helper")"
@@ -40,8 +45,8 @@ else
 fi
 
 output_dir="$(dirname -- "$output")"
-archive_name="$(basename -- "$probe_archive")"
-[[ $archive_name != *'"'* && $archive_name != *$'\r'* && $archive_name != *$'\n'* ]] || { printf 'invalid probe archive name\n' >&2; exit 64; }
+archive_name="${probe_archive##*/}"
+[[ $archive_name =~ $archive_name_pattern ]] || { printf 'invalid probe archive name\n' >&2; exit 64; }
 mkdir -p -- "$output_dir"
 if [[ $(cd -- "$(dirname -- "$probe_archive")" && pwd)/$archive_name != $(cd -- "$output_dir" && pwd)/$archive_name ]]; then
   install -m 0644 "$probe_archive" "$output_dir/$archive_name"
