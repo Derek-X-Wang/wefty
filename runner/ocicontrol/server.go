@@ -65,6 +65,7 @@ func (server *Server) Serve(ctx context.Context) error {
 		return fmt.Errorf("restrict OCI control socket: %w", err)
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/doctor", server.handleDoctor)
 	mux.HandleFunc("GET /v1/intent", server.handleIntent)
 	mux.HandleFunc("POST /v1/setup", server.handleSetup)
 	mux.HandleFunc("POST /v1/oci/start", server.handleStart)
@@ -79,6 +80,11 @@ func (server *Server) Serve(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+func (server *Server) handleDoctor(writer http.ResponseWriter, request *http.Request) {
+	value, err := server.service.Doctor(request.Context())
+	writeControlResponse(writer, value, err)
 }
 
 func prepareSocketPath(path string) error {

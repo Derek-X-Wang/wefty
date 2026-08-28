@@ -11,8 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/agent"
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
@@ -29,6 +32,30 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	var mu sync.Mutex
 	var archiveBytes []byte
 	service := ocicontrol.ServiceFuncs{
+		DoctorFunc: func(ctx context.Context) (ocicontrol.DoctorResponse, error) {
+			report := ocicontrol.BuildDoctor(ctx, ocicontrol.DoctorConfig{
+				HostPlatform: ocicontrol.PlatformFacts{OS: "linux", Architecture: "amd64"},
+				AgentUser:    "operator", LaunchUnit: "wefty-agent.service",
+				CapabilitySnapshot: func() agent.CapabilitySnapshot {
+					probeAt := time.Now()
+					return agent.CapabilitySnapshot{CapabilityObservation: contract.CapabilityObservation{
+						Revision: 3, ObservedAt: time.Now(), Capabilities: map[string]bool{"kind:process": true},
+						MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonProbeFailed,
+					}, LastProbe: &contract.CapabilityObservation{Revision: 3, ObservedAt: probeAt, Capabilities: map[string]bool{"kind:process": true}, MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonProbeFailed}}
+				},
+				Intent: func(context.Context) (lima.OCIIntent, error) {
+					return (lima.FileIntentSource{Path: intentPath}).ReadIntent(ctx)
+				},
+				Helper: func(context.Context) (ocicontrol.HelperDoctorSnapshot, error) {
+					return ocicontrol.HelperDoctorSnapshot{
+						ProtocolVersion: ocihelper.ProtocolVersion, Version: "test", Checksum: "sha256:test", InstanceID: "helper", SessionGeneration: 1,
+						RuntimePlatformRecorded: true,
+						Runtime:                 ocihelper.DoctorStatus{RuntimePlatform: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}, ContainerdVersion: "2.3.4", RuncVersion: "1.3.3", AllowedMountRoots: []string{}, Cache: ocihelper.ImageCacheStatus{CapBytes: 16 << 30}},
+					}, nil
+				},
+			})
+			return report, report.Validate()
+		},
 		IntentFunc: func(ctx context.Context) (lima.OCIIntent, error) {
 			return (lima.FileIntentSource{Path: intentPath}).ReadIntent(ctx)
 		},
@@ -76,6 +103,17 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
+	if err := run(t.Context(), []string{
+		"--fabric=invalid-must-not-open", "--node-config=" + configPath, "--json", "node", "doctor",
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("doctor: %v stderr=%s", err, stderr.String())
+	}
+	var doctor ocicontrol.DoctorResponse
+	if err := json.Unmarshal(stdout.Bytes(), &doctor); err != nil || doctor.Version != ocicontrol.DoctorVersion || doctor.Probe.Outcome != ocicontrol.DiagnosticFailed {
+		t.Fatalf("doctor output=%q decoded=%+v err=%v", stdout.String(), doctor, err)
+	}
+	stdout.Reset()
+	stderr.Reset()
 	if err := run(t.Context(), []string{
 		"--fabric=invalid-must-not-open", "--node-config=" + configPath,
 		"node", "load-image", archivePath,

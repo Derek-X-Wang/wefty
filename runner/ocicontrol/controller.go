@@ -36,6 +36,14 @@ type ControllerConfig struct {
 	StopCycle  StopCycle
 	Setup      SetupFunc
 	Clock      Clock
+	Doctor     func(context.Context) (DoctorResponse, error)
+}
+
+func (controller *Controller) Doctor(ctx context.Context) (DoctorResponse, error) {
+	if controller.config.Doctor == nil {
+		return DoctorResponse{}, runtimeUnavailable("OCI doctor is unavailable", nil)
+	}
+	return controller.config.Doctor(ctx)
 }
 
 // Controller is the only writer of durable OCI intent. One operation mutex

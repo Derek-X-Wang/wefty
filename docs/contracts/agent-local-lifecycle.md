@@ -140,6 +140,29 @@ The writer checks for content changes and polls no faster than 20 seconds. It
 never contains a raw command error, path detail,
 environment dump, credential, or opaque helper session capability.
 
+The versioned general node doctor is a separate facts-only read over the
+operator-authenticated local control socket. JSON and human views contain the
+same host/runtime platform, agent user/unit, Lima, helper handshake, recorded
+functional probe and Capability revision, intent, cache, mount-root, version,
+and convergence facts. Each check is `OK`, `FAILED`, or `NOT-RUN`; `OK` is
+permitted only when the corresponding assertion ran and passed. The doctor
+reads the existing helper session and capability snapshot and never acquires a
+session, runs a functional probe, sweeps, changes intent, applies convergence,
+starts a service, or enforces cache policy. Failed checks use the closed M3
+reason vocabulary and stable `docs/runbooks/oci-node.md#doctor-code-*` anchors.
+It also surfaces #220's process-payload UID-isolation limitation without
+claiming that operator peer credentials distinguish the shared UID.
+
+`NOT-RUN` is a first-class receipt: it carries no failure reason and instead
+names one closed `not_run_cause`. A helper diagnostic failure preserves the
+already-authenticated handshake and degrades only the reads that did not
+complete; diagnostic transport is never evidence for session loss, attempt
+reap, or capability withdrawal. Runtime versions are facts only. Difference
+from the pinned real-time CI versions is `WARN`/`outside_tested_range`, not a
+failed capability verdict. Doctor compares the applied setup-state receipt
+with the configure-only desired-state receipt; if either side is unavailable,
+it does not manufacture a convergence class.
+
 ## Durable OCI intent and node-local control
 
 The versioned OCI intent marker is the node-local operator decision, separate
@@ -153,6 +176,11 @@ writes the requested configuration/template or Linux units, and reports the
 resulting convergence class without recovering or starting OCI. The sole
 runtime exception is an explicit restart/recreate flag with zero live OCI
 attempts; `wefty node oci start` remains the ordinary start operation.
+Configure-only setup writes a separate desired-state receipt before returning
+a restart/recreate refusal. The applied receipt advances only after authorized
+convergence, so doctor derives unchanged, live-safe, restart-required, or
+recreate-required by comparing current with desired rather than echoing the
+last probe reason.
 
 Singular `wefty node` commands resolve the installed node configuration before
 Fabric initialization and use only the live agent's Unix control socket. Its

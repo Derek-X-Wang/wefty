@@ -23,6 +23,13 @@ type SetupState struct {
 	ProbeDigest   string `json:"probe_digest"`
 }
 
+func DesiredSetupStatePath(currentPath string) string {
+	if currentPath == "" {
+		return ""
+	}
+	return currentPath + ".desired"
+}
+
 func ClassifyConvergence(current, desired SetupState) ConvergenceClass {
 	if current == desired {
 		return ConvergenceUnchanged

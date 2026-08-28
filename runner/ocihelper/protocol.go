@@ -42,6 +42,7 @@ const (
 	MethodReleaseImagePin    Method = "ReleaseImagePin"
 	MethodReleaseAttemptPin  Method = "ReleaseAttemptImagePin"
 	MethodImageCacheStatus   Method = "ImageCacheStatus"
+	MethodDoctorStatus       Method = "DoctorStatus"
 	MethodRun                Method = "Run"
 	MethodSignal             Method = "Signal"
 	MethodWatch              Method = "Watch"
@@ -78,8 +79,11 @@ const (
 	CodeImageUnavailable      ErrorCode = "image_unavailable"
 	CodeInsufficientDisk      ErrorCode = "insufficient_disk"
 	CodeEngineFailure         ErrorCode = "engine_failure"
-	CodeUnsupportedOperation  ErrorCode = "unsupported_operation"
-	CodeSweepRequired         ErrorCode = "sweep_required"
+	// CodeDiagnosticFailure is a read-only observation failure. It is never
+	// evidence that the helper session or runtime authority was lost.
+	CodeDiagnosticFailure    ErrorCode = "diagnostic_failure"
+	CodeUnsupportedOperation ErrorCode = "unsupported_operation"
+	CodeSweepRequired        ErrorCode = "sweep_required"
 )
 
 // RPCError is safe to cross the private protocol. Engine detail remains local.
@@ -381,6 +385,47 @@ type ImageCacheStatus struct {
 	CapBytes     int64               `json:"cap_bytes"`
 	LastEviction *ImageCacheEviction `json:"last_eviction,omitempty"`
 	LastError    string              `json:"last_error,omitempty"`
+}
+
+type DiagnosticReadOutcome string
+
+const (
+	DiagnosticReadOK     DiagnosticReadOutcome = "ok"
+	DiagnosticReadFailed DiagnosticReadOutcome = "failed"
+
+	DiagnosticErrorContainerdVersion = "containerd_version_unavailable"
+	DiagnosticErrorRuncVersion       = "runc_version_unavailable"
+	DiagnosticErrorCacheStatus       = "cache_status_unavailable"
+	DiagnosticErrorCacheEviction     = "cache_eviction_failed"
+	DiagnosticErrorMountRoots        = "mount_roots_unavailable"
+
+	RuncVersionSourceConfiguredPath = "configured_absolute_path"
+	RuncVersionSourceContainerdInfo = "containerd_runtime_info"
+)
+
+// DiagnosticReadReceipt states whether one helper-side read produced its
+// fact. ErrorCode is a closed, sanitized local code; raw errors never cross
+// the privileged helper boundary.
+type DiagnosticReadReceipt struct {
+	Outcome   DiagnosticReadOutcome `json:"outcome"`
+	ErrorCode string                `json:"error_code,omitempty"`
+}
+
+// DoctorStatus is the helper's read-only mechanics snapshot. It contains no
+// session capability, raw error, or mutation control and is safe to surface to
+// the operator-only node doctor.
+type DoctorStatus struct {
+	RuntimePlatform    OCIPlatform           `json:"runtime_platform"`
+	ContainerdVersion  string                `json:"containerd_version"`
+	ContainerdRead     DiagnosticReadReceipt `json:"containerd_read"`
+	RuncVersion        string                `json:"runc_version"`
+	RuncVersionSource  string                `json:"runc_version_source"`
+	RuncRead           DiagnosticReadReceipt `json:"runc_read"`
+	AllowedMountRoots  []string              `json:"allowed_mount_roots"`
+	MountRootsRead     DiagnosticReadReceipt `json:"mount_roots_read"`
+	Cache              ImageCacheStatus      `json:"cache"`
+	CacheRead          DiagnosticReadReceipt `json:"cache_read"`
+	CacheLastErrorCode string                `json:"cache_last_error_code,omitempty"`
 }
 
 // ImageSource selects one closed delivery mechanism. Empty retains the wire-v1

@@ -3,6 +3,7 @@
 package lima
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -377,7 +378,7 @@ func TestMinimalDoctorFactsAreBoundedAndAtomic(t *testing.T) {
 	observation := contract.CapabilityObservation{
 		Revision: 7, Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, ObservedAt: now,
 	}
-	facts := BuildMinimalDoctorFacts(UnitStateLaunchedByUnit, SupervisorFacts{Instance: DefaultInstanceName, State: InstanceRunning, Enabled: true, ObservedAt: now}, handshake, observation, now, now)
+	facts := BuildMinimalDoctorFacts(UnitStateLaunchedByUnit, SupervisorFacts{Instance: DefaultInstanceName, State: InstanceRunning, Enabled: true, ObservedAt: now}, handshake, observation, &observation, now)
 	path := filepath.Join(t.TempDir(), "facts", "minimal.json")
 	if err := WriteMinimalDoctorFacts(path, facts); err != nil {
 		t.Fatal(err)
@@ -420,9 +421,16 @@ func TestMinimalDoctorFactsPreferStableLimaReason(t *testing.T) {
 	facts := BuildMinimalDoctorFacts(UnitStateLaunchedByUnit, SupervisorFacts{
 		Instance: DefaultInstanceName, State: InstanceBroken, Enabled: true,
 		ReasonCode: contract.CapabilityReasonLimaBroken, ObservedAt: now,
-	}, nil, contract.CapabilityObservation{Revision: 8, Capabilities: map[string]bool{"kind:process": true}}, time.Time{}, now)
-	if facts.ReasonCode != contract.CapabilityReasonLimaBroken || facts.Helper.State != HelperStateUnavailable || facts.Probe.State != ProbeStateFailed {
+	}, nil, contract.CapabilityObservation{Revision: 8, Capabilities: map[string]bool{"kind:process": true}}, nil, now)
+	if facts.ReasonCode != contract.CapabilityReasonLimaBroken || facts.Helper.State != HelperStateUnavailable || facts.Probe.State != ProbeStateNotRun {
 		t.Fatalf("degraded minimal facts = %+v", facts)
+	}
+	payload, err := json.Marshal(facts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(payload, []byte(`"protocol_version":0`)) {
+		t.Fatalf("zero-valued protocol fact was omitted: %s", payload)
 	}
 }
 

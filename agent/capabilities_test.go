@@ -48,7 +48,7 @@ func TestCapabilityRevisionChangesOnlyOnPublishableTransition(t *testing.T) {
 	}
 	second := state.capabilitySnapshot()
 	if first.Revision != 2 || second.Revision != first.Revision || !second.ObservedAt.After(first.ObservedAt) ||
-		!second.LastProbeAt.Equal(second.ObservedAt) || len(second.MissingCapabilities) != 0 || second.ReasonCode != "" {
+		second.LastProbe == nil || !second.LastProbe.ObservedAt.Equal(second.ObservedAt) || len(second.MissingCapabilities) != 0 || second.ReasonCode != "" {
 		t.Fatalf("unchanged probe snapshots = first %#v second %#v", first, second)
 	}
 }
@@ -82,6 +82,19 @@ func TestComputerCapabilityIsProbeOwnedAndRevisioned(t *testing.T) {
 	recovered := state.snapshot()
 	if !recovered.Capabilities["computer"] || recovered.Revision != 4 {
 		t.Fatalf("fresh-boot Computer capability = %+v", recovered)
+	}
+}
+
+func TestRestrictiveObservationDoesNotFabricateProbeReceipt(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 8, 28, 10, 30, 0, 0, time.UTC))
+	state := newCapabilityState(map[string]bool{"kind:process": true}, nil, clock, 0)
+	state.suppressOCI(contract.CapabilityReasonHelperUnreachable, errors.New("helper unavailable"))
+	snapshot := state.capabilitySnapshot()
+	if snapshot.LastProbe != nil {
+		t.Fatalf("restrictive observation fabricated last probe receipt: %+v", snapshot.LastProbe)
+	}
+	if snapshot.ReasonCode != contract.CapabilityReasonHelperUnreachable || snapshot.ObservedAt.IsZero() {
+		t.Fatalf("restrictive observation was not retained separately: %+v", snapshot)
 	}
 }
 

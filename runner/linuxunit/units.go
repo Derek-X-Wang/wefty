@@ -35,6 +35,7 @@ type Config struct {
 	ContainerdAddress   string
 	ContainerdStateRoot string
 	RuntimeRoot         string
+	RuncExecutable      string
 }
 
 type Units struct {
@@ -54,6 +55,9 @@ func Render(config Config) (Units, error) {
 			return Units{}, errors.New("Linux OCI unit paths must be absolute, non-root, and single-line")
 		}
 	}
+	if config.RuncExecutable != "" && (!filepath.IsAbs(config.RuncExecutable) || strings.ContainsAny(config.RuncExecutable, "\r\n")) {
+		return Units{}, errors.New("Linux runc executable must be an absolute single-line path")
+	}
 	for _, argument := range config.AgentArguments {
 		lower := strings.ToLower(argument)
 		if strings.ContainsAny(argument, "\r\n") || strings.Contains(lower, "--auth-key") || strings.Contains(lower, "ts_authkey") {
@@ -66,6 +70,9 @@ func Render(config Config) (Units, error) {
 		"--oci-containerd-address=" + filepath.Clean(config.ContainerdAddress),
 		"--oci-containerd-state-root=" + filepath.Clean(config.ContainerdStateRoot),
 		"--oci-runtime-root=" + filepath.Clean(config.RuntimeRoot),
+	}
+	if config.RuncExecutable != "" {
+		helperArguments = append(helperArguments, "--oci-runc-executable="+filepath.Clean(config.RuncExecutable))
 	}
 	for _, root := range config.AllowedMountRoots {
 		helperArguments = append(helperArguments, "--oci-allowed-mount-root="+filepath.Clean(root))
@@ -85,6 +92,7 @@ WorkingDirectory=` + quote(config.WorkingDirectory) + `
 RuntimeDirectory=wefty-agent
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=restart
+Environment=WEFTY_LAUNCH_UNIT=` + AgentUnit + `
 ExecStart=` + quoteArguments(agentArguments) + `
 Restart=on-failure
 RestartSec=5s

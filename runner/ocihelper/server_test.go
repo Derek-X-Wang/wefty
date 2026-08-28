@@ -1646,6 +1646,86 @@ type blockingWatchEngine struct {
 	entered chan struct{}
 }
 
+type doctorEngine struct{ *fakeEngine }
+
+func (engine *doctorEngine) DoctorStatus(context.Context) (DoctorStatus, error) {
+	engine.record("DoctorStatus")
+	return DoctorStatus{
+		RuntimePlatform:   OCIPlatform{OS: "linux", Architecture: "amd64"},
+		ContainerdVersion: "2.3.4", RuncVersion: "1.3.3",
+		ContainerdRead:    DiagnosticReadReceipt{Outcome: DiagnosticReadOK},
+		RuncRead:          DiagnosticReadReceipt{Outcome: DiagnosticReadOK},
+		AllowedMountRoots: []string{"/srv/wefty"}, MountRootsRead: DiagnosticReadReceipt{Outcome: DiagnosticReadOK},
+		Cache: ImageCacheStatus{Bytes: 8 << 30, CapBytes: 16 << 30}, CacheRead: DiagnosticReadReceipt{Outcome: DiagnosticReadOK},
+	}, nil
+}
+
+type failingDoctorEngine struct{ *fakeEngine }
+
+func (engine *failingDoctorEngine) DoctorStatus(context.Context) (DoctorStatus, error) {
+	engine.record("DoctorStatus")
+	return DoctorStatus{}, errors.New("simulated absolute runc version read failure")
+}
+
+func TestDoctorStatusIsReadOnlyAndAssertionDerived(t *testing.T) {
+	engine := &doctorEngine{fakeEngine: newFakeEngine()}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	before := len(engine.methods())
+	status, err := session.DoctorStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := engine.methods()
+	if status.RuntimePlatform.OS != "linux" || status.ContainerdVersion != "2.3.4" || status.Cache.Bytes > status.Cache.CapBytes {
+		t.Fatalf("doctor status = %+v", status)
+	}
+	if len(after) != before+1 || after[len(after)-1] != "DoctorStatus" {
+		t.Fatalf("doctor invoked mechanics beyond its read: before=%d calls=%v", before, after)
+	}
+}
+
+func TestDoctorFailureNeverInvalidatesSessionOrReapsAttempts(t *testing.T) {
+	engine := &failingDoctorEngine{fakeEngine: newFakeEngine()}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	before := session.Handshake()
+	losses := 0
+	session.SetLossHandler(func(error) { losses++ })
+	_, err = session.DoctorStatus(t.Context())
+	assertRPCCode(t, err, CodeDiagnosticFailure)
+	dial := session.client.Dial
+	session.client.Dial = func(context.Context) (net.Conn, error) { return nil, errors.New("simulated diagnostic dial failure") }
+	if _, err := session.DoctorStatus(t.Context()); err == nil {
+		t.Fatal("diagnostic dial failure was hidden")
+	}
+	session.client.Dial = dial
+	if healthErr := session.HealthError(); healthErr != nil {
+		t.Fatalf("diagnostic failure invalidated session: %v", healthErr)
+	}
+	if after := session.Handshake(); after.HelperInstanceID != before.HelperInstanceID || after.SessionGeneration != before.SessionGeneration {
+		t.Fatalf("diagnostic failure changed helper authority: before=%+v after=%+v", before, after)
+	}
+	if losses != 0 || engine.sessionReapCount() != 0 || engine.attemptReapCount() != 0 {
+		t.Fatalf("diagnostic failure caused loss=%d session_reaps=%d attempt_reaps=%d", losses, engine.sessionReapCount(), engine.attemptReapCount())
+	}
+	if _, err := session.Verify(t.Context(), VerifyRequest{Scope: VerifyNamespace}); err != nil {
+		t.Fatalf("session was not usable after diagnostic failure: %v", err)
+	}
+}
+
 type guardianRecordingEngine struct {
 	*fakeEngine
 	guardianMu sync.Mutex

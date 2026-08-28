@@ -15,7 +15,7 @@ import (
 
 func executeLocalNode(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError("usage: wefty node setup-oci | wefty node oci start|stop | wefty node load-image FILE")
+		return usageError("usage: wefty node doctor | wefty node setup-oci | wefty node oci start|stop | wefty node load-image FILE")
 	}
 	if handled, err := maybeExecutePrivilegedLinuxSetup(ctx, options, args, stdout, stderr); handled {
 		return err
@@ -37,6 +37,8 @@ func executeLocalNode(ctx context.Context, options globalOptions, args []string,
 	}
 	defer client.Close()
 	switch args[0] {
+	case "doctor":
+		return executeLocalDoctor(ctx, client, options.jsonOutput, args[1:], stdout)
 	case "setup-oci":
 		return executeLocalSetupOCI(ctx, client, options.jsonOutput, args[1:], stdout, stderr)
 	case "oci":
@@ -46,6 +48,23 @@ func executeLocalNode(ctx context.Context, options globalOptions, args []string,
 	default:
 		return usageError(fmt.Sprintf("unknown singular node command %q", args[0]))
 	}
+}
+
+func executeLocalDoctor(ctx context.Context, client *ocicontrol.Client, jsonOutput bool, args []string, stdout io.Writer) error {
+	if len(args) != 0 {
+		return usageError("wefty node doctor does not accept arguments")
+	}
+	report, err := client.Doctor(ctx)
+	if err != nil {
+		return err
+	}
+	if err := report.Validate(); err != nil {
+		return fmt.Errorf("validate node doctor response: %w", err)
+	}
+	if jsonOutput {
+		return writeJSON(stdout, report)
+	}
+	return ocicontrol.WriteDoctorHuman(stdout, report)
 }
 
 func executeLocalSetupOCI(ctx context.Context, client *ocicontrol.Client, jsonOutput bool, args []string, stdout, stderr io.Writer) error {

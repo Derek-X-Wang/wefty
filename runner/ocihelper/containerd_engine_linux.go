@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -109,9 +110,10 @@ type ContainerdEngine struct {
 }
 
 const (
-	defaultAttemptPortMin   uint16 = 42000
-	defaultAttemptPortMax   uint16 = 42999
-	defaultHandoffRetention        = 24 * time.Hour
+	defaultAttemptPortMin    uint16 = 42000
+	defaultAttemptPortMax    uint16 = 42999
+	defaultHandoffRetention         = 24 * time.Hour
+	doctorRuntimeReadTimeout        = 2 * time.Second
 )
 
 func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
@@ -120,6 +122,9 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	}
 	if config.RuntimeRoot == "" {
 		config.RuntimeRoot = "/var/lib/wefty/oci"
+	}
+	if config.RuncExecutable != "" && !filepath.IsAbs(config.RuncExecutable) {
+		return nil, errors.New("configured runc executable must be absolute")
 	}
 	if config.ContainerdStateRoot == "" {
 		config.ContainerdStateRoot = "/run/containerd"
@@ -269,6 +274,69 @@ func (engine *ContainerdEngine) Close() error {
 		}
 	})
 	return engine.closeErr
+}
+
+func (engine *ContainerdEngine) DoctorStatus(ctx context.Context) (DoctorStatus, error) {
+	status := DoctorStatus{RuntimePlatform: OCIPlatform{OS: runtime.GOOS, Architecture: runtime.GOARCH}}
+	versionContext, cancelVersion := context.WithTimeout(ctx, doctorRuntimeReadTimeout)
+	version, err := engine.client.Version(versionContext)
+	cancelVersion()
+	if err != nil {
+		status.ContainerdRead = DiagnosticReadReceipt{Outcome: DiagnosticReadFailed, ErrorCode: DiagnosticErrorContainerdVersion}
+	} else {
+		status.ContainerdVersion = version.Version
+		status.ContainerdRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
+	}
+	runcContext, cancelRunc := context.WithTimeout(ctx, doctorRuntimeReadTimeout)
+	if engine.config.RuncExecutable != "" {
+		payload, runcErr := exec.CommandContext(runcContext, engine.config.RuncExecutable, "--version").Output()
+		if runcErr == nil {
+			line, _, _ := strings.Cut(strings.TrimSpace(string(payload)), "\n")
+			status.RuncVersion = strings.TrimSpace(strings.TrimPrefix(line, "runc version"))
+			status.RuncVersionSource = RuncVersionSourceConfiguredPath
+		}
+		if runcErr != nil || status.RuncVersion == "" {
+			status.RuncRead = DiagnosticReadReceipt{Outcome: DiagnosticReadFailed, ErrorCode: DiagnosticErrorRuncVersion}
+		} else {
+			status.RuncRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
+		}
+	} else {
+		runtimeInfo, runcErr := engine.client.RuntimeInfo(runcContext, DefaultRuntimeHandler, nil)
+		if runcErr == nil && runtimeInfo != nil {
+			status.RuncVersion = strings.TrimSpace(runtimeInfo.Version.Version)
+			status.RuncVersionSource = RuncVersionSourceContainerdInfo
+		}
+		if runcErr != nil || status.RuncVersion == "" {
+			status.RuncRead = DiagnosticReadReceipt{Outcome: DiagnosticReadFailed, ErrorCode: DiagnosticErrorRuncVersion}
+		} else {
+			status.RuncRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
+		}
+	}
+	cancelRunc()
+	cacheContext, cancelCache := context.WithTimeout(ctx, doctorRuntimeReadTimeout)
+	cache, cacheErr := engine.ImageCacheStatus(cacheContext)
+	cancelCache()
+	if cacheErr != nil {
+		status.CacheRead = DiagnosticReadReceipt{Outcome: DiagnosticReadFailed, ErrorCode: DiagnosticErrorCacheStatus}
+	} else {
+		if cache.LastError != "" {
+			status.CacheLastErrorCode = DiagnosticErrorCacheEviction
+			cache.LastError = ""
+		}
+		status.Cache = cache
+		status.CacheRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
+	}
+	roots := append([]string(nil), engine.config.AllowedMountRoots...)
+	if engine.config.HostMountRoot != "" {
+		roots = []string{engine.config.HostMountRoot}
+	}
+	for index := range roots {
+		roots[index] = filepath.Clean(roots[index])
+	}
+	sort.Strings(roots)
+	status.AllowedMountRoots = roots
+	status.MountRootsRead = DiagnosticReadReceipt{Outcome: DiagnosticReadOK}
+	return status, nil
 }
 
 func engineContext(ctx context.Context) context.Context {

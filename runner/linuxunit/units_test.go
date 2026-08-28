@@ -9,7 +9,7 @@ func TestRenderLinuxUnitsKeepsAgentUnprivilegedAndHelperNarrow(t *testing.T) {
 	units, err := Render(Config{
 		AgentPath: "/usr/local/libexec/wefty-agent", OperatorUser: "wefty", OperatorGroup: "wefty", OperatorUID: 1001, OperatorGID: 1001,
 		WorkingDirectory: "/var/lib/wefty", ContainerdAddress: "/run/containerd/containerd.sock",
-		ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci",
+		ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci", RuncExecutable: "/usr/local/sbin/runc",
 		AllowedMountRoots: []string{"/srv/wefty"}, AgentArguments: []string{
 			"--node-id=node-linux", "--oci-helper-socket=" + HelperSocketPath,
 			"--oci-intent-file=/var/lib/wefty/oci-intent.json", "--oci-control-socket=/run/wefty-agent/control.sock",
@@ -21,12 +21,12 @@ func TestRenderLinuxUnitsKeepsAgentUnprivilegedAndHelperNarrow(t *testing.T) {
 	agent := string(units.Agent)
 	helper := string(units.HelperService)
 	socket := string(units.HelperSocket)
-	for _, want := range []string{"User=wefty", "SupplementaryGroups=wefty-oci", "NoNewPrivileges=true", "Restart=on-failure"} {
+	for _, want := range []string{"User=wefty", "SupplementaryGroups=wefty-oci", "NoNewPrivileges=true", "Restart=on-failure", "Environment=WEFTY_LAUNCH_UNIT=wefty-agent.service"} {
 		if !strings.Contains(agent, want) {
 			t.Fatalf("agent unit missing %q:\n%s", want, agent)
 		}
 	}
-	for _, want := range []string{"User=root", "WEFTY_OCI_HELPER_ALLOWED_UIDS=1001", "__wefty_oci_helper", "--oci-allowed-mount-root=/srv/wefty"} {
+	for _, want := range []string{"User=root", "WEFTY_OCI_HELPER_ALLOWED_UIDS=1001", "__wefty_oci_helper", "--oci-allowed-mount-root=/srv/wefty", "--oci-runc-executable=/usr/local/sbin/runc"} {
 		if !strings.Contains(helper, want) {
 			t.Fatalf("helper unit missing %q:\n%s", want, helper)
 		}
@@ -68,6 +68,7 @@ func TestRenderLinuxUnitsRejectsAdversarialConfiguration(t *testing.T) {
 		{name: "root group", mutate: func(config *Config) { config.OperatorGID = 0 }},
 		{name: "missing operator group", mutate: func(config *Config) { config.OperatorGroup = "" }},
 		{name: "relative binary", mutate: func(config *Config) { config.AgentPath = "wefty-agent" }},
+		{name: "relative runc", mutate: func(config *Config) { config.RuncExecutable = "runc" }},
 		{name: "root mount", mutate: func(config *Config) { config.AllowedMountRoots = []string{"/"} }},
 		{name: "credential argument", mutate: func(config *Config) { config.AgentArguments = []string{"--auth-key=secret"} }},
 		{name: "newline", mutate: func(config *Config) { config.AgentArguments = []string{"--node-id=x\nEnvironment=oops"} }},

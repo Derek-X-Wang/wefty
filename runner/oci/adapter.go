@@ -44,6 +44,49 @@ type Adapter struct {
 	mountGuards           map[string]*ocihelper.HostMountGuard
 }
 
+// DoctorStatus is a read-only view of the current barrier-pinned helper. It
+// deliberately omits the helper session capability.
+type DoctorStatus struct {
+	ProtocolVersion         int
+	HelperVersion           string
+	HelperChecksum          string
+	HelperInstanceID        string
+	SessionGeneration       uint64
+	Runtime                 ocihelper.DoctorStatus
+	RuntimePlatformRecorded bool
+	SweepReceipt            ocihelper.VerifiedSweepReceipt
+	SweepReceiptRecorded    bool
+}
+
+func (adapter *Adapter) DoctorStatus(ctx context.Context) (DoctorStatus, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return DoctorStatus{}, errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return DoctorStatus{}, err
+	}
+	handshake := session.Handshake()
+	status := DoctorStatus{
+		ProtocolVersion: handshake.ProtocolVersion, HelperVersion: handshake.HelperVersion,
+		HelperChecksum: handshake.HelperChecksum, HelperInstanceID: handshake.HelperInstanceID,
+		SessionGeneration: handshake.SessionGeneration,
+	}
+	if source, ok := adapter.sessions.(sweepReceiptSource); ok {
+		status.SweepReceipt, status.SweepReceiptRecorded = source.SweepReceipt()
+	}
+	runtimeStatus, runtimeErr := session.DoctorStatus(ctx)
+	probePlatform, platformRecorded := adapter.probePlatform(session)
+	if platformRecorded {
+		runtimeStatus.RuntimePlatform = probePlatform
+	} else {
+		runtimeStatus.RuntimePlatform = ocihelper.OCIPlatform{}
+	}
+	status.Runtime = runtimeStatus
+	status.RuntimePlatformRecorded = platformRecorded
+	return status, runtimeErr
+}
+
 type memoryBindingPinLedger struct {
 	mu   sync.Mutex
 	pins map[string]workloadrunner.OCIImageBindingPin

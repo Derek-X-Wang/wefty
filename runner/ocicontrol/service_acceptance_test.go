@@ -7,7 +7,21 @@ import (
 	"os"
 	"runtime"
 	"testing"
+	"time"
 )
+
+func TestServiceAcceptanceNodeDoctorIsFactsOnly(t *testing.T) {
+	now := time.Date(2026, 8, 28, 22, 0, 0, 0, time.UTC)
+	report := BuildDoctor(t.Context(), healthyDoctorConfig(now, ""))
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range report.Findings {
+		if item.Outcome == DiagnosticNotRun && item.Check != "lima" {
+			t.Fatalf("configured doctor check did not run: %+v", item)
+		}
+	}
+}
 
 type rebootReceipt struct {
 	Version           int    `json:"version"`

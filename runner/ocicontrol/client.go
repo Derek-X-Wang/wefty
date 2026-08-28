@@ -46,6 +46,12 @@ func (client *Client) Intent(ctx context.Context) (lima.OCIIntent, error) {
 	return response, err
 }
 
+func (client *Client) Doctor(ctx context.Context) (DoctorResponse, error) {
+	var response DoctorResponse
+	err := client.call(ctx, http.MethodGet, "/v1/doctor", nil, "", &response)
+	return response, err
+}
+
 func (client *Client) Setup(ctx context.Context, request SetupRequest) (SetupResponse, error) {
 	var response SetupResponse
 	err := client.callJSON(ctx, "/v1/setup", request, &response)
