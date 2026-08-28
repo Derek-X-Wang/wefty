@@ -1,6 +1,15 @@
 package ocicontrol
 
-import "errors"
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+
+	"github.com/Derek-X-Wang/wefty/runner/lima"
+)
 
 // SetupState is the durable, explicit node-local configuration compared by
 // setup. Probe identity is live-safe; fixed VM sizing requires a restart; VM
@@ -34,15 +43,59 @@ func AuthorizeConvergence(class ConvergenceClass, applyRestart, recreate bool, l
 	switch class {
 	case ConvergenceRecreateRequired:
 		if !recreate {
-			return errors.New("template_recreate_required")
+			return controlError(ErrorTemplateRecreateRequired, 409, "template recreation required", nil)
 		}
 		if liveOCIAttempts != 0 {
 			return errors.New("template recreation requires zero live OCI attempts")
 		}
 	case ConvergenceRestartRequired:
 		if !applyRestart {
-			return errors.New("template_restart_required")
+			return controlError(ErrorTemplateRestartRequired, 409, "template restart required", nil)
 		}
+		if liveOCIAttempts != 0 {
+			return errors.New("template restart requires zero live OCI attempts")
+		}
+	}
+	return nil
+}
+
+func ReadSetupState(path string) (SetupState, error) {
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return SetupState{}, err
+	}
+	var state SetupState
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&state); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return SetupState{}, errors.New("invalid OCI setup state")
+	}
+	if err := validateSetupState(state); err != nil {
+		return SetupState{}, err
+	}
+	return state, nil
+}
+
+func WriteSetupState(path string, state SetupState) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("OCI setup state path must be absolute")
+	}
+	if err := validateSetupState(state); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	return writeAtomic(path, append(payload, '\n'), 0o600)
+}
+
+func validateSetupState(state SetupState) error {
+	if err := (lima.Sizing{Memory: state.VMMemory, CPUs: state.VMCPUs, Disk: state.VMDisk}).Validate(); err != nil {
+		return errors.New("invalid OCI setup state")
+	}
+	if state.VMType == "" || state.ProbeDigest == "" || !filepath.IsAbs(state.HostMountRoot) || filepath.Clean(state.HostMountRoot) == string(filepath.Separator) {
+		return errors.New("invalid OCI setup state")
 	}
 	return nil
 }

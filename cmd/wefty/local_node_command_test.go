@@ -33,7 +33,7 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 			return (lima.FileIntentSource{Path: intentPath}).ReadIntent(ctx)
 		},
 		StopFunc: func(_ context.Context, request ocicontrol.IntentMutationRequest) (ocicontrol.IntentResponse, error) {
-			intent, err := lima.SetOCIIntent(intentPath, request.ExpectedRevision, false, time.Now())
+			intent, err := lima.SetOCIIntent(context.Background(), intentPath, request.ExpectedRevision, false, time.Now())
 			return ocicontrol.IntentResponse{Intent: intent, RuntimeQuiesced: err == nil}, err
 		},
 		LoadImageFunc: func(_ context.Context, archive io.Reader) (ocicontrol.LoadImageResponse, error) {

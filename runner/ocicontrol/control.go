@@ -5,8 +5,8 @@ package ocicontrol
 
 import (
 	"context"
-	"errors"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -55,6 +55,8 @@ type SetupResponse struct {
 	Intent            lima.OCIIntent                `json:"intent"`
 	Convergence       ConvergenceClass              `json:"convergence"`
 	ProbePreloaded    bool                          `json:"probe_preloaded"`
+	RestartApplied    bool                          `json:"restart_applied,omitempty"`
+	RecreateApplied   bool                          `json:"recreate_applied,omitempty"`
 	ReasonCode        contract.CapabilityReasonCode `json:"reason_code,omitempty"`
 	MissingCapability string                        `json:"missing_capability,omitempty"`
 	Runbook           string                        `json:"runbook,omitempty"`
@@ -76,18 +78,38 @@ type LoadImageResponse struct {
 	Evidence       ocihelper.ImageEvidence `json:"evidence"`
 }
 
-type ErrorResponse struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+const (
+	ErrorInvalidRequest           contract.ErrorCode = contract.ErrorInvalidRequest
+	ErrorIntentConflict           contract.ErrorCode = contract.ErrorStaleIntentRevision
+	ErrorRuntimeUnavailable       contract.ErrorCode = "oci_runtime_unavailable"
+	ErrorRuntimeQuiescenceFailed  contract.ErrorCode = "oci_runtime_quiescence_failed"
+	ErrorSetupRequired            contract.ErrorCode = "oci_setup_required"
+	ErrorTemplateRestartRequired  contract.ErrorCode = "template_restart_required"
+	ErrorTemplateRecreateRequired contract.ErrorCode = "template_recreate_required"
+	ErrorInternal                 contract.ErrorCode = contract.ErrorInternal
+)
+
+type ControlError struct {
+	Code    contract.ErrorCode
+	Status  int
+	Message string
+	Cause   error
 }
 
-const (
-	ErrorInvalidRequest     = "invalid_request"
-	ErrorIntentConflict     = "intent_conflict"
-	ErrorRuntimeUnavailable = "runtime_unavailable"
-	ErrorSetupRequired      = "setup_required"
-	ErrorInternal           = "internal_error"
-)
+func (err *ControlError) Error() string { return err.Message }
+func (err *ControlError) Unwrap() error { return err.Cause }
+
+func controlError(code contract.ErrorCode, status int, message string, cause error) error {
+	return &ControlError{Code: code, Status: status, Message: message, Cause: cause}
+}
+
+func invalidRequest(message string, cause error) error {
+	return controlError(ErrorInvalidRequest, http.StatusBadRequest, message, cause)
+}
+
+func runtimeUnavailable(message string, cause error) error {
+	return controlError(ErrorRuntimeUnavailable, http.StatusServiceUnavailable, message, cause)
+}
 
 type Service interface {
 	Intent(context.Context) (lima.OCIIntent, error)
@@ -107,35 +129,35 @@ type ServiceFuncs struct {
 
 func (service ServiceFuncs) Intent(ctx context.Context) (lima.OCIIntent, error) {
 	if service.IntentFunc == nil {
-		return lima.OCIIntent{}, errors.New("OCI intent control is unavailable")
+		return lima.OCIIntent{}, runtimeUnavailable("OCI intent control is unavailable", nil)
 	}
 	return service.IntentFunc(ctx)
 }
 
 func (service ServiceFuncs) Setup(ctx context.Context, request SetupRequest) (SetupResponse, error) {
 	if service.SetupFunc == nil {
-		return SetupResponse{}, errors.New("OCI setup control is unavailable")
+		return SetupResponse{}, controlError(ErrorSetupRequired, http.StatusPreconditionFailed, "OCI setup control is unavailable", nil)
 	}
 	return service.SetupFunc(ctx, request)
 }
 
 func (service ServiceFuncs) Start(ctx context.Context, request IntentMutationRequest) (IntentResponse, error) {
 	if service.StartFunc == nil {
-		return IntentResponse{}, errors.New("OCI start control is unavailable")
+		return IntentResponse{}, runtimeUnavailable("OCI start control is unavailable", nil)
 	}
 	return service.StartFunc(ctx, request)
 }
 
 func (service ServiceFuncs) Stop(ctx context.Context, request IntentMutationRequest) (IntentResponse, error) {
 	if service.StopFunc == nil {
-		return IntentResponse{}, errors.New("OCI stop control is unavailable")
+		return IntentResponse{}, runtimeUnavailable("OCI stop control is unavailable", nil)
 	}
 	return service.StopFunc(ctx, request)
 }
 
 func (service ServiceFuncs) LoadImage(ctx context.Context, archive io.Reader) (LoadImageResponse, error) {
 	if service.LoadImageFunc == nil {
-		return LoadImageResponse{}, errors.New("OCI image loading is unavailable")
+		return LoadImageResponse{}, runtimeUnavailable("OCI image loading is unavailable", nil)
 	}
 	return service.LoadImageFunc(ctx, archive)
 }

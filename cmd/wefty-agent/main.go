@@ -141,6 +141,7 @@ func runMacBootstrap(arguments []string) error {
 	intentPath := flags.String("intent-file", "", "absolute read-only durable OCI intent file")
 	controlSocket := flags.String("control-socket", "", "absolute operator-only OCI control socket")
 	nodeConfig := flags.String("node-config", "", "absolute installed node configuration for singular CLI commands")
+	setupState := flags.String("setup-state", "", "absolute durable OCI setup convergence state")
 	stdoutPath := flags.String("stdout-path", "", "absolute LaunchDaemon stdout log path")
 	stderrPath := flags.String("stderr-path", "", "absolute LaunchDaemon stderr log path")
 	remove := flags.Bool("remove", false, "remove the interim Mac bootstrap idempotently and emit JSON evidence")
@@ -157,16 +158,20 @@ func runMacBootstrap(arguments []string) error {
 		*controlSocket = filepath.Join(*limaHome, "wefty-control.sock")
 	}
 	if *nodeConfig == "" && filepath.IsAbs(*operatorHome) {
-		*nodeConfig = filepath.Join(*operatorHome, ".config", "wefty", "node.json")
+		*nodeConfig, _ = ocicontrol.DefaultInstalledConfigPath(*operatorHome)
+	}
+	if *setupState == "" && filepath.IsAbs(*limaHome) {
+		*setupState = filepath.Join(*limaHome, "wefty-oci-setup.json")
 	}
 	if *remove {
-		return removeMacBootstrap(*instance, *limactl, *factsPath, *intentPath, *controlSocket, *nodeConfig)
+		return removeMacBootstrap(*instance, *limactl, *factsPath, *intentPath, *controlSocket, *nodeConfig, *setupState)
 	}
 	for _, argument := range agentArguments {
 		for _, reserved := range []string{
 			"--node-id", "--oci-helper-socket", "--oci-helper-checksum", "--oci-probe-image", "--oci-probe-digest",
 			"--oci-lima-instance", "--oci-lima-host-mount-root", "--oci-minimal-doctor-facts", "--oci-intent-file",
 			"--oci-control-socket", "--oci-probe-archive",
+			"--oci-setup-state",
 		} {
 			if argument == reserved || strings.HasPrefix(argument, reserved+"=") {
 				return fmt.Errorf("--agent-arg must not override bootstrap-owned %s", reserved)
@@ -183,8 +188,8 @@ func runMacBootstrap(arguments []string) error {
 	if !filepath.IsAbs(*intentPath) {
 		return errors.New("--intent-file must be absolute")
 	}
-	if !filepath.IsAbs(*controlSocket) || !filepath.IsAbs(*nodeConfig) {
-		return errors.New("--control-socket and --node-config must be absolute")
+	if !filepath.IsAbs(*controlSocket) || !filepath.IsAbs(*nodeConfig) || !filepath.IsAbs(*setupState) {
+		return errors.New("--control-socket, --node-config, and --setup-state must be absolute")
 	}
 	operator, err := user.Lookup(*operatorUser)
 	if err != nil {
@@ -222,6 +227,7 @@ func runMacBootstrap(arguments []string) error {
 		"--oci-intent-file="+*intentPath,
 		"--oci-control-socket="+*controlSocket,
 		"--oci-probe-archive="+*probeArchive,
+		"--oci-setup-state="+*setupState,
 	)
 	launchConfig := limarunner.LaunchDaemonConfig{
 		AgentPath: *agentPath, Arguments: installedArguments, OperatorUser: *operatorUser,
@@ -259,6 +265,9 @@ func runMacBootstrap(arguments []string) error {
 	if err := os.Chown(filepath.Dir(*nodeConfig), operatorUID, operatorGID); err != nil {
 		return fmt.Errorf("set installed node configuration directory owner: %w", err)
 	}
+	if err := os.Chown(filepath.Dir(filepath.Dir(*nodeConfig)), operatorUID, operatorGID); err != nil {
+		return fmt.Errorf("set installed node configuration parent owner: %w", err)
+	}
 	if err := os.Chown(*nodeConfig, operatorUID, operatorGID); err != nil {
 		return fmt.Errorf("set installed node configuration owner: %w", err)
 	}
@@ -272,9 +281,10 @@ type macBootstrapRemovalEvidence struct {
 	IntentAbsent        bool                                   `json:"intent_absent"`
 	ControlSocketAbsent bool                                   `json:"control_socket_absent"`
 	NodeConfigAbsent    bool                                   `json:"node_config_absent"`
+	SetupStateAbsent    bool                                   `json:"setup_state_absent"`
 }
 
-func removeMacBootstrap(instance, limactl, factsPath, intentPath, controlSocket, nodeConfig string) error {
+func removeMacBootstrap(instance, limactl, factsPath, intentPath, controlSocket, nodeConfig, setupState string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	evidence := macBootstrapRemovalEvidence{}
@@ -295,13 +305,14 @@ func removeMacBootstrap(instance, limactl, factsPath, intentPath, controlSocket,
 		_, err := os.Stat(path)
 		return errors.Is(err, os.ErrNotExist), nil
 	}
-	var factsErr, intentErr, socketErr, configErr error
+	var factsErr, intentErr, socketErr, configErr, setupErr error
 	evidence.FactsAbsent, factsErr = removeLocal(factsPath)
 	evidence.IntentAbsent, intentErr = removeLocal(intentPath)
 	evidence.ControlSocketAbsent, socketErr = removeLocal(controlSocket)
 	evidence.NodeConfigAbsent, configErr = removeLocal(nodeConfig)
+	evidence.SetupStateAbsent, setupErr = removeLocal(setupState)
 	encodeErr := json.NewEncoder(os.Stdout).Encode(evidence)
-	return errors.Join(unitErr, helperErr, factsErr, intentErr, socketErr, configErr, encodeErr)
+	return errors.Join(unitErr, helperErr, factsErr, intentErr, socketErr, configErr, setupErr, encodeErr)
 }
 
 func run() error {
@@ -346,6 +357,7 @@ func run() error {
 		ociIntentFile         = flag.String("oci-intent-file", "", "absolute read-only durable OCI intent file; missing disables OCI")
 		ociControlSocket      = flag.String("oci-control-socket", "", "operator-only node-local OCI control socket")
 		ociProbeArchive       = flag.String("oci-probe-archive", "", "absolute immutable OCI archive used by setup-oci")
+		ociSetupState         = flag.String("oci-setup-state", "", "absolute durable OCI setup convergence state")
 	)
 	flag.Parse()
 	if *nodeID == "" {
@@ -365,6 +377,9 @@ func run() error {
 	}
 	if *ociProbeArchive != "" && !filepath.IsAbs(*ociProbeArchive) {
 		return errors.New("--oci-probe-archive must be absolute when set")
+	}
+	if *ociSetupState != "" && !filepath.IsAbs(*ociSetupState) {
+		return errors.New("--oci-setup-state must be absolute when set")
 	}
 	if *ociImageCacheMaxBytes <= 0 {
 		return fmt.Errorf("--oci-image-cache-max-bytes must be positive")
@@ -431,6 +446,7 @@ func run() error {
 			limaSupervisor, err = limarunner.NewSupervisor(limarunner.SupervisorConfig{
 				Instance: *ociLimaInstance,
 				Intent:   limarunner.FileIntentSource{Path: *ociIntentFile},
+				Logf:     log.Printf,
 			})
 			if err != nil {
 				return err
@@ -497,46 +513,106 @@ func run() error {
 	defer nodeAgent.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var controlErrors chan error
 	if *ociControlSocket != "" {
 		if *ociIntentFile == "" {
 			return errors.New("--oci-intent-file is required with --oci-control-socket")
 		}
+		var stopCycle ocicontrol.StopCycle
+		if supervisedBootBarrier != nil {
+			stopCycle = supervisedBootBarrier
+		}
 		controller, err := ocicontrol.NewController(ocicontrol.ControllerConfig{
-			IntentPath: *ociIntentFile, Runtime: nodeAgent, Images: ociAdapter, StopCycle: supervisedBootBarrier,
-			Setup: func(setupContext context.Context, _ ocicontrol.SetupRequest, intent limarunner.OCIIntent) (ocicontrol.SetupResponse, error) {
-				response := ocicontrol.SetupResponse{Intent: intent, Convergence: ocicontrol.ConvergenceUnchanged}
-				probeInfo, probeErr := os.Stat(*ociProbeArchive)
-				if ociAdapter == nil || *ociProbeArchive == "" || probeErr != nil || !probeInfo.Mode().IsRegular() {
+			IntentPath: *ociIntentFile, Runtime: nodeAgent, Images: ociAdapter, StopCycle: stopCycle,
+			Setup: func(setupContext context.Context, request ocicontrol.SetupRequest) (ocicontrol.SetupResponse, error) {
+				response := ocicontrol.SetupResponse{Convergence: ocicontrol.ConvergenceLiveSafe}
+				if runtime.GOOS == "linux" {
 					response.ReasonCode = contract.CapabilityReasonPrerequisiteMissing
-					response.MissingCapability = "configured_probe_archive"
+					response.MissingCapability = "privileged_linux_setup"
 					response.Runbook = ocicontrol.RunbookPath
 					return response, nil
 				}
-				if !intent.Enabled {
-					// Explicit setup preserves a disabled intent and cannot wake the
-					// runtime merely to refresh an already configured probe artifact.
-					response.Configured = true
-					response.ReasonCode = contract.CapabilityReasonOCIIntentDisabled
+				probeInfo, probeErr := os.Stat(*ociProbeArchive)
+				if ociAdapter == nil || *ociProbeArchive == "" || probeErr != nil || !probeInfo.Mode().IsRegular() || *ociSetupState == "" {
+					response.ReasonCode = contract.CapabilityReasonPrerequisiteMissing
+					response.MissingCapability = "configured_probe_archive_or_setup_state"
+					response.Runbook = ocicontrol.RunbookPath
 					return response, nil
 				}
-				if err := nodeAgent.RecoverOCIRuntimeCapabilities(setupContext); err != nil {
-					return response, err
+				desired := ocicontrol.SetupState{
+					VMMemory: request.VMMemory, VMCPUs: request.VMCPUs, VMDisk: request.VMDisk,
+					VMType: "vz", HostMountRoot: *ociLimaMountRoot, ProbeDigest: *ociProbeDigest,
 				}
-				archive, err := os.Open(*ociProbeArchive)
-				if err != nil {
-					return response, fmt.Errorf("open configured OCI probe archive: %w", err)
+				current, stateErr := ocicontrol.ReadSetupState(*ociSetupState)
+				if stateErr == nil {
+					response.Convergence = ocicontrol.ClassifyConvergence(current, desired)
+				} else if !errors.Is(stateErr, os.ErrNotExist) {
+					return response, stateErr
 				}
-				loaded, loadErr := ociAdapter.LoadImage(setupContext, *ociProbeImage, archive)
-				closeErr := archive.Close()
-				if loadErr != nil || closeErr != nil {
-					return response, errors.Join(loadErr, closeErr)
-				}
-				if loaded.TopLevelDigest != *ociProbeDigest {
-					return response, errors.New("configured OCI probe archive digest does not match --oci-probe-digest")
+				if runtime.GOOS == "darwin" {
+					limaHome := os.Getenv("LIMA_HOME")
+					if !filepath.IsAbs(limaHome) {
+						response.ReasonCode = contract.CapabilityReasonPrerequisiteMissing
+						response.MissingCapability = "LIMA_HOME"
+						response.Runbook = ocicontrol.RunbookPath
+						return response, nil
+					}
+					if err := limarunner.WriteTemplate(filepath.Join(limaHome, *ociLimaInstance, "lima.yaml"), limarunner.TemplateConfig{
+						Sizing: limarunner.Sizing{Memory: request.VMMemory, CPUs: request.VMCPUs, Disk: request.VMDisk}, HostAllowedMountRoot: *ociLimaMountRoot,
+					}); err != nil {
+						return response, err
+					}
 				}
 				response.Configured = true
-				response.ProbePreloaded = true
+				if response.Convergence == ocicontrol.ConvergenceRestartRequired && !request.ApplyRestart {
+					response.ReasonCode = contract.CapabilityReasonTemplateRestartRequired
+					return response, nil
+				}
+				if response.Convergence == ocicontrol.ConvergenceRecreateRequired && !request.Recreate {
+					response.ReasonCode = contract.CapabilityReasonTemplateRecreateRequired
+					return response, nil
+				}
+				if authErr := ocicontrol.AuthorizeConvergence(response.Convergence, request.ApplyRestart, request.Recreate, nodeAgent.LiveOCIAttempts()); authErr != nil {
+					return response, authErr
+				}
+				if bootBarrier != nil && bootBarrier.Ready() {
+					archive, err := os.Open(*ociProbeArchive)
+					if err != nil {
+						return response, fmt.Errorf("open configured OCI probe archive: %w", err)
+					}
+					loaded, loadErr := ociAdapter.LoadImage(setupContext, *ociProbeImage, archive)
+					closeErr := archive.Close()
+					if loadErr != nil || closeErr != nil {
+						return response, errors.Join(loadErr, closeErr)
+					}
+					if loaded.TopLevelDigest != *ociProbeDigest {
+						return response, errors.New("configured OCI probe archive digest does not match --oci-probe-digest")
+					}
+					response.ProbePreloaded = true
+				}
+				applyCycle := response.Convergence == ocicontrol.ConvergenceRestartRequired && request.ApplyRestart ||
+					response.Convergence == ocicontrol.ConvergenceRecreateRequired && request.Recreate
+				if applyCycle {
+					if supervisedBootBarrier == nil {
+						return response, errors.New("requested Lima restart is unavailable")
+					}
+					template := limarunner.TemplateConfig{
+						Sizing: limarunner.Sizing{Memory: request.VMMemory, CPUs: request.VMCPUs, Disk: request.VMDisk}, HostAllowedMountRoot: *ociLimaMountRoot,
+					}
+					var cycleErr error
+					if response.Convergence == ocicontrol.ConvergenceRecreateRequired {
+						cycleErr = supervisedBootBarrier.Recreate(setupContext, nodeAgent.StopOCIRuntime, nodeAgent.RecoverOCIRuntimeCapabilities, template)
+					} else {
+						cycleErr = supervisedBootBarrier.Restart(setupContext, nodeAgent.StopOCIRuntime, nodeAgent.RecoverOCIRuntimeCapabilities)
+					}
+					if cycleErr != nil {
+						return response, cycleErr
+					}
+					response.RestartApplied = true
+					response.RecreateApplied = response.Convergence == ocicontrol.ConvergenceRecreateRequired
+				}
+				if err := ocicontrol.WriteSetupState(*ociSetupState, desired); err != nil {
+					return response, err
+				}
 				return response, nil
 			},
 		})
@@ -547,11 +623,10 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		controlErrors = make(chan error, 1)
 		go func() {
 			if err := controlServer.Serve(ctx); err != nil {
-				controlErrors <- err
-				cancel()
+				nodeAgent.SuppressOCIRuntime(contract.CapabilityReasonLocalPermissionDenied, err)
+				log.Printf("wefty-agent: node-local OCI control unavailable: %v", err)
 			}
 		}()
 	}
@@ -592,13 +667,6 @@ func run() error {
 	}()
 	err = nodeAgent.Run(ctx)
 	cancel()
-	if controlErrors != nil {
-		select {
-		case controlErr := <-controlErrors:
-			err = errors.Join(err, controlErr)
-		default:
-		}
-	}
 	return err
 }
 

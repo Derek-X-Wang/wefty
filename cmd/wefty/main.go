@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -30,7 +29,7 @@ func main() {
 func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
 	var localErr *ocicontrol.ResponseError
 	if jsonOutput && errors.As(err, &localErr) {
-		_ = writeJSON(writer, localErr.ErrorResponse)
+		_ = writeJSON(writer, contract.ErrorResponse{Error: localErr.APIError})
 		return
 	}
 	var responseErr *apiResponseError
@@ -85,6 +84,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		plainIdentity.Tags = nil
 		if options.fabricMode == "plain" && (options.plainUserID == "" || options.plainDeviceID == "") {
 			return usageError("plain admin commands require DEVELOPMENT ONLY --plain-user-id and --plain-device-id")
+		}
 	}
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           options.fabricMode,
@@ -135,11 +135,15 @@ func defaultNodeConfigPath() string {
 	if configured := os.Getenv("WEFTY_NODE_CONFIG"); configured != "" {
 		return configured
 	}
-	directory, err := os.UserConfigDir()
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(directory, "wefty", "node.json")
+	path, err := ocicontrol.DefaultInstalledConfigPath(home)
+	if err != nil {
+		return ""
+	}
+	return path
 }
 
 func removeBoolFlag(args []string, name string) ([]string, bool) {
@@ -158,10 +162,10 @@ func removeBoolFlag(args []string, name string) ([]string, bool) {
 const rootUsage = `Usage: wefty [global flags] <command>
 
 Commands:
-	  admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
-	  node setup-oci             Configure the installed node's OCI runtime
-	  node oci start|stop        Set durable node-local OCI intent
-	  node load-image FILE       Import an OCI archive through the live agent
+  admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
+  node setup-oci             Configure the installed node's OCI runtime
+  node oci start|stop        Set durable node-local OCI intent
+  node load-image FILE       Import an OCI archive through the live agent
   nodes list                 List node reachability, eligibility, and capacity
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   services <verb>            Create and operate service-class jobs

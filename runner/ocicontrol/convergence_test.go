@@ -1,6 +1,10 @@
 package ocicontrol
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestConvergenceClassesAndAuthorization(t *testing.T) {
 	base := SetupState{
@@ -37,5 +41,22 @@ func TestConvergenceClassesAndAuthorization(t *testing.T) {
 				t.Fatalf("authorization err=%v wantErr=%t", err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestSetupStateFailsClosedOnIncompleteOrUnsafeState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setup.json")
+	for _, payload := range []string{
+		`{"vm_memory":"4GiB","vm_cpus":4,"vm_disk":"32GiB","vm_type":"vz","host_mount_root":"relative","probe_digest":"sha256:a"}`,
+		`{"vm_memory":"bad","vm_cpus":4,"vm_disk":"32GiB","vm_type":"vz","host_mount_root":"/srv/wefty","probe_digest":"sha256:a"}`,
+		`{"vm_memory":"4GiB","vm_cpus":4,"vm_disk":"32GiB","vm_type":"","host_mount_root":"/srv/wefty","probe_digest":"sha256:a"}`,
+		`{"vm_memory":"4GiB","vm_cpus":4,"vm_disk":"32GiB","vm_type":"vz","host_mount_root":"/srv/wefty","probe_digest":""}`,
+	} {
+		if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadSetupState(path); err == nil {
+			t.Fatalf("unsafe setup state was accepted: %s", payload)
+		}
 	}
 }

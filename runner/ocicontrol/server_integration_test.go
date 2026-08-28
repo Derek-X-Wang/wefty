@@ -89,6 +89,41 @@ func TestOperatorControlSocketUsesARealProcess(t *testing.T) {
 	}
 }
 
+func TestControlSocketRejectsUIDOutsideOperatorAllowlist(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "wefty-peer-auth-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	socket := filepath.Join(root, "control.sock")
+	server, err := NewServer(socket, ServiceFuncs{IntentFunc: func(context.Context) (lima.OCIIntent, error) {
+		return lima.OCIIntent{Version: 1, Revision: 1, Enabled: true, UpdatedAt: time.Now()}, nil
+	}}, uint32(os.Geteuid()+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() { _ = server.Serve(ctx) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(socket); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("control socket was not published")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	client, _ := NewClient(socket)
+	defer client.Close()
+	requestContext, stop := context.WithTimeout(t.Context(), time.Second)
+	defer stop()
+	if _, err := client.Intent(requestContext); err == nil {
+		t.Fatal("control socket admitted a peer outside the operator UID allowlist")
+	}
+}
+
 func runControlChild(t *testing.T) {
 	socket := os.Getenv("WEFTY_CONTROL_TEST_SOCKET")
 	intentPath := os.Getenv("WEFTY_CONTROL_TEST_INTENT")
@@ -102,7 +137,7 @@ func runControlChild(t *testing.T) {
 			return (lima.FileIntentSource{Path: intentPath}).ReadIntent(ctx)
 		},
 		StopFunc: func(_ context.Context, request IntentMutationRequest) (IntentResponse, error) {
-			intent, err := lima.SetOCIIntent(intentPath, request.ExpectedRevision, false, time.Now())
+			intent, err := lima.SetOCIIntent(context.Background(), intentPath, request.ExpectedRevision, false, time.Now())
 			if err == nil {
 				go stop()
 			}

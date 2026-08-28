@@ -10,6 +10,13 @@ import (
 	"path/filepath"
 )
 
+func DefaultInstalledConfigPath(home string) (string, error) {
+	if !filepath.IsAbs(home) {
+		return "", errors.New("operator home must be absolute")
+	}
+	return filepath.Join(home, ".config", "wefty", "node.json"), nil
+}
+
 func ReadInstalledConfig(path string) (InstalledConfig, error) {
 	if !filepath.IsAbs(path) {
 		return InstalledConfig{}, errors.New("installed node configuration path must be absolute")
@@ -34,21 +41,24 @@ func WriteInstalledConfig(path string, config InstalledConfig) error {
 	if !filepath.IsAbs(path) || config.Version != InstalledConfigVersion || !filepath.IsAbs(config.ControlSocket) || filepath.Clean(config.ControlSocket) == string(filepath.Separator) {
 		return errors.New("installed node configuration requires absolute paths and the current version")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create installed node configuration directory: %w", err)
-	}
 	payload, err := json.Marshal(config)
 	if err != nil {
 		return err
 	}
-	payload = append(payload, '\n')
+	return writeAtomic(path, append(payload, '\n'), 0o600)
+}
+
+func writeAtomic(path string, payload []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create installed node configuration directory: %w", err)
+	}
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".wefty-node-config-*")
 	if err != nil {
 		return err
 	}
 	temporaryPath := temporary.Name()
 	defer func() { _ = os.Remove(temporaryPath) }()
-	if err := temporary.Chmod(0o600); err != nil {
+	if err := temporary.Chmod(mode); err != nil {
 		_ = temporary.Close()
 		return err
 	}

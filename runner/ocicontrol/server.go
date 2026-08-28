@@ -10,32 +10,47 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
+	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const maximumControlJSONBytes = 1 << 20
 
 type Server struct {
-	path     string
-	service  Service
-	listener net.Listener
-	server   *http.Server
+	path        string
+	service     Service
+	listener    net.Listener
+	server      *http.Server
+	allowedUIDs map[uint32]struct{}
 }
 
-func NewServer(path string, service Service) (*Server, error) {
+func NewServer(path string, service Service, allowedUIDs ...uint32) (*Server, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) == string(filepath.Separator) {
 		return nil, errors.New("OCI control socket path must be absolute and non-root")
 	}
 	if service == nil {
 		return nil, errors.New("OCI control service is required")
 	}
-	return &Server{path: filepath.Clean(path), service: service}, nil
+	if len(allowedUIDs) == 0 {
+		allowedUIDs = []uint32{uint32(os.Geteuid())}
+	}
+	allowlist := make(map[uint32]struct{}, len(allowedUIDs))
+	for _, uid := range allowedUIDs {
+		allowlist[uid] = struct{}{}
+	}
+	return &Server{path: filepath.Clean(path), service: service, allowedUIDs: allowlist}, nil
 }
 
 func (server *Server) Serve(ctx context.Context) error {
 	if server == nil {
 		return errors.New("OCI control server is unavailable")
 	}
+	lock, err := acquireSocketLock(server.path)
+	if err != nil {
+		return err
+	}
+	defer releaseSocketLock(lock)
 	if err := prepareSocketPath(server.path); err != nil {
 		return err
 	}
@@ -43,7 +58,8 @@ func (server *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen on OCI control socket: %w", err)
 	}
-	server.listener = listener
+	authenticated := &peerAuthenticatedListener{Listener: listener, allowedUIDs: server.allowedUIDs}
+	server.listener = authenticated
 	if err := os.Chmod(server.path, 0o600); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("restrict OCI control socket: %w", err)
@@ -54,10 +70,10 @@ func (server *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/oci/start", server.handleStart)
 	mux.HandleFunc("POST /v1/oci/stop", server.handleStop)
 	mux.HandleFunc("POST /v1/images/load", server.handleLoadImage)
-	server.server = &http.Server{Handler: mux, ReadHeaderTimeout: 0}
+	server.server = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Minute}
 	shutdown := context.AfterFunc(ctx, func() { _ = server.server.Close() })
 	defer shutdown()
-	err = server.server.Serve(listener)
+	err = server.server.Serve(authenticated)
 	_ = os.Remove(server.path)
 	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
 		return nil
@@ -69,9 +85,6 @@ func prepareSocketPath(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create OCI control directory: %w", err)
 	}
-	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("restrict OCI control directory: %w", err)
-	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -82,7 +95,7 @@ func prepareSocketPath(path string) error {
 	if info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("refusing to replace a non-socket OCI control path")
 	}
-	if connection, dialErr := net.Dial("unix", path); dialErr == nil {
+	if connection, dialErr := net.DialTimeout("unix", path, 250*time.Millisecond); dialErr == nil {
 		_ = connection.Close()
 		return errors.New("OCI control socket is already active")
 	}
@@ -90,6 +103,25 @@ func prepareSocketPath(path string) error {
 		return fmt.Errorf("remove stale OCI control socket: %w", err)
 	}
 	return nil
+}
+
+type peerAuthenticatedListener struct {
+	net.Listener
+	allowedUIDs map[uint32]struct{}
+}
+
+func (listener *peerAuthenticatedListener) Accept() (net.Conn, error) {
+	for {
+		connection, err := listener.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		uid, err := unixPeerUID(connection)
+		if _, allowed := listener.allowedUIDs[uid]; err == nil && allowed {
+			return connection, nil
+		}
+		_ = connection.Close()
+	}
 }
 
 func (server *Server) handleIntent(writer http.ResponseWriter, request *http.Request) {
@@ -149,27 +181,19 @@ func decodeControlJSON(writer http.ResponseWriter, request *http.Request, target
 
 func writeControlResponse(writer http.ResponseWriter, value any, err error) {
 	if err != nil {
-		code := ErrorInternal
-		status := http.StatusInternalServerError
-		message := err.Error()
-		lower := strings.ToLower(message)
-		switch {
-		case strings.Contains(lower, "revision conflict"):
-			code, status = ErrorIntentConflict, http.StatusConflict
-		case strings.Contains(lower, "unavailable") || strings.Contains(lower, "disabled"):
-			code, status = ErrorRuntimeUnavailable, http.StatusServiceUnavailable
-		case strings.Contains(lower, "requires") || strings.Contains(lower, "invalid"):
-			code, status = ErrorInvalidRequest, http.StatusBadRequest
+		failure := &ControlError{Code: ErrorInternal, Status: http.StatusInternalServerError, Message: "node-local OCI control failed", Cause: err}
+		if !errors.As(err, &failure) {
+			failure.Cause = err
 		}
-		writeControlError(writer, status, code, message)
+		writeControlError(writer, failure.Status, failure.Code, failure.Message)
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(writer).Encode(value)
 }
 
-func writeControlError(writer http.ResponseWriter, status int, code, message string) {
+func writeControlError(writer http.ResponseWriter, status int, code contract.ErrorCode, message string) {
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(status)
-	_ = json.NewEncoder(writer).Encode(ErrorResponse{Code: code, Message: message})
+	_ = json.NewEncoder(writer).Encode(contract.ErrorResponse{Error: contract.APIError{Code: code, Message: message}})
 }

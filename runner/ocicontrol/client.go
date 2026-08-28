@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 )
 
@@ -22,7 +23,7 @@ type Client struct {
 
 type ResponseError struct {
 	Status int
-	ErrorResponse
+	contract.APIError
 }
 
 func (err *ResponseError) Error() string { return err.Message }
@@ -100,11 +101,11 @@ func (client *Client) call(ctx context.Context, method, path string, body io.Rea
 	defer result.Body.Close()
 	decoder := json.NewDecoder(io.LimitReader(result.Body, maximumControlJSONBytes))
 	if result.StatusCode < 200 || result.StatusCode >= 300 {
-		var failure ErrorResponse
+		var failure contract.ErrorResponse
 		if err := decoder.Decode(&failure); err != nil {
 			return fmt.Errorf("node-local OCI control returned HTTP %d", result.StatusCode)
 		}
-		return &ResponseError{Status: result.StatusCode, ErrorResponse: failure}
+		return &ResponseError{Status: result.StatusCode, APIError: failure.Error}
 	}
 	if err := decoder.Decode(response); err != nil {
 		return fmt.Errorf("decode node-local OCI control response: %w", err)

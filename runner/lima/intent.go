@@ -23,6 +23,19 @@ type OCIIntent struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// IntentStateError identifies an absent or malformed durable intent marker.
+// Callers use the type, rather than parsing prose, to report setup_required.
+type IntentStateError struct{ Message string }
+
+func (err *IntentStateError) Error() string { return err.Message }
+
+// IntentConflictError identifies a compare-and-swap revision conflict.
+type IntentConflictError struct{ CurrentRevision uint64 }
+
+func (err *IntentConflictError) Error() string {
+	return fmt.Sprintf("OCI intent revision conflict: current revision is %d", err.CurrentRevision)
+}
+
 func (intent OCIIntent) valid() bool {
 	return intent.Version == OCIIntentVersion && intent.Revision > 0 && !intent.UpdatedAt.IsZero()
 }
@@ -62,7 +75,7 @@ func (source FileIntentSource) ReadIntent(ctx context.Context) (OCIIntent, error
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&intent); err != nil || decoder.Decode(&struct{}{}) != io.EOF || !intent.valid() {
-		return OCIIntent{}, errors.New("read OCI intent: invalid marker")
+		return OCIIntent{}, &IntentStateError{Message: "read OCI intent: invalid marker"}
 	}
 	intent.UpdatedAt = intent.UpdatedAt.UTC().Round(0)
 	return intent, nil
@@ -73,17 +86,17 @@ func (source FileIntentSource) ReadIntent(ctx context.Context) (OCIIntent, error
 // semantics against the revision it observed and persists the replacement
 // before returning it. Replaying an already-achieved state is idempotent and
 // does not manufacture another revision.
-func SetOCIIntent(path string, expectedRevision uint64, enabled bool, now time.Time) (OCIIntent, error) {
+func SetOCIIntent(ctx context.Context, path string, expectedRevision uint64, enabled bool, now time.Time) (OCIIntent, error) {
 	source := FileIntentSource{Path: path}
-	current, err := source.ReadIntent(context.Background())
+	current, err := source.ReadIntent(ctx)
 	if err != nil {
 		return OCIIntent{}, err
 	}
 	if !current.valid() {
-		return OCIIntent{}, errors.New("OCI intent is unavailable or invalid")
+		return OCIIntent{}, &IntentStateError{Message: "OCI intent is unavailable or invalid"}
 	}
 	if current.Revision != expectedRevision {
-		return OCIIntent{}, fmt.Errorf("OCI intent revision conflict: current revision is %d", current.Revision)
+		return OCIIntent{}, &IntentConflictError{CurrentRevision: current.Revision}
 	}
 	if current.Enabled == enabled {
 		return current, nil

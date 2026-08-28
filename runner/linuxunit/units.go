@@ -17,7 +17,7 @@ const (
 	AgentUnit         = "wefty-agent.service"
 	HelperSocketUnit  = "wefty-oci-helper.socket"
 	HelperServiceUnit = "wefty-oci-helper.service"
-	HelperSocketPath  = "/run/wefty/oci-helper.sock"
+	HelperSocketPath  = "/run/wefty-oci/oci-helper.sock"
 	HelperGroup       = "wefty-oci"
 )
 
@@ -28,7 +28,8 @@ type Config struct {
 	AgentArguments      []string
 	OperatorUser        string
 	OperatorGroup       string
-	OperatorUID         uint32
+	OperatorUID         int
+	OperatorGID         int
 	WorkingDirectory    string
 	AllowedMountRoots   []string
 	ContainerdAddress   string
@@ -43,7 +44,8 @@ type Units struct {
 }
 
 func Render(config Config) (Units, error) {
-	if !filepath.IsAbs(config.AgentPath) || !filepath.IsAbs(config.WorkingDirectory) || config.OperatorUID == 0 ||
+	if !filepath.IsAbs(config.AgentPath) || !filepath.IsAbs(config.WorkingDirectory) || config.OperatorUID == 0 || config.OperatorGID == 0 ||
+		strings.ContainsAny(config.AgentPath+config.WorkingDirectory, "\r\n") ||
 		!userPattern.MatchString(config.OperatorUser) || !userPattern.MatchString(config.OperatorGroup) {
 		return Units{}, errors.New("Linux units require an absolute agent/working path and a non-root operator identity")
 	}
@@ -80,8 +82,9 @@ User=` + config.OperatorUser + `
 Group=` + config.OperatorGroup + `
 SupplementaryGroups=` + HelperGroup + `
 WorkingDirectory=` + quote(config.WorkingDirectory) + `
-RuntimeDirectory=wefty
+RuntimeDirectory=wefty-agent
 RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
 ExecStart=` + quoteArguments(agentArguments) + `
 Restart=on-failure
 RestartSec=5s
@@ -98,6 +101,9 @@ Description=Wefty OCI helper socket
 
 [Socket]
 ListenStream=` + HelperSocketPath + `
+RuntimeDirectory=wefty-oci
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=restart
 SocketUser=root
 SocketGroup=` + HelperGroup + `
 SocketMode=0660
@@ -116,7 +122,7 @@ Requires=containerd.service
 Type=simple
 User=root
 Group=root
-Environment=` + ocihelper.AllowedUIDsEnvironment + `=` + strconv.FormatUint(uint64(config.OperatorUID), 10) + `
+		Environment=` + ocihelper.AllowedUIDsEnvironment + `=` + strconv.Itoa(config.OperatorUID) + `
 ExecStart=` + quoteArguments(helperArguments) + `
 StandardOutput=journal
 StandardError=journal

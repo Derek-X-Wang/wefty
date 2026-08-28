@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -165,6 +166,41 @@ portForwards:
 `, config.Sizing.CPUs, quote(config.Sizing.Memory), quote(config.Sizing.Disk),
 		quote(filepath.Clean(config.HostAllowedMountRoot)), quote(GuestAllowedMountRoot), quote(GuestHelperSocket), HostHelperSocketName)
 	return []byte(template), nil
+}
+
+func WriteTemplate(path string, config TemplateConfig) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("Lima template path must be absolute")
+	}
+	payload, err := RenderTemplate(config)
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".wefty-lima-template-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(payload); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
 }
 
 // HelperSocketPath is the operator-owned 0700 instance socket directory used

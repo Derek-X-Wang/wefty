@@ -1218,9 +1218,13 @@ func startFailureServer(t *testing.T, network *plain.Network, clock l1.Clock, no
 }
 
 func startFailureServerWithPolicies(t *testing.T, network *plain.Network, clock l1.Clock, policies map[string]l1.NodePolicy) (*l1.Store, func()) {
+	return startFailureServerWithPoliciesAndLease(t, network, clock, policies, 30*time.Second)
+}
+
+func startFailureServerWithPoliciesAndLease(t *testing.T, network *plain.Network, clock l1.Clock, policies map[string]l1.NodePolicy, leaseDuration time.Duration) (*l1.Store, func()) {
 	t.Helper()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
-	options := l1.StoreOptions{LeaseDuration: 30 * time.Second}
+	options := l1.StoreOptions{LeaseDuration: leaseDuration}
 	if clock != nil {
 		options.Clock = clock
 	}

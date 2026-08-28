@@ -210,6 +210,54 @@ func TestSupervisedBarrierHoldsCycleLockAcrossLimaAndHelperBarrier(t *testing.T)
 	}
 }
 
+func TestSupervisedBarrierCycleAcquisitionHonorsContext(t *testing.T) {
+	intent := newMutableIntent(true)
+	supervisor := newTestSupervisor(t, intent, &supervisorRunner{states: []InstanceState{InstanceRunning}})
+	client := &ocihelper.Client{
+		Version: ocihelper.ProtocolVersion, ExpectedChecksum: "sha256:" + strings.Repeat("a", 64),
+		Dial: func(context.Context) (net.Conn, error) { return nil, errors.New("not reached") },
+	}
+	helperBarrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+	barrier.cycleMu.Lock()
+	defer barrier.cycleMu.Unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	if err := barrier.Ensure(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("contended Ensure error=%v", err)
+	}
+}
+
+func TestSupervisedBarrierRecreateDeletesAndStartsFromExplicitTemplate(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{}
+	supervisor := newTestSupervisor(t, intent, runner)
+	client := &ocihelper.Client{
+		Version: ocihelper.ProtocolVersion, ExpectedChecksum: "sha256:" + strings.Repeat("a", 64),
+		Dial: func(context.Context) (net.Conn, error) { return nil, errors.New("not reached") },
+	}
+	helperBarrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+	quiesced, recovered := false, false
+	err = barrier.Recreate(t.Context(), func(context.Context) error { quiesced = true; return nil }, func(context.Context) error { recovered = true; return nil }, TemplateConfig{
+		Sizing: Sizing{Memory: "4GiB", CPUs: 4, Disk: "32GiB"}, HostAllowedMountRoot: "/Users/operator/wefty",
+	})
+	if err != nil || !quiesced || !recovered {
+		t.Fatalf("recreate quiesced=%t recovered=%t err=%v", quiesced, recovered, err)
+	}
+	commands := runner.commandsSnapshot()
+	if len(commands) != 2 || !reflect.DeepEqual(commands[0], []string{"limactl", "delete", "--force", DefaultInstanceName}) ||
+		len(commands[1]) != 4 || commands[1][1] != "start" || commands[1][2] != "--name="+DefaultInstanceName || !filepath.IsAbs(commands[1][3]) {
+		t.Fatalf("recreate commands=%v", commands)
+	}
+}
+
 func TestFileIntentSourceFailsClosedAndPreservesDisabledMarker(t *testing.T) {
 	path := t.TempDir() + "/intent.json"
 	source := FileIntentSource{Path: path}
@@ -244,21 +292,21 @@ func TestSetOCIIntentIsRevisionedIdempotentAndFailClosed(t *testing.T) {
 	if _, err := InitializeOCIIntent(path, firstAt); err != nil {
 		t.Fatal(err)
 	}
-	disabled, err := SetOCIIntent(path, 1, false, firstAt.Add(time.Minute))
+	disabled, err := SetOCIIntent(t.Context(), path, 1, false, firstAt.Add(time.Minute))
 	if err != nil || disabled.Enabled || disabled.Revision != 2 {
 		t.Fatalf("disable=%+v err=%v", disabled, err)
 	}
-	replay, err := SetOCIIntent(path, 2, false, firstAt.Add(2*time.Minute))
+	replay, err := SetOCIIntent(t.Context(), path, 2, false, firstAt.Add(2*time.Minute))
 	if err != nil || replay != disabled {
 		t.Fatalf("disabled replay=%+v err=%v", replay, err)
 	}
-	if _, err := SetOCIIntent(path, 1, true, firstAt.Add(3*time.Minute)); err == nil {
+	if _, err := SetOCIIntent(t.Context(), path, 1, true, firstAt.Add(3*time.Minute)); err == nil {
 		t.Fatal("stale revision was accepted")
 	}
 	if err := os.WriteFile(path, []byte(`{"version":1,"revision":2,"enabled":false}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := SetOCIIntent(path, 2, true, firstAt.Add(4*time.Minute)); err == nil {
+	if _, err := SetOCIIntent(t.Context(), path, 2, true, firstAt.Add(4*time.Minute)); err == nil {
 		t.Fatal("malformed durable intent was overwritten with a confident enable")
 	}
 }

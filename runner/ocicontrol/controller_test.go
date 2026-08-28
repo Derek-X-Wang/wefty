@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -25,7 +26,10 @@ type controlTestRuntime struct {
 	recovered  int
 	stopped    int
 	stopErr    error
+	live       bool
 }
+
+func (runtime *controlTestRuntime) OCIRuntimeLive() bool { return runtime.live }
 
 func (runtime *controlTestRuntime) RecoverOCIRuntimeCapabilities(context.Context) error {
 	runtime.mu.Lock()
@@ -114,19 +118,41 @@ func TestControllerFailureNeverRollsBackPersistedDisable(t *testing.T) {
 	}
 }
 
+func TestControllerClassifiesIntentFailuresByType(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intent.json")
+	clock := &controlTestClock{now: time.Now()}
+	if _, err := lima.InitializeOCIIntent(path, clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	controller, _ := NewController(ControllerConfig{IntentPath: path, Clock: clock})
+	_, err := controller.Start(t.Context(), IntentMutationRequest{ExpectedRevision: 9})
+	var controlErr *ControlError
+	if !errors.As(err, &controlErr) || controlErr.Code != ErrorIntentConflict || controlErr.Status != 409 {
+		t.Fatalf("stale revision error=%#v", err)
+	}
+	if err := os.WriteFile(path, []byte("{\"version\":1}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = controller.Start(t.Context(), IntentMutationRequest{ExpectedRevision: 1})
+	controlErr = nil
+	if !errors.As(err, &controlErr) || controlErr.Code != ErrorSetupRequired || controlErr.Status != 412 {
+		t.Fatalf("corrupt marker error=%#v", err)
+	}
+}
+
 func TestSetupPreservesExistingDisabledIntent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "intent.json")
 	clock := &controlTestClock{now: time.Date(2026, 8, 28, 14, 0, 0, 0, time.UTC)}
 	if _, err := lima.InitializeOCIIntent(path, clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := lima.SetOCIIntent(path, 1, false, clock.Now().Add(time.Minute)); err != nil {
+	if _, err := lima.SetOCIIntent(t.Context(), path, 1, false, clock.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	controller, _ := NewController(ControllerConfig{
 		IntentPath: path, Clock: clock,
-		Setup: func(_ context.Context, _ SetupRequest, intent lima.OCIIntent) (SetupResponse, error) {
-			return SetupResponse{Configured: true, Intent: intent, Convergence: ConvergenceUnchanged}, nil
+		Setup: func(_ context.Context, _ SetupRequest) (SetupResponse, error) {
+			return SetupResponse{Configured: true, Convergence: ConvergenceUnchanged}, nil
 		},
 	})
 	response, err := controller.Setup(t.Context(), SetupRequest{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB"})
@@ -143,6 +169,44 @@ func TestSetupRejectsAdversarialSizingBeforeInitializingIntent(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("invalid setup initialized intent: %v", err)
+	}
+}
+
+func TestSetupChecksPrerequisitesBeforeIntentMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intent.json")
+	controller, _ := NewController(ControllerConfig{
+		IntentPath: path, Clock: &controlTestClock{now: time.Now()},
+		Setup: func(context.Context, SetupRequest) (SetupResponse, error) {
+			return SetupResponse{MissingCapability: "containerd", ReasonCode: contract.CapabilityReasonPrerequisiteMissing, Runbook: RunbookPath}, nil
+		},
+	})
+	response, err := controller.Setup(t.Context(), SetupRequest{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB"})
+	if err != nil || response.MissingCapability != "containerd" || response.Runbook != RunbookPath {
+		t.Fatalf("setup response=%+v err=%v", response, err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing prerequisite mutated intent: %v", err)
+	}
+}
+
+func TestRepeatedStartKeepsHealthyRuntimeLive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intent.json")
+	clock := &controlTestClock{now: time.Now()}
+	if _, err := lima.InitializeOCIIntent(path, clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &controlTestRuntime{intentPath: path, live: true}
+	controller, _ := NewController(ControllerConfig{IntentPath: path, Runtime: runtime, Clock: clock})
+	response, err := controller.Start(t.Context(), IntentMutationRequest{ExpectedRevision: 1})
+	if err != nil || response.Intent.Revision != 1 || !response.CapabilityPublished || runtime.recovered != 0 {
+		t.Fatalf("idempotent start response=%+v recovered=%d err=%v", response, runtime.recovered, err)
+	}
+}
+
+func TestCanonicalInstalledConfigPathMatchesBootstrap(t *testing.T) {
+	path, err := DefaultInstalledConfigPath("/Users/operator")
+	if err != nil || path != "/Users/operator/.config/wefty/node.json" {
+		t.Fatalf("canonical config path=%q err=%v", path, err)
 	}
 }
 

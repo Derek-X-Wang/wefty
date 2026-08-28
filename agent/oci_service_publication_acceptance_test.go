@@ -179,9 +179,9 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	}()
 
 	network := plain.NewNetwork()
-	store, stopServer := startFailureServerWithPolicies(t, network, nil, map[string]l1.NodePolicy{
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
 		"native-service-node": {Tags: []string{"native-service"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
-	})
+	}, 2*time.Second)
 	defer stopServer()
 	serviceSpec := func(dispatchKey string) contract.JobSpec {
 		return contract.JobSpec{
@@ -251,6 +251,39 @@ while :; do sleep 1; done
 	if firstAttempt == "" || firstRunning.BoundNodeID != "native-service-node" || firstRunning.Spec.Execution.OCI == nil || firstRunning.Spec.Execution.OCI.Image.Digest == nil {
 		t.Fatalf("initial L1/agent OCI service = %+v", firstRunning)
 	}
+	pinsBeforeStop, err := nodeAgent.logSpool.ListOCIImageBindingPins(t.Context())
+	if err != nil || !containsBindingPin(pinsBeforeStop, primary.JobID, digest) {
+		t.Fatalf("initial OCI binding pin=%+v err=%v", pinsBeforeStop, err)
+	}
+	stopContext, cancelStop := context.WithTimeout(t.Context(), 15*time.Second)
+	if err := nodeAgent.StopOCIRuntime(stopContext); err != nil {
+		cancelStop()
+		t.Fatal(err)
+	}
+	cancelStop()
+	// The real two-second lease proves that local intent stop is neither an
+	// execution failure nor a hidden service restart. L1 retains the binding
+	// and digest pin when the quiesced attempt expires back to queued.
+	time.Sleep(2100 * time.Millisecond)
+	if result, err := store.Reconcile(t.Context()); err != nil || result.ExpiredAttempts != 1 {
+		t.Fatalf("intent-stop lease reconciliation=%+v err=%v", result, err)
+	}
+	intentStopped := waitNativeServiceState(t, store, primary.JobID, contract.JobQueued, 5*time.Second)
+	if intentStopped.BoundNodeID != firstRunning.BoundNodeID || intentStopped.Spec.Execution.OCI == nil ||
+		intentStopped.Spec.Execution.OCI.Image.Digest == nil || *intentStopped.Spec.Execution.OCI.Image.Digest != digest ||
+		intentStopped.RestartStreak != 0 || intentStopped.LifetimeRestartCount != 0 || intentStopped.NextRestartAt != nil ||
+		len(intentStopped.LastFailure) != 0 {
+		t.Fatalf("intent stop changed service binding/failure budget: before=%+v after=%+v", firstRunning, intentStopped)
+	}
+	pinsAfterStop, err := nodeAgent.logSpool.ListOCIImageBindingPins(t.Context())
+	if err != nil || !containsBindingPin(pinsAfterStop, primary.JobID, digest) {
+		t.Fatalf("intent stop lost OCI binding pin=%+v err=%v", pinsAfterStop, err)
+	}
+	if err := nodeAgent.RecoverOCIRuntimeCapabilities(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	firstRunning = waitNativeServiceAttempt(t, store, primary.JobID, firstAttempt, 45*time.Second)
+	firstAttempt = firstRunning.CurrentAttemptID
 	sibling, _, err := store.CreateJob(t.Context(), serviceSpec("native-service-sibling"))
 	if err != nil {
 		t.Fatal(err)
@@ -474,6 +507,15 @@ while :; do sleep 1; done
 	if err := <-restartDone; err != nil {
 		t.Fatalf("restarted L1/agent realtiming shutdown: %v", err)
 	}
+}
+
+func containsBindingPin(pins []workloadrunner.OCIImageBindingPin, jobID, digest string) bool {
+	for _, pin := range pins {
+		if pin.JobID == jobID && pin.Digest == digest {
+			return true
+		}
+	}
+	return false
 }
 
 func waitRuntimeRemovalManifestPhase(t *testing.T, directory, jobID string, want runtimeRemovalPhase, timeout time.Duration) runtimeRemovalRecord {

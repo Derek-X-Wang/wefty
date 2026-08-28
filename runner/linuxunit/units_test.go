@@ -7,12 +7,12 @@ import (
 
 func TestRenderLinuxUnitsKeepsAgentUnprivilegedAndHelperNarrow(t *testing.T) {
 	units, err := Render(Config{
-		AgentPath: "/usr/local/libexec/wefty-agent", OperatorUser: "wefty", OperatorGroup: "wefty", OperatorUID: 1001,
+		AgentPath: "/usr/local/libexec/wefty-agent", OperatorUser: "wefty", OperatorGroup: "wefty", OperatorUID: 1001, OperatorGID: 1001,
 		WorkingDirectory: "/var/lib/wefty", ContainerdAddress: "/run/containerd/containerd.sock",
 		ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci",
 		AllowedMountRoots: []string{"/srv/wefty"}, AgentArguments: []string{
 			"--node-id=node-linux", "--oci-helper-socket=" + HelperSocketPath,
-			"--oci-intent-file=/var/lib/wefty/oci-intent.json", "--oci-control-socket=/run/wefty/control.sock",
+			"--oci-intent-file=/var/lib/wefty/oci-intent.json", "--oci-control-socket=/run/wefty-agent/control.sock",
 		},
 	})
 	if err != nil {
@@ -31,7 +31,7 @@ func TestRenderLinuxUnitsKeepsAgentUnprivilegedAndHelperNarrow(t *testing.T) {
 			t.Fatalf("helper unit missing %q:\n%s", want, helper)
 		}
 	}
-	for _, want := range []string{"ListenStream=/run/wefty/oci-helper.sock", "SocketUser=root", "SocketGroup=wefty-oci", "SocketMode=0660"} {
+	for _, want := range []string{"ListenStream=/run/wefty-oci/oci-helper.sock", "RuntimeDirectory=wefty-oci", "SocketUser=root", "SocketGroup=wefty-oci", "SocketMode=0660"} {
 		if !strings.Contains(socket, want) {
 			t.Fatalf("socket unit missing %q:\n%s", want, socket)
 		}
@@ -56,7 +56,7 @@ func TestSupplementaryGroupAdditionForcesOneAgentRestart(t *testing.T) {
 
 func TestRenderLinuxUnitsRejectsAdversarialConfiguration(t *testing.T) {
 	base := Config{
-		AgentPath: "/usr/local/libexec/wefty-agent", OperatorUser: "wefty", OperatorGroup: "wefty", OperatorUID: 1001,
+		AgentPath: "/usr/local/libexec/wefty-agent", OperatorUser: "wefty", OperatorGroup: "wefty", OperatorUID: 1001, OperatorGID: 1001,
 		WorkingDirectory: "/var/lib/wefty", ContainerdAddress: "/run/containerd/containerd.sock",
 		ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci", AllowedMountRoots: []string{"/srv/wefty"},
 	}
@@ -65,11 +65,14 @@ func TestRenderLinuxUnitsRejectsAdversarialConfiguration(t *testing.T) {
 		mutate func(*Config)
 	}{
 		{name: "root agent", mutate: func(config *Config) { config.OperatorUID = 0 }},
+		{name: "root group", mutate: func(config *Config) { config.OperatorGID = 0 }},
 		{name: "missing operator group", mutate: func(config *Config) { config.OperatorGroup = "" }},
 		{name: "relative binary", mutate: func(config *Config) { config.AgentPath = "wefty-agent" }},
 		{name: "root mount", mutate: func(config *Config) { config.AllowedMountRoots = []string{"/"} }},
 		{name: "credential argument", mutate: func(config *Config) { config.AgentArguments = []string{"--auth-key=secret"} }},
 		{name: "newline", mutate: func(config *Config) { config.AgentArguments = []string{"--node-id=x\nEnvironment=oops"} }},
+		{name: "agent path newline", mutate: func(config *Config) { config.AgentPath = "/usr/local/bin/wefty-agent\nEnvironment=oops" }},
+		{name: "working directory newline", mutate: func(config *Config) { config.WorkingDirectory = "/var/lib/wefty\nEnvironment=oops" }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

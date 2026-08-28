@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +69,7 @@ type SupervisorConfig struct {
 	now             func() time.Time
 	wait            func(context.Context, time.Duration) error
 	withTimeout     timeoutContext
+	Logf            func(string, ...any)
 }
 
 // Supervisor is the sole Lima lifecycle mutator in the macOS agent process.
@@ -459,20 +461,101 @@ type SupervisedBootBarrier struct {
 	reason  contract.CapabilityReasonCode
 }
 
-// Stop holds the shared Lima/helper cycle across agent quiescence and VM stop.
-// This prevents the watchdog from observing the newly disabled intent and
-// stopping Lima before every OCI attempt has withdrawn and reaped.
+// Stop quiesces before taking the shared Lima/helper cycle lock, then performs
+// the VM transition under that lock. Holding cycleMu across quiescence would
+// invert with an attempt's helper-loss recovery path, which also calls Ensure.
 func (barrier *SupervisedBootBarrier) Stop(ctx context.Context, quiesce func(context.Context) error) error {
 	if barrier == nil || barrier.Supervisor == nil || barrier.Barrier == nil || quiesce == nil {
 		return errors.New("supervised OCI stop cycle is unavailable")
 	}
-	barrier.cycleMu.Lock()
-	defer barrier.cycleMu.Unlock()
 	if err := quiesce(ctx); err != nil {
 		return err
 	}
+	if err := lockSupervisorCycle(ctx, &barrier.cycleMu); err != nil {
+		return err
+	}
+	defer barrier.cycleMu.Unlock()
 	barrier.Barrier.Invalidate()
 	return barrier.Supervisor.Stop(ctx)
+}
+
+func (barrier *SupervisedBootBarrier) Restart(ctx context.Context, quiesce, recover func(context.Context) error) error {
+	if barrier == nil || barrier.Supervisor == nil || barrier.Barrier == nil || quiesce == nil || recover == nil {
+		return errors.New("supervised OCI restart cycle is unavailable")
+	}
+	if err := quiesce(ctx); err != nil {
+		return err
+	}
+	if err := lockSupervisorCycle(ctx, &barrier.cycleMu); err != nil {
+		return err
+	}
+	barrier.Supervisor.ensureMu.Lock()
+	intent, intentErr := barrier.Supervisor.readIntent(ctx)
+	if intentErr == nil && intent.Enabled {
+		intentErr = barrier.Supervisor.forceStop(ctx)
+	}
+	barrier.Barrier.Invalidate()
+	barrier.Supervisor.ensureMu.Unlock()
+	barrier.cycleMu.Unlock()
+	if intentErr != nil {
+		return intentErr
+	}
+	if !intent.Enabled {
+		return errors.New("OCI intent is disabled")
+	}
+	return recover(ctx)
+}
+
+// Recreate replaces the Lima instance from an explicit setup template, then
+// runs the ordinary helper/sweep/probe recovery before reporting success.
+func (barrier *SupervisedBootBarrier) Recreate(ctx context.Context, quiesce, recover func(context.Context) error, template TemplateConfig) error {
+	if barrier == nil || barrier.Supervisor == nil || barrier.Barrier == nil || quiesce == nil || recover == nil {
+		return errors.New("supervised OCI recreate cycle is unavailable")
+	}
+	payload, err := RenderTemplate(template)
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp("", ".wefty-lima-recreate-*.yaml")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if _, err := temporary.Write(payload); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := quiesce(ctx); err != nil {
+		return err
+	}
+	if err := lockSupervisorCycle(ctx, &barrier.cycleMu); err != nil {
+		return err
+	}
+	barrier.Supervisor.ensureMu.Lock()
+	intent, intentErr := barrier.Supervisor.readIntent(ctx)
+	if intentErr == nil && intent.Enabled {
+		barrier.Barrier.Invalidate()
+		if _, intentErr = barrier.Supervisor.runBounded(ctx, "delete", "--force", barrier.Supervisor.config.Instance); intentErr == nil {
+			_, intentErr = barrier.Supervisor.runBounded(ctx, "start", "--name="+barrier.Supervisor.config.Instance, temporaryPath)
+		}
+	}
+	barrier.Supervisor.ensureMu.Unlock()
+	barrier.cycleMu.Unlock()
+	if intentErr != nil {
+		return intentErr
+	}
+	if !intent.Enabled {
+		return errors.New("OCI intent is disabled")
+	}
+	return recover(ctx)
 }
 
 func (barrier *SupervisedBootBarrier) Ready() bool {
@@ -483,7 +566,9 @@ func (barrier *SupervisedBootBarrier) Ensure(ctx context.Context) error {
 	if barrier == nil || barrier.Supervisor == nil || barrier.Barrier == nil {
 		return errors.New("supervised OCI boot barrier is unavailable")
 	}
-	barrier.cycleMu.Lock()
+	if err := lockSupervisorCycle(ctx, &barrier.cycleMu); err != nil {
+		return err
+	}
 	defer barrier.cycleMu.Unlock()
 	recoveryContext, cancel := barrier.Supervisor.config.withTimeout(ctx, barrier.Supervisor.config.RecoveryTimeout)
 	defer cancel()
@@ -499,6 +584,24 @@ func (barrier *SupervisedBootBarrier) Ensure(ctx context.Context) error {
 	err = barrier.ensureHelperReady(recoveryContext, intent)
 	barrier.setReason(classifyHelperBarrierError(err))
 	return err
+}
+
+func lockSupervisorCycle(ctx context.Context, mutex *sync.Mutex) error {
+	if mutex.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if mutex.TryLock() {
+				return nil
+			}
+		}
+	}
 }
 
 func (barrier *SupervisedBootBarrier) ensureHelperReady(ctx context.Context, expected OCIIntent) error {
@@ -558,7 +661,12 @@ func (barrier *SupervisedBootBarrier) Run(ctx context.Context, recover func(cont
 		needed := barrier.Supervisor.recoveryNeeded(ctx, barrier.Barrier.Ready())
 		barrier.cycleMu.Unlock()
 		if needed {
-			_ = recover(ctx)
+			if err := recover(ctx); err != nil {
+				barrier.setReason(classifyHelperBarrierError(err))
+				if barrier.Supervisor.config.Logf != nil {
+					barrier.Supervisor.config.Logf("Lima background OCI convergence: %v", err)
+				}
+			}
 		}
 	}
 }

@@ -14,6 +14,12 @@ import (
 )
 
 func executeLocalNode(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return usageError("usage: wefty node setup-oci | wefty node oci start|stop | wefty node load-image FILE")
+	}
+	if handled, err := maybeExecutePrivilegedLinuxSetup(ctx, options, args, stdout, stderr); handled {
+		return err
+	}
 	if options.nodeConfigPath == "" {
 		return errors.New("singular node commands require an installed node configuration; set --node-config or WEFTY_NODE_CONFIG")
 	}
@@ -30,9 +36,6 @@ func executeLocalNode(ctx context.Context, options globalOptions, args []string,
 		return err
 	}
 	defer client.Close()
-	if len(args) == 0 {
-		return usageError("usage: wefty node setup-oci | wefty node oci start|stop | wefty node load-image FILE")
-	}
 	switch args[0] {
 	case "setup-oci":
 		return executeLocalSetupOCI(ctx, client, options.jsonOutput, args[1:], stdout, stderr)
@@ -79,8 +82,9 @@ func executeLocalSetupOCI(ctx context.Context, client *ocicontrol.Client, jsonOu
 		_, err = fmt.Fprintf(stdout, "OCI setup not applied: missing %s; see %s\n", response.MissingCapability, response.Runbook)
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "OCI setup configured (%s); intent enabled=%t revision=%d; probe preloaded=%t\n",
-		response.Convergence, response.Intent.Enabled, response.Intent.Revision, response.ProbePreloaded)
+	_, err = fmt.Fprintf(stdout, "OCI setup configured (%s); intent enabled=%t revision=%d; probe preloaded=%t; restart applied=%t; recreate applied=%t; reason=%s\n",
+		response.Convergence, response.Intent.Enabled, response.Intent.Revision, response.ProbePreloaded,
+		response.RestartApplied, response.RecreateApplied, response.ReasonCode)
 	return err
 }
 

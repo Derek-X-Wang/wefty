@@ -63,6 +63,7 @@ type agentSession struct {
 
 	claimMu         sync.Mutex
 	residentJobID   map[string]struct{}
+	residentKind    map[string]string
 	resident        map[string]*residentAttempt
 	serviceReaps    map[string]runtimeReapOutcome
 	serviceBoots    map[string]string
@@ -137,6 +138,7 @@ func newAgentSession(
 		capacityChanged: make(chan struct{}, 1),
 		claimsEnabled:   true,
 		residentJobID:   make(map[string]struct{}),
+		residentKind:    make(map[string]string),
 		resident:        make(map[string]*residentAttempt),
 		serviceReaps:    make(map[string]runtimeReapOutcome),
 		serviceBoots:    make(map[string]string),
@@ -768,6 +770,7 @@ func (session *agentSession) executeResident(
 		session.claimMu.Lock()
 		delete(session.resident, claim.Job.JobID)
 		delete(session.residentJobID, claim.Job.JobID)
+		delete(session.residentKind, claim.Job.JobID)
 		close(resident.done)
 		session.notifyResidentChangedLocked()
 		session.claimMu.Unlock()
@@ -799,24 +802,68 @@ func (session *agentSession) stopOCIRuntime(ctx context.Context) error {
 		}()
 	}
 
-	session.claimMu.Lock()
-	done := make([]<-chan struct{}, 0, len(session.resident))
-	for _, resident := range session.resident {
-		if resident.kind != contract.JobKindOCI {
-			continue
+	seen := make(map[string]struct{})
+	for {
+		session.claimMu.Lock()
+		pending := false
+		var targets []*residentAttempt
+		for jobID, kind := range session.residentKind {
+			if kind != contract.JobKindOCI {
+				continue
+			}
+			resident, active := session.resident[jobID]
+			if !active {
+				pending = true
+				continue
+			}
+			if _, already := seen[jobID]; !already {
+				seen[jobID] = struct{}{}
+				resident.cancel(errOCIIntentDisabled)
+				targets = append(targets, resident)
+			}
 		}
-		resident.cancel(errOCIIntentDisabled)
-		done = append(done, resident.done)
-	}
-	session.claimMu.Unlock()
-	for _, completed := range done {
+		changed := session.residentChanged
+		session.claimMu.Unlock()
+		for _, resident := range targets {
+			var outcome runtimeReapOutcome
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case outcome = <-resident.runtimeReaped:
+			case <-resident.done:
+				select {
+				case outcome = <-resident.runtimeReaped:
+				default:
+					return errors.New("agent: OCI attempt completed without a runtime reap receipt")
+				}
+			}
+			if _, err := verifiedRuntimeReap("OCI attempt", outcome); err != nil {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-resident.done:
+			}
+		}
+		if !pending {
+			session.claimMu.Lock()
+			remaining := false
+			for jobID, kind := range session.residentKind {
+				_, quiesced := seen[jobID]
+				remaining = remaining || kind == contract.JobKindOCI && !quiesced
+			}
+			session.claimMu.Unlock()
+			if !remaining {
+				return nil
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-completed:
+		case <-changed:
 		}
 	}
-	return nil
 }
 
 func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- destinationError) {
@@ -928,6 +975,7 @@ func (session *agentSession) claim(
 		gate.acquireReserved()
 	}
 	session.residentJobID[claim.Job.JobID] = struct{}{}
+	session.residentKind[claim.Job.JobID] = claim.Job.Spec.Kind
 	return claim, true, nil
 }
 
@@ -988,15 +1036,17 @@ func (session *agentSession) recordRuntimeReap(jobID string, receipt workloadrun
 	defer session.claimMu.Unlock()
 	outcome := runtimeReapOutcome{receipt: receipt, err: err}
 	resident, active := session.resident[jobID]
+	if active {
+		select {
+		case resident.runtimeReaped <- outcome:
+		default:
+		}
+	}
 	if active && resident.class == contract.JobClassService {
 		if session.serviceReaps == nil {
 			session.serviceReaps = make(map[string]runtimeReapOutcome)
 		}
 		session.serviceReaps[jobID] = outcome
-		select {
-		case resident.runtimeReaped <- outcome:
-		default:
-		}
 	}
 }
 
