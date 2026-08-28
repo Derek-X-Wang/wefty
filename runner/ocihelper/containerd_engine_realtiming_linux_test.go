@@ -66,7 +66,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoDigest == "" || echoArchivePath == "" || weftyCLI == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" {
 		t.Fatal("Linux OCI realtiming provisioning is incomplete")
 	}
-	if reference != echoReference || digest != echoDigest || archivePath != echoArchivePath || !strings.HasPrefix(reference, "ghcr.io/derek-x-wang/wefty-echo-service:") {
+	if reference != echoReference || digest != echoDigest || archivePath != echoArchivePath || reference != "ghcr.io/derek-x-wang/wefty-echo-service" {
 		t.Fatalf("probe and workload did not consume one canonical public artifact: probe=%s@%s archive=%s echo=%s@%s archive=%s", reference, digest, archivePath, echoReference, echoDigest, echoArchivePath)
 	}
 	if os.Geteuid() == 0 {
@@ -97,6 +97,25 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	session, err := barrier.Session()
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The release artifact's CLI and multi-platform archive are the first image
+	// path through a clean node. Registry egress is disabled so load-image is
+	// the only possible source; the helper filters to this node's platform
+	// before the 16 GiB cache ceiling and probe pin are reconciled.
+	requestRootFault(t, "reset-containerd")
+	requestRootFault(t, "disable-registry")
+	loadedByCLI := loadNativeImageThroughCLI(t, ctx, adapter, weftyCLI, archivePath)
+	requestRootFault(t, "enable-registry")
+	if loadedByCLI.TopLevelDigest != digest || loadedByCLI.PlatformDigest == "" {
+		t.Fatalf("clean-cache wefty node load-image evidence = %+v", loadedByCLI)
+	}
+	const acceptanceCacheCap = int64(16 << 30)
+	if _, err := session.ReconcileImagePins(ctx, ocihelper.ReconcileImagePinsRequest{ProbeDigests: []string{digest}, CacheMaxBytes: acceptanceCacheCap}); err != nil {
+		t.Fatal(err)
+	}
+	cacheAfterCLI, err := session.ImageCacheStatus(ctx)
+	if err != nil || cacheAfterCLI.CapBytes != acceptanceCacheCap || cacheAfterCLI.Bytes > cacheAfterCLI.CapBytes {
+		t.Fatalf("clean-cache CLI import cache status = %+v err=%v", cacheAfterCLI, err)
 	}
 	probeStarted := time.Now()
 	if err := adapter.Probe(ctx, "native-node", "native-boot", reference, digest, l1.DefaultLeaseDuration); err != nil {
@@ -377,7 +396,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	}
 	numericImage := loadNativeImageArchive(t, ctx, adapter, numericReference, numericArchivePath)
 	namedImage := loadNativeImageArchive(t, ctx, adapter, namedReference, namedArchivePath)
-	serviceDataEvidence := exerciseNativeLinuxServiceData(t, ctx, adapter, []nativeServiceDataImage{
+	serviceDataEvidence := exerciseNativeLinuxServiceData(t, ctx, session, adapter, []nativeServiceDataImage{
 		{name: "root", reference: echoReference, digest: echoImage.TopLevelDigest, owner: "0:0"},
 		{name: "numeric", reference: numericReference, digest: numericImage.TopLevelDigest, owner: "13001:13002"},
 		{name: "named", reference: namedReference, digest: namedImage.TopLevelDigest, owner: "12001:12002"},
@@ -655,7 +674,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "node-doctor.json"), append(doctorBundle, '\n'), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_agent_restart_same_generation=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerDiskEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_agent_restart_same_generation=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerDiskEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -949,7 +968,7 @@ func loadNativeImageThroughCLI(t *testing.T, ctx context.Context, adapter *ociru
 	return response
 }
 
-func exerciseNativeLinuxServiceData(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, images []nativeServiceDataImage) nativeServiceDataEvidence {
+func exerciseNativeLinuxServiceData(t *testing.T, ctx context.Context, session *ocihelper.Session, adapter *ocirunner.Adapter, images []nativeServiceDataImage) nativeServiceDataEvidence {
 	t.Helper()
 	evidence := nativeServiceDataEvidence{}
 	for _, image := range images {
@@ -965,15 +984,12 @@ test "$prior" -eq %d
 printf '%%d\n' %d > /wefty/service/attempt-count
 touch /rootfs-attempt-marker
 `, image.owner, attempt-1, attempt)
-			request := nativeAdapterRequest(image.reference, image.digest, fmt.Sprintf("%s-%d", jobID, attempt), []string{"/bin/sh", "-c", script})
+			request := nativeAdapterRequest(image.reference, image.digest, fmt.Sprintf("%s-%d", jobID, attempt), nil)
 			request.Authority.JobID = jobID
 			request.Authority.WorkloadClass = contract.JobClassService
 			request.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 			request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-			result, err := adapter.Run(ctx, request, nil)
-			if err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
-				t.Fatalf("%s attempt %d service data result = %+v err=%v", image.name, attempt, result.Outcome, err)
-			}
+			runNativeEchoService(t, ctx, session, adapter, &request, script)
 			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: request.Authority}); err != nil || !receipt.RuntimeQuiesced {
 				t.Fatalf("%s attempt %d cleanup = %+v err=%v", image.name, attempt, receipt, err)
 			}
@@ -990,27 +1006,21 @@ touch /rootfs-attempt-marker
 		evidence.stopStartPersistent = true
 		evidence.rootfsDiscarded = true
 		if image.name == "root" {
-			replacement := nativeAdapterRequest(image.reference, image.digest, jobID+"-replacement-1", []string{"/bin/sh", "-c", "set -eu; test ! -e /wefty/service/attempt-count; printf 'replacement\\n' > /wefty/service/replacement"})
+			replacement := nativeAdapterRequest(image.reference, image.digest, jobID+"-replacement-1", nil)
 			replacement.Authority.JobID = jobID + "-replacement"
 			replacement.Authority.WorkloadClass = contract.JobClassService
 			replacement.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 			replacement.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-			result, err := adapter.Run(ctx, replacement, nil)
-			if err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
-				t.Fatalf("same-digest replacement service data result = %+v err=%v", result.Outcome, err)
-			}
+			runNativeEchoService(t, ctx, session, adapter, &replacement, "set -eu; test ! -e /wefty/service/attempt-count; printf 'replacement\\n' > /wefty/service/replacement")
 			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: replacement.Authority}); err != nil || !receipt.RuntimeQuiesced {
 				t.Fatalf("same-digest replacement cleanup = %+v err=%v", receipt, err)
 			}
-			original := nativeAdapterRequest(image.reference, image.digest, jobID+"-4", []string{"/bin/sh", "-c", "set -eu; test \"$(cat /wefty/service/attempt-count)\" -eq 3; test ! -e /wefty/service/replacement; printf '4\\n' > /wefty/service/attempt-count"})
+			original := nativeAdapterRequest(image.reference, image.digest, jobID+"-4", nil)
 			original.Authority.JobID = jobID
 			original.Authority.WorkloadClass = contract.JobClassService
 			original.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 			original.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-			result, err = adapter.Run(ctx, original, nil)
-			if err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
-				t.Fatalf("original same-digest service after replacement = %+v err=%v", result.Outcome, err)
-			}
+			runNativeEchoService(t, ctx, session, adapter, &original, "set -eu; test \"$(cat /wefty/service/attempt-count)\" -eq 3; test ! -e /wefty/service/replacement; printf '4\\n' > /wefty/service/attempt-count")
 			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: original.Authority}); err != nil || !receipt.RuntimeQuiesced {
 				t.Fatalf("original same-digest service cleanup = %+v err=%v", receipt, err)
 			}
@@ -1024,6 +1034,85 @@ touch /rootfs-attempt-marker
 		}
 	}
 	return evidence
+}
+
+func runNativeEchoService(t *testing.T, ctx context.Context, session *ocihelper.Session, adapter *ocirunner.Adapter, request *workloadrunner.Request, prelude string) {
+	t.Helper()
+	request.Execution.OCI.Argv = []string{"/bin/sh", "-c", prelude + "\nexec /usr/local/bin/wefty-echo-service"}
+	request.AttemptEndpoints = []string{workloadrunner.AttemptEndpointService}
+	endpointReady := make(chan workloadrunner.AttemptEndpoint, 1)
+	request.AttemptEndpointReady = func(name string, endpoint workloadrunner.AttemptEndpoint) error {
+		if name != workloadrunner.AttemptEndpointService {
+			return fmt.Errorf("unexpected service endpoint %q", name)
+		}
+		endpointReady <- endpoint
+		return nil
+	}
+	type runResult struct {
+		result workloadrunner.Result
+		err    error
+	}
+	runDone := make(chan runResult, 1)
+	go func() {
+		result, err := adapter.Run(ctx, *request, nil)
+		runDone <- runResult{result: result, err: err}
+	}()
+	var endpoint workloadrunner.AttemptEndpoint
+	select {
+	case endpoint = <-endpointReady:
+	case result := <-runDone:
+		t.Fatalf("echo service exited before endpoint readiness: result=%+v err=%v", result.result.Outcome, result.err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	transport := &http.Transport{DialContext: func(dialContext context.Context, _, _ string) (net.Conn, error) { return endpoint.Dial(dialContext) }}
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	defer transport.CloseIdleConnections()
+	var health struct {
+		ServiceDirectory string `json:"service_directory"`
+		ListeningPort    int    `json:"listening_port"`
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		response, err := client.Get("http://wefty-service/healthz")
+		if err == nil && response.StatusCode == http.StatusOK {
+			err = json.NewDecoder(response.Body).Decode(&health)
+			_ = response.Body.Close()
+			if err == nil {
+				break
+			}
+		} else if response != nil {
+			_ = response.Body.Close()
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("echo service health did not become ready: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if health.ServiceDirectory != "/wefty/service" || health.ListeningPort != int(endpoint.Port) {
+		t.Fatalf("echo service health = %+v endpoint=%+v", health, endpoint)
+	}
+	payload := []byte("published-echo-service:" + request.Authority.AttemptID)
+	response, err := client.Post("http://wefty-service/echo", "application/octet-stream", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	echoed, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if readErr != nil || closeErr != nil || response.StatusCode != http.StatusOK || !bytes.Equal(echoed, payload) {
+		t.Fatalf("echo response status=%d bytes=%q err=%v", response.StatusCode, echoed, errors.Join(readErr, closeErr))
+	}
+	if err := session.Signal(ctx, ocihelper.SignalRequest{Authority: ocirunner.HelperAuthority(request.Authority), Signal: ocihelper.SignalTERM}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-runDone:
+		if result.err != nil || result.result.Outcome.ExitCode == nil || *result.result.Outcome.ExitCode != 0 {
+			t.Fatalf("echo service result=%+v err=%v", result.result.Outcome, result.err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
 }
 
 func exerciseNativeLinuxOneshotContract(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, echoReference, echoDigest, probeReference, probeDigest string) bool {

@@ -1,8 +1,7 @@
 name: acceptance-image
 
 on:
-  pull_request:
-    branches: [main]
+  workflow_call:
   push:
     branches: [main]
 
@@ -10,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: acceptance-image-${{ github.ref }}
+  group: acceptance-image-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -24,50 +23,92 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports: [5000:5000]
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
         with:
           version: v0.36.1
-          driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
-      - name: Build the platform image twice from empty caches
+          driver-opts: |
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+            network=host
+      - name: Build with OCI and registry exporter shapes from empty caches
         env:
           PLATFORM: linux/${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
+          registry_reference="localhost:5000/wefty-echo-service:${GITHUB_SHA}-${ARCH}"
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
-            --build-arg SOURCE_DATE_EPOCH=0 \
-            --file examples/oci-echo-service/Dockerfile \
-            --output "type=oci,dest=$RUNNER_TEMP/acceptance-image-first.oci.tar,rewrite-timestamp=true" .
+            --build-arg SOURCE_DATE_EPOCH=0 --file examples/oci-echo-service/Dockerfile \
+            --output "type=oci,dest=$RUNNER_TEMP/acceptance-image.oci.tar,rewrite-timestamp=true" .
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
-            --build-arg SOURCE_DATE_EPOCH=0 \
-            --file examples/oci-echo-service/Dockerfile \
-            --output "type=oci,dest=$RUNNER_TEMP/acceptance-image-second.oci.tar,rewrite-timestamp=true" .
-      - name: Prove the selected platform manifest is reproducible
+            --build-arg SOURCE_DATE_EPOCH=0 --file examples/oci-echo-service/Dockerfile \
+            --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
+      - name: Prove reproducibility and execute the exact platform digest
         env:
           PLATFORM: linux/${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/acceptance-image-linux"
-          scripts/verify-acceptance-image.sh \
-            --archive "$RUNNER_TEMP/acceptance-image-first.oci.tar" \
-            --expected-platform "$PLATFORM" \
-            --platform-digest-output "$RUNNER_TEMP/acceptance-image-$PLATFORM.digest" \
-            --receipt-output "$RUNNER_TEMP/acceptance-image-$PLATFORM-first.json"
-          scripts/verify-acceptance-image.sh \
-            --archive "$RUNNER_TEMP/acceptance-image-second.oci.tar" \
-            --expected-platform "$PLATFORM" \
-            --platform-digest-output "$RUNNER_TEMP/acceptance-image-$PLATFORM-second.digest" \
-            --receipt-output "$RUNNER_TEMP/acceptance-image-$PLATFORM-second.json"
-          cmp "$RUNNER_TEMP/acceptance-image-$PLATFORM.digest" "$RUNNER_TEMP/acceptance-image-$PLATFORM-second.digest"
-      - name: Upload reproducibility evidence
-        uses: actions/upload-artifact@v7
+          evidence="$RUNNER_TEMP/acceptance-image-linux"
+          mkdir -p "$evidence"
+          scripts/verify-acceptance-image.sh --archive "$RUNNER_TEMP/acceptance-image.oci.tar" \
+            --expected-platform "$PLATFORM" --platform-digest-output "$evidence/${ARCH}.digest" \
+            --receipt-output "$evidence/${ARCH}-oci.json"
+          go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
+          crane="$(go env GOPATH)/bin/crane"
+          registry_reference="localhost:5000/wefty-echo-service:${GITHUB_SHA}-${ARCH}"
+          platform_digest="$(cat "$evidence/${ARCH}.digest")"
+          registry_digest="$("$crane" digest --insecure "$registry_reference")"
+          test "$registry_digest" = "$platform_digest"
+          printf '%s\n' "$registry_digest" > "$evidence/${ARCH}-registry.digest"
+
+          pinned_reference="${registry_reference}@${platform_digest}"
+          docker pull --platform "$PLATFORM" "$pinned_reference"
+          container_id="$(docker run --detach --rm --platform "$PLATFORM" --network host \
+            --env WEFTY_SERVICE_PORT=18156 --env WEFTY_SERVICE_DIR=/tmp/wefty-service "$pinned_reference")"
+          cleanup() { docker stop --time 15 "$container_id" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          for _ in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:18156/healthz > "$evidence/${ARCH}-health.json"; then break; fi
+            sleep 1
+          done
+          jq -e '.service_directory == "/tmp/wefty-service" and .listening_port == 18156 and (.pid > 0)' "$evidence/${ARCH}-health.json"
+          printf 'wefty-public-echo-%s\n' "$ARCH" > "$evidence/${ARCH}-echo-input.txt"
+          curl --fail --silent --request POST --data-binary "@$evidence/${ARCH}-echo-input.txt" \
+            http://127.0.0.1:18156/echo > "$evidence/${ARCH}-echo-output.txt"
+          cmp "$evidence/${ARCH}-echo-input.txt" "$evidence/${ARCH}-echo-output.txt"
+          docker stop --time 15 "$container_id"
+          trap - EXIT
+
+          "$crane" export --insecure --platform "$PLATFORM" "$pinned_reference" "$RUNNER_TEMP/rootfs.tar"
+          tar -xOf "$RUNNER_TEMP/rootfs.tar" usr/local/bin/wefty-echo-service > "$RUNNER_TEMP/wefty-echo-service"
+          python3 - "$RUNNER_TEMP/wefty-echo-service" "$ARCH" <<'PY'
+          import struct, sys
+          payload = open(sys.argv[1], "rb").read(20)
+          if payload[:4] != b"\x7fELF": raise SystemExit("echo service is not ELF")
+          machine = struct.unpack("<H", payload[18:20])[0]
+          expected = {"amd64": 62, "arm64": 183}[sys.argv[2]]
+          if machine != expected: raise SystemExit(f"ELF e_machine={machine}, want {expected}")
+          PY
+          machine="$(test "$ARCH" = amd64 && printf 62 || printf 183)"
+          jq -n --arg platform "$PLATFORM" --arg digest "$platform_digest" --argjson e_machine "$machine" \
+            '{platform: $platform, digest: $digest, executed: true, health: true, echo: true, elf_e_machine: $e_machine}' \
+            > "$evidence/${ARCH}-runtime.json"
+      - name: Upload reproducibility and runtime evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: wefty-echo-service-platform-${{ matrix.arch }}-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/acceptance-image-linux/${{ matrix.arch }}.digest
-            ${{ runner.temp }}/acceptance-image-linux/${{ matrix.arch }}-first.json
-            ${{ runner.temp }}/acceptance-image-linux/${{ matrix.arch }}-second.json
+          path: ${{ runner.temp }}/acceptance-image-linux
           if-no-files-found: error
 
   publish:
@@ -81,30 +122,30 @@ jobs:
     outputs:
       index-digest: ${{ steps.publish.outputs.digest }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
         with:
           version: v0.36.1
           driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
       - name: Download platform digest evidence
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: wefty-echo-service-platform-*-${{ github.sha }}
           path: ${{ runner.temp }}/platforms
           merge-multiple: true
       - name: Authenticate the main-only publisher
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Publish the commit-tagged multi-platform index
         id: publish
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: examples/oci-echo-service/Dockerfile
@@ -115,75 +156,75 @@ jobs:
           no-cache: true
           build-args: SOURCE_DATE_EPOCH=0
           outputs: type=registry,rewrite-timestamp=true
-      - name: Match the published index to both reproducible builds
+      - name: Resolve the published digest once and verify its platform set
         env:
-          INDEX_DIGEST: ${{ steps.publish.outputs.digest }}
+          ACTION_DIGEST: ${{ steps.publish.outputs.digest }}
         run: |
           set -euo pipefail
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
-          published="$("$crane" digest "$IMAGE_NAME:$GITHUB_SHA")"
-          test "$published" = "$INDEX_DIGEST"
-          "$crane" manifest "$IMAGE_NAME@$INDEX_DIGEST" > "$RUNNER_TEMP/acceptance-image-index.json"
+          index_digest="$("$crane" digest "$IMAGE_NAME:$GITHUB_SHA")"
+          test "$index_digest" = "$ACTION_DIGEST"
+          printf '%s\n' "$index_digest" > "$RUNNER_TEMP/acceptance-image-index-digest.txt"
+          "$crane" manifest "$IMAGE_NAME@$index_digest" > "$RUNNER_TEMP/acceptance-image-index.json"
           amd64_digest="$(cat "$RUNNER_TEMP/platforms/amd64.digest")"
           arm64_digest="$(cat "$RUNNER_TEMP/platforms/arm64.digest")"
           test "$(jq -r --arg digest "$amd64_digest" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64" and .digest == $digest)] | length' "$RUNNER_TEMP/acceptance-image-index.json")" = 1
           test "$(jq -r --arg digest "$arm64_digest" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64" and .digest == $digest)] | length' "$RUNNER_TEMP/acceptance-image-index.json")" = 1
           test "$(jq -r '[.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length' "$RUNNER_TEMP/acceptance-image-index.json")" = 2
-      - name: Emit and verify the OCI archive
-        env:
-          INDEX_DIGEST: ${{ steps.publish.outputs.digest }}
+          jq -e --arg digest "$amd64_digest" '.digest == $digest and .executed and .health and .echo and .elf_e_machine == 62' "$RUNNER_TEMP/platforms/amd64-runtime.json"
+          jq -e --arg digest "$arm64_digest" '.digest == $digest and .executed and .health and .echo and .elf_e_machine == 183' "$RUNNER_TEMP/platforms/arm64-runtime.json"
+      - name: Emit the digest-selected OCI archive and public-pull proof
         run: |
           set -euo pipefail
           crane="$(go env GOPATH)/bin/crane"
+          index_digest="$(cat "$RUNNER_TEMP/acceptance-image-index-digest.txt")"
           layout="$RUNNER_TEMP/wefty-echo-service.oci"
           archive="$RUNNER_TEMP/wefty-echo-service.oci.tar"
-          "$crane" pull "$IMAGE_NAME:$GITHUB_SHA" "$layout" --format=oci --annotate-ref
+          "$crane" pull "$IMAGE_NAME@$index_digest" "$layout" --format=oci --annotate-ref
           tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$layout" -cf "$archive" .
-          scripts/verify-acceptance-image.sh \
-            --archive "$archive" \
-            --expected-top-digest "$INDEX_DIGEST" \
-            --expected-platform linux/amd64 \
-            --expected-platform linux/arm64 \
+          scripts/verify-acceptance-image.sh --archive "$archive" --expected-top-digest "$index_digest" \
+            --expected-platform linux/amd64 --expected-platform linux/arm64 \
             --expected-platform-digest "linux/amd64=$(cat "$RUNNER_TEMP/platforms/amd64.digest")" \
             --expected-platform-digest "linux/arm64=$(cat "$RUNNER_TEMP/platforms/arm64.digest")" \
             --receipt-output "$RUNNER_TEMP/acceptance-image-archive-receipt.json"
           mkdir -p "$RUNNER_TEMP/anonymous-docker"
-          DOCKER_CONFIG="$RUNNER_TEMP/anonymous-docker" "$crane" manifest "$IMAGE_NAME@$INDEX_DIGEST" >/dev/null
-      - name: Assemble digest-pinned install manifests
-        env:
-          INDEX_DIGEST: ${{ steps.publish.outputs.digest }}
+          if ! DOCKER_CONFIG="$RUNNER_TEMP/anonymous-docker" "$crane" manifest "$IMAGE_NAME@$index_digest" >/dev/null; then
+            printf '%s\n' '::error title=Public GHCR verification failed::Set the repository-linked wefty-echo-service package visibility to Public, then rerun acceptance-image.' >&2
+            exit 1
+          fi
+      - name: Assemble digest-pinned runnable release trees
         run: |
           set -euo pipefail
           release="$RUNNER_TEMP/acceptance-image-release"
+          index_digest="$(cat "$RUNNER_TEMP/acceptance-image-index-digest.txt")"
           mkdir -p "$release"
+          cp "$RUNNER_TEMP/wefty-echo-service.oci.tar" "$release/wefty-echo-service.oci.tar"
           for arch in amd64 arm64; do
             root="$release/linux-$arch"
-            mkdir -p "$root/libexec" "$root/share/wefty/oci"
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false -ldflags='-buildid=' \
-              -o "$root/libexec/wefty-agent" ./cmd/wefty-agent
-            scripts/build-oci-install-manifest.sh \
-              --helper "$root/libexec/wefty-agent" \
-              --probe-reference "$IMAGE_NAME:$GITHUB_SHA" \
-              --probe-digest "$INDEX_DIGEST" \
-              --probe-archive "$RUNNER_TEMP/wefty-echo-service.oci.tar" \
+            mkdir -p "$root/bin" "$root/libexec" "$root/share/wefty/oci"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false -ldflags='-buildid=' -o "$root/bin/wefty" ./cmd/wefty
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false -ldflags='-buildid=' -o "$root/libexec/wefty-agent" ./cmd/wefty-agent
+            scripts/build-oci-install-manifest.sh --helper "$root/libexec/wefty-agent" --probe-reference "$IMAGE_NAME" \
+              --probe-digest "$index_digest" --probe-archive "$release/wefty-echo-service.oci.tar" \
               --output "$root/share/wefty/oci/manifest.json"
+            rm "$root/share/wefty/oci/wefty-echo-service.oci.tar"
+            ln "$release/wefty-echo-service.oci.tar" "$root/share/wefty/oci/wefty-echo-service.oci.tar"
           done
           cp "$RUNNER_TEMP/acceptance-image-index.json" "$release/acceptance-image-index.json"
           cp "$RUNNER_TEMP/acceptance-image-archive-receipt.json" "$release/acceptance-image-archive-receipt.json"
-          cp "$RUNNER_TEMP/wefty-echo-service.oci.tar" "$release/wefty-echo-service.oci.tar"
-          printf '%s\n' "$INDEX_DIGEST" > "$release/acceptance-image-index-digest.txt"
-          jq -n \
-            --arg commit "$GITHUB_SHA" \
-            --arg reference "$IMAGE_NAME:$GITHUB_SHA" \
-            --arg index_digest "$INDEX_DIGEST" \
-            --arg amd64_digest "$(cat "$RUNNER_TEMP/platforms/amd64.digest")" \
-            --arg arm64_digest "$(cat "$RUNNER_TEMP/platforms/arm64.digest")" \
-            '{version: 1, commit: $commit, reference: $reference, index_digest: $index_digest, platforms: {"linux/amd64": $amd64_digest, "linux/arm64": $arm64_digest}, public_pull: true, archive_verified: true}' \
+          cp "$RUNNER_TEMP/acceptance-image-index-digest.txt" "$release/acceptance-image-index-digest.txt"
+          jq -n --arg commit "$GITHUB_SHA" --arg reference "$IMAGE_NAME" --arg index_digest "$index_digest" \
+            --arg amd64_digest "$(cat "$RUNNER_TEMP/platforms/amd64.digest")" --arg arm64_digest "$(cat "$RUNNER_TEMP/platforms/arm64.digest")" \
+            '{version: 1, commit: $commit, reference: $reference, index_digest: $index_digest, platforms: {"linux/amd64": $amd64_digest, "linux/arm64": $arm64_digest}, public_pull: true, archive_verified: true, runtime_verified: {"linux/amd64": true, "linux/arm64": true}}' \
             > "$release/acceptance-image-receipt.json"
+          package="$RUNNER_TEMP/acceptance-image-package"
+          mkdir -p "$package"
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$RUNNER_TEMP" \
+            -cf "$package/wefty-acceptance-image-release.tar" acceptance-image-release
       - name: Upload stable acceptance image outputs
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: wefty-echo-service-${{ github.sha }}
-          path: ${{ runner.temp }}/acceptance-image-release
+          path: ${{ runner.temp }}/acceptance-image-package
           if-no-files-found: error

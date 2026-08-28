@@ -14,6 +14,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  acceptance-image:
+    name: acceptance-image
+    uses: ./.github/workflows/acceptance-image.yml
+    permissions:
+      contents: read
+
   unit:
     name: unit
     runs-on: ubuntu-latest
@@ -33,7 +39,7 @@ jobs:
         run: go test ./...
       - name: Validate acceptance image workflow and artifact contract
         run: |
-          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          go tool actionlint
           bash scripts/test-acceptance-image.sh
       - name: Exercise privileged OCI install and configure path
         run: bash scripts/test-install-oci-privileged.sh
@@ -122,6 +128,7 @@ jobs:
   all-tests-pass:
     name: all-tests-pass
     needs:
+      - acceptance-image
       - unit
       - sqlite-integration
       - mac-linux-runner
@@ -135,6 +142,7 @@ jobs:
     steps:
       - name: Enforce required lane results
         env:
+          ACCEPTANCE_IMAGE_RESULT: ${{ needs['acceptance-image'].result }}
           UNIT_RESULT: ${{ needs.unit.result }}
           SQLITE_RESULT: ${{ needs['sqlite-integration'].result }}
           MAC_LINUX_RESULT: ${{ needs['mac-linux-runner'].result }}
@@ -143,11 +151,13 @@ jobs:
         run: |
           set -eu
           printf '%s\n' \
+            "acceptance-image=$ACCEPTANCE_IMAGE_RESULT" \
             "unit=$UNIT_RESULT" \
             "sqlite-integration=$SQLITE_RESULT" \
             "mac-linux-runner=$MAC_LINUX_RESULT" \
             "service-acceptance=$SERVICE_ACCEPTANCE_RESULT" \
             "dogfood-workflow=$DOGFOOD_RESULT"
+          test "$ACCEPTANCE_IMAGE_RESULT" = success
           test "$UNIT_RESULT" = success
           test "$SQLITE_RESULT" = success
           test "$MAC_LINUX_RESULT" = success

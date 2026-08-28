@@ -12,6 +12,7 @@ on:
     - cron: "47 7 * * 1"
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -19,9 +20,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  resolve-published-artifact:
+    name: resolve-published-artifact
+    runs-on: ubuntu-latest
+    outputs:
+      available: ${{ steps.resolve.outputs.available }}
+      candidate-sha: ${{ steps.resolve.outputs.candidate_sha }}
+      run-id: ${{ steps.resolve.outputs.run_id }}
+    steps:
+      - name: Resolve the immutable publishing run
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          TRIGGER_RUN_ID: ${{ github.event.workflow_run.id }}
+          TRIGGER_SHA: ${{ github.event.workflow_run.head_sha }}
+          TRIGGER_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = workflow_run ]; then
+            if [ "$TRIGGER_CONCLUSION" != success ]; then
+              printf '%s\n' "::notice::typed-skip: acceptance-image run $TRIGGER_RUN_ID concluded $TRIGGER_CONCLUSION; no published artifact exists"
+              printf 'available=false\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            run_id="$TRIGGER_RUN_ID"
+            candidate_sha="$TRIGGER_SHA"
+          else
+            published="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow acceptance-image.yml --branch main --status success --limit 1 --json databaseId,headSha)"
+            if [ "$(jq 'length' <<<"$published")" = 0 ]; then
+              printf '%s\n' '::notice::typed-skip: no successful acceptance-image publication exists on main yet'
+              printf 'available=false\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            run_id="$(jq -r '.[0].databaseId' <<<"$published")"
+            candidate_sha="$(jq -r '.[0].headSha' <<<"$published")"
+          fi
+          case "$candidate_sha" in *[!0-9a-f]*|'') exit 64 ;; esac
+          printf 'available=true\ncandidate_sha=%s\nrun_id=%s\n' "$candidate_sha" "$run_id" >> "$GITHUB_OUTPUT"
+
   service-acceptance-realtiming:
     name: service-acceptance-realtiming / ${{ matrix.os }}
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    needs: [resolve-published-artifact]
+    if: needs.resolve-published-artifact.outputs.available == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -30,25 +71,28 @@ jobs:
     env:
       IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: main
+          ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           persist-credentials: false
-      - name: Pin the trusted main identity
+      - name: Download the triggering publication artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: wefty-echo-service-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/acceptance-image-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.resolve-published-artifact.outputs.run-id }}
+      - name: Pin the downloaded artifact identity
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          PUBLISHED_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
         run: |
           set -euo pipefail
-          candidate_sha="$(git rev-parse HEAD)"
-          case "$candidate_sha" in
-            *[!0-9a-f]*|'') exit 64 ;;
-          esac
-          if [ "$EVENT_NAME" = workflow_run ]; then
-            test "$candidate_sha" = "$PUBLISHED_SHA"
-          fi
-          printf 'CANDIDATE_SHA=%s\n' "$candidate_sha" >> "$GITHUB_ENV"
-      - uses: actions/setup-go@v7
+          tar -xf "$RUNNER_TEMP/acceptance-image-download/wefty-acceptance-image-release.tar" -C "$RUNNER_TEMP"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(jq -r .commit "$RUNNER_TEMP/acceptance-image-release/acceptance-image-receipt.json")" = "$EXPECTED_SHA"
+          printf 'CANDIDATE_SHA=%s\n' "$EXPECTED_SHA" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: false
@@ -94,23 +138,25 @@ jobs:
           done
           sudo /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock version
           sudo chmod 0600 /run/wefty-containerd/containerd.sock
-          go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
-          CRANE="$(go env GOPATH)/bin/crane"
-          ECHO_REFERENCE="$IMAGE_NAME:$CANDIDATE_SHA"
-          ECHO_DIGEST="$("$CRANE" digest "$ECHO_REFERENCE")"
-          "$CRANE" pull "$ECHO_REFERENCE" /tmp/wefty-echo.oci --format=oci --annotate-ref
-          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C /tmp/wefty-echo.oci -cf /tmp/wefty-echo.oci.tar .
+          release="$RUNNER_TEMP/acceptance-image-release"
+          manifest="$release/linux-amd64/share/wefty/oci/manifest.json"
+          ECHO_REFERENCE="$(jq -r .probe_reference "$manifest")"
+          ECHO_DIGEST="$(jq -r .probe_digest "$manifest")"
+          test "$ECHO_REFERENCE" = "$IMAGE_NAME"
+          test "$ECHO_DIGEST" = "$(cat "$release/acceptance-image-index-digest.txt")"
+          ECHO_ARCHIVE="$release/linux-amd64/share/wefty/oci/$(jq -r .probe_archive_path "$manifest")"
           scripts/verify-acceptance-image.sh \
-            --archive /tmp/wefty-echo.oci.tar \
+            --archive "$ECHO_ARCHIVE" \
             --expected-top-digest "$ECHO_DIGEST" \
             --expected-platform linux/amd64 \
             --expected-platform linux/arm64 \
             --receipt-output /tmp/wefty-acceptance-image.json
-          chmod 0644 /tmp/wefty-echo.oci.tar
+          chmod 0644 "$ECHO_ARCHIVE"
           PROBE_REFERENCE="$ECHO_REFERENCE"
           PROBE_DIGEST="$ECHO_DIGEST"
-          go build -o /tmp/wefty-agent-oci-realtiming ./cmd/wefty-agent
-          go build -o /tmp/wefty-realtiming ./cmd/wefty
+          WEFTY_AGENT="$release/linux-amd64/libexec/wefty-agent"
+          WEFTY_CLI="$release/linux-amd64/bin/wefty"
+          chmod 0755 "$WEFTY_AGENT" "$WEFTY_CLI"
           docker buildx create --name wefty-realtiming --driver docker-container --use
           docker buildx inspect --bootstrap
           NUMERIC_REFERENCE="wefty.local/service-data-numeric:${CANDIDATE_SHA}"
@@ -127,9 +173,9 @@ jobs:
           docker buildx build --platform linux/amd64 --tag "$NAMED_REFERENCE" \
             --output type=oci,dest=/tmp/wefty-service-data-named.oci.tar /tmp/wefty-service-data-named
           chmod 0644 /tmp/wefty-service-data-numeric.oci.tar /tmp/wefty-service-data-named.oci.tar
-          sudo install --owner=root --group=root --mode=0755 /tmp/wefty-agent-oci-realtiming /usr/local/libexec/wefty-agent-oci-realtiming
-          HELPER_CHECKSUM="sha256:$(sha256sum /tmp/wefty-agent-oci-realtiming | cut -d' ' -f1)"
-          scripts/build-oci-install-manifest.sh --helper /tmp/wefty-agent-oci-realtiming --probe-reference "$PROBE_REFERENCE" --probe-digest "$PROBE_DIGEST" --probe-archive /tmp/wefty-echo.oci.tar --output /tmp/wefty-release/share/wefty/oci/manifest.json
+          sudo install --owner=root --group=root --mode=0755 "$WEFTY_AGENT" /usr/local/libexec/wefty-agent-oci-realtiming
+          HELPER_CHECKSUM="sha256:$(sha256sum "$WEFTY_AGENT" | cut -d' ' -f1)"
+          test "$HELPER_CHECKSUM" = "$(jq -r .helper_checksum "$manifest")"
           AGENT_UID="$(id -u)"
           AGENT_GROUP="$(id -gn)"
           sudo install --directory --owner=root --group="$AGENT_GROUP" --mode=0750 /run/wefty-oci-helper
@@ -242,11 +288,11 @@ jobs:
             printf 'WEFTY_OCI_HELPER_CHECKSUM=%s\n' "$HELPER_CHECKSUM"
             printf 'WEFTY_OCI_PROBE_REFERENCE=%s\n' "$PROBE_REFERENCE"
             printf 'WEFTY_OCI_PROBE_DIGEST=%s\n' "$PROBE_DIGEST"
-            printf 'WEFTY_OCI_PROBE_ARCHIVE=%s\n' /tmp/wefty-echo.oci.tar
+            printf 'WEFTY_OCI_PROBE_ARCHIVE=%s\n' "$ECHO_ARCHIVE"
             printf 'WEFTY_OCI_ECHO_REFERENCE=%s\n' "$ECHO_REFERENCE"
             printf 'WEFTY_OCI_ECHO_DIGEST=%s\n' "$ECHO_DIGEST"
-            printf 'WEFTY_OCI_ECHO_ARCHIVE=%s\n' /tmp/wefty-echo.oci.tar
-            printf 'WEFTY_OCI_CLI=%s\n' /tmp/wefty-realtiming
+            printf 'WEFTY_OCI_ECHO_ARCHIVE=%s\n' "$ECHO_ARCHIVE"
+            printf 'WEFTY_OCI_CLI=%s\n' "$WEFTY_CLI"
             printf 'WEFTY_OCI_SERVICE_NUMERIC_REFERENCE=%s\n' "$NUMERIC_REFERENCE"
             printf 'WEFTY_OCI_SERVICE_NUMERIC_ARCHIVE=%s\n' /tmp/wefty-service-data-numeric.oci.tar
             printf 'WEFTY_OCI_SERVICE_NAMED_REFERENCE=%s\n' "$NAMED_REFERENCE"
@@ -267,7 +313,7 @@ jobs:
           go test -count=1 -p 1 -timeout=30m -v -tags=service_acceptance_realtiming ./...
       - name: Upload service acceptance evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: service-acceptance-realtiming-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}
           path: ${{ runner.temp }}/service-acceptance-realtiming

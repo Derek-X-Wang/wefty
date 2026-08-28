@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/images"
@@ -87,6 +89,114 @@ func TestInspectOCIArchiveRejectsTruncatedTar(t *testing.T) {
 	if _, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive[:len(archive)-700]), "", ""); err == nil {
 		t.Fatal("truncated OCI archive was accepted")
 	}
+}
+
+func TestInspectOCIArchiveFiltersForeignPlatformBlobsBeforeImport(t *testing.T) {
+	archive, topDigest, selected, foreign := testMultiPlatformOCIArchive(t)
+	inspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty:test", topDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(inspection.Path) })
+	if inspection.PlatformDigest != selected {
+		t.Fatalf("selected platform digest = %s, want %s", inspection.PlatformDigest, selected)
+	}
+	file, err := os.Open(inspection.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	names := make(map[string]struct{})
+	reader := tar.NewReader(file)
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		names[header.Name] = struct{}{}
+	}
+	if _, exists := names["blobs/sha256/"+foreign.Encoded()]; exists {
+		t.Fatal("foreign-platform manifest entered the filtered import archive")
+	}
+	for _, required := range []string{"oci-layout", "index.json", "blobs/sha256/" + topDigest.Encoded(), "blobs/sha256/" + selected.Encoded()} {
+		if _, exists := names[required]; !exists {
+			t.Fatalf("filtered archive is missing %s", required)
+		}
+	}
+}
+
+func testMultiPlatformOCIArchive(t *testing.T) ([]byte, digest.Digest, digest.Digest, digest.Digest) {
+	t.Helper()
+	type platformImage struct {
+		manifest   ocispec.Descriptor
+		manifestB  []byte
+		config     ocispec.Descriptor
+		configB    []byte
+		layer      ocispec.Descriptor
+		layerBytes []byte
+	}
+	makeImage := func(architecture string, layerBytes []byte) platformImage {
+		configBytes, err := json.Marshal(ocispec.Image{Platform: ocispec.Platform{OS: runtime.GOOS, Architecture: architecture}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		config := descriptor(ocispec.MediaTypeImageConfig, configBytes)
+		layers := []ocispec.Descriptor{}
+		var layer ocispec.Descriptor
+		if layerBytes != nil {
+			layer = descriptor(ocispec.MediaTypeImageLayer, layerBytes)
+			layers = append(layers, layer)
+		}
+		manifestBytes, err := json.Marshal(map[string]any{"schemaVersion": 2, "mediaType": ocispec.MediaTypeImageManifest, "config": config, "layers": layers})
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifest := descriptor(ocispec.MediaTypeImageManifest, manifestBytes)
+		manifest.Platform = &ocispec.Platform{OS: runtime.GOOS, Architecture: architecture}
+		return platformImage{manifest: manifest, manifestB: manifestBytes, config: config, configB: configBytes, layer: layer, layerBytes: layerBytes}
+	}
+	foreignArchitecture := "arm64"
+	if runtime.GOARCH == "arm64" {
+		foreignArchitecture = "amd64"
+	}
+	selected := makeImage(runtime.GOARCH, nil)
+	foreign := makeImage(foreignArchitecture, []byte(strings.Repeat("foreign-platform-layer", 4096)))
+	indexBytes, err := json.Marshal(map[string]any{"schemaVersion": 2, "mediaType": ocispec.MediaTypeImageIndex, "manifests": []ocispec.Descriptor{selected.manifest, foreign.manifest}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	top := descriptor(ocispec.MediaTypeImageIndex, indexBytes)
+	top.Annotations = map[string]string{images.AnnotationImageName: "example.invalid/wefty:test"}
+	rootBytes, err := json.Marshal(map[string]any{"schemaVersion": 2, "manifests": []ocispec.Descriptor{top}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := map[string][]byte{
+		"oci-layout": []byte(`{"imageLayoutVersion":"1.0.0"}`), "index.json": rootBytes,
+		"blobs/sha256/" + top.Digest.Encoded():               indexBytes,
+		"blobs/sha256/" + selected.manifest.Digest.Encoded(): selected.manifestB,
+		"blobs/sha256/" + selected.config.Digest.Encoded():   selected.configB,
+		"blobs/sha256/" + foreign.manifest.Digest.Encoded():  foreign.manifestB,
+		"blobs/sha256/" + foreign.config.Digest.Encoded():    foreign.configB,
+		"blobs/sha256/" + foreign.layer.Digest.Encoded():     foreign.layerBytes,
+	}
+	var output bytes.Buffer
+	writer := tar.NewWriter(&output)
+	for name, payload := range entries {
+		if err := writer.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: int64(len(payload)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes(), top.Digest, selected.manifest.Digest, foreign.manifest.Digest
 }
 
 func testOCIArchive(t *testing.T, corruptConfig, digestedReference bool) ([]byte, digest.Digest, digest.Digest) {

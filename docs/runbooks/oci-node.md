@@ -29,12 +29,14 @@ Every written path, owner, and mode appears in the dry-run or completion receipt
 
 ## Configure the installed node
 
-The installer and setup have deliberately separate authority. A Linux release installs `wefty` in `bin`, the matching agent in `libexec`, and `share/wefty/oci/manifest.json` containing the helper checksum, probe reference/digest, and a relative probe archive path. The main-only `acceptance-image` workflow publishes `ghcr.io/derek-x-wang/wefty-echo-service:<commit>` and uploads the stable `wefty-echo-service-<commit>` artifact. Its root contains `acceptance-image-index-digest.txt`, `acceptance-image-index.json`, `acceptance-image-receipt.json`, and `wefty-echo-service.oci.tar`; its `linux-amd64/` and `linux-arm64/` trees contain the matching helper plus a generated `share/wefty/oci/manifest.json`. The digest receipt is the authority for both registry pull and offline import; never substitute a mutable tag.
+The installer and setup have deliberately separate authority. A Linux release installs `wefty` in `bin`, the matching agent in `libexec`, and `share/wefty/oci/manifest.json` containing the helper checksum, probe repository name, digest, and a relative probe archive path. The main-only `acceptance-image` workflow publishes `ghcr.io/derek-x-wang/wefty-echo-service:<commit>` as a discovery alias, resolves its index digest once, and uploads the stable `wefty-echo-service-<commit>` artifact. Extract `wefty-acceptance-image-release.tar` from that artifact; its root contains `acceptance-image-index-digest.txt`, `acceptance-image-index.json`, `acceptance-image-receipt.json`, and one canonical `wefty-echo-service.oci.tar`, while its runnable `linux-amd64/` and `linux-arm64/` trees contain `bin/wefty`, the matching `libexec/wefty-agent`, and a generated `share/wefty/oci/manifest.json` referencing the canonical archive through a tar hard link. The digest receipt is the authority for both `ghcr.io/derek-x-wang/wefty-echo-service@sha256:...` registry pull and offline import; never substitute a mutable tag.
+
+GHCR package visibility defaults can make the first publication private. If anonymous digest pull fails, set the repository-linked `wefty-echo-service` package visibility to **Public** and rerun `acceptance-image`; the workflow reports this exact typed remediation instead of treating the artifact as published.
 
 For unpackaged release assembly, reproduce the manifest from the exact helper and acceptance archive with the tested builder (replace the variables with values from that workflow artifact):
 
 ```sh
-scripts/build-oci-install-manifest.sh --helper /tmp/wefty-agent-oci-realtiming --probe-reference "$PROBE_REFERENCE" --probe-digest "$PROBE_DIGEST" --probe-archive /tmp/wefty-echo-service.oci.tar --output share/wefty/oci/manifest.json
+scripts/build-oci-install-manifest.sh --helper "$RELEASE_ROOT/libexec/wefty-agent" --probe-reference "$PROBE_REPOSITORY" --probe-digest "$PROBE_DIGEST" --probe-archive "$ACCEPTANCE_ARCHIVE" --output "$RELEASE_ROOT/share/wefty/oci/manifest.json"
 ```
 
 With a normally installed release, Linux setup finds `<prefix>/share/wefty/oci/manifest.json` from the `wefty` executable and defaults all four artifact flags from it:
@@ -86,12 +88,13 @@ The owner-ratified cache ceiling is 16 GiB. Operation leases, live attempts, dur
 wefty node load-image FILE
 ```
 
-For the acceptance artifact, `FILE` is `wefty-echo-service.oci.tar`. The command
+For the acceptance artifact, set `FILE="$ACCEPTANCE_RELEASE/wefty-echo-service.oci.tar"`. The command
 must print the same top-level digest as
 `acceptance-image-index-digest.txt` and a platform digest present in
 `acceptance-image-index.json`. The archive contains both `linux/amd64` and
-`linux/arm64`; the helper admits only the probed runtime platform, retains the
-operator import hold, and continues to enforce the configured 16 GiB cache
+`linux/arm64`; the helper verifies the complete descriptor graph, filters the
+spooled import to the node's probed platform before containerd writes content,
+retains the operator import hold, and therefore enforces the configured 16 GiB cache
 ceiling and stronger live-attempt, service-binding, and probe holds.
 
 ## Read diagnostics before changing state
