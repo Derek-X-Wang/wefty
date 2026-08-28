@@ -138,6 +138,14 @@ type MountDoctorFacts struct {
 	AllowedRoots []string          `json:"allowed_roots"`
 }
 
+type ProfileDoctorFacts struct {
+	Outcome                   DiagnosticOutcome          `json:"outcome"`
+	MemoryLimitBytes          int64                      `json:"memory_limit_bytes"`
+	ComputerTmpfsCeilingBytes int64                      `json:"computer_tmpfs_ceiling_bytes"`
+	LargestTmpfsCeilingBytes  int64                      `json:"largest_tmpfs_ceiling_bytes"`
+	Warnings                  []ocihelper.ProfileWarning `json:"warnings"`
+}
+
 type ConvergenceDoctorFacts struct {
 	Outcome DiagnosticOutcome `json:"outcome"`
 	Class   ConvergenceClass  `json:"class,omitempty"`
@@ -181,6 +189,7 @@ type DoctorResponse struct {
 	Intent          IntentDoctorFacts      `json:"intent"`
 	Cache           CacheDoctorFacts       `json:"cache"`
 	Mounts          MountDoctorFacts       `json:"mounts"`
+	Profile         ProfileDoctorFacts     `json:"profile"`
 	Convergence     ConvergenceDoctorFacts `json:"convergence"`
 	Findings        []DiagnosticFinding    `json:"findings"`
 	Limitations     []DoctorLimitation     `json:"limitations"`
@@ -288,6 +297,7 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 		Probe:  ProbeDoctorFacts{Outcome: DiagnosticNotRun, Verdict: "not_run", Capabilities: map[string]bool{}, MissingCapabilities: []string{}},
 		Intent: IntentDoctorFacts{Outcome: DiagnosticNotRun}, Cache: CacheDoctorFacts{Outcome: DiagnosticNotRun},
 		Mounts:      MountDoctorFacts{Outcome: DiagnosticNotRun, AllowedRoots: []string{}},
+		Profile:     ProfileDoctorFacts{Outcome: DiagnosticNotRun, Warnings: []ocihelper.ProfileWarning{}},
 		Convergence: ConvergenceDoctorFacts{Outcome: DiagnosticNotRun},
 		Findings:    []DiagnosticFinding{},
 		Limitations: []DoctorLimitation{{
@@ -535,6 +545,24 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 	report.Cache = CacheDoctorFacts{Outcome: outcomeFor(cacheRan, cacheOK), Bytes: cache.Bytes, CapBytes: cache.CapBytes, WithinBound: cacheOK, LastEviction: cache.LastEviction}
 	report.Findings = append(report.Findings, finding("cache", diagnosticReceipt{ran: cacheRan, passed: cacheOK, code: cacheCodeValue, notRunCause: NotRunSourceUnavailable, detail: "bounded cache accounting was read without enforcing or evicting"}))
 
+	if runtimeStatus.LastProfile == nil {
+		report.Findings = append(report.Findings, finding("profile-ceilings", diagnosticReceipt{code: "oci_profile_ceilings_not_recorded", notRunCause: NotRunNoProbeReceipt, detail: "no completed runtime profile receipt was recorded"}))
+	} else {
+		profile := runtimeStatus.LastProfile
+		report.Profile = ProfileDoctorFacts{Outcome: DiagnosticOK, MemoryLimitBytes: profile.MemoryLimitBytes,
+			ComputerTmpfsCeilingBytes: profile.ComputerTmpfsCeilingBytes, LargestTmpfsCeilingBytes: profile.LargestTmpfsCeilingBytes,
+			Warnings: append([]ocihelper.ProfileWarning{}, profile.Warnings...)}
+		code := "oci_profile_tmpfs_ceilings_within_memory_limit"
+		severity := DiagnosticInfo
+		detail := "the last assertion-derived runtime profile receipt has tmpfs ceilings within its memory limit"
+		if len(profile.Warnings) > 0 {
+			code = "oci_profile_tmpfs_ceilings_exceed_memory_limit"
+			severity = DiagnosticWarn
+			detail = "tmpfs ceilings are caps rather than reservations; the last profile can reach its cgroup memory limit before those ceilings"
+		}
+		report.Findings = append(report.Findings, finding("profile-ceilings", diagnosticReceipt{ran: true, passed: true, code: code, severity: severity, detail: detail}))
+	}
+
 	buildMountRoots(runtimeStatus, report)
 }
 
@@ -550,13 +578,13 @@ func appendHelperDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
 }
 
 func appendRuntimeDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
-	for _, check := range []string{"runtime-platform", "runtime-versions", "cache", "mount-roots"} {
+	for _, check := range []string{"runtime-platform", "runtime-versions", "cache", "profile-ceilings", "mount-roots"} {
 		report.Findings = append(report.Findings, finding(check, diagnosticReceipt{code: "oci_" + strings.ReplaceAll(check, "-", "_") + "_not_run", notRunCause: cause, detail: "the dependent helper read did not run"}))
 	}
 }
 
 func appendMechanicsDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
-	for _, check := range []string{"runtime-versions", "cache", "mount-roots"} {
+	for _, check := range []string{"runtime-versions", "cache", "profile-ceilings", "mount-roots"} {
 		report.Findings = append(report.Findings, finding(check, diagnosticReceipt{code: "oci_" + strings.ReplaceAll(check, "-", "_") + "_not_run", notRunCause: cause, detail: "the dependent helper read did not run"}))
 	}
 }
@@ -725,6 +753,7 @@ func StableDoctorCodes() []string {
 		"oci_runtime_platform_not_run", "oci_runtime_platform_not_recorded", "oci_runtime_platform_observed",
 		"oci_runtime_versions_not_run", "oci_runtime_versions_unavailable", "oci_runtime_versions_unsupported", "oci_runtime_versions_observed", "oci_runtime_versions_outside_tested_range",
 		"oci_cache_not_run", "oci_cache_status_unavailable", "oci_cache_within_bound", "oci_cache_over_bound", "oci_cache_eviction_failed",
+		"oci_profile_ceilings_not_run", "oci_profile_ceilings_not_recorded", "oci_profile_tmpfs_ceilings_within_memory_limit", "oci_profile_tmpfs_ceilings_exceed_memory_limit",
 		"oci_mount_roots_not_run", "oci_mount_roots_unavailable", "oci_mount_roots_observed", "oci_mount_root_unavailable",
 		"oci_convergence_not_read", "oci_convergence_state_unavailable", "oci_convergence_desired_not_read",
 		"oci_convergence_unchanged", "oci_convergence_live_safe", "oci_convergence_restart_required", "oci_convergence_recreate_required",

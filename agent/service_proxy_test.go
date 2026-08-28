@@ -794,8 +794,9 @@ func (*rejectPublishedListenerFabric) ConnectHost() string { return "127.0.0.1" 
 type capturingStartedRunner struct{ request processrunner.Request }
 
 type opaqueEndpointRuntime struct {
-	release chan struct{}
-	request workloadrunner.Request
+	release   chan struct{}
+	request   workloadrunner.Request
+	startedAt time.Time
 }
 
 func (runtime *opaqueEndpointRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
@@ -804,6 +805,13 @@ func (runtime *opaqueEndpointRuntime) Preflight(_ context.Context, request workl
 
 func (runtime *opaqueEndpointRuntime) Run(ctx context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
 	runtime.request = request
+	if request.OCIStartedAt != nil {
+		startedAt := runtime.startedAt
+		if startedAt.IsZero() {
+			startedAt = time.Now().UTC()
+		}
+		request.OCIStartedAt(startedAt)
+	}
 	if request.Started != nil {
 		request.Started()
 	}

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -39,6 +40,10 @@ func runComputerService(
 	sink workloadrunner.OutputSink,
 	config computerServiceConfig,
 ) (contract.ProcessResult, error) {
+	clock := config.clock
+	if clock == nil {
+		clock = systemClock{}
+	}
 	if config.fabric == nil || config.authorizer == nil || config.auditor == nil || config.dial == nil {
 		err := errors.New("Computer service front door dependencies are incomplete")
 		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
@@ -63,7 +68,7 @@ func runComputerService(
 	defer cancelRun()
 	frontDoor, err := newComputerFrontDoor(computerFrontDoorConfig{
 		authorityContext: runContext, fabric: config.fabric, authorizer: config.authorizer, auditor: config.auditor,
-		clock: config.clock, computerID: config.computerID, jobID: config.jobID, attemptID: config.attemptID,
+		clock: clock, computerID: config.computerID, jobID: config.jobID, attemptID: config.attemptID,
 		fencingToken: config.fencingToken, dial: config.dial,
 	})
 	if err != nil {
@@ -71,7 +76,7 @@ func runComputerService(
 	}
 	tenure, err := newControllerTenure(controllerTenureConfig{
 		authorityContext: runContext,
-		clock:            config.clock,
+		clock:            clock,
 		dial:             config.dial,
 		setControlState: func(signalContext context.Context, humanDriving bool) error {
 			return controlRuntime.SetComputerControlState(signalContext, request.Authority, humanDriving)
@@ -99,7 +104,7 @@ func runComputerService(
 		serverErrors <- serveErr
 	}()
 
-	publication := newPublicationController(config.clock, 0, 0,
+	publication := newPublicationController(clock, 0, 0,
 		func(publishContext context.Context, ready bool) error {
 			if config.publish == nil {
 				return nil
@@ -109,12 +114,24 @@ func runComputerService(
 	publicationDone := make(chan error, 1)
 	go func() { publicationDone <- publication.Run(runContext) }()
 
-	started := make(chan struct{})
+	started := make(chan time.Time, 1)
 	startupSignalErrors := make(chan error, 1)
 	var startedOnce sync.Once
+	var helperStartedAt time.Time
+	priorOCIStartedAt := request.OCIStartedAt
+	request.OCIStartedAt = func(startedAt time.Time) {
+		helperStartedAt = startedAt
+		if priorOCIStartedAt != nil {
+			priorOCIStartedAt(startedAt)
+		}
+	}
 	priorStarted := request.Started
 	request.Started = func() {
 		startedOnce.Do(func() {
+			if helperStartedAt.IsZero() {
+				startupSignalErrors <- errors.New("Computer runtime omitted the helper Started timestamp")
+				return
+			}
 			startupSignalContext, cancelStartupSignal := context.WithTimeout(context.WithoutCancel(runContext), controllerTenureFinalizationLimit)
 			err := controlRuntime.SetComputerControlState(startupSignalContext, request.Authority, false)
 			cancelStartupSignal()
@@ -125,7 +142,7 @@ func runComputerService(
 			if priorStarted != nil {
 				priorStarted()
 			}
-			close(started)
+			started <- helperStartedAt
 		})
 	}
 	outcomes := make(chan serviceRunOutcome, 1)
@@ -135,7 +152,7 @@ func runComputerService(
 	}()
 	readinessErrors := make(chan error, 1)
 	go func() {
-		readinessErrors <- monitorComputerReadiness(runContext, config.clock, started, config.dial, publication.Observe)
+		readinessErrors <- monitorComputerReadiness(runContext, clock, started, config.dial, publication.Observe)
 	}()
 
 	stop := func(publicationFinished bool, publicationErr error) error {
@@ -195,18 +212,20 @@ func runComputerService(
 	}
 }
 
-func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan struct{}, dial computerEndpointDial, observe func(bool)) error {
+func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan time.Time, dial computerEndpointDial, observe func(bool)) error {
 	if clock == nil {
 		clock = systemClock{}
 	}
 	select {
 	case <-ctx.Done():
 		return &computerReadinessError{Code: contract.SpawnFailureRuntimeUnavailable, Err: fmt.Errorf("Computer runtime ended before Started: %w", context.Cause(ctx))}
-	case <-started:
-	}
-	startedAt := clock.Now()
-	if err := probeComputerBackends(ctx, clock, startedAt, dial); err != nil {
-		return err
+	case startedAt := <-started:
+		if startedAt.IsZero() {
+			return &computerReadinessError{Code: contract.SpawnFailureRuntimeUnavailable, Err: errors.New("Computer runtime reported an invalid Started timestamp")}
+		}
+		if err := probeComputerBackends(ctx, clock, startedAt, dial); err != nil {
+			return err
+		}
 	}
 	observe(true)
 	ready := true
@@ -221,7 +240,7 @@ func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan s
 			return nil
 		case <-timer.C():
 		}
-		probeContext, cancel := context.WithTimeout(ctx, DefaultComputerReadinessConnectTimeout)
+		probeContext, cancel := contextWithClockTimeout(ctx, clock, DefaultComputerReadinessConnectTimeout)
 		nextReady := probeComputerBackendPairOnce(probeContext, dial) == nil
 		cancel()
 		if nextReady != ready {
@@ -229,6 +248,20 @@ func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan s
 			observe(ready)
 		}
 	}
+}
+
+func contextWithClockTimeout(parent context.Context, clock Clock, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	timer := clock.NewTimer(timeout)
+	go func() {
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+		case <-timer.C():
+			cancel()
+		}
+	}()
+	return ctx, cancel
 }
 
 func probeComputerBackendPairOnce(ctx context.Context, dial computerEndpointDial) error {

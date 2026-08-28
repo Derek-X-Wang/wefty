@@ -243,6 +243,13 @@ func (tenure *controllerTenure) Release(ctx context.Context, sessionID string, r
 			return nil
 		}
 		holder := tenure.held
+		select {
+		case <-holder.session.context.Done():
+			// The session authority owns the release reason once it has ended,
+			// even when its lifetime closure is first observed as backend EOF.
+			reason = computerSessionEndReason(holder.session.context, reason)
+		default:
+		}
 		operationContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), controllerTenureFinalizationLimit)
 		operation := &controllerOperation{sessionID: sessionID, context: operationContext, cancel: cancel, done: make(chan struct{})}
 		tenure.held = nil
@@ -361,7 +368,7 @@ func (tenure *controllerTenure) report(err error) {
 // override or release may install a replacement input path.
 type controllerConn struct {
 	net.Conn
-	websocket *websocket.Conn
+	websocket immediateWebSocketCloser
 	owner     *controllerTenure
 	sessionID string
 
@@ -373,7 +380,10 @@ type controllerConn struct {
 }
 
 func newControllerConn(connection net.Conn, websocketConnection *websocket.Conn, owner *controllerTenure, sessionID string) *controllerConn {
-	managed := &controllerConn{Conn: connection, websocket: websocketConnection, owner: owner, sessionID: sessionID}
+	managed := &controllerConn{Conn: connection, owner: owner, sessionID: sessionID}
+	if websocketConnection != nil {
+		managed.websocket = websocketConnection
+	}
 	managed.cond = sync.NewCond(&managed.mu)
 	return managed
 }
@@ -429,10 +439,13 @@ func (connection *controllerConn) closeAndWait() {
 	connection.mu.Lock()
 	if !connection.closing {
 		connection.closing = true
-		_ = connection.Conn.Close()
+		// websocket.NetConn.Close waits up to five seconds for a peer close
+		// frame. Authority loss must close the input socket without depending on
+		// peer cooperation, then wait only for already-active operations.
 		if connection.websocket != nil {
 			_ = connection.websocket.CloseNow()
 		}
+		_ = connection.Conn.Close()
 	}
 	for connection.active != 0 {
 		connection.cond.Wait()

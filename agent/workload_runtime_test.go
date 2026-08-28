@@ -676,6 +676,32 @@ func TestRuntimeAttemptEndpointsCompileComputerRolesExactly(t *testing.T) {
 	}
 }
 
+func TestComputerReservedOperatorEnvironmentIsStrippedBeforeAuthoritativeInjection(t *testing.T) {
+	public := map[string]string{
+		contract.EnvHandoffDir: "attacker", contract.EnvServiceDir: "attacker", contract.EnvServicePort: "1",
+		contract.EnvL3Endpoint: "attacker", contract.EnvComputerViewPort: "2", contract.EnvComputerControlPort: "3",
+		"WEFTY_CUSTOM": "preserved",
+	}
+	sensitive := map[string]string{contract.EnvRunToken: "attacker", contract.EnvComputerToken: "attacker", "TENANT_SECRET": "preserved"}
+	got := withoutComputerReservedOperatorEnvironment(contract.ExecutionSpec{Env: public, SensitiveEnv: sensitive})
+	for name := range got.Env {
+		if contract.IsOCIReservedEnvironmentName(name) {
+			t.Fatalf("reserved public operator value %q survived", name)
+		}
+	}
+	for name := range got.SensitiveEnv {
+		if contract.IsOCIReservedEnvironmentName(name) {
+			t.Fatalf("reserved sensitive operator value %q survived", name)
+		}
+	}
+	if got.Env["WEFTY_CUSTOM"] != "preserved" || got.SensitiveEnv["TENANT_SECRET"] != "preserved" {
+		t.Fatalf("non-reserved operator environment changed: public=%v sensitive=%v", got.Env, got.SensitiveEnv)
+	}
+	if public[contract.EnvComputerViewPort] != "2" || sensitive[contract.EnvComputerToken] != "attacker" {
+		t.Fatal("reserved-environment stripping mutated the immutable Job projection")
+	}
+}
+
 func (executor *preflightExecutor) Run(context.Context, processrunner.Request, processrunner.OutputSink) (contract.ProcessResult, error) {
 	executor.calls++
 	return contract.ProcessResult{}, nil

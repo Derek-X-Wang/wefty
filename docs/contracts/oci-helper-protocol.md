@@ -176,7 +176,7 @@ heartbeats.
 | `EnsureImage` | Session-authorized, typed progress/result stream on a dedicated connection. The agent supplies the canonical platform retained from the successful probe for this helper generation; manifest selection and image singleflight are keyed by it. Registry mode resolves only a public reference, pins the returned top-level digest, pulls into the fixed namespace, and unpacks that platform. Archive mode receives an OCI-layout tar stream, recomputes every blob digest, validates descriptor sizes and reachability, admits exactly that platform, and imports/unpacks it. Both modes return the same complete image evidence used by `Run`, including top-level/platform digests, platform, runtime handler, and snapshotter; no containerd type, private registry credential, or retry policy crosses the boundary. |
 | `ImageCacheStatus` | Session-authorized read of namespace content bytes, applied cap, and the last completed eviction. It never enforces the cap or changes a pin. |
 | `DoctorStatus` | Session-authorized read of runtime platform, containerd/runc versions, allowed mount roots, and bounded `ImageCacheStatus`. Each sub-read carries its own assertion-derived receipt, so a partial failure does not erase the authenticated handshake or successful siblings. Runc comes only from containerd runtime info or a setup-resolved absolute executable path; the privileged helper never performs an operator-triggered PATH lookup. A whole-RPC failure uses `diagnostic_failure`, which is explicitly not runtime-loss evidence: the client does not invalidate the session, reap attempts, or withdraw capability. It never acquires a session, probes, sweeps, starts a task, mutates policy, or evicts content. |
-| `Run` | Exact attempt authority, initial deadman, a bounded requested endpoint-name list, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started` with helper-observed image evidence and a map from every requested endpoint name to its allocated loopback port. Ordinary attempts request either no endpoint or exactly `service`; a Computer requests exactly the distinct `{view, control}` set, receives authoritative `WEFTY_COMPUTER_VIEW_PORT` and `WEFTY_COMPUTER_CONTROL_PORT`, and cannot retain `WEFTY_SERVICE_PORT`. An explicit Mac bridge-fallback request creates a separate guest loopback listener and capability. |
+| `Run` | Exact attempt authority, initial deadman, a bounded requested endpoint-name list, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started`, the helper-captured `started_at` timestamp from that exact edge, assertion-derived profile evidence, helper-observed image evidence, and a map from every requested endpoint name to its allocated loopback port. Ordinary attempts request either no endpoint or exactly `service`; a Computer requests exactly the distinct `{view, control}` set, receives authoritative `WEFTY_COMPUTER_VIEW_PORT` and `WEFTY_COMPUTER_CONTROL_PORT`, and cannot retain `WEFTY_SERVICE_PORT`. An explicit Mac bridge-fallback request creates a separate guest loopback listener and capability. |
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. |
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only. A positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments while retaining any stable handoff volume; only then does the server tombstone authorization. |
@@ -288,7 +288,7 @@ retries.
 
 `Run.workload` carries only the closed program inputs the agent owns: immutable
 image digest, optional full argv and working-directory replacements, separate
-public and sensitive operator environment, helper-managed reserved environment,
+public and sensitive operator environment, typed helper-minting inputs,
 enumerated managed volumes, operator mounts, and optional memory/CPU limits.
 The managed-volume list is closed to `handoff`, `service_data`,
 `computer_disk`, and `log_segments`; `kind=oci`, `class=one-shot` selects exactly one `handoff`
@@ -296,9 +296,12 @@ descriptor carrying an opaque stable handoff-owner key, whose helper-owned
 source is mounted at `/wefty/handoff`. Presence of that descriptor makes the
 helper-reserved `WEFTY_HANDOFF_DIR=/wefty/handoff` value authoritative even if
 an operator or image layer supplied another value. The
-reserved environment list is closed to the names in the run-execution-context
-contract. A reserved name arriving defensively in either operator list is
-stripped rather than winning authority. Image
+caller-supplied `reserved_environment` is always rejected at the privileged
+trust boundary, including `WEFTY_COMPUTER_TOKEN` until its dedicated minter
+lands. `WEFTY_L3_ENDPOINT` and `WEFTY_RUN_TOKEN` cross only through their
+closed public and sensitive minting fields; a reserved name in either generic
+operator list is rejected. The helper derives mount paths and endpoint ports
+from its own descriptors and allocation. Image
 configuration, image-rootfs user/group databases, guest architecture/kernel
 facts, resolver and hosts files, translated Lima mount paths, namespace/device
 policy, and OCI JSON never cross from the agent.
@@ -335,7 +338,11 @@ Golden review redacts sensitive values deterministically without changing the
 runtime document. `/etc/resolv.conf` and `/etc/hosts` are
 explicit read-only private bind mounts from helper-managed files. Their
 targets, the fixed `/proc`, `/dev`, `/sys`, and `/run` hierarchies, and
-`/wefty/handoff` and `/wefty/service` are helper-reserved mount targets.
+`/wefty/handoff`, `/wefty/service`, and `/wefty/control` are helper-reserved
+mount targets. A Computer receives a private 1 GiB `/dev/shm` tmpfs with
+`mode=1777,nosuid,nodev,noexec`; the private mount/IPC namespaces make it
+attempt-local and the kernel charges its pages to the attempt cgroup. Ordinary
+workloads retain the shared profile's 64 MiB `/dev/shm` ceiling.
 
 Wire validation is lexical only. The engine translates every operator source
 inside the helper (identity on native Linux; preconfigured shared-root mapping
@@ -362,7 +369,10 @@ runtime-spec v1.3.0 used by containerd v2.3.4 and the runc v2 shim targeted by
 The serialized fixtures under
 `runner/ocihelper/testdata/containerd-v2.3.4/` are the review boundary for
 native Linux amd64, Lima Linux arm64, service mounts/environment, default-root,
-numeric-user, and unlimited-resource inputs. The Linux-only oracle also compares
+numeric-user, unlimited-resource, and the complete Computer profile. The
+Computer fixture proves image USER/ENTRYPOINT/CMD semantics, the unchanged
+capability/seccomp/namespace/pseudo-device walls, no new privilege or GPU, and
+the private 1 GiB shm mount. The Linux-only oracle also compares
 each architecture's seccomp fixture with the real containerd generator after
 final capabilities are applied. Regenerate complete fixtures only in their
 matching Linux architecture with:
@@ -466,6 +476,13 @@ post-publication failure. The attempt log/resource cleanup path owns this tmpfs
 mount; attempt reap, session
 loss, and boot sweep unmount and remove it without adding it to Computer
 Storage evidence.
+
+For a Computer, the profile receipt reports the 1600 MiB combined ceiling for
+`/dev/shm`, `/tmp`, and `/var/tmp`, the largest single ceiling, the cgroup
+memory limit, and typed ceiling-over-limit warnings. These tmpfs values are
+caps rather than reservations, so the warnings do not reject admission; the
+memory cgroup remains the enforcement boundary. The node doctor repeats the
+last assertion-derived comparison as `WARN` when applicable.
 
 The helper holds an exclusive per-generation file lock for the attachment
 lifetime and durably records exact attempt/fence/boot authority beside the

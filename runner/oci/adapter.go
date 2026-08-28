@@ -970,6 +970,14 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		_ = reapAfterFailedStart(session, authority)
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
+	if runResponse.StartedAt.IsZero() {
+		err := errors.New("OCI helper Started response omitted the authoritative Started timestamp")
+		_ = reapAfterFailedStart(session, authority)
+		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
+	}
+	if request.OCIStartedAt != nil {
+		request.OCIStartedAt(runResponse.StartedAt.UTC().Round(0))
+	}
 	if runResponse.Image.Platform != probePlatform {
 		err := errors.New("OCI Started evidence differs from the current probe platform")
 		_ = reapAfterFailedStart(session, authority)
@@ -1700,16 +1708,8 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 	if execution.WorkingDirectory != nil {
 		workingDirectory = *execution.WorkingDirectory
 	}
-	public, reservedPublic := splitEnvironment(request.Execution.Env)
-	sensitive, reservedSensitive := splitEnvironment(request.Execution.SensitiveEnv)
-	reservedValues := make(map[string]string, len(reservedPublic)+len(reservedSensitive))
-	for _, variable := range reservedPublic {
-		reservedValues[variable.Name] = variable.Value
-	}
-	// SensitiveEnv has the same precedence it has for non-reserved variables.
-	for _, variable := range reservedSensitive {
-		reservedValues[variable.Name] = variable.Value
-	}
+	public := unreservedEnvironment(request.Execution.Env)
+	sensitive := unreservedEnvironment(request.Execution.SensitiveEnv)
 	managedVolumes := make([]ocihelper.ManagedVolumeDescriptor, 0, len(request.ManagedVolumes))
 	for _, volume := range request.ManagedVolumes {
 		switch volume.Kind {
@@ -1717,14 +1717,10 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 			managedVolumes = append(managedVolumes, ocihelper.ManagedVolumeDescriptor{
 				Kind: ocihelper.ManagedVolumeHandoff, OwnerKey: volume.OwnerKey,
 			})
-			// The helper-owned descriptor is authority for the guest mount.
-			reservedValues[contract.EnvHandoffDir] = contract.OCIContainerHandoffDirectory
 		case workloadrunner.ManagedVolumeServiceData:
 			managedVolumes = append(managedVolumes, ocihelper.ManagedVolumeDescriptor{
 				Kind: ocihelper.ManagedVolumeServiceData,
 			})
-			// The helper-owned descriptor is authority for the guest mount.
-			reservedValues[contract.EnvServiceDir] = contract.OCIContainerServiceDirectory
 		case workloadrunner.ManagedVolumeComputerDisk:
 			var storage *ocihelper.ComputerStorageReference
 			if volume.ComputerStorage != nil {
@@ -1737,15 +1733,23 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 			managedVolumes = append(managedVolumes, ocihelper.ManagedVolumeDescriptor{
 				Kind: ocihelper.ManagedVolumeComputerDisk, ComputerStorage: storage,
 			})
-			reservedValues[contract.EnvServiceDir] = contract.OCIContainerServiceDirectory
 		}
 	}
-	reserved := environment(reservedValues)
 	input := ocihelper.WorkloadInput{
 		ImageReference: execution.Image.Reference, ImageDigest: digest,
-		Argv: append([]string(nil), execution.Argv...), WorkingDirectory: workingDirectory,
-		Environment: public, SensitiveEnvironment: sensitive, ReservedEnvironment: reserved,
+		Computer: contract.IsComputerExecution(request.Execution),
+		Argv:     append([]string(nil), execution.Argv...), WorkingDirectory: workingDirectory,
+		Environment: public, SensitiveEnvironment: sensitive,
 		ManagedVolumes: managedVolumes,
+	}
+	// Reserved names never cross the helper boundary through generic layers.
+	// The only currently minted execution-context values have closed fields,
+	// and their source layer is part of the protocol contract.
+	if value, ok := request.Execution.Env[contract.EnvL3Endpoint]; ok && !contract.IsOCISensitiveReservedEnvironmentName(contract.EnvL3Endpoint) {
+		input.L3Endpoint = value
+	}
+	if value, ok := request.Execution.SensitiveEnv[contract.EnvRunToken]; ok && contract.IsOCISensitiveReservedEnvironmentName(contract.EnvRunToken) {
+		input.RunToken = value
 	}
 	for _, mount := range execution.Mounts {
 		input.OperatorMounts = append(input.OperatorMounts, ocihelper.OperatorMount{NodePath: mount.NodePath, ContainerPath: mount.ContainerPath, ReadOnly: mount.ReadOnly})
@@ -1761,17 +1765,14 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 	return input
 }
 
-func splitEnvironment(values map[string]string) ([]ocihelper.EnvironmentVariable, []ocihelper.EnvironmentVariable) {
+func unreservedEnvironment(values map[string]string) []ocihelper.EnvironmentVariable {
 	public := make(map[string]string, len(values))
-	reserved := make(map[string]string)
 	for name, value := range values {
-		if contract.IsOCIReservedEnvironmentName(name) {
-			reserved[name] = value
-		} else {
+		if !contract.IsOCIReservedEnvironmentName(name) {
 			public[name] = value
 		}
 	}
-	return environment(public), environment(reserved)
+	return environment(public)
 }
 
 func environment(values map[string]string) []ocihelper.EnvironmentVariable {

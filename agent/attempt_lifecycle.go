@@ -482,8 +482,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		err := &contract.ExecutionError{Kind: claim.Job.Spec.Kind}
 		return spawnFailure(contract.SpawnFailureUnsupportedKind, err), err
 	}
-	if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Execution.OCI != nil &&
-		claim.Job.Spec.Execution.OCI.Computer != nil && claim.ComputerStorage == nil {
+	if claim.Job.Spec.Kind == contract.JobKindOCI && contract.IsComputerExecution(claim.Job.Spec.Execution) && claim.ComputerStorage == nil {
 		err := errors.New("Computer claim is missing its durable Storage identity")
 		return spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err
 	}
@@ -562,12 +561,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	}
 	portfulService := claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.PublishedPort != nil
 	computerService := claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassService &&
-		claim.Job.Spec.Execution.OCI != nil && claim.Job.Spec.Execution.OCI.Computer != nil
+		contract.IsComputerExecution(claim.Job.Spec.Execution)
 	var ociEndpointLatch *runtimeEndpointLatch
 	if endpoints := runtimeAttemptEndpoints(claim.Job.Spec); len(endpoints) > 0 {
 		// Ordinary service readiness consumes the service endpoint below. The
 		// Computer view/control pair is intentionally retained by this latch for
-		// the atomic rfb-websocket-v1 consumer owned by #123/#125.
+		// the atomic rfb-websocket-v1 readiness consumer.
 		ociEndpointLatch = newRuntimeEndpointLatch()
 		request.AttemptEndpoints = endpoints
 		request.AttemptEndpointReady = ociEndpointLatch.publish
@@ -576,6 +575,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		request.Started = func() {
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptRunning, nil)
 		}
+	}
+	if computerService {
+		request.Execution = withoutComputerReservedOperatorEnvironment(request.Execution)
 	}
 	admission, preflightResult, preflightErr := runtimeAdapter.Preflight(ctx, request)
 	if admission.Release != nil {
@@ -863,6 +865,26 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	return finish(result, runErr)
 }
 
+// withoutComputerReservedOperatorEnvironment removes every tenant-supplied
+// reserved value before later Computer lifecycle steps inject the authoritative
+// service directory and the helper injects its allocated ports. Ordinary L3
+// OCI Runs retain their separately minted run-token execution context.
+func withoutComputerReservedOperatorEnvironment(execution contract.ExecutionSpec) contract.ExecutionSpec {
+	execution.Env = cloneEnvironment(execution.Env)
+	execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
+	for name := range execution.Env {
+		if contract.IsOCIReservedEnvironmentName(name) {
+			delete(execution.Env, name)
+		}
+	}
+	for name := range execution.SensitiveEnv {
+		if contract.IsOCIReservedEnvironmentName(name) {
+			delete(execution.SensitiveEnv, name)
+		}
+	}
+	return execution
+}
+
 func workloadAuthority(nodeID, bootSessionID string, claim l1.Claim) workloadrunner.AttemptAuthority {
 	removalGeneration := "attempt"
 	if claim.Job.Spec.Class == contract.JobClassService {
@@ -888,7 +910,7 @@ func runtimeManagedVolumes(claim l1.Claim) []workloadrunner.ManagedVolume {
 	case contract.JobClassOneShot:
 		return []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: handoffOwnerRunID(spec)}}
 	case contract.JobClassService:
-		if spec.Execution.OCI != nil && spec.Execution.OCI.Computer != nil {
+		if contract.IsComputerExecution(spec.Execution) {
 			if claim.ComputerStorage == nil {
 				return nil
 			}
@@ -908,7 +930,7 @@ func runtimeAttemptEndpoints(spec contract.JobSpec) []string {
 	if spec.Kind != contract.JobKindOCI || spec.Class != contract.JobClassService {
 		return nil
 	}
-	if spec.Execution.OCI != nil && spec.Execution.OCI.Computer != nil {
+	if contract.IsComputerExecution(spec.Execution) {
 		return []string{workloadrunner.AttemptEndpointView, workloadrunner.AttemptEndpointControl}
 	}
 	if spec.PublishedPort != nil {

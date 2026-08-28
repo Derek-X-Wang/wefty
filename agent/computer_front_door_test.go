@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -50,6 +51,7 @@ func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.
 	if _, _, err := connection.Read(t.Context()); err == nil {
 		t.Fatal("revocation left the client relay open")
 	}
+	waitComputerAuditKind(t, auditor, l1.ComputerTakeoverSessionClose)
 	events := auditor.snapshot()
 	if len(events) != 2 || events[0].Kind != l1.ComputerTakeoverSessionOpen || events[1].Kind != l1.ComputerTakeoverSessionClose ||
 		events[0].AuthorizedRole != l1.ComputerGrantControl || events[0].AdmittedMode != "view" ||
@@ -282,6 +284,79 @@ func TestComputerFrontDoorSessionCapAndTextFramesCloseBothLegs(t *testing.T) {
 	})
 }
 
+func TestComputerFrontDoorClosesRelayBeforeAuditFinalization(t *testing.T) {
+	fixture, _, auditor, _, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantView)
+	server.Close()
+	var viewClosed atomic.Bool
+	originalDial := fixture.frontDoor.config.dial
+	config := fixture.frontDoor.config
+	config.sessionCap = 5 * time.Minute
+	config.dial = func(ctx context.Context, name string) (net.Conn, error) {
+		connection, err := originalDial(ctx, name)
+		if err != nil || name != workloadrunner.AttemptEndpointView {
+			return connection, err
+		}
+		return &closeObservedConn{Conn: connection, closed: &viewClosed}, nil
+	}
+	releaseObserved := make(chan bool, 1)
+	config.controlTenure = &releaseOrderingTenure{viewClosed: &viewClosed, releaseObserved: releaseObserved}
+	frontDoor, err := newComputerFrontDoor(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontDoor.SetReady(true)
+	server = httptest.NewServer(frontDoor)
+	defer server.Close()
+	connection := dialComputerFrontDoor(t, server.URL, nil)
+	defer connection.CloseNow()
+	if _, _, err := connection.Read(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	fixture.clock.waitForDeadline(t, fixture.clock.Now().Add(5*time.Minute))
+	fixture.clock.Advance(5 * time.Minute)
+	if closed := <-releaseObserved; !closed {
+		t.Fatal("audit finalization began before the relay socket closed")
+	}
+	waitComputerAuditKind(t, auditor, l1.ComputerTakeoverSessionClose)
+}
+
+func TestComputerPolicyDrainDoesNotWaitForAuditFinalization(t *testing.T) {
+	fixture, cache, auditor, _, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantView)
+	defer server.Close()
+	connection := dialComputerFrontDoor(t, server.URL, nil)
+	defer connection.CloseNow()
+	if _, _, err := connection.Read(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	auditStarted := make(chan struct{}, 1)
+	releaseAudit := make(chan struct{})
+	var releaseOnce sync.Once
+	unblockAudit := func() { releaseOnce.Do(func() { close(releaseAudit) }) }
+	t.Cleanup(unblockAudit)
+	auditor.mu.Lock()
+	auditor.blockKind = l1.ComputerTakeoverSessionClose
+	auditor.blockStarted = auditStarted
+	auditor.blockRelease = releaseAudit
+	auditor.mu.Unlock()
+	receipt, err := cache.Install(policySnapshot(t, fixture.clock.Now().Add(time.Second), 1, 2, nil, l1.ComputerGrant{
+		FabricID: identity.FabricID, UserID: identity.UserID, Permission: l1.ComputerGrantNone, PolicyRevision: 2,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-auditStarted
+	select {
+	case <-receipt.SessionsClosed:
+	default:
+		t.Fatal("policy drain waited for session audit after the relay socket closed")
+	}
+	if _, _, err := connection.Read(t.Context()); err == nil {
+		t.Fatal("policy drain completed before closing the client socket")
+	}
+	unblockAudit()
+	waitComputerAuditKind(t, auditor, l1.ComputerTakeoverSessionClose)
+}
+
 func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 	good := newComputerBackend(t, computerBackendOptions{})
 	defer good.Close()
@@ -295,8 +370,10 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 		options computerBackendOptions
 	}{
 		{name: "wrong path", options: computerBackendOptions{requiredPath: "/wrong"}},
+		{name: "missing subprotocol", options: computerBackendOptions{noSubprotocol: true}},
 		{name: "wrong subprotocol", options: computerBackendOptions{subprotocol: "other"}},
 		{name: "text banner", options: computerBackendOptions{textBanner: true}},
+		{name: "HTTP response without upgrade", options: computerBackendOptions{httpOnly: true}},
 	}
 	for _, fixture := range fixtures {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -308,13 +385,34 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 				}
 				return good.dial(ctx)
 			}
-			err := probeComputerBackends(t.Context(), systemClock{}, time.Now().Add(-DefaultComputerReadinessDeadline), dial)
-			var readiness *computerReadinessError
-			if !errors.As(err, &readiness) || readiness.Code != "startup_readiness_timeout" {
-				t.Fatalf("readiness error = %#v", err)
-			}
+			assertComputerBackendNeverReady(t, dial)
 		})
 	}
+
+	t.Run("plain TCP", func(t *testing.T) {
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		go func() {
+			for {
+				connection, acceptErr := listener.Accept()
+				if acceptErr != nil {
+					return
+				}
+				_, _ = connection.Write([]byte("RFB 003.008\n"))
+				_ = connection.Close()
+			}
+		}()
+		dial := func(ctx context.Context, name string) (net.Conn, error) {
+			if name == workloadrunner.AttemptEndpointView {
+				return (&net.Dialer{}).DialContext(ctx, "tcp4", listener.Addr().String())
+			}
+			return good.dial(ctx)
+		}
+		assertComputerBackendNeverReady(t, dial)
+	})
 
 	t.Run("60 second deadline", func(t *testing.T) {
 		now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
@@ -333,6 +431,72 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 			t.Fatalf("deadline error = %#v", err)
 		}
 	})
+
+	t.Run("success at deadline is timeout", func(t *testing.T) {
+		for range 20 {
+			now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+			clock := newManualClock(now)
+			advanced := false
+			dial := func(ctx context.Context, name string) (net.Conn, error) {
+				if name == workloadrunner.AttemptEndpointControl && !advanced {
+					advanced = true
+					clock.Advance(DefaultComputerReadinessDeadline)
+				}
+				return good.dial(ctx)
+			}
+			err := probeComputerBackends(t.Context(), clock, now, dial)
+			var readiness *computerReadinessError
+			if !errors.As(err, &readiness) || readiness.Code != contract.SpawnFailureStartupReadinessTimeout {
+				t.Fatalf("at-deadline successful probe = %#v", err)
+			}
+		}
+	})
+}
+
+func TestComputerSessionAuthorityLossOwnsConcurrentRelayClosure(t *testing.T) {
+	frontDoor := &computerFrontDoor{config: computerFrontDoorConfig{
+		clock: systemClock{}, sessionCap: time.Hour, revalidationInterval: time.Hour,
+	}}
+	authorization := &ComputerGrantAuthorization{revocations: make(chan ComputerPolicyRevocation)}
+	for range 64 {
+		ctx, cancel := context.WithCancelCause(t.Context())
+		cancel(&computerSessionEnd{reason: l1.ComputerTakeoverAttemptAuthorityLost})
+		relay := &computerSessionRelay{reason: make(chan l1.ComputerTakeoverReason, 1)}
+		relay.reason <- l1.ComputerTakeoverControlBackendClosed
+		if got := frontDoor.waitForSessionEnd(ctx, "127.0.0.1:1", fabric.Identity{}, authorization, relay, time.Now()); got != l1.ComputerTakeoverAttemptAuthorityLost {
+			t.Fatalf("concurrent authority loss reason = %q, want %q", got, l1.ComputerTakeoverAttemptAuthorityLost)
+		}
+	}
+}
+
+func TestComputerSessionContextCanonicalizesParentAuthorityLoss(t *testing.T) {
+	authority, cancelAuthority := context.WithCancel(t.Context())
+	session, cancelSession, stop := newComputerSessionContext(authority)
+	defer stop()
+	defer cancelSession(nil)
+	cancelAuthority()
+	<-session.Done()
+	if got := computerSessionEndReason(session, l1.ComputerTakeoverControlBackendClosed); got != l1.ComputerTakeoverAttemptAuthorityLost {
+		t.Fatalf("parent authority loss reason = %q, want %q", got, l1.ComputerTakeoverAttemptAuthorityLost)
+	}
+}
+
+func assertComputerBackendNeverReady(t *testing.T, dial computerEndpointDial) {
+	t.Helper()
+	if err := probeComputerBackendPairOnce(t.Context(), dial); err == nil {
+		t.Fatal("negative readiness fixture completed a conformant probe")
+	}
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(now)
+	result := make(chan error, 1)
+	go func() { result <- probeComputerBackends(t.Context(), clock, now, dial) }()
+	clock.waitForDeadline(t, now.Add(DefaultComputerReadinessDeadline))
+	clock.Advance(DefaultComputerReadinessDeadline)
+	err := <-result
+	var readiness *computerReadinessError
+	if !errors.As(err, &readiness) || readiness.Code != contract.SpawnFailureStartupReadinessTimeout {
+		t.Fatalf("readiness error = %#v", err)
+	}
 }
 
 func TestComputerFrontDoorRequiresDenyByDefaultConstruction(t *testing.T) {
@@ -528,14 +692,64 @@ type recordingComputerAuditor struct {
 	mu              sync.Mutex
 	events          []l1.ComputerTakeoverAuditEvent
 	mismatchReceipt bool
+	changed         chan struct{}
+	blockKind       l1.ComputerTakeoverAuditEventKind
+	blockStarted    chan<- struct{}
+	blockRelease    <-chan struct{}
 }
 
+type closeObservedConn struct {
+	net.Conn
+	closed *atomic.Bool
+}
+
+func (connection *closeObservedConn) Close() error {
+	connection.closed.Store(true)
+	return connection.Conn.Close()
+}
+
+type releaseOrderingTenure struct {
+	viewClosed      *atomic.Bool
+	releaseObserved chan<- bool
+	once            sync.Once
+}
+
+func (*releaseOrderingTenure) Register(controlTenureSession) error { return nil }
+func (*releaseOrderingTenure) Take(context.Context, string) (net.Conn, error) {
+	return nil, &ComputerTenureError{Code: ComputerTenureUnavailable}
+}
+func (tenure *releaseOrderingTenure) Release(context.Context, string, l1.ComputerTakeoverReason) error {
+	tenure.once.Do(func() { tenure.releaseObserved <- tenure.viewClosed.Load() })
+	return nil
+}
+func (*releaseOrderingTenure) Unregister(string) {}
+func (*releaseOrderingTenure) controlTenure()    {}
+
 func (auditor *recordingComputerAuditor) AppendComputerTakeoverAudit(
-	_ context.Context, _, _, _ string, request l1.ComputerTakeoverAuditRequest,
+	ctx context.Context, _, _, _ string, request l1.ComputerTakeoverAuditRequest,
 ) (l1.ComputerTakeoverAuditReceipt, error) {
+	auditor.mu.Lock()
+	block := request.Event.Kind == auditor.blockKind
+	started, release := auditor.blockStarted, auditor.blockRelease
+	auditor.mu.Unlock()
+	if block && release != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return l1.ComputerTakeoverAuditReceipt{}, context.Cause(ctx)
+		}
+	}
 	auditor.mu.Lock()
 	defer auditor.mu.Unlock()
 	auditor.events = append(auditor.events, request.Event)
+	if auditor.changed != nil {
+		close(auditor.changed)
+	}
+	auditor.changed = make(chan struct{})
 	receiptEvent := request.Event
 	receiptEvent.AuthorityGeneration = 1
 	if auditor.mismatchReceipt {
@@ -552,23 +766,34 @@ func (auditor *recordingComputerAuditor) snapshot() []l1.ComputerTakeoverAuditEv
 
 func waitComputerAuditKind(t *testing.T, auditor *recordingComputerAuditor, kind l1.ComputerTakeoverAuditEventKind) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		for _, event := range auditor.snapshot() {
+	for {
+		auditor.mu.Lock()
+		for _, event := range auditor.events {
 			if event.Kind == kind {
+				auditor.mu.Unlock()
 				return
 			}
 		}
-		time.Sleep(time.Millisecond)
+		if auditor.changed == nil {
+			auditor.changed = make(chan struct{})
+		}
+		changed := auditor.changed
+		auditor.mu.Unlock()
+		select {
+		case <-changed:
+		case <-t.Context().Done():
+			t.Fatalf("waiting for %s audit: %v; events: %#v", kind, context.Cause(t.Context()), auditor.snapshot())
+		}
 	}
-	t.Fatalf("timed out waiting for %s audit: %#v", kind, auditor.snapshot())
 }
 
 type computerBackendOptions struct {
-	requiredPath string
-	subprotocol  string
-	textBanner   bool
-	echoPrefix   string
+	requiredPath  string
+	subprotocol   string
+	noSubprotocol bool
+	textBanner    bool
+	httpOnly      bool
+	echoPrefix    string
 }
 
 type computerBackendServer struct {
@@ -591,7 +816,15 @@ func newComputerBackend(t *testing.T, options computerBackendOptions) *computerB
 			http.NotFound(writer, request)
 			return
 		}
-		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{Subprotocols: []string{subprotocol}})
+		if options.httpOnly {
+			writer.WriteHeader(http.StatusOK)
+			return
+		}
+		subprotocols := []string{subprotocol}
+		if options.noSubprotocol {
+			subprotocols = nil
+		}
+		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{Subprotocols: subprotocols})
 		if err != nil {
 			return
 		}

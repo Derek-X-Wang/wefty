@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -411,6 +412,31 @@ func TestOCIReservedEnvironmentNamesAreExact(t *testing.T) {
 	}
 	if IsOCIReservedEnvironmentName(EnvRunID) || IsOCIReservedEnvironmentName("WEFTY_CUSTOM") {
 		t.Fatal("OCI reserved-name set differs from the eight ratified names")
+	}
+	if !IsOCISensitiveReservedEnvironmentName(EnvRunToken) || !IsOCISensitiveReservedEnvironmentName(EnvComputerToken) ||
+		IsOCISensitiveReservedEnvironmentName(EnvComputerViewPort) {
+		t.Fatal("OCI sensitive reserved-name subset differs from run and Computer tokens")
+	}
+}
+
+func TestComputerImageContractVocabularyIsExact(t *testing.T) {
+	t.Parallel()
+
+	if ComputerDisplayEndpointView != "view" || ComputerDisplayEndpointControl != "control" ||
+		ComputerDisplayWebSocketPath != "/websockify" || ComputerDisplayWebSocketSubprotocol != "binary" ||
+		ComputerRFBVersionBannerBytes != 12 || ComputerStartupReadinessTimeout != 60*time.Second ||
+		ComputerDevShmBytes != 1<<30 {
+		t.Fatal("Computer image contract vocabulary drifted")
+	}
+	for _, banner := range [][]byte{[]byte("RFB 003.003\n"), []byte("RFB 003.008\n")} {
+		if !ValidComputerRFBVersionBanner(banner) {
+			t.Fatalf("valid RFB banner rejected: %q", banner)
+		}
+	}
+	for _, banner := range [][]byte{[]byte("RFB 003.008"), []byte("RFB abc.def\n"), []byte("HTTP/1.1 200")} {
+		if ValidComputerRFBVersionBanner(banner) {
+			t.Fatalf("invalid RFB banner accepted: %q", banner)
+		}
 	}
 }
 

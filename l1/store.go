@@ -27,12 +27,11 @@ import (
 )
 
 const (
-	DefaultLogPageLimit         = 200
-	MaxLogPageLimit             = 1000
-	MaxLogBatchEvents           = 256
-	MaxLogEventBytes            = 4 << 20
-	MaxLogUploadBodyBytes       = 20 << 20
-	computerDisplayEndpointPath = "/websockify"
+	DefaultLogPageLimit   = 200
+	MaxLogPageLimit       = 1000
+	MaxLogBatchEvents     = 256
+	MaxLogEventBytes      = 4 << 20
+	MaxLogUploadBodyBytes = 20 << 20
 )
 
 type StoreOptions struct {
@@ -1963,7 +1962,7 @@ func (s *Store) SetAttemptPublication(
 
 func validComputerDisplayEndpoint(value string) bool {
 	parsed, err := url.Parse(value)
-	return err == nil && parsed.Scheme == "ws" && parsed.Host != "" && parsed.Path == computerDisplayEndpointPath &&
+	return err == nil && parsed.Scheme == "ws" && parsed.Host != "" && parsed.Path == contract.ComputerDisplayWebSocketPath &&
 		parsed.RawQuery == "" && parsed.Fragment == "" && parsed.User == nil
 }
 

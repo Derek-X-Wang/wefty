@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -91,6 +93,222 @@ func TestComputerServicePublishesOnlyFabricFrontDoorAndAdmissionDialsView(t *tes
 	defer dialMu.Unlock()
 	if dials[workloadrunner.AttemptEndpointView] != dials[workloadrunner.AttemptEndpointControl]+1 {
 		t.Fatalf("endpoint dials=%v, want exactly one admission-only view dial", dials)
+	}
+}
+
+func TestComputerReadinessIsAtomicAcrossPartialLossAndRecovery(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(now)
+	view := newComputerBackend(t, computerBackendOptions{})
+	defer view.Close()
+	control := newComputerBackend(t, computerBackendOptions{})
+	defer control.Close()
+	var controlReady atomic.Bool
+	var viewReady atomic.Bool
+	controlReady.Store(true)
+	viewReady.Store(true)
+	dial := func(ctx context.Context, name string) (net.Conn, error) {
+		if name == workloadrunner.AttemptEndpointControl {
+			if !controlReady.Load() {
+				return nil, errors.New("control endpoint unavailable")
+			}
+			return control.dial(ctx)
+		}
+		if !viewReady.Load() {
+			return nil, errors.New("view endpoint unavailable")
+		}
+		return view.dial(ctx)
+	}
+	started := make(chan time.Time, 1)
+	started <- now
+	observations := make(chan bool, 8)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- monitorComputerReadiness(ctx, clock, started, dial, func(ready bool) { observations <- ready })
+	}()
+	wantComputerReadinessObservation(t, observations, true)
+
+	controlReady.Store(false)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	wantComputerReadinessObservation(t, observations, false)
+
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	wantNoComputerReadinessObservation(t, observations)
+
+	controlReady.Store(true)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	wantComputerReadinessObservation(t, observations, true)
+
+	viewReady.Store(false)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	wantComputerReadinessObservation(t, observations, false)
+
+	viewReady.Store(true)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	wantComputerReadinessObservation(t, observations, true)
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("readiness monitor stop: %v", err)
+	}
+	wantComputerReadinessObservation(t, observations, false)
+}
+
+func TestComputerBackendLossWithdrawsPublicationWithoutKillingPayload(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(now)
+	identity := fabric.Identity{FabricID: "fabric-one", UserID: "person-a", DeviceID: "device-a"}
+	privateFabric := &recordingComputerServiceFabric{identity: identity}
+	cache := NewComputerPolicyCache(clock, "node-1", "boot-1")
+	defer cache.Close()
+	if _, err := cache.Install(policySnapshot(t, now, 1, 1, nil, l1.ComputerGrant{FabricID: identity.FabricID, UserID: identity.UserID, Permission: l1.ComputerGrantView, PolicyRevision: 1})); err != nil {
+		t.Fatal(err)
+	}
+	backend := newComputerBackend(t, computerBackendOptions{})
+	defer backend.Close()
+	var available atomic.Bool
+	available.Store(true)
+	dial := func(ctx context.Context, _ string) (net.Conn, error) {
+		if !available.Load() {
+			return nil, errors.New("backend unavailable")
+		}
+		return backend.dial(ctx)
+	}
+	type publication struct{ ready bool }
+	publications := make(chan publication, 8)
+	ctx, cancel := context.WithCancel(t.Context())
+	runtime := &opaqueEndpointRuntime{release: make(chan struct{}), startedAt: now}
+	done := make(chan error, 1)
+	go func() {
+		_, err := runComputerService(ctx, runtime, workloadrunner.Request{}, nil, computerServiceConfig{
+			clock: clock, fabric: privateFabric, authorizer: cache, auditor: &recordingComputerAuditor{},
+			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1", dial: dial,
+			publish: func(_ context.Context, ready bool, _ string) error {
+				publications <- publication{ready: ready}
+				return nil
+			},
+		})
+		done <- err
+	}()
+	if published := <-publications; !published.ready {
+		t.Fatal("Computer did not publish after both backends became ready")
+	}
+	available.Store(false)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	if withdrawn := <-publications; withdrawn.ready {
+		t.Fatal("partial backend loss did not withdraw the atomic publication")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("backend loss killed tenant payload: %v", err)
+	default:
+	}
+	available.Store(true)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultPublicationRecoveryWindow))
+	clock.Advance(DefaultPublicationRecoveryWindow)
+	if republished := <-publications; !republished.ready {
+		t.Fatal("both recovered backends did not republish atomically")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Computer service did not stop after cancellation")
+	}
+}
+
+func TestComputerReadinessDeadlineUsesAuthoritativeStartedTimestamp(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 5, 0, time.UTC)
+	startedAt := now.Add(-5 * time.Second)
+	clock := newManualClock(now)
+	view := newComputerBackend(t, computerBackendOptions{})
+	defer view.Close()
+	dial := func(ctx context.Context, name string) (net.Conn, error) {
+		if name == workloadrunner.AttemptEndpointControl {
+			return nil, errors.New("control endpoint unavailable")
+		}
+		return view.dial(ctx)
+	}
+	started := make(chan time.Time, 1)
+	started <- startedAt
+	observations := make(chan bool, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- monitorComputerReadiness(t.Context(), clock, started, dial, func(ready bool) { observations <- ready })
+	}()
+	deadline := startedAt.Add(DefaultComputerReadinessDeadline)
+	clock.waitForDeadline(t, deadline)
+	clock.Advance(deadline.Sub(clock.Now()))
+	err := <-done
+	var readiness *computerReadinessError
+	if !errors.As(err, &readiness) || readiness.Code != contract.SpawnFailureStartupReadinessTimeout {
+		t.Fatalf("late readiness error = %#v", err)
+	}
+	wantNoComputerReadinessObservation(t, observations)
+}
+
+func TestComputerSteadyStateConnectTimeoutUsesInjectedClock(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(now)
+	backend := newComputerBackend(t, computerBackendOptions{})
+	defer backend.Close()
+	var blocked atomic.Bool
+	dial := func(ctx context.Context, _ string) (net.Conn, error) {
+		if blocked.Load() {
+			<-ctx.Done()
+			return nil, context.Cause(ctx)
+		}
+		return backend.dial(ctx)
+	}
+	started := make(chan time.Time, 1)
+	started <- now
+	observations := make(chan bool, 4)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- monitorComputerReadiness(ctx, clock, started, dial, func(ready bool) { observations <- ready })
+	}()
+	wantComputerReadinessObservation(t, observations, true)
+
+	blocked.Store(true)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessConnectTimeout))
+	clock.Advance(DefaultComputerReadinessConnectTimeout)
+	wantComputerReadinessObservation(t, observations, false)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func wantComputerReadinessObservation(t *testing.T, observations <-chan bool, want bool) {
+	t.Helper()
+	select {
+	case got := <-observations:
+		if got != want {
+			t.Fatalf("Computer readiness observation = %t, want %t", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for Computer readiness=%t", want)
+	}
+}
+
+func wantNoComputerReadinessObservation(t *testing.T, observations <-chan bool) {
+	t.Helper()
+	select {
+	case got := <-observations:
+		t.Fatalf("unexpected Computer readiness observation %t", got)
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 

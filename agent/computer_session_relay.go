@@ -14,10 +14,15 @@ import (
 // computerSessionRelay owns the client socket and its durable view leg. It can
 // pause that view leg, install exactly one control leg, and later return to the
 // same view connection without opening a second client input reader.
+type immediateWebSocketCloser interface {
+	CloseNow() error
+}
+
 type computerSessionRelay struct {
-	client        net.Conn
-	view          net.Conn
-	viewWebSocket *websocket.Conn
+	client          net.Conn
+	view            net.Conn
+	clientWebSocket immediateWebSocketCloser
+	viewWebSocket   immediateWebSocketCloser
 
 	mu      sync.Mutex
 	cond    *sync.Cond
@@ -30,9 +35,9 @@ type computerSessionRelay struct {
 	readers sync.WaitGroup
 }
 
-func newComputerSessionRelay(client, view net.Conn, viewWebSocket *websocket.Conn) *computerSessionRelay {
+func newComputerSessionRelay(client, view net.Conn, clientWebSocket, viewWebSocket *websocket.Conn) *computerSessionRelay {
 	relay := &computerSessionRelay{
-		client: client, view: view, viewWebSocket: viewWebSocket, current: view,
+		client: client, view: view, clientWebSocket: clientWebSocket, viewWebSocket: viewWebSocket, current: view,
 		reason: make(chan l1.ComputerTakeoverReason, 3),
 	}
 	relay.cond = sync.NewCond(&relay.mu)
@@ -204,11 +209,17 @@ func (relay *computerSessionRelay) Close() {
 	relay.control = nil
 	relay.mu.Unlock()
 
-	_ = relay.client.Close()
-	_ = relay.view.Close()
+	// websocket.NetConn.Close performs a five-second close handshake. Force the
+	// underlying sockets closed first so peer cooperation and goroutine
+	// scheduling cannot delay the session boundary or policy drain.
+	if relay.clientWebSocket != nil {
+		_ = relay.clientWebSocket.CloseNow()
+	}
 	if relay.viewWebSocket != nil {
 		_ = relay.viewWebSocket.CloseNow()
 	}
+	_ = relay.client.Close()
+	_ = relay.view.Close()
 	if control != nil {
 		control.closeAndWait()
 	}

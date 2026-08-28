@@ -1111,6 +1111,57 @@ func TestAttemptPortAllocationRemainsAttemptScopedUntilRelease(t *testing.T) {
 	}
 }
 
+func TestTwoComputersReceiveFourUniqueLoopbackPorts(t *testing.T) {
+	engine := &ContainerdEngine{
+		config: NativeEngineConfig{AttemptPortMin: 25000, AttemptPortMax: 40000},
+		ports:  make(map[uint16]string), nextPort: 25000,
+	}
+	type allocation struct {
+		authority string
+		port      uint16
+		hold      net.Listener
+	}
+	allocations := make([]allocation, 0, 4)
+	for _, authority := range []string{"computer-a", "computer-b"} {
+		for range []string{"view", "control"} {
+			port, hold, err := engine.reserveAttemptPort(authority)
+			if err != nil {
+				t.Fatal(err)
+			}
+			allocations = append(allocations, allocation{authority: authority, port: port, hold: hold})
+		}
+	}
+	defer func() {
+		for _, allocation := range allocations {
+			_ = allocation.hold.Close()
+			engine.releaseAttemptPort(allocation.port, allocation.authority)
+		}
+	}()
+	ports := make(map[uint16]struct{}, len(allocations))
+	for _, allocation := range allocations {
+		host, port, err := net.SplitHostPort(allocation.hold.Addr().String())
+		if err != nil || host != "127.0.0.1" || port != fmt.Sprint(allocation.port) {
+			t.Fatalf("Computer allocation %q = %q, port=%d err=%v", allocation.authority, allocation.hold.Addr(), allocation.port, err)
+		}
+		if _, duplicate := ports[allocation.port]; duplicate {
+			t.Fatalf("Computer endpoint port %d was allocated twice", allocation.port)
+		}
+		ports[allocation.port] = struct{}{}
+	}
+}
+
+func TestAttemptEndpointOwnershipRejectsWildcardListener(t *testing.T) {
+	wildcard, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wildcard.Close()
+	port := uint16(wildcard.Addr().(*net.TCPAddr).Port)
+	if inode, found, err := loopbackListenInode(port); err != nil || found || inode != "" {
+		t.Fatalf("wildcard listener was accepted as loopback ownership: inode=%q found=%t err=%v", inode, found, err)
+	}
+}
+
 func TestResidualVerificationRetainsPortAgainstConcurrentAllocation(t *testing.T) {
 	probe, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
