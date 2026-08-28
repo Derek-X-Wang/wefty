@@ -129,6 +129,80 @@
           "updated_at": { "type": "string", "format": "date-time" }
         }
       },
+      "ComputerIntent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "intent_revision", "operation", "desired_state", "storage_id", "storage_generation",
+          "job_id", "spec_revision", "actor", "created_at"
+        ],
+        "properties": {
+          "intent_revision": { "type": "integer", "minimum": 1 },
+          "operation": { "enum": ["create", "start", "stop", "restart", "remove", "project"] },
+          "desired_state": { "enum": ["running", "stopped", "removed"] },
+          "storage_id": { "type": "string", "minLength": 1 },
+          "storage_generation": { "type": "integer", "minimum": 1 },
+          "job_id": { "type": "string", "minLength": 1 },
+          "spec_revision": { "type": "integer", "minimum": 1 },
+          "actor": { "type": "string", "minLength": 1 },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ComputerIntentList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["intents"],
+        "properties": {
+          "intents": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ComputerIntent" }
+          },
+          "next_cursor": { "type": "string" }
+        }
+      },
+      "Computer": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "computer_id", "name", "placement_node_id", "grants", "storage_id", "storage_generation",
+          "desired_state", "intent_revision", "applied_revision", "current_job_id",
+          "current_spec_revision", "reconfiguration_phase", "current_job", "created_at", "updated_at"
+        ],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 },
+          "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "placement_node_id": { "type": "string", "minLength": 1 },
+          "bound_node_id": {
+            "type": "string",
+            "description": "Durable service binding. Stop releases only Slot occupancy and retains this binding."
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["user_id", "permission"],
+              "properties": {
+                "user_id": { "type": "string", "minLength": 1 },
+                "permission": { "enum": ["view", "control", "none"] }
+              }
+            }
+          },
+          "storage_id": { "type": "string", "minLength": 1 },
+          "storage_generation": { "type": "integer", "minimum": 1 },
+          "desired_state": { "enum": ["running", "stopped", "removed"] },
+          "intent_revision": { "type": "integer", "minimum": 1 },
+          "applied_revision": { "type": "integer", "minimum": 0 },
+          "current_job_id": { "type": "string", "minLength": 1 },
+          "current_spec_revision": { "type": "integer", "minimum": 1 },
+          "reconfiguration_phase": { "enum": ["stable", "projecting", "removing"] },
+          "reconfiguration_revision": { "type": "integer", "minimum": 1 },
+          "current_job": { "$ref": "#/components/schemas/Job" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        },
+        "description": "Durable Computer identity and sole desired-state authority. computer_id and current_job_id are distinct; immutable Job projections cannot be restarted after retirement."
+      },
       "Attempt": {
         "type": "object",
         "additionalProperties": false,

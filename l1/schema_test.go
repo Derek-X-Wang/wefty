@@ -33,6 +33,18 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 			"job_id", "desired_state", "bound_node_id", "restart_streak", "lifetime_restart_count",
 			"next_restart_at", "published_port", "last_failure", "healthy_since_ns", "published_attempt_id",
 		},
+		"computers": {
+			"computer_id", "name", "placement_node_id", "bound_node_id", "grants_json", "storage_id",
+			"storage_generation", "desired_state", "intent_revision", "applied_revision", "current_job_id",
+			"current_spec_revision", "reconfiguration_phase", "reconfiguration_revision", "created_ns", "updated_ns",
+		},
+		"computer_job_projections": {
+			"computer_id", "job_id", "spec_revision", "current", "created_ns", "retired_ns",
+		},
+		"computer_intent_history": {
+			"computer_id", "intent_revision", "operation", "desired_state", "storage_id", "storage_generation",
+			"job_id", "spec_revision", "actor", "created_ns",
+		},
 		"service_restart_requests": {"job_id", "idempotency_key", "request_hash", "created_ns"},
 		"service_log_truncations": {
 			"job_id", "bound_kind", "evicted_event_count", "evicted_byte_count",
