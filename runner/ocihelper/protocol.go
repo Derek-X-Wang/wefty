@@ -1001,10 +1001,11 @@ type CreateComputerBackupResponse struct {
 }
 
 type DeleteComputerBackupCopyRequest struct {
-	BackupID  string                   `json:"backup_id"`
-	CopyID    string                   `json:"copy_id"`
-	Storage   ComputerStorageReference `json:"storage"`
-	Authority ComputerBackupAuthority  `json:"authority"`
+	BackupID   string                   `json:"backup_id"`
+	CopyID     string                   `json:"copy_id"`
+	Storage    ComputerStorageReference `json:"storage"`
+	Authority  ComputerBackupAuthority  `json:"authority"`
+	Superseded bool                     `json:"superseded"`
 }
 
 type ComputerBackupCopyRemovalReceipt = contract.ComputerBackupCopyRemovalReceipt

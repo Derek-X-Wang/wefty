@@ -169,14 +169,21 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 			applied_revision INTEGER NOT NULL CHECK(applied_revision >= 0 AND applied_revision <= intent_revision),
 			current_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id), current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
 			reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'removing')),
-			reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0), created_ns INTEGER NOT NULL, updated_ns INTEGER NOT NULL
+			reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0),
+			submit_enabled INTEGER NOT NULL DEFAULT 0 CHECK(submit_enabled IN (0, 1)),
+			submit_intent_revision INTEGER NOT NULL DEFAULT 0 CHECK(submit_intent_revision >= 0),
+			submit_max_inflight INTEGER NOT NULL DEFAULT 20 CHECK(submit_max_inflight > 0),
+			submit_policy_revision INTEGER NOT NULL DEFAULT 0 CHECK(submit_policy_revision >= 0),
+			created_ns INTEGER NOT NULL, updated_ns INTEGER NOT NULL
 			);
 		INSERT INTO computers_old_constraint(computer_id, name, placement_node_id, bound_node_id, grants_json,
 			storage_id, storage_generation, desired_state, intent_revision, applied_revision, current_job_id,
-			current_spec_revision, reconfiguration_phase, reconfiguration_revision, created_ns, updated_ns)
+			current_spec_revision, reconfiguration_phase, reconfiguration_revision, submit_enabled,
+			submit_intent_revision, submit_max_inflight, submit_policy_revision, created_ns, updated_ns)
 		SELECT computer_id, name, placement_node_id, bound_node_id, grants_json, storage_id,
 			storage_generation, desired_state, intent_revision, applied_revision, current_job_id,
-			current_spec_revision, reconfiguration_phase, reconfiguration_revision, created_ns, updated_ns FROM computers;
+			current_spec_revision, reconfiguration_phase, reconfiguration_revision, 1, 7, 37, 11,
+			created_ns, updated_ns FROM computers;
 		DROP TABLE computers;
 		ALTER TABLE computers_old_constraint RENAME TO computers;
 		CREATE INDEX computers_binding ON computers(bound_node_id, desired_state);
@@ -189,7 +196,10 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 			job_id TEXT NOT NULL REFERENCES jobs(job_id), spec_revision INTEGER NOT NULL CHECK(spec_revision > 0),
 			actor TEXT NOT NULL, created_ns INTEGER NOT NULL, PRIMARY KEY(computer_id, intent_revision)
 			);
-		INSERT INTO computer_intent_history_old_constraint SELECT * FROM computer_intent_history;
+		INSERT INTO computer_intent_history_old_constraint(computer_id, intent_revision, operation, desired_state,
+			storage_id, storage_generation, job_id, spec_revision, actor, created_ns)
+			SELECT computer_id, intent_revision, operation, desired_state, storage_id, storage_generation,
+			job_id, spec_revision, actor, created_ns FROM computer_intent_history;
 		DROP TABLE computer_intent_history;
 		ALTER TABLE computer_intent_history_old_constraint RENAME TO computer_intent_history;
 		PRAGMA foreign_keys=ON;`)
@@ -222,6 +232,18 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 		grantsJSON != `[{"user_id":"migration-user","permission":"control"}]` ||
 		currentJob != "migration-job" || intentRevision != 1 {
 		t.Fatalf("migrated Computer authority = %q %q %s %q %d", name, placement, grantsJSON, currentJob, intentRevision)
+	}
+	var submitEnabled bool
+	var submitIntentRevision, submitPolicyRevision int64
+	var submitMaxInflight int
+	if err := store.db.QueryRow(`SELECT submit_enabled, submit_intent_revision, submit_max_inflight, submit_policy_revision
+		FROM computers WHERE computer_id='migration-computer'`).Scan(
+		&submitEnabled, &submitIntentRevision, &submitMaxInflight, &submitPolicyRevision); err != nil {
+		t.Fatal(err)
+	}
+	if !submitEnabled || submitIntentRevision != 7 || submitMaxInflight != 37 || submitPolicyRevision != 11 {
+		t.Fatalf("migrated Computer submit policy = %t/%d/%d/%d, want true/7/37/11",
+			submitEnabled, submitIntentRevision, submitMaxInflight, submitPolicyRevision)
 	}
 	var projectionCount, intentCount int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM computer_job_projections

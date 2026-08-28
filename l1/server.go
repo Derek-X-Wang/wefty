@@ -235,6 +235,7 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("GET /v1/computers/{computer_id}", s.getComputer)
 	client.HandleFunc("GET /v1/computers/{computer_id}/intents", s.listComputerIntents)
 	client.HandleFunc("PUT /v1/computers/{computer_id}/desired-state", s.setComputerDesiredState)
+	client.HandleFunc("PUT /v1/computers/{computer_id}/backup-cap", s.setComputerBackupCap)
 	client.HandleFunc("POST /v1/computers/{computer_id}/restart", s.restartComputer)
 	client.HandleFunc("POST /v1/computers/{computer_id}/storage-reset", s.resetComputerStorage)
 	client.HandleFunc("GET /v1/computers/{computer_id}/storage-generations", s.listComputerStorageGenerations)
@@ -722,6 +723,21 @@ func (s *Server) setComputerDesiredState(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	writeJSON(w, http.StatusAccepted, redactComputer(computer))
+}
+
+func (s *Server) setComputerBackupCap(w http.ResponseWriter, r *http.Request) {
+	var request ComputerBackupCapRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	computer, err := s.store.SetComputerBackupCap(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, redactComputer(computer))
 }
 
 func (s *Server) restartComputer(w http.ResponseWriter, r *http.Request) {

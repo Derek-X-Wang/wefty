@@ -37,7 +37,19 @@ type computerBackupManifest struct {
 	TemporaryFile string                     `json:"temporary_file,omitempty"`
 	PublishedFile string                     `json:"published_file,omitempty"`
 	ContentDigest string                     `json:"content_digest,omitempty"`
+	Encryption    string                     `json:"encryption"`
 	Receipt       *ComputerBackupCopyReceipt `json:"receipt,omitempty"`
+}
+
+type computerBackupSupersession struct {
+	Version           int                      `json:"version"`
+	BackupID          string                   `json:"backup_id"`
+	CopyID            string                   `json:"copy_id"`
+	Storage           ComputerStorageReference `json:"storage"`
+	NodeID            string                   `json:"node_id"`
+	RootInstanceID    string                   `json:"root_instance_id"`
+	OperationRevision int64                    `json:"operation_revision"`
+	L1OperationState  string                   `json:"l1_operation_state"`
 }
 
 func (engine *ContainerdEngine) computerBackupCheckpoint(checkpoint computerBackupCheckpoint) error {
@@ -52,6 +64,13 @@ func (engine *ContainerdEngine) allocateComputerBackup(path string, size int64) 
 		return engine.computerBackupAllocate(path, size)
 	}
 	return fullyAllocateComputerDisk(path, size)
+}
+
+func (engine *ContainerdEngine) copyComputerBackup(destination io.Writer, source io.Reader, size int64) (int64, error) {
+	if engine.computerBackupCopyN != nil {
+		return engine.computerBackupCopyN(destination, source, size)
+	}
+	return io.CopyN(destination, source, size)
 }
 
 func deterministicComputerBackupCopyName(copyID string) (string, error) {
@@ -175,10 +194,88 @@ func readComputerBackupManifest(path string) (computerBackupManifest, bool, erro
 		return computerBackupManifest{}, false, err
 	}
 	var manifest computerBackupManifest
-	if err := json.Unmarshal(payload, &manifest); err != nil || manifest.Version != 1 {
+	if err := json.Unmarshal(payload, &manifest); err != nil || manifest.Version != 1 || manifest.Encryption != "none" {
 		return computerBackupManifest{}, false, errors.New("Computer Backup manifest is invalid")
 	}
 	return manifest, true, nil
+}
+
+func computerBackupSupersessionPath(parent, copyName string) string {
+	return filepath.Join(parent, "supersessions", copyName+".json")
+}
+
+func writeComputerBackupSupersession(parent, copyName string, request DeleteComputerBackupCopyRequest) error {
+	state := "pruning"
+	if request.Superseded {
+		state = "superseded"
+	}
+	root := filepath.Join(parent, "supersessions")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(computerBackupSupersession{Version: 1, BackupID: request.BackupID,
+		CopyID: request.CopyID, Storage: request.Storage, NodeID: request.Authority.NodeID,
+		RootInstanceID: request.Authority.RootInstanceID, OperationRevision: request.Authority.OperationRevision,
+		L1OperationState: state})
+	if err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(root, ".supersession.tmp-")
+	if err != nil {
+		return err
+	}
+	name := file.Name()
+	defer os.Remove(name)
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	writeErr := error(nil)
+	if _, writeErr = file.Write(payload); writeErr == nil {
+		writeErr = file.Sync()
+	}
+	writeErr = errors.Join(writeErr, file.Close())
+	if writeErr != nil {
+		return writeErr
+	}
+	if err := os.Rename(name, computerBackupSupersessionPath(parent, copyName)); err != nil {
+		return err
+	}
+	return syncDirectory(root)
+}
+
+func readComputerBackupSupersession(path string) (computerBackupSupersession, bool, error) {
+	payload, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return computerBackupSupersession{}, false, nil
+	}
+	if err != nil {
+		return computerBackupSupersession{}, false, err
+	}
+	var supersession computerBackupSupersession
+	if err := json.Unmarshal(payload, &supersession); err != nil || supersession.Version != 1 ||
+		(supersession.L1OperationState != "pruning" && supersession.L1OperationState != "superseded") {
+		return computerBackupSupersession{}, false, errors.New("Computer Backup supersession is invalid")
+	}
+	return supersession, true, nil
+}
+
+func sameComputerBackupSupersession(supersession computerBackupSupersession, request CreateComputerBackupRequest) bool {
+	return supersession.BackupID == request.BackupID && supersession.CopyID == request.CopyID &&
+		sameComputerStorageIdentity(supersession.Storage, request.Storage) &&
+		supersession.NodeID == request.Authority.NodeID && supersession.RootInstanceID == request.Authority.RootInstanceID &&
+		supersession.OperationRevision == request.Authority.OperationRevision
+}
+
+func sameComputerBackupRemovalSupersession(supersession computerBackupSupersession, request DeleteComputerBackupCopyRequest) bool {
+	wantState := "pruning"
+	if request.Superseded {
+		wantState = "superseded"
+	}
+	return supersession.BackupID == request.BackupID && supersession.CopyID == request.CopyID &&
+		sameComputerStorageIdentity(supersession.Storage, request.Storage) &&
+		supersession.NodeID == request.Authority.NodeID && supersession.RootInstanceID == request.Authority.RootInstanceID &&
+		supersession.OperationRevision == request.Authority.OperationRevision && supersession.L1OperationState == wantState
 }
 
 func digestFile(path string) (string, error) {
@@ -223,6 +320,19 @@ func removeComputerBackupRoot(root string) error {
 	return syncDirectory(parent)
 }
 
+func removeAndObserveComputerBackupRoot(root string) error {
+	if err := removeComputerBackupRoot(root); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return errors.New("Computer Backup copy remains after deletion")
+		}
+		return fmt.Errorf("observe Computer Backup copy absence: %w", err)
+	}
+	return nil
+}
+
 func backupFailureReceipt(request CreateComputerBackupRequest, helperGeneration uint64, code string) (CreateComputerBackupResponse, error) {
 	receiptID, err := randomCapability()
 	if err != nil {
@@ -253,6 +363,14 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 	if err := os.MkdirAll(backupParent, 0o700); err != nil {
 		return CreateComputerBackupResponse{}, err
 	}
+	if supersession, present, err := readComputerBackupSupersession(computerBackupSupersessionPath(backupParent, copyName)); err != nil {
+		return CreateComputerBackupResponse{}, err
+	} else if present {
+		if !sameComputerBackupSupersession(supersession, request) {
+			return CreateComputerBackupResponse{}, errors.New("Computer Backup supersession has different durable authority")
+		}
+		return CreateComputerBackupResponse{}, errors.New("Computer Backup operation was durably superseded")
+	}
 	root := filepath.Join(backupParent, copyName)
 	manifestPath := filepath.Join(root, "copy.json")
 	manifest, present, err := readComputerBackupManifest(manifestPath)
@@ -279,7 +397,7 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 	} else {
 		manifest = computerBackupManifest{Version: 1, BackupID: request.BackupID, CopyID: request.CopyID,
 			Storage: request.Storage, Authority: request.Authority, Phase: computerBackupReserved,
-			TemporaryFile: "backup.ext4.staging", PublishedFile: "backup.ext4"}
+			TemporaryFile: "backup.ext4.staging", PublishedFile: "backup.ext4", Encryption: "none"}
 		if err := writeComputerBackupManifest(root, manifest); err != nil {
 			return CreateComputerBackupResponse{}, err
 		}
@@ -307,7 +425,7 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 		if err := engine.allocateComputerBackup(temporaryPath, request.Storage.DiskBytes); err != nil {
 			_ = file.Close()
 			if errors.Is(err, syscall.ENOSPC) {
-				if cleanupErr := removeComputerBackupRoot(root); cleanupErr != nil {
+				if cleanupErr := removeAndObserveComputerBackupRoot(root); cleanupErr != nil {
 					return CreateComputerBackupResponse{}, errors.Join(err, cleanupErr)
 				}
 				return backupFailureReceipt(request, request.Authority.HelperGeneration, "insufficient_disk")
@@ -334,7 +452,7 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 				_ = source.Close()
 				return err
 			}
-			_, err = io.CopyN(destination, source, request.Storage.DiskBytes)
+			_, err = engine.copyComputerBackup(destination, source, request.Storage.DiskBytes)
 			if err == nil {
 				err = destination.Sync()
 			}
@@ -342,7 +460,7 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 		}()
 		if copyErr != nil {
 			if errors.Is(copyErr, syscall.ENOSPC) {
-				if cleanupErr := removeComputerBackupRoot(root); cleanupErr != nil {
+				if cleanupErr := removeAndObserveComputerBackupRoot(root); cleanupErr != nil {
 					return CreateComputerBackupResponse{}, errors.Join(copyErr, cleanupErr)
 				}
 				return backupFailureReceipt(request, request.Authority.HelperGeneration, "insufficient_disk")
@@ -374,7 +492,7 @@ func (engine *ContainerdEngine) createComputerBackupLocked(ctx context.Context, 
 		return CreateComputerBackupResponse{}, err
 	}
 	if sourceDigest != destinationDigest {
-		if cleanupErr := removeComputerBackupRoot(root); cleanupErr != nil {
+		if cleanupErr := removeAndObserveComputerBackupRoot(root); cleanupErr != nil {
 			return CreateComputerBackupResponse{}, errors.Join(errors.New("Computer Backup digest mismatch"), cleanupErr)
 		}
 		return backupFailureReceipt(request, request.Authority.HelperGeneration, "digest_mismatch")
@@ -438,6 +556,12 @@ func (engine *ContainerdEngine) DeleteComputerBackupCopy(_ context.Context, requ
 		return DeleteComputerBackupCopyResponse{}, err
 	}
 	root := filepath.Join(engine.config.RuntimeRoot, "computer-backups", copyName)
+	backupParent := filepath.Dir(root)
+	if supersession, present, err := readComputerBackupSupersession(computerBackupSupersessionPath(backupParent, copyName)); err != nil {
+		return DeleteComputerBackupCopyResponse{}, err
+	} else if present && !sameComputerBackupRemovalSupersession(supersession, request) {
+		return DeleteComputerBackupCopyResponse{}, errors.New("Backup copy removal authority does not match its durable supersession")
+	}
 	manifest, present, err := readComputerBackupManifest(filepath.Join(root, "copy.json"))
 	if err != nil {
 		return DeleteComputerBackupCopyResponse{}, err
@@ -448,11 +572,14 @@ func (engine *ContainerdEngine) DeleteComputerBackupCopy(_ context.Context, requ
 		manifest.Authority.RootInstanceID != request.Authority.RootInstanceID) {
 		return DeleteComputerBackupCopyResponse{}, errors.New("Backup copy removal authority does not match its manifest")
 	}
-	if err := removeComputerBackupRoot(root); err != nil {
+	if err := writeComputerBackupSupersession(backupParent, copyName, request); err != nil {
 		return DeleteComputerBackupCopyResponse{}, err
 	}
-	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
-		return DeleteComputerBackupCopyResponse{}, errors.New("Backup copy remains after deletion")
+	if engine.computerBackupRemovalHook != nil {
+		engine.computerBackupRemovalHook()
+	}
+	if err := removeAndObserveComputerBackupRoot(root); err != nil {
+		return DeleteComputerBackupCopyResponse{}, err
 	}
 	receiptID, err := randomCapability()
 	if err != nil {

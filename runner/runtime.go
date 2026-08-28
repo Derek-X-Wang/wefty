@@ -536,6 +536,7 @@ type ComputerBackupCopyRemovalRequest struct {
 	RootInstanceID    string
 	OperationRevision int64
 	CleanupFence      string
+	Superseded        bool
 }
 
 type ComputerBackupCopyRemovalReceipt = contract.ComputerBackupCopyRemovalReceipt

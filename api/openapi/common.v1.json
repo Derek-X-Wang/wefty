@@ -366,15 +366,16 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "intent_revision", "operation", "desired_state", "storage_id", "storage_generation",
+          "intent_revision", "operation", "desired_state", "storage_id", "storage_generation", "backup_cap",
           "job_id", "spec_revision", "actor", "created_at"
         ],
         "properties": {
           "intent_revision": { "type": "integer", "minimum": 1 },
-          "operation": { "enum": ["create", "start", "stop", "restart", "remove", "project", "reset", "backup_create"] },
+          "operation": { "enum": ["create", "start", "stop", "restart", "remove", "project", "reset", "backup_create", "backup_cap"] },
           "desired_state": { "enum": ["running", "stopped", "removed"] },
           "storage_id": { "type": "string", "minLength": 1 },
           "storage_generation": { "type": "integer", "minimum": 1 },
+          "backup_cap": { "type": "integer", "format": "int64", "minimum": 0 },
           "job_id": { "type": "string", "minLength": 1 },
           "spec_revision": { "type": "integer", "minimum": 1 },
           "actor": { "type": "string", "minLength": 1 },
@@ -423,6 +424,7 @@
           "current_job_id": { "type": "string", "minLength": 1 },
           "current_spec_revision": { "type": "integer", "minimum": 1 },
           "backup_cap": { "type": "integer", "format": "int64", "minimum": 0, "description": "Effective retained Backup cap. Zero disables creation; pruning is always explicit." },
+          "last_backup_operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome" },
           "reconfiguration_phase": { "enum": ["stable", "projecting", "resetting", "backing_up", "removing"] },
           "reconfiguration_revision": { "type": "integer", "minimum": 1 },
           "submit_enabled": { "type": "boolean", "default": false },
@@ -515,7 +517,23 @@
         "type": "object",
         "additionalProperties": false,
         "required": ["backups"],
-        "properties": { "backups": { "type": "array", "items": { "$ref": "#/components/schemas/Backup" } } }
+        "properties": {
+          "backups": { "type": "array", "items": { "$ref": "#/components/schemas/Backup" } },
+          "last_operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome" }
+        }
+      },
+      "ComputerBackupOperationOutcome": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation_revision", "backup_id", "status"],
+        "properties": {
+          "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+          "backup_id": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["planned", "published", "failed", "superseded"] },
+          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch"] },
+          "completed_at": { "type": "string", "format": "date-time" }
+        },
+        "description": "Latest Computer Backup operation observation. A planned status is still running; failed always carries a typed failure_code."
       },
       "ComputerBackupDirective": {
         "type": "object",
@@ -534,13 +552,14 @@
       "ComputerBackupPruneDirective": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["backup_id", "copy_id", "computer_id", "storage_id", "storage_generation", "allocated_size", "bound_node_id", "root_instance_id", "operation_revision", "cleanup_fence"],
+        "required": ["backup_id", "copy_id", "computer_id", "storage_id", "storage_generation", "allocated_size", "bound_node_id", "root_instance_id", "operation_revision", "cleanup_fence", "superseded"],
         "properties": {
           "backup_id": { "type": "string", "minLength": 1 }, "copy_id": { "type": "string", "minLength": 1 },
           "computer_id": { "type": "string", "minLength": 1 }, "storage_id": { "type": "string", "minLength": 1 },
           "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 }, "allocated_size": { "type": "integer", "format": "int64", "minimum": 1 },
           "bound_node_id": { "type": "string", "minLength": 1 }, "root_instance_id": { "type": "string", "minLength": 1 },
-          "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 }, "cleanup_fence": { "type": "string", "minLength": 1 }
+          "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 }, "cleanup_fence": { "type": "string", "minLength": 1 },
+          "superseded": { "type": "boolean", "description": "True only when irreversible Computer removal superseded a stale create before helper-side absence proof." }
         }
       },
       "Attempt": {

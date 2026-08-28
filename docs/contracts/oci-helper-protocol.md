@@ -7,6 +7,13 @@ workload-class lifecycle policy crosses this protocol. The Linux and Lima
 transports both present a Unix stream socket; the raw containerd socket remains
 root-only and is never forwarded.
 
+Computer Backup `copy.json` manifests durably record `encryption=none` before
+copy bytes are allocated. ENOSPC and digest-mismatch receipts set `CopyAbsent`
+only after a post-delete `lstat` observes the copy root absent. Composite
+Computer removal first syncs an operation-keyed supersession tombstone while
+holding the shared Backup mutex; a delayed create checks the tombstone before
+writing and fails closed.
+
 On Mac, the Lima 2.2 `vz` template enables only rootful containerd with the
 `overlayfs` snapshotter, maps one explicit operator-owned host root to
 `/mnt/wefty-host`, and forwards only `/run/wefty/oci-helper.sock` into the

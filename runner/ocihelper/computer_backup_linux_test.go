@@ -5,6 +5,7 @@ package ocihelper
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -39,6 +40,10 @@ func prepareDetachedBackupSource(t *testing.T) (string, *fakeComputerDiskSystem,
 		t.Fatal(err)
 	}
 	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	authorityMarker := []byte("fencing_token=planted\ncleanup_fence=planted\nroot_instance_id=planted\n")
+	if err := os.WriteFile(filepath.Join(filepath.Dir(attachment.imagePath), "wefty-authority.marker"), authorityMarker, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return root, system, storage, authority
@@ -106,6 +111,10 @@ func TestComputerBackupResumesEveryTrackedCrashBoundary(t *testing.T) {
 				bytes.Contains(payload, []byte("root_instance_id")) {
 				t.Fatal("Backup disk contains wefty authority artifacts")
 			}
+			manifest, present, err := readComputerBackupManifest(filepath.Join(copyRoot, "copy.json"))
+			if err != nil || !present || manifest.Encryption != "none" {
+				t.Fatalf("durable Backup manifest encryption = %+v present=%t err=%v", manifest, present, err)
+			}
 			for _, path := range []string{copyRoot, filepath.Join(copyRoot, "copy.json"), filepath.Join(copyRoot, "backup.ext4")} {
 				info, err := os.Stat(path)
 				if err != nil {
@@ -135,6 +144,15 @@ func TestComputerBackupENOSPCAndDigestMismatchLeaveNoBackupOrSourceMutation(t *t
 	}{
 		{name: "ENOSPC", wantCode: "insufficient_disk", configure: func(engine *ContainerdEngine, _ string, _ CreateComputerBackupRequest) {
 			engine.computerBackupAllocate = func(string, int64) error { return syscall.ENOSPC }
+		}},
+		{name: "mid-copy ENOSPC", wantCode: "insufficient_disk", configure: func(engine *ContainerdEngine, _ string, _ CreateComputerBackupRequest) {
+			engine.computerBackupCopyN = func(destination io.Writer, source io.Reader, _ int64) (int64, error) {
+				copied, err := io.CopyN(destination, source, 4096)
+				if err != nil {
+					return copied, err
+				}
+				return copied, syscall.ENOSPC
+			}
 		}},
 		{name: "digest mismatch", wantCode: "digest_mismatch", configure: func(engine *ContainerdEngine, root string, request CreateComputerBackupRequest) {
 			engine.computerBackupHook = func(checkpoint computerBackupCheckpoint) error {
@@ -177,6 +195,49 @@ func TestComputerBackupENOSPCAndDigestMismatchLeaveNoBackupOrSourceMutation(t *t
 				t.Fatalf("failed Backup mutated source: before=%s after=%s err=%v", before, after, err)
 			}
 		})
+	}
+}
+
+func TestComputerBackupRemovalSupersessionWinsRacingStaleCreate(t *testing.T) {
+	root, system, storage, sourceAuthority := prepareDetachedBackupSource(t)
+	request := backupTestRequest(storage, sourceAuthority)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	removalEntered := make(chan struct{})
+	releaseRemoval := make(chan struct{})
+	engine.computerBackupRemovalHook = func() {
+		close(removalEntered)
+		<-releaseRemoval
+	}
+	deleteRequest := DeleteComputerBackupCopyRequest{BackupID: request.BackupID, CopyID: request.CopyID,
+		Storage: request.Storage, Authority: request.Authority, Superseded: true}
+	removed := make(chan error, 1)
+	go func() {
+		response, err := engine.DeleteComputerBackupCopy(t.Context(), deleteRequest)
+		if err == nil && (!response.Receipt.Absent || response.Receipt.Kind != "computer_backup_copy_removed") {
+			err = errors.New("removal returned no positive absence")
+		}
+		removed <- err
+	}()
+	<-removalEntered
+	created := make(chan error, 1)
+	go func() {
+		_, err := engine.CreateComputerBackup(t.Context(), request)
+		created <- err
+	}()
+	close(releaseRemoval)
+	if err := <-removed; err != nil {
+		t.Fatalf("superseding removal: %v", err)
+	}
+	if err := <-created; err == nil || !bytes.Contains([]byte(err.Error()), []byte("durably superseded")) {
+		t.Fatalf("stale create after supersession = %v, want durable refusal", err)
+	}
+	copyName, _ := deterministicComputerBackupCopyName(request.CopyID)
+	copyRoot := filepath.Join(root, "computer-backups", copyName)
+	if _, err := os.Lstat(copyRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("late copy exists after supersession: %v", err)
+	}
+	if _, err := os.Lstat(computerBackupSupersessionPath(filepath.Dir(copyRoot), copyName)); err != nil {
+		t.Fatalf("durable supersession tombstone missing: %v", err)
 	}
 }
 

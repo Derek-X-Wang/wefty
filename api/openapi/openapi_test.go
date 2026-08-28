@@ -94,6 +94,7 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 		"/v1/computers/{computer_id}",
 		"/v1/computers/{computer_id}/intents",
 		"/v1/computers/{computer_id}/desired-state",
+		"/v1/computers/{computer_id}/backup-cap",
 		"/v1/computers/{computer_id}/restart",
 		"/v1/computers/{computer_id}/storage-reset",
 		"/v1/computers/{computer_id}/storage-generations",
@@ -133,7 +134,7 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 	if _, present := schemas["ComputerStorageGenerationList"]; !present {
 		t.Fatal("common schema is missing Computer Storage generation evidence")
 	}
-	for _, name := range []string{"StorageProvenance", "BackupCopy", "Backup", "BackupList", "ComputerBackupDirective", "ComputerBackupPruneDirective"} {
+	for _, name := range []string{"StorageProvenance", "BackupCopy", "Backup", "BackupList", "ComputerBackupOperationOutcome", "ComputerBackupDirective", "ComputerBackupPruneDirective"} {
 		if _, present := schemas[name]; !present {
 			t.Errorf("common schema is missing %s", name)
 		}
@@ -180,6 +181,11 @@ func TestColdBackupContractsPublishAgentReceiptsAndStandingWork(t *testing.T) {
 	encryption := object(t, backupProperties["encryption"], "Backup encryption")
 	if encryption["const"] != "none" {
 		t.Fatalf("Backup encryption = %#v, want none", encryption["const"])
+	}
+	outcome := object(t, schemas["ComputerBackupOperationOutcome"], "ComputerBackupOperationOutcome")
+	outcomeProperties := object(t, outcome["properties"], "ComputerBackupOperationOutcome properties")
+	if _, present := outcomeProperties["failure_code"]; !present {
+		t.Fatal("Computer Backup outcome omits typed failure_code")
 	}
 }
 

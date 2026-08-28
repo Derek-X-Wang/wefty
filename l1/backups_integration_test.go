@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 )
 
 func backupHarness(t *testing.T, clusterCap int64, perComputerCap *int64) (*integrationHarness, Node, Computer) {
@@ -100,6 +101,15 @@ func TestComputerBackupDefaultCapZeroAndExplicitOverride(t *testing.T) {
 	unchanged, err := h.store.GetComputer(context.Background(), computer.ComputerID)
 	if err != nil || unchanged.IntentRevision != computer.IntentRevision || unchanged.CurrentJob.State != contract.JobRunning {
 		t.Fatalf("default-zero Backup changed Computer = %#v err=%v", unchanged, err)
+	}
+	mutable, err := h.store.SetComputerBackupCap(context.Background(), unchanged.ComputerID,
+		ComputerBackupCapRequest{ComputerMutationPrecondition: computerPrecondition(unchanged, "operator"), BackupCap: 1})
+	if err != nil || mutable.BackupCap != 1 || mutable.IntentRevision != unchanged.IntentRevision+1 || mutable.AppliedRevision != mutable.IntentRevision {
+		t.Fatalf("mutable Backup cap = %#v err=%v", mutable, err)
+	}
+	intents, err := h.store.ListComputerIntents(context.Background(), mutable.ComputerID, "", 10)
+	if err != nil || intents.Intents[len(intents.Intents)-1].Operation != ComputerIntentBackupCap || intents.Intents[len(intents.Intents)-1].BackupCap != 1 {
+		t.Fatalf("revisioned Backup cap intent = %#v err=%v", intents, err)
 	}
 
 	override := int64(1)
@@ -197,7 +207,8 @@ func TestComputerBackupStopAndFailureRacesNeverResumeStaleIntent(t *testing.T) {
 		finishBackupQuiescence(t, h, claim, "backup-stop-quiescence")
 		stopped, err := h.store.SetComputerDesiredState(context.Background(), computer.ComputerID,
 			computerDesiredRequest(reserved, contract.ServiceDesiredStopped, "operator-stop"))
-		if err != nil || stopped.IntentRevision != reserved.IntentRevision+1 || stopped.ReconfigurationPhase != ComputerReconfigurationBackingUp {
+		if err != nil || stopped.IntentRevision != reserved.IntentRevision+1 || stopped.ReconfigurationPhase != ComputerReconfigurationBackingUp ||
+			stopped.AppliedRevision != reserved.AppliedRevision {
 			t.Fatalf("stop during Backup = %#v err=%v", stopped, err)
 		}
 		directives, err := h.store.ListNodeComputerBackupDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
@@ -206,7 +217,7 @@ func TestComputerBackupStopAndFailureRacesNeverResumeStaleIntent(t *testing.T) {
 		}
 		_, completed := acknowledgeBackup(t, h, node, directives[0], successfulBackupReceipt(directives[0]))
 		if completed.DesiredState != contract.ServiceDesiredStopped || completed.CurrentJob.State != contract.JobStopped ||
-			completed.IntentRevision != stopped.IntentRevision {
+			completed.IntentRevision != stopped.IntentRevision || completed.AppliedRevision != stopped.IntentRevision {
 			t.Fatalf("Backup publication resumed stale desired-running intent: %#v", completed)
 		}
 	})
@@ -231,8 +242,34 @@ func TestComputerBackupStopAndFailureRacesNeverResumeStaleIntent(t *testing.T) {
 			t.Fatalf("ENOSPC Backup result = backup=%#v Computer=%#v", backup, resumed)
 		}
 		list, err := h.store.ListComputerBackups(context.Background(), computer.ComputerID)
-		if err != nil || len(list.Backups) != 0 {
+		if err != nil || len(list.Backups) != 0 || list.LastOperation == nil ||
+			list.LastOperation.Status != "failed" || list.LastOperation.FailureCode != ComputerBackupFailureInsufficientDisk ||
+			resumed.LastBackupOperation == nil || resumed.LastBackupOperation.FailureCode != ComputerBackupFailureInsufficientDisk {
 			t.Fatalf("ENOSPC created a Backup: %#v err=%v", list, err)
+		}
+	})
+
+	t.Run("latched failure stays failed", func(t *testing.T) {
+		h, node, computer := backupHarness(t, 2, nil)
+		computer, claim := startBackupComputer(t, h, node, computer)
+		reserved, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
+			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-failed"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.store.CompleteAttempt(context.Background(), "fabric-computer-node", claim.Job.JobID,
+			claim.Lease.AttemptID, CompletionRequest{FencingToken: claim.Lease.FencingToken,
+				IdempotencyKey: "backup-failed-quiescence", Result: ProcessResult{OutputError: "quiescence failed"}}); err != nil {
+			t.Fatal(err)
+		}
+		directives, err := h.store.ListNodeComputerBackupDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+		if err != nil || len(directives) != 1 {
+			t.Fatalf("latched-failed Backup directive = %#v err=%v", directives, err)
+		}
+		_, completed := acknowledgeBackup(t, h, node, directives[0], successfulBackupReceipt(directives[0]))
+		if completed.CurrentJob.State != contract.JobFailed || completed.ReconfigurationPhase != ComputerReconfigurationStable ||
+			completed.AppliedRevision != reserved.IntentRevision {
+			t.Fatalf("latched-failed Backup completion = %#v", completed)
 		}
 	})
 }
@@ -315,6 +352,9 @@ func TestComputerBackupExplicitPruneAndRemovalSupersession(t *testing.T) {
 			t.Fatalf("service removal without Backup absence = %v, want conflict", err)
 		}
 		copyDirective := removals[0].ComputerBackupCopies.Copies[0]
+		if !copyDirective.Superseded {
+			t.Fatalf("in-flight create removal directive lacks durable supersession state: %#v", copyDirective)
+		}
 		if _, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", computer.ComputerID,
 			ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
 				IdempotencyKey: "superseded-copy-removed", Receipt: backupRemovalReceipt(copyDirective)}); err != nil {
@@ -324,6 +364,46 @@ func TestComputerBackupExplicitPruneAndRemovalSupersession(t *testing.T) {
 			t.Fatalf("service removal after Backup absence: %v", err)
 		}
 	})
+}
+
+func TestComputerRemovalGatesPublishedBackupCopyAbsence(t *testing.T) {
+	h, node, computer := backupHarness(t, 2, nil)
+	computer, claim := startBackupComputer(t, h, node, computer)
+	_, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
+		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-published-remove"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishBackupQuiescence(t, h, claim, "backup-published-remove-quiescence")
+	creates, _ := h.store.ListNodeComputerBackupDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	_, completed := acknowledgeBackup(t, h, node, creates[0], successfulBackupReceipt(creates[0]))
+	removed, err := h.store.RemoveComputer(context.Background(), completed.ComputerID,
+		ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(completed, "operator-remove")})
+	if err != nil || removed.DesiredState != contract.ServiceDesiredRemoved {
+		t.Fatalf("remove published Backup Computer = %#v err=%v", removed, err)
+	}
+	removals, err := h.store.ListNodeRemovalDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(removals) != 1 || removals[0].ComputerBackupCopies == nil || len(removals[0].ComputerBackupCopies.Copies) != 1 {
+		t.Fatalf("published composite removal directive = %#v err=%v", removals, err)
+	}
+	copyDirective := removals[0].ComputerBackupCopies.Copies[0]
+	if copyDirective.Superseded {
+		t.Fatalf("published Backup copy was mislabeled as a stale create: %#v", copyDirective)
+	}
+	serviceReceipt := RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+		RemovalGeneration: removals[0].RemovalGeneration, CleanupFence: removals[0].CleanupFence,
+		RootInstanceID: removals[0].RootInstanceID, IdempotencyKey: "published-service-removed"}
+	if _, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node", removals[0].JobID, serviceReceipt); errorCode(err) != contract.ErrorConflict {
+		t.Fatalf("published service removal without Backup absence = %v, want conflict", err)
+	}
+	if _, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", computer.ComputerID,
+		ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: "published-copy-removed", Receipt: backupRemovalReceipt(copyDirective)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node", removals[0].JobID, serviceReceipt); err != nil {
+		t.Fatalf("published service removal after Backup absence: %v", err)
+	}
 }
 
 func TestComputerBackupReceiptAuthorityMutationsFailClosed(t *testing.T) {
@@ -360,5 +440,71 @@ func TestComputerBackupReceiptAuthorityMutationsFailClosed(t *testing.T) {
 				t.Fatal("mutated Backup receipt was accepted")
 			}
 		})
+	}
+}
+
+func TestComputerBackupAcknowledgementsRequireBoundNodeAndCurrentRoot(t *testing.T) {
+	h, node, computer := backupHarness(t, 2, nil)
+	computer, claim := startBackupComputer(t, h, node, computer)
+	_, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
+		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-authority"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishBackupQuiescence(t, h, claim, "backup-authority-quiescence")
+	creates, err := h.store.ListNodeComputerBackupDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(creates) != 1 {
+		t.Fatalf("Backup authority directive = %#v err=%v", creates, err)
+	}
+	createReceipt := successfulBackupReceipt(creates[0])
+	otherRegistration := node.NodeRegistration
+	otherRegistration.NodeID = "other-backup-node"
+	otherRegistration.BootSessionID = "other-backup-boot"
+	otherRegistration.RootInstanceID = "other-backup-root"
+	otherNode, err := h.store.RegisterNode(context.Background(), fabric.Identity{NodeID: "fabric-computer-node"},
+		otherRegistration, NodePolicy{MaxOneshotSlots: 1, MaxServiceSlots: 1}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.store.AcknowledgeComputerBackup(context.Background(), "fabric-computer-node", computer.ComputerID,
+		ComputerBackupAcknowledgementRequest{NodeID: otherNode.NodeID, BootSessionID: otherNode.BootSessionID,
+			IdempotencyKey: "forged-create-node", Receipt: createReceipt}); errorCode(err) != contract.ErrorAttemptNotOwned {
+		t.Fatalf("forged create node acknowledgement = %v, want %q", err, contract.ErrorAttemptNotOwned)
+	}
+	if _, err := h.store.db.Exec(`UPDATE nodes SET root_instance_id='recreated-backup-root' WHERE node_id=?`, node.NodeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.store.AcknowledgeComputerBackup(context.Background(), "fabric-computer-node", computer.ComputerID,
+		ComputerBackupAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: "recreated-create-root", Receipt: createReceipt}); errorCode(err) != contract.ErrorConflict {
+		t.Fatalf("recreated create root acknowledgement = %v, want %q", err, contract.ErrorConflict)
+	}
+	if _, err := h.store.db.Exec(`UPDATE nodes SET root_instance_id=? WHERE node_id=?`, creates[0].RootInstanceID, node.NodeID); err != nil {
+		t.Fatal(err)
+	}
+	backup, completed := acknowledgeBackup(t, h, node, creates[0], createReceipt)
+	planned, _, err := h.store.BeginComputerBackupPrune(context.Background(), computer.ComputerID,
+		ComputerBackupPruneRequest{ComputerMutationPrecondition: computerPrecondition(completed, "operator"),
+			BackupID: backup.BackupID, IdempotencyKey: "prune-authority"})
+	if err != nil || planned.Status != "pruning" {
+		t.Fatalf("plan authority prune = %#v err=%v", planned, err)
+	}
+	prunes, err := h.store.ListNodeComputerBackupPruneDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(prunes) != 1 {
+		t.Fatalf("Backup prune authority directive = %#v err=%v", prunes, err)
+	}
+	pruneReceipt := backupRemovalReceipt(prunes[0])
+	if _, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", computer.ComputerID,
+		ComputerBackupPruneAcknowledgementRequest{NodeID: otherNode.NodeID, BootSessionID: otherNode.BootSessionID,
+			IdempotencyKey: "forged-prune-node", Receipt: pruneReceipt}); errorCode(err) != contract.ErrorAttemptNotOwned {
+		t.Fatalf("forged prune node acknowledgement = %v, want %q", err, contract.ErrorAttemptNotOwned)
+	}
+	if _, err := h.store.db.Exec(`UPDATE nodes SET root_instance_id='recreated-prune-root' WHERE node_id=?`, node.NodeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.AcknowledgeComputerBackupPrune(context.Background(), "fabric-computer-node", computer.ComputerID,
+		ComputerBackupPruneAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: "recreated-prune-root", Receipt: pruneReceipt}); errorCode(err) != contract.ErrorConflict {
+		t.Fatalf("recreated prune root acknowledgement = %v, want %q", err, contract.ErrorConflict)
 	}
 }

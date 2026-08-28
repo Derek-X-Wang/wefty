@@ -11,5 +11,7 @@ func TestServiceAcceptanceComputerColdBackupContract(t *testing.T) {
 	t.Run("cap and immutable publication", TestComputerBackupRunningQuiescesPublishesAndResumesSameRevision)
 	t.Run("stale intent never resumes", TestComputerBackupStopAndFailureRacesNeverResumeStaleIntent)
 	t.Run("receipt authority mutations", TestComputerBackupReceiptAuthorityMutationsFailClosed)
+	t.Run("node and root acknowledgement fences", TestComputerBackupAcknowledgementsRequireBoundNodeAndCurrentRoot)
 	t.Run("explicit and composite removal", TestComputerBackupExplicitPruneAndRemovalSupersession)
+	t.Run("published copy composite removal", TestComputerRemovalGatesPublishedBackupCopyAbsence)
 }

@@ -69,7 +69,7 @@ func (controller *backupController) processPrune(ctx context.Context, directive 
 			DiskBytes: directive.AllocatedSize},
 		NodeID: controller.nodeID, BootSessionID: controller.bootSessionID,
 		RootInstanceID: directive.RootInstanceID, OperationRevision: directive.OperationRevision,
-		CleanupFence: directive.CleanupFence,
+		CleanupFence: directive.CleanupFence, Superseded: directive.Superseded,
 	})
 	if err != nil {
 		return err

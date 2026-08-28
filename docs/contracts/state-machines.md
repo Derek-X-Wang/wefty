@@ -108,7 +108,7 @@ Computer-trait Job is invalid at L1 construction time: it must be created in
 the same transaction as its Computer. `computer_id`, `storage_id`, and every
 successive `job_id` are distinct identities.
 
-Start, stop, restart, reset, removal, and projection replacement require the exact observed
+Start, stop, restart, reset, Backup-cap mutation, removal, and projection replacement require the exact observed
 `intent_revision` and `storage_id@generation`. The transaction returns
 `stale_intent_revision` or `storage_reference_conflict` without changing any
 row when either precondition moved. An accepted no-change desired-state retry
@@ -152,9 +152,10 @@ The Job resumes only when desired-running intent and the exact operation
 revision are unchanged; an intervening stop or remove wins.
 
 The effective retained Backup cap is the per-Computer override when supplied,
-otherwise the cluster cap; the shipped cluster cap is zero. Zero or an
-already-reached positive cap rejects creation without mutation. Capacity never
-auto-deletes: pruning is explicit, retains the immutable logical record as
+otherwise the cluster cap; the shipped cluster cap is zero. An administrator
+may later change the materialized cap through the ordinary revisioned Computer
+intent CAS. Zero or an already-reached positive cap rejects creation without
+mutation. Capacity never auto-deletes: pruning is explicit, retains the immutable logical record as
 `pruned`, and moves its one physical copy through
 `published → removal_pending → removed` only after a positive absence receipt.
 ENOSPC and digest mismatch publish no Backup and require positive copy absence.
@@ -177,7 +178,10 @@ tracked Backup copy, including a planned copy whose create was superseded
 after helper reservation but before L1 publication. The standing removal
 directive carries those copies and their exact source Storage generation,
 Node, root instance, copy, operation revision, and cleanup fence; no service
-cleanup acknowledgement is accepted while a copy lacks positive absence.
+cleanup acknowledgement is accepted while a copy lacks positive absence. For
+a superseded create, the helper writes and syncs an operation-keyed
+supersession tombstone under the Backup mutex before it proves absence. A late
+create must observe that tombstone and refuse to publish bytes.
 Custody export and cross-node replicas remain later contracts.
 
 The first successful claim copies the ordinary service binding to the Computer

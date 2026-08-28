@@ -301,8 +301,8 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 				return nil, internalError(errors.New("Computer removal has no Storage generations"), "list Computer Storage removal generations")
 			}
 			backupRows, backupErr := s.db.QueryContext(ctx, `SELECT p.backup_id, p.copy_id, p.computer_id,
-				b.source_storage_id, b.source_generation, b.allocated_size, bc.node_id, bc.root_instance_id,
-				p.intent_revision, p.cleanup_fence
+					b.source_storage_id, b.source_generation, b.allocated_size, bc.node_id, bc.root_instance_id,
+					p.intent_revision, p.cleanup_fence, 0
 				FROM computer_backup_prunes p
 				JOIN backups b ON b.backup_id=p.backup_id
 				JOIN backup_copies bc ON bc.copy_id=p.copy_id
@@ -310,7 +310,7 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 				UNION ALL
 				SELECT o.backup_id, o.copy_id, o.computer_id, o.source_storage_id,
 				o.source_generation, o.allocated_size, o.bound_node_id, o.root_instance_id,
-				o.operation_revision, o.cleanup_fence
+					o.operation_revision, o.cleanup_fence, 1
 				FROM computer_backup_operations o
 				WHERE o.computer_id=? AND o.status='superseded' AND o.acknowledgement_key IS NULL
 				ORDER BY copy_id`, computerID.String, computerID.String)
@@ -323,7 +323,7 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 				if err := backupRows.Scan(&copy.BackupID, &copy.CopyID, &copy.ComputerID,
 					&copy.StorageID, &copy.StorageGeneration, &copy.AllocatedSize,
 					&copy.BoundNodeID, &copy.RootInstanceID, &copy.OperationRevision,
-					&copy.CleanupFence); err != nil {
+					&copy.CleanupFence, &copy.Superseded); err != nil {
 					backupRows.Close()
 					return nil, internalError(err, "scan Computer Backup copy removal")
 				}

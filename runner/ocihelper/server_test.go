@@ -218,13 +218,28 @@ func TestComputerBackupRequiresCurrentSessionAndReturnsBoundReceipts(t *testing.
 		assertRPCCode(t, err, CodeInvalidRequest)
 	}
 	request.Authority.HelperGeneration = session.Handshake().SessionGeneration
+	engine.createBackupResponse = CreateComputerBackupResponse{Receipt: ComputerBackupCopyReceipt{
+		Kind: "computer_backup_copy_verified", ReceiptID: "observed-backup-receipt", BackupID: "backup-1",
+		CopyID: "copy-1", ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1,
+		NodeID: "node-1", RootInstanceID: "managed-root-1", JobID: "job-1", OperationRevision: 2,
+		CleanupFence: "backup-fence", HelperGeneration: request.Authority.HelperGeneration, AllocatedSize: 8 << 30,
+		ContentDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Encryption: "none",
+	}}
 	created, err := session.CreateComputerBackup(t.Context(), request)
 	if err != nil || created.Receipt.Kind != "computer_backup_copy_verified" ||
 		created.Receipt.CopyID != request.CopyID || created.Receipt.HelperGeneration != request.Authority.HelperGeneration {
 		t.Fatalf("current-session Backup = %+v err=%v", created, err)
 	}
 	request.Authority.CleanupFence = "prune-fence"
-	removed, err := session.DeleteComputerBackupCopy(t.Context(), DeleteComputerBackupCopyRequest(request))
+	engine.deleteBackupResponse = DeleteComputerBackupCopyResponse{Receipt: ComputerBackupCopyRemovalReceipt{
+		Kind: "computer_backup_copy_removed", ReceiptID: "observed-removal-receipt", BackupID: "backup-1",
+		CopyID: "copy-1", ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1,
+		NodeID: "node-1", RootInstanceID: "managed-root-1", OperationRevision: 2, CleanupFence: "prune-fence",
+		HelperGeneration: request.Authority.HelperGeneration, Absent: true,
+	}}
+	removed, err := session.DeleteComputerBackupCopy(t.Context(), DeleteComputerBackupCopyRequest{
+		BackupID: request.BackupID, CopyID: request.CopyID, Storage: request.Storage, Authority: request.Authority,
+	})
 	if err != nil || removed.Receipt.Kind != "computer_backup_copy_removed" || !removed.Receipt.Absent ||
 		removed.Receipt.CleanupFence != "prune-fence" {
 		t.Fatalf("current-session Backup prune = %+v err=%v", removed, err)
@@ -1718,6 +1733,8 @@ type fakeEngine struct {
 	dialHostBridgeDone       chan struct{}
 	lastDialAttemptRequest   DialAttemptPortRequest
 	controlWrites            []SetComputerControlStateRequest
+	createBackupResponse     CreateComputerBackupResponse
+	deleteBackupResponse     DeleteComputerBackupCopyResponse
 }
 
 type blockingWatchEngine struct {
@@ -2151,25 +2168,11 @@ func (*fakeEngine) ResetComputerStorage(_ context.Context, request ResetComputer
 		CleanupFence: request.Authority.CleanupFence, HelperGeneration: request.Authority.HelperGeneration,
 	}}, nil
 }
-func (*fakeEngine) CreateComputerBackup(_ context.Context, request CreateComputerBackupRequest) (CreateComputerBackupResponse, error) {
-	return CreateComputerBackupResponse{Receipt: ComputerBackupCopyReceipt{
-		Kind: "computer_backup_copy_verified", ReceiptID: "backup-receipt", BackupID: request.BackupID,
-		CopyID: request.CopyID, ComputerID: request.Storage.ComputerID, StorageID: request.Storage.StorageID,
-		StorageGeneration: request.Storage.StorageGeneration, NodeID: request.Authority.NodeID,
-		RootInstanceID: request.Authority.RootInstanceID, JobID: request.Authority.JobID,
-		OperationRevision: request.Authority.OperationRevision, CleanupFence: request.Authority.CleanupFence,
-		HelperGeneration: request.Authority.HelperGeneration, AllocatedSize: request.Storage.DiskBytes,
-		ContentDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Encryption: "none",
-	}}, nil
+func (engine *fakeEngine) CreateComputerBackup(_ context.Context, _ CreateComputerBackupRequest) (CreateComputerBackupResponse, error) {
+	return engine.createBackupResponse, nil
 }
-func (*fakeEngine) DeleteComputerBackupCopy(_ context.Context, request DeleteComputerBackupCopyRequest) (DeleteComputerBackupCopyResponse, error) {
-	return DeleteComputerBackupCopyResponse{Receipt: ComputerBackupCopyRemovalReceipt{
-		Kind: "computer_backup_copy_removed", ReceiptID: "backup-removal-receipt", BackupID: request.BackupID,
-		CopyID: request.CopyID, ComputerID: request.Storage.ComputerID, StorageID: request.Storage.StorageID,
-		StorageGeneration: request.Storage.StorageGeneration, NodeID: request.Authority.NodeID,
-		RootInstanceID: request.Authority.RootInstanceID, OperationRevision: request.Authority.OperationRevision,
-		CleanupFence: request.Authority.CleanupFence, HelperGeneration: request.Authority.HelperGeneration, Absent: true,
-	}}, nil
+func (engine *fakeEngine) DeleteComputerBackupCopy(_ context.Context, _ DeleteComputerBackupCopyRequest) (DeleteComputerBackupCopyResponse, error) {
+	return engine.deleteBackupResponse, nil
 }
 func (engine *fakeEngine) Verify(context.Context, VerifyRequest) (VerifyResponse, error) {
 	engine.record("Verify")

@@ -379,10 +379,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS computer_current_projection
 CREATE TABLE IF NOT EXISTS computer_intent_history (
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
   intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
-  operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create')),
+	operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap')),
   desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
   storage_id TEXT NOT NULL,
-  storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+	storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+	backup_cap INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0),
   job_id TEXT NOT NULL REFERENCES jobs(job_id),
   spec_revision INTEGER NOT NULL CHECK(spec_revision > 0),
   actor TEXT NOT NULL,
@@ -704,6 +705,9 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	if err := s.ensureColumn(ctx, "computers", "backup_cap", "INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0)"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "computer_intent_history", "backup_cap", "INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0)"); err != nil {
+		return err
+	}
 	if err := s.migrateComputerResetConstraints(ctx); err != nil {
 		return err
 	}
@@ -756,6 +760,61 @@ func (s *Store) ensureColumn(ctx context.Context, table, column, definition stri
 	return nil
 }
 
+func sqliteTableColumns(ctx context.Context, q queryer, table string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := []string{}
+	for rows.Next() {
+		var ordinal, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&ordinal, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return nil, err
+		}
+		columns = append(columns, name)
+	}
+	return columns, rows.Err()
+}
+
+func quoteSQLiteIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
+func migratedSQLiteCreateTable(sourceSQL, targetTable string, replacements map[string]string) (string, error) {
+	open := strings.Index(sourceSQL, "(")
+	if open < 0 {
+		return "", fmt.Errorf("SQLite table definition has no column list")
+	}
+	migrated := "CREATE TABLE " + quoteSQLiteIdentifier(targetTable) + " " + sourceSQL[open:]
+	for old, replacement := range replacements {
+		if !strings.Contains(migrated, old) {
+			return "", fmt.Errorf("SQLite table definition lacks expected constraint %q", old)
+		}
+		migrated = strings.Replace(migrated, old, replacement, 1)
+	}
+	return migrated, nil
+}
+
+func copySQLiteTableColumns(ctx context.Context, tx *sql.Tx, sourceTable, targetTable string) error {
+	columns, err := sqliteTableColumns(ctx, tx, sourceTable)
+	if err != nil {
+		return err
+	}
+	if len(columns) == 0 {
+		return fmt.Errorf("SQLite table %s has no columns", sourceTable)
+	}
+	quoted := make([]string, len(columns))
+	for index, column := range columns {
+		quoted[index] = quoteSQLiteIdentifier(column)
+	}
+	columnList := strings.Join(quoted, ", ")
+	_, err = tx.ExecContext(ctx, "INSERT INTO "+quoteSQLiteIdentifier(targetTable)+" ("+columnList+") SELECT "+columnList+" FROM "+quoteSQLiteIdentifier(sourceTable))
+	return err
+}
+
 // migrateComputerResetConstraints widens the two CHECK constraints introduced
 // before Storage reset existed. CREATE TABLE IF NOT EXISTS cannot change those
 // constraints in an already durable L1 database.
@@ -773,7 +832,7 @@ func (s *Store) migrateComputerResetConstraints(ctx context.Context) error {
 		return fmt.Errorf("l1: inspect Computer intent schema: %w", err)
 	}
 	migrateComputers := !strings.Contains(computersSQL, "'backing_up'")
-	migrateIntents := !strings.Contains(intentsSQL, "'backup_create'")
+	migrateIntents := !strings.Contains(intentsSQL, "'backup_cap'")
 	if !migrateComputers && !migrateIntents {
 		return nil
 	}
@@ -787,36 +846,20 @@ func (s *Store) migrateComputerResetConstraints(ctx context.Context) error {
 	}
 	defer transaction.Rollback()
 	if migrateComputers {
-		if _, err := transaction.ExecContext(ctx, `CREATE TABLE computers_reset_migration (
-			computer_id TEXT PRIMARY KEY,
-			name TEXT NOT NULL UNIQUE,
-			placement_node_id TEXT NOT NULL,
-			bound_node_id TEXT,
-			grants_json BLOB NOT NULL,
-			storage_id TEXT NOT NULL UNIQUE,
-			storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
-			backup_cap INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0),
-			desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
-			intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
-			applied_revision INTEGER NOT NULL CHECK(applied_revision >= 0 AND applied_revision <= intent_revision),
-			current_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
-			current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
-			reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'backing_up', 'removing')),
-			reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0),
-			created_ns INTEGER NOT NULL,
-			updated_ns INTEGER NOT NULL
-		)`); err != nil {
+		oldPhaseConstraint := "'stable', 'projecting', 'resetting', 'removing'"
+		if !strings.Contains(computersSQL, oldPhaseConstraint) {
+			oldPhaseConstraint = "'stable', 'projecting', 'removing'"
+		}
+		createSQL, rewriteErr := migratedSQLiteCreateTable(computersSQL, "computers_reset_migration", map[string]string{
+			oldPhaseConstraint: "'stable', 'projecting', 'resetting', 'backing_up', 'removing'",
+		})
+		if rewriteErr != nil {
+			return fmt.Errorf("l1: rewrite widened Computer schema: %w", rewriteErr)
+		}
+		if _, err := transaction.ExecContext(ctx, createSQL); err != nil {
 			return fmt.Errorf("l1: create widened Computer schema: %w", err)
 		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO computers_reset_migration(
-			computer_id, name, placement_node_id, bound_node_id, grants_json, storage_id,
-			storage_generation, backup_cap, desired_state, intent_revision, applied_revision,
-			current_job_id, current_spec_revision, reconfiguration_phase, reconfiguration_revision,
-			created_ns, updated_ns)
-			SELECT computer_id, name, placement_node_id, bound_node_id, grants_json, storage_id,
-			storage_generation, backup_cap, desired_state, intent_revision, applied_revision,
-			current_job_id, current_spec_revision, reconfiguration_phase, reconfiguration_revision,
-			created_ns, updated_ns FROM computers`); err != nil {
+		if err := copySQLiteTableColumns(ctx, transaction, "computers", "computers_reset_migration"); err != nil {
 			return fmt.Errorf("l1: copy Computer authority during migration: %w", err)
 		}
 		if _, err := transaction.ExecContext(ctx, `DROP TABLE computers`); err != nil {
@@ -830,22 +873,23 @@ func (s *Store) migrateComputerResetConstraints(ctx context.Context) error {
 		}
 	}
 	if migrateIntents {
-		if _, err := transaction.ExecContext(ctx, `CREATE TABLE computer_intent_history_reset_migration (
-			computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
-			intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
-			operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create')),
-			desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
-			storage_id TEXT NOT NULL,
-			storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
-			job_id TEXT NOT NULL REFERENCES jobs(job_id),
-			spec_revision INTEGER NOT NULL CHECK(spec_revision > 0),
-			actor TEXT NOT NULL,
-			created_ns INTEGER NOT NULL,
-			PRIMARY KEY(computer_id, intent_revision)
-		)`); err != nil {
+		oldOperationConstraint := "'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create'"
+		if !strings.Contains(intentsSQL, oldOperationConstraint) {
+			oldOperationConstraint = "'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset'"
+		}
+		if !strings.Contains(intentsSQL, oldOperationConstraint) {
+			oldOperationConstraint = "'create', 'start', 'stop', 'restart', 'remove', 'project'"
+		}
+		createSQL, rewriteErr := migratedSQLiteCreateTable(intentsSQL, "computer_intent_history_reset_migration", map[string]string{
+			oldOperationConstraint: "'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap'",
+		})
+		if rewriteErr != nil {
+			return fmt.Errorf("l1: rewrite widened Computer intent schema: %w", rewriteErr)
+		}
+		if _, err := transaction.ExecContext(ctx, createSQL); err != nil {
 			return fmt.Errorf("l1: create widened Computer intent schema: %w", err)
 		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO computer_intent_history_reset_migration SELECT * FROM computer_intent_history`); err != nil {
+		if err := copySQLiteTableColumns(ctx, transaction, "computer_intent_history", "computer_intent_history_reset_migration"); err != nil {
 			return fmt.Errorf("l1: copy Computer intents during migration: %w", err)
 		}
 		if _, err := transaction.ExecContext(ctx, `DROP TABLE computer_intent_history`); err != nil {

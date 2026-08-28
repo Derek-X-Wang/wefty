@@ -30,6 +30,7 @@ const (
 	ComputerIntentProject      ComputerIntentOperation = "project"
 	ComputerIntentReset        ComputerIntentOperation = "reset"
 	ComputerIntentBackupCreate ComputerIntentOperation = "backup_create"
+	ComputerIntentBackupCap    ComputerIntentOperation = "backup_cap"
 )
 
 type ComputerGrantPermission string
@@ -64,6 +65,7 @@ type ComputerIntent struct {
 	DesiredState      contract.ServiceDesiredState `json:"desired_state"`
 	StorageID         string                       `json:"storage_id"`
 	StorageGeneration int64                        `json:"storage_generation"`
+	BackupCap         int64                        `json:"backup_cap"`
 	JobID             string                       `json:"job_id"`
 	SpecRevision      int64                        `json:"spec_revision"`
 	Actor             string                       `json:"actor"`
@@ -74,26 +76,27 @@ type ComputerIntent struct {
 // Runtime state remains on CurrentJob; intent and identity survive projection
 // replacement.
 type Computer struct {
-	ComputerID              string                       `json:"computer_id"`
-	Name                    string                       `json:"name"`
-	PlacementNodeID         string                       `json:"placement_node_id"`
-	BoundNodeID             string                       `json:"bound_node_id,omitempty"`
-	Grants                  []ComputerGrant              `json:"grants"`
-	StorageID               string                       `json:"storage_id"`
-	StorageGeneration       int64                        `json:"storage_generation"`
-	BackupCap               int64                        `json:"backup_cap"`
-	DesiredDiskBytes        int64                        `json:"desired_disk_bytes"`
-	DesiredState            contract.ServiceDesiredState `json:"desired_state"`
-	IntentRevision          int64                        `json:"intent_revision"`
-	AppliedRevision         int64                        `json:"applied_revision"`
-	CurrentJobID            string                       `json:"current_job_id"`
-	CurrentSpecRevision     int64                        `json:"current_spec_revision"`
-	ReconfigurationPhase    ComputerReconfigurationPhase `json:"reconfiguration_phase"`
-	ReconfigurationRevision *int64                       `json:"reconfiguration_revision,omitempty"`
-	SubmitEnabled           bool                         `json:"submit_enabled"`
-	SubmitIntentRevision    int64                        `json:"submit_intent_revision"`
-	SubmitMaxInflight       int                          `json:"submit_max_inflight"`
-	SubmitPolicyRevision    int64                        `json:"submit_policy_revision"`
+	ComputerID              string                          `json:"computer_id"`
+	Name                    string                          `json:"name"`
+	PlacementNodeID         string                          `json:"placement_node_id"`
+	BoundNodeID             string                          `json:"bound_node_id,omitempty"`
+	Grants                  []ComputerGrant                 `json:"grants"`
+	StorageID               string                          `json:"storage_id"`
+	StorageGeneration       int64                           `json:"storage_generation"`
+	BackupCap               int64                           `json:"backup_cap"`
+	LastBackupOperation     *ComputerBackupOperationOutcome `json:"last_backup_operation,omitempty"`
+	DesiredDiskBytes        int64                           `json:"desired_disk_bytes"`
+	DesiredState            contract.ServiceDesiredState    `json:"desired_state"`
+	IntentRevision          int64                           `json:"intent_revision"`
+	AppliedRevision         int64                           `json:"applied_revision"`
+	CurrentJobID            string                          `json:"current_job_id"`
+	CurrentSpecRevision     int64                           `json:"current_spec_revision"`
+	ReconfigurationPhase    ComputerReconfigurationPhase    `json:"reconfiguration_phase"`
+	ReconfigurationRevision *int64                          `json:"reconfiguration_revision,omitempty"`
+	SubmitEnabled           bool                            `json:"submit_enabled"`
+	SubmitIntentRevision    int64                           `json:"submit_intent_revision"`
+	SubmitMaxInflight       int                             `json:"submit_max_inflight"`
+	SubmitPolicyRevision    int64                           `json:"submit_policy_revision"`
 	// DisplayEndpoint remains explicitly null until an active private
 	// take-over front door has been published. It is never a placeholder URL.
 	DisplayEndpoint *string   `json:"display_endpoint"`
@@ -119,6 +122,11 @@ type ComputerMutationPrecondition struct {
 type ComputerDesiredStateRequest struct {
 	ComputerMutationPrecondition
 	DesiredState contract.ServiceDesiredState `json:"desired_state"`
+}
+
+type ComputerBackupCapRequest struct {
+	ComputerMutationPrecondition
+	BackupCap int64 `json:"backup_cap"`
 }
 
 type ComputerRemoveRequest struct {
@@ -394,9 +402,9 @@ func insertComputerIntent(
 ) error {
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_intent_history(
 		computer_id, intent_revision, operation, desired_state, storage_id,
-		storage_generation, job_id, spec_revision, actor, created_ns
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, computerID, revision, operation, desired,
-		storageID, storageGeneration, jobID, specRevision, actor, now.UnixNano()); err != nil {
+		storage_generation, backup_cap, job_id, spec_revision, actor, created_ns
+	) VALUES(?, ?, ?, ?, ?, ?, (SELECT backup_cap FROM computers WHERE computer_id=?), ?, ?, ?, ?)`, computerID, revision, operation, desired,
+		storageID, storageGeneration, computerID, jobID, specRevision, actor, now.UnixNano()); err != nil {
 		return internalError(err, "append immutable Computer intent")
 	}
 	return nil
@@ -495,6 +503,10 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	}
 	job.Status = string(job.State)
 	computer.CurrentJob = job
+	computer.LastBackupOperation, err = readLastComputerBackupOperation(ctx, q, computerID)
+	if err != nil {
+		return Computer{}, fmt.Errorf("read last Computer Backup operation: %w", err)
+	}
 	var displayEndpoint sql.NullString
 	err = q.QueryRowContext(ctx, `SELECT service_jobs.display_endpoint
 		FROM service_jobs JOIN jobs ON jobs.job_id=service_jobs.job_id
@@ -523,7 +535,7 @@ func queryComputerIntents(ctx context.Context, q queryer, computerID string, aft
 		return nil, fmt.Errorf("query source cannot list Computer intents")
 	}
 	rows, err := rowsSource.QueryContext(ctx, `SELECT intent_revision, operation, desired_state,
-		storage_id, storage_generation, job_id, spec_revision, actor, created_ns
+		storage_id, storage_generation, backup_cap, job_id, spec_revision, actor, created_ns
 		FROM computer_intent_history WHERE computer_id=? AND intent_revision>?
 		ORDER BY intent_revision LIMIT ?`, computerID, afterRevision, limit)
 	if err != nil {
@@ -535,7 +547,7 @@ func queryComputerIntents(ctx context.Context, q queryer, computerID string, aft
 		var intent ComputerIntent
 		var createdNS int64
 		if err := rows.Scan(&intent.IntentRevision, &intent.Operation, &intent.DesiredState,
-			&intent.StorageID, &intent.StorageGeneration, &intent.JobID, &intent.SpecRevision,
+			&intent.StorageID, &intent.StorageGeneration, &intent.BackupCap, &intent.JobID, &intent.SpecRevision,
 			&intent.Actor, &createdNS); err != nil {
 			return nil, err
 		}
@@ -543,6 +555,59 @@ func queryComputerIntents(ctx context.Context, q queryer, computerID string, aft
 		intents = append(intents, intent)
 	}
 	return intents, rows.Err()
+}
+
+func (s *Store) SetComputerBackupCap(ctx context.Context, computerID string, request ComputerBackupCapRequest) (Computer, error) {
+	if request.BackupCap < 0 {
+		return Computer{}, protocolError(contract.ErrorInvalidRequest, "backup_cap must be non-negative")
+	}
+	now := canonicalTime(s.clock.Now())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Computer{}, internalError(err, "begin Computer Backup cap mutation")
+	}
+	defer tx.Rollback()
+	computer, err := readComputerAuthority(ctx, tx, computerID, now)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
+	}
+	if err != nil {
+		return Computer{}, internalError(err, "read Computer Backup cap target")
+	}
+	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+		return Computer{}, err
+	}
+	if computer.DesiredState == contract.ServiceDesiredRemoved || computer.ReconfigurationPhase != ComputerReconfigurationStable {
+		return Computer{}, protocolError(contract.ErrorConflict, "Computer %q is not stable", computerID)
+	}
+	if computer.BackupCap == request.BackupCap {
+		return computer, nil
+	}
+	nextRevision := computer.IntentRevision + 1
+	result, err := tx.ExecContext(ctx, `UPDATE computers SET backup_cap=?, intent_revision=?, updated_ns=?
+		WHERE computer_id=? AND intent_revision=?`, request.BackupCap, nextRevision, now.UnixNano(), computerID, computer.IntentRevision)
+	if err != nil {
+		return Computer{}, internalError(err, "store Computer Backup cap")
+	}
+	if err := requireComputerCAS(result, computerID, computer.IntentRevision); err != nil {
+		return Computer{}, err
+	}
+	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentBackupCap,
+		computer.DesiredState, computer.StorageID, computer.StorageGeneration, computer.CurrentJobID,
+		computer.CurrentSpecRevision, request.Actor, now); err != nil {
+		return Computer{}, err
+	}
+	if err := markComputerIntentApplied(ctx, tx, computerID, nextRevision, now); err != nil {
+		return Computer{}, err
+	}
+	updated, err := readComputerAuthority(ctx, tx, computerID, now)
+	if err != nil {
+		return Computer{}, internalError(err, "read Computer Backup cap result")
+	}
+	if err := tx.Commit(); err != nil {
+		return Computer{}, internalError(err, "commit Computer Backup cap")
+	}
+	return updated, nil
 }
 
 func encodeComputerIntentCursor(revision int64) string {
@@ -685,8 +750,10 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	if err := setComputerServiceDesiredState(ctx, tx, computer.CurrentJob, request.DesiredState, now); err != nil {
 		return Computer{}, err
 	}
-	if err := markComputerIntentApplied(ctx, tx, computerID, nextRevision, now); err != nil {
-		return Computer{}, err
+	if !backupStopWins {
+		if err := markComputerIntentApplied(ctx, tx, computerID, nextRevision, now); err != nil {
+			return Computer{}, err
+		}
 	}
 	updated, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {

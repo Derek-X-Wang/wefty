@@ -703,6 +703,39 @@
         }
       }
     },
+    "/v1/computers/{computer_id}/backup-cap": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "put": {
+        "operationId": "setComputerBackupCap",
+        "summary": "Set the finite retained Backup cap under Computer intent and Storage CAS",
+        "description": "The cap is revisioned Computer intent. Zero disables new Backup creation; capacity pressure never auto-deletes an existing Backup.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["intent_revision", "storage_id", "storage_generation", "backup_cap"],
+            "properties": {
+              "intent_revision": { "type": "integer", "minimum": 1 },
+              "storage_id": { "type": "string", "minLength": 1 },
+              "storage_generation": { "type": "integer", "minimum": 1 },
+              "backup_cap": { "type": "integer", "format": "int64", "minimum": 0 }
+            }
+          } } }
+        },
+        "responses": {
+          "200": { "description": "Backup cap intent accepted and applied.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/computers/{computer_id}/restart": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }

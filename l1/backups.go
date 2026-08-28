@@ -60,7 +60,23 @@ type BackupCopy struct {
 }
 
 type BackupList struct {
-	Backups []Backup `json:"backups"`
+	Backups       []Backup                        `json:"backups"`
+	LastOperation *ComputerBackupOperationOutcome `json:"last_operation,omitempty"`
+}
+
+type ComputerBackupFailureCode string
+
+const (
+	ComputerBackupFailureInsufficientDisk ComputerBackupFailureCode = "insufficient_disk"
+	ComputerBackupFailureDigestMismatch   ComputerBackupFailureCode = "digest_mismatch"
+)
+
+type ComputerBackupOperationOutcome struct {
+	OperationRevision int64                     `json:"operation_revision"`
+	BackupID          string                    `json:"backup_id"`
+	Status            string                    `json:"status"`
+	FailureCode       ComputerBackupFailureCode `json:"failure_code,omitempty"`
+	CompletedAt       *time.Time                `json:"completed_at,omitempty"`
 }
 
 type ComputerBackupCreateRequest struct {
@@ -113,6 +129,7 @@ type ComputerBackupPruneDirective struct {
 	RootInstanceID    string `json:"root_instance_id"`
 	OperationRevision int64  `json:"operation_revision"`
 	CleanupFence      string `json:"cleanup_fence"`
+	Superseded        bool   `json:"superseded"`
 }
 
 type ComputerBackupCopyRemovalReceipt = contract.ComputerBackupCopyRemovalReceipt
@@ -297,6 +314,26 @@ func validateBackupNodeSession(ctx context.Context, q queryer, identityNodeID, n
 	return nil
 }
 
+func validateBackupAcknowledgementAuthority(ctx context.Context, q queryer, identityNodeID, requestNodeID, boundNodeID, plannedRootInstanceID string) error {
+	var storedIdentity, currentRootInstanceID string
+	if requestNodeID != boundNodeID {
+		return protocolError(contract.ErrorAttemptNotOwned, "authenticated node does not own this Computer Backup operation")
+	}
+	if err := q.QueryRowContext(ctx, `SELECT identity_node_id, root_instance_id FROM nodes WHERE node_id=?`, boundNodeID).Scan(&storedIdentity, &currentRootInstanceID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return protocolError(contract.ErrorNodeNotRegistered, "node %q is not registered", boundNodeID)
+		}
+		return internalError(err, "read current Computer Backup managed-root authority")
+	}
+	if storedIdentity != identityNodeID {
+		return protocolError(contract.ErrorAttemptNotOwned, "authenticated node does not own this Computer Backup operation")
+	}
+	if currentRootInstanceID == "" || currentRootInstanceID != plannedRootInstanceID {
+		return protocolError(contract.ErrorConflict, "Computer Backup managed-root authority was replaced")
+	}
+	return nil
+}
+
 func (s *Store) ListNodeComputerBackupDirectives(ctx context.Context, identityNodeID, nodeID, bootSessionID string) ([]ComputerBackupDirective, error) {
 	if err := validateBackupNodeSession(ctx, s.db, identityNodeID, nodeID, bootSessionID); err != nil {
 		return nil, err
@@ -391,6 +428,9 @@ func (s *Store) AcknowledgeComputerBackup(ctx context.Context, identityNodeID, c
 	if err := validateBackupReceipt(row, request.Receipt); err != nil {
 		return Backup{}, Computer{}, err
 	}
+	if err := validateBackupAcknowledgementAuthority(ctx, tx, identityNodeID, request.NodeID, row.BoundNodeID, row.RootInstanceID); err != nil {
+		return Backup{}, Computer{}, err
+	}
 	if row.AcknowledgementKey.Valid {
 		if row.AcknowledgementKey.String != request.IdempotencyKey || !row.AcknowledgementHash.Valid || row.AcknowledgementHash.String != bodyHash {
 			return Backup{}, Computer{}, protocolError(contract.ErrorConflict, "Computer Backup acknowledgement replay differs from the accepted receipt")
@@ -459,15 +499,20 @@ func (s *Store) AcknowledgeComputerBackup(ctx context.Context, identityNodeID, c
 		*computer.ReconfigurationRevision != row.OperationRevision {
 		return Backup{}, Computer{}, protocolError(contract.ErrorConflict, "Computer Backup operation was superseded")
 	}
-	if computer.IntentRevision == row.OperationRevision && computer.DesiredState == contract.ServiceDesiredRunning && row.ResumeDesiredRunning {
+	if computer.IntentRevision == row.OperationRevision && computer.DesiredState == contract.ServiceDesiredRunning &&
+		row.ResumeDesiredRunning && computer.CurrentJob.State != contract.JobFailed {
 		if err := setComputerServiceDesiredState(ctx, tx, computer.CurrentJob, contract.ServiceDesiredRunning, now); err != nil {
 			return Backup{}, Computer{}, err
 		}
 	}
+	appliedRevision := row.OperationRevision
+	if computer.DesiredState == contract.ServiceDesiredStopped && computer.IntentRevision > appliedRevision {
+		appliedRevision = computer.IntentRevision
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE computers SET reconfiguration_phase='stable',
 		reconfiguration_revision=NULL, applied_revision=CASE WHEN applied_revision<? THEN ? ELSE applied_revision END,
 		updated_ns=? WHERE computer_id=? AND reconfiguration_phase='backing_up' AND reconfiguration_revision=?`,
-		row.OperationRevision, row.OperationRevision, now.UnixNano(), computerID, row.OperationRevision); err != nil {
+		appliedRevision, appliedRevision, now.UnixNano(), computerID, row.OperationRevision); err != nil {
 		return Backup{}, Computer{}, internalError(err, "release Computer Backup intent")
 	}
 	computer, err = readComputerAuthority(ctx, tx, computerID, now)
@@ -478,6 +523,25 @@ func (s *Store) AcknowledgeComputerBackup(ctx context.Context, identityNodeID, c
 		return Backup{}, Computer{}, internalError(err, "commit Computer Backup acknowledgement")
 	}
 	return backup, computer, nil
+}
+
+func readLastComputerBackupOperation(ctx context.Context, q queryer, computerID string) (*ComputerBackupOperationOutcome, error) {
+	var outcome ComputerBackupOperationOutcome
+	var completedNS sql.NullInt64
+	err := q.QueryRowContext(ctx, `SELECT operation_revision, backup_id, status, failure_code, completed_ns
+		FROM computer_backup_operations WHERE computer_id=? ORDER BY operation_revision DESC LIMIT 1`, computerID).Scan(
+		&outcome.OperationRevision, &outcome.BackupID, &outcome.Status, &outcome.FailureCode, &completedNS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if completedNS.Valid {
+		value := time.Unix(0, completedNS.Int64).UTC()
+		outcome.CompletedAt = &value
+	}
+	return &outcome, nil
 }
 
 func readBackup(ctx context.Context, q queryer, backupID string) (Backup, error) {
@@ -566,6 +630,10 @@ func (s *Store) ListComputerBackups(ctx context.Context, computerID string) (Bac
 		}
 		list.Backups = append(list.Backups, backup)
 	}
+	list.LastOperation, err = readLastComputerBackupOperation(ctx, s.db, computerID)
+	if err != nil {
+		return BackupList{}, internalError(err, "read last Computer Backup operation")
+	}
 	return list, nil
 }
 
@@ -590,8 +658,11 @@ func (s *Store) BeginComputerBackupPrune(ctx context.Context, computerID string,
 	}
 	defer tx.Rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Backup{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
+	}
 	if err != nil {
-		return Backup{}, false, err
+		return Backup{}, false, internalError(err, "read Computer Backup prune target")
 	}
 	var storedHash string
 	if err := tx.QueryRowContext(ctx, `SELECT request_hash FROM computer_backup_prunes WHERE computer_id=? AND idempotency_key=?`, computerID, request.IdempotencyKey).Scan(&storedHash); err == nil {
@@ -725,6 +796,9 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 		if err != nil {
 			return Backup{}, internalError(err, "read superseded Computer Backup copy removal")
 		}
+		if err := validateBackupAcknowledgementAuthority(ctx, tx, identityNodeID, request.NodeID, operation.BoundNodeID, operation.RootInstanceID); err != nil {
+			return Backup{}, err
+		}
 		r := request.Receipt
 		if operation.Status != "superseded" || r.BackupID != operation.BackupID || r.CopyID != operation.CopyID ||
 			r.ComputerID != operation.ComputerID || r.StorageID != operation.StorageID ||
@@ -758,6 +832,9 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 	}
 	if err != nil {
 		return Backup{}, internalError(err, "read Computer Backup prune acknowledgement")
+	}
+	if err := validateBackupAcknowledgementAuthority(ctx, tx, identityNodeID, request.NodeID, stored.BoundNodeID, stored.RootInstanceID); err != nil {
+		return Backup{}, err
 	}
 	r := request.Receipt
 	if r.BackupID != stored.BackupID || r.ComputerID != stored.ComputerID || r.StorageID != stored.StorageID ||

@@ -1751,6 +1751,7 @@ func (adapter *Adapter) DeleteComputerBackupCopy(ctx context.Context, request wo
 		Authority: ocihelper.ComputerBackupAuthority{NodeID: request.NodeID, BootSessionID: request.BootSessionID,
 			HelperGeneration: handshake.SessionGeneration, RootInstanceID: request.RootInstanceID,
 			OperationRevision: request.OperationRevision, CleanupFence: request.CleanupFence},
+		Superseded: request.Superseded,
 	})
 	if err != nil {
 		return workloadrunner.ComputerBackupCopyRemovalReceipt{}, err
