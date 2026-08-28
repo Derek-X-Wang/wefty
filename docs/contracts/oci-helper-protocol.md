@@ -369,18 +369,27 @@ fixture version. A containerd patch change therefore fails until the baseline,
 architecture-specific seccomp profile, and complete serialized specs are
 regenerated and reviewed together.
 
-Profile-construction rejection crosses helper RPC as `oci_spec_rejected` and
-maps to the existing agent `SpawnFailureOCISpecRejected`; it is never collapsed
-into the ambiguous `engine_failure` bucket.
+Profile-construction rejection and a service-data directory/owner-record
+conflict cross helper RPC as `oci_spec_rejected` and map to the existing agent
+`SpawnFailureOCISpecRejected`; neither is collapsed into the ambiguous
+`engine_failure` bucket. The latter diagnostic includes the observed and
+wanted primary owners so an always-restart service latches with an actionable
+reason instead of retrying an unsafe ownership transition forever.
 
 ## Deterministic identities and serialization
 
 The helper hashes the complete attempt authority tuple with SHA-256 and uses
 the first 128 bits to derive deterministic names for the lease, snapshot,
 container, task, shim, cgroup, and log-segment directory. It separately hashes
-the stable service job ID to derive its service-data volume and the opaque
-stable handoff-owner key to derive the handoff volume directory, so neither
-durable identity can be replaced by an attempt identity. Every label-capable attempt resource carries the
+the stable service job ID to derive its service-data volume and its paired
+owner-record name, and the opaque stable handoff-owner key to derive the
+handoff volume directory, so no durable identity can be replaced by an attempt
+identity. The service-data directory lives under
+`<runtime-root>/service-data/<service-volume-directory>` and its record lives
+under `<runtime-root>/service-data-state/<service-volume-owner-record>`; both
+names are explicit `ResourceIdentity` fields so removal manifests and
+inventory verification can name them independently. Every label-capable
+attempt resource carries the
 unabridged labels:
 
 ```text
@@ -404,13 +413,22 @@ calls it after accepted successful completion; future removal work may call the
 same closed operation but gains no general path deletion authority.
 
 Service-data volumes live under their own helper-owned guest-native durable
-root, outside the attempt inventory swept during boot takeover. Before the
-first mount, the helper resolves the image `USER` against the pinned rootfs,
-sets the new directory's primary UID:GID, and durably records that
-initialization. Later attempts require the same recorded owner and never
-re-chown existing data. Attempt `Delete`, session reap, and boot sweep preserve
-the directory; the separate removal-manifest contract owns its eventual
-deletion.
+root, outside the attempt inventory swept during boot takeover. They and their
+owner records remain visible as separate inventory classes so explicit job
+removal can positively verify both absent; attempt verification reports them
+even though attempt deletion treats them as allowed job-lifetime residue.
+Namespace boot-sweep verification projects them out. Before the first mount, the helper
+resolves the image `USER` once while building the runtime spec, sets the new
+directory's primary UID:GID through its no-follow directory descriptor, and
+atomically publishes and fsyncs an owner record containing the directory
+device/inode and owner. The directory's descriptor-observed UID:GID is
+authority; the record is evidence, not truth. A fresh directory is initialized
+even when an orphan record exists, a matching existing directory with a
+missing record is recorded without re-ownership, and a record/directory
+identity disagreement fails closed. Later attempts require the same owner and
+never re-chown existing data. Attempt `Delete`, session reap, and boot sweep
+preserve the directory; the separate removal-manifest contract owns its
+eventual deletion.
 
 The native Linux engine uses containerd namespace `wefty`, runtime handler
 `io.containerd.runc.v2`, and snapshotter `overlayfs`. It creates the labelled

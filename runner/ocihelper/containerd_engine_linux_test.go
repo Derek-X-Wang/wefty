@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -27,6 +28,7 @@ import (
 	"github.com/containerd/platforms"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sys/unix"
 )
 
 func TestSegmentTailerMarksTruncatedFinalFrameIncomplete(t *testing.T) {
@@ -374,7 +376,7 @@ func TestOwnerKeyedHandoffBytesSurviveAttemptsUntilExplicitFinalization(t *testi
 		Resources: ResourceIdentity{HandoffVolumeDirectory: name},
 		Workload:  WorkloadInput{ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "run-owner"}}},
 	}
-	first, err := engine.managedVolumeSourcesForImage(t.Context(), request, "", ImageRuntimeConfig{})
+	first, _, err := engine.managedVolumeSources(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +384,7 @@ func TestOwnerKeyedHandoffBytesSurviveAttemptsUntilExplicitFinalization(t *testi
 	if err := os.WriteFile(marker, []byte("handoff bytes\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	second, err := engine.managedVolumeSourcesForImage(t.Context(), request, "", ImageRuntimeConfig{})
+	second, _, err := engine.managedVolumeSources(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,8 +412,15 @@ func TestServiceDataVolumeInitializesOwnerOnlyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, "service-data", resources.ServiceVolumeDirectory)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
-	if err := engine.initializeServiceVolume(path, uid, gid); err != nil {
+	fresh, err := serviceVolumeCreationAt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, fresh, uid, gid); err != nil {
 		t.Fatal(err)
 	}
 	var stat syscall.Stat_t
@@ -422,14 +431,199 @@ func TestServiceDataVolumeInitializesOwnerOnlyOnce(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("service bytes\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.initializeServiceVolume(path, uid, gid); err != nil {
+	if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, nil, uid, gid); err != nil {
 		t.Fatal(err)
 	}
 	if payload, err := os.ReadFile(marker); err != nil || string(payload) != "service bytes\n" {
 		t.Fatalf("service data after repeated initialization = %q err=%v", payload, err)
 	}
-	if err := engine.initializeServiceVolume(path, uid+1, gid); err == nil {
+	if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, nil, uid+1, gid); err == nil {
 		t.Fatal("service data volume was re-owned for a different image identity")
+	}
+}
+
+func TestServiceDataOwnerRecordRecoveryRows(t *testing.T) {
+	for _, row := range []struct {
+		name                                                                             string
+		fresh, recordPresent, recordIdentity, recordOwner, actualOwner, empty, rootOwned bool
+		wantChown, wantWrite                                                             bool
+	}{
+		{name: "orphan-marker", fresh: true, recordPresent: true, actualOwner: false, empty: true, rootOwned: true, wantChown: true, wantWrite: true},
+		{name: "missing-marker-with-data", recordPresent: false, actualOwner: true, empty: false, wantWrite: true},
+		{name: "crash-between-mkdir-and-marker", recordPresent: false, actualOwner: false, empty: true, rootOwned: true, wantChown: true, wantWrite: true},
+	} {
+		t.Run("decision-"+row.name, func(t *testing.T) {
+			decision := decideServiceVolumeInitialization(row.fresh, row.recordPresent, row.recordIdentity, row.recordOwner, row.actualOwner, row.empty, row.rootOwned)
+			if decision.rejection != "" || decision.chown != row.wantChown || decision.writeRecord != row.wantWrite {
+				t.Fatalf("decision = %+v, want chown=%t write=%t", decision, row.wantChown, row.wantWrite)
+			}
+		})
+	}
+
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	initializeFresh := func(t *testing.T, engine *ContainerdEngine, path, recordName string) error {
+		t.Helper()
+		fresh, err := serviceVolumeCreationAt(path)
+		if err != nil {
+			return err
+		}
+		return engine.initializeServiceVolume(path, recordName, fresh, uid, gid)
+	}
+	newFixture := func(t *testing.T, jobID string) (*ContainerdEngine, ResourceIdentity, string, string) {
+		t.Helper()
+		root := t.TempDir()
+		engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}}
+		resources, err := DeterministicResourceIdentity(AttemptAuthority{
+			NodeID: "node", BootSessionID: "boot", JobID: jobID, AttemptID: "attempt-1",
+			FencingToken: "fence-1", Class: contract.JobClassService, RemovalGeneration: "attempt",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(root, "service-data", resources.ServiceVolumeDirectory)
+		record := filepath.Join(root, "service-data-state", resources.ServiceVolumeOwnerRecord)
+		return engine, resources, path, record
+	}
+
+	t.Run("orphan-marker", func(t *testing.T) {
+		engine, resources, path, record := newFixture(t, "orphan-marker")
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := initializeFresh(t, engine, path, resources.ServiceVolumeOwnerRecord); err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.ReadFile(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := initializeFresh(t, engine, path, resources.ServiceVolumeOwnerRecord); err != nil {
+			t.Fatalf("fresh directory was rejected by orphan record: %v", err)
+		}
+		after, err := os.ReadFile(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Equal(before, after) {
+			t.Fatal("orphan owner record was not rebound to the fresh directory identity")
+		}
+	})
+
+	t.Run("missing-marker-with-data", func(t *testing.T) {
+		engine, resources, path, record := newFixture(t, "missing-marker-with-data")
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := initializeFresh(t, engine, path, resources.ServiceVolumeOwnerRecord); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "data"), []byte("retained\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(record); err != nil {
+			t.Fatal(err)
+		}
+		var before unix.Stat_t
+		if err := unix.Stat(path, &before); err != nil {
+			t.Fatal(err)
+		}
+		if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, nil, uid, gid); err != nil {
+			t.Fatalf("matching directory without record was rejected: %v", err)
+		}
+		var after unix.Stat_t
+		if err := unix.Stat(path, &after); err != nil {
+			t.Fatal(err)
+		}
+		if before.Ctim != after.Ctim {
+			t.Fatal("matching data directory was re-chowned while reconstructing its record")
+		}
+		if _, err := os.Stat(record); err != nil {
+			t.Fatalf("owner record was not reconstructed: %v", err)
+		}
+	})
+
+	t.Run("crash-between-mkdir-and-marker", func(t *testing.T) {
+		engine, resources, path, record := newFixture(t, "mkdir-marker-crash")
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, nil, uid, gid); err != nil {
+			t.Fatalf("interrupted empty directory initialization was not recovered: %v", err)
+		}
+		if _, err := os.Stat(record); err != nil {
+			t.Fatalf("owner record was not durably completed: %v", err)
+		}
+	})
+
+	t.Run("owner-mismatch-is-typed", func(t *testing.T) {
+		engine, resources, path, _ := newFixture(t, "owner-mismatch")
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "data"), []byte("retained\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, nil, uid+1, gid)
+		var rejection *ServiceDataRejectionError
+		if !errors.As(err, &rejection) || rejection.ActualUID != uid || rejection.WantedUID != uid+1 {
+			t.Fatalf("owner mismatch = %#v, want typed actual/wanted rejection", err)
+		}
+	})
+
+	t.Run("fresh-directory-swap", func(t *testing.T) {
+		engine, resources, path, _ := newFixture(t, "fresh-directory-swap")
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		fresh, err := serviceVolumeCreationAt(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(path, path+"-replaced"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		err = engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, fresh, uid, gid)
+		var rejection *ServiceDataRejectionError
+		if !errors.As(err, &rejection) || !strings.Contains(rejection.Reason, "identity changed") {
+			t.Fatalf("fresh directory swap = %v, want typed identity rejection", err)
+		}
+	})
+}
+
+func TestServiceDataDirectoryAndOwnerRecordAreInventorySubjects(t *testing.T) {
+	root := t.TempDir()
+	resources, err := DeterministicResourceIdentity(AttemptAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "inventory-service", AttemptID: "attempt-1",
+		FencingToken: "fence-1", Class: contract.JobClassService, RemovalGeneration: "attempt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "service-data", resources.ServiceVolumeDirectory), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "service-data-state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "service-data-state", resources.ServiceVolumeOwnerRecord), []byte("record\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inventory := ResourceInventory{ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}}
+	if err := inventoryManagedVolumeResources(root, &inventory); err != nil {
+		t.Fatal(err)
+	}
+	filtered := filterInventory(inventory, resources)
+	if !slices.Equal(filtered.ManagedVolumes, []string{resources.ServiceVolumeDirectory}) || !slices.Equal(filtered.ManagedVolumeRecords, []string{resources.ServiceVolumeOwnerRecord}) {
+		t.Fatalf("service data inventory = %+v, want directory and owner record", filtered)
 	}
 }
 

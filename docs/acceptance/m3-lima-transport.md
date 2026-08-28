@@ -163,7 +163,9 @@ the helper instance/session generation before each row.
    begin with exactly that UID:GID and accept a payload write. For one stable
    service job, record attempt counters `0,1,2` across crash restart and
    stop→start while a marker outside `/wefty/service` is absent at the start of
-   every fresh attempt. The helper-owned backing path must resolve inside the
+   every fresh attempt. Start a second service job on the same pinned digest;
+   require its service data to be empty while the original job remains
+   digest-pinned and retains its own counter. The helper-owned backing path must resolve inside the
    Linux guest's native filesystem, remain absent from the Lima host mounts,
    and never traverse virtiofs. Record these facts in the
    `service_data_guest_native` row.

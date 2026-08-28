@@ -21,6 +21,7 @@ var testImagePlatform = OCIPlatform{OS: "linux", Architecture: "amd64"}
 
 func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	authority := testAuthority()
+	authority.Class = contract.JobClassService
 	first, err := DeterministicResourceIdentity(authority)
 	if err != nil {
 		t.Fatal(err)
@@ -32,7 +33,7 @@ func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	if first.LeaseID != second.LeaseID || first.ContainerID != second.ContainerID || first.TaskID != second.TaskID ||
 		first.SnapshotID != second.SnapshotID || first.ShimID != second.ShimID || first.CgroupID != second.CgroupID ||
 		first.LogSegmentDirectory != second.LogSegmentDirectory || first.HandoffVolumeDirectory != second.HandoffVolumeDirectory ||
-		first.ServiceVolumeDirectory != second.ServiceVolumeDirectory {
+		first.ServiceVolumeDirectory != second.ServiceVolumeDirectory || first.ServiceVolumeOwnerRecord != second.ServiceVolumeOwnerRecord {
 		t.Fatalf("deterministic identity changed: first=%+v second=%+v", first, second)
 	}
 	if len(first.Labels) != 7 || first.Labels["io.wefty/fencing_token"] != authority.FencingToken || first.Labels["io.wefty/removal_generation"] != authority.RemovalGeneration {
@@ -47,7 +48,7 @@ func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	if different.LeaseID == first.LeaseID {
 		t.Fatal("a new fence reused the prior deterministic identity")
 	}
-	if different.ServiceVolumeDirectory != first.ServiceVolumeDirectory {
+	if different.ServiceVolumeDirectory != first.ServiceVolumeDirectory || different.ServiceVolumeOwnerRecord != first.ServiceVolumeOwnerRecord {
 		t.Fatal("a new attempt changed the stable job-owned service volume identity")
 	}
 	changed.JobID = "job-2"
@@ -57,6 +58,22 @@ func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	}
 	if differentJob.ServiceVolumeDirectory == first.ServiceVolumeDirectory || strings.Contains(first.ServiceVolumeDirectory, authority.JobID) {
 		t.Fatal("service volume identity is not stable, opaque, and job-scoped")
+	}
+}
+
+func TestProcessAttemptIdentityDoesNotRequireServiceVolumeJobID(t *testing.T) {
+	authority := testAuthority()
+	authority.JobID = strings.Repeat("x", 256)
+	identity, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatalf("process attempt identity inherited service volume validation: %v", err)
+	}
+	if identity.ServiceVolumeDirectory != "" || identity.ServiceVolumeOwnerRecord != "" {
+		t.Fatalf("process attempt received service identities: %+v", identity)
+	}
+	authority.Class = contract.JobClassService
+	if _, err := DeterministicResourceIdentity(authority); err == nil {
+		t.Fatal("service identity accepted an overlong stable job ID")
 	}
 }
 
@@ -447,6 +464,28 @@ func TestRuntimeSpecRejectionSurvivesHelperAndAgentMapping(t *testing.T) {
 	assertRPCCode(t, err, CodeOCISpecRejected)
 	failure := SpawnFailureForRunError(err)
 	if failure == nil || failure.Code != contract.SpawnFailureOCISpecRejected {
+		t.Fatalf("agent spawn failure = %#v", failure)
+	}
+}
+
+func TestServiceDataOwnerRejectionSurvivesHelperAndAgentMapping(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runErr = &ServiceDataRejectionError{Reason: "directory owner mismatch", ActualUID: 12001, ActualGID: 12002, WantedUID: 13001, WantedGID: 13002}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	_, err = session.Run(t.Context(), testRunRequest(testAuthority(), time.Second))
+	assertRPCCode(t, err, CodeOCISpecRejected)
+	if !strings.Contains(err.Error(), "actual owner 12001:12002, wanted 13001:13002") {
+		t.Fatalf("service data rejection lost owner diagnostic: %v", err)
+	}
+	failure := SpawnFailureForRunError(err)
+	if failure == nil || failure.Code != contract.SpawnFailureOCISpecRejected || !strings.Contains(failure.Message, "wanted 13001:13002") {
 		t.Fatalf("agent spawn failure = %#v", failure)
 	}
 }

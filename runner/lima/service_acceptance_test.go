@@ -56,7 +56,7 @@ type attendedResult struct {
 	ServiceOwners        []string            `json:"service_owners,omitempty"`
 	ServiceAttemptCounts []int               `json:"service_attempt_counts,omitempty"`
 	GuestNativeData      bool                `json:"guest_native_data,omitempty"`
-	VirtioFSData         bool                `json:"virtiofs_data,omitempty"`
+	VirtioFSData         *bool               `json:"virtiofs_data,omitempty"`
 	RootfsDiscarded      bool                `json:"rootfs_discarded,omitempty"`
 }
 
@@ -273,7 +273,7 @@ func TestServiceAcceptanceAttendedLimaArtifact(t *testing.T) {
 			t.Fatalf("service data receipt omitted initialized owner %s: %+v", owner, serviceData)
 		}
 	}
-	if !slices.Equal(serviceData.ServiceAttemptCounts, []int{0, 1, 2}) || !serviceData.GuestNativeData || serviceData.VirtioFSData || !serviceData.RootfsDiscarded {
+	if !slices.Equal(serviceData.ServiceAttemptCounts, []int{0, 1, 2}) || !serviceData.GuestNativeData || serviceData.VirtioFSData == nil || *serviceData.VirtioFSData || !serviceData.RootfsDiscarded {
 		t.Fatalf("service data receipt lacks restart/stop-start persistence and fresh-rootfs proof: %+v", serviceData)
 	}
 	launch := artifact.Rows["launch_daemon"]

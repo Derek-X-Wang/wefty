@@ -1157,7 +1157,7 @@ func adapterTestImageEvidence(digest string) ocihelper.ImageEvidence {
 }
 
 func emptyAdapterInventory() ocihelper.ResourceInventory {
-	return ocihelper.ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}}
+	return ocihelper.ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}}
 }
 
 func intPointer(value int) *int { return &value }
