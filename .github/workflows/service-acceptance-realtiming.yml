@@ -4,7 +4,9 @@ name: service-acceptance-realtiming
 # It is intentionally absent from contract-gate's all-tests-pass aggregation.
 on:
   workflow_dispatch:
-  push:
+  workflow_run:
+    workflows: [acceptance-image]
+    types: [completed]
     branches: [main]
   schedule:
     - cron: "47 7 * * 1"
@@ -19,13 +21,19 @@ concurrency:
 jobs:
   service-acceptance-realtiming:
     name: service-acceptance-realtiming / ${{ matrix.os }}
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -35,9 +43,8 @@ jobs:
         env:
           CONTAINERD_VERSION: 2.3.4
           RUNC_VERSION: 1.5.1
-          PROBE_REFERENCE: docker.io/library/busybox@sha256:1487d0af5f52b4ba31c7e465126ee2123fe3f2305d638e7827681e7cf6c83d5e
-          PROBE_DIGEST: sha256:1487d0af5f52b4ba31c7e465126ee2123fe3f2305d638e7827681e7cf6c83d5e
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes e2fsprogs util-linux
           sudo modprobe loop
@@ -73,40 +80,42 @@ jobs:
           done
           sudo /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock version
           sudo chmod 0600 /run/wefty-containerd/containerd.sock
-          sudo /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock --namespace wefty images pull --platform linux/amd64 "$PROBE_REFERENCE"
-          sudo /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock --namespace wefty images export --platform linux/amd64 /tmp/wefty-probe.oci.tar "$PROBE_REFERENCE"
-          sudo chmod 0644 /tmp/wefty-probe.oci.tar
-          PROBE_NAME="${PROBE_REFERENCE%@*}"
+          go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
+          CRANE="$(go env GOPATH)/bin/crane"
+          ECHO_REFERENCE="$IMAGE_NAME:$CANDIDATE_SHA"
+          ECHO_DIGEST="$("$CRANE" digest "$ECHO_REFERENCE")"
+          "$CRANE" pull "$ECHO_REFERENCE" /tmp/wefty-echo.oci --format=oci --annotate-ref
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C /tmp/wefty-echo.oci -cf /tmp/wefty-echo.oci.tar .
+          scripts/verify-acceptance-image.sh \
+            --archive /tmp/wefty-echo.oci.tar \
+            --expected-top-digest "$ECHO_DIGEST" \
+            --expected-platform linux/amd64 \
+            --expected-platform linux/arm64 \
+            --receipt-output /tmp/wefty-acceptance-image.json
+          chmod 0644 /tmp/wefty-echo.oci.tar
+          PROBE_REFERENCE="$ECHO_REFERENCE"
+          PROBE_DIGEST="$ECHO_DIGEST"
           go build -o /tmp/wefty-agent-oci-realtiming ./cmd/wefty-agent
-          CGO_ENABLED=0 go build -o /tmp/wefty-echo-service-realtiming ./cmd/wefty-echo-service
-          ECHO_REFERENCE="wefty.local/echo-realtiming:${GITHUB_SHA}"
-          install --directory --mode=0755 /tmp/wefty-echo-image
-          install --mode=0755 /tmp/wefty-echo-service-realtiming /tmp/wefty-echo-image/wefty-echo-service
-          printf '%s\n' \
-            "FROM ${PROBE_REFERENCE}" \
-            'COPY wefty-echo-service /usr/local/bin/wefty-echo-service' \
-            'ENTRYPOINT ["/usr/local/bin/wefty-echo-service"]' \
-            > /tmp/wefty-echo-image/Dockerfile
+          go build -o /tmp/wefty-realtiming ./cmd/wefty
           docker buildx create --name wefty-realtiming --driver docker-container --use
           docker buildx inspect --bootstrap
-          docker buildx build --platform linux/amd64 --tag "$ECHO_REFERENCE" \
-            --output type=oci,dest=/tmp/wefty-echo.oci.tar /tmp/wefty-echo-image
-          chmod 0644 /tmp/wefty-echo.oci.tar
-          NUMERIC_REFERENCE="wefty.local/service-data-numeric:${GITHUB_SHA}"
-          NAMED_REFERENCE="wefty.local/service-data-named:${GITHUB_SHA}"
-          cp -R /tmp/wefty-echo-image /tmp/wefty-service-data-numeric
-          printf '%s\n' 'USER 13001:13002' >> /tmp/wefty-service-data-numeric/Dockerfile
+          NUMERIC_REFERENCE="wefty.local/service-data-numeric:${CANDIDATE_SHA}"
+          NAMED_REFERENCE="wefty.local/service-data-named:${CANDIDATE_SHA}"
+          install --directory --mode=0755 /tmp/wefty-service-data-numeric /tmp/wefty-service-data-named
+          printf '%s\n' "FROM $ECHO_REFERENCE@$ECHO_DIGEST" 'USER 13001:13002' > /tmp/wefty-service-data-numeric/Dockerfile
           docker buildx build --platform linux/amd64 --tag "$NUMERIC_REFERENCE" \
             --output type=oci,dest=/tmp/wefty-service-data-numeric.oci.tar /tmp/wefty-service-data-numeric
-          cp -R /tmp/wefty-echo-image /tmp/wefty-service-data-named
-          sed -i '/ENTRYPOINT/i RUN printf "wefty:x:12001:12002:wefty:/nonexistent:/bin/sh\\n" >> /etc/passwd && printf "wefty:x:12002:\\n" >> /etc/group' /tmp/wefty-service-data-named/Dockerfile
-          printf '%s\n' 'USER wefty:wefty' >> /tmp/wefty-service-data-named/Dockerfile
+          printf '%s\n' \
+            "FROM $ECHO_REFERENCE@$ECHO_DIGEST" \
+            'RUN printf "wefty:x:12001:12002:wefty:/nonexistent:/bin/sh\n" >> /etc/passwd && printf "wefty:x:12002:\n" >> /etc/group' \
+            'USER wefty:wefty' \
+            > /tmp/wefty-service-data-named/Dockerfile
           docker buildx build --platform linux/amd64 --tag "$NAMED_REFERENCE" \
             --output type=oci,dest=/tmp/wefty-service-data-named.oci.tar /tmp/wefty-service-data-named
           chmod 0644 /tmp/wefty-service-data-numeric.oci.tar /tmp/wefty-service-data-named.oci.tar
           sudo install --owner=root --group=root --mode=0755 /tmp/wefty-agent-oci-realtiming /usr/local/libexec/wefty-agent-oci-realtiming
           HELPER_CHECKSUM="sha256:$(sha256sum /tmp/wefty-agent-oci-realtiming | cut -d' ' -f1)"
-          scripts/build-oci-install-manifest.sh --helper /tmp/wefty-agent-oci-realtiming --probe-reference "$PROBE_REFERENCE" --probe-digest "$PROBE_DIGEST" --probe-archive /tmp/wefty-probe.oci.tar --output /tmp/wefty-release/share/wefty/oci/manifest.json
+          scripts/build-oci-install-manifest.sh --helper /tmp/wefty-agent-oci-realtiming --probe-reference "$PROBE_REFERENCE" --probe-digest "$PROBE_DIGEST" --probe-archive /tmp/wefty-echo.oci.tar --output /tmp/wefty-release/share/wefty/oci/manifest.json
           AGENT_UID="$(id -u)"
           AGENT_GROUP="$(id -gn)"
           sudo install --directory --owner=root --group="$AGENT_GROUP" --mode=0750 /run/wefty-oci-helper
@@ -210,17 +219,20 @@ jobs:
             /usr/local/sbin/runc --version
             grep -w overlay /proc/filesystems
             sudo stat --format='raw_socket_mode=%a raw_socket_owner=%U:%G' /run/wefty-containerd/containerd.sock
-            printf 'probe_reference=%s\nprobe_digest=%s\n' "$PROBE_NAME" "$PROBE_DIGEST"
+            printf 'acceptance_reference=%s\nacceptance_index_digest=%s\n' "$PROBE_REFERENCE" "$PROBE_DIGEST"
+            cat /tmp/wefty-acceptance-image.json
           } > /tmp/wefty-oci-provision.txt
           {
             printf 'WEFTY_OCI_CONTAINERD_ADDRESS=%s\n' /run/wefty-containerd/containerd.sock
             printf 'WEFTY_OCI_HELPER_SOCKET=%s\n' /run/wefty-oci-helper/helper.sock
             printf 'WEFTY_OCI_HELPER_CHECKSUM=%s\n' "$HELPER_CHECKSUM"
-            printf 'WEFTY_OCI_PROBE_REFERENCE=%s\n' "$PROBE_NAME"
+            printf 'WEFTY_OCI_PROBE_REFERENCE=%s\n' "$PROBE_REFERENCE"
             printf 'WEFTY_OCI_PROBE_DIGEST=%s\n' "$PROBE_DIGEST"
-            printf 'WEFTY_OCI_PROBE_ARCHIVE=%s\n' /tmp/wefty-probe.oci.tar
+            printf 'WEFTY_OCI_PROBE_ARCHIVE=%s\n' /tmp/wefty-echo.oci.tar
             printf 'WEFTY_OCI_ECHO_REFERENCE=%s\n' "$ECHO_REFERENCE"
+            printf 'WEFTY_OCI_ECHO_DIGEST=%s\n' "$ECHO_DIGEST"
             printf 'WEFTY_OCI_ECHO_ARCHIVE=%s\n' /tmp/wefty-echo.oci.tar
+            printf 'WEFTY_OCI_CLI=%s\n' /tmp/wefty-realtiming
             printf 'WEFTY_OCI_SERVICE_NUMERIC_REFERENCE=%s\n' "$NUMERIC_REFERENCE"
             printf 'WEFTY_OCI_SERVICE_NUMERIC_ARCHIVE=%s\n' /tmp/wefty-service-data-numeric.oci.tar
             printf 'WEFTY_OCI_SERVICE_NAMED_REFERENCE=%s\n' "$NAMED_REFERENCE"
@@ -236,13 +248,13 @@ jobs:
           if [ -f /tmp/wefty-oci-provision.txt ]; then
             cp /tmp/wefty-oci-provision.txt "$WEFTY_REALTIME_EVIDENCE_DIR/"
           fi
-          printf 'commit=%s\nrunner=%s\n' "$GITHUB_SHA" "$RUNNER_NAME" > "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
+          printf 'commit=%s\nrunner=%s\n' "$CANDIDATE_SHA" "$RUNNER_NAME" > "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
           go version >> "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
           go test -count=1 -p 1 -timeout=30m -v -tags=service_acceptance_realtiming ./...
       - name: Upload service acceptance evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: service-acceptance-realtiming-${{ matrix.os }}-${{ github.sha }}
+          name: service-acceptance-realtiming-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}
           path: ${{ runner.temp }}/service-acceptance-realtiming
           if-no-files-found: error

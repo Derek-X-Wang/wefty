@@ -16,13 +16,19 @@ and raw environment dumps must never enter the artifact.
   user in that group;
 - rootful containerd 2.0 or newer, runc 1.x, and working `overlayfs` in the
   guest;
-- a preloaded immutable Linux/arm64 test image containing `/bin/sh`, BusyBox
-  `wget`/`nc`, and distinct stdout/stderr markers;
+- the `wefty-echo-service-<candidate-commit>` artifact from the successful
+  main `acceptance-image` workflow, with the public commit tag pinned to
+  `acceptance-image-index-digest.txt`; its OCI archive contains the same
+  `/bin/sh`, BusyBox utilities, and `cmd/wefty-echo-service` program used by
+  Linux realtiming, including the distinct one-shot stdout/stderr markers;
 - one temporary host operator-mount root dedicated to this run.
 
 Ticket #152 adds the minimum installed boot topology consumed by this lane.
-Build the candidate macOS agent, its matching Linux/arm64 helper, and the
-Linux/arm64 probe OCI archive before running the private bootstrap mode. Pass
+Build the candidate macOS agent and use the matching Linux/arm64 release tree
+from that artifact before running the private bootstrap mode. Use its
+`share/wefty/oci/manifest.json` reference, digest, and adjacent
+`wefty-echo-service.oci.tar` unchanged; manifest inspection must show the same
+arm64 platform digest recorded in `acceptance-image-index.json`. Pass
 secret-free agent arguments only; tsnet must use persisted state rather than
 an auth key in the plist or process arguments.
 

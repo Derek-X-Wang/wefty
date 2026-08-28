@@ -29,10 +29,12 @@ Every written path, owner, and mode appears in the dry-run or completion receipt
 
 ## Configure the installed node
 
-The installer and setup have deliberately separate authority. A Linux release installs `wefty` in `bin`, the matching agent in `libexec`, and `share/wefty/oci/manifest.json` containing the helper checksum, probe reference/digest, and a relative probe archive path. Until #156/#157 own release assembly, produce the manifest from the exact helper and probe artifacts already built by the realtiming lane with this tested script invocation (replace the two digest variables with that lane's pinned values):
+The installer and setup have deliberately separate authority. A Linux release installs `wefty` in `bin`, the matching agent in `libexec`, and `share/wefty/oci/manifest.json` containing the helper checksum, probe reference/digest, and a relative probe archive path. The main-only `acceptance-image` workflow publishes `ghcr.io/derek-x-wang/wefty-echo-service:<commit>` and uploads the stable `wefty-echo-service-<commit>` artifact. Its root contains `acceptance-image-index-digest.txt`, `acceptance-image-index.json`, `acceptance-image-receipt.json`, and `wefty-echo-service.oci.tar`; its `linux-amd64/` and `linux-arm64/` trees contain the matching helper plus a generated `share/wefty/oci/manifest.json`. The digest receipt is the authority for both registry pull and offline import; never substitute a mutable tag.
+
+For unpackaged release assembly, reproduce the manifest from the exact helper and acceptance archive with the tested builder (replace the variables with values from that workflow artifact):
 
 ```sh
-scripts/build-oci-install-manifest.sh --helper /tmp/wefty-agent-oci-realtiming --probe-reference "$PROBE_REFERENCE" --probe-digest "$PROBE_DIGEST" --probe-archive /tmp/wefty-probe.oci.tar --output share/wefty/oci/manifest.json
+scripts/build-oci-install-manifest.sh --helper /tmp/wefty-agent-oci-realtiming --probe-reference "$PROBE_REFERENCE" --probe-digest "$PROBE_DIGEST" --probe-archive /tmp/wefty-echo-service.oci.tar --output share/wefty/oci/manifest.json
 ```
 
 With a normally installed release, Linux setup finds `<prefix>/share/wefty/oci/manifest.json` from the `wefty` executable and defaults all four artifact flags from it:
@@ -83,6 +85,14 @@ The owner-ratified cache ceiling is 16 GiB. Operation leases, live attempts, dur
 ```sh
 wefty node load-image FILE
 ```
+
+For the acceptance artifact, `FILE` is `wefty-echo-service.oci.tar`. The command
+must print the same top-level digest as
+`acceptance-image-index-digest.txt` and a platform digest present in
+`acceptance-image-index.json`. The archive contains both `linux/amd64` and
+`linux/arm64`; the helper admits only the probed runtime platform, retains the
+operator import hold, and continues to enforce the configured 16 GiB cache
+ceiling and stronger live-attempt, service-binding, and probe holds.
 
 ## Read diagnostics before changing state
 

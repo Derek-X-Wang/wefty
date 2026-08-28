@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -55,13 +56,18 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	digest := os.Getenv("WEFTY_OCI_PROBE_DIGEST")
 	archivePath := os.Getenv("WEFTY_OCI_PROBE_ARCHIVE")
 	echoReference := os.Getenv("WEFTY_OCI_ECHO_REFERENCE")
+	echoDigest := os.Getenv("WEFTY_OCI_ECHO_DIGEST")
 	echoArchivePath := os.Getenv("WEFTY_OCI_ECHO_ARCHIVE")
+	weftyCLI := os.Getenv("WEFTY_OCI_CLI")
 	numericReference := os.Getenv("WEFTY_OCI_SERVICE_NUMERIC_REFERENCE")
 	numericArchivePath := os.Getenv("WEFTY_OCI_SERVICE_NUMERIC_ARCHIVE")
 	namedReference := os.Getenv("WEFTY_OCI_SERVICE_NAMED_REFERENCE")
 	namedArchivePath := os.Getenv("WEFTY_OCI_SERVICE_NAMED_ARCHIVE")
-	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoArchivePath == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" {
+	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoDigest == "" || echoArchivePath == "" || weftyCLI == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" {
 		t.Fatal("Linux OCI realtiming provisioning is incomplete")
+	}
+	if reference != echoReference || digest != echoDigest || archivePath != echoArchivePath || !strings.HasPrefix(reference, "ghcr.io/derek-x-wang/wefty-echo-service:") {
+		t.Fatalf("probe and workload did not consume one canonical public artifact: probe=%s@%s archive=%s echo=%s@%s archive=%s", reference, digest, archivePath, echoReference, echoDigest, echoArchivePath)
 	}
 	if os.Geteuid() == 0 {
 		t.Fatal("Linux OCI realtiming test process must be unprivileged")
@@ -365,14 +371,9 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	}
 	requestRootFault(t, "enable-registry")
 	registryDisabled = false
-	echoArchive, err := os.Open(echoArchivePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	echoImage, importEchoErr := adapter.LoadImage(ctx, echoReference, echoArchive)
-	closeEchoErr := echoArchive.Close()
-	if importEchoErr != nil || closeEchoErr != nil {
-		t.Fatal(errors.Join(importEchoErr, closeEchoErr))
+	echoImage := loadNativeImageThroughCLI(t, ctx, adapter, weftyCLI, echoArchivePath)
+	if echoImage.TopLevelDigest != echoDigest || echoImage.PlatformDigest == "" {
+		t.Fatalf("wefty node load-image identity = %+v, want top-level %s", echoImage, echoDigest)
 	}
 	numericImage := loadNativeImageArchive(t, ctx, adapter, numericReference, numericArchivePath)
 	namedImage := loadNativeImageArchive(t, ctx, adapter, namedReference, namedArchivePath)
@@ -654,7 +655,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "node-doctor.json"), append(doctorBundle, '\n'), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_agent_restart_same_generation=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerDiskEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_agent_restart_same_generation=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerDiskEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -891,6 +892,61 @@ func loadNativeImageArchive(t *testing.T, ctx context.Context, adapter *ocirunne
 		t.Fatal(errors.Join(loadErr, closeErr))
 	}
 	return image
+}
+
+func loadNativeImageThroughCLI(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, cliPath, archivePath string) ocicontrol.LoadImageResponse {
+	t.Helper()
+	root := t.TempDir()
+	intentPath := filepath.Join(root, "intent.json")
+	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := ocicontrol.NewController(ocicontrol.ControllerConfig{IntentPath: intentPath, Images: adapter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(root, "control.sock")
+	server, err := ocicontrol.NewServer(socketPath, controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverContext, cancelServer := context.WithCancel(ctx)
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- server.Serve(serverContext) }()
+	t.Cleanup(func() {
+		cancelServer()
+		if err := <-serverDone; err != nil {
+			t.Errorf("stop node-local control server: %v", err)
+		}
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if info, statErr := os.Lstat(socketPath); statErr == nil && info.Mode()&os.ModeSocket != 0 {
+			break
+		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatal(statErr)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("node-local control server did not publish its socket")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	configPath := filepath.Join(root, "node.json")
+	if err := ocicontrol.WriteInstalledConfig(configPath, ocicontrol.InstalledConfig{Version: ocicontrol.InstalledConfigVersion, ControlSocket: socketPath}); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.CommandContext(ctx, cliPath,
+		"--fabric=invalid-must-not-open", "--node-config="+configPath, "--json", "node", "load-image", archivePath,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wefty node load-image: %v output=%s", err, output)
+	}
+	var response ocicontrol.LoadImageResponse
+	if err := json.Unmarshal(output, &response); err != nil {
+		t.Fatalf("decode wefty node load-image response: %v output=%s", err, output)
+	}
+	return response
 }
 
 func exerciseNativeLinuxServiceData(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, images []nativeServiceDataImage) nativeServiceDataEvidence {
