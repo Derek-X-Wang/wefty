@@ -16,7 +16,7 @@ concurrency:
 jobs:
   acceptance-image:
     name: acceptance-image
-    uses: ./.github/workflows/acceptance-image.yml
+    uses: ./.github/workflows/acceptance-image-build.yml
     permissions:
       contents: read
 

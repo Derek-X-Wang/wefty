@@ -1,7 +1,6 @@
 name: acceptance-image
 
 on:
-  workflow_call:
   push:
     branches: [main]
 

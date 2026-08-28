@@ -32,16 +32,17 @@ type workflowStep struct {
 
 func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	image, imageBytes := readWorkflow(t, "../.github/workflows/acceptance-image.yml")
+	build, buildBytes := readWorkflow(t, "../.github/workflows/acceptance-image-build.yml")
 	gate, gateBytes := readWorkflow(t, "../.github/workflows/contract-gate.yml")
 	realtiming, realtimingBytes := readWorkflow(t, "../.github/workflows/service-acceptance-realtiming.yml")
 
-	if _, ok := image.On["workflow_call"]; !ok {
+	if _, ok := build.On["workflow_call"]; !ok {
 		t.Fatal("acceptance-image must expose the secretless required workflow_call lane")
 	}
 	if _, ok := image.On["push"]; !ok {
 		t.Fatal("acceptance-image must publish from push to main")
 	}
-	for _, workflow := range []workflowContract{image, gate, realtiming} {
+	for _, workflow := range []workflowContract{image, build, gate, realtiming} {
 		if _, ok := workflow.On["pull_request_target"]; ok {
 			t.Fatal("acceptance workflows must never use pull_request_target")
 		}
@@ -58,6 +59,11 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			t.Fatalf("PR-callable job %s grants package permissions", name)
 		}
 	}
+	for name, job := range build.Jobs {
+		if job.Permissions["packages"] != "" {
+			t.Fatalf("PR-callable job %s grants package permissions", name)
+		}
+	}
 	pinnedAction := regexp.MustCompile(`^[^./][^@]*@[0-9a-f]{40}$`)
 	for name, job := range image.Jobs {
 		for _, step := range job.Steps {
@@ -66,15 +72,22 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			}
 		}
 	}
+	for name, job := range build.Jobs {
+		for _, step := range job.Steps {
+			if step.Uses != "" && !pinnedAction.MatchString(step.Uses) {
+				t.Fatalf("PR image workflow job %s has mutable action ref %q", name, step.Uses)
+			}
+		}
+	}
 	if strings.Contains(string(imageBytes), "secrets.") {
 		t.Fatal("acceptance-image must not use repository secrets")
 	}
-	if strings.Contains(marshalJob(t, image.Jobs["reproducible-platform-build"]), "github.token") {
+	if strings.Contains(string(buildBytes), "secrets.") || strings.Contains(marshalJob(t, build.Jobs["reproducible-platform-build"]), "github.token") {
 		t.Fatal("PR-callable image build must not consume github.token")
 	}
 
 	called := gate.Jobs["acceptance-image"]
-	if called.Uses != "./.github/workflows/acceptance-image.yml" {
+	if called.Uses != "./.github/workflows/acceptance-image-build.yml" {
 		t.Fatalf("contract-gate image lane uses %q", called.Uses)
 	}
 	needs := stringSlice(t, gate.Jobs["all-tests-pass"].Needs)
