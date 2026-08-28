@@ -800,7 +800,7 @@ func TestAttemptDeadmanUsesGuardianReaper(t *testing.T) {
 
 func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
 	engine := newFakeEngine()
-	engine.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}, HostBridgeReady: true})
+	engine.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}, HostBridgeReady: true, HostBridgeEndpoint: "http://127.0.0.1:42002/l3"})
 	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
 	defer stop()
 	session, err := client.OpenSession(t.Context(), testSessionRequest())
@@ -1017,7 +1017,7 @@ func TestAttemptPortMarkerFailureInvalidatesSession(t *testing.T) {
 
 func TestHostBridgeStreamRemainsCoupledToDialContext(t *testing.T) {
 	engine := newFakeEngine()
-	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), HostBridgeReady: true}
+	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), HostBridgeReady: true, HostBridgeEndpoint: "http://127.0.0.1:42002/l3"}
 	engine.dialHostBridgeRead = true
 	engine.dialHostBridgeDone = make(chan struct{})
 	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})

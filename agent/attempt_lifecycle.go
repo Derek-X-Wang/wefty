@@ -48,34 +48,35 @@ func (disabledAttemptWatch) Check() error           { return nil }
 func (disabledAttemptWatch) Stop()                  {}
 
 type attemptLifecycleDependencies struct {
-	client                 *Client
-	runtimes               workloadRuntimeSet
-	outbox                 *evidenceOutbox
-	watchdog               attemptWatchdog
-	clock                  Clock
-	renewalInterval        time.Duration
-	completionRetry        time.Duration
-	finalizationTimeout    time.Duration
-	outputSinkFactory      OutputSinkFactory
-	managedResource        managedResourceManager
-	handoffs               *handoffManager
-	nodeID                 string
-	bootSessionID          string
-	workflowBridge         func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error)
-	logf                   func(string, ...any)
-	observer               *lifecycleObserver
-	fabric                 fabric.Fabric
-	computerPolicy         *ComputerPolicyCache
-	reservePublishedPort   func(l1.Claim) (net.Listener, *contract.SpawnFailure)
-	prepareServiceEndpoint func(context.Context) (serviceRuntimeEndpoint, error)
-	prepareAuthorityLoss   func(context.Context, string) error
-	allowsStart            func(contract.JobSpec) bool
-	currentOCIGeneration   func() (workloadrunner.RuntimeGeneration, bool)
-	embargoOCIRuntime      func(workloadrunner.RuntimeGeneration)
-	recoverOCIRuntime      func(context.Context, workloadrunner.RuntimeGeneration) error
-	runtimeReaped          func(string, workloadrunner.ReapReceipt, error)
-	attemptDeadman         AttemptDeadmanRenewer
-	computerTokens         ComputerTokenMinter
+	client                     *Client
+	runtimes                   workloadRuntimeSet
+	outbox                     *evidenceOutbox
+	watchdog                   attemptWatchdog
+	clock                      Clock
+	renewalInterval            time.Duration
+	completionRetry            time.Duration
+	finalizationTimeout        time.Duration
+	outputSinkFactory          OutputSinkFactory
+	managedResource            managedResourceManager
+	handoffs                   *handoffManager
+	nodeID                     string
+	bootSessionID              string
+	workflowBridge             func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error)
+	logf                       func(string, ...any)
+	observer                   *lifecycleObserver
+	fabric                     fabric.Fabric
+	computerPolicy             *ComputerPolicyCache
+	reservePublishedPort       func(l1.Claim) (net.Listener, *contract.SpawnFailure)
+	prepareServiceEndpoint     func(context.Context) (serviceRuntimeEndpoint, error)
+	prepareAuthorityLoss       func(context.Context, string) error
+	allowsStart                func(contract.JobSpec) bool
+	currentOCIGeneration       func() (workloadrunner.RuntimeGeneration, bool)
+	embargoOCIRuntime          func(workloadrunner.RuntimeGeneration)
+	recoverOCIRuntime          func(context.Context, workloadrunner.RuntimeGeneration) error
+	runtimeReaped              func(string, workloadrunner.ReapReceipt, error)
+	attemptDeadman             AttemptDeadmanRenewer
+	computerTokens             ComputerTokenMinter
+	computerHostBridgeFallback bool
 }
 
 // attemptLifecycle owns one attempt from renewal startup through process/log
@@ -795,20 +796,37 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 	}
 	var err error
-	var bridge *workflowBridge
-	if lifecycle.dependencies.workflowBridge != nil && needsAttemptBridge(claim.Job.Spec.Class, executionSpec) {
-		bridge, err = lifecycle.dependencies.workflowBridge(ctx, claim.Job.Spec.Kind, executionSpec)
-		if err != nil {
-			return finish(spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, err), err)
+	var computerBridge *computerAttemptBridgeController
+	if computerService {
+		computerBridge = newComputerAttemptBridgeController(ctx, lifecycle.dependencies.workflowBridge, claim.Job.Spec.Kind, executionSpec)
+		defer computerBridge.disable()
+		if claim.ComputerStorage.SubmitEnabled {
+			endpoint, bridgeErr := computerBridge.enable(executionSpec.SensitiveEnv[contract.EnvComputerToken])
+			if bridgeErr != nil {
+				return finish(spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, bridgeErr), bridgeErr)
+			}
+			executionSpec.Env = cloneEnvironment(executionSpec.Env)
+			delete(executionSpec.Env, "WEFTY_L1_ENDPOINT")
+			executionSpec.Env[contract.EnvL3Endpoint] = endpoint
 		}
-	}
-	if bridge != nil {
-		defer bridge.close()
-		executionSpec.Env = cloneEnvironment(executionSpec.Env)
-		delete(executionSpec.Env, "WEFTY_L1_ENDPOINT")
-		executionSpec.Env[contract.EnvL3Endpoint] = bridge.l3Endpoint
-		if bridge.hostBridgeFallback {
-			request.HostBridgeDial = bridge.dial
+		if lifecycle.dependencies.computerHostBridgeFallback {
+			request.HostBridgeDial = computerBridge.dial
+			request.HostBridgeEndpointReady = computerBridge.setGuestEndpoint
+			request.HostBridgeFallbackActive = computerBridge.usesHostBridgeFallback()
+		}
+	} else if claim.Job.Spec.Class == contract.JobClassOneShot && lifecycle.dependencies.workflowBridge != nil {
+		bridge, bridgeErr := lifecycle.dependencies.workflowBridge(ctx, claim.Job.Spec.Kind, executionSpec)
+		if bridgeErr != nil {
+			return finish(spawnFailure(contract.SpawnFailureWorkflowBridgeCreation, bridgeErr), bridgeErr)
+		}
+		if bridge != nil {
+			defer bridge.close()
+			executionSpec.Env = cloneEnvironment(executionSpec.Env)
+			delete(executionSpec.Env, "WEFTY_L1_ENDPOINT")
+			executionSpec.Env[contract.EnvL3Endpoint] = bridge.l3Endpoint
+			if bridge.hostBridgeFallback {
+				request.HostBridgeDial = bridge.dial
+			}
 		}
 	}
 	var sinks multiOutputSink
@@ -857,7 +875,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		result, runErr = runComputerService(ctx, runtimeAdapter, request, sink, computerServiceConfig{
 			clock: lifecycle.dependencies.clock, fabric: lifecycle.dependencies.fabric,
 			authorizer: lifecycle.dependencies.computerPolicy, auditor: lifecycle.dependencies.client,
-			computerTokens: lifecycle.dependencies.computerTokens, computerBridge: bridge,
+			computerTokens: lifecycle.dependencies.computerTokens, computerBridge: computerBridge,
 			submission: ComputerSubmissionAuthority{ComputerID: claim.ComputerStorage.ComputerID,
 				Enabled: claim.ComputerStorage.SubmitEnabled, SubmitIntentRevision: claim.ComputerStorage.SubmitIntentRevision,
 				SubmitMaxInflight: claim.ComputerStorage.SubmitMaxInflight, SubmitPolicyRevision: claim.ComputerStorage.SubmitPolicyRevision},
@@ -904,10 +922,6 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		result, runErr = runtimeResult.Outcome, err
 	}
 	return finish(result, runErr)
-}
-
-func needsAttemptBridge(class string, execution contract.ExecutionSpec) bool {
-	return class == contract.JobClassOneShot || (class == contract.JobClassService && contract.IsComputerExecution(execution))
 }
 
 // withoutComputerReservedOperatorEnvironment removes every tenant-supplied

@@ -83,6 +83,9 @@ func validateWorkloadWire(input WorkloadInput) error {
 	if input.ComputerToken != "" && !input.Computer {
 		return errors.New("Computer token requires a Computer workload")
 	}
+	if input.Computer && (input.ComputerToken == "") != (input.L3Endpoint == "") {
+		return errors.New("Computer token and L3 endpoint must be supplied together")
+	}
 	if input.Limits.MemoryBytes < 0 || input.Limits.CPUMillicores < 0 {
 		return errors.New("workload limits must not be negative")
 	}

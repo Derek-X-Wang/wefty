@@ -10,6 +10,7 @@ func TestServiceAcceptanceComputerTokenInjection(t *testing.T) {
 	t.Run("live policy change rotates attempt-local token file", TestComputerSubmissionPolicyChangeRotatesAttemptTokenFile)
 	t.Run("transport allowlist and typed errors", TestComputerAttemptBridgeProjectsOnlyTheL3OwnedSurface)
 	t.Run("negative mutation receipt", TestComputerAttemptBridgeNegativeRouteReceiptIsAssertionDerived)
-	t.Run("disable cancellation and re-enable", TestComputerAttemptBridgeDisableCancelsInflightAndReenableRestoresTransport)
-	t.Run("Computer-only service eligibility", TestAttemptBridgeEligibilityAddsOnlyComputerServices)
+	t.Run("policy loss cancellation and re-enable", TestComputerSubmissionPolicyLossCancelsInflightAndReenableRestoresTransport)
+	t.Run("production Computer surface and forced Mac fallback", TestStartWorkflowBridgeSelectsComputerSurfaceOnForcedMacFallback)
+	t.Run("allowlist equals L3 Computer routes", TestComputerAttemptBridgeAllowlistExactlyMirrorsL3ComputerRoutes)
 }

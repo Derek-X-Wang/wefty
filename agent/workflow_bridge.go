@@ -10,11 +10,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
+
+const workflowBridgeCloseTimeout = 2 * time.Second
 
 type workflowBridgeSurface uint8
 
@@ -31,7 +35,6 @@ type workflowBridge struct {
 	hostBridgeFallback bool
 	dial               func(context.Context) (net.Conn, error)
 	surface            workflowBridgeSurface
-	cancelServe        context.CancelFunc
 	mu                 sync.Mutex
 	reachable          bool
 	reachability       context.Context
@@ -41,7 +44,8 @@ type workflowBridge struct {
 
 func (a *Agent) startWorkflowBridge(ctx context.Context, kind string, execution contract.ExecutionSpec) (*workflowBridge, error) {
 	computer := contract.IsComputerExecution(execution)
-	if a.fabric == nil || (!computer && execution.Env[contract.EnvL3Endpoint] == "") {
+	computerEnabled := computer && execution.SensitiveEnv[contract.EnvComputerToken] != ""
+	if a.fabric == nil || (computer && !computerEnabled) || (!computer && execution.Env[contract.EnvL3Endpoint] == "") {
 		return nil, nil
 	}
 	surface := workflowBridgeSurfaceRun
@@ -54,10 +58,10 @@ func (a *Agent) startWorkflowBridge(ctx context.Context, kind string, execution 
 			return nil, err
 		}
 		return newWorkflowBridgeWithSurface(ctx, a.fabric, a.runLedgerAddr, binding, surface,
-			execution.SensitiveEnv[contract.EnvComputerToken] != "")
+			computerEnabled)
 	}
 	return newWorkflowBridgeWithSurface(ctx, a.fabric, a.runLedgerAddr, workloadrunner.WorkflowBridgeBinding{}, surface,
-		execution.SensitiveEnv[contract.EnvComputerToken] != "")
+		computerEnabled)
 }
 
 func newWorkflowBridge(ctx context.Context, participant fabric.Fabric, l3Address string) (*workflowBridge, error) {
@@ -104,26 +108,37 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 	}
 	dialer := &net.Dialer{}
 	dialAddress := binding.Listener.Addr().String()
-	serveContext, cancelServe := context.WithCancel(ctx)
 	bridge := &workflowBridge{
 		listener:           binding.Listener,
 		l3:                 workflowBridgeTransport(participant, l3Address),
 		hostBridgeFallback: binding.HostBridgeFallback,
 		surface:            surface,
-		cancelServe:        cancelServe,
 		dial: func(ctx context.Context) (net.Conn, error) {
 			return dialer.DialContext(ctx, "tcp", dialAddress)
 		},
 	}
-	l3Proxy := workflowReverseProxy(bridge.l3, "/l3")
-	mux := http.NewServeMux()
+	proxyError := contract.ErrorInternal
 	if surface == workflowBridgeSurfaceComputer {
-		mux.Handle("/l3/", bridge.computerHandler(l3Proxy))
+		proxyError = contract.ErrorPassUnavailable
+	}
+	l3Proxy := workflowReverseProxy(bridge.l3, "/l3", proxyError)
+	var handler http.Handler
+	if surface == workflowBridgeSurfaceComputer {
+		computer := bridge.computerHandler(l3Proxy)
+		handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			if !strings.HasPrefix(request.URL.Path, "/l3/") {
+				http.NotFound(w, request)
+				return
+			}
+			computer.ServeHTTP(w, request)
+		})
 		bridge.setReachable(reachable)
 	} else {
+		mux := http.NewServeMux()
 		mux.Handle("/l3/", l3Proxy)
+		handler = mux
 	}
-	bridge.server = &http.Server{Handler: mux, BaseContext: func(net.Listener) context.Context { return serveContext }}
+	bridge.server = &http.Server{Handler: handler, BaseContext: func(net.Listener) context.Context { return ctx }}
 	baseURL := "http://" + net.JoinHostPort(binding.AdvertiseHost, strconv.Itoa(tcpAddress.Port))
 	bridge.l3Endpoint = baseURL + "/l3"
 	go func() {
@@ -140,7 +155,7 @@ func (b *workflowBridge) computerHandler(next http.Handler) http.Handler {
 		}
 		requestContext, cancel, ok := b.reachableRequestContext(request.Context())
 		if !ok {
-			writeWorkflowBridgeError(w, http.StatusServiceUnavailable, contract.ErrorInternal, "Computer attempt bridge is not reachable")
+			writeWorkflowBridgeError(w, http.StatusServiceUnavailable, contract.ErrorPassUnavailable, "Computer attempt bridge is not reachable")
 			return
 		}
 		defer cancel()
@@ -149,28 +164,42 @@ func (b *workflowBridge) computerHandler(next http.Handler) http.Handler {
 }
 
 func computerBridgeRouteAllowed(method, path string) bool {
-	if method == http.MethodGet && (path == "/v1/computer/self" || path == "/v1/runs") {
-		return true
+	for _, route := range computerBridgeRoutes {
+		if method == route.Method && computerBridgePathMatches(route.Path, path) {
+			return true
+		}
 	}
-	if method == http.MethodPost && path == "/v1/runs" {
-		return true
-	}
-	if method != http.MethodGet || !strings.HasPrefix(path, "/v1/runs/") {
+	return false
+}
+
+var computerBridgeRoutes = []l3.ComputerTokenRoute{
+	{Method: http.MethodGet, Path: "/v1/computer/self"},
+	{Method: http.MethodGet, Path: "/v1/runs"},
+	{Method: http.MethodPost, Path: "/v1/runs"},
+	{Method: http.MethodGet, Path: "/v1/runs/{run_id}"},
+	{Method: http.MethodGet, Path: "/v1/runs/{run_id}/lineage"},
+	{Method: http.MethodGet, Path: "/v1/runs/{run_id}/logs"},
+}
+
+func computerBridgePathMatches(pattern, requestPath string) bool {
+	patternParts := strings.Split(strings.TrimPrefix(pattern, "/"), "/")
+	requestParts := strings.Split(strings.TrimPrefix(requestPath, "/"), "/")
+	if len(patternParts) != len(requestParts) || !strings.HasPrefix(requestPath, "/") {
 		return false
 	}
-	parts := strings.Split(strings.TrimPrefix(path, "/v1/runs/"), "/")
-	if len(parts) == 1 {
-		return parts[0] != ""
+	for index := range patternParts {
+		if patternParts[index] == "{run_id}" {
+			if requestParts[index] == "" || requestParts[index] == "." || requestParts[index] == ".." ||
+				strings.TrimSpace(requestParts[index]) != requestParts[index] {
+				return false
+			}
+			continue
+		}
+		if requestParts[index] != patternParts[index] {
+			return false
+		}
 	}
-	if len(parts) != 2 || parts[0] == "" {
-		return false
-	}
-	switch parts[1] {
-	case "lineage", "logs", "envelopes":
-		return true
-	default:
-		return false
-	}
+	return true
 }
 
 func (b *workflowBridge) setReachable(reachable bool) {
@@ -211,7 +240,7 @@ func workflowBridgeTransport(participant fabric.Fabric, address string) *http.Tr
 	}}
 }
 
-func workflowReverseProxy(transport http.RoundTripper, prefix string) *httputil.ReverseProxy {
+func workflowReverseProxy(transport http.RoundTripper, prefix string, errorCode contract.ErrorCode) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Director: func(request *http.Request) {
 			request.URL.Scheme = "http"
@@ -221,7 +250,7 @@ func workflowReverseProxy(transport http.RoundTripper, prefix string) *httputil.
 		},
 		Transport: transport,
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-			writeWorkflowBridgeError(w, http.StatusBadGateway, contract.ErrorInternal, err.Error())
+			writeWorkflowBridgeError(w, http.StatusBadGateway, errorCode, err.Error())
 		},
 	}
 }
@@ -233,20 +262,23 @@ func writeWorkflowBridgeError(w http.ResponseWriter, status int, code contract.E
 }
 
 func (b *workflowBridge) close() error {
-	b.mu.Lock()
-	b.closed = true
-	b.reachable = false
-	if b.cancelReachability != nil {
-		b.cancelReachability()
-		b.cancelReachability = nil
-		b.reachability = nil
+	if b.surface == workflowBridgeSurfaceComputer {
+		b.mu.Lock()
+		b.closed = true
+		if b.cancelReachability != nil {
+			b.cancelReachability()
+			b.cancelReachability = nil
+			b.reachability = nil
+		}
+		b.reachable = false
+		b.mu.Unlock()
 	}
-	b.mu.Unlock()
-	b.cancelServe()
-	err := b.server.Close()
+	closeContext, cancel := context.WithTimeout(context.Background(), workflowBridgeCloseTimeout)
+	defer cancel()
+	err := b.server.Shutdown(closeContext)
 	b.l3.CloseIdleConnections()
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
+	if errors.Is(err, context.DeadlineExceeded) {
+		_ = b.listener.Close()
 	}
 	return err
 }

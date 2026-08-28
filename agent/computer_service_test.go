@@ -477,7 +477,7 @@ type recordingComputerServiceFabric struct {
 func (runtime *opaqueEndpointRuntime) SetComputerControlState(context.Context, workloadrunner.AttemptAuthority, bool) error {
 	return nil
 }
-func (runtime *opaqueEndpointRuntime) SetComputerToken(context.Context, workloadrunner.AttemptAuthority, string) error {
+func (runtime *opaqueEndpointRuntime) SetComputerSubmission(context.Context, workloadrunner.AttemptAuthority, string, string) error {
 	return nil
 }
 
@@ -513,7 +513,7 @@ func (runtime *restartComputerRuntime) SetComputerControlState(_ context.Context
 	runtime.signals = append(runtime.signals, value)
 	return nil
 }
-func (runtime *restartComputerRuntime) SetComputerToken(context.Context, workloadrunner.AttemptAuthority, string) error {
+func (runtime *restartComputerRuntime) SetComputerSubmission(context.Context, workloadrunner.AttemptAuthority, string, string) error {
 	return nil
 }
 

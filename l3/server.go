@@ -107,11 +107,7 @@ type computerTokenContextKey struct{}
 
 func (s *Server) routes() http.Handler {
 	runs := http.NewServeMux()
-	runs.HandleFunc("POST /v1/runs", s.createRun)
-	runs.HandleFunc("GET /v1/runs/{run_id}", s.getRun)
 	runs.HandleFunc("GET /v1/runs/{run_id}/execution", s.getRunExecution)
-	runs.HandleFunc("GET /v1/runs/{run_id}/lineage", s.getRunLineage)
-	runs.HandleFunc("GET /v1/runs/{run_id}/logs", s.getRunLogs)
 	runs.HandleFunc("POST /v1/runs/{run_id}/envelopes", s.appendEnvelope)
 	runs.HandleFunc("POST /v1/runs/{run_id}/gates", s.appendGateResult)
 	runs.HandleFunc("POST /v1/runs/{run_id}/rerun", s.rerun)
@@ -126,7 +122,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/computer-token/revoke", s.authenticateFabric(http.HandlerFunc(s.revokeComputerTokens)))
 	root.Handle("/v1/computer-token/revoke-attempt", s.authenticateFabric(http.HandlerFunc(s.revokeComputerAttemptTokens)))
 	root.Handle("/v1/computer-token/revoke-host", s.authenticateFabric(http.HandlerFunc(s.revokeHostComputerTokens)))
-	root.Handle("/v1/computer/self", s.authenticateFabric(s.authorize(http.HandlerFunc(s.getComputerSelf))))
+	s.registerComputerTokenRoutes(runs, root)
 	root.Handle("/v1/runs", s.authenticateFabric(s.authorize(runs)))
 	root.Handle("/v1/runs/", s.authenticateFabric(s.authorize(runs)))
 	root.Handle("/v1/workflows/", s.authenticateFabric(s.authorize(s.requireCaller(workflows))))
@@ -379,6 +375,55 @@ func (s *Server) getComputerSelf(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.store.ComputerSelf(scope))
+}
+
+func (s *Server) listComputerRuns(w http.ResponseWriter, r *http.Request) {
+	scope, ok := computerTokenFromRequest(r)
+	if !ok {
+		writeError(w, protocolError(contract.ErrorForbidden, "a Computer token is required to list Computer Runs"))
+		return
+	}
+	query := r.URL.Query()
+	for name, values := range query {
+		switch name {
+		case "origin", "include_descendants", "limit", "cursor":
+			if len(values) != 1 {
+				writeError(w, protocolError(contract.ErrorInvalidRequest, "%s must be supplied at most once", name))
+				return
+			}
+		default:
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "unknown Computer Run list parameter %q", name))
+			return
+		}
+	}
+	origins, present := query["origin"]
+	if !present || len(origins) != 1 || origins[0] != "computer:self" {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "origin=computer:self is required"))
+		return
+	}
+	includeDescendants := false
+	if values, present := query["include_descendants"]; present {
+		if len(values) != 1 || (values[0] != "true" && values[0] != "false") {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "include_descendants must be true or false"))
+			return
+		}
+		includeDescendants = values[0] == "true"
+	}
+	limit := DefaultComputerRunPageLimit
+	if value := query.Get("limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > MaxComputerRunPageLimit {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "limit must be an integer between 1 and %d", MaxComputerRunPageLimit))
+			return
+		}
+		limit = parsed
+	}
+	page, err := s.store.ListComputerRuns(r.Context(), scope, query.Get("cursor"), limit, includeDescendants)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) verifyComputerScope(ctx context.Context, scope ComputerTokenScope, hostIdentityNodeID string) error {

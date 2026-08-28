@@ -17,6 +17,8 @@ const (
 	DefaultHandoffRoot               = contract.DefaultHandoffRoot
 	DefaultRunTokenGrace             = 5 * time.Minute
 	DefaultComputerSubmitMaxInflight = 20
+	DefaultComputerRunPageLimit      = 100
+	MaxComputerRunPageLimit          = 1000
 )
 
 // Clock supplies ledger timestamps so state projection can be tested without
@@ -262,6 +264,11 @@ type ComputerSelf struct {
 	ComputerStorageGeneration int64                `json:"computer_storage_generation"`
 	GrantRevision             int64                `json:"grant_revision"`
 	Permissions               []ComputerPermission `json:"permissions"`
+}
+
+type ComputerRunPage struct {
+	Runs       []contract.RunRecord `json:"runs"`
+	NextCursor string               `json:"next_cursor,omitempty"`
 }
 
 // ComputerTokenScopeProof is the L1-authoritative fact L3 consumes before it

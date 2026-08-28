@@ -555,11 +555,12 @@ type WorkloadLimits struct {
 }
 
 type RunRequest struct {
-	Authority                AttemptAuthority `json:"authority"`
-	InitialDeadman           time.Duration    `json:"initial_deadman"`
-	AllocateEndpoints        []string         `json:"allocate_endpoints,omitempty"`
-	EnableHostBridgeFallback bool             `json:"enable_host_bridge_fallback,omitempty"`
-	Workload                 WorkloadInput    `json:"workload"`
+	Authority                  AttemptAuthority `json:"authority"`
+	InitialDeadman             time.Duration    `json:"initial_deadman"`
+	AllocateEndpoints          []string         `json:"allocate_endpoints,omitempty"`
+	EnableHostBridgeFallback   bool             `json:"enable_host_bridge_fallback,omitempty"`
+	ActivateHostBridgeFallback bool             `json:"activate_host_bridge_fallback,omitempty"`
+	Workload                   WorkloadInput    `json:"workload"`
 	// Resources is helper-derived after decoding. It cannot be supplied over
 	// the wire, so the engine always receives the deterministic names and full
 	// labels before it creates the lease or any dependent resource.
@@ -567,14 +568,15 @@ type RunRequest struct {
 }
 
 type RunResponse struct {
-	Started          bool                     `json:"started"`
-	StartedAt        time.Time                `json:"started_at"`
-	Image            *ImageEvidence           `json:"image,omitempty"`
-	Endpoints        map[string]uint16        `json:"endpoints,omitempty"`
-	HostBridgeReady  bool                     `json:"host_bridge_ready,omitempty"`
-	BridgeCapability string                   `json:"bridge_capability,omitempty"`
-	Profile          ProfileReceipt           `json:"profile"`
-	Admission        ResourceAdmissionReceipt `json:"admission"`
+	Started            bool                     `json:"started"`
+	StartedAt          time.Time                `json:"started_at"`
+	Image              *ImageEvidence           `json:"image,omitempty"`
+	Endpoints          map[string]uint16        `json:"endpoints,omitempty"`
+	HostBridgeReady    bool                     `json:"host_bridge_ready,omitempty"`
+	HostBridgeEndpoint string                   `json:"host_bridge_endpoint,omitempty"`
+	BridgeCapability   string                   `json:"bridge_capability,omitempty"`
+	Profile            ProfileReceipt           `json:"profile"`
+	Admission          ResourceAdmissionReceipt `json:"admission"`
 }
 
 // ResourceAdmissionReceipt records the exact facts used for one atomic
@@ -659,8 +661,9 @@ type SetComputerControlStateRequest struct {
 }
 
 type SetComputerTokenRequest struct {
-	Authority AttemptAuthority `json:"authority"`
-	Token     string           `json:"token,omitempty"`
+	Authority  AttemptAuthority `json:"authority"`
+	Token      string           `json:"token,omitempty"`
+	L3Endpoint string           `json:"l3_endpoint,omitempty"`
 }
 
 type Signal string

@@ -9,6 +9,7 @@ import (
 
 const computerControlFilename = "driver.json"
 const computerTokenFilename = "computer-token"
+const computerL3EndpointFilename = "l3-endpoint"
 
 var (
 	computerControlFalse = []byte(`{"version":1,"human_driving":false}`)
@@ -79,16 +80,24 @@ func atomicWriteComputerControlState(controlDirectory string, humanDriving bool)
 }
 
 func atomicWriteComputerToken(controlDirectory, token string, uid, gid uint32) (writeErr error) {
-	target := filepath.Join(controlDirectory, computerTokenFilename)
-	if token == "" {
+	return atomicWriteComputerSecret(controlDirectory, computerTokenFilename, token, uid, gid)
+}
+
+func atomicWriteComputerL3Endpoint(controlDirectory, endpoint string, uid, gid uint32) error {
+	return atomicWriteComputerSecret(controlDirectory, computerL3EndpointFilename, endpoint, uid, gid)
+}
+
+func atomicWriteComputerSecret(controlDirectory, filename, value string, uid, gid uint32) (writeErr error) {
+	target := filepath.Join(controlDirectory, filename)
+	if value == "" {
 		if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove Computer token: %w", err)
+			return fmt.Errorf("remove Computer submission authority: %w", err)
 		}
 		return nil
 	}
-	temporary, err := os.CreateTemp(controlDirectory, ".computer-token-*")
+	temporary, err := os.CreateTemp(controlDirectory, ".computer-submission-*")
 	if err != nil {
-		return fmt.Errorf("create Computer token: %w", err)
+		return fmt.Errorf("create Computer submission authority: %w", err)
 	}
 	temporaryName := temporary.Name()
 	defer func() {
@@ -105,13 +114,13 @@ func atomicWriteComputerToken(controlDirectory, token string, uid, gid uint32) (
 		}
 	}()
 	if err := temporary.Chown(int(uid), int(gid)); err != nil {
-		return fmt.Errorf("own Computer token for tenant: %w", err)
+		return fmt.Errorf("own Computer submission authority for tenant: %w", err)
 	}
 	if err := temporary.Chmod(0o400); err != nil {
-		return fmt.Errorf("make Computer token tenant-readable: %w", err)
+		return fmt.Errorf("make Computer submission authority tenant-readable: %w", err)
 	}
-	if _, err := temporary.WriteString(token); err != nil {
-		return fmt.Errorf("write Computer token: %w", err)
+	if _, err := temporary.WriteString(value); err != nil {
+		return fmt.Errorf("write Computer submission authority: %w", err)
 	}
 	if err := temporary.Sync(); err != nil {
 		return fmt.Errorf("sync Computer token: %w", err)

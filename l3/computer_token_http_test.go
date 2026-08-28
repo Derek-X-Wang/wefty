@@ -6,10 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -287,6 +290,93 @@ func TestComputerHTTPAuthoritySurfaceAndNodeBinding(t *testing.T) {
 		status, _, body = doComputerHTTP(t, node, test.method, test.path, grant.Token, "disabled", test.body)
 		if status != http.StatusUnauthorized {
 			t.Fatalf("disabled %s %s status=%d body=%s", test.method, test.path, status, body)
+		}
+	}
+}
+
+func TestComputerRootRunListIsPaginatedAndCurrentGenerationScoped(t *testing.T) {
+	proof := ComputerTokenScopeProof{ComputerID: "computer-list", ComputerAttemptID: "attempt-current",
+		ComputerStorageGeneration: 7, SubmitIntentRevision: 4, HostNodeID: "fabric-node-1", SubmitMaxInflight: 20}
+	h := newComputerHTTPHarness(t, &controlledComputerGrantVerifier{proof: proof})
+	client := h.client(proof.HostNodeID)
+	grant := mintComputerHTTPToken(t, h, client, proof)
+	created := make([]RunAccepted, 0, 2)
+	for index, content := range []string{"exit 1\n", "exit 2\n"} {
+		status, _, body := doComputerHTTP(t, client, http.MethodPost, "/v1/runs", grant.Token,
+			fmt.Sprintf("computer-list-root-%d", index), computerHTTPRunRequest(content))
+		if status != http.StatusCreated {
+			t.Fatalf("create root %d status=%d body=%s", index, status, body)
+		}
+		var accepted RunAccepted
+		if err := json.Unmarshal(body, &accepted); err != nil {
+			t.Fatal(err)
+		}
+		created = append(created, accepted)
+	}
+	childRequest := computerHTTPRunRequest("exit 3\n")
+	childRequest.ParentRunID = created[0].RunID
+	child, _, err := h.store.CreateRun(t.Context(), CreateRunInput{IdempotencyKey: "computer-list-child", Actor: "run:" + created[0].RunID, Request: childRequest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	earlierProof := proof
+	earlierProof.ComputerAttemptID = "attempt-earlier"
+	earlierProof.ComputerStorageGeneration = 6
+	earlierGrant, err := h.store.MintComputerToken(t.Context(), earlierProof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	earlierScope, err := h.store.AuthenticateComputerToken(t.Context(), earlierGrant.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.store.CreateRun(t.Context(), CreateRunInput{IdempotencyKey: "computer-list-earlier", Actor: "computer:" + proof.ComputerID,
+		ComputerScope: &earlierScope, VerifyComputerScope: func(context.Context, ComputerTokenScope) error { return nil }, Request: computerHTTPRunRequest("exit 6\n")}); err != nil {
+		t.Fatal(err)
+	}
+	// Re-mint current authority because minting the earlier fixture revoked it.
+	grant, err = h.store.MintComputerToken(t.Context(), proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	status, _, body := doComputerHTTP(t, client, http.MethodGet, "/v1/runs?origin=computer:self&limit=1", grant.Token, "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("first page status=%d body=%s", status, body)
+	}
+	var first ComputerRunPage
+	if err := json.Unmarshal(body, &first); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Runs) != 1 || first.NextCursor == "" {
+		t.Fatalf("first page = %+v", first)
+	}
+	status, _, body = doComputerHTTP(t, client, http.MethodGet, "/v1/runs?origin=computer:self&limit=1&cursor="+url.QueryEscape(first.NextCursor), grant.Token, "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("second page status=%d body=%s", status, body)
+	}
+	var second ComputerRunPage
+	if err := json.Unmarshal(body, &second); err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Runs) != 1 || second.NextCursor != "" || second.Runs[0].RunID == first.Runs[0].RunID {
+		t.Fatalf("second page = %+v after %+v", second, first)
+	}
+	status, _, body = doComputerHTTP(t, client, http.MethodGet, "/v1/runs?origin=computer:self&include_descendants=true", grant.Token, "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("descendant page status=%d body=%s", status, body)
+	}
+	var descendants ComputerRunPage
+	if err := json.Unmarshal(body, &descendants); err != nil {
+		t.Fatal(err)
+	}
+	if len(descendants.Runs) != 3 || !slices.ContainsFunc(descendants.Runs, func(run contract.RunRecord) bool { return run.RunID == child.RunID }) {
+		t.Fatalf("descendant page = %+v", descendants)
+	}
+	for _, invalid := range []string{"/v1/runs", "/v1/runs?origin=computer:other", "/v1/runs?origin=computer:self&origin=computer:self"} {
+		status, _, body = doComputerHTTP(t, client, http.MethodGet, invalid, grant.Token, "", nil)
+		if status != http.StatusBadRequest {
+			t.Fatalf("invalid list %q status=%d body=%s", invalid, status, body)
 		}
 	}
 }

@@ -19,7 +19,7 @@ func TestServiceAcceptanceHelperAuthorityFailsClosed(t *testing.T) {
 	}
 	authority := testAuthority()
 	requireSweep(t, session)
-	engine.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42101}, HostBridgeReady: true})
+	engine.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42101}, HostBridgeReady: true, HostBridgeEndpoint: "http://127.0.0.1:42102/l3"})
 	request := testRunRequest(authority, 2*time.Second)
 	request.AllocateEndpoints = []string{"service"}
 	request.EnableHostBridgeFallback = true

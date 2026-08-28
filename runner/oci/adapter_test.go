@@ -645,6 +645,51 @@ func TestAdapterPumpsConstrainedMacHostBridgeFallback(t *testing.T) {
 	}
 }
 
+func TestComputerAdapterActivatesForcedMacDialHostBridgeFallback(t *testing.T) {
+	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}, bridgeExchange: make(chan error, 1)}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	memory := int64(2 << 30)
+	request.Execution.OCI.Computer = &contract.OCIComputerSpec{DiskBytes: 8 << 30}
+	request.Execution.OCI.Limits = &contract.OCILimits{MemoryBytes: &memory}
+	request.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: &workloadrunner.ComputerStorage{
+		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30,
+	}}}
+	request.Execution.Env = map[string]string{contract.EnvL3Endpoint: "http://127.0.0.1:43100/l3"}
+	request.Execution.SensitiveEnv = map[string]string{contract.EnvComputerToken: "computer-pass"}
+	request.AttemptEndpoints = []string{workloadrunner.AttemptEndpointView, workloadrunner.AttemptEndpointControl}
+	request.AttemptEndpointReady = func(string, workloadrunner.AttemptEndpoint) error { return nil }
+	request.HostBridgeFallbackActive = true
+	var guestEndpoint string
+	request.HostBridgeEndpointReady = func(endpoint string) error {
+		guestEndpoint = endpoint
+		return nil
+	}
+	request.HostBridgeDial = func(context.Context) (net.Conn, error) {
+		adapterSide, bridgeSide := net.Pipe()
+		go func() {
+			defer bridgeSide.Close()
+			payload := make([]byte, len("guest-request"))
+			if _, err := io.ReadFull(bridgeSide, payload); err == nil && string(payload) == "guest-request" {
+				_, _ = bridgeSide.Write([]byte("host-response"))
+			}
+		}()
+		return adapterSide, nil
+	}
+	result, err := adapter.Run(t.Context(), request, nil)
+	if err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+		t.Fatalf("Computer fallback result=%+v err=%v", result, err)
+	}
+	engine.mu.Lock()
+	requested, activated, computer := engine.lastRun.EnableHostBridgeFallback, engine.lastRun.ActivateHostBridgeFallback, engine.lastRun.Workload.Computer
+	engine.mu.Unlock()
+	if !requested || !activated || !computer || guestEndpoint == "" {
+		t.Fatalf("Computer fallback requested=%t activated=%t computer=%t endpoint=%q", requested, activated, computer, guestEndpoint)
+	}
+}
+
 func TestWorkloadInputMakesManagedVolumeMountsAuthoritative(t *testing.T) {
 	request := workloadrunner.Request{
 		Authority:      workloadrunner.AttemptAuthority{WorkloadClass: contract.JobClassOneShot},
@@ -1148,6 +1193,7 @@ func (engine *adapterTestEngine) Run(_ context.Context, request ocihelper.RunReq
 	}}
 	if request.EnableHostBridgeFallback {
 		response.HostBridgeReady = true
+		response.HostBridgeEndpoint = "http://127.0.0.1:42425/l3"
 	}
 	if len(request.AllocateEndpoints) > 0 {
 		response.Endpoints = make(map[string]uint16, len(request.AllocateEndpoints))

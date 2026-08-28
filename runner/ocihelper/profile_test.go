@@ -556,6 +556,14 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 	if err := validateWorkloadWire(computerDisk); err != nil {
 		t.Fatalf("valid Computer disk was rejected: %v", err)
 	}
+	computerDisk.ComputerToken = "computer-pass"
+	if err := validateWorkloadWire(computerDisk); err == nil {
+		t.Fatal("Computer token without its L3 endpoint was accepted")
+	}
+	computerDisk.L3Endpoint = "http://127.0.0.1:4242/l3"
+	if err := validateWorkloadWire(computerDisk); err != nil {
+		t.Fatalf("paired Computer submission authority was rejected: %v", err)
+	}
 	reservedInOperatorLayers := valid()
 	reservedInOperatorLayers.Environment = []EnvironmentVariable{{Name: "WEFTY_RUN_TOKEN", Value: "public"}}
 	reservedInOperatorLayers.SensitiveEnvironment = []EnvironmentVariable{{Name: "WEFTY_RUN_TOKEN", Value: "sensitive"}}

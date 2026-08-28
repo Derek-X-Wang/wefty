@@ -6,8 +6,11 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -277,6 +280,120 @@ func (s *Store) CanComputerReadRun(ctx context.Context, scope ComputerTokenScope
 		return false, internalError(err, "authorize Computer run read")
 	}
 	return allowed == 1, nil
+}
+
+type computerRunCursor struct {
+	ComputerID                string `json:"computer_id"`
+	ComputerStorageGeneration int64  `json:"computer_storage_generation"`
+	IncludeDescendants        bool   `json:"include_descendants"`
+	CreatedNS                 int64  `json:"created_ns"`
+	RunID                     string `json:"run_id"`
+}
+
+func encodeComputerRunCursor(cursor computerRunCursor) string {
+	payload, err := json.Marshal(cursor)
+	if err != nil {
+		panic("l3: encode Computer Run cursor: " + err.Error())
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func decodeComputerRunCursor(value string, scope ComputerTokenScope, includeDescendants bool) (computerRunCursor, error) {
+	if value == "" {
+		return computerRunCursor{ComputerID: scope.ComputerID, ComputerStorageGeneration: scope.ComputerStorageGeneration,
+			IncludeDescendants: includeDescendants}, nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return computerRunCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+	}
+	var cursor computerRunCursor
+	decoder := json.NewDecoder(strings.NewReader(string(payload)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cursor); err != nil || cursor.ComputerID != scope.ComputerID ||
+		cursor.ComputerStorageGeneration != scope.ComputerStorageGeneration || cursor.IncludeDescendants != includeDescendants ||
+		cursor.CreatedNS < 0 || strings.TrimSpace(cursor.RunID) == "" {
+		return computerRunCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid for this Computer Run scope")
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return computerRunCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+	}
+	return cursor, nil
+}
+
+func (s *Store) ListComputerRuns(ctx context.Context, scope ComputerTokenScope, cursorValue string, limit int, includeDescendants bool) (ComputerRunPage, error) {
+	if limit < 1 || limit > MaxComputerRunPageLimit {
+		return ComputerRunPage{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxComputerRunPageLimit)
+	}
+	cursor, err := decodeComputerRunCursor(cursorValue, scope, includeDescendants)
+	if err != nil {
+		return ComputerRunPage{}, err
+	}
+	query := `SELECT r.run_id, r.created_ns FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
+		WHERE r.parent_run_id IS NULL AND t.source='computer' AND t.computer_id=? AND t.computer_storage_generation=?
+			AND (r.created_ns>? OR (r.created_ns=? AND r.run_id>?))
+		ORDER BY r.created_ns, r.run_id LIMIT ?`
+	if includeDescendants {
+		query = `WITH RECURSIVE visible(run_id) AS (
+			SELECT r.run_id FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
+			WHERE r.parent_run_id IS NULL AND t.source='computer' AND t.computer_id=? AND t.computer_storage_generation=?
+			UNION ALL
+			SELECT child.run_id FROM runs child JOIN visible parent ON child.parent_run_id=parent.run_id
+		) SELECT r.run_id, r.created_ns FROM runs r JOIN visible v ON v.run_id=r.run_id
+		WHERE (r.created_ns>? OR (r.created_ns=? AND r.run_id>?))
+		ORDER BY r.created_ns, r.run_id LIMIT ?`
+	}
+	rows, err := s.db.QueryContext(ctx, query, scope.ComputerID, scope.ComputerStorageGeneration,
+		cursor.CreatedNS, cursor.CreatedNS, cursor.RunID, limit+1)
+	if err != nil {
+		return ComputerRunPage{}, internalError(err, "list Computer Run IDs")
+	}
+	type listedRun struct {
+		runID     string
+		createdNS int64
+	}
+	listed := make([]listedRun, 0, limit+1)
+	for rows.Next() {
+		var item listedRun
+		if err := rows.Scan(&item.runID, &item.createdNS); err != nil {
+			rows.Close()
+			return ComputerRunPage{}, internalError(err, "scan Computer Run ID")
+		}
+		listed = append(listed, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return ComputerRunPage{}, internalError(err, "iterate Computer Run IDs")
+	}
+	if err := rows.Close(); err != nil {
+		return ComputerRunPage{}, internalError(err, "close Computer Run list")
+	}
+	page := ComputerRunPage{Runs: []contract.RunRecord{}}
+	hasMore := len(listed) > limit
+	if hasMore {
+		listed = listed[:limit]
+	}
+	for _, item := range listed {
+		allowed, err := s.CanComputerReadRun(ctx, scope, item.runID)
+		if err != nil {
+			return ComputerRunPage{}, err
+		}
+		if !allowed {
+			return ComputerRunPage{}, protocolError(contract.ErrorForbidden, "Computer Run list crossed its current scope")
+		}
+		record, err := s.GetRun(ctx, item.runID)
+		if err != nil {
+			return ComputerRunPage{}, err
+		}
+		page.Runs = append(page.Runs, record)
+	}
+	if hasMore && len(listed) > 0 {
+		last := listed[len(listed)-1]
+		page.NextCursor = encodeComputerRunCursor(computerRunCursor{ComputerID: scope.ComputerID,
+			ComputerStorageGeneration: scope.ComputerStorageGeneration, IncludeDescendants: includeDescendants,
+			CreatedNS: last.createdNS, RunID: last.runID})
+	}
+	return page, nil
 }
 
 type computerTokenAuditRow struct {

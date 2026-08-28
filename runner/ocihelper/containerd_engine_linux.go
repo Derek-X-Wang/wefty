@@ -803,6 +803,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	created := true
 	var computerDisk *computerDiskAttachment
 	var hostBridge net.Listener
+	var hostBridgeEndpoint string
 	endpoints := make(map[string]uint16, len(request.AllocateEndpoints))
 	endpointHolds := make(map[string]net.Listener, len(request.AllocateEndpoints))
 	defer func() {
@@ -881,9 +882,12 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		if err != nil {
 			return RunResponse{}, fmt.Errorf("reserve constrained guest-to-host bridge: %w", err)
 		}
-		request.Workload.ReservedEnvironment, err = fallbackBridgeEnvironment(request.Workload.ReservedEnvironment, hostBridge.Addr())
+		request.Workload.ReservedEnvironment, hostBridgeEndpoint, err = fallbackBridgeEnvironment(request.Workload.ReservedEnvironment, hostBridge.Addr(), request.ActivateHostBridgeFallback)
 		if err != nil {
 			return RunResponse{}, err
+		}
+		if request.ActivateHostBridgeFallback && request.Workload.L3Endpoint != "" {
+			request.Workload.L3Endpoint = hostBridgeEndpoint
 		}
 	}
 	request.Workload.helperMintedReserved = true
@@ -966,6 +970,11 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			}
 			if computer {
 				computerUID, computerGID = uid, gid
+				if ownerErr = atomicWriteComputerL3Endpoint(controlDirectory, request.Workload.L3Endpoint, uid, gid); ownerErr != nil {
+					closeErr := document.Close()
+					document = nil
+					return errors.Join(ownerErr, closeErr)
+				}
 				if ownerErr = atomicWriteComputerToken(controlDirectory, request.Workload.ComputerToken, uid, gid); ownerErr != nil {
 					closeErr := document.Close()
 					document = nil
@@ -1051,7 +1060,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	}
 	startedAt := time.Now().UTC().Round(0)
 	created = false
-	return RunResponse{Started: true, StartedAt: startedAt, Image: &evidence, Endpoints: endpoints, HostBridgeReady: hostBridge != nil, Profile: profile, Admission: admission}, nil
+	return RunResponse{Started: true, StartedAt: startedAt, Image: &evidence, Endpoints: endpoints, HostBridgeReady: hostBridge != nil, HostBridgeEndpoint: hostBridgeEndpoint, Profile: profile, Admission: admission}, nil
 }
 
 func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cgroupID string, port uint16) error {
@@ -1220,27 +1229,30 @@ func (engine *ContainerdEngine) translateOperatorMountSource(source string) (str
 	return translated, nil
 }
 
-func fallbackBridgeEnvironment(environment []EnvironmentVariable, address net.Addr) ([]EnvironmentVariable, error) {
+func fallbackBridgeEnvironment(environment []EnvironmentVariable, address net.Addr, activate bool) ([]EnvironmentVariable, string, error) {
 	index := -1
-	var endpoint *url.URL
+	endpoint := &url.URL{Scheme: "http", Host: address.String(), Path: "/l3"}
 	for position, variable := range environment {
 		if variable.Name != contract.EnvL3Endpoint {
 			continue
 		}
 		parsed, err := url.Parse(variable.Value)
 		if err != nil || parsed.Scheme != "http" || parsed.Host == "" {
-			return nil, errors.New("Lima host bridge fallback requires a valid HTTP WEFTY_L3_ENDPOINT")
+			return nil, "", errors.New("Lima host bridge fallback requires a valid HTTP WEFTY_L3_ENDPOINT")
 		}
 		index, endpoint = position, parsed
 		break
 	}
 	if index < 0 {
-		return nil, errors.New("Lima host bridge fallback requires WEFTY_L3_ENDPOINT")
+		return environment, endpoint.String(), nil
+	}
+	if !activate {
+		return environment, endpoint.String(), nil
 	}
 	endpoint.Host = address.String()
 	result := append([]EnvironmentVariable(nil), environment...)
 	result[index].Value = endpoint.String()
-	return result, nil
+	return result, endpoint.String(), nil
 }
 
 func (engine *ContainerdEngine) Signal(ctx context.Context, request SignalRequest) error {
@@ -2157,8 +2169,11 @@ func (engine *ContainerdEngine) SetComputerControlState(_ context.Context, reque
 }
 
 func (engine *ContainerdEngine) SetComputerToken(_ context.Context, request SetComputerTokenRequest) error {
-	if strings.IndexByte(request.Token, 0) >= 0 {
-		return errors.New("Computer token contains NUL")
+	if strings.IndexByte(request.Token, 0) >= 0 || strings.IndexByte(request.L3Endpoint, 0) >= 0 {
+		return errors.New("Computer submission authority contains NUL")
+	}
+	if (request.Token == "") != (request.L3Endpoint == "") {
+		return errors.New("Computer token and L3 endpoint must be published or removed together")
 	}
 	attempt, err := engine.attempt(request.Authority)
 	if err != nil {
@@ -2169,7 +2184,19 @@ func (engine *ContainerdEngine) SetComputerToken(_ context.Context, request SetC
 	if attempt.controlDirectory == "" {
 		return errors.New("attempt has no Computer control state")
 	}
-	return atomicWriteComputerToken(attempt.controlDirectory, request.Token, attempt.computerUID, attempt.computerGID)
+	if request.Token == "" {
+		return errors.Join(
+			atomicWriteComputerToken(attempt.controlDirectory, "", attempt.computerUID, attempt.computerGID),
+			atomicWriteComputerL3Endpoint(attempt.controlDirectory, "", attempt.computerUID, attempt.computerGID),
+		)
+	}
+	if err := atomicWriteComputerL3Endpoint(attempt.controlDirectory, request.L3Endpoint, attempt.computerUID, attempt.computerGID); err != nil {
+		return err
+	}
+	if err := atomicWriteComputerToken(attempt.controlDirectory, request.Token, attempt.computerUID, attempt.computerGID); err != nil {
+		return errors.Join(err, atomicWriteComputerL3Endpoint(attempt.controlDirectory, "", attempt.computerUID, attempt.computerGID))
+	}
+	return nil
 }
 func (engine *ContainerdEngine) DialHostBridge(ctx context.Context, request DialHostBridgeRequest, stream io.ReadWriteCloser) error {
 	attempt, err := engine.attempt(request.Authority)

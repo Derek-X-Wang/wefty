@@ -71,6 +71,11 @@ func TestComputerControlStateIsFreshExactReadableAndAtomic(t *testing.T) {
 	if len(entries) != 1 || entries[0].Name() != computerControlFilename {
 		t.Fatalf("Computer control directory = %+v", entries)
 	}
+	for _, filename := range []string{computerTokenFilename, computerL3EndpointFilename} {
+		if _, err := os.Stat(filepath.Join(controlDirectory, filename)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("default-off Computer control file %q exists or returned %v", filename, err)
+		}
+	}
 	if _, err := prepareComputerControlDirectory(logDirectory, func(string) error { return nil }, func(string) error { return nil }); err == nil {
 		t.Fatal("fresh attempt preparation reused prior Computer control state")
 	}
@@ -84,6 +89,11 @@ func TestComputerTokenFileIsAtomicTenantOwnedAndRemovedOnDisable(t *testing.T) {
 	}
 	tokenPath := filepath.Join(controlDirectory, computerTokenFilename)
 	assertComputerTokenFile(t, tokenPath, "first-secret", uid, gid)
+	endpointPath := filepath.Join(controlDirectory, computerL3EndpointFilename)
+	if err := atomicWriteComputerL3Endpoint(controlDirectory, "http://127.0.0.1:4242/l3", uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	assertComputerTokenFile(t, endpointPath, "http://127.0.0.1:4242/l3", uid, gid)
 	if err := atomicWriteComputerToken(controlDirectory, "replacement-secret", uid, gid); err != nil {
 		t.Fatal(err)
 	}
@@ -91,8 +101,14 @@ func TestComputerTokenFileIsAtomicTenantOwnedAndRemovedOnDisable(t *testing.T) {
 	if err := atomicWriteComputerToken(controlDirectory, "", uid, gid); err != nil {
 		t.Fatal(err)
 	}
+	if err := atomicWriteComputerL3Endpoint(controlDirectory, "", uid, gid); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(tokenPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("disabled Computer token file stat error = %v, want not exist", err)
+	}
+	if _, err := os.Stat(endpointPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("disabled Computer endpoint file stat error = %v, want not exist", err)
 	}
 	entries, err := os.ReadDir(controlDirectory)
 	if err != nil {
