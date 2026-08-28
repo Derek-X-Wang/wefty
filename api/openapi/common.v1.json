@@ -184,6 +184,18 @@
           "next_cursor": { "type": "string" }
         }
       },
+      "AuthenticatedPerson": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["fabric_id", "user_id", "device_id", "seen_at"],
+        "properties": {
+          "fabric_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "user_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "device_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "seen_at": { "type": "string", "format": "date-time" }
+        },
+        "description": "The caller person identity authenticated by Fabric. Calling this route records the stable FabricID/UserID pair as grantable person evidence; DeviceID remains audit evidence."
+      },
       "ComputerGrant": {
         "type": "object",
         "additionalProperties": false,
@@ -237,7 +249,7 @@
         "properties": {
           "policy_revision": { "type": "integer", "minimum": 1 },
           "computer_id": { "type": "string", "minLength": 1 },
-          "operation": { "enum": ["grant", "admin_remove", "admin_reset"] },
+          "operation": { "enum": ["grant", "grant_delete", "admin_remove", "admin_reset"] },
           "actor_kind": { "enum": ["fabric_person", "local_operator"] },
           "actor_fabric_id": { "type": "string" },
           "actor_user_id": { "type": "string" },
@@ -262,10 +274,11 @@
       "ComputerPolicySnapshot": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["policy_generation", "policy_revision", "node_id", "boot_session_id", "issued_at", "fresh_until", "admins", "computers", "snapshot_digest"],
+        "required": ["policy_generation", "policy_revision", "issuing_fabric_id", "node_id", "boot_session_id", "issued_at", "fresh_until", "admins", "computers", "snapshot_digest"],
         "properties": {
           "policy_generation": { "type": "integer", "minimum": 1 },
           "policy_revision": { "type": "integer", "minimum": 0 },
+          "issuing_fabric_id": { "type": "string", "minLength": 1, "maxLength": 255 },
           "node_id": { "type": "string", "minLength": 1 },
           "boot_session_id": { "type": "string", "minLength": 1 },
           "issued_at": { "type": "string", "format": "date-time" },
@@ -297,7 +310,7 @@
           },
           "snapshot_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
         },
-        "description": "Short-lived L1-generation/Node/boot-bound policy. Agents keep it only in memory and fail closed on loss, expiry, or regression."
+        "description": "Short-lived issuing-Fabric/L1-generation/Node/boot-bound policy. Agents keep it only in memory and fail closed on loss, expiry, or any revision below the cache high-water mark."
       },
       "ComputerPolicyInstallAcknowledgement": {
         "type": "object",

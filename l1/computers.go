@@ -432,12 +432,11 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	}
 	// grants_json is the pre-policy placeholder retained for durable schema
 	// compatibility. Current person grants live in the revisioned table.
-	_ = grantsJSON
 	computer.Grants, err = listComputerGrants(ctx, q, computerID)
 	if err != nil {
 		return Computer{}, fmt.Errorf("read Computer grants: %w", err)
 	}
-	if len(computer.Grants) == 0 {
+	if len(computer.Grants) == 0 && computer.DesiredState != contract.ServiceDesiredRemoved {
 		// Pre-policy rows used grants_json as an opaque Computer-lifecycle
 		// preservation fixture. Keep projecting those bytes until a real,
 		// Fabric-scoped grant is written; they never enter node policy.
@@ -944,6 +943,9 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	}
 	if err := markComputerIntentApplied(ctx, tx, computerID, nextRevision, now); err != nil {
 		return Computer{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM computer_grants WHERE computer_id=?`, computerID); err != nil {
+		return Computer{}, internalError(err, "delete removed Computer grants")
 	}
 	removed, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {

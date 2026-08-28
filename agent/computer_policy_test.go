@@ -18,7 +18,7 @@ func TestComputerPolicyCacheFailsClosedAndDrainsBeforeAcknowledgement(t *testing
 	machine := person
 	machine.Kind = fabric.IdentityKindMachine
 
-	if decision := cache.LookupGrant("computer-1", person); decision.Allowed() {
+	if decision := cache.lookupGrant("computer-1", person); decision.allowed() {
 		t.Fatalf("cold cache decision = %#v", decision)
 	}
 	view := policySnapshot(t, now, 1, 1, nil, l1.ComputerGrant{FabricID: person.FabricID,
@@ -28,11 +28,11 @@ func TestComputerPolicyCacheFailsClosedAndDrainsBeforeAcknowledgement(t *testing
 		t.Fatal(err)
 	}
 	assertClosed(t, receipt.SessionsClosed, "initial install")
-	if decision := cache.LookupGrant("computer-1", machine); decision.Allowed() {
+	if decision := cache.lookupGrant("computer-1", machine); decision.allowed() {
 		t.Fatalf("machine principal inherited person grant: %#v", decision)
 	}
 	authorization, err := cache.AcquireGrant("computer-1", person)
-	if err != nil || authorization == nil || authorization.Decision().Permission != l1.ComputerGrantView {
+	if err != nil || authorization == nil || authorization.AdmissionRole() != ComputerAdmissionView || authorization.CanTake() {
 		t.Fatalf("view authorization = %#v err=%v", authorization, err)
 	}
 
@@ -49,7 +49,7 @@ func TestComputerPolicyCacheFailsClosedAndDrainsBeforeAcknowledgement(t *testing
 	default:
 	}
 	controller, err := cache.AcquireGrant("computer-1", person)
-	if err != nil || controller == nil || controller.Decision().Permission != l1.ComputerGrantControl {
+	if err != nil || controller == nil || controller.AdmissionRole() != ComputerAdmissionView || !controller.CanTake() {
 		t.Fatalf("control authorization = %#v err=%v", controller, err)
 	}
 
@@ -93,7 +93,7 @@ func TestComputerPolicyCacheFailsClosedAndDrainsBeforeAcknowledgement(t *testing
 	assertOpen(t, revokedReceipt.SessionsClosed, "revoke before relay close")
 	viewer.Release()
 	assertClosed(t, revokedReceipt.SessionsClosed, "revoke after relay close")
-	if decision := cache.LookupGrant("computer-1", person); decision.Allowed() {
+	if decision := cache.lookupGrant("computer-1", person); decision.allowed() {
 		t.Fatalf("revoked grant remained usable: %#v", decision)
 	}
 }
@@ -110,7 +110,7 @@ func TestComputerPolicyCacheAuthorityLossAndExpiryFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	authorization, err := cache.AcquireGrant("computer-1", person)
-	if err != nil || authorization == nil || authorization.Decision().Permission != l1.ComputerGrantControl {
+	if err != nil || authorization == nil || authorization.AdmissionRole() != ComputerAdmissionView || !authorization.CanTake() {
 		t.Fatalf("admin authorization = %#v err=%v", authorization, err)
 	}
 	regressed := policySnapshot(t, now.Add(time.Second), 5, 6, []l1.ComputerPolicyAdmin{admin})
@@ -167,6 +167,36 @@ func TestComputerPolicyCacheAuthorityLossAndExpiryFailClosed(t *testing.T) {
 	cache.Invalidate(ComputerPolicyWatchLost)
 	assertRevocationReason(t, authorization, ComputerPolicyWatchLost)
 	authorization.Release()
+	if cache.Revision() != 11 {
+		t.Fatalf("invalid cache high-water revision = %d, want 11", cache.Revision())
+	}
+	if _, err := cache.Install(policySnapshot(t, clock.Now().Add(time.Second), 7, 10, []l1.ComputerPolicyAdmin{admin})); err == nil {
+		t.Fatal("invalid cache reinstalled a stale pre-watch-loss snapshot")
+	}
+	if cache.Revision() != 11 {
+		t.Fatalf("stale install lowered high-water revision to %d", cache.Revision())
+	}
+}
+
+func TestComputerPolicyDeniesGrantFromAnotherIssuingFabric(t *testing.T) {
+	now := time.Date(2026, 8, 28, 13, 30, 0, 0, time.UTC)
+	cache := NewComputerPolicyCache(newManualClock(now), "node-1", "boot-1")
+	t.Cleanup(cache.Close)
+	oldIdentity := fabric.Identity{FabricID: "fabric-old", UserID: "person-a", DeviceID: "device-a"}
+	snapshot := policySnapshot(t, now, 1, 1, nil, l1.ComputerGrant{FabricID: oldIdentity.FabricID,
+		UserID: oldIdentity.UserID, Permission: l1.ComputerGrantControl, PolicyRevision: 1})
+	snapshot.IssuingFabricID = "fabric-current"
+	var err error
+	snapshot.SnapshotDigest, err = l1.ComputeComputerPolicySnapshotDigest(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Install(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if authorization, err := cache.AcquireGrant("computer-1", oldIdentity); err != nil || authorization != nil {
+		t.Fatalf("foreign-Fabric grant authorization = %#v err=%v", authorization, err)
+	}
 }
 
 func TestComputerPolicyAcquireRacingRevocationHasNoAdmissionGap(t *testing.T) {
@@ -231,7 +261,7 @@ func policySnapshot(t *testing.T, issued time.Time, generation, revision int64, 
 		}
 	}
 	snapshot := l1.ComputerPolicySnapshot{PolicyGeneration: generation, PolicyRevision: revision,
-		NodeID: "node-1", BootSessionID: "boot-1", IssuedAt: issued, FreshUntil: issued.Add(10 * time.Minute),
+		IssuingFabricID: "fabric-one", NodeID: "node-1", BootSessionID: "boot-1", IssuedAt: issued, FreshUntil: issued.Add(10 * time.Minute),
 		Admins: admins, Computers: []l1.ComputerPolicyComputer{{ComputerID: "computer-1", Grants: grants}}}
 	if snapshot.Admins == nil {
 		snapshot.Admins = []l1.ComputerPolicyAdmin{}

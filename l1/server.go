@@ -108,6 +108,9 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	if policyFreshness <= policyWatchWait {
 		return nil, fmt.Errorf("l1: Computer policy freshness must exceed watch wait")
 	}
+	if policyWatchWait >= ComputerPolicyClientTimeout {
+		return nil, fmt.Errorf("l1: Computer policy watch wait must be shorter than the shared client timeout")
+	}
 	s := &Server{
 		fabric: f, store: store,
 		clientPrincipalTag: clientTag, agentPrincipalTag: agentTag,
@@ -251,6 +254,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-retirement-acknowledgement", s.acknowledgeComputerStorageRetirement)
 
 	person := http.NewServeMux()
+	person.HandleFunc("GET /v1/whoami", s.whoAmI)
 	person.HandleFunc("POST /v1/admin-bootstrap", s.bootstrapAdmin)
 	person.HandleFunc("GET /v1/admin-policy", s.getAdminPolicy)
 	person.HandleFunc("GET /v1/admin-policy/audit", s.listAdminPolicyAudit)
@@ -258,6 +262,7 @@ func (s *Server) routes() http.Handler {
 	person.HandleFunc("DELETE /v1/admin-policy/admins/{user_id}", s.removeAdmin)
 	person.HandleFunc("GET /v1/computers/{computer_id}/grants", s.listComputerGrants)
 	person.HandleFunc("PUT /v1/computers/{computer_id}/grants/{user_id}", s.mutateComputerGrant)
+	person.HandleFunc("DELETE /v1/computers/{computer_id}/grants/{user_id}", s.deleteComputerGrant)
 	person.HandleFunc("GET /v1/computers/{computer_id}/grants/audit", s.listComputerPolicyAudit)
 	person.HandleFunc("GET /v1/computers/{computer_id}/revocations/{policy_revision}", s.getComputerPolicyRevocation)
 
@@ -275,6 +280,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/admin-bootstrap", s.authorize(personPrincipal, person))
 	root.Handle("/v1/admin-policy", s.authorize(personPrincipal, person))
 	root.Handle("/v1/admin-policy/", s.authorize(personPrincipal, person))
+	root.Handle("/v1/whoami", s.authorize(personPrincipal, person))
 	return root
 }
 
@@ -375,6 +381,10 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 				writeError(w, err)
 				return
 			}
+			if _, err := s.store.ObserveAuthenticatedPerson(r.Context(), identity); err != nil {
+				writeError(w, err)
+				return
+			}
 		} else {
 			tag := s.clientPrincipalTag
 			if principal == agentPrincipal {
@@ -388,6 +398,12 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 		ctx := context.WithValue(r.Context(), identityContextKey{}, identity)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func (s *Server) whoAmI(w http.ResponseWriter, r *http.Request) {
+	identity := identityFromRequest(r)
+	writeJSON(w, http.StatusOK, AuthenticatedPerson{FabricID: identity.FabricID,
+		UserID: identity.UserID, DeviceID: identity.DeviceID, SeenAt: canonicalTime(s.store.clock.Now())})
 }
 
 func identityFromRequest(r *http.Request) fabric.Identity {
@@ -490,6 +506,24 @@ func (s *Server) mutateComputerGrant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (s *Server) deleteComputerGrant(w http.ResponseWriter, r *http.Request) {
+	var request ComputerGrantDeleteRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	result, err := s.store.DeleteForeignComputerGrant(r.Context(), identityFromRequest(r),
+		r.PathValue("computer_id"), r.PathValue("user_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if result.Replayed {
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (s *Server) listComputerPolicyAudit(w http.ResponseWriter, r *http.Request) {
 	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
 	if err != nil {
@@ -512,7 +546,7 @@ func (s *Server) getComputerPolicyRevocation(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	revocation, err := s.store.GetComputerPolicyRevocation(r.Context(), identityFromRequest(r),
-		revision, r.PathValue("computer_id"), "", "")
+		revision, r.PathValue("computer_id"), r.URL.Query().Get("fabric_id"), r.URL.Query().Get("user_id"))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -891,11 +925,10 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	computerPolicy, err := s.store.IssueComputerPolicySnapshot(r.Context(), identity.NodeID, nodeID,
+	computerPolicy, err := s.store.IssueComputerPolicySnapshot(r.Context(), identity.NodeID, identity.FabricID, nodeID,
 		request.BootSessionID, s.computerPolicyFreshness)
 	if err != nil {
-		writeError(w, err)
-		return
+		computerPolicy = nil
 	}
 	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, RemovalDirectives: directives,
 		StorageResetDirectives: storageResets, ComputerPolicy: computerPolicy})
@@ -911,7 +944,7 @@ func (s *Server) watchComputerPolicy(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.PathValue("node_id")
 	bootSessionID := r.URL.Query().Get("boot_session_id")
 	change := s.store.computerPolicyChangeChannel()
-	snapshot, err := s.store.IssueComputerPolicySnapshot(r.Context(), identity.NodeID, nodeID,
+	snapshot, err := s.store.IssueComputerPolicySnapshot(r.Context(), identity.NodeID, identity.FabricID, nodeID,
 		bootSessionID, s.computerPolicyFreshness)
 	if err != nil {
 		writeError(w, err)
@@ -921,15 +954,15 @@ func (s *Server) watchComputerPolicy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, snapshot)
 		return
 	}
-	timer := time.NewTimer(s.computerPolicyWatchWait)
+	timer := newClockTimer(s.store.clock, s.computerPolicyWatchWait)
 	defer timer.Stop()
 	select {
 	case <-r.Context().Done():
 		return
 	case <-change:
-	case <-timer.C:
+	case <-timer.C():
 	}
-	snapshot, err = s.store.IssueComputerPolicySnapshot(r.Context(), identity.NodeID, nodeID,
+	snapshot, err = s.store.IssueComputerPolicySnapshot(r.Context(), identity.NodeID, identity.FabricID, nodeID,
 		bootSessionID, s.computerPolicyFreshness)
 	if err != nil {
 		writeError(w, err)
@@ -1155,13 +1188,7 @@ func redactJob(job Job) Job {
 
 func redactComputer(computer Computer) Computer {
 	computer.CurrentJob = redactJob(computer.CurrentJob)
-	grants := make([]ComputerGrant, 0, len(computer.Grants))
-	for _, grant := range computer.Grants {
-		if grant.FabricID != "" && grant.UserID != "" && !grant.UpdatedAt.IsZero() {
-			grants = append(grants, grant)
-		}
-	}
-	computer.Grants = grants
+	computer.Grants = []ComputerGrant{}
 	return computer
 }
 

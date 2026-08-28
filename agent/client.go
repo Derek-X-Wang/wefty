@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	DefaultOperationTimeout    = 10 * time.Second
+	DefaultOperationTimeout    = l1.ComputerPolicyClientTimeout
 	DefaultMaxIdleConnsPerHost = 16
 
 	// DefaultFinalizationTimeout bounds the uncancelable finalization phase —

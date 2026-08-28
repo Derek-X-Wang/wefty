@@ -20,6 +20,7 @@ import (
 const (
 	DefaultComputerPolicyFreshness = 15 * time.Second
 	DefaultComputerPolicyWatchWait = 5 * time.Second
+	ComputerPolicyClientTimeout    = 10 * time.Second
 )
 
 type ComputerPolicyRevocationState string
@@ -31,8 +32,16 @@ const (
 
 type ComputerGrantMutationRequest struct {
 	PolicyRevision int64                   `json:"policy_revision"`
+	FabricID       string                  `json:"fabric_id,omitempty"`
 	Permission     ComputerGrantPermission `json:"permission"`
 	IdempotencyKey string                  `json:"idempotency_key"`
+	delete         bool
+}
+
+type ComputerGrantDeleteRequest struct {
+	PolicyRevision int64  `json:"policy_revision"`
+	FabricID       string `json:"fabric_id"`
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 type ComputerGrantMutationResult struct {
@@ -50,6 +59,7 @@ type ComputerPolicyAuditOperation string
 
 const (
 	ComputerPolicyAuditGrant       ComputerPolicyAuditOperation = "grant"
+	ComputerPolicyAuditGrantDelete ComputerPolicyAuditOperation = "grant_delete"
 	ComputerPolicyAuditAdminRemove ComputerPolicyAuditOperation = "admin_remove"
 	ComputerPolicyAuditAdminReset  ComputerPolicyAuditOperation = "admin_reset"
 )
@@ -100,6 +110,7 @@ type ComputerPolicyComputer struct {
 type ComputerPolicySnapshot struct {
 	PolicyGeneration int64                    `json:"policy_generation"`
 	PolicyRevision   int64                    `json:"policy_revision"`
+	IssuingFabricID  string                   `json:"issuing_fabric_id"`
 	NodeID           string                   `json:"node_id"`
 	BootSessionID    string                   `json:"boot_session_id"`
 	IssuedAt         time.Time                `json:"issued_at"`
@@ -152,13 +163,15 @@ func computerGrantRank(permission ComputerGrantPermission) int {
 
 func computerGrantRequestHash(identity fabric.Identity, computerID, userID string, request ComputerGrantMutationRequest) (string, error) {
 	payload, err := json.Marshal(struct {
-		ActorFabricID string                  `json:"actor_fabric_id"`
-		ActorUserID   string                  `json:"actor_user_id"`
-		ComputerID    string                  `json:"computer_id"`
-		SubjectUserID string                  `json:"subject_user_id"`
-		Revision      int64                   `json:"policy_revision"`
-		Permission    ComputerGrantPermission `json:"permission"`
-	}{identity.FabricID, identity.UserID, computerID, userID, request.PolicyRevision, request.Permission})
+		ActorFabricID   string                  `json:"actor_fabric_id"`
+		ActorUserID     string                  `json:"actor_user_id"`
+		ComputerID      string                  `json:"computer_id"`
+		SubjectFabricID string                  `json:"subject_fabric_id"`
+		SubjectUserID   string                  `json:"subject_user_id"`
+		Revision        int64                   `json:"policy_revision"`
+		Permission      ComputerGrantPermission `json:"permission"`
+		Delete          bool                    `json:"delete"`
+	}{identity.FabricID, identity.UserID, computerID, request.FabricID, userID, request.PolicyRevision, request.Permission, request.delete})
 	if err != nil {
 		return "", internalError(err, "encode Computer grant mutation")
 	}
@@ -172,6 +185,9 @@ func validateGrantMutation(computerID, userID string, request ComputerGrantMutat
 	}
 	if _, err := validateAdminUserID(userID); err != nil {
 		return err
+	}
+	if strings.TrimSpace(request.FabricID) == "" || request.FabricID != strings.TrimSpace(request.FabricID) || len(request.FabricID) > 255 {
+		return protocolError(contract.ErrorInvalidRequest, "fabric_id must contain between 1 and 255 bytes")
 	}
 	if err := validateComputerGrantPermission(request.Permission); err != nil {
 		return err
@@ -189,6 +205,9 @@ func (s *Store) MutateComputerGrant(ctx context.Context, identity fabric.Identit
 	if err := validatePersonIdentity(identity); err != nil {
 		return ComputerGrantMutationResult{}, err
 	}
+	if request.FabricID == "" {
+		request.FabricID = identity.FabricID
+	}
 	if err := validateGrantMutation(computerID, userID, request); err != nil {
 		return ComputerGrantMutationResult{}, err
 	}
@@ -205,9 +224,13 @@ func (s *Store) MutateComputerGrant(ctx context.Context, identity fabric.Identit
 	if err := requireCurrentAdmin(ctx, tx, identity); err != nil {
 		return ComputerGrantMutationResult{}, err
 	}
+	if request.delete && request.FabricID == identity.FabricID {
+		return ComputerGrantMutationResult{}, protocolError(contract.ErrorInvalidRequest,
+			"current issuing-Fabric grants must retain durable none instead of being deleted")
+	}
 	if replay, replayErr := readComputerGrantReplay(ctx, tx, computerID, request.IdempotencyKey, requestHash); replayErr == nil {
 		replay.Replayed = true
-		replay.Revocation, err = readComputerPolicyRevocation(ctx, tx, replay.Grant.PolicyRevision, computerID, identity.FabricID, userID)
+		replay.Revocation, err = readComputerPolicyRevocation(ctx, tx, replay.Grant.PolicyRevision, computerID, request.FabricID, userID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return ComputerGrantMutationResult{}, internalError(err, "read replayed Computer revocation")
 		}
@@ -244,22 +267,44 @@ func (s *Store) MutateComputerGrant(ctx context.Context, identity fabric.Identit
 	previous := ComputerGrantNone
 	var previousValue string
 	readErr := tx.QueryRowContext(ctx, `SELECT permission FROM computer_grants WHERE computer_id=? AND fabric_id=? AND user_id=?`,
-		computerID, identity.FabricID, userID).Scan(&previousValue)
+		computerID, request.FabricID, userID).Scan(&previousValue)
 	if readErr == nil {
 		previous = ComputerGrantPermission(previousValue)
 	} else if !errors.Is(readErr, sql.ErrNoRows) {
 		return ComputerGrantMutationResult{}, internalError(readErr, "read current Computer grant")
 	}
-	if previous == request.Permission {
+	if request.delete && errors.Is(readErr, sql.ErrNoRows) {
+		return ComputerGrantMutationResult{}, protocolError(contract.ErrorNotFound,
+			"Computer %q has no grant for person %q in Fabric %q", computerID, userID, request.FabricID)
+	}
+	if !request.delete && (request.Permission != ComputerGrantNone || errors.Is(readErr, sql.ErrNoRows)) {
+		var provenPerson bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM authenticated_people WHERE fabric_id=? AND user_id=?)`,
+			request.FabricID, userID).Scan(&provenPerson); err != nil {
+			return ComputerGrantMutationResult{}, internalError(err, "read Computer grant person evidence")
+		}
+		if !provenPerson {
+			return ComputerGrantMutationResult{}, protocolError(contract.ErrorPersonIdentityRequired,
+				"grant subject %q has not authenticated as a person in Fabric %q", userID, request.FabricID)
+		}
+	}
+	if !request.delete && previous == request.Permission && !(request.Permission == ComputerGrantNone && errors.Is(readErr, sql.ErrNoRows)) {
 		return ComputerGrantMutationResult{}, protocolError(contract.ErrorConflict,
 			"Computer %q already has %s permission for person %q", computerID, request.Permission, userID)
 	}
 	nextRevision := revision + 1
-	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_grants(computer_id, fabric_id, user_id, permission, policy_revision, updated_ns)
-		VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(computer_id, fabric_id, user_id) DO UPDATE SET
-		permission=excluded.permission, policy_revision=excluded.policy_revision, updated_ns=excluded.updated_ns`,
-		computerID, identity.FabricID, userID, request.Permission, nextRevision, now.UnixNano()); err != nil {
-		return ComputerGrantMutationResult{}, internalError(err, "store current Computer grant")
+	if request.delete {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM computer_grants WHERE computer_id=? AND fabric_id=? AND user_id=?`,
+			computerID, request.FabricID, userID); err != nil {
+			return ComputerGrantMutationResult{}, internalError(err, "delete foreign-Fabric Computer grant")
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO computer_grants(computer_id, fabric_id, user_id, permission, policy_revision, updated_ns)
+			VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(computer_id, fabric_id, user_id) DO UPDATE SET
+			permission=excluded.permission, policy_revision=excluded.policy_revision, updated_ns=excluded.updated_ns`,
+			computerID, request.FabricID, userID, request.Permission, nextRevision, now.UnixNano()); err != nil {
+			return ComputerGrantMutationResult{}, internalError(err, "store current Computer grant")
+		}
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE admin_policy SET revision=?, updated_ns=? WHERE singleton=1 AND revision=?`,
 		nextRevision, now.UnixNano(), revision)
@@ -273,31 +318,43 @@ func (s *Store) MutateComputerGrant(ctx context.Context, identity fabric.Identit
 		return ComputerGrantMutationResult{}, protocolError(contract.ErrorStalePolicyRevision,
 			"Computer policy revision changed from %d", revision)
 	}
+	operation := ComputerPolicyAuditGrant
+	if request.delete {
+		operation = ComputerPolicyAuditGrantDelete
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_policy_audit(
 		policy_revision, computer_id, operation, actor_kind, actor_fabric_id, actor_user_id, actor_device_id,
 		subject_fabric_id, subject_user_id, previous_permission, permission, idempotency_key, request_hash, created_ns
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, nextRevision, computerID, ComputerPolicyAuditGrant,
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, nextRevision, computerID, operation,
 		AdminPolicyActorFabricPerson, identity.FabricID, identity.UserID, identity.DeviceID,
-		identity.FabricID, userID, previous, request.Permission, request.IdempotencyKey, requestHash, now.UnixNano()); err != nil {
+		request.FabricID, userID, previous, request.Permission, request.IdempotencyKey, requestHash, now.UnixNano()); err != nil {
 		return ComputerGrantMutationResult{}, internalError(err, "append Computer policy audit")
 	}
 	var revocation *ComputerPolicyRevocation
 	if computerGrantRank(request.Permission) < computerGrantRank(previous) {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO computer_policy_revocations(
 			policy_revision, computer_id, subject_fabric_id, subject_user_id, target_permission, created_ns
-		) VALUES(?, ?, ?, ?, ?, ?)`, nextRevision, computerID, identity.FabricID, userID, request.Permission, now.UnixNano()); err != nil {
+		) VALUES(?, ?, ?, ?, ?, ?)`, nextRevision, computerID, request.FabricID, userID, request.Permission, now.UnixNano()); err != nil {
 			return ComputerGrantMutationResult{}, internalError(err, "record Computer policy revocation")
 		}
 		revocation = &ComputerPolicyRevocation{PolicyRevision: nextRevision, ComputerID: computerID,
-			SubjectFabricID: identity.FabricID, SubjectUserID: userID, TargetPermission: request.Permission,
+			SubjectFabricID: request.FabricID, SubjectUserID: userID, TargetPermission: request.Permission,
 			State: ComputerPolicyRevocationPending, CreatedAt: now}
 	}
 	if err := tx.Commit(); err != nil {
 		return ComputerGrantMutationResult{}, internalError(err, "commit Computer grant mutation")
 	}
 	s.notifyComputerPolicyChanged()
-	return ComputerGrantMutationResult{Grant: ComputerGrant{FabricID: identity.FabricID, UserID: userID,
+	return ComputerGrantMutationResult{Grant: ComputerGrant{FabricID: request.FabricID, UserID: userID,
 		Permission: request.Permission, PolicyRevision: nextRevision, UpdatedAt: now}, Revocation: revocation}, nil
+}
+
+func (s *Store) DeleteForeignComputerGrant(ctx context.Context, identity fabric.Identity, computerID, userID string,
+	request ComputerGrantDeleteRequest) (ComputerGrantMutationResult, error) {
+	return s.MutateComputerGrant(ctx, identity, computerID, userID, ComputerGrantMutationRequest{
+		PolicyRevision: request.PolicyRevision, FabricID: request.FabricID, Permission: ComputerGrantNone,
+		IdempotencyKey: request.IdempotencyKey, delete: true,
+	})
 }
 
 func readComputerGrantReplay(ctx context.Context, q queryer, computerID, idempotencyKey, requestHash string) (ComputerGrantMutationResult, error) {
@@ -442,7 +499,9 @@ func ComputeComputerPolicySnapshotDigest(snapshot ComputerPolicySnapshot) (strin
 }
 
 func ValidateComputerPolicySnapshot(snapshot ComputerPolicySnapshot) error {
-	if snapshot.PolicyGeneration < 1 || snapshot.PolicyRevision < 0 || strings.TrimSpace(snapshot.NodeID) == "" ||
+	if snapshot.PolicyGeneration < 1 || snapshot.PolicyRevision < 0 || strings.TrimSpace(snapshot.IssuingFabricID) == "" ||
+		snapshot.IssuingFabricID != strings.TrimSpace(snapshot.IssuingFabricID) || len(snapshot.IssuingFabricID) > 255 ||
+		strings.TrimSpace(snapshot.NodeID) == "" ||
 		strings.TrimSpace(snapshot.BootSessionID) == "" || snapshot.IssuedAt.IsZero() || !snapshot.FreshUntil.After(snapshot.IssuedAt) {
 		return errors.New("invalid Computer policy snapshot authority")
 	}
@@ -493,7 +552,10 @@ func ValidateComputerPolicySnapshot(snapshot ComputerPolicySnapshot) error {
 	return nil
 }
 
-func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID, nodeID, bootSessionID string, freshness time.Duration) (*ComputerPolicySnapshot, error) {
+func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID, issuingFabricID, nodeID, bootSessionID string, freshness time.Duration) (*ComputerPolicySnapshot, error) {
+	if strings.TrimSpace(issuingFabricID) == "" || issuingFabricID != strings.TrimSpace(issuingFabricID) || len(issuingFabricID) > 255 {
+		return nil, protocolError(contract.ErrorUnauthorized, "agent identity has no valid issuing Fabric")
+	}
 	if freshness <= 0 {
 		freshness = DefaultComputerPolicyFreshness
 	}
@@ -515,14 +577,6 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 	}
 	if storedBoot != bootSessionID {
 		return nil, protocolError(contract.ErrorNodeSessionReplaced, "node %q boot session was replaced", nodeID)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM computer_policy_issued
-		WHERE node_id=? AND (boot_session_id<>? OR expires_ns<=?)`, nodeID, bootSessionID, now.UnixNano()); err != nil {
-		return nil, internalError(err, "expire old Computer policy issuances")
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM computer_policy_installations
-		WHERE node_id=? AND boot_session_id<>?`, nodeID, bootSessionID); err != nil {
-		return nil, internalError(err, "expire old Computer policy installations")
 	}
 	var generation, revision int64
 	if err := tx.QueryRowContext(ctx, `SELECT authority_generation, revision FROM admin_policy WHERE singleton=1`).Scan(&generation, &revision); err != nil {
@@ -555,6 +609,10 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 		}
 		return nil, nil
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM computer_policy_issued
+		WHERE node_id=? AND expires_ns<=?`, nodeID, now.UnixNano()); err != nil {
+		return nil, internalError(err, "expire old Computer policy issuances")
+	}
 	adminRows, err := tx.QueryContext(ctx, `SELECT fabric_id, user_id FROM admins ORDER BY fabric_id, user_id`)
 	if err != nil {
 		return nil, internalError(err, "list Computer policy administrators")
@@ -579,7 +637,7 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 		}
 		computers = append(computers, ComputerPolicyComputer{ComputerID: computerID, Grants: grants})
 	}
-	snapshot := ComputerPolicySnapshot{PolicyGeneration: generation, PolicyRevision: revision,
+	snapshot := ComputerPolicySnapshot{PolicyGeneration: generation, PolicyRevision: revision, IssuingFabricID: issuingFabricID,
 		NodeID: nodeID, BootSessionID: bootSessionID, IssuedAt: now, FreshUntil: canonicalTime(now.Add(freshness)),
 		Admins: admins, Computers: computers}
 	snapshot.SnapshotDigest, err = ComputeComputerPolicySnapshotDigest(snapshot)
@@ -735,7 +793,7 @@ func (s *Store) computerPolicyRevisionInstalled(ctx context.Context, revision in
 		return false, internalError(err, "read revocation nodes")
 	}
 	for _, nodeID := range nodes {
-		var installed bool
+		var installed, olderBootStillLeased bool
 		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
 			SELECT 1 FROM nodes n JOIN computer_policy_installations i
 			ON i.node_id=n.node_id AND i.boot_session_id=n.boot_session_id
@@ -744,6 +802,22 @@ func (s *Store) computerPolicyRevisionInstalled(ctx context.Context, revision in
 			return false, internalError(err, "read revocation installation")
 		}
 		if !installed {
+			return false, nil
+		}
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+			SELECT 1 FROM nodes n JOIN computer_policy_issued issued ON issued.node_id=n.node_id
+			WHERE n.node_id=? AND issued.boot_session_id<>n.boot_session_id
+			AND issued.expires_ns>? AND issued.policy_revision<? AND NOT EXISTS(
+				SELECT 1 FROM computer_policy_installations installed
+				WHERE installed.node_id=issued.node_id
+				AND installed.boot_session_id=issued.boot_session_id
+				AND installed.policy_generation=issued.policy_generation
+				AND installed.policy_revision>=?
+			)
+		)`, nodeID, canonicalTime(s.clock.Now()).UnixNano(), revision, revision).Scan(&olderBootStillLeased); err != nil {
+			return false, internalError(err, "read replaced-boot Computer policy lease")
+		}
+		if olderBootStillLeased {
 			return false, nil
 		}
 	}

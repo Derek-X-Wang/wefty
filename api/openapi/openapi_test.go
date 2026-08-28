@@ -89,6 +89,7 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 	client := readObject(t, "l1-client.v1.json")
 	paths := object(t, client["paths"], "paths")
 	for _, path := range []string{
+		"/v1/whoami",
 		"/v1/computers",
 		"/v1/computers/{computer_id}",
 		"/v1/computers/{computer_id}/intents",
@@ -212,7 +213,7 @@ func TestComputerGrantPolicyContractsAreNodeBoundAndPersonScoped(t *testing.T) {
 	common := readObject(t, "common.v1.json")
 	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
 	for _, name := range []string{
-		"ComputerGrant", "ComputerGrantList", "ComputerGrantMutationResult", "ComputerPolicyAudit",
+		"AuthenticatedPerson", "ComputerGrant", "ComputerGrantList", "ComputerGrantMutationResult", "ComputerPolicyAudit",
 		"ComputerPolicyAuditList", "ComputerPolicyRevocation", "ComputerPolicySnapshot",
 		"ComputerPolicyInstallAcknowledgement",
 	} {
@@ -229,7 +230,7 @@ func TestComputerGrantPolicyContractsAreNodeBoundAndPersonScoped(t *testing.T) {
 	}
 	snapshot := object(t, schemas["ComputerPolicySnapshot"], "ComputerPolicySnapshot")
 	snapshotRequired := stringSet(t, snapshot["required"])
-	for _, field := range []string{"policy_generation", "policy_revision", "node_id", "boot_session_id", "fresh_until", "snapshot_digest"} {
+	for _, field := range []string{"policy_generation", "policy_revision", "issuing_fabric_id", "node_id", "boot_session_id", "fresh_until", "snapshot_digest"} {
 		if !snapshotRequired[field] {
 			t.Errorf("ComputerPolicySnapshot does not require %q", field)
 		}

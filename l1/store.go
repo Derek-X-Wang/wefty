@@ -403,6 +403,13 @@ CREATE TABLE IF NOT EXISTS admins (
   added_ns INTEGER NOT NULL,
   PRIMARY KEY(fabric_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS authenticated_people (
+  fabric_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  last_device_id TEXT NOT NULL,
+  last_seen_ns INTEGER NOT NULL,
+  PRIMARY KEY(fabric_id, user_id)
+);
 CREATE TRIGGER IF NOT EXISTS admins_bounded_before_insert
 BEFORE INSERT ON admins WHEN (SELECT COUNT(*) FROM admins) >= 32
 BEGIN SELECT RAISE(ABORT, 'admin policy limit reached'); END;
@@ -437,7 +444,7 @@ CREATE TABLE IF NOT EXISTS computer_grants (
 CREATE TABLE IF NOT EXISTS computer_policy_audit (
   policy_revision INTEGER NOT NULL CHECK(policy_revision > 0),
   computer_id TEXT NOT NULL,
-  operation TEXT NOT NULL CHECK(operation IN ('grant', 'admin_remove', 'admin_reset')),
+  operation TEXT NOT NULL CHECK(operation IN ('grant', 'grant_delete', 'admin_remove', 'admin_reset')),
   actor_kind TEXT NOT NULL CHECK(actor_kind IN ('fabric_person', 'local_operator')),
   actor_fabric_id TEXT NOT NULL,
   actor_user_id TEXT NOT NULL,

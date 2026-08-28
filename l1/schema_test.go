@@ -57,8 +57,9 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 			"verification_receipt_json", "verification_receipt_hash", "acknowledgement_key", "acknowledgement_hash",
 			"requested_ns", "verified_ns", "published_ns",
 		},
-		"admin_policy": {"singleton", "revision", "bootstrap_open", "authority_generation", "updated_ns"},
-		"admins":       {"fabric_id", "user_id", "added_revision", "added_ns"},
+		"admin_policy":         {"singleton", "revision", "bootstrap_open", "authority_generation", "updated_ns"},
+		"admins":               {"fabric_id", "user_id", "added_revision", "added_ns"},
+		"authenticated_people": {"fabric_id", "user_id", "last_device_id", "last_seen_ns"},
 		"admin_policy_audit": {
 			"revision", "operation", "actor_kind", "actor_fabric_id", "actor_user_id",
 			"actor_device_id", "subject_fabric_id", "subject_user_id", "created_ns",

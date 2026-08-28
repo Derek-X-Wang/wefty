@@ -8,6 +8,19 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/whoami": {
+      "get": {
+        "operationId": "observeAuthenticatedPerson",
+        "summary": "Record and return the Fabric-authenticated person identity",
+        "description": "Any authenticated person may call this before an administrator grants Computer access. Machine principals are rejected and never recorded.",
+        "responses": {
+          "200": { "description": "Current authenticated person evidence.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/AuthenticatedPerson" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/jobs": {
       "post": {
         "operationId": "createJob",
@@ -421,12 +434,13 @@
       "put": {
         "operationId": "mutateComputerGrant",
         "summary": "Set view, control, or durable none under policy CAS",
-        "description": "Current administrators only. The subject is scoped to the actor's authenticated issuing Fabric; the idempotency key provides exact replay and every accepted mutation appends immutable person/device audit.",
+        "description": "Current administrators only. fabric_id defaults to the actor's current issuing Fabric and may address an older Fabric grant for explicit revocation. A new grant requires prior authenticated-person evidence; the idempotency key provides exact replay and every accepted mutation appends immutable person/device audit.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["policy_revision", "permission", "idempotency_key"],
           "properties": {
             "policy_revision": { "type": "integer", "minimum": 1 },
+            "fabric_id": { "type": "string", "minLength": 1, "maxLength": 255 },
             "permission": { "enum": ["none", "view", "control"] },
             "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 255 }
           }
@@ -437,6 +451,29 @@
             "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean" } } },
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerGrantMutationResult" } } }
           },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      },
+      "delete": {
+        "operationId": "deleteForeignComputerGrant",
+        "summary": "Delete a grant from an older issuing Fabric under policy CAS",
+        "description": "Current administrators only. Deletion requires an explicit fabric_id different from the current issuing Fabric; current-Fabric revocation remains a durable none row.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["policy_revision", "fabric_id", "idempotency_key"],
+          "properties": {
+            "policy_revision": { "type": "integer", "minimum": 1 },
+            "fabric_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 255 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Foreign-Fabric grant deleted with immutable audit evidence.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerGrantMutationResult" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
@@ -467,7 +504,9 @@
     "/v1/computers/{computer_id}/revocations/{policy_revision}": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
-        { "name": "policy_revision", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 } }
+        { "name": "policy_revision", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 } },
+        { "name": "fabric_id", "in": "query", "schema": { "type": "string", "minLength": 1, "maxLength": 255 } },
+        { "name": "user_id", "in": "query", "schema": { "type": "string", "minLength": 1, "maxLength": 255 } }
       ],
       "get": {
         "operationId": "getComputerPolicyRevocation",

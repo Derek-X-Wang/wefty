@@ -130,7 +130,7 @@
       "post": {
         "operationId": "acknowledgeComputerPolicy",
         "summary": "Acknowledge an issued snapshot after installation and session closure",
-        "description": "The receipt is derived from the installed in-memory snapshot. The agent sends it only after every authorization downgraded by this revision has released after closing both relay legs.",
+        "description": "The receipt is derived from the installed in-memory snapshot. A dedicated retry loop sends it only after every authorization downgraded by this revision has released after closing both relay legs, without parking heartbeat or watch. A replacement boot does not complete revocation until any older boot policy lease expires or that boot already acknowledged the revision.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerPolicyInstallAcknowledgement" } } } },
         "responses": {
           "204": { "description": "Matching current-boot installation recorded." },

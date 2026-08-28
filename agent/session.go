@@ -72,6 +72,7 @@ type agentSession struct {
 	removals        *removalController
 	storageResets   *storageResetController
 	computerPolicy  *ComputerPolicyCache
+	computerAcks    *computerPolicyAckController
 
 	drainOnce      sync.Once
 	drainRequested chan struct{}
@@ -147,6 +148,7 @@ func newAgentSession(
 		drainRequested:  make(chan struct{}),
 		computerPolicy:  NewComputerPolicyCache(clock, registration.NodeID, registration.BootSessionID),
 	}
+	session.computerAcks = newComputerPolicyAckController(client, clock, logf)
 	return session
 }
 
@@ -430,13 +432,8 @@ func (session *agentSession) installComputerPolicy(ctx context.Context, snapshot
 	if err != nil {
 		return err
 	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-receipt.SessionsClosed:
-	}
-	if err := session.client.AcknowledgeComputerPolicy(ctx, receipt.Acknowledgement); err != nil {
-		return fmt.Errorf("agent: acknowledge Computer policy installation: %w", err)
+	if session.computerAcks != nil {
+		session.computerAcks.submit(receipt)
 	}
 	return nil
 }
@@ -591,6 +588,11 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 		defer close(policyWatchDone)
 		session.computerPolicyWatchLoop(sessionContext)
 	}()
+	policyAckDone := make(chan struct{})
+	go func() {
+		defer close(policyAckDone)
+		session.computerAcks.run(sessionContext)
+	}()
 	type claimWorker struct {
 		id       int
 		pool     classPool
@@ -651,6 +653,7 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 		stopSession()
 		<-heartbeatDone
 		<-policyWatchDone
+		<-policyAckDone
 		for len(workers) > 0 {
 			result := <-workerDone
 			delete(workers, result.id)

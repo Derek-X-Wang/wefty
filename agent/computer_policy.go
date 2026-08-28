@@ -27,7 +27,7 @@ type ComputerPolicyRevocation struct {
 	Permission     l1.ComputerGrantPermission
 }
 
-type ComputerGrantDecision struct {
+type computerGrantDecision struct {
 	ComputerID     string
 	FabricID       string
 	UserID         string
@@ -36,7 +36,7 @@ type ComputerGrantDecision struct {
 	FreshUntil     time.Time
 }
 
-func (decision ComputerGrantDecision) Allowed() bool {
+func (decision computerGrantDecision) allowed() bool {
 	return decision.Permission == l1.ComputerGrantView || decision.Permission == l1.ComputerGrantControl
 }
 
@@ -47,18 +47,25 @@ func (decision ComputerGrantDecision) Allowed() bool {
 type ComputerGrantAuthorization struct {
 	cache       *ComputerPolicyCache
 	id          uint64
-	decision    ComputerGrantDecision
+	decision    computerGrantDecision
 	revocations chan ComputerPolicyRevocation
 	once        sync.Once
 	barriers    []*computerPolicyDrainBarrier
 	revoked     bool
 }
 
-func (authorization *ComputerGrantAuthorization) Decision() ComputerGrantDecision {
-	if authorization == nil {
-		return ComputerGrantDecision{Permission: l1.ComputerGrantNone}
-	}
-	return authorization.decision
+type ComputerAdmissionRole string
+
+const ComputerAdmissionView ComputerAdmissionRole = "view"
+
+// AdmissionRole deliberately cannot express control. Every connection starts
+// as view; a later session-bound Take may use CanTake separately.
+func (authorization *ComputerGrantAuthorization) AdmissionRole() ComputerAdmissionRole {
+	return ComputerAdmissionView
+}
+
+func (authorization *ComputerGrantAuthorization) CanTake() bool {
+	return authorization != nil && authorization.decision.Permission == l1.ComputerGrantControl
 }
 
 func (authorization *ComputerGrantAuthorization) Revocations() <-chan ComputerPolicyRevocation {
@@ -118,6 +125,8 @@ type ComputerPolicyCache struct {
 	bootSessionID  string
 	snapshot       l1.ComputerPolicySnapshot
 	valid          bool
+	highGeneration int64
+	highRevision   int64
 	installSerial  uint64
 	nextAuthID     uint64
 	authorizations map[uint64]*ComputerGrantAuthorization
@@ -133,10 +142,7 @@ func NewComputerPolicyCache(clock Clock, nodeID, bootSessionID string) *Computer
 func (cache *ComputerPolicyCache) Revision() int64 {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
-	if !cache.valid {
-		return 0
-	}
-	return cache.snapshot.PolicyRevision
+	return cache.highRevision
 }
 
 func (cache *ComputerPolicyCache) Valid() bool {
@@ -146,9 +152,9 @@ func (cache *ComputerPolicyCache) Valid() bool {
 	return cache.valid
 }
 
-func (cache *ComputerPolicyCache) LookupGrant(computerID string, identity fabric.Identity) ComputerGrantDecision {
+func (cache *ComputerPolicyCache) lookupGrant(computerID string, identity fabric.Identity) computerGrantDecision {
 	if !validComputerPolicyPerson(identity) {
-		return ComputerGrantDecision{ComputerID: computerID, FabricID: identity.FabricID,
+		return computerGrantDecision{ComputerID: computerID, FabricID: identity.FabricID,
 			UserID: identity.UserID, Permission: l1.ComputerGrantNone}
 	}
 	cache.mu.Lock()
@@ -165,7 +171,7 @@ func (cache *ComputerPolicyCache) AcquireGrant(computerID string, identity fabri
 	defer cache.mu.Unlock()
 	cache.expireIfNeededLocked()
 	decision := cache.lookupLocked(cache.snapshot, cache.valid, computerID, identity)
-	if !decision.Allowed() {
+	if !decision.allowed() {
 		return nil, nil
 	}
 	cache.nextAuthID++
@@ -182,10 +188,11 @@ func validComputerPolicyPerson(identity fabric.Identity) bool {
 		len(identity.FabricID) <= 255 && len(identity.UserID) <= 255 && len(identity.DeviceID) <= 255
 }
 
-func (cache *ComputerPolicyCache) lookupLocked(snapshot l1.ComputerPolicySnapshot, valid bool, computerID string, identity fabric.Identity) ComputerGrantDecision {
-	decision := ComputerGrantDecision{ComputerID: computerID, FabricID: identity.FabricID,
+func (cache *ComputerPolicyCache) lookupLocked(snapshot l1.ComputerPolicySnapshot, valid bool, computerID string, identity fabric.Identity) computerGrantDecision {
+	decision := computerGrantDecision{ComputerID: computerID, FabricID: identity.FabricID,
 		UserID: identity.UserID, Permission: l1.ComputerGrantNone}
-	if !valid || identity.Kind == fabric.IdentityKindMachine || identity.FabricID == "" || identity.UserID == "" {
+	if !valid || identity.Kind == fabric.IdentityKindMachine || identity.FabricID == "" || identity.UserID == "" ||
+		identity.FabricID != snapshot.IssuingFabricID {
 		return decision
 	}
 	decision.PolicyRevision = snapshot.PolicyRevision
@@ -230,7 +237,8 @@ func (cache *ComputerPolicyCache) Install(snapshot l1.ComputerPolicySnapshot) (C
 		cache.invalidateLocked(ComputerPolicyExpired)
 		return ComputerPolicyInstallReceipt{}, errors.New("agent: Computer policy is already expired")
 	}
-	if cache.valid && snapshot.PolicyGeneration == cache.snapshot.PolicyGeneration && snapshot.PolicyRevision < cache.snapshot.PolicyRevision {
+	if snapshot.PolicyGeneration < cache.highGeneration ||
+		snapshot.PolicyGeneration == cache.highGeneration && snapshot.PolicyRevision < cache.highRevision {
 		cache.invalidateLocked(ComputerPolicyRevisionRegressed)
 		return ComputerPolicyInstallReceipt{}, errors.New("agent: Computer policy revision regressed")
 	}
@@ -260,6 +268,8 @@ func (cache *ComputerPolicyCache) Install(snapshot l1.ComputerPolicySnapshot) (C
 	}
 	cache.snapshot = snapshot
 	cache.valid = true
+	cache.highGeneration = snapshot.PolicyGeneration
+	cache.highRevision = snapshot.PolicyRevision
 	cache.installSerial++
 	serial := cache.installSerial
 	cache.scheduleExpiryLocked(serial, snapshot.FreshUntil)

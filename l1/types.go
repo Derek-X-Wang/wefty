@@ -30,6 +30,27 @@ type Clock interface {
 	Now() time.Time
 }
 
+type clockTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+}
+
+type clockTimerProvider interface {
+	NewTimer(time.Duration) clockTimer
+}
+
+type systemClockTimer struct{ timer *time.Timer }
+
+func (timer *systemClockTimer) C() <-chan time.Time { return timer.timer.C }
+func (timer *systemClockTimer) Stop() bool          { return timer.timer.Stop() }
+
+func newClockTimer(clock Clock, duration time.Duration) clockTimer {
+	if provider, ok := clock.(clockTimerProvider); ok {
+		return provider.NewTimer(duration)
+	}
+	return &systemClockTimer{timer: time.NewTimer(duration)}
+}
+
 // ClockFunc adapts a function into a Clock.
 type ClockFunc func() time.Time
 
