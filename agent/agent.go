@@ -351,6 +351,15 @@ func (a *Agent) Drain(ctx context.Context) (l1.Node, error) {
 	return a.session.drain(ctx)
 }
 
+// ComputerPolicy exposes only the grant lookup and revocation lease needed by
+// the private Take-over admission module in #178.
+func (a *Agent) ComputerPolicy() *ComputerPolicyCache {
+	if a == nil || a.session == nil {
+		return nil
+	}
+	return a.session.computerPolicy
+}
+
 // Run registers and then serves claims until the context is canceled or the
 // control plane rejects a liveness or execution operation.
 func (a *Agent) Run(ctx context.Context) error {

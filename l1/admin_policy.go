@@ -37,8 +37,9 @@ const (
 // AdminPolicy is the bounded current person-based administrator policy.
 // Device evidence is deliberately retained only in immutable audit rows.
 type AdminPolicy struct {
-	Revision int64   `json:"revision"`
-	Admins   []Admin `json:"admins,omitempty"`
+	Revision    int64                      `json:"revision"`
+	Admins      []Admin                    `json:"admins,omitempty"`
+	Revocations []ComputerPolicyRevocation `json:"revocations,omitempty"`
 }
 
 type Admin struct {
@@ -230,6 +231,7 @@ func (s *Store) BootstrapAdmin(ctx context.Context, identity fabric.Identity, no
 	if err := tx.Commit(); err != nil {
 		return AdminPolicy{}, internalError(err, "commit admin bootstrap")
 	}
+	s.notifyComputerPolicyChanged()
 	return policy, nil
 }
 
@@ -388,6 +390,7 @@ func (s *Store) mutateAdmin(
 		return AdminPolicy{}, internalError(err, "read admin membership")
 	}
 	nextRevision := revision + 1
+	var revocations []ComputerPolicyRevocation
 	switch operation {
 	case AdminPolicyAdd:
 		if exists {
@@ -423,6 +426,11 @@ func (s *Store) mutateAdmin(
 			identity.FabricID, userID); err != nil {
 			return AdminPolicy{}, internalError(err, "remove administrator")
 		}
+		revocations, err = revokeAdminAcrossComputers(ctx, tx, identity.FabricID, userID, nextRevision,
+			ComputerPolicyAuditAdminRemove, AdminPolicyActorFabricPerson, identity, now)
+		if err != nil {
+			return AdminPolicy{}, err
+		}
 	default:
 		return AdminPolicy{}, internalError(fmt.Errorf("unknown operation %q", operation),
 			"mutate admin policy")
@@ -450,7 +458,63 @@ func (s *Store) mutateAdmin(
 	if err := tx.Commit(); err != nil {
 		return AdminPolicy{}, internalError(err, "commit admin policy mutation")
 	}
+	policy.Revocations = revocations
+	s.notifyComputerPolicyChanged()
 	return policy, nil
+}
+
+func revokeAdminAcrossComputers(
+	ctx context.Context,
+	tx *sql.Tx,
+	fabricID, userID string,
+	revision int64,
+	operation ComputerPolicyAuditOperation,
+	actorKind AdminPolicyActorKind,
+	actor fabric.Identity,
+	now time.Time,
+) ([]ComputerPolicyRevocation, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT computer_id FROM computers WHERE desired_state<>'removed' ORDER BY computer_id`)
+	if err != nil {
+		return nil, internalError(err, "list Computers for administrator revocation")
+	}
+	var computerIDs []string
+	for rows.Next() {
+		var computerID string
+		if err := rows.Scan(&computerID); err != nil {
+			rows.Close()
+			return nil, internalError(err, "scan Computer for administrator revocation")
+		}
+		computerIDs = append(computerIDs, computerID)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, internalError(err, "close administrator revocation Computers")
+	}
+	revocations := make([]ComputerPolicyRevocation, 0, len(computerIDs))
+	for _, computerID := range computerIDs {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO computer_grants(
+			computer_id, fabric_id, user_id, permission, policy_revision, updated_ns
+		) VALUES(?, ?, ?, 'none', ?, ?) ON CONFLICT(computer_id, fabric_id, user_id) DO UPDATE SET
+			permission='none', policy_revision=excluded.policy_revision, updated_ns=excluded.updated_ns`,
+			computerID, fabricID, userID, revision, now.UnixNano()); err != nil {
+			return nil, internalError(err, "store administrator removal Computer denial")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO computer_policy_audit(
+			policy_revision, computer_id, operation, actor_kind, actor_fabric_id, actor_user_id, actor_device_id,
+			subject_fabric_id, subject_user_id, previous_permission, permission, idempotency_key, request_hash, created_ns
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'control', 'none', '', '', ?)`, revision, computerID, operation,
+			actorKind, actor.FabricID, actor.UserID, actor.DeviceID, fabricID, userID, now.UnixNano()); err != nil {
+			return nil, internalError(err, "append administrator revocation audit")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO computer_policy_revocations(
+			policy_revision, computer_id, subject_fabric_id, subject_user_id, target_permission, created_ns
+		) VALUES(?, ?, ?, ?, 'none', ?)`, revision, computerID, fabricID, userID, now.UnixNano()); err != nil {
+			return nil, internalError(err, "record administrator policy revocation")
+		}
+		revocations = append(revocations, ComputerPolicyRevocation{PolicyRevision: revision, ComputerID: computerID,
+			SubjectFabricID: fabricID, SubjectUserID: userID, TargetPermission: ComputerGrantNone,
+			State: ComputerPolicyRevocationPending, CreatedAt: now})
+	}
+	return revocations, nil
 }
 
 func insertAdminPolicyAudit(
@@ -489,6 +553,31 @@ func (s *Store) ResetAdminPolicy(ctx context.Context) (AdminPolicy, error) {
 		return AdminPolicy{}, internalError(err, "read admin policy reset state")
 	}
 	nextRevision := revision + 1
+	adminRows, err := tx.QueryContext(ctx, `SELECT fabric_id, user_id FROM admins ORDER BY fabric_id, user_id`)
+	if err != nil {
+		return AdminPolicy{}, internalError(err, "list administrators for policy reset")
+	}
+	var resetAdmins []ComputerPolicyAdmin
+	for adminRows.Next() {
+		var admin ComputerPolicyAdmin
+		if err := adminRows.Scan(&admin.FabricID, &admin.UserID); err != nil {
+			adminRows.Close()
+			return AdminPolicy{}, internalError(err, "scan administrator for policy reset")
+		}
+		resetAdmins = append(resetAdmins, admin)
+	}
+	if err := adminRows.Close(); err != nil {
+		return AdminPolicy{}, internalError(err, "close policy reset administrators")
+	}
+	var revocations []ComputerPolicyRevocation
+	for _, admin := range resetAdmins {
+		entries, revokeErr := revokeAdminAcrossComputers(ctx, tx, admin.FabricID, admin.UserID, nextRevision,
+			ComputerPolicyAuditAdminReset, AdminPolicyActorLocalOperator, fabric.Identity{}, now)
+		if revokeErr != nil {
+			return AdminPolicy{}, revokeErr
+		}
+		revocations = append(revocations, entries...)
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM admins`); err != nil {
 		return AdminPolicy{}, internalError(err, "clear administrators")
 	}
@@ -514,6 +603,8 @@ func (s *Store) ResetAdminPolicy(ctx context.Context) (AdminPolicy, error) {
 	if err := tx.Commit(); err != nil {
 		return AdminPolicy{}, internalError(err, "commit admin policy reset")
 	}
+	policy.Revocations = revocations
+	s.notifyComputerPolicyChanged()
 	return policy, nil
 }
 

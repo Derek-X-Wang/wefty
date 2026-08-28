@@ -213,6 +213,7 @@ type HeartbeatResponse struct {
 	Node
 	RemovalDirectives      []RemovalDirective              `json:"removal_directives"`
 	StorageResetDirectives []ComputerStorageResetDirective `json:"storage_reset_directives"`
+	ComputerPolicy         *ComputerPolicySnapshot         `json:"computer_policy,omitempty"`
 }
 
 type ServiceBindingProofRequest struct {

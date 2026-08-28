@@ -96,6 +96,21 @@ func (c *Client) Heartbeat(ctx context.Context, nodeID string, request l1.Heartb
 	return response, err
 }
 
+func (c *Client) WatchComputerPolicy(ctx context.Context, nodeID, bootSessionID string, afterRevision int64) (*l1.ComputerPolicySnapshot, error) {
+	path := "/v1/agent/nodes/" + url.PathEscape(nodeID) + "/computer-policy?boot_session_id=" +
+		url.QueryEscape(bootSessionID) + "&after_revision=" + fmt.Sprint(afterRevision)
+	var snapshot l1.ComputerPolicySnapshot
+	noContent, err := c.requestAllowNoContent(ctx, http.MethodGet, path, nil, &snapshot)
+	if err != nil || noContent {
+		return nil, err
+	}
+	return &snapshot, nil
+}
+
+func (c *Client) AcknowledgeComputerPolicy(ctx context.Context, request l1.ComputerPolicyInstallAcknowledgement) error {
+	return c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(request.NodeID)+"/computer-policy-acknowledgement", request, nil)
+}
+
 func (c *Client) Drain(ctx context.Context, nodeID, bootSessionID string) (l1.Node, error) {
 	var node l1.Node
 	err := c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/drain", l1.DrainRequest{BootSessionID: bootSessionID}, &node)
@@ -232,6 +247,9 @@ func (c *Client) requestAllowNoContent(ctx context.Context, method, path string,
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return false, decodeProtocolError(response)
+	}
+	if target == nil {
+		return false, nil
 	}
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 1<<20))
 	if err := decoder.Decode(target); err != nil {

@@ -60,6 +60,43 @@ func TestClaimRequestsOneShotWorkWithLocalJobExclusions(t *testing.T) {
 	}
 }
 
+func TestClientWatchesAndAcknowledgesComputerPolicy(t *testing.T) {
+	snapshot := policySnapshot(t, time.Now().UTC(), 3, 9, nil)
+	receivedAck := make(chan l1.ComputerPolicyInstallAcknowledgement, 1)
+	client := newRoundTripClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.Method + " " + request.URL.EscapedPath() {
+		case "GET /v1/agent/nodes/node%2Fone/computer-policy":
+			if request.URL.Query().Get("boot_session_id") != "boot/one" || request.URL.Query().Get("after_revision") != "8" {
+				t.Errorf("policy watch query = %q", request.URL.RawQuery)
+			}
+			response.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(response).Encode(snapshot)
+		case "POST /v1/agent/nodes/node%2Fone/computer-policy-acknowledgement":
+			var acknowledgement l1.ComputerPolicyInstallAcknowledgement
+			if err := json.NewDecoder(request.Body).Decode(&acknowledgement); err != nil {
+				t.Errorf("decode Computer policy acknowledgement: %v", err)
+			}
+			receivedAck <- acknowledgement
+			response.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected Computer policy request = %s %s", request.Method, request.URL.EscapedPath())
+			response.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	got, err := client.WatchComputerPolicy(context.Background(), "node/one", "boot/one", 8)
+	if err != nil || got == nil || got.SnapshotDigest != snapshot.SnapshotDigest {
+		t.Fatalf("Computer policy watch = %#v err=%v", got, err)
+	}
+	acknowledgement := l1.ComputerPolicyInstallAcknowledgement{NodeID: "node/one", BootSessionID: "boot/one",
+		PolicyGeneration: got.PolicyGeneration, PolicyRevision: got.PolicyRevision, SnapshotDigest: got.SnapshotDigest}
+	if err := client.AcknowledgeComputerPolicy(context.Background(), acknowledgement); err != nil {
+		t.Fatal(err)
+	}
+	if received := <-receivedAck; received != acknowledgement {
+		t.Fatalf("Computer policy acknowledgement = %#v, want %#v", received, acknowledgement)
+	}
+}
+
 func TestClientBoundsAnOperationWhoseServerNeverResponds(t *testing.T) {
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})

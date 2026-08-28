@@ -49,8 +49,11 @@ const (
 )
 
 type ComputerGrant struct {
-	UserID     string                  `json:"user_id"`
-	Permission ComputerGrantPermission `json:"permission"`
+	FabricID       string                  `json:"fabric_id"`
+	UserID         string                  `json:"user_id"`
+	Permission     ComputerGrantPermission `json:"permission"`
+	PolicyRevision int64                   `json:"policy_revision"`
+	UpdatedAt      time.Time               `json:"updated_at"`
 }
 
 type ComputerIntent struct {
@@ -300,6 +303,7 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	if err := tx.Commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer creation")
 	}
+	s.notifyComputerPolicyChanged()
 	return computer, false, nil
 }
 
@@ -426,11 +430,23 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	if boundNodeID.Valid {
 		computer.BoundNodeID = boundNodeID.String
 	}
-	if err := json.Unmarshal(grantsJSON, &computer.Grants); err != nil {
-		return Computer{}, fmt.Errorf("decode Computer grants: %w", err)
+	// grants_json is the pre-policy placeholder retained for durable schema
+	// compatibility. Current person grants live in the revisioned table.
+	_ = grantsJSON
+	computer.Grants, err = listComputerGrants(ctx, q, computerID)
+	if err != nil {
+		return Computer{}, fmt.Errorf("read Computer grants: %w", err)
 	}
-	if computer.Grants == nil {
-		computer.Grants = []ComputerGrant{}
+	if len(computer.Grants) == 0 {
+		// Pre-policy rows used grants_json as an opaque Computer-lifecycle
+		// preservation fixture. Keep projecting those bytes until a real,
+		// Fabric-scoped grant is written; they never enter node policy.
+		if err := json.Unmarshal(grantsJSON, &computer.Grants); err != nil {
+			return Computer{}, fmt.Errorf("decode legacy Computer grants: %w", err)
+		}
+		if computer.Grants == nil {
+			computer.Grants = []ComputerGrant{}
+		}
 	}
 	if reconfigurationRevision.Valid {
 		value := reconfigurationRevision.Int64
@@ -939,6 +955,7 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	if err := s.checkpointSecretWAL(ctx); err != nil {
 		return Computer{}, err
 	}
+	s.notifyComputerPolicyChanged()
 	return removed, nil
 }
 

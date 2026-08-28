@@ -27,6 +27,8 @@ type ServerConfig struct {
 	NodePolicies                      map[string]NodePolicy
 	ReconcileInterval                 time.Duration
 	AllowSelfAssertedPersonIdentities bool
+	ComputerPolicyFreshness           time.Duration
+	ComputerPolicyWatchWait           time.Duration
 }
 
 // NodePolicy is authoritative control-plane configuration for one stable node.
@@ -56,14 +58,16 @@ func (s *Server) effectiveNodePolicy(nodeID string) (NodePolicy, bool) {
 // Fabric identity tags select the protocol principal; configured node policy
 // controls job eligibility and class-scoped admission.
 type Server struct {
-	fabric                fabric.Fabric
-	store                 *Store
-	clientPrincipalTag    string
-	agentPrincipalTag     string
-	nodePolicies          map[string]NodePolicy
-	reconcileInterval     time.Duration
-	allowPersonIdentities bool
-	handler               http.Handler
+	fabric                  fabric.Fabric
+	store                   *Store
+	clientPrincipalTag      string
+	agentPrincipalTag       string
+	nodePolicies            map[string]NodePolicy
+	reconcileInterval       time.Duration
+	allowPersonIdentities   bool
+	computerPolicyFreshness time.Duration
+	computerPolicyWatchWait time.Duration
+	handler                 http.Handler
 }
 
 func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, error) {
@@ -93,12 +97,25 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	if reconcileInterval <= 0 {
 		reconcileInterval = DefaultReconcileInterval
 	}
+	policyFreshness := config.ComputerPolicyFreshness
+	if policyFreshness <= 0 {
+		policyFreshness = DefaultComputerPolicyFreshness
+	}
+	policyWatchWait := config.ComputerPolicyWatchWait
+	if policyWatchWait <= 0 {
+		policyWatchWait = DefaultComputerPolicyWatchWait
+	}
+	if policyFreshness <= policyWatchWait {
+		return nil, fmt.Errorf("l1: Computer policy freshness must exceed watch wait")
+	}
 	s := &Server{
 		fabric: f, store: store,
 		clientPrincipalTag: clientTag, agentPrincipalTag: agentTag,
-		nodePolicies:          nodePolicies,
-		reconcileInterval:     reconcileInterval,
-		allowPersonIdentities: personIdentitiesAllowed(f, config.AllowSelfAssertedPersonIdentities),
+		nodePolicies:            nodePolicies,
+		reconcileInterval:       reconcileInterval,
+		allowPersonIdentities:   personIdentitiesAllowed(f, config.AllowSelfAssertedPersonIdentities),
+		computerPolicyFreshness: policyFreshness,
+		computerPolicyWatchWait: policyWatchWait,
 	}
 	s.handler = s.routes()
 	return s, nil
@@ -217,6 +234,8 @@ func (s *Server) routes() http.Handler {
 	agent := http.NewServeMux()
 	agent.HandleFunc("POST /v1/agent/nodes/register", s.registerNode)
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/heartbeat", s.heartbeatNode)
+	agent.HandleFunc("GET /v1/agent/nodes/{node_id}/computer-policy", s.watchComputerPolicy)
+	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/computer-policy-acknowledgement", s.acknowledgeComputerPolicy)
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/drain", s.drainNode)
 	agent.HandleFunc("POST /v1/agent/jobs/claim", s.claimJob)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/service-binding-proof", s.proveServiceBinding)
@@ -237,12 +256,19 @@ func (s *Server) routes() http.Handler {
 	person.HandleFunc("GET /v1/admin-policy/audit", s.listAdminPolicyAudit)
 	person.HandleFunc("PUT /v1/admin-policy/admins/{user_id}", s.addAdmin)
 	person.HandleFunc("DELETE /v1/admin-policy/admins/{user_id}", s.removeAdmin)
+	person.HandleFunc("GET /v1/computers/{computer_id}/grants", s.listComputerGrants)
+	person.HandleFunc("PUT /v1/computers/{computer_id}/grants/{user_id}", s.mutateComputerGrant)
+	person.HandleFunc("GET /v1/computers/{computer_id}/grants/audit", s.listComputerPolicyAudit)
+	person.HandleFunc("GET /v1/computers/{computer_id}/revocations/{policy_revision}", s.getComputerPolicyRevocation)
 
 	root := http.NewServeMux()
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
 	root.Handle("/v1/jobs", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/jobs/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/computers", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/computers/{computer_id}/grants", s.authorize(personPrincipal, person))
+	root.Handle("/v1/computers/{computer_id}/grants/", s.authorize(personPrincipal, person))
+	root.Handle("/v1/computers/{computer_id}/revocations/", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes/", s.authorize(clientPrincipal, client))
@@ -435,6 +461,63 @@ func (s *Server) removeAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, policy)
+}
+
+func (s *Server) listComputerGrants(w http.ResponseWriter, r *http.Request) {
+	grants, err := s.store.ListComputerGrants(r.Context(), identityFromRequest(r), r.PathValue("computer_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, grants)
+}
+
+func (s *Server) mutateComputerGrant(w http.ResponseWriter, r *http.Request) {
+	var request ComputerGrantMutationRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	result, err := s.store.MutateComputerGrant(r.Context(), identityFromRequest(r),
+		r.PathValue("computer_id"), r.PathValue("user_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if result.Replayed {
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) listComputerPolicyAudit(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	page, err := s.store.ListComputerPolicyAudit(r.Context(), identityFromRequest(r),
+		r.PathValue("computer_id"), r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) getComputerPolicyRevocation(w http.ResponseWriter, r *http.Request) {
+	revision, err := strconv.ParseInt(r.PathValue("policy_revision"), 10, 64)
+	if err != nil || revision < 1 {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "policy_revision must be positive"))
+		return
+	}
+	revocation, err := s.store.GetComputerPolicyRevocation(r.Context(), identityFromRequest(r),
+		revision, r.PathValue("computer_id"), "", "")
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, revocation)
 }
 
 func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
@@ -808,7 +891,72 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, RemovalDirectives: directives, StorageResetDirectives: storageResets})
+	computerPolicy, err := s.store.IssueComputerPolicySnapshot(r.Context(), identity.NodeID, nodeID,
+		request.BootSessionID, s.computerPolicyFreshness)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, RemovalDirectives: directives,
+		StorageResetDirectives: storageResets, ComputerPolicy: computerPolicy})
+}
+
+func (s *Server) watchComputerPolicy(w http.ResponseWriter, r *http.Request) {
+	afterRevision, err := strconv.ParseInt(r.URL.Query().Get("after_revision"), 10, 64)
+	if err != nil || afterRevision < 0 {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "after_revision must be non-negative"))
+		return
+	}
+	identity := identityFromRequest(r)
+	nodeID := r.PathValue("node_id")
+	bootSessionID := r.URL.Query().Get("boot_session_id")
+	change := s.store.computerPolicyChangeChannel()
+	snapshot, err := s.store.IssueComputerPolicySnapshot(r.Context(), identity.NodeID, nodeID,
+		bootSessionID, s.computerPolicyFreshness)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if snapshot != nil && snapshot.PolicyRevision > afterRevision {
+		writeJSON(w, http.StatusOK, snapshot)
+		return
+	}
+	timer := time.NewTimer(s.computerPolicyWatchWait)
+	defer timer.Stop()
+	select {
+	case <-r.Context().Done():
+		return
+	case <-change:
+	case <-timer.C:
+	}
+	snapshot, err = s.store.IssueComputerPolicySnapshot(r.Context(), identity.NodeID, nodeID,
+		bootSessionID, s.computerPolicyFreshness)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if snapshot == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func (s *Server) acknowledgeComputerPolicy(w http.ResponseWriter, r *http.Request) {
+	var request ComputerPolicyInstallAcknowledgement
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	if request.NodeID != r.PathValue("node_id") {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "node_id does not match route"))
+		return
+	}
+	if err := s.store.AcknowledgeComputerPolicyInstallation(r.Context(), identityFromRequest(r).NodeID, request); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) acknowledgeComputerStorageReset(w http.ResponseWriter, r *http.Request) {
@@ -1007,6 +1155,13 @@ func redactJob(job Job) Job {
 
 func redactComputer(computer Computer) Computer {
 	computer.CurrentJob = redactJob(computer.CurrentJob)
+	grants := make([]ComputerGrant, 0, len(computer.Grants))
+	for _, grant := range computer.Grants {
+		if grant.FabricID != "" && grant.UserID != "" && !grant.UpdatedAt.IsZero() {
+			grants = append(grants, grant)
+		}
+	}
+	computer.Grants = grants
 	return computer
 }
 

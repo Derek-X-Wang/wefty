@@ -150,6 +150,11 @@
                 "added_at": { "type": "string", "format": "date-time" }
               }
             }
+          },
+          "revocations": {
+            "type": "array",
+            "description": "Per-Computer revocations created by an administrator removal. Each remains pending until its current node boot acknowledges installation after matching sessions close.",
+            "items": { "$ref": "#/components/schemas/ComputerPolicyRevocation" }
           }
         },
         "description": "Current bounded person-based administrator policy. Membership is scoped to the issuing Fabric; device identity is audit evidence, never membership."
@@ -178,6 +183,134 @@
           "entries": { "type": "array", "items": { "$ref": "#/components/schemas/AdminPolicyAudit" } },
           "next_cursor": { "type": "string" }
         }
+      },
+      "ComputerGrant": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["fabric_id", "user_id", "permission", "policy_revision", "updated_at"],
+        "properties": {
+          "fabric_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "user_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "permission": { "enum": ["none", "view", "control"] },
+          "policy_revision": { "type": "integer", "minimum": 1 },
+          "updated_at": { "type": "string", "format": "date-time" }
+        },
+        "description": "Current person grant scoped to its issuing Fabric. none is durable revocation, never absence or fallback."
+      },
+      "ComputerGrantList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["policy_revision", "grants"],
+        "properties": {
+          "policy_revision": { "type": "integer", "minimum": 0 },
+          "grants": { "type": "array", "items": { "$ref": "#/components/schemas/ComputerGrant" } }
+        }
+      },
+      "ComputerPolicyRevocation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["policy_revision", "computer_id", "subject_fabric_id", "subject_user_id", "target_permission", "state", "created_at"],
+        "properties": {
+          "policy_revision": { "type": "integer", "minimum": 1 },
+          "computer_id": { "type": "string", "minLength": 1 },
+          "subject_fabric_id": { "type": "string", "minLength": 1 },
+          "subject_user_id": { "type": "string", "minLength": 1 },
+          "target_permission": { "enum": ["none", "view"] },
+          "state": { "enum": ["pending", "completed"] },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ComputerGrantMutationResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["grant", "replayed"],
+        "properties": {
+          "grant": { "$ref": "#/components/schemas/ComputerGrant" },
+          "replayed": { "type": "boolean" },
+          "revocation": { "$ref": "#/components/schemas/ComputerPolicyRevocation" }
+        }
+      },
+      "ComputerPolicyAudit": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["policy_revision", "computer_id", "operation", "actor_kind", "actor_fabric_id", "actor_user_id", "actor_device_id", "subject_fabric_id", "subject_user_id", "previous_permission", "permission", "created_at"],
+        "properties": {
+          "policy_revision": { "type": "integer", "minimum": 1 },
+          "computer_id": { "type": "string", "minLength": 1 },
+          "operation": { "enum": ["grant", "admin_remove", "admin_reset"] },
+          "actor_kind": { "enum": ["fabric_person", "local_operator"] },
+          "actor_fabric_id": { "type": "string" },
+          "actor_user_id": { "type": "string" },
+          "actor_device_id": { "type": "string" },
+          "subject_fabric_id": { "type": "string", "minLength": 1 },
+          "subject_user_id": { "type": "string", "minLength": 1 },
+          "previous_permission": { "enum": ["none", "view", "control"] },
+          "permission": { "enum": ["none", "view", "control"] },
+          "idempotency_key": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ComputerPolicyAuditList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["entries"],
+        "properties": {
+          "entries": { "type": "array", "items": { "$ref": "#/components/schemas/ComputerPolicyAudit" } },
+          "next_cursor": { "type": "string" }
+        }
+      },
+      "ComputerPolicySnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["policy_generation", "policy_revision", "node_id", "boot_session_id", "issued_at", "fresh_until", "admins", "computers", "snapshot_digest"],
+        "properties": {
+          "policy_generation": { "type": "integer", "minimum": 1 },
+          "policy_revision": { "type": "integer", "minimum": 0 },
+          "node_id": { "type": "string", "minLength": 1 },
+          "boot_session_id": { "type": "string", "minLength": 1 },
+          "issued_at": { "type": "string", "format": "date-time" },
+          "fresh_until": { "type": "string", "format": "date-time" },
+          "admins": {
+            "type": "array",
+            "maxItems": 32,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["fabric_id", "user_id"],
+              "properties": {
+                "fabric_id": { "type": "string", "minLength": 1 },
+                "user_id": { "type": "string", "minLength": 1 }
+              }
+            }
+          },
+          "computers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["computer_id", "grants"],
+              "properties": {
+                "computer_id": { "type": "string", "minLength": 1 },
+                "grants": { "type": "array", "items": { "$ref": "#/components/schemas/ComputerGrant" } }
+              }
+            }
+          },
+          "snapshot_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        },
+        "description": "Short-lived L1-generation/Node/boot-bound policy. Agents keep it only in memory and fail closed on loss, expiry, or regression."
+      },
+      "ComputerPolicyInstallAcknowledgement": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node_id", "boot_session_id", "policy_generation", "policy_revision", "snapshot_digest"],
+        "properties": {
+          "node_id": { "type": "string", "minLength": 1 },
+          "boot_session_id": { "type": "string", "minLength": 1 },
+          "policy_generation": { "type": "integer", "minimum": 1 },
+          "policy_revision": { "type": "integer", "minimum": 0 },
+          "snapshot_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        },
+        "description": "Assertion-derived receipt emitted from installed memory only after every affected authorization lease releases."
       },
       "ComputerIntent": {
         "type": "object",
@@ -228,15 +361,7 @@
           },
           "grants": {
             "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["user_id", "permission"],
-              "properties": {
-                "user_id": { "type": "string", "minLength": 1 },
-                "permission": { "enum": ["view", "control", "none"] }
-              }
-            }
+            "items": { "$ref": "#/components/schemas/ComputerGrant" }
           },
           "storage_id": { "type": "string", "minLength": 1 },
           "storage_generation": { "type": "integer", "minimum": 1 },
@@ -733,6 +858,11 @@
                 "items": { "$ref": "#/components/schemas/ComputerStorageResetDirective" },
                 "readOnly": true,
                 "description": "Revision-fenced standing work that must verify old-generation deletion before the replacement generation can publish."
+              },
+              "computer_policy": {
+                "$ref": "#/components/schemas/ComputerPolicySnapshot",
+                "readOnly": true,
+                "description": "Heartbeat bootstrap only. Fast changes and freshness renewal use the policy watch. Omitted for nodes that have never hosted a Computer."
               }
             }
           }

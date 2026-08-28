@@ -396,6 +396,91 @@
         }
       }
     },
+    "/v1/computers/{computer_id}/grants": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+      ],
+      "get": {
+        "operationId": "listComputerGrants",
+        "summary": "List current person grants under the global policy revision",
+        "description": "Current administrators only. Durable none rows are returned so revocation never falls back to older authority.",
+        "responses": {
+          "200": { "description": "Current Fabric-scoped grants.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerGrantList" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/grants/{user_id}": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "user_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 255 } }
+      ],
+      "put": {
+        "operationId": "mutateComputerGrant",
+        "summary": "Set view, control, or durable none under policy CAS",
+        "description": "Current administrators only. The subject is scoped to the actor's authenticated issuing Fabric; the idempotency key provides exact replay and every accepted mutation appends immutable person/device audit.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["policy_revision", "permission", "idempotency_key"],
+          "properties": {
+            "policy_revision": { "type": "integer", "minimum": 1 },
+            "permission": { "enum": ["none", "view", "control"] },
+            "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 255 }
+          }
+        } } } },
+        "responses": {
+          "200": {
+            "description": "Grant changed or identical idempotent replay. Downgrade/revoke includes pending status until the current node boot acknowledges after matching sessions close.",
+            "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean" } } },
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerGrantMutationResult" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/grants/audit": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+      ],
+      "get": {
+        "operationId": "listComputerPolicyAudit",
+        "summary": "Page immutable Computer policy mutations",
+        "responses": {
+          "200": { "description": "Revision-ordered policy audit.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerPolicyAuditList" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/revocations/{policy_revision}": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "policy_revision", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 } }
+      ],
+      "get": {
+        "operationId": "getComputerPolicyRevocation",
+        "summary": "Read pending or completed node installation status",
+        "responses": {
+          "200": { "description": "Revocation status.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerPolicyRevocation" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/computers": {
       "post": {
         "operationId": "createComputer",

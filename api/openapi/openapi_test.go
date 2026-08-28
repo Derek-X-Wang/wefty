@@ -185,6 +185,64 @@ func TestL1ClientPublishesPersonAdminBootstrapSurface(t *testing.T) {
 	}
 }
 
+func TestComputerGrantPolicyContractsAreNodeBoundAndPersonScoped(t *testing.T) {
+	t.Parallel()
+	client := readObject(t, "l1-client.v1.json")
+	clientPaths := object(t, client["paths"], "client paths")
+	for _, path := range []string{
+		"/v1/computers/{computer_id}/grants",
+		"/v1/computers/{computer_id}/grants/{user_id}",
+		"/v1/computers/{computer_id}/grants/audit",
+		"/v1/computers/{computer_id}/revocations/{policy_revision}",
+	} {
+		if _, present := clientPaths[path]; !present {
+			t.Errorf("L1 client protocol is missing %s", path)
+		}
+	}
+	agent := readObject(t, "l1-agent.v1.json")
+	agentPaths := object(t, agent["paths"], "agent paths")
+	for _, path := range []string{
+		"/v1/agent/nodes/{node_id}/computer-policy",
+		"/v1/agent/nodes/{node_id}/computer-policy-acknowledgement",
+	} {
+		if _, present := agentPaths[path]; !present {
+			t.Errorf("L1 agent protocol is missing %s", path)
+		}
+	}
+	common := readObject(t, "common.v1.json")
+	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
+	for _, name := range []string{
+		"ComputerGrant", "ComputerGrantList", "ComputerGrantMutationResult", "ComputerPolicyAudit",
+		"ComputerPolicyAuditList", "ComputerPolicyRevocation", "ComputerPolicySnapshot",
+		"ComputerPolicyInstallAcknowledgement",
+	} {
+		if _, present := schemas[name]; !present {
+			t.Errorf("common protocol is missing %s", name)
+		}
+	}
+	grant := object(t, schemas["ComputerGrant"], "ComputerGrant")
+	required := stringSet(t, grant["required"])
+	for _, field := range []string{"fabric_id", "user_id", "permission", "policy_revision", "updated_at"} {
+		if !required[field] {
+			t.Errorf("ComputerGrant does not require %q", field)
+		}
+	}
+	snapshot := object(t, schemas["ComputerPolicySnapshot"], "ComputerPolicySnapshot")
+	snapshotRequired := stringSet(t, snapshot["required"])
+	for _, field := range []string{"policy_generation", "policy_revision", "node_id", "boot_session_id", "fresh_until", "snapshot_digest"} {
+		if !snapshotRequired[field] {
+			t.Errorf("ComputerPolicySnapshot does not require %q", field)
+		}
+	}
+	heartbeat := object(t, schemas["HeartbeatResponse"], "HeartbeatResponse")
+	heartbeatParts := heartbeat["allOf"].([]any)
+	heartbeatProjection := object(t, heartbeatParts[1], "HeartbeatResponse.allOf[1]")
+	heartbeatProperties := object(t, heartbeatProjection["properties"], "HeartbeatResponse.properties")
+	if _, present := heartbeatProperties["computer_policy"]; !present {
+		t.Fatal("heartbeat does not expose the optional bootstrap-only Computer policy")
+	}
+}
+
 func TestL3ImageProgramPublishesJobSpecOCIConstraints(t *testing.T) {
 	t.Parallel()
 

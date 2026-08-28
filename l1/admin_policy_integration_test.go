@@ -179,6 +179,11 @@ func TestMachinePrincipalRejectedFromEveryPersonRoute(t *testing.T) {
 		{http.MethodGet, "/v1/admin-policy/audit", nil},
 		{http.MethodPut, "/v1/admin-policy/admins/attacker", AdminPolicyMutationRequest{PolicyRevision: 1}},
 		{http.MethodDelete, "/v1/admin-policy/admins/attacker", AdminPolicyMutationRequest{PolicyRevision: 1}},
+		{http.MethodGet, "/v1/computers/computer-forged/grants", nil},
+		{http.MethodPut, "/v1/computers/computer-forged/grants/person-forged", ComputerGrantMutationRequest{
+			PolicyRevision: 1, Permission: ComputerGrantView, IdempotencyKey: "forged"}},
+		{http.MethodGet, "/v1/computers/computer-forged/grants/audit", nil},
+		{http.MethodGet, "/v1/computers/computer-forged/revocations/1", nil},
 	}
 	for _, row := range rows {
 		status, _, body := h.do(client, row.method, row.path, row.body)

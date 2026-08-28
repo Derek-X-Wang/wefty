@@ -219,9 +219,37 @@ Each accepted bootstrap/add/remove/reset advances the policy revision exactly
 once and commits the membership change plus one immutable audit row in the same
 transaction. Audit retains revision, operation, actor UserID, actor DeviceID,
 issuing Fabric IDs, subject UserID, actor kind, and L1 time; current membership
-remains bounded and person based. Per-Computer grants, Node distribution,
-endpoint admission, live revocation, and control arbitration are separate later
-contracts.
+remains bounded and person based.
+
+### Computer grant policy and live revocation
+
+Each Computer has a durable person grant of `none`, `view`, or `control`, keyed
+by `(computer_id, FabricID, UserID)`. Current administrators have effective
+`control` without a duplicate grant row. Only a current administrator may
+mutate a grant, and every accepted mutation requires the exact global policy
+revision, advances that revision once, and atomically records the new grant and
+an immutable actor-and-subject audit row. Idempotent replay returns the original
+result; stale revisions, machine grantees, and nonadministrator mutations make
+no policy change. Removing or resetting an administrator first writes durable
+`none` grants for that person on every Computer, so an older explicit grant can
+never reappear when the override disappears.
+
+L1 issues only the Computers hosted by an authenticated Node as a bounded,
+short-lived policy snapshot bound to the current policy generation, Node ID,
+and boot session. Heartbeat may bootstrap an empty node cache, while a
+long-poll watch carries subsequent revisions; the agent persists no copy.
+Policy expiry, watch loss, generation change, revision regression, or an agent
+restart therefore fails closed. An installation acknowledgement is accepted
+only from the snapshot's current authenticated boot and cannot regress its
+installed revision.
+
+A downgrade or revoke is `pending` until the current hosting boot has installed
+that revision and every affected authorization lease has released. The agent
+signals those leases while holding the same lock used to admit them, closing
+the lookup-versus-revocation race; future endpoint admission must acquire this
+lease and release it only after both relay legs close. Admission always starts
+in view mode. Session-bound control take-over and tenure arbitration remain
+separate contracts.
 
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:

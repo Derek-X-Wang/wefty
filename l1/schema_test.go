@@ -66,6 +66,23 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 		"admin_bootstrap_challenges": {
 			"singleton", "nonce_hash", "deployment_hash", "authority_generation", "created_ns", "expires_ns",
 		},
+		"computer_grants": {
+			"computer_id", "fabric_id", "user_id", "permission", "policy_revision", "updated_ns",
+		},
+		"computer_policy_audit": {
+			"policy_revision", "computer_id", "operation", "actor_kind", "actor_fabric_id", "actor_user_id",
+			"actor_device_id", "subject_fabric_id", "subject_user_id", "previous_permission", "permission",
+			"idempotency_key", "request_hash", "created_ns",
+		},
+		"computer_policy_revocations": {
+			"policy_revision", "computer_id", "subject_fabric_id", "subject_user_id", "target_permission", "created_ns",
+		},
+		"computer_policy_issued": {
+			"node_id", "boot_session_id", "policy_generation", "policy_revision", "snapshot_digest", "expires_ns", "issued_ns",
+		},
+		"computer_policy_installations": {
+			"node_id", "boot_session_id", "policy_generation", "policy_revision", "snapshot_digest", "installed_ns",
+		},
 		"service_restart_requests": {"job_id", "idempotency_key", "request_hash", "created_ns"},
 		"service_log_truncations": {
 			"job_id", "bound_kind", "evicted_event_count", "evicted_byte_count",
