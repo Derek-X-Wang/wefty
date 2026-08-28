@@ -262,6 +262,11 @@ func validateOCIExecution(spec *JobSpec) error {
 		if oci.Limits == nil || oci.Limits.MemoryBytes == nil || *oci.Limits.MemoryBytes < 1 {
 			return invalidJobSpecf("OCI computer trait requires positive explicit memory_bytes")
 		}
+		for index, mount := range oci.Mounts {
+			if !mount.ReadOnly {
+				return invalidJobSpecf("OCI computer mount %d must be read-only so tenant writes remain bounded", index)
+			}
+		}
 	}
 	return nil
 }

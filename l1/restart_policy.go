@@ -32,6 +32,7 @@ var failureClassifications = map[contract.SpawnFailureCode]failureClassification
 	contract.SpawnFailureImageNotFound:            failureTerminal,
 	contract.SpawnFailureImageManifestInvalid:     failureTerminal,
 	contract.SpawnFailureImagePlatformUnsupported: failureTerminal,
+	contract.SpawnFailureInsufficientDisk:         failureTerminal,
 }
 
 var runtimeFailureClassifications = map[contract.RuntimeFailureCode]failureClassification{

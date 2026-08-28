@@ -35,6 +35,7 @@ type removalController struct {
 	purgeJob              func(context.Context, string) error
 	removeResource        func(context.Context, localRemoval) error
 	releaseImagePin       func(context.Context, string) error
+	finalizeVolumes       func(context.Context, workloadrunner.ManagedVolumeFinalizationRequest) error
 	ackRemoval            func(context.Context, localRemoval) error
 	finishRemoval         func(context.Context, localRemoval) error
 
@@ -133,6 +134,10 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 			return err
 		}
 		if found {
+			computerStorage, err := removalComputerStorage(runtimeRemoval.manifest, directive.ComputerStorage)
+			if err != nil {
+				return err
+			}
 			switch runtimeRemoval.phase {
 			case runtimeRemovalComplete:
 				// Runtime preparation is complete; continue through the existing
@@ -153,7 +158,7 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 				return fmt.Errorf("service %q runtime removal has invalid phase %q", directive.JobID, runtimeRemoval.phase)
 			}
 			removal.processTreeReaped = true
-			return controller.completeLocalRemoval(ctx, removal)
+			return controller.completeLocalRemoval(ctx, removal, computerStorage)
 		}
 	}
 	receipt, err := controller.reapService(ctx, directive.JobID)
@@ -166,15 +171,26 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	// Services created before runtime manifests were introduced retain the
 	// legacy boolean as their crash-resume compatibility marker.
 	removal.processTreeReaped = true
-	return controller.completeLocalRemoval(ctx, removal)
+	return controller.completeLocalRemoval(ctx, removal, computerStorageFromClaim(directive.ComputerStorage))
 }
 
-func (controller *removalController) completeLocalRemoval(ctx context.Context, removal localRemoval) error {
+func (controller *removalController) completeLocalRemoval(ctx context.Context, removal localRemoval, computerStorage *workloadrunner.ComputerStorage) error {
 	if err := controller.purgeJob(ctx, removal.jobID); err != nil {
 		return err
 	}
 	if err := controller.removeResource(ctx, removal); err != nil {
 		return fmt.Errorf("delete managed service resource: %w", err)
+	}
+	if computerStorage != nil {
+		if controller.finalizeVolumes == nil {
+			return errors.New("Computer removal requires OCI disk finalization")
+		}
+		if err := controller.finalizeVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
+			Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: computerStorage}},
+			Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID, RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence},
+		}); err != nil {
+			return fmt.Errorf("delete Computer disk resource: %w", err)
+		}
 	}
 	if controller.releaseImagePin != nil {
 		if err := controller.releaseImagePin(ctx, removal.jobID); err != nil {
@@ -254,7 +270,11 @@ func (controller *removalController) resume(ctx context.Context) error {
 				return fmt.Errorf("service %q runtime removal has invalid phase %q", record.removal.jobID, record.phase)
 			}
 			record.removal.processTreeReaped = true
-			if err := controller.completeLocalRemoval(ctx, record.removal); err != nil {
+			computerStorage, err := removalComputerStorage(record.manifest, nil)
+			if err != nil {
+				return err
+			}
+			if err := controller.completeLocalRemoval(ctx, record.removal, computerStorage); err != nil {
 				return err
 			}
 		}
@@ -283,6 +303,47 @@ func (controller *removalController) resume(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func removalComputerStorage(manifest runtimeRemovalManifest, claim *l1.ComputerStorageClaim) (*workloadrunner.ComputerStorage, error) {
+	var frozen *workloadrunner.ComputerStorage
+	sawNonComputer := false
+	for _, attempt := range manifest.Attempts {
+		if attempt.ComputerStorage == nil {
+			if frozen != nil {
+				return nil, errors.New("agent: frozen runtime removal manifest mixes Computer and service-data attempts")
+			}
+			sawNonComputer = true
+			continue
+		}
+		if sawNonComputer {
+			return nil, errors.New("agent: frozen runtime removal manifest mixes Computer and service-data attempts")
+		}
+		if frozen == nil {
+			storage := *attempt.ComputerStorage
+			frozen = &storage
+			continue
+		}
+		if *frozen != *attempt.ComputerStorage {
+			return nil, errors.New("agent: frozen runtime removal manifest has conflicting Computer Storage identities")
+		}
+	}
+	if claim == nil {
+		return frozen, nil
+	}
+	if frozen == nil || frozen.ComputerID != claim.ComputerID || frozen.StorageID != claim.StorageID || frozen.StorageGeneration != claim.StorageGeneration {
+		return nil, errors.New("agent: Computer removal directive does not match the frozen runtime manifest")
+	}
+	return frozen, nil
+}
+
+func computerStorageFromClaim(claim *l1.ComputerStorageClaim) *workloadrunner.ComputerStorage {
+	if claim == nil {
+		return nil
+	}
+	return &workloadrunner.ComputerStorage{
+		ComputerID: claim.ComputerID, StorageID: claim.StorageID, StorageGeneration: claim.StorageGeneration,
+	}
 }
 
 func (controller *removalController) acknowledge(ctx context.Context, removal localRemoval) error {

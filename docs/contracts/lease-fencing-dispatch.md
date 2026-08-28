@@ -85,6 +85,11 @@ different identity; later stop/start/restart and projection-transfer
 transactions retain that binding while releasing or reacquiring only the
 identity-free Slot occupancy.
 
+The successful agent claim projects the exact current `computer_id` and
+`storage_id@generation` alongside the immutable Job. That Storage witness is
+absent for ordinary Jobs and is the only identity the agent may pass to the
+helper's `computer_disk` attachment mechanic.
+
 The agent issues one fixed claim loop per class. Each loop blocks on its own
 existing class admission gate, currently pinned to one resident attempt, so a
 service cannot prevent the one-shot loop from asking for work and vice versa.

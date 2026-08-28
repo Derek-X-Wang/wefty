@@ -66,6 +66,7 @@ const (
 	CodeUnauthorizedBridge    ErrorCode = "unauthorized_bridge"
 	CodeOCISpecRejected       ErrorCode = "oci_spec_rejected"
 	CodeImageUnavailable      ErrorCode = "image_unavailable"
+	CodeInsufficientDisk      ErrorCode = "insufficient_disk"
 	CodeEngineFailure         ErrorCode = "engine_failure"
 	CodeUnsupportedOperation  ErrorCode = "unsupported_operation"
 	CodeSweepRequired         ErrorCode = "sweep_required"
@@ -76,7 +77,24 @@ type RPCError struct {
 	Code         ErrorCode         `json:"code"`
 	Message      string            `json:"message"`
 	ImageFailure *ImageFailureFact `json:"image_failure,omitempty"`
+	DiskFailure  *DiskFailureFact  `json:"disk_failure,omitempty"`
 }
+
+type DiskFailureFact struct {
+	RequestedBytes         int64 `json:"requested_bytes"`
+	ObservedAvailableBytes int64 `json:"observed_available_bytes"`
+}
+
+type insufficientDiskError struct {
+	RequestedBytes         int64
+	ObservedAvailableBytes int64
+	err                    error
+}
+
+func (failure *insufficientDiskError) Error() string {
+	return "insufficient disk for full Computer allocation"
+}
+func (failure *insufficientDiskError) Unwrap() error { return failure.err }
 
 // ImageFailureFact is sanitized mechanics evidence. The helper reports only
 // what it observed; retry and terminal classification remain agent policy.
@@ -387,15 +405,26 @@ type EnvironmentVariable struct {
 type ManagedVolumeKind string
 
 const (
-	ManagedVolumeHandoff     ManagedVolumeKind = "handoff"
-	ManagedVolumeServiceData ManagedVolumeKind = "service_data"
-	ManagedVolumeLogSegments ManagedVolumeKind = "log_segments"
+	ManagedVolumeHandoff      ManagedVolumeKind = "handoff"
+	ManagedVolumeServiceData  ManagedVolumeKind = "service_data"
+	ManagedVolumeComputerDisk ManagedVolumeKind = "computer_disk"
+	ManagedVolumeLogSegments  ManagedVolumeKind = "log_segments"
 )
 
+// ComputerStorageReference is the complete durable identity and allocation
+// budget for one Computer Storage generation. It contains no host path.
+type ComputerStorageReference struct {
+	ComputerID        string `json:"computer_id"`
+	StorageID         string `json:"storage_id"`
+	StorageGeneration int64  `json:"storage_generation"`
+	DiskBytes         int64  `json:"disk_bytes"`
+}
+
 type ManagedVolumeDescriptor struct {
-	Kind     ManagedVolumeKind `json:"kind"`
-	OwnerKey string            `json:"owner_key,omitempty"`
-	ReadOnly bool              `json:"read_only,omitempty"`
+	Kind            ManagedVolumeKind         `json:"kind"`
+	OwnerKey        string                    `json:"owner_key,omitempty"`
+	ComputerStorage *ComputerStorageReference `json:"computer_storage,omitempty"`
+	ReadOnly        bool                      `json:"read_only,omitempty"`
 }
 
 type OperatorMount struct {
@@ -544,8 +573,18 @@ type DeleteResponse struct {
 // DeleteManagedVolumeRequest names durable helper-owned state independently
 // from an attempt. OwnerKey is an opaque stable handoff-owner identity.
 type DeleteManagedVolumeRequest struct {
-	Kind     ManagedVolumeKind `json:"kind"`
-	OwnerKey string            `json:"owner_key"`
+	Kind            ManagedVolumeKind              `json:"kind"`
+	OwnerKey        string                         `json:"owner_key"`
+	ComputerStorage *ComputerStorageReference      `json:"computer_storage,omitempty"`
+	Removal         *ManagedVolumeRemovalAuthority `json:"removal,omitempty"`
+}
+
+type ManagedVolumeRemovalAuthority struct {
+	NodeID            string `json:"node_id"`
+	BootSessionID     string `json:"boot_session_id"`
+	JobID             string `json:"job_id"`
+	RemovalGeneration uint64 `json:"removal_generation"`
+	CleanupFence      string `json:"cleanup_fence"`
 }
 
 type DeleteManagedVolumeResponse struct {
@@ -571,7 +610,11 @@ type VerifyResponse struct {
 
 // SweepRequest is intentionally empty: the boot barrier always sweeps the
 // complete wefty namespace, so no caller-supplied selection policy exists.
-type SweepRequest struct{}
+type SweepRequest struct {
+	// SweepEpoch is helper-derived before engine entry and never decoded from
+	// the wire. Computer attachment receipts bind to this exact sweep.
+	SweepEpoch string `json:"-"`
+}
 
 type SweepResponse struct {
 	SweepEpoch            string                  `json:"sweep_epoch"`
@@ -585,15 +628,25 @@ type SweepResponse struct {
 // observation. Empty slices are retained in receipts so every inventory class
 // is explicitly verified, rather than inferred from a total count.
 type ResourceInventory struct {
-	Leases               []string `json:"leases"`
-	Snapshots            []string `json:"snapshots"`
-	Containers           []string `json:"containers"`
-	Tasks                []string `json:"tasks"`
-	Shims                []string `json:"shims"`
-	Cgroups              []string `json:"cgroups"`
-	LogSegments          []string `json:"log_segments"`
-	ManagedVolumes       []string `json:"managed_volumes"`
-	ManagedVolumeRecords []string `json:"managed_volume_records"`
+	Leases                  []string `json:"leases"`
+	Snapshots               []string `json:"snapshots"`
+	Containers              []string `json:"containers"`
+	Tasks                   []string `json:"tasks"`
+	Shims                   []string `json:"shims"`
+	Cgroups                 []string `json:"cgroups"`
+	LogSegments             []string `json:"log_segments"`
+	ManagedVolumes          []string `json:"managed_volumes"`
+	ManagedVolumeRecords    []string `json:"managed_volume_records"`
+	ComputerDiskImages      []string `json:"computer_disk_images"`
+	ComputerDiskAllocations []string `json:"computer_disk_allocations"`
+	ComputerDiskQuotas      []string `json:"computer_disk_quotas"`
+	ComputerDiskManifests   []string `json:"computer_disk_manifests"`
+	ComputerDiskMounts      []string `json:"computer_disk_mounts"`
+	ComputerDiskLoops       []string `json:"computer_disk_loops"`
+	ComputerAttachments     []string `json:"computer_attachments"`
+	// ComputerDiskAnomalies are per-disk observations. They remain auditable
+	// without turning one durable disk's accounting drift into node-wide helper failure.
+	ComputerDiskAnomalies []string `json:"computer_disk_anomalies"`
 }
 
 // SweptAttemptAuthority is the immutable removal-validation subset recovered

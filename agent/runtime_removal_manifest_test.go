@@ -51,6 +51,23 @@ func TestRuntimeRemovalManifestFreezesCurrentAttemptAndServiceDataIdentity(t *te
 	}
 }
 
+func TestRuntimeRemovalManifestAcceptsComputerStorageInsteadOfPhantomServiceData(t *testing.T) {
+	manifest := testRuntimeResourceManifest("computer-job", "attempt-1")
+	manifest.ServiceDataVolume = ""
+	manifest.ServiceDataOwnerRecord = ""
+	manifest.ComputerStorage = &workloadrunner.ComputerStorage{
+		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 2, DiskBytes: 8 << 30,
+	}
+	if err := validateRuntimeResourceManifest(manifest); err != nil {
+		t.Fatalf("Computer runtime manifest rejected: %v", err)
+	}
+	manifest.ServiceDataVolume = "phantom"
+	manifest.ServiceDataOwnerRecord = "phantom.owner"
+	if err := validateRuntimeResourceManifest(manifest); err == nil {
+		t.Fatal("Computer runtime manifest accepted phantom service-data classes")
+	}
+}
+
 func TestRuntimeRemovalManifestResumesCrashBoundaries(t *testing.T) {
 	directory := t.TempDir()
 	createdAt := time.Date(2026, 8, 27, 13, 0, 0, 0, time.UTC)

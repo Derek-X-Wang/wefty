@@ -37,6 +37,10 @@ const (
 	containerRootfsPath          = "rootfs"
 	containerdRuntimeSpecTypeURL = "types.containerd.io/opencontainers/runtime-spec/1/Spec"
 	defaultCPUPeriodMicroseconds = uint64(100_000)
+	// OWNER-CALL: Computer desktops need a browser-sized /tmp; the combined
+	// cgroup-charged tmpfs ceilings must be reviewed against the 1 GiB default.
+	computerTmpKilobytes    = 512 * 1024
+	computerVarTmpKilobytes = 64 * 1024
 )
 
 var appArmorProfilePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
@@ -225,6 +229,13 @@ func SpawnFailureForRunError(err error) *contract.SpawnFailure {
 		return &contract.SpawnFailure{Code: contract.SpawnFailureOCISpecRejected, Message: rpcErr.Message}
 	case CodeImageUnavailable:
 		return &contract.SpawnFailure{Code: contract.SpawnFailureImageUnavailable, Message: rpcErr.Message}
+	case CodeInsufficientDisk:
+		failure := &contract.SpawnFailure{Code: contract.SpawnFailureInsufficientDisk, Message: rpcErr.Message}
+		if rpcErr.DiskFailure != nil {
+			failure.RequestedBytes = rpcErr.DiskFailure.RequestedBytes
+			failure.ObservedAvailableBytes = rpcErr.DiskFailure.ObservedAvailableBytes
+		}
+		return failure
 	default:
 		return nil
 	}
@@ -294,7 +305,7 @@ func marshalRuntimeSpec(spec *specs.Spec) ([]byte, error) {
 	if !ok {
 		return nil, errors.New("OCI runtime spec root is absent")
 	}
-	root["readonly"] = false
+	root["readonly"] = spec.Root.Readonly
 	return json.Marshal(document)
 }
 
@@ -347,7 +358,11 @@ func buildRuntimeSpec(ctx context.Context, input RuntimeSpecInput, dependencies 
 	// release pins runtime-spec v1.3.0, so the bundle version must remain the
 	// linked specs.Version rather than being independently downgraded.
 	spec.Version = specs.Version
-	spec.Root = &specs.Root{Path: containerRootfsPath, Readonly: false}
+	computerDisk := false
+	for _, volume := range input.Workload.ManagedVolumes {
+		computerDisk = computerDisk || volume.Kind == ManagedVolumeComputerDisk
+	}
+	spec.Root = &specs.Root{Path: containerRootfsPath, Readonly: computerDisk}
 	spec.Hostname = ""
 	spec.Domainname = ""
 	spec.Hooks = nil
@@ -575,11 +590,20 @@ func isolationMounts(input RuntimeSpecInput) ([]specs.Mount, error) {
 		readonlyBindMount(input.HostsPath, "/etc/hosts"),
 	}
 	for _, volume := range input.Workload.ManagedVolumes {
+		if volume.Kind == ManagedVolumeComputerDisk {
+			mounts = append(mounts,
+				specs.Mount{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", computerTmpKilobytes)}},
+				specs.Mount{Destination: "/var/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", computerVarTmpKilobytes)}},
+			)
+			break
+		}
+	}
+	for _, volume := range input.Workload.ManagedVolumes {
 		var destination string
 		switch volume.Kind {
 		case ManagedVolumeHandoff:
 			destination = "/wefty/handoff"
-		case ManagedVolumeServiceData:
+		case ManagedVolumeServiceData, ManagedVolumeComputerDisk:
 			destination = "/wefty/service"
 		case ManagedVolumeLogSegments:
 			continue

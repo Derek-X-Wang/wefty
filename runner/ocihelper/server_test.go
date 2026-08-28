@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -490,6 +491,25 @@ func TestServiceDataOwnerRejectionSurvivesHelperAndAgentMapping(t *testing.T) {
 	failure := SpawnFailureForRunError(err)
 	if failure == nil || failure.Code != contract.SpawnFailureOCISpecRejected || !strings.Contains(failure.Message, "wanted 13001:13002") {
 		t.Fatalf("agent spawn failure = %#v", failure)
+	}
+}
+
+func TestInsufficientDiskSurvivesHelperAndAgentMapping(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runErr = &insufficientDiskError{RequestedBytes: 8 << 30, ObservedAvailableBytes: 2 << 30, err: syscall.ENOSPC}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	_, err = session.Run(t.Context(), testRunRequest(testAuthority(), time.Second))
+	assertRPCCode(t, err, CodeInsufficientDisk)
+	failure := SpawnFailureForRunError(err)
+	if failure == nil || failure.Code != contract.SpawnFailureInsufficientDisk || failure.RequestedBytes != 8<<30 || failure.ObservedAvailableBytes != 2<<30 {
+		t.Fatalf("insufficient disk spawn failure = %#v", failure)
 	}
 }
 

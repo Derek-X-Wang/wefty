@@ -628,21 +628,32 @@ func (adapter *finalizationContextRuntime) ReapAndVerify(ctx context.Context, _ 
 type preflightExecutor struct{ calls int }
 
 func TestRuntimeManagedVolumesCompileClassPolicyBeforeOCIAdapter(t *testing.T) {
-	oneshoot := runtimeManagedVolumes(contract.JobSpec{
+	oneshoot := runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: contract.JobSpec{
 		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
 		Labels: map[string]string{"run_id": "run-1"},
-	})
+	}}})
 	if len(oneshoot) != 1 || oneshoot[0].Kind != workloadrunner.ManagedVolumeHandoff || oneshoot[0].OwnerKey != "run-1" {
 		t.Fatalf("one-shot managed volumes = %+v", oneshoot)
 	}
-	service := runtimeManagedVolumes(contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService})
+	service := runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService}}})
 	if len(service) != 1 || service[0].Kind != workloadrunner.ManagedVolumeServiceData || service[0].OwnerKey != "" {
 		t.Fatalf("service managed volumes = %+v", service)
 	}
 	if finalized := runtimeManagedVolumesForSuccessfulCompletion(contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService}); len(finalized) != 0 {
 		t.Fatalf("successful service completion finalized durable data = %+v", finalized)
 	}
-	if volumes := runtimeManagedVolumes(contract.JobSpec{Kind: contract.JobKindProcess, Class: contract.JobClassService}); len(volumes) != 0 {
+	computer := runtimeManagedVolumes(l1.Claim{
+		Job: l1.Job{Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService, Execution: contract.ExecutionSpec{
+			OCI: &contract.OCIExecutionSpec{Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}},
+		}}},
+		ComputerStorage: &l1.ComputerStorageClaim{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 3},
+	})
+	if len(computer) != 1 || computer[0].Kind != workloadrunner.ManagedVolumeComputerDisk || computer[0].ComputerStorage == nil ||
+		computer[0].ComputerStorage.ComputerID != "computer-1" || computer[0].ComputerStorage.StorageID != "storage-1" ||
+		computer[0].ComputerStorage.StorageGeneration != 3 || computer[0].ComputerStorage.DiskBytes != 8<<30 {
+		t.Fatalf("Computer managed volume = %+v", computer)
+	}
+	if volumes := runtimeManagedVolumes(l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Kind: contract.JobKindProcess, Class: contract.JobClassService}}}); len(volumes) != 0 {
 		t.Fatalf("process managed volumes = %+v", volumes)
 	}
 }

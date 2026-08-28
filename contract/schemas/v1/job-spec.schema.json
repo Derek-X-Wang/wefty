@@ -246,7 +246,13 @@
                 "required": ["limits"],
                 "properties": {
                   "image": { "required": ["digest"] },
-                  "limits": { "required": ["memory_bytes"] }
+                  "limits": { "required": ["memory_bytes"] },
+                  "mounts": {
+                    "items": {
+                      "required": ["read_only"],
+                      "properties": { "read_only": { "const": true } }
+                    }
+                  }
                 }
               }
             }

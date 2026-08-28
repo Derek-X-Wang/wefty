@@ -79,7 +79,7 @@ func validateWorkloadWire(input WorkloadInput) error {
 	seenVolumes := make(map[string]struct{}, len(input.OperatorMounts))
 	for _, volume := range input.ManagedVolumes {
 		switch volume.Kind {
-		case ManagedVolumeHandoff, ManagedVolumeServiceData, ManagedVolumeLogSegments:
+		case ManagedVolumeHandoff, ManagedVolumeServiceData, ManagedVolumeComputerDisk, ManagedVolumeLogSegments:
 		default:
 			return fmt.Errorf("managed volume kind %q is not supported", volume.Kind)
 		}
@@ -93,6 +93,15 @@ func validateWorkloadWire(input WorkloadInput) error {
 			}
 		} else if volume.OwnerKey != "" {
 			return fmt.Errorf("managed volume kind %q does not accept an owner key", volume.Kind)
+		}
+		if volume.Kind == ManagedVolumeComputerDisk {
+			storage := volume.ComputerStorage
+			if storage == nil || !boundedStorageID(storage.ComputerID) || !boundedStorageID(storage.StorageID) ||
+				storage.StorageGeneration < 1 || storage.DiskBytes <= 0 {
+				return errors.New("computer disk requires a bounded durable Storage identity and positive allocation")
+			}
+		} else if volume.ComputerStorage != nil {
+			return fmt.Errorf("managed volume kind %q does not accept Computer Storage", volume.Kind)
 		}
 	}
 	for _, mount := range input.OperatorMounts {
@@ -110,7 +119,18 @@ func validateWorkloadWire(input WorkloadInput) error {
 		}
 		seenVolumes[mount.ContainerPath] = struct{}{}
 	}
+	if _, computerDisk := seenManagedKinds[ManagedVolumeComputerDisk]; computerDisk {
+		for _, mount := range input.OperatorMounts {
+			if !mount.ReadOnly {
+				return errors.New("Computer operator mounts must be read-only so tenant writes remain bounded")
+			}
+		}
+	}
 	return nil
+}
+
+func boundedStorageID(value string) bool {
+	return value != "" && strings.TrimSpace(value) == value && len(value) <= 255 && strings.IndexByte(value, 0) < 0
 }
 
 func validateEnvironmentLayer(layerName string, environment []EnvironmentVariable, reservedOnly bool) error {

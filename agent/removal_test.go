@@ -64,6 +64,65 @@ func TestRemovalControllerPersistsReapsDeletesThenAcknowledges(t *testing.T) {
 	}
 }
 
+func TestComputerRemovalDeletesDiskBeforeAcknowledgement(t *testing.T) {
+	directive := l1.RemovalDirective{JobID: "computer-job", BoundNodeID: "node", RemovalGeneration: 4, CleanupFence: "cleanup", RootInstanceID: "root",
+		ComputerStorage: &l1.ComputerStorageClaim{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2}}
+	var stages []string
+	controller := &removalController{nodeID: "node", bootSessionID: "boot"}
+	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
+	controller.reapService = func(context.Context, string) (workloadrunner.ReapReceipt, error) {
+		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+	}
+	controller.purgeJob = func(context.Context, string) error { return nil }
+	controller.removeResource = func(context.Context, localRemoval) error { stages = append(stages, "managed"); return nil }
+	controller.finalizeVolumes = func(_ context.Context, request workloadrunner.ManagedVolumeFinalizationRequest) error {
+		stages = append(stages, "disk")
+		if request.Removal == nil || request.Removal.CleanupFence != directive.CleanupFence || len(request.Volumes) != 1 || request.Volumes[0].ComputerStorage.StorageGeneration != 2 {
+			t.Fatalf("Computer finalization request = %+v", request)
+		}
+		return nil
+	}
+	controller.ackRemoval = func(context.Context, localRemoval) error { stages = append(stages, "ack"); return nil }
+	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
+	if err := controller.process(t.Context(), directive); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"managed", "disk", "ack"}; !reflect.DeepEqual(stages, want) {
+		t.Fatalf("Computer removal stages = %v, want %v", stages, want)
+	}
+}
+
+func TestComputerRemovalResumesDiskDeletionFromFrozenManifest(t *testing.T) {
+	removal := localRemoval{jobID: "computer-job", generation: 4, cleanupFence: "cleanup", rootInstanceID: "root", processTreeReaped: true}
+	storage := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30}
+	record := runtimeRemovalRecord{
+		removal: removal, phase: runtimeRemovalComplete,
+		manifest: runtimeRemovalManifest{Version: 1, JobID: removal.jobID, RemovalGeneration: removal.generation,
+			Attempts: []workloadrunner.RuntimeResourceManifest{{ComputerStorage: storage}}},
+	}
+	var stages []string
+	controller := &removalController{managed: &resumedManagedResource{}, nodeID: "node", bootSessionID: "new-boot"}
+	controller.listRuntimeRemovals = func(context.Context) ([]runtimeRemovalRecord, error) { return []runtimeRemovalRecord{record}, nil }
+	controller.purgeJob = func(context.Context, string) error { return nil }
+	controller.removeResource = func(context.Context, localRemoval) error { return nil }
+	controller.finalizeVolumes = func(_ context.Context, request workloadrunner.ManagedVolumeFinalizationRequest) error {
+		stages = append(stages, "disk")
+		if request.Removal == nil || request.Removal.BootSessionID != "new-boot" || len(request.Volumes) != 1 ||
+			request.Volumes[0].ComputerStorage == nil || *request.Volumes[0].ComputerStorage != *storage {
+			t.Fatalf("resumed Computer finalization request = %+v", request)
+		}
+		return nil
+	}
+	controller.ackRemoval = func(context.Context, localRemoval) error { stages = append(stages, "ack"); return nil }
+	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
+	if err := controller.resume(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"disk", "ack"}; !reflect.DeepEqual(stages, want) {
+		t.Fatalf("resumed Computer removal stages = %v, want %v", stages, want)
+	}
+}
+
 func TestRemovalControllerNeverAcknowledgesFailedDeletion(t *testing.T) {
 	errDelete := errors.New("injected deletion failure")
 	acknowledged := false

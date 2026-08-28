@@ -177,6 +177,37 @@ func TestNamedAndNumericImageUsersChooseDifferentSupplementalLookup(t *testing.T
 	}
 }
 
+func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
+	input := goldenRuntimeSpecInput(t, "amd64")
+	input.Workload.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
+		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 8 << 30,
+	}}}
+	input.Workload.OperatorMounts = nil
+	input.OperatorMountSources = nil
+	input.ManagedVolumeSources = map[ManagedVolumeKind]string{ManagedVolumeComputerDisk: "/run/wefty/fixtures/computer-disk"}
+	spec, err := buildRuntimeSpec(context.Background(), input,
+		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.4", "seccomp-linux-amd64.json")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Root == nil || !spec.Root.Readonly {
+		t.Fatalf("Computer root = %#v, want read-only", spec.Root)
+	}
+	writable := map[string]string{"/wefty/service": "", "/tmp": "size=524288k", "/var/tmp": "size=65536k"}
+	bounded := map[string]bool{}
+	for _, mount := range spec.Mounts {
+		if size, expected := writable[mount.Destination]; expected {
+			bounded[mount.Destination] = mount.Destination == "/wefty/service" ||
+				(mount.Type == "tmpfs" && slices.Contains(mount.Options, size))
+		}
+	}
+	for path := range writable {
+		if !bounded[path] {
+			t.Fatalf("Computer writable path %s is absent or unbounded: %+v", path, spec.Mounts)
+		}
+	}
+}
+
 func TestOperatorMountsSortParentsBeforeChildren(t *testing.T) {
 	input := goldenRuntimeSpecInput(t, "amd64")
 	input.Workload.OperatorMounts = []OperatorMount{
@@ -399,6 +430,25 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 		{name: "managed duplicate", mutate: func(input *WorkloadInput) {
 			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "run-1"}, {Kind: ManagedVolumeHandoff, OwnerKey: "run-1"}}
 		}},
+		{name: "Computer disk missing Storage", mutate: func(input *WorkloadInput) {
+			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk}}
+		}},
+		{name: "Computer disk invalid generation", mutate: func(input *WorkloadInput) {
+			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
+				ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 0, DiskBytes: 1024,
+			}}}
+		}},
+		{name: "ordinary volume carries Computer Storage", mutate: func(input *WorkloadInput) {
+			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeServiceData, ComputerStorage: &ComputerStorageReference{
+				ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 1024,
+			}}}
+		}},
+		{name: "Computer disk writable operator mount", mutate: func(input *WorkloadInput) {
+			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
+				ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 1024,
+			}}}
+			input.OperatorMounts = []OperatorMount{{NodePath: "/host/data", ContainerPath: "/data"}}
+		}},
 		{name: "mount source", mutate: func(input *WorkloadInput) {
 			input.OperatorMounts = []OperatorMount{{NodePath: "/", ContainerPath: "/data"}}
 		}},
@@ -422,6 +472,13 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 				t.Fatal("invalid wire workload was accepted")
 			}
 		})
+	}
+	computerDisk := valid()
+	computerDisk.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
+		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 8 << 30,
+	}}}
+	if err := validateWorkloadWire(computerDisk); err != nil {
+		t.Fatalf("valid Computer disk was rejected: %v", err)
 	}
 	reservedInOperatorLayers := valid()
 	reservedInOperatorLayers.Environment = []EnvironmentVariable{{Name: "WEFTY_RUN_TOKEN", Value: "public"}}

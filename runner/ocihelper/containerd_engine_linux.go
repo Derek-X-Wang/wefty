@@ -54,6 +54,7 @@ import (
 type containerdAttempt struct {
 	authority       AttemptAuthority
 	resources       ResourceIdentity
+	computerDisk    *computerDiskAttachment
 	container       containerd.Container
 	task            containerd.Task
 	terminalReady   chan struct{}
@@ -99,6 +100,7 @@ type ContainerdEngine struct {
 	ports             map[uint16]string
 	nextPort          uint16
 	serviceVolumeMu   sync.Mutex
+	diskSystem        computerDiskSystem
 }
 
 const (
@@ -687,6 +689,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	}
 	leaseContext := leases.WithLease(ctx, lease.ID)
 	created := true
+	var computerDisk *computerDiskAttachment
 	var hostBridge net.Listener
 	endpoints := make(map[string]uint16, len(request.AllocateEndpoints))
 	endpointHolds := make(map[string]net.Listener, len(request.AllocateEndpoints))
@@ -700,10 +703,14 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			}
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			defer cancel()
-			runErr = errors.Join(runErr, engine.deleteResources(cleanupCtx, request.Authority, request.Resources))
+			runErr = errors.Join(runErr, engine.deleteResources(cleanupCtx, request.Authority, request.Resources, computerDisk))
 			verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
 			runErr = errors.Join(runErr, verifyErr)
-			if verifyErr == nil && verification.Absent {
+			runtimeAbsent := verification.Absent
+			if computerDisk != nil {
+				runtimeAbsent = InventoryEmpty(withoutDurableDataInventory(verification.Inventory))
+			}
+			if verifyErr == nil && runtimeAbsent {
 				runErr = errors.Join(runErr, engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()))
 				for _, port := range endpoints {
 					engine.releaseAttemptPort(port, request.Authority.key())
@@ -762,10 +769,11 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		if err := engine.refreshManagedNetworkFiles(); err != nil {
 			return err
 		}
-		managedSources, freshServiceVolume, managedErr := engine.managedVolumeSources(request)
+		managedSources, freshServiceVolume, attachedDisk, managedErr := engine.managedVolumeSources(leaseContext, &request)
 		if managedErr != nil {
 			return managedErr
 		}
+		computerDisk = attachedDisk
 		operatorSources, translateErr := TranslateOperatorMountSources(request.Workload, engine.translateOperatorMountSource)
 		if translateErr != nil {
 			return translateErr
@@ -779,14 +787,21 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			ManagedVolumeSources: managedSources, OperatorMountSources: operatorSources,
 		})
 		if configErr == nil {
+			uid, gid, ownerErr := document.ProcessOwner()
+			if ownerErr != nil {
+				closeErr := document.Close()
+				document = nil
+				return errors.Join(ownerErr, closeErr)
+			}
 			if servicePath, ok := managedSources[ManagedVolumeServiceData]; ok {
-				uid, gid, ownerErr := document.ProcessOwner()
-				if ownerErr != nil {
+				if ownerErr = engine.initializeServiceVolume(servicePath, request.Resources.ServiceVolumeOwnerRecord, freshServiceVolume, uid, gid); ownerErr != nil {
 					closeErr := document.Close()
 					document = nil
 					return errors.Join(ownerErr, closeErr)
 				}
-				if ownerErr = engine.initializeServiceVolume(servicePath, request.Resources.ServiceVolumeOwnerRecord, freshServiceVolume, uid, gid); ownerErr != nil {
+			}
+			if computerDisk != nil {
+				if ownerErr = initializeComputerDiskRoot(computerDisk, uid, gid); ownerErr != nil {
 					closeErr := document.Close()
 					document = nil
 					return errors.Join(ownerErr, closeErr)
@@ -831,7 +846,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		attemptCancel()
 		return RunResponse{}, fmt.Errorf("register task Wait before Start: %w", err)
 	}
-	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, container: container, task: task, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds}
+	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, computerDisk: computerDisk, container: container, task: task, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds}
 	engine.watchOOM(attempt)
 	engine.mu.Lock()
 	engine.attempts[request.Authority.key()] = attempt
@@ -1151,6 +1166,10 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 	if attempt != nil {
 		resources = attempt.resources
 	}
+	var computerDisk *computerDiskAttachment
+	if attempt != nil {
+		computerDisk = attempt.computerDisk
+	}
 	cleanupCtx, cancel := context.WithTimeout(engineContext(ctx), 10*time.Second)
 	defer cancel()
 	var lastErr error
@@ -1161,11 +1180,11 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 		// this inside the retry budget because containerd inspection is transient.
 		identityErr := engine.validateAttemptResourceIdentity(cleanupCtx, request.Authority, resources)
 		if identityErr == nil {
-			deleteErr := engine.deleteResources(cleanupCtx, request.Authority, resources)
+			deleteErr := engine.deleteResources(cleanupCtx, request.Authority, resources, computerDisk)
 			verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
 			runtimeAbsent := verification.Absent
 			if request.Authority.Class == contract.JobClassService {
-				runtimeAbsent = InventoryEmpty(withoutServiceDataInventory(verification.Inventory))
+				runtimeAbsent = InventoryEmpty(withoutDurableDataInventory(verification.Inventory))
 			}
 			if deleteErr == nil && verifyErr == nil && runtimeAbsent {
 				if releaseErr := engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()); releaseErr == nil {
@@ -1267,6 +1286,15 @@ func validateRuntimeResourceLabels(kind, observedID, expectedID string, labels m
 }
 
 func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
+	if request.Kind == ManagedVolumeComputerDisk {
+		if request.ComputerStorage == nil || request.Removal == nil {
+			return DeleteManagedVolumeResponse{}, errors.New("Computer disk deletion requires Storage and removal authority")
+		}
+		if err := engine.deleteComputerDisk(*request.ComputerStorage, *request.Removal); err != nil {
+			return DeleteManagedVolumeResponse{}, err
+		}
+		return DeleteManagedVolumeResponse{Deleted: true}, nil
+	}
 	if request.Kind != ManagedVolumeHandoff {
 		return DeleteManagedVolumeResponse{}, fmt.Errorf("managed volume kind %q cannot be finalized", request.Kind)
 	}
@@ -1291,7 +1319,14 @@ func (engine *ContainerdEngine) ReapAttempt(ctx context.Context, authority Attem
 	if err != nil {
 		return err
 	}
-	return engine.deleteResources(engineContext(ctx), authority, resources)
+	engine.mu.Lock()
+	var computerDisk *computerDiskAttachment
+	if attempt := engine.attempts[authority.key()]; attempt != nil {
+		resources = attempt.resources
+		computerDisk = attempt.computerDisk
+	}
+	engine.mu.Unlock()
+	return engine.deleteResources(engineContext(ctx), authority, resources, computerDisk)
 }
 
 func (engine *ContainerdEngine) ReapSession(ctx context.Context, _ SessionIdentity) error {
@@ -1336,13 +1371,20 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 		if identityErr != nil {
 			return VerifyResponse{}, identityErr
 		}
-		inventory = filterInventory(inventory, resources)
+		engine.mu.Lock()
+		var computerDisk *computerDiskAttachment
+		if attempt := engine.attempts[request.Authority.key()]; attempt != nil {
+			resources = attempt.resources
+			computerDisk = attempt.computerDisk
+		}
+		engine.mu.Unlock()
+		inventory = filterInventory(inventory, resources, computerDisk)
 	}
 	// Service data is job-lifetime state, not boot-sweep residue. Attempt
 	// verification retains it so explicit job removal can positively observe
 	// the directory and owner record, while namespace quiescence projects it out.
 	if request.Scope == VerifyNamespace {
-		inventory = withoutServiceDataInventory(inventory)
+		inventory = withoutDurableDataInventory(inventory)
 	}
 	absent := InventoryEmpty(inventory)
 	if absent && request.Scope == VerifyNamespace {
@@ -1351,7 +1393,7 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 	return VerifyResponse{Absent: absent, Inventory: inventory}, nil
 }
 
-func (engine *ContainerdEngine) Sweep(ctx context.Context, _ SweepRequest) (SweepResponse, error) {
+func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
 	ctx = engineContext(ctx)
 	if err := engine.cleanupExpiredHandoffs(time.Now()); err != nil {
 		return SweepResponse{}, err
@@ -1413,6 +1455,9 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, _ SweepRequest) (Swee
 		if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil && !errdefs.IsNotFound(err) {
 			return SweepResponse{}, err
 		}
+	}
+	if err := engine.sweepComputerDisks(request.SweepEpoch); err != nil {
+		return SweepResponse{}, err
 	}
 	return engine.finishSweep(ctx, inventory, prior, attempts)
 }
@@ -1544,7 +1589,7 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 		attemptList = append(attemptList, attempt)
 	}
 	sort.Slice(attemptList, func(i, j int) bool { return attemptList[i].AttemptID < attemptList[j].AttemptID })
-	return SweepResponse{Removed: inventoryCount(inventory), PriorBootSessionsSeen: priorList, Inventory: inventory, Attempts: attemptList}, nil
+	return SweepResponse{Removed: inventoryCount(withoutDurableDataInventory(inventory)), PriorBootSessionsSeen: priorList, Inventory: inventory, Attempts: attemptList}, nil
 }
 
 func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
@@ -1610,7 +1655,7 @@ func (engine *ContainerdEngine) attempt(authority AttemptAuthority) (*containerd
 	return attempt, nil
 }
 
-func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority AttemptAuthority, resources ResourceIdentity) error {
+func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority AttemptAuthority, resources ResourceIdentity, computerDisk *computerDiskAttachment) error {
 	engine.mu.Lock()
 	attempt := engine.attempts[authority.key()]
 	engine.mu.Unlock()
@@ -1656,6 +1701,11 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 		}
 	} else {
 		if err := engine.client.SnapshotService(DefaultSnapshotter).Remove(ctx, resources.SnapshotID); err != nil && !errdefs.IsNotFound(err) {
+			failures = append(failures, err)
+		}
+	}
+	if computerDisk != nil {
+		if err := engine.detachComputerDisk(computerDisk, computerDiskReapReceipt, ""); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -1836,9 +1886,10 @@ type serviceVolumeCreation struct {
 	inode  uint64
 }
 
-func (engine *ContainerdEngine) managedVolumeSources(request RunRequest) (map[ManagedVolumeKind]string, *serviceVolumeCreation, error) {
+func (engine *ContainerdEngine) managedVolumeSources(ctx context.Context, request *RunRequest) (map[ManagedVolumeKind]string, *serviceVolumeCreation, *computerDiskAttachment, error) {
 	result := make(map[ManagedVolumeKind]string)
 	var freshServiceVolume *serviceVolumeCreation
+	var computerDisk *computerDiskAttachment
 	for _, volume := range request.Workload.ManagedVolumes {
 		name := ""
 		root := "volumes"
@@ -1849,36 +1900,47 @@ func (engine *ContainerdEngine) managedVolumeSources(request RunRequest) (map[Ma
 		case ManagedVolumeServiceData:
 			name = request.Resources.ServiceVolumeDirectory
 			root = "service-data"
+		case ManagedVolumeComputerDisk:
+			if volume.ComputerStorage == nil {
+				return nil, nil, nil, errors.New("Computer disk Storage identity is required")
+			}
+			attachment, err := engine.attachComputerDisk(ctx, *volume.ComputerStorage, request.Authority)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			computerDisk = attachment
+			result[volume.Kind] = attachment.mountPath
+			continue
 		case ManagedVolumeLogSegments:
 			name = request.Resources.LogSegmentDirectory
 		default:
-			return nil, nil, fmt.Errorf("managed volume kind %q is unsupported", volume.Kind)
+			return nil, nil, nil, fmt.Errorf("managed volume kind %q is unsupported", volume.Kind)
 		}
 		path := filepath.Join(engine.config.RuntimeRoot, root, name)
 		if volume.Kind == ManagedVolumeServiceData {
 			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			if err := os.Mkdir(path, 0o700); err == nil {
 				freshServiceVolume, err = serviceVolumeCreationAt(path)
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 			} else if !errors.Is(err, os.ErrExist) {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		} else if err := os.MkdirAll(path, 0o700); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if volume.Kind == ManagedVolumeHandoff {
 			now := time.Now()
 			if err := os.Chtimes(path, now, now); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 		result[volume.Kind] = path
 	}
-	return result, freshServiceVolume, nil
+	return result, freshServiceVolume, computerDisk, nil
 }
 
 type serviceVolumeOwnerRecord struct {
@@ -2225,7 +2287,7 @@ func (engine *ContainerdEngine) watchOOM(attempt *containerdAttempt) {
 }
 
 func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventory, error) {
-	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}}
+	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerDiskAnomalies: []string{}}
 	leaseList, err := engine.client.LeasesService().List(ctx)
 	if err != nil {
 		return result, err
@@ -2316,6 +2378,9 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 	if err := inventoryManagedVolumeResources(engine.config.RuntimeRoot, &result); err != nil {
 		return result, err
 	}
+	if err := engine.inventoryComputerDiskResources(&result); err != nil {
+		return result, err
+	}
 	sort.Strings(result.Leases)
 	sort.Strings(result.Snapshots)
 	sort.Strings(result.Containers)
@@ -2325,6 +2390,14 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 	sort.Strings(result.LogSegments)
 	sort.Strings(result.ManagedVolumes)
 	sort.Strings(result.ManagedVolumeRecords)
+	sort.Strings(result.ComputerDiskImages)
+	sort.Strings(result.ComputerDiskAllocations)
+	sort.Strings(result.ComputerDiskQuotas)
+	sort.Strings(result.ComputerDiskManifests)
+	sort.Strings(result.ComputerDiskMounts)
+	sort.Strings(result.ComputerDiskLoops)
+	sort.Strings(result.ComputerAttachments)
+	sort.Strings(result.ComputerDiskAnomalies)
 	return result, nil
 }
 
@@ -2359,8 +2432,8 @@ func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInvento
 	return nil
 }
 
-func filterInventory(inventory ResourceInventory, resources ResourceIdentity) ResourceInventory {
-	filtered := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}}
+func filterInventory(inventory ResourceInventory, resources ResourceIdentity, attachment *computerDiskAttachment) ResourceInventory {
+	filtered := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerDiskAnomalies: []string{}}
 	for _, pair := range []struct {
 		values []string
 		target string
@@ -2372,6 +2445,19 @@ func filterInventory(inventory ResourceInventory, resources ResourceIdentity) Re
 			}
 		}
 	}
+	if attachment != nil {
+		for _, pair := range []struct {
+			values []string
+			target string
+			output *[]string
+		}{{inventory.ComputerDiskImages, attachment.name, &filtered.ComputerDiskImages}, {inventory.ComputerDiskAllocations, attachment.name, &filtered.ComputerDiskAllocations}, {inventory.ComputerDiskQuotas, attachment.name, &filtered.ComputerDiskQuotas}, {inventory.ComputerDiskManifests, attachment.name, &filtered.ComputerDiskManifests}, {inventory.ComputerDiskMounts, attachment.name, &filtered.ComputerDiskMounts}, {inventory.ComputerDiskLoops, attachment.loopDevice, &filtered.ComputerDiskLoops}, {inventory.ComputerAttachments, attachment.name, &filtered.ComputerAttachments}} {
+			for _, value := range pair.values {
+				if value == pair.target {
+					*pair.output = append(*pair.output, value)
+				}
+			}
+		}
+	}
 	return filtered
 }
 
@@ -2380,6 +2466,15 @@ func withoutServiceDataInventory(inventory ResourceInventory) ResourceInventory 
 		return strings.HasPrefix(name, "wefty-service-volume-")
 	})
 	inventory.ManagedVolumeRecords = []string{}
+	return inventory
+}
+
+func withoutDurableDataInventory(inventory ResourceInventory) ResourceInventory {
+	inventory = withoutServiceDataInventory(inventory)
+	inventory.ComputerDiskImages = []string{}
+	inventory.ComputerDiskAllocations = []string{}
+	inventory.ComputerDiskQuotas = []string{}
+	inventory.ComputerDiskManifests = []string{}
 	return inventory
 }
 
@@ -2422,7 +2517,7 @@ func mapKeys(values map[string]struct{}) []string {
 	return result
 }
 func inventoryCount(inventory ResourceInventory) int {
-	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords)
+	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments)
 }
 
 func kernelRelease() string {

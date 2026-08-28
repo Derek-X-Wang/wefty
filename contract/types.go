@@ -592,8 +592,11 @@ const RuntimeFailureUnavailable RuntimeFailureCode = "runtime_unavailable"
 // SpawnFailure is a stable machine-readable pre-execution failure. Message is
 // diagnostic only; policy must key exclusively on Code.
 type SpawnFailure struct {
-	Code    SpawnFailureCode `json:"code"`
-	Message string           `json:"message"`
+	Code                   SpawnFailureCode `json:"code"`
+	Message                string           `json:"message"`
+	NodeID                 string           `json:"node_id,omitempty"`
+	RequestedBytes         int64            `json:"requested_bytes,omitempty"`
+	ObservedAvailableBytes int64            `json:"observed_available_bytes,omitempty"`
 }
 
 type SpawnFailureCode string
@@ -620,6 +623,7 @@ const (
 	SpawnFailureImageManifestInvalid       SpawnFailureCode = "image_manifest_invalid"
 	SpawnFailureImagePlatformUnsupported   SpawnFailureCode = "image_platform_unsupported"
 	SpawnFailureOCISpecRejected            SpawnFailureCode = "oci_spec_rejected"
+	SpawnFailureInsufficientDisk           SpawnFailureCode = "insufficient_disk"
 )
 
 // TerminationCause identifies who initiated a signal termination. A service

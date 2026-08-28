@@ -233,8 +233,10 @@ removal receipts across mid-removal crashes.
 Before an OCI service attempt can enter helper `Run`, the agent persists its
 immutable fenced resource manifest in the FULL-synchronous local SQLite ledger.
 The manifest names the attempt lease, task, container, writable snapshot,
-shim, cgroup, framed-log directory, and the stable service-data directory plus
-its owner record. Operator bind source paths are excluded; their existing
+shim, cgroup, and framed-log directory. An ordinary service manifest then names
+the stable service-data directory plus its owner record, while a Computer
+manifest instead names its exact Computer, Storage, generation, and allocation
+identity; the two durable-data branches are mutually exclusive. Operator bind source paths are excluded; their existing
 descriptor-backed guards remain held through runtime teardown and removal never
 traverses them.
 
@@ -279,6 +281,11 @@ opaque backing identity from the stable job ID, initializes the fresh guest
 directory once to the pinned image's resolved UID:GID, and mounts it at the
 reserved path on every attempt. Attempt reap, restart, stop, and start retain
 that data while each attempt receives a fresh writable root snapshot.
+For a Computer projection, the authoritative claim additionally carries its
+exact `computer_id` and `storage_id@generation`; the agent compiles
+`computer_disk` instead of `service_data` and copies the trait's positive
+`disk_bytes`. A Computer claim missing that joined Storage authority fails
+closed before runtime entry.
 
 ## Attempts and occupancy
 

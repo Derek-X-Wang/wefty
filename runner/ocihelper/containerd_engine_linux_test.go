@@ -400,7 +400,7 @@ func TestOwnerKeyedHandoffBytesSurviveAttemptsUntilExplicitFinalization(t *testi
 		Resources: ResourceIdentity{HandoffVolumeDirectory: name},
 		Workload:  WorkloadInput{ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "run-owner"}}},
 	}
-	first, _, err := engine.managedVolumeSources(request)
+	first, _, _, err := engine.managedVolumeSources(t.Context(), &request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +408,7 @@ func TestOwnerKeyedHandoffBytesSurviveAttemptsUntilExplicitFinalization(t *testi
 	if err := os.WriteFile(marker, []byte("handoff bytes\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	second, _, err := engine.managedVolumeSources(request)
+	second, _, _, err := engine.managedVolumeSources(t.Context(), &request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,7 +668,7 @@ func TestServiceDataDirectoryAndOwnerRecordAreInventorySubjects(t *testing.T) {
 	if err := inventoryManagedVolumeResources(root, &inventory); err != nil {
 		t.Fatal(err)
 	}
-	filtered := filterInventory(inventory, resources)
+	filtered := filterInventory(inventory, resources, nil)
 	if !slices.Equal(filtered.ManagedVolumes, []string{resources.ServiceVolumeDirectory}) || !slices.Equal(filtered.ManagedVolumeRecords, []string{resources.ServiceVolumeOwnerRecord}) {
 		t.Fatalf("service data inventory = %+v, want directory and owner record", filtered)
 	}

@@ -129,9 +129,11 @@ current Job to `removal_pending`; no later Job or attempt can be created. The
 ordinary durable service-removal directive carries current Job cleanup to the
 bound agent. Its authenticated acknowledgement finalizes the Job observation
 in place as `removed_verified` and releases Slot occupancy while retaining the
-Computer and immutable Job evidence. Composite Storage/resource deletion and
-the final Computer removal strength remain owned by the later Computer removal
-contract.
+Computer and immutable Job evidence. For a Computer, acknowledgement is gated
+on helper-verified deletion of its detached current single-generation disk
+image, manifest, and quota directory. Storage provenance, Backups, custody,
+multiple generations, and the final composite Computer removal strength remain
+owned by the later Computer removal contract.
 
 The first successful claim copies the ordinary service binding to the Computer
 row. Stop follows the ordinary positive-quiescence transition and releases the

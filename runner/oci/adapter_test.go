@@ -59,6 +59,30 @@ func TestRemovalResourceManifestNamesAllManagedResourcesWithoutBindSources(t *te
 	}
 }
 
+func TestComputerRemovalResourceManifestNamesStorageInsteadOfServiceData(t *testing.T) {
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.Authority.RemovalGeneration = "1"
+	request.ManagedVolumes = []workloadrunner.ManagedVolume{{
+		Kind: workloadrunner.ManagedVolumeComputerDisk,
+		ComputerStorage: &workloadrunner.ComputerStorage{
+			ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 3, DiskBytes: 8 << 30,
+		},
+	}}
+	manifest, err := (&Adapter{}).RemovalResourceManifest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.ComputerStorage == nil || manifest.ComputerStorage.ComputerID != "computer-1" ||
+		manifest.ComputerStorage.StorageID != "storage-1" || manifest.ComputerStorage.StorageGeneration != 3 ||
+		manifest.ComputerStorage.DiskBytes != 8<<30 {
+		t.Fatalf("Computer removal manifest Storage = %+v", manifest.ComputerStorage)
+	}
+	if manifest.ServiceDataVolume != "" || manifest.ServiceDataOwnerRecord != "" {
+		t.Fatalf("Computer removal manifest fabricated service-data identity: %+v", manifest)
+	}
+}
+
 func TestAdapterRequiresAuthoritativeStartedBeforeLocalPromotion(t *testing.T) {
 	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
@@ -625,6 +649,17 @@ func TestWorkloadInputMakesManagedVolumeMountsAuthoritative(t *testing.T) {
 	if len(input.ReservedEnvironment) != 1 || input.ReservedEnvironment[0].Name != contract.EnvServiceDir ||
 		input.ReservedEnvironment[0].Value != contract.OCIContainerServiceDirectory {
 		t.Fatalf("service reserved environment = %+v", input.ReservedEnvironment)
+	}
+
+	request.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: &workloadrunner.ComputerStorage{
+		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 2, DiskBytes: 8 << 30,
+	}}}
+	input = workloadInput(request)
+	if len(input.ManagedVolumes) != 1 || input.ManagedVolumes[0].Kind != ocihelper.ManagedVolumeComputerDisk ||
+		input.ManagedVolumes[0].ComputerStorage == nil || input.ManagedVolumes[0].ComputerStorage.ComputerID != "computer-1" ||
+		input.ManagedVolumes[0].ComputerStorage.StorageID != "storage-1" || input.ManagedVolumes[0].ComputerStorage.StorageGeneration != 2 ||
+		input.ManagedVolumes[0].ComputerStorage.DiskBytes != 8<<30 {
+		t.Fatalf("Computer managed volume = %+v", input.ManagedVolumes)
 	}
 }
 

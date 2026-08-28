@@ -78,6 +78,7 @@ func assertServiceCompletionClassification(t *testing.T) {
 		wantBackoff          bool
 		wantFailure          bool
 		wantFailureCode      contract.SpawnFailureCode
+		wantResourceFacts    bool
 	}{
 		{name: "exit zero is a successful attempt but unexpected service termination", result: ProcessResult{ExitCode: &exitZero}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptSucceeded, wantStreak: 1, wantLifetimeRestarts: 1, wantBackoff: true, wantFailure: true},
 		{name: "nonzero exit restarts", result: ProcessResult{ExitCode: &exitOne}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantStreak: 1, wantLifetimeRestarts: 1, wantBackoff: true, wantFailure: true},
@@ -89,6 +90,7 @@ func assertServiceCompletionClassification(t *testing.T) {
 		{name: "deterministic spawn failure latches", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureProcessSpawn, Message: "executable missing"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailureProcessSpawn},
 		{name: "unknown spawn failure defaults terminal", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureCode("future_spawn_failure"), Message: "unknown"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailureCode("future_spawn_failure")},
 		{name: "published port occupied latches", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailurePublishedPortOccupied, Message: "port 8080 occupied"}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailurePublishedPortOccupied},
+		{name: "insufficient disk latches without restart accounting", result: ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureInsufficientDisk, Message: "allocation failed", RequestedBytes: 8 << 30, ObservedAvailableBytes: 2 << 30}}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true, wantFailureCode: contract.SpawnFailureInsufficientDisk, wantResourceFacts: true},
 		{name: "genuine output error latches", result: ProcessResult{OutputError: "SQLite corruption"}, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantFailure: true},
 		{name: "guardian termination is infrastructure", result: ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseGuardian}, wantJob: contract.JobQueued, wantAttempt: contract.AttemptFailed, wantLifetimeRestarts: 1, wantBackoff: true},
 		{name: "configured streak maximum latches on first countable termination", result: ProcessResult{ExitCode: &exitOne}, maximum: &maximumOne, wantJob: contract.JobFailed, wantAttempt: contract.AttemptFailed, wantStreak: 1, wantFailure: true},
@@ -132,6 +134,9 @@ func assertServiceCompletionClassification(t *testing.T) {
 				}
 				if failure.Code != test.wantFailureCode {
 					t.Fatalf("last_failure.code = %q, want %q", failure.Code, test.wantFailureCode)
+				}
+				if test.wantResourceFacts && (failure.NodeID != node.NodeID || failure.RequestedBytes != 8<<30 || failure.ObservedAvailableBytes != 2<<30) {
+					t.Fatalf("last_failure resource facts = %+v", failure)
 				}
 			}
 			assertAttemptState(t, h, claim.Lease.AttemptID, test.wantAttempt)

@@ -254,14 +254,15 @@ func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
 	defer server.createSweep.Unlock()
 	sweepContext, cancel := context.WithTimeout(ctx, server.config.ReapTimeout)
 	defer cancel()
-	sweep, err := server.engine.Sweep(sweepContext, SweepRequest{})
-	if err != nil {
-		return fmt.Errorf("startup sweep OCI runtime namespace: %w", err)
-	}
-	sweep.SweepEpoch, err = randomCapability()
+	sweepEpoch, err := randomCapability()
 	if err != nil {
 		return errors.New("startup sweep OCI runtime namespace: generate sweep epoch")
 	}
+	sweep, err := server.engine.Sweep(sweepContext, SweepRequest{SweepEpoch: sweepEpoch})
+	if err != nil {
+		return fmt.Errorf("startup sweep OCI runtime namespace: %w", err)
+	}
+	sweep.SweepEpoch = sweepEpoch
 	verification, err := server.engine.Verify(sweepContext, VerifyRequest{Scope: VerifyNamespace})
 	if err != nil {
 		return fmt.Errorf("startup verify OCI runtime namespace: %w", err)
@@ -941,6 +942,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			var rpcErr *RPCError
 			var specRejection *RuntimeSpecRejectionError
 			var serviceDataRejection *ServiceDataRejectionError
+			var insufficientDisk *insufficientDiskError
 			var imageUnavailable *ImageUnavailableError
 			if errors.As(err, &rpcErr) {
 				_ = writeRPCError(wire, rpcErr)
@@ -948,6 +950,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				_ = writeFailure(wire, CodeOCISpecRejected, "OCI runtime spec was rejected")
 			} else if errors.As(err, &serviceDataRejection) {
 				_ = writeFailure(wire, CodeOCISpecRejected, serviceDataRejection.Error())
+			} else if errors.As(err, &insufficientDisk) {
+				_ = writeRPCError(wire, &RPCError{Code: CodeInsufficientDisk, Message: insufficientDisk.Error(), DiskFailure: &DiskFailureFact{RequestedBytes: insufficientDisk.RequestedBytes, ObservedAvailableBytes: insufficientDisk.ObservedAvailableBytes}})
 			} else if errors.As(err, &imageUnavailable) {
 				_ = writeFailure(wire, CodeImageUnavailable, "pinned local OCI image is unavailable")
 			} else {
@@ -1016,12 +1020,20 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if !decodeRequest(wire, request.Body, &body) {
 			return
 		}
-		if body.Kind != ManagedVolumeHandoff {
-			_ = writeFailure(wire, CodeInvalidRequest, "only handoff managed-volume deletion is supported")
-			return
-		}
-		if _, err := DeterministicHandoffVolumeDirectory(body.OwnerKey); err != nil {
-			_ = writeFailure(wire, CodeInvalidRequest, err.Error())
+		switch body.Kind {
+		case ManagedVolumeHandoff:
+			if _, err := DeterministicHandoffVolumeDirectory(body.OwnerKey); err != nil {
+				_ = writeFailure(wire, CodeInvalidRequest, err.Error())
+				return
+			}
+		case ManagedVolumeComputerDisk:
+			if body.ComputerStorage == nil || body.Removal == nil || body.Removal.NodeID != session.identity.NodeID || body.Removal.BootSessionID != session.identity.BootSessionID ||
+				body.Removal.JobID == "" || body.Removal.RemovalGeneration == 0 || body.Removal.CleanupFence == "" {
+				_ = writeFailure(wire, CodeInvalidRequest, "complete current-session Computer removal authority is required")
+				return
+			}
+		default:
+			_ = writeFailure(wire, CodeInvalidRequest, "managed-volume deletion kind is unsupported")
 			return
 		}
 		engine, ok := server.engine.(ManagedVolumeEngine)
@@ -1076,9 +1088,12 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		session.sweepVerified = false
 		session.sweepResponse = SweepResponse{}
 		session.mu.Unlock()
-		response, err := server.engine.Sweep(operation.ctx, body)
+		sweepEpoch, err := randomCapability()
+		body.SweepEpoch = sweepEpoch
+		var response SweepResponse
 		if err == nil {
-			response.SweepEpoch, err = randomCapability()
+			response, err = server.engine.Sweep(operation.ctx, body)
+			response.SweepEpoch = body.SweepEpoch
 		}
 		if err == nil {
 			if carriedSweep.SweepEpoch != "" {
@@ -1154,6 +1169,14 @@ func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {
 	left.LogSegments = append(left.LogSegments, right.LogSegments...)
 	left.ManagedVolumes = append(left.ManagedVolumes, right.ManagedVolumes...)
 	left.ManagedVolumeRecords = append(left.ManagedVolumeRecords, right.ManagedVolumeRecords...)
+	left.ComputerDiskImages = append(left.ComputerDiskImages, right.ComputerDiskImages...)
+	left.ComputerDiskAllocations = append(left.ComputerDiskAllocations, right.ComputerDiskAllocations...)
+	left.ComputerDiskQuotas = append(left.ComputerDiskQuotas, right.ComputerDiskQuotas...)
+	left.ComputerDiskManifests = append(left.ComputerDiskManifests, right.ComputerDiskManifests...)
+	left.ComputerDiskMounts = append(left.ComputerDiskMounts, right.ComputerDiskMounts...)
+	left.ComputerDiskLoops = append(left.ComputerDiskLoops, right.ComputerDiskLoops...)
+	left.ComputerAttachments = append(left.ComputerAttachments, right.ComputerAttachments...)
+	left.ComputerDiskAnomalies = append(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies...)
 	return left
 }
 

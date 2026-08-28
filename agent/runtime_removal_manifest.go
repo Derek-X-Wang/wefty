@@ -116,11 +116,26 @@ func validateRuntimeResourceManifest(manifest workloadrunner.RuntimeResourceMani
 		strings.TrimSpace(manifest.RemovalGeneration) == "" || strings.TrimSpace(manifest.LeaseID) == "" ||
 		strings.TrimSpace(manifest.TaskID) == "" || strings.TrimSpace(manifest.ContainerID) == "" ||
 		strings.TrimSpace(manifest.SnapshotID) == "" || strings.TrimSpace(manifest.ShimID) == "" ||
-		strings.TrimSpace(manifest.CgroupID) == "" || strings.TrimSpace(manifest.LogSegmentDirectory) == "" ||
-		strings.TrimSpace(manifest.ServiceDataVolume) == "" || strings.TrimSpace(manifest.ServiceDataOwnerRecord) == "" {
+		strings.TrimSpace(manifest.CgroupID) == "" || strings.TrimSpace(manifest.LogSegmentDirectory) == "" {
 		return errors.New("agent: runtime attempt manifest is incomplete")
 	}
+	hasServiceData := strings.TrimSpace(manifest.ServiceDataVolume) != "" || strings.TrimSpace(manifest.ServiceDataOwnerRecord) != ""
+	hasComputerDisk := manifest.ComputerStorage != nil
+	if hasServiceData == hasComputerDisk {
+		return errors.New("agent: runtime attempt manifest must name exactly one durable service-data class")
+	}
+	if hasServiceData && (strings.TrimSpace(manifest.ServiceDataVolume) == "" || strings.TrimSpace(manifest.ServiceDataOwnerRecord) == "") {
+		return errors.New("agent: runtime attempt manifest has incomplete service-data identity")
+	}
+	if hasComputerDisk && !validComputerStorage(manifest.ComputerStorage) {
+		return errors.New("agent: runtime attempt manifest has incomplete Computer Storage identity")
+	}
 	return nil
+}
+
+func validComputerStorage(storage *workloadrunner.ComputerStorage) bool {
+	return storage != nil && strings.TrimSpace(storage.ComputerID) != "" && strings.TrimSpace(storage.StorageID) != "" &&
+		storage.StorageGeneration > 0 && storage.DiskBytes > 0
 }
 
 func (spool *logSpool) freezeRuntimeRemoval(ctx context.Context, tx *sql.Tx, removal localRemoval, preparedAt time.Time) (bool, error) {

@@ -38,6 +38,10 @@ jobs:
           PROBE_REFERENCE: docker.io/library/busybox@sha256:1487d0af5f52b4ba31c7e465126ee2123fe3f2305d638e7827681e7cf6c83d5e
           PROBE_DIGEST: sha256:1487d0af5f52b4ba31c7e465126ee2123fe3f2305d638e7827681e7cf6c83d5e
         run: |
+          sudo apt-get update
+          sudo apt-get install --yes e2fsprogs util-linux
+          sudo modprobe loop
+          test -e /dev/loop-control
           curl --fail --location --retry 5 --output containerd.tar.gz "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz"
           curl --fail --location --retry 5 --output containerd.sha256 "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz.sha256sum"
           sed -i "s/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz/containerd.tar.gz/" containerd.sha256
@@ -160,6 +164,12 @@ jobs:
                   done
                   /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock version >/dev/null
                   chmod 0600 /run/wefty-containerd/containerd.sock
+                  ;;
+                kill-helper)
+                  systemctl kill --kill-who=all --signal=KILL wefty-oci-helper-realtiming.service
+                  systemctl reset-failed wefty-oci-helper-realtiming.service
+                  systemctl start wefty-oci-helper-realtiming.service
+                  systemctl is-active --quiet wefty-oci-helper-realtiming.service
                   ;;
                 reset-containerd)
                   systemctl stop wefty-test-containerd.service

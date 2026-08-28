@@ -1062,6 +1062,7 @@ AND state=@job_queued
 	if err != nil {
 		return nil, internalError(err, "create claimed attempt")
 	}
+	var computerStorage *ComputerStorageClaim
 	if class == contract.JobClassService {
 		bindingResult, err := tx.ExecContext(ctx, `UPDATE service_jobs
 			SET bound_node_id=CASE WHEN bound_node_id IS NULL THEN ? ELSE bound_node_id END,
@@ -1087,6 +1088,13 @@ AND state=@job_queued
 			if err := requireClaimBindingUpdate(bindingResult, "Computer", computerID, nodeID); err != nil {
 				return nil, err
 			}
+			var storage ComputerStorageClaim
+			if err := tx.QueryRowContext(ctx, `SELECT computer_id, storage_id, storage_generation
+				FROM computers WHERE computer_id=? AND current_job_id=?`, computerID, jobID).
+				Scan(&storage.ComputerID, &storage.StorageID, &storage.StorageGeneration); err != nil {
+				return nil, internalError(err, "read claimed Computer Storage identity")
+			}
+			computerStorage = &storage
 		}
 	}
 	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
@@ -1104,6 +1112,7 @@ AND state=@job_queued
 			AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: leaseExpires,
 			LeaseTTL: leaseExpires.Sub(now),
 		},
+		ComputerStorage: computerStorage,
 	}
 	if prestartDeadlineNS.Valid {
 		deadline := time.Unix(0, prestartDeadlineNS.Int64).UTC()
@@ -2115,6 +2124,17 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	if request.Result.SpawnError != nil && request.Result.SpawnError.Code == contract.SpawnFailurePublishedPortOccupied {
 		if err := recordPublishedPortOccupied(ctx, tx, jobID, attempt.nodeID, *request.Result.SpawnError); err != nil {
 			return Job{}, err
+		}
+	}
+	if request.Result.SpawnError != nil && request.Result.SpawnError.Code == contract.SpawnFailureInsufficientDisk {
+		failure := *request.Result.SpawnError
+		failure.NodeID = attempt.nodeID
+		lastFailure, marshalErr := json.Marshal(failure)
+		if marshalErr != nil {
+			return Job{}, internalError(marshalErr, "encode insufficient disk failure")
+		}
+		if _, updateErr := tx.ExecContext(ctx, `UPDATE service_jobs SET last_failure=?, next_restart_at=NULL WHERE job_id=?`, lastFailure, jobID); updateErr != nil {
+			return Job{}, internalError(updateErr, "record insufficient disk failure")
 		}
 	}
 	if _, err := pruneServiceAttemptSummaries(ctx, tx, jobID); err != nil {
