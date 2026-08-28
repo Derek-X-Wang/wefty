@@ -75,6 +75,13 @@ func IsOCISensitiveReservedEnvironmentName(name string) bool {
 	return name == EnvRunToken || name == EnvComputerToken
 }
 
+// IsComputerExecution is the single cross-layer discriminator for Computer
+// mechanics. Durable disk attachment is a consequence of this trait, not a
+// substitute signal for it.
+func IsComputerExecution(execution ExecutionSpec) bool {
+	return execution.OCI != nil && execution.OCI.Computer != nil
+}
+
 // ValidComputerRFBVersionBanner recognizes the 12-byte RFB version greeting
 // required after the rfb-websocket-v1 upgrade. Version negotiation after the
 // greeting remains the image's responsibility.

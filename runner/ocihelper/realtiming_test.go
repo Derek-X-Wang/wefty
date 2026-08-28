@@ -131,7 +131,7 @@ func TestRealtimeOCIHelperChildProcess(t *testing.T) {
 type realtimeFakeEngine struct{ *fakeEngine }
 
 func (engine *realtimeFakeEngine) Run(ctx context.Context, request RunRequest) (RunResponse, error) {
-	response := RunResponse{Started: true}
+	response := RunResponse{Started: true, StartedAt: time.Now().UTC()}
 	if len(request.AllocateEndpoints) != 0 {
 		response.Endpoints = make(map[string]uint16, len(request.AllocateEndpoints))
 		for index, name := range request.AllocateEndpoints {

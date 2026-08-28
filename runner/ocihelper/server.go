@@ -579,7 +579,7 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 	if err := validateEndpointNames(request.AllocateEndpoints); err != nil {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
 	}
-	computer := workloadHasComputerDisk(request.Workload)
+	computer := request.Workload.Computer
 	if computer && request.Authority.Class != contract.JobClassService {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: "Computer mechanics require service attempt authority"}
 	}
@@ -631,15 +631,6 @@ func validateEndpointNames(names []string) error {
 	return nil
 }
 
-func workloadHasComputerDisk(workload WorkloadInput) bool {
-	for _, volume := range workload.ManagedVolumes {
-		if volume.Kind == ManagedVolumeComputerDisk {
-			return true
-		}
-	}
-	return false
-}
-
 func validateRunEndpointContract(computer bool, names []string) error {
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
@@ -685,6 +676,10 @@ func (session *serverSession) completeAttempt(request RunRequest, attempt *serve
 	if !response.Started {
 		return &RPCError{Code: CodeEngineFailure, Message: "engine Run returned without authoritative Started evidence"}
 	}
+	if response.StartedAt.IsZero() {
+		return &RPCError{Code: CodeEngineFailure, Message: "engine Run returned without the authoritative Started timestamp"}
+	}
+	response.StartedAt = response.StartedAt.UTC().Round(0)
 	if response.HostBridgeReady && !request.EnableHostBridgeFallback {
 		return &RPCError{Code: CodeEngineFailure, Message: "engine enabled an unrequested host bridge fallback"}
 	}

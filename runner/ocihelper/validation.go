@@ -69,8 +69,16 @@ func validateWorkloadWire(input WorkloadInput) error {
 	if err := validateEnvironmentLayer("sensitive environment", input.SensitiveEnvironment, false); err != nil {
 		return err
 	}
-	if err := validateEnvironmentLayer("reserved environment", input.ReservedEnvironment, true); err != nil {
-		return err
+	if len(input.ReservedEnvironment) > 0 && !input.helperMintedReserved {
+		return errors.New("reserved environment values must be minted by the helper")
+	}
+	if input.helperMintedReserved {
+		if err := validateEnvironmentLayer("reserved environment", input.ReservedEnvironment, true); err != nil {
+			return err
+		}
+	}
+	if strings.IndexByte(input.L3Endpoint, 0) >= 0 || strings.IndexByte(input.RunToken, 0) >= 0 {
+		return errors.New("helper environment minting inputs contain NUL")
 	}
 	if input.Limits.MemoryBytes < 0 || input.Limits.CPUMillicores < 0 {
 		return errors.New("workload limits must not be negative")
@@ -119,7 +127,11 @@ func validateWorkloadWire(input WorkloadInput) error {
 		}
 		seenVolumes[mount.ContainerPath] = struct{}{}
 	}
-	if _, computerDisk := seenManagedKinds[ManagedVolumeComputerDisk]; computerDisk {
+	_, computerDisk := seenManagedKinds[ManagedVolumeComputerDisk]
+	if input.Computer != computerDisk {
+		return errors.New("Computer trait and durable Computer disk descriptor must agree")
+	}
+	if input.Computer {
 		for _, mount := range input.OperatorMounts {
 			if !mount.ReadOnly {
 				return errors.New("Computer operator mounts must be read-only so tenant writes remain bounded")
@@ -141,6 +153,9 @@ func validateEnvironmentLayer(layerName string, environment []EnvironmentVariabl
 		}
 		if reservedOnly && !contract.IsOCIReservedEnvironmentName(variable.Name) {
 			return fmt.Errorf("reserved environment variable %q is not helper-managed", variable.Name)
+		}
+		if !reservedOnly && contract.IsOCIReservedEnvironmentName(variable.Name) {
+			return fmt.Errorf("%s variable %q must use a closed helper-minting input", layerName, variable.Name)
 		}
 		if _, exists := seen[variable.Name]; exists {
 			return fmt.Errorf("%s variable %q is duplicated", layerName, variable.Name)

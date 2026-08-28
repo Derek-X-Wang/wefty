@@ -674,7 +674,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "node-doctor.json"), append(doctorBundle, '\n'), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_private_1g=%t\ncomputer_agent_restart_same_generation=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmPrivateOneGiB, computerAgentRestartEvidence, handoffMarkerBytes)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_agent_restart_same_generation=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -766,7 +766,8 @@ func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, 
 
 type nativeComputerDiskEvidence struct {
 	exactlyOnePersistentAndReset bool
-	shmPrivateOneGiB             bool
+	shmModeFlagsSizeOneGiB       bool
+	shmCgroupCharged             bool
 }
 
 func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, reference, digest string) nativeComputerDiskEvidence {
@@ -785,13 +786,12 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 			Authority: authority, InitialDeadman: l1.DefaultLeaseDuration,
 			AllocateEndpoints: []string{"view", "control"},
 			Workload: ocihelper.WorkloadInput{
-				ImageReference: reference, ImageDigest: digest, Argv: argv,
-				ReservedEnvironment: []ocihelper.EnvironmentVariable{{Name: contract.EnvServiceDir, Value: contract.OCIContainerServiceDirectory}},
-				ManagedVolumes:      []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeComputerDisk, ComputerStorage: storage}},
+				ImageReference: reference, ImageDigest: digest, Computer: true, Argv: argv,
+				ManagedVolumes: []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeComputerDisk, ComputerStorage: storage}},
 			},
 		}
 	}
-	first := request("a", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' && grep -q ' /wefty/control tmpfs ' /proc/mounts && test ! -w /wefty/control/driver.json || exit 18; test "$(stat -c %a /dev/shm)" = 1777 || exit 20; awk '$2 == "/dev/shm" && $3 == "tmpfs" && index("," $4 ",", ",nosuid,") && index("," $4 ",", ",nodev,") && index("," $4 ",", ",noexec,") && index($4, "size=1048576k") { found=1 } END { exit !found }' /proc/mounts || exit 21; for i in $(seq 1 50); do test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' && break; sleep .1; done; test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' || exit 19; printf computer-disk-marker > /wefty/service/marker; exec sleep 60`})
+	first := request("a", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' && grep -q ' /wefty/control tmpfs ' /proc/mounts && test ! -w /wefty/control/driver.json || exit 18; test "$(stat -c %a /dev/shm)" = 1777 || exit 20; awk '$2 == "/dev/shm" && $3 == "tmpfs" && index("," $4 ",", ",nosuid,") && index("," $4 ",", ",nodev,") && index("," $4 ",", ",noexec,") && index($4, "size=1048576k") { found=1 } END { exit !found }' /proc/mounts || exit 21; before=$(cat /sys/fs/cgroup/memory.current) || exit 22; dd if=/dev/zero of=/dev/shm/wefty-memory-charge bs=1048576 count=16 2>/dev/null || exit 23; after=$(cat /sys/fs/cgroup/memory.current) || exit 24; test "$after" -gt "$before" || exit 25; rm /dev/shm/wefty-memory-charge || exit 26; for i in $(seq 1 50); do test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' && break; sleep .1; done; test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' || exit 19; printf computer-disk-marker > /wefty/service/marker; exec sleep 60`})
 	if _, err := session.Run(ctx, first); err != nil {
 		t.Fatal(err)
 	}
@@ -882,10 +882,10 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	if deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: fresh.Authority}); err != nil || !deleted.Deleted {
 		t.Fatalf("real reset Computer cleanup = %+v err=%v", deleted, err)
 	}
-	// Both receipt fields are assertion-derived: the guest's shm checks must
+	// All receipt fields are assertion-derived: the guest's shm checks must
 	// reach the persistent marker, and every disk/reset assertion above must
 	// complete, before this evidence is emitted.
-	return nativeComputerDiskEvidence{exactlyOnePersistentAndReset: true, shmPrivateOneGiB: true}
+	return nativeComputerDiskEvidence{exactlyOnePersistentAndReset: true, shmModeFlagsSizeOneGiB: true, shmCgroupCharged: true}
 }
 
 func assertNativeComputerHostCleanup(t *testing.T, authority ocihelper.AttemptAuthority) {

@@ -271,6 +271,22 @@ Meaning: observed bytes exceed the configured cap. Evidence: inspect operation, 
 
 Meaning: bounded enforcement recorded a sanitized failure. Evidence: preserve last eviction receipt and current pins. First action: inspect helper logs locally. Escalation: redact paths and credentials while retaining content identities and error category.
 
+## doctor-code-oci-profile-ceilings-not-run
+
+Meaning: profile-ceiling evaluation lacked a helper dependency. Evidence: inspect the `not_run_cause`. First action: restore helper diagnostics. Escalation: do not infer workload memory safety from absent profile evidence.
+
+## doctor-code-oci-profile-ceilings-not-recorded
+
+Meaning: no completed runtime profile receipt is available. Evidence: verify whether any OCI attempt has reached profile construction. First action: inspect the next attempt receipt. Escalation: report the workload memory limit and profile ceilings separately.
+
+## doctor-code-oci-profile-tmpfs-ceilings-within-memory-limit
+
+Meaning: each Computer tmpfs ceiling and their combined ceiling fit within the recorded workload memory limit. Evidence: preserve the assertion-derived profile receipt. First action: none. Escalation: include the exact limit and ceiling bytes.
+
+## doctor-code-oci-profile-tmpfs-ceilings-exceed-memory-limit
+
+Meaning: one or more Computer tmpfs caps exceed the recorded cgroup memory limit. Evidence: preserve the typed warnings and exact bytes. First action: treat the cgroup memory limit as enforcement because tmpfs ceilings are not reservations. Escalation: carry the OWNER-CALL on production memory sizing without weakening the cgroup.
+
 ## doctor-code-oci-mount-roots-not-run
 
 Meaning: mount comparison lacked current setup or helper evidence. Evidence: identify the unavailable source. First action: repair that source before changing roots. Escalation: attach desired and observed root metadata separately.

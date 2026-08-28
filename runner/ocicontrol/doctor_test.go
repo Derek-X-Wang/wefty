@@ -58,6 +58,7 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 					RuncVersion: TestedRuncVersion, RuncVersionSource: ocihelper.RuncVersionSourceConfiguredPath, RuncRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					AllowedMountRoots: []string{"/srv/wefty", "/worktrees"}, MountRootsRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					Cache: ocihelper.ImageCacheStatus{Bytes: 8 << 30, CapBytes: 16 << 30}, CacheRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
+					LastProfile: &ocihelper.ProfileReceipt{Computer: true, MemoryLimitBytes: 2 << 30, ComputerTmpfsCeilingBytes: 1600 << 20, LargestTmpfsCeilingBytes: 1 << 30, Warnings: []ocihelper.ProfileWarning{}},
 				},
 				SweepReceiptRecorded: true,
 				SweepReceipt: ocihelper.VerifiedSweepReceipt{SweepEpoch: "sweep-1", HelperSession: ocihelper.HelperSession{
@@ -72,6 +73,35 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 		ReadDesiredSetupState: func(string) (SetupState, error) {
 			return SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: "/srv/wefty", ProbeDigest: "sha256:probe"}, nil
 		},
+	}
+}
+
+func TestDoctorSurfacesComputerTmpfsCeilingPressureAsWarning(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	config := healthyDoctorConfig(now, "")
+	base := config.Helper
+	config.Helper = func(ctx context.Context) (HelperDoctorSnapshot, error) {
+		snapshot, err := base(ctx)
+		profile := snapshot.Runtime.LastProfile
+		profile.MemoryLimitBytes = 512 << 20
+		profile.Warnings = []ocihelper.ProfileWarning{
+			{Code: ocihelper.ProfileWarningTmpfsCeilingExceedsMemory, Target: "/dev/shm", CeilingBytes: 1 << 30, LimitBytes: 512 << 20},
+			{Code: ocihelper.ProfileWarningTmpfsCombinedExceedsMemory, CeilingBytes: 1600 << 20, LimitBytes: 512 << 20},
+		}
+		return snapshot, err
+	}
+	report := BuildDoctor(t.Context(), config)
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range report.Findings {
+		if item.Check == "profile-ceilings" {
+			found = item.Outcome == DiagnosticOK && item.Severity == DiagnosticWarn && item.Code == "oci_profile_tmpfs_ceilings_exceed_memory_limit"
+		}
+	}
+	if !found || report.Profile.MemoryLimitBytes != 512<<20 || report.Profile.ComputerTmpfsCeilingBytes != 1600<<20 || len(report.Profile.Warnings) != 2 {
+		t.Fatalf("profile warning was not assertion-derived: profile=%+v findings=%+v", report.Profile, report.Findings)
 	}
 }
 

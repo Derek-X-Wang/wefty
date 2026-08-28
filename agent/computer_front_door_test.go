@@ -296,8 +296,10 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 		options computerBackendOptions
 	}{
 		{name: "wrong path", options: computerBackendOptions{requiredPath: "/wrong"}},
+		{name: "missing subprotocol", options: computerBackendOptions{noSubprotocol: true}},
 		{name: "wrong subprotocol", options: computerBackendOptions{subprotocol: "other"}},
 		{name: "text banner", options: computerBackendOptions{textBanner: true}},
+		{name: "HTTP response without upgrade", options: computerBackendOptions{httpOnly: true}},
 	}
 	for _, fixture := range fixtures {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -355,6 +357,26 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 			t.Fatalf("deadline error = %#v", err)
 		}
 	})
+
+	t.Run("success at deadline is timeout", func(t *testing.T) {
+		for range 20 {
+			now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+			clock := newManualClock(now)
+			advanced := false
+			dial := func(ctx context.Context, name string) (net.Conn, error) {
+				if name == workloadrunner.AttemptEndpointControl && !advanced {
+					advanced = true
+					clock.Advance(DefaultComputerReadinessDeadline)
+				}
+				return good.dial(ctx)
+			}
+			err := probeComputerBackends(t.Context(), clock, now, dial)
+			var readiness *computerReadinessError
+			if !errors.As(err, &readiness) || readiness.Code != contract.SpawnFailureStartupReadinessTimeout {
+				t.Fatalf("at-deadline successful probe = %#v", err)
+			}
+		}
+	})
 }
 
 func TestComputerSessionAuthorityLossOwnsConcurrentRelayClosure(t *testing.T) {
@@ -375,6 +397,9 @@ func TestComputerSessionAuthorityLossOwnsConcurrentRelayClosure(t *testing.T) {
 
 func assertComputerBackendNeverReady(t *testing.T, dial computerEndpointDial) {
 	t.Helper()
+	if err := probeComputerBackendPairOnce(t.Context(), dial); err == nil {
+		t.Fatal("negative readiness fixture completed a conformant probe")
+	}
 	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 	clock := newManualClock(now)
 	result := make(chan error, 1)
@@ -618,10 +643,12 @@ func waitComputerAuditKind(t *testing.T, auditor *recordingComputerAuditor, kind
 }
 
 type computerBackendOptions struct {
-	requiredPath string
-	subprotocol  string
-	textBanner   bool
-	echoPrefix   string
+	requiredPath  string
+	subprotocol   string
+	noSubprotocol bool
+	textBanner    bool
+	httpOnly      bool
+	echoPrefix    string
 }
 
 type computerBackendServer struct {
@@ -644,7 +671,15 @@ func newComputerBackend(t *testing.T, options computerBackendOptions) *computerB
 			http.NotFound(writer, request)
 			return
 		}
-		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{Subprotocols: []string{subprotocol}})
+		if options.httpOnly {
+			writer.WriteHeader(http.StatusOK)
+			return
+		}
+		subprotocols := []string{subprotocol}
+		if options.noSubprotocol {
+			subprotocols = nil
+		}
+		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{Subprotocols: subprotocols})
 		if err != nil {
 			return
 		}

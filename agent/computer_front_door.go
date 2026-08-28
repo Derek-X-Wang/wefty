@@ -833,6 +833,9 @@ func probeComputerBackends(ctx context.Context, clock Clock, startedAt time.Time
 			stopTimer(connectTimeout)
 		}
 		if probeErr == nil {
+			if !clock.Now().Before(startedAt.Add(DefaultComputerReadinessDeadline)) {
+				return timeout()
+			}
 			return nil
 		}
 		interval := clock.NewTimer(DefaultComputerReadinessProbeInterval)

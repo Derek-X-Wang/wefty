@@ -80,10 +80,11 @@ desktop-health checks are deliberately outside this screen-door contract.
 
 ## Atomic readiness
 
-The authoritative OCI `Started` edge fixes `t0`; image pull and preparation
-precede it and do not consume the budget. The agent captures `t0` before
-post-start signal I/O and polls the exact upgrade-plus-banner contract through
-both helper tunnels.
+The privileged helper's successful container task `Start` edge fixes `t0`;
+image pull and preparation precede it and do not consume the budget. The
+helper returns that timestamp in `Run.started_at`, and the agent carries it
+unchanged across the L1 `OCIStarted` acknowledgement and other post-start
+round trips before polling both helper tunnels.
 
 ```text
 Started at t0
@@ -105,7 +106,9 @@ Started at t0
              eligible for one atomic republication
 ```
 
-The deadline is exactly 60 seconds after `t0`. Expiry produces the existing
+The deadline is exactly 60 seconds after `t0`. A probe that finishes at or
+after that deadline cannot publish even when both handshakes succeeded; the
+agent rechecks its injected clock immediately before publication. Expiry produces the existing
 typed `startup_readiness_timeout`, which service restart policy classifies as
 restartable; no partial endpoint or placeholder display URL is published.
 After the first successful publication, losing either backend withdraws both
@@ -125,9 +128,28 @@ The Computer-specific profile adds a private `/dev/shm` tmpfs with a 1 GiB
 size ceiling, mode `1777`, and `nosuid,nodev,noexec`. It is created in the
 attempt's private mount and IPC namespaces, and its pages count against the
 attempt's cgroup memory limit. The existing bounded `/tmp` (512 MiB),
-`/var/tmp` (64 MiB), `/dev`, and `/run` mounts remain unchanged. `/wefty/control`
-is a separate read-only attempt-local mount whose `driver.json` contract is
-owned by the Controller-tenure ticket.
+`/var/tmp` (64 MiB), `/dev`, and `/run` mounts remain unchanged. The three
+Computer-specific ceilings total 1600 MiB. They are caps rather than
+reservations: a smaller memory limit remains admissible and the cgroup limit
+is enforcement. The assertion-derived profile receipt and node doctor expose
+the exact ceiling/limit comparison as typed warnings; the production sizing
+OWNER-CALL remains open.
+
+## Tenant `driver.json` consumer contract
+
+The image's tenant agent consumes read-only
+`/wefty/control/driver.json`. Every fresh attempt begins with exactly
+`{"version":1,"human_driving":false}`. While a human holds Controller tenure
+the complete document is exactly `{"version":1,"human_driving":true}`; it
+returns to the false document after tenure is released.
+
+The helper owns the attempt-local file outside `/wefty/service`, mode 0444,
+and replaces it with a same-directory atomic rename. The consumer therefore
+sees only complete version-1 documents, never a partially written update. It
+must reopen or watch the path rather than retain one inode, treat any missing,
+malformed, or unknown-version document as `human_driving=false`, and must not
+attempt to write, rename, or persist it. The signal carries no driver identity,
+history, or authority and never asks the tenant process to pause.
 
 ## Conformance seam and evidence
 
@@ -140,6 +162,7 @@ complete serialized Computer profile is pinned at
 Portable tests prove reserved-value stripping, exact endpoint admission,
 wire-negative cases, atomic loss/recovery, injected-clock deadline behavior,
 and the serialized profile. The Linux `service_acceptance_realtiming` lane
-asserts `/dev/shm` mode, flags, and size from inside the guest. The optional
+asserts `/dev/shm` mode, flags, size, and a rising cgroup `memory.current` after
+a guest write. The optional
 reference image and `wefty-computer-conformance` CLI remain separate tickets;
 this contract does not implement either artifact.

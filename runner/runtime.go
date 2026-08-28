@@ -385,6 +385,9 @@ type Request struct {
 	// OCIStarted replays helper-observed identity after task start and then
 	// performs the fenced L1 Started mutation. The helper adapter must reap the
 	// task when this callback fails.
+	// OCIStartedAt carries the helper-captured task Start edge before any L1
+	// round trip so lifecycle clocks retain the original budget.
+	OCIStartedAt     func(time.Time)
 	OCIStarted       func(context.Context, OCIImageObservation) error
 	OCIImageDeadline time.Time
 	InitialDeadman   time.Duration

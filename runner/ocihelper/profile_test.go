@@ -97,13 +97,10 @@ func runtimeSpecGoldenCases() []runtimeSpecGoldenCase {
 		{name: "Computer Linux amd64", architecture: "amd64", golden: "wefty-v1-computer-linux-amd64.json", expectedUID: 1001, expectedGID: 1002, expectedGIDs: []uint32{1002, 44, 2000}, computer: true, configure: func(input *RuntimeSpecInput) {
 			input.ContainerID = "golden-computer-amd64"
 			input.CgroupPath = "/wefty/golden-computer-amd64"
+			input.Workload.Computer = true
 			input.Image.Environment = append(input.Image.Environment,
 				contract.EnvComputerToken+"=stale-image-token",
 				contract.EnvComputerViewPort+"=stale-image-port",
-			)
-			input.Workload.Environment = append(input.Workload.Environment,
-				EnvironmentVariable{Name: contract.EnvServicePort, Value: "stale-operator-port"},
-				EnvironmentVariable{Name: contract.EnvComputerControlPort, Value: "stale-operator-port"},
 			)
 			input.Workload.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
 				ComputerID: "computer-golden", StorageID: "storage-golden", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30,
@@ -204,6 +201,7 @@ func TestNamedAndNumericImageUsersChooseDifferentSupplementalLookup(t *testing.T
 
 func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 	input := goldenRuntimeSpecInput(t, "amd64")
+	input.Workload.Computer = true
 	input.Workload.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
 		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30,
 	}}}
@@ -258,6 +256,21 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 		if strings.Contains(device.Path, "dri") || strings.Contains(device.Path, "nvidia") {
 			t.Fatalf("Computer profile added a GPU device: %+v", device)
 		}
+	}
+}
+
+func TestComputerProfileReceiptExposesTmpfsCeilingsWithoutAdmissionRejection(t *testing.T) {
+	workload := WorkloadInput{Computer: true, Limits: WorkloadLimits{MemoryBytes: 512 << 20}}
+	receipt := profileReceipt(workload)
+	if receipt.ComputerTmpfsCeilingBytes != 1600<<20 || receipt.LargestTmpfsTarget != "/dev/shm" || receipt.LargestTmpfsCeilingBytes != 1<<30 {
+		t.Fatalf("Computer profile receipt = %+v", receipt)
+	}
+	if len(receipt.Warnings) != 2 || receipt.Warnings[0].Code != ProfileWarningTmpfsCeilingExceedsMemory || receipt.Warnings[1].Code != ProfileWarningTmpfsCombinedExceedsMemory {
+		t.Fatalf("typed profile warnings = %+v", receipt.Warnings)
+	}
+	ordinary := profileReceipt(WorkloadInput{Limits: WorkloadLimits{MemoryBytes: 64 << 20}})
+	if ordinary.ComputerTmpfsCeilingBytes != 0 || len(ordinary.Warnings) != 0 {
+		t.Fatalf("ordinary profile inherited Computer ceilings: %+v", ordinary)
 	}
 }
 
@@ -478,6 +491,9 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 		{name: "reserved env NUL", mutate: func(input *WorkloadInput) {
 			input.ReservedEnvironment = []EnvironmentVariable{{Name: "WEFTY_RUN_TOKEN", Value: "x\x00"}}
 		}},
+		{name: "hostile reserved Computer token", mutate: func(input *WorkloadInput) {
+			input.ReservedEnvironment = []EnvironmentVariable{{Name: contract.EnvComputerToken, Value: "attacker"}}
+		}},
 		{name: "negative memory", mutate: func(input *WorkloadInput) { input.Limits.MemoryBytes = -1 }},
 		{name: "negative CPU", mutate: func(input *WorkloadInput) { input.Limits.CPUMillicores = -1 }},
 		{name: "managed kind", mutate: func(input *WorkloadInput) {
@@ -530,6 +546,7 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 		})
 	}
 	computerDisk := valid()
+	computerDisk.Computer = true
 	computerDisk.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
 		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30,
 	}}}
@@ -539,8 +556,8 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 	reservedInOperatorLayers := valid()
 	reservedInOperatorLayers.Environment = []EnvironmentVariable{{Name: "WEFTY_RUN_TOKEN", Value: "public"}}
 	reservedInOperatorLayers.SensitiveEnvironment = []EnvironmentVariable{{Name: "WEFTY_RUN_TOKEN", Value: "sensitive"}}
-	if err := validateWorkloadWire(reservedInOperatorLayers); err != nil {
-		t.Fatalf("defensively stripped reserved operator keys were rejected on the wire: %v", err)
+	if err := validateWorkloadWire(reservedInOperatorLayers); err == nil {
+		t.Fatal("reserved operator keys crossed the helper trust boundary")
 	}
 }
 
@@ -760,20 +777,19 @@ func goldenRuntimeSpecInput(t *testing.T, architecture string) RuntimeSpecInput 
 			Environment: []EnvironmentVariable{
 				{Name: "MODE", Value: "operator"},
 				{Name: "SECRET_TOKEN", Value: "public-value"},
-				{Name: "WEFTY_RUN_TOKEN", Value: "untrusted-public-token"},
 			},
 			SensitiveEnvironment: []EnvironmentVariable{
 				{Name: "SECRET_TOKEN", Value: "fixture-sensitive-value"},
-				{Name: "WEFTY_RUN_TOKEN", Value: "untrusted-sensitive-token"},
 			},
 			ReservedEnvironment: []EnvironmentVariable{
 				{Name: "WEFTY_HANDOFF_DIR", Value: "/wefty/handoff"},
 				{Name: "WEFTY_L3_ENDPOINT", Value: "http://127.0.0.1:41000"},
 				{Name: "WEFTY_RUN_TOKEN", Value: "authoritative-token"},
 			},
-			ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "run-fixture"}},
-			OperatorMounts: []OperatorMount{{NodePath: operatorSource, ContainerPath: "/workspace/input", ReadOnly: readOnly}},
-			Limits:         WorkloadLimits{MemoryBytes: 536870912, CPUMillicores: 750},
+			ManagedVolumes:       []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "run-fixture"}},
+			OperatorMounts:       []OperatorMount{{NodePath: operatorSource, ContainerPath: "/workspace/input", ReadOnly: readOnly}},
+			Limits:               WorkloadLimits{MemoryBytes: 536870912, CPUMillicores: 750},
+			helperMintedReserved: true,
 		},
 		Guest: GuestKernelFacts{
 			Architecture:  architecture,

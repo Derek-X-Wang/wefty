@@ -82,7 +82,7 @@ func ValidateJobSpec(spec *JobSpec) error {
 	}
 	if RequiresPinnedPlacement(*spec) {
 		message := "OCI jobs with mounts require exactly one stable-node routing tag"
-		if spec.Execution.OCI.Computer != nil {
+		if IsComputerExecution(spec.Execution) {
 			message = "Pinned OCI jobs require exactly one stable-node routing tag"
 		}
 		if err := validatePinnedRouting(true, normalizedTags, message); err != nil {
@@ -140,7 +140,7 @@ func ValidatePinnedRouting(program ImageProgram, tags []string) error {
 // predicate; neither introduces a scheduling axis.
 func RequiresPinnedPlacement(spec JobSpec) bool {
 	return spec.Kind == JobKindOCI && spec.Execution.OCI != nil &&
-		(len(spec.Execution.OCI.Mounts) > 0 || spec.Execution.OCI.Computer != nil)
+		(len(spec.Execution.OCI.Mounts) > 0 || IsComputerExecution(spec.Execution))
 }
 
 func validatePinnedRouting(required bool, tags []string, message string) error {

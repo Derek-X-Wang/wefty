@@ -107,6 +107,7 @@ type ContainerdEngine struct {
 	diskSystem        computerDiskSystem
 	storageResetHook  func(computerStorageResetPhase) error
 	computerDiskHook  func(computerDiskCheckpoint) error
+	lastProfile       *ProfileReceipt
 }
 
 const (
@@ -278,6 +279,13 @@ func (engine *ContainerdEngine) Close() error {
 
 func (engine *ContainerdEngine) DoctorStatus(ctx context.Context) (DoctorStatus, error) {
 	status := DoctorStatus{RuntimePlatform: OCIPlatform{OS: runtime.GOOS, Architecture: runtime.GOARCH}}
+	engine.mu.Lock()
+	if engine.lastProfile != nil {
+		receipt := *engine.lastProfile
+		receipt.Warnings = slices.Clone(receipt.Warnings)
+		status.LastProfile = &receipt
+	}
+	engine.mu.Unlock()
 	versionContext, cancelVersion := context.WithTimeout(ctx, doctorRuntimeReadTimeout)
 	version, err := engine.client.Version(versionContext)
 	cancelVersion()
@@ -800,7 +808,22 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		endpoints[name] = port
 		endpointHolds[name] = hold
 	}
-	computer := workloadHasComputerDisk(request.Workload)
+	computer := request.Workload.Computer
+	request.Workload.ReservedEnvironment = nil
+	for _, volume := range request.Workload.ManagedVolumes {
+		switch volume.Kind {
+		case ManagedVolumeHandoff:
+			request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvHandoffDir, contract.OCIContainerHandoffDirectory)
+		case ManagedVolumeServiceData, ManagedVolumeComputerDisk:
+			request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvServiceDir, contract.OCIContainerServiceDirectory)
+		}
+	}
+	if request.Workload.L3Endpoint != "" && !contract.IsOCISensitiveReservedEnvironmentName(contract.EnvL3Endpoint) {
+		request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvL3Endpoint, request.Workload.L3Endpoint)
+	}
+	if request.Workload.RunToken != "" && contract.IsOCISensitiveReservedEnvironmentName(contract.EnvRunToken) {
+		request.Workload.ReservedEnvironment = setReservedEnvironment(request.Workload.ReservedEnvironment, contract.EnvRunToken, request.Workload.RunToken)
+	}
 	if servicePort := endpoints["service"]; servicePort != 0 {
 		request.Workload.ReservedEnvironment = setReservedEnvironment(
 			request.Workload.ReservedEnvironment, contract.EnvServicePort, fmt.Sprint(servicePort),
@@ -822,6 +845,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			return RunResponse{}, err
 		}
 	}
+	request.Workload.helperMintedReserved = true
 
 	image, evidence, err := engine.localImage(leaseContext, request.Workload.ImageReference, request.Workload.ImageDigest)
 	if err != nil {
@@ -902,6 +926,13 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		return RunResponse{}, err
 	}
 	defer document.Close()
+	profile, err := document.ProfileReceipt()
+	if err != nil {
+		return RunResponse{}, &RuntimeSpecRejectionError{err: err}
+	}
+	engine.mu.Lock()
+	engine.lastProfile = &profile
+	engine.mu.Unlock()
 	spec, err := document.ContainerdSpec()
 	if err != nil {
 		return RunResponse{}, &RuntimeSpecRejectionError{err: err}
@@ -956,8 +987,9 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if err := task.Start(leaseContext); err != nil {
 		return RunResponse{}, fmt.Errorf("start runc v2 task: %w", err)
 	}
+	startedAt := time.Now().UTC().Round(0)
 	created = false
-	return RunResponse{Started: true, Image: &evidence, Endpoints: endpoints, HostBridgeReady: hostBridge != nil}, nil
+	return RunResponse{Started: true, StartedAt: startedAt, Image: &evidence, Endpoints: endpoints, HostBridgeReady: hostBridge != nil, Profile: profile}, nil
 }
 
 func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cgroupID string, port uint16) error {

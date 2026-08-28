@@ -146,6 +146,7 @@ type RuntimeSpecDocument struct {
 	mounts   *retainedMountSources
 	ownerUID uint32
 	ownerGID uint32
+	profile  ProfileReceipt
 }
 
 func (document *RuntimeSpecDocument) JSON() []byte {
@@ -163,6 +164,15 @@ func (document *RuntimeSpecDocument) ProcessOwner() (uint32, uint32, error) {
 		return 0, 0, errors.New("OCI runtime spec document is absent")
 	}
 	return document.ownerUID, document.ownerGID, nil
+}
+
+func (document *RuntimeSpecDocument) ProfileReceipt() (ProfileReceipt, error) {
+	if document == nil {
+		return ProfileReceipt{}, errors.New("OCI runtime spec document is absent")
+	}
+	receipt := document.profile
+	receipt.Warnings = slices.Clone(receipt.Warnings)
+	return receipt, nil
 }
 
 // ContainerdSpec first revalidates every retained mount identity, then returns
@@ -263,7 +273,36 @@ func BuildRuntimeSpec(ctx context.Context, input RuntimeSpecInput) (*RuntimeSpec
 		_ = retained.close()
 		return nil, &RuntimeSpecRejectionError{err: err}
 	}
-	return &RuntimeSpecDocument{payload: payload, mounts: retained, ownerUID: spec.Process.User.UID, ownerGID: spec.Process.User.GID}, nil
+	return &RuntimeSpecDocument{payload: payload, mounts: retained, ownerUID: spec.Process.User.UID, ownerGID: spec.Process.User.GID, profile: profileReceipt(input.Workload)}, nil
+}
+
+func profileReceipt(workload WorkloadInput) ProfileReceipt {
+	receipt := ProfileReceipt{Computer: workload.Computer, MemoryLimitBytes: workload.Limits.MemoryBytes, Warnings: []ProfileWarning{}}
+	if !workload.Computer {
+		return receipt
+	}
+	ceilings := []struct {
+		target string
+		bytes  int64
+	}{
+		{target: "/dev/shm", bytes: computerDevShmKilobytes * 1024},
+		{target: "/tmp", bytes: computerTmpKilobytes * 1024},
+		{target: "/var/tmp", bytes: computerVarTmpKilobytes * 1024},
+	}
+	for _, ceiling := range ceilings {
+		receipt.ComputerTmpfsCeilingBytes += ceiling.bytes
+		if ceiling.bytes > receipt.LargestTmpfsCeilingBytes {
+			receipt.LargestTmpfsTarget = ceiling.target
+			receipt.LargestTmpfsCeilingBytes = ceiling.bytes
+		}
+		if workload.Limits.MemoryBytes > 0 && ceiling.bytes > workload.Limits.MemoryBytes {
+			receipt.Warnings = append(receipt.Warnings, ProfileWarning{Code: ProfileWarningTmpfsCeilingExceedsMemory, Target: ceiling.target, CeilingBytes: ceiling.bytes, LimitBytes: workload.Limits.MemoryBytes})
+		}
+	}
+	if workload.Limits.MemoryBytes > 0 && receipt.ComputerTmpfsCeilingBytes > workload.Limits.MemoryBytes {
+		receipt.Warnings = append(receipt.Warnings, ProfileWarning{Code: ProfileWarningTmpfsCombinedExceedsMemory, CeilingBytes: receipt.ComputerTmpfsCeilingBytes, LimitBytes: workload.Limits.MemoryBytes})
+	}
+	return receipt
 }
 
 // marshalRuntimeSpec serializes the profile while retaining explicit empty
@@ -360,10 +399,7 @@ func buildRuntimeSpec(ctx context.Context, input RuntimeSpecInput, dependencies 
 	// release pins runtime-spec v1.3.0, so the bundle version must remain the
 	// linked specs.Version rather than being independently downgraded.
 	spec.Version = specs.Version
-	computerDisk := false
-	for _, volume := range input.Workload.ManagedVolumes {
-		computerDisk = computerDisk || volume.Kind == ManagedVolumeComputerDisk
-	}
+	computerDisk := input.Workload.Computer
 	spec.Root = &specs.Root{Path: containerRootfsPath, Readonly: computerDisk}
 	spec.Hostname = ""
 	spec.Domainname = ""
@@ -475,7 +511,7 @@ func validateRuntimeSpecInput(input RuntimeSpecInput, validateSource func(string
 			return fmt.Errorf("managed volume %q source is not permitted: %w", volume.Kind, err)
 		}
 	}
-	computerDisk := workloadHasComputerDisk(input.Workload)
+	computerDisk := input.Workload.Computer
 	if computerDisk {
 		if input.ComputerControlSource == "" {
 			return errors.New("Computer control source is required")
@@ -591,7 +627,7 @@ func isolationResources(limits WorkloadLimits) (*specs.LinuxResources, error) {
 
 func isolationMounts(input RuntimeSpecInput) ([]specs.Mount, error) {
 	devShmKilobytes := int64(64 * 1024)
-	computer := workloadHasComputerDisk(input.Workload)
+	computer := input.Workload.Computer
 	if computer {
 		devShmKilobytes = computerDevShmKilobytes
 	}

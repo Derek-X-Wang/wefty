@@ -731,7 +731,7 @@ func TestAttemptDeadmanUsesGuardianReaper(t *testing.T) {
 
 func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
 	engine := newFakeEngine()
-	engine.setRunResponse(RunResponse{Started: true, Endpoints: map[string]uint16{"service": 42001}, HostBridgeReady: true})
+	engine.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}, HostBridgeReady: true})
 	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
 	defer stop()
 	session, err := client.OpenSession(t.Context(), testSessionRequest())
@@ -772,7 +772,7 @@ func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
 
 func TestNamedEndpointAuthorizationResolvesOnlyTheRequestedName(t *testing.T) {
 	engine := newFakeEngine()
-	engine.runResponse = RunResponse{Started: true, Endpoints: map[string]uint16{"view": 42011, "control": 42012}}
+	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"view": 42011, "control": 42012}}
 	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
 	defer stop()
 	session, err := client.OpenSession(t.Context(), testSessionRequest())
@@ -783,6 +783,7 @@ func TestNamedEndpointAuthorizationResolvesOnlyTheRequestedName(t *testing.T) {
 	requireSweep(t, session)
 	request := testRunRequest(testAuthority(), time.Second)
 	request.Authority.Class = contract.JobClassService
+	request.Workload.Computer = true
 	request.Workload.ManagedVolumes = testComputerManagedVolumes()
 	request.AllocateEndpoints = []string{"view", "control"}
 	if _, err := session.Run(t.Context(), request); err != nil {
@@ -820,12 +821,14 @@ func TestComputerEndpointContractFailsClosed(t *testing.T) {
 	} {
 		request := testRunRequest(testAuthority(), time.Second)
 		request.Authority.Class = contract.JobClassService
+		request.Workload.Computer = true
 		request.Workload.ManagedVolumes = testComputerManagedVolumes()
 		request.AllocateEndpoints = endpoints
 		_, err := session.Run(t.Context(), request)
 		assertRPCCode(t, err, CodeInvalidRequest)
 	}
 	oneShot := testRunRequest(testAuthority(), time.Second)
+	oneShot.Workload.Computer = true
 	oneShot.Workload.ManagedVolumes = testComputerManagedVolumes()
 	oneShot.AllocateEndpoints = []string{"view", "control"}
 	_, err = session.Run(t.Context(), oneShot)
@@ -838,6 +841,25 @@ func TestComputerEndpointContractFailsClosed(t *testing.T) {
 	assertRPCCode(t, err, CodeInvalidRequest)
 	if engine.runCount() != 0 {
 		t.Fatal("invalid Computer endpoints entered the engine")
+	}
+}
+
+func TestRunRejectsCallerReservedEnvironmentAtHelperBoundary(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.Workload.ReservedEnvironment = []EnvironmentVariable{{Name: contract.EnvComputerToken, Value: "hostile-caller-value"}}
+	_, err = session.Run(t.Context(), request)
+	assertRPCCode(t, err, CodeInvalidRequest)
+	if engine.runCount() != 0 {
+		t.Fatal("hostile reserved environment crossed the privileged helper boundary")
 	}
 }
 
@@ -862,9 +884,10 @@ func TestComputerControlStateRequiresExactLiveComputerAuthority(t *testing.T) {
 	computer := testRunRequest(testAuthority(), time.Second)
 	computer.Authority.AttemptID = "computer-attempt"
 	computer.Authority.Class = contract.JobClassService
+	computer.Workload.Computer = true
 	computer.Workload.ManagedVolumes = testComputerManagedVolumes()
 	computer.AllocateEndpoints = []string{"view", "control"}
-	engine.setRunResponse(RunResponse{Started: true, Endpoints: map[string]uint16{"view": 42011, "control": 42012}})
+	engine.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"view": 42011, "control": 42012}})
 	if _, err := session.Run(t.Context(), computer); err != nil {
 		t.Fatal(err)
 	}
@@ -898,7 +921,7 @@ func TestComputerControlStateRequiresExactLiveComputerAuthority(t *testing.T) {
 
 func TestAttemptPortMarkerFailureInvalidatesSession(t *testing.T) {
 	engine := newFakeEngine()
-	engine.runResponse = RunResponse{Started: true, Endpoints: map[string]uint16{"service": 42001}}
+	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}}
 	engine.dialAttemptWithoutMarker = true
 	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
 	defer stop()
@@ -923,7 +946,7 @@ func TestAttemptPortMarkerFailureInvalidatesSession(t *testing.T) {
 
 func TestHostBridgeStreamRemainsCoupledToDialContext(t *testing.T) {
 	engine := newFakeEngine()
-	engine.runResponse = RunResponse{Started: true, HostBridgeReady: true}
+	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), HostBridgeReady: true}
 	engine.dialHostBridgeRead = true
 	engine.dialHostBridgeDone = make(chan struct{})
 	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
@@ -1796,7 +1819,7 @@ func (engine *crashBoundaryEngine) Run(_ context.Context, request RunRequest) (R
 			return RunResponse{}, errors.New("simulated helper crash after create boundary")
 		}
 	}
-	return RunResponse{Started: true}, nil
+	return RunResponse{Started: true, StartedAt: testStartedAt()}, nil
 }
 
 func (engine *crashBoundaryEngine) Sweep(context.Context, SweepRequest) (SweepResponse, error) {
@@ -1902,7 +1925,11 @@ func (engine *crashBoundaryEngine) duplicateStarts() int {
 	return engine.duplicateRuns
 }
 
-func newFakeEngine() *fakeEngine { return &fakeEngine{runResponse: RunResponse{Started: true}} }
+func testStartedAt() time.Time { return time.Unix(1, 0).UTC() }
+
+func newFakeEngine() *fakeEngine {
+	return &fakeEngine{runResponse: RunResponse{Started: true, StartedAt: testStartedAt()}}
+}
 
 func testComputerManagedVolumes() []ManagedVolumeDescriptor {
 	return []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{

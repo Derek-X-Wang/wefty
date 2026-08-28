@@ -104,6 +104,25 @@ func TestAdapterRequiresAuthoritativeStartedBeforeLocalPromotion(t *testing.T) {
 	}
 }
 
+func TestAdapterCarriesHelperStartedEdgeAcrossL1Acknowledgement(t *testing.T) {
+	helperStartedAt := time.Date(2026, 8, 28, 12, 0, 0, 123, time.UTC)
+	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}, startedAt: helperStartedAt}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	var observed time.Time
+	request.OCIStartedAt = func(startedAt time.Time) { observed = startedAt }
+	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
+		if !observed.Equal(helperStartedAt) {
+			t.Fatalf("helper Started edge before L1 acknowledgement = %s, want %s", observed, helperStartedAt)
+		}
+		return nil
+	}
+	if result, err := adapter.Run(t.Context(), request, nil); err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+		t.Fatalf("Run = %+v err=%v", result, err)
+	}
+}
+
 func TestAdapterPersistsResolutionBeforePrestartRunFailure(t *testing.T) {
 	engine := &adapterTestEngine{runErr: errors.New("containerd stopped before task start")}
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
@@ -634,9 +653,8 @@ func TestWorkloadInputMakesManagedVolumeMountsAuthoritative(t *testing.T) {
 	if len(input.ManagedVolumes) != 1 || input.ManagedVolumes[0].Kind != ocihelper.ManagedVolumeHandoff || input.ManagedVolumes[0].OwnerKey != "run-1" {
 		t.Fatalf("one-shot managed volumes = %+v, want handoff", input.ManagedVolumes)
 	}
-	if len(input.ReservedEnvironment) != 1 || input.ReservedEnvironment[0].Name != contract.EnvHandoffDir ||
-		input.ReservedEnvironment[0].Value != contract.OCIContainerHandoffDirectory {
-		t.Fatalf("one-shot reserved environment = %+v", input.ReservedEnvironment)
+	if len(input.ReservedEnvironment) != 0 {
+		t.Fatalf("caller supplied one-shot reserved environment = %+v", input.ReservedEnvironment)
 	}
 
 	request.Authority.WorkloadClass = contract.JobClassService
@@ -646,16 +664,16 @@ func TestWorkloadInputMakesManagedVolumeMountsAuthoritative(t *testing.T) {
 	if len(input.ManagedVolumes) != 1 || input.ManagedVolumes[0].Kind != ocihelper.ManagedVolumeServiceData {
 		t.Fatalf("service managed volumes = %+v, want service data", input.ManagedVolumes)
 	}
-	if len(input.ReservedEnvironment) != 1 || input.ReservedEnvironment[0].Name != contract.EnvServiceDir ||
-		input.ReservedEnvironment[0].Value != contract.OCIContainerServiceDirectory {
-		t.Fatalf("service reserved environment = %+v", input.ReservedEnvironment)
+	if len(input.ReservedEnvironment) != 0 {
+		t.Fatalf("caller supplied service reserved environment = %+v", input.ReservedEnvironment)
 	}
 
 	request.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: &workloadrunner.ComputerStorage{
 		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 2, IntentRevision: 3, DiskBytes: 8 << 30,
 	}}}
+	request.Execution.OCI.Computer = &contract.OCIComputerSpec{DiskBytes: 8 << 30}
 	input = workloadInput(request)
-	if len(input.ManagedVolumes) != 1 || input.ManagedVolumes[0].Kind != ocihelper.ManagedVolumeComputerDisk ||
+	if !input.Computer || len(input.ManagedVolumes) != 1 || input.ManagedVolumes[0].Kind != ocihelper.ManagedVolumeComputerDisk ||
 		input.ManagedVolumes[0].ComputerStorage == nil || input.ManagedVolumes[0].ComputerStorage.ComputerID != "computer-1" ||
 		input.ManagedVolumes[0].ComputerStorage.StorageID != "storage-1" || input.ManagedVolumes[0].ComputerStorage.StorageGeneration != 2 ||
 		input.ManagedVolumes[0].ComputerStorage.IntentRevision != 3 || input.ManagedVolumes[0].ComputerStorage.DiskBytes != 8<<30 {
@@ -667,21 +685,19 @@ func TestWorkloadInputMakesWeftyBridgeAndTokenHelperAuthoritative(t *testing.T) 
 	request := adapterTestRequest()
 	request.Execution.Env = map[string]string{
 		"PUBLIC": "value", contract.EnvL3Endpoint: "http://host.lima.internal:43100/l3",
+		contract.EnvRunToken: "public-layer-attacker", contract.EnvComputerToken: "public-computer-attacker",
 	}
 	request.Execution.SensitiveEnv = map[string]string{
-		contract.EnvRunToken: "secret-token", contract.EnvL3Endpoint: "http://sensitive-precedence/l3", "OPERATOR_SECRET": "secret-value",
+		contract.EnvRunToken: "secret-token", contract.EnvComputerToken: "unminted-computer-token",
+		contract.EnvL3Endpoint: "http://sensitive-precedence/l3", "OPERATOR_SECRET": "secret-value",
 	}
 	input := workloadInput(request)
 	if len(input.Environment) != 1 || input.Environment[0].Name != "PUBLIC" ||
 		len(input.SensitiveEnvironment) != 1 || input.SensitiveEnvironment[0].Name != "OPERATOR_SECRET" {
 		t.Fatalf("operator environment was not separated: public=%+v sensitive=%+v", input.Environment, input.SensitiveEnvironment)
 	}
-	reserved := make(map[string]string)
-	for _, variable := range input.ReservedEnvironment {
-		reserved[variable.Name] = variable.Value
-	}
-	if reserved[contract.EnvL3Endpoint] != "http://sensitive-precedence/l3" || reserved[contract.EnvRunToken] != "secret-token" || len(reserved) != 2 {
-		t.Fatalf("reserved environment = %+v", reserved)
+	if len(input.ReservedEnvironment) != 0 || input.L3Endpoint != "http://host.lima.internal:43100/l3" || input.RunToken != "secret-token" {
+		t.Fatalf("helper minting inputs: reserved=%+v l3=%q token=%q", input.ReservedEnvironment, input.L3Endpoint, input.RunToken)
 	}
 }
 
@@ -988,6 +1004,7 @@ type adapterTestEngine struct {
 	deletes            int
 	refuseDelete       bool
 	runErr             error
+	startedAt          time.Time
 	ensureErrors       []error
 	ensureCalls        int
 	responseDigest     string
@@ -1082,7 +1099,11 @@ func (engine *adapterTestEngine) Run(_ context.Context, request ocihelper.RunReq
 	if engine.runErr != nil {
 		return ocihelper.RunResponse{}, engine.runErr
 	}
-	response := ocihelper.RunResponse{Started: true, Image: &ocihelper.ImageEvidence{
+	startedAt := engine.startedAt
+	if startedAt.IsZero() {
+		startedAt = time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	}
+	response := ocihelper.RunResponse{Started: true, StartedAt: startedAt, Image: &ocihelper.ImageEvidence{
 		SubmittedReference: "example.invalid/image", TopLevelDigest: adapterTestDigest, TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json",
 		PlatformManifestDigest: adapterTestDigest, Platform: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"},
 		RuntimeHandler: ocihelper.DefaultRuntimeHandler, Snapshotter: ocihelper.DefaultSnapshotter,

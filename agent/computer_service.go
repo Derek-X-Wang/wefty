@@ -117,13 +117,21 @@ func runComputerService(
 	started := make(chan time.Time, 1)
 	startupSignalErrors := make(chan error, 1)
 	var startedOnce sync.Once
+	var helperStartedAt time.Time
+	priorOCIStartedAt := request.OCIStartedAt
+	request.OCIStartedAt = func(startedAt time.Time) {
+		helperStartedAt = startedAt
+		if priorOCIStartedAt != nil {
+			priorOCIStartedAt(startedAt)
+		}
+	}
 	priorStarted := request.Started
 	request.Started = func() {
 		startedOnce.Do(func() {
-			// Capture the authoritative Started edge before any post-start guest
-			// signal I/O. Scheduling or helper latency must not extend the exact
-			// 60-second image-readiness budget.
-			startedAt := clock.Now()
+			if helperStartedAt.IsZero() {
+				startupSignalErrors <- errors.New("Computer runtime omitted the helper Started timestamp")
+				return
+			}
 			startupSignalContext, cancelStartupSignal := context.WithTimeout(context.WithoutCancel(runContext), controllerTenureFinalizationLimit)
 			err := controlRuntime.SetComputerControlState(startupSignalContext, request.Authority, false)
 			cancelStartupSignal()
@@ -134,7 +142,7 @@ func runComputerService(
 			if priorStarted != nil {
 				priorStarted()
 			}
-			started <- startedAt
+			started <- helperStartedAt
 		})
 	}
 	outcomes := make(chan serviceRunOutcome, 1)
@@ -232,7 +240,7 @@ func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan t
 			return nil
 		case <-timer.C():
 		}
-		probeContext, cancel := context.WithTimeout(ctx, DefaultComputerReadinessConnectTimeout)
+		probeContext, cancel := contextWithClockTimeout(ctx, clock, DefaultComputerReadinessConnectTimeout)
 		nextReady := probeComputerBackendPairOnce(probeContext, dial) == nil
 		cancel()
 		if nextReady != ready {
@@ -240,6 +248,20 @@ func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan t
 			observe(ready)
 		}
 	}
+}
+
+func contextWithClockTimeout(parent context.Context, clock Clock, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	timer := clock.NewTimer(timeout)
+	go func() {
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+		case <-timer.C():
+			cancel()
+		}
+	}()
+	return ctx, cancel
 }
 
 func probeComputerBackendPairOnce(ctx context.Context, dial computerEndpointDial) error {

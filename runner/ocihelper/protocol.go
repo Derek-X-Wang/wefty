@@ -426,6 +426,7 @@ type DoctorStatus struct {
 	Cache              ImageCacheStatus      `json:"cache"`
 	CacheRead          DiagnosticReadReceipt `json:"cache_read"`
 	CacheLastErrorCode string                `json:"cache_last_error_code,omitempty"`
+	LastProfile        *ProfileReceipt       `json:"last_profile,omitempty"`
 }
 
 // ImageSource selects one closed delivery mechanism. Empty retains the wire-v1
@@ -506,16 +507,23 @@ type OperatorMount struct {
 // privileged helper constructs its runtime spec. A caller cannot supply OCI
 // JSON, namespaces, privileges, devices, or other runtime mechanics.
 type WorkloadInput struct {
-	ImageReference       string                    `json:"image_reference"`
-	ImageDigest          string                    `json:"image_digest"`
-	Argv                 []string                  `json:"argv,omitempty"`
-	WorkingDirectory     string                    `json:"working_directory,omitempty"`
-	Environment          []EnvironmentVariable     `json:"environment,omitempty"`
-	SensitiveEnvironment []EnvironmentVariable     `json:"sensitive_environment,omitempty"`
+	ImageReference       string                `json:"image_reference"`
+	ImageDigest          string                `json:"image_digest"`
+	Computer             bool                  `json:"computer,omitempty"`
+	Argv                 []string              `json:"argv,omitempty"`
+	WorkingDirectory     string                `json:"working_directory,omitempty"`
+	Environment          []EnvironmentVariable `json:"environment,omitempty"`
+	SensitiveEnvironment []EnvironmentVariable `json:"sensitive_environment,omitempty"`
+	// L3Endpoint and RunToken are closed helper-minting inputs. Their values
+	// become reserved environment only inside the privileged trust boundary;
+	// RunToken is deliberately separate so sensitive-only routing is explicit.
+	L3Endpoint           string                    `json:"l3_endpoint,omitempty"`
+	RunToken             string                    `json:"run_token,omitempty"`
 	ReservedEnvironment  []EnvironmentVariable     `json:"reserved_environment,omitempty"`
 	ManagedVolumes       []ManagedVolumeDescriptor `json:"managed_volumes,omitempty"`
 	OperatorMounts       []OperatorMount           `json:"operator_mounts,omitempty"`
 	Limits               WorkloadLimits            `json:"limits,omitempty"`
+	helperMintedReserved bool                      `json:"-"`
 }
 
 // WorkloadLimits are cgroup-v2 hard limits. Zero means the corresponding
@@ -539,10 +547,40 @@ type RunRequest struct {
 
 type RunResponse struct {
 	Started          bool              `json:"started"`
+	StartedAt        time.Time         `json:"started_at"`
 	Image            *ImageEvidence    `json:"image,omitempty"`
 	Endpoints        map[string]uint16 `json:"endpoints,omitempty"`
 	HostBridgeReady  bool              `json:"host_bridge_ready,omitempty"`
 	BridgeCapability string            `json:"bridge_capability,omitempty"`
+	Profile          ProfileReceipt    `json:"profile"`
+}
+
+type ProfileWarningCode string
+
+const (
+	ProfileWarningTmpfsCeilingExceedsMemory  ProfileWarningCode = "tmpfs_ceiling_exceeds_memory_limit"
+	ProfileWarningTmpfsCombinedExceedsMemory ProfileWarningCode = "tmpfs_combined_ceiling_exceeds_memory_limit"
+)
+
+// ProfileWarning is a typed, non-admission warning. Tmpfs sizes are ceilings,
+// not reservations; the memory cgroup remains the enforcement boundary.
+type ProfileWarning struct {
+	Code         ProfileWarningCode `json:"code"`
+	Target       string             `json:"target,omitempty"`
+	CeilingBytes int64              `json:"ceiling_bytes"`
+	LimitBytes   int64              `json:"limit_bytes"`
+}
+
+// ProfileReceipt is assertion-derived from the exact runtime profile handed
+// to containerd. ComputerTmpfsCeilingBytes covers /dev/shm, /tmp, and
+// /var/tmp; ordinary baseline tmpfs mounts remain outside that product delta.
+type ProfileReceipt struct {
+	Computer                  bool             `json:"computer"`
+	MemoryLimitBytes          int64            `json:"memory_limit_bytes"`
+	ComputerTmpfsCeilingBytes int64            `json:"computer_tmpfs_ceiling_bytes"`
+	LargestTmpfsTarget        string           `json:"largest_tmpfs_target,omitempty"`
+	LargestTmpfsCeilingBytes  int64            `json:"largest_tmpfs_ceiling_bytes"`
+	Warnings                  []ProfileWarning `json:"warnings"`
 }
 
 // ImageEvidence is produced from the local immutable image selected by the

@@ -40,8 +40,11 @@ door. No form exposes the bridge on a host wildcard or embeds a fixed gateway.
 For `kind=oci`, the exact reserved-name set is `WEFTY_HANDOFF_DIR`,
 `WEFTY_SERVICE_DIR`, `WEFTY_SERVICE_PORT`, `WEFTY_L3_ENDPOINT`,
 `WEFTY_RUN_TOKEN`, `WEFTY_COMPUTER_TOKEN`, `WEFTY_COMPUTER_VIEW_PORT`, and
-`WEFTY_COMPUTER_CONTROL_PORT`. The runtime strips those names from image and
-operator environment before authoritative attempt-local injection; another
+`WEFTY_COMPUTER_CONTROL_PORT`. The unprivileged adapter removes those names
+from generic operator layers, and the privileged helper independently rejects
+any reserved name that crosses in a generic or caller-supplied reserved layer.
+Only closed typed minting inputs and helper-derived mount/endpoint facts may
+produce the authoritative attempt-local values; another
 tenant-defined `WEFTY_*` name is not reserved implicitly. For a Computer the
 helper injects the two public port values, strips and omits
 `WEFTY_SERVICE_PORT`, and preserves `WEFTY_SERVICE_DIR=/wefty/service`.

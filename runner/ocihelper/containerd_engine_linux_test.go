@@ -1122,12 +1122,14 @@ func TestTwoComputersReceiveFourUniqueLoopbackPorts(t *testing.T) {
 		hold      net.Listener
 	}
 	allocations := make([]allocation, 0, 4)
-	for _, authority := range []string{"computer-a:view", "computer-a:control", "computer-b:view", "computer-b:control"} {
-		port, hold, err := engine.reserveAttemptPort(authority)
-		if err != nil {
-			t.Fatal(err)
+	for _, authority := range []string{"computer-a", "computer-b"} {
+		for range []string{"view", "control"} {
+			port, hold, err := engine.reserveAttemptPort(authority)
+			if err != nil {
+				t.Fatal(err)
+			}
+			allocations = append(allocations, allocation{authority: authority, port: port, hold: hold})
 		}
-		allocations = append(allocations, allocation{authority: authority, port: port, hold: hold})
 	}
 	defer func() {
 		for _, allocation := range allocations {

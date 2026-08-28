@@ -19,7 +19,7 @@ func TestServiceAcceptanceHelperAuthorityFailsClosed(t *testing.T) {
 	}
 	authority := testAuthority()
 	requireSweep(t, session)
-	engine.setRunResponse(RunResponse{Started: true, Endpoints: map[string]uint16{"service": 42101}, HostBridgeReady: true})
+	engine.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42101}, HostBridgeReady: true})
 	request := testRunRequest(authority, 2*time.Second)
 	request.AllocateEndpoints = []string{"service"}
 	request.EnableHostBridgeFallback = true
@@ -43,7 +43,7 @@ func TestServiceAcceptanceHelperAuthorityFailsClosed(t *testing.T) {
 
 func TestServiceAcceptanceComputerControlStateFailsClosed(t *testing.T) {
 	engine := newFakeEngine()
-	engine.setRunResponse(RunResponse{Started: true, Endpoints: map[string]uint16{"view": 42111, "control": 42112}})
+	engine.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"view": 42111, "control": 42112}})
 	client, stop := startTestServer(t, engine, ServerConfig{
 		HeartbeatTimeout: 2 * time.Second, MaximumAttemptDeadman: 3 * time.Second,
 	})
@@ -57,6 +57,7 @@ func TestServiceAcceptanceComputerControlStateFailsClosed(t *testing.T) {
 	authority := testAuthority()
 	authority.Class = "service"
 	request := testRunRequest(authority, 2*time.Second)
+	request.Workload.Computer = true
 	request.Workload.ManagedVolumes = testComputerManagedVolumes()
 	request.AllocateEndpoints = []string{"view", "control"}
 	if _, err := session.Run(t.Context(), request); err != nil {
