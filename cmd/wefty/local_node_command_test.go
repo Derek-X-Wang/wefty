@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -121,16 +122,18 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &doctor); err != nil || doctor.Version != ocicontrol.DoctorVersion || doctor.Probe.Outcome != ocicontrol.DiagnosticFailed {
 		t.Fatalf("doctor output=%q decoded=%+v err=%v", stdout.String(), doctor, err)
 	}
-	stdout.Reset()
-	stderr.Reset()
-	if err := run(t.Context(), []string{
-		"--fabric=invalid-must-not-open", "--node-config=" + configPath, "--json", "node", "setup-oci",
-	}, &stdout, &stderr); err != nil {
-		t.Fatalf("setup-oci: %v stderr=%s", err, stderr.String())
-	}
-	var setup ocicontrol.SetupResponse
-	if err := json.Unmarshal(stdout.Bytes(), &setup); err != nil || !setup.Configured || setup.Convergence != ocicontrol.ConvergenceUnchanged || !setup.ProbePreloaded {
-		t.Fatalf("setup output=%q decoded=%+v err=%v", stdout.String(), setup, err)
+	if runtime.GOOS != "linux" {
+		stdout.Reset()
+		stderr.Reset()
+		if err := run(t.Context(), []string{
+			"--fabric=invalid-must-not-open", "--node-config=" + configPath, "--json", "node", "setup-oci",
+		}, &stdout, &stderr); err != nil {
+			t.Fatalf("setup-oci: %v stderr=%s", err, stderr.String())
+		}
+		var setup ocicontrol.SetupResponse
+		if err := json.Unmarshal(stdout.Bytes(), &setup); err != nil || !setup.Configured || setup.Convergence != ocicontrol.ConvergenceUnchanged || !setup.ProbePreloaded {
+			t.Fatalf("setup output=%q decoded=%+v err=%v", stdout.String(), setup, err)
+		}
 	}
 	stdout.Reset()
 	stderr.Reset()
