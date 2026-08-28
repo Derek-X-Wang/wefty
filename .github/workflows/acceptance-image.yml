@@ -38,11 +38,11 @@ jobs:
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
             --build-arg SOURCE_DATE_EPOCH=0 \
             --file examples/oci-echo-service/Dockerfile \
-            --output "type=oci,dest=$RUNNER_TEMP/acceptance-image-first.oci.tar" .
+            --output "type=oci,dest=$RUNNER_TEMP/acceptance-image-first.oci.tar,rewrite-timestamp=true" .
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
             --build-arg SOURCE_DATE_EPOCH=0 \
             --file examples/oci-echo-service/Dockerfile \
-            --output "type=oci,dest=$RUNNER_TEMP/acceptance-image-second.oci.tar" .
+            --output "type=oci,dest=$RUNNER_TEMP/acceptance-image-second.oci.tar,rewrite-timestamp=true" .
       - name: Prove the selected platform manifest is reproducible
         env:
           PLATFORM: linux/${{ matrix.arch }}
@@ -109,12 +109,12 @@ jobs:
           context: .
           file: examples/oci-echo-service/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
           tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           provenance: false
           sbom: false
           no-cache: true
           build-args: SOURCE_DATE_EPOCH=0
+          outputs: type=registry,rewrite-timestamp=true
       - name: Match the published index to both reproducible builds
         env:
           INDEX_DIGEST: ${{ steps.publish.outputs.digest }}
