@@ -4,18 +4,24 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	limarunner "github.com/Derek-X-Wang/wefty/runner/lima"
 )
 
 type capabilityProbeAdapterStub struct {
-	err error
+	err   error
+	calls *int
 }
 
 func (stub capabilityProbeAdapterStub) Probe(context.Context, string, string, string, string, time.Duration) error {
+	if stub.calls != nil {
+		*stub.calls++
+	}
 	return stub.err
 }
 
@@ -40,6 +46,30 @@ func TestOCIProbePublishesComputerOnlyAfterExactHelperProbe(t *testing.T) {
 			}
 			if test.wantErr && len(result.MissingCapabilities) != 1 {
 				t.Fatalf("lost helper result = %+v", result)
+			}
+		})
+	}
+}
+
+func TestOCIProbeFailsClosedBeforeAdapterWhenIntentIsUnavailable(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		intent limarunner.IntentSource
+	}{
+		{name: "missing", intent: limarunner.FileIntentSource{Path: filepath.Join(t.TempDir(), "missing.json")}},
+		{name: "disabled", intent: limarunner.IntentSourceFunc(func(context.Context) (limarunner.OCIIntent, error) {
+			return limarunner.OCIIntent{Version: limarunner.OCIIntentVersion, Revision: 2, Enabled: false, UpdatedAt: time.Now()}, nil
+		})},
+		{name: "malformed", intent: limarunner.IntentSourceFunc(func(context.Context) (limarunner.OCIIntent, error) {
+			return limarunner.OCIIntent{}, errors.New("invalid marker")
+		})},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			probe := ociCapabilityProbe{adapter: capabilityProbeAdapterStub{calls: &calls}, intent: test.intent}
+			result, err := probe.Probe(t.Context())
+			if err == nil || calls != 0 || result.ReasonCode != contract.CapabilityReasonOCIIntentDisabled {
+				t.Fatalf("result=%+v calls=%d err=%v", result, calls, err)
 			}
 		})
 	}

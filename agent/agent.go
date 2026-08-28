@@ -507,6 +507,17 @@ func (a *Agent) RecoverOCIRuntimeCapabilities(ctx context.Context) error {
 	return err
 }
 
+// StopOCIRuntime suppresses OCI admission immediately and joins resident OCI
+// attempts through their ordinary publication-withdrawal and runtime-reap
+// lifecycle. It deliberately leaves process attempts and process admission
+// untouched.
+func (a *Agent) StopOCIRuntime(ctx context.Context) error {
+	if a == nil || a.session == nil {
+		return errors.New("agent: OCI runtime control is unavailable")
+	}
+	return a.session.stopOCIRuntime(ctx)
+}
+
 // OCISweepReceipt returns a defensive copy of the currently pinned verified
 // sweep proof for runtime adapters and removal validation.
 func (a *Agent) OCISweepReceipt() (ocihelper.VerifiedSweepReceipt, bool) {

@@ -78,6 +78,7 @@ type agentSession struct {
 
 type residentAttempt struct {
 	class         string
+	kind          string
 	cancel        context.CancelCauseFunc
 	done          chan struct{}
 	runtimeReaped chan runtimeReapOutcome
@@ -749,7 +750,7 @@ func (session *agentSession) executeResident(
 ) (errorDestination, error) {
 	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
 	resident := &residentAttempt{
-		class: claim.Job.Spec.Class, cancel: cancelAttempt,
+		class: claim.Job.Spec.Class, kind: claim.Job.Spec.Kind, cancel: cancelAttempt,
 		done: make(chan struct{}), runtimeReaped: make(chan runtimeReapOutcome, 1),
 	}
 	session.claimMu.Lock()
@@ -772,6 +773,50 @@ func (session *agentSession) executeResident(
 		session.claimMu.Unlock()
 	}()
 	return execute(attemptContext, claim, claimStarted)
+}
+
+var errOCIIntentDisabled = errors.New("OCI intent disabled by the node-local operator")
+
+// stopOCIRuntime closes admission through the shared capability snapshot, then
+// joins only resident OCI attempts. Process work remains available. Attempt
+// completion owns front-door withdrawal and positive runtime quiescence, so the
+// return is the ordering barrier before a Mac caller may stop Lima.
+func (session *agentSession) stopOCIRuntime(ctx context.Context) error {
+	if session == nil || session.capabilities == nil {
+		return errors.New("agent: OCI runtime control is unavailable")
+	}
+	session.capabilities.suppressOCI(contract.CapabilityReasonOCIIntentDisabled, errOCIIntentDisabled)
+	// The command must not wait on L1 reachability. Publish immediately when
+	// possible, while the durable marker and local admission remain restrictive
+	// even if this best-effort heartbeat fails.
+	if session.client != nil {
+		go func() {
+			publishContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultOperationTimeout)
+			defer cancel()
+			if _, err := session.publishCapabilityHeartbeat(publishContext, nil); err != nil && session.logf != nil {
+				session.logf("agent: publish OCI intent withdrawal: %v", err)
+			}
+		}()
+	}
+
+	session.claimMu.Lock()
+	done := make([]<-chan struct{}, 0, len(session.resident))
+	for _, resident := range session.resident {
+		if resident.kind != contract.JobKindOCI {
+			continue
+		}
+		resident.cancel(errOCIIntentDisabled)
+		done = append(done, resident.done)
+	}
+	session.claimMu.Unlock()
+	for _, completed := range done {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-completed:
+		}
+	}
+	return nil
 }
 
 func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- destinationError) {

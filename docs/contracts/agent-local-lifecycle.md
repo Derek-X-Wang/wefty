@@ -140,6 +140,38 @@ The writer checks for content changes and polls no faster than 20 seconds. It
 never contains a raw command error, path detail,
 environment dump, credential, or opaque helper session capability.
 
+## Durable OCI intent and node-local control
+
+The versioned OCI intent marker is the node-local operator decision, separate
+from L1 `claims_enabled` and Capability revision. Missing, unreadable, malformed,
+or zero-revision state is disabled. `setup-oci` creates revision 1 enabled only
+when the marker has never existed; every rerun preserves an existing disabled
+marker exactly. `oci start` and `oci stop` compare-and-swap the revision and
+fsync the replacement and its parent directory before any runtime effect.
+
+Singular `wefty node` commands resolve the installed node configuration before
+Fabric initialization and use only the live agent's Unix control socket. Its
+directory is `0700`, its socket is `0600`, an active socket is never replaced,
+and a symlink or non-socket path fails closed. The agent is the sole writer of
+intent and runtime state. `load-image` streams an OCI archive through this
+surface to the existing helper-owned import/cache seam; it accepts no mutable
+reference override and returns only verified top-level and admitted-platform
+digests plus bounded evidence.
+
+Stop ordering is durable disable → restrictive local Capability observation →
+published-service withdrawal → attempt reap and positive runtime quiescence →
+Mac Lima stop. The shared Mac recovery-cycle lock covers the quiescence and VM
+stop, preventing the background watchdog from stopping Lima early. Linux leaves
+containerd running. A failed post-persistence action never rolls the intent bit
+back. Start persists enabled, reacquires the helper, completes the boot barrier
+and probe, and only then publishes the positive Capability revision.
+
+Linux ships one unprivileged `wefty-agent.service` with
+`SupplementaryGroups=wefty-oci` and one root socket-activated helper pair. The
+socket is exactly `0660 root:wefty-oci`; the helper UID allowlist names only the
+agent user. A setup that newly adds group membership restarts the agent once;
+an already-member convergence rerun does not manufacture another restart.
+
 ## Workload runtime selection
 
 The agent selects exactly one `WorkloadRuntime` by the job's open `kind` after

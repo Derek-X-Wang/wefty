@@ -507,7 +507,9 @@ func validateHelperRemovalAttestation(request workloadrunner.RuntimeRemovalProof
 // LoadImage is the agent-side offline-import seam used by the node-local
 // operator control plane. The agent owns the same total policy budget while
 // the helper exclusively validates and imports archive mechanics.
-// TODO(#153): expose this seam through the operator-only local control socket.
+// The operator-only node-local control socket uses this seam for
+// `wefty node load-image`; an empty reference keeps the imported identity
+// digest-only while the helper enforces the bound cache and binding pins.
 func (adapter *Adapter) LoadImage(ctx context.Context, reference string, archive io.Reader) (ocihelper.EnsureImageResponse, error) {
 	if adapter == nil || adapter.sessions == nil {
 		return ocihelper.EnsureImageResponse{}, errors.New("OCI helper session is not configured")

@@ -152,6 +152,35 @@ func (supervisor *Supervisor) Ensure(ctx context.Context) error {
 	return supervisor.ensureWithin(recoveryContext)
 }
 
+// Stop enforces an already-persisted disabled intent. It is intentionally not
+// an intent writer; the node-local controller must durably disable first.
+func (supervisor *Supervisor) Stop(ctx context.Context) error {
+	if supervisor == nil {
+		return errors.New("Lima supervisor is unavailable")
+	}
+	recoveryContext, cancel := supervisor.config.withTimeout(ctx, supervisor.config.RecoveryTimeout)
+	defer cancel()
+	supervisor.ensureMu.Lock()
+	defer supervisor.ensureMu.Unlock()
+	intent, err := supervisor.readIntent(recoveryContext)
+	if err != nil {
+		return err
+	}
+	if intent.Enabled {
+		return errors.New("Lima stop requires disabled OCI intent")
+	}
+	state, inspectErr := supervisor.inspect(recoveryContext)
+	if inspectErr == nil && state != InstanceStopped {
+		if err := supervisor.forceStop(recoveryContext); err != nil {
+			supervisor.record(state, false, false, contract.CapabilityReasonOCIIntentDisabled, false)
+			return err
+		}
+		state = InstanceStopped
+	}
+	supervisor.record(state, false, false, contract.CapabilityReasonOCIIntentDisabled, false)
+	return inspectErr
+}
+
 func (supervisor *Supervisor) ensureWithin(ctx context.Context) error {
 	intent, err := supervisor.readIntent(ctx)
 	if err != nil || !intent.Enabled {
@@ -428,6 +457,22 @@ type SupervisedBootBarrier struct {
 	cycleMu sync.Mutex
 	mu      sync.RWMutex
 	reason  contract.CapabilityReasonCode
+}
+
+// Stop holds the shared Lima/helper cycle across agent quiescence and VM stop.
+// This prevents the watchdog from observing the newly disabled intent and
+// stopping Lima before every OCI attempt has withdrawn and reaped.
+func (barrier *SupervisedBootBarrier) Stop(ctx context.Context, quiesce func(context.Context) error) error {
+	if barrier == nil || barrier.Supervisor == nil || barrier.Barrier == nil || quiesce == nil {
+		return errors.New("supervised OCI stop cycle is unavailable")
+	}
+	barrier.cycleMu.Lock()
+	defer barrier.cycleMu.Unlock()
+	if err := quiesce(ctx); err != nil {
+		return err
+	}
+	barrier.Barrier.Invalidate()
+	return barrier.Supervisor.Stop(ctx)
 }
 
 func (barrier *SupervisedBootBarrier) Ready() bool {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -234,6 +235,46 @@ func TestFileIntentSourceFailsClosedAndPreservesDisabledMarker(t *testing.T) {
 	intent, err = source.ReadIntent(t.Context())
 	if err != nil || intent.Enabled || intent.Revision != 2 {
 		t.Fatalf("preserved disabled intent = %+v, %v", intent, err)
+	}
+}
+
+func TestSetOCIIntentIsRevisionedIdempotentAndFailClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intent.json")
+	firstAt := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	if _, err := InitializeOCIIntent(path, firstAt); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := SetOCIIntent(path, 1, false, firstAt.Add(time.Minute))
+	if err != nil || disabled.Enabled || disabled.Revision != 2 {
+		t.Fatalf("disable=%+v err=%v", disabled, err)
+	}
+	replay, err := SetOCIIntent(path, 2, false, firstAt.Add(2*time.Minute))
+	if err != nil || replay != disabled {
+		t.Fatalf("disabled replay=%+v err=%v", replay, err)
+	}
+	if _, err := SetOCIIntent(path, 1, true, firstAt.Add(3*time.Minute)); err == nil {
+		t.Fatal("stale revision was accepted")
+	}
+	if err := os.WriteFile(path, []byte(`{"version":1,"revision":2,"enabled":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetOCIIntent(path, 2, true, firstAt.Add(4*time.Minute)); err == nil {
+		t.Fatal("malformed durable intent was overwritten with a confident enable")
+	}
+}
+
+func TestFileIntentSourceRejectsUnknownAndTrailingFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intent.json")
+	for _, payload := range []string{
+		`{"version":1,"revision":1,"enabled":true,"updated_at":"2026-08-28T10:00:00Z","override":true}`,
+		`{"version":1,"revision":1,"enabled":true,"updated_at":"2026-08-28T10:00:00Z"} {}`,
+	} {
+		if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if intent, err := (FileIntentSource{Path: path}).ReadIntent(t.Context()); err == nil || intent.Enabled {
+			t.Fatalf("adversarial intent was accepted: intent=%+v err=%v", intent, err)
+		}
 	}
 }
 

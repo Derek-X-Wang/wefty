@@ -8,12 +8,14 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/l3"
+	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
 
 func main() {
@@ -26,6 +28,11 @@ func main() {
 }
 
 func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
+	var localErr *ocicontrol.ResponseError
+	if jsonOutput && errors.As(err, &localErr) {
+		_ = writeJSON(writer, localErr.ErrorResponse)
+		return
+	}
 	var responseErr *apiResponseError
 	if jsonOutput && errors.As(err, &responseErr) {
 		_ = writeJSON(writer, contract.ErrorResponse{Error: responseErr.APIError})
@@ -56,6 +63,7 @@ type globalOptions struct {
 	controlURL     string
 	ephemeral      bool
 	jsonOutput     bool
+	nodeConfigPath string
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -66,6 +74,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(commandArgs) == 0 {
 		return usageError("a command is required")
 	}
+	if commandArgs[0] == "node" {
+		return executeLocalNode(ctx, options, commandArgs[1:], stdout, stderr)
+	}
 	plainIdentity := fabric.Identity{
 		NodeID: options.plainIdentity, UserID: options.plainUserID, DeviceID: options.plainDeviceID,
 		Tags: []string{l3.DefaultCallerPrincipalTag},
@@ -74,7 +85,6 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		plainIdentity.Tags = nil
 		if options.fabricMode == "plain" && (options.plainUserID == "" || options.plainDeviceID == "") {
 			return usageError("plain admin commands require DEVELOPMENT ONLY --plain-user-id and --plain-device-id")
-		}
 	}
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           options.fabricMode,
@@ -113,11 +123,23 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.StringVar(&options.authKey, "auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
 	flags.StringVar(&options.controlURL, "control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
 	flags.BoolVar(&options.ephemeral, "ephemeral", false, "register an ephemeral tsnet node")
+	flags.StringVar(&options.nodeConfigPath, "node-config", defaultNodeConfigPath(), "installed node configuration used by singular node commands")
 	flags.Usage = func() { fmt.Fprint(stderr, rootUsage) }
 	if err := flags.Parse(args); err != nil {
 		return globalOptions{}, nil, err
 	}
 	return options, flags.Args(), nil
+}
+
+func defaultNodeConfigPath() string {
+	if configured := os.Getenv("WEFTY_NODE_CONFIG"); configured != "" {
+		return configured
+	}
+	directory, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(directory, "wefty", "node.json")
 }
 
 func removeBoolFlag(args []string, name string) ([]string, bool) {
@@ -136,7 +158,10 @@ func removeBoolFlag(args []string, name string) ([]string, bool) {
 const rootUsage = `Usage: wefty [global flags] <command>
 
 Commands:
-  admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
+	  admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
+	  node setup-oci             Configure the installed node's OCI runtime
+	  node oci start|stop        Set durable node-local OCI intent
+	  node load-image FILE       Import an OCI archive through the live agent
   nodes list                 List node reachability, eligibility, and capacity
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   services <verb>            Create and operate service-class jobs
@@ -155,6 +180,7 @@ Global flags:
   --plain-user-id USER_ID    DEVELOPMENT ONLY: self-asserted plain person identity
   --plain-device-id DEVICE_ID
   --json
+  --node-config PATH
 `
 
 type usageError string
