@@ -22,6 +22,7 @@ const (
 	DefaultMaxOneshotSlots                    = 4
 	DefaultMaxServiceSlots                    = 2
 	DefaultPrestartInfrastructureBudget       = 10 * time.Minute
+	DefaultAdminBootstrapTTL                  = 10 * time.Minute
 )
 
 // Clock supplies all control-plane timestamps used by lease logic.

@@ -1027,7 +1027,7 @@ func exerciseOrdinaryL3OCIOneshot(
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "native-control"})
 	ledgerFabric := network.NewFabric(fabric.Identity{NodeID: "native-ledger", Tags: []string{l1.DefaultClientPrincipalTag}})
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "native-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	callerFabric := network.NewFabric(fabric.Identity{NodeID: "native-caller", User: "realtiming@example.test", Tags: []string{l3.DefaultCallerPrincipalTag}})
+	callerFabric := network.NewFabric(fabric.Identity{NodeID: "native-caller", UserID: "realtiming-person", Tags: []string{l3.DefaultCallerPrincipalTag}})
 
 	l1Store, err := l1.OpenStore(filepath.Join(t.TempDir(), "ordinary-l1.sqlite"), l1.StoreOptions{})
 	if err != nil {

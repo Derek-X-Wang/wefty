@@ -25,6 +25,9 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	operatorFabric := network.NewFabric(fabric.Identity{
 		NodeID: "operator", Tags: []string{l3.DefaultCallerPrincipalTag},
 	})
+	personFabric := network.NewFabric(fabric.Identity{
+		NodeID: "operator-person", UserID: "person-alice", DeviceID: "device-a",
+	})
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 
 	l1Store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{})
@@ -32,9 +35,12 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l1Store.Close()
-	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
-		"node-cli": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"node-cli"),
-	}})
+	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{
+		AllowSelfAssertedPersonIdentities: true,
+		NodePolicies: map[string]l1.NodePolicy{
+			"node-cli": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"node-cli"),
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,6 +104,27 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clients.close()
+	challenge, err := l1Store.InitiateAdminBootstrap(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personClients, err := newAPIClients(personFabric, l3.DefaultL1Address, l3.DefaultL3Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer personClients.close()
+	var bootstrapOut bytes.Buffer
+	if err := execute(ctx, personClients, true, []string{"admin", "bootstrap", challenge.Nonce},
+		&bootstrapOut, &bytes.Buffer{}); err != nil {
+		t.Fatalf("admin bootstrap: %v", err)
+	}
+	var adminPolicy l1.AdminPolicy
+	if err := json.Unmarshal(bootstrapOut.Bytes(), &adminPolicy); err != nil {
+		t.Fatal(err)
+	}
+	if adminPolicy.Revision != 1 || len(adminPolicy.Admins) != 1 || adminPolicy.Admins[0].UserID != "person-alice" {
+		t.Fatalf("admin bootstrap policy = %#v", adminPolicy)
+	}
 	scriptPath := filepath.Join(t.TempDir(), "workflow.sh")
 	script := "#!/bin/sh\nprintf 'cli-output\\n'\nprintf 'cli-error\\n' >&2\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {

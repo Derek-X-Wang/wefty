@@ -7,6 +7,11 @@ The client and agent protocols are separate Fabric-authenticated route groups.
 Configured Fabric identity tags grant the `client` or `agent` principal; a
 principal for one group cannot call the other. Run-token scoping remains an L3
 concern and does not replace the L1 Fabric principal boundary.
+Person-policy routes form a third, narrow group: they require stable User and
+Device IDs from Fabric WhoIs rather than a client or agent tag. Person identity
+does not grant access to either existing protocol group, and client/agent tags
+do not synthesize a person. Administrator membership uses User ID; Device ID is
+audit evidence only.
 
 ## Atomic claim and eligibility
 

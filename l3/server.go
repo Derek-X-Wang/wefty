@@ -150,7 +150,7 @@ func (s *Server) getRunExecution(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authenticateFabric(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		identity, err := s.fabric.WhoIs(r.Context(), r.RemoteAddr)
-		if err != nil || (strings.TrimSpace(identity.NodeID) == "" && strings.TrimSpace(identity.User) == "") {
+		if err != nil || (strings.TrimSpace(identity.NodeID) == "" && strings.TrimSpace(identity.UserID) == "") {
 			writeError(w, protocolError(contract.ErrorUnauthorized, "fabric identity could not be authenticated"))
 			return
 		}
@@ -209,8 +209,8 @@ func runTokenFromRequest(r *http.Request) (RunTokenScope, bool) {
 }
 
 func actorFromIdentity(identity fabric.Identity) string {
-	if strings.TrimSpace(identity.User) != "" {
-		return identity.User
+	if strings.TrimSpace(identity.UserID) != "" {
+		return identity.UserID
 	}
 	return identity.NodeID
 }

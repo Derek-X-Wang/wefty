@@ -48,6 +48,8 @@ type globalOptions struct {
 	l1Address      string
 	l3Address      string
 	plainIdentity  string
+	plainUserID    string
+	plainDeviceID  string
 	fabricName     string
 	stateDirectory string
 	authKey        string
@@ -64,12 +66,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(commandArgs) == 0 {
 		return usageError("a command is required")
 	}
+	plainIdentity := fabric.Identity{
+		NodeID: options.plainIdentity, UserID: options.plainUserID, DeviceID: options.plainDeviceID,
+		Tags: []string{l3.DefaultCallerPrincipalTag},
+	}
+	if commandArgs[0] == "admin" {
+		plainIdentity.Tags = nil
+		if options.fabricMode == "plain" && (options.plainUserID == "" || options.plainDeviceID == "") {
+			return usageError("plain admin commands require DEVELOPMENT ONLY --plain-user-id and --plain-device-id")
+		}
+	}
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
-		Mode: options.fabricMode,
-		Identity: fabric.Identity{
-			NodeID: options.plainIdentity,
-			Tags:   []string{l3.DefaultCallerPrincipalTag},
-		},
+		Mode:           options.fabricMode,
+		Identity:       plainIdentity,
 		Name:           options.fabricName,
 		StateDirectory: options.stateDirectory,
 		AuthKey:        options.authKey,
@@ -97,6 +106,8 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.StringVar(&options.l1Address, "l1", l3.DefaultL1Address, "L1 control-plane Fabric address")
 	flags.StringVar(&options.l3Address, "l3", l3.DefaultL3Address, "L3 run-ledger Fabric address")
 	flags.StringVar(&options.plainIdentity, "plain-identity", "wefty-cli", "plain Fabric identity node ID")
+	flags.StringVar(&options.plainUserID, "plain-user-id", os.Getenv("WEFTY_DEV_PLAIN_USER_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person user ID")
+	flags.StringVar(&options.plainDeviceID, "plain-device-id", os.Getenv("WEFTY_DEV_PLAIN_DEVICE_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person device ID")
 	flags.StringVar(&options.fabricName, "fabric-name", "wefty-cli", "tsnet logical node name")
 	flags.StringVar(&options.stateDirectory, "state-dir", "", "tsnet state directory")
 	flags.StringVar(&options.authKey, "auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
@@ -125,6 +136,7 @@ func removeBoolFlag(args []string, name string) ([]string, bool) {
 const rootUsage = `Usage: wefty [global flags] <command>
 
 Commands:
+  admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
   nodes list                 List node reachability, eligibility, and capacity
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   services <verb>            Create and operate service-class jobs
@@ -140,6 +152,8 @@ Global flags:
   --fabric plain|tsnet
   --l1 ADDRESS
   --l3 ADDRESS
+  --plain-user-id USER_ID    DEVELOPMENT ONLY: self-asserted plain person identity
+  --plain-device-id DEVICE_ID
   --json
 `
 

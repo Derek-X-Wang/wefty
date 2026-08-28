@@ -17,7 +17,10 @@ import (
 func TestEchoWithInjectedIdentity(t *testing.T) {
 	network := NewNetwork()
 	server := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
-	clientIdentity := fabric.Identity{NodeID: "runner-1", User: "agent@example.com", Tags: []string{"runner", "linux"}}
+	clientIdentity := fabric.Identity{
+		NodeID: "runner-1", UserID: "person-1", DeviceID: "device-1", DisplayName: "Agent",
+		Tags: []string{"runner", "linux"},
+	}
 	client := network.NewFabric(clientIdentity)
 
 	ln, err := server.Listen("tcp", "wefty://control-plane")
@@ -39,7 +42,9 @@ func TestEchoWithInjectedIdentity(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		if got.NodeID != clientIdentity.NodeID || got.User != clientIdentity.User || !slices.Equal(got.Tags, clientIdentity.Tags) {
+		if got.NodeID != clientIdentity.NodeID || got.UserID != clientIdentity.UserID ||
+			got.DeviceID != clientIdentity.DeviceID || got.DisplayName != clientIdentity.DisplayName ||
+			!slices.Equal(got.Tags, clientIdentity.Tags) {
 			serverErr <- fmt.Errorf("WhoIs() = %#v, want %#v", got, clientIdentity)
 			return
 		}

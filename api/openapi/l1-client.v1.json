@@ -3,7 +3,7 @@
   "info": {
     "title": "Wefty L1 client protocol",
     "version": "0.1.0-prerelease",
-    "description": "Fabric-authenticated job submission and polling surface for client principals. Agent-only mutation verbs are in l1-agent.v1.json."
+    "description": "Fabric-authenticated job submission and polling surface for client principals, plus the separate stable-person administrator-policy routes. Agent-only mutation verbs are in l1-agent.v1.json."
   },
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
@@ -298,6 +298,99 @@
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/admin-bootstrap": {
+      "post": {
+        "operationId": "bootstrapAdmin",
+        "summary": "Consume a locally initiated challenge as the first administrator",
+        "description": "The challenge can be initiated only by a process with local L1 database access, is short-lived, stored hashed, bound to the L1 authority instance and generation, and consumed once. The authenticated Fabric UserID becomes the administrator; DeviceID is retained only in audit.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["nonce"],
+            "properties": { "nonce": { "type": "string", "minLength": 1 } }
+          } } }
+        },
+        "responses": {
+          "201": { "description": "First administrator installed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/AdminPolicy" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/admin-policy": {
+      "get": {
+        "operationId": "getAdminPolicy",
+        "summary": "Read the current person-based administrator policy",
+        "description": "Every authenticated person receives the revision; only a current administrator receives the roster.",
+        "responses": {
+          "200": { "description": "Current bounded policy.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/AdminPolicy" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/admin-policy/audit": {
+      "get": {
+        "operationId": "listAdminPolicyAudit",
+        "summary": "Page immutable administrator-policy audit",
+        "description": "Current administrators only. Each row is committed atomically with the matching policy revision and retains authenticated person plus device evidence.",
+        "parameters": [
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+        ],
+        "responses": {
+          "200": { "description": "One revision-ordered audit page.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/AdminPolicyAuditList" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/admin-policy/admins/{user_id}": {
+      "parameters": [
+        { "name": "user_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 255 } }
+      ],
+      "put": {
+        "operationId": "addAdmin",
+        "summary": "Add one person as an administrator under policy CAS",
+        "description": "Current administrators only. The actor is derived from Fabric WhoIs and the accepted mutation advances revision with an atomic audit row.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false, "required": ["policy_revision"],
+          "properties": { "policy_revision": { "type": "integer", "minimum": 1 } }
+        } } } },
+        "responses": {
+          "200": { "description": "Administrator added.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/AdminPolicy" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      },
+      "delete": {
+        "operationId": "removeAdmin",
+        "summary": "Remove one person as an administrator under policy CAS",
+        "description": "Current administrators only. The final administrator is protected and a rejected mutation writes neither policy nor audit.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false, "required": ["policy_revision"],
+          "properties": { "policy_revision": { "type": "integer", "minimum": 1 } }
+        } } } },
+        "responses": {
+          "200": { "description": "Administrator removed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/AdminPolicy" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
         }

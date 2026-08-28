@@ -97,11 +97,44 @@ func run() error {
 		controlURL               = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
 		ephemeral                = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
 		readyFile                = flag.String("ready-file", "", "write listener metadata after the server is ready")
+		initiateAdminBootstrap   = flag.Bool("initiate-admin-bootstrap", false, "create a short-lived local admin bootstrap challenge and exit")
+		resetAdminPolicy         = flag.Bool("reset-admin-policy", false, "locally clear the admin roster, reopen bootstrap, audit the reset, and exit")
+		allowPlainPersonIDs      = flag.Bool("allow-plain-person-identities", false, "DEVELOPMENT ONLY: allow self-asserted plain Fabric identities on person routes")
 	)
 	flag.Var(nodeTagsFlag{policies: nodePolicies}, "node-tags", "authoritative routing tags as node-id=tag,tag (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies}, "node-max-oneshot-slots", "authoritative one-shot capacity as node-id=slots (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies, service: true}, "node-max-service-slots", "authoritative service capacity as node-id=slots (repeatable)")
 	flag.Parse()
+	storeOptions := l1.StoreOptions{
+		LeaseDuration:                *leaseDuration,
+		LateEvidenceWindow:           *lateEvidenceWindow,
+		PrestartInfrastructureBudget: *prestartBudget,
+		ServiceStabilityWindow:       *serviceStabilityWindow,
+		ServiceLogRetentionBytes:     *serviceLogRetentionBytes,
+		ServiceLogRetentionAge:       *serviceLogRetentionAge,
+	}
+	if *initiateAdminBootstrap && *resetAdminPolicy {
+		return errors.New("-initiate-admin-bootstrap and -reset-admin-policy are mutually exclusive")
+	}
+	if *initiateAdminBootstrap || *resetAdminPolicy {
+		store, err := l1.OpenStore(*databasePath, storeOptions)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		if *resetAdminPolicy {
+			policy, err := store.ResetAdminPolicy(context.Background())
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(policy)
+		}
+		challenge, err := store.InitiateAdminBootstrap(context.Background())
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(challenge)
+	}
 
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           *fabricMode,
@@ -117,19 +150,14 @@ func run() error {
 		return err
 	}
 	defer closeFabric()
-	store, err := l1.OpenStore(*databasePath, l1.StoreOptions{
-		LeaseDuration:                *leaseDuration,
-		LateEvidenceWindow:           *lateEvidenceWindow,
-		PrestartInfrastructureBudget: *prestartBudget,
-		ServiceStabilityWindow:       *serviceStabilityWindow,
-		ServiceLogRetentionBytes:     *serviceLogRetentionBytes,
-		ServiceLogRetentionAge:       *serviceLogRetentionAge,
-	})
+	store, err := l1.OpenStore(*databasePath, storeOptions)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	server, err := l1.NewServer(participant, store, l1.ServerConfig{NodePolicies: nodePolicies})
+	server, err := l1.NewServer(participant, store, l1.ServerConfig{
+		NodePolicies: nodePolicies, AllowSelfAssertedPersonIdentities: *allowPlainPersonIDs,
+	})
 	if err != nil {
 		return err
 	}

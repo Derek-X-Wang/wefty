@@ -22,6 +22,8 @@ import (
 
 func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	switch args[0] {
+	case "admin":
+		return executeAdmin(ctx, clients, jsonOutput, args[1:], stdout)
 	case "nodes":
 		return executeNodes(ctx, clients, jsonOutput, args[1:], stdout)
 	case "services":
@@ -42,6 +44,21 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 	default:
 		return usageError(fmt.Sprintf("unknown command %q", args[0]))
 	}
+}
+
+func executeAdmin(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
+	if len(args) != 2 || args[0] != "bootstrap" || strings.TrimSpace(args[1]) == "" {
+		return usageError("usage: wefty admin bootstrap NONCE")
+	}
+	policy, err := clients.bootstrapAdmin(ctx, args[1])
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		return writeJSON(stdout, policy)
+	}
+	_, err = fmt.Fprintf(stdout, "administrator bootstrap complete at policy revision %d\n", policy.Revision)
+	return err
 }
 
 type runInspection struct {

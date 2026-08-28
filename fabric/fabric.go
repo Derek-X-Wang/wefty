@@ -23,17 +23,51 @@ type Fabric interface {
 	ConnectHost() string
 }
 
+// PersonIdentityTrust describes whether a Fabric authenticates person identity
+// or merely transports a development identity asserted by its peer.
+type PersonIdentityTrust string
+
+const (
+	PersonIdentitySelfAsserted  PersonIdentityTrust = "self_asserted"
+	PersonIdentityAuthenticated PersonIdentityTrust = "authenticated"
+)
+
+// PersonIdentityTrustProvider lets an L1 deployment fail closed when a Fabric
+// cannot authenticate person identity. Implementations that omit this seam are
+// treated as self-asserted.
+type PersonIdentityTrustProvider interface {
+	PersonIdentityTrust() PersonIdentityTrust
+}
+
+// IdentityKind distinguishes person-capable peers from machine principals.
+// An empty kind is retained for compatibility with test/dev implementations;
+// IdentityKindMachine is always ineligible for person authorization.
+type IdentityKind string
+
+const IdentityKindMachine IdentityKind = "machine"
+
 type Provisioner interface {
 	Provision(ctx context.Context, spec ProvisionSpec) (Credential, error)
 	Deprovision(ctx context.Context, nodeID string) error
 }
 
-// Identity is authenticated by the Fabric implementation. Tags in this type,
-// never fields self-reported by a node registration request, drive claims.
+// Identity is authenticated by the Fabric implementation. UserID identifies
+// one person across devices, while DeviceID retains the peer device evidence.
+// FabricID identifies the issuing Fabric so a different issuer cannot silently
+// reinterpret an existing UserID. Kind records machine principals without
+// exposing implementation-specific tag semantics.
+// Both are opaque Fabric-owned identifiers: callers must not parse them or
+// substitute display data for policy. Tags in this type, never fields
+// self-reported by a node registration request, drive protocol principals and
+// claims.
 type Identity struct {
-	NodeID string
-	User   string
-	Tags   []string
+	NodeID      string
+	UserID      string
+	DeviceID    string
+	FabricID    string
+	Kind        IdentityKind
+	DisplayName string
+	Tags        []string
 }
 
 type ProvisionSpec struct {

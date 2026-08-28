@@ -35,7 +35,7 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	ledgerFabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger", Tags: []string{l1.DefaultClientPrincipalTag}})
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "agent-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	callerFabric := network.NewFabric(fabric.Identity{NodeID: "caller", User: "acceptance@example.test", Tags: []string{l3.DefaultCallerPrincipalTag}})
+	callerFabric := network.NewFabric(fabric.Identity{NodeID: "caller", UserID: "acceptance-person", Tags: []string{l3.DefaultCallerPrincipalTag}})
 
 	l1Store, err := l1.OpenStore(t.TempDir()+"/l1.sqlite", l1.StoreOptions{})
 	if err != nil {

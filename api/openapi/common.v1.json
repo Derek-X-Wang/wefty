@@ -129,6 +129,56 @@
           "updated_at": { "type": "string", "format": "date-time" }
         }
       },
+      "AdminPolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["revision"],
+        "properties": {
+          "revision": { "type": "integer", "minimum": 0 },
+          "admins": {
+            "type": "array",
+            "maxItems": 32,
+            "description": "Present only for a current administrator.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["fabric_id", "user_id", "added_revision", "added_at"],
+              "properties": {
+                "fabric_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+                "user_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+                "added_revision": { "type": "integer", "minimum": 1 },
+                "added_at": { "type": "string", "format": "date-time" }
+              }
+            }
+          }
+        },
+        "description": "Current bounded person-based administrator policy. Membership is scoped to the issuing Fabric; device identity is audit evidence, never membership."
+      },
+      "AdminPolicyAudit": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["revision", "operation", "actor_kind", "actor_fabric_id", "actor_user_id", "actor_device_id", "subject_fabric_id", "subject_user_id", "created_at"],
+        "properties": {
+          "revision": { "type": "integer", "minimum": 1 },
+          "operation": { "enum": ["bootstrap", "add", "remove", "reset"] },
+          "actor_kind": { "enum": ["fabric_person", "local_operator"] },
+          "actor_fabric_id": { "type": "string" },
+          "actor_user_id": { "type": "string" },
+          "actor_device_id": { "type": "string" },
+          "subject_fabric_id": { "type": "string" },
+          "subject_user_id": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "AdminPolicyAuditList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["entries"],
+        "properties": {
+          "entries": { "type": "array", "items": { "$ref": "#/components/schemas/AdminPolicyAudit" } },
+          "next_cursor": { "type": "string" }
+        }
+      },
       "ComputerIntent": {
         "type": "object",
         "additionalProperties": false,
@@ -767,7 +817,7 @@
     "securitySchemes": {
       "fabricIdentity": {
         "type": "mutualTLS",
-        "description": "Identity supplied by the selected Fabric implementation."
+        "description": "Identity supplied by the selected Fabric implementation. Person-policy routes require opaque stable UserID and DeviceID; display data is never authority."
       },
       "runToken": {
         "type": "http",
