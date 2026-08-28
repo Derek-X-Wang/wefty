@@ -70,6 +70,42 @@ func TestAttemptPublicationFencedMutationAndTrueNoOps(t *testing.T) {
 	assertAttemptPublicationFencedMutationAndTrueNoOps(t)
 }
 
+func TestComputerDisplayPublicationIsFencedAndWithdrawn(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{"computer-node": {"computer"}})
+	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	computer, _, err := h.store.CreateComputer(context.Background(), CreateComputerRequest{
+		Name: "published-computer", Spec: computerCapabilityJobSpec("computer:published"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := h.store.ClaimJob(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID, contract.JobClassService)
+	if err != nil || claim == nil {
+		t.Fatalf("claim Computer = %#v err=%v", claim, err)
+	}
+	ready := true
+	endpoint := "ws://computer-node.tailnet:43123/websockify"
+	if _, err := h.store.SetAttemptPublication(context.Background(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID,
+		PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready, DisplayEndpoint: &endpoint}); err != nil {
+		t.Fatal(err)
+	}
+	projected, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	if err != nil || projected.DisplayEndpoint == nil || *projected.DisplayEndpoint != endpoint {
+		t.Fatalf("published Computer = %#v err=%v", projected.DisplayEndpoint, err)
+	}
+	ready = false
+	if _, err := h.store.SetAttemptPublication(context.Background(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID,
+		PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready}); err != nil {
+		t.Fatal(err)
+	}
+	projected, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	if err != nil || projected.DisplayEndpoint != nil {
+		t.Fatalf("withdrawn Computer display = %#v err=%v", projected.DisplayEndpoint, err)
+	}
+}
+
 func assertAttemptPublicationFencedMutationAndTrueNoOps(t *testing.T) {
 	t.Helper()
 	port := 8080

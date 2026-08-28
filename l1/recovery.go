@@ -163,6 +163,14 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		result.PrunedAttempts += pruned
 	}
 
+	// Take-over audit has its own age bound. This sweep is intentionally not
+	// nested in service attempt-summary retention, and the audit table has no
+	// cascading foreign key to attempts.
+	result.PrunedComputerTakeoverAuditEvents, err = s.pruneComputerTakeoverAudit(ctx, tx, now)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+
 	removalRows, err := tx.QueryContext(ctx, `SELECT job_id FROM service_removals
 		WHERE status=? OR (status=? AND agent_cleaned_ns IS NOT NULL)
 		ORDER BY requested_ns, job_id`, contract.JobAgentCleaned, contract.JobForgottenCleanupUnverified)

@@ -247,6 +247,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("PUT /v1/agent/jobs/{job_id}/attempts/{attempt_id}/image", s.observeAttemptImage)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/started", s.startAttempt)
 	agent.HandleFunc("PUT /v1/agent/jobs/{job_id}/attempts/{attempt_id}/publication", s.setAttemptPublication)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/takeover-audit", s.appendComputerTakeoverAudit)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/logs", s.appendLogs)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete", s.completeAttempt)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/removal-acknowledgement", s.acknowledgeServiceRemoval)
@@ -1137,6 +1138,24 @@ func (s *Server) appendLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) appendComputerTakeoverAudit(w http.ResponseWriter, r *http.Request) {
+	var request ComputerTakeoverAuditRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	identity := identityFromRequest(r)
+	receipt, err := s.store.AppendComputerTakeoverAudit(
+		r.Context(), identity.NodeID, r.PathValue("computer_id"), r.PathValue("job_id"),
+		r.PathValue("attempt_id"), request,
+	)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, receipt)
 }
 
 func (s *Server) completeAttempt(w http.ResponseWriter, r *http.Request) {

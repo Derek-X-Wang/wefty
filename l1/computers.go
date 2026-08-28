@@ -87,9 +87,12 @@ type Computer struct {
 	CurrentSpecRevision     int64                        `json:"current_spec_revision"`
 	ReconfigurationPhase    ComputerReconfigurationPhase `json:"reconfiguration_phase"`
 	ReconfigurationRevision *int64                       `json:"reconfiguration_revision,omitempty"`
-	CurrentJob              Job                          `json:"current_job"`
-	CreatedAt               time.Time                    `json:"created_at"`
-	UpdatedAt               time.Time                    `json:"updated_at"`
+	// DisplayEndpoint remains explicitly null until an active private
+	// take-over front door has been published. It is never a placeholder URL.
+	DisplayEndpoint *string   `json:"display_endpoint"`
+	CurrentJob      Job       `json:"current_job"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type CreateComputerRequest struct {
@@ -462,6 +465,17 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	}
 	job.Status = string(job.State)
 	computer.CurrentJob = job
+	var displayEndpoint sql.NullString
+	err = q.QueryRowContext(ctx, `SELECT service_jobs.display_endpoint
+		FROM service_jobs JOIN jobs ON jobs.job_id=service_jobs.job_id
+		WHERE service_jobs.job_id=? AND service_jobs.published_attempt_id=jobs.current_attempt_id`, computer.CurrentJobID).Scan(&displayEndpoint)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return Computer{}, fmt.Errorf("read Computer display endpoint: %w", err)
+	}
+	if displayEndpoint.Valid {
+		value := displayEndpoint.String
+		computer.DisplayEndpoint = &value
+	}
 	if job.Spec.Execution.OCI == nil || job.Spec.Execution.OCI.Computer == nil || job.Spec.Execution.OCI.Computer.DiskBytes <= 0 {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest,
 			"Computer current Job has no explicit disk budget")

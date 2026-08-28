@@ -205,6 +205,7 @@ func TestComputerGrantPolicyContractsAreNodeBoundAndPersonScoped(t *testing.T) {
 	for _, path := range []string{
 		"/v1/agent/nodes/{node_id}/computer-policy",
 		"/v1/agent/nodes/{node_id}/computer-policy-acknowledgement",
+		"/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/takeover-audit",
 	} {
 		if _, present := agentPaths[path]; !present {
 			t.Errorf("L1 agent protocol is missing %s", path)
@@ -215,7 +216,7 @@ func TestComputerGrantPolicyContractsAreNodeBoundAndPersonScoped(t *testing.T) {
 	for _, name := range []string{
 		"AuthenticatedPerson", "ComputerGrant", "ComputerGrantList", "ComputerGrantMutationResult", "ComputerPolicyAudit",
 		"ComputerPolicyAuditList", "ComputerPolicyRevocation", "ComputerPolicySnapshot",
-		"ComputerPolicyInstallAcknowledgement",
+		"ComputerPolicyInstallAcknowledgement", "ComputerTakeoverAuditEvent", "ComputerTakeoverAuditReceipt",
 	} {
 		if _, present := schemas[name]; !present {
 			t.Errorf("common protocol is missing %s", name)

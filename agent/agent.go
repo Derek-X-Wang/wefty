@@ -395,8 +395,12 @@ func (a *Agent) runWorkload(ctx context.Context, claim l1.Claim) (contract.Proce
 
 func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 	var allowsStart func(contract.JobSpec) bool
+	var computerPolicy *ComputerPolicyCache
 	if a.capabilities != nil {
 		allowsStart = a.capabilities.allows
+	}
+	if a.session != nil {
+		computerPolicy = a.session.computerPolicy
 	}
 	return newAttemptLifecycle(attemptLifecycleDependencies{
 		client: a.sessionClient(), runtimes: a.runtimes, outbox: a.outbox,
@@ -408,6 +412,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		nodeID:          a.registration.NodeID, bootSessionID: a.registration.BootSessionID,
 		workflowBridge: a.startWorkflowBridge, logf: a.logf,
 		observer: a.observer, reservePublishedPort: a.reservePublishedPort,
+		fabric: a.fabric, computerPolicy: computerPolicy,
 		prepareServiceEndpoint: prepareProcessServiceEndpoint,
 		prepareAuthorityLoss:   a.prepareAuthorityLoss,
 		allowsStart:            allowsStart,

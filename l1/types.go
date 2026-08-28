@@ -8,21 +8,22 @@ import (
 )
 
 const (
-	DefaultClientPrincipalTag                 = "tag:wefty-client"
-	DefaultAgentPrincipalTag                  = "tag:wefty-agent"
-	DefaultLeaseDuration                      = 30 * time.Second
-	DefaultLateEvidenceWindow                 = 48 * time.Hour
-	DefaultNodeStaleAfter                     = 45 * time.Second
-	DefaultNodeDeadAfter                      = 2 * time.Minute
-	DefaultReconcileInterval                  = time.Second
-	DefaultServiceStabilityWindow             = 2 * time.Minute
-	DefaultServiceLogRetentionAge             = 7 * 24 * time.Hour
-	DefaultServiceLogRetentionBytes     int64 = 32 << 20
-	DefaultServiceAttemptSummaries            = 32
-	DefaultMaxOneshotSlots                    = 4
-	DefaultMaxServiceSlots                    = 2
-	DefaultPrestartInfrastructureBudget       = 10 * time.Minute
-	DefaultAdminBootstrapTTL                  = 10 * time.Minute
+	DefaultClientPrincipalTag                      = "tag:wefty-client"
+	DefaultAgentPrincipalTag                       = "tag:wefty-agent"
+	DefaultLeaseDuration                           = 30 * time.Second
+	DefaultLateEvidenceWindow                      = 48 * time.Hour
+	DefaultNodeStaleAfter                          = 45 * time.Second
+	DefaultNodeDeadAfter                           = 2 * time.Minute
+	DefaultReconcileInterval                       = time.Second
+	DefaultServiceStabilityWindow                  = 2 * time.Minute
+	DefaultServiceLogRetentionAge                  = 7 * 24 * time.Hour
+	DefaultServiceLogRetentionBytes          int64 = 32 << 20
+	DefaultServiceAttemptSummaries                 = 32
+	DefaultMaxOneshotSlots                         = 4
+	DefaultMaxServiceSlots                         = 2
+	DefaultPrestartInfrastructureBudget            = 10 * time.Minute
+	DefaultAdminBootstrapTTL                       = 10 * time.Minute
+	DefaultComputerTakeoverAuditRetentionAge       = 90 * 24 * time.Hour
 )
 
 // Clock supplies all control-plane timestamps used by lease logic.
@@ -368,12 +369,90 @@ type RenewalRequest struct {
 	FencingToken string `json:"fencing_token"`
 }
 
-// PublicationRequest carries an absolute publication state for one portful
-// service attempt. Ready is a pointer so the HTTP boundary can distinguish a
-// required false value from an omitted field.
+// PublicationRequest carries an absolute publication state for one service
+// attempt. Computer display endpoints are private Fabric front doors and are
+// present only while ready is true.
 type PublicationRequest struct {
-	FencingToken string `json:"fencing_token"`
-	Ready        *bool  `json:"ready"`
+	FencingToken    string  `json:"fencing_token"`
+	Ready           *bool   `json:"ready"`
+	DisplayEndpoint *string `json:"display_endpoint,omitempty"`
+}
+
+// ComputerTakeoverAuditEventKind is the closed, immutable take-over evidence
+// vocabulary. Ticket #178 emits admission/session events; the control events
+// are reserved for the session-bound tenure implementation in #179.
+type ComputerTakeoverAuditEventKind string
+
+const (
+	ComputerTakeoverAdmissionDenied ComputerTakeoverAuditEventKind = "admission_denied"
+	ComputerTakeoverSessionOpen     ComputerTakeoverAuditEventKind = "session_open"
+	ComputerTakeoverSessionClose    ComputerTakeoverAuditEventKind = "session_close"
+	ComputerTakeoverControlAcquired ComputerTakeoverAuditEventKind = "control_acquired"
+	ComputerTakeoverControlReleased ComputerTakeoverAuditEventKind = "control_released"
+	ComputerTakeoverAdminOverrode   ComputerTakeoverAuditEventKind = "admin_overrode"
+)
+
+// ComputerAdmittedMode is the closed relay mode recorded by take-over audit.
+// Admission can produce only view; #179 owns the transition to controller.
+type ComputerAdmittedMode string
+
+const (
+	ComputerAdmittedView       ComputerAdmittedMode = "view"
+	ComputerAdmittedController ComputerAdmittedMode = "controller"
+)
+
+// ComputerTakeoverReason is the closed reason vocabulary carried on the wire
+// and stored in L1. It is evidence, never an arbitrary error message.
+type ComputerTakeoverReason string
+
+const (
+	ComputerTakeoverIdentityUnavailable    ComputerTakeoverReason = "identity_unavailable"
+	ComputerTakeoverInvalidRequestPath     ComputerTakeoverReason = "invalid_request_path"
+	ComputerTakeoverInvalidSubprotocol     ComputerTakeoverReason = "invalid_subprotocol"
+	ComputerTakeoverUnauthorizedIdentity   ComputerTakeoverReason = "unauthorized_identity"
+	ComputerTakeoverAttemptAuthorityLost   ComputerTakeoverReason = "attempt_authority_lost"
+	ComputerTakeoverRevoked                ComputerTakeoverReason = "revoked"
+	ComputerTakeoverViewBackendUnavailable ComputerTakeoverReason = "view_backend_unavailable"
+	ComputerTakeoverClientUpgradeFailed    ComputerTakeoverReason = "client_upgrade_failed"
+	ComputerTakeoverClientClosed           ComputerTakeoverReason = "client_closed"
+	ComputerTakeoverViewBackendClosed      ComputerTakeoverReason = "view_backend_closed"
+	ComputerTakeoverRevalidationFailed     ComputerTakeoverReason = "revalidation_failed"
+	ComputerTakeoverSessionCapExpired      ComputerTakeoverReason = "session_cap_expired"
+)
+
+// ComputerTakeoverAuditEvent contains identity and policy evidence only. It
+// deliberately has no fencing token, display bytes, input data, or endpoint.
+type ComputerTakeoverAuditEvent struct {
+	EventID        string                         `json:"event_id"`
+	Kind           ComputerTakeoverAuditEventKind `json:"kind"`
+	ComputerID     string                         `json:"computer_id"`
+	JobID          string                         `json:"job_id"`
+	AttemptID      string                         `json:"attempt_id"`
+	SessionID      string                         `json:"session_id,omitempty"`
+	FabricID       string                         `json:"fabric_id,omitempty"`
+	UserID         string                         `json:"user_id,omitempty"`
+	DeviceID       string                         `json:"device_id,omitempty"`
+	AuthorizedRole ComputerGrantPermission        `json:"authorized_role,omitempty"`
+	AdmittedMode   ComputerAdmittedMode           `json:"admitted_mode,omitempty"`
+	PolicyRevision int64                          `json:"policy_revision,omitempty"`
+	OccurredAt     time.Time                      `json:"occurred_at"`
+	Reason         ComputerTakeoverReason         `json:"reason,omitempty"`
+	EventCount     int64                          `json:"event_count,omitempty"`
+	// AuthorityGeneration is derived by L1 from the fenced attempt and never
+	// accepted from the uploader.
+	AuthorityGeneration int64 `json:"authority_generation,omitempty"`
+}
+
+type ComputerTakeoverAuditRequest struct {
+	// FencingToken authenticates the upload but is never copied into the
+	// durable event or any operator response.
+	FencingToken string                     `json:"fencing_token"`
+	Event        ComputerTakeoverAuditEvent `json:"event"`
+}
+
+type ComputerTakeoverAuditReceipt struct {
+	Event    ComputerTakeoverAuditEvent `json:"event"`
+	Replayed bool                       `json:"replayed"`
 }
 
 type HeartbeatRequest struct {
@@ -400,14 +479,15 @@ type NodeIntentRequest struct {
 // ReconcileResult reports the durable transitions won by one reconciliation
 // pass. Counts are useful for observability and deterministic tests.
 type ReconcileResult struct {
-	ExpiredAttempts     int64 `json:"expired_attempts"`
-	StaleNodes          int64 `json:"stale_nodes"`
-	DeadNodes           int64 `json:"dead_nodes"`
-	RestartStreakResets int64 `json:"restart_streak_resets"`
-	EvictedLogEvents    int64 `json:"evicted_log_events"`
-	EvictedLogBytes     int64 `json:"evicted_log_bytes"`
-	PrunedAttempts      int64 `json:"pruned_attempts"`
-	FinalizedRemovals   int64 `json:"finalized_removals"`
+	ExpiredAttempts                   int64 `json:"expired_attempts"`
+	StaleNodes                        int64 `json:"stale_nodes"`
+	DeadNodes                         int64 `json:"dead_nodes"`
+	RestartStreakResets               int64 `json:"restart_streak_resets"`
+	EvictedLogEvents                  int64 `json:"evicted_log_events"`
+	EvictedLogBytes                   int64 `json:"evicted_log_bytes"`
+	PrunedAttempts                    int64 `json:"pruned_attempts"`
+	PrunedComputerTakeoverAuditEvents int64 `json:"pruned_computer_takeover_audit_events"`
+	FinalizedRemovals                 int64 `json:"finalized_removals"`
 }
 
 // AppendLogsRequest is one provenance-authenticated, idempotent upload batch.

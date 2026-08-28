@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -62,6 +63,8 @@ type attemptLifecycleDependencies struct {
 	workflowBridge         func(context.Context, string, contract.ExecutionSpec) (*workflowBridge, error)
 	logf                   func(string, ...any)
 	observer               *lifecycleObserver
+	fabric                 fabric.Fabric
+	computerPolicy         *ComputerPolicyCache
 	reservePublishedPort   func(l1.Claim) (net.Listener, *contract.SpawnFailure)
 	prepareServiceEndpoint func(context.Context) (serviceRuntimeEndpoint, error)
 	prepareAuthorityLoss   func(context.Context, string) error
@@ -558,6 +561,8 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		request.TerminationGrace = processrunner.DefaultTerminationGraceTime
 	}
 	portfulService := claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.PublishedPort != nil
+	computerService := claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassService &&
+		claim.Job.Spec.Execution.OCI != nil && claim.Job.Spec.Execution.OCI.Computer != nil
 	var ociEndpointLatch *runtimeEndpointLatch
 	if endpoints := runtimeAttemptEndpoints(claim.Job.Spec); len(endpoints) > 0 {
 		// Ordinary service readiness consumes the service endpoint below. The
@@ -805,7 +810,29 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	request.Execution = executionSpec
 	var result contract.ProcessResult
 	var runErr error
-	if portfulService {
+	if computerService {
+		if ociEndpointLatch == nil || claim.ComputerStorage == nil {
+			err := errors.New("Computer attempt is missing runtime endpoints or Computer authority")
+			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
+		}
+		result, runErr = runComputerService(ctx, runtimeAdapter, request, sink, computerServiceConfig{
+			clock: lifecycle.dependencies.clock, fabric: lifecycle.dependencies.fabric,
+			authorizer: lifecycle.dependencies.computerPolicy, auditor: lifecycle.dependencies.client,
+			computerID: claim.ComputerStorage.ComputerID, jobID: claim.Job.JobID,
+			attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken,
+			dial: func(dialContext context.Context, endpointName string) (net.Conn, error) {
+				return ociEndpointLatch.endpoint(endpointName).dial(dialContext)
+			},
+			publish: func(publishContext context.Context, ready bool, endpoint string) error {
+				request := l1.PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready}
+				if ready {
+					request.DisplayEndpoint = &endpoint
+				}
+				_, err := lifecycle.dependencies.client.SetAttemptPublication(publishContext, claim.Job.JobID, claim.Lease.AttemptID, request)
+				return err
+			},
+		})
+	} else if portfulService {
 		config := serviceSupervisorConfig{
 			clock: lifecycle.dependencies.clock,
 			onReadiness: func(startupSatisfied, ready bool) {

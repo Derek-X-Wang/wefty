@@ -298,8 +298,8 @@
       ],
       "put": {
         "operationId": "setAttemptPublication",
-        "summary": "Set absolute publication state for one portful service attempt",
-        "description": "L1 derives the immutable published port from the service specification. The mutation is authorized in fenced-write order, is not replayable after terminalization, and leaves the database untouched when the stored publication already equals the requested state.",
+        "summary": "Set absolute publication state for one service attempt",
+        "description": "L1 derives an ordinary service's immutable port from its specification; a Computer instead supplies its private Fabric front-door display endpoint only while ready. The mutation is authorized in fenced-write order, is not replayable after terminalization, and leaves the database untouched when the stored publication already equals the requested state.",
         "requestBody": {
           "required": true,
           "content": {
@@ -310,7 +310,8 @@
                 "required": ["fencing_token", "ready"],
                 "properties": {
                   "fencing_token": { "type": "string", "minLength": 1 },
-                  "ready": { "type": "boolean" }
+                  "ready": { "type": "boolean" },
+                  "display_endpoint": { "type": "string", "pattern": "^ws://[^/]+/websockify$" }
                 }
               }
             }
@@ -537,6 +538,38 @@
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/takeover-audit": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "attempt_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+      ],
+      "post": {
+        "operationId": "appendComputerTakeoverAudit",
+        "summary": "Append one immutable, attempt-fenced Computer take-over event",
+        "description": "Identical event replay is idempotent. L1 derives authority generation from the attempt and never stores the request fencing token. Session-open must commit before forwarding and session-close before the agent discards the session.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["fencing_token", "event"],
+            "properties": {
+              "fencing_token": { "type": "string", "minLength": 1 },
+              "event": { "$ref": "./common.v1.json#/components/schemas/ComputerTakeoverAuditEvent" }
+            }
+          } } }
+        },
+        "responses": {
+          "200": { "description": "Event committed or identically replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerTakeoverAuditReceipt" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
         }
       }
     },

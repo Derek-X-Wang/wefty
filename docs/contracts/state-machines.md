@@ -273,6 +273,45 @@ acknowledgement without blocking heartbeat, registration, or watch.
 Session-bound control take-over and tenure arbitration remain separate
 contracts.
 
+The private Computer front door accepts only `GET /websockify` with exactly the
+`binary` WebSocket subprotocol. It authenticates every accepted connection with
+`Fabric.WhoIs`, acquires the authorization lease above, dials only the
+helper-returned `view` endpoint, upgrades the client, and durably records
+`session_open` before forwarding any bytes. A
+control-authorized admission exposes only `CanTake`; the default sealed tenure
+returns typed `tenure_unavailable` and has no control dialer. #179 owns replacing
+that tenure and controller arbitration. The server never consults client
+headers for role, mode, backend, or control authority. Text frames, machine principals, stale
+policy, identity revalidation failure, downgrade/revocation, attempt authority
+loss, and the one-hour cap all close both relay legs. The authorization lease
+releases immediately after relay closure; the uncancelable `session_close`
+upload follows and cannot delay the revocation acknowledgement barrier. The RFB
+relay deliberately closes both legs when either copy reaches EOF instead of
+propagating TCP half-close through WebSocket framing.
+
+The attempt lifecycle mounts this handler only through `Fabric.Listen("tcp",
+":0")`; neither a LAN listener nor either raw guest/helper endpoint is
+published. After authoritative `Started`, both view and control wire contracts
+are polled until they succeed or the 60-second deadline yields typed,
+restartable `startup_readiness_timeout`. Readiness publishes the Fabric
+front-door URL as `display_endpoint`; later loss or stop first disables the
+front door and closes its sessions, then withdraws the fenced L1 projection.
+Recovery republishes through revision-ordered absolute state. Otherwise the
+Computer projection returns an explicitly null endpoint and never guesses a
+placeholder URL.
+
+L1 stores the immutable take-over vocabulary `admission_denied`,
+`session_open`, `session_close`, `control_acquired`, `control_released`, and
+`admin_overrode`. Uploads are idempotent under `(attempt_id, event_id)` and
+authenticated by the attempt fence, but the durable row and response never
+contain that fence, display bytes, input data, or endpoint data. L1 derives the
+attempt authority generation; session events retain Fabric, person, device,
+authorized role, admitted mode, policy revision, time, session, and reason.
+Pre-authorization denials are locally coalesced into counted periodic evidence
+so unauthenticated peers cannot synchronously saturate L1. Audit rows never
+cascade with attempt or Job retention and have their own 90-day default
+retention sweep, independent from attempt-summary retention.
+
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:
 
