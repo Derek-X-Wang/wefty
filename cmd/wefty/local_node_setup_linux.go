@@ -38,6 +38,7 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 	probeReference := flags.String("probe-reference", "", "pinned probe image reference")
 	probeDigest := flags.String("probe-digest", "", "pinned probe top-level digest")
 	probeArchive := flags.String("probe-archive", "", "absolute probe OCI archive")
+	installManifest := flags.String("install-manifest", "", "release OCI install manifest (defaults next to the wefty binary)")
 	allowedMountRoot := flags.String("allowed-mount-root", "/srv/wefty", "absolute operator mount root")
 	intentPath := flags.String("intent-file", "/var/lib/wefty/oci-intent.json", "durable OCI intent")
 	setupStatePath := flags.String("setup-state", "/var/lib/wefty/oci-setup.json", "durable setup convergence state")
@@ -57,6 +58,35 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 	missing := func(name string) (bool, error) {
 		_, err := fmt.Fprintf(stdout, "OCI setup not applied: missing %s; see %s\n", name, ocicontrol.RunbookPath)
 		return true, err
+	}
+	if *helperChecksum == "" || *probeReference == "" || *probeDigest == "" || *probeArchive == "" {
+		manifestPath := *installManifest
+		if manifestPath == "" {
+			executable, executableErr := os.Executable()
+			if executableErr != nil {
+				return missing("install_manifest")
+			}
+			manifestPath, err = ocicontrol.DefaultOCIInstallManifestPath(executable)
+			if err != nil {
+				return missing("install_manifest")
+			}
+		}
+		manifest, manifestErr := ocicontrol.ReadOCIInstallManifest(manifestPath)
+		if manifestErr != nil {
+			return missing("install_manifest")
+		}
+		if *helperChecksum == "" {
+			*helperChecksum = manifest.HelperChecksum
+		}
+		if *probeReference == "" {
+			*probeReference = manifest.ProbeReference
+		}
+		if *probeDigest == "" {
+			*probeDigest = manifest.ProbeDigest
+		}
+		if *probeArchive == "" {
+			*probeArchive = manifest.ProbeArchivePath
+		}
 	}
 	if *operatorUser == "" || *helperChecksum == "" || *probeReference == "" || *probeDigest == "" || *probeArchive == "" {
 		return missing("operator_or_probe_configuration")
