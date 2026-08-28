@@ -130,7 +130,7 @@ install_macos() {
 	local simulated=0
 	((dry_run)) && [[ -n ${WEFTY_OCI_INSTALL_TEST_PLATFORM+x} ]] && simulated=1
 	if ((simulated == 0)) && ! command -v brew >/dev/null 2>&1; then
-		((dry_run)) && [[ -n ${WEFTY_OCI_INSTALL_TEST_PLATFORM+x} ]] || die 64 "Homebrew is required; install it separately, then rerun this script"
+		die 64 "Homebrew is required; install it separately, then rerun this script"
 	fi
   macos_version="${WEFTY_OCI_INSTALL_TEST_DISTRO_VERSION:-$(sw_vers -productVersion)}"
   version_at_least "$macos_version" 13.5.0 || die 64 "macOS $macos_version does not provide the supported Lima vz baseline (13.5 or newer)"
