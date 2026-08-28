@@ -197,6 +197,7 @@ func TestServiceAcceptanceControllerTenureRealProcessAuthorityLoss(t *testing.T)
 	if _, _, err := connection.Read(readContext); err == nil {
 		t.Fatal("real-process expired control session remained open")
 	}
+	waitComputerAuditKind(t, auditor, l1.ComputerTakeoverSessionClose)
 	events := auditor.snapshot()
 	if len(events) != 4 || events[0].Kind != l1.ComputerTakeoverSessionOpen || events[1].Kind != l1.ComputerTakeoverControlAcquired ||
 		events[2].Kind != l1.ComputerTakeoverControlReleased || events[2].Reason != l1.ComputerTakeoverAttemptAuthorityLost ||

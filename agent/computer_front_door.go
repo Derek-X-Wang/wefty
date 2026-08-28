@@ -502,18 +502,21 @@ func (frontDoor *computerFrontDoor) waitForSessionEnd(
 	reason := l1.ComputerTakeoverClientClosed
 	select {
 	case <-ctx.Done():
-		var ended *computerSessionEnd
-		if errors.As(context.Cause(ctx), &ended) {
-			reason = ended.reason
-		} else {
-			reason = l1.ComputerTakeoverAttemptAuthorityLost
-		}
+		reason = computerSessionEndReason(ctx, l1.ComputerTakeoverAttemptAuthorityLost)
 	case <-authorization.Revocations():
 		reason = l1.ComputerTakeoverRevoked
 	case reason = <-revalidation:
 	case reason = <-relay.Reasons():
 	case <-capTimer.C():
 		reason = l1.ComputerTakeoverSessionCapExpired
+	}
+	// Session cancellation carries the authoritative attempt/session reason.
+	// Prefer it when a lower-layer relay closure became observable at the same
+	// time so scheduling cannot rewrite authority loss as a backend failure.
+	select {
+	case <-ctx.Done():
+		reason = computerSessionEndReason(ctx, l1.ComputerTakeoverAttemptAuthorityLost)
+	default:
 	}
 	return reason
 }

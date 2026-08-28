@@ -357,6 +357,22 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 	})
 }
 
+func TestComputerSessionAuthorityLossOwnsConcurrentRelayClosure(t *testing.T) {
+	frontDoor := &computerFrontDoor{config: computerFrontDoorConfig{
+		clock: systemClock{}, sessionCap: time.Hour, revalidationInterval: time.Hour,
+	}}
+	authorization := &ComputerGrantAuthorization{revocations: make(chan ComputerPolicyRevocation)}
+	for range 64 {
+		ctx, cancel := context.WithCancelCause(t.Context())
+		cancel(&computerSessionEnd{reason: l1.ComputerTakeoverAttemptAuthorityLost})
+		relay := &computerSessionRelay{reason: make(chan l1.ComputerTakeoverReason, 1)}
+		relay.reason <- l1.ComputerTakeoverControlBackendClosed
+		if got := frontDoor.waitForSessionEnd(ctx, "127.0.0.1:1", fabric.Identity{}, authorization, relay, time.Now()); got != l1.ComputerTakeoverAttemptAuthorityLost {
+			t.Fatalf("concurrent authority loss reason = %q, want %q", got, l1.ComputerTakeoverAttemptAuthorityLost)
+		}
+	}
+}
+
 func assertComputerBackendNeverReady(t *testing.T, dial computerEndpointDial) {
 	t.Helper()
 	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
