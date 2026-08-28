@@ -99,6 +99,7 @@ const (
 type RemovalDirective struct {
 	JobID             string                `json:"job_id"`
 	BoundNodeID       string                `json:"bound_node_id"`
+	Kind              string                `json:"kind"`
 	RemovalGeneration uint64                `json:"removal_generation"`
 	CleanupFence      string                `json:"cleanup_fence"`
 	RootInstanceID    string                `json:"root_instance_id"`

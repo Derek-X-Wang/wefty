@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -44,6 +45,8 @@ const (
 	MethodWatch              Method = "Watch"
 	MethodDelete             Method = "Delete"
 	MethodDeleteVolume       Method = "DeleteManagedVolume"
+	MethodInventoryRemoval   Method = "InventoryRemoval"
+	MethodAttestRemoval      Method = "AttestRemoval"
 	MethodVerify             Method = "Verify"
 	MethodSweep              Method = "Sweep"
 	MethodDialAttemptPort    Method = "DialAttemptPort"
@@ -295,6 +298,18 @@ func DeterministicHandoffVolumeDirectory(ownerKey string) (string, error) {
 	}
 	digest := sha256.Sum256([]byte("handoff\x00" + ownerKey))
 	return "wefty-handoff-volume-" + hex.EncodeToString(digest[:16]), nil
+}
+
+// DeterministicComputerDiskName maps one non-transferable Storage generation
+// to the stable helper-owned disk identity used by manifests and inventory.
+func DeterministicComputerDiskName(storage ComputerStorageReference) (string, error) {
+	if !boundedStorageID(storage.ComputerID) || !boundedStorageID(storage.StorageID) || storage.StorageGeneration < 1 {
+		return "", errors.New("Computer disk requires a bounded durable Storage identity")
+	}
+	digest := sha256.Sum256([]byte(strings.Join([]string{
+		"computer-disk", storage.ComputerID, storage.StorageID, strconv.FormatInt(storage.StorageGeneration, 10),
+	}, "\x00")))
+	return "wefty-computer-disk-" + hex.EncodeToString(digest[:16]), nil
 }
 
 type DeadmanRenewal struct {
@@ -599,6 +614,173 @@ type ManagedVolumeRemovalAuthority struct {
 
 type DeleteManagedVolumeResponse struct {
 	Deleted bool `json:"deleted"`
+}
+
+// RemovalResourceClass is the helper inventory registry used for compound
+// post-delete proof. New runtime-owned classes extend this registry without
+// changing the agent's removal state machine.
+type RemovalResourceClass string
+
+const (
+	RemovalResourceLease                  RemovalResourceClass = "lease"
+	RemovalResourceSnapshot               RemovalResourceClass = "snapshot"
+	RemovalResourceContainer              RemovalResourceClass = "container"
+	RemovalResourceTask                   RemovalResourceClass = "task"
+	RemovalResourceShim                   RemovalResourceClass = "shim"
+	RemovalResourceCgroup                 RemovalResourceClass = "cgroup"
+	RemovalResourceLogSegments            RemovalResourceClass = "log_segments"
+	RemovalResourceHandoffVolume          RemovalResourceClass = "handoff_volume"
+	RemovalResourceServiceData            RemovalResourceClass = "service_data"
+	RemovalResourceServiceDataRecord      RemovalResourceClass = "service_data_owner_record"
+	RemovalResourceComputerDiskImage      RemovalResourceClass = "computer_disk_image"
+	RemovalResourceComputerDiskAllocation RemovalResourceClass = "computer_disk_allocation"
+	RemovalResourceComputerDiskQuota      RemovalResourceClass = "computer_disk_quota"
+	RemovalResourceComputerDiskManifest   RemovalResourceClass = "computer_disk_manifest"
+	RemovalResourceComputerDiskMount      RemovalResourceClass = "computer_disk_mount"
+	RemovalResourceComputerDiskLoop       RemovalResourceClass = "computer_disk_loop"
+	RemovalResourceComputerAttachment     RemovalResourceClass = "computer_attachment"
+)
+
+type RemovalResource struct {
+	Class RemovalResourceClass `json:"class"`
+	ID    string               `json:"id"`
+}
+
+type RemovalAttemptManifest struct {
+	Authority       AttemptAuthority          `json:"authority"`
+	HandoffVolume   string                    `json:"handoff_volume,omitempty"`
+	ComputerStorage *ComputerStorageReference `json:"computer_storage,omitempty"`
+	Resources       []RemovalResource         `json:"resources"`
+}
+
+type InventoryRemovalRequest struct {
+	Removal         ManagedVolumeRemovalAuthority `json:"removal"`
+	ComputerStorage *ComputerStorageReference     `json:"computer_storage,omitempty"`
+}
+
+type InventoryRemovalResponse struct {
+	JobID             string                   `json:"job_id"`
+	RemovalGeneration uint64                   `json:"removal_generation"`
+	HelperSession     HelperSession            `json:"helper_session"`
+	Attempts          []RemovalAttemptManifest `json:"attempts"`
+}
+
+type AttestRemovalRequest struct {
+	JobID             string                   `json:"job_id"`
+	RemovalGeneration string                   `json:"removal_generation"`
+	Attempts          []RemovalAttemptManifest `json:"attempts"`
+}
+
+type RemovalAssertion struct {
+	Class  RemovalResourceClass `json:"class"`
+	ID     string               `json:"id"`
+	Absent bool                 `json:"absent"`
+}
+
+type AttestRemovalResponse struct {
+	JobID             string             `json:"job_id"`
+	RemovalGeneration string             `json:"removal_generation"`
+	HelperSession     HelperSession      `json:"helper_session"`
+	Assertions        []RemovalAssertion `json:"assertions"`
+}
+
+// ExpectedRemovalResources is the helper's closed manifest registry. Agent
+// manifests are pinned against this projection in adapter tests so adding a
+// resource class cannot silently diverge across the protocol boundary.
+func ExpectedRemovalResources(identity ResourceIdentity, handoffVolume string, computerStorage *ComputerStorageReference) []RemovalResource {
+	resources := []RemovalResource{
+		{Class: RemovalResourceLease, ID: identity.LeaseID},
+		{Class: RemovalResourceSnapshot, ID: identity.SnapshotID},
+		{Class: RemovalResourceContainer, ID: identity.ContainerID},
+		{Class: RemovalResourceTask, ID: identity.TaskID},
+		{Class: RemovalResourceShim, ID: identity.ShimID},
+		{Class: RemovalResourceCgroup, ID: identity.CgroupID},
+		{Class: RemovalResourceLogSegments, ID: identity.LogSegmentDirectory},
+		{Class: RemovalResourceHandoffVolume, ID: handoffVolume},
+	}
+	if computerStorage == nil {
+		resources = append(resources,
+			RemovalResource{Class: RemovalResourceServiceData, ID: identity.ServiceVolumeDirectory},
+			RemovalResource{Class: RemovalResourceServiceDataRecord, ID: identity.ServiceVolumeOwnerRecord},
+		)
+	} else {
+		name, err := DeterministicComputerDiskName(*computerStorage)
+		if err == nil {
+			resources = append(resources,
+				RemovalResource{Class: RemovalResourceComputerDiskImage, ID: name},
+				RemovalResource{Class: RemovalResourceComputerDiskAllocation, ID: name},
+				RemovalResource{Class: RemovalResourceComputerDiskQuota, ID: name},
+				RemovalResource{Class: RemovalResourceComputerDiskManifest, ID: name},
+				RemovalResource{Class: RemovalResourceComputerDiskMount, ID: name},
+				RemovalResource{Class: RemovalResourceComputerDiskLoop, ID: name},
+				RemovalResource{Class: RemovalResourceComputerAttachment, ID: name},
+			)
+		}
+	}
+	result := resources[:0]
+	for _, resource := range resources {
+		if resource.ID != "" {
+			result = append(result, resource)
+		}
+	}
+	return result
+}
+
+func expectedRemovalResources(identity ResourceIdentity, storage ...*ComputerStorageReference) []RemovalResource {
+	var computerStorage *ComputerStorageReference
+	if len(storage) > 0 {
+		computerStorage = storage[0]
+	}
+	return ExpectedRemovalResources(identity, "", computerStorage)
+}
+
+func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) error {
+	generation, err := strconv.ParseUint(request.RemovalGeneration, 10, 64)
+	if strings.TrimSpace(request.JobID) == "" || err != nil || generation == 0 || len(request.Attempts) == 0 {
+		return errors.New("removal attestation requires a job, positive generation, and reconstructed attempt inventory")
+	}
+	seenAttempts := make(map[string]struct{}, len(request.Attempts))
+	for _, attempt := range request.Attempts {
+		authority := attempt.Authority
+		if err := authority.validate(); err != nil || authority.NodeID != nodeID || authority.JobID != request.JobID ||
+			authority.Class != "service" || authority.RemovalGeneration != request.RemovalGeneration {
+			return errors.New("removal attestation attempt authority does not match the active node, job, class, and generation")
+		}
+		if _, exists := seenAttempts[authority.key()]; exists {
+			return errors.New("removal attestation repeats an attempt authority")
+		}
+		seenAttempts[authority.key()] = struct{}{}
+		identity, err := DeterministicResourceIdentity(authority)
+		if err != nil {
+			return err
+		}
+		if attempt.ComputerStorage != nil {
+			if _, err := DeterministicComputerDiskName(*attempt.ComputerStorage); err != nil || attempt.ComputerStorage.DiskBytes <= 0 {
+				return errors.New("removal attestation Computer Storage identity is incomplete")
+			}
+		}
+		want := ExpectedRemovalResources(identity, attempt.HandoffVolume, attempt.ComputerStorage)
+		if len(attempt.Resources) != len(want) {
+			return errors.New("removal attestation resource inventory is incomplete")
+		}
+		remaining := make(map[RemovalResource]struct{}, len(want))
+		for _, resource := range want {
+			remaining[resource] = struct{}{}
+		}
+		for _, resource := range attempt.Resources {
+			if strings.TrimSpace(string(resource.Class)) == "" || strings.TrimSpace(resource.ID) == "" {
+				return errors.New("removal attestation resource identity is incomplete")
+			}
+			if _, ok := remaining[resource]; !ok {
+				return fmt.Errorf("removal attestation resource %s/%s does not match deterministic authority", resource.Class, resource.ID)
+			}
+			delete(remaining, resource)
+		}
+		if len(remaining) != 0 {
+			return errors.New("removal attestation omitted deterministic resources")
+		}
+	}
+	return nil
 }
 
 type VerifyScope string

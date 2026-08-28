@@ -163,9 +163,10 @@ CREATE TABLE IF NOT EXISTS spool_acknowledgements (
   sequence INTEGER NOT NULL,
   PRIMARY KEY(attempt_id, stream)
 );
-CREATE TABLE IF NOT EXISTS spool_removals (
-  job_id TEXT PRIMARY KEY,
-  removal_generation INTEGER NOT NULL,
+	CREATE TABLE IF NOT EXISTS spool_removals (
+	  job_id TEXT PRIMARY KEY,
+	  runtime_kind TEXT NOT NULL,
+	  removal_generation INTEGER NOT NULL,
   cleanup_fence TEXT NOT NULL,
   root_instance_id TEXT NOT NULL,
 	  started_ns INTEGER NOT NULL
@@ -204,15 +205,80 @@ CREATE TABLE IF NOT EXISTS spool_removals (
 	  root_instance_id TEXT NOT NULL,
 	  manifest_json BLOB NOT NULL,
 	  runtime_quiescence_json BLOB,
+	  absence_attestation_json BLOB,
 	  phase TEXT NOT NULL,
 	  prepared_ns INTEGER NOT NULL,
 	  quiesced_ns INTEGER,
+	  attested_ns INTEGER,
 	  completed_ns INTEGER
 	);`
 	if _, err := spool.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("agent: initialize log spool: %w", err)
 	}
+	for _, migration := range []struct {
+		table, column, definition string
+	}{
+		{table: "spool_removals", column: "runtime_kind", definition: "TEXT"},
+		{table: "runtime_removal_manifests", column: "absence_attestation_json", definition: "BLOB"},
+		{table: "runtime_removal_manifests", column: "attested_ns", definition: "INTEGER"},
+	} {
+		if err := ensureLogSpoolColumn(ctx, spool.db, migration.table, migration.column, migration.definition); err != nil {
+			return fmt.Errorf("agent: migrate log spool %s.%s: %w", migration.table, migration.column, err)
+		}
+	}
+	// Pre-proof spools did not record the workload kind. Existing OCI
+	// removals can be identified without guessing from their durable runtime
+	// manifest or binding pin; remaining rows are process removals.
+	if _, err := spool.db.ExecContext(ctx, `UPDATE spool_removals
+SET runtime_kind=CASE
+  WHEN EXISTS (SELECT 1 FROM runtime_removal_manifests WHERE runtime_removal_manifests.job_id=spool_removals.job_id)
+    OR EXISTS (SELECT 1 FROM runtime_service_manifests WHERE runtime_service_manifests.job_id=spool_removals.job_id)
+    OR EXISTS (SELECT 1 FROM oci_binding_pins WHERE oci_binding_pins.job_id=spool_removals.job_id)
+  THEN ? ELSE ? END
+WHERE runtime_kind IS NULL OR runtime_kind=''`, contract.JobKindOCI, contract.JobKindProcess); err != nil {
+		return fmt.Errorf("agent: migrate log spool removal kinds: %w", err)
+	}
+	// A pre-proof complete row proves runtime quiescence only. Downgrade it to
+	// quarantined so upgrade recovery must still delete durable data and
+	// persist a post-delete attestation before acknowledging L1.
+	if _, err := spool.db.ExecContext(ctx, `UPDATE runtime_removal_manifests
+SET phase=?, completed_ns=NULL
+WHERE phase=? AND absence_attestation_json IS NULL`, runtimeRemovalQuarantined, runtimeRemovalComplete); err != nil {
+		return fmt.Errorf("agent: migrate pre-attestation runtime removals: %w", err)
+	}
 	return nil
+}
+
+func ensureLogSpoolColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition)
+	return err
 }
 
 func (spool *logSpool) Close() error { return spool.db.Close() }
@@ -287,9 +353,9 @@ func (spool *logSpool) beginRemoval(ctx context.Context, removal localRemoval, s
 	}
 	defer tx.Rollback()
 	response, err := tx.ExecContext(ctx, `INSERT INTO spool_removals(
-job_id, removal_generation, cleanup_fence, root_instance_id, started_ns
-) VALUES(?, ?, ?, ?, ?)
-ON CONFLICT(job_id) DO NOTHING`, removal.jobID, removal.generation, removal.cleanupFence,
+job_id, runtime_kind, removal_generation, cleanup_fence, root_instance_id, started_ns
+) VALUES(?, ?, ?, ?, ?, ?)
+ON CONFLICT(job_id) DO NOTHING`, removal.jobID, removal.kind, removal.generation, removal.cleanupFence,
 		removal.rootInstanceID, startedAt.UTC().Round(0).UnixNano())
 	if err != nil {
 		return fmt.Errorf("agent: persist service removal intent: %w", err)
@@ -298,12 +364,12 @@ ON CONFLICT(job_id) DO NOTHING`, removal.jobID, removal.generation, removal.clea
 		return fmt.Errorf("agent: inspect service removal intent persistence: %w", err)
 	}
 	var generation uint64
-	var cleanupFence, rootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT removal_generation, cleanup_fence, root_instance_id
-FROM spool_removals WHERE job_id=?`, removal.jobID).Scan(&generation, &cleanupFence, &rootInstanceID); err != nil {
+	var kind, cleanupFence, rootInstanceID string
+	if err := tx.QueryRowContext(ctx, `SELECT runtime_kind, removal_generation, cleanup_fence, root_instance_id
+FROM spool_removals WHERE job_id=?`, removal.jobID).Scan(&kind, &generation, &cleanupFence, &rootInstanceID); err != nil {
 		return fmt.Errorf("agent: verify service removal intent: %w", err)
 	}
-	if generation != removal.generation || cleanupFence != removal.cleanupFence || rootInstanceID != removal.rootInstanceID {
+	if kind != removal.kind || generation != removal.generation || cleanupFence != removal.cleanupFence || rootInstanceID != removal.rootInstanceID {
 		return fmt.Errorf("agent: service removal %q conflicts with locally persisted authority", removal.jobID)
 	}
 	frozen, err := spool.freezeRuntimeRemoval(ctx, tx, removal, startedAt)
@@ -326,6 +392,19 @@ func (spool *logSpool) purgeJob(ctx context.Context, jobID string) error {
 		return fmt.Errorf("agent: purge service spool metadata: %w", err)
 	}
 	return nil
+}
+
+func (spool *logSpool) removalIntent(ctx context.Context, jobID string) (localRemoval, bool, error) {
+	var removal localRemoval
+	removal.jobID = jobID
+	if err := spool.db.QueryRowContext(ctx, `SELECT runtime_kind, removal_generation, cleanup_fence, root_instance_id
+FROM spool_removals WHERE job_id=?`, jobID).Scan(&removal.kind, &removal.generation, &removal.cleanupFence, &removal.rootInstanceID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return localRemoval{}, false, nil
+		}
+		return localRemoval{}, false, fmt.Errorf("agent: read durable service removal intent: %w", err)
+	}
+	return removal, true, nil
 }
 
 func (spool *logSpool) completeRemoval(ctx context.Context, removal localRemoval) error {

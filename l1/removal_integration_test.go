@@ -112,7 +112,7 @@ func assertServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
 		t.Fatalf("removal directives = %#v, %v", directives, err)
 	}
 	directive := directives[0]
-	if directive.JobID != job.JobID || directive.RemovalGeneration != 1 ||
+	if directive.JobID != job.JobID || directive.Kind != contract.JobKindProcess || directive.RemovalGeneration != 1 ||
 		directive.RootInstanceID != node.RootInstanceID || directive.CleanupFence == "" {
 		t.Fatalf("removal directive = %#v", directive)
 	}

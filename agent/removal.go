@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
@@ -30,12 +31,18 @@ type removalController struct {
 	loadRuntimeRemoval    func(context.Context, string) (runtimeRemovalRecord, bool, error)
 	listRuntimeRemovals   func(context.Context) ([]runtimeRemovalRecord, error)
 	recordRuntimeQuiesced func(context.Context, localRemoval, workloadrunner.ReapReceipt) error
+	recordRuntimeAttested func(context.Context, localRemoval, workloadrunner.RuntimeRemovalAttestation) error
+	persistRuntimeRemoval func(context.Context, localRemoval, []workloadrunner.RuntimeResourceManifest) error
+	loadRemovalIntent     func(context.Context, string) (localRemoval, bool, error)
 	reapService           func(context.Context, string) (workloadrunner.ReapReceipt, error)
 	clearReap             func(string)
 	purgeJob              func(context.Context, string) error
 	removeResource        func(context.Context, localRemoval) error
 	releaseImagePin       func(context.Context, string) error
 	finalizeVolumes       func(context.Context, workloadrunner.ManagedVolumeFinalizationRequest) error
+	reconstructRuntime    func(context.Context, workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error)
+	deleteRuntimeData     func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error
+	attestRuntimeRemoval  func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error)
 	ackRemoval            func(context.Context, localRemoval) error
 	finishRemoval         func(context.Context, localRemoval) error
 
@@ -62,6 +69,9 @@ func newRemovalController(
 		controller.loadRuntimeRemoval = outbox.runtimeRemoval
 		controller.listRuntimeRemovals = outbox.pendingRuntimeRemovals
 		controller.recordRuntimeQuiesced = outbox.recordRuntimeQuiesced
+		controller.recordRuntimeAttested = outbox.recordRuntimeAttested
+		controller.persistRuntimeRemoval = outbox.storeReconstructedRuntimeRemoval
+		controller.loadRemovalIntent = outbox.removalIntent
 		controller.purgeJob = outbox.purgeJob
 		controller.finishRemoval = outbox.completeRemoval
 	}
@@ -120,8 +130,14 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 		return fmt.Errorf("removal directive belongs to node %q, not %q", directive.BoundNodeID, controller.nodeID)
 	}
 	removal := localRemoval{
-		jobID: directive.JobID, generation: directive.RemovalGeneration,
+		jobID: directive.JobID, kind: directive.Kind, generation: directive.RemovalGeneration,
 		rootInstanceID: directive.RootInstanceID, cleanupFence: directive.CleanupFence,
+	}
+	if removal.kind != contract.JobKindProcess && removal.kind != contract.JobKindOCI {
+		return fmt.Errorf("removal directive for service %q has invalid workload kind %q", directive.JobID, removal.kind)
+	}
+	if directive.ComputerStorage != nil && removal.kind != contract.JobKindOCI {
+		return fmt.Errorf("agent: Computer removal for service %q requires OCI workload kind", directive.JobID)
 	}
 	// This FULL-synchronous SQLite write must precede any signal sent to the
 	// guardian. A crash after it leaves an unambiguous local removing record.
@@ -133,33 +149,19 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 		if err != nil {
 			return err
 		}
-		if found {
-			computerStorage, err := removalComputerStorage(runtimeRemoval.manifest, directive.ComputerStorage)
+		if !found && removal.kind == contract.JobKindOCI {
+			runtimeRemoval, err = controller.reconstructAndPersistRuntimeRemoval(ctx, removal, computerStorageFromClaim(directive.ComputerStorage))
 			if err != nil {
 				return err
 			}
-			switch runtimeRemoval.phase {
-			case runtimeRemovalComplete:
-				// Runtime preparation is complete; continue through the existing
-				// removal path so #150 remains additive to working cleanup.
-			case runtimeRemovalQuarantined:
-				if err := controller.recordRuntimeQuiesced(ctx, removal, runtimeRemoval.receipt); err != nil {
-					return err
-				}
-			case runtimeRemovalPrepared:
-				receipt, err := controller.reapService(ctx, directive.JobID)
-				if err != nil {
-					return err
-				}
-				if err := controller.recordRuntimeQuiesced(ctx, removal, receipt); err != nil {
-					return err
-				}
-			default:
-				return fmt.Errorf("service %q runtime removal has invalid phase %q", directive.JobID, runtimeRemoval.phase)
-			}
-			removal.processTreeReaped = true
-			return controller.completeLocalRemoval(ctx, removal, computerStorage)
+			found = true
 		}
+		if found {
+			return controller.continueRuntimeRemoval(ctx, removal, &runtimeRemoval, directive.ComputerStorage)
+		}
+	}
+	if removal.kind == contract.JobKindOCI {
+		return fmt.Errorf("agent: legacy OCI removal %q has no persisted helper-owned inventory", removal.jobID)
 	}
 	receipt, err := controller.reapService(ctx, directive.JobID)
 	if err != nil {
@@ -171,17 +173,18 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	// Services created before runtime manifests were introduced retain the
 	// legacy boolean as their crash-resume compatibility marker.
 	removal.processTreeReaped = true
-	return controller.completeLocalRemoval(ctx, removal, computerStorageFromClaim(directive.ComputerStorage))
+	return controller.completeLocalRemoval(ctx, removal, nil, computerStorageFromClaim(directive.ComputerStorage))
 }
 
-func (controller *removalController) completeLocalRemoval(ctx context.Context, removal localRemoval, computerStorage *workloadrunner.ComputerStorage) error {
+func (controller *removalController) completeLocalRemoval(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, computerStorage *workloadrunner.ComputerStorage) error {
 	if err := controller.purgeJob(ctx, removal.jobID); err != nil {
 		return err
 	}
 	if err := controller.removeResource(ctx, removal); err != nil {
 		return fmt.Errorf("delete managed service resource: %w", err)
 	}
-	if computerStorage != nil {
+	needsRuntimeProof := removal.kind == contract.JobKindOCI && (runtimeRemoval == nil || runtimeRemoval.phase != runtimeRemovalComplete)
+	if computerStorage != nil && needsRuntimeProof {
 		if controller.finalizeVolumes == nil {
 			return errors.New("Computer removal requires OCI disk finalization")
 		}
@@ -190,6 +193,43 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 			Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID, RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence},
 		}); err != nil {
 			return fmt.Errorf("delete Computer disk resource: %w", err)
+		}
+	}
+	if removal.kind == contract.JobKindOCI {
+		if needsRuntimeProof {
+			if controller.deleteRuntimeData == nil || controller.attestRuntimeRemoval == nil {
+				return errors.New("OCI service removal proof runtime is unavailable")
+			}
+			attempts := []workloadrunner.RuntimeResourceManifest(nil)
+			if runtimeRemoval != nil {
+				attempts = runtimeRemoval.manifest.Attempts
+			}
+			proofRequest := workloadrunner.RuntimeRemovalProofRequest{
+				NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID,
+				RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence,
+				ComputerStorage: computerStorage, Attempts: attempts,
+			}
+			if err := controller.deleteRuntimeData(ctx, proofRequest); err != nil {
+				return fmt.Errorf("delete OCI service data: %w", err)
+			}
+			attestation, err := controller.attestRuntimeRemoval(ctx, proofRequest)
+			if err != nil {
+				return fmt.Errorf("attest deleted OCI service resources: %w", err)
+			}
+			manifest := runtimeRemovalManifest{Version: 1, JobID: removal.jobID, RemovalGeneration: removal.generation, Attempts: attestation.Attempts}
+			if runtimeRemoval != nil {
+				manifest = runtimeRemoval.manifest
+			}
+			if err := validateRuntimeRemovalAttestation(manifest, attestation); err != nil {
+				return err
+			}
+			if runtimeRemoval != nil {
+				if err := controller.recordRuntimeAttested(ctx, removal, attestation); err != nil {
+					return err
+				}
+				runtimeRemoval.phase = runtimeRemovalComplete
+				runtimeRemoval.attestation = attestation
+			}
 		}
 	}
 	if controller.releaseImagePin != nil {
@@ -207,6 +247,65 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 		controller.clearReap(removal.jobID)
 	}
 	return nil
+}
+
+func (controller *removalController) reconstructAndPersistRuntimeRemoval(ctx context.Context, removal localRemoval, computerStorage *workloadrunner.ComputerStorage) (runtimeRemovalRecord, error) {
+	if controller.reconstructRuntime == nil || controller.persistRuntimeRemoval == nil || controller.loadRuntimeRemoval == nil {
+		return runtimeRemovalRecord{}, errors.New("agent: legacy OCI removal inventory reconstruction is unavailable")
+	}
+	request := workloadrunner.RuntimeRemovalProofRequest{
+		NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID,
+		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence, ComputerStorage: computerStorage,
+	}
+	attempts, err := controller.reconstructRuntime(ctx, request)
+	if err != nil {
+		return runtimeRemovalRecord{}, fmt.Errorf("agent: legacy OCI removal %q remains pending because helper inventory reconstruction failed: %w", removal.jobID, err)
+	}
+	if err := controller.persistRuntimeRemoval(ctx, removal, attempts); err != nil {
+		return runtimeRemovalRecord{}, err
+	}
+	record, found, err := controller.loadRuntimeRemoval(ctx, removal.jobID)
+	if err != nil {
+		return runtimeRemovalRecord{}, err
+	}
+	if !found {
+		return runtimeRemovalRecord{}, errors.New("agent: reconstructed OCI removal manifest disappeared after persistence")
+	}
+	return record, nil
+}
+
+func (controller *removalController) continueRuntimeRemoval(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, claim *l1.ComputerStorageClaim) error {
+	computerStorage, err := removalComputerStorage(runtimeRemoval.manifest, claim)
+	if err != nil {
+		return err
+	}
+	if computerStorage != nil && removal.kind != contract.JobKindOCI {
+		return errors.New("agent: frozen Computer removal inventory requires OCI workload kind")
+	}
+	switch runtimeRemoval.phase {
+	case runtimeRemovalComplete:
+		// The post-delete receipt is already durable; continue to pin release
+		// and L1 acknowledgement without repeating helper mutation or proof.
+	case runtimeRemovalQuarantined:
+		// Runtime quiescence is durable; local and helper deletion may resume.
+	case runtimeRemovalPrepared:
+		receipt, err := controller.reapService(ctx, removal.jobID)
+		if err != nil {
+			return err
+		}
+		if !receipt.RuntimeQuiesced || receipt.Evidence == "" {
+			return fmt.Errorf("service %q removal has no positive runtime reap receipt", removal.jobID)
+		}
+		if err := controller.recordRuntimeQuiesced(ctx, removal, receipt); err != nil {
+			return err
+		}
+		runtimeRemoval.receipt = receipt
+		runtimeRemoval.phase = runtimeRemovalQuarantined
+	default:
+		return fmt.Errorf("service %q runtime removal has invalid phase %q", removal.jobID, runtimeRemoval.phase)
+	}
+	removal.processTreeReaped = true
+	return controller.completeLocalRemoval(ctx, removal, runtimeRemoval, computerStorage)
 }
 
 // prepareAuthorityLoss closes the renewal-vs-heartbeat race for a running
@@ -230,7 +329,7 @@ func (controller *removalController) prepareAuthorityLoss(ctx context.Context, j
 			return fmt.Errorf("removal directive belongs to node %q, not %q", directive.BoundNodeID, controller.nodeID)
 		}
 		return controller.outbox.beginRemoval(ctx, localRemoval{
-			jobID: directive.JobID, generation: directive.RemovalGeneration,
+			jobID: directive.JobID, kind: directive.Kind, generation: directive.RemovalGeneration,
 			rootInstanceID: directive.RootInstanceID, cleanupFence: directive.CleanupFence,
 		})
 	}
@@ -247,34 +346,7 @@ func (controller *removalController) resume(ctx context.Context) error {
 			return fmt.Errorf("resume runtime service removals: %w", err)
 		}
 		for _, record := range removals {
-			switch record.phase {
-			case runtimeRemovalComplete:
-				// Runtime quiescence is already durable; finish the legacy cleanup
-				// sequence and prune the complete record.
-			case runtimeRemovalQuarantined:
-				if err := controller.recordRuntimeQuiesced(ctx, record.removal, record.receipt); err != nil {
-					return err
-				}
-			case runtimeRemovalPrepared:
-				receipt, err := controller.reapService(ctx, record.removal.jobID)
-				if err != nil {
-					return err
-				}
-				if !receipt.RuntimeQuiesced || receipt.Evidence == "" {
-					return fmt.Errorf("service %q removal has no positive runtime reap receipt", record.removal.jobID)
-				}
-				if err := controller.recordRuntimeQuiesced(ctx, record.removal, receipt); err != nil {
-					return err
-				}
-			default:
-				return fmt.Errorf("service %q runtime removal has invalid phase %q", record.removal.jobID, record.phase)
-			}
-			record.removal.processTreeReaped = true
-			computerStorage, err := removalComputerStorage(record.manifest, nil)
-			if err != nil {
-				return err
-			}
-			if err := controller.completeLocalRemoval(ctx, record.removal, computerStorage); err != nil {
+			if err := controller.continueRuntimeRemoval(ctx, record.removal, &record, nil); err != nil {
 				return err
 			}
 		}
@@ -287,6 +359,36 @@ func (controller *removalController) resume(ctx context.Context) error {
 		return fmt.Errorf("resume managed service removals: %w", err)
 	}
 	for _, removal := range completed {
+		if controller.loadRemovalIntent == nil {
+			return errors.New("resume managed service removal requires durable runtime-kind intent")
+		}
+		intent, found, err := controller.loadRemovalIntent(ctx, removal.jobID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			// managedroot tombstones are permanent. Once the matching durable
+			// intent has been released, this historical completion is done.
+			continue
+		}
+		intent.processTreeReaped = removal.processTreeReaped
+		removal = intent
+		if removal.kind == contract.JobKindOCI {
+			record, found, err := controller.loadRuntimeRemoval(ctx, removal.jobID)
+			if err != nil {
+				return err
+			}
+			if !found {
+				record, err = controller.reconstructAndPersistRuntimeRemoval(ctx, removal, nil)
+				if err != nil {
+					return err
+				}
+			}
+			if err := controller.continueRuntimeRemoval(ctx, removal, &record, nil); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := controller.purgeJob(ctx, removal.jobID); err != nil {
 			return err
 		}

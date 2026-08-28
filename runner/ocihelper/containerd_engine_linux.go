@@ -1334,7 +1334,8 @@ func validateRuntimeResourceLabels(kind, observedID, expectedID string, labels m
 }
 
 func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
-	if request.Kind == ManagedVolumeComputerDisk {
+	switch request.Kind {
+	case ManagedVolumeComputerDisk:
 		if request.ComputerStorage == nil || request.Removal == nil {
 			return DeleteManagedVolumeResponse{}, errors.New("Computer disk deletion requires Storage and removal authority")
 		}
@@ -1342,24 +1343,329 @@ func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request
 			return DeleteManagedVolumeResponse{}, err
 		}
 		return DeleteManagedVolumeResponse{Deleted: true}, nil
-	}
-	if request.Kind != ManagedVolumeHandoff {
+	case ManagedVolumeHandoff:
+		name, err := DeterministicHandoffVolumeDirectory(request.OwnerKey)
+		if err != nil {
+			return DeleteManagedVolumeResponse{}, err
+		}
+		path := filepath.Join(engine.config.RuntimeRoot, "handoffs", name)
+		if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return DeleteManagedVolumeResponse{}, err
+		}
+		if err := requirePathAbsent(path, "handoff managed volume"); err != nil {
+			return DeleteManagedVolumeResponse{}, err
+		}
+		return DeleteManagedVolumeResponse{Deleted: true}, nil
+	case ManagedVolumeServiceData:
+		if request.Removal == nil || request.Removal.JobID != request.OwnerKey || request.Removal.NodeID == "" || request.Removal.BootSessionID == "" || request.Removal.RemovalGeneration == 0 || request.Removal.CleanupFence == "" {
+			return DeleteManagedVolumeResponse{}, errors.New("service data deletion requires exact removal authority")
+		}
+		if err := engine.deleteServiceDataVolume(request.OwnerKey); err != nil {
+			return DeleteManagedVolumeResponse{}, err
+		}
+		return DeleteManagedVolumeResponse{Deleted: true}, nil
+	default:
 		return DeleteManagedVolumeResponse{}, fmt.Errorf("managed volume kind %q cannot be finalized", request.Kind)
 	}
-	name, err := DeterministicHandoffVolumeDirectory(request.OwnerKey)
+}
+
+func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request InventoryRemovalRequest) (InventoryRemovalResponse, error) {
+	ctx = engineContext(ctx)
+	inventory, err := engine.inventory(ctx)
 	if err != nil {
-		return DeleteManagedVolumeResponse{}, err
+		return InventoryRemovalResponse{}, err
 	}
-	path := filepath.Join(engine.config.RuntimeRoot, "handoffs", name)
-	if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return DeleteManagedVolumeResponse{}, err
+	authorities := make(map[string]AttemptAuthority)
+	add := func(authority AttemptAuthority, kind, observedID string) error {
+		if authority.JobID != request.Removal.JobID {
+			return nil
+		}
+		if authority.NodeID != request.Removal.NodeID || authority.Class != contract.JobClassService || authority.RemovalGeneration != fmt.Sprint(request.Removal.RemovalGeneration) {
+			return fmt.Errorf("legacy removal found %s %q with conflicting authority", kind, observedID)
+		}
+		identity, identityErr := DeterministicResourceIdentity(authority)
+		if identityErr != nil {
+			return identityErr
+		}
+		var expectedID string
+		switch kind {
+		case "lease":
+			expectedID = identity.LeaseID
+		case "snapshot":
+			expectedID = identity.SnapshotID
+		case "container":
+			expectedID = identity.ContainerID
+		case "computer":
+			expectedID = observedID
+		default:
+			return fmt.Errorf("legacy removal inventory class %q is unsupported", kind)
+		}
+		if expectedID != observedID {
+			return fmt.Errorf("legacy removal %s %q does not match deterministic authority %q", kind, observedID, expectedID)
+		}
+		authorities[authority.key()] = authority
+		return nil
 	}
+	leases, err := engine.client.LeasesService().List(ctx)
+	if err != nil {
+		return InventoryRemovalResponse{}, err
+	}
+	for _, lease := range leases {
+		if !strings.HasPrefix(lease.ID, "wefty-lease-") {
+			continue
+		}
+		authority, labelErr := authorityFromLabels(lease.Labels)
+		if labelErr != nil {
+			return InventoryRemovalResponse{}, labelErr
+		}
+		if err := add(authority, "lease", lease.ID); err != nil {
+			return InventoryRemovalResponse{}, err
+		}
+	}
+	if err := engine.client.SnapshotService(DefaultSnapshotter).Walk(ctx, func(_ context.Context, info snapshots.Info) error {
+		if !strings.HasPrefix(info.Name, "wefty-snapshot-") {
+			return nil
+		}
+		authority, labelErr := authorityFromLabels(info.Labels)
+		if labelErr != nil {
+			return labelErr
+		}
+		return add(authority, "snapshot", info.Name)
+	}); err != nil {
+		return InventoryRemovalResponse{}, err
+	}
+	containers, err := engine.client.Containers(ctx)
+	if err != nil {
+		return InventoryRemovalResponse{}, err
+	}
+	for _, container := range containers {
+		if !strings.HasPrefix(container.ID(), "wefty-container-") {
+			continue
+		}
+		info, infoErr := container.Info(ctx)
+		if infoErr != nil {
+			return InventoryRemovalResponse{}, infoErr
+		}
+		authority, labelErr := authorityFromLabels(info.Labels)
+		if labelErr != nil {
+			return InventoryRemovalResponse{}, labelErr
+		}
+		if err := add(authority, "container", info.ID); err != nil {
+			return InventoryRemovalResponse{}, err
+		}
+	}
+	var computerStorage *ComputerStorageReference
+	if request.ComputerStorage != nil {
+		name, nameErr := DeterministicComputerDiskName(*request.ComputerStorage)
+		if nameErr != nil {
+			return InventoryRemovalResponse{}, nameErr
+		}
+		for _, anomaly := range inventory.ComputerDiskAnomalies {
+			if strings.HasPrefix(anomaly, name+":") {
+				return InventoryRemovalResponse{}, fmt.Errorf("legacy Computer removal inventory is anomalous: %s", anomaly)
+			}
+		}
+		root := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+		manifest, present, manifestErr := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
+		if manifestErr != nil || !present {
+			return InventoryRemovalResponse{}, errors.Join(manifestErr, errors.New("legacy Computer removal has no readable disk manifest"))
+		}
+		if !sameComputerStorageIdentity(manifest.Storage, *request.ComputerStorage) {
+			return InventoryRemovalResponse{}, errors.New("legacy Computer removal disk manifest does not match L1 Storage identity")
+		}
+		storage := manifest.Storage
+		computerStorage = &storage
+		for _, authority := range []*AttemptAuthority{manifest.Attached, manifest.Pending} {
+			if authority != nil {
+				if err := add(*authority, "computer", name); err != nil {
+					return InventoryRemovalResponse{}, err
+				}
+			}
+		}
+	}
+	if len(authorities) == 0 {
+		return InventoryRemovalResponse{}, errors.New("legacy OCI removal current scan found no matching helper-owned attempt authority")
+	}
+	attempts := make([]RemovalAttemptManifest, 0, len(authorities))
+	for _, authority := range authorities {
+		identity, identityErr := DeterministicResourceIdentity(authority)
+		if identityErr != nil {
+			return InventoryRemovalResponse{}, identityErr
+		}
+		attempts = append(attempts, RemovalAttemptManifest{
+			Authority: authority, ComputerStorage: computerStorage,
+			Resources: ExpectedRemovalResources(identity, "", computerStorage),
+		})
+	}
+	sort.Slice(attempts, func(i, j int) bool { return attempts[i].Authority.AttemptID < attempts[j].Authority.AttemptID })
+	return InventoryRemovalResponse{Attempts: attempts}, nil
+}
+
+func (engine *ContainerdEngine) deleteServiceDataVolume(jobID string) error {
+	name, err := DeterministicServiceVolumeDirectory(jobID)
+	if err != nil {
+		return err
+	}
+	engine.serviceVolumeMu.Lock()
+	defer engine.serviceVolumeMu.Unlock()
+	volumeRoot := filepath.Join(engine.config.RuntimeRoot, "service-data")
+	stateRoot := filepath.Join(engine.config.RuntimeRoot, "service-data-state")
+	volumePath := filepath.Join(volumeRoot, name)
+	recordPath := filepath.Join(stateRoot, name+".owner")
+	info, statErr := os.Lstat(volumePath)
+	if statErr == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("service data volume is not a helper-owned directory")
+		}
+		payload, readErr := os.ReadFile(recordPath)
+		if readErr != nil {
+			return fmt.Errorf("read service data owner record before deletion: %w", readErr)
+		}
+		var record serviceVolumeOwnerRecord
+		if json.Unmarshal(payload, &record) != nil || record.Version != 1 {
+			return errors.New("service data owner record is invalid before deletion")
+		}
+		file, openErr := os.OpenFile(volumePath, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+		if openErr != nil {
+			return fmt.Errorf("open service data volume before deletion: %w", openErr)
+		}
+		var stat unix.Stat_t
+		inspectErr := unix.Fstat(int(file.Fd()), &stat)
+		closeErr := file.Close()
+		if inspectErr != nil || closeErr != nil {
+			return errors.Join(inspectErr, closeErr)
+		}
+		if record.Device != uint64(stat.Dev) || record.Inode != stat.Ino {
+			return errors.New("service data owner record does not match the directory selected for deletion")
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	if err := os.RemoveAll(volumePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := requirePathAbsent(volumePath, "service data volume"); err != nil {
+		return err
+	}
+	if err := os.Remove(recordPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := requirePathAbsent(recordPath, "service data owner record"); err != nil {
+		return err
+	}
+	return errors.Join(syncDirectoryIfPresent(volumeRoot), syncDirectoryIfPresent(stateRoot))
+}
+
+func requirePathAbsent(path, description string) error {
 	if _, err := os.Lstat(path); err == nil {
-		return DeleteManagedVolumeResponse{}, errors.New("handoff managed volume remains after deletion")
+		return fmt.Errorf("%s remains after deletion", description)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return DeleteManagedVolumeResponse{}, err
+		return err
 	}
-	return DeleteManagedVolumeResponse{Deleted: true}, nil
+	return nil
+}
+
+func syncDirectoryIfPresent(path string) error {
+	directory, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
+}
+
+func (engine *ContainerdEngine) AttestRemoval(ctx context.Context, request AttestRemovalRequest) (AttestRemovalResponse, error) {
+	if len(request.Attempts) == 0 {
+		return AttestRemovalResponse{}, errors.New("removal attestation requires reconstructed attempts")
+	}
+	inventory, err := engine.inventory(engineContext(ctx))
+	if err != nil {
+		return AttestRemovalResponse{}, err
+	}
+	return attestRemovalInventory(inventory, request)
+}
+
+func attestRemovalInventory(inventory ResourceInventory, request AttestRemovalRequest) (AttestRemovalResponse, error) {
+	seen := make(map[RemovalResource]struct{})
+	assertions := make([]RemovalAssertion, 0)
+	for _, attempt := range request.Attempts {
+		for _, resource := range attempt.Resources {
+			if _, duplicate := seen[resource]; duplicate {
+				continue
+			}
+			if err := assertRemovalResourceAbsent(inventory, resource); err != nil {
+				return AttestRemovalResponse{}, err
+			}
+			seen[resource] = struct{}{}
+			assertions = append(assertions, RemovalAssertion{Class: resource.Class, ID: resource.ID, Absent: true})
+		}
+	}
+	return AttestRemovalResponse{Assertions: assertions}, nil
+}
+
+func assertRemovalResourceAbsent(inventory ResourceInventory, resource RemovalResource) error {
+	var values []string
+	contains := func(value string) bool { return value == resource.ID }
+	computerClass := false
+	switch resource.Class {
+	case RemovalResourceLease:
+		values = inventory.Leases
+	case RemovalResourceSnapshot:
+		values = inventory.Snapshots
+	case RemovalResourceContainer:
+		values = inventory.Containers
+	case RemovalResourceTask:
+		values = inventory.Tasks
+	case RemovalResourceShim:
+		values = inventory.Shims
+	case RemovalResourceCgroup:
+		values = inventory.Cgroups
+		contains = func(value string) bool { return value == resource.ID || strings.Contains(value, resource.ID) }
+	case RemovalResourceLogSegments:
+		values = inventory.LogSegments
+	case RemovalResourceHandoffVolume, RemovalResourceServiceData:
+		values = inventory.ManagedVolumes
+	case RemovalResourceServiceDataRecord:
+		values = inventory.ManagedVolumeRecords
+	case RemovalResourceComputerDiskImage:
+		computerClass = true
+		values = inventory.ComputerDiskImages
+	case RemovalResourceComputerDiskAllocation:
+		computerClass = true
+		values = inventory.ComputerDiskAllocations
+	case RemovalResourceComputerDiskQuota:
+		computerClass = true
+		values = inventory.ComputerDiskQuotas
+	case RemovalResourceComputerDiskManifest:
+		computerClass = true
+		values = inventory.ComputerDiskManifests
+	case RemovalResourceComputerDiskMount:
+		computerClass = true
+		values = inventory.ComputerDiskMounts
+	case RemovalResourceComputerDiskLoop:
+		computerClass = true
+		values = inventory.ComputerDiskLoops
+	case RemovalResourceComputerAttachment:
+		computerClass = true
+		values = inventory.ComputerAttachments
+	default:
+		return fmt.Errorf("removal resource class %q is unsupported", resource.Class)
+	}
+	if computerClass {
+		for _, anomaly := range inventory.ComputerDiskAnomalies {
+			if strings.HasPrefix(anomaly, resource.ID+":") {
+				return fmt.Errorf("removal resource %s/%s has inventory anomaly %q", resource.Class, resource.ID, anomaly)
+			}
+		}
+	}
+	for _, value := range values {
+		if contains(value) {
+			return fmt.Errorf("removal resource %s/%s remains", resource.Class, resource.ID)
+		}
+	}
+	return nil
 }
 
 func (engine *ContainerdEngine) ReapAttempt(ctx context.Context, authority AttemptAuthority) error {
@@ -1628,7 +1934,7 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 			logDirectory,
 			// M3 handoffs now live under the durable handoffs root. Sweep this
 			// legacy attempt-scoped location so upgrades do not strand residue.
-			filepath.Join(engine.config.RuntimeRoot, "volumes", identity.HandoffVolumeDirectory),
+			filepath.Join(engine.config.RuntimeRoot, "handoffs", identity.HandoffVolumeDirectory),
 		} {
 			if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return SweepResponse{}, err
@@ -2470,7 +2776,7 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 }
 
 func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInventory) error {
-	volumeEntries, err := readDirectoryIfPresent(filepath.Join(runtimeRoot, "volumes"))
+	volumeEntries, err := readDirectoryIfPresent(filepath.Join(runtimeRoot, "handoffs"))
 	if err != nil {
 		return err
 	}
@@ -2518,7 +2824,7 @@ func filterInventory(inventory ResourceInventory, resources ResourceIdentity, at
 			values []string
 			target string
 			output *[]string
-		}{{inventory.ComputerDiskImages, attachment.name, &filtered.ComputerDiskImages}, {inventory.ComputerDiskAllocations, attachment.name, &filtered.ComputerDiskAllocations}, {inventory.ComputerDiskQuotas, attachment.name, &filtered.ComputerDiskQuotas}, {inventory.ComputerDiskManifests, attachment.name, &filtered.ComputerDiskManifests}, {inventory.ComputerDiskMounts, attachment.name, &filtered.ComputerDiskMounts}, {inventory.ComputerDiskLoops, attachment.loopDevice, &filtered.ComputerDiskLoops}, {inventory.ComputerAttachments, attachment.name, &filtered.ComputerAttachments}} {
+		}{{inventory.ComputerDiskImages, attachment.name, &filtered.ComputerDiskImages}, {inventory.ComputerDiskAllocations, attachment.name, &filtered.ComputerDiskAllocations}, {inventory.ComputerDiskQuotas, attachment.name, &filtered.ComputerDiskQuotas}, {inventory.ComputerDiskManifests, attachment.name, &filtered.ComputerDiskManifests}, {inventory.ComputerDiskMounts, attachment.name, &filtered.ComputerDiskMounts}, {inventory.ComputerDiskLoops, attachment.name, &filtered.ComputerDiskLoops}, {inventory.ComputerAttachments, attachment.name, &filtered.ComputerAttachments}} {
 			for _, value := range pair.values {
 				if value == pair.target {
 					*pair.output = append(*pair.output, value)

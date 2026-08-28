@@ -501,10 +501,11 @@
       "RemovalDirective": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["job_id", "bound_node_id", "removal_generation", "cleanup_fence", "root_instance_id"],
+        "required": ["job_id", "bound_node_id", "kind", "removal_generation", "cleanup_fence", "root_instance_id"],
         "properties": {
           "job_id": { "type": "string" },
           "bound_node_id": { "type": "string" },
+          "kind": { "type": "string", "enum": ["process", "oci"] },
           "removal_generation": { "type": "integer", "minimum": 1 },
           "cleanup_fence": { "type": "string", "minLength": 1 },
           "root_instance_id": { "type": "string", "minLength": 1 }

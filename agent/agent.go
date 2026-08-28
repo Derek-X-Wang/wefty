@@ -215,12 +215,16 @@ func New(config Config) (*Agent, error) {
 	}
 	var ociImagePins workloadrunner.OCIImagePinRuntime
 	var managedVolumeFinalizer workloadrunner.ManagedVolumeFinalizer
+	var ociRemovalProof workloadrunner.RuntimeRemovalProofRuntime
 	if runtimeAdapter, configured := runtimes.selectKind(contract.JobKindOCI); configured {
 		if pinRuntime, supported := runtimeAdapter.(workloadrunner.OCIImagePinRuntime); supported {
 			pinRuntime.SetOCIImageBindingPinLedger(outbox.spool)
 			ociImagePins = pinRuntime
 		}
 		managedVolumeFinalizer, _ = runtimeAdapter.(workloadrunner.ManagedVolumeFinalizer)
+		if proofRuntime, supported := runtimeAdapter.(workloadrunner.RuntimeRemovalProofRuntime); supported {
+			ociRemovalProof = proofRuntime
+		}
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
@@ -276,6 +280,11 @@ func New(config Config) (*Agent, error) {
 	}
 	if managedVolumeFinalizer != nil {
 		session.removals.finalizeVolumes = managedVolumeFinalizer.FinalizeManagedVolumes
+	}
+	if ociRemovalProof != nil {
+		session.removals.reconstructRuntime = ociRemovalProof.ReconstructRuntimeRemoval
+		session.removals.deleteRuntimeData = ociRemovalProof.DeleteRuntimeRemovalData
+		session.removals.attestRuntimeRemoval = ociRemovalProof.AttestRuntimeRemoval
 	}
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),

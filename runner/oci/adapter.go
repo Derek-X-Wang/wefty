@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -289,6 +290,216 @@ func (adapter *Adapter) ReleaseOCIImageBindingPin(ctx context.Context, jobID str
 		return err
 	}
 	return ledger.DeleteOCIImageBindingPin(ctx, jobID)
+}
+
+func (adapter *Adapter) DeleteRuntimeRemovalData(ctx context.Context, request workloadrunner.RuntimeRemovalProofRequest) error {
+	if adapter == nil || adapter.sessions == nil || strings.TrimSpace(request.NodeID) == "" || strings.TrimSpace(request.BootSessionID) == "" ||
+		strings.TrimSpace(request.JobID) == "" || request.RemovalGeneration == 0 || strings.TrimSpace(request.CleanupFence) == "" || len(request.Attempts) == 0 {
+		return errors.New("OCI removal deletion requires a configured runtime, job, and generation")
+	}
+	session, _, err := adapter.sessions.ExecutionSnapshot()
+	if err != nil {
+		return err
+	}
+	computer := false
+	for index, attempt := range request.Attempts {
+		if index == 0 {
+			computer = attempt.ComputerStorage != nil
+		}
+		if (attempt.ComputerStorage != nil) != computer {
+			return errors.New("OCI removal manifests mix durable service-data classes")
+		}
+	}
+	if computer {
+		// Computer disk deletion is already performed through the helper with
+		// exact L1 cleanup authority; the following attestation independently
+		// verifies every disk inventory class absent.
+		return nil
+	}
+	removal := &ocihelper.ManagedVolumeRemovalAuthority{
+		NodeID: request.NodeID, BootSessionID: request.BootSessionID, JobID: request.JobID,
+		RemovalGeneration: request.RemovalGeneration, CleanupFence: request.CleanupFence,
+	}
+	response, err := session.DeleteManagedVolume(ctx, ocihelper.DeleteManagedVolumeRequest{
+		Kind: ocihelper.ManagedVolumeServiceData, OwnerKey: request.JobID, Removal: removal,
+	})
+	if err != nil {
+		return err
+	}
+	if !response.Deleted {
+		return errors.New("OCI helper did not positively delete service data")
+	}
+	return nil
+}
+
+// AttestRuntimeRemoval independently inventories every frozen runtime-resource
+// row after service-data deletion and before the agent may acknowledge cleanup
+// to L1.
+func (adapter *Adapter) AttestRuntimeRemoval(ctx context.Context, request workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+	if adapter == nil || adapter.sessions == nil || strings.TrimSpace(request.JobID) == "" || request.RemovalGeneration == 0 || len(request.Attempts) == 0 {
+		return workloadrunner.RuntimeRemovalAttestation{}, errors.New("OCI removal proof requires a configured runtime, job, and generation")
+	}
+	attempts := slices.Clone(request.Attempts)
+	helperAttempts := make([]ocihelper.RemovalAttemptManifest, 0, len(attempts))
+	for _, attempt := range attempts {
+		if attempt.RuntimeKind != contract.JobKindOCI || attempt.JobID != request.JobID || attempt.WorkloadClass != contract.JobClassService ||
+			attempt.RemovalGeneration != fmt.Sprint(request.RemovalGeneration) {
+			return workloadrunner.RuntimeRemovalAttestation{}, errors.New("OCI removal proof manifest does not match the requested job and generation")
+		}
+		resources := attempt.RemovalResources()
+		helperResources := make([]ocihelper.RemovalResource, 0, len(resources))
+		for _, resource := range resources {
+			helperResources = append(helperResources, ocihelper.RemovalResource{Class: ocihelper.RemovalResourceClass(resource.Class), ID: resource.ID})
+		}
+		var computerStorage *ocihelper.ComputerStorageReference
+		if attempt.ComputerStorage != nil {
+			computerStorage = &ocihelper.ComputerStorageReference{
+				ComputerID: attempt.ComputerStorage.ComputerID, StorageID: attempt.ComputerStorage.StorageID,
+				StorageGeneration: attempt.ComputerStorage.StorageGeneration, DiskBytes: attempt.ComputerStorage.DiskBytes,
+			}
+		}
+		helperAttempts = append(helperAttempts, ocihelper.RemovalAttemptManifest{
+			Authority: HelperAuthority(workloadrunner.AttemptAuthority{
+				NodeID: attempt.NodeID, BootSessionID: attempt.BootSessionID, JobID: attempt.JobID,
+				AttemptID: attempt.AttemptID, FencingToken: attempt.FencingToken,
+				WorkloadClass: attempt.WorkloadClass, RemovalGeneration: attempt.RemovalGeneration,
+			}),
+			HandoffVolume: attempt.HandoffVolume, ComputerStorage: computerStorage,
+			Resources: helperResources,
+		})
+	}
+	session, _, err := adapter.sessions.ExecutionSnapshot()
+	if err != nil {
+		return workloadrunner.RuntimeRemovalAttestation{}, err
+	}
+	generation := helperSession(session)
+	response, err := session.AttestRemoval(ctx, ocihelper.AttestRemovalRequest{
+		JobID: request.JobID, RemovalGeneration: fmt.Sprint(request.RemovalGeneration), Attempts: helperAttempts,
+	})
+	if err != nil {
+		return workloadrunner.RuntimeRemovalAttestation{}, err
+	}
+	if err := validateHelperRemovalAttestation(request, helperAttempts, response, generation); err != nil {
+		return workloadrunner.RuntimeRemovalAttestation{}, err
+	}
+	assertions := make([]workloadrunner.RuntimeRemovalAssertion, 0, len(response.Assertions))
+	for _, assertion := range response.Assertions {
+		assertions = append(assertions, workloadrunner.RuntimeRemovalAssertion{
+			Class: workloadrunner.RuntimeRemovalResourceClass(assertion.Class), ID: assertion.ID, Absent: assertion.Absent,
+		})
+	}
+	return workloadrunner.RuntimeRemovalAttestation{
+		Version: 1, JobID: request.JobID, RemovalGeneration: request.RemovalGeneration,
+		RuntimeInstanceID: response.HelperSession.HelperInstanceID, RuntimeGeneration: response.HelperSession.SessionGeneration,
+		Attempts: attempts, Assertions: assertions,
+	}, nil
+}
+
+func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error) {
+	if adapter == nil || adapter.sessions == nil || request.NodeID == "" || request.BootSessionID == "" || request.JobID == "" || request.RemovalGeneration == 0 || request.CleanupFence == "" {
+		return nil, errors.New("legacy OCI removal inventory requires exact durable removal authority")
+	}
+	session, _, err := adapter.sessions.ExecutionSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	var computerStorage *ocihelper.ComputerStorageReference
+	if request.ComputerStorage != nil {
+		computerStorage = &ocihelper.ComputerStorageReference{
+			ComputerID: request.ComputerStorage.ComputerID, StorageID: request.ComputerStorage.StorageID,
+			StorageGeneration: request.ComputerStorage.StorageGeneration, DiskBytes: request.ComputerStorage.DiskBytes,
+		}
+	}
+	response, err := session.InventoryRemoval(ctx, ocihelper.InventoryRemovalRequest{
+		Removal: ocihelper.ManagedVolumeRemovalAuthority{
+			NodeID: request.NodeID, BootSessionID: request.BootSessionID, JobID: request.JobID,
+			RemovalGeneration: request.RemovalGeneration, CleanupFence: request.CleanupFence,
+		},
+		ComputerStorage: computerStorage,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response.JobID != request.JobID || response.RemovalGeneration != request.RemovalGeneration || response.HelperSession != helperSession(session) || len(response.Attempts) == 0 {
+		return nil, errors.New("legacy OCI removal inventory receipt is not bound to the current helper, job, and generation")
+	}
+	attempts := make([]workloadrunner.RuntimeResourceManifest, 0, len(response.Attempts))
+	for _, helperAttempt := range response.Attempts {
+		authority := helperAttempt.Authority
+		if authority.NodeID != request.NodeID || authority.JobID != request.JobID || authority.Class != contract.JobClassService || authority.RemovalGeneration != fmt.Sprint(request.RemovalGeneration) {
+			return nil, errors.New("legacy OCI removal inventory returned conflicting attempt authority")
+		}
+		identity, identityErr := ocihelper.DeterministicResourceIdentity(authority)
+		if identityErr != nil {
+			return nil, identityErr
+		}
+		manifest := workloadrunner.RuntimeResourceManifest{
+			Version: 1, RuntimeKind: contract.JobKindOCI,
+			NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID,
+			AttemptID: authority.AttemptID, FencingToken: authority.FencingToken,
+			WorkloadClass: authority.Class, RemovalGeneration: authority.RemovalGeneration,
+			LeaseID: identity.LeaseID, TaskID: identity.TaskID, ContainerID: identity.ContainerID,
+			SnapshotID: identity.SnapshotID, ShimID: identity.ShimID, CgroupID: identity.CgroupID,
+			LogSegmentDirectory: identity.LogSegmentDirectory, HandoffVolume: helperAttempt.HandoffVolume,
+		}
+		if helperAttempt.ComputerStorage == nil {
+			manifest.ServiceDataVolume = identity.ServiceVolumeDirectory
+			manifest.ServiceDataOwnerRecord = identity.ServiceVolumeOwnerRecord
+		} else {
+			manifest.ComputerStorage = &workloadrunner.ComputerStorage{
+				ComputerID: helperAttempt.ComputerStorage.ComputerID, StorageID: helperAttempt.ComputerStorage.StorageID,
+				StorageGeneration: helperAttempt.ComputerStorage.StorageGeneration, DiskBytes: helperAttempt.ComputerStorage.DiskBytes,
+			}
+		}
+		if !sameRemovalRegistries(manifest, helperAttempt.Resources) {
+			return nil, errors.New("legacy OCI removal helper inventory diverges from the agent manifest registry")
+		}
+		attempts = append(attempts, manifest)
+	}
+	sort.Slice(attempts, func(i, j int) bool { return attempts[i].AttemptID < attempts[j].AttemptID })
+	return attempts, nil
+}
+
+func sameRemovalRegistries(manifest workloadrunner.RuntimeResourceManifest, helper []ocihelper.RemovalResource) bool {
+	agent := manifest.RemovalResources()
+	if len(agent) != len(helper) {
+		return false
+	}
+	for index := range agent {
+		if string(agent[index].Class) != string(helper[index].Class) || agent[index].ID != helper[index].ID {
+			return false
+		}
+	}
+	return true
+}
+
+func validateHelperRemovalAttestation(request workloadrunner.RuntimeRemovalProofRequest, attempts []ocihelper.RemovalAttemptManifest, response ocihelper.AttestRemovalResponse, helper ocihelper.HelperSession) error {
+	if response.JobID != request.JobID || response.RemovalGeneration != fmt.Sprint(request.RemovalGeneration) || response.HelperSession != helper {
+		return errors.New("OCI helper removal attestation is not bound to the requested job, generation, and helper session")
+	}
+	want := make(map[ocihelper.RemovalResource]struct{})
+	for _, attempt := range attempts {
+		for _, resource := range attempt.Resources {
+			want[resource] = struct{}{}
+		}
+	}
+	if len(response.Assertions) != len(want) {
+		return errors.New("OCI helper removal attestation omitted a frozen resource row")
+	}
+	for _, assertion := range response.Assertions {
+		resource := ocihelper.RemovalResource{Class: assertion.Class, ID: assertion.ID}
+		if !assertion.Absent {
+			return fmt.Errorf("OCI helper removal attestation did not prove %s/%s absent", assertion.Class, assertion.ID)
+		}
+		if _, ok := want[resource]; !ok {
+			return fmt.Errorf("OCI helper removal attestation asserted unknown resource %s/%s", assertion.Class, assertion.ID)
+		}
+		delete(want, resource)
+	}
+	if len(want) != 0 {
+		return errors.New("OCI helper removal attestation did not execute every frozen assertion")
+	}
+	return nil
 }
 
 // LoadImage is the agent-side offline-import seam used by the node-local

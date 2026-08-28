@@ -178,7 +178,8 @@ heartbeats.
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. |
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only. A positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments while retaining any stable handoff volume; only then does the server tombstone authorization. |
-| `DeleteManagedVolume` | Session-authorized and closed to `handoff`. The caller supplies only the opaque stable owner key; the helper derives the source, deletes that one directory, independently verifies absence, and returns no general path authority. |
+| `DeleteManagedVolume` | Session-authorized and closed to `handoff` and `service_data`. The caller supplies only the opaque stable owner key; the helper derives the source, deletes exactly that directory (plus the paired service-data owner record), independently verifies absence, and returns no general path authority. |
+| `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. After separate stable service-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend, and only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
@@ -411,10 +412,12 @@ attempt namespace. `Delete` reaps and verifies the attempt while retaining its
 handoff volume. Session reap and boot sweep likewise leave unexpired handoffs
 intact; reuse refreshes the default 24-hour retry age, and sweep removes only
 expired direct children with the deterministic handoff prefix. The narrow
-`DeleteManagedVolume(handoff, owner_key)` operation removes that one derived
-directory and returns success only after a separate absence check. The agent
-calls it after accepted successful completion; future removal work may call the
-same closed operation but gains no general path deletion authority.
+`DeleteManagedVolume(kind, owner_key)` operation is closed to `handoff` and
+`service_data`. It derives exactly one helper-owned identity, removes only that
+volume (and, for service data, its paired owner record), and returns success
+only after separate absence checks. The agent calls the handoff arm after
+accepted successful completion and the service-data arm during Job removal;
+neither arm grants general path deletion authority.
 
 Service-data volumes live under their own helper-owned guest-native durable
 root, outside the attempt inventory swept during boot takeover. They and their
@@ -482,6 +485,18 @@ boot, Job, removal-generation, and cleanup-fence authority to the helper. The
 helper requires a matching detached receipt, verifies mount and loop absence,
 deletes the image, manifest, and generation quota directory, and positively
 checks their absence before the agent may acknowledge `removed_verified`.
+
+`AttestRemoval` accepts only an exact service Job/generation plus reconstructed
+attempt authorities and their deterministic resource rows, and is called after
+the separate idempotent `DeleteManagedVolume(service_data, job_id)` succeeds.
+It inventories every named lease, snapshot, container, task, shim, cgroup,
+framed-log directory, and durable-data class. Ordinary services assert both
+their service-data directory and owner record; Computers instead assert disk
+image, allocation, quota, manifest, mount, loop, and attachment identities.
+It returns one positive row only after that class was actually inspected and
+the identity was absent. Unknown future classes fail closed until the helper's
+central inventory registry is extended; they cannot be silently omitted or
+reported as passing.
 
 The native Linux engine uses containerd namespace `wefty`, runtime handler
 `io.containerd.runc.v2`, and snapshotter `overlayfs`. It creates the labelled
