@@ -180,7 +180,7 @@ func TestNamedAndNumericImageUsersChooseDifferentSupplementalLookup(t *testing.T
 func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 	input := goldenRuntimeSpecInput(t, "amd64")
 	input.Workload.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
-		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 8 << 30,
+		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30,
 	}}}
 	input.Workload.OperatorMounts = nil
 	input.OperatorMountSources = nil
@@ -447,17 +447,17 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 		}},
 		{name: "Computer disk invalid generation", mutate: func(input *WorkloadInput) {
 			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
-				ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 0, DiskBytes: 1024,
+				ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 0, IntentRevision: 1, DiskBytes: 1024,
 			}}}
 		}},
 		{name: "ordinary volume carries Computer Storage", mutate: func(input *WorkloadInput) {
 			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeServiceData, ComputerStorage: &ComputerStorageReference{
-				ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 1024,
+				ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 1024,
 			}}}
 		}},
 		{name: "Computer disk writable operator mount", mutate: func(input *WorkloadInput) {
 			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
-				ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 1024,
+				ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 1024,
 			}}}
 			input.OperatorMounts = []OperatorMount{{NodePath: "/host/data", ContainerPath: "/data"}}
 		}},
@@ -487,7 +487,7 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 	}
 	computerDisk := valid()
 	computerDisk.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
-		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 8 << 30,
+		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30,
 	}}}
 	if err := validateWorkloadWire(computerDisk); err != nil {
 		t.Fatalf("valid Computer disk was rejected: %v", err)

@@ -453,6 +453,12 @@ func (session *Session) AttestRemoval(ctx context.Context, request AttestRemoval
 	return response, err
 }
 
+func (session *Session) ResetComputerStorage(ctx context.Context, request ResetComputerStorageRequest) (ResetComputerStorageResponse, error) {
+	var response ResetComputerStorageResponse
+	err := session.call(ctx, MethodResetStorage, request, &response)
+	return response, err
+}
+
 func (session *Session) Verify(ctx context.Context, request VerifyRequest) (VerifyResponse, error) {
 	var response VerifyResponse
 	err := session.call(ctx, MethodVerify, request, &response)

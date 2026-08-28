@@ -463,6 +463,66 @@
         }
       }
     },
+    "/v1/computers/{computer_id}/storage-reset": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "resetComputerStorage",
+        "summary": "Reserve a new empty Storage generation",
+        "description": "Persists one CAS intent, stages generation+1, and quiesces the current Job. The old generation remains current until the bound agent positively verifies detach, quarantine, deletion, and absence; only then may L1 publish the replacement and restore the Computer's authoritative desired state.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["intent_revision", "storage_id", "storage_generation", "idempotency_key"],
+            "properties": {
+              "intent_revision": { "type": "integer", "minimum": 1 },
+              "storage_id": { "type": "string", "minLength": 1 },
+              "storage_generation": { "type": "integer", "minimum": 1 },
+              "idempotency_key": { "type": "string", "minLength": 1 }
+            }
+          } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Identical reset replay; no second generation was reserved.",
+            "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } },
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+          },
+          "202": {
+            "description": "Reset reserved; reconfiguration_phase remains resetting until old-generation absence is verified.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/storage-generations": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "get": {
+        "operationId": "listComputerStorageGenerations",
+        "summary": "List current, staging, and retired Storage generations",
+        "responses": {
+          "200": {
+            "description": "Generation-ordered Storage lifecycle evidence.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageGenerationList" } } }
+          },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/computers/{computer_id}/projections": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }

@@ -101,7 +101,7 @@ func (system *fakeComputerDiskSystem) loopsForRoot(root string) (map[string]stri
 }
 
 func testComputerStorage() ComputerStorageReference {
-	return ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, DiskBytes: 16 << 20}
+	return ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 16 << 20}
 }
 
 func testComputerAuthority(attempt, fence, boot string) AttemptAuthority {

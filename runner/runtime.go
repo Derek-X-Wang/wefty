@@ -172,6 +172,7 @@ type ComputerStorage struct {
 	ComputerID        string
 	StorageID         string
 	StorageGeneration int64
+	IntentRevision    int64
 	DiskBytes         int64
 }
 
@@ -469,6 +470,37 @@ type ManagedVolumeRemovalAuthority struct {
 	JobID             string
 	RemovalGeneration uint64
 	CleanupFence      string
+}
+
+// ComputerStorageResetter replaces one detached Computer Storage generation.
+// It owns node-local quarantine/delete/verify mechanics only; the L1 intent
+// revision remains the authority for publishing the next generation.
+type ComputerStorageResetter interface {
+	ResetComputerStorage(context.Context, ComputerStorageResetRequest) (ComputerStorageResetReceipt, error)
+}
+
+type ComputerStorageResetRequest struct {
+	Storage        ComputerStorage
+	NewGeneration  int64
+	NodeID         string
+	BootSessionID  string
+	JobID          string
+	IntentRevision int64
+	CleanupFence   string
+}
+
+type ComputerStorageResetReceipt struct {
+	Kind             string
+	ReceiptID        string
+	ComputerID       string
+	StorageID        string
+	OldGeneration    int64
+	NewGeneration    int64
+	NodeID           string
+	JobID            string
+	IntentRevision   int64
+	CleanupFence     string
+	HelperGeneration uint64
 }
 
 // OutputSink receives raw output events. Calls may be concurrent across

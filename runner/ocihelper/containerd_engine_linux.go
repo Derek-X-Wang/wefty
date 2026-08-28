@@ -102,7 +102,9 @@ type ContainerdEngine struct {
 	ports             map[uint16]string
 	nextPort          uint16
 	serviceVolumeMu   sync.Mutex
+	storageResetMu    sync.Mutex
 	diskSystem        computerDiskSystem
+	storageResetHook  func(computerStorageResetPhase) error
 }
 
 const (

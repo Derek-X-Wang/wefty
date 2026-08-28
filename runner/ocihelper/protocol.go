@@ -47,6 +47,7 @@ const (
 	MethodDeleteVolume       Method = "DeleteManagedVolume"
 	MethodInventoryRemoval   Method = "InventoryRemoval"
 	MethodAttestRemoval      Method = "AttestRemoval"
+	MethodResetStorage       Method = "ResetComputerStorage"
 	MethodVerify             Method = "Verify"
 	MethodSweep              Method = "Sweep"
 	MethodDialAttemptPort    Method = "DialAttemptPort"
@@ -437,6 +438,7 @@ type ComputerStorageReference struct {
 	ComputerID        string `json:"computer_id"`
 	StorageID         string `json:"storage_id"`
 	StorageGeneration int64  `json:"storage_generation"`
+	IntentRevision    int64  `json:"intent_revision"`
 	DiskBytes         int64  `json:"disk_bytes"`
 }
 
@@ -781,6 +783,40 @@ func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) e
 		}
 	}
 	return nil
+}
+
+type ComputerStorageResetAuthority struct {
+	NodeID           string `json:"node_id"`
+	BootSessionID    string `json:"boot_session_id"`
+	HelperGeneration uint64 `json:"helper_generation"`
+	JobID            string `json:"job_id"`
+	IntentRevision   int64  `json:"intent_revision"`
+	CleanupFence     string `json:"cleanup_fence"`
+}
+
+type ResetComputerStorageRequest struct {
+	Storage       ComputerStorageReference      `json:"storage"`
+	NewGeneration int64                         `json:"new_generation"`
+	Authority     ComputerStorageResetAuthority `json:"authority"`
+}
+
+type ComputerStorageResetReceipt struct {
+	Kind             string `json:"kind"`
+	ReceiptID        string `json:"receipt_id"`
+	ComputerID       string `json:"computer_id"`
+	StorageID        string `json:"storage_id"`
+	OldGeneration    int64  `json:"old_generation"`
+	NewGeneration    int64  `json:"new_generation"`
+	NodeID           string `json:"node_id"`
+	JobID            string `json:"job_id"`
+	IntentRevision   int64  `json:"intent_revision"`
+	CleanupFence     string `json:"cleanup_fence"`
+	HelperGeneration uint64 `json:"helper_generation"`
+}
+
+type ResetComputerStorageResponse struct {
+	Verified bool                        `json:"verified"`
+	Receipt  ComputerStorageResetReceipt `json:"receipt"`
 }
 
 type VerifyScope string

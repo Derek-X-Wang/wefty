@@ -108,7 +108,7 @@ Computer-trait Job is invalid at L1 construction time: it must be created in
 the same transaction as its Computer. `computer_id`, `storage_id`, and every
 successive `job_id` are distinct identities.
 
-Start, stop, restart, removal, and projection replacement require the exact observed
+Start, stop, restart, reset, removal, and projection replacement require the exact observed
 `intent_revision` and `storage_id@generation`. The transaction returns
 `stale_intent_revision` or `storage_reference_conflict` without changing any
 row when either precondition moved. An accepted no-change desired-state retry
@@ -120,6 +120,19 @@ History is read through a bounded revision-ordered page rather than being
 materialized by an authority read or CAS. Every history actor is the
 authenticated Fabric identity, never a request-body claim; creation replay by
 a different actor conflicts even when the JobSpec bytes match.
+
+A Storage reset appends one `reset` intent, enters revision-fenced `resetting`,
+and creates exactly one `staging` generation at current generation plus one.
+The old generation remains `current` and the replacement remains unclaimable
+while the current Job is quiesced. The bound agent may advance the reset only
+with a helper receipt naming the exact Computer, Storage ID, old and new
+generations, Job, Node, reset revision, cleanup fence, and helper generation.
+L1 commits that verification before a separate publication transaction
+atomically changes old `current → retired`, staging `→ current`, advances
+`storage_generation` and `applied_revision`, and restores the authoritative
+Computer desired state on the same Job. A crash before publication repeats the
+standing directive; a crash after publication sees an idempotent terminal
+reset row. Neither path auto-resumes the old generation.
 
 The current immutable Job mirrors Computer desired state only so it can reuse
 the ordinary service attempt state machine. Claim additionally joins the

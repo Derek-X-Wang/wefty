@@ -216,6 +216,7 @@ func New(config Config) (*Agent, error) {
 	var ociImagePins workloadrunner.OCIImagePinRuntime
 	var managedVolumeFinalizer workloadrunner.ManagedVolumeFinalizer
 	var ociRemovalProof workloadrunner.RuntimeRemovalProofRuntime
+	var computerStorageResetter workloadrunner.ComputerStorageResetter
 	if runtimeAdapter, configured := runtimes.selectKind(contract.JobKindOCI); configured {
 		if pinRuntime, supported := runtimeAdapter.(workloadrunner.OCIImagePinRuntime); supported {
 			pinRuntime.SetOCIImageBindingPinLedger(outbox.spool)
@@ -225,6 +226,7 @@ func New(config Config) (*Agent, error) {
 		if proofRuntime, supported := runtimeAdapter.(workloadrunner.RuntimeRemovalProofRuntime); supported {
 			ociRemovalProof = proofRuntime
 		}
+		computerStorageResetter, _ = runtimeAdapter.(workloadrunner.ComputerStorageResetter)
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
@@ -286,6 +288,8 @@ func New(config Config) (*Agent, error) {
 		session.removals.deleteRuntimeData = ociRemovalProof.DeleteRuntimeRemovalData
 		session.removals.attestRuntimeRemoval = ociRemovalProof.AttestRuntimeRemoval
 	}
+	session.storageResets = newStorageResetController(client, session, computerStorageResetter,
+		config.NodeID, config.BootSessionID, logf)
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
 		registration: registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),

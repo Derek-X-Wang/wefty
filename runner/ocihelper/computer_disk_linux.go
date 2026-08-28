@@ -117,12 +117,18 @@ func (engine *ContainerdEngine) computerDiskSystem() computerDiskSystem {
 }
 
 func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage ComputerStorageReference, authority AttemptAuthority) (_ *computerDiskAttachment, err error) {
-	if storage.DiskBytes <= 0 {
+	if storage.DiskBytes <= 0 || storage.IntentRevision < 1 {
 		return nil, errors.New("Computer disk requires a positive allocation")
 	}
 	name, err := deterministicComputerDiskName(storage)
 	if err != nil {
 		return nil, err
+	}
+	if _, retired, err := readComputerStorageResetManifest(filepath.Join(engine.config.RuntimeRoot,
+		"computer-storage-resets", name+".json")); err != nil {
+		return nil, err
+	} else if retired {
+		return nil, errors.New("Computer Storage generation is retired by a durable reset receipt")
 	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
 	mountPath := filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)
@@ -157,6 +163,9 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		}
 		if !validComputerDiskEvidence(manifest.PreviousDetachment, storage, authority) {
 			return nil, errors.New("Computer Storage generation lacks positive prior attachment detachment evidence")
+		}
+		if storage.IntentRevision < manifest.Storage.IntentRevision {
+			return nil, errors.New("Computer Storage attachment intent revision is stale")
 		}
 	}
 	imagePath := filepath.Join(diskRoot, "disk.ext4")
@@ -224,6 +233,8 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		}
 	} else {
 		previousDetachment := manifest.PreviousDetachment
+		storage.DiskBytes = manifest.Storage.DiskBytes
+		manifest.Storage = storage
 		manifest.Pending = &authority
 		manifest.PreviousDetachment = nil
 		if err = writeComputerDiskManifest(diskRoot, manifest); err != nil {

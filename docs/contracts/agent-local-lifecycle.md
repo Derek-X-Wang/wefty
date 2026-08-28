@@ -57,7 +57,7 @@ cannot run directly. Registration carries a restrictive OCI observation
 and asks L1 to atomically assign stored same-boot revision `N+1`; the response
 therefore both establishes node authority and removes a stale badge without a
 second registration or authority-generation bump. Pending process-service
-removal resumption runs unconditionally after that registration, even if helper
+removal and Computer Storage reset resumption run unconditionally after that registration, even if helper
 takeover, sweep, or verification failed. Only OCI probing and positive
 publication depend on a successful barrier.
 
@@ -73,6 +73,15 @@ bounce publishes the restriction before reacquisition and runs removal recovery
 on that event path; ordinary healthy heartbeats probe without rescanning the
 filesystem. `boot_sweep_failed` is the bounded L1 reason for an incomplete
 sweep/verify/removal-resume barrier, while detailed errors remain local.
+
+Computer Storage reset is standing heartbeat work, not attempt authority. The
+agent first asks the resident service lifecycle to reap, but never converts a
+missing local receipt into absence. It passes the exact reset directive to the
+OCI helper, whose same-boot detach or prior-boot sweep evidence gates
+quarantine/delete/verify. Only the helper-derived verified receipt is sent to
+L1. A crash at any node-local phase leaves the directive standing and the
+helper manifest resumes; a repeated receipt is idempotent, while a receipt for
+another revision or generation fails closed.
 Before a Mac reaches that helper barrier, the supervised wrapper may instead
 publish any closed OCI restriction, including `oci_intent_disabled`,
 `lima_stopped`, `lima_broken`, or `lima_start_timeout`; L1 validates the actual

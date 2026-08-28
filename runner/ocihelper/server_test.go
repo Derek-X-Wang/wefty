@@ -167,6 +167,34 @@ func TestEngineReceivesOwnerKeyedHandoffAndFinalizesItSeparately(t *testing.T) {
 	}
 }
 
+func TestComputerStorageResetRequiresCurrentHelperGeneration(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := ResetComputerStorageRequest{
+		Storage:       ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 2, DiskBytes: 8 << 30},
+		NewGeneration: 2,
+		Authority: ComputerStorageResetAuthority{NodeID: "node-1", BootSessionID: "boot-1",
+			HelperGeneration: session.Handshake().SessionGeneration + 1, JobID: "job-1", IntentRevision: 2, CleanupFence: "reset-fence"},
+	}
+	if _, err := session.ResetComputerStorage(t.Context(), request); err == nil {
+		t.Fatal("stale helper generation authorized Computer Storage reset")
+	} else {
+		assertRPCCode(t, err, CodeInvalidRequest)
+	}
+	request.Authority.HelperGeneration = session.Handshake().SessionGeneration
+	response, err := session.ResetComputerStorage(t.Context(), request)
+	if err != nil || !response.Verified || response.Receipt.HelperGeneration != request.Authority.HelperGeneration {
+		t.Fatalf("current helper generation reset = %+v err=%v", response, err)
+	}
+}
+
 func TestAttemptOutsideSessionIsDistinctFromNonLiveAttempt(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -1943,6 +1971,16 @@ func (engine *fakeEngine) AttestRemoval(_ context.Context, request AttestRemoval
 		}
 	}
 	return AttestRemovalResponse{Assertions: assertions}, nil
+}
+
+func (*fakeEngine) ResetComputerStorage(_ context.Context, request ResetComputerStorageRequest) (ResetComputerStorageResponse, error) {
+	return ResetComputerStorageResponse{Verified: true, Receipt: ComputerStorageResetReceipt{
+		Kind: "computer_storage_reset_verified", ReceiptID: "reset-receipt",
+		ComputerID: request.Storage.ComputerID, StorageID: request.Storage.StorageID,
+		OldGeneration: request.Storage.StorageGeneration, NewGeneration: request.NewGeneration,
+		NodeID: request.Authority.NodeID, JobID: request.Authority.JobID, IntentRevision: request.Authority.IntentRevision,
+		CleanupFence: request.Authority.CleanupFence, HelperGeneration: request.Authority.HelperGeneration,
+	}}, nil
 }
 func (engine *fakeEngine) Verify(context.Context, VerifyRequest) (VerifyResponse, error) {
 	engine.record("Verify")

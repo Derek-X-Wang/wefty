@@ -10,3 +10,7 @@ import "testing"
 func TestServiceAcceptanceComputerRemovalReleasesOccupancy(t *testing.T) {
 	assertComputerRemovalDirectiveCompletionReleasesSlot(t)
 }
+
+func TestServiceAcceptanceComputerStorageResetLifecycle(t *testing.T) {
+	assertComputerStorageResetLifecycle(t)
+}

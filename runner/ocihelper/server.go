@@ -1160,6 +1160,27 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			response.HelperSession = session.helper
 		}
 		_ = writeEngineResponse(wire, response, err)
+	case MethodResetStorage:
+		var body ResetComputerStorageRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if body.Authority.NodeID != session.identity.NodeID || body.Authority.BootSessionID != session.identity.BootSessionID || body.Authority.NodeID == "" ||
+			body.Authority.HelperGeneration != session.helper.SessionGeneration || body.Authority.HelperGeneration == 0 ||
+			body.Authority.JobID == "" || body.Authority.IntentRevision < 1 || body.Authority.CleanupFence == "" ||
+			body.Storage.ComputerID == "" || body.Storage.StorageID == "" || body.Storage.StorageGeneration < 1 ||
+			body.Storage.IntentRevision != body.Authority.IntentRevision || body.NewGeneration != body.Storage.StorageGeneration+1 {
+			_ = writeFailure(wire, CodeInvalidRequest, "complete current-session Computer Storage reset authority is required")
+			return
+		}
+		engine, ok := server.engine.(ComputerStorageResetEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "Computer Storage reset is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.ResetComputerStorage(operation.ctx, body)
+		_ = writeEngineResponse(wire, response, err)
 	case MethodVerify:
 		var body VerifyRequest
 		if !decodeRequest(wire, request.Body, &body) {

@@ -138,7 +138,7 @@
         ],
         "properties": {
           "intent_revision": { "type": "integer", "minimum": 1 },
-          "operation": { "enum": ["create", "start", "stop", "restart", "remove", "project"] },
+          "operation": { "enum": ["create", "start", "stop", "restart", "remove", "project", "reset"] },
           "desired_state": { "enum": ["running", "stopped", "removed"] },
           "storage_id": { "type": "string", "minLength": 1 },
           "storage_generation": { "type": "integer", "minimum": 1 },
@@ -164,7 +164,7 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "computer_id", "name", "placement_node_id", "grants", "storage_id", "storage_generation",
+          "computer_id", "name", "placement_node_id", "grants", "storage_id", "storage_generation", "desired_disk_bytes",
           "desired_state", "intent_revision", "applied_revision", "current_job_id",
           "current_spec_revision", "reconfiguration_phase", "current_job", "created_at", "updated_at"
         ],
@@ -190,18 +190,44 @@
           },
           "storage_id": { "type": "string", "minLength": 1 },
           "storage_generation": { "type": "integer", "minimum": 1 },
+          "desired_disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
           "desired_state": { "enum": ["running", "stopped", "removed"] },
           "intent_revision": { "type": "integer", "minimum": 1 },
           "applied_revision": { "type": "integer", "minimum": 0 },
           "current_job_id": { "type": "string", "minLength": 1 },
           "current_spec_revision": { "type": "integer", "minimum": 1 },
-          "reconfiguration_phase": { "enum": ["stable", "projecting", "removing"] },
+          "reconfiguration_phase": { "enum": ["stable", "projecting", "resetting", "removing"] },
           "reconfiguration_revision": { "type": "integer", "minimum": 1 },
           "current_job": { "$ref": "#/components/schemas/Job" },
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" }
         },
         "description": "Durable Computer identity and sole desired-state authority. computer_id and current_job_id are distinct; immutable Job projections cannot be restarted after retirement."
+      },
+      "ComputerStorageGeneration": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["storage_id", "storage_generation", "disk_bytes", "phase", "created_at"],
+        "properties": {
+          "storage_id": { "type": "string", "minLength": 1 },
+          "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
+          "phase": { "enum": ["current", "staging", "retired"] },
+          "reset_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+          "created_at": { "type": "string", "format": "date-time" },
+          "retired_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ComputerStorageGenerationList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["generations"],
+        "properties": {
+          "generations": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ComputerStorageGeneration" }
+          }
+        }
       },
       "Attempt": {
         "type": "object",
@@ -511,6 +537,25 @@
           "root_instance_id": { "type": "string", "minLength": 1 }
         }
       },
+      "ComputerStorageResetDirective": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "computer_id", "bound_node_id", "job_id", "intent_revision", "storage_id",
+          "old_generation", "new_generation", "disk_bytes", "cleanup_fence"
+        ],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 },
+          "bound_node_id": { "type": "string", "minLength": 1 },
+          "job_id": { "type": "string", "minLength": 1 },
+          "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+          "storage_id": { "type": "string", "minLength": 1 },
+          "old_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "new_generation": { "type": "integer", "format": "int64", "minimum": 2 },
+          "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
+          "cleanup_fence": { "type": "string", "minLength": 1 }
+        }
+      },
       "Node": {
         "allOf": [
           { "$ref": "#/components/schemas/NodeRegistration" },
@@ -590,13 +635,19 @@
           { "$ref": "#/components/schemas/Node" },
           {
             "type": "object",
-            "required": ["removal_directives"],
+            "required": ["removal_directives", "storage_reset_directives"],
             "properties": {
               "removal_directives": {
                 "type": "array",
                 "items": { "$ref": "#/components/schemas/RemovalDirective" },
                 "readOnly": true,
                 "description": "Boot-session-scoped standing cleanup directives, including when no attempt is live."
+              },
+              "storage_reset_directives": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/ComputerStorageResetDirective" },
+                "readOnly": true,
+                "description": "Revision-fenced standing work that must verify old-generation deletion before the replacement generation can publish."
               }
             }
           }

@@ -28,6 +28,7 @@ const (
 	ComputerIntentRestart ComputerIntentOperation = "restart"
 	ComputerIntentRemove  ComputerIntentOperation = "remove"
 	ComputerIntentProject ComputerIntentOperation = "project"
+	ComputerIntentReset   ComputerIntentOperation = "reset"
 )
 
 type ComputerGrantPermission string
@@ -44,6 +45,7 @@ const (
 	ComputerReconfigurationStable     ComputerReconfigurationPhase = "stable"
 	ComputerReconfigurationProjecting ComputerReconfigurationPhase = "projecting"
 	ComputerReconfigurationRemoving   ComputerReconfigurationPhase = "removing"
+	ComputerReconfigurationResetting  ComputerReconfigurationPhase = "resetting"
 )
 
 type ComputerGrant struct {
@@ -74,6 +76,7 @@ type Computer struct {
 	Grants                  []ComputerGrant              `json:"grants"`
 	StorageID               string                       `json:"storage_id"`
 	StorageGeneration       int64                        `json:"storage_generation"`
+	DesiredDiskBytes        int64                        `json:"desired_disk_bytes"`
 	DesiredState            contract.ServiceDesiredState `json:"desired_state"`
 	IntentRevision          int64                        `json:"intent_revision"`
 	AppliedRevision         int64                        `json:"applied_revision"`
@@ -280,6 +283,12 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	) VALUES(?, ?, 1, 1, ?)`, computerID, job.JobID, now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "store initial Computer projection")
 	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_storage_generations(
+		computer_id, storage_id, storage_generation, disk_bytes, phase, created_ns
+	) VALUES(?, ?, 1, ?, 'current', ?)`, computerID, storageID,
+		request.Spec.Execution.OCI.Computer.DiskBytes, now.UnixNano()); err != nil {
+		return Computer{}, false, internalError(err, "store initial Computer Storage generation")
+	}
 	if err := insertComputerIntent(ctx, tx, computerID, initialComputerRevision, ComputerIntentCreate,
 		contract.ServiceDesiredRunning, storageID, 1, job.JobID, 1, request.Actor, now); err != nil {
 		return Computer{}, false, err
@@ -438,6 +447,10 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	}
 	job.Status = string(job.State)
 	computer.CurrentJob = job
+	if job.Spec.Execution.OCI == nil || job.Spec.Execution.OCI.Computer == nil || job.Spec.Execution.OCI.Computer.DiskBytes <= 0 {
+		return Computer{}, errors.New("Computer current Job has no explicit disk budget")
+	}
+	computer.DesiredDiskBytes = job.Spec.Execution.OCI.Computer.DiskBytes
 	return computer, nil
 }
 

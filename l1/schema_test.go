@@ -2,9 +2,12 @@ package l1
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -45,6 +48,15 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 			"computer_id", "intent_revision", "operation", "desired_state", "storage_id", "storage_generation",
 			"job_id", "spec_revision", "actor", "created_ns",
 		},
+		"computer_storage_generations": {
+			"computer_id", "storage_id", "storage_generation", "disk_bytes", "phase", "reset_revision", "created_ns", "retired_ns",
+		},
+		"computer_storage_resets": {
+			"computer_id", "intent_revision", "storage_id", "old_generation", "new_generation", "disk_bytes",
+			"bound_node_id", "job_id", "cleanup_fence", "idempotency_key", "request_hash", "status",
+			"verification_receipt_json", "verification_receipt_hash", "acknowledgement_key", "acknowledgement_hash",
+			"requested_ns", "verified_ns", "published_ns",
+		},
 		"service_restart_requests": {"job_id", "idempotency_key", "request_hash", "created_ns"},
 		"service_log_truncations": {
 			"job_id", "bound_kind", "evicted_event_count", "evicted_byte_count",
@@ -76,6 +88,67 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 	}
 	if secureDelete != 1 {
 		t.Fatalf("secure_delete = %d, want 1", secureDelete)
+	}
+}
+
+func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-reset.sqlite")
+	store, err := OpenStore(path, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.Exec(`PRAGMA foreign_keys=OFF;
+		CREATE TABLE computers_old_constraint (
+			computer_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, placement_node_id TEXT NOT NULL,
+			bound_node_id TEXT, grants_json BLOB NOT NULL, storage_id TEXT NOT NULL UNIQUE,
+			storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+			desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
+			intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
+			applied_revision INTEGER NOT NULL CHECK(applied_revision >= 0 AND applied_revision <= intent_revision),
+			current_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id), current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
+			reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'removing')),
+			reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0), created_ns INTEGER NOT NULL, updated_ns INTEGER NOT NULL
+		);
+		DROP TABLE computers;
+		ALTER TABLE computers_old_constraint RENAME TO computers;
+		CREATE INDEX computers_binding ON computers(bound_node_id, desired_state);
+		CREATE TABLE computer_intent_history_old_constraint (
+			computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+			intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
+			operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project')),
+			desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
+			storage_id TEXT NOT NULL, storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+			job_id TEXT NOT NULL REFERENCES jobs(job_id), spec_revision INTEGER NOT NULL CHECK(spec_revision > 0),
+			actor TEXT NOT NULL, created_ns INTEGER NOT NULL, PRIMARY KEY(computer_id, intent_revision)
+		);
+		DROP TABLE computer_intent_history;
+		ALTER TABLE computer_intent_history_old_constraint RENAME TO computer_intent_history;
+		PRAGMA foreign_keys=ON;`)
+	closeErr := database.Close()
+	if err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	store, err = OpenStore(path, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var computersSQL, intentsSQL string
+	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computers'`).Scan(&computersSQL); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_intent_history'`).Scan(&intentsSQL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(computersSQL, "'resetting'") || !strings.Contains(intentsSQL, "'reset'") {
+		t.Fatalf("reset constraints were not migrated: computers=%s intents=%s", computersSQL, intentsSQL)
 	}
 }
 

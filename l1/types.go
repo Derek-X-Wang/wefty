@@ -169,6 +169,7 @@ type ComputerStorageClaim struct {
 	ComputerID        string `json:"computer_id"`
 	StorageID         string `json:"storage_id"`
 	StorageGeneration int64  `json:"storage_generation"`
+	IntentRevision    int64  `json:"intent_revision"`
 }
 
 // Node is the node projection shared by the operator list and agent protocol.
@@ -194,7 +195,8 @@ type Node struct {
 // off the operator-visible Node projection because they carry cleanup fences.
 type HeartbeatResponse struct {
 	Node
-	RemovalDirectives []RemovalDirective `json:"removal_directives"`
+	RemovalDirectives      []RemovalDirective              `json:"removal_directives"`
+	StorageResetDirectives []ComputerStorageResetDirective `json:"storage_reset_directives"`
 }
 
 type ServiceBindingProofRequest struct {

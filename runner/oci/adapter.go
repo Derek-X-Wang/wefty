@@ -1590,8 +1590,9 @@ func (adapter *Adapter) FinalizeManagedVolumes(ctx context.Context, request work
 				return fmt.Errorf("Computer disk finalization requires Storage and removal authority")
 			}
 			input = ocihelper.DeleteManagedVolumeRequest{Kind: ocihelper.ManagedVolumeComputerDisk,
-				ComputerStorage: &ocihelper.ComputerStorageReference{ComputerID: volume.ComputerStorage.ComputerID, StorageID: volume.ComputerStorage.StorageID, StorageGeneration: volume.ComputerStorage.StorageGeneration},
-				Removal:         &ocihelper.ManagedVolumeRemovalAuthority{NodeID: request.Removal.NodeID, BootSessionID: request.Removal.BootSessionID, JobID: request.Removal.JobID, RemovalGeneration: request.Removal.RemovalGeneration, CleanupFence: request.Removal.CleanupFence}}
+				ComputerStorage: &ocihelper.ComputerStorageReference{ComputerID: volume.ComputerStorage.ComputerID, StorageID: volume.ComputerStorage.StorageID,
+					StorageGeneration: volume.ComputerStorage.StorageGeneration, IntentRevision: volume.ComputerStorage.IntentRevision},
+				Removal: &ocihelper.ManagedVolumeRemovalAuthority{NodeID: request.Removal.NodeID, BootSessionID: request.Removal.BootSessionID, JobID: request.Removal.JobID, RemovalGeneration: request.Removal.RemovalGeneration, CleanupFence: request.Removal.CleanupFence}}
 		default:
 			return fmt.Errorf("unsupported runtime-managed volume finalization: %+v", volume)
 		}
@@ -1604,6 +1605,37 @@ func (adapter *Adapter) FinalizeManagedVolumes(ctx context.Context, request work
 		}
 	}
 	return nil
+}
+
+func (adapter *Adapter) ResetComputerStorage(ctx context.Context, request workloadrunner.ComputerStorageResetRequest) (workloadrunner.ComputerStorageResetReceipt, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return workloadrunner.ComputerStorageResetReceipt{}, errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return workloadrunner.ComputerStorageResetReceipt{}, err
+	}
+	handshake := session.Handshake()
+	response, err := session.ResetComputerStorage(ctx, ocihelper.ResetComputerStorageRequest{
+		Storage: ocihelper.ComputerStorageReference{ComputerID: request.Storage.ComputerID,
+			StorageID: request.Storage.StorageID, StorageGeneration: request.Storage.StorageGeneration,
+			IntentRevision: request.Storage.IntentRevision, DiskBytes: request.Storage.DiskBytes},
+		NewGeneration: request.NewGeneration,
+		Authority: ocihelper.ComputerStorageResetAuthority{NodeID: request.NodeID, BootSessionID: request.BootSessionID,
+			HelperGeneration: handshake.SessionGeneration, JobID: request.JobID,
+			IntentRevision: request.IntentRevision, CleanupFence: request.CleanupFence},
+	})
+	if err != nil {
+		return workloadrunner.ComputerStorageResetReceipt{}, err
+	}
+	if !response.Verified || response.Receipt.ReceiptID == "" {
+		return workloadrunner.ComputerStorageResetReceipt{}, errors.New("OCI helper did not positively verify Computer Storage reset")
+	}
+	return workloadrunner.ComputerStorageResetReceipt{Kind: response.Receipt.Kind, ReceiptID: response.Receipt.ReceiptID,
+		ComputerID: response.Receipt.ComputerID, StorageID: response.Receipt.StorageID,
+		OldGeneration: response.Receipt.OldGeneration, NewGeneration: response.Receipt.NewGeneration,
+		NodeID: response.Receipt.NodeID, JobID: response.Receipt.JobID, IntentRevision: response.Receipt.IntentRevision,
+		CleanupFence: response.Receipt.CleanupFence, HelperGeneration: response.Receipt.HelperGeneration}, nil
 }
 
 func adapterAuthorityKey(authority workloadrunner.AttemptAuthority) string {
@@ -1650,7 +1682,8 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 			if volume.ComputerStorage != nil {
 				storage = &ocihelper.ComputerStorageReference{
 					ComputerID: volume.ComputerStorage.ComputerID, StorageID: volume.ComputerStorage.StorageID,
-					StorageGeneration: volume.ComputerStorage.StorageGeneration, DiskBytes: volume.ComputerStorage.DiskBytes,
+					StorageGeneration: volume.ComputerStorage.StorageGeneration, IntentRevision: volume.ComputerStorage.IntentRevision,
+					DiskBytes: volume.ComputerStorage.DiskBytes,
 				}
 			}
 			managedVolumes = append(managedVolumes, ocihelper.ManagedVolumeDescriptor{

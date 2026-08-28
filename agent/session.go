@@ -69,6 +69,7 @@ type agentSession struct {
 	residentChanged chan struct{}
 	reapPriorBoot   func(context.Context, string) (workloadrunner.ReapReceipt, error)
 	removals        *removalController
+	storageResets   *storageResetController
 
 	drainOnce      sync.Once
 	drainRequested chan struct{}
@@ -182,7 +183,8 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	}
 	// ADR-0002 removal recovery is independent of OCI readiness and always runs
 	// once registration authority and its restrictive N+1 are published.
-	removalErr := errors.Join(session.resumePendingRemovals(ctx), session.processRemovalDirectives(ctx, registrationHeartbeat.RemovalDirectives))
+	removalErr := errors.Join(session.resumePendingRemovals(ctx), session.processRemovalDirectives(ctx, registrationHeartbeat.RemovalDirectives),
+		session.processStorageResetDirectives(ctx, registrationHeartbeat.StorageResetDirectives))
 	pinsErr := error(nil)
 	if barrierErr == nil && removalErr == nil {
 		pinsErr = session.reconcileOCIImagePins(ctx)
@@ -230,6 +232,19 @@ func (session *agentSession) processRemovalDirectives(ctx context.Context, direc
 	for _, directive := range directives {
 		if err := session.removals.process(ctx, directive); err != nil {
 			failures = append(failures, fmt.Errorf("reconcile removed OCI binding %q: %w", directive.JobID, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (session *agentSession) processStorageResetDirectives(ctx context.Context, directives []l1.ComputerStorageResetDirective) error {
+	if session.storageResets == nil {
+		return nil
+	}
+	var failures []error
+	for _, directive := range directives {
+		if err := session.storageResets.process(ctx, directive); err != nil {
+			failures = append(failures, fmt.Errorf("reconcile Computer Storage reset %q: %w", directive.ComputerID, err))
 		}
 	}
 	return errors.Join(failures...)
@@ -453,6 +468,9 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 		session.attempts.Wait()
 		if session.removals != nil {
 			session.removals.wait()
+		}
+		if session.storageResets != nil {
+			session.storageResets.wait()
 		}
 	}()
 
@@ -809,6 +827,11 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			if session.removals != nil {
 				for _, directive := range response.RemovalDirectives {
 					session.removals.enqueue(ctx, directive, failures)
+				}
+			}
+			if session.storageResets != nil {
+				for _, directive := range response.StorageResetDirectives {
+					session.storageResets.enqueue(ctx, directive, failures)
 				}
 			}
 			backoff.reset()

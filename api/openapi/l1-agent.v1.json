@@ -190,11 +190,12 @@
                     "computer_storage": {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["computer_id", "storage_id", "storage_generation"],
+                      "required": ["computer_id", "storage_id", "storage_generation", "intent_revision"],
                       "properties": {
                         "computer_id": { "type": "string", "minLength": 1 },
                         "storage_id": { "type": "string", "minLength": 1 },
-                        "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 }
+                        "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+                        "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 }
                       },
                       "description": "Computer claims only. Exact durable Storage identity authorized by the current immutable Job projection."
                     }
@@ -491,6 +492,63 @@
           "200": {
             "description": "Deletion attestation accepted, identically replayed, or already finalized without mutation.",
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/agent/computers/{computer_id}/storage-reset-acknowledgement": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "acknowledgeComputerStorageReset",
+        "summary": "Attest that one old Storage generation is absent",
+        "description": "The authenticated current node submits a helper-derived receipt bound to Computer, Storage, old/new generations, Job, reset intent revision, cleanup fence, and helper generation. L1 first commits verification, then separately publishes generation+1 so a crash at that boundary resumes without deleting twice or attaching early.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
+            "properties": {
+              "node_id": { "type": "string", "minLength": 1 },
+              "boot_session_id": { "type": "string", "minLength": 1 },
+              "idempotency_key": { "type": "string", "minLength": 1 },
+              "receipt": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind", "receipt_id", "computer_id", "storage_id", "old_generation",
+                  "new_generation", "node_id", "job_id", "intent_revision", "cleanup_fence",
+                  "helper_generation"
+                ],
+                "properties": {
+                  "kind": { "const": "computer_storage_reset_verified" },
+                  "receipt_id": { "type": "string", "minLength": 1 },
+                  "computer_id": { "type": "string", "minLength": 1 },
+                  "storage_id": { "type": "string", "minLength": 1 },
+                  "old_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+                  "new_generation": { "type": "integer", "format": "int64", "minimum": 2 },
+                  "node_id": { "type": "string", "minLength": 1 },
+                  "job_id": { "type": "string", "minLength": 1 },
+                  "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+                  "cleanup_fence": { "type": "string", "minLength": 1 },
+                  "helper_generation": { "type": "integer", "minimum": 1 }
+                }
+              }
+            }
+          } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Verification accepted or identically replayed; the returned Computer shows whether publication completed.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },

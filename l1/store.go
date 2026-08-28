@@ -257,7 +257,7 @@ CREATE TABLE IF NOT EXISTS computers (
   applied_revision INTEGER NOT NULL CHECK(applied_revision >= 0 AND applied_revision <= intent_revision),
   current_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
   current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
-  reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'removing')),
+  reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'removing')),
   reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0),
   created_ns INTEGER NOT NULL,
   updated_ns INTEGER NOT NULL
@@ -277,7 +277,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS computer_current_projection
 CREATE TABLE IF NOT EXISTS computer_intent_history (
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
   intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
-  operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project')),
+  operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset')),
   desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
   storage_id TEXT NOT NULL,
   storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
@@ -287,6 +287,47 @@ CREATE TABLE IF NOT EXISTS computer_intent_history (
   created_ns INTEGER NOT NULL,
   PRIMARY KEY(computer_id, intent_revision)
 );
+CREATE TABLE IF NOT EXISTS computer_storage_generations (
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  storage_id TEXT NOT NULL,
+  storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+  disk_bytes INTEGER NOT NULL CHECK(disk_bytes > 0),
+  phase TEXT NOT NULL CHECK(phase IN ('current', 'staging', 'retired')),
+  reset_revision INTEGER CHECK(reset_revision > 0),
+  created_ns INTEGER NOT NULL,
+  retired_ns INTEGER,
+  PRIMARY KEY(computer_id, storage_generation),
+  UNIQUE(storage_id, storage_generation)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_current
+  ON computer_storage_generations(computer_id) WHERE phase='current';
+CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_staging
+  ON computer_storage_generations(computer_id) WHERE phase='staging';
+CREATE TABLE IF NOT EXISTS computer_storage_resets (
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
+  storage_id TEXT NOT NULL,
+  old_generation INTEGER NOT NULL CHECK(old_generation > 0),
+  new_generation INTEGER NOT NULL CHECK(new_generation > old_generation),
+  disk_bytes INTEGER NOT NULL CHECK(disk_bytes > 0),
+  bound_node_id TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(job_id),
+  cleanup_fence TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('reserved', 'verified', 'published')),
+  verification_receipt_json BLOB,
+  verification_receipt_hash TEXT,
+  acknowledgement_key TEXT,
+  acknowledgement_hash TEXT,
+  requested_ns INTEGER NOT NULL,
+  verified_ns INTEGER,
+  published_ns INTEGER,
+  PRIMARY KEY(computer_id, intent_revision),
+  UNIQUE(computer_id, idempotency_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_reset_active
+  ON computer_storage_resets(computer_id) WHERE status<>'published';
 CREATE TABLE IF NOT EXISTS service_restart_requests (
   job_id TEXT NOT NULL REFERENCES service_jobs(job_id) ON DELETE CASCADE,
   idempotency_key TEXT NOT NULL,
@@ -351,7 +392,125 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
+	if err := s.migrateComputerResetConstraints(ctx); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO computer_storage_generations(
+		computer_id, storage_id, storage_generation, disk_bytes, phase, created_ns
+	) SELECT c.computer_id, c.storage_id, c.storage_generation,
+		CAST(json_extract(j.spec_json, '$.execution.oci.computer.disk_bytes') AS INTEGER),
+		'current', c.created_ns
+	FROM computers c JOIN jobs j ON j.job_id=c.current_job_id`); err != nil {
+		return fmt.Errorf("l1: backfill Computer Storage generations: %w", err)
+	}
 	return nil
+}
+
+// migrateComputerResetConstraints widens the two CHECK constraints introduced
+// before Storage reset existed. CREATE TABLE IF NOT EXISTS cannot change those
+// constraints in an already durable L1 database.
+func (s *Store) migrateComputerResetConstraints(ctx context.Context) error {
+	connection, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("l1: acquire SQLite schema migration connection: %w", err)
+	}
+	defer connection.Close()
+	var computersSQL, intentsSQL string
+	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computers'`).Scan(&computersSQL); err != nil {
+		return fmt.Errorf("l1: inspect Computer schema: %w", err)
+	}
+	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_intent_history'`).Scan(&intentsSQL); err != nil {
+		return fmt.Errorf("l1: inspect Computer intent schema: %w", err)
+	}
+	migrateComputers := !strings.Contains(computersSQL, "'resetting'")
+	migrateIntents := !strings.Contains(intentsSQL, "'reset'")
+	if !migrateComputers && !migrateIntents {
+		return nil
+	}
+	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return fmt.Errorf("l1: disable foreign keys for Computer reset migration: %w", err)
+	}
+	defer connection.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+	transaction, err := connection.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("l1: begin Computer reset schema migration: %w", err)
+	}
+	defer transaction.Rollback()
+	if migrateComputers {
+		if _, err := transaction.ExecContext(ctx, `CREATE TABLE computers_reset_migration (
+			computer_id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			placement_node_id TEXT NOT NULL,
+			bound_node_id TEXT,
+			grants_json BLOB NOT NULL,
+			storage_id TEXT NOT NULL UNIQUE,
+			storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+			desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
+			intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
+			applied_revision INTEGER NOT NULL CHECK(applied_revision >= 0 AND applied_revision <= intent_revision),
+			current_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
+			current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
+			reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'removing')),
+			reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0),
+			created_ns INTEGER NOT NULL,
+			updated_ns INTEGER NOT NULL
+		)`); err != nil {
+			return fmt.Errorf("l1: create widened Computer schema: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `INSERT INTO computers_reset_migration SELECT * FROM computers`); err != nil {
+			return fmt.Errorf("l1: copy Computer authority during migration: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `DROP TABLE computers`); err != nil {
+			return fmt.Errorf("l1: replace old Computer schema: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `ALTER TABLE computers_reset_migration RENAME TO computers`); err != nil {
+			return fmt.Errorf("l1: publish widened Computer schema: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `CREATE INDEX computers_binding ON computers(bound_node_id, desired_state)`); err != nil {
+			return fmt.Errorf("l1: restore Computer binding index: %w", err)
+		}
+	}
+	if migrateIntents {
+		if _, err := transaction.ExecContext(ctx, `CREATE TABLE computer_intent_history_reset_migration (
+			computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+			intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
+			operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset')),
+			desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
+			storage_id TEXT NOT NULL,
+			storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+			job_id TEXT NOT NULL REFERENCES jobs(job_id),
+			spec_revision INTEGER NOT NULL CHECK(spec_revision > 0),
+			actor TEXT NOT NULL,
+			created_ns INTEGER NOT NULL,
+			PRIMARY KEY(computer_id, intent_revision)
+		)`); err != nil {
+			return fmt.Errorf("l1: create widened Computer intent schema: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `INSERT INTO computer_intent_history_reset_migration SELECT * FROM computer_intent_history`); err != nil {
+			return fmt.Errorf("l1: copy Computer intents during migration: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `DROP TABLE computer_intent_history`); err != nil {
+			return fmt.Errorf("l1: replace old Computer intent schema: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `ALTER TABLE computer_intent_history_reset_migration RENAME TO computer_intent_history`); err != nil {
+			return fmt.Errorf("l1: publish widened Computer intent schema: %w", err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("l1: commit Computer reset schema migration: %w", err)
+	}
+	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+		return fmt.Errorf("l1: restore foreign keys after Computer reset migration: %w", err)
+	}
+	rows, err := connection.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return fmt.Errorf("l1: verify Computer reset schema migration: %w", err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return errors.New("l1: Computer reset schema migration violated a foreign key")
+	}
+	return rows.Err()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -1089,9 +1248,9 @@ AND state=@job_queued
 				return nil, err
 			}
 			var storage ComputerStorageClaim
-			if err := tx.QueryRowContext(ctx, `SELECT computer_id, storage_id, storage_generation
+			if err := tx.QueryRowContext(ctx, `SELECT computer_id, storage_id, storage_generation, intent_revision
 				FROM computers WHERE computer_id=? AND current_job_id=?`, computerID, jobID).
-				Scan(&storage.ComputerID, &storage.StorageID, &storage.StorageGeneration); err != nil {
+				Scan(&storage.ComputerID, &storage.StorageID, &storage.StorageGeneration, &storage.IntentRevision); err != nil {
 				return nil, internalError(err, "read claimed Computer Storage identity")
 			}
 			computerStorage = &storage

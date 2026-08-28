@@ -445,6 +445,7 @@ func computerStorageFromClaim(claim *l1.ComputerStorageClaim) *workloadrunner.Co
 	}
 	return &workloadrunner.ComputerStorage{
 		ComputerID: claim.ComputerID, StorageID: claim.StorageID, StorageGeneration: claim.StorageGeneration,
+		IntentRevision: claim.IntentRevision,
 	}
 }
 

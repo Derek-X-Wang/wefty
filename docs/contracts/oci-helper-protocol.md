@@ -178,8 +178,9 @@ heartbeats.
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. |
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only. A positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments while retaining any stable handoff volume; only then does the server tombstone authorization. |
-| `DeleteManagedVolume` | Session-authorized and closed to `handoff` and `service_data`. The caller supplies only the opaque stable owner key; the helper derives the source, deletes exactly that directory (plus the paired service-data owner record), independently verifies absence, and returns no general path authority. |
+| `DeleteManagedVolume` | Session-authorized and closed to a derived `handoff` or `service_data` owner key, or exact Computer-removal Storage and cleanup authority. The helper derives the source, deletes only that resource (plus any paired owner record), independently verifies absence, and returns no general path authority. |
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. After separate stable service-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
+| `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Requires positive detachment, durably quarantines/deletes/verifies the old generation, and returns one stable revision-bound receipt; it cannot publish or attach the successor. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend, and only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
@@ -439,7 +440,7 @@ eventual deletion.
 
 A Computer replaces `service_data` with exactly one `computer_disk`
 descriptor carrying the L1-claimed `computer_id`, non-transferable
-`storage_id`, positive Storage generation, and current `disk_bytes` intent; no host
+`storage_id`, positive Storage generation, Computer intent revision, and current `disk_bytes` intent; no host
 path crosses RPC. The helper hashes Computer, Storage, and generation identity
 (not resizable size intent), fully
 allocates a staging image, formats ext4 with zero reserved blocks, and
@@ -476,10 +477,25 @@ loop devices, and live attachments; namespace quiescence projects out only
 durable images/allocations/quotas/manifests, never live attachment mechanics.
 The sweep receipt retains every observed Computer disk class while its
 post-sweep namespace verification projects only those durable classes out.
-The L1 claim's current `(computer_id, storage_id, generation)` is the attach
-identity. A later reset/reconfiguration contract must add an explicit claim
-revision/fence and reject stale-generation claims before this helper seam; the
-helper already rejects any manifest or receipt for a different generation.
+The L1 claim's current `(computer_id, storage_id, generation, intent_revision)`
+is the attach authority. The deterministic disk identity excludes revision and
+resizable byte intent, while the adjacent manifest advances its highest
+attached revision and rejects a lower one. A verified reset manifest
+permanently retires its old deterministic generation name, so a delayed helper
+request cannot recreate deleted bytes after L1 publishes a successor.
+
+`ResetComputerStorage` accepts only the authenticated current helper session
+plus exact Node, Job, reset-intent revision, cleanup fence, old generation, and
+successor generation. It requires the old generation's same-boot detach receipt
+or prior-boot sweep receipt, then durably resumes `prepared → quarantined →
+deleted → verified`. Quarantine is an atomic rename outside the current disk
+root; deletion is followed by positive absence checks for the old root,
+quarantine, mount, and loops. The verified receipt is stable across retries and
+binds Computer, Storage, both generations, Node, Job, revision, and cleanup
+fence. Helper mechanics never publish or attach the successor; L1 does so only
+after it durably accepts that receipt. The receipt also persists the helper
+generation that performed positive verification; a later helper session may
+replay that receipt but cannot restamp it with a newer generation.
 Computer removal carries the same exact Storage identity plus current node,
 boot, Job, removal-generation, and cleanup-fence authority to the helper. The
 helper requires a matching detached receipt, verifies mount and loop absence,
