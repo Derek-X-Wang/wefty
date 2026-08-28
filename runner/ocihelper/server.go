@@ -649,10 +649,10 @@ func validateRunEndpointContract(computer bool, names []string) error {
 		if len(names) != 2 {
 			return errors.New("Computer attempts require exactly the view and control endpoints")
 		}
-		if _, ok := seen["view"]; !ok {
+		if _, ok := seen[contract.ComputerDisplayEndpointView]; !ok {
 			return errors.New("Computer attempts require exactly the view and control endpoints")
 		}
-		if _, ok := seen["control"]; !ok {
+		if _, ok := seen[contract.ComputerDisplayEndpointControl]; !ok {
 			return errors.New("Computer attempts require exactly the view and control endpoints")
 		}
 		return nil

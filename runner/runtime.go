@@ -340,8 +340,8 @@ type AttemptEndpoint struct {
 
 const (
 	AttemptEndpointService = "service"
-	AttemptEndpointView    = "view"
-	AttemptEndpointControl = "control"
+	AttemptEndpointView    = contract.ComputerDisplayEndpointView
+	AttemptEndpointControl = contract.ComputerDisplayEndpointControl
 )
 
 // OCIComputerControlRuntime exposes the attempt-fenced guest driving signal

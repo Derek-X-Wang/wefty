@@ -305,8 +305,9 @@ agent restart and has no idle-release timer.
 
 The attempt lifecycle mounts this handler only through `Fabric.Listen("tcp",
 ":0")`; neither a LAN listener nor either raw guest/helper endpoint is
-published. After authoritative `Started`, both view and control wire contracts
-are polled until they succeed or the 60-second deadline yields typed,
+published. It captures the authoritative `Started` timestamp before
+post-start signal I/O, then polls both view and control wire contracts until
+they succeed or the exact 60-second deadline yields typed,
 restartable `startup_readiness_timeout`. Readiness publishes the Fabric
 front-door URL as `display_endpoint`; later loss or stop first disables the
 front door and closes its sessions, then withdraws the fenced L1 projection.

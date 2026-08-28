@@ -41,6 +41,7 @@ const (
 	// cgroup-charged tmpfs ceilings must be reviewed against the 1 GiB default.
 	computerTmpKilobytes    = 512 * 1024
 	computerVarTmpKilobytes = 64 * 1024
+	computerDevShmKilobytes = contract.ComputerDevShmBytes / 1024
 )
 
 var appArmorProfilePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
@@ -589,13 +590,16 @@ func isolationResources(limits WorkloadLimits) (*specs.LinuxResources, error) {
 }
 
 func isolationMounts(input RuntimeSpecInput) ([]specs.Mount, error) {
+	devShmKilobytes := int64(64 * 1024)
+	computer := workloadHasComputerDisk(input.Workload)
+	if computer {
+		devShmKilobytes = computerDevShmKilobytes
+	}
 	mounts := []specs.Mount{
 		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
 		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
 		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
-		// TODO(#125): the M3.5 Ticket 10 / spec section 11.2 profile work
-		// replaces this shared 64 MiB default with a private 1 GiB Computer mount.
-		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
+		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", fmt.Sprintf("size=%dk", devShmKilobytes)}},
 		{Destination: "/dev/mqueue", Type: "mqueue", Source: "mqueue", Options: []string{"nosuid", "noexec", "nodev"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 		{Destination: "/sys/fs/cgroup", Type: "cgroup", Source: "cgroup", Options: []string{"nosuid", "noexec", "nodev", "relatime", "ro"}},
@@ -603,15 +607,12 @@ func isolationMounts(input RuntimeSpecInput) ([]specs.Mount, error) {
 		readonlyBindMount(input.ResolverPath, "/etc/resolv.conf"),
 		readonlyBindMount(input.HostsPath, "/etc/hosts"),
 	}
-	for _, volume := range input.Workload.ManagedVolumes {
-		if volume.Kind == ManagedVolumeComputerDisk {
-			mounts = append(mounts,
-				readonlyBindMount(input.ComputerControlSource, contract.OCIContainerControlDirectory),
-				specs.Mount{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", computerTmpKilobytes)}},
-				specs.Mount{Destination: "/var/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", computerVarTmpKilobytes)}},
-			)
-			break
-		}
+	if computer {
+		mounts = append(mounts,
+			readonlyBindMount(input.ComputerControlSource, contract.OCIContainerControlDirectory),
+			specs.Mount{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", computerTmpKilobytes)}},
+			specs.Mount{Destination: "/var/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", computerVarTmpKilobytes)}},
+		)
 	}
 	for _, volume := range input.Workload.ManagedVolumes {
 		var destination string

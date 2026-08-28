@@ -63,6 +63,20 @@ func TestServiceAcceptancePinnedRuntimeProfiles(t *testing.T) {
 					t.Fatal("helper log segments escaped into the payload mount table")
 				}
 			}
+			if test.computer {
+				if profile.Root == nil || !profile.Root.Readonly {
+					t.Fatalf("Computer golden root = %#v, want read-only", profile.Root)
+				}
+				assertMount(t, profile.Mounts, "/wefty/service", "/run/wefty/fixtures/computer-disk", false)
+				assertMount(t, profile.Mounts, "/wefty/control", "/run/wefty/fixtures/control", true)
+				assertExactMount(t, profile.Mounts, specs.Mount{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=1048576k"}})
+				if environmentValue(profile.Process.Env, "WEFTY_COMPUTER_VIEW_PORT") != "42111" ||
+					environmentValue(profile.Process.Env, "WEFTY_COMPUTER_CONTROL_PORT") != "42112" ||
+					environmentValue(profile.Process.Env, "WEFTY_SERVICE_PORT") != "" ||
+					environmentValue(profile.Process.Env, "WEFTY_COMPUTER_TOKEN") != "" {
+					t.Fatalf("Computer golden reserved environment = %#v", profile.Process.Env)
+				}
+			}
 			if test.golden == "wefty-v1-linux-amd64.json" && profile.Process.ApparmorProfile != "wefty-default" {
 				t.Fatalf("opportunistic AppArmor profile = %q", profile.Process.ApparmorProfile)
 			}

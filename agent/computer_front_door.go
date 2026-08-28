@@ -21,15 +21,15 @@ import (
 )
 
 const (
-	computerWebSocketPath                  = "/websockify"
-	computerWebSocketSubprotocol           = "binary"
+	computerWebSocketPath                  = contract.ComputerDisplayWebSocketPath
+	computerWebSocketSubprotocol           = contract.ComputerDisplayWebSocketSubprotocol
 	computerControlTakePath                = "/wefty/control/take"
 	computerControlReleasePath             = "/wefty/control/release"
 	computerControlTokenHeader             = "X-Wefty-Control-Token"
-	computerRFBVersionBannerBytes          = 12
+	computerRFBVersionBannerBytes          = contract.ComputerRFBVersionBannerBytes
 	DefaultComputerSessionCap              = time.Hour
 	DefaultComputerIdentityRevalidation    = time.Minute
-	DefaultComputerReadinessDeadline       = 60 * time.Second
+	DefaultComputerReadinessDeadline       = contract.ComputerStartupReadinessTimeout
 	DefaultComputerReadinessProbeInterval  = 100 * time.Millisecond
 	DefaultComputerReadinessConnectTimeout = 2 * time.Second
 	DefaultComputerDenialFlushInterval     = time.Minute
@@ -777,15 +777,7 @@ func dialComputerBackendWithLifetime(dialContext, lifetimeContext context.Contex
 }
 
 func validRFBVersionBanner(banner []byte) bool {
-	if len(banner) != computerRFBVersionBannerBytes || string(banner[:4]) != "RFB " || banner[7] != '.' || banner[11] != '\n' {
-		return false
-	}
-	for _, index := range []int{4, 5, 6, 8, 9, 10} {
-		if banner[index] < '0' || banner[index] > '9' {
-			return false
-		}
-	}
-	return true
+	return contract.ValidComputerRFBVersionBanner(banner)
 }
 
 type computerReadinessError struct {

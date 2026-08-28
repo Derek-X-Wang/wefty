@@ -577,6 +577,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			lifecycle.dependencies.observer.setAttempt(claim.Lease.AttemptID, AttemptRunning, nil)
 		}
 	}
+	if computerService {
+		request.Execution = withoutComputerReservedOperatorEnvironment(request.Execution)
+	}
 	admission, preflightResult, preflightErr := runtimeAdapter.Preflight(ctx, request)
 	if admission.Release != nil {
 		defer admission.Release()
@@ -861,6 +864,26 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		result, runErr = runtimeResult.Outcome, err
 	}
 	return finish(result, runErr)
+}
+
+// withoutComputerReservedOperatorEnvironment removes every tenant-supplied
+// reserved value before later Computer lifecycle steps inject the authoritative
+// service directory and the helper injects its allocated ports. Ordinary L3
+// OCI Runs retain their separately minted run-token execution context.
+func withoutComputerReservedOperatorEnvironment(execution contract.ExecutionSpec) contract.ExecutionSpec {
+	execution.Env = cloneEnvironment(execution.Env)
+	execution.SensitiveEnv = cloneEnvironment(execution.SensitiveEnv)
+	for name := range execution.Env {
+		if contract.IsOCIReservedEnvironmentName(name) {
+			delete(execution.Env, name)
+		}
+	}
+	for name := range execution.SensitiveEnv {
+		if contract.IsOCIReservedEnvironmentName(name) {
+			delete(execution.SensitiveEnv, name)
+		}
+	}
+	return execution
 }
 
 func workloadAuthority(nodeID, bootSessionID string, claim l1.Claim) workloadrunner.AttemptAuthority {

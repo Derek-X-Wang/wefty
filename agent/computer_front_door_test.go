@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -308,13 +309,34 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 				}
 				return good.dial(ctx)
 			}
-			err := probeComputerBackends(t.Context(), systemClock{}, time.Now().Add(-DefaultComputerReadinessDeadline), dial)
-			var readiness *computerReadinessError
-			if !errors.As(err, &readiness) || readiness.Code != "startup_readiness_timeout" {
-				t.Fatalf("readiness error = %#v", err)
-			}
+			assertComputerBackendNeverReady(t, dial)
 		})
 	}
+
+	t.Run("plain TCP", func(t *testing.T) {
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		go func() {
+			for {
+				connection, acceptErr := listener.Accept()
+				if acceptErr != nil {
+					return
+				}
+				_, _ = connection.Write([]byte("RFB 003.008\n"))
+				_ = connection.Close()
+			}
+		}()
+		dial := func(ctx context.Context, name string) (net.Conn, error) {
+			if name == workloadrunner.AttemptEndpointView {
+				return (&net.Dialer{}).DialContext(ctx, "tcp4", listener.Addr().String())
+			}
+			return good.dial(ctx)
+		}
+		assertComputerBackendNeverReady(t, dial)
+	})
 
 	t.Run("60 second deadline", func(t *testing.T) {
 		now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
@@ -333,6 +355,21 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 			t.Fatalf("deadline error = %#v", err)
 		}
 	})
+}
+
+func assertComputerBackendNeverReady(t *testing.T, dial computerEndpointDial) {
+	t.Helper()
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(now)
+	result := make(chan error, 1)
+	go func() { result <- probeComputerBackends(t.Context(), clock, now, dial) }()
+	clock.waitForDeadline(t, now.Add(DefaultComputerReadinessDeadline))
+	clock.Advance(DefaultComputerReadinessDeadline)
+	err := <-result
+	var readiness *computerReadinessError
+	if !errors.As(err, &readiness) || readiness.Code != contract.SpawnFailureStartupReadinessTimeout {
+		t.Fatalf("readiness error = %#v", err)
+	}
 }
 
 func TestComputerFrontDoorRequiresDenyByDefaultConstruction(t *testing.T) {

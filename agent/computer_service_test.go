@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -91,6 +93,106 @@ func TestComputerServicePublishesOnlyFabricFrontDoorAndAdmissionDialsView(t *tes
 	defer dialMu.Unlock()
 	if dials[workloadrunner.AttemptEndpointView] != dials[workloadrunner.AttemptEndpointControl]+1 {
 		t.Fatalf("endpoint dials=%v, want exactly one admission-only view dial", dials)
+	}
+}
+
+func TestComputerReadinessIsAtomicAcrossPartialLossAndRecovery(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(now)
+	view := newComputerBackend(t, computerBackendOptions{})
+	defer view.Close()
+	control := newComputerBackend(t, computerBackendOptions{})
+	defer control.Close()
+	var controlReady atomic.Bool
+	controlReady.Store(true)
+	dial := func(ctx context.Context, name string) (net.Conn, error) {
+		if name == workloadrunner.AttemptEndpointControl {
+			if !controlReady.Load() {
+				return nil, errors.New("control endpoint unavailable")
+			}
+			return control.dial(ctx)
+		}
+		return view.dial(ctx)
+	}
+	started := make(chan time.Time, 1)
+	started <- now
+	observations := make(chan bool, 8)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- monitorComputerReadiness(ctx, clock, started, dial, func(ready bool) { observations <- ready })
+	}()
+	wantComputerReadinessObservation(t, observations, true)
+
+	controlReady.Store(false)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	wantComputerReadinessObservation(t, observations, false)
+
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	wantNoComputerReadinessObservation(t, observations)
+
+	controlReady.Store(true)
+	clock.waitForDeadline(t, clock.Now().Add(DefaultComputerReadinessProbeInterval))
+	clock.Advance(DefaultComputerReadinessProbeInterval)
+	wantComputerReadinessObservation(t, observations, true)
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("readiness monitor stop: %v", err)
+	}
+	wantComputerReadinessObservation(t, observations, false)
+}
+
+func TestComputerReadinessDeadlineUsesAuthoritativeStartedTimestamp(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 5, 0, time.UTC)
+	startedAt := now.Add(-5 * time.Second)
+	clock := newManualClock(now)
+	view := newComputerBackend(t, computerBackendOptions{})
+	defer view.Close()
+	dial := func(ctx context.Context, name string) (net.Conn, error) {
+		if name == workloadrunner.AttemptEndpointControl {
+			return nil, errors.New("control endpoint unavailable")
+		}
+		return view.dial(ctx)
+	}
+	started := make(chan time.Time, 1)
+	started <- startedAt
+	observations := make(chan bool, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- monitorComputerReadiness(t.Context(), clock, started, dial, func(ready bool) { observations <- ready })
+	}()
+	deadline := startedAt.Add(DefaultComputerReadinessDeadline)
+	clock.waitForDeadline(t, deadline)
+	clock.Advance(deadline.Sub(clock.Now()))
+	err := <-done
+	var readiness *computerReadinessError
+	if !errors.As(err, &readiness) || readiness.Code != contract.SpawnFailureStartupReadinessTimeout {
+		t.Fatalf("late readiness error = %#v", err)
+	}
+	wantNoComputerReadinessObservation(t, observations)
+}
+
+func wantComputerReadinessObservation(t *testing.T, observations <-chan bool, want bool) {
+	t.Helper()
+	select {
+	case got := <-observations:
+		if got != want {
+			t.Fatalf("Computer readiness observation = %t, want %t", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for Computer readiness=%t", want)
+	}
+}
+
+func wantNoComputerReadinessObservation(t *testing.T, observations <-chan bool) {
+	t.Helper()
+	select {
+	case got := <-observations:
+		t.Fatalf("unexpected Computer readiness observation %t", got)
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 

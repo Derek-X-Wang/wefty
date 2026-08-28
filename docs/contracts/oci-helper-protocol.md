@@ -335,7 +335,11 @@ Golden review redacts sensitive values deterministically without changing the
 runtime document. `/etc/resolv.conf` and `/etc/hosts` are
 explicit read-only private bind mounts from helper-managed files. Their
 targets, the fixed `/proc`, `/dev`, `/sys`, and `/run` hierarchies, and
-`/wefty/handoff` and `/wefty/service` are helper-reserved mount targets.
+`/wefty/handoff`, `/wefty/service`, and `/wefty/control` are helper-reserved
+mount targets. A Computer receives a private 1 GiB `/dev/shm` tmpfs with
+`mode=1777,nosuid,nodev,noexec`; the private mount/IPC namespaces make it
+attempt-local and the kernel charges its pages to the attempt cgroup. Ordinary
+workloads retain the shared profile's 64 MiB `/dev/shm` ceiling.
 
 Wire validation is lexical only. The engine translates every operator source
 inside the helper (identity on native Linux; preconfigured shared-root mapping
@@ -362,7 +366,10 @@ runtime-spec v1.3.0 used by containerd v2.3.4 and the runc v2 shim targeted by
 The serialized fixtures under
 `runner/ocihelper/testdata/containerd-v2.3.4/` are the review boundary for
 native Linux amd64, Lima Linux arm64, service mounts/environment, default-root,
-numeric-user, and unlimited-resource inputs. The Linux-only oracle also compares
+numeric-user, unlimited-resource, and the complete Computer profile. The
+Computer fixture proves image USER/ENTRYPOINT/CMD semantics, the unchanged
+capability/seccomp/namespace/pseudo-device walls, no new privilege or GPU, and
+the private 1 GiB shm mount. The Linux-only oracle also compares
 each architecture's seccomp fixture with the real containerd generator after
 final capabilities are applied. Regenerate complete fixtures only in their
 matching Linux architecture with:

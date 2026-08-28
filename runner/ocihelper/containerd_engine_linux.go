@@ -1048,7 +1048,7 @@ func removeReservedEnvironment(environment []EnvironmentVariable, name string) [
 }
 
 func computerEndpointEnvironment(environment []EnvironmentVariable, endpoints map[string]uint16) ([]EnvironmentVariable, error) {
-	view, control := endpoints["view"], endpoints["control"]
+	view, control := endpoints[contract.ComputerDisplayEndpointView], endpoints[contract.ComputerDisplayEndpointControl]
 	if view == 0 || control == 0 || view == control || len(endpoints) != 2 {
 		return nil, errors.New("Computer endpoint allocation must be exactly distinct view and control ports")
 	}

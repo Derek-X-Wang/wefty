@@ -28,6 +28,17 @@ const (
 	OCIContainerServiceDirectory = "/wefty/service"
 	OCIContainerControlDirectory = "/wefty/control"
 
+	// Computer image compatibility is a fixed named/wire contract. Keep these
+	// values in the transport-neutral contract package so the agent, helper,
+	// reference image, and conformance checker cannot drift independently.
+	ComputerDisplayEndpointView               = "view"
+	ComputerDisplayEndpointControl            = "control"
+	ComputerDisplayWebSocketPath              = "/websockify"
+	ComputerDisplayWebSocketSubprotocol       = "binary"
+	ComputerRFBVersionBannerBytes             = 12
+	ComputerStartupReadinessTimeout           = 60 * time.Second
+	ComputerDevShmBytes                 int64 = 1 << 30
+
 	// StableNodeTagPrefix reserves the routing tag used when a cold rerun
 	// consumes node-local handoff files from an earlier execution.
 	StableNodeTagPrefix = "wefty:node:"
@@ -55,6 +66,28 @@ func IsOCIReservedEnvironmentName(name string) bool {
 		}
 	}
 	return false
+}
+
+// IsOCISensitiveReservedEnvironmentName reports the reserved values whose
+// authoritative contents must travel only through the sensitive environment
+// layer. Operator and image values are stripped for every reserved name.
+func IsOCISensitiveReservedEnvironmentName(name string) bool {
+	return name == EnvRunToken || name == EnvComputerToken
+}
+
+// ValidComputerRFBVersionBanner recognizes the 12-byte RFB version greeting
+// required after the rfb-websocket-v1 upgrade. Version negotiation after the
+// greeting remains the image's responsibility.
+func ValidComputerRFBVersionBanner(banner []byte) bool {
+	if len(banner) != ComputerRFBVersionBannerBytes || string(banner[:4]) != "RFB " || banner[7] != '.' || banner[11] != '\n' {
+		return false
+	}
+	for _, index := range []int{4, 5, 6, 8, 9, 10} {
+		if banner[index] < '0' || banner[index] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // JobSpec is the versioned, transport-neutral description of a job. Kind and
