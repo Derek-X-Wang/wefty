@@ -32,6 +32,7 @@ type computerGrantDecision struct {
 	FabricID       string
 	UserID         string
 	Permission     l1.ComputerGrantPermission
+	Administrator  bool
 	PolicyRevision int64
 	FreshUntil     time.Time
 }
@@ -80,6 +81,10 @@ func (authorization *ComputerGrantAuthorization) PolicyRevision() int64 {
 
 func (authorization *ComputerGrantAuthorization) CanTake() bool {
 	return authorization != nil && authorization.decision.Permission == l1.ComputerGrantControl
+}
+
+func (authorization *ComputerGrantAuthorization) IsAdministrator() bool {
+	return authorization != nil && authorization.decision.Administrator
 }
 
 func (authorization *ComputerGrantAuthorization) Revocations() <-chan ComputerPolicyRevocation {
@@ -220,6 +225,7 @@ func (cache *ComputerPolicyCache) lookupLocked(snapshot l1.ComputerPolicySnapsho
 		for _, admin := range snapshot.Admins {
 			if admin.FabricID == identity.FabricID && admin.UserID == identity.UserID {
 				decision.Permission = l1.ComputerGrantControl
+				decision.Administrator = true
 				return decision
 			}
 		}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -92,9 +94,209 @@ func TestComputerServicePublishesOnlyFabricFrontDoorAndAdmissionDialsView(t *tes
 	}
 }
 
+func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T) {
+	identity := fabric.Identity{FabricID: "fabric-one", UserID: "person-a", DeviceID: "device-a"}
+	privateFabric := &recordingComputerServiceFabric{identity: identity}
+	cache := NewComputerPolicyCache(systemClock{}, "node-1", "boot-1")
+	defer cache.Close()
+	if _, err := cache.Install(policySnapshot(t, time.Now().UTC(), 1, 1, nil, l1.ComputerGrant{
+		FabricID: identity.FabricID, UserID: identity.UserID, Permission: l1.ComputerGrantControl, PolicyRevision: 1,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	viewBackend := newComputerBackend(t, computerBackendOptions{})
+	defer viewBackend.Close()
+	controlBackend := newComputerBackend(t, computerBackendOptions{})
+	defer controlBackend.Close()
+	dial := func(ctx context.Context, name string) (net.Conn, error) {
+		if name == workloadrunner.AttemptEndpointControl {
+			return controlBackend.dial(ctx)
+		}
+		return viewBackend.dial(ctx)
+	}
+	auditor := &recordingComputerAuditor{}
+	type runningService struct {
+		cancel   context.CancelFunc
+		done     chan error
+		endpoint string
+		runtime  *restartComputerRuntime
+	}
+	start := func() runningService {
+		ctx, cancel := context.WithCancel(t.Context())
+		runtime := &restartComputerRuntime{opaqueEndpointRuntime: &opaqueEndpointRuntime{release: make(chan struct{})}}
+		published := make(chan string, 2)
+		done := make(chan error, 1)
+		go func() {
+			_, err := runComputerService(ctx, runtime, workloadrunner.Request{}, nil, computerServiceConfig{
+				clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: auditor,
+				computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1", dial: dial,
+				publish: func(_ context.Context, ready bool, endpoint string) error {
+					if ready {
+						published <- endpoint
+					}
+					return nil
+				},
+			})
+			done <- err
+		}()
+		select {
+		case endpoint := <-published:
+			return runningService{cancel: cancel, done: done, endpoint: endpoint, runtime: runtime}
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatal("Computer service was not published")
+			return runningService{}
+		}
+	}
+
+	first := start()
+	firstBase := "http" + strings.TrimSuffix(first.endpoint[len("ws"):], computerWebSocketPath)
+	oldClient, oldToken := dialComputerFrontDoorWithToken(t, firstBase, nil)
+	if _, _, err := oldClient.Read(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if status := postComputerControl(t, firstBase, computerControlTakePath, oldToken); status != http.StatusNoContent {
+		t.Fatalf("first take status = %d", status)
+	}
+	if signals := first.runtime.signalSnapshot(); len(signals) != 2 || signals[0] || !signals[1] {
+		t.Fatalf("first service startup/take signals = %v", signals)
+	}
+	first.cancel()
+	select {
+	case <-first.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old Computer service did not stop")
+	}
+	readContext, cancelRead := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelRead()
+	if _, _, err := oldClient.Read(readContext); err == nil {
+		t.Fatal("agent restart left the old input leg open")
+	}
+	if signals := first.runtime.signalSnapshot(); len(signals) != 3 || signals[2] {
+		t.Fatalf("old service did not clear driver signal: %v", signals)
+	}
+	var released bool
+	for _, event := range auditor.snapshot() {
+		released = released || event.Kind == l1.ComputerTakeoverControlReleased
+	}
+	if !released {
+		t.Fatalf("agent restart did not record release: %#v", auditor.snapshot())
+	}
+
+	second := start()
+	defer second.cancel()
+	secondBase := "http" + strings.TrimSuffix(second.endpoint[len("ws"):], computerWebSocketPath)
+	freshClient, freshToken := dialComputerFrontDoorWithToken(t, secondBase, nil)
+	defer freshClient.CloseNow()
+	if _, _, err := freshClient.Read(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if status := postComputerControl(t, secondBase, computerControlTakePath, freshToken); status != http.StatusNoContent {
+		t.Fatalf("fresh holder take status = %d", status)
+	}
+	if signals := second.runtime.signalSnapshot(); len(signals) != 2 || signals[0] || !signals[1] {
+		t.Fatalf("fresh service startup/take signals = %v", signals)
+	}
+}
+
+func TestComputerServiceConsumesRetriedFrontDoorAuditFailure(t *testing.T) {
+	identity := fabric.Identity{FabricID: "fabric-one", UserID: "person-a", DeviceID: "device-a"}
+	privateFabric := &recordingComputerServiceFabric{identity: identity}
+	cache := NewComputerPolicyCache(systemClock{}, "node-1", "boot-1")
+	defer cache.Close()
+	if _, err := cache.Install(policySnapshot(t, time.Now().UTC(), 1, 1, nil, l1.ComputerGrant{
+		FabricID: identity.FabricID, UserID: identity.UserID, Permission: l1.ComputerGrantView, PolicyRevision: 1,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	backend := newComputerBackend(t, computerBackendOptions{})
+	defer backend.Close()
+	auditor := &failingComputerAuditor{}
+	runtime := &opaqueEndpointRuntime{release: make(chan struct{})}
+	published := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, err := runComputerService(t.Context(), runtime, workloadrunner.Request{}, nil, computerServiceConfig{
+			clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: auditor,
+			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1",
+			dial: func(ctx context.Context, _ string) (net.Conn, error) { return backend.dial(ctx) },
+			publish: func(_ context.Context, ready bool, endpoint string) error {
+				if ready {
+					published <- endpoint
+				}
+				return nil
+			},
+		})
+		done <- err
+	}()
+	var endpoint string
+	select {
+	case endpoint = <-published:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Computer service was not published")
+	}
+	base := "http" + strings.TrimSuffix(endpoint[len("ws"):], computerWebSocketPath)
+	connection, _ := dialComputerFrontDoorWithToken(t, base, nil)
+	defer connection.CloseNow()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "audit unavailable") {
+			t.Fatalf("service audit failure = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Computer service ignored front-door audit failure")
+	}
+	if calls := auditor.callCount(); calls != computerAuditAttempts {
+		t.Fatalf("front-door audit attempts = %d, want %d", calls, computerAuditAttempts)
+	}
+}
+
 type recordingComputerServiceFabric struct {
 	identity                     fabric.Identity
 	listenNetwork, listenAddress string
+}
+
+func (runtime *opaqueEndpointRuntime) SetComputerControlState(context.Context, workloadrunner.AttemptAuthority, bool) error {
+	return nil
+}
+
+type restartComputerRuntime struct {
+	*opaqueEndpointRuntime
+	mu      sync.Mutex
+	signals []bool
+}
+
+type failingComputerAuditor struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (auditor *failingComputerAuditor) AppendComputerTakeoverAudit(
+	context.Context, string, string, string, l1.ComputerTakeoverAuditRequest,
+) (l1.ComputerTakeoverAuditReceipt, error) {
+	auditor.mu.Lock()
+	defer auditor.mu.Unlock()
+	auditor.calls++
+	return l1.ComputerTakeoverAuditReceipt{}, errors.New("audit unavailable")
+}
+
+func (auditor *failingComputerAuditor) callCount() int {
+	auditor.mu.Lock()
+	defer auditor.mu.Unlock()
+	return auditor.calls
+}
+
+func (runtime *restartComputerRuntime) SetComputerControlState(_ context.Context, _ workloadrunner.AttemptAuthority, value bool) error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	runtime.signals = append(runtime.signals, value)
+	return nil
+}
+
+func (runtime *restartComputerRuntime) signalSnapshot() []bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return append([]bool(nil), runtime.signals...)
 }
 
 func (value *recordingComputerServiceFabric) Listen(network, address string) (net.Listener, error) {
