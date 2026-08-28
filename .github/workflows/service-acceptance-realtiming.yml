@@ -71,9 +71,17 @@ jobs:
     env:
       IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out the exact trusted publishing commit
+        if: github.event_name == 'workflow_run'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Check out current trusted main for scheduled evidence
+        if: github.event_name != 'workflow_run'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
           persist-credentials: false
       - name: Download the triggering publication artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -89,9 +97,12 @@ jobs:
         run: |
           set -euo pipefail
           tar -xf "$RUNNER_TEMP/acceptance-image-download/wefty-acceptance-image-release.tar" -C "$RUNNER_TEMP"
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
           test "$(jq -r .commit "$RUNNER_TEMP/acceptance-image-release/acceptance-image-receipt.json")" = "$EXPECTED_SHA"
-          printf 'CANDIDATE_SHA=%s\n' "$EXPECTED_SHA" >> "$GITHUB_ENV"
+          candidate_sha="$(git rev-parse HEAD)"
+          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
+            test "$candidate_sha" = "$EXPECTED_SHA"
+          fi
+          printf 'CANDIDATE_SHA=%s\nPUBLISHED_SHA=%s\n' "$candidate_sha" "$EXPECTED_SHA" >> "$GITHUB_ENV"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod

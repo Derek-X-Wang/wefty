@@ -104,9 +104,14 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			t.Fatalf("realtiming is missing immutable artifact contract %q", required)
 		}
 	}
-	for _, forbidden := range []string{"ref: main", "$IMAGE_NAME:$CANDIDATE_SHA", "crane pull"} {
+	for _, forbidden := range []string{"$IMAGE_NAME:$CANDIDATE_SHA", "crane pull"} {
 		if strings.Contains(realtimeText, forbidden) {
 			t.Fatalf("realtiming reintroduced mutable consumption %q", forbidden)
+		}
+	}
+	for _, required := range []string{"if: github.event_name == 'workflow_run'", "ref: ${{ github.event.workflow_run.head_sha }}", "if: github.event_name != 'workflow_run'", "ref: main", "PUBLISHED_SHA"} {
+		if !strings.Contains(realtimeText, required) {
+			t.Fatalf("realtiming checkout trust split is missing %q", required)
 		}
 	}
 	for _, required := range []string{"$IMAGE_NAME@$index_digest", "--probe-reference \"$IMAGE_NAME\"", "bin/wefty", "wefty-acceptance-image-release.tar", "Public GHCR verification failed"} {
