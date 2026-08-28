@@ -14,6 +14,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/coder/websocket"
 )
 
@@ -32,6 +33,11 @@ func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.
 	handle := <-frontDoor.sessionHandles
 	if !handle.CanTake() {
 		t.Fatal("control-authorized session did not retain its narrow take capability")
+	}
+	controlConnection, takeErr := handle.dialControl(t.Context())
+	var tenureErr *ComputerTenureError
+	if controlConnection != nil || !errors.As(takeErr, &tenureErr) || tenureErr.Code != ComputerTenureUnavailable {
+		t.Fatalf("default control tenure = %#v err=%v", controlConnection, takeErr)
 	}
 
 	now := cache.clock.Now().Add(time.Second)
@@ -53,13 +59,27 @@ func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.
 	events := auditor.snapshot()
 	if len(events) != 2 || events[0].Kind != l1.ComputerTakeoverSessionOpen || events[1].Kind != l1.ComputerTakeoverSessionClose ||
 		events[0].AuthorizedRole != l1.ComputerGrantControl || events[0].AdmittedMode != "view" ||
-		events[1].Reason != string(ComputerPolicyRevoked) {
+		events[1].Reason != l1.ComputerTakeoverRevoked {
 		t.Fatalf("take-over audit events = %#v", events)
 	}
 	for _, event := range events {
 		if event.UserID != identity.UserID || event.DeviceID != identity.DeviceID || event.AuthorityGeneration != 0 {
 			t.Fatalf("audit identity/privacy = %#v", event)
 		}
+	}
+}
+
+func TestComputerFrontDoorIgnoresClientAuthorityHeaders(t *testing.T) {
+	fixture, _, _, _, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantView)
+	defer server.Close()
+	connection := dialComputerFrontDoor(t, server.URL, http.Header{"X-Wefty-Take": []string{"control"}, "X-Wefty-Role": []string{"control"}})
+	defer connection.CloseNow()
+	if _, _, err := connection.Read(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	handle := <-fixture.sessionHandles
+	if handle.CanTake() || fixture.controlDials.Load() != 0 {
+		t.Fatalf("client headers changed authority: canTake=%t controlDials=%d", handle.CanTake(), fixture.controlDials.Load())
 	}
 }
 
@@ -96,7 +116,6 @@ func TestComputerFrontDoorRejectsAdversarialAdmissionBeforeBackendDial(t *testin
 		{name: "missing subprotocol", permission: l1.ComputerGrantView, path: computerWebSocketPath},
 		{name: "wrong subprotocol", permission: l1.ComputerGrantView, path: computerWebSocketPath, protocols: []string{"control"}},
 		{name: "multiple subprotocols", permission: l1.ComputerGrantView, path: computerWebSocketPath, protocols: []string{"binary", "control"}},
-		{name: "client role header", permission: l1.ComputerGrantControl, path: computerWebSocketPath, protocols: []string{"binary"}, headers: http.Header{"X-Wefty-Role": []string{"control"}}},
 		{name: "machine principal", permission: l1.ComputerGrantControl, path: computerWebSocketPath, protocols: []string{"binary"}, identity: func(identity fabric.Identity) fabric.Identity {
 			identity.Kind = fabric.IdentityKindMachine
 			return identity
@@ -118,10 +137,17 @@ func TestComputerFrontDoorRejectsAdversarialAdmissionBeforeBackendDial(t *testin
 			if fixture.viewDials.Load() != 0 || fixture.controlDials.Load() != 0 {
 				t.Fatalf("rejected admission dialed view/control = %d/%d", fixture.viewDials.Load(), fixture.controlDials.Load())
 			}
+			fixture.frontDoor.denials.flush(t.Context())
 			events := auditor.snapshot()
-			if len(events) != 1 || events[0].Kind != l1.ComputerTakeoverAdmissionDenied ||
-				events[0].UserID != identity.UserID || events[0].DeviceID != identity.DeviceID {
+			if len(events) != 1 || events[0].Kind != l1.ComputerTakeoverAdmissionDenied {
 				t.Fatalf("authenticated denial audit = %#v", events)
+			}
+			if test.name == "machine principal" {
+				if events[0].UserID != "" || events[0].DeviceID != "" {
+					t.Fatalf("machine denial populated person columns: %#v", events[0])
+				}
+			} else if events[0].UserID != identity.UserID || events[0].DeviceID != identity.DeviceID {
+				t.Fatalf("person denial identity = %#v", events[0])
 			}
 		})
 	}
@@ -136,6 +162,7 @@ func TestComputerFrontDoorRejectsWhoIsFailureAndStalePolicyBeforeDial(t *testing
 		connection.CloseNow()
 		t.Fatal("WhoIs failure admitted")
 	}
+	fixture.frontDoor.denials.flush(t.Context())
 	if events := auditor.snapshot(); len(events) != 1 || events[0].Kind != l1.ComputerTakeoverAdmissionDenied ||
 		events[0].Reason != "identity_unavailable" {
 		t.Fatalf("WhoIs denial audit = %#v", events)
@@ -180,8 +207,16 @@ func TestComputerFrontDoorRejectsWhoIsFailureAndStalePolicyBeforeDial(t *testing
 func TestComputerFrontDoorSessionCapAndTextFramesCloseBothLegs(t *testing.T) {
 	t.Run("session cap", func(t *testing.T) {
 		fixture, _, auditor, _, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantView)
+		server.Close()
+		config := fixture.frontDoor.config
+		config.sessionCap = 5 * time.Minute
+		frontDoor, err := newComputerFrontDoor(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frontDoor.SetReady(true)
+		server = httptest.NewServer(frontDoor)
 		defer server.Close()
-		fixture.frontDoor.config.sessionCap = 5 * time.Minute
 		connection := dialComputerFrontDoor(t, server.URL, nil)
 		defer connection.CloseNow()
 		if _, _, err := connection.Read(t.Context()); err != nil {
@@ -207,8 +242,21 @@ func TestComputerFrontDoorSessionCapAndTextFramesCloseBothLegs(t *testing.T) {
 
 	t.Run("periodic identity revalidation", func(t *testing.T) {
 		fixture, _, auditor, _, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantView)
+		server.Close()
+		config := fixture.frontDoor.config
+		config.revalidationInterval = 5 * time.Minute
+		frontDoor, err := newComputerFrontDoor(config)
+		if err == nil {
+			t.Fatal("front door accepted revalidation less frequent than once per minute")
+		}
+		config.revalidationInterval = time.Minute
+		frontDoor, err = newComputerFrontDoor(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frontDoor.SetReady(true)
+		server = httptest.NewServer(frontDoor)
 		defer server.Close()
-		fixture.frontDoor.config.revalidationInterval = 5 * time.Minute
 		connection := dialComputerFrontDoor(t, server.URL, nil)
 		defer connection.CloseNow()
 		if _, _, err := connection.Read(t.Context()); err != nil {
@@ -216,11 +264,11 @@ func TestComputerFrontDoorSessionCapAndTextFramesCloseBothLegs(t *testing.T) {
 		}
 		identity.DeviceID = "different-device"
 		fixture.identity.set(identity, nil)
-		fixture.clock.waitForDeadline(t, fixture.clock.Now().Add(5*time.Minute))
-		fixture.clock.Advance(5 * time.Minute)
+		fixture.clock.waitForDeadline(t, fixture.clock.Now().Add(time.Minute))
+		fixture.clock.Advance(time.Minute)
 		waitComputerAuditKind(t, auditor, l1.ComputerTakeoverSessionClose)
 		events := auditor.snapshot()
-		if events[len(events)-1].Reason != "identity_changed" {
+		if events[len(events)-1].Reason != l1.ComputerTakeoverRevalidationFailed {
 			t.Fatalf("identity-change close reason = %q", events[len(events)-1].Reason)
 		}
 	})
@@ -248,7 +296,8 @@ func TestComputerFrontDoorSessionCapAndTextFramesCloseBothLegs(t *testing.T) {
 func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 	good := newComputerBackend(t, computerBackendOptions{})
 	defer good.Close()
-	if err := probeComputerBackends(t.Context(), systemClock{}, time.Now(), good.dial, good.dial); err != nil {
+	dialGood := func(ctx context.Context, _ string) (net.Conn, error) { return good.dial(ctx) }
+	if err := probeComputerBackends(t.Context(), systemClock{}, time.Now(), dialGood); err != nil {
 		t.Fatalf("valid readiness: %v", err)
 	}
 
@@ -264,9 +313,15 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 		t.Run(fixture.name, func(t *testing.T) {
 			backend := newComputerBackend(t, fixture.options)
 			defer backend.Close()
-			err := probeComputerBackends(t.Context(), systemClock{}, time.Now(), backend.dial, good.dial)
+			dial := func(ctx context.Context, name string) (net.Conn, error) {
+				if name == workloadrunner.AttemptEndpointView {
+					return backend.dial(ctx)
+				}
+				return good.dial(ctx)
+			}
+			err := probeComputerBackends(t.Context(), systemClock{}, time.Now().Add(-DefaultComputerReadinessDeadline), dial)
 			var readiness *computerReadinessError
-			if !errors.As(err, &readiness) || readiness.Code != "runtime_unavailable" {
+			if !errors.As(err, &readiness) || readiness.Code != "startup_readiness_timeout" {
 				t.Fatalf("readiness error = %#v", err)
 			}
 		})
@@ -275,12 +330,12 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 	t.Run("60 second deadline", func(t *testing.T) {
 		now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 		clock := newManualClock(now)
-		blocked := func(ctx context.Context) (net.Conn, error) {
+		blocked := func(ctx context.Context, _ string) (net.Conn, error) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}
 		result := make(chan error, 1)
-		go func() { result <- probeComputerBackends(t.Context(), clock, now, blocked, blocked) }()
+		go func() { result <- probeComputerBackends(t.Context(), clock, now, blocked) }()
 		clock.waitForDeadline(t, now.Add(DefaultComputerReadinessDeadline))
 		clock.Advance(DefaultComputerReadinessDeadline)
 		err := <-result
@@ -344,23 +399,28 @@ func computerFrontDoorFixture(t *testing.T, permission l1.ComputerGrantPermissio
 	t.Cleanup(backend.Close)
 	auditor := &recordingComputerAuditor{}
 	fixture := &computerFrontDoorTestFixture{identity: identityFabric, clock: clock, sessionHandles: make(chan *computerSessionHandle, 1)}
-	viewDial := func(ctx context.Context) (net.Conn, error) {
-		fixture.viewDials.Add(1)
-		return backend.dial(ctx)
-	}
-	controlDial := func(context.Context) (net.Conn, error) {
-		fixture.controlDials.Add(1)
-		return nil, errors.New("control must not be dialed by admission")
+	dial := func(ctx context.Context, name string) (net.Conn, error) {
+		switch name {
+		case workloadrunner.AttemptEndpointView:
+			fixture.viewDials.Add(1)
+			return backend.dial(ctx)
+		case workloadrunner.AttemptEndpointControl:
+			fixture.controlDials.Add(1)
+			return nil, errors.New("control must not be dialed by admission")
+		default:
+			return nil, errors.New("unknown Computer endpoint")
+		}
 	}
 	frontDoor, err := newComputerFrontDoor(computerFrontDoorConfig{
 		authorityContext: t.Context(), fabric: identityFabric, authorizer: cache, auditor: auditor, clock: clock,
 		computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1",
-		viewDial: viewDial, controlDial: controlDial, onSession: func(handle *computerSessionHandle) { fixture.sessionHandles <- handle },
+		dial: dial, onSession: func(handle *computerSessionHandle) { fixture.sessionHandles <- handle },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	fixture.frontDoor = frontDoor
+	frontDoor.SetReady(true)
 	server := httptest.NewServer(frontDoor)
 	return fixture, cache, auditor, &fixture.controlDials, server, identity
 }

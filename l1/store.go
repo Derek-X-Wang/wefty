@@ -27,44 +27,47 @@ import (
 )
 
 const (
-	DefaultLogPageLimit   = 200
-	MaxLogPageLimit       = 1000
-	MaxLogBatchEvents     = 256
-	MaxLogEventBytes      = 4 << 20
-	MaxLogUploadBodyBytes = 20 << 20
+	DefaultLogPageLimit         = 200
+	MaxLogPageLimit             = 1000
+	MaxLogBatchEvents           = 256
+	MaxLogEventBytes            = 4 << 20
+	MaxLogUploadBodyBytes       = 20 << 20
+	computerDisplayEndpointPath = "/websockify"
 )
 
 type StoreOptions struct {
-	Clock                        Clock
-	Jitter                       func(time.Duration) time.Duration
-	LeaseDuration                time.Duration
-	LateEvidenceWindow           time.Duration
-	NodeStaleAfter               time.Duration
-	NodeDeadAfter                time.Duration
-	ServiceStabilityWindow       time.Duration
-	ServiceLogRetentionBytes     int64
-	ServiceLogRetentionAge       time.Duration
-	PrestartInfrastructureBudget time.Duration
-	AdminBootstrapTTL            time.Duration
+	Clock                             Clock
+	Jitter                            func(time.Duration) time.Duration
+	LeaseDuration                     time.Duration
+	LateEvidenceWindow                time.Duration
+	NodeStaleAfter                    time.Duration
+	NodeDeadAfter                     time.Duration
+	ServiceStabilityWindow            time.Duration
+	ServiceLogRetentionBytes          int64
+	ServiceLogRetentionAge            time.Duration
+	PrestartInfrastructureBudget      time.Duration
+	AdminBootstrapTTL                 time.Duration
+	ComputerTakeoverAuditRetentionAge time.Duration
 }
 
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
-	db                           *sql.DB
-	clock                        Clock
-	restartJitter                func(time.Duration) time.Duration
-	leaseDuration                time.Duration
-	lateEvidenceWindow           time.Duration
-	nodeStaleAfter               time.Duration
-	nodeDeadAfter                time.Duration
-	serviceStabilityWindow       time.Duration
-	serviceLogRetentionBytes     int64
-	serviceLogRetentionAge       time.Duration
-	prestartInfrastructureBudget time.Duration
-	adminBootstrapTTL            time.Duration
-	deploymentID                 string
-	policyChangeMu               sync.Mutex
-	policyChanged                chan struct{}
+	db                                *sql.DB
+	clock                             Clock
+	restartJitter                     func(time.Duration) time.Duration
+	leaseDuration                     time.Duration
+	lateEvidenceWindow                time.Duration
+	nodeStaleAfter                    time.Duration
+	nodeDeadAfter                     time.Duration
+	serviceStabilityWindow            time.Duration
+	serviceLogRetentionBytes          int64
+	serviceLogRetentionAge            time.Duration
+	prestartInfrastructureBudget      time.Duration
+	adminBootstrapTTL                 time.Duration
+	computerTakeoverAuditRetentionAge time.Duration
+	deploymentID                      string
+	policyChangeMu                    sync.Mutex
+	policyChanged                     chan struct{}
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
@@ -130,6 +133,13 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if adminBootstrapTTL == 0 {
 		adminBootstrapTTL = DefaultAdminBootstrapTTL
 	}
+	computerTakeoverAuditRetentionAge := options.ComputerTakeoverAuditRetentionAge
+	if computerTakeoverAuditRetentionAge < 0 {
+		return nil, fmt.Errorf("l1: Computer take-over audit retention age must be non-negative")
+	}
+	if computerTakeoverAuditRetentionAge == 0 {
+		computerTakeoverAuditRetentionAge = DefaultComputerTakeoverAuditRetentionAge
+	}
 	deploymentID, err := loadOrCreateDeploymentID(path)
 	if err != nil {
 		return nil, err
@@ -150,10 +160,11 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		db: db, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
-		prestartInfrastructureBudget: prestartInfrastructureBudget,
-		adminBootstrapTTL:            adminBootstrapTTL,
-		deploymentID:                 deploymentID,
-		policyChanged:                make(chan struct{}),
+		prestartInfrastructureBudget:      prestartInfrastructureBudget,
+		adminBootstrapTTL:                 adminBootstrapTTL,
+		computerTakeoverAuditRetentionAge: computerTakeoverAuditRetentionAge,
+		deploymentID:                      deploymentID,
+		policyChanged:                     make(chan struct{}),
 	}
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
@@ -299,7 +310,8 @@ CREATE TABLE IF NOT EXISTS service_jobs (
   published_port INTEGER CHECK(published_port BETWEEN 1 AND 65535),
   last_failure BLOB,
   healthy_since_ns INTEGER,
-  published_attempt_id TEXT REFERENCES attempts(attempt_id) ON DELETE SET NULL
+  published_attempt_id TEXT REFERENCES attempts(attempt_id) ON DELETE SET NULL,
+  display_endpoint TEXT
 );
 CREATE INDEX IF NOT EXISTS service_jobs_bound_desired ON service_jobs(bound_node_id, desired_state);
 CREATE TABLE IF NOT EXISTS computers (
@@ -489,11 +501,11 @@ CREATE TABLE IF NOT EXISTS computer_policy_installations (
   PRIMARY KEY(node_id, boot_session_id, policy_generation)
 );
 CREATE TABLE IF NOT EXISTS computer_takeover_audit (
-  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL,
   event_id TEXT NOT NULL,
   event_kind TEXT NOT NULL CHECK(event_kind IN ('admission_denied', 'session_open', 'session_close', 'control_acquired', 'control_released', 'admin_overrode')),
   computer_id TEXT NOT NULL,
-  job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+  job_id TEXT NOT NULL,
   session_id TEXT NOT NULL,
   fabric_id TEXT NOT NULL,
   user_id TEXT NOT NULL,
@@ -504,6 +516,7 @@ CREATE TABLE IF NOT EXISTS computer_takeover_audit (
   authority_generation INTEGER NOT NULL CHECK(authority_generation >= 0),
   occurred_ns INTEGER NOT NULL,
   reason TEXT NOT NULL,
+  event_count INTEGER NOT NULL CHECK(event_count >= 0),
   request_hash TEXT NOT NULL,
   PRIMARY KEY(attempt_id, event_id)
 );
@@ -573,6 +586,9 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
+	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
+		return err
+	}
 	if err := s.migrateComputerResetConstraints(ctx); err != nil {
 		return err
 	}
@@ -583,6 +599,34 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 		'current', c.created_ns
 	FROM computers c JOIN jobs j ON j.job_id=c.current_job_id`); err != nil {
 		return fmt.Errorf("l1: backfill Computer Storage generations: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return fmt.Errorf("l1: inspect %s columns: %w", table, err)
+	}
+	found := false
+	for rows.Next() {
+		var ordinal, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&ordinal, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("l1: inspect %s column: %w", table, err)
+		}
+		found = found || name == column
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("l1: close %s column inspection: %w", table, err)
+	}
+	if found {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition); err != nil {
+		return fmt.Errorf("l1: add %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -1816,7 +1860,7 @@ func validOCIDigest(value string) bool {
 }
 
 // SetAttemptPublication applies the absolute publication state of one
-// authoritative portful service attempt. Unlike evidence writes, publication
+// authoritative service attempt. Unlike evidence writes, publication
 // is never replayable after authority or attempt lifecycle ends.
 func (s *Store) SetAttemptPublication(
 	ctx context.Context,
@@ -1855,26 +1899,45 @@ func (s *Store) SetAttemptPublication(
 	}
 
 	var publishedPort sql.NullInt64
-	err = tx.QueryRowContext(ctx, "SELECT published_port FROM service_jobs WHERE job_id=?", jobID).Scan(&publishedPort)
+	var computerProjection bool
+	err = tx.QueryRowContext(ctx, `SELECT service_jobs.published_port,
+		EXISTS(SELECT 1 FROM computer_job_projections WHERE computer_job_projections.job_id=service_jobs.job_id)
+		FROM service_jobs WHERE service_jobs.job_id=?`, jobID).Scan(&publishedPort, &computerProjection)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, protocolError(contract.ErrorConflict, "publication is not applicable to this job")
 	}
 	if err != nil {
 		return Job{}, internalError(err, "read service publication applicability")
 	}
-	if !publishedPort.Valid {
+	if !publishedPort.Valid && !computerProjection {
 		return Job{}, protocolError(contract.ErrorConflict, "publication is not applicable to this job")
+	}
+	if computerProjection {
+		if *request.Ready {
+			if request.DisplayEndpoint == nil || !validComputerDisplayEndpoint(*request.DisplayEndpoint) {
+				return Job{}, protocolError(contract.ErrorInvalidRequest, "ready Computer publication requires an exact private display_endpoint")
+			}
+		} else if request.DisplayEndpoint != nil {
+			return Job{}, protocolError(contract.ErrorInvalidRequest, "withdrawn Computer publication cannot include display_endpoint")
+		}
+	} else if request.DisplayEndpoint != nil {
+		return Job{}, protocolError(contract.ErrorInvalidRequest, "display_endpoint is applicable only to Computers")
 	}
 
 	var targetAttempt any
+	var displayEndpoint any
 	if *request.Ready {
 		targetAttempt = attemptID
+		if request.DisplayEndpoint != nil {
+			displayEndpoint = *request.DisplayEndpoint
+		}
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE service_jobs
 		SET published_attempt_id=?,
-			healthy_since_ns=CASE WHEN ? THEN COALESCE(healthy_since_ns, ?) ELSE NULL END
-		WHERE job_id=? AND published_attempt_id IS NOT ?`,
-		targetAttempt, *request.Ready, now.UnixNano(), jobID, targetAttempt)
+			healthy_since_ns=CASE WHEN ? THEN COALESCE(healthy_since_ns, ?) ELSE NULL END,
+			display_endpoint=?
+		WHERE job_id=? AND (published_attempt_id IS NOT ? OR display_endpoint IS NOT ?)`,
+		targetAttempt, *request.Ready, now.UnixNano(), displayEndpoint, jobID, targetAttempt, displayEndpoint)
 	if err != nil {
 		return Job{}, internalError(err, "write service publication")
 	}
@@ -1896,6 +1959,12 @@ func (s *Store) SetAttemptPublication(
 		return Job{}, internalError(err, "commit publication mutation")
 	}
 	return job, nil
+}
+
+func validComputerDisplayEndpoint(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && parsed.Scheme == "ws" && parsed.Host != "" && parsed.Path == computerDisplayEndpointPath &&
+		parsed.RawQuery == "" && parsed.Fragment == "" && parsed.User == nil
 }
 
 func readAttemptDirective(ctx context.Context, tx *sql.Tx, jobID, attemptID string) (AttemptDirective, error) {

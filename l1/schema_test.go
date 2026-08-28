@@ -34,7 +34,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 		},
 		"service_jobs": {
 			"job_id", "desired_state", "bound_node_id", "restart_streak", "lifetime_restart_count",
-			"next_restart_at", "published_port", "last_failure", "healthy_since_ns", "published_attempt_id",
+			"next_restart_at", "published_port", "last_failure", "healthy_since_ns", "published_attempt_id", "display_endpoint",
 		},
 		"computers": {
 			"computer_id", "name", "placement_node_id", "bound_node_id", "grants_json", "storage_id",
@@ -87,7 +87,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 		"computer_takeover_audit": {
 			"attempt_id", "event_id", "event_kind", "computer_id", "job_id", "session_id", "fabric_id",
 			"user_id", "device_id", "authorized_role", "admitted_mode", "policy_revision",
-			"authority_generation", "occurred_ns", "reason", "request_hash",
+			"authority_generation", "occurred_ns", "reason", "event_count", "request_hash",
 		},
 		"service_restart_requests": {"job_id", "idempotency_key", "request_hash", "created_ns"},
 		"service_log_truncations": {

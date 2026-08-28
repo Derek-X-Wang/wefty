@@ -16,24 +16,59 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/coder/websocket"
 )
 
 const (
-	computerWebSocketPath                 = "/websockify"
-	computerWebSocketSubprotocol          = "binary"
-	computerRFBVersionBannerBytes         = 12
-	DefaultComputerSessionCap             = time.Hour
-	DefaultComputerIdentityRevalidation   = time.Minute
-	DefaultComputerReadinessDeadline      = 60 * time.Second
-	defaultComputerAuditFinalizationLimit = 30 * time.Second
+	computerWebSocketPath                  = "/websockify"
+	computerWebSocketSubprotocol           = "binary"
+	computerRFBVersionBannerBytes          = 12
+	DefaultComputerSessionCap              = time.Hour
+	DefaultComputerIdentityRevalidation    = time.Minute
+	DefaultComputerReadinessDeadline       = 60 * time.Second
+	DefaultComputerReadinessProbeInterval  = 100 * time.Millisecond
+	DefaultComputerReadinessConnectTimeout = 2 * time.Second
+	DefaultComputerDenialFlushInterval     = time.Minute
+	defaultComputerAuditFinalizationLimit  = 30 * time.Second
+	maximumComputerDenialGroups            = 128
 )
 
 type computerTakeoverAuditor interface {
 	AppendComputerTakeoverAudit(context.Context, string, string, string, l1.ComputerTakeoverAuditRequest) (l1.ComputerTakeoverAuditReceipt, error)
 }
 
-type computerBackendDial func(context.Context) (net.Conn, error)
+type computerEndpointDial func(context.Context, string) (net.Conn, error)
+
+type ComputerTenureErrorCode string
+
+const ComputerTenureUnavailable ComputerTenureErrorCode = "tenure_unavailable"
+
+type ComputerTenureError struct {
+	Code ComputerTenureErrorCode
+}
+
+func (failure *ComputerTenureError) Error() string {
+	return "agent: Computer control tenure is unavailable"
+}
+
+// ControlTenure is sealed to package agent so only the #179 implementation
+// can gain a control dial. Admission receives no control endpoint capability.
+type ControlTenure interface {
+	Take(context.Context, string) (net.Conn, error)
+	controlTenure()
+}
+
+type unavailableControlTenure struct{}
+
+func (unavailableControlTenure) Take(context.Context, string) (net.Conn, error) {
+	return nil, &ComputerTenureError{Code: ComputerTenureUnavailable}
+}
+func (unavailableControlTenure) controlTenure() {}
+
+type computerSessionEnd struct{ reason l1.ComputerTakeoverReason }
+
+func (end *computerSessionEnd) Error() string { return string(end.reason) }
 
 type computerFrontDoorConfig struct {
 	authorityContext     context.Context
@@ -45,10 +80,11 @@ type computerFrontDoorConfig struct {
 	jobID                string
 	attemptID            string
 	fencingToken         string
-	viewDial             computerBackendDial
-	controlDial          computerBackendDial
+	dial                 computerEndpointDial
+	controlTenure        ControlTenure
 	sessionCap           time.Duration
 	revalidationInterval time.Duration
+	denialFlushInterval  time.Duration
 	newSessionID         func() (string, error)
 	onSession            func(*computerSessionHandle)
 }
@@ -57,8 +93,10 @@ type computerFrontDoorConfig struct {
 // handle names one live admission, and only a control-authorized handle owns a
 // session-bound capability that can dial control. Admission never invokes it.
 type computerSessionHandle struct {
-	id   string
-	take *computerTakeCapability
+	id      string
+	canTake bool
+	tenure  ControlTenure
+	session context.Context
 }
 
 func (handle *computerSessionHandle) ID() string {
@@ -68,35 +106,27 @@ func (handle *computerSessionHandle) ID() string {
 	return handle.id
 }
 
-func (handle *computerSessionHandle) CanTake() bool { return handle != nil && handle.take != nil }
+func (handle *computerSessionHandle) CanTake() bool { return handle != nil && handle.canTake }
 
 func (handle *computerSessionHandle) dialControl(ctx context.Context) (net.Conn, error) {
 	if !handle.CanTake() {
 		return nil, errors.New("agent: Computer session is not authorized to take control")
 	}
-	return handle.take.dialControl(ctx)
-}
-
-type computerTakeCapability struct {
-	session context.Context
-	dial    computerBackendDial
-}
-
-func (capability *computerTakeCapability) dialControl(ctx context.Context) (net.Conn, error) {
-	if capability == nil || capability.dial == nil {
-		return nil, errors.New("agent: Computer session has no take capability")
-	}
 	select {
-	case <-capability.session.Done():
+	case <-handle.session.Done():
 		return nil, errors.New("agent: Computer session is no longer live")
 	default:
 	}
-	return capability.dial(ctx)
+	return handle.tenure.Take(ctx, handle.id)
 }
 
 type computerFrontDoor struct {
-	config computerFrontDoorConfig
-	errors chan error
+	config  computerFrontDoorConfig
+	errors  chan error
+	denials *computerDenialCoalescer
+	mu      sync.Mutex
+	ready   bool
+	active  map[string]context.CancelCauseFunc
 }
 
 // newComputerFrontDoor deliberately requires the deny-by-default policy cache.
@@ -118,8 +148,8 @@ func newComputerFrontDoor(config computerFrontDoorConfig) (*computerFrontDoor, e
 	if config.computerID == "" || config.jobID == "" || config.attemptID == "" || config.fencingToken == "" {
 		return nil, errors.New("agent: Computer front door requires complete attempt identity")
 	}
-	if config.viewDial == nil || config.controlDial == nil {
-		return nil, errors.New("agent: Computer front door requires distinct view and control backend dialers")
+	if config.dial == nil {
+		return nil, errors.New("agent: Computer front door requires an exact-authority endpoint dialer")
 	}
 	if config.clock == nil {
 		config.clock = systemClock{}
@@ -129,43 +159,70 @@ func newComputerFrontDoor(config computerFrontDoorConfig) (*computerFrontDoor, e
 		return nil, errors.New("agent: Computer session cap cannot exceed one hour")
 	}
 	config.revalidationInterval = durationOrDefault(config.revalidationInterval, DefaultComputerIdentityRevalidation)
+	if config.revalidationInterval > DefaultComputerIdentityRevalidation {
+		return nil, errors.New("agent: Computer identity revalidation cannot be less frequent than once per minute")
+	}
+	config.denialFlushInterval = durationOrDefault(config.denialFlushInterval, DefaultComputerDenialFlushInterval)
+	if config.controlTenure == nil {
+		config.controlTenure = unavailableControlTenure{}
+	}
 	if config.newSessionID == nil {
 		config.newSessionID = newComputerSessionID
 	}
-	return &computerFrontDoor{config: config, errors: make(chan error, 16)}, nil
+	frontDoor := &computerFrontDoor{config: config, errors: make(chan error, 16), active: make(map[string]context.CancelCauseFunc)}
+	frontDoor.denials = newComputerDenialCoalescer(frontDoor)
+	go frontDoor.denials.run(config.authorityContext)
+	return frontDoor, nil
 }
 
 func (frontDoor *computerFrontDoor) Errors() <-chan error { return frontDoor.errors }
 
+func (frontDoor *computerFrontDoor) SetReady(ready bool) {
+	frontDoor.mu.Lock()
+	frontDoor.ready = ready
+	if !ready {
+		for _, cancel := range frontDoor.active {
+			cancel(&computerSessionEnd{reason: l1.ComputerTakeoverViewBackendClosed})
+		}
+	}
+	frontDoor.mu.Unlock()
+}
+
+func (frontDoor *computerFrontDoor) isReady() bool {
+	frontDoor.mu.Lock()
+	defer frontDoor.mu.Unlock()
+	return frontDoor.ready
+}
+
 func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	admittedAt := frontDoor.config.clock.Now()
+	if !frontDoor.isReady() {
+		http.Error(writer, "Computer display is not ready", http.StatusServiceUnavailable)
+		return
+	}
 	identity, err := frontDoor.config.fabric.WhoIs(request.Context(), request.RemoteAddr)
 	if err != nil {
-		frontDoor.recordDenial(request.Context(), fabric.Identity{}, "identity_unavailable")
+		frontDoor.recordPreAuthorizationDenial(fabric.Identity{}, l1.ComputerTakeoverIdentityUnavailable)
 		http.Error(writer, "Fabric identity could not be authenticated", http.StatusUnauthorized)
 		return
 	}
 	if request.URL.Path != computerWebSocketPath || request.URL.RawQuery != "" || request.Method != http.MethodGet {
-		frontDoor.recordDenial(request.Context(), identity, "invalid_request_path")
+		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverInvalidRequestPath)
 		http.Error(writer, "Computer display path is fixed", http.StatusNotFound)
 		return
 	}
-	if hasComputerAuthorityOverride(request) {
-		frontDoor.recordDenial(request.Context(), identity, "client_authority_override")
-		http.Error(writer, "client-supplied Computer authority is forbidden", http.StatusBadRequest)
-		return
-	}
 	if !exactComputerSubprotocol(request.Header.Values("Sec-WebSocket-Protocol")) {
-		frontDoor.recordDenial(request.Context(), identity, "invalid_subprotocol")
+		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverInvalidSubprotocol)
 		http.Error(writer, "Computer display requires the binary WebSocket subprotocol", http.StatusBadRequest)
 		return
 	}
 	authorization, err := frontDoor.config.authorizer.AcquireGrant(frontDoor.config.computerID, identity)
 	if err != nil || authorization == nil {
-		frontDoor.recordDenial(request.Context(), identity, "unauthorized_identity")
+		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverUnauthorizedIdentity)
 		http.Error(writer, "Computer access is not authorized", http.StatusForbidden)
 		return
 	}
-	frontDoor.serveAuthorized(writer, request, identity, authorization)
+	frontDoor.serveAuthorized(writer, request, identity, authorization, admittedAt)
 }
 
 func (frontDoor *computerFrontDoor) serveAuthorized(
@@ -173,8 +230,16 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	request *http.Request,
 	identity fabric.Identity,
 	authorization *ComputerGrantAuthorization,
+	admittedAt time.Time,
 ) {
-	defer authorization.Release()
+	released := false
+	release := func() {
+		if !released {
+			authorization.Release()
+			released = true
+		}
+	}
+	defer release()
 	sessionID, err := frontDoor.config.newSessionID()
 	if err != nil {
 		frontDoor.report(fmt.Errorf("generate Computer session identity: %w", err))
@@ -183,11 +248,11 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	}
 	select {
 	case <-frontDoor.config.authorityContext.Done():
-		frontDoor.recordDenial(request.Context(), identity, "attempt_authority_lost")
+		frontDoor.recordDenial(request.Context(), identity, l1.ComputerTakeoverAttemptAuthorityLost)
 		http.Error(writer, "Computer attempt authority is unavailable", http.StatusServiceUnavailable)
 		return
-	case revocation := <-authorization.Revocations():
-		frontDoor.recordDenial(request.Context(), identity, string(revocation.Reason))
+	case <-authorization.Revocations():
+		frontDoor.recordDenial(request.Context(), identity, l1.ComputerTakeoverRevoked)
 		http.Error(writer, "Computer access was revoked", http.StatusForbidden)
 		return
 	default:
@@ -195,9 +260,17 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 
 	sessionContext, cancelSession := context.WithCancelCause(frontDoor.config.authorityContext)
 	defer cancelSession(nil)
-	backend, backendWebSocket, banner, err := dialComputerBackend(sessionContext, frontDoor.config.viewDial)
+	frontDoor.mu.Lock()
+	frontDoor.active[sessionID] = cancelSession
+	frontDoor.mu.Unlock()
+	defer func() {
+		frontDoor.mu.Lock()
+		delete(frontDoor.active, sessionID)
+		frontDoor.mu.Unlock()
+	}()
+	backend, backendWebSocket, banner, err := dialComputerBackend(sessionContext, frontDoor.config.dial, workloadrunner.AttemptEndpointView)
 	if err != nil {
-		frontDoor.recordDenial(request.Context(), identity, "view_backend_unavailable")
+		frontDoor.recordDenial(request.Context(), identity, l1.ComputerTakeoverViewBackendUnavailable)
 		frontDoor.report(fmt.Errorf("dial Computer view backend: %w", err))
 		http.Error(writer, "Computer display unavailable", http.StatusServiceUnavailable)
 		return
@@ -209,7 +282,7 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	})
 	if err != nil {
 		_ = backend.Close()
-		frontDoor.recordDenial(request.Context(), identity, "client_upgrade_failed")
+		frontDoor.recordDenial(request.Context(), identity, l1.ComputerTakeoverClientUpgradeFailed)
 		frontDoor.report(fmt.Errorf("upgrade Computer display client: %w", err))
 		return
 	}
@@ -229,21 +302,20 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	}
 	if _, err := client.Write(banner); err != nil {
 		_ = backend.Close()
-		frontDoor.finishSession(request.Context(), baseEvent, "client_closed")
+		release()
+		frontDoor.finishSession(request.Context(), baseEvent, l1.ComputerTakeoverClientClosed)
 		return
 	}
 
-	handle := &computerSessionHandle{id: sessionID}
-	if authorization.CanTake() {
-		handle.take = &computerTakeCapability{session: sessionContext, dial: frontDoor.config.controlDial}
-	}
+	handle := &computerSessionHandle{id: sessionID, canTake: authorization.CanTake(), tenure: frontDoor.config.controlTenure, session: sessionContext}
 	if frontDoor.config.onSession != nil {
 		frontDoor.config.onSession(handle)
 	}
 
-	reason := frontDoor.relay(sessionContext, cancelSession, request.RemoteAddr, identity, authorization, client, backend)
+	reason := frontDoor.relay(sessionContext, cancelSession, request.RemoteAddr, identity, authorization, client, backend, admittedAt)
 	_ = clientWebSocket.CloseNow()
 	_ = backendWebSocket.CloseNow()
+	release()
 	frontDoor.finishSession(request.Context(), baseEvent, reason)
 }
 
@@ -254,35 +326,45 @@ func (frontDoor *computerFrontDoor) relay(
 	identity fabric.Identity,
 	authorization *ComputerGrantAuthorization,
 	client, backend net.Conn,
-) string {
-	closed := make(chan string, 2)
+	admittedAt time.Time,
+) l1.ComputerTakeoverReason {
+	closed := make(chan l1.ComputerTakeoverReason, 2)
 	var copies sync.WaitGroup
 	copies.Add(2)
 	go copyComputerRelay(&copies, backend, client, "client_closed", closed)
 	go copyComputerRelay(&copies, client, backend, "view_backend_closed", closed)
-	revalidation := make(chan string, 1)
+	revalidation := make(chan l1.ComputerTakeoverReason, 1)
 	go frontDoor.revalidateIdentity(ctx, remoteAddress, identity, revalidation)
-	capTimer := frontDoor.config.clock.NewTimer(frontDoor.config.sessionCap)
+	remaining := frontDoor.config.sessionCap - frontDoor.config.clock.Now().Sub(admittedAt)
+	if remaining < 0 {
+		remaining = 0
+	}
+	capTimer := frontDoor.config.clock.NewTimer(remaining)
 	defer stopTimer(capTimer)
-	reason := "session_closed"
+	reason := l1.ComputerTakeoverClientClosed
 	select {
 	case <-ctx.Done():
-		reason = "attempt_authority_lost"
-	case revocation := <-authorization.Revocations():
-		reason = string(revocation.Reason)
+		var ended *computerSessionEnd
+		if errors.As(context.Cause(ctx), &ended) {
+			reason = ended.reason
+		} else {
+			reason = l1.ComputerTakeoverAttemptAuthorityLost
+		}
+	case <-authorization.Revocations():
+		reason = l1.ComputerTakeoverRevoked
 	case reason = <-revalidation:
 	case reason = <-closed:
 	case <-capTimer.C():
-		reason = "session_cap_expired"
+		reason = l1.ComputerTakeoverSessionCapExpired
 	}
-	cancel(errors.New(reason))
+	cancel(errors.New(string(reason)))
 	_ = client.Close()
 	_ = backend.Close()
 	copies.Wait()
 	return reason
 }
 
-func (frontDoor *computerFrontDoor) revalidateIdentity(ctx context.Context, remoteAddress string, original fabric.Identity, failed chan<- string) {
+func (frontDoor *computerFrontDoor) revalidateIdentity(ctx context.Context, remoteAddress string, original fabric.Identity, failed chan<- l1.ComputerTakeoverReason) {
 	for {
 		timer := frontDoor.config.clock.NewTimer(frontDoor.config.revalidationInterval)
 		select {
@@ -294,7 +376,7 @@ func (frontDoor *computerFrontDoor) revalidateIdentity(ctx context.Context, remo
 		identity, err := frontDoor.config.fabric.WhoIs(ctx, remoteAddress)
 		if err != nil {
 			select {
-			case failed <- "identity_revalidation_failed":
+			case failed <- l1.ComputerTakeoverRevalidationFailed:
 			case <-ctx.Done():
 			}
 			return
@@ -302,7 +384,7 @@ func (frontDoor *computerFrontDoor) revalidateIdentity(ctx context.Context, remo
 		if identity.Kind != original.Kind || identity.FabricID != original.FabricID ||
 			identity.UserID != original.UserID || identity.DeviceID != original.DeviceID {
 			select {
-			case failed <- "identity_changed":
+			case failed <- l1.ComputerTakeoverRevalidationFailed:
 			case <-ctx.Done():
 			}
 			return
@@ -310,7 +392,7 @@ func (frontDoor *computerFrontDoor) revalidateIdentity(ctx context.Context, remo
 	}
 }
 
-func copyComputerRelay(wait *sync.WaitGroup, destination, source net.Conn, reason string, closed chan<- string) {
+func copyComputerRelay(wait *sync.WaitGroup, destination, source net.Conn, reason l1.ComputerTakeoverReason, closed chan<- l1.ComputerTakeoverReason) {
 	defer wait.Done()
 	_, _ = io.Copy(destination, source)
 	select {
@@ -324,12 +406,12 @@ func (frontDoor *computerFrontDoor) sessionEvent(identity fabric.Identity, autho
 		ComputerID: frontDoor.config.computerID, JobID: frontDoor.config.jobID,
 		AttemptID: frontDoor.config.attemptID, SessionID: sessionID,
 		FabricID: identity.FabricID, UserID: identity.UserID, DeviceID: identity.DeviceID,
-		AuthorizedRole: authorization.decision.Permission, AdmittedMode: "view",
-		PolicyRevision: authorization.decision.PolicyRevision, OccurredAt: occurred,
+		AuthorizedRole: authorization.AuthorizedRole(), AdmittedMode: l1.ComputerAdmittedMode(authorization.AdmissionRole()),
+		PolicyRevision: authorization.PolicyRevision(), OccurredAt: occurred,
 	}
 }
 
-func (frontDoor *computerFrontDoor) finishSession(ctx context.Context, base l1.ComputerTakeoverAuditEvent, reason string) {
+func (frontDoor *computerFrontDoor) finishSession(ctx context.Context, base l1.ComputerTakeoverAuditEvent, reason l1.ComputerTakeoverReason) {
 	closeEvent := base
 	closeEvent.EventID = base.SessionID + ":close"
 	closeEvent.Kind = l1.ComputerTakeoverSessionClose
@@ -342,7 +424,7 @@ func (frontDoor *computerFrontDoor) finishSession(ctx context.Context, base l1.C
 	}
 }
 
-func (frontDoor *computerFrontDoor) recordDenial(ctx context.Context, identity fabric.Identity, reason string) {
+func (frontDoor *computerFrontDoor) recordDenial(ctx context.Context, identity fabric.Identity, reason l1.ComputerTakeoverReason) {
 	eventID, err := frontDoor.config.newSessionID()
 	if err != nil {
 		frontDoor.report(fmt.Errorf("generate Computer denial identity: %w", err))
@@ -352,10 +434,94 @@ func (frontDoor *computerFrontDoor) recordDenial(ctx context.Context, identity f
 		EventID: eventID + ":denied", Kind: l1.ComputerTakeoverAdmissionDenied,
 		ComputerID: frontDoor.config.computerID, JobID: frontDoor.config.jobID, AttemptID: frontDoor.config.attemptID,
 		FabricID: identity.FabricID, UserID: identity.UserID, DeviceID: identity.DeviceID,
-		PolicyRevision: frontDoor.config.authorizer.Revision(), OccurredAt: wallNow(frontDoor.config.clock), Reason: reason,
+		PolicyRevision: frontDoor.config.authorizer.Revision(), OccurredAt: wallNow(frontDoor.config.clock), Reason: reason, EventCount: 1,
 	}
 	if err := frontDoor.record(ctx, event); err != nil {
 		frontDoor.report(fmt.Errorf("record Computer admission denial: %w", err))
+	}
+}
+
+func (frontDoor *computerFrontDoor) recordPreAuthorizationDenial(identity fabric.Identity, reason l1.ComputerTakeoverReason) {
+	if identity.Kind == fabric.IdentityKindMachine {
+		identity = fabric.Identity{}
+	}
+	frontDoor.denials.add(identity, reason)
+}
+
+type computerDenialKey struct {
+	reason                     l1.ComputerTakeoverReason
+	fabricID, userID, deviceID string
+}
+
+type computerDenialSummary struct {
+	key   computerDenialKey
+	count int64
+}
+
+// computerDenialCoalescer keeps untrusted pre-authorization traffic off the
+// synchronous agent-to-L1 path. Its bounded local map is periodically flushed
+// as counted evidence, and attempt shutdown performs one best-effort flush.
+type computerDenialCoalescer struct {
+	frontDoor *computerFrontDoor
+	mu        sync.Mutex
+	counts    map[computerDenialKey]int64
+}
+
+func newComputerDenialCoalescer(frontDoor *computerFrontDoor) *computerDenialCoalescer {
+	return &computerDenialCoalescer{frontDoor: frontDoor, counts: make(map[computerDenialKey]int64)}
+}
+
+func (coalescer *computerDenialCoalescer) add(identity fabric.Identity, reason l1.ComputerTakeoverReason) {
+	key := computerDenialKey{reason: reason, fabricID: identity.FabricID, userID: identity.UserID, deviceID: identity.DeviceID}
+	coalescer.mu.Lock()
+	if _, exists := coalescer.counts[key]; !exists && len(coalescer.counts) >= maximumComputerDenialGroups {
+		key = computerDenialKey{reason: reason}
+	}
+	coalescer.counts[key]++
+	coalescer.mu.Unlock()
+}
+
+func (coalescer *computerDenialCoalescer) run(ctx context.Context) {
+	for {
+		timer := coalescer.frontDoor.config.clock.NewTimer(coalescer.frontDoor.config.denialFlushInterval)
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			flushContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultComputerAuditFinalizationLimit)
+			coalescer.flush(flushContext)
+			cancel()
+			return
+		case <-timer.C():
+			coalescer.flush(ctx)
+		}
+	}
+}
+
+func (coalescer *computerDenialCoalescer) flush(ctx context.Context) {
+	coalescer.mu.Lock()
+	summaries := make([]computerDenialSummary, 0, len(coalescer.counts))
+	for key, count := range coalescer.counts {
+		summaries = append(summaries, computerDenialSummary{key: key, count: count})
+	}
+	clear(coalescer.counts)
+	coalescer.mu.Unlock()
+	for _, summary := range summaries {
+		eventID, err := coalescer.frontDoor.config.newSessionID()
+		if err != nil {
+			coalescer.frontDoor.report(fmt.Errorf("generate Computer denial identity: %w", err))
+			continue
+		}
+		event := l1.ComputerTakeoverAuditEvent{
+			EventID: eventID + ":denied", Kind: l1.ComputerTakeoverAdmissionDenied,
+			ComputerID: coalescer.frontDoor.config.computerID, JobID: coalescer.frontDoor.config.jobID,
+			AttemptID: coalescer.frontDoor.config.attemptID, FabricID: summary.key.fabricID,
+			UserID: summary.key.userID, DeviceID: summary.key.deviceID,
+			PolicyRevision: coalescer.frontDoor.config.authorizer.Revision(), OccurredAt: wallNow(coalescer.frontDoor.config.clock),
+			Reason: summary.key.reason, EventCount: summary.count,
+		}
+		if err := coalescer.frontDoor.record(ctx, event); err != nil {
+			coalescer.frontDoor.report(fmt.Errorf("record Computer admission denial summary: %w", err))
+		}
 	}
 }
 
@@ -372,17 +538,6 @@ func (frontDoor *computerFrontDoor) report(err error) {
 	case frontDoor.errors <- err:
 	default:
 	}
-}
-
-func hasComputerAuthorityOverride(request *http.Request) bool {
-	for name := range request.Header {
-		lower := strings.ToLower(name)
-		if strings.HasPrefix(lower, "x-wefty-") && (strings.Contains(lower, "role") ||
-			strings.Contains(lower, "mode") || strings.Contains(lower, "backend") || strings.Contains(lower, "control")) {
-			return true
-		}
-	}
-	return false
 }
 
 func exactComputerSubprotocol(values []string) bool {
@@ -403,7 +558,7 @@ func newComputerSessionID() (string, error) {
 	return "takeover_" + hex.EncodeToString(value[:]), nil
 }
 
-func dialComputerBackend(ctx context.Context, dial computerBackendDial) (net.Conn, *websocket.Conn, []byte, error) {
+func dialComputerBackend(ctx context.Context, dial computerEndpointDial, endpointName string) (net.Conn, *websocket.Conn, []byte, error) {
 	var mu sync.Mutex
 	used := false
 	transport := &http.Transport{DialContext: func(dialContext context.Context, _, _ string) (net.Conn, error) {
@@ -413,7 +568,7 @@ func dialComputerBackend(ctx context.Context, dial computerBackendDial) (net.Con
 			return nil, errors.New("Computer backend handshake attempted more than one dial")
 		}
 		used = true
-		return dial(dialContext)
+		return dial(dialContext, endpointName)
 	}}
 	defer transport.CloseIdleConnections()
 	connection, _, err := websocket.Dial(ctx, "ws://computer-backend.invalid"+computerWebSocketPath, &websocket.DialOptions{
@@ -459,9 +614,10 @@ type computerReadinessError struct {
 func (failure *computerReadinessError) Error() string { return failure.Err.Error() }
 func (failure *computerReadinessError) Unwrap() error { return failure.Err }
 
-// probeComputerBackends proves the exact wire contract on both helper tunnels.
-// Both probes must succeed before a caller may publish either one.
-func probeComputerBackends(ctx context.Context, clock Clock, startedAt time.Time, viewDial, controlDial computerBackendDial) error {
+// probeComputerBackends polls the exact wire contract on both helper tunnels.
+// Connection refusal while the guest starts is ordinary; only the deadline
+// produces startup_readiness_timeout.
+func probeComputerBackends(ctx context.Context, clock Clock, startedAt time.Time, dial computerEndpointDial) error {
 	if clock == nil {
 		clock = systemClock{}
 	}
@@ -470,38 +626,48 @@ func probeComputerBackends(ctx context.Context, clock Clock, startedAt time.Time
 		return &computerReadinessError{Code: contract.SpawnFailureStartupReadinessTimeout,
 			Err: errors.New("Computer display startup readiness exceeded 60 seconds from Started")}
 	}
-	probeContext, cancel := context.WithCancel(ctx)
-	defer cancel()
-	results := make(chan error, 2)
-	for _, dial := range []computerBackendDial{viewDial, controlDial} {
-		go func(dial computerBackendDial) {
-			connection, websocketConnection, _, err := dialComputerBackend(probeContext, dial)
-			if connection != nil {
-				_ = connection.Close()
-			}
-			if websocketConnection != nil {
-				_ = websocketConnection.CloseNow()
-			}
-			results <- err
-		}(dial)
+	deadline := clock.NewTimer(remaining)
+	defer stopTimer(deadline)
+	timeout := func() error {
+		return &computerReadinessError{Code: contract.SpawnFailureStartupReadinessTimeout,
+			Err: errors.New("Computer display startup readiness exceeded 60 seconds from Started")}
 	}
-	timer := clock.NewTimer(remaining)
-	defer stopTimer(timer)
-	for range 2 {
+	for {
+		probeContext, cancelProbe := context.WithCancel(ctx)
+		probeResult := make(chan error, 1)
+		go func() { probeResult <- probeComputerBackendPairOnce(probeContext, dial) }()
+		connectTimeout := clock.NewTimer(DefaultComputerReadinessConnectTimeout)
+		var probeErr error
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C():
-			cancel()
-			return &computerReadinessError{Code: contract.SpawnFailureStartupReadinessTimeout,
-				Err: errors.New("Computer display startup readiness exceeded 60 seconds from Started")}
-		case err := <-results:
-			if err != nil {
-				cancel()
-				return &computerReadinessError{Code: contract.SpawnFailureRuntimeUnavailable,
-					Err: fmt.Errorf("Computer display readiness: %w", err)}
-			}
+			cancelProbe()
+			stopTimer(connectTimeout)
+			return &computerReadinessError{Code: contract.SpawnFailureRuntimeUnavailable,
+				Err: fmt.Errorf("Computer display readiness canceled: %w", context.Cause(ctx))}
+		case <-deadline.C():
+			cancelProbe()
+			stopTimer(connectTimeout)
+			return timeout()
+		case <-connectTimeout.C():
+			cancelProbe()
+			probeErr = errors.New("Computer display readiness probe timed out")
+		case probeErr = <-probeResult:
+			cancelProbe()
+			stopTimer(connectTimeout)
+		}
+		if probeErr == nil {
+			return nil
+		}
+		interval := clock.NewTimer(DefaultComputerReadinessProbeInterval)
+		select {
+		case <-ctx.Done():
+			stopTimer(interval)
+			return &computerReadinessError{Code: contract.SpawnFailureRuntimeUnavailable,
+				Err: fmt.Errorf("Computer display readiness canceled: %w", context.Cause(ctx))}
+		case <-deadline.C():
+			stopTimer(interval)
+			return timeout()
+		case <-interval.C():
 		}
 	}
-	return nil
 }

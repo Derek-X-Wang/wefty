@@ -52,7 +52,7 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 		t.Fatalf("audit replay = %#v err=%v", replay, err)
 	}
 	conflict := request
-	conflict.Event.Reason = "changed"
+	conflict.Event.Reason = ComputerTakeoverClientClosed
 	if _, err := h.store.AppendComputerTakeoverAudit(context.Background(), "fabric-computer-node",
 		computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, conflict); errorCode(err) != contract.ErrorIdempotencyConflict {
 		t.Fatalf("conflicting audit replay error = %v", err)
@@ -102,5 +102,20 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 		ComputerTakeoverAuditRequest{FencingToken: claim.Lease.FencingToken, Event: closeEvent})
 	if status != http.StatusOK || strings.Contains(string(body), `"fencing_token"`) || !strings.Contains(string(body), `"kind":"session_close"`) {
 		t.Fatalf("take-over audit route status=%d body=%s", status, body)
+	}
+	h.clock.Advance(3 * time.Second)
+	if _, err := h.store.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_takeover_audit WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("attempt expiry removed immutable audit: count=%d err=%v", count, err)
+	}
+	h.clock.Advance(DefaultComputerTakeoverAuditRetentionAge + time.Second)
+	result, err := h.store.Reconcile(context.Background())
+	if err != nil || result.PrunedComputerTakeoverAuditEvents != 2 {
+		t.Fatalf("independent audit retention result=%#v err=%v", result, err)
+	}
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_takeover_audit`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("expired audit rows=%d err=%v", count, err)
 	}
 }

@@ -64,6 +64,20 @@ func (authorization *ComputerGrantAuthorization) AdmissionRole() ComputerAdmissi
 	return ComputerAdmissionView
 }
 
+func (authorization *ComputerGrantAuthorization) AuthorizedRole() l1.ComputerGrantPermission {
+	if authorization == nil {
+		return l1.ComputerGrantNone
+	}
+	return authorization.decision.Permission
+}
+
+func (authorization *ComputerGrantAuthorization) PolicyRevision() int64 {
+	if authorization == nil {
+		return 0
+	}
+	return authorization.decision.PolicyRevision
+}
+
 func (authorization *ComputerGrantAuthorization) CanTake() bool {
 	return authorization != nil && authorization.decision.Permission == l1.ComputerGrantControl
 }

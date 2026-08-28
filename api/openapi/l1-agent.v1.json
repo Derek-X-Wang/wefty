@@ -298,8 +298,8 @@
       ],
       "put": {
         "operationId": "setAttemptPublication",
-        "summary": "Set absolute publication state for one portful service attempt",
-        "description": "L1 derives the immutable published port from the service specification. The mutation is authorized in fenced-write order, is not replayable after terminalization, and leaves the database untouched when the stored publication already equals the requested state.",
+        "summary": "Set absolute publication state for one service attempt",
+        "description": "L1 derives an ordinary service's immutable port from its specification; a Computer instead supplies its private Fabric front-door display endpoint only while ready. The mutation is authorized in fenced-write order, is not replayable after terminalization, and leaves the database untouched when the stored publication already equals the requested state.",
         "requestBody": {
           "required": true,
           "content": {
@@ -310,7 +310,8 @@
                 "required": ["fencing_token", "ready"],
                 "properties": {
                   "fencing_token": { "type": "string", "minLength": 1 },
-                  "ready": { "type": "boolean" }
+                  "ready": { "type": "boolean" },
+                  "display_endpoint": { "type": "string", "pattern": "^ws://[^/]+/websockify$" }
                 }
               }
             }

@@ -64,17 +64,18 @@ func TestServiceAcceptanceComputerFrontDoorRealProcessAuthorityLoss(t *testing.T
 	// lease-loss result.
 	authority, cancelAuthority := context.WithTimeout(t.Context(), 1500*time.Millisecond)
 	defer cancelAuthority()
-	dialBackend := func(ctx context.Context) (net.Conn, error) {
+	dialBackend := func(ctx context.Context, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp", backendAddress)
 	}
 	frontDoor, err := newComputerFrontDoor(computerFrontDoorConfig{
 		authorityContext: authority, fabric: identityFabric, authorizer: cache, auditor: auditor,
 		computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1",
-		viewDial: dialBackend, controlDial: dialBackend,
+		dial: dialBackend,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	frontDoor.SetReady(true)
 	server := httptest.NewServer(frontDoor)
 	defer server.Close()
 	connection := dialComputerFrontDoor(t, server.URL, nil)

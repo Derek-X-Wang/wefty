@@ -76,11 +76,11 @@ func (s *Store) AppendComputerTakeoverAudit(
 	event.AuthorityGeneration = attempt.authorityGeneration
 	_, err = tx.ExecContext(ctx, `INSERT INTO computer_takeover_audit(
 		attempt_id, event_id, event_kind, computer_id, job_id, session_id, fabric_id, user_id, device_id,
-		authorized_role, admitted_mode, policy_revision, authority_generation, occurred_ns, reason, request_hash
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		authorized_role, admitted_mode, policy_revision, authority_generation, occurred_ns, reason, event_count, request_hash
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.AttemptID, event.EventID, event.Kind, event.ComputerID, event.JobID, event.SessionID,
 		event.FabricID, event.UserID, event.DeviceID, event.AuthorizedRole, event.AdmittedMode,
-		event.PolicyRevision, event.AuthorityGeneration, event.OccurredAt.UnixNano(), event.Reason, eventHash)
+		event.PolicyRevision, event.AuthorityGeneration, event.OccurredAt.UnixNano(), event.Reason, event.EventCount, eventHash)
 	if err != nil {
 		return ComputerTakeoverAuditReceipt{}, internalError(err, "append Computer take-over audit event")
 	}
@@ -112,7 +112,7 @@ func validateComputerTakeoverAuditRequest(computerID, jobID, attemptID string, r
 	}
 	for name, value := range map[string]string{
 		"session_id": request.Event.SessionID, "fabric_id": request.Event.FabricID,
-		"user_id": request.Event.UserID, "device_id": request.Event.DeviceID, "reason": request.Event.Reason,
+		"user_id": request.Event.UserID, "device_id": request.Event.DeviceID, "reason": string(request.Event.Reason),
 	} {
 		if !boundedComputerAuditValue(value, false) {
 			return protocolError(contract.ErrorInvalidRequest, "%s must be at most %d bytes with no surrounding whitespace", name, maximumComputerTakeoverAuditFieldBytes)
@@ -120,7 +120,7 @@ func validateComputerTakeoverAuditRequest(computerID, jobID, attemptID string, r
 	}
 	switch request.Event.Kind {
 	case ComputerTakeoverAdmissionDenied:
-		if request.Event.SessionID != "" || request.Event.AdmittedMode != "" || request.Event.Reason == "" {
+		if request.Event.SessionID != "" || request.Event.AdmittedMode != "" || request.Event.Reason == "" || request.Event.EventCount < 1 {
 			return protocolError(contract.ErrorInvalidRequest, "admission_denied requires a reason and no session or admitted mode")
 		}
 	case ComputerTakeoverSessionOpen, ComputerTakeoverSessionClose,
@@ -134,10 +134,13 @@ func validateComputerTakeoverAuditRequest(computerID, jobID, attemptID string, r
 		if request.Event.AuthorizedRole != ComputerGrantView && request.Event.AuthorizedRole != ComputerGrantControl {
 			return protocolError(contract.ErrorInvalidRequest, "session audit authorized_role must be view or control")
 		}
-		if request.Event.AdmittedMode != "view" && request.Event.AdmittedMode != "controller" {
+		if request.Event.EventCount != 0 {
+			return protocolError(contract.ErrorInvalidRequest, "session audit cannot be a coalesced event")
+		}
+		if request.Event.AdmittedMode != ComputerAdmittedView && request.Event.AdmittedMode != ComputerAdmittedController {
 			return protocolError(contract.ErrorInvalidRequest, "session audit admitted_mode must be view or controller")
 		}
-		if request.Event.Kind == ComputerTakeoverSessionOpen && request.Event.AdmittedMode != "view" {
+		if request.Event.Kind == ComputerTakeoverSessionOpen && request.Event.AdmittedMode != ComputerAdmittedView {
 			return protocolError(contract.ErrorInvalidRequest, "every session must open in view mode")
 		}
 		if request.Event.Kind == ComputerTakeoverSessionClose && request.Event.Reason == "" {
@@ -146,7 +149,24 @@ func validateComputerTakeoverAuditRequest(computerID, jobID, attemptID string, r
 	default:
 		return protocolError(contract.ErrorInvalidRequest, "unknown Computer take-over audit event kind %q", request.Event.Kind)
 	}
+	if request.Event.Reason != "" && !validComputerTakeoverReason(request.Event.Reason) {
+		return protocolError(contract.ErrorInvalidRequest, "unknown Computer take-over reason %q", request.Event.Reason)
+	}
 	return nil
+}
+
+func validComputerTakeoverReason(reason ComputerTakeoverReason) bool {
+	switch reason {
+	case ComputerTakeoverIdentityUnavailable, ComputerTakeoverInvalidRequestPath,
+		ComputerTakeoverInvalidSubprotocol, ComputerTakeoverUnauthorizedIdentity,
+		ComputerTakeoverAttemptAuthorityLost, ComputerTakeoverRevoked,
+		ComputerTakeoverViewBackendUnavailable, ComputerTakeoverClientUpgradeFailed,
+		ComputerTakeoverClientClosed, ComputerTakeoverViewBackendClosed,
+		ComputerTakeoverRevalidationFailed, ComputerTakeoverSessionCapExpired:
+		return true
+	default:
+		return false
+	}
 }
 
 func boundedComputerAuditValue(value string, required bool) bool {
@@ -172,16 +192,32 @@ func readComputerTakeoverAudit(ctx context.Context, q queryer, attemptID, eventI
 	var requestHash string
 	err := q.QueryRowContext(ctx, `SELECT event_id, event_kind, computer_id, job_id, attempt_id, session_id,
 		fabric_id, user_id, device_id, authorized_role, admitted_mode, policy_revision,
-		authority_generation, occurred_ns, reason, request_hash
+		authority_generation, occurred_ns, reason, event_count, request_hash
 		FROM computer_takeover_audit WHERE attempt_id=? AND event_id=?`, attemptID, eventID).Scan(
 		&event.EventID, &event.Kind, &event.ComputerID, &event.JobID, &event.AttemptID, &event.SessionID,
 		&event.FabricID, &event.UserID, &event.DeviceID, &event.AuthorizedRole, &event.AdmittedMode,
-		&event.PolicyRevision, &event.AuthorityGeneration, &occurredNS, &event.Reason, &requestHash)
+		&event.PolicyRevision, &event.AuthorityGeneration, &occurredNS, &event.Reason, &event.EventCount, &requestHash)
 	if err != nil {
 		return ComputerTakeoverAuditEvent{}, "", err
 	}
 	event.OccurredAt = time.Unix(0, occurredNS).UTC()
 	return event, requestHash, nil
+}
+
+// pruneComputerTakeoverAudit applies the audit stream's own finite retention.
+// It is deliberately independent from attempt/log-summary retention: deleting
+// an attempt never deletes take-over evidence as a foreign-key side effect.
+func (s *Store) pruneComputerTakeoverAudit(ctx context.Context, tx *sql.Tx, now time.Time) (int64, error) {
+	cutoff := now.Add(-s.computerTakeoverAuditRetentionAge).UnixNano()
+	result, err := tx.ExecContext(ctx, "DELETE FROM computer_takeover_audit WHERE occurred_ns<?", cutoff)
+	if err != nil {
+		return 0, internalError(err, "prune Computer take-over audit retention")
+	}
+	pruned, err := result.RowsAffected()
+	if err != nil {
+		return 0, internalError(err, "read Computer take-over audit retention result")
+	}
+	return pruned, nil
 }
 
 func (kind ComputerTakeoverAuditEventKind) String() string { return string(kind) }
