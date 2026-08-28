@@ -185,6 +185,7 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 	input.Workload.OperatorMounts = nil
 	input.OperatorMountSources = nil
 	input.ManagedVolumeSources = map[ManagedVolumeKind]string{ManagedVolumeComputerDisk: "/run/wefty/fixtures/computer-disk"}
+	input.ComputerControlSource = "/run/wefty/fixtures/control"
 	spec, err := buildRuntimeSpec(context.Background(), input,
 		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.4", "seccomp-linux-amd64.json")))
 	if err != nil {
@@ -195,11 +196,18 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 	}
 	writable := map[string]string{"/wefty/service": "", "/tmp": "size=524288k", "/var/tmp": "size=65536k"}
 	bounded := map[string]bool{}
+	controlReadOnly := false
 	for _, mount := range spec.Mounts {
+		if mount.Destination == contract.OCIContainerControlDirectory {
+			controlReadOnly = mount.Source == input.ComputerControlSource && slices.Contains(mount.Options, "rro")
+		}
 		if size, expected := writable[mount.Destination]; expected {
 			bounded[mount.Destination] = mount.Destination == "/wefty/service" ||
 				(mount.Type == "tmpfs" && slices.Contains(mount.Options, size))
 		}
+	}
+	if !controlReadOnly {
+		t.Fatalf("Computer control mount is absent or writable: %+v", spec.Mounts)
 	}
 	for path := range writable {
 		if !bounded[path] {
@@ -372,6 +380,9 @@ func TestWorkloadValidationRejectsReservedEnvironmentAndMaliciousMounts(t *testi
 		}},
 		{name: "reserved subtree", mutate: func(input *WorkloadInput) {
 			input.OperatorMounts = []OperatorMount{{NodePath: regular, ContainerPath: "/wefty"}}
+		}},
+		{name: "control signal shadow", mutate: func(input *WorkloadInput) {
+			input.OperatorMounts = []OperatorMount{{NodePath: regular, ContainerPath: contract.OCIContainerControlDirectory}}
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {

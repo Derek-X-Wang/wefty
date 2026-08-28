@@ -40,6 +40,10 @@ type ManagedVolumeEngine interface {
 	DeleteManagedVolume(context.Context, DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error)
 }
 
+type ComputerControlEngine interface {
+	SetComputerControlState(context.Context, SetComputerControlStateRequest) error
+}
+
 // Engine is the helper-internal mechanics seam. No containerd request or type
 // crosses RPC.
 type Engine interface {

@@ -3,11 +3,55 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
+
+type capabilityProbeAdapterStub struct {
+	version int
+	err     error
+}
+
+func (stub capabilityProbeAdapterStub) Probe(context.Context, string, string, string, string, time.Duration) error {
+	return nil
+}
+
+func (stub capabilityProbeAdapterStub) HelperProtocolVersion() (int, error) {
+	return stub.version, stub.err
+}
+
+func TestOCIProbeDerivesComputerOnlyFromSupportingHelperProtocol(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		version      int
+		versionErr   error
+		wantComputer bool
+		wantErr      bool
+	}{
+		{name: "unsupported helper", version: ocihelper.ComputerProtocolVersion - 1},
+		{name: "supporting helper", version: ocihelper.ComputerProtocolVersion, wantComputer: true},
+		{name: "lost helper", versionErr: errors.New("helper session lost"), wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			probe := ociCapabilityProbe{adapter: capabilityProbeAdapterStub{version: test.version, err: test.versionErr}}
+			result, err := probe.Probe(t.Context())
+			if (err != nil) != test.wantErr {
+				t.Fatalf("probe error = %v, want error %t", err, test.wantErr)
+			}
+			if result.Capabilities["computer"] != test.wantComputer {
+				t.Fatalf("computer capability = %t, want %t in %+v", result.Capabilities["computer"], test.wantComputer, result)
+			}
+			if test.wantErr && len(result.MissingCapabilities) != 1 {
+				t.Fatalf("lost helper result = %+v", result)
+			}
+		})
+	}
+}
 
 func TestConsoleOutputIsAttributedAndSerialized(t *testing.T) {
 	assertConsoleOutputIsAttributedAndSerialized(t)

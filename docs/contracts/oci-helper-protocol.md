@@ -57,7 +57,9 @@ handshake also returns a non-secret helper-instance ID, a monotonically
 increasing process-local session generation, and the configured reap timeout;
 the client uses that advertised timeout for sweep and verification.
 
-Wire major `1` is carried on every request and response. A different major is
+Wire major `2` is carried on every request and response. It is the first major
+that carries the complete Computer endpoint, control-state, and attachment
+semantics. A different major is
 rejected as `version_mismatch` before dispatch. `AcquireSession` also carries
 the agent's required expected helper checksum; an empty expectation fails
 closed and a mismatch is
@@ -172,7 +174,7 @@ heartbeats.
 | RPC | Scope and result |
 | --- | --- |
 | `EnsureImage` | Session-authorized, typed progress/result stream on a dedicated connection. The agent supplies the canonical platform retained from the successful probe for this helper generation; manifest selection and image singleflight are keyed by it. Registry mode resolves only a public reference, pins the returned top-level digest, pulls into the fixed namespace, and unpacks that platform. Archive mode receives an OCI-layout tar stream, recomputes every blob digest, validates descriptor sizes and reachability, admits exactly that platform, and imports/unpacks it. Both modes return the same complete image evidence used by `Run`, including top-level/platform digests, platform, runtime handler, and snapshotter; no containerd type, private registry credential, or retry policy crosses the boundary. |
-| `Run` | Exact attempt authority, initial deadman, a bounded requested endpoint-name list, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started` with helper-observed image evidence and a map from every requested endpoint name to its allocated loopback port. Today ordinary services request only `service`; the named map is the ratified wire shape for later `view` and `control` endpoints. An explicit Mac bridge-fallback request creates a separate guest loopback listener and capability. |
+| `Run` | Exact attempt authority, initial deadman, a bounded requested endpoint-name list, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started` with helper-observed image evidence and a map from every requested endpoint name to its allocated loopback port. Ordinary attempts request either no endpoint or exactly `service`; a Computer requests exactly the distinct `{view, control}` set, receives authoritative `WEFTY_COMPUTER_VIEW_PORT` and `WEFTY_COMPUTER_CONTROL_PORT`, and cannot retain `WEFTY_SERVICE_PORT`. An explicit Mac bridge-fallback request creates a separate guest loopback listener and capability. |
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. |
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only. A positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments while retaining any stable handoff volume; only then does the server tombstone authorization. |
@@ -181,6 +183,7 @@ heartbeats.
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend, and only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
 | `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the Mac bind-failure fallback and the helper issued that attempt's separate bridge capability. It never accepts an arbitrary host address or port. |
+| `SetComputerControlState` | Exact live Computer-attempt authority and one boolean enter. The helper atomically replaces the attempt-local `/wefty/control/driver.json` body with the exact version-1 false or true document; ordinary, stale, old-boot, and reaped attempts are refused. |
 
 `DialAttemptPort` terminates inside the guest at `127.0.0.1:<allocated-port>`.
 The helper emits an internal backend-ready marker only after that connection is
@@ -447,6 +450,14 @@ absence are proved.
 The read-only root and fixed-size `/dev`, `/dev/shm`, `/run`, `/tmp`, and
 `/var/tmp` tmpfs mounts leave the Computer disk as the only unbounded writable
 filesystem; Computer operator mounts are therefore required to be read-only.
+The helper also mounts a fresh attempt-local tmpfs outside the Computer disk,
+writes `driver.json` false before `Started`, and bind-mounts that directory
+read-only at the non-shadowable `/wefty/control` target. The file is mode 0444
+and each state replacement is a same-directory atomic rename followed by a
+directory sync, so the image sees only the two exact complete documents. The
+attempt log/resource cleanup path owns this tmpfs mount; attempt reap, session
+loss, and boot sweep unmount and remove it without adding it to Computer
+Storage evidence.
 
 The helper holds an exclusive per-generation file lock for the attachment
 lifetime and durably records exact attempt/fence/boot authority beside the

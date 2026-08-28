@@ -211,7 +211,17 @@ type AttemptEndpoint struct {
 	Dial func(context.Context) (net.Conn, error)
 }
 
-const AttemptEndpointService = "service"
+const (
+	AttemptEndpointService = "service"
+	AttemptEndpointView    = "view"
+	AttemptEndpointControl = "control"
+)
+
+// OCIComputerControlRuntime exposes the attempt-fenced guest driving signal
+// without exposing helper protocol or filesystem mechanics to the agent.
+type OCIComputerControlRuntime interface {
+	SetComputerControlState(context.Context, AttemptAuthority, bool) error
+}
 
 // Request contains the mechanics needed by any workload runtime. Kind and
 // class are intentionally absent: kind selected the adapter already, while

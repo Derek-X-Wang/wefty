@@ -20,8 +20,11 @@ const (
 	// ProtocolVersion is the only wire major accepted by this implementation.
 	// The helper executable checksum pins the exact minor shape within this
 	// major, so an in-place wire change still fails closed at session setup.
-	ProtocolVersion = 1
-	InvocationArg   = "__wefty_oci_helper"
+	ProtocolVersion = 2
+	// ComputerProtocolVersion is the first protocol carrying the exact Computer
+	// endpoint, control-state, and attachment semantics required for admission.
+	ComputerProtocolVersion = 2
+	InvocationArg           = "__wefty_oci_helper"
 	// MaxFrameBytes bounds every decoded request, response, and stream event.
 	MaxFrameBytes = 1 << 20
 )
@@ -45,6 +48,7 @@ const (
 	MethodSweep              Method = "Sweep"
 	MethodDialAttemptPort    Method = "DialAttemptPort"
 	MethodDialHostBridge     Method = "DialHostBridge"
+	MethodSetComputerControl Method = "SetComputerControlState"
 )
 
 // attemptPortBackendReady is emitted only after the helper has connected the
@@ -500,6 +504,11 @@ type SignalRequest struct {
 	Signal    Signal           `json:"signal"`
 }
 
+type SetComputerControlStateRequest struct {
+	Authority    AttemptAuthority `json:"authority"`
+	HumanDriving bool             `json:"human_driving"`
+}
+
 type Signal string
 
 const (
@@ -684,6 +693,12 @@ type DialAttemptPortRequest struct {
 type DialHostBridgeRequest struct {
 	Authority        AttemptAuthority `json:"authority"`
 	BridgeCapability string           `json:"bridge_capability"`
+}
+
+// SupportsComputerProtocol reports only the negotiated wire-semantic fact.
+// Functional runtime probing and boot-scoped publication remain agent-owned.
+func SupportsComputerProtocol(handshake AcquireSessionResponse) bool {
+	return handshake.ProtocolVersion >= ComputerProtocolVersion
 }
 
 func marshalBody(value any) (json.RawMessage, error) {

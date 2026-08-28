@@ -40,3 +40,40 @@ func TestServiceAcceptanceHelperAuthorityFailsClosed(t *testing.T) {
 	err = session.Watch(t.Context(), WatchRequest{Authority: authority}, nil)
 	assertRPCCode(t, err, CodeSessionStale)
 }
+
+func TestServiceAcceptanceComputerControlStateFailsClosed(t *testing.T) {
+	engine := newFakeEngine()
+	engine.setRunResponse(RunResponse{Started: true, Endpoints: map[string]uint16{"view": 42111, "control": 42112}})
+	client, stop := startTestServer(t, engine, ServerConfig{
+		HeartbeatTimeout: 2 * time.Second, MaximumAttemptDeadman: 3 * time.Second,
+	})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	authority := testAuthority()
+	authority.Class = "service"
+	request := testRunRequest(authority, 2*time.Second)
+	request.Workload.ManagedVolumes = testComputerManagedVolumes()
+	request.AllocateEndpoints = []string{"view", "control"}
+	if _, err := session.Run(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SetComputerControlState(t.Context(), SetComputerControlStateRequest{Authority: authority, HumanDriving: true}); err != nil {
+		t.Fatal(err)
+	}
+	stale := authority
+	stale.FencingToken = "stale"
+	if err := session.SetComputerControlState(t.Context(), SetComputerControlStateRequest{Authority: stale}); err == nil {
+		t.Fatal("stale authority changed the Computer driving signal")
+	}
+	if _, err := session.Delete(t.Context(), DeleteRequest{Authority: authority}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SetComputerControlState(t.Context(), SetComputerControlStateRequest{Authority: authority}); err == nil {
+		t.Fatal("reaped authority changed the Computer driving signal")
+	}
+}

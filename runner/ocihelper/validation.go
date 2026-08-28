@@ -157,6 +157,7 @@ func conflictsWithReservedMount(target string) bool {
 	for _, reserved := range []string{
 		contract.OCIContainerHandoffDirectory,
 		contract.OCIContainerServiceDirectory,
+		contract.OCIContainerControlDirectory,
 		"/proc",
 		"/dev",
 		"/sys",

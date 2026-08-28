@@ -173,16 +173,17 @@ func TestImageProgramSchemaAndGoValidationAgree(t *testing.T) {
 		wantValid bool
 	}
 	cases := map[string]validatorCase{
-		"complete valid program":       {raw: `{"reference":"ghcr.io/example/tool:v1","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","argv":["","run"],"working_directory":"/","mounts":[{"node_path":"/srv/input","container_path":"/input","read_only":false}],"limits":{"memory_bytes":1,"cpu_millicores":1},"runtime_handler":""}`, wantValid: true},
-		"argv all empty":               {raw: `{"reference":"alpine:latest","argv":[""]}`, wantValid: false},
-		"trailing working directory":   {raw: `{"reference":"alpine:latest","working_directory":"/workspace/"}`, wantValid: false},
-		"dot working directory":        {raw: `{"reference":"alpine:latest","working_directory":"/workspace/../tmp"}`, wantValid: false},
-		"root node mount":              {raw: `{"reference":"alpine:latest","mounts":[{"node_path":"/","container_path":"/input"}]}`, wantValid: false},
-		"reserved mount target":        {raw: `{"reference":"alpine:latest","mounts":[{"node_path":"/srv/input","container_path":"/wefty/handoff/result"}]}`, wantValid: false},
-		"empty limits":                 {raw: `{"reference":"alpine:latest","limits":{}}`, wantValid: false},
-		"limit beyond int64":           {raw: `{"reference":"alpine:latest","limits":{"memory_bytes":9223372036854775808}}`, wantValid: false},
-		"explicit null optional field": {raw: `{"reference":"alpine:latest","working_directory":null}`, wantValid: false},
-		"unknown member":               {raw: `{"reference":"alpine:latest","future":true}`, wantValid: false},
+		"complete valid program":        {raw: `{"reference":"ghcr.io/example/tool:v1","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","argv":["","run"],"working_directory":"/","mounts":[{"node_path":"/srv/input","container_path":"/input","read_only":false}],"limits":{"memory_bytes":1,"cpu_millicores":1},"runtime_handler":""}`, wantValid: true},
+		"argv all empty":                {raw: `{"reference":"alpine:latest","argv":[""]}`, wantValid: false},
+		"trailing working directory":    {raw: `{"reference":"alpine:latest","working_directory":"/workspace/"}`, wantValid: false},
+		"dot working directory":         {raw: `{"reference":"alpine:latest","working_directory":"/workspace/../tmp"}`, wantValid: false},
+		"root node mount":               {raw: `{"reference":"alpine:latest","mounts":[{"node_path":"/","container_path":"/input"}]}`, wantValid: false},
+		"reserved mount target":         {raw: `{"reference":"alpine:latest","mounts":[{"node_path":"/srv/input","container_path":"/wefty/handoff/result"}]}`, wantValid: false},
+		"reserved control mount target": {raw: `{"reference":"alpine:latest","mounts":[{"node_path":"/srv/input","container_path":"/wefty/control"}]}`, wantValid: false},
+		"empty limits":                  {raw: `{"reference":"alpine:latest","limits":{}}`, wantValid: false},
+		"limit beyond int64":            {raw: `{"reference":"alpine:latest","limits":{"memory_bytes":9223372036854775808}}`, wantValid: false},
+		"explicit null optional field":  {raw: `{"reference":"alpine:latest","working_directory":null}`, wantValid: false},
+		"unknown member":                {raw: `{"reference":"alpine:latest","future":true}`, wantValid: false},
 	}
 	for _, tc := range []struct {
 		name, field, number string

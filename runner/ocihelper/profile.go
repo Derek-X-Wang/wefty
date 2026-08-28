@@ -82,18 +82,19 @@ type GuestKernelFacts struct {
 // that only the privileged helper can obtain. OperatorMountSources contains
 // guest-visible translations in the same order as Workload.OperatorMounts.
 type RuntimeSpecInput struct {
-	ContainerID          string
-	CgroupPath           string
-	RootfsPath           string
-	Image                ImageRuntimeConfig
-	Workload             WorkloadInput
-	Guest                GuestKernelFacts
-	ResolverPath         string
-	HostsPath            string
-	ManagedRoot          string
-	AllowedMountRoots    []string
-	ManagedVolumeSources map[ManagedVolumeKind]string
-	OperatorMountSources []string
+	ContainerID           string
+	CgroupPath            string
+	RootfsPath            string
+	Image                 ImageRuntimeConfig
+	Workload              WorkloadInput
+	Guest                 GuestKernelFacts
+	ResolverPath          string
+	HostsPath             string
+	ManagedRoot           string
+	AllowedMountRoots     []string
+	ManagedVolumeSources  map[ManagedVolumeKind]string
+	ComputerControlSource string
+	OperatorMountSources  []string
 }
 
 // TranslateOperatorMountSources is the helper-side translation seam used by
@@ -473,6 +474,17 @@ func validateRuntimeSpecInput(input RuntimeSpecInput, validateSource func(string
 			return fmt.Errorf("managed volume %q source is not permitted: %w", volume.Kind, err)
 		}
 	}
+	computerDisk := workloadHasComputerDisk(input.Workload)
+	if computerDisk {
+		if input.ComputerControlSource == "" {
+			return errors.New("Computer control source is required")
+		}
+		if err := validateSource(input.ComputerControlSource, []string{input.ManagedRoot}, false); err != nil {
+			return fmt.Errorf("Computer control source is not permitted: %w", err)
+		}
+	} else if input.ComputerControlSource != "" {
+		return errors.New("Computer control source is reserved for Computer workloads")
+	}
 	return nil
 }
 
@@ -592,6 +604,7 @@ func isolationMounts(input RuntimeSpecInput) ([]specs.Mount, error) {
 	for _, volume := range input.Workload.ManagedVolumes {
 		if volume.Kind == ManagedVolumeComputerDisk {
 			mounts = append(mounts,
+				bindMount(input.ComputerControlSource, contract.OCIContainerControlDirectory, true),
 				specs.Mount{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", computerTmpKilobytes)}},
 				specs.Mount{Destination: "/var/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", computerVarTmpKilobytes)}},
 			)

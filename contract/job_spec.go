@@ -321,7 +321,7 @@ func shadowsOCIReservedTarget(value string) bool {
 	if value == "/" {
 		return true
 	}
-	for _, reserved := range [...]string{OCIContainerHandoffDirectory, OCIContainerServiceDirectory} {
+	for _, reserved := range [...]string{OCIContainerHandoffDirectory, OCIContainerServiceDirectory, OCIContainerControlDirectory} {
 		if value == reserved || strings.HasPrefix(value, reserved+"/") || strings.HasPrefix(reserved, value+"/") {
 			return true
 		}

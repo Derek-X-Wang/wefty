@@ -52,27 +52,29 @@ import (
 )
 
 type containerdAttempt struct {
-	authority       AttemptAuthority
-	resources       ResourceIdentity
-	computerDisk    *computerDiskAttachment
-	container       containerd.Container
-	task            containerd.Task
-	terminalReady   chan struct{}
-	terminalCode    uint32
-	terminalErr     error
-	stdout          string
-	stderr          string
-	oom             bool
-	oomCancel       context.CancelFunc
-	cancel          context.CancelFunc
-	signal          Signal
-	signalCause     string
-	deleted         bool
-	logAcknowledged map[string]uint64
-	hostBridge      net.Listener
-	endpoints       map[string]uint16
-	endpointHolds   map[string]net.Listener
-	mu              sync.Mutex
+	authority        AttemptAuthority
+	resources        ResourceIdentity
+	computerDisk     *computerDiskAttachment
+	container        containerd.Container
+	task             containerd.Task
+	terminalReady    chan struct{}
+	terminalCode     uint32
+	terminalErr      error
+	stdout           string
+	stderr           string
+	oom              bool
+	oomCancel        context.CancelFunc
+	cancel           context.CancelFunc
+	signal           Signal
+	signalCause      string
+	deleted          bool
+	logAcknowledged  map[string]uint64
+	hostBridge       net.Listener
+	endpoints        map[string]uint16
+	endpointHolds    map[string]net.Listener
+	controlDirectory string
+	controlMu        sync.Mutex
+	mu               sync.Mutex
 }
 
 type ContainerdEngine struct {
@@ -727,10 +729,17 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		endpoints[name] = port
 		endpointHolds[name] = hold
 	}
+	computer := workloadHasComputerDisk(request.Workload)
 	if servicePort := endpoints["service"]; servicePort != 0 {
 		request.Workload.ReservedEnvironment = setReservedEnvironment(
 			request.Workload.ReservedEnvironment, contract.EnvServicePort, fmt.Sprint(servicePort),
 		)
+	}
+	if computer {
+		request.Workload.ReservedEnvironment, err = computerEndpointEnvironment(request.Workload.ReservedEnvironment, endpoints)
+		if err != nil {
+			return RunResponse{}, err
+		}
 	}
 	if request.EnableHostBridgeFallback {
 		hostBridge, err = net.Listen("tcp4", "127.0.0.1:0")
@@ -760,6 +769,14 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if err != nil {
 		return RunResponse{}, fmt.Errorf("prepare overlayfs snapshot: %w", err)
 	}
+	logDirectory := filepath.Join(engine.config.RuntimeRoot, "logs", request.Resources.LogSegmentDirectory)
+	var controlDirectory string
+	if computer {
+		controlDirectory, err = prepareComputerControlDirectory(logDirectory, mountComputerControlTmpfs, unmountComputerControlTmpfs)
+		if err != nil {
+			return RunResponse{}, err
+		}
+	}
 	var document *RuntimeSpecDocument
 	err = mount.WithTempMount(leaseContext, mounts, func(root string) error {
 		imageConfig, configErr := readImageRuntimeConfig(leaseContext, engine.client.ContentStore(), image)
@@ -784,7 +801,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			Guest:        GuestKernelFacts{Architecture: runtime.GOARCH, KernelRelease: kernelRelease()},
 			ResolverPath: engine.config.ResolverPath, HostsPath: engine.config.HostsPath,
 			ManagedRoot: engine.config.RuntimeRoot, AllowedMountRoots: engine.config.AllowedMountRoots,
-			ManagedVolumeSources: managedSources, OperatorMountSources: operatorSources,
+			ManagedVolumeSources: managedSources, ComputerControlSource: controlDirectory, OperatorMountSources: operatorSources,
 		})
 		if configErr == nil {
 			uid, gid, ownerErr := document.ProcessOwner()
@@ -830,7 +847,6 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if err != nil {
 		return RunResponse{}, fmt.Errorf("create runc v2 container: %w", err)
 	}
-	logDirectory := filepath.Join(engine.config.RuntimeRoot, "logs", request.Resources.LogSegmentDirectory)
 	if err := os.MkdirAll(logDirectory, 0o700); err != nil {
 		return RunResponse{}, err
 	}
@@ -846,7 +862,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		attemptCancel()
 		return RunResponse{}, fmt.Errorf("register task Wait before Start: %w", err)
 	}
-	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, computerDisk: computerDisk, container: container, task: task, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds}
+	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, computerDisk: computerDisk, container: container, task: task, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory}
 	engine.watchOOM(attempt)
 	engine.mu.Lock()
 	engine.attempts[request.Authority.key()] = attempt
@@ -952,6 +968,38 @@ func setReservedEnvironment(environment []EnvironmentVariable, name, value strin
 		}
 	}
 	return append(result, EnvironmentVariable{Name: name, Value: value})
+}
+
+func removeReservedEnvironment(environment []EnvironmentVariable, name string) []EnvironmentVariable {
+	return slices.DeleteFunc(append([]EnvironmentVariable(nil), environment...), func(variable EnvironmentVariable) bool {
+		return variable.Name == name
+	})
+}
+
+func computerEndpointEnvironment(environment []EnvironmentVariable, endpoints map[string]uint16) ([]EnvironmentVariable, error) {
+	view, control := endpoints["view"], endpoints["control"]
+	if view == 0 || control == 0 || view == control || len(endpoints) != 2 {
+		return nil, errors.New("Computer endpoint allocation must be exactly distinct view and control ports")
+	}
+	result := removeReservedEnvironment(environment, contract.EnvServicePort)
+	result = setReservedEnvironment(result, contract.EnvComputerViewPort, fmt.Sprint(view))
+	result = setReservedEnvironment(result, contract.EnvComputerControlPort, fmt.Sprint(control))
+	return result, nil
+}
+
+func mountComputerControlTmpfs(path string) error {
+	return unix.Mount("tmpfs", path, "tmpfs", uintptr(unix.MS_NODEV|unix.MS_NOSUID|unix.MS_NOEXEC), "mode=0755,size=64k")
+}
+
+func unmountComputerControlTmpfs(path string) error {
+	err := unix.Unmount(path, 0)
+	if err == nil || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if errors.Is(err, unix.EBUSY) {
+		return unix.Unmount(path, unix.MNT_DETACH)
+	}
+	return err
 }
 
 func (engine *ContainerdEngine) reserveAttemptPort(authorityKey string) (uint16, net.Listener, error) {
@@ -1572,8 +1620,12 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 		if identityErr != nil {
 			return SweepResponse{}, identityErr
 		}
+		logDirectory := filepath.Join(engine.config.RuntimeRoot, "logs", identity.LogSegmentDirectory)
+		if err := unmountComputerControlTmpfs(filepath.Join(logDirectory, "control")); err != nil {
+			return SweepResponse{}, err
+		}
 		for _, path := range []string{
-			filepath.Join(engine.config.RuntimeRoot, "logs", identity.LogSegmentDirectory),
+			logDirectory,
 			// M3 handoffs now live under the durable handoffs root. Sweep this
 			// legacy attempt-scoped location so upgrades do not strand residue.
 			filepath.Join(engine.config.RuntimeRoot, "volumes", identity.HandoffVolumeDirectory),
@@ -1611,6 +1663,19 @@ func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request Dia
 		return fmt.Errorf("confirm attempt loopback connection: %w", err)
 	}
 	return Relay(ctx, stream, backend)
+}
+
+func (engine *ContainerdEngine) SetComputerControlState(_ context.Context, request SetComputerControlStateRequest) error {
+	attempt, err := engine.attempt(request.Authority)
+	if err != nil {
+		return err
+	}
+	attempt.controlMu.Lock()
+	defer attempt.controlMu.Unlock()
+	if attempt.controlDirectory == "" {
+		return errors.New("attempt has no Computer control state")
+	}
+	return atomicWriteComputerControlState(attempt.controlDirectory, request.HumanDriving)
 }
 func (engine *ContainerdEngine) DialHostBridge(ctx context.Context, request DialHostBridgeRequest, stream io.ReadWriteCloser) error {
 	attempt, err := engine.attempt(request.Authority)
@@ -1716,6 +1781,9 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 	for _, path := range []string{
 		filepath.Join(engine.config.RuntimeRoot, "logs", resources.LogSegmentDirectory),
 	} {
+		if err := unmountComputerControlTmpfs(filepath.Join(path, "control")); err != nil {
+			failures = append(failures, err)
+		}
 		if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			failures = append(failures, err)
 		}

@@ -1087,7 +1087,10 @@ func (engine *adapterTestEngine) Run(_ context.Context, request ocihelper.RunReq
 		response.HostBridgeReady = true
 	}
 	if len(request.AllocateEndpoints) > 0 {
-		response.Endpoints = map[string]uint16{request.AllocateEndpoints[0]: 42424}
+		response.Endpoints = make(map[string]uint16, len(request.AllocateEndpoints))
+		for index, name := range request.AllocateEndpoints {
+			response.Endpoints[name] = uint16(42424 + index)
+		}
 	}
 	return response, nil
 }

@@ -551,9 +551,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	}
 	portfulService := claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.PublishedPort != nil
 	var ociEndpointLatch *runtimeEndpointLatch
-	if portfulService && claim.Job.Spec.Kind == contract.JobKindOCI {
+	if endpoints := runtimeAttemptEndpoints(claim.Job.Spec); len(endpoints) > 0 {
 		ociEndpointLatch = newRuntimeEndpointLatch()
-		request.AttemptEndpoints = []string{workloadrunner.AttemptEndpointService}
+		request.AttemptEndpoints = endpoints
 		request.AttemptEndpointReady = ociEndpointLatch.publish
 	}
 	if claim.Job.Spec.Class == contract.JobClassService && !portfulService {
@@ -863,6 +863,19 @@ func runtimeManagedVolumes(claim l1.Claim) []workloadrunner.ManagedVolume {
 	default:
 		return nil
 	}
+}
+
+func runtimeAttemptEndpoints(spec contract.JobSpec) []string {
+	if spec.Kind != contract.JobKindOCI || spec.Class != contract.JobClassService {
+		return nil
+	}
+	if spec.Execution.OCI != nil && spec.Execution.OCI.Computer != nil {
+		return []string{workloadrunner.AttemptEndpointView, workloadrunner.AttemptEndpointControl}
+	}
+	if spec.PublishedPort != nil {
+		return []string{workloadrunner.AttemptEndpointService}
+	}
+	return nil
 }
 
 func runtimeManagedVolumesForSuccessfulCompletion(spec contract.JobSpec) []workloadrunner.ManagedVolume {
