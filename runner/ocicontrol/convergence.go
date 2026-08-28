@@ -15,12 +15,14 @@ import (
 // setup. Probe identity is live-safe; fixed VM sizing requires a restart; VM
 // topology or the operator mount root requires recreation.
 type SetupState struct {
-	VMMemory      string `json:"vm_memory"`
-	VMCPUs        int    `json:"vm_cpus"`
-	VMDisk        string `json:"vm_disk"`
-	VMType        string `json:"vm_type"`
-	HostMountRoot string `json:"host_mount_root"`
-	ProbeDigest   string `json:"probe_digest"`
+	VMMemory            string `json:"vm_memory"`
+	VMCPUs              int    `json:"vm_cpus"`
+	VMDisk              string `json:"vm_disk"`
+	VMType              string `json:"vm_type"`
+	HostMountRoot       string `json:"host_mount_root"`
+	ProbeDigest         string `json:"probe_digest"`
+	MemoryCapacityBytes int64  `json:"memory_capacity_bytes,omitempty"`
+	MemoryReserveBytes  int64  `json:"memory_reserve_bytes,omitempty"`
 }
 
 func DesiredSetupStatePath(currentPath string) string {
@@ -37,7 +39,8 @@ func ClassifyConvergence(current, desired SetupState) ConvergenceClass {
 	if current.VMType != desired.VMType || current.HostMountRoot != desired.HostMountRoot {
 		return ConvergenceRecreateRequired
 	}
-	if current.VMMemory != desired.VMMemory || current.VMCPUs != desired.VMCPUs || current.VMDisk != desired.VMDisk {
+	if current.VMMemory != desired.VMMemory || current.VMCPUs != desired.VMCPUs || current.VMDisk != desired.VMDisk ||
+		current.MemoryCapacityBytes != desired.MemoryCapacityBytes || current.MemoryReserveBytes != desired.MemoryReserveBytes {
 		return ConvergenceRestartRequired
 	}
 	return ConvergenceLiveSafe
@@ -102,6 +105,9 @@ func validateSetupState(state SetupState) error {
 		return errors.New("invalid OCI setup state")
 	}
 	if state.VMType == "" || state.ProbeDigest == "" || !filepath.IsAbs(state.HostMountRoot) || filepath.Clean(state.HostMountRoot) == string(filepath.Separator) {
+		return errors.New("invalid OCI setup state")
+	}
+	if state.MemoryCapacityBytes < 0 || state.MemoryReserveBytes < 0 {
 		return errors.New("invalid OCI setup state")
 	}
 	return nil

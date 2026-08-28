@@ -32,6 +32,7 @@ var failureClassifications = map[contract.SpawnFailureCode]failureClassification
 	contract.SpawnFailureImageNotFound:            failureTerminal,
 	contract.SpawnFailureImageManifestInvalid:     failureTerminal,
 	contract.SpawnFailureImagePlatformUnsupported: failureTerminal,
+	contract.SpawnFailureInsufficientMemory:       failureTerminal,
 	contract.SpawnFailureInsufficientDisk:         failureTerminal,
 }
 
@@ -148,7 +149,11 @@ func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, quiesce
 
 	restartable := false
 	infrastructure := false
+	computer := job.Spec.Kind == contract.JobKindOCI && job.Spec.Execution.OCI != nil && job.Spec.Execution.OCI.Computer != nil
 	switch {
+	case computer && (result.OOM || result.DiskExhausted):
+		// Resource exhaustion is a terminal operator-recovery latch. It never
+		// consumes service restart accounting or enters infrastructure retry.
 	case result.SpawnError != nil:
 		classification := classifySpawnFailure(result.SpawnError.Code)
 		if result.SpawnError.Code == contract.SpawnFailureRuntimeUnavailable && job.Spec.Kind != contract.JobKindOCI {
@@ -174,6 +179,9 @@ func (s *Store) classifyServiceCompletion(job Job, result ProcessResult, quiesce
 	case result.RuntimeFailure != nil:
 		infrastructure = job.Spec.Kind == contract.JobKindOCI &&
 			classifyRuntimeFailure(result.RuntimeFailure.Code) == failureInfrastructure
+	case result.OOM || result.DiskExhausted:
+		// Additive resource evidence on an ordinary OCI service never changes
+		// its primary terminal arm or restart policy.
 	}
 
 	if infrastructure {

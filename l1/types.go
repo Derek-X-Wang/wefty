@@ -270,6 +270,7 @@ type ProcessResult struct {
 	Signal                string                    `json:"signal,omitempty"`
 	TerminationCause      contract.TerminationCause `json:"termination_cause,omitempty"`
 	OOM                   bool                      `json:"oom,omitempty"`
+	DiskExhausted         bool                      `json:"disk_exhausted,omitempty"`
 	LogEvidenceIncomplete bool                      `json:"log_evidence_incomplete,omitempty"`
 }
 

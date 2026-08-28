@@ -38,6 +38,38 @@ func TestDefaultSizingIsResolvedOnceFromOwnerDefaults(t *testing.T) {
 	}
 }
 
+func TestShippedMacSizingStartsAndAdmitsThreeDefaultComputers(t *testing.T) {
+	for _, hostMemory := range []int64{4 << 30, 8 << 30} {
+		sizing, err := DefaultSizing(hostMemory, 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		capacity, reserve, err := DefaultMacComputerCapacity(sizing)
+		if err != nil || capacity != 4<<30 || reserve <= 0 || 3<<30 > capacity-reserve {
+			t.Fatalf("host=%d sizing=%+v capacity=%d reserve=%d err=%v", hostMemory, sizing, capacity, reserve, err)
+		}
+	}
+}
+
+func TestParseByteQuantityUsesSetupSizingGrammar(t *testing.T) {
+	for value, want := range map[string]int64{
+		"1024MiB": 1 << 30,
+		"2GiB":    2 << 30,
+		"4GB":     4_000_000_000,
+		"8kB":     8_000,
+	} {
+		got, err := ParseByteQuantity(value)
+		if err != nil || got != want {
+			t.Fatalf("ParseByteQuantity(%q) = %d, %v; want %d", value, got, err, want)
+		}
+	}
+	for _, value := range []string{"0GiB", "4", "9223372036854775807GiB"} {
+		if _, err := ParseByteQuantity(value); err == nil {
+			t.Fatalf("ParseByteQuantity(%q) unexpectedly succeeded", value)
+		}
+	}
+}
+
 func TestTemplateCarriesOnlyTheNarrowLimaTransport(t *testing.T) {
 	root := filepath.Join(string(filepath.Separator), "Users", "operator", "wefty-mounts")
 	payload, err := RenderTemplate(TemplateConfig{

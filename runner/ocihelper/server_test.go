@@ -603,6 +603,25 @@ func TestInsufficientDiskSurvivesHelperAndAgentMapping(t *testing.T) {
 	}
 }
 
+func TestInsufficientMemorySurvivesHelperAndAgentMapping(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runErr = &insufficientMemoryError{RequestedBytes: 1 << 30, ObservedAvailableBytes: 512 << 20}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	_, err = session.Run(t.Context(), testRunRequest(testAuthority(), time.Second))
+	assertRPCCode(t, err, CodeInsufficientMemory)
+	failure := SpawnFailureForRunError(err)
+	if failure == nil || failure.Code != contract.SpawnFailureInsufficientMemory || failure.RequestedBytes != 1<<30 || failure.ObservedAvailableBytes != 512<<20 {
+		t.Fatalf("insufficient memory spawn failure = %#v", failure)
+	}
+}
+
 func TestClientVerifiesReturnedChecksumLocally(t *testing.T) {
 	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{})
 	defer stop()
@@ -784,6 +803,7 @@ func TestNamedEndpointAuthorizationResolvesOnlyTheRequestedName(t *testing.T) {
 	request := testRunRequest(testAuthority(), time.Second)
 	request.Authority.Class = contract.JobClassService
 	request.Workload.Computer = true
+	request.Workload.Limits.MemoryBytes = 1 << 30
 	request.Workload.ManagedVolumes = testComputerManagedVolumes()
 	request.AllocateEndpoints = []string{"view", "control"}
 	if _, err := session.Run(t.Context(), request); err != nil {
@@ -885,6 +905,7 @@ func TestComputerControlStateRequiresExactLiveComputerAuthority(t *testing.T) {
 	computer.Authority.AttemptID = "computer-attempt"
 	computer.Authority.Class = contract.JobClassService
 	computer.Workload.Computer = true
+	computer.Workload.Limits.MemoryBytes = 1 << 30
 	computer.Workload.ManagedVolumes = testComputerManagedVolumes()
 	computer.AllocateEndpoints = []string{"view", "control"}
 	engine.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"view": 42011, "control": 42012}})

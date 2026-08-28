@@ -198,7 +198,7 @@ jobs:
           [Service]
           Type=simple
           Environment=WEFTY_OCI_HELPER_ALLOWED_UIDS=$AGENT_UID
-          ExecStart=/usr/local/libexec/wefty-agent-oci-realtiming __wefty_oci_helper --oci-containerd-address /run/wefty-containerd/containerd.sock --oci-containerd-state-root /run/wefty-containerd/state --oci-runtime-root /var/lib/wefty/oci
+          ExecStart=/usr/local/libexec/wefty-agent-oci-realtiming __wefty_oci_helper --oci-containerd-address /run/wefty-containerd/containerd.sock --oci-containerd-state-root /run/wefty-containerd/state --oci-runtime-root /var/lib/wefty/oci --oci-memory-capacity-bytes 4294967296 --oci-memory-reserve-bytes 1073741824
           User=root
           Group=root
           UNIT

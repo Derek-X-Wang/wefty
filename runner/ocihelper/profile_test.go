@@ -495,6 +495,7 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 			input.ReservedEnvironment = []EnvironmentVariable{{Name: contract.EnvComputerToken, Value: "attacker"}}
 		}},
 		{name: "negative memory", mutate: func(input *WorkloadInput) { input.Limits.MemoryBytes = -1 }},
+		{name: "Computer without memory cap", mutate: func(input *WorkloadInput) { input.Computer = true; input.Limits.MemoryBytes = 0 }},
 		{name: "negative CPU", mutate: func(input *WorkloadInput) { input.Limits.CPUMillicores = -1 }},
 		{name: "managed kind", mutate: func(input *WorkloadInput) {
 			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: "host_device"}}
@@ -547,6 +548,7 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 	}
 	computerDisk := valid()
 	computerDisk.Computer = true
+	computerDisk.Limits.MemoryBytes = 1 << 30
 	computerDisk.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{
 		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30,
 	}}}

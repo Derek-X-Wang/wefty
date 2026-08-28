@@ -58,7 +58,8 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 					RuncVersion: TestedRuncVersion, RuncVersionSource: ocihelper.RuncVersionSourceConfiguredPath, RuncRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					AllowedMountRoots: []string{"/srv/wefty", "/worktrees"}, MountRootsRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					Cache: ocihelper.ImageCacheStatus{Bytes: 8 << 30, CapBytes: 16 << 30}, CacheRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
-					LastProfile: &ocihelper.ProfileReceipt{Computer: true, MemoryLimitBytes: 2 << 30, ComputerTmpfsCeilingBytes: 1600 << 20, LargestTmpfsCeilingBytes: 1 << 30, Warnings: []ocihelper.ProfileWarning{}},
+					LastProfile:   &ocihelper.ProfileReceipt{Computer: true, MemoryLimitBytes: 2 << 30, MemoryMaxBytes: 2 << 30, MemoryOOMGroup: true, MemorySwapMaxBytes: 0, ComputerTmpfsCeilingBytes: 1600 << 20, LargestTmpfsCeilingBytes: 1 << 30, Warnings: []ocihelper.ProfileWarning{}},
+					LastAdmission: &ocihelper.ResourceAdmissionReceipt{ObservedAt: now.Add(-30 * time.Second), Admitted: true, MemoryCapacityBytes: 4 << 30, MemoryReserveBytes: 1 << 30, MemoryCommittedBeforeBytes: 1 << 30, RequestedMemoryBytes: 1 << 30, MemoryCommittedAfterBytes: 2 << 30, MemTotalBytes: 4 << 30, MemAvailableBytes: 64 << 20, RequestedDiskBytes: 8 << 30, FilesystemAvailableBytes: 12 << 30, ComputerTmpfsCeilingBytes: 1600 << 20},
 				},
 				SweepReceiptRecorded: true,
 				SweepReceipt: ocihelper.VerifiedSweepReceipt{SweepEpoch: "sweep-1", HelperSession: ocihelper.HelperSession{
@@ -103,6 +104,44 @@ func TestDoctorSurfacesComputerTmpfsCeilingPressureAsWarning(t *testing.T) {
 	if !found || report.Profile.MemoryLimitBytes != 512<<20 || report.Profile.ComputerTmpfsCeilingBytes != 1600<<20 || len(report.Profile.Warnings) != 2 {
 		t.Fatalf("profile warning was not assertion-derived: profile=%+v findings=%+v", report.Profile, report.Findings)
 	}
+}
+
+func TestDoctorSurfacesFactsOnlyResourceAdmissionWithoutFitForecast(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	report := BuildDoctor(t.Context(), healthyDoctorConfig(now, ""))
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if report.ResourceAdmission == nil || report.ResourceAdmission.MemAvailableBytes != 64<<20 ||
+		report.ResourceAdmission.MemoryCommittedAfterBytes != 2<<30 || report.ResourceAdmission.ComputerTmpfsCeilingBytes != 1600<<20 {
+		t.Fatalf("resource admission facts = %+v", report.ResourceAdmission)
+	}
+	for _, finding := range report.Findings {
+		if finding.Check == "resource-admission" && finding.Code == "oci_resource_admission_admitted" && finding.Outcome == DiagnosticOK {
+			return
+		}
+	}
+	t.Fatalf("resource admission finding missing: %+v", report.Findings)
+}
+
+func TestDoctorDoesNotRenderARefusedAdmissionAsHealthy(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	config := healthyDoctorConfig(now, "")
+	base := config.Helper
+	config.Helper = func(ctx context.Context) (HelperDoctorSnapshot, error) {
+		snapshot, err := base(ctx)
+		snapshot.Runtime.LastAdmission.Admitted = false
+		snapshot.Runtime.LastAdmission.FailureCode = ocihelper.CodeInsufficientMemory
+		snapshot.Runtime.LastAdmission.MemoryCommittedAfterBytes = snapshot.Runtime.LastAdmission.MemoryCommittedBeforeBytes
+		return snapshot, err
+	}
+	report := BuildDoctor(t.Context(), config)
+	for _, finding := range report.Findings {
+		if finding.Check == "resource-admission" && finding.Code == "oci_resource_admission_refused" && finding.Outcome == DiagnosticFailed && finding.Severity == DiagnosticWarn {
+			return
+		}
+	}
+	t.Fatalf("refused admission was not preserved as typed non-healthy evidence: %+v", report.Findings)
 }
 
 func setProbeReason(config *DoctorConfig, reason contract.CapabilityReasonCode) {

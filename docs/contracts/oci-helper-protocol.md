@@ -321,6 +321,40 @@ known profile gap, not an implicit default. The
 runtime handler, snapshotter, and containerd namespace are fixed at
 `io.containerd.runc.v2`, `overlayfs`, and `wefty`.
 
+Before any task reaches `Started`, the helper serializes one node-local
+newcomer decision over declared memory and disk caps for Computers only.
+Setup supplies the configured Node/VM memory capacity and infrastructure
+reserve; helper startup never derives or rejects those values. A
+request whose cap exceeds the remaining declared-cap budget fails as exact
+`insufficient_memory`. `MemAvailable` is sampled with the receipt timestamp but
+never participates in the verdict. The receipt records configured
+capacity/reserve, committed memory and disk before and after, requested memory/disk,
+`MemTotal`, `MemAvailable`, filesystem free bytes, and the declared Computer
+tmpfs ceiling without forecasting a fit count. Disk admission samples the
+filesystem that holds the Computer disk root under the same lock and reserves
+the declared bytes before allocation. Reservations are bound-Job scoped so a
+replacement attempt reuses, rather than doubles, its charge.
+
+The shipped Mac setup records a 4 GiB Computer ceiling and an infrastructure
+reserve proportional to the setup-time Lima VM memory. The Linux setup records
+the node `MemTotal` as capacity and defaults its reserve to the smaller of
+1 GiB or 25 percent. A zero capacity is explicitly unknown: the helper still
+records and sums declared Computer caps but has no ceiling against which to
+refuse them, and it never treats that configuration as a startup failure.
+
+For a Computer the canonical profile also requests `memory.oom.group=1`.
+After task creation and before `Start`, the helper reads back `memory.max`,
+`memory.oom.group`, and `memory.swap.max`; only exact `<cap>`, `1`, and `0` may
+produce `Started`. Missing, malformed, or mismatched files fail closed as an
+OCI profile rejection rather than recording a successful receipt.
+
+`Watch` retains OOM as kernel-observed additive evidence. It adds
+`disk_exhausted` only from a positively observed attempt-local ENOSPC event;
+when no helper-visible write-budget or filesystem error event exists the field
+stays absent. A post-hoc filesystem-free sample, exit code, or error text cannot
+create either fact. The agent maps supported post-`Started` observations to the exact terminal
+`insufficient_memory|insufficient_disk` latch with declared-cap facts.
+
 Capability parity is exact: bounding, permitted, and effective contain the 12
 allowed capabilities; inheritable and ambient are explicit empty arrays. The
 latter two, plus the explicit workload-trait-selected `root.readonly`, are emitted by the canonical
@@ -482,7 +516,8 @@ For a Computer, the profile receipt reports the 1600 MiB combined ceiling for
 memory limit, and typed ceiling-over-limit warnings. These tmpfs values are
 caps rather than reservations, so the warnings do not reject admission; the
 memory cgroup remains the enforcement boundary. The node doctor repeats the
-last assertion-derived comparison as `WARN` when applicable.
+last assertion-derived comparison as `WARN` when applicable and exposes the
+last atomic admission facts. A missing receipt remains `NOT-RUN`.
 
 The helper holds an exclusive per-generation file lock for the attachment
 lifetime and durably records exact attempt/fence/boot authority beside the

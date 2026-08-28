@@ -161,20 +161,22 @@ func ValidateLaunchDaemonInstall(config LaunchDaemonConfig) error {
 }
 
 type GuestHelperInstallConfig struct {
-	Instance         string
-	Limactl          string
-	GuestUser        string
-	GuestUID         uint32
-	HelperBinary     string
-	ExpectedVersion  string
-	ExpectedChecksum string
-	HostMountRoot    string
-	HelperSocket     string
-	ProbeArchive     string
-	ProbeReference   string
-	ProbeDigest      string
-	NodeID           string
-	BootSessionID    string
+	Instance            string
+	Limactl             string
+	GuestUser           string
+	GuestUID            uint32
+	HelperBinary        string
+	ExpectedVersion     string
+	ExpectedChecksum    string
+	HostMountRoot       string
+	HelperSocket        string
+	ProbeArchive        string
+	ProbeReference      string
+	ProbeDigest         string
+	NodeID              string
+	BootSessionID       string
+	MemoryCapacityBytes int64
+	MemoryReserveBytes  int64
 }
 
 type GuestHelperRemovalConfig struct {
@@ -208,6 +210,9 @@ func (config GuestHelperInstallConfig) validate() error {
 	}
 	if filepath.Clean(config.HostMountRoot) == string(filepath.Separator) {
 		return errors.New("guest helper host mount root must not be filesystem root")
+	}
+	if config.MemoryCapacityBytes < 0 || config.MemoryReserveBytes < 0 {
+		return errors.New("guest helper memory capacity configuration must not be negative")
 	}
 	if config.Limactl == "" {
 		config.Limactl = "limactl"
@@ -261,6 +266,8 @@ func renderGuestServiceUnit(config GuestHelperInstallConfig) []byte {
 		"--oci-allowed-mount-root=" + GuestAllowedMountRoot,
 		"--oci-lima-host-mount-root=" + filepath.Clean(config.HostMountRoot),
 		"--oci-lima-guest-mount-root=" + GuestAllowedMountRoot,
+		"--oci-memory-capacity-bytes=" + strconv.FormatInt(config.MemoryCapacityBytes, 10),
+		"--oci-memory-reserve-bytes=" + strconv.FormatInt(config.MemoryReserveBytes, 10),
 	}
 	for index := range arguments {
 		arguments[index] = systemdQuote(arguments[index])

@@ -48,14 +48,14 @@ func TestProcessResultSerializesTerminationCause(t *testing.T) {
 	}
 }
 
-func TestProcessResultSerializesRuntimeFailureAndAdditiveOOM(t *testing.T) {
+func TestProcessResultSerializesRuntimeFailureAndAdditiveResourceEvidence(t *testing.T) {
 	encoded, err := json.Marshal(ProcessResult{
-		RuntimeFailure: &RuntimeFailure{Code: RuntimeFailureUnavailable, Message: "helper lost"}, OOM: true,
+		RuntimeFailure: &RuntimeFailure{Code: RuntimeFailureUnavailable, Message: "helper lost"}, OOM: true, DiskExhausted: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(encoded), `{"runtime_failure":{"code":"runtime_unavailable","message":"helper lost"},"oom":true}`; got != want {
+	if got, want := string(encoded), `{"runtime_failure":{"code":"runtime_unavailable","message":"helper lost"},"oom":true,"disk_exhausted":true}`; got != want {
 		t.Fatalf("ProcessResult JSON = %s, want %s", got, want)
 	}
 }

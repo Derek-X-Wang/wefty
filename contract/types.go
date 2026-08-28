@@ -604,9 +604,9 @@ const (
 // one process. ExitCode is a pointer so a successful exit code of zero remains
 // present on the wire when omitempty is applied. OutputError supersedes an
 // otherwise-successful exit when durable output cannot be finalized. A signal
-// outcome always names its structured initiator in TerminationCause. OOM and
-// LogEvidenceIncomplete are additive evidence and never replace the primary
-// terminal arm.
+// outcome always names its structured initiator in TerminationCause. OOM,
+// DiskExhausted, and LogEvidenceIncomplete are additive evidence and never
+// replace the primary terminal arm.
 type ProcessResult struct {
 	SpawnError            *SpawnFailure    `json:"spawn_error,omitempty"`
 	RuntimeFailure        *RuntimeFailure  `json:"runtime_failure,omitempty"`
@@ -615,6 +615,7 @@ type ProcessResult struct {
 	Signal                string           `json:"signal,omitempty"`
 	TerminationCause      TerminationCause `json:"termination_cause,omitempty"`
 	OOM                   bool             `json:"oom,omitempty"`
+	DiskExhausted         bool             `json:"disk_exhausted,omitempty"`
 	LogEvidenceIncomplete bool             `json:"log_evidence_incomplete,omitempty"`
 }
 
@@ -664,6 +665,7 @@ const (
 	SpawnFailureImageManifestInvalid       SpawnFailureCode = "image_manifest_invalid"
 	SpawnFailureImagePlatformUnsupported   SpawnFailureCode = "image_platform_unsupported"
 	SpawnFailureOCISpecRejected            SpawnFailureCode = "oci_spec_rejected"
+	SpawnFailureInsufficientMemory         SpawnFailureCode = "insufficient_memory"
 	SpawnFailureInsufficientDisk           SpawnFailureCode = "insufficient_disk"
 )
 

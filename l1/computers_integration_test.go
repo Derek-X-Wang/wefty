@@ -542,8 +542,11 @@ func TestComputerRestartRecoversFailedAndStoppedObservations(t *testing.T) {
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
 		"kind:oci": true, "cgroup_v2": true, "computer": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	spec := computerCapabilityJobSpec("computer:restart")
+	memoryBytes := int64(1 << 30)
+	spec.Execution.OCI.Limits.MemoryBytes = &memoryBytes
 	computer, _, err := h.store.CreateComputer(context.Background(), CreateComputerRequest{
-		Name: "restartable", Spec: computerCapabilityJobSpec("computer:restart"), Actor: "operator",
+		Name: "restartable", Spec: spec, Actor: "operator",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -552,16 +555,33 @@ func TestComputerRestartRecoversFailedAndStoppedObservations(t *testing.T) {
 	if err != nil || firstClaim == nil {
 		t.Fatalf("first claim = %#v err=%v", firstClaim, err)
 	}
-	if _, err := h.store.LatchServiceImageReconciliationFailure(context.Background(), "fabric-computer-node",
-		computer.CurrentJobID, ServiceImageReconciliationFailureRequest{
-			NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			Failure: contract.SpawnFailure{Code: contract.SpawnFailureImageUnavailable, Message: "latched for restart test"},
+	if _, err := h.store.ObserveAttemptImage(context.Background(), "fabric-computer-node", computer.CurrentJobID,
+		firstClaim.Lease.AttemptID, testImageObservation(firstClaim.Lease.FencingToken)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.StartAttempt(context.Background(), "fabric-computer-node", computer.CurrentJobID,
+		firstClaim.Lease.AttemptID, StartedRequest{FencingToken: firstClaim.Lease.FencingToken}); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 137
+	if _, err := h.store.CompleteAttempt(context.Background(), "fabric-computer-node", computer.CurrentJobID,
+		firstClaim.Lease.AttemptID, CompletionRequest{
+			FencingToken: firstClaim.Lease.FencingToken, IdempotencyKey: "runtime-oom",
+			Result: ProcessResult{ExitCode: &exitCode, OOM: true},
 		}); err != nil {
 		t.Fatal(err)
 	}
 	failed, err := h.store.GetComputer(context.Background(), computer.ComputerID)
-	if err != nil || failed.CurrentJob.State != contract.JobFailed {
+	if err != nil || failed.CurrentJob.State != contract.JobFailed || failed.CurrentJob.NextRestartAt != nil ||
+		failed.CurrentJob.RestartStreak != 0 || failed.CurrentJob.LifetimeRestartCount != 0 || failed.CurrentJob.HoldsSlot(failed.CurrentJob.State) ||
+		failed.BoundNodeID != node.NodeID || failed.StorageID != computer.StorageID || failed.CurrentJob.Spec.Execution.OCI.Image.Digest == nil {
 		t.Fatalf("failed Computer = %#v err=%v", failed, err)
+	}
+	var resourceFailure contract.SpawnFailure
+	if err := json.Unmarshal(failed.CurrentJob.LastFailure, &resourceFailure); err != nil ||
+		resourceFailure.Code != contract.SpawnFailureInsufficientMemory || resourceFailure.NodeID != node.NodeID ||
+		resourceFailure.RequestedBytes != 1<<30 || resourceFailure.ObservedAvailableBytes != 0 {
+		t.Fatalf("failed Computer resource evidence = %+v err=%v", resourceFailure, err)
 	}
 	if _, err := h.store.SetComputerDesiredState(context.Background(), failed.ComputerID,
 		computerDesiredRequest(failed, contract.ServiceDesiredRunning, "operator")); errorCode(err) != contract.ErrorConflict {

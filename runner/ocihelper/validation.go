@@ -83,6 +83,9 @@ func validateWorkloadWire(input WorkloadInput) error {
 	if input.Limits.MemoryBytes < 0 || input.Limits.CPUMillicores < 0 {
 		return errors.New("workload limits must not be negative")
 	}
+	if input.Computer && input.Limits.MemoryBytes <= 0 {
+		return errors.New("Computer workload requires a positive memory cap")
+	}
 	seenManagedKinds := make(map[ManagedVolumeKind]struct{}, len(input.ManagedVolumes))
 	seenVolumes := make(map[string]struct{}, len(input.OperatorMounts))
 	for _, volume := range input.ManagedVolumes {

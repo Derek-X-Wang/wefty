@@ -401,6 +401,27 @@ The helper injects the two reserved Computer port values, omits
 `WEFTY_SERVICE_PORT`, and mounts its fresh attempt-local read-only
 `/wefty/control/driver.json` outside that Storage generation.
 
+Immediately before privileged runtime creation, the helper atomically reserves
+the newcomer Computer's declared memory and disk caps against the setup-
+configured Node/VM capacity and infrastructure reserve. Reservations are keyed
+by bound Job, so a replacement attempt reuses its Computer's charge. Ordinary
+OCI services do not participate. The refused newcomer changes no resident attempt,
+publication, Controller tenure, or write budget. Low `MemAvailable` is retained
+only as a timestamped fact. The disk decision is serialized against the
+filesystem holding the Computer disk root before allocation. Full Computer disk
+allocation remains the durable charge: pre-`Started` `ENOSPC` leaves no partial
+image/loop/mount/manifest, and stopped Computer images retain their bytes.
+
+At terminal observation, kernel OOM evidence becomes the exact Computer memory
+latch. `disk_exhausted` requires a positively observed attempt-local ENOSPC
+event; a post-hoc free-byte sample is advisory only and cannot create the
+latch. Neither resource fact is inferred from stderr or a numeric exit status.
+
+Mac setup ships a 4 GiB Computer ceiling with an infrastructure reserve
+proportional to the fixed Lima VM sizing. Linux setup defaults the configured
+usable arithmetic to `MemTotal - min(1 GiB, 25%)`. The helper consumes those
+facts as configuration and never refuses to start because of their values.
+
 ## Attempts and occupancy
 
 The `attempts` map is keyed by attempt ID. Each entry carries job ID, workload

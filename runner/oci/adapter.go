@@ -1201,7 +1201,8 @@ func helperRunDefinitivelyRejected(err error) bool {
 	}
 	switch rpcErr.Code {
 	case ocihelper.CodeEngineFailure, ocihelper.CodeOCISpecRejected, ocihelper.CodeImageUnavailable,
-		ocihelper.CodeInvalidRequest, ocihelper.CodeSweepRequired, ocihelper.CodeUnsupportedOperation:
+		ocihelper.CodeInsufficientMemory, ocihelper.CodeInsufficientDisk, ocihelper.CodeInvalidRequest,
+		ocihelper.CodeSweepRequired, ocihelper.CodeUnsupportedOperation:
 		return true
 	default:
 		return false
@@ -1799,7 +1800,7 @@ func imageObservation(evidence ocihelper.ImageEvidence) workloadrunner.OCIImageO
 }
 
 func processResult(response ocihelper.WatchResponse) contract.ProcessResult {
-	result := contract.ProcessResult{ExitCode: response.ExitCode, OOM: response.OutOfMemory, LogEvidenceIncomplete: response.LogEvidenceIncomplete}
+	result := contract.ProcessResult{ExitCode: response.ExitCode, OOM: response.OutOfMemory, DiskExhausted: response.DiskExhausted, LogEvidenceIncomplete: response.LogEvidenceIncomplete}
 	if response.Signal != "" {
 		result.ExitCode = nil
 		result.Signal = signalName(response.Signal)

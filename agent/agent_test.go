@@ -206,8 +206,8 @@ func TestRunWorkloadReportsOutputFinalizationFailureInsteadOfExitZero(t *testing
 
 func TestToL1ResultPreservesIncompleteOCILogEvidence(t *testing.T) {
 	exitCode := 7
-	result := toL1Result(contract.ProcessResult{ExitCode: &exitCode, LogEvidenceIncomplete: true})
-	if result.ExitCode == nil || *result.ExitCode != exitCode || !result.LogEvidenceIncomplete {
+	result := toL1Result(contract.ProcessResult{ExitCode: &exitCode, DiskExhausted: true, LogEvidenceIncomplete: true})
+	if result.ExitCode == nil || *result.ExitCode != exitCode || !result.DiskExhausted || !result.LogEvidenceIncomplete {
 		t.Fatalf("L1 completion result = %#v", result)
 	}
 }

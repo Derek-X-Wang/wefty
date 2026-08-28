@@ -70,7 +70,7 @@ wefty node oci stop
 
 `oci start` restores transport, completes the boot sweep barrier and functional probe, then advertises capability. `oci stop` persists disabled first, withdraws local admission and publication, reaps OCI attempts, and then stops Lima on Mac; Linux containerd is left alone.
 
-An unchanged setup rerun causes no restart, intent revision, or capability revision. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, and zero live OCI attempts. The Mac defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk. Per-job limits remain independent.
+An unchanged setup rerun causes no restart, intent revision, or capability revision. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, and zero live OCI attempts. The Mac VM defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk; Computer admission separately ships a configured 4 GiB ceiling and a reserve proportional to the VM memory. Linux setup defaults capacity to `MemTotal` with a reserve of `min(1 GiB, 25%)`. Per-job limits remain independent.
 
 ## FileVault, TCC, and the attended Mac boundary
 
@@ -286,6 +286,22 @@ Meaning: each Computer tmpfs ceiling and their combined ceiling fit within the r
 ## doctor-code-oci-profile-tmpfs-ceilings-exceed-memory-limit
 
 Meaning: one or more Computer tmpfs caps exceed the recorded cgroup memory limit. Evidence: preserve the typed warnings and exact bytes. First action: treat the cgroup memory limit as enforcement because tmpfs ceilings are not reservations. Escalation: carry the OWNER-CALL on production memory sizing without weakening the cgroup.
+
+## doctor-code-oci-resource-admission-not-run
+
+Meaning: the helper resource-admission read did not run because an upstream helper/runtime fact was unavailable. Evidence: preserve the NOT-RUN cause. First action: restore the named dependency. Escalation: do not infer an empty or healthy capacity snapshot.
+
+## doctor-code-oci-resource-admission-not-recorded
+
+Meaning: no Computer has produced an atomic resource-admission receipt in the current helper generation. Evidence: preserve the absence as NOT-RUN. First action: inspect after the next admitted or refused Computer workload. Escalation: do not forecast fit from this absence.
+
+## doctor-code-oci-resource-admission-admitted
+
+Meaning: doctor read a successful last atomic Computer cap decision with configured memory, committed/requested memory and disk, timestamped MemTotal/MemAvailable, disk-root filesystem free bytes, and the Computer tmpfs ceiling. Evidence: preserve the receipt. First action: compare facts without treating MemAvailable, filesystem-free bytes, or tmpfs ceilings as runtime exhaustion evidence. Escalation: investigate only if the admitted facts differ from the declared cap.
+
+## doctor-code-oci-resource-admission-refused
+
+Meaning: doctor read a typed refused memory or disk admission; the receipt is not a healthy empty result. Evidence: preserve the failure code and exact before/after facts. First action: free or enlarge the named resource. Escalation: explicitly restart the latched Computer only after the facts change.
 
 ## doctor-code-oci-mount-roots-not-run
 

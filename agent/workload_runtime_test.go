@@ -129,6 +129,8 @@ func TestOCIImageFailuresSurviveFullLifecycleFinalization(t *testing.T) {
 		contract.SpawnFailureImageManifestInvalid,
 		contract.SpawnFailureImagePlatformUnsupported,
 		contract.SpawnFailureRuntimeUnavailable,
+		contract.SpawnFailureInsufficientMemory,
+		contract.SpawnFailureInsufficientDisk,
 	}
 	for _, code := range codes {
 		t.Run(string(code), func(t *testing.T) {
