@@ -1,7 +1,10 @@
 package scripts
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
+	"os/exec"
 	"regexp"
 	"slices"
 	"strings"
@@ -58,6 +61,17 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	computerPublish := image.Jobs["publish-reference-computer"]
 	if computerPublish.Permissions["packages"] != "write" || !strings.Contains(computerPublish.If, "github.event_name == 'push'") || !strings.Contains(computerPublish.If, "refs/heads/main") {
 		t.Fatalf("Computer publisher permissions/guard = %+v if=%q", computerPublish.Permissions, computerPublish.If)
+	}
+	for name, job := range map[string]workflowJob{"publish": publish, "publish-reference-computer": computerPublish} {
+		text := marshalJob(t, job)
+		for _, required := range []string{"crane\" push", "crane\" index append", ".oci.tar"} {
+			if !strings.Contains(text, required) {
+				t.Fatalf("%s does not promote executed OCI archives with %q", name, required)
+			}
+		}
+		if strings.Contains(text, "docker buildx") || strings.Contains(text, "docker/build-push-action") {
+			t.Fatalf("%s re-solves image bytes instead of promoting the executed archive", name)
+		}
 	}
 	for name, job := range image.Jobs {
 		if name != "publish" && name != "publish-reference-computer" && job.Permissions["packages"] != "" {
@@ -161,66 +175,90 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_COMPUTER_REFERENCE", "exerciseNativeLinuxReferenceComputer", "ComputerStartupReadinessTimeout", "assertReferenceComputerWireNegatives")
 	assertFileMatches(t, "../examples/oci-echo-service/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG GO_IMAGE=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG BUSYBOX_IMAGE=.*@sha256:[0-9a-f]{64}$`)
 	assertFileMatches(t, "../examples/computer/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG DEBIAN_IMAGE=.*@sha256:[0-9a-f]{64}$`)
+	assertFileContains(t, "../examples/computer/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "ARG SOURCE_DATE_EPOCH=0", "chromium=", "/var/log/dpkg.log", "/var/log/alternatives.log", "/var/log/apt/*")
 	assertFileContains(t, "../examples/computer/entrypoint.sh", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "/wefty/service")
 	assertFileContains(t, "../examples/computer/rfb-websocket.py", `target.path != "/websockify"`, `"binary" not in offered`, "BinaryOnlyWebSocket")
 	assertFileContains(t, "../examples/computer/rfb-backend.py", `command.append("-viewonly")`, "socket.AF_UNIX")
-	assertFileContains(t, "../examples/computer/watch-driver.py", "/wefty/control/driver.json", "os.replace", "return False")
+	assertFileContains(t, "../examples/computer/watch-driver.py", "/wefty/control/driver.json", "os.replace", `type(value["version"]) is not int`, `type(value["human_driving"]) is not bool`)
 	assertFileContains(t, "../examples/computer/oracle.html", `data-wefty-input-oracle="v1"`, "events=0 bytes=0 hash=00000000")
+	assertFileContains(t, "../examples/computer/pointer-oracle.py", "XQueryPointer", "input-oracle.json", "os.replace")
+	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", "x11vnc-view.*-viewonly", "--mode pointer-event", "wrong_version_type", "wrong_human_driving_type", "rootfs_read_only", "restarted_edge_recovered")
 	assertFileContains(t, "../docs/guides/computer-images.md", "Bring-your-own desktop is the product", "not a required base image", "CPU rendering", "--no-sandbox", "ticket #182", "ticket #207")
+	assertFileContains(t, "../docs/guides/computer-images.md", "docker buildx create", "tonistiigi/binfmt@sha256:", "scripts/test-computer-image-runtime.sh", "scripts/probe-rfb-websocket.py", "operator-owned")
+	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "RunComputerServiceRealtiming", "computer_reference_publication_loss_recovery=%t", "computer_reference_helper_stop_start_profile_sign_in_rootfs=%t")
 	assertFileContains(t, "../docs/runbooks/oci-node.md", "wefty node load-image", "acceptance-image-index-digest.txt")
 	assertFileContains(t, "../docs/acceptance/m3-lima-transport.md", "acceptance-image-index-digest.txt", "computer-image-index-digest.txt", "wefty-computer-reference.oci.tar", "atomically within 60 seconds")
 }
 
 func TestReferenceComputerReceiptFailsEveryNegativeMutation(t *testing.T) {
-	type receipt struct {
-		platforms, endpoints                         int
-		executed, rfb, viewLoopback, controlLoopback bool
-		wrongPath, missingProtocol, wrongProtocol    bool
-		textFrame, driver, profile, signIn, rootfs   bool
-		shmPrivate, shmOneGiB, shmMode, shmFlags     bool
-		readyUnder60, elf                            bool
+	_, imageBytes := readWorkflow(t, "../.github/workflows/acceptance-image.yml")
+	match := regexp.MustCompile(`receipt_assertion='([^']+)'`).FindSubmatch(imageBytes)
+	if len(match) != 2 {
+		t.Fatal("publisher receipt_assertion was not found")
 	}
-	conformant := receipt{platforms: 2, endpoints: 2, executed: true, rfb: true, viewLoopback: true, controlLoopback: true,
-		wrongPath: true, missingProtocol: true, wrongProtocol: true, textFrame: true, driver: true, profile: true, signIn: true, rootfs: true,
-		shmPrivate: true, shmOneGiB: true, shmMode: true, shmFlags: true, readyUnder60: true, elf: true}
-	valid := func(value receipt) bool {
-		return value.platforms == 2 && value.endpoints == 2 && value.executed && value.rfb && value.viewLoopback && value.controlLoopback &&
-			value.wrongPath && value.missingProtocol && value.wrongProtocol && value.textFrame && value.driver && value.profile && value.signIn && value.rootfs &&
-			value.shmPrivate && value.shmOneGiB && value.shmMode && value.shmFlags && value.readyUnder60 && value.elf
+	assertion := string(match[1]) + " and .elf_e_machine == 62"
+	conformant := map[string]any{
+		"digest": "sha256:good", "executed": true, "rfb_websocket_v1": true, "transport_assertions": true,
+		"negative_rows":          map[string]any{"driver_fail_closed": true},
+		"endpoints":              map[string]any{"view": "loopback", "control": "loopback"},
+		"roles":                  map[string]any{"view_process_view_only": true, "control_process_interactive": true, "view_pointer_discarded": true},
+		"driver_signal_consumed": true, "profile_persistent": true, "sign_in_persistent": true,
+		"rootfs_read_only": true, "attempt_tmpfs_discarded": true,
+		"shm":               map[string]any{"private": true, "conformant": true},
+		"readiness_seconds": 1, "restarted_edge_recovered": true, "elf_e_machine": 62,
+	}
+	valid := func(value map[string]any) bool {
+		payload, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("jq", "-e", "--arg", "digest", "sha256:good", assertion)
+		command.Stdin = bytes.NewReader(payload)
+		return command.Run() == nil
 	}
 	if !valid(conformant) {
-		t.Fatal("fully conformant reference Computer receipt was rejected")
+		t.Fatal("real publisher jq assertion rejected a conformant receipt")
 	}
 	mutations := []struct {
 		name   string
-		mutate func(*receipt)
+		mutate func(map[string]any)
 	}{
-		{"missing-platform", func(value *receipt) { value.platforms = 1 }},
-		{"missing-endpoint", func(value *receipt) { value.endpoints = 1 }},
-		{"not-executed", func(value *receipt) { value.executed = false }},
-		{"wrong-transport", func(value *receipt) { value.rfb = false }},
-		{"view-wildcard", func(value *receipt) { value.viewLoopback = false }},
-		{"control-wildcard", func(value *receipt) { value.controlLoopback = false }},
-		{"wrong-path-accepted", func(value *receipt) { value.wrongPath = false }},
-		{"missing-protocol-accepted", func(value *receipt) { value.missingProtocol = false }},
-		{"wrong-protocol-accepted", func(value *receipt) { value.wrongProtocol = false }},
-		{"text-frame-accepted", func(value *receipt) { value.textFrame = false }},
-		{"driver-unconsumed", func(value *receipt) { value.driver = false }},
-		{"profile-lost", func(value *receipt) { value.profile = false }},
-		{"sign-in-lost", func(value *receipt) { value.signIn = false }},
-		{"rootfs-retained", func(value *receipt) { value.rootfs = false }},
-		{"shared-shm", func(value *receipt) { value.shmPrivate = false }},
-		{"wrong-shm-size", func(value *receipt) { value.shmOneGiB = false }},
-		{"wrong-shm-mode", func(value *receipt) { value.shmMode = false }},
-		{"wrong-shm-flags", func(value *receipt) { value.shmFlags = false }},
-		{"readiness-timeout", func(value *receipt) { value.readyUnder60 = false }},
-		{"wrong-elf", func(value *receipt) { value.elf = false }},
+		{"wrong-digest", func(v map[string]any) { v["digest"] = "sha256:bad" }},
+		{"not-executed", func(v map[string]any) { v["executed"] = false }},
+		{"wrong-transport", func(v map[string]any) { v["rfb_websocket_v1"] = false }},
+		{"transport-negative", func(v map[string]any) { v["transport_assertions"] = false }},
+		{"driver-not-fail-closed", func(v map[string]any) { v["negative_rows"].(map[string]any)["driver_fail_closed"] = false }},
+		{"view-wildcard", func(v map[string]any) { v["endpoints"].(map[string]any)["view"] = "wildcard" }},
+		{"control-wildcard", func(v map[string]any) { v["endpoints"].(map[string]any)["control"] = "wildcard" }},
+		{"view-process-interactive", func(v map[string]any) { v["roles"].(map[string]any)["view_process_view_only"] = false }},
+		{"control-process-view-only", func(v map[string]any) { v["roles"].(map[string]any)["control_process_interactive"] = false }},
+		{"view-pointer-accepted", func(v map[string]any) { v["roles"].(map[string]any)["view_pointer_discarded"] = false }},
+		{"driver-unconsumed", func(v map[string]any) { v["driver_signal_consumed"] = false }},
+		{"profile-lost", func(v map[string]any) { v["profile_persistent"] = false }},
+		{"sign-in-lost", func(v map[string]any) { v["sign_in_persistent"] = false }},
+		{"writable-rootfs", func(v map[string]any) { v["rootfs_read_only"] = false }},
+		{"attempt-state-retained", func(v map[string]any) { v["attempt_tmpfs_discarded"] = false }},
+		{"shared-shm", func(v map[string]any) { v["shm"].(map[string]any)["private"] = false }},
+		{"bad-shm", func(v map[string]any) { v["shm"].(map[string]any)["conformant"] = false }},
+		{"readiness-timeout", func(v map[string]any) { v["readiness_seconds"] = 60 }},
+		{"edge-not-recovered", func(v map[string]any) { v["restarted_edge_recovered"] = false }},
+		{"wrong-elf", func(v map[string]any) { v["elf_e_machine"] = 183 }},
+	}
+	if len(mutations) != 20 {
+		t.Fatalf("negative mutation rows = %d, want 20", len(mutations))
 	}
 	failed := 0
 	for _, mutation := range mutations {
 		t.Run(mutation.name, func(t *testing.T) {
-			candidate := conformant
-			mutation.mutate(&candidate)
+			payload, err := json.Marshal(conformant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var candidate map[string]any
+			if err := json.Unmarshal(payload, &candidate); err != nil {
+				t.Fatal(err)
+			}
+			mutation.mutate(candidate)
 			if valid(candidate) {
 				t.Fatalf("negative mutation %q passed", mutation.name)
 			}

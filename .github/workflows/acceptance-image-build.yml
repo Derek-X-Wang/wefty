@@ -59,6 +59,7 @@ jobs:
           scripts/verify-acceptance-image.sh --archive "$RUNNER_TEMP/acceptance-image.oci.tar" \
             --expected-platform "$PLATFORM" --platform-digest-output "$evidence/${ARCH}.digest" \
             --receipt-output "$evidence/${ARCH}-oci.json"
+          cp "$RUNNER_TEMP/acceptance-image.oci.tar" "$evidence/${ARCH}.oci.tar"
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           registry_reference="localhost:5000/wefty-echo-service:${GITHUB_SHA}-${ARCH}"
@@ -146,7 +147,7 @@ jobs:
           driver-opts: |
             image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
             network=host
-      - name: Build the reference desktop through both exporter shapes
+      - name: Build the reference desktop twice from empty caches
         env:
           PLATFORM: linux/${{ matrix.arch }}
           ARCH: ${{ matrix.arch }}
@@ -154,8 +155,10 @@ jobs:
           set -euo pipefail
           registry_reference="localhost:5000/wefty-computer-reference:${GITHUB_SHA}-${ARCH}"
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
-            --file examples/computer/Dockerfile \
-            --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" \
+            --build-arg SOURCE_DATE_EPOCH=0 --file examples/computer/Dockerfile \
+            --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" .
+          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+            --build-arg SOURCE_DATE_EPOCH=0 --file examples/computer/Dockerfile \
             --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
       - name: Execute the exact desktop digest and assert its ELF architecture
         env:
@@ -168,6 +171,7 @@ jobs:
           scripts/verify-acceptance-image.sh --archive "$RUNNER_TEMP/computer-image.oci.tar" \
             --expected-platform "$PLATFORM" --platform-digest-output "$evidence/${ARCH}.digest" \
             --receipt-output "$evidence/${ARCH}-oci.json"
+          cp "$RUNNER_TEMP/computer-image.oci.tar" "$evidence/${ARCH}.oci.tar"
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           registry_reference="localhost:5000/wefty-computer-reference:${GITHUB_SHA}-${ARCH}"

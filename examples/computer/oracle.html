@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>wefty Computer input oracle</title>
+    <title>wefty-oracle events=0 bytes=0 hash=00000000</title>
     <style>
       :root { color-scheme: dark; font-family: sans-serif; }
       body { align-items: center; background: #111827; display: flex; height: 100vh; justify-content: center; margin: 0; }
@@ -23,13 +23,24 @@
       const input = document.querySelector('#oracle');
       const receipt = document.querySelector('#receipt');
       let events = 0;
-      input.addEventListener('input', () => {
+      let bytes = [];
+      const publish = () => {
         events += 1;
         let hash = 2166136261;
-        for (const byte of new TextEncoder().encode(input.value)) {
+        for (const byte of bytes) {
           hash = Math.imul(hash ^ byte, 16777619) >>> 0;
         }
-        receipt.value = `events=${events} bytes=${input.value.length} hash=${hash.toString(16).padStart(8, '0')}`;
+        const value = `events=${events} bytes=${bytes.length} hash=${hash.toString(16).padStart(8, '0')}`;
+        receipt.value = value;
+        document.title = `wefty-oracle ${value}`;
+      };
+      input.addEventListener('input', () => {
+        bytes = Array.from(new TextEncoder().encode(input.value));
+        publish();
+      });
+      document.querySelector('main').addEventListener('pointerdown', (event) => {
+        bytes.push(event.button & 0xff, event.clientX & 0xff, event.clientY & 0xff);
+        publish();
       });
       input.focus();
     </script>

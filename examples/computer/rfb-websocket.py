@@ -21,7 +21,7 @@ class RFBWebSocketHandler(ProxyRequestHandler):
 
     def handle_upgrade(self):
         target = urlsplit(self.path)
-        if target.path != "/websockify" or target.query or target.fragment:
+        if target.path != "/websockify":
             self.send_error(404, "Not Found")
             return
         offered = [value.strip() for value in self.headers.get("Sec-WebSocket-Protocol", "").split(",")]

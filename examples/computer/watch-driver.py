@@ -14,7 +14,13 @@ def read_state() -> bool:
     try:
         with open(SOURCE, "r", encoding="utf-8") as source:
             value = json.load(source)
-        return value == {"version": 1, "human_driving": True}
+        if not isinstance(value, dict) or set(value) != {"version", "human_driving"}:
+            return False
+        if type(value["version"]) is not int or value["version"] != 1:
+            return False
+        if type(value["human_driving"]) is not bool:
+            return False
+        return value["human_driving"]
     except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
         return False
 

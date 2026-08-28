@@ -3,11 +3,13 @@
 
 import argparse
 import os
+import signal
 import socket
 import subprocess
 
 
 def main() -> None:
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", required=True)
     parser.add_argument("--view-only", action="store_true")
@@ -22,7 +24,10 @@ def main() -> None:
     os.chmod(args.socket, 0o600)
     listener.listen(16)
 
-    command = ["x11vnc", "-inetd", "-display", os.environ.get("DISPLAY", ":99"), "-nopw", "-shared", "-quiet"]
+    command = [
+        "x11vnc-view" if args.view_only else "x11vnc-control",
+        "-inetd", "-display", os.environ.get("DISPLAY", ":99"), "-nopw", "-shared", "-quiet",
+    ]
     if args.view_only:
         command.append("-viewonly")
 
@@ -30,6 +35,7 @@ def main() -> None:
         connection, _ = listener.accept()
         subprocess.Popen(
             command,
+            executable="/usr/bin/x11vnc",
             stdin=connection,
             stdout=connection,
             stderr=subprocess.DEVNULL,

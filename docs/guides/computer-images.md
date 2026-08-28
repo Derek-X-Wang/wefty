@@ -18,6 +18,13 @@ behavior from it.
 Build both supported platforms from the repository root:
 
 ```sh
+# Once per Docker host: install emulation and select a container-backed builder.
+docker run --privileged --rm \
+  tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 \
+  --install amd64,arm64
+docker buildx create --name wefty-computer --driver docker-container --use
+docker buildx inspect --bootstrap
+
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --file examples/computer/Dockerfile \
@@ -34,13 +41,74 @@ tarball. Treat the commit tag as discovery only; submit or copy the image by
 the recorded `sha256:` index digest. Linux realtiming and attended Mac/Lima
 acceptance consume that same digest and tar identity.
 
+The reference build uses a dated Debian snapshot, pins every directly selected
+package version, passes `SOURCE_DATE_EPOCH`, and removes apt/dpkg logs in the
+install layer. CI performs two empty-cache solves per architecture and requires
+their platform digests to match. That is a reproducibility check for these
+inputs, not a promise that tags or future toolchains reproduce the bytes; the
+recorded digest is the only image identity.
+
+## Build your own image
+
+An operator-owned image need not inherit this example. Its Dockerfile should
+install a display server, desktop, browser, an RFB server, and a binary-only
+WebSocket edge, create an unprivileged user, and make that user's home resolve
+inside `/wefty/service`. Its entrypoint should follow this shape:
+
+```Dockerfile
+FROM your-linux-base@sha256:<digest>
+RUN install-your-pinned-display-desktop-rfb-and-websocket-packages
+RUN useradd --uid 12000 --create-home desktop \
+ && rm -rf /home/desktop \
+ && ln -s /wefty/service/home/desktop /home/desktop
+COPY entrypoint.sh /usr/local/bin/computer-entrypoint
+USER 12000:12000
+ENTRYPOINT ["/usr/local/bin/computer-entrypoint"]
+```
+
+```sh
+#!/bin/sh
+set -eu
+# Validate both injected ports and WEFTY_SERVICE_DIR=/wefty/service.
+# Start one display, then loopback-only view and control RFB/WebSocket edges.
+start_display_and_desktop
+start_view_edge --bind 127.0.0.1:"$WEFTY_COMPUTER_VIEW_PORT" --view-only
+start_control_edge --bind 127.0.0.1:"$WEFTY_COMPUTER_CONTROL_PORT"
+# Reopen /wefty/control/driver.json after every atomic replacement and default
+# false unless version is the integer 1 and human_driving is a boolean.
+exec watch_driver_and_children
+```
+
+Build and push it to an operator-owned registry, resolve its digest, then run
+the shipped runtime harness against those immutable bytes:
+
+```sh
+scripts/test-computer-image-runtime.sh \
+  --image registry.example/operator/computer@sha256:<platform-digest> \
+  --arch amd64 --evidence ./computer-evidence
+```
+
+For focused transport debugging while the image is running on host port 18181:
+
+```sh
+scripts/probe-rfb-websocket.py --port 18181 --mode ready
+scripts/probe-rfb-websocket.py --port 18181 --mode query-ready
+scripts/probe-rfb-websocket.py --port 18181 --mode fragment-ready
+scripts/probe-rfb-websocket.py --port 18181 --mode text-frame
+```
+
+These scripts test the shipped example and help image authors today. Ticket
+#182 will turn the same seam into the product conformance CLI; authors do not
+need to wait for that CLI to exercise their image.
+
 ## Image responsibilities
 
 The reference image demonstrates the minimum contract shape:
 
 - `WEFTY_COMPUTER_VIEW_PORT` and `WEFTY_COMPUTER_CONTROL_PORT` are distinct,
   helper-allocated IPv4-loopback listeners named `view` and `control`.
-- Both implement `rfb-websocket-v1`: exact `/websockify` path, negotiated
+- Both implement `rfb-websocket-v1`: exact `/websockify` path (query components
+  are ignored), negotiated
   `binary` subprotocol, binary frames, and an RFB version greeting.
 - View input is discarded in the RFB server; control input is accepted. Neither
   backend performs viewer authentication.

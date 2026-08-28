@@ -29,11 +29,16 @@ cleanup() {
 trap cleanup TERM INT EXIT
 
 start Xvfb "$DISPLAY" -screen 0 1280x720x24 -nolisten tcp -noreset
-for _ in $(seq 1 60); do
+startup_remaining=60
+while [ "$startup_remaining" -gt 0 ]; do
   if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then break; fi
   sleep 1
+  startup_remaining=$((startup_remaining - 1))
 done
-xdpyinfo -display "$DISPLAY" >/dev/null
+if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+  echo 'display server did not become ready within the 60 second startup budget' >&2
+  exit 1
+fi
 
 # shellcheck disable=SC2016 # HOME expands in the dbus-run-session child shell.
 start dbus-run-session -- sh -c '
@@ -43,22 +48,71 @@ start dbus-run-session -- sh -c '
     --user-data-dir="$HOME/.config/chromium" file:///opt/wefty-computer/oracle.html
 '
 start /usr/local/libexec/wefty-watch-driver
+start /usr/local/libexec/wefty-pointer-oracle
 
 view_socket=/tmp/wefty-computer/view-rfb.sock
 control_socket=/tmp/wefty-computer/control-rfb.sock
-start /usr/local/libexec/wefty-rfb-backend --socket "$view_socket" --view-only
-start /usr/local/libexec/wefty-rfb-backend --socket "$control_socket"
-for _ in $(seq 1 60); do
+
+supervise_edge() (
+  role=$1
+  port=$2
+  socket_path=$3
+  view_flag=${4:-}
+  backend_pid=
+  websocket_pid=
+  # shellcheck disable=SC2329 # invoked by the trap below.
+  stop_edge() {
+    trap - TERM INT EXIT
+    [ -z "$websocket_pid" ] || kill "$websocket_pid" 2>/dev/null || true
+    [ -z "$backend_pid" ] || kill "$backend_pid" 2>/dev/null || true
+    wait || true
+    rm -f "$socket_path"
+  }
+  trap stop_edge TERM INT EXIT
+  while :; do
+    rm -f "$socket_path"
+    if [ -n "$view_flag" ]; then
+      /usr/local/libexec/wefty-rfb-backend --socket "$socket_path" --view-only &
+    else
+      /usr/local/libexec/wefty-rfb-backend --socket "$socket_path" &
+    fi
+    backend_pid=$!
+    edge_remaining=60
+    while [ ! -S "$socket_path" ] && kill -0 "$backend_pid" 2>/dev/null && [ "$edge_remaining" -gt 0 ]; do
+      sleep 1
+      edge_remaining=$((edge_remaining - 1))
+    done
+    if [ ! -S "$socket_path" ]; then
+      echo "$role RFB backend did not become ready" >&2
+      kill "$backend_pid" 2>/dev/null || true
+      wait "$backend_pid" 2>/dev/null || true
+      sleep 1
+      continue
+    fi
+    /usr/local/libexec/wefty-rfb-websocket --port "$port" --target "$socket_path" &
+    websocket_pid=$!
+    while kill -0 "$backend_pid" 2>/dev/null && kill -0 "$websocket_pid" 2>/dev/null; do sleep 1; done
+    kill "$websocket_pid" "$backend_pid" 2>/dev/null || true
+    wait "$websocket_pid" 2>/dev/null || true
+    wait "$backend_pid" 2>/dev/null || true
+    websocket_pid=
+    backend_pid=
+    sleep 1
+  done
+)
+
+start supervise_edge view "$WEFTY_COMPUTER_VIEW_PORT" "$view_socket" --view-only
+start supervise_edge control "$WEFTY_COMPUTER_CONTROL_PORT" "$control_socket"
+while [ "$startup_remaining" -gt 0 ]; do
   if [ -S "$view_socket" ] && [ -S "$control_socket" ]; then break; fi
   sleep 1
+  startup_remaining=$((startup_remaining - 1))
 done
-test -S "$view_socket"
-test -S "$control_socket"
+if [ ! -S "$view_socket" ] || [ ! -S "$control_socket" ]; then
+  echo 'RFB backends did not become ready within the 60 second startup budget' >&2
+  exit 1
+fi
 
-start /usr/local/libexec/wefty-rfb-websocket --port "$WEFTY_COMPUTER_VIEW_PORT" --target "$view_socket"
-start /usr/local/libexec/wefty-rfb-websocket --port "$WEFTY_COMPUTER_CONTROL_PORT" --target "$control_socket"
-
-# The helper probes both edges continuously and atomically withdraws publication
-# if either one disappears. Keep the remaining image processes available so a
-# recovered edge can become eligible for republication.
+# Edge supervisors restart failed local transports. The helper independently
+# decides whether the pair is eligible for publication.
 wait

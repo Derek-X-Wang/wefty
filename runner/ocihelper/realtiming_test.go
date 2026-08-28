@@ -90,7 +90,9 @@ func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
 		t.Fatal(err)
 	}
 	backupRequest.Authority.CleanupFence = "realtime-prune-fence"
-	if removed, err := session.DeleteComputerBackupCopy(ctx, DeleteComputerBackupCopyRequest(backupRequest)); err != nil || !removed.Receipt.Absent {
+	deleteBackupRequest := DeleteComputerBackupCopyRequest{BackupID: backupRequest.BackupID, CopyID: backupRequest.CopyID,
+		Storage: backupRequest.Storage, Authority: backupRequest.Authority}
+	if removed, err := session.DeleteComputerBackupCopy(ctx, deleteBackupRequest); err != nil || !removed.Receipt.Absent {
 		t.Fatalf("real helper process Backup prune = %+v err=%v", removed, err)
 	}
 }

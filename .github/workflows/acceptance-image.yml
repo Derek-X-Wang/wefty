@@ -64,6 +64,7 @@ jobs:
           scripts/verify-acceptance-image.sh --archive "$RUNNER_TEMP/acceptance-image.oci.tar" \
             --expected-platform "$PLATFORM" --platform-digest-output "$evidence/${ARCH}.digest" \
             --receipt-output "$evidence/${ARCH}-oci.json"
+          cp "$RUNNER_TEMP/acceptance-image.oci.tar" "$evidence/${ARCH}.oci.tar"
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           registry_reference="localhost:5000/wefty-echo-service:${GITHUB_SHA}-${ARCH}"
@@ -127,10 +128,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
-        with:
-          version: v0.36.1
-          driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
       - name: Download platform digest evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -145,23 +142,28 @@ jobs:
           password: ${{ github.token }}
       - name: Publish the commit-tagged multi-platform index
         id: publish
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: .
-          file: examples/oci-echo-service/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          provenance: false
-          sbom: false
-          no-cache: true
-          build-args: SOURCE_DATE_EPOCH=0
-          outputs: type=registry,rewrite-timestamp=true
+        run: |
+          set -euo pipefail
+          go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
+          crane="$(go env GOPATH)/bin/crane"
+          for arch in amd64 arm64; do
+            layout="$RUNNER_TEMP/echo-$arch.oci"
+            mkdir -p "$layout"
+            tar -xf "$RUNNER_TEMP/platforms/$arch.oci.tar" -C "$layout"
+            "$crane" push "$layout" "$IMAGE_NAME:${GITHUB_SHA}-${arch}"
+            test "$("$crane" digest "$IMAGE_NAME:${GITHUB_SHA}-${arch}")" = "$(cat "$RUNNER_TEMP/platforms/$arch.digest")"
+          done
+          "$crane" index append \
+            -m "$IMAGE_NAME@$(cat "$RUNNER_TEMP/platforms/amd64.digest")" \
+            -m "$IMAGE_NAME@$(cat "$RUNNER_TEMP/platforms/arm64.digest")" \
+            -t "$IMAGE_NAME:$GITHUB_SHA"
+          index_digest="$("$crane" digest "$IMAGE_NAME:$GITHUB_SHA")"
+          printf '%s\n' "digest=$index_digest" >> "$GITHUB_OUTPUT"
       - name: Resolve the published digest once and verify its platform set
         env:
           ACTION_DIGEST: ${{ steps.publish.outputs.digest }}
         run: |
           set -euo pipefail
-          go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           index_digest="$("$crane" digest "$IMAGE_NAME:$GITHUB_SHA")"
           test "$index_digest" = "$ACTION_DIGEST"
@@ -253,7 +255,7 @@ jobs:
           driver-opts: |
             image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
             network=host
-      - name: Build the reference desktop through both exporter shapes
+      - name: Build the reference desktop twice from empty caches
         env:
           PLATFORM: linux/${{ matrix.arch }}
           ARCH: ${{ matrix.arch }}
@@ -261,8 +263,10 @@ jobs:
           set -euo pipefail
           registry_reference="localhost:5000/wefty-computer-reference:${GITHUB_SHA}-${ARCH}"
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
-            --file examples/computer/Dockerfile \
-            --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" \
+            --build-arg SOURCE_DATE_EPOCH=0 --file examples/computer/Dockerfile \
+            --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" .
+          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+            --build-arg SOURCE_DATE_EPOCH=0 --file examples/computer/Dockerfile \
             --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
       - name: Execute the exact desktop digest and assert its ELF architecture
         env:
@@ -275,6 +279,7 @@ jobs:
           scripts/verify-acceptance-image.sh --archive "$RUNNER_TEMP/computer-image.oci.tar" \
             --expected-platform "$PLATFORM" --platform-digest-output "$evidence/${ARCH}.digest" \
             --receipt-output "$evidence/${ARCH}-oci.json"
+          cp "$RUNNER_TEMP/computer-image.oci.tar" "$evidence/${ARCH}.oci.tar"
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           registry_reference="localhost:5000/wefty-computer-reference:${GITHUB_SHA}-${ARCH}"
@@ -322,11 +327,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
-        with:
-          version: v0.36.1
-          driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
       - name: Download executed platform evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -341,22 +341,28 @@ jobs:
           password: ${{ github.token }}
       - name: Publish the commit-tagged reference desktop index
         id: publish-computer
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: .
-          file: examples/computer/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ env.COMPUTER_IMAGE_NAME }}:${{ github.sha }}
-          provenance: false
-          sbom: false
-          no-cache: true
-          outputs: type=registry,rewrite-timestamp=true
+        run: |
+          set -euo pipefail
+          go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
+          crane="$(go env GOPATH)/bin/crane"
+          for arch in amd64 arm64; do
+            layout="$RUNNER_TEMP/computer-$arch.oci"
+            mkdir -p "$layout"
+            tar -xf "$RUNNER_TEMP/computer-platforms/$arch.oci.tar" -C "$layout"
+            "$crane" push "$layout" "$COMPUTER_IMAGE_NAME:${GITHUB_SHA}-${arch}"
+            test "$("$crane" digest "$COMPUTER_IMAGE_NAME:${GITHUB_SHA}-${arch}")" = "$(cat "$RUNNER_TEMP/computer-platforms/$arch.digest")"
+          done
+          "$crane" index append \
+            -m "$COMPUTER_IMAGE_NAME@$(cat "$RUNNER_TEMP/computer-platforms/amd64.digest")" \
+            -m "$COMPUTER_IMAGE_NAME@$(cat "$RUNNER_TEMP/computer-platforms/arm64.digest")" \
+            -t "$COMPUTER_IMAGE_NAME:$GITHUB_SHA"
+          index_digest="$("$crane" digest "$COMPUTER_IMAGE_NAME:$GITHUB_SHA")"
+          printf '%s\n' "digest=$index_digest" >> "$GITHUB_OUTPUT"
       - name: Bind the public index to the executed platform bytes
         env:
           ACTION_DIGEST: ${{ steps.publish-computer.outputs.digest }}
         run: |
           set -euo pipefail
-          go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           index_digest="$("$crane" digest "$COMPUTER_IMAGE_NAME:$GITHUB_SHA")"
           test "$index_digest" = "$ACTION_DIGEST"
@@ -368,7 +374,7 @@ jobs:
           test "$(jq -r --arg digest "$arm64_digest" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64" and .digest == $digest)] | length' "$RUNNER_TEMP/computer-image-index.json")" = 1
           test "$(jq -r '[.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length' "$RUNNER_TEMP/computer-image-index.json")" = 2
           # shellcheck disable=SC2016 # $digest is a jq variable, not a shell expansion.
-          receipt_assertion='.digest == $digest and .executed and .rfb_websocket_v1 and .negative_rows.wrong_path and .negative_rows.missing_protocol and .negative_rows.wrong_protocol and .negative_rows.text_frame and .negative_rows.unknown_driver_version and .negative_rows.missing_driver and .endpoints.view == "loopback" and .endpoints.control == "loopback" and .driver_signal_consumed and .profile_persistent and .sign_in_persistent and .rootfs_discarded and .shm.private and .shm.bytes == 1073741824 and .shm.mode == "1777" and .shm.nosuid and .shm.nodev and .shm.noexec and .readiness_seconds < 60'
+          receipt_assertion='.digest == $digest and .executed and .rfb_websocket_v1 and .transport_assertions and .negative_rows.driver_fail_closed and .endpoints.view == "loopback" and .endpoints.control == "loopback" and .roles.view_process_view_only and .roles.control_process_interactive and .roles.view_pointer_discarded and .driver_signal_consumed and .profile_persistent and .sign_in_persistent and .rootfs_read_only and .attempt_tmpfs_discarded and .shm.private and .shm.conformant and .readiness_seconds < 60 and .restarted_edge_recovered'
           jq -e --arg digest "$amd64_digest" "$receipt_assertion and .elf_e_machine == 62" "$RUNNER_TEMP/computer-platforms/amd64-runtime.json"
           jq -e --arg digest "$arm64_digest" "$receipt_assertion and .elf_e_machine == 183" "$RUNNER_TEMP/computer-platforms/arm64-runtime.json"
       - name: Emit the digest-selected Computer OCI archive
