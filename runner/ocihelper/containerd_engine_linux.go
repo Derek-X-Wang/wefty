@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -120,6 +121,9 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	}
 	if config.RuntimeRoot == "" {
 		config.RuntimeRoot = "/var/lib/wefty/oci"
+	}
+	if config.RuncExecutable == "" {
+		config.RuncExecutable = "runc"
 	}
 	if config.ContainerdStateRoot == "" {
 		config.ContainerdStateRoot = "/run/containerd"
@@ -269,6 +273,37 @@ func (engine *ContainerdEngine) Close() error {
 		}
 	})
 	return engine.closeErr
+}
+
+func (engine *ContainerdEngine) DoctorStatus(ctx context.Context) (DoctorStatus, error) {
+	version, err := engine.client.Version(ctx)
+	if err != nil {
+		return DoctorStatus{}, fmt.Errorf("read containerd version: %w", err)
+	}
+	payload, err := exec.CommandContext(ctx, engine.config.RuncExecutable, "--version").Output()
+	if err != nil {
+		return DoctorStatus{}, fmt.Errorf("read runc version: %w", err)
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(string(payload)), "\n")
+	runcVersion := strings.TrimSpace(strings.TrimPrefix(line, "runc version"))
+	if runcVersion == "" {
+		return DoctorStatus{}, errors.New("read runc version: empty version")
+	}
+	cache, err := engine.ImageCacheStatus(ctx)
+	if err != nil {
+		return DoctorStatus{}, fmt.Errorf("read image cache status: %w", err)
+	}
+	cache.LastError = ""
+	roots := append([]string(nil), engine.config.AllowedMountRoots...)
+	for index := range roots {
+		roots[index] = filepath.Clean(roots[index])
+	}
+	sort.Strings(roots)
+	return DoctorStatus{
+		RuntimePlatform:   OCIPlatform{OS: runtime.GOOS, Architecture: runtime.GOARCH},
+		ContainerdVersion: version.Version, RuncVersion: runcVersion,
+		AllowedMountRoots: roots, Cache: cache,
+	}, nil
 }
 
 func engineContext(ctx context.Context) context.Context {

@@ -317,6 +317,12 @@ func (session *Session) ImageCacheStatus(ctx context.Context) (ImageCacheStatus,
 	return response, err
 }
 
+func (session *Session) DoctorStatus(ctx context.Context) (DoctorStatus, error) {
+	var response DoctorStatus
+	err := session.call(ctx, MethodDoctorStatus, struct{}{}, &response)
+	return response, err
+}
+
 // ImportImage streams one verified OCI image-layout archive into the helper.
 // The raw bytes never enter a JSON frame or an argv/path supplied to root.
 func (session *Session) ImportImage(ctx context.Context, request EnsureImageRequest, archive io.Reader, receive func(EnsureImageEvent) error) error {

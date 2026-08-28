@@ -930,6 +930,18 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		response, err := cacheEngine.ImageCacheStatus(operation.ctx)
 		_ = writeEngineResponse(wire, response, err)
+	case MethodDoctorStatus:
+		var body struct{}
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		doctorEngine, ok := server.engine.(DoctorEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "OCI doctor facts are unavailable")
+			return
+		}
+		response, err := doctorEngine.DoctorStatus(operation.ctx)
+		_ = writeEngineResponse(wire, response, err)
 	case MethodRun:
 		var body RunRequest
 		if !decodeRequest(wire, request.Body, &body) {

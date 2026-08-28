@@ -21,6 +21,7 @@ type NativeEngineConfig struct {
 	ResolverPath           string
 	HostsPath              string
 	AllowedMountRoots      []string
+	RuncExecutable         string
 	HostMountRoot          string
 	GuestMountRoot         string
 	AttemptPortMin         uint16
@@ -77,6 +78,12 @@ type ImageCacheEngine interface {
 	ReleaseImagePin(context.Context, ReleaseImagePinRequest) error
 	ReleaseAttemptImagePin(context.Context, ReleaseAttemptImagePinRequest) error
 	ImageCacheStatus(context.Context) (ImageCacheStatus, error)
+}
+
+// DoctorEngine reads already-configured runtime mechanics. Implementations
+// must not pull images, create tasks, sweep resources, or alter cache policy.
+type DoctorEngine interface {
+	DoctorStatus(context.Context) (DoctorStatus, error)
 }
 
 // UnavailableEngine keeps the private helper mode fail-closed on unsupported

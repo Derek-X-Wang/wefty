@@ -523,6 +523,25 @@ func run() error {
 		}
 		controller, err := ocicontrol.NewController(ocicontrol.ControllerConfig{
 			IntentPath: *ociIntentFile, Runtime: nodeAgent, Images: ociAdapter, StopCycle: stopCycle,
+			Doctor: func(doctorContext context.Context) (ocicontrol.DoctorResponse, error) {
+				currentUser, userErr := user.Current()
+				agentUser := ""
+				if userErr == nil {
+					agentUser = currentUser.Username
+				}
+				var limaFacts func() limarunner.SupervisorFacts
+				if limaSupervisor != nil {
+					limaFacts = limaSupervisor.Facts
+				}
+				report := ocicontrol.BuildDoctor(doctorContext, ocicontrol.DoctorConfig{
+					HostPlatform: ocicontrol.PlatformFacts{OS: runtime.GOOS, Architecture: runtime.GOARCH},
+					AgentUser:    agentUser, LaunchUnit: os.Getenv("WEFTY_LAUNCH_UNIT"),
+					CapabilitySnapshot: nodeAgent.CapabilitySnapshot,
+					Intent:             (limarunner.FileIntentSource{Path: *ociIntentFile}).ReadIntent,
+					LimaFacts:          limaFacts, Helper: doctorHelperSource(ociAdapter), SetupStatePath: *ociSetupState,
+				})
+				return report, report.Validate()
+			},
 			Setup: func(setupContext context.Context, request ocicontrol.SetupRequest) (ocicontrol.SetupResponse, error) {
 				response := ocicontrol.SetupResponse{Convergence: ocicontrol.ConvergenceLiveSafe}
 				if runtime.GOOS == "linux" {
@@ -668,6 +687,24 @@ func run() error {
 	err = nodeAgent.Run(ctx)
 	cancel()
 	return err
+}
+
+func doctorHelperSource(adapter *ocirunner.Adapter) ocicontrol.HelperDoctorSource {
+	if adapter == nil {
+		return nil
+	}
+	return func(ctx context.Context) (ocicontrol.HelperDoctorSnapshot, error) {
+		status, err := adapter.DoctorStatus(ctx)
+		if err != nil {
+			return ocicontrol.HelperDoctorSnapshot{}, err
+		}
+		return ocicontrol.HelperDoctorSnapshot{
+			ProtocolVersion: status.ProtocolVersion, Version: status.HelperVersion,
+			Checksum: status.HelperChecksum, InstanceID: status.HelperInstanceID,
+			SessionGeneration: status.SessionGeneration, Runtime: status.Runtime,
+			RuntimePlatformRecorded: status.RuntimePlatformRecorded,
+		}, nil
+	}
 }
 
 var consoleOutputMu sync.Mutex

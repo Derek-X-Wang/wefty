@@ -66,7 +66,8 @@ type CapabilityProbeResult struct {
 // every completed probe even when the publishable observation is unchanged.
 type CapabilitySnapshot struct {
 	contract.CapabilityObservation
-	LastProbeAt time.Time `json:"last_probe_at,omitempty"`
+	LastProbeAt                time.Time `json:"last_probe_at,omitempty"`
+	PendingPublicationRevision int64     `json:"pending_publication_revision,omitempty"`
 }
 
 // capabilityState is the one process-wide source for registration, heartbeat,
@@ -319,7 +320,10 @@ func (state *capabilityState) capabilitySnapshot() CapabilitySnapshot {
 	}
 	state.mu.RLock()
 	defer state.mu.RUnlock()
-	return CapabilitySnapshot{CapabilityObservation: cloneCapabilityObservation(state.current), LastProbeAt: state.lastProbeAt}
+	return CapabilitySnapshot{
+		CapabilityObservation: cloneCapabilityObservation(state.current), LastProbeAt: state.lastProbeAt,
+		PendingPublicationRevision: state.pendingPublicationRevision,
+	}
 }
 
 func cloneCapabilityObservation(observation contract.CapabilityObservation) contract.CapabilityObservation {

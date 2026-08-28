@@ -30,7 +30,9 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/lima"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
+	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
@@ -97,6 +99,55 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	probeElapsed := time.Since(probeStarted)
 	if probeElapsed > 10*time.Second {
 		t.Fatalf("production functional probe took %s, want at most 10s", probeElapsed)
+	}
+	doctorBefore, err := session.Verify(ctx, ocihelper.VerifyRequest{Scope: ocihelper.VerifyNamespace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doctorObservedAt := time.Now().UTC().Round(0)
+	doctorJSON := ocicontrol.BuildDoctor(ctx, ocicontrol.DoctorConfig{
+		HostPlatform: ocicontrol.PlatformFacts{OS: "linux", Architecture: runtime.GOARCH},
+		AgentUser:    fmt.Sprintf("uid:%d", os.Getuid()), LaunchUnit: "wefty-agent.service",
+		CapabilitySnapshot: func() agent.CapabilitySnapshot {
+			return agent.CapabilitySnapshot{CapabilityObservation: contract.CapabilityObservation{
+				Revision: 2, ObservedAt: doctorObservedAt, Capabilities: map[string]bool{
+					"kind:process": true, "kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true,
+				}, MissingCapabilities: []string{},
+			}, LastProbeAt: doctorObservedAt}
+		},
+		Intent: func(context.Context) (lima.OCIIntent, error) {
+			return lima.OCIIntent{Version: lima.OCIIntentVersion, Revision: 1, Enabled: true, UpdatedAt: doctorObservedAt}, nil
+		},
+		Helper: func(ctx context.Context) (ocicontrol.HelperDoctorSnapshot, error) {
+			status, err := adapter.DoctorStatus(ctx)
+			return ocicontrol.HelperDoctorSnapshot{
+				ProtocolVersion: status.ProtocolVersion, Version: status.HelperVersion, Checksum: status.HelperChecksum,
+				InstanceID: status.HelperInstanceID, SessionGeneration: status.SessionGeneration,
+				Runtime: status.Runtime, RuntimePlatformRecorded: status.RuntimePlatformRecorded,
+			}, err
+		},
+		SetupStatePath: "/var/lib/wefty/oci-setup.json",
+		ReadSetupState: func(string) (ocicontrol.SetupState, error) {
+			return ocicontrol.SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "native", HostMountRoot: "/srv/wefty", ProbeDigest: digest}, nil
+		},
+	})
+	if err := doctorJSON.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	doctorAfter, err := session.Verify(ctx, ocihelper.VerifyRequest{Scope: ocihelper.VerifyNamespace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(doctorBefore, doctorAfter) {
+		t.Fatalf("facts-only doctor mutated helper namespace: before=%+v after=%+v", doctorBefore, doctorAfter)
+	}
+	doctorBundle, err := json.MarshalIndent(struct {
+		Before ocihelper.VerifyResponse  `json:"before"`
+		Doctor ocicontrol.DoctorResponse `json:"doctor"`
+		After  ocihelper.VerifyResponse  `json:"after"`
+	}{Before: doctorBefore, Doctor: doctorJSON, After: doctorAfter}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// Delete must accept the live owner-key-derived handoff name. It cannot be
@@ -598,6 +649,9 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatalf("namespace cleanup verification=%+v err=%v", verification, err)
 	}
 	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
+		if err := os.WriteFile(filepath.Join(evidenceDirectory, "node-doctor.json"), append(doctorBundle, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_agent_restart_same_generation=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerDiskEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)

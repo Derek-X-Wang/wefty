@@ -1646,6 +1646,42 @@ type blockingWatchEngine struct {
 	entered chan struct{}
 }
 
+type doctorEngine struct{ *fakeEngine }
+
+func (engine *doctorEngine) DoctorStatus(context.Context) (DoctorStatus, error) {
+	engine.record("DoctorStatus")
+	return DoctorStatus{
+		RuntimePlatform:   OCIPlatform{OS: "linux", Architecture: "amd64"},
+		ContainerdVersion: "2.3.4", RuncVersion: "1.3.3",
+		AllowedMountRoots: []string{"/srv/wefty"},
+		Cache:             ImageCacheStatus{Bytes: 8 << 30, CapBytes: 16 << 30},
+	}, nil
+}
+
+func TestDoctorStatusIsReadOnlyAndAssertionDerived(t *testing.T) {
+	engine := &doctorEngine{fakeEngine: newFakeEngine()}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	before := len(engine.methods())
+	status, err := session.DoctorStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := engine.methods()
+	if status.RuntimePlatform.OS != "linux" || status.ContainerdVersion != "2.3.4" || status.Cache.Bytes > status.Cache.CapBytes {
+		t.Fatalf("doctor status = %+v", status)
+	}
+	if len(after) != before+1 || after[len(after)-1] != "DoctorStatus" {
+		t.Fatalf("doctor invoked mechanics beyond its read: before=%d calls=%v", before, after)
+	}
+}
+
 type guardianRecordingEngine struct {
 	*fakeEngine
 	guardianMu sync.Mutex

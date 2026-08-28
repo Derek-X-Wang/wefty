@@ -42,6 +42,7 @@ const (
 	MethodReleaseImagePin    Method = "ReleaseImagePin"
 	MethodReleaseAttemptPin  Method = "ReleaseAttemptImagePin"
 	MethodImageCacheStatus   Method = "ImageCacheStatus"
+	MethodDoctorStatus       Method = "DoctorStatus"
 	MethodRun                Method = "Run"
 	MethodSignal             Method = "Signal"
 	MethodWatch              Method = "Watch"
@@ -381,6 +382,17 @@ type ImageCacheStatus struct {
 	CapBytes     int64               `json:"cap_bytes"`
 	LastEviction *ImageCacheEviction `json:"last_eviction,omitempty"`
 	LastError    string              `json:"last_error,omitempty"`
+}
+
+// DoctorStatus is the helper's read-only mechanics snapshot. It contains no
+// session capability, raw error, or mutation control and is safe to surface to
+// the operator-only node doctor.
+type DoctorStatus struct {
+	RuntimePlatform   OCIPlatform      `json:"runtime_platform"`
+	ContainerdVersion string           `json:"containerd_version"`
+	RuncVersion       string           `json:"runc_version"`
+	AllowedMountRoots []string         `json:"allowed_mount_roots"`
+	Cache             ImageCacheStatus `json:"cache"`
 }
 
 // ImageSource selects one closed delivery mechanism. Empty retains the wire-v1

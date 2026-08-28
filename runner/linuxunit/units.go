@@ -85,6 +85,7 @@ WorkingDirectory=` + quote(config.WorkingDirectory) + `
 RuntimeDirectory=wefty-agent
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=restart
+Environment=WEFTY_LAUNCH_UNIT=` + AgentUnit + `
 ExecStart=` + quoteArguments(agentArguments) + `
 Restart=on-failure
 RestartSec=5s

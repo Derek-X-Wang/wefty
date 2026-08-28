@@ -140,6 +140,19 @@ The writer checks for content changes and polls no faster than 20 seconds. It
 never contains a raw command error, path detail,
 environment dump, credential, or opaque helper session capability.
 
+The versioned general node doctor is a separate facts-only read over the
+operator-authenticated local control socket. JSON and human views contain the
+same host/runtime platform, agent user/unit, Lima, helper handshake, recorded
+functional probe and Capability revision, intent, cache, mount-root, version,
+and convergence facts. Each check is `OK`, `FAILED`, or `NOT-RUN`; `OK` is
+permitted only when the corresponding assertion ran and passed. The doctor
+reads the existing helper session and capability snapshot and never acquires a
+session, runs a functional probe, sweeps, changes intent, applies convergence,
+starts a service, or enforces cache policy. Failed checks use the closed M3
+reason vocabulary and stable `docs/runbooks/oci-node.md#doctor-code-*` anchors.
+It also surfaces #220's process-payload UID-isolation limitation without
+claiming that operator peer credentials distinguish the shared UID.
+
 ## Durable OCI intent and node-local control
 
 The versioned OCI intent marker is the node-local operator decision, separate

@@ -112,6 +112,7 @@ func runtimeUnavailable(message string, cause error) error {
 }
 
 type Service interface {
+	Doctor(context.Context) (DoctorResponse, error)
 	Intent(context.Context) (lima.OCIIntent, error)
 	Setup(context.Context, SetupRequest) (SetupResponse, error)
 	Start(context.Context, IntentMutationRequest) (IntentResponse, error)
@@ -120,11 +121,19 @@ type Service interface {
 }
 
 type ServiceFuncs struct {
+	DoctorFunc    func(context.Context) (DoctorResponse, error)
 	IntentFunc    func(context.Context) (lima.OCIIntent, error)
 	SetupFunc     func(context.Context, SetupRequest) (SetupResponse, error)
 	StartFunc     func(context.Context, IntentMutationRequest) (IntentResponse, error)
 	StopFunc      func(context.Context, IntentMutationRequest) (IntentResponse, error)
 	LoadImageFunc func(context.Context, io.Reader) (LoadImageResponse, error)
+}
+
+func (service ServiceFuncs) Doctor(ctx context.Context) (DoctorResponse, error) {
+	if service.DoctorFunc == nil {
+		return DoctorResponse{}, runtimeUnavailable("OCI doctor is unavailable", nil)
+	}
+	return service.DoctorFunc(ctx)
 }
 
 func (service ServiceFuncs) Intent(ctx context.Context) (lima.OCIIntent, error) {

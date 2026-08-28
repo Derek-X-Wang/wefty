@@ -21,7 +21,7 @@ func TestRenderLinuxUnitsKeepsAgentUnprivilegedAndHelperNarrow(t *testing.T) {
 	agent := string(units.Agent)
 	helper := string(units.HelperService)
 	socket := string(units.HelperSocket)
-	for _, want := range []string{"User=wefty", "SupplementaryGroups=wefty-oci", "NoNewPrivileges=true", "Restart=on-failure"} {
+	for _, want := range []string{"User=wefty", "SupplementaryGroups=wefty-oci", "NoNewPrivileges=true", "Restart=on-failure", "Environment=WEFTY_LAUNCH_UNIT=wefty-agent.service"} {
 		if !strings.Contains(agent, want) {
 			t.Fatalf("agent unit missing %q:\n%s", want, agent)
 		}
