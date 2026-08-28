@@ -8,6 +8,7 @@ permissions:
 
 env:
   IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
+  COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-reference
 
 jobs:
   reproducible-platform-build:
@@ -119,4 +120,85 @@ jobs:
         with:
           name: wefty-echo-service-platform-${{ matrix.arch }}-${{ github.sha }}
           path: ${{ runner.temp }}/acceptance-image-linux
+          if-no-files-found: error
+
+  reference-computer-platform-build:
+    name: reference-computer-platform-build / linux/${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports: [5000:5000]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        with:
+          version: v0.36.1
+          driver-opts: |
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+            network=host
+      - name: Build the reference desktop through both exporter shapes
+        env:
+          PLATFORM: linux/${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          registry_reference="localhost:5000/wefty-computer-reference:${GITHUB_SHA}-${ARCH}"
+          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+            --file examples/computer/Dockerfile \
+            --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" .
+          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+            --file examples/computer/Dockerfile \
+            --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
+      - name: Execute the exact desktop digest and assert its ELF architecture
+        env:
+          PLATFORM: linux/${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/computer-image-linux"
+          mkdir -p "$evidence"
+          scripts/verify-acceptance-image.sh --archive "$RUNNER_TEMP/computer-image.oci.tar" \
+            --expected-platform "$PLATFORM" --platform-digest-output "$evidence/${ARCH}.digest" \
+            --receipt-output "$evidence/${ARCH}-oci.json"
+          go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
+          crane="$(go env GOPATH)/bin/crane"
+          registry_reference="localhost:5000/wefty-computer-reference:${GITHUB_SHA}-${ARCH}"
+          platform_digest="$(cat "$evidence/${ARCH}.digest")"
+          registry_digest="$("$crane" digest --insecure "$registry_reference")"
+          test "$registry_digest" = "$platform_digest"
+          printf '%s\n' "$registry_digest" > "$evidence/${ARCH}-registry.digest"
+          pinned_reference="${registry_reference}@${platform_digest}"
+          docker pull --platform "$PLATFORM" "$pinned_reference"
+          scripts/test-computer-image-runtime.sh --image "$pinned_reference" --arch "$ARCH" --evidence "$evidence"
+
+          "$crane" export --insecure --platform "$PLATFORM" "$pinned_reference" "$RUNNER_TEMP/computer-rootfs.tar"
+          tar -xOf "$RUNNER_TEMP/computer-rootfs.tar" usr/lib/chromium/chromium > "$RUNNER_TEMP/chromium"
+          python3 - "$RUNNER_TEMP/chromium" "$ARCH" <<'PY'
+          import struct, sys
+          payload = open(sys.argv[1], "rb").read(20)
+          if payload[:4] != b"\x7fELF": raise SystemExit("Chromium is not ELF")
+          machine = struct.unpack("<H", payload[18:20])[0]
+          expected = {"amd64": 62, "arm64": 183}[sys.argv[2]]
+          if machine != expected: raise SystemExit(f"ELF e_machine={machine}, want {expected}")
+          PY
+          machine="$(test "$ARCH" = amd64 && printf 62 || printf 183)"
+          jq --arg digest "$platform_digest" --argjson e_machine "$machine" \
+            '.digest = $digest | .elf_e_machine = $e_machine' "$evidence/${ARCH}-runtime.json" \
+            > "$evidence/${ARCH}-runtime.complete.json"
+          mv "$evidence/${ARCH}-runtime.complete.json" "$evidence/${ARCH}-runtime.json"
+      - name: Upload reference desktop evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wefty-computer-reference-platform-${{ matrix.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/computer-image-linux
           if-no-files-found: error

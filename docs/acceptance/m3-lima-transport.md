@@ -1,6 +1,6 @@
 # M3 Lima transport and service publication attended acceptance
 
-This is the owner-hardware lane for Tickets #145, #147, #149, and #150 and the Mac rows of the M3 OCI
+This is the owner-hardware lane for Tickets #145, #147, #149, #150, and #181 and the Mac rows of the M3 OCI
 spec §9. It is deliberately absent from `service-acceptance-realtiming`: hosted
 macOS runners do not prove nested Lima `vz`. A run is PASS only when every row
 below has a captured command, exit code, and redacted receipt from the same
@@ -22,6 +22,12 @@ and raw environment dumps must never enter the artifact.
   discovery-only); its OCI archive contains the same
   `/bin/sh`, BusyBox utilities, and `cmd/wefty-echo-service` program used by
   Linux realtiming, including the distinct one-shot stdout/stderr markers;
+- the separate `wefty-computer-reference-<candidate-commit>` artifact from
+  that exact workflow run. Extract `wefty-computer-reference-release.tar`,
+  require its commit to match the echo artifact, and use the repository name
+  plus `computer-image-index-digest.txt` and
+  `wefty-computer-reference.oci.tar` unchanged. The index and archive receipt
+  must name the same amd64/arm64 child digests executed by secretless CI;
 - one temporary host operator-mount root dedicated to this run.
 
 Ticket #152 adds the minimum installed boot topology consumed by this lane.
@@ -176,7 +182,17 @@ the helper instance/session generation before each row.
    Linux guest's native filesystem, remain absent from the Lima host mounts,
    and never traverse virtiofs. Record these facts in the
    `service_data_guest_native` row.
-9. Removal manifest: while the agent is offline, request removal of a bound OCI
+9. Reference Computer image: import the arm64 child from the separate
+   digest-selected Computer OCI tar through the helper, then boot it without
+   argv or working-directory replacement. Require both returned names to reach
+   `rfb-websocket-v1` readiness atomically within 60 seconds of authoritative
+   `Started`, with view input discarded server-side and control input accepted.
+   Record the 1 GiB private `/dev/shm`, CPU-rendered XFCE/Chromium session,
+   profile/sign-in markers across a fresh attempt and stop→start, missing or
+   malformed `driver.json` failing closed, and attempt-local scratch absence.
+   The reference and echo artifact receipts must retain distinct repositories,
+   digests, and tar names while sharing the candidate commit.
+10. Removal manifest: while the agent is offline, request removal of a bound OCI
    service and observe L1 at exactly `removal_pending`. Return the same
    node through the ordinary boot sweep barrier, then capture the immutable
    job/removal-generation manifest with every attempt lease, task, container,
