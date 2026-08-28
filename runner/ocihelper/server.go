@@ -753,10 +753,13 @@ func (session *serverSession) authorizeAttempt(authority AttemptAuthority) (*ser
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.closed || authority.NodeID != session.identity.NodeID || authority.BootSessionID != session.identity.BootSessionID {
-		return nil, &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt is outside this helper session"}
+		return nil, &RPCError{Code: CodeAttemptOutsideSession, Message: "attempt is outside this helper session"}
 	}
 	attempt := session.attempts[authority.key()]
-	if attempt == nil || attempt.state != attemptLive || attempt.authority != authority {
+	if attempt == nil {
+		return nil, &RPCError{Code: CodeAttemptOutsideSession, Message: "attempt is outside this helper session"}
+	}
+	if attempt.state != attemptLive || attempt.authority != authority {
 		return nil, &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt authority does not match a live attempt"}
 	}
 	return attempt, nil
@@ -766,7 +769,7 @@ func (session *serverSession) sweepRequired(method Method) bool {
 	switch method {
 	case MethodAcquireSession, MethodSweep, MethodVerify:
 		return false
-	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus, MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDialAttemptPort, MethodDialHostBridge:
+	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus, MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodDialAttemptPort, MethodDialHostBridge:
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		return !session.sweepVerified
@@ -885,13 +888,23 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		if err := body.Authority.validate(); err != nil || body.Authority.NodeID != session.identity.NodeID || body.Authority.BootSessionID != session.identity.BootSessionID {
-			_ = writeFailure(wire, CodeUnauthorizedAttempt, "Run authority is outside this helper session")
+			_ = writeFailure(wire, CodeAttemptOutsideSession, "Run authority is outside this helper session")
 			return
 		}
 		resources, err := DeterministicResourceIdentity(body.Authority)
 		if err != nil {
 			_ = writeFailure(wire, CodeInvalidRequest, err.Error())
 			return
+		}
+		for _, volume := range body.Workload.ManagedVolumes {
+			if volume.Kind != ManagedVolumeHandoff {
+				continue
+			}
+			resources.HandoffVolumeDirectory, err = DeterministicHandoffVolumeDirectory(volume.OwnerKey)
+			if err != nil {
+				_ = writeFailure(wire, CodeInvalidRequest, err.Error())
+				return
+			}
 		}
 		body.Resources = resources
 		if server.config.beforeRunCreateLock != nil {
@@ -994,6 +1007,27 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if err == nil && response.Deleted {
 			err = session.reapAttempt(attempt, false, false)
 		}
+		_ = writeEngineResponse(wire, response, err)
+	case MethodDeleteVolume:
+		var body DeleteManagedVolumeRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if body.Kind != ManagedVolumeHandoff {
+			_ = writeFailure(wire, CodeInvalidRequest, "only handoff managed-volume deletion is supported")
+			return
+		}
+		if _, err := DeterministicHandoffVolumeDirectory(body.OwnerKey); err != nil {
+			_ = writeFailure(wire, CodeInvalidRequest, err.Error())
+			return
+		}
+		engine, ok := server.engine.(ManagedVolumeEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "managed-volume deletion is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.DeleteManagedVolume(operation.ctx, body)
 		_ = writeEngineResponse(wire, response, err)
 	case MethodVerify:
 		var body VerifyRequest

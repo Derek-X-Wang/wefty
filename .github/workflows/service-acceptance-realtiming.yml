@@ -74,6 +74,20 @@ jobs:
           sudo chmod 0644 /tmp/wefty-probe.oci.tar
           PROBE_NAME="${PROBE_REFERENCE%@*}"
           go build -o /tmp/wefty-agent-oci-realtiming ./cmd/wefty-agent
+          CGO_ENABLED=0 go build -o /tmp/wefty-echo-service-realtiming ./cmd/wefty-echo-service
+          ECHO_REFERENCE="wefty.local/echo-realtiming:${GITHUB_SHA}"
+          install --directory --mode=0755 /tmp/wefty-echo-image
+          install --mode=0755 /tmp/wefty-echo-service-realtiming /tmp/wefty-echo-image/wefty-echo-service
+          printf '%s\n' \
+            "FROM ${PROBE_REFERENCE}" \
+            'COPY wefty-echo-service /usr/local/bin/wefty-echo-service' \
+            'ENTRYPOINT ["/usr/local/bin/wefty-echo-service"]' \
+            > /tmp/wefty-echo-image/Dockerfile
+          docker buildx create --name wefty-realtiming --driver docker-container --use
+          docker buildx inspect --bootstrap
+          docker buildx build --platform linux/amd64 --tag "$ECHO_REFERENCE" \
+            --output type=oci,dest=/tmp/wefty-echo.oci.tar /tmp/wefty-echo-image
+          chmod 0644 /tmp/wefty-echo.oci.tar
           sudo install --owner=root --group=root --mode=0755 /tmp/wefty-agent-oci-realtiming /usr/local/libexec/wefty-agent-oci-realtiming
           HELPER_CHECKSUM="sha256:$(sha256sum /tmp/wefty-agent-oci-realtiming | cut -d' ' -f1)"
           AGENT_UID="$(id -u)"
@@ -174,6 +188,8 @@ jobs:
             printf 'WEFTY_OCI_PROBE_REFERENCE=%s\n' "$PROBE_NAME"
             printf 'WEFTY_OCI_PROBE_DIGEST=%s\n' "$PROBE_DIGEST"
             printf 'WEFTY_OCI_PROBE_ARCHIVE=%s\n' /tmp/wefty-probe.oci.tar
+            printf 'WEFTY_OCI_ECHO_REFERENCE=%s\n' "$ECHO_REFERENCE"
+            printf 'WEFTY_OCI_ECHO_ARCHIVE=%s\n' /tmp/wefty-echo.oci.tar
             printf 'WEFTY_OCI_FAULT_FIFO=%s\n' /tmp/wefty-oci-faults/control
             printf 'WEFTY_OCI_FAULT_DIR=%s\n' /tmp/wefty-oci-faults
           } >> "$GITHUB_ENV"

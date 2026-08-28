@@ -432,6 +432,12 @@ func (session *Session) Delete(ctx context.Context, request DeleteRequest) (Dele
 	return response, err
 }
 
+func (session *Session) DeleteManagedVolume(ctx context.Context, request DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
+	var response DeleteManagedVolumeResponse
+	err := session.call(ctx, MethodDeleteVolume, request, &response)
+	return response, err
+}
+
 func (session *Session) Verify(ctx context.Context, request VerifyRequest) (VerifyResponse, error) {
 	var response VerifyResponse
 	err := session.call(ctx, MethodVerify, request, &response)

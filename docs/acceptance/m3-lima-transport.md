@@ -160,6 +160,43 @@ the helper instance/session generation before each row.
    paths in the payload environment. Restart classification, stop quiescence,
    and service-data persistence are not rows for Ticket #147.
 
+## Ordinary L3 OCI one-shot
+
+Run the normal L1, L3, and agent processes, then submit the candidate echo
+artifact through the ordinary `wefty submit --image ... --argv
+wefty-echo-service --argv=--once` surface. Do not call the helper or OCI
+adapter directly for these rows. The L3 snapshot must be the only source of
+the `kind=oci`, `class=one-shot` Job.
+
+Record four rows:
+
+1. `oci_oneshot_run`: require the helper-owned `/wefty/handoff` mount, one
+   authenticated run-scoped bridge request, distinct ordered stdout/stderr
+   markers, exit zero, accepted top-level and Lima-platform digests, one
+   attempt ID, and exactly one payload execution. Capture the exact
+   `wefty echo one-shot handoff\n` marker bytes before finalization, then prove
+   the helper-owned volume is absent only after L1 accepts success.
+2. `oci_oneshot_prestarted_loss`: stop the VM or helper after image evidence
+   but before authoritative `Started`. Require the old attempt to terminalize,
+   the job to requeue with its original absolute deadline and digest, a fresh
+   attempt/fence after recovery, and exactly one payload execution across the
+   two attempts.
+3. `oci_oneshot_poststarted_loss`: stop the VM or helper after `Started`.
+   Require one terminal `runtime_failure`, no automatic requeue, one attempt,
+   and exactly one payload execution.
+4. `oci_oneshot_rerun_identity`: explicitly rerun the completed first row.
+   Require a fresh run/job/attempt, the identical top-level and platform
+   digests, a second payload execution, and no tag resolution. The two
+   executions must have distinct attempt IDs. Record the same opaque handoff
+   owner identity, exact marker bytes, and accepted-completion deletion proof.
+
+For every row, record the ordinary L3 run and L1 job projections, redacted
+reserved-name presence (never values), helper generation, attempts, digest
+arrays, payload-execution count, logs, exact handoff marker bytes,
+`handoff_absent_after_completion`, and final residue inventory. A Mac/Lima
+row is `NOT-RUN` unless this attended owner-hardware procedure actually
+executes it; hosted macOS does not satisfy the row.
+
 ## Loss and recovery order
 
 For helper loss and then full VM stop, leave a live marker workload before the
@@ -202,7 +239,10 @@ The redacted artifact is strict JSON with this shape:
       "command": ["limactl", "template", "copy", "--fill", "lima.yaml", "-"],
       "exit_code": 0, "helper_generations": [],
       "capability_revisions": [], "inventories": [], "round_trip": false,
-      "dynamic_listeners": {}
+      "dynamic_listeners": {}, "attempt_ids": [],
+      "top_level_digests": [], "platform_digests": [],
+      "payload_executions": 0, "stdout_markers": [],
+      "stderr_markers": []
     }
   }
 }
@@ -212,7 +252,9 @@ It must contain PASS evidence for `template_permissions`, `probe`,
 `task_logs_delete`, `mount_validation`, `host_to_guest`,
 `guest_to_host_primary`, `guest_to_host_fallback`, `helper_loss`, `vm_loss`,
 `sweep_before_recovery`, `dynamic_forwarding_disabled`, and
-`raw_containerd_denied`. Ticket #147 additionally requires
+`raw_containerd_denied`, plus `oci_oneshot_run`,
+`oci_oneshot_prestarted_loss`, `oci_oneshot_poststarted_loss`, and
+`oci_oneshot_rerun_identity`. Ticket #147 additionally requires
 `service_health_echo`, `service_startup_timeout`,
 `service_withdrawal_republication`, `service_port_collision`, and
 `service_portless_started` from the same attended session.

@@ -85,6 +85,24 @@ func (barrier *BootBarrier) SweepReceipt() (VerifiedSweepReceipt, bool) {
 	return cloneVerifiedSweepReceipt(barrier.receipt), true
 }
 
+// ExecutionSnapshot atomically captures the session and the sweep receipt
+// that authorized it. Adapters call this immediately before Run so recovery
+// cannot pair an old session with a new sweep epoch (or vice versa).
+func (barrier *BootBarrier) ExecutionSnapshot() (*Session, VerifiedSweepReceipt, error) {
+	if barrier == nil {
+		return nil, VerifiedSweepReceipt{}, errors.New("OCI boot barrier is unavailable")
+	}
+	barrier.mu.RLock()
+	defer barrier.mu.RUnlock()
+	if !barrier.prepared || barrier.session == nil {
+		return nil, VerifiedSweepReceipt{}, errors.New("OCI boot barrier has not completed")
+	}
+	if err := barrier.session.HealthError(); err != nil {
+		return nil, VerifiedSweepReceipt{}, err
+	}
+	return barrier.session, cloneVerifiedSweepReceipt(barrier.receipt), nil
+}
+
 func (barrier *BootBarrier) SetLossHandler(handler func(HelperSession, error)) {
 	if barrier == nil {
 		return

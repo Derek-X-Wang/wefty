@@ -27,12 +27,17 @@ type NativeEngineConfig struct {
 	AttemptPortMax         uint16
 	AttemptPortBindTimeout time.Duration
 	LogSealTimeout         time.Duration
+	HandoffRetention       time.Duration
 }
 
 // GuardianReaper preserves the helper deadman's signal initiator when the
 // concrete engine can obtain a real task signal-delivery acknowledgement.
 type GuardianReaper interface {
 	ReapAttemptAsGuardian(context.Context, AttemptAuthority) error
+}
+
+type ManagedVolumeEngine interface {
+	DeleteManagedVolume(context.Context, DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error)
 }
 
 // Engine is the helper-internal mechanics seam. No containerd request or type

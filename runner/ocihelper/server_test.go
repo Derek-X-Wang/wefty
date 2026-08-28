@@ -49,6 +49,24 @@ func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	}
 }
 
+func TestHandoffVolumeIdentityUsesStableOpaqueOwner(t *testing.T) {
+	first, err := DeterministicHandoffVolumeDirectory("run-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := DeterministicHandoffVolumeDirectory("run-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	different, err := DeterministicHandoffVolumeDirectory("run-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second || first == different || strings.Contains(first, "run-source") {
+		t.Fatalf("stable opaque handoff identities = first %q second %q different %q", first, second, different)
+	}
+}
+
 func TestEngineReceivesHelperDerivedResourcePlanBeforeRun(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -84,6 +102,63 @@ func TestEngineReceivesHelperDerivedResourcePlanBeforeRun(t *testing.T) {
 			t.Fatalf("engine resource label %q = %q, want %q", label, request.Resources.Labels[label], value)
 		}
 	}
+}
+
+func TestEngineReceivesOwnerKeyedHandoffAndFinalizesItSeparately(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.Workload.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "run-source"}}
+	if _, err := session.Run(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	engine.mu.Lock()
+	got := engine.lastRunRequest.Resources.HandoffVolumeDirectory
+	engine.mu.Unlock()
+	want, err := DeterministicHandoffVolumeDirectory("run-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("engine handoff identity = %q, want stable owner identity %q", got, want)
+	}
+	deleted, err := session.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{Kind: ManagedVolumeHandoff, OwnerKey: "run-source"})
+	if err != nil || !deleted.Deleted {
+		t.Fatalf("managed handoff deletion = %+v err=%v", deleted, err)
+	}
+}
+
+func TestAttemptOutsideSessionIsDistinctFromNonLiveAttempt(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	outside := testAuthority()
+	outside.BootSessionID = "different-boot"
+	_, err = session.Run(t.Context(), testRunRequest(outside, time.Second))
+	assertRPCCode(t, err, CodeAttemptOutsideSession)
+
+	authority := testAuthority()
+	if _, err := session.Run(t.Context(), testRunRequest(authority, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Delete(t.Context(), DeleteRequest{Authority: authority}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = session.Delete(t.Context(), DeleteRequest{Authority: authority})
+	assertRPCCode(t, err, CodeUnauthorizedAttempt)
 }
 
 func TestBootBarrierSweepsVerifiesAndRetriesExclusiveTakeover(t *testing.T) {
@@ -1602,6 +1677,9 @@ func (engine *fakeEngine) Watch(_ context.Context, _ WatchRequest, emit func(Wat
 func (engine *fakeEngine) Delete(context.Context, DeleteRequest) (DeleteResponse, error) {
 	engine.record("Delete")
 	return DeleteResponse{Deleted: true}, nil
+}
+func (*fakeEngine) DeleteManagedVolume(context.Context, DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
+	return DeleteManagedVolumeResponse{Deleted: true}, nil
 }
 func (engine *fakeEngine) Verify(context.Context, VerifyRequest) (VerifyResponse, error) {
 	engine.record("Verify")

@@ -166,7 +166,8 @@ heartbeats.
 | `Run` | Exact attempt authority, initial deadman, a bounded requested endpoint-name list, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started` with helper-observed image evidence and a map from every requested endpoint name to its allocated loopback port. Today ordinary services request only `service`; the named map is the ratified wire shape for later `view` and `control` endpoints. An explicit Mac bridge-fallback request creates a separate guest loopback listener and capability. |
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. |
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
-| `Delete` | Exact live attempt only. A positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments; only then does the server tombstone authorization. |
+| `Delete` | Exact live attempt only. A positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments while retaining any stable handoff volume; only then does the server tombstone authorization. |
+| `DeleteManagedVolume` | Session-authorized and closed to `handoff`. The caller supplies only the opaque stable owner key; the helper derives the source, deletes that one directory, independently verifies absence, and returns no general path authority. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend, and only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
@@ -264,9 +265,15 @@ retries.
 image digest, optional full argv and working-directory replacements, separate
 public and sensitive operator environment, helper-managed reserved environment,
 enumerated managed volumes, operator mounts, and optional memory/CPU limits.
-The helper-managed list may contain only the exact five reserved names. A
-reserved name arriving defensively in either operator list is stripped rather
-than winning authority. Image
+The managed-volume list is closed to `handoff`, `service_data`, and
+`log_segments`; `kind=oci`, `class=one-shot` selects exactly one `handoff`
+descriptor carrying an opaque stable handoff-owner key, whose helper-owned
+source is mounted at `/wefty/handoff`. Presence of that descriptor makes the
+helper-reserved `WEFTY_HANDOFF_DIR=/wefty/handoff` value authoritative even if
+an operator or image layer supplied another value. The
+reserved environment list is closed to the names in the run-execution-context
+contract. A reserved name arriving defensively in either operator list is
+stripped rather than winning authority. Image
 configuration, image-rootfs user/group databases, guest architecture/kernel
 facts, resolver and hosts files, translated Lima mount paths, namespace/device
 policy, and OCI JSON never cross from the agent.
@@ -352,8 +359,10 @@ into the ambiguous `engine_failure` bucket.
 
 The helper hashes the complete attempt authority tuple with SHA-256 and uses
 the first 128 bits to derive deterministic names for the lease, snapshot,
-container, task, shim, cgroup, log-segment directory, handoff volume directory,
-and service-data volume directory. Every label-capable resource carries the
+container, task, shim, cgroup, log-segment directory, and service-data volume
+directory. It separately hashes the opaque stable handoff-owner key to derive
+the handoff volume directory, so a retry or explicit rerun never substitutes
+an attempt identity for handoff lineage. Every label-capable attempt resource carries the
 unabridged labels:
 
 ```text
@@ -365,6 +374,16 @@ io.wefty/boot_session_id
 io.wefty/class
 io.wefty/removal_generation
 ```
+
+Handoff volumes live under a distinct helper-owned durable root, not the
+attempt namespace. `Delete` reaps and verifies the attempt while retaining its
+handoff volume. Session reap and boot sweep likewise leave unexpired handoffs
+intact; reuse refreshes the default 24-hour retry age, and sweep removes only
+expired direct children with the deterministic handoff prefix. The narrow
+`DeleteManagedVolume(handoff, owner_key)` operation removes that one derived
+directory and returns success only after a separate absence check. The agent
+calls it after accepted successful completion; future removal work may call the
+same closed operation but gains no general path deletion authority.
 
 The native Linux engine uses containerd namespace `wefty`, runtime handler
 `io.containerd.runc.v2`, and snapshotter `overlayfs`. It creates the labelled

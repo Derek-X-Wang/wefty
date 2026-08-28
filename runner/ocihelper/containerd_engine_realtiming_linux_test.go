@@ -3,22 +3,31 @@
 package ocihelper_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -42,7 +51,9 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	reference := os.Getenv("WEFTY_OCI_PROBE_REFERENCE")
 	digest := os.Getenv("WEFTY_OCI_PROBE_DIGEST")
 	archivePath := os.Getenv("WEFTY_OCI_PROBE_ARCHIVE")
-	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" {
+	echoReference := os.Getenv("WEFTY_OCI_ECHO_REFERENCE")
+	echoArchivePath := os.Getenv("WEFTY_OCI_ECHO_ARCHIVE")
+	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoArchivePath == "" {
 		t.Fatal("Linux OCI realtiming provisioning is incomplete")
 	}
 	if os.Geteuid() == 0 {
@@ -227,14 +238,34 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	}
 	requestRootFault(t, "enable-registry")
 	registryDisabled = false
-	refloat := newRefloatRegistry(t, archivePath)
-	exerciseNativeLinuxPrestartRequeue(t, ctx, adapter, barrier, reference, digest, refloat.reference(), refloat.originalDigest(), refloat.moveTag)
+	echoArchive, err := os.Open(echoArchivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echoImage, importEchoErr := adapter.LoadImage(ctx, echoReference, echoArchive)
+	closeEchoErr := echoArchive.Close()
+	if importEchoErr != nil || closeEchoErr != nil {
+		t.Fatal(errors.Join(importEchoErr, closeEchoErr))
+	}
+	refloat := newRefloatRegistry(t, echoArchivePath)
+	exerciseNativeLinuxPrestartRequeue(t, ctx, adapter, refloat.reference(), refloat.originalDigest(), refloat.moveTag, func() {
+		barrier.Invalidate()
+		if err := barrier.Ensure(ctx); err != nil {
+			t.Fatal(err)
+		}
+		session, err = barrier.Session()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := adapter.Probe(ctx, "native-node", "native-boot", reference, digest, l1.DefaultLeaseDuration); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if requests := refloat.observedTagRequests(); requests != 1 {
 		t.Fatalf("mutable tag was resolved %d times, want exactly the initial resolution", requests)
 	}
-	session, err = barrier.Session()
-	if err != nil {
-		t.Fatalf("load recovered helper session: %v", err)
+	if echoImage.TopLevelDigest != refloat.originalDigest() {
+		t.Fatalf("echo import/refloat digest = %s / %s", echoImage.TopLevelDigest, refloat.originalDigest())
 	}
 
 	activeDigest := lruRegistry.addVariant(t, "active-attempt")
@@ -284,6 +315,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if releasedEviction.Bytes <= 0 {
 		t.Fatalf("released attempt eviction record = %+v", releasedEviction)
 	}
+	handoffMarkerBytes := exerciseNativeLinuxOneshotContract(t, ctx, adapter, echoReference, echoImage.TopLevelDigest, reference, digest)
 
 	liveRequest := nativeAdapterRequest(reference, digest, "live-logs", []string{"/bin/sh", "-c", "printf live-before-exit; sleep 2; exit 0"})
 	liveRequest.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
@@ -443,6 +475,17 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	exerciseOrdinaryL3OCIOneshot(t, ctx, barrier, adapter, echoReference, echoImage.TopLevelDigest, reference, digest)
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Probe(ctx, "native-node", "native-boot", reference, digest, l1.DefaultLeaseDuration); err != nil {
+		t.Fatal(err)
+	}
+	session, err = barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	controlAuthority := nativeAuthority("control-loss")
 	if _, err := session.Run(ctx, ocihelper.RunRequest{Authority: controlAuthority, InitialDeadman: l1.DefaultLeaseDuration, Workload: ocihelper.WorkloadInput{ImageReference: reference, ImageDigest: digest, Argv: []string{"/bin/sh", "-c", "exec sleep 60"}}}); err != nil {
@@ -468,15 +511,329 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatalf("namespace cleanup verification=%+v err=%v", verification, err)
 	}
 	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), probeElapsed, l1.DefaultLeaseDuration, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 }
 
-func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, barrier *ocihelper.BootBarrier, probeReference, probeDigest, reference, expectedDigest string, afterResolution func()) {
+func exerciseNativeLinuxOneshotContract(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, echoReference, echoDigest, probeReference, probeDigest string) bool {
 	t.Helper()
+	const token = "native-one-shot-token"
+	volume := workloadrunner.ManagedVolume{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: "native-one-shot-owner"}
+	var bridgeCalls atomic.Int32
+	bridge := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		bridgeCalls.Add(1)
+		if request.Method != http.MethodGet || !strings.HasPrefix(request.URL.Path, "/v1/runs/native-one-shot") ||
+			request.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("one-shot bridge request = %s %s authorization=%q", request.Method, request.URL.Path, request.Header.Get("Authorization"))
+			response.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer bridge.Close()
+
+	request := nativeAdapterRequest(echoReference, echoDigest, "one-shot-contract", []string{"/usr/local/bin/wefty-echo-service", "--once"})
+	request.ManagedVolumes = []workloadrunner.ManagedVolume{volume}
+	request.Execution.Env = map[string]string{
+		contract.EnvRunID: "native-one-shot", contract.EnvL3Endpoint: bridge.URL,
+		contract.EnvHandoffDir: "/operator-value-must-not-survive",
+	}
+	request.Execution.SensitiveEnv = map[string]string{contract.EnvRunToken: token}
+	started := 0
+	request.OCIStarted = func(_ context.Context, observation workloadrunner.OCIImageObservation) error {
+		started++
+		if observation.TopLevelDigest != echoDigest || observation.PlatformManifestDigest == "" {
+			return fmt.Errorf("one-shot image evidence = %+v", observation)
+		}
+		return nil
+	}
+	var logs []contract.LogEvent
+	result, err := adapter.Run(ctx, request, workloadrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
+		logs = append(logs, event)
+		return nil
+	}))
+	if err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+		t.Fatalf("native one-shot contract result=%+v err=%v", result.Outcome, err)
+	}
+	if started != 1 || bridgeCalls.Load() != 1 {
+		t.Fatalf("native one-shot started=%d bridge_calls=%d, want exactly one each", started, bridgeCalls.Load())
+	}
+	if !containsLog(logs, contract.LogStdout, "wefty-echo-once-stdout\n") ||
+		!containsLog(logs, contract.LogStderr, "wefty-echo-once-stderr\n") {
+		t.Fatalf("native one-shot streams = %+v", logs)
+	}
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: request.Authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("native one-shot cleanup receipt=%+v err=%v", receipt, err)
+	}
+
+	// Attempt cleanup retains the stable helper-owned handoff. A second attempt
+	// with the same owner must observe the exact marker bytes.
+	readMarker := nativeAdapterRequest(probeReference, probeDigest, "handoff-read", []string{
+		"/bin/sh", "-c", `test "$(cat /wefty/handoff/wefty-echo-once.txt)" = "wefty echo one-shot handoff"`,
+	})
+	readMarker.ManagedVolumes = []workloadrunner.ManagedVolume{volume}
+	readMarker.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+	if result, err := adapter.Run(ctx, readMarker, nil); err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+		t.Fatalf("retained handoff marker bytes result=%+v err=%v", result.Outcome, err)
+	}
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: readMarker.Authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("handoff read cleanup receipt=%+v err=%v", receipt, err)
+	}
+	if err := adapter.FinalizeManagedVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
+		Authority: request.Authority, Volumes: []workloadrunner.ManagedVolume{volume},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	absentMarker := nativeAdapterRequest(probeReference, probeDigest, "handoff-absent", []string{
+		"/bin/sh", "-c", `test ! -e /wefty/handoff/wefty-echo-once.txt`,
+	})
+	absentMarker.ManagedVolumes = []workloadrunner.ManagedVolume{volume}
+	absentMarker.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+	if result, err := adapter.Run(ctx, absentMarker, nil); err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 0 {
+		t.Fatalf("accepted-completion handoff deletion result=%+v err=%v", result.Outcome, err)
+	}
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: absentMarker.Authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("handoff absence cleanup receipt=%+v err=%v", receipt, err)
+	}
+
+	postStarted := nativeAdapterRequest(echoReference, echoDigest, "one-shot-post-started-loss", []string{
+		"/bin/sh", "-c", "/usr/local/bin/wefty-echo-service --once; sleep 60",
+	})
+	postStarted.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: "native-post-started-owner"}}
+	postStarted.Execution.Env = map[string]string{contract.EnvRunID: "native-one-shot-loss", contract.EnvL3Endpoint: bridge.URL}
+	postStarted.Execution.SensitiveEnv = map[string]string{contract.EnvRunToken: token}
+	postStarted.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
+		requestRootFault(t, "kill-shim")
+		return nil
+	}
+	postResult, postErr := adapter.Run(ctx, postStarted, nil)
+	if postErr != nil || postResult.Outcome.RuntimeFailure == nil || postResult.Outcome.RuntimeFailure.Code != contract.RuntimeFailureUnavailable {
+		t.Fatalf("echo post-Started loss result=%+v err=%v", postResult.Outcome, postErr)
+	}
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: postStarted.Authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("echo post-Started loss cleanup receipt=%+v err=%v", receipt, err)
+	}
+	return true
+}
+
+func exerciseOrdinaryL3OCIOneshot(
+	t *testing.T,
+	ctx context.Context,
+	barrier *ocihelper.BootBarrier,
+	adapter *ocirunner.Adapter,
+	echoReference, echoDigest, probeReference, probeDigest string,
+) {
+	t.Helper()
+	network := plain.NewNetwork()
+	controlFabric := network.NewFabric(fabric.Identity{NodeID: "native-control"})
+	ledgerFabric := network.NewFabric(fabric.Identity{NodeID: "native-ledger", Tags: []string{l1.DefaultClientPrincipalTag}})
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "native-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	callerFabric := network.NewFabric(fabric.Identity{NodeID: "native-caller", User: "realtiming@example.test", Tags: []string{l3.DefaultCallerPrincipalTag}})
+
+	l1Store, err := l1.OpenStore(filepath.Join(t.TempDir(), "ordinary-l1.sqlite"), l1.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l1Store.Close()
+	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
+		"native-node": l1.DefaultNodePolicy("linux"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l1Listener, err := controlFabric.Listen("tcp", l3.DefaultL1Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l3Store, err := l3.OpenStore(filepath.Join(t.TempDir(), "ordinary-l3.sqlite"), l3.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l3Store.Close()
+	l1Client, err := l3.NewL1Client(ledgerFabric, l3.DefaultL1Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l1Client.CloseIdleConnections()
+	reconciler, err := l3.NewReconciler(l3Store, l1Client, l3.ReconcilerConfig{Interval: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l3Server, err := l3.NewServer(ledgerFabric, l3Store, l3.ServerConfig{Reconciler: reconciler, Logs: l1Client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l3Listener, err := ledgerFabric.Listen("tcp", l3.DefaultL3Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runContext, cancelRun := context.WithCancel(ctx)
+	served := make(chan error, 2)
+	go func() { served <- l1Server.Serve(runContext, l1Listener) }()
+	go func() { served <- l3Server.Serve(runContext, l3Listener) }()
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := realOCIProbe{run: func(probeContext context.Context) error {
+		return adapter.Probe(probeContext, "native-node", "native-boot", probeReference, probeDigest, l1.DefaultLeaseDuration)
+	}}
+	nodeAgent, err := agent.New(agent.Config{
+		Fabric: agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
+		NodeID: "native-node", BootSessionID: "native-boot", Version: "realtiming", OS: "linux", Architecture: runtime.GOARCH,
+		Capabilities: map[string]bool{"kind:process": true}, CapabilityProbe: probe, OCIBootBarrier: barrier,
+		WorkloadRuntimes:  map[string]agent.WorkloadRuntime{contract.JobKindOCI: adapter},
+		HeartbeatInterval: time.Second, ClaimInterval: 25 * time.Millisecond, RenewalInterval: time.Second,
+		LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), ManagedRootDirectory: managedRoot,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentDone := make(chan error, 1)
+	go func() { agentDone <- nodeAgent.Run(runContext) }()
+
+	caller := &http.Client{Transport: &http.Transport{DialContext: func(dialContext context.Context, networkName, _ string) (net.Conn, error) {
+		return callerFabric.Dial(dialContext, networkName, l3.DefaultL3Address)
+	}}}
+	defer caller.CloseIdleConnections()
+	digest := echoDigest
+	create := l3.CreateRunRequest{
+		Image:  &contract.ImageProgram{Reference: echoReference, Digest: &digest, Argv: []string{"/usr/local/bin/wefty-echo-service", "--once"}},
+		Params: json.RawMessage(`{"lane":"native-linux"}`), Tags: []string{"linux"},
+	}
+	var accepted l3.RunAccepted
+	doNativeJSON(t, caller, http.MethodPost, "/v1/runs", create, http.Header{"Idempotency-Key": []string{"native-ordinary-oci"}}, http.StatusCreated, &accepted)
+	original := waitNativeRun(t, caller, accepted.RunID, contract.RunSucceeded)
+	if original.L1JobID == "" {
+		t.Fatalf("ordinary OCI run omitted L1 job identity: %+v", original)
+	}
+	assertNativeRunLogs(t, caller, accepted.RunID)
+
+	var rerun l3.RunAccepted
+	doNativeJSON(t, caller, http.MethodPost, "/v1/runs/"+accepted.RunID+"/rerun", nil,
+		http.Header{"Idempotency-Key": []string{"native-ordinary-oci-rerun"}}, http.StatusCreated, &rerun)
+	rerunRecord := waitNativeRun(t, caller, rerun.RunID, contract.RunSucceeded)
+	if rerunRecord.L1JobID == "" {
+		t.Fatalf("ordinary OCI rerun omitted L1 job identity: %+v", rerunRecord)
+	}
+	assertNativeRunLogs(t, caller, rerun.RunID)
+
+	cancelRun()
+	if err := <-agentDone; err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent.Close()
+	for range 2 {
+		if err := <-served; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+type realOCIProbe struct{ run func(context.Context) error }
+
+func (probe realOCIProbe) Probe(ctx context.Context) (agent.CapabilityProbeResult, error) {
+	if err := probe.run(ctx); err != nil {
+		return agent.CapabilityProbeResult{}, err
+	}
+	return agent.CapabilityProbeResult{Capabilities: map[string]bool{
+		"kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true,
+	}}, nil
+}
+
+func doNativeJSON(t *testing.T, client *http.Client, method, path string, input any, headers http.Header, wantStatus int, output any) {
+	t.Helper()
+	var body io.Reader
+	if input != nil {
+		payload, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body = bytes.NewReader(payload)
+	}
+	request, err := http.NewRequest(method, "http://wefty.invalid"+path, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	for name, values := range headers {
+		request.Header[name] = append([]string(nil), values...)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != wantStatus {
+		t.Fatalf("%s %s status=%d want=%d body=%s", method, path, response.StatusCode, wantStatus, payload)
+	}
+	if output != nil {
+		if err := json.Unmarshal(payload, output); err != nil {
+			t.Fatalf("decode %s %s: %v body=%s", method, path, err, payload)
+		}
+	}
+}
+
+func waitNativeRun(t *testing.T, client *http.Client, runID string, want contract.RunState) contract.RunRecord {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		var record contract.RunRecord
+		doNativeJSON(t, client, http.MethodGet, "/v1/runs/"+runID, nil, nil, http.StatusOK, &record)
+		if record.Status == want {
+			return record
+		}
+		if record.Status == contract.RunFailed {
+			t.Fatalf("run %s failed while waiting for %s", runID, want)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for run %s state %s", runID, want)
+	return contract.RunRecord{}
+}
+
+func assertNativeRunLogs(t *testing.T, client *http.Client, runID string) {
+	t.Helper()
+	var logs l1.LogPage
+	doNativeJSON(t, client, http.MethodGet, "/v1/runs/"+runID+"/logs", nil, nil, http.StatusOK, &logs)
+	var stdout, stderr int
+	for _, event := range logs.Events {
+		if event.Stream == contract.LogStdout && string(event.Bytes) == "wefty-echo-once-stdout\n" {
+			stdout++
+		}
+		if event.Stream == contract.LogStderr && string(event.Bytes) == "wefty-echo-once-stderr\n" {
+			stderr++
+		}
+	}
+	if stdout != 1 || stderr != 1 {
+		t.Fatalf("run %s echo execution markers = stdout %d stderr %d logs %+v", runID, stdout, stderr, logs.Events)
+	}
+}
+
+func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, reference, expectedDigest string, afterResolution, recoverRuntime func()) {
+	t.Helper()
+	const (
+		runID = "native-prestart-run"
+		token = "native-prestart-token"
+	)
+	var bridgeCalls atomic.Int32
+	bridge := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		bridgeCalls.Add(1)
+		if request.URL.Path != "/v1/runs/"+runID || request.Header.Get("Authorization") != "Bearer "+token {
+			response.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer bridge.Close()
 	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "native-prestart.sqlite"), l1.StoreOptions{
 		Jitter: func(time.Duration) time.Duration { return 10 * time.Millisecond },
 	})
@@ -497,7 +854,12 @@ func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapt
 	spec := contract.JobSpec{
 		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "native-prestart-requeue", Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
 		RuntimeHandler: ocihelper.DefaultRuntimeHandler,
-		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: reference}, Argv: []string{"/bin/true"}}},
+		Labels:         map[string]string{"run_id": runID},
+		Execution: contract.ExecutionSpec{
+			Env:          map[string]string{contract.EnvRunID: runID, contract.EnvL3Endpoint: bridge.URL},
+			SensitiveEnv: map[string]string{contract.EnvRunToken: token},
+			OCI:          &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: reference}, Argv: []string{"/usr/local/bin/wefty-echo-service", "--once"}},
+		},
 	}
 	job, _, err := store.CreateJob(ctx, spec)
 	if err != nil {
@@ -508,6 +870,7 @@ func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapt
 		t.Fatalf("initial realtiming claim unexpectedly pinned before resolution: %+v", first.Job.Spec.Execution.OCI.Image)
 	}
 	firstRequest := nativeL1AdapterRequest(first)
+	firstRequest.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: runID}}
 	firstRequest.OCIImageResolved = func(callbackContext context.Context, observation workloadrunner.OCIImageObservation) error {
 		if _, err := store.ObserveAttemptImage(callbackContext, "native-agent", job.JobID, first.Lease.AttemptID, nativeImageObservation(first.Lease.FencingToken, observation)); err != nil {
 			return err
@@ -521,17 +884,12 @@ func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapt
 	}
 	firstResult, firstRunErr := adapter.Run(ctx, firstRequest, nil)
 	requestRootFault(t, "start-containerd")
+	recoverRuntime()
 	if firstRunErr == nil || firstResult.Outcome.SpawnError == nil || firstResult.Outcome.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable {
 		t.Fatalf("pre-start engine loss = result %+v err %v", firstResult.Outcome, firstRunErr)
 	}
-	if err := barrier.Ensure(ctx); err != nil {
-		t.Fatalf("re-establish boot barrier after pre-start engine loss: %v", err)
-	}
-	if err := adapter.Probe(ctx, firstRequest.Authority.NodeID, firstRequest.Authority.BootSessionID, probeReference, probeDigest, l1.DefaultLeaseDuration); err != nil {
-		t.Fatalf("re-probe after pre-start engine loss: %v", err)
-	}
-	if sweep, ok := barrier.SweepReceipt(); !ok || sweep.SweepEpoch == "" || sweep.HelperSession.SessionGeneration == 0 {
-		t.Fatalf("pre-start recovery omitted verified sweep evidence: %+v", sweep)
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: firstRequest.Authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("pre-start cleanup = receipt %+v err %v", receipt, err)
 	}
 	requeued, err := store.CompleteAttempt(ctx, "native-agent", job.JobID, first.Lease.AttemptID, l1.CompletionRequest{
 		FencingToken: first.Lease.FencingToken, IdempotencyKey: "native-prestart-loss", Result: l1.ProcessResult(firstResult.Outcome),
@@ -557,6 +915,7 @@ func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapt
 		t.Fatalf("digest-pinned second claim = %+v", second)
 	}
 	secondRequest := nativeL1AdapterRequest(second)
+	secondRequest.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeHandoff, OwnerKey: runID}}
 	secondRequest.OCIImageResolved = func(callbackContext context.Context, observation workloadrunner.OCIImageObservation) error {
 		_, err := store.ObserveAttemptImage(callbackContext, "native-agent", job.JobID, second.Lease.AttemptID, nativeImageObservation(second.Lease.FencingToken, observation))
 		return err
@@ -580,6 +939,14 @@ func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapt
 	})
 	if err != nil || completed.State != contract.JobSucceeded {
 		t.Fatalf("retry completion = job %+v err %v", completed, err)
+	}
+	if bridgeCalls.Load() != 1 {
+		t.Fatalf("pre-Started retry echo bridge calls = %d, want one payload execution", bridgeCalls.Load())
+	}
+	if err := adapter.FinalizeManagedVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
+		Authority: secondRequest.Authority, Volumes: secondRequest.ManagedVolumes,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	attempts, err := store.ListJobAttempts(ctx, job.JobID)
 	if err != nil || len(attempts) != 2 || attempts[0].Image == nil || attempts[1].Image == nil ||

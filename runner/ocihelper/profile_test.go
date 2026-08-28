@@ -397,7 +397,7 @@ func TestWorkloadWireValidationRejectsEveryInvalidBranch(t *testing.T) {
 			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: "host_device"}}
 		}},
 		{name: "managed duplicate", mutate: func(input *WorkloadInput) {
-			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff}, {Kind: ManagedVolumeHandoff}}
+			input.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "run-1"}, {Kind: ManagedVolumeHandoff, OwnerKey: "run-1"}}
 		}},
 		{name: "mount source", mutate: func(input *WorkloadInput) {
 			input.OperatorMounts = []OperatorMount{{NodePath: "/", ContainerPath: "/data"}}
@@ -658,7 +658,7 @@ func goldenRuntimeSpecInput(t *testing.T, architecture string) RuntimeSpecInput 
 				{Name: "WEFTY_L3_ENDPOINT", Value: "http://127.0.0.1:41000"},
 				{Name: "WEFTY_RUN_TOKEN", Value: "authoritative-token"},
 			},
-			ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff}},
+			ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "run-fixture"}},
 			OperatorMounts: []OperatorMount{{NodePath: operatorSource, ContainerPath: "/workspace/input", ReadOnly: readOnly}},
 			Limits:         WorkloadLimits{MemoryBytes: 536870912, CPUMillicores: 750},
 		},

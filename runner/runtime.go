@@ -115,6 +115,19 @@ func (refusal *OCIObservationRefusal) Unwrap() error { return refusal.Err }
 // workload class or depend on host paths hidden behind the handle.
 type ManagedResources any
 
+// ManagedVolumeKind names an agent-owned lifecycle requirement without
+// exposing helper paths or runtime mechanics.
+type ManagedVolumeKind string
+
+const ManagedVolumeHandoff ManagedVolumeKind = "handoff"
+
+// ManagedVolume identifies durable runtime-managed state. OwnerKey is stable
+// across attempts and reruns and is opaque to the runtime.
+type ManagedVolume struct {
+	Kind     ManagedVolumeKind
+	OwnerKey string
+}
+
 // AttemptEndpoint is an adapter-owned, exact-authority service endpoint. Its
 // dial function never accepts an arbitrary address or port.
 type AttemptEndpoint struct {
@@ -133,6 +146,7 @@ type Request struct {
 	Execution        contract.ExecutionSpec
 	Limits           *contract.JobLimits
 	ManagedResources ManagedResources
+	ManagedVolumes   []ManagedVolume
 	LifetimeBoundary LifetimeBoundary
 	IdlePolicy       IdlePolicy
 	CompletionSignal <-chan struct{}
@@ -194,6 +208,7 @@ const (
 	ReapEvidenceNoRuntime         ReapEvidence = "no_runtime_resources"
 	ReapEvidencePriorBootGuardian ReapEvidence = "prior_boot_guardian"
 	ReapEvidencePriorBootOCISweep ReapEvidence = "prior_boot_oci_sweep"
+	ReapEvidenceOCIRuntimeSweep   ReapEvidence = "oci_runtime_sweep"
 )
 
 // ReapReceipt is positive evidence that runtime-owned workload state is gone.
@@ -223,6 +238,17 @@ type PriorBootReapRequest struct {
 // from the helper boot sweep.
 type PriorBootReaper interface {
 	ReapPriorBoot(context.Context, PriorBootReapRequest) (ReapReceipt, error)
+}
+
+// ManagedVolumeFinalizer deletes durable runtime-managed state only after the
+// agent has received authoritative acceptance of a successful completion.
+type ManagedVolumeFinalizer interface {
+	FinalizeManagedVolumes(context.Context, ManagedVolumeFinalizationRequest) error
+}
+
+type ManagedVolumeFinalizationRequest struct {
+	Authority AttemptAuthority
+	Volumes   []ManagedVolume
 }
 
 // OutputSink receives raw output events. Calls may be concurrent across
