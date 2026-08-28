@@ -28,13 +28,26 @@ jobs:
         os: [macos-15, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     env:
-      CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
       IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.CANDIDATE_SHA }}
+          ref: main
           persist-credentials: false
+      - name: Pin the trusted main identity
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISHED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          candidate_sha="$(git rev-parse HEAD)"
+          case "$candidate_sha" in
+            *[!0-9a-f]*|'') exit 64 ;;
+          esac
+          if [ "$EVENT_NAME" = workflow_run ]; then
+            test "$candidate_sha" = "$PUBLISHED_SHA"
+          fi
+          printf 'CANDIDATE_SHA=%s\n' "$candidate_sha" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
