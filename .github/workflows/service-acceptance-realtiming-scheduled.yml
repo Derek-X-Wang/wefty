@@ -1,19 +1,18 @@
-name: service-acceptance-realtiming
+name: service-acceptance-realtiming-scheduled
 
 # Evidence lane only: production clocks make this too slow for pull requests.
 # It is intentionally absent from contract-gate's all-tests-pass aggregation.
 on:
-  workflow_run:
-    workflows: [acceptance-image]
-    types: [completed]
-    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "47 7 * * 1"
 
 permissions:
   actions: read
   contents: read
 
 concurrency:
-  group: service-acceptance-realtiming-${{ github.ref }}
+  group: service-acceptance-realtiming-scheduled-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -68,11 +67,10 @@ jobs:
     env:
       IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
     steps:
-      - name: Check out the exact trusted publishing commit
-        if: github.event_name == 'workflow_run'
+      - name: Check out current trusted main for scheduled evidence
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: main
           persist-credentials: false
       - name: Download the triggering publication artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

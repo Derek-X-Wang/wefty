@@ -35,6 +35,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	build, buildBytes := readWorkflow(t, "../.github/workflows/acceptance-image-build.yml")
 	gate, gateBytes := readWorkflow(t, "../.github/workflows/contract-gate.yml")
 	realtiming, realtimingBytes := readWorkflow(t, "../.github/workflows/service-acceptance-realtiming.yml")
+	scheduled, scheduledBytes := readWorkflow(t, "../.github/workflows/service-acceptance-realtiming-scheduled.yml")
 
 	if _, ok := build.On["workflow_call"]; !ok {
 		t.Fatal("acceptance-image must expose the secretless required workflow_call lane")
@@ -42,7 +43,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if _, ok := image.On["push"]; !ok {
 		t.Fatal("acceptance-image must publish from push to main")
 	}
-	for _, workflow := range []workflowContract{image, build, gate, realtiming} {
+	for _, workflow := range []workflowContract{image, build, gate, realtiming, scheduled} {
 		if _, ok := workflow.On["pull_request_target"]; ok {
 			t.Fatal("acceptance workflows must never use pull_request_target")
 		}
@@ -98,6 +99,12 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if _, ok := realtiming.On["workflow_run"]; !ok {
 		t.Fatal("realtiming must be causally downstream of acceptance-image")
 	}
+	if _, ok := scheduled.On["schedule"]; !ok {
+		t.Fatal("scheduled realtiming must retain its evidence cadence")
+	}
+	if _, ok := scheduled.On["workflow_dispatch"]; !ok {
+		t.Fatal("scheduled realtiming must remain manually dispatchable")
+	}
 	realtimeText := string(realtimingBytes)
 	for _, required := range []string{"workflow_run.head_sha", "workflow_run.id", "actions/download-artifact@", "run-id:", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST"} {
 		if !strings.Contains(realtimeText, required) {
@@ -109,10 +116,22 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			t.Fatalf("realtiming reintroduced mutable consumption %q", forbidden)
 		}
 	}
-	for _, required := range []string{"if: github.event_name == 'workflow_run'", "ref: ${{ github.event.workflow_run.head_sha }}", "if: github.event_name != 'workflow_run'", "ref: main", "PUBLISHED_SHA"} {
+	for _, required := range []string{"if: github.event_name == 'workflow_run'", "ref: ${{ github.event.workflow_run.head_sha }}", "PUBLISHED_SHA"} {
 		if !strings.Contains(realtimeText, required) {
-			t.Fatalf("realtiming checkout trust split is missing %q", required)
+			t.Fatalf("workflow-run realtiming checkout is missing %q", required)
 		}
+	}
+	if strings.Contains(realtimeText, "ref: main") {
+		t.Fatal("workflow-run realtiming must check out the triggering main SHA directly")
+	}
+	scheduledText := string(scheduledBytes)
+	for _, required := range []string{"ref: main", "typed-skip: no successful acceptance-image publication exists", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST"} {
+		if !strings.Contains(scheduledText, required) {
+			t.Fatalf("scheduled realtiming is missing %q", required)
+		}
+	}
+	if strings.Contains(scheduledText, "ref: ${{ github.event.workflow_run.head_sha }}") {
+		t.Fatal("scheduled realtiming must not dynamically check out publication bytes")
 	}
 	for _, required := range []string{"$IMAGE_NAME@$index_digest", "--probe-reference \"$IMAGE_NAME\"", "bin/wefty", "wefty-acceptance-image-release.tar", "Public GHCR verification failed"} {
 		if !strings.Contains(string(imageBytes), required) {
