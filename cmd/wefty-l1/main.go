@@ -97,11 +97,32 @@ func run() error {
 		controlURL               = flag.String("control-url", os.Getenv("TS_CONTROL_URL"), "optional tsnet coordination URL")
 		ephemeral                = flag.Bool("ephemeral", false, "register an ephemeral tsnet node")
 		readyFile                = flag.String("ready-file", "", "write listener metadata after the server is ready")
+		initiateAdminBootstrap   = flag.Bool("initiate-admin-bootstrap", false, "create a short-lived local admin bootstrap challenge and exit")
 	)
 	flag.Var(nodeTagsFlag{policies: nodePolicies}, "node-tags", "authoritative routing tags as node-id=tag,tag (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies}, "node-max-oneshot-slots", "authoritative one-shot capacity as node-id=slots (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies, service: true}, "node-max-service-slots", "authoritative service capacity as node-id=slots (repeatable)")
 	flag.Parse()
+	storeOptions := l1.StoreOptions{
+		LeaseDuration:                *leaseDuration,
+		LateEvidenceWindow:           *lateEvidenceWindow,
+		PrestartInfrastructureBudget: *prestartBudget,
+		ServiceStabilityWindow:       *serviceStabilityWindow,
+		ServiceLogRetentionBytes:     *serviceLogRetentionBytes,
+		ServiceLogRetentionAge:       *serviceLogRetentionAge,
+	}
+	if *initiateAdminBootstrap {
+		store, err := l1.OpenStore(*databasePath, storeOptions)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		challenge, err := store.InitiateAdminBootstrap(context.Background())
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(challenge)
+	}
 
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           *fabricMode,
@@ -117,14 +138,7 @@ func run() error {
 		return err
 	}
 	defer closeFabric()
-	store, err := l1.OpenStore(*databasePath, l1.StoreOptions{
-		LeaseDuration:                *leaseDuration,
-		LateEvidenceWindow:           *lateEvidenceWindow,
-		PrestartInfrastructureBudget: *prestartBudget,
-		ServiceStabilityWindow:       *serviceStabilityWindow,
-		ServiceLogRetentionBytes:     *serviceLogRetentionBytes,
-		ServiceLogRetentionAge:       *serviceLogRetentionAge,
-	})
+	store, err := l1.OpenStore(*databasePath, storeOptions)
 	if err != nil {
 		return err
 	}

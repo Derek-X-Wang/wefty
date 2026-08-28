@@ -141,6 +141,45 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 	}
 }
 
+func TestL1ClientPublishesPersonAdminBootstrapSurface(t *testing.T) {
+	t.Parallel()
+
+	client := readObject(t, "l1-client.v1.json")
+	paths := object(t, client["paths"], "paths")
+	for _, path := range []string{
+		"/v1/admin-bootstrap",
+		"/v1/admin-policy",
+		"/v1/admin-policy/audit",
+		"/v1/admin-policy/admins/{user_id}",
+	} {
+		if _, present := paths[path]; !present {
+			t.Errorf("L1 client protocol is missing %s", path)
+		}
+	}
+
+	common := readObject(t, "common.v1.json")
+	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
+	policy := object(t, schemas["AdminPolicy"], "AdminPolicy")
+	required := stringSet(t, policy["required"])
+	if !required["revision"] || !required["admins"] {
+		t.Fatalf("AdminPolicy required fields = %#v", required)
+	}
+	adminPath := object(t, paths["/v1/admin-policy/admins/{user_id}"], "admin mutation path")
+	for _, method := range []string{"put", "delete"} {
+		operation := object(t, adminPath[method], method+" admin")
+		requestBody := object(t, operation["requestBody"], method+" request body")
+		content := object(t, requestBody["content"], method+" content")
+		media := object(t, content["application/json"], method+" media")
+		requestSchema := object(t, media["schema"], method+" request schema")
+		properties := object(t, requestSchema["properties"], method+" request properties")
+		for _, forbidden := range []string{"actor_user_id", "actor_device_id", "display_login"} {
+			if _, present := properties[forbidden]; present {
+				t.Errorf("%s admin request exposes forgeable %q", method, forbidden)
+			}
+		}
+	}
+}
+
 func TestL3ImageProgramPublishesJobSpecOCIConstraints(t *testing.T) {
 	t.Parallel()
 

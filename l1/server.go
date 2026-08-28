@@ -175,6 +175,7 @@ type principal int
 const (
 	clientPrincipal principal = iota
 	agentPrincipal
+	personPrincipal
 )
 
 type identityContextKey struct{}
@@ -222,6 +223,13 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-reset-acknowledgement", s.acknowledgeComputerStorageReset)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-retirement-acknowledgement", s.acknowledgeComputerStorageRetirement)
 
+	person := http.NewServeMux()
+	person.HandleFunc("POST /v1/admin-bootstrap", s.bootstrapAdmin)
+	person.HandleFunc("GET /v1/admin-policy", s.getAdminPolicy)
+	person.HandleFunc("GET /v1/admin-policy/audit", s.listAdminPolicyAudit)
+	person.HandleFunc("PUT /v1/admin-policy/admins/{user_id}", s.addAdmin)
+	person.HandleFunc("DELETE /v1/admin-policy/admins/{user_id}", s.removeAdmin)
+
 	root := http.NewServeMux()
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
 	root.Handle("/v1/jobs", s.authorize(clientPrincipal, client))
@@ -230,6 +238,9 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/computers/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes/", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/admin-bootstrap", s.authorize(personPrincipal, person))
+	root.Handle("/v1/admin-policy", s.authorize(personPrincipal, person))
+	root.Handle("/v1/admin-policy/", s.authorize(personPrincipal, person))
 	return root
 }
 
@@ -313,13 +324,20 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 			writeError(w, protocolError(contract.ErrorUnauthorized, "fabric identity could not be authenticated"))
 			return
 		}
-		tag := s.clientPrincipalTag
-		if principal == agentPrincipal {
-			tag = s.agentPrincipalTag
-		}
-		if !slices.Contains(NormalizeTags(identity.Tags), tag) {
-			writeError(w, protocolError(contract.ErrorPrincipalForbidden, "fabric identity is not authorized for this protocol"))
-			return
+		if principal == personPrincipal {
+			if err := validatePersonIdentity(identity); err != nil {
+				writeError(w, err)
+				return
+			}
+		} else {
+			tag := s.clientPrincipalTag
+			if principal == agentPrincipal {
+				tag = s.agentPrincipalTag
+			}
+			if !slices.Contains(NormalizeTags(identity.Tags), tag) {
+				writeError(w, protocolError(contract.ErrorPrincipalForbidden, "fabric identity is not authorized for this protocol"))
+				return
+			}
 		}
 		ctx := context.WithValue(r.Context(), identityContextKey{}, identity)
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -329,6 +347,74 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 func identityFromRequest(r *http.Request) fabric.Identity {
 	identity, _ := r.Context().Value(identityContextKey{}).(fabric.Identity)
 	return identity
+}
+
+func (s *Server) bootstrapAdmin(w http.ResponseWriter, r *http.Request) {
+	var request BootstrapAdminRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	policy, err := s.store.BootstrapAdmin(r.Context(), identityFromRequest(r), request.Nonce)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, policy)
+}
+
+func (s *Server) getAdminPolicy(w http.ResponseWriter, r *http.Request) {
+	policy, err := s.store.GetAdminPolicy(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, policy)
+}
+
+func (s *Server) listAdminPolicyAudit(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	page, err := s.store.ListAdminPolicyAudit(r.Context(), identityFromRequest(r),
+		r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) addAdmin(w http.ResponseWriter, r *http.Request) {
+	var request AdminPolicyMutationRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	policy, err := s.store.AddAdmin(r.Context(), identityFromRequest(r),
+		r.PathValue("user_id"), request.PolicyRevision)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, policy)
+}
+
+func (s *Server) removeAdmin(w http.ResponseWriter, r *http.Request) {
+	var request AdminPolicyMutationRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	policy, err := s.store.RemoveAdmin(r.Context(), identityFromRequest(r),
+		r.PathValue("user_id"), request.PolicyRevision)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, policy)
 }
 
 func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
@@ -951,9 +1037,10 @@ func writeError(w http.ResponseWriter, err error) {
 	switch code {
 	case contract.ErrorInvalidRequest:
 		status = http.StatusBadRequest
-	case contract.ErrorUnauthorized:
+	case contract.ErrorUnauthorized, contract.ErrorPersonIdentityRequired:
 		status = http.StatusUnauthorized
-	case contract.ErrorForbidden, contract.ErrorPrincipalForbidden, contract.ErrorIdentityBound, contract.ErrorAttemptNotOwned:
+	case contract.ErrorForbidden, contract.ErrorPrincipalForbidden, contract.ErrorIdentityBound, contract.ErrorAttemptNotOwned,
+		contract.ErrorAdminRequired, contract.ErrorAdminBootstrapInvalid:
 		status = http.StatusForbidden
 	case contract.ErrorNotFound, contract.ErrorAttemptNotFound:
 		status = http.StatusNotFound

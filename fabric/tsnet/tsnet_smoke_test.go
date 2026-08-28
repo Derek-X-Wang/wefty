@@ -69,8 +69,8 @@ func TestTSNetSmoke(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		if identity.NodeID == "" {
-			serverErr <- fmt.Errorf("WhoIs returned an empty node ID")
+		if identity.NodeID == "" || identity.UserID == "" || identity.DeviceID == "" {
+			serverErr <- fmt.Errorf("WhoIs returned incomplete node/person/device identity")
 			return
 		}
 		_, err = io.Copy(conn, conn)

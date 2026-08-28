@@ -203,7 +203,7 @@ type Provisioner interface {
 (Shape, not final signatures.)
 
 1. **Transport** — `Dial`/`Listen` wired into `http.Transport.DialContext` / `http.Server.Serve`. Implementations: `tsnet` (prod), `plain` (dev/localhost), future `actnel` relay.
-2. **Identity** — wefty-owned `Identity` type (node id, tags, user). tsnet's WhoIs response is translated at the boundary and discarded; no Tailscale types on the public surface. The network layer doubles as the authz layer for control-plane RPCs (tags checked, not API tokens).
+2. **Identity** — wefty-owned `Identity` type (node ID, opaque stable User ID, opaque stable Device ID, optional display data, and tags). tsnet's WhoIs response is translated at the boundary and discarded; login names and Tailscale types never become authority or cross the public surface. The network layer doubles as the authz layer for control-plane RPCs (tags checked, not API tokens), while person-policy routes require the distinct User/Device identity pair.
 3. **Naming** — wefty scheme (`wefty://control-plane`, `wefty://node/<id>`) resolved inside the implementation. MagicDNS/`svc:` names never escape the package; Tailscale's 10-Services cap stays an implementation detail.
 4. **Provisioning** — connectors enroll nodes via `Provision`/`Deprovision`, never the Tailscale HTTP API directly. tsnet impl: OAuth → ephemeral pre-authorized tagged authkey; `Deprovision` deletes the device.
 

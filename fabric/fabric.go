@@ -28,12 +28,18 @@ type Provisioner interface {
 	Deprovision(ctx context.Context, nodeID string) error
 }
 
-// Identity is authenticated by the Fabric implementation. Tags in this type,
-// never fields self-reported by a node registration request, drive claims.
+// Identity is authenticated by the Fabric implementation. UserID identifies
+// one person across devices, while DeviceID retains the peer device evidence.
+// Both are opaque Fabric-owned identifiers: callers must not parse them or
+// substitute display data for policy. Tags in this type, never fields
+// self-reported by a node registration request, drive protocol principals and
+// claims.
 type Identity struct {
-	NodeID string
-	User   string
-	Tags   []string
+	NodeID      string
+	UserID      string
+	DeviceID    string
+	DisplayName string
+	Tags        []string
 }
 
 type ProvisionSpec struct {

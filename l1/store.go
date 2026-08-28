@@ -43,6 +43,7 @@ type StoreOptions struct {
 	ServiceLogRetentionBytes     int64
 	ServiceLogRetentionAge       time.Duration
 	PrestartInfrastructureBudget time.Duration
+	AdminBootstrapTTL            time.Duration
 }
 
 // Store is the durable SQLite substrate for L1 queue operations.
@@ -58,6 +59,7 @@ type Store struct {
 	serviceLogRetentionBytes     int64
 	serviceLogRetentionAge       time.Duration
 	prestartInfrastructureBudget time.Duration
+	adminBootstrapTTL            time.Duration
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
@@ -116,6 +118,13 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if prestartInfrastructureBudget <= 0 {
 		prestartInfrastructureBudget = DefaultPrestartInfrastructureBudget
 	}
+	adminBootstrapTTL := options.AdminBootstrapTTL
+	if adminBootstrapTTL < 0 {
+		return nil, fmt.Errorf("l1: admin bootstrap TTL must be non-negative")
+	}
+	if adminBootstrapTTL == 0 {
+		adminBootstrapTTL = DefaultAdminBootstrapTTL
+	}
 
 	query := make(url.Values)
 	query.Add("_pragma", "busy_timeout(5000)")
@@ -133,6 +142,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
 		prestartInfrastructureBudget: prestartInfrastructureBudget,
+		adminBootstrapTTL:            adminBootstrapTTL,
 	}
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
@@ -329,6 +339,31 @@ CREATE TABLE IF NOT EXISTS computer_storage_resets (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_reset_active
 	  ON computer_storage_resets(computer_id) WHERE status NOT IN ('retired', 'superseded');
+CREATE TABLE IF NOT EXISTS admin_policy (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  revision INTEGER NOT NULL CHECK(revision >= 0),
+  updated_ns INTEGER NOT NULL CHECK(updated_ns >= 0)
+);
+INSERT OR IGNORE INTO admin_policy(singleton, revision, updated_ns) VALUES(1, 0, 0);
+CREATE TABLE IF NOT EXISTS admins (
+  user_id TEXT PRIMARY KEY,
+  added_revision INTEGER NOT NULL CHECK(added_revision > 0),
+  added_ns INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS admin_policy_audit (
+  revision INTEGER PRIMARY KEY CHECK(revision > 0),
+  operation TEXT NOT NULL CHECK(operation IN ('bootstrap', 'add', 'remove')),
+  actor_user_id TEXT NOT NULL,
+  actor_device_id TEXT NOT NULL,
+  subject_user_id TEXT NOT NULL,
+  created_ns INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS admin_bootstrap_challenges (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  nonce_hash TEXT NOT NULL UNIQUE,
+  created_ns INTEGER NOT NULL,
+  expires_ns INTEGER NOT NULL CHECK(expires_ns > created_ns)
+);
 CREATE TABLE IF NOT EXISTS service_restart_requests (
   job_id TEXT NOT NULL REFERENCES service_jobs(job_id) ON DELETE CASCADE,
   idempotency_key TEXT NOT NULL,

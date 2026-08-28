@@ -104,7 +104,7 @@ func newIntegrationHarnessWithL1Options(t *testing.T, l1Options l1.StoreOptions)
 		callerUser: "alice@example.test", cancel: cancel,
 	}
 	h.served = append(h.served, serveL1(ctx, l1Server, l1Listener), serveL3(ctx, l3Server, l3Listener))
-	h.caller = h.client(fabric.Identity{NodeID: "caller", User: h.callerUser, Tags: []string{DefaultCallerPrincipalTag}}, DefaultL3Address)
+	h.caller = h.client(fabric.Identity{NodeID: "caller", UserID: h.callerUser, Tags: []string{DefaultCallerPrincipalTag}}, DefaultL3Address)
 	t.Cleanup(func() {
 		for _, client := range h.clients {
 			client.CloseIdleConnections()

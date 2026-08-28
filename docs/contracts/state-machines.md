@@ -175,6 +175,32 @@ reacquired Slot atomically, advances `applied_revision`, and returns to
 semantics. Retired and staging projections are absent from the active service
 collection but remain addressable evidence.
 
+### Person identity and administrator policy
+
+Fabric WhoIs projects opaque stable `UserID` and `DeviceID` into wefty-owned
+types. Administrator membership is keyed only by `UserID`, so a login or
+display-name change cannot alter authority and two devices for one person share
+membership while retaining distinct device evidence. No display value, network
+hostname, or device ID is accepted as a person-policy key.
+
+The admin policy begins at revision zero with no administrators. The first
+administrator can be installed only by consuming a short-lived challenge that
+was initiated through local access to the L1 database; there is no network
+initiation route. The challenge is stored hashed, replacement invalidates the
+prior challenge, expiry denies redemption, and the first successful redemption
+permanently closes bootstrap. Fabric WhoIs supplies both the actor UserID and
+DeviceID at redemption; request data cannot supply either.
+
+Every later add or remove requires a current administrator and the exact
+observed policy revision. A stale revision, nonadministrator caller, missing
+member, duplicate member, or attempted final-admin removal changes no row.
+Each accepted bootstrap/add/remove advances the policy revision exactly once
+and commits the membership change plus one immutable audit row in the same
+transaction. Audit retains revision, operation, actor UserID, actor DeviceID,
+subject UserID, and L1 time; current membership remains bounded and person
+based. Per-Computer grants, Node distribution, endpoint admission, live
+revocation, and control arbitration are separate later contracts.
+
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:
 

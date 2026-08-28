@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -129,13 +130,16 @@ func (f *Fabric) localClient() (*local.Client, error) {
 }
 
 func identityFromWhoIs(who *apitype.WhoIsResponse) (fabric.Identity, error) {
-	if who == nil || who.Node == nil || who.UserProfile == nil {
+	if who == nil || who.Node == nil || who.UserProfile == nil ||
+		who.Node.StableID == "" || who.UserProfile.ID == 0 {
 		return fabric.Identity{}, errors.New("tsnet fabric: WhoIs returned an incomplete identity")
 	}
 	return fabric.Identity{
-		NodeID: string(who.Node.StableID),
-		User:   who.UserProfile.LoginName,
-		Tags:   append([]string(nil), who.Node.Tags...),
+		NodeID:      string(who.Node.StableID),
+		UserID:      strconv.FormatInt(int64(who.UserProfile.ID), 10),
+		DeviceID:    string(who.Node.StableID),
+		DisplayName: who.UserProfile.DisplayName,
+		Tags:        append([]string(nil), who.Node.Tags...),
 	}, nil
 }
 

@@ -57,7 +57,11 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 			"verification_receipt_json", "verification_receipt_hash", "acknowledgement_key", "acknowledgement_hash",
 			"requested_ns", "verified_ns", "published_ns",
 		},
-		"service_restart_requests": {"job_id", "idempotency_key", "request_hash", "created_ns"},
+		"admin_policy":               {"singleton", "revision", "updated_ns"},
+		"admins":                     {"user_id", "added_revision", "added_ns"},
+		"admin_policy_audit":         {"revision", "operation", "actor_user_id", "actor_device_id", "subject_user_id", "created_ns"},
+		"admin_bootstrap_challenges": {"singleton", "nonce_hash", "created_ns", "expires_ns"},
+		"service_restart_requests":   {"job_id", "idempotency_key", "request_hash", "created_ns"},
 		"service_log_truncations": {
 			"job_id", "bound_kind", "evicted_event_count", "evicted_byte_count",
 			"evicted_through_ordinal", "earliest_retained_ns", "updated_ns",
@@ -202,6 +206,27 @@ func TestStoreConfiguresLateEvidenceWindowIndependently(t *testing.T) {
 	defer store.Close()
 	if store.lateEvidenceWindow != 6*time.Hour {
 		t.Fatalf("late evidence window = %s, want 6h", store.lateEvidenceWindow)
+	}
+}
+
+func TestStoreConfiguresBoundedAdminBootstrapTTL(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "admin-bootstrap.sqlite"), StoreOptions{
+		AdminBootstrapTTL: 2 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.adminBootstrapTTL != 2*time.Minute {
+		t.Fatalf("admin bootstrap TTL = %s, want 2m", store.adminBootstrapTTL)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if store, err := OpenStore(filepath.Join(t.TempDir(), "invalid-admin-bootstrap.sqlite"), StoreOptions{
+		AdminBootstrapTTL: -time.Second,
+	}); err == nil {
+		store.Close()
+		t.Fatal("OpenStore accepted negative admin bootstrap TTL")
 	}
 }
 
