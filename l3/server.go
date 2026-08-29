@@ -812,7 +812,7 @@ func writeRunAccepted(w http.ResponseWriter, record contract.RunRecord, replayed
 	status := http.StatusCreated
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, status, RunAccepted{
 		RunID: record.RunID, StatusURL: "/v1/runs/" + record.RunID,
@@ -856,7 +856,7 @@ func writeProtocolAppend(w http.ResponseWriter, value any, replayed bool) {
 	status := http.StatusCreated
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, status, value)
 }

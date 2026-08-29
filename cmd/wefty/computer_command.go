@@ -18,8 +18,6 @@ import (
 const (
 	defaultComputerMemoryBytes int64 = 1 << 30
 	defaultComputerDiskBytes   int64 = 8 << 30
-	computerTmpfsCeilingBytes  int64 = 1600 << 20
-	computerUsage                    = "usage: wefty computers create|list|get|start|stop|restart|remove|reimage|reset|grow|abort"
 )
 
 type computerEvidenceCell struct {
@@ -29,10 +27,9 @@ type computerEvidenceCell struct {
 }
 
 type computerCapacityProjection struct {
-	RequestedMemoryBytes      int64                `json:"requested_memory_bytes"`
-	RequestedDiskBytes        int64                `json:"requested_disk_bytes"`
-	ComputerTmpfsCeilingBytes int64                `json:"computer_tmpfs_ceiling_bytes"`
-	Admission                 computerEvidenceCell `json:"admission"`
+	RequestedMemoryBytes *int64               `json:"requested_memory_bytes,omitempty"`
+	RequestedDiskBytes   int64                `json:"requested_disk_bytes"`
+	Admission            computerEvidenceCell `json:"admission"`
 }
 
 type computerOperatorProjection struct {
@@ -43,22 +40,17 @@ type computerOperatorProjection struct {
 	IdempotentReplay *bool                      `json:"idempotent_replay,omitempty"`
 }
 
-type computerListProjection struct {
-	Computers  []computerOperatorProjection `json:"computers"`
-	NextCursor string                       `json:"next_cursor,omitempty"`
-}
-
 func newComputerProjection(computer l1.Computer, mutationApplied, replay *bool) computerOperatorProjection {
-	memoryBytes := int64(0)
+	var memoryBytes *int64
 	if oci := computer.CurrentJob.Spec.Execution.OCI; oci != nil && oci.Limits != nil && oci.Limits.MemoryBytes != nil {
-		memoryBytes = *oci.Limits.MemoryBytes
+		value := *oci.Limits.MemoryBytes
+		memoryBytes = &value
 	}
 	return computerOperatorProjection{
 		Computer: computer,
 		Capacity: computerCapacityProjection{
-			RequestedMemoryBytes:      memoryBytes,
-			RequestedDiskBytes:        computer.DesiredDiskBytes,
-			ComputerTmpfsCeilingBytes: computerTmpfsCeilingBytes,
+			RequestedMemoryBytes: memoryBytes,
+			RequestedDiskBytes:   computer.DesiredDiskBytes,
 			Admission: computerEvidenceCell{Status: "NOT-RUN", Code: "admission_receipt_not_projected",
 				Reason: "the current L1 Computer route does not retain helper-local admission receipts"},
 		},
@@ -68,42 +60,8 @@ func newComputerProjection(computer l1.Computer, mutationApplied, replay *bool) 
 	}
 }
 
-func executeComputers(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	if len(args) == 0 {
-		return usageError(computerUsage)
-	}
-	switch args[0] {
-	case "submission":
-		return executeComputerSubmission(ctx, clients, jsonOutput, args, stdout, stderr)
-	case "create":
-		return executeComputerCreate(ctx, clients, jsonOutput, args[1:], stdout, stderr)
-	case "list":
-		return executeComputerList(ctx, clients, jsonOutput, args[1:], stdout, stderr)
-	case "get":
-		return executeComputerGet(ctx, clients, jsonOutput, args[1:], stdout)
-	case "start":
-		return executeComputerDesiredState(ctx, clients, jsonOutput, args[1:], stdout, stderr, contract.ServiceDesiredRunning)
-	case "stop":
-		return executeComputerDesiredState(ctx, clients, jsonOutput, args[1:], stdout, stderr, contract.ServiceDesiredStopped)
-	case "restart":
-		return executeComputerRestart(ctx, clients, jsonOutput, args[1:], stdout, stderr)
-	case "remove":
-		return executeComputerRemove(ctx, clients, jsonOutput, args[1:], stdout, stderr)
-	case "reimage":
-		return executeComputerReimage(ctx, clients, jsonOutput, args[1:], stdout, stderr)
-	case "reset":
-		return executeComputerReset(ctx, clients, jsonOutput, args[1:], stdout, stderr)
-	case "grow":
-		return executeComputerGrow(ctx, clients, jsonOutput, args[1:], stdout, stderr)
-	case "abort":
-		return executeComputerAbort(ctx, clients, jsonOutput, args[1:], stdout, stderr)
-	default:
-		return usageError(fmt.Sprintf("unknown computers command %q", args[0]))
-	}
-}
-
 func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("computers create", flag.ContinueOnError)
+	flags := flag.NewFlagSet("services create", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var name, idempotencyKey string
 	var backupCap int64
@@ -118,7 +76,7 @@ func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput 
 		return err
 	}
 	if flags.NArg() != 0 || strings.TrimSpace(name) == "" || strings.TrimSpace(imageFlags.reference) == "" || strings.TrimSpace(imageFlags.nodeID) == "" || backupCap < 0 {
-		return usageError("usage: wefty computers create --name NAME --image IMAGE --node NODE_ID [--memory-bytes BYTES] [--disk-bytes BYTES] [--backup-cap COUNT] [--idempotency-key KEY]")
+		return usageError("usage: wefty services create --computer --name NAME --image IMAGE --node NODE_ID [--memory-bytes BYTES] [--disk-bytes BYTES] [--backup-cap COUNT] [--idempotency-key KEY]")
 	}
 	if !imageFlags.memoryBytes.set {
 		imageFlags.memoryBytes = optionalInt64Flag{value: defaultComputerMemoryBytes, set: true}
@@ -133,7 +91,7 @@ func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput 
 		return err
 	}
 	if program == nil {
-		return usageError("computers create requires --image")
+		return usageError("services create requires --image")
 	}
 	if program.Digest == nil {
 		resolver := clients.images
@@ -174,52 +132,13 @@ func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput 
 			}, DiskBytes: diskBytes.value},
 		}},
 	}
-	computer, replayed, err := clients.createComputer(ctx, l1.CreateComputerRequest{
+	computer, receipt, err := clients.createComputer(ctx, l1.CreateComputerRequest{
 		Name: strings.TrimSpace(name), Spec: spec, BackupCap: &backupCap,
 	})
 	if err != nil {
 		return err
 	}
-	applied := !replayed
-	return writeComputerProjection(stdout, newComputerProjection(computer, &applied, &replayed), jsonOutput)
-}
-
-func executeComputerList(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("computers list", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	var cursor string
-	var limit int
-	flags.StringVar(&cursor, "cursor", "", "opaque cursor from the previous page")
-	flags.IntVar(&limit, "limit", l1.DefaultJobPageLimit, "Computers per page")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 || limit < 1 || limit > l1.MaxJobPageLimit {
-		return usageError(fmt.Sprintf("usage: wefty computers list [--limit 1..%d] [--cursor CURSOR]", l1.MaxJobPageLimit))
-	}
-	page, err := clients.listComputers(ctx, cursor, limit)
-	if err != nil {
-		return err
-	}
-	output := computerListProjection{Computers: make([]computerOperatorProjection, 0, len(page.Computers)), NextCursor: page.NextCursor}
-	for _, computer := range page.Computers {
-		output.Computers = append(output.Computers, newComputerProjection(computer, nil, nil))
-	}
-	if jsonOutput {
-		return writeJSON(stdout, output)
-	}
-	return writeComputersTable(stdout, output.Computers)
-}
-
-func executeComputerGet(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
-	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
-		return usageError("usage: wefty computers get COMPUTER_ID")
-	}
-	computer, err := clients.getComputer(ctx, args[0])
-	if err != nil {
-		return err
-	}
-	return writeComputerProjection(stdout, newComputerProjection(computer, nil, nil), jsonOutput)
+	return writeComputerMutation(stdout, computer, receipt, jsonOutput)
 }
 
 type computerMutationFlags struct {
@@ -262,9 +181,8 @@ func (mutation *computerMutationFlags) bind(flags *flag.FlagSet, keyed bool) {
 }
 
 func (mutation computerMutationFlags) resolve(ctx context.Context, clients *apiClients, computerID string) (l1.ComputerMutationPrecondition, error) {
-	explicit := mutation.intentRevision.set || strings.TrimSpace(mutation.storageID) != "" || mutation.storageGeneration.set
-	if mutation.expectCurrent && explicit {
-		return l1.ComputerMutationPrecondition{}, usageError("--expect-current cannot be combined with explicit CAS flags")
+	if err := mutation.validate(false); err != nil {
+		return l1.ComputerMutationPrecondition{}, err
 	}
 	if mutation.expectCurrent {
 		computer, err := clients.getComputer(ctx, computerID)
@@ -274,11 +192,23 @@ func (mutation computerMutationFlags) resolve(ctx context.Context, clients *apiC
 		return l1.ComputerMutationPrecondition{IntentRevision: computer.IntentRevision,
 			StorageID: computer.StorageID, StorageGeneration: computer.StorageGeneration}, nil
 	}
-	if !mutation.intentRevision.set || strings.TrimSpace(mutation.storageID) == "" || !mutation.storageGeneration.set {
-		return l1.ComputerMutationPrecondition{}, usageError("mutation requires --intent-revision, --storage-id, and --storage-generation, or explicit --expect-current")
-	}
 	return l1.ComputerMutationPrecondition{IntentRevision: mutation.intentRevision.value,
 		StorageID: strings.TrimSpace(mutation.storageID), StorageGeneration: mutation.storageGeneration.value}, nil
+}
+
+func (mutation computerMutationFlags) validate(keyed bool) error {
+	explicit := mutation.intentRevision.set || strings.TrimSpace(mutation.storageID) != "" || mutation.storageGeneration.set
+	if mutation.expectCurrent && explicit {
+		return usageError("--expect-current cannot be combined with explicit CAS flags")
+	}
+	if !mutation.expectCurrent && (!mutation.intentRevision.set || strings.TrimSpace(mutation.storageID) == "" || !mutation.storageGeneration.set) {
+		return usageError("mutation requires --intent-revision, --storage-id, and --storage-generation, or explicit --expect-current")
+	}
+	if keyed {
+		_, err := mutation.key()
+		return err
+	}
+	return nil
 }
 
 func (mutation computerMutationFlags) key() (string, error) {
@@ -288,93 +218,24 @@ func (mutation computerMutationFlags) key() (string, error) {
 	return validateIdempotencyKey(mutation.idempotencyKey)
 }
 
-func writeComputerMutation(stdout io.Writer, computer l1.Computer, observedRevision int64, replayed bool, jsonOutput bool) error {
-	applied := !replayed && computer.IntentRevision > observedRevision
-	return writeComputerProjection(stdout, newComputerProjection(computer, &applied, &replayed), jsonOutput)
+func resolveComputerID(ctx context.Context, clients *apiClients, target string) (string, error) {
+	_, computer, err := resolveServiceTarget(ctx, clients, target)
+	if err != nil {
+		return "", err
+	}
+	if computer == nil {
+		return "", usageError(fmt.Sprintf("service %q is not Computer-owned", target))
+	}
+	return computer.ComputerID, nil
 }
 
-func executeComputerDesiredState(ctx context.Context, clients *apiClients, jsonOutput bool, args []string,
-	stdout, stderr io.Writer, desired contract.ServiceDesiredState,
-) error {
-	args = moveFirstPositionalToEnd(args)
-	flags := flag.NewFlagSet("computers "+string(desired), flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	var mutation computerMutationFlags
-	mutation.bind(flags, false)
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" {
-		return usageError("usage: wefty computers start|stop COMPUTER_ID --intent-revision REV --storage-id ID --storage-generation GENERATION [--expect-current]")
-	}
-	precondition, err := mutation.resolve(ctx, clients, flags.Arg(0))
-	if err != nil {
-		return err
-	}
-	computer, err := clients.setComputerDesiredState(ctx, flags.Arg(0), l1.ComputerDesiredStateRequest{
-		ComputerMutationPrecondition: precondition, DesiredState: desired,
-	})
-	if err != nil {
-		return err
-	}
-	return writeComputerMutation(stdout, computer, precondition.IntentRevision, false, jsonOutput)
-}
-
-func executeComputerRestart(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	args = moveFirstPositionalToEnd(args)
-	flags := flag.NewFlagSet("computers restart", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	var mutation computerMutationFlags
-	mutation.bind(flags, true)
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 1 {
-		return usageError("usage: wefty computers restart COMPUTER_ID --idempotency-key KEY [CAS flags | --expect-current]")
-	}
-	precondition, err := mutation.resolve(ctx, clients, flags.Arg(0))
-	if err != nil {
-		return err
-	}
-	key, err := mutation.key()
-	if err != nil {
-		return err
-	}
-	computer, replayed, err := clients.restartComputer(ctx, flags.Arg(0), l1.ComputerRestartRequest{
-		ComputerMutationPrecondition: precondition, IdempotencyKey: key,
-	})
-	if err != nil {
-		return err
-	}
-	return writeComputerMutation(stdout, computer, precondition.IntentRevision, replayed, jsonOutput)
-}
-
-func executeComputerRemove(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	args = moveFirstPositionalToEnd(args)
-	flags := flag.NewFlagSet("computers remove", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	var mutation computerMutationFlags
-	mutation.bind(flags, false)
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 1 {
-		return usageError("usage: wefty computers remove COMPUTER_ID [CAS flags | --expect-current]")
-	}
-	precondition, err := mutation.resolve(ctx, clients, flags.Arg(0))
-	if err != nil {
-		return err
-	}
-	computer, err := clients.removeComputer(ctx, flags.Arg(0), l1.ComputerRemoveRequest{ComputerMutationPrecondition: precondition})
-	if err != nil {
-		return err
-	}
-	return writeComputerMutation(stdout, computer, precondition.IntentRevision, false, jsonOutput)
+func writeComputerMutation(stdout io.Writer, computer l1.Computer, receipt mutationReceipt, jsonOutput bool) error {
+	return writeComputerProjection(stdout, newComputerProjection(computer, &receipt.Applied, &receipt.Replay), jsonOutput)
 }
 
 func executeComputerReimage(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
-	flags := flag.NewFlagSet("computers reimage", flag.ContinueOnError)
+	flags := flag.NewFlagSet("services reimage", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var mutation computerMutationFlags
 	var image string
@@ -387,9 +248,16 @@ func executeComputerReimage(ctx context.Context, clients *apiClients, jsonOutput
 		return err
 	}
 	if flags.NArg() != 1 || strings.TrimSpace(image) == "" {
-		return usageError("usage: wefty computers reimage COMPUTER_ID --image IMAGE --idempotency-key KEY [CAS flags | --expect-current]")
+		return usageError("usage: wefty services reimage COMPUTER_ID --image IMAGE --idempotency-key KEY [CAS flags | --expect-current]")
 	}
-	precondition, err := mutation.resolve(ctx, clients, flags.Arg(0))
+	if err := mutation.validate(true); err != nil {
+		return err
+	}
+	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	precondition, err := mutation.resolve(ctx, clients, computerID)
 	if err != nil {
 		return err
 	}
@@ -412,7 +280,7 @@ func executeComputerReimage(ctx context.Context, clients *apiClients, jsonOutput
 		}
 		digest = &resolved
 	}
-	computer, replayed, err := clients.reimageComputer(ctx, flags.Arg(0), l1.ComputerReimageRequest{
+	computer, receipt, err := clients.reimageComputer(ctx, computerID, l1.ComputerReimageRequest{
 		ComputerMutationPrecondition: precondition,
 		Image:                        contract.OCIImageSpec{Reference: reference, Digest: digest}, Chown: chown,
 		TerminateSessions: terminateSessions, IdempotencyKey: key,
@@ -420,12 +288,12 @@ func executeComputerReimage(ctx context.Context, clients *apiClients, jsonOutput
 	if err != nil {
 		return err
 	}
-	return writeComputerMutation(stdout, computer, precondition.IntentRevision, replayed, jsonOutput)
+	return writeComputerMutation(stdout, computer, receipt, jsonOutput)
 }
 
 func executeComputerReset(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
-	flags := flag.NewFlagSet("computers reset", flag.ContinueOnError)
+	flags := flag.NewFlagSet("services reset", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var mutation computerMutationFlags
 	var terminateSessions bool
@@ -435,9 +303,16 @@ func executeComputerReset(ctx context.Context, clients *apiClients, jsonOutput b
 		return err
 	}
 	if flags.NArg() != 1 {
-		return usageError("usage: wefty computers reset COMPUTER_ID --idempotency-key KEY [CAS flags | --expect-current]")
+		return usageError("usage: wefty services reset COMPUTER_ID --idempotency-key KEY [CAS flags | --expect-current]")
 	}
-	precondition, err := mutation.resolve(ctx, clients, flags.Arg(0))
+	if err := mutation.validate(true); err != nil {
+		return err
+	}
+	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	precondition, err := mutation.resolve(ctx, clients, computerID)
 	if err != nil {
 		return err
 	}
@@ -445,18 +320,18 @@ func executeComputerReset(ctx context.Context, clients *apiClients, jsonOutput b
 	if err != nil {
 		return err
 	}
-	computer, replayed, err := clients.resetComputer(ctx, flags.Arg(0), l1.ComputerStorageResetRequest{
+	computer, receipt, err := clients.resetComputer(ctx, computerID, l1.ComputerStorageResetRequest{
 		ComputerMutationPrecondition: precondition, IdempotencyKey: key, TerminateSessions: terminateSessions,
 	})
 	if err != nil {
 		return err
 	}
-	return writeComputerMutation(stdout, computer, precondition.IntentRevision, replayed, jsonOutput)
+	return writeComputerMutation(stdout, computer, receipt, jsonOutput)
 }
 
-func executeComputerGrow(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
+func executeComputerResize(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
-	flags := flag.NewFlagSet("computers grow", flag.ContinueOnError)
+	flags := flag.NewFlagSet("services resize", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var mutation computerMutationFlags
 	var diskBytes optionalInt64Flag
@@ -466,9 +341,16 @@ func executeComputerGrow(ctx context.Context, clients *apiClients, jsonOutput bo
 		return err
 	}
 	if flags.NArg() != 1 || !diskBytes.set {
-		return usageError("usage: wefty computers grow COMPUTER_ID --disk-bytes BYTES --idempotency-key KEY [CAS flags | --expect-current]")
+		return usageError("usage: wefty services resize COMPUTER_ID --disk-bytes BYTES --idempotency-key KEY [CAS flags | --expect-current]")
 	}
-	precondition, err := mutation.resolve(ctx, clients, flags.Arg(0))
+	if err := mutation.validate(true); err != nil {
+		return err
+	}
+	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	precondition, err := mutation.resolve(ctx, clients, computerID)
 	if err != nil {
 		return err
 	}
@@ -476,18 +358,18 @@ func executeComputerGrow(ctx context.Context, clients *apiClients, jsonOutput bo
 	if err != nil {
 		return err
 	}
-	computer, replayed, err := clients.growComputer(ctx, flags.Arg(0), l1.ComputerGrowRequest{
+	computer, receipt, err := clients.growComputer(ctx, computerID, l1.ComputerGrowRequest{
 		ComputerMutationPrecondition: precondition, DiskBytes: diskBytes.value, IdempotencyKey: key,
 	})
 	if err != nil {
 		return err
 	}
-	return writeComputerMutation(stdout, computer, precondition.IntentRevision, replayed, jsonOutput)
+	return writeComputerMutation(stdout, computer, receipt, jsonOutput)
 }
 
 func executeComputerAbort(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
-	flags := flag.NewFlagSet("computers abort", flag.ContinueOnError)
+	flags := flag.NewFlagSet("services abort", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var mutation computerMutationFlags
 	mutation.bind(flags, true)
@@ -495,9 +377,16 @@ func executeComputerAbort(ctx context.Context, clients *apiClients, jsonOutput b
 		return err
 	}
 	if flags.NArg() != 1 {
-		return usageError("usage: wefty computers abort COMPUTER_ID --idempotency-key KEY [CAS flags | --expect-current]")
+		return usageError("usage: wefty services abort COMPUTER_ID --idempotency-key KEY [CAS flags | --expect-current]")
 	}
-	precondition, err := mutation.resolve(ctx, clients, flags.Arg(0))
+	if err := mutation.validate(true); err != nil {
+		return err
+	}
+	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	precondition, err := mutation.resolve(ctx, clients, computerID)
 	if err != nil {
 		return err
 	}
@@ -505,13 +394,13 @@ func executeComputerAbort(ctx context.Context, clients *apiClients, jsonOutput b
 	if err != nil {
 		return err
 	}
-	computer, replayed, err := clients.abortComputer(ctx, flags.Arg(0), l1.ComputerReconfigurationAbortRequest{
+	computer, receipt, err := clients.abortComputer(ctx, computerID, l1.ComputerReconfigurationAbortRequest{
 		ComputerMutationPrecondition: precondition, IdempotencyKey: key,
 	})
 	if err != nil {
 		return err
 	}
-	return writeComputerMutation(stdout, computer, precondition.IntentRevision, replayed, jsonOutput)
+	return writeComputerMutation(stdout, computer, receipt, jsonOutput)
 }
 
 func writeComputerProjection(writer io.Writer, computer computerOperatorProjection, jsonOutput bool) error {
@@ -523,17 +412,17 @@ func writeComputerProjection(writer io.Writer, computer computerOperatorProjecti
 
 func writeComputersTable(writer io.Writer, computers []computerOperatorProjection) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "COMPUTER ID\tNAME\tDESIRED\tOBSERVED\tSTORAGE\tINTENT/APPLIED\tPHASE\tJOB ID\tATTEMPT\tNODE\tMEMORY\tDISK\tBACKUP CAP\tREADY\tDISPLAY ENDPOINT\tCONTROLLER TENURE\tLAST FAILURE\tREMOVAL\tMUTATION APPLIED\tIDEMPOTENT REPLAY"); err != nil {
+	if _, err := fmt.Fprintln(table, "COMPUTER ID\tNAME\tDESIRED\tOBSERVED\tSTORAGE\tINTENT/APPLIED\tPHASE\tJOB ID\tATTEMPT\tNODE\tMEMORY\tDISK\tBACKUP CAP\tADMISSION\tREADY\tDISPLAY ENDPOINT\tCONTROLLER TENURE\tLAST FAILURE\tREMOVAL\tMUTATION APPLIED\tIDEMPOTENT REPLAY"); err != nil {
 		return err
 	}
 	for _, computer := range computers {
 		job := computer.CurrentJob
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			computer.ComputerID, computer.Name, computer.DesiredState, job.State,
 			computer.StorageID, computer.StorageGeneration, computer.IntentRevision, computer.AppliedRevision,
 			computer.ReconfigurationPhase, computer.CurrentJobID, valueOrNA(job.CurrentAttemptID),
-			valueOrNA(computer.BoundNodeID), computer.Capacity.RequestedMemoryBytes, computer.Capacity.RequestedDiskBytes, computer.BackupCap,
-			boolOrNA(job.Ready), pointerOrNA(computer.DisplayEndpoint, ""),
+			valueOrNA(computer.BoundNodeID), int64PointerOrNA(computer.Capacity.RequestedMemoryBytes), computer.Capacity.RequestedDiskBytes, computer.BackupCap,
+			computer.Capacity.Admission.Status+"("+computer.Capacity.Admission.Code+")", boolOrNA(job.Ready), pointerOrNA(computer.DisplayEndpoint, ""),
 			computer.ControllerTenure.Status+"("+computer.ControllerTenure.Code+")",
 			jsonOrNA(job.LastFailure), valueOrNA(computer.RemovalOutcome), boolPointerOrNA(computer.MutationApplied),
 			boolPointerOrNA(computer.IdempotentReplay)); err != nil {
@@ -541,6 +430,13 @@ func writeComputersTable(writer io.Writer, computers []computerOperatorProjectio
 		}
 	}
 	return table.Flush()
+}
+
+func int64PointerOrNA(value *int64) string {
+	if value == nil {
+		return "N/A"
+	}
+	return strconv.FormatInt(*value, 10)
 }
 
 func boolPointerOrNA(value *bool) string {

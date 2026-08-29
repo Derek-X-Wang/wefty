@@ -770,7 +770,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusCreated
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	job, err = s.store.projectJob(r.Context(), job)
 	if err != nil {
@@ -795,9 +795,17 @@ func (s *Server) createComputer(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusCreated
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
+	writeComputerMutationHeaders(w, !replayed, replayed)
 	writeJSON(w, status, redactComputer(computer))
+}
+
+func writeComputerMutationHeaders(w http.ResponseWriter, applied, replayed bool) {
+	w.Header().Set("Mutation-Applied", strconv.FormatBool(applied))
+	if replayed {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
 }
 
 func (s *Server) getComputer(w http.ResponseWriter, r *http.Request) {
@@ -859,6 +867,7 @@ func (s *Server) setComputerDesiredState(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
+	writeComputerMutationHeaders(w, computer.IntentRevision > request.IntentRevision, false)
 	writeJSON(w, http.StatusAccepted, redactComputer(computer))
 }
 
@@ -898,8 +907,9 @@ func (s *Server) restartComputer(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
+	writeComputerMutationHeaders(w, !replayed, replayed)
 	writeJSON(w, status, redactComputer(computer))
 }
 
@@ -924,8 +934,9 @@ func (s *Server) resetComputerStorage(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
+	writeComputerMutationHeaders(w, !replayed, replayed)
 	writeJSON(w, status, redactComputer(computer))
 }
 
@@ -944,8 +955,9 @@ func (s *Server) growComputer(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
+	writeComputerMutationHeaders(w, !replayed, replayed)
 	writeJSON(w, status, redactComputer(computer))
 }
 
@@ -964,8 +976,9 @@ func (s *Server) abortComputerReconfiguration(w http.ResponseWriter, r *http.Req
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
+	writeComputerMutationHeaders(w, !replayed, replayed)
 	writeJSON(w, status, redactComputer(computer))
 }
 
@@ -993,7 +1006,7 @@ func (s *Server) createComputerBackup(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, status, redactComputer(computer))
 }
@@ -1023,7 +1036,7 @@ func (s *Server) pruneComputerBackup(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, status, backup)
 }
@@ -1044,7 +1057,7 @@ func (s *Server) restoreComputerBackup(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, status, redactComputer(computer))
 }
@@ -1066,7 +1079,7 @@ func (s *Server) cloneComputerBackup(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, status, redactComputer(computer))
 }
@@ -1087,7 +1100,7 @@ func (s *Server) exportComputerBackup(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, status, export)
 }
@@ -1131,7 +1144,7 @@ func (s *Server) importComputerCustody(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, status, operation)
 }
@@ -1174,8 +1187,9 @@ func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
+	writeComputerMutationHeaders(w, !replayed && computer.IntentRevision > request.IntentRevision, replayed)
 	writeJSON(w, status, redactComputer(computer))
 }
 
@@ -1195,6 +1209,7 @@ func (s *Server) removeComputer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	writeComputerMutationHeaders(w, computer.IntentRevision > request.IntentRevision, false)
 	writeJSON(w, http.StatusAccepted, redactComputer(computer))
 }
 
@@ -1323,7 +1338,7 @@ func (s *Server) restartService(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, status, redactJob(job))
 }

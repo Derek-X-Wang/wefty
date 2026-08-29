@@ -63,10 +63,11 @@ func (systemClock) Now() time.Time { return time.Now() }
 
 // Job is the L1 HTTP representation of a job.
 type Job struct {
-	JobID  string            `json:"job_id"`
-	NodeID string            `json:"node_id,omitempty"`
-	State  contract.JobState `json:"state"`
-	Status string            `json:"status,omitempty"`
+	JobID      string            `json:"job_id"`
+	ComputerID string            `json:"computer_id,omitempty"`
+	NodeID     string            `json:"node_id,omitempty"`
+	State      contract.JobState `json:"state"`
+	Status     string            `json:"status,omitempty"`
 	// Spec is absent once removal has finalized because tombstones deliberately
 	// retain no executable or environment bytes.
 	Spec                contract.JobSpec `json:"spec,omitzero"`

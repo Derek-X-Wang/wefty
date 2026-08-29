@@ -88,6 +88,28 @@ The helper-owned, guest-native `/wefty/service` storage that belongs to one
 service-class job.
 _Avoid_: working directory, bind mount, container writable layer, shared volume
 
+**Storage generation**:
+One immutable allocation generation of a Computer's durable Storage identity.
+Exactly one generation is current; reset may temporarily add one staging
+generation and retains retired generations until verified deletion.
+_Avoid_: disk version, volume revision, Lineage
+
+**Backup**:
+An immutable logical cold-copy record for one exact Storage generation. It
+survives explicit pruning of its physical copy and records `encryption=none`
+until a later encryption contract exists.
+_Avoid_: snapshot, image, archive, Lineage
+
+**Backup copy**:
+One helper-owned physical realization of a Backup, bound to its Node and
+managed-root instance. V1 permits exactly one live source-node copy.
+_Avoid_: replica when only the V1 source copy exists, Lineage
+
+**Storage provenance**:
+The immutable origin record connecting a Backup to the exact source Storage
+identity and generation from which it was created.
+_Avoid_: Lineage, ancestry, parent disk
+
 ### Placement and movement
 
 **Movable**:

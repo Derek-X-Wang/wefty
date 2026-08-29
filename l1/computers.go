@@ -576,7 +576,12 @@ func (s *Store) ListComputers(ctx context.Context, cursorValue string, limit int
 	if err != nil {
 		return ComputerList{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT computer_id, created_ns FROM computers
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ComputerList{}, internalError(err, "begin Computer list snapshot")
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT computer_id, created_ns FROM computers
 		WHERE created_ns>? OR (created_ns=? AND computer_id>?)
 		ORDER BY created_ns, computer_id LIMIT ?`, cursor.CreatedNS, cursor.CreatedNS, cursor.ComputerID, limit+1)
 	if err != nil {
@@ -598,6 +603,9 @@ func (s *Store) ListComputers(ctx context.Context, cursorValue string, limit int
 	if err := rows.Err(); err != nil {
 		return ComputerList{}, internalError(err, "iterate Computer IDs")
 	}
+	if err := rows.Close(); err != nil {
+		return ComputerList{}, internalError(err, "close Computer list page")
+	}
 
 	page := ComputerList{Computers: []Computer{}}
 	hasMore := len(listed) > limit
@@ -605,7 +613,7 @@ func (s *Store) ListComputers(ctx context.Context, cursorValue string, limit int
 		listed = listed[:limit]
 	}
 	for _, item := range listed {
-		computer, err := s.GetComputer(ctx, item.computerID)
+		computer, err := readComputerAuthority(ctx, tx, item.computerID, s.clock.Now().UTC())
 		if err != nil {
 			return ComputerList{}, err
 		}
@@ -614,6 +622,9 @@ func (s *Store) ListComputers(ctx context.Context, cursorValue string, limit int
 	if hasMore && len(listed) > 0 {
 		last := listed[len(listed)-1]
 		page.NextCursor = encodeComputerCursor(computerCursor{CreatedNS: last.createdNS, ComputerID: last.computerID})
+	}
+	if err := tx.Commit(); err != nil {
+		return ComputerList{}, internalError(err, "commit Computer list snapshot")
 	}
 	return page, nil
 }

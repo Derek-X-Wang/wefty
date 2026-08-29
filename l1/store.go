@@ -352,6 +352,7 @@ CREATE TABLE IF NOT EXISTS computers (
   updated_ns INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS computers_binding ON computers(bound_node_id, desired_state);
+CREATE INDEX IF NOT EXISTS computers_created_id ON computers(created_ns, computer_id);
 CREATE TABLE IF NOT EXISTS computer_submission_audit (
   audit_id TEXT PRIMARY KEY,
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
@@ -3678,6 +3679,7 @@ func getJobByDispatchKey(ctx context.Context, q queryer, dispatchKey string, now
 	var failureReason sql.NullString
 	var serviceColumns serviceJobColumns
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
+COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id), ''),
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
 state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash, prestart_terminal_reason,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
@@ -3702,7 +3704,7 @@ CASE
 END
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql.Named("dispatch_key", dispatchKey)).Scan(append([]any{
-		&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash, &failureReason,
+		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash, &failureReason,
 	}, serviceColumns.scanDestinations()...)...)
 	if err != nil {
 		return Job{}, "", err
@@ -3729,6 +3731,7 @@ func getJobByID(ctx context.Context, q queryer, jobID string, now time.Time) (Jo
 	var failureReason sql.NullString
 	var serviceColumns serviceJobColumns
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
+COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id), ''),
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
 state, spec_json, current_attempt_id, created_ns, updated_ns, prestart_terminal_reason,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
@@ -3753,7 +3756,7 @@ CASE
 END
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_id", jobID)).Scan(append([]any{
-		&job.JobID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &failureReason,
+		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &specJSON, &currentAttempt, &createdNS, &updatedNS, &failureReason,
 	}, serviceColumns.scanDestinations()...)...)
 	if err != nil {
 		return Job{}, err

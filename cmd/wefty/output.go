@@ -169,16 +169,29 @@ func writeServiceList(writer io.Writer, page l1.JobList, jsonOutput bool) error 
 	if jsonOutput {
 		return writeJSON(writer, serviceListOutput{Jobs: services, NextCursor: page.NextCursor})
 	}
-	return writeServicesTable(writer, services)
+	if err := writeServicesTable(writer, services); err != nil {
+		return err
+	}
+	if page.NextCursor != "" {
+		_, err := fmt.Fprintf(writer, "NEXT CURSOR\t%s\n", page.NextCursor)
+		return err
+	}
+	return nil
 }
 
 func writeServicesTable(writer io.Writer, services []serviceOutput) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "JOB ID\tSTATE\tSTATUS\tDESIRED\tBOUND NODE\tNODE STATE\tATTEMPT\tHOLDS SLOT\tREADY\tPORT\tRESTART STREAK\tNEXT RESTART\tRESTART SUPPRESSED\tLAST FAILURE\tCREATED\tUPDATED\tMANAGED DATA\tWORKING DIRECTORY"); err != nil {
+	if _, err := fmt.Fprintln(table, "KIND\tCOMPUTER ID\tJOB ID\tSTATE\tSTATUS\tDESIRED\tBOUND NODE\tNODE STATE\tATTEMPT\tHOLDS SLOT\tREADY\tPORT\tRESTART STREAK\tNEXT RESTART\tRESTART SUPPRESSED\tLAST FAILURE\tCREATED\tUPDATED\tMANAGED DATA\tWORKING DIRECTORY"); err != nil {
 		return err
 	}
 	for _, service := range services {
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%t\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		kind := "service"
+		if service.ComputerID != "" {
+			kind = "Computer"
+		}
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%t\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			kind,
+			valueOrNA(service.ComputerID),
 			service.JobID,
 			service.State,
 			service.Status,

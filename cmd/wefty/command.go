@@ -30,8 +30,6 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 		return executeNodes(ctx, clients, jsonOutput, args[1:], stdout)
 	case "services":
 		return executeServices(ctx, clients, jsonOutput, args[1:], stdout, stderr)
-	case "computers":
-		return executeComputers(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "runs":
 		return executeRuns(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "submit":

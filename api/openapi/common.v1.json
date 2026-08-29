@@ -56,6 +56,7 @@
         "required": ["job_id", "state", "created_at", "updated_at"],
         "properties": {
           "job_id": { "type": "string" },
+          "computer_id": { "type": "string", "description": "Durable Computer authority owning this immutable Job projection, when present." },
           "node_id": { "type": "string", "description": "Stable node ID for the current or latest attempt. This is not the durable service binding." },
           "state": {
             "enum": ["queued", "claimed", "running", "stopping", "stopped", "awaiting-input", "succeeded", "failed", "removal_pending", "agent_cleaned", "removed_verified", "forgotten_cleanup_unverified"]

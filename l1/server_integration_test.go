@@ -722,8 +722,8 @@ func TestDispatchKeyIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, headers, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
-	if status != http.StatusOK || headers.Get("Idempotency-Replayed") != "true" {
-		t.Fatalf("replay status/header = %d/%q body=%s", status, headers.Get("Idempotency-Replayed"), body)
+	if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" {
+		t.Fatalf("replay status/header = %d/%q body=%s", status, headers.Get("Idempotent-Replay"), body)
 	}
 	var replay Job
 	if err := json.Unmarshal(body, &replay); err != nil {
