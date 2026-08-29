@@ -795,6 +795,7 @@ CREATE TABLE IF NOT EXISTS computer_takeover_audit (
   policy_revision INTEGER NOT NULL CHECK(policy_revision >= 0),
   authority_generation INTEGER NOT NULL CHECK(authority_generation >= 0),
   occurred_ns INTEGER NOT NULL,
+  stored_ns INTEGER NOT NULL,
   reason TEXT NOT NULL,
   event_count INTEGER NOT NULL CHECK(event_count >= 0),
   request_hash TEXT NOT NULL,
@@ -868,6 +869,16 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
 		return err
+	}
+	if err := s.ensureColumn(ctx, "computer_takeover_audit", "stored_ns", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE computer_takeover_audit SET stored_ns=occurred_ns WHERE stored_ns=0`); err != nil {
+		return fmt.Errorf("l1: backfill Computer take-over storage time: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS computer_takeover_audit_computer_stored
+		ON computer_takeover_audit(computer_id, stored_ns)`); err != nil {
+		return fmt.Errorf("l1: ensure Computer take-over stored-order index: %w", err)
 	}
 	if err := s.ensureColumn(ctx, "computers", "backup_cap", "INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0)"); err != nil {
 		return err

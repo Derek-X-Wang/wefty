@@ -110,7 +110,6 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 			t.Errorf("L1 client protocol is missing %s", path)
 		}
 	}
-
 	common := readObject(t, "common.v1.json")
 	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
 	computer := object(t, schemas["Computer"], "Computer")
@@ -202,10 +201,29 @@ func TestL1ClientPublishesPersonAdminBootstrapSurface(t *testing.T) {
 		"/v1/admin-policy",
 		"/v1/admin-policy/audit",
 		"/v1/admin-policy/admins/{user_id}",
+		"/v1/computers/{computer_id}/grants",
+		"/v1/computers/{computer_id}/grants/{user_id}",
+		"/v1/computers/{computer_id}/takeover",
+		"/v1/computers/{computer_id}/takeover/sessions",
+		"/v1/computers/{computer_id}/takeover/audit",
 	} {
 		if _, present := paths[path]; !present {
 			t.Errorf("L1 client protocol is missing %s", path)
 		}
+	}
+	takeoverAudit := object(t, paths["/v1/computers/{computer_id}/takeover/audit"], "takeover audit path")
+	parameters, ok := takeoverAudit["parameters"].([]any)
+	if !ok {
+		t.Fatalf("takeover audit parameters = %#v", takeoverAudit["parameters"])
+	}
+	parameterNames := map[string]bool{}
+	for _, value := range parameters {
+		parameter := object(t, value, "takeover audit parameter")
+		name, _ := parameter["name"].(string)
+		parameterNames[name] = true
+	}
+	if !parameterNames["tail"] {
+		t.Fatal("takeover audit protocol is missing tail")
 	}
 
 	common := readObject(t, "common.v1.json")

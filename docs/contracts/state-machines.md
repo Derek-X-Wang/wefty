@@ -439,6 +439,28 @@ so unauthenticated peers cannot synchronously saturate L1. Audit rows never
 cascade with attempt or Job retention and have their own 90-day default
 retention sweep, independent from attempt-summary retention.
 
+The person-authenticated operator surface projects those same rows without
+inventing a second session store. Audit pages are chronological and
+cursor-bounded. The active-session projection replays `session_open` through
+`session_close` and Controller-tenure events in durable insertion order, so
+equal injected timestamps cannot reverse causality; it names at most one
+observed controller. An `open_without_close` row is explicitly audit evidence,
+not live socket authority, because close upload finalization follows the
+observable socket boundary and can briefly lag it. The projection never returns the session control bearer, attempt fence,
+front-door endpoint, or a raw backend address. Both projections require a
+current administrator.
+
+The CLI's L1 discovery route returns durable availability only, never a live
+admission role; that URL always attempts view-first admission at the agent's
+current evaluator. `takeover view --session-token-file FILE` opens that live
+WebSocket and atomically retains its opaque bearer plus private dial endpoint
+in an owner-readable file. The CLI reads that file, sends the bearer only to
+the fixed sideband path on the same front door and same Fabric identity, and
+never prints or persists its contents itself. The sideband remains the
+authority: a copied file from another person, device, ended session, or
+Computer fails closed, and neither a CLI flag nor URL selects the control
+backend directly.
+
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:
 

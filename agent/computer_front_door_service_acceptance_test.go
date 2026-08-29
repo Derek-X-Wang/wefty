@@ -16,7 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/coder/websocket"
 )
@@ -177,8 +179,9 @@ func TestServiceAcceptanceControllerTenureRealProcessAuthorityLoss(t *testing.T)
 	if _, banner, err := connection.Read(t.Context()); err != nil || string(banner) != "RFB 003.008\n" {
 		t.Fatalf("real-process Controller banner = %q err=%v", banner, err)
 	}
-	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusNoContent {
-		t.Fatalf("real-process take status = %d", status)
+	if _, err := takeover.Perform(t.Context(), directTakeoverFabric{},
+		"ws"+server.URL[len("http"):]+contract.ComputerDisplayWebSocketPath, token, "take"); err != nil {
+		t.Fatalf("real-process CLI take adapter: %v", err)
 	}
 	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("real input")); err != nil {
 		t.Fatal(err)

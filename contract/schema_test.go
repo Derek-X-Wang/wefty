@@ -424,6 +424,8 @@ func TestComputerImageContractVocabularyIsExact(t *testing.T) {
 
 	if ComputerDisplayEndpointView != "view" || ComputerDisplayEndpointControl != "control" ||
 		ComputerDisplayWebSocketPath != "/websockify" || ComputerDisplayWebSocketSubprotocol != "binary" ||
+		ComputerControlTakePath != "/wefty/control/take" || ComputerControlReleasePath != "/wefty/control/release" ||
+		ComputerControlTokenHeader != "X-Wefty-Control-Token" ||
 		ComputerRFBVersionBannerBytes != 12 || ComputerStartupReadinessTimeout != 60*time.Second ||
 		ComputerDevShmBytes != 1<<30 {
 		t.Fatal("Computer image contract vocabulary drifted")
@@ -509,6 +511,15 @@ func TestJobClassSchemaIsOpen(t *testing.T) {
 	}
 	if _, closed := class["const"]; closed {
 		t.Fatal("job class must not use a JSON Schema const")
+	}
+}
+
+func TestComputerControlErrorCodesAreSharedProtocolConstants(t *testing.T) {
+	t.Parallel()
+	if ErrorControllerBusy != "controller_busy" || ErrorControllerAlreadyHeld != "controller_already_held" ||
+		ErrorControlNotAuthorized != "control_not_authorized" || ErrorTakeoverSessionEnded != "takeover_session_ended" {
+		t.Fatalf("Computer control error vocabulary drifted: busy=%q held=%q unauthorized=%q ended=%q",
+			ErrorControllerBusy, ErrorControllerAlreadyHeld, ErrorControlNotAuthorized, ErrorTakeoverSessionEnded)
 	}
 }
 

@@ -44,6 +44,9 @@ const (
 	ComputerDisplayEndpointControl            = "control"
 	ComputerDisplayWebSocketPath              = "/websockify"
 	ComputerDisplayWebSocketSubprotocol       = "binary"
+	ComputerControlTakePath                   = "/wefty/control/take"
+	ComputerControlReleasePath                = "/wefty/control/release"
+	ComputerControlTokenHeader                = "X-Wefty-Control-Token"
 	ComputerRFBVersionBannerBytes             = 12
 	ComputerStartupReadinessTimeout           = 60 * time.Second
 	ComputerDevShmBytes                 int64 = 1 << 30
@@ -52,6 +55,28 @@ const (
 	// consumes node-local handoff files from an earlier execution.
 	StableNodeTagPrefix = "wefty:node:"
 )
+
+type ComputerControlTenureState string
+
+const (
+	ComputerControlTenureFree ComputerControlTenureState = "free"
+	ComputerControlTenureHeld ComputerControlTenureState = "held"
+)
+
+// ComputerControlReceipt is the front door's authoritative result for one
+// session-bound take or release. It contains tenure facts only, never the
+// session capability or either guest backend.
+type ComputerControlReceipt struct {
+	ComputerID                 string                     `json:"computer_id"`
+	Action                     string                     `json:"action"`
+	HolderSessionID            string                     `json:"holder_session_id,omitempty"`
+	AdmittedMode               string                     `json:"admitted_mode"`
+	TenureState                ComputerControlTenureState `json:"tenure_state"`
+	PolicyRevision             int64                      `json:"policy_revision"`
+	OverrideDisplacedSessionID string                     `json:"override_displaced_session_id,omitempty"`
+	HumanDriving               bool                       `json:"human_driving"`
+	SignalStayedTrue           bool                       `json:"signal_stayed_true"`
+}
 
 var ociReservedEnvironmentNames = [...]string{
 	EnvHandoffDir,

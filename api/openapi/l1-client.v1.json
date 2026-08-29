@@ -613,6 +613,61 @@
         }
       }
     },
+    "/v1/computers/{computer_id}/takeover/sessions": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+      ],
+      "get": {
+        "operationId": "listComputerTakeoverSessions",
+        "summary": "List open-without-close session evidence",
+        "description": "Current administrators only. The projection is derived from immutable session and Controller-tenure evidence, can briefly lag socket close finalization, and contains no session capability or backend address.",
+        "responses": {
+          "200": { "description": "Take-over sessions with open-without-close evidence.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerTakeoverSessionList" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/takeover": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+      ],
+      "get": {
+        "operationId": "getComputerTakeoverAccess",
+        "summary": "Discover person-authorized view-first Computer admission",
+        "description": "Returns the authenticated person/device, server-derived role, policy revision, and authorized front door. It never returns a session bearer or raw backend address, and no URL or option selects control.",
+        "responses": {
+          "200": { "description": "View-first admission projection; display_endpoint is null until ready.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerTakeoverAccess" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/takeover/audit": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
+        { "name": "tail", "in": "query", "schema": { "type": "boolean", "default": false }, "description": "Return the newest bounded events in chronological display order; mutually exclusive with cursor." }
+      ],
+      "get": {
+        "operationId": "listComputerTakeoverAudit",
+        "summary": "Page immutable Computer take-over evidence",
+        "description": "Current administrators only. Events retain person/device, policy revision, admitted mode, Controller tenure, time, and closed reason without credentials, endpoints, display content, input data, or fencing material.",
+        "responses": {
+          "200": { "description": "Chronological take-over audit page or newest bounded tail.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerTakeoverAuditList" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/computers/{computer_id}/revocations/{policy_revision}": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },

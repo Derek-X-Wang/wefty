@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/coder/websocket"
@@ -107,23 +108,40 @@ func (tenure *controllerTenure) Unregister(sessionID string) {
 }
 
 func (tenure *controllerTenure) Take(ctx context.Context, sessionID string) (net.Conn, error) {
+	connection, _, err := tenure.take(ctx, sessionID)
+	return connection, err
+}
+
+func (tenure *controllerTenure) TakeReceipt(ctx context.Context, sessionID string) (contract.ComputerControlReceipt, error) {
+	_, displacedSessionID, err := tenure.take(ctx, sessionID)
+	receipt := tenure.receipt(sessionID)
+	receipt.OverrideDisplacedSessionID = displacedSessionID
+	receipt.SignalStayedTrue = err == nil && displacedSessionID != ""
+	return receipt, err
+}
+
+func (tenure *controllerTenure) take(ctx context.Context, sessionID string) (net.Conn, string, error) {
 	session, prior, serial, operation, operationContext, err := tenure.beginTake(ctx, sessionID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer operation.cancel()
 
 	override := prior != nil
+	displacedSessionID := ""
+	if prior != nil {
+		displacedSessionID = prior.session.id
+	}
 	signalTrue := override
 	if override {
 		tenure.detachControl(prior)
 		if err := tenure.record(prior.session, prior.serial, l1.ComputerTakeoverControlReleased, l1.ComputerTakeoverControllerOverridden); err != nil {
-			return nil, tenure.failTake(operation, session, serial, override, signalTrue, false, err)
+			return nil, displacedSessionID, tenure.failTake(operation, session, serial, override, signalTrue, false, err)
 		}
 	} else {
 		if err := tenure.config.setControlState(operationContext, true); err != nil {
 			tenure.finishOperation(operation, nil)
-			return nil, &ComputerTenureError{Code: ComputerTenureUnavailable, Err: fmt.Errorf("set driver signal true: %w", err)}
+			return nil, "", &ComputerTenureError{Code: ComputerTenureUnavailable, Err: fmt.Errorf("set driver signal true: %w", err)}
 		}
 		signalTrue = true
 	}
@@ -134,7 +152,7 @@ func (tenure *controllerTenure) Take(ctx context.Context, sessionID string) (net
 	)
 	cancelDial()
 	if dialErr != nil {
-		return nil, tenure.failTake(operation, session, serial, override, signalTrue, true,
+		return nil, displacedSessionID, tenure.failTake(operation, session, serial, override, signalTrue, true,
 			fmt.Errorf("dial Computer control backend: %w", dialErr))
 	}
 	managed := newControllerConn(connection, websocketConnection, tenure, sessionID)
@@ -142,25 +160,25 @@ func (tenure *controllerTenure) Take(ctx context.Context, sessionID string) (net
 	if override {
 		if err := tenure.record(session, serial, l1.ComputerTakeoverAdminOverrode, ""); err != nil {
 			managed.closeAndWait()
-			return nil, tenure.failTake(operation, session, serial, true, signalTrue, false, err)
+			return nil, displacedSessionID, tenure.failTake(operation, session, serial, true, signalTrue, false, err)
 		}
 	}
 	if err := tenure.record(session, serial, l1.ComputerTakeoverControlAcquired, ""); err != nil {
 		managed.closeAndWait()
-		return nil, tenure.failTake(operation, session, serial, override, signalTrue, false, err)
+		return nil, displacedSessionID, tenure.failTake(operation, session, serial, override, signalTrue, false, err)
 	}
 	if session.relay != nil {
 		if err := session.relay.activateControl(managed); err != nil {
 			managed.closeAndWait()
-			return nil, tenure.failTake(operation, session, serial, override, signalTrue, false, err)
+			return nil, displacedSessionID, tenure.failTake(operation, session, serial, override, signalTrue, false, err)
 		}
 	}
 	if !tenure.finishOperation(operation, &controllerHolder{session: session, serial: serial, conn: managed}) {
 		tenure.detachControl(&controllerHolder{session: session, serial: serial, conn: managed})
-		return nil, tenure.failTake(operation, session, serial, override, signalTrue, false,
+		return nil, displacedSessionID, tenure.failTake(operation, session, serial, override, signalTrue, false,
 			&ComputerTenureError{Code: ComputerTenureSessionEnded})
 	}
-	return managed, nil
+	return managed, displacedSessionID, nil
 }
 
 func (tenure *controllerTenure) beginTake(
@@ -263,6 +281,37 @@ func (tenure *controllerTenure) Release(ctx context.Context, sessionID string, r
 		cancel()
 		return errors.Join(auditErr, clearErr)
 	}
+}
+
+func (tenure *controllerTenure) ReleaseReceipt(
+	ctx context.Context,
+	sessionID string,
+	reason l1.ComputerTakeoverReason,
+) (contract.ComputerControlReceipt, error) {
+	err := tenure.Release(ctx, sessionID, reason)
+	return tenure.receipt(sessionID), err
+}
+
+func (tenure *controllerTenure) receipt(sessionID string) contract.ComputerControlReceipt {
+	tenure.mu.Lock()
+	defer tenure.mu.Unlock()
+	receipt := contract.ComputerControlReceipt{
+		AdmittedMode: string(l1.ComputerAdmittedView),
+		TenureState:  contract.ComputerControlTenureFree,
+	}
+	if session, ok := tenure.live[sessionID]; ok {
+		receipt.PolicyRevision = session.event.PolicyRevision
+	}
+	if tenure.held == nil {
+		return receipt
+	}
+	receipt.HolderSessionID = tenure.held.session.id
+	receipt.TenureState = contract.ComputerControlTenureHeld
+	receipt.HumanDriving = true
+	if tenure.held.session.id == sessionID {
+		receipt.AdmittedMode = string(l1.ComputerAdmittedController)
+	}
+	return receipt
 }
 
 func (tenure *controllerTenure) releaseAfterBackendFailure(sessionID string) {

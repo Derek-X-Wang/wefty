@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -69,6 +70,7 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 		func() ComputerTakeoverAuditEvent {
 			value := event
 			value.EventID, value.Kind, value.AdmittedMode = "session-1:control:1:acquired", ComputerTakeoverControlAcquired, ComputerAdmittedController
+			value.OccurredAt = value.OccurredAt.Add(-10 * time.Minute)
 			return value
 		}(),
 		func() ComputerTakeoverAuditEvent {
@@ -91,6 +93,47 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 			t.Fatalf("control audit receipt = %#v err=%v", controlReceipt, err)
 		}
 	}
+	adminIdentity := fabric.Identity{FabricID: "fabric-test", UserID: "person-admin", DeviceID: "device-admin"}
+	challenge, err := h.store.InitiateAdminBootstrap(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminClient := h.client(adminIdentity)
+	status, _, body := h.do(adminClient, http.MethodPost, "/v1/admin-bootstrap", BootstrapAdminRequest{Nonce: challenge.Nonce})
+	if status != http.StatusCreated {
+		t.Fatalf("bootstrap admin status=%d body=%s", status, body)
+	}
+	sessionsPath := "/v1/computers/" + computer.ComputerID + "/takeover/sessions"
+	status, _, body = h.do(adminClient, http.MethodGet, sessionsPath, nil)
+	var sessions ComputerTakeoverSessionList
+	if err := json.Unmarshal(body, &sessions); status != http.StatusOK || err != nil || len(sessions.Sessions) != 1 ||
+		sessions.Sessions[0].SessionID != "session-1" || sessions.Sessions[0].AdmittedMode != ComputerAdmittedView ||
+		sessions.ControllerSessionID != "" {
+		t.Fatalf("active session projection status=%d sessions=%#v err=%v body=%s", status, sessions, err, body)
+	}
+	auditPath := "/v1/computers/" + computer.ComputerID + "/takeover/audit?limit=2"
+	status, _, body = h.do(adminClient, http.MethodGet, auditPath, nil)
+	var auditPage ComputerTakeoverAuditList
+	if err := json.Unmarshal(body, &auditPage); status != http.StatusOK || err != nil || len(auditPage.Events) != 2 || auditPage.NextCursor == "" {
+		t.Fatalf("take-over audit page status=%d page=%#v err=%v body=%s", status, auditPage, err, body)
+	}
+	status, _, body = h.do(adminClient, http.MethodGet,
+		"/v1/computers/"+computer.ComputerID+"/takeover/audit?limit=2&tail=true", nil)
+	auditPage = ComputerTakeoverAuditList{}
+	if err := json.Unmarshal(body, &auditPage); status != http.StatusOK || err != nil || len(auditPage.Events) != 2 ||
+		auditPage.Events[0].Kind != ComputerTakeoverAdminOverrode || auditPage.Events[1].Kind != ComputerTakeoverControlReleased ||
+		auditPage.NextCursor == "" {
+		t.Fatalf("take-over audit tail status=%d page=%#v err=%v body=%s", status, auditPage, err, body)
+	}
+	status, _, body = h.do(adminClient, http.MethodGet,
+		"/v1/computers/"+computer.ComputerID+"/takeover/audit?limit=2&cursor=forged%21", nil)
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+	status, _, body = h.do(adminClient, http.MethodGet,
+		"/v1/computers/"+computer.ComputerID+"/takeover/audit?limit=0", nil)
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+	status, _, body = h.do(h.client(fabric.Identity{FabricID: "fabric-test", UserID: "person-viewer", DeviceID: "viewer-device"}),
+		http.MethodGet, sessionsPath, nil)
+	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorAdminRequired)
 
 	var storedColumns string
 	rows, err := h.store.db.Query(`PRAGMA table_info(computer_takeover_audit)`)
@@ -124,10 +167,14 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 	agentClient := h.client(fabric.Identity{NodeID: "fabric-computer-node", Tags: []string{DefaultAgentPrincipalTag}})
 	path := "/v1/agent/computers/" + computer.ComputerID + "/jobs/" + claim.Job.JobID +
 		"/attempts/" + claim.Lease.AttemptID + "/takeover-audit"
-	status, _, body := h.do(agentClient, http.MethodPost, path,
+	status, _, body = h.do(agentClient, http.MethodPost, path,
 		ComputerTakeoverAuditRequest{FencingToken: claim.Lease.FencingToken, Event: closeEvent})
 	if status != http.StatusOK || strings.Contains(string(body), `"fencing_token"`) || !strings.Contains(string(body), `"kind":"session_close"`) {
 		t.Fatalf("take-over audit route status=%d body=%s", status, body)
+	}
+	status, _, body = h.do(adminClient, http.MethodGet, sessionsPath, nil)
+	if err := json.Unmarshal(body, &sessions); status != http.StatusOK || err != nil || len(sessions.Sessions) != 0 {
+		t.Fatalf("closed session projection status=%d sessions=%#v err=%v body=%s", status, sessions, err, body)
 	}
 	h.clock.Advance(3 * time.Second)
 	if _, err := h.store.Reconcile(context.Background()); err != nil {

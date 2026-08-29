@@ -3,7 +3,6 @@ package agent
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +30,7 @@ type computerGrantDecision struct {
 	ComputerID     string
 	FabricID       string
 	UserID         string
+	DeviceID       string
 	Permission     l1.ComputerGrantPermission
 	Administrator  bool
 	PolicyRevision int64
@@ -267,45 +267,15 @@ func (cache *ComputerPolicyCache) AcquireGrant(computerID string, identity fabri
 }
 
 func validComputerPolicyPerson(identity fabric.Identity) bool {
-	return identity.Kind != fabric.IdentityKindMachine && identity.FabricID != "" && identity.UserID != "" &&
-		identity.DeviceID != "" && identity.FabricID == strings.TrimSpace(identity.FabricID) &&
-		identity.UserID == strings.TrimSpace(identity.UserID) && identity.DeviceID == strings.TrimSpace(identity.DeviceID) &&
-		len(identity.FabricID) <= 255 && len(identity.UserID) <= 255 && len(identity.DeviceID) <= 255
+	return l1.ValidComputerPolicyPerson(identity)
 }
 
 func (cache *ComputerPolicyCache) lookupLocked(snapshot l1.ComputerPolicySnapshot, valid bool, computerID string, identity fabric.Identity) computerGrantDecision {
-	decision := computerGrantDecision{ComputerID: computerID, FabricID: identity.FabricID,
-		UserID: identity.UserID, Permission: l1.ComputerGrantNone}
-	if !valid || identity.Kind == fabric.IdentityKindMachine || identity.FabricID == "" || identity.UserID == "" ||
-		identity.FabricID != snapshot.IssuingFabricID {
-		return decision
-	}
-	decision.PolicyRevision = snapshot.PolicyRevision
-	decision.FreshUntil = snapshot.FreshUntil
-	foundComputer := false
-	for _, computer := range snapshot.Computers {
-		if computer.ComputerID != computerID {
-			continue
-		}
-		foundComputer = true
-		for _, admin := range snapshot.Admins {
-			if admin.FabricID == identity.FabricID && admin.UserID == identity.UserID {
-				decision.Permission = l1.ComputerGrantControl
-				decision.Administrator = true
-				return decision
-			}
-		}
-		for _, grant := range computer.Grants {
-			if grant.FabricID == identity.FabricID && grant.UserID == identity.UserID {
-				decision.Permission = grant.Permission
-				return decision
-			}
-		}
-	}
-	if !foundComputer {
-		return decision
-	}
-	return decision
+	evaluated := l1.EvaluateComputerPolicyPerson(snapshot, valid, computerID, identity)
+	return computerGrantDecision{ComputerID: computerID, FabricID: identity.FabricID, UserID: identity.UserID,
+		DeviceID:   identity.DeviceID,
+		Permission: evaluated.Permission, Administrator: evaluated.Administrator,
+		PolicyRevision: evaluated.PolicyRevision, FreshUntil: evaluated.FreshUntil}
 }
 
 func (cache *ComputerPolicyCache) Install(snapshot l1.ComputerPolicySnapshot) (ComputerPolicyInstallReceipt, error) {
@@ -340,7 +310,8 @@ func (cache *ComputerPolicyCache) Install(snapshot l1.ComputerPolicySnapshot) (C
 	}
 	affected := make([]*ComputerGrantAuthorization, 0)
 	for _, authorization := range cache.authorizations {
-		identity := fabric.Identity{FabricID: authorization.decision.FabricID, UserID: authorization.decision.UserID}
+		identity := fabric.Identity{FabricID: authorization.decision.FabricID, UserID: authorization.decision.UserID,
+			DeviceID: authorization.decision.DeviceID}
 		next := cache.lookupLocked(snapshot, true, authorization.decision.ComputerID, identity)
 		if authorization.revoked || computerGrantRank(next.Permission) < computerGrantRank(authorization.decision.Permission) || reason == ComputerPolicyGenerationChanged {
 			affected = append(affected, authorization)
