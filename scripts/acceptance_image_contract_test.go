@@ -162,13 +162,13 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		t.Fatal("workflow-run realtiming must check out the triggering main SHA directly")
 	}
 	scheduledText := string(scheduledBytes)
-	for _, required := range []string{"ref: main", "typed-skip: no successful acceptance-image publication exists", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT"} {
+	for _, required := range []string{"ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}", "typed-skip: no successful acceptance-image publication exists", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT"} {
 		if !strings.Contains(scheduledText, required) {
 			t.Fatalf("scheduled realtiming is missing %q", required)
 		}
 	}
-	if strings.Contains(scheduledText, "ref: ${{ github.event.workflow_run.head_sha }}") {
-		t.Fatal("scheduled realtiming must not dynamically check out publication bytes")
+	if strings.Contains(scheduledText, "ref: main") || strings.Contains(scheduledText, "ref: ${{ github.event.workflow_run.head_sha }}") {
+		t.Fatal("scheduled realtiming must check out the commit selected by the resolved immutable artifact")
 	}
 	for name, workflow := range map[string]workflowContract{"workflow-run": realtiming, "scheduled": scheduled} {
 		result, ok := workflow.Jobs["realtiming-result"]
@@ -182,7 +182,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 		resultText := marshalJob(t, result)
 		for _, required := range []string{"ARTIFACT_AVAILABLE", "$ARTIFACT_AVAILABLE", "= true",
-			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success"} {
+			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json"} {
 			if !strings.Contains(resultText, required) {
 				t.Fatalf("%s realtiming result does not fail closed on %q", name, required)
 			}
