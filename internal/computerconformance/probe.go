@@ -210,7 +210,10 @@ func (stream *rfbStream) write(value []byte) error { return stream.connection.wr
 // StartInput sends the same real RFB key and pointer bytes to either role. The
 // caller compares an image-owned oracle before and after; the probe never
 // assumes what the deterministic surface renders.
-type InputSession struct{ connection *websocketConnection }
+type InputSession struct {
+	connection *websocketConnection
+	stream     *rfbStream
+}
 
 func (session *InputSession) Close() { session.connection.close() }
 
@@ -219,9 +222,27 @@ func (session *InputSession) Close() { session.connection.close() }
 // compositor cannot discard the key while switching between RFB clients.
 func (session *InputSession) SendKey() error {
 	for _, event := range rfbKeyEvents() {
-		if err := session.connection.writeFrame(2, event); err != nil {
+		if err := session.stream.write(event); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// Fence waits for a framebuffer response requested after the input bytes. RFB
+// client messages are ordered on one connection, so the response proves the
+// server consumed the preceding input before a control-side sentinel is sent.
+func (session *InputSession) Fence() error {
+	request := []byte{3, 0, 0, 0, 0, 0, 0, 1, 0, 1}
+	if err := session.stream.write(request); err != nil {
+		return err
+	}
+	header, err := session.stream.read(4)
+	if err != nil {
+		return err
+	}
+	if header[0] != 0 {
+		return fmt.Errorf("RFB input fence returned server message type %d", header[0])
 	}
 	return nil
 }
@@ -284,7 +305,7 @@ func startRFBEvents(ctx context.Context, port int, events [][]byte) (*InputSessi
 			return fail(err)
 		}
 	}
-	return &InputSession{connection: connection}, nil
+	return &InputSession{connection: connection, stream: stream}, nil
 }
 
 func rfbInputEvents(withKey bool, x, y int) [][]byte {

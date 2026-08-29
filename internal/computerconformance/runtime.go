@@ -693,6 +693,23 @@ func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targe
 	cancel()
 	var sentinelSession *InputSession
 	if err == nil {
+		err = viewSession.Fence()
+	}
+	if err == nil {
+		// The RFB fence proves transport consumption. Give the guest observer a
+		// bounded opportunity to publish a forbidden delivery before introducing
+		// the control sentinel whose coordinates close the no-delivery proof.
+		for poll := 0; poll < 8; poll++ {
+			observation, readErr := r.readInputObservation(ctx)
+			if readErr == nil && (observation.KeyEvents != before.KeyEvents || historyContains(observation, targetX, targetY)) {
+				viewSession.Close()
+				r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
+				return false
+			}
+			if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
+				break
+			}
+		}
 		probeCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
 		sentinelSession, err = StartPointer(probeCtx, r.controlPort, sentinelX, sentinelY)
 		cancel()
