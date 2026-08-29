@@ -47,7 +47,7 @@ type computerSubmissionOutput struct {
 	IdempotentReplay bool `json:"idempotent_replay"`
 }
 
-func executeComputers(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
+func executeComputerSubmission(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if len(args) < 2 || args[0] != "submission" {
 		return usageError(computerSubmissionUsage)
 	}

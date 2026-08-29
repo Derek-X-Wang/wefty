@@ -31,7 +31,7 @@ func main() {
 // pre-existing commands. Typed exits are an explicit contract only for the
 // access-policy and take-over commands introduced by #191.
 func commandExitCodeForArgs(err error, args []string) int {
-	if !isAccessCLIArgs(args) {
+	if !isAccessCLIArgs(args) && !isComputerCLIArgs(args) {
 		return exitFailure
 	}
 	return commandExitCode(err)
@@ -53,7 +53,6 @@ func isAccessCLIArgs(args []string) bool {
 	return len(positionals) >= 2 && positionals[0] == "services" &&
 		(positionals[1] == "grant" || positionals[1] == "grants" || positionals[1] == "revoke" || positionals[1] == "takeover")
 }
-
 const (
 	exitFailure      = 1
 	exitUsage        = 2
@@ -90,7 +89,7 @@ func commandExitCode(err error) int {
 	case contract.ErrorNotFound, contract.ErrorAttemptNotFound, contract.ErrorTakeoverSessionEnded:
 		return exitNotFound
 	case contract.ErrorConflict, contract.ErrorStalePolicyRevision, contract.ErrorStaleIntentRevision,
-		contract.ErrorIdempotencyConflict, contract.ErrorDispatchKeyConflict, contract.ErrorFinalAdmin,
+		contract.ErrorStorageReferenceConflict, contract.ErrorIdempotencyConflict, contract.ErrorDispatchKeyConflict, contract.ErrorFinalAdmin,
 		contract.ErrorCapacityExhausted, contract.ErrorComputerResourceRequired, contract.ErrorComputerTraitRequired,
 		contract.ErrorControllerBusy, contract.ErrorControllerAlreadyHeld:
 		return exitConflict
@@ -282,6 +281,8 @@ Commands:
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   services <verb>            Create and operate service-class jobs
     create|list|status|start|stop|restart|logs|remove|forget
+  computers <verb>           Create and operate durable Computers
+    create|list|get|start|stop|restart|remove|reimage|reset|grow|abort
   computers submission <verb>
                              Enable, disable, or set Computer Run submission inflight capacity
     enable|disable|set-inflight

@@ -199,6 +199,103 @@ func (c *apiClients) createService(ctx context.Context, spec contract.JobSpec) (
 	return job, err
 }
 
+func (c *apiClients) createComputer(ctx context.Context, request l1.CreateComputerRequest) (l1.Computer, bool, error) {
+	var computer l1.Computer
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, "/v1/computers", request, nil, &computer,
+		http.StatusCreated, http.StatusOK)
+	return computer, responseWasReplay(headers), err
+}
+
+func (c *apiClients) listComputers(ctx context.Context, cursor string, limit int) (l1.ComputerList, error) {
+	query := url.Values{"limit": []string{strconv.Itoa(limit)}}
+	if cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	var result l1.ComputerList
+	err := c.l1.do(ctx, http.MethodGet, "/v1/computers?"+query.Encode(), nil, nil, &result, http.StatusOK)
+	return result, err
+}
+
+func (c *apiClients) getComputer(ctx context.Context, computerID string) (l1.Computer, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID)
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &computer, http.StatusOK)
+	return computer, err
+}
+
+func (c *apiClients) setComputerDesiredState(ctx context.Context, computerID string,
+	request l1.ComputerDesiredStateRequest,
+) (l1.Computer, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/desired-state"
+	err := c.l1.do(ctx, http.MethodPut, path, request, nil, &computer, http.StatusAccepted)
+	return computer, err
+}
+
+func (c *apiClients) restartComputer(ctx context.Context, computerID string,
+	request l1.ComputerRestartRequest,
+) (l1.Computer, bool, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/restart"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer,
+		http.StatusAccepted, http.StatusOK)
+	return computer, responseWasReplay(headers), err
+}
+
+func (c *apiClients) removeComputer(ctx context.Context, computerID string,
+	request l1.ComputerRemoveRequest,
+) (l1.Computer, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/remove"
+	err := c.l1.do(ctx, http.MethodPost, path, request, nil, &computer, http.StatusAccepted)
+	return computer, err
+}
+
+func (c *apiClients) reimageComputer(ctx context.Context, computerID string,
+	request l1.ComputerReimageRequest,
+) (l1.Computer, bool, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/reimage"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer,
+		http.StatusAccepted, http.StatusOK)
+	return computer, responseWasReplay(headers), err
+}
+
+func (c *apiClients) resetComputer(ctx context.Context, computerID string,
+	request l1.ComputerStorageResetRequest,
+) (l1.Computer, bool, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/storage-reset"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer,
+		http.StatusAccepted, http.StatusOK)
+	return computer, responseWasReplay(headers), err
+}
+
+func (c *apiClients) growComputer(ctx context.Context, computerID string,
+	request l1.ComputerGrowRequest,
+) (l1.Computer, bool, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/grow"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer,
+		http.StatusAccepted, http.StatusOK)
+	return computer, responseWasReplay(headers), err
+}
+
+func (c *apiClients) abortComputer(ctx context.Context, computerID string,
+	request l1.ComputerReconfigurationAbortRequest,
+) (l1.Computer, bool, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/reconfiguration-abort"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer,
+		http.StatusAccepted, http.StatusOK)
+	return computer, responseWasReplay(headers), err
+}
+
+func responseWasReplay(headers http.Header) bool {
+	return strings.EqualFold(headers.Get("Idempotent-Replay"), "true") ||
+		strings.EqualFold(headers.Get("Idempotency-Replayed"), "true")
+}
+
 func (c *apiClients) listServices(ctx context.Context, cursor string, limit int) (l1.JobList, error) {
 	query := url.Values{
 		"class": []string{contract.JobClassService},

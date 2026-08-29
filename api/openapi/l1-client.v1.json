@@ -688,6 +688,24 @@
       }
     },
     "/v1/computers": {
+      "get": {
+        "operationId": "listComputers",
+        "summary": "List durable Computer authorities and their current Job observations",
+        "parameters": [
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "One creation/Computer-ID ordered page. Removed Computers remain as terminal truth.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerList" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      },
       "post": {
         "operationId": "createComputer",
         "summary": "Create a durable Computer and its first immutable Job projection",
@@ -903,6 +921,7 @@
           }
         } } } },
         "responses": {
+          "200": { "description": "Identical reimage replay; no second intent or projection was issued.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "202": { "description": "Reimage accepted or advanced through internal quiescence.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },

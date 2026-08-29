@@ -258,6 +258,7 @@ From M4 the implement/review steps can land on Daytona capacity instead — same
 | **M1 — L1 minimal** | Control plane + node agent: tsnet join via fabric, heartbeat, tag-matched pull-claim, `kind=process`, one-shot only. Fleet: **1 Mac + 1 existing Linux server** (cross-OS validated early; other Macs join whenever). |
 | **M2 — L3 minimal + dogfood** | `POST /v1/runs`, run ledger, envelope/gate storage, poll logs, manual + chain triggers, dogfood script (sandcastle `noSandbox()`). **Loop closes; daily dogfood starts; tag `v0.1`.** |
 | **M3 — `kind=oci`** | Lima + containerd on Macs, native containerd on Linux. Cron trigger. |
+| **M3.5 — Agent computers** | Persistent headful OCI service Computers on owned Nodes; take-over, Storage provenance, and removal proof. |
 | **M4 — Daytona connector** | Proves the sandbox-provider contract; script may switch to sandcastle's Daytona provider. |
 | **M5 — Fly connector** | Converged agent image + reconciler/reaper — structurally last (depends on a mature agent). Webhook trigger last. |
 

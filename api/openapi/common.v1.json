@@ -514,6 +514,19 @@
         },
         "description": "Durable Computer identity and sole desired-state authority. computer_id and current_job_id are distinct; immutable Job projections cannot be restarted after retirement."
       },
+      "ComputerList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["computers"],
+        "properties": {
+          "computers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Computer" }
+          },
+          "next_cursor": { "type": "string" }
+        },
+        "description": "One stable page of durable Computer authorities. Terminal removal truth remains listed."
+      },
       "ComputerStorageGeneration": {
         "type": "object",
         "additionalProperties": false,

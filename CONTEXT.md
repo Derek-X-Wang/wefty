@@ -88,28 +88,6 @@ The helper-owned, guest-native `/wefty/service` storage that belongs to one
 service-class job.
 _Avoid_: working directory, bind mount, container writable layer, shared volume
 
-**Storage generation**:
-One immutable allocation generation of a Computer's durable Storage identity.
-Exactly one generation is current; reset may temporarily add one staging
-generation and retains retired generations until verified deletion.
-_Avoid_: disk version, volume revision, Lineage
-
-**Backup**:
-An immutable logical cold-copy record for one exact Storage generation. It
-survives explicit pruning of its physical copy and records `encryption=none`
-until a later encryption contract exists.
-_Avoid_: snapshot, image, archive, Lineage
-
-**Backup copy**:
-One helper-owned physical realization of a Backup, bound to its Node and
-managed-root instance. V1 permits exactly one live source-node copy.
-_Avoid_: replica when only the V1 source copy exists, Lineage
-
-**Storage provenance**:
-The immutable origin record connecting a Backup to the exact source Storage
-identity and generation from which it was created.
-_Avoid_: Lineage, ancestry, parent disk
-
 ### Placement and movement
 
 **Movable**:
@@ -124,9 +102,54 @@ never through local files.
 _Avoid_: sticky, affinity
 
 **Service binding**:
-The current placement relationship between a service job and one node. In
-v1 it is retained across payload restarts and admits no cross-node failover.
+The current placement relationship between a durable service resource — a
+service Job or a Computer — and one Node. It is retained across payload
+restarts and admits no cross-node failover.
 _Avoid_: pin, affinity, ownership, permanent placement
+
+### Agent computers and storage
+
+**Computer**:
+A durable, Pinned service resource whose storage identity, name, placement,
+and grants persist across runtime attempts and image changes. Its tenant image
+may change without changing the Computer.
+_Avoid_: node, machine, VM, container, tenant, service job
+
+**Storage generation**:
+One monotonically identified incarnation of a Computer's persistent storage.
+Exactly one generation may be current and attached.
+_Avoid_: disk version, snapshot, removal generation, authority generation
+
+**Backup**:
+An immutable wefty-managed copy of one Storage generation under wefty's
+removal responsibility.
+_Avoid_: snapshot, export, archive, recovery point
+
+**Backup copy**:
+One physical wefty-owned replica of a Backup on one Node.
+_Avoid_: Backup, mirror, custody export
+
+**Storage provenance**:
+The recorded source relationships among Storage generations, Backups,
+clones, imports, and Custody exports.
+_Avoid_: Lineage, run lineage, attachment history
+
+**Custody export**:
+The recorded transfer of storage bytes outside wefty ownership, permanently
+reducing what removal can prove.
+_Avoid_: Backup, managed copy, verified deletion
+
+### Human take-over
+
+**Take-over session**:
+One authenticated, bounded viewing or control connection from a person to a
+Computer through the Fabric.
+_Avoid_: Run, login, VNC session, tenant session
+
+**Controller tenure**:
+The exclusive, attempt-scoped period in which one Take-over session holds a
+Computer's human input path.
+_Avoid_: grant, control role, lock, idle session
 
 **Slot**:
 One unit of a node's configured admission capacity within one workload

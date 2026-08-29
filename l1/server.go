@@ -232,6 +232,8 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/jobs/{job_id}/prompt", s.notImplemented)
 	client.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.notImplemented)
 	client.HandleFunc("POST /v1/computers", s.createComputer)
+	client.HandleFunc("GET /v1/computers", s.listComputers)
+	client.HandleFunc("GET /v1/computers/{$}", s.listComputers)
 	client.HandleFunc("GET /v1/computers/{computer_id}", s.getComputer)
 	client.HandleFunc("GET /v1/computers/{computer_id}/intents", s.listComputerIntents)
 	client.HandleFunc("PUT /v1/computers/{computer_id}/desired-state", s.setComputerDesiredState)
@@ -807,6 +809,23 @@ func (s *Server) getComputer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, redactComputer(computer))
 }
 
+func (s *Server) listComputers(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	page, err := s.store.ListComputers(r.Context(), r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	for index := range page.Computers {
+		page.Computers[index] = redactComputer(page.Computers[index])
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
 func (s *Server) listComputerIntents(w http.ResponseWriter, r *http.Request) {
 	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
 	if err != nil {
@@ -1143,7 +1162,7 @@ func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.Actor = identityFromRequest(r).NodeID
-	computer, err := s.store.ReimageComputer(r.Context(), r.PathValue("computer_id"), request)
+	computer, replayed, err := s.store.ReimageComputerWithReplay(r.Context(), r.PathValue("computer_id"), request)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1152,7 +1171,12 @@ func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, redactComputer(computer))
+	status := http.StatusAccepted
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, redactComputer(computer))
 }
 
 func (s *Server) removeComputer(w http.ResponseWriter, r *http.Request) {
