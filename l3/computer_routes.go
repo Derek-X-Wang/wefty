@@ -34,7 +34,7 @@ func (s *Server) registerComputerTokenRoutes(runs *http.ServeMux, root *http.Ser
 			handler = s.getComputerSelf
 		case "/v1/runs":
 			if route.Method == http.MethodGet {
-				handler = s.listComputerRuns
+				handler = s.listRuns
 			} else {
 				handler = s.createRun
 			}

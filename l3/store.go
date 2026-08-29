@@ -684,18 +684,9 @@ func (s *Store) CreateRun(ctx context.Context, input CreateRunInput) (record con
 		if err := validateComputerGrantTx(ctx, tx, *input.ComputerScope); err != nil {
 			return contract.RunRecord{}, false, err
 		}
-		var inflight int
-		if err := tx.QueryRowContext(ctx, `WITH RECURSIVE computer_lineages(root_id, run_id) AS (
-			SELECT r.run_id, r.run_id FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
-			WHERE t.source='computer' AND t.computer_id=? AND r.parent_run_id IS NULL
-			UNION ALL
-			SELECT lineage.root_id, child.run_id FROM computer_lineages lineage
-			JOIN runs child ON child.parent_run_id=lineage.run_id
-		)
-		SELECT COUNT(DISTINCT lineage.root_id) FROM computer_lineages lineage
-		JOIN runs member ON member.run_id=lineage.run_id
-		WHERE member.status NOT IN (?, ?)`, input.ComputerScope.ComputerID, contract.RunSucceeded, contract.RunFailed).Scan(&inflight); err != nil {
-			return contract.RunRecord{}, false, internalError(err, "count Computer-submitted root Lineages")
+		inflight, err := countComputerInflight(ctx, tx, input.ComputerScope.ComputerID)
+		if err != nil {
+			return contract.RunRecord{}, false, err
 		}
 		if inflight >= input.ComputerScope.SubmitMaxInflight {
 			return contract.RunRecord{}, false, &Error{Code: contract.ErrorSubmitInflightLimit,

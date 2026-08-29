@@ -80,10 +80,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		NodeID: options.plainIdentity, UserID: options.plainUserID, DeviceID: options.plainDeviceID,
 		Tags: []string{l3.DefaultCallerPrincipalTag},
 	}
-	if commandArgs[0] == "admin" {
+	if usesPersonProtocol(commandArgs) {
 		plainIdentity.Tags = nil
 		if options.fabricMode == "plain" && (options.plainUserID == "" || options.plainDeviceID == "") {
-			return usageError("plain admin commands require DEVELOPMENT ONLY --plain-user-id and --plain-device-id")
+			return usageError("plain person commands require DEVELOPMENT ONLY --plain-user-id and --plain-device-id")
 		}
 	}
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
@@ -105,6 +105,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	defer clients.close()
 	return execute(ctx, clients, options.jsonOutput, commandArgs, stdout, stderr)
+}
+
+func usesPersonProtocol(args []string) bool {
+	return len(args) > 0 && (args[0] == "admin" ||
+		(args[0] == "computers" && len(args) > 1 && args[1] == "submission"))
 }
 
 func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []string, error) {
@@ -171,6 +176,11 @@ Commands:
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   services <verb>            Create and operate service-class jobs
     create|list|status|start|stop|restart|logs|remove|forget
+  computers submission <verb>
+                             Enable, disable, or set Computer Run submission inflight capacity
+    enable|disable|set-inflight
+                             Requires observed policy and submission revisions, or --expect-current
+  runs list                  List Runs by immutable Computer origin
   submit                     Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID               Create a new run from a stored snapshot
   logs RUN_ID [--follow]     Read or follow run logs

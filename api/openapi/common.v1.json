@@ -7,6 +7,16 @@
   "paths": {},
   "components": {
     "schemas": {
+      "ComputerTokenRevocationReceipt": {
+        "type": "object", "additionalProperties": false,
+        "required": ["computer_id", "submit_intent_revision", "revoked_grant_count", "committed_at"],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 },
+          "submit_intent_revision": { "type": "integer", "minimum": 0 },
+          "revoked_grant_count": { "type": "integer", "minimum": 0 },
+          "committed_at": { "type": "string", "format": "date-time" }
+        }
+      },
       "ErrorResponse": {
         "type": "object",
         "additionalProperties": false,

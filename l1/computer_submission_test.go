@@ -13,12 +13,22 @@ import (
 )
 
 type recordingComputerTokenRevoker struct {
-	revoke func(context.Context, ComputerTokenRevocation) error
+	revoke func(context.Context, ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error)
+	count  func(context.Context, string) (int, error)
 }
 
-func (revoker recordingComputerTokenRevoker) RevokeComputerTokens(ctx context.Context, request ComputerTokenRevocation) error {
+func (revoker recordingComputerTokenRevoker) RevokeComputerTokens(ctx context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 	return revoker.revoke(ctx, request)
 }
+
+func (revoker recordingComputerTokenRevoker) CountComputerInflight(ctx context.Context, computerID string) (int, error) {
+	if revoker.count == nil {
+		return 0, nil
+	}
+	return revoker.count(ctx, computerID)
+}
+
+func intPointer(value int) *int { return &value }
 
 func TestComputerSubmissionIntentDefaultsOffAndAdvancesWithAudit(t *testing.T) {
 	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{})
@@ -43,27 +53,27 @@ func TestComputerSubmissionIntentDefaultsOffAndAdvancesWithAudit(t *testing.T) {
 		t.Fatalf("default submission authority = %#v", computer)
 	}
 	request := ComputerSubmissionRequest{PolicyRevision: policy.Revision, SubmitIntentRevision: 0,
-		SubmitEnabled: true, SubmitMaxInflight: 20, IdempotencyKey: "enable-submit"}
-	enabled, replayed, err := h.store.MutateComputerSubmission(ctx, admin, computer.ComputerID, request)
-	if err != nil || replayed {
-		t.Fatalf("enable submission = (%#v, %v, %v)", enabled, replayed, err)
+		SubmitEnabled: boolPointer(true), IdempotencyKey: "enable-submit"}
+	enabled, replayed, applied, err := h.store.MutateComputerSubmission(ctx, admin, computer.ComputerID, request)
+	if err != nil || replayed || !applied {
+		t.Fatalf("enable submission = (%#v, replay=%v, applied=%v, %v)", enabled, replayed, applied, err)
 	}
 	if !enabled.SubmitEnabled || enabled.SubmitIntentRevision != 1 || enabled.SubmitPolicyRevision != 2 {
 		t.Fatalf("enabled submission authority = %#v", enabled)
 	}
-	replayedComputer, replayed, err := h.store.MutateComputerSubmission(ctx, admin, computer.ComputerID, request)
+	replayedComputer, replayed, applied, err := h.store.MutateComputerSubmission(ctx, admin, computer.ComputerID, request)
 	if err != nil || !replayed || replayedComputer.SubmitIntentRevision != enabled.SubmitIntentRevision {
 		t.Fatalf("submission replay = (%#v, %v, %v)", replayedComputer, replayed, err)
 	}
-	if _, _, err := h.store.MutateComputerSubmission(ctx, admin, computer.ComputerID,
-		ComputerSubmissionRequest{PolicyRevision: 2, SubmitIntentRevision: 1, SubmitEnabled: false,
-			SubmitMaxInflight: 19, IdempotencyKey: "enable-submit"}); errorCode(err) != contract.ErrorIdempotencyConflict {
+	if _, _, _, err := h.store.MutateComputerSubmission(ctx, admin, computer.ComputerID,
+		ComputerSubmissionRequest{PolicyRevision: 2, SubmitIntentRevision: 1, SubmitMaxInflight: intPointer(19),
+			IdempotencyKey: "enable-submit"}); errorCode(err) != contract.ErrorIdempotencyConflict {
 		t.Fatalf("changed idempotency replay error = %v", err)
 	}
 	nonAdmin := fabric.Identity{FabricID: "fabric-test", UserID: "viewer", DeviceID: "device-2"}
-	if _, _, err := h.store.MutateComputerSubmission(ctx, nonAdmin, computer.ComputerID,
-		ComputerSubmissionRequest{PolicyRevision: 2, SubmitIntentRevision: 1, SubmitEnabled: false,
-			SubmitMaxInflight: 20, IdempotencyKey: "disable-submit"}); errorCode(err) != contract.ErrorAdminRequired {
+	if _, _, _, err := h.store.MutateComputerSubmission(ctx, nonAdmin, computer.ComputerID,
+		ComputerSubmissionRequest{PolicyRevision: 2, SubmitIntentRevision: 1, SubmitEnabled: boolPointer(false),
+			IdempotencyKey: "disable-submit"}); errorCode(err) != contract.ErrorAdminRequired {
 		t.Fatalf("non-admin submission error = %v", err)
 	}
 	var rows int
@@ -101,28 +111,64 @@ func TestComputerSubmissionRouteRevokesL3BeforeReportingSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	h.server.computerTokenRevoker = recordingComputerTokenRevoker{}
+	status, _, body = h.do(client, http.MethodGet, "/v1/computers/"+computer.ComputerID+"/submission", nil)
+	if status != http.StatusOK {
+		t.Fatalf("read submission state status=%d body=%s", status, body)
+	}
+	var state ComputerSubmissionState
+	if err := json.Unmarshal(body, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.ComputerID != computer.ComputerID || state.SubmitEnabled || state.SubmitIntentRevision != 0 ||
+		state.SubmitMaxInflight != DefaultComputerSubmitMaxInflight || state.PolicyRevision != policy.Revision {
+		t.Fatalf("submission state = %#v", state)
+	}
+	var narrow map[string]json.RawMessage
+	if err := json.Unmarshal(body, &narrow); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"grants", "current_job", "storage_id", "display_endpoint"} {
+		if _, present := narrow[forbidden]; present {
+			t.Fatalf("submission state leaked %q: %s", forbidden, body)
+		}
+	}
 	revokedBeforeMutation := false
-	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) error {
+	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 		current, readErr := readComputerAuthority(ctx, h.store.db, computer.ComputerID, h.clock.Now())
 		if readErr != nil {
-			return readErr
+			return contract.ComputerTokenRevocationReceipt{}, readErr
 		}
 		revokedBeforeMutation = !current.SubmitEnabled && current.SubmitIntentRevision == 0 &&
 			request.ComputerID == computer.ComputerID && request.NewSubmitIntentRevision == 1
-		return nil
+		return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
+			SubmitIntentRevision: request.NewSubmitIntentRevision, CommittedAt: h.clock.Now()}, nil
 	}}
-	status, _, body = h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/submission",
-		ComputerSubmissionRequest{PolicyRevision: policy.Revision, SubmitIntentRevision: 0, SubmitEnabled: true,
-			SubmitMaxInflight: 20, IdempotencyKey: "enable-route"})
-	if status != http.StatusOK || !revokedBeforeMutation {
-		t.Fatalf("enable route status=%d body=%s revoked-before=%t", status, body, revokedBeforeMutation)
+	status, headers, body := h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/submission",
+		ComputerSubmissionRequest{PolicyRevision: policy.Revision, SubmitIntentRevision: 0, SubmitEnabled: boolPointer(true),
+			IdempotencyKey: "enable-route"})
+	if status != http.StatusOK || !revokedBeforeMutation || headers.Get("Idempotent-Replay") != "" {
+		t.Fatalf("enable route status=%d body=%s revoked-before=%t headers=%v", status, body, revokedBeforeMutation, headers)
 	}
-	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(context.Context, ComputerTokenRevocation) error {
-		return errors.New("L3 unavailable")
+	var mutation ComputerSubmissionMutationResult
+	if err := json.Unmarshal(body, &mutation); err != nil || !mutation.MutationApplied || mutation.Revoked == nil ||
+		mutation.Revoked.SubmitIntentRevision != 1 || mutation.PolicyRevision != 2 {
+		t.Fatalf("enable route mutation = %#v err=%v body=%s", mutation, err, body)
+	}
+	status, headers, body = h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/submission",
+		ComputerSubmissionRequest{PolicyRevision: policy.Revision, SubmitIntentRevision: 0, SubmitEnabled: boolPointer(true),
+			IdempotencyKey: "enable-route"})
+	mutation = ComputerSubmissionMutationResult{}
+	if err := json.Unmarshal(body, &mutation); status != http.StatusOK || err != nil || headers.Get("Idempotent-Replay") != "true" ||
+		mutation.MutationApplied || mutation.Revoked != nil {
+		t.Fatalf("enable replay status=%d headers=%v mutation=%#v err=%v body=%s", status, headers, mutation, err, body)
+	}
+	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(context.Context, ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+		return contract.ComputerTokenRevocationReceipt{}, errors.New("L3 unavailable")
 	}}
 	status, _, body = h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/submission",
-		ComputerSubmissionRequest{PolicyRevision: 2, SubmitIntentRevision: 1, SubmitEnabled: false,
-			SubmitMaxInflight: 20, IdempotencyKey: "disable-route"})
+		ComputerSubmissionRequest{PolicyRevision: 2, SubmitIntentRevision: 1, SubmitEnabled: boolPointer(false),
+			IdempotencyKey: "disable-route"})
 	if status != http.StatusInternalServerError {
 		t.Fatalf("disable without L3 status=%d body=%s", status, body)
 	}
@@ -132,6 +178,52 @@ func TestComputerSubmissionRouteRevokesL3BeforeReportingSuccess(t *testing.T) {
 	}
 	if !current.SubmitEnabled || current.SubmitIntentRevision != 1 {
 		t.Fatalf("failed revocation mutated submission authority: %#v", current)
+	}
+}
+
+func TestComputerSubmissionAuthorityChangeInvalidatesPublishedReadiness(t *testing.T) {
+	h := newIntegrationHarness(t, map[string][]string{"computer-node": {"computer"}})
+	ctx := context.Background()
+	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	computer, _, err := h.store.CreateComputer(ctx, CreateComputerRequest{
+		Name: "readiness-revision", Spec: computerCapabilityJobSpec("computer:readiness-revision"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := h.store.ClaimJob(ctx, "fabric-computer-node", node.NodeID, node.BootSessionID, contract.JobClassService)
+	if err != nil || claim == nil {
+		t.Fatalf("claim Computer = %#v err=%v", claim, err)
+	}
+	ready := true
+	endpoint := "ws://computer-node.private:43123/websockify"
+	if _, err := h.store.SetAttemptPublication(ctx, "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID,
+		PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready, DisplayEndpoint: &endpoint}); err != nil {
+		t.Fatal(err)
+	}
+	admin := fabric.Identity{FabricID: "fabric-test", UserID: "admin", DeviceID: "device-1"}
+	challenge, err := h.store.InitiateAdminBootstrap(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := h.store.BootstrapAdmin(ctx, admin, challenge.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated, replayed, applied, err := h.store.MutateComputerSubmission(ctx, admin, computer.ComputerID,
+		ComputerSubmissionRequest{PolicyRevision: policy.Revision, SubmitIntentRevision: 0,
+			SubmitEnabled: boolPointer(true), IdempotencyKey: "invalidate-ready"})
+	if err != nil || replayed || !applied || (mutated.CurrentJob.Ready != nil && *mutated.CurrentJob.Ready) || mutated.DisplayEndpoint != nil {
+		t.Fatalf("mutated readiness = %#v replay=%v applied=%v err=%v", mutated, replayed, applied, err)
+	}
+	var publishedAttempt *string
+	if err := h.store.db.QueryRow(`SELECT published_attempt_id FROM service_jobs WHERE job_id=?`, computer.CurrentJobID).Scan(&publishedAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if publishedAttempt != nil {
+		t.Fatalf("published attempt survived authority change: %q", *publishedAttempt)
 	}
 }
 
@@ -157,9 +249,9 @@ func TestComputerTokenScopeProofRequiresLiveAttemptAndInstalledPolicy(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	computer, _, err = h.store.MutateComputerSubmission(ctx, admin, computer.ComputerID, ComputerSubmissionRequest{
-		PolicyRevision: policy.Revision, SubmitIntentRevision: 0, SubmitEnabled: true,
-		SubmitMaxInflight: 20, IdempotencyKey: "scope-enable",
+	computer, _, _, err = h.store.MutateComputerSubmission(ctx, admin, computer.ComputerID, ComputerSubmissionRequest{
+		PolicyRevision: policy.Revision, SubmitIntentRevision: 0, SubmitEnabled: boolPointer(true),
+		IdempotencyKey: "scope-enable",
 	})
 	if err != nil {
 		t.Fatal(err)

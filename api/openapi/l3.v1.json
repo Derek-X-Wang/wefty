@@ -31,8 +31,23 @@
         "security": [{ "fabricIdentity": [] }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerTokenRevocationRequest" } } } },
         "responses": {
-          "204": { "description": "Every older active grant is revoked." },
+          "200": { "description": "Durable revocation receipt, including zero matching grants.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerTokenRevocationReceipt" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/inflight": {
+      "parameters": [{ "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
+      "get": {
+        "operationId": "getComputerInflightState",
+        "summary": "Read the current nonterminal Computer-root Lineage count",
+        "description": "L1 control-plane machine identity only. Uses the same count primitive that atomically enforces submit_max_inflight.",
+        "security": [{ "fabricIdentity": [] }],
+        "responses": {
+          "200": { "description": "Current count across every Storage generation.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerInflightState" } } } },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
@@ -148,19 +163,19 @@
     },
     "/v1/runs": {
       "get": {
-        "operationId": "listComputerRuns",
-        "summary": "List current-generation Runs rooted by this Computer",
-        "description": "Computer-token only. origin=computer:self is mandatory. Roots are limited to the authenticated computer_id and current storage generation; include_descendants expands only through those roots and every result is independently CanComputerReadRun-scoped.",
-        "security": [{ "fabricIdentity": [], "computerToken": [] }],
+        "operationId": "listRunsByComputerOrigin",
+        "summary": "List Runs by immutable Computer origin",
+        "description": "This is an operator-level query: only the L3 caller client tag may use origin=computer:<id>; a tokenless bridge agent identity is rejected. Computer-token callers must use origin=computer:self and remain limited to the authenticated Computer and current Storage generation. Both scopes share one root-selection, descendant-expansion, ordering, hydration, and cursor primitive.",
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "computerToken": [] }],
         "parameters": [
-          { "name": "origin", "in": "query", "required": true, "schema": { "type": "string", "const": "computer:self" } },
+          { "name": "origin", "in": "query", "required": true, "schema": { "type": "string", "pattern": "^computer:.+$" } },
           { "name": "include_descendants", "in": "query", "schema": { "type": "boolean", "default": false } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
           { "name": "cursor", "in": "query", "schema": { "type": "string" } }
         ],
         "responses": {
           "200": {
-            "description": "Current-generation Computer Run page.",
+            "description": "Computer-originated Run page with exact immutable trigger projections.",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerRunPage" } } }
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
@@ -721,6 +736,14 @@
           "computer_id": { "type": "string", "minLength": 1 }, "submit_intent_revision": { "type": "integer", "minimum": 0 },
           "revoke_all": { "type": "boolean", "default": false },
           "reason": { "type": "string", "minLength": 1 }
+        }
+      },
+      "ComputerInflightState": {
+        "type": "object", "additionalProperties": false,
+        "required": ["computer_id", "nonterminal_root_lineages"],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 },
+          "nonterminal_root_lineages": { "type": "integer", "minimum": 0 }
         }
       },
       "ComputerAttemptTokenRevocationRequest": {

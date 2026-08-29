@@ -353,8 +353,9 @@ CREATE TABLE IF NOT EXISTS computers (
 );
 CREATE INDEX IF NOT EXISTS computers_binding ON computers(bound_node_id, desired_state);
 CREATE TABLE IF NOT EXISTS computer_submission_audit (
+  audit_id TEXT PRIMARY KEY,
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
-  submit_intent_revision INTEGER NOT NULL CHECK(submit_intent_revision > 0),
+  submit_intent_revision INTEGER NOT NULL CHECK(submit_intent_revision >= 0),
   policy_revision INTEGER NOT NULL CHECK(policy_revision > 0),
   actor_fabric_id TEXT NOT NULL,
   actor_user_id TEXT NOT NULL,
@@ -364,10 +365,12 @@ CREATE TABLE IF NOT EXISTS computer_submission_audit (
   submit_max_inflight INTEGER NOT NULL CHECK(submit_max_inflight > 0),
   idempotency_key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
+  mutation_applied INTEGER NOT NULL CHECK(mutation_applied IN (0, 1)),
   created_ns INTEGER NOT NULL,
-  PRIMARY KEY(computer_id, submit_intent_revision),
   UNIQUE(computer_id, idempotency_key)
 );
+CREATE INDEX IF NOT EXISTS computer_submission_audit_revision
+ON computer_submission_audit(computer_id, submit_intent_revision, created_ns);
 CREATE TRIGGER IF NOT EXISTS computer_submission_audit_no_update
 BEFORE UPDATE ON computer_submission_audit BEGIN SELECT RAISE(ABORT, 'computer submission audit is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS computer_submission_audit_no_delete

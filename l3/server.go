@@ -122,6 +122,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/computer-token/revoke", s.authenticateFabric(http.HandlerFunc(s.revokeComputerTokens)))
 	root.Handle("/v1/computer-token/revoke-attempt", s.authenticateFabric(http.HandlerFunc(s.revokeComputerAttemptTokens)))
 	root.Handle("/v1/computer-token/revoke-host", s.authenticateFabric(http.HandlerFunc(s.revokeHostComputerTokens)))
+	root.Handle("GET /v1/computers/{computer_id}/inflight", s.authenticateFabric(http.HandlerFunc(s.getComputerInflight)))
 	s.registerComputerTokenRoutes(runs, root)
 	root.Handle("/v1/runs", s.authenticateFabric(s.authorize(runs)))
 	root.Handle("/v1/runs/", s.authenticateFabric(s.authorize(runs)))
@@ -313,11 +314,26 @@ func (s *Server) revokeComputerTokens(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.store.RevokeComputerTokens(r.Context(), request); err != nil {
+	receipt, err := s.store.RevokeComputerTokens(r.Context(), request)
+	if err != nil {
 		writeError(w, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, receipt)
+}
+
+func (s *Server) getComputerInflight(w http.ResponseWriter, r *http.Request) {
+	if identityFromRequest(r).NodeID != s.controlPlaneNodeID {
+		writeError(w, protocolError(contract.ErrorForbidden, "only the L1 control plane may read Computer inflight state"))
+		return
+	}
+	computerID := r.PathValue("computer_id")
+	count, err := s.store.CountComputerInflight(r.Context(), computerID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ComputerInflightState{ComputerID: computerID, NonterminalRootLineages: count})
 }
 
 func (s *Server) revokeComputerAttemptTokens(w http.ResponseWriter, r *http.Request) {
@@ -377,12 +393,7 @@ func (s *Server) getComputerSelf(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.ComputerSelf(scope))
 }
 
-func (s *Server) listComputerRuns(w http.ResponseWriter, r *http.Request) {
-	scope, ok := computerTokenFromRequest(r)
-	if !ok {
-		writeError(w, protocolError(contract.ErrorForbidden, "a Computer token is required to list Computer Runs"))
-		return
-	}
+func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	for name, values := range query {
 		switch name {
@@ -392,13 +403,13 @@ func (s *Server) listComputerRuns(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		default:
-			writeError(w, protocolError(contract.ErrorInvalidRequest, "unknown Computer Run list parameter %q", name))
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "unknown Run list parameter %q", name))
 			return
 		}
 	}
 	origins, present := query["origin"]
-	if !present || len(origins) != 1 || origins[0] != "computer:self" {
-		writeError(w, protocolError(contract.ErrorInvalidRequest, "origin=computer:self is required"))
+	if !present || len(origins) != 1 {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "exactly one origin is required"))
 		return
 	}
 	includeDescendants := false
@@ -418,7 +429,28 @@ func (s *Server) listComputerRuns(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	page, err := s.store.ListComputerRuns(r.Context(), scope, query.Get("cursor"), limit, includeDescendants)
+	var (
+		page ComputerRunPage
+		err  error
+	)
+	if scope, ok := computerTokenFromRequest(r); ok {
+		if origins[0] != "computer:self" {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "origin=computer:self is required"))
+			return
+		}
+		page, err = s.store.ListComputerRuns(r.Context(), scope, query.Get("cursor"), limit, includeDescendants)
+	} else {
+		if _, ok := runTokenFromRequest(r); ok {
+			writeError(w, protocolError(contract.ErrorForbidden, "run tokens cannot enumerate Computer-originated Runs"))
+			return
+		}
+		computerID, found := strings.CutPrefix(origins[0], "computer:")
+		if !found || strings.TrimSpace(computerID) == "" || computerID == "self" || computerID != strings.TrimSpace(computerID) {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "origin must be computer:COMPUTER_ID"))
+			return
+		}
+		page, err = s.store.ListRunsByComputerOrigin(r.Context(), computerID, query.Get("cursor"), limit, includeDescendants)
+	}
 	if err != nil {
 		writeError(w, err)
 		return

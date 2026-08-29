@@ -43,9 +43,9 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 			"submit_intent_revision", "submit_max_inflight", "submit_policy_revision", "created_ns", "updated_ns",
 		},
 		"computer_submission_audit": {
-			"computer_id", "submit_intent_revision", "policy_revision", "actor_fabric_id", "actor_user_id",
+			"audit_id", "computer_id", "submit_intent_revision", "policy_revision", "actor_fabric_id", "actor_user_id",
 			"actor_device_id", "previous_enabled", "submit_enabled", "submit_max_inflight", "idempotency_key",
-			"request_hash", "created_ns",
+			"request_hash", "mutation_applied", "created_ns",
 		},
 		"computer_job_projections": {
 			"computer_id", "job_id", "spec_revision", "current", "chown", "created_ns", "retired_ns",

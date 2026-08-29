@@ -125,15 +125,15 @@ func (s *Store) MintComputerToken(ctx context.Context, proof ComputerTokenScopeP
 
 // RevokeComputerTokens advances the authoritative grant record before callers
 // close transport reachability or report an administrative disable complete.
-func (s *Store) RevokeComputerTokens(ctx context.Context, request ComputerTokenRevocationRequest) error {
+func (s *Store) RevokeComputerTokens(ctx context.Context, request ComputerTokenRevocationRequest) (contract.ComputerTokenRevocationReceipt, error) {
 	request.ComputerID = strings.TrimSpace(request.ComputerID)
 	request.Reason = strings.TrimSpace(request.Reason)
 	if request.ComputerID == "" || len(request.ComputerID) > 255 || (!request.RevokeAll && request.SubmitIntentRevision < 1) || request.Reason == "" || len(request.Reason) > 255 {
-		return protocolError(contract.ErrorInvalidRequest, "Computer token revocation is incomplete")
+		return contract.ComputerTokenRevocationReceipt{}, protocolError(contract.ErrorInvalidRequest, "Computer token revocation is incomplete")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return internalError(err, "begin Computer token revocation")
+		return contract.ComputerTokenRevocationReceipt{}, internalError(err, "begin Computer token revocation")
 	}
 	defer tx.Rollback()
 	now := canonicalTime(s.clock.Now())
@@ -143,13 +143,15 @@ func (s *Store) RevokeComputerTokens(ctx context.Context, request ComputerTokenR
 		predicate = `computer_id=? AND revoked_ns IS NULL`
 		args = []any{request.ComputerID}
 	}
-	if err := revokeComputerGrantRows(ctx, tx, predicate, args, now.UnixNano(), request.Reason); err != nil {
-		return err
+	revoked, err := revokeComputerGrantRowsWithCount(ctx, tx, predicate, args, now.UnixNano(), request.Reason)
+	if err != nil {
+		return contract.ComputerTokenRevocationReceipt{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return internalError(err, "commit Computer token revocation")
+		return contract.ComputerTokenRevocationReceipt{}, internalError(err, "commit Computer token revocation")
 	}
-	return nil
+	return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
+		SubmitIntentRevision: request.SubmitIntentRevision, RevokedGrantCount: revoked, CommittedAt: now}, nil
 }
 
 func (s *Store) RevokeComputerTokenScope(ctx context.Context, scope ComputerTokenScope, reason string) error {
@@ -282,12 +284,47 @@ func (s *Store) CanComputerReadRun(ctx context.Context, scope ComputerTokenScope
 	return allowed == 1, nil
 }
 
+type queryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func countComputerInflight(ctx context.Context, q queryRower, computerID string) (int, error) {
+	computerID = strings.TrimSpace(computerID)
+	if computerID == "" {
+		return 0, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
+	}
+	var count int
+	err := q.QueryRowContext(ctx, `WITH RECURSIVE computer_lineages(root_id, run_id) AS (
+		SELECT r.run_id, r.run_id FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
+		WHERE t.source='computer' AND t.computer_id=? AND r.parent_run_id IS NULL
+		UNION ALL
+		SELECT lineage.root_id, child.run_id FROM computer_lineages lineage
+		JOIN runs child ON child.parent_run_id=lineage.run_id
+	)
+	SELECT COUNT(DISTINCT lineage.root_id) FROM computer_lineages lineage
+	JOIN runs member ON member.run_id=lineage.run_id
+	WHERE member.status NOT IN (?, ?)`, computerID, contract.RunSucceeded, contract.RunFailed).Scan(&count)
+	if err != nil {
+		return 0, internalError(err, "count Computer-submitted root Lineages")
+	}
+	return count, nil
+}
+
+func (s *Store) CountComputerInflight(ctx context.Context, computerID string) (int, error) {
+	return countComputerInflight(ctx, s.db, computerID)
+}
+
 type computerRunCursor struct {
 	ComputerID                string `json:"computer_id"`
-	ComputerStorageGeneration int64  `json:"computer_storage_generation"`
+	ComputerStorageGeneration *int64 `json:"computer_storage_generation,omitempty"`
 	IncludeDescendants        bool   `json:"include_descendants"`
 	CreatedNS                 int64  `json:"created_ns"`
 	RunID                     string `json:"run_id"`
+}
+
+type computerRunListScope struct {
+	ComputerID                string
+	ComputerStorageGeneration *int64
 }
 
 func encodeComputerRunCursor(cursor computerRunCursor) string {
@@ -298,7 +335,7 @@ func encodeComputerRunCursor(cursor computerRunCursor) string {
 	return base64.RawURLEncoding.EncodeToString(payload)
 }
 
-func decodeComputerRunCursor(value string, scope ComputerTokenScope, includeDescendants bool) (computerRunCursor, error) {
+func decodeComputerRunCursor(value string, scope computerRunListScope, includeDescendants bool) (computerRunCursor, error) {
 	if value == "" {
 		return computerRunCursor{ComputerID: scope.ComputerID, ComputerStorageGeneration: scope.ComputerStorageGeneration,
 			IncludeDescendants: includeDescendants}, nil
@@ -311,7 +348,7 @@ func decodeComputerRunCursor(value string, scope ComputerTokenScope, includeDesc
 	decoder := json.NewDecoder(strings.NewReader(string(payload)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&cursor); err != nil || cursor.ComputerID != scope.ComputerID ||
-		cursor.ComputerStorageGeneration != scope.ComputerStorageGeneration || cursor.IncludeDescendants != includeDescendants ||
+		!sameOptionalInt64(cursor.ComputerStorageGeneration, scope.ComputerStorageGeneration) || cursor.IncludeDescendants != includeDescendants ||
 		cursor.CreatedNS < 0 || strings.TrimSpace(cursor.RunID) == "" {
 		return computerRunCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid for this Computer Run scope")
 	}
@@ -321,7 +358,37 @@ func decodeComputerRunCursor(value string, scope ComputerTokenScope, includeDesc
 	return cursor, nil
 }
 
+func sameOptionalInt64(left, right *int64) bool {
+	return (left == nil && right == nil) || (left != nil && right != nil && *left == *right)
+}
+
 func (s *Store) ListComputerRuns(ctx context.Context, scope ComputerTokenScope, cursorValue string, limit int, includeDescendants bool) (ComputerRunPage, error) {
+	generation := scope.ComputerStorageGeneration
+	listScope := computerRunListScope{ComputerID: scope.ComputerID, ComputerStorageGeneration: &generation}
+	return s.listComputerRuns(ctx, listScope, cursorValue, limit, includeDescendants, func(runID string) error {
+		allowed, err := s.CanComputerReadRun(ctx, scope, runID)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return protocolError(contract.ErrorForbidden, "Computer Run list crossed its current scope")
+		}
+		return nil
+	})
+}
+
+// ListRunsByComputerOrigin is the ordinary L3 caller projection across every
+// Storage generation of one Computer. Computer-token callers use
+// ListComputerRuns instead and remain restricted to their current generation.
+func (s *Store) ListRunsByComputerOrigin(ctx context.Context, computerID, cursorValue string, limit int, includeDescendants bool) (ComputerRunPage, error) {
+	if strings.TrimSpace(computerID) == "" || computerID != strings.TrimSpace(computerID) {
+		return ComputerRunPage{}, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
+	}
+	return s.listComputerRuns(ctx, computerRunListScope{ComputerID: computerID}, cursorValue, limit, includeDescendants, nil)
+}
+
+func (s *Store) listComputerRuns(ctx context.Context, scope computerRunListScope, cursorValue string, limit int,
+	includeDescendants bool, authorize func(string) error) (ComputerRunPage, error) {
 	if limit < 1 || limit > MaxComputerRunPageLimit {
 		return ComputerRunPage{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxComputerRunPageLimit)
 	}
@@ -329,24 +396,30 @@ func (s *Store) ListComputerRuns(ctx context.Context, scope ComputerTokenScope, 
 	if err != nil {
 		return ComputerRunPage{}, err
 	}
+	var generation any
+	if scope.ComputerStorageGeneration != nil {
+		generation = *scope.ComputerStorageGeneration
+	}
 	query := `SELECT r.run_id, r.created_ns FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
-		WHERE r.parent_run_id IS NULL AND t.source='computer' AND t.computer_id=? AND t.computer_storage_generation=?
+		WHERE r.parent_run_id IS NULL AND t.source='computer' AND t.computer_id=?
+			AND (? IS NULL OR t.computer_storage_generation=?)
 			AND (r.created_ns>? OR (r.created_ns=? AND r.run_id>?))
 		ORDER BY r.created_ns, r.run_id LIMIT ?`
 	if includeDescendants {
 		query = `WITH RECURSIVE visible(run_id) AS (
 			SELECT r.run_id FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
-			WHERE r.parent_run_id IS NULL AND t.source='computer' AND t.computer_id=? AND t.computer_storage_generation=?
+			WHERE r.parent_run_id IS NULL AND t.source='computer' AND t.computer_id=?
+				AND (? IS NULL OR t.computer_storage_generation=?)
 			UNION ALL
 			SELECT child.run_id FROM runs child JOIN visible parent ON child.parent_run_id=parent.run_id
 		) SELECT r.run_id, r.created_ns FROM runs r JOIN visible v ON v.run_id=r.run_id
 		WHERE (r.created_ns>? OR (r.created_ns=? AND r.run_id>?))
 		ORDER BY r.created_ns, r.run_id LIMIT ?`
 	}
-	rows, err := s.db.QueryContext(ctx, query, scope.ComputerID, scope.ComputerStorageGeneration,
+	rows, err := s.db.QueryContext(ctx, query, scope.ComputerID, generation, generation,
 		cursor.CreatedNS, cursor.CreatedNS, cursor.RunID, limit+1)
 	if err != nil {
-		return ComputerRunPage{}, internalError(err, "list Computer Run IDs")
+		return ComputerRunPage{}, internalError(err, "list Computer-originated Run IDs")
 	}
 	type listedRun struct {
 		runID     string
@@ -357,16 +430,16 @@ func (s *Store) ListComputerRuns(ctx context.Context, scope ComputerTokenScope, 
 		var item listedRun
 		if err := rows.Scan(&item.runID, &item.createdNS); err != nil {
 			rows.Close()
-			return ComputerRunPage{}, internalError(err, "scan Computer Run ID")
+			return ComputerRunPage{}, internalError(err, "scan Computer-originated Run ID")
 		}
 		listed = append(listed, item)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return ComputerRunPage{}, internalError(err, "iterate Computer Run IDs")
+		return ComputerRunPage{}, internalError(err, "iterate Computer-originated Run IDs")
 	}
 	if err := rows.Close(); err != nil {
-		return ComputerRunPage{}, internalError(err, "close Computer Run list")
+		return ComputerRunPage{}, internalError(err, "close Computer-originated Run list")
 	}
 	page := ComputerRunPage{Runs: []contract.RunRecord{}}
 	hasMore := len(listed) > limit
@@ -374,12 +447,10 @@ func (s *Store) ListComputerRuns(ctx context.Context, scope ComputerTokenScope, 
 		listed = listed[:limit]
 	}
 	for _, item := range listed {
-		allowed, err := s.CanComputerReadRun(ctx, scope, item.runID)
-		if err != nil {
-			return ComputerRunPage{}, err
-		}
-		if !allowed {
-			return ComputerRunPage{}, protocolError(contract.ErrorForbidden, "Computer Run list crossed its current scope")
+		if authorize != nil {
+			if err := authorize(item.runID); err != nil {
+				return ComputerRunPage{}, err
+			}
 		}
 		record, err := s.GetRun(ctx, item.runID)
 		if err != nil {
@@ -418,12 +489,17 @@ func appendComputerTokenAudit(ctx context.Context, tx *sql.Tx, row computerToken
 }
 
 func revokeComputerGrantRows(ctx context.Context, tx *sql.Tx, predicate string, args []any, revokedNS int64, reason string) error {
+	_, err := revokeComputerGrantRowsWithCount(ctx, tx, predicate, args, revokedNS, reason)
+	return err
+}
+
+func revokeComputerGrantRowsWithCount(ctx context.Context, tx *sql.Tx, predicate string, args []any, revokedNS int64, reason string) (int, error) {
 	query := `SELECT grant_id, computer_id, computer_attempt_id, computer_storage_generation, submit_intent_revision,
 		host_node_id, l3_authority_generation, grant_revision, submit_max_inflight, token_hash
 		FROM computer_token_grants WHERE ` + predicate
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
-		return internalError(err, "list Computer grants for revocation")
+		return 0, internalError(err, "list Computer grants for revocation")
 	}
 	var grants []computerTokenAuditRow
 	for rows.Next() {
@@ -432,22 +508,22 @@ func revokeComputerGrantRows(ctx context.Context, tx *sql.Tx, predicate string, 
 			&row.SubmitIntentRevision, &row.HostNodeID, &row.AuthorityGeneration, &row.GrantRevision,
 			&row.SubmitMaxInflight, &row.TokenHash); err != nil {
 			rows.Close()
-			return internalError(err, "scan Computer grant for revocation")
+			return 0, internalError(err, "scan Computer grant for revocation")
 		}
 		row.Operation, row.Reason, row.OccurredNS = "revoked", reason, revokedNS
 		grants = append(grants, row)
 	}
 	if err := rows.Close(); err != nil {
-		return internalError(err, "close Computer grants for revocation")
+		return 0, internalError(err, "close Computer grants for revocation")
 	}
 	for _, grant := range grants {
 		if _, err := tx.ExecContext(ctx, `UPDATE computer_token_grants SET revoked_ns=?, revocation_reason=?
 			WHERE grant_id=? AND revoked_ns IS NULL`, revokedNS, reason, grant.GrantID); err != nil {
-			return internalError(err, "revoke Computer token grant")
+			return 0, internalError(err, "revoke Computer token grant")
 		}
 		if err := appendComputerTokenAudit(ctx, tx, grant); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return len(grants), nil
 }
