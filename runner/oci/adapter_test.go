@@ -638,6 +638,46 @@ func TestAdapterIgnoreTERMWaitsForSlowPostKILLReleaseWithinStopBudget(t *testing
 	}
 }
 
+func TestAdapterServiceExitRacesKillAndKeepsTerminalEvidence(t *testing.T) {
+	engine := &adapterTestEngine{
+		watchSignals:   make(chan ocihelper.Signal, 1),
+		ignoreTERM:     true,
+		exitOnKillRace: true,
+	}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+	request.TerminationGrace = 10 * time.Millisecond
+	started := make(chan struct{})
+	request.Started = func() { close(started) }
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct {
+		result workloadrunner.Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := adapter.Run(ctx, request, nil)
+		done <- struct {
+			result workloadrunner.Result
+			err    error
+		}{result: result, err: err}
+	}()
+	<-started
+	cancel()
+	finished := <-done
+	if finished.err != nil || finished.result.Outcome.Signal != "terminated" || finished.result.Outcome.TerminationCause != contract.TerminationCauseAgent {
+		t.Fatalf("exit-during-grace cancellation = (%+v, %v)", finished.result.Outcome, finished.err)
+	}
+	engine.mu.Lock()
+	got := slices.Clone(engine.signals)
+	engine.mu.Unlock()
+	if !slices.Equal(got, []ocihelper.Signal{ocihelper.SignalTERM, ocihelper.SignalKILL}) {
+		t.Fatalf("signal attempts = %v, want TERM then raced KILL", got)
+	}
+}
+
 func TestAdapterServiceUninterruptiblePayloadDoesNotReportRuntimeLoss(t *testing.T) {
 	engine := &adapterTestEngine{watchSignals: make(chan ocihelper.Signal, 2), ignoreTERM: true, ignoreKILL: true}
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
@@ -663,6 +703,40 @@ func TestAdapterServiceUninterruptiblePayloadDoesNotReportRuntimeLoss(t *testing
 	}
 	if recoveries != 0 {
 		t.Fatalf("uninterruptible payload triggered %d namespace recoveries", recoveries)
+	}
+}
+
+func TestAdapterReapedTaskWithoutWaitConfirmationReportsRuntimeLoss(t *testing.T) {
+	engine := &adapterTestEngine{
+		watchSignals:          make(chan ocihelper.Signal),
+		ignoreTERM:            true,
+		killAlreadyTerminated: true,
+	}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+	request.TerminationGrace = 10 * time.Millisecond
+	recoveries := 0
+	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
+	started := make(chan struct{})
+	request.Started = func() { close(started) }
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := adapter.Run(ctx, request, nil)
+		done <- err
+	}()
+	<-started
+	cancel()
+	err := <-done
+	var runtimeLoss *ocihelper.RuntimeLossError
+	if !errors.As(err, &runtimeLoss) || !strings.Contains(err.Error(), "did not confirm exit after KILL") {
+		t.Fatalf("reaped task without Wait confirmation = %T %v, want typed runtime loss", err, err)
+	}
+	if recoveries != 1 {
+		t.Fatalf("reaped task without Wait confirmation recoveries = %d, want 1", recoveries)
 	}
 }
 
@@ -1225,38 +1299,40 @@ func TestServiceRestartRejectsChangedProbePlatformWithoutMutatingFirstBinding(t 
 }
 
 type adapterTestEngine struct {
-	mu                 sync.Mutex
-	watch              ocihelper.WatchResponse
-	deletes            int
-	runtimeDeletes     int
-	refuseDelete       bool
-	runErr             error
-	startedAt          time.Time
-	ensureErrors       []error
-	ensureCalls        int
-	responseDigest     string
-	responsePlatform   ocihelper.OCIPlatform
-	ensureEntered      chan struct{}
-	releaseEnsure      chan struct{}
-	lastRun            ocihelper.RunRequest
-	lastEnsure         ocihelper.EnsureImageRequest
-	bridgeExchange     chan error
-	missingUntilEnsure bool
-	reconcileCalls     int
-	watchSignals       chan ocihelper.Signal
-	ignoreTERM         bool
-	ignoreKILL         bool
-	releaseDelay       time.Duration
-	blockSignal        bool
-	signals            []ocihelper.Signal
-	watchErrorOnCancel bool
-	inventoryRemoval   ocihelper.InventoryRemovalResponse
-	inventoryErr       error
-	attestRemoval      ocihelper.AttestRemovalResponse
-	attestErr          error
-	doctorPlatform     ocihelper.OCIPlatform
-	doctorErr          error
-	doctorCalls        int
+	mu                    sync.Mutex
+	watch                 ocihelper.WatchResponse
+	deletes               int
+	runtimeDeletes        int
+	refuseDelete          bool
+	runErr                error
+	startedAt             time.Time
+	ensureErrors          []error
+	ensureCalls           int
+	responseDigest        string
+	responsePlatform      ocihelper.OCIPlatform
+	ensureEntered         chan struct{}
+	releaseEnsure         chan struct{}
+	lastRun               ocihelper.RunRequest
+	lastEnsure            ocihelper.EnsureImageRequest
+	bridgeExchange        chan error
+	missingUntilEnsure    bool
+	reconcileCalls        int
+	watchSignals          chan ocihelper.Signal
+	ignoreTERM            bool
+	ignoreKILL            bool
+	exitOnKillRace        bool
+	killAlreadyTerminated bool
+	releaseDelay          time.Duration
+	blockSignal           bool
+	signals               []ocihelper.Signal
+	watchErrorOnCancel    bool
+	inventoryRemoval      ocihelper.InventoryRemovalResponse
+	inventoryErr          error
+	attestRemoval         ocihelper.AttestRemovalResponse
+	attestErr             error
+	doctorPlatform        ocihelper.OCIPlatform
+	doctorErr             error
+	doctorCalls           int
 }
 
 func (engine *adapterTestEngine) DoctorStatus(context.Context) (ocihelper.DoctorStatus, error) {
@@ -1367,11 +1443,20 @@ func (engine *adapterTestEngine) Signal(ctx context.Context, request ocihelper.S
 	engine.signals = append(engine.signals, request.Signal)
 	watchSignals := engine.watchSignals
 	ignore := request.Signal == ocihelper.SignalTERM && engine.ignoreTERM || request.Signal == ocihelper.SignalKILL && engine.ignoreKILL
+	exitOnKillRace := request.Signal == ocihelper.SignalKILL && engine.exitOnKillRace
+	killAlreadyTerminated := request.Signal == ocihelper.SignalKILL && engine.killAlreadyTerminated
 	block := engine.blockSignal
 	engine.mu.Unlock()
 	if block {
 		<-ctx.Done()
 		return ctx.Err()
+	}
+	if watchSignals != nil && exitOnKillRace {
+		watchSignals <- ocihelper.SignalTERM
+		return ocihelper.ErrTaskAlreadyTerminated
+	}
+	if killAlreadyTerminated {
+		return ocihelper.ErrTaskAlreadyTerminated
 	}
 	if watchSignals != nil && !ignore {
 		watchSignals <- request.Signal

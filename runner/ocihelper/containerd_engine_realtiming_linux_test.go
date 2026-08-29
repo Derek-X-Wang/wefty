@@ -69,21 +69,23 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	computerReference := os.Getenv("WEFTY_OCI_COMPUTER_REFERENCE")
 	computerDigest := os.Getenv("WEFTY_OCI_COMPUTER_DIGEST")
 	computerArchivePath := os.Getenv("WEFTY_OCI_COMPUTER_ARCHIVE")
+	computerVariant := os.Getenv("WEFTY_OCI_COMPUTER_VARIANT")
 	waylandComputerReference := os.Getenv("WEFTY_OCI_WAYLAND_COMPUTER_REFERENCE")
 	waylandComputerDigest := os.Getenv("WEFTY_OCI_WAYLAND_COMPUTER_DIGEST")
 	waylandComputerArchivePath := os.Getenv("WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE")
 	provisionReceipt := os.Getenv("WEFTY_OCI_PROVISION_RECEIPT")
-	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoDigest == "" || echoArchivePath == "" || weftyCLI == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" || computerReference == "" || computerDigest == "" || computerArchivePath == "" || waylandComputerReference == "" || waylandComputerDigest == "" || waylandComputerArchivePath == "" || provisionReceipt == "" {
+	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoDigest == "" || echoArchivePath == "" || weftyCLI == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" || computerReference == "" || computerDigest == "" || computerArchivePath == "" || computerVariant == "" || waylandComputerReference == "" || waylandComputerDigest == "" || waylandComputerArchivePath == "" || provisionReceipt == "" {
 		t.Fatal("Linux OCI realtiming provisioning is incomplete")
 	}
 	if reference != echoReference || digest != echoDigest || archivePath != echoArchivePath || reference != "ghcr.io/derek-x-wang/wefty-echo-service" {
 		t.Fatalf("probe and workload did not consume one canonical public artifact: probe=%s@%s archive=%s echo=%s@%s archive=%s", reference, digest, archivePath, echoReference, echoDigest, echoArchivePath)
 	}
-	if computerReference != "ghcr.io/derek-x-wang/wefty-computer-reference" || computerReference == echoReference || computerArchivePath == echoArchivePath {
-		t.Fatalf("reference Computer artifact is not separate from generic OCI acceptance: %s@%s archive=%s", computerReference, computerDigest, computerArchivePath)
-	}
-	if waylandComputerReference != "ghcr.io/derek-x-wang/wefty-computer-wayland-reference" || waylandComputerReference == computerReference || waylandComputerArchivePath == computerArchivePath {
-		t.Fatalf("Wayland reference Computer artifact is not separate: %s@%s archive=%s", waylandComputerReference, waylandComputerDigest, waylandComputerArchivePath)
+	if err := validateNativeLinuxComputerArtifacts(nativeLinuxComputerArtifacts{
+		Variant: computerVariant, GenericReference: echoReference, GenericArchive: echoArchivePath,
+		SelectedReference: computerReference, SelectedDigest: computerDigest, SelectedArchive: computerArchivePath,
+		WaylandReference: waylandComputerReference, WaylandDigest: waylandComputerDigest, WaylandArchive: waylandComputerArchivePath,
+	}); err != nil {
+		t.Fatalf("reference Computer artifact separation: %v: selected=%s@%s archive=%s wayland=%s@%s archive=%s", err, computerReference, computerDigest, computerArchivePath, waylandComputerReference, waylandComputerDigest, waylandComputerArchivePath)
 	}
 	if os.Geteuid() == 0 {
 		t.Fatal("Linux OCI realtiming test process must be unprivileged")

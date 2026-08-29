@@ -643,6 +643,15 @@ func TestBootBarrierReceiptsRetainedHandoffInventoryWithoutCallingItResidue(t *t
 	if !ok || !receipt.VerifiedAbsent || !slices.Equal(receipt.VerifiedInventory.ManagedVolumes, []string{handoff}) {
 		t.Fatalf("retained handoff verification receipt = %+v, ok=%t", receipt, ok)
 	}
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.EnsureImage(t.Context(), EnsureImageRequest{
+		Reference: "registry.invalid/app", Platform: testImagePlatform,
+	}, nil); err != nil {
+		t.Fatalf("retention-aware boot sweep left OCI operations embargoed: %v", err)
+	}
 }
 
 func TestHelperRestartSweepsAndVerifiesBeforeAcceptingSession(t *testing.T) {
@@ -1495,6 +1504,35 @@ func TestSweepGateAndClosedWorkloadValidation(t *testing.T) {
 	assertRPCCode(t, err, CodeInvalidRequest)
 }
 
+func TestSignalAlreadyTerminatedPreservesVerifiedSession(t *testing.T) {
+	engine := newFakeEngine()
+	engine.signalErr = ErrTaskAlreadyTerminated
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	authority := testAuthority()
+	if _, err := session.Run(t.Context(), testRunRequest(authority, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := session.SignalResult(t.Context(), SignalRequest{Authority: authority, Signal: SignalKILL})
+	if err != nil {
+		t.Fatalf("KILL racing terminal transition = %v, want already-terminated success", err)
+	}
+	if !response.AlreadyTerminated {
+		t.Fatalf("KILL racing terminal transition response = %+v, want already-terminated fact", response)
+	}
+	if err := session.EnsureImage(t.Context(), EnsureImageRequest{
+		Reference: "registry.invalid/app", Platform: testImagePlatform,
+	}, nil); err != nil {
+		t.Fatalf("already-terminated Signal invalidated verified session: %v", err)
+	}
+}
+
 func TestEnsureImageRejectsEmbeddedDigestReference(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -1979,6 +2017,7 @@ type fakeEngine struct {
 	releaseSweep             chan struct{}
 	signalEntered            chan struct{}
 	releaseSignal            chan struct{}
+	signalErr                error
 	sessionReapErr           error
 	verifyResponses          []VerifyResponse
 	dialAttemptWithoutMarker bool
@@ -2448,7 +2487,10 @@ func (engine *fakeEngine) Signal(context.Context, SignalRequest) error {
 		close(signalEntered)
 		<-releaseSignal
 	}
-	return nil
+	engine.mu.Lock()
+	err := engine.signalErr
+	engine.mu.Unlock()
+	return err
 }
 func (engine *fakeEngine) SetComputerControlState(_ context.Context, request SetComputerControlStateRequest) error {
 	engine.record("SetComputerControlState")

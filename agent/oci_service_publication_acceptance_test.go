@@ -43,11 +43,11 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 		t.Fatal("Linux OCI service publication realtiming provisioning is incomplete")
 	}
 	var healthOK, echoOK, startupTimedOut, withdrawalObserved, republicationObserved bool
-	var portCollisionAvoided, portlessOK, gracefulStopOK, restartIdentityOK bool
+	var portCollisionAvoided, portlessOK, gracefulStopOK, killEscalationOK, restartIdentityOK bool
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
 			helperTunnelOK := healthOK && echoOK
-			evidence := fmt.Sprintf("platform=%s/%s\nhealth=%t\necho=%t\nstartup_timeout=%t\nwithdrawal=%t\nrepublication=%t\nport_collision_avoided=%t\nportless_started=%t\nhelper_tunnel=%t\nterm_grace_stop=%t\nfresh_restart_authority=%t\n", runtime.GOOS, runtime.GOARCH, healthOK, echoOK, startupTimedOut, withdrawalObserved, republicationObserved, portCollisionAvoided, portlessOK, helperTunnelOK, gracefulStopOK, restartIdentityOK)
+			evidence := fmt.Sprintf("platform=%s/%s\nhealth=%t\necho=%t\nstartup_timeout=%t\nwithdrawal=%t\nrepublication=%t\nport_collision_avoided=%t\nportless_started=%t\nhelper_tunnel=%t\nterm_cooperative_stop=%t\nterm_kill_escalation=%t\nterm_grace_stop=%t\nfresh_restart_authority=%t\n", runtime.GOOS, runtime.GOARCH, healthOK, echoOK, startupTimedOut, withdrawalObserved, republicationObserved, portCollisionAvoided, portlessOK, helperTunnelOK, gracefulStopOK, killEscalationOK, gracefulStopOK && killEscalationOK, restartIdentityOK)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-publication-"+runtime.GOOS+".txt"), []byte(evidence), 0o600); err != nil {
 				t.Errorf("write OCI service publication evidence: %v", err)
 			}
@@ -141,6 +141,7 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	}
 
 	gracefulStopOK = primary.stop(t, adapter)
+	killEscalationOK = verifyNativeOCIServiceKILLEscalation(t, ctx, adapter, reference, digest)
 	restarted := startNativeOCIService(t, ctx, adapter, reference, digest, "primary-restart", primary.requestAuthority.JobID, nil, true)
 	primaryResources, primaryIdentityErr := ocihelper.DeterministicResourceIdentity(ocirunner.HelperAuthority(primary.requestAuthority))
 	restartedResources, restartedIdentityErr := ocihelper.DeterministicResourceIdentity(ocirunner.HelperAuthority(restarted.requestAuthority))
@@ -762,9 +763,7 @@ terminate() {
   trap - TERM
   if test -n "$server"; then
     kill "$server" 2>/dev/null || true
-    wait "$server" 2>/dev/null
-    status=$?
-    exit "$status"
+    wait "$server" 2>/dev/null || true
   fi
   exit 143
 }
@@ -773,6 +772,9 @@ while :; do
   /bin/httpd -f -p "127.0.0.1:$WEFTY_SERVICE_PORT" -h /tmp/wefty-www &
   server=$!
   printf '%s\n' "$server" >/tmp/wefty-httpd.pid
+  # Keep PID 1 available to run its TERM trap. The integer sleep is portable
+  # across BusyBox builds and WithKillAll interrupts both it and httpd.
+  while kill -0 "$server" 2>/dev/null; do sleep 1; done
   wait "$server"
   status=$?
   if test -f /tmp/wefty-listener-restart; then
@@ -783,6 +785,58 @@ while :; do
   fi
 done
 `
+
+func verifyNativeOCIServiceKILLEscalation(t *testing.T, parent context.Context, adapter *ocirunner.Adapter, reference, digest string) bool {
+	t.Helper()
+	request := nativeOCIServiceRequest(reference, digest, "term-ignoring", []string{
+		"/bin/sh", "-c", `trap '' TERM; while :; do sleep 60; done`,
+	})
+	started := make(chan struct{})
+	request.Started = func() { close(started) }
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct {
+		result workloadrunner.Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := adapter.Run(ctx, request, nil)
+		done <- struct {
+			result workloadrunner.Result
+			err    error
+		}{result: result, err: err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("TERM-ignoring OCI service did not start")
+	}
+	stopStarted := time.Now()
+	cancel()
+	var outcome struct {
+		result workloadrunner.Result
+		err    error
+	}
+	select {
+	case outcome = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("TERM-ignoring OCI service did not reach bounded KILL escalation")
+	}
+	elapsed := time.Since(stopStarted)
+	if outcome.err != nil || outcome.result.Outcome.Signal != "killed" || outcome.result.Outcome.TerminationCause != contract.TerminationCauseAgent {
+		t.Fatalf("TERM-ignoring OCI service escalation = (%+v, %v)", outcome.result.Outcome, outcome.err)
+	}
+	if elapsed < processrunner.DefaultTerminationGraceTime || elapsed >= 10*time.Second {
+		t.Fatalf("TERM-ignoring OCI service escalation elapsed %s, want grace honoured and completion inside stop budget", elapsed)
+	}
+	ctxReap, cancelReap := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelReap()
+	receipt, err := adapter.ReapAndVerify(ctxReap, workloadrunner.ReapRequest{Authority: request.Authority})
+	if err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("TERM-ignoring OCI service cleanup = (%+v, %v)", receipt, err)
+	}
+	return true
+}
 
 func (service *nativeOCIService) request(t *testing.T, method, path string, body []byte) []byte {
 	t.Helper()

@@ -424,7 +424,14 @@ func (session *Session) Run(ctx context.Context, request RunRequest) (RunRespons
 }
 
 func (session *Session) Signal(ctx context.Context, request SignalRequest) error {
-	return session.call(ctx, MethodSignal, request, &struct{}{})
+	_, err := session.SignalResult(ctx, request)
+	return err
+}
+
+func (session *Session) SignalResult(ctx context.Context, request SignalRequest) (SignalResponse, error) {
+	var response SignalResponse
+	err := session.call(ctx, MethodSignal, request, &response)
+	return response, err
 }
 
 func (session *Session) SetComputerControlState(ctx context.Context, request SetComputerControlStateRequest) error {

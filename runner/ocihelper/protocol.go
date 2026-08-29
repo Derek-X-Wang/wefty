@@ -706,6 +706,13 @@ type SignalRequest struct {
 	Signal    Signal           `json:"signal"`
 }
 
+// SignalResponse distinguishes a signal delivered to a live task from the
+// benign race where containerd had already reaped the task. Watch remains the
+// authority for the terminal outcome in both cases.
+type SignalResponse struct {
+	AlreadyTerminated bool `json:"already_terminated"`
+}
+
 type SetComputerControlStateRequest struct {
 	Authority    AttemptAuthority `json:"authority"`
 	HumanDriving bool             `json:"human_driving"`

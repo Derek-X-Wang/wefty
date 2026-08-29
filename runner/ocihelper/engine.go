@@ -10,6 +10,11 @@ import (
 
 const DefaultContainerdAddress = "/run/containerd/containerd.sock"
 
+// ErrTaskAlreadyTerminated is the closed engine fact returned when Signal
+// races a task's terminal transition. The helper must continue to Watch for
+// terminal evidence instead of treating this as engine loss.
+var ErrTaskAlreadyTerminated = errors.New("OCI task already terminated")
+
 // NativeEngineConfig contains only host-side helper configuration. The agent
 // never supplies these values over the helper protocol.
 type NativeEngineConfig struct {

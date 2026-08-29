@@ -1218,14 +1218,14 @@ func terminateAndWait(
 			return nil, false
 		}
 	}
-	signal := func(value ocihelper.Signal) error {
+	signal := func(value ocihelper.Signal) (ocihelper.SignalResponse, error) {
 		signalContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminationSignalTimeout)
 		defer cancel()
-		err := session.Signal(signalContext, ocihelper.SignalRequest{Authority: authority, Signal: value})
+		response, err := session.SignalResult(signalContext, ocihelper.SignalRequest{Authority: authority, Signal: value})
 		if errors.Is(signalContext.Err(), context.DeadlineExceeded) {
-			return &ocihelper.RuntimeLossError{Cause: err}
+			return response, &ocihelper.RuntimeLossError{Cause: err}
 		}
-		return err
+		return response, err
 	}
 
 	select {
@@ -1233,7 +1233,7 @@ func terminateAndWait(
 		return err
 	default:
 	}
-	termErr := signal(ocihelper.SignalTERM)
+	_, termErr := signal(ocihelper.SignalTERM)
 	if termErr == nil {
 		if err, done := watchResult(grace); done {
 			return err
@@ -1245,7 +1245,7 @@ func terminateAndWait(
 		default:
 		}
 	}
-	killErr := signal(ocihelper.SignalKILL)
+	killResponse, killErr := signal(ocihelper.SignalKILL)
 	if killErr != nil {
 		select {
 		case err := <-watchDone:
@@ -1261,7 +1261,14 @@ func terminateAndWait(
 	if err, done := watchResult(ocihelper.DefaultTaskReleaseTimeout + postKillReleaseMargin); done {
 		return err
 	}
-	return errors.New("OCI helper Watch did not confirm exit after KILL")
+	unconfirmed := errors.New("OCI helper Watch did not confirm exit after KILL")
+	if killResponse.AlreadyTerminated {
+		// A reaped task whose Wait stream never resolves is positive shim/control
+		// loss: the payload is gone, but this helper generation cannot publish
+		// the terminal fact needed to safely retain namespace authority.
+		return &ocihelper.RuntimeLossError{Cause: unconfirmed}
+	}
+	return unconfirmed
 }
 
 func helperRunDefinitivelyRejected(err error) bool {

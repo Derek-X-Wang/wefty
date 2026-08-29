@@ -58,6 +58,7 @@ type containerdAttempt struct {
 	computerDisk     *computerDiskAttachment
 	container        containerd.Container
 	task             containerd.Task
+	signaler         containerdTaskSignaler
 	releaseTask      func(context.Context) error
 	terminalReady    chan struct{}
 	terminalCode     uint32
@@ -79,6 +80,10 @@ type containerdAttempt struct {
 	computerGID      uint32
 	controlMu        sync.Mutex
 	mu               sync.Mutex
+}
+
+type containerdTaskSignaler interface {
+	Kill(context.Context, syscall.Signal, ...containerd.KillOpts) error
 }
 
 type ContainerdEngine struct {
@@ -1058,7 +1063,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		attemptCancel()
 		return RunResponse{}, fmt.Errorf("register task Wait before Start: %w", err)
 	}
-	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, computerDisk: computerDisk, container: container, task: task, releaseTask: func(ctx context.Context) error {
+	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, computerDisk: computerDisk, container: container, task: task, signaler: task, releaseTask: func(ctx context.Context) error {
 		_, deleteErr := task.Delete(engineContext(ctx))
 		if errdefs.IsNotFound(deleteErr) {
 			return nil
@@ -1293,14 +1298,18 @@ func (engine *ContainerdEngine) Signal(ctx context.Context, request SignalReques
 	if request.Signal == SignalKILL {
 		signal = syscall.SIGKILL
 	}
-	if err := attempt.task.Kill(engineContext(ctx), signal, containerd.WithKillAll); err != nil {
-		return err
+	signaler := attempt.signaler
+	if signaler == nil {
+		signaler = attempt.task
 	}
-	attempt.mu.Lock()
-	attempt.signal = request.Signal
-	attempt.signalCause = "agent"
-	attempt.mu.Unlock()
-	return nil
+	return deliverSignalAndRecord(request.Signal, "agent", func() error {
+		return normalizeContainerdSignalError(signaler.Kill(engineContext(ctx), signal, containerd.WithKillAll))
+	}, func(delivered Signal, cause string) {
+		attempt.mu.Lock()
+		attempt.signal = delivered
+		attempt.signalCause = cause
+		attempt.mu.Unlock()
+	})
 }
 
 func (engine *ContainerdEngine) Watch(ctx context.Context, request WatchRequest, emit func(WatchEvent) error) error {
@@ -1356,27 +1365,24 @@ func (engine *ContainerdEngine) Watch(ctx context.Context, request WatchRequest,
 		}
 	}
 	attempt.mu.Lock()
-	oom, sentSignal, signalCause := attempt.oom || cgroupReportedOOM(engine.config.CgroupRoot, attempt.resources.CgroupID), attempt.signal, attempt.signalCause
+	oom := attempt.oom || cgroupReportedOOM(engine.config.CgroupRoot, attempt.resources.CgroupID)
+	attempt.mu.Unlock()
+	result := attempt.terminalResult(oom, logIncomplete)
+	return emit(WatchEvent{Kind: WatchComplete, Result: &result})
+}
+
+func (attempt *containerdAttempt) terminalResult(oom, logIncomplete bool) WatchResponse {
+	attempt.mu.Lock()
+	sentSignal, signalCause := attempt.signal, attempt.signalCause
 	code, waitErr := attempt.terminalCode, attempt.terminalErr
 	attempt.mu.Unlock()
-	if waitErr != nil {
-		return emit(WatchEvent{Kind: WatchComplete, Result: &WatchResponse{RuntimeFailure: waitErr.Error(), OutOfMemory: oom, LogEvidenceIncomplete: logIncomplete}})
-	}
 	// A post-hoc free-byte sample cannot prove that this attempt observed
 	// ENOSPC. Until a positive guest/runtime event is available, retain the
 	// filesystem sample only in the admission receipt and leave this fact absent.
-	result := &WatchResponse{OutOfMemory: oom, LogEvidenceIncomplete: logIncomplete}
 	// containerd ExitStatus exposes only a numeric code. Therefore 137/143 are
 	// plain exits unless this helper independently observed successful delivery
 	// of the matching signal.
-	if (sentSignal == SignalKILL && code == 128+uint32(syscall.SIGKILL)) || (sentSignal == SignalTERM && code == 128+uint32(syscall.SIGTERM)) {
-		result.Signal = sentSignal
-		result.TerminationCause = signalCause
-	} else {
-		exitCode := int(code)
-		result.ExitCode = &exitCode
-	}
-	return emit(WatchEvent{Kind: WatchComplete, Result: result})
+	return terminalResultFromSignalDelivery(code, waitErr, sentSignal, signalCause, oom, logIncomplete)
 }
 
 func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatus, cgroupRoot string, releaseTimeout time.Duration) {
