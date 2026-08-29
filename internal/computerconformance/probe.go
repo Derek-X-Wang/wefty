@@ -214,6 +214,18 @@ type InputSession struct{ connection *websocketConnection }
 
 func (session *InputSession) Close() { session.connection.close() }
 
+// SendKey appends a key press and release to an established RFB session. The
+// control oracle uses the same session that focused the guest surface so the
+// compositor cannot discard the key while switching between RFB clients.
+func (session *InputSession) SendKey() error {
+	for _, event := range rfbKeyEvents() {
+		if err := session.connection.writeFrame(2, event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func StartInput(ctx context.Context, port, x, y int) (*InputSession, error) {
 	return startRFBEvents(ctx, port, rfbInputEvents(true, x, y))
 }
@@ -223,14 +235,6 @@ func StartInput(ctx context.Context, port, x, y int) (*InputSession, error) {
 // through the backend's input queue without relying on a fixed sleep.
 func StartPointer(ctx context.Context, port, x, y int) (*InputSession, error) {
 	return startRFBEvents(ctx, port, rfbInputEvents(false, x, y))
-}
-
-// StartKey sends a key only after the compositor-side pointer observer has
-// restored focus to the native keyboard client. Keeping this as a separate
-// RFB session makes the control proof causal instead of depending on input
-// dispatch timing between two Wayland clients.
-func StartKey(ctx context.Context, port int) (*InputSession, error) {
-	return startRFBEvents(ctx, port, rfbKeyEvents())
 }
 
 func startRFBEvents(ctx context.Context, port int, events [][]byte) (*InputSession, error) {
