@@ -580,12 +580,26 @@ func (r *runtimeRunner) checkDriver(ctx context.Context) {
 
 type inputObservation struct {
 	Version        int      `json:"version"`
+	Ready          *bool    `json:"ready,omitempty"`
 	Generation     uint64   `json:"generation"`
 	KeyEvents      uint64   `json:"key_events"`
 	X              int      `json:"x"`
 	Y              int      `json:"y"`
 	PointerHistory [][2]int `json:"pointer_history"`
 	ObserverLines  uint64   `json:"observer_lines"`
+}
+
+func (r *runtimeRunner) waitInputReady(ctx context.Context) bool {
+	for attempt := 0; attempt < 400; attempt++ {
+		observation, err := r.readInputObservation(ctx)
+		if err == nil && (observation.Ready == nil || *observation.Ready) {
+			return true
+		}
+		if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
+			return false
+		}
+	}
+	return false
 }
 
 func (r *runtimeRunner) readInputObservation(ctx context.Context) (inputObservation, error) {
@@ -723,6 +737,10 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 		return
 	}
 	if !r.requireTools(ids, "cat") {
+		return
+	}
+	if !r.waitInputReady(ctx) {
+		r.record(ids[0], StatusFail, "guest input observer did not become ready")
 		return
 	}
 	if !r.proveViewIsolation(ctx, ids[0], 211, 173, 947, 411) {

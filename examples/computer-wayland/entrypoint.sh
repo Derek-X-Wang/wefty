@@ -72,16 +72,6 @@ start chromium --no-sandbox --disable-gpu --disable-software-rasterizer=false \
   --no-first-run --no-default-browser-check --class=chromium \
   --user-data-dir="$HOME/.config/chromium" --app=http://127.0.0.1:18888/ 2>/dev/null
 
-surface_wait=25
-while [ "$surface_wait" -gt 0 ] && { [ ! -s /tmp/wefty-computer/surface-ready ] || [ ! -s /tmp/wefty-computer/driver-state.json ]; }; do
-  sleep 1
-  surface_wait=$((surface_wait - 1))
-done
-if [ "$surface_wait" -eq 0 ]; then
-  echo 'Wayland input surface or driver observer did not become ready within 25 seconds' >&2
-  exit 1
-fi
-
 supervise_edge() (
   role=$1
   port=$2
@@ -107,6 +97,16 @@ while [ "$edge_wait" -gt 0 ] && { [ ! -s /tmp/wefty-computer/view-edge-ready ] |
 done
 if [ "$edge_wait" -eq 0 ]; then
   echo 'native view and control listeners did not become ready within 5 seconds' >&2
+  exit 1
+fi
+
+surface_wait=45
+while [ "$surface_wait" -gt 0 ] && { [ ! -s /tmp/wefty-computer/surface-ready ] || [ ! -s /tmp/wefty-computer/driver-state.json ]; }; do
+  sleep 1
+  surface_wait=$((surface_wait - 1))
+done
+if [ "$surface_wait" -eq 0 ]; then
+  echo 'Wayland input surface or driver observer did not become ready within 45 seconds' >&2
   exit 1
 fi
 

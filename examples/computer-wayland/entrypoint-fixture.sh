@@ -113,9 +113,9 @@ supervise_edge() (
   done
 )
 
-# Prepare assertion-derived input and driver state before exposing the edges.
-# The checker can begin its oracle probes immediately after RFB readiness, so
-# publishing either edge before these files exist would create a startup race.
+# Start assertion-derived input and driver observers independently of the
+# listener-owned edges. The checker waits on the oracle's explicit ready bit
+# before sending input; edge readiness never depends on the browser surface.
 DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --session --fork --print-address)
 export DBUS_SESSION_BUS_ADDRESS
 start /usr/local/libexec/wefty-watch-driver
@@ -124,16 +124,6 @@ start chromium --no-sandbox --disable-gpu --disable-software-rasterizer=false \
   --ozone-platform=wayland --enable-features=UseOzonePlatform \
   --no-first-run --no-default-browser-check --class=chromium \
   --user-data-dir="$HOME/.config/chromium" --app=http://127.0.0.1:18888/ 2>/dev/null
-oracle_wait=25
-while [ "$oracle_wait" -gt 0 ] && { [ ! -s /tmp/wefty-computer/surface-ready ] || [ ! -s /tmp/wefty-computer/driver-state.json ]; }; do
-  sleep 1
-  oracle_wait=$((oracle_wait - 1))
-done
-if [ "$oracle_wait" -eq 0 ]; then
-  echo 'Wayland input surface or driver observer did not become ready within 25 seconds' >&2
-  exit 1
-fi
-
 view_flag=--disable-input
 if [ "$mutation" = view-accepts-input ]; then view_flag=; fi
 wait_native_edge() {
@@ -163,6 +153,16 @@ if [ "$mutation" = plain-tcp-control ]; then
   start python3 -m http.server "$control_port" --bind 127.0.0.1
 elif [ -n "$mutation" ] && [ "$mutation" != missing-control-endpoint ] && [ "$mutation" != duplicate-endpoint ]; then
   start supervise_edge control "$control_port"
+fi
+
+oracle_wait=45
+while [ "$oracle_wait" -gt 0 ] && { [ ! -s /tmp/wefty-computer/surface-ready ] || [ ! -s /tmp/wefty-computer/driver-state.json ]; }; do
+  sleep 1
+  oracle_wait=$((oracle_wait - 1))
+done
+if [ "$oracle_wait" -eq 0 ]; then
+  echo 'Wayland input surface or driver observer did not become ready within 45 seconds' >&2
+  exit 1
 fi
 
 start foot --server

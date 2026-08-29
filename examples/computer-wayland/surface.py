@@ -18,7 +18,7 @@ STATE = f"{HOME}/.local/state/wefty/agent-state.json"
 THEME = f"{HOME}/.config/wefty/theme.json"
 HTML = "/opt/wefty-computer-wayland/oracle.html"
 LOCK = threading.Lock()
-INPUT = {"version": 1, "generation": 0, "key_events": 0, "x": 0, "y": 0, "pointer_history": [[0, 0]], "observer_lines": 0}
+INPUT = {"version": 1, "ready": False, "generation": 0, "key_events": 0, "x": 0, "y": 0, "pointer_history": [[0, 0]], "observer_lines": 0}
 OBSERVED_STATES = []
 POINTER_MOTION = re.compile(r"] motion: time: [0-9]+; x, y: (-?[0-9]+(?:\.[0-9]+)?), (-?[0-9]+(?:\.[0-9]+)?)")
 
@@ -131,6 +131,9 @@ def publish_surface_readiness():
         time.sleep(0.05)
     with open(SURFACE_READY, "w", encoding="ascii") as marker:
         marker.write("ready\n")
+    with LOCK:
+        INPUT["ready"] = True
+        atomic_json(ORACLE, INPUT)
 
 
 class Handler(BaseHTTPRequestHandler):
