@@ -62,7 +62,11 @@ FROM ${DEBIAN_IMAGE}
 ARG SOURCE_DATE_EPOCH
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
-RUN case "$TARGETARCH" in amd64) swaybg_version=1.2.1-1 ;; arm64) swaybg_version=1.2.1-1+b1 ;; *) exit 64 ;; esac \
+RUN case "$TARGETARCH" in \
+      amd64) swaybg_version=1.2.1-1; wev_version=1.0.0-3 ;; \
+      arm64) swaybg_version=1.2.1-1+b1; wev_version=1.0.0-3+b1 ;; \
+      *) exit 64 ;; \
+    esac \
     && printf '%s\n' \
       'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260827T000000Z trixie main' \
       > /etc/apt/sources.list \
@@ -84,6 +88,7 @@ RUN case "$TARGETARCH" in amd64) swaybg_version=1.2.1-1 ;; arm64) swaybg_version
         swaybg="$swaybg_version" \
         tini=0.19.0-3+b7 \
         wayvnc=0.9.1-1 \
+        wev="$wev_version" \
     && rm -f /var/log/dpkg.log /var/log/alternatives.log /var/log/apt/* \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/cache/fontconfig/* /var/cache/ldconfig/aux-cache \
     && printf '%032d\n' 0 > /etc/machine-id \

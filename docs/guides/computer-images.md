@@ -95,12 +95,14 @@ published library contains no mutation hook; the `text-frames-accepted`
 derivative recompiles it with `-Dwefty_mutation_hooks=true` before proving the
 owning cell fails.
 
-The image derives its input receipt after compositor delivery. Chromium is a
-real Wayland client on the focused Sway surface; its DOM pointer and keyboard
-listeners feed `input-oracle.json`. The checker first proves view input leaves
-that guest receipt unchanged and then proves control input changes it at exact
-coordinates. Thus parser acceptance alone cannot satisfy `input.control-accepted`,
-and regressing `--disable-input` fails both view-isolation cells.
+The image derives its input receipt after compositor delivery. A transparent,
+fullscreen `wev` surface is the focused native Wayland client; its
+`wl_pointer` and `wl_keyboard` events feed `input-oracle.json`, while Chromium
+remains visible underneath for the desktop furniture. The checker first proves
+view input leaves that guest receipt unchanged and then proves control input
+changes it at exact coordinates. Thus parser acceptance alone cannot satisfy
+`input.control-accepted`, and regressing `--disable-input` fails both
+view-isolation cells.
 
 The image also demonstrates optional, image-owned agent furniture outside the
 Computer wire contract:

@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""Serve the focused Chromium Wayland surface and its guest input receipt."""
+"""Serve the furniture surface and record focused native Wayland input."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
+import subprocess
 import threading
+import time
 
 ROOT = "/tmp/wefty-computer"
 HOME = os.environ.get("HOME", "/home/wefty")
 ORACLE = f"{ROOT}/input-oracle.json"
+BROWSER_READY = f"{ROOT}/browser-ready"
+SURFACE_READY = f"{ROOT}/surface-ready"
 STATE = f"{HOME}/.local/state/wefty/agent-state.json"
 THEME = f"{HOME}/.config/wefty/theme.json"
 HTML = "/opt/wefty-computer-wayland/oracle.html"
 LOCK = threading.Lock()
 INPUT = {"version": 1, "generation": 0, "key_events": 0, "x": 0, "y": 0, "pointer_history": [[0, 0]]}
 OBSERVED_STATES = []
+POINTER_EVENT = re.compile(r"\] motion: .*x, y: (-?[0-9]+(?:\.[0-9]+)?), (-?[0-9]+(?:\.[0-9]+)?)")
 
 
 def atomic_json(path, value):
@@ -52,6 +58,66 @@ def wefty_record_input(value):
         INPUT["generation"] += 1
         atomic_json(ORACLE, INPUT)
     return True
+
+
+def wait_for_browser():
+    while not os.path.exists(BROWSER_READY):
+        time.sleep(0.05)
+
+
+def observe_wayland_input():
+    """Translate events from the focused native Wayland client into the oracle."""
+    wait_for_browser()
+    while True:
+        process = subprocess.Popen(
+            ["stdbuf", "-oL", "wev", "-f", "wl_pointer:motion", "-f", "wl_keyboard:key"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            pointer = POINTER_EVENT.search(line)
+            if pointer:
+                wefty_record_input({"version": 1, "kind": "pointer", "x": round(float(pointer.group(1))), "y": round(float(pointer.group(2)))})
+            elif "wl_keyboard" in line and "] key:" in line:
+                wefty_record_input({"version": 1, "kind": "key"})
+        process.wait()
+        time.sleep(0.1)
+
+
+def tree_has_focused_oracle():
+    try:
+        result = subprocess.run(
+            ["swaymsg", "--type", "get_tree", "--raw"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        root = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return False
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        if not isinstance(node, dict):
+            continue
+        rect = node.get("rect", {})
+        if node.get("app_id") == "wev" and node.get("focused") is True and rect.get("width") == 1280 and rect.get("height") == 720:
+            return True
+        pending.extend(node.get("nodes", []))
+        pending.extend(node.get("floating_nodes", []))
+    return False
+
+
+def publish_surface_readiness():
+    wait_for_browser()
+    while not tree_has_focused_oracle():
+        time.sleep(0.05)
+    with open(SURFACE_READY, "w", encoding="ascii") as marker:
+        marker.write("ready\n")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -98,7 +164,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ("/surface-ready", "/input"):
+        if self.path != "/surface-ready":
             self.send_error(404)
             return
         try:
@@ -114,22 +180,19 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeError, json.JSONDecodeError):
             self.send_error(400)
             return
-        if self.path == "/surface-ready":
-            if value != {"version": 1}:
-                self.send_error(400)
-                return
-            with open(f"{ROOT}/surface-ready", "w", encoding="ascii") as marker:
-                marker.write("ready\n")
-        else:
-            if not wefty_record_input(value):
-                self.send_error(400)
-                return
+        if value != {"version": 1}:
+            self.send_error(400)
+            return
+        with open(BROWSER_READY, "w", encoding="ascii") as marker:
+            marker.write("ready\n")
         self.send_response(204)
         self.end_headers()
 
 def main():
     os.makedirs(ROOT, exist_ok=True)
     atomic_json(ORACLE, INPUT)
+    threading.Thread(target=observe_wayland_input, daemon=True).start()
+    threading.Thread(target=publish_surface_readiness, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", 18888), Handler).serve_forever()
 
 
