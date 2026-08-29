@@ -19,6 +19,7 @@ type storageCopyController struct {
 	attestRuntimeRemoval func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error)
 	nodeID               string
 	bootSessionID        string
+	rootInstanceID       string
 	logf                 func(string, ...any)
 
 	mu       sync.Mutex
@@ -27,17 +28,21 @@ type storageCopyController struct {
 }
 
 func newStorageCopyController(client *Client, copier workloadrunner.ComputerStorageCopier,
-	backupper workloadrunner.ComputerBackupper, nodeID, bootSessionID string, logf func(string, ...any)) *storageCopyController {
+	backupper workloadrunner.ComputerBackupper, nodeID, bootSessionID, rootInstanceID string, logf func(string, ...any)) *storageCopyController {
 	if copier == nil {
 		return nil
 	}
 	return &storageCopyController{client: client, copier: copier, backupper: backupper,
-		nodeID: nodeID, bootSessionID: bootSessionID, logf: logf, inflight: make(map[string]struct{})}
+		nodeID: nodeID, bootSessionID: bootSessionID, rootInstanceID: rootInstanceID,
+		logf: logf, inflight: make(map[string]struct{})}
 }
 
 func (controller *storageCopyController) process(ctx context.Context, directive l1.ComputerStorageCopyDirective) error {
 	if directive.BoundNodeID != controller.nodeID {
 		return fmt.Errorf("Computer Storage copy belongs to node %q, not %q", directive.BoundNodeID, controller.nodeID)
+	}
+	if directive.RootInstanceID != controller.rootInstanceID {
+		return fmt.Errorf("Computer Storage copy belongs to managed-root instance %q, not %q", directive.RootInstanceID, controller.rootInstanceID)
 	}
 	if directive.Phase == "published" {
 		if directive.Operation != "restore" {
@@ -75,6 +80,7 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 		Operation: directive.Operation, BackupID: directive.BackupID, CopyID: directive.CopyID,
 		SourceComputerID: directive.SourceComputerID, SourceStorageID: directive.SourceStorageID,
 		SourceGeneration: directive.SourceGeneration, SourceSize: directive.SourceSize, SourceDigest: directive.SourceDigest,
+		ExportID: directive.ExportID, ExternalPath: directive.ExternalPath, ManifestDigest: directive.ManifestDigest,
 		Destination: workloadrunner.ComputerStorage{ComputerID: directive.DestinationComputerID,
 			StorageID: directive.DestinationStorageID, StorageGeneration: directive.DestinationGeneration,
 			IntentRevision: directive.OperationRevision, DiskBytes: directive.DestinationSize},

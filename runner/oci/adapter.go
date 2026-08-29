@@ -1878,6 +1878,7 @@ func (adapter *Adapter) CopyComputerStorage(ctx context.Context, request workloa
 		Operation: request.Operation, BackupID: request.BackupID, CopyID: request.CopyID,
 		SourceComputerID: request.SourceComputerID, SourceStorageID: request.SourceStorageID,
 		SourceGeneration: request.SourceGeneration, SourceSize: request.SourceSize, SourceDigest: request.SourceDigest,
+		ExportID: request.ExportID, ExternalPath: request.ExternalPath, ManifestDigest: request.ManifestDigest,
 		Destination: ocihelper.ComputerStorageReference{ComputerID: request.Destination.ComputerID,
 			StorageID: request.Destination.StorageID, StorageGeneration: request.Destination.StorageGeneration,
 			IntentRevision: request.Destination.IntentRevision, DiskBytes: request.Destination.DiskBytes},
@@ -1891,6 +1892,35 @@ func (adapter *Adapter) CopyComputerStorage(ctx context.Context, request workloa
 	if response.Receipt.Kind != "computer_storage_copy_verified" || response.Receipt.ReceiptID == "" ||
 		response.Receipt.HelperGeneration == 0 {
 		return workloadrunner.ComputerStorageCopyReceipt{}, errors.New("OCI helper did not positively verify Computer Storage copy")
+	}
+	return response.Receipt, nil
+}
+
+func (adapter *Adapter) ExportComputerCustody(ctx context.Context, request workloadrunner.ComputerCustodyExportRequest) (workloadrunner.ComputerCustodyExportReceipt, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return workloadrunner.ComputerCustodyExportReceipt{}, errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return workloadrunner.ComputerCustodyExportReceipt{}, err
+	}
+	handshake := session.Handshake()
+	response, err := session.ExportComputerCustody(ctx, ocihelper.ExportComputerCustodyRequest{
+		ExportID: request.ExportID, BackupID: request.BackupID, CopyID: request.CopyID,
+		Storage: ocihelper.ComputerStorageReference{ComputerID: request.Storage.ComputerID,
+			StorageID: request.Storage.StorageID, StorageGeneration: request.Storage.StorageGeneration,
+			IntentRevision: request.Storage.IntentRevision, DiskBytes: request.Storage.DiskBytes},
+		SourceSize: request.SourceSize, SourceDigest: request.SourceDigest, ExternalPath: request.ExternalPath,
+		Authority: ocihelper.ComputerCustodyExportAuthority{NodeID: request.NodeID, BootSessionID: request.BootSessionID,
+			HelperGeneration: handshake.SessionGeneration, RootInstanceID: request.RootInstanceID,
+			OperationRevision: request.OperationRevision, CustodyFence: request.CustodyFence},
+	})
+	if err != nil {
+		return workloadrunner.ComputerCustodyExportReceipt{}, err
+	}
+	if response.Receipt.Kind != "computer_custody_export_verified" || response.Receipt.ReceiptID == "" ||
+		response.Receipt.HelperGeneration == 0 {
+		return workloadrunner.ComputerCustodyExportReceipt{}, errors.New("OCI helper did not positively verify Custody export")
 	}
 	return response.Receipt, nil
 }

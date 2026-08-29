@@ -511,6 +511,12 @@ func (session *Session) CopyComputerStorage(ctx context.Context, request CopyCom
 	return response, err
 }
 
+func (session *Session) ExportComputerCustody(ctx context.Context, request ExportComputerCustodyRequest) (ExportComputerCustodyResponse, error) {
+	var response ExportComputerCustodyResponse
+	err := session.call(ctx, MethodExportCustody, request, &response)
+	return response, err
+}
+
 func (session *Session) Verify(ctx context.Context, request VerifyRequest) (VerifyResponse, error) {
 	var response VerifyResponse
 	err := session.call(ctx, MethodVerify, request, &response)

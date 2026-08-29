@@ -246,6 +246,45 @@ func TestComputerBackupRequiresCurrentSessionAndReturnsBoundReceipts(t *testing.
 	}
 }
 
+func TestComputerCustodyExportRequiresCurrentSessionAndReturnsBoundReceipt(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := ExportComputerCustodyRequest{ExportID: "export-1", BackupID: "backup-1", CopyID: "copy-1",
+		Storage: ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1",
+			StorageGeneration: 1, IntentRevision: 2, DiskBytes: 8 << 30},
+		SourceSize: 8 << 30, SourceDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ExternalPath: "/operator/export-1", Authority: ComputerCustodyExportAuthority{NodeID: "node-1",
+			BootSessionID: "boot-1", HelperGeneration: session.Handshake().SessionGeneration + 1,
+			RootInstanceID: "managed-root-1", OperationRevision: 2, CustodyFence: "custody-fence"}}
+	if _, err := session.ExportComputerCustody(t.Context(), request); err == nil {
+		t.Fatal("stale helper generation authorized Custody export")
+	} else {
+		assertRPCCode(t, err, CodeInvalidRequest)
+	}
+	request.Authority.HelperGeneration = session.Handshake().SessionGeneration
+	engine.exportCustodyResponse = ExportComputerCustodyResponse{Receipt: ComputerCustodyExportReceipt{
+		Kind: "computer_custody_export_verified", ReceiptID: "export-receipt", ExportID: request.ExportID,
+		BackupID: request.BackupID, CopyID: request.CopyID, ComputerID: request.Storage.ComputerID,
+		StorageID: request.Storage.StorageID, StorageGeneration: request.Storage.StorageGeneration,
+		NodeID: request.Authority.NodeID, RootInstanceID: request.Authority.RootInstanceID,
+		OperationRevision: request.Authority.OperationRevision, CustodyFence: request.Authority.CustodyFence,
+		HelperGeneration: request.Authority.HelperGeneration, ExternalPath: request.ExternalPath,
+		AllocatedSize: request.SourceSize, ContentDigest: request.SourceDigest,
+		ManifestDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}
+	response, err := session.ExportComputerCustody(t.Context(), request)
+	if err != nil || response.Receipt.ExportID != request.ExportID ||
+		response.Receipt.HelperGeneration != request.Authority.HelperGeneration {
+		t.Fatalf("current-session Custody export = %+v err=%v", response, err)
+	}
+}
+
 func TestComputerStorageCopyRequiresCurrentSessionAndReturnsBoundReceipt(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -1779,6 +1818,7 @@ type fakeEngine struct {
 	createBackupResponse     CreateComputerBackupResponse
 	deleteBackupResponse     DeleteComputerBackupCopyResponse
 	copyStorageResponse      CopyComputerStorageResponse
+	exportCustodyResponse    ExportComputerCustodyResponse
 }
 
 type blockingWatchEngine struct {
@@ -2220,6 +2260,9 @@ func (engine *fakeEngine) DeleteComputerBackupCopy(_ context.Context, _ DeleteCo
 }
 func (engine *fakeEngine) CopyComputerStorage(_ context.Context, _ CopyComputerStorageRequest) (CopyComputerStorageResponse, error) {
 	return engine.copyStorageResponse, nil
+}
+func (engine *fakeEngine) ExportComputerCustody(_ context.Context, _ ExportComputerCustodyRequest) (ExportComputerCustodyResponse, error) {
+	return engine.exportCustodyResponse, nil
 }
 func (engine *fakeEngine) Verify(context.Context, VerifyRequest) (VerifyResponse, error) {
 	engine.record("Verify")

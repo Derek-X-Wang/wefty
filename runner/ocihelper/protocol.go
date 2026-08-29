@@ -56,6 +56,7 @@ const (
 	MethodCreateBackup       Method = "CreateComputerBackup"
 	MethodDeleteBackup       Method = "DeleteComputerBackupCopy"
 	MethodCopyStorage        Method = "CopyComputerStorage"
+	MethodExportCustody      Method = "ExportComputerCustody"
 	MethodVerify             Method = "Verify"
 	MethodSweep              Method = "Sweep"
 	MethodDialAttemptPort    Method = "DialAttemptPort"
@@ -1110,6 +1111,9 @@ type CopyComputerStorageRequest struct {
 	SourceGeneration int64                        `json:"source_generation"`
 	SourceSize       int64                        `json:"source_size"`
 	SourceDigest     string                       `json:"source_digest"`
+	ExportID         string                       `json:"export_id,omitempty"`
+	ExternalPath     string                       `json:"external_path,omitempty"`
+	ManifestDigest   string                       `json:"manifest_digest,omitempty"`
 	Destination      ComputerStorageReference     `json:"destination"`
 	Authority        ComputerStorageCopyAuthority `json:"authority"`
 }
@@ -1118,6 +1122,32 @@ type ComputerStorageCopyReceipt = contract.ComputerStorageCopyReceipt
 
 type CopyComputerStorageResponse struct {
 	Receipt ComputerStorageCopyReceipt `json:"receipt"`
+}
+
+type ComputerCustodyExportAuthority struct {
+	NodeID            string `json:"node_id"`
+	BootSessionID     string `json:"boot_session_id"`
+	HelperGeneration  uint64 `json:"helper_generation"`
+	RootInstanceID    string `json:"root_instance_id"`
+	OperationRevision int64  `json:"operation_revision"`
+	CustodyFence      string `json:"custody_fence"`
+}
+
+type ExportComputerCustodyRequest struct {
+	ExportID     string                         `json:"export_id"`
+	BackupID     string                         `json:"backup_id"`
+	CopyID       string                         `json:"copy_id"`
+	Storage      ComputerStorageReference       `json:"storage"`
+	SourceSize   int64                          `json:"source_size"`
+	SourceDigest string                         `json:"source_digest"`
+	ExternalPath string                         `json:"external_path"`
+	Authority    ComputerCustodyExportAuthority `json:"authority"`
+}
+
+type ComputerCustodyExportReceipt = contract.ComputerCustodyExportReceipt
+
+type ExportComputerCustodyResponse struct {
+	Receipt ComputerCustodyExportReceipt `json:"receipt"`
 }
 
 type VerifyScope string

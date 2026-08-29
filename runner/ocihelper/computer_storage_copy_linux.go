@@ -112,7 +112,9 @@ func sameComputerStorageCopyRequest(left, right CopyComputerStorageRequest) bool
 	return left.Operation == right.Operation && left.BackupID == right.BackupID && left.CopyID == right.CopyID &&
 		left.SourceComputerID == right.SourceComputerID && left.SourceStorageID == right.SourceStorageID &&
 		left.SourceGeneration == right.SourceGeneration && left.SourceSize == right.SourceSize &&
-		left.SourceDigest == right.SourceDigest && sameComputerStorageIdentity(left.Destination, right.Destination) &&
+		left.SourceDigest == right.SourceDigest && left.ExportID == right.ExportID &&
+		left.ExternalPath == right.ExternalPath && left.ManifestDigest == right.ManifestDigest &&
+		sameComputerStorageIdentity(left.Destination, right.Destination) &&
 		left.Destination.DiskBytes == right.Destination.DiskBytes && left.Destination.IntentRevision == right.Destination.IntentRevision &&
 		left.Authority == right.Authority
 }
@@ -308,7 +310,7 @@ func ext4Geometry(ctx context.Context, imagePath string) (blocks, blockSize int6
 
 func (engine *ContainerdEngine) finalizeComputerStorageCopy(ctx context.Context, operation, imagePath, mountPath string, sourceSize int64, expanded bool) (facts computerStorageCopyFacts, returnedErr error) {
 	if engine.storageCopyFinalize != nil {
-		if operation == "clone" {
+		if operation == "clone" || operation == "import" {
 			if err := engine.storageCopyCheckpoint(computerStorageCopyMountedRekey); err != nil {
 				return facts, err
 			}
@@ -341,7 +343,7 @@ func (engine *ContainerdEngine) finalizeComputerStorageCopy(ctx context.Context,
 		}
 		facts.FilesystemExpanded = true
 	}
-	if operation != "clone" {
+	if operation != "clone" && operation != "import" {
 		return facts, nil
 	}
 	if err := os.MkdirAll(mountPath, 0o700); err != nil {
@@ -366,7 +368,10 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	defer engine.computerBackupMu.Unlock()
 	engine.storageCopyMu.Lock()
 	defer engine.storageCopyMu.Unlock()
-	if (request.Operation != "restore" && request.Operation != "clone") || request.BackupID == "" || request.CopyID == "" ||
+	managedSource := request.Operation == "restore" || request.Operation == "clone"
+	importSource := request.Operation == "import"
+	if (!managedSource && !importSource) || request.BackupID == "" || request.CopyID == "" ||
+		(importSource && (request.ExportID == "" || request.ExternalPath == "" || request.ManifestDigest == "")) ||
 		request.SourceComputerID == "" || request.SourceStorageID == "" || request.SourceGeneration < 1 || request.SourceSize < 1 ||
 		request.SourceDigest == "" || request.Destination.ComputerID == "" || request.Destination.StorageID == "" ||
 		request.Destination.StorageGeneration < 1 || request.Destination.DiskBytes < request.SourceSize ||
@@ -375,12 +380,18 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		request.Authority.JobID == "" || request.Authority.OperationRevision < 1 || request.Authority.CleanupFence == "" {
 		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy request is incomplete")
 	}
-	copyName, err := deterministicComputerBackupCopyName(request.CopyID)
-	if err != nil {
-		return CopyComputerStorageResponse{}, err
+	var sourcePath string
+	var err error
+	if importSource {
+		sourcePath, err = validateImportCustodySource(engine.config.RuntimeRoot, request)
+	} else {
+		var copyName string
+		copyName, err = deterministicComputerBackupCopyName(request.CopyID)
+		if err == nil {
+			sourceRoot := filepath.Join(engine.config.RuntimeRoot, "computer-backups", copyName)
+			sourcePath, err = validateStorageCopySource(sourceRoot, request)
+		}
 	}
-	sourceRoot := filepath.Join(engine.config.RuntimeRoot, "computer-backups", copyName)
-	sourcePath, err := validateStorageCopySource(sourceRoot, request)
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
 	}
@@ -594,6 +605,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	}
 	receipt := ComputerStorageCopyReceipt{Kind: "computer_storage_copy_verified", ReceiptID: receiptID,
 		Operation: request.Operation, BackupID: request.BackupID, CopyID: request.CopyID,
+		ExportID: request.ExportID, ExternalPath: request.ExternalPath, ManifestDigest: request.ManifestDigest,
 		SourceComputerID: request.SourceComputerID, SourceStorageID: request.SourceStorageID,
 		SourceGeneration: request.SourceGeneration, DestinationComputerID: request.Destination.ComputerID,
 		DestinationStorageID: request.Destination.StorageID, DestinationGeneration: request.Destination.StorageGeneration,

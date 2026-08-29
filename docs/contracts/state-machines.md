@@ -209,7 +209,19 @@ provenance records the source Backup and destination as a custody fork. If one
 managed branch is removed while another secret-bearing branch survives, the
 Computer outcome is `removed_reduced`; after coordinated positive removal of
 every managed branch, retained Computer outcomes may advance to
-`removed_verified`. Custody export and import remain a separate contract.
+`removed_verified` only when no Custody export taints the provenance graph.
+
+A Custody export first CAS-records immutable source Backup, Storage, Node,
+managed-root, path, and fence evidence and moves the Computer through
+`exporting`; that commit permanently taints the branch before the agent may
+write the external manifest or its first storage byte. Missing or late helper
+completion cannot retract the event. `operator_attested_deleted` is append-only
+operator evidence and never changes `removed_reduced`. Import accepts only a
+completed export plus its trusted manifest digest, verifies the external bytes
+before creating any visible Computer, then publishes fresh Computer, Storage,
+Job, and narrowly rekeyed OS identities with no grants and desired state
+`stopped`. Storage provenance connects `import` and every later clone so the
+external-custody taint is permanent through all descendants.
 
 The current immutable Job mirrors Computer desired state only so it can reuse
 the ordinary service attempt state machine. Claim additionally joins the
@@ -234,7 +246,7 @@ cleanup acknowledgement is accepted while a copy lacks positive absence. For
 a superseded create, the helper writes and syncs an operation-keyed
 supersession tombstone under the Backup mutex before it proves absence. A late
 create must observe that tombstone and refuse to publish bytes.
-Custody export and cross-node replicas remain later contracts.
+Cross-node replicas remain a later contract.
 
 The first successful claim copies the ordinary service binding to the Computer
 row. Stop follows the ordinary positive-quiescence transition and releases the

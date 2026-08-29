@@ -36,6 +36,9 @@ type ComputerCloneRequest struct {
 
 type ComputerStorageCopyDirective struct {
 	Operation             string `json:"operation"`
+	ExportID              string `json:"export_id,omitempty"`
+	ExternalPath          string `json:"external_path,omitempty"`
+	ManifestDigest        string `json:"manifest_digest,omitempty"`
 	BackupID              string `json:"backup_id"`
 	CopyID                string `json:"copy_id"`
 	SourceComputerID      string `json:"source_computer_id"`
@@ -459,7 +462,14 @@ func (s *Store) ListNodeComputerStorageCopyDirectives(ctx context.Context, ident
 		}
 		directives = append(directives, storageCopyDirective(row))
 	}
-	return directives, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, internalError(err, "close Computer Storage copy directives")
+	}
+	return s.appendCustodyImportDirectives(ctx, nodeID, directives)
 }
 
 func (s *Store) ListNodeComputerRestoreRevocations(ctx context.Context, nodeID string) ([]string, error) {
@@ -587,6 +597,9 @@ func abortRestoreForFailedPredecessorCopy(ctx context.Context, tx *sql.Tx, row c
 }
 
 func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNodeID, destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest) (Computer, error) {
+	if request.Receipt.Operation == "import" {
+		return s.AcknowledgeComputerCustodyImport(ctx, identityNodeID, destinationComputerID, request)
+	}
 	if destinationComputerID == "" || request.NodeID == "" || request.BootSessionID == "" || request.IdempotencyKey == "" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "complete Computer Storage copy acknowledgement fields are required")
 	}

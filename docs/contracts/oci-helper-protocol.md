@@ -195,7 +195,8 @@ heartbeats.
 | `DeleteManagedVolume` | Session-authorized and closed to a derived `handoff` or `service_data` owner key, or exact Computer-removal Storage and cleanup authority. The helper derives the source, deletes only that resource (plus any paired owner record), independently verifies absence, and returns no general path authority. |
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. After separate stable service-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
-| `CopyComputerStorage` | Session-authorized exact restore or clone operation, published Backup/copy source, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. Under the Backup mutex it revalidates source size and digest before destination publication and fully allocates the destination. Restore preserves bytes exactly; clone narrowly rekeys machine ID and SSH host keys, never browser profile data, and expands a larger filesystem. Its receipt binds every authority and observed size/digest; it does not attach or start the Computer. |
+| `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves OS identity; clone/import narrowly rekey it and may expand a larger filesystem. |
+| `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path outside the managed root. L1 has already committed the permanent custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, and manifest-digest evidence. |
 | `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. |
 | `PreflightComputerReimage` | Session-authorized exact current Storage generation, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. It requires positive detachment evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived evidence before L1 may publish the staging projection. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
@@ -621,8 +622,16 @@ requires any present manifest to match the exact copy, source Storage identity,
 Node, and root instance. It deletes only the deterministic Wefty-owned copy
 root and returns `computer_backup_copy_removed` only after positive absence.
 The helper does not choose retention, auto-delete, restore, clone, export,
-encryption, or replica policy. It executes only the exact restore or clone
-operation already authorized by L1; export and import remain later contracts.
+encryption, or replica policy. `ExportComputerCustody` accepts only an
+already-recorded event bound to one published Backup copy and rejects paths
+inside the managed root. It writes the external manifest before the disk,
+retains partial bytes after interruption, and returns a receipt only after
+size, content digest, and manifest digest are observed. `CopyComputerStorage`
+also accepts `import`: it verifies the recorded manifest digest and full disk
+digest before creating a managed destination, then applies the same narrow OS
+identity rekey and optional filesystem expansion as clone. Both receipts bind
+the Node, managed-root instance, operation revision, cleanup/custody fence,
+and helper generation; neither helper call decides removal truth.
 
 `AttestRemoval` accepts only an exact service Job/generation plus reconstructed
 attempt authorities and their deterministic resource rows, and is called after

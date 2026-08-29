@@ -93,6 +93,9 @@ type ComputerStorageCopyReceipt struct {
 	Operation             string `json:"operation"`
 	BackupID              string `json:"backup_id"`
 	CopyID                string `json:"copy_id"`
+	ExportID              string `json:"export_id,omitempty"`
+	ExternalPath          string `json:"external_path,omitempty"`
+	ManifestDigest        string `json:"manifest_digest,omitempty"`
 	SourceComputerID      string `json:"source_computer_id"`
 	SourceStorageID       string `json:"source_storage_id"`
 	SourceGeneration      int64  `json:"source_generation"`
@@ -111,4 +114,28 @@ type ComputerStorageCopyReceipt struct {
 	DestinationDigest     string `json:"destination_digest"`
 	OSIdentityRekeyed     bool   `json:"os_identity_rekeyed"`
 	FilesystemExpanded    bool   `json:"filesystem_expanded"`
+}
+
+// ComputerCustodyExportReceipt proves that the helper observed the exact
+// immutable Backup bytes and manifest at an operator-owned destination. The
+// L1 custody event predates this receipt: even a missing receipt cannot undo
+// the fact that an external write was authorized and may contain secrets.
+type ComputerCustodyExportReceipt struct {
+	Kind              string `json:"kind"`
+	ReceiptID         string `json:"receipt_id"`
+	ExportID          string `json:"export_id"`
+	BackupID          string `json:"backup_id"`
+	CopyID            string `json:"copy_id"`
+	ComputerID        string `json:"computer_id"`
+	StorageID         string `json:"storage_id"`
+	StorageGeneration int64  `json:"storage_generation"`
+	NodeID            string `json:"node_id"`
+	RootInstanceID    string `json:"root_instance_id"`
+	OperationRevision int64  `json:"operation_revision"`
+	CustodyFence      string `json:"custody_fence"`
+	HelperGeneration  uint64 `json:"helper_generation"`
+	ExternalPath      string `json:"external_path"`
+	AllocatedSize     int64  `json:"allocated_size"`
+	ContentDigest     string `json:"content_digest"`
+	ManifestDigest    string `json:"manifest_digest"`
 }

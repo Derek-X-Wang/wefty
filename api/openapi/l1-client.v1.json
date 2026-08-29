@@ -1059,6 +1059,89 @@
         }
       }
     },
+    "/v1/computers/{computer_id}/backups/{backup_id}/export": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "backup_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+      ],
+      "post": {
+        "operationId": "exportComputerBackupToOperatorCustody",
+        "summary": "Permanently record external custody before writing the first byte",
+        "description": "The accepted event immediately reduces removal truth for this Storage provenance branch and descendants. Completion is separate assertion-derived evidence; interruption never retracts the event.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["intent_revision", "storage_id", "storage_generation", "external_path", "idempotency_key"],
+          "properties": {
+            "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+            "storage_id": { "type": "string", "minLength": 1 },
+            "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+            "external_path": { "type": "string", "minLength": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Identical Custody export replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "type": "object" } } } },
+          "202": { "description": "Custody event committed before external bytes; the branch is already permanently tainted.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/custody-exports": {
+      "parameters": [{ "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
+      "get": {
+        "operationId": "listComputerCustodyExports",
+        "summary": "List permanent external custody events and non-upgrading deletion attestations",
+        "responses": {
+          "200": { "description": "Custody events ordered by record time.", "content": { "application/json": { "schema": { "type": "array", "items": { "type": "object" } } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" }, "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/custody-exports/{export_id}/attest-deleted": {
+      "parameters": [{ "name": "export_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
+      "post": {
+        "operationId": "attestComputerCustodyDeleted",
+        "summary": "Record operator_attested_deleted without upgrading removal truth",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false, "required": ["idempotency_key"],
+          "properties": { "idempotency_key": { "type": "string", "minLength": 1 } }
+        } } } },
+        "responses": {
+          "200": { "description": "Attestation recorded; removed_reduced remains the strongest possible outcome.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/custody-exports/{export_id}/import": {
+      "parameters": [{ "name": "export_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
+      "post": {
+        "operationId": "importComputerCustody",
+        "summary": "Validate a Custody manifest and digest into a new stopped no-grant Computer",
+        "description": "The exported event is untouched. Publication occurs only after manifest, source digest, destination digest, and clone-style OS identity rekey evidence bind the new Computer and Storage identities.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["name", "disk_bytes", "external_path", "idempotency_key"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
+            "external_path": { "type": "string", "minLength": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Identical Custody import replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "type": "object" } } } },
+          "202": { "description": "Import validation and managed materialization reserved; no Computer exists until positive evidence is accepted.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/computers/{computer_id}/projections": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }

@@ -250,6 +250,12 @@ func (c *Client) AcknowledgeComputerStorageCopy(ctx context.Context, computerID 
 	return computer, err
 }
 
+func (c *Client) AcknowledgeComputerCustodyExport(ctx context.Context, computerID string, request l1.ComputerCustodyExportAcknowledgementRequest) (l1.ComputerCustodyExport, error) {
+	var export l1.ComputerCustodyExport
+	err := c.post(ctx, "/v1/agent/computers/"+url.PathEscape(computerID)+"/custody-export-acknowledgement", request, &export)
+	return export, err
+}
+
 func (c *Client) AcknowledgeComputerRestoreRetirement(ctx context.Context, computerID string, request l1.RemovalAcknowledgementRequest) (l1.Computer, error) {
 	var computer l1.Computer
 	err := c.post(ctx, "/v1/agent/computers/"+url.PathEscape(computerID)+"/restore-retirement-acknowledgement", request, &computer)

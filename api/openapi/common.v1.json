@@ -371,7 +371,7 @@
         ],
         "properties": {
           "intent_revision": { "type": "integer", "minimum": 1 },
-          "operation": { "enum": ["create", "start", "stop", "restart", "remove", "project", "reset", "backup_create", "backup_cap", "restore", "clone"] },
+          "operation": { "enum": ["create", "start", "stop", "restart", "remove", "project", "reset", "backup_create", "backup_cap", "restore", "clone", "custody_export", "custody_import", "reimage", "grow", "abort"] },
           "desired_state": { "enum": ["running", "stopped", "removed"] },
           "storage_id": { "type": "string", "minLength": 1 },
           "storage_generation": { "type": "integer", "minimum": 1 },
@@ -425,7 +425,7 @@
           "current_spec_revision": { "type": "integer", "minimum": 1 },
           "backup_cap": { "type": "integer", "format": "int64", "minimum": 0, "description": "Effective retained Backup cap. Zero disables creation; pruning is always explicit." },
           "last_backup_operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome" },
-          "reconfiguration_phase": { "enum": ["stable", "projecting", "resetting", "backing_up", "reimaging", "growing", "restoring", "cloning", "removing"] },
+          "reconfiguration_phase": { "enum": ["stable", "projecting", "resetting", "backing_up", "restoring", "cloning", "exporting", "importing", "reimaging", "growing", "removing"] },
           "reconfiguration_revision": { "type": "integer", "minimum": 1 },
           "submit_enabled": { "type": "boolean", "default": false },
           "submit_intent_revision": { "type": "integer", "minimum": 0 },
@@ -476,7 +476,7 @@
         "required": ["provenance_id", "kind", "source_storage_id", "source_generation", "backup_id", "created_at"],
         "properties": {
           "provenance_id": { "type": "string", "minLength": 1 },
-          "kind": { "enum": ["backup", "restore", "clone"] },
+          "kind": { "enum": ["backup", "restore", "clone", "export", "import"] },
           "source_storage_id": { "type": "string", "minLength": 1 },
           "source_generation": { "type": "integer", "format": "int64", "minimum": 1 },
           "backup_id": { "type": "string", "minLength": 1 },
@@ -574,7 +574,10 @@
         "additionalProperties": false,
         "required": ["operation", "backup_id", "copy_id", "source_computer_id", "source_storage_id", "source_generation", "source_size", "source_digest", "destination_computer_id", "destination_storage_id", "old_generation", "destination_generation", "destination_size", "bound_node_id", "root_instance_id", "job_id", "operation_revision", "cleanup_fence", "keep_old_as_backup", "phase"],
         "properties": {
-          "operation": { "enum": ["restore", "clone"] },
+          "operation": { "enum": ["restore", "clone", "import"] },
+          "export_id": { "type": "string", "minLength": 1 },
+          "external_path": { "type": "string", "minLength": 1 },
+          "manifest_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
           "backup_id": { "type": "string", "minLength": 1 },
           "copy_id": { "type": "string", "minLength": 1 },
           "source_computer_id": { "type": "string", "minLength": 1 },
@@ -596,6 +599,26 @@
           "old_backup_id": { "type": "string", "minLength": 1 },
           "old_copy_id": { "type": "string", "minLength": 1 },
           "phase": { "enum": ["reserved", "prepared", "published"] }
+        }
+      },
+      "ComputerCustodyExportDirective": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["export_id", "computer_id", "operation_revision", "backup_id", "copy_id", "storage_id", "storage_generation", "allocated_size", "content_digest", "bound_node_id", "root_instance_id", "external_path", "custody_fence"],
+        "properties": {
+          "export_id": { "type": "string", "minLength": 1 },
+          "computer_id": { "type": "string", "minLength": 1 },
+          "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+          "backup_id": { "type": "string", "minLength": 1 },
+          "copy_id": { "type": "string", "minLength": 1 },
+          "storage_id": { "type": "string", "minLength": 1 },
+          "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "allocated_size": { "type": "integer", "format": "int64", "minimum": 1 },
+          "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "bound_node_id": { "type": "string", "minLength": 1 },
+          "root_instance_id": { "type": "string", "minLength": 1 },
+          "external_path": { "type": "string", "minLength": 1 },
+          "custody_fence": { "type": "string", "minLength": 1 }
         }
       },
       "Attempt": {
@@ -954,6 +977,28 @@
             "properties": {
               "copies": { "type": "array", "items": { "$ref": "#/components/schemas/ComputerBackupPruneDirective" } }
             }
+          },
+          "computer_custody_exports": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["exports"],
+            "properties": {
+              "exports": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["export_id", "source_storage_id", "source_generation", "status", "operator_attested_deleted"],
+                  "properties": {
+                    "export_id": { "type": "string", "minLength": 1 },
+                    "source_storage_id": { "type": "string", "minLength": 1 },
+                    "source_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+                    "status": { "enum": ["planned", "exported", "superseded"] },
+                    "operator_attested_deleted": { "type": "boolean" }
+                  }
+                }
+              }
+            }
           }
         }
       },
@@ -1105,7 +1150,7 @@
           { "$ref": "#/components/schemas/Node" },
           {
             "type": "object",
-            "required": ["removal_directives", "storage_reset_directives", "storage_grow_directives", "reimage_preflight_directives", "backup_directives", "backup_prune_directives", "storage_copy_directives"],
+            "required": ["removal_directives", "storage_reset_directives", "storage_grow_directives", "reimage_preflight_directives", "backup_directives", "backup_prune_directives", "storage_copy_directives", "custody_export_directives"],
             "properties": {
               "removal_directives": {
                 "type": "array",
@@ -1148,6 +1193,12 @@
                 "items": { "$ref": "#/components/schemas/ComputerStorageCopyDirective" },
                 "readOnly": true,
                 "description": "Restore and clone work released only from a published source-node Backup copy; published restore rows remain until predecessor absence is acknowledged."
+              },
+              "custody_export_directives": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/ComputerCustodyExportDirective" },
+                "readOnly": true,
+                "description": "Transfers released only after L1 durably records permanent external custody taint."
               },
               "computer_policy": {
                 "$ref": "#/components/schemas/ComputerPolicySnapshot",

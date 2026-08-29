@@ -78,6 +78,10 @@ type ComputerStorageCopyEngine interface {
 	CopyComputerStorage(context.Context, CopyComputerStorageRequest) (CopyComputerStorageResponse, error)
 }
 
+type ComputerCustodyExportEngine interface {
+	ExportComputerCustody(context.Context, ExportComputerCustodyRequest) (ExportComputerCustodyResponse, error)
+}
+
 // Engine is the helper-internal mechanics seam. No containerd request or type
 // crosses RPC.
 type Engine interface {

@@ -1306,7 +1306,10 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if !decodeRequest(wire, request.Body, &body) {
 			return
 		}
-		if (body.Operation != "restore" && body.Operation != "clone") || body.BackupID == "" || body.CopyID == "" ||
+		managedSource := body.Operation == "restore" || body.Operation == "clone"
+		importSource := body.Operation == "import"
+		if (!managedSource && !importSource) || body.BackupID == "" || body.CopyID == "" ||
+			(importSource && (body.ExportID == "" || body.ExternalPath == "" || body.ManifestDigest == "")) ||
 			body.SourceComputerID == "" || body.SourceStorageID == "" || body.SourceGeneration < 1 ||
 			body.SourceSize < 1 || body.SourceDigest == "" || body.Destination.ComputerID == "" ||
 			body.Destination.StorageID == "" || body.Destination.StorageGeneration < 1 || body.Destination.DiskBytes < body.SourceSize ||
@@ -1324,6 +1327,28 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.CopyComputerStorage(operation.ctx, body)
+		_ = writeEngineResponse(wire, response, err)
+	case MethodExportCustody:
+		var body ExportComputerCustodyRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if body.ExportID == "" || body.BackupID == "" || body.CopyID == "" ||
+			body.Storage.ComputerID == "" || body.Storage.StorageID == "" || body.Storage.StorageGeneration < 1 ||
+			body.SourceSize < 1 || body.SourceDigest == "" || body.ExternalPath == "" ||
+			body.Authority.NodeID != session.identity.NodeID || body.Authority.BootSessionID != session.identity.BootSessionID ||
+			body.Authority.HelperGeneration != session.helper.SessionGeneration || body.Authority.HelperGeneration == 0 ||
+			body.Authority.RootInstanceID == "" || body.Authority.OperationRevision < 1 || body.Authority.CustodyFence == "" {
+			_ = writeFailure(wire, CodeInvalidRequest, "complete current-session Custody export authority is required")
+			return
+		}
+		engine, ok := server.engine.(ComputerCustodyExportEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "Custody export is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.ExportComputerCustody(operation.ctx, body)
 		_ = writeEngineResponse(wire, response, err)
 	case MethodVerify:
 		var body VerifyRequest
