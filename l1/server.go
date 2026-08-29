@@ -237,6 +237,9 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("PUT /v1/computers/{computer_id}/desired-state", s.setComputerDesiredState)
 	client.HandleFunc("PUT /v1/computers/{computer_id}/backup-cap", s.setComputerBackupCap)
 	client.HandleFunc("POST /v1/computers/{computer_id}/restart", s.restartComputer)
+	client.HandleFunc("POST /v1/computers/{computer_id}/reimage", s.reimageComputer)
+	client.HandleFunc("POST /v1/computers/{computer_id}/grow", s.growComputer)
+	client.HandleFunc("POST /v1/computers/{computer_id}/reconfiguration-abort", s.abortComputerReconfiguration)
 	client.HandleFunc("POST /v1/computers/{computer_id}/storage-reset", s.resetComputerStorage)
 	client.HandleFunc("GET /v1/computers/{computer_id}/storage-generations", s.listComputerStorageGenerations)
 	client.HandleFunc("POST /v1/computers/{computer_id}/backups", s.createComputerBackup)
@@ -269,6 +272,8 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete", s.completeAttempt)
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/removal-acknowledgement", s.acknowledgeServiceRemoval)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-reset-acknowledgement", s.acknowledgeComputerStorageReset)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-grow-acknowledgement", s.acknowledgeComputerStorageGrow)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/reimage-preflight-acknowledgement", s.acknowledgeComputerReimagePreflight)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-retirement-acknowledgement", s.acknowledgeComputerStorageRetirement)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/backup-acknowledgement", s.acknowledgeComputerBackup)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/backup-prune-acknowledgement", s.acknowledgeComputerBackupPrune)
@@ -796,6 +801,46 @@ func (s *Server) resetComputerStorage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, redactComputer(computer))
 }
 
+func (s *Server) growComputer(w http.ResponseWriter, r *http.Request) {
+	var request ComputerGrowRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	computer, replayed, err := s.store.BeginComputerGrow(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusAccepted
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, redactComputer(computer))
+}
+
+func (s *Server) abortComputerReconfiguration(w http.ResponseWriter, r *http.Request) {
+	var request ComputerReconfigurationAbortRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	computer, replayed, err := s.store.AbortComputerReconfiguration(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusAccepted
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, redactComputer(computer))
+}
+
 func (s *Server) listComputerStorageGenerations(w http.ResponseWriter, r *http.Request) {
 	generations, err := s.store.ListComputerStorageGenerations(r.Context(), r.PathValue("computer_id"))
 	if err != nil {
@@ -906,6 +951,25 @@ func (s *Server) installComputerProjection(w http.ResponseWriter, r *http.Reques
 	}
 	request.Actor = identityFromRequest(r).NodeID
 	computer, err := s.store.InstallComputerProjection(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_reimaged"); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, redactComputer(computer))
+}
+
+func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
+	var request ComputerReimageRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	computer, err := s.store.ReimageComputer(r.Context(), r.PathValue("computer_id"), request)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1157,6 +1221,16 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	storageGrows, err := s.store.ListNodeComputerStorageGrowDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	reimages, err := s.store.ListNodeComputerReimagePreflightDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	backups, err := s.store.ListNodeComputerBackupDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
 	if err != nil {
 		writeError(w, err)
@@ -1198,7 +1272,7 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		computerPolicy = nil
 	}
 	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, RemovalDirectives: directives,
-		StorageResetDirectives: storageResets, BackupDirectives: backups,
+		StorageResetDirectives: storageResets, StorageGrowDirectives: storageGrows, ReimageDirectives: reimages, BackupDirectives: backups,
 		BackupPruneDirectives: backupPrunes, StorageCopyDirectives: storageCopies, ComputerPolicy: computerPolicy})
 }
 
@@ -1267,6 +1341,42 @@ func (s *Server) acknowledgeComputerStorageReset(w http.ResponseWriter, r *http.
 		return
 	}
 	computer, err := s.store.AcknowledgeComputerStorageReset(r.Context(), identityFromRequest(r).NodeID,
+		r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, redactComputer(computer))
+}
+
+func (s *Server) acknowledgeComputerStorageGrow(w http.ResponseWriter, r *http.Request) {
+	var request ComputerStorageGrowAcknowledgementRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	computer, err := s.store.AcknowledgeComputerStorageGrow(r.Context(), identityFromRequest(r).NodeID,
+		r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if computer.CurrentJob.State == contract.JobFailed {
+		if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_grow_capacity_failed"); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, redactComputer(computer))
+}
+
+func (s *Server) acknowledgeComputerReimagePreflight(w http.ResponseWriter, r *http.Request) {
+	var request ComputerReimagePreflightAcknowledgementRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	computer, err := s.store.AcknowledgeComputerReimagePreflight(r.Context(), identityFromRequest(r).NodeID,
 		r.PathValue("computer_id"), request)
 	if err != nil {
 		writeError(w, err)

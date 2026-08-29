@@ -174,6 +174,7 @@ type ComputerStorage struct {
 	StorageGeneration int64
 	IntentRevision    int64
 	DiskBytes         int64
+	Chown             bool
 }
 
 // RuntimeResourceManifest is the immutable, runtime-neutral inventory for one
@@ -513,6 +514,69 @@ type ComputerStorageResetRequest struct {
 }
 
 type ComputerStorageResetReceipt = contract.ComputerStorageResetReceipt
+
+type ComputerStorageGrower interface {
+	GrowComputerStorage(context.Context, ComputerStorageGrowRequest) (ComputerStorageGrowReceipt, error)
+}
+
+type ComputerStorageGrowRequest struct {
+	Storage           ComputerStorage
+	NewDiskBytes      int64
+	NodeID            string
+	BootSessionID     string
+	RootInstanceID    string
+	JobID             string
+	OperationRevision int64
+	OperationFence    string
+}
+
+type ComputerStorageGrowReceipt = contract.ComputerStorageGrowReceipt
+
+// ComputerReimagePreflighter verifies the target image and detached disk
+// together before L1 may transfer projection authority.
+type ComputerReimagePreflighter interface {
+	PreflightComputerReimage(context.Context, ComputerReimagePreflightRequest) (ComputerReimagePreflightReceipt, error)
+}
+
+type ComputerReimagePreflightRequest struct {
+	Storage           ComputerStorage
+	OldJobID          string
+	StagingJobID      string
+	NodeID            string
+	BootSessionID     string
+	RootInstanceID    string
+	OperationRevision int64
+	OperationFence    string
+	TargetReference   string
+	TargetDigest      string
+	Chown             bool
+}
+
+type ComputerReimagePreflightReceipt struct {
+	Kind                   string
+	ReceiptID              string
+	ComputerID             string
+	StorageID              string
+	StorageGeneration      int64
+	OldJobID               string
+	StagingJobID           string
+	NodeID                 string
+	RootInstanceID         string
+	OperationRevision      int64
+	OperationFence         string
+	TargetDigest           string
+	PlatformOS             string
+	PlatformArchitecture   string
+	ImageUID               uint32
+	ImageGID               uint32
+	DiskRootUID            uint32
+	DiskRootGID            uint32
+	DetachmentReceiptID    string
+	DetachmentAttemptID    string
+	DetachmentFencingToken string
+	HelperGeneration       uint64
+	FailureCode            string
+}
 
 // ComputerBackupper owns the physical source-node copy mechanics behind the
 // runtime-neutral agent seam. L1 owns cap, intent, resume, and pruning policy.

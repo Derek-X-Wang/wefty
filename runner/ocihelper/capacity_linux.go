@@ -20,6 +20,7 @@ type memoryFacts struct {
 type capacityReservation struct {
 	memoryBytes      int64
 	diskBytes        int64
+	pendingDiskBytes int64
 	diskMaterialized bool
 	attempts         map[string]struct{}
 }
@@ -166,14 +167,16 @@ func (engine *ContainerdEngine) admitResources(request RunRequest) (ResourceAdmi
 	memoryCommitted, diskCommitted, diskPending := int64(0), int64(0), int64(0)
 	for _, reservation := range engine.capacityReservations {
 		if reservation.memoryBytes > int64(^uint64(0)>>1)-memoryCommitted || reservation.diskBytes > int64(^uint64(0)>>1)-diskCommitted ||
-			!reservation.diskMaterialized && reservation.diskBytes > int64(^uint64(0)>>1)-diskPending {
+			!reservation.diskMaterialized && reservation.diskBytes > int64(^uint64(0)>>1)-diskPending ||
+			reservation.pendingDiskBytes > int64(^uint64(0)>>1)-diskPending {
 			return ResourceAdmissionReceipt{}, errors.New("resource capacity accounting overflowed")
 		}
 		memoryCommitted += reservation.memoryBytes
-		diskCommitted += reservation.diskBytes
+		diskCommitted += reservation.diskBytes + reservation.pendingDiskBytes
 		if !reservation.diskMaterialized {
 			diskPending += reservation.diskBytes
 		}
+		diskPending += reservation.pendingDiskBytes
 	}
 	warnings := append([]ProfileWarning{}, profileReceipt(request.Workload).Warnings...)
 	receipt := ResourceAdmissionReceipt{
@@ -245,6 +248,8 @@ func (engine *ContainerdEngine) admitResources(request RunRequest) (ResourceAdmi
 func (engine *ContainerdEngine) markCapacityDiskMaterialized(jobID string) {
 	engine.capacityMu.Lock()
 	if reservation := engine.capacityReservations[jobID]; reservation != nil {
+		reservation.diskBytes += reservation.pendingDiskBytes
+		reservation.pendingDiskBytes = 0
 		reservation.diskMaterialized = true
 	}
 	engine.capacityMu.Unlock()

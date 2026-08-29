@@ -94,6 +94,10 @@ func (s *Store) PrepareComputerSubmissionMutation(ctx context.Context, identity 
 	if err != nil {
 		return Computer{}, false, internalError(err, "read Computer submission authority")
 	}
+	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
+		return Computer{}, false, protocolError(contract.ErrorConflict,
+			"Computer submission authority cannot change during reconfiguration")
+	}
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
 		return Computer{}, false, protocolError(contract.ErrorConflict, "removed Computer cannot submit Runs")
 	}

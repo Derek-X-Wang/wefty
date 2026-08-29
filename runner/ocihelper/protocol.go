@@ -51,6 +51,8 @@ const (
 	MethodInventoryRemoval   Method = "InventoryRemoval"
 	MethodAttestRemoval      Method = "AttestRemoval"
 	MethodResetStorage       Method = "ResetComputerStorage"
+	MethodGrowStorage        Method = "GrowComputerStorage"
+	MethodPreflightReimage   Method = "PreflightComputerReimage"
 	MethodCreateBackup       Method = "CreateComputerBackup"
 	MethodDeleteBackup       Method = "DeleteComputerBackupCopy"
 	MethodCopyStorage        Method = "CopyComputerStorage"
@@ -509,6 +511,7 @@ type ComputerStorageReference struct {
 	StorageGeneration int64  `json:"storage_generation"`
 	IntentRevision    int64  `json:"intent_revision"`
 	DiskBytes         int64  `json:"disk_bytes"`
+	Chown             bool   `json:"chown,omitempty"`
 }
 
 type ManagedVolumeDescriptor struct {
@@ -979,6 +982,76 @@ type ComputerStorageResetReceipt = contract.ComputerStorageResetReceipt
 type ResetComputerStorageResponse struct {
 	Verified bool                        `json:"verified"`
 	Receipt  ComputerStorageResetReceipt `json:"receipt"`
+}
+
+type ComputerStorageGrowAuthority struct {
+	NodeID            string `json:"node_id"`
+	BootSessionID     string `json:"boot_session_id"`
+	HelperGeneration  uint64 `json:"helper_generation"`
+	RootInstanceID    string `json:"root_instance_id"`
+	JobID             string `json:"job_id"`
+	OperationRevision int64  `json:"operation_revision"`
+	OperationFence    string `json:"operation_fence"`
+}
+
+type GrowComputerStorageRequest struct {
+	Storage      ComputerStorageReference     `json:"storage"`
+	NewDiskBytes int64                        `json:"new_disk_bytes"`
+	Authority    ComputerStorageGrowAuthority `json:"authority"`
+}
+
+type ComputerStorageGrowReceipt = contract.ComputerStorageGrowReceipt
+
+type GrowComputerStorageResponse struct {
+	Receipt ComputerStorageGrowReceipt `json:"receipt"`
+}
+
+type ComputerReimagePreflightAuthority struct {
+	NodeID            string `json:"node_id"`
+	BootSessionID     string `json:"boot_session_id"`
+	HelperGeneration  uint64 `json:"helper_generation"`
+	RootInstanceID    string `json:"root_instance_id"`
+	OldJobID          string `json:"old_job_id"`
+	StagingJobID      string `json:"staging_job_id"`
+	OperationRevision int64  `json:"operation_revision"`
+	OperationFence    string `json:"operation_fence"`
+}
+
+type PreflightComputerReimageRequest struct {
+	Storage     ComputerStorageReference          `json:"storage"`
+	TargetImage EnsureImageRequest                `json:"target_image"`
+	Chown       bool                              `json:"chown"`
+	Authority   ComputerReimagePreflightAuthority `json:"authority"`
+}
+
+type ComputerReimagePreflightReceipt struct {
+	Kind                   string `json:"kind"`
+	ReceiptID              string `json:"receipt_id"`
+	ComputerID             string `json:"computer_id"`
+	StorageID              string `json:"storage_id"`
+	StorageGeneration      int64  `json:"storage_generation"`
+	OldJobID               string `json:"old_job_id"`
+	StagingJobID           string `json:"staging_job_id"`
+	NodeID                 string `json:"node_id"`
+	RootInstanceID         string `json:"root_instance_id"`
+	OperationRevision      int64  `json:"operation_revision"`
+	OperationFence         string `json:"operation_fence"`
+	TargetDigest           string `json:"target_digest"`
+	PlatformOS             string `json:"platform_os"`
+	PlatformArchitecture   string `json:"platform_architecture"`
+	ImageUID               uint32 `json:"image_uid"`
+	ImageGID               uint32 `json:"image_gid"`
+	DiskRootUID            uint32 `json:"disk_root_uid"`
+	DiskRootGID            uint32 `json:"disk_root_gid"`
+	DetachmentReceiptID    string `json:"detachment_receipt_id"`
+	DetachmentAttemptID    string `json:"detachment_attempt_id"`
+	DetachmentFencingToken string `json:"detachment_fencing_token"`
+	HelperGeneration       uint64 `json:"helper_generation"`
+	FailureCode            string `json:"failure_code"`
+}
+
+type PreflightComputerReimageResponse struct {
+	Receipt ComputerReimagePreflightReceipt `json:"receipt"`
 }
 
 type ComputerBackupAuthority struct {

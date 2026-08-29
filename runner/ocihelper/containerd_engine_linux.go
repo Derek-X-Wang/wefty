@@ -81,47 +81,50 @@ type containerdAttempt struct {
 }
 
 type ContainerdEngine struct {
-	client                    *containerd.Client
-	imageLeaseDeletes         imageLeaseDeletionManager
-	config                    NativeEngineConfig
-	imageOperations           *imageOperationGroup
-	imageNameMu               sync.Mutex
-	imageContentMu            sync.Mutex
-	imageResourceMu           sync.Mutex
-	activeSpools              map[string]struct{}
-	activeLeases              map[string]struct{}
-	attemptImagePins          map[string]imageOperationKey
-	bindingImagePins          map[string]imageOperationKey
-	probeDigests              map[string]struct{}
-	cache                     *imageCacheLedger
-	cacheMaxBytes             int64
-	cacheReady                bool
-	cacheStop                 chan struct{}
-	cacheDone                 chan struct{}
-	closeOnce                 sync.Once
-	closeErr                  error
-	mu                        sync.Mutex
-	attempts                  map[string]*containerdAttempt
-	ports                     map[uint16]string
-	nextPort                  uint16
-	serviceVolumeMu           sync.Mutex
-	storageResetMu            sync.Mutex
-	computerBackupMu          sync.Mutex
-	storageCopyMu             sync.Mutex
-	diskSystem                computerDiskSystem
-	storageResetHook          func(computerStorageResetPhase) error
-	computerBackupHook        func(computerBackupCheckpoint) error
-	computerBackupAllocate    func(string, int64) error
-	computerBackupCopyN       func(io.Writer, io.Reader, int64) (int64, error)
-	computerBackupRemovalHook func()
-	storageCopyHook           func(computerStorageCopyPhase) error
-	storageCopyFinalize       func(context.Context, string, string, string, int64, bool) (computerStorageCopyFacts, error)
-	computerDiskHook          func(computerDiskCheckpoint) error
-	lastProfile               *ProfileReceipt
-	capacityMu                sync.Mutex
-	capacityReservations      map[string]*capacityReservation
-	lastAdmission             *ResourceAdmissionReceipt
-	memoryFactsPath           string
+	client                      *containerd.Client
+	imageLeaseDeletes           imageLeaseDeletionManager
+	config                      NativeEngineConfig
+	imageOperations             *imageOperationGroup
+	imageNameMu                 sync.Mutex
+	imageContentMu              sync.Mutex
+	imageResourceMu             sync.Mutex
+	activeSpools                map[string]struct{}
+	activeLeases                map[string]struct{}
+	attemptImagePins            map[string]imageOperationKey
+	bindingImagePins            map[string]imageOperationKey
+	probeDigests                map[string]struct{}
+	cache                       *imageCacheLedger
+	cacheMaxBytes               int64
+	cacheReady                  bool
+	cacheStop                   chan struct{}
+	cacheDone                   chan struct{}
+	closeOnce                   sync.Once
+	closeErr                    error
+	mu                          sync.Mutex
+	attempts                    map[string]*containerdAttempt
+	ports                       map[uint16]string
+	nextPort                    uint16
+	serviceVolumeMu             sync.Mutex
+	storageResetMu              sync.Mutex
+	computerBackupMu            sync.Mutex
+	storageCopyMu               sync.Mutex
+	diskSystem                  computerDiskSystem
+	storageResetHook            func(computerStorageResetPhase) error
+	computerBackupHook          func(computerBackupCheckpoint) error
+	computerBackupAllocate      func(string, int64) error
+	computerBackupCopyN         func(io.Writer, io.Reader, int64) (int64, error)
+	computerBackupRemovalHook   func()
+	storageCopyHook             func(computerStorageCopyPhase) error
+	storageCopyFinalize         func(context.Context, string, string, string, int64, bool) (computerStorageCopyFacts, error)
+	computerDiskHook            func(computerDiskCheckpoint) error
+	computerGrowHook            func(string) error
+	computerGrowResize          func(context.Context, string, string, int64, int64) error
+	computerGrowFilesystemBytes func(context.Context, string) (int64, error)
+	lastProfile                 *ProfileReceipt
+	capacityMu                  sync.Mutex
+	capacityReservations        map[string]*capacityReservation
+	lastAdmission               *ResourceAdmissionReceipt
+	memoryFactsPath             string
 }
 
 const (
@@ -965,7 +968,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 				}
 			}
 			if computerDisk != nil {
-				if ownerErr = initializeComputerDiskRoot(computerDisk, uid, gid); ownerErr != nil {
+				if ownerErr = initializeComputerDiskRoot(computerDisk, uid, gid, computerDisk.storage.Chown); ownerErr != nil {
 					closeErr := document.Close()
 					document = nil
 					return errors.Join(ownerErr, closeErr)

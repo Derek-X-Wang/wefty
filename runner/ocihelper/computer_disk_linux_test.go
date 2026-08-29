@@ -245,12 +245,74 @@ func TestComputerDiskResizeIntentDoesNotChangeGenerationIdentity(t *testing.T) {
 func TestComputerDiskRootOwnershipInitializesOnlyFreshFormat(t *testing.T) {
 	mountPath := t.TempDir()
 	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
-	if err := initializeComputerDiskRoot(&computerDiskAttachment{mountPath: mountPath, fresh: true}, uid, gid); err != nil {
+	if err := initializeComputerDiskRoot(&computerDiskAttachment{mountPath: mountPath, fresh: true}, uid, gid, false); err != nil {
 		t.Fatal(err)
 	}
 	wrongUID := uid + 1
-	if err := initializeComputerDiskRoot(&computerDiskAttachment{mountPath: mountPath, fresh: false}, wrongUID, gid); err == nil {
+	if err := initializeComputerDiskRoot(&computerDiskAttachment{mountPath: mountPath, fresh: false}, wrongUID, gid, false); err == nil {
 		t.Fatal("existing Computer disk was silently re-owned")
+	}
+}
+
+func TestComputerDiskOwnershipMigrationNeverFollowsSymlinks(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "tenant-file"), []byte("inside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outside, "must-not-touch")
+	if err := os.WriteFile(outsideFile, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "tenant-link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	visited := map[string]bool{}
+	if err := migrateComputerDiskOwnership(root, 1001, 1002, func(path string, uid, gid int) error {
+		if uid != 1001 || gid != 1002 {
+			t.Fatalf("ownership = %d:%d", uid, gid)
+		}
+		visited[path] = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !visited[root] || !visited[filepath.Join(root, "tenant-file")] || !visited[link] || visited[outsideFile] {
+		t.Fatalf("lstat traversal paths = %#v", visited)
+	}
+}
+
+func TestComputerDiskOwnershipMigrationRetriesAfterMidWalkFailure(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a", "b", "c"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	injected := errors.New("injected lchown failure")
+	calls := 0
+	if err := migrateComputerDiskOwnership(root, 1001, 1002, func(string, int, int) error {
+		calls++
+		if calls == 3 {
+			return injected
+		}
+		return nil
+	}); !errors.Is(err, injected) {
+		t.Fatalf("mid-walk failure = %v", err)
+	}
+	visited := map[string]int{}
+	if err := migrateComputerDiskOwnership(root, 1001, 1002, func(path string, uid, gid int) error {
+		if uid != 1001 || gid != 1002 {
+			t.Fatalf("retry ownership = %d:%d", uid, gid)
+		}
+		visited[path]++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(visited) != 4 {
+		t.Fatalf("retry did not walk every entry: %#v", visited)
 	}
 }
 

@@ -500,7 +500,7 @@ func TestComputerProjectionQuiescesRunningObservationWithoutStopIntent(t *testin
 	if projecting.DesiredState != contract.ServiceDesiredRunning ||
 		projecting.ReconfigurationPhase != ComputerReconfigurationProjecting ||
 		projecting.CurrentJobID != oldJobID || projecting.CurrentJob.State != contract.JobStopping ||
-		projecting.CurrentJob.DesiredState != contract.ServiceDesiredStopped ||
+		projecting.CurrentJob.DesiredState != contract.ServiceDesiredRunning ||
 		projecting.IntentRevision != computer.IntentRevision+1 || projecting.AppliedRevision != computer.AppliedRevision {
 		t.Fatalf("projecting Computer = %#v", projecting)
 	}

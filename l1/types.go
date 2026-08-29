@@ -217,6 +217,10 @@ type ComputerStorageClaim struct {
 	SubmitIntentRevision int64  `json:"submit_intent_revision"`
 	SubmitMaxInflight    int    `json:"submit_max_inflight"`
 	SubmitPolicyRevision int64  `json:"submit_policy_revision"`
+	DiskBytes            int64  `json:"disk_bytes"`
+	// Chown authorizes one explicit, crash-resumable ownership migration for
+	// the current reimage only. It is never inferred from an image mismatch.
+	Chown bool `json:"chown,omitempty"`
 }
 
 // ComputerTokenScopeProof is returned only after L1 has verified the exact
@@ -254,12 +258,14 @@ type Node struct {
 // off the operator-visible Node projection because they carry cleanup fences.
 type HeartbeatResponse struct {
 	Node
-	RemovalDirectives      []RemovalDirective              `json:"removal_directives"`
-	StorageResetDirectives []ComputerStorageResetDirective `json:"storage_reset_directives"`
-	BackupDirectives       []ComputerBackupDirective       `json:"backup_directives"`
-	BackupPruneDirectives  []ComputerBackupPruneDirective  `json:"backup_prune_directives"`
-	StorageCopyDirectives  []ComputerStorageCopyDirective  `json:"storage_copy_directives"`
-	ComputerPolicy         *ComputerPolicySnapshot         `json:"computer_policy,omitempty"`
+	RemovalDirectives      []RemovalDirective                  `json:"removal_directives"`
+	StorageResetDirectives []ComputerStorageResetDirective     `json:"storage_reset_directives"`
+	StorageGrowDirectives  []ComputerStorageGrowDirective      `json:"storage_grow_directives"`
+	ReimageDirectives      []ComputerReimagePreflightDirective `json:"reimage_preflight_directives"`
+	BackupDirectives       []ComputerBackupDirective           `json:"backup_directives"`
+	BackupPruneDirectives  []ComputerBackupPruneDirective      `json:"backup_prune_directives"`
+	StorageCopyDirectives  []ComputerStorageCopyDirective      `json:"storage_copy_directives"`
+	ComputerPolicy         *ComputerPolicySnapshot             `json:"computer_policy,omitempty"`
 }
 
 type ServiceBindingProofRequest struct {

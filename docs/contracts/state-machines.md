@@ -108,7 +108,7 @@ Computer-trait Job is invalid at L1 construction time: it must be created in
 the same transaction as its Computer. `computer_id`, `storage_id`, and every
 successive `job_id` are distinct identities.
 
-Start, stop, restart, reset, Backup-cap mutation, removal, and projection replacement require the exact observed
+Start, stop, restart, reset, reimage, grow, Backup-cap mutation, removal, and projection replacement require the exact observed
 `intent_revision` and `storage_id@generation`. The transaction returns
 `stale_intent_revision` or `storage_reference_conflict` without changing any
 row when either precondition moved. An accepted no-change desired-state retry
@@ -121,23 +121,52 @@ materialized by an authority read or CAS. Every history actor is the
 authenticated Fabric identity, never a request-body claim; creation replay by
 a different actor conflicts even when the JobSpec bytes match.
 
-A Storage reset is stopped-only: L1 refuses running, attached, already
-reconfiguring, or removed Computers and never performs an internal quiesce.
-Reservation appends one `reset` intent, admits successor capacity, enters
+A Storage reset may internally quiesce a running Computer only when the caller
+explicitly authorizes take-over session termination. This changes the projecting
+Job state without fabricating an operator stop intent; Computer desired state
+remains authoritative. Reservation appends one `reset` intent, admits successor capacity, enters
 revision-fenced `resetting`, and creates exactly one `staging` generation at
 current generation plus one. The helper takes the predecessor's attachment
 flock, revalidates detachment, durably fences stale attaches in the shared disk
 manifest, then fully allocates, formats, and verifies the successor. Its
 receipt binds the exact managed-root instance in addition to Computer, Storage,
 both generations, Job, Node, reset revision, cleanup fence, and helper
-generation. L1 durably records that receipt before a separate publication
-transaction changes old `current → retired`, staging `→ current`, and advances
-`storage_generation`; the same Job remains stopped and unclaimable. Only after
+generation. L1 durably records that receipt before a separate destroy-last
+publication transaction changes old `current → retired`, staging `→ current`,
+and advances `storage_generation`; the same Job remains stopped and
+unclaimable. Attaching N+1 requires the identity-bound receipt proving N
+detached, never an assertion that N's bytes are already absent. Only after
 publication does the agent retire predecessor bytes through the shared
 authority-bound disk deletion and assertion-derived removal attestation. That
 acknowledgement advances `applied_revision` and returns the Computer to
 `stable`. Removal may supersede any standing reset and deletes every recorded
-generation. No reset phase starts the Computer automatically.
+generation. A desired-running Computer resumes only after predecessor absence
+is positively acknowledged.
+
+A reimage changes only the image of a Computer. It internally quiesces using
+the same explicit session-termination rule, creates a new immutable Job/spec
+projection, and retains Computer identity, placement, grants, Storage identity,
+generation, disk contents, and authoritative desired state. The optional
+`chown` capability authorizes one crash-resumable traversal that uses lstat and
+lchown semantics and never follows tenant-controlled symlinks. A failed new
+image preflight records a typed failure, retires the refused staging
+projection, and leaves the prior projection stopped and operable; it never
+publishes unverified image authority.
+
+A grow intent is strictly larger than `desired_disk_bytes`. It preserves the
+current immutable Job, attempt, Computer identity, Storage identity, and
+generation. The bound helper makes one locked newcomer-pays capacity decision,
+fully allocates the requested final size, expands ext4 (including a live loop
+capacity refresh when attached), and publishes an assertion-derived receipt
+before L1 advances the size authority. `insufficient_disk` proves the old size
+was unchanged and recovery is an explicit Computer restart; shrink is never an
+operation.
+
+`backing_up`, `resetting`, `reimaging`, and `growing` have one typed abort escape hatch
+when their exact bound Node is durably `dead`. Abort is CAS- and
+idempotency-guarded, preserves Computer desired state, supersedes uncertain
+artifacts for later composite removal, and holds the projection stopped until
+an explicit restart. It does not manufacture node-local absence evidence.
 
 A cold Backup is one explicitly disruptive Computer intent. L1 first commits
 the immutable logical Backup identity and its one planned V1 source-node copy

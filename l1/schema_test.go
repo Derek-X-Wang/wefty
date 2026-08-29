@@ -38,7 +38,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 		},
 		"computers": {
 			"computer_id", "name", "placement_node_id", "bound_node_id", "grants_json", "storage_id",
-			"storage_generation", "desired_state", "intent_revision", "applied_revision", "current_job_id",
+			"storage_generation", "desired_disk_bytes", "desired_state", "intent_revision", "applied_revision", "current_job_id",
 			"current_spec_revision", "reconfiguration_phase", "reconfiguration_revision", "submit_enabled",
 			"submit_intent_revision", "submit_max_inflight", "submit_policy_revision", "created_ns", "updated_ns",
 		},
@@ -48,7 +48,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 			"request_hash", "created_ns",
 		},
 		"computer_job_projections": {
-			"computer_id", "job_id", "spec_revision", "current", "created_ns", "retired_ns",
+			"computer_id", "job_id", "spec_revision", "current", "chown", "created_ns", "retired_ns",
 		},
 		"computer_intent_history": {
 			"computer_id", "intent_revision", "operation", "desired_state", "storage_id", "storage_generation",
@@ -61,7 +61,24 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 			"computer_id", "intent_revision", "storage_id", "old_generation", "new_generation", "disk_bytes",
 			"bound_node_id", "job_id", "cleanup_fence", "idempotency_key", "request_hash", "status",
 			"verification_receipt_json", "verification_receipt_hash", "acknowledgement_key", "acknowledgement_hash",
-			"requested_ns", "verified_ns", "published_ns",
+			"resume_desired_running", "requested_ns", "verified_ns", "published_ns",
+		},
+		"computer_storage_grows": {
+			"computer_id", "operation_revision", "storage_id", "storage_generation", "old_disk_bytes", "new_disk_bytes",
+			"bound_node_id", "root_instance_id", "job_id", "operation_fence", "idempotency_key", "request_hash",
+			"status", "failure_code", "receipt_json", "receipt_hash", "acknowledgement_key", "acknowledgement_hash",
+			"requested_ns", "completed_ns",
+		},
+		"computer_reimage_operations": {
+			"computer_id", "operation_revision", "old_job_id", "staging_job_id", "storage_id",
+			"storage_generation", "bound_node_id", "root_instance_id", "operation_fence",
+			"target_reference", "target_digest", "chown", "idempotency_key", "request_hash", "status",
+			"preflight_receipt_json", "preflight_receipt_hash", "acknowledgement_key", "acknowledgement_hash",
+			"requested_ns", "verified_ns", "completed_ns",
+		},
+		"computer_reconfiguration_aborts": {
+			"computer_id", "aborted_revision", "intent_revision", "aborted_phase", "idempotency_key",
+			"request_hash", "actor", "created_ns",
 		},
 		"admin_policy":         {"singleton", "revision", "bootstrap_open", "authority_generation", "updated_ns"},
 		"admins":               {"fabric_id", "user_id", "added_revision", "added_ns"},
@@ -148,11 +165,11 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 		INSERT INTO service_jobs(job_id, desired_state, bound_node_id, restart_streak, lifetime_restart_count)
 		VALUES('migration-job', 'stopped', NULL, 0, 0);
 		INSERT INTO computers(computer_id, name, placement_node_id, bound_node_id, grants_json,
-			storage_id, storage_generation, desired_state, intent_revision, applied_revision,
+			storage_id, storage_generation, desired_disk_bytes, desired_state, intent_revision, applied_revision,
 			current_job_id, current_spec_revision, reconfiguration_phase, reconfiguration_revision,
 			created_ns, updated_ns)
 		VALUES('migration-computer', 'migration-name', 'migration-node', NULL,
-			'[{"user_id":"migration-user","permission":"control"}]', 'migration-storage', 1,
+			'[{"user_id":"migration-user","permission":"control"}]', 'migration-storage', 1, 1,
 			'stopped', 1, 1, 'migration-job', 1, 'stable', NULL, 100, 100);
 		INSERT INTO computer_job_projections(computer_id, job_id, spec_revision, current, created_ns)
 		VALUES('migration-computer', 'migration-job', 1, 1, 100);
@@ -228,9 +245,6 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 		if !strings.Contains(intentsSQL, operation) {
 			t.Fatalf("Computer operation %s was not reconciled: %s", operation, intentsSQL)
 		}
-	}
-	if !strings.Contains(computersSQL, "'resetting'") || !strings.Contains(intentsSQL, "'reset'") {
-		t.Fatalf("reset constraints were not migrated: computers=%s intents=%s", computersSQL, intentsSQL)
 	}
 	var name, placement, grantsJSON, currentJob string
 	var intentRevision int64

@@ -321,16 +321,17 @@ func TestComputerStorageResetRefusalMatrixAndGenerationUniqueness(t *testing.T) 
 		return h, computer
 	}
 
-	t.Run("running", func(t *testing.T) {
+	t.Run("desired-running but detached", func(t *testing.T) {
 		h, computer := newStopped(t, "running-refusal")
 		if _, err := h.store.db.Exec(`UPDATE computers SET desired_state='running' WHERE computer_id=?`, computer.ComputerID); err != nil {
 			t.Fatal(err)
 		}
 		computer.DesiredState = contract.ServiceDesiredRunning
-		_, _, err := h.store.BeginComputerStorageReset(t.Context(), computer.ComputerID,
+		resetting, _, err := h.store.BeginComputerStorageReset(t.Context(), computer.ComputerID,
 			ComputerStorageResetRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "running"})
-		if errorCode(err) != contract.ErrorConflict {
-			t.Fatalf("running reset error = %v", err)
+		if err != nil || resetting.DesiredState != contract.ServiceDesiredRunning ||
+			resetting.ReconfigurationPhase != ComputerReconfigurationResetting {
+			t.Fatalf("detached desired-running reset = %#v err=%v", resetting, err)
 		}
 	})
 

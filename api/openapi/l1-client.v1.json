@@ -777,6 +777,90 @@
         }
       }
     },
+    "/v1/computers/{computer_id}/reimage": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "reimageComputer",
+        "summary": "Replace a Computer image while retaining its disk",
+        "description": "CAS-guarded reimage creates a new immutable Job projection for the same Computer and Storage generation. A running Computer is internally quiesced only with explicit session termination; authoritative desired state is preserved. chown authorizes one crash-resumable, symlink-safe ownership migration.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["intent_revision", "storage_id", "storage_generation", "image", "idempotency_key"],
+          "properties": {
+            "intent_revision": { "type": "integer", "minimum": 1 },
+            "storage_id": { "type": "string", "minLength": 1 },
+            "storage_generation": { "type": "integer", "minimum": 1 },
+            "image": { "$ref": "../../contract/schemas/v1/job-spec.schema.json#/$defs/ociExecution/properties/image" },
+            "chown": { "type": "boolean", "default": false },
+            "terminate_sessions": { "type": "boolean", "default": false },
+            "idempotency_key": { "type": "string", "minLength": 1 }
+          }
+        } } } },
+        "responses": {
+          "202": { "description": "Reimage accepted or advanced through internal quiescence.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/grow": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "growComputerStorage",
+        "summary": "Grow a Computer disk without changing its identity",
+        "description": "Grow-only CAS intent. The helper atomically applies newcomer-pays capacity admission, fully allocates the requested bytes, expands ext4, and publishes an authority-bound receipt before L1 changes desired_disk_bytes. Job, attempt, Storage identity, and generation remain unchanged.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["intent_revision", "storage_id", "storage_generation", "disk_bytes", "idempotency_key"],
+          "properties": {
+            "intent_revision": { "type": "integer", "minimum": 1 },
+            "storage_id": { "type": "string", "minLength": 1 },
+            "storage_generation": { "type": "integer", "minimum": 1 },
+            "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Identical grow replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "202": { "description": "Grow reserved; reconfiguration_phase remains growing until a helper receipt is accepted.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/reconfiguration-abort": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "abortComputerReconfiguration",
+        "summary": "Release a reconfiguration stranded on a dead bound Node",
+        "description": "Typed escape hatch for backing_up, resetting, or reimaging. It requires exact CAS authority and a dead bound Node, preserves desired state, records uncertain artifacts for later removal, and requires explicit restart for recovery.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["intent_revision", "storage_id", "storage_generation", "idempotency_key"],
+          "properties": {
+            "intent_revision": { "type": "integer", "minimum": 1 },
+            "storage_id": { "type": "string", "minLength": 1 },
+            "storage_generation": { "type": "integer", "minimum": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Identical abort replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "202": { "description": "Reconfiguration authority released; explicit restart or removal is now available.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/computers/{computer_id}/storage-reset": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
@@ -784,7 +868,7 @@
       "post": {
         "operationId": "resetComputerStorage",
         "summary": "Reserve a new empty Storage generation",
-        "description": "Stopped-only operation that persists one CAS intent and reserves generation+1 after capacity admission. The bound agent fences the detached predecessor, fully allocates and verifies the tracked successor, and L1 durably publishes it while keeping the Computer stopped; only then does shared removal delete and attest the predecessor.",
+        "description": "CAS operation that internally quiesces a running Computer only with explicit session termination and reserves generation+1 after capacity admission without fabricating operator stop intent. The bound agent fences the detached predecessor, fully allocates and verifies the tracked successor, and L1 durably publishes it; only then does shared removal delete and attest the predecessor before desired-running recovery resumes.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": {
@@ -795,6 +879,7 @@
               "intent_revision": { "type": "integer", "minimum": 1 },
               "storage_id": { "type": "string", "minLength": 1 },
               "storage_generation": { "type": "integer", "minimum": 1 },
+              "terminate_sessions": { "type": "boolean", "default": false },
               "idempotency_key": { "type": "string", "minLength": 1 }
             }
           } } }
