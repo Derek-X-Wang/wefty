@@ -84,11 +84,24 @@ jobs:
       COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-reference
       WEFTY_LINUX_COMPUTER_MUTATE_ROW: ${{ inputs.mutation_row != 'none' && inputs.mutation_row || '' }}
     steps:
-      - name: Check out the exact commit that published the selected artifacts
+      - name: Check out trusted main history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          ref: refs/heads/main
+          fetch-depth: 0
           persist-credentials: false
+      - name: Detach to the validated artifact-producing commit
+        env:
+          EXPECTED_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+        run: |
+          set -euo pipefail
+          case "$EXPECTED_SHA" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) exit 64 ;;
+          esac
+          git merge-base --is-ancestor "$EXPECTED_SHA" HEAD
+          git checkout --detach "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Download the triggering publication artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -382,11 +395,24 @@ jobs:
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Check out the receipt gate from the publishing commit
+      - name: Check out trusted main history for the receipt gate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          ref: refs/heads/main
+          fetch-depth: 0
           persist-credentials: false
+      - name: Detach the receipt gate to the validated publishing commit
+        env:
+          EXPECTED_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+        run: |
+          set -euo pipefail
+          case "$EXPECTED_SHA" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) exit 64 ;;
+          esac
+          git merge-base --is-ancestor "$EXPECTED_SHA" HEAD
+          git checkout --detach "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Download the Linux matrix receipt
         if: needs.resolve-published-artifact.outputs.available == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
