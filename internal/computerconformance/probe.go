@@ -256,5 +256,15 @@ func SendInput(ctx context.Context, port, x, y int) error {
 			return err
 		}
 	}
+	// Keep the RFB session alive long enough for the backend to consume the
+	// queued events. Closing immediately after the final WebSocket write can
+	// race x11vnc and turn accepted input into a false negative.
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+	}
 	return nil
 }

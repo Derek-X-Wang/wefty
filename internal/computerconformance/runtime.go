@@ -434,10 +434,13 @@ func (runner *runtimeRunner) checkProfile(ctx context.Context) {
 	} else {
 		runner.record("runtime.image-config", StatusFail, "runtime replaced image ENTRYPOINT, CMD, or working directory")
 	}
-	if runner.execShell(ctx, `if : > /wefty-conformance-rootfs 2>/dev/null; then rm -f /wefty-conformance-rootfs; exit 1; fi`, "") == nil {
+	rootfsProbeAvailable := runner.execShell(ctx, `command -v touch >/dev/null`, "") == nil
+	rootfsWriteErr := runner.command(ctx, "exec", runner.containerID, "touch", "/wefty-conformance-rootfs").Run()
+	if rootfsProbeAvailable && rootfsWriteErr != nil {
 		runner.record("profile.rootfs-read-only", StatusPass, "rootfs write was rejected")
 	} else {
-		runner.record("profile.rootfs-read-only", StatusFail, "rootfs write succeeded")
+		_ = runner.command(ctx, "exec", runner.containerID, "rm", "-f", "/wefty-conformance-rootfs").Run()
+		runner.record("profile.rootfs-read-only", StatusFail, "rootfs rejection probe was unavailable or the write succeeded")
 	}
 	if runner.execShell(ctx, `test -w /wefty/service`, "") == nil {
 		runner.record("profile.service-writable", StatusPass, "service data mount is tenant writable")
