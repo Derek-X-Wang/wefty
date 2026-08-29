@@ -903,15 +903,15 @@ func TestSavedWorkflowNotFoundAndRerunSnapshotReuse(t *testing.T) {
 	}
 
 	status, replayHeaders, replayBody := h.do(h.caller, http.MethodPost, "/v1/runs/"+source.RunID+"/rerun", nil, http.Header{"Idempotency-Key": []string{"rerun-copy"}})
-	if status != http.StatusOK || replayHeaders.Get("Idempotency-Replayed") != "true" {
-		t.Fatalf("rerun replay status/header = %d/%q body=%s", status, replayHeaders.Get("Idempotency-Replayed"), replayBody)
+	if status != http.StatusOK || replayHeaders.Get("Idempotent-Replay") != "true" {
+		t.Fatalf("rerun replay status/header = %d/%q body=%s", status, replayHeaders.Get("Idempotent-Replay"), replayBody)
 	}
 	var replay RunAccepted
 	if err := json.Unmarshal(replayBody, &replay); err != nil {
 		t.Fatal(err)
 	}
-	if replay.RunID != rerun.RunID || headers.Get("Idempotency-Replayed") != "" {
-		t.Fatalf("rerun replay id/header = %q/%q", replay.RunID, headers.Get("Idempotency-Replayed"))
+	if replay.RunID != rerun.RunID || headers.Get("Idempotent-Replay") != "" {
+		t.Fatalf("rerun replay id/header = %q/%q", replay.RunID, headers.Get("Idempotent-Replay"))
 	}
 
 	reconciler, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
@@ -1106,8 +1106,8 @@ func TestRunSubmissionValidationAndIdempotency(t *testing.T) {
 	request := inlineRunRequest("#!/bin/sh\necho replay\n")
 	accepted := h.submit(request, "run-replay-1")
 	status, headers, body := h.do(h.caller, http.MethodPost, "/v1/runs", request, http.Header{"Idempotency-Key": []string{"run-replay-1"}})
-	if status != http.StatusOK || headers.Get("Idempotency-Replayed") != "true" {
-		t.Fatalf("replay status/header = %d/%q body=%s", status, headers.Get("Idempotency-Replayed"), body)
+	if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" {
+		t.Fatalf("replay status/header = %d/%q body=%s", status, headers.Get("Idempotent-Replay"), body)
 	}
 	var replay RunAccepted
 	if err := json.Unmarshal(body, &replay); err != nil {

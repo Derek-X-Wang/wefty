@@ -27,7 +27,7 @@ const (
 
 func executeServices(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError("usage: wefty services create|list|status|start|stop|restart|logs|remove|forget|grants|grant|revoke|takeover")
+		return usageError(serviceUsage)
 	}
 	switch args[0] {
 	case "create":
@@ -56,10 +56,22 @@ func executeServices(ctx context.Context, clients *apiClients, jsonOutput bool, 
 		return executeComputerGrant(ctx, clients, jsonOutput, args[1:], stdout, stderr, true)
 	case "takeover":
 		return executeComputerTakeover(ctx, clients, jsonOutput, args[1:], stdout, stderr)
+	case "reimage":
+		return executeComputerReimage(ctx, clients, jsonOutput, args[1:], stdout, stderr)
+	case "reset":
+		return executeComputerReset(ctx, clients, jsonOutput, args[1:], stdout, stderr)
+	case "resize":
+		return executeComputerResize(ctx, clients, jsonOutput, args[1:], stdout, stderr)
+	case "abort":
+		return executeComputerAbort(ctx, clients, jsonOutput, args[1:], stdout, stderr)
+	case "submission":
+		return executeComputerSubmission(ctx, clients, jsonOutput, args, stdout, stderr)
 	default:
 		return usageError(fmt.Sprintf("unknown services command %q", args[0]))
 	}
 }
+
+const serviceUsage = "usage: wefty services create|list|status|start|stop|restart|logs|remove|forget|reimage|reset|resize|abort|submission|grants|grant|revoke|takeover"
 
 func executeServiceCreate(
 	ctx context.Context,
@@ -71,11 +83,19 @@ func executeServiceCreate(
 	flags := flag.NewFlagSet("services create", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var scriptPath, idempotencyKey string
+	var computer bool
+	var computerName string
+	var computerBackupCap int64
+	var computerDiskBytes optionalInt64Flag
 	var mode scriptMode
 	var tags, interpreters stringListFlag
 	var publishedPort optionalPortFlag
 	var imageFlags imageFlagSet
 	flags.StringVar(&scriptPath, "script", "", "service script file")
+	flags.BoolVar(&computer, "computer", false, "create a durable Computer authority")
+	flags.StringVar(&computerName, "name", "", "durable Computer name (requires --computer)")
+	flags.Int64Var(&computerBackupCap, "backup-cap", 0, "maximum retained Computer Backups (requires --computer)")
+	flags.Var(&computerDiskBytes, "disk-bytes", "fully allocated Computer disk budget (requires --computer)")
 	imageFlags.bind(flags)
 	flags.Var(&interpreters, "interpreter", "inline script interpreter argv entry (repeatable)")
 	flags.Var(&mode, "mode", "inline script mode, such as 0755")
@@ -87,6 +107,18 @@ func executeServiceCreate(
 	}
 	if flags.NArg() != 0 {
 		return usageError("services create does not accept positional arguments")
+	}
+	if computer {
+		computerArgs := make([]string, 0, len(args)-1)
+		for _, arg := range args {
+			if arg != "--computer" {
+				computerArgs = append(computerArgs, arg)
+			}
+		}
+		return executeComputerCreate(ctx, clients, jsonOutput, computerArgs, stdout, stderr)
+	}
+	if computerName != "" || computerBackupCap != 0 || computerDiskBytes.set {
+		return usageError("--name, --backup-cap, and --disk-bytes require --computer")
 	}
 	if (strings.TrimSpace(scriptPath) == "") == (strings.TrimSpace(imageFlags.reference) == "") {
 		return usageError("services create requires exactly one of --script or --image")
@@ -250,13 +282,44 @@ func executeServiceList(
 
 func executeServiceStatus(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
 	if len(args) != 1 {
-		return usageError("usage: wefty services status JOB_ID")
+		return usageError("usage: wefty services status JOB_ID|COMPUTER_ID")
 	}
-	job, err := clients.getService(ctx, args[0])
+	job, computer, err := resolveServiceTarget(ctx, clients, args[0])
 	if err != nil {
 		return err
 	}
-	return writeServiceResult(stdout, job, jsonOutput)
+	if computer != nil {
+		return writeComputerProjection(stdout, newComputerProjection(*computer, nil, nil), jsonOutput)
+	}
+	return writeServiceResult(stdout, *job, jsonOutput)
+}
+
+func resolveServiceTarget(ctx context.Context, clients *apiClients, target string) (*l1.Job, *l1.Computer, error) {
+	job, err := clients.getService(ctx, target)
+	if err == nil {
+		if job.ComputerID == "" {
+			return &job, nil, nil
+		}
+		computer, computerErr := clients.getComputer(ctx, job.ComputerID)
+		if computerErr != nil {
+			return nil, nil, computerErr
+		}
+		return &job, &computer, nil
+	}
+	var responseErr *apiResponseError
+	if !errors.As(err, &responseErr) || responseErr.APIError.Code != contract.ErrorNotFound {
+		return nil, nil, err
+	}
+	computer, computerErr := clients.getComputer(ctx, target)
+	if computerErr != nil {
+		return nil, nil, computerErr
+	}
+	return nil, &computer, nil
+}
+
+func computerMutationFlagsSet(mutation computerMutationFlags) bool {
+	return mutation.expectCurrent || mutation.intentRevision.set || mutation.storageGeneration.set ||
+		strings.TrimSpace(mutation.storageID) != ""
 }
 
 func executeServiceDesiredState(
@@ -275,8 +338,10 @@ func executeServiceDesiredState(
 	flags := flag.NewFlagSet("services "+verb, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var wait, pollInterval time.Duration
+	var mutation computerMutationFlags
 	flags.DurationVar(&wait, "wait", 0, "wait up to this duration for observed completion")
 	flags.DurationVar(&pollInterval, "poll-interval", defaultServicePollInterval, "wait polling interval")
+	mutation.bind(flags, false)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -289,8 +354,39 @@ func executeServiceDesiredState(
 	if pollInterval <= 0 {
 		return usageError("--poll-interval must be positive")
 	}
+	if computerMutationFlagsSet(mutation) {
+		if err := mutation.validate(false); err != nil {
+			return err
+		}
+	}
 	jobID := flags.Arg(0)
-	job, err := clients.setServiceDesiredState(ctx, jobID, desired)
+	jobTarget, computer, err := resolveServiceTarget(ctx, clients, jobID)
+	if err != nil {
+		return err
+	}
+	if computer != nil {
+		if wait != 0 || pollInterval != defaultServicePollInterval {
+			return usageError("--wait and --poll-interval are not valid for Computer lifecycle mutations")
+		}
+		if validateErr := mutation.validate(false); validateErr != nil {
+			return validateErr
+		}
+		precondition, resolveErr := mutation.resolve(ctx, clients, computer.ComputerID)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		updated, receipt, mutationErr := clients.setComputerDesiredState(ctx, computer.ComputerID, l1.ComputerDesiredStateRequest{
+			ComputerMutationPrecondition: precondition, DesiredState: desired,
+		})
+		if mutationErr != nil {
+			return mutationErr
+		}
+		return writeComputerMutation(stdout, updated, receipt, jsonOutput)
+	}
+	if computerMutationFlagsSet(mutation) {
+		return usageError("Computer CAS flags are valid only for a Computer-owned service")
+	}
+	job, err := clients.setServiceDesiredState(ctx, jobTarget.JobID, desired)
 	if err != nil {
 		return err
 	}
@@ -319,26 +415,58 @@ func executeServiceRestart(
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services restart", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	var idempotencyKey string
-	flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable idempotency key for this restart request")
+	var mutation computerMutationFlags
+	mutation.bind(flags, true)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services restart JOB_ID --idempotency-key KEY")
 	}
-	if strings.TrimSpace(idempotencyKey) == "" {
+	if strings.TrimSpace(mutation.idempotencyKey) == "" {
 		return usageError("services restart requires --idempotency-key so retries cannot restart twice")
 	}
-	key, err := validateIdempotencyKey(idempotencyKey)
+	if computerMutationFlagsSet(mutation) {
+		if err := mutation.validate(true); err != nil {
+			return err
+		}
+	}
+	job, computer, err := resolveServiceTarget(ctx, clients, flags.Arg(0))
 	if err != nil {
 		return err
 	}
-	job, err := clients.restartService(ctx, flags.Arg(0), key)
+	if computer != nil {
+		if validateErr := mutation.validate(false); validateErr != nil {
+			return validateErr
+		}
+		precondition, resolveErr := mutation.resolve(ctx, clients, computer.ComputerID)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		key, keyErr := mutation.key()
+		if keyErr != nil {
+			return keyErr
+		}
+		updated, receipt, mutationErr := clients.restartComputer(ctx, computer.ComputerID, l1.ComputerRestartRequest{
+			ComputerMutationPrecondition: precondition, IdempotencyKey: key,
+		})
+		if mutationErr != nil {
+			return mutationErr
+		}
+		return writeComputerMutation(stdout, updated, receipt, jsonOutput)
+	}
+	if computerMutationFlagsSet(mutation) {
+		return usageError("Computer CAS flags are valid only for a Computer-owned service")
+	}
+	key, err := validateIdempotencyKey(mutation.idempotencyKey)
 	if err != nil {
 		return err
 	}
-	return writeServiceResult(stdout, job, jsonOutput)
+	updated, err := clients.restartService(ctx, job.JobID, key)
+	if err != nil {
+		return err
+	}
+	return writeServiceResult(stdout, updated, jsonOutput)
 }
 
 func executeServiceRemove(
@@ -352,8 +480,10 @@ func executeServiceRemove(
 	flags := flag.NewFlagSet("services remove", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var wait, pollInterval time.Duration
+	var mutation computerMutationFlags
 	flags.DurationVar(&wait, "wait", 0, "wait up to this duration for verified removal")
 	flags.DurationVar(&pollInterval, "poll-interval", defaultServicePollInterval, "wait polling interval")
+	mutation.bind(flags, false)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -366,12 +496,34 @@ func executeServiceRemove(
 	if pollInterval <= 0 {
 		return usageError("--poll-interval must be positive")
 	}
+	if computerMutationFlagsSet(mutation) {
+		if err := mutation.validate(false); err != nil {
+			return err
+		}
+	}
 	jobID := flags.Arg(0)
-	prior, err := clients.getService(ctx, jobID)
+	prior, computer, err := resolveServiceTarget(ctx, clients, jobID)
 	if err != nil {
 		return err
 	}
-	job, err := clients.removeService(ctx, jobID)
+	if computer != nil {
+		if wait != 0 || pollInterval != defaultServicePollInterval {
+			return usageError("--wait and --poll-interval are not valid for Computer removal")
+		}
+		precondition, resolveErr := mutation.resolve(ctx, clients, computer.ComputerID)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		updated, receipt, mutationErr := clients.removeComputer(ctx, computer.ComputerID, l1.ComputerRemoveRequest{ComputerMutationPrecondition: precondition})
+		if mutationErr != nil {
+			return mutationErr
+		}
+		return writeComputerMutation(stdout, updated, receipt, jsonOutput)
+	}
+	if computerMutationFlagsSet(mutation) {
+		return usageError("Computer CAS flags are valid only for a Computer-owned service")
+	}
+	job, err := clients.removeService(ctx, prior.JobID)
 	if err != nil {
 		return err
 	}

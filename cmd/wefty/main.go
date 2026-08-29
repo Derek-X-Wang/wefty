@@ -28,10 +28,10 @@ func main() {
 }
 
 // commandExitCodeForArgs preserves the historical exit 1 contract for all
-// pre-existing commands. Typed exits are an explicit contract only for the
-// access-policy and take-over commands introduced by #191.
+// pre-existing commands. Typed exits are explicit contracts only for the
+// Computer lifecycle and access surfaces introduced by #190 and #191.
 func commandExitCodeForArgs(err error, args []string) int {
-	if !isAccessCLIArgs(args) {
+	if !isAccessCLIArgs(args) && !isComputerCLIArgs(args) {
 		return exitFailure
 	}
 	return commandExitCode(err)
@@ -52,6 +52,41 @@ func isAccessCLIArgs(args []string) bool {
 	}
 	return len(positionals) >= 2 && positionals[0] == "services" &&
 		(positionals[1] == "grant" || positionals[1] == "grants" || positionals[1] == "revoke" || positionals[1] == "takeover")
+}
+
+func isComputerCLIArgs(args []string) bool {
+	positionals := make([]string, 0, 3)
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") {
+			positionals = append(positionals, arg)
+		}
+	}
+	if len(positionals) < 2 || positionals[0] != "services" {
+		return false
+	}
+	switch positionals[1] {
+	case "reimage", "reset", "resize", "abort", "submission":
+		return true
+	case "create":
+		return hasArg(args, "--computer")
+	case "status", "start", "stop", "restart", "remove":
+		// These shared verbs return typed exits only when Computer-specific CAS
+		// flags identify the new authority surface. Plain Job behavior remains 1.
+		target := positionals[len(positionals)-1]
+		return strings.HasPrefix(target, "computer_") || strings.HasPrefix(target, "computer-") || hasArg(args, "--expect-current") ||
+			hasArg(args, "--intent-revision") || hasArg(args, "--storage-id") || hasArg(args, "--storage-generation")
+	default:
+		return false
+	}
+}
+
+func hasArg(args []string, name string) bool {
+	for _, arg := range args {
+		if arg == name || strings.HasPrefix(arg, name+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 const (
@@ -90,7 +125,7 @@ func commandExitCode(err error) int {
 	case contract.ErrorNotFound, contract.ErrorAttemptNotFound, contract.ErrorTakeoverSessionEnded:
 		return exitNotFound
 	case contract.ErrorConflict, contract.ErrorStalePolicyRevision, contract.ErrorStaleIntentRevision,
-		contract.ErrorIdempotencyConflict, contract.ErrorDispatchKeyConflict, contract.ErrorFinalAdmin,
+		contract.ErrorStorageReferenceConflict, contract.ErrorIdempotencyConflict, contract.ErrorDispatchKeyConflict, contract.ErrorFinalAdmin,
 		contract.ErrorCapacityExhausted, contract.ErrorComputerResourceRequired, contract.ErrorComputerTraitRequired,
 		contract.ErrorControllerBusy, contract.ErrorControllerAlreadyHeld:
 		return exitConflict
@@ -201,7 +236,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 func usesPersonProtocol(args []string) bool {
 	return requiresPersonCommand(args) ||
-		(len(args) > 1 && args[0] == "computers" && args[1] == "submission")
+		(len(args) > 1 && args[0] == "services" && args[1] == "submission")
 }
 
 func requiresPersonCommand(args []string) bool {
@@ -281,11 +316,22 @@ Commands:
   nodes list                 List node reachability, eligibility, and capacity
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   services <verb>            Create and operate service-class jobs
-    create|list|status|start|stop|restart|logs|remove|forget
-  computers submission <verb>
+    create [--computer --name NAME --image IMAGE --node NODE_ID --argv ARG --working-directory PATH --mount SPEC --memory-bytes BYTES --cpu-millicores VALUE --runtime-handler NAME --disk-bytes BYTES --backup-cap COUNT --idempotency-key KEY]
+    list [--limit COUNT --cursor CURSOR]
+    status JOB_ID|COMPUTER_ID
+    start|stop COMPUTER [--intent-revision REV --storage-id ID --storage-generation GENERATION | --expect-current]
+    restart COMPUTER --idempotency-key KEY [CAS flags | --expect-current]
+    remove COMPUTER [CAS flags | --expect-current]
+    reimage COMPUTER --image IMAGE --idempotency-key KEY [--chown --terminate-sessions] [CAS flags | --expect-current]
+    reset COMPUTER --idempotency-key KEY [--terminate-sessions] [CAS flags | --expect-current]
+    resize COMPUTER --disk-bytes BYTES --idempotency-key KEY [CAS flags | --expect-current]
+    abort COMPUTER --idempotency-key KEY [CAS flags | --expect-current]
+    logs|forget JOB_ID
+    grants|grant|revoke|takeover
+  services submission <verb>
                              Enable, disable, or set Computer Run submission inflight capacity
-    enable|disable|set-inflight
-                             Requires observed policy and submission revisions, or --expect-current
+    enable|disable COMPUTER [--policy-revision REV --submit-intent-revision REV | --expect-current] [--idempotency-key KEY]
+    set-inflight COMPUTER --max-inflight COUNT [--policy-revision REV --submit-intent-revision REV | --expect-current] [--idempotency-key KEY]
   runs list                  List Runs by immutable Computer origin
     grants|grant|revoke      List or mutate Computer person grants
     takeover view COMPUTER --session-token-file FILE

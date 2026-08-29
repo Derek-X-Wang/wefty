@@ -124,9 +124,54 @@ never through local files.
 _Avoid_: sticky, affinity
 
 **Service binding**:
-The current placement relationship between a service job and one node. In
-v1 it is retained across payload restarts and admits no cross-node failover.
+The current placement relationship between a durable service resource — a
+service Job or a Computer — and one Node. It is retained across payload
+restarts and admits no cross-node failover.
 _Avoid_: pin, affinity, ownership, permanent placement
+
+### Agent computers and storage
+
+**Computer**:
+A durable, Pinned service resource whose storage identity, name, placement,
+and grants persist across runtime attempts and image changes. Its tenant image
+may change without changing the Computer.
+_Avoid_: node, machine, VM, container, tenant, service job
+
+**Storage generation**:
+One monotonically identified incarnation of a Computer's persistent storage.
+Exactly one generation may be current and attached.
+_Avoid_: disk version, snapshot, removal generation, authority generation
+
+**Backup**:
+An immutable wefty-managed copy of one Storage generation under wefty's
+removal responsibility.
+_Avoid_: snapshot, export, archive, recovery point
+
+**Backup copy**:
+One physical wefty-owned replica of a Backup on one Node.
+_Avoid_: Backup, mirror, custody export
+
+**Storage provenance**:
+The recorded source relationships among Storage generations, Backups,
+clones, imports, and Custody exports.
+_Avoid_: Lineage, run lineage, attachment history
+
+**Custody export**:
+The recorded transfer of storage bytes outside wefty ownership, permanently
+reducing what removal can prove.
+_Avoid_: Backup, managed copy, verified deletion
+
+### Human take-over
+
+**Take-over session**:
+One authenticated, bounded viewing or control connection from a person to a
+Computer through the Fabric.
+_Avoid_: Run, login, VNC session, tenant session
+
+**Controller tenure**:
+The exclusive, attempt-scoped period in which one Take-over session holds a
+Computer's human input path.
+_Avoid_: grant, control role, lock, idle session
 
 **Slot**:
 One unit of a node's configured admission capacity within one workload

@@ -150,7 +150,7 @@
           "200": {
             "description": "Identical dispatch-key replay; original job returned.",
             "headers": {
-              "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } }
+              "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } }
             },
             "content": {
               "application/json": {
@@ -349,7 +349,7 @@
         "responses": {
           "200": {
             "description": "Identical restart replay; no second restart was issued.",
-            "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } },
+            "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } },
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } }
           },
           "202": {
@@ -560,7 +560,7 @@
         "responses": {
           "200": {
             "description": "Grant changed or identical idempotent replay. Downgrade/revoke includes pending status until the current node boot acknowledges after matching sessions close.",
-            "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean" } } },
+            "headers": { "Idempotent-Replay": { "schema": { "type": "boolean" } } },
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerGrantMutationResult" } } }
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
@@ -688,6 +688,24 @@
       }
     },
     "/v1/computers": {
+      "get": {
+        "operationId": "listComputers",
+        "summary": "List durable Computer authorities and their current Job observations",
+        "parameters": [
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "One creation/Computer-ID ordered page. Removed Computers remain as terminal truth.",
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerList" } } }
+          },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      },
       "post": {
         "operationId": "createComputer",
         "summary": "Create a durable Computer and its first immutable Job projection",
@@ -712,7 +730,7 @@
         "responses": {
           "200": {
             "description": "Identical dispatch-key replay; the original Computer is returned.",
-            "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } },
+            "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } },
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
           },
           "201": {
@@ -865,7 +883,7 @@
         "responses": {
           "200": {
             "description": "Identical restart replay; no second intent or attempt was issued.",
-            "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } },
+            "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } },
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
           },
           "202": {
@@ -903,6 +921,7 @@
           }
         } } } },
         "responses": {
+          "200": { "description": "Identical reimage replay; no second intent or projection was issued.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "202": { "description": "Reimage accepted or advanced through internal quiescence.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
@@ -930,7 +949,7 @@
           }
         } } } },
         "responses": {
-          "200": { "description": "Identical grow replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "200": { "description": "Identical grow replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "202": { "description": "Grow reserved; reconfiguration_phase remains growing until a helper receipt is accepted.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
@@ -957,7 +976,7 @@
           }
         } } } },
         "responses": {
-          "200": { "description": "Identical abort replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "200": { "description": "Identical abort replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "202": { "description": "Reconfiguration authority released; explicit restart or removal is now available.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
@@ -991,7 +1010,7 @@
         "responses": {
           "200": {
             "description": "Identical reset replay; no second generation was reserved.",
-            "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } },
+            "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } },
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
           },
           "202": {
@@ -1056,7 +1075,7 @@
           }
         } } } },
         "responses": {
-          "200": { "description": "Identical creation replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "200": { "description": "Identical creation replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "202": { "description": "Backup intent planned; reconfiguration remains backing_up until the exact receipt is accepted.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -1087,7 +1106,7 @@
           }
         } } } },
         "responses": {
-          "200": { "description": "Identical prune replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Backup" } } } },
+          "200": { "description": "Identical prune replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Backup" } } } },
           "202": { "description": "Physical copy removal planned.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Backup" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -1119,7 +1138,7 @@
           }
         } } } },
         "responses": {
-          "200": { "description": "Identical restore replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "200": { "description": "Identical restore replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "202": { "description": "Restore reserved; the Computer remains stopped through verification, publication, and predecessor retirement.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -1152,7 +1171,7 @@
           }
         } } } },
         "responses": {
-          "200": { "description": "Identical clone replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "200": { "description": "Identical clone replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "202": { "description": "Clone reserved and not claimable until its source-copy receipt is accepted.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -1184,7 +1203,7 @@
           }
         } } } },
         "responses": {
-          "200": { "description": "Identical Custody export replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "type": "object" } } } },
+          "200": { "description": "Identical Custody export replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "type": "object" } } } },
           "202": { "description": "Custody event committed before external bytes; the branch is already permanently tainted.", "content": { "application/json": { "schema": { "type": "object" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
@@ -1256,7 +1275,7 @@
           }
         } } } },
         "responses": {
-          "200": { "description": "Identical Custody import replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "type": "object" } } } },
+          "200": { "description": "Identical Custody import replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "type": "object" } } } },
           "202": { "description": "Import validation and managed materialization reserved atomically as a stopped, non-claimable Computer until positive evidence is accepted.", "content": { "application/json": { "schema": { "type": "object" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },

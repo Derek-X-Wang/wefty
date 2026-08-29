@@ -382,13 +382,17 @@ type serviceCLIHarness struct {
 }
 
 func newServiceCLIHarness(t *testing.T) *serviceCLIHarness {
+	return newServiceCLIHarnessWithOptions(t, l1.StoreOptions{})
+}
+
+func newServiceCLIHarnessWithOptions(t *testing.T, options l1.StoreOptions) *serviceCLIHarness {
 	t.Helper()
 	network := plain.NewNetwork()
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "service-cli-control"})
 	operatorFabric := network.NewFabric(fabric.Identity{
 		NodeID: "service-cli-operator", Tags: []string{l1.DefaultClientPrincipalTag},
 	})
-	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{})
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), options)
 	if err != nil {
 		t.Fatal(err)
 	}

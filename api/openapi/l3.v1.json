@@ -283,7 +283,7 @@
           "200": {
             "description": "Identical idempotency replay; original run returned.",
             "headers": {
-              "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } }
+              "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } }
             },
             "content": {
               "application/json": { "schema": { "$ref": "#/components/schemas/RunAccepted" } }
@@ -396,7 +396,7 @@
           "200": {
             "description": "Identical idempotency replay; the previously created rerun is returned.",
             "headers": {
-              "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } }
+              "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } }
             },
             "content": {
               "application/json": { "schema": { "$ref": "#/components/schemas/RunAccepted" } }
@@ -466,7 +466,7 @@
           "200": {
             "description": "Identical idempotency replay; the original envelope is returned.",
             "headers": {
-              "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } }
+              "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } }
             },
             "content": {
               "application/json": {
@@ -511,7 +511,7 @@
           "200": {
             "description": "Identical idempotency replay; the original gate result is returned.",
             "headers": {
-              "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } }
+              "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } }
             },
             "content": {
               "application/json": {

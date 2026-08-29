@@ -19,7 +19,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/l3"
 )
 
-const computerSubmissionUsage = "usage: wefty computers submission enable|disable|set-inflight COMPUTER_ID [--max-inflight LIMIT] (--policy-revision REVISION --submit-intent-revision REVISION | --expect-current) [--idempotency-key KEY]"
+const computerSubmissionUsage = "usage: wefty services submission enable|disable|set-inflight COMPUTER_ID [--max-inflight LIMIT] (--policy-revision REVISION --submit-intent-revision REVISION | --expect-current) [--idempotency-key KEY]"
 
 type optionalRevisionFlag struct {
 	value int64
@@ -47,16 +47,16 @@ type computerSubmissionOutput struct {
 	IdempotentReplay bool `json:"idempotent_replay"`
 }
 
-func executeComputers(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
+func executeComputerSubmission(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if len(args) < 2 || args[0] != "submission" {
 		return usageError(computerSubmissionUsage)
 	}
 	verb := args[1]
 	if verb != "enable" && verb != "disable" && verb != "set-inflight" {
-		return usageError(fmt.Sprintf("unknown computers submission command %q", verb))
+		return usageError(fmt.Sprintf("unknown services submission command %q", verb))
 	}
 	args = moveFirstPositionalToEnd(args[2:])
-	flags := flag.NewFlagSet("computers submission "+verb, flag.ContinueOnError)
+	flags := flag.NewFlagSet("services submission "+verb, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var policyRevision, submitIntentRevision optionalRevisionFlag
 	var maxInflight int
@@ -80,10 +80,10 @@ func executeComputers(ctx context.Context, clients *apiClients, jsonOutput bool,
 		}
 	})
 	if verb == "set-inflight" && !maxInflightSet {
-		return usageError("computers submission set-inflight requires --max-inflight")
+		return usageError("services submission set-inflight requires --max-inflight")
 	}
 	if verb != "set-inflight" && maxInflightSet {
-		return usageError("--max-inflight is only valid with computers submission set-inflight")
+		return usageError("--max-inflight is only valid with services submission set-inflight")
 	}
 	if maxInflightSet && (maxInflight < 1 || maxInflight > 1000) {
 		return usageError("--max-inflight must be between 1 and 1000")

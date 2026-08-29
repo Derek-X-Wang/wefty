@@ -28,7 +28,7 @@ func TestComputerOperatorRoutesPreserveCASAndRedaction(t *testing.T) {
 	if status != http.StatusCreated {
 		t.Fatalf("create Computer status = %d body=%s", status, body)
 	}
-	if headers.Get("Idempotency-Replayed") != "" || string(body) == "" {
+	if headers.Get("Idempotent-Replay") != "" || string(body) == "" {
 		t.Fatalf("create Computer headers/body = %v / %s", headers, body)
 	}
 	if containsJSONSecret(body, "never-publish") {
@@ -139,12 +139,12 @@ func TestComputerRestartProjectionAndIntentRoutes(t *testing.T) {
 		IdempotencyKey:               "route-restart",
 	}
 	status, headers, body := h.do(client, http.MethodPost, "/v1/computers/"+computer.ComputerID+"/restart", restartRequest)
-	if status != http.StatusAccepted || headers.Get("Idempotency-Replayed") != "" {
-		t.Fatalf("restart Computer status/header = %d/%q body=%s", status, headers.Get("Idempotency-Replayed"), body)
+	if status != http.StatusAccepted || headers.Get("Idempotent-Replay") != "" {
+		t.Fatalf("restart Computer status/header = %d/%q body=%s", status, headers.Get("Idempotent-Replay"), body)
 	}
 	status, headers, body = h.do(client, http.MethodPost, "/v1/computers/"+computer.ComputerID+"/restart", restartRequest)
-	if status != http.StatusOK || headers.Get("Idempotency-Replayed") != "true" {
-		t.Fatalf("restart Computer replay = %d/%q body=%s", status, headers.Get("Idempotency-Replayed"), body)
+	if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" {
+		t.Fatalf("restart Computer replay = %d/%q body=%s", status, headers.Get("Idempotent-Replay"), body)
 	}
 	status, _, body = h.do(client, http.MethodGet, "/v1/computers/"+computer.ComputerID+"/intents?limit=2", nil)
 	if status != http.StatusOK {

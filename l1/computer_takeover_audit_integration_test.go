@@ -92,6 +92,14 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 			controlReceipt.Event.AuthorityGeneration != node.AuthorityGeneration {
 			t.Fatalf("control audit receipt = %#v err=%v", controlReceipt, err)
 		}
+		projected, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+		wantTenure := contract.ComputerControlTenureHeld
+		if controlEvent.Kind == ComputerTakeoverControlReleased {
+			wantTenure = contract.ComputerControlTenureFree
+		}
+		if err != nil || projected.ControllerTenure != wantTenure {
+			t.Fatalf("Controller tenure after %q = %q err=%v, want %q", controlEvent.Kind, projected.ControllerTenure, err, wantTenure)
+		}
 	}
 	adminIdentity := fabric.Identity{FabricID: "fabric-test", UserID: "person-admin", DeviceID: "device-admin"}
 	challenge, err := h.store.InitiateAdminBootstrap(context.Background())

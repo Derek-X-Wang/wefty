@@ -18,6 +18,10 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	var computerPageIndex string
+	if err := store.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name='computers_created_id'`).Scan(&computerPageIndex); err != nil {
+		t.Fatalf("Computer page index: %v", err)
+	}
 
 	wantColumns := map[string][]string{
 		"jobs":                      {"image_resolution_json", "image_resolution_hash", "prestart_budget_deadline_ns", "prestart_terminal_reason"},

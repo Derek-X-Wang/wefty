@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -113,10 +114,11 @@ type Computer struct {
 	RemovalOutcome          string                          `json:"removal_outcome,omitempty"`
 	// DisplayEndpoint remains explicitly null until an active private
 	// take-over front door has been published. It is never a placeholder URL.
-	DisplayEndpoint *string   `json:"display_endpoint"`
-	CurrentJob      Job       `json:"current_job"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	DisplayEndpoint  *string                             `json:"display_endpoint"`
+	ControllerTenure contract.ComputerControlTenureState `json:"controller_tenure"`
+	CurrentJob       Job                                 `json:"current_job"`
+	CreatedAt        time.Time                           `json:"created_at"`
+	UpdatedAt        time.Time                           `json:"updated_at"`
 }
 
 type CreateComputerRequest struct {
@@ -229,6 +231,19 @@ type ComputerRestartRequest struct {
 type ComputerIntentList struct {
 	Intents    []ComputerIntent `json:"intents"`
 	NextCursor string           `json:"next_cursor,omitempty"`
+}
+
+// ComputerList is one stable creation/Computer-ID ordered page. Durable
+// removal outcomes remain operator truth, so terminal Computers stay in the
+// collection instead of disappearing like ordinary removed Job definitions.
+type ComputerList struct {
+	Computers  []Computer `json:"computers"`
+	NextCursor string     `json:"next_cursor,omitempty"`
+}
+
+type computerCursor struct {
+	CreatedNS  int64  `json:"created_ns"`
+	ComputerID string `json:"computer_id"`
 }
 
 func isComputerSpec(spec contract.JobSpec) bool {
@@ -522,6 +537,99 @@ func (s *Store) GetComputer(ctx context.Context, computerID string) (Computer, e
 	return computer, nil
 }
 
+func encodeComputerCursor(cursor computerCursor) string {
+	payload, err := json.Marshal(cursor)
+	if err != nil {
+		panic("l1: encode Computer cursor: " + err.Error())
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func decodeComputerCursor(value string) (computerCursor, error) {
+	if value == "" {
+		return computerCursor{}, nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return computerCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+	}
+	var cursor computerCursor
+	decoder := json.NewDecoder(strings.NewReader(string(payload)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cursor); err != nil || cursor.CreatedNS < 0 || strings.TrimSpace(cursor.ComputerID) == "" {
+		return computerCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return computerCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+	}
+	return cursor, nil
+}
+
+// ListComputers returns durable Computer authorities rather than their
+// immutable Job projections. computer_id and current_job_id therefore remain
+// visibly distinct on every row.
+func (s *Store) ListComputers(ctx context.Context, cursorValue string, limit int) (ComputerList, error) {
+	if limit < 1 || limit > MaxJobPageLimit {
+		return ComputerList{}, protocolError(contract.ErrorInvalidRequest,
+			"limit must be between 1 and %d", MaxJobPageLimit)
+	}
+	cursor, err := decodeComputerCursor(cursorValue)
+	if err != nil {
+		return ComputerList{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ComputerList{}, internalError(err, "begin Computer list snapshot")
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT computer_id, created_ns FROM computers
+		WHERE created_ns>? OR (created_ns=? AND computer_id>?)
+		ORDER BY created_ns, computer_id LIMIT ?`, cursor.CreatedNS, cursor.CreatedNS, cursor.ComputerID, limit+1)
+	if err != nil {
+		return ComputerList{}, internalError(err, "list Computer IDs")
+	}
+	defer rows.Close()
+	type listedComputer struct {
+		computerID string
+		createdNS  int64
+	}
+	listed := make([]listedComputer, 0, limit+1)
+	for rows.Next() {
+		var item listedComputer
+		if err := rows.Scan(&item.computerID, &item.createdNS); err != nil {
+			return ComputerList{}, internalError(err, "scan Computer ID")
+		}
+		listed = append(listed, item)
+	}
+	if err := rows.Err(); err != nil {
+		return ComputerList{}, internalError(err, "iterate Computer IDs")
+	}
+	if err := rows.Close(); err != nil {
+		return ComputerList{}, internalError(err, "close Computer list page")
+	}
+
+	page := ComputerList{Computers: []Computer{}}
+	hasMore := len(listed) > limit
+	if hasMore {
+		listed = listed[:limit]
+	}
+	for _, item := range listed {
+		computer, err := readComputerAuthority(ctx, tx, item.computerID, s.clock.Now().UTC())
+		if err != nil {
+			return ComputerList{}, err
+		}
+		page.Computers = append(page.Computers, computer)
+	}
+	if hasMore && len(listed) > 0 {
+		last := listed[len(listed)-1]
+		page.NextCursor = encodeComputerCursor(computerCursor{CreatedNS: last.createdNS, ComputerID: last.computerID})
+	}
+	if err := tx.Commit(); err != nil {
+		return ComputerList{}, internalError(err, "commit Computer list snapshot")
+	}
+	return page, nil
+}
+
 func (s *Store) ComputerIDForJob(ctx context.Context, jobID string) (string, error) {
 	var computerID string
 	err := s.db.QueryRowContext(ctx, `SELECT computer_id FROM computer_job_projections WHERE job_id=?`, jobID).Scan(&computerID)
@@ -622,11 +730,62 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 		value := displayEndpoint.String
 		computer.DisplayEndpoint = &value
 	}
+	computer.ControllerTenure, err = readComputerControllerTenure(ctx, q, computerID, computer.CurrentJobID,
+		computer.CurrentJob.CurrentAttemptID, now)
+	if err != nil {
+		return Computer{}, fmt.Errorf("read Computer Controller tenure: %w", err)
+	}
 	if job.Spec.Execution.OCI == nil || job.Spec.Execution.OCI.Computer == nil || job.Spec.Execution.OCI.Computer.DiskBytes <= 0 {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest,
 			"Computer current Job has no explicit disk budget")
 	}
 	return computer, nil
+}
+
+func readComputerControllerTenure(ctx context.Context, q queryer, computerID, jobID, attemptID string, now time.Time) (contract.ComputerControlTenureState, error) {
+	if attemptID == "" {
+		return contract.ComputerControlTenureFree, nil
+	}
+	rows, err := q.QueryContext(ctx, `SELECT event_kind, session_id FROM computer_takeover_audit
+		WHERE computer_id=? AND job_id=? AND attempt_id=? AND stored_ns>=? ORDER BY rowid`,
+		computerID, jobID, attemptID, now.Add(-time.Hour).UnixNano())
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	active := map[string]bool{}
+	controller := ""
+	for rows.Next() {
+		var kind ComputerTakeoverAuditEventKind
+		var sessionID string
+		if err := rows.Scan(&kind, &sessionID); err != nil {
+			return "", err
+		}
+		switch kind {
+		case ComputerTakeoverSessionOpen:
+			active[sessionID] = true
+		case ComputerTakeoverSessionClose:
+			delete(active, sessionID)
+			if controller == sessionID {
+				controller = ""
+			}
+		case ComputerTakeoverControlAcquired, ComputerTakeoverAdminOverrode:
+			if active[sessionID] {
+				controller = sessionID
+			}
+		case ComputerTakeoverControlReleased:
+			if controller == sessionID {
+				controller = ""
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if controller != "" {
+		return contract.ComputerControlTenureHeld, nil
+	}
+	return contract.ComputerControlTenureFree, nil
 }
 
 func queryComputerIntents(ctx context.Context, q queryer, computerID string, afterRevision int64, limit int) ([]ComputerIntent, error) {
@@ -1323,7 +1482,7 @@ func scrubComputerControllerState(ctx context.Context, tx *sql.Tx, computerID st
 // agent has positively reaped an active attempt.
 func (s *Store) InstallComputerProjection(ctx context.Context, computerID string, request ComputerProjectionRequest) (Computer, error) {
 	return s.installComputerProjection(ctx, computerID, request, ComputerIntentProject,
-		ComputerReconfigurationProjecting, false, "", "")
+		ComputerReconfigurationProjecting, false, "", "", nil)
 }
 
 func (s *Store) reconfigurationCheckpoint(name string) error {
@@ -1338,6 +1497,20 @@ func (s *Store) reconfigurationCheckpoint(name string) error {
 // a reimage cannot smuggle in placement, storage-budget, environment, or
 // lifecycle changes.
 func (s *Store) ReimageComputer(ctx context.Context, computerID string, request ComputerReimageRequest) (Computer, error) {
+	return s.reimageComputer(ctx, computerID, request, nil)
+}
+
+// ReimageComputerWithReplay additionally reports whether this call reused an
+// already-accepted idempotency key. The decision is made while reading the
+// fenced projection transaction, so the HTTP replay receipt cannot race a
+// concurrent first application.
+func (s *Store) ReimageComputerWithReplay(ctx context.Context, computerID string, request ComputerReimageRequest) (Computer, bool, error) {
+	replayed := false
+	computer, err := s.reimageComputer(ctx, computerID, request, &replayed)
+	return computer, replayed, err
+}
+
+func (s *Store) reimageComputer(ctx context.Context, computerID string, request ComputerReimageRequest, replayed *bool) (Computer, error) {
 	request.Actor = strings.TrimSpace(request.Actor)
 	request.IdempotencyKey = strings.TrimSpace(request.IdempotencyKey)
 	if request.IdempotencyKey == "" {
@@ -1365,6 +1538,9 @@ func (s *Store) ReimageComputer(ctx context.Context, computerID string, request 
 		if storedRequestHash != reimageRequestHash {
 			return Computer{}, protocolError(contract.ErrorIdempotencyConflict,
 				"Computer reimage idempotency key was reused with different authority")
+		}
+		if replayed != nil {
+			*replayed = true
 		}
 	} else if !errors.Is(lookupErr, sql.ErrNoRows) {
 		return Computer{}, internalError(lookupErr, "read Computer reimage replay")
@@ -1397,12 +1573,12 @@ func (s *Store) ReimageComputer(ctx context.Context, computerID string, request 
 	nextSpec.DispatchKey = dispatchKey
 	projection := ComputerProjectionRequest{ComputerMutationPrecondition: request.ComputerMutationPrecondition, Spec: nextSpec}
 	return s.installComputerProjection(ctx, computerID, projection, ComputerIntentReimage,
-		ComputerReconfigurationReimaging, request.Chown, request.IdempotencyKey, reimageRequestHash)
+		ComputerReconfigurationReimaging, request.Chown, request.IdempotencyKey, reimageRequestHash, replayed)
 }
 
 func (s *Store) installComputerProjection(ctx context.Context, computerID string, request ComputerProjectionRequest,
 	operation ComputerIntentOperation, phase ComputerReconfigurationPhase, chown bool,
-	reimageIdempotencyKey, reimageRequestHash string,
+	reimageIdempotencyKey, reimageRequestHash string, replayed *bool,
 ) (Computer, error) {
 	request.Spec.RoutingTags = NormalizeTags(request.Spec.RoutingTags)
 	if err := validateJobSpec(&request.Spec); err != nil {
@@ -1441,6 +1617,9 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 			"Computer disk budget cannot change during projection replacement")
 	}
 	if computer.ReconfigurationPhase == phase {
+		if replayed != nil {
+			*replayed = true
+		}
 		if err := validatePendingComputerProjection(ctx, tx, computer, request, requestHash, chown); err != nil {
 			return Computer{}, err
 		}

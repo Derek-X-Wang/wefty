@@ -61,12 +61,12 @@ func TestComputerSubmissionAndOriginUsageValidation(t *testing.T) {
 		name string
 		args []string
 	}{
-		{"unknown submission verb", []string{"computers", "submission", "rotate", "computer-one"}},
-		{"missing CAS", []string{"computers", "submission", "disable", "computer-one"}},
-		{"set inflight without limit", []string{"computers", "submission", "set-inflight", "computer-one", "--policy-revision", "1", "--submit-intent-revision", "0"}},
-		{"set inflight below range", []string{"computers", "submission", "set-inflight", "computer-one", "--max-inflight", "0", "--policy-revision", "1", "--submit-intent-revision", "0"}},
-		{"set inflight above range", []string{"computers", "submission", "set-inflight", "computer-one", "--max-inflight", "1001", "--policy-revision", "1", "--submit-intent-revision", "0"}},
-		{"expect current conflict", []string{"computers", "submission", "disable", "computer-one", "--expect-current", "--policy-revision", "1"}},
+		{"unknown submission verb", []string{"services", "submission", "rotate", "computer-one"}},
+		{"missing CAS", []string{"services", "submission", "disable", "computer-one"}},
+		{"set inflight without limit", []string{"services", "submission", "set-inflight", "computer-one", "--policy-revision", "1", "--submit-intent-revision", "0"}},
+		{"set inflight below range", []string{"services", "submission", "set-inflight", "computer-one", "--max-inflight", "0", "--policy-revision", "1", "--submit-intent-revision", "0"}},
+		{"set inflight above range", []string{"services", "submission", "set-inflight", "computer-one", "--max-inflight", "1001", "--policy-revision", "1", "--submit-intent-revision", "0"}},
+		{"expect current conflict", []string{"services", "submission", "disable", "computer-one", "--expect-current", "--policy-revision", "1"}},
 		{"self origin", []string{"runs", "list", "--origin", "computer:self"}},
 		{"whitespace origin", []string{"runs", "list", "--origin", "computer: computer-one"}},
 		{"runs positional", []string{"runs", "list", "computer:one", "--origin", "computer:one"}},
@@ -189,7 +189,7 @@ func assertComputerSubmissionAndOriginCLIOverRealRoutes(t *testing.T) {
 	}
 	roots, child := seedComputerOriginRuns(t, l3Store, computer.ComputerID)
 	var humanSubmission, warning bytes.Buffer
-	if err := execute(ctx, adminClients, false, []string{"computers", "submission", "set-inflight", computer.ComputerID,
+	if err := execute(ctx, adminClients, false, []string{"services", "submission", "set-inflight", computer.ComputerID,
 		"--max-inflight", "2", "--policy-revision", "2", "--submit-intent-revision", "1",
 		"--idempotency-key", "cli-resize"}, &humanSubmission, &warning); err != nil {
 		t.Fatalf("human set-inflight: %v", err)
@@ -215,18 +215,18 @@ func assertComputerSubmissionAndOriginCLIOverRealRoutes(t *testing.T) {
 		t.Fatalf("resize replay receipt = %#v after %#v", replayed, resized)
 	}
 	var staleOut bytes.Buffer
-	err = execute(ctx, adminClients, true, []string{"computers", "submission", "disable", computer.ComputerID,
+	err = execute(ctx, adminClients, true, []string{"services", "submission", "disable", computer.ComputerID,
 		"--policy-revision", "2", "--submit-intent-revision", "1", "--idempotency-key", "cli-stale"}, &staleOut, &bytes.Buffer{})
 	assertCLIAPIError(t, err, contract.ErrorStalePolicyRevision)
 
 	nonAdminClients := mustTestAPIClients(t, nonAdminFabric)
 	defer nonAdminClients.close()
-	err = execute(ctx, nonAdminClients, true, []string{"computers", "submission", "disable", computer.ComputerID,
+	err = execute(ctx, nonAdminClients, true, []string{"services", "submission", "disable", computer.ComputerID,
 		"--policy-revision", "3", "--submit-intent-revision", "2"}, &bytes.Buffer{}, &bytes.Buffer{})
 	assertCLIAPIError(t, err, contract.ErrorAdminRequired)
 	machineClients := mustTestAPIClients(t, machineFabric)
 	defer machineClients.close()
-	err = execute(ctx, machineClients, true, []string{"computers", "submission", "disable", computer.ComputerID,
+	err = execute(ctx, machineClients, true, []string{"services", "submission", "disable", computer.ComputerID,
 		"--policy-revision", "3", "--submit-intent-revision", "2"}, &bytes.Buffer{}, &bytes.Buffer{})
 	assertCLIAPIError(t, err, contract.ErrorPrincipalForbidden)
 
@@ -260,7 +260,7 @@ func assertComputerSubmissionAndOriginCLIOverRealRoutes(t *testing.T) {
 		}
 		return response, roundTripErr
 	})
-	err = execute(ctx, adminClients, true, []string{"computers", "submission", "disable", computer.ComputerID,
+	err = execute(ctx, adminClients, true, []string{"services", "submission", "disable", computer.ComputerID,
 		"--expect-current", "--idempotency-key", "cli-revoked-mid-command"}, &bytes.Buffer{}, &bytes.Buffer{})
 	assertCLIAPIError(t, err, contract.ErrorAdminRequired)
 
@@ -329,7 +329,7 @@ func mustTestAPIClients(t *testing.T, participant fabric.Fabric) *apiClients {
 
 func executeComputerSubmissionJSON(t *testing.T, ctx context.Context, clients *apiClients, verb, computerID string, args ...string) computerSubmissionOutput {
 	t.Helper()
-	command := []string{"computers", "submission", verb, computerID}
+	command := []string{"services", "submission", verb, computerID}
 	command = append(command, args...)
 	var output bytes.Buffer
 	if err := execute(ctx, clients, true, command, &output, &bytes.Buffer{}); err != nil {

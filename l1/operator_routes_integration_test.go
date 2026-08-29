@@ -246,7 +246,7 @@ func assertServiceOperatorDesiredStateRestartCapacityAndLogs(t *testing.T) {
 	}
 	freshAttempt := claimOperatorService(t, h, node, first.JobID)
 	status, headers, body := h.do(client, http.MethodPost, serviceMutationPath(first.JobID, "restart"), restartRequest)
-	if status != http.StatusOK || headers.Get("Idempotency-Replayed") != "true" {
+	if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" {
 		t.Fatalf("restart replay = %d headers=%v body=%s", status, headers, body)
 	}
 	lease, err := h.store.RenewLease(context.Background(), "fabric-service-node", first.JobID, freshAttempt.AttemptID, freshAttempt.FencingToken)

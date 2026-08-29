@@ -107,12 +107,12 @@ func TestEnvelopeAndGateWritesAreAppendOnlyAndIdempotent(t *testing.T) {
 		{"/v1/runs/" + accepted.RunID + "/gates", gate},
 	} {
 		status, headers, body := h.do(workflow, http.MethodPost, write.path, write.body, auth)
-		if status != http.StatusCreated || headers.Get("Idempotency-Replayed") != "" {
-			t.Fatalf("first append %s = %d/%q body=%s", write.path, status, headers.Get("Idempotency-Replayed"), body)
+		if status != http.StatusCreated || headers.Get("Idempotent-Replay") != "" {
+			t.Fatalf("first append %s = %d/%q body=%s", write.path, status, headers.Get("Idempotent-Replay"), body)
 		}
 		status, headers, body = h.do(workflow, http.MethodPost, write.path, write.body, auth)
-		if status != http.StatusOK || headers.Get("Idempotency-Replayed") != "true" {
-			t.Fatalf("replayed append %s = %d/%q body=%s", write.path, status, headers.Get("Idempotency-Replayed"), body)
+		if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" {
+			t.Fatalf("replayed append %s = %d/%q body=%s", write.path, status, headers.Get("Idempotent-Replay"), body)
 		}
 	}
 
