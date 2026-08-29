@@ -109,7 +109,7 @@ def tree_has_focused_oracle():
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
         return False
     pending = [root]
-    browser_fullscreen = False
+    browser_output_sized = False
     keyboard_focused = False
     while pending:
         node = pending.pop()
@@ -117,12 +117,12 @@ def tree_has_focused_oracle():
             continue
         rect = node.get("rect", {})
         if node.get("name") == "Wefty Wayland Computer" and rect.get("width") == 1280 and rect.get("height") == 720:
-            browser_fullscreen = True
+            browser_output_sized = True
         if node.get("app_id") == "wev" and node.get("focused") is True:
             keyboard_focused = True
         pending.extend(node.get("nodes", []))
         pending.extend(node.get("floating_nodes", []))
-    return browser_fullscreen and keyboard_focused
+    return browser_output_sized and keyboard_focused
 
 
 def publish_surface_readiness():
