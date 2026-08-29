@@ -668,28 +668,43 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 		return
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	controlSession, err := StartInput(probeCtx, r.controlPort, 503, 389)
+	pointerSession, err := StartPointer(probeCtx, r.controlPort, 503, 389)
 	cancel()
 	if err != nil {
-		r.record(ids[2], StatusFail, "control input probe failed")
+		r.record(ids[2], StatusFail, "control pointer probe failed")
 		return
 	}
-	observed := false
+	pointerObservation, pointerObserved := r.waitInputSentinel(ctx, before.Generation, 503, 389)
+	pointerSession.Close()
+	if !pointerObserved {
+		r.record(ids[2], StatusFail, "control pointer was not observed")
+		_ = r.writeDriver(`{"version":1,"human_driving":false}`)
+		return
+	}
+	probeCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
+	keySession, err := StartKey(probeCtx, r.controlPort)
+	cancel()
+	if err != nil {
+		r.record(ids[2], StatusFail, "control key probe failed")
+		_ = r.writeDriver(`{"version":1,"human_driving":false}`)
+		return
+	}
+	keyObserved := false
 	for attempt := 0; attempt < 80; attempt++ {
 		after, readErr := r.readInputObservation(ctx)
-		if readErr == nil && after.Generation > before.Generation && after.KeyEvents > before.KeyEvents && historyContains(after, 503, 389) {
-			observed = true
+		if readErr == nil && after.KeyEvents > pointerObservation.KeyEvents {
+			keyObserved = true
 			break
 		}
 		if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
 			break
 		}
 	}
-	controlSession.Close()
-	if observed {
+	keySession.Close()
+	if keyObserved {
 		r.record(ids[2], StatusPass, "control pointer coordinates and key event were both observed")
 	} else {
-		r.record(ids[2], StatusFail, "control pointer and key were not both observed")
+		r.record(ids[2], StatusFail, "control key was not observed after pointer focus")
 	}
 	_ = r.writeDriver(`{"version":1,"human_driving":false}`)
 }

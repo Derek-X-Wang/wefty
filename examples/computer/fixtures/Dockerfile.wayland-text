@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.18.0@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf
 
 ARG DEBIAN_IMAGE=docker.io/library/debian@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
+ARG BASE_IMAGE
 FROM ${DEBIAN_IMAGE} AS neatvnc-mutation-build
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
@@ -26,7 +27,6 @@ RUN mkdir /tmp/neatvnc \
     && meson compile -C /tmp/neatvnc/build \
     && meson install -C /tmp/neatvnc/build
 
-ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 ENV WEFTY_CONFORMANCE_MUTATION=text-frames-accepted
 ENV WEFTY_COMPUTER_VIEW_PORT=9

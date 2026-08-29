@@ -215,17 +215,25 @@ type InputSession struct{ connection *websocketConnection }
 func (session *InputSession) Close() { session.connection.close() }
 
 func StartInput(ctx context.Context, port, x, y int) (*InputSession, error) {
-	return startRFBEvents(ctx, port, true, x, y)
+	return startRFBEvents(ctx, port, rfbInputEvents(true, x, y))
 }
 
 // SendPointer is the consumption sentinel used after a view probe. Observing
 // its unique coordinates proves the earlier key and pointer bytes have passed
 // through the backend's input queue without relying on a fixed sleep.
 func StartPointer(ctx context.Context, port, x, y int) (*InputSession, error) {
-	return startRFBEvents(ctx, port, false, x, y)
+	return startRFBEvents(ctx, port, rfbInputEvents(false, x, y))
 }
 
-func startRFBEvents(ctx context.Context, port int, withKey bool, x, y int) (*InputSession, error) {
+// StartKey sends a key only after the compositor-side pointer observer has
+// restored focus to the native keyboard client. Keeping this as a separate
+// RFB session makes the control proof causal instead of depending on input
+// dispatch timing between two Wayland clients.
+func StartKey(ctx context.Context, port int) (*InputSession, error) {
+	return startRFBEvents(ctx, port, rfbKeyEvents())
+}
+
+func startRFBEvents(ctx context.Context, port int, events [][]byte) (*InputSession, error) {
 	connection, err := OpenRFB(ctx, port, contract.ComputerDisplayWebSocketPath)
 	if err != nil {
 		return nil, err
@@ -267,7 +275,7 @@ func startRFBEvents(ctx context.Context, port int, withKey bool, x, y int) (*Inp
 	if _, err := stream.read(nameSize); err != nil {
 		return fail(err)
 	}
-	for _, event := range rfbInputEvents(withKey, x, y) {
+	for _, event := range events {
 		if err := stream.write(event); err != nil {
 			return fail(err)
 		}
@@ -280,11 +288,18 @@ func rfbInputEvents(withKey bool, x, y int) [][]byte {
 	// the pointer. The exact byte sequence remains identical for view and control.
 	events := make([][]byte, 0, 4)
 	if withKey {
-		events = append(events, []byte{4, 1, 0, 0, 0, 0, 0, 'w'}, []byte{4, 0, 0, 0, 0, 0, 0, 'w'})
+		events = append(events, rfbKeyEvents()...)
 	}
 	events = append(events,
 		[]byte{5, 1, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
 		[]byte{5, 0, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
 	)
 	return events
+}
+
+func rfbKeyEvents() [][]byte {
+	return [][]byte{
+		{4, 1, 0, 0, 0, 0, 0, 'w'},
+		{4, 0, 0, 0, 0, 0, 0, 'w'},
+	}
 }

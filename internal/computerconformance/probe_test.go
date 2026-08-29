@@ -21,6 +21,13 @@ func TestRFBInputEventsKeyboardBeforePointerFocus(t *testing.T) {
 	}
 }
 
+func TestRFBKeyEventsContainNoPointer(t *testing.T) {
+	events := rfbKeyEvents()
+	if len(events) != 2 || events[0][0] != 4 || events[1][0] != 4 {
+		t.Fatalf("events = %v, want key down/up only", events)
+	}
+}
+
 func TestHistoryContainsEarlierSentinel(t *testing.T) {
 	observation := inputObservation{X: 211, Y: 173, PointerHistory: [][2]int{{0, 0}, {947, 611}, {211, 173}}}
 	if !historyContains(observation, 947, 611) {
