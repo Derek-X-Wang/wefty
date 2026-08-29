@@ -5,19 +5,19 @@ import (
 	"testing"
 )
 
-func TestRFBInputEventsFocusBeforeTyping(t *testing.T) {
+func TestRFBInputEventsKeyboardBeforePointerFocus(t *testing.T) {
 	events := rfbInputEvents(true, 503, 389)
 	if len(events) != 4 {
-		t.Fatalf("events = %d, want pointer down/up then key down/up", len(events))
+		t.Fatalf("events = %d, want key down/up then pointer down/up", len(events))
 	}
-	if events[0][0] != 5 || events[1][0] != 5 || events[2][0] != 4 || events[3][0] != 4 {
-		t.Fatalf("event types = %d,%d,%d,%d, want 5,5,4,4", events[0][0], events[1][0], events[2][0], events[3][0])
+	if events[0][0] != 4 || events[1][0] != 4 || events[2][0] != 5 || events[3][0] != 5 {
+		t.Fatalf("event types = %d,%d,%d,%d, want 4,4,5,5", events[0][0], events[1][0], events[2][0], events[3][0])
 	}
-	if x, y := binary.BigEndian.Uint16(events[0][2:4]), binary.BigEndian.Uint16(events[0][4:6]); x != 503 || y != 389 {
+	if x, y := binary.BigEndian.Uint16(events[2][2:4]), binary.BigEndian.Uint16(events[2][4:6]); x != 503 || y != 389 {
 		t.Fatalf("pointer = %d,%d, want 503,389", x, y)
 	}
-	if events[2][1] != 1 || events[3][1] != 0 || events[2][7] != 'w' || events[3][7] != 'w' {
-		t.Fatalf("key events = %v %v, want w down/up", events[2], events[3])
+	if events[0][1] != 1 || events[1][1] != 0 || events[0][7] != 'w' || events[1][7] != 'w' {
+		t.Fatalf("key events = %v %v, want w down/up", events[0], events[1])
 	}
 }
 

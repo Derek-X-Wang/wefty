@@ -95,13 +95,13 @@ published library contains no mutation hook; the `text-frames-accepted`
 derivative recompiles it with `-Dwefty_mutation_hooks=true` before proving the
 owning cell fails.
 
-The image derives its input receipt after compositor delivery. A transparent,
-fullscreen `wev` surface is the focused native Wayland client; its
-`wl_pointer` and `wl_keyboard` events feed `input-oracle.json`, while Chromium
-remains visible underneath for the desktop furniture. The checker first proves
-view input leaves that guest receipt unchanged and then proves control input
-changes it at exact coordinates. Thus parser acceptance alone cannot satisfy
-`input.control-accepted`, and regressing `--disable-input` fails both
+The image derives its input receipt after compositor delivery. Chromium's
+Wayland surface records pointer coordinates, while a focused native `wev`
+client records `wl_keyboard` events. After each pointer event, the image
+restores `wev` focus before publishing the causal sentinel. The checker first
+proves view input leaves that guest receipt unchanged and then proves control
+input changes it at exact coordinates. Thus parser acceptance alone cannot
+satisfy `input.control-accepted`, and regressing `--disable-input` fails both
 view-isolation cells.
 
 The image also demonstrates optional, image-owned agent furniture outside the

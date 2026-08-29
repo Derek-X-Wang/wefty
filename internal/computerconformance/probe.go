@@ -276,14 +276,15 @@ func startRFBEvents(ctx context.Context, port int, withKey bool, x, y int) (*Inp
 }
 
 func rfbInputEvents(withKey bool, x, y int) [][]byte {
-	// Click first so a compositor can establish keyboard focus before the key
-	// transition. The exact byte sequence remains identical for view and control.
-	events := [][]byte{
-		[]byte{5, 1, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
-		[]byte{5, 0, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
-	}
+	// Send the key while the image's keyboard oracle retains focus, then move
+	// the pointer. The exact byte sequence remains identical for view and control.
+	events := make([][]byte, 0, 4)
 	if withKey {
 		events = append(events, []byte{4, 1, 0, 0, 0, 0, 0, 'w'}, []byte{4, 0, 0, 0, 0, 0, 0, 'w'})
 	}
+	events = append(events,
+		[]byte{5, 1, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
+		[]byte{5, 0, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
+	)
 	return events
 }
