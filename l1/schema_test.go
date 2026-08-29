@@ -219,6 +219,16 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_intent_history'`).Scan(&intentsSQL); err != nil {
 		t.Fatal(err)
 	}
+	for _, phase := range []string{"'resetting'", "'backing_up'", "'restoring'", "'cloning'", "'reimaging'", "'growing'"} {
+		if !strings.Contains(computersSQL, phase) {
+			t.Fatalf("Computer phase %s was not reconciled: %s", phase, computersSQL)
+		}
+	}
+	for _, operation := range []string{"'reset'", "'backup_create'", "'backup_cap'", "'restore'", "'clone'", "'reimage'", "'grow'", "'abort'"} {
+		if !strings.Contains(intentsSQL, operation) {
+			t.Fatalf("Computer operation %s was not reconciled: %s", operation, intentsSQL)
+		}
+	}
 	if !strings.Contains(computersSQL, "'resetting'") || !strings.Contains(intentsSQL, "'reset'") {
 		t.Fatalf("reset constraints were not migrated: computers=%s intents=%s", computersSQL, intentsSQL)
 	}
@@ -308,6 +318,97 @@ func TestStoreMigratesStorageProvenanceWithoutDroppingFutureColumns(t *testing.T
 		VALUES('future-provenance', 'clone', 'source-storage', 1, 'missing-backup',
 			'destination-storage', 1, 1, 'still-preserved')`); err == nil {
 		t.Fatal("Storage provenance accepted a missing immutable Backup source")
+	}
+}
+
+func TestStoreReconcilesParallelReimageAndRestoreConstraintLadders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "parallel-ladder.sqlite")
+	store, err := OpenStore(path, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var computersSQL, intentsSQL string
+	if err := database.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computers'`).Scan(&computersSQL); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_intent_history'`).Scan(&intentsSQL); err != nil {
+		t.Fatal(err)
+	}
+	computersSQL, err = migratedSQLiteCreateTable(computersSQL, "computers_parallel", map[string]string{
+		"'stable', 'projecting', 'resetting', 'backing_up', 'restoring', 'cloning', 'reimaging', 'growing', 'removing'": "'stable', 'projecting', 'resetting', 'backing_up', 'reimaging', 'growing', 'removing'",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentsSQL, err = migratedSQLiteCreateTable(intentsSQL, "computer_intent_history_parallel", map[string]string{
+		"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'restore', 'clone', 'reimage', 'grow', 'abort'": "'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'reimage', 'grow', 'abort'",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(computersSQL); err != nil {
+		t.Fatal(err)
+	}
+	if err := copySQLiteTableColumns(context.Background(), tx, "computers", "computers_parallel"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`DROP TABLE computers; ALTER TABLE computers_parallel RENAME TO computers; CREATE INDEX computers_binding ON computers(bound_node_id, desired_state)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(intentsSQL); err != nil {
+		t.Fatal(err)
+	}
+	if err := copySQLiteTableColumns(context.Background(), tx, "computer_intent_history", "computer_intent_history_parallel"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`DROP TABLE computer_intent_history; ALTER TABLE computer_intent_history_parallel RENAME TO computer_intent_history`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenStore(path, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computers'`).Scan(&computersSQL); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_intent_history'`).Scan(&intentsSQL); err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{"'restoring'", "'cloning'", "'reimaging'", "'growing'"} {
+		if !strings.Contains(computersSQL, token) {
+			t.Fatalf("reconciled Computer ladder lacks %s: %s", token, computersSQL)
+		}
+	}
+	for _, token := range []string{"'restore'", "'clone'", "'reimage'", "'grow'", "'abort'"} {
+		if !strings.Contains(intentsSQL, token) {
+			t.Fatalf("reconciled intent ladder lacks %s: %s", token, intentsSQL)
+		}
 	}
 }
 

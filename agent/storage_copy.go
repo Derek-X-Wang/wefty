@@ -63,6 +63,13 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 			return err
 		}
 		oldBackupReceipt = &receipt
+		if receipt.FailureCode != "" || receipt.CopyAbsent {
+			_, acknowledgeErr := controller.client.AcknowledgeComputerStorageCopy(ctx, directive.DestinationComputerID,
+				l1.ComputerStorageCopyAcknowledgementRequest{NodeID: controller.nodeID,
+					BootSessionID: controller.bootSessionID, IdempotencyKey: receipt.ReceiptID,
+					OldBackupReceipt: oldBackupReceipt})
+			return acknowledgeErr
+		}
 	}
 	receipt, err := controller.copier.CopyComputerStorage(ctx, workloadrunner.ComputerStorageCopyRequest{
 		Operation: directive.Operation, BackupID: directive.BackupID, CopyID: directive.CopyID,
@@ -149,7 +156,7 @@ func (controller *storageCopyController) enqueue(ctx context.Context, directive 
 		}()
 		if err := controller.process(ctx, directive); err != nil && ctx.Err() == nil {
 			classification := classifyAgentProtocolError(err)
-			if classification.destination == errorDestinationNodeSession {
+			if classification.destination == errorDestinationNodeSession && failures != nil {
 				select {
 				case failures <- destinationError{destination: classification.destination, err: fmt.Errorf("agent: reconcile Storage copy %q: %w", key, err)}:
 				default:

@@ -278,13 +278,12 @@ func (session *agentSession) processBackupDirectives(ctx context.Context, direct
 	if session.backups == nil {
 		return nil
 	}
-	var failures []error
 	for _, directive := range directives {
-		if err := session.backups.processCreate(ctx, directive); err != nil {
-			failures = append(failures, fmt.Errorf("reconcile Computer Backup %q: %w", directive.CopyID, err))
-		}
+		directive := directive
+		session.backups.enqueue(ctx, "create\x00"+directive.CopyID,
+			func(runContext context.Context) error { return session.backups.processCreate(runContext, directive) }, nil)
 	}
-	return errors.Join(failures...)
+	return nil
 }
 
 func (session *agentSession) processBackupPruneDirectives(ctx context.Context, directives []l1.ComputerBackupPruneDirective) error {
@@ -304,13 +303,10 @@ func (session *agentSession) processStorageCopyDirectives(ctx context.Context, d
 	if session.storageCopies == nil {
 		return nil
 	}
-	var failures []error
 	for _, directive := range directives {
-		if err := session.storageCopies.process(ctx, directive); err != nil {
-			failures = append(failures, fmt.Errorf("reconcile Computer Storage copy %q: %w", directive.String(), err))
-		}
+		session.storageCopies.enqueue(ctx, directive, nil)
 	}
-	return errors.Join(failures...)
+	return nil
 }
 
 func (session *agentSession) reconcileOCIImagePins(ctx context.Context) error {

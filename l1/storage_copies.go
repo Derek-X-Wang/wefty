@@ -19,13 +19,14 @@ const computerStorageCopyReceiptKind = "computer_storage_copy_verified"
 
 type ComputerRestoreRequest struct {
 	ComputerMutationPrecondition
-	BackupID       string `json:"backup_id"`
+	BackupID       string `json:"-"`
 	KeepOldBackup  bool   `json:"keep_old_as_backup"`
 	IdempotencyKey string `json:"idempotency_key"`
 }
 
 type ComputerCloneRequest struct {
-	BackupID         string `json:"backup_id"`
+	ComputerMutationPrecondition
+	BackupID         string `json:"-"`
 	Name             string `json:"name"`
 	DiskBytes        int64  `json:"disk_bytes"`
 	IdempotencyKey   string `json:"idempotency_key"`
@@ -127,7 +128,8 @@ func storageCopyHash(value any) (string, error) {
 
 func validateStoppedDetachedComputer(computer Computer, action string) error {
 	if computer.DesiredState != contract.ServiceDesiredStopped ||
-		(computer.CurrentJob.State != contract.JobStopped && computer.CurrentJob.State != contract.JobFailed) {
+		(computer.CurrentJob.State != contract.JobStopped && computer.CurrentJob.State != contract.JobFailed) ||
+		computer.CurrentJob.CurrentAttemptID != "" {
 		return protocolError(contract.ErrorConflict, "Computer %q must be stopped and positively detached before %s", computer.ComputerID, action)
 	}
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
@@ -181,12 +183,23 @@ func (s *Store) BeginComputerRestore(ctx context.Context, computerID string, req
 	}
 	if replay, replayErr := scanComputerStorageCopy(tx.QueryRowContext(ctx, `SELECT `+storageCopyColumns+`
 		FROM computer_storage_copy_operations WHERE destination_computer_id=? AND idempotency_key=?`, computerID, request.IdempotencyKey)); replayErr == nil {
+		if replay.Operation != "restore" {
+			return Computer{}, false, protocolError(contract.ErrorIdempotencyConflict, "idempotency key was already used for a Computer clone")
+		}
 		if replay.RequestHash != requestHash {
 			return Computer{}, false, protocolError(contract.ErrorIdempotencyConflict, "Computer restore idempotency key was reused with different authority")
 		}
 		return computer, true, nil
 	} else if !errors.Is(replayErr, sql.ErrNoRows) {
 		return Computer{}, false, internalError(replayErr, "read Computer restore replay")
+	}
+	var reusedOperation string
+	if err := tx.QueryRowContext(ctx, `SELECT operation FROM computer_storage_copy_operations
+		WHERE backup_id=? AND idempotency_key=?`, request.BackupID, request.IdempotencyKey).Scan(&reusedOperation); err == nil {
+		return Computer{}, false, protocolError(contract.ErrorIdempotencyConflict,
+			"idempotency key was already used for a Computer %s", reusedOperation)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return Computer{}, false, internalError(err, "check cross-verb Storage copy idempotency")
 	}
 	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
@@ -204,11 +217,20 @@ func (s *Store) BeginComputerRestore(ctx context.Context, computerID string, req
 	if backup.ComputerID != computerID || backup.SourceStorageID != computer.StorageID {
 		return Computer{}, false, protocolError(contract.ErrorStorageReferenceConflict, "Backup %q does not belong to Computer %q Storage", backup.BackupID, computerID)
 	}
-	if backup.AllocatedSize != computer.DesiredDiskBytes {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "restore Backup size must equal the Computer disk budget")
+	if backup.AllocatedSize > computer.DesiredDiskBytes {
+		return Computer{}, false, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
+			"backup_bytes": backup.AllocatedSize, "destination_budget_bytes": computer.DesiredDiskBytes,
+		}, "restore Backup is larger than the Computer disk budget; grow the Computer first")
 	}
 	if copy.NodeID != computer.BoundNodeID || copy.RootInstanceID == "" {
 		return Computer{}, false, protocolError(contract.ErrorConflict, "restore Backup copy is not on the Computer's bound Node")
+	}
+	var currentRootInstanceID string
+	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, copy.NodeID).Scan(&currentRootInstanceID); err != nil {
+		return Computer{}, false, internalError(err, "read restore detachment managed-root authority")
+	}
+	if currentRootInstanceID == "" || currentRootInstanceID != copy.RootInstanceID {
+		return Computer{}, false, protocolError(contract.ErrorConflict, "restore requires an identity-bound current detachment receipt")
 	}
 	if request.KeepOldBackup {
 		var retained int64
@@ -291,6 +313,9 @@ func (s *Store) BeginComputerClone(ctx context.Context, request ComputerCloneReq
 	defer tx.Rollback()
 	if replay, replayErr := scanComputerStorageCopy(tx.QueryRowContext(ctx, `SELECT `+storageCopyColumns+`
 		FROM computer_storage_copy_operations WHERE backup_id=? AND idempotency_key=?`, request.BackupID, request.IdempotencyKey)); replayErr == nil {
+		if replay.Operation != "clone" {
+			return Computer{}, false, protocolError(contract.ErrorIdempotencyConflict, "idempotency key was already used for a Computer restore")
+		}
 		if replay.RequestHash != requestHash {
 			return Computer{}, false, protocolError(contract.ErrorIdempotencyConflict, "Computer clone idempotency key was reused with different authority")
 		}
@@ -320,6 +345,16 @@ func (s *Store) BeginComputerClone(ctx context.Context, request ComputerCloneReq
 	}
 	if source.DesiredState == contract.ServiceDesiredRemoved || copy.NodeID != source.PlacementNodeID {
 		return Computer{}, false, protocolError(contract.ErrorConflict, "clone source is not available on its Pinned Node")
+	}
+	var currentRootInstanceID string
+	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, copy.NodeID).Scan(&currentRootInstanceID); err != nil {
+		return Computer{}, false, internalError(err, "read clone source managed-root authority")
+	}
+	if currentRootInstanceID == "" || currentRootInstanceID != copy.RootInstanceID {
+		return Computer{}, false, protocolError(contract.ErrorConflict, "clone source Backup copy belongs to a stale managed-root instance")
+	}
+	if err := validateComputerPrecondition(source, request.ComputerMutationPrecondition); err != nil {
+		return Computer{}, false, err
 	}
 	computerID, storageID := newID("computer"), newID("storage")
 	spec := source.CurrentJob.Spec
@@ -368,6 +403,13 @@ func (s *Store) BeginComputerClone(ctx context.Context, request ComputerCloneReq
 		requestHash, now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "persist Computer clone operation")
 	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO storage_provenance(provenance_id, kind,
+		source_storage_id, source_generation, backup_id, destination_computer_id,
+		destination_storage_id, destination_generation, created_ns) VALUES(?, 'clone', ?, ?, ?, ?, ?, 1, ?)`,
+		newID("storage-provenance"), backup.SourceStorageID, backup.SourceGeneration, backup.BackupID,
+		computerID, storageID, now.UnixNano()); err != nil {
+		return Computer{}, false, internalError(err, "reserve clone custody fork")
+	}
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
 		return Computer{}, false, internalError(err, "read staged cloned Computer")
@@ -402,7 +444,9 @@ func (s *Store) ListNodeComputerStorageCopyDirectives(ctx context.Context, ident
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+storageCopyColumns+` FROM computer_storage_copy_operations
-		WHERE bound_node_id=? AND status IN ('reserved', 'prepared', 'published') ORDER BY requested_ns, destination_computer_id`, nodeID)
+		WHERE bound_node_id=? AND status IN ('reserved', 'prepared', 'published')
+		AND (operation='clone' OR authority_revoked_ns IS NOT NULL)
+		ORDER BY requested_ns, destination_computer_id`, nodeID)
 	if err != nil {
 		return nil, internalError(err, "list Computer Storage copy directives")
 	}
@@ -416,6 +460,42 @@ func (s *Store) ListNodeComputerStorageCopyDirectives(ctx context.Context, ident
 		directives = append(directives, storageCopyDirective(row))
 	}
 	return directives, rows.Err()
+}
+
+func (s *Store) ListNodeComputerRestoreRevocations(ctx context.Context, nodeID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT destination_computer_id FROM computer_storage_copy_operations
+		WHERE bound_node_id=? AND operation='restore' AND status IN ('reserved', 'prepared')
+		ORDER BY requested_ns, destination_computer_id`, nodeID)
+	if err != nil {
+		return nil, internalError(err, "list pending restore authority revocations")
+	}
+	defer rows.Close()
+	var computerIDs []string
+	for rows.Next() {
+		var computerID string
+		if err := rows.Scan(&computerID); err != nil {
+			return nil, internalError(err, "scan pending restore authority revocation")
+		}
+		computerIDs = append(computerIDs, computerID)
+	}
+	return computerIDs, rows.Err()
+}
+
+func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, computerID string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET authority_revoked_ns=?
+		WHERE destination_computer_id=? AND operation='restore' AND status IN ('reserved', 'prepared')`,
+		canonicalTime(s.clock.Now()).UnixNano(), computerID)
+	if err != nil {
+		return internalError(err, "record restore authority revocation")
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "count restore authority revocation")
+	}
+	if affected != 1 {
+		return protocolError(contract.ErrorStaleIntentRevision, "Computer restore no longer owns authority revocation")
+	}
+	return nil
 }
 
 func validateStorageCopyReceipt(row computerStorageCopyRow, receipt ComputerStorageCopyReceipt) error {
@@ -433,8 +513,9 @@ func validateStorageCopyReceipt(row computerStorageCopyRow, receipt ComputerStor
 	}
 	switch row.Operation {
 	case "restore":
-		if receipt.OSIdentityRekeyed || receipt.FilesystemExpanded || receipt.SourceDigest != receipt.DestinationDigest || row.SourceSize != row.DestinationSize {
-			return protocolError(contract.ErrorConflict, "Computer restore receipt changed identity, size, or content")
+		if receipt.OSIdentityRekeyed || receipt.FilesystemExpanded != (row.DestinationSize > row.SourceSize) ||
+			(row.DestinationSize == row.SourceSize && receipt.SourceDigest != receipt.DestinationDigest) {
+			return protocolError(contract.ErrorConflict, "Computer restore receipt lacks required byte preservation or expansion evidence")
 		}
 	case "clone":
 		if !receipt.OSIdentityRekeyed || receipt.FilesystemExpanded != (row.DestinationSize > row.SourceSize) {
@@ -456,11 +537,53 @@ func validateOldBackupReceipt(row computerStorageCopyRow, receipt *ComputerBacku
 	if receipt == nil || !row.OldBackupID.Valid || !row.OldCopyID.Valid {
 		return protocolError(contract.ErrorConflict, "restore lacks its precommitted old-generation Backup evidence")
 	}
+	if receipt.Kind != computerBackupCopyReceiptKind || receipt.FailureCode != "" || receipt.CopyAbsent ||
+		!backupDigestPattern.MatchString(receipt.ContentDigest) {
+		return protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
+			"failure_code": receipt.FailureCode,
+		}, "restore predecessor Backup copy did not complete successfully; the old generation remains current")
+	}
 	return validateBackupReceipt(computerBackupOperationRow{ComputerID: row.DestinationComputerID,
 		OperationRevision: row.OperationRevision, BackupID: row.OldBackupID.String, CopyID: row.OldCopyID.String,
 		StorageID: row.DestinationStorageID, StorageGeneration: row.OldGeneration,
 		AllocatedSize: row.DestinationSize, BoundNodeID: row.BoundNodeID, RootInstanceID: row.RootInstanceID,
 		JobID: row.JobID, CleanupFence: row.CleanupFence}, *receipt)
+}
+
+func abortRestoreForFailedPredecessorCopy(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+	receipt ComputerBackupCopyReceipt, now time.Time) error {
+	if err := validateBackupReceipt(computerBackupOperationRow{ComputerID: row.DestinationComputerID,
+		OperationRevision: row.OperationRevision, BackupID: row.OldBackupID.String, CopyID: row.OldCopyID.String,
+		StorageID: row.DestinationStorageID, StorageGeneration: row.OldGeneration,
+		AllocatedSize: row.DestinationSize, BoundNodeID: row.BoundNodeID, RootInstanceID: row.RootInstanceID,
+		JobID: row.JobID, CleanupFence: row.CleanupFence}, receipt); err != nil {
+		return err
+	}
+	if receipt.Kind != computerBackupFailureReceiptKind {
+		return protocolError(contract.ErrorInvalidRequest, "restore predecessor copy failure evidence is invalid")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_generations SET phase='retired', retired_ns=?
+		WHERE computer_id=? AND storage_generation=? AND phase='staging'`, now.UnixNano(),
+		row.DestinationComputerID, row.DestinationGeneration); err != nil {
+		return internalError(err, "retire aborted restore staging generation")
+	}
+	receiptJSON, err := json.Marshal(receipt)
+	if err != nil {
+		return internalError(err, "encode failed restore predecessor copy")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='failed',
+		failure_code=?, old_backup_receipt_json=?, completed_ns=?
+		WHERE destination_computer_id=? AND operation_revision=? AND status='reserved'`, receipt.FailureCode,
+		receiptJSON, now.UnixNano(), row.DestinationComputerID, row.OperationRevision); err != nil {
+		return internalError(err, "record failed restore predecessor copy")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE computers SET applied_revision=?, reconfiguration_phase='stable',
+		reconfiguration_revision=NULL, updated_ns=? WHERE computer_id=? AND intent_revision=? AND reconfiguration_phase='restoring'`,
+		row.OperationRevision, now.UnixNano(), row.DestinationComputerID, row.OperationRevision)
+	if err != nil {
+		return internalError(err, "abort restore after predecessor copy failure")
+	}
+	return requireComputerCAS(result, row.DestinationComputerID, row.OperationRevision)
 }
 
 func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNodeID, destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest) (Computer, error) {
@@ -491,6 +614,17 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 	}
 	if err := validateBackupAcknowledgementAuthority(ctx, tx, identityNodeID, request.NodeID, row.BoundNodeID, row.RootInstanceID); err != nil {
 		return Computer{}, err
+	}
+	if row.KeepOldBackup && request.OldBackupReceipt != nil && request.OldBackupReceipt.Kind == computerBackupFailureReceiptKind {
+		if err := abortRestoreForFailedPredecessorCopy(ctx, tx, row, *request.OldBackupReceipt, now); err != nil {
+			return Computer{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return Computer{}, internalError(err, "commit failed restore predecessor copy outcome")
+		}
+		return Computer{}, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
+			"failure_code": request.OldBackupReceipt.FailureCode,
+		}, "restore predecessor Backup copy failed; the old generation remains current")
 	}
 	if err := validateStorageCopyReceipt(row, request.Receipt); err != nil {
 		return Computer{}, err
@@ -556,6 +690,16 @@ func (s *Store) publishVerifiedComputerStorageCopy(ctx context.Context, destinat
 	}
 	if row.Status != "prepared" {
 		return Computer{}, protocolError(contract.ErrorConflict, "Computer Storage copy has no durable positive verification")
+	}
+	if row.Operation == "restore" {
+		var revoked sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT authority_revoked_ns FROM computer_storage_copy_operations
+			WHERE destination_computer_id=? AND operation_revision=?`, destinationComputerID, operationRevision).Scan(&revoked); err != nil {
+			return Computer{}, internalError(err, "read durable restore authority revocation")
+		}
+		if !revoked.Valid || revoked.Int64 <= 0 {
+			return Computer{}, protocolError(contract.ErrorConflict, "Computer restore authority was not durably revoked before publication")
+		}
 	}
 	var receiptJSON []byte
 	var oldReceiptJSON sql.NullString
@@ -648,13 +792,15 @@ func publishComputerStorageCopy(ctx context.Context, tx *sql.Tx, row computerSto
 	if err := requireSingleStorageGenerationMutation(published, "publish copied Computer Storage generation"); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO storage_provenance(provenance_id, kind,
+	if row.Operation != "clone" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO storage_provenance(provenance_id, kind,
 		source_storage_id, source_generation, backup_id, destination_computer_id,
 		destination_storage_id, destination_generation, created_ns) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		newID("storage-provenance"), row.Operation, row.SourceStorageID, row.SourceGeneration,
-		row.BackupID, row.DestinationComputerID, row.DestinationStorageID,
-		row.DestinationGeneration, now.UnixNano()); err != nil {
-		return internalError(err, "publish destination Storage provenance")
+			newID("storage-provenance"), row.Operation, row.SourceStorageID, row.SourceGeneration,
+			row.BackupID, row.DestinationComputerID, row.DestinationStorageID,
+			row.DestinationGeneration, now.UnixNano()); err != nil {
+			return internalError(err, "publish destination Storage provenance")
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state='stopped', current_attempt_id=NULL,
 		updated_ns=? WHERE job_id=?`, now.UnixNano(), row.JobID); err != nil {
@@ -694,6 +840,10 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 		request.CleanupFence == "" || request.IdempotencyKey == "" || request.RemovalGeneration == 0 {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "complete Computer restore retirement acknowledgement fields are required")
 	}
+	bodyHash, err := storageCopyHash(request)
+	if err != nil {
+		return Computer{}, internalError(err, "encode Computer restore retirement acknowledgement")
+	}
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -709,10 +859,22 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 	if err != nil {
 		return Computer{}, protocolError(contract.ErrorStaleIntentRevision, "Computer restore operation is no longer current")
 	}
-	if row.Operation != "restore" || row.Status != "published" || request.NodeID != row.BoundNodeID ||
+	if row.Operation != "restore" || (row.Status != "published" && row.Status != "retired") || request.NodeID != row.BoundNodeID ||
 		request.RootInstanceID != row.RootInstanceID || request.CleanupFence != row.CleanupFence ||
 		request.RemovalGeneration != uint64(row.OperationRevision) {
 		return Computer{}, protocolError(contract.ErrorStaleFence, "Computer restore retirement authority does not match")
+	}
+	if row.Status == "retired" {
+		var key, hash sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT retirement_acknowledgement_key, retirement_acknowledgement_hash
+			FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?`,
+			computerID, row.OperationRevision).Scan(&key, &hash); err != nil {
+			return Computer{}, internalError(err, "read restore retirement replay")
+		}
+		if !key.Valid || key.String != request.IdempotencyKey || !hash.Valid || hash.String != bodyHash {
+			return Computer{}, protocolError(contract.ErrorIdempotencyConflict, "Computer restore retirement replay differs from durable evidence")
+		}
+		return readComputerAuthority(ctx, tx, computerID, now)
 	}
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
@@ -721,8 +883,9 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 	if computer.StorageGeneration != row.DestinationGeneration || computer.ReconfigurationPhase != ComputerReconfigurationRestoring {
 		return Computer{}, protocolError(contract.ErrorStaleIntentRevision, "Computer restore no longer owns predecessor retirement")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='retired', completed_ns=?
-		WHERE destination_computer_id=? AND status='published'`, now.UnixNano(), computerID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='retired', completed_ns=?,
+		retirement_acknowledgement_key=?, retirement_acknowledgement_hash=?
+		WHERE destination_computer_id=? AND status='published'`, now.UnixNano(), request.IdempotencyKey, bodyHash, computerID); err != nil {
 		return Computer{}, internalError(err, "complete restored predecessor retirement")
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET applied_revision=?, reconfiguration_phase='stable',

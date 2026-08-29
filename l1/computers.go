@@ -809,6 +809,12 @@ func setComputerServiceDesiredState(
 			if err := transitionServiceJob(ctx, tx, job.JobID, desired, contract.JobStopped, now); err != nil {
 				return err
 			}
+			// A queued Computer has no live runtime owner. Clearing the terminal
+			// predecessor attempt turns that observed quiescence into the positive
+			// detached precondition required by Storage replacement operations.
+			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET current_attempt_id=NULL WHERE job_id=?`, job.JobID); err != nil {
+				return internalError(err, "publish detached stopped Computer")
+			}
 		case contract.JobClaimed, contract.JobRunning:
 			if err := transitionServiceJob(ctx, tx, job.JobID, desired, contract.JobStopping, now); err != nil {
 				return err
@@ -1010,6 +1016,10 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 			WHERE destination_computer_id=? AND status IN ('reserved', 'prepared', 'published')`, computerID); err != nil {
 			return Computer{}, internalError(err, "supersede Computer Storage copy for removal")
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded'
+		WHERE source_computer_id=? AND operation='clone' AND status IN ('reserved', 'prepared')`, computerID); err != nil {
+		return Computer{}, internalError(err, "supersede clone custody forks sourced by removed Computer")
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET desired_state=?, intent_revision=?, removal_outcome='removal_pending',
 		reconfiguration_phase=?, reconfiguration_revision=?, updated_ns=?

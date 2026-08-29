@@ -952,8 +952,11 @@
         "description": "Copies no grants, requires a new name, rejects a smaller destination, fully allocates and expands a larger destination, narrowly rekeys machine-id and SSH host keys, preserves browser profile bytes, and records a Storage provenance custody fork.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
-          "required": ["name", "disk_bytes", "idempotency_key"],
+          "required": ["intent_revision", "storage_id", "storage_generation", "name", "disk_bytes", "idempotency_key"],
           "properties": {
+            "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+            "storage_id": { "type": "string", "minLength": 1 },
+            "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
             "name": { "type": "string", "minLength": 1, "maxLength": 255 },
             "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
             "idempotency_key": { "type": "string", "minLength": 1 }

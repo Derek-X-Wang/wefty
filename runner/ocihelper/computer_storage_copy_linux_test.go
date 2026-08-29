@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -20,6 +22,75 @@ func publishedStorageCopySource(t *testing.T) (string, *fakeComputerDiskSystem, 
 		t.Fatal(err)
 	}
 	return root, system, response
+}
+
+func TestRealCloneIdentityRekeyRegeneratesHostKeysAndPreservesBrowserProfile(t *testing.T) {
+	root := t.TempDir()
+	etcSSH := filepath.Join(root, "etc", "ssh")
+	profile := filepath.Join(root, "home", "agent", ".config", "chromium", "Default")
+	if err := os.MkdirAll(etcSSH, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(profile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldMachineID := []byte("0123456789abcdef0123456789abcdef\n")
+	oldHostKey := []byte("planted-old-host-private-key")
+	browserSecret := []byte("browser-profile-secret-must-remain-byte-identical")
+	if err := os.WriteFile(filepath.Join(root, "etc", "machine-id"), oldMachineID, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(etcSSH, "ssh_host_ed25519_key"), oldHostKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(etcSSH, "ssh_host_ed25519_key.pub"), []byte("old-public"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(profile, "Login Data")
+	if err := os.WriteFile(markerPath, browserSecret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rekeyed, err := rekeyCloneIdentity(t.Context(), root)
+	if err != nil || !rekeyed {
+		t.Fatalf("real identity rekey = %t err=%v", rekeyed, err)
+	}
+	newMachineID, err := os.ReadFile(filepath.Join(root, "etc", "machine-id"))
+	if err != nil || bytes.Equal(newMachineID, oldMachineID) || len(strings.TrimSpace(string(newMachineID))) != 32 {
+		t.Fatalf("observed machine-id = %q err=%v", newMachineID, err)
+	}
+	newHostKey, err := os.ReadFile(filepath.Join(etcSSH, "ssh_host_ed25519_key"))
+	if err != nil || bytes.Equal(newHostKey, oldHostKey) {
+		t.Fatalf("observed regenerated host key err=%v", err)
+	}
+	marker, err := os.ReadFile(markerPath)
+	if err != nil || !bytes.Equal(marker, browserSecret) {
+		t.Fatalf("browser marker changed: %q err=%v", marker, err)
+	}
+}
+
+func TestComputerStorageCopyRejectsMutatedStagingBytesBeforeFilesystemMutation(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+	finalizeCalls := 0
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerBackupCopyN: func(destination io.Writer, source io.Reader, size int64) (int64, error) {
+			payload, err := io.ReadAll(io.LimitReader(source, size))
+			if err != nil {
+				return 0, err
+			}
+			payload[4096] ^= 0xff
+			written, err := destination.Write(payload)
+			return int64(written), err
+		}, storageCopyFinalize: func(context.Context, string, string, string, int64, bool) (computerStorageCopyFacts, error) {
+			finalizeCalls++
+			return computerStorageCopyFacts{}, nil
+		}}
+	if _, err := engine.CopyComputerStorage(t.Context(), request); err == nil || !strings.Contains(err.Error(), "staging digest mismatch") {
+		t.Fatalf("mutated staging error = %v", err)
+	}
+	if finalizeCalls != 0 {
+		t.Fatalf("filesystem mutation ran %d times before staging digest verification", finalizeCalls)
+	}
 }
 
 func storageCopyTestRequest(response CreateComputerBackupResponse, operation string, destinationSize int64) CopyComputerStorageRequest {
@@ -40,14 +111,18 @@ func storageCopyTestRequest(response CreateComputerBackupResponse, operation str
 	return request
 }
 
-func fakeCloneFinalize(_ *testing.T) func(context.Context, string, string, bool) error {
-	return func(_ context.Context, imagePath, _ string, _ bool) error {
+func fakeCloneFinalize(_ *testing.T) func(context.Context, string, string, string, int64, bool) (computerStorageCopyFacts, error) {
+	return func(_ context.Context, operation, imagePath, _ string, _ int64, expanded bool) (computerStorageCopyFacts, error) {
+		facts := computerStorageCopyFacts{OSIdentityRekeyed: operation == "clone", FilesystemExpanded: expanded}
 		file, err := os.OpenFile(imagePath, os.O_WRONLY, 0)
 		if err != nil {
-			return err
+			return facts, err
 		}
-		_, writeErr := file.WriteAt([]byte("machine-id=rekeyed\nssh-host-keys=removed\n"), 8192)
-		return errors.Join(writeErr, file.Sync(), file.Close())
+		if operation != "clone" {
+			return facts, file.Close()
+		}
+		_, writeErr := file.WriteAt([]byte("machine-id=rekeyed\nssh-host-keys=regenerated\n"), 8192)
+		return facts, errors.Join(writeErr, file.Sync(), file.Close())
 	}
 }
 
@@ -55,10 +130,10 @@ func TestComputerStorageCopyResumesEveryCrashBoundaryAndPreservesBrowserBytes(t 
 	for _, operation := range []string{"restore", "clone"} {
 		for _, checkpoint := range []computerStorageCopyPhase{
 			computerStorageCopyReserved, computerStorageCopyAllocated, computerStorageCopyCopied,
-			computerStorageCopySourceVerified, computerStorageCopyManifestWritten, computerStorageCopyPublished,
+			computerStorageCopySourceVerified, computerStorageCopyMountedRekey, computerStorageCopyManifestWritten, computerStorageCopyPublished,
 			computerStorageCopyIdentityRekeyed, computerStorageCopyExpanded,
 		} {
-			if operation == "restore" && (checkpoint == computerStorageCopyIdentityRekeyed || checkpoint == computerStorageCopyExpanded) {
+			if operation == "restore" && (checkpoint == computerStorageCopyMountedRekey || checkpoint == computerStorageCopyIdentityRekeyed || checkpoint == computerStorageCopyExpanded) {
 				continue
 			}
 			t.Run(operation+"/"+string(checkpoint), func(t *testing.T) {
@@ -106,7 +181,7 @@ func TestComputerStorageCopyResumesEveryCrashBoundaryAndPreservesBrowserBytes(t 
 					t.Fatal("Storage copy did not preserve user, browser, and deliberately copied old credential bytes")
 				}
 				if operation == "clone" && (!bytes.Contains(payload, []byte("machine-id=rekeyed")) ||
-					!bytes.Contains(payload, []byte("ssh-host-keys=removed"))) {
+					!bytes.Contains(payload, []byte("ssh-host-keys=regenerated"))) {
 					t.Fatal("clone did not narrowly rekey OS identity")
 				}
 			})

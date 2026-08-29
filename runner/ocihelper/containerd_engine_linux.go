@@ -115,7 +115,7 @@ type ContainerdEngine struct {
 	computerBackupCopyN       func(io.Writer, io.Reader, int64) (int64, error)
 	computerBackupRemovalHook func()
 	storageCopyHook           func(computerStorageCopyPhase) error
-	storageCopyFinalize       func(context.Context, string, string, bool) error
+	storageCopyFinalize       func(context.Context, string, string, string, int64, bool) (computerStorageCopyFacts, error)
 	computerDiskHook          func(computerDiskCheckpoint) error
 	lastProfile               *ProfileReceipt
 	capacityMu                sync.Mutex

@@ -280,15 +280,19 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 			directive.ComputerStorage = &ComputerStorageClaim{ComputerID: computerID.String, StorageID: storageID.String,
 				StorageGeneration: storageGeneration.Int64}
 			directive.ComputerStorageGenerations = &ComputerStorageGenerationClaims{Generations: []ComputerStorageGenerationClaim{}}
-			generationRows, generationErr := s.db.QueryContext(ctx, `SELECT storage_id, storage_generation, disk_bytes
-				FROM computer_storage_generations WHERE computer_id=? ORDER BY storage_generation`, computerID.String)
+			generationRows, generationErr := s.db.QueryContext(ctx, `SELECT computer_id, storage_id, storage_generation, disk_bytes
+				FROM computer_storage_generations WHERE computer_id=?
+				UNION
+				SELECT destination_computer_id, destination_storage_id, destination_generation, destination_size
+				FROM computer_storage_copy_operations
+				WHERE source_computer_id=? AND operation='clone' AND status='superseded'
+				ORDER BY storage_generation`, computerID.String, computerID.String)
 			if generationErr != nil {
 				return nil, internalError(generationErr, "list Computer Storage removal generations")
 			}
 			for generationRows.Next() {
 				var generation ComputerStorageGenerationClaim
-				generation.ComputerID = computerID.String
-				if err := generationRows.Scan(&generation.StorageID, &generation.StorageGeneration, &generation.DiskBytes); err != nil {
+				if err := generationRows.Scan(&generation.ComputerID, &generation.StorageID, &generation.StorageGeneration, &generation.DiskBytes); err != nil {
 					generationRows.Close()
 					return nil, internalError(err, "scan Computer Storage removal generation")
 				}

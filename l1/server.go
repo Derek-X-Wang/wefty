@@ -868,12 +868,6 @@ func (s *Server) restoreComputerBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if !replayed {
-		if err := s.revokeComputerAuthority(r.Context(), computer.ComputerID, "computer_restoring"); err != nil {
-			writeError(w, err)
-			return
-		}
-	}
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
@@ -1172,6 +1166,26 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	restoreRevocations, err := s.store.ListNodeComputerRestoreRevocations(r.Context(), nodeID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	for _, computerID := range restoreRevocations {
+		if s.computerTokenRevoker == nil {
+			writeError(w, internalError(errors.New("L3 Computer token revoker is not configured"),
+				"revoke pre-restore Computer authority"))
+			return
+		}
+		if err := s.revokeComputerAuthority(r.Context(), computerID, "computer_restoring"); err != nil {
+			writeError(w, err)
+			return
+		}
+		if err := s.store.RecordComputerRestoreAuthorityRevoked(r.Context(), computerID); err != nil {
+			writeError(w, err)
+			return
+		}
 	}
 	storageCopies, err := s.store.ListNodeComputerStorageCopyDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
 	if err != nil {
