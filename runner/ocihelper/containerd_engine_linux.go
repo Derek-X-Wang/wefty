@@ -1293,7 +1293,7 @@ func (engine *ContainerdEngine) Signal(ctx context.Context, request SignalReques
 	if request.Signal == SignalKILL {
 		signal = syscall.SIGKILL
 	}
-	if err := attempt.task.Kill(engineContext(ctx), signal, containerd.WithKillAll); err != nil {
+	if err := normalizeContainerdSignalError(attempt.task.Kill(engineContext(ctx), signal, containerd.WithKillAll)); err != nil {
 		return err
 	}
 	attempt.mu.Lock()

@@ -638,6 +638,46 @@ func TestAdapterIgnoreTERMWaitsForSlowPostKILLReleaseWithinStopBudget(t *testing
 	}
 }
 
+func TestAdapterServiceExitRacesKillAndKeepsTerminalEvidence(t *testing.T) {
+	engine := &adapterTestEngine{
+		watchSignals:   make(chan ocihelper.Signal, 1),
+		ignoreTERM:     true,
+		exitOnKillRace: true,
+	}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+	request.TerminationGrace = 10 * time.Millisecond
+	started := make(chan struct{})
+	request.Started = func() { close(started) }
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct {
+		result workloadrunner.Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := adapter.Run(ctx, request, nil)
+		done <- struct {
+			result workloadrunner.Result
+			err    error
+		}{result: result, err: err}
+	}()
+	<-started
+	cancel()
+	finished := <-done
+	if finished.err != nil || finished.result.Outcome.Signal != "terminated" || finished.result.Outcome.TerminationCause != contract.TerminationCauseAgent {
+		t.Fatalf("exit-during-grace cancellation = (%+v, %v)", finished.result.Outcome, finished.err)
+	}
+	engine.mu.Lock()
+	got := slices.Clone(engine.signals)
+	engine.mu.Unlock()
+	if !slices.Equal(got, []ocihelper.Signal{ocihelper.SignalTERM, ocihelper.SignalKILL}) {
+		t.Fatalf("signal attempts = %v, want TERM then raced KILL", got)
+	}
+}
+
 func TestAdapterServiceUninterruptiblePayloadDoesNotReportRuntimeLoss(t *testing.T) {
 	engine := &adapterTestEngine{watchSignals: make(chan ocihelper.Signal, 2), ignoreTERM: true, ignoreKILL: true}
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
@@ -1246,6 +1286,7 @@ type adapterTestEngine struct {
 	watchSignals       chan ocihelper.Signal
 	ignoreTERM         bool
 	ignoreKILL         bool
+	exitOnKillRace     bool
 	releaseDelay       time.Duration
 	blockSignal        bool
 	signals            []ocihelper.Signal
@@ -1367,11 +1408,16 @@ func (engine *adapterTestEngine) Signal(ctx context.Context, request ocihelper.S
 	engine.signals = append(engine.signals, request.Signal)
 	watchSignals := engine.watchSignals
 	ignore := request.Signal == ocihelper.SignalTERM && engine.ignoreTERM || request.Signal == ocihelper.SignalKILL && engine.ignoreKILL
+	exitOnKillRace := request.Signal == ocihelper.SignalKILL && engine.exitOnKillRace
 	block := engine.blockSignal
 	engine.mu.Unlock()
 	if block {
 		<-ctx.Done()
 		return ctx.Err()
+	}
+	if watchSignals != nil && exitOnKillRace {
+		watchSignals <- ocihelper.SignalTERM
+		return ocihelper.ErrTaskAlreadyTerminated
 	}
 	if watchSignals != nil && !ignore {
 		watchSignals <- request.Signal

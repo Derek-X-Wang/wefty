@@ -1110,7 +1110,14 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
-		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, server.engine.Signal(operation.ctx, body))
+		signalErr := server.engine.Signal(operation.ctx, body)
+		if errors.Is(signalErr, ErrTaskAlreadyTerminated) {
+			// The task crossed its terminal edge before this signal reached
+			// containerd. Watch remains the authority for how it terminated;
+			// this race is neither a failed mechanics operation nor runtime loss.
+			signalErr = nil
+		}
+		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, signalErr)
 	case MethodSetComputerControl:
 		var body SetComputerControlStateRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1440,7 +1447,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			server.createSweep.Lock()
 		}
 		response, err := server.engine.Verify(operation.ctx, body)
-		if err == nil && body.Scope == VerifyNamespace && response.Absent && InventoryEmpty(response.Inventory) {
+		if err == nil && body.Scope == VerifyNamespace && response.Absent {
 			session.mu.Lock()
 			if session.sweepPending {
 				session.sweepPending = false

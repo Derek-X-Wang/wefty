@@ -301,7 +301,10 @@ For an agent-boot-lifetime OCI service, execution cancellation first withdraws
 publication and closes the Fabric front door. The OCI adapter then keeps the
 helper `Watch` stream alive, sends `TERM`, waits the agent-compiled five-second
 grace, sends `KILL` if the task has not exited, and waits for the structured
-terminal result. `Delete` must subsequently verify task, container, snapshot,
+terminal result. A task that exits as the `KILL` races its terminal edge is
+already terminated, not helper loss: the helper does not record that undelivered
+`KILL`, and the retained `Watch` supplies the actual exit or signal evidence.
+`Delete` must subsequently verify task, container, snapshot,
 lease, cgroup, shim, and log absence before L1 may observe `stopped`.
 
 Helper/session or engine loss takes a different positive-proof path. The OCI

@@ -762,9 +762,7 @@ terminate() {
   trap - TERM
   if test -n "$server"; then
     kill "$server" 2>/dev/null || true
-    wait "$server" 2>/dev/null
-    status=$?
-    exit "$status"
+    wait "$server" 2>/dev/null || true
   fi
   exit 143
 }
@@ -773,6 +771,9 @@ while :; do
   /bin/httpd -f -p "127.0.0.1:$WEFTY_SERVICE_PORT" -h /tmp/wefty-www &
   server=$!
   printf '%s\n' "$server" >/tmp/wefty-httpd.pid
+  # Do not block the PID 1 shell in wait: BusyBox ash defers its TERM trap
+  # while waiting for the foreground child, which consumed the whole grace.
+  while kill -0 "$server" 2>/dev/null; do sleep 0.05; done
   wait "$server"
   status=$?
   if test -f /tmp/wefty-listener-restart; then
