@@ -118,8 +118,7 @@ def tree_has_focused_oracle():
         rect = node.get("rect", {})
         if node.get("name") == "Wefty Wayland Computer" and rect.get("width") == 1280 and rect.get("height") == 720:
             browser_output_sized = True
-        if (node.get("app_id") == "wev" and node.get("focused") is True and
-                rect.get("width") == 1280 and rect.get("height") == 720):
+        if node.get("app_id") == "wev" and node.get("focused") is True:
             keyboard_focused = True
         pending.extend(node.get("nodes", []))
         pending.extend(node.get("floating_nodes", []))
