@@ -556,6 +556,7 @@ type inputObservation struct {
 	X              int      `json:"x"`
 	Y              int      `json:"y"`
 	PointerHistory [][2]int `json:"pointer_history"`
+	ObserverLines  uint64   `json:"observer_lines"`
 }
 
 func (r *runtimeRunner) readInputObservation(ctx context.Context) (inputObservation, error) {
@@ -581,16 +582,20 @@ func historyContains(observation inputObservation, x, y int) bool {
 	return false
 }
 func (r *runtimeRunner) waitInputSentinel(ctx context.Context, after uint64, x, y int) (inputObservation, bool) {
+	last := inputObservation{}
 	for attempt := 0; attempt < 80; attempt++ {
 		value, err := r.readInputObservation(ctx)
-		if err == nil && value.Generation > after && historyContains(value, x, y) {
-			return value, true
+		if err == nil {
+			last = value
+			if value.Generation > after && historyContains(value, x, y) {
+				return value, true
+			}
 		}
 		if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
 			break
 		}
 	}
-	return inputObservation{}, false
+	return last, false
 }
 
 func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targetX, targetY, sentinelX, sentinelY int) bool {
@@ -619,7 +624,11 @@ func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targe
 	viewSession.Close()
 	sentinelSession.Close()
 	if !ok {
-		r.record(id, StatusFail, "control sentinel was not observed after view input")
+		detail := "control sentinel was not observed after view input"
+		if r.config.MutationProfile == "" {
+			detail = fmt.Sprintf("%s (generation=%d key_events=%d pointer=%d,%d observer_lines=%d)", detail, after.Generation, after.KeyEvents, after.X, after.Y, after.ObserverLines)
+		}
+		r.record(id, StatusFail, detail)
 		return false
 	}
 	if after.KeyEvents != before.KeyEvents || historyContains(after, targetX, targetY) {

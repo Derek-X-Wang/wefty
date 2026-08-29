@@ -288,7 +288,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../examples/computer-wayland/surface.py", "input-oracle.json", "def wefty_record_input", "Record only events delivered through Sway", `"wev"`, "wl_pointer", "wl_keyboard", `"swaymsg"`, "def do_POST", `self.path != "/surface-ready"`, "agent-state-surface.json", "theme-surface.json", "os.replace")
 	assertFileContains(t, "../examples/computer-wayland/oracle.html", "'/surface-ready'")
 	assertFileNotContains(t, "../examples/computer-wayland/oracle.html", "pointermove", "keydown", "keyup", "'/input'")
-	assertFileContains(t, "../examples/computer-wayland/sway-config", `app_id="wev"`, "opacity set 0.0", "fullscreen enable", "focus")
+	assertFileContains(t, "../examples/computer-wayland/sway-config", `app_id="wev"`, "opacity set 0.01", "fullscreen enable", "focus")
 	assertFileContains(t, "../examples/computer-wayland/LICENSES.md", "Herdr", "Apache-2.0", "no code or assets copied", "no code, assets, installer, name, or branding copied")
 	assertFileContains(t, "../scripts/test-computer-wayland-furniture.sh", "test ! -e /dev/dri", "agent-state-surface.json", "theme-surface.json", "crash-briefing.json", "idle_rss_bytes", "wefty-verify-licenses --check", `type == "number"`)
 	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", "cmd/wefty-computer-conformance", "--input-oracle-path", "--driver-oracle-path", "executed_rows", ".executed_rows == 20", "Dockerfile.wayland-text")

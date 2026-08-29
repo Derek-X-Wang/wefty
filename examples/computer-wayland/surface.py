@@ -18,9 +18,9 @@ STATE = f"{HOME}/.local/state/wefty/agent-state.json"
 THEME = f"{HOME}/.config/wefty/theme.json"
 HTML = "/opt/wefty-computer-wayland/oracle.html"
 LOCK = threading.Lock()
-INPUT = {"version": 1, "generation": 0, "key_events": 0, "x": 0, "y": 0, "pointer_history": [[0, 0]]}
+INPUT = {"version": 1, "generation": 0, "key_events": 0, "x": 0, "y": 0, "pointer_history": [[0, 0]], "observer_lines": 0}
 OBSERVED_STATES = []
-POINTER_EVENT = re.compile(r"\] motion: .*x, y: (-?[0-9]+(?:\.[0-9]+)?), (-?[0-9]+(?:\.[0-9]+)?)")
+POINTER_EVENT = re.compile(r"wl_pointer\] motion: .*x, y: (-?[0-9]+(?:\.[0-9]+)?), (-?[0-9]+(?:\.[0-9]+)?)")
 
 
 def atomic_json(path, value):
@@ -70,7 +70,7 @@ def observe_wayland_input():
     wait_for_browser()
     while True:
         process = subprocess.Popen(
-            ["stdbuf", "-oL", "wev", "-f", "wl_pointer:motion", "-f", "wl_keyboard:key"],
+            ["stdbuf", "-o0", "wev"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -78,6 +78,9 @@ def observe_wayland_input():
         )
         assert process.stdout is not None
         for line in process.stdout:
+            with LOCK:
+                INPUT["observer_lines"] += 1
+                atomic_json(ORACLE, INPUT)
             pointer = POINTER_EVENT.search(line)
             if pointer:
                 wefty_record_input({"version": 1, "kind": "pointer", "x": round(float(pointer.group(1))), "y": round(float(pointer.group(2)))})
