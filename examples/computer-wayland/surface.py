@@ -105,7 +105,7 @@ def tree_has_focused_oracle():
         if not isinstance(node, dict):
             continue
         rect = node.get("rect", {})
-        if node.get("app_id") == "chromium" and rect.get("width") == 1280 and rect.get("height") == 720:
+        if node.get("name") == "Wefty Wayland Computer" and rect.get("width") == 1280 and rect.get("height") == 720:
             browser_fullscreen = True
         if node.get("app_id") == "wev" and node.get("focused") is True:
             keyboard_focused = True
