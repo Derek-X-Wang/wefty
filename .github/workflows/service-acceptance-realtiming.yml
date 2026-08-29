@@ -101,14 +101,12 @@ jobs:
           test "$(jq -r .commit "$RUNNER_TEMP/acceptance-image-release/acceptance-image-receipt.json")" = "$EXPECTED_SHA"
           test "$(jq -r .commit "$RUNNER_TEMP/computer-image-release/computer-image-receipt.json")" = "$EXPECTED_SHA"
           candidate_sha="$(git rev-parse HEAD)"
-          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
-            test "$candidate_sha" = "$EXPECTED_SHA"
-          fi
+          test "$candidate_sha" = "$EXPECTED_SHA"
           printf 'CANDIDATE_SHA=%s\nPUBLISHED_SHA=%s\n' "$candidate_sha" "$EXPECTED_SHA" >> "$GITHUB_ENV"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
       - name: Provision pinned Linux OCI engine and probe
         if: runner.os == 'Linux'
         env:
@@ -244,10 +242,23 @@ jobs:
           while true; do
             if IFS= read -r action < /tmp/wefty-oci-faults/control; then
               case "$action" in
-                kill-shim)
-                  pid="$(pgrep -f 'containerd-shim-runc-v2.*-namespace wefty' | head -n 1)"
-                  test -n "$pid"
-                  kill -KILL "$pid"
+                kill-payload:*|kill-shim:*)
+                  job_id="${action#*:}"
+                  container=""
+                  for candidate in $(/usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock --namespace wefty tasks list --quiet); do
+                    if /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock --namespace wefty containers info "$candidate" | grep -F "$job_id" >/dev/null; then
+                      container="$candidate"
+                      break
+                    fi
+                  done
+                  test -n "$container"
+                  if [ "${action%%:*}" = kill-payload ]; then
+                    /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock --namespace wefty tasks kill --signal KILL "$container"
+                  else
+                    shim_pid="$(pgrep -f "containerd-shim-runc-v2.*-id $container" | head -n 1)"
+                    test -n "$shim_pid"
+                    kill -KILL "$shim_pid"
+                  fi
                   ;;
                 stop-containerd)
                   systemctl stop wefty-test-containerd.service
@@ -323,6 +334,7 @@ jobs:
             printf 'WEFTY_OCI_COMPUTER_REFERENCE=%s\n' "$COMPUTER_REFERENCE"
             printf 'WEFTY_OCI_COMPUTER_DIGEST=%s\n' "$COMPUTER_DIGEST"
             printf 'WEFTY_OCI_COMPUTER_ARCHIVE=%s\n' "$COMPUTER_ARCHIVE"
+            printf 'WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT=%s\n' "$computer_release/amd64-runtime.json"
             printf 'WEFTY_OCI_CLI=%s\n' "$WEFTY_CLI"
             printf 'WEFTY_OCI_SERVICE_NUMERIC_REFERENCE=%s\n' "$NUMERIC_REFERENCE"
             printf 'WEFTY_OCI_SERVICE_NUMERIC_ARCHIVE=%s\n' /tmp/wefty-service-data-numeric.oci.tar
@@ -341,7 +353,7 @@ jobs:
           fi
           printf 'commit=%s\nrunner=%s\n' "$CANDIDATE_SHA" "$RUNNER_NAME" > "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
           go version >> "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
-          go test -count=1 -p 1 -timeout=30m -v -tags=service_acceptance_realtiming ./...
+          go test -count=1 -p 1 -timeout=75m -v -tags=service_acceptance_realtiming ./...
       - name: Upload service acceptance evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -349,3 +361,38 @@ jobs:
           name: service-acceptance-realtiming-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}
           path: ${{ runner.temp }}/service-acceptance-realtiming
           if-no-files-found: error
+
+  realtiming-result:
+    name: realtiming-result
+    needs: [resolve-published-artifact, service-acceptance-realtiming]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the receipt gate from the publishing commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          persist-credentials: false
+      - name: Download the Linux matrix receipt
+        if: needs.resolve-published-artifact.outputs.available == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: service-acceptance-realtiming-ubuntu-latest-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/linux-computer-receipt
+      - name: Fail closed unless the published lane executed and passed
+        env:
+          RESOLVE_RESULT: ${{ needs.resolve-published-artifact.result }}
+          ARTIFACT_AVAILABLE: ${{ needs.resolve-published-artifact.outputs.available }}
+          REALTIMING_RESULT: ${{ needs.service-acceptance-realtiming.result }}
+        run: |
+          set -eu
+          printf '%s\n' \
+            "resolve-published-artifact=$RESOLVE_RESULT" \
+            "artifact-available=$ARTIFACT_AVAILABLE" \
+            "service-acceptance-realtiming=$REALTIMING_RESULT"
+          test "$RESOLVE_RESULT" = success
+          test "$ARTIFACT_AVAILABLE" = true
+          test "$REALTIMING_RESULT" = success
+          scripts/check-linux-computer-receipt.sh \
+            "$RUNNER_TEMP/linux-computer-receipt/linux-computer-matrix.json" \
+            "${{ needs.resolve-published-artifact.outputs.candidate-sha }}"

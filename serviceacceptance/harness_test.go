@@ -31,6 +31,7 @@ var (
 	weftyBinaryPath       string
 	agentBinaryPath       string
 	controlPlanePath      string
+	runLedgerPath         string
 	echoServiceBinaryPath string
 )
 
@@ -43,6 +44,7 @@ func TestMain(main *testing.M) {
 	weftyBinaryPath = filepath.Join(directory, "wefty")
 	agentBinaryPath = filepath.Join(directory, "wefty-agent")
 	controlPlanePath = filepath.Join(directory, "wefty-l1")
+	runLedgerPath = filepath.Join(directory, "wefty-l3")
 	echoServiceBinaryPath = filepath.Join(directory, "wefty-echo-service")
 	for _, build := range []struct {
 		name, output, pkg string
@@ -50,6 +52,7 @@ func TestMain(main *testing.M) {
 		{name: "CLI", output: weftyBinaryPath, pkg: "./cmd/wefty"},
 		{name: "agent", output: agentBinaryPath, pkg: "./cmd/wefty-agent"},
 		{name: "control plane", output: controlPlanePath, pkg: "./cmd/wefty-l1"},
+		{name: "run ledger", output: runLedgerPath, pkg: "./cmd/wefty-l3"},
 		{name: "echo service", output: echoServiceBinaryPath, pkg: "./cmd/wefty-echo-service"},
 	} {
 		command := exec.Command("go", "build", "-o", build.output, build.pkg)
@@ -74,11 +77,14 @@ type acceptanceHarness struct {
 	agent               *managedProcess
 	agents              []*managedProcess
 	controlPlane        *managedProcess
+	runLedger           *managedProcess
 	managedRoot         string
 	handoffRoot         string
 	l1Database          string
 	spoolDirectory      string
 	controlPlaneAddress string
+	runLedgerAddress    string
+	adminBootstrapNonce string
 	agentArguments      []string
 	productionTimings   bool
 	workingDirectories  map[string]string
@@ -100,6 +106,7 @@ type acceptanceHarnessOptions struct {
 	leaseDuration     time.Duration
 	productionTimings bool
 	agentArguments    []string
+	computerLane      bool
 }
 
 func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOptions) *acceptanceHarness {
@@ -117,18 +124,63 @@ func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOpti
 	l1Database := filepath.Join(directory, "l1.sqlite")
 	spoolDirectory := filepath.Join(directory, "agent-spool")
 	readyFile := filepath.Join(directory, "l1-ready.json")
-	controlPlane := newManagedProcess(t, controlPlanePath,
+	controlPlaneArguments := []string{
 		"--fabric=plain",
 		"--listen=127.0.0.1:0",
-		"--db="+l1Database,
-		"--lease-duration="+options.leaseDuration.String(),
+		"--db=" + l1Database,
+		"--lease-duration=" + options.leaseDuration.String(),
 		"--node-tags=acceptance-node=service-acceptance",
 		"--node-max-oneshot-slots=acceptance-node=4",
 		"--node-max-service-slots=acceptance-node=2",
-		"--ready-file="+readyFile,
-	)
+		"--ready-file=" + readyFile,
+	}
+	var runLedgerAddress string
+	if options.computerLane {
+		runLedgerAddress = net.JoinHostPort("127.0.0.1", strconv.Itoa(reservePort(t)))
+		controlPlaneArguments = append(controlPlaneArguments,
+			"--allow-plain-person-identities",
+			"--computer-backup-cap=4",
+			"--run-ledger="+runLedgerAddress,
+		)
+	}
+	var adminBootstrapNonce string
+	if options.computerLane {
+		command := exec.Command(controlPlanePath,
+			"--db="+l1Database,
+			"--computer-backup-cap=4",
+			"--initiate-admin-bootstrap",
+		)
+		output, bootstrapErr := command.CombinedOutput()
+		if bootstrapErr != nil {
+			t.Fatalf("initiate admin bootstrap with shipped L1: %v\n%s", bootstrapErr, output)
+		}
+		var challenge l1.AdminBootstrapChallenge
+		if err := json.Unmarshal(output, &challenge); err != nil || challenge.Nonce == "" {
+			t.Fatalf("decode shipped L1 admin bootstrap challenge: %v\n%s", err, output)
+		}
+		adminBootstrapNonce = challenge.Nonce
+	}
+	controlPlane := newManagedProcess(t, controlPlanePath, controlPlaneArguments...)
 	controlPlane.start(t)
 	address := waitForReadyAddress(t, readyFile, controlPlane, 10*time.Second)
+	var runLedger *managedProcess
+	if options.computerLane {
+		runLedgerReadyFile := filepath.Join(directory, "l3-ready.json")
+		runLedgerArguments := []string{
+			"--fabric=plain",
+			"--listen=" + runLedgerAddress,
+			"--control-plane=" + address,
+			"--db=" + filepath.Join(directory, "l3.sqlite"),
+			"--ready-file=" + runLedgerReadyFile,
+		}
+		if !options.productionTimings {
+			runLedgerArguments = append(runLedgerArguments, "--reconcile-interval=100ms")
+		}
+		runLedger = newManagedProcess(t, runLedgerPath, runLedgerArguments...)
+		runLedger.start(t)
+		runLedgerAddress = waitForReadyAddress(t, runLedgerReadyFile, runLedger, 10*time.Second)
+		options.agentArguments = append(options.agentArguments, "--run-ledger="+runLedgerAddress)
+	}
 
 	agentProcess := newAcceptanceAgentProcess(
 		t, address, spoolDirectory, managedRoot, handoffRoot, options.productionTimings, options.agentArguments...,
@@ -147,13 +199,15 @@ func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOpti
 	t.Cleanup(client.CloseIdleConnections)
 	return &acceptanceHarness{
 		client: client, publishedFabric: plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "service-client"}), agent: agentProcess,
-		agents: []*managedProcess{agentProcess}, controlPlane: controlPlane,
+		agents: []*managedProcess{agentProcess}, controlPlane: controlPlane, runLedger: runLedger,
 		managedRoot: managedRoot, handoffRoot: handoffRoot,
 		l1Database: l1Database, spoolDirectory: spoolDirectory, controlPlaneAddress: address,
-		agentArguments:     append([]string(nil), options.agentArguments...),
-		productionTimings:  options.productionTimings,
-		workingDirectories: make(map[string]string),
-		specs:              make(map[string]contract.JobSpec),
+		runLedgerAddress:    runLedgerAddress,
+		adminBootstrapNonce: adminBootstrapNonce,
+		agentArguments:      append([]string(nil), options.agentArguments...),
+		productionTimings:   options.productionTimings,
+		workingDirectories:  make(map[string]string),
+		specs:               make(map[string]contract.JobSpec),
 	}
 }
 
