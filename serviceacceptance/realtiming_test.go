@@ -23,6 +23,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/runner/lima"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -117,6 +119,10 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	evidence := newRealTimingEvidence(t)
 	var agentArguments []string
 	if runtime.GOOS == "linux" {
+		intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+		if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+			t.Fatal(err)
+		}
 		for _, value := range []struct{ name, flag string }{
 			{"WEFTY_OCI_HELPER_SOCKET", "--oci-helper-socket="},
 			{"WEFTY_OCI_HELPER_CHECKSUM", "--oci-helper-checksum="},
@@ -129,6 +135,14 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 			}
 			agentArguments = append(agentArguments, value.flag+setting)
 		}
+		archivePath := os.Getenv("WEFTY_OCI_PROBE_ARCHIVE")
+		if archivePath == "" {
+			t.Fatal("Linux OCI removal acceptance requires WEFTY_OCI_PROBE_ARCHIVE")
+		}
+		importRealtimeProbeImage(t, archivePath,
+			os.Getenv("WEFTY_OCI_HELPER_SOCKET"), os.Getenv("WEFTY_OCI_HELPER_CHECKSUM"),
+			os.Getenv("WEFTY_OCI_PROBE_REFERENCE"), os.Getenv("WEFTY_OCI_PROBE_DIGEST"))
+		agentArguments = append(agentArguments, "--oci-intent-file="+intentPath)
 	}
 	harness := newAcceptanceHarnessWithOptions(t, acceptanceHarnessOptions{
 		leaseDuration:     l1.DefaultLeaseDuration,
@@ -393,6 +407,49 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	}
 	assertSpoolRowsAbsent(t, harness.spoolDirectory, allJobIDs)
 	evidence.recordResidue(t, harness)
+}
+
+func importRealtimeProbeImage(t *testing.T, archivePath, helperSocket, helperChecksum, reference, digest string) {
+	t.Helper()
+	client := ocihelper.NewUnixClient(helperSocket, helperChecksum)
+	barrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{
+		NodeID: "service-acceptance-provisioner", BootSessionID: "service-acceptance-provisioner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer barrier.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, err := os.Open(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var imported ocihelper.EnsureImageResponse
+	importErr := session.ImportImage(ctx, ocihelper.EnsureImageRequest{
+		Reference: reference, Digest: digest,
+		Platform:         ocihelper.OCIPlatform{OS: "linux", Architecture: runtime.GOARCH},
+		OperationTimeout: 2 * time.Minute,
+	}, archive, func(event ocihelper.EnsureImageEvent) error {
+		if event.Result != nil {
+			imported = *event.Result
+		}
+		return nil
+	})
+	closeErr := archive.Close()
+	if importErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(importErr, closeErr))
+	}
+	if imported.TopLevelDigest != digest || imported.PlatformDigest == "" {
+		t.Fatalf("realtiming probe import = %+v, want top-level digest %s and a platform digest", imported, digest)
+	}
 }
 
 func assertProductionTimingDefaults(t *testing.T) {

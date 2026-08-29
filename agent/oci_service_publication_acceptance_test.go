@@ -35,7 +35,8 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	helperChecksum := os.Getenv("WEFTY_OCI_HELPER_CHECKSUM")
 	reference := os.Getenv("WEFTY_OCI_PROBE_REFERENCE")
 	digest := os.Getenv("WEFTY_OCI_PROBE_DIGEST")
-	if helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" {
+	archivePath := os.Getenv("WEFTY_OCI_PROBE_ARCHIVE")
+	if helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" {
 		if runtime.GOOS == "darwin" {
 			t.Skip("NOT-RUN: attended Mac/Lima OCI service publication requires the owner-hardware helper and probe environment")
 		}
@@ -67,6 +68,7 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	if err := barrier.Ensure(ctx); err != nil {
 		t.Fatal(err)
 	}
+	importRealtimeProbeImage(t, ctx, barrier, reference, digest)
 	adapter := ocirunner.NewAdapter(barrier)
 	if err := adapter.Probe(ctx, "service-publication-node", "service-publication-boot", reference, digest, l1.DefaultLeaseDuration); err != nil {
 		t.Fatal(err)
@@ -159,7 +161,8 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	helperChecksum := os.Getenv("WEFTY_OCI_HELPER_CHECKSUM")
 	reference := os.Getenv("WEFTY_OCI_PROBE_REFERENCE")
 	digest := os.Getenv("WEFTY_OCI_PROBE_DIGEST")
-	if helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" {
+	archivePath := os.Getenv("WEFTY_OCI_PROBE_ARCHIVE")
+	if helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" {
 		if runtime.GOOS == "darwin" {
 			t.Skip("NOT-RUN: attended Mac/Lima OCI L1/agent restart transitions require the owner-hardware helper and probe environment")
 		}
@@ -214,6 +217,7 @@ while :; do sleep 1; done
 	if err != nil {
 		t.Fatal(err)
 	}
+	importRealtimeProbeImage(t, t.Context(), barrier, reference, digest)
 	adapter := ocirunner.NewAdapter(barrier)
 	spoolDirectory := t.TempDir()
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
@@ -516,6 +520,43 @@ func containsBindingPin(pins []workloadrunner.OCIImageBindingPin, jobID, digest 
 		}
 	}
 	return false
+}
+
+func importRealtimeProbeImage(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, reference, digest string) {
+	t.Helper()
+	archivePath := os.Getenv("WEFTY_OCI_PROBE_ARCHIVE")
+	if archivePath == "" {
+		t.Fatal("OCI service realtiming provisioning requires WEFTY_OCI_PROBE_ARCHIVE")
+	}
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, err := os.Open(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var imported ocihelper.EnsureImageResponse
+	importErr := session.ImportImage(ctx, ocihelper.EnsureImageRequest{
+		Reference: reference, Digest: digest,
+		Platform:         ocihelper.OCIPlatform{OS: "linux", Architecture: runtime.GOARCH},
+		OperationTimeout: 2 * time.Minute,
+	}, archive, func(event ocihelper.EnsureImageEvent) error {
+		if event.Result != nil {
+			imported = *event.Result
+		}
+		return nil
+	})
+	closeErr := archive.Close()
+	if importErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(importErr, closeErr))
+	}
+	if imported.TopLevelDigest != digest || imported.PlatformDigest == "" {
+		t.Fatalf("realtiming probe import = %+v, want top-level digest %s and a platform digest", imported, digest)
+	}
 }
 
 func waitRuntimeRemovalManifestPhase(t *testing.T, directory, jobID string, want runtimeRemovalPhase, timeout time.Duration) runtimeRemovalRecord {
