@@ -44,6 +44,7 @@ type runtimeRunner struct {
 	containerID                              string
 	viewPort, controlPort, attempt           int
 	tools                                    map[string]bool
+	failed                                   bool
 }
 
 func Run(ctx context.Context, config RuntimeConfig) RuntimeResult {
@@ -117,14 +118,42 @@ func (r *runtimeRunner) run(ctx context.Context) error {
 	r.discoverTools(ctx)
 	r.markContainerdProfileNotRun()
 	r.checkEnvironment(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkTargets(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkLoopback(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkTransportNegatives(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkDriver(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkInput(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkHarnessProfile(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkEdgeRecovery(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	return r.checkPersistence(ctx)
+}
+
+func (r *runtimeRunner) mutationFailed() bool {
+	return r.config.MutationProfile != "" && r.failed
 }
 
 func (r *runtimeRunner) withStartupLogs(ctx context.Context, readinessErr error) error {
@@ -976,6 +1005,9 @@ func errWithOutput(err error, output commandResult) error {
 func (r *runtimeRunner) record(id string, status Status, detail string) {
 	if err := r.recorder.Record(id, status, detail); err != nil {
 		panic(err)
+	}
+	if status == StatusFail {
+		r.failed = true
 	}
 }
 
