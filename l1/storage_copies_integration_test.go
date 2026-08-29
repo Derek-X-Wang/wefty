@@ -15,7 +15,7 @@ func publishedBackupForStorageCopy(t *testing.T, keepCapacity int64) (*integrati
 	h, node, computer := backupHarness(t, keepCapacity, nil)
 	computer, claim := startBackupComputer(t, h, node, computer)
 	reserved, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
-		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "copy-source"})
+		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "copy-source", AllowPowerOff: true})
 	if err != nil {
 		t.Fatal(err)
 	}

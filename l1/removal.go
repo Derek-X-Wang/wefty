@@ -348,13 +348,7 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 			if err := backupRows.Close(); err != nil {
 				return nil, internalError(err, "close Computer Backup copy removals")
 			}
-			custodyRows, custodyErr := s.db.QueryContext(ctx, `WITH RECURSIVE custody(storage_id) AS (
-				VALUES(?)
-				UNION SELECT p.source_storage_id FROM storage_provenance p
-					JOIN custody c ON p.destination_storage_id=c.storage_id WHERE p.kind IN ('clone', 'import')
-				UNION SELECT p.destination_storage_id FROM storage_provenance p
-					JOIN custody c ON p.source_storage_id=c.storage_id WHERE p.kind IN ('clone', 'import')
-			) SELECT e.export_id, e.source_storage_id, e.source_generation, e.status,
+			custodyRows, custodyErr := s.db.QueryContext(ctx, computerCustodyGraph+` SELECT e.export_id, e.source_storage_id, e.source_generation, e.status,
 				e.operator_attestation_key IS NOT NULL FROM computer_custody_exports e
 				JOIN custody ON custody.storage_id=e.source_storage_id ORDER BY e.requested_ns, e.export_id`, storageID.String)
 			if custodyErr != nil {
@@ -645,24 +639,15 @@ func finalizeComputerCustodyOutcome(ctx context.Context, tx *sql.Tx, computerID 
 	if err := tx.QueryRowContext(ctx, `SELECT storage_id FROM computers WHERE computer_id=?`, computerID).Scan(&storageID); err != nil {
 		return internalError(err, "read Computer Storage custody identity")
 	}
-	const custodyGraph = `WITH RECURSIVE custody(storage_id) AS (
-		VALUES(?)
-		UNION
-		SELECT p.source_storage_id FROM storage_provenance p
-		JOIN custody c ON p.destination_storage_id=c.storage_id WHERE p.kind IN ('clone', 'import')
-		UNION
-		SELECT p.destination_storage_id FROM storage_provenance p
-		JOIN custody c ON p.source_storage_id=c.storage_id WHERE p.kind IN ('clone', 'import')
-	)`
 	var surviving int64
-	if err := tx.QueryRowContext(ctx, custodyGraph+`
+	if err := tx.QueryRowContext(ctx, computerCustodyGraph+`
 		SELECT COUNT(*) FROM computers c JOIN custody ON custody.storage_id=c.storage_id
 		WHERE c.computer_id<>? AND c.removal_outcome NOT IN ('removed_reduced', 'removed_verified')`,
 		storageID, computerID).Scan(&surviving); err != nil {
 		return internalError(err, "classify Computer clone custody fork")
 	}
 	var externalCustody int64
-	if err := tx.QueryRowContext(ctx, custodyGraph+`
+	if err := tx.QueryRowContext(ctx, computerCustodyGraph+`
 		SELECT COUNT(*) FROM (
 			SELECT e.export_id AS custody_id FROM computer_custody_exports e
 			JOIN custody ON custody.storage_id=e.source_storage_id
@@ -682,7 +667,7 @@ func finalizeComputerCustodyOutcome(ctx context.Context, tx *sql.Tx, computerID 
 		return internalError(err, "record Computer custody removal outcome")
 	}
 	if outcome == "removed_verified" {
-		if _, err := tx.ExecContext(ctx, custodyGraph+`
+		if _, err := tx.ExecContext(ctx, computerCustodyGraph+`
 			UPDATE computers SET removal_outcome='removed_verified', updated_ns=?
 			WHERE storage_id IN (SELECT storage_id FROM custody) AND removal_outcome='removed_reduced'`,
 			storageID, now.UnixNano()); err != nil {

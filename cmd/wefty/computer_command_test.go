@@ -413,6 +413,10 @@ func TestComputerCLIExitCodesAreTyped(t *testing.T) {
 }
 
 func TestComputerCLIUsageForeignIDAndRoutePaginationErrors(t *testing.T) {
+	assertComputerCLIUsageForeignIDAndRoutePaginationErrors(t)
+}
+
+func assertComputerCLIUsageForeignIDAndRoutePaginationErrors(t *testing.T) {
 	harness := newServiceCLIHarness(t)
 	ctx := context.Background()
 

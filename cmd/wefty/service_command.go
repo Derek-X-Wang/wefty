@@ -66,12 +66,14 @@ func executeServices(ctx context.Context, clients *apiClients, jsonOutput bool, 
 		return executeComputerAbort(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "submission":
 		return executeComputerSubmission(ctx, clients, jsonOutput, args, stdout, stderr)
+	case "backup", "restore", "clone", "custody":
+		return executeComputerStorage(ctx, clients, jsonOutput, args, stdout, stderr)
 	default:
 		return usageError(fmt.Sprintf("unknown services command %q", args[0]))
 	}
 }
 
-const serviceUsage = "usage: wefty services create|list|status|start|stop|restart|logs|remove|forget|reimage|reset|resize|abort|submission|grants|grant|revoke|takeover"
+const serviceUsage = "usage: wefty services create|list|status|start|stop|restart|logs|remove|forget|reimage|reset|resize|abort|submission|grants|grant|revoke|takeover|backup|restore|clone|custody"
 
 func executeServiceCreate(
 	ctx context.Context,

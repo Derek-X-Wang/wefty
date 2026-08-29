@@ -94,7 +94,7 @@ func TestComputerBackupDefaultCapZeroAndExplicitOverride(t *testing.T) {
 	if computer.BackupCap != 0 {
 		t.Fatalf("shipped Backup cap = %d, want 0", computer.BackupCap)
 	}
-	request := ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-0"}
+	request := ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-0", AllowPowerOff: true}
 	if _, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID, request); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("default-zero Backup error = %v, want %q", err, contract.ErrorConflict)
 	}
@@ -126,8 +126,12 @@ func TestComputerBackupDefaultCapZeroAndExplicitOverride(t *testing.T) {
 func TestComputerBackupRunningQuiescesPublishesAndResumesSameRevision(t *testing.T) {
 	h, node, computer := backupHarness(t, 1, nil)
 	computer, claim := startBackupComputer(t, h, node, computer)
+	if _, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
+		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-without-power-off"}); errorCode(err) != contract.ErrorConflict {
+		t.Fatalf("running Backup without allow_power_off = %v, want %q", err, contract.ErrorConflict)
+	}
 	reserved, replayed, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
-		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-1"})
+		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-1", AllowPowerOff: true})
 	if err != nil || replayed {
 		t.Fatalf("begin Backup = %#v replayed=%t err=%v", reserved, replayed, err)
 	}
@@ -157,7 +161,7 @@ func TestComputerBackupRunningQuiescesPublishesAndResumesSameRevision(t *testing
 		t.Fatalf("unchanged-intent Backup resume = %#v", resumed)
 	}
 	if _, _, err := h.store.BeginComputerBackup(context.Background(), resumed.ComputerID,
-		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(resumed, "operator"), IdempotencyKey: "at-cap"}); errorCode(err) != contract.ErrorConflict {
+		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(resumed, "operator"), IdempotencyKey: "at-cap", AllowPowerOff: true}); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("Backup at cap error = %v, want %q", err, contract.ErrorConflict)
 	}
 	list, err := h.store.ListComputerBackups(context.Background(), resumed.ComputerID)
@@ -200,7 +204,7 @@ func TestComputerBackupStopAndFailureRacesNeverResumeStaleIntent(t *testing.T) {
 		h, node, computer := backupHarness(t, 2, nil)
 		computer, claim := startBackupComputer(t, h, node, computer)
 		reserved, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
-			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-stop"})
+			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-stop", AllowPowerOff: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -226,7 +230,7 @@ func TestComputerBackupStopAndFailureRacesNeverResumeStaleIntent(t *testing.T) {
 		h, node, computer := backupHarness(t, 2, nil)
 		computer, claim := startBackupComputer(t, h, node, computer)
 		_, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
-			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-enospc"})
+			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-enospc", AllowPowerOff: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -253,7 +257,7 @@ func TestComputerBackupStopAndFailureRacesNeverResumeStaleIntent(t *testing.T) {
 		h, node, computer := backupHarness(t, 2, nil)
 		computer, claim := startBackupComputer(t, h, node, computer)
 		reserved, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
-			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-failed"})
+			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-failed", AllowPowerOff: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -279,7 +283,7 @@ func TestComputerBackupExplicitPruneAndRemovalSupersession(t *testing.T) {
 		h, node, computer := backupHarness(t, 2, nil)
 		computer, claim := startBackupComputer(t, h, node, computer)
 		_, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
-			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-prune-source"})
+			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-prune-source", AllowPowerOff: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -331,7 +335,7 @@ func TestComputerBackupExplicitPruneAndRemovalSupersession(t *testing.T) {
 		h, node, computer := backupHarness(t, 2, nil)
 		computer, claim := startBackupComputer(t, h, node, computer)
 		reserved, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
-			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-remove"})
+			ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-remove", AllowPowerOff: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -370,7 +374,7 @@ func TestComputerRemovalGatesPublishedBackupCopyAbsence(t *testing.T) {
 	h, node, computer := backupHarness(t, 2, nil)
 	computer, claim := startBackupComputer(t, h, node, computer)
 	_, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
-		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-published-remove"})
+		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-published-remove", AllowPowerOff: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +451,7 @@ func TestComputerBackupAcknowledgementsRequireBoundNodeAndCurrentRoot(t *testing
 	h, node, computer := backupHarness(t, 2, nil)
 	computer, claim := startBackupComputer(t, h, node, computer)
 	_, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID,
-		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-authority"})
+		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "backup-authority", AllowPowerOff: true})
 	if err != nil {
 		t.Fatal(err)
 	}

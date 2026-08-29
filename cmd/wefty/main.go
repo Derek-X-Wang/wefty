@@ -29,15 +29,18 @@ func main() {
 
 // commandExitCodeForArgs preserves the historical exit 1 contract for all
 // pre-existing commands. Typed exits are explicit contracts only for the
-// Computer lifecycle and access surfaces introduced by #190 and #191.
+// Computer lifecycle, access, and Storage surfaces introduced in M3.5.
 func commandExitCodeForArgs(err error, args []string) int {
-	if !isAccessCLIArgs(args) && !isComputerCLIArgs(args) {
+	if !isTypedExitCLIArgs(args) {
 		return exitFailure
 	}
 	return commandExitCode(err)
 }
 
-func isAccessCLIArgs(args []string) bool {
+func isTypedExitCLIArgs(args []string) bool {
+	if isComputerCLIArgs(args) {
+		return true
+	}
 	positionals := []string{}
 	for _, arg := range args {
 		if !strings.HasPrefix(arg, "-") {
@@ -51,7 +54,8 @@ func isAccessCLIArgs(args []string) bool {
 		return true
 	}
 	return len(positionals) >= 2 && positionals[0] == "services" &&
-		(positionals[1] == "grant" || positionals[1] == "grants" || positionals[1] == "revoke" || positionals[1] == "takeover")
+		(positionals[1] == "grant" || positionals[1] == "grants" || positionals[1] == "revoke" || positionals[1] == "takeover" ||
+			positionals[1] == "backup" || positionals[1] == "restore" || positionals[1] == "clone" || positionals[1] == "custody")
 }
 
 func isComputerCLIArgs(args []string) bool {
@@ -332,14 +336,15 @@ Commands:
                              Enable, disable, or set Computer Run submission inflight capacity
     enable|disable COMPUTER [--policy-revision REV --submit-intent-revision REV | --expect-current] [--idempotency-key KEY]
     set-inflight COMPUTER --max-inflight COUNT [--policy-revision REV --submit-intent-revision REV | --expect-current] [--idempotency-key KEY]
+  services backup <verb>     Create, list, prune, or configure cold Backups
+    create|list|prune|set-cap
+  services restore COMPUTER BACKUP
+                             Restore a stopped Computer from one Backup
+  services clone COMPUTER BACKUP
+                             Clone one Backup into a new stopped Computer with no grants
+  services custody <verb>    Export, import, or attest external storage custody
+    export|import|attest
   runs list                  List Runs by immutable Computer origin
-    grants|grant|revoke      List or mutate Computer person grants
-    takeover view COMPUTER --session-token-file FILE
-                              Open a live view session and write its owner-only capability
-    takeover take|release COMPUTER --session-token-file FILE
-                            Act on the same live view session without printing its capability
-    takeover sessions list COMPUTER
-    takeover audit tail COMPUTER
   submit                     Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID               Create a new run from a stored snapshot
   logs RUN_ID [--follow]     Read or follow run logs

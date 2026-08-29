@@ -570,6 +570,49 @@
           "created_at": { "type": "string", "format": "date-time" }
         }
       },
+      "ComputerCustodyBranch": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["computer_id", "storage_id", "storage_generation"],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 },
+          "storage_id": { "type": "string", "minLength": 1 },
+          "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "removal_outcome": { "enum": ["removal_pending", "removed_reduced", "removed_verified"] }
+        }
+      },
+      "ComputerStorageProvenance": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["computer_id", "storage_id", "storage_generation", "custody_tainted", "custody_forks", "storage_provenance", "custody_exports"],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 },
+          "storage_id": { "type": "string", "minLength": 1 },
+          "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "removal_outcome": { "enum": ["removal_pending", "removed_reduced", "removed_verified"] },
+          "custody_tainted": { "type": "boolean", "description": "True when the custody graph contains a committed export or imported external bytes; operator deletion attestation never clears it." },
+          "custody_forks": { "type": "array", "items": { "$ref": "#/components/schemas/ComputerCustodyBranch" } },
+          "storage_provenance": { "type": "array", "items": { "$ref": "#/components/schemas/StorageProvenance" } },
+          "custody_exports": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "ComputerCustodyImport": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["import_id", "export_id", "operation_revision", "destination_computer_id", "destination_storage_id", "destination_name", "destination_size", "status", "requested_at"],
+        "properties": {
+          "import_id": { "type": "string", "minLength": 1 },
+          "export_id": { "type": "string", "minLength": 1 },
+          "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+          "destination_computer_id": { "type": "string", "minLength": 1 },
+          "destination_storage_id": { "type": "string", "minLength": 1 },
+          "destination_name": { "type": "string", "minLength": 1 },
+          "destination_size": { "type": "integer", "format": "int64", "minimum": 1 },
+          "status": { "enum": ["reserved", "prepared", "complete", "failed"] },
+          "requested_at": { "type": "string", "format": "date-time" },
+          "completed_at": { "type": "string", "format": "date-time" }
+        }
+      },
       "BackupCopy": {
         "type": "object",
         "additionalProperties": false,
