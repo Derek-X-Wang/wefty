@@ -280,7 +280,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		t.Fatal("Wayland image must remove ldconfig's nondeterministic cache after both invocations")
 	}
 	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "WLR_BACKENDS=headless", "WLR_RENDERER=pixman", "WLR_HEADLESS_OUTPUTS=1")
-	assertFileContains(t, "../examples/computer-wayland/entrypoint.sh", "wayvnc -w", "--disable-input", "--app=http://127.0.0.1:18888/", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "surface-ready", "view-edge-ready", "control-edge-ready")
+	assertFileContains(t, "../examples/computer-wayland/entrypoint.sh", "wayvnc -w", "--disable-input", "--class=chromium", "--app=http://127.0.0.1:18888/", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "surface-ready", "view-edge-ready", "control-edge-ready")
 	assertFileNotContains(t, "../examples/computer-wayland/entrypoint.sh", "WEFTY_CONFORMANCE_MUTATION", "WEFTY_WAYVNC_RECORD_INPUT")
 	assertFileContains(t, "../examples/computer-wayland/watch-driver.py", "/wefty/control/driver.json", "type(value[\"version\"]) is not int", "os.replace")
 	assertFileContains(t, "../examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch", "GET /websockify", "Sec-WebSocket-Protocol: binary", "WS_OPCODE_TEXT", "wefty_mutation_hooks", "view-edge-ready", "control-edge-ready")
