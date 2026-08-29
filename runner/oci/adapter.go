@@ -1195,6 +1195,7 @@ func reportOCIRuntimeUnavailable(request workloadrunner.Request, generation ocih
 const (
 	defaultTerminationGrace  = 5 * time.Second
 	terminationSignalTimeout = time.Second
+	postKillReleaseMargin    = time.Second
 )
 
 func terminateAndWait(
@@ -1253,7 +1254,11 @@ func terminateAndWait(
 			return errors.Join(termErr, killErr)
 		}
 	}
-	if err, done := watchResult(grace); done {
+	// After KILL, payload grace is no longer the relevant bound. Watch is
+	// waiting for the helper to delete the exited task, seal logger pipes, and
+	// publish terminal evidence, so give that fixed release contract its own
+	// margin instead of serializing a second copy of the TERM grace.
+	if err, done := watchResult(ocihelper.DefaultTaskReleaseTimeout + postKillReleaseMargin); done {
 		return err
 	}
 	return errors.New("OCI helper Watch did not confirm exit after KILL")
@@ -1575,7 +1580,7 @@ func (adapter *Adapter) reapFromMatchingSweep(authority workloadrunner.AttemptAu
 		return workloadrunner.ReapReceipt{}, false
 	}
 	receipt, ok := source.SweepReceipt()
-	if !ok || receipt.SweepEpoch == "" || receipt.HelperSession.HelperInstanceID == "" || receipt.HelperSession.SessionGeneration == 0 || !ocihelper.InventoryEmpty(receipt.VerifiedInventory) {
+	if !ok || receipt.SweepEpoch == "" || receipt.HelperSession.HelperInstanceID == "" || receipt.HelperSession.SessionGeneration == 0 || !receipt.VerifiedAbsent {
 		return workloadrunner.ReapReceipt{}, false
 	}
 	found := false
@@ -1627,7 +1632,7 @@ func (adapter *Adapter) reapFromReplacementSweep(authority workloadrunner.Attemp
 	if previous.epoch == "" || previous.helper.HelperInstanceID == "" || previous.helper.SessionGeneration == 0 ||
 		receipt.SweepEpoch == "" || receipt.SweepEpoch == previous.epoch || receipt.HelperSession == previous.helper ||
 		receipt.HelperSession.HelperInstanceID == "" || receipt.HelperSession.SessionGeneration == 0 ||
-		!resourceInventoryEmpty(receipt.VerifiedInventory) {
+		!receipt.VerifiedAbsent {
 		return workloadrunner.ReapReceipt{}, false
 	}
 	key := runtimeSweepEvidenceKey{epoch: receipt.SweepEpoch, helper: receipt.HelperSession, authority: authority}

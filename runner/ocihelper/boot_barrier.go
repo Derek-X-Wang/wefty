@@ -148,14 +148,15 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("verify OCI runtime namespace: %w", err)
 	}
-	if !verification.Absent || !InventoryEmpty(verification.Inventory) {
-		return errors.New("verify OCI runtime namespace: residue remains after sweep")
+	if !verification.Absent {
+		return fmt.Errorf("verify OCI runtime namespace: residue remains after sweep: %+v", verification.Inventory)
 	}
 	receipt := VerifiedSweepReceipt{
 		SweepEpoch:            sweep.SweepEpoch,
 		HelperSession:         HelperSession{HelperInstanceID: handshake.HelperInstanceID, SessionGeneration: handshake.SessionGeneration},
 		PriorBootSessionsSeen: slices.Clone(sweep.PriorBootSessionsSeen),
 		SweptInventory:        cloneResourceInventory(sweep.Inventory),
+		VerifiedAbsent:        verification.Absent,
 		VerifiedInventory:     cloneResourceInventory(verification.Inventory),
 		Attempts:              slices.Clone(sweep.Attempts),
 	}

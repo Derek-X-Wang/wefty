@@ -661,7 +661,18 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 	if err == nil {
 		return false
 	}
-	if err.Code == CodeSessionStale || err.Code == CodeEngineFailure {
+	if err.Code == CodeSessionStale {
+		return true
+	}
+	if err.Code == CodeEngineFailure {
+		// Delete is independently bounded and followed by attempt-scoped
+		// verification. Cancellation or deadline expiry here is failed cleanup
+		// for this attempt, not proof that the helper session or namespace
+		// authority disappeared.
+		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodDelete &&
+			(err.EngineFailure.Reason == EngineFailureDeadlineExceeded || err.EngineFailure.Reason == EngineFailureCanceled) {
+			return false
+		}
 		return true
 	}
 	return err.ImageFailure != nil && err.ImageFailure.Kind == ImageFailureEngineLoss

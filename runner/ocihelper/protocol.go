@@ -94,13 +94,55 @@ const (
 	CodeSweepRequired        ErrorCode = "sweep_required"
 )
 
-// RPCError is safe to cross the private protocol. Engine detail remains local.
+// RPCError is safe to cross the private protocol. Raw engine detail remains local.
 type RPCError struct {
 	Code          ErrorCode          `json:"code"`
 	Message       string             `json:"message"`
 	ImageFailure  *ImageFailureFact  `json:"image_failure,omitempty"`
+	EngineFailure *EngineFailureFact `json:"engine_failure,omitempty"`
 	MemoryFailure *MemoryFailureFact `json:"memory_failure,omitempty"`
 	DiskFailure   *DiskFailureFact   `json:"disk_failure,omitempty"`
+}
+
+// EngineFailureFact is bounded mechanics evidence for a failed helper engine
+// operation. It deliberately carries no containerd type, host path, or raw
+// privileged error text.
+type EngineFailureFact struct {
+	Operation Method              `json:"operation"`
+	Reason    EngineFailureReason `json:"reason"`
+}
+
+// EngineFailureReason is the closed, sanitized mechanics vocabulary allowed
+// to cross the helper boundary for an engine failure.
+type EngineFailureReason string
+
+const (
+	EngineFailureDeadlineExceeded EngineFailureReason = "deadline_exceeded"
+	EngineFailureCanceled         EngineFailureReason = "canceled"
+	EngineFailurePermissionDenied EngineFailureReason = "permission_denied"
+	EngineFailureOperationFailed  EngineFailureReason = "operation_failed"
+)
+
+func (reason EngineFailureReason) valid() bool {
+	switch reason {
+	case EngineFailureDeadlineExceeded, EngineFailureCanceled, EngineFailurePermissionDenied, EngineFailureOperationFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func (reason *EngineFailureReason) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	decoded := EngineFailureReason(value)
+	if !decoded.valid() {
+		return fmt.Errorf("unknown engine failure reason %q", value)
+	}
+	*reason = decoded
+	return nil
 }
 
 type MemoryFailureFact struct {
@@ -158,6 +200,9 @@ const (
 func (err *RPCError) Error() string {
 	if err == nil {
 		return ""
+	}
+	if err.EngineFailure != nil {
+		return fmt.Sprintf("oci helper %s: %s (operation=%s reason=%s)", err.Code, err.Message, err.EngineFailure.Operation, err.EngineFailure.Reason)
 	}
 	return fmt.Sprintf("oci helper %s: %s", err.Code, err.Message)
 }
@@ -1233,6 +1278,7 @@ type VerifiedSweepReceipt struct {
 	HelperSession         HelperSession           `json:"helper_session"`
 	PriorBootSessionsSeen []string                `json:"prior_boot_sessions_seen"`
 	SweptInventory        ResourceInventory       `json:"swept_inventory"`
+	VerifiedAbsent        bool                    `json:"verified_absent"`
 	VerifiedInventory     ResourceInventory       `json:"verified_inventory"`
 	Attempts              []SweptAttemptAuthority `json:"attempts"`
 }

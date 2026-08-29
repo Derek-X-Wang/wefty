@@ -243,14 +243,20 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		result, err := lifecycle.runWorkloadContexts(executionContext, finalization, claim, &reapEvidence, func(unlock func()) {
 			handoffUnlock = unlock
 		})
-		var durabilityErr error
-		if lifecycle.dependencies.outbox != nil {
-			durabilityErr = lifecycle.dependencies.outbox.storeCompletion(
-				context.WithoutCancel(attemptContext), attemptID, toL1Result(result), lifecycle.dependencies.clock.Now(), toL1QuiescenceEvidence(reapEvidence),
-			)
-		}
-		completed <- runOutcome{result: result, reapEvidence: reapEvidence, err: err, durabilityErr: durabilityErr}
+		completed <- runOutcome{result: result, reapEvidence: reapEvidence, err: err}
 	}()
+	persistCompletion := func(outcome *runOutcome) error {
+		if lifecycle.dependencies.outbox == nil || outcome.durabilityErr != nil {
+			return outcome.durabilityErr
+		}
+		outcome.durabilityErr = lifecycle.dependencies.outbox.storeCompletion(
+			context.WithoutCancel(attemptContext), attemptID, toL1Result(outcome.result), lifecycle.dependencies.clock.Now(), toL1QuiescenceEvidence(outcome.reapEvidence),
+		)
+		return outcome.durabilityErr
+	}
+	withholdOCIIntentCompletion := func() bool {
+		return claim.Job.Spec.Class == contract.JobClassService && errors.Is(context.Cause(attemptContext), errOCIIntentDisabled)
+	}
 
 	var outcome runOutcome
 	select {
@@ -272,6 +278,17 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 		outcome := <-completed
 		<-renewalDone
+		if withholdOCIIntentCompletion() {
+			// The stop command has already joined the runtime reap. Do not race
+			// that node-local intent with either a durable or live L1 completion:
+			// the lease must expire back to the retained service binding without
+			// consuming restart budget. One-shots still publish their genuine
+			// terminal result and finish any handoff or volume finalization.
+			return errorDestinationUnclassified, nil
+		}
+		if err := persistCompletion(&outcome); err != nil {
+			return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
+		}
 		if errors.Is(cause, errServiceRemovalRequested) {
 			// The removal controller persists its local removing record before
 			// canceling this context and waits here for the guardian's positive
@@ -279,7 +296,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			return errorDestinationUnclassified, nil
 		}
 		result := outcome.result
-		if result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
+		if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
 			result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
 		}
 		request := l1.CompletionRequest{
@@ -292,6 +309,11 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		if failure.err != nil && protocolErrorCode(failure.err) != contract.ErrorLeaseExpired {
 			return failure.destination, fmt.Errorf("agent: shutdown completion: %w", failure.err)
 		}
+		if failure.err == nil {
+			if destination, err := lifecycle.finishCompletedAttempt(ctx, claim, result, outcome.err); err != nil {
+				return destination, err
+			}
+		}
 		return errorDestinationUnclassified, ctx.Err()
 	case failure := <-renewalErrors:
 		if errors.Is(failure.err, errAttemptDirectiveStop) || errors.Is(failure.err, errAttemptDirectiveRestart) {
@@ -300,8 +322,11 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			cancelAttempt(failure.err)
 			outcome := <-completed
 			<-renewalDone
+			if err := persistCompletion(&outcome); err != nil {
+				return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
+			}
 			result := outcome.result
-			if result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
+			if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
 				result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
 			}
 			request := l1.CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: toL1Result(result), RuntimeQuiescenceEvidence: toL1QuiescenceEvidence(outcome.reapEvidence)}
@@ -321,18 +346,44 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		// which classifies as transient and retries indefinitely. The events
 		// stay durable in the spool either way.
 		finalization.stop()
-		<-completed
+		outcome := <-completed
 		<-renewalDone
+		if err := persistCompletion(&outcome); err != nil {
+			return errorDestinationUnclassified, errors.Join(fmt.Errorf("agent: renew lease: %w", failure.err), fmt.Errorf("agent: persist durable completion: %w", err))
+		}
 		return failure.destination, fmt.Errorf("agent: renew lease: %w", failure.err)
 	case err := <-watch.Failures():
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, err)
 		cancelAttempt(err)
 		finalization.stop()
-		<-completed
+		outcome := <-completed
 		<-renewalDone
+		if durabilityErr := persistCompletion(&outcome); durabilityErr != nil {
+			return errorDestinationAttemptAuthority, errors.Join(fmt.Errorf("agent: authority watchdog: %w", err), fmt.Errorf("agent: persist durable completion: %w", durabilityErr))
+		}
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", err)
 	case outcome = <-completed:
 		cancelExecution()
+	}
+	if withholdOCIIntentCompletion() {
+		// This is the ordering where terminal outcome won the select while the
+		// service-stop cancellation was already observable. Withhold the spool
+		// record as well as the live completion so restart replay cannot consume
+		// the retained binding's lease or restart budget.
+		<-renewalDone
+		return errorDestinationUnclassified, nil
+	}
+	if err := persistCompletion(&outcome); err != nil {
+		return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
+	}
+	if withholdOCIIntentCompletion() {
+		if lifecycle.dependencies.outbox != nil {
+			if err := lifecycle.dependencies.outbox.suppressCompletion(context.WithoutCancel(attemptContext), attemptID); err != nil {
+				return errorDestinationUnclassified, err
+			}
+		}
+		<-renewalDone
+		return errorDestinationUnclassified, nil
 	}
 	var routed *routedDestinationError
 	if errors.As(outcome.err, &routed) && routed.destination != errorDestinationUnclassified {
@@ -347,20 +398,8 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", cause)
 	}
 	lifecycle.dependencies.observer.setAttempt(attemptID, AttemptFinalizing, outcome.err)
-	if outcome.durabilityErr != nil {
-		return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", outcome.durabilityErr)
-	}
-
 	if outcome.err != nil {
 		lifecycle.log("attempt %s execution: %v", claim.Lease.AttemptID, outcome.err)
-	}
-	if cause := context.Cause(attemptContext); errors.Is(cause, errOCIIntentDisabled) {
-		// Node-local OCI stop is not a workload failure or a service restart.
-		// Runtime reap has completed above; withholding completion lets the lease
-		// expire back to the existing binding without consuming restart budget,
-		// changing the pinned digest, or latching the service failed.
-		<-renewalDone
-		return errorDestinationUnclassified, nil
 	}
 	request := l1.CompletionRequest{
 		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
@@ -368,7 +407,8 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	}
 	completionDone := make(chan destinationError, 1)
 	completionContext := attemptContext
-	if cause := context.Cause(attemptContext); errors.Is(cause, errAttemptDirectiveStop) || errors.Is(cause, errAttemptDirectiveRestart) {
+	if cause := context.Cause(attemptContext); errors.Is(cause, errAttemptDirectiveStop) || errors.Is(cause, errAttemptDirectiveRestart) ||
+		(errors.Is(cause, errOCIIntentDisabled) && claim.Job.Spec.Class != contract.JobClassService) {
 		completionContext = context.WithoutCancel(attemptContext)
 	}
 	go func() { completionDone <- lifecycle.completeWithRetry(completionContext, claim, request) }()
@@ -404,7 +444,11 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	if completionFailure.err != nil {
 		return completionFailure.destination, fmt.Errorf("agent: complete attempt: %w", completionFailure.err)
 	}
-	succeeded := outcome.err == nil && outcome.result.ExitCode != nil && *outcome.result.ExitCode == 0
+	return lifecycle.finishCompletedAttempt(ctx, claim, outcome.result, outcome.err)
+}
+
+func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, claim l1.Claim, result contract.ProcessResult, runErr error) (errorDestination, error) {
+	succeeded := runErr == nil && result.ExitCode != nil && *result.ExitCode == 0
 	if lifecycle.dependencies.handoffs != nil && usesAgentHandoffLifecycle(claim.Job.Spec) {
 		if err := lifecycle.dependencies.handoffs.finish(claim.Job.Spec, lifecycle.dependencies.nodeID, succeeded); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: finish handoff lifecycle: %w", err)

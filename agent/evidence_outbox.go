@@ -21,6 +21,9 @@ type evidenceOutbox struct {
 	batchSize     int
 	flushInterval time.Duration
 	retryInterval time.Duration
+	// completionStored is a test seam for ordering cancellation against the
+	// durable commit edge. Production construction leaves it nil.
+	completionStored func()
 
 	recoveryMu     sync.Mutex
 	recoveryCancel context.CancelFunc
@@ -47,11 +50,21 @@ func (outbox *evidenceOutbox) ensureAttempt(ctx context.Context, claim l1.Claim)
 }
 
 func (outbox *evidenceOutbox) storeCompletion(ctx context.Context, attemptID string, result l1.ProcessResult, finishedAt time.Time, evidence ...l1.RuntimeQuiescenceEvidence) error {
-	return outbox.spool.storeCompletion(ctx, attemptID, result, finishedAt, evidence...)
+	if err := outbox.spool.storeCompletion(ctx, attemptID, result, finishedAt, evidence...); err != nil {
+		return err
+	}
+	if outbox.completionStored != nil {
+		outbox.completionStored()
+	}
+	return nil
 }
 
 func (outbox *evidenceOutbox) completionDelivered(ctx context.Context, attemptID string) error {
 	return outbox.spool.completionDelivered(ctx, attemptID)
+}
+
+func (outbox *evidenceOutbox) suppressCompletion(ctx context.Context, attemptID string) error {
+	return outbox.spool.suppressCompletion(ctx, attemptID)
 }
 
 func (outbox *evidenceOutbox) beginRemoval(ctx context.Context, removal localRemoval) error {

@@ -754,21 +754,32 @@ test "$WEFTY_SERVICE_DIR" = "/wefty/service" || exit 91
 mkdir -p /tmp/wefty-www/cgi-bin
 printf 'healthy\n' >/tmp/wefty-www/healthz
 printf '#!/bin/sh\nprintf "Content-Type: application/octet-stream\\r\\n\\r\\n"\ndd bs=1 count="${CONTENT_LENGTH:-0}" 2>/dev/null\n' >/tmp/wefty-www/cgi-bin/echo
-printf '#!/bin/sh\ntouch /tmp/wefty-listener-restart\nprintf "Status: 204 No Content\\r\\n\\r\\n"\n' >/tmp/wefty-www/cgi-bin/restart-listener
+printf '#!/bin/sh\ntouch /tmp/wefty-listener-restart\nprintf "Status: 204 No Content\\r\\n\\r\\n"\nkill "$(cat /tmp/wefty-httpd.pid)" 2>/dev/null || true\n' >/tmp/wefty-www/cgi-bin/restart-listener
 chmod 0755 /tmp/wefty-www/cgi-bin/echo
 chmod 0755 /tmp/wefty-www/cgi-bin/restart-listener
+server=
+terminate() {
+  trap - TERM
+  if test -n "$server"; then
+    kill "$server" 2>/dev/null || true
+    wait "$server" 2>/dev/null
+    status=$?
+    exit "$status"
+  fi
+  exit 143
+}
+trap terminate TERM
 while :; do
   /bin/httpd -f -p "127.0.0.1:$WEFTY_SERVICE_PORT" -h /tmp/wefty-www &
   server=$!
-  while kill -0 "$server" 2>/dev/null && test ! -f /tmp/wefty-listener-restart; do sleep 0.05; done
+  printf '%s\n' "$server" >/tmp/wefty-httpd.pid
+  wait "$server"
+  status=$?
   if test -f /tmp/wefty-listener-restart; then
-    kill "$server" 2>/dev/null || true
-    wait "$server" 2>/dev/null || true
     sleep 1
     rm -f /tmp/wefty-listener-restart
   else
-    wait "$server"
-    exit $?
+    exit "$status"
   fi
 done
 `

@@ -275,8 +275,8 @@ func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("startup verify OCI runtime namespace: %w", err)
 	}
-	if !verification.Absent || !InventoryEmpty(verification.Inventory) {
-		return errors.New("startup verify OCI runtime namespace: residue remains after sweep")
+	if !verification.Absent {
+		return fmt.Errorf("startup verify OCI runtime namespace: residue remains after sweep: %+v", verification.Inventory)
 	}
 	server.sessionMu.Lock()
 	server.startupSweep = &sweep
@@ -353,7 +353,7 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 	}
 	capability, err := randomCapability()
 	if err != nil {
-		_ = writeFailure(wire, CodeEngineFailure, "session capability generation failed")
+		_ = writeRPCError(wire, engineFailureRPC(MethodAcquireSession, "session capability generation failed", EngineFailureOperationFailed))
 		return
 	}
 	now := server.config.Clock.Now()
@@ -681,27 +681,27 @@ func endpointAllocationMatches(requested []string, allocated map[string]uint16) 
 
 func (session *serverSession) completeAttempt(request RunRequest, attempt *serverAttempt, response *RunResponse) *RPCError {
 	if !response.Started {
-		return &RPCError{Code: CodeEngineFailure, Message: "engine Run returned without authoritative Started evidence"}
+		return engineFailureRPC(MethodRun, "engine Run returned without authoritative Started evidence", EngineFailureOperationFailed)
 	}
 	if response.StartedAt.IsZero() {
-		return &RPCError{Code: CodeEngineFailure, Message: "engine Run returned without the authoritative Started timestamp"}
+		return engineFailureRPC(MethodRun, "engine Run returned without the authoritative Started timestamp", EngineFailureOperationFailed)
 	}
 	response.StartedAt = response.StartedAt.UTC().Round(0)
 	if response.HostBridgeReady && !request.EnableHostBridgeFallback {
-		return &RPCError{Code: CodeEngineFailure, Message: "engine enabled an unrequested host bridge fallback"}
+		return engineFailureRPC(MethodRun, "engine enabled an unrequested host bridge fallback", EngineFailureOperationFailed)
 	}
 	if response.HostBridgeReady != (response.HostBridgeEndpoint != "") {
-		return &RPCError{Code: CodeEngineFailure, Message: "engine host bridge endpoint evidence is inconsistent"}
+		return engineFailureRPC(MethodRun, "engine host bridge endpoint evidence is inconsistent", EngineFailureOperationFailed)
 	}
 	if !endpointAllocationMatches(request.AllocateEndpoints, response.Endpoints) {
-		return &RPCError{Code: CodeEngineFailure, Message: "engine endpoint allocation did not match the request"}
+		return engineFailureRPC(MethodRun, "engine endpoint allocation did not match the request", EngineFailureOperationFailed)
 	}
 	bridgeCapability := ""
 	var err error
 	if response.HostBridgeReady {
 		bridgeCapability, err = randomCapability()
 		if err != nil {
-			return &RPCError{Code: CodeEngineFailure, Message: "bridge capability generation failed"}
+			return engineFailureRPC(MethodRun, "bridge capability generation failed", EngineFailureOperationFailed)
 		}
 	}
 	session.mu.Lock()
@@ -859,7 +859,7 @@ func (session *serverSession) authorizeDelete(ctx context.Context, authority Att
 			case <-reaped:
 				continue
 			case <-ctx.Done():
-				return nil, false, &RPCError{Code: CodeEngineFailure, Message: "guardian attempt reap was not confirmed"}
+				return nil, false, engineFailureRPC(MethodDelete, "guardian attempt reap was not confirmed", engineFailureReason(ctx.Err()))
 			}
 		}
 		if attempt.state == attemptTombstoned && attempt.guardianReaped && !attempt.guardianDelete {
@@ -924,7 +924,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				timeout = 10 * time.Minute
 			}
 			if err := operation.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-				_ = writeFailure(wire, CodeEngineFailure, "bound OCI archive upload deadline")
+				_ = writeRPCError(wire, engineFailureRPC(MethodEnsureImage, "bound OCI archive upload deadline", EngineFailureOperationFailed))
 				return
 			}
 			if err := writeSuccess(wire, struct{}{}); err != nil {
@@ -956,7 +956,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		response, err := cacheEngine.ReconcileImagePins(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodReleaseImagePin:
 		var body ReleaseImagePinRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -972,7 +972,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		err := cacheEngine.ReleaseImagePin(operation.ctx, body)
-		_ = writeEngineResponse(wire, struct{}{}, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, err)
 	case MethodReleaseAttemptPin:
 		var body ReleaseAttemptImagePinRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -988,7 +988,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		err := cacheEngine.ReleaseAttemptImagePin(operation.ctx, body)
-		_ = writeEngineResponse(wire, struct{}{}, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, err)
 	case MethodImageCacheStatus:
 		var body struct{}
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1000,7 +1000,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		response, err := cacheEngine.ImageCacheStatus(operation.ctx)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodDoctorStatus:
 		var body struct{}
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1088,7 +1088,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			} else if errors.As(err, &imageUnavailable) {
 				_ = writeFailure(wire, CodeImageUnavailable, "pinned local OCI image is unavailable")
 			} else {
-				_ = writeFailure(wire, CodeEngineFailure, "OCI engine operation failed")
+				_ = writeRPCError(wire, engineFailureRPC(MethodRun, "OCI engine operation failed", engineFailureReason(err)))
 			}
 			return
 		}
@@ -1110,7 +1110,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
-		_ = writeEngineResponse(wire, struct{}{}, server.engine.Signal(operation.ctx, body))
+		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, server.engine.Signal(operation.ctx, body))
 	case MethodSetComputerControl:
 		var body SetComputerControlStateRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1131,7 +1131,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
-		_ = writeEngineResponse(wire, struct{}{}, engine.SetComputerControlState(operation.ctx, body))
+		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, engine.SetComputerControlState(operation.ctx, body))
 	case MethodSetComputerToken:
 		var body SetComputerTokenRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1156,7 +1156,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
-		_ = writeEngineResponse(wire, struct{}{}, engine.SetComputerToken(operation.ctx, body))
+		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, engine.SetComputerToken(operation.ctx, body))
 	case MethodWatch:
 		var body WatchRequest
 		if !decodeRequest(wire, request.Body, &body) || !authorizeRequest(wire, session, body.Authority) {
@@ -1177,7 +1177,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				return operation.ctx.Err()
 			}
 		})
-		writeStreamResult(wire, err)
+		writeStreamResult(wire, request.Method, err)
 	case MethodDelete:
 		var body DeleteRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1195,7 +1195,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		} else if err == nil && response.Deleted {
 			err = session.reapAttempt(attempt, false, false)
 		}
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodDeleteVolume:
 		var body DeleteManagedVolumeRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1228,7 +1228,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.DeleteManagedVolume(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodInventoryRemoval:
 		var body InventoryRemovalRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1250,7 +1250,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			response.RemovalGeneration = body.Removal.RemovalGeneration
 			response.HelperSession = session.helper
 		}
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodAttestRemoval:
 		var body AttestRemovalRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1272,7 +1272,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			response.RemovalGeneration = body.RemovalGeneration
 			response.HelperSession = session.helper
 		}
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodResetStorage:
 		var body ResetComputerStorageRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1293,7 +1293,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.ResetComputerStorage(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodGrowStorage:
 		var body GrowComputerStorageRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1315,7 +1315,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.GrowComputerStorage(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodPreflightReimage:
 		var body PreflightComputerReimageRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1338,7 +1338,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.PreflightComputerReimage(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodCreateBackup:
 		var body CreateComputerBackupRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1355,7 +1355,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.CreateComputerBackup(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodDeleteBackup:
 		var body DeleteComputerBackupCopyRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1372,7 +1372,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.DeleteComputerBackupCopy(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodCopyStorage:
 		var body CopyComputerStorageRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1399,7 +1399,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.CopyComputerStorage(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodExportCustody:
 		var body ExportComputerCustodyRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1421,7 +1421,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.ExportComputerCustody(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodVerify:
 		var body VerifyRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1452,7 +1452,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if body.Scope == VerifyNamespace {
 			server.createSweep.Unlock()
 		}
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodSweep:
 		var body SweepRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1496,7 +1496,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			session.mu.Unlock()
 		}
 		server.createSweep.Unlock()
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodDialAttemptPort:
 		var body DialAttemptPortRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1620,13 +1620,13 @@ func decodeRequest(connection *framedConn, raw json.RawMessage, target any) bool
 	return true
 }
 
-func writeEngineResponse(connection *framedConn, response any, err error) error {
+func writeEngineResponseWithMethod(connection *framedConn, method Method, response any, err error) error {
 	if err != nil {
 		var serviceDataRejection *ServiceDataRejectionError
 		if errors.As(err, &serviceDataRejection) {
 			return writeFailure(connection, CodeOCISpecRejected, serviceDataRejection.Error())
 		}
-		return writeFailure(connection, CodeEngineFailure, "OCI engine operation failed")
+		return writeRPCError(connection, engineFailureRPC(method, "OCI engine operation failed", engineFailureReason(err)))
 	}
 	return writeSuccess(connection, response)
 }
@@ -1638,12 +1638,29 @@ func writeDiagnosticResponse(connection *framedConn, response any, err error) er
 	return writeSuccess(connection, response)
 }
 
-func writeStreamResult(connection *framedConn, err error) {
+func writeStreamResult(connection *framedConn, method Method, err error) {
 	if err != nil {
-		_ = writeFailure(connection, CodeEngineFailure, "OCI engine operation failed")
+		_ = writeRPCError(connection, engineFailureRPC(method, "OCI engine operation failed", engineFailureReason(err)))
 		return
 	}
 	_ = connection.write(frame{Version: ProtocolVersion, OK: true})
+}
+
+func engineFailureRPC(method Method, message string, reason EngineFailureReason) *RPCError {
+	return &RPCError{Code: CodeEngineFailure, Message: message, EngineFailure: &EngineFailureFact{Operation: method, Reason: reason}}
+}
+
+func engineFailureReason(err error) EngineFailureReason {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return EngineFailureDeadlineExceeded
+	case errors.Is(err, context.Canceled):
+		return EngineFailureCanceled
+	case errors.Is(err, os.ErrPermission):
+		return EngineFailurePermissionDenied
+	default:
+		return EngineFailureOperationFailed
+	}
 }
 
 func writeImageStreamResult(connection *framedConn, err error) {

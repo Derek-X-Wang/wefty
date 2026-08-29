@@ -19,8 +19,282 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
+
+func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+		"intent-node": {Tags: []string{"intent-stop"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	}, 500*time.Millisecond)
+	defer stopServer()
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "intent-stop-cancel-first",
+		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
+		RoutingTags: []string{"intent-stop"}, RuntimeHandler: "io.containerd.runc.v2",
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/intent-stop:v1", Digest: &digest},
+			Argv:  []string{"/payload"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newIntentStopRuntime()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "intent-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "intent-node", BootSessionID: "intent-boot", Version: "test",
+		Capabilities: map[string]bool{
+			"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
+		},
+		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+			return CapabilityProbeResult{Capabilities: map[string]bool{
+				"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
+			}}, nil
+		}),
+		OCIBootBarrier:       readyOCIBootBarrier{},
+		WorkloadRuntimes:     map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
+		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
+		Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	runContext, cancelRun := context.WithCancel(t.Context())
+	defer cancelRun()
+	defer runtime.release()
+	runDone := make(chan error, 1)
+	go func() { runDone <- nodeAgent.Run(runContext) }()
+	var attemptID string
+	select {
+	case attemptID = <-runtime.started:
+	case <-time.After(5 * time.Second):
+		current, _ := store.GetJob(t.Context(), job.JobID)
+		nodes, _ := store.ListNodes(t.Context())
+		t.Fatalf("intent-stop OCI service did not start: job=%+v nodes=%+v agent=%+v", current, nodes, nodeAgent.Status())
+	}
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- nodeAgent.StopOCIRuntime(t.Context()) }()
+	runtime.waitCanceled(t)
+	// Cancellation is now the only ready lifecycle branch. Delay terminal
+	// publication until it has won, reproducing the native payload ordering.
+	runtime.release()
+	if err := <-stopDone; err != nil {
+		cancelRun()
+		t.Fatal(err)
+	}
+	time.Sleep(600 * time.Millisecond)
+	reconciliation, err := store.Reconcile(t.Context())
+	if err != nil || reconciliation.ExpiredAttempts != 1 {
+		cancelRun()
+		t.Fatalf("intent-stop reconciliation=%+v err=%v", reconciliation, err)
+	}
+	queued, err := store.GetJob(t.Context(), job.JobID)
+	if err != nil || queued.State != contract.JobQueued || queued.CurrentAttemptID != attemptID ||
+		queued.BoundNodeID != "intent-node" || queued.RestartStreak != 0 ||
+		runtime.starts.Load() != 1 {
+		cancelRun()
+		t.Fatalf("intent-stop service=%+v starts=%d err=%v", queued, runtime.starts.Load(), err)
+	}
+	cancelRun()
+	if err := <-runDone; err != nil {
+		t.Fatalf("agent shutdown: %v", err)
+	}
+}
+
+func TestOCIIntentStopOutcomeWinsSuppressesRestartReplay(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+		"intent-outcome-node": {Tags: []string{"intent-outcome"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	}, 2*time.Second)
+	defer stopServer()
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "intent-stop-outcome-first",
+		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
+		RoutingTags: []string{"intent-outcome"}, RuntimeHandler: "io.containerd.runc.v2",
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/intent-stop:v1", Digest: &digest},
+			Argv:  []string{"/payload"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoolDirectory := t.TempDir()
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newOutcomeFirstIntentRuntime()
+	newAgent := func(bootSessionID string, workload WorkloadRuntime) *Agent {
+		agentFabric := network.NewFabric(fabric.Identity{NodeID: "intent-outcome-agent-" + bootSessionID, Tags: []string{l1.DefaultAgentPrincipalTag}})
+		nodeAgent, err := New(Config{
+			Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+			NodeID: "intent-outcome-node", BootSessionID: bootSessionID, Version: "test",
+			Capabilities: map[string]bool{
+				"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
+			},
+			CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+				return CapabilityProbeResult{Capabilities: map[string]bool{
+					"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
+				}}, nil
+			}),
+			OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: workload},
+			ManagedRootDirectory: managedRoot, LogSpoolDirectory: spoolDirectory, MaxServiceSlots: 1,
+			HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
+			Logf: t.Logf,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return nodeAgent
+	}
+
+	nodeAgent := newAgent("intent-outcome-boot", runtime)
+	runContext, cancelRun := context.WithCancel(t.Context())
+	runDone := make(chan error, 1)
+	go func() { runDone <- nodeAgent.Run(runContext) }()
+	var attemptID string
+	select {
+	case attemptID = <-runtime.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("outcome-first OCI service did not start")
+	}
+	stopDone := make(chan error, 1)
+	nodeAgent.outbox.completionStored = func() {
+		go func() { stopDone <- nodeAgent.StopOCIRuntime(t.Context()) }()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if nodeAgent.CapabilitySnapshot().ReasonCode == contract.CapabilityReasonOCIIntentDisabled {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Error("OCI intent stop did not cancel the outcome-selected resident")
+	}
+	runtime.complete()
+	if err := <-stopDone; err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, present, err := nodeAgent.outbox.spool.completionWithEvidence(t.Context(), attemptID)
+	if err != nil || present {
+		t.Fatalf("intent-stop outcome left replayable completion present=%t err=%v", present, err)
+	}
+	stillRunning, err := store.GetJob(t.Context(), job.JobID)
+	if err != nil || stillRunning.State != contract.JobClaimed || stillRunning.CurrentAttemptID != attemptID ||
+		stillRunning.BoundNodeID != "intent-outcome-node" || stillRunning.RestartStreak != 0 {
+		t.Fatalf("outcome-first intent stop changed service authority: job=%+v err=%v", stillRunning, err)
+	}
+	cancelRun()
+	if err := <-runDone; err != nil {
+		t.Fatalf("first agent shutdown: %v", err)
+	}
+	nodeAgent.Close()
+
+	restartedRuntime := newIntentStopRuntime()
+	restarted := newAgent("intent-outcome-boot", restartedRuntime)
+	restartContext, cancelRestart := context.WithCancel(t.Context())
+	restartDone := make(chan error, 1)
+	go func() { restartDone <- restarted.Run(restartContext) }()
+	time.Sleep(150 * time.Millisecond)
+	afterReplay, err := store.GetJob(t.Context(), job.JobID)
+	if err != nil || afterReplay.State != contract.JobClaimed || afterReplay.CurrentAttemptID != attemptID ||
+		afterReplay.BoundNodeID != "intent-outcome-node" || afterReplay.RestartStreak != 0 || restartedRuntime.starts.Load() != 0 {
+		t.Fatalf("restart replay consumed retained service authority: job=%+v starts=%d err=%v", afterReplay, restartedRuntime.starts.Load(), err)
+	}
+	cancelRestart()
+	if err := <-restartDone; err != nil {
+		t.Fatalf("restarted agent shutdown: %v", err)
+	}
+	restarted.Close()
+}
+
+func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+		"intent-oneshot-node": {Tags: []string{"intent-oneshot"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	}, 2*time.Second)
+	defer stopServer()
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "intent-stop-oneshot",
+		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+		RoutingTags: []string{"intent-oneshot"}, RuntimeHandler: "io.containerd.runc.v2",
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/intent-stop:v1", Digest: &digest}, Argv: []string{"/payload"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newOneShotIntentRuntime()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "intent-oneshot-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "intent-oneshot-node", BootSessionID: "intent-oneshot-boot", Version: "test",
+		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true},
+		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true}}, nil
+		}),
+		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxOneshotSlots: 1,
+		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
+		Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	completionStored := make(chan struct{})
+	var completionStoredOnce sync.Once
+	nodeAgent.outbox.completionStored = func() { completionStoredOnce.Do(func() { close(completionStored) }) }
+	runContext, cancelRun := context.WithCancel(t.Context())
+	runDone := make(chan error, 1)
+	go func() { runDone <- nodeAgent.Run(runContext) }()
+	select {
+	case <-runtime.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("intent-stop OCI one-shot did not start")
+	}
+	if err := nodeAgent.StopOCIRuntime(t.Context()); err != nil {
+		cancelRun()
+		t.Fatal(err)
+	}
+	select {
+	case <-completionStored:
+	case <-time.After(time.Second):
+		t.Fatal("intent-stop one-shot never persisted its genuine completion")
+	}
+	select {
+	case runErr := <-runDone:
+		t.Fatalf("intent-stop one-shot agent exited before L1 completion: %v", runErr)
+	default:
+	}
+	completed, err := waitForFailureJobState(store, job.JobID, contract.JobSucceeded, 5*time.Second)
+	if err != nil || completed.State != contract.JobSucceeded || runtime.finalized.Load() != 1 {
+		cancelRun()
+		attempts, attemptsErr := store.ListJobAttempts(t.Context(), job.JobID)
+		t.Fatalf("intent-stop one-shot completion=%+v attempts=%+v attempts_err=%v finalized=%d err=%v", completed, attempts, attemptsErr, runtime.finalized.Load(), err)
+	}
+	cancelRun()
+	if err := <-runDone; err != nil {
+		t.Fatalf("agent shutdown: %v", err)
+	}
+}
 
 func TestReapRefusalCannotCompleteExitZeroAttemptSuccessfully(t *testing.T) {
 	network := plain.NewNetwork()
@@ -1342,6 +1616,118 @@ type finalizationAnchorRunner struct {
 	started chan string
 	killed  chan struct{}
 	once    sync.Once
+}
+
+type intentStopRuntime struct {
+	started  chan string
+	canceled chan struct{}
+	releaseC chan struct{}
+	once     sync.Once
+	starts   atomic.Int32
+}
+
+type outcomeFirstIntentRuntime struct {
+	*intentStopRuntime
+	finish chan struct{}
+}
+
+type oneShotIntentRuntime struct {
+	*intentStopRuntime
+	finalized atomic.Int32
+}
+
+func newOneShotIntentRuntime() *oneShotIntentRuntime {
+	return &oneShotIntentRuntime{intentStopRuntime: newIntentStopRuntime()}
+}
+
+func (runtime *oneShotIntentRuntime) Run(ctx context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	runtime.starts.Add(1)
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	observation := workloadrunner.OCIImageObservation{
+		SubmittedReference: request.Execution.OCI.Image.Reference,
+		TopLevelDigest:     digest, TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json",
+		PlatformManifestDigest: digest, PlatformOS: "linux", PlatformArchitecture: "amd64",
+		RuntimeHandler: "io.containerd.runc.v2", Snapshotter: "overlayfs",
+	}
+	if err := request.OCIImageResolved(ctx, observation); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	if err := request.OCIStarted(ctx, observation); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	runtime.started <- request.Authority.AttemptID
+	<-ctx.Done()
+	exitCode := 0
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+}
+
+func (runtime *oneShotIntentRuntime) FinalizeManagedVolumes(context.Context, workloadrunner.ManagedVolumeFinalizationRequest) error {
+	runtime.finalized.Add(1)
+	return nil
+}
+
+func newOutcomeFirstIntentRuntime() *outcomeFirstIntentRuntime {
+	return &outcomeFirstIntentRuntime{intentStopRuntime: newIntentStopRuntime(), finish: make(chan struct{})}
+}
+
+func (runtime *outcomeFirstIntentRuntime) Run(_ context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	runtime.starts.Add(1)
+	runtime.started <- request.Authority.AttemptID
+	<-runtime.finish
+	exitCode := 0
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+}
+
+func (runtime *outcomeFirstIntentRuntime) complete() {
+	runtime.once.Do(func() { close(runtime.finish) })
+}
+
+func newIntentStopRuntime() *intentStopRuntime {
+	return &intentStopRuntime{started: make(chan string, 1), canceled: make(chan struct{}), releaseC: make(chan struct{})}
+}
+
+func (runtime *intentStopRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (runtime *intentStopRuntime) Run(ctx context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	runtime.starts.Add(1)
+	runtime.started <- request.Authority.AttemptID
+	<-ctx.Done()
+	close(runtime.canceled)
+	<-runtime.releaseC
+	return workloadrunner.Result{Outcome: contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}}, context.Cause(ctx)
+}
+
+func (*intentStopRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+}
+
+func (*intentStopRuntime) RemovalResourceManifest(request workloadrunner.Request) (workloadrunner.RuntimeResourceManifest, error) {
+	suffix := request.Authority.AttemptID
+	return workloadrunner.RuntimeResourceManifest{
+		Version: 1, RuntimeKind: contract.JobKindOCI,
+		NodeID: request.Authority.NodeID, BootSessionID: request.Authority.BootSessionID,
+		JobID: request.Authority.JobID, AttemptID: suffix, FencingToken: request.Authority.FencingToken,
+		WorkloadClass: request.Authority.WorkloadClass, RemovalGeneration: request.Authority.RemovalGeneration,
+		LeaseID: "lease-" + suffix, TaskID: "task-" + suffix, ContainerID: "container-" + suffix,
+		SnapshotID: "snapshot-" + suffix, ShimID: "shim-" + suffix, CgroupID: "cgroup-" + suffix,
+		LogSegmentDirectory: "logs-" + suffix, ServiceDataVolume: "service-" + request.Authority.JobID,
+		ServiceDataOwnerRecord: "service-" + request.Authority.JobID + ".owner",
+	}, nil
+}
+
+func (runtime *intentStopRuntime) waitCanceled(t *testing.T) {
+	t.Helper()
+	select {
+	case <-runtime.canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("intent-stop OCI service was not canceled")
+	}
+}
+
+func (runtime *intentStopRuntime) release() {
+	runtime.once.Do(func() { close(runtime.releaseC) })
 }
 
 func newFinalizationAnchorRunner() *finalizationAnchorRunner {

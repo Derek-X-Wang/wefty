@@ -3,6 +3,7 @@ package ocihelper
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -355,6 +356,108 @@ func TestAttemptOutsideSessionIsDistinctFromNonLiveAttempt(t *testing.T) {
 	assertRPCCode(t, err, CodeUnauthorizedAttempt)
 }
 
+func TestEngineFailureCarriesBoundedOperationMechanics(t *testing.T) {
+	engine := newFakeEngine()
+	engine.deleteErr = context.DeadlineExceeded
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	authority := testAuthority()
+	if _, err := session.Run(t.Context(), testRunRequest(authority, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = session.Delete(t.Context(), DeleteRequest{Authority: authority})
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeEngineFailure || rpcErr.EngineFailure == nil ||
+		rpcErr.EngineFailure.Operation != MethodDelete || rpcErr.EngineFailure.Reason != EngineFailureDeadlineExceeded {
+		t.Fatalf("Delete engine mechanics = %#v err=%v", rpcErr, err)
+	}
+	if strings.Contains(err.Error(), context.DeadlineExceeded.Error()) ||
+		!strings.Contains(err.Error(), "operation=Delete reason=deadline_exceeded") {
+		t.Fatalf("Delete engine error exposed wrong mechanics: %v", err)
+	}
+	if err := session.flushHeartbeat(t.Context()); err != nil {
+		t.Fatalf("attempt-scoped Delete deadline marked the live helper session lost: %v", err)
+	}
+}
+
+func TestEngineFailureReasonRejectsUnknownWireValue(t *testing.T) {
+	var response frame
+	err := json.Unmarshal([]byte(`{"version":2,"error":{"code":"engine_failure","message":"failed","engine_failure":{"operation":"Delete","reason":"host_specific"}}}`), &response)
+	if err == nil || !strings.Contains(err.Error(), "unknown engine failure reason") {
+		t.Fatalf("unknown engine failure reason decoded as %+v err=%v", response, err)
+	}
+}
+
+func TestDeleteReleasesAttemptAuthorityWhileOwnerHandoffRemainsRetained(t *testing.T) {
+	engine := &retainedHandoffEngine{fakeEngine: newFakeEngine()}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	authority := testAuthority()
+	request := testRunRequest(authority, time.Second)
+	request.Workload.ManagedVolumes = []ManagedVolumeDescriptor{{Kind: ManagedVolumeHandoff, OwnerKey: "live-owner"}}
+	if _, err := session.Run(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := session.Delete(t.Context(), DeleteRequest{Authority: authority})
+	if err != nil || !deleted.Deleted {
+		t.Fatalf("Delete with retained handoff = %+v err=%v", deleted, err)
+	}
+	verification, err := session.Verify(t.Context(), VerifyRequest{Scope: VerifyNamespace})
+	if err != nil || !verification.Absent || !slices.Equal(verification.Inventory.ManagedVolumes, []string{engine.handoffName()}) {
+		t.Fatalf("post-Delete retained handoff verification = %+v err=%v", verification, err)
+	}
+	if _, err := session.Delete(t.Context(), DeleteRequest{Authority: authority}); err == nil {
+		t.Fatal("released attempt authority remained live after positive Delete")
+	}
+	if err := session.flushHeartbeat(t.Context()); err != nil {
+		t.Fatalf("retained handoff ordering marked helper session lost: %v", err)
+	}
+}
+
+func TestRunAndWatchEngineFailuresCarryClosedMechanicsFacts(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runErr = errors.New("privileged host detail")
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	_, err = session.Run(t.Context(), testRunRequest(testAuthority(), time.Second))
+	var runFailure *RPCError
+	if !errors.As(err, &runFailure) || runFailure.EngineFailure == nil ||
+		runFailure.EngineFailure.Operation != MethodRun || runFailure.EngineFailure.Reason != EngineFailureOperationFailed {
+		t.Fatalf("Run engine failure = %+v err=%v", runFailure, err)
+	}
+
+	helperConnection, agentConnection := net.Pipe()
+	go func() {
+		writeStreamResult(newFramedConn(helperConnection), MethodWatch, context.Canceled)
+		_ = helperConnection.Close()
+	}()
+	err = decodeResponse(newFramedConn(agentConnection), nil)
+	_ = agentConnection.Close()
+	var watchFailure *RPCError
+	if !errors.As(err, &watchFailure) || watchFailure.EngineFailure == nil ||
+		watchFailure.EngineFailure.Operation != MethodWatch || watchFailure.EngineFailure.Reason != EngineFailureCanceled {
+		t.Fatalf("Watch engine failure = %+v err=%v", watchFailure, err)
+	}
+}
+
 func TestRemovalAttestationRequiresExactNodeJobGenerationAndResourceInventory(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -518,10 +621,14 @@ func TestBootBarrierRefusesResidueAndNeverExposesSession(t *testing.T) {
 	}
 }
 
-func TestBootBarrierInspectsIndependentNamespaceInventory(t *testing.T) {
+func TestBootBarrierReceiptsRetainedHandoffInventoryWithoutCallingItResidue(t *testing.T) {
 	engine := newFakeEngine()
+	handoff, err := DeterministicHandoffVolumeDirectory("live-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
 	engine.verifyResponses = []VerifyResponse{{Absent: true}, {
-		Absent: true, Inventory: ResourceInventory{Leases: []string{"wefty-lease-unlabelled"}},
+		Absent: true, Inventory: ResourceInventory{ManagedVolumes: []string{handoff}},
 	}}
 	client, stop := startTestServer(t, engine, ServerConfig{})
 	defer stop()
@@ -529,8 +636,12 @@ func TestBootBarrierInspectsIndependentNamespaceInventory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := barrier.Ensure(t.Context()); err == nil {
-		t.Fatal("barrier trusted absent=true despite independently inventoried residue")
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	receipt, ok := barrier.SweepReceipt()
+	if !ok || !receipt.VerifiedAbsent || !slices.Equal(receipt.VerifiedInventory.ManagedVolumes, []string{handoff}) {
+		t.Fatalf("retained handoff verification receipt = %+v, ok=%t", receipt, ok)
 	}
 }
 
@@ -582,7 +693,7 @@ func TestHelperStartupResidueFailsServeBeforeSessionAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = server.Serve(t.Context(), listener)
-	if err == nil || err.Error() != "startup verify OCI runtime namespace: residue remains after sweep" {
+	if err == nil || !strings.Contains(err.Error(), "startup verify OCI runtime namespace: residue remains after sweep:") {
 		t.Fatalf("helper startup error = %v", err)
 	}
 	if got := engine.methods(); !equalStrings(got, []string{"Sweep", "Verify"}) {
@@ -1861,6 +1972,7 @@ type fakeEngine struct {
 	runResponse              RunResponse
 	lastRunRequest           RunRequest
 	runErr                   error
+	deleteErr                error
 	runEntered               chan struct{}
 	releaseRun               chan struct{}
 	sweepEntered             chan struct{}
@@ -2033,6 +2145,42 @@ type crashBoundaryEngine struct {
 	live          map[string]struct{}
 	duplicateRuns int
 	lastAuthority AttemptAuthority
+}
+
+type retainedHandoffEngine struct {
+	*fakeEngine
+	retainedMu sync.Mutex
+	handoff    string
+}
+
+func (engine *retainedHandoffEngine) Run(ctx context.Context, request RunRequest) (RunResponse, error) {
+	response, err := engine.fakeEngine.Run(ctx, request)
+	if err == nil {
+		engine.retainedMu.Lock()
+		engine.handoff = request.Resources.HandoffVolumeDirectory
+		engine.retainedMu.Unlock()
+	}
+	return response, err
+}
+
+func (engine *retainedHandoffEngine) Delete(context.Context, DeleteRequest) (DeleteResponse, error) {
+	engine.record("Delete")
+	return DeleteResponse{Deleted: true}, nil
+}
+
+func (engine *retainedHandoffEngine) Verify(context.Context, VerifyRequest) (VerifyResponse, error) {
+	engine.record("Verify")
+	name := engine.handoffName()
+	if name == "" {
+		return VerifyResponse{Absent: true}, nil
+	}
+	return VerifyResponse{Absent: true, Inventory: ResourceInventory{ManagedVolumes: []string{name}}}, nil
+}
+
+func (engine *retainedHandoffEngine) handoffName() string {
+	engine.retainedMu.Lock()
+	defer engine.retainedMu.Unlock()
+	return engine.handoff
 }
 
 func newCrashBoundaryEngine(crashAfter int) *crashBoundaryEngine {
@@ -2320,7 +2468,10 @@ func (engine *fakeEngine) Watch(_ context.Context, _ WatchRequest, emit func(Wat
 }
 func (engine *fakeEngine) Delete(context.Context, DeleteRequest) (DeleteResponse, error) {
 	engine.record("Delete")
-	return DeleteResponse{Deleted: true}, nil
+	engine.mu.Lock()
+	err := engine.deleteErr
+	engine.mu.Unlock()
+	return DeleteResponse{Deleted: err == nil}, err
 }
 func (*fakeEngine) DeleteManagedVolume(context.Context, DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
 	return DeleteManagedVolumeResponse{Deleted: true}, nil
