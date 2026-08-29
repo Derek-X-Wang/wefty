@@ -28,6 +28,7 @@ type workflowJob struct {
 	Needs          any               `yaml:"needs"`
 	Permissions    map[string]string `yaml:"permissions"`
 	Uses           string            `yaml:"uses"`
+	With           map[string]any    `yaml:"with"`
 	TimeoutMinutes int               `yaml:"timeout-minutes"`
 	Steps          []workflowStep    `yaml:"steps"`
 }
@@ -153,6 +154,12 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if _, ok := realtiming.On["workflow_run"]; !ok {
 		t.Fatal("realtiming must be causally downstream of acceptance-image")
 	}
+	if _, ok := realtiming.On["pull_request"]; !ok {
+		t.Fatal("realtiming must expose the secretless pull_request lane")
+	}
+	if _, ok := realtiming.On["workflow_dispatch"]; !ok {
+		t.Fatal("realtiming must allow manual dispatch on a PR head")
+	}
 	if _, ok := scheduled.On["schedule"]; !ok {
 		t.Fatal("scheduled realtiming must retain its evidence cadence")
 	}
@@ -160,7 +167,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		t.Fatal("scheduled realtiming must remain manually dispatchable")
 	}
 	realtimeText := string(realtimingBytes)
-	for _, required := range []string{"workflow_run.head_sha", "workflow_run.id", "actions/download-artifact@", "run-id:", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT", "wefty-computer-wayland-reference-", "WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE"} {
+	for _, required := range []string{"workflow_run.head_sha", "workflow_run.id", "pull_request.head.sha", "pull_request.head.repo.full_name", "actions/download-artifact@", "run-id:", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT", "wefty-computer-wayland-reference-", "WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE"} {
 		if !strings.Contains(realtimeText, required) {
 			t.Fatalf("realtiming is missing immutable artifact contract %q", required)
 		}
@@ -170,13 +177,37 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			t.Fatalf("realtiming reintroduced mutable consumption %q", forbidden)
 		}
 	}
-	for _, required := range []string{"if: github.event_name == 'workflow_run'", "ref: ${{ github.event.workflow_run.head_sha }}", "PUBLISHED_SHA"} {
+	for _, required := range []string{"repository: ${{ needs.resolve-published-artifact.outputs.source-repository }}", "ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}", "source=pr-build", "source=published-artifact", "provenance-receipt.json", "EVIDENCE_SOURCE"} {
 		if !strings.Contains(realtimeText, required) {
-			t.Fatalf("workflow-run realtiming checkout is missing %q", required)
+			t.Fatalf("shared main/PR realtiming contract is missing %q", required)
 		}
 	}
 	if strings.Contains(realtimeText, "ref: main") {
 		t.Fatal("workflow-run realtiming must check out the triggering main SHA directly")
+	}
+	for _, requiredPath := range []string{"runner/**", "agent/**", "l1/**", "l3/**", "cmd/wefty*/**", "serviceacceptance/**", "examples/computer*/**", "scripts/**", ".github/workflows/service-acceptance-realtiming*.yml", ".github/workflows/acceptance-image*.yml", "docs/contracts/**"} {
+		if !strings.Contains(realtimeText, "- "+requiredPath) {
+			t.Fatalf("PR realtiming paths are missing %q", requiredPath)
+		}
+	}
+	prBuild := realtiming.Jobs["build-pr-artifacts"]
+	if prBuild.Uses != "./.github/workflows/acceptance-image-build.yml" || prBuild.With["package_releases"] != true {
+		t.Fatalf("PR realtiming artifact build = uses %q with %#v", prBuild.Uses, prBuild.With)
+	}
+	for _, sharedAnchor := range []string{"Provision pinned Linux OCI engine and probe", "Run service acceptance at production timings", "Capture Linux OCI service diagnostics", "Upload service acceptance evidence", "name: realtiming-result"} {
+		if strings.Count(realtimeText, sharedAnchor) != 1 {
+			t.Fatalf("main and PR lanes must share exactly one %q block", sharedAnchor)
+		}
+	}
+	packageJob := build.Jobs["package-pr-releases"]
+	packageText := marshalJob(t, packageJob)
+	for _, required := range []string{"scripts/assemble-oci-index.sh", `source:"pr-build"`, "public_pull:false", "wefty-acceptance-image-release.tar", "artifact=wefty-computer-reference", "artifact=wefty-computer-wayland-reference", `$artifact-release.tar`} {
+		if !strings.Contains(packageText, required) {
+			t.Fatalf("secretless PR release packaging is missing %q", required)
+		}
+	}
+	if strings.Contains(packageText, "crane") || strings.Contains(packageText, "docker login") {
+		t.Fatal("PR release packaging must assemble build artifacts without a registry")
 	}
 	scheduledText := string(scheduledBytes)
 	for _, required := range []string{"ref: refs/heads/main", "fetch-depth: 0", "git merge-base --is-ancestor", "git checkout --detach", "typed-skip: no successful acceptance-image publication exists", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT", "wefty-computer-wayland-reference-", "WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE"} {
