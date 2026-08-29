@@ -583,7 +583,7 @@ func historyContains(observation inputObservation, x, y int) bool {
 func (r *runtimeRunner) waitInputSentinel(ctx context.Context, after uint64, x, y int) (inputObservation, bool) {
 	for attempt := 0; attempt < 80; attempt++ {
 		value, err := r.readInputObservation(ctx)
-		if err == nil && value.Generation > after && value.X == x && value.Y == y {
+		if err == nil && value.Generation > after && historyContains(value, x, y) {
 			return value, true
 		}
 		if r.config.Sleep(ctx, 125*time.Millisecond) != nil {

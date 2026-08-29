@@ -35,6 +35,7 @@
       }).catch(() => {});
       window.addEventListener('pointermove', event => record({kind: 'pointer', x: event.clientX, y: event.clientY}));
       window.addEventListener('keydown', () => record({kind: 'key'}));
+      window.addEventListener('keyup', () => record({kind: 'key'}));
       setInterval(refresh, 100);
       refresh();
       document.body.focus();
