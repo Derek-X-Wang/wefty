@@ -479,18 +479,6 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 			return CopyComputerStorageResponse{}, err
 		}
 	}
-	stagingDigest, err := digestFilePrefix(stagingPath, request.SourceSize)
-	if err != nil {
-		return CopyComputerStorageResponse{}, err
-	}
-	if stagingDigest != request.SourceDigest {
-		return CopyComputerStorageResponse{}, errors.New("Computer Storage staging digest mismatch before filesystem mutation")
-	}
-	if request.Destination.DiskBytes > request.SourceSize {
-		if err := engine.allocateComputerBackup(stagingPath, request.Destination.DiskBytes); err != nil {
-			return CopyComputerStorageResponse{}, err
-		}
-	}
 	sourceDigest, err := digestFile(sourcePath)
 	if err != nil {
 		return CopyComputerStorageResponse{}, err
@@ -500,6 +488,13 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	}
 	manifest.SourceDigest = sourceDigest
 	if manifest.Phase == computerStorageCopyCopied {
+		stagingDigest, err := digestFilePrefix(stagingPath, request.SourceSize)
+		if err != nil {
+			return CopyComputerStorageResponse{}, err
+		}
+		if stagingDigest != request.SourceDigest {
+			return CopyComputerStorageResponse{}, errors.New("Computer Storage staging digest mismatch before filesystem mutation")
+		}
 		manifest.Phase = computerStorageCopySourceVerified
 		if err := writeComputerStorageCopyManifest(destinationRoot, manifest); err != nil {
 			return CopyComputerStorageResponse{}, err
@@ -510,6 +505,11 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	}
 	facts := computerStorageCopyFacts{}
 	if manifest.Phase == computerStorageCopySourceVerified {
+		if request.Destination.DiskBytes > request.SourceSize {
+			if err := engine.allocateComputerBackup(stagingPath, request.Destination.DiskBytes); err != nil {
+				return CopyComputerStorageResponse{}, err
+			}
+		}
 		expanded := request.Destination.DiskBytes > request.SourceSize
 		mountPath := filepath.Join(engine.config.RuntimeRoot, "computer-copy-mounts", destinationName)
 		facts, err = engine.finalizeComputerStorageCopy(ctx, request.Operation, stagingPath, mountPath, request.SourceSize, expanded)
