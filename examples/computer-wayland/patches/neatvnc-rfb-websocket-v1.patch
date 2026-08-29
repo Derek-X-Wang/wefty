@@ -1,0 +1,127 @@
+--- a/src/stream/ws/handshake.c
++++ b/src/stream/ws/handshake.c
+@@ -25,0 +26,4 @@
++#include <fcntl.h>
++#include <nettle/sha1.h>
++#include <stdlib.h>
++#include <unistd.h>
+@@ -32,3 +36,5 @@
+-	while (*src)
+-		if (!isspace(*src))
+-			*dst++ = tolower(*src++);
++	while (*src) {
++		unsigned char value = (unsigned char)*src++;
++		if (!isspace(value))
++			*dst++ = (char)tolower(value);
++	}
+@@ -45,0 +52,9 @@
++	/* Wefty rfb-websocket-v1 owns one exact path. Query and fragment
++	 * components are viewer metadata and do not change routing. */
++	static const char prefix[] = "GET /websockify";
++	if (strncmp(input, prefix, sizeof(prefix) - 1) != 0)
++		goto failure;
++	char delimiter = input[sizeof(prefix) - 1];
++	if (delimiter != ' ' && delimiter != '?' && delimiter != '#')
++		goto failure;
++
+@@ -73 +88 @@
+-	if (have_protocols && !strstr(protocols, ",chat,"))
++	if (!have_protocols || !strstr(protocols, ",binary,"))
+@@ -80,6 +95,6 @@
+-	crypto_hash_many(hash, sizeof(hash), CRYPTO_HASH_SHA1,
+-			(struct crypto_data_entry[]){
+-		{ (uint8_t*)challenge, strlen(challenge) },
+-		{ (uint8_t*)magic_uuid, strlen(magic_uuid) },
+-		{}
+-	});
++	/* Keep the RFC 6455 SHA-1 call typed on every architecture. */
++	struct sha1_ctx sha1;
++	sha1_init(&sha1);
++	sha1_update(&sha1, strlen(challenge), (uint8_t*)challenge);
++	sha1_update(&sha1, strlen(magic_uuid), (uint8_t*)magic_uuid);
++	sha1_digest(&sha1, sizeof(hash), hash);
+@@ -98 +113 @@
+-			have_protocols ? "Sec-WebSocket-Protocol: char\r\n" : "",
++			"Sec-WebSocket-Protocol: binary\r\n",
+@@ -103,0 +119,24 @@ failure:
++	/* Defer CPU-heavy desktop furniture until both native edges have served
++	 * one contract-valid handshake. This keeps edge startup deterministic on
++	 * small arm64 runners without making the marker part of conformance. */
++	if (ok) {
++		const char* role = getenv("WEFTY_WAYVNC_ROLE");
++		const char* marker = role && strcmp(role, "view") == 0 ?
++				"/tmp/wefty-computer/view-edge-ready" :
++			role && strcmp(role, "control") == 0 ?
++				"/tmp/wefty-computer/control-edge-ready" : NULL;
++		if (marker) {
++			int fd = open(marker, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
++			if (fd >= 0)
++				close(fd);
++		}
++	}
++
++	if (!ok && req.header_length > 0) {
++		len = snprintf(output, output_maxlen,
++				"HTTP/1.1 400 Bad Request\r\n"
++				"Connection: close\r\n"
++				"Content-Length: 0\r\n\r\n");
++		header_len = req.header_length;
++		ok = len < output_maxlen;
++	}
+--- a/src/stream/ws/ws.c
++++ b/src/stream/ws/ws.c
+@@ -118,2 +118,10 @@ case WS_OPCODE_TEXT:
+-		// This is unexpected, but let's just ignore it...
+-		stream_ws_advance_read_buffer(ws, SIZE_MAX, offset);
++		/* RFB bytes are binary frames only. Close instead of silently
++		 * accepting a text frame. The mutation hook is repository-only
++		 * evidence that this branch is load-bearing. */
++		if (getenv("WEFTY_CONFORMANCE_MUTATION") &&
++				strcmp(getenv("WEFTY_CONFORMANCE_MUTATION"),
++					"text-frames-accepted") == 0) {
++			stream_ws_advance_read_buffer(ws, SIZE_MAX, offset);
++			return 0;
++		}
++		stream__remote_closed(&ws->base);
+@@ -205,0 +214,5 @@ stream_tcp_send_first:
++	if (strncmp(reply, "HTTP/1.1 101 ", 13) != 0) {
++		/* The HTTP rejection was sent; never advance this stream to RFB. */
++		ws->read_index = 0;
++		return 0;
++	}
+--- a/src/server.c
++++ b/src/server.c
+@@ -48,0 +49 @@ native-input-oracle-includes:
++#include <fcntl.h>
+@@ -1001,0 +1003,27 @@ native-input-oracle:
++/* The image's conformance oracle records protocol input at the native RFB
++ * parser. Each wayvnc role opts in independently, so --disable-input remains
++ * the view-side enforcement point rather than a client-side filter. */
++static bool wefty_input_oracle_enabled(void)
++{
++	const char* enabled = getenv("WEFTY_WAYVNC_RECORD_INPUT");
++	return enabled && (strcmp(enabled, "control") == 0 ||
++			strcmp(enabled, "view") == 0);
++}
++
++static void wefty_record_input(const char* kind, uint16_t x, uint16_t y)
++{
++	if (!wefty_input_oracle_enabled())
++		return;
++
++	int fd = open("/tmp/wefty-computer/native-input-events",
++			O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
++	if (fd < 0)
++		return;
++	if (strcmp(kind, "pointer") == 0)
++		dprintf(fd, "%s pointer %u %u\n",
++				getenv("WEFTY_WAYVNC_RECORD_INPUT"), x, y);
++	else
++		dprintf(fd, "%s key\n", getenv("WEFTY_WAYVNC_RECORD_INPUT"));
++	close(fd);
++}
++
+@@ -1014,0 +1043 @@ native-input-oracle-key:
++	wefty_record_input("key", 0, 0);
+@@ -1080,0 +1110 @@ native-input-oracle-pointer:
++	wefty_record_input("pointer", x, y);

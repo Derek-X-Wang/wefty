@@ -6,9 +6,11 @@ does not install, launch, or repair desktop components inside an image. Build
 against [`docs/contracts/computer-image.md`](../contracts/computer-image.md),
 which is the authoritative boot, endpoint, persistence, and profile contract.
 
-Wefty ships the public, digest-pinned `examples/computer/` image as an optional
-acceptance and image-author example. It is not a required base image, runtime
-layer, compatibility target, or security profile. Bring-your-own desktop is the product:
+Wefty ships two public, digest-pinned examples: the XFCE image under
+`examples/computer/` and the GPU-free Wayland image under
+`examples/computer-wayland/`. They are optional acceptance and image-author
+examples. Each is not a required base image, runtime layer, compatibility
+target, or security profile. Bring-your-own desktop is the product:
 inheriting from the reference image is neither required nor a claim of
 compatibility, and generic OCI Jobs and services do not acquire any Computer
 behavior from it.
@@ -30,6 +32,12 @@ docker buildx build \
   --file examples/computer/Dockerfile \
   --provenance=false --sbom=false \
   --output type=oci,dest=wefty-computer.oci.tar,rewrite-timestamp=true .
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --file examples/computer-wayland/Dockerfile \
+  --provenance=false --sbom=false \
+  --output type=oci,dest=wefty-computer-wayland.oci.tar,rewrite-timestamp=true .
 ```
 
 CI builds and executes each architecture without credentials on pull requests.
@@ -41,12 +49,88 @@ tarball. Treat the commit tag as discovery only; submit or copy the image by
 the recorded `sha256:` index digest. Linux realtiming and attended Mac/Lima
 acceptance consume that same digest and tar identity.
 
-The reference build uses a dated Debian snapshot, pins every directly selected
-package version, passes `SOURCE_DATE_EPOCH`, and removes apt/dpkg logs in the
-install layer. CI performs two empty-cache solves per architecture and requires
-their platform digests to match. That is a reproducibility check for these
-inputs, not a promise that tags or future toolchains reproduce the bytes; the
-recorded digest is the only image identity.
+Both reference builds use a dated Debian snapshot, pin every directly selected
+package version, pass `SOURCE_DATE_EPOCH`, and remove apt/dpkg logs in the
+install layer. XFCE retains its two-empty-cache-solve reproducibility check.
+The Wayland lane builds one OCI tar, promotes that exact layout into the
+ephemeral execution registry, and requires its digest to remain unchanged.
+This proves that the bytes executed and later published are the same; it does
+not promise that future toolchains reproduce them. The recorded digest is the
+only image identity.
+
+The second publication is
+`ghcr.io/derek-x-wang/wefty-computer-wayland-reference:<commit>`. It follows
+the same per-architecture execute-and-ELF-check, promote-not-rebuild, immutable
+index, anonymous-pull, and digest-selected archive rules. Its platform jobs
+run the same public conformance checker and the same 20 broken-image rows; a
+row is useful only when the conformant image passes and that derivative fails
+its one owning cell.
+
+### Reference measurements
+
+The required image lane records cold-start time from the conformance receipt
+and whole-container idle RSS from a separate steady-state boot. The values are
+evidence for one runner and digest, not sizing promises. The 2026-08-29 required
+[contract-gate snapshot](https://github.com/Derek-X-Wang/wefty/actions/runs/33241736102)
+recorded:
+
+| Reference | Platform | Idle RSS | Cold start | Executed digest |
+| --- | --- | ---: | ---: | --- |
+| XFCE/Xvfb | `linux/amd64` | 1,353.3 MiB | 2.662 s | `sha256:e810a2d6a072b73211cab8f408603f320769336ece313dd02c7bca7dcc19c647` |
+| XFCE/Xvfb | `linux/arm64` | 1,308.2 MiB | 7.523 s | `sha256:fc0c8c0f68568c1864fa437013e4babf01f1622fd78861645d8681ef6257a37c` |
+| GPU-free Wayland | `linux/amd64` | 931.2 MiB | 3.395 s | `sha256:5e078930cca3a40343a990d670ecfe2f476393249666108ca7bac9dfbb701adc` |
+| GPU-free Wayland | `linux/arm64` | 882.5 MiB | 3.527 s | `sha256:36d643df24e1c485364e5b37e1cd25eef247ce639151a3aa83525046622f43bc` |
+
+The exact-byte `amd64-metrics.json` and `arm64-metrics.json` receipts are in
+`wefty-computer-reference-platform-*` for XFCE and
+`wefty-computer-wayland-reference-platform-*` for Wayland. They retain
+`idle_rss_bytes` and `cold_start_seconds`; publication carries the same files
+forward without rebuilding.
+
+## Second example: GPU-free Wayland
+
+The Wayland example runs Sway with `WLR_BACKENDS=headless`,
+`WLR_RENDERER=pixman`, one 1280x720 headless output, and no `/dev/dri`. Two
+native `wayvnc -w` processes serve that output directly. The view process uses
+`--disable-input`; the control process accepts input. There is no websockify
+process or client-side input filter.
+
+Debian's pinned `wayvnc` already owns RFB-over-WebSocket, but its pinned
+`neatvnc` accepts a different subprotocol, does not constrain the request path,
+and ignores text frames. The image builds an ISC-licensed patch over the pinned
+source so the native server accepts only `/websockify` (with ignored query or
+fragment), negotiates exactly `binary`, and closes on text frames. The
+repository mutation hook makes the text rejection load-bearing in the same
+20-row negative lane.
+
+The image derives its input receipt at neatvnc's native RFB parser. The control
+role records parsed pointer and key events; the view role records none only
+when it actually starts with `--disable-input`. This keeps the isolation proof
+load-bearing without making the browser or another client-side layer filter
+input.
+
+The image also demonstrates optional, image-owned agent furniture outside the
+Computer wire contract:
+
+- a focused surface exposing `idle`, `working`, `blocked`, and `done`, with a
+  scripted session proving all four observations;
+- a bounded crash briefing for the next agent loop;
+- a self-reconfiguration skill that atomically changes a persistent theme;
+- pinned mise with lazy `claude` and `codex` stubs; and
+- keyboard-first Sway bindings for Foot, Chromium, Neovim, lazygit, Fuzzel,
+  and notifications.
+
+These are tenant-image choices, not cluster judgment or new Wefty protocols.
+The surface and `driver.json` consumers reopen atomically replaced files and
+fail closed. `/home/wefty` remains a symlink into `/wefty/service`.
+
+The repo and image carry
+`examples/computer-wayland/LICENSES.md`; the build also rejects Debian
+`contrib`/`non-free`, requires package copyright files, and records the
+installed-package manifest. Herdr is credited for Apache-2.0 design
+inspiration only. The other researched desktop is inspiration only: no code,
+assets, installer, trademark, or branding is copied. Chromium still runs with
+`--no-sandbox`, which is an image limitation rather than an OCI-profile change.
 
 ## Build your own image
 
@@ -125,7 +209,7 @@ well as pointer coordinates.
 
 ## Image responsibilities
 
-The reference image demonstrates the minimum contract shape:
+Both reference images demonstrate the minimum contract shape:
 
 - `WEFTY_COMPUTER_VIEW_PORT` and `WEFTY_COMPUTER_CONTROL_PORT` are distinct,
   helper-allocated IPv4-loopback listeners named `view` and `control`.
@@ -139,14 +223,13 @@ The reference image demonstrates the minimum contract shape:
 - `/home/wefty` is an image-owned symlink into `/wefty/service`; profile and
   sign-in state persist there. Attempt-local rootfs and tmpfs writes do not.
 
-The image runs Xvfb/XFCE and Chromium with CPU rendering. Chromium is launched
+The first image runs Xvfb/XFCE and Chromium with CPU rendering. Chromium is launched
 with `--no-sandbox`; that is a disclosed limitation of this example, not an
 expansion of the OCI security profile. Wefty adds no GPU, device, capability,
 ptrace, privilege, browser-sandbox exception, font, locale, or D-Bus policy.
 The helper retains the ordinary `wefty-v1` walls and supplies the private 1 GiB
 `/dev/shm` defined by the Computer image contract.
 
-The Omarchy-inspired Wayland/wayvnc variant belongs to ticket #207. The
-reference image leaves its deterministic focused input and driver oracle
-surfaces for `wefty-computer-conformance`; neither surface is a guest-facing
-Wefty protocol.
+The second image runs headless Sway/pixman and native wayvnc. Both images leave
+deterministic focused input and driver oracle surfaces for
+`wefty-computer-conformance`; neither surface is a guest-facing Wefty protocol.

@@ -1,6 +1,6 @@
 # M3 Lima transport and service publication attended acceptance
 
-This is the owner-hardware lane for Tickets #145, #147, #149, #150, and #181 and the Mac rows of the M3 OCI
+This is the owner-hardware lane for Tickets #145, #147, #149, #150, #181, and #207 and the Mac rows of the M3 OCI
 spec §9. It is deliberately absent from `service-acceptance-realtiming`: hosted
 macOS runners do not prove nested Lima `vz`. A run is PASS only when every row
 below has a captured command, exit code, and redacted receipt from the same
@@ -28,6 +28,13 @@ and raw environment dumps must never enter the artifact.
   plus `computer-image-index-digest.txt` and
   `wefty-computer-reference.oci.tar` unchanged. The index and archive receipt
   must name the same amd64/arm64 child digests executed by secretless CI;
+- the separate `wefty-computer-wayland-reference-<candidate-commit>` artifact
+  from that exact workflow run. Extract
+  `wefty-computer-wayland-reference-release.tar`, require its commit to match
+  both earlier artifacts, and use `wayland-computer-image-index-digest.txt`
+  plus `wefty-computer-wayland-reference.oci.tar` unchanged. Its platform
+  receipts must show conformance, furniture, and ELF execution before this
+  attended lane imports the arm64 child;
 - one temporary host operator-mount root dedicated to this run.
 
 Ticket #152 adds the minimum installed boot topology consumed by this lane.
@@ -182,16 +189,19 @@ the helper instance/session generation before each row.
    Linux guest's native filesystem, remain absent from the Lima host mounts,
    and never traverse virtiofs. Record these facts in the
    `service_data_guest_native` row.
-9. Reference Computer image: import the arm64 child from the separate
-   digest-selected Computer OCI tar through the helper, then boot it without
+9. Reference Computer images: import each arm64 child from its separate
+   digest-selected Computer OCI tar through the helper, then boot each without
    argv or working-directory replacement. Require both returned names to reach
    `rfb-websocket-v1` readiness atomically within 60 seconds of authoritative
    `Started`, with view input discarded server-side and control input accepted.
-   Record the 1 GiB private `/dev/shm`, CPU-rendered XFCE/Chromium session,
-   profile/sign-in markers across a fresh attempt and stop→start, missing or
-   malformed `driver.json` failing closed, and attempt-local scratch absence.
-   The reference and echo artifact receipts must retain distinct repositories,
-   digests, and tar names while sharing the candidate commit.
+   For XFCE record the CPU-rendered Xvfb/XFCE/Chromium session. For the Wayland
+   image record Sway's headless backend, pixman renderer, two native `wayvnc -w`
+   processes, `--disable-input` on view, and the absence of `/dev/dri` and
+   websockify. For both record the 1 GiB private `/dev/shm`, profile/sign-in
+   markers across a fresh attempt and stop→start, missing or malformed
+   `driver.json` failing closed, and attempt-local scratch absence. All three
+   image receipts must retain distinct repositories, digests, and tar names
+   while sharing the candidate commit.
 10. Removal manifest: while the agent is offline, request removal of a bound OCI
    service and observe L1 at exactly `removal_pending`. Return the same
    node through the ordinary boot sweep barrier, then capture the immutable

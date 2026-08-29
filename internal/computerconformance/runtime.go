@@ -108,7 +108,7 @@ func (r *runtimeRunner) run(ctx context.Context) error {
 	}
 	r.record("runtime.started", StatusPass, "container task started")
 	if err := r.waitReady(ctx, startedAt, false); err != nil {
-		return err
+		return r.withStartupLogs(ctx, err)
 	}
 	if r.config.MutationProfile == "duplicate-endpoint" {
 		r.record("endpoints.distinct", StatusFail, "view and control received the same attempt-local port")
@@ -125,6 +125,27 @@ func (r *runtimeRunner) run(ctx context.Context) error {
 	r.checkHarnessProfile(ctx)
 	r.checkEdgeRecovery(ctx)
 	return r.checkPersistence(ctx)
+}
+
+func (r *runtimeRunner) withStartupLogs(ctx context.Context, readinessErr error) error {
+	// A readiness receipt deliberately records only contract assertions, but an
+	// operator still needs the tenant's bounded startup diagnostics to repair an
+	// image that never exposed an edge. Keep those diagnostics on stderr, redact
+	// endpoint-looking values, and cap their size instead of putting them in the
+	// durable receipt.
+	result, err := r.runCommand(ctx, "logs", "--tail", "200", r.containerID)
+	if err != nil {
+		return readinessErr
+	}
+	logs := strings.TrimSpace(result.stdout + result.stderr)
+	if logs == "" {
+		return readinessErr
+	}
+	logs = strings.TrimSpace(portPattern.ReplaceAllString(logs, "<endpoint>"))
+	if len(logs) > 8192 {
+		logs = logs[:8192]
+	}
+	return fmt.Errorf("%w; tenant startup logs: %s", readinessErr, logs)
 }
 
 func (r *runtimeRunner) allocatePorts() error {
@@ -204,12 +225,13 @@ func (r *runtimeRunner) startContainer(ctx context.Context) error {
 
 func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, restart bool) error {
 	viewReady, controlReady, plainTCP := false, false, false
+	var viewProbeErr, controlProbeErr error
 	for BeforeReadinessDeadline(r.config.Now(), startedAt) {
 		if !viewReady {
-			viewReady, plainTCP = r.probeReady(ctx, r.viewPort, plainTCP)
+			viewReady, plainTCP, viewProbeErr = r.probeReady(ctx, r.viewPort, plainTCP)
 		}
 		if !controlReady {
-			controlReady, plainTCP = r.probeReady(ctx, r.controlPort, plainTCP)
+			controlReady, plainTCP, controlProbeErr = r.probeReady(ctx, r.controlPort, plainTCP)
 		}
 		if viewReady && controlReady {
 			r.record("transport.view-ready", StatusPass, "binary RFB greeting observed")
@@ -239,23 +261,29 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 	}
 	if !viewReady {
 		r.record("transport.view-ready", StatusFail, "view never completed rfb-websocket-v1")
+		if viewProbeErr != nil {
+			return fmt.Errorf("view endpoint readiness timeout: %w", viewProbeErr)
+		}
 		return errors.New("view endpoint readiness timeout")
 	}
 	r.record("transport.view-ready", StatusPass, "binary RFB greeting observed")
 	if !controlReady {
 		r.record("transport.control-ready", StatusFail, "control never completed rfb-websocket-v1")
+		if controlProbeErr != nil {
+			return fmt.Errorf("control endpoint readiness timeout: %w", controlProbeErr)
+		}
 		return errors.New("control endpoint readiness timeout")
 	}
 	return errors.New("Computer startup readiness timeout")
 }
 
-func (r *runtimeRunner) probeReady(ctx context.Context, port int, plainSeen bool) (bool, bool) {
+func (r *runtimeRunner) probeReady(ctx context.Context, port int, plainSeen bool) (bool, bool, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	connection, err := OpenRFB(probeCtx, port, contract.ComputerDisplayWebSocketPath)
 	if err == nil {
 		connection.close()
-		return true, plainSeen
+		return true, plainSeen, nil
 	}
 	dialer := net.Dialer{Timeout: 250 * time.Millisecond}
 	tcp, tcpErr := dialer.DialContext(probeCtx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
@@ -263,7 +291,7 @@ func (r *runtimeRunner) probeReady(ctx context.Context, port int, plainSeen bool
 		plainSeen = true
 		_ = tcp.Close()
 	}
-	return false, plainSeen
+	return false, plainSeen, err
 }
 
 // BeforeReadinessDeadline is the publication edge shared by runtime polling

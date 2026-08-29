@@ -66,7 +66,11 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if computerPublish.Permissions["packages"] != "write" || !strings.Contains(computerPublish.If, "github.event_name == 'push'") || !strings.Contains(computerPublish.If, "refs/heads/main") {
 		t.Fatalf("Computer publisher permissions/guard = %+v if=%q", computerPublish.Permissions, computerPublish.If)
 	}
-	for name, job := range map[string]workflowJob{"publish": publish, "publish-reference-computer": computerPublish} {
+	waylandPublish := image.Jobs["publish-wayland-reference-computer"]
+	if waylandPublish.Permissions["packages"] != "write" || !strings.Contains(waylandPublish.If, "github.event_name == 'push'") || !strings.Contains(waylandPublish.If, "refs/heads/main") {
+		t.Fatalf("Wayland Computer publisher permissions/guard = %+v if=%q", waylandPublish.Permissions, waylandPublish.If)
+	}
+	for name, job := range map[string]workflowJob{"publish": publish, "publish-reference-computer": computerPublish, "publish-wayland-reference-computer": waylandPublish} {
 		text := marshalJob(t, job)
 		for _, required := range []string{"crane\" push", "crane\" index append", ".oci.tar"} {
 			if !strings.Contains(text, required) {
@@ -78,7 +82,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 	}
 	for name, job := range image.Jobs {
-		if name != "publish" && name != "publish-reference-computer" && job.Permissions["packages"] != "" {
+		if name != "publish" && name != "publish-reference-computer" && name != "publish-wayland-reference-computer" && job.Permissions["packages"] != "" {
 			t.Fatalf("PR-callable job %s grants package permissions", name)
 		}
 	}
@@ -113,7 +117,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			t.Fatalf("PR-callable image build does not exercise release manifest assembly %q", required)
 		}
 	}
-	for _, required := range []string{"reference-computer-platform-build", "examples/computer/Dockerfile", "scripts/test-computer-image-runtime.sh", "wefty-computer-reference-platform-", "usr/lib/chromium/chromium"} {
+	for _, required := range []string{"reference-computer-platform-build", "examples/computer/Dockerfile", "examples/computer-wayland/Dockerfile", "scripts/test-computer-image-runtime.sh", "scripts/test-computer-wayland-furniture.sh", "scripts/measure-computer-image.sh", "wefty-computer-reference", "wefty-computer-wayland-reference", "usr/bin/wayvnc"} {
 		if !strings.Contains(string(buildBytes), required) {
 			t.Fatalf("PR-callable reference Computer build is missing %q", required)
 		}
@@ -144,7 +148,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		t.Fatal("scheduled realtiming must remain manually dispatchable")
 	}
 	realtimeText := string(realtimingBytes)
-	for _, required := range []string{"workflow_run.head_sha", "workflow_run.id", "actions/download-artifact@", "run-id:", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT"} {
+	for _, required := range []string{"workflow_run.head_sha", "workflow_run.id", "actions/download-artifact@", "run-id:", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT", "wefty-computer-wayland-reference-", "WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE"} {
 		if !strings.Contains(realtimeText, required) {
 			t.Fatalf("realtiming is missing immutable artifact contract %q", required)
 		}
@@ -163,7 +167,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		t.Fatal("workflow-run realtiming must check out the triggering main SHA directly")
 	}
 	scheduledText := string(scheduledBytes)
-	for _, required := range []string{"ref: refs/heads/main", "fetch-depth: 0", "git merge-base --is-ancestor", "git checkout --detach", "typed-skip: no successful acceptance-image publication exists", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT"} {
+	for _, required := range []string{"ref: refs/heads/main", "fetch-depth: 0", "git merge-base --is-ancestor", "git checkout --detach", "typed-skip: no successful acceptance-image publication exists", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT", "wefty-computer-wayland-reference-", "WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE"} {
 		if !strings.Contains(scheduledText, required) {
 			t.Fatalf("scheduled realtiming is missing %q", required)
 		}
@@ -227,11 +231,18 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			t.Fatalf("reference Computer publication contract is missing %q", required)
 		}
 	}
+	for _, required := range []string{"publish-wayland-reference-computer", "$WAYLAND_COMPUTER_IMAGE_NAME@$index_digest", "wefty-computer-wayland-reference.oci.tar", "wefty-computer-wayland-reference-release.tar", "wayland-computer-image-receipt.json", "furniture_assertion"} {
+		if !strings.Contains(string(imageBytes), required) {
+			t.Fatalf("Wayland reference Computer publication contract is missing %q", required)
+		}
+	}
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "exec /usr/local/bin/wefty-echo-service", "published-echo-service:", "clean-cache wefty node load-image")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "CodeImageUnavailable", "ImageFailureNetwork", "WEFTY_OCI_PROVISION_RECEIPT", "registry_disabled_pull_rejected=%t")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_COMPUTER_REFERENCE", "exerciseNativeLinuxReferenceComputer", "ComputerStartupReadinessTimeout", "assertReferenceComputerWireNegatives")
+	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_WAYLAND_COMPUTER_REFERENCE", `exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, "wayland"`, "wayland_computer_reference_wire_negatives=true")
 	assertFileMatches(t, "../examples/oci-echo-service/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG GO_IMAGE=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG BUSYBOX_IMAGE=.*@sha256:[0-9a-f]{64}$`)
 	assertFileMatches(t, "../examples/computer/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG DEBIAN_IMAGE=.*@sha256:[0-9a-f]{64}$`)
+	assertFileMatches(t, "../examples/computer-wayland/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG DEBIAN_IMAGE=.*@sha256:[0-9a-f]{64}$`)
 	assertFileContains(t, "../examples/computer/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "ARG SOURCE_DATE_EPOCH=0", "chromium=", "/var/log/dpkg.log", "/var/log/alternatives.log", "/var/log/apt/*")
 	assertFileContains(t, "../examples/computer/entrypoint.sh", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "/wefty/service")
 	assertFileContains(t, "../examples/computer/rfb-websocket.py", `target.path != "/websockify"`, `"binary" not in offered`, "BinaryOnlyWebSocket")
@@ -239,8 +250,16 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../examples/computer/watch-driver.py", "/wefty/control/driver.json", "os.replace", `type(value["version"]) is not int`, `type(value["human_driving"]) is not bool`)
 	assertFileContains(t, "../examples/computer/oracle.html", `data-wefty-input-oracle="v1"`, "events=0 bytes=0 hash=00000000")
 	assertFileContains(t, "../examples/computer/pointer-oracle.py", "XQueryPointer", "input-oracle.json", "os.replace")
+	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "wayvnc=0.9.1-1", "sway=1.10.1-2", "mise-v2026.8.14", "wefty-verify-licenses", "ldconfig -p", "/usr/local/lib/libneatvnc.so.0")
+	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "WLR_BACKENDS=headless", "WLR_RENDERER=pixman", "WLR_HEADLESS_OUTPUTS=1")
+	assertFileContains(t, "../examples/computer-wayland/entrypoint.sh", "wayvnc -w", "--disable-input", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT")
+	assertFileContains(t, "../examples/computer-wayland/watch-driver.py", "/wefty/control/driver.json", "type(value[\"version\"]) is not int", "os.replace")
+	assertFileContains(t, "../examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch", "GET /websockify", "Sec-WebSocket-Protocol: binary", "WS_OPCODE_TEXT", "WEFTY_WAYVNC_RECORD_INPUT", "native-input-events")
+	assertFileContains(t, "../examples/computer-wayland/surface.py", "input-oracle.json", "native-input-events", "agent-state-surface.json", "theme-surface.json", "os.replace")
+	assertFileContains(t, "../examples/computer-wayland/LICENSES.md", "Herdr", "Apache-2.0", "no code or assets copied", "no code, assets, installer, name, or branding copied")
+	assertFileContains(t, "../scripts/test-computer-wayland-furniture.sh", "test ! -e /dev/dri", "agent-state-surface.json", "theme-surface.json", "crash-briefing.json", "idle_rss_bytes")
 	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", "cmd/wefty-computer-conformance", "--input-oracle-path", "--driver-oracle-path")
-	assertFileContains(t, "../docs/guides/computer-images.md", "Bring-your-own desktop is the product", "not a required base image", "CPU rendering", "--no-sandbox", "wefty-computer-conformance", "ticket #207")
+	assertFileContains(t, "../docs/guides/computer-images.md", "Bring-your-own desktop is the product", "not a required base image", "CPU rendering", "--no-sandbox", "wefty-computer-conformance", "GPU-free Wayland")
 	assertFileContains(t, "../docs/guides/computer-images.md", "docker buildx create", "tonistiigi/binfmt@sha256:", "--input-oracle-path", "NOT-RUN", "operator-owned")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "RunComputerServiceRealtiming", "computer_reference_publication_loss_recovery=%t", "computer_reference_helper_stop_start_profile_sign_in_rootfs=%t")
 	assertFileContains(t, "../docs/runbooks/oci-node.md", "wefty node load-image", "acceptance-image-index-digest.txt")

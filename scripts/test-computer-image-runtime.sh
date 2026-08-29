@@ -6,16 +6,18 @@ set -euo pipefail
 image=
 arch=
 evidence=
+edge_process_pattern='wefty-rfb-websocket --port'
 while (($# > 0)); do
   case "$1" in
     --image) image="${2:-}"; shift ;;
     --arch) arch="${2:-}"; shift ;;
     --evidence) evidence="${2:-}"; shift ;;
-    *) printf '%s\n' 'usage: scripts/test-computer-image-runtime.sh --image REF@sha256:DIGEST --arch amd64|arm64 --evidence DIR' >&2; exit 64 ;;
+    --edge-process-pattern) edge_process_pattern="${2:-}"; shift ;;
+    *) printf '%s\n' 'usage: scripts/test-computer-image-runtime.sh --image REF@sha256:DIGEST --arch amd64|arm64 --evidence DIR [--edge-process-pattern TEXT]' >&2; exit 64 ;;
   esac
   shift
 done
-[[ $image == *@sha256:* && $arch =~ ^(amd64|arm64)$ && -n $evidence ]] || exit 64
+[[ $image == *@sha256:* && $arch =~ ^(amd64|arm64)$ && -n $evidence && -n $edge_process_pattern ]] || exit 64
 mkdir -p "$evidence"
 
 checker="$evidence/wefty-computer-conformance"
@@ -26,7 +28,7 @@ go build -o "$checker" ./cmd/wefty-computer-conformance
   --platform "linux/$arch" \
   --input-oracle-path /tmp/wefty-computer/input-oracle.json \
   --driver-oracle-path /tmp/wefty-computer/driver-state.json \
-  --edge-process-pattern 'wefty-rfb-websocket --port' \
+  --edge-process-pattern "$edge_process_pattern" \
   --receipt "$evidence/${arch}-runtime.json"
 
 # The reference executes on both supported architectures. The actual broken
@@ -45,7 +47,7 @@ run_mutation() {
   "$checker" --image "$tag" --platform "linux/$arch" \
     --input-oracle-path /tmp/wefty-computer/input-oracle.json \
     --driver-oracle-path /tmp/wefty-computer/driver-state.json \
-    --edge-process-pattern 'wefty-rfb-websocket --port' \
+    --edge-process-pattern "$edge_process_pattern" \
     --mutation-profile "$mutation" --receipt "$mutations/$mutation.json"
   local checker_status=$?
   set -e
