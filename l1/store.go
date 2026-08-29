@@ -50,6 +50,9 @@ type StoreOptions struct {
 	// ComputerBackupCap is the explicit cluster default materialized onto each
 	// Computer at creation. Zero is the shipped fail-closed default.
 	ComputerBackupCap int64
+	// ReconfigurationHook injects deterministic state-machine crash boundaries.
+	// Production callers leave it nil.
+	ReconfigurationHook func(string) error
 }
 
 // Store is the durable SQLite substrate for L1 queue operations.
@@ -68,6 +71,7 @@ type Store struct {
 	adminBootstrapTTL                 time.Duration
 	computerTakeoverAuditRetentionAge time.Duration
 	computerBackupCap                 int64
+	reconfigurationHook               func(string) error
 	deploymentID                      string
 	policyChangeMu                    sync.Mutex
 	policyChanged                     chan struct{}
@@ -170,6 +174,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		adminBootstrapTTL:                 adminBootstrapTTL,
 		computerTakeoverAuditRetentionAge: computerTakeoverAuditRetentionAge,
 		computerBackupCap:                 options.ComputerBackupCap,
+		reconfigurationHook:               options.ReconfigurationHook,
 		deploymentID:                      deploymentID,
 		policyChanged:                     make(chan struct{}),
 	}
@@ -336,7 +341,7 @@ CREATE TABLE IF NOT EXISTS computers (
   applied_revision INTEGER NOT NULL CHECK(applied_revision >= 0 AND applied_revision <= intent_revision),
   current_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
   current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
-  reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'backing_up', 'reimaging', 'growing', 'restoring', 'cloning', 'removing')),
+  reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'backing_up', 'restoring', 'cloning', 'reimaging', 'growing', 'removing')),
   reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0),
   submit_enabled INTEGER NOT NULL DEFAULT 0 CHECK(submit_enabled IN (0, 1)),
   submit_intent_revision INTEGER NOT NULL DEFAULT 0 CHECK(submit_intent_revision >= 0),
@@ -382,7 +387,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS computer_current_projection
 CREATE TABLE IF NOT EXISTS computer_intent_history (
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
   intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
-	operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'reimage', 'grow', 'abort', 'restore', 'clone')),
+	operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'restore', 'clone', 'reimage', 'grow', 'abort')),
   desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
   storage_id TEXT NOT NULL,
 	storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
@@ -462,11 +467,39 @@ CREATE TABLE IF NOT EXISTS computer_storage_grows (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_grow_active
   ON computer_storage_grows(computer_id) WHERE status='planned';
+CREATE TABLE IF NOT EXISTS computer_reimage_operations (
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  operation_revision INTEGER NOT NULL CHECK(operation_revision > 0),
+  old_job_id TEXT NOT NULL REFERENCES jobs(job_id),
+  staging_job_id TEXT NOT NULL REFERENCES jobs(job_id),
+  storage_id TEXT NOT NULL,
+  storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+  bound_node_id TEXT NOT NULL,
+  root_instance_id TEXT NOT NULL,
+  operation_fence TEXT NOT NULL,
+  target_reference TEXT NOT NULL,
+  target_digest TEXT NOT NULL,
+  chown INTEGER NOT NULL CHECK(chown IN (0, 1)),
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('planned', 'preflight_verified', 'completed', 'failed', 'superseded')),
+  preflight_receipt_json BLOB,
+  preflight_receipt_hash TEXT,
+  acknowledgement_key TEXT,
+  acknowledgement_hash TEXT,
+  requested_ns INTEGER NOT NULL,
+  verified_ns INTEGER,
+  completed_ns INTEGER,
+  PRIMARY KEY(computer_id, operation_revision),
+  UNIQUE(computer_id, idempotency_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS computer_reimage_active
+  ON computer_reimage_operations(computer_id) WHERE status IN ('planned', 'preflight_verified');
 CREATE TABLE IF NOT EXISTS computer_reconfiguration_aborts (
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
   aborted_revision INTEGER NOT NULL CHECK(aborted_revision > 0),
   intent_revision INTEGER NOT NULL CHECK(intent_revision > aborted_revision),
-  aborted_phase TEXT NOT NULL CHECK(aborted_phase IN ('backing_up', 'resetting', 'reimaging')),
+  aborted_phase TEXT NOT NULL CHECK(aborted_phase IN ('backing_up', 'resetting', 'reimaging', 'growing')),
   idempotency_key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
   actor TEXT NOT NULL,
@@ -825,6 +858,9 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	if err := s.migrateComputerResetConstraints(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateComputerAbortConstraints(ctx); err != nil {
+		return err
+	}
 	if err := s.migrateBackupDigestConstraint(ctx); err != nil {
 		return err
 	}
@@ -975,10 +1011,10 @@ func (s *Store) migrateComputerResetConstraints(ctx context.Context) error {
 	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_intent_history'`).Scan(&intentsSQL); err != nil {
 		return fmt.Errorf("l1: inspect Computer intent schema: %w", err)
 	}
-	migrateComputers := !strings.Contains(computersSQL, "'cloning'") || !strings.Contains(computersSQL, "'reimaging'") ||
-		!strings.Contains(computersSQL, "'growing'")
-	migrateIntents := !strings.Contains(intentsSQL, "'clone'") || !strings.Contains(intentsSQL, "'reimage'") ||
-		!strings.Contains(intentsSQL, "'grow'") || !strings.Contains(intentsSQL, "'abort'")
+	migrateComputers := !strings.Contains(computersSQL, "'reimaging'") || !strings.Contains(computersSQL, "'growing'") ||
+		!strings.Contains(computersSQL, "'restoring'") || !strings.Contains(computersSQL, "'cloning'")
+	migrateIntents := !strings.Contains(intentsSQL, "'reimage'") || !strings.Contains(intentsSQL, "'grow'") ||
+		!strings.Contains(intentsSQL, "'abort'") || !strings.Contains(intentsSQL, "'restore'") || !strings.Contains(intentsSQL, "'clone'")
 	if !migrateComputers && !migrateIntents {
 		return nil
 	}
@@ -994,9 +1030,11 @@ func (s *Store) migrateComputerResetConstraints(ctx context.Context) error {
 	if migrateComputers {
 		oldPhaseConstraint := ""
 		for _, candidate := range []string{
+			"'stable', 'projecting', 'resetting', 'backing_up', 'reimaging', 'growing', 'restoring', 'cloning', 'removing'",
 			"'stable', 'projecting', 'resetting', 'backing_up', 'restoring', 'cloning', 'reimaging', 'growing', 'removing'",
-			"'stable', 'projecting', 'resetting', 'backing_up', 'reimaging', 'growing', 'removing'",
 			"'stable', 'projecting', 'resetting', 'backing_up', 'restoring', 'cloning', 'removing'",
+			"'stable', 'projecting', 'resetting', 'backing_up', 'reimaging', 'growing', 'removing'",
+			"'stable', 'projecting', 'resetting', 'backing_up', 'reimaging', 'removing'",
 			"'stable', 'projecting', 'resetting', 'backing_up', 'removing'",
 			"'stable', 'projecting', 'resetting', 'removing'",
 			"'stable', 'projecting', 'removing'",
@@ -1034,9 +1072,11 @@ func (s *Store) migrateComputerResetConstraints(ctx context.Context) error {
 	if migrateIntents {
 		oldOperationConstraint := ""
 		for _, candidate := range []string{
+			"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'reimage', 'grow', 'abort', 'restore', 'clone'",
 			"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'restore', 'clone', 'reimage', 'grow', 'abort'",
-			"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'reimage', 'grow', 'abort'",
 			"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'restore', 'clone'",
+			"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'reimage', 'grow', 'abort'",
+			"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'reimage'",
 			"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap'",
 			"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create'",
 			"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset'",
@@ -1199,6 +1239,62 @@ func (s *Store) migrateStorageProvenanceConstraints(ctx context.Context) error {
 	}
 	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
 		return fmt.Errorf("l1: restore foreign keys after Storage provenance migration: %w", err)
+	}
+	return nil
+}
+
+// migrateComputerAbortConstraints widens the branch-introduced abort table
+// without assuming a fixed column set so a durable database from an earlier
+// review build remains openable.
+func (s *Store) migrateComputerAbortConstraints(ctx context.Context) error {
+	connection, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("l1: acquire Computer abort migration connection: %w", err)
+	}
+	defer connection.Close()
+	var sourceSQL string
+	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_reconfiguration_aborts'`).Scan(&sourceSQL); err != nil {
+		return fmt.Errorf("l1: inspect Computer abort schema: %w", err)
+	}
+	if strings.Contains(sourceSQL, "'growing'") {
+		return nil
+	}
+	const oldConstraint = "'backing_up', 'resetting', 'reimaging'"
+	const newConstraint = "'backing_up', 'resetting', 'reimaging', 'growing'"
+	if !strings.Contains(sourceSQL, oldConstraint) {
+		return errors.New("l1: Computer abort constraint has an unknown durable shape")
+	}
+	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return fmt.Errorf("l1: disable foreign keys for Computer abort migration: %w", err)
+	}
+	defer connection.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+	tx, err := connection.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("l1: begin Computer abort schema migration: %w", err)
+	}
+	defer tx.Rollback()
+	createSQL, err := migratedSQLiteCreateTable(sourceSQL, "computer_reconfiguration_aborts_migration",
+		map[string]string{oldConstraint: newConstraint})
+	if err != nil {
+		return fmt.Errorf("l1: rewrite Computer abort schema: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, createSQL); err != nil {
+		return fmt.Errorf("l1: create widened Computer abort schema: %w", err)
+	}
+	if err := copySQLiteTableColumns(ctx, tx, "computer_reconfiguration_aborts", "computer_reconfiguration_aborts_migration"); err != nil {
+		return fmt.Errorf("l1: copy Computer aborts during migration: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE computer_reconfiguration_aborts`); err != nil {
+		return fmt.Errorf("l1: replace old Computer abort schema: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE computer_reconfiguration_aborts_migration RENAME TO computer_reconfiguration_aborts`); err != nil {
+		return fmt.Errorf("l1: publish widened Computer abort schema: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("l1: commit Computer abort schema migration: %w", err)
+	}
+	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+		return fmt.Errorf("l1: restore foreign keys after Computer abort migration: %w", err)
 	}
 	return nil
 }

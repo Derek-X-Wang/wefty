@@ -80,7 +80,8 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 			"Computer %q has no abortable reconfiguration authority", computerID)
 	}
 	switch computer.ReconfigurationPhase {
-	case ComputerReconfigurationBackingUp, ComputerReconfigurationResetting, ComputerReconfigurationReimaging:
+	case ComputerReconfigurationBackingUp, ComputerReconfigurationResetting, ComputerReconfigurationReimaging,
+		ComputerReconfigurationGrowing:
 	default:
 		return Computer{}, false, protocolError(contract.ErrorConflict,
 			"Computer %q reconfiguration phase %q is not abortable", computerID, computer.ReconfigurationPhase)
@@ -88,6 +89,24 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 	boundNodeID := computer.BoundNodeID
 	if boundNodeID == "" {
 		boundNodeID = computer.CurrentJob.BoundNodeID
+	}
+	if boundNodeID == "" {
+		var query string
+		switch computer.ReconfigurationPhase {
+		case ComputerReconfigurationBackingUp:
+			query = `SELECT bound_node_id FROM computer_backup_operations WHERE computer_id=? AND operation_revision=?`
+		case ComputerReconfigurationResetting:
+			query = `SELECT bound_node_id FROM computer_storage_resets WHERE computer_id=? AND intent_revision=?`
+		case ComputerReconfigurationReimaging:
+			query = `SELECT bound_node_id FROM computer_reimage_operations WHERE computer_id=? AND operation_revision=?`
+		case ComputerReconfigurationGrowing:
+			query = `SELECT bound_node_id FROM computer_storage_grows WHERE computer_id=? AND operation_revision=?`
+		}
+		if query != "" {
+			if err := tx.QueryRowContext(ctx, query, computerID, computer.IntentRevision).Scan(&boundNodeID); err != nil {
+				return Computer{}, false, internalError(err, "read aborted Computer operation binding")
+			}
+		}
 	}
 	if boundNodeID == "" {
 		return Computer{}, false, protocolError(contract.ErrorConflict,
@@ -124,23 +143,47 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 		}
 	case ComputerReconfigurationReimaging:
 		if _, err := tx.ExecContext(ctx, `UPDATE computer_job_projections SET retired_ns=?, chown=0
-			WHERE computer_id=? AND current=0 AND retired_ns IS NULL AND spec_revision=?`, now.UnixNano(),
-			computerID, computer.CurrentSpecRevision+1); err != nil {
+			WHERE computer_id=? AND current=0 AND retired_ns IS NULL AND job_id=(
+				SELECT job_id FROM computer_intent_history WHERE computer_id=? AND intent_revision=?)`,
+			now.UnixNano(), computerID, computerID, abortedRevision); err != nil {
 			return Computer{}, false, internalError(err, "retire aborted Computer reimage projection")
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET desired_state=?, bound_node_id=NULL,
-			published_attempt_id=NULL, healthy_since_ns=NULL, next_restart_at=NULL
-			WHERE job_id IN (SELECT job_id FROM computer_job_projections WHERE computer_id=?
-				AND current=0 AND retired_ns=?)`, contract.ServiceDesiredStopped, computerID, now.UnixNano()); err != nil {
-			return Computer{}, false, internalError(err, "withdraw aborted Computer reimage projection")
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_reimage_operations SET status='superseded', completed_ns=?
+			WHERE computer_id=? AND operation_revision=? AND status IN ('planned', 'preflight_verified')`,
+			now.UnixNano(), computerID, abortedRevision); err != nil {
+			return Computer{}, false, internalError(err, "supersede aborted Computer reimage")
+		}
+	case ComputerReconfigurationGrowing:
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_grows SET status='superseded',
+			completed_ns=? WHERE computer_id=? AND operation_revision=? AND status='planned'`,
+			now.UnixNano(), computerID, abortedRevision); err != nil {
+			return Computer{}, false, internalError(err, "supersede aborted Computer grow")
 		}
 	}
-	// Preserve authoritative desired_state while holding the old projection
-	// stopped. An operator must explicitly restart after reviewing the abort.
-	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET desired_state=?, next_restart_at=NULL,
-		published_attempt_id=NULL, healthy_since_ns=NULL WHERE job_id=?`, contract.ServiceDesiredStopped,
-		computer.CurrentJobID); err != nil {
-		return Computer{}, false, internalError(err, "hold aborted Computer projection stopped")
+	if err := s.reconfigurationCheckpoint("abort_artifacts_superseded"); err != nil {
+		return Computer{}, false, err
+	}
+	lastFailure, err := json.Marshal(contract.SpawnFailure{Code: contract.SpawnFailureReconfigurationAborted,
+		Message: "Computer reconfiguration was aborted after its bound Node died", NodeID: boundNodeID})
+	if err != nil {
+		return Computer{}, false, internalError(err, "encode Computer reconfiguration abort observation")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, lease_expires_ns=MIN(lease_expires_ns, ?),
+		updated_ns=? WHERE job_id=? AND state IN (?, ?, ?)`, contract.AttemptLost, now.UnixNano(),
+		now.UnixNano(), computer.CurrentJobID, contract.AttemptClaimed, contract.AttemptRunning,
+		contract.AttemptAwaitingInput); err != nil {
+		return Computer{}, false, internalError(err, "fence aborted Computer attempt")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, current_attempt_id=NULL, updated_ns=? WHERE job_id=?`,
+		contract.JobStopped, now.UnixNano(), computer.CurrentJobID); err != nil {
+		return Computer{}, false, internalError(err, "stop aborted Computer projection")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET next_restart_at=NULL, last_failure=?,
+		published_attempt_id=NULL, healthy_since_ns=NULL WHERE job_id=?`, lastFailure, computer.CurrentJobID); err != nil {
+		return Computer{}, false, internalError(err, "record Computer reconfiguration abort observation")
+	}
+	if err := s.reconfigurationCheckpoint("abort_projection_stopped"); err != nil {
+		return Computer{}, false, err
 	}
 	nextRevision := abortedRevision + 1
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET intent_revision=?, applied_revision=?,
@@ -165,6 +208,9 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 		request.IdempotencyKey, requestHash, request.Actor, now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "persist Computer reconfiguration abort")
 	}
+	if err := s.reconfigurationCheckpoint("abort_recorded"); err != nil {
+		return Computer{}, false, err
+	}
 	updated, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
 		return Computer{}, false, internalError(err, "read aborted Computer reconfiguration")
@@ -172,5 +218,6 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 	if err := tx.Commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer reconfiguration abort")
 	}
+	s.notifyComputerPolicyChanged()
 	return updated, false, nil
 }

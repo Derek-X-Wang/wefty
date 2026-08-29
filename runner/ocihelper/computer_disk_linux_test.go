@@ -283,6 +283,39 @@ func TestComputerDiskOwnershipMigrationNeverFollowsSymlinks(t *testing.T) {
 	}
 }
 
+func TestComputerDiskOwnershipMigrationRetriesAfterMidWalkFailure(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a", "b", "c"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	injected := errors.New("injected lchown failure")
+	calls := 0
+	if err := migrateComputerDiskOwnership(root, 1001, 1002, func(string, int, int) error {
+		calls++
+		if calls == 3 {
+			return injected
+		}
+		return nil
+	}); !errors.Is(err, injected) {
+		t.Fatalf("mid-walk failure = %v", err)
+	}
+	visited := map[string]int{}
+	if err := migrateComputerDiskOwnership(root, 1001, 1002, func(path string, uid, gid int) error {
+		if uid != 1001 || gid != 1002 {
+			t.Fatalf("retry ownership = %d:%d", uid, gid)
+		}
+		visited[path]++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(visited) != 4 {
+		t.Fatalf("retry did not walk every entry: %#v", visited)
+	}
+}
+
 func TestComputerDiskSweepIgnoresRecycledForeignLoopNumber(t *testing.T) {
 	root := t.TempDir()
 	system := newFakeComputerDiskSystem()

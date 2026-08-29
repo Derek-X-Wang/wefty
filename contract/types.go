@@ -671,6 +671,7 @@ const (
 	SpawnFailureOCISpecRejected            SpawnFailureCode = "oci_spec_rejected"
 	SpawnFailureInsufficientMemory         SpawnFailureCode = "insufficient_memory"
 	SpawnFailureInsufficientDisk           SpawnFailureCode = "insufficient_disk"
+	SpawnFailureReconfigurationAborted     SpawnFailureCode = "reconfiguration_aborted"
 	SpawnFailurePassUnavailable            SpawnFailureCode = "pass_unavailable"
 )
 

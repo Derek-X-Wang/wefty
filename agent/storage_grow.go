@@ -48,7 +48,7 @@ func (controller *storageGrowController) process(ctx context.Context, directive 
 	}
 	_, err = controller.client.AcknowledgeComputerStorageGrow(ctx, directive.ComputerID,
 		l1.ComputerStorageGrowAcknowledgementRequest{NodeID: controller.nodeID, BootSessionID: controller.bootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+			IdempotencyKey: fmt.Sprintf("computer-grow:%s:%d", directive.ComputerID, directive.OperationRevision), Receipt: receipt})
 	return err
 }
 

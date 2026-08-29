@@ -592,7 +592,8 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 		return nil, internalError(err, "read Computer policy authority")
 	}
 	computerRows, err := tx.QueryContext(ctx, `SELECT computer_id FROM computers
-		WHERE desired_state<>'removed' AND (placement_node_id=? OR bound_node_id=?) ORDER BY computer_id`, nodeID, nodeID)
+		WHERE desired_state<>'removed' AND reconfiguration_phase='stable'
+		AND (placement_node_id=? OR bound_node_id=?) ORDER BY computer_id`, nodeID, nodeID)
 	if err != nil {
 		return nil, internalError(err, "list node Computers for policy")
 	}

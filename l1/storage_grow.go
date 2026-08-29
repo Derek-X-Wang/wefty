@@ -182,6 +182,7 @@ func (s *Store) BeginComputerGrow(ctx context.Context, computerID string, reques
 	if err := tx.Commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer grow intent")
 	}
+	s.notifyComputerPolicyChanged()
 	return updated, false, nil
 }
 
@@ -320,19 +321,8 @@ func (s *Store) AcknowledgeComputerStorageGrow(ctx context.Context, identityNode
 		if marshalErr != nil {
 			return Computer{}, internalError(marshalErr, "encode Computer grow capacity failure")
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, lease_expires_ns=MIN(lease_expires_ns, ?),
-			updated_ns=? WHERE job_id=? AND state IN (?, ?, ?)`, contract.AttemptLost, now.UnixNano(),
-			now.UnixNano(), row.JobID, contract.AttemptClaimed, contract.AttemptRunning,
-			contract.AttemptAwaitingInput); err != nil {
-			return Computer{}, internalError(err, "fence Computer attempt after grow capacity failure")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, current_attempt_id=NULL, updated_ns=?
-			WHERE job_id=?`, contract.JobFailed, now.UnixNano(), row.JobID); err != nil {
-			return Computer{}, internalError(err, "latch Computer grow capacity failure")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET desired_state=?, next_restart_at=NULL,
-			last_failure=?, healthy_since_ns=NULL, published_attempt_id=NULL WHERE job_id=?`,
-			contract.ServiceDesiredStopped, latchedFailure, row.JobID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET last_failure=?, next_restart_at=NULL
+			WHERE job_id=?`, latchedFailure, row.JobID); err != nil {
 			return Computer{}, internalError(err, "record Computer grow capacity failure")
 		}
 	}
@@ -358,5 +348,6 @@ func (s *Store) AcknowledgeComputerStorageGrow(ctx context.Context, identityNode
 	if err := tx.Commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer grow acknowledgement")
 	}
+	s.notifyComputerPolicyChanged()
 	return updated, nil
 }

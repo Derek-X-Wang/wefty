@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -48,26 +49,37 @@ func (engine *ContainerdEngine) reserveGrowCapacity(request GrowComputerStorageR
 		engine.capacityReservations = make(map[string]*capacityReservation)
 	}
 	reservation := engine.capacityReservations[request.Authority.JobID]
+	delta := request.NewDiskBytes - request.Storage.DiskBytes
+	if delta <= 0 {
+		return 0, false, errors.New("Computer grow delta must be positive")
+	}
 	if reservation != nil && reservation.diskBytes != request.Storage.DiskBytes && reservation.diskBytes != request.NewDiskBytes {
 		return 0, false, errors.New("Computer grow conflicts with its atomic capacity reservation")
 	}
-	gate := request.NewDiskBytes - request.Storage.DiskBytes
-	if imageSize < 0 {
-		gate = request.NewDiskBytes
-	} else if imageSize == request.NewDiskBytes {
+	gate := delta
+	if imageSize == request.NewDiskBytes {
 		// A retry after filesystem expansion must not charge the already
 		// materialized delta a second time.
+		gate = 0
+	} else if reservation != nil && reservation.pendingDiskBytes != 0 {
+		if reservation.pendingDiskBytes != delta {
+			return 0, false, errors.New("Computer grow conflicts with its pending delta reservation")
+		}
 		gate = 0
 	}
 	pending := int64(0)
 	for jobID, existing := range engine.capacityReservations {
-		if jobID == request.Authority.JobID || existing.diskMaterialized {
+		if jobID == request.Authority.JobID {
 			continue
 		}
-		if existing.diskBytes > int64(^uint64(0)>>1)-pending {
+		charge := existing.pendingDiskBytes
+		if !existing.diskMaterialized {
+			charge += existing.diskBytes
+		}
+		if charge > int64(^uint64(0)>>1)-pending {
 			return 0, false, errors.New("Computer disk capacity accounting overflowed")
 		}
-		pending += existing.diskBytes
+		pending += charge
 	}
 	available -= pending
 	if available < 0 {
@@ -77,11 +89,16 @@ func (engine *ContainerdEngine) reserveGrowCapacity(request GrowComputerStorageR
 		return available, false, nil
 	}
 	if reservation == nil {
-		reservation = &capacityReservation{attempts: make(map[string]struct{})}
+		reservation = &capacityReservation{diskBytes: request.Storage.DiskBytes,
+			diskMaterialized: true, attempts: make(map[string]struct{})}
 		engine.capacityReservations[request.Authority.JobID] = reservation
 	}
-	reservation.diskBytes = request.NewDiskBytes
-	reservation.diskMaterialized = false
+	if imageSize == request.NewDiskBytes {
+		reservation.diskBytes = request.NewDiskBytes
+		reservation.pendingDiskBytes = 0
+	} else {
+		reservation.pendingDiskBytes = delta
+	}
 	return available, true, nil
 }
 
@@ -97,6 +114,7 @@ func (engine *ContainerdEngine) rollbackGrowCapacity(jobID string, oldBytes int6
 		return
 	}
 	reservation.diskBytes = oldBytes
+	reservation.pendingDiskBytes = 0
 	reservation.diskMaterialized = imagePresent
 }
 
@@ -136,7 +154,41 @@ func (engine *ContainerdEngine) acquireComputerGrowLock(diskRoot string, storage
 	return nil, release, nil
 }
 
-func growExt4(ctx context.Context, imagePath, loopDevice string, oldBytes, newBytes int64) error {
+func readExt4FilesystemBytes(ctx context.Context, target string) (int64, error) {
+	dumpe2fs, err := findRootTool("dumpe2fs")
+	if err != nil {
+		return 0, err
+	}
+	output, err := exec.CommandContext(ctx, dumpe2fs, "-h", target).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("read ext4 Computer filesystem size: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	var blockCount, blockSize int64
+	for _, line := range strings.Split(string(output), "\n") {
+		key, value, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		number, parseErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if parseErr != nil {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "Block count":
+			blockCount = number
+		case "Block size":
+			blockSize = number
+		}
+	}
+	if blockCount <= 0 || blockSize <= 0 || blockCount > int64(^uint64(0)>>1)/blockSize {
+		return 0, errors.New("ext4 Computer filesystem size readback was incomplete")
+	}
+	return blockCount * blockSize, nil
+}
+
+func growExt4(ctx context.Context, imagePath, loopDevice string, oldBytes, newBytes int64,
+	readFilesystemBytes func(context.Context, string) (int64, error),
+) error {
 	info, err := os.Lstat(imagePath)
 	if err != nil {
 		return err
@@ -145,7 +197,24 @@ func growExt4(ctx context.Context, imagePath, loopDevice string, oldBytes, newBy
 		return errors.New("Computer disk image size conflicts with grow authority")
 	}
 	if info.Size() == oldBytes {
-		if err := fullyAllocateComputerDisk(imagePath, newBytes); err != nil {
+		file, openErr := os.OpenFile(imagePath, os.O_RDWR, 0)
+		if openErr != nil {
+			return openErr
+		}
+		allocationErr := unix.Fallocate(int(file.Fd()), unix.FALLOC_FL_KEEP_SIZE, oldBytes, newBytes-oldBytes)
+		if allocationErr == nil {
+			allocationErr = file.Truncate(newBytes)
+		}
+		if allocationErr == nil {
+			allocationErr = file.Sync()
+		}
+		allocationErr = errors.Join(allocationErr, file.Close())
+		if allocationErr != nil {
+			_ = os.Truncate(imagePath, oldBytes)
+			return allocationErr
+		}
+		if err := verifyComputerDiskAllocation(imagePath, newBytes); err != nil {
+			_ = os.Truncate(imagePath, oldBytes)
 			return err
 		}
 	}
@@ -168,16 +237,47 @@ func growExt4(ctx context.Context, imagePath, loopDevice string, oldBytes, newBy
 	}
 	output, err := exec.CommandContext(ctx, resize2fs, target).CombinedOutput()
 	if err != nil {
+		_ = os.Truncate(imagePath, oldBytes)
 		return fmt.Errorf("expand ext4 Computer filesystem: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	observed, err := readFilesystemBytes(ctx, target)
+	if err != nil || observed < newBytes {
+		_ = os.Truncate(imagePath, oldBytes)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("ext4 Computer filesystem size readback = %d, want at least %d", observed, newBytes)
 	}
 	return verifyComputerDiskAllocation(imagePath, newBytes)
 }
 
 func (engine *ContainerdEngine) resizeComputerStorage(ctx context.Context, imagePath, loopDevice string, oldBytes, newBytes int64) error {
 	if engine.computerGrowResize != nil {
-		return engine.computerGrowResize(ctx, imagePath, loopDevice, oldBytes, newBytes)
+		if err := engine.computerGrowResize(ctx, imagePath, loopDevice, oldBytes, newBytes); err != nil {
+			return err
+		}
+		reader := engine.computerGrowFilesystemBytes
+		if reader == nil {
+			reader = readExt4FilesystemBytes
+		}
+		target := imagePath
+		if loopDevice != "" {
+			target = loopDevice
+		}
+		observed, err := reader(ctx, target)
+		if err != nil {
+			return err
+		}
+		if observed < newBytes {
+			return fmt.Errorf("ext4 Computer filesystem size readback = %d, want at least %d", observed, newBytes)
+		}
+		return verifyComputerDiskAllocation(imagePath, newBytes)
 	}
-	return growExt4(ctx, imagePath, loopDevice, oldBytes, newBytes)
+	reader := engine.computerGrowFilesystemBytes
+	if reader == nil {
+		reader = readExt4FilesystemBytes
+	}
+	return growExt4(ctx, imagePath, loopDevice, oldBytes, newBytes, reader)
 }
 
 func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request GrowComputerStorageRequest) (GrowComputerStorageResponse, error) {
@@ -220,6 +320,9 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 		}
 		imageSize = imageInfo.Size()
 	}
+	if !imagePresent {
+		return GrowComputerStorageResponse{}, errors.New("Computer grow refused because the current disk image is missing")
+	}
 	available, admitted, err := engine.reserveGrowCapacity(request, diskRoot, imageSize)
 	if err != nil {
 		return GrowComputerStorageResponse{}, err
@@ -237,29 +340,13 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 	} else if present && manifest.Attached != nil {
 		return GrowComputerStorageResponse{}, errors.New("Computer grow found an attached manifest without live attachment ownership")
 	}
-	if !imagePresent {
-		if present && (manifest.Attached != nil || manifest.Pending != nil || manifest.PreviousDetachment != nil) {
-			return GrowComputerStorageResponse{}, errors.New("Computer grow found missing bytes for existing attachment history")
+	if err := engine.resizeComputerStorage(ctx, imagePath, loopDevice, request.Storage.DiskBytes, request.NewDiskBytes); err != nil {
+		engine.rollbackGrowCapacity(request.Authority.JobID, request.Storage.DiskBytes, true)
+		_ = os.Truncate(imagePath, request.Storage.DiskBytes)
+		if errors.Is(err, unix.ENOSPC) || strings.Contains(strings.ToLower(err.Error()), "no space left on device") {
+			receipt, receiptErr := growReceipt(request, "computer_storage_grow_failed_unchanged", false, "insufficient_disk", available)
+			return GrowComputerStorageResponse{Receipt: receipt}, receiptErr
 		}
-		temporary, err := os.CreateTemp(diskRoot, ".grow-disk.tmp-")
-		if err != nil {
-			return GrowComputerStorageResponse{}, err
-		}
-		temporaryPath := temporary.Name()
-		_ = temporary.Close()
-		defer os.Remove(temporaryPath)
-		if err := engine.computerDiskSystem().allocateAndFormat(ctx, temporaryPath, request.NewDiskBytes); err != nil {
-			if errors.Is(err, unix.ENOSPC) {
-				engine.rollbackGrowCapacity(request.Authority.JobID, request.Storage.DiskBytes, imagePresent)
-				receipt, receiptErr := growReceipt(request, "computer_storage_grow_failed_unchanged", false, "insufficient_disk", available)
-				return GrowComputerStorageResponse{Receipt: receipt}, receiptErr
-			}
-			return GrowComputerStorageResponse{}, err
-		}
-		if err := os.Rename(temporaryPath, imagePath); err != nil {
-			return GrowComputerStorageResponse{}, err
-		}
-	} else if err := engine.resizeComputerStorage(ctx, imagePath, loopDevice, request.Storage.DiskBytes, request.NewDiskBytes); err != nil {
 		return GrowComputerStorageResponse{}, err
 	}
 	if err := engine.growCheckpoint("filesystem_expanded"); err != nil {

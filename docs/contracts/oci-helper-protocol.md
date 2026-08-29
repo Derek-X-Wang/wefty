@@ -197,6 +197,7 @@ heartbeats.
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
 | `CopyComputerStorage` | Session-authorized exact restore or clone operation, published Backup/copy source, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. Under the Backup mutex it revalidates source size and digest before destination publication and fully allocates the destination. Restore preserves bytes exactly; clone narrowly rekeys machine ID and SSH host keys, never browser profile data, and expands a larger filesystem. Its receipt binds every authority and observed size/digest; it does not attach or start the Computer. |
 | `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. |
+| `PreflightComputerReimage` | Session-authorized exact current Storage generation, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. It requires positive detachment evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived evidence before L1 may publish the staging projection. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend, and only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
@@ -582,6 +583,19 @@ never reports applied before full allocation plus filesystem expansion. The
 capacity decision includes unmaterialized admitted reservations under the same
 lock, so existing workloads retain their reservations and the newcomer pays.
 An insufficient-capacity receipt is valid only before bytes change.
+
+`PreflightComputerReimage` runs only after the old Job is stopped and the disk
+manifest contains exact same-boot reap or prior-boot sweep evidence. Image
+delivery remains agent policy; the helper consumes only the locally selected
+digest and verifies its manifest platform before reading image-user metadata.
+It reads the detached ext4 root UID:GID without following tenant paths, refuses
+an ownership mismatch unless the durable operation explicitly carries `chown`,
+and binds the receipt to both Jobs, the operation revision/fence, Node,
+managed-root instance, helper generation, and consumed detachment receipt.
+If the exact digest is unavailable or has no manifest for the bound Node's
+platform, the helper returns a typed `failed_unchanged` receipt only after the
+same detachment and disk-allocation checks. L1 then retires the refused staging
+projection while preserving the stopped current Job and disk generation.
 
 Computer removal carries the same exact Storage identity plus current node,
 boot, Job, removal-generation, and cleanup-fence authority to the helper. The

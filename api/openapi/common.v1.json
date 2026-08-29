@@ -998,6 +998,34 @@
           "operation_fence": { "type": "string", "minLength": 1 }
         }
       },
+      "ComputerReimagePreflightDirective": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "computer_id", "storage_id", "storage_generation", "old_job_id", "staging_job_id",
+          "bound_node_id", "root_instance_id", "operation_revision", "operation_fence", "target_image", "chown"
+        ],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 },
+          "storage_id": { "type": "string", "minLength": 1 },
+          "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "old_job_id": { "type": "string", "minLength": 1 },
+          "staging_job_id": { "type": "string", "minLength": 1 },
+          "bound_node_id": { "type": "string", "minLength": 1 },
+          "root_instance_id": { "type": "string", "minLength": 1 },
+          "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+          "operation_fence": { "type": "string", "minLength": 1 },
+          "target_image": {
+            "type": "object", "additionalProperties": false,
+            "required": ["reference", "digest"],
+            "properties": {
+              "reference": { "type": "string", "minLength": 1 },
+              "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+            }
+          },
+          "chown": { "type": "boolean" }
+        }
+      },
       "Node": {
         "allOf": [
           { "$ref": "#/components/schemas/NodeRegistration" },
@@ -1077,7 +1105,7 @@
           { "$ref": "#/components/schemas/Node" },
           {
             "type": "object",
-            "required": ["removal_directives", "storage_reset_directives", "storage_grow_directives", "backup_directives", "backup_prune_directives", "storage_copy_directives"],
+            "required": ["removal_directives", "storage_reset_directives", "storage_grow_directives", "reimage_preflight_directives", "backup_directives", "backup_prune_directives", "storage_copy_directives"],
             "properties": {
               "removal_directives": {
                 "type": "array",
@@ -1096,6 +1124,12 @@
                 "items": { "$ref": "#/components/schemas/ComputerStorageGrowDirective" },
                 "readOnly": true,
                 "description": "Revision- and managed-root-fenced grow work. The current Storage generation and running attempt remain authoritative until a positive applied receipt is accepted."
+              },
+              "reimage_preflight_directives": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/ComputerReimagePreflightDirective" },
+                "readOnly": true,
+                "description": "Identity-, managed-root-, and revision-fenced work that verifies target image platform, image user and detached disk ownership before reimage publication."
               },
               "backup_directives": {
                 "type": "array",

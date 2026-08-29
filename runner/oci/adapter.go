@@ -1751,6 +1751,63 @@ func (adapter *Adapter) GrowComputerStorage(ctx context.Context, request workloa
 	return response.Receipt, nil
 }
 
+func (adapter *Adapter) PreflightComputerReimage(ctx context.Context, request workloadrunner.ComputerReimagePreflightRequest) (workloadrunner.ComputerReimagePreflightReceipt, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return workloadrunner.ComputerReimagePreflightReceipt{}, errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return workloadrunner.ComputerReimagePreflightReceipt{}, err
+	}
+	platform, ok := adapter.probePlatform(session)
+	if !ok {
+		return workloadrunner.ComputerReimagePreflightReceipt{}, errors.New("OCI runtime platform has not been positively probed")
+	}
+	var deliveryErr error
+	if _, failure, err := adapter.ensureImage(ctx, session, request.TargetReference, request.TargetDigest,
+		platform, time.Time{}, nil); err != nil {
+		if failure != nil {
+			deliveryErr = fmt.Errorf("preflight Computer reimage image: %s: %w", failure.Code, err)
+		} else {
+			deliveryErr = err
+		}
+	}
+	handshake := session.Handshake()
+	response, err := session.PreflightComputerReimage(ctx, ocihelper.PreflightComputerReimageRequest{
+		Storage: ocihelper.ComputerStorageReference{ComputerID: request.Storage.ComputerID,
+			StorageID: request.Storage.StorageID, StorageGeneration: request.Storage.StorageGeneration,
+			IntentRevision: request.Storage.IntentRevision, DiskBytes: request.Storage.DiskBytes},
+		TargetImage: ocihelper.EnsureImageRequest{Reference: request.TargetReference, Digest: request.TargetDigest,
+			Platform: platform}, Chown: request.Chown,
+		Authority: ocihelper.ComputerReimagePreflightAuthority{NodeID: request.NodeID,
+			BootSessionID: request.BootSessionID, HelperGeneration: handshake.SessionGeneration,
+			RootInstanceID: request.RootInstanceID, OldJobID: request.OldJobID,
+			StagingJobID: request.StagingJobID, OperationRevision: request.OperationRevision,
+			OperationFence: request.OperationFence},
+	})
+	if err != nil {
+		if deliveryErr != nil {
+			return workloadrunner.ComputerReimagePreflightReceipt{}, deliveryErr
+		}
+		return workloadrunner.ComputerReimagePreflightReceipt{}, err
+	}
+	r := response.Receipt
+	if (r.Kind != "computer_reimage_preflight_verified" && r.Kind != "computer_reimage_preflight_failed_unchanged") ||
+		r.ReceiptID == "" || r.HelperGeneration == 0 {
+		return workloadrunner.ComputerReimagePreflightReceipt{}, errors.New("OCI helper did not return assertion-derived Computer reimage preflight evidence")
+	}
+	return workloadrunner.ComputerReimagePreflightReceipt{Kind: r.Kind, ReceiptID: r.ReceiptID,
+		ComputerID: r.ComputerID, StorageID: r.StorageID, StorageGeneration: r.StorageGeneration,
+		OldJobID: r.OldJobID, StagingJobID: r.StagingJobID, NodeID: r.NodeID,
+		RootInstanceID: r.RootInstanceID, OperationRevision: r.OperationRevision,
+		OperationFence: r.OperationFence, TargetDigest: r.TargetDigest, PlatformOS: r.PlatformOS,
+		PlatformArchitecture: r.PlatformArchitecture, ImageUID: r.ImageUID, ImageGID: r.ImageGID,
+		DiskRootUID: r.DiskRootUID, DiskRootGID: r.DiskRootGID,
+		DetachmentReceiptID: r.DetachmentReceiptID, DetachmentAttemptID: r.DetachmentAttemptID,
+		DetachmentFencingToken: r.DetachmentFencingToken, HelperGeneration: r.HelperGeneration,
+		FailureCode: r.FailureCode}, nil
+}
+
 func (adapter *Adapter) CreateComputerBackup(ctx context.Context, request workloadrunner.ComputerBackupRequest) (workloadrunner.ComputerBackupCopyReceipt, error) {
 	if adapter == nil || adapter.sessions == nil {
 		return workloadrunner.ComputerBackupCopyReceipt{}, errors.New("OCI helper session is not configured")

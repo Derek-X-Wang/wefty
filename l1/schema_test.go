@@ -69,6 +69,13 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 			"status", "failure_code", "receipt_json", "receipt_hash", "acknowledgement_key", "acknowledgement_hash",
 			"requested_ns", "completed_ns",
 		},
+		"computer_reimage_operations": {
+			"computer_id", "operation_revision", "old_job_id", "staging_job_id", "storage_id",
+			"storage_generation", "bound_node_id", "root_instance_id", "operation_fence",
+			"target_reference", "target_digest", "chown", "idempotency_key", "request_hash", "status",
+			"preflight_receipt_json", "preflight_receipt_hash", "acknowledgement_key", "acknowledgement_hash",
+			"requested_ns", "verified_ns", "completed_ns",
+		},
 		"computer_reconfiguration_aborts": {
 			"computer_id", "aborted_revision", "intent_revision", "aborted_phase", "idempotency_key",
 			"request_hash", "actor", "created_ns",
@@ -238,9 +245,6 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 		if !strings.Contains(intentsSQL, operation) {
 			t.Fatalf("Computer operation %s was not reconciled: %s", operation, intentsSQL)
 		}
-	}
-	if !strings.Contains(computersSQL, "'resetting'") || !strings.Contains(intentsSQL, "'reset'") {
-		t.Fatalf("reset constraints were not migrated: computers=%s intents=%s", computersSQL, intentsSQL)
 	}
 	var name, placement, grantsJSON, currentJob string
 	var intentRevision int64

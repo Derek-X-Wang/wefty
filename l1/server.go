@@ -273,6 +273,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/removal-acknowledgement", s.acknowledgeServiceRemoval)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-reset-acknowledgement", s.acknowledgeComputerStorageReset)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-grow-acknowledgement", s.acknowledgeComputerStorageGrow)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/reimage-preflight-acknowledgement", s.acknowledgeComputerReimagePreflight)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-retirement-acknowledgement", s.acknowledgeComputerStorageRetirement)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/backup-acknowledgement", s.acknowledgeComputerBackup)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/backup-prune-acknowledgement", s.acknowledgeComputerBackupPrune)
@@ -1225,6 +1226,11 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	reimages, err := s.store.ListNodeComputerReimagePreflightDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	backups, err := s.store.ListNodeComputerBackupDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
 	if err != nil {
 		writeError(w, err)
@@ -1266,7 +1272,7 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		computerPolicy = nil
 	}
 	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, RemovalDirectives: directives,
-		StorageResetDirectives: storageResets, StorageGrowDirectives: storageGrows, BackupDirectives: backups,
+		StorageResetDirectives: storageResets, StorageGrowDirectives: storageGrows, ReimageDirectives: reimages, BackupDirectives: backups,
 		BackupPruneDirectives: backupPrunes, StorageCopyDirectives: storageCopies, ComputerPolicy: computerPolicy})
 }
 
@@ -1360,6 +1366,21 @@ func (s *Server) acknowledgeComputerStorageGrow(w http.ResponseWriter, r *http.R
 			writeError(w, err)
 			return
 		}
+	}
+	writeJSON(w, http.StatusOK, redactComputer(computer))
+}
+
+func (s *Server) acknowledgeComputerReimagePreflight(w http.ResponseWriter, r *http.Request) {
+	var request ComputerReimagePreflightAcknowledgementRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	computer, err := s.store.AcknowledgeComputerReimagePreflight(r.Context(), identityFromRequest(r).NodeID,
+		r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, redactComputer(computer))
 }

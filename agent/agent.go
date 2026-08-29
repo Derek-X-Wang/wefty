@@ -241,6 +241,7 @@ func New(config Config) (*Agent, error) {
 	var ociRemovalProof workloadrunner.RuntimeRemovalProofRuntime
 	var computerStorageResetter workloadrunner.ComputerStorageResetter
 	var computerStorageGrower workloadrunner.ComputerStorageGrower
+	var computerReimagePreflighter workloadrunner.ComputerReimagePreflighter
 	var computerBackupper workloadrunner.ComputerBackupper
 	var computerStorageCopier workloadrunner.ComputerStorageCopier
 	if runtimeAdapter, configured := runtimes.selectKind(contract.JobKindOCI); configured {
@@ -254,6 +255,7 @@ func New(config Config) (*Agent, error) {
 		}
 		computerStorageResetter, _ = runtimeAdapter.(workloadrunner.ComputerStorageResetter)
 		computerStorageGrower, _ = runtimeAdapter.(workloadrunner.ComputerStorageGrower)
+		computerReimagePreflighter, _ = runtimeAdapter.(workloadrunner.ComputerReimagePreflighter)
 		computerBackupper, _ = runtimeAdapter.(workloadrunner.ComputerBackupper)
 		computerStorageCopier, _ = runtimeAdapter.(workloadrunner.ComputerStorageCopier)
 	}
@@ -325,6 +327,8 @@ func New(config Config) (*Agent, error) {
 	}
 	session.storageGrows = newStorageGrowController(client, computerStorageGrower, config.NodeID,
 		config.BootSessionID, registration.RootInstanceID, logf)
+	session.reimagePreflights = newReimagePreflightController(client, computerReimagePreflighter,
+		config.NodeID, config.BootSessionID, registration.RootInstanceID, logf)
 	session.backups = newBackupController(client, computerBackupper, config.NodeID, config.BootSessionID,
 		registration.RootInstanceID, logf)
 	if session.backups != nil {

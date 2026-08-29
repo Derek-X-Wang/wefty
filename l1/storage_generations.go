@@ -175,7 +175,11 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 		return Computer{}, false, protocolError(contract.ErrorConflict, "Computer %q exhausted Storage generation space", computerID)
 	}
 	nextRevision := computer.IntentRevision + 1
-	nextGeneration := computer.StorageGeneration + 1
+	var nextGeneration int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(storage_generation), 0) + 1
+		FROM computer_storage_generations WHERE computer_id=?`, computerID).Scan(&nextGeneration); err != nil {
+		return Computer{}, false, internalError(err, "reserve monotonic Computer Storage generation")
+	}
 	boundNodeID := computer.BoundNodeID
 	if boundNodeID == "" {
 		boundNodeID = computer.PlacementNodeID
@@ -239,6 +243,7 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	if err := tx.Commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer Storage reset reservation")
 	}
+	s.notifyComputerPolicyChanged()
 	return updated, false, nil
 }
 

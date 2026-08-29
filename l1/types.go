@@ -258,13 +258,14 @@ type Node struct {
 // off the operator-visible Node projection because they carry cleanup fences.
 type HeartbeatResponse struct {
 	Node
-	RemovalDirectives      []RemovalDirective              `json:"removal_directives"`
-	StorageResetDirectives []ComputerStorageResetDirective `json:"storage_reset_directives"`
-	StorageGrowDirectives  []ComputerStorageGrowDirective  `json:"storage_grow_directives"`
-	BackupDirectives       []ComputerBackupDirective       `json:"backup_directives"`
-	BackupPruneDirectives  []ComputerBackupPruneDirective  `json:"backup_prune_directives"`
-	StorageCopyDirectives  []ComputerStorageCopyDirective  `json:"storage_copy_directives"`
-	ComputerPolicy         *ComputerPolicySnapshot         `json:"computer_policy,omitempty"`
+	RemovalDirectives      []RemovalDirective                  `json:"removal_directives"`
+	StorageResetDirectives []ComputerStorageResetDirective     `json:"storage_reset_directives"`
+	StorageGrowDirectives  []ComputerStorageGrowDirective      `json:"storage_grow_directives"`
+	ReimageDirectives      []ComputerReimagePreflightDirective `json:"reimage_preflight_directives"`
+	BackupDirectives       []ComputerBackupDirective           `json:"backup_directives"`
+	BackupPruneDirectives  []ComputerBackupPruneDirective      `json:"backup_prune_directives"`
+	StorageCopyDirectives  []ComputerStorageCopyDirective      `json:"storage_copy_directives"`
+	ComputerPolicy         *ComputerPolicySnapshot             `json:"computer_policy,omitempty"`
 }
 
 type ServiceBindingProofRequest struct {

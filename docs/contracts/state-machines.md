@@ -131,9 +131,11 @@ flock, revalidates detachment, durably fences stale attaches in the shared disk
 manifest, then fully allocates, formats, and verifies the successor. Its
 receipt binds the exact managed-root instance in addition to Computer, Storage,
 both generations, Job, Node, reset revision, cleanup fence, and helper
-generation. L1 durably records that receipt before a separate publication
-transaction changes old `current → retired`, staging `→ current`, and advances
-`storage_generation`; the same Job remains stopped and unclaimable. Only after
+generation. L1 durably records that receipt before a separate destroy-last
+publication transaction changes old `current → retired`, staging `→ current`,
+and advances `storage_generation`; the same Job remains stopped and
+unclaimable. Attaching N+1 requires the identity-bound receipt proving N
+detached, never an assertion that N's bytes are already absent. Only after
 publication does the agent retire predecessor bytes through the shared
 authority-bound disk deletion and assertion-derived removal attestation. That
 acknowledgement advances `applied_revision` and returns the Computer to
@@ -147,7 +149,9 @@ projection, and retains Computer identity, placement, grants, Storage identity,
 generation, disk contents, and authoritative desired state. The optional
 `chown` capability authorizes one crash-resumable traversal that uses lstat and
 lchown semantics and never follows tenant-controlled symlinks. A failed new
-image latches on that projection; it never rolls back automatically.
+image preflight records a typed failure, retires the refused staging
+projection, and leaves the prior projection stopped and operable; it never
+publishes unverified image authority.
 
 A grow intent is strictly larger than `desired_disk_bytes`. It preserves the
 current immutable Job, attempt, Computer identity, Storage identity, and
@@ -158,7 +162,7 @@ before L1 advances the size authority. `insufficient_disk` proves the old size
 was unchanged and recovery is an explicit Computer restart; shrink is never an
 operation.
 
-`backing_up`, `resetting`, and `reimaging` have one typed abort escape hatch
+`backing_up`, `resetting`, `reimaging`, and `growing` have one typed abort escape hatch
 when their exact bound Node is durably `dead`. Abort is CAS- and
 idempotency-guarded, preserves Computer desired state, supersedes uncertain
 artifacts for later composite removal, and holds the projection stopped until

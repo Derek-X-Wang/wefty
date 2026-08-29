@@ -767,6 +767,60 @@
         }
       }
     },
+    "/v1/agent/computers/{computer_id}/reimage-preflight-acknowledgement": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "acknowledgeComputerReimagePreflight",
+        "summary": "Accept assertion-derived Computer reimage preflight evidence",
+        "description": "The authenticated current node submits helper evidence binding the exact managed-root instance, old and staging Jobs, operation revision and fence, target digest and platform, image and disk-root ownership, and positive detachment receipt. A typed image failure proves the detached disk remained unchanged and releases the refused staging projection.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
+          "properties": {
+            "node_id": { "type": "string", "minLength": 1 },
+            "boot_session_id": { "type": "string", "minLength": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 },
+            "receipt": {
+              "type": "object", "additionalProperties": false,
+              "required": ["kind", "receipt_id", "computer_id", "storage_id", "storage_generation", "old_job_id", "staging_job_id", "node_id", "root_instance_id", "operation_revision", "operation_fence", "target_digest", "platform_os", "platform_architecture", "image_uid", "image_gid", "disk_root_uid", "disk_root_gid", "detachment_receipt_id", "detachment_attempt_id", "detachment_fencing_token", "helper_generation", "failure_code"],
+              "properties": {
+                "kind": { "enum": ["computer_reimage_preflight_verified", "computer_reimage_preflight_failed_unchanged"] },
+                "receipt_id": { "type": "string", "minLength": 1 },
+                "computer_id": { "type": "string", "minLength": 1 },
+                "storage_id": { "type": "string", "minLength": 1 },
+                "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+                "old_job_id": { "type": "string", "minLength": 1 },
+                "staging_job_id": { "type": "string", "minLength": 1 },
+                "node_id": { "type": "string", "minLength": 1 },
+                "root_instance_id": { "type": "string", "minLength": 1 },
+                "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+                "operation_fence": { "type": "string", "minLength": 1 },
+                "target_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "platform_os": { "type": "string", "minLength": 1 },
+                "platform_architecture": { "type": "string", "minLength": 1 },
+                "image_uid": { "type": "integer", "minimum": 0 },
+                "image_gid": { "type": "integer", "minimum": 0 },
+                "disk_root_uid": { "type": "integer", "minimum": 0 },
+                "disk_root_gid": { "type": "integer", "minimum": 0 },
+                "detachment_receipt_id": { "type": "string", "minLength": 1 },
+                "detachment_attempt_id": { "type": "string", "minLength": 1 },
+                "detachment_fencing_token": { "type": "string", "minLength": 1 },
+                "helper_generation": { "type": "integer", "minimum": 1 },
+                "failure_code": { "type": "string", "enum": ["", "image_unavailable", "image_platform_unsupported"] }
+              }
+            }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Preflight evidence accepted or identically replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/agent/computers/{computer_id}/storage-reset-acknowledgement": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
