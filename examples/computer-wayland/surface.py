@@ -109,7 +109,7 @@ def tree_has_focused_oracle():
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
         return False
     pending = [root]
-    browser_output_sized = False
+    browser_fullscreen = False
     keyboard_focused = False
     while pending:
         node = pending.pop()
@@ -117,12 +117,12 @@ def tree_has_focused_oracle():
             continue
         rect = node.get("rect", {})
         if node.get("name") == "Wefty Wayland Computer" and rect.get("width") == 1280 and rect.get("height") == 720:
-            browser_output_sized = True
+            browser_fullscreen = True
         if node.get("app_id") == "wev" and node.get("focused") is True:
             keyboard_focused = True
         pending.extend(node.get("nodes", []))
         pending.extend(node.get("floating_nodes", []))
-    return browser_output_sized and keyboard_focused
+    return browser_fullscreen and keyboard_focused
 
 
 def publish_surface_readiness():
@@ -144,6 +144,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def focus_keyboard_oracle(self):
+        try:
+            subprocess.run(
+                ["swaymsg", '[app_id="wev"] focus'],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     def do_GET(self):
         if self.path == "/":
@@ -177,7 +190,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        if self.path != "/surface-ready":
+        if self.path not in ("/surface-ready", "/input"):
             self.send_error(404)
             return
         try:
@@ -193,11 +206,15 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeError, json.JSONDecodeError):
             self.send_error(400)
             return
-        if value != {"version": 1}:
+        if self.path == "/surface-ready":
+            if value != {"version": 1}:
+                self.send_error(400)
+                return
+            with open(BROWSER_READY, "w", encoding="ascii") as marker:
+                marker.write("ready\n")
+        elif not self.focus_keyboard_oracle() or not wefty_record_input(value):
             self.send_error(400)
             return
-        with open(BROWSER_READY, "w", encoding="ascii") as marker:
-            marker.write("ready\n")
         self.send_response(204)
         self.end_headers()
 

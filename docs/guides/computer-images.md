@@ -95,9 +95,10 @@ published library contains no mutation hook; the `text-frames-accepted`
 derivative recompiles it with `-Dwefty_mutation_hooks=true` before proving the
 owning cell fails.
 
-The image derives its input receipt after compositor delivery. A transparent,
-output-sized native `wev` client records both `wl_pointer` coordinates and
-`wl_keyboard` events delivered by Sway. The checker first
+The image derives its input receipt after compositor delivery. Chromium's
+Wayland surface records pointer coordinates, while a focused native `wev`
+client records `wl_keyboard` events. After each pointer event, the image
+restores `wev` focus before publishing the causal sentinel. The checker first
 proves view input leaves that guest receipt unchanged and then proves control
 input changes it at exact coordinates. Thus parser acceptance alone cannot
 satisfy `input.control-accepted`, and regressing `--disable-input` fails both

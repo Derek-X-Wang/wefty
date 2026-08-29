@@ -11,9 +11,8 @@ source patch makes its native WebSocket edge implement Wefty's exact
 `rfb-websocket-v1` path, subprotocol, and binary-frame behavior; there is no
 websockify process.
 
-The focused, transparent, output-sized `wev` client publishes the deterministic
-input oracle only after Sway delivers keyboard or pointer events to its native
-`wl_keyboard` or `wl_pointer` listener.
+The focused, transparent `wev` client and Chromium Wayland surface publish the
+deterministic input oracle only after Sway delivers keyboard or pointer events.
 Chromium also shows `idle`, `working`, `blocked`, and `done` agent states. The included
 self-reconfiguration skill changes a persistent theme setting. Agent CLI stubs
 delegate lazy installation to pinned mise, and crash briefings preserve a

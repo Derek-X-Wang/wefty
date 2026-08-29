@@ -28,6 +28,19 @@
           document.body.dataset.theme = theme.theme;
         } catch (_) {}
       };
+      const recordPointer = event => fetch('/input', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          version: 1,
+          kind: 'pointer',
+          x: event.clientX,
+          y: event.clientY + (window.outerHeight - window.innerHeight),
+        }),
+      }).catch(() => {});
+      for (const type of ['pointermove', 'pointerdown', 'pointerup']) {
+        window.addEventListener(type, recordPointer);
+      }
       setInterval(refresh, 100);
       refresh();
       document.body.focus();
