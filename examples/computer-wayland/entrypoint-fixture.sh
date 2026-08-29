@@ -122,8 +122,8 @@ start /usr/local/libexec/wefty-watch-driver
 start /usr/local/libexec/wefty-wayland-surface
 start chromium --no-sandbox --disable-gpu --disable-software-rasterizer=false \
   --ozone-platform=wayland --enable-features=UseOzonePlatform \
-  --no-first-run --no-default-browser-check --kiosk \
-  --user-data-dir="$HOME/.config/chromium" http://127.0.0.1:18888/ 2>/dev/null
+  --no-first-run --no-default-browser-check --class=chromium \
+  --user-data-dir="$HOME/.config/chromium" --app=http://127.0.0.1:18888/ 2>/dev/null
 oracle_wait=10
 while [ "$oracle_wait" -gt 0 ] && { [ ! -s /tmp/wefty-computer/surface-ready ] || [ ! -s /tmp/wefty-computer/driver-state.json ]; }; do
   sleep 1
