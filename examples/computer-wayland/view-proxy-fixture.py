@@ -39,10 +39,16 @@ def main() -> None:
     with socket.create_server(("127.0.0.1", listen_port), reuse_port=False) as listener:
         while True:
             client, _ = listener.accept()
-            try:
-                bridge(client, control_port)
-            except OSError:
-                client.close()
+            threading.Thread(
+                target=bridge_safely, args=(client, control_port), daemon=True
+            ).start()
+
+
+def bridge_safely(client: socket.socket, control_port: int) -> None:
+    try:
+        bridge(client, control_port)
+    except OSError:
+        client.close()
 
 
 if __name__ == "__main__":
