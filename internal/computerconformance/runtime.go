@@ -698,16 +698,16 @@ func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targe
 	after, ok := r.waitInputSentinel(ctx, before.Generation, sentinelX, sentinelY)
 	viewSession.Close()
 	sentinelSession.Close()
+	if after.KeyEvents != before.KeyEvents || historyContains(after, targetX, targetY) {
+		r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
+		return false
+	}
 	if !ok {
 		detail := "control sentinel was not observed after view input"
 		if r.config.MutationProfile == "" {
 			detail = fmt.Sprintf("%s (generation=%d key_events=%d pointer=%d,%d observer_lines=%d)", detail, after.Generation, after.KeyEvents, after.X, after.Y, after.ObserverLines)
 		}
 		r.record(id, StatusFail, detail)
-		return false
-	}
-	if after.KeyEvents != before.KeyEvents || historyContains(after, targetX, targetY) {
-		r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
 		return false
 	}
 	r.record(id, StatusPass, "control sentinel proved the preceding view pointer and key were consumed without guest input")
