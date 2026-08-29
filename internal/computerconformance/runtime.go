@@ -598,6 +598,52 @@ func (r *runtimeRunner) waitInputSentinel(ctx context.Context, after uint64, x, 
 	return last, false
 }
 
+func (r *runtimeRunner) sendControlPointer(ctx context.Context, after uint64, x, y int) (inputObservation, bool) {
+	last := inputObservation{}
+	for attempt := 0; attempt < 2; attempt++ {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		session, err := StartPointer(probeCtx, r.controlPort, x, y)
+		cancel()
+		if err != nil {
+			continue
+		}
+		observation, observed := r.waitInputSentinel(ctx, after, x, y)
+		session.Close()
+		last = observation
+		if observed {
+			return observation, true
+		}
+	}
+	return last, false
+}
+
+func (r *runtimeRunner) sendControlKey(ctx context.Context, after uint64) bool {
+	for attempt := 0; attempt < 2; attempt++ {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		session, err := StartKey(probeCtx, r.controlPort)
+		cancel()
+		if err != nil {
+			continue
+		}
+		observed := false
+		for poll := 0; poll < 80; poll++ {
+			value, readErr := r.readInputObservation(ctx)
+			if readErr == nil && value.KeyEvents > after {
+				observed = true
+				break
+			}
+			if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
+				break
+			}
+		}
+		session.Close()
+		if observed {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targetX, targetY, sentinelX, sentinelY int) bool {
 	before, err := r.readInputObservation(ctx)
 	if err != nil {
@@ -667,40 +713,13 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 		r.record(ids[2], StatusNotRun, "input oracle was unavailable")
 		return
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	pointerSession, err := StartPointer(probeCtx, r.controlPort, 503, 389)
-	cancel()
-	if err != nil {
-		r.record(ids[2], StatusFail, "control pointer probe failed")
-		return
-	}
-	pointerObservation, pointerObserved := r.waitInputSentinel(ctx, before.Generation, 503, 389)
-	pointerSession.Close()
+	pointerObservation, pointerObserved := r.sendControlPointer(ctx, before.Generation, 503, 389)
 	if !pointerObserved {
 		r.record(ids[2], StatusFail, "control pointer was not observed")
 		_ = r.writeDriver(`{"version":1,"human_driving":false}`)
 		return
 	}
-	probeCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
-	keySession, err := StartKey(probeCtx, r.controlPort)
-	cancel()
-	if err != nil {
-		r.record(ids[2], StatusFail, "control key probe failed")
-		_ = r.writeDriver(`{"version":1,"human_driving":false}`)
-		return
-	}
-	keyObserved := false
-	for attempt := 0; attempt < 80; attempt++ {
-		after, readErr := r.readInputObservation(ctx)
-		if readErr == nil && after.KeyEvents > pointerObservation.KeyEvents {
-			keyObserved = true
-			break
-		}
-		if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
-			break
-		}
-	}
-	keySession.Close()
+	keyObserved := r.sendControlKey(ctx, pointerObservation.KeyEvents)
 	if keyObserved {
 		r.record(ids[2], StatusPass, "control pointer coordinates and key event were both observed")
 	} else {
