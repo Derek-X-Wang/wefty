@@ -246,6 +246,49 @@ func TestComputerBackupRequiresCurrentSessionAndReturnsBoundReceipts(t *testing.
 	}
 }
 
+func TestComputerStorageCopyRequiresCurrentSessionAndReturnsBoundReceipt(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := CopyComputerStorageRequest{Operation: "clone", BackupID: "backup-1", CopyID: "copy-1",
+		SourceComputerID: "source-computer", SourceStorageID: "source-storage", SourceGeneration: 1,
+		SourceSize: 8 << 30, SourceDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Destination: ComputerStorageReference{ComputerID: "clone-computer", StorageID: "clone-storage",
+			StorageGeneration: 1, IntentRevision: 1, DiskBytes: 9 << 30},
+		Authority: ComputerStorageCopyAuthority{NodeID: "node-1", BootSessionID: "boot-1",
+			HelperGeneration: session.Handshake().SessionGeneration + 1, RootInstanceID: "managed-root-1",
+			JobID: "clone-job", OperationRevision: 1, CleanupFence: "clone-fence"}}
+	if _, err := session.CopyComputerStorage(t.Context(), request); err == nil {
+		t.Fatal("stale helper generation authorized Computer Storage copy")
+	} else {
+		assertRPCCode(t, err, CodeInvalidRequest)
+	}
+	request.Authority.HelperGeneration = session.Handshake().SessionGeneration
+	engine.copyStorageResponse = CopyComputerStorageResponse{Receipt: ComputerStorageCopyReceipt{
+		Kind: "computer_storage_copy_verified", ReceiptID: "copy-receipt", Operation: "clone",
+		BackupID: request.BackupID, CopyID: request.CopyID, SourceComputerID: request.SourceComputerID,
+		SourceStorageID: request.SourceStorageID, SourceGeneration: request.SourceGeneration,
+		DestinationComputerID: request.Destination.ComputerID, DestinationStorageID: request.Destination.StorageID,
+		DestinationGeneration: request.Destination.StorageGeneration, NodeID: request.Authority.NodeID,
+		RootInstanceID: request.Authority.RootInstanceID, JobID: request.Authority.JobID,
+		OperationRevision: request.Authority.OperationRevision, CleanupFence: request.Authority.CleanupFence,
+		HelperGeneration: request.Authority.HelperGeneration, SourceSize: request.SourceSize,
+		DestinationSize: request.Destination.DiskBytes, SourceDigest: request.SourceDigest,
+		DestinationDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		OSIdentityRekeyed: true, FilesystemExpanded: true}}
+	response, err := session.CopyComputerStorage(t.Context(), request)
+	if err != nil || response.Receipt.RootInstanceID != request.Authority.RootInstanceID ||
+		response.Receipt.HelperGeneration != request.Authority.HelperGeneration {
+		t.Fatalf("current-session Computer Storage copy = %+v err=%v", response, err)
+	}
+}
+
 func TestAttemptOutsideSessionIsDistinctFromNonLiveAttempt(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -1735,6 +1778,7 @@ type fakeEngine struct {
 	controlWrites            []SetComputerControlStateRequest
 	createBackupResponse     CreateComputerBackupResponse
 	deleteBackupResponse     DeleteComputerBackupCopyResponse
+	copyStorageResponse      CopyComputerStorageResponse
 }
 
 type blockingWatchEngine struct {
@@ -2173,6 +2217,9 @@ func (engine *fakeEngine) CreateComputerBackup(_ context.Context, _ CreateComput
 }
 func (engine *fakeEngine) DeleteComputerBackupCopy(_ context.Context, _ DeleteComputerBackupCopyRequest) (DeleteComputerBackupCopyResponse, error) {
 	return engine.deleteBackupResponse, nil
+}
+func (engine *fakeEngine) CopyComputerStorage(_ context.Context, _ CopyComputerStorageRequest) (CopyComputerStorageResponse, error) {
+	return engine.copyStorageResponse, nil
 }
 func (engine *fakeEngine) Verify(context.Context, VerifyRequest) (VerifyResponse, error) {
 	engine.record("Verify")

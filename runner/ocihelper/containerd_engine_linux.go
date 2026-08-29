@@ -107,12 +107,15 @@ type ContainerdEngine struct {
 	serviceVolumeMu           sync.Mutex
 	storageResetMu            sync.Mutex
 	computerBackupMu          sync.Mutex
+	storageCopyMu             sync.Mutex
 	diskSystem                computerDiskSystem
 	storageResetHook          func(computerStorageResetPhase) error
 	computerBackupHook        func(computerBackupCheckpoint) error
 	computerBackupAllocate    func(string, int64) error
 	computerBackupCopyN       func(io.Writer, io.Reader, int64) (int64, error)
 	computerBackupRemovalHook func()
+	storageCopyHook           func(computerStorageCopyPhase) error
+	storageCopyFinalize       func(context.Context, string, string, bool) error
 	computerDiskHook          func(computerDiskCheckpoint) error
 	lastProfile               *ProfileReceipt
 	capacityMu                sync.Mutex

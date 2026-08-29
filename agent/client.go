@@ -232,6 +232,18 @@ func (c *Client) AcknowledgeComputerBackupPrune(ctx context.Context, computerID 
 	return backup, err
 }
 
+func (c *Client) AcknowledgeComputerStorageCopy(ctx context.Context, computerID string, request l1.ComputerStorageCopyAcknowledgementRequest) (l1.Computer, error) {
+	var computer l1.Computer
+	err := c.post(ctx, "/v1/agent/computers/"+url.PathEscape(computerID)+"/storage-copy-acknowledgement", request, &computer)
+	return computer, err
+}
+
+func (c *Client) AcknowledgeComputerRestoreRetirement(ctx context.Context, computerID string, request l1.RemovalAcknowledgementRequest) (l1.Computer, error) {
+	var computer l1.Computer
+	err := c.post(ctx, "/v1/agent/computers/"+url.PathEscape(computerID)+"/restore-retirement-acknowledgement", request, &computer)
+	return computer, err
+}
+
 func attemptPath(jobID, attemptID string) string {
 	return "/v1/agent/jobs/" + url.PathEscape(jobID) + "/attempts/" + url.PathEscape(attemptID)
 }

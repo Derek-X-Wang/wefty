@@ -259,6 +259,58 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 	}
 }
 
+func TestStoreMigratesStorageProvenanceWithoutDroppingFutureColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-copy-provenance.sqlite")
+	store, err := OpenStore(path, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.Exec(`PRAGMA foreign_keys=OFF;
+		CREATE TABLE storage_provenance_old_constraint (
+			provenance_id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL CHECK(kind='backup'),
+			source_storage_id TEXT NOT NULL,
+			source_generation INTEGER NOT NULL CHECK(source_generation > 0),
+			backup_id TEXT NOT NULL UNIQUE REFERENCES backups(backup_id),
+			created_ns INTEGER NOT NULL,
+			future_custody_fact TEXT NOT NULL DEFAULT 'preserved'
+		);
+		DROP TABLE storage_provenance;
+		ALTER TABLE storage_provenance_old_constraint RENAME TO storage_provenance;
+		PRAGMA foreign_keys=ON;`)
+	closeErr := database.Close()
+	if err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	store, err = OpenStore(path, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var tableSQL string
+	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='storage_provenance'`).Scan(&tableSQL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(tableSQL, "'restore'") || !strings.Contains(tableSQL, "'clone'") ||
+		!strings.Contains(tableSQL, "future_custody_fact") || strings.Contains(tableSQL, "backup_id TEXT NOT NULL UNIQUE") {
+		t.Fatalf("Storage provenance constraints were not widened column-preservingly: %s", tableSQL)
+	}
+	if _, err := store.db.Exec(`INSERT INTO storage_provenance(
+		provenance_id, kind, source_storage_id, source_generation, backup_id,
+		destination_storage_id, destination_generation, created_ns, future_custody_fact)
+		VALUES('future-provenance', 'clone', 'source-storage', 1, 'missing-backup',
+			'destination-storage', 1, 1, 'still-preserved')`); err == nil {
+		t.Fatal("Storage provenance accepted a missing immutable Backup source")
+	}
+}
+
 func TestStoreConfiguresLateEvidenceWindowIndependently(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "late-window.sqlite"), StoreOptions{LateEvidenceWindow: 6 * time.Hour})
 	if err != nil {

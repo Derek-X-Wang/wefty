@@ -258,6 +258,7 @@ type HeartbeatResponse struct {
 	StorageResetDirectives []ComputerStorageResetDirective `json:"storage_reset_directives"`
 	BackupDirectives       []ComputerBackupDirective       `json:"backup_directives"`
 	BackupPruneDirectives  []ComputerBackupPruneDirective  `json:"backup_prune_directives"`
+	StorageCopyDirectives  []ComputerStorageCopyDirective  `json:"storage_copy_directives"`
 	ComputerPolicy         *ComputerPolicySnapshot         `json:"computer_policy,omitempty"`
 }
 

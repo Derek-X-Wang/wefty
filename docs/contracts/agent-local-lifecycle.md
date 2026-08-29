@@ -97,6 +97,17 @@ receipts reach L1. Prune removes only the deterministic Wefty-owned copy root
 and likewise requires a positive absence receipt. Composite Computer removal
 executes these copy directives before managed-root and disk cleanup, so a
 superseded staged copy cannot be stranded outside L1 tracking.
+
+Computer restore and clone are likewise standing heartbeat work. The agent
+passes only the exact L1 directive to the helper and forwards only the
+helper-derived, Node- and root-instance-bound receipt. Restore optionally
+creates the precommitted predecessor Backup before switchover, then retires the
+old generation through the same managed-volume deletion and assertion-derived
+attestation used by reset. Clone never inherits grants or starts itself;
+machine identity rekey and filesystem expansion are helper mechanics whose
+positive facts are required in the receipt. Crashes replay the durable helper
+phase manifest, and a changed revision, boot, root instance, source digest, or
+size fails closed before L1 publication.
 Before a Mac reaches that helper barrier, the supervised wrapper may instead
 publish any closed OCI restriction, including `oci_intent_disabled`,
 `lima_stopped`, `lima_broken`, or `lima_start_timeout`; L1 validates the actual

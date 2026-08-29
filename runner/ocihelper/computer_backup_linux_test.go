@@ -27,7 +27,7 @@ func prepareDetachedBackupSource(t *testing.T) (string, *fakeComputerDiskSystem,
 	if err != nil {
 		t.Fatal(err)
 	}
-	markers := []byte("browser-secret=survives\nuser-marker=alice\n")
+	markers := []byte("browser-secret=survives\nuser-marker=alice\nold-credential=copied-but-not-authority\n")
 	if _, err := file.WriteAt(markers, 4096); err != nil {
 		_ = file.Close()
 		t.Fatal(err)

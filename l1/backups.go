@@ -791,7 +791,58 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 			&operation.Status, &operation.FailureCode, &operation.ResumeDesiredRunning,
 			&operation.AcknowledgementKey, &operation.AcknowledgementHash)
 		if errors.Is(err, sql.ErrNoRows) {
-			return Backup{}, protocolError(contract.ErrorNotFound, "Computer Backup copy removal was not planned")
+			storageCopy, storageCopyErr := scanComputerStorageCopy(tx.QueryRowContext(ctx, `SELECT `+storageCopyColumns+`
+				FROM computer_storage_copy_operations WHERE destination_computer_id=? AND old_copy_id=?`,
+				computerID, request.Receipt.CopyID))
+			if errors.Is(storageCopyErr, sql.ErrNoRows) {
+				return Backup{}, protocolError(contract.ErrorNotFound, "Computer Backup copy removal was not planned")
+			}
+			if storageCopyErr != nil {
+				return Backup{}, internalError(storageCopyErr, "read superseded restore predecessor Backup copy removal")
+			}
+			if err := validateBackupAcknowledgementAuthority(ctx, tx, identityNodeID, request.NodeID,
+				storageCopy.BoundNodeID, storageCopy.RootInstanceID); err != nil {
+				return Backup{}, err
+			}
+			r := request.Receipt
+			if storageCopy.Status != "superseded" || !storageCopy.KeepOldBackup ||
+				!storageCopy.OldBackupID.Valid || !storageCopy.OldCopyID.Valid ||
+				r.BackupID != storageCopy.OldBackupID.String || r.CopyID != storageCopy.OldCopyID.String ||
+				r.ComputerID != storageCopy.DestinationComputerID || r.StorageID != storageCopy.DestinationStorageID ||
+				r.StorageGeneration != storageCopy.OldGeneration || r.NodeID != storageCopy.BoundNodeID ||
+				r.RootInstanceID != storageCopy.RootInstanceID || r.OperationRevision != storageCopy.OperationRevision ||
+				r.CleanupFence != storageCopy.CleanupFence || r.HelperGeneration == 0 || r.ReceiptID == "" {
+				return Backup{}, protocolError(contract.ErrorConflict,
+					"Computer Backup removal receipt does not match superseded restore precommit")
+			}
+			var absenceKey, absenceHash sql.NullString
+			if err := tx.QueryRowContext(ctx, `SELECT old_backup_absence_acknowledgement_key,
+				old_backup_absence_acknowledgement_hash FROM computer_storage_copy_operations
+				WHERE destination_computer_id=? AND operation_revision=?`, computerID,
+				storageCopy.OperationRevision).Scan(&absenceKey, &absenceHash); err != nil {
+				return Backup{}, internalError(err, "read restore predecessor Backup absence replay")
+			}
+			if absenceKey.Valid {
+				if absenceKey.String != request.IdempotencyKey || !absenceHash.Valid || absenceHash.String != bodyHash {
+					return Backup{}, protocolError(contract.ErrorConflict,
+						"restore predecessor Backup removal replay differs from the accepted receipt")
+				}
+				return Backup{}, nil
+			}
+			receiptJSON, marshalErr := json.Marshal(request.Receipt)
+			if marshalErr != nil {
+				return Backup{}, internalError(marshalErr, "encode superseded restore predecessor Backup absence")
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET old_backup_absence_receipt_json=?,
+				old_backup_absence_acknowledgement_key=?, old_backup_absence_acknowledgement_hash=?, completed_ns=?
+				WHERE destination_computer_id=? AND status='superseded' AND old_copy_id=?`, receiptJSON,
+				request.IdempotencyKey, bodyHash, now.UnixNano(), computerID, request.Receipt.CopyID); err != nil {
+				return Backup{}, internalError(err, "record superseded restore predecessor Backup absence")
+			}
+			if err := tx.Commit(); err != nil {
+				return Backup{}, internalError(err, "commit superseded restore predecessor Backup absence")
+			}
+			return Backup{}, nil
 		}
 		if err != nil {
 			return Backup{}, internalError(err, "read superseded Computer Backup copy removal")

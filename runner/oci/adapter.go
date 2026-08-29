@@ -1777,6 +1777,36 @@ func (adapter *Adapter) DeleteComputerBackupCopy(ctx context.Context, request wo
 	return response.Receipt, nil
 }
 
+func (adapter *Adapter) CopyComputerStorage(ctx context.Context, request workloadrunner.ComputerStorageCopyRequest) (workloadrunner.ComputerStorageCopyReceipt, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return workloadrunner.ComputerStorageCopyReceipt{}, errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return workloadrunner.ComputerStorageCopyReceipt{}, err
+	}
+	handshake := session.Handshake()
+	response, err := session.CopyComputerStorage(ctx, ocihelper.CopyComputerStorageRequest{
+		Operation: request.Operation, BackupID: request.BackupID, CopyID: request.CopyID,
+		SourceComputerID: request.SourceComputerID, SourceStorageID: request.SourceStorageID,
+		SourceGeneration: request.SourceGeneration, SourceSize: request.SourceSize, SourceDigest: request.SourceDigest,
+		Destination: ocihelper.ComputerStorageReference{ComputerID: request.Destination.ComputerID,
+			StorageID: request.Destination.StorageID, StorageGeneration: request.Destination.StorageGeneration,
+			IntentRevision: request.Destination.IntentRevision, DiskBytes: request.Destination.DiskBytes},
+		Authority: ocihelper.ComputerStorageCopyAuthority{NodeID: request.NodeID, BootSessionID: request.BootSessionID,
+			HelperGeneration: handshake.SessionGeneration, RootInstanceID: request.RootInstanceID,
+			JobID: request.JobID, OperationRevision: request.OperationRevision, CleanupFence: request.CleanupFence},
+	})
+	if err != nil {
+		return workloadrunner.ComputerStorageCopyReceipt{}, err
+	}
+	if response.Receipt.Kind != "computer_storage_copy_verified" || response.Receipt.ReceiptID == "" ||
+		response.Receipt.HelperGeneration == 0 {
+		return workloadrunner.ComputerStorageCopyReceipt{}, errors.New("OCI helper did not positively verify Computer Storage copy")
+	}
+	return response.Receipt, nil
+}
+
 func adapterAuthorityKey(authority workloadrunner.AttemptAuthority) string {
 	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", authority.NodeID, authority.BootSessionID, authority.JobID, authority.AttemptID, authority.FencingToken, authority.WorkloadClass, authority.RemovalGeneration)
 }

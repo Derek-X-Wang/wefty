@@ -66,6 +66,10 @@ type ComputerBackupEngine interface {
 	DeleteComputerBackupCopy(context.Context, DeleteComputerBackupCopyRequest) (DeleteComputerBackupCopyResponse, error)
 }
 
+type ComputerStorageCopyEngine interface {
+	CopyComputerStorage(context.Context, CopyComputerStorageRequest) (CopyComputerStorageResponse, error)
+}
+
 // Engine is the helper-internal mechanics seam. No containerd request or type
 // crosses RPC.
 type Engine interface {

@@ -72,6 +72,7 @@ type agentSession struct {
 	removals        *removalController
 	storageResets   *storageResetController
 	backups         *backupController
+	storageCopies   *storageCopyController
 	computerPolicy  *ComputerPolicyCache
 	computerAcks    *computerPolicyAckController
 
@@ -206,7 +207,8 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	removalErr := errors.Join(session.resumePendingRemovals(ctx), session.processRemovalDirectives(ctx, registrationHeartbeat.RemovalDirectives),
 		session.processStorageResetDirectives(ctx, registrationHeartbeat.StorageResetDirectives),
 		session.processBackupDirectives(ctx, registrationHeartbeat.BackupDirectives),
-		session.processBackupPruneDirectives(ctx, registrationHeartbeat.BackupPruneDirectives))
+		session.processBackupPruneDirectives(ctx, registrationHeartbeat.BackupPruneDirectives),
+		session.processStorageCopyDirectives(ctx, registrationHeartbeat.StorageCopyDirectives))
 	pinsErr := error(nil)
 	if barrierErr == nil && removalErr == nil {
 		pinsErr = session.reconcileOCIImagePins(ctx)
@@ -293,6 +295,19 @@ func (session *agentSession) processBackupPruneDirectives(ctx context.Context, d
 	for _, directive := range directives {
 		if err := session.backups.processPrune(ctx, directive); err != nil {
 			failures = append(failures, fmt.Errorf("reconcile Backup prune %q: %w", directive.CopyID, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (session *agentSession) processStorageCopyDirectives(ctx context.Context, directives []l1.ComputerStorageCopyDirective) error {
+	if session.storageCopies == nil {
+		return nil
+	}
+	var failures []error
+	for _, directive := range directives {
+		if err := session.storageCopies.process(ctx, directive); err != nil {
+			failures = append(failures, fmt.Errorf("reconcile Computer Storage copy %q: %w", directive.String(), err))
 		}
 	}
 	return errors.Join(failures...)
@@ -412,7 +427,8 @@ func (session *agentSession) recoverOCIRuntimeLocked(ctx context.Context) (ocihe
 		session.processRemovalDirectives(ctx, restrictiveResponse.RemovalDirectives),
 		session.processStorageResetDirectives(ctx, restrictiveResponse.StorageResetDirectives),
 		session.processBackupDirectives(ctx, restrictiveResponse.BackupDirectives),
-		session.processBackupPruneDirectives(ctx, restrictiveResponse.BackupPruneDirectives))
+		session.processBackupPruneDirectives(ctx, restrictiveResponse.BackupPruneDirectives),
+		session.processStorageCopyDirectives(ctx, restrictiveResponse.StorageCopyDirectives))
 	if barrierErr != nil {
 		return ocihelper.HelperSession{}, barrierErr
 	}
@@ -540,6 +556,9 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 		}
 		if session.storageResets != nil {
 			session.storageResets.wait()
+		}
+		if session.storageCopies != nil {
+			session.storageCopies.wait()
 		}
 	}()
 
@@ -1054,6 +1073,11 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 					directive := directive
 					session.backups.enqueue(ctx, "prune\x00"+directive.CopyID,
 						func(runContext context.Context) error { return session.backups.processPrune(runContext, directive) }, failures)
+				}
+			}
+			if session.storageCopies != nil {
+				for _, directive := range response.StorageCopyDirectives {
+					session.storageCopies.enqueue(ctx, directive, failures)
 				}
 			}
 			backoff.reset()

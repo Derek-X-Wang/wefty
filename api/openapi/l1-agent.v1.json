@@ -647,6 +647,73 @@
         }
       }
     },
+    "/v1/agent/computers/{computer_id}/storage-copy-acknowledgement": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "acknowledgeComputerStorageCopy",
+        "summary": "Publish an assertion-derived restore or clone destination",
+        "description": "The receipt binds both source Backup copy and destination Storage authority. Restore requires identical size and digest with no identity change; clone requires narrow OS-identity rekey evidence and exact larger-filesystem expansion evidence. An optional old Backup receipt is accepted only when restore precommitted that choice.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
+          "properties": {
+            "node_id": { "type": "string", "minLength": 1 },
+            "boot_session_id": { "type": "string", "minLength": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 },
+            "receipt": {
+              "type": "object", "additionalProperties": false,
+              "required": ["kind", "receipt_id", "operation", "backup_id", "copy_id", "source_computer_id", "source_storage_id", "source_generation", "destination_computer_id", "destination_storage_id", "destination_generation", "node_id", "root_instance_id", "job_id", "operation_revision", "cleanup_fence", "helper_generation", "source_size", "destination_size", "source_digest", "destination_digest", "os_identity_rekeyed", "filesystem_expanded"],
+              "properties": {
+                "kind": { "const": "computer_storage_copy_verified" }, "receipt_id": { "type": "string", "minLength": 1 },
+                "operation": { "enum": ["restore", "clone"] }, "backup_id": { "type": "string", "minLength": 1 }, "copy_id": { "type": "string", "minLength": 1 },
+                "source_computer_id": { "type": "string", "minLength": 1 }, "source_storage_id": { "type": "string", "minLength": 1 },
+                "source_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+                "destination_computer_id": { "type": "string", "minLength": 1 }, "destination_storage_id": { "type": "string", "minLength": 1 },
+                "destination_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+                "node_id": { "type": "string", "minLength": 1 }, "root_instance_id": { "type": "string", "minLength": 1 }, "job_id": { "type": "string", "minLength": 1 },
+                "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 }, "cleanup_fence": { "type": "string", "minLength": 1 },
+                "helper_generation": { "type": "integer", "minimum": 1 }, "source_size": { "type": "integer", "format": "int64", "minimum": 1 }, "destination_size": { "type": "integer", "format": "int64", "minimum": 1 },
+                "source_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "destination_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "os_identity_rekeyed": { "type": "boolean" }, "filesystem_expanded": { "type": "boolean" }
+              }
+            },
+            "old_backup_receipt": { "type": "object", "description": "Exact Computer Backup copy receipt for the precommitted old generation; forbidden when keep_old_as_backup was false." }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Destination published or identically replayed; clones are stable and stopped, while restores remain stopped pending predecessor retirement.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/agent/computers/{computer_id}/restore-retirement-acknowledgement": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "acknowledgeComputerRestoreRetirement",
+        "summary": "Complete restore after shared predecessor absence proof",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["node_id", "boot_session_id", "removal_generation", "cleanup_fence", "root_instance_id", "idempotency_key"],
+          "properties": {
+            "node_id": { "type": "string", "minLength": 1 }, "boot_session_id": { "type": "string", "minLength": 1 },
+            "removal_generation": { "type": "integer", "minimum": 1 }, "cleanup_fence": { "type": "string", "minLength": 1 },
+            "root_instance_id": { "type": "string", "minLength": 1 }, "idempotency_key": { "type": "string", "minLength": 1 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Predecessor absence accepted; the restored Computer is stable and remains stopped.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/agent/computers/{computer_id}/storage-reset-acknowledgement": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }

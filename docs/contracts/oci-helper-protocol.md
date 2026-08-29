@@ -13,6 +13,11 @@ only after a post-delete `lstat` observes the copy root absent. Composite
 Computer removal first syncs an operation-keyed supersession tombstone while
 holding the shared Backup mutex; a delayed create checks the tombstone before
 writing and fails closed.
+Computer restore and clone use a separate durable copy manifest under that
+mutex. Its phases are `reserved`, `allocated`, `copied`, `source_verified`,
+optional `identity_rekeyed`, optional `expanded`, `manifest_written`, and
+`published`; restart resumes from the first incomplete boundary without
+accepting a changed authority tuple.
 
 On Mac, the Lima 2.2 `vz` template enables only rootful containerd with the
 `overlayfs` snapshotter, maps one explicit operator-owned host root to
@@ -190,6 +195,7 @@ heartbeats.
 | `DeleteManagedVolume` | Session-authorized and closed to a derived `handoff` or `service_data` owner key, or exact Computer-removal Storage and cleanup authority. The helper derives the source, deletes only that resource (plus any paired owner record), independently verifies absence, and returns no general path authority. |
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. After separate stable service-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
+| `CopyComputerStorage` | Session-authorized exact restore or clone operation, published Backup/copy source, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. Under the Backup mutex it revalidates source size and digest before destination publication and fully allocates the destination. Restore preserves bytes exactly; clone narrowly rekeys machine ID and SSH host keys, never browser profile data, and expands a larger filesystem. Its receipt binds every authority and observed size/digest; it does not attach or start the Computer. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend, and only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
@@ -589,7 +595,8 @@ requires any present manifest to match the exact copy, source Storage identity,
 Node, and root instance. It deletes only the deterministic Wefty-owned copy
 root and returns `computer_backup_copy_removed` only after positive absence.
 The helper does not choose retention, auto-delete, restore, clone, export,
-encryption, or replica policy.
+encryption, or replica policy. It executes only the exact restore or clone
+operation already authorized by L1; export and import remain later contracts.
 
 `AttestRemoval` accepts only an exact service Job/generation plus reconstructed
 attempt authorities and their deterministic resource rows, and is called after
