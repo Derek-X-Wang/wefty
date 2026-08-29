@@ -526,21 +526,32 @@ func (engine *ContainerdEngine) pullPublicImage(ctx context.Context, reference, 
 	} else if !isLocalImageNotFound(localErr) {
 		return EnsureImageResponse{}, classifyImageOperationError(localErr, topLevelDigest)
 	}
-	tracker := &retryAfterTracker{}
-	_, err := engine.client.Pull(ctx, reference+"@"+topLevelDigest,
-		containerd.WithResolver(publicResolver(tracker)),
-		containerd.WithPlatformMatcher(matcher),
-		containerd.WithPullUnpack,
-		containerd.WithPullSnapshotter(DefaultSnapshotter),
-	)
-	if err != nil {
-		return EnsureImageResponse{}, classifyRegistryError(err, tracker.Delay(), topLevelDigest)
+	if err := pullPublicImageContent(ctx, engine.client, reference, topLevelDigest, matcher); err != nil {
+		return EnsureImageResponse{}, err
 	}
 	_, evidence, err := engine.localImageForPlatform(ctx, reference, topLevelDigest, matcher)
 	if err != nil {
 		return EnsureImageResponse{}, classifyImageOperationError(err, topLevelDigest)
 	}
 	return ensureImageResponse(evidence), nil
+}
+
+type publicImagePuller interface {
+	Pull(context.Context, string, ...containerd.RemoteOpt) (containerd.Image, error)
+}
+
+func pullPublicImageContent(ctx context.Context, puller publicImagePuller, reference, topLevelDigest string, matcher platforms.MatchComparer) error {
+	tracker := &retryAfterTracker{}
+	_, err := puller.Pull(ctx, reference+"@"+topLevelDigest,
+		containerd.WithResolver(publicResolver(tracker)),
+		containerd.WithPlatformMatcher(matcher),
+		containerd.WithPullUnpack,
+		containerd.WithPullSnapshotter(DefaultSnapshotter),
+	)
+	if err != nil {
+		return classifyRegistryError(err, tracker.Delay(), topLevelDigest)
+	}
+	return nil
 }
 
 func isLocalImageNotFound(err error) bool {

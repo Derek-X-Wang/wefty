@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/leases"
 	contentlocal "github.com/containerd/containerd/v2/plugins/content/local"
@@ -259,6 +260,61 @@ func TestPublicRegistryMechanicsFactsComeFromRegistryBehavior(t *testing.T) {
 				t.Fatalf("mechanics fact = %+v", mechanics.Fact)
 			}
 		})
+	}
+}
+
+func TestPullPublicImagePinnedDigestRefusalIsNetworkMechanics(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	registryAddress := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	expectedDigest := digest.FromString("pinned public pull refusal").String()
+	reference, resolvedDigest, err := (&ContainerdEngine{}).resolvePublicImage(t.Context(), registryAddress+"/repo:tag", expectedDigest)
+	if err != nil || resolvedDigest != expectedDigest {
+		t.Fatalf("pinned image resolution = (%q, %q, %v)", reference, resolvedDigest, err)
+	}
+	puller := publicImagePullFunc(func(ctx context.Context, pinnedReference string, options ...containerd.RemoteOpt) (containerd.Image, error) {
+		remoteContext := &containerd.RemoteContext{}
+		for _, option := range options {
+			if optionErr := option(nil, remoteContext); optionErr != nil {
+				return nil, optionErr
+			}
+		}
+		if remoteContext.Resolver == nil {
+			return nil, errors.New("public pull omitted its registry resolver")
+		}
+		_, _, pullErr := remoteContext.Resolver.Resolve(ctx, pinnedReference)
+		if pullErr == nil {
+			return nil, errors.New("closed registry port unexpectedly resolved")
+		}
+		if !strings.Contains(strings.ToLower(pullErr.Error()), "connection refused") {
+			t.Fatalf("closed registry port error = %v, want ECONNREFUSED", pullErr)
+		}
+		return nil, fmt.Errorf("failed to resolve reference %q: %w", pinnedReference, pullErr)
+	})
+	err = pullPublicImageContent(t.Context(), puller, reference, resolvedDigest, platforms.DefaultStrict())
+	var mechanics *ImageMechanicsError
+	if !errors.As(err, &mechanics) || mechanics.Fact.Kind != ImageFailureNetwork || mechanics.Fact.TopLevelDigest != expectedDigest {
+		t.Fatalf("pinned pull refusal mechanics = %+v err=%v, want network for %s", mechanics, err, expectedDigest)
+	}
+	helperConnection, agentConnection := net.Pipe()
+	go func() {
+		writeImageStreamResult(newFramedConn(helperConnection), err)
+		_ = helperConnection.Close()
+	}()
+	rpcErr := decodeResponse(newFramedConn(agentConnection), nil)
+	_ = agentConnection.Close()
+	var rpcFailure *RPCError
+	if !errors.As(rpcErr, &rpcFailure) || rpcFailure.Code != CodeImageUnavailable || rpcFailure.ImageFailure == nil || rpcFailure.ImageFailure.Kind != ImageFailureNetwork {
+		t.Fatalf("pinned pull refusal RPC = %v, want image_unavailable with network mechanics", rpcErr)
+	}
+	if rpcErrorProvesRuntimeLoss(rpcFailure) {
+		t.Fatalf("pinned pull refusal would mark the helper session lost: %+v", rpcFailure)
 	}
 }
 
@@ -903,6 +959,12 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)
+}
+
+type publicImagePullFunc func(context.Context, string, ...containerd.RemoteOpt) (containerd.Image, error)
+
+func (function publicImagePullFunc) Pull(ctx context.Context, reference string, options ...containerd.RemoteOpt) (containerd.Image, error) {
+	return function(ctx, reference, options...)
 }
 
 func TestLimaOperatorMountTranslationStaysWithinConfiguredRoots(t *testing.T) {
