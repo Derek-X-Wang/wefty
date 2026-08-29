@@ -683,58 +683,61 @@ func (r *runtimeRunner) sendControlInput(ctx context.Context, after uint64, x, y
 }
 
 func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targetX, targetY, sentinelX, sentinelY int) bool {
-	before, err := r.readInputObservation(ctx)
-	if err != nil {
-		r.record(id, StatusNotRun, "input oracle was unavailable")
-		return false
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	viewSession, err := StartInput(probeCtx, r.viewPort, targetX, targetY)
-	cancel()
-	var sentinelSession *InputSession
-	if err == nil {
-		err = viewSession.Fence()
-	}
-	if err == nil {
-		// The RFB fence proves transport consumption. Give the guest observer a
-		// bounded opportunity to publish a forbidden delivery before introducing
-		// the control sentinel whose coordinates close the no-delivery proof.
-		for poll := 0; poll < 8; poll++ {
-			observation, readErr := r.readInputObservation(ctx)
-			if readErr == nil && (observation.KeyEvents != before.KeyEvents || historyContains(observation, targetX, targetY)) {
-				viewSession.Close()
-				r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
-				return false
-			}
-			if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
-				break
-			}
+	// A newly started wayvnc client can need one event cycle before its virtual
+	// input objects are active. Probe twice so isolation is proved after that
+	// warm-up too; a broken view edge must not get a free first connection.
+	for round := 0; round < 2; round++ {
+		x, y := targetX+round*29, targetY+round*31
+		sx, sy := sentinelX-round*17, sentinelY+round*19
+		before, err := r.readInputObservation(ctx)
+		if err != nil {
+			r.record(id, StatusNotRun, "input oracle was unavailable")
+			return false
 		}
-		probeCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
-		sentinelSession, err = StartPointer(probeCtx, r.controlPort, sentinelX, sentinelY)
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		viewSession, err := StartInput(probeCtx, r.viewPort, x, y)
 		cancel()
-	}
-	if err != nil {
-		if viewSession != nil {
-			viewSession.Close()
+		if err == nil {
+			for poll := 0; poll < 12; poll++ {
+				observation, readErr := r.readInputObservation(ctx)
+				if readErr == nil && (observation.KeyEvents != before.KeyEvents || (observation.Generation > before.Generation && historyContains(observation, x, y))) {
+					viewSession.Close()
+					r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
+					return false
+				}
+				if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
+					break
+				}
+			}
 		}
-		r.record(id, StatusFail, "RFB view probe or control consumption barrier failed")
-		return false
-	}
-	after, ok := r.waitInputSentinel(ctx, before.Generation, sentinelX, sentinelY)
-	viewSession.Close()
-	sentinelSession.Close()
-	if after.KeyEvents != before.KeyEvents || historyContains(after, targetX, targetY) {
-		r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
-		return false
-	}
-	if !ok {
-		detail := "control sentinel was not observed after view input"
-		if r.config.MutationProfile == "" {
-			detail = fmt.Sprintf("%s (generation=%d key_events=%d pointer=%d,%d observer_lines=%d)", detail, after.Generation, after.KeyEvents, after.X, after.Y, after.ObserverLines)
+		var sentinelSession *InputSession
+		if err == nil {
+			probeCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
+			sentinelSession, err = StartPointer(probeCtx, r.controlPort, sx, sy)
+			cancel()
 		}
-		r.record(id, StatusFail, detail)
-		return false
+		if err != nil {
+			if viewSession != nil {
+				viewSession.Close()
+			}
+			r.record(id, StatusFail, "RFB view probe or control consumption barrier failed")
+			return false
+		}
+		after, ok := r.waitInputSentinel(ctx, before.Generation, sx, sy)
+		viewSession.Close()
+		sentinelSession.Close()
+		if after.KeyEvents != before.KeyEvents || (after.Generation > before.Generation && historyContains(after, x, y)) {
+			r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
+			return false
+		}
+		if !ok {
+			detail := "control sentinel was not observed after view input"
+			if r.config.MutationProfile == "" {
+				detail = fmt.Sprintf("%s (generation=%d key_events=%d pointer=%d,%d observer_lines=%d)", detail, after.Generation, after.KeyEvents, after.X, after.Y, after.ObserverLines)
+			}
+			r.record(id, StatusFail, detail)
+			return false
+		}
 	}
 	r.record(id, StatusPass, "control sentinel proved the preceding view pointer and key were consumed without guest input")
 	return true
