@@ -97,7 +97,8 @@ RUN ln -s libneatvnc.so.0.0.0 /usr/local/lib/libneatvnc.so.0 \
     && ldconfig \
     && ldconfig -p | grep -F 'libneatvnc.so.0' | grep -F '/usr/local/lib/libneatvnc.so.0' \
     && ldd /usr/bin/wayvnc | grep -F 'libneatvnc.so.0 => /usr/local/lib/libneatvnc.so.0' \
-    && ! find "/usr/lib/$multiarch" -maxdepth 1 -name 'libneatvnc.so*' -print -quit | grep .
+    && ! find "/usr/lib/$multiarch" -maxdepth 1 -name 'libneatvnc.so*' -print -quit | grep . \
+    && rm -f /var/cache/ldconfig/aux-cache
 COPY --from=neatvnc-build --chmod=0755 /opt/mise /usr/local/bin/mise
 
 RUN groupadd --gid 12000 wefty \

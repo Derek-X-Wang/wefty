@@ -123,6 +123,16 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			t.Fatalf("PR-callable reference Computer build is missing %q", required)
 		}
 	}
+	for name, workflow := range map[string]workflowContract{"required": build, "publisher": image} {
+		referenceBuild := workflow.Jobs["reference-computer-platform-build"]
+		text := marshalJob(t, referenceBuild)
+		if strings.Count(text, "docker buildx build --no-cache") != 2 {
+			t.Fatalf("%s reference Computer lane must perform exactly two empty-cache solves", name)
+		}
+		if strings.Contains(text, "if [[ $VARIANT == xfce") || strings.Contains(text, `crane" push --insecure "$layout" "$registry_reference"`) {
+			t.Fatalf("%s reference Computer lane bypasses the second solve for one variant", name)
+		}
+	}
 
 	called := gate.Jobs["acceptance-image"]
 	if called.Uses != "./.github/workflows/acceptance-image-build.yml" {
@@ -262,6 +272,13 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../examples/computer/pointer-oracle.py", "XQueryPointer", "input-oracle.json", "os.replace")
 	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "wayvnc=0.9.1-1", "sway=1.10.1-2", "mise-v2026.8.14", "wefty-verify-licenses", "ldconfig -p", "/usr/local/lib/libneatvnc.so.0", "non-dpkg-components.tsv", "mise-MIT.txt", "wefty-Apache-2.0.txt", "rm -f \"/usr/lib/$multiarch/libneatvnc.so\"*")
 	assertFileNotContains(t, "../examples/computer-wayland/Dockerfile", "LD_LIBRARY_PATH", "ADD --chmod")
+	waylandDockerfile, err := os.ReadFile("../examples/computer-wayland/Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(waylandDockerfile), "/var/cache/ldconfig/aux-cache") != 2 {
+		t.Fatal("Wayland image must remove ldconfig's nondeterministic cache after both invocations")
+	}
 	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "WLR_BACKENDS=headless", "WLR_RENDERER=pixman", "WLR_HEADLESS_OUTPUTS=1")
 	assertFileContains(t, "../examples/computer-wayland/entrypoint.sh", "wayvnc -w", "--disable-input", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "surface-ready", "view-edge-ready", "control-edge-ready")
 	assertFileNotContains(t, "../examples/computer-wayland/entrypoint.sh", "WEFTY_CONFORMANCE_MUTATION", "WEFTY_WAYVNC_RECORD_INPUT")

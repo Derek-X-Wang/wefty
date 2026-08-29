@@ -274,17 +274,9 @@ jobs:
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
             --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" .
-          if [[ $VARIANT == xfce ]]; then
-            docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
-              --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
-              --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
-          else
-            go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
-            layout="$RUNNER_TEMP/computer-image.oci"
-            mkdir -p "$layout"
-            tar -xf "$RUNNER_TEMP/computer-image.oci.tar" -C "$layout"
-            "$(go env GOPATH)/bin/crane" push --insecure "$layout" "$registry_reference"
-          fi
+          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+            --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
+            --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
       - name: Execute the exact desktop digest and assert its ELF architecture
         env:
           PLATFORM: linux/${{ matrix.arch }}
