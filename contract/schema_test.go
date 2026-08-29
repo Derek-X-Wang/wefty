@@ -514,6 +514,15 @@ func TestJobClassSchemaIsOpen(t *testing.T) {
 	}
 }
 
+func TestComputerControlErrorCodesAreSharedProtocolConstants(t *testing.T) {
+	t.Parallel()
+	if ErrorControllerBusy != "controller_busy" || ErrorControllerAlreadyHeld != "controller_already_held" ||
+		ErrorControlNotAuthorized != "control_not_authorized" || ErrorTakeoverSessionEnded != "takeover_session_ended" {
+		t.Fatalf("Computer control error vocabulary drifted: busy=%q held=%q unauthorized=%q ended=%q",
+			ErrorControllerBusy, ErrorControllerAlreadyHeld, ErrorControlNotAuthorized, ErrorTakeoverSessionEnded)
+	}
+}
+
 func compileSchemas(t *testing.T) map[string]*jsonschema.Schema {
 	t.Helper()
 

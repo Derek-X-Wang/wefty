@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -22,8 +23,35 @@ func main() {
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		writeCommandError(os.Stderr, err, hasJSONFlag(os.Args[1:]))
-		os.Exit(commandExitCode(err))
+		os.Exit(commandExitCodeForArgs(err, os.Args[1:]))
 	}
+}
+
+// commandExitCodeForArgs preserves the historical exit 1 contract for all
+// pre-existing commands. Typed exits are an explicit contract only for the
+// access-policy and take-over commands introduced by #191.
+func commandExitCodeForArgs(err error, args []string) int {
+	if !isAccessCLIArgs(args) {
+		return exitFailure
+	}
+	return commandExitCode(err)
+}
+
+func isAccessCLIArgs(args []string) bool {
+	positionals := []string{}
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") {
+			positionals = append(positionals, arg)
+		}
+	}
+	if len(positionals) >= 2 && positionals[0] == "admin" && positionals[1] == "policy" {
+		return true
+	}
+	if len(positionals) >= 1 && positionals[0] == "admins" {
+		return true
+	}
+	return len(positionals) >= 2 && positionals[0] == "services" &&
+		(positionals[1] == "grant" || positionals[1] == "grants" || positionals[1] == "revoke" || positionals[1] == "takeover")
 }
 
 const (
@@ -72,6 +100,13 @@ func commandExitCode(err error) int {
 }
 
 func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
+	var usage usageError
+	if jsonOutput && errors.As(err, &usage) {
+		_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
+			Code: contract.ErrorInvalidRequest, Message: usage.Error(), Retryable: false,
+		}})
+		return
+	}
 	var localErr *ocicontrol.ResponseError
 	if jsonOutput && errors.As(err, &localErr) {
 		_ = writeJSON(writer, contract.ErrorResponse{Error: localErr.APIError})
@@ -83,8 +118,15 @@ func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
 		return
 	}
 	var takeoverErr *takeoverActionError
-	if jsonOutput && errors.As(err, &takeoverErr) {
-		_ = writeJSON(writer, contract.ErrorResponse{Error: takeoverErr.APIError})
+	if errors.As(err, &takeoverErr) {
+		if jsonOutput {
+			_ = writeJSON(writer, contract.ComputerControlErrorResponse{Error: takeoverErr.APIError, Receipt: takeoverErr.Receipt})
+			return
+		}
+		_, _ = fmt.Fprintf(writer, "wefty: %v\n", err)
+		if takeoverErr.Receipt != nil {
+			_ = writeComputerControlReceipt(writer, *takeoverErr.Receipt, false)
+		}
 		return
 	}
 	_, _ = fmt.Fprintf(writer, "wefty: %v\n", err)
@@ -118,7 +160,7 @@ type globalOptions struct {
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	options, commandArgs, err := parseGlobalOptions(args, stderr)
 	if err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if len(commandArgs) == 0 {
 		return usageError("a command is required")
@@ -246,7 +288,8 @@ Commands:
                              Requires observed policy and submission revisions, or --expect-current
   runs list                  List Runs by immutable Computer origin
     grants|grant|revoke      List or mutate Computer person grants
-    takeover view COMPUTER  Discover the person-authorized view-only front door
+    takeover view COMPUTER --session-token-file FILE
+                              Open a live view session and write its owner-only capability
     takeover take|release COMPUTER --session-token-file FILE
                             Act on the same live view session without printing its capability
     takeover sessions list COMPUTER

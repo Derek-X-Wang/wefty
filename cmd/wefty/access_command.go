@@ -2,18 +2,42 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
+
+func computerGrantObservationError(code contract.ErrorCode, message string, result l1.ComputerGrantMutationResult) error {
+	details := map[string]any{
+		"mutation_applied":         result.MutationApplied,
+		"observation_state":        result.ObservationState,
+		"last_observed_revocation": result.LastObservedRevocation,
+	}
+	if result.ObservationFailure != "" {
+		details["observation_failure"] = result.ObservationFailure
+	}
+	return &apiResponseError{Service: "CLI", StatusCode: 0, APIError: contract.APIError{
+		Code: code, Message: message, Retryable: true, Details: details,
+	}}
+}
+
+func computerGrantObservationMessage(result l1.ComputerGrantMutationResult, suffix string) string {
+	if result.MutationApplied {
+		return "revocation was applied but " + suffix
+	}
+	return "replayed revocation mutation was not reapplied and " + suffix
+}
 
 func executeAdminPolicy(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
 	if len(args) == 1 && args[0] == "get" {
@@ -32,7 +56,7 @@ func executeAdminPolicy(ctx context.Context, clients *apiClients, jsonOutput boo
 	var revision int64
 	flags.Int64Var(&revision, "policy-revision", 0, "policy revision observed by admin policy get")
 	if err := flags.Parse(mutationArgs); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	seenRevision := false
 	flags.Visit(func(visited *flag.Flag) { seenRevision = seenRevision || visited.Name == "policy-revision" })
@@ -48,7 +72,7 @@ func executeAdminPolicy(ctx context.Context, clients *apiClients, jsonOutput boo
 
 func executeAdmins(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
 	if len(args) == 1 && args[0] == "list" {
-		args[0] = "get"
+		args = []string{"get"}
 	}
 	return executeAdminPolicy(ctx, clients, jsonOutput, args, stdout)
 }
@@ -78,15 +102,16 @@ func executeComputerGrant(
 	var revision int64
 	var permission, fabricID, idempotencyKey string
 	var waitForCompletion bool
-	var pollInterval time.Duration
+	var pollInterval, waitTimeout time.Duration
 	flags.Int64Var(&revision, "policy-revision", 0, "policy revision observed by services grants")
 	flags.StringVar(&permission, "permission", "", "grant permission: view or control")
 	flags.StringVar(&fabricID, "fabric-id", "", "opaque issuing Fabric ID (defaults to the current Fabric)")
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable Computer grant mutation key")
 	flags.BoolVar(&waitForCompletion, "wait", false, "wait until the hosting node closes affected sessions and installs the revocation")
 	flags.DurationVar(&pollInterval, "poll-interval", time.Second, "revocation status polling interval")
+	flags.DurationVar(&waitTimeout, "wait-timeout", 2*time.Minute, "maximum time to observe revocation installation")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	seenRevision := false
 	flags.Visit(func(visited *flag.Flag) { seenRevision = seenRevision || visited.Name == "policy-revision" })
@@ -105,8 +130,8 @@ func executeComputerGrant(
 	if !revoke && waitForCompletion {
 		return usageError("services grant does not accept --wait")
 	}
-	if pollInterval <= 0 {
-		return usageError("--poll-interval must be positive")
+	if pollInterval <= 0 || waitTimeout <= 0 {
+		return usageError("--poll-interval and --wait-timeout must be positive")
 	}
 	var err error
 	idempotencyKey, err = ensureIdempotencyKey(idempotencyKey)
@@ -123,17 +148,34 @@ func executeComputerGrant(
 		return err
 	}
 	if waitForCompletion && result.Revocation != nil {
+		result.ObservationState = "pending"
+		result.LastObservedRevocation = result.Revocation
+		waited := time.Duration(0)
 		for result.Revocation.State != l1.ComputerPolicyRevocationCompleted {
-			if err := clients.wait(ctx, pollInterval); err != nil {
-				return err
+			if waited >= waitTimeout {
+				return computerGrantObservationError(contract.ErrorRevocationWaitTimeout,
+					computerGrantObservationMessage(result, "observation timed out"), result)
 			}
+			delay := min(pollInterval, waitTimeout-waited)
+			if err := clients.wait(ctx, delay); err != nil {
+				result.ObservationState = "failed"
+				result.ObservationFailure = err.Error()
+				return computerGrantObservationError(contract.ErrorRevocationObservationFailed,
+					computerGrantObservationMessage(result, "observation failed"), result)
+			}
+			waited += delay
 			revocation, err := clients.getComputerPolicyRevocation(ctx, result.Revocation.ComputerID,
 				result.Revocation.SubjectFabricID, result.Revocation.SubjectUserID, result.Revocation.PolicyRevision)
 			if err != nil {
-				return err
+				result.ObservationState = "failed"
+				result.ObservationFailure = err.Error()
+				return computerGrantObservationError(contract.ErrorRevocationObservationFailed,
+					computerGrantObservationMessage(result, "observation failed"), result)
 			}
 			result.Revocation = &revocation
+			result.LastObservedRevocation = &revocation
 		}
+		result.ObservationState = "completed"
 	}
 	return writeComputerGrantMutation(stdout, result, jsonOutput)
 }
@@ -173,7 +215,7 @@ func executeComputerTakeover(
 		flags.StringVar(&cursor, "cursor", "", "opaque cursor from the previous page")
 		flags.IntVar(&limit, "limit", l1.DefaultJobPageLimit, "take-over events per page")
 		if err := flags.Parse(moveFirstPositionalToEnd(args[1:])); err != nil {
-			return err
+			return usageError(err.Error())
 		}
 		if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" || limit < 1 || limit > l1.MaxJobPageLimit {
 			return usageError(fmt.Sprintf("usage: wefty services takeover audit COMPUTER_ID [--limit 1..%d] [--cursor CURSOR]", l1.MaxJobPageLimit))
@@ -190,16 +232,16 @@ func executeComputerTakeover(
 	return usageError("usage: wefty services takeover view|take|release|sessions|audit COMPUTER_ID")
 }
 
-type computerTakeoverActionResult struct {
-	ComputerID      string                     `json:"computer_id"`
-	Action          string                     `json:"action"`
-	UserID          string                     `json:"user_id"`
-	DeviceID        string                     `json:"device_id"`
-	DisplayName     string                     `json:"display_name,omitempty"`
-	AuthorizedRole  l1.ComputerGrantPermission `json:"authorized_role"`
-	PolicyRevision  int64                      `json:"policy_revision"`
-	DisplayEndpoint *string                    `json:"display_endpoint"`
-	SessionBound    bool                       `json:"session_bound"`
+type computerTakeoverViewResult struct {
+	ComputerID       string `json:"computer_id"`
+	Action           string `json:"action"`
+	DisplayEndpoint  string `json:"display_endpoint"`
+	SessionTokenFile string `json:"session_token_file"`
+}
+
+type takeoverSessionCapability struct {
+	Endpoint string `json:"endpoint"`
+	Token    string `json:"token"`
 }
 
 func executeComputerTakeoverAction(
@@ -216,98 +258,128 @@ func executeComputerTakeoverAction(
 	var tokenFile string
 	flags.StringVar(&tokenFile, "session-token-file", "", "owner-readable file containing the capability issued by this live view session")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" {
 		return usageError("usage: wefty services takeover " + action + " COMPUTER_ID" + takeoverTokenFileUsage(action))
 	}
-	if action == "view" && tokenFile != "" {
-		return usageError("takeover view does not accept --session-token-file; the viewer retains its handshake capability")
-	}
-	if action != "view" && strings.TrimSpace(tokenFile) == "" {
+	if strings.TrimSpace(tokenFile) == "" {
 		return usageError("takeover " + action + " requires --session-token-file from the live view session")
 	}
-	access, err := clients.getComputerTakeoverAccess(ctx, flags.Arg(0))
-	if err != nil {
-		return err
-	}
-	result := computerTakeoverActionResult{ComputerID: access.ComputerID, Action: action,
-		UserID: access.UserID, DeviceID: access.DeviceID, DisplayName: access.DisplayName,
-		AuthorizedRole: access.AuthorizedRole, PolicyRevision: access.PolicyRevision,
-		DisplayEndpoint: access.DisplayEndpoint, SessionBound: action != "view"}
 	if action == "view" {
-		return writeComputerTakeoverAction(stdout, result, jsonOutput)
+		availability, err := clients.getComputerTakeoverAvailability(ctx, flags.Arg(0))
+		if err != nil {
+			return err
+		}
+		if availability.DisplayEndpoint == nil {
+			return &takeoverActionError{APIError: contract.APIError{Code: contract.ErrorPassUnavailable,
+				Message: "Computer display is not ready; retry after services status reports a display endpoint", Retryable: true}}
+		}
+		session, err := takeover.Open(ctx, clients.fabric, *availability.DisplayEndpoint)
+		if err != nil {
+			return err
+		}
+		defer session.Close()
+		if err := writeTakeoverSessionCapability(tokenFile, takeoverSessionCapability{Endpoint: session.Endpoint, Token: session.Token}); err != nil {
+			return err
+		}
+		// OWNER-CALL: whether a MagicDNS-shaped ConnectHost may appear on the
+		// CLI surface at all is an owner decision. It is sanctioned presentation
+		// data here; no dial endpoint or other host-shaped value is printed.
+		result := computerTakeoverViewResult{ComputerID: availability.ComputerID, Action: action,
+			DisplayEndpoint: clients.fabric.ConnectHost(), SessionTokenFile: tokenFile}
+		if err := writeComputerTakeoverView(stdout, result, jsonOutput); err != nil {
+			return err
+		}
+		if err := session.Wait(ctx); err != nil && ctx.Err() == nil {
+			return err
+		}
+		return nil
 	}
-	if access.DisplayEndpoint == nil {
-		return &takeoverActionError{APIError: contract.APIError{Code: contract.ErrorPassUnavailable,
-			Message: "Computer display is not ready; retry after services status reports a display endpoint", Retryable: true}}
-	}
-	token, err := readTakeoverSessionToken(tokenFile)
+	capability, err := readTakeoverSessionCapability(tokenFile)
 	if err != nil {
 		return err
 	}
-	if err := clients.performComputerTakeoverAction(ctx, *access.DisplayEndpoint, token, action); err != nil {
+	receipt, err := clients.performComputerTakeoverAction(ctx, capability.Endpoint, capability.Token, action)
+	if err != nil {
 		return err
 	}
-	result.DisplayEndpoint = nil
-	return writeComputerTakeoverAction(stdout, result, jsonOutput)
+	return writeComputerControlReceipt(stdout, receipt, jsonOutput)
 }
 
-func readTakeoverSessionToken(path string) (string, error) {
+func readTakeoverSessionCapability(path string) (takeoverSessionCapability, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("open live take-over session token file: %w", err)
+		return takeoverSessionCapability{}, fmt.Errorf("open live take-over session token file: %w", err)
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return "", fmt.Errorf("inspect live take-over session token file: %w", err)
+		return takeoverSessionCapability{}, fmt.Errorf("inspect live take-over session token file: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", usageError("session token file must be a regular file")
+		return takeoverSessionCapability{}, usageError("session token file must be a regular file")
 	}
 	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
-		return "", usageError("session token file must not be readable or writable by group or others")
+		return takeoverSessionCapability{}, usageError("session token file must not be readable or writable by group or others")
 	}
 	tokenBytes, err := io.ReadAll(io.LimitReader(file, 4097))
 	if err != nil {
-		return "", fmt.Errorf("read live take-over session token file: %w", err)
+		return takeoverSessionCapability{}, fmt.Errorf("read live take-over session token file: %w", err)
 	}
-	raw := string(tokenBytes)
-	token := strings.TrimSuffix(raw, "\n")
-	token = strings.TrimSuffix(token, "\r")
-	if token == "" || len(tokenBytes) > 4096 || token != strings.TrimSpace(token) || strings.ContainsAny(token, "\r\n") {
-		return "", usageError("session token file must contain exactly one non-empty capability line")
+	var capability takeoverSessionCapability
+	if len(tokenBytes) > 4096 || json.Unmarshal(tokenBytes, &capability) != nil ||
+		strings.TrimSpace(capability.Endpoint) == "" || strings.TrimSpace(capability.Token) == "" {
+		return takeoverSessionCapability{}, usageError("session token file must contain one valid live-session capability")
 	}
-	return token, nil
+	return capability, nil
+}
+
+func writeTakeoverSessionCapability(path string, capability takeoverSessionCapability) error {
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, ".wefty-takeover-*")
+	if err != nil {
+		return fmt.Errorf("create live take-over session token file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := json.NewEncoder(temporary).Encode(capability); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("install live take-over session token file: %w", err)
+	}
+	return nil
 }
 
 func takeoverTokenFileUsage(action string) string {
-	if action == "view" {
-		return ""
-	}
 	return " --session-token-file FILE"
 }
 
-func writeComputerTakeoverAction(writer io.Writer, result computerTakeoverActionResult, jsonOutput bool) error {
+func writeComputerTakeoverView(writer io.Writer, result computerTakeoverViewResult, jsonOutput bool) error {
 	if jsonOutput {
 		return writeJSON(writer, result)
 	}
-	if _, err := fmt.Fprintf(writer, "COMPUTER ID\t%s\nACTION\t%s\nUSER ID\t%s\nDEVICE ID\t%s\nDISPLAY NAME\t%s\nAUTHORIZED ROLE\t%s\nPOLICY REVISION\t%d\n",
-		result.ComputerID, result.Action, result.UserID, result.DeviceID, valueOrNA(result.DisplayName),
-		result.AuthorizedRole, result.PolicyRevision); err != nil {
-		return err
+	_, err := fmt.Fprintf(writer, "COMPUTER ID\t%s\nACTION\t%s\nDISPLAY ENDPOINT\t%s\nSESSION TOKEN FILE\t%s\n",
+		result.ComputerID, result.Action, result.DisplayEndpoint, result.SessionTokenFile)
+	return err
+}
+
+func writeComputerControlReceipt(writer io.Writer, receipt contract.ComputerControlReceipt, jsonOutput bool) error {
+	if jsonOutput {
+		return writeJSON(writer, receipt)
 	}
-	if result.DisplayEndpoint != nil {
-		if _, err := fmt.Fprintf(writer, "DISPLAY ENDPOINT\t%s\n", *result.DisplayEndpoint); err != nil {
-			return err
-		}
-	} else {
-		if _, err := fmt.Fprintln(writer, "DISPLAY ENDPOINT\tN/A"); err != nil {
-			return err
-		}
-	}
-	_, err := fmt.Fprintf(writer, "SESSION BOUND\t%t\n", result.SessionBound)
+	_, err := fmt.Fprintf(writer, "COMPUTER ID\t%s\nACTION\t%s\nHOLDER SESSION ID\t%s\nADMITTED MODE\t%s\nTENURE STATE\t%s\nPOLICY REVISION\t%d\nOVERRIDE DISPLACED SESSION ID\t%s\nHUMAN DRIVING\t%t\nSIGNAL STAYED TRUE\t%t\n",
+		receipt.ComputerID, receipt.Action, valueOrNA(receipt.HolderSessionID), valueOrNA(receipt.AdmittedMode), receipt.TenureState,
+		receipt.PolicyRevision, valueOrNA(receipt.OverrideDisplacedSessionID), receipt.HumanDriving, receipt.SignalStayedTrue)
 	return err
 }
 
@@ -323,7 +395,8 @@ func moveFirstPositionalsToEnd(args []string, count int) []string {
 			continue
 		}
 		rest = append(rest, args[index])
-		if strings.HasPrefix(args[index], "-") && !strings.Contains(args[index], "=") && index+1 < len(args) {
+		boolFlag := args[index] == "--wait" || args[index] == "-wait"
+		if strings.HasPrefix(args[index], "-") && !strings.Contains(args[index], "=") && !boolFlag && index+1 < len(args) {
 			rest = append(rest, args[index+1])
 			index++
 		}
@@ -388,9 +461,9 @@ func writeComputerGrantMutation(writer io.Writer, result l1.ComputerGrantMutatio
 	if _, err := fmt.Fprintf(writer, "POLICY REVISION\t%d\n", result.Grant.PolicyRevision); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(writer, "FABRIC ID\tUSER ID\tPERMISSION\tUPDATED REVISION\tUPDATED\tREPLAYED\tREVOCATION\n%s\t%s\t%s\t%d\t%s\t%t\t",
+	if _, err := fmt.Fprintf(writer, "FABRIC ID\tUSER ID\tPERMISSION\tUPDATED REVISION\tUPDATED\tREPLAYED\tMUTATION APPLIED\tREVOCATION\n%s\t%s\t%s\t%d\t%s\t%t\t%t\t",
 		result.Grant.FabricID, result.Grant.UserID, result.Grant.Permission, result.Grant.PolicyRevision,
-		result.Grant.UpdatedAt.Format(time.RFC3339), result.Replayed); err != nil {
+		result.Grant.UpdatedAt.Format(time.RFC3339), result.Replayed, result.MutationApplied); err != nil {
 		return err
 	}
 	if result.Revocation == nil {
@@ -408,6 +481,9 @@ func writeComputerTakeoverSessions(writer io.Writer, sessions l1.ComputerTakeove
 		return writeJSON(writer, sessions)
 	}
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintf(table, "CONTROLLER SESSION ID\t%s\n", valueOrNA(sessions.ControllerSessionID)); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintln(table, "COMPUTER ID\tJOB ID\tATTEMPT ID\tSESSION ID\tFABRIC ID\tUSER ID\tDEVICE ID\tAUTHORIZED ROLE\tOBSERVED MODE\tPOLICY REVISION\tOPENED\tEVIDENCE STATE"); err != nil {
 		return err
 	}

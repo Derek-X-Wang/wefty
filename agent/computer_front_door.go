@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -43,15 +44,15 @@ type computerTakeoverAuditor interface {
 
 type computerEndpointDial func(context.Context, string) (net.Conn, error)
 
-type ComputerTenureErrorCode string
+type ComputerTenureErrorCode = contract.ErrorCode
 
-const ComputerTenureUnavailable ComputerTenureErrorCode = "tenure_unavailable"
+const ComputerTenureUnavailable = contract.ErrorTenureUnavailable
 
 const (
-	ComputerTenureUnauthorized ComputerTenureErrorCode = "control_not_authorized"
-	ComputerTenureBusy         ComputerTenureErrorCode = "controller_busy"
-	ComputerTenureAlreadyHeld  ComputerTenureErrorCode = "controller_already_held"
-	ComputerTenureSessionEnded ComputerTenureErrorCode = "session_ended"
+	ComputerTenureUnauthorized = contract.ErrorControlNotAuthorized
+	ComputerTenureBusy         = contract.ErrorControllerBusy
+	ComputerTenureAlreadyHeld  = contract.ErrorControllerAlreadyHeld
+	ComputerTenureSessionEnded = contract.ErrorTakeoverSessionEnded
 )
 
 type ComputerTenureError struct {
@@ -85,7 +86,9 @@ type controlTenureSession struct {
 type ControlTenure interface {
 	Register(controlTenureSession) error
 	Take(context.Context, string) (net.Conn, error)
+	TakeReceipt(context.Context, string) (contract.ComputerControlReceipt, error)
 	Release(context.Context, string, l1.ComputerTakeoverReason) error
+	ReleaseReceipt(context.Context, string, l1.ComputerTakeoverReason) (contract.ComputerControlReceipt, error)
 	Unregister(string)
 	controlTenure()
 }
@@ -96,8 +99,16 @@ func (unavailableControlTenure) Register(controlTenureSession) error { return ni
 func (unavailableControlTenure) Take(context.Context, string) (net.Conn, error) {
 	return nil, &ComputerTenureError{Code: ComputerTenureUnavailable}
 }
+func (unavailableControlTenure) TakeReceipt(context.Context, string) (contract.ComputerControlReceipt, error) {
+	return contract.ComputerControlReceipt{AdmittedMode: string(l1.ComputerAdmittedView),
+		TenureState: contract.ComputerControlTenureFree}, &ComputerTenureError{Code: ComputerTenureUnavailable}
+}
 func (unavailableControlTenure) Release(context.Context, string, l1.ComputerTakeoverReason) error {
 	return nil
+}
+func (unavailableControlTenure) ReleaseReceipt(context.Context, string, l1.ComputerTakeoverReason) (contract.ComputerControlReceipt, error) {
+	return contract.ComputerControlReceipt{AdmittedMode: string(l1.ComputerAdmittedView),
+		TenureState: contract.ComputerControlTenureFree}, nil
 }
 func (unavailableControlTenure) Unregister(string) {}
 func (unavailableControlTenure) controlTenure()    {}
@@ -145,23 +156,24 @@ type activeComputerSession struct {
 
 func (handle *computerSessionHandle) CanTake() bool { return handle != nil && handle.canTake }
 
-func (handle *computerSessionHandle) Take(ctx context.Context) (net.Conn, error) {
+func (handle *computerSessionHandle) Take(ctx context.Context) (contract.ComputerControlReceipt, error) {
 	if !handle.CanTake() {
-		return nil, &ComputerTenureError{Code: ComputerTenureUnauthorized}
+		return contract.ComputerControlReceipt{}, &ComputerTenureError{Code: ComputerTenureUnauthorized}
 	}
 	select {
 	case <-handle.session.Done():
-		return nil, &ComputerTenureError{Code: ComputerTenureSessionEnded}
+		return contract.ComputerControlReceipt{}, &ComputerTenureError{Code: ComputerTenureSessionEnded}
 	default:
 	}
-	return handle.tenure.Take(ctx, handle.id)
+	return handle.tenure.TakeReceipt(ctx, handle.id)
 }
 
-func (handle *computerSessionHandle) Release(ctx context.Context) error {
+func (handle *computerSessionHandle) Release(ctx context.Context) (contract.ComputerControlReceipt, error) {
 	if handle == nil || handle.tenure == nil {
-		return nil
+		return contract.ComputerControlReceipt{AdmittedMode: string(l1.ComputerAdmittedView),
+			TenureState: contract.ComputerControlTenureFree}, nil
 	}
-	return handle.tenure.Release(ctx, handle.id, l1.ComputerTakeoverExplicitRelease)
+	return handle.tenure.ReleaseReceipt(ctx, handle.id, l1.ComputerTakeoverExplicitRelease)
 }
 
 type computerFrontDoor struct {
@@ -316,7 +328,8 @@ func (frontDoor *computerFrontDoor) serveControlAction(writer http.ResponseWrite
 	}
 	values := request.Header.Values(computerControlTokenHeader)
 	if len(values) != 1 || values[0] == "" || values[0] != strings.TrimSpace(values[0]) {
-		http.Error(writer, "Computer control session token is required", http.StatusUnauthorized)
+		writeComputerControlError(writer, http.StatusUnauthorized, contract.APIError{Code: contract.ErrorUnauthorized,
+			Message: "Computer control session token is required"}, nil)
 		return
 	}
 	frontDoor.mu.Lock()
@@ -324,18 +337,24 @@ func (frontDoor *computerFrontDoor) serveControlAction(writer http.ResponseWrite
 	frontDoor.mu.Unlock()
 	if session == nil || session.identity.Kind != identity.Kind || session.identity.FabricID != identity.FabricID ||
 		session.identity.UserID != identity.UserID || session.identity.DeviceID != identity.DeviceID {
-		http.Error(writer, "Computer control session is not active for this identity", http.StatusUnauthorized)
+		writeComputerControlError(writer, http.StatusUnauthorized, contract.APIError{Code: contract.ErrorUnauthorized,
+			Message: "Computer control session is not active for this identity"}, nil)
 		return
 	}
 
+	action := "release"
+	var receipt contract.ComputerControlReceipt
 	var err error
 	if request.URL.Path == computerControlTakePath {
-		_, err = session.handle.Take(request.Context())
+		action = "take"
+		receipt, err = session.handle.Take(request.Context())
 	} else {
-		err = session.handle.Release(request.Context())
+		receipt, err = session.handle.Release(request.Context())
 	}
+	receipt.ComputerID = frontDoor.config.computerID
+	receipt.Action = action
 	if err == nil {
-		writer.WriteHeader(http.StatusNoContent)
+		writeComputerControlJSON(writer, http.StatusOK, receipt)
 		return
 	}
 	var tenureErr *ComputerTenureError
@@ -349,14 +368,29 @@ func (frontDoor *computerFrontDoor) serveControlAction(writer http.ResponseWrite
 		case ComputerTenureSessionEnded:
 			status = http.StatusGone
 		}
-		http.Error(writer, string(tenureErr.Code), status)
+		writeComputerControlError(writer, status, contract.APIError{Code: tenureErr.Code,
+			Message:   "Computer " + action + " was refused by Controller tenure",
+			Retryable: tenureErr.Code == contract.ErrorControllerBusy}, &receipt)
 		if tenureErr.Err != nil {
 			frontDoor.report(fmt.Errorf("perform Computer control action: %w", err))
 		}
 		return
 	}
 	frontDoor.report(fmt.Errorf("perform Computer control action: %w", err))
-	http.Error(writer, "tenure_unavailable", http.StatusServiceUnavailable)
+	writeComputerControlError(writer, http.StatusServiceUnavailable, contract.APIError{Code: contract.ErrorTenureUnavailable,
+		Message: "Computer Controller tenure is unavailable"}, &receipt)
+}
+
+func writeComputerControlError(writer http.ResponseWriter, status int, apiError contract.APIError, receipt *contract.ComputerControlReceipt) {
+	writeComputerControlJSON(writer, status, contract.ComputerControlErrorResponse{Error: apiError, Receipt: receipt})
+}
+
+func writeComputerControlJSON(writer http.ResponseWriter, status int, value any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	if err := json.NewEncoder(writer).Encode(value); err != nil {
+		return
+	}
 }
 
 func (frontDoor *computerFrontDoor) serveAuthorized(

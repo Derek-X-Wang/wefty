@@ -87,7 +87,7 @@ func TestComputerFrontDoorViewerCannotTakeControl(t *testing.T) {
 	if _, _, err := connection.Read(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	err := takeover.Perform(t.Context(), directTakeoverFabric{},
+	_, err := takeover.Perform(t.Context(), directTakeoverFabric{},
 		"ws"+server.URL[len("http"):]+computerWebSocketPath, token, "take")
 	var actionErr *takeover.ActionError
 	if !errors.As(err, &actionErr) || actionErr.APIError.Code != contract.ErrorControlNotAuthorized {
@@ -735,9 +735,17 @@ func (*releaseOrderingTenure) Register(controlTenureSession) error { return nil 
 func (*releaseOrderingTenure) Take(context.Context, string) (net.Conn, error) {
 	return nil, &ComputerTenureError{Code: ComputerTenureUnavailable}
 }
+func (tenure *releaseOrderingTenure) TakeReceipt(ctx context.Context, sessionID string) (contract.ComputerControlReceipt, error) {
+	_, err := tenure.Take(ctx, sessionID)
+	return contract.ComputerControlReceipt{}, err
+}
 func (tenure *releaseOrderingTenure) Release(context.Context, string, l1.ComputerTakeoverReason) error {
 	tenure.once.Do(func() { tenure.releaseObserved <- tenure.viewClosed.Load() })
 	return nil
+}
+func (tenure *releaseOrderingTenure) ReleaseReceipt(ctx context.Context, sessionID string, reason l1.ComputerTakeoverReason) (contract.ComputerControlReceipt, error) {
+	err := tenure.Release(ctx, sessionID, reason)
+	return contract.ComputerControlReceipt{}, err
 }
 func (*releaseOrderingTenure) Unregister(string) {}
 func (*releaseOrderingTenure) controlTenure()    {}

@@ -660,7 +660,7 @@ func (s *Server) mutateComputerGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if result.Replayed {
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -678,7 +678,7 @@ func (s *Server) deleteComputerGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if result.Replayed {
-		w.Header().Set("Idempotency-Replayed", "true")
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -723,7 +723,7 @@ func (s *Server) listComputerTakeoverSessions(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) getComputerTakeoverAccess(w http.ResponseWriter, r *http.Request) {
-	access, err := s.store.GetComputerTakeoverAccess(r.Context(), identityFromRequest(r), r.PathValue("computer_id"))
+	access, err := s.store.GetComputerTakeoverAvailability(r.Context(), identityFromRequest(r), r.PathValue("computer_id"))
 	if err != nil {
 		writeError(w, err)
 		return

@@ -103,13 +103,14 @@ func (s *Store) AppendComputerTakeoverAudit(
 
 	event := request.Event
 	event.AuthorityGeneration = attempt.authorityGeneration
+	storedNS := canonicalTime(s.clock.Now()).UnixNano()
 	_, err = tx.ExecContext(ctx, `INSERT INTO computer_takeover_audit(
 		attempt_id, event_id, event_kind, computer_id, job_id, session_id, fabric_id, user_id, device_id,
-		authorized_role, admitted_mode, policy_revision, authority_generation, occurred_ns, reason, event_count, request_hash
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		authorized_role, admitted_mode, policy_revision, authority_generation, occurred_ns, stored_ns, reason, event_count, request_hash
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.AttemptID, event.EventID, event.Kind, event.ComputerID, event.JobID, event.SessionID,
 		event.FabricID, event.UserID, event.DeviceID, event.AuthorizedRole, event.AdmittedMode,
-		event.PolicyRevision, event.AuthorityGeneration, event.OccurredAt.UnixNano(), event.Reason, event.EventCount, eventHash)
+		event.PolicyRevision, event.AuthorityGeneration, event.OccurredAt.UnixNano(), storedNS, event.Reason, event.EventCount, eventHash)
 	if err != nil {
 		return ComputerTakeoverAuditReceipt{}, internalError(err, "append Computer take-over audit event")
 	}
@@ -242,28 +243,30 @@ func readComputerTakeoverAudit(ctx context.Context, q queryer, attemptID, eventI
 	return event, requestHash, nil
 }
 
-func encodeComputerTakeoverAuditCursor(occurredNS int64, attemptID, eventID string) string {
-	value := strconv.FormatInt(occurredNS, 10) + "\x00" + attemptID + "\x00" + eventID
+func encodeComputerTakeoverAuditCursor(rowID int64, computerID string) string {
+	digest := sha256.Sum256([]byte(computerID))
+	value := "v1\x00" + strconv.FormatInt(rowID, 10) + "\x00" + hex.EncodeToString(digest[:8])
 	return base64.RawURLEncoding.EncodeToString([]byte(value))
 }
 
-func decodeComputerTakeoverAuditCursor(value string) (int64, string, string, error) {
+func decodeComputerTakeoverAuditCursor(value, computerID string) (int64, error) {
 	if value == "" {
-		return 0, "", "", nil
+		return 0, nil
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(value)
 	if err != nil {
-		return 0, "", "", protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+		return 0, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
 	}
 	parts := strings.Split(string(payload), "\x00")
-	if len(parts) != 3 {
-		return 0, "", "", protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+	digest := sha256.Sum256([]byte(computerID))
+	if len(parts) != 3 || parts[0] != "v1" || parts[2] != hex.EncodeToString(digest[:8]) {
+		return 0, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
 	}
-	occurredNS, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil || occurredNS < 0 || !boundedComputerAuditValue(parts[1], true) || !boundedComputerAuditValue(parts[2], true) {
-		return 0, "", "", protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+	rowID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || rowID < 0 {
+		return 0, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
 	}
-	return occurredNS, parts[1], parts[2], nil
+	return rowID, nil
 }
 
 func (s *Store) ListComputerTakeoverAudit(
@@ -282,7 +285,7 @@ func (s *Store) ListComputerTakeoverAudit(
 	if _, err := s.GetComputer(ctx, computerID); err != nil {
 		return ComputerTakeoverAuditList{}, err
 	}
-	occurredNS, attemptID, eventID, err := decodeComputerTakeoverAuditCursor(cursor)
+	rowID, err := decodeComputerTakeoverAuditCursor(cursor, computerID)
 	if err != nil {
 		return ComputerTakeoverAuditList{}, err
 	}
@@ -292,22 +295,21 @@ func (s *Store) ListComputerTakeoverAudit(
 		}
 		return s.listComputerTakeoverAuditTail(ctx, computerID, limit)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT event_id, event_kind, computer_id, job_id, attempt_id, session_id,
+	rows, err := s.db.QueryContext(ctx, `SELECT rowid, event_id, event_kind, computer_id, job_id, attempt_id, session_id,
 		fabric_id, user_id, device_id, authorized_role, admitted_mode, policy_revision,
 		authority_generation, occurred_ns, reason, event_count
-		FROM computer_takeover_audit WHERE computer_id=? AND
-		(occurred_ns>? OR (occurred_ns=? AND (attempt_id>? OR (attempt_id=? AND event_id>?))))
-		ORDER BY occurred_ns, attempt_id, event_id LIMIT ?`,
-		computerID, occurredNS, occurredNS, attemptID, attemptID, eventID, limit+1)
+		FROM computer_takeover_audit WHERE computer_id=? AND rowid>?
+		ORDER BY rowid LIMIT ?`, computerID, rowID, limit+1)
 	if err != nil {
 		return ComputerTakeoverAuditList{}, internalError(err, "list Computer take-over audit")
 	}
 	defer rows.Close()
 	page := ComputerTakeoverAuditList{Events: []ComputerTakeoverAuditEvent{}}
+	rowIDs := []int64{}
 	for rows.Next() {
 		var event ComputerTakeoverAuditEvent
-		var eventNS int64
-		if err := rows.Scan(&event.EventID, &event.Kind, &event.ComputerID, &event.JobID, &event.AttemptID,
+		var eventNS, eventRowID int64
+		if err := rows.Scan(&eventRowID, &event.EventID, &event.Kind, &event.ComputerID, &event.JobID, &event.AttemptID,
 			&event.SessionID, &event.FabricID, &event.UserID, &event.DeviceID, &event.AuthorizedRole,
 			&event.AdmittedMode, &event.PolicyRevision, &event.AuthorityGeneration, &eventNS,
 			&event.Reason, &event.EventCount); err != nil {
@@ -315,33 +317,35 @@ func (s *Store) ListComputerTakeoverAudit(
 		}
 		event.OccurredAt = time.Unix(0, eventNS).UTC()
 		page.Events = append(page.Events, event)
+		rowIDs = append(rowIDs, eventRowID)
 	}
 	if err := rows.Err(); err != nil {
 		return ComputerTakeoverAuditList{}, internalError(err, "read Computer take-over audit")
 	}
 	if len(page.Events) > limit {
 		page.Events = page.Events[:limit]
-		last := page.Events[len(page.Events)-1]
-		page.NextCursor = encodeComputerTakeoverAuditCursor(last.OccurredAt.UnixNano(), last.AttemptID, last.EventID)
+		rowIDs = rowIDs[:limit]
+		page.NextCursor = encodeComputerTakeoverAuditCursor(rowIDs[len(rowIDs)-1], computerID)
 	}
 	return page, nil
 }
 
 func (s *Store) listComputerTakeoverAuditTail(ctx context.Context, computerID string, limit int) (ComputerTakeoverAuditList, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT event_id, event_kind, computer_id, job_id, attempt_id, session_id,
+	rows, err := s.db.QueryContext(ctx, `SELECT rowid, event_id, event_kind, computer_id, job_id, attempt_id, session_id,
 		fabric_id, user_id, device_id, authorized_role, admitted_mode, policy_revision,
 		authority_generation, occurred_ns, reason, event_count
 		FROM computer_takeover_audit WHERE computer_id=?
-		ORDER BY occurred_ns DESC, rowid DESC LIMIT ?`, computerID, limit)
+		ORDER BY rowid DESC LIMIT ?`, computerID, limit)
 	if err != nil {
 		return ComputerTakeoverAuditList{}, internalError(err, "tail Computer take-over audit")
 	}
 	defer rows.Close()
 	page := ComputerTakeoverAuditList{Events: []ComputerTakeoverAuditEvent{}}
+	rowIDs := []int64{}
 	for rows.Next() {
 		var event ComputerTakeoverAuditEvent
-		var eventNS int64
-		if err := rows.Scan(&event.EventID, &event.Kind, &event.ComputerID, &event.JobID, &event.AttemptID,
+		var eventNS, eventRowID int64
+		if err := rows.Scan(&eventRowID, &event.EventID, &event.Kind, &event.ComputerID, &event.JobID, &event.AttemptID,
 			&event.SessionID, &event.FabricID, &event.UserID, &event.DeviceID, &event.AuthorizedRole,
 			&event.AdmittedMode, &event.PolicyRevision, &event.AuthorityGeneration, &eventNS,
 			&event.Reason, &event.EventCount); err != nil {
@@ -349,12 +353,17 @@ func (s *Store) listComputerTakeoverAuditTail(ctx context.Context, computerID st
 		}
 		event.OccurredAt = time.Unix(0, eventNS).UTC()
 		page.Events = append(page.Events, event)
+		rowIDs = append(rowIDs, eventRowID)
 	}
 	if err := rows.Err(); err != nil {
 		return ComputerTakeoverAuditList{}, internalError(err, "read Computer take-over audit tail")
 	}
 	for left, right := 0, len(page.Events)-1; left < right; left, right = left+1, right-1 {
 		page.Events[left], page.Events[right] = page.Events[right], page.Events[left]
+		rowIDs[left], rowIDs[right] = rowIDs[right], rowIDs[left]
+	}
+	if len(rowIDs) > 0 {
+		page.NextCursor = encodeComputerTakeoverAuditCursor(rowIDs[len(rowIDs)-1], computerID)
 	}
 	return page, nil
 }
@@ -370,10 +379,11 @@ func (s *Store) ListComputerTakeoverSessions(
 	if _, err := s.GetComputer(ctx, computerID); err != nil {
 		return ComputerTakeoverSessionList{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT event_kind, job_id, attempt_id, session_id, fabric_id, user_id,
+	cutoff := s.clock.Now().Add(-time.Hour).UnixNano()
+	rows, err := s.db.QueryContext(ctx, `SELECT rowid, event_kind, job_id, attempt_id, session_id, fabric_id, user_id,
 		device_id, authorized_role, admitted_mode, policy_revision, occurred_ns
-		FROM computer_takeover_audit WHERE computer_id=? AND session_id<>''
-		ORDER BY occurred_ns, rowid`, computerID)
+		FROM computer_takeover_audit WHERE computer_id=? AND session_id<>'' AND stored_ns>=?
+		ORDER BY rowid`, computerID, cutoff)
 	if err != nil {
 		return ComputerTakeoverSessionList{}, internalError(err, "list Computer take-over sessions")
 	}
@@ -381,6 +391,7 @@ func (s *Store) ListComputerTakeoverSessions(
 	type state struct {
 		session ComputerTakeoverSession
 		active  bool
+		rowID   int64
 	}
 	states := map[string]*state{}
 	controllerKey := ""
@@ -389,15 +400,15 @@ func (s *Store) ListComputerTakeoverSessions(
 		var jobID, attemptID, sessionID, fabricID, userID, deviceID string
 		var role ComputerGrantPermission
 		var mode ComputerAdmittedMode
-		var revision, occurredNS int64
-		if err := rows.Scan(&kind, &jobID, &attemptID, &sessionID, &fabricID, &userID, &deviceID,
+		var revision, occurredNS, rowID int64
+		if err := rows.Scan(&rowID, &kind, &jobID, &attemptID, &sessionID, &fabricID, &userID, &deviceID,
 			&role, &mode, &revision, &occurredNS); err != nil {
 			return ComputerTakeoverSessionList{}, internalError(err, "scan Computer take-over sessions")
 		}
 		key := attemptID + "\x00" + sessionID
 		switch kind {
 		case ComputerTakeoverSessionOpen:
-			states[key] = &state{active: true, session: ComputerTakeoverSession{
+			states[key] = &state{active: true, rowID: rowID, session: ComputerTakeoverSession{
 				ComputerID: computerID, JobID: jobID, AttemptID: attemptID, SessionID: sessionID,
 				FabricID: fabricID, UserID: userID, DeviceID: deviceID, AuthorizedRole: role,
 				AdmittedMode: ComputerAdmittedView, PolicyRevision: revision,
@@ -431,21 +442,20 @@ func (s *Store) ListComputerTakeoverSessions(
 		return ComputerTakeoverSessionList{}, internalError(err, "read Computer take-over sessions")
 	}
 	result := ComputerTakeoverSessionList{Sessions: []ComputerTakeoverSession{}}
+	active := []*state{}
 	for key, current := range states {
 		if !current.active {
 			continue
 		}
-		result.Sessions = append(result.Sessions, current.session)
+		active = append(active, current)
 		if key == controllerKey {
 			result.ControllerSessionID = current.session.SessionID
 		}
 	}
-	sort.Slice(result.Sessions, func(i, j int) bool {
-		if result.Sessions[i].OpenedAt.Equal(result.Sessions[j].OpenedAt) {
-			return result.Sessions[i].SessionID < result.Sessions[j].SessionID
-		}
-		return result.Sessions[i].OpenedAt.Before(result.Sessions[j].OpenedAt)
-	})
+	sort.Slice(active, func(i, j int) bool { return active[i].rowID < active[j].rowID })
+	for _, current := range active {
+		result.Sessions = append(result.Sessions, current.session)
+	}
 	return result, nil
 }
 
@@ -454,7 +464,7 @@ func (s *Store) ListComputerTakeoverSessions(
 // an attempt never deletes take-over evidence as a foreign-key side effect.
 func (s *Store) pruneComputerTakeoverAudit(ctx context.Context, tx *sql.Tx, now time.Time) (int64, error) {
 	cutoff := now.Add(-s.computerTakeoverAuditRetentionAge).UnixNano()
-	result, err := tx.ExecContext(ctx, "DELETE FROM computer_takeover_audit WHERE occurred_ns<?", cutoff)
+	result, err := tx.ExecContext(ctx, "DELETE FROM computer_takeover_audit WHERE stored_ns<?", cutoff)
 	if err != nil {
 		return 0, internalError(err, "prune Computer take-over audit retention")
 	}

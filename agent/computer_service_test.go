@@ -374,7 +374,7 @@ func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T
 	if _, _, err := oldClient.Read(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if err := takeover.Perform(t.Context(), privateFabric, first.endpoint, oldToken, "take"); err != nil {
+	if _, err := takeover.Perform(t.Context(), privateFabric, first.endpoint, oldToken, "take"); err != nil {
 		t.Fatalf("CLI take adapter against the real front door: %v", err)
 	}
 	if signals := first.runtime.signalSnapshot(); len(signals) != 2 || signals[0] || !signals[1] {
@@ -410,13 +410,13 @@ func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T
 	if _, _, err := freshClient.Read(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if status := postComputerControl(t, secondBase, computerControlTakePath, freshToken); status != http.StatusNoContent {
+	if status := postComputerControl(t, secondBase, computerControlTakePath, freshToken); status != http.StatusOK {
 		t.Fatalf("fresh holder take status = %d", status)
 	}
 	if signals := second.runtime.signalSnapshot(); len(signals) != 2 || signals[0] || !signals[1] {
 		t.Fatalf("fresh service startup/take signals = %v", signals)
 	}
-	if err := takeover.Perform(t.Context(), privateFabric, second.endpoint, freshToken, "release"); err != nil {
+	if _, err := takeover.Perform(t.Context(), privateFabric, second.endpoint, freshToken, "release"); err != nil {
 		t.Fatalf("CLI release adapter against the real front door: %v", err)
 	}
 	if signals := second.runtime.signalSnapshot(); len(signals) != 3 || signals[2] {

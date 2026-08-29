@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -110,65 +109,57 @@ func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
 		t.Fatal(err)
 	}
 	stdout.Reset()
-	err = execute(ctx, viewerClients, true, []string{"services", "takeover", "view", computer.ComputerID}, &stdout, &stderr)
+	err = execute(ctx, viewerClients, true, []string{"services", "takeover", "view", computer.ComputerID, "--session-token-file", filepath.Join(t.TempDir(), "viewer")}, &stdout, &stderr)
 	assertCLIErrorCode(t, err, contract.ErrorForbidden)
 	stdout.Reset()
-	err = execute(ctx, machineClients, true, []string{"services", "takeover", "view", computer.ComputerID}, &stdout, &stderr)
+	err = execute(ctx, machineClients, true, []string{"services", "takeover", "view", computer.ComputerID, "--session-token-file", filepath.Join(t.TempDir(), "machine")}, &stdout, &stderr)
 	assertCLIErrorCode(t, err, contract.ErrorPrincipalForbidden)
 	grantJSON := runAccessCLI(t, ctx, adminClients, true, "services", "grant", computer.ComputerID,
 		viewerIdentity.UserID, "--permission", "control", "--policy-revision", "3", "--idempotency-key", "grant-viewer")
 	var grant l1.ComputerGrantMutationResult
-	if err := json.Unmarshal(grantJSON, &grant); err != nil || grant.Grant.Permission != l1.ComputerGrantControl || grant.Replayed {
+	if err := json.Unmarshal(grantJSON, &grant); err != nil || grant.Grant.Permission != l1.ComputerGrantControl || grant.Replayed || !grant.MutationApplied {
 		t.Fatalf("grant result = %#v err=%v", grant, err)
 	}
 	replayedJSON := runAccessCLI(t, ctx, adminClients, true, "services", "grant", computer.ComputerID,
 		viewerIdentity.UserID, "--permission", "control", "--policy-revision", "3", "--idempotency-key", "grant-viewer")
-	if err := json.Unmarshal(replayedJSON, &grant); err != nil || !grant.Replayed {
+	if err := json.Unmarshal(replayedJSON, &grant); err != nil || !grant.Replayed || grant.MutationApplied {
 		t.Fatalf("replayed grant = %#v err=%v", grant, err)
 	}
 	grantsHuman := string(runAccessCLI(t, ctx, adminClients, false, "services", "grants", computer.ComputerID))
 	if !strings.Contains(grantsHuman, "POLICY REVISION\t4") || !strings.Contains(grantsHuman, "person-viewer\tcontrol") {
 		t.Fatalf("human grant list omitted revision or permission:\n%s", grantsHuman)
 	}
-	viewJSON := runAccessCLI(t, ctx, viewerClients, true, "services", "takeover", "view", computer.ComputerID)
-	var view computerTakeoverActionResult
-	if err := json.Unmarshal(viewJSON, &view); err != nil || view.Action != "view" ||
-		view.AuthorizedRole != l1.ComputerGrantControl || view.DisplayEndpoint != nil || view.SessionBound {
-		t.Fatalf("view-first access projection = %#v err=%v", view, err)
-	}
-
 	stdout.Reset()
 	err = execute(ctx, adminClients, true, []string{"services", "revoke", computer.ComputerID, viewerIdentity.UserID,
 		"--policy-revision", "3", "--idempotency-key", "stale-revoke"}, &stdout, &stderr)
 	assertCLIErrorCode(t, err, contract.ErrorStalePolicyRevision)
-	revokeJSON := runAccessCLI(t, ctx, adminClients, true, "services", "revoke", computer.ComputerID,
-		viewerIdentity.UserID, "--policy-revision", "4", "--idempotency-key", "revoke-viewer")
-	if err := json.Unmarshal(revokeJSON, &grant); err != nil || grant.Grant.Permission != l1.ComputerGrantNone ||
-		grant.Revocation == nil || grant.Revocation.State != l1.ComputerPolicyRevocationPending {
-		t.Fatalf("revoke result = %#v err=%v", grant, err)
-	}
 	adminClients.wait = func(context.Context, time.Duration) error { return context.Canceled }
 	stdout.Reset()
 	err = execute(ctx, adminClients, true, []string{"services", "revoke", computer.ComputerID, viewerIdentity.UserID,
 		"--policy-revision", "4", "--idempotency-key", "revoke-viewer", "--wait"}, &stdout, &stderr)
-	if !errors.Is(err, context.Canceled) {
+	var observationErr *apiResponseError
+	if !errors.As(err, &observationErr) || observationErr.APIError.Code != contract.ErrorRevocationObservationFailed ||
+		observationErr.APIError.Details["mutation_applied"] != true || observationErr.APIError.Details["last_observed_revocation"] == nil {
 		t.Fatalf("injected revocation wait cancellation = %v", err)
 	}
+	revokeJSON := runAccessCLI(t, ctx, adminClients, true, "services", "revoke", computer.ComputerID,
+		viewerIdentity.UserID, "--policy-revision", "4", "--idempotency-key", "revoke-viewer")
+	if err := json.Unmarshal(revokeJSON, &grant); err != nil || grant.Grant.Permission != l1.ComputerGrantNone ||
+		grant.Revocation == nil || grant.Revocation.State != l1.ComputerPolicyRevocationPending || !grant.Replayed || grant.MutationApplied {
+		t.Fatalf("revoke replay result = %#v err=%v", grant, err)
+	}
+	adminClients.wait = func(context.Context, time.Duration) error { return nil }
 	stdout.Reset()
-	err = execute(ctx, viewerClients, true, []string{"services", "takeover", "view", computer.ComputerID}, &stdout, &stderr)
-	assertCLIErrorCode(t, err, contract.ErrorForbidden)
-	tokenPath := filepath.Join(t.TempDir(), "session-token")
-	if err := os.WriteFile(tokenPath, []byte("opaque-live-session-bearer\n"), 0o600); err != nil {
-		t.Fatal(err)
+	err = execute(ctx, adminClients, true, []string{"services", "revoke", computer.ComputerID, viewerIdentity.UserID,
+		"--policy-revision", "4", "--idempotency-key", "revoke-viewer", "--wait",
+		"--poll-interval", "1ns", "--wait-timeout", "1ns"}, &stdout, &stderr)
+	if !errors.As(err, &observationErr) || observationErr.APIError.Code != contract.ErrorRevocationWaitTimeout ||
+		observationErr.APIError.Details["mutation_applied"] != false {
+		t.Fatalf("bounded revocation timeout = %v", err)
 	}
 	stdout.Reset()
-	err = execute(ctx, adminClients, true, []string{"services", "takeover", "take", computer.ComputerID,
-		"--session-token-file", tokenPath}, &stdout, &stderr)
-	assertCLIErrorCode(t, err, contract.ErrorPassUnavailable)
-	stdout.Reset()
-	err = execute(ctx, adminClients, true, []string{"services", "takeover", "release", computer.ComputerID,
-		"--session-token-file", tokenPath}, &stdout, &stderr)
-	assertCLIErrorCode(t, err, contract.ErrorPassUnavailable)
+	err = execute(ctx, viewerClients, true, []string{"services", "takeover", "view", computer.ComputerID, "--session-token-file", filepath.Join(t.TempDir(), "revoked")}, &stdout, &stderr)
+	assertCLIErrorCode(t, err, contract.ErrorForbidden)
 	sessionsJSON := runAccessCLI(t, ctx, adminClients, true, "services", "takeover", "sessions", "list", computer.ComputerID)
 	var sessions l1.ComputerTakeoverSessionList
 	if err := json.Unmarshal(sessionsJSON, &sessions); err != nil || sessions.Sessions == nil || len(sessions.Sessions) != 0 {
@@ -179,7 +170,7 @@ func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
 		t.Fatalf("human take-over audit omitted evidence columns:\n%s", auditHuman)
 	}
 	allAccessOutput := bytes.Join([][]byte{bootstrap, []byte(human), grantJSON, replayedJSON, []byte(grantsHuman),
-		viewJSON, revokeJSON, sessionsJSON, []byte(auditHuman)}, []byte("\n"))
+		revokeJSON, sessionsJSON, []byte(auditHuman)}, []byte("\n"))
 	for _, forbidden := range []string{"bearer", "fencing_token", "framebuffer", "pointer", "hidden_backend", "idempotency_key"} {
 		if bytes.Contains(bytes.ToLower(allAccessOutput), []byte(forbidden)) {
 			t.Fatalf("access output leaked forbidden surface %q: %s", forbidden, allAccessOutput)
@@ -213,6 +204,42 @@ func assertCLIErrorCode(t *testing.T, err error, want contract.ErrorCode) {
 	}
 	if (want == contract.ErrorFinalAdmin || want == contract.ErrorStalePolicyRevision) && commandExitCode(err) != exitConflict {
 		t.Fatalf("conflict exit = %d, want %d", commandExitCode(err), exitConflict)
+	}
+}
+
+func TestAccessCLIErrorProjectionAndScopedExitCodes(t *testing.T) {
+	usage := usageError("bad access flags")
+	var usageJSON bytes.Buffer
+	writeCommandError(&usageJSON, usage, true)
+	var envelope contract.ErrorResponse
+	if err := json.Unmarshal(usageJSON.Bytes(), &envelope); err != nil || envelope.Error.Code != contract.ErrorInvalidRequest {
+		t.Fatalf("usage JSON = %s err=%v", usageJSON.String(), err)
+	}
+	if got := commandExitCodeForArgs(usage, []string{"services", "takeover", "view"}); got != exitUsage {
+		t.Fatalf("access usage exit = %d", got)
+	}
+	if got := commandExitCodeForArgs(usage, []string{"services", "status"}); got != exitFailure {
+		t.Fatalf("pre-existing command exit = %d, want historical %d", got, exitFailure)
+	}
+	receipt := contract.ComputerControlReceipt{ComputerID: "computer-1", Action: "take",
+		AdmittedMode: string(l1.ComputerAdmittedView), TenureState: contract.ComputerControlTenureFree,
+		PolicyRevision: 9, HumanDriving: false, SignalStayedTrue: false}
+	actionErr := &takeoverActionError{APIError: contract.APIError{Code: contract.ErrorTenureUnavailable,
+		Message: "replacement failed", Retryable: false}, Receipt: &receipt}
+	var failureJSON bytes.Buffer
+	writeCommandError(&failureJSON, actionErr, true)
+	var failure contract.ComputerControlErrorResponse
+	if err := json.Unmarshal(failureJSON.Bytes(), &failure); err != nil || failure.Receipt == nil ||
+		failure.Receipt.TenureState != contract.ComputerControlTenureFree || failure.Receipt.HumanDriving {
+		t.Fatalf("failed replacement JSON = %s err=%v", failureJSON.String(), err)
+	}
+}
+
+func TestAccessArgumentReorderingDoesNotConsumeBooleanFollower(t *testing.T) {
+	got := moveFirstPositionalsToEnd([]string{"--wait", "computer-1", "person-1", "--wait-timeout", "3s"}, 2)
+	want := []string{"--wait", "--wait-timeout", "3s", "computer-1", "person-1"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("reordered args = %q, want %q", got, want)
 	}
 }
 

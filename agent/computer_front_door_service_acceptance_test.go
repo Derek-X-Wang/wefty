@@ -179,7 +179,7 @@ func TestServiceAcceptanceControllerTenureRealProcessAuthorityLoss(t *testing.T)
 	if _, banner, err := connection.Read(t.Context()); err != nil || string(banner) != "RFB 003.008\n" {
 		t.Fatalf("real-process Controller banner = %q err=%v", banner, err)
 	}
-	if err := takeover.Perform(t.Context(), directTakeoverFabric{},
+	if _, err := takeover.Perform(t.Context(), directTakeoverFabric{},
 		"ws"+server.URL[len("http"):]+contract.ComputerDisplayWebSocketPath, token, "take"); err != nil {
 		t.Fatalf("real-process CLI take adapter: %v", err)
 	}

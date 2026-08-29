@@ -277,6 +277,30 @@ func policySnapshot(t *testing.T, issued time.Time, generation, revision int64, 
 	return snapshot
 }
 
+func TestComputerPolicyCacheDecisionMatchesSharedEvaluator(t *testing.T) {
+	now := time.Now().UTC()
+	identity := fabric.Identity{FabricID: "fabric-one", UserID: "person-one", DeviceID: "device-one"}
+	snapshot := policySnapshot(t, now, 1, 7, nil, l1.ComputerGrant{
+		FabricID: identity.FabricID, UserID: identity.UserID, Permission: l1.ComputerGrantControl,
+	})
+	cache := NewComputerPolicyCache(systemClock{}, snapshot.NodeID, snapshot.BootSessionID)
+	defer cache.Close()
+	if _, err := cache.Install(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	agentDecision := cache.lookupGrant("computer-1", identity)
+	shared := l1.EvaluateComputerPolicyPerson(snapshot, true, "computer-1", identity)
+	if agentDecision.Permission != shared.Permission || agentDecision.Administrator != shared.Administrator ||
+		agentDecision.PolicyRevision != shared.PolicyRevision || !agentDecision.FreshUntil.Equal(shared.FreshUntil) {
+		t.Fatalf("agent decision %#v differs from shared evaluator %#v", agentDecision, shared)
+	}
+	wrongFabric := identity
+	wrongFabric.FabricID = "fabric-two"
+	if got := cache.lookupGrant("computer-1", wrongFabric); got.Permission != l1.ComputerGrantNone {
+		t.Fatalf("cross-Fabric decision = %#v", got)
+	}
+}
+
 func assertRevocationReason(t *testing.T, authorization *ComputerGrantAuthorization, want ComputerPolicyRevocationReason) {
 	t.Helper()
 	select {

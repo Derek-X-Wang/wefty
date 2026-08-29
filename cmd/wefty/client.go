@@ -126,7 +126,11 @@ func (c *apiClients) mutateComputerGrant(
 ) (l1.ComputerGrantMutationResult, error) {
 	var result l1.ComputerGrantMutationResult
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/grants/" + url.PathEscape(userID)
-	err := c.l1.do(ctx, http.MethodPut, path, request, nil, &result, http.StatusOK)
+	responseHeaders, err := c.l1.doWithResponse(ctx, http.MethodPut, path, request, nil, &result, http.StatusOK)
+	if err == nil && responseHeaders.Get("Idempotent-Replay") == "true" {
+		result.Replayed = true
+		result.MutationApplied = false
+	}
 	return result, err
 }
 
@@ -143,13 +147,6 @@ func (c *apiClients) getComputerPolicyRevocation(
 	return revocation, err
 }
 
-func (c *apiClients) getComputer(ctx context.Context, computerID string) (l1.Computer, error) {
-	var computer l1.Computer
-	path := "/v1/computers/" + url.PathEscape(computerID)
-	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &computer, http.StatusOK)
-	return computer, err
-}
-
 func (c *apiClients) listComputerTakeoverSessions(ctx context.Context, computerID string) (l1.ComputerTakeoverSessionList, error) {
 	var sessions l1.ComputerTakeoverSessionList
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/takeover/sessions"
@@ -157,8 +154,8 @@ func (c *apiClients) listComputerTakeoverSessions(ctx context.Context, computerI
 	return sessions, err
 }
 
-func (c *apiClients) getComputerTakeoverAccess(ctx context.Context, computerID string) (l1.ComputerTakeoverAccess, error) {
-	var access l1.ComputerTakeoverAccess
+func (c *apiClients) getComputerTakeoverAvailability(ctx context.Context, computerID string) (l1.ComputerTakeoverAvailability, error) {
+	var access l1.ComputerTakeoverAvailability
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/takeover"
 	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &access, http.StatusOK)
 	return access, err
@@ -166,7 +163,7 @@ func (c *apiClients) getComputerTakeoverAccess(ctx context.Context, computerID s
 
 type takeoverActionError = takeover.ActionError
 
-func (c *apiClients) performComputerTakeoverAction(ctx context.Context, endpoint, token, action string) error {
+func (c *apiClients) performComputerTakeoverAction(ctx context.Context, endpoint, token, action string) (contract.ComputerControlReceipt, error) {
 	return takeover.Perform(ctx, c.fabric, endpoint, token, action)
 }
 
@@ -415,7 +412,7 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 	}
 	var responseError contract.ErrorResponse
 	if err := json.Unmarshal(responseBody, &responseError); err == nil && responseError.Error.Code != "" {
-		return nil, &apiResponseError{Service: c.name, StatusCode: response.StatusCode, APIError: responseError.Error}
+		return response.Header.Clone(), &apiResponseError{Service: c.name, StatusCode: response.StatusCode, APIError: responseError.Error}
 	}
-	return nil, fmt.Errorf("%s returned HTTP %d", c.name, response.StatusCode)
+	return response.Header.Clone(), fmt.Errorf("%s returned HTTP %d", c.name, response.StatusCode)
 }

@@ -56,6 +56,28 @@ const (
 	StableNodeTagPrefix = "wefty:node:"
 )
 
+type ComputerControlTenureState string
+
+const (
+	ComputerControlTenureFree ComputerControlTenureState = "free"
+	ComputerControlTenureHeld ComputerControlTenureState = "held"
+)
+
+// ComputerControlReceipt is the front door's authoritative result for one
+// session-bound take or release. It contains tenure facts only, never the
+// session capability or either guest backend.
+type ComputerControlReceipt struct {
+	ComputerID                 string                     `json:"computer_id"`
+	Action                     string                     `json:"action"`
+	HolderSessionID            string                     `json:"holder_session_id,omitempty"`
+	AdmittedMode               string                     `json:"admitted_mode"`
+	TenureState                ComputerControlTenureState `json:"tenure_state"`
+	PolicyRevision             int64                      `json:"policy_revision"`
+	OverrideDisplacedSessionID string                     `json:"override_displaced_session_id,omitempty"`
+	HumanDriving               bool                       `json:"human_driving"`
+	SignalStayedTrue           bool                       `json:"signal_stayed_true"`
+}
+
 var ociReservedEnvironmentNames = [...]string{
 	EnvHandoffDir,
 	EnvServiceDir,

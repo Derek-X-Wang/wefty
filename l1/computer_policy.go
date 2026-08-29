@@ -45,9 +45,13 @@ type ComputerGrantDeleteRequest struct {
 }
 
 type ComputerGrantMutationResult struct {
-	Grant      ComputerGrant             `json:"grant"`
-	Replayed   bool                      `json:"replayed"`
-	Revocation *ComputerPolicyRevocation `json:"revocation,omitempty"`
+	Grant                  ComputerGrant             `json:"grant"`
+	Replayed               bool                      `json:"replayed"`
+	MutationApplied        bool                      `json:"mutation_applied"`
+	Revocation             *ComputerPolicyRevocation `json:"revocation,omitempty"`
+	ObservationState       string                    `json:"observation_state,omitempty"`
+	ObservationFailure     string                    `json:"observation_failure,omitempty"`
+	LastObservedRevocation *ComputerPolicyRevocation `json:"last_observed_revocation,omitempty"`
 }
 
 type ComputerGrantList struct {
@@ -55,14 +59,61 @@ type ComputerGrantList struct {
 	Grants         []ComputerGrant `json:"grants"`
 }
 
-type ComputerTakeoverAccess struct {
-	ComputerID      string                  `json:"computer_id"`
-	UserID          string                  `json:"user_id"`
-	DeviceID        string                  `json:"device_id"`
-	DisplayName     string                  `json:"display_name,omitempty"`
-	AuthorizedRole  ComputerGrantPermission `json:"authorized_role"`
-	PolicyRevision  int64                   `json:"policy_revision"`
-	DisplayEndpoint *string                 `json:"display_endpoint"`
+// ComputerTakeoverAvailability is durable discovery data, not a live
+// admission decision. The front door remains the sole admission authority.
+type ComputerTakeoverAvailability struct {
+	ComputerID      string  `json:"computer_id"`
+	UserID          string  `json:"user_id"`
+	DeviceID        string  `json:"device_id"`
+	DisplayName     string  `json:"display_name,omitempty"`
+	PolicyRevision  int64   `json:"policy_revision"`
+	DisplayEndpoint *string `json:"display_endpoint"`
+}
+
+// ComputerPolicyDecision is the one pure admission evaluator shared by L1
+// projections and the agent's live cache. Snapshot membership also proves the
+// Computer was stable when the snapshot was issued.
+type ComputerPolicyDecision struct {
+	Permission     ComputerGrantPermission
+	Administrator  bool
+	PolicyRevision int64
+	FreshUntil     time.Time
+}
+
+func ValidComputerPolicyPerson(identity fabric.Identity) bool {
+	return identity.Kind != fabric.IdentityKindMachine && identity.FabricID != "" && identity.UserID != "" &&
+		identity.DeviceID != "" && identity.FabricID == strings.TrimSpace(identity.FabricID) &&
+		identity.UserID == strings.TrimSpace(identity.UserID) && identity.DeviceID == strings.TrimSpace(identity.DeviceID) &&
+		len(identity.FabricID) <= 255 && len(identity.UserID) <= 255 && len(identity.DeviceID) <= 255
+}
+
+func EvaluateComputerPolicyPerson(snapshot ComputerPolicySnapshot, valid bool, computerID string, identity fabric.Identity) ComputerPolicyDecision {
+	decision := ComputerPolicyDecision{Permission: ComputerGrantNone}
+	if !valid || !ValidComputerPolicyPerson(identity) || identity.FabricID != snapshot.IssuingFabricID {
+		return decision
+	}
+	decision.PolicyRevision = snapshot.PolicyRevision
+	decision.FreshUntil = snapshot.FreshUntil
+	for _, computer := range snapshot.Computers {
+		if computer.ComputerID != computerID {
+			continue
+		}
+		for _, admin := range snapshot.Admins {
+			if admin.FabricID == identity.FabricID && admin.UserID == identity.UserID {
+				decision.Permission = ComputerGrantControl
+				decision.Administrator = true
+				return decision
+			}
+		}
+		for _, grant := range computer.Grants {
+			if grant.FabricID == identity.FabricID && grant.UserID == identity.UserID {
+				decision.Permission = grant.Permission
+				return decision
+			}
+		}
+		return decision
+	}
+	return decision
 }
 
 type ComputerPolicyAuditOperation string
@@ -360,7 +411,7 @@ func (s *Store) MutateComputerGrant(ctx context.Context, identity fabric.Identit
 	}
 	s.notifyComputerPolicyChanged()
 	return ComputerGrantMutationResult{Grant: ComputerGrant{FabricID: request.FabricID, UserID: userID,
-		Permission: request.Permission, PolicyRevision: nextRevision, UpdatedAt: now}, Revocation: revocation}, nil
+		Permission: request.Permission, PolicyRevision: nextRevision, UpdatedAt: now}, MutationApplied: true, Revocation: revocation}, nil
 }
 
 func (s *Store) DeleteForeignComputerGrant(ctx context.Context, identity fabric.Identity, computerID, userID string,
@@ -412,56 +463,56 @@ func (s *Store) ListComputerGrants(ctx context.Context, identity fabric.Identity
 	return result, nil
 }
 
-func (s *Store) GetComputerTakeoverAccess(
+func (s *Store) GetComputerTakeoverAvailability(
 	ctx context.Context,
 	identity fabric.Identity,
 	computerID string,
-) (ComputerTakeoverAccess, error) {
+) (ComputerTakeoverAvailability, error) {
 	if err := validatePersonIdentity(identity); err != nil {
-		return ComputerTakeoverAccess{}, err
+		return ComputerTakeoverAvailability{}, err
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return ComputerTakeoverAccess{}, internalError(err, "begin Computer take-over access read")
+		return ComputerTakeoverAvailability{}, internalError(err, "begin Computer take-over availability read")
 	}
 	defer tx.Rollback()
-	access := ComputerTakeoverAccess{ComputerID: computerID, UserID: identity.UserID,
+	access := ComputerTakeoverAvailability{ComputerID: computerID, UserID: identity.UserID,
 		DeviceID: identity.DeviceID, DisplayName: identity.DisplayName}
 	if err := tx.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&access.PolicyRevision); err != nil {
-		return ComputerTakeoverAccess{}, internalError(err, "read Computer take-over policy revision")
-	}
-	var endpoint sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT service_jobs.display_endpoint FROM computers
-		JOIN service_jobs ON service_jobs.job_id=computers.current_job_id
-		WHERE computers.computer_id=? AND computers.desired_state<>'removed'`, computerID).Scan(&endpoint); errors.Is(err, sql.ErrNoRows) {
-		return ComputerTakeoverAccess{}, protocolError(contract.ErrorNotFound, "Computer %q not found", computerID)
-	} else if err != nil {
-		return ComputerTakeoverAccess{}, internalError(err, "read Computer take-over endpoint")
+		return ComputerTakeoverAvailability{}, internalError(err, "read Computer take-over policy revision")
 	}
 	var administrator bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
 		identity.FabricID, identity.UserID).Scan(&administrator); err != nil {
-		return ComputerTakeoverAccess{}, internalError(err, "read Computer administrator access")
+		return ComputerTakeoverAvailability{}, internalError(err, "read Computer administrator access")
 	}
-	if administrator {
-		access.AuthorizedRole = ComputerGrantControl
-	} else {
+	if !administrator {
+		var permission ComputerGrantPermission
 		if err := tx.QueryRowContext(ctx, `SELECT permission FROM computer_grants
 			WHERE computer_id=? AND fabric_id=? AND user_id=?`, computerID, identity.FabricID, identity.UserID).
-			Scan(&access.AuthorizedRole); errors.Is(err, sql.ErrNoRows) {
-			return ComputerTakeoverAccess{}, protocolError(contract.ErrorForbidden, "person %q has no Computer access", identity.UserID)
+			Scan(&permission); errors.Is(err, sql.ErrNoRows) {
+			return ComputerTakeoverAvailability{}, protocolError(contract.ErrorForbidden, "person %q has no Computer access", identity.UserID)
 		} else if err != nil {
-			return ComputerTakeoverAccess{}, internalError(err, "read Computer person access")
+			return ComputerTakeoverAvailability{}, internalError(err, "read Computer person access")
 		}
-		if access.AuthorizedRole != ComputerGrantView && access.AuthorizedRole != ComputerGrantControl {
-			return ComputerTakeoverAccess{}, protocolError(contract.ErrorForbidden, "person %q has no Computer access", identity.UserID)
+		if permission != ComputerGrantView && permission != ComputerGrantControl {
+			return ComputerTakeoverAvailability{}, protocolError(contract.ErrorForbidden, "person %q has no Computer access", identity.UserID)
 		}
+	}
+	// Authorization precedes existence/endpoint discovery to avoid an oracle.
+	var endpoint sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT service_jobs.display_endpoint FROM computers
+		JOIN service_jobs ON service_jobs.job_id=computers.current_job_id
+		WHERE computers.computer_id=? AND computers.desired_state<>'removed'`, computerID).Scan(&endpoint); errors.Is(err, sql.ErrNoRows) {
+		return ComputerTakeoverAvailability{}, protocolError(contract.ErrorNotFound, "Computer %q not found", computerID)
+	} else if err != nil {
+		return ComputerTakeoverAvailability{}, internalError(err, "read Computer take-over endpoint")
 	}
 	if endpoint.Valid {
 		access.DisplayEndpoint = &endpoint.String
 	}
 	if err := tx.Commit(); err != nil {
-		return ComputerTakeoverAccess{}, internalError(err, "commit Computer take-over access read")
+		return ComputerTakeoverAvailability{}, internalError(err, "commit Computer take-over availability read")
 	}
 	return access, nil
 }

@@ -450,10 +450,11 @@ observable socket boundary and can briefly lag it. The projection never returns 
 front-door endpoint, or a raw backend address. Both projections require a
 current administrator.
 
-The CLI discovers only the authorized front-door URL and server-derived role;
-that URL always admits view. A viewer retains the opaque bearer returned by
-its live WebSocket handshake in an owner-readable file when it wants the CLI
-to issue `take` or `release`. The CLI reads that file, sends the bearer only to
+The CLI's L1 discovery route returns durable availability only, never a live
+admission role; that URL always attempts view-first admission at the agent's
+current evaluator. `takeover view --session-token-file FILE` opens that live
+WebSocket and atomically retains its opaque bearer plus private dial endpoint
+in an owner-readable file. The CLI reads that file, sends the bearer only to
 the fixed sideband path on the same front door and same Fabric identity, and
 never prints or persists its contents itself. The sideband remains the
 authority: a copied file from another person, device, ended session, or

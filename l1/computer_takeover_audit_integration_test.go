@@ -70,6 +70,7 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 		func() ComputerTakeoverAuditEvent {
 			value := event
 			value.EventID, value.Kind, value.AdmittedMode = "session-1:control:1:acquired", ComputerTakeoverControlAcquired, ComputerAdmittedController
+			value.OccurredAt = value.OccurredAt.Add(-10 * time.Minute)
 			return value
 		}(),
 		func() ComputerTakeoverAuditEvent {
@@ -121,9 +122,15 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 	auditPage = ComputerTakeoverAuditList{}
 	if err := json.Unmarshal(body, &auditPage); status != http.StatusOK || err != nil || len(auditPage.Events) != 2 ||
 		auditPage.Events[0].Kind != ComputerTakeoverAdminOverrode || auditPage.Events[1].Kind != ComputerTakeoverControlReleased ||
-		auditPage.NextCursor != "" {
+		auditPage.NextCursor == "" {
 		t.Fatalf("take-over audit tail status=%d page=%#v err=%v body=%s", status, auditPage, err, body)
 	}
+	status, _, body = h.do(adminClient, http.MethodGet,
+		"/v1/computers/"+computer.ComputerID+"/takeover/audit?limit=2&cursor=forged%21", nil)
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
+	status, _, body = h.do(adminClient, http.MethodGet,
+		"/v1/computers/"+computer.ComputerID+"/takeover/audit?limit=0", nil)
+	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
 	status, _, body = h.do(h.client(fabric.Identity{FabricID: "fabric-test", UserID: "person-viewer", DeviceID: "viewer-device"}),
 		http.MethodGet, sessionsPath, nil)
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorAdminRequired)

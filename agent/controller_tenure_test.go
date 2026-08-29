@@ -72,8 +72,12 @@ func TestControllerTenureFirstDriverRetainsWheelAndOperationsAreSessionBound(t *
 	if heldSession == second.id {
 		loser = first.id
 	}
-	if err := fixture.tenure.Release(t.Context(), loser, l1.ComputerTakeoverExplicitRelease); err != nil {
+	nonholderReceipt, err := fixture.tenure.ReleaseReceipt(t.Context(), loser, l1.ComputerTakeoverExplicitRelease)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if nonholderReceipt.TenureState != contract.ComputerControlTenureHeld || nonholderReceipt.HolderSessionID != heldSession || !nonholderReceipt.HumanDriving {
+		t.Fatalf("non-holder release receipt = %#v", nonholderReceipt)
 	}
 	if len(fixture.signalSnapshot()) != 1 {
 		t.Fatalf("non-holder release changed signal: %v", fixture.signalSnapshot())
@@ -324,9 +328,12 @@ func TestControllerTenureAdminOverrideObservesOldLegAndPreservesTrueSignal(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	newConnection, err := fixture.tenure.Take(t.Context(), admin.id)
-	if err != nil || newConnection == nil {
-		t.Fatalf("admin override = conn=%v err=%v", newConnection, err)
+	receipt, err := fixture.tenure.TakeReceipt(t.Context(), admin.id)
+	if err != nil {
+		t.Fatalf("admin override: %v", err)
+	}
+	if receipt.OverrideDisplacedSessionID != first.id || receipt.HolderSessionID != admin.id || !receipt.SignalStayedTrue || !receipt.HumanDriving {
+		t.Fatalf("admin override receipt = %#v", receipt)
 	}
 	if _, err := oldConnection.Write([]byte("input")); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("old input leg remained usable after override: %v", err)
@@ -365,8 +372,13 @@ func TestControllerTenureFailedOverrideClearsSignalAndReturnsFree(t *testing.T) 
 		t.Fatal(err)
 	}
 	fixture.failDial = true
-	if _, err := fixture.tenure.Take(t.Context(), admin.id); err == nil {
+	receipt, err := fixture.tenure.TakeReceipt(t.Context(), admin.id)
+	if err == nil {
 		t.Fatal("failed replacement backend preserved tenure")
+	}
+	if receipt.TenureState != contract.ComputerControlTenureFree || receipt.HumanDriving || receipt.SignalStayedTrue ||
+		receipt.OverrideDisplacedSessionID != first.id {
+		t.Fatalf("failed replacement receipt = %#v", receipt)
 	}
 	if fixture.tenure.held != nil {
 		t.Fatalf("failed override retained holder: %#v", fixture.tenure.held)
@@ -521,11 +533,11 @@ func TestComputerFrontDoorSidebandTakeAndReleaseReplaceRelayLeg(t *testing.T) {
 		t.Fatalf("banner = %q err=%v", banner, err)
 	}
 	assertRelayRoundTrip(t, client, "before", "view:before")
-	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusNoContent {
+	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusOK {
 		t.Fatalf("take status = %d", status)
 	}
 	assertRelayRoundTrip(t, client, "driving", "control:driving")
-	if status := postComputerControl(t, server.URL, computerControlReleasePath, token); status != http.StatusNoContent {
+	if status := postComputerControl(t, server.URL, computerControlReleasePath, token); status != http.StatusOK {
 		t.Fatalf("release status = %d", status)
 	}
 	assertRelayRoundTrip(t, client, "after", "view:after")
@@ -602,7 +614,7 @@ func TestComputerFrontDoorRevocationWhileDrivingClosesControlBeforeSession(t *te
 	if kind, banner, err := connection.Read(t.Context()); err != nil || kind != websocket.MessageBinary || string(banner) != "RFB 003.008\n" {
 		t.Fatalf("view banner = %q kind=%v err=%v", banner, kind, err)
 	}
-	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusNoContent {
+	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusOK {
 		t.Fatalf("take status = %d", status)
 	}
 	tenure.mu.Lock()
