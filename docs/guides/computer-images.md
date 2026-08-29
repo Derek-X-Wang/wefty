@@ -79,14 +79,34 @@ start_control_edge --bind 127.0.0.1:"$WEFTY_COMPUTER_CONTROL_PORT"
 exec watch_driver_and_children
 ```
 
-Build and push it to an operator-owned registry, resolve its digest, then run
-the shipped runtime harness against those immutable bytes:
+Build and push it to an operator-owned registry, resolve its digest, then build
+and run the checker against those immutable bytes:
 
 ```sh
-scripts/test-computer-image-runtime.sh \
+go build -o ./wefty-computer-conformance ./cmd/wefty-computer-conformance
+./wefty-computer-conformance \
   --image registry.example/operator/computer@sha256:<platform-digest> \
-  --arch amd64 --evidence ./computer-evidence
+  --platform linux/amd64 \
+  --input-oracle-path /path/inside/image/to/input-receipt \
+  --driver-oracle-path /path/inside/image/to/observed-driver-state \
+  --receipt ./computer-conformance.json
 ```
+
+Use `--runtime nerdctl` for a containerd installation. The checker applies the
+GPU-free Computer profile, injects fresh loopback ports, drives the exact
+WebSocket/RFB transport (including byte-identical key and pointer input over
+view and control), atomically changes `driver.json`, and restarts the image to
+test the persistence boundary. It prints a human summary and writes a
+machine-readable receipt with stable check IDs. Every cell starts `NOT-RUN`;
+omitting either explicit oracle never becomes `PASS`, and the process exits 2
+when no check failed but at least one remains `NOT-RUN`.
+
+An input oracle is image-owned observation, not a new Wefty wire protocol. It
+must expose a deterministic file whose bytes change after accepted input and
+stay byte-identical when input is discarded. A driver oracle similarly exposes
+the tenant agent's already-internal observation of `driver.json`. The reference
+image uses `/tmp/wefty-computer/input-oracle.json` and
+`/tmp/wefty-computer/driver-state.json`; other images choose their own paths.
 
 For focused transport debugging while the image is running on host port 18181:
 
@@ -97,9 +117,10 @@ scripts/probe-rfb-websocket.py --port 18181 --mode fragment-ready
 scripts/probe-rfb-websocket.py --port 18181 --mode text-frame
 ```
 
-These scripts test the shipped example and help image authors today. Ticket
-#182 will turn the same seam into the product conformance CLI; authors do not
-need to wait for that CLI to exercise their image.
+The standalone probe remains useful for focused transport debugging. The CI
+compatibility wrapper `scripts/test-computer-image-runtime.sh` delegates all
+contract assertions to `wefty-computer-conformance`, so the reference lane and
+image authors consume one checker rather than two drifting harnesses.
 
 ## Image responsibilities
 
@@ -125,5 +146,6 @@ The helper retains the ordinary `wefty-v1` walls and supplies the private 1 GiB
 `/dev/shm` defined by the Computer image contract.
 
 The Omarchy-inspired Wayland/wayvnc variant belongs to ticket #207. The
-`wefty-computer-conformance` checker belongs to ticket #182; this image leaves
-its deterministic focused input-oracle surface without implementing that CLI.
+reference image leaves its deterministic focused input and driver oracle
+surfaces for `wefty-computer-conformance`; neither surface is a guest-facing
+Wefty protocol.

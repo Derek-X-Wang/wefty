@@ -199,6 +199,11 @@ wire-negative cases, atomic loss/recovery, injected-clock deadline behavior,
 and the serialized profile. The Linux `service_acceptance_realtiming` lane
 asserts `/dev/shm` mode, flags, size, and a rising cgroup `memory.current` after
 a guest write. The optional `examples/computer/` reference image implements
-this minimum contract as an image-author and acceptance example. The
-`wefty-computer-conformance` CLI remains ticket #182; this contract does not
-implement that checker.
+this minimum contract as an image-author and acceptance example.
+
+`wefty-computer-conformance --image` runs these image-owned assertions through
+Docker or containerd's `nerdctl`, emits one versioned JSON receipt with stable
+check IDs, and prints the same cells as a human summary. Every cell begins as
+`NOT-RUN`; an omitted or unavailable input/driver oracle therefore cannot be
+folded into an aggregate `PASS`. The reference image supplies both explicit
+oracle paths and the secretless required image lane proves every cell `PASS`.

@@ -9,7 +9,8 @@ The image owns its desktop stack and implements both reserved
 input disabled; `control` accepts input. Both are exposed only at the injected
 loopback ports, require `/websockify` and the `binary` subprotocol, and reject
 text frames. The focused Chromium page is the deterministic oracle seam that
-ticket #182 can exercise.
+`wefty-computer-conformance` exercises with real, byte-identical view and
+control input.
 
 `/home/wefty` is an image-owned symlink to
 `/wefty/service/home/wefty`, so browser profile and sign-in markers follow the
