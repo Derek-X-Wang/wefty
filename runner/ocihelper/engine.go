@@ -143,7 +143,12 @@ func NewImageMechanicsError(fact ImageFailureFact, err error) error {
 }
 
 func imageMechanicsError(kind ImageFailureKind, digest string, err error) error {
-	return &ImageMechanicsError{Fact: ImageFailureFact{Kind: kind, TopLevelDigest: digest}, err: err}
+	fact := ImageFailureFact{Kind: kind, TopLevelDigest: digest}
+	var inspection *ociArchiveInspectionError
+	if errors.As(err, &inspection) {
+		fact.Reason = inspection.Error()
+	}
+	return &ImageMechanicsError{Fact: fact, err: err}
 }
 
 func (UnavailableEngine) EnsureImage(context.Context, EnsureImageRequest, io.Reader, func(EnsureImageEvent) error) error {

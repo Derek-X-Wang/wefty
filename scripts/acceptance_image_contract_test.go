@@ -180,6 +180,26 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		if jobTimeout != 100 || jobTimeout < goTimeout+15 {
 			t.Fatalf("%s realtiming timeouts: job=%dm go=%dm, want job=100m and at least 15m outer margin", name, jobTimeout, goTimeout)
 		}
+		for _, required := range []string{
+			"StandardError=append:/tmp/wefty-oci-helper-realtiming.stderr",
+			"if: ${{ always() && runner.os == 'Linux' }}",
+			"journalctl --boot --no-pager --utc --output=short-precise",
+			"-u wefty-oci-helper-realtiming.service",
+			"-u wefty-test-containerd.service",
+			"systemctl status --no-pager --full",
+			"wefty-oci-helper.stderr.txt",
+			"linux-oci-diagnostics.status.txt",
+			"set +e",
+			"journalctl_exit=%s\\n",
+			"systemctl_status_exit=%s\\n",
+			"helper_stderr_test_exit=%s\\n",
+			"helper_stderr_capture_exit=%s\\n",
+			"PIPESTATUS[0]",
+		} {
+			if !strings.Contains(fixture.text, required) {
+				t.Fatalf("%s realtiming diagnostics are missing %q", name, required)
+			}
+		}
 		assertRegistryFaultAction(t, name, fixture.text, "disable-registry",
 			"iptables -I OUTPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT")
 		assertRegistryFaultAction(t, name, fixture.text, "enable-registry",

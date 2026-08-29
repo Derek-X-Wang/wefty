@@ -1,11 +1,14 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +21,111 @@ import (
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
+
+const localNodeCLIChildEnvironment = "WEFTY_LOCAL_NODE_CLI_CHILD"
+
+func TestNodeLoadImageCLIReportsHelperMechanics(t *testing.T) {
+	if os.Getenv(localNodeCLIChildEnvironment) == "1" {
+		args := []string{
+			"--fabric=invalid-must-not-open",
+			"--node-config=" + os.Getenv("WEFTY_LOCAL_NODE_CLI_CONFIG"),
+			"--json", "node", "load-image", os.Getenv("WEFTY_LOCAL_NODE_CLI_ARCHIVE"),
+		}
+		if err := run(context.Background(), args, os.Stdout, os.Stderr); err != nil {
+			writeCommandError(os.Stderr, err, true)
+			os.Exit(commandExitCodeForArgs(err, args))
+		}
+		return
+	}
+
+	root, err := os.MkdirTemp("/tmp", "wefty-node-cli-mechanics-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	archivePath := filepath.Join(root, "gnu-shaped.oci.tar")
+	var archive bytes.Buffer
+	archiveWriter := tar.NewWriter(&archive)
+	if err := archiveWriter.WriteHeader(&tar.Header{Name: "./", Mode: 0o700, Typeflag: tar.TypeDir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := archiveWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(archivePath, archive.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	socket := filepath.Join(root, "control.sock")
+	service := ocicontrol.ServiceFuncs{LoadImageFunc: func(_ context.Context, archive io.Reader) (ocicontrol.LoadImageResponse, error) {
+		header, err := tar.NewReader(archive).Next()
+		if err != nil || header.Name != "./" || !header.FileInfo().IsDir() {
+			return ocicontrol.LoadImageResponse{}, errors.New("CLI did not stream the GNU-shaped archive")
+		}
+		return ocicontrol.LoadImageResponse{}, &ocihelper.RPCError{
+			Code:    ocihelper.CodeImageUnavailable,
+			Message: "OCI image delivery failed",
+			ImageFailure: &ocihelper.ImageFailureFact{
+				Kind:   ocihelper.ImageFailureManifestRejected,
+				Reason: `OCI archive path "." is unsafe`,
+			},
+		}
+	}}
+	server, err := ocicontrol.NewServer(socket, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverContext, cancelServer := context.WithCancel(t.Context())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- server.Serve(serverContext) }()
+	t.Cleanup(func() {
+		cancelServer()
+		if err := <-serverDone; err != nil {
+			t.Errorf("stop node-local control server: %v", err)
+		}
+	})
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if info, statErr := os.Stat(socket); statErr == nil && info.Mode()&os.ModeSocket != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("control server did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	configPath := filepath.Join(root, "node.json")
+	configPayload, err := json.Marshal(ocicontrol.InstalledConfig{Version: ocicontrol.InstalledConfigVersion, ControlSocket: socket})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configPayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestNodeLoadImageCLIReportsHelperMechanics$")
+	command.Env = append(os.Environ(),
+		localNodeCLIChildEnvironment+"=1",
+		"WEFTY_LOCAL_NODE_CLI_CONFIG="+configPath,
+		"WEFTY_LOCAL_NODE_CLI_ARCHIVE="+archivePath,
+	)
+	output, err := command.CombinedOutput()
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("wefty node load-image exit=%v output=%s", err, output)
+	}
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(output, &response); err != nil {
+		t.Fatalf("decode CLI error: %v output=%s", err, output)
+	}
+	if response.Error.Code != contract.ErrorInternal || response.Error.Retryable || response.Error.Details["reason"] != string(ocihelper.CodeImageUnavailable) {
+		t.Fatalf("CLI error=%+v", response.Error)
+	}
+	mechanics, ok := response.Error.Details["image_failure"].(map[string]any)
+	if !ok || mechanics["kind"] != string(ocihelper.ImageFailureManifestRejected) || mechanics["reason"] != `OCI archive path "." is unsafe` {
+		t.Fatalf("CLI image mechanics=%#v", response.Error.Details["image_failure"])
+	}
+}
 
 func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "wefty-node-cli-")

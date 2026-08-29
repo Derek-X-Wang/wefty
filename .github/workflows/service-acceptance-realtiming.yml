@@ -234,6 +234,7 @@ jobs:
           ExecStart=/usr/local/libexec/wefty-agent-oci-realtiming __wefty_oci_helper --oci-containerd-address /run/wefty-containerd/containerd.sock --oci-containerd-state-root /run/wefty-containerd/state --oci-runtime-root /var/lib/wefty/oci --oci-memory-capacity-bytes 4294967296 --oci-memory-reserve-bytes 1073741824
           User=root
           Group=root
+          StandardError=append:/tmp/wefty-oci-helper-realtiming.stderr
           UNIT
           sudo systemctl daemon-reload
           sudo systemctl start wefty-oci-helper-realtiming.socket
@@ -387,6 +388,42 @@ jobs:
           printf 'commit=%s\nrunner=%s\n' "$CANDIDATE_SHA" "$RUNNER_NAME" > "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
           go version >> "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
           go test -count=1 -p 1 -timeout=75m -v -tags=service_acceptance_realtiming ./...
+      - name: Capture Linux OCI service diagnostics
+        if: ${{ always() && runner.os == 'Linux' }}
+        env:
+          WEFTY_REALTIME_EVIDENCE_DIR: ${{ runner.temp }}/service-acceptance-realtiming
+        run: |
+          mkdir -p "$WEFTY_REALTIME_EVIDENCE_DIR"
+          diagnostics_status="$WEFTY_REALTIME_EVIDENCE_DIR/linux-oci-diagnostics.status.txt"
+          : > "$diagnostics_status"
+          set +e
+          sudo journalctl --boot --no-pager --utc --output=short-precise \
+            -u wefty-oci-helper-realtiming.service \
+            -u wefty-test-containerd.service \
+            2>&1 | tee "$WEFTY_REALTIME_EVIDENCE_DIR/linux-oci-services.journal.txt" >/dev/null
+          journal_status="${PIPESTATUS[0]}"
+          printf 'journalctl_exit=%s\n' "$journal_status" >> "$diagnostics_status"
+          sudo systemctl status --no-pager --full \
+            wefty-oci-helper-realtiming.socket \
+            wefty-oci-helper-realtiming.service \
+            wefty-test-containerd.service \
+            2>&1 | tee "$WEFTY_REALTIME_EVIDENCE_DIR/linux-oci-services.status.txt" >/dev/null
+          systemctl_status="${PIPESTATUS[0]}"
+          printf 'systemctl_status_exit=%s\n' "$systemctl_status" >> "$diagnostics_status"
+          sudo test -f /tmp/wefty-oci-helper-realtiming.stderr
+          helper_stderr_test_status="$?"
+          printf 'helper_stderr_test_exit=%s\n' "$helper_stderr_test_status" >> "$diagnostics_status"
+          if [ "$helper_stderr_test_status" -eq 0 ]; then
+            sudo cat /tmp/wefty-oci-helper-realtiming.stderr 2>&1 | \
+              tee "$WEFTY_REALTIME_EVIDENCE_DIR/wefty-oci-helper.stderr.txt" >/dev/null
+            helper_stderr_capture_status="${PIPESTATUS[0]}"
+          else
+            printf '%s\n' 'helper stderr file was not created' \
+              > "$WEFTY_REALTIME_EVIDENCE_DIR/wefty-oci-helper.stderr.txt"
+            helper_stderr_capture_status="$helper_stderr_test_status"
+          fi
+          printf 'helper_stderr_capture_exit=%s\n' "$helper_stderr_capture_status" >> "$diagnostics_status"
+          set -e
       - name: Upload service acceptance evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
