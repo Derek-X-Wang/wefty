@@ -878,6 +878,10 @@ func TestAttemptDeadmanUsesGuardianReaper(t *testing.T) {
 	}
 	clock.Advance(time.Second)
 	waitFor(t, time.Second, func() bool { return engine.guardianCount() == 1 }, "guardian deadman reap")
+	deleted, err := session.Delete(t.Context(), DeleteRequest{Authority: testAuthority()})
+	if err != nil || !deleted.Deleted {
+		t.Fatalf("Delete after exact guardian reap = %+v err=%v", deleted, err)
+	}
 }
 
 func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {

@@ -213,6 +213,30 @@ func TestAdapterLoadImageUsesAgentBudgetAndReturnsDigests(t *testing.T) {
 	}
 }
 
+func TestAdapterLoadImageBootstrapsPlatformWithoutFunctionalProbe(t *testing.T) {
+	engine := &adapterTestEngine{}
+	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{Budget: 3 * time.Second})
+	defer closeAdapter()
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.mu.Lock()
+	delete(adapter.probePlatforms, helperSession(session))
+	adapter.mu.Unlock()
+
+	result, err := adapter.LoadImage(t.Context(), "", bytes.NewReader([]byte("archive")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TopLevelDigest != adapterTestDigest || engine.ensureCalls != 1 {
+		t.Fatalf("bootstrap load-image result=%+v calls=%d", result, engine.ensureCalls)
+	}
+	if _, recorded := adapter.probePlatform(session); recorded {
+		t.Fatal("offline import promoted diagnostic platform mechanics into functional probe evidence")
+	}
+}
+
 func TestAdapterRejectsHelperDigestDifferentFromPinnedRequest(t *testing.T) {
 	other := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	engine := &adapterTestEngine{responseDigest: other}
@@ -1109,6 +1133,10 @@ type adapterTestEngine struct {
 	inventoryErr       error
 	attestRemoval      ocihelper.AttestRemovalResponse
 	attestErr          error
+}
+
+func (*adapterTestEngine) DoctorStatus(context.Context) (ocihelper.DoctorStatus, error) {
+	return ocihelper.DoctorStatus{RuntimePlatform: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}}, nil
 }
 
 func (engine *adapterTestEngine) ReconcileImagePins(_ context.Context, request ocihelper.ReconcileImagePinsRequest) (ocihelper.ReconcileImagePinsResponse, error) {

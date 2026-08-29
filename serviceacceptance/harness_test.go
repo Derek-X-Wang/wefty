@@ -129,7 +129,7 @@ func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOpti
 		"--listen=127.0.0.1:0",
 		"--db=" + l1Database,
 		"--lease-duration=" + options.leaseDuration.String(),
-		"--node-tags=acceptance-node=service-acceptance",
+		"--node-tags=acceptance-node=service-acceptance," + contract.StableNodeTagPrefix + "acceptance-node",
 		"--node-max-oneshot-slots=acceptance-node=4",
 		"--node-max-service-slots=acceptance-node=2",
 		"--ready-file=" + readyFile,

@@ -570,7 +570,14 @@ func (adapter *Adapter) LoadImage(ctx context.Context, reference string, archive
 	}
 	probePlatform, ok := adapter.probePlatform(session)
 	if !ok {
-		return ocihelper.EnsureImageResponse{}, errors.New("current OCI helper generation has no successful probe platform")
+		status, statusErr := session.DoctorStatus(budgetContext)
+		if statusErr != nil {
+			return ocihelper.EnsureImageResponse{}, fmt.Errorf("read OCI helper platform for offline import: %w", statusErr)
+		}
+		probePlatform, statusErr = canonicalProbePlatform(status.RuntimePlatform)
+		if statusErr != nil {
+			return ocihelper.EnsureImageResponse{}, fmt.Errorf("read OCI helper platform for offline import: %w", statusErr)
+		}
 	}
 	deadline, _ := budgetContext.Deadline()
 	remaining := time.Until(deadline)
