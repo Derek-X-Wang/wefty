@@ -104,7 +104,11 @@ func newComputerHTTPHarness(t *testing.T, verifier ComputerGrantVerifier) *compu
 }
 
 func (h *computerHTTPHarness) client(nodeID string) *http.Client {
-	participant := h.network.NewFabric(fabric.Identity{NodeID: nodeID})
+	return h.clientForIdentity(fabric.Identity{NodeID: nodeID})
+}
+
+func (h *computerHTTPHarness) clientForIdentity(identity fabric.Identity) *http.Client {
+	participant := h.network.NewFabric(identity)
 	return &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return participant.Dial(ctx, network, h.address)
 	}}}
@@ -378,6 +382,133 @@ func TestComputerRootRunListIsPaginatedAndCurrentGenerationScoped(t *testing.T) 
 		if status != http.StatusBadRequest {
 			t.Fatalf("invalid list %q status=%d body=%s", invalid, status, body)
 		}
+	}
+}
+
+func TestComputerHTTPInflightLimitErrorKeepsTypedCountAndLimit(t *testing.T) {
+	proof := ComputerTokenScopeProof{ComputerID: "computer-limit", ComputerAttemptID: "attempt-limit",
+		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node-limit", SubmitMaxInflight: 1}
+	h := newComputerHTTPHarness(t, &controlledComputerGrantVerifier{proof: proof})
+	client := h.client(proof.HostNodeID)
+	grant := mintComputerHTTPToken(t, h, client, proof)
+	status, _, body := doComputerHTTP(t, client, http.MethodPost, "/v1/runs", grant.Token, "limit-first", computerHTTPRunRequest("exit 0\n"))
+	if status != http.StatusCreated {
+		t.Fatalf("first inflight root status=%d body=%s", status, body)
+	}
+	status, _, body = doComputerHTTP(t, client, http.MethodPost, "/v1/runs", grant.Token, "limit-second", computerHTTPRunRequest("exit 1\n"))
+	if status != http.StatusConflict {
+		t.Fatalf("limited root status=%d body=%s", status, body)
+	}
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error.Code != contract.ErrorSubmitInflightLimit || !response.Error.Retryable ||
+		response.Error.Details["computer_id"] != proof.ComputerID || response.Error.Details["count"] != float64(1) ||
+		response.Error.Details["limit"] != float64(1) ||
+		response.Error.Message != `Computer "computer-limit" has 1 nonterminal root Lineages (limit 1)` {
+		t.Fatalf("typed inflight limit response = %#v", response.Error)
+	}
+}
+
+func TestCallerComputerOriginRunListSpansGenerationsAndKeepsExactTriggers(t *testing.T) {
+	proof := ComputerTokenScopeProof{ComputerID: "computer-origin", ComputerAttemptID: "attempt-one",
+		ComputerStorageGeneration: 1, SubmitIntentRevision: 1, HostNodeID: "fabric-node", SubmitMaxInflight: 20}
+	h := newComputerHTTPHarness(t, &controlledComputerGrantVerifier{proof: proof})
+	created := make([]contract.RunRecord, 0, 2)
+	for generation := int64(1); generation <= 2; generation++ {
+		generationProof := proof
+		generationProof.ComputerAttemptID = fmt.Sprintf("attempt-%d", generation)
+		generationProof.ComputerStorageGeneration = generation
+		generationProof.SubmitIntentRevision = generation
+		grant, err := h.store.MintComputerToken(t.Context(), generationProof)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scope, err := h.store.AuthenticateComputerToken(t.Context(), grant.Token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, _, err := h.store.CreateRun(t.Context(), CreateRunInput{IdempotencyKey: fmt.Sprintf("origin-%d", generation),
+			Actor: "computer:" + proof.ComputerID, ComputerScope: &scope,
+			VerifyComputerScope: func(context.Context, ComputerTokenScope) error { return nil },
+			Request:             computerHTTPRunRequest(fmt.Sprintf("exit %d\n", generation))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		created = append(created, run)
+	}
+	childRequest := computerHTTPRunRequest("exit 3\n")
+	childRequest.ParentRunID = created[0].RunID
+	child, _, err := h.store.CreateRun(t.Context(), CreateRunInput{IdempotencyKey: "origin-child",
+		Actor: "run:" + created[0].RunID, Request: childRequest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignProof := proof
+	foreignProof.ComputerID = "computer-foreign"
+	foreignProof.ComputerAttemptID = "attempt-foreign"
+	foreignProof.ComputerStorageGeneration = 1
+	foreignProof.SubmitIntentRevision = 1
+	foreignGrant, err := h.store.MintComputerToken(t.Context(), foreignProof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignScope, err := h.store.AuthenticateComputerToken(t.Context(), foreignGrant.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.store.CreateRun(t.Context(), CreateRunInput{IdempotencyKey: "origin-foreign",
+		Actor: "computer:computer-foreign", ComputerScope: &foreignScope,
+		VerifyComputerScope: func(context.Context, ComputerTokenScope) error { return nil },
+		Request:             computerHTTPRunRequest("exit 4\n")}); err != nil {
+		t.Fatal(err)
+	}
+
+	caller := h.clientForIdentity(fabric.Identity{NodeID: "operator", Tags: []string{DefaultCallerPrincipalTag}})
+	path := "/v1/runs?origin=computer:" + proof.ComputerID + "&limit=1"
+	status, _, body := doComputerHTTP(t, caller, http.MethodGet, path, "", "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("first operator page status=%d body=%s", status, body)
+	}
+	var first ComputerRunPage
+	if err := json.Unmarshal(body, &first); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Runs) != 1 || first.NextCursor == "" || first.Runs[0].Trigger.Type != "computer" ||
+		first.Runs[0].Trigger.ComputerID != proof.ComputerID {
+		t.Fatalf("first operator page = %+v", first)
+	}
+	status, _, body = doComputerHTTP(t, caller, http.MethodGet, path+"&cursor="+url.QueryEscape(first.NextCursor), "", "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("second operator page status=%d body=%s", status, body)
+	}
+	var second ComputerRunPage
+	if err := json.Unmarshal(body, &second); err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Runs) != 1 || second.NextCursor != "" ||
+		second.Runs[0].Trigger.ComputerStorageGeneration == first.Runs[0].Trigger.ComputerStorageGeneration {
+		t.Fatalf("second operator page = %+v after %+v", second, first)
+	}
+	status, _, body = doComputerHTTP(t, caller, http.MethodGet,
+		"/v1/runs?origin=computer:"+proof.ComputerID+"&include_descendants=true", "", "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("operator descendant page status=%d body=%s", status, body)
+	}
+	var descendants ComputerRunPage
+	if err := json.Unmarshal(body, &descendants); err != nil {
+		t.Fatal(err)
+	}
+	if len(descendants.Runs) != 3 || !slices.ContainsFunc(descendants.Runs, func(run contract.RunRecord) bool {
+		return run.RunID == child.RunID && run.Trigger.Type == "chain" && run.Trigger.SourceRunID == created[0].RunID
+	}) {
+		t.Fatalf("operator descendant page = %+v", descendants)
+	}
+	status, _, body = doComputerHTTP(t, caller, http.MethodGet,
+		"/v1/runs?origin=computer:computer-foreign&cursor="+url.QueryEscape(first.NextCursor), "", "", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("cross-origin cursor status=%d body=%s", status, body)
 	}
 }
 

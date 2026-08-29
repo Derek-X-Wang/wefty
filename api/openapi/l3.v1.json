@@ -148,19 +148,19 @@
     },
     "/v1/runs": {
       "get": {
-        "operationId": "listComputerRuns",
-        "summary": "List current-generation Runs rooted by this Computer",
-        "description": "Computer-token only. origin=computer:self is mandatory. Roots are limited to the authenticated computer_id and current storage generation; include_descendants expands only through those roots and every result is independently CanComputerReadRun-scoped.",
-        "security": [{ "fabricIdentity": [], "computerToken": [] }],
+        "operationId": "listRunsByComputerOrigin",
+        "summary": "List Runs by immutable Computer origin",
+        "description": "Ordinary L3 callers use origin=computer:<id> to enumerate roots across that Computer's Storage generations. Computer-token callers must use origin=computer:self and remain limited to the authenticated Computer and current Storage generation. include_descendants expands only through matching roots; Computer-token results are independently CanComputerReadRun-scoped.",
+        "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "computerToken": [] }],
         "parameters": [
-          { "name": "origin", "in": "query", "required": true, "schema": { "type": "string", "const": "computer:self" } },
+          { "name": "origin", "in": "query", "required": true, "schema": { "type": "string", "pattern": "^computer:.+$" } },
           { "name": "include_descendants", "in": "query", "schema": { "type": "boolean", "default": false } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
           { "name": "cursor", "in": "query", "schema": { "type": "string" } }
         ],
         "responses": {
           "200": {
-            "description": "Current-generation Computer Run page.",
+            "description": "Computer-originated Run page with exact immutable trigger projections.",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerRunPage" } } }
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },

@@ -377,12 +377,7 @@ func (s *Server) getComputerSelf(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.ComputerSelf(scope))
 }
 
-func (s *Server) listComputerRuns(w http.ResponseWriter, r *http.Request) {
-	scope, ok := computerTokenFromRequest(r)
-	if !ok {
-		writeError(w, protocolError(contract.ErrorForbidden, "a Computer token is required to list Computer Runs"))
-		return
-	}
+func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	for name, values := range query {
 		switch name {
@@ -392,13 +387,13 @@ func (s *Server) listComputerRuns(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		default:
-			writeError(w, protocolError(contract.ErrorInvalidRequest, "unknown Computer Run list parameter %q", name))
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "unknown Run list parameter %q", name))
 			return
 		}
 	}
 	origins, present := query["origin"]
-	if !present || len(origins) != 1 || origins[0] != "computer:self" {
-		writeError(w, protocolError(contract.ErrorInvalidRequest, "origin=computer:self is required"))
+	if !present || len(origins) != 1 {
+		writeError(w, protocolError(contract.ErrorInvalidRequest, "exactly one origin is required"))
 		return
 	}
 	includeDescendants := false
@@ -418,7 +413,28 @@ func (s *Server) listComputerRuns(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	page, err := s.store.ListComputerRuns(r.Context(), scope, query.Get("cursor"), limit, includeDescendants)
+	var (
+		page ComputerRunPage
+		err  error
+	)
+	if scope, ok := computerTokenFromRequest(r); ok {
+		if origins[0] != "computer:self" {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "origin=computer:self is required"))
+			return
+		}
+		page, err = s.store.ListComputerRuns(r.Context(), scope, query.Get("cursor"), limit, includeDescendants)
+	} else {
+		if _, ok := runTokenFromRequest(r); ok {
+			writeError(w, protocolError(contract.ErrorForbidden, "run tokens cannot enumerate Computer-originated Runs"))
+			return
+		}
+		computerID, found := strings.CutPrefix(origins[0], "computer:")
+		if !found || strings.TrimSpace(computerID) == "" || computerID == "self" || computerID != strings.TrimSpace(computerID) {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "origin must be computer:COMPUTER_ID"))
+			return
+		}
+		page, err = s.store.ListRunsByComputerOrigin(r.Context(), computerID, query.Get("cursor"), limit, includeDescendants)
+	}
 	if err != nil {
 		writeError(w, err)
 		return

@@ -292,6 +292,7 @@ func (s *Server) routes() http.Handler {
 	person.HandleFunc("DELETE /v1/computers/{computer_id}/grants/{user_id}", s.deleteComputerGrant)
 	person.HandleFunc("GET /v1/computers/{computer_id}/grants/audit", s.listComputerPolicyAudit)
 	person.HandleFunc("GET /v1/computers/{computer_id}/revocations/{policy_revision}", s.getComputerPolicyRevocation)
+	person.HandleFunc("GET /v1/computers/{computer_id}/submission", s.getComputerSubmission)
 	person.HandleFunc("PUT /v1/computers/{computer_id}/submission", s.mutateComputerSubmission)
 
 	root := http.NewServeMux()
@@ -364,6 +365,7 @@ func (s *Server) mutateComputerSubmission(w http.ResponseWriter, r *http.Request
 	}
 	if replayed {
 		w.Header().Set("Idempotent-Replay", "true")
+		w.Header().Set(ComputerSubmissionRevocationCommittedHeader, "true")
 		writeJSON(w, http.StatusOK, computer)
 		return
 	}
@@ -386,7 +388,17 @@ func (s *Server) mutateComputerSubmission(w http.ResponseWriter, r *http.Request
 	if replayed {
 		w.Header().Set("Idempotent-Replay", "true")
 	}
+	w.Header().Set(ComputerSubmissionRevocationCommittedHeader, "true")
 	writeJSON(w, http.StatusOK, computer)
+}
+
+func (s *Server) getComputerSubmission(w http.ResponseWriter, r *http.Request) {
+	state, err := s.store.GetComputerSubmissionState(r.Context(), identityFromRequest(r), r.PathValue("computer_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
 }
 
 func (s *Server) latchServiceImageReconciliationFailure(w http.ResponseWriter, r *http.Request) {

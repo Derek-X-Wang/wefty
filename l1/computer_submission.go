@@ -16,6 +16,8 @@ import (
 
 const DefaultComputerSubmitMaxInflight = 20
 
+const ComputerSubmissionRevocationCommittedHeader = "Wefty-Computer-Revocation-Committed"
+
 type ComputerSubmissionRequest struct {
 	PolicyRevision       int64  `json:"policy_revision"`
 	SubmitIntentRevision int64  `json:"submit_intent_revision"`
@@ -36,6 +38,71 @@ type ComputerSubmissionAudit struct {
 	SubmitMaxInflight    int       `json:"submit_max_inflight"`
 	IdempotencyKey       string    `json:"idempotency_key"`
 	CreatedAt            time.Time `json:"created_at"`
+}
+
+// ComputerSubmissionState is the narrow administrator projection used to
+// drive CAS mutations without exposing grants or other Computer lifecycle
+// authority through the submission command family.
+type ComputerSubmissionState struct {
+	ComputerID           string                 `json:"computer_id"`
+	SubmitEnabled        bool                   `json:"submit_enabled"`
+	SubmitIntentRevision int64                  `json:"submit_intent_revision"`
+	SubmitMaxInflight    int                    `json:"submit_max_inflight"`
+	PolicyRevision       int64                  `json:"policy_revision"`
+	Ready                *bool                  `json:"ready"`
+	Status               string                 `json:"status,omitempty"`
+	PassUnavailable      *contract.SpawnFailure `json:"pass_unavailable,omitempty"`
+}
+
+func projectComputerSubmissionState(computer Computer, policyRevision int64) ComputerSubmissionState {
+	state := ComputerSubmissionState{
+		ComputerID: computer.ComputerID, SubmitEnabled: computer.SubmitEnabled,
+		SubmitIntentRevision: computer.SubmitIntentRevision, SubmitMaxInflight: computer.SubmitMaxInflight,
+		PolicyRevision: policyRevision, Status: computer.CurrentJob.Status,
+	}
+	if computer.CurrentJob.ServiceJob != nil {
+		state.Ready = computer.CurrentJob.Ready
+		state.PassUnavailable = ComputerPassUnavailable(computer.CurrentJob.LastFailure)
+	}
+	return state
+}
+
+// ComputerPassUnavailable recognizes both the ordinary service ProcessResult
+// evidence and the direct latched SpawnFailure shape used by Computer
+// reconfiguration. It returns only the exact typed pass_unavailable fact.
+func ComputerPassUnavailable(lastFailure json.RawMessage) *contract.SpawnFailure {
+	if len(lastFailure) == 0 {
+		return nil
+	}
+	var result ProcessResult
+	if json.Unmarshal(lastFailure, &result) == nil && result.SpawnError != nil &&
+		result.SpawnError.Code == contract.SpawnFailurePassUnavailable {
+		failure := *result.SpawnError
+		return &failure
+	}
+	var failure contract.SpawnFailure
+	if json.Unmarshal(lastFailure, &failure) == nil && failure.Code == contract.SpawnFailurePassUnavailable {
+		return &failure
+	}
+	return nil
+}
+
+func (s *Store) GetComputerSubmissionState(ctx context.Context, identity fabric.Identity, computerID string) (ComputerSubmissionState, error) {
+	if err := requireCurrentAdmin(ctx, s.db, identity); err != nil {
+		return ComputerSubmissionState{}, err
+	}
+	computer, err := readComputerAuthority(ctx, s.db, computerID, canonicalTime(s.clock.Now()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ComputerSubmissionState{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
+	}
+	if err != nil {
+		return ComputerSubmissionState{}, internalError(err, "read Computer submission state")
+	}
+	var policyRevision int64
+	if err := s.db.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&policyRevision); err != nil {
+		return ComputerSubmissionState{}, internalError(err, "read Computer submission policy revision")
+	}
+	return projectComputerSubmissionState(computer, policyRevision), nil
 }
 
 type ComputerTokenRevocation struct {

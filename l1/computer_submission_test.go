@@ -101,6 +101,27 @@ func TestComputerSubmissionRouteRevokesL3BeforeReportingSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	status, _, body = h.do(client, http.MethodGet, "/v1/computers/"+computer.ComputerID+"/submission", nil)
+	if status != http.StatusOK {
+		t.Fatalf("read submission state status=%d body=%s", status, body)
+	}
+	var state ComputerSubmissionState
+	if err := json.Unmarshal(body, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.ComputerID != computer.ComputerID || state.SubmitEnabled || state.SubmitIntentRevision != 0 ||
+		state.SubmitMaxInflight != DefaultComputerSubmitMaxInflight || state.PolicyRevision != policy.Revision {
+		t.Fatalf("submission state = %#v", state)
+	}
+	var narrow map[string]json.RawMessage
+	if err := json.Unmarshal(body, &narrow); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"grants", "current_job", "storage_id", "display_endpoint"} {
+		if _, present := narrow[forbidden]; present {
+			t.Fatalf("submission state leaked %q: %s", forbidden, body)
+		}
+	}
 	revokedBeforeMutation := false
 	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) error {
 		current, readErr := readComputerAuthority(ctx, h.store.db, computer.ComputerID, h.clock.Now())
@@ -111,11 +132,12 @@ func TestComputerSubmissionRouteRevokesL3BeforeReportingSuccess(t *testing.T) {
 			request.ComputerID == computer.ComputerID && request.NewSubmitIntentRevision == 1
 		return nil
 	}}
-	status, _, body = h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/submission",
+	status, headers, body := h.do(client, http.MethodPut, "/v1/computers/"+computer.ComputerID+"/submission",
 		ComputerSubmissionRequest{PolicyRevision: policy.Revision, SubmitIntentRevision: 0, SubmitEnabled: true,
 			SubmitMaxInflight: 20, IdempotencyKey: "enable-route"})
-	if status != http.StatusOK || !revokedBeforeMutation {
-		t.Fatalf("enable route status=%d body=%s revoked-before=%t", status, body, revokedBeforeMutation)
+	if status != http.StatusOK || !revokedBeforeMutation || headers.Get(ComputerSubmissionRevocationCommittedHeader) != "true" {
+		t.Fatalf("enable route status=%d body=%s revoked-before=%t header=%q", status, body, revokedBeforeMutation,
+			headers.Get(ComputerSubmissionRevocationCommittedHeader))
 	}
 	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(context.Context, ComputerTokenRevocation) error {
 		return errors.New("L3 unavailable")

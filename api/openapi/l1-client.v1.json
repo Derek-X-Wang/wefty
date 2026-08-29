@@ -23,6 +23,31 @@
     },
     "/v1/computers/{computer_id}/submission": {
       "parameters": [{ "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
+      "get": {
+        "operationId": "getComputerSubmission",
+        "summary": "Read the narrow Computer submission CAS projection",
+        "description": "Current administrators only. Returns the revisions and current readiness observation needed to issue a CAS mutation without exposing Computer grants, Storage authority, or take-over state.",
+        "responses": {
+          "200": { "description": "Current Computer submission state.", "content": { "application/json": { "schema": {
+            "type": "object", "additionalProperties": false,
+            "required": ["computer_id", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "policy_revision", "ready"],
+            "properties": {
+              "computer_id": { "type": "string", "minLength": 1 },
+              "submit_enabled": { "type": "boolean" },
+              "submit_intent_revision": { "type": "integer", "minimum": 0 },
+              "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+              "policy_revision": { "type": "integer", "minimum": 1 },
+              "ready": { "type": ["boolean", "null"] },
+              "status": { "type": "string" },
+              "pass_unavailable": { "$ref": "./common.v1.json#/components/schemas/SpawnFailure" }
+            }
+          } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      },
       "put": {
         "operationId": "mutateComputerSubmission",
         "summary": "Enable, disable, or resize Computer Run submission",
@@ -39,7 +64,16 @@
           }
         } } } },
         "responses": {
-          "200": { "description": "Submission intent accepted or replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "200": {
+            "description": "Submission intent accepted or replayed after L3 revocation committed.",
+            "headers": {
+              "Wefty-Computer-Revocation-Committed": {
+                "description": "Literal true only after the authoritative L3 revocation precedes the successful response.",
+                "schema": { "type": "string", "const": "true" }
+              }
+            },
+            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+          },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },

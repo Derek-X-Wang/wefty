@@ -396,6 +396,114 @@ func (s *Store) ListComputerRuns(ctx context.Context, scope ComputerTokenScope, 
 	return page, nil
 }
 
+type computerOriginRunCursor struct {
+	ComputerID         string `json:"computer_id"`
+	IncludeDescendants bool   `json:"include_descendants"`
+	CreatedNS          int64  `json:"created_ns"`
+	RunID              string `json:"run_id"`
+}
+
+func encodeComputerOriginRunCursor(cursor computerOriginRunCursor) string {
+	payload, err := json.Marshal(cursor)
+	if err != nil {
+		panic("l3: encode Computer origin Run cursor: " + err.Error())
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func decodeComputerOriginRunCursor(value, computerID string, includeDescendants bool) (computerOriginRunCursor, error) {
+	if value == "" {
+		return computerOriginRunCursor{ComputerID: computerID, IncludeDescendants: includeDescendants}, nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return computerOriginRunCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+	}
+	var cursor computerOriginRunCursor
+	decoder := json.NewDecoder(strings.NewReader(string(payload)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cursor); err != nil || cursor.ComputerID != computerID ||
+		cursor.IncludeDescendants != includeDescendants || cursor.CreatedNS < 0 || strings.TrimSpace(cursor.RunID) == "" {
+		return computerOriginRunCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid for this Computer origin")
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return computerOriginRunCursor{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+	}
+	return cursor, nil
+}
+
+// ListRunsByComputerOrigin is the ordinary L3 caller projection across every
+// Storage generation of one Computer. Computer-token callers use
+// ListComputerRuns instead and remain restricted to their current generation.
+func (s *Store) ListRunsByComputerOrigin(ctx context.Context, computerID, cursorValue string, limit int, includeDescendants bool) (ComputerRunPage, error) {
+	if strings.TrimSpace(computerID) == "" || computerID != strings.TrimSpace(computerID) {
+		return ComputerRunPage{}, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
+	}
+	if limit < 1 || limit > MaxComputerRunPageLimit {
+		return ComputerRunPage{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxComputerRunPageLimit)
+	}
+	cursor, err := decodeComputerOriginRunCursor(cursorValue, computerID, includeDescendants)
+	if err != nil {
+		return ComputerRunPage{}, err
+	}
+	query := `SELECT r.run_id, r.created_ns FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
+		WHERE r.parent_run_id IS NULL AND t.source='computer' AND t.computer_id=?
+			AND (r.created_ns>? OR (r.created_ns=? AND r.run_id>?))
+		ORDER BY r.created_ns, r.run_id LIMIT ?`
+	if includeDescendants {
+		query = `WITH RECURSIVE visible(run_id) AS (
+			SELECT r.run_id FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
+			WHERE r.parent_run_id IS NULL AND t.source='computer' AND t.computer_id=?
+			UNION ALL
+			SELECT child.run_id FROM runs child JOIN visible parent ON child.parent_run_id=parent.run_id
+		) SELECT r.run_id, r.created_ns FROM runs r JOIN visible v ON v.run_id=r.run_id
+		WHERE (r.created_ns>? OR (r.created_ns=? AND r.run_id>?))
+		ORDER BY r.created_ns, r.run_id LIMIT ?`
+	}
+	rows, err := s.db.QueryContext(ctx, query, computerID, cursor.CreatedNS, cursor.CreatedNS, cursor.RunID, limit+1)
+	if err != nil {
+		return ComputerRunPage{}, internalError(err, "list Computer-originated Run IDs")
+	}
+	type listedRun struct {
+		runID     string
+		createdNS int64
+	}
+	listed := make([]listedRun, 0, limit+1)
+	for rows.Next() {
+		var item listedRun
+		if err := rows.Scan(&item.runID, &item.createdNS); err != nil {
+			rows.Close()
+			return ComputerRunPage{}, internalError(err, "scan Computer-originated Run ID")
+		}
+		listed = append(listed, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return ComputerRunPage{}, internalError(err, "iterate Computer-originated Run IDs")
+	}
+	if err := rows.Close(); err != nil {
+		return ComputerRunPage{}, internalError(err, "close Computer-originated Run list")
+	}
+	page := ComputerRunPage{Runs: []contract.RunRecord{}}
+	hasMore := len(listed) > limit
+	if hasMore {
+		listed = listed[:limit]
+	}
+	for _, item := range listed {
+		record, err := s.GetRun(ctx, item.runID)
+		if err != nil {
+			return ComputerRunPage{}, err
+		}
+		page.Runs = append(page.Runs, record)
+	}
+	if hasMore && len(listed) > 0 {
+		last := listed[len(listed)-1]
+		page.NextCursor = encodeComputerOriginRunCursor(computerOriginRunCursor{ComputerID: computerID,
+			IncludeDescendants: includeDescendants, CreatedNS: last.createdNS, RunID: last.runID})
+	}
+	return page, nil
+}
+
 type computerTokenAuditRow struct {
 	GrantID, Operation, ComputerID, ComputerAttemptID, HostNodeID, Reason       string
 	StorageGeneration, SubmitIntentRevision, AuthorityGeneration, GrantRevision int64

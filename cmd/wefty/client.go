@@ -230,18 +230,51 @@ func (c *apiClients) getRunLogs(ctx context.Context, runID, cursor string, limit
 	return page, err
 }
 
+func (c *apiClients) getComputerSubmission(ctx context.Context, computerID string) (l1.ComputerSubmissionState, error) {
+	var state l1.ComputerSubmissionState
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/submission"
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &state, http.StatusOK)
+	return state, err
+}
+
+func (c *apiClients) mutateComputerSubmission(ctx context.Context, computerID string, request l1.ComputerSubmissionRequest) (l1.Computer, bool, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/submission"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPut, path, request, nil, &computer, http.StatusOK)
+	return computer, err == nil && headers.Get(l1.ComputerSubmissionRevocationCommittedHeader) == "true", err
+}
+
+func (c *apiClients) listRunsByOrigin(ctx context.Context, origin, cursor string, limit int, includeDescendants bool) (l3.ComputerRunPage, error) {
+	query := url.Values{
+		"origin":              []string{origin},
+		"include_descendants": []string{strconv.FormatBool(includeDescendants)},
+		"limit":               []string{strconv.Itoa(limit)},
+	}
+	if cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	var page l3.ComputerRunPage
+	err := c.l3.do(ctx, http.MethodGet, "/v1/runs?"+query.Encode(), nil, nil, &page, http.StatusOK)
+	return page, err
+}
+
 func (c *apiClient) do(ctx context.Context, method, path string, body any, headers http.Header, target any, success ...int) error {
+	_, err := c.doWithResponse(ctx, method, path, body, headers, target, success...)
+	return err
+}
+
+func (c *apiClient) doWithResponse(ctx context.Context, method, path string, body any, headers http.Header, target any, success ...int) (http.Header, error) {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("encode %s request: %w", c.name, err)
+			return nil, fmt.Errorf("encode %s request: %w", c.name, err)
 		}
 		reader = bytes.NewReader(encoded)
 	}
 	request, err := http.NewRequestWithContext(ctx, method, "http://wefty.invalid"+path, reader)
 	if err != nil {
-		return fmt.Errorf("create %s request: %w", c.name, err)
+		return nil, fmt.Errorf("create %s request: %w", c.name, err)
 	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
@@ -251,27 +284,27 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, heade
 	}
 	response, err := c.client.Do(request)
 	if err != nil {
-		return fmt.Errorf("call %s: %w", c.name, err)
+		return nil, fmt.Errorf("call %s: %w", c.name, err)
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 16<<20))
 	if err != nil {
-		return fmt.Errorf("read %s response: %w", c.name, err)
+		return nil, fmt.Errorf("read %s response: %w", c.name, err)
 	}
 	for _, status := range success {
 		if response.StatusCode == status {
 			if target == nil || len(responseBody) == 0 {
-				return nil
+				return response.Header.Clone(), nil
 			}
 			if err := json.Unmarshal(responseBody, target); err != nil {
-				return fmt.Errorf("decode %s response: %w", c.name, err)
+				return nil, fmt.Errorf("decode %s response: %w", c.name, err)
 			}
-			return nil
+			return response.Header.Clone(), nil
 		}
 	}
 	var responseError contract.ErrorResponse
 	if err := json.Unmarshal(responseBody, &responseError); err == nil && responseError.Error.Code != "" {
-		return &apiResponseError{Service: c.name, StatusCode: response.StatusCode, APIError: responseError.Error}
+		return nil, &apiResponseError{Service: c.name, StatusCode: response.StatusCode, APIError: responseError.Error}
 	}
-	return fmt.Errorf("%s returned HTTP %d", c.name, response.StatusCode)
+	return nil, fmt.Errorf("%s returned HTTP %d", c.name, response.StatusCode)
 }
