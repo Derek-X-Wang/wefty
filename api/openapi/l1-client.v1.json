@@ -1045,6 +1045,23 @@
         }
       }
     },
+    "/v1/computers/{computer_id}/storage-provenance": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+      ],
+      "get": {
+        "operationId": "listComputerStorageProvenance",
+        "summary": "Project Storage provenance, managed custody forks, external taint, and exact removal outcomes",
+        "description": "Returns durable L1 ledger facts only. A committed Custody export or import keeps custody_tainted true even after operator_attested_deleted; each managed branch independently reports removed_reduced versus removed_verified.",
+        "responses": {
+          "200": { "description": "Storage provenance and custody graph facts.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageProvenance" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/computers/{computer_id}/backups": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
@@ -1066,12 +1083,13 @@
         "description": "This one disruptive intent auto-quiesces a running Computer, plans the source-node copy before bytes are written, publishes only after full allocation and digest verification, and resumes only unchanged desired-running intent. Stopped stays stopped and stop or remove wins races.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
-          "required": ["intent_revision", "storage_id", "storage_generation", "idempotency_key"],
+          "required": ["intent_revision", "storage_id", "storage_generation", "idempotency_key", "allow_power_off"],
           "properties": {
             "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
             "storage_id": { "type": "string", "minLength": 1 },
             "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
-            "idempotency_key": { "type": "string", "minLength": 1 }
+            "idempotency_key": { "type": "string", "minLength": 1 },
+            "allow_power_off": { "type": "boolean", "description": "Required true when the Computer's authoritative desired state is running; acknowledges cold-copy quiescence and unchanged-intent resume." }
           }
         } } } },
         "responses": {
@@ -1233,7 +1251,7 @@
           "properties": { "idempotency_key": { "type": "string", "minLength": 1 } }
         } } } },
         "responses": {
-          "200": { "description": "Attestation recorded; removed_reduced remains the strongest possible outcome.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "200": { "description": "Attestation recorded or identically replayed; removed_reduced remains the strongest possible outcome.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "type": "object" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
@@ -1275,8 +1293,8 @@
           }
         } } } },
         "responses": {
-          "200": { "description": "Identical Custody import replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "type": "object" } } } },
-          "202": { "description": "Import validation and managed materialization reserved atomically as a stopped, non-claimable Computer until positive evidence is accepted.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "200": { "description": "Identical Custody import replay.", "headers": { "Idempotent-Replay": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerCustodyImport" } } } },
+          "202": { "description": "Import validation and managed materialization reserved atomically as a stopped, non-claimable Computer until positive evidence is accepted.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerCustodyImport" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }

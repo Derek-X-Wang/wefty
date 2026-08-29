@@ -87,6 +87,7 @@ type ComputerCustodyImportRequest struct {
 type ComputerCustodyImport struct {
 	ImportID              string     `json:"import_id"`
 	ExportID              string     `json:"export_id"`
+	OperationRevision     int64      `json:"operation_revision"`
 	DestinationComputerID string     `json:"destination_computer_id"`
 	DestinationStorageID  string     `json:"destination_storage_id"`
 	DestinationName       string     `json:"destination_name"`
@@ -404,30 +405,38 @@ func (s *Store) AcknowledgeComputerCustodyExport(ctx context.Context, identityNo
 }
 
 func (s *Store) AttestComputerCustodyDeleted(ctx context.Context, exportID string, request ComputerCustodyAttestationRequest) (ComputerCustodyExport, error) {
+	exported, _, err := s.AttestComputerCustodyDeletedWithReplay(ctx, exportID, request)
+	return exported, err
+}
+
+func (s *Store) AttestComputerCustodyDeletedWithReplay(ctx context.Context, exportID string, request ComputerCustodyAttestationRequest) (ComputerCustodyExport, bool, error) {
 	request.IdempotencyKey = strings.TrimSpace(request.IdempotencyKey)
 	request.Actor = strings.TrimSpace(request.Actor)
 	if exportID == "" || request.IdempotencyKey == "" || request.Actor == "" {
-		return ComputerCustodyExport{}, protocolError(contract.ErrorInvalidRequest, "export_id, idempotency_key, and actor are required")
+		return ComputerCustodyExport{}, false, protocolError(contract.ErrorInvalidRequest, "export_id, idempotency_key, and actor are required")
 	}
 	now := canonicalTime(s.clock.Now())
 	result, err := s.db.ExecContext(ctx, `UPDATE computer_custody_exports SET operator_attestation_key=?,
 		operator_attestation_actor=?, operator_attested_ns=? WHERE export_id=? AND operator_attestation_key IS NULL`,
 		request.IdempotencyKey, request.Actor, now.UnixNano(), exportID)
 	if err != nil {
-		return ComputerCustodyExport{}, internalError(err, "record operator_attested_deleted evidence")
+		return ComputerCustodyExport{}, false, internalError(err, "record operator_attested_deleted evidence")
 	}
+	replayed := false
 	if changed, _ := result.RowsAffected(); changed == 0 {
+		replayed = true
 		var key, actor string
 		if err := s.db.QueryRowContext(ctx, `SELECT operator_attestation_key, operator_attestation_actor
 			FROM computer_custody_exports WHERE export_id=?`, exportID).Scan(&key, &actor); errors.Is(err, sql.ErrNoRows) {
-			return ComputerCustodyExport{}, protocolError(contract.ErrorNotFound, "Custody export %q was not found", exportID)
+			return ComputerCustodyExport{}, false, protocolError(contract.ErrorNotFound, "Custody export %q was not found", exportID)
 		} else if err != nil {
-			return ComputerCustodyExport{}, internalError(err, "read Custody deletion attestation")
+			return ComputerCustodyExport{}, false, internalError(err, "read Custody deletion attestation")
 		} else if key != request.IdempotencyKey || actor != request.Actor {
-			return ComputerCustodyExport{}, protocolError(contract.ErrorIdempotencyConflict, "Custody deletion attestation is immutable")
+			return ComputerCustodyExport{}, false, protocolError(contract.ErrorIdempotencyConflict, "Custody deletion attestation is immutable")
 		}
 	}
-	return scanCustodyExport(s.db.QueryRowContext(ctx, `SELECT `+custodyExportColumns+` FROM computer_custody_exports WHERE export_id=?`, exportID))
+	exported, err := scanCustodyExport(s.db.QueryRowContext(ctx, `SELECT `+custodyExportColumns+` FROM computer_custody_exports WHERE export_id=?`, exportID))
+	return exported, replayed, err
 }
 
 func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string, request ComputerCustodyImportRequest) (ComputerCustodyImport, bool, error) {
@@ -490,6 +499,7 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 		var name string
 		_ = tx.QueryRowContext(ctx, `SELECT name FROM computers WHERE computer_id=?`, replay.DestinationComputerID).Scan(&name)
 		return ComputerCustodyImport{ImportID: replay.DestinationComputerID, ExportID: replay.ExportID,
+			OperationRevision:     replay.OperationRevision,
 			DestinationComputerID: replay.DestinationComputerID, DestinationStorageID: replay.DestinationStorageID,
 			DestinationName: name, DestinationSize: replay.DestinationSize, Status: replay.Status}, true, nil
 	} else if !errors.Is(replayErr, sql.ErrNoRows) {
@@ -556,6 +566,7 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 		return ComputerCustodyImport{}, false, err
 	}
 	value := ComputerCustodyImport{ImportID: computerID, ExportID: exportID, DestinationComputerID: computerID,
+		OperationRevision:    1,
 		DestinationStorageID: storageID, DestinationName: request.Name, DestinationSize: request.DiskBytes,
 		Status: "reserved", RequestedAt: now}
 	if err := tx.Commit(); err != nil {

@@ -244,6 +244,7 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/computers/{computer_id}/reconfiguration-abort", s.abortComputerReconfiguration)
 	client.HandleFunc("POST /v1/computers/{computer_id}/storage-reset", s.resetComputerStorage)
 	client.HandleFunc("GET /v1/computers/{computer_id}/storage-generations", s.listComputerStorageGenerations)
+	client.HandleFunc("GET /v1/computers/{computer_id}/storage-provenance", s.listComputerStorageProvenance)
 	client.HandleFunc("POST /v1/computers/{computer_id}/backups", s.createComputerBackup)
 	client.HandleFunc("GET /v1/computers/{computer_id}/backups", s.listComputerBackups)
 	client.HandleFunc("POST /v1/computers/{computer_id}/backups/{backup_id}/prune", s.pruneComputerBackup)
@@ -991,6 +992,15 @@ func (s *Server) listComputerStorageGenerations(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, generations)
 }
 
+func (s *Server) listComputerStorageProvenance(w http.ResponseWriter, r *http.Request) {
+	projection, err := s.store.ListComputerStorageProvenance(r.Context(), r.PathValue("computer_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, projection)
+}
+
 func (s *Server) createComputerBackup(w http.ResponseWriter, r *http.Request) {
 	var request ComputerBackupCreateRequest
 	if err := decodeJSON(r, &request); err != nil {
@@ -1071,6 +1081,7 @@ func (s *Server) cloneComputerBackup(w http.ResponseWriter, r *http.Request) {
 	request.BackupID = r.PathValue("backup_id")
 	request.SourceComputerID = r.PathValue("computer_id")
 	request.Actor = identityFromRequest(r).NodeID
+	request.ComputerMutationPrecondition.Actor = request.Actor
 	computer, replayed, err := s.store.BeginComputerClone(r.Context(), request)
 	if err != nil {
 		writeError(w, err)
@@ -1121,10 +1132,13 @@ func (s *Server) attestComputerCustodyDeleted(w http.ResponseWriter, r *http.Req
 		return
 	}
 	request.Actor = identityFromRequest(r).NodeID
-	export, err := s.store.AttestComputerCustodyDeleted(r.Context(), r.PathValue("export_id"), request)
+	export, replayed, err := s.store.AttestComputerCustodyDeletedWithReplay(r.Context(), r.PathValue("export_id"), request)
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	if replayed {
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, http.StatusOK, export)
 }

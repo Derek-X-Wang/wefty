@@ -94,14 +94,25 @@ func TestCustodyExportCommitsTaintBeforeBytesAndAttestationNeverUpgrades(t *test
 	if err != nil || removed.RemovalOutcome != "removed_reduced" {
 		t.Fatalf("pre-byte Custody event removal = %#v err=%v", removed, err)
 	}
-	attested, err := h.store.AttestComputerCustodyDeleted(context.Background(), export.ExportID,
+	attested, replayed, err := h.store.AttestComputerCustodyDeletedWithReplay(context.Background(), export.ExportID,
 		ComputerCustodyAttestationRequest{IdempotencyKey: "operator-deleted", Actor: "operator"})
-	if err != nil || !attested.OperatorAttestedDeleted {
+	if err != nil || replayed || !attested.OperatorAttestedDeleted {
 		t.Fatalf("operator_attested_deleted = %#v err=%v", attested, err)
+	}
+	attested, replayed, err = h.store.AttestComputerCustodyDeletedWithReplay(context.Background(), export.ExportID,
+		ComputerCustodyAttestationRequest{IdempotencyKey: "operator-deleted", Actor: "operator"})
+	if err != nil || !replayed || !attested.OperatorAttestedDeleted {
+		t.Fatalf("operator_attested_deleted replay = %#v replay=%t err=%v", attested, replayed, err)
 	}
 	removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
 	if err != nil || removed.RemovalOutcome != "removed_reduced" {
 		t.Fatalf("attestation upgraded removal = %#v err=%v", removed, err)
+	}
+	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), removed.ComputerID)
+	if err != nil || !provenance.CustodyTainted || len(provenance.CustodyForks) != 1 ||
+		provenance.CustodyForks[0].RemovalOutcome != "removed_reduced" || len(provenance.CustodyExports) != 1 ||
+		!provenance.CustodyExports[0].OperatorAttestedDeleted {
+		t.Fatalf("reduced removal provenance projection = %#v err=%v", provenance, err)
 	}
 	receipt := successfulCustodyExportReceipt(directive)
 	completed, err := h.store.AcknowledgeComputerCustodyExport(context.Background(), "fabric-computer-node",

@@ -101,6 +101,7 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 		"/v1/computers/{computer_id}/reconfiguration-abort",
 		"/v1/computers/{computer_id}/storage-reset",
 		"/v1/computers/{computer_id}/storage-generations",
+		"/v1/computers/{computer_id}/storage-provenance",
 		"/v1/computers/{computer_id}/backups",
 		"/v1/computers/{computer_id}/backups/{backup_id}/prune",
 		"/v1/computers/{computer_id}/projections",
@@ -136,7 +137,7 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 	if _, present := schemas["ComputerStorageGenerationList"]; !present {
 		t.Fatal("common schema is missing Computer Storage generation evidence")
 	}
-	for _, name := range []string{"StorageProvenance", "BackupCopy", "Backup", "BackupList", "ComputerBackupOperationOutcome", "ComputerBackupDirective", "ComputerBackupPruneDirective"} {
+	for _, name := range []string{"StorageProvenance", "ComputerCustodyBranch", "ComputerStorageProvenance", "BackupCopy", "Backup", "BackupList", "ComputerBackupOperationOutcome", "ComputerBackupDirective", "ComputerBackupPruneDirective"} {
 		if _, present := schemas[name]; !present {
 			t.Errorf("common schema is missing %s", name)
 		}

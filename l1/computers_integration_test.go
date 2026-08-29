@@ -84,6 +84,11 @@ func TestComputerOperatorRoutesPreserveCASAndRedaction(t *testing.T) {
 	if neverBoundRemoved.RemovalOutcome != "removed_verified" || neverBoundRemoved.CurrentJob.State != contract.JobRemovedVerified {
 		t.Fatalf("never-bound Computer removal stayed non-terminal: %#v", neverBoundRemoved)
 	}
+	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), neverBoundRemoved.ComputerID)
+	if err != nil || provenance.CustodyTainted || len(provenance.CustodyForks) != 1 ||
+		provenance.CustodyForks[0].RemovalOutcome != "removed_verified" {
+		t.Fatalf("verified removal provenance projection = %#v err=%v", provenance, err)
+	}
 	var storedSpec []byte
 	if err := h.store.db.QueryRow(`SELECT spec_json FROM jobs WHERE job_id=?`, computer.CurrentJobID).Scan(&storedSpec); err != nil {
 		t.Fatal(err)

@@ -449,6 +449,94 @@ func (c *apiClients) getComputerSubmission(ctx context.Context, computerID strin
 	return state, err
 }
 
+func (c *apiClients) getComputerStorageAuthority(ctx context.Context, computerID string) (l1.Computer, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID)
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &computer, http.StatusOK)
+	return computer, err
+}
+
+func (c *apiClients) setComputerBackupCap(ctx context.Context, computerID string, request l1.ComputerBackupCapRequest) (l1.Computer, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/backup-cap"
+	err := c.l1.do(ctx, http.MethodPut, path, request, nil, &computer, http.StatusOK)
+	return computer, err
+}
+
+func (c *apiClients) createComputerBackup(ctx context.Context, computerID string, request l1.ComputerBackupCreateRequest) (l1.Computer, bool, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer, http.StatusAccepted, http.StatusOK)
+	return computer, responseWasIdempotentReplay(headers), err
+}
+
+func (c *apiClients) listComputerBackups(ctx context.Context, computerID string) (l1.BackupList, error) {
+	var backups l1.BackupList
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups"
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &backups, http.StatusOK)
+	return backups, err
+}
+
+func (c *apiClients) listComputerStorageProvenance(ctx context.Context, computerID string) (l1.ComputerStorageProvenance, error) {
+	var projection l1.ComputerStorageProvenance
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/storage-provenance"
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &projection, http.StatusOK)
+	return projection, err
+}
+
+func (c *apiClients) pruneComputerBackup(ctx context.Context, computerID, backupID string, request l1.ComputerBackupPruneRequest) (l1.Backup, bool, error) {
+	var backup l1.Backup
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups/" + url.PathEscape(backupID) + "/prune"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &backup, http.StatusAccepted, http.StatusOK)
+	return backup, responseWasIdempotentReplay(headers), err
+}
+
+func (c *apiClients) restoreComputerBackup(ctx context.Context, computerID, backupID string, request l1.ComputerRestoreRequest) (l1.Computer, bool, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups/" + url.PathEscape(backupID) + "/restore"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer, http.StatusAccepted, http.StatusOK)
+	return computer, responseWasIdempotentReplay(headers), err
+}
+
+func (c *apiClients) cloneComputerBackup(ctx context.Context, sourceComputerID, backupID string, request l1.ComputerCloneRequest) (l1.Computer, bool, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(sourceComputerID) + "/backups/" + url.PathEscape(backupID) + "/clone"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer, http.StatusAccepted, http.StatusOK)
+	return computer, responseWasIdempotentReplay(headers), err
+}
+
+func (c *apiClients) exportComputerBackup(ctx context.Context, computerID, backupID string, request l1.ComputerCustodyExportRequest) (l1.ComputerCustodyExport, bool, error) {
+	var export l1.ComputerCustodyExport
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups/" + url.PathEscape(backupID) + "/export"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &export, http.StatusAccepted, http.StatusOK)
+	return export, responseWasIdempotentReplay(headers), err
+}
+
+func (c *apiClients) listComputerCustodyExports(ctx context.Context, computerID string) ([]l1.ComputerCustodyExport, error) {
+	var exports []l1.ComputerCustodyExport
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/custody-exports"
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &exports, http.StatusOK)
+	return exports, err
+}
+
+func (c *apiClients) attestComputerCustodyDeleted(ctx context.Context, exportID string, request l1.ComputerCustodyAttestationRequest) (l1.ComputerCustodyExport, bool, error) {
+	var export l1.ComputerCustodyExport
+	path := "/v1/custody-exports/" + url.PathEscape(exportID) + "/attest-deleted"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &export, http.StatusOK)
+	return export, responseWasIdempotentReplay(headers), err
+}
+
+func (c *apiClients) importComputerCustody(ctx context.Context, exportID string, request l1.ComputerCustodyImportRequest) (l1.ComputerCustodyImport, bool, error) {
+	var imported l1.ComputerCustodyImport
+	path := "/v1/custody-exports/" + url.PathEscape(exportID) + "/import"
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &imported, http.StatusAccepted, http.StatusOK)
+	return imported, responseWasIdempotentReplay(headers), err
+}
+
+func responseWasIdempotentReplay(headers http.Header) bool {
+	return strings.EqualFold(headers.Get("Idempotent-Replay"), "true")
+}
+
 func (c *apiClients) mutateComputerSubmission(ctx context.Context, computerID string, request l1.ComputerSubmissionRequest) (l1.ComputerSubmissionMutationResult, bool, error) {
 	var result l1.ComputerSubmissionMutationResult
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/submission"
