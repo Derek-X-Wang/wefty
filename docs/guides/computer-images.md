@@ -70,18 +70,9 @@ its one owning cell.
 
 The required image lane records cold-start time from the conformance receipt
 and whole-container idle RSS from a separate steady-state boot. The values are
-evidence for one runner and digest, not sizing promises. The 2026-08-29 required
-[contract-gate snapshot](https://github.com/Derek-X-Wang/wefty/actions/runs/33241736102)
-recorded:
-
-| Reference | Platform | Idle RSS | Cold start | Executed digest |
-| --- | --- | ---: | ---: | --- |
-| XFCE/Xvfb | `linux/amd64` | 1,353.3 MiB | 2.662 s | `sha256:e810a2d6a072b73211cab8f408603f320769336ece313dd02c7bca7dcc19c647` |
-| XFCE/Xvfb | `linux/arm64` | 1,308.2 MiB | 7.523 s | `sha256:fc0c8c0f68568c1864fa437013e4babf01f1622fd78861645d8681ef6257a37c` |
-| GPU-free Wayland | `linux/amd64` | 931.2 MiB | 3.395 s | `sha256:5e078930cca3a40343a990d670ecfe2f476393249666108ca7bac9dfbb701adc` |
-| GPU-free Wayland | `linux/arm64` | 882.5 MiB | 3.527 s | `sha256:36d643df24e1c485364e5b37e1cd25eef247ce639151a3aa83525046622f43bc` |
-
-The exact-byte `amd64-metrics.json` and `arm64-metrics.json` receipts are in
+evidence for one runner and digest, not sizing promises, so this guide does not
+copy values that would go stale when the example changes. Each required run's
+exact-byte `amd64-metrics.json` and `arm64-metrics.json` receipts are in
 `wefty-computer-reference-platform-*` for XFCE and
 `wefty-computer-wayland-reference-platform-*` for Wayland. They retain
 `idle_rss_bytes` and `cold_start_seconds`; publication carries the same files
