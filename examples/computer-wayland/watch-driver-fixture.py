@@ -8,6 +8,7 @@ import time
 
 SOURCE = "/wefty/control/driver.json"
 TARGET = "/tmp/wefty-computer/driver-state.json"
+MUTATION = os.environ.get("WEFTY_CONFORMANCE_MUTATION", "")
 
 
 def read_document():
@@ -17,16 +18,20 @@ def read_document():
         fingerprint = hashlib.sha256(payload).hexdigest()
         value = json.loads(payload)
         if not isinstance(value, dict) or set(value) != {"version", "human_driving"}:
-            return False, fingerprint, "malformed"
-        if type(value["version"]) is not int or type(value["human_driving"]) is not bool:
-            return False, fingerprint, "malformed"
+            return MUTATION == "malformed-driver-accepted", fingerprint, "malformed"
+        if type(value["version"]) is not int:
+            return MUTATION == "malformed-driver-accepted", fingerprint, "malformed"
         if value["version"] != 1:
-            return False, fingerprint, "unknown-version"
-        return value["human_driving"], fingerprint, "valid"
+            accepted = MUTATION == "unknown-driver-version-accepted" and value.get("human_driving") is True
+            return accepted, fingerprint, "unknown-version"
+        if type(value["human_driving"]) is not bool:
+            return MUTATION == "malformed-driver-accepted", fingerprint, "malformed"
+        state = False if MUTATION == "driver-json-ignored" else value["human_driving"]
+        return state, fingerprint, "valid"
     except FileNotFoundError:
         return False, "missing", "missing"
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return False, "malformed", "malformed"
+        return MUTATION == "malformed-driver-accepted", "malformed", "malformed"
 
 
 def main():

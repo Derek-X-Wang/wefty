@@ -37,6 +37,15 @@ RUN case "$TARGETARCH" in amd64) ninja_version=1.12.1-1 ;; arm64) ninja_version=
     && printf '%s  %s\n' \
       '46d689818d88e0d65387bf9182f1bd1015c4b28e0347696f0bec7c7d9c829194' \
       /tmp/neatvnc.tar.xz | sha256sum --check -
+RUN case "$TARGETARCH" in \
+      amd64) mise_arch=x64; mise_sha=7cd12d6002d5b3c83a89cad79023712faf2a36f9e8b2ee2061dac5135b3de0ed ;; \
+      arm64) mise_arch=arm64; mise_sha=bc2c447a7e498b0bed0a421cc2101b407fef09a3195670d35a4aa3f43cd868a1 ;; \
+      *) exit 64 ;; \
+    esac \
+    && curl --fail --location --retry 5 --output /tmp/mise \
+      "https://github.com/jdx/mise/releases/download/v2026.8.14/mise-v2026.8.14-linux-${mise_arch}" \
+    && printf '%s  %s\n' "$mise_sha" /tmp/mise | sha256sum --check - \
+    && install --mode=0755 /tmp/mise /opt/mise
 COPY examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch /tmp/neatvnc.patch
 RUN mkdir /tmp/neatvnc \
     && tar --extract --xz --file /tmp/neatvnc.tar.xz --directory /tmp/neatvnc --strip-components=1 \
@@ -45,7 +54,7 @@ RUN mkdir /tmp/neatvnc \
       --buildtype=release --prefix=/opt/neatvnc --libdir=lib \
       -Dtests=false -Dexamples=false -Dbenchmarks=false \
       -Djpeg=disabled -Dtls=enabled -Dnettle=enabled \
-      -Dgbm=disabled -Dh264=disabled \
+      -Dgbm=disabled -Dh264=disabled -Dwefty_mutation_hooks=false \
     && meson compile -C /tmp/neatvnc/build \
     && meson install -C /tmp/neatvnc/build
 
@@ -80,22 +89,16 @@ RUN case "$TARGETARCH" in amd64) swaybg_version=1.2.1-1 ;; arm64) swaybg_version
     && printf '%032d\n' 0 > /etc/machine-id \
     && ln -sf /etc/machine-id /var/lib/dbus/machine-id
 
-# Debian's multiarch cache order differs by platform. Make the root-owned
-# patched library the explicit runtime authority instead of relying on ldconfig
-# to prefer /usr/local/lib over the package copy.
-ENV LD_LIBRARY_PATH=/usr/local/lib
 COPY --from=neatvnc-build /opt/neatvnc/lib/libneatvnc.so.0.0.0 /usr/local/lib/libneatvnc.so.0.0.0
 RUN ln -s libneatvnc.so.0.0.0 /usr/local/lib/libneatvnc.so.0 \
+    && case "$TARGETARCH" in amd64) multiarch=x86_64-linux-gnu ;; arm64) multiarch=aarch64-linux-gnu ;; *) exit 64 ;; esac \
+    && rm -f "/usr/lib/$multiarch/libneatvnc.so"* \
     && printf '%s\n' /usr/local/lib > /etc/ld.so.conf.d/wefty-neatvnc.conf \
     && ldconfig \
     && ldconfig -p | grep -F 'libneatvnc.so.0' | grep -F '/usr/local/lib/libneatvnc.so.0' \
-    && ldd /usr/bin/wayvnc | grep -F 'libneatvnc.so.0 => /usr/local/lib/libneatvnc.so.0'
-
-ADD --chmod=0755 --checksum=sha256:7cd12d6002d5b3c83a89cad79023712faf2a36f9e8b2ee2061dac5135b3de0ed \
-  https://github.com/jdx/mise/releases/download/v2026.8.14/mise-v2026.8.14-linux-x64 /opt/mise/amd64/mise
-ADD --chmod=0755 --checksum=sha256:bc2c447a7e498b0bed0a421cc2101b407fef09a3195670d35a4aa3f43cd868a1 \
-  https://github.com/jdx/mise/releases/download/v2026.8.14/mise-v2026.8.14-linux-arm64 /opt/mise/arm64/mise
-RUN install --mode=0755 "/opt/mise/${TARGETARCH}/mise" /usr/local/bin/mise && rm -rf /opt/mise
+    && ldd /usr/bin/wayvnc | grep -F 'libneatvnc.so.0 => /usr/local/lib/libneatvnc.so.0' \
+    && ! find "/usr/lib/$multiarch" -maxdepth 1 -name 'libneatvnc.so*' -print -quit | grep .
+COPY --from=neatvnc-build --chmod=0755 /opt/mise /usr/local/bin/mise
 
 RUN groupadd --gid 12000 wefty \
     && useradd --uid 12000 --gid 12000 --home-dir /home/wefty --shell /bin/sh --no-create-home wefty \
@@ -117,9 +120,14 @@ COPY --chmod=0644 examples/computer-wayland/oracle.html /opt/wefty-computer-wayl
 COPY --chmod=0644 examples/computer-wayland/sway-config /opt/wefty-computer-wayland/sway-config
 COPY --chmod=0644 examples/computer-wayland/skills/self-reconfigure/SKILL.md /opt/wefty-computer-wayland/skills/self-reconfigure/SKILL.md
 COPY --chmod=0644 examples/computer-wayland/LICENSES.md /usr/share/doc/wefty-computer-wayland/ATTRIBUTIONS.md
-RUN /usr/local/libexec/wefty-verify-licenses /usr/share/wefty/licenses/debian-packages.tsv \
+COPY --from=neatvnc-build --chmod=0644 /tmp/neatvnc/COPYING /usr/share/wefty/licenses/neatvnc-ISC.txt
+COPY --chmod=0644 examples/computer-wayland/licenses/mise-MIT.txt /usr/share/wefty/licenses/mise-MIT.txt
+COPY --chmod=0644 LICENSE /usr/share/wefty/licenses/wefty-Apache-2.0.txt
+RUN /usr/local/libexec/wefty-verify-licenses --generate \
+      /usr/share/wefty/licenses/debian-packages.tsv /usr/share/wefty/licenses/non-dpkg-components.tsv \
+    && /usr/local/libexec/wefty-verify-licenses --check \
+      /usr/share/wefty/licenses/debian-packages.tsv /usr/share/wefty/licenses/non-dpkg-components.tsv \
     && chmod 0755 /usr/share/wefty /usr/share/wefty/licenses /usr/share/doc/wefty-computer-wayland \
-    && test -s /usr/share/wefty/licenses/debian-packages.tsv \
     && test -s /usr/share/doc/wefty-computer-wayland/ATTRIBUTIONS.md
 
 LABEL org.opencontainers.image.source="https://github.com/Derek-X-Wang/wefty" \

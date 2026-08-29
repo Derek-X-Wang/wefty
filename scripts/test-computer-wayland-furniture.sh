@@ -5,29 +5,29 @@ image=
 arch=
 conformance_receipt=
 output=
+metrics_output=
 while (($# > 0)); do
   case "$1" in
     --image) image="${2:-}"; shift ;;
     --arch) arch="${2:-}"; shift ;;
     --conformance-receipt) conformance_receipt="${2:-}"; shift ;;
     --output) output="${2:-}"; shift ;;
-    *) printf '%s\n' 'usage: scripts/test-computer-wayland-furniture.sh --image REF@sha256:DIGEST --arch amd64|arm64 --conformance-receipt FILE --output FILE' >&2; exit 64 ;;
+    --metrics-output) metrics_output="${2:-}"; shift ;;
+    *) printf '%s\n' 'usage: scripts/test-computer-wayland-furniture.sh --image REF@sha256:DIGEST --arch amd64|arm64 --conformance-receipt FILE --output FILE --metrics-output FILE' >&2; exit 64 ;;
   esac
   shift
 done
-[[ $image == *@sha256:* && $arch =~ ^(amd64|arm64)$ && -f $conformance_receipt && -n $output ]] || exit 64
+[[ $image == *@sha256:* && $arch =~ ^(amd64|arm64)$ && -f $conformance_receipt && -n $output && -n $metrics_output ]] || exit 64
 
 root=$(mktemp -d)
 container=
 cleanup() {
-  if [[ -n $container ]]; then docker rm --force "$container" >/dev/null 2>&1 || true; fi
-  # The image runs as uid 12000 and deliberately makes its home private. Give
-  # the host runner traversal rights after the container stops so this exact
-  # temporary bind can still be removed.
-  if [[ -d $root/service ]]; then
-    docker run --rm --platform "linux/$arch" --user 0 --entrypoint /bin/chmod \
-      --mount "type=bind,src=$root/service,dst=/wefty-cleanup" \
-      "$image" --recursive a+rwX /wefty-cleanup >/dev/null 2>&1 || true
+  if [[ -n $container ]]; then
+    # Match the public checker's cleanup: the running tenant relaxes only its
+    # own bind content before the container is removed. No root cleanup image
+    # receives the host path.
+    docker exec "$container" sh -c 'chmod -R u+rwX,go+rwX /wefty/service 2>/dev/null || true' >/dev/null 2>&1 || true
+    docker rm --force "$container" >/dev/null 2>&1 || true
   fi
   if ! rm -rf "$root"; then printf 'warning: could not remove furniture directory %s\n' "$root" >&2; fi
 }
@@ -99,11 +99,14 @@ if [[ $ready != true ]]; then
   exit 1
 fi
 docker exec "$container" sh -c 'test ! -e /dev/dri && tr "\000" " " < /proc/1/cmdline | grep -q wefty-computer-wayland-entrypoint'
+gpu_device_absent=true
 docker exec "$container" sh -c 'for p in /proc/[0-9]*; do tr "\000" " " < "$p/cmdline" 2>/dev/null; echo; done' > "$root/processes.txt"
 grep -F 'sway --config /opt/wefty-computer-wayland/sway-config' "$root/processes.txt"
 grep -E 'wayvnc -w .*--disable-input|wayvnc -w --disable-input' "$root/processes.txt"
+view_disable_input=true
 grep -E "wayvnc -w .*127\.0\.0\.1 $control_port" "$root/processes.txt"
 if grep -q websockify "$root/processes.txt"; then echo 'websockify process is forbidden' >&2; exit 1; fi
+native_wayvnc_websocket=true
 
 docker exec --env WEFTY_AGENT_DEMO_PAUSE=0.6 "$container" wefty-agent-session-demo
 for _ in $(seq 1 80); do
@@ -111,6 +114,7 @@ for _ in $(seq 1 80); do
   sleep 0.125
 done
 docker exec "$container" jq -e '.state == "done" and .observed == ["idle","working","blocked","done"]' /tmp/wefty-computer/agent-state-surface.json
+agent_states_observed=true
 
 docker exec "$container" wefty-theme amber
 for _ in $(seq 1 80); do
@@ -118,6 +122,7 @@ for _ in $(seq 1 80); do
   sleep 0.125
 done
 docker exec "$container" jq -e '.theme == "amber"' /tmp/wefty-computer/theme-surface.json
+self_reconfiguration_observed=true
 
 set +e
 docker exec "$container" wefty-crash-briefing sh -c 'printf crash-proof >&2; exit 23'
@@ -126,6 +131,7 @@ set -e
 test "$crash_status" -eq 23
 docker exec "$container" jq -e '.kind == "crash-briefing" and .exit_code == 23 and (.log_tail | contains("crash-proof"))' \
   /home/wefty/.local/state/wefty/crash-briefing.json
+crash_briefing_observed=true
 docker exec "$container" test -x /usr/local/bin/mise || {
   echo 'mise is not executable in the running reference image' >&2
   exit 1
@@ -134,14 +140,10 @@ docker exec "$container" sh -c 'test -L /usr/local/bin/claude && test -L /usr/lo
   echo 'agent command stubs are not both symbolic links' >&2
   exit 1
 }
-docker exec "$container" test -s /usr/share/doc/wefty-computer-wayland/ATTRIBUTIONS.md || {
-  echo 'reference image attribution manifest is missing or empty' >&2
-  exit 1
-}
-docker exec "$container" test -s /usr/share/wefty/licenses/debian-packages.tsv || {
-  echo 'reference image Debian package license inventory is missing or empty' >&2
-  exit 1
-}
+mise_stubs_present=true
+docker exec "$container" /usr/local/libexec/wefty-verify-licenses --check \
+  /usr/share/wefty/licenses/debian-packages.tsv /usr/share/wefty/licenses/non-dpkg-components.tsv
+license_manifest_present=true
 
 idle_rss_kib=$(docker exec "$container" sh -c '
   total=0
@@ -157,7 +159,19 @@ if ! test "$idle_rss_kib" -gt 0; then
   exit 1
 fi
 cold_start=$(jq -r '.first_boot_readiness_seconds' "$conformance_receipt")
+jq -e '.first_boot_readiness_seconds | type == "number" and . < 60' "$conformance_receipt" >/dev/null
 jq -n --arg platform "linux/$arch" --argjson idle_rss_bytes "$((idle_rss_kib * 1024))" \
   --argjson cold_start_seconds "$cold_start" \
-  '{version:1,platform:$platform,gpu_device_absent:true,native_wayvnc_websocket:true,view_disable_input:true,agent_states_observed:["idle","working","blocked","done"],self_reconfiguration_observed:true,crash_briefing_observed:true,mise_stubs_present:true,license_manifest_present:true,idle_rss_bytes:$idle_rss_bytes,cold_start_seconds:$cold_start_seconds}' \
+  --argjson gpu_device_absent "$gpu_device_absent" \
+  --argjson native_wayvnc_websocket "$native_wayvnc_websocket" \
+  --argjson view_disable_input "$view_disable_input" \
+  --argjson agent_states_observed "$agent_states_observed" \
+  --argjson self_reconfiguration_observed "$self_reconfiguration_observed" \
+  --argjson crash_briefing_observed "$crash_briefing_observed" \
+  --argjson mise_stubs_present "$mise_stubs_present" \
+  --argjson license_manifest_present "$license_manifest_present" \
+  '{version:1,platform:$platform,gpu_device_absent:$gpu_device_absent,native_wayvnc_websocket:$native_wayvnc_websocket,view_disable_input:$view_disable_input,agent_states_observed:(if $agent_states_observed then ["idle","working","blocked","done"] else [] end),self_reconfiguration_observed:$self_reconfiguration_observed,crash_briefing_observed:$crash_briefing_observed,mise_stubs_present:$mise_stubs_present,license_manifest_present:$license_manifest_present,idle_rss_bytes:$idle_rss_bytes,cold_start_seconds:$cold_start_seconds}' \
   > "$output"
+jq -n --arg platform "linux/$arch" --argjson idle_rss_bytes "$((idle_rss_kib * 1024))" \
+  --argjson cold_start_seconds "$cold_start" \
+  '{version:1,platform:$platform,idle_rss_bytes:$idle_rss_bytes,cold_start_seconds:$cold_start_seconds}' > "$metrics_output"

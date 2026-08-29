@@ -3,6 +3,7 @@ package scripts
 import (
 	"bytes"
 	"encoding/json"
+	"maps"
 	"os"
 	"os/exec"
 	"regexp"
@@ -204,6 +205,15 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 	}
 	for name, workflow := range map[string]workflowContract{"workflow-run": realtiming, "scheduled": scheduled} {
+		workflowText := realtimeText
+		if name == "scheduled" {
+			workflowText = scheduledText
+		}
+		for _, required := range []string{"{os: ubuntu-latest, image: xfce}", "{os: ubuntu-latest, image: wayland}", "WEFTY_OCI_COMPUTER_VARIANT", "wayland_computer_release/amd64-runtime.json", "ubuntu-latest-xfce-", "ubuntu-latest-wayland-"} {
+			if !strings.Contains(workflowText, required) {
+				t.Fatalf("%s realtiming image dimension is missing %q", name, required)
+			}
+		}
 		result, ok := workflow.Jobs["realtiming-result"]
 		if !ok {
 			t.Fatalf("%s realtiming has no fail-closed result job", name)
@@ -215,7 +225,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 		resultText := marshalJob(t, result)
 		for _, required := range []string{"ARTIFACT_AVAILABLE", "$ARTIFACT_AVAILABLE", "= true",
-			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json"} {
+			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland"} {
 			if !strings.Contains(resultText, required) {
 				t.Fatalf("%s realtiming result does not fail closed on %q", name, required)
 			}
@@ -250,15 +260,19 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../examples/computer/watch-driver.py", "/wefty/control/driver.json", "os.replace", `type(value["version"]) is not int`, `type(value["human_driving"]) is not bool`)
 	assertFileContains(t, "../examples/computer/oracle.html", `data-wefty-input-oracle="v1"`, "events=0 bytes=0 hash=00000000")
 	assertFileContains(t, "../examples/computer/pointer-oracle.py", "XQueryPointer", "input-oracle.json", "os.replace")
-	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "wayvnc=0.9.1-1", "sway=1.10.1-2", "mise-v2026.8.14", "wefty-verify-licenses", "ldconfig -p", "/usr/local/lib/libneatvnc.so.0")
+	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "wayvnc=0.9.1-1", "sway=1.10.1-2", "mise-v2026.8.14", "wefty-verify-licenses", "ldconfig -p", "/usr/local/lib/libneatvnc.so.0", "non-dpkg-components.tsv", "mise-MIT.txt", "wefty-Apache-2.0.txt", "rm -f \"/usr/lib/$multiarch/libneatvnc.so\"*")
+	assertFileNotContains(t, "../examples/computer-wayland/Dockerfile", "LD_LIBRARY_PATH", "ADD --chmod")
 	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "WLR_BACKENDS=headless", "WLR_RENDERER=pixman", "WLR_HEADLESS_OUTPUTS=1")
-	assertFileContains(t, "../examples/computer-wayland/entrypoint.sh", "wayvnc -w", "--disable-input", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT")
+	assertFileContains(t, "../examples/computer-wayland/entrypoint.sh", "wayvnc -w", "--disable-input", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "surface-ready", "view-edge-ready", "control-edge-ready")
+	assertFileNotContains(t, "../examples/computer-wayland/entrypoint.sh", "WEFTY_CONFORMANCE_MUTATION", "WEFTY_WAYVNC_RECORD_INPUT")
 	assertFileContains(t, "../examples/computer-wayland/watch-driver.py", "/wefty/control/driver.json", "type(value[\"version\"]) is not int", "os.replace")
-	assertFileContains(t, "../examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch", "GET /websockify", "Sec-WebSocket-Protocol: binary", "WS_OPCODE_TEXT", "WEFTY_WAYVNC_RECORD_INPUT", "native-input-events")
-	assertFileContains(t, "../examples/computer-wayland/surface.py", "input-oracle.json", "native-input-events", "agent-state-surface.json", "theme-surface.json", "os.replace")
+	assertFileContains(t, "../examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch", "GET /websockify", "Sec-WebSocket-Protocol: binary", "WS_OPCODE_TEXT", "wefty_mutation_hooks", "view-edge-ready", "control-edge-ready")
+	assertFileNotContains(t, "../examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch", "WEFTY_WAYVNC_RECORD_INPUT", "native-input-events")
+	assertFileContains(t, "../examples/computer-wayland/surface.py", "input-oracle.json", "def wefty_record_input", "Record only events delivered through Sway", "def do_POST", `self.path == "/surface-ready"`, "agent-state-surface.json", "theme-surface.json", "os.replace")
+	assertFileContains(t, "../examples/computer-wayland/oracle.html", "pointermove", "keydown", "'/input'", "'/surface-ready'")
 	assertFileContains(t, "../examples/computer-wayland/LICENSES.md", "Herdr", "Apache-2.0", "no code or assets copied", "no code, assets, installer, name, or branding copied")
-	assertFileContains(t, "../scripts/test-computer-wayland-furniture.sh", "test ! -e /dev/dri", "agent-state-surface.json", "theme-surface.json", "crash-briefing.json", "idle_rss_bytes")
-	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", "cmd/wefty-computer-conformance", "--input-oracle-path", "--driver-oracle-path")
+	assertFileContains(t, "../scripts/test-computer-wayland-furniture.sh", "test ! -e /dev/dri", "agent-state-surface.json", "theme-surface.json", "crash-briefing.json", "idle_rss_bytes", "wefty-verify-licenses --check", `type == "number"`)
+	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", "cmd/wefty-computer-conformance", "--input-oracle-path", "--driver-oracle-path", "executed_rows", ".executed_rows == 20", "Dockerfile.wayland-text")
 	assertFileContains(t, "../docs/guides/computer-images.md", "Bring-your-own desktop is the product", "not a required base image", "CPU rendering", "--no-sandbox", "wefty-computer-conformance", "GPU-free Wayland")
 	assertFileContains(t, "../docs/guides/computer-images.md", "docker buildx create", "tonistiigi/binfmt@sha256:", "--input-oracle-path", "NOT-RUN", "operator-owned")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "RunComputerServiceRealtiming", "computer_reference_publication_loss_recovery=%t", "computer_reference_helper_stop_start_profile_sign_in_rootfs=%t")
@@ -329,11 +343,14 @@ func workflowCaseActionBody(t *testing.T, workflowName, workflowText, action str
 
 func TestReferenceComputerPublisherConsumesRealCheckerReceipt(t *testing.T) {
 	_, imageBytes := readWorkflow(t, "../.github/workflows/acceptance-image.yml")
-	match := regexp.MustCompile(`receipt_assertion='([^']+)'`).FindSubmatch(imageBytes)
-	if len(match) != 2 {
-		t.Fatal("publisher receipt_assertion was not found")
+	matches := regexp.MustCompile(`receipt_assertion='([^']+)'`).FindAllSubmatch(imageBytes, -1)
+	if len(matches) != 2 {
+		t.Fatalf("publisher receipt_assertions = %d, want XFCE and Wayland", len(matches))
 	}
-	assertion := string(match[1]) + " and .elf_e_machine == 62"
+	if string(matches[0][1]) != string(matches[1][1]) {
+		t.Fatal("XFCE and Wayland publishers enforce different runtime receipts")
+	}
+	assertion := string(matches[0][1]) + " and .elf_e_machine == 62"
 	recorder := computerconformance.NewRecorder("reference", "docker", "linux/amd64", time.Unix(1, 0))
 	for _, definition := range computerconformance.CheckCatalog {
 		status, detail := computerconformance.StatusPass, "observed"
@@ -368,6 +385,80 @@ func TestReferenceComputerPublisherConsumesRealCheckerReceipt(t *testing.T) {
 	if !valid(conformant) {
 		t.Fatal("real publisher jq assertion rejected a conformant receipt")
 	}
+	for name, mutate := range map[string]func(map[string]any){
+		"empty catalog": func(value map[string]any) { value["checks"] = []any{} },
+		"missing load-bearing cell": func(value map[string]any) {
+			checks := value["checks"].([]any)
+			filtered := checks[:0]
+			for _, raw := range checks {
+				if raw.(map[string]any)["id"] != "input.control-accepted" {
+					filtered = append(filtered, raw)
+				}
+			}
+			value["checks"] = filtered
+		},
+		"renamed catalog": func(value map[string]any) {
+			for _, raw := range value["checks"].([]any) {
+				raw.(map[string]any)["id"] = "renamed"
+			}
+		},
+	} {
+		t.Run("reject/"+name, func(t *testing.T) {
+			payload, err := json.Marshal(conformant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var subject map[string]any
+			if err := json.Unmarshal(payload, &subject); err != nil {
+				t.Fatal(err)
+			}
+			mutate(subject)
+			if valid(subject) {
+				t.Fatal("real publisher jq assertion accepted invalid receipt")
+			}
+		})
+	}
+}
+
+func TestWaylandFurniturePublisherRejectsUnearnedFields(t *testing.T) {
+	_, imageBytes := readWorkflow(t, "../.github/workflows/acceptance-image.yml")
+	match := regexp.MustCompile(`furniture_assertion='([^']+)'`).FindSubmatch(imageBytes)
+	if len(match) != 2 {
+		t.Fatal("publisher furniture_assertion was not found")
+	}
+	assertion := string(match[1])
+	conformant := map[string]any{
+		"gpu_device_absent": true, "native_wayvnc_websocket": true, "view_disable_input": true,
+		"agent_states_observed":         []string{"idle", "working", "blocked", "done"},
+		"self_reconfiguration_observed": true, "crash_briefing_observed": true,
+		"mise_stubs_present": true, "license_manifest_present": true,
+		"idle_rss_bytes": 1.0, "cold_start_seconds": 1.0,
+	}
+	valid := func(value map[string]any) bool {
+		payload, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("jq", "-e", assertion)
+		command.Stdin = bytes.NewReader(payload)
+		return command.Run() == nil
+	}
+	if !valid(conformant) {
+		t.Fatal("publisher rejected observed furniture receipt")
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"null cold start":           func(value map[string]any) { value["cold_start_seconds"] = nil },
+		"literal license claim":     func(value map[string]any) { value["license_manifest_present"] = false },
+		"missing input enforcement": func(value map[string]any) { delete(value, "view_disable_input") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := maps.Clone(conformant)
+			mutate(value)
+			if valid(value) {
+				t.Fatal("publisher accepted unearned furniture evidence")
+			}
+		})
+	}
 }
 
 func TestReferenceComputerRunsTwentyBrokenImagesThroughRealChecker(t *testing.T) {
@@ -378,6 +469,9 @@ func TestReferenceComputerRunsTwentyBrokenImagesThroughRealChecker(t *testing.T)
 	rows := regexp.MustCompile(`(?m)^run_mutation ([^ ]+) ([^ ]+) '([^']+)'$`).FindAllSubmatch(payload, -1)
 	if len(rows) != 20 {
 		t.Fatalf("real broken-image rows = %d, want 20", len(rows))
+	}
+	if bytes.Contains(payload, []byte(`if [[ $arch != amd64 ]]; then exit 0; fi`)) {
+		t.Fatal("arm64 skips the broken-image matrix")
 	}
 	names, cells := map[string]bool{}, map[string]bool{}
 	for _, row := range rows {
@@ -456,6 +550,19 @@ func assertFileMatches(t *testing.T, path string, patterns ...string) {
 	for _, pattern := range patterns {
 		if !regexp.MustCompile(pattern).Match(payload) {
 			t.Fatalf("%s does not match %q", path, pattern)
+		}
+	}
+}
+
+func assertFileNotContains(t *testing.T, path string, values ...string) {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range values {
+		if strings.Contains(string(payload), value) {
+			t.Fatalf("%s unexpectedly contains %q", path, value)
 		}
 	}
 }

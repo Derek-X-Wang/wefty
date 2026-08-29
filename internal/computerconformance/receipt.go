@@ -126,7 +126,10 @@ func (r *Recorder) Finish(finishedAt time.Time) Receipt {
 }
 
 func (r *Recorder) projectObservedCompatibility() {
-	passed := func(id string) bool { return r.receipt.Checks[r.index[id]].Status == StatusPass }
+	passed := func(id string) bool {
+		index, ok := r.index[id]
+		return ok && index >= 0 && index < len(r.receipt.Checks) && r.receipt.Checks[index].ID == id && r.receipt.Checks[index].Status == StatusPass
+	}
 	all := func(ids ...string) bool {
 		for _, id := range ids {
 			if !passed(id) {

@@ -33,9 +33,9 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		}
 		return path
 	}
-	runGate := func(t *testing.T, receipt map[string]any, mutated string) error {
+	runGate := func(t *testing.T, receipt map[string]any, image, mutated string) error {
 		t.Helper()
-		arguments := []string{"../scripts/check-linux-computer-receipt.sh", writeReceipt(t, receipt), candidate}
+		arguments := []string{"../scripts/check-linux-computer-receipt.sh", writeReceipt(t, receipt), candidate, image}
 		if mutated != "" {
 			arguments = append(arguments, mutated)
 		}
@@ -46,17 +46,19 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		return nil
 	}
 
-	if err := runGate(t, conformantLinuxComputerReceipt(candidate), ""); err != nil {
-		t.Fatalf("conformant receipt failed: %v", err)
+	for _, image := range []string{"xfce", "wayland"} {
+		if err := runGate(t, conformantLinuxComputerReceipt(candidate, image), image, ""); err != nil {
+			t.Fatalf("conformant %s receipt failed: %v", image, err)
+		}
 	}
 	for _, mutated := range linuxComputerReceiptRows {
 		t.Run("mutation/"+mutated, func(t *testing.T) {
-			receipt := conformantLinuxComputerReceipt(candidate)
+			receipt := conformantLinuxComputerReceipt(candidate, "xfce")
 			receipt["status"] = "FAIL"
 			row := receipt["rows"].(map[string]any)[mutated].(map[string]any)
 			row["status"] = "FAIL"
 			row["assertions"] = map[string]bool{"live_product_path": false}
-			if err := runGate(t, receipt, mutated); err != nil {
+			if err := runGate(t, receipt, "xfce", mutated); err != nil {
 				t.Fatalf("owning-row mutation receipt failed: %v", err)
 			}
 		})
@@ -71,11 +73,14 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		"false assertion": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.create_boot"].(map[string]any)["assertions"] = map[string]bool{"live_product_path": false}
 		},
+		"wrong image variant": func(receipt map[string]any) {
+			receipt["image"].(map[string]any)["variant"] = "wayland"
+		},
 	} {
 		t.Run("reject/"+name, func(t *testing.T) {
-			receipt := conformantLinuxComputerReceipt(candidate)
+			receipt := conformantLinuxComputerReceipt(candidate, "xfce")
 			mutate(receipt)
-			if err := runGate(t, receipt, ""); err == nil {
+			if err := runGate(t, receipt, "xfce", ""); err == nil {
 				t.Fatal("receipt gate accepted invalid evidence")
 			}
 		})
@@ -91,7 +96,7 @@ func (err *receiptGateError) Error() string {
 	return err.err.Error() + ": " + err.output
 }
 
-func conformantLinuxComputerReceipt(candidate string) map[string]any {
+func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 	rows := make(map[string]any, len(linuxComputerReceiptRows))
 	for _, id := range linuxComputerReceiptRows {
 		rows[id] = map[string]any{
@@ -116,6 +121,7 @@ func conformantLinuxComputerReceipt(candidate string) map[string]any {
 		"candidate_sha": candidate,
 		"platform":      "linux/amd64",
 		"image": map[string]any{
+			"variant":         variant,
 			"index_digest":    digest,
 			"platform_digest": digest,
 		},

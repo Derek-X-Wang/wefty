@@ -28,9 +28,21 @@
           document.body.dataset.theme = theme.theme;
         } catch (_) {}
       };
+      const record = (value) => fetch('/input', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({version: 1, ...value}),
+      }).catch(() => {});
+      window.addEventListener('pointermove', event => record({kind: 'pointer', x: event.clientX, y: event.clientY}));
+      window.addEventListener('keydown', () => record({kind: 'key'}));
       setInterval(refresh, 100);
       refresh();
       document.body.focus();
+      fetch('/surface-ready', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({version: 1}),
+      });
     </script>
   </body>
 </html>

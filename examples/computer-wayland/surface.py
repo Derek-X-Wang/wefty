@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Serve the focused Wayland surface and assertion-derived local receipts."""
+"""Serve the focused Chromium Wayland surface and its guest input receipt."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import threading
-import time
 
 ROOT = "/tmp/wefty-computer"
 HOME = os.environ.get("HOME", "/home/wefty")
 ORACLE = f"{ROOT}/input-oracle.json"
-EVENTS = f"{ROOT}/native-input-events"
 STATE = f"{HOME}/.local/state/wefty/agent-state.json"
 THEME = f"{HOME}/.config/wefty/theme.json"
 HTML = "/opt/wefty-computer-wayland/oracle.html"
@@ -36,35 +34,24 @@ def read_json(path, fallback):
         return fallback
 
 
-def consume_native_input():
-    offset = 0
-    while True:
-        try:
-            with open(EVENTS, "r", encoding="ascii") as source:
-                source.seek(offset)
-                events = source.readlines()
-                offset = source.tell()
-        except (OSError, UnicodeError):
-            events = []
-        if events:
-            with LOCK:
-                for event in events:
-                    fields = event.split()
-                    if len(fields) == 2 and fields[0] in ("control", "view") and fields[1] == "key":
-                        INPUT["key_events"] += 1
-                        INPUT["generation"] += 1
-                    elif len(fields) == 4 and fields[0] in ("control", "view") and fields[1] == "pointer":
-                        try:
-                            x, y = int(fields[2]), int(fields[3])
-                        except ValueError:
-                            continue
-                        if fields[0] == "control":
-                            INPUT["x"], INPUT["y"] = x, y
-                        INPUT["pointer_history"].append([x, y])
-                        INPUT["pointer_history"] = INPUT["pointer_history"][-64:]
-                        INPUT["generation"] += 1
-                atomic_json(ORACLE, INPUT)
-        time.sleep(0.01)
+def wefty_record_input(value):
+    """Record only events delivered through Sway to the focused Wayland client."""
+    kind = value.get("kind") if isinstance(value, dict) else None
+    with LOCK:
+        if kind == "key" and value.get("version") == 1:
+            INPUT["key_events"] += 1
+        elif kind == "pointer" and value.get("version") == 1 and type(value.get("x")) is int and type(value.get("y")) is int:
+            x, y = value["x"], value["y"]
+            if not (0 <= x < 1280 and 0 <= y < 720):
+                return False
+            INPUT["x"], INPUT["y"] = x, y
+            INPUT["pointer_history"].append([x, y])
+            INPUT["pointer_history"] = INPUT["pointer_history"][-64:]
+        else:
+            return False
+        INPUT["generation"] += 1
+        atomic_json(ORACLE, INPUT)
+    return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -110,12 +97,39 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def do_POST(self):
+        if self.path not in ("/surface-ready", "/input"):
+            self.send_error(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400)
+            return
+        if length < 2 or length > 256:
+            self.send_error(400)
+            return
+        try:
+            value = json.loads(self.rfile.read(length).decode("ascii"))
+        except (UnicodeError, json.JSONDecodeError):
+            self.send_error(400)
+            return
+        if self.path == "/surface-ready":
+            if value != {"version": 1}:
+                self.send_error(400)
+                return
+            with open(f"{ROOT}/surface-ready", "w", encoding="ascii") as marker:
+                marker.write("ready\n")
+        else:
+            if not wefty_record_input(value):
+                self.send_error(400)
+                return
+        self.send_response(204)
+        self.end_headers()
+
 def main():
     os.makedirs(ROOT, exist_ok=True)
-    with open(EVENTS, "w", encoding="ascii"):
-        pass
     atomic_json(ORACLE, INPUT)
-    threading.Thread(target=consume_native_input, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", 18888), Handler).serve_forever()
 
 

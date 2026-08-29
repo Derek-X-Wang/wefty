@@ -57,19 +57,23 @@ jobs:
           printf 'available=true\ncandidate_sha=%s\nrun_id=%s\n' "$candidate_sha" "$run_id" >> "$GITHUB_OUTPUT"
 
   service-acceptance-realtiming:
-    name: service-acceptance-realtiming / ${{ matrix.os }}
+    name: service-acceptance-realtiming / ${{ matrix.os }} / ${{ matrix.image }}
     needs: [resolve-published-artifact]
     if: needs.resolve-published-artifact.outputs.available == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-latest]
+        include:
+          - {os: macos-15, image: xfce}
+          - {os: ubuntu-latest, image: xfce}
+          - {os: ubuntu-latest, image: wayland}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 100
     env:
       IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
       COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-reference
       WAYLAND_COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-wayland-reference
+      COMPUTER_VARIANT: ${{ matrix.image }}
     steps:
       - name: Check out the exact trusted publishing commit
         if: github.event_name == 'workflow_run'
@@ -389,10 +393,18 @@ jobs:
             printf 'WEFTY_OCI_ECHO_REFERENCE=%s\n' "$ECHO_REFERENCE"
             printf 'WEFTY_OCI_ECHO_DIGEST=%s\n' "$ECHO_DIGEST"
             printf 'WEFTY_OCI_ECHO_ARCHIVE=%s\n' "$ECHO_ARCHIVE"
-            printf 'WEFTY_OCI_COMPUTER_REFERENCE=%s\n' "$COMPUTER_REFERENCE"
-            printf 'WEFTY_OCI_COMPUTER_DIGEST=%s\n' "$COMPUTER_DIGEST"
-            printf 'WEFTY_OCI_COMPUTER_ARCHIVE=%s\n' "$COMPUTER_ARCHIVE"
-            printf 'WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT=%s\n' "$computer_release/amd64-runtime.json"
+            if [ "$COMPUTER_VARIANT" = wayland ]; then
+              printf 'WEFTY_OCI_COMPUTER_REFERENCE=%s\n' "$WAYLAND_COMPUTER_REFERENCE"
+              printf 'WEFTY_OCI_COMPUTER_DIGEST=%s\n' "$WAYLAND_COMPUTER_DIGEST"
+              printf 'WEFTY_OCI_COMPUTER_ARCHIVE=%s\n' "$WAYLAND_COMPUTER_ARCHIVE"
+              printf 'WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT=%s\n' "$wayland_computer_release/amd64-runtime.json"
+            else
+              printf 'WEFTY_OCI_COMPUTER_REFERENCE=%s\n' "$COMPUTER_REFERENCE"
+              printf 'WEFTY_OCI_COMPUTER_DIGEST=%s\n' "$COMPUTER_DIGEST"
+              printf 'WEFTY_OCI_COMPUTER_ARCHIVE=%s\n' "$COMPUTER_ARCHIVE"
+              printf 'WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT=%s\n' "$computer_release/amd64-runtime.json"
+            fi
+            printf 'WEFTY_OCI_COMPUTER_VARIANT=%s\n' "$COMPUTER_VARIANT"
             printf 'WEFTY_OCI_WAYLAND_COMPUTER_REFERENCE=%s\n' "$WAYLAND_COMPUTER_REFERENCE"
             printf 'WEFTY_OCI_WAYLAND_COMPUTER_DIGEST=%s\n' "$WAYLAND_COMPUTER_DIGEST"
             printf 'WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE=%s\n' "$WAYLAND_COMPUTER_ARCHIVE"
@@ -420,7 +432,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: service-acceptance-realtiming-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}
+          name: service-acceptance-realtiming-${{ matrix.os }}-${{ matrix.image }}-${{ env.CANDIDATE_SHA }}
           path: ${{ runner.temp }}/service-acceptance-realtiming
           if-no-files-found: error
 
@@ -435,12 +447,18 @@ jobs:
         with:
           ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           persist-credentials: false
-      - name: Download the Linux matrix receipt
+      - name: Download the Linux XFCE matrix receipt
         if: needs.resolve-published-artifact.outputs.available == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: service-acceptance-realtiming-ubuntu-latest-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
-          path: ${{ runner.temp }}/linux-computer-receipt
+          name: service-acceptance-realtiming-ubuntu-latest-xfce-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/linux-computer-receipt-xfce
+      - name: Download the Linux Wayland matrix receipt
+        if: needs.resolve-published-artifact.outputs.available == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: service-acceptance-realtiming-ubuntu-latest-wayland-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/linux-computer-receipt-wayland
       - name: Fail closed unless the published lane executed and passed
         env:
           RESOLVE_RESULT: ${{ needs.resolve-published-artifact.result }}
@@ -456,5 +474,8 @@ jobs:
           test "$ARTIFACT_AVAILABLE" = true
           test "$REALTIMING_RESULT" = success
           scripts/check-linux-computer-receipt.sh \
-            "$RUNNER_TEMP/linux-computer-receipt/linux-computer-matrix.json" \
-            "${{ needs.resolve-published-artifact.outputs.candidate-sha }}"
+            "$RUNNER_TEMP/linux-computer-receipt-xfce/linux-computer-matrix.json" \
+            "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" xfce
+          scripts/check-linux-computer-receipt.sh \
+            "$RUNNER_TEMP/linux-computer-receipt-wayland/linux-computer-matrix.json" \
+            "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" wayland

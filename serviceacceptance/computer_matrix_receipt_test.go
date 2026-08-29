@@ -47,6 +47,7 @@ type linuxComputerMatrixReceipt struct {
 }
 
 type linuxComputerImageEvidence struct {
+	Variant        string `json:"variant"`
 	Reference      string `json:"reference"`
 	IndexDigest    string `json:"index_digest"`
 	PlatformDigest string `json:"platform_digest"`

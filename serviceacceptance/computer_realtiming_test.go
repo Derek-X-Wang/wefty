@@ -56,7 +56,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	digest := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_DIGEST")
 	archive := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_ARCHIVE")
 	imageRuntime := readPublishedComputerRuntimeReceipt(t, requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT"))
-	receipt.Image = linuxComputerImageEvidence{Reference: reference, IndexDigest: digest,
+	receipt.Image = linuxComputerImageEvidence{Variant: requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_VARIANT"), Reference: reference, IndexDigest: digest,
 		PlatformDigest: imageRuntime.Digest, Archive: filepath.Base(archive)}
 	candidate, err := exec.Command("git", "rev-parse", "HEAD").Output()
 	if err != nil || strings.TrimSpace(string(candidate)) == "" {

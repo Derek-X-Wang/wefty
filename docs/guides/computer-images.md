@@ -51,9 +51,9 @@ acceptance consume that same digest and tar identity.
 
 Both reference builds use a dated Debian snapshot, pin every directly selected
 package version, pass `SOURCE_DATE_EPOCH`, and remove apt/dpkg logs in the
-install layer. XFCE retains its two-empty-cache-solve reproducibility check.
-The Wayland lane builds one OCI tar, promotes that exact layout into the
-ephemeral execution registry, and requires its digest to remain unchanged.
+install layer. Both references retain the two-empty-cache-solve
+reproducibility check: one solve emits the OCI tar and the second emits the
+ephemeral registry image, whose platform digests must be equal.
 This proves that the bytes executed and later published are the same; it does
 not promise that future toolchains reproduce them. The recorded digest is the
 only image identity.
@@ -100,14 +100,16 @@ Debian's pinned `wayvnc` already owns RFB-over-WebSocket, but its pinned
 and ignores text frames. The image builds an ISC-licensed patch over the pinned
 source so the native server accepts only `/websockify` (with ignored query or
 fragment), negotiates exactly `binary`, and closes on text frames. The
-repository mutation hook makes the text rejection load-bearing in the same
-20-row negative lane.
+published library contains no mutation hook; the `text-frames-accepted`
+derivative recompiles it with `-Dwefty_mutation_hooks=true` before proving the
+owning cell fails.
 
-The image derives its input receipt at neatvnc's native RFB parser. The control
-role records parsed pointer and key events; the view role records none only
-when it actually starts with `--disable-input`. This keeps the isolation proof
-load-bearing without making the browser or another client-side layer filter
-input.
+The image derives its input receipt after compositor delivery. Chromium is a
+real Wayland client on the focused Sway surface; its DOM pointer and keyboard
+listeners feed `input-oracle.json`. The checker first proves view input leaves
+that guest receipt unchanged and then proves control input changes it at exact
+coordinates. Thus parser acceptance alone cannot satisfy `input.control-accepted`,
+and regressing `--disable-input` fails both view-isolation cells.
 
 The image also demonstrates optional, image-owned agent furniture outside the
 Computer wire contract:
@@ -125,11 +127,12 @@ The surface and `driver.json` consumers reopen atomically replaced files and
 fail closed. `/home/wefty` remains a symlink into `/wefty/service`.
 
 The repo and image carry
-`examples/computer-wayland/LICENSES.md`; the build also rejects Debian
-`contrib`/`non-free`, requires package copyright files, and records the
-installed-package manifest. Herdr is credited for Apache-2.0 design
-inspiration only. The other researched desktop is inspiration only: no code,
-assets, installer, trademark, or branding is copied. Chromium still runs with
+`examples/computer-wayland/LICENSES.md`; the build requires every installed
+Debian package copyright file and records a separate closed manifest for the
+patched neatvnc library, mise, and Wefty-authored image files. Their ISC, MIT,
+and repository Apache-2.0 notices are shipped in the image. Herdr is credited
+for Apache-2.0 design inspiration only. The other researched desktop is
+inspiration only: no code, assets, installer, trademark, or branding is copied. Chromium still runs with
 `--no-sandbox`, which is an image limitation rather than an OCI-profile change.
 
 ## Build your own image

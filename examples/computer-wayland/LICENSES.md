@@ -1,9 +1,10 @@
 # Wayland reference image attribution and license manifest
 
 This image contains only Debian `main` packages plus the components listed
-below. Its build emits `/usr/share/wefty/licenses/debian-packages.tsv`, rejects
-Debian `contrib` and `non-free` sections, and requires every installed package
-to carry its Debian copyright file.
+below. Its build emits `/usr/share/wefty/licenses/debian-packages.tsv`, requires
+every installed package to carry its Debian copyright file, and emits the
+closed `/usr/share/wefty/licenses/non-dpkg-components.tsv` inventory for the
+three non-package components.
 
 | Component or idea | Version / identity | License | Use |
 | --- | --- | --- | --- |

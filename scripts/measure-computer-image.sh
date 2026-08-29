@@ -20,14 +20,9 @@ done
 root=$(mktemp -d)
 container=
 cleanup() {
-  if [[ -n $container ]]; then docker rm --force "$container" >/dev/null 2>&1 || true; fi
-  # The image runs as uid 12000 and deliberately makes its home private. Give
-  # the host runner traversal rights after the container stops so this exact
-  # temporary bind can still be removed.
-  if [[ -d $root/service ]]; then
-    docker run --rm --platform "linux/$arch" --user 0 --entrypoint /bin/chmod \
-      --mount "type=bind,src=$root/service,dst=/wefty-cleanup" \
-      "$image" --recursive a+rwX /wefty-cleanup >/dev/null 2>&1 || true
+  if [[ -n $container ]]; then
+    docker exec "$container" sh -c 'chmod -R u+rwX,go+rwX /wefty/service 2>/dev/null || true' >/dev/null 2>&1 || true
+    docker rm --force "$container" >/dev/null 2>&1 || true
   fi
   if ! rm -rf "$root"; then printf 'warning: could not remove measurement directory %s\n' "$root" >&2; fi
 }

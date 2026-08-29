@@ -11,8 +11,8 @@ source patch makes its native WebSocket edge implement Wefty's exact
 `rfb-websocket-v1` path, subprotocol, and binary-frame behavior; there is no
 websockify process.
 
-The native RFB parser publishes the deterministic input oracle, with the
-focused browser as its visible target surface. The browser also shows `idle`,
+The focused Chromium Wayland client publishes the deterministic input oracle
+only after Sway delivers pointer or keyboard events. The browser also shows `idle`,
 `working`, `blocked`, and `done` agent states. The included
 self-reconfiguration skill changes a persistent theme setting. Agent CLI stubs
 delegate lazy installation to pinned mise, and crash briefings preserve a
