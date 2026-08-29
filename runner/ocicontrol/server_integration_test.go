@@ -3,6 +3,9 @@ package ocicontrol
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -11,10 +14,42 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 const controlChildEnvironment = "WEFTY_OCI_CONTROL_CHILD"
+
+func TestControlResponsePreservesSanitizedHelperMechanics(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeControlResponse(recorder, nil, &ocihelper.RPCError{
+		Code:    ocihelper.CodeImageUnavailable,
+		Message: "OCI image delivery failed",
+		ImageFailure: &ocihelper.ImageFailureFact{
+			Kind:           ocihelper.ImageFailureManifestRejected,
+			TopLevelDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
+	})
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error.Code != ErrorInternal || response.Error.Message != "node-local OCI control failed" {
+		t.Fatalf("control error=%+v", response.Error)
+	}
+	if got := response.Error.Details["reason"]; got != string(ocihelper.CodeImageUnavailable) {
+		t.Fatalf("helper reason=%v", got)
+	}
+	mechanics, ok := response.Error.Details["image_failure"].(map[string]any)
+	if !ok || mechanics["kind"] != string(ocihelper.ImageFailureManifestRejected) || mechanics["top_level_digest"] == "" {
+		t.Fatalf("image mechanics=%#v", response.Error.Details["image_failure"])
+	}
+}
 
 func TestOperatorControlSocketUsesARealProcess(t *testing.T) {
 	if os.Getenv(controlChildEnvironment) == "1" {

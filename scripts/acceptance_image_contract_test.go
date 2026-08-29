@@ -159,6 +159,19 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			t.Fatalf("workflow-run realtiming checkout is missing %q", required)
 		}
 	}
+	for _, required := range []string{
+		"StandardError=append:/tmp/wefty-oci-helper-realtiming.stderr",
+		"if: ${{ always() && runner.os == 'Linux' }}",
+		"journalctl --boot --no-pager --utc --output=short-precise",
+		"-u wefty-oci-helper-realtiming.service",
+		"-u wefty-test-containerd.service",
+		"systemctl status --no-pager --full",
+		"wefty-oci-helper.stderr.txt",
+	} {
+		if !strings.Contains(realtimeText, required) {
+			t.Fatalf("workflow-run realtiming diagnostics are missing %q", required)
+		}
+	}
 	if strings.Contains(realtimeText, "ref: main") {
 		t.Fatal("workflow-run realtiming must check out the triggering main SHA directly")
 	}

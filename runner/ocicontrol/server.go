@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 const maximumControlJSONBytes = 1 << 20
@@ -191,7 +192,7 @@ func writeControlResponse(writer http.ResponseWriter, value any, err error) {
 		if !errors.As(err, &failure) {
 			failure.Cause = err
 		}
-		writeControlError(writer, failure.Status, failure.Code, failure.Message)
+		writeControlErrorDetails(writer, failure.Status, failure.Code, failure.Message, helperMechanicsDetails(err))
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json")
@@ -199,7 +200,31 @@ func writeControlResponse(writer http.ResponseWriter, value any, err error) {
 }
 
 func writeControlError(writer http.ResponseWriter, status int, code contract.ErrorCode, message string) {
+	writeControlErrorDetails(writer, status, code, message, nil)
+}
+
+func writeControlErrorDetails(writer http.ResponseWriter, status int, code contract.ErrorCode, message string, details map[string]any) {
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(status)
-	_ = json.NewEncoder(writer).Encode(contract.ErrorResponse{Error: contract.APIError{Code: code, Message: message}})
+	_ = json.NewEncoder(writer).Encode(contract.ErrorResponse{Error: contract.APIError{Code: code, Message: message, Details: details}})
+}
+
+// helperMechanicsDetails preserves only the helper protocol's closed,
+// sanitized facts. Engine errors and paths remain helper-local.
+func helperMechanicsDetails(err error) map[string]any {
+	var failure *ocihelper.RPCError
+	if !errors.As(err, &failure) {
+		return nil
+	}
+	details := map[string]any{"reason": string(failure.Code)}
+	if failure.ImageFailure != nil {
+		details["image_failure"] = failure.ImageFailure
+	}
+	if failure.MemoryFailure != nil {
+		details["memory_failure"] = failure.MemoryFailure
+	}
+	if failure.DiskFailure != nil {
+		details["disk_failure"] = failure.DiskFailure
+	}
+	return details
 }
