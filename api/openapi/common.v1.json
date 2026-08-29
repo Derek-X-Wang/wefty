@@ -471,7 +471,7 @@
           "computer_id", "name", "placement_node_id", "grants", "storage_id", "storage_generation", "desired_disk_bytes",
           "desired_state", "intent_revision", "applied_revision", "current_job_id",
           "current_spec_revision", "backup_cap", "reconfiguration_phase", "submit_enabled", "submit_intent_revision",
-          "submit_max_inflight", "submit_policy_revision", "display_endpoint", "current_job", "created_at", "updated_at"
+          "submit_max_inflight", "submit_policy_revision", "display_endpoint", "controller_tenure", "current_job", "created_at", "updated_at"
         ],
         "properties": {
           "computer_id": { "type": "string", "minLength": 1 },
@@ -509,6 +509,7 @@
             "type": ["string", "null"],
             "description": "Private take-over front-door endpoint. Null until the admission module is active; never a placeholder URL."
           },
+          "controller_tenure": { "enum": ["free", "held"], "description": "Current Controller-tenure truth derived from immutable current-attempt audit evidence." },
           "current_job": { "$ref": "#/components/schemas/Job" },
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" }

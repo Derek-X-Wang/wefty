@@ -35,7 +35,6 @@ type computerCapacityProjection struct {
 type computerOperatorProjection struct {
 	l1.Computer
 	Capacity         computerCapacityProjection `json:"capacity"`
-	ControllerTenure computerEvidenceCell       `json:"controller_tenure"`
 	MutationApplied  *bool                      `json:"mutation_applied,omitempty"`
 	IdempotentReplay *bool                      `json:"idempotent_replay,omitempty"`
 }
@@ -54,8 +53,6 @@ func newComputerProjection(computer l1.Computer, mutationApplied, replay *bool) 
 			Admission: computerEvidenceCell{Status: "NOT-RUN", Code: "admission_receipt_not_projected",
 				Reason: "the current L1 Computer route does not retain helper-local admission receipts"},
 		},
-		ControllerTenure: computerEvidenceCell{Status: "NOT-RUN", Code: "tenure_state_not_projected",
-			Reason: "the lifecycle route exposes the display front door but no current tenure authority"},
 		MutationApplied: mutationApplied, IdempotentReplay: replay,
 	}
 }
@@ -76,7 +73,7 @@ func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput 
 		return err
 	}
 	if flags.NArg() != 0 || strings.TrimSpace(name) == "" || strings.TrimSpace(imageFlags.reference) == "" || strings.TrimSpace(imageFlags.nodeID) == "" || backupCap < 0 {
-		return usageError("usage: wefty services create --computer --name NAME --image IMAGE --node NODE_ID [--memory-bytes BYTES] [--disk-bytes BYTES] [--backup-cap COUNT] [--idempotency-key KEY]")
+		return usageError("usage: wefty services create --computer --name NAME --image IMAGE --node NODE_ID [--argv ARG] [--working-directory PATH] [--mount NODE_PATH:CONTAINER_PATH[:ro]] [--memory-bytes BYTES] [--cpu-millicores VALUE] [--runtime-handler NAME] [--disk-bytes BYTES] [--backup-cap COUNT] [--idempotency-key KEY]")
 	}
 	if !imageFlags.memoryBytes.set {
 		imageFlags.memoryBytes = optionalInt64Flag{value: defaultComputerMemoryBytes, set: true}
@@ -423,7 +420,7 @@ func writeComputersTable(writer io.Writer, computers []computerOperatorProjectio
 			computer.ReconfigurationPhase, computer.CurrentJobID, valueOrNA(job.CurrentAttemptID),
 			valueOrNA(computer.BoundNodeID), int64PointerOrNA(computer.Capacity.RequestedMemoryBytes), computer.Capacity.RequestedDiskBytes, computer.BackupCap,
 			computer.Capacity.Admission.Status+"("+computer.Capacity.Admission.Code+")", boolOrNA(job.Ready), pointerOrNA(computer.DisplayEndpoint, ""),
-			computer.ControllerTenure.Status+"("+computer.ControllerTenure.Code+")",
+			computer.ControllerTenure,
 			jsonOrNA(job.LastFailure), valueOrNA(computer.RemovalOutcome), boolPointerOrNA(computer.MutationApplied),
 			boolPointerOrNA(computer.IdempotentReplay)); err != nil {
 			return err

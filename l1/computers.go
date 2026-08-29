@@ -114,10 +114,11 @@ type Computer struct {
 	RemovalOutcome          string                          `json:"removal_outcome,omitempty"`
 	// DisplayEndpoint remains explicitly null until an active private
 	// take-over front door has been published. It is never a placeholder URL.
-	DisplayEndpoint *string   `json:"display_endpoint"`
-	CurrentJob      Job       `json:"current_job"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	DisplayEndpoint  *string                             `json:"display_endpoint"`
+	ControllerTenure contract.ComputerControlTenureState `json:"controller_tenure"`
+	CurrentJob       Job                                 `json:"current_job"`
+	CreatedAt        time.Time                           `json:"created_at"`
+	UpdatedAt        time.Time                           `json:"updated_at"`
 }
 
 type CreateComputerRequest struct {
@@ -729,11 +730,62 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 		value := displayEndpoint.String
 		computer.DisplayEndpoint = &value
 	}
+	computer.ControllerTenure, err = readComputerControllerTenure(ctx, q, computerID, computer.CurrentJobID,
+		computer.CurrentJob.CurrentAttemptID, now)
+	if err != nil {
+		return Computer{}, fmt.Errorf("read Computer Controller tenure: %w", err)
+	}
 	if job.Spec.Execution.OCI == nil || job.Spec.Execution.OCI.Computer == nil || job.Spec.Execution.OCI.Computer.DiskBytes <= 0 {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest,
 			"Computer current Job has no explicit disk budget")
 	}
 	return computer, nil
+}
+
+func readComputerControllerTenure(ctx context.Context, q queryer, computerID, jobID, attemptID string, now time.Time) (contract.ComputerControlTenureState, error) {
+	if attemptID == "" {
+		return contract.ComputerControlTenureFree, nil
+	}
+	rows, err := q.QueryContext(ctx, `SELECT event_kind, session_id FROM computer_takeover_audit
+		WHERE computer_id=? AND job_id=? AND attempt_id=? AND stored_ns>=? ORDER BY rowid`,
+		computerID, jobID, attemptID, now.Add(-time.Hour).UnixNano())
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	active := map[string]bool{}
+	controller := ""
+	for rows.Next() {
+		var kind ComputerTakeoverAuditEventKind
+		var sessionID string
+		if err := rows.Scan(&kind, &sessionID); err != nil {
+			return "", err
+		}
+		switch kind {
+		case ComputerTakeoverSessionOpen:
+			active[sessionID] = true
+		case ComputerTakeoverSessionClose:
+			delete(active, sessionID)
+			if controller == sessionID {
+				controller = ""
+			}
+		case ComputerTakeoverControlAcquired, ComputerTakeoverAdminOverrode:
+			if active[sessionID] {
+				controller = sessionID
+			}
+		case ComputerTakeoverControlReleased:
+			if controller == sessionID {
+				controller = ""
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if controller != "" {
+		return contract.ComputerControlTenureHeld, nil
+	}
+	return contract.ComputerControlTenureFree, nil
 }
 
 func queryComputerIntents(ctx context.Context, q queryer, computerID string, afterRevision int64, limit int) ([]ComputerIntent, error) {

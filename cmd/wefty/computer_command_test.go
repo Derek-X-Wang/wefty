@@ -48,7 +48,7 @@ func TestComputerCLIRealRoutesDefaultsLifecycleAndReplay(t *testing.T) {
 	if created.MutationApplied == nil || !*created.MutationApplied || created.IdempotentReplay == nil || *created.IdempotentReplay {
 		t.Fatalf("creation mutation receipt = applied %v replay %v", created.MutationApplied, created.IdempotentReplay)
 	}
-	if created.DisplayEndpoint != nil || created.ControllerTenure.Status != "NOT-RUN" ||
+	if created.DisplayEndpoint != nil || created.ControllerTenure != contract.ComputerControlTenureFree ||
 		created.Capacity.Admission.Status != "NOT-RUN" {
 		t.Fatalf("unavailable projection facts were overstated: %#v", created)
 	}
@@ -307,6 +307,89 @@ func TestComputerCLIAbortRequiresDeadNodeAndReplays(t *testing.T) {
 	}
 }
 
+func TestComputerCLIRunningReconfigurationAndRemovalSupersession(t *testing.T) {
+	for _, verb := range []string{"reimage", "reset"} {
+		t.Run(verb, func(t *testing.T) {
+			harness, computer, _, _ := newRunningComputerCLIFixture(t, "running-"+verb)
+			args := []string{"services", verb, computer.CurrentJobID, "--expect-current", "--idempotency-key", "running-" + verb}
+			if verb == "reimage" {
+				args = append(args, "--image", "ghcr.io/example/running-v2@"+computerCLITestDigestB)
+			}
+			var stdout, stderr bytes.Buffer
+			err := execute(context.Background(), harness.clients, true, args, &stdout, &stderr)
+			var responseErr *apiResponseError
+			if !errors.As(err, &responseErr) || responseErr.APIError.Code != contract.ErrorConflict {
+				t.Fatalf("running %s without termination = %T %v", verb, err, err)
+			}
+			args = append(args, "--terminate-sessions")
+			output := runServiceCLI(t, context.Background(), harness.clients, true, args...)
+			var projected computerOperatorProjection
+			if err := json.Unmarshal(output, &projected); err != nil || projected.CurrentJob.State != contract.JobStopping ||
+				projected.MutationApplied == nil || !*projected.MutationApplied {
+				t.Fatalf("running %s projection = %#v err=%v", verb, projected, err)
+			}
+		})
+	}
+
+	t.Run("remove supersedes reset", func(t *testing.T) {
+		harness, created, _, _ := newRunningComputerCLIFixture(t, "superseded-reset")
+		resetBytes := runServiceCLI(t, context.Background(), harness.clients, true, "services", "reset", created.CurrentJobID,
+			"--expect-current", "--idempotency-key", "superseded-reset", "--terminate-sessions")
+		var resetting computerOperatorProjection
+		if err := json.Unmarshal(resetBytes, &resetting); err != nil || resetting.ReconfigurationPhase != l1.ComputerReconfigurationResetting {
+			t.Fatalf("resetting projection = %#v err=%v", resetting, err)
+		}
+		removedBytes := runServiceCLI(t, context.Background(), harness.clients, true, "services", "remove", resetting.CurrentJobID, "--expect-current")
+		var removed computerOperatorProjection
+		if err := json.Unmarshal(removedBytes, &removed); err != nil || removed.DesiredState != contract.ServiceDesiredRemoved ||
+			removed.ReconfigurationPhase != l1.ComputerReconfigurationRemoving || removed.MutationApplied == nil || !*removed.MutationApplied {
+			t.Fatalf("superseding removal = %#v err=%v", removed, err)
+		}
+	})
+}
+
+func TestComputerCLIInsufficientDiskLatchRequiresExplicitRestart(t *testing.T) {
+	harness, computer, node, claim := newRunningComputerCLIFixture(t, "insufficient-restart")
+	ctx := context.Background()
+	resizeBytes := runServiceCLI(t, ctx, harness.clients, true, "services", "resize", computer.CurrentJobID,
+		"--expect-current", "--disk-bytes", fmt.Sprint(computer.DesiredDiskBytes+(1<<30)), "--idempotency-key", "insufficient-resize")
+	var resizing computerOperatorProjection
+	if err := json.Unmarshal(resizeBytes, &resizing); err != nil {
+		t.Fatal(err)
+	}
+	directives, err := harness.store.ListNodeComputerStorageGrowDirectives(ctx, "fabric-"+node.NodeID, node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("grow directives = %#v err=%v", directives, err)
+	}
+	directive := directives[0]
+	receipt := l1.ComputerStorageGrowReceipt{
+		Kind: "computer_storage_grow_failed_unchanged", ReceiptID: "insufficient-receipt",
+		ComputerID: directive.ComputerID, StorageID: directive.StorageID, StorageGeneration: directive.StorageGeneration,
+		NodeID: directive.BoundNodeID, RootInstanceID: directive.RootInstanceID, JobID: directive.JobID,
+		OperationRevision: directive.OperationRevision, OperationFence: directive.OperationFence, HelperGeneration: 1,
+		OldDiskBytes: directive.OldDiskBytes, NewDiskBytes: directive.NewDiskBytes, Applied: false,
+		FailureCode: "insufficient_disk", ObservedAvailableBytes: 512 << 20,
+	}
+	failed, err := harness.store.AcknowledgeComputerStorageGrow(ctx, "fabric-"+node.NodeID, computer.ComputerID,
+		l1.ComputerStorageGrowAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failure contract.SpawnFailure
+	if failed.CurrentJob.State != contract.JobRunning || json.Unmarshal(failed.CurrentJob.LastFailure, &failure) != nil ||
+		failure.Code != contract.SpawnFailureInsufficientDisk || failed.CurrentJob.CurrentAttemptID != claim.Lease.AttemptID {
+		t.Fatalf("latched failure = %#v failure=%#v", failed, failure)
+	}
+	restartedBytes := runServiceCLI(t, ctx, harness.clients, true, "services", "restart", failed.CurrentJobID,
+		"--expect-current", "--idempotency-key", "insufficient-restart")
+	var restarted computerOperatorProjection
+	if err := json.Unmarshal(restartedBytes, &restarted); err != nil || restarted.CurrentJob.State != contract.JobStopping ||
+		len(restarted.CurrentJob.LastFailure) != 0 || restarted.MutationApplied == nil || !*restarted.MutationApplied {
+		t.Fatalf("explicit restart = %#v err=%v", restarted, err)
+	}
+}
+
 func TestComputerCLIExitCodesAreTyped(t *testing.T) {
 	tests := []struct {
 		name string
@@ -333,7 +416,7 @@ func TestComputerCLIUsageForeignIDAndRoutePaginationErrors(t *testing.T) {
 	harness := newServiceCLIHarness(t)
 	ctx := context.Background()
 
-	foreignArgs := []string{"services", "status", "computer-foreign"}
+	foreignArgs := []string{"services", "status", "computer_foreign"}
 	var stdout, stderr bytes.Buffer
 	err := execute(ctx, harness.clients, true, foreignArgs, &stdout, &stderr)
 	if err == nil || commandExitCodeForArgs(err, foreignArgs) != exitNotFound {
@@ -377,6 +460,47 @@ func TestComputerCLIUsageForeignIDAndRoutePaginationErrors(t *testing.T) {
 	if err == nil || commandExitCodeForArgs(err, plainArgs) != exitFailure {
 		t.Fatalf("pre-existing service exit changed = %T %v exit=%d", err, err, commandExitCodeForArgs(err, plainArgs))
 	}
+}
+
+func newRunningComputerCLIFixture(t *testing.T, name string) (*serviceCLIHarness, l1.Computer, l1.Node, *l1.Claim) {
+	t.Helper()
+	harness := newServiceCLIHarness(t)
+	harness.clients.images = &fakeImageResolver{digest: computerCLITestDigest}
+	ctx := context.Background()
+	nodeID := "computer-node"
+	node, err := harness.store.RegisterNode(ctx, fabric.Identity{NodeID: "fabric-" + nodeID}, contract.NodeRegistration{
+		NodeID: nodeID, BootSessionID: "boot-" + name, RootInstanceID: "root-" + name,
+		OS: "linux", Architecture: "amd64", AgentVersion: "computer-cli-test",
+		Capabilities: map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true}, CapabilityRevision: 1,
+		CapabilityObservedAt: time.Now().UTC(), MissingCapabilities: []string{},
+	}, l1.NodePolicy{Tags: []string{contract.StableNodeTagPrefix + nodeID}, MaxServiceSlots: 4}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := createComputerCLIProjection(t, ctx, harness.clients, name, name+"-create")
+	claim, err := harness.store.ClaimJob(ctx, "fabric-"+nodeID, nodeID, node.BootSessionID, contract.JobClassService)
+	if err != nil || claim == nil || claim.Job.JobID != created.CurrentJobID {
+		t.Fatalf("claim = %#v err=%v", claim, err)
+	}
+	platformDigest := computerCLITestDigestB
+	indexDigest := computerCLITestDigest
+	if _, err := harness.store.ObserveAttemptImage(ctx, "fabric-"+nodeID, claim.Job.JobID, claim.Lease.AttemptID, l1.ImageObservationRequest{
+		FencingToken: claim.Lease.FencingToken, SubmittedReference: "ghcr.io/example/" + name,
+		TopLevelDigest: computerCLITestDigest, TopLevelMediaType: "application/vnd.oci.image.index.v1+json",
+		IndexDigest: &indexDigest, PlatformManifestDigest: platformDigest,
+		Platform: l1.OCIPlatform{OS: "linux", Architecture: "amd64"}, RuntimeHandler: "io.containerd.runc.v2", Snapshotter: "overlayfs",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.store.StartAttempt(ctx, "fabric-"+nodeID, claim.Job.JobID, claim.Lease.AttemptID,
+		l1.StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
+		t.Fatal(err)
+	}
+	computer, err := harness.store.GetComputer(ctx, created.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return harness, computer, node, claim
 }
 
 func runComputerMutation(t *testing.T, ctx context.Context, clients *apiClients, verb string, computer l1.Computer, args ...string) computerOperatorProjection {

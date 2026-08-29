@@ -72,7 +72,8 @@ func isComputerCLIArgs(args []string) bool {
 	case "status", "start", "stop", "restart", "remove":
 		// These shared verbs return typed exits only when Computer-specific CAS
 		// flags identify the new authority surface. Plain Job behavior remains 1.
-		return strings.HasPrefix(positionals[len(positionals)-1], "computer-") || hasArg(args, "--expect-current") ||
+		target := positionals[len(positionals)-1]
+		return strings.HasPrefix(target, "computer_") || strings.HasPrefix(target, "computer-") || hasArg(args, "--expect-current") ||
 			hasArg(args, "--intent-revision") || hasArg(args, "--storage-id") || hasArg(args, "--storage-generation")
 	default:
 		return false
@@ -315,15 +316,22 @@ Commands:
   nodes list                 List node reachability, eligibility, and capacity
   nodes set-claims NODE_ID   Set durable claim eligibility with an observed revision
   services <verb>            Create and operate service-class jobs
-    create [--computer --name NAME --image IMAGE --node NODE_ID --disk-bytes BYTES --backup-cap COUNT]
+    create [--computer --name NAME --image IMAGE --node NODE_ID --argv ARG --working-directory PATH --mount SPEC --memory-bytes BYTES --cpu-millicores VALUE --runtime-handler NAME --disk-bytes BYTES --backup-cap COUNT --idempotency-key KEY]
     list [--limit COUNT --cursor CURSOR]
-    status|start|stop|restart|logs|remove|forget
-    reimage|reset|resize|abort
+    status JOB_ID|COMPUTER_ID
+    start|stop COMPUTER [--intent-revision REV --storage-id ID --storage-generation GENERATION | --expect-current]
+    restart COMPUTER --idempotency-key KEY [CAS flags | --expect-current]
+    remove COMPUTER [CAS flags | --expect-current]
+    reimage COMPUTER --image IMAGE --idempotency-key KEY [--chown --terminate-sessions] [CAS flags | --expect-current]
+    reset COMPUTER --idempotency-key KEY [--terminate-sessions] [CAS flags | --expect-current]
+    resize COMPUTER --disk-bytes BYTES --idempotency-key KEY [CAS flags | --expect-current]
+    abort COMPUTER --idempotency-key KEY [CAS flags | --expect-current]
+    logs|forget JOB_ID
     grants|grant|revoke|takeover
   services submission <verb>
                              Enable, disable, or set Computer Run submission inflight capacity
-    enable|disable|set-inflight
-                             Requires observed policy and submission revisions, or --expect-current
+    enable|disable COMPUTER [--policy-revision REV --submit-intent-revision REV | --expect-current] [--idempotency-key KEY]
+    set-inflight COMPUTER --max-inflight COUNT [--policy-revision REV --submit-intent-revision REV | --expect-current] [--idempotency-key KEY]
   runs list                  List Runs by immutable Computer origin
     grants|grant|revoke      List or mutate Computer person grants
     takeover view COMPUTER --session-token-file FILE
