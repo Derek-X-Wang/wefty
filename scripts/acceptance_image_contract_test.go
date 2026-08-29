@@ -286,7 +286,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch", "GET /websockify", "Sec-WebSocket-Protocol: binary", "WS_OPCODE_TEXT", "wefty_mutation_hooks", "view-edge-ready", "control-edge-ready")
 	assertFileNotContains(t, "../examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch", "WEFTY_WAYVNC_RECORD_INPUT", "native-input-events")
 	assertFileContains(t, "../examples/computer-wayland/surface.py", "input-oracle.json", "def wefty_record_input", "Record only events delivered through Sway", `"wev"`, "wl_keyboard", `"swaymsg"`, "focus_keyboard_oracle", `self.path not in ("/surface-ready", "/input")`, "agent-state-surface.json", "theme-surface.json", "os.replace")
-	assertFileContains(t, "../examples/computer-wayland/oracle.html", "pointermove", "'/input'", "'/surface-ready'")
+	assertFileContains(t, "../examples/computer-wayland/oracle.html", "pointermove", "window.outerHeight - window.innerHeight", "'/input'", "'/surface-ready'")
 	assertFileNotContains(t, "../examples/computer-wayland/oracle.html", "keydown", "keyup")
 	assertFileContains(t, "../examples/computer-wayland/sway-config", `title="^Wefty Wayland Computer$"`, "border none", "fullscreen enable", `app_id="wev"`, "opacity set 0.0", "floating enable", "resize set width 32 px height 32 px", "focus")
 	assertFileContains(t, "../examples/computer-wayland/LICENSES.md", "Herdr", "Apache-2.0", "no code or assets copied", "no code, assets, installer, name, or branding copied")
