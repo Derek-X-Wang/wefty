@@ -39,6 +39,7 @@ func TestWriteErrorPublishesTruthfulRetryability(t *testing.T) {
 		{name: "final admin", err: protocolError(contract.ErrorFinalAdmin, "final admin"), wantStatus: http.StatusConflict, wantCode: contract.ErrorFinalAdmin},
 		{name: "Computer storage changed", err: protocolError(contract.ErrorStorageReferenceConflict, "storage changed"), wantStatus: http.StatusConflict, wantCode: contract.ErrorStorageReferenceConflict},
 		{name: "Computer resource required", err: protocolError(contract.ErrorComputerResourceRequired, "Computer resource required"), wantStatus: http.StatusConflict, wantCode: contract.ErrorComputerResourceRequired},
+		{name: "Computer trait required", err: protocolError(contract.ErrorComputerTraitRequired, "Computer trait required"), wantStatus: http.StatusConflict, wantCode: contract.ErrorComputerTraitRequired},
 		{name: "capacity exhausted", err: protocolErrorWithDetails(contract.ErrorCapacityExhausted, map[string]any{"node_id": "node-1", "occupancy": 2, "capacity": 2}, "full"), wantStatus: http.StatusConflict, wantCode: contract.ErrorCapacityExhausted, wantRetryable: true},
 	}
 

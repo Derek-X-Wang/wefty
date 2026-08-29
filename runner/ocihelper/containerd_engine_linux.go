@@ -117,6 +117,8 @@ type ContainerdEngine struct {
 	storageCopyHook           func(computerStorageCopyPhase) error
 	storageCopyFinalize       func(context.Context, string, string, string, int64, bool) (computerStorageCopyFacts, error)
 	computerDiskHook          func(computerDiskCheckpoint) error
+	computerGrowHook          func(string) error
+	computerGrowResize        func(context.Context, string, string, int64, int64) error
 	lastProfile               *ProfileReceipt
 	capacityMu                sync.Mutex
 	capacityReservations      map[string]*capacityReservation
@@ -965,7 +967,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 				}
 			}
 			if computerDisk != nil {
-				if ownerErr = initializeComputerDiskRoot(computerDisk, uid, gid); ownerErr != nil {
+				if ownerErr = initializeComputerDiskRoot(computerDisk, uid, gid, computerDisk.storage.Chown); ownerErr != nil {
 					closeErr := document.Close()
 					document = nil
 					return errors.Join(ownerErr, closeErr)

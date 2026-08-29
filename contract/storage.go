@@ -19,6 +19,28 @@ type ComputerStorageResetReceipt struct {
 	HelperGeneration uint64 `json:"helper_generation"`
 }
 
+// ComputerStorageGrowReceipt is assertion-derived evidence that the exact
+// current generation either reached its fully allocated target size or was
+// left at the old size after an atomic capacity refusal.
+type ComputerStorageGrowReceipt struct {
+	Kind                   string `json:"kind"`
+	ReceiptID              string `json:"receipt_id"`
+	ComputerID             string `json:"computer_id"`
+	StorageID              string `json:"storage_id"`
+	StorageGeneration      int64  `json:"storage_generation"`
+	NodeID                 string `json:"node_id"`
+	RootInstanceID         string `json:"root_instance_id"`
+	JobID                  string `json:"job_id"`
+	OperationRevision      int64  `json:"operation_revision"`
+	OperationFence         string `json:"operation_fence"`
+	HelperGeneration       uint64 `json:"helper_generation"`
+	OldDiskBytes           int64  `json:"old_disk_bytes"`
+	NewDiskBytes           int64  `json:"new_disk_bytes"`
+	Applied                bool   `json:"applied"`
+	FailureCode            string `json:"failure_code,omitempty"`
+	ObservedAvailableBytes int64  `json:"observed_available_bytes,omitempty"`
+}
+
 // ComputerBackupCopyReceipt is assertion-derived helper evidence for one
 // planned source-node copy. Failure receipts are accepted only when CopyAbsent
 // proves the helper removed every staging and published byte for that copy.

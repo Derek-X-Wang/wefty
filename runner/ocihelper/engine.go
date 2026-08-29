@@ -61,6 +61,10 @@ type ComputerStorageResetEngine interface {
 	ResetComputerStorage(context.Context, ResetComputerStorageRequest) (ResetComputerStorageResponse, error)
 }
 
+type ComputerStorageGrowEngine interface {
+	GrowComputerStorage(context.Context, GrowComputerStorageRequest) (GrowComputerStorageResponse, error)
+}
+
 type ComputerBackupEngine interface {
 	CreateComputerBackup(context.Context, CreateComputerBackupRequest) (CreateComputerBackupResponse, error)
 	DeleteComputerBackupCopy(context.Context, DeleteComputerBackupCopyRequest) (DeleteComputerBackupCopyResponse, error)

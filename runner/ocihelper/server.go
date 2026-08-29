@@ -1222,6 +1222,28 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		operation.monitorEOF()
 		response, err := engine.ResetComputerStorage(operation.ctx, body)
 		_ = writeEngineResponse(wire, response, err)
+	case MethodGrowStorage:
+		var body GrowComputerStorageRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if body.Authority.NodeID != session.identity.NodeID || body.Authority.BootSessionID != session.identity.BootSessionID ||
+			body.Authority.NodeID == "" || body.Authority.HelperGeneration != session.helper.SessionGeneration ||
+			body.Authority.HelperGeneration == 0 || body.Authority.RootInstanceID == "" || body.Authority.JobID == "" ||
+			body.Authority.OperationRevision < 1 || body.Authority.OperationFence == "" || body.Storage.ComputerID == "" ||
+			body.Storage.StorageID == "" || body.Storage.StorageGeneration < 1 || body.Storage.DiskBytes <= 0 ||
+			body.Storage.IntentRevision != body.Authority.OperationRevision || body.NewDiskBytes <= body.Storage.DiskBytes {
+			_ = writeFailure(wire, CodeInvalidRequest, "complete current-session grow-only Computer Storage authority is required")
+			return
+		}
+		engine, ok := server.engine.(ComputerStorageGrowEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "Computer Storage grow is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.GrowComputerStorage(operation.ctx, body)
+		_ = writeEngineResponse(wire, response, err)
 	case MethodCreateBackup:
 		var body CreateComputerBackupRequest
 		if !decodeRequest(wire, request.Body, &body) {

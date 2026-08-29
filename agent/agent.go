@@ -240,6 +240,7 @@ func New(config Config) (*Agent, error) {
 	var managedVolumeFinalizer workloadrunner.ManagedVolumeFinalizer
 	var ociRemovalProof workloadrunner.RuntimeRemovalProofRuntime
 	var computerStorageResetter workloadrunner.ComputerStorageResetter
+	var computerStorageGrower workloadrunner.ComputerStorageGrower
 	var computerBackupper workloadrunner.ComputerBackupper
 	var computerStorageCopier workloadrunner.ComputerStorageCopier
 	if runtimeAdapter, configured := runtimes.selectKind(contract.JobKindOCI); configured {
@@ -252,6 +253,7 @@ func New(config Config) (*Agent, error) {
 			ociRemovalProof = proofRuntime
 		}
 		computerStorageResetter, _ = runtimeAdapter.(workloadrunner.ComputerStorageResetter)
+		computerStorageGrower, _ = runtimeAdapter.(workloadrunner.ComputerStorageGrower)
 		computerBackupper, _ = runtimeAdapter.(workloadrunner.ComputerBackupper)
 		computerStorageCopier, _ = runtimeAdapter.(workloadrunner.ComputerStorageCopier)
 	}
@@ -321,6 +323,8 @@ func New(config Config) (*Agent, error) {
 		session.storageResets.finalizeVolumes = session.removals.finalizeVolumes
 		session.storageResets.attestRuntimeRemoval = session.removals.attestRuntimeRemoval
 	}
+	session.storageGrows = newStorageGrowController(client, computerStorageGrower, config.NodeID,
+		config.BootSessionID, registration.RootInstanceID, logf)
 	session.backups = newBackupController(client, computerBackupper, config.NodeID, config.BootSessionID,
 		registration.RootInstanceID, logf)
 	if session.backups != nil {

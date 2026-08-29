@@ -196,6 +196,7 @@ heartbeats.
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. After separate stable service-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
 | `CopyComputerStorage` | Session-authorized exact restore or clone operation, published Backup/copy source, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. Under the Backup mutex it revalidates source size and digest before destination publication and fully allocates the destination. Restore preserves bytes exactly; clone narrowly rekeys machine ID and SSH host keys, never browser profile data, and expands a larger filesystem. Its receipt binds every authority and observed size/digest; it does not attach or start the Computer. |
+| `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend, and only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
@@ -571,6 +572,17 @@ the agent uses shared deterministic removal resource classes for the old disk,
 legacy reset manifest, and quarantine root; `AttestRemoval` returns only
 assertions that were actually inventoried absent. A later helper session may
 replay that receipt but cannot restamp it with a newer generation.
+
+`GrowComputerStorage` binds its receipt to Computer, Storage generation, Node,
+managed-root instance, Job, operation revision and fence, helper generation,
+and both byte counts. Grow serializes with reset, Backup, attach, detach, and
+removal. Its crash boundaries are capacity reservation, filesystem expansion,
+and manifest publication; retry inspects durable image and manifest facts and
+never reports applied before full allocation plus filesystem expansion. The
+capacity decision includes unmaterialized admitted reservations under the same
+lock, so existing workloads retain their reservations and the newcomer pays.
+An insufficient-capacity receipt is valid only before bytes change.
+
 Computer removal carries the same exact Storage identity plus current node,
 boot, Job, removal-generation, and cleanup-fence authority to the helper. The
 helper requires a matching detached receipt, verifies mount and loop absence,

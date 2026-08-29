@@ -214,6 +214,12 @@ func (c *Client) AcknowledgeComputerStorageReset(ctx context.Context, computerID
 	return computer, err
 }
 
+func (c *Client) AcknowledgeComputerStorageGrow(ctx context.Context, computerID string, request l1.ComputerStorageGrowAcknowledgementRequest) (l1.Computer, error) {
+	var computer l1.Computer
+	err := c.post(ctx, "/v1/agent/computers/"+url.PathEscape(computerID)+"/storage-grow-acknowledgement", request, &computer)
+	return computer, err
+}
+
 func (c *Client) AcknowledgeComputerStorageRetirement(ctx context.Context, computerID string, request l1.RemovalAcknowledgementRequest) (l1.Computer, error) {
 	var computer l1.Computer
 	err := c.post(ctx, "/v1/agent/computers/"+url.PathEscape(computerID)+"/storage-retirement-acknowledgement", request, &computer)

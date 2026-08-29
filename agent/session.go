@@ -71,6 +71,7 @@ type agentSession struct {
 	reapPriorBoot   func(context.Context, string) (workloadrunner.ReapReceipt, error)
 	removals        *removalController
 	storageResets   *storageResetController
+	storageGrows    *storageGrowController
 	backups         *backupController
 	storageCopies   *storageCopyController
 	computerPolicy  *ComputerPolicyCache
@@ -206,6 +207,7 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	// once registration authority and its restrictive N+1 are published.
 	removalErr := errors.Join(session.resumePendingRemovals(ctx), session.processRemovalDirectives(ctx, registrationHeartbeat.RemovalDirectives),
 		session.processStorageResetDirectives(ctx, registrationHeartbeat.StorageResetDirectives),
+		session.processStorageGrowDirectives(ctx, registrationHeartbeat.StorageGrowDirectives),
 		session.processBackupDirectives(ctx, registrationHeartbeat.BackupDirectives),
 		session.processBackupPruneDirectives(ctx, registrationHeartbeat.BackupPruneDirectives),
 		session.processStorageCopyDirectives(ctx, registrationHeartbeat.StorageCopyDirectives))
@@ -269,6 +271,19 @@ func (session *agentSession) processStorageResetDirectives(ctx context.Context, 
 	for _, directive := range directives {
 		if err := session.storageResets.process(ctx, directive); err != nil {
 			failures = append(failures, fmt.Errorf("reconcile Computer Storage reset %q: %w", directive.ComputerID, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (session *agentSession) processStorageGrowDirectives(ctx context.Context, directives []l1.ComputerStorageGrowDirective) error {
+	if session.storageGrows == nil {
+		return nil
+	}
+	var failures []error
+	for _, directive := range directives {
+		if err := session.storageGrows.process(ctx, directive); err != nil {
+			failures = append(failures, fmt.Errorf("reconcile Computer Storage grow %q: %w", directive.ComputerID, err))
 		}
 	}
 	return errors.Join(failures...)
@@ -422,6 +437,7 @@ func (session *agentSession) recoverOCIRuntimeLocked(ctx context.Context) (ocihe
 	removalErr := errors.Join(session.resumePendingRemovals(ctx),
 		session.processRemovalDirectives(ctx, restrictiveResponse.RemovalDirectives),
 		session.processStorageResetDirectives(ctx, restrictiveResponse.StorageResetDirectives),
+		session.processStorageGrowDirectives(ctx, restrictiveResponse.StorageGrowDirectives),
 		session.processBackupDirectives(ctx, restrictiveResponse.BackupDirectives),
 		session.processBackupPruneDirectives(ctx, restrictiveResponse.BackupPruneDirectives),
 		session.processStorageCopyDirectives(ctx, restrictiveResponse.StorageCopyDirectives))
@@ -555,6 +571,9 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 		}
 		if session.storageCopies != nil {
 			session.storageCopies.wait()
+		}
+		if session.storageGrows != nil {
+			session.storageGrows.wait()
 		}
 	}()
 
@@ -1057,6 +1076,11 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			if session.storageResets != nil {
 				for _, directive := range response.StorageResetDirectives {
 					session.storageResets.enqueue(ctx, directive, failures)
+				}
+			}
+			if session.storageGrows != nil {
+				for _, directive := range response.StorageGrowDirectives {
+					session.storageGrows.enqueue(ctx, directive, failures)
 				}
 			}
 			if session.backups != nil {

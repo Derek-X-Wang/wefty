@@ -96,6 +96,9 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 		"/v1/computers/{computer_id}/desired-state",
 		"/v1/computers/{computer_id}/backup-cap",
 		"/v1/computers/{computer_id}/restart",
+		"/v1/computers/{computer_id}/reimage",
+		"/v1/computers/{computer_id}/grow",
+		"/v1/computers/{computer_id}/reconfiguration-abort",
 		"/v1/computers/{computer_id}/storage-reset",
 		"/v1/computers/{computer_id}/storage-generations",
 		"/v1/computers/{computer_id}/backups",
@@ -665,7 +668,7 @@ func TestAgentClaimCarriesExactComputerStorageIdentity(t *testing.T) {
 	properties := object(t, schema["properties"], "claim properties")
 	storage := object(t, properties["computer_storage"], "Computer Storage")
 	required := stringSet(t, storage["required"])
-	if !required["computer_id"] || !required["storage_id"] || !required["storage_generation"] || !required["intent_revision"] || len(required) != 4 {
+	if !required["computer_id"] || !required["storage_id"] || !required["storage_generation"] || !required["intent_revision"] || !required["disk_bytes"] {
 		t.Fatalf("Computer Storage required members = %#v", required)
 	}
 }
@@ -691,6 +694,12 @@ func TestAgentPublishesComputerStorageResetReceiptSurface(t *testing.T) {
 	required := stringSet(t, channel["required"])
 	if !required["storage_reset_directives"] {
 		t.Fatal("heartbeat does not require the standing Storage reset directive channel")
+	}
+	if !required["storage_grow_directives"] {
+		t.Fatal("heartbeat does not require the standing Storage grow directive channel")
+	}
+	if _, present := paths["/v1/agent/computers/{computer_id}/storage-grow-acknowledgement"]; !present {
+		t.Fatal("agent protocol is missing Computer Storage grow acknowledgement")
 	}
 	directive := object(t, schemas["ComputerStorageResetDirective"], "ComputerStorageResetDirective")
 	directiveRequired := stringSet(t, directive["required"])

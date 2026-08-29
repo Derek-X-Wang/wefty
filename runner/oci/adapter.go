@@ -399,6 +399,7 @@ func (adapter *Adapter) AttestRuntimeRemoval(ctx context.Context, request worklo
 			computerStorage = &ocihelper.ComputerStorageReference{
 				ComputerID: attempt.ComputerStorage.ComputerID, StorageID: attempt.ComputerStorage.StorageID,
 				StorageGeneration: attempt.ComputerStorage.StorageGeneration, DiskBytes: attempt.ComputerStorage.DiskBytes,
+				Chown: attempt.ComputerStorage.Chown,
 			}
 		}
 		helperAttempts = append(helperAttempts, ocihelper.RemovalAttemptManifest{
@@ -453,6 +454,7 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 		computerStorage = &ocihelper.ComputerStorageReference{
 			ComputerID: request.ComputerStorage.ComputerID, StorageID: request.ComputerStorage.StorageID,
 			StorageGeneration: request.ComputerStorage.StorageGeneration, DiskBytes: request.ComputerStorage.DiskBytes,
+			Chown: request.ComputerStorage.Chown,
 		}
 	}
 	response, err := session.InventoryRemoval(ctx, ocihelper.InventoryRemovalRequest{
@@ -1718,6 +1720,35 @@ func (adapter *Adapter) ResetComputerStorage(ctx context.Context, request worklo
 		NodeID: response.Receipt.NodeID, RootInstanceID: response.Receipt.RootInstanceID,
 		JobID: response.Receipt.JobID, IntentRevision: response.Receipt.IntentRevision,
 		CleanupFence: response.Receipt.CleanupFence, HelperGeneration: response.Receipt.HelperGeneration}, nil
+}
+
+func (adapter *Adapter) GrowComputerStorage(ctx context.Context, request workloadrunner.ComputerStorageGrowRequest) (workloadrunner.ComputerStorageGrowReceipt, error) {
+	if adapter == nil || adapter.sessions == nil {
+		return workloadrunner.ComputerStorageGrowReceipt{}, errors.New("OCI helper session is not configured")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		return workloadrunner.ComputerStorageGrowReceipt{}, err
+	}
+	handshake := session.Handshake()
+	response, err := session.GrowComputerStorage(ctx, ocihelper.GrowComputerStorageRequest{
+		Storage: ocihelper.ComputerStorageReference{ComputerID: request.Storage.ComputerID,
+			StorageID: request.Storage.StorageID, StorageGeneration: request.Storage.StorageGeneration,
+			IntentRevision: request.Storage.IntentRevision, DiskBytes: request.Storage.DiskBytes},
+		NewDiskBytes: request.NewDiskBytes,
+		Authority: ocihelper.ComputerStorageGrowAuthority{NodeID: request.NodeID,
+			BootSessionID: request.BootSessionID, HelperGeneration: handshake.SessionGeneration,
+			RootInstanceID: request.RootInstanceID, JobID: request.JobID,
+			OperationRevision: request.OperationRevision, OperationFence: request.OperationFence},
+	})
+	if err != nil {
+		return workloadrunner.ComputerStorageGrowReceipt{}, err
+	}
+	if response.Receipt.ReceiptID == "" || response.Receipt.HelperGeneration == 0 ||
+		(response.Receipt.Kind != "computer_storage_grow_applied" && response.Receipt.Kind != "computer_storage_grow_failed_unchanged") {
+		return workloadrunner.ComputerStorageGrowReceipt{}, errors.New("OCI helper did not return assertion-derived Computer grow evidence")
+	}
+	return response.Receipt, nil
 }
 
 func (adapter *Adapter) CreateComputerBackup(ctx context.Context, request workloadrunner.ComputerBackupRequest) (workloadrunner.ComputerBackupCopyReceipt, error) {

@@ -33,6 +33,9 @@ const (
 	ComputerIntentBackupCap    ComputerIntentOperation = "backup_cap"
 	ComputerIntentRestore      ComputerIntentOperation = "restore"
 	ComputerIntentClone        ComputerIntentOperation = "clone"
+	ComputerIntentReimage      ComputerIntentOperation = "reimage"
+	ComputerIntentGrow         ComputerIntentOperation = "grow"
+	ComputerIntentAbort        ComputerIntentOperation = "abort"
 )
 
 type ComputerGrantPermission string
@@ -53,6 +56,8 @@ const (
 	ComputerReconfigurationBackingUp  ComputerReconfigurationPhase = "backing_up"
 	ComputerReconfigurationRestoring  ComputerReconfigurationPhase = "restoring"
 	ComputerReconfigurationCloning    ComputerReconfigurationPhase = "cloning"
+	ComputerReconfigurationReimaging  ComputerReconfigurationPhase = "reimaging"
+	ComputerReconfigurationGrowing    ComputerReconfigurationPhase = "growing"
 )
 
 type ComputerGrant struct {
@@ -141,6 +146,28 @@ type ComputerRemoveRequest struct {
 type ComputerProjectionRequest struct {
 	ComputerMutationPrecondition
 	Spec contract.JobSpec `json:"spec"`
+}
+
+// ComputerReimageRequest changes only the tenant image of the current
+// immutable projection. Identity, placement, grants, and Storage generation
+// remain owned by the Computer.
+type ComputerReimageRequest struct {
+	ComputerMutationPrecondition
+	Image             contract.OCIImageSpec `json:"image"`
+	Chown             bool                  `json:"chown,omitempty"`
+	TerminateSessions bool                  `json:"terminate_sessions,omitempty"`
+	IdempotencyKey    string                `json:"idempotency_key"`
+}
+
+type ComputerGrowRequest struct {
+	ComputerMutationPrecondition
+	DiskBytes      int64  `json:"disk_bytes"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+type ComputerReconfigurationAbortRequest struct {
+	ComputerMutationPrecondition
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 type ComputerRestartRequest struct {
@@ -304,11 +331,11 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	storageID := newID("storage")
 	grantsJSON := []byte("[]")
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computers(
-		computer_id, name, placement_node_id, grants_json, storage_id, storage_generation, backup_cap,
+		computer_id, name, placement_node_id, grants_json, storage_id, storage_generation, desired_disk_bytes, backup_cap,
 		desired_state, intent_revision, applied_revision, current_job_id, current_spec_revision,
 		reconfiguration_phase, created_ns, updated_ns
-	) VALUES(?, ?, ?, ?, ?, 1, ?, ?, 1, 1, ?, 1, ?, ?, ?)`,
-		computerID, request.Name, placementNodeID, grantsJSON, storageID, backupCap,
+	) VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?, 1, 1, ?, 1, ?, ?, ?)`,
+		computerID, request.Name, placementNodeID, grantsJSON, storageID, request.Spec.Execution.OCI.Computer.DiskBytes, backupCap,
 		contract.ServiceDesiredRunning, job.JobID, ComputerReconfigurationStable,
 		now.UnixNano(), now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "store Computer")
@@ -459,13 +486,13 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	var reconfigurationRevision sql.NullInt64
 	var createdNS, updatedNS int64
 	err := q.QueryRowContext(ctx, `SELECT computer_id, name, placement_node_id, bound_node_id,
-		grants_json, storage_id, storage_generation, backup_cap, desired_state, intent_revision,
+		grants_json, storage_id, storage_generation, desired_disk_bytes, backup_cap, desired_state, intent_revision,
 		applied_revision, current_job_id, current_spec_revision, reconfiguration_phase,
 		reconfiguration_revision, submit_enabled, submit_intent_revision, submit_max_inflight,
 		submit_policy_revision, removal_outcome, created_ns, updated_ns
 		FROM computers WHERE computer_id=?`, computerID).Scan(
 		&computer.ComputerID, &computer.Name, &computer.PlacementNodeID, &boundNodeID,
-		&grantsJSON, &computer.StorageID, &computer.StorageGeneration, &computer.BackupCap, &computer.DesiredState,
+		&grantsJSON, &computer.StorageID, &computer.StorageGeneration, &computer.DesiredDiskBytes, &computer.BackupCap, &computer.DesiredState,
 		&computer.IntentRevision, &computer.AppliedRevision, &computer.CurrentJobID,
 		&computer.CurrentSpecRevision, &computer.ReconfigurationPhase,
 		&reconfigurationRevision, &computer.SubmitEnabled, &computer.SubmitIntentRevision,
@@ -527,7 +554,6 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 		return Computer{}, protocolError(contract.ErrorInvalidRequest,
 			"Computer current Job has no explicit disk budget")
 	}
-	computer.DesiredDiskBytes = job.Spec.Execution.OCI.Computer.DiskBytes
 	return computer, nil
 }
 
@@ -993,7 +1019,9 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 		computer.ReconfigurationPhase != ComputerReconfigurationResetting &&
 		computer.ReconfigurationPhase != ComputerReconfigurationBackingUp &&
 		computer.ReconfigurationPhase != ComputerReconfigurationRestoring &&
-		computer.ReconfigurationPhase != ComputerReconfigurationCloning {
+		computer.ReconfigurationPhase != ComputerReconfigurationCloning &&
+		computer.ReconfigurationPhase != ComputerReconfigurationReimaging &&
+		computer.ReconfigurationPhase != ComputerReconfigurationGrowing {
 		return Computer{}, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
 	}
@@ -1020,6 +1048,25 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded'
 		WHERE source_computer_id=? AND operation='clone' AND status IN ('reserved', 'prepared')`, computerID); err != nil {
 		return Computer{}, internalError(err, "supersede clone custody forks sourced by removed Computer")
+	}
+	if computer.ReconfigurationPhase == ComputerReconfigurationGrowing {
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_grows SET status='superseded'
+			WHERE computer_id=? AND status='planned'`, computerID); err != nil {
+			return Computer{}, internalError(err, "supersede Computer Storage grow for removal")
+		}
+	}
+	if computer.ReconfigurationPhase == ComputerReconfigurationReimaging {
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_job_projections SET retired_ns=?, chown=0
+			WHERE computer_id=? AND current=0 AND retired_ns IS NULL`, now.UnixNano(), computerID); err != nil {
+			return Computer{}, internalError(err, "retire staged Computer reimage for removal")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET desired_state=?, bound_node_id=NULL,
+			published_attempt_id=NULL, healthy_since_ns=NULL, next_restart_at=NULL
+			WHERE job_id IN (SELECT job_id FROM computer_job_projections
+				WHERE computer_id=? AND current=0 AND retired_ns=?)`, contract.ServiceDesiredStopped,
+			computerID, now.UnixNano()); err != nil {
+			return Computer{}, internalError(err, "withdraw staged Computer reimage for removal")
+		}
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET desired_state=?, intent_revision=?, removal_outcome='removal_pending',
 		reconfiguration_phase=?, reconfiguration_revision=?, updated_ns=?
@@ -1181,6 +1228,69 @@ func scrubComputerControllerState(ctx context.Context, tx *sql.Tx, computerID st
 // caller may repeat the same request while phase=projecting to finish after the
 // agent has positively reaped an active attempt.
 func (s *Store) InstallComputerProjection(ctx context.Context, computerID string, request ComputerProjectionRequest) (Computer, error) {
+	return s.installComputerProjection(ctx, computerID, request, ComputerIntentProject,
+		ComputerReconfigurationProjecting, false)
+}
+
+// ReimageComputer is the typed Computer-only image-replacement seam. It
+// deliberately derives the next immutable Job from the current projection so
+// a reimage cannot smuggle in placement, storage-budget, environment, or
+// lifecycle changes.
+func (s *Store) ReimageComputer(ctx context.Context, computerID string, request ComputerReimageRequest) (Computer, error) {
+	request.Actor = strings.TrimSpace(request.Actor)
+	request.IdempotencyKey = strings.TrimSpace(request.IdempotencyKey)
+	if request.IdempotencyKey == "" {
+		return Computer{}, protocolError(contract.ErrorInvalidRequest, "idempotency_key is required")
+	}
+	computer, err := s.GetComputer(ctx, computerID)
+	if err != nil {
+		return Computer{}, err
+	}
+	if computer.CurrentJob.Spec.Execution.OCI == nil || computer.CurrentJob.Spec.Execution.OCI.Computer == nil {
+		return Computer{}, protocolError(contract.ErrorComputerTraitRequired, "Computer reimage requires the computer trait")
+	}
+	if request.Image.Digest == nil || strings.TrimSpace(*request.Image.Digest) == "" {
+		return Computer{}, protocolError(contract.ErrorInvalidRequest, "Computer reimage target must be digest pinned")
+	}
+	reimagePayload, err := json.Marshal(request)
+	if err != nil {
+		return Computer{}, internalError(err, "encode Computer reimage request")
+	}
+	dispatchHash := sha256.Sum256(append([]byte(computerID+"\x00"+request.Actor+"\x00"), reimagePayload...))
+	dispatchKey := "computer-reimage:" + hex.EncodeToString(dispatchHash[:])
+	if computer.CurrentJob.Spec.Execution.OCI.Image.Digest != nil &&
+		*computer.CurrentJob.Spec.Execution.OCI.Image.Digest == *request.Image.Digest &&
+		computer.CurrentJob.Spec.Execution.OCI.Image.Reference == request.Image.Reference {
+		if computer.CurrentJob.Spec.DispatchKey == dispatchKey {
+			return computer, nil
+		}
+		return Computer{}, protocolError(contract.ErrorConflict, "Computer reimage target is already current")
+	}
+	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+		// A retry while the same reimage is quiescing observes the preceding
+		// revision. The projection validator performs the exact replay check.
+		if computer.ReconfigurationPhase != ComputerReconfigurationReimaging ||
+			request.IntentRevision != computer.IntentRevision-1 {
+			return Computer{}, err
+		}
+	}
+	if (computer.CurrentJob.State == contract.JobClaimed || computer.CurrentJob.State == contract.JobRunning ||
+		computer.CurrentJob.State == contract.JobStopping) && !request.TerminateSessions {
+		return Computer{}, protocolError(contract.ErrorConflict,
+			"running Computer reimage requires explicit take-over session termination")
+	}
+	nextSpec := computer.CurrentJob.Spec
+	nextOCI := *nextSpec.Execution.OCI
+	nextOCI.Image = request.Image
+	nextSpec.Execution.OCI = &nextOCI
+	nextSpec.DispatchKey = dispatchKey
+	projection := ComputerProjectionRequest{ComputerMutationPrecondition: request.ComputerMutationPrecondition, Spec: nextSpec}
+	return s.installComputerProjection(ctx, computerID, projection, ComputerIntentReimage,
+		ComputerReconfigurationReimaging, request.Chown)
+}
+
+func (s *Store) installComputerProjection(ctx context.Context, computerID string, request ComputerProjectionRequest,
+	operation ComputerIntentOperation, phase ComputerReconfigurationPhase, chown bool) (Computer, error) {
 	request.Spec.RoutingTags = NormalizeTags(request.Spec.RoutingTags)
 	if err := validateJobSpec(&request.Spec); err != nil {
 		return Computer{}, err
@@ -1217,14 +1327,14 @@ func (s *Store) InstallComputerProjection(ctx context.Context, computerID string
 		return Computer{}, protocolError(contract.ErrorConflict,
 			"Computer disk budget cannot change during projection replacement")
 	}
-	if computer.ReconfigurationPhase == ComputerReconfigurationProjecting {
-		if err := validatePendingComputerProjection(ctx, tx, computer, request, requestHash); err != nil {
+	if computer.ReconfigurationPhase == phase {
+		if err := validatePendingComputerProjection(ctx, tx, computer, request, requestHash, chown); err != nil {
 			return Computer{}, err
 		}
 		if computer.CurrentJob.State != contract.JobStopped {
 			return computer, nil
 		}
-		if err := finalizeComputerProjectionTx(ctx, tx, computer, now); err != nil {
+		if err := finalizeComputerProjectionTx(ctx, tx, computer, phase, now); err != nil {
 			return Computer{}, err
 		}
 		updated, err := readComputerAuthority(ctx, tx, computerID, now)
@@ -1262,21 +1372,21 @@ func (s *Store) InstallComputerProjection(ctx context.Context, computerID string
 	}
 	nextSpecRevision := computer.CurrentSpecRevision + 1
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_job_projections(
-		computer_id, job_id, spec_revision, current, created_ns
-	) VALUES(?, ?, ?, 0, ?)`, computerID, job.JobID, nextSpecRevision, now.UnixNano()); err != nil {
+		computer_id, job_id, spec_revision, current, chown, created_ns
+	) VALUES(?, ?, ?, 0, ?, ?)`, computerID, job.JobID, nextSpecRevision, chown, now.UnixNano()); err != nil {
 		return Computer{}, internalError(err, "store staging Computer Job projection")
 	}
 	nextRevision := computer.IntentRevision + 1
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET intent_revision=?, reconfiguration_phase=?,
 		reconfiguration_revision=?, updated_ns=? WHERE computer_id=? AND intent_revision=?`,
-		nextRevision, ComputerReconfigurationProjecting, nextRevision, now.UnixNano(), computerID, computer.IntentRevision)
+		nextRevision, phase, nextRevision, now.UnixNano(), computerID, computer.IntentRevision)
 	if err != nil {
 		return Computer{}, internalError(err, "store Computer projection intent")
 	}
 	if err := requireComputerCAS(result, computerID, computer.IntentRevision); err != nil {
 		return Computer{}, err
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentProject,
+	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, operation,
 		computer.DesiredState, computer.StorageID, computer.StorageGeneration,
 		job.JobID, nextSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, err
@@ -1286,10 +1396,10 @@ func (s *Store) InstallComputerProjection(ctx context.Context, computerID string
 		return Computer{}, err
 	}
 	computer.IntentRevision = nextRevision
-	computer.ReconfigurationPhase = ComputerReconfigurationProjecting
+	computer.ReconfigurationPhase = phase
 	computer.ReconfigurationRevision = &nextRevision
 	if quiescent {
-		if err := finalizeComputerProjectionTx(ctx, tx, computer, now); err != nil {
+		if err := finalizeComputerProjectionTx(ctx, tx, computer, phase, now); err != nil {
 			return Computer{}, err
 		}
 	}
@@ -1309,6 +1419,7 @@ func validatePendingComputerProjection(
 	computer Computer,
 	request ComputerProjectionRequest,
 	requestHash string,
+	chown bool,
 ) error {
 	if computer.ReconfigurationRevision == nil || *computer.ReconfigurationRevision != computer.IntentRevision {
 		return internalError(errors.New("projecting Computer has no matching revision"), "read Computer projection fence")
@@ -1326,7 +1437,9 @@ func validatePendingComputerProjection(
 		}, "Computer %q projection revision changed", computer.ComputerID)
 	}
 	var storedHash, actor string
-	err := tx.QueryRowContext(ctx, `SELECT jobs.request_hash, computer_intent_history.actor
+	var storedChown bool
+	err := tx.QueryRowContext(ctx, `SELECT jobs.request_hash, computer_intent_history.actor,
+		computer_job_projections.chown
 		FROM computer_job_projections
 		JOIN jobs ON jobs.job_id=computer_job_projections.job_id
 		JOIN computer_intent_history ON computer_intent_history.computer_id=computer_job_projections.computer_id
@@ -1334,11 +1447,11 @@ func validatePendingComputerProjection(
 		WHERE computer_job_projections.computer_id=? AND computer_job_projections.current=0
 			AND computer_job_projections.retired_ns IS NULL
 			AND computer_job_projections.spec_revision=?`, computer.IntentRevision, computer.ComputerID,
-		computer.CurrentSpecRevision+1).Scan(&storedHash, &actor)
+		computer.CurrentSpecRevision+1).Scan(&storedHash, &actor, &storedChown)
 	if err != nil {
 		return internalError(err, "read staging Computer projection")
 	}
-	if storedHash != requestHash || actor != request.Actor {
+	if storedHash != requestHash || actor != request.Actor || storedChown != chown {
 		return protocolError(contract.ErrorConflict, "Computer %q has a different projection in progress", computer.ComputerID)
 	}
 	return nil
@@ -1373,7 +1486,7 @@ func quiesceComputerProjectionTx(ctx context.Context, tx *sql.Tx, job Job, now t
 	}
 }
 
-func finalizeComputerProjectionTx(ctx context.Context, tx *sql.Tx, computer Computer, now time.Time) error {
+func finalizeComputerProjectionTx(ctx context.Context, tx *sql.Tx, computer Computer, phase ComputerReconfigurationPhase, now time.Time) error {
 	if computer.ReconfigurationRevision == nil {
 		return internalError(errors.New("Computer projection revision is missing"), "finalize Computer projection")
 	}
@@ -1434,7 +1547,7 @@ func finalizeComputerProjectionTx(ctx context.Context, tx *sql.Tx, computer Comp
 		WHERE computer_id=? AND intent_revision=? AND reconfiguration_phase=? AND reconfiguration_revision=?`,
 		stagingJobID, stagingSpecRevision, *computer.ReconfigurationRevision,
 		ComputerReconfigurationStable, now.UnixNano(), computer.ComputerID, computer.IntentRevision,
-		ComputerReconfigurationProjecting, *computer.ReconfigurationRevision)
+		phase, *computer.ReconfigurationRevision)
 	if err != nil {
 		return internalError(err, "transfer Computer projection authority")
 	}

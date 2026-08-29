@@ -481,6 +481,12 @@ func (session *Session) ResetComputerStorage(ctx context.Context, request ResetC
 	return response, err
 }
 
+func (session *Session) GrowComputerStorage(ctx context.Context, request GrowComputerStorageRequest) (GrowComputerStorageResponse, error) {
+	var response GrowComputerStorageResponse
+	err := session.call(ctx, MethodGrowStorage, request, &response)
+	return response, err
+}
+
 func (session *Session) CreateComputerBackup(ctx context.Context, request CreateComputerBackupRequest) (CreateComputerBackupResponse, error) {
 	var response CreateComputerBackupResponse
 	err := session.call(ctx, MethodCreateBackup, request, &response)

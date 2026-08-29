@@ -38,7 +38,8 @@ type ComputerStorageGenerationList struct {
 
 type ComputerStorageResetRequest struct {
 	ComputerMutationPrecondition
-	IdempotencyKey string `json:"idempotency_key"`
+	IdempotencyKey    string `json:"idempotency_key"`
+	TerminateSessions bool   `json:"terminate_sessions,omitempty"`
 }
 
 // ComputerStorageResetDirective is standing node-scoped authority to erase
@@ -70,23 +71,24 @@ type ComputerStorageResetAcknowledgementRequest struct {
 }
 
 type computerStorageResetRow struct {
-	ComputerID          string
-	IntentRevision      int64
-	StorageID           string
-	OldGeneration       int64
-	NewGeneration       int64
-	DiskBytes           int64
-	BoundNodeID         string
-	RootInstanceID      string
-	JobID               string
-	CleanupFence        string
-	IdempotencyKey      string
-	RequestHash         string
-	Status              string
-	ReceiptJSON         []byte
-	ReceiptHash         sql.NullString
-	AcknowledgementKey  sql.NullString
-	AcknowledgementHash sql.NullString
+	ComputerID           string
+	IntentRevision       int64
+	StorageID            string
+	OldGeneration        int64
+	NewGeneration        int64
+	DiskBytes            int64
+	BoundNodeID          string
+	RootInstanceID       string
+	JobID                string
+	CleanupFence         string
+	IdempotencyKey       string
+	RequestHash          string
+	Status               string
+	ReceiptJSON          []byte
+	ReceiptHash          sql.NullString
+	AcknowledgementKey   sql.NullString
+	AcknowledgementHash  sql.NullString
+	ResumeDesiredRunning bool
 }
 
 func computerStorageResetRequestHash(request ComputerStorageResetRequest) (string, error) {
@@ -96,7 +98,8 @@ func computerStorageResetRequestHash(request ComputerStorageResetRequest) (strin
 		StorageGeneration int64  `json:"storage_generation"`
 		Actor             string `json:"actor"`
 		IdempotencyKey    string `json:"idempotency_key"`
-	}{request.IntentRevision, request.StorageID, request.StorageGeneration, request.Actor, request.IdempotencyKey})
+		TerminateSessions bool   `json:"terminate_sessions"`
+	}{request.IntentRevision, request.StorageID, request.StorageGeneration, request.Actor, request.IdempotencyKey, request.TerminateSessions})
 	if err != nil {
 		return "", err
 	}
@@ -109,12 +112,12 @@ func readComputerStorageResetByKey(ctx context.Context, q queryer, computerID, k
 	err := q.QueryRowContext(ctx, `SELECT computer_id, intent_revision, storage_id, old_generation,
 		new_generation, disk_bytes, bound_node_id, root_instance_id, job_id, cleanup_fence, idempotency_key,
 		request_hash, status, verification_receipt_json, verification_receipt_hash,
-		acknowledgement_key, acknowledgement_hash
+		acknowledgement_key, acknowledgement_hash, resume_desired_running
 		FROM computer_storage_resets WHERE computer_id=? AND idempotency_key=?`, computerID, key).Scan(
 		&row.ComputerID, &row.IntentRevision, &row.StorageID, &row.OldGeneration,
 		&row.NewGeneration, &row.DiskBytes, &row.BoundNodeID, &row.RootInstanceID, &row.JobID, &row.CleanupFence,
 		&row.IdempotencyKey, &row.RequestHash, &row.Status, &row.ReceiptJSON, &row.ReceiptHash,
-		&row.AcknowledgementKey, &row.AcknowledgementHash)
+		&row.AcknowledgementKey, &row.AcknowledgementHash, &row.ResumeDesiredRunning)
 	return row, err
 }
 
@@ -158,11 +161,11 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
 		return Computer{}, false, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
 	}
-	if computer.DesiredState != contract.ServiceDesiredStopped ||
-		(computer.CurrentJob.State != contract.JobStopped && computer.CurrentJob.State != contract.JobFailed) ||
-		computer.CurrentJob.CurrentAttemptID != "" {
+	active := computer.CurrentJob.State == contract.JobClaimed || computer.CurrentJob.State == contract.JobRunning ||
+		computer.CurrentJob.State == contract.JobStopping
+	if active && !request.TerminateSessions {
 		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"Computer %q must be stopped and detached before Storage reset", computerID)
+			"running Computer reset requires explicit take-over session termination")
 	}
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
 		return Computer{}, false, protocolError(contract.ErrorConflict,
@@ -196,6 +199,9 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 			return Computer{}, false, err
 		}
 	}
+	if _, err := quiesceComputerProjectionTx(ctx, tx, computer.CurrentJob, now); err != nil {
+		return Computer{}, false, err
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET intent_revision=?, reconfiguration_phase=?,
 		reconfiguration_revision=?, updated_ns=? WHERE computer_id=? AND intent_revision=?`,
 		nextRevision, ComputerReconfigurationResetting, nextRevision, now.UnixNano(), computerID, computer.IntentRevision)
@@ -213,14 +219,16 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_storage_resets(
 		computer_id, intent_revision, storage_id, old_generation, new_generation, disk_bytes,
-		bound_node_id, root_instance_id, job_id, cleanup_fence, idempotency_key, request_hash, status, requested_ns
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?)`, computerID, nextRevision,
+		bound_node_id, root_instance_id, job_id, cleanup_fence, idempotency_key, request_hash,
+		status, resume_desired_running, requested_ns
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)`, computerID, nextRevision,
 		computer.StorageID, computer.StorageGeneration, nextGeneration, computer.DesiredDiskBytes,
-		boundNodeID, rootInstanceID, computer.CurrentJobID, cleanupFence, request.IdempotencyKey, requestHash, now.UnixNano()); err != nil {
+		boundNodeID, rootInstanceID, computer.CurrentJobID, cleanupFence, request.IdempotencyKey, requestHash,
+		computer.DesiredState == contract.ServiceDesiredRunning, now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "persist Computer Storage reset intent")
 	}
 	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentReset,
-		contract.ServiceDesiredStopped, computer.StorageID, nextGeneration, computer.CurrentJobID,
+		computer.DesiredState, computer.StorageID, nextGeneration, computer.CurrentJobID,
 		computer.CurrentSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, false, err
 	}
@@ -302,10 +310,12 @@ func (s *Store) ListNodeComputerStorageResetDirectives(ctx context.Context, iden
 	if err := validateStorageResetNode(ctx, s.db, identityNodeID, nodeID, bootSessionID); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT computer_id, bound_node_id, root_instance_id, job_id, intent_revision,
-		storage_id, old_generation, new_generation, disk_bytes, cleanup_fence, status
-		FROM computer_storage_resets WHERE bound_node_id=? AND status IN ('reserved', 'prepared', 'published')
-		ORDER BY requested_ns, computer_id`, nodeID)
+	rows, err := s.db.QueryContext(ctx, `SELECT r.computer_id, r.bound_node_id, r.root_instance_id, r.job_id, r.intent_revision,
+		r.storage_id, r.old_generation, r.new_generation, r.disk_bytes, r.cleanup_fence, r.status
+		FROM computer_storage_resets r JOIN jobs j ON j.job_id=r.job_id
+		WHERE r.bound_node_id=? AND r.status IN ('reserved', 'prepared', 'published')
+		AND j.state IN (?, ?)
+		ORDER BY r.requested_ns, r.computer_id`, nodeID, contract.JobStopped, contract.JobFailed)
 	if err != nil {
 		return nil, internalError(err, "list Computer Storage reset directives")
 	}
@@ -376,12 +386,12 @@ func (s *Store) recordComputerStorageResetVerification(ctx context.Context, iden
 	err = tx.QueryRowContext(ctx, `SELECT computer_id, intent_revision, storage_id, old_generation,
 		new_generation, disk_bytes, bound_node_id, root_instance_id, job_id, cleanup_fence, idempotency_key,
 		request_hash, status, verification_receipt_json, verification_receipt_hash,
-		acknowledgement_key, acknowledgement_hash FROM computer_storage_resets
+		acknowledgement_key, acknowledgement_hash, resume_desired_running FROM computer_storage_resets
 		WHERE computer_id=? AND intent_revision=?`, computerID, request.Receipt.IntentRevision).Scan(
 		&reset.ComputerID, &reset.IntentRevision, &reset.StorageID, &reset.OldGeneration,
 		&reset.NewGeneration, &reset.DiskBytes, &reset.BoundNodeID, &reset.RootInstanceID, &reset.JobID, &reset.CleanupFence,
 		&reset.IdempotencyKey, &reset.RequestHash, &reset.Status, &reset.ReceiptJSON, &reset.ReceiptHash,
-		&reset.AcknowledgementKey, &reset.AcknowledgementHash)
+		&reset.AcknowledgementKey, &reset.AcknowledgementHash, &reset.ResumeDesiredRunning)
 	if errors.Is(err, sql.ErrNoRows) {
 		return protocolError(contract.ErrorStaleIntentRevision, "Computer Storage reset revision is no longer current")
 	}
@@ -444,12 +454,12 @@ func (s *Store) publishVerifiedComputerStorageReset(ctx context.Context, compute
 	err = tx.QueryRowContext(ctx, `SELECT computer_id, intent_revision, storage_id, old_generation,
 		new_generation, disk_bytes, bound_node_id, root_instance_id, job_id, cleanup_fence, idempotency_key,
 		request_hash, status, verification_receipt_json, verification_receipt_hash,
-		acknowledgement_key, acknowledgement_hash FROM computer_storage_resets
+		acknowledgement_key, acknowledgement_hash, resume_desired_running FROM computer_storage_resets
 		WHERE computer_id=? AND intent_revision=?`, computerID, intentRevision).Scan(
 		&reset.ComputerID, &reset.IntentRevision, &reset.StorageID, &reset.OldGeneration,
 		&reset.NewGeneration, &reset.DiskBytes, &reset.BoundNodeID, &reset.RootInstanceID, &reset.JobID, &reset.CleanupFence,
 		&reset.IdempotencyKey, &reset.RequestHash, &reset.Status, &reset.ReceiptJSON, &reset.ReceiptHash,
-		&reset.AcknowledgementKey, &reset.AcknowledgementHash)
+		&reset.AcknowledgementKey, &reset.AcknowledgementHash, &reset.ResumeDesiredRunning)
 	if err != nil {
 		return Computer{}, internalError(err, "read verified Computer Storage reset")
 	}
@@ -467,9 +477,7 @@ func (s *Store) publishVerifiedComputerStorageReset(ctx context.Context, compute
 		computer.ReconfigurationRevision == nil || *computer.ReconfigurationRevision != intentRevision {
 		return Computer{}, protocolError(contract.ErrorStaleIntentRevision, "Computer Storage reset no longer owns publication")
 	}
-	if computer.DesiredState != contract.ServiceDesiredStopped ||
-		(computer.CurrentJob.State != contract.JobStopped && computer.CurrentJob.State != contract.JobFailed) ||
-		computer.CurrentJob.CurrentAttemptID != "" {
+	if computer.CurrentJob.State != contract.JobStopped && computer.CurrentJob.State != contract.JobFailed {
 		return Computer{}, protocolError(contract.ErrorConflict, "Computer runtime is not stopped for Storage publication")
 	}
 	retired, err := tx.ExecContext(ctx, `UPDATE computer_storage_generations SET phase='retired', retired_ns=?
@@ -497,9 +505,9 @@ func (s *Store) publishVerifiedComputerStorageReset(ctx context.Context, compute
 	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?`, contract.JobStopped, now.UnixNano(), computer.CurrentJobID); err != nil {
 		return Computer{}, internalError(err, "keep Computer stopped after Storage reset")
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE computers SET storage_generation=?, desired_state=?, updated_ns=?
+	result, err := tx.ExecContext(ctx, `UPDATE computers SET storage_generation=?, updated_ns=?
 		WHERE computer_id=? AND intent_revision=? AND storage_generation=? AND reconfiguration_phase=?`,
-		reset.NewGeneration, contract.ServiceDesiredStopped, now.UnixNano(), computerID,
+		reset.NewGeneration, now.UnixNano(), computerID,
 		intentRevision, reset.OldGeneration, ComputerReconfigurationResetting)
 	if err != nil {
 		return Computer{}, internalError(err, "publish Computer Storage reset authority")
@@ -564,13 +572,13 @@ func (s *Store) AcknowledgeComputerStorageRetirement(ctx context.Context, identi
 	err = tx.QueryRowContext(ctx, `SELECT computer_id, intent_revision, storage_id, old_generation,
 		new_generation, disk_bytes, bound_node_id, root_instance_id, job_id, cleanup_fence,
 		idempotency_key, request_hash, status, verification_receipt_json, verification_receipt_hash,
-		acknowledgement_key, acknowledgement_hash FROM computer_storage_resets
+		acknowledgement_key, acknowledgement_hash, resume_desired_running FROM computer_storage_resets
 		WHERE computer_id=? AND intent_revision=?`, computerID, request.RemovalGeneration).Scan(
 		&reset.ComputerID, &reset.IntentRevision, &reset.StorageID, &reset.OldGeneration,
 		&reset.NewGeneration, &reset.DiskBytes, &reset.BoundNodeID, &reset.RootInstanceID,
 		&reset.JobID, &reset.CleanupFence, &reset.IdempotencyKey, &reset.RequestHash,
 		&reset.Status, &reset.ReceiptJSON, &reset.ReceiptHash, &reset.AcknowledgementKey,
-		&reset.AcknowledgementHash)
+		&reset.AcknowledgementHash, &reset.ResumeDesiredRunning)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorStaleIntentRevision,
 			"Computer Storage reset revision is no longer current")
@@ -610,6 +618,12 @@ func (s *Store) AcknowledgeComputerStorageRetirement(ctx context.Context, identi
 	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_resets SET status='retired'
 		WHERE computer_id=? AND intent_revision=? AND status='published'`, computerID, reset.IntentRevision); err != nil {
 		return Computer{}, internalError(err, "complete Computer Storage predecessor retirement")
+	}
+	if reset.ResumeDesiredRunning && computer.DesiredState == contract.ServiceDesiredRunning &&
+		computer.IntentRevision == reset.IntentRevision {
+		if err := setComputerServiceDesiredState(ctx, tx, computer.CurrentJob, contract.ServiceDesiredRunning, now); err != nil {
+			return Computer{}, err
+		}
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET applied_revision=?,
 		reconfiguration_phase=?, reconfiguration_revision=NULL, updated_ns=?

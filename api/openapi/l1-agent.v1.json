@@ -228,14 +228,20 @@
                     "computer_storage": {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["computer_id", "storage_id", "storage_generation", "intent_revision"],
+                      "required": ["computer_id", "storage_id", "storage_generation", "intent_revision", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "submit_policy_revision", "disk_bytes"],
                       "properties": {
                         "computer_id": { "type": "string", "minLength": 1 },
                         "storage_id": { "type": "string", "minLength": 1 },
                         "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
-                        "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 }
+                        "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+                        "submit_enabled": { "type": "boolean" },
+                        "submit_intent_revision": { "type": "integer", "format": "int64", "minimum": 0 },
+                        "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                        "submit_policy_revision": { "type": "integer", "format": "int64", "minimum": 0 },
+                        "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
+                        "chown": { "type": "boolean", "default": false }
                       },
-                      "description": "Computer claims only. Exact durable Storage identity authorized by the current immutable Job projection."
+                      "description": "Computer claims only. Exact durable Storage identity, current disk budget, submission policy, and optional one-shot chown authority authorized by the current immutable Job projection."
                     }
                   }
                 }
@@ -708,6 +714,53 @@
         } } } },
         "responses": {
           "200": { "description": "Predecessor absence accepted; the restored Computer is stable and remains stopped.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/agent/computers/{computer_id}/storage-grow-acknowledgement": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "acknowledgeComputerStorageGrow",
+        "summary": "Accept an assertion-derived Computer disk grow result",
+        "description": "The authenticated current node submits a helper receipt bound to Computer, Storage generation, exact managed-root instance, Job, operation revision and fence, and old/new byte counts. Applied receipts advance desired_disk_bytes; insufficient_disk receipts prove an unchanged disk and latch explicit-restart recovery.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
+          "properties": {
+            "node_id": { "type": "string", "minLength": 1 },
+            "boot_session_id": { "type": "string", "minLength": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 },
+            "receipt": {
+              "type": "object", "additionalProperties": false,
+              "required": ["kind", "receipt_id", "computer_id", "storage_id", "storage_generation", "node_id", "root_instance_id", "job_id", "operation_revision", "operation_fence", "helper_generation", "old_disk_bytes", "new_disk_bytes", "applied", "failure_code", "observed_available_bytes"],
+              "properties": {
+                "kind": { "enum": ["computer_storage_grow_applied", "computer_storage_grow_failed_unchanged"] },
+                "receipt_id": { "type": "string", "minLength": 1 },
+                "computer_id": { "type": "string", "minLength": 1 },
+                "storage_id": { "type": "string", "minLength": 1 },
+                "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+                "node_id": { "type": "string", "minLength": 1 },
+                "root_instance_id": { "type": "string", "minLength": 1 },
+                "job_id": { "type": "string", "minLength": 1 },
+                "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+                "operation_fence": { "type": "string", "minLength": 1 },
+                "helper_generation": { "type": "integer", "minimum": 1 },
+                "old_disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
+                "new_disk_bytes": { "type": "integer", "format": "int64", "minimum": 2 },
+                "applied": { "type": "boolean" },
+                "failure_code": { "type": "string", "enum": ["", "insufficient_disk"] },
+                "observed_available_bytes": { "type": "integer", "format": "int64", "minimum": 0 }
+              }
+            }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Grow result accepted or identically replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }

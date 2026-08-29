@@ -329,13 +329,14 @@ CREATE TABLE IF NOT EXISTS computers (
   grants_json BLOB NOT NULL,
   storage_id TEXT NOT NULL UNIQUE,
   storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+	desired_disk_bytes INTEGER NOT NULL CHECK(desired_disk_bytes > 0),
 	backup_cap INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0),
   desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
   intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
   applied_revision INTEGER NOT NULL CHECK(applied_revision >= 0 AND applied_revision <= intent_revision),
   current_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
   current_spec_revision INTEGER NOT NULL CHECK(current_spec_revision > 0),
-  reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'backing_up', 'restoring', 'cloning', 'removing')),
+  reconfiguration_phase TEXT NOT NULL CHECK(reconfiguration_phase IN ('stable', 'projecting', 'resetting', 'backing_up', 'reimaging', 'growing', 'restoring', 'cloning', 'removing')),
   reconfiguration_revision INTEGER CHECK(reconfiguration_revision > 0),
   submit_enabled INTEGER NOT NULL DEFAULT 0 CHECK(submit_enabled IN (0, 1)),
   submit_intent_revision INTEGER NOT NULL DEFAULT 0 CHECK(submit_intent_revision >= 0),
@@ -371,6 +372,7 @@ CREATE TABLE IF NOT EXISTS computer_job_projections (
   job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
   spec_revision INTEGER NOT NULL CHECK(spec_revision > 0),
   current INTEGER NOT NULL CHECK(current IN (0, 1)),
+	chown INTEGER NOT NULL DEFAULT 0 CHECK(chown IN (0, 1)),
   created_ns INTEGER NOT NULL,
   retired_ns INTEGER,
   PRIMARY KEY(computer_id, spec_revision)
@@ -380,7 +382,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS computer_current_projection
 CREATE TABLE IF NOT EXISTS computer_intent_history (
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
   intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
-	operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'restore', 'clone')),
+	operation TEXT NOT NULL CHECK(operation IN ('create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'reimage', 'grow', 'abort', 'restore', 'clone')),
   desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
   storage_id TEXT NOT NULL,
 	storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
@@ -425,6 +427,7 @@ CREATE TABLE IF NOT EXISTS computer_storage_resets (
   verification_receipt_hash TEXT,
   acknowledgement_key TEXT,
   acknowledgement_hash TEXT,
+	resume_desired_running INTEGER NOT NULL DEFAULT 0 CHECK(resume_desired_running IN (0, 1)),
   requested_ns INTEGER NOT NULL,
   verified_ns INTEGER,
   published_ns INTEGER,
@@ -433,6 +436,44 @@ CREATE TABLE IF NOT EXISTS computer_storage_resets (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_reset_active
 	  ON computer_storage_resets(computer_id) WHERE status NOT IN ('retired', 'superseded');
+CREATE TABLE IF NOT EXISTS computer_storage_grows (
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  operation_revision INTEGER NOT NULL CHECK(operation_revision > 0),
+  storage_id TEXT NOT NULL,
+  storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
+  old_disk_bytes INTEGER NOT NULL CHECK(old_disk_bytes > 0),
+  new_disk_bytes INTEGER NOT NULL CHECK(new_disk_bytes > old_disk_bytes),
+  bound_node_id TEXT NOT NULL,
+  root_instance_id TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(job_id),
+  operation_fence TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('planned', 'applied', 'failed', 'superseded')),
+  failure_code TEXT NOT NULL DEFAULT '',
+  receipt_json BLOB,
+  receipt_hash TEXT,
+  acknowledgement_key TEXT,
+  acknowledgement_hash TEXT,
+  requested_ns INTEGER NOT NULL,
+  completed_ns INTEGER,
+  PRIMARY KEY(computer_id, operation_revision),
+  UNIQUE(computer_id, idempotency_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_grow_active
+  ON computer_storage_grows(computer_id) WHERE status='planned';
+CREATE TABLE IF NOT EXISTS computer_reconfiguration_aborts (
+  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
+  aborted_revision INTEGER NOT NULL CHECK(aborted_revision > 0),
+  intent_revision INTEGER NOT NULL CHECK(intent_revision > aborted_revision),
+  aborted_phase TEXT NOT NULL CHECK(aborted_phase IN ('backing_up', 'resetting', 'reimaging')),
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  created_ns INTEGER NOT NULL,
+  PRIMARY KEY(computer_id, intent_revision),
+  UNIQUE(computer_id, idempotency_key)
+);
 CREATE TABLE IF NOT EXISTS computer_backup_operations (
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
   operation_revision INTEGER NOT NULL CHECK(operation_revision > 0),
@@ -757,6 +798,9 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	if err := s.ensureColumn(ctx, "computers", "backup_cap", "INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0)"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "computers", "desired_disk_bytes", "INTEGER NOT NULL DEFAULT 1 CHECK(desired_disk_bytes > 0)"); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "computer_intent_history", "backup_cap", "INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0)"); err != nil {
 		return err
 	}
@@ -770,6 +814,12 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 		return err
 	}
 	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "failure_code", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "computer_job_projections", "chown", "INTEGER NOT NULL DEFAULT 0 CHECK(chown IN (0, 1))"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "computer_storage_resets", "resume_desired_running", "INTEGER NOT NULL DEFAULT 0 CHECK(resume_desired_running IN (0, 1))"); err != nil {
 		return err
 	}
 	if err := s.migrateComputerResetConstraints(ctx); err != nil {
@@ -816,6 +866,12 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 		'current', c.created_ns
 	FROM computers c JOIN jobs j ON j.job_id=c.current_job_id`); err != nil {
 		return fmt.Errorf("l1: backfill Computer Storage generations: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE computers SET desired_disk_bytes=COALESCE((
+		SELECT CAST(json_extract(j.spec_json, '$.execution.oci.computer.disk_bytes') AS INTEGER)
+		FROM jobs j WHERE j.job_id=computers.current_job_id
+	), desired_disk_bytes) WHERE desired_disk_bytes=1`); err != nil {
+		return fmt.Errorf("l1: backfill Computer desired disk budget: %w", err)
 	}
 	return nil
 }
@@ -1882,12 +1938,15 @@ AND state=@job_queued
 				return nil, err
 			}
 			var storage ComputerStorageClaim
-			if err := tx.QueryRowContext(ctx, `SELECT computer_id, storage_id, storage_generation, intent_revision,
-				submit_enabled, submit_intent_revision, submit_max_inflight, submit_policy_revision
-				FROM computers WHERE computer_id=? AND current_job_id=?`, computerID, jobID).
+			if err := tx.QueryRowContext(ctx, `SELECT c.computer_id, c.storage_id, c.storage_generation, c.intent_revision,
+				c.submit_enabled, c.submit_intent_revision, c.submit_max_inflight, c.submit_policy_revision,
+				c.desired_disk_bytes,
+				p.chown
+				FROM computers c JOIN computer_job_projections p ON p.computer_id=c.computer_id AND p.job_id=c.current_job_id
+				WHERE c.computer_id=? AND c.current_job_id=?`, computerID, jobID).
 				Scan(&storage.ComputerID, &storage.StorageID, &storage.StorageGeneration, &storage.IntentRevision,
 					&storage.SubmitEnabled, &storage.SubmitIntentRevision, &storage.SubmitMaxInflight,
-					&storage.SubmitPolicyRevision); err != nil {
+					&storage.SubmitPolicyRevision, &storage.DiskBytes, &storage.Chown); err != nil {
 				return nil, internalError(err, "read claimed Computer Storage identity")
 			}
 			computerStorage = &storage
@@ -2236,6 +2295,10 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 	}
 	if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
 		return Job{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_job_projections SET chown=0
+		WHERE job_id=? AND current=1 AND chown=1`, jobID); err != nil {
+		return Job{}, internalError(err, "complete Computer ownership migration")
 	}
 	job, err := getJobByID(ctx, tx, jobID, now)
 	if err != nil {

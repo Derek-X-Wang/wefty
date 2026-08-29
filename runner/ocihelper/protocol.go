@@ -51,6 +51,7 @@ const (
 	MethodInventoryRemoval   Method = "InventoryRemoval"
 	MethodAttestRemoval      Method = "AttestRemoval"
 	MethodResetStorage       Method = "ResetComputerStorage"
+	MethodGrowStorage        Method = "GrowComputerStorage"
 	MethodCreateBackup       Method = "CreateComputerBackup"
 	MethodDeleteBackup       Method = "DeleteComputerBackupCopy"
 	MethodCopyStorage        Method = "CopyComputerStorage"
@@ -509,6 +510,7 @@ type ComputerStorageReference struct {
 	StorageGeneration int64  `json:"storage_generation"`
 	IntentRevision    int64  `json:"intent_revision"`
 	DiskBytes         int64  `json:"disk_bytes"`
+	Chown             bool   `json:"chown,omitempty"`
 }
 
 type ManagedVolumeDescriptor struct {
@@ -979,6 +981,28 @@ type ComputerStorageResetReceipt = contract.ComputerStorageResetReceipt
 type ResetComputerStorageResponse struct {
 	Verified bool                        `json:"verified"`
 	Receipt  ComputerStorageResetReceipt `json:"receipt"`
+}
+
+type ComputerStorageGrowAuthority struct {
+	NodeID            string `json:"node_id"`
+	BootSessionID     string `json:"boot_session_id"`
+	HelperGeneration  uint64 `json:"helper_generation"`
+	RootInstanceID    string `json:"root_instance_id"`
+	JobID             string `json:"job_id"`
+	OperationRevision int64  `json:"operation_revision"`
+	OperationFence    string `json:"operation_fence"`
+}
+
+type GrowComputerStorageRequest struct {
+	Storage      ComputerStorageReference     `json:"storage"`
+	NewDiskBytes int64                        `json:"new_disk_bytes"`
+	Authority    ComputerStorageGrowAuthority `json:"authority"`
+}
+
+type ComputerStorageGrowReceipt = contract.ComputerStorageGrowReceipt
+
+type GrowComputerStorageResponse struct {
+	Receipt ComputerStorageGrowReceipt `json:"receipt"`
 }
 
 type ComputerBackupAuthority struct {

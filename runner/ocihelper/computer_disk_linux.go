@@ -554,13 +554,40 @@ func verifyComputerDiskAllocation(path string, bytes int64) error {
 	return nil
 }
 
-func initializeComputerDiskRoot(attachment *computerDiskAttachment, uid, gid uint32) error {
+func migrateComputerDiskOwnership(root string, uid, gid uint32, lchown func(string, int, int) error) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		return lchown(path, int(uid), int(gid))
+	})
+}
+
+func syncComputerDiskFilesystem(root string) error {
+	directory, err := os.Open(root)
+	if err != nil {
+		return err
+	}
+	err = unix.Syncfs(int(directory.Fd()))
+	return errors.Join(err, directory.Close())
+}
+
+func initializeComputerDiskRoot(attachment *computerDiskAttachment, uid, gid uint32, migrate bool) error {
 	if attachment == nil {
 		return nil
 	}
 	if attachment.fresh {
 		if err := os.Chown(attachment.mountPath, int(uid), int(gid)); err != nil {
 			return fmt.Errorf("initialize Computer disk root ownership: %w", err)
+		}
+	} else if migrate {
+		// WalkDir uses lstat semantics. Lchown changes a symlink's own metadata
+		// and never follows tenant-controlled links outside the mounted disk.
+		if err := migrateComputerDiskOwnership(attachment.mountPath, uid, gid, os.Lchown); err != nil {
+			return fmt.Errorf("migrate Computer disk ownership: %w", err)
+		}
+		if err := syncComputerDiskFilesystem(attachment.mountPath); err != nil {
+			return fmt.Errorf("sync Computer disk ownership migration: %w", err)
 		}
 	}
 	info, err := os.Stat(attachment.mountPath)
