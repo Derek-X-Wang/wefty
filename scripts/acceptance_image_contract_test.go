@@ -281,7 +281,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	}
 	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "WLR_BACKENDS=headless", "WLR_RENDERER=pixman", "WLR_HEADLESS_OUTPUTS=1")
 	assertFileContains(t, "../examples/computer-wayland/entrypoint.sh", "wayvnc -w", "--disable-input", "--class=chromium", "--app=http://127.0.0.1:18888/", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "surface-ready", "surface_wait=45", "within 45 seconds", "view-edge-ready", "control-edge-ready")
-	assertFileContains(t, "../examples/computer-wayland/entrypoint-fixture.sh", "WEFTY_CONFORMANCE_MUTATION", "--class=chromium", "--app=http://127.0.0.1:18888/", "oracle_wait=45", "within 45 seconds")
+	assertFileContains(t, "../examples/computer-wayland/entrypoint-fixture.sh", "WEFTY_CONFORMANCE_MUTATION", "--class=chromium", "--app=http://127.0.0.1:18888/", "oracle_wait=45", "within 45 seconds", "wefty-view-proxy")
+	assertFileContains(t, "../examples/computer/fixtures/Dockerfile", "view-proxy-fixture.py", "/usr/local/libexec/wefty-view-proxy")
 	assertFileNotContains(t, "../examples/computer-wayland/entrypoint.sh", "WEFTY_CONFORMANCE_MUTATION", "WEFTY_WAYVNC_RECORD_INPUT")
 	assertFileContains(t, "../examples/computer-wayland/watch-driver.py", "/wefty/control/driver.json", "type(value[\"version\"]) is not int", "os.replace")
 	assertFileContains(t, "../examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch", "GET /websockify", "Sec-WebSocket-Protocol: binary", "WS_OPCODE_TEXT", "wefty_mutation_hooks", "view-edge-ready", "control-edge-ready")

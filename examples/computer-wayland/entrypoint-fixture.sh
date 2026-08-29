@@ -146,12 +146,19 @@ if [ -z "$mutation" ]; then
   start supervise_edge control "$control_port"
   wait_native_edge view
   wait_native_edge control
+elif [ "$mutation" = view-accepts-input ]; then
+  # Route the broken view edge through the known input-enabled control
+  # listener. This fixture changes the image behavior, while the checker still
+  # requires the compositor-owned oracle to observe the resulting delivery.
+  start supervise_edge control "$control_port"
+  wait_native_edge control
+  start /usr/local/libexec/wefty-view-proxy "$view_port" "$control_port"
 elif [ "$mutation" != missing-view-endpoint ]; then
   start supervise_edge view "$view_port" "$view_flag"
 fi
 if [ "$mutation" = plain-tcp-control ]; then
   start python3 -m http.server "$control_port" --bind 127.0.0.1
-elif [ -n "$mutation" ] && [ "$mutation" != missing-control-endpoint ] && [ "$mutation" != duplicate-endpoint ]; then
+elif [ -n "$mutation" ] && [ "$mutation" != missing-control-endpoint ] && [ "$mutation" != duplicate-endpoint ] && [ "$mutation" != view-accepts-input ]; then
   start supervise_edge control "$control_port"
 fi
 
