@@ -75,6 +75,7 @@ type agentSession struct {
 	reimagePreflights *reimagePreflightController
 	backups           *backupController
 	storageCopies     *storageCopyController
+	custody           *custodyController
 	computerPolicy    *ComputerPolicyCache
 	computerAcks      *computerPolicyAckController
 
@@ -212,7 +213,8 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 		session.processReimageDirectives(ctx, registrationHeartbeat.ReimageDirectives),
 		session.processBackupDirectives(ctx, registrationHeartbeat.BackupDirectives),
 		session.processBackupPruneDirectives(ctx, registrationHeartbeat.BackupPruneDirectives),
-		session.processStorageCopyDirectives(ctx, registrationHeartbeat.StorageCopyDirectives))
+		session.processStorageCopyDirectives(ctx, registrationHeartbeat.StorageCopyDirectives),
+		session.processCustodyExportDirectives(ctx, registrationHeartbeat.CustodyExportDirectives))
 	pinsErr := error(nil)
 	if barrierErr == nil && removalErr == nil {
 		pinsErr = session.reconcileOCIImagePins(ctx)
@@ -339,6 +341,16 @@ func (session *agentSession) processStorageCopyDirectives(ctx context.Context, d
 	return nil
 }
 
+func (session *agentSession) processCustodyExportDirectives(ctx context.Context, directives []l1.ComputerCustodyExportDirective) error {
+	if session.custody == nil {
+		return nil
+	}
+	for _, directive := range directives {
+		session.custody.enqueue(ctx, directive, nil)
+	}
+	return nil
+}
+
 func (session *agentSession) reconcileOCIImagePins(ctx context.Context) error {
 	if session.ociImagePins == nil {
 		return nil
@@ -456,7 +468,8 @@ func (session *agentSession) recoverOCIRuntimeLocked(ctx context.Context) (ocihe
 		session.processReimageDirectives(ctx, restrictiveResponse.ReimageDirectives),
 		session.processBackupDirectives(ctx, restrictiveResponse.BackupDirectives),
 		session.processBackupPruneDirectives(ctx, restrictiveResponse.BackupPruneDirectives),
-		session.processStorageCopyDirectives(ctx, restrictiveResponse.StorageCopyDirectives))
+		session.processStorageCopyDirectives(ctx, restrictiveResponse.StorageCopyDirectives),
+		session.processCustodyExportDirectives(ctx, restrictiveResponse.CustodyExportDirectives))
 	if barrierErr != nil {
 		return ocihelper.HelperSession{}, barrierErr
 	}
@@ -593,6 +606,9 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 		}
 		if session.reimagePreflights != nil {
 			session.reimagePreflights.wait()
+		}
+		if session.custody != nil {
+			session.custody.wait()
 		}
 	}()
 
@@ -1122,6 +1138,11 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			if session.storageCopies != nil {
 				for _, directive := range response.StorageCopyDirectives {
 					session.storageCopies.enqueue(ctx, directive, failures)
+				}
+			}
+			if session.custody != nil {
+				for _, directive := range response.CustodyExportDirectives {
+					session.custody.enqueue(ctx, directive, failures)
 				}
 			}
 			backoff.reset()

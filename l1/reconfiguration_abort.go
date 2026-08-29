@@ -81,7 +81,7 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 	}
 	switch computer.ReconfigurationPhase {
 	case ComputerReconfigurationBackingUp, ComputerReconfigurationResetting, ComputerReconfigurationReimaging,
-		ComputerReconfigurationGrowing:
+		ComputerReconfigurationGrowing, ComputerReconfigurationExporting, ComputerReconfigurationImporting:
 	default:
 		return Computer{}, false, protocolError(contract.ErrorConflict,
 			"Computer %q reconfiguration phase %q is not abortable", computerID, computer.ReconfigurationPhase)
@@ -101,6 +101,10 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 			query = `SELECT bound_node_id FROM computer_reimage_operations WHERE computer_id=? AND operation_revision=?`
 		case ComputerReconfigurationGrowing:
 			query = `SELECT bound_node_id FROM computer_storage_grows WHERE computer_id=? AND operation_revision=?`
+		case ComputerReconfigurationExporting:
+			query = `SELECT bound_node_id FROM computer_custody_exports WHERE computer_id=? AND operation_revision=?`
+		case ComputerReconfigurationImporting:
+			query = `SELECT bound_node_id FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=? AND operation='import'`
 		}
 		if query != "" {
 			if err := tx.QueryRowContext(ctx, query, computerID, computer.IntentRevision).Scan(&boundNodeID); err != nil {
@@ -158,6 +162,25 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 			completed_ns=? WHERE computer_id=? AND operation_revision=? AND status='planned'`,
 			now.UnixNano(), computerID, abortedRevision); err != nil {
 			return Computer{}, false, internalError(err, "supersede aborted Computer grow")
+		}
+	case ComputerReconfigurationExporting:
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_custody_exports SET status='failed',
+			failure_code='aborted_dead_node', completed_ns=? WHERE computer_id=? AND operation_revision=? AND status='planned'`,
+			now.UnixNano(), computerID, abortedRevision); err != nil {
+			return Computer{}, false, internalError(err, "fail aborted Custody export")
+		}
+	case ComputerReconfigurationImporting:
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded',
+			failure_code='aborted_dead_node', completed_ns=? WHERE destination_computer_id=? AND operation_revision=?
+			AND operation='import' AND status IN ('reserved', 'prepared')`, now.UnixNano(), computerID, abortedRevision); err != nil {
+			return Computer{}, false, internalError(err, "supersede aborted Custody import")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_generations SET phase='retired', retired_ns=?
+			WHERE computer_id=? AND reset_revision=? AND phase='staging'`, now.UnixNano(), computerID, abortedRevision); err != nil {
+			return Computer{}, false, internalError(err, "retire aborted Custody import staging generation")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE computers SET name='aborted-import-' || computer_id WHERE computer_id=?`, computerID); err != nil {
+			return Computer{}, false, internalError(err, "release aborted Custody import name")
 		}
 	}
 	if err := s.reconfigurationCheckpoint("abort_artifacts_superseded"); err != nil {

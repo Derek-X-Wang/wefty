@@ -22,20 +22,22 @@ const initialComputerRevision int64 = 1
 type ComputerIntentOperation string
 
 const (
-	ComputerIntentCreate       ComputerIntentOperation = "create"
-	ComputerIntentStart        ComputerIntentOperation = "start"
-	ComputerIntentStop         ComputerIntentOperation = "stop"
-	ComputerIntentRestart      ComputerIntentOperation = "restart"
-	ComputerIntentRemove       ComputerIntentOperation = "remove"
-	ComputerIntentProject      ComputerIntentOperation = "project"
-	ComputerIntentReset        ComputerIntentOperation = "reset"
-	ComputerIntentBackupCreate ComputerIntentOperation = "backup_create"
-	ComputerIntentBackupCap    ComputerIntentOperation = "backup_cap"
-	ComputerIntentRestore      ComputerIntentOperation = "restore"
-	ComputerIntentClone        ComputerIntentOperation = "clone"
-	ComputerIntentReimage      ComputerIntentOperation = "reimage"
-	ComputerIntentGrow         ComputerIntentOperation = "grow"
-	ComputerIntentAbort        ComputerIntentOperation = "abort"
+	ComputerIntentCreate        ComputerIntentOperation = "create"
+	ComputerIntentStart         ComputerIntentOperation = "start"
+	ComputerIntentStop          ComputerIntentOperation = "stop"
+	ComputerIntentRestart       ComputerIntentOperation = "restart"
+	ComputerIntentRemove        ComputerIntentOperation = "remove"
+	ComputerIntentProject       ComputerIntentOperation = "project"
+	ComputerIntentReset         ComputerIntentOperation = "reset"
+	ComputerIntentBackupCreate  ComputerIntentOperation = "backup_create"
+	ComputerIntentBackupCap     ComputerIntentOperation = "backup_cap"
+	ComputerIntentRestore       ComputerIntentOperation = "restore"
+	ComputerIntentClone         ComputerIntentOperation = "clone"
+	ComputerIntentCustodyExport ComputerIntentOperation = "custody_export"
+	ComputerIntentCustodyImport ComputerIntentOperation = "custody_import"
+	ComputerIntentReimage       ComputerIntentOperation = "reimage"
+	ComputerIntentGrow          ComputerIntentOperation = "grow"
+	ComputerIntentAbort         ComputerIntentOperation = "abort"
 )
 
 type ComputerGrantPermission string
@@ -56,6 +58,8 @@ const (
 	ComputerReconfigurationBackingUp  ComputerReconfigurationPhase = "backing_up"
 	ComputerReconfigurationRestoring  ComputerReconfigurationPhase = "restoring"
 	ComputerReconfigurationCloning    ComputerReconfigurationPhase = "cloning"
+	ComputerReconfigurationExporting  ComputerReconfigurationPhase = "exporting"
+	ComputerReconfigurationImporting  ComputerReconfigurationPhase = "importing"
 	ComputerReconfigurationReimaging  ComputerReconfigurationPhase = "reimaging"
 	ComputerReconfigurationGrowing    ComputerReconfigurationPhase = "growing"
 )
@@ -433,7 +437,22 @@ func insertComputerJob(
 	boundNodeID string,
 	now time.Time,
 ) (Job, error) {
-	job := Job{JobID: newID("job"), State: state, Spec: spec, CreatedAt: now, UpdatedAt: now}
+	return insertComputerJobWithID(ctx, tx, newID("job"), spec, specJSON, requestHash, state, desired, boundNodeID, now)
+}
+
+func insertComputerJobWithID(
+	ctx context.Context,
+	tx *sql.Tx,
+	jobID string,
+	spec contract.JobSpec,
+	specJSON []byte,
+	requestHash string,
+	state contract.JobState,
+	desired contract.ServiceDesiredState,
+	boundNodeID string,
+	now time.Time,
+) (Job, error) {
+	job := Job{JobID: jobID, State: state, Spec: spec, CreatedAt: now, UpdatedAt: now}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(
 		job_id, dispatch_key, request_hash, spec_json, state, created_ns, updated_ns
 	) VALUES(?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKey, requestHash, specJSON,
@@ -1083,6 +1102,7 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 		computer.ReconfigurationPhase != ComputerReconfigurationBackingUp &&
 		computer.ReconfigurationPhase != ComputerReconfigurationRestoring &&
 		computer.ReconfigurationPhase != ComputerReconfigurationCloning &&
+		computer.ReconfigurationPhase != ComputerReconfigurationExporting &&
 		computer.ReconfigurationPhase != ComputerReconfigurationReimaging &&
 		computer.ReconfigurationPhase != ComputerReconfigurationGrowing {
 		return Computer{}, protocolError(contract.ErrorConflict,
@@ -1099,6 +1119,12 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 		if _, err := tx.ExecContext(ctx, `UPDATE computer_backup_operations SET status='superseded'
 			WHERE computer_id=? AND status='planned'`, computerID); err != nil {
 			return Computer{}, internalError(err, "supersede Computer Backup for removal")
+		}
+	}
+	if computer.ReconfigurationPhase == ComputerReconfigurationExporting {
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_custody_exports SET status='superseded'
+			WHERE computer_id=? AND operation_revision=? AND status='planned'`, computerID, computer.IntentRevision); err != nil {
+			return Computer{}, internalError(err, "supersede Custody export for removal")
 		}
 	}
 	if computer.ReconfigurationPhase == ComputerReconfigurationRestoring ||
@@ -1219,6 +1245,11 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	}
 	if err := markComputerIntentApplied(ctx, tx, computerID, nextRevision, now); err != nil {
 		return Computer{}, err
+	}
+	if boundNodeID == "" {
+		if err := finalizeComputerCustodyOutcome(ctx, tx, computerID, now); err != nil {
+			return Computer{}, err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM computer_grants WHERE computer_id=?`, computerID); err != nil {
 		return Computer{}, internalError(err, "delete removed Computer grants")

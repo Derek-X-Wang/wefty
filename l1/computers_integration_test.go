@@ -77,6 +77,13 @@ func TestComputerOperatorRoutesPreserveCASAndRedaction(t *testing.T) {
 	if status != http.StatusAccepted {
 		t.Fatalf("remove Computer status = %d body=%s", status, body)
 	}
+	var neverBoundRemoved Computer
+	if err := json.Unmarshal(body, &neverBoundRemoved); err != nil {
+		t.Fatal(err)
+	}
+	if neverBoundRemoved.RemovalOutcome != "removed_verified" || neverBoundRemoved.CurrentJob.State != contract.JobRemovedVerified {
+		t.Fatalf("never-bound Computer removal stayed non-terminal: %#v", neverBoundRemoved)
+	}
 	var storedSpec []byte
 	if err := h.store.db.QueryRow(`SELECT spec_json FROM jobs WHERE job_id=?`, computer.CurrentJobID).Scan(&storedSpec); err != nil {
 		t.Fatal(err)

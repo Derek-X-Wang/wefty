@@ -247,6 +247,10 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/computers/{computer_id}/backups/{backup_id}/prune", s.pruneComputerBackup)
 	client.HandleFunc("POST /v1/computers/{computer_id}/backups/{backup_id}/restore", s.restoreComputerBackup)
 	client.HandleFunc("POST /v1/computers/{computer_id}/backups/{backup_id}/clone", s.cloneComputerBackup)
+	client.HandleFunc("POST /v1/computers/{computer_id}/backups/{backup_id}/export", s.exportComputerBackup)
+	client.HandleFunc("GET /v1/computers/{computer_id}/custody-exports", s.listComputerCustodyExports)
+	client.HandleFunc("POST /v1/custody-exports/{export_id}/attest-deleted", s.attestComputerCustodyDeleted)
+	client.HandleFunc("POST /v1/custody-exports/{export_id}/import", s.importComputerCustody)
 	client.HandleFunc("POST /v1/computers/{computer_id}/projections", s.installComputerProjection)
 	client.HandleFunc("POST /v1/computers/{computer_id}/remove", s.removeComputer)
 	client.HandleFunc("POST /v1/computers/{computer_id}/token-scope-proof", s.proveComputerTokenScope)
@@ -278,6 +282,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/backup-acknowledgement", s.acknowledgeComputerBackup)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/backup-prune-acknowledgement", s.acknowledgeComputerBackupPrune)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-copy-acknowledgement", s.acknowledgeComputerStorageCopy)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/custody-export-acknowledgement", s.acknowledgeComputerCustodyExport)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/restore-retirement-acknowledgement", s.acknowledgeComputerRestoreRetirement)
 
 	person := http.NewServeMux()
@@ -300,6 +305,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/jobs", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/jobs/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/computers", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/custody-exports/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/computers/{computer_id}/grants", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/grants/", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/revocations/", s.authorize(personPrincipal, person))
@@ -1000,6 +1006,71 @@ func (s *Server) cloneComputerBackup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, redactComputer(computer))
 }
 
+func (s *Server) exportComputerBackup(w http.ResponseWriter, r *http.Request) {
+	var request ComputerCustodyExportRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.BackupID = r.PathValue("backup_id")
+	request.Actor = identityFromRequest(r).NodeID
+	export, replayed, err := s.store.BeginComputerCustodyExport(r.Context(), r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusAccepted
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, export)
+}
+
+func (s *Server) listComputerCustodyExports(w http.ResponseWriter, r *http.Request) {
+	exports, err := s.store.ListComputerCustodyExports(r.Context(), r.PathValue("computer_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, exports)
+}
+
+func (s *Server) attestComputerCustodyDeleted(w http.ResponseWriter, r *http.Request) {
+	var request ComputerCustodyAttestationRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	export, err := s.store.AttestComputerCustodyDeleted(r.Context(), r.PathValue("export_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, export)
+}
+
+func (s *Server) importComputerCustody(w http.ResponseWriter, r *http.Request) {
+	var request ComputerCustodyImportRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	request.Actor = identityFromRequest(r).NodeID
+	operation, replayed, err := s.store.BeginComputerCustodyImport(r.Context(), r.PathValue("export_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusAccepted
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(w, status, operation)
+}
+
 func (s *Server) installComputerProjection(w http.ResponseWriter, r *http.Request) {
 	var request ComputerProjectionRequest
 	if err := decodeJSON(r, &request); err != nil {
@@ -1323,6 +1394,11 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	custodyExports, err := s.store.ListNodeComputerCustodyExportDirectives(r.Context(), identity.NodeID, nodeID, request.BootSessionID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	computerPolicy, err := s.store.IssueComputerPolicySnapshot(r.Context(), identity.NodeID, identity.FabricID, nodeID,
 		request.BootSessionID, s.computerPolicyFreshness)
 	if err != nil {
@@ -1330,7 +1406,8 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, HeartbeatResponse{Node: node, RemovalDirectives: directives,
 		StorageResetDirectives: storageResets, StorageGrowDirectives: storageGrows, ReimageDirectives: reimages, BackupDirectives: backups,
-		BackupPruneDirectives: backupPrunes, StorageCopyDirectives: storageCopies, ComputerPolicy: computerPolicy})
+		BackupPruneDirectives: backupPrunes, StorageCopyDirectives: storageCopies,
+		CustodyExportDirectives: custodyExports, ComputerPolicy: computerPolicy})
 }
 
 func (s *Server) watchComputerPolicy(w http.ResponseWriter, r *http.Request) {
@@ -1508,6 +1585,21 @@ func (s *Server) acknowledgeComputerStorageCopy(w http.ResponseWriter, r *http.R
 		return
 	}
 	writeJSON(w, http.StatusOK, redactComputer(computer))
+}
+
+func (s *Server) acknowledgeComputerCustodyExport(w http.ResponseWriter, r *http.Request) {
+	var request ComputerCustodyExportAcknowledgementRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	export, err := s.store.AcknowledgeComputerCustodyExport(r.Context(), identityFromRequest(r).NodeID,
+		r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, export)
 }
 
 func (s *Server) acknowledgeComputerRestoreRetirement(w http.ResponseWriter, r *http.Request) {

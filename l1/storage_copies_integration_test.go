@@ -76,6 +76,7 @@ func successfulStorageCopyReceipt(directive ComputerStorageCopyDirective) Comput
 	}
 	return ComputerStorageCopyReceipt{Kind: computerStorageCopyReceiptKind, ReceiptID: "receipt-" + directive.DestinationComputerID,
 		Operation: directive.Operation, BackupID: directive.BackupID, CopyID: directive.CopyID,
+		ExportID: directive.ExportID, ExternalPath: directive.ExternalPath, ManifestDigest: directive.ManifestDigest,
 		SourceComputerID: directive.SourceComputerID, SourceStorageID: directive.SourceStorageID,
 		SourceGeneration: directive.SourceGeneration, DestinationComputerID: directive.DestinationComputerID,
 		DestinationStorageID: directive.DestinationStorageID, DestinationGeneration: directive.DestinationGeneration,
@@ -83,8 +84,8 @@ func successfulStorageCopyReceipt(directive ComputerStorageCopyDirective) Comput
 		OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence, HelperGeneration: 9,
 		SourceSize: directive.SourceSize, DestinationSize: directive.DestinationSize,
 		SourceDigest: directive.SourceDigest, DestinationDigest: destinationDigest,
-		OSIdentityRekeyed:  directive.Operation == "clone",
-		FilesystemExpanded: directive.Operation == "clone" && directive.DestinationSize > directive.SourceSize}
+		OSIdentityRekeyed:  directive.Operation == "clone" || directive.Operation == "import",
+		FilesystemExpanded: (directive.Operation == "clone" || directive.Operation == "import") && directive.DestinationSize > directive.SourceSize}
 }
 
 func successfulOldGenerationBackupReceipt(directive ComputerStorageCopyDirective) ComputerBackupCopyReceipt {

@@ -236,12 +236,12 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_intent_history'`).Scan(&intentsSQL); err != nil {
 		t.Fatal(err)
 	}
-	for _, phase := range []string{"'resetting'", "'backing_up'", "'restoring'", "'cloning'", "'reimaging'", "'growing'"} {
+	for _, phase := range []string{"'resetting'", "'backing_up'", "'restoring'", "'cloning'", "'exporting'", "'importing'", "'reimaging'", "'growing'"} {
 		if !strings.Contains(computersSQL, phase) {
 			t.Fatalf("Computer phase %s was not reconciled: %s", phase, computersSQL)
 		}
 	}
-	for _, operation := range []string{"'reset'", "'backup_create'", "'backup_cap'", "'restore'", "'clone'", "'reimage'", "'grow'", "'abort'"} {
+	for _, operation := range []string{"'reset'", "'backup_create'", "'backup_cap'", "'restore'", "'clone'", "'custody_export'", "'custody_import'", "'reimage'", "'grow'", "'abort'"} {
 		if !strings.Contains(intentsSQL, operation) {
 			t.Fatalf("Computer operation %s was not reconciled: %s", operation, intentsSQL)
 		}
@@ -323,15 +323,16 @@ func TestStoreMigratesStorageProvenanceWithoutDroppingFutureColumns(t *testing.T
 		t.Fatal(err)
 	}
 	if !strings.Contains(tableSQL, "'restore'") || !strings.Contains(tableSQL, "'clone'") ||
-		!strings.Contains(tableSQL, "future_custody_fact") || strings.Contains(tableSQL, "backup_id TEXT NOT NULL UNIQUE") {
+		!strings.Contains(tableSQL, "future_custody_fact") || strings.Contains(tableSQL, "backup_id TEXT NOT NULL UNIQUE") ||
+		strings.Contains(tableSQL, "backup_id TEXT NOT NULL REFERENCES") {
 		t.Fatalf("Storage provenance constraints were not widened column-preservingly: %s", tableSQL)
 	}
 	if _, err := store.db.Exec(`INSERT INTO storage_provenance(
 		provenance_id, kind, source_storage_id, source_generation, backup_id,
 		destination_storage_id, destination_generation, created_ns, future_custody_fact)
-		VALUES('future-provenance', 'clone', 'source-storage', 1, 'missing-backup',
-			'destination-storage', 1, 1, 'still-preserved')`); err == nil {
-		t.Fatal("Storage provenance accepted a missing immutable Backup source")
+		VALUES('future-provenance', 'import', 'source-storage', 1, 'portable-backup-id',
+			'destination-storage', 1, 1, 'still-preserved')`); err != nil {
+		t.Fatalf("Storage provenance rejected a portable import source after L1 loss: %v", err)
 	}
 }
 
@@ -357,13 +358,13 @@ func TestStoreReconcilesParallelReimageAndRestoreConstraintLadders(t *testing.T)
 		t.Fatal(err)
 	}
 	computersSQL, err = migratedSQLiteCreateTable(computersSQL, "computers_parallel", map[string]string{
-		"'stable', 'projecting', 'resetting', 'backing_up', 'restoring', 'cloning', 'reimaging', 'growing', 'removing'": "'stable', 'projecting', 'resetting', 'backing_up', 'reimaging', 'growing', 'removing'",
+		"'stable', 'projecting', 'resetting', 'backing_up', 'restoring', 'cloning', 'exporting', 'importing', 'reimaging', 'growing', 'removing'": "'stable', 'projecting', 'resetting', 'backing_up', 'exporting', 'importing', 'reimaging', 'growing', 'removing'",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	intentsSQL, err = migratedSQLiteCreateTable(intentsSQL, "computer_intent_history_parallel", map[string]string{
-		"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'restore', 'clone', 'reimage', 'grow', 'abort'": "'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'reimage', 'grow', 'abort'",
+		"'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'restore', 'clone', 'custody_export', 'custody_import', 'reimage', 'grow', 'abort'": "'create', 'start', 'stop', 'restart', 'remove', 'project', 'reset', 'backup_create', 'backup_cap', 'custody_export', 'custody_import', 'reimage', 'grow', 'abort'",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -414,12 +415,12 @@ func TestStoreReconcilesParallelReimageAndRestoreConstraintLadders(t *testing.T)
 	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_intent_history'`).Scan(&intentsSQL); err != nil {
 		t.Fatal(err)
 	}
-	for _, token := range []string{"'restoring'", "'cloning'", "'reimaging'", "'growing'"} {
+	for _, token := range []string{"'restoring'", "'cloning'", "'exporting'", "'importing'", "'reimaging'", "'growing'"} {
 		if !strings.Contains(computersSQL, token) {
 			t.Fatalf("reconciled Computer ladder lacks %s: %s", token, computersSQL)
 		}
 	}
-	for _, token := range []string{"'restore'", "'clone'", "'reimage'", "'grow'", "'abort'"} {
+	for _, token := range []string{"'restore'", "'clone'", "'custody_export'", "'custody_import'", "'reimage'", "'grow'", "'abort'"} {
 		if !strings.Contains(intentsSQL, token) {
 			t.Fatalf("reconciled intent ladder lacks %s: %s", token, intentsSQL)
 		}

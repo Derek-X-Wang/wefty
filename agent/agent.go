@@ -244,6 +244,7 @@ func New(config Config) (*Agent, error) {
 	var computerReimagePreflighter workloadrunner.ComputerReimagePreflighter
 	var computerBackupper workloadrunner.ComputerBackupper
 	var computerStorageCopier workloadrunner.ComputerStorageCopier
+	var computerCustodyExporter workloadrunner.ComputerCustodyExporter
 	if runtimeAdapter, configured := runtimes.selectKind(contract.JobKindOCI); configured {
 		if pinRuntime, supported := runtimeAdapter.(workloadrunner.OCIImagePinRuntime); supported {
 			pinRuntime.SetOCIImageBindingPinLedger(outbox.spool)
@@ -258,6 +259,7 @@ func New(config Config) (*Agent, error) {
 		computerReimagePreflighter, _ = runtimeAdapter.(workloadrunner.ComputerReimagePreflighter)
 		computerBackupper, _ = runtimeAdapter.(workloadrunner.ComputerBackupper)
 		computerStorageCopier, _ = runtimeAdapter.(workloadrunner.ComputerStorageCopier)
+		computerCustodyExporter, _ = runtimeAdapter.(workloadrunner.ComputerCustodyExporter)
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
@@ -342,11 +344,13 @@ func New(config Config) (*Agent, error) {
 		}
 	}
 	session.storageCopies = newStorageCopyController(client, computerStorageCopier, computerBackupper,
-		config.NodeID, config.BootSessionID, logf)
+		config.NodeID, config.BootSessionID, registration.RootInstanceID, logf)
 	if session.storageCopies != nil {
 		session.storageCopies.finalizeVolumes = session.removals.finalizeVolumes
 		session.storageCopies.attestRuntimeRemoval = session.removals.attestRuntimeRemoval
 	}
+	session.custody = newCustodyController(client, computerCustodyExporter, config.NodeID, config.BootSessionID,
+		registration.RootInstanceID, logf)
 	constructionSucceeded = true
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),

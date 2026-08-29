@@ -129,10 +129,23 @@ type RemovalDirective struct {
 	ComputerStorage            *ComputerStorageClaim            `json:"computer_storage,omitempty"`
 	ComputerStorageGenerations *ComputerStorageGenerationClaims `json:"computer_storage_generations,omitempty"`
 	ComputerBackupCopies       *ComputerBackupCopyClaims        `json:"computer_backup_copies,omitempty"`
+	ComputerCustodyExports     *ComputerCustodyExportClaims     `json:"computer_custody_exports,omitempty"`
 }
 
 type ComputerBackupCopyClaims struct {
 	Copies []ComputerBackupPruneDirective `json:"copies"`
+}
+
+type ComputerCustodyExportClaims struct {
+	Exports []ComputerCustodyExportClaim `json:"exports"`
+}
+
+type ComputerCustodyExportClaim struct {
+	ExportID                string `json:"export_id"`
+	SourceStorageID         string `json:"source_storage_id"`
+	SourceGeneration        int64  `json:"source_generation"`
+	Status                  string `json:"status"`
+	OperatorAttestedDeleted bool   `json:"operator_attested_deleted"`
 }
 
 type ComputerStorageGenerationClaims struct {
@@ -258,14 +271,15 @@ type Node struct {
 // off the operator-visible Node projection because they carry cleanup fences.
 type HeartbeatResponse struct {
 	Node
-	RemovalDirectives      []RemovalDirective                  `json:"removal_directives"`
-	StorageResetDirectives []ComputerStorageResetDirective     `json:"storage_reset_directives"`
-	StorageGrowDirectives  []ComputerStorageGrowDirective      `json:"storage_grow_directives"`
-	ReimageDirectives      []ComputerReimagePreflightDirective `json:"reimage_preflight_directives"`
-	BackupDirectives       []ComputerBackupDirective           `json:"backup_directives"`
-	BackupPruneDirectives  []ComputerBackupPruneDirective      `json:"backup_prune_directives"`
-	StorageCopyDirectives  []ComputerStorageCopyDirective      `json:"storage_copy_directives"`
-	ComputerPolicy         *ComputerPolicySnapshot             `json:"computer_policy,omitempty"`
+	RemovalDirectives       []RemovalDirective                  `json:"removal_directives"`
+	StorageResetDirectives  []ComputerStorageResetDirective     `json:"storage_reset_directives"`
+	StorageGrowDirectives   []ComputerStorageGrowDirective      `json:"storage_grow_directives"`
+	ReimageDirectives       []ComputerReimagePreflightDirective `json:"reimage_preflight_directives"`
+	BackupDirectives        []ComputerBackupDirective           `json:"backup_directives"`
+	BackupPruneDirectives   []ComputerBackupPruneDirective      `json:"backup_prune_directives"`
+	StorageCopyDirectives   []ComputerStorageCopyDirective      `json:"storage_copy_directives"`
+	CustodyExportDirectives []ComputerCustodyExportDirective    `json:"custody_export_directives"`
+	ComputerPolicy          *ComputerPolicySnapshot             `json:"computer_policy,omitempty"`
 }
 
 type ServiceBindingProofRequest struct {

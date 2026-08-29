@@ -36,6 +36,9 @@ type ComputerCloneRequest struct {
 
 type ComputerStorageCopyDirective struct {
 	Operation             string `json:"operation"`
+	ExportID              string `json:"export_id,omitempty"`
+	ExternalPath          string `json:"external_path,omitempty"`
+	ManifestDigest        string `json:"manifest_digest,omitempty"`
 	BackupID              string `json:"backup_id"`
 	CopyID                string `json:"copy_id"`
 	SourceComputerID      string `json:"source_computer_id"`
@@ -88,6 +91,12 @@ type computerStorageCopyRow struct {
 	RootInstanceID        string
 	JobID                 string
 	CleanupFence          string
+	ExportID              string
+	ExternalPath          string
+	ManifestDigest        string
+	SourceSpecJSON        []byte
+	SourceSpecHash        string
+	Actor                 string
 	KeepOldBackup         bool
 	OldBackupID           sql.NullString
 	OldCopyID             sql.NullString
@@ -103,7 +112,8 @@ const storageCopyColumns = `destination_computer_id, operation, operation_revisi
 	source_size, source_digest, destination_storage_id, old_generation,
 	destination_generation, destination_size, bound_node_id, root_instance_id,
 	job_id, cleanup_fence, keep_old_as_backup, old_backup_id, old_copy_id,
-	idempotency_key, request_hash, status, acknowledgement_key, acknowledgement_hash`
+	idempotency_key, request_hash, status, acknowledgement_key, acknowledgement_hash,
+	export_id, external_path, manifest_digest, source_spec_json, source_spec_hash, actor`
 
 func scanComputerStorageCopy(scanner interface{ Scan(...any) error }) (computerStorageCopyRow, error) {
 	var row computerStorageCopyRow
@@ -113,7 +123,9 @@ func scanComputerStorageCopy(scanner interface{ Scan(...any) error }) (computerS
 		&row.OldGeneration, &row.DestinationGeneration, &row.DestinationSize,
 		&row.BoundNodeID, &row.RootInstanceID, &row.JobID, &row.CleanupFence,
 		&row.KeepOldBackup, &row.OldBackupID, &row.OldCopyID, &row.IdempotencyKey,
-		&row.RequestHash, &row.Status, &row.AcknowledgementKey, &row.AcknowledgementHash)
+		&row.RequestHash, &row.Status, &row.AcknowledgementKey, &row.AcknowledgementHash,
+		&row.ExportID, &row.ExternalPath, &row.ManifestDigest, &row.SourceSpecJSON,
+		&row.SourceSpecHash, &row.Actor)
 	return row, err
 }
 
@@ -429,7 +441,8 @@ func storageCopyDirective(row computerStorageCopyRow) ComputerStorageCopyDirecti
 		OldGeneration: row.OldGeneration, DestinationGeneration: row.DestinationGeneration,
 		DestinationSize: row.DestinationSize, BoundNodeID: row.BoundNodeID,
 		RootInstanceID: row.RootInstanceID, JobID: row.JobID, OperationRevision: row.OperationRevision,
-		CleanupFence: row.CleanupFence, KeepOldBackup: row.KeepOldBackup, Phase: row.Status}
+		CleanupFence: row.CleanupFence, KeepOldBackup: row.KeepOldBackup, Phase: row.Status,
+		ExportID: row.ExportID, ExternalPath: row.ExternalPath, ManifestDigest: row.ManifestDigest}
 	if row.OldBackupID.Valid {
 		directive.OldBackupID = row.OldBackupID.String
 	}
@@ -445,7 +458,11 @@ func (s *Store) ListNodeComputerStorageCopyDirectives(ctx context.Context, ident
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+storageCopyColumns+` FROM computer_storage_copy_operations
 		WHERE bound_node_id=? AND status IN ('reserved', 'prepared', 'published')
-		AND (operation='clone' OR authority_revoked_ns IS NOT NULL)
+		AND (operation IN ('clone', 'import') OR authority_revoked_ns IS NOT NULL)
+		AND (operation, destination_computer_id, operation_revision) IN (
+			SELECT CASE reconfiguration_phase WHEN 'cloning' THEN 'clone' WHEN 'importing' THEN 'import' ELSE 'restore' END,
+				computer_id, reconfiguration_revision FROM computers
+			WHERE reconfiguration_phase IN ('cloning', 'importing', 'restoring'))
 		ORDER BY requested_ns, destination_computer_id`, nodeID)
 	if err != nil {
 		return nil, internalError(err, "list Computer Storage copy directives")
@@ -459,7 +476,14 @@ func (s *Store) ListNodeComputerStorageCopyDirectives(ctx context.Context, ident
 		}
 		directives = append(directives, storageCopyDirective(row))
 	}
-	return directives, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, internalError(err, "close Computer Storage copy directives")
+	}
+	return directives, nil
 }
 
 func (s *Store) ListNodeComputerRestoreRevocations(ctx context.Context, nodeID string) ([]string, error) {
@@ -499,7 +523,7 @@ func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, compu
 }
 
 func validateStorageCopyReceipt(row computerStorageCopyRow, receipt ComputerStorageCopyReceipt) error {
-	if receipt.Kind != computerStorageCopyReceiptKind || strings.TrimSpace(receipt.ReceiptID) == "" ||
+	if strings.TrimSpace(receipt.ReceiptID) == "" ||
 		receipt.Operation != row.Operation || receipt.BackupID != row.BackupID || receipt.CopyID != row.CopyID ||
 		receipt.SourceComputerID != row.SourceComputerID || receipt.SourceStorageID != row.SourceStorageID ||
 		receipt.SourceGeneration != row.SourceGeneration || receipt.DestinationComputerID != row.DestinationComputerID ||
@@ -508,8 +532,25 @@ func validateStorageCopyReceipt(row computerStorageCopyRow, receipt ComputerStor
 		receipt.OperationRevision != row.OperationRevision || receipt.CleanupFence != row.CleanupFence ||
 		receipt.HelperGeneration == 0 || receipt.SourceSize != row.SourceSize ||
 		receipt.DestinationSize != row.DestinationSize || receipt.SourceDigest != row.SourceDigest ||
-		!backupDigestPattern.MatchString(receipt.SourceDigest) || !backupDigestPattern.MatchString(receipt.DestinationDigest) {
+		!backupDigestPattern.MatchString(receipt.SourceDigest) {
 		return protocolError(contract.ErrorConflict, "Computer Storage copy receipt does not match durable operation authority")
+	}
+	if row.Operation == "import" && (receipt.ExportID != row.ExportID || receipt.ExternalPath != row.ExternalPath ||
+		receipt.ManifestDigest != row.ManifestDigest) {
+		return protocolError(contract.ErrorStorageReferenceConflict, "Custody import receipt does not bind its portable manifest")
+	}
+	if receipt.Kind == "computer_storage_copy_failed_absent" {
+		if row.Operation != "import" || !receipt.DestinationAbsent || receipt.DestinationDigest != "" ||
+			receipt.OSIdentityRekeyed || receipt.FilesystemExpanded ||
+			(receipt.FailureCode != "manifest_invalid" && receipt.FailureCode != "digest_mismatch" &&
+				receipt.FailureCode != "insufficient_disk" && receipt.FailureCode != "cancelled") {
+			return protocolError(contract.ErrorInvalidRequest, "Custody import failure receipt lacks positive staging absence")
+		}
+		return nil
+	}
+	if receipt.Kind != computerStorageCopyReceiptKind || receipt.FailureCode != "" || receipt.DestinationAbsent ||
+		!backupDigestPattern.MatchString(receipt.DestinationDigest) {
+		return protocolError(contract.ErrorStorageReferenceConflict, "Computer Storage copy receipt outcome is invalid")
 	}
 	switch row.Operation {
 	case "restore":
@@ -520,6 +561,10 @@ func validateStorageCopyReceipt(row computerStorageCopyRow, receipt ComputerStor
 	case "clone":
 		if !receipt.OSIdentityRekeyed || receipt.FilesystemExpanded != (row.DestinationSize > row.SourceSize) {
 			return protocolError(contract.ErrorConflict, "Computer clone receipt lacks required rekey or expansion evidence")
+		}
+	case "import":
+		if !receipt.OSIdentityRekeyed || receipt.FilesystemExpanded != (row.DestinationSize > row.SourceSize) {
+			return protocolError(contract.ErrorStorageReferenceConflict, "Custody import receipt lacks required rekey or expansion evidence")
 		}
 	default:
 		return protocolError(contract.ErrorInvalidRequest, "Computer Storage copy operation is invalid")
@@ -589,6 +634,17 @@ func abortRestoreForFailedPredecessorCopy(ctx context.Context, tx *sql.Tx, row c
 func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNodeID, destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest) (Computer, error) {
 	if destinationComputerID == "" || request.NodeID == "" || request.BootSessionID == "" || request.IdempotencyKey == "" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "complete Computer Storage copy acknowledgement fields are required")
+	}
+	var storedOperation string
+	if err := s.db.QueryRowContext(ctx, `SELECT operation FROM computer_storage_copy_operations
+		WHERE destination_computer_id=? ORDER BY operation_revision DESC LIMIT 1`, destinationComputerID).
+		Scan(&storedOperation); errors.Is(err, sql.ErrNoRows) {
+		return Computer{}, protocolError(contract.ErrorNotFound, "Computer Storage copy operation was not found")
+	} else if err != nil {
+		return Computer{}, internalError(err, "read stored Computer Storage copy verb")
+	}
+	if storedOperation == "import" {
+		return s.AcknowledgeComputerCustodyImport(ctx, identityNodeID, destinationComputerID, request)
 	}
 	bodyHash, err := storageCopyHash(request)
 	if err != nil {

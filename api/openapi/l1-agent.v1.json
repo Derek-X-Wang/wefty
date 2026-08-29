@@ -659,8 +659,8 @@
       ],
       "post": {
         "operationId": "acknowledgeComputerStorageCopy",
-        "summary": "Publish an assertion-derived restore or clone destination",
-        "description": "The receipt binds both source Backup copy and destination Storage authority. Restore requires identical size and digest with no identity change; clone requires narrow OS-identity rekey evidence and exact larger-filesystem expansion evidence. An optional old Backup receipt is accepted only when restore precommitted that choice.",
+        "summary": "Publish an assertion-derived restore, clone, or Custody import destination",
+        "description": "The receipt binds source bytes and destination Storage authority. Custody import additionally binds the immutable export event, external path, and manifest digest, and requires clone-style OS identity rekeying.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
@@ -672,8 +672,10 @@
               "type": "object", "additionalProperties": false,
               "required": ["kind", "receipt_id", "operation", "backup_id", "copy_id", "source_computer_id", "source_storage_id", "source_generation", "destination_computer_id", "destination_storage_id", "destination_generation", "node_id", "root_instance_id", "job_id", "operation_revision", "cleanup_fence", "helper_generation", "source_size", "destination_size", "source_digest", "destination_digest", "os_identity_rekeyed", "filesystem_expanded"],
               "properties": {
-                "kind": { "const": "computer_storage_copy_verified" }, "receipt_id": { "type": "string", "minLength": 1 },
-                "operation": { "enum": ["restore", "clone"] }, "backup_id": { "type": "string", "minLength": 1 }, "copy_id": { "type": "string", "minLength": 1 },
+                "kind": { "enum": ["computer_storage_copy_verified", "computer_storage_copy_failed_absent"] }, "receipt_id": { "type": "string", "minLength": 1 },
+                "operation": { "enum": ["restore", "clone", "import"] }, "backup_id": { "type": "string", "minLength": 1 }, "copy_id": { "type": "string", "minLength": 1 },
+                "export_id": { "type": "string", "minLength": 1 }, "external_path": { "type": "string", "minLength": 1 },
+                "manifest_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
                 "source_computer_id": { "type": "string", "minLength": 1 }, "source_storage_id": { "type": "string", "minLength": 1 },
                 "source_generation": { "type": "integer", "format": "int64", "minimum": 1 },
                 "destination_computer_id": { "type": "string", "minLength": 1 }, "destination_storage_id": { "type": "string", "minLength": 1 },
@@ -682,7 +684,9 @@
                 "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 }, "cleanup_fence": { "type": "string", "minLength": 1 },
                 "helper_generation": { "type": "integer", "minimum": 1 }, "source_size": { "type": "integer", "format": "int64", "minimum": 1 }, "destination_size": { "type": "integer", "format": "int64", "minimum": 1 },
                 "source_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "destination_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-                "os_identity_rekeyed": { "type": "boolean" }, "filesystem_expanded": { "type": "boolean" }
+                "os_identity_rekeyed": { "type": "boolean" }, "filesystem_expanded": { "type": "boolean" },
+                "failure_code": { "enum": ["manifest_invalid", "digest_mismatch", "insufficient_disk", "cancelled"] },
+                "destination_absent": { "type": "boolean" }
               }
             },
             "old_backup_receipt": { "type": "object", "description": "Exact Computer Backup copy receipt for the precommitted old generation; forbidden when keep_old_as_backup was false." }
@@ -690,6 +694,42 @@
         } } } },
         "responses": {
           "200": { "description": "Destination published or identically replayed; clones are stable and stopped, while restores remain stopped pending predecessor retirement.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/agent/computers/{computer_id}/custody-export-acknowledgement": {
+      "parameters": [{ "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
+      "post": {
+        "operationId": "acknowledgeComputerCustodyExport",
+        "summary": "Record assertion-derived completion of an already-tainting Custody export",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
+          "properties": {
+            "node_id": { "type": "string", "minLength": 1 }, "boot_session_id": { "type": "string", "minLength": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 },
+            "receipt": {
+              "type": "object", "additionalProperties": false,
+              "required": ["kind", "receipt_id", "export_id", "backup_id", "copy_id", "computer_id", "storage_id", "storage_generation", "node_id", "root_instance_id", "operation_revision", "custody_fence", "helper_generation", "external_path", "allocated_size", "content_digest", "manifest_digest"],
+              "properties": {
+                "kind": { "enum": ["computer_custody_export_verified", "computer_custody_export_failed"] }, "receipt_id": { "type": "string", "minLength": 1 },
+                "export_id": { "type": "string", "minLength": 1 }, "backup_id": { "type": "string", "minLength": 1 }, "copy_id": { "type": "string", "minLength": 1 },
+                "computer_id": { "type": "string", "minLength": 1 }, "storage_id": { "type": "string", "minLength": 1 },
+                "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 }, "node_id": { "type": "string", "minLength": 1 },
+                "root_instance_id": { "type": "string", "minLength": 1 }, "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+                "custody_fence": { "type": "string", "minLength": 1 }, "helper_generation": { "type": "integer", "minimum": 1 },
+                "external_path": { "type": "string", "minLength": 1 }, "allocated_size": { "type": "integer", "format": "int64", "minimum": 1 },
+                "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "manifest_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "failure_code": { "enum": ["insufficient_disk", "destination_not_empty", "managed_root_path", "cancelled"] }
+              }
+            }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Completion evidence recorded; the pre-write custody taint remains permanent.", "content": { "application/json": { "schema": { "type": "object" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }

@@ -19,6 +19,7 @@ type storageCopyController struct {
 	attestRuntimeRemoval func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error)
 	nodeID               string
 	bootSessionID        string
+	rootInstanceID       string
 	logf                 func(string, ...any)
 
 	mu       sync.Mutex
@@ -27,17 +28,21 @@ type storageCopyController struct {
 }
 
 func newStorageCopyController(client *Client, copier workloadrunner.ComputerStorageCopier,
-	backupper workloadrunner.ComputerBackupper, nodeID, bootSessionID string, logf func(string, ...any)) *storageCopyController {
+	backupper workloadrunner.ComputerBackupper, nodeID, bootSessionID, rootInstanceID string, logf func(string, ...any)) *storageCopyController {
 	if copier == nil {
 		return nil
 	}
 	return &storageCopyController{client: client, copier: copier, backupper: backupper,
-		nodeID: nodeID, bootSessionID: bootSessionID, logf: logf, inflight: make(map[string]struct{})}
+		nodeID: nodeID, bootSessionID: bootSessionID, rootInstanceID: rootInstanceID,
+		logf: logf, inflight: make(map[string]struct{})}
 }
 
 func (controller *storageCopyController) process(ctx context.Context, directive l1.ComputerStorageCopyDirective) error {
 	if directive.BoundNodeID != controller.nodeID {
 		return fmt.Errorf("Computer Storage copy belongs to node %q, not %q", directive.BoundNodeID, controller.nodeID)
+	}
+	if directive.RootInstanceID != controller.rootInstanceID {
+		return fmt.Errorf("Computer Storage copy belongs to managed-root instance %q, not %q", directive.RootInstanceID, controller.rootInstanceID)
 	}
 	if directive.Phase == "published" {
 		if directive.Operation != "restore" {
@@ -75,6 +80,7 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 		Operation: directive.Operation, BackupID: directive.BackupID, CopyID: directive.CopyID,
 		SourceComputerID: directive.SourceComputerID, SourceStorageID: directive.SourceStorageID,
 		SourceGeneration: directive.SourceGeneration, SourceSize: directive.SourceSize, SourceDigest: directive.SourceDigest,
+		ExportID: directive.ExportID, ExternalPath: directive.ExternalPath, ManifestDigest: directive.ManifestDigest,
 		Destination: workloadrunner.ComputerStorage{ComputerID: directive.DestinationComputerID,
 			StorageID: directive.DestinationStorageID, StorageGeneration: directive.DestinationGeneration,
 			IntentRevision: directive.OperationRevision, DiskBytes: directive.DestinationSize},
@@ -85,11 +91,51 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 	if err != nil {
 		return err
 	}
+	if directive.Operation == "import" && receipt.Kind == "computer_storage_copy_failed_absent" {
+		if err := controller.attestFailedImportCleanup(ctx, directive); err != nil {
+			return err
+		}
+	}
 	_, err = controller.client.AcknowledgeComputerStorageCopy(ctx, directive.DestinationComputerID,
 		l1.ComputerStorageCopyAcknowledgementRequest{NodeID: controller.nodeID,
 			BootSessionID: controller.bootSessionID, IdempotencyKey: receipt.ReceiptID,
 			Receipt: receipt, OldBackupReceipt: oldBackupReceipt})
 	return err
+}
+
+func (controller *storageCopyController) attestFailedImportCleanup(ctx context.Context, directive l1.ComputerStorageCopyDirective) error {
+	if controller.finalizeVolumes == nil || controller.attestRuntimeRemoval == nil {
+		return errors.New("failed Custody import cleanup requires shared removal mechanics")
+	}
+	generation := uint64(directive.OperationRevision)
+	storage := &workloadrunner.ComputerStorage{ComputerID: directive.DestinationComputerID,
+		StorageID: directive.DestinationStorageID, StorageGeneration: directive.DestinationGeneration,
+		IntentRevision: directive.OperationRevision, DiskBytes: directive.DestinationSize}
+	if err := controller.finalizeVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
+		Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
+		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: controller.nodeID,
+			BootSessionID: controller.bootSessionID, JobID: directive.JobID,
+			RemovalGeneration: generation, CleanupFence: directive.CleanupFence},
+	}); err != nil {
+		return fmt.Errorf("delete failed Custody import staging through shared removal machinery: %w", err)
+	}
+	manifest := workloadrunner.RuntimeResourceManifest{Version: 1, RuntimeKind: contract.JobKindOCI,
+		NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: directive.JobID,
+		AttemptID:    "storage-import-failed-" + fmt.Sprint(directive.OperationRevision),
+		FencingToken: directive.CleanupFence, WorkloadClass: contract.JobClassService,
+		RemovalGeneration: fmt.Sprint(generation), ComputerStorage: storage, StorageOnly: true}
+	attestation, err := controller.attestRuntimeRemoval(ctx, workloadrunner.RuntimeRemovalProofRequest{
+		JobID: directive.JobID, RemovalGeneration: generation,
+		Attempts: []workloadrunner.RuntimeResourceManifest{manifest},
+	})
+	if err != nil {
+		return fmt.Errorf("attest failed Custody import staging absence: %w", err)
+	}
+	if err := validateRuntimeRemovalAttestation(runtimeRemovalManifest{Version: 1, JobID: directive.JobID,
+		RemovalGeneration: generation, Attempts: []workloadrunner.RuntimeResourceManifest{manifest}}, attestation); err != nil {
+		return fmt.Errorf("validate failed Custody import staging absence: %w", err)
+	}
+	return nil
 }
 
 func (controller *storageCopyController) retirePredecessor(ctx context.Context, directive l1.ComputerStorageCopyDirective) error {

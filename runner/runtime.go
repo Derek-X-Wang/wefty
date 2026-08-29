@@ -629,6 +629,9 @@ type ComputerStorageCopyRequest struct {
 	SourceGeneration  int64
 	SourceSize        int64
 	SourceDigest      string
+	ExportID          string
+	ExternalPath      string
+	ManifestDigest    string
 	Destination       ComputerStorage
 	NodeID            string
 	BootSessionID     string
@@ -639,6 +642,31 @@ type ComputerStorageCopyRequest struct {
 }
 
 type ComputerStorageCopyReceipt = contract.ComputerStorageCopyReceipt
+
+// ComputerCustodyExporter transfers one already-published Backup copy beyond
+// the managed root. L1 records the permanent custody event before calling it.
+type ComputerCustodyExporter interface {
+	ExportComputerCustody(context.Context, ComputerCustodyExportRequest) (ComputerCustodyExportReceipt, error)
+}
+
+type ComputerCustodyExportRequest struct {
+	ExportID          string
+	BackupID          string
+	CopyID            string
+	Storage           ComputerStorage
+	SourceSize        int64
+	SourceDigest      string
+	ExternalPath      string
+	NodeID            string
+	BootSessionID     string
+	RootInstanceID    string
+	OperationRevision int64
+	CustodyFence      string
+	JobSpec           contract.JobSpec
+	JobSpecHash       string
+}
+
+type ComputerCustodyExportReceipt = contract.ComputerCustodyExportReceipt
 
 // OutputSink receives raw output events. Calls may be concurrent across
 // streams, so implementations must provide any required synchronization.
