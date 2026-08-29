@@ -14,6 +14,7 @@ concurrency:
 env:
   IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
   COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-reference
+  WAYLAND_COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-wayland-reference
 
 jobs:
   reproducible-platform-build:
@@ -232,12 +233,16 @@ jobs:
           if-no-files-found: error
 
   reference-computer-platform-build:
-    name: reference-computer-platform-build / linux/${{ matrix.arch }}
+    name: reference-computer-platform-build / ${{ matrix.variant }} / linux/${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
-    runs-on: ubuntu-latest
+        include:
+          - {arch: amd64, variant: xfce, dockerfile: examples/computer/Dockerfile, local_name: wefty-computer-reference, artifact: wefty-computer-reference, edge: 'wefty-rfb-websocket --port', elf_path: usr/lib/chromium/chromium}
+          - {arch: arm64, variant: xfce, dockerfile: examples/computer/Dockerfile, local_name: wefty-computer-reference, artifact: wefty-computer-reference, edge: 'wefty-rfb-websocket --port', elf_path: usr/lib/chromium/chromium}
+          - {arch: amd64, variant: wayland, dockerfile: examples/computer-wayland/Dockerfile, local_name: wefty-computer-wayland-reference, artifact: wefty-computer-wayland-reference, edge: 'wayvnc -w', elf_path: usr/bin/wayvnc}
+          - {arch: arm64, variant: wayland, dockerfile: examples/computer-wayland/Dockerfile, local_name: wefty-computer-wayland-reference, artifact: wefty-computer-wayland-reference, edge: 'wayvnc -w', elf_path: usr/bin/wayvnc}
+    runs-on: ${{ matrix.arch == 'arm64' && matrix.variant == 'wayland' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     services:
       registry:
         image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
@@ -248,30 +253,38 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+      - if: matrix.arch != 'arm64' || matrix.variant != 'wayland'
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
         with:
           version: v0.36.1
           driver-opts: |
             image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
             network=host
-      - name: Build the reference desktop twice from empty caches
+      - name: Build the reference desktop into its execution shape
         env:
           PLATFORM: linux/${{ matrix.arch }}
           ARCH: ${{ matrix.arch }}
+          VARIANT: ${{ matrix.variant }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          LOCAL_NAME: ${{ matrix.local_name }}
         run: |
           set -euo pipefail
-          registry_reference="localhost:5000/wefty-computer-reference:${GITHUB_SHA}-${ARCH}"
+          registry_reference="localhost:5000/${LOCAL_NAME}:${GITHUB_SHA}-${ARCH}"
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
-            --build-arg SOURCE_DATE_EPOCH=0 --file examples/computer/Dockerfile \
+            --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" .
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
-            --build-arg SOURCE_DATE_EPOCH=0 --file examples/computer/Dockerfile \
+            --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
       - name: Execute the exact desktop digest and assert its ELF architecture
         env:
           PLATFORM: linux/${{ matrix.arch }}
           ARCH: ${{ matrix.arch }}
+          VARIANT: ${{ matrix.variant }}
+          LOCAL_NAME: ${{ matrix.local_name }}
+          EDGE_PROCESS_PATTERN: ${{ matrix.edge }}
+          ELF_PATH: ${{ matrix.elf_path }}
         run: |
           set -euo pipefail
           evidence="$RUNNER_TEMP/computer-image-linux"
@@ -282,21 +295,29 @@ jobs:
           cp "$RUNNER_TEMP/computer-image.oci.tar" "$evidence/${ARCH}.oci.tar"
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
-          registry_reference="localhost:5000/wefty-computer-reference:${GITHUB_SHA}-${ARCH}"
+          registry_reference="localhost:5000/${LOCAL_NAME}:${GITHUB_SHA}-${ARCH}"
           platform_digest="$(cat "$evidence/${ARCH}.digest")"
           registry_digest="$("$crane" digest --insecure "$registry_reference")"
           test "$registry_digest" = "$platform_digest"
           printf '%s\n' "$registry_digest" > "$evidence/${ARCH}-registry.digest"
           pinned_reference="${registry_reference}@${platform_digest}"
           docker pull --platform "$PLATFORM" "$pinned_reference"
-          scripts/test-computer-image-runtime.sh --image "$pinned_reference" --arch "$ARCH" --evidence "$evidence"
+          scripts/test-computer-image-runtime.sh --image "$pinned_reference" --arch "$ARCH" --evidence "$evidence" \
+            --edge-process-pattern "$EDGE_PROCESS_PATTERN"
+          scripts/measure-computer-image.sh --image "$pinned_reference" --arch "$ARCH" \
+            --conformance-receipt "$evidence/${ARCH}-runtime.json" --output "$evidence/${ARCH}-metrics.json"
+          if [[ $VARIANT == wayland ]]; then
+            scripts/test-computer-wayland-furniture.sh --image "$pinned_reference" --arch "$ARCH" \
+              --conformance-receipt "$evidence/${ARCH}-runtime.json" --output "$evidence/${ARCH}-furniture.json" \
+              --metrics-output "$evidence/${ARCH}-metrics.json"
+          fi
 
           "$crane" export --insecure --platform "$PLATFORM" "$pinned_reference" "$RUNNER_TEMP/computer-rootfs.tar"
-          tar -xOf "$RUNNER_TEMP/computer-rootfs.tar" usr/lib/chromium/chromium > "$RUNNER_TEMP/chromium"
-          python3 - "$RUNNER_TEMP/chromium" "$ARCH" <<'PY'
+          tar -xOf "$RUNNER_TEMP/computer-rootfs.tar" "$ELF_PATH" > "$RUNNER_TEMP/computer-elf"
+          python3 - "$RUNNER_TEMP/computer-elf" "$ARCH" <<'PY'
           import struct, sys
           payload = open(sys.argv[1], "rb").read(20)
-          if payload[:4] != b"\x7fELF": raise SystemExit("Chromium is not ELF")
+          if payload[:4] != b"\x7fELF": raise SystemExit("reference desktop executable is not ELF")
           machine = struct.unpack("<H", payload[18:20])[0]
           expected = {"amd64": 62, "arm64": 183}[sys.argv[2]]
           if machine != expected: raise SystemExit(f"ELF e_machine={machine}, want {expected}")
@@ -309,7 +330,7 @@ jobs:
       - name: Upload reference desktop evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: wefty-computer-reference-platform-${{ matrix.arch }}-${{ github.sha }}
+          name: ${{ matrix.artifact }}-platform-${{ matrix.arch }}-${{ github.sha }}
           path: ${{ runner.temp }}/computer-image-linux
           if-no-files-found: error
 
@@ -374,7 +395,7 @@ jobs:
           test "$(jq -r --arg digest "$arm64_digest" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64" and .digest == $digest)] | length' "$RUNNER_TEMP/computer-image-index.json")" = 1
           test "$(jq -r '[.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length' "$RUNNER_TEMP/computer-image-index.json")" = 2
           # shellcheck disable=SC2016 # $digest is a jq variable, not a shell expansion.
-          receipt_assertion='.digest == $digest and .executed and .rfb_websocket_v1 and .transport_assertions and .negative_rows.driver_fail_closed and .endpoints.view == "loopback" and .endpoints.control == "loopback" and .roles.view_process_view_only and .roles.control_process_interactive and .roles.view_pointer_discarded and .driver_signal_consumed and .profile_persistent and .sign_in_persistent and .rootfs_read_only and .attempt_tmpfs_discarded and .shm.private and .shm.conformant and .readiness_seconds < 60 and .restarted_edge_recovered'
+          receipt_assertion='def pass($id): ([.checks[] | select(.id == $id and .status == "PASS")] | length) == 1; .digest == $digest and .image_status == "PASS" and .harness_status == "PASS" and .containerd_profile_status == "NOT-RUN" and (.checks | length) == 60 and pass("transport.view-ready") and pass("transport.control-ready") and pass("transport.text-frame-rejected") and pass("input.view-isolated") and pass("input.view-isolated-during-tenure") and pass("input.control-accepted") and pass("driver.true-consumed") and pass("driver.release-consumed") and pass("persistence.profile-survives") and pass("persistence.sign-in-survives") and pass("persistence.edge-recovers") and ([.checks[] | select(.scope != "containerd-profile" and .status != "PASS")] | length) == 0 and ([.checks[] | select(.scope == "containerd-profile" and .status != "NOT-RUN")] | length) == 0 and .readiness_seconds < 60'
           jq -e --arg digest "$amd64_digest" "$receipt_assertion and .elf_e_machine == 62" "$RUNNER_TEMP/computer-platforms/amd64-runtime.json"
           jq -e --arg digest "$arm64_digest" "$receipt_assertion and .elf_e_machine == 183" "$RUNNER_TEMP/computer-platforms/arm64-runtime.json"
       - name: Emit the digest-selected Computer OCI archive
@@ -409,6 +430,8 @@ jobs:
           cp "$RUNNER_TEMP/computer-image-archive-receipt.json" "$release/"
           cp "$RUNNER_TEMP/computer-platforms/amd64-runtime.json" "$release/amd64-runtime.json"
           cp "$RUNNER_TEMP/computer-platforms/arm64-runtime.json" "$release/arm64-runtime.json"
+          cp "$RUNNER_TEMP/computer-platforms/amd64-metrics.json" "$release/amd64-metrics.json"
+          cp "$RUNNER_TEMP/computer-platforms/arm64-metrics.json" "$release/arm64-metrics.json"
           jq -n --arg commit "$GITHUB_SHA" --arg reference "$COMPUTER_IMAGE_NAME" --arg index_digest "$index_digest" \
             --arg amd64_digest "$(cat "$RUNNER_TEMP/computer-platforms/amd64.digest")" --arg arm64_digest "$(cat "$RUNNER_TEMP/computer-platforms/arm64.digest")" \
             '{version: 1, commit: $commit, reference: $reference, index_digest: $index_digest, platforms: {"linux/amd64": $amd64_digest, "linux/arm64": $arm64_digest}, public_pull: true, archive_verified: true, runtime_verified: {"linux/amd64": true, "linux/arm64": true}}' \
@@ -420,4 +443,119 @@ jobs:
         with:
           name: wefty-computer-reference-${{ github.sha }}
           path: ${{ runner.temp }}/computer-image-package
+          if-no-files-found: error
+
+  publish-wayland-reference-computer:
+    name: publish-wayland-reference-computer-index-and-archive
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [reference-computer-platform-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Download executed Wayland platform evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: wefty-computer-wayland-reference-platform-*-${{ github.sha }}
+          path: ${{ runner.temp }}/wayland-computer-platforms
+          merge-multiple: true
+      - name: Authenticate the main-only Wayland desktop publisher
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Promote the executed Wayland archives into a multi-platform index
+        id: publish-wayland-computer
+        run: |
+          set -euo pipefail
+          go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
+          crane="$(go env GOPATH)/bin/crane"
+          for arch in amd64 arm64; do
+            layout="$RUNNER_TEMP/wayland-computer-$arch.oci"
+            mkdir -p "$layout"
+            tar -xf "$RUNNER_TEMP/wayland-computer-platforms/$arch.oci.tar" -C "$layout"
+            "$crane" push "$layout" "$WAYLAND_COMPUTER_IMAGE_NAME:${GITHUB_SHA}-${arch}"
+            test "$("$crane" digest "$WAYLAND_COMPUTER_IMAGE_NAME:${GITHUB_SHA}-${arch}")" = "$(cat "$RUNNER_TEMP/wayland-computer-platforms/$arch.digest")"
+          done
+          "$crane" index append \
+            -m "$WAYLAND_COMPUTER_IMAGE_NAME@$(cat "$RUNNER_TEMP/wayland-computer-platforms/amd64.digest")" \
+            -m "$WAYLAND_COMPUTER_IMAGE_NAME@$(cat "$RUNNER_TEMP/wayland-computer-platforms/arm64.digest")" \
+            -t "$WAYLAND_COMPUTER_IMAGE_NAME:$GITHUB_SHA"
+          index_digest="$("$crane" digest "$WAYLAND_COMPUTER_IMAGE_NAME:$GITHUB_SHA")"
+          printf '%s\n' "digest=$index_digest" >> "$GITHUB_OUTPUT"
+      - name: Bind the Wayland index to conformance, furniture, and ELF evidence
+        env:
+          ACTION_DIGEST: ${{ steps.publish-wayland-computer.outputs.digest }}
+        run: |
+          set -euo pipefail
+          crane="$(go env GOPATH)/bin/crane"
+          index_digest="$("$crane" digest "$WAYLAND_COMPUTER_IMAGE_NAME:$GITHUB_SHA")"
+          test "$index_digest" = "$ACTION_DIGEST"
+          printf '%s\n' "$index_digest" > "$RUNNER_TEMP/wayland-computer-image-index-digest.txt"
+          "$crane" manifest "$WAYLAND_COMPUTER_IMAGE_NAME@$index_digest" > "$RUNNER_TEMP/wayland-computer-image-index.json"
+          amd64_digest="$(cat "$RUNNER_TEMP/wayland-computer-platforms/amd64.digest")"
+          arm64_digest="$(cat "$RUNNER_TEMP/wayland-computer-platforms/arm64.digest")"
+          test "$(jq -r --arg digest "$amd64_digest" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64" and .digest == $digest)] | length' "$RUNNER_TEMP/wayland-computer-image-index.json")" = 1
+          test "$(jq -r --arg digest "$arm64_digest" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64" and .digest == $digest)] | length' "$RUNNER_TEMP/wayland-computer-image-index.json")" = 1
+          test "$(jq -r '[.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length' "$RUNNER_TEMP/wayland-computer-image-index.json")" = 2
+          # shellcheck disable=SC2016 # $digest is a jq variable, not a shell expansion.
+          receipt_assertion='def pass($id): ([.checks[] | select(.id == $id and .status == "PASS")] | length) == 1; .digest == $digest and .image_status == "PASS" and .harness_status == "PASS" and .containerd_profile_status == "NOT-RUN" and (.checks | length) == 60 and pass("transport.view-ready") and pass("transport.control-ready") and pass("transport.text-frame-rejected") and pass("input.view-isolated") and pass("input.view-isolated-during-tenure") and pass("input.control-accepted") and pass("driver.true-consumed") and pass("driver.release-consumed") and pass("persistence.profile-survives") and pass("persistence.sign-in-survives") and pass("persistence.edge-recovers") and ([.checks[] | select(.scope != "containerd-profile" and .status != "PASS")] | length) == 0 and ([.checks[] | select(.scope == "containerd-profile" and .status != "NOT-RUN")] | length) == 0 and .readiness_seconds < 60'
+          jq -e --arg digest "$amd64_digest" "$receipt_assertion and .elf_e_machine == 62" "$RUNNER_TEMP/wayland-computer-platforms/amd64-runtime.json"
+          jq -e --arg digest "$arm64_digest" "$receipt_assertion and .elf_e_machine == 183" "$RUNNER_TEMP/wayland-computer-platforms/arm64-runtime.json"
+          furniture_assertion='.gpu_device_absent == true and .native_wayvnc_websocket == true and .view_disable_input == true and .agent_states_observed == ["idle","working","blocked","done"] and .self_reconfiguration_observed == true and .crash_briefing_observed == true and .mise_stubs_present == true and .license_manifest_present == true and .idle_rss_bytes > 0 and (.cold_start_seconds | type) == "number" and .cold_start_seconds < 60'
+          jq -e "$furniture_assertion" "$RUNNER_TEMP/wayland-computer-platforms/amd64-furniture.json"
+          jq -e "$furniture_assertion" "$RUNNER_TEMP/wayland-computer-platforms/arm64-furniture.json"
+      - name: Emit the digest-selected Wayland Computer OCI archive
+        run: |
+          set -euo pipefail
+          crane="$(go env GOPATH)/bin/crane"
+          index_digest="$(cat "$RUNNER_TEMP/wayland-computer-image-index-digest.txt")"
+          layout="$RUNNER_TEMP/wefty-computer-wayland-reference.oci"
+          archive="$RUNNER_TEMP/wefty-computer-wayland-reference.oci.tar"
+          "$crane" pull "$WAYLAND_COMPUTER_IMAGE_NAME@$index_digest" "$layout" --format=oci --annotate-ref
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$layout" -cf "$archive" .
+          scripts/verify-acceptance-image.sh --archive "$archive" --expected-top-digest "$index_digest" \
+            --expected-platform linux/amd64 --expected-platform linux/arm64 \
+            --expected-platform-digest "linux/amd64=$(cat "$RUNNER_TEMP/wayland-computer-platforms/amd64.digest")" \
+            --expected-platform-digest "linux/arm64=$(cat "$RUNNER_TEMP/wayland-computer-platforms/arm64.digest")" \
+            --receipt-output "$RUNNER_TEMP/wayland-computer-image-archive-receipt.json"
+          mkdir -p "$RUNNER_TEMP/anonymous-wayland-docker"
+          if ! DOCKER_CONFIG="$RUNNER_TEMP/anonymous-wayland-docker" "$crane" manifest "$WAYLAND_COMPUTER_IMAGE_NAME@$index_digest" >/dev/null; then
+            printf '%s\n' '::error title=Public GHCR verification failed::Set the repository-linked wefty-computer-wayland-reference package visibility to Public, then rerun acceptance-image.' >&2
+            exit 1
+          fi
+      - name: Assemble the separate Wayland Computer release artifact
+        run: |
+          set -euo pipefail
+          release="$RUNNER_TEMP/wayland-computer-image-release"
+          package="$RUNNER_TEMP/wayland-computer-image-package"
+          index_digest="$(cat "$RUNNER_TEMP/wayland-computer-image-index-digest.txt")"
+          mkdir -p "$release" "$package"
+          cp "$RUNNER_TEMP/wefty-computer-wayland-reference.oci.tar" "$release/"
+          cp "$RUNNER_TEMP/wayland-computer-image-index.json" "$release/"
+          cp "$RUNNER_TEMP/wayland-computer-image-index-digest.txt" "$release/"
+          cp "$RUNNER_TEMP/wayland-computer-image-archive-receipt.json" "$release/"
+          for arch in amd64 arm64; do
+            cp "$RUNNER_TEMP/wayland-computer-platforms/$arch-runtime.json" "$release/$arch-runtime.json"
+            cp "$RUNNER_TEMP/wayland-computer-platforms/$arch-metrics.json" "$release/$arch-metrics.json"
+            cp "$RUNNER_TEMP/wayland-computer-platforms/$arch-furniture.json" "$release/$arch-furniture.json"
+          done
+          jq -n --arg commit "$GITHUB_SHA" --arg reference "$WAYLAND_COMPUTER_IMAGE_NAME" --arg index_digest "$index_digest" \
+            --arg amd64_digest "$(cat "$RUNNER_TEMP/wayland-computer-platforms/amd64.digest")" --arg arm64_digest "$(cat "$RUNNER_TEMP/wayland-computer-platforms/arm64.digest")" \
+            '{version:1,commit:$commit,reference:$reference,index_digest:$index_digest,platforms:{"linux/amd64":$amd64_digest,"linux/arm64":$arm64_digest},public_pull:true,archive_verified:true,runtime_verified:{"linux/amd64":true,"linux/arm64":true},furniture_verified:{"linux/amd64":true,"linux/arm64":true}}' \
+            > "$release/wayland-computer-image-receipt.json"
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$RUNNER_TEMP" \
+            -cf "$package/wefty-computer-wayland-reference-release.tar" wayland-computer-image-release
+      - name: Upload stable Wayland Computer image outputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wefty-computer-wayland-reference-${{ github.sha }}
+          path: ${{ runner.temp }}/wayland-computer-image-package
           if-no-files-found: error

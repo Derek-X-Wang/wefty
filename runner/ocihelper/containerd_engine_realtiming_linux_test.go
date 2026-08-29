@@ -69,8 +69,11 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	computerReference := os.Getenv("WEFTY_OCI_COMPUTER_REFERENCE")
 	computerDigest := os.Getenv("WEFTY_OCI_COMPUTER_DIGEST")
 	computerArchivePath := os.Getenv("WEFTY_OCI_COMPUTER_ARCHIVE")
+	waylandComputerReference := os.Getenv("WEFTY_OCI_WAYLAND_COMPUTER_REFERENCE")
+	waylandComputerDigest := os.Getenv("WEFTY_OCI_WAYLAND_COMPUTER_DIGEST")
+	waylandComputerArchivePath := os.Getenv("WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE")
 	provisionReceipt := os.Getenv("WEFTY_OCI_PROVISION_RECEIPT")
-	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoDigest == "" || echoArchivePath == "" || weftyCLI == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" || computerReference == "" || computerDigest == "" || computerArchivePath == "" || provisionReceipt == "" {
+	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoDigest == "" || echoArchivePath == "" || weftyCLI == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" || computerReference == "" || computerDigest == "" || computerArchivePath == "" || waylandComputerReference == "" || waylandComputerDigest == "" || waylandComputerArchivePath == "" || provisionReceipt == "" {
 		t.Fatal("Linux OCI realtiming provisioning is incomplete")
 	}
 	if reference != echoReference || digest != echoDigest || archivePath != echoArchivePath || reference != "ghcr.io/derek-x-wang/wefty-echo-service" {
@@ -78,6 +81,9 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	}
 	if computerReference != "ghcr.io/derek-x-wang/wefty-computer-reference" || computerReference == echoReference || computerArchivePath == echoArchivePath {
 		t.Fatalf("reference Computer artifact is not separate from generic OCI acceptance: %s@%s archive=%s", computerReference, computerDigest, computerArchivePath)
+	}
+	if waylandComputerReference != "ghcr.io/derek-x-wang/wefty-computer-wayland-reference" || waylandComputerReference == computerReference || waylandComputerArchivePath == computerArchivePath {
+		t.Fatalf("Wayland reference Computer artifact is not separate: %s@%s archive=%s", waylandComputerReference, waylandComputerDigest, waylandComputerArchivePath)
 	}
 	if os.Geteuid() == 0 {
 		t.Fatal("Linux OCI realtiming test process must be unprivileged")
@@ -431,7 +437,12 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if computerImage.TopLevelDigest != computerDigest || computerImage.PlatformDigest == "" {
 		t.Fatalf("reference Computer archive identity = %+v, want top-level %s", computerImage, computerDigest)
 	}
-	referenceComputerReadiness := exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, computerReference, computerDigest)
+	referenceComputerReadiness := exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, "xfce", computerReference, computerDigest)
+	waylandComputerImage := loadNativeImageArchive(t, ctx, adapter, waylandComputerReference, waylandComputerArchivePath)
+	if waylandComputerImage.TopLevelDigest != waylandComputerDigest || waylandComputerImage.PlatformDigest == "" {
+		t.Fatalf("Wayland reference Computer archive identity = %+v, want top-level %s", waylandComputerImage, waylandComputerDigest)
+	}
+	waylandComputerReadiness := exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, "wayland", waylandComputerReference, waylandComputerDigest)
 	numericImage := loadNativeImageArchive(t, ctx, adapter, numericReference, numericArchivePath)
 	namedImage := loadNativeImageArchive(t, ctx, adapter, namedReference, namedArchivePath)
 	serviceDataEvidence := exerciseNativeLinuxServiceData(t, ctx, session, adapter, []nativeServiceDataImage{
@@ -713,7 +724,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "node-doctor.json"), append(doctorBundle, '\n'), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_pull_rejected=%t\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_reference=%s\ncomputer_index_digest=%s\ncomputer_reference_separate=true\ncomputer_reference_archive_import=true\ncomputer_reference_atomic_readiness=%t\ncomputer_reference_readiness_elapsed=%s\ncomputer_reference_publication_loss_recovery=%t\ncomputer_reference_wire_negatives=true\ncomputer_capacity_three_live_published_fourth_refused=true\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\ncomputer_reference_helper_stop_start_profile_sign_in_rootfs=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, registryDisabledPullRejected, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerReference, computerDigest, referenceComputerReadiness.atomicPublication, referenceComputerReadiness.elapsed, referenceComputerReadiness.lossRecovery, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_pull_rejected=%t\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_reference=%s\ncomputer_index_digest=%s\ncomputer_reference_separate=true\ncomputer_reference_archive_import=true\ncomputer_reference_atomic_readiness=%t\ncomputer_reference_readiness_elapsed=%s\ncomputer_reference_publication_loss_recovery=%t\ncomputer_reference_wire_negatives=true\nwayland_computer_reference=%s\nwayland_computer_index_digest=%s\nwayland_computer_reference_separate=true\nwayland_computer_reference_archive_import=true\nwayland_computer_reference_atomic_readiness=%t\nwayland_computer_reference_readiness_elapsed=%s\nwayland_computer_reference_publication_loss_recovery=%t\nwayland_computer_reference_wire_negatives=true\ncomputer_capacity_three_live_published_fourth_refused=true\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\ncomputer_reference_helper_stop_start_profile_sign_in_rootfs=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, registryDisabledPullRejected, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerReference, computerDigest, referenceComputerReadiness.atomicPublication, referenceComputerReadiness.elapsed, referenceComputerReadiness.lossRecovery, waylandComputerReference, waylandComputerDigest, waylandComputerReadiness.atomicPublication, waylandComputerReadiness.elapsed, waylandComputerReadiness.lossRecovery, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -726,12 +737,12 @@ type referenceComputerEvidence struct {
 	lossRecovery      bool
 }
 
-func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, session *ocihelper.Session, adapter *ocirunner.Adapter, reference, digest string) referenceComputerEvidence {
+func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, session *ocihelper.Session, adapter *ocirunner.Adapter, identity, reference, digest string) referenceComputerEvidence {
 	t.Helper()
 	memory := int64(2 << 30)
 	digestCopy := digest
-	authority := workloadrunner.AttemptAuthority{NodeID: "reference-node", BootSessionID: "reference-boot", JobID: "reference-job", AttemptID: "reference-attempt", FencingToken: "reference-fence", WorkloadClass: contract.JobClassService, RemovalGeneration: "attempt"}
-	storage := &workloadrunner.ComputerStorage{ComputerID: "reference-computer", StorageID: "reference-storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 128 << 20}
+	authority := workloadrunner.AttemptAuthority{NodeID: "reference-" + identity + "-node", BootSessionID: "reference-" + identity + "-boot", JobID: "reference-" + identity + "-job", AttemptID: "reference-" + identity + "-attempt", FencingToken: "reference-" + identity + "-fence", WorkloadClass: contract.JobClassService, RemovalGeneration: "attempt"}
+	storage := &workloadrunner.ComputerStorage{ComputerID: "reference-" + identity + "-computer", StorageID: "reference-" + identity + "-storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 128 << 20}
 	request := workloadrunner.Request{Authority: authority, RuntimeHandler: ocihelper.DefaultRuntimeHandler, InitialDeadman: l1.DefaultLeaseDuration, LifetimeBoundary: workloadrunner.AgentBootLifetime,
 		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: reference, Digest: &digestCopy}, Computer: &contract.OCIComputerSpec{Display: contract.OCIComputerDisplaySpec{Protocol: contract.ComputerDisplayProtocolRFBWebSocketV1}, DiskBytes: storage.DiskBytes}, Limits: &contract.OCILimits{MemoryBytes: &memory}}},
 		ManagedVolumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}}, AttemptEndpoints: []string{workloadrunner.AttemptEndpointView, workloadrunner.AttemptEndpointControl},
@@ -766,7 +777,7 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 	startedAt := time.Now()
 	network := plain.NewNetwork()
 	go func() {
-		_, err := agent.RunComputerServiceRealtiming(runContext, adapter, request, network.NewFabric(fabric.Identity{NodeID: "reference-agent"}), dial,
+		_, err := agent.RunComputerServiceRealtiming(runContext, adapter, request, network.NewFabric(fabric.Identity{NodeID: "reference-" + identity + "-agent"}), dial,
 			func(_ context.Context, ready bool, _ string) error { publications <- ready; return nil })
 		runDone <- err
 	}()
@@ -804,7 +815,7 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 	}
 	if err := adapter.FinalizeManagedVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
 		Authority: authority, Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
-		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "reference-computer-cleanup"},
+		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "reference-" + identity + "-computer-cleanup"},
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -17,6 +17,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
+const missingEndpointObservationWindow = 15 * time.Second
+
 type RuntimeConfig struct {
 	Image              string
 	Runtime            string
@@ -44,6 +46,7 @@ type runtimeRunner struct {
 	containerID                              string
 	viewPort, controlPort, attempt           int
 	tools                                    map[string]bool
+	failed                                   bool
 }
 
 func Run(ctx context.Context, config RuntimeConfig) RuntimeResult {
@@ -108,7 +111,7 @@ func (r *runtimeRunner) run(ctx context.Context) error {
 	}
 	r.record("runtime.started", StatusPass, "container task started")
 	if err := r.waitReady(ctx, startedAt, false); err != nil {
-		return err
+		return r.withStartupLogs(ctx, err)
 	}
 	if r.config.MutationProfile == "duplicate-endpoint" {
 		r.record("endpoints.distinct", StatusFail, "view and control received the same attempt-local port")
@@ -117,14 +120,63 @@ func (r *runtimeRunner) run(ctx context.Context) error {
 	r.discoverTools(ctx)
 	r.markContainerdProfileNotRun()
 	r.checkEnvironment(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkTargets(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkLoopback(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkTransportNegatives(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkDriver(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkInput(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkHarnessProfile(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	r.checkEdgeRecovery(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	return r.checkPersistence(ctx)
+}
+
+func (r *runtimeRunner) mutationFailed() bool {
+	return r.config.MutationProfile != "" && r.failed
+}
+
+func (r *runtimeRunner) withStartupLogs(ctx context.Context, readinessErr error) error {
+	// A readiness receipt deliberately records only contract assertions, but an
+	// operator still needs the tenant's bounded startup diagnostics to repair an
+	// image that never exposed an edge. Keep those diagnostics on stderr, redact
+	// endpoint-looking values, and cap their size instead of putting them in the
+	// durable receipt.
+	result, err := r.runCommand(ctx, "logs", "--tail", "200", r.containerID)
+	if err != nil {
+		return readinessErr
+	}
+	logs := strings.TrimSpace(result.stdout + result.stderr)
+	if logs == "" {
+		return readinessErr
+	}
+	logs = strings.TrimSpace(portPattern.ReplaceAllString(logs, "<endpoint>"))
+	if len(logs) > 8192 {
+		logs = logs[:8192]
+	}
+	return fmt.Errorf("%w; tenant startup logs: %s", readinessErr, logs)
 }
 
 func (r *runtimeRunner) allocatePorts() error {
@@ -204,12 +256,13 @@ func (r *runtimeRunner) startContainer(ctx context.Context) error {
 
 func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, restart bool) error {
 	viewReady, controlReady, plainTCP := false, false, false
+	var viewProbeErr, controlProbeErr error
 	for BeforeReadinessDeadline(r.config.Now(), startedAt) {
 		if !viewReady {
-			viewReady, plainTCP = r.probeReady(ctx, r.viewPort, plainTCP)
+			viewReady, plainTCP, viewProbeErr = r.probeReady(ctx, r.viewPort, plainTCP)
 		}
 		if !controlReady {
-			controlReady, plainTCP = r.probeReady(ctx, r.controlPort, plainTCP)
+			controlReady, plainTCP, controlProbeErr = r.probeReady(ctx, r.controlPort, plainTCP)
 		}
 		if viewReady && controlReady {
 			r.record("transport.view-ready", StatusPass, "binary RFB greeting observed")
@@ -219,7 +272,7 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 			r.recorder.RecordReadiness(restart, r.config.Now().Sub(startedAt))
 			return nil
 		}
-		if (r.config.MutationProfile == "missing-control-endpoint" || r.config.MutationProfile == "missing-view-endpoint") && r.config.Now().Sub(startedAt) >= 5*time.Second {
+		if (r.config.MutationProfile == "missing-control-endpoint" || r.config.MutationProfile == "missing-view-endpoint") && r.config.Now().Sub(startedAt) >= missingEndpointObservationWindow {
 			break
 		}
 		if plainTCP && viewReady {
@@ -239,23 +292,29 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 	}
 	if !viewReady {
 		r.record("transport.view-ready", StatusFail, "view never completed rfb-websocket-v1")
+		if viewProbeErr != nil {
+			return fmt.Errorf("view endpoint readiness timeout: %w", viewProbeErr)
+		}
 		return errors.New("view endpoint readiness timeout")
 	}
 	r.record("transport.view-ready", StatusPass, "binary RFB greeting observed")
 	if !controlReady {
 		r.record("transport.control-ready", StatusFail, "control never completed rfb-websocket-v1")
+		if controlProbeErr != nil {
+			return fmt.Errorf("control endpoint readiness timeout: %w", controlProbeErr)
+		}
 		return errors.New("control endpoint readiness timeout")
 	}
 	return errors.New("Computer startup readiness timeout")
 }
 
-func (r *runtimeRunner) probeReady(ctx context.Context, port int, plainSeen bool) (bool, bool) {
+func (r *runtimeRunner) probeReady(ctx context.Context, port int, plainSeen bool) (bool, bool, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	connection, err := OpenRFB(probeCtx, port, contract.ComputerDisplayWebSocketPath)
 	if err == nil {
 		connection.close()
-		return true, plainSeen
+		return true, plainSeen, nil
 	}
 	dialer := net.Dialer{Timeout: 250 * time.Millisecond}
 	tcp, tcpErr := dialer.DialContext(probeCtx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
@@ -263,7 +322,7 @@ func (r *runtimeRunner) probeReady(ctx context.Context, port int, plainSeen bool
 		plainSeen = true
 		_ = tcp.Close()
 	}
-	return false, plainSeen
+	return false, plainSeen, err
 }
 
 // BeforeReadinessDeadline is the publication edge shared by runtime polling
@@ -523,11 +582,26 @@ func (r *runtimeRunner) checkDriver(ctx context.Context) {
 
 type inputObservation struct {
 	Version        int      `json:"version"`
+	Ready          *bool    `json:"ready,omitempty"`
 	Generation     uint64   `json:"generation"`
 	KeyEvents      uint64   `json:"key_events"`
 	X              int      `json:"x"`
 	Y              int      `json:"y"`
 	PointerHistory [][2]int `json:"pointer_history"`
+	ObserverLines  *uint64  `json:"observer_lines,omitempty"`
+}
+
+func (r *runtimeRunner) waitInputReady(ctx context.Context) bool {
+	for attempt := 0; attempt < 400; attempt++ {
+		observation, err := r.readInputObservation(ctx)
+		if err == nil && (observation.Ready == nil || *observation.Ready) {
+			return true
+		}
+		if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
+			return false
+		}
+	}
+	return false
 }
 
 func (r *runtimeRunner) readInputObservation(ctx context.Context) (inputObservation, error) {
@@ -553,52 +627,192 @@ func historyContains(observation inputObservation, x, y int) bool {
 	return false
 }
 func (r *runtimeRunner) waitInputSentinel(ctx context.Context, after uint64, x, y int) (inputObservation, bool) {
+	last := inputObservation{}
 	for attempt := 0; attempt < 80; attempt++ {
 		value, err := r.readInputObservation(ctx)
-		if err == nil && value.Generation > after && value.X == x && value.Y == y {
-			return value, true
+		if err == nil {
+			last = value
+			if value.Generation > after && historyContains(value, x, y) {
+				return value, true
+			}
 		}
 		if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
 			break
 		}
 	}
-	return inputObservation{}, false
+	return last, false
+}
+
+func inputObserverAdvanced(before, after inputObservation) bool {
+	if after.KeyEvents <= before.KeyEvents {
+		return false
+	}
+	if before.ObserverLines == nil {
+		return after.ObserverLines == nil
+	}
+	return after.ObserverLines != nil && *after.ObserverLines > *before.ObserverLines
+}
+
+func inputObserverLines(observation inputObservation) uint64 {
+	if observation.ObserverLines == nil {
+		return 0
+	}
+	return *observation.ObserverLines
+}
+
+func (r *runtimeRunner) waitInputObserverAdvance(ctx context.Context, before inputObservation, session *InputSession) (inputObservation, bool) {
+	last := inputObservation{}
+	// wayvnc can create a new client's virtual keyboard after its first RFB
+	// messages arrive. Reuse that established client while proving liveness so
+	// a cold-start discard cannot look like a dead guest observer.
+	for dispatch := 0; dispatch < 3; dispatch++ {
+		for poll := 0; poll < 4; poll++ {
+			value, err := r.readInputObservation(ctx)
+			if err == nil {
+				last = value
+				if inputObserverAdvanced(before, value) {
+					return value, true
+				}
+			}
+			if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
+				return last, false
+			}
+		}
+		if dispatch < 2 && session.SendKey() != nil {
+			return last, false
+		}
+	}
+	return last, false
+}
+
+func (r *runtimeRunner) sendControlInput(ctx context.Context, after uint64, x, y int) (inputObservation, bool) {
+	last := inputObservation{}
+	for attempt := 0; attempt < 2; attempt++ {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		session, err := StartPointer(probeCtx, r.controlPort, x, y)
+		cancel()
+		if err != nil {
+			continue
+		}
+		observation, observed := r.waitInputSentinel(ctx, after, x, y)
+		last = observation
+		if !observed {
+			session.Close()
+			continue
+		}
+		if err := session.SendKey(); err != nil {
+			session.Close()
+			continue
+		}
+		keyObserved := false
+		for poll := 0; poll < 80; poll++ {
+			value, readErr := r.readInputObservation(ctx)
+			if readErr == nil {
+				last = value
+			}
+			if readErr == nil && value.KeyEvents > observation.KeyEvents {
+				keyObserved = true
+				break
+			}
+			if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
+				break
+			}
+		}
+		session.Close()
+		if keyObserved {
+			return last, true
+		}
+	}
+	return last, false
 }
 
 func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targetX, targetY, sentinelX, sentinelY int) bool {
-	before, err := r.readInputObservation(ctx)
-	if err != nil {
-		r.record(id, StatusNotRun, "input oracle was unavailable")
-		return false
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	viewSession, err := StartInput(probeCtx, r.viewPort, targetX, targetY)
-	cancel()
-	var sentinelSession *InputSession
-	if err == nil {
-		probeCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
-		sentinelSession, err = StartPointer(probeCtx, r.controlPort, sentinelX, sentinelY)
-		cancel()
-	}
-	if err != nil {
-		if viewSession != nil {
-			viewSession.Close()
+	// A newly started wayvnc client can need one event cycle before its virtual
+	// input objects are active. Probe twice so isolation is proved after that
+	// warm-up too; a broken view edge must not get a free first connection.
+	for round := 0; round < 2; round++ {
+		x, y := targetX+round*29, targetY+round*31
+		sx, sy := sentinelX-round*17, sentinelY+round*19
+		before, err := r.readInputObservation(ctx)
+		if err != nil {
+			r.record(id, StatusNotRun, "input oracle was unavailable")
+			return false
 		}
-		r.record(id, StatusFail, "RFB view probe or control consumption barrier failed")
-		return false
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		observerSession, err := StartKey(probeCtx, r.controlPort)
+		cancel()
+		if err != nil {
+			if observerSession != nil {
+				observerSession.Close()
+			}
+			r.record(id, StatusFail, "key observer liveness control keystroke could not be sent")
+			return false
+		}
+		observer, observerLive := r.waitInputObserverAdvance(ctx, before, observerSession)
+		observerSession.Close()
+		if !observerLive {
+			r.record(id, StatusFail, fmt.Sprintf("key observer did not advance after the control liveness keystroke (key_events=%d observer_lines=%d)", observer.KeyEvents, inputObserverLines(observer)))
+			return false
+		}
+		before = observer
+		probeCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		viewSession, err := StartInput(probeCtx, r.viewPort, x, y)
+		cancel()
+		if err == nil {
+			for dispatch := 0; dispatch < 3; dispatch++ {
+				for poll := 0; poll < 4; poll++ {
+					observation, readErr := r.readInputObservation(ctx)
+					if readErr == nil && (observation.KeyEvents != before.KeyEvents || (observation.Generation > before.Generation && historyContains(observation, x, y))) {
+						viewSession.Close()
+						r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
+						return false
+					}
+					if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
+						break
+					}
+				}
+				if dispatch < 2 {
+					err = viewSession.SendInput(x, y)
+					if err != nil {
+						break
+					}
+				}
+			}
+		}
+		var sentinelSession *InputSession
+		if err == nil {
+			probeCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
+			sentinelSession, err = StartPointer(probeCtx, r.controlPort, sx, sy)
+			cancel()
+		}
+		if err != nil {
+			if viewSession != nil {
+				viewSession.Close()
+			}
+			r.record(id, StatusFail, "RFB view probe or control consumption barrier failed")
+			return false
+		}
+		after, ok := r.waitInputSentinel(ctx, before.Generation, sx, sy)
+		if after.KeyEvents != before.KeyEvents || (after.Generation > before.Generation && historyContains(after, x, y)) {
+			viewSession.Close()
+			sentinelSession.Close()
+			r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
+			return false
+		}
+		if !ok {
+			viewSession.Close()
+			sentinelSession.Close()
+			detail := "control sentinel was not observed after view input"
+			if r.config.MutationProfile == "" {
+				detail = fmt.Sprintf("%s (generation=%d key_events=%d pointer=%d,%d observer_lines=%d)", detail, after.Generation, after.KeyEvents, after.X, after.Y, inputObserverLines(after))
+			}
+			r.record(id, StatusFail, detail)
+			return false
+		}
+		viewSession.Close()
+		sentinelSession.Close()
 	}
-	after, ok := r.waitInputSentinel(ctx, before.Generation, sentinelX, sentinelY)
-	viewSession.Close()
-	sentinelSession.Close()
-	if !ok {
-		r.record(id, StatusFail, "control sentinel was not observed after view input")
-		return false
-	}
-	if after.KeyEvents != before.KeyEvents || historyContains(after, targetX, targetY) {
-		r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
-		return false
-	}
-	r.record(id, StatusPass, "control sentinel proved the preceding view pointer and key were consumed without guest input")
+	r.record(id, StatusPass, "key-observer liveness and a control pointer sentinel proved the view input was consumed without guest input")
 	return true
 }
 
@@ -613,7 +827,11 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 	if !r.requireTools(ids, "cat") {
 		return
 	}
-	if !r.proveViewIsolation(ctx, ids[0], 211, 173, 947, 611) {
+	if !r.waitInputReady(ctx) {
+		r.record(ids[0], StatusFail, "guest input observer did not become ready")
+		return
+	}
+	if !r.proveViewIsolation(ctx, ids[0], 211, 173, 947, 411) {
 		return
 	}
 	if !r.mutateAndObserveDriver(ctx, `{"version":1,"human_driving":true}`, true) {
@@ -621,7 +839,7 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 		r.record(ids[2], StatusNotRun, "driver tenure oracle was unavailable")
 		return
 	}
-	if !r.proveViewIsolation(ctx, ids[1], 337, 229, 901, 577) {
+	if !r.proveViewIsolation(ctx, ids[1], 337, 229, 901, 477) {
 		_ = r.writeDriver(`{"version":1,"human_driving":false}`)
 		return
 	}
@@ -630,29 +848,11 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 		r.record(ids[2], StatusNotRun, "input oracle was unavailable")
 		return
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	controlSession, err := StartInput(probeCtx, r.controlPort, 503, 389)
-	cancel()
-	if err != nil {
-		r.record(ids[2], StatusFail, "control input probe failed")
-		return
-	}
-	observed := false
-	for attempt := 0; attempt < 80; attempt++ {
-		after, readErr := r.readInputObservation(ctx)
-		if readErr == nil && after.Generation > before.Generation && after.KeyEvents > before.KeyEvents && historyContains(after, 503, 389) {
-			observed = true
-			break
-		}
-		if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
-			break
-		}
-	}
-	controlSession.Close()
-	if observed {
+	controlObservation, controlObserved := r.sendControlInput(ctx, before.Generation, 1103, 389)
+	if controlObserved {
 		r.record(ids[2], StatusPass, "control pointer coordinates and key event were both observed")
 	} else {
-		r.record(ids[2], StatusFail, "control pointer and key were not both observed")
+		r.record(ids[2], StatusFail, fmt.Sprintf("control pointer and key were not both observed (generation=%d key_events=%d pointer=%d,%d)", controlObservation.Generation, controlObservation.KeyEvents, controlObservation.X, controlObservation.Y))
 	}
 	_ = r.writeDriver(`{"version":1,"human_driving":false}`)
 }
@@ -905,6 +1105,9 @@ func errWithOutput(err error, output commandResult) error {
 func (r *runtimeRunner) record(id string, status Status, detail string) {
 	if err := r.recorder.Record(id, status, detail); err != nil {
 		panic(err)
+	}
+	if status == StatusFail {
+		r.failed = true
 	}
 }
 

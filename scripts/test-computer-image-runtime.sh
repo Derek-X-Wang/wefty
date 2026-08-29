@@ -6,16 +6,18 @@ set -euo pipefail
 image=
 arch=
 evidence=
+edge_process_pattern='wefty-rfb-websocket --port'
 while (($# > 0)); do
   case "$1" in
     --image) image="${2:-}"; shift ;;
     --arch) arch="${2:-}"; shift ;;
     --evidence) evidence="${2:-}"; shift ;;
-    *) printf '%s\n' 'usage: scripts/test-computer-image-runtime.sh --image REF@sha256:DIGEST --arch amd64|arm64 --evidence DIR' >&2; exit 64 ;;
+    --edge-process-pattern) edge_process_pattern="${2:-}"; shift ;;
+    *) printf '%s\n' 'usage: scripts/test-computer-image-runtime.sh --image REF@sha256:DIGEST --arch amd64|arm64 --evidence DIR [--edge-process-pattern TEXT]' >&2; exit 64 ;;
   esac
   shift
 done
-[[ $image == *@sha256:* && $arch =~ ^(amd64|arm64)$ && -n $evidence ]] || exit 64
+[[ $image == *@sha256:* && $arch =~ ^(amd64|arm64)$ && -n $evidence && -n $edge_process_pattern ]] || exit 64
 mkdir -p "$evidence"
 
 checker="$evidence/wefty-computer-conformance"
@@ -26,26 +28,26 @@ go build -o "$checker" ./cmd/wefty-computer-conformance
   --platform "linux/$arch" \
   --input-oracle-path /tmp/wefty-computer/input-oracle.json \
   --driver-oracle-path /tmp/wefty-computer/driver-state.json \
-  --edge-process-pattern 'wefty-rfb-websocket --port' \
+  --edge-process-pattern "$edge_process_pattern" \
   --receipt "$evidence/${arch}-runtime.json"
-
-# The reference executes on both supported architectures. The actual broken
-# image matrix runs once on native amd64: every row boots a derivative image,
-# invokes the same public checker, and must produce exactly its owning FAIL.
-if [[ $arch != amd64 ]]; then exit 0; fi
 
 mutations="$evidence/mutations"
 mkdir -p "$mutations"
+executed_rows=0
 run_mutation() {
   local mutation=$1 cell=$2 detail=$3
   local tag="wefty-computer-broken-${mutation}:local"
-  docker build --platform "linux/$arch" --file examples/computer/fixtures/Dockerfile \
-    --build-arg "BASE_IMAGE=$image" --build-arg "MUTATION=$mutation" --tag "$tag" examples/computer/fixtures
+  local fixture_dockerfile=examples/computer/fixtures/Dockerfile
+  if [[ $mutation == text-frames-accepted && $edge_process_pattern == 'wayvnc -w' ]]; then
+    fixture_dockerfile=examples/computer/fixtures/Dockerfile.wayland-text
+  fi
+  docker build --platform "linux/$arch" --file "$fixture_dockerfile" \
+    --build-arg "BASE_IMAGE=$image" --build-arg "MUTATION=$mutation" --tag "$tag" .
   set +e
   "$checker" --image "$tag" --platform "linux/$arch" \
     --input-oracle-path /tmp/wefty-computer/input-oracle.json \
     --driver-oracle-path /tmp/wefty-computer/driver-state.json \
-    --edge-process-pattern 'wefty-rfb-websocket --port' \
+    --edge-process-pattern "$edge_process_pattern" \
     --mutation-profile "$mutation" --receipt "$mutations/$mutation.json"
   local checker_status=$?
   set -e
@@ -57,6 +59,7 @@ run_mutation() {
     [.checks[] | select(.status == "FAIL")] as $failed |
     ($failed | length) == 1 and $failed[0].id == $cell and $failed[0].detail == $detail
   ' "$mutations/$mutation.json" >/dev/null
+  executed_rows=$((executed_rows + 1))
 }
 
 run_mutation missing-control-endpoint transport.control-ready 'control never completed rfb-websocket-v1'
@@ -79,3 +82,6 @@ run_mutation control-wildcard-bind endpoints.control-loopback 'endpoint was miss
 run_mutation profile-state-lost persistence.profile-survives 'profile marker under HOME was lost'
 run_mutation sign-in-state-lost persistence.sign-in-survives 'sign-in marker under HOME was lost'
 run_mutation edge-does-not-recover persistence.edge-recovers 'both endpoints did not recover after edge withdrawal'
+jq -n --arg platform "linux/$arch" --argjson executed_rows "$executed_rows" \
+  '{version:1,platform:$platform,executed_rows:$executed_rows}' > "$mutations/summary.json"
+jq -e --arg platform "linux/$arch" '.platform == $platform and .executed_rows == 20' "$mutations/summary.json" >/dev/null

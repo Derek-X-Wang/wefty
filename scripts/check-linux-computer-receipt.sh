@@ -1,17 +1,19 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-  printf '%s\n' 'usage: check-linux-computer-receipt.sh RECEIPT CANDIDATE_SHA [MUTATED_ROW]' >&2
+if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
+  printf '%s\n' 'usage: check-linux-computer-receipt.sh RECEIPT CANDIDATE_SHA xfce|wayland [MUTATED_ROW]' >&2
   exit 64
 fi
 
 receipt=$1
 candidate_sha=$2
-mutated_row=${3:-}
+expected_image=$3
+mutated_row=${4:-}
+case "$expected_image" in xfce|wayland) ;; *) exit 64 ;; esac
 test -s "$receipt"
 
-jq -e --arg candidate "$candidate_sha" --arg mutated "$mutated_row" '
+jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutated "$mutated_row" '
   def required_rows: [
     "linux.create_boot",
     "linux.remote_takeover",
@@ -25,6 +27,7 @@ jq -e --arg candidate "$candidate_sha" --arg mutated "$mutated_row" '
   .version == 2 and
   .platform == "linux/amd64" and
   .candidate_sha == $candidate and
+  .image.variant == $image and
   (.candidate_sha | test("^[0-9a-f]{40}$")) and
   (if $mutated == "" then .status == "NOT-RUN" and .not_run_issue == 157 else .status == "FAIL" end) and
   (.image.index_digest | test("^sha256:[0-9a-f]{64}$")) and

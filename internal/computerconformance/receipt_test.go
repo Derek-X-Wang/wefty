@@ -1,9 +1,34 @@
 package computerconformance
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestReceiptV1CatalogIDsArePinned(t *testing.T) {
+	expected := strings.Fields(`
+		runtime.started runtime.image-config
+		environment.service-dir environment.view-port environment.control-port environment.service-port-omitted environment.handoff-dir-omitted environment.authority-omitted environment.other-wefty-preserved
+		targets.service-nonshadowable targets.control-nonshadowable targets.handoff-nonshadowable targets.token-mode targets.endpoint-mode
+		endpoints.distinct endpoints.view-loopback endpoints.control-loopback
+		transport.view-ready transport.control-ready transport.plain-tcp-rejected transport.query-ignored transport.fragment-ignored transport.wrong-path-rejected transport.missing-subprotocol-rejected transport.wrong-subprotocol-rejected transport.text-frame-rejected
+		readiness.before-deadline
+		input.view-isolated input.view-isolated-during-tenure input.control-accepted
+		driver.read-only driver.mode driver.initial-false driver.true-consumed driver.release-consumed driver.malformed-fails-closed driver.unknown-version-fails-closed driver.missing-fails-closed
+		harness.image-user harness.rootfs-read-only harness.service-writable harness.no-new-privileges harness.forbidden-privilege harness.shm-private harness.shm-size harness.shm-flags harness.tmp-ceilings
+		profile.capabilities profile.seccomp profile.namespaces profile.devices profile.cgroup-memory-max profile.cgroup-oom-group profile.cgroup-swap-max
+		persistence.service-survives persistence.profile-survives persistence.sign-in-survives persistence.rootfs-discarded persistence.edge-recovers targets.control-nonpersistent
+	`)
+	if len(CheckCatalog) != len(expected) {
+		t.Fatalf("receipt v1 catalog length = %d, want %d", len(CheckCatalog), len(expected))
+	}
+	for index, definition := range CheckCatalog {
+		if definition.ID != expected[index] {
+			t.Fatalf("receipt v1 catalog id[%d] = %q, want %q", index, definition.ID, expected[index])
+		}
+	}
+}
 
 func TestRecorderStartsEveryCheckNotRunAndUsesInjectedClock(t *testing.T) {
 	start := time.Unix(100, 0)
@@ -49,6 +74,20 @@ func TestUnknownCheckAndStatusFailClosed(t *testing.T) {
 	}
 	if Aggregate([]Check{{Status: Status("UNKNOWN")}}) != StatusFail {
 		t.Fatal("unknown aggregate status did not fail closed")
+	}
+}
+
+func TestObservedCompatibilityFailsClosedWhenCatalogIDIsMissing(t *testing.T) {
+	recorder := NewRecorder("image", "docker", "linux/amd64", time.Unix(100, 0))
+	for _, definition := range CheckCatalog {
+		if err := recorder.Record(definition.ID, StatusPass, "observed"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delete(recorder.index, "runtime.started")
+	receipt := recorder.Finish(time.Unix(101, 0))
+	if receipt.Executed {
+		t.Fatal("missing runtime.started catalog id projected check zero as executed")
 	}
 }
 

@@ -1,0 +1,24 @@
+output HEADLESS-1 mode 1280x720 position 0 0 bg #111827 solid_color
+seat seat0 hide_cursor 5000
+focus_follows_mouse no
+default_border pixel 2
+default_floating_border pixel 2
+font pango:DejaVu Sans Mono 10
+client.focused #38bdf8 #1f2937 #f8fafc #38bdf8 #38bdf8
+client.unfocused #334155 #111827 #94a3b8 #334155 #334155
+for_window [title="^Wefty Wayland Computer$"] border none, fullscreen enable
+for_window [app_id="wev"] floating enable, resize set width 32 px height 32 px, move position 0 0, opacity set 0.0, focus
+
+set $mod Mod4
+bindsym $mod+Return exec footclient || foot
+bindsym $mod+b exec chromium --no-sandbox --disable-gpu --ozone-platform=wayland
+bindsym $mod+d exec fuzzel
+bindsym $mod+e exec foot -e nvim
+bindsym $mod+g exec foot -e lazygit
+bindsym $mod+Shift+q kill
+bindsym $mod+Shift+c reload
+bindsym $mod+1 workspace number 1
+bindsym $mod+2 workspace number 2
+bindsym $mod+3 workspace number 3
+
+exec swaymsg 'workspace number 1'

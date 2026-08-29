@@ -1,0 +1,39 @@
+package computerconformance
+
+import (
+	"encoding/binary"
+	"testing"
+)
+
+func TestRFBInputEventsPreserveKeyboardObserverFocus(t *testing.T) {
+	events := rfbInputEvents(true, 503, 389)
+	if len(events) != 3 {
+		t.Fatalf("events = %d, want key down/up then pointer motion", len(events))
+	}
+	if events[0][0] != 4 || events[1][0] != 4 || events[2][0] != 5 {
+		t.Fatalf("event types = %d,%d,%d, want 4,4,5", events[0][0], events[1][0], events[2][0])
+	}
+	if x, y := binary.BigEndian.Uint16(events[2][2:4]), binary.BigEndian.Uint16(events[2][4:6]); x != 503 || y != 389 {
+		t.Fatalf("pointer = %d,%d, want 503,389", x, y)
+	}
+	if events[2][1] != 0 {
+		t.Fatalf("pointer button mask = %d, want motion without a click", events[2][1])
+	}
+	if events[0][1] != 1 || events[1][1] != 0 || events[0][7] != 'w' || events[1][7] != 'w' {
+		t.Fatalf("key events = %v %v, want w down/up", events[0], events[1])
+	}
+}
+
+func TestRFBKeyEventsContainNoPointer(t *testing.T) {
+	events := rfbKeyEvents()
+	if len(events) != 2 || events[0][0] != 4 || events[1][0] != 4 {
+		t.Fatalf("events = %v, want key down/up only", events)
+	}
+}
+
+func TestHistoryContainsEarlierSentinel(t *testing.T) {
+	observation := inputObservation{X: 211, Y: 173, PointerHistory: [][2]int{{0, 0}, {947, 611}, {211, 173}}}
+	if !historyContains(observation, 947, 611) {
+		t.Fatal("bounded compositor history lost an observed sentinel when a later event became current")
+	}
+}

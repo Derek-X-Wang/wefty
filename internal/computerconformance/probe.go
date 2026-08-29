@@ -210,22 +210,56 @@ func (stream *rfbStream) write(value []byte) error { return stream.connection.wr
 // StartInput sends the same real RFB key and pointer bytes to either role. The
 // caller compares an image-owned oracle before and after; the probe never
 // assumes what the deterministic surface renders.
-type InputSession struct{ connection *websocketConnection }
+type InputSession struct {
+	connection *websocketConnection
+}
 
 func (session *InputSession) Close() { session.connection.close() }
 
+// SendKey appends a key press and release to an established RFB session. The
+// control oracle keeps the pointer and key on one session while the image's
+// keyboard observer retains focus.
+func (session *InputSession) SendKey() error {
+	for _, event := range rfbKeyEvents() {
+		if err := session.connection.writeFrame(2, event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SendInput repeats a real key and pointer sequence on an established client.
+// A new wayvnc client may create its virtual Wayland input objects after the
+// first RFB messages arrive, so the isolation oracle exercises the active
+// client as well as its cold-start path.
+func (session *InputSession) SendInput(x, y int) error {
+	for _, event := range rfbInputEvents(true, x, y) {
+		if err := session.connection.writeFrame(2, event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func StartInput(ctx context.Context, port, x, y int) (*InputSession, error) {
-	return startRFBEvents(ctx, port, true, x, y)
+	return startRFBEvents(ctx, port, rfbInputEvents(true, x, y))
 }
 
-// SendPointer is the consumption sentinel used after a view probe. Observing
+// StartKey opens a control session without moving or clicking the pointer, so
+// the image's focused keyboard observer can prove its own liveness.
+func StartKey(ctx context.Context, port int) (*InputSession, error) {
+	return startRFBEvents(ctx, port, rfbKeyEvents())
+}
+
+// StartPointer is the consumption sentinel used after a view probe. Observing
 // its unique coordinates proves the earlier key and pointer bytes have passed
-// through the backend's input queue without relying on a fixed sleep.
+// through the backend's input queue without relying on a fixed sleep. Motion
+// without a button press preserves the keyboard observer's Sway focus.
 func StartPointer(ctx context.Context, port, x, y int) (*InputSession, error) {
-	return startRFBEvents(ctx, port, false, x, y)
+	return startRFBEvents(ctx, port, rfbInputEvents(false, x, y))
 }
 
-func startRFBEvents(ctx context.Context, port int, withKey bool, x, y int) (*InputSession, error) {
+func startRFBEvents(ctx context.Context, port int, events [][]byte) (*InputSession, error) {
 	connection, err := OpenRFB(ctx, port, contract.ComputerDisplayWebSocketPath)
 	if err != nil {
 		return nil, err
@@ -267,20 +301,29 @@ func startRFBEvents(ctx context.Context, port int, withKey bool, x, y int) (*Inp
 	if _, err := stream.read(nameSize); err != nil {
 		return fail(err)
 	}
-	// KeyEvent down/up for keysym "w", then pointer button down/up. The exact
-	// byte sequence is identical for view and control.
-	events := make([][]byte, 0, 4)
-	if withKey {
-		events = append(events, []byte{4, 1, 0, 0, 0, 0, 0, 'w'}, []byte{4, 0, 0, 0, 0, 0, 0, 'w'})
-	}
-	events = append(events,
-		[]byte{5, 1, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
-		[]byte{5, 0, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
-	)
 	for _, event := range events {
 		if err := stream.write(event); err != nil {
 			return fail(err)
 		}
 	}
 	return &InputSession{connection: connection}, nil
+}
+
+func rfbInputEvents(withKey bool, x, y int) [][]byte {
+	// Send the key while the image's keyboard oracle retains focus, then move
+	// the pointer without clicking away that focus. The exact byte sequence
+	// remains identical for view and control.
+	events := make([][]byte, 0, 3)
+	if withKey {
+		events = append(events, rfbKeyEvents()...)
+	}
+	events = append(events, []byte{5, 0, byte(x >> 8), byte(x), byte(y >> 8), byte(y)})
+	return events
+}
+
+func rfbKeyEvents() [][]byte {
+	return [][]byte{
+		{4, 1, 0, 0, 0, 0, 0, 'w'},
+		{4, 0, 0, 0, 0, 0, 0, 'w'},
+	}
 }

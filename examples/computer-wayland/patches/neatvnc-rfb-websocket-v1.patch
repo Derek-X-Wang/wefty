@@ -1,0 +1,180 @@
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -126,6 +126,10 @@ if host_system == 'linux' and get_option('systemtap') and cc.has_header('sys/sdt
+ 	config.set('HAVE_USDT', true)
+ endif
+ 
++if get_option('wefty_mutation_hooks')
++	config.set('WEFTY_MUTATION_HOOKS', true)
++endif
++
+ if gbm.found()
+ 	dependencies += gbm
+ 	config.set('HAVE_GBM', true)
+diff --git a/meson_options.txt b/meson_options.txt
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -10,2 +10,3 @@ option('h264', type: 'feature', value: 'auto', description: 'Enable open h264 en
+ option('h264', type: 'feature', value: 'auto', description: 'Enable open h264 encoding')
+ option('experimental', type: 'boolean', value: false, description: 'Enable experimental features')
++option('wefty_mutation_hooks', type: 'boolean', value: false, description: 'Build repository-only conformance mutation hooks')
+diff --git a/src/server.c b/src/server.c
+--- a/src/server.c
++++ b/src/server.c
+@@ -41,6 +41,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <inttypes.h>
++#include <fcntl.h>
+ #include <unistd.h>
+ #include <sys/queue.h>
+ #include <sys/param.h>
+@@ -2212,6 +2213,22 @@ static struct nvnc* open_common(const char* address, uint16_t port,
+ 	if (aml_start(aml_get_default(), self->poll_handle) < 0)
+ 		goto poll_start_failure;
+ 
++	/* The listener, not a client handshake, owns edge readiness. This marker
++	 * only sequences image startup; the external checker still proves the
++	 * complete rfb-websocket-v1 handshake independently. */
++	const char* role = getenv("WEFTY_WAYVNC_ROLE");
++	const char* marker = role && strcmp(role, "view") == 0 ?
++			"/tmp/wefty-computer/view-edge-ready" :
++		role && strcmp(role, "control") == 0 ?
++			"/tmp/wefty-computer/control-edge-ready" : NULL;
++	if (marker) {
++		int marker_fd = open(marker, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
++		if (marker_fd >= 0) {
++			write(marker_fd, "ready\n", 6);
++			close(marker_fd);
++		}
++	}
++
+ 	return self;
+ 
+ poll_start_failure:
+diff --git a/src/stream/ws/handshake.c b/src/stream/ws/handshake.c
+--- a/src/stream/ws/handshake.c
++++ b/src/stream/ws/handshake.c
+@@ -18,9 +18,10 @@
+ #include "stream/http.h"
+ #include "crypto.h"
+ #include "base64.h"
++#include <nettle/sha1.h>
+ 
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdbool.h>
+ #include <ctype.h>
+@@ -31,9 +32,11 @@ static const char magic_uuid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+ 
+ static void tolower_and_remove_ws(char* dst, const char* src)
+ {
+-	while (*src)
+-		if (!isspace(*src))
+-			*dst++ = tolower(*src++);
++	while (*src) {
++		unsigned char value = (unsigned char)*src++;
++		if (!isspace(value))
++			*dst++ = (char)tolower(value);
++	}
+ 	*dst = '\0';
+ }
+ 
+@@ -45,6 +48,15 @@ ssize_t ws_handshake(char* output, size_t output_maxlen, const char* input)
+ 	if (http_req_parse(&req, input) < 0)
+ 		return -1;
+ 
++	/* rfb-websocket-v1 owns one exact path. Query and fragment components
++	 * are viewer metadata and do not change routing. */
++	static const char prefix[] = "GET /websockify";
++	if (strncmp(input, prefix, sizeof(prefix) - 1) != 0)
++		goto failure;
++	char delimiter = input[sizeof(prefix) - 1];
++	if (delimiter != ' ' && delimiter != '?' && delimiter != '#')
++		goto failure;
++
+ 	char protocols[256] = ",";
+ 	char versions[256] = ",";
+ 	char tmpstring[256];
+@@ -69,19 +81,18 @@ ssize_t ws_handshake(char* output, size_t output_maxlen, const char* input)
+ 	bool have_protocols = strlen(protocols) != 1;
+ 	bool have_versions = strlen(versions) != 1;
+ 
+-	if (have_protocols && !strstr(protocols, ",chat,"))
++	if (!have_protocols || !strstr(protocols, ",binary,"))
+ 		goto failure;
+ 
+ 	if (have_versions && !strstr(versions, ",13,"))
+ 		goto failure;
+ 
+ 	uint8_t hash[20];
+-	crypto_hash_many(hash, sizeof(hash), CRYPTO_HASH_SHA1,
+-			(struct crypto_data_entry[]){
+-		{ (uint8_t*)challenge, strlen(challenge) },
+-		{ (uint8_t*)magic_uuid, strlen(magic_uuid) },
+-		{}
+-	});
++	struct sha1_ctx sha1;
++	sha1_init(&sha1);
++	sha1_update(&sha1, strlen(challenge), (uint8_t*)challenge);
++	sha1_update(&sha1, strlen(magic_uuid), (uint8_t*)magic_uuid);
++	sha1_digest(&sha1, sizeof(hash), hash);
+ 
+ 	char response[BASE64_ENCODED_SIZE(sizeof(hash))] = {};
+ 	base64_encode(response, hash, sizeof(hash));
+@@ -95,11 +105,19 @@ ssize_t ws_handshake(char* output, size_t output_maxlen, const char* input)
+ 			"\r\n",
+ 			response,
+-			have_protocols ? "Sec-WebSocket-Protocol: char\r\n" : "",
++			"Sec-WebSocket-Protocol: binary\r\n",
+ 			have_versions ? "Sec-WebSocket-Version: 13\r\n" : "");
+ 
+ 	ssize_t header_len = req.header_length;
+ 	ok = len < output_maxlen;
+ failure:
++	if (!ok && req.header_length > 0) {
++		len = snprintf(output, output_maxlen,
++				"HTTP/1.1 400 Bad Request\r\n"
++				"Connection: close\r\n"
++				"Content-Length: 0\r\n\r\n");
++		header_len = req.header_length;
++		ok = len < output_maxlen;
++	}
+ 	http_req_free(&req);
+ 	return ok ? header_len : -1;
+ }
+diff --git a/src/stream/ws/ws.c b/src/stream/ws/ws.c
+--- a/src/stream/ws/ws.c
++++ b/src/stream/ws/ws.c
+@@ -116,8 +116,15 @@ static ssize_t stream_ws_process_payload(struct stream_ws* ws, void* dst,
+ 		stream__remote_closed(&ws->base);
+ 		return 0;
+ 	case WS_OPCODE_TEXT:
+-		// This is unexpected, but let's just ignore it...
+-		stream_ws_advance_read_buffer(ws, SIZE_MAX, offset);
++#ifdef WEFTY_MUTATION_HOOKS
++		if (getenv("WEFTY_CONFORMANCE_MUTATION") &&
++				strcmp(getenv("WEFTY_CONFORMANCE_MUTATION"),
++					"text-frames-accepted") == 0) {
++			stream_ws_advance_read_buffer(ws, SIZE_MAX, offset);
++			return 0;
++		}
++#endif
++		stream__remote_closed(&ws->base);
+ 		return 0;
+ 	case WS_OPCODE_BIN:
+ 		return stream_ws_copy_payload(ws, dst, size, offset);
+@@ -201,5 +209,11 @@ static ssize_t stream_ws_read_handshake(struct stream_ws* ws, void* dst,
+ 	ws->base.cork = false;
+ 	stream_tcp_send_first(&ws->base, rcbuf_from_mem(reply, strlen(reply)));
+ 
++	if (strncmp(reply, "HTTP/1.1 101 ", 13) != 0) {
++		/* The HTTP rejection was sent; never advance this stream to RFB. */
++		ws->read_index = 0;
++		return 0;
++	}
++
+ 	ws->read_index -= header_len;
+ 	memmove(ws->read_buffer, ws->read_buffer + header_len, ws->read_index);

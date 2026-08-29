@@ -198,8 +198,12 @@ Portable tests prove reserved-value stripping, exact endpoint admission,
 wire-negative cases, atomic loss/recovery, injected-clock deadline behavior,
 and the serialized profile. The Linux `service_acceptance_realtiming` lane
 asserts `/dev/shm` mode, flags, size, and a rising cgroup `memory.current` after
-a guest write. The optional `examples/computer/` reference image implements
-this minimum contract as an image-author and acceptance example.
+a guest write. The optional `examples/computer/` XFCE image and
+`examples/computer-wayland/` GPU-free Wayland image independently implement
+this minimum contract as image-author and acceptance examples. Each exact
+platform digest runs the same checker and 20-row broken-image matrix before a
+main-only publisher promotes those executed archives into its own immutable
+multi-platform index; neither image is a required base or compatibility target.
 
 `wefty-computer-conformance --image` runs these image-owned assertions through
 Docker or containerd's `nerdctl`, emits one versioned JSON receipt with stable
