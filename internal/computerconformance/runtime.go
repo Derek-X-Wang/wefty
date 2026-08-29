@@ -17,6 +17,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
+const missingEndpointObservationWindow = 15 * time.Second
+
 type RuntimeConfig struct {
 	Image              string
 	Runtime            string
@@ -270,7 +272,7 @@ func (r *runtimeRunner) waitReady(ctx context.Context, startedAt time.Time, rest
 			r.recorder.RecordReadiness(restart, r.config.Now().Sub(startedAt))
 			return nil
 		}
-		if (r.config.MutationProfile == "missing-control-endpoint" || r.config.MutationProfile == "missing-view-endpoint") && r.config.Now().Sub(startedAt) >= 5*time.Second {
+		if (r.config.MutationProfile == "missing-control-endpoint" || r.config.MutationProfile == "missing-view-endpoint") && r.config.Now().Sub(startedAt) >= missingEndpointObservationWindow {
 			break
 		}
 		if plainTCP && viewReady {

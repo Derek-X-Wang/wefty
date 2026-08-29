@@ -3,7 +3,18 @@ package computerconformance
 import (
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
+
+func TestMissingEndpointObservationWindowStaysInsideReadinessBudget(t *testing.T) {
+	if missingEndpointObservationWindow != 15*time.Second {
+		t.Fatalf("missing endpoint observation window = %s, want 15s", missingEndpointObservationWindow)
+	}
+	if missingEndpointObservationWindow >= contract.ComputerStartupReadinessTimeout {
+		t.Fatal("missing endpoint observation window exhausted the contract readiness budget")
+	}
+}
 
 func TestMutationFailureStopsAfterOwningCell(t *testing.T) {
 	runner := runtimeRunner{
