@@ -662,6 +662,8 @@ type ComputerCustodyExportRequest struct {
 	RootInstanceID    string
 	OperationRevision int64
 	CustodyFence      string
+	JobSpec           contract.JobSpec
+	JobSpecHash       string
 }
 
 type ComputerCustodyExportReceipt = contract.ComputerCustodyExportReceipt

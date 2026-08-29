@@ -663,7 +663,13 @@ func finalizeComputerCustodyOutcome(ctx context.Context, tx *sql.Tx, computerID 
 	}
 	var externalCustody int64
 	if err := tx.QueryRowContext(ctx, custodyGraph+`
-		SELECT COUNT(*) FROM computer_custody_exports e JOIN custody ON custody.storage_id=e.source_storage_id`,
+		SELECT COUNT(*) FROM (
+			SELECT e.export_id AS custody_id FROM computer_custody_exports e
+			JOIN custody ON custody.storage_id=e.source_storage_id
+			UNION ALL
+			SELECT p.provenance_id FROM storage_provenance p
+			JOIN custody ON custody.storage_id=p.destination_storage_id WHERE p.kind='import'
+		)`,
 		storageID).Scan(&externalCustody); err != nil {
 		return internalError(err, "classify permanent Custody export taint")
 	}

@@ -1141,6 +1141,8 @@ type ExportComputerCustodyRequest struct {
 	SourceSize   int64                          `json:"source_size"`
 	SourceDigest string                         `json:"source_digest"`
 	ExternalPath string                         `json:"external_path"`
+	JobSpec      contract.JobSpec               `json:"job_spec"`
+	JobSpecHash  string                         `json:"job_spec_hash"`
 	Authority    ComputerCustodyExportAuthority `json:"authority"`
 }
 

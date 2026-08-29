@@ -1121,6 +1121,12 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 			return Computer{}, internalError(err, "supersede Computer Backup for removal")
 		}
 	}
+	if computer.ReconfigurationPhase == ComputerReconfigurationExporting {
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_custody_exports SET status='superseded'
+			WHERE computer_id=? AND operation_revision=? AND status='planned'`, computerID, computer.IntentRevision); err != nil {
+			return Computer{}, internalError(err, "supersede Custody export for removal")
+		}
+	}
 	if computer.ReconfigurationPhase == ComputerReconfigurationRestoring ||
 		computer.ReconfigurationPhase == ComputerReconfigurationCloning {
 		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded'
@@ -1239,6 +1245,11 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	}
 	if err := markComputerIntentApplied(ctx, tx, computerID, nextRevision, now); err != nil {
 		return Computer{}, err
+	}
+	if boundNodeID == "" {
+		if err := finalizeComputerCustodyOutcome(ctx, tx, computerID, now); err != nil {
+			return Computer{}, err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM computer_grants WHERE computer_id=?`, computerID); err != nil {
 		return Computer{}, internalError(err, "delete removed Computer grants")

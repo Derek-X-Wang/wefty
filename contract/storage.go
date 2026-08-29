@@ -1,5 +1,11 @@
 package contract
 
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+)
+
 // ComputerStorageResetReceipt is the one cross-boundary witness for a
 // prepared replacement generation. Keeping the wire shape in contract avoids
 // hand-copied receipt declarations drifting between L1, agent, adapter, and
@@ -114,6 +120,42 @@ type ComputerStorageCopyReceipt struct {
 	DestinationDigest     string `json:"destination_digest"`
 	OSIdentityRekeyed     bool   `json:"os_identity_rekeyed"`
 	FilesystemExpanded    bool   `json:"filesystem_expanded"`
+	FailureCode           string `json:"failure_code,omitempty"`
+	DestinationAbsent     bool   `json:"destination_absent,omitempty"`
+}
+
+// ComputerCustodyManifest is the portable, self-contained authority record
+// written beside exported bytes. Import does not depend on the L1 database
+// that authorized the export: the operator submits this exact manifest and
+// the destination helper independently re-reads and verifies it.
+type ComputerCustodyManifest struct {
+	Version           int     `json:"version"`
+	ExportID          string  `json:"export_id"`
+	BackupID          string  `json:"backup_id"`
+	CopyID            string  `json:"copy_id"`
+	ComputerID        string  `json:"computer_id"`
+	StorageID         string  `json:"storage_id"`
+	StorageGeneration int64   `json:"storage_generation"`
+	AllocatedSize     int64   `json:"allocated_size"`
+	ContentDigest     string  `json:"content_digest"`
+	Encryption        string  `json:"encryption"`
+	NodeID            string  `json:"node_id"`
+	RootInstanceID    string  `json:"root_instance_id"`
+	OperationRevision int64   `json:"operation_revision"`
+	CustodyFence      string  `json:"custody_fence"`
+	JobSpec           JobSpec `json:"job_spec"`
+	JobSpecHash       string  `json:"job_spec_hash"`
+	DiskFile          string  `json:"disk_file"`
+	Phase             string  `json:"phase"`
+}
+
+func DigestComputerCustodyManifest(manifest ComputerCustodyManifest) (string, error) {
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(payload)
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
 // ComputerCustodyExportReceipt proves that the helper observed the exact
@@ -138,4 +180,5 @@ type ComputerCustodyExportReceipt struct {
 	AllocatedSize     int64  `json:"allocated_size"`
 	ContentDigest     string `json:"content_digest"`
 	ManifestDigest    string `json:"manifest_digest"`
+	FailureCode       string `json:"failure_code,omitempty"`
 }

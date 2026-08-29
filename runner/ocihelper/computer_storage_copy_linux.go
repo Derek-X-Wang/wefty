@@ -363,7 +363,58 @@ func (engine *ContainerdEngine) finalizeComputerStorageCopy(ctx context.Context,
 	return facts, err
 }
 
-func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request CopyComputerStorageRequest) (CopyComputerStorageResponse, error) {
+func custodyImportFailureReceipt(runtimeRoot string, request CopyComputerStorageRequest, code string) (CopyComputerStorageResponse, error) {
+	destinationName, err := deterministicComputerDiskName(request.Destination)
+	if err != nil {
+		return CopyComputerStorageResponse{}, err
+	}
+	destinationRoot := filepath.Join(runtimeRoot, "computer-disks", destinationName)
+	if err := os.RemoveAll(destinationRoot); err != nil {
+		return CopyComputerStorageResponse{}, err
+	}
+	if _, err := os.Lstat(destinationRoot); !errors.Is(err, os.ErrNotExist) {
+		return CopyComputerStorageResponse{}, errors.New("Custody import staging remains after failure cleanup")
+	}
+	receiptID, err := randomCapability()
+	if err != nil {
+		return CopyComputerStorageResponse{}, err
+	}
+	return CopyComputerStorageResponse{Receipt: ComputerStorageCopyReceipt{
+		Kind: "computer_storage_copy_failed_absent", ReceiptID: receiptID, Operation: "import",
+		BackupID: request.BackupID, CopyID: request.CopyID, ExportID: request.ExportID,
+		ExternalPath: request.ExternalPath, ManifestDigest: request.ManifestDigest,
+		SourceComputerID: request.SourceComputerID, SourceStorageID: request.SourceStorageID,
+		SourceGeneration: request.SourceGeneration, DestinationComputerID: request.Destination.ComputerID,
+		DestinationStorageID: request.Destination.StorageID, DestinationGeneration: request.Destination.StorageGeneration,
+		NodeID: request.Authority.NodeID, RootInstanceID: request.Authority.RootInstanceID,
+		JobID: request.Authority.JobID, OperationRevision: request.Authority.OperationRevision,
+		CleanupFence: request.Authority.CleanupFence, HelperGeneration: request.Authority.HelperGeneration,
+		SourceSize: request.SourceSize, DestinationSize: request.Destination.DiskBytes,
+		SourceDigest: request.SourceDigest, FailureCode: code, DestinationAbsent: true,
+	}}, nil
+}
+
+func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request CopyComputerStorageRequest) (response CopyComputerStorageResponse, returnedErr error) {
+	defer func() {
+		if request.Operation != "import" || returnedErr == nil {
+			return
+		}
+		code := ""
+		switch {
+		case errors.Is(returnedErr, context.Canceled), errors.Is(returnedErr, context.DeadlineExceeded):
+			code = "cancelled"
+		case errors.Is(returnedErr, unix.ENOSPC):
+			code = "insufficient_disk"
+		case strings.Contains(returnedErr.Error(), "digest"):
+			code = "digest_mismatch"
+		case strings.Contains(returnedErr.Error(), "Custody import manifest"),
+			strings.Contains(returnedErr.Error(), "Custody import disk size"):
+			code = "manifest_invalid"
+		}
+		if code != "" {
+			response, returnedErr = custodyImportFailureReceipt(engine.config.RuntimeRoot, request, code)
+		}
+	}()
 	engine.computerBackupMu.Lock()
 	defer engine.computerBackupMu.Unlock()
 	engine.storageCopyMu.Lock()
@@ -472,7 +523,7 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 			_ = source.Close()
 			return CopyComputerStorageResponse{}, err
 		}
-		copied, copyErr := engine.copyComputerBackup(destination, source, request.SourceSize)
+		copied, copyErr := engine.copyComputerBackup(destination, custodyContextReader{ctx: ctx, r: source}, request.SourceSize)
 		if copyErr == nil && copied != request.SourceSize {
 			copyErr = io.ErrUnexpectedEOF
 		}

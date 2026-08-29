@@ -291,7 +291,7 @@ CREATE TABLE IF NOT EXISTS node_tags (
 );
 CREATE TABLE IF NOT EXISTS attempts (
   attempt_id TEXT PRIMARY KEY,
-  job_id TEXT NOT NULL REFERENCES jobs(job_id),
+  job_id TEXT NOT NULL,
   node_id TEXT NOT NULL REFERENCES nodes(node_id),
   boot_session_id TEXT NOT NULL,
   state TEXT NOT NULL,
@@ -499,7 +499,7 @@ CREATE TABLE IF NOT EXISTS computer_reconfiguration_aborts (
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
   aborted_revision INTEGER NOT NULL CHECK(aborted_revision > 0),
   intent_revision INTEGER NOT NULL CHECK(intent_revision > aborted_revision),
-  aborted_phase TEXT NOT NULL CHECK(aborted_phase IN ('backing_up', 'resetting', 'reimaging', 'growing')),
+  aborted_phase TEXT NOT NULL CHECK(aborted_phase IN ('backing_up', 'resetting', 'exporting', 'importing', 'reimaging', 'growing')),
   idempotency_key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
   actor TEXT NOT NULL,
@@ -536,12 +536,12 @@ CREATE TABLE IF NOT EXISTS computer_backup_operations (
 CREATE UNIQUE INDEX IF NOT EXISTS computer_backup_operation_active
   ON computer_backup_operations(computer_id) WHERE status='planned';
 CREATE TABLE IF NOT EXISTS computer_storage_copy_operations (
-  destination_computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
-  operation TEXT NOT NULL CHECK(operation IN ('restore', 'clone')),
+  destination_computer_id TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK(operation IN ('restore', 'clone', 'import')),
   operation_revision INTEGER NOT NULL CHECK(operation_revision > 0),
-  source_computer_id TEXT NOT NULL REFERENCES computers(computer_id),
-  backup_id TEXT NOT NULL REFERENCES backups(backup_id),
-  copy_id TEXT NOT NULL REFERENCES backup_copies(copy_id),
+  source_computer_id TEXT NOT NULL,
+  backup_id TEXT NOT NULL,
+  copy_id TEXT NOT NULL,
   source_storage_id TEXT NOT NULL,
   source_generation INTEGER NOT NULL CHECK(source_generation > 0),
   source_size INTEGER NOT NULL CHECK(source_size > 0),
@@ -554,6 +554,12 @@ CREATE TABLE IF NOT EXISTS computer_storage_copy_operations (
   root_instance_id TEXT NOT NULL,
   job_id TEXT NOT NULL REFERENCES jobs(job_id),
   cleanup_fence TEXT NOT NULL,
+	export_id TEXT NOT NULL DEFAULT '',
+	external_path TEXT NOT NULL DEFAULT '',
+	manifest_digest TEXT NOT NULL DEFAULT '',
+	source_spec_json BLOB NOT NULL DEFAULT X'',
+	source_spec_hash TEXT NOT NULL DEFAULT '',
+	actor TEXT NOT NULL DEFAULT '',
   keep_old_as_backup INTEGER NOT NULL CHECK(keep_old_as_backup IN (0, 1)),
   old_backup_id TEXT UNIQUE,
   old_copy_id TEXT UNIQUE,
@@ -598,7 +604,7 @@ CREATE TABLE IF NOT EXISTS backups (
 );
 CREATE TABLE IF NOT EXISTS backup_copies (
   copy_id TEXT PRIMARY KEY,
-  backup_id TEXT NOT NULL REFERENCES backups(backup_id),
+  backup_id TEXT NOT NULL,
   node_id TEXT NOT NULL,
   root_instance_id TEXT NOT NULL,
   allocated_size INTEGER NOT NULL CHECK(allocated_size > 0),
@@ -650,13 +656,14 @@ CREATE TABLE IF NOT EXISTS computer_custody_exports (
   content_digest TEXT NOT NULL,
   bound_node_id TEXT NOT NULL,
   root_instance_id TEXT NOT NULL,
-  external_path TEXT NOT NULL UNIQUE,
+  external_path TEXT NOT NULL,
   custody_fence TEXT NOT NULL,
   source_spec_json BLOB NOT NULL,
   source_spec_hash TEXT NOT NULL,
   idempotency_key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('planned', 'exported', 'superseded')),
+  status TEXT NOT NULL CHECK(status IN ('planned', 'exported', 'failed', 'superseded')),
+	failure_code TEXT NOT NULL DEFAULT '',
   manifest_digest TEXT NOT NULL DEFAULT '',
   receipt_json BLOB,
   acknowledgement_key TEXT,
@@ -669,31 +676,6 @@ CREATE TABLE IF NOT EXISTS computer_custody_exports (
   UNIQUE(computer_id, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS custody_exports_storage ON computer_custody_exports(source_storage_id, source_generation);
-CREATE TABLE IF NOT EXISTS computer_custody_imports (
-  import_id TEXT PRIMARY KEY,
-  export_id TEXT NOT NULL REFERENCES computer_custody_exports(export_id),
-  destination_computer_id TEXT NOT NULL UNIQUE,
-  destination_storage_id TEXT NOT NULL UNIQUE,
-  destination_job_id TEXT NOT NULL UNIQUE,
-  destination_name TEXT NOT NULL UNIQUE,
-  destination_size INTEGER NOT NULL CHECK(destination_size > 0),
-  bound_node_id TEXT NOT NULL,
-  root_instance_id TEXT NOT NULL,
-  external_path TEXT NOT NULL,
-  operation_revision INTEGER NOT NULL CHECK(operation_revision > 0),
-  cleanup_fence TEXT NOT NULL,
-  destination_spec_json BLOB NOT NULL,
-  destination_spec_hash TEXT NOT NULL,
-  actor TEXT NOT NULL,
-  idempotency_key TEXT NOT NULL UNIQUE,
-  request_hash TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('reserved', 'complete', 'failed', 'superseded')),
-  receipt_json BLOB,
-  acknowledgement_key TEXT,
-  acknowledgement_hash TEXT,
-  requested_ns INTEGER NOT NULL,
-  completed_ns INTEGER
-);
 CREATE TABLE IF NOT EXISTS admin_policy (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   revision INTEGER NOT NULL CHECK(revision >= 0),
@@ -905,6 +887,21 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "failure_code", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	for _, column := range []struct{ name, definition string }{
+		{"export_id", "TEXT NOT NULL DEFAULT ''"},
+		{"external_path", "TEXT NOT NULL DEFAULT ''"},
+		{"manifest_digest", "TEXT NOT NULL DEFAULT ''"},
+		{"source_spec_json", "BLOB NOT NULL DEFAULT X''"},
+		{"source_spec_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"actor", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.ensureColumn(ctx, "computer_storage_copy_operations", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if err := s.migrateComputerStorageCopyConstraints(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "computer_job_projections", "chown", "INTEGER NOT NULL DEFAULT 0 CHECK(chown IN (0, 1))"); err != nil {
 		return err
 	}
@@ -932,13 +929,20 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	if err := s.ensureColumn(ctx, "computers", "removal_outcome", "TEXT NOT NULL DEFAULT '' CHECK(removal_outcome IN ('', 'removal_pending', 'removed_reduced', 'removed_verified'))"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "computer_custody_exports", "failure_code", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.migrateCustodyExportConstraints(ctx); err != nil {
+		return err
+	}
 	if err := s.migrateStorageProvenanceConstraints(ctx); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS storage_provenance_backup_origin
 		ON storage_provenance(backup_id) WHERE kind='backup';
-		CREATE UNIQUE INDEX IF NOT EXISTS storage_provenance_destination
-		ON storage_provenance(destination_storage_id, destination_generation) WHERE kind IN ('restore', 'clone');`); err != nil {
+		DROP INDEX IF EXISTS storage_provenance_destination;
+		CREATE UNIQUE INDEX storage_provenance_destination
+		ON storage_provenance(destination_storage_id, destination_generation) WHERE kind IN ('restore', 'clone', 'import');`); err != nil {
 		return fmt.Errorf("l1: ensure Storage provenance indexes: %w", err)
 	}
 	for _, column := range []struct{ name, definition string }{
@@ -1187,6 +1191,121 @@ func (s *Store) migrateComputerResetConstraints(ctx context.Context) error {
 	return rows.Err()
 }
 
+// migrateComputerStorageCopyConstraints merges the import branch with the
+// restore/clone ledger without assuming a fixed column list. Import source
+// identities come from a portable custody manifest, so they intentionally do
+// not require the exporting L1 database's Computer/Backup rows.
+func (s *Store) migrateComputerStorageCopyConstraints(ctx context.Context) error {
+	connection, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("l1: acquire Storage copy migration connection: %w", err)
+	}
+	defer connection.Close()
+	var sourceSQL string
+	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_storage_copy_operations'`).Scan(&sourceSQL); err != nil {
+		return fmt.Errorf("l1: inspect Storage copy schema: %w", err)
+	}
+	if strings.Contains(sourceSQL, "'import'") && !strings.Contains(sourceSQL, "destination_computer_id TEXT NOT NULL REFERENCES") &&
+		!strings.Contains(sourceSQL, "job_id TEXT NOT NULL REFERENCES") {
+		return nil
+	}
+	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return fmt.Errorf("l1: disable foreign keys for Storage copy migration: %w", err)
+	}
+	defer connection.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+	tx, err := connection.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("l1: begin Storage copy migration: %w", err)
+	}
+	defer tx.Rollback()
+	replacements := map[string]string{}
+	for oldValue, newValue := range map[string]string{
+		"operation IN ('restore', 'clone')": "operation IN ('restore', 'clone', 'import')",
+		"destination_computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE": "destination_computer_id TEXT NOT NULL",
+		"source_computer_id TEXT NOT NULL REFERENCES computers(computer_id)":                        "source_computer_id TEXT NOT NULL",
+		"backup_id TEXT NOT NULL REFERENCES backups(backup_id)":                                     "backup_id TEXT NOT NULL",
+		"copy_id TEXT NOT NULL REFERENCES backup_copies(copy_id)":                                   "copy_id TEXT NOT NULL",
+		"job_id TEXT NOT NULL REFERENCES jobs(job_id)":                                              "job_id TEXT NOT NULL",
+	} {
+		if strings.Contains(sourceSQL, oldValue) {
+			replacements[oldValue] = newValue
+		}
+	}
+	createSQL, err := migratedSQLiteCreateTable(sourceSQL, "computer_storage_copy_operations_import_migration", replacements)
+	if err != nil {
+		return fmt.Errorf("l1: rewrite Storage copy schema: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, createSQL); err != nil {
+		return fmt.Errorf("l1: create widened Storage copy schema: %w", err)
+	}
+	if err := copySQLiteTableColumns(ctx, tx, "computer_storage_copy_operations", "computer_storage_copy_operations_import_migration"); err != nil {
+		return fmt.Errorf("l1: copy Storage operations during migration: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE computer_storage_copy_operations;
+		ALTER TABLE computer_storage_copy_operations_import_migration RENAME TO computer_storage_copy_operations;
+		CREATE UNIQUE INDEX computer_storage_copy_active ON computer_storage_copy_operations(destination_computer_id)
+		WHERE status IN ('reserved', 'prepared', 'published')`); err != nil {
+		return fmt.Errorf("l1: publish widened Storage copy schema: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("l1: commit Storage copy migration: %w", err)
+	}
+	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+		return fmt.Errorf("l1: restore foreign keys after Storage copy migration: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateCustodyExportConstraints(ctx context.Context) error {
+	connection, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("l1: acquire Custody export migration connection: %w", err)
+	}
+	defer connection.Close()
+	var sourceSQL string
+	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_custody_exports'`).Scan(&sourceSQL); err != nil {
+		return fmt.Errorf("l1: inspect Custody export schema: %w", err)
+	}
+	if strings.Contains(sourceSQL, "'failed'") && !strings.Contains(sourceSQL, "external_path TEXT NOT NULL UNIQUE") {
+		_, err := connection.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS custody_export_event_path
+			ON computer_custody_exports(external_path, export_id)`)
+		return err
+	}
+	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return err
+	}
+	defer connection.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+	tx, err := connection.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	createSQL, err := migratedSQLiteCreateTable(sourceSQL, "computer_custody_exports_failure_migration", map[string]string{
+		"status IN ('planned', 'exported', 'superseded')": "status IN ('planned', 'exported', 'failed', 'superseded')",
+		"external_path TEXT NOT NULL UNIQUE":              "external_path TEXT NOT NULL",
+	})
+	if err != nil {
+		return fmt.Errorf("l1: rewrite Custody export schema: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, createSQL); err != nil {
+		return fmt.Errorf("l1: create widened Custody export schema: %w", err)
+	}
+	if err := copySQLiteTableColumns(ctx, tx, "computer_custody_exports", "computer_custody_exports_failure_migration"); err != nil {
+		return fmt.Errorf("l1: copy Custody exports during migration: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE computer_custody_exports;
+		ALTER TABLE computer_custody_exports_failure_migration RENAME TO computer_custody_exports;
+		CREATE INDEX custody_exports_storage ON computer_custody_exports(source_storage_id, source_generation);
+		CREATE UNIQUE INDEX custody_export_event_path ON computer_custody_exports(external_path, export_id)`); err != nil {
+		return fmt.Errorf("l1: publish widened Custody export schema: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("l1: commit Custody export migration: %w", err)
+	}
+	_, err = connection.ExecContext(ctx, "PRAGMA foreign_keys=ON")
+	return err
+}
+
 func (s *Store) migrateBackupDigestConstraint(ctx context.Context) error {
 	connection, err := s.db.Conn(ctx)
 	if err != nil {
@@ -1257,7 +1376,8 @@ func (s *Store) migrateStorageProvenanceConstraints(ctx context.Context) error {
 	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='storage_provenance'`).Scan(&sourceSQL); err != nil {
 		return fmt.Errorf("l1: inspect Storage provenance schema: %w", err)
 	}
-	if strings.Contains(sourceSQL, "'import'") && !strings.Contains(sourceSQL, "backup_id TEXT NOT NULL UNIQUE") {
+	if strings.Contains(sourceSQL, "'import'") && !strings.Contains(sourceSQL, "backup_id TEXT NOT NULL UNIQUE") &&
+		!strings.Contains(sourceSQL, "backup_id TEXT NOT NULL REFERENCES") {
 		return nil
 	}
 	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
@@ -1278,7 +1398,10 @@ func (s *Store) migrateStorageProvenanceConstraints(ctx context.Context) error {
 	}
 	replacements := map[string]string{oldKindConstraint: "kind IN ('backup', 'restore', 'clone', 'export', 'import')"}
 	if strings.Contains(sourceSQL, "backup_id TEXT NOT NULL UNIQUE REFERENCES backups(backup_id)") {
-		replacements["backup_id TEXT NOT NULL UNIQUE REFERENCES backups(backup_id)"] = "backup_id TEXT NOT NULL REFERENCES backups(backup_id)"
+		replacements["backup_id TEXT NOT NULL UNIQUE REFERENCES backups(backup_id)"] = "backup_id TEXT NOT NULL"
+	}
+	if strings.Contains(sourceSQL, "backup_id TEXT NOT NULL REFERENCES backups(backup_id)") {
+		replacements["backup_id TEXT NOT NULL REFERENCES backups(backup_id)"] = "backup_id TEXT NOT NULL"
 	}
 	createSQL, err := migratedSQLiteCreateTable(sourceSQL, "storage_provenance_copy_migration", replacements)
 	if err != nil {
@@ -1299,7 +1422,7 @@ func (s *Store) migrateStorageProvenanceConstraints(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX storage_provenance_backup_origin ON storage_provenance(backup_id) WHERE kind='backup'`); err != nil {
 		return fmt.Errorf("l1: restore Backup provenance index: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX storage_provenance_destination ON storage_provenance(destination_storage_id, destination_generation) WHERE kind IN ('restore', 'clone')`); err != nil {
+	if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX storage_provenance_destination ON storage_provenance(destination_storage_id, destination_generation) WHERE kind IN ('restore', 'clone', 'import')`); err != nil {
 		return fmt.Errorf("l1: restore destination provenance index: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -1324,12 +1447,22 @@ func (s *Store) migrateComputerAbortConstraints(ctx context.Context) error {
 	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_reconfiguration_aborts'`).Scan(&sourceSQL); err != nil {
 		return fmt.Errorf("l1: inspect Computer abort schema: %w", err)
 	}
-	if strings.Contains(sourceSQL, "'growing'") {
+	if strings.Contains(sourceSQL, "'growing'") && strings.Contains(sourceSQL, "'exporting'") && strings.Contains(sourceSQL, "'importing'") {
 		return nil
 	}
-	const oldConstraint = "'backing_up', 'resetting', 'reimaging'"
-	const newConstraint = "'backing_up', 'resetting', 'reimaging', 'growing'"
-	if !strings.Contains(sourceSQL, oldConstraint) {
+	oldConstraint := ""
+	for _, candidate := range []string{
+		"'backing_up', 'resetting', 'exporting', 'importing', 'reimaging', 'growing'",
+		"'backing_up', 'resetting', 'reimaging', 'growing'",
+		"'backing_up', 'resetting', 'reimaging'",
+	} {
+		if strings.Contains(sourceSQL, candidate) {
+			oldConstraint = candidate
+			break
+		}
+	}
+	const newConstraint = "'backing_up', 'resetting', 'exporting', 'importing', 'reimaging', 'growing'"
+	if oldConstraint == "" {
 		return errors.New("l1: Computer abort constraint has an unknown durable shape")
 	}
 	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {

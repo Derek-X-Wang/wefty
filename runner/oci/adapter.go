@@ -1889,7 +1889,7 @@ func (adapter *Adapter) CopyComputerStorage(ctx context.Context, request workloa
 	if err != nil {
 		return workloadrunner.ComputerStorageCopyReceipt{}, err
 	}
-	if response.Receipt.Kind != "computer_storage_copy_verified" || response.Receipt.ReceiptID == "" ||
+	if (response.Receipt.Kind != "computer_storage_copy_verified" && response.Receipt.Kind != "computer_storage_copy_failed_absent") || response.Receipt.ReceiptID == "" ||
 		response.Receipt.HelperGeneration == 0 {
 		return workloadrunner.ComputerStorageCopyReceipt{}, errors.New("OCI helper did not positively verify Computer Storage copy")
 	}
@@ -1911,6 +1911,7 @@ func (adapter *Adapter) ExportComputerCustody(ctx context.Context, request workl
 			StorageID: request.Storage.StorageID, StorageGeneration: request.Storage.StorageGeneration,
 			IntentRevision: request.Storage.IntentRevision, DiskBytes: request.Storage.DiskBytes},
 		SourceSize: request.SourceSize, SourceDigest: request.SourceDigest, ExternalPath: request.ExternalPath,
+		JobSpec: request.JobSpec, JobSpecHash: request.JobSpecHash,
 		Authority: ocihelper.ComputerCustodyExportAuthority{NodeID: request.NodeID, BootSessionID: request.BootSessionID,
 			HelperGeneration: handshake.SessionGeneration, RootInstanceID: request.RootInstanceID,
 			OperationRevision: request.OperationRevision, CustodyFence: request.CustodyFence},
@@ -1918,7 +1919,7 @@ func (adapter *Adapter) ExportComputerCustody(ctx context.Context, request workl
 	if err != nil {
 		return workloadrunner.ComputerCustodyExportReceipt{}, err
 	}
-	if response.Receipt.Kind != "computer_custody_export_verified" || response.Receipt.ReceiptID == "" ||
+	if (response.Receipt.Kind != "computer_custody_export_verified" && response.Receipt.Kind != "computer_custody_export_failed") || response.Receipt.ReceiptID == "" ||
 		response.Receipt.HelperGeneration == 0 {
 		return workloadrunner.ComputerCustodyExportReceipt{}, errors.New("OCI helper did not positively verify Custody export")
 	}

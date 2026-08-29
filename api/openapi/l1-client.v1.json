@@ -1122,20 +1122,38 @@
       "post": {
         "operationId": "importComputerCustody",
         "summary": "Validate a Custody manifest and digest into a new stopped no-grant Computer",
-        "description": "The exported event is untouched. Publication occurs only after manifest, source digest, destination digest, and clone-style OS identity rekey evidence bind the new Computer and Storage identities.",
+        "description": "The exported event is untouched. The operator supplies the portable custody.json and chooses the current destination Node; import does not depend on the exporting L1 database or its frozen root instance. The destination name and identities are atomically reserved in the shared Storage-copy ledger, then published only after manifest, source digest, destination digest, and clone-style OS identity rekey evidence bind them.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
-          "required": ["name", "disk_bytes", "external_path", "idempotency_key"],
+          "required": ["name", "disk_bytes", "node_id", "external_path", "manifest", "manifest_digest", "idempotency_key"],
           "properties": {
             "name": { "type": "string", "minLength": 1, "maxLength": 255 },
             "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
+            "node_id": { "type": "string", "minLength": 1 },
             "external_path": { "type": "string", "minLength": 1 },
+            "manifest_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "manifest": {
+              "type": "object", "additionalProperties": false,
+              "required": ["version", "export_id", "backup_id", "copy_id", "computer_id", "storage_id", "storage_generation", "allocated_size", "content_digest", "encryption", "node_id", "root_instance_id", "operation_revision", "custody_fence", "job_spec", "job_spec_hash", "disk_file", "phase"],
+              "properties": {
+                "version": { "const": 1 }, "export_id": { "type": "string", "minLength": 1 },
+                "backup_id": { "type": "string", "minLength": 1 }, "copy_id": { "type": "string", "minLength": 1 },
+                "computer_id": { "type": "string", "minLength": 1 }, "storage_id": { "type": "string", "minLength": 1 },
+                "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+                "allocated_size": { "type": "integer", "format": "int64", "minimum": 1 },
+                "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "encryption": { "const": "none" },
+                "node_id": { "type": "string", "minLength": 1 }, "root_instance_id": { "type": "string", "minLength": 1 },
+                "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 }, "custody_fence": { "type": "string", "minLength": 1 },
+                "job_spec": { "$ref": "./common.v1.json#/components/schemas/JobSpec" }, "job_spec_hash": { "type": "string", "minLength": 1 },
+                "disk_file": { "const": "storage.ext4" }, "phase": { "const": "complete" }
+              }
+            },
             "idempotency_key": { "type": "string", "minLength": 1 }
           }
         } } } },
         "responses": {
           "200": { "description": "Identical Custody import replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "type": "object" } } } },
-          "202": { "description": "Import validation and managed materialization reserved; no Computer exists until positive evidence is accepted.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "202": { "description": "Import validation and managed materialization reserved atomically as a stopped, non-claimable Computer until positive evidence is accepted.", "content": { "application/json": { "schema": { "type": "object" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }

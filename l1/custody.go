@@ -33,6 +33,7 @@ type ComputerCustodyExport struct {
 	RootInstanceID          string     `json:"root_instance_id"`
 	ExternalPath            string     `json:"external_path"`
 	Status                  string     `json:"status"`
+	FailureCode             string     `json:"failure_code,omitempty"`
 	ManifestDigest          string     `json:"manifest_digest,omitempty"`
 	OperatorAttestedDeleted bool       `json:"operator_attested_deleted"`
 	RequestedAt             time.Time  `json:"requested_at"`
@@ -41,19 +42,21 @@ type ComputerCustodyExport struct {
 }
 
 type ComputerCustodyExportDirective struct {
-	ExportID          string `json:"export_id"`
-	ComputerID        string `json:"computer_id"`
-	OperationRevision int64  `json:"operation_revision"`
-	BackupID          string `json:"backup_id"`
-	CopyID            string `json:"copy_id"`
-	StorageID         string `json:"storage_id"`
-	StorageGeneration int64  `json:"storage_generation"`
-	AllocatedSize     int64  `json:"allocated_size"`
-	ContentDigest     string `json:"content_digest"`
-	BoundNodeID       string `json:"bound_node_id"`
-	RootInstanceID    string `json:"root_instance_id"`
-	ExternalPath      string `json:"external_path"`
-	CustodyFence      string `json:"custody_fence"`
+	ExportID          string           `json:"export_id"`
+	ComputerID        string           `json:"computer_id"`
+	OperationRevision int64            `json:"operation_revision"`
+	BackupID          string           `json:"backup_id"`
+	CopyID            string           `json:"copy_id"`
+	StorageID         string           `json:"storage_id"`
+	StorageGeneration int64            `json:"storage_generation"`
+	AllocatedSize     int64            `json:"allocated_size"`
+	ContentDigest     string           `json:"content_digest"`
+	BoundNodeID       string           `json:"bound_node_id"`
+	RootInstanceID    string           `json:"root_instance_id"`
+	ExternalPath      string           `json:"external_path"`
+	CustodyFence      string           `json:"custody_fence"`
+	SourceSpec        contract.JobSpec `json:"source_spec"`
+	SourceSpecHash    string           `json:"source_spec_hash"`
 }
 
 type ComputerCustodyExportReceipt = contract.ComputerCustodyExportReceipt
@@ -71,11 +74,14 @@ type ComputerCustodyAttestationRequest struct {
 }
 
 type ComputerCustodyImportRequest struct {
-	Name           string `json:"name"`
-	DiskBytes      int64  `json:"disk_bytes"`
-	ExternalPath   string `json:"external_path"`
-	IdempotencyKey string `json:"idempotency_key"`
-	Actor          string `json:"-"`
+	Name           string                           `json:"name"`
+	DiskBytes      int64                            `json:"disk_bytes"`
+	NodeID         string                           `json:"node_id,omitempty"`
+	ExternalPath   string                           `json:"external_path"`
+	Manifest       contract.ComputerCustodyManifest `json:"manifest"`
+	ManifestDigest string                           `json:"manifest_digest"`
+	IdempotencyKey string                           `json:"idempotency_key"`
+	Actor          string                           `json:"-"`
 }
 
 type ComputerCustodyImport struct {
@@ -98,7 +104,7 @@ func scanCustodyExport(scanner interface{ Scan(...any) error }) (ComputerCustody
 	err := scanner.Scan(&value.ExportID, &value.ComputerID, &value.OperationRevision, &value.BackupID,
 		&value.CopyID, &value.SourceStorageID, &value.SourceGeneration, &value.AllocatedSize,
 		&value.ContentDigest, &value.BoundNodeID, &value.RootInstanceID, &value.ExternalPath,
-		&value.Status, &value.ManifestDigest, &attestationKey, &requested, &completed, &attested)
+		&value.Status, &value.FailureCode, &value.ManifestDigest, &attestationKey, &requested, &completed, &attested)
 	value.OperatorAttestedDeleted = attestationKey.Valid
 	value.RequestedAt = time.Unix(0, requested).UTC()
 	if completed.Valid {
@@ -114,7 +120,7 @@ func scanCustodyExport(scanner interface{ Scan(...any) error }) (ComputerCustody
 
 const custodyExportColumns = `export_id, computer_id, operation_revision, backup_id, copy_id,
 	source_storage_id, source_generation, allocated_size, content_digest, bound_node_id,
-	root_instance_id, external_path, status, manifest_digest, operator_attestation_key,
+	root_instance_id, external_path, status, failure_code, manifest_digest, operator_attestation_key,
 	requested_ns, completed_ns, operator_attested_ns`
 
 func (s *Store) BeginComputerCustodyExport(ctx context.Context, computerID string, request ComputerCustodyExportRequest) (ComputerCustodyExport, bool, error) {
@@ -127,7 +133,10 @@ func (s *Store) BeginComputerCustodyExport(ctx context.Context, computerID strin
 		return ComputerCustodyExport{}, false, protocolError(contract.ErrorInvalidRequest,
 			"computer_id, backup_id, absolute external_path, actor, and idempotency_key are required")
 	}
-	requestHash, err := storageCopyHash(request)
+	requestHash, err := storageCopyHash(struct {
+		ComputerCustodyExportRequest
+		BackupID string `json:"backup_id"`
+	}{request, request.BackupID})
 	if err != nil {
 		return ComputerCustodyExport{}, false, internalError(err, "encode Custody export request")
 	}
@@ -159,11 +168,6 @@ func (s *Store) BeginComputerCustodyExport(ctx context.Context, computerID strin
 	}
 	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
 		return ComputerCustodyExport{}, false, err
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT export_id FROM computer_custody_exports WHERE external_path=?`, request.ExternalPath).Scan(new(string)); err == nil {
-		return ComputerCustodyExport{}, false, protocolError(contract.ErrorConflict, "external_path is already bound to another Custody export")
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return ComputerCustodyExport{}, false, internalError(err, "check Custody export path")
 	}
 	if computer.DesiredState == contract.ServiceDesiredRemoved || computer.ReconfigurationPhase != ComputerReconfigurationStable {
 		return ComputerCustodyExport{}, false, protocolError(contract.ErrorConflict, "Computer %q cannot begin a Custody export", computerID)
@@ -212,11 +216,6 @@ func (s *Store) BeginComputerCustodyExport(ctx context.Context, computerID strin
 		newID("custody-fence"), specJSON, specHash, request.IdempotencyKey, requestHash, now.UnixNano()); err != nil {
 		return ComputerCustodyExport{}, false, internalError(err, "record Custody export before external bytes")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO storage_provenance(provenance_id, kind, source_storage_id,
-		source_generation, backup_id, created_ns) VALUES(?, 'export', ?, ?, ?, ?)`, newID("storage-provenance"),
-		backup.SourceStorageID, backup.SourceGeneration, backup.BackupID, now.UnixNano()); err != nil {
-		return ComputerCustodyExport{}, false, internalError(err, "record Custody export provenance")
-	}
 	if err := insertComputerIntent(ctx, tx, computerID, revision, ComputerIntentCustodyExport,
 		computer.DesiredState, computer.StorageID, computer.StorageGeneration, computer.CurrentJobID,
 		computer.CurrentSpecRevision, request.Actor, now); err != nil {
@@ -237,10 +236,13 @@ func (s *Store) ListNodeComputerCustodyExportDirectives(ctx context.Context, ide
 	if err := validateStorageResetNode(ctx, s.db, identityNodeID, nodeID, bootSessionID); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT export_id, computer_id, operation_revision, backup_id,
-		copy_id, source_storage_id, source_generation, allocated_size, content_digest, bound_node_id,
-		root_instance_id, external_path, custody_fence FROM computer_custody_exports
-		WHERE bound_node_id=? AND status='planned' ORDER BY requested_ns, export_id`, nodeID)
+	rows, err := s.db.QueryContext(ctx, `SELECT e.export_id, e.computer_id, e.operation_revision, e.backup_id,
+		e.copy_id, e.source_storage_id, e.source_generation, e.allocated_size, e.content_digest, e.bound_node_id,
+		e.root_instance_id, e.external_path, e.custody_fence, e.source_spec_json, e.source_spec_hash
+		FROM computer_custody_exports e JOIN computers c ON c.computer_id=e.computer_id
+		WHERE e.bound_node_id=? AND e.status='planned'
+		AND c.reconfiguration_phase='exporting' AND c.reconfiguration_revision=e.operation_revision
+		ORDER BY e.requested_ns, e.export_id`, nodeID)
 	if err != nil {
 		return nil, internalError(err, "list Custody export directives")
 	}
@@ -248,11 +250,16 @@ func (s *Store) ListNodeComputerCustodyExportDirectives(ctx context.Context, ide
 	directives := []ComputerCustodyExportDirective{}
 	for rows.Next() {
 		var directive ComputerCustodyExportDirective
+		var specJSON []byte
 		if err := rows.Scan(&directive.ExportID, &directive.ComputerID, &directive.OperationRevision,
 			&directive.BackupID, &directive.CopyID, &directive.StorageID, &directive.StorageGeneration,
 			&directive.AllocatedSize, &directive.ContentDigest, &directive.BoundNodeID,
-			&directive.RootInstanceID, &directive.ExternalPath, &directive.CustodyFence); err != nil {
+			&directive.RootInstanceID, &directive.ExternalPath, &directive.CustodyFence, &specJSON,
+			&directive.SourceSpecHash); err != nil {
 			return nil, internalError(err, "scan Custody export directive")
+		}
+		if err := json.Unmarshal(specJSON, &directive.SourceSpec); err != nil {
+			return nil, internalError(err, "decode Custody export directive specification")
 		}
 		directives = append(directives, directive)
 	}
@@ -287,14 +294,27 @@ func (s *Store) ListComputerCustodyExports(ctx context.Context, computerID strin
 }
 
 func validateCustodyExportReceipt(export ComputerCustodyExportDirective, receipt ComputerCustodyExportReceipt) error {
-	if receipt.Kind != "computer_custody_export_verified" || receipt.ReceiptID == "" || receipt.HelperGeneration == 0 ||
-		!backupDigestPattern.MatchString(receipt.ManifestDigest) || receipt.ExportID != export.ExportID || receipt.BackupID != export.BackupID ||
+	if receipt.ReceiptID == "" || receipt.HelperGeneration == 0 || receipt.ExportID != export.ExportID || receipt.BackupID != export.BackupID ||
 		receipt.CopyID != export.CopyID || receipt.ComputerID != export.ComputerID || receipt.StorageID != export.StorageID ||
 		receipt.StorageGeneration != export.StorageGeneration || receipt.NodeID != export.BoundNodeID ||
 		receipt.RootInstanceID != export.RootInstanceID || receipt.OperationRevision != export.OperationRevision ||
 		receipt.CustodyFence != export.CustodyFence || receipt.ExternalPath != export.ExternalPath ||
 		receipt.AllocatedSize != export.AllocatedSize || receipt.ContentDigest != export.ContentDigest {
 		return protocolError(contract.ErrorStorageReferenceConflict, "Custody export receipt does not bind the recorded external transfer")
+	}
+	switch receipt.Kind {
+	case "computer_custody_export_verified":
+		if receipt.FailureCode != "" || !backupDigestPattern.MatchString(receipt.ManifestDigest) {
+			return protocolError(contract.ErrorInvalidRequest, "successful Custody export receipt is incomplete")
+		}
+	case "computer_custody_export_failed":
+		if receipt.ManifestDigest != "" || (receipt.FailureCode != "insufficient_disk" &&
+			receipt.FailureCode != "destination_not_empty" && receipt.FailureCode != "managed_root_path" &&
+			receipt.FailureCode != "cancelled") {
+			return protocolError(contract.ErrorInvalidRequest, "failed Custody export receipt is incomplete")
+		}
+	default:
+		return protocolError(contract.ErrorInvalidRequest, "Custody export receipt kind is invalid")
 	}
 	return nil
 }
@@ -349,16 +369,28 @@ func (s *Store) AcknowledgeComputerCustodyExport(ctx context.Context, identityNo
 	if err != nil {
 		return ComputerCustodyExport{}, internalError(err, "encode Custody export receipt")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE computer_custody_exports SET status='exported', manifest_digest=?,
+	if status != "planned" {
+		return ComputerCustodyExport{}, protocolError(contract.ErrorConflict, "Custody export is no longer awaiting completion")
+	}
+	completedStatus := "exported"
+	if request.Receipt.Kind == "computer_custody_export_failed" {
+		completedStatus = "failed"
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_custody_exports SET status=?, failure_code=?, manifest_digest=?,
 		receipt_json=?, acknowledgement_key=?, acknowledgement_hash=?, completed_ns=? WHERE export_id=?`,
-		request.Receipt.ManifestDigest, receiptJSON, request.IdempotencyKey, bodyHash, now.UnixNano(), directive.ExportID); err != nil {
+		completedStatus, request.Receipt.FailureCode, request.Receipt.ManifestDigest, receiptJSON, request.IdempotencyKey, bodyHash, now.UnixNano(), directive.ExportID); err != nil {
 		return ComputerCustodyExport{}, internalError(err, "record verified Custody export")
 	}
 	if status == "planned" {
-		if _, err := tx.ExecContext(ctx, `UPDATE computers SET applied_revision=?, reconfiguration_phase='stable',
-			reconfiguration_revision=NULL, updated_ns=? WHERE computer_id=? AND intent_revision=? AND reconfiguration_phase='exporting'`,
-			directive.OperationRevision, now.UnixNano(), computerID, directive.OperationRevision); err != nil {
+		result, err := tx.ExecContext(ctx, `UPDATE computers SET applied_revision=?, reconfiguration_phase='stable',
+			reconfiguration_revision=NULL, updated_ns=? WHERE computer_id=? AND intent_revision=?
+			AND reconfiguration_phase='exporting' AND reconfiguration_revision=?`,
+			directive.OperationRevision, now.UnixNano(), computerID, directive.OperationRevision, directive.OperationRevision)
+		if err != nil {
 			return ComputerCustodyExport{}, internalError(err, "complete Custody export intent")
+		}
+		if err := requireComputerCAS(result, computerID, directive.OperationRevision); err != nil {
+			return ComputerCustodyExport{}, protocolError(contract.ErrorStaleIntentRevision, "Custody export was superseded before acknowledgement")
 		}
 	}
 	export, err := scanCustodyExport(tx.QueryRowContext(ctx, `SELECT `+custodyExportColumns+` FROM computer_custody_exports WHERE export_id=?`, directive.ExportID))
@@ -400,14 +432,44 @@ func (s *Store) AttestComputerCustodyDeleted(ctx context.Context, exportID strin
 
 func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string, request ComputerCustodyImportRequest) (ComputerCustodyImport, bool, error) {
 	request.Name = strings.TrimSpace(request.Name)
+	request.NodeID = strings.TrimSpace(request.NodeID)
 	request.ExternalPath = filepath.Clean(strings.TrimSpace(request.ExternalPath))
+	request.ManifestDigest = strings.TrimSpace(request.ManifestDigest)
 	request.IdempotencyKey = strings.TrimSpace(request.IdempotencyKey)
 	request.Actor = strings.TrimSpace(request.Actor)
 	if err := validateComputerNameAndActor(request.Name, request.Actor); err != nil {
 		return ComputerCustodyImport{}, false, err
 	}
-	if exportID == "" || request.DiskBytes < 1 || request.IdempotencyKey == "" || !filepath.IsAbs(request.ExternalPath) {
-		return ComputerCustodyImport{}, false, protocolError(contract.ErrorInvalidRequest, "export_id, name, positive disk_bytes, absolute external_path, and idempotency_key are required")
+	manifest := request.Manifest
+	if exportID == "" || request.DiskBytes < 1 || request.IdempotencyKey == "" || !filepath.IsAbs(request.ExternalPath) ||
+		request.ManifestDigest == "" || manifest.Version != 1 || manifest.ExportID != exportID || manifest.Phase != "complete" ||
+		manifest.DiskFile != "storage.ext4" || manifest.Encryption != "none" || manifest.AllocatedSize < 1 ||
+		!backupDigestPattern.MatchString(manifest.ContentDigest) || manifest.ComputerID == "" || manifest.StorageID == "" ||
+		manifest.StorageGeneration < 1 || manifest.BackupID == "" || manifest.CopyID == "" {
+		return ComputerCustodyImport{}, false, protocolError(contract.ErrorInvalidRequest,
+			"complete self-contained Custody manifest, export_id, name, positive disk_bytes, absolute external_path, and idempotency_key are required")
+	}
+	observedManifestDigest, err := contract.DigestComputerCustodyManifest(manifest)
+	if err != nil || observedManifestDigest != request.ManifestDigest {
+		return ComputerCustodyImport{}, false, protocolError(contract.ErrorStorageReferenceConflict,
+			"Custody import manifest digest does not match its submitted manifest")
+	}
+	if request.DiskBytes < manifest.AllocatedSize {
+		return ComputerCustodyImport{}, false, protocolError(contract.ErrorConflict,
+			"Custody import disk_bytes cannot be smaller than its manifest")
+	}
+	if !isComputerSpec(manifest.JobSpec) || len(manifest.JobSpec.Execution.SensitiveEnv) != 0 {
+		return ComputerCustodyImport{}, false, protocolError(contract.ErrorStorageReferenceConflict,
+			"Custody import manifest does not contain a safe Computer Job specification")
+	}
+	_, observedSpecHash, err := encodeJobSpec(manifest.JobSpec)
+	if err != nil || observedSpecHash != manifest.JobSpecHash {
+		return ComputerCustodyImport{}, false, protocolError(contract.ErrorStorageReferenceConflict,
+			"Custody import Job specification digest does not match its manifest")
+	}
+	if request.NodeID == "" {
+		return ComputerCustodyImport{}, false, protocolError(contract.ErrorInvalidRequest,
+			"node_id is required when the export path's Node cannot be discovered")
 	}
 	requestHash, err := storageCopyHash(request)
 	if err != nil {
@@ -419,71 +481,31 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 		return ComputerCustodyImport{}, false, internalError(err, "begin Custody import")
 	}
 	defer tx.Rollback()
-	var existing ComputerCustodyImport
-	var requested int64
-	var completed sql.NullInt64
-	var storedHash string
-	if err := tx.QueryRowContext(ctx, `SELECT import_id, export_id, destination_computer_id,
-		destination_storage_id, destination_name, destination_size, status, requested_ns, completed_ns, request_hash
-		FROM computer_custody_imports WHERE idempotency_key=?`, request.IdempotencyKey).Scan(&existing.ImportID,
-		&existing.ExportID, &existing.DestinationComputerID, &existing.DestinationStorageID, &existing.DestinationName,
-		&existing.DestinationSize, &existing.Status, &requested, &completed, &storedHash); err == nil {
-		if storedHash != requestHash || existing.ExportID != exportID {
+	if replay, replayErr := scanComputerStorageCopy(tx.QueryRowContext(ctx, `SELECT `+storageCopyColumns+`
+		FROM computer_storage_copy_operations WHERE export_id=? AND idempotency_key=?`, exportID,
+		request.IdempotencyKey)); replayErr == nil {
+		if replay.Operation != "import" || replay.RequestHash != requestHash {
 			return ComputerCustodyImport{}, false, protocolError(contract.ErrorIdempotencyConflict, "Custody import idempotency key was reused")
 		}
-		existing.RequestedAt = time.Unix(0, requested).UTC()
-		if completed.Valid {
-			stamp := time.Unix(0, completed.Int64).UTC()
-			existing.CompletedAt = &stamp
-		}
-		return existing, true, nil
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return ComputerCustodyImport{}, false, internalError(err, "read Custody import replay")
+		var name string
+		_ = tx.QueryRowContext(ctx, `SELECT name FROM computers WHERE computer_id=?`, replay.DestinationComputerID).Scan(&name)
+		return ComputerCustodyImport{ImportID: replay.DestinationComputerID, ExportID: replay.ExportID,
+			DestinationComputerID: replay.DestinationComputerID, DestinationStorageID: replay.DestinationStorageID,
+			DestinationName: name, DestinationSize: replay.DestinationSize, Status: replay.Status}, true, nil
+	} else if !errors.Is(replayErr, sql.ErrNoRows) {
+		return ComputerCustodyImport{}, false, internalError(replayErr, "read Custody import replay")
 	}
-	var sourceStorageID, nodeID, rootID, manifestDigest, sourceSpecHash string
-	var sourceGeneration, sourceSize int64
-	var sourceDigest string
-	var sourceSpecJSON []byte
-	if err := tx.QueryRowContext(ctx, `SELECT source_storage_id,
-		source_generation, allocated_size, content_digest, bound_node_id, root_instance_id, manifest_digest,
-		source_spec_json, source_spec_hash FROM computer_custody_exports WHERE export_id=? AND status='exported'`, exportID).Scan(
-		&sourceStorageID, &sourceGeneration, &sourceSize, &sourceDigest,
-		&nodeID, &rootID, &manifestDigest, &sourceSpecJSON, &sourceSpecHash); errors.Is(err, sql.ErrNoRows) {
-		return ComputerCustodyImport{}, false, protocolError(contract.ErrorConflict, "Custody export %q is not complete and importable", exportID)
+	var rootID string
+	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, request.NodeID).Scan(&rootID); errors.Is(err, sql.ErrNoRows) {
+		return ComputerCustodyImport{}, false, protocolError(contract.ErrorNotFound, "destination Node %q was not found", request.NodeID)
 	} else if err != nil {
-		return ComputerCustodyImport{}, false, internalError(err, "read Custody import source")
+		return ComputerCustodyImport{}, false, internalError(err, "read Custody import destination managed-root identity")
 	}
-	if request.DiskBytes < sourceSize {
-		return ComputerCustodyImport{}, false, protocolError(contract.ErrorConflict, "Custody import disk_bytes cannot be smaller than its manifest")
-	}
-	if request.ExternalPath == "" || manifestDigest == "" {
-		return ComputerCustodyImport{}, false, protocolError(contract.ErrorConflict, "Custody export lacks immutable manifest evidence")
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT computer_id FROM computers WHERE name=?`, request.Name).Scan(new(string)); err == nil {
-		return ComputerCustodyImport{}, false, protocolError(contract.ErrorConflict, "Computer name %q is already used", request.Name)
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return ComputerCustodyImport{}, false, internalError(err, "check Custody import name")
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT import_id FROM computer_custody_imports
-		WHERE destination_name=? AND status='reserved'`, request.Name).Scan(new(string)); err == nil {
-		return ComputerCustodyImport{}, false, protocolError(contract.ErrorConflict, "Computer name %q is reserved by another Custody import", request.Name)
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return ComputerCustodyImport{}, false, internalError(err, "check pending Custody import name")
-	}
-	var spec contract.JobSpec
-	if err := json.Unmarshal(sourceSpecJSON, &spec); err != nil {
-		return ComputerCustodyImport{}, false, internalError(err, "decode Custody export Computer specification")
-	}
-	if !isComputerSpec(spec) {
-		return ComputerCustodyImport{}, false, internalError(errors.New("Custody export specification lost its Computer trait"), "decode Custody export Computer specification")
-	}
-	if _, observedHash, err := encodeJobSpec(spec); err != nil || observedHash != sourceSpecHash {
-		if err == nil {
-			err = errors.New("Custody export specification digest mismatch")
-		}
-		return ComputerCustodyImport{}, false, internalError(err, "verify Custody export Computer specification")
+	if rootID == "" {
+		return ComputerCustodyImport{}, false, protocolError(contract.ErrorConflict, "destination Node has no current managed-root identity")
 	}
 	computerID, storageID, jobID := newID("computer"), newID("storage"), newID("job")
+	spec := manifest.JobSpec
 	spec.DispatchKey = "computer:import:" + computerID
 	spec.Execution.SensitiveEnv = nil
 	spec.Execution.OCI.Computer.DiskBytes = request.DiskBytes
@@ -491,54 +513,55 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 	if err != nil {
 		return ComputerCustodyImport{}, false, err
 	}
-	importID := newID("custody-import")
-	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_custody_imports(import_id, export_id,
-		destination_computer_id, destination_storage_id, destination_job_id, destination_name,
-		destination_size, bound_node_id, root_instance_id, external_path, operation_revision,
-		cleanup_fence, destination_spec_json, destination_spec_hash, actor, idempotency_key,
-		request_hash, status, requested_ns) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'reserved', ?)`,
-		importID, exportID, computerID, storageID, jobID, request.Name, request.DiskBytes, nodeID, rootID,
-		request.ExternalPath, newID("import-fence"), specJSON, specHash, request.Actor, request.IdempotencyKey,
-		requestHash, now.UnixNano()); err != nil {
-		return ComputerCustodyImport{}, false, internalError(err, "reserve Custody import")
+	if _, err := insertComputerJobWithID(ctx, tx, jobID, spec, specJSON, specHash, contract.JobStopped,
+		contract.ServiceDesiredStopped, request.NodeID, now); err != nil {
+		return ComputerCustodyImport{}, false, err
 	}
-	value := ComputerCustodyImport{ImportID: importID, ExportID: exportID, DestinationComputerID: computerID,
+	if _, err := tx.ExecContext(ctx, `INSERT INTO computers(computer_id, name, placement_node_id,
+		bound_node_id, grants_json, storage_id, storage_generation, desired_disk_bytes, backup_cap, desired_state,
+		intent_revision, applied_revision, current_job_id, current_spec_revision, reconfiguration_phase,
+		reconfiguration_revision, created_ns, updated_ns) VALUES(?, ?, ?, ?, '[]', ?, 1, ?, 0, 'stopped',
+		1, 0, ?, 1, 'importing', 1, ?, ?)`, computerID, request.Name, request.NodeID, request.NodeID,
+		storageID, request.DiskBytes, jobID, now.UnixNano(), now.UnixNano()); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed: computers.name") {
+			return ComputerCustodyImport{}, false, protocolError(contract.ErrorConflict, "Computer name %q is already used or reserved", request.Name)
+		}
+		return ComputerCustodyImport{}, false, internalError(err, "reserve imported Computer identity")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_job_projections(computer_id, job_id,
+		spec_revision, current, created_ns) VALUES(?, ?, 1, 1, ?)`, computerID, jobID, now.UnixNano()); err != nil {
+		return ComputerCustodyImport{}, false, internalError(err, "reserve imported Computer projection")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_storage_generations(computer_id, storage_id,
+		storage_generation, disk_bytes, phase, reset_revision, created_ns) VALUES(?, ?, 1, ?, 'staging', 1, ?)`,
+		computerID, storageID, request.DiskBytes, now.UnixNano()); err != nil {
+		return ComputerCustodyImport{}, false, internalError(err, "reserve imported Storage generation")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_storage_copy_operations(
+		destination_computer_id, operation, operation_revision, source_computer_id, backup_id, copy_id,
+		source_storage_id, source_generation, source_size, source_digest, destination_storage_id,
+		old_generation, destination_generation, destination_size, bound_node_id, root_instance_id,
+		job_id, cleanup_fence, keep_old_as_backup, idempotency_key, request_hash, status, requested_ns,
+		export_id, external_path, manifest_digest, source_spec_json, source_spec_hash, actor)
+		VALUES(?, 'import', 1, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, ?, 0, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?)`,
+		computerID, manifest.ComputerID, manifest.BackupID, manifest.CopyID, manifest.StorageID,
+		manifest.StorageGeneration, manifest.AllocatedSize, manifest.ContentDigest, storageID,
+		request.DiskBytes, request.NodeID, rootID, jobID, newID("import-fence"), request.IdempotencyKey,
+		requestHash, now.UnixNano(), exportID, request.ExternalPath, request.ManifestDigest, specJSON,
+		specHash, request.Actor); err != nil {
+		return ComputerCustodyImport{}, false, internalError(err, "reserve Custody import in Storage copy ledger")
+	}
+	if err := insertComputerIntent(ctx, tx, computerID, 1, ComputerIntentCustodyImport,
+		contract.ServiceDesiredStopped, storageID, 1, jobID, 1, request.Actor, now); err != nil {
+		return ComputerCustodyImport{}, false, err
+	}
+	value := ComputerCustodyImport{ImportID: computerID, ExportID: exportID, DestinationComputerID: computerID,
 		DestinationStorageID: storageID, DestinationName: request.Name, DestinationSize: request.DiskBytes,
 		Status: "reserved", RequestedAt: now}
 	if err := tx.Commit(); err != nil {
 		return ComputerCustodyImport{}, false, internalError(err, "commit Custody import reservation")
 	}
 	return value, false, nil
-}
-
-func (s *Store) appendCustodyImportDirectives(ctx context.Context, nodeID string, directives []ComputerStorageCopyDirective) ([]ComputerStorageCopyDirective, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT i.export_id, e.backup_id, e.copy_id, e.computer_id,
-		e.source_storage_id, e.source_generation, e.allocated_size, e.content_digest,
-		i.destination_computer_id, i.destination_storage_id, i.destination_size, i.bound_node_id,
-		i.root_instance_id, i.destination_job_id, i.operation_revision, i.cleanup_fence,
-		i.external_path, e.manifest_digest FROM computer_custody_imports i
-		JOIN computer_custody_exports e ON e.export_id=i.export_id
-		WHERE i.bound_node_id=? AND i.status='reserved' ORDER BY i.requested_ns, i.import_id`, nodeID)
-	if err != nil {
-		return nil, internalError(err, "list Custody import directives")
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var directive ComputerStorageCopyDirective
-		directive.Operation = "import"
-		directive.DestinationGeneration = 1
-		if err := rows.Scan(&directive.ExportID, &directive.BackupID, &directive.CopyID,
-			&directive.SourceComputerID, &directive.SourceStorageID, &directive.SourceGeneration,
-			&directive.SourceSize, &directive.SourceDigest, &directive.DestinationComputerID,
-			&directive.DestinationStorageID, &directive.DestinationSize, &directive.BoundNodeID,
-			&directive.RootInstanceID, &directive.JobID, &directive.OperationRevision,
-			&directive.CleanupFence, &directive.ExternalPath, &directive.ManifestDigest); err != nil {
-			return nil, internalError(err, "scan Custody import directive")
-		}
-		directive.Phase = "reserved"
-		directives = append(directives, directive)
-	}
-	return directives, rows.Err()
 }
 
 func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNodeID, destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest) (Computer, error) {
@@ -558,109 +581,122 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 	if err := validateBackupNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Computer{}, err
 	}
-	var importID, exportID, storageID, jobID, name, nodeID, rootID, cleanupFence, status, actor string
-	var destinationSize, revision int64
-	var specJSON []byte
-	var specHash, backupID, copyID, sourceComputerID, sourceStorageID, sourceDigest, externalPath, manifestDigest string
-	var sourceGeneration, sourceSize int64
-	var ackKey, ackHash sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT i.import_id, i.export_id, i.destination_storage_id,
-		i.destination_job_id, i.destination_name, i.destination_size, i.bound_node_id, i.root_instance_id,
-		i.operation_revision, i.cleanup_fence, i.status, i.destination_spec_json, i.destination_spec_hash,
-		i.actor, i.acknowledgement_key, i.acknowledgement_hash, e.backup_id, e.copy_id, e.computer_id,
-		e.source_storage_id, e.source_generation, e.allocated_size, e.content_digest, i.external_path,
-		e.manifest_digest FROM computer_custody_imports i
-		JOIN computer_custody_exports e ON e.export_id=i.export_id WHERE i.destination_computer_id=?`, destinationComputerID).Scan(
-		&importID, &exportID, &storageID, &jobID, &name, &destinationSize, &nodeID, &rootID,
-		&revision, &cleanupFence, &status, &specJSON, &specHash, &actor, &ackKey, &ackHash, &backupID,
-		&copyID, &sourceComputerID, &sourceStorageID, &sourceGeneration, &sourceSize, &sourceDigest,
-		&externalPath, &manifestDigest)
+	row, err := scanComputerStorageCopy(tx.QueryRowContext(ctx, `SELECT `+storageCopyColumns+`
+		FROM computer_storage_copy_operations WHERE destination_computer_id=?
+		ORDER BY operation_revision DESC LIMIT 1`, destinationComputerID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Custody import operation was not found")
 	}
 	if err != nil {
 		return Computer{}, internalError(err, "read Custody import acknowledgement target")
 	}
-	if err := validateBackupAcknowledgementAuthority(ctx, tx, identityNodeID, request.NodeID, nodeID, rootID); err != nil {
+	if row.Operation != "import" {
+		return Computer{}, protocolError(contract.ErrorInvalidRequest, "stored Storage copy operation is not a Custody import")
+	}
+	if err := validateBackupAcknowledgementAuthority(ctx, tx, identityNodeID, request.NodeID, row.BoundNodeID, row.RootInstanceID); err != nil {
 		return Computer{}, err
 	}
 	receipt := request.Receipt
-	if receipt.Kind != computerStorageCopyReceiptKind || receipt.ReceiptID == "" || receipt.Operation != "import" ||
-		receipt.BackupID != backupID || receipt.CopyID != copyID || receipt.ExportID != exportID ||
-		receipt.ExternalPath != externalPath || receipt.ManifestDigest != manifestDigest ||
-		receipt.SourceComputerID != sourceComputerID || receipt.SourceStorageID != sourceStorageID ||
-		receipt.SourceGeneration != sourceGeneration || receipt.DestinationComputerID != destinationComputerID ||
-		receipt.DestinationStorageID != storageID || receipt.DestinationGeneration != 1 || receipt.NodeID != nodeID ||
-		receipt.RootInstanceID != rootID || receipt.JobID != jobID || receipt.OperationRevision != revision ||
-		receipt.CleanupFence != cleanupFence || receipt.HelperGeneration == 0 || receipt.SourceSize != sourceSize ||
-		receipt.DestinationSize != destinationSize || receipt.SourceDigest != sourceDigest ||
-		!backupDigestPattern.MatchString(receipt.SourceDigest) || !backupDigestPattern.MatchString(receipt.DestinationDigest) ||
-		!receipt.OSIdentityRekeyed || receipt.FilesystemExpanded != (destinationSize > sourceSize) {
-		return Computer{}, protocolError(contract.ErrorStorageReferenceConflict, "Custody import receipt does not bind the verified manifest and destination")
+	if err := validateStorageCopyReceipt(row, receipt); err != nil {
+		return Computer{}, err
 	}
-	if ackKey.Valid {
-		if ackKey.String != request.IdempotencyKey || !ackHash.Valid || ackHash.String != bodyHash {
+	if row.AcknowledgementKey.Valid {
+		if row.AcknowledgementKey.String != request.IdempotencyKey || !row.AcknowledgementHash.Valid || row.AcknowledgementHash.String != bodyHash {
 			return Computer{}, protocolError(contract.ErrorIdempotencyConflict, "Custody import acknowledgement differs from durable evidence")
+		}
+		if row.Status == "failed" {
+			return Computer{}, nil
 		}
 		return readComputerAuthority(ctx, tx, destinationComputerID, now)
 	}
-	if status != "reserved" {
+	if row.Status != "reserved" {
 		return Computer{}, protocolError(contract.ErrorConflict, "Custody import is not awaiting verification")
-	}
-	var spec contract.JobSpec
-	if err := json.Unmarshal(specJSON, &spec); err != nil {
-		return Computer{}, internalError(err, "decode Custody import Computer specification")
-	}
-	if !isComputerSpec(spec) {
-		return Computer{}, internalError(errors.New("Custody import specification lost its Computer trait"), "decode Custody import Computer specification")
-	}
-	if _, observedHash, err := encodeJobSpec(spec); err != nil || observedHash != specHash {
-		if err == nil {
-			err = errors.New("Custody import specification digest mismatch")
-		}
-		return Computer{}, internalError(err, "verify Custody import Computer specification")
-	}
-	if _, err := insertComputerJobWithID(ctx, tx, jobID, spec, specJSON, specHash, contract.JobStopped,
-		contract.ServiceDesiredStopped, nodeID, now); err != nil {
-		return Computer{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO computers(computer_id, name, placement_node_id,
-		bound_node_id, grants_json, storage_id, storage_generation, desired_disk_bytes, backup_cap, desired_state,
-		intent_revision, applied_revision, current_job_id, current_spec_revision, reconfiguration_phase,
-		created_ns, updated_ns) VALUES(?, ?, ?, ?, '[]', ?, 1, ?, 0, 'stopped', 1, 1, ?, 1, 'stable', ?, ?)`,
-		destinationComputerID, name, nodeID, nodeID, storageID, destinationSize, jobID, now.UnixNano(), now.UnixNano()); err != nil {
-		return Computer{}, internalError(err, "publish imported Computer identity")
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_job_projections(computer_id, job_id,
-		spec_revision, current, created_ns) VALUES(?, ?, 1, 1, ?)`, destinationComputerID, jobID, now.UnixNano()); err != nil {
-		return Computer{}, internalError(err, "publish imported Computer projection")
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_storage_generations(computer_id, storage_id,
-		storage_generation, disk_bytes, phase, created_ns) VALUES(?, ?, 1, ?, 'current', ?)`,
-		destinationComputerID, storageID, destinationSize, now.UnixNano()); err != nil {
-		return Computer{}, internalError(err, "publish imported Storage identity")
-	}
-	if err := insertComputerIntent(ctx, tx, destinationComputerID, 1, ComputerIntentCustodyImport,
-		contract.ServiceDesiredStopped, storageID, 1, jobID, 1, actor, now); err != nil {
-		return Computer{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO storage_provenance(provenance_id, kind,
-		source_storage_id, source_generation, backup_id, destination_computer_id,
-		destination_storage_id, destination_generation, created_ns) VALUES(?, 'import', ?, ?, ?, ?, ?, 1, ?)`,
-		newID("storage-provenance"), sourceStorageID, sourceGeneration, backupID,
-		destinationComputerID, storageID, now.UnixNano()); err != nil {
-		return Computer{}, internalError(err, "publish imported Storage provenance")
 	}
 	receiptJSON, err := json.Marshal(receipt)
 	if err != nil {
 		return Computer{}, internalError(err, "encode Custody import receipt")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE computer_custody_imports SET status='complete', receipt_json=?,
-		acknowledgement_key=?, acknowledgement_hash=?, completed_ns=? WHERE import_id=? AND status='reserved'`,
-		receiptJSON, request.IdempotencyKey, bodyHash, now.UnixNano(), importID); err != nil {
-		return Computer{}, internalError(err, "complete Custody import")
+	if receipt.Kind == "computer_storage_copy_failed_absent" {
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='failed',
+			failure_code=?, verification_receipt_json=?, verification_receipt_hash=?, acknowledgement_key=?,
+			acknowledgement_hash=?, completed_ns=? WHERE destination_computer_id=? AND operation_revision=? AND status='reserved'`,
+			receipt.FailureCode, receiptJSON, bodyHash, request.IdempotencyKey, bodyHash, now.UnixNano(),
+			destinationComputerID, row.OperationRevision); err != nil {
+			return Computer{}, internalError(err, "record failed Custody import")
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM computer_job_projections WHERE computer_id=?;
+			DELETE FROM computer_intent_history WHERE computer_id=?;
+			DELETE FROM computer_storage_generations WHERE computer_id=?;
+			DELETE FROM computers WHERE computer_id=?`, destinationComputerID, destinationComputerID,
+			destinationComputerID, destinationComputerID); err != nil {
+			return Computer{}, internalError(err, "release failed Custody import identities")
+		}
+		if err := deleteServiceRows(ctx, tx, row.JobID); err != nil {
+			return Computer{}, internalError(err, "release failed Custody import Job")
+		}
+		if err := tx.Commit(); err != nil {
+			return Computer{}, internalError(err, "commit failed Custody import")
+		}
+		return Computer{}, nil
 	}
 	computer, err := readComputerAuthority(ctx, tx, destinationComputerID, now)
+	if err != nil {
+		return Computer{}, internalError(err, "read Custody import publication authority")
+	}
+	if computer.IntentRevision != row.OperationRevision || computer.ReconfigurationPhase != ComputerReconfigurationImporting ||
+		computer.ReconfigurationRevision == nil || *computer.ReconfigurationRevision != row.OperationRevision {
+		return Computer{}, protocolError(contract.ErrorStaleIntentRevision, "Custody import no longer owns publication")
+	}
+	var spec contract.JobSpec
+	if err := json.Unmarshal(row.SourceSpecJSON, &spec); err != nil {
+		return Computer{}, internalError(err, "decode Custody import Computer specification")
+	}
+	if !isComputerSpec(spec) {
+		return Computer{}, internalError(errors.New("Custody import specification lost its Computer trait"), "decode Custody import Computer specification")
+	}
+	if _, observedHash, err := encodeJobSpec(spec); err != nil || observedHash != row.SourceSpecHash {
+		if err == nil {
+			err = errors.New("Custody import specification digest mismatch")
+		}
+		return Computer{}, internalError(err, "verify Custody import Computer specification")
+	}
+	published, err := tx.ExecContext(ctx, `UPDATE computer_storage_generations SET phase='current'
+		WHERE computer_id=? AND storage_generation=1 AND phase='staging' AND reset_revision=1`, destinationComputerID)
+	if err != nil {
+		return Computer{}, internalError(err, "publish imported Storage generation")
+	}
+	if err := requireSingleStorageGenerationMutation(published, "publish imported Storage generation"); err != nil {
+		return Computer{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO storage_provenance(provenance_id, kind,
+		source_storage_id, source_generation, backup_id, destination_computer_id,
+		destination_storage_id, destination_generation, created_ns) VALUES(?, 'import', ?, ?, ?, ?, ?, 1, ?)`,
+		newID("storage-provenance"), row.SourceStorageID, row.SourceGeneration, row.BackupID,
+		destinationComputerID, row.DestinationStorageID, now.UnixNano()); err != nil {
+		return Computer{}, internalError(err, "publish imported Storage provenance")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state='stopped', current_attempt_id=NULL, updated_ns=? WHERE job_id=?;
+		UPDATE service_jobs SET desired_state='stopped', published_attempt_id=NULL, healthy_since_ns=NULL,
+		next_restart_at=NULL WHERE job_id=?`, now.UnixNano(), row.JobID, row.JobID); err != nil {
+		return Computer{}, internalError(err, "keep imported Computer stopped")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE computers SET applied_revision=1, reconfiguration_phase='stable',
+		reconfiguration_revision=NULL, updated_ns=? WHERE computer_id=? AND intent_revision=1
+		AND reconfiguration_phase='importing' AND reconfiguration_revision=1`, now.UnixNano(), destinationComputerID)
+	if err != nil {
+		return Computer{}, internalError(err, "publish imported Computer authority")
+	}
+	if err := requireComputerCAS(result, destinationComputerID, 1); err != nil {
+		return Computer{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='complete',
+		verification_receipt_json=?, verification_receipt_hash=?, acknowledgement_key=?, acknowledgement_hash=?,
+		verified_ns=?, published_ns=?, completed_ns=? WHERE destination_computer_id=? AND operation_revision=1 AND status='reserved'`,
+		receiptJSON, bodyHash, request.IdempotencyKey, bodyHash, now.UnixNano(), now.UnixNano(), now.UnixNano(),
+		destinationComputerID); err != nil {
+		return Computer{}, internalError(err, "complete Custody import")
+	}
+	computer, err = readComputerAuthority(ctx, tx, destinationComputerID, now)
 	if err != nil {
 		return Computer{}, internalError(err, "read imported Computer")
 	}

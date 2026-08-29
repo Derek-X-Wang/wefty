@@ -604,7 +604,7 @@
       "ComputerCustodyExportDirective": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["export_id", "computer_id", "operation_revision", "backup_id", "copy_id", "storage_id", "storage_generation", "allocated_size", "content_digest", "bound_node_id", "root_instance_id", "external_path", "custody_fence"],
+        "required": ["export_id", "computer_id", "operation_revision", "backup_id", "copy_id", "storage_id", "storage_generation", "allocated_size", "content_digest", "bound_node_id", "root_instance_id", "external_path", "custody_fence", "source_spec", "source_spec_hash"],
         "properties": {
           "export_id": { "type": "string", "minLength": 1 },
           "computer_id": { "type": "string", "minLength": 1 },
@@ -618,7 +618,9 @@
           "bound_node_id": { "type": "string", "minLength": 1 },
           "root_instance_id": { "type": "string", "minLength": 1 },
           "external_path": { "type": "string", "minLength": 1 },
-          "custody_fence": { "type": "string", "minLength": 1 }
+          "custody_fence": { "type": "string", "minLength": 1 },
+          "source_spec": { "$ref": "#/components/schemas/JobSpec" },
+          "source_spec_hash": { "type": "string", "minLength": 1 }
         }
       },
       "Attempt": {

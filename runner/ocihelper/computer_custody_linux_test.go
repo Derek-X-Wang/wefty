@@ -18,6 +18,7 @@ func custodyExportTestRequest(source CreateComputerBackupResponse, externalPath 
 			StorageGeneration: receipt.StorageGeneration, IntentRevision: receipt.OperationRevision,
 			DiskBytes: receipt.AllocatedSize},
 		SourceSize: receipt.AllocatedSize, SourceDigest: receipt.ContentDigest, ExternalPath: externalPath,
+		JobSpecHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Authority: ComputerCustodyExportAuthority{NodeID: receipt.NodeID, BootSessionID: "export-boot",
 			HelperGeneration: 4, RootInstanceID: receipt.RootInstanceID,
 			OperationRevision: receipt.OperationRevision + 1, CustodyFence: "custody-fence"}}
@@ -77,11 +78,57 @@ func TestComputerCustodyExportRejectsSymlinkBackIntoManagedRoot(t *testing.T) {
 	}
 	request := custodyExportTestRequest(source, filepath.Join(alias, "operator-custody"))
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
-	if _, err := engine.ExportComputerCustody(t.Context(), request); err == nil {
-		t.Fatal("Custody export accepted an external-path alias into the managed root")
+	response, err := engine.ExportComputerCustody(t.Context(), request)
+	if err != nil || response.Receipt.Kind != "computer_custody_export_failed" || response.Receipt.FailureCode != "managed_root_path" {
+		t.Fatalf("Custody export managed-root rejection = %+v err=%v", response, err)
 	}
 	if _, err := os.Lstat(filepath.Join(root, "operator-custody")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("rejected Custody path created managed bytes: %v", err)
+	}
+}
+
+func TestComputerCustodyExportCommitBarrierAndCancellationAreTyped(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	externalRoot := filepath.Join(t.TempDir(), "operator-custody")
+	request := custodyExportTestRequest(source, externalRoot)
+	committed := false
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerCustodyHook: func(phase string) error {
+			if phase == "before_external_write" && !committed {
+				return errors.New("Custody event was not committed")
+			}
+			return nil
+		}}
+	if _, err := engine.ExportComputerCustody(t.Context(), request); err == nil {
+		t.Fatal("external write began before the durable L1 custody event")
+	}
+	if _, err := os.Lstat(externalRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("precommit rejection wrote external bytes: %v", err)
+	}
+	committed = true
+	ctx, cancel := context.WithCancel(t.Context())
+	engine.computerCustodyCopyN = func(destination io.Writer, source io.Reader, _ int64) (int64, error) {
+		payload := make([]byte, 4096)
+		count, err := source.Read(payload)
+		if err != nil {
+			return 0, err
+		}
+		written, err := destination.Write(payload[:count])
+		if err != nil {
+			return int64(written), err
+		}
+		cancel()
+		_, err = source.Read(payload)
+		return int64(written), err
+	}
+	response, err := engine.ExportComputerCustody(ctx, request)
+	if err != nil || response.Receipt.Kind != "computer_custody_export_failed" ||
+		response.Receipt.FailureCode != "cancelled" {
+		t.Fatalf("cancelled Custody export = %+v err=%v", response, err)
+	}
+	partial, err := os.Stat(filepath.Join(externalRoot, "storage.ext4"))
+	if err != nil || partial.Size() == 0 {
+		t.Fatalf("cancelled export did not retain possibly-secret partial bytes: %#v err=%v", partial, err)
 	}
 }
 

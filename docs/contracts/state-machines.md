@@ -215,13 +215,25 @@ A Custody export first CAS-records immutable source Backup, Storage, Node,
 managed-root, path, and fence evidence and moves the Computer through
 `exporting`; that commit permanently taints the branch before the agent may
 write the external manifest or its first storage byte. Missing or late helper
-completion cannot retract the event. `operator_attested_deleted` is append-only
-operator evidence and never changes `removed_reduced`. Import accepts only a
-completed export plus its trusted manifest digest, verifies the external bytes
-before creating any visible Computer, then publishes fresh Computer, Storage,
-Job, and narrowly rekeyed OS identities with no grants and desired state
-`stopped`. Storage provenance connects `import` and every later clone so the
-external-custody taint is permanent through all descendants.
+completion cannot retract the event. Removal supersedes a still-planned export
+and closes its directive fence; the already-committed event remains permanent
+taint. Typed helper failure evidence closes `exporting`, and a dead bound Node
+permits an explicit abort. `operator_attested_deleted` is append-only operator
+evidence and never changes `removed_reduced`.
+
+`custody.json` is the portable import authority: it contains the sanitized Job
+specification, manifest digest inputs, immutable source digest, and Storage
+provenance needed after the exporting L1 database is gone. The operator chooses
+the destination Node; omission may use the Node currently holding the external
+path when that can be discovered, but import never reuses the export's frozen
+managed-root identity. L1 atomically reserves the destination name and fresh
+Computer, Storage, and Job identities in the shared Storage-copy ledger with
+`operation='import'`. The destination helper re-reads the manifest, verifies the
+external bytes, and narrowly rekeys OS identity before publication. A typed
+failed-import receipt positively proves staging absence, records `failed`, and
+releases the reserved name and identities. Storage provenance connects
+`import` and every later clone so external-custody taint is permanent through
+all descendants.
 
 The current immutable Job mirrors Computer desired state only so it can reuse
 the ordinary service attempt state machine. Claim additionally joins the
