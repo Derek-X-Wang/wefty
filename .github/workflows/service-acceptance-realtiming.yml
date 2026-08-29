@@ -290,10 +290,10 @@ jobs:
                   chmod 0600 /run/wefty-containerd/containerd.sock
                   ;;
                 disable-registry)
-                  iptables -I OUTPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -j REJECT
+                  iptables -I OUTPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT
                   ;;
                 enable-registry)
-                  iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -j REJECT
+                  iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT
                   ;;
                 assert-computer-clean:wefty-log-segments-*)
                   name="${action#assert-computer-clean:}"

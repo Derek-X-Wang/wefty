@@ -170,6 +170,19 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if strings.Contains(scheduledText, "ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}") || strings.Contains(scheduledText, "ref: ${{ github.event.workflow_run.head_sha }}") {
 		t.Fatal("scheduled realtiming must check out the commit selected by the resolved immutable artifact")
 	}
+	for name, workflowText := range map[string]string{"workflow-run": realtimeText, "scheduled": scheduledText} {
+		for _, required := range []string{
+			"iptables -I OUTPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT",
+			"iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT",
+		} {
+			if !strings.Contains(workflowText, required) {
+				t.Fatalf("%s realtiming registry fault is not root-process scoped: missing %q", name, required)
+			}
+		}
+		if strings.Contains(workflowText, "--ctstate NEW -j REJECT") {
+			t.Fatalf("%s realtiming registry fault can sever the unprivileged runner control channel", name)
+		}
+	}
 	for name, workflow := range map[string]workflowContract{"workflow-run": realtiming, "scheduled": scheduled} {
 		result, ok := workflow.Jobs["realtiming-result"]
 		if !ok {
