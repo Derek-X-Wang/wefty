@@ -13,6 +13,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/coder/websocket"
@@ -373,8 +374,8 @@ func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T
 	if _, _, err := oldClient.Read(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if status := postComputerControl(t, firstBase, computerControlTakePath, oldToken); status != http.StatusNoContent {
-		t.Fatalf("first take status = %d", status)
+	if err := takeover.Perform(t.Context(), privateFabric, first.endpoint, oldToken, "take"); err != nil {
+		t.Fatalf("CLI take adapter against the real front door: %v", err)
 	}
 	if signals := first.runtime.signalSnapshot(); len(signals) != 2 || signals[0] || !signals[1] {
 		t.Fatalf("first service startup/take signals = %v", signals)
@@ -414,6 +415,12 @@ func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T
 	}
 	if signals := second.runtime.signalSnapshot(); len(signals) != 2 || signals[0] || !signals[1] {
 		t.Fatalf("fresh service startup/take signals = %v", signals)
+	}
+	if err := takeover.Perform(t.Context(), privateFabric, second.endpoint, freshToken, "release"); err != nil {
+		t.Fatalf("CLI release adapter against the real front door: %v", err)
+	}
+	if signals := second.runtime.signalSnapshot(); len(signals) != 3 || signals[2] {
+		t.Fatalf("explicit CLI release did not clear the driver signal: %v", signals)
 	}
 }
 
@@ -531,8 +538,8 @@ func (value *recordingComputerServiceFabric) Listen(network, address string) (ne
 	return net.Listen("tcp4", "127.0.0.1:0")
 }
 
-func (*recordingComputerServiceFabric) Dial(context.Context, string, string) (net.Conn, error) {
-	return nil, errors.New("unused")
+func (*recordingComputerServiceFabric) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, address)
 }
 func (value *recordingComputerServiceFabric) WhoIs(context.Context, string) (fabric.Identity, error) {
 	return value.identity, nil

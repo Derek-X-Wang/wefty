@@ -55,6 +55,16 @@ type ComputerGrantList struct {
 	Grants         []ComputerGrant `json:"grants"`
 }
 
+type ComputerTakeoverAccess struct {
+	ComputerID      string                  `json:"computer_id"`
+	UserID          string                  `json:"user_id"`
+	DeviceID        string                  `json:"device_id"`
+	DisplayName     string                  `json:"display_name,omitempty"`
+	AuthorizedRole  ComputerGrantPermission `json:"authorized_role"`
+	PolicyRevision  int64                   `json:"policy_revision"`
+	DisplayEndpoint *string                 `json:"display_endpoint"`
+}
+
 type ComputerPolicyAuditOperation string
 
 const (
@@ -400,6 +410,60 @@ func (s *Store) ListComputerGrants(ctx context.Context, identity fabric.Identity
 	}
 	result.Grants = grants
 	return result, nil
+}
+
+func (s *Store) GetComputerTakeoverAccess(
+	ctx context.Context,
+	identity fabric.Identity,
+	computerID string,
+) (ComputerTakeoverAccess, error) {
+	if err := validatePersonIdentity(identity); err != nil {
+		return ComputerTakeoverAccess{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return ComputerTakeoverAccess{}, internalError(err, "begin Computer take-over access read")
+	}
+	defer tx.Rollback()
+	access := ComputerTakeoverAccess{ComputerID: computerID, UserID: identity.UserID,
+		DeviceID: identity.DeviceID, DisplayName: identity.DisplayName}
+	if err := tx.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&access.PolicyRevision); err != nil {
+		return ComputerTakeoverAccess{}, internalError(err, "read Computer take-over policy revision")
+	}
+	var endpoint sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT service_jobs.display_endpoint FROM computers
+		JOIN service_jobs ON service_jobs.job_id=computers.current_job_id
+		WHERE computers.computer_id=? AND computers.desired_state<>'removed'`, computerID).Scan(&endpoint); errors.Is(err, sql.ErrNoRows) {
+		return ComputerTakeoverAccess{}, protocolError(contract.ErrorNotFound, "Computer %q not found", computerID)
+	} else if err != nil {
+		return ComputerTakeoverAccess{}, internalError(err, "read Computer take-over endpoint")
+	}
+	var administrator bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
+		identity.FabricID, identity.UserID).Scan(&administrator); err != nil {
+		return ComputerTakeoverAccess{}, internalError(err, "read Computer administrator access")
+	}
+	if administrator {
+		access.AuthorizedRole = ComputerGrantControl
+	} else {
+		if err := tx.QueryRowContext(ctx, `SELECT permission FROM computer_grants
+			WHERE computer_id=? AND fabric_id=? AND user_id=?`, computerID, identity.FabricID, identity.UserID).
+			Scan(&access.AuthorizedRole); errors.Is(err, sql.ErrNoRows) {
+			return ComputerTakeoverAccess{}, protocolError(contract.ErrorForbidden, "person %q has no Computer access", identity.UserID)
+		} else if err != nil {
+			return ComputerTakeoverAccess{}, internalError(err, "read Computer person access")
+		}
+		if access.AuthorizedRole != ComputerGrantView && access.AuthorizedRole != ComputerGrantControl {
+			return ComputerTakeoverAccess{}, protocolError(contract.ErrorForbidden, "person %q has no Computer access", identity.UserID)
+		}
+	}
+	if endpoint.Valid {
+		access.DisplayEndpoint = &endpoint.String
+	}
+	if err := tx.Commit(); err != nil {
+		return ComputerTakeoverAccess{}, internalError(err, "commit Computer take-over access read")
+	}
+	return access, nil
 }
 
 func listComputerGrants(ctx context.Context, q queryer, computerID string) ([]ComputerGrant, error) {

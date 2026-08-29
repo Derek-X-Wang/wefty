@@ -23,9 +23,9 @@ import (
 const (
 	computerWebSocketPath                  = contract.ComputerDisplayWebSocketPath
 	computerWebSocketSubprotocol           = contract.ComputerDisplayWebSocketSubprotocol
-	computerControlTakePath                = "/wefty/control/take"
-	computerControlReleasePath             = "/wefty/control/release"
-	computerControlTokenHeader             = "X-Wefty-Control-Token"
+	computerControlTakePath                = contract.ComputerControlTakePath
+	computerControlReleasePath             = contract.ComputerControlReleasePath
+	computerControlTokenHeader             = contract.ComputerControlTokenHeader
 	computerRFBVersionBannerBytes          = contract.ComputerRFBVersionBannerBytes
 	DefaultComputerSessionCap              = time.Hour
 	DefaultComputerIdentityRevalidation    = time.Minute

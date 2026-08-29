@@ -44,6 +44,9 @@ const (
 	ComputerDisplayEndpointControl            = "control"
 	ComputerDisplayWebSocketPath              = "/websockify"
 	ComputerDisplayWebSocketSubprotocol       = "binary"
+	ComputerControlTakePath                   = "/wefty/control/take"
+	ComputerControlReleasePath                = "/wefty/control/release"
+	ComputerControlTokenHeader                = "X-Wefty-Control-Token"
 	ComputerRFBVersionBannerBytes             = 12
 	ComputerStartupReadinessTimeout           = 60 * time.Second
 	ComputerDevShmBytes                 int64 = 1 << 30

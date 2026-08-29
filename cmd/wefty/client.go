@@ -11,9 +11,11 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
@@ -22,6 +24,8 @@ type apiClients struct {
 	l1     *apiClient
 	l3     *apiClient
 	images imageDigestResolver
+	fabric fabric.Fabric
+	wait   func(context.Context, time.Duration) error
 }
 
 type apiClient struct {
@@ -50,7 +54,20 @@ func newAPIClients(participant fabric.Fabric, l1Address, l3Address string) (*api
 		l1:     newAPIClient("L1", participant, l1Address),
 		l3:     newAPIClient("L3", participant, l3Address),
 		images: newRegistryResolver(nil),
+		fabric: participant,
+		wait:   waitForContext,
 	}, nil
+}
+
+func waitForContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-timer.C:
+		return nil
+	}
 }
 
 func newAPIClient(name string, participant fabric.Fabric, address string) *apiClient {
@@ -76,6 +93,100 @@ func (c *apiClients) bootstrapAdmin(ctx context.Context, nonce string) (l1.Admin
 	err := c.l1.do(ctx, http.MethodPost, "/v1/admin-bootstrap", l1.BootstrapAdminRequest{Nonce: nonce},
 		nil, &policy, http.StatusCreated)
 	return policy, err
+}
+
+func (c *apiClients) getAdminPolicy(ctx context.Context) (l1.AdminPolicy, error) {
+	var policy l1.AdminPolicy
+	err := c.l1.do(ctx, http.MethodGet, "/v1/admin-policy", nil, nil, &policy, http.StatusOK)
+	return policy, err
+}
+
+func (c *apiClients) mutateAdmin(ctx context.Context, userID string, revision int64, remove bool) (l1.AdminPolicy, error) {
+	method := http.MethodPut
+	if remove {
+		method = http.MethodDelete
+	}
+	var policy l1.AdminPolicy
+	path := "/v1/admin-policy/admins/" + url.PathEscape(userID)
+	err := c.l1.do(ctx, method, path, l1.AdminPolicyMutationRequest{PolicyRevision: revision}, nil, &policy, http.StatusOK)
+	return policy, err
+}
+
+func (c *apiClients) listComputerGrants(ctx context.Context, computerID string) (l1.ComputerGrantList, error) {
+	var grants l1.ComputerGrantList
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/grants"
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &grants, http.StatusOK)
+	return grants, err
+}
+
+func (c *apiClients) mutateComputerGrant(
+	ctx context.Context,
+	computerID, userID string,
+	request l1.ComputerGrantMutationRequest,
+) (l1.ComputerGrantMutationResult, error) {
+	var result l1.ComputerGrantMutationResult
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/grants/" + url.PathEscape(userID)
+	err := c.l1.do(ctx, http.MethodPut, path, request, nil, &result, http.StatusOK)
+	return result, err
+}
+
+func (c *apiClients) getComputerPolicyRevocation(
+	ctx context.Context,
+	computerID, fabricID, userID string,
+	policyRevision int64,
+) (l1.ComputerPolicyRevocation, error) {
+	query := url.Values{"fabric_id": []string{fabricID}, "user_id": []string{userID}}
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/revocations/" +
+		strconv.FormatInt(policyRevision, 10) + "?" + query.Encode()
+	var revocation l1.ComputerPolicyRevocation
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &revocation, http.StatusOK)
+	return revocation, err
+}
+
+func (c *apiClients) getComputer(ctx context.Context, computerID string) (l1.Computer, error) {
+	var computer l1.Computer
+	path := "/v1/computers/" + url.PathEscape(computerID)
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &computer, http.StatusOK)
+	return computer, err
+}
+
+func (c *apiClients) listComputerTakeoverSessions(ctx context.Context, computerID string) (l1.ComputerTakeoverSessionList, error) {
+	var sessions l1.ComputerTakeoverSessionList
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/takeover/sessions"
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &sessions, http.StatusOK)
+	return sessions, err
+}
+
+func (c *apiClients) getComputerTakeoverAccess(ctx context.Context, computerID string) (l1.ComputerTakeoverAccess, error) {
+	var access l1.ComputerTakeoverAccess
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/takeover"
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &access, http.StatusOK)
+	return access, err
+}
+
+type takeoverActionError = takeover.ActionError
+
+func (c *apiClients) performComputerTakeoverAction(ctx context.Context, endpoint, token, action string) error {
+	return takeover.Perform(ctx, c.fabric, endpoint, token, action)
+}
+
+func (c *apiClients) listComputerTakeoverAudit(
+	ctx context.Context,
+	computerID, cursor string,
+	limit int,
+	tail bool,
+) (l1.ComputerTakeoverAuditList, error) {
+	query := url.Values{"limit": []string{strconv.Itoa(limit)}}
+	if cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	if tail {
+		query.Set("tail", "true")
+	}
+	var page l1.ComputerTakeoverAuditList
+	path := "/v1/computers/" + url.PathEscape(computerID) + "/takeover/audit?" + query.Encode()
+	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &page, http.StatusOK)
+	return page, err
 }
 
 func (c *apiClients) setNodeClaims(ctx context.Context, nodeID string, request l1.NodeIntentRequest) (l1.Node, error) {

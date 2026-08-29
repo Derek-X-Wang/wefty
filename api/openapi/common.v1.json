@@ -372,6 +372,65 @@
           "replayed": { "type": "boolean" }
         }
       },
+      "ComputerTakeoverAuditList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["events"],
+        "properties": {
+          "events": { "type": "array", "items": { "$ref": "#/components/schemas/ComputerTakeoverAuditEvent" } },
+          "next_cursor": { "type": "string" }
+        },
+        "description": "Chronological immutable take-over evidence with no credentials, endpoints, display data, input data, or fencing material."
+      },
+      "ComputerTakeoverSession": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["computer_id", "job_id", "attempt_id", "session_id", "fabric_id", "user_id", "device_id", "authorized_role", "admitted_mode", "policy_revision", "opened_at", "evidence_state"],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 },
+          "job_id": { "type": "string", "minLength": 1 },
+          "attempt_id": { "type": "string", "minLength": 1 },
+          "session_id": { "type": "string", "minLength": 1 },
+          "fabric_id": { "type": "string", "minLength": 1 },
+          "user_id": { "type": "string", "minLength": 1 },
+          "device_id": { "type": "string", "minLength": 1 },
+          "authorized_role": { "enum": ["view", "control"] },
+          "admitted_mode": { "enum": ["view", "controller"] },
+          "policy_revision": { "type": "integer", "minimum": 1 },
+          "opened_at": { "type": "string", "format": "date-time" },
+          "evidence_state": { "const": "open_without_close" }
+        },
+        "description": "Session evidence derived from immutable open/close and Controller-tenure audit rows. open_without_close may briefly lag a live close because close audit finalization follows the socket boundary."
+      },
+      "ComputerTakeoverSessionList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sessions"],
+        "properties": {
+          "sessions": { "type": "array", "items": { "$ref": "#/components/schemas/ComputerTakeoverSession" } },
+          "controller_session_id": { "type": "string", "minLength": 1 }
+        }
+      },
+      "ComputerTakeoverAccess": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["computer_id", "user_id", "device_id", "authorized_role", "policy_revision", "display_endpoint"],
+        "properties": {
+          "computer_id": { "type": "string", "minLength": 1 },
+          "user_id": { "type": "string", "minLength": 1 },
+          "device_id": { "type": "string", "minLength": 1 },
+          "display_name": { "type": "string" },
+          "authorized_role": { "enum": ["view", "control"] },
+          "policy_revision": { "type": "integer", "minimum": 1 },
+          "display_endpoint": {
+            "oneOf": [
+              { "type": "null" },
+              { "type": "string", "pattern": "^ws://[^/]+/websockify$" }
+            ]
+          }
+        },
+        "description": "Person-bound view-first discovery. The endpoint is the authorized Fabric front door, never a raw view/control backend; null means admission is not ready."
+      },
       "ComputerIntent": {
         "type": "object",
         "additionalProperties": false,

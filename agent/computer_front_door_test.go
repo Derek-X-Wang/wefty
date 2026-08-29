@@ -14,6 +14,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/coder/websocket"
@@ -86,13 +87,29 @@ func TestComputerFrontDoorViewerCannotTakeControl(t *testing.T) {
 	if _, _, err := connection.Read(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusForbidden {
-		t.Fatalf("viewer take status = %d", status)
+	err := takeover.Perform(t.Context(), directTakeoverFabric{},
+		"ws"+server.URL[len("http"):]+computerWebSocketPath, token, "take")
+	var actionErr *takeover.ActionError
+	if !errors.As(err, &actionErr) || actionErr.APIError.Code != contract.ErrorControlNotAuthorized {
+		t.Fatalf("CLI viewer take error = %#v", err)
 	}
 	if controlDials.Load() != 0 {
 		t.Fatalf("viewer take refusal dialed control %d times", controlDials.Load())
 	}
 }
+
+type directTakeoverFabric struct{}
+
+func (directTakeoverFabric) Listen(string, string) (net.Listener, error) {
+	return nil, errors.New("unused")
+}
+func (directTakeoverFabric) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, address)
+}
+func (directTakeoverFabric) WhoIs(context.Context, string) (fabric.Identity, error) {
+	return fabric.Identity{}, errors.New("unused")
+}
+func (directTakeoverFabric) ConnectHost() string { return "" }
 
 func TestComputerFrontDoorRejectsAdversarialAdmissionBeforeBackendDial(t *testing.T) {
 	tests := []struct {

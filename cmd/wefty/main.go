@@ -22,7 +22,52 @@ func main() {
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		writeCommandError(os.Stderr, err, hasJSONFlag(os.Args[1:]))
-		os.Exit(1)
+		os.Exit(commandExitCode(err))
+	}
+}
+
+const (
+	exitFailure      = 1
+	exitUsage        = 2
+	exitUnauthorized = 3
+	exitNotFound     = 4
+	exitConflict     = 5
+)
+
+func commandExitCode(err error) int {
+	var usage usageError
+	if errors.As(err, &usage) {
+		return exitUsage
+	}
+	var apiError contract.APIError
+	var localErr *ocicontrol.ResponseError
+	var responseErr *apiResponseError
+	var takeoverErr *takeoverActionError
+	switch {
+	case errors.As(err, &localErr):
+		apiError = localErr.APIError
+	case errors.As(err, &responseErr):
+		apiError = responseErr.APIError
+	case errors.As(err, &takeoverErr):
+		apiError = takeoverErr.APIError
+	default:
+		return exitFailure
+	}
+	switch apiError.Code {
+	case contract.ErrorInvalidRequest:
+		return exitUsage
+	case contract.ErrorUnauthorized, contract.ErrorForbidden, contract.ErrorPrincipalForbidden,
+		contract.ErrorPersonIdentityRequired, contract.ErrorAdminRequired, contract.ErrorControlNotAuthorized:
+		return exitUnauthorized
+	case contract.ErrorNotFound, contract.ErrorAttemptNotFound, contract.ErrorTakeoverSessionEnded:
+		return exitNotFound
+	case contract.ErrorConflict, contract.ErrorStalePolicyRevision, contract.ErrorStaleIntentRevision,
+		contract.ErrorIdempotencyConflict, contract.ErrorDispatchKeyConflict, contract.ErrorFinalAdmin,
+		contract.ErrorCapacityExhausted, contract.ErrorComputerResourceRequired, contract.ErrorComputerTraitRequired,
+		contract.ErrorControllerBusy, contract.ErrorControllerAlreadyHeld:
+		return exitConflict
+	default:
+		return exitFailure
 	}
 }
 
@@ -35,6 +80,11 @@ func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
 	var responseErr *apiResponseError
 	if jsonOutput && errors.As(err, &responseErr) {
 		_ = writeJSON(writer, contract.ErrorResponse{Error: responseErr.APIError})
+		return
+	}
+	var takeoverErr *takeoverActionError
+	if jsonOutput && errors.As(err, &takeoverErr) {
+		_ = writeJSON(writer, contract.ErrorResponse{Error: takeoverErr.APIError})
 		return
 	}
 	_, _ = fmt.Fprintf(writer, "wefty: %v\n", err)
@@ -108,8 +158,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 }
 
 func usesPersonProtocol(args []string) bool {
-	return len(args) > 0 && (args[0] == "admin" ||
-		(args[0] == "computers" && len(args) > 1 && args[1] == "submission"))
+	return requiresPersonCommand(args) ||
+		(len(args) > 1 && args[0] == "computers" && args[1] == "submission")
+}
+
+func requiresPersonCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	if args[0] == "admin" || args[0] == "admins" {
+		return true
+	}
+	return len(args) > 1 && args[0] == "services" &&
+		(args[1] == "grant" || args[1] == "grants" || args[1] == "revoke" || args[1] == "takeover")
 }
 
 func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []string, error) {
@@ -168,6 +229,9 @@ const rootUsage = `Usage: wefty [global flags] <command>
 
 Commands:
   admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
+  admin policy get           Read the current administrator policy revision and members
+  admin policy add|remove    Mutate administrator membership with an observed revision
+  admins list|add|remove     Alias for the administrator policy commands
   node setup-oci             Configure the installed node's OCI runtime
   node doctor                Read versioned node-local OCI diagnostics
   node oci start|stop        Set durable node-local OCI intent
@@ -181,6 +245,12 @@ Commands:
     enable|disable|set-inflight
                              Requires observed policy and submission revisions, or --expect-current
   runs list                  List Runs by immutable Computer origin
+    grants|grant|revoke      List or mutate Computer person grants
+    takeover view COMPUTER  Discover the person-authorized view-only front door
+    takeover take|release COMPUTER --session-token-file FILE
+                            Act on the same live view session without printing its capability
+    takeover sessions list COMPUTER
+    takeover audit tail COMPUTER
   submit                     Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID               Create a new run from a stored snapshot
   logs RUN_ID [--follow]     Read or follow run logs

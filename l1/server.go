@@ -298,6 +298,9 @@ func (s *Server) routes() http.Handler {
 	person.HandleFunc("GET /v1/computers/{computer_id}/grants/audit", s.listComputerPolicyAudit)
 	person.HandleFunc("GET /v1/computers/{computer_id}/revocations/{policy_revision}", s.getComputerPolicyRevocation)
 	person.HandleFunc("GET /v1/computers/{computer_id}/submission", s.getComputerSubmission)
+	person.HandleFunc("GET /v1/computers/{computer_id}/takeover/sessions", s.listComputerTakeoverSessions)
+	person.HandleFunc("GET /v1/computers/{computer_id}/takeover/audit", s.listComputerTakeoverAudit)
+	person.HandleFunc("GET /v1/computers/{computer_id}/takeover", s.getComputerTakeoverAccess)
 	person.HandleFunc("PUT /v1/computers/{computer_id}/submission", s.mutateComputerSubmission)
 
 	root := http.NewServeMux()
@@ -309,6 +312,8 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/computers/{computer_id}/grants", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/grants/", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/revocations/", s.authorize(personPrincipal, person))
+	root.Handle("/v1/computers/{computer_id}/takeover/", s.authorize(personPrincipal, person))
+	root.Handle("/v1/computers/{computer_id}/takeover", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/submission", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes", s.authorize(clientPrincipal, client))
@@ -706,6 +711,47 @@ func (s *Server) getComputerPolicyRevocation(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, revocation)
+}
+
+func (s *Server) listComputerTakeoverSessions(w http.ResponseWriter, r *http.Request) {
+	sessions, err := s.store.ListComputerTakeoverSessions(r.Context(), identityFromRequest(r), r.PathValue("computer_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sessions)
+}
+
+func (s *Server) getComputerTakeoverAccess(w http.ResponseWriter, r *http.Request) {
+	access, err := s.store.GetComputerTakeoverAccess(r.Context(), identityFromRequest(r), r.PathValue("computer_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, access)
+}
+
+func (s *Server) listComputerTakeoverAudit(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	tail := false
+	if value := r.URL.Query().Get("tail"); value != "" {
+		tail, err = strconv.ParseBool(value)
+		if err != nil {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "tail must be true or false"))
+			return
+		}
+	}
+	page, err := s.store.ListComputerTakeoverAudit(r.Context(), identityFromRequest(r),
+		r.PathValue("computer_id"), r.URL.Query().Get("cursor"), limit, tail)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {

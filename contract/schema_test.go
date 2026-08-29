@@ -424,6 +424,8 @@ func TestComputerImageContractVocabularyIsExact(t *testing.T) {
 
 	if ComputerDisplayEndpointView != "view" || ComputerDisplayEndpointControl != "control" ||
 		ComputerDisplayWebSocketPath != "/websockify" || ComputerDisplayWebSocketSubprotocol != "binary" ||
+		ComputerControlTakePath != "/wefty/control/take" || ComputerControlReleasePath != "/wefty/control/release" ||
+		ComputerControlTokenHeader != "X-Wefty-Control-Token" ||
 		ComputerRFBVersionBannerBytes != 12 || ComputerStartupReadinessTimeout != 60*time.Second ||
 		ComputerDevShmBytes != 1<<30 {
 		t.Fatal("Computer image contract vocabulary drifted")

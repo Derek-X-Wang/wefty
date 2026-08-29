@@ -27,7 +27,7 @@ const (
 
 func executeServices(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError("usage: wefty services create|list|status|start|stop|restart|logs|remove|forget")
+		return usageError("usage: wefty services create|list|status|start|stop|restart|logs|remove|forget|grants|grant|revoke|takeover")
 	}
 	switch args[0] {
 	case "create":
@@ -48,6 +48,14 @@ func executeServices(ctx context.Context, clients *apiClients, jsonOutput bool, 
 		return executeServiceRemove(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "forget":
 		return executeServiceForget(ctx, clients, jsonOutput, args[1:], stdout, stderr)
+	case "grants":
+		return executeComputerGrants(ctx, clients, jsonOutput, args[1:], stdout)
+	case "grant":
+		return executeComputerGrant(ctx, clients, jsonOutput, args[1:], stdout, stderr, false)
+	case "revoke":
+		return executeComputerGrant(ctx, clients, jsonOutput, args[1:], stdout, stderr, true)
+	case "takeover":
+		return executeComputerTakeover(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	default:
 		return usageError(fmt.Sprintf("unknown services command %q", args[0]))
 	}
