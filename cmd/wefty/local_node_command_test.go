@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,13 @@ import (
 )
 
 const localNodeCLIChildEnvironment = "WEFTY_LOCAL_NODE_CLI_CHILD"
+
+type cliNonRPCFailure struct{ err error }
+
+func (failure *cliNonRPCFailure) Error() string { return failure.err.Error() }
+func (*cliNonRPCFailure) ControlFailureReason() string {
+	return string(ocihelper.CodeDiagnosticFailure)
+}
 
 func TestNodeLoadImageCLIReportsHelperMechanics(t *testing.T) {
 	if os.Getenv(localNodeCLIChildEnvironment) == "1" {
@@ -57,10 +65,14 @@ func TestNodeLoadImageCLIReportsHelperMechanics(t *testing.T) {
 	}
 
 	socket := filepath.Join(root, "control.sock")
+	var plainFailure atomic.Bool
 	service := ocicontrol.ServiceFuncs{LoadImageFunc: func(_ context.Context, archive io.Reader) (ocicontrol.LoadImageResponse, error) {
 		header, err := tar.NewReader(archive).Next()
 		if err != nil || header.Name != "./" || !header.FileInfo().IsDir() {
 			return ocicontrol.LoadImageResponse{}, errors.New("CLI did not stream the GNU-shaped archive")
+		}
+		if plainFailure.Load() {
+			return ocicontrol.LoadImageResponse{}, &cliNonRPCFailure{err: errors.New("private archive path /operator/secret/image.tar failed")}
 		}
 		return ocicontrol.LoadImageResponse{}, &ocihelper.RPCError{
 			Code:    ocihelper.CodeImageUnavailable,
@@ -125,6 +137,31 @@ func TestNodeLoadImageCLIReportsHelperMechanics(t *testing.T) {
 	if !ok || mechanics["kind"] != string(ocihelper.ImageFailureManifestRejected) || mechanics["reason"] != `OCI archive path "." is unsafe` {
 		t.Fatalf("CLI image mechanics=%#v", response.Error.Details["image_failure"])
 	}
+
+	plainFailure.Store(true)
+	output, err = commandOutput(t, configPath, archivePath)
+	exitErr, ok = err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("plain wefty node load-image exit=%v output=%s", err, output)
+	}
+	response = contract.ErrorResponse{}
+	if err := json.Unmarshal(output, &response); err != nil {
+		t.Fatalf("decode plain CLI error: %v output=%s", err, output)
+	}
+	if response.Error.Details["reason"] != string(ocihelper.CodeDiagnosticFailure) || strings.Contains(string(output), "/operator/secret") {
+		t.Fatalf("plain CLI error was not sanitized: %+v", response.Error)
+	}
+}
+
+func commandOutput(t *testing.T, configPath, archivePath string) ([]byte, error) {
+	t.Helper()
+	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestNodeLoadImageCLIReportsHelperMechanics$")
+	command.Env = append(os.Environ(),
+		localNodeCLIChildEnvironment+"=1",
+		"WEFTY_LOCAL_NODE_CLI_CONFIG="+configPath,
+		"WEFTY_LOCAL_NODE_CLI_ARCHIVE="+archivePath,
+	)
+	return command.CombinedOutput()
 }
 
 func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {

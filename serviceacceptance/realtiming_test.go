@@ -519,8 +519,7 @@ func waitForRestartPending(t *testing.T, harness *acceptanceHarness, jobID strin
 		if status != http.StatusOK {
 			t.Fatalf("read restart-pending service = %d body=%s", status, body)
 		}
-		if job.State == contract.JobQueued && job.Status == "restart-pending" && job.NextRestartAt != nil &&
-			job.Ready != nil && !*job.Ready {
+		if restartPendingObserved(job) {
 			return job
 		}
 		if job.State == contract.JobFailed {

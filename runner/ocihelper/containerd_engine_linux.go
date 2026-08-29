@@ -58,6 +58,7 @@ type containerdAttempt struct {
 	computerDisk     *computerDiskAttachment
 	container        containerd.Container
 	task             containerd.Task
+	releaseTask      func(context.Context) error
 	terminalReady    chan struct{}
 	terminalCode     uint32
 	terminalErr      error
@@ -160,6 +161,9 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	}
 	if config.LogSealTimeout <= 0 {
 		config.LogSealTimeout = 5 * time.Second
+	}
+	if config.TaskReleaseTimeout <= 0 {
+		config.TaskReleaseTimeout = defaultTaskReleaseTimeout
 	}
 	if config.HandoffRetention <= 0 {
 		config.HandoffRetention = defaultHandoffRetention
@@ -1054,12 +1058,18 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		attemptCancel()
 		return RunResponse{}, fmt.Errorf("register task Wait before Start: %w", err)
 	}
-	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, computerDisk: computerDisk, container: container, task: task, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID}
+	attempt := &containerdAttempt{authority: request.Authority, resources: request.Resources, computerDisk: computerDisk, container: container, task: task, releaseTask: func(ctx context.Context) error {
+		_, deleteErr := task.Delete(engineContext(ctx))
+		if errdefs.IsNotFound(deleteErr) {
+			return nil
+		}
+		return deleteErr
+	}, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID}
 	engine.watchOOM(attempt)
 	engine.mu.Lock()
 	engine.attempts[request.Authority.key()] = attempt
 	engine.mu.Unlock()
-	go attempt.cacheTerminal(wait)
+	go attempt.cacheTerminal(wait, engine.config.CgroupRoot, engine.config.TaskReleaseTimeout)
 	if err := document.RevalidateMounts(); err != nil {
 		return RunResponse{}, &RuntimeSpecRejectionError{err: err}
 	}
@@ -1369,7 +1379,7 @@ func (engine *ContainerdEngine) Watch(ctx context.Context, request WatchRequest,
 	return emit(WatchEvent{Kind: WatchComplete, Result: result})
 }
 
-func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatus) {
+func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatus, cgroupRoot string, releaseTimeout time.Duration) {
 	exit, ok := <-wait
 	attempt.mu.Lock()
 	if !ok {
@@ -1377,8 +1387,13 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 	} else {
 		attempt.terminalCode, _, attempt.terminalErr = exit.Result()
 	}
+	if cgroupReportedOOM(cgroupRoot, attempt.resources.CgroupID) {
+		attempt.oom = true
+	}
 	attempt.mu.Unlock()
-	close(attempt.terminalReady)
+	if err := publishTerminalAfterTaskRelease(releaseTimeout, attempt.releaseTask, attempt.terminalReady); err != nil {
+		log.Printf("release exited OCI task %s before log sealing: %v", attempt.authority.AttemptID, err)
+	}
 }
 
 func (engine *ContainerdEngine) ReapAttemptAsGuardian(ctx context.Context, authority AttemptAuthority) error {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"maps"
 	"net"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -84,6 +85,9 @@ type serverAttempt struct {
 	runCancel        context.CancelFunc
 	closeWatch       sync.Once
 	closeReaped      sync.Once
+	guardianReaping  bool
+	guardianReaped   bool
+	guardianDelete   bool
 }
 
 func (attempt *serverAttempt) stopWatcher() {
@@ -762,6 +766,7 @@ func (session *serverSession) reapAttempt(attempt *serverAttempt, createGateHeld
 		return nil
 	case attemptStarting, attemptLive:
 		attempt.state = attemptReaping
+		attempt.guardianReaping = guardian
 		session.internalReaps.Add(1)
 		if attempt.runCancel != nil {
 			attempt.runCancel()
@@ -785,7 +790,19 @@ func (session *serverSession) reapAttempt(attempt *serverAttempt, createGateHeld
 		err = session.server.engine.ReapAttempt(ctx, attempt.authority)
 	}
 	cancel()
+	outcome := "verified_absent"
+	if err != nil {
+		outcome = "failed"
+	}
+	if guardian {
+		payload, _ := json.Marshal(map[string]string{
+			"event": "guardian_deadman_reap", "attempt_id": attempt.authority.AttemptID,
+			"fencing_token": attempt.authority.FencingToken, "outcome": outcome,
+		})
+		_, _ = fmt.Fprintln(os.Stderr, string(payload))
+	}
 	session.mu.Lock()
+	attempt.guardianReaped = guardian && err == nil
 	attempt.state = attemptTombstoned
 	attempt.closeReaped.Do(func() { close(attempt.reaped) })
 	session.mu.Unlock()
@@ -810,6 +827,59 @@ func (session *serverSession) authorizeAttempt(authority AttemptAuthority) (*ser
 		return nil, &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt authority does not match a live attempt"}
 	}
 	return attempt, nil
+}
+
+// authorizeDelete accepts a completed guardian reap as exact positive absence
+// evidence. Ordinary repeated Delete remains a non-live authority refusal: the
+// exception exists only for the race where the helper's own deadman completed
+// the same fenced attempt before the agent could request final deletion.
+func (session *serverSession) authorizeDelete(ctx context.Context, authority AttemptAuthority) (*serverAttempt, bool, *RPCError) {
+	if err := authority.validate(); err != nil {
+		return nil, false, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
+	}
+	for {
+		session.mu.Lock()
+		if session.closed || authority.NodeID != session.identity.NodeID || authority.BootSessionID != session.identity.BootSessionID {
+			session.mu.Unlock()
+			return nil, false, &RPCError{Code: CodeAttemptOutsideSession, Message: "attempt is outside this helper session"}
+		}
+		attempt := session.attempts[authority.key()]
+		if attempt == nil {
+			session.mu.Unlock()
+			return nil, false, &RPCError{Code: CodeAttemptOutsideSession, Message: "attempt is outside this helper session"}
+		}
+		if attempt.authority != authority {
+			session.mu.Unlock()
+			return nil, false, &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt authority does not match a live attempt"}
+		}
+		if attempt.state == attemptReaping && attempt.guardianReaping {
+			reaped := attempt.reaped
+			session.mu.Unlock()
+			select {
+			case <-reaped:
+				continue
+			case <-ctx.Done():
+				return nil, false, &RPCError{Code: CodeEngineFailure, Message: "guardian attempt reap was not confirmed"}
+			}
+		}
+		if attempt.state == attemptTombstoned && attempt.guardianReaped && !attempt.guardianDelete {
+			attempt.guardianDelete = true
+			session.mu.Unlock()
+			return attempt, true, nil
+		}
+		if attempt.state != attemptLive {
+			session.mu.Unlock()
+			return nil, false, &RPCError{Code: CodeUnauthorizedAttempt, Message: "attempt authority does not match a live attempt"}
+		}
+		session.mu.Unlock()
+		return attempt, false, nil
+	}
+}
+
+func (session *serverSession) consumeGuardianDelete(attempt *serverAttempt) {
+	session.mu.Lock()
+	attempt.guardianReaped = false
+	session.mu.Unlock()
 }
 
 func (session *serverSession) sweepRequired(method Method) bool {
@@ -1113,14 +1183,16 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if !decodeRequest(wire, request.Body, &body) {
 			return
 		}
-		attempt, rpcErr := session.authorizeAttempt(body.Authority)
+		attempt, alreadyReaped, rpcErr := session.authorizeDelete(operation.ctx, body.Authority)
 		if rpcErr != nil {
 			_ = writeRPCError(wire, rpcErr)
 			return
 		}
 		operation.monitorEOF()
 		response, err := server.engine.Delete(operation.ctx, body)
-		if err == nil && response.Deleted {
+		if alreadyReaped {
+			session.consumeGuardianDelete(attempt)
+		} else if err == nil && response.Deleted {
 			err = session.reapAttempt(attempt, false, false)
 		}
 		_ = writeEngineResponse(wire, response, err)

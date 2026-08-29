@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -863,7 +864,7 @@ func TestHeartbeatRefreshesOnlyExactLiveAttemptDeadman(t *testing.T) {
 }
 
 func TestAttemptDeadmanUsesGuardianReaper(t *testing.T) {
-	engine := &guardianRecordingEngine{fakeEngine: newFakeEngine()}
+	engine := newGuardianRecordingEngine()
 	clock := newManualClock(time.Unix(25_000, 0))
 	client, stop := startTestServer(t, engine, ServerConfig{Clock: clock, HeartbeatTimeout: time.Hour, MaximumAttemptDeadman: time.Minute})
 	defer stop()
@@ -878,6 +879,64 @@ func TestAttemptDeadmanUsesGuardianReaper(t *testing.T) {
 	}
 	clock.Advance(time.Second)
 	waitFor(t, time.Second, func() bool { return engine.guardianCount() == 1 }, "guardian deadman reap")
+	authority := testAuthority()
+	for _, test := range []struct {
+		name   string
+		mutate func(*AttemptAuthority)
+	}{
+		{name: "stale fence", mutate: func(value *AttemptAuthority) { value.FencingToken = "stale-fence" }},
+		{name: "foreign attempt", mutate: func(value *AttemptAuthority) { value.AttemptID = "foreign-attempt" }},
+		{name: "different removal generation", mutate: func(value *AttemptAuthority) { value.RemovalGeneration = "removal-2" }},
+		{name: "different boot session", mutate: func(value *AttemptAuthority) { value.BootSessionID = "boot-2" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			changed := authority
+			test.mutate(&changed)
+			if _, err := session.Delete(t.Context(), DeleteRequest{Authority: changed}); err == nil {
+				t.Fatal("guardian evidence authorized a different attempt authority")
+			}
+		})
+	}
+	deleted, err := session.Delete(t.Context(), DeleteRequest{Authority: authority})
+	if err != nil || !deleted.Deleted {
+		t.Fatalf("Delete after exact guardian reap = %+v err=%v", deleted, err)
+	}
+	methods := engine.methods()
+	if !slices.Contains(methods, "Delete") || !slices.Contains(methods, "Verify") {
+		t.Fatalf("accepted guardian Delete did not execute deletion and absence verification: %v", methods)
+	}
+	if pins, capacity, runtime := engine.releasedState(); !pins || !capacity || !runtime {
+		t.Fatalf("accepted guardian Delete retained state: pins_released=%t capacity_released=%t runtime_released=%t", pins, capacity, runtime)
+	}
+	if _, err := session.Delete(t.Context(), DeleteRequest{Authority: authority}); err == nil {
+		t.Fatal("consumed guardian evidence authorized a second exact Delete")
+	}
+}
+
+func TestFailedGuardianDeadmanReapDoesNotAuthorizeDelete(t *testing.T) {
+	engine := newGuardianRecordingEngine()
+	engine.guardianErr = errors.New("guardian absence verification failed")
+	clock := newManualClock(time.Unix(25_500, 0))
+	client, stop := startTestServer(t, engine, ServerConfig{Clock: clock, HeartbeatTimeout: time.Hour, MaximumAttemptDeadman: time.Minute})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	authority := testAuthority()
+	if _, err := session.Run(t.Context(), testRunRequest(authority, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	waitFor(t, time.Second, func() bool { return engine.guardianCount() == 1 }, "failed guardian deadman reap")
+	if _, err := session.Delete(t.Context(), DeleteRequest{Authority: authority}); err == nil {
+		t.Fatal("failed guardian reap authorized Delete")
+	}
+	if slices.Contains(engine.methods(), "Delete") {
+		t.Fatalf("failed guardian evidence reached engine Delete: %v", engine.methods())
+	}
 }
 
 func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
@@ -1908,21 +1967,56 @@ func TestDoctorFailureNeverInvalidatesSessionOrReapsAttempts(t *testing.T) {
 
 type guardianRecordingEngine struct {
 	*fakeEngine
-	guardianMu sync.Mutex
-	guardians  int
+	guardianMu       sync.Mutex
+	guardians        int
+	guardianErr      error
+	pinsReleased     bool
+	capacityReleased bool
+	runtimeReleased  bool
+}
+
+func newGuardianRecordingEngine() *guardianRecordingEngine {
+	return &guardianRecordingEngine{fakeEngine: newFakeEngine()}
 }
 
 func (engine *guardianRecordingEngine) ReapAttemptAsGuardian(ctx context.Context, authority AttemptAuthority) error {
 	engine.guardianMu.Lock()
 	engine.guardians++
+	err := engine.guardianErr
 	engine.guardianMu.Unlock()
+	if err != nil {
+		return err
+	}
 	return engine.fakeEngine.ReapAttempt(ctx, authority)
+}
+
+func (engine *guardianRecordingEngine) Delete(ctx context.Context, request DeleteRequest) (DeleteResponse, error) {
+	response, err := engine.fakeEngine.Delete(ctx, request)
+	if err != nil || !response.Deleted {
+		return response, err
+	}
+	verification, err := engine.fakeEngine.Verify(ctx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
+	if err != nil || !verification.Absent {
+		return DeleteResponse{}, errors.Join(err, errors.New("attempt resources remain after delete"))
+	}
+	engine.guardianMu.Lock()
+	engine.pinsReleased = true
+	engine.capacityReleased = true
+	engine.runtimeReleased = true
+	engine.guardianMu.Unlock()
+	return response, nil
 }
 
 func (engine *guardianRecordingEngine) guardianCount() int {
 	engine.guardianMu.Lock()
 	defer engine.guardianMu.Unlock()
 	return engine.guardians
+}
+
+func (engine *guardianRecordingEngine) releasedState() (pins, capacity, runtime bool) {
+	engine.guardianMu.Lock()
+	defer engine.guardianMu.Unlock()
+	return engine.pinsReleased, engine.capacityReleased, engine.runtimeReleased
 }
 
 func (engine *blockingWatchEngine) Watch(ctx context.Context, _ WatchRequest, _ func(WatchEvent) error) error {
