@@ -228,6 +228,19 @@ func (session *InputSession) SendKey() error {
 	return nil
 }
 
+// SendInput repeats a real key and pointer sequence on an established client.
+// A new wayvnc client may create its virtual Wayland input objects after the
+// first RFB messages arrive, so the isolation oracle exercises the active
+// client as well as its cold-start path.
+func (session *InputSession) SendInput(x, y int) error {
+	for _, event := range rfbInputEvents(true, x, y) {
+		if err := session.connection.writeFrame(2, event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func StartInput(ctx context.Context, port, x, y int) (*InputSession, error) {
 	return startRFBEvents(ctx, port, rfbInputEvents(true, x, y))
 }

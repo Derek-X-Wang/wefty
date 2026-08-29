@@ -698,15 +698,23 @@ func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targe
 		viewSession, err := StartInput(probeCtx, r.viewPort, x, y)
 		cancel()
 		if err == nil {
-			for poll := 0; poll < 12; poll++ {
-				observation, readErr := r.readInputObservation(ctx)
-				if readErr == nil && (observation.KeyEvents != before.KeyEvents || (observation.Generation > before.Generation && historyContains(observation, x, y))) {
-					viewSession.Close()
-					r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
-					return false
+			for dispatch := 0; dispatch < 3; dispatch++ {
+				for poll := 0; poll < 4; poll++ {
+					observation, readErr := r.readInputObservation(ctx)
+					if readErr == nil && (observation.KeyEvents != before.KeyEvents || (observation.Generation > before.Generation && historyContains(observation, x, y))) {
+						viewSession.Close()
+						r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
+						return false
+					}
+					if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
+						break
+					}
 				}
-				if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
-					break
+				if dispatch < 2 {
+					err = viewSession.SendInput(x, y)
+					if err != nil {
+						break
+					}
 				}
 			}
 		}
