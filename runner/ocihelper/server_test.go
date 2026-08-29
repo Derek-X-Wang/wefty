@@ -1519,8 +1519,12 @@ func TestSignalAlreadyTerminatedPreservesVerifiedSession(t *testing.T) {
 	if _, err := session.Run(t.Context(), testRunRequest(authority, time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.Signal(t.Context(), SignalRequest{Authority: authority, Signal: SignalKILL}); err != nil {
+	response, err := session.SignalResult(t.Context(), SignalRequest{Authority: authority, Signal: SignalKILL})
+	if err != nil {
 		t.Fatalf("KILL racing terminal transition = %v, want already-terminated success", err)
+	}
+	if !response.AlreadyTerminated {
+		t.Fatalf("KILL racing terminal transition response = %+v, want already-terminated fact", response)
 	}
 	if err := session.EnsureImage(t.Context(), EnsureImageRequest{
 		Reference: "registry.invalid/app", Platform: testImagePlatform,

@@ -304,6 +304,12 @@ grace, sends `KILL` if the task has not exited, and waits for the structured
 terminal result. A task that exits as the `KILL` races its terminal edge is
 already terminated, not helper loss: the helper does not record that undelivered
 `KILL`, and the retained `Watch` supplies the actual exit or signal evidence.
+The same normalization applies when a task self-exits before `TERM` reaches
+containerd. Because no signal was delivered in that race, the helper records no
+signal and `Watch` reports the task's ordinary `ExitCode` arm. If containerd has
+reaped the task but its Wait stream never supplies that terminal evidence, the
+agent treats the missing confirmation as typed runtime loss and performs the
+replacement-generation sweep.
 `Delete` must subsequently verify task, container, snapshot,
 lease, cgroup, shim, and log absence before L1 may observe `stopped`.
 

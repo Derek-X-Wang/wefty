@@ -1111,13 +1111,15 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		signalErr := server.engine.Signal(operation.ctx, body)
+		response := SignalResponse{}
 		if errors.Is(signalErr, ErrTaskAlreadyTerminated) {
 			// The task crossed its terminal edge before this signal reached
 			// containerd. Watch remains the authority for how it terminated;
 			// this race is neither a failed mechanics operation nor runtime loss.
+			response.AlreadyTerminated = true
 			signalErr = nil
 		}
-		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, signalErr)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, signalErr)
 	case MethodSetComputerControl:
 		var body SetComputerControlStateRequest
 		if !decodeRequest(wire, request.Body, &body) {

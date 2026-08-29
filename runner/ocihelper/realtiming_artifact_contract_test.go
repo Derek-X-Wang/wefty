@@ -38,7 +38,7 @@ func validateNativeLinuxComputerArtifacts(artifacts nativeLinuxComputerArtifacts
 		if artifacts.SelectedReference != linuxXFCEComputerReference {
 			return fmt.Errorf("XFCE matrix row selected %q", artifacts.SelectedReference)
 		}
-		if artifacts.SelectedReference == artifacts.WaylandReference || artifacts.SelectedArchive == artifacts.WaylandArchive {
+		if artifacts.SelectedReference == artifacts.WaylandReference || artifacts.SelectedDigest == artifacts.WaylandDigest || artifacts.SelectedArchive == artifacts.WaylandArchive {
 			return fmt.Errorf("XFCE and Wayland Computer artifacts are not separate")
 		}
 	case "wayland":
@@ -77,23 +77,33 @@ func TestNativeLinuxComputerArtifactSeparationAcceptsBothMatrixVariants(t *testi
 }
 
 func TestNativeLinuxComputerArtifactSeparationRejectsAliasing(t *testing.T) {
-	base := nativeLinuxComputerArtifacts{
+	wayland := nativeLinuxComputerArtifacts{
 		Variant: "wayland", GenericReference: "ghcr.io/derek-x-wang/wefty-echo-service", GenericArchive: "/release/echo.oci.tar",
 		SelectedReference: linuxWaylandComputerReference, SelectedDigest: "sha256:wayland", SelectedArchive: "/release/wayland.oci.tar",
 		WaylandReference: linuxWaylandComputerReference, WaylandDigest: "sha256:wayland", WaylandArchive: "/release/wayland.oci.tar",
 	}
-	tests := map[string]func(*nativeLinuxComputerArtifacts){
-		"generic archive alias": func(artifacts *nativeLinuxComputerArtifacts) { artifacts.SelectedArchive = artifacts.GenericArchive },
-		"wrong selected name": func(artifacts *nativeLinuxComputerArtifacts) {
-			artifacts.SelectedReference = linuxXFCEComputerReference
-		},
-		"wayland alias mismatch": func(artifacts *nativeLinuxComputerArtifacts) { artifacts.SelectedDigest = "sha256:different" },
-		"unknown variant":        func(artifacts *nativeLinuxComputerArtifacts) { artifacts.Variant = "future" },
+	xfce := nativeLinuxComputerArtifacts{
+		Variant: "xfce", GenericReference: wayland.GenericReference, GenericArchive: wayland.GenericArchive,
+		SelectedReference: linuxXFCEComputerReference, SelectedDigest: "sha256:xfce", SelectedArchive: "/release/xfce.oci.tar",
+		WaylandReference: wayland.WaylandReference, WaylandDigest: wayland.WaylandDigest, WaylandArchive: wayland.WaylandArchive,
 	}
-	for name, mutate := range tests {
+	tests := map[string]struct {
+		base   nativeLinuxComputerArtifacts
+		mutate func(*nativeLinuxComputerArtifacts)
+	}{
+		"generic archive alias": {base: wayland, mutate: func(artifacts *nativeLinuxComputerArtifacts) { artifacts.SelectedArchive = artifacts.GenericArchive }},
+		"wrong selected name": {base: wayland, mutate: func(artifacts *nativeLinuxComputerArtifacts) {
+			artifacts.SelectedReference = linuxXFCEComputerReference
+		}},
+		"wayland alias mismatch": {base: wayland, mutate: func(artifacts *nativeLinuxComputerArtifacts) { artifacts.SelectedDigest = "sha256:different" }},
+		"xfce digest alias":      {base: xfce, mutate: func(artifacts *nativeLinuxComputerArtifacts) { artifacts.SelectedDigest = artifacts.WaylandDigest }},
+		"xfce archive alias":     {base: xfce, mutate: func(artifacts *nativeLinuxComputerArtifacts) { artifacts.SelectedArchive = artifacts.WaylandArchive }},
+		"unknown variant":        {base: wayland, mutate: func(artifacts *nativeLinuxComputerArtifacts) { artifacts.Variant = "future" }},
+	}
+	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			artifacts := base
-			mutate(&artifacts)
+			artifacts := test.base
+			test.mutate(&artifacts)
 			if err := validateNativeLinuxComputerArtifacts(artifacts); err == nil {
 				t.Fatal("invalid artifact relationship was accepted")
 			}
