@@ -41,6 +41,11 @@
       for (const type of ['pointermove', 'pointerdown', 'pointerup']) {
         window.addEventListener(type, recordPointer);
       }
+      window.addEventListener('keydown', () => fetch('/input', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({version: 1, kind: 'key'}),
+      }).catch(() => {}));
       setInterval(refresh, 100);
       refresh();
       document.body.focus();

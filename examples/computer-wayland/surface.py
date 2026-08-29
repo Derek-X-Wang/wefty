@@ -148,19 +148,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def focus_keyboard_oracle(self):
-        try:
-            subprocess.run(
-                ["swaymsg", '[app_id="wev"] focus'],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-            )
-            return True
-        except (OSError, subprocess.SubprocessError):
-            return False
-
     def do_GET(self):
         if self.path == "/":
             with open(HTML, "rb") as source:
@@ -215,7 +202,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with open(BROWSER_READY, "w", encoding="ascii") as marker:
                 marker.write("ready\n")
-        elif not self.focus_keyboard_oracle() or not wefty_record_input(value):
+        elif not wefty_record_input(value):
             self.send_error(400)
             return
         self.send_response(204)
