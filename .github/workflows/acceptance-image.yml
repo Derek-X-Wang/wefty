@@ -308,7 +308,8 @@ jobs:
             --conformance-receipt "$evidence/${ARCH}-runtime.json" --output "$evidence/${ARCH}-metrics.json"
           if [[ $VARIANT == wayland ]]; then
             scripts/test-computer-wayland-furniture.sh --image "$pinned_reference" --arch "$ARCH" \
-              --conformance-receipt "$evidence/${ARCH}-runtime.json" --output "$evidence/${ARCH}-furniture.json"
+              --conformance-receipt "$evidence/${ARCH}-runtime.json" --output "$evidence/${ARCH}-furniture.json" \
+              --metrics-output "$evidence/${ARCH}-metrics.json"
           fi
 
           "$crane" export --insecure --platform "$PLATFORM" "$pinned_reference" "$RUNNER_TEMP/computer-rootfs.tar"

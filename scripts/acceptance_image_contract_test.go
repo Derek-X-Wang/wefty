@@ -132,6 +132,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		if strings.Contains(text, "if [[ $VARIANT == xfce") || strings.Contains(text, `crane" push --insecure "$layout" "$registry_reference"`) {
 			t.Fatalf("%s reference Computer lane bypasses the second solve for one variant", name)
 		}
+		assertWaylandFurnitureInvocations(t, name, workflow)
 	}
 
 	called := gate.Jobs["acceptance-image"]
@@ -299,6 +300,49 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "RunComputerServiceRealtiming", "computer_reference_publication_loss_recovery=%t", "computer_reference_helper_stop_start_profile_sign_in_rootfs=%t")
 	assertFileContains(t, "../docs/runbooks/oci-node.md", "wefty node load-image", "acceptance-image-index-digest.txt")
 	assertFileContains(t, "../docs/acceptance/m3-lima-transport.md", "acceptance-image-index-digest.txt", "computer-image-index-digest.txt", "wefty-computer-reference.oci.tar", "atomically within 60 seconds")
+}
+
+func assertWaylandFurnitureInvocations(t *testing.T, workflowName string, workflow workflowContract) {
+	t.Helper()
+	const command = "scripts/test-computer-wayland-furniture.sh"
+	wantArguments := []string{
+		`--image "$pinned_reference"`,
+		`--arch "$ARCH"`,
+		`--conformance-receipt "$evidence/${ARCH}-runtime.json"`,
+		`--output "$evidence/${ARCH}-furniture.json"`,
+		`--metrics-output "$evidence/${ARCH}-metrics.json"`,
+	}
+
+	var invocations []string
+	for _, job := range workflow.Jobs {
+		for _, step := range job.Steps {
+			lines := strings.Split(step.Run, "\n")
+			for index := 0; index < len(lines); index++ {
+				line := strings.TrimSpace(lines[index])
+				if !strings.HasPrefix(line, command+" ") {
+					continue
+				}
+				invocation := strings.TrimSpace(strings.TrimSuffix(line, `\`))
+				for strings.HasSuffix(line, `\`) {
+					index++
+					if index == len(lines) {
+						t.Fatalf("%s has an unterminated %s invocation", workflowName, command)
+					}
+					line = strings.TrimSpace(lines[index])
+					invocation += " " + strings.TrimSpace(strings.TrimSuffix(line, `\`))
+				}
+				invocations = append(invocations, invocation)
+			}
+		}
+	}
+	if len(invocations) != 1 {
+		t.Fatalf("%s %s invocation count = %d, want 1", workflowName, command, len(invocations))
+	}
+	for _, required := range wantArguments {
+		if !strings.Contains(invocations[0], required) {
+			t.Fatalf("%s %s invocation is missing %q: %s", workflowName, command, required, invocations[0])
+		}
+	}
 }
 
 func assertRegistryFaultAction(t *testing.T, workflowName, workflowText, action, want string) {
