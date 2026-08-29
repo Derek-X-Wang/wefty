@@ -143,7 +143,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		t.Fatal("scheduled realtiming must remain manually dispatchable")
 	}
 	realtimeText := string(realtimingBytes)
-	for _, required := range []string{"workflow_run.head_sha", "workflow_run.id", "actions/download-artifact@", "run-id:", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE"} {
+	for _, required := range []string{"workflow_run.head_sha", "workflow_run.id", "actions/download-artifact@", "run-id:", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT"} {
 		if !strings.Contains(realtimeText, required) {
 			t.Fatalf("realtiming is missing immutable artifact contract %q", required)
 		}
@@ -162,13 +162,31 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		t.Fatal("workflow-run realtiming must check out the triggering main SHA directly")
 	}
 	scheduledText := string(scheduledBytes)
-	for _, required := range []string{"ref: main", "typed-skip: no successful acceptance-image publication exists", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE"} {
+	for _, required := range []string{"ref: main", "typed-skip: no successful acceptance-image publication exists", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT"} {
 		if !strings.Contains(scheduledText, required) {
 			t.Fatalf("scheduled realtiming is missing %q", required)
 		}
 	}
 	if strings.Contains(scheduledText, "ref: ${{ github.event.workflow_run.head_sha }}") {
 		t.Fatal("scheduled realtiming must not dynamically check out publication bytes")
+	}
+	for name, workflow := range map[string]workflowContract{"workflow-run": realtiming, "scheduled": scheduled} {
+		result, ok := workflow.Jobs["realtiming-result"]
+		if !ok {
+			t.Fatalf("%s realtiming has no fail-closed result job", name)
+		}
+		needs := stringSlice(t, result.Needs)
+		if !slices.Contains(needs, "resolve-published-artifact") || !slices.Contains(needs, "service-acceptance-realtiming") ||
+			!strings.Contains(result.If, "always()") {
+			t.Fatalf("%s realtiming result dependencies/guard = %#v if=%q", name, needs, result.If)
+		}
+		resultText := marshalJob(t, result)
+		for _, required := range []string{"ARTIFACT_AVAILABLE", "$ARTIFACT_AVAILABLE", "= true",
+			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success"} {
+			if !strings.Contains(resultText, required) {
+				t.Fatalf("%s realtiming result does not fail closed on %q", name, required)
+			}
+		}
 	}
 	for _, required := range []string{"$IMAGE_NAME@$index_digest", "--probe-reference \"$IMAGE_NAME\"", "bin/wefty", "wefty-acceptance-image-release.tar", "Public GHCR verification failed"} {
 		if !strings.Contains(string(imageBytes), required) {

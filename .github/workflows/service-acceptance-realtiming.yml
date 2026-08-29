@@ -323,6 +323,7 @@ jobs:
             printf 'WEFTY_OCI_COMPUTER_REFERENCE=%s\n' "$COMPUTER_REFERENCE"
             printf 'WEFTY_OCI_COMPUTER_DIGEST=%s\n' "$COMPUTER_DIGEST"
             printf 'WEFTY_OCI_COMPUTER_ARCHIVE=%s\n' "$COMPUTER_ARCHIVE"
+            printf 'WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT=%s\n' "$computer_release/amd64-runtime.json"
             printf 'WEFTY_OCI_CLI=%s\n' "$WEFTY_CLI"
             printf 'WEFTY_OCI_SERVICE_NUMERIC_REFERENCE=%s\n' "$NUMERIC_REFERENCE"
             printf 'WEFTY_OCI_SERVICE_NUMERIC_ARCHIVE=%s\n' /tmp/wefty-service-data-numeric.oci.tar
@@ -349,3 +350,24 @@ jobs:
           name: service-acceptance-realtiming-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}
           path: ${{ runner.temp }}/service-acceptance-realtiming
           if-no-files-found: error
+
+  realtiming-result:
+    name: realtiming-result
+    needs: [resolve-published-artifact, service-acceptance-realtiming]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail closed unless the published lane executed and passed
+        env:
+          RESOLVE_RESULT: ${{ needs.resolve-published-artifact.result }}
+          ARTIFACT_AVAILABLE: ${{ needs.resolve-published-artifact.outputs.available }}
+          REALTIMING_RESULT: ${{ needs.service-acceptance-realtiming.result }}
+        run: |
+          set -eu
+          printf '%s\n' \
+            "resolve-published-artifact=$RESOLVE_RESULT" \
+            "artifact-available=$ARTIFACT_AVAILABLE" \
+            "service-acceptance-realtiming=$REALTIMING_RESULT"
+          test "$RESOLVE_RESULT" = success
+          test "$ARTIFACT_AVAILABLE" = true
+          test "$REALTIMING_RESULT" = success
