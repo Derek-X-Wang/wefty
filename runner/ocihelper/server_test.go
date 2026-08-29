@@ -355,6 +355,33 @@ func TestAttemptOutsideSessionIsDistinctFromNonLiveAttempt(t *testing.T) {
 	assertRPCCode(t, err, CodeUnauthorizedAttempt)
 }
 
+func TestEngineFailureCarriesBoundedOperationMechanics(t *testing.T) {
+	engine := newFakeEngine()
+	engine.deleteErr = context.DeadlineExceeded
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	authority := testAuthority()
+	if _, err := session.Run(t.Context(), testRunRequest(authority, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = session.Delete(t.Context(), DeleteRequest{Authority: authority})
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeEngineFailure || rpcErr.EngineFailure == nil ||
+		rpcErr.EngineFailure.Operation != MethodDelete || rpcErr.EngineFailure.Reason != "deadline_exceeded" {
+		t.Fatalf("Delete engine mechanics = %#v err=%v", rpcErr, err)
+	}
+	if strings.Contains(err.Error(), context.DeadlineExceeded.Error()) ||
+		!strings.Contains(err.Error(), "operation=Delete reason=deadline_exceeded") {
+		t.Fatalf("Delete engine error exposed wrong mechanics: %v", err)
+	}
+}
+
 func TestRemovalAttestationRequiresExactNodeJobGenerationAndResourceInventory(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -582,7 +609,7 @@ func TestHelperStartupResidueFailsServeBeforeSessionAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = server.Serve(t.Context(), listener)
-	if err == nil || err.Error() != "startup verify OCI runtime namespace: residue remains after sweep" {
+	if err == nil || !strings.Contains(err.Error(), "startup verify OCI runtime namespace: residue remains after sweep:") {
 		t.Fatalf("helper startup error = %v", err)
 	}
 	if got := engine.methods(); !equalStrings(got, []string{"Sweep", "Verify"}) {
@@ -1861,6 +1888,7 @@ type fakeEngine struct {
 	runResponse              RunResponse
 	lastRunRequest           RunRequest
 	runErr                   error
+	deleteErr                error
 	runEntered               chan struct{}
 	releaseRun               chan struct{}
 	sweepEntered             chan struct{}
@@ -2320,7 +2348,10 @@ func (engine *fakeEngine) Watch(_ context.Context, _ WatchRequest, emit func(Wat
 }
 func (engine *fakeEngine) Delete(context.Context, DeleteRequest) (DeleteResponse, error) {
 	engine.record("Delete")
-	return DeleteResponse{Deleted: true}, nil
+	engine.mu.Lock()
+	err := engine.deleteErr
+	engine.mu.Unlock()
+	return DeleteResponse{Deleted: err == nil}, err
 }
 func (*fakeEngine) DeleteManagedVolume(context.Context, DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
 	return DeleteManagedVolumeResponse{Deleted: true}, nil

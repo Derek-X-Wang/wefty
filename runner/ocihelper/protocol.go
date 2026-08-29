@@ -94,13 +94,22 @@ const (
 	CodeSweepRequired        ErrorCode = "sweep_required"
 )
 
-// RPCError is safe to cross the private protocol. Engine detail remains local.
+// RPCError is safe to cross the private protocol. Raw engine detail remains local.
 type RPCError struct {
 	Code          ErrorCode          `json:"code"`
 	Message       string             `json:"message"`
 	ImageFailure  *ImageFailureFact  `json:"image_failure,omitempty"`
+	EngineFailure *EngineFailureFact `json:"engine_failure,omitempty"`
 	MemoryFailure *MemoryFailureFact `json:"memory_failure,omitempty"`
 	DiskFailure   *DiskFailureFact   `json:"disk_failure,omitempty"`
+}
+
+// EngineFailureFact is bounded mechanics evidence for a failed helper engine
+// operation. It deliberately carries no containerd type, host path, or raw
+// privileged error text.
+type EngineFailureFact struct {
+	Operation Method `json:"operation"`
+	Reason    string `json:"reason"`
 }
 
 type MemoryFailureFact struct {
@@ -158,6 +167,9 @@ const (
 func (err *RPCError) Error() string {
 	if err == nil {
 		return ""
+	}
+	if err.EngineFailure != nil {
+		return fmt.Sprintf("oci helper %s: %s (operation=%s reason=%s)", err.Code, err.Message, err.EngineFailure.Operation, err.EngineFailure.Reason)
 	}
 	return fmt.Sprintf("oci helper %s: %s", err.Code, err.Message)
 }

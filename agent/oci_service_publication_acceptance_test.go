@@ -757,6 +757,16 @@ printf '#!/bin/sh\nprintf "Content-Type: application/octet-stream\\r\\n\\r\\n"\n
 printf '#!/bin/sh\ntouch /tmp/wefty-listener-restart\nprintf "Status: 204 No Content\\r\\n\\r\\n"\n' >/tmp/wefty-www/cgi-bin/restart-listener
 chmod 0755 /tmp/wefty-www/cgi-bin/echo
 chmod 0755 /tmp/wefty-www/cgi-bin/restart-listener
+server=
+terminate() {
+  trap - TERM
+  if test -n "$server"; then
+    kill "$server" 2>/dev/null || true
+    wait "$server" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap terminate TERM
 while :; do
   /bin/httpd -f -p "127.0.0.1:$WEFTY_SERVICE_PORT" -h /tmp/wefty-www &
   server=$!

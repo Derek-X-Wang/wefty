@@ -149,7 +149,7 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 		return fmt.Errorf("verify OCI runtime namespace: %w", err)
 	}
 	if !verification.Absent || !InventoryEmpty(verification.Inventory) {
-		return errors.New("verify OCI runtime namespace: residue remains after sweep")
+		return fmt.Errorf("verify OCI runtime namespace: residue remains after sweep: %+v", verification.Inventory)
 	}
 	receipt := VerifiedSweepReceipt{
 		SweepEpoch:            sweep.SweepEpoch,

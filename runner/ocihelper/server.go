@@ -276,7 +276,7 @@ func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
 		return fmt.Errorf("startup verify OCI runtime namespace: %w", err)
 	}
 	if !verification.Absent || !InventoryEmpty(verification.Inventory) {
-		return errors.New("startup verify OCI runtime namespace: residue remains after sweep")
+		return fmt.Errorf("startup verify OCI runtime namespace: residue remains after sweep: %+v", verification.Inventory)
 	}
 	server.sessionMu.Lock()
 	server.startupSweep = &sweep
@@ -956,7 +956,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		response, err := cacheEngine.ReconcileImagePins(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodReleaseImagePin:
 		var body ReleaseImagePinRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -972,7 +972,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		err := cacheEngine.ReleaseImagePin(operation.ctx, body)
-		_ = writeEngineResponse(wire, struct{}{}, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, err)
 	case MethodReleaseAttemptPin:
 		var body ReleaseAttemptImagePinRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -988,7 +988,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		err := cacheEngine.ReleaseAttemptImagePin(operation.ctx, body)
-		_ = writeEngineResponse(wire, struct{}{}, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, err)
 	case MethodImageCacheStatus:
 		var body struct{}
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1000,7 +1000,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		response, err := cacheEngine.ImageCacheStatus(operation.ctx)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodDoctorStatus:
 		var body struct{}
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1110,7 +1110,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
-		_ = writeEngineResponse(wire, struct{}{}, server.engine.Signal(operation.ctx, body))
+		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, server.engine.Signal(operation.ctx, body))
 	case MethodSetComputerControl:
 		var body SetComputerControlStateRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1131,7 +1131,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
-		_ = writeEngineResponse(wire, struct{}{}, engine.SetComputerControlState(operation.ctx, body))
+		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, engine.SetComputerControlState(operation.ctx, body))
 	case MethodSetComputerToken:
 		var body SetComputerTokenRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1156,7 +1156,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
-		_ = writeEngineResponse(wire, struct{}{}, engine.SetComputerToken(operation.ctx, body))
+		_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, engine.SetComputerToken(operation.ctx, body))
 	case MethodWatch:
 		var body WatchRequest
 		if !decodeRequest(wire, request.Body, &body) || !authorizeRequest(wire, session, body.Authority) {
@@ -1195,7 +1195,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		} else if err == nil && response.Deleted {
 			err = session.reapAttempt(attempt, false, false)
 		}
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodDeleteVolume:
 		var body DeleteManagedVolumeRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1228,7 +1228,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.DeleteManagedVolume(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodInventoryRemoval:
 		var body InventoryRemovalRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1250,7 +1250,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			response.RemovalGeneration = body.Removal.RemovalGeneration
 			response.HelperSession = session.helper
 		}
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodAttestRemoval:
 		var body AttestRemovalRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1272,7 +1272,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			response.RemovalGeneration = body.RemovalGeneration
 			response.HelperSession = session.helper
 		}
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodResetStorage:
 		var body ResetComputerStorageRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1293,7 +1293,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.ResetComputerStorage(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodGrowStorage:
 		var body GrowComputerStorageRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1315,7 +1315,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.GrowComputerStorage(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodPreflightReimage:
 		var body PreflightComputerReimageRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1338,7 +1338,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.PreflightComputerReimage(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodCreateBackup:
 		var body CreateComputerBackupRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1355,7 +1355,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.CreateComputerBackup(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodDeleteBackup:
 		var body DeleteComputerBackupCopyRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1372,7 +1372,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.DeleteComputerBackupCopy(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodCopyStorage:
 		var body CopyComputerStorageRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1399,7 +1399,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.CopyComputerStorage(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodExportCustody:
 		var body ExportComputerCustodyRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1421,7 +1421,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.ExportComputerCustody(operation.ctx, body)
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodVerify:
 		var body VerifyRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1452,7 +1452,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if body.Scope == VerifyNamespace {
 			server.createSweep.Unlock()
 		}
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodSweep:
 		var body SweepRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1496,7 +1496,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			session.mu.Unlock()
 		}
 		server.createSweep.Unlock()
-		_ = writeEngineResponse(wire, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodDialAttemptPort:
 		var body DialAttemptPortRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1620,13 +1620,22 @@ func decodeRequest(connection *framedConn, raw json.RawMessage, target any) bool
 	return true
 }
 
-func writeEngineResponse(connection *framedConn, response any, err error) error {
+func writeEngineResponseWithMethod(connection *framedConn, method Method, response any, err error) error {
 	if err != nil {
 		var serviceDataRejection *ServiceDataRejectionError
 		if errors.As(err, &serviceDataRejection) {
 			return writeFailure(connection, CodeOCISpecRejected, serviceDataRejection.Error())
 		}
-		return writeFailure(connection, CodeEngineFailure, "OCI engine operation failed")
+		reason := "operation_failed"
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			reason = "deadline_exceeded"
+		case errors.Is(err, context.Canceled):
+			reason = "canceled"
+		case errors.Is(err, os.ErrPermission):
+			reason = "permission_denied"
+		}
+		return writeRPCError(connection, &RPCError{Code: CodeEngineFailure, Message: "OCI engine operation failed", EngineFailure: &EngineFailureFact{Operation: method, Reason: reason}})
 	}
 	return writeSuccess(connection, response)
 }

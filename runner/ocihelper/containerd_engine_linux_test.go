@@ -894,6 +894,25 @@ func TestHandoffInventoryUsesDurableHandoffsRoot(t *testing.T) {
 	}
 }
 
+func TestDurableHandoffInventoryIsNotAttemptOrNamespaceResidue(t *testing.T) {
+	handoff, err := DeterministicHandoffVolumeDirectory("retained-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inventory := ResourceInventory{
+		ManagedVolumes: []string{handoff, "wefty-service-volume-retained", "unexpected-volume"},
+		Containers:     []string{"unexpected-container"},
+	}
+	projected := withoutDurableDataInventory(inventory)
+	if slices.Contains(projected.ManagedVolumes, handoff) || slices.Contains(projected.ManagedVolumes, "wefty-service-volume-retained") {
+		t.Fatalf("durable data remained in quiescence projection: %+v", projected)
+	}
+	if !slices.Equal(projected.ManagedVolumes, []string{"unexpected-volume"}) ||
+		!slices.Equal(projected.Containers, []string{"unexpected-container"}) {
+		t.Fatalf("quiescence projection hid runtime residue: %+v", projected)
+	}
+}
+
 func TestImageOperationMechanicsNeverClaimsUnknownErrorsAreInvalidManifests(t *testing.T) {
 	tests := []struct {
 		name string

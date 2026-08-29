@@ -278,6 +278,14 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			// reap before it purges spool metadata or invokes managedroot.Remove.
 			return errorDestinationUnclassified, nil
 		}
+		if errors.Is(cause, errOCIIntentDisabled) {
+			// The stop command has already joined the runtime reap. Do not race
+			// that node-local intent with an L1 completion: the lease must expire
+			// back to the retained service binding without consuming restart
+			// budget. This branch owns the ordering where cancellation wins the
+			// select before the promptly terminating payload publishes outcome.
+			return errorDestinationUnclassified, nil
+		}
 		result := outcome.result
 		if result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
 			result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}

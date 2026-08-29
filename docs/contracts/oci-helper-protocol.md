@@ -117,6 +117,12 @@ Signal deadline is runtime loss because the independently bounded helper RPC
 could not be reached; by contrast, KILL sent without an observed exit is a
 failed quiescence proof and does not authorize a namespace sweep.
 
+Unary `engine_failure` responses include only a closed mechanics fact naming
+the helper method and one sanitized reason (`deadline_exceeded`, `canceled`,
+`permission_denied`, or `operation_failed`). Raw privileged error text,
+containerd types, and host paths remain local, while CI and callers can still
+distinguish which operation and bounded failure class lost runtime authority.
+
 ## Boot sweep barrier
 
 Helper process startup takes the exclusive create/sweep gate, sweeps every
@@ -476,7 +482,10 @@ Handoff volumes live under a distinct helper-owned durable root, not the
 attempt namespace. `Delete` reaps and verifies the attempt while retaining its
 handoff volume. Session reap and boot sweep likewise leave unexpired handoffs
 intact; reuse refreshes the default 24-hour retry age, and sweep removes only
-expired direct children with the deterministic handoff prefix. The narrow
+expired direct children with the deterministic handoff prefix. Attempt and
+namespace quiescence therefore project those retained durable handoffs out of
+their absence decision while keeping them visible in inventory for the narrow
+explicit finalizer. The narrow
 `DeleteManagedVolume(kind, owner_key)` operation is closed to `handoff` and
 `service_data`. It derives exactly one helper-owned identity, removes only that
 volume (and, for service data, its paired owner record), and returns success

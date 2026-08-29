@@ -849,10 +849,10 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			runErr = errors.Join(runErr, engine.deleteResources(cleanupCtx, request.Authority, request.Resources, computerDisk))
 			verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
 			runErr = errors.Join(runErr, verifyErr)
-			runtimeAbsent := verification.Absent
-			if computerDisk != nil {
-				runtimeAbsent = InventoryEmpty(withoutDurableDataInventory(verification.Inventory))
-			}
+			// Handoff, service-data, and computer-disk resources outlive one
+			// attempt by contract. Their retained inventory cannot prevent the
+			// failed attempt's runtime resources from being proven absent.
+			runtimeAbsent := InventoryEmpty(withoutDurableDataInventory(verification.Inventory))
 			if verifyErr == nil && runtimeAbsent {
 				runErr = errors.Join(runErr, engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()))
 				for _, port := range endpoints {
@@ -1444,10 +1444,11 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 		if identityErr == nil {
 			deleteErr := engine.deleteResources(cleanupCtx, request.Authority, resources, computerDisk)
 			verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
-			runtimeAbsent := verification.Absent
-			if request.Authority.Class == contract.JobClassService {
-				runtimeAbsent = InventoryEmpty(withoutDurableDataInventory(verification.Inventory))
-			}
+			// Durable managed data is finalized separately from an attempt.
+			// Project it out for every workload class so an owner-key handoff
+			// retained by a one-shot cannot turn successful runtime deletion
+			// into a full cleanup-timeout failure.
+			runtimeAbsent := InventoryEmpty(withoutDurableDataInventory(verification.Inventory))
 			if deleteErr == nil && verifyErr == nil && runtimeAbsent {
 				if releaseErr := engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()); releaseErr == nil {
 					return DeleteResponse{Deleted: true}, nil
@@ -1952,9 +1953,9 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 		engine.mu.Unlock()
 		inventory = filterInventory(inventory, resources, computerDisk)
 	}
-	// Service data is job-lifetime state, not boot-sweep residue. Attempt
-	// verification retains it so explicit job removal can positively observe
-	// the directory and owner record, while namespace quiescence projects it out.
+	// Managed data has an owner lifetime beyond one attempt, so attempt
+	// verification retains it for explicit finalization while namespace
+	// quiescence projects it out.
 	if request.Scope == VerifyNamespace {
 		inventory = withoutDurableDataInventory(inventory)
 	}
@@ -3098,6 +3099,9 @@ func withoutServiceDataInventory(inventory ResourceInventory) ResourceInventory 
 
 func withoutDurableDataInventory(inventory ResourceInventory) ResourceInventory {
 	inventory = withoutServiceDataInventory(inventory)
+	inventory.ManagedVolumes = slices.DeleteFunc(inventory.ManagedVolumes, func(name string) bool {
+		return strings.HasPrefix(name, "wefty-handoff-volume-")
+	})
 	inventory.ComputerDiskImages = []string{}
 	inventory.ComputerDiskAllocations = []string{}
 	inventory.ComputerDiskQuotas = []string{}
