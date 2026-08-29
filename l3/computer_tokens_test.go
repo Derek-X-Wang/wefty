@@ -57,9 +57,14 @@ func TestComputerTokenIsHashOnlyRevocableAndPromotionInvalidated(t *testing.T) {
 	if err != nil || scope.ComputerID != grant.ComputerID || scope.GrantRevision != grant.GrantRevision {
 		t.Fatalf("authenticate = (%#v, %v)", scope, err)
 	}
-	if err := store.RevokeComputerTokens(ctx, ComputerTokenRevocationRequest{ComputerID: grant.ComputerID,
-		SubmitIntentRevision: grant.SubmitIntentRevision + 1, Reason: "disabled"}); err != nil {
+	receipt, err := store.RevokeComputerTokens(ctx, ComputerTokenRevocationRequest{ComputerID: grant.ComputerID,
+		SubmitIntentRevision: grant.SubmitIntentRevision + 1, Reason: "disabled"})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if receipt.ComputerID != grant.ComputerID || receipt.SubmitIntentRevision != grant.SubmitIntentRevision+1 ||
+		receipt.RevokedGrantCount != 1 || receipt.CommittedAt.IsZero() {
+		t.Fatalf("revocation receipt = %#v", receipt)
 	}
 	if _, err := store.AuthenticateComputerToken(ctx, grant.Token); err == nil {
 		t.Fatal("revoked Computer token authenticated")

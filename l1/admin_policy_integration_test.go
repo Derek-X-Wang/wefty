@@ -189,7 +189,7 @@ func TestMachinePrincipalRejectedFromEveryPersonRoute(t *testing.T) {
 		{http.MethodGet, "/v1/computers/computer-forged/revocations/1", nil},
 		{http.MethodGet, "/v1/computers/computer-forged/submission", nil},
 		{http.MethodPut, "/v1/computers/computer-forged/submission", ComputerSubmissionRequest{
-			PolicyRevision: 1, SubmitMaxInflight: 20, IdempotencyKey: "forged-submission"}},
+			PolicyRevision: 1, SubmitMaxInflight: intPointer(20), IdempotencyKey: "forged-submission"}},
 	}
 	for _, row := range rows {
 		status, _, body := h.do(client, row.method, row.path, row.body)

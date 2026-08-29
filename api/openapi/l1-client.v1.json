@@ -30,12 +30,13 @@
         "responses": {
           "200": { "description": "Current Computer submission state.", "content": { "application/json": { "schema": {
             "type": "object", "additionalProperties": false,
-            "required": ["computer_id", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "policy_revision", "ready"],
+            "required": ["computer_id", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "inflight_count", "policy_revision", "ready"],
             "properties": {
               "computer_id": { "type": "string", "minLength": 1 },
               "submit_enabled": { "type": "boolean" },
               "submit_intent_revision": { "type": "integer", "minimum": 0 },
               "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+              "inflight_count": { "type": "integer", "minimum": 0 },
               "policy_revision": { "type": "integer", "minimum": 1 },
               "ready": { "type": ["boolean", "null"] },
               "status": { "type": "string" },
@@ -51,28 +52,42 @@
       "put": {
         "operationId": "mutateComputerSubmission",
         "summary": "Enable, disable, or resize Computer Run submission",
-        "description": "Current administrators only. The revisioned intent defaults disabled with max 20. L3 revocation is committed before this operation reports success, and each accepted mutation advances the globally distributed policy revision.",
+        "description": "Current administrators only. Exactly one policy is changed against caller-observed CAS revisions. An applied change invalidates readiness and carries L3's exact revocation receipt; replay and audited no-op responses carry revoked=null.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
-          "required": ["policy_revision", "submit_intent_revision", "submit_enabled", "submit_max_inflight", "idempotency_key"],
+          "required": ["policy_revision", "submit_intent_revision", "idempotency_key"],
           "properties": {
             "policy_revision": { "type": "integer", "minimum": 1 },
             "submit_intent_revision": { "type": "integer", "minimum": 0 },
             "submit_enabled": { "type": "boolean" },
             "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 20 },
             "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 255 }
-          }
+          },
+          "oneOf": [
+            { "required": ["submit_enabled"], "not": { "required": ["submit_max_inflight"] } },
+            { "required": ["submit_max_inflight"], "not": { "required": ["submit_enabled"] } }
+          ]
         } } } },
         "responses": {
           "200": {
-            "description": "Submission intent accepted or replayed after L3 revocation committed.",
-            "headers": {
-              "Wefty-Computer-Revocation-Committed": {
-                "description": "Literal true only after the authoritative L3 revocation precedes the successful response.",
-                "schema": { "type": "string", "const": "true" }
+            "description": "Canonical narrow state plus whether policy changed and the factual L3 revocation receipt. Idempotent replay is additionally identified by Idempotent-Replay: true.",
+            "content": { "application/json": { "schema": {
+              "type": "object", "additionalProperties": false,
+              "required": ["computer_id", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "inflight_count", "policy_revision", "ready", "mutation_applied", "revoked"],
+              "properties": {
+                "computer_id": { "type": "string", "minLength": 1 },
+                "submit_enabled": { "type": "boolean" },
+                "submit_intent_revision": { "type": "integer", "minimum": 0 },
+                "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                "inflight_count": { "type": "integer", "minimum": 0 },
+                "policy_revision": { "type": "integer", "minimum": 1 },
+                "ready": { "type": ["boolean", "null"] },
+                "status": { "type": "string" },
+                "pass_unavailable": { "$ref": "./common.v1.json#/components/schemas/SpawnFailure" },
+                "mutation_applied": { "type": "boolean" },
+                "revoked": { "oneOf": [{ "$ref": "./common.v1.json#/components/schemas/ComputerTokenRevocationReceipt" }, { "type": "null" }] }
               }
-            },
-            "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+            } } }
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },

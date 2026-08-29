@@ -358,29 +358,42 @@ func (s *Server) mutateComputerSubmission(w http.ResponseWriter, r *http.Request
 		return
 	}
 	identity := identityFromRequest(r)
-	computer, replayed, err := s.store.PrepareComputerSubmissionMutation(r.Context(), identity, r.PathValue("computer_id"), request)
+	computer, replayed, mutationApplied, err := s.store.PrepareComputerSubmissionMutation(r.Context(), identity, r.PathValue("computer_id"), request)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	if replayed {
 		w.Header().Set("Idempotent-Replay", "true")
-		w.Header().Set(ComputerSubmissionRevocationCommittedHeader, "true")
-		writeJSON(w, http.StatusOK, computer)
+		result, resultErr := s.computerSubmissionResult(r.Context(), identity, computer, false, nil)
+		if resultErr != nil {
+			writeError(w, resultErr)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 		return
 	}
-	if s.computerTokenRevoker == nil {
+	var receipt *contract.ComputerTokenRevocationReceipt
+	if mutationApplied && s.computerTokenRevoker == nil {
 		writeError(w, internalError(errors.New("L3 Computer token revoker is not configured"), "revoke Computer token grants"))
 		return
 	}
-	if err := s.computerTokenRevoker.RevokeComputerTokens(r.Context(), ComputerTokenRevocation{
-		ComputerID: computer.ComputerID, NewSubmitIntentRevision: computer.SubmitIntentRevision + 1,
-		Reason: "submission_intent_advanced",
-	}); err != nil {
-		writeError(w, internalError(err, "revoke Computer token grants before submission mutation"))
-		return
+	if mutationApplied {
+		observed, revokeErr := s.computerTokenRevoker.RevokeComputerTokens(r.Context(), ComputerTokenRevocation{
+			ComputerID: computer.ComputerID, NewSubmitIntentRevision: computer.SubmitIntentRevision + 1,
+			Reason: "submission_intent_advanced",
+		})
+		if revokeErr != nil {
+			writeError(w, internalError(revokeErr, "revoke Computer token grants before submission mutation"))
+			return
+		}
+		if observed.ComputerID != computer.ComputerID || observed.SubmitIntentRevision != computer.SubmitIntentRevision+1 || observed.CommittedAt.IsZero() {
+			writeError(w, internalError(errors.New("L3 Computer token revocation receipt did not match the mutation"), "verify Computer token revocation receipt"))
+			return
+		}
+		receipt = &observed
 	}
-	computer, replayed, err = s.store.MutateComputerSubmission(r.Context(), identity, computer.ComputerID, request)
+	computer, replayed, mutationApplied, err = s.store.MutateComputerSubmission(r.Context(), identity, computer.ComputerID, request)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -388,8 +401,15 @@ func (s *Server) mutateComputerSubmission(w http.ResponseWriter, r *http.Request
 	if replayed {
 		w.Header().Set("Idempotent-Replay", "true")
 	}
-	w.Header().Set(ComputerSubmissionRevocationCommittedHeader, "true")
-	writeJSON(w, http.StatusOK, computer)
+	if replayed || !mutationApplied {
+		receipt = nil
+	}
+	result, err := s.computerSubmissionResult(r.Context(), identity, computer, mutationApplied, receipt)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) getComputerSubmission(w http.ResponseWriter, r *http.Request) {
@@ -398,7 +418,32 @@ func (s *Server) getComputerSubmission(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if s.computerTokenRevoker == nil {
+		writeError(w, internalError(errors.New("L3 Computer inflight reader is not configured"), "read Computer inflight state"))
+		return
+	}
+	state.InflightCount, err = s.computerTokenRevoker.CountComputerInflight(r.Context(), state.ComputerID)
+	if err != nil {
+		writeError(w, internalError(err, "read Computer inflight state"))
+		return
+	}
 	writeJSON(w, http.StatusOK, state)
+}
+
+func (s *Server) computerSubmissionResult(ctx context.Context, identity fabric.Identity, computer Computer, mutationApplied bool,
+	receipt *contract.ComputerTokenRevocationReceipt) (ComputerSubmissionMutationResult, error) {
+	state, err := s.store.GetComputerSubmissionState(ctx, identity, computer.ComputerID)
+	if err != nil {
+		return ComputerSubmissionMutationResult{}, err
+	}
+	if s.computerTokenRevoker == nil {
+		return ComputerSubmissionMutationResult{}, internalError(errors.New("L3 Computer inflight reader is not configured"), "read Computer inflight state")
+	}
+	state.InflightCount, err = s.computerTokenRevoker.CountComputerInflight(ctx, computer.ComputerID)
+	if err != nil {
+		return ComputerSubmissionMutationResult{}, internalError(err, "read Computer inflight state")
+	}
+	return ComputerSubmissionMutationResult{ComputerSubmissionState: state, MutationApplied: mutationApplied, Revoked: receipt}, nil
 }
 
 func (s *Server) latchServiceImageReconciliationFailure(w http.ResponseWriter, r *http.Request) {
@@ -1016,7 +1061,7 @@ func (s *Server) revokeComputerAuthority(ctx context.Context, computerID, reason
 	if s.computerTokenRevoker == nil {
 		return nil
 	}
-	if err := s.computerTokenRevoker.RevokeComputerTokens(ctx, ComputerTokenRevocation{
+	if _, err := s.computerTokenRevoker.RevokeComputerTokens(ctx, ComputerTokenRevocation{
 		ComputerID: computerID, NewSubmitIntentRevision: 1, RevokeAll: true, Reason: reason,
 	}); err != nil {
 		return internalError(err, "revoke Computer token grants after authority loss")

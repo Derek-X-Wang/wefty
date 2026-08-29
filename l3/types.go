@@ -271,6 +271,11 @@ type ComputerRunPage struct {
 	NextCursor string               `json:"next_cursor,omitempty"`
 }
 
+type ComputerInflightState struct {
+	ComputerID              string `json:"computer_id"`
+	NonterminalRootLineages int    `json:"nonterminal_root_lineages"`
+}
+
 // ComputerTokenScopeProof is the L1-authoritative fact L3 consumes before it
 // mints a pass. The host Node and attempt are verified, never caller asserted.
 type ComputerTokenScopeProof struct {

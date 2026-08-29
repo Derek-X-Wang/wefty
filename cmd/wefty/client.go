@@ -237,11 +237,11 @@ func (c *apiClients) getComputerSubmission(ctx context.Context, computerID strin
 	return state, err
 }
 
-func (c *apiClients) mutateComputerSubmission(ctx context.Context, computerID string, request l1.ComputerSubmissionRequest) (l1.Computer, bool, error) {
-	var computer l1.Computer
+func (c *apiClients) mutateComputerSubmission(ctx context.Context, computerID string, request l1.ComputerSubmissionRequest) (l1.ComputerSubmissionMutationResult, bool, error) {
+	var result l1.ComputerSubmissionMutationResult
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/submission"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPut, path, request, nil, &computer, http.StatusOK)
-	return computer, err == nil && headers.Get(l1.ComputerSubmissionRevocationCommittedHeader) == "true", err
+	headers, err := c.l1.doWithResponse(ctx, http.MethodPut, path, request, nil, &result, http.StatusOK)
+	return result, err == nil && headers.Get("Idempotent-Replay") == "true", err
 }
 
 func (c *apiClients) listRunsByOrigin(ctx context.Context, origin, cursor string, limit int, includeDescendants bool) (l3.ComputerRunPage, error) {

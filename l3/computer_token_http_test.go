@@ -260,7 +260,7 @@ func TestComputerHTTPAuthoritySurfaceAndNodeBinding(t *testing.T) {
 		t.Fatalf("forged provenance status=%d body=%s", status, body)
 	}
 
-	if err := h.store.RevokeComputerTokens(context.Background(), ComputerTokenRevocationRequest{
+	if _, err := h.store.RevokeComputerTokens(context.Background(), ComputerTokenRevocationRequest{
 		ComputerID: proof.ComputerID, SubmitIntentRevision: proof.SubmitIntentRevision + 1, Reason: "disabled"}); err != nil {
 		t.Fatal(err)
 	}
@@ -510,6 +510,30 @@ func TestCallerComputerOriginRunListSpansGenerationsAndKeepsExactTriggers(t *tes
 	if status != http.StatusBadRequest {
 		t.Fatalf("cross-origin cursor status=%d body=%s", status, body)
 	}
+	status, _, body = doComputerHTTP(t, caller, http.MethodGet,
+		path+"&cursor="+url.QueryEscape(first.NextCursor)+"&include_descendants=true", "", "", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("cross-descendant cursor status=%d body=%s", status, body)
+	}
+	status, _, body = doComputerHTTP(t, caller, http.MethodGet,
+		"/v1/runs?origin=computer:computer-absent", "", "", nil)
+	var absent ComputerRunPage
+	if status != http.StatusOK || json.Unmarshal(body, &absent) != nil || len(absent.Runs) != 0 || absent.NextCursor != "" {
+		t.Fatalf("absent Computer origin status=%d page=%+v body=%s", status, absent, body)
+	}
+	agent := h.clientForIdentity(fabric.Identity{NodeID: proof.HostNodeID, Tags: []string{l1.DefaultAgentPrincipalTag}})
+	status, _, body = doComputerHTTP(t, agent, http.MethodGet,
+		"/v1/runs?origin=computer:computer-foreign", "", "", nil)
+	if status != http.StatusForbidden {
+		t.Fatalf("tokenless bridge agent origin query status=%d body=%s", status, body)
+	}
+	control := h.clientForIdentity(fabric.Identity{NodeID: h.server.controlPlaneNodeID})
+	status, _, body = doComputerHTTP(t, control, http.MethodGet,
+		"/v1/computers/"+proof.ComputerID+"/inflight", "", "", nil)
+	var inflight ComputerInflightState
+	if status != http.StatusOK || json.Unmarshal(body, &inflight) != nil || inflight.NonterminalRootLineages != 2 {
+		t.Fatalf("Computer inflight state status=%d state=%+v body=%s", status, inflight, body)
+	}
 }
 
 func TestComputerCreateRunRechecksRevocationAfterAuthentication(t *testing.T) {
@@ -533,7 +557,7 @@ func TestComputerCreateRunRechecksRevocationAfterAuthentication(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("submission did not pause after bearer authentication")
 	}
-	if err := h.store.RevokeComputerTokens(context.Background(), ComputerTokenRevocationRequest{
+	if _, err := h.store.RevokeComputerTokens(context.Background(), ComputerTokenRevocationRequest{
 		ComputerID: proof.ComputerID, SubmitIntentRevision: proof.SubmitIntentRevision + 1, Reason: "disabled"}); err != nil {
 		t.Fatal(err)
 	}

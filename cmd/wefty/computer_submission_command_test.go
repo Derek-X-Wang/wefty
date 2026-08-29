@@ -39,20 +39,47 @@ func TestComputerSubmissionOutputProjectsExactPassUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	computer := l1.Computer{ComputerID: "computer-pass", SubmitEnabled: true, SubmitIntentRevision: 7,
-		SubmitMaxInflight: 4, SubmitPolicyRevision: 11, CurrentJob: l1.Job{Status: "pass_unavailable",
-			ServiceJob: &l1.ServiceJob{Ready: &ready, LastFailure: failureJSON}}}
-	projection := projectComputerSubmissionOutput(computer)
+	projection := l1.ComputerSubmissionState{ComputerID: "computer-pass", SubmitEnabled: true,
+		SubmitIntentRevision: 7, SubmitMaxInflight: 4, PolicyRevision: 11, Status: "pass_unavailable",
+		Ready: &ready, PassUnavailable: l1.ComputerPassUnavailable(failureJSON)}
 	if projection.Ready == nil || *projection.Ready || projection.PassUnavailable == nil ||
 		projection.PassUnavailable.Code != contract.SpawnFailurePassUnavailable || projection.PassUnavailable.Message != failure.Message {
 		t.Fatalf("pass unavailable projection = %#v", projection)
 	}
 	var human bytes.Buffer
-	if err := writeComputerSubmissionOutput(&human, computerSubmissionOutput{ComputerSubmissionState: projection}); err != nil {
+	if err := writeComputerSubmissionOutput(&human, computerSubmissionOutput{ComputerSubmissionMutationResult: l1.ComputerSubmissionMutationResult{
+		ComputerSubmissionState: projection}}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(human.String(), "pass_unavailable: "+failure.Message) || !strings.Contains(human.String(), "false") {
 		t.Fatalf("human pass unavailable projection:\n%s", human.String())
+	}
+}
+
+func TestComputerSubmissionAndOriginUsageValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"unknown submission verb", []string{"computers", "submission", "rotate", "computer-one"}},
+		{"missing CAS", []string{"computers", "submission", "disable", "computer-one"}},
+		{"set inflight without limit", []string{"computers", "submission", "set-inflight", "computer-one", "--policy-revision", "1", "--submit-intent-revision", "0"}},
+		{"set inflight below range", []string{"computers", "submission", "set-inflight", "computer-one", "--max-inflight", "0", "--policy-revision", "1", "--submit-intent-revision", "0"}},
+		{"set inflight above range", []string{"computers", "submission", "set-inflight", "computer-one", "--max-inflight", "1001", "--policy-revision", "1", "--submit-intent-revision", "0"}},
+		{"expect current conflict", []string{"computers", "submission", "disable", "computer-one", "--expect-current", "--policy-revision", "1"}},
+		{"self origin", []string{"runs", "list", "--origin", "computer:self"}},
+		{"whitespace origin", []string{"runs", "list", "--origin", "computer: computer-one"}},
+		{"runs positional", []string{"runs", "list", "computer:one", "--origin", "computer:one"}},
+		{"limit below range", []string{"runs", "list", "--origin", "computer:one", "--limit", "0"}},
+		{"limit above range", []string{"runs", "list", "--origin", "computer:one", "--limit", "1001"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := execute(context.Background(), nil, true, test.args, &bytes.Buffer{}, &bytes.Buffer{})
+			if _, ok := err.(usageError); !ok {
+				t.Fatalf("error = %T %v, want usageError", err, err)
+			}
+		})
 	}
 }
 
@@ -141,20 +168,42 @@ func assertComputerSubmissionAndOriginCLIOverRealRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	noopDisabled := executeComputerSubmissionJSON(t, ctx, adminClients, "disable", computer.ComputerID,
+		"--policy-revision", "1", "--submit-intent-revision", "0")
+	if noopDisabled.SubmitEnabled || noopDisabled.SubmitIntentRevision != 0 || noopDisabled.PolicyRevision != 1 ||
+		noopDisabled.MutationApplied || noopDisabled.IdempotentReplay || noopDisabled.Revoked != nil {
+		t.Fatalf("audited disable no-op = %#v", noopDisabled)
+	}
 	enabled := executeComputerSubmissionJSON(t, ctx, adminClients, "enable", computer.ComputerID,
-		"--idempotency-key", "cli-enable")
+		"--policy-revision", "1", "--submit-intent-revision", "0")
 	if !enabled.SubmitEnabled || enabled.SubmitIntentRevision != 1 || enabled.PolicyRevision != 2 ||
 		enabled.SubmitMaxInflight != l1.DefaultComputerSubmitMaxInflight || !enabled.MutationApplied ||
-		!enabled.RevocationCommittedBeforeSuccess {
+		enabled.Revoked == nil || enabled.Revoked.SubmitIntentRevision != 1 || enabled.IdempotentReplay {
 		t.Fatalf("enable receipt = %#v", enabled)
 	}
-	noopEnabled := executeComputerSubmissionJSON(t, ctx, adminClients, "enable", computer.ComputerID)
-	if noopEnabled.SubmitIntentRevision != enabled.SubmitIntentRevision || noopEnabled.PolicyRevision != enabled.PolicyRevision ||
-		noopEnabled.MutationApplied || noopEnabled.RevocationCommittedBeforeSuccess {
-		t.Fatalf("idempotent enable no-op = %#v after %#v", noopEnabled, enabled)
+	replayedEnable := executeComputerSubmissionJSON(t, ctx, adminClients, "enable", computer.ComputerID,
+		"--policy-revision", "1", "--submit-intent-revision", "0")
+	if replayedEnable.SubmitIntentRevision != enabled.SubmitIntentRevision || replayedEnable.PolicyRevision != enabled.PolicyRevision ||
+		replayedEnable.MutationApplied || !replayedEnable.IdempotentReplay || replayedEnable.Revoked != nil {
+		t.Fatalf("keyless enable replay = %#v after %#v", replayedEnable, enabled)
 	}
-	resized := executeComputerSubmissionJSON(t, ctx, adminClients, "set-inflight", computer.ComputerID,
-		"--max-inflight", "2", "--idempotency-key", "cli-resize")
+	roots, child := seedComputerOriginRuns(t, l3Store, computer.ComputerID)
+	var humanSubmission, warning bytes.Buffer
+	if err := execute(ctx, adminClients, false, []string{"computers", "submission", "set-inflight", computer.ComputerID,
+		"--max-inflight", "2", "--policy-revision", "2", "--submit-intent-revision", "1",
+		"--idempotency-key", "cli-resize"}, &humanSubmission, &warning); err != nil {
+		t.Fatalf("human set-inflight: %v", err)
+	}
+	if !strings.Contains(humanSubmission.String(), "2/2") || !strings.Contains(humanSubmission.String(), "revision 2") ||
+		!strings.Contains(warning.String(), "saturated at inflight 2/2") {
+		t.Fatalf("human submission output=%q warning=%q", humanSubmission.String(), warning.String())
+	}
+	resizedState, err := adminClients.getComputerSubmission(ctx, computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resized := computerSubmissionOutput{ComputerSubmissionMutationResult: l1.ComputerSubmissionMutationResult{
+		ComputerSubmissionState: resizedState, MutationApplied: true}}
 	if !resized.SubmitEnabled || resized.SubmitIntentRevision != 2 || resized.PolicyRevision != 3 || resized.SubmitMaxInflight != 2 {
 		t.Fatalf("resize receipt = %#v", resized)
 	}
@@ -162,7 +211,7 @@ func assertComputerSubmissionAndOriginCLIOverRealRoutes(t *testing.T) {
 		"--max-inflight", "2", "--policy-revision", "2", "--submit-intent-revision", "1",
 		"--idempotency-key", "cli-resize")
 	if replayed.SubmitIntentRevision != resized.SubmitIntentRevision || replayed.PolicyRevision != resized.PolicyRevision ||
-		!replayed.RevocationCommittedBeforeSuccess {
+		replayed.MutationApplied || !replayed.IdempotentReplay || replayed.Revoked != nil {
 		t.Fatalf("resize replay receipt = %#v after %#v", replayed, resized)
 	}
 	var staleOut bytes.Buffer
@@ -172,21 +221,23 @@ func assertComputerSubmissionAndOriginCLIOverRealRoutes(t *testing.T) {
 
 	nonAdminClients := mustTestAPIClients(t, nonAdminFabric)
 	defer nonAdminClients.close()
-	err = execute(ctx, nonAdminClients, true, []string{"computers", "submission", "disable", computer.ComputerID}, &bytes.Buffer{}, &bytes.Buffer{})
+	err = execute(ctx, nonAdminClients, true, []string{"computers", "submission", "disable", computer.ComputerID,
+		"--policy-revision", "3", "--submit-intent-revision", "2"}, &bytes.Buffer{}, &bytes.Buffer{})
 	assertCLIAPIError(t, err, contract.ErrorAdminRequired)
 	machineClients := mustTestAPIClients(t, machineFabric)
 	defer machineClients.close()
-	err = execute(ctx, machineClients, true, []string{"computers", "submission", "disable", computer.ComputerID}, &bytes.Buffer{}, &bytes.Buffer{})
+	err = execute(ctx, machineClients, true, []string{"computers", "submission", "disable", computer.ComputerID,
+		"--policy-revision", "3", "--submit-intent-revision", "2"}, &bytes.Buffer{}, &bytes.Buffer{})
 	assertCLIAPIError(t, err, contract.ErrorPrincipalForbidden)
 
 	disabled := executeComputerSubmissionJSON(t, ctx, adminClients, "disable", computer.ComputerID,
-		"--idempotency-key", "cli-disable")
-	if disabled.SubmitEnabled || disabled.SubmitIntentRevision != 3 || !disabled.RevocationCommittedBeforeSuccess {
+		"--policy-revision", "3", "--submit-intent-revision", "2", "--idempotency-key", "cli-disable")
+	if disabled.SubmitEnabled || disabled.SubmitIntentRevision != 3 || disabled.Revoked == nil {
 		t.Fatalf("disable receipt = %#v", disabled)
 	}
 	reenabled := executeComputerSubmissionJSON(t, ctx, adminClients, "enable", computer.ComputerID,
-		"--idempotency-key", "cli-reenable")
-	if !reenabled.SubmitEnabled || reenabled.SubmitIntentRevision != 4 || !reenabled.RevocationCommittedBeforeSuccess {
+		"--policy-revision", "4", "--submit-intent-revision", "3", "--idempotency-key", "cli-reenable")
+	if !reenabled.SubmitEnabled || reenabled.SubmitIntentRevision != 4 || reenabled.Revoked == nil {
 		t.Fatalf("re-enable receipt = %#v", reenabled)
 	}
 
@@ -210,10 +261,9 @@ func assertComputerSubmissionAndOriginCLIOverRealRoutes(t *testing.T) {
 		return response, roundTripErr
 	})
 	err = execute(ctx, adminClients, true, []string{"computers", "submission", "disable", computer.ComputerID,
-		"--idempotency-key", "cli-revoked-mid-command"}, &bytes.Buffer{}, &bytes.Buffer{})
+		"--expect-current", "--idempotency-key", "cli-revoked-mid-command"}, &bytes.Buffer{}, &bytes.Buffer{})
 	assertCLIAPIError(t, err, contract.ErrorAdminRequired)
 
-	roots, child := seedComputerOriginRuns(t, l3Store, computer.ComputerID)
 	callerClients := mustTestAPIClients(t, callerFabric)
 	defer callerClients.close()
 	var firstOut bytes.Buffer

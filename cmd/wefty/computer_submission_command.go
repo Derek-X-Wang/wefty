@@ -8,16 +8,18 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
 
-const computerSubmissionUsage = "usage: wefty computers submission enable|disable|set-inflight COMPUTER_ID [--max-inflight LIMIT] [--policy-revision REVISION] [--submit-intent-revision REVISION] [--idempotency-key KEY]"
+const computerSubmissionUsage = "usage: wefty computers submission enable|disable|set-inflight COMPUTER_ID [--max-inflight LIMIT] (--policy-revision REVISION --submit-intent-revision REVISION | --expect-current) [--idempotency-key KEY]"
 
 type optionalRevisionFlag struct {
 	value int64
@@ -41,9 +43,8 @@ func (f *optionalRevisionFlag) String() string {
 }
 
 type computerSubmissionOutput struct {
-	l1.ComputerSubmissionState
-	MutationApplied                  bool `json:"mutation_applied"`
-	RevocationCommittedBeforeSuccess bool `json:"revocation_committed_before_success"`
+	l1.ComputerSubmissionMutationResult
+	IdempotentReplay bool `json:"idempotent_replay"`
 }
 
 func executeComputers(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
@@ -60,10 +61,12 @@ func executeComputers(ctx context.Context, clients *apiClients, jsonOutput bool,
 	var policyRevision, submitIntentRevision optionalRevisionFlag
 	var maxInflight int
 	var idempotencyKey string
+	var expectCurrent bool
 	flags.Var(&policyRevision, "policy-revision", "admin policy revision observed before this CAS mutation")
 	flags.Var(&submitIntentRevision, "submit-intent-revision", "Computer submission revision observed before this CAS mutation")
 	flags.IntVar(&maxInflight, "max-inflight", 0, "maximum nonterminal Computer-root Lineages")
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable mutation idempotency key")
+	flags.BoolVar(&expectCurrent, "expect-current", false, "read the current revisions before issuing the mutation")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -91,62 +94,64 @@ func executeComputers(ctx context.Context, clients *apiClients, jsonOutput bool,
 	if submitIntentRevision.set && submitIntentRevision.value < 0 {
 		return usageError("--submit-intent-revision must be non-negative")
 	}
+	if expectCurrent && (policyRevision.set || submitIntentRevision.set) {
+		return usageError("--expect-current cannot be combined with explicit revision flags")
+	}
+	if !expectCurrent && (!policyRevision.set || !submitIntentRevision.set) {
+		return usageError("Computer submission mutations require --policy-revision and --submit-intent-revision, or --expect-current")
+	}
 
 	computerID := flags.Arg(0)
-	current, err := clients.getComputerSubmission(ctx, computerID)
-	if err != nil {
-		return err
+	if expectCurrent {
+		current, err := clients.getComputerSubmission(ctx, computerID)
+		if err != nil {
+			return err
+		}
+		policyRevision.value, policyRevision.set = current.PolicyRevision, true
+		submitIntentRevision.value, submitIntentRevision.set = current.SubmitIntentRevision, true
 	}
-	desiredEnabled := current.SubmitEnabled
-	desiredMaxInflight := current.SubmitMaxInflight
+	request := l1.ComputerSubmissionRequest{PolicyRevision: policyRevision.value,
+		SubmitIntentRevision: submitIntentRevision.value}
 	switch verb {
 	case "enable":
-		desiredEnabled = true
+		enabled := true
+		request.SubmitEnabled = &enabled
 	case "disable":
-		desiredEnabled = false
+		enabled := false
+		request.SubmitEnabled = &enabled
 	case "set-inflight":
-		desiredMaxInflight = maxInflight
+		request.SubmitMaxInflight = &maxInflight
 	}
-	desiredAlreadyObserved := desiredEnabled == current.SubmitEnabled && desiredMaxInflight == current.SubmitMaxInflight
-	if desiredAlreadyObserved && !policyRevision.set && !submitIntentRevision.set {
-		output := computerSubmissionOutput{ComputerSubmissionState: current}
-		if jsonOutput {
-			return writeJSON(stdout, output)
-		}
-		return writeComputerSubmissionOutput(stdout, output)
-	}
-	observedPolicyRevision := current.PolicyRevision
-	if policyRevision.set {
-		observedPolicyRevision = policyRevision.value
-	}
-	observedSubmitRevision := current.SubmitIntentRevision
-	if submitIntentRevision.set {
-		observedSubmitRevision = submitIntentRevision.value
-	}
-	request := l1.ComputerSubmissionRequest{
-		PolicyRevision: observedPolicyRevision, SubmitIntentRevision: observedSubmitRevision,
-		SubmitEnabled: desiredEnabled, SubmitMaxInflight: desiredMaxInflight,
-	}
+	var err error
 	idempotencyKey, err = ensureComputerSubmissionIdempotencyKey(idempotencyKey, computerID, request)
 	if err != nil {
 		return err
 	}
 	request.IdempotencyKey = idempotencyKey
-	computer, revocationCommitted, err := clients.mutateComputerSubmission(ctx, computerID, request)
+	result, replayed, err := clients.mutateComputerSubmission(ctx, computerID, request)
 	if err != nil {
 		return err
 	}
-	if !revocationCommitted {
-		return errors.New("L1 submission mutation omitted its revocation-before-success receipt")
+	if replayed {
+		result.MutationApplied = false
 	}
-	output := computerSubmissionOutput{
-		ComputerSubmissionState: projectComputerSubmissionOutput(computer), MutationApplied: true,
-		RevocationCommittedBeforeSuccess: true,
+	if result.MutationApplied && result.Revoked == nil {
+		return &apiResponseError{Service: "L1", StatusCode: http.StatusInternalServerError,
+			APIError: contract.APIError{Code: contract.ErrorInternal, Message: "L1 submission mutation omitted its L3 revocation receipt"}}
 	}
+	output := computerSubmissionOutput{ComputerSubmissionMutationResult: result, IdempotentReplay: replayed}
 	if jsonOutput {
 		return writeJSON(stdout, output)
 	}
-	return writeComputerSubmissionOutput(stdout, output)
+	if err := writeComputerSubmissionOutput(stdout, output); err != nil {
+		return err
+	}
+	if verb == "set-inflight" && output.InflightCount >= output.SubmitMaxInflight {
+		_, err := fmt.Fprintf(stderr, "warning: Computer %s is saturated at inflight %d/%d\n",
+			output.ComputerID, output.InflightCount, output.SubmitMaxInflight)
+		return err
+	}
+	return nil
 }
 
 func ensureComputerSubmissionIdempotencyKey(value, computerID string, request l1.ComputerSubmissionRequest) (string, error) {
@@ -157,8 +162,8 @@ func ensureComputerSubmissionIdempotencyKey(value, computerID string, request l1
 		ComputerID           string `json:"computer_id"`
 		PolicyRevision       int64  `json:"policy_revision"`
 		SubmitIntentRevision int64  `json:"submit_intent_revision"`
-		SubmitEnabled        bool   `json:"submit_enabled"`
-		SubmitMaxInflight    int    `json:"submit_max_inflight"`
+		SubmitEnabled        *bool  `json:"submit_enabled,omitempty"`
+		SubmitMaxInflight    *int   `json:"submit_max_inflight,omitempty"`
 	}{computerID, request.PolicyRevision, request.SubmitIntentRevision, request.SubmitEnabled, request.SubmitMaxInflight})
 	if err != nil {
 		return "", fmt.Errorf("encode Computer submission idempotency input: %w", err)
@@ -167,32 +172,24 @@ func ensureComputerSubmissionIdempotencyKey(value, computerID string, request l1
 	return fmt.Sprintf("wefty-cli-computer-submission-%x", digest[:]), nil
 }
 
-func projectComputerSubmissionOutput(computer l1.Computer) l1.ComputerSubmissionState {
-	state := l1.ComputerSubmissionState{
-		ComputerID: computer.ComputerID, SubmitEnabled: computer.SubmitEnabled,
-		SubmitIntentRevision: computer.SubmitIntentRevision, SubmitMaxInflight: computer.SubmitMaxInflight,
-		PolicyRevision: computer.SubmitPolicyRevision, Status: computer.CurrentJob.Status,
-	}
-	if computer.CurrentJob.ServiceJob != nil {
-		state.Ready = computer.CurrentJob.Ready
-		state.PassUnavailable = l1.ComputerPassUnavailable(computer.CurrentJob.LastFailure)
-	}
-	return state
-}
-
 func writeComputerSubmissionOutput(writer io.Writer, output computerSubmissionOutput) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "COMPUTER ID\tENABLED\tMAX INFLIGHT\tSUBMIT REVISION\tPOLICY REVISION\tREADY\tPASS UNAVAILABLE\tMUTATION APPLIED\tREVOCATION BEFORE SUCCESS"); err != nil {
+	if _, err := fmt.Fprintln(table, "COMPUTER ID\tENABLED\tINFLIGHT\tSUBMIT REVISION\tPOLICY REVISION\tREADY\tPASS UNAVAILABLE\tMUTATION APPLIED\tREPLAY\tREVOKED"); err != nil {
 		return err
 	}
 	passUnavailable := "N/A"
 	if output.PassUnavailable != nil {
 		passUnavailable = string(output.PassUnavailable.Code) + ": " + output.PassUnavailable.Message
 	}
-	if _, err := fmt.Fprintf(table, "%s\t%t\t%d\t%d\t%d\t%s\t%s\t%t\t%t\n",
-		output.ComputerID, output.SubmitEnabled, output.SubmitMaxInflight,
+	revoked := "none"
+	if output.Revoked != nil {
+		revoked = fmt.Sprintf("revision %d at %s (%d grants)", output.Revoked.SubmitIntentRevision,
+			output.Revoked.CommittedAt.Format(time.RFC3339), output.Revoked.RevokedGrantCount)
+	}
+	if _, err := fmt.Fprintf(table, "%s\t%t\t%d/%d\t%d\t%d\t%s\t%s\t%t\t%t\t%s\n",
+		output.ComputerID, output.SubmitEnabled, output.InflightCount, output.SubmitMaxInflight,
 		output.SubmitIntentRevision, output.PolicyRevision, boolOrNA(output.Ready),
-		passUnavailable, output.MutationApplied, output.RevocationCommittedBeforeSuccess); err != nil {
+		passUnavailable, output.MutationApplied, output.IdempotentReplay, revoked); err != nil {
 		return err
 	}
 	return table.Flush()
@@ -259,8 +256,5 @@ func writeComputerOriginRuns(writer io.Writer, page l3.ComputerRunPage) error {
 }
 
 func int64OrNA(value int64) string {
-	if value == 0 {
-		return "N/A"
-	}
 	return strconv.FormatInt(value, 10)
 }

@@ -49,12 +49,13 @@ func TestRestoreHeartbeatFailsClosedAndReissuesRevocationBeforeDirective(t *test
 		t.Fatalf("heartbeat without revoker status=%d body=%s", status, body)
 	}
 	revocations := 0
-	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) error {
+	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 		if request.ComputerID != computer.ComputerID || !request.RevokeAll || request.Reason != "computer_restoring" {
 			t.Fatalf("restore revocation = %#v", request)
 		}
 		revocations++
-		return nil
+		return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
+			SubmitIntentRevision: request.NewSubmitIntentRevision, CommittedAt: h.clock.Now()}, nil
 	}}
 	for heartbeat := 1; heartbeat <= 2; heartbeat++ {
 		status, _, body = h.do(agentClient, http.MethodPost, "/v1/agent/nodes/"+node.NodeID+"/heartbeat", heartbeatRequestForNode(node))

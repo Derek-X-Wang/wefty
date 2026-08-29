@@ -179,6 +179,7 @@ Commands:
   computers submission <verb>
                              Enable, disable, or set Computer Run submission inflight capacity
     enable|disable|set-inflight
+                             Requires observed policy and submission revisions, or --expect-current
   runs list                  List Runs by immutable Computer origin
   submit                     Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID               Create a new run from a stored snapshot

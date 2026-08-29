@@ -122,6 +122,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/computer-token/revoke", s.authenticateFabric(http.HandlerFunc(s.revokeComputerTokens)))
 	root.Handle("/v1/computer-token/revoke-attempt", s.authenticateFabric(http.HandlerFunc(s.revokeComputerAttemptTokens)))
 	root.Handle("/v1/computer-token/revoke-host", s.authenticateFabric(http.HandlerFunc(s.revokeHostComputerTokens)))
+	root.Handle("GET /v1/computers/{computer_id}/inflight", s.authenticateFabric(http.HandlerFunc(s.getComputerInflight)))
 	s.registerComputerTokenRoutes(runs, root)
 	root.Handle("/v1/runs", s.authenticateFabric(s.authorize(runs)))
 	root.Handle("/v1/runs/", s.authenticateFabric(s.authorize(runs)))
@@ -313,11 +314,26 @@ func (s *Server) revokeComputerTokens(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.store.RevokeComputerTokens(r.Context(), request); err != nil {
+	receipt, err := s.store.RevokeComputerTokens(r.Context(), request)
+	if err != nil {
 		writeError(w, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, receipt)
+}
+
+func (s *Server) getComputerInflight(w http.ResponseWriter, r *http.Request) {
+	if identityFromRequest(r).NodeID != s.controlPlaneNodeID {
+		writeError(w, protocolError(contract.ErrorForbidden, "only the L1 control plane may read Computer inflight state"))
+		return
+	}
+	computerID := r.PathValue("computer_id")
+	count, err := s.store.CountComputerInflight(r.Context(), computerID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ComputerInflightState{ComputerID: computerID, NonterminalRootLineages: count})
 }
 
 func (s *Server) revokeComputerAttemptTokens(w http.ResponseWriter, r *http.Request) {

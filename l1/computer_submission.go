@@ -16,13 +16,11 @@ import (
 
 const DefaultComputerSubmitMaxInflight = 20
 
-const ComputerSubmissionRevocationCommittedHeader = "Wefty-Computer-Revocation-Committed"
-
 type ComputerSubmissionRequest struct {
 	PolicyRevision       int64  `json:"policy_revision"`
 	SubmitIntentRevision int64  `json:"submit_intent_revision"`
-	SubmitEnabled        bool   `json:"submit_enabled"`
-	SubmitMaxInflight    int    `json:"submit_max_inflight"`
+	SubmitEnabled        *bool  `json:"submit_enabled,omitempty"`
+	SubmitMaxInflight    *int   `json:"submit_max_inflight,omitempty"`
 	IdempotencyKey       string `json:"idempotency_key"`
 }
 
@@ -48,10 +46,17 @@ type ComputerSubmissionState struct {
 	SubmitEnabled        bool                   `json:"submit_enabled"`
 	SubmitIntentRevision int64                  `json:"submit_intent_revision"`
 	SubmitMaxInflight    int                    `json:"submit_max_inflight"`
+	InflightCount        int                    `json:"inflight_count"`
 	PolicyRevision       int64                  `json:"policy_revision"`
 	Ready                *bool                  `json:"ready"`
 	Status               string                 `json:"status,omitempty"`
 	PassUnavailable      *contract.SpawnFailure `json:"pass_unavailable,omitempty"`
+}
+
+type ComputerSubmissionMutationResult struct {
+	ComputerSubmissionState
+	MutationApplied bool                                     `json:"mutation_applied"`
+	Revoked         *contract.ComputerTokenRevocationReceipt `json:"revoked"`
 }
 
 func projectComputerSubmissionState(computer Computer, policyRevision int64) ComputerSubmissionState {
@@ -113,14 +118,18 @@ type ComputerTokenRevocation struct {
 }
 
 type ComputerTokenRevoker interface {
-	RevokeComputerTokens(context.Context, ComputerTokenRevocation) error
+	RevokeComputerTokens(context.Context, ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error)
+	CountComputerInflight(context.Context, string) (int, error)
 }
 
 func validateComputerSubmissionRequest(request ComputerSubmissionRequest) error {
 	if request.PolicyRevision < 1 || request.SubmitIntentRevision < 0 {
 		return protocolError(contract.ErrorInvalidRequest, "policy_revision must be positive and submit_intent_revision non-negative")
 	}
-	if request.SubmitMaxInflight < 1 || request.SubmitMaxInflight > 1000 {
+	if (request.SubmitEnabled == nil) == (request.SubmitMaxInflight == nil) {
+		return protocolError(contract.ErrorInvalidRequest, "exactly one Computer submission policy must be supplied")
+	}
+	if request.SubmitMaxInflight != nil && (*request.SubmitMaxInflight < 1 || *request.SubmitMaxInflight > 1000) {
 		return protocolError(contract.ErrorInvalidRequest, "submit_max_inflight must be between 1 and 1000")
 	}
 	if strings.TrimSpace(request.IdempotencyKey) == "" || len(request.IdempotencyKey) > 255 {
@@ -133,8 +142,8 @@ func computerSubmissionRequestHash(request ComputerSubmissionRequest) (string, e
 	payload, err := json.Marshal(struct {
 		PolicyRevision       int64 `json:"policy_revision"`
 		SubmitIntentRevision int64 `json:"submit_intent_revision"`
-		SubmitEnabled        bool  `json:"submit_enabled"`
-		SubmitMaxInflight    int   `json:"submit_max_inflight"`
+		SubmitEnabled        *bool `json:"submit_enabled,omitempty"`
+		SubmitMaxInflight    *int  `json:"submit_max_inflight,omitempty"`
 	}{request.PolicyRevision, request.SubmitIntentRevision, request.SubmitEnabled, request.SubmitMaxInflight})
 	if err != nil {
 		return "", internalError(err, "encode Computer submission request")
@@ -143,133 +152,164 @@ func computerSubmissionRequestHash(request ComputerSubmissionRequest) (string, e
 	return hex.EncodeToString(hash[:]), nil
 }
 
-func (s *Store) PrepareComputerSubmissionMutation(ctx context.Context, identity fabric.Identity, computerID string, request ComputerSubmissionRequest) (Computer, bool, error) {
+func (s *Store) PrepareComputerSubmissionMutation(ctx context.Context, identity fabric.Identity, computerID string, request ComputerSubmissionRequest) (Computer, bool, bool, error) {
 	if err := validateComputerSubmissionRequest(request); err != nil {
-		return Computer{}, false, err
+		return Computer{}, false, false, err
 	}
 	if err := requireCurrentAdmin(ctx, s.db, identity); err != nil {
-		return Computer{}, false, err
+		return Computer{}, false, false, err
 	}
 	requestHash, err := computerSubmissionRequestHash(request)
 	if err != nil {
-		return Computer{}, false, err
+		return Computer{}, false, false, err
 	}
 	computer, err := readComputerAuthority(ctx, s.db, computerID, canonicalTime(s.clock.Now()))
 	if errors.Is(err, sql.ErrNoRows) {
-		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
+		return Computer{}, false, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
 	}
 	if err != nil {
-		return Computer{}, false, internalError(err, "read Computer submission authority")
+		return Computer{}, false, false, internalError(err, "read Computer submission authority")
 	}
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
+		return Computer{}, false, false, protocolError(contract.ErrorConflict,
 			"Computer submission authority cannot change during reconfiguration")
 	}
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "removed Computer cannot submit Runs")
+		return Computer{}, false, false, protocolError(contract.ErrorConflict, "removed Computer cannot submit Runs")
 	}
 	var storedHash string
 	if err := s.db.QueryRowContext(ctx, `SELECT request_hash FROM computer_submission_audit
 		WHERE computer_id=? AND idempotency_key=?`, computerID, request.IdempotencyKey).Scan(&storedHash); err == nil {
 		if storedHash != requestHash {
-			return Computer{}, false, protocolError(contract.ErrorIdempotencyConflict, "Computer submission idempotency key was reused with different authority")
+			return Computer{}, false, false, protocolError(contract.ErrorIdempotencyConflict, "Computer submission idempotency key was reused with different authority")
 		}
-		return computer, true, nil
+		return computer, true, false, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		return Computer{}, false, internalError(err, "read Computer submission replay")
+		return Computer{}, false, false, internalError(err, "read Computer submission replay")
 	}
 	if computer.SubmitIntentRevision != request.SubmitIntentRevision {
-		return Computer{}, false, protocolError(contract.ErrorStalePolicyRevision, "Computer submission revision changed")
+		return Computer{}, false, false, protocolError(contract.ErrorStalePolicyRevision, "Computer submission revision changed")
 	}
 	var policyRevision int64
 	if err := s.db.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&policyRevision); err != nil {
-		return Computer{}, false, internalError(err, "read admin policy revision")
+		return Computer{}, false, false, internalError(err, "read admin policy revision")
 	}
 	if err := validatePolicyRevision(policyRevision, request.PolicyRevision); err != nil {
-		return Computer{}, false, err
+		return Computer{}, false, false, err
 	}
-	return computer, false, nil
+	return computer, false, computerSubmissionChanges(computer, request), nil
 }
 
-func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Identity, computerID string, request ComputerSubmissionRequest) (Computer, bool, error) {
+func computerSubmissionChanges(computer Computer, request ComputerSubmissionRequest) bool {
+	if request.SubmitEnabled != nil {
+		return computer.SubmitEnabled != *request.SubmitEnabled
+	}
+	return computer.SubmitMaxInflight != *request.SubmitMaxInflight
+}
+
+func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Identity, computerID string, request ComputerSubmissionRequest) (Computer, bool, bool, error) {
 	if err := validateComputerSubmissionRequest(request); err != nil {
-		return Computer{}, false, err
+		return Computer{}, false, false, err
 	}
 	requestHash, err := computerSubmissionRequestHash(request)
 	if err != nil {
-		return Computer{}, false, err
+		return Computer{}, false, false, err
 	}
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Computer{}, false, internalError(err, "begin Computer submission mutation")
+		return Computer{}, false, false, internalError(err, "begin Computer submission mutation")
 	}
 	defer tx.Rollback()
 	if err := requireCurrentAdmin(ctx, tx, identity); err != nil {
-		return Computer{}, false, err
+		return Computer{}, false, false, err
 	}
 	var storedHash string
 	if err := tx.QueryRowContext(ctx, `SELECT request_hash FROM computer_submission_audit
 		WHERE computer_id=? AND idempotency_key=?`, computerID, request.IdempotencyKey).Scan(&storedHash); err == nil {
 		if storedHash != requestHash {
-			return Computer{}, false, protocolError(contract.ErrorIdempotencyConflict, "Computer submission idempotency key was reused with different authority")
+			return Computer{}, false, false, protocolError(contract.ErrorIdempotencyConflict, "Computer submission idempotency key was reused with different authority")
 		}
 		computer, readErr := readComputerAuthority(ctx, tx, computerID, now)
-		return computer, true, readErr
+		return computer, true, false, readErr
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		return Computer{}, false, internalError(err, "read Computer submission replay")
+		return Computer{}, false, false, internalError(err, "read Computer submission replay")
 	}
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
+		return Computer{}, false, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
 	}
 	if err != nil {
-		return Computer{}, false, internalError(err, "read Computer submission authority")
+		return Computer{}, false, false, internalError(err, "read Computer submission authority")
 	}
 	if computer.SubmitIntentRevision != request.SubmitIntentRevision {
-		return Computer{}, false, protocolErrorWithDetails(contract.ErrorStalePolicyRevision,
+		return Computer{}, false, false, protocolErrorWithDetails(contract.ErrorStalePolicyRevision,
 			map[string]any{"expected_revision": computer.SubmitIntentRevision, "observed_revision": request.SubmitIntentRevision},
 			"Computer submission revision changed")
 	}
 	var policyRevision int64
 	if err := tx.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&policyRevision); err != nil {
-		return Computer{}, false, internalError(err, "read admin policy revision")
+		return Computer{}, false, false, internalError(err, "read admin policy revision")
 	}
 	if err := validatePolicyRevision(policyRevision, request.PolicyRevision); err != nil {
-		return Computer{}, false, err
+		return Computer{}, false, false, err
+	}
+	desiredEnabled, desiredMaxInflight := computer.SubmitEnabled, computer.SubmitMaxInflight
+	if request.SubmitEnabled != nil {
+		desiredEnabled = *request.SubmitEnabled
+	} else {
+		desiredMaxInflight = *request.SubmitMaxInflight
+	}
+	if !computerSubmissionChanges(computer, request) {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO computer_submission_audit(audit_id, computer_id, submit_intent_revision,
+			policy_revision, actor_fabric_id, actor_user_id, actor_device_id, previous_enabled, submit_enabled,
+			submit_max_inflight, idempotency_key, request_hash, mutation_applied, created_ns)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`, newID("computersubmissionaudit"), computerID,
+			computer.SubmitIntentRevision, policyRevision, identity.FabricID, identity.UserID, identity.DeviceID,
+			computer.SubmitEnabled, desiredEnabled, desiredMaxInflight, request.IdempotencyKey, requestHash, now.UnixNano()); err != nil {
+			return Computer{}, false, false, internalError(err, "append Computer submission no-op audit")
+		}
+		if err := tx.Commit(); err != nil {
+			return Computer{}, false, false, internalError(err, "commit Computer submission no-op")
+		}
+		return computer, false, false, nil
 	}
 	nextSubmitRevision, nextPolicyRevision := computer.SubmitIntentRevision+1, policyRevision+1
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET submit_enabled=?, submit_intent_revision=?,
 		submit_max_inflight=?, submit_policy_revision=?, updated_ns=?
-		WHERE computer_id=? AND submit_intent_revision=?`, request.SubmitEnabled, nextSubmitRevision,
-		request.SubmitMaxInflight, nextPolicyRevision, now.UnixNano(), computerID, request.SubmitIntentRevision)
+		WHERE computer_id=? AND submit_intent_revision=?`, desiredEnabled, nextSubmitRevision,
+		desiredMaxInflight, nextPolicyRevision, now.UnixNano(), computerID, request.SubmitIntentRevision)
 	if err != nil {
-		return Computer{}, false, internalError(err, "update Computer submission authority")
+		return Computer{}, false, false, internalError(err, "update Computer submission authority")
 	}
 	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
-		return Computer{}, false, protocolError(contract.ErrorStalePolicyRevision, "Computer submission revision changed")
+		return Computer{}, false, false, protocolError(contract.ErrorStalePolicyRevision, "Computer submission revision changed")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE admin_policy SET revision=?, updated_ns=? WHERE singleton=1 AND revision=?`,
 		nextPolicyRevision, now.UnixNano(), policyRevision); err != nil {
-		return Computer{}, false, internalError(err, "advance submission policy revision")
+		return Computer{}, false, false, internalError(err, "advance submission policy revision")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_submission_audit(computer_id, submit_intent_revision,
+	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET healthy_since_ns=NULL, published_attempt_id=NULL,
+		display_endpoint=NULL WHERE job_id=?`, computer.CurrentJobID); err != nil {
+		return Computer{}, false, false, internalError(err, "invalidate Computer readiness after submission authority change")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_submission_audit(audit_id, computer_id, submit_intent_revision,
 		policy_revision, actor_fabric_id, actor_user_id, actor_device_id, previous_enabled, submit_enabled,
-		submit_max_inflight, idempotency_key, request_hash, created_ns) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		computerID, nextSubmitRevision, nextPolicyRevision, identity.FabricID, identity.UserID, identity.DeviceID,
-		computer.SubmitEnabled, request.SubmitEnabled, request.SubmitMaxInflight, request.IdempotencyKey, requestHash,
+		submit_max_inflight, idempotency_key, request_hash, mutation_applied, created_ns) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+		newID("computersubmissionaudit"), computerID, nextSubmitRevision, nextPolicyRevision, identity.FabricID, identity.UserID, identity.DeviceID,
+		computer.SubmitEnabled, desiredEnabled, desiredMaxInflight, request.IdempotencyKey, requestHash,
 		now.UnixNano()); err != nil {
-		return Computer{}, false, internalError(err, "append Computer submission audit")
+		return Computer{}, false, false, internalError(err, "append Computer submission audit")
 	}
 	computer, err = readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
-		return Computer{}, false, internalError(err, "read mutated Computer submission authority")
+		return Computer{}, false, false, internalError(err, "read mutated Computer submission authority")
 	}
 	if err := tx.Commit(); err != nil {
-		return Computer{}, false, internalError(err, "commit Computer submission mutation")
+		return Computer{}, false, false, internalError(err, "commit Computer submission mutation")
 	}
 	s.notifyComputerPolicyChanged()
-	return computer, false, nil
+	return computer, false, true, nil
 }
 
 func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attemptID, hostIdentityNodeID, hostNodeID string) (ComputerTokenScopeProof, error) {
