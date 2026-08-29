@@ -280,7 +280,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		t.Fatal("Wayland image must remove ldconfig's nondeterministic cache after both invocations")
 	}
 	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "WLR_BACKENDS=headless", "WLR_RENDERER=pixman", "WLR_HEADLESS_OUTPUTS=1")
-	assertFileContains(t, "../examples/computer-wayland/entrypoint.sh", "wayvnc -w", "--disable-input", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "surface-ready", "view-edge-ready", "control-edge-ready")
+	assertFileContains(t, "../examples/computer-wayland/entrypoint.sh", "wayvnc -w", "--disable-input", "--app=http://127.0.0.1:18888/", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "surface-ready", "view-edge-ready", "control-edge-ready")
 	assertFileNotContains(t, "../examples/computer-wayland/entrypoint.sh", "WEFTY_CONFORMANCE_MUTATION", "WEFTY_WAYVNC_RECORD_INPUT")
 	assertFileContains(t, "../examples/computer-wayland/watch-driver.py", "/wefty/control/driver.json", "type(value[\"version\"]) is not int", "os.replace")
 	assertFileContains(t, "../examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch", "GET /websockify", "Sec-WebSocket-Protocol: binary", "WS_OPCODE_TEXT", "wefty_mutation_hooks", "view-edge-ready", "control-edge-ready")
@@ -288,7 +288,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../examples/computer-wayland/surface.py", "input-oracle.json", "def wefty_record_input", "Record only events delivered through Sway", `"wev"`, "wl_keyboard", `"swaymsg"`, "focus_keyboard_oracle", `self.path not in ("/surface-ready", "/input")`, "agent-state-surface.json", "theme-surface.json", "os.replace")
 	assertFileContains(t, "../examples/computer-wayland/oracle.html", "pointermove", "'/input'", "'/surface-ready'")
 	assertFileNotContains(t, "../examples/computer-wayland/oracle.html", "keydown", "keyup")
-	assertFileContains(t, "../examples/computer-wayland/sway-config", `app_id="chromium"`, "fullscreen enable", `app_id="wev"`, "opacity set 0.0", "floating enable", "resize set width 32 px height 32 px", "focus")
+	assertFileContains(t, "../examples/computer-wayland/sway-config", `app_id="chromium"`, "border none", "fullscreen enable", `app_id="wev"`, "opacity set 0.0", "floating enable", "resize set width 32 px height 32 px", "focus")
 	assertFileContains(t, "../examples/computer-wayland/LICENSES.md", "Herdr", "Apache-2.0", "no code or assets copied", "no code, assets, installer, name, or branding copied")
 	assertFileContains(t, "../scripts/test-computer-wayland-furniture.sh", "test ! -e /dev/dri", "agent-state-surface.json", "theme-surface.json", "crash-briefing.json", "idle_rss_bytes", "wefty-verify-licenses --check", `type == "number"`)
 	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", "cmd/wefty-computer-conformance", "--input-oracle-path", "--driver-oracle-path", "executed_rows", ".executed_rows == 20", "Dockerfile.wayland-text")
