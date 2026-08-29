@@ -485,7 +485,7 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 	sweepOK := snapshot.SweepReceiptRecorded && snapshot.SweepReceipt.SweepEpoch != "" &&
 		snapshot.SweepReceipt.HelperSession.HelperInstanceID == snapshot.InstanceID &&
 		snapshot.SweepReceipt.HelperSession.SessionGeneration == snapshot.SessionGeneration &&
-		ocihelper.InventoryEmpty(snapshot.SweepReceipt.VerifiedInventory)
+		snapshot.SweepReceipt.VerifiedAbsent
 	if snapshot.SweepReceiptRecorded {
 		report.Findings = append(report.Findings, finding("boot-sweep", diagnosticReceipt{ran: true, passed: sweepOK, code: map[bool]string{true: "oci_boot_sweep_verified", false: "oci_boot_sweep_failed"}[sweepOK], reasonCode: reasonUnless(sweepOK, contract.CapabilityReasonBootSweepFailed), detail: "the barrier-pinned namespace sweep receipt was checked without running a sweep"}))
 	} else {

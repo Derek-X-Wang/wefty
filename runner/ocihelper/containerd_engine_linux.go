@@ -163,7 +163,7 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 		config.LogSealTimeout = 5 * time.Second
 	}
 	if config.TaskReleaseTimeout <= 0 {
-		config.TaskReleaseTimeout = defaultTaskReleaseTimeout
+		config.TaskReleaseTimeout = DefaultTaskReleaseTimeout
 	}
 	if config.HandoffRetention <= 0 {
 		config.HandoffRetention = defaultHandoffRetention
@@ -849,10 +849,10 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			runErr = errors.Join(runErr, engine.deleteResources(cleanupCtx, request.Authority, request.Resources, computerDisk))
 			verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
 			runErr = errors.Join(runErr, verifyErr)
-			// Handoff, service-data, and computer-disk resources outlive one
-			// attempt by contract. Their retained inventory cannot prevent the
-			// failed attempt's runtime resources from being proven absent.
-			runtimeAbsent := InventoryEmpty(withoutDurableDataInventory(verification.Inventory))
+			// Service data volumes, retained handoff bindings, and Computer disk
+			// resources outlive one attempt. Verify computes runtime absence from
+			// that retention-aware projection while returning observed inventory.
+			runtimeAbsent := verification.Absent
 			if verifyErr == nil && runtimeAbsent {
 				runErr = errors.Join(runErr, engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()))
 				for _, port := range endpoints {
@@ -1391,6 +1391,13 @@ func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatu
 		attempt.oom = true
 	}
 	attempt.mu.Unlock()
+	// Task.Wait was registered with the attempt lease context before Start.
+	// Release that completed wait and its lease-scoped client work before
+	// Task.Delete asks containerd to drain the shim logger. Leaving the context
+	// live made every ordinary task deletion consume the full release bound.
+	if attempt.cancel != nil {
+		attempt.cancel()
+	}
 	if err := publishTerminalAfterTaskRelease(releaseTimeout, attempt.releaseTask, attempt.terminalReady); err != nil {
 		log.Printf("release exited OCI task %s before log sealing: %v", attempt.authority.AttemptID, err)
 	}
@@ -1444,11 +1451,10 @@ func (engine *ContainerdEngine) Delete(ctx context.Context, request DeleteReques
 		if identityErr == nil {
 			deleteErr := engine.deleteResources(cleanupCtx, request.Authority, resources, computerDisk)
 			verification, verifyErr := engine.Verify(cleanupCtx, VerifyRequest{Scope: VerifyAttempt, Authority: &request.Authority})
-			// Durable managed data is finalized separately from an attempt.
-			// Project it out for every workload class so an owner-key handoff
-			// retained by a one-shot cannot turn successful runtime deletion
-			// into a full cleanup-timeout failure.
-			runtimeAbsent := InventoryEmpty(withoutDurableDataInventory(verification.Inventory))
+			// Service data volumes and retained owner-key handoff bindings are
+			// finalized separately from an attempt. Verify keeps them visible in
+			// inventory while projecting only unexpired bindings from absence.
+			runtimeAbsent := verification.Absent
 			if deleteErr == nil && verifyErr == nil && runtimeAbsent {
 				if releaseErr := engine.releaseVerifiedAttempt(cleanupCtx, request.Authority.key()); releaseErr == nil {
 					return DeleteResponse{Deleted: true}, nil
@@ -1953,17 +1959,16 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 		engine.mu.Unlock()
 		inventory = filterInventory(inventory, resources, computerDisk)
 	}
-	// Managed data has an owner lifetime beyond one attempt, so attempt
-	// verification retains it for explicit finalization while namespace
-	// quiescence projects it out.
-	if request.Scope == VerifyNamespace {
-		inventory = withoutDurableDataInventory(inventory)
+	observed := inventory
+	projected, err := engine.runtimeAbsenceInventory(observed, time.Now())
+	if err != nil {
+		return VerifyResponse{}, err
 	}
-	absent := InventoryEmpty(inventory)
+	absent := InventoryEmpty(projected)
 	if absent && request.Scope == VerifyNamespace {
 		engine.releaseVerifiedNamespace()
 	}
-	return VerifyResponse{Absent: absent, Inventory: inventory}, nil
+	return VerifyResponse{Absent: absent, Inventory: observed}, nil
 }
 
 func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
@@ -2166,7 +2171,7 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 		attemptList = append(attemptList, attempt)
 	}
 	sort.Slice(attemptList, func(i, j int) bool { return attemptList[i].AttemptID < attemptList[j].AttemptID })
-	return SweepResponse{Removed: inventoryCount(withoutDurableDataInventory(inventory)), PriorBootSessionsSeen: priorList, Inventory: inventory, Attempts: attemptList}, nil
+	return SweepResponse{Removed: inventoryCount(withoutRetainedBindingInventory(inventory)), PriorBootSessionsSeen: priorList, Inventory: inventory, Attempts: attemptList}, nil
 }
 
 func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
@@ -3097,7 +3102,7 @@ func withoutServiceDataInventory(inventory ResourceInventory) ResourceInventory 
 	return inventory
 }
 
-func withoutDurableDataInventory(inventory ResourceInventory) ResourceInventory {
+func withoutRetainedBindingInventory(inventory ResourceInventory) ResourceInventory {
 	inventory = withoutServiceDataInventory(inventory)
 	inventory.ManagedVolumes = slices.DeleteFunc(inventory.ManagedVolumes, func(name string) bool {
 		return strings.HasPrefix(name, "wefty-handoff-volume-")
@@ -3107,6 +3112,50 @@ func withoutDurableDataInventory(inventory ResourceInventory) ResourceInventory 
 	inventory.ComputerDiskQuotas = []string{}
 	inventory.ComputerDiskManifests = []string{}
 	return inventory
+}
+
+func (engine *ContainerdEngine) runtimeAbsenceInventory(inventory ResourceInventory, now time.Time) (ResourceInventory, error) {
+	retention := engine.config.HandoffRetention
+	if retention <= 0 {
+		retention = defaultHandoffRetention
+	}
+	return projectRuntimeAbsenceInventory(inventory, func(name string) (bool, error) {
+		info, err := os.Stat(filepath.Join(engine.config.RuntimeRoot, "handoffs", name))
+		if errors.Is(err, os.ErrNotExist) {
+			// A concurrently removed inventory entry cannot be retained evidence;
+			// keeping it in the projection makes the next verification retry prove
+			// absence from a fresh observation.
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return now.Sub(info.ModTime()) < retention, nil
+	})
+}
+
+func projectRuntimeAbsenceInventory(inventory ResourceInventory, retainedHandoff func(string) (bool, error)) (ResourceInventory, error) {
+	projected := withoutServiceDataInventory(cloneResourceInventory(inventory))
+	volumes := make([]string, 0, len(projected.ManagedVolumes))
+	for _, name := range projected.ManagedVolumes {
+		if !strings.HasPrefix(name, "wefty-handoff-volume-") {
+			volumes = append(volumes, name)
+			continue
+		}
+		retained, err := retainedHandoff(name)
+		if err != nil {
+			return ResourceInventory{}, err
+		}
+		if !retained {
+			volumes = append(volumes, name)
+		}
+	}
+	projected.ManagedVolumes = volumes
+	projected.ComputerDiskImages = []string{}
+	projected.ComputerDiskAllocations = []string{}
+	projected.ComputerDiskQuotas = []string{}
+	projected.ComputerDiskManifests = []string{}
+	return projected, nil
 }
 
 func captureSweepAuthority(authority AttemptAuthority, prior map[string]struct{}, attempts map[string]SweptAttemptAuthority) {

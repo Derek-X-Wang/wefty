@@ -75,6 +75,9 @@ func TestContainerdTerminalPublicationReleasesTaskSealsLogsAndRetainsOOM(t *test
 		stderr:          stderr,
 		terminalReady:   ready,
 		logAcknowledged: make(map[string]uint64),
+		cancel: func() {
+			record("cancel Wait context")
+		},
 		releaseTask: func(context.Context) error {
 			record("Task.Delete")
 			close(taskDeleteEntered)
@@ -143,13 +146,13 @@ func TestContainerdTerminalPublicationReleasesTaskSealsLogsAndRetainsOOM(t *test
 	orderMu.Lock()
 	observedOrder := append([]string(nil), order...)
 	orderMu.Unlock()
-	for _, event := range []string{"Wait", "Task.Delete", "logger EOF stdout", "stdout seal", "logger EOF stderr", "stderr seal", "terminal completion"} {
+	for _, event := range []string{"Wait", "cancel Wait context", "Task.Delete", "logger EOF stdout", "stdout seal", "logger EOF stderr", "stderr seal", "terminal completion"} {
 		if !slices.Contains(observedOrder, event) {
 			t.Fatalf("terminal ordering omitted %q: %v", event, observedOrder)
 		}
 	}
 	index := func(event string) int { return slices.Index(observedOrder, event) }
-	if index("Wait") > index("Task.Delete") || index("Task.Delete") > index("stdout seal") || index("Task.Delete") > index("stderr seal") || index("stdout seal") > index("terminal completion") || index("stderr seal") > index("terminal completion") {
+	if index("Wait") > index("cancel Wait context") || index("cancel Wait context") > index("Task.Delete") || index("Task.Delete") > index("stdout seal") || index("Task.Delete") > index("stderr seal") || index("stdout seal") > index("terminal completion") || index("stderr seal") > index("terminal completion") {
 		t.Fatalf("terminal ordering = %v", observedOrder)
 	}
 }

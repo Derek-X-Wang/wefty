@@ -374,7 +374,8 @@ func TestAdapterRequiresPositiveDeleteReceipt(t *testing.T) {
 func TestAdapterConsumesMatchingPriorBootSweepEvidenceOnce(t *testing.T) {
 	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
 		SweepEpoch: "sweep-1", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-1", SessionGeneration: 7},
-		Attempts: []ocihelper.SweptAttemptAuthority{{NodeID: "node", JobID: "job", AttemptID: "attempt", FencingToken: "fence", PriorBootSessionID: "boot-old", Class: contract.JobClassService, RemovalGeneration: "remove-1"}},
+		VerifiedAbsent: true,
+		Attempts:       []ocihelper.SweptAttemptAuthority{{NodeID: "node", JobID: "job", AttemptID: "attempt", FencingToken: "fence", PriorBootSessionID: "boot-old", Class: contract.JobClassService, RemovalGeneration: "remove-1"}},
 	}}
 	adapter := NewAdapter(source)
 	request := workloadrunner.PriorBootReapRequest{NodeID: "node", JobID: "job", PriorBootSessionID: "boot-old", CurrentBootSessionID: "boot-new"}
@@ -456,6 +457,7 @@ func TestAdapterConsumesExactSameBootSweepEvidenceOnce(t *testing.T) {
 	}
 	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
 		SweepEpoch: "sweep-1", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-2", SessionGeneration: 8},
+		VerifiedAbsent:    true,
 		VerifiedInventory: emptyAdapterInventory(),
 		Attempts: []ocihelper.SweptAttemptAuthority{{
 			NodeID: authority.NodeID, JobID: authority.JobID, AttemptID: authority.AttemptID,
@@ -588,6 +590,51 @@ func TestAdapterServiceCancellationUsesTermBeforeKill(t *testing.T) {
 				t.Fatalf("signals = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestAdapterIgnoreTERMWaitsForSlowPostKILLReleaseWithinStopBudget(t *testing.T) {
+	engine := &adapterTestEngine{
+		watchSignals: make(chan ocihelper.Signal, 2),
+		ignoreTERM:   true,
+		releaseDelay: 250 * time.Millisecond,
+	}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.LifetimeBoundary = workloadrunner.AgentBootLifetime
+	request.TerminationGrace = 50 * time.Millisecond
+	started := make(chan struct{})
+	request.Started = func() { close(started) }
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct {
+		result workloadrunner.Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := adapter.Run(ctx, request, nil)
+		done <- struct {
+			result workloadrunner.Result
+			err    error
+		}{result: result, err: err}
+	}()
+	<-started
+	stopStarted := time.Now()
+	cancel()
+	finished := <-done
+	elapsed := time.Since(stopStarted)
+	if finished.err != nil || finished.result.Outcome.Signal != "killed" || finished.result.Outcome.TerminationCause != contract.TerminationCauseAgent {
+		t.Fatalf("slow-release cancellation outcome = (%+v, %v)", finished.result.Outcome, finished.err)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("TERM -> grace -> KILL -> release took %s, want margin below the 10s acceptance budget", elapsed)
+	}
+	engine.mu.Lock()
+	got := slices.Clone(engine.signals)
+	engine.mu.Unlock()
+	if !slices.Equal(got, []ocihelper.Signal{ocihelper.SignalTERM, ocihelper.SignalKILL}) {
+		t.Fatalf("signals = %v, want TERM then KILL", got)
 	}
 }
 
@@ -1199,6 +1246,7 @@ type adapterTestEngine struct {
 	watchSignals       chan ocihelper.Signal
 	ignoreTERM         bool
 	ignoreKILL         bool
+	releaseDelay       time.Duration
 	blockSignal        bool
 	signals            []ocihelper.Signal
 	watchErrorOnCancel bool
@@ -1341,6 +1389,15 @@ func (engine *adapterTestEngine) Watch(ctx context.Context, _ ocihelper.WatchReq
 	}
 	if engine.watchSignals != nil {
 		signal := <-engine.watchSignals
+		if engine.releaseDelay > 0 {
+			timer := time.NewTimer(engine.releaseDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
 		engine.watch = ocihelper.WatchResponse{Signal: signal, TerminationCause: "agent"}
 	}
 	if engine.watchErrorOnCancel {

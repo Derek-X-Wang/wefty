@@ -109,8 +109,11 @@ socket activation can start a fresh helper and boot sweep; the failed process
 never restores authority or remains indefinitely `session_busy`.
 
 The client boundary exposes runtime loss as a typed error only for an active
-session's transport disappearance, `session_stale`, `engine_failure`, or an
-explicit image `engine_loss` fact. Caller cancellation, deadlines owned by the
+session's transport disappearance, `session_stale`, an `engine_failure` that
+is not a bounded `Delete` cancellation/deadline, or an explicit image
+`engine_loss` fact. A typed `Delete` `deadline_exceeded` or `canceled` fact is
+attempt-scoped cleanup failure and does not invalidate the live session.
+Caller cancellation, deadlines owned by the
 caller, `sweep_required`, validation/policy refusals, digest disagreement, and
 unknown agent errors never manufacture runtime-loss evidence. A stop-specific
 Signal deadline is runtime loss because the independently bounded helper RPC
@@ -121,7 +124,8 @@ Unary `engine_failure` responses include only a closed mechanics fact naming
 the helper method and one sanitized reason (`deadline_exceeded`, `canceled`,
 `permission_denied`, or `operation_failed`). Raw privileged error text,
 containerd types, and host paths remain local, while CI and callers can still
-distinguish which operation and bounded failure class lost runtime authority.
+distinguish the operation and bounded failure class before applying the
+runtime-loss rule above.
 
 ## Boot sweep barrier
 
@@ -483,9 +487,12 @@ attempt namespace. `Delete` reaps and verifies the attempt while retaining its
 handoff volume. Session reap and boot sweep likewise leave unexpired handoffs
 intact; reuse refreshes the default 24-hour retry age, and sweep removes only
 expired direct children with the deterministic handoff prefix. Attempt and
-namespace quiescence therefore project those retained durable handoffs out of
-their absence decision while keeping them visible in inventory for the narrow
-explicit finalizer. The narrow
+namespace quiescence therefore project only unexpired handoff volumes (the
+retained bindings) out of their absence decision. `Verify` returns the
+observed inventory unchanged, and the boot receipt records both
+`verified_absent` and that inventory, so an expired handoff left behind by a
+failed sweep remains visible residue rather than passing by name prefix. The
+narrow
 `DeleteManagedVolume(kind, owner_key)` operation is closed to `handoff` and
 `service_data`. It derives exactly one helper-owned identity, removes only that
 volume (and, for service data, its paired owner record), and returns success

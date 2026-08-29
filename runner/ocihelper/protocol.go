@@ -108,8 +108,41 @@ type RPCError struct {
 // operation. It deliberately carries no containerd type, host path, or raw
 // privileged error text.
 type EngineFailureFact struct {
-	Operation Method `json:"operation"`
-	Reason    string `json:"reason"`
+	Operation Method              `json:"operation"`
+	Reason    EngineFailureReason `json:"reason"`
+}
+
+// EngineFailureReason is the closed, sanitized mechanics vocabulary allowed
+// to cross the helper boundary for an engine failure.
+type EngineFailureReason string
+
+const (
+	EngineFailureDeadlineExceeded EngineFailureReason = "deadline_exceeded"
+	EngineFailureCanceled         EngineFailureReason = "canceled"
+	EngineFailurePermissionDenied EngineFailureReason = "permission_denied"
+	EngineFailureOperationFailed  EngineFailureReason = "operation_failed"
+)
+
+func (reason EngineFailureReason) valid() bool {
+	switch reason {
+	case EngineFailureDeadlineExceeded, EngineFailureCanceled, EngineFailurePermissionDenied, EngineFailureOperationFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func (reason *EngineFailureReason) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	decoded := EngineFailureReason(value)
+	if !decoded.valid() {
+		return fmt.Errorf("unknown engine failure reason %q", value)
+	}
+	*reason = decoded
+	return nil
 }
 
 type MemoryFailureFact struct {
@@ -1245,6 +1278,7 @@ type VerifiedSweepReceipt struct {
 	HelperSession         HelperSession           `json:"helper_session"`
 	PriorBootSessionsSeen []string                `json:"prior_boot_sessions_seen"`
 	SweptInventory        ResourceInventory       `json:"swept_inventory"`
+	VerifiedAbsent        bool                    `json:"verified_absent"`
 	VerifiedInventory     ResourceInventory       `json:"verified_inventory"`
 	Attempts              []SweptAttemptAuthority `json:"attempts"`
 }

@@ -64,7 +64,7 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 				SweepReceiptRecorded: true,
 				SweepReceipt: ocihelper.VerifiedSweepReceipt{SweepEpoch: "sweep-1", HelperSession: ocihelper.HelperSession{
 					HelperInstanceID: "helper-instance", SessionGeneration: 7,
-				}},
+				}, VerifiedAbsent: true},
 			}, nil
 		},
 		SetupStatePath: "/var/lib/wefty/setup.json",

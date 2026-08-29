@@ -275,7 +275,7 @@ func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("startup verify OCI runtime namespace: %w", err)
 	}
-	if !verification.Absent || !InventoryEmpty(verification.Inventory) {
+	if !verification.Absent {
 		return fmt.Errorf("startup verify OCI runtime namespace: residue remains after sweep: %+v", verification.Inventory)
 	}
 	server.sessionMu.Lock()
@@ -353,7 +353,7 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 	}
 	capability, err := randomCapability()
 	if err != nil {
-		_ = writeFailure(wire, CodeEngineFailure, "session capability generation failed")
+		_ = writeRPCError(wire, engineFailureRPC(MethodAcquireSession, "session capability generation failed", EngineFailureOperationFailed))
 		return
 	}
 	now := server.config.Clock.Now()
@@ -681,27 +681,27 @@ func endpointAllocationMatches(requested []string, allocated map[string]uint16) 
 
 func (session *serverSession) completeAttempt(request RunRequest, attempt *serverAttempt, response *RunResponse) *RPCError {
 	if !response.Started {
-		return &RPCError{Code: CodeEngineFailure, Message: "engine Run returned without authoritative Started evidence"}
+		return engineFailureRPC(MethodRun, "engine Run returned without authoritative Started evidence", EngineFailureOperationFailed)
 	}
 	if response.StartedAt.IsZero() {
-		return &RPCError{Code: CodeEngineFailure, Message: "engine Run returned without the authoritative Started timestamp"}
+		return engineFailureRPC(MethodRun, "engine Run returned without the authoritative Started timestamp", EngineFailureOperationFailed)
 	}
 	response.StartedAt = response.StartedAt.UTC().Round(0)
 	if response.HostBridgeReady && !request.EnableHostBridgeFallback {
-		return &RPCError{Code: CodeEngineFailure, Message: "engine enabled an unrequested host bridge fallback"}
+		return engineFailureRPC(MethodRun, "engine enabled an unrequested host bridge fallback", EngineFailureOperationFailed)
 	}
 	if response.HostBridgeReady != (response.HostBridgeEndpoint != "") {
-		return &RPCError{Code: CodeEngineFailure, Message: "engine host bridge endpoint evidence is inconsistent"}
+		return engineFailureRPC(MethodRun, "engine host bridge endpoint evidence is inconsistent", EngineFailureOperationFailed)
 	}
 	if !endpointAllocationMatches(request.AllocateEndpoints, response.Endpoints) {
-		return &RPCError{Code: CodeEngineFailure, Message: "engine endpoint allocation did not match the request"}
+		return engineFailureRPC(MethodRun, "engine endpoint allocation did not match the request", EngineFailureOperationFailed)
 	}
 	bridgeCapability := ""
 	var err error
 	if response.HostBridgeReady {
 		bridgeCapability, err = randomCapability()
 		if err != nil {
-			return &RPCError{Code: CodeEngineFailure, Message: "bridge capability generation failed"}
+			return engineFailureRPC(MethodRun, "bridge capability generation failed", EngineFailureOperationFailed)
 		}
 	}
 	session.mu.Lock()
@@ -859,7 +859,7 @@ func (session *serverSession) authorizeDelete(ctx context.Context, authority Att
 			case <-reaped:
 				continue
 			case <-ctx.Done():
-				return nil, false, &RPCError{Code: CodeEngineFailure, Message: "guardian attempt reap was not confirmed"}
+				return nil, false, engineFailureRPC(MethodDelete, "guardian attempt reap was not confirmed", engineFailureReason(ctx.Err()))
 			}
 		}
 		if attempt.state == attemptTombstoned && attempt.guardianReaped && !attempt.guardianDelete {
@@ -924,7 +924,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				timeout = 10 * time.Minute
 			}
 			if err := operation.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-				_ = writeFailure(wire, CodeEngineFailure, "bound OCI archive upload deadline")
+				_ = writeRPCError(wire, engineFailureRPC(MethodEnsureImage, "bound OCI archive upload deadline", EngineFailureOperationFailed))
 				return
 			}
 			if err := writeSuccess(wire, struct{}{}); err != nil {
@@ -1088,7 +1088,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			} else if errors.As(err, &imageUnavailable) {
 				_ = writeFailure(wire, CodeImageUnavailable, "pinned local OCI image is unavailable")
 			} else {
-				_ = writeFailure(wire, CodeEngineFailure, "OCI engine operation failed")
+				_ = writeRPCError(wire, engineFailureRPC(MethodRun, "OCI engine operation failed", engineFailureReason(err)))
 			}
 			return
 		}
@@ -1177,7 +1177,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				return operation.ctx.Err()
 			}
 		})
-		writeStreamResult(wire, err)
+		writeStreamResult(wire, request.Method, err)
 	case MethodDelete:
 		var body DeleteRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1626,16 +1626,7 @@ func writeEngineResponseWithMethod(connection *framedConn, method Method, respon
 		if errors.As(err, &serviceDataRejection) {
 			return writeFailure(connection, CodeOCISpecRejected, serviceDataRejection.Error())
 		}
-		reason := "operation_failed"
-		switch {
-		case errors.Is(err, context.DeadlineExceeded):
-			reason = "deadline_exceeded"
-		case errors.Is(err, context.Canceled):
-			reason = "canceled"
-		case errors.Is(err, os.ErrPermission):
-			reason = "permission_denied"
-		}
-		return writeRPCError(connection, &RPCError{Code: CodeEngineFailure, Message: "OCI engine operation failed", EngineFailure: &EngineFailureFact{Operation: method, Reason: reason}})
+		return writeRPCError(connection, engineFailureRPC(method, "OCI engine operation failed", engineFailureReason(err)))
 	}
 	return writeSuccess(connection, response)
 }
@@ -1647,12 +1638,29 @@ func writeDiagnosticResponse(connection *framedConn, response any, err error) er
 	return writeSuccess(connection, response)
 }
 
-func writeStreamResult(connection *framedConn, err error) {
+func writeStreamResult(connection *framedConn, method Method, err error) {
 	if err != nil {
-		_ = writeFailure(connection, CodeEngineFailure, "OCI engine operation failed")
+		_ = writeRPCError(connection, engineFailureRPC(method, "OCI engine operation failed", engineFailureReason(err)))
 		return
 	}
 	_ = connection.write(frame{Version: ProtocolVersion, OK: true})
+}
+
+func engineFailureRPC(method Method, message string, reason EngineFailureReason) *RPCError {
+	return &RPCError{Code: CodeEngineFailure, Message: message, EngineFailure: &EngineFailureFact{Operation: method, Reason: reason}}
+}
+
+func engineFailureReason(err error) EngineFailureReason {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return EngineFailureDeadlineExceeded
+	case errors.Is(err, context.Canceled):
+		return EngineFailureCanceled
+	case errors.Is(err, os.ErrPermission):
+		return EngineFailurePermissionDenied
+	default:
+		return EngineFailureOperationFailed
+	}
 }
 
 func writeImageStreamResult(connection *framedConn, err error) {

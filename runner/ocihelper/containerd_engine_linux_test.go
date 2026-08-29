@@ -894,7 +894,7 @@ func TestHandoffInventoryUsesDurableHandoffsRoot(t *testing.T) {
 	}
 }
 
-func TestDurableHandoffInventoryIsNotAttemptOrNamespaceResidue(t *testing.T) {
+func TestRetainedHandoffProjectionKeepsObservedInventoryAndExpiredResidue(t *testing.T) {
 	handoff, err := DeterministicHandoffVolumeDirectory("retained-owner")
 	if err != nil {
 		t.Fatal(err)
@@ -903,13 +903,27 @@ func TestDurableHandoffInventoryIsNotAttemptOrNamespaceResidue(t *testing.T) {
 		ManagedVolumes: []string{handoff, "wefty-service-volume-retained", "unexpected-volume"},
 		Containers:     []string{"unexpected-container"},
 	}
-	projected := withoutDurableDataInventory(inventory)
+	projected, err := projectRuntimeAbsenceInventory(inventory, func(name string) (bool, error) {
+		return name == handoff, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if slices.Contains(projected.ManagedVolumes, handoff) || slices.Contains(projected.ManagedVolumes, "wefty-service-volume-retained") {
-		t.Fatalf("durable data remained in quiescence projection: %+v", projected)
+		t.Fatalf("retained binding or service data remained in quiescence projection: %+v", projected)
 	}
 	if !slices.Equal(projected.ManagedVolumes, []string{"unexpected-volume"}) ||
 		!slices.Equal(projected.Containers, []string{"unexpected-container"}) {
 		t.Fatalf("quiescence projection hid runtime residue: %+v", projected)
+	}
+	if !slices.Equal(inventory.ManagedVolumes, []string{handoff, "wefty-service-volume-retained", "unexpected-volume"}) {
+		t.Fatalf("projection mutated observed inventory: %+v", inventory)
+	}
+	expired, err := projectRuntimeAbsenceInventory(ResourceInventory{ManagedVolumes: []string{handoff}}, func(string) (bool, error) {
+		return false, nil
+	})
+	if err != nil || !slices.Equal(expired.ManagedVolumes, []string{handoff}) {
+		t.Fatalf("expired handoff was projected as retained: inventory=%+v err=%v", expired, err)
 	}
 }
 

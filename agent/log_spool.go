@@ -821,6 +821,16 @@ WHERE attempt_id=? AND result_json IS NULL AND incomplete_json IS NULL
 	return nil
 }
 
+// suppressCompletion removes only replayable terminal evidence. Node-local
+// service intent-stop still needs the attempt identity, logs, and runtime
+// manifest to survive until lease expiry and any later removal/finalization.
+func (spool *logSpool) suppressCompletion(ctx context.Context, attemptID string) error {
+	if _, err := spool.db.ExecContext(ctx, `UPDATE spool_attempts SET result_json=NULL, finished_ns=NULL WHERE attempt_id=?`, attemptID); err != nil {
+		return fmt.Errorf("agent: suppress durable completion replay: %w", err)
+	}
+	return nil
+}
+
 func (spool *logSpool) replaceBatchWithReplayGaps(ctx context.Context, attemptID string, batch []durableSpoolEvent) error {
 	byStream := make(map[contract.LogStream][]durableSpoolEvent, 2)
 	for _, stored := range batch {
