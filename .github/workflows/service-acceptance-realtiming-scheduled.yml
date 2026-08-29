@@ -79,7 +79,7 @@ jobs:
       matrix:
         os: [macos-15, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 100
     env:
       IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
       COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-reference
@@ -348,13 +348,26 @@ jobs:
           sudo chmod 0755 /usr/local/libexec/wefty-oci-fault-supervisor
           sudo sh -c 'nohup /usr/local/libexec/wefty-oci-fault-supervisor >/tmp/wefty-oci-fault-supervisor.log 2>&1 &'
           runner_job_uid="$(id -u)"
-          runner_listener_pid="$(pgrep -o -f '[R]unner.Listener')"
-          test -n "$runner_listener_pid"
-          runner_listener_uid="$(ps -o uid= -p "$runner_listener_pid" | tr -d ' ')"
-          runner_listener_owner="$(ps -o user= -p "$runner_listener_pid" | tr -d ' ')"
-          test "$runner_job_uid" -ne 0
-          test "$runner_listener_uid" -ne 0
-          test -n "$runner_listener_owner"
+          if test "$runner_job_uid" -eq 0; then
+            printf '%s\n' '::error::the workflow job is unexpectedly running as root'
+            exit 1
+          fi
+          if ! runner_listener_pid="$(pgrep -o -f '[R]unner.Listener')" || test -z "$runner_listener_pid"; then
+            printf '%s\n' '::error::Runner.Listener process was not found'
+            exit 1
+          fi
+          if ! runner_listener_uid="$(ps -o uid= -p "$runner_listener_pid" | tr -d ' ')" || test -z "$runner_listener_uid"; then
+            printf '%s\n' '::error::Runner.Listener uid could not be read'
+            exit 1
+          fi
+          if ! runner_listener_owner="$(ps -o user= -p "$runner_listener_pid" | tr -d ' ')" || test -z "$runner_listener_owner"; then
+            printf '%s\n' '::error::Runner.Listener owner could not be read'
+            exit 1
+          fi
+          if test "$runner_listener_uid" -eq 0; then
+            printf '%s\n' '::error::Runner.Listener is unexpectedly running as root'
+            exit 1
+          fi
           {
             /usr/local/bin/containerd --version
             /usr/local/sbin/runc --version
