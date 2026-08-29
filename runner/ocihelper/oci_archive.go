@@ -30,6 +30,16 @@ const (
 
 var errOCIArchiveTooLarge = errors.New("OCI archive exceeds the helper byte bound")
 
+// ociArchiveInspectionError marks an archive rejection whose quoted,
+// input-derived reason is safe to expose as helper mechanics evidence.
+type ociArchiveInspectionError struct{ reason string }
+
+func (err *ociArchiveInspectionError) Error() string { return err.reason }
+
+func archiveInspectionErrorf(format string, arguments ...any) error {
+	return &ociArchiveInspectionError{reason: fmt.Sprintf(format, arguments...)}
+}
+
 type ociArchiveInspection struct {
 	Path           string
 	Reference      string
@@ -103,8 +113,11 @@ func inspectOCIArchiveWithSpoolForPlatform(ctx context.Context, runtimeRoot stri
 		}
 		rawName := strings.TrimPrefix(header.Name, "./")
 		name := path.Clean(rawName)
+		if name == "." && header.FileInfo().IsDir() && (header.Name == "." || header.Name == "./") {
+			continue
+		}
 		if name == "." || strings.HasPrefix(name, "../") || path.IsAbs(name) {
-			return ociArchiveInspection{}, fmt.Errorf("OCI archive path %q is unsafe", header.Name)
+			return ociArchiveInspection{}, archiveInspectionErrorf("OCI archive path %q is unsafe", header.Name)
 		}
 		if header.FileInfo().IsDir() {
 			if rawName != name && rawName != name+"/" {

@@ -28,6 +28,48 @@ func TestInspectOCIArchiveVerifiesGraphPlatformAndContainerdExtensions(t *testin
 	}
 }
 
+func TestInspectOCIArchiveAcceptsRootDirectoryMember(t *testing.T) {
+	archive, topDigest, manifestDigest := testOCIArchive(t, false, false)
+	archive = rewriteTestOCIArchive(t, archive, []tar.Header{{Name: "./", Mode: 0o700, Typeflag: tar.TypeDir}}, func(name string) string { return name })
+
+	inspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty:test", topDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(inspection.Path) })
+	if inspection.TopLevel.Digest != topDigest || inspection.PlatformDigest != manifestDigest {
+		t.Fatalf("archive inspection = %+v", inspection)
+	}
+}
+
+func TestInspectOCIArchiveAcceptsGNUTarDirectoryOrdering(t *testing.T) {
+	archive, topDigest, manifestDigest := testOCIArchive(t, false, false)
+	archive = rewriteTestOCIArchive(t, archive, []tar.Header{{Name: "./", Mode: 0o700, Typeflag: tar.TypeDir}}, func(name string) string { return "./" + name })
+
+	inspection, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "example.invalid/wefty:test", topDigest.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTestArchive(inspection.Path) })
+	if inspection.TopLevel.Digest != topDigest || inspection.PlatformDigest != manifestDigest {
+		t.Fatalf("archive inspection = %+v", inspection)
+	}
+}
+
+func TestInspectOCIArchiveRejectsRegularRootMember(t *testing.T) {
+	archive, _, _ := testOCIArchive(t, false, false)
+	archive = rewriteTestOCIArchive(t, archive, []tar.Header{{Name: ".", Mode: 0o600, Typeflag: tar.TypeReg}}, func(name string) string { return name })
+
+	_, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "", "")
+	if err == nil || !strings.Contains(err.Error(), `OCI archive path "." is unsafe`) {
+		t.Fatalf("regular root member error = %v", err)
+	}
+	var rejection *ImageMechanicsError
+	if mechanicsErr := imageMechanicsError(ImageFailureManifestRejected, "", err); !errors.As(mechanicsErr, &rejection) || rejection.Fact.Reason != `OCI archive path "." is unsafe` {
+		t.Fatalf("regular root member mechanics = %#v", mechanicsErr)
+	}
+}
+
 func TestInspectOCIArchiveRejectsRecomputedDigestMismatch(t *testing.T) {
 	archive, _, _ := testOCIArchive(t, true, false)
 	if _, err := inspectOCIArchive(t.Context(), t.TempDir(), bytes.NewReader(archive), "", ""); err == nil {
@@ -295,6 +337,39 @@ func testOCIArchive(t *testing.T, corruptConfig, digestedReference bool) ([]byte
 		t.Fatal(err)
 	}
 	return output.Bytes(), indexDescriptor.Digest, manifestDescriptor.Digest
+}
+
+func rewriteTestOCIArchive(t *testing.T, source []byte, prefix []tar.Header, rewriteName func(string) string) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	writer := tar.NewWriter(&output)
+	for index := range prefix {
+		header := prefix[index]
+		if err := writer.WriteHeader(&header); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader := tar.NewReader(bytes.NewReader(source))
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		header.Name = rewriteName(header.Name)
+		if err := writer.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(writer, reader); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
 }
 
 func descriptor(mediaType string, payload []byte) ocispec.Descriptor {

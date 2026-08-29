@@ -137,6 +137,7 @@ func (failure *insufficientDiskError) Unwrap() error { return failure.err }
 // what it observed; retry and terminal classification remain agent policy.
 type ImageFailureFact struct {
 	Kind           ImageFailureKind `json:"kind"`
+	Reason         string           `json:"reason,omitempty"`
 	HTTPStatus     int              `json:"http_status,omitempty"`
 	RetryAfter     time.Duration    `json:"retry_after,omitempty"`
 	TopLevelDigest string           `json:"top_level_digest,omitempty"`
