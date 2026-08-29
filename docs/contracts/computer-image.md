@@ -206,4 +206,8 @@ Docker or containerd's `nerdctl`, emits one versioned JSON receipt with stable
 check IDs, and prints the same cells as a human summary. Every cell begins as
 `NOT-RUN`; an omitted or unavailable input/driver oracle therefore cannot be
 folded into an aggregate `PASS`. The reference image supplies both explicit
-oracle paths and the secretless required image lane proves every cell `PASS`.
+oracle paths and the secretless required image lane proves every image and
+Docker-harness cell `PASS`. Capability-set, seccomp, namespace, device, and
+cgroup/OOM/swap read-backs remain explicit `NOT-RUN` cells with the stable
+reason `harness profile is not the containerd wefty-v1 profile`; native
+containerd acceptance owns those assertions.

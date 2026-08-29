@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -11,24 +12,43 @@ import (
 )
 
 func main() {
+	os.Exit(run(os.Args[1:]))
+}
+
+func run(arguments []string) int {
 	var config computerconformance.RuntimeConfig
-	flag.StringVar(&config.Image, "image", "", "OCI image reference or digest to check (required)")
-	flag.StringVar(&config.Runtime, "runtime", "docker", "OCI command-line runtime: docker or nerdctl")
-	flag.StringVar(&config.Platform, "platform", "", "optional Linux platform, for example linux/amd64")
-	flag.StringVar(&config.InputOraclePath, "input-oracle-path", "", "absolute image path to an input receipt; omission reports input checks NOT-RUN")
-	flag.StringVar(&config.DriverOraclePath, "driver-oracle-path", "", "absolute image path to observed driver state; omission reports consumer checks NOT-RUN")
-	flag.StringVar(&config.ReceiptPath, "receipt", "computer-conformance.json", "machine-readable receipt path, or - for stdout")
-	flag.Parse()
+	flags := flag.NewFlagSet("wefty-computer-conformance", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.StringVar(&config.Image, "image", "", "OCI image reference or digest to check (required)")
+	flags.StringVar(&config.Runtime, "runtime", "docker", "OCI command-line runtime: docker or nerdctl")
+	flags.StringVar(&config.Platform, "platform", "", "optional Linux platform, for example linux/amd64")
+	flags.StringVar(&config.InputOraclePath, "input-oracle-path", "", "absolute image path to an input receipt; omission reports input checks NOT-RUN")
+	flags.StringVar(&config.DriverOraclePath, "driver-oracle-path", "", "absolute image path to observed driver state; omission reports consumer checks NOT-RUN")
+	flags.StringVar(&config.EdgeProcessPattern, "edge-process-pattern", "", "image process substring used to prove edge loss and recovery; omission reports the cell NOT-RUN")
+	flags.StringVar(&config.MutationProfile, "mutation-profile", "", "repository acceptance-fixture profile mutation")
+	flags.StringVar(&config.ReceiptPath, "receipt", "computer-conformance.json", "machine-readable receipt path, or - for stdout")
+	if err := flags.Parse(arguments); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 64
+	}
+	if flags.NArg() != 0 || config.Image == "" || (config.Runtime != "docker" && config.Runtime != "nerdctl") ||
+		(config.InputOraclePath != "" && !filepath.IsAbs(config.InputOraclePath)) ||
+		(config.DriverOraclePath != "" && !filepath.IsAbs(config.DriverOraclePath)) {
+		fmt.Fprintln(os.Stderr, "usage: wefty-computer-conformance --image IMAGE [options]")
+		return 64
+	}
 
 	result := computerconformance.Run(context.Background(), config)
 	payload, marshalErr := computerconformance.Marshal(result.Receipt)
 	if marshalErr != nil {
 		fmt.Fprintf(os.Stderr, "wefty-computer-conformance: encode receipt: %v\n", marshalErr)
-		os.Exit(1)
+		return 1
 	}
 	if err := writeReceipt(config.ReceiptPath, payload); err != nil {
 		fmt.Fprintf(os.Stderr, "wefty-computer-conformance: write receipt: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	writeSummary(result.Receipt, config.ReceiptPath)
 	if result.Err != nil {
@@ -36,11 +56,11 @@ func main() {
 	}
 	switch result.Receipt.Status {
 	case computerconformance.StatusPass:
-		return
+		return 0
 	case computerconformance.StatusNotRun:
-		os.Exit(2)
+		return 2
 	default:
-		os.Exit(1)
+		return 1
 	}
 }
 
@@ -76,7 +96,11 @@ func writeSummary(receipt computerconformance.Receipt, receiptPath string) {
 		case computerconformance.StatusNotRun:
 			notRun++
 		}
-		fmt.Fprintf(writer, "%-7s %-42s %s\n", check.Status, check.ID, check.Summary)
+		detail := ""
+		if check.Status != computerconformance.StatusPass && check.Detail != "" {
+			detail = " — " + check.Detail
+		}
+		fmt.Fprintf(writer, "%-7s %-18s %-42s %s%s\n", check.Status, check.Scope, check.ID, check.Summary, detail)
 	}
-	fmt.Fprintf(writer, "%s — %d PASS, %d FAIL, %d NOT-RUN; receipt=%s\n", receipt.Status, passed, failed, notRun, receiptPath)
+	fmt.Fprintf(writer, "image=%s harness=%s containerd-profile=%s — %d PASS, %d FAIL, %d NOT-RUN; receipt=%s\n", receipt.ImageStatus, receipt.HarnessStatus, receipt.ContainerdProfileStatus, passed, failed, notRun, receiptPath)
 }

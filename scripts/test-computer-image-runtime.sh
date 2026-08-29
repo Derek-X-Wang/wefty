@@ -18,9 +18,64 @@ done
 [[ $image == *@sha256:* && $arch =~ ^(amd64|arm64)$ && -n $evidence ]] || exit 64
 mkdir -p "$evidence"
 
-go run ./cmd/wefty-computer-conformance \
+checker="$evidence/wefty-computer-conformance"
+go build -o "$checker" ./cmd/wefty-computer-conformance
+
+"$checker" \
   --image "$image" \
   --platform "linux/$arch" \
   --input-oracle-path /tmp/wefty-computer/input-oracle.json \
   --driver-oracle-path /tmp/wefty-computer/driver-state.json \
+  --edge-process-pattern 'wefty-rfb-websocket --port' \
   --receipt "$evidence/${arch}-runtime.json"
+
+# The reference executes on both supported architectures. The actual broken
+# image matrix runs once on native amd64: every row boots a derivative image,
+# invokes the same public checker, and must produce exactly its owning FAIL.
+if [[ $arch != amd64 ]]; then exit 0; fi
+
+mutations="$evidence/mutations"
+mkdir -p "$mutations"
+run_mutation() {
+  local mutation=$1 cell=$2 detail=$3
+  local tag="wefty-computer-broken-${mutation}:local"
+  docker build --platform "linux/$arch" --file examples/computer/fixtures/Dockerfile \
+    --build-arg "BASE_IMAGE=$image" --build-arg "MUTATION=$mutation" --tag "$tag" examples/computer/fixtures
+  set +e
+  "$checker" --image "$tag" --platform "linux/$arch" \
+    --input-oracle-path /tmp/wefty-computer/input-oracle.json \
+    --driver-oracle-path /tmp/wefty-computer/driver-state.json \
+    --edge-process-pattern 'wefty-rfb-websocket --port' \
+    --mutation-profile "$mutation" --receipt "$mutations/$mutation.json"
+  local checker_status=$?
+  set -e
+  if ((checker_status == 64)); then
+    printf 'checker usage failure for mutation %s\n' "$mutation" >&2
+    exit 1
+  fi
+  jq -e --arg cell "$cell" --arg detail "$detail" '
+    [.checks[] | select(.status == "FAIL")] as $failed |
+    ($failed | length) == 1 and $failed[0].id == $cell and $failed[0].detail == $detail
+  ' "$mutations/$mutation.json" >/dev/null
+}
+
+run_mutation missing-control-endpoint transport.control-ready 'control never completed rfb-websocket-v1'
+run_mutation missing-view-endpoint transport.view-ready 'view never completed rfb-websocket-v1'
+run_mutation duplicate-endpoint endpoints.distinct 'view and control received the same attempt-local port'
+run_mutation plain-tcp-control transport.plain-tcp-rejected 'endpoint accepted TCP but did not complete the required WebSocket upgrade'
+run_mutation view-accepts-input input.view-isolated 'view pointer or key input reached the guest before the control sentinel'
+run_mutation text-frames-accepted transport.text-frame-rejected 'one endpoint violated the negative wire assertion'
+run_mutation driver-json-ignored driver.true-consumed 'tenant ignored the true driver generation'
+run_mutation malformed-driver-accepted driver.malformed-fails-closed 'a malformed generation was accepted or not observed'
+run_mutation unknown-driver-version-accepted driver.unknown-version-fails-closed 'unknown-version generation was accepted or not observed'
+run_mutation writable-driver driver.read-only 'tenant can write driver.json'
+run_mutation reserved-env-shadowed environment.view-port 'reserved environment did not match the authoritative value'
+run_mutation forbidden-privilege harness.forbidden-privilege 'forbidden SYS_ADMIN capability was added'
+run_mutation readiness-over-60s readiness.before-deadline 'endpoint pair was not ready before t0 + 60s'
+run_mutation shm-too-small harness.shm-size '/dev/shm ceiling is not 1 GiB'
+run_mutation writable-rootfs harness.rootfs-read-only 'write failed with EACCES, not EROFS'
+run_mutation view-wildcard-bind endpoints.view-loopback 'endpoint was missing or wildcard-bound'
+run_mutation control-wildcard-bind endpoints.control-loopback 'endpoint was missing or wildcard-bound'
+run_mutation profile-state-lost persistence.profile-survives 'profile marker under HOME was lost'
+run_mutation sign-in-state-lost persistence.sign-in-survives 'sign-in marker under HOME was lost'
+run_mutation edge-does-not-recover persistence.edge-recovers 'both endpoints did not recover after edge withdrawal'

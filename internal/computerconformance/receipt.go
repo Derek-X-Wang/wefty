@@ -10,6 +10,7 @@ import (
 )
 
 const ReceiptVersion = 1
+const ContainerdProfileNotRun = "harness profile is not the containerd wefty-v1 profile"
 
 type Status string
 
@@ -19,57 +20,66 @@ const (
 	StatusNotRun Status = "NOT-RUN"
 )
 
+type Scope string
+
+const (
+	ScopeImage   Scope = "image"
+	ScopeHarness Scope = "harness"
+	ScopeProfile Scope = "containerd-profile"
+)
+
 type Check struct {
 	ID      string `json:"id"`
+	Scope   Scope  `json:"scope"`
 	Status  Status `json:"status"`
 	Summary string `json:"summary"`
 	Detail  string `json:"detail,omitempty"`
 }
 
 type Receipt struct {
-	Version    int       `json:"version"`
-	Image      string    `json:"image"`
-	Runtime    string    `json:"runtime"`
-	Platform   string    `json:"platform,omitempty"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at"`
-	Status     Status    `json:"status"`
-	Checks     []Check   `json:"checks"`
-
-	// Compatibility projection consumed by the already-published #234 image
-	// promotion assertion. Every positive value is derived from the complete
-	// stable-check aggregate, so the old seam cannot hide a NOT-RUN cell.
-	Executed               bool                   `json:"executed"`
-	RFBWebSocketV1         bool                   `json:"rfb_websocket_v1"`
-	TransportAssertions    bool                   `json:"transport_assertions"`
-	NegativeRows           CompatibilityNegatives `json:"negative_rows"`
-	Endpoints              CompatibilityEndpoints `json:"endpoints"`
-	Roles                  CompatibilityRoles     `json:"roles"`
-	DriverSignalConsumed   bool                   `json:"driver_signal_consumed"`
-	ProfilePersistent      bool                   `json:"profile_persistent"`
-	SignInPersistent       bool                   `json:"sign_in_persistent"`
-	RootFSReadOnly         bool                   `json:"rootfs_read_only"`
-	AttemptTmpfsDiscarded  bool                   `json:"attempt_tmpfs_discarded"`
-	Shm                    CompatibilityShm       `json:"shm"`
-	ReadinessSeconds       float64                `json:"readiness_seconds"`
-	RestartedEdgeRecovered bool                   `json:"restarted_edge_recovered"`
+	Version                     int       `json:"version"`
+	Image                       string    `json:"image"`
+	Runtime                     string    `json:"runtime"`
+	Platform                    string    `json:"platform,omitempty"`
+	StartedAt                   time.Time `json:"started_at"`
+	FinishedAt                  time.Time `json:"finished_at"`
+	Status                      Status    `json:"status"`
+	ImageStatus                 Status    `json:"image_status"`
+	HarnessStatus               Status    `json:"harness_status"`
+	ContainerdProfileStatus     Status    `json:"containerd_profile_status"`
+	Checks                      []Check   `json:"checks"`
+	FirstBootReadinessSeconds   float64   `json:"first_boot_readiness_seconds,omitempty"`
+	RestartBootReadinessSeconds float64   `json:"restart_boot_readiness_seconds,omitempty"`
+	ProfilePersistent           *bool     `json:"profile_persistent,omitempty"`
+	SignInPersistent            *bool     `json:"sign_in_persistent,omitempty"`
+	RestartedEdgeRecovered      *bool     `json:"restarted_edge_recovered,omitempty"`
+	// Compatibility fields remain publication inputs, but each is projected
+	// from the named observed cells below rather than from the aggregate.
+	Executed              bool                   `json:"executed"`
+	RFBWebSocketV1        bool                   `json:"rfb_websocket_v1"`
+	TransportAssertions   bool                   `json:"transport_assertions"`
+	NegativeRows          CompatibilityNegatives `json:"negative_rows"`
+	Endpoints             CompatibilityEndpoints `json:"endpoints"`
+	Roles                 CompatibilityRoles     `json:"roles"`
+	DriverSignalConsumed  bool                   `json:"driver_signal_consumed"`
+	RootFSReadOnly        bool                   `json:"rootfs_read_only"`
+	AttemptTmpfsDiscarded bool                   `json:"attempt_tmpfs_discarded"`
+	Shm                   CompatibilityShm       `json:"shm"`
+	ReadinessSeconds      float64                `json:"readiness_seconds"`
 }
 
 type CompatibilityNegatives struct {
 	DriverFailClosed bool `json:"driver_fail_closed"`
 }
-
 type CompatibilityEndpoints struct {
 	View    string `json:"view"`
 	Control string `json:"control"`
 }
-
 type CompatibilityRoles struct {
 	ViewProcessViewOnly       bool `json:"view_process_view_only"`
 	ControlProcessInteractive bool `json:"control_process_interactive"`
 	ViewPointerDiscarded      bool `json:"view_pointer_discarded"`
 }
-
 type CompatibilityShm struct {
 	Private    bool `json:"private"`
 	Conformant bool `json:"conformant"`
@@ -86,13 +96,10 @@ func NewRecorder(image, runtimeName, platform string, startedAt time.Time) *Reco
 	checks := make([]Check, len(CheckCatalog))
 	index := make(map[string]int, len(CheckCatalog))
 	for i, definition := range CheckCatalog {
-		checks[i] = Check{ID: definition.ID, Status: StatusNotRun, Summary: definition.Summary}
+		checks[i] = Check{ID: definition.ID, Scope: definition.Scope, Status: StatusNotRun, Summary: definition.Summary}
 		index[definition.ID] = i
 	}
-	return &Recorder{receipt: Receipt{
-		Version: ReceiptVersion, Image: image, Runtime: runtimeName, Platform: platform,
-		StartedAt: startedAt.UTC(), Status: StatusNotRun, Checks: checks,
-	}, index: index}
+	return &Recorder{receipt: Receipt{Version: ReceiptVersion, Image: image, Runtime: runtimeName, Platform: platform, StartedAt: startedAt.UTC(), Status: StatusNotRun, Checks: checks}, index: index}
 }
 
 func (r *Recorder) Record(id string, status Status, detail string) error {
@@ -103,37 +110,61 @@ func (r *Recorder) Record(id string, status Status, detail string) error {
 	if !ok {
 		return fmt.Errorf("unknown Computer conformance check %q", id)
 	}
-	r.receipt.Checks[i].Status = status
-	r.receipt.Checks[i].Detail = detail
+	r.receipt.Checks[i].Status, r.receipt.Checks[i].Detail = status, detail
 	return nil
 }
 
 func (r *Recorder) Finish(finishedAt time.Time) Receipt {
 	r.receipt.FinishedAt = finishedAt.UTC()
-	r.receipt.Status = Aggregate(r.receipt.Checks)
-	passed := r.receipt.Status == StatusPass
-	r.receipt.Executed = passed
-	r.receipt.RFBWebSocketV1 = passed
-	r.receipt.TransportAssertions = passed
-	r.receipt.NegativeRows.DriverFailClosed = passed
-	if passed {
-		r.receipt.Endpoints = CompatibilityEndpoints{View: "loopback", Control: "loopback"}
-	}
-	r.receipt.Roles = CompatibilityRoles{ViewProcessViewOnly: passed, ControlProcessInteractive: passed, ViewPointerDiscarded: passed}
-	r.receipt.DriverSignalConsumed = passed
-	r.receipt.ProfilePersistent = passed
-	r.receipt.SignInPersistent = passed
-	r.receipt.RootFSReadOnly = passed
-	r.receipt.AttemptTmpfsDiscarded = passed
-	r.receipt.Shm = CompatibilityShm{Private: passed, Conformant: passed}
-	r.receipt.RestartedEdgeRecovered = passed
+	r.receipt.ImageStatus = aggregateScope(r.receipt.Checks, ScopeImage)
+	r.receipt.HarnessStatus = aggregateScope(r.receipt.Checks, ScopeHarness)
+	r.receipt.ContainerdProfileStatus = aggregateScope(r.receipt.Checks, ScopeProfile)
+	r.receipt.Status = Aggregate([]Check{{Status: r.receipt.ImageStatus}, {Status: r.receipt.HarnessStatus}})
+	r.projectObservedCompatibility()
 	r.receipt.Checks = slices.Clone(r.receipt.Checks)
 	return r.receipt
 }
 
-func (r *Recorder) RecordReadiness(duration time.Duration) {
-	r.receipt.ReadinessSeconds = duration.Seconds()
+func (r *Recorder) projectObservedCompatibility() {
+	passed := func(id string) bool { return r.receipt.Checks[r.index[id]].Status == StatusPass }
+	all := func(ids ...string) bool {
+		for _, id := range ids {
+			if !passed(id) {
+				return false
+			}
+		}
+		return true
+	}
+	r.receipt.Executed = passed("runtime.started")
+	r.receipt.RFBWebSocketV1 = all("transport.view-ready", "transport.control-ready")
+	r.receipt.TransportAssertions = all("transport.plain-tcp-rejected", "transport.query-ignored", "transport.fragment-ignored", "transport.wrong-path-rejected", "transport.missing-subprotocol-rejected", "transport.wrong-subprotocol-rejected", "transport.text-frame-rejected")
+	r.receipt.NegativeRows.DriverFailClosed = all("driver.malformed-fails-closed", "driver.unknown-version-fails-closed", "driver.missing-fails-closed")
+	if passed("endpoints.view-loopback") {
+		r.receipt.Endpoints.View = "loopback"
+	}
+	if passed("endpoints.control-loopback") {
+		r.receipt.Endpoints.Control = "loopback"
+	}
+	viewIsolated := all("input.view-isolated", "input.view-isolated-during-tenure")
+	r.receipt.Roles = CompatibilityRoles{ViewProcessViewOnly: viewIsolated, ControlProcessInteractive: passed("input.control-accepted"), ViewPointerDiscarded: viewIsolated}
+	r.receipt.DriverSignalConsumed = all("driver.true-consumed", "driver.release-consumed")
+	r.receipt.RootFSReadOnly = passed("harness.rootfs-read-only")
+	r.receipt.AttemptTmpfsDiscarded = passed("persistence.rootfs-discarded")
+	r.receipt.Shm = CompatibilityShm{Private: passed("harness.shm-private"), Conformant: all("harness.shm-size", "harness.shm-flags")}
+	r.receipt.ReadinessSeconds = r.receipt.FirstBootReadinessSeconds
 }
+
+func (r *Recorder) RecordReadiness(restart bool, duration time.Duration) {
+	if restart {
+		r.receipt.RestartBootReadinessSeconds = duration.Seconds()
+	} else {
+		r.receipt.FirstBootReadinessSeconds = duration.Seconds()
+	}
+}
+func (r *Recorder) RecordPersistence(profile, signIn bool) {
+	r.receipt.ProfilePersistent, r.receipt.SignInPersistent = &profile, &signIn
+}
+func (r *Recorder) RecordEdgeRecovery(value bool) { r.receipt.RestartedEdgeRecovered = &value }
 
 func Aggregate(checks []Check) Status {
 	status := StatusPass
@@ -150,58 +181,84 @@ func Aggregate(checks []Check) Status {
 	}
 	return status
 }
-
-func Marshal(receipt Receipt) ([]byte, error) {
-	return json.MarshalIndent(receipt, "", "  ")
+func aggregateScope(checks []Check, scope Scope) Status {
+	filtered := make([]Check, 0, len(checks))
+	for _, check := range checks {
+		if check.Scope == scope {
+			filtered = append(filtered, check)
+		}
+	}
+	return Aggregate(filtered)
 }
+func Marshal(receipt Receipt) ([]byte, error) { return json.MarshalIndent(receipt, "", "  ") }
 
 type CheckDefinition struct {
 	ID      string
+	Scope   Scope
 	Summary string
 }
 
 // CheckCatalog is append-only within receipt version 1. Stable IDs let CI and
 // image authors compare evidence without scraping human prose.
 var CheckCatalog = []CheckDefinition{
-	{ID: "runtime.started", Summary: "image starts under the Computer OCI profile"},
-	{ID: "runtime.image-config", Summary: "image USER, ENTRYPOINT, CMD, and working directory retain OCI semantics"},
-	{ID: "environment.service-dir", Summary: "WEFTY_SERVICE_DIR is authoritative"},
-	{ID: "environment.view-port", Summary: "view port is authoritative"},
-	{ID: "environment.control-port", Summary: "control port is authoritative"},
-	{ID: "environment.service-port-omitted", Summary: "WEFTY_SERVICE_PORT is omitted"},
-	{ID: "environment.authority-omitted", Summary: "default-off Computer authority environment is omitted"},
-	{ID: "environment.other-wefty-preserved", Summary: "unreserved WEFTY_* environment remains tenant-owned"},
-	{ID: "endpoints.distinct", Summary: "view and control use distinct allocated ports"},
-	{ID: "endpoints.view-loopback", Summary: "view binds IPv4 loopback only"},
-	{ID: "endpoints.control-loopback", Summary: "control binds IPv4 loopback only"},
-	{ID: "transport.view-ready", Summary: "view completes rfb-websocket-v1"},
-	{ID: "transport.control-ready", Summary: "control completes rfb-websocket-v1"},
-	{ID: "transport.query-ignored", Summary: "query does not change routing"},
-	{ID: "transport.fragment-ignored", Summary: "fragment does not change routing"},
-	{ID: "transport.wrong-path-rejected", Summary: "wrong WebSocket path is rejected"},
-	{ID: "transport.missing-subprotocol-rejected", Summary: "missing binary subprotocol is rejected"},
-	{ID: "transport.wrong-subprotocol-rejected", Summary: "wrong subprotocol is rejected"},
-	{ID: "transport.text-frame-rejected", Summary: "text RFB frame is rejected"},
-	{ID: "readiness.before-deadline", Summary: "both endpoints are ready before the 60 second deadline"},
-	{ID: "input.view-isolated", Summary: "view discards byte-identical pointer and key input"},
-	{ID: "input.control-accepted", Summary: "control accepts byte-identical pointer and key input"},
-	{ID: "driver.read-only", Summary: "driver.json is tenant read-only"},
-	{ID: "driver.mode", Summary: "driver.json mode is exactly 0444"},
-	{ID: "driver.initial-false", Summary: "fresh attempt starts with exact false driver document"},
-	{ID: "driver.true-consumed", Summary: "tenant reopens and consumes true driver document"},
-	{ID: "driver.release-consumed", Summary: "tenant consumes the restored false document"},
-	{ID: "driver.malformed-fails-closed", Summary: "malformed and wrong-type driver documents fail closed"},
-	{ID: "driver.missing-fails-closed", Summary: "missing driver document fails closed"},
-	{ID: "profile.image-user", Summary: "runtime retains the image USER"},
-	{ID: "profile.rootfs-read-only", Summary: "root filesystem is read-only"},
-	{ID: "profile.service-writable", Summary: "/wefty/service is the persistent writable path"},
-	{ID: "profile.no-new-privileges", Summary: "noNewPrivileges is active"},
-	{ID: "profile.capabilities", Summary: "capability bounding set has no forbidden capability"},
-	{ID: "profile.shm-private", Summary: "/dev/shm is attempt-private"},
-	{ID: "profile.shm-size", Summary: "/dev/shm ceiling is exactly 1 GiB"},
-	{ID: "profile.shm-flags", Summary: "/dev/shm is mode 1777,nosuid,nodev,noexec"},
-	{ID: "profile.tmp-ceilings", Summary: "/tmp and /var/tmp retain the bounded Computer ceilings"},
-	{ID: "persistence.service-survives", Summary: "/wefty/service survives a fresh attempt"},
-	{ID: "persistence.rootfs-discarded", Summary: "attempt-local rootfs state does not survive"},
-	{ID: "targets.control-nonpersistent", Summary: "/wefty/control state does not enter service data"},
+	{ID: "runtime.started", Scope: ScopeImage, Summary: "image starts under the Computer harness profile"},
+	{ID: "runtime.image-config", Scope: ScopeImage, Summary: "image USER, ENTRYPOINT, CMD, and working directory retain OCI semantics"},
+	{ID: "environment.service-dir", Scope: ScopeImage, Summary: "WEFTY_SERVICE_DIR is authoritative"},
+	{ID: "environment.view-port", Scope: ScopeImage, Summary: "view port is authoritative"},
+	{ID: "environment.control-port", Scope: ScopeImage, Summary: "control port is authoritative"},
+	{ID: "environment.service-port-omitted", Scope: ScopeImage, Summary: "WEFTY_SERVICE_PORT is omitted"},
+	{ID: "environment.handoff-dir-omitted", Scope: ScopeImage, Summary: "WEFTY_HANDOFF_DIR is omitted when no handoff is supplied"},
+	{ID: "environment.authority-omitted", Scope: ScopeImage, Summary: "default-off Computer authority environment is omitted"},
+	{ID: "environment.other-wefty-preserved", Scope: ScopeImage, Summary: "unreserved WEFTY_* environment remains tenant-owned"},
+	{ID: "targets.service-nonshadowable", Scope: ScopeHarness, Summary: "/wefty/service hides image filesystem content"},
+	{ID: "targets.control-nonshadowable", Scope: ScopeHarness, Summary: "/wefty/control hides image filesystem content"},
+	{ID: "targets.handoff-nonshadowable", Scope: ScopeHarness, Summary: "/wefty/handoff hides image filesystem content"},
+	{ID: "targets.token-mode", Scope: ScopeImage, Summary: "optional computer-token is absent or mode 0400"},
+	{ID: "targets.endpoint-mode", Scope: ScopeImage, Summary: "optional l3-endpoint is absent or mode 0400"},
+	{ID: "endpoints.distinct", Scope: ScopeHarness, Summary: "view and control use distinct allocated ports"},
+	{ID: "endpoints.view-loopback", Scope: ScopeImage, Summary: "view binds IPv4 loopback only"},
+	{ID: "endpoints.control-loopback", Scope: ScopeImage, Summary: "control binds IPv4 loopback only"},
+	{ID: "transport.view-ready", Scope: ScopeImage, Summary: "view completes rfb-websocket-v1"},
+	{ID: "transport.control-ready", Scope: ScopeImage, Summary: "control completes rfb-websocket-v1"},
+	{ID: "transport.plain-tcp-rejected", Scope: ScopeImage, Summary: "plain TCP or HTTP without upgrade is not readiness"},
+	{ID: "transport.query-ignored", Scope: ScopeImage, Summary: "query does not change routing"},
+	{ID: "transport.fragment-ignored", Scope: ScopeImage, Summary: "fragment does not change routing"},
+	{ID: "transport.wrong-path-rejected", Scope: ScopeImage, Summary: "wrong WebSocket path is rejected"},
+	{ID: "transport.missing-subprotocol-rejected", Scope: ScopeImage, Summary: "missing binary subprotocol is rejected"},
+	{ID: "transport.wrong-subprotocol-rejected", Scope: ScopeImage, Summary: "wrong subprotocol is rejected"},
+	{ID: "transport.text-frame-rejected", Scope: ScopeImage, Summary: "text RFB frame is rejected"},
+	{ID: "readiness.before-deadline", Scope: ScopeImage, Summary: "both endpoints are ready before the 60 second deadline"},
+	{ID: "input.view-isolated", Scope: ScopeImage, Summary: "view discards pointer and observed key input while tenure is false"},
+	{ID: "input.view-isolated-during-tenure", Scope: ScopeImage, Summary: "view discards pointer and observed key input while tenure is true"},
+	{ID: "input.control-accepted", Scope: ScopeImage, Summary: "control accepts pointer and observed key input"},
+	{ID: "driver.read-only", Scope: ScopeHarness, Summary: "driver.json is tenant read-only"},
+	{ID: "driver.mode", Scope: ScopeHarness, Summary: "driver.json mode is exactly 0444"},
+	{ID: "driver.initial-false", Scope: ScopeImage, Summary: "fresh attempt starts with exact false driver document"},
+	{ID: "driver.true-consumed", Scope: ScopeImage, Summary: "tenant reopens and consumes true driver document"},
+	{ID: "driver.release-consumed", Scope: ScopeImage, Summary: "tenant consumes the restored false document"},
+	{ID: "driver.malformed-fails-closed", Scope: ScopeImage, Summary: "malformed and wrong-type driver documents fail closed after observation"},
+	{ID: "driver.unknown-version-fails-closed", Scope: ScopeImage, Summary: "unknown driver version fails closed after observation"},
+	{ID: "driver.missing-fails-closed", Scope: ScopeImage, Summary: "missing driver document fails closed after observation"},
+	{ID: "harness.image-user", Scope: ScopeHarness, Summary: "Docker harness retains the image USER"},
+	{ID: "harness.rootfs-read-only", Scope: ScopeHarness, Summary: "Docker harness root filesystem is read-only"},
+	{ID: "harness.service-writable", Scope: ScopeHarness, Summary: "/wefty/service is the persistent writable path"},
+	{ID: "harness.no-new-privileges", Scope: ScopeHarness, Summary: "Docker harness enables noNewPrivileges"},
+	{ID: "harness.forbidden-privilege", Scope: ScopeHarness, Summary: "Docker harness adds no forbidden privilege"},
+	{ID: "harness.shm-private", Scope: ScopeHarness, Summary: "/dev/shm is attempt-private"},
+	{ID: "harness.shm-size", Scope: ScopeHarness, Summary: "/dev/shm ceiling is exactly 1 GiB"},
+	{ID: "harness.shm-flags", Scope: ScopeHarness, Summary: "/dev/shm is mode 1777,nosuid,nodev,noexec"},
+	{ID: "harness.tmp-ceilings", Scope: ScopeHarness, Summary: "/tmp and /var/tmp retain bounded ceilings"},
+	{ID: "profile.capabilities", Scope: ScopeProfile, Summary: "containerd capability sets match wefty-v1"},
+	{ID: "profile.seccomp", Scope: ScopeProfile, Summary: "containerd generated seccomp profile is active"},
+	{ID: "profile.namespaces", Scope: ScopeProfile, Summary: "containerd namespace profile matches wefty-v1"},
+	{ID: "profile.devices", Scope: ScopeProfile, Summary: "containerd deny-all device profile matches wefty-v1"},
+	{ID: "profile.cgroup-memory-max", Scope: ScopeProfile, Summary: "memory.max equals the declared cap"},
+	{ID: "profile.cgroup-oom-group", Scope: ScopeProfile, Summary: "memory.oom.group equals 1"},
+	{ID: "profile.cgroup-swap-max", Scope: ScopeProfile, Summary: "memory.swap.max equals 0"},
+	{ID: "persistence.service-survives", Scope: ScopeImage, Summary: "/wefty/service survives a fresh attempt"},
+	{ID: "persistence.profile-survives", Scope: ScopeImage, Summary: "profile marker under image HOME survives restart"},
+	{ID: "persistence.sign-in-survives", Scope: ScopeImage, Summary: "sign-in marker under image HOME survives restart"},
+	{ID: "persistence.rootfs-discarded", Scope: ScopeImage, Summary: "attempt-local rootfs state does not survive"},
+	{ID: "persistence.edge-recovers", Scope: ScopeImage, Summary: "killed WebSocket edge withdraws and both endpoints recover"},
+	{ID: "targets.control-nonpersistent", Scope: ScopeImage, Summary: "/wefty/control state does not enter service data"},
 }

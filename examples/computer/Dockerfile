@@ -22,6 +22,7 @@ RUN printf '%s\n' \
         python3-websockify=0.10.0+dfsg1-4+b1 \
         tini=0.19.0-1+b3 \
         x11-utils=7.7+5 \
+        xinput=1.6.3-1 \
         x11vnc=0.9.16-9 \
         xfce4-panel=4.18.2-1 \
         xfce4-session=4.18.1-1 \

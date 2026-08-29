@@ -7,6 +7,7 @@ import (
 	"crypto/sha1" // #nosec G505 -- RFC 6455 mandates SHA-1 for the public handshake nonce.
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -169,10 +170,16 @@ func AssertTextRejected(ctx context.Context, port int) error {
 	}
 	opcode, payload, err := connection.readFrame()
 	if err != nil {
-		return fmt.Errorf("read close frame: %w", err)
+		// An immediate protocol-error close is conformant; the contract does not
+		// prescribe a particular RFC 6455 close code.
+		var networkError net.Error
+		if errors.As(err, &networkError) && networkError.Timeout() {
+			return fmt.Errorf("text frame was accepted and the connection remained open: %w", err)
+		}
+		return nil
 	}
-	if opcode != 8 || len(payload) < 2 || binary.BigEndian.Uint16(payload[:2]) != 1003 {
-		return fmt.Errorf("text frame close = opcode %d payload %x, want close 1003", opcode, payload)
+	if opcode != 8 {
+		return fmt.Errorf("text frame produced opcode %d payload %x instead of closing", opcode, payload)
 	}
 	return nil
 }
@@ -200,71 +207,80 @@ func (stream *rfbStream) read(size int) ([]byte, error) {
 
 func (stream *rfbStream) write(value []byte) error { return stream.connection.writeFrame(2, value) }
 
-// SendInput sends the same real RFB key and pointer bytes to either role. The
+// StartInput sends the same real RFB key and pointer bytes to either role. The
 // caller compares an image-owned oracle before and after; the probe never
 // assumes what the deterministic surface renders.
-func SendInput(ctx context.Context, port, x, y int) error {
+type InputSession struct{ connection *websocketConnection }
+
+func (session *InputSession) Close() { session.connection.close() }
+
+func StartInput(ctx context.Context, port, x, y int) (*InputSession, error) {
+	return startRFBEvents(ctx, port, true, x, y)
+}
+
+// SendPointer is the consumption sentinel used after a view probe. Observing
+// its unique coordinates proves the earlier key and pointer bytes have passed
+// through the backend's input queue without relying on a fixed sleep.
+func StartPointer(ctx context.Context, port, x, y int) (*InputSession, error) {
+	return startRFBEvents(ctx, port, false, x, y)
+}
+
+func startRFBEvents(ctx context.Context, port int, withKey bool, x, y int) (*InputSession, error) {
 	connection, err := OpenRFB(ctx, port, contract.ComputerDisplayWebSocketPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer connection.close()
+	fail := func(err error) (*InputSession, error) { connection.close(); return nil, err }
 	stream := &rfbStream{connection: connection, buffer: bytes.Clone(connection.banner)}
 	if _, err := stream.read(contract.ComputerRFBVersionBannerBytes); err != nil {
-		return err
+		return fail(err)
 	}
 	if err := stream.write([]byte("RFB 003.008\n")); err != nil {
-		return err
+		return fail(err)
 	}
 	count, err := stream.read(1)
 	if err != nil || count[0] == 0 {
-		return fmt.Errorf("RFB security types unavailable: %w", err)
+		return fail(fmt.Errorf("RFB security types unavailable: %w", err))
 	}
 	types, err := stream.read(int(count[0]))
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	if !bytes.Contains(types, []byte{1}) {
-		return fmt.Errorf("RFB None security type unavailable")
+		return fail(fmt.Errorf("RFB None security type unavailable"))
 	}
 	if err := stream.write([]byte{1}); err != nil {
-		return err
+		return fail(err)
 	}
 	security, err := stream.read(4)
 	if err != nil || !bytes.Equal(security, []byte{0, 0, 0, 0}) {
-		return fmt.Errorf("RFB security negotiation failed: %x: %w", security, err)
+		return fail(fmt.Errorf("RFB security negotiation failed: %x: %w", security, err))
 	}
 	if err := stream.write([]byte{1}); err != nil {
-		return err
+		return fail(err)
 	}
 	serverInit, err := stream.read(24)
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	nameSize := int(binary.BigEndian.Uint32(serverInit[20:24]))
 	if _, err := stream.read(nameSize); err != nil {
-		return err
+		return fail(err)
 	}
 	// KeyEvent down/up for keysym "w", then pointer button down/up. The exact
 	// byte sequence is identical for view and control.
-	for _, event := range [][]byte{
-		{4, 1, 0, 0, 0, 0, 0, 'w'}, {4, 0, 0, 0, 0, 0, 0, 'w'},
-		{5, 1, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
-		{5, 0, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
-	} {
+	events := make([][]byte, 0, 4)
+	if withKey {
+		events = append(events, []byte{4, 1, 0, 0, 0, 0, 0, 'w'}, []byte{4, 0, 0, 0, 0, 0, 0, 'w'})
+	}
+	events = append(events,
+		[]byte{5, 1, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
+		[]byte{5, 0, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
+	)
+	for _, event := range events {
 		if err := stream.write(event); err != nil {
-			return err
+			return fail(err)
 		}
 	}
-	// Keep the RFB session alive long enough for the backend to consume the
-	// queued events. Closing immediately after the final WebSocket write can
-	// race x11vnc and turn accepted input into a false negative.
-	timer := time.NewTimer(250 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-	}
-	return nil
+	return &InputSession{connection: connection}, nil
 }

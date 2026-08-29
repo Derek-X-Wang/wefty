@@ -12,6 +12,11 @@ text frames. The focused Chromium page is the deterministic oracle seam that
 `wefty-computer-conformance` exercises with real, byte-identical view and
 control input.
 
+The checker simulates tenure through the raw control endpoint and its local
+`driver.json`; this example is not a #223/#225 admission or tenure integration
+test. Its oracle records actual X key events and pointer history so a control
+sentinel can prove ordering without a fixed sleep.
+
 `/home/wefty` is an image-owned symlink to
 `/wefty/service/home/wefty`, so browser profile and sign-in markers follow the
 Computer disk across attempts and stop/start. Runtime scratch state stays in

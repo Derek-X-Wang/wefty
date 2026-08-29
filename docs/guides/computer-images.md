@@ -89,6 +89,7 @@ go build -o ./wefty-computer-conformance ./cmd/wefty-computer-conformance
   --platform linux/amd64 \
   --input-oracle-path /path/inside/image/to/input-receipt \
   --driver-oracle-path /path/inside/image/to/observed-driver-state \
+  --edge-process-pattern 'your-websocket-edge --port' \
   --receipt ./computer-conformance.json
 ```
 
@@ -108,19 +109,19 @@ the tenant agent's already-internal observation of `driver.json`. The reference
 image uses `/tmp/wefty-computer/input-oracle.json` and
 `/tmp/wefty-computer/driver-state.json`; other images choose their own paths.
 
-For focused transport debugging while the image is running on host port 18181:
+The checker is the sole transport and runtime harness. Its Docker/nerdctl
+profile cells are labelled `harness.*` and reported separately from image
+conformance. Capability-set, seccomp, namespace, device, and cgroup read-backs
+are explicit `NOT-RUN` cells because this harness is not the containerd
+`wefty-v1` profile; the native tagged acceptance lane owns those assertions.
 
-```sh
-scripts/probe-rfb-websocket.py --port 18181 --mode ready
-scripts/probe-rfb-websocket.py --port 18181 --mode query-ready
-scripts/probe-rfb-websocket.py --port 18181 --mode fragment-ready
-scripts/probe-rfb-websocket.py --port 18181 --mode text-frame
-```
-
-The standalone probe remains useful for focused transport debugging. The CI
-compatibility wrapper `scripts/test-computer-image-runtime.sh` delegates all
-contract assertions to `wefty-computer-conformance`, so the reference lane and
-image authors consume one checker rather than two drifting harnesses.
+The input test simulates Controller tenure inside the harness by opening the
+raw control port and atomically replacing the local `driver.json`. It proves
+the image role and consumer contracts, including view isolation both before
+and during simulated tenure, but it is not an integration test of the #223
+grant or #225 sealed-control-tenure front door. A control-pointer sentinel is
+the consumption barrier, and the oracle must expose observed key events as
+well as pointer coordinates.
 
 ## Image responsibilities
 

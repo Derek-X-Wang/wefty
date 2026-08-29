@@ -9,6 +9,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Derek-X-Wang/wefty/internal/computerconformance"
 
 	"gopkg.in/yaml.v3"
 )
@@ -196,23 +199,35 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../docs/acceptance/m3-lima-transport.md", "acceptance-image-index-digest.txt", "computer-image-index-digest.txt", "wefty-computer-reference.oci.tar", "atomically within 60 seconds")
 }
 
-func TestReferenceComputerReceiptFailsEveryNegativeMutation(t *testing.T) {
+func TestReferenceComputerPublisherConsumesRealCheckerReceipt(t *testing.T) {
 	_, imageBytes := readWorkflow(t, "../.github/workflows/acceptance-image.yml")
 	match := regexp.MustCompile(`receipt_assertion='([^']+)'`).FindSubmatch(imageBytes)
 	if len(match) != 2 {
 		t.Fatal("publisher receipt_assertion was not found")
 	}
 	assertion := string(match[1]) + " and .elf_e_machine == 62"
-	conformant := map[string]any{
-		"digest": "sha256:good", "executed": true, "rfb_websocket_v1": true, "transport_assertions": true,
-		"negative_rows":          map[string]any{"driver_fail_closed": true},
-		"endpoints":              map[string]any{"view": "loopback", "control": "loopback"},
-		"roles":                  map[string]any{"view_process_view_only": true, "control_process_interactive": true, "view_pointer_discarded": true},
-		"driver_signal_consumed": true, "profile_persistent": true, "sign_in_persistent": true,
-		"rootfs_read_only": true, "attempt_tmpfs_discarded": true,
-		"shm":               map[string]any{"private": true, "conformant": true},
-		"readiness_seconds": 1, "restarted_edge_recovered": true, "elf_e_machine": 62,
+	recorder := computerconformance.NewRecorder("reference", "docker", "linux/amd64", time.Unix(1, 0))
+	for _, definition := range computerconformance.CheckCatalog {
+		status, detail := computerconformance.StatusPass, "observed"
+		if definition.Scope == computerconformance.ScopeProfile {
+			status, detail = computerconformance.StatusNotRun, computerconformance.ContainerdProfileNotRun
+		}
+		if err := recorder.Record(definition.ID, status, detail); err != nil {
+			t.Fatal(err)
+		}
 	}
+	recorder.RecordReadiness(false, time.Second)
+	recorder.RecordPersistence(true, true)
+	recorder.RecordEdgeRecovery(true)
+	payload, err := computerconformance.Marshal(recorder.Finish(time.Unix(2, 0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conformant map[string]any
+	if err := json.Unmarshal(payload, &conformant); err != nil {
+		t.Fatal(err)
+	}
+	conformant["digest"], conformant["elf_e_machine"] = "sha256:good", 62
 	valid := func(value map[string]any) bool {
 		payload, err := json.Marshal(value)
 		if err != nil {
@@ -225,54 +240,30 @@ func TestReferenceComputerReceiptFailsEveryNegativeMutation(t *testing.T) {
 	if !valid(conformant) {
 		t.Fatal("real publisher jq assertion rejected a conformant receipt")
 	}
-	mutations := []struct {
-		name   string
-		mutate func(map[string]any)
-	}{
-		{"wrong-digest", func(v map[string]any) { v["digest"] = "sha256:bad" }},
-		{"not-executed", func(v map[string]any) { v["executed"] = false }},
-		{"wrong-transport", func(v map[string]any) { v["rfb_websocket_v1"] = false }},
-		{"transport-negative", func(v map[string]any) { v["transport_assertions"] = false }},
-		{"driver-not-fail-closed", func(v map[string]any) { v["negative_rows"].(map[string]any)["driver_fail_closed"] = false }},
-		{"view-wildcard", func(v map[string]any) { v["endpoints"].(map[string]any)["view"] = "wildcard" }},
-		{"control-wildcard", func(v map[string]any) { v["endpoints"].(map[string]any)["control"] = "wildcard" }},
-		{"view-process-interactive", func(v map[string]any) { v["roles"].(map[string]any)["view_process_view_only"] = false }},
-		{"control-process-view-only", func(v map[string]any) { v["roles"].(map[string]any)["control_process_interactive"] = false }},
-		{"view-pointer-accepted", func(v map[string]any) { v["roles"].(map[string]any)["view_pointer_discarded"] = false }},
-		{"driver-unconsumed", func(v map[string]any) { v["driver_signal_consumed"] = false }},
-		{"profile-lost", func(v map[string]any) { v["profile_persistent"] = false }},
-		{"sign-in-lost", func(v map[string]any) { v["sign_in_persistent"] = false }},
-		{"writable-rootfs", func(v map[string]any) { v["rootfs_read_only"] = false }},
-		{"attempt-state-retained", func(v map[string]any) { v["attempt_tmpfs_discarded"] = false }},
-		{"shared-shm", func(v map[string]any) { v["shm"].(map[string]any)["private"] = false }},
-		{"bad-shm", func(v map[string]any) { v["shm"].(map[string]any)["conformant"] = false }},
-		{"readiness-timeout", func(v map[string]any) { v["readiness_seconds"] = 60 }},
-		{"edge-not-recovered", func(v map[string]any) { v["restarted_edge_recovered"] = false }},
-		{"wrong-elf", func(v map[string]any) { v["elf_e_machine"] = 183 }},
+}
+
+func TestReferenceComputerRunsTwentyBrokenImagesThroughRealChecker(t *testing.T) {
+	payload, err := os.ReadFile("../scripts/test-computer-image-runtime.sh")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(mutations) != 20 {
-		t.Fatalf("negative mutation rows = %d, want 20", len(mutations))
+	rows := regexp.MustCompile(`(?m)^run_mutation ([^ ]+) ([^ ]+) '([^']+)'$`).FindAllSubmatch(payload, -1)
+	if len(rows) != 20 {
+		t.Fatalf("real broken-image rows = %d, want 20", len(rows))
 	}
-	failed := 0
-	for _, mutation := range mutations {
-		t.Run(mutation.name, func(t *testing.T) {
-			payload, err := json.Marshal(conformant)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var candidate map[string]any
-			if err := json.Unmarshal(payload, &candidate); err != nil {
-				t.Fatal(err)
-			}
-			mutation.mutate(candidate)
-			if valid(candidate) {
-				t.Fatalf("negative mutation %q passed", mutation.name)
-			}
-			failed++
-		})
-	}
-	if failed != 20 {
-		t.Fatalf("negative mutation coverage = %d/20", failed)
+	names, cells := map[string]bool{}, map[string]bool{}
+	for _, row := range rows {
+		name, cell, detail := string(row[1]), string(row[2]), string(row[3])
+		if names[name] {
+			t.Fatalf("duplicate broken image %q", name)
+		}
+		if cells[cell] {
+			t.Fatalf("duplicate owning cell %q", cell)
+		}
+		if detail == "" {
+			t.Fatalf("broken image %q has no stable reason", name)
+		}
+		names[name], cells[cell] = true, true
 	}
 }
 
