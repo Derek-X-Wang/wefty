@@ -23,11 +23,12 @@ type workflowContract struct {
 }
 
 type workflowJob struct {
-	If          string            `yaml:"if"`
-	Needs       any               `yaml:"needs"`
-	Permissions map[string]string `yaml:"permissions"`
-	Uses        string            `yaml:"uses"`
-	Steps       []workflowStep    `yaml:"steps"`
+	If             string            `yaml:"if"`
+	Needs          any               `yaml:"needs"`
+	Permissions    map[string]string `yaml:"permissions"`
+	Uses           string            `yaml:"uses"`
+	TimeoutMinutes int               `yaml:"timeout-minutes"`
+	Steps          []workflowStep    `yaml:"steps"`
 }
 
 type workflowStep struct {
@@ -171,16 +172,24 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		t.Fatal("scheduled realtiming must check out the commit selected by the resolved immutable artifact")
 	}
 	for name, workflowText := range map[string]string{"workflow-run": realtimeText, "scheduled": scheduledText} {
+		if timeout := map[string]workflowContract{"workflow-run": realtiming, "scheduled": scheduled}[name].Jobs["service-acceptance-realtiming"].TimeoutMinutes; timeout != 90 {
+			t.Fatalf("%s realtiming job timeout-minutes = %d, want 90", name, timeout)
+		}
+		assertRegistryFaultAction(t, name, workflowText, "disable-registry",
+			"iptables -I OUTPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT")
+		assertRegistryFaultAction(t, name, workflowText, "enable-registry",
+			"iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT")
 		for _, required := range []string{
-			"iptables -I OUTPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT",
-			"iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT",
+			"sudo iptables -I OUTPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT",
+			"sudo iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT",
+			`runner_job_uid="$(id -u)"`, `test "$runner_job_uid" -ne 0`,
+			`runner_listener_uid="$(ps -o uid= -p "$runner_listener_pid" | tr -d ' ')"`, `test "$runner_listener_uid" -ne 0`,
+			"runner_job_uid=%s\\nrunner_listener_uid=%s\\nrunner_listener_owner=%s\\n",
+			"WEFTY_OCI_PROVISION_RECEIPT=%s\\n",
 		} {
 			if !strings.Contains(workflowText, required) {
-				t.Fatalf("%s realtiming registry fault is not root-process scoped: missing %q", name, required)
+				t.Fatalf("%s realtiming provisioning is missing %q", name, required)
 			}
-		}
-		if strings.Contains(workflowText, "--ctstate NEW -j REJECT") {
-			t.Fatalf("%s realtiming registry fault can sever the unprivileged runner control channel", name)
 		}
 	}
 	for name, workflow := range map[string]workflowContract{"workflow-run": realtiming, "scheduled": scheduled} {
@@ -212,6 +221,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 	}
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "exec /usr/local/bin/wefty-echo-service", "published-echo-service:", "clean-cache wefty node load-image")
+	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "CodeImageUnavailable", "ImageFailureNetwork", "WEFTY_OCI_PROVISION_RECEIPT")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_COMPUTER_REFERENCE", "exerciseNativeLinuxReferenceComputer", "ComputerStartupReadinessTimeout", "assertReferenceComputerWireNegatives")
 	assertFileMatches(t, "../examples/oci-echo-service/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG GO_IMAGE=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG BUSYBOX_IMAGE=.*@sha256:[0-9a-f]{64}$`)
 	assertFileMatches(t, "../examples/computer/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG DEBIAN_IMAGE=.*@sha256:[0-9a-f]{64}$`)
@@ -228,6 +238,43 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "RunComputerServiceRealtiming", "computer_reference_publication_loss_recovery=%t", "computer_reference_helper_stop_start_profile_sign_in_rootfs=%t")
 	assertFileContains(t, "../docs/runbooks/oci-node.md", "wefty node load-image", "acceptance-image-index-digest.txt")
 	assertFileContains(t, "../docs/acceptance/m3-lima-transport.md", "acceptance-image-index-digest.txt", "computer-image-index-digest.txt", "wefty-computer-reference.oci.tar", "atomically within 60 seconds")
+}
+
+func assertRegistryFaultAction(t *testing.T, workflowName, workflowText, action, want string) {
+	t.Helper()
+	body := workflowCaseActionBody(t, workflowName, workflowText, action)
+	var portRules []string
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "iptables ") && strings.Contains(line, "--dport 443") {
+			portRules = append(portRules, line)
+		}
+	}
+	if !slices.Equal(portRules, []string{want}) {
+		t.Fatalf("%s %s port-443 rules = %#v, want %q", workflowName, action, portRules, want)
+	}
+}
+
+func workflowCaseActionBody(t *testing.T, workflowName, workflowText, action string) string {
+	t.Helper()
+	var bodies []string
+	lines := strings.Split(workflowText, "\n")
+	for index := 0; index < len(lines); index++ {
+		if strings.TrimSpace(lines[index]) != action+")" {
+			continue
+		}
+		start := index + 1
+		for index = start; index < len(lines) && strings.TrimSpace(lines[index]) != ";;"; index++ {
+		}
+		if index == len(lines) {
+			t.Fatalf("%s %s case body has no terminator", workflowName, action)
+		}
+		bodies = append(bodies, strings.Join(lines[start:index], "\n"))
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("%s %s case body count = %d, want 1", workflowName, action, len(bodies))
+	}
+	return bodies[0]
 }
 
 func TestReferenceComputerPublisherConsumesRealCheckerReceipt(t *testing.T) {

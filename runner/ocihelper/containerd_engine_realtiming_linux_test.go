@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,7 +69,8 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	computerReference := os.Getenv("WEFTY_OCI_COMPUTER_REFERENCE")
 	computerDigest := os.Getenv("WEFTY_OCI_COMPUTER_DIGEST")
 	computerArchivePath := os.Getenv("WEFTY_OCI_COMPUTER_ARCHIVE")
-	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoDigest == "" || echoArchivePath == "" || weftyCLI == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" || computerReference == "" || computerDigest == "" || computerArchivePath == "" {
+	provisionReceipt := os.Getenv("WEFTY_OCI_PROVISION_RECEIPT")
+	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoDigest == "" || echoArchivePath == "" || weftyCLI == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" || computerReference == "" || computerDigest == "" || computerArchivePath == "" || provisionReceipt == "" {
 		t.Fatal("Linux OCI realtiming provisioning is incomplete")
 	}
 	if reference != echoReference || digest != echoDigest || archivePath != echoArchivePath || reference != "ghcr.io/derek-x-wang/wefty-echo-service" {
@@ -80,6 +82,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Fatal("Linux OCI realtiming test process must be unprivileged")
 	}
+	assertUnprivilegedRunnerReceipt(t, provisionReceipt)
 	if connection, err := net.DialTimeout("unix", address, 250*time.Millisecond); err == nil {
 		_ = connection.Close()
 		t.Fatal("unprivileged agent reached the root-only raw containerd socket")
@@ -106,14 +109,34 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The release artifact's CLI and multi-platform archive are the first image
-	// path through a clean node. Registry egress is disabled so load-image is
-	// the only possible source; the helper filters to this node's platform
-	// before the 16 GiB cache ceiling and probe pin are reconciled.
+	// A clean-cache pull must first prove that root-owned helper/containerd
+	// registry HTTPS is rejected. The release archive is then the only successful
+	// image source; the helper filters it to this node's platform before the 16 GiB
+	// cache ceiling and probe pin are reconciled.
 	requestRootFault(t, "reset-containerd")
 	requestRootFault(t, "disable-registry")
+	firstRegistryDisabled := true
+	t.Cleanup(func() {
+		if firstRegistryDisabled {
+			requestRootFault(t, "enable-registry")
+		}
+	})
+	registryProbeContext, cancelRegistryProbe := context.WithTimeout(ctx, 5*time.Second)
+	registryProbeErr := session.EnsureImage(registryProbeContext, ocihelper.EnsureImageRequest{
+		Reference: reference, Digest: digest, Source: ocihelper.ImageSourceRegistry,
+		Platform:         ocihelper.OCIPlatform{OS: "linux", Architecture: runtime.GOARCH},
+		OperationTimeout: 5 * time.Second,
+	}, nil)
+	cancelRegistryProbe()
+	var registryProbeFailure *ocihelper.RPCError
+	if !errors.As(registryProbeErr, &registryProbeFailure) || registryProbeFailure.Code != ocihelper.CodeImageUnavailable ||
+		registryProbeFailure.ImageFailure == nil || registryProbeFailure.ImageFailure.Kind != ocihelper.ImageFailureNetwork ||
+		registryProbeFailure.ImageFailure.TopLevelDigest != digest {
+		t.Fatalf("disabled-registry pull = %v, want image_unavailable with network mechanics for %s", registryProbeErr, digest)
+	}
 	loadedByCLI := loadNativeImageThroughCLI(t, ctx, adapter, weftyCLI, archivePath)
 	requestRootFault(t, "enable-registry")
+	firstRegistryDisabled = false
 	if loadedByCLI.TopLevelDigest != digest || loadedByCLI.PlatformDigest == "" {
 		t.Fatalf("clean-cache wefty node load-image evidence = %+v", loadedByCLI)
 	}
@@ -254,8 +277,8 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	}
 
 	// Pull and offline import each start from an empty containerd root. The
-	// second row also rejects all registry HTTPS so the tar stream is the only
-	// possible source of the imported bytes.
+	// second row also rejects root-owned helper/containerd registry HTTPS so the
+	// tar stream is the only possible source of the imported bytes.
 	requestRootFault(t, "reset-containerd")
 	var pulled ocihelper.EnsureImageResponse
 	err = session.EnsureImage(ctx, ocihelper.EnsureImageRequest{
@@ -1913,6 +1936,29 @@ func requestRootFault(t *testing.T, action string) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("root fault %s was not acknowledged", action)
+}
+
+func assertUnprivilegedRunnerReceipt(t *testing.T, path string) {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read OCI provision receipt: %v", err)
+	}
+	facts := map[string]string{}
+	for _, line := range strings.Split(string(payload), "\n") {
+		if key, value, ok := strings.Cut(line, "="); ok {
+			facts[key] = value
+		}
+	}
+	for _, key := range []string{"runner_job_uid", "runner_listener_uid"} {
+		uid, parseErr := strconv.ParseUint(facts[key], 10, 32)
+		if parseErr != nil || uid == 0 {
+			t.Fatalf("OCI provision receipt %s = %q, want an unprivileged uid", key, facts[key])
+		}
+	}
+	if facts["runner_listener_owner"] == "" {
+		t.Fatal("OCI provision receipt omitted the runner listener process owner")
+	}
 }
 
 func waitForCacheEviction(t *testing.T, ctx context.Context, session *ocihelper.Session, previousDigest, wantDigest string) ocihelper.ImageCacheEviction {

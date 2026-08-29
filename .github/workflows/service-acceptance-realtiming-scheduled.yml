@@ -79,6 +79,7 @@ jobs:
       matrix:
         os: [macos-15, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     env:
       IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
       COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-reference
@@ -143,6 +144,14 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes e2fsprogs util-linux
+          if ! sudo iptables -I OUTPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT; then
+            printf '%s\n' '::error::owner-scoped registry fault rule is unsupported'
+            exit 1
+          fi
+          if ! sudo iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT; then
+            printf '%s\n' '::error::owner-scoped registry fault rule could not be removed'
+            exit 1
+          fi
           sudo modprobe loop
           test -e /dev/loop-control
           curl --fail --location --retry 5 --output containerd.tar.gz "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz"
@@ -338,11 +347,21 @@ jobs:
           SCRIPT
           sudo chmod 0755 /usr/local/libexec/wefty-oci-fault-supervisor
           sudo sh -c 'nohup /usr/local/libexec/wefty-oci-fault-supervisor >/tmp/wefty-oci-fault-supervisor.log 2>&1 &'
+          runner_job_uid="$(id -u)"
+          runner_listener_pid="$(pgrep -o -f '[R]unner.Listener')"
+          test -n "$runner_listener_pid"
+          runner_listener_uid="$(ps -o uid= -p "$runner_listener_pid" | tr -d ' ')"
+          runner_listener_owner="$(ps -o user= -p "$runner_listener_pid" | tr -d ' ')"
+          test "$runner_job_uid" -ne 0
+          test "$runner_listener_uid" -ne 0
+          test -n "$runner_listener_owner"
           {
             /usr/local/bin/containerd --version
             /usr/local/sbin/runc --version
             grep -w overlay /proc/filesystems
             sudo stat --format='raw_socket_mode=%a raw_socket_owner=%U:%G' /run/wefty-containerd/containerd.sock
+            printf 'runner_job_uid=%s\nrunner_listener_uid=%s\nrunner_listener_owner=%s\n' \
+              "$runner_job_uid" "$runner_listener_uid" "$runner_listener_owner"
             printf 'acceptance_reference=%s\nacceptance_index_digest=%s\n' "$PROBE_REFERENCE" "$PROBE_DIGEST"
             cat /tmp/wefty-acceptance-image.json
             printf 'computer_reference=%s\ncomputer_index_digest=%s\n' "$COMPUTER_REFERENCE" "$COMPUTER_DIGEST"
@@ -369,6 +388,7 @@ jobs:
             printf 'WEFTY_OCI_SERVICE_NAMED_ARCHIVE=%s\n' /tmp/wefty-service-data-named.oci.tar
             printf 'WEFTY_OCI_FAULT_FIFO=%s\n' /tmp/wefty-oci-faults/control
             printf 'WEFTY_OCI_FAULT_DIR=%s\n' /tmp/wefty-oci-faults
+            printf 'WEFTY_OCI_PROVISION_RECEIPT=%s\n' /tmp/wefty-oci-provision.txt
           } >> "$GITHUB_ENV"
       - name: Run service acceptance at production timings
         env:
