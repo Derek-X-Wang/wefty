@@ -4,6 +4,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -19,6 +20,7 @@ HTML = "/opt/wefty-computer-wayland/oracle.html"
 LOCK = threading.Lock()
 INPUT = {"version": 1, "generation": 0, "key_events": 0, "x": 0, "y": 0, "pointer_history": [[0, 0]], "observer_lines": 0}
 OBSERVED_STATES = []
+POINTER_MOTION = re.compile(r"] motion: time: [0-9]+; x, y: (-?[0-9]+(?:\.[0-9]+)?), (-?[0-9]+(?:\.[0-9]+)?)")
 
 
 def atomic_json(path, value):
@@ -81,6 +83,15 @@ def observe_wayland_input():
                 atomic_json(ORACLE, INPUT)
             if "wl_keyboard" in line and "] key:" in line:
                 wefty_record_input({"version": 1, "kind": "key"})
+            elif "wl_pointer" in line and "] motion:" in line:
+                match = POINTER_MOTION.search(line)
+                if match:
+                    wefty_record_input({
+                        "version": 1,
+                        "kind": "pointer",
+                        "x": round(float(match.group(1))),
+                        "y": round(float(match.group(2))),
+                    })
         process.wait()
         time.sleep(0.1)
 
@@ -120,20 +131,6 @@ def publish_surface_readiness():
         time.sleep(0.05)
     with open(SURFACE_READY, "w", encoding="ascii") as marker:
         marker.write("ready\n")
-
-
-def focus_keyboard_oracle():
-    try:
-        subprocess.run(
-            ["swaymsg", '[app_id="wev"] focus'],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-        )
-        return True
-    except (OSError, subprocess.SubprocessError):
-        return False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -180,7 +177,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ("/surface-ready", "/input"):
+        if self.path != "/surface-ready":
             self.send_error(404)
             return
         try:
@@ -196,15 +193,11 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeError, json.JSONDecodeError):
             self.send_error(400)
             return
-        if self.path == "/surface-ready":
-            if value != {"version": 1}:
-                self.send_error(400)
-                return
-            with open(BROWSER_READY, "w", encoding="ascii") as marker:
-                marker.write("ready\n")
-        elif not focus_keyboard_oracle() or not wefty_record_input(value):
+        if value != {"version": 1}:
             self.send_error(400)
             return
+        with open(BROWSER_READY, "w", encoding="ascii") as marker:
+            marker.write("ready\n")
         self.send_response(204)
         self.end_headers()
 

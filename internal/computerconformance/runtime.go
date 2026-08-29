@@ -713,7 +713,7 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 		r.record(ids[2], StatusNotRun, "input oracle was unavailable")
 		return
 	}
-	pointerObservation, pointerObserved := r.sendControlPointer(ctx, before.Generation, 503, 389)
+	pointerObservation, pointerObserved := r.sendControlPointer(ctx, before.Generation, 1103, 389)
 	if !pointerObserved {
 		r.record(ids[2], StatusFail, "control pointer was not observed")
 		_ = r.writeDriver(`{"version":1,"human_driving":false}`)
