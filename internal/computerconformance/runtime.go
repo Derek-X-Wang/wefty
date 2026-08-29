@@ -650,7 +650,7 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 	if !r.requireTools(ids, "cat") {
 		return
 	}
-	if !r.proveViewIsolation(ctx, ids[0], 211, 173, 947, 611) {
+	if !r.proveViewIsolation(ctx, ids[0], 211, 173, 947, 411) {
 		return
 	}
 	if !r.mutateAndObserveDriver(ctx, `{"version":1,"human_driving":true}`, true) {
@@ -658,7 +658,7 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 		r.record(ids[2], StatusNotRun, "driver tenure oracle was unavailable")
 		return
 	}
-	if !r.proveViewIsolation(ctx, ids[1], 337, 229, 901, 577) {
+	if !r.proveViewIsolation(ctx, ids[1], 337, 229, 901, 477) {
 		_ = r.writeDriver(`{"version":1,"human_driving":false}`)
 		return
 	}
