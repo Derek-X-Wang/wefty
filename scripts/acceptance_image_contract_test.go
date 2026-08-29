@@ -119,6 +119,12 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if called.Uses != "./.github/workflows/acceptance-image-build.yml" {
 		t.Fatalf("contract-gate image lane uses %q", called.Uses)
 	}
+	if !bytes.Contains(gateBytes, []byte("GOOS=linux go vet -tags=service_acceptance_realtiming ./...")) {
+		t.Fatal("contract-gate does not compile the Linux production-timing acceptance surface")
+	}
+	if !bytes.Contains(gateBytes, []byte("GOOS=darwin go vet -tags=service_acceptance_realtiming ./...")) {
+		t.Fatal("contract-gate does not compile the Darwin production-timing acceptance surface")
+	}
 	needs := stringSlice(t, gate.Jobs["all-tests-pass"].Needs)
 	if !slices.Contains(needs, "acceptance-image") || !strings.Contains(string(gateBytes), "ACCEPTANCE_IMAGE_RESULT") {
 		t.Fatal("all-tests-pass does not fail closed on acceptance-image")

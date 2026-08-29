@@ -69,6 +69,7 @@ func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
 	computerAuthority.Class = "service"
 	computerRequest := testRunRequest(computerAuthority, 5*time.Second)
 	computerRequest.Workload.Computer = true
+	computerRequest.Workload.Limits.MemoryBytes = 1 << 30
 	computerRequest.Workload.ManagedVolumes = testComputerManagedVolumes()
 	computerRequest.AllocateEndpoints = []string{"view", "control"}
 	if _, err := session.Run(ctx, computerRequest); err != nil {
@@ -156,4 +157,28 @@ func (engine *realtimeFakeEngine) Run(ctx context.Context, request RunRequest) (
 	}
 	engine.setRunResponse(response)
 	return engine.fakeEngine.Run(ctx, request)
+}
+
+func (*realtimeFakeEngine) CreateComputerBackup(_ context.Context, request CreateComputerBackupRequest) (CreateComputerBackupResponse, error) {
+	return CreateComputerBackupResponse{Receipt: ComputerBackupCopyReceipt{
+		Kind: "computer_backup_copy_verified", ReceiptID: "realtime-backup-receipt",
+		BackupID: request.BackupID, CopyID: request.CopyID,
+		ComputerID: request.Storage.ComputerID, StorageID: request.Storage.StorageID,
+		StorageGeneration: request.Storage.StorageGeneration, NodeID: request.Authority.NodeID,
+		RootInstanceID: request.Authority.RootInstanceID, JobID: request.Authority.JobID,
+		OperationRevision: request.Authority.OperationRevision, CleanupFence: request.Authority.CleanupFence,
+		HelperGeneration: request.Authority.HelperGeneration, AllocatedSize: request.Storage.DiskBytes,
+		ContentDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Encryption: "none",
+	}}, nil
+}
+
+func (*realtimeFakeEngine) DeleteComputerBackupCopy(_ context.Context, request DeleteComputerBackupCopyRequest) (DeleteComputerBackupCopyResponse, error) {
+	return DeleteComputerBackupCopyResponse{Receipt: ComputerBackupCopyRemovalReceipt{
+		Kind: "computer_backup_copy_removed", ReceiptID: "realtime-backup-removal-receipt",
+		BackupID: request.BackupID, CopyID: request.CopyID,
+		ComputerID: request.Storage.ComputerID, StorageID: request.Storage.StorageID,
+		StorageGeneration: request.Storage.StorageGeneration, NodeID: request.Authority.NodeID,
+		RootInstanceID: request.Authority.RootInstanceID, OperationRevision: request.Authority.OperationRevision,
+		CleanupFence: request.Authority.CleanupFence, HelperGeneration: request.Authority.HelperGeneration, Absent: true,
+	}}, nil
 }
