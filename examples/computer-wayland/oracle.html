@@ -20,6 +20,7 @@
       <output id="state">idle</output>
     </main>
     <script>
+      const inputNonce = __WEFTY_INPUT_NONCE__;
       const refresh = async () => {
         try {
           const state = await (await fetch('/agent-state', {cache: 'no-store'})).json();
@@ -33,6 +34,7 @@
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           version: 1,
+          nonce: inputNonce,
           kind: 'pointer',
           x: event.clientX,
           y: event.clientY + (window.outerHeight - window.innerHeight),
@@ -41,18 +43,13 @@
       for (const type of ['pointermove', 'pointerdown', 'pointerup']) {
         window.addEventListener(type, recordPointer);
       }
-      window.addEventListener('keydown', () => fetch('/input', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({version: 1, kind: 'key'}),
-      }).catch(() => {}));
       setInterval(refresh, 100);
       refresh();
       document.body.focus();
       fetch('/surface-ready', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({version: 1}),
+        body: JSON.stringify({version: 1, nonce: inputNonce}),
       });
     </script>
   </body>

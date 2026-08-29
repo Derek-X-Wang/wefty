@@ -95,10 +95,12 @@ published library contains no mutation hook; the `text-frames-accepted`
 derivative recompiles it with `-Dwefty_mutation_hooks=true` before proving the
 owning cell fails.
 
-The image derives its input receipt after compositor delivery. Chromium's
-Wayland surface records pointer coordinates and focused key events, while a
-transparent native `wev` client independently observes `wl_keyboard` events
-when it owns focus. The checker first
+The image derives its input receipt from two guest-side Wayland clients after
+compositor delivery. The fullscreen Chromium surface records pointer
+coordinates through a per-boot nonce-bound callback, while a transparent
+native `wev` client records `wl_keyboard` events only when it owns keyboard
+focus. These are client observations, not compositor-listener evidence. The
+checker first
 proves view input leaves that guest receipt unchanged and then proves control
 input changes it at exact coordinates. Thus parser acceptance alone cannot
 satisfy `input.control-accepted`, and regressing `--disable-input` fails both

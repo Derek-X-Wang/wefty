@@ -102,9 +102,17 @@ fi
 
 surface_wait=45
 while [ "$surface_wait" -gt 0 ] && { [ ! -s /tmp/wefty-computer/surface-ready ] || [ ! -s /tmp/wefty-computer/driver-state.json ]; }; do
+  if [ -s /tmp/wefty-computer/surface-failure ]; then
+    cat /tmp/wefty-computer/surface-failure >&2
+    exit 1
+  fi
   sleep 1
   surface_wait=$((surface_wait - 1))
 done
+if [ -s /tmp/wefty-computer/surface-failure ]; then
+  cat /tmp/wefty-computer/surface-failure >&2
+  exit 1
+fi
 if [ "$surface_wait" -eq 0 ]; then
   echo 'Wayland input surface or driver observer did not become ready within 45 seconds' >&2
   exit 1

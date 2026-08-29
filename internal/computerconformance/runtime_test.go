@@ -39,3 +39,26 @@ func TestConformantSubjectNeverUsesMutationShortCircuit(t *testing.T) {
 		t.Fatal("conformant subject used the broken-image short circuit")
 	}
 }
+
+func TestInputObserverAdvanceRequiresKeyAndObserverProgress(t *testing.T) {
+	observerLines := func(value uint64) *uint64 { return &value }
+	before := inputObservation{KeyEvents: 7, ObserverLines: observerLines(19)}
+	for name, after := range map[string]inputObservation{
+		"neither":       {KeyEvents: 7, ObserverLines: observerLines(19)},
+		"key only":      {KeyEvents: 8, ObserverLines: observerLines(19)},
+		"observer only": {KeyEvents: 7, ObserverLines: observerLines(20)},
+		"field removed": {KeyEvents: 8},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if inputObserverAdvanced(before, after) {
+				t.Fatalf("inputObserverAdvanced(%+v, %+v) = true", before, after)
+			}
+		})
+	}
+	if after := (inputObservation{KeyEvents: 8, ObserverLines: observerLines(20)}); !inputObserverAdvanced(before, after) {
+		t.Fatalf("inputObserverAdvanced(%+v, %+v) = false", before, after)
+	}
+	if !inputObserverAdvanced(inputObservation{KeyEvents: 7}, inputObservation{KeyEvents: 8}) {
+		t.Fatal("inputObserverAdvanced rejected a key-only legacy oracle")
+	}
+}

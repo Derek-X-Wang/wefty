@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Serve the furniture surface and record focused native Wayland input."""
+"""Serve the furniture surface and record guest-side Wayland input."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-import re
+import secrets
 import subprocess
+import sys
 import threading
 import time
 
@@ -14,13 +15,14 @@ HOME = os.environ.get("HOME", "/home/wefty")
 ORACLE = f"{ROOT}/input-oracle.json"
 BROWSER_READY = f"{ROOT}/browser-ready"
 SURFACE_READY = f"{ROOT}/surface-ready"
+SURFACE_FAILURE = f"{ROOT}/surface-failure"
 STATE = f"{HOME}/.local/state/wefty/agent-state.json"
 THEME = f"{HOME}/.config/wefty/theme.json"
 HTML = "/opt/wefty-computer-wayland/oracle.html"
 LOCK = threading.Lock()
+INPUT_NONCE = secrets.token_hex(32)
 INPUT = {"version": 1, "ready": False, "generation": 0, "key_events": 0, "x": 0, "y": 0, "pointer_history": [[0, 0]], "observer_lines": 0}
 OBSERVED_STATES = []
-POINTER_MOTION = re.compile(r"] motion: time: [0-9]+; x, y: (-?[0-9]+(?:\.[0-9]+)?), (-?[0-9]+(?:\.[0-9]+)?)")
 
 
 def atomic_json(path, value):
@@ -41,7 +43,7 @@ def read_json(path, fallback):
 
 
 def wefty_record_input(value):
-    """Record only events delivered through Sway to the focused Wayland client."""
+    """Record wev keys or pointer facts from the focused Chromium client."""
     kind = value.get("kind") if isinstance(value, dict) else None
     with LOCK:
         if kind == "key" and value.get("version") == 1:
@@ -66,7 +68,7 @@ def wait_for_browser():
 
 
 def observe_wayland_input():
-    """Translate events from the focused native Wayland client into the oracle."""
+    """Translate keyboard events from the focused native wev client."""
     wait_for_browser()
     while True:
         process = subprocess.Popen(
@@ -83,15 +85,6 @@ def observe_wayland_input():
                 atomic_json(ORACLE, INPUT)
             if "wl_keyboard" in line and "] key:" in line:
                 wefty_record_input({"version": 1, "kind": "key"})
-            elif "wl_pointer" in line and "] motion:" in line:
-                match = POINTER_MOTION.search(line)
-                if match:
-                    wefty_record_input({
-                        "version": 1,
-                        "kind": "pointer",
-                        "x": round(float(match.group(1))),
-                        "y": round(float(match.group(2))),
-                    })
         process.wait()
         time.sleep(0.1)
 
@@ -141,17 +134,26 @@ def focus_input_observer():
 
 def publish_surface_readiness():
     wait_for_browser()
-    while True:
+    next_focus_attempt = 0.0
+    for _ in range(40):
         browser_fullscreen, keyboard_focused = tree_surface_state()
-        if browser_fullscreen and not keyboard_focused:
+        now = time.monotonic()
+        if browser_fullscreen and not keyboard_focused and now >= next_focus_attempt:
             # Chromium may publish browser readiness before Sway applies its
             # title-based fullscreen rule. If that late rule steals focus from
             # the already-mapped wev listener, explicitly restore the listener
-            # once the visible surface is known to be fullscreen.
+            # at most once per second while the bounded convergence loop runs.
             focus_input_observer()
+            next_focus_attempt = now + 1.0
         if browser_fullscreen and keyboard_focused:
             break
-        time.sleep(0.05)
+        time.sleep(0.25)
+    else:
+        failure = "wayland-surface-focus-convergence-failed: Chromium was not fullscreen with wev keyboard focus within 10 seconds"
+        with open(SURFACE_FAILURE, "w", encoding="ascii") as marker:
+            marker.write(failure + "\n")
+        print(failure, file=sys.stderr, flush=True)
+        return
     with open(SURFACE_READY, "w", encoding="ascii") as marker:
         marker.write("ready\n")
     with LOCK:
@@ -175,6 +177,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             with open(HTML, "rb") as source:
                 payload = source.read()
+            payload = payload.replace(b"__WEFTY_INPUT_NONCE__", json.dumps(INPUT_NONCE).encode("ascii"), 1)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
@@ -219,13 +222,20 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeError, json.JSONDecodeError):
             self.send_error(400)
             return
+        if not isinstance(value, dict):
+            self.send_error(400)
+            return
+        nonce = value.pop("nonce", None)
+        if not isinstance(nonce, str) or not secrets.compare_digest(nonce, INPUT_NONCE):
+            self.send_error(403)
+            return
         if self.path == "/surface-ready":
             if value != {"version": 1}:
                 self.send_error(400)
                 return
             with open(BROWSER_READY, "w", encoding="ascii") as marker:
                 marker.write("ready\n")
-        elif not wefty_record_input(value):
+        elif value.get("kind") != "pointer" or not wefty_record_input(value):
             self.send_error(400)
             return
         self.send_response(204)

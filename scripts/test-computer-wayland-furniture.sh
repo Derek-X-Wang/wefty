@@ -98,52 +98,57 @@ if [[ $ready != true ]]; then
   docker logs "$container" >&2
   exit 1
 fi
-docker exec "$container" sh -c 'test ! -e /dev/dri && tr "\000" " " < /proc/1/cmdline | grep -q wefty-computer-wayland-entrypoint'
-gpu_device_absent=true
+gpu_device_absent=$(docker exec "$container" sh -c '
+  test ! -e /dev/dri &&
+  tr "\000" " " < /proc/1/cmdline | grep -q wefty-computer-wayland-entrypoint &&
+  printf true
+')
 docker exec "$container" sh -c 'for p in /proc/[0-9]*; do tr "\000" " " < "$p/cmdline" 2>/dev/null; echo; done' > "$root/processes.txt"
 grep -F 'sway --config /opt/wefty-computer-wayland/sway-config' "$root/processes.txt"
-grep -E 'wayvnc -w .*--disable-input|wayvnc -w --disable-input' "$root/processes.txt"
-view_disable_input=true
+view_disable_input=$(grep -E 'wayvnc -w .*--disable-input|wayvnc -w --disable-input' "$root/processes.txt" >/dev/null && printf true)
 grep -E "wayvnc -w .*127\.0\.0\.1 $control_port" "$root/processes.txt"
 if grep -q websockify "$root/processes.txt"; then echo 'websockify process is forbidden' >&2; exit 1; fi
-native_wayvnc_websocket=true
+native_wayvnc_websocket=$(grep -E "wayvnc -w .*127\.0\.0\.1 ($view_port|$control_port)" "$root/processes.txt" >/dev/null && printf true)
 
 docker exec --env WEFTY_AGENT_DEMO_PAUSE=0.6 "$container" wefty-agent-session-demo
 for _ in $(seq 1 80); do
   if docker exec "$container" jq -e '.state == "done" and .observed == ["idle","working","blocked","done"]' /tmp/wefty-computer/agent-state-surface.json >/dev/null 2>&1; then break; fi
   sleep 0.125
 done
-docker exec "$container" jq -e '.state == "done" and .observed == ["idle","working","blocked","done"]' /tmp/wefty-computer/agent-state-surface.json
-agent_states_observed=true
+agent_states_observed=$(docker exec "$container" jq -ce '
+  select(.state == "done" and .observed == ["idle","working","blocked","done"]) | .observed
+' /tmp/wefty-computer/agent-state-surface.json)
 
 docker exec "$container" wefty-theme amber
 for _ in $(seq 1 80); do
   if docker exec "$container" jq -e '.theme == "amber"' /tmp/wefty-computer/theme-surface.json >/dev/null 2>&1; then break; fi
   sleep 0.125
 done
-docker exec "$container" jq -e '.theme == "amber"' /tmp/wefty-computer/theme-surface.json
-self_reconfiguration_observed=true
+self_reconfiguration_observed=$(docker exec "$container" jq -er '.theme == "amber"' /tmp/wefty-computer/theme-surface.json)
 
 set +e
 docker exec "$container" wefty-crash-briefing sh -c 'printf crash-proof >&2; exit 23'
 crash_status=$?
 set -e
 test "$crash_status" -eq 23
-docker exec "$container" jq -e '.kind == "crash-briefing" and .exit_code == 23 and (.log_tail | contains("crash-proof"))' \
-  /home/wefty/.local/state/wefty/crash-briefing.json
-crash_briefing_observed=true
-docker exec "$container" test -x /usr/local/bin/mise || {
-  echo 'mise is not executable in the running reference image' >&2
+crash_briefing_observed=$(docker exec "$container" jq -er \
+  '.kind == "crash-briefing" and .exit_code == 23 and (.log_tail | contains("crash-proof"))' \
+  /home/wefty/.local/state/wefty/crash-briefing.json)
+mise_stubs_present=$(docker exec "$container" sh -c '
+  test -x /usr/local/bin/mise &&
+  test -L /usr/local/bin/claude &&
+  test -L /usr/local/bin/codex &&
+  printf true
+') || {
+  echo 'mise or its agent command stubs are unavailable in the running reference image' >&2
   exit 1
 }
-docker exec "$container" sh -c 'test -L /usr/local/bin/claude && test -L /usr/local/bin/codex' || {
-  echo 'agent command stubs are not both symbolic links' >&2
-  exit 1
-}
-mise_stubs_present=true
-docker exec "$container" /usr/local/libexec/wefty-verify-licenses --check \
-  /usr/share/wefty/licenses/debian-packages.tsv /usr/share/wefty/licenses/non-dpkg-components.tsv
-license_manifest_present=true
+license_manifest_present=$(docker exec "$container" sh -c '
+  /usr/local/libexec/wefty-verify-licenses --check \
+    /usr/share/wefty/licenses/debian-packages.tsv \
+    /usr/share/wefty/licenses/non-dpkg-components.tsv >/dev/null &&
+  printf true
+')
 
 idle_rss_kib=$(docker exec "$container" sh -c '
   total=0
@@ -170,7 +175,7 @@ jq -n --arg platform "linux/$arch" --argjson idle_rss_bytes "$((idle_rss_kib * 1
   --argjson crash_briefing_observed "$crash_briefing_observed" \
   --argjson mise_stubs_present "$mise_stubs_present" \
   --argjson license_manifest_present "$license_manifest_present" \
-  '{version:1,platform:$platform,gpu_device_absent:$gpu_device_absent,native_wayvnc_websocket:$native_wayvnc_websocket,view_disable_input:$view_disable_input,agent_states_observed:(if $agent_states_observed then ["idle","working","blocked","done"] else [] end),self_reconfiguration_observed:$self_reconfiguration_observed,crash_briefing_observed:$crash_briefing_observed,mise_stubs_present:$mise_stubs_present,license_manifest_present:$license_manifest_present,idle_rss_bytes:$idle_rss_bytes,cold_start_seconds:$cold_start_seconds}' \
+  '{version:1,platform:$platform,gpu_device_absent:$gpu_device_absent,native_wayvnc_websocket:$native_wayvnc_websocket,view_disable_input:$view_disable_input,agent_states_observed:$agent_states_observed,self_reconfiguration_observed:$self_reconfiguration_observed,crash_briefing_observed:$crash_briefing_observed,mise_stubs_present:$mise_stubs_present,license_manifest_present:$license_manifest_present,idle_rss_bytes:$idle_rss_bytes,cold_start_seconds:$cold_start_seconds}' \
   > "$output"
 jq -n --arg platform "linux/$arch" --argjson idle_rss_bytes "$((idle_rss_kib * 1024))" \
   --argjson cold_start_seconds "$cold_start" \

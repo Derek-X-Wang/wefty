@@ -217,8 +217,8 @@ type InputSession struct {
 func (session *InputSession) Close() { session.connection.close() }
 
 // SendKey appends a key press and release to an established RFB session. The
-// control oracle uses the same session that focused the guest surface so the
-// compositor cannot discard the key while switching between RFB clients.
+// control oracle keeps the pointer and key on one session while the image's
+// keyboard observer retains focus.
 func (session *InputSession) SendKey() error {
 	for _, event := range rfbKeyEvents() {
 		if err := session.connection.writeFrame(2, event); err != nil {
@@ -245,9 +245,16 @@ func StartInput(ctx context.Context, port, x, y int) (*InputSession, error) {
 	return startRFBEvents(ctx, port, rfbInputEvents(true, x, y))
 }
 
-// SendPointer is the consumption sentinel used after a view probe. Observing
+// StartKey opens a control session without moving or clicking the pointer, so
+// the image's focused keyboard observer can prove its own liveness.
+func StartKey(ctx context.Context, port int) (*InputSession, error) {
+	return startRFBEvents(ctx, port, rfbKeyEvents())
+}
+
+// StartPointer is the consumption sentinel used after a view probe. Observing
 // its unique coordinates proves the earlier key and pointer bytes have passed
-// through the backend's input queue without relying on a fixed sleep.
+// through the backend's input queue without relying on a fixed sleep. Motion
+// without a button press preserves the keyboard observer's Sway focus.
 func StartPointer(ctx context.Context, port, x, y int) (*InputSession, error) {
 	return startRFBEvents(ctx, port, rfbInputEvents(false, x, y))
 }
@@ -304,15 +311,13 @@ func startRFBEvents(ctx context.Context, port int, events [][]byte) (*InputSessi
 
 func rfbInputEvents(withKey bool, x, y int) [][]byte {
 	// Send the key while the image's keyboard oracle retains focus, then move
-	// the pointer. The exact byte sequence remains identical for view and control.
-	events := make([][]byte, 0, 4)
+	// the pointer without clicking away that focus. The exact byte sequence
+	// remains identical for view and control.
+	events := make([][]byte, 0, 3)
 	if withKey {
 		events = append(events, rfbKeyEvents()...)
 	}
-	events = append(events,
-		[]byte{5, 1, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
-		[]byte{5, 0, byte(x >> 8), byte(x), byte(y >> 8), byte(y)},
-	)
+	events = append(events, []byte{5, 0, byte(x >> 8), byte(x), byte(y >> 8), byte(y)})
 	return events
 }
 

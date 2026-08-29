@@ -588,7 +588,7 @@ type inputObservation struct {
 	X              int      `json:"x"`
 	Y              int      `json:"y"`
 	PointerHistory [][2]int `json:"pointer_history"`
-	ObserverLines  uint64   `json:"observer_lines"`
+	ObserverLines  *uint64  `json:"observer_lines,omitempty"`
 }
 
 func (r *runtimeRunner) waitInputReady(ctx context.Context) bool {
@@ -638,6 +638,48 @@ func (r *runtimeRunner) waitInputSentinel(ctx context.Context, after uint64, x, 
 		}
 		if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
 			break
+		}
+	}
+	return last, false
+}
+
+func inputObserverAdvanced(before, after inputObservation) bool {
+	if after.KeyEvents <= before.KeyEvents {
+		return false
+	}
+	if before.ObserverLines == nil {
+		return after.ObserverLines == nil
+	}
+	return after.ObserverLines != nil && *after.ObserverLines > *before.ObserverLines
+}
+
+func inputObserverLines(observation inputObservation) uint64 {
+	if observation.ObserverLines == nil {
+		return 0
+	}
+	return *observation.ObserverLines
+}
+
+func (r *runtimeRunner) waitInputObserverAdvance(ctx context.Context, before inputObservation, session *InputSession) (inputObservation, bool) {
+	last := inputObservation{}
+	// wayvnc can create a new client's virtual keyboard after its first RFB
+	// messages arrive. Reuse that established client while proving liveness so
+	// a cold-start discard cannot look like a dead guest observer.
+	for dispatch := 0; dispatch < 3; dispatch++ {
+		for poll := 0; poll < 4; poll++ {
+			value, err := r.readInputObservation(ctx)
+			if err == nil {
+				last = value
+				if inputObserverAdvanced(before, value) {
+					return value, true
+				}
+			}
+			if r.config.Sleep(ctx, 125*time.Millisecond) != nil {
+				return last, false
+			}
+		}
+		if dispatch < 2 && session.SendKey() != nil {
+			return last, false
 		}
 	}
 	return last, false
@@ -697,6 +739,23 @@ func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targe
 			return false
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		observerSession, err := StartKey(probeCtx, r.controlPort)
+		cancel()
+		if err != nil {
+			if observerSession != nil {
+				observerSession.Close()
+			}
+			r.record(id, StatusFail, "key observer liveness control keystroke could not be sent")
+			return false
+		}
+		observer, observerLive := r.waitInputObserverAdvance(ctx, before, observerSession)
+		observerSession.Close()
+		if !observerLive {
+			r.record(id, StatusFail, fmt.Sprintf("key observer did not advance after the control liveness keystroke (key_events=%d observer_lines=%d)", observer.KeyEvents, inputObserverLines(observer)))
+			return false
+		}
+		before = observer
+		probeCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
 		viewSession, err := StartInput(probeCtx, r.viewPort, x, y)
 		cancel()
 		if err == nil {
@@ -734,22 +793,26 @@ func (r *runtimeRunner) proveViewIsolation(ctx context.Context, id string, targe
 			return false
 		}
 		after, ok := r.waitInputSentinel(ctx, before.Generation, sx, sy)
-		viewSession.Close()
-		sentinelSession.Close()
 		if after.KeyEvents != before.KeyEvents || (after.Generation > before.Generation && historyContains(after, x, y)) {
+			viewSession.Close()
+			sentinelSession.Close()
 			r.record(id, StatusFail, "view pointer or key input reached the guest before the control sentinel")
 			return false
 		}
 		if !ok {
+			viewSession.Close()
+			sentinelSession.Close()
 			detail := "control sentinel was not observed after view input"
 			if r.config.MutationProfile == "" {
-				detail = fmt.Sprintf("%s (generation=%d key_events=%d pointer=%d,%d observer_lines=%d)", detail, after.Generation, after.KeyEvents, after.X, after.Y, after.ObserverLines)
+				detail = fmt.Sprintf("%s (generation=%d key_events=%d pointer=%d,%d observer_lines=%d)", detail, after.Generation, after.KeyEvents, after.X, after.Y, inputObserverLines(after))
 			}
 			r.record(id, StatusFail, detail)
 			return false
 		}
+		viewSession.Close()
+		sentinelSession.Close()
 	}
-	r.record(id, StatusPass, "control sentinel proved the preceding view pointer and key were consumed without guest input")
+	r.record(id, StatusPass, "key-observer liveness and a control pointer sentinel proved the view input was consumed without guest input")
 	return true
 }
 
