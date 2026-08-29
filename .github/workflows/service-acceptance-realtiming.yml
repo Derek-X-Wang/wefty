@@ -67,6 +67,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
+      COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-reference
     steps:
       - name: Check out the exact trusted publishing commit
         if: github.event_name == 'workflow_run'
@@ -82,13 +83,23 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ needs.resolve-published-artifact.outputs.run-id }}
+      - name: Download the matching Computer image artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: wefty-computer-reference-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          path: ${{ runner.temp }}/computer-image-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.resolve-published-artifact.outputs.run-id }}
       - name: Pin the downloaded artifact identity
         env:
           EXPECTED_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
         run: |
           set -euo pipefail
           tar -xf "$RUNNER_TEMP/acceptance-image-download/wefty-acceptance-image-release.tar" -C "$RUNNER_TEMP"
+          tar -xf "$RUNNER_TEMP/computer-image-download/wefty-computer-reference-release.tar" -C "$RUNNER_TEMP"
           test "$(jq -r .commit "$RUNNER_TEMP/acceptance-image-release/acceptance-image-receipt.json")" = "$EXPECTED_SHA"
+          test "$(jq -r .commit "$RUNNER_TEMP/computer-image-release/computer-image-receipt.json")" = "$EXPECTED_SHA"
           candidate_sha="$(git rev-parse HEAD)"
           if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
             test "$candidate_sha" = "$EXPECTED_SHA"
@@ -154,6 +165,19 @@ jobs:
             --expected-platform linux/arm64 \
             --receipt-output /tmp/wefty-acceptance-image.json
           chmod 0644 "$ECHO_ARCHIVE"
+          computer_release="$RUNNER_TEMP/computer-image-release"
+          COMPUTER_REFERENCE="$(jq -r .reference "$computer_release/computer-image-receipt.json")"
+          COMPUTER_DIGEST="$(jq -r .index_digest "$computer_release/computer-image-receipt.json")"
+          COMPUTER_ARCHIVE="$computer_release/wefty-computer-reference.oci.tar"
+          test "$COMPUTER_REFERENCE" = "$COMPUTER_IMAGE_NAME"
+          test "$COMPUTER_DIGEST" = "$(cat "$computer_release/computer-image-index-digest.txt")"
+          scripts/verify-acceptance-image.sh \
+            --archive "$COMPUTER_ARCHIVE" \
+            --expected-top-digest "$COMPUTER_DIGEST" \
+            --expected-platform linux/amd64 \
+            --expected-platform linux/arm64 \
+            --receipt-output /tmp/wefty-computer-image.json
+          chmod 0644 "$COMPUTER_ARCHIVE"
           PROBE_REFERENCE="$ECHO_REFERENCE"
           PROBE_DIGEST="$ECHO_DIGEST"
           WEFTY_AGENT="$release/linux-amd64/libexec/wefty-agent"
@@ -283,6 +307,8 @@ jobs:
             sudo stat --format='raw_socket_mode=%a raw_socket_owner=%U:%G' /run/wefty-containerd/containerd.sock
             printf 'acceptance_reference=%s\nacceptance_index_digest=%s\n' "$PROBE_REFERENCE" "$PROBE_DIGEST"
             cat /tmp/wefty-acceptance-image.json
+            printf 'computer_reference=%s\ncomputer_index_digest=%s\n' "$COMPUTER_REFERENCE" "$COMPUTER_DIGEST"
+            cat /tmp/wefty-computer-image.json
           } > /tmp/wefty-oci-provision.txt
           {
             printf 'WEFTY_OCI_CONTAINERD_ADDRESS=%s\n' /run/wefty-containerd/containerd.sock
@@ -294,6 +320,9 @@ jobs:
             printf 'WEFTY_OCI_ECHO_REFERENCE=%s\n' "$ECHO_REFERENCE"
             printf 'WEFTY_OCI_ECHO_DIGEST=%s\n' "$ECHO_DIGEST"
             printf 'WEFTY_OCI_ECHO_ARCHIVE=%s\n' "$ECHO_ARCHIVE"
+            printf 'WEFTY_OCI_COMPUTER_REFERENCE=%s\n' "$COMPUTER_REFERENCE"
+            printf 'WEFTY_OCI_COMPUTER_DIGEST=%s\n' "$COMPUTER_DIGEST"
+            printf 'WEFTY_OCI_COMPUTER_ARCHIVE=%s\n' "$COMPUTER_ARCHIVE"
             printf 'WEFTY_OCI_CLI=%s\n' "$WEFTY_CLI"
             printf 'WEFTY_OCI_SERVICE_NUMERIC_REFERENCE=%s\n' "$NUMERIC_REFERENCE"
             printf 'WEFTY_OCI_SERVICE_NUMERIC_ARCHIVE=%s\n' /tmp/wefty-service-data-numeric.oci.tar

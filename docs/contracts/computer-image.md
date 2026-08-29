@@ -85,7 +85,9 @@ The roles are fixed:
 
 Both named endpoints implement the same exact transport contract:
 
-- WebSocket request path `/websockify`.
+- WebSocket request path `/websockify`; query and fragment components are
+  accepted and ignored, so viewer-added values such as `?token=` do not change
+  routing.
 - Exactly negotiated `binary` WebSocket subprotocol.
 - RFB bytes in binary frames only; a text frame is rejected and closes the
   connection.
@@ -180,6 +182,10 @@ malformed, or unknown-version document as `human_driving=false`, and must not
 attempt to write, rename, or persist it. The signal carries no driver identity,
 history, or authority and never asks the tenant process to pause.
 
+JSON types are exact: `version` is an integer (not a boolean) equal to `1`, and
+`human_driving` is a boolean (not `0` or `1`). A type mismatch is malformed and
+therefore fails closed to `human_driving=false`.
+
 ## Conformance seam and evidence
 
 The transport-neutral Go contract exports the endpoint names, path,
@@ -192,6 +198,7 @@ Portable tests prove reserved-value stripping, exact endpoint admission,
 wire-negative cases, atomic loss/recovery, injected-clock deadline behavior,
 and the serialized profile. The Linux `service_acceptance_realtiming` lane
 asserts `/dev/shm` mode, flags, size, and a rising cgroup `memory.current` after
-a guest write. The optional
-reference image and `wefty-computer-conformance` CLI remain separate tickets;
-this contract does not implement either artifact.
+a guest write. The optional `examples/computer/` reference image implements
+this minimum contract as an image-author and acceptance example. The
+`wefty-computer-conformance` CLI remains ticket #182; this contract does not
+implement that checker.

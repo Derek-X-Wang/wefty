@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -35,6 +36,7 @@ import (
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
+	"github.com/coder/websocket"
 )
 
 func TestMain(m *testing.M) {
@@ -63,11 +65,17 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	numericArchivePath := os.Getenv("WEFTY_OCI_SERVICE_NUMERIC_ARCHIVE")
 	namedReference := os.Getenv("WEFTY_OCI_SERVICE_NAMED_REFERENCE")
 	namedArchivePath := os.Getenv("WEFTY_OCI_SERVICE_NAMED_ARCHIVE")
-	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoDigest == "" || echoArchivePath == "" || weftyCLI == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" {
+	computerReference := os.Getenv("WEFTY_OCI_COMPUTER_REFERENCE")
+	computerDigest := os.Getenv("WEFTY_OCI_COMPUTER_DIGEST")
+	computerArchivePath := os.Getenv("WEFTY_OCI_COMPUTER_ARCHIVE")
+	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoDigest == "" || echoArchivePath == "" || weftyCLI == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" || computerReference == "" || computerDigest == "" || computerArchivePath == "" {
 		t.Fatal("Linux OCI realtiming provisioning is incomplete")
 	}
 	if reference != echoReference || digest != echoDigest || archivePath != echoArchivePath || reference != "ghcr.io/derek-x-wang/wefty-echo-service" {
 		t.Fatalf("probe and workload did not consume one canonical public artifact: probe=%s@%s archive=%s echo=%s@%s archive=%s", reference, digest, archivePath, echoReference, echoDigest, echoArchivePath)
+	}
+	if computerReference != "ghcr.io/derek-x-wang/wefty-computer-reference" || computerReference == echoReference || computerArchivePath == echoArchivePath {
+		t.Fatalf("reference Computer artifact is not separate from generic OCI acceptance: %s@%s archive=%s", computerReference, computerDigest, computerArchivePath)
 	}
 	if os.Geteuid() == 0 {
 		t.Fatal("Linux OCI realtiming test process must be unprivileged")
@@ -88,7 +96,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer barrier.Close()
-	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Minute)
 	defer cancel()
 	if err := barrier.Ensure(ctx); err != nil {
 		t.Fatal(err)
@@ -394,6 +402,11 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if echoImage.TopLevelDigest != echoDigest || echoImage.PlatformDigest == "" {
 		t.Fatalf("wefty node load-image identity = %+v, want top-level %s", echoImage, echoDigest)
 	}
+	computerImage := loadNativeImageArchive(t, ctx, adapter, computerReference, computerArchivePath)
+	if computerImage.TopLevelDigest != computerDigest || computerImage.PlatformDigest == "" {
+		t.Fatalf("reference Computer archive identity = %+v, want top-level %s", computerImage, computerDigest)
+	}
+	referenceComputerReadiness := exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, computerReference, computerDigest)
 	numericImage := loadNativeImageArchive(t, ctx, adapter, numericReference, numericArchivePath)
 	namedImage := loadNativeImageArchive(t, ctx, adapter, namedReference, namedArchivePath)
 	serviceDataEvidence := exerciseNativeLinuxServiceData(t, ctx, session, adapter, []nativeServiceDataImage{
@@ -675,10 +688,183 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "node-doctor.json"), append(doctorBundle, '\n'), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_capacity_three_live_published_fourth_refused=true\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, handoffMarkerBytes)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_reference=%s\ncomputer_index_digest=%s\ncomputer_reference_separate=true\ncomputer_reference_archive_import=true\ncomputer_reference_atomic_readiness=%t\ncomputer_reference_readiness_elapsed=%s\ncomputer_reference_publication_loss_recovery=%t\ncomputer_reference_wire_negatives=true\ncomputer_capacity_three_live_published_fourth_refused=true\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\ncomputer_reference_helper_stop_start_profile_sign_in_rootfs=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerReference, computerDigest, referenceComputerReadiness.atomicPublication, referenceComputerReadiness.elapsed, referenceComputerReadiness.lossRecovery, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+type referenceComputerEvidence struct {
+	elapsed           time.Duration
+	atomicPublication bool
+	lossRecovery      bool
+}
+
+func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, session *ocihelper.Session, adapter *ocirunner.Adapter, reference, digest string) referenceComputerEvidence {
+	t.Helper()
+	memory := int64(2 << 30)
+	digestCopy := digest
+	authority := workloadrunner.AttemptAuthority{NodeID: "reference-node", BootSessionID: "reference-boot", JobID: "reference-job", AttemptID: "reference-attempt", FencingToken: "reference-fence", WorkloadClass: contract.JobClassService, RemovalGeneration: "attempt"}
+	storage := &workloadrunner.ComputerStorage{ComputerID: "reference-computer", StorageID: "reference-storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 128 << 20}
+	request := workloadrunner.Request{Authority: authority, RuntimeHandler: ocihelper.DefaultRuntimeHandler, InitialDeadman: l1.DefaultLeaseDuration, LifetimeBoundary: workloadrunner.AgentBootLifetime,
+		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: reference, Digest: &digestCopy}, Computer: &contract.OCIComputerSpec{Display: contract.OCIComputerDisplaySpec{Protocol: contract.ComputerDisplayProtocolRFBWebSocketV1}, DiskBytes: storage.DiskBytes}, Limits: &contract.OCILimits{MemoryBytes: &memory}}},
+		ManagedVolumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}}, AttemptEndpoints: []string{workloadrunner.AttemptEndpointView, workloadrunner.AttemptEndpointControl},
+		OCIImageResolved: func(context.Context, workloadrunner.OCIImageObservation) error { return nil }, OCIStarted: func(context.Context, workloadrunner.OCIImageObservation) error { return nil }}
+	endpoints := make(map[string]workloadrunner.AttemptEndpoint)
+	endpointReady := make(chan struct{}, 2)
+	var endpointMu sync.Mutex
+	request.AttemptEndpointReady = func(name string, endpoint workloadrunner.AttemptEndpoint) error {
+		endpointMu.Lock()
+		endpoints[name] = endpoint
+		endpointMu.Unlock()
+		endpointReady <- struct{}{}
+		return nil
+	}
+	var available atomic.Bool
+	available.Store(true)
+	dial := func(dialContext context.Context, name string) (net.Conn, error) {
+		if !available.Load() {
+			return nil, errors.New("injected realtiming endpoint loss")
+		}
+		endpointMu.Lock()
+		endpoint, ok := endpoints[name]
+		endpointMu.Unlock()
+		if !ok {
+			return nil, fmt.Errorf("endpoint %q not ready", name)
+		}
+		return endpoint.Dial(dialContext)
+	}
+	publications := make(chan bool, 8)
+	runContext, cancelRun := context.WithCancel(ctx)
+	runDone := make(chan error, 1)
+	startedAt := time.Now()
+	network := plain.NewNetwork()
+	go func() {
+		_, err := agent.RunComputerServiceRealtiming(runContext, adapter, request, network.NewFabric(fabric.Identity{NodeID: "reference-agent"}), dial,
+			func(_ context.Context, ready bool, _ string) error { publications <- ready; return nil })
+		runDone <- err
+	}()
+	for range 2 {
+		select {
+		case <-endpointReady:
+		case <-time.After(contract.ComputerStartupReadinessTimeout):
+			t.Fatal("helper did not return both reference endpoints")
+		}
+	}
+	waitPublication := func(want bool) {
+		t.Helper()
+		select {
+		case got := <-publications:
+			if got != want {
+				t.Fatalf("Computer publication=%t, want %t", got, want)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatalf("Computer publication did not become %t", want)
+		}
+	}
+	waitPublication(true)
+	readyAt := time.Now()
+	helperAuthority := ocihelper.AttemptAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, AttemptID: authority.AttemptID, FencingToken: authority.FencingToken, Class: authority.WorkloadClass, RemovalGeneration: authority.RemovalGeneration}
+	assertReferenceComputerWireNegatives(t, ctx, session, helperAuthority)
+	available.Store(false)
+	waitPublication(false)
+	available.Store(true)
+	waitPublication(true)
+	cancelRun()
+	select {
+	case <-runDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("reference Computer agent service did not stop")
+	}
+	if err := adapter.FinalizeManagedVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
+		Authority: authority, Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
+		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "reference-computer-cleanup"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return referenceComputerEvidence{elapsed: readyAt.Sub(startedAt), atomicPublication: true, lossRecovery: true}
+}
+
+func probeReferenceComputerPair(ctx context.Context, session *ocihelper.Session, authority ocihelper.AttemptAuthority) error {
+	view, err := openReferenceComputerEndpoint(ctx, session, authority, contract.ComputerDisplayEndpointView, contract.ComputerDisplayWebSocketPath, []string{contract.ComputerDisplayWebSocketSubprotocol})
+	if err != nil {
+		return err
+	}
+	defer view.CloseNow()
+	control, err := openReferenceComputerEndpoint(ctx, session, authority, contract.ComputerDisplayEndpointControl, contract.ComputerDisplayWebSocketPath, []string{contract.ComputerDisplayWebSocketSubprotocol})
+	if err != nil {
+		return err
+	}
+	defer control.CloseNow()
+	return nil
+}
+
+func openReferenceComputerEndpoint(ctx context.Context, session *ocihelper.Session, authority ocihelper.AttemptAuthority, name, path string, protocols []string) (*websocket.Conn, error) {
+	var used atomic.Bool
+	transport := &http.Transport{DialContext: func(dialContext context.Context, _, _ string) (net.Conn, error) {
+		if !used.CompareAndSwap(false, true) {
+			return nil, errors.New("reference Computer probe attempted more than one helper dial")
+		}
+		return session.DialAttemptPort(dialContext, ocihelper.DialAttemptPortRequest{Authority: authority, Name: name})
+	}}
+	defer transport.CloseIdleConnections()
+	connection, _, err := websocket.Dial(ctx, "ws://computer-backend.invalid"+path, &websocket.DialOptions{
+		HTTPClient: &http.Client{Transport: transport}, Subprotocols: protocols,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if connection.Subprotocol() != contract.ComputerDisplayWebSocketSubprotocol {
+		connection.CloseNow()
+		return nil, fmt.Errorf("reference Computer %s negotiated subprotocol %q", name, connection.Subprotocol())
+	}
+	network := websocket.NetConn(ctx, connection, websocket.MessageBinary)
+	banner := make([]byte, contract.ComputerRFBVersionBannerBytes)
+	if _, err := io.ReadFull(network, banner); err != nil {
+		connection.CloseNow()
+		return nil, err
+	}
+	if !contract.ValidComputerRFBVersionBanner(banner) {
+		connection.CloseNow()
+		return nil, fmt.Errorf("reference Computer %s banner = %q", name, banner)
+	}
+	return connection, nil
+}
+
+func assertReferenceComputerWireNegatives(t *testing.T, ctx context.Context, session *ocihelper.Session, authority ocihelper.AttemptAuthority) {
+	t.Helper()
+	for _, test := range []struct {
+		name      string
+		path      string
+		protocols []string
+	}{
+		{name: "wrong-path", path: "/wrong", protocols: []string{contract.ComputerDisplayWebSocketSubprotocol}},
+		{name: "missing-protocol", path: contract.ComputerDisplayWebSocketPath},
+		{name: "wrong-protocol", path: contract.ComputerDisplayWebSocketPath, protocols: []string{"base64"}},
+	} {
+		probeContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+		connection, err := openReferenceComputerEndpoint(probeContext, session, authority, contract.ComputerDisplayEndpointView, test.path, test.protocols)
+		cancel()
+		if connection != nil {
+			connection.CloseNow()
+		}
+		if err == nil {
+			t.Fatalf("reference Computer %s negative row upgraded", test.name)
+		}
+	}
+	probeContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	connection, err := openReferenceComputerEndpoint(probeContext, session, authority, contract.ComputerDisplayEndpointView, contract.ComputerDisplayWebSocketPath, []string{contract.ComputerDisplayWebSocketSubprotocol})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.CloseNow()
+	if err := connection.Write(probeContext, websocket.MessageText, []byte("forbidden")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := connection.Read(probeContext); err == nil || websocket.CloseStatus(err) != websocket.StatusUnsupportedData {
+		t.Fatalf("reference Computer text-frame close = %v status=%v", err, websocket.CloseStatus(err))
 	}
 }
 
@@ -701,7 +887,17 @@ func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, 
 	spec := contract.JobSpec{SchemaVersion: contract.SchemaVersionV1, DispatchKey: "native-computer-agent-restart", Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
 		RuntimeHandler: ocihelper.DefaultRuntimeHandler, RoutingTags: []string{contract.StableNodeTagPrefix + registration.NodeID},
 		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: reference, Digest: &digestCopy},
-			Argv:     []string{"/bin/sh", "-c", "if test -f /wefty/service/agent-restart-marker; then test \"$(cat /wefty/service/agent-restart-marker)\" = durable; else printf durable > /wefty/service/agent-restart-marker; exit 17; fi"},
+			Argv: []string{"/bin/sh", "-c", `if test -f /wefty/service/home/wefty/.config/chromium/wefty-profile-marker; then
+  test "$(cat /wefty/service/home/wefty/.config/chromium/wefty-profile-marker)" = persistent-profile
+  test "$(cat /wefty/service/home/wefty/.config/chromium/wefty-sign-in-marker)" = persistent-sign-in
+  test ! -e /tmp/wefty-attempt-marker
+else
+  mkdir -p /wefty/service/home/wefty/.config/chromium
+  printf persistent-profile > /wefty/service/home/wefty/.config/chromium/wefty-profile-marker
+  printf persistent-sign-in > /wefty/service/home/wefty/.config/chromium/wefty-sign-in-marker
+  printf attempt-local > /tmp/wefty-attempt-marker
+  exit 17
+fi`},
 			Computer: &contract.OCIComputerSpec{Display: contract.OCIComputerDisplaySpec{Protocol: contract.ComputerDisplayProtocolRFBWebSocketV1}, DiskBytes: 32 << 20}, Limits: &contract.OCILimits{MemoryBytes: &memory}}}}
 	computer, _, err := store.CreateComputer(ctx, l1.CreateComputerRequest{Name: "native-agent-restart", Spec: spec, Actor: "realtiming"})
 	if err != nil {

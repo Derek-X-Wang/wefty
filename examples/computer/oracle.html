@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>wefty-oracle events=0 bytes=0 hash=00000000</title>
+    <style>
+      :root { color-scheme: dark; font-family: sans-serif; }
+      body { align-items: center; background: #111827; display: flex; height: 100vh; justify-content: center; margin: 0; }
+      main { background: #1f2937; border: 4px solid #38bdf8; border-radius: 1rem; padding: 3rem; text-align: center; width: 44rem; }
+      input { font: 2rem monospace; padding: 1rem; width: 34rem; }
+      output { display: block; font: 3rem monospace; margin-top: 2rem; }
+    </style>
+  </head>
+  <body>
+    <main data-wefty-input-oracle="v1">
+      <h1>Wefty reference Computer</h1>
+      <p>Focused deterministic input surface</p>
+      <input id="oracle" autofocus autocomplete="off" aria-label="Input oracle">
+      <output id="receipt">events=0 bytes=0 hash=00000000</output>
+    </main>
+    <script>
+      const input = document.querySelector('#oracle');
+      const receipt = document.querySelector('#receipt');
+      let events = 0;
+      let bytes = [];
+      const publish = () => {
+        events += 1;
+        let hash = 2166136261;
+        for (const byte of bytes) {
+          hash = Math.imul(hash ^ byte, 16777619) >>> 0;
+        }
+        const value = `events=${events} bytes=${bytes.length} hash=${hash.toString(16).padStart(8, '0')}`;
+        receipt.value = value;
+        document.title = `wefty-oracle ${value}`;
+      };
+      input.addEventListener('input', () => {
+        bytes = Array.from(new TextEncoder().encode(input.value));
+        publish();
+      });
+      document.querySelector('main').addEventListener('pointerdown', (event) => {
+        bytes.push(event.button & 0xff, event.clientX & 0xff, event.clientY & 0xff);
+        publish();
+      });
+      input.focus();
+    </script>
+  </body>
+</html>
