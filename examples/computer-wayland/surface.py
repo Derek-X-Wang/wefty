@@ -96,7 +96,7 @@ def observe_wayland_input():
         time.sleep(0.1)
 
 
-def tree_has_focused_oracle():
+def tree_surface_state():
     try:
         result = subprocess.run(
             ["swaymsg", "--type", "get_tree", "--raw"],
@@ -107,7 +107,7 @@ def tree_has_focused_oracle():
         )
         root = json.loads(result.stdout)
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-        return False
+        return False, False
     pending = [root]
     browser_fullscreen = False
     keyboard_focused = False
@@ -122,12 +122,35 @@ def tree_has_focused_oracle():
             keyboard_focused = True
         pending.extend(node.get("nodes", []))
         pending.extend(node.get("floating_nodes", []))
-    return browser_fullscreen and keyboard_focused
+    return browser_fullscreen, keyboard_focused
+
+
+def focus_input_observer():
+    """Resolve the Chromium-map race after the visible surface is fullscreen."""
+    try:
+        subprocess.run(
+            ["swaymsg", '[app_id="wev"] focus'],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def publish_surface_readiness():
     wait_for_browser()
-    while not tree_has_focused_oracle():
+    while True:
+        browser_fullscreen, keyboard_focused = tree_surface_state()
+        if browser_fullscreen and not keyboard_focused:
+            # Chromium may publish browser readiness before Sway applies its
+            # title-based fullscreen rule. If that late rule steals focus from
+            # the already-mapped wev listener, explicitly restore the listener
+            # once the visible surface is known to be fullscreen.
+            focus_input_observer()
+        if browser_fullscreen and keyboard_focused:
+            break
         time.sleep(0.05)
     with open(SURFACE_READY, "w", encoding="ascii") as marker:
         marker.write("ready\n")
