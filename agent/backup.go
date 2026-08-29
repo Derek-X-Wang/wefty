@@ -101,7 +101,7 @@ func (controller *backupController) enqueue(ctx context.Context, key string, run
 		}()
 		if err := run(ctx); err != nil && ctx.Err() == nil {
 			classification := classifyAgentProtocolError(err)
-			if classification.destination == errorDestinationNodeSession {
+			if classification.destination == errorDestinationNodeSession && failures != nil {
 				select {
 				case failures <- destinationError{destination: classification.destination, err: fmt.Errorf("agent: reconcile Backup copy %q: %w", key, err)}:
 				default:

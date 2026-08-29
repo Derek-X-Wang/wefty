@@ -60,3 +60,33 @@ type ComputerBackupCopyRemovalReceipt struct {
 	HelperGeneration  uint64 `json:"helper_generation"`
 	Absent            bool   `json:"absent"`
 }
+
+// ComputerStorageCopyReceipt is assertion-derived helper evidence that one
+// exact Backup copy produced a detached destination Storage generation. The
+// source digest is checked before any destination publication; the destination
+// digest is recorded after clone identity rekeying and optional expansion.
+type ComputerStorageCopyReceipt struct {
+	Kind                  string `json:"kind"`
+	ReceiptID             string `json:"receipt_id"`
+	Operation             string `json:"operation"`
+	BackupID              string `json:"backup_id"`
+	CopyID                string `json:"copy_id"`
+	SourceComputerID      string `json:"source_computer_id"`
+	SourceStorageID       string `json:"source_storage_id"`
+	SourceGeneration      int64  `json:"source_generation"`
+	DestinationComputerID string `json:"destination_computer_id"`
+	DestinationStorageID  string `json:"destination_storage_id"`
+	DestinationGeneration int64  `json:"destination_generation"`
+	NodeID                string `json:"node_id"`
+	RootInstanceID        string `json:"root_instance_id"`
+	JobID                 string `json:"job_id"`
+	OperationRevision     int64  `json:"operation_revision"`
+	CleanupFence          string `json:"cleanup_fence"`
+	HelperGeneration      uint64 `json:"helper_generation"`
+	SourceSize            int64  `json:"source_size"`
+	DestinationSize       int64  `json:"destination_size"`
+	SourceDigest          string `json:"source_digest"`
+	DestinationDigest     string `json:"destination_digest"`
+	OSIdentityRekeyed     bool   `json:"os_identity_rekeyed"`
+	FilesystemExpanded    bool   `json:"filesystem_expanded"`
+}

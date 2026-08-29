@@ -909,6 +909,71 @@
         }
       }
     },
+    "/v1/computers/{computer_id}/backups/{backup_id}/restore": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } },
+        { "name": "backup_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "restoreComputerBackup",
+        "summary": "Restore a stopped Computer into exactly generation plus one",
+        "description": "Requires stopped and positively detached authority, precommits the optional old-generation Backup identity, verifies a fully allocated copy before atomic publication, rotates stale authority, retires the predecessor, and never resumes the Computer.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["intent_revision", "storage_id", "storage_generation", "keep_old_as_backup", "idempotency_key"],
+          "properties": {
+            "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+            "storage_id": { "type": "string", "minLength": 1 },
+            "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+            "keep_old_as_backup": { "type": "boolean" },
+            "idempotency_key": { "type": "string", "minLength": 1 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Identical restore replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "202": { "description": "Restore reserved; the Computer remains stopped through verification, publication, and predecessor retirement.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/computers/{computer_id}/backups/{backup_id}/clone": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Source Computer that owns the Backup." },
+        { "name": "backup_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "cloneComputerBackup",
+        "summary": "Create a stopped Computer with fresh Computer, Storage, and OS identities",
+        "description": "Copies no grants, requires a new name, rejects a smaller destination, fully allocates and expands a larger destination, narrowly rekeys machine-id and SSH host keys, preserves browser profile bytes, and records a Storage provenance custody fork.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["intent_revision", "storage_id", "storage_generation", "name", "disk_bytes", "idempotency_key"],
+          "properties": {
+            "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+            "storage_id": { "type": "string", "minLength": 1 },
+            "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+            "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
+            "idempotency_key": { "type": "string", "minLength": 1 }
+          }
+        } } } },
+        "responses": {
+          "200": { "description": "Identical clone replay.", "headers": { "Idempotency-Replayed": { "schema": { "type": "boolean", "const": true } } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "202": { "description": "Clone reserved and not claimable until its source-copy receipt is accepted.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/computers/{computer_id}/projections": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }

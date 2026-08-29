@@ -1256,6 +1256,30 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		operation.monitorEOF()
 		response, err := engine.DeleteComputerBackupCopy(operation.ctx, body)
 		_ = writeEngineResponse(wire, response, err)
+	case MethodCopyStorage:
+		var body CopyComputerStorageRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if (body.Operation != "restore" && body.Operation != "clone") || body.BackupID == "" || body.CopyID == "" ||
+			body.SourceComputerID == "" || body.SourceStorageID == "" || body.SourceGeneration < 1 ||
+			body.SourceSize < 1 || body.SourceDigest == "" || body.Destination.ComputerID == "" ||
+			body.Destination.StorageID == "" || body.Destination.StorageGeneration < 1 || body.Destination.DiskBytes < body.SourceSize ||
+			body.Destination.IntentRevision != body.Authority.OperationRevision || body.Authority.NodeID != session.identity.NodeID ||
+			body.Authority.BootSessionID != session.identity.BootSessionID || body.Authority.HelperGeneration != session.helper.SessionGeneration ||
+			body.Authority.HelperGeneration == 0 || body.Authority.RootInstanceID == "" || body.Authority.JobID == "" ||
+			body.Authority.OperationRevision < 1 || body.Authority.CleanupFence == "" {
+			_ = writeFailure(wire, CodeInvalidRequest, "complete current-session Computer Storage copy authority is required")
+			return
+		}
+		engine, ok := server.engine.(ComputerStorageCopyEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "Computer Storage copy is unavailable")
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.CopyComputerStorage(operation.ctx, body)
+		_ = writeEngineResponse(wire, response, err)
 	case MethodVerify:
 		var body VerifyRequest
 		if !decodeRequest(wire, request.Body, &body) {

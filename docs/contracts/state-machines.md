@@ -160,6 +160,28 @@ mutation. Capacity never auto-deletes: pruning is explicit, retains the immutabl
 `published → removal_pending → removed` only after a positive absence receipt.
 ENOSPC and digest mismatch publish no Backup and require positive copy absence.
 
+Restore is stopped-only and positively detached. L1 preserves `computer_id`
+and `storage_id`, reserves exactly current generation plus one, and commits any
+"keep predecessor as Backup" choice and Backup identity before helper work.
+Before the successor can attach, L1 revokes prior Computer, session, and L3
+authority. The helper copies only from the selected published Backup copy,
+verifies source size and digest before publication, and returns exact
+Node/root/operation-bound evidence. L1 records that evidence before publishing
+the staging generation and retiring its predecessor. The source Backup is
+immutable, no phase auto-resumes the Computer, and predecessor deletion reuses
+the shared generation-removal machinery.
+
+Clone uses the same cold-copy primitive but creates a new `computer_id`,
+`storage_id`, required name, dispatch authority, and generation one with no
+grants. A smaller destination is refused; a larger one is fully allocated and
+its filesystem expanded. The helper narrowly regenerates `/etc/machine-id`
+and SSH host keys and does not alter browser profile data. Immutable Storage
+provenance records the source Backup and destination as a custody fork. If one
+managed branch is removed while another secret-bearing branch survives, the
+Computer outcome is `removed_reduced`; after coordinated positive removal of
+every managed branch, retained Computer outcomes may advance to
+`removed_verified`. Custody export and import remain a separate contract.
+
 The current immutable Job mirrors Computer desired state only so it can reuse
 the ordinary service attempt state machine. Claim additionally joins the
 Computer authority: only the one current projection may win, and only while
@@ -171,8 +193,9 @@ durable desired state to `removed`, fences every mapped attempt, and moves the
 current Job to `removal_pending`; no later Job or attempt can be created. The
 ordinary durable service-removal directive carries current Job cleanup to the
 bound agent. Its authenticated acknowledgement finalizes the Job observation
-in place as `removed_verified` and releases Slot occupancy while retaining the
-Computer and immutable Job evidence. For a Computer, acknowledgement is gated
+in place and releases Slot occupancy while retaining the Computer and
+immutable Job evidence. The Computer separately records `removed_reduced` or
+`removed_verified` from known Storage custody. For a Computer, acknowledgement is gated
 on helper-verified deletion of every detached Storage generation and every
 tracked Backup copy, including a planned copy whose create was superseded
 after helper reservation but before L1 publication. The standing removal

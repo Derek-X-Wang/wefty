@@ -53,6 +53,7 @@ const (
 	MethodResetStorage       Method = "ResetComputerStorage"
 	MethodCreateBackup       Method = "CreateComputerBackup"
 	MethodDeleteBackup       Method = "DeleteComputerBackupCopy"
+	MethodCopyStorage        Method = "CopyComputerStorage"
 	MethodVerify             Method = "Verify"
 	MethodSweep              Method = "Sweep"
 	MethodDialAttemptPort    Method = "DialAttemptPort"
@@ -1015,6 +1016,35 @@ type ComputerBackupCopyRemovalReceipt = contract.ComputerBackupCopyRemovalReceip
 
 type DeleteComputerBackupCopyResponse struct {
 	Receipt ComputerBackupCopyRemovalReceipt `json:"receipt"`
+}
+
+type ComputerStorageCopyAuthority struct {
+	NodeID            string `json:"node_id"`
+	BootSessionID     string `json:"boot_session_id"`
+	HelperGeneration  uint64 `json:"helper_generation"`
+	RootInstanceID    string `json:"root_instance_id"`
+	JobID             string `json:"job_id"`
+	OperationRevision int64  `json:"operation_revision"`
+	CleanupFence      string `json:"cleanup_fence"`
+}
+
+type CopyComputerStorageRequest struct {
+	Operation        string                       `json:"operation"`
+	BackupID         string                       `json:"backup_id"`
+	CopyID           string                       `json:"copy_id"`
+	SourceComputerID string                       `json:"source_computer_id"`
+	SourceStorageID  string                       `json:"source_storage_id"`
+	SourceGeneration int64                        `json:"source_generation"`
+	SourceSize       int64                        `json:"source_size"`
+	SourceDigest     string                       `json:"source_digest"`
+	Destination      ComputerStorageReference     `json:"destination"`
+	Authority        ComputerStorageCopyAuthority `json:"authority"`
+}
+
+type ComputerStorageCopyReceipt = contract.ComputerStorageCopyReceipt
+
+type CopyComputerStorageResponse struct {
+	Receipt ComputerStorageCopyReceipt `json:"receipt"`
 }
 
 type VerifyScope string

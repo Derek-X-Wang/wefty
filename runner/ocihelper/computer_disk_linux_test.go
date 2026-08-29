@@ -310,6 +310,39 @@ func TestComputerDiskSweepRecoversCrashBeforeAttachedManifestWrite(t *testing.T)
 	}
 }
 
+func TestComputerDiskSweepDetachesCrashedStorageCopyMount(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system, attempts: make(map[string]*containerdAttempt)}
+	storage := testComputerStorage()
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	imagePath := filepath.Join(diskRoot, "disk.ext4.staging")
+	if err := os.WriteFile(imagePath, []byte("staging"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mountPath := filepath.Join(root, "computer-copy-mounts", name)
+	if err := os.MkdirAll(mountPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	loop, err := system.attachAndMount(t.Context(), imagePath, mountPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.sweepComputerDisks("copy-sweep"); err != nil {
+		t.Fatal(err)
+	}
+	if _, mounted, err := system.mountedSource(mountPath); err != nil || mounted {
+		t.Fatalf("copy mount survived sweep: mounted=%t err=%v", mounted, err)
+	}
+	if _, present, err := system.loopBackingFile(loop); err != nil || present {
+		t.Fatalf("copy loop survived sweep: present=%t err=%v", present, err)
+	}
+}
+
 func TestComputerDiskRequiresExactConsumedDetachmentEvidence(t *testing.T) {
 	root := t.TempDir()
 	system := newFakeComputerDiskSystem()

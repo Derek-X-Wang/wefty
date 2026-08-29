@@ -31,6 +31,8 @@ const (
 	ComputerIntentReset        ComputerIntentOperation = "reset"
 	ComputerIntentBackupCreate ComputerIntentOperation = "backup_create"
 	ComputerIntentBackupCap    ComputerIntentOperation = "backup_cap"
+	ComputerIntentRestore      ComputerIntentOperation = "restore"
+	ComputerIntentClone        ComputerIntentOperation = "clone"
 )
 
 type ComputerGrantPermission string
@@ -49,6 +51,8 @@ const (
 	ComputerReconfigurationRemoving   ComputerReconfigurationPhase = "removing"
 	ComputerReconfigurationResetting  ComputerReconfigurationPhase = "resetting"
 	ComputerReconfigurationBackingUp  ComputerReconfigurationPhase = "backing_up"
+	ComputerReconfigurationRestoring  ComputerReconfigurationPhase = "restoring"
+	ComputerReconfigurationCloning    ComputerReconfigurationPhase = "cloning"
 )
 
 type ComputerGrant struct {
@@ -97,6 +101,7 @@ type Computer struct {
 	SubmitIntentRevision    int64                           `json:"submit_intent_revision"`
 	SubmitMaxInflight       int                             `json:"submit_max_inflight"`
 	SubmitPolicyRevision    int64                           `json:"submit_policy_revision"`
+	RemovalOutcome          string                          `json:"removal_outcome,omitempty"`
 	// DisplayEndpoint remains explicitly null until an active private
 	// take-over front door has been published. It is never a placeholder URL.
 	DisplayEndpoint *string   `json:"display_endpoint"`
@@ -457,14 +462,14 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 		grants_json, storage_id, storage_generation, backup_cap, desired_state, intent_revision,
 		applied_revision, current_job_id, current_spec_revision, reconfiguration_phase,
 		reconfiguration_revision, submit_enabled, submit_intent_revision, submit_max_inflight,
-		submit_policy_revision, created_ns, updated_ns
+		submit_policy_revision, removal_outcome, created_ns, updated_ns
 		FROM computers WHERE computer_id=?`, computerID).Scan(
 		&computer.ComputerID, &computer.Name, &computer.PlacementNodeID, &boundNodeID,
 		&grantsJSON, &computer.StorageID, &computer.StorageGeneration, &computer.BackupCap, &computer.DesiredState,
 		&computer.IntentRevision, &computer.AppliedRevision, &computer.CurrentJobID,
 		&computer.CurrentSpecRevision, &computer.ReconfigurationPhase,
 		&reconfigurationRevision, &computer.SubmitEnabled, &computer.SubmitIntentRevision,
-		&computer.SubmitMaxInflight, &computer.SubmitPolicyRevision, &createdNS, &updatedNS)
+		&computer.SubmitMaxInflight, &computer.SubmitPolicyRevision, &computer.RemovalOutcome, &createdNS, &updatedNS)
 	if err != nil {
 		return Computer{}, err
 	}
@@ -804,6 +809,12 @@ func setComputerServiceDesiredState(
 			if err := transitionServiceJob(ctx, tx, job.JobID, desired, contract.JobStopped, now); err != nil {
 				return err
 			}
+			// A queued Computer has no live runtime owner. Clearing the terminal
+			// predecessor attempt turns that observed quiescence into the positive
+			// detached precondition required by Storage replacement operations.
+			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET current_attempt_id=NULL WHERE job_id=?`, job.JobID); err != nil {
+				return internalError(err, "publish detached stopped Computer")
+			}
 		case contract.JobClaimed, contract.JobRunning:
 			if err := transitionServiceJob(ctx, tx, job.JobID, desired, contract.JobStopping, now); err != nil {
 				return err
@@ -980,7 +991,9 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable &&
 		computer.ReconfigurationPhase != ComputerReconfigurationProjecting &&
 		computer.ReconfigurationPhase != ComputerReconfigurationResetting &&
-		computer.ReconfigurationPhase != ComputerReconfigurationBackingUp {
+		computer.ReconfigurationPhase != ComputerReconfigurationBackingUp &&
+		computer.ReconfigurationPhase != ComputerReconfigurationRestoring &&
+		computer.ReconfigurationPhase != ComputerReconfigurationCloning {
 		return Computer{}, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
 	}
@@ -997,7 +1010,18 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 			return Computer{}, internalError(err, "supersede Computer Backup for removal")
 		}
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE computers SET desired_state=?, intent_revision=?,
+	if computer.ReconfigurationPhase == ComputerReconfigurationRestoring ||
+		computer.ReconfigurationPhase == ComputerReconfigurationCloning {
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded'
+			WHERE destination_computer_id=? AND status IN ('reserved', 'prepared', 'published')`, computerID); err != nil {
+			return Computer{}, internalError(err, "supersede Computer Storage copy for removal")
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded'
+		WHERE source_computer_id=? AND operation='clone' AND status IN ('reserved', 'prepared')`, computerID); err != nil {
+		return Computer{}, internalError(err, "supersede clone custody forks sourced by removed Computer")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE computers SET desired_state=?, intent_revision=?, removal_outcome='removal_pending',
 		reconfiguration_phase=?, reconfiguration_revision=?, updated_ns=?
 		WHERE computer_id=? AND intent_revision=?`, contract.ServiceDesiredRemoved, nextRevision,
 		ComputerReconfigurationRemoving, nextRevision, now.UnixNano(), computerID, computer.IntentRevision)

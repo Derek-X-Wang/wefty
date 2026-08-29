@@ -241,6 +241,7 @@ func New(config Config) (*Agent, error) {
 	var ociRemovalProof workloadrunner.RuntimeRemovalProofRuntime
 	var computerStorageResetter workloadrunner.ComputerStorageResetter
 	var computerBackupper workloadrunner.ComputerBackupper
+	var computerStorageCopier workloadrunner.ComputerStorageCopier
 	if runtimeAdapter, configured := runtimes.selectKind(contract.JobKindOCI); configured {
 		if pinRuntime, supported := runtimeAdapter.(workloadrunner.OCIImagePinRuntime); supported {
 			pinRuntime.SetOCIImageBindingPinLedger(outbox.spool)
@@ -252,6 +253,7 @@ func New(config Config) (*Agent, error) {
 		}
 		computerStorageResetter, _ = runtimeAdapter.(workloadrunner.ComputerStorageResetter)
 		computerBackupper, _ = runtimeAdapter.(workloadrunner.ComputerBackupper)
+		computerStorageCopier, _ = runtimeAdapter.(workloadrunner.ComputerStorageCopier)
 	}
 	observer := newLifecycleObserver(clock)
 	logf := serialLogf(config.Logf)
@@ -330,6 +332,12 @@ func New(config Config) (*Agent, error) {
 			}
 			return nil
 		}
+	}
+	session.storageCopies = newStorageCopyController(client, computerStorageCopier, computerBackupper,
+		config.NodeID, config.BootSessionID, logf)
+	if session.storageCopies != nil {
+		session.storageCopies.finalizeVolumes = session.removals.finalizeVolumes
+		session.storageCopies.attestRuntimeRemoval = session.removals.attestRuntimeRemoval
 	}
 	constructionSucceeded = true
 	return &Agent{

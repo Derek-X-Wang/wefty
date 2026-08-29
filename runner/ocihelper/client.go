@@ -493,6 +493,12 @@ func (session *Session) DeleteComputerBackupCopy(ctx context.Context, request De
 	return response, err
 }
 
+func (session *Session) CopyComputerStorage(ctx context.Context, request CopyComputerStorageRequest) (CopyComputerStorageResponse, error) {
+	var response CopyComputerStorageResponse
+	err := session.call(ctx, MethodCopyStorage, request, &response)
+	return response, err
+}
+
 func (session *Session) Verify(ctx context.Context, request VerifyRequest) (VerifyResponse, error) {
 	var response VerifyResponse
 	err := session.call(ctx, MethodVerify, request, &response)

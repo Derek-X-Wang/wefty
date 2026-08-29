@@ -280,15 +280,19 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 			directive.ComputerStorage = &ComputerStorageClaim{ComputerID: computerID.String, StorageID: storageID.String,
 				StorageGeneration: storageGeneration.Int64}
 			directive.ComputerStorageGenerations = &ComputerStorageGenerationClaims{Generations: []ComputerStorageGenerationClaim{}}
-			generationRows, generationErr := s.db.QueryContext(ctx, `SELECT storage_id, storage_generation, disk_bytes
-				FROM computer_storage_generations WHERE computer_id=? ORDER BY storage_generation`, computerID.String)
+			generationRows, generationErr := s.db.QueryContext(ctx, `SELECT computer_id, storage_id, storage_generation, disk_bytes
+				FROM computer_storage_generations WHERE computer_id=?
+				UNION
+				SELECT destination_computer_id, destination_storage_id, destination_generation, destination_size
+				FROM computer_storage_copy_operations
+				WHERE source_computer_id=? AND operation='clone' AND status='superseded'
+				ORDER BY storage_generation`, computerID.String, computerID.String)
 			if generationErr != nil {
 				return nil, internalError(generationErr, "list Computer Storage removal generations")
 			}
 			for generationRows.Next() {
 				var generation ComputerStorageGenerationClaim
-				generation.ComputerID = computerID.String
-				if err := generationRows.Scan(&generation.StorageID, &generation.StorageGeneration, &generation.DiskBytes); err != nil {
+				if err := generationRows.Scan(&generation.ComputerID, &generation.StorageID, &generation.StorageGeneration, &generation.DiskBytes); err != nil {
 					generationRows.Close()
 					return nil, internalError(err, "scan Computer Storage removal generation")
 				}
@@ -313,7 +317,15 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 					o.operation_revision, o.cleanup_fence, 1
 				FROM computer_backup_operations o
 				WHERE o.computer_id=? AND o.status='superseded' AND o.acknowledgement_key IS NULL
-				ORDER BY copy_id`, computerID.String, computerID.String)
+				UNION ALL
+				SELECT o.old_backup_id, o.old_copy_id, o.destination_computer_id, o.destination_storage_id,
+					o.old_generation, o.destination_size, o.bound_node_id, o.root_instance_id,
+					o.operation_revision, o.cleanup_fence, 1
+				FROM computer_storage_copy_operations o
+				WHERE o.destination_computer_id=? AND o.status='superseded' AND o.keep_old_as_backup=1
+					AND o.old_backup_absence_acknowledgement_key IS NULL
+					AND NOT EXISTS(SELECT 1 FROM backups b WHERE b.backup_id=o.old_backup_id)
+				ORDER BY copy_id`, computerID.String, computerID.String, computerID.String)
 			if backupErr != nil {
 				return nil, internalError(backupErr, "list Computer Backup copies for removal")
 			}
@@ -419,7 +431,7 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
 		return Job{}, mapErr
 	} else if mapped {
-		var outstandingCopies, outstandingSuperseded int64
+		var outstandingCopies, outstandingSuperseded, outstandingRestorePrecommits int64
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backup_copies bc
 			JOIN backups b ON b.backup_id=bc.backup_id
 			WHERE b.computer_id=? AND bc.phase<>'removed'`, computerID).Scan(&outstandingCopies); err != nil {
@@ -430,10 +442,17 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 			Scan(&outstandingSuperseded); err != nil {
 			return Job{}, internalError(err, "count superseded Computer Backup copies")
 		}
-		if outstandingCopies != 0 || outstandingSuperseded != 0 {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM computer_storage_copy_operations
+			WHERE destination_computer_id=? AND status='superseded' AND keep_old_as_backup=1
+				AND old_backup_absence_acknowledgement_key IS NULL
+				AND NOT EXISTS(SELECT 1 FROM backups b WHERE b.backup_id=computer_storage_copy_operations.old_backup_id)`,
+			computerID).Scan(&outstandingRestorePrecommits); err != nil {
+			return Job{}, internalError(err, "count superseded restore predecessor Backup copies")
+		}
+		if outstandingCopies != 0 || outstandingSuperseded != 0 || outstandingRestorePrecommits != 0 {
 			return Job{}, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
 				"computer_id": computerID, "retained_backup_copies": outstandingCopies,
-				"unattested_superseded_copies": outstandingSuperseded,
+				"unattested_superseded_copies": outstandingSuperseded + outstandingRestorePrecommits,
 			}, "Computer removal requires positive absence for every Backup copy")
 		}
 	}
@@ -544,9 +563,8 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 			healthy_since_ns=NULL, next_restart_at=NULL WHERE job_id=?`, contract.ServiceDesiredStopped, jobID); err != nil {
 			return Job{}, false, internalError(err, "release verified Computer removal Slot")
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE computers SET updated_ns=? WHERE computer_id=?`,
-			now.UnixNano(), computerID); err != nil {
-			return Job{}, false, internalError(err, "timestamp verified Computer removal")
+		if err := finalizeComputerCustodyOutcome(ctx, tx, computerID, now); err != nil {
+			return Job{}, false, err
 		}
 		job, readErr := getJobByID(ctx, tx, jobID, now)
 		if readErr != nil {
@@ -591,6 +609,50 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 		return Job{}, false, internalError(err, "record forgotten-service cleanup acknowledgement")
 	}
 	return tombstone.job(), true, nil
+}
+
+// finalizeComputerCustodyOutcome distinguishes positive managed cleanup from
+// the stronger claim that no secret-bearing branch of a clone custody fork
+// survives. A later coordinated removal upgrades every reduced sibling once
+// the final managed branch is positively absent.
+func finalizeComputerCustodyOutcome(ctx context.Context, tx *sql.Tx, computerID string, now time.Time) error {
+	var storageID string
+	if err := tx.QueryRowContext(ctx, `SELECT storage_id FROM computers WHERE computer_id=?`, computerID).Scan(&storageID); err != nil {
+		return internalError(err, "read Computer Storage custody identity")
+	}
+	const custodyGraph = `WITH RECURSIVE custody(storage_id) AS (
+		VALUES(?)
+		UNION
+		SELECT p.source_storage_id FROM storage_provenance p
+		JOIN custody c ON p.destination_storage_id=c.storage_id WHERE p.kind='clone'
+		UNION
+		SELECT p.destination_storage_id FROM storage_provenance p
+		JOIN custody c ON p.source_storage_id=c.storage_id WHERE p.kind='clone'
+	)`
+	var surviving int64
+	if err := tx.QueryRowContext(ctx, custodyGraph+`
+		SELECT COUNT(*) FROM computers c JOIN custody ON custody.storage_id=c.storage_id
+		WHERE c.computer_id<>? AND c.removal_outcome NOT IN ('removed_reduced', 'removed_verified')`,
+		storageID, computerID).Scan(&surviving); err != nil {
+		return internalError(err, "classify Computer clone custody fork")
+	}
+	outcome := "removed_verified"
+	if surviving > 0 {
+		outcome = "removed_reduced"
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE computers SET removal_outcome=?, updated_ns=? WHERE computer_id=?`,
+		outcome, now.UnixNano(), computerID); err != nil {
+		return internalError(err, "record Computer custody removal outcome")
+	}
+	if outcome == "removed_verified" {
+		if _, err := tx.ExecContext(ctx, custodyGraph+`
+			UPDATE computers SET removal_outcome='removed_verified', updated_ns=?
+			WHERE storage_id IN (SELECT storage_id FROM custody) AND removal_outcome='removed_reduced'`,
+			storageID, now.UnixNano()); err != nil {
+			return internalError(err, "upgrade coordinated Computer custody removal outcomes")
+		}
+	}
+	return nil
 }
 
 func scrubServiceControllerState(ctx context.Context, tx *sql.Tx, jobID string, specJSON []byte, now time.Time) error {

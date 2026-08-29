@@ -936,6 +936,36 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 			}
 		}
 	}
+	copyMountRoot := filepath.Join(engine.config.RuntimeRoot, "computer-copy-mounts")
+	copyMountEntries, err := readDirectoryIfPresent(copyMountRoot)
+	if err != nil {
+		return err
+	}
+	for _, entry := range copyMountEntries {
+		if !strings.HasPrefix(entry.Name(), "wefty-computer-disk-") || !entry.IsDir() {
+			continue
+		}
+		mountPath := filepath.Join(copyMountRoot, entry.Name())
+		source, mounted, err := engine.computerDiskSystem().mountedSource(mountPath)
+		if err != nil {
+			return err
+		}
+		if !mounted {
+			continue
+		}
+		backing, ours, err := engine.computerDiskSystem().loopBackingFile(source)
+		if err != nil {
+			return err
+		}
+		expectedRoot := filepath.Join(diskRoot, entry.Name())
+		relative, relErr := filepath.Rel(expectedRoot, backing)
+		if !ours || relErr != nil || relative == "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return errors.New("Computer Storage copy mount has an unexpected backing image")
+		}
+		if err := engine.computerDiskSystem().detach(mountPath, source, backing); err != nil {
+			return err
+		}
+	}
 	loops, err := engine.computerDiskSystem().loopsForRoot(diskRoot)
 	if err != nil {
 		return err

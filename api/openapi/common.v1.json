@@ -371,7 +371,7 @@
         ],
         "properties": {
           "intent_revision": { "type": "integer", "minimum": 1 },
-          "operation": { "enum": ["create", "start", "stop", "restart", "remove", "project", "reset", "backup_create", "backup_cap"] },
+          "operation": { "enum": ["create", "start", "stop", "restart", "remove", "project", "reset", "backup_create", "backup_cap", "restore", "clone"] },
           "desired_state": { "enum": ["running", "stopped", "removed"] },
           "storage_id": { "type": "string", "minLength": 1 },
           "storage_generation": { "type": "integer", "minimum": 1 },
@@ -425,12 +425,16 @@
           "current_spec_revision": { "type": "integer", "minimum": 1 },
           "backup_cap": { "type": "integer", "format": "int64", "minimum": 0, "description": "Effective retained Backup cap. Zero disables creation; pruning is always explicit." },
           "last_backup_operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome" },
-          "reconfiguration_phase": { "enum": ["stable", "projecting", "resetting", "backing_up", "removing"] },
+          "reconfiguration_phase": { "enum": ["stable", "projecting", "resetting", "backing_up", "restoring", "cloning", "removing"] },
           "reconfiguration_revision": { "type": "integer", "minimum": 1 },
           "submit_enabled": { "type": "boolean", "default": false },
           "submit_intent_revision": { "type": "integer", "minimum": 0 },
           "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 20 },
           "submit_policy_revision": { "type": "integer", "minimum": 0 },
+          "removal_outcome": {
+            "enum": ["removal_pending", "removed_reduced", "removed_verified"],
+            "description": "Computer-only custody outcome. removed_reduced proves managed cleanup while another clone branch still bears the secret."
+          },
           "display_endpoint": {
             "type": ["string", "null"],
             "description": "Private take-over front-door endpoint. Null until the admission module is active; never a placeholder URL."
@@ -472,10 +476,13 @@
         "required": ["provenance_id", "kind", "source_storage_id", "source_generation", "backup_id", "created_at"],
         "properties": {
           "provenance_id": { "type": "string", "minLength": 1 },
-          "kind": { "const": "backup" },
+          "kind": { "enum": ["backup", "restore", "clone"] },
           "source_storage_id": { "type": "string", "minLength": 1 },
           "source_generation": { "type": "integer", "format": "int64", "minimum": 1 },
           "backup_id": { "type": "string", "minLength": 1 },
+          "destination_computer_id": { "type": "string", "minLength": 1 },
+          "destination_storage_id": { "type": "string", "minLength": 1 },
+          "destination_generation": { "type": "integer", "format": "int64", "minimum": 1 },
           "created_at": { "type": "string", "format": "date-time" }
         }
       },
@@ -560,6 +567,35 @@
           "bound_node_id": { "type": "string", "minLength": 1 }, "root_instance_id": { "type": "string", "minLength": 1 },
           "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 }, "cleanup_fence": { "type": "string", "minLength": 1 },
           "superseded": { "type": "boolean", "description": "True only when irreversible Computer removal superseded a stale create before helper-side absence proof." }
+        }
+      },
+      "ComputerStorageCopyDirective": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation", "backup_id", "copy_id", "source_computer_id", "source_storage_id", "source_generation", "source_size", "source_digest", "destination_computer_id", "destination_storage_id", "old_generation", "destination_generation", "destination_size", "bound_node_id", "root_instance_id", "job_id", "operation_revision", "cleanup_fence", "keep_old_as_backup", "phase"],
+        "properties": {
+          "operation": { "enum": ["restore", "clone"] },
+          "backup_id": { "type": "string", "minLength": 1 },
+          "copy_id": { "type": "string", "minLength": 1 },
+          "source_computer_id": { "type": "string", "minLength": 1 },
+          "source_storage_id": { "type": "string", "minLength": 1 },
+          "source_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "source_size": { "type": "integer", "format": "int64", "minimum": 1 },
+          "source_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "destination_computer_id": { "type": "string", "minLength": 1 },
+          "destination_storage_id": { "type": "string", "minLength": 1 },
+          "old_generation": { "type": "integer", "format": "int64", "minimum": 0 },
+          "destination_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "destination_size": { "type": "integer", "format": "int64", "minimum": 1 },
+          "bound_node_id": { "type": "string", "minLength": 1 },
+          "root_instance_id": { "type": "string", "minLength": 1 },
+          "job_id": { "type": "string", "minLength": 1 },
+          "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+          "cleanup_fence": { "type": "string", "minLength": 1 },
+          "keep_old_as_backup": { "type": "boolean" },
+          "old_backup_id": { "type": "string", "minLength": 1 },
+          "old_copy_id": { "type": "string", "minLength": 1 },
+          "phase": { "enum": ["reserved", "prepared", "published"] }
         }
       },
       "Attempt": {
@@ -1019,7 +1055,7 @@
           { "$ref": "#/components/schemas/Node" },
           {
             "type": "object",
-            "required": ["removal_directives", "storage_reset_directives", "backup_directives", "backup_prune_directives"],
+            "required": ["removal_directives", "storage_reset_directives", "backup_directives", "backup_prune_directives", "storage_copy_directives"],
             "properties": {
               "removal_directives": {
                 "type": "array",
@@ -1044,6 +1080,12 @@
                 "items": { "$ref": "#/components/schemas/ComputerBackupPruneDirective" },
                 "readOnly": true,
                 "description": "Explicit physical copy removals requiring positive absence receipts."
+              },
+              "storage_copy_directives": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/ComputerStorageCopyDirective" },
+                "readOnly": true,
+                "description": "Restore and clone work released only from a published source-node Backup copy; published restore rows remain until predecessor absence is acknowledged."
               },
               "computer_policy": {
                 "$ref": "#/components/schemas/ComputerPolicySnapshot",

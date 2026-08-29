@@ -549,6 +549,33 @@ type ComputerBackupCopyRemovalRequest struct {
 
 type ComputerBackupCopyRemovalReceipt = contract.ComputerBackupCopyRemovalReceipt
 
+// ComputerStorageCopier materializes one detached restore or clone destination
+// from an already-published source-node Backup copy. L1 owns publication,
+// provenance, authority rotation, and predecessor retirement.
+type ComputerStorageCopier interface {
+	CopyComputerStorage(context.Context, ComputerStorageCopyRequest) (ComputerStorageCopyReceipt, error)
+}
+
+type ComputerStorageCopyRequest struct {
+	Operation         string
+	BackupID          string
+	CopyID            string
+	SourceComputerID  string
+	SourceStorageID   string
+	SourceGeneration  int64
+	SourceSize        int64
+	SourceDigest      string
+	Destination       ComputerStorage
+	NodeID            string
+	BootSessionID     string
+	RootInstanceID    string
+	JobID             string
+	OperationRevision int64
+	CleanupFence      string
+}
+
+type ComputerStorageCopyReceipt = contract.ComputerStorageCopyReceipt
+
 // OutputSink receives raw output events. Calls may be concurrent across
 // streams, so implementations must provide any required synchronization.
 type OutputSink interface {
