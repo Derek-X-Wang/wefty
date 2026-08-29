@@ -214,7 +214,7 @@ func TestAdapterLoadImageUsesAgentBudgetAndReturnsDigests(t *testing.T) {
 }
 
 func TestAdapterLoadImageBootstrapsPlatformWithoutFunctionalProbe(t *testing.T) {
-	engine := &adapterTestEngine{}
+	engine := &adapterTestEngine{doctorPlatform: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}}
 	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{Budget: 3 * time.Second})
 	defer closeAdapter()
 	session, err := barrier.Session()
@@ -232,8 +232,81 @@ func TestAdapterLoadImageBootstrapsPlatformWithoutFunctionalProbe(t *testing.T) 
 	if result.TopLevelDigest != adapterTestDigest || engine.ensureCalls != 1 {
 		t.Fatalf("bootstrap load-image result=%+v calls=%d", result, engine.ensureCalls)
 	}
+	engine.mu.Lock()
+	platform := engine.lastEnsure.Platform
+	engine.mu.Unlock()
+	if platform != (ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64", Variant: "v8"}) {
+		t.Fatalf("offline import platform = %+v, want canonical arm64 variant", platform)
+	}
 	if _, recorded := adapter.probePlatform(session); recorded {
 		t.Fatal("offline import promoted diagnostic platform mechanics into functional probe evidence")
+	}
+}
+
+func TestCanonicalProbePlatformIncludesDefaultArm64Variant(t *testing.T) {
+	for _, test := range []struct {
+		input ocihelper.OCIPlatform
+		want  ocihelper.OCIPlatform
+	}{
+		{input: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64"}, want: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64", Variant: "v8"}},
+		{input: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64", Variant: "v9"}, want: ocihelper.OCIPlatform{OS: "linux", Architecture: "arm64", Variant: "v9"}},
+		{input: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}, want: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}},
+	} {
+		if got, err := canonicalProbePlatform(test.input); err != nil || got != test.want {
+			t.Fatalf("canonicalProbePlatform(%+v) = %+v, %v, want %+v", test.input, got, err, test.want)
+		}
+	}
+}
+
+func TestAdapterRuntimeDeliveryStillRequiresFunctionalProbePlatform(t *testing.T) {
+	engine := &adapterTestEngine{doctorPlatform: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}}
+	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{Budget: 3 * time.Second})
+	defer closeAdapter()
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.mu.Lock()
+	delete(adapter.probePlatforms, helperSession(session))
+	adapter.mu.Unlock()
+	result, err := adapter.Run(t.Context(), adapterTestRequest(), nil)
+	if err == nil || result.Outcome.SpawnError == nil || result.Outcome.SpawnError.Code != contract.SpawnFailureRuntimeUnavailable {
+		t.Fatalf("runtime delivery without probe = (%+v, %v)", result.Outcome, err)
+	}
+	engine.mu.Lock()
+	ensureCalls, doctorCalls := engine.ensureCalls, engine.doctorCalls
+	engine.mu.Unlock()
+	if ensureCalls != 0 || doctorCalls != 0 {
+		t.Fatalf("runtime delivery used archive bootstrap fallback: ensure_calls=%d doctor_calls=%d", ensureCalls, doctorCalls)
+	}
+}
+
+func TestAdapterLoadImageClassifiesDiagnosticPlatformFailures(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		platform ocihelper.OCIPlatform
+		err      error
+	}{
+		{name: "diagnostic read", err: errors.New("diagnostic unavailable")},
+		{name: "invalid diagnostic platform", platform: ocihelper.OCIPlatform{OS: "linux"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine := &adapterTestEngine{doctorPlatform: test.platform, doctorErr: test.err}
+			adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{Budget: 3 * time.Second})
+			defer closeAdapter()
+			session, err := barrier.Session()
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter.mu.Lock()
+			delete(adapter.probePlatforms, helperSession(session))
+			adapter.mu.Unlock()
+			_, err = adapter.LoadImage(t.Context(), "", bytes.NewReader([]byte("archive")))
+			var reasoned interface{ ControlFailureReason() string }
+			if !errors.As(err, &reasoned) || reasoned.ControlFailureReason() != string(ocihelper.CodeDiagnosticFailure) {
+				t.Fatalf("offline import platform error = %v reason=%v", err, reasoned)
+			}
+		})
 	}
 }
 
@@ -1133,10 +1206,20 @@ type adapterTestEngine struct {
 	inventoryErr       error
 	attestRemoval      ocihelper.AttestRemovalResponse
 	attestErr          error
+	doctorPlatform     ocihelper.OCIPlatform
+	doctorErr          error
+	doctorCalls        int
 }
 
-func (*adapterTestEngine) DoctorStatus(context.Context) (ocihelper.DoctorStatus, error) {
-	return ocihelper.DoctorStatus{RuntimePlatform: ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}}, nil
+func (engine *adapterTestEngine) DoctorStatus(context.Context) (ocihelper.DoctorStatus, error) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.doctorCalls++
+	platform := engine.doctorPlatform
+	if platform.OS == "" {
+		platform = ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}
+	}
+	return ocihelper.DoctorStatus{RuntimePlatform: platform}, engine.doctorErr
 }
 
 func (engine *adapterTestEngine) ReconcileImagePins(_ context.Context, request ocihelper.ReconcileImagePinsRequest) (ocihelper.ReconcileImagePinsResponse, error) {

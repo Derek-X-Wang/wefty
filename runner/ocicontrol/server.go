@@ -214,7 +214,15 @@ func writeControlErrorDetails(writer http.ResponseWriter, status int, code contr
 func helperMechanicsDetails(err error) map[string]any {
 	var failure *ocihelper.RPCError
 	if !errors.As(err, &failure) {
-		return nil
+		var reasoned interface{ ControlFailureReason() string }
+		if errors.As(err, &reasoned) {
+			switch reason := reasoned.ControlFailureReason(); reason {
+			case string(ocihelper.CodeInvalidRequest), string(ocihelper.CodeEngineFailure),
+				string(ocihelper.CodeDiagnosticFailure), string(ocihelper.CodeImageUnavailable):
+				return map[string]any{"reason": reason}
+			}
+		}
+		return map[string]any{"reason": string(contract.ErrorInternal)}
 	}
 	details := map[string]any{"reason": string(failure.Code)}
 	if failure.ImageFailure != nil {

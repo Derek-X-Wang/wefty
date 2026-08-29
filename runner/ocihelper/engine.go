@@ -28,6 +28,7 @@ type NativeEngineConfig struct {
 	AttemptPortMax         uint16
 	AttemptPortBindTimeout time.Duration
 	LogSealTimeout         time.Duration
+	TaskReleaseTimeout     time.Duration
 	HandoffRetention       time.Duration
 	MemoryCapacityBytes    int64
 	MemoryReserveBytes     int64

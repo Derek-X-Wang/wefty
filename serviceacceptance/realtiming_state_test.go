@@ -1,3 +1,5 @@
+//go:build service_acceptance_realtiming && (darwin || linux)
+
 package serviceacceptance
 
 import (

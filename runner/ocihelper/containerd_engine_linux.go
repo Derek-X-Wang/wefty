@@ -162,6 +162,9 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	if config.LogSealTimeout <= 0 {
 		config.LogSealTimeout = 5 * time.Second
 	}
+	if config.TaskReleaseTimeout <= 0 {
+		config.TaskReleaseTimeout = defaultTaskReleaseTimeout
+	}
 	if config.HandoffRetention <= 0 {
 		config.HandoffRetention = defaultHandoffRetention
 	}
@@ -1066,7 +1069,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	engine.mu.Lock()
 	engine.attempts[request.Authority.key()] = attempt
 	engine.mu.Unlock()
-	go attempt.cacheTerminal(wait, engine.config.LogSealTimeout)
+	go attempt.cacheTerminal(wait, engine.config.CgroupRoot, engine.config.TaskReleaseTimeout)
 	if err := document.RevalidateMounts(); err != nil {
 		return RunResponse{}, &RuntimeSpecRejectionError{err: err}
 	}
@@ -1376,13 +1379,16 @@ func (engine *ContainerdEngine) Watch(ctx context.Context, request WatchRequest,
 	return emit(WatchEvent{Kind: WatchComplete, Result: result})
 }
 
-func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatus, releaseTimeout time.Duration) {
+func (attempt *containerdAttempt) cacheTerminal(wait <-chan containerd.ExitStatus, cgroupRoot string, releaseTimeout time.Duration) {
 	exit, ok := <-wait
 	attempt.mu.Lock()
 	if !ok {
 		attempt.terminalErr = errors.New("containerd task Wait closed without exit status")
 	} else {
 		attempt.terminalCode, _, attempt.terminalErr = exit.Result()
+	}
+	if cgroupReportedOOM(cgroupRoot, attempt.resources.CgroupID) {
+		attempt.oom = true
 	}
 	attempt.mu.Unlock()
 	if err := publishTerminalAfterTaskRelease(releaseTimeout, attempt.releaseTask, attempt.terminalReady); err != nil {

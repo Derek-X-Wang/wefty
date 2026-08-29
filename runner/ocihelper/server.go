@@ -8,6 +8,7 @@ import (
 	"io"
 	"maps"
 	"net"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -86,6 +87,7 @@ type serverAttempt struct {
 	closeReaped      sync.Once
 	guardianReaping  bool
 	guardianReaped   bool
+	guardianDelete   bool
 }
 
 func (attempt *serverAttempt) stopWatcher() {
@@ -788,6 +790,17 @@ func (session *serverSession) reapAttempt(attempt *serverAttempt, createGateHeld
 		err = session.server.engine.ReapAttempt(ctx, attempt.authority)
 	}
 	cancel()
+	outcome := "verified_absent"
+	if err != nil {
+		outcome = "failed"
+	}
+	if guardian {
+		payload, _ := json.Marshal(map[string]string{
+			"event": "guardian_deadman_reap", "attempt_id": attempt.authority.AttemptID,
+			"fencing_token": attempt.authority.FencingToken, "outcome": outcome,
+		})
+		_, _ = fmt.Fprintln(os.Stderr, string(payload))
+	}
 	session.mu.Lock()
 	attempt.guardianReaped = guardian && err == nil
 	attempt.state = attemptTombstoned
@@ -849,7 +862,8 @@ func (session *serverSession) authorizeDelete(ctx context.Context, authority Att
 				return nil, false, &RPCError{Code: CodeEngineFailure, Message: "guardian attempt reap was not confirmed"}
 			}
 		}
-		if attempt.state == attemptTombstoned && attempt.guardianReaped {
+		if attempt.state == attemptTombstoned && attempt.guardianReaped && !attempt.guardianDelete {
+			attempt.guardianDelete = true
 			session.mu.Unlock()
 			return attempt, true, nil
 		}
@@ -860,6 +874,12 @@ func (session *serverSession) authorizeDelete(ctx context.Context, authority Att
 		session.mu.Unlock()
 		return attempt, false, nil
 	}
+}
+
+func (session *serverSession) consumeGuardianDelete(attempt *serverAttempt) {
+	session.mu.Lock()
+	attempt.guardianReaped = false
+	session.mu.Unlock()
 }
 
 func (session *serverSession) sweepRequired(method Method) bool {
@@ -1168,13 +1188,11 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			_ = writeRPCError(wire, rpcErr)
 			return
 		}
-		if alreadyReaped {
-			_ = writeEngineResponse(wire, DeleteResponse{Deleted: true}, nil)
-			return
-		}
 		operation.monitorEOF()
 		response, err := server.engine.Delete(operation.ctx, body)
-		if err == nil && response.Deleted {
+		if alreadyReaped {
+			session.consumeGuardianDelete(attempt)
+		} else if err == nil && response.Deleted {
 			err = session.reapAttempt(attempt, false, false)
 		}
 		_ = writeEngineResponse(wire, response, err)

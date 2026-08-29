@@ -216,6 +216,12 @@ intent and runtime state. `load-image` streams an OCI archive through this
 surface to the existing helper-owned import/cache seam; it accepts no mutable
 reference override and returns only verified top-level and admitted-platform
 digests plus bounded evidence.
+Node-local JSON failures always carry a closed, sanitized `details.reason`:
+typed helper failures retain their helper protocol code, adapter-side platform
+diagnostics use `diagnostic_failure`, other recognized adapter failures use
+their bounded helper code, and an otherwise plain internal failure uses
+`internal`. Raw paths, error strings, credentials, and other helper-local
+mechanics never cross this boundary.
 
 Stop ordering is durable disable → restrictive local Capability observation →
 published-service withdrawal → attempt reap and positive runtime quiescence →

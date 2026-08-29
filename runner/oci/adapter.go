@@ -20,12 +20,29 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
+	"github.com/containerd/platforms"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // SessionSource returns the currently boot-barrier-pinned helper session.
 type SessionSource interface {
 	Session() (*ocihelper.Session, error)
 	ExecutionSnapshot() (*ocihelper.Session, ocihelper.VerifiedSweepReceipt, error)
+}
+
+type controlFailureError struct {
+	reason string
+	err    error
+}
+
+func (failure *controlFailureError) Error() string { return failure.err.Error() }
+func (failure *controlFailureError) Unwrap() error { return failure.err }
+func (failure *controlFailureError) ControlFailureReason() string {
+	return failure.reason
+}
+
+func controlFailure(reason ocihelper.ErrorCode, err error) error {
+	return &controlFailureError{reason: string(reason), err: err}
 }
 
 type Adapter struct {
@@ -557,32 +574,32 @@ func validateHelperRemovalAttestation(request workloadrunner.RuntimeRemovalProof
 // digest-only while the helper enforces the bound cache and binding pins.
 func (adapter *Adapter) LoadImage(ctx context.Context, reference string, archive io.Reader) (ocihelper.EnsureImageResponse, error) {
 	if adapter == nil || adapter.sessions == nil {
-		return ocihelper.EnsureImageResponse{}, errors.New("OCI helper session is not configured")
+		return ocihelper.EnsureImageResponse{}, controlFailure(ocihelper.CodeEngineFailure, errors.New("OCI helper session is not configured"))
 	}
 	if archive == nil {
-		return ocihelper.EnsureImageResponse{}, errors.New("OCI image archive reader is required")
+		return ocihelper.EnsureImageResponse{}, controlFailure(ocihelper.CodeInvalidRequest, errors.New("OCI image archive reader is required"))
 	}
 	budgetContext, cancel := context.WithTimeout(ctx, adapter.imagePolicy.Budget)
 	defer cancel()
 	session, err := adapter.sessions.Session()
 	if err != nil {
-		return ocihelper.EnsureImageResponse{}, err
+		return ocihelper.EnsureImageResponse{}, controlFailure(ocihelper.CodeEngineFailure, err)
 	}
 	probePlatform, ok := adapter.probePlatform(session)
 	if !ok {
 		status, statusErr := session.DoctorStatus(budgetContext)
 		if statusErr != nil {
-			return ocihelper.EnsureImageResponse{}, fmt.Errorf("read OCI helper platform for offline import: %w", statusErr)
+			return ocihelper.EnsureImageResponse{}, controlFailure(ocihelper.CodeDiagnosticFailure, fmt.Errorf("read OCI helper platform for offline import: %w", statusErr))
 		}
-		probePlatform, statusErr = canonicalProbePlatform(status.RuntimePlatform)
+		probePlatform, statusErr = canonicalOfflineImportPlatform(status.RuntimePlatform)
 		if statusErr != nil {
-			return ocihelper.EnsureImageResponse{}, fmt.Errorf("read OCI helper platform for offline import: %w", statusErr)
+			return ocihelper.EnsureImageResponse{}, controlFailure(ocihelper.CodeDiagnosticFailure, fmt.Errorf("read OCI helper platform for offline import: %w", statusErr))
 		}
 	}
 	deadline, _ := budgetContext.Deadline()
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		return ocihelper.EnsureImageResponse{}, errors.New("OCI image import budget exhausted")
+		return ocihelper.EnsureImageResponse{}, controlFailure(ocihelper.CodeImageUnavailable, errors.New("OCI image import budget exhausted"))
 	}
 	var response ocihelper.EnsureImageResponse
 	err = session.ImportImage(budgetContext, ocihelper.EnsureImageRequest{
@@ -595,14 +612,22 @@ func (adapter *Adapter) LoadImage(ctx context.Context, reference string, archive
 	})
 	if err != nil {
 		if budgetContext.Err() != nil {
-			return ocihelper.EnsureImageResponse{}, errors.New("OCI image import budget exhausted")
+			return ocihelper.EnsureImageResponse{}, controlFailure(ocihelper.CodeImageUnavailable, errors.New("OCI image import budget exhausted"))
 		}
-		return ocihelper.EnsureImageResponse{}, err
+		var rpcErr *ocihelper.RPCError
+		if errors.As(err, &rpcErr) {
+			return ocihelper.EnsureImageResponse{}, err
+		}
+		return ocihelper.EnsureImageResponse{}, controlFailure(ocihelper.CodeEngineFailure, err)
 	}
 	if response.TopLevelDigest == "" || response.PlatformDigest == "" {
-		return ocihelper.EnsureImageResponse{}, errors.New("OCI helper completed image import without immutable digests")
+		return ocihelper.EnsureImageResponse{}, controlFailure(ocihelper.CodeImageUnavailable, errors.New("OCI helper completed image import without immutable digests"))
 	}
 	return response, nil
+}
+
+func canonicalOfflineImportPlatform(platform ocihelper.OCIPlatform) (ocihelper.OCIPlatform, error) {
+	return canonicalProbePlatform(platform)
 }
 
 // DialAttemptPort exposes one named exact-authority host-to-guest stream to the
@@ -704,7 +729,13 @@ func canonicalProbePlatform(platform ocihelper.OCIPlatform) (ocihelper.OCIPlatfo
 	if canonical.OS == "" || canonical.Architecture == "" || canonical != platform {
 		return ocihelper.OCIPlatform{}, errors.New("OCI functional probe returned a non-canonical platform")
 	}
-	return canonical, nil
+	normalized := platforms.Normalize(ocispec.Platform{
+		OS: canonical.OS, Architecture: canonical.Architecture, Variant: canonical.Variant,
+	})
+	if normalized.Architecture == "arm64" && normalized.Variant == "" {
+		normalized.Variant = "v8"
+	}
+	return ocihelper.OCIPlatform{OS: normalized.OS, Architecture: normalized.Architecture, Variant: normalized.Variant}, nil
 }
 
 func helperSession(session *ocihelper.Session) ocihelper.HelperSession {
