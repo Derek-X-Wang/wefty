@@ -9,7 +9,9 @@ import (
 )
 
 const (
-	maxServiceRestartDelay     = 30 * time.Second
+	// MaximumServiceRestartDelay bounds both service failure and lease-loss
+	// backoff so infrastructure churn cannot suppress a binding indefinitely.
+	MaximumServiceRestartDelay = 30 * time.Second
 	minimumServiceRestartDelay = 500 * time.Millisecond
 )
 
@@ -59,15 +61,15 @@ func prestartRetryDelay(retryCount int, jitter func(time.Duration) time.Duration
 		retryCount = 1
 	}
 	delay := time.Second
-	for i := 1; i < retryCount && delay < maxServiceRestartDelay; i++ {
+	for i := 1; i < retryCount && delay < MaximumServiceRestartDelay; i++ {
 		delay *= 2
-		if delay > maxServiceRestartDelay {
-			delay = maxServiceRestartDelay
+		if delay > MaximumServiceRestartDelay {
+			delay = MaximumServiceRestartDelay
 		}
 	}
 	delay = jitter(delay)
-	if delay > maxServiceRestartDelay {
-		return maxServiceRestartDelay
+	if delay > MaximumServiceRestartDelay {
+		return MaximumServiceRestartDelay
 	}
 	return delay
 }
@@ -98,14 +100,14 @@ func serviceRestartDelay(restartStreak int, leaseDuration time.Duration, jitter 
 	}
 	nominal := time.Second
 	for range exponent {
-		if nominal >= maxServiceRestartDelay/2 {
-			nominal = maxServiceRestartDelay
+		if nominal >= MaximumServiceRestartDelay/2 {
+			nominal = MaximumServiceRestartDelay
 			break
 		}
 		nominal *= 2
 	}
-	if nominal > maxServiceRestartDelay {
-		nominal = maxServiceRestartDelay
+	if nominal > MaximumServiceRestartDelay {
+		nominal = MaximumServiceRestartDelay
 	}
 	if nominal > leaseDuration {
 		nominal = leaseDuration

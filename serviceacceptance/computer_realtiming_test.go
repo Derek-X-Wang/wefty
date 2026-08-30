@@ -282,7 +282,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"--image", reference+"@"+digest, "--expect-current", "--idempotency-key", "linux-native-reimage")
 	reimaged = waitForComputerCLI(t, harness, reimaged.ComputerID, 4*time.Minute, func(current l1.Computer) bool {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision &&
-			current.CurrentSpecRevision > reset.CurrentSpecRevision && current.DisplayEndpoint != nil
+			current.CurrentSpecRevision > reset.CurrentSpecRevision && computerDisplayPublished(current)
 	})
 	abortEvidence := exerciseLiveReconfigurationAbort(t, harness, reference, digest)
 	detachment := inspectLiveComputerDetachment(t, reimaged)

@@ -154,7 +154,7 @@ jobs:
       - name: Pin the downloaded artifact identity
         env:
           EXPECTED_SHA: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
-          EVIDENCE_SOURCE: ${{ needs.resolve-published-artifact.outputs.source }}
+          WEFTY_REALTIME_EVIDENCE_SOURCE: ${{ needs.resolve-published-artifact.outputs.source }}
         run: |
           set -euo pipefail
           tar -xf "$RUNNER_TEMP/acceptance-image-download/wefty-acceptance-image-release.tar" -C "$RUNNER_TEMP"
@@ -163,20 +163,20 @@ jobs:
           test "$(jq -r .commit "$RUNNER_TEMP/acceptance-image-release/acceptance-image-receipt.json")" = "$EXPECTED_SHA"
           test "$(jq -r .commit "$RUNNER_TEMP/computer-image-release/computer-image-receipt.json")" = "$EXPECTED_SHA"
           test "$(jq -r .commit "$RUNNER_TEMP/wayland-computer-image-release/wayland-computer-image-receipt.json")" = "$EXPECTED_SHA"
-          if [ "$EVIDENCE_SOURCE" = pr-build ]; then
+          if [ "$WEFTY_REALTIME_EVIDENCE_SOURCE" = pr-build ]; then
             jq -e '.source == "pr-build" and .public_pull == false' "$RUNNER_TEMP/acceptance-image-release/acceptance-image-receipt.json"
             jq -e '.source == "pr-build" and .public_pull == false' "$RUNNER_TEMP/computer-image-release/computer-image-receipt.json"
             jq -e '.source == "pr-build" and .public_pull == false' "$RUNNER_TEMP/wayland-computer-image-release/wayland-computer-image-receipt.json"
           else
-            test "$EVIDENCE_SOURCE" = published-artifact
+            test "$WEFTY_REALTIME_EVIDENCE_SOURCE" = published-artifact
             jq -e '.public_pull == true' "$RUNNER_TEMP/acceptance-image-release/acceptance-image-receipt.json"
             jq -e '.public_pull == true' "$RUNNER_TEMP/computer-image-release/computer-image-receipt.json"
             jq -e '.public_pull == true' "$RUNNER_TEMP/wayland-computer-image-release/wayland-computer-image-receipt.json"
           fi
           candidate_sha="$(git rev-parse HEAD)"
           test "$candidate_sha" = "$EXPECTED_SHA"
-          printf 'CANDIDATE_SHA=%s\nEVIDENCE_SOURCE=%s\nARTIFACT_RUN_ID=%s\n' \
-            "$candidate_sha" "$EVIDENCE_SOURCE" "${{ needs.resolve-published-artifact.outputs.run-id }}" >> "$GITHUB_ENV"
+          printf 'CANDIDATE_SHA=%s\nWEFTY_REALTIME_EVIDENCE_SOURCE=%s\nARTIFACT_RUN_ID=%s\n' \
+            "$candidate_sha" "$WEFTY_REALTIME_EVIDENCE_SOURCE" "${{ needs.resolve-published-artifact.outputs.run-id }}" >> "$GITHUB_ENV"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
@@ -488,9 +488,9 @@ jobs:
             cp /tmp/wefty-oci-provision.txt "$WEFTY_REALTIME_EVIDENCE_DIR/"
           fi
           printf 'commit=%s\nrunner=%s\nsource=%s\nartifact_run_id=%s\n' \
-            "$CANDIDATE_SHA" "$RUNNER_NAME" "$EVIDENCE_SOURCE" "$ARTIFACT_RUN_ID" \
+            "$CANDIDATE_SHA" "$RUNNER_NAME" "$WEFTY_REALTIME_EVIDENCE_SOURCE" "$ARTIFACT_RUN_ID" \
             > "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
-          jq -n --arg commit "$CANDIDATE_SHA" --arg source "$EVIDENCE_SOURCE" --arg artifact_run_id "$ARTIFACT_RUN_ID" \
+          jq -n --arg commit "$CANDIDATE_SHA" --arg source "$WEFTY_REALTIME_EVIDENCE_SOURCE" --arg artifact_run_id "$ARTIFACT_RUN_ID" \
             '{version:1,commit:$commit,source:$source,artifact_run_id:$artifact_run_id}' \
             > "$WEFTY_REALTIME_EVIDENCE_DIR/provenance-receipt.json"
           go version >> "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
@@ -568,7 +568,7 @@ jobs:
           RESOLVE_RESULT: ${{ needs.resolve-published-artifact.result }}
           ARTIFACT_AVAILABLE: ${{ needs.resolve-published-artifact.outputs.available }}
           REALTIMING_RESULT: ${{ needs.service-acceptance-realtiming.result }}
-          EVIDENCE_SOURCE: ${{ needs.resolve-published-artifact.outputs.source }}
+          WEFTY_REALTIME_EVIDENCE_SOURCE: ${{ needs.resolve-published-artifact.outputs.source }}
         run: |
           set -eu
           printf '%s\n' \
@@ -578,10 +578,10 @@ jobs:
           test "$RESOLVE_RESULT" = success
           test "$ARTIFACT_AVAILABLE" = true
           test "$REALTIMING_RESULT" = success
-          jq -e --arg commit "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" --arg source "$EVIDENCE_SOURCE" \
+          jq -e --arg commit "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" --arg source "$WEFTY_REALTIME_EVIDENCE_SOURCE" \
             '.commit == $commit and .source == $source' \
             "$RUNNER_TEMP/linux-computer-receipt-xfce/provenance-receipt.json"
-          jq -e --arg commit "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" --arg source "$EVIDENCE_SOURCE" \
+          jq -e --arg commit "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" --arg source "$WEFTY_REALTIME_EVIDENCE_SOURCE" \
             '.commit == $commit and .source == $source' \
             "$RUNNER_TEMP/linux-computer-receipt-wayland/provenance-receipt.json"
           scripts/check-linux-computer-receipt.sh \
@@ -591,6 +591,8 @@ jobs:
             "$RUNNER_TEMP/linux-computer-receipt-wayland/linux-computer-matrix.json" \
             "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" wayland
           scripts/check-native-linux-oci-receipt.sh \
-            "$RUNNER_TEMP/linux-computer-receipt-xfce/native-linux-oci.txt" "$EVIDENCE_SOURCE"
+            "$RUNNER_TEMP/linux-computer-receipt-xfce/native-linux-oci.txt" "$WEFTY_REALTIME_EVIDENCE_SOURCE" \
+            "$RUNNER_TEMP/linux-computer-receipt-xfce/oci-service-publication-linux.txt"
           scripts/check-native-linux-oci-receipt.sh \
-            "$RUNNER_TEMP/linux-computer-receipt-wayland/native-linux-oci.txt" "$EVIDENCE_SOURCE"
+            "$RUNNER_TEMP/linux-computer-receipt-wayland/native-linux-oci.txt" "$WEFTY_REALTIME_EVIDENCE_SOURCE" \
+            "$RUNNER_TEMP/linux-computer-receipt-wayland/oci-service-publication-linux.txt"

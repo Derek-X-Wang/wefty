@@ -339,6 +339,14 @@ type AttemptEndpoint struct {
 	Dial func(context.Context) (net.Conn, error)
 }
 
+// OCILogSealObservation preserves the helper's per-stream EOF boundary for
+// acceptance and diagnostics without treating it as an application log event.
+type OCILogSealObservation struct {
+	Stream   contract.LogStream
+	Complete bool
+	Reason   string
+}
+
 const (
 	AttemptEndpointService = "service"
 	AttemptEndpointView    = contract.ComputerDisplayEndpointView
@@ -389,10 +397,13 @@ type Request struct {
 	// task when this callback fails.
 	// OCIStartedAt carries the helper-captured task Start edge before any L1
 	// round trip so lifecycle clocks retain the original budget.
-	OCIStartedAt     func(time.Time)
-	OCIStarted       func(context.Context, OCIImageObservation) error
-	OCIImageDeadline time.Time
-	InitialDeadman   time.Duration
+	OCIStartedAt func(time.Time)
+	OCIStarted   func(context.Context, OCIImageObservation) error
+	// OCILogSealObserved reports the helper's terminal record for each stream.
+	// ProcessResult.LogEvidenceIncomplete remains the durable aggregate fact.
+	OCILogSealObserved func(OCILogSealObservation)
+	OCIImageDeadline   time.Time
+	InitialDeadman     time.Duration
 	// HostBridgeDial is set only for Lima's bind-failure reverse-tunnel path.
 	// It dials the host-local run bridge and never accepts an arbitrary target.
 	HostBridgeDial func(context.Context) (net.Conn, error)

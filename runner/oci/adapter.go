@@ -1100,6 +1100,11 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 	watchDone := make(chan error, 1)
 	go func() {
 		watchDone <- session.Watch(watchContext, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
+			if event.Seal != nil && request.OCILogSealObserved != nil {
+				request.OCILogSealObserved(workloadrunner.OCILogSealObservation{
+					Stream: contract.LogStream(event.Seal.Stream), Complete: event.Seal.Complete, Reason: event.Seal.Reason,
+				})
+			}
 			if event.Log != nil && sink != nil {
 				logEvent := contract.LogEvent{
 					AttemptID: request.Authority.AttemptID, Stream: contract.LogStream(event.Log.Stream),
