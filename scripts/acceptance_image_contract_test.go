@@ -133,6 +133,11 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			t.Fatalf("%s reference Computer lane bypasses the second solve for one variant", name)
 		}
 		assertWaylandFurnitureInvocations(t, name, workflow)
+		for _, required := range []string{"::error title=computer image runtime::stage", "stage='runtime-conformance'", "stage='digest-compare'", "stage='rootfs-export'", "stage='elf-validate'", "stage='receipt-finalize'"} {
+			if !strings.Contains(text, required) {
+				t.Fatalf("%s reference Computer runtime step is missing attributed stage %q", name, required)
+			}
+		}
 	}
 
 	called := gate.Jobs["acceptance-image"]
@@ -290,9 +295,18 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileMatches(t, "../examples/computer-wayland/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG DEBIAN_IMAGE=.*@sha256:[0-9a-f]{64}$`)
 	assertFileContains(t, "../examples/computer/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "ARG SOURCE_DATE_EPOCH=0", "chromium=", "/var/log/dpkg.log", "/var/log/alternatives.log", "/var/log/apt/*")
 	assertFileContains(t, "../examples/computer/entrypoint.sh", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "/wefty/service")
+	for _, path := range []string{"../examples/computer/entrypoint.sh", "../examples/computer/fixtures/entrypoint.sh", "../examples/computer-wayland/entrypoint.sh", "../examples/computer-wayland/entrypoint-fixture.sh"} {
+		assertFileContains(t, path, "wait || true\n  chmod -R u+rwX,go+rwX /wefty/service")
+	}
 	assertFileContains(t, "../examples/computer/rfb-websocket.py", `target.path != "/websockify"`, `"binary" not in offered`, "BinaryOnlyWebSocket")
 	assertFileContains(t, "../examples/computer/rfb-backend.py", `command.append("-viewonly")`, "socket.AF_UNIX")
-	assertFileContains(t, "../examples/computer/watch-driver.py", "/wefty/control/driver.json", "os.replace", `type(value["version"]) is not int`, `type(value["human_driving"]) is not bool`)
+	assertFileContains(t, "../examples/computer/watch-driver.py", "/wefty/control/driver.json", "fingerprint", "os.replace", `type(value["version"]) is not int`, `type(value["human_driving"]) is not bool`)
+	for _, path := range []string{"../examples/computer/entrypoint.sh", "../examples/computer/watch-driver.py", "../examples/computer/rfb-websocket.py"} {
+		assertFileNotContains(t, path, "WEFTY_CONFORMANCE_MUTATION")
+	}
+	for _, path := range []string{"../examples/computer/fixtures/entrypoint.sh", "../examples/computer/fixtures/watch-driver.py", "../examples/computer/fixtures/rfb-websocket.py"} {
+		assertFileContains(t, path, "WEFTY_CONFORMANCE_MUTATION")
+	}
 	assertFileContains(t, "../examples/computer/oracle.html", `data-wefty-input-oracle="v1"`, "events=0 bytes=0 hash=00000000")
 	assertFileContains(t, "../examples/computer/pointer-oracle.py", "XQueryPointer", "input-oracle.json", "os.replace")
 	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "wayvnc=0.9.1-1", "sway=1.10.1-2", "wev=", "mise-v2026.8.14", "wefty-verify-licenses", "ldconfig -p", "/usr/local/lib/libneatvnc.so.0", "non-dpkg-components.tsv", "mise-MIT.txt", "wefty-Apache-2.0.txt", "rm -f \"/usr/lib/$multiarch/libneatvnc.so\"*")
@@ -307,9 +321,9 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "WLR_BACKENDS=headless", "WLR_RENDERER=pixman", "WLR_HEADLESS_OUTPUTS=1")
 	assertFileContains(t, "../examples/computer-wayland/entrypoint.sh", "wayvnc -w", "--disable-input", "--class=chromium", "--app=http://127.0.0.1:18888/", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "surface-ready", "surface-failure", "surface_wait=45", "within 45 seconds", "view-edge-ready", "control-edge-ready")
 	assertFileContains(t, "../examples/computer-wayland/entrypoint-fixture.sh", "WEFTY_CONFORMANCE_MUTATION", "--class=chromium", "--app=http://127.0.0.1:18888/", "surface-failure", "oracle_wait=45", "within 45 seconds", "wefty-view-proxy")
-	assertFileContains(t, "../examples/computer/fixtures/Dockerfile", "view-proxy-fixture.py", "/usr/local/libexec/wefty-view-proxy")
+	assertFileContains(t, "../examples/computer/fixtures/Dockerfile", "view-proxy-fixture.py", "/usr/local/libexec/wefty-view-proxy", "wefty-xfce-entrypoint-fixture", "wefty-xfce-watch-driver-fixture", "wefty-xfce-rfb-websocket-fixture")
 	assertFileNotContains(t, "../examples/computer-wayland/entrypoint.sh", "WEFTY_CONFORMANCE_MUTATION", "WEFTY_WAYVNC_RECORD_INPUT")
-	assertFileContains(t, "../examples/computer-wayland/watch-driver.py", "/wefty/control/driver.json", "type(value[\"version\"]) is not int", "os.replace")
+	assertFileContains(t, "../examples/computer-wayland/watch-driver.py", "/wefty/control/driver.json", "type(value[\"version\"]) is not int", "fingerprint", "os.replace")
 	assertFileContains(t, "../examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch", "GET /websockify", "Sec-WebSocket-Protocol: binary", "WS_OPCODE_TEXT", "wefty_mutation_hooks", "view-edge-ready", "control-edge-ready")
 	assertFileNotContains(t, "../examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch", "WEFTY_WAYVNC_RECORD_INPUT", "native-input-events")
 	assertFileContains(t, "../examples/computer-wayland/surface.py", "input-oracle.json", `"ready": False`, `INPUT["ready"] = True`, "def wefty_record_input", "Record wev keys or pointer facts from the focused Chromium client", `"wev"`, "wl_keyboard", "secrets.token_hex(32)", "secrets.compare_digest", "wayland-surface-focus-convergence-failed", "focus_input_observer", `'[app_id="wev"] focus'`, `self.path not in ("/surface-ready", "/input")`, "agent-state-surface.json", "theme-surface.json", "os.replace")
@@ -319,7 +333,10 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../examples/computer-wayland/sway-config", `title="^Wefty Wayland Computer$"`, "border none", "fullscreen enable", `app_id="wev"`, "opacity set 0.0", "floating enable", "resize set width 32 px height 32 px", "focus")
 	assertFileContains(t, "../examples/computer-wayland/LICENSES.md", "Herdr", "Apache-2.0", "no code or assets copied", "no code, assets, installer, name, or branding copied")
 	assertFileContains(t, "../scripts/test-computer-wayland-furniture.sh", "gpu_device_absent=$(docker exec", "agent_states_observed=$(docker exec", "agent_states_observed:$agent_states_observed", "self_reconfiguration_observed=$(docker exec", "crash_briefing_observed=$(docker exec", "mise_stubs_present=$(docker exec", "license_manifest_present=$(docker exec", "test ! -e /dev/dri", "agent-state-surface.json", "theme-surface.json", "crash-briefing.json", "idle_rss_bytes", "wefty-verify-licenses --check", `type == "number"`)
-	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", "cmd/wefty-computer-conformance", "--input-oracle-path", "--driver-oracle-path", "executed_rows", ".executed_rows == 20", "Dockerfile.wayland-text")
+	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", "cmd/wefty-computer-conformance", "--input-oracle-path", "--driver-oracle-path", "executed_rows", "check-computer-image-runtime-evidence.sh", "Dockerfile.wayland-text", "checker_wall_seconds", "docker rmi")
+	for _, path := range []string{"../docs/contracts/computer-image.md", "../docs/guides/computer-images.md"} {
+		assertFileContains(t, path, "version", "human_driving", "generation", "fingerprint", "classification", "lowercase", "exact bytes", "valid", "malformed", "unknown-version", "missing", "sentinel")
+	}
 	assertFileContains(t, "../docs/guides/computer-images.md", "Bring-your-own desktop is the product", "not a required base image", "CPU rendering", "--no-sandbox", "wefty-computer-conformance", "GPU-free Wayland")
 	assertFileContains(t, "../docs/guides/computer-images.md", "docker buildx create", "tonistiigi/binfmt@sha256:", "--input-oracle-path", "NOT-RUN", "operator-owned")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "RunComputerServiceRealtiming", "computer_reference_publication_loss_recovery=%t", "computer_reference_helper_stop_start_profile_sign_in_rootfs=%t")
