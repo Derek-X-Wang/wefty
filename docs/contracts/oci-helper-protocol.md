@@ -170,6 +170,10 @@ fencing_token, prior_boot_session_id)` tuples. A helper-startup sweep is folded
 into the first session receipt so evidence is not discarded before session
 acquisition. This is evidence for the later runtime/removal adapter; this
 protocol ticket does not itself persist a deletion manifest or removal receipt.
+Every swept and verified inventory class has identity-set semantics: merges are
+sorted and compacted per class, never counted as a multiset. Recovered Attempt
+authority tuples use the same set semantics across startup, session-reap, and
+current-session sweep sources.
 
 ## Attempt authority and deadmen
 

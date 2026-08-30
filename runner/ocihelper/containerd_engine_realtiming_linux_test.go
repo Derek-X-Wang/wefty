@@ -130,6 +130,11 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	initialSweep, ok := barrier.SweepReceipt()
+	if !ok || !initialSweep.VerifiedAbsent || !ocihelper.InventoryEmpty(initialSweep.VerifiedResidue) {
+		t.Fatalf("initial native sweep receipt = %+v present=%t", initialSweep, ok)
+	}
+	expectedRetained := initialSweep.VerifiedRetained
 	// A clean-cache pull must first prove that root-owned helper/containerd
 	// registry HTTPS is rejected. The release archive is then the only successful
 	// image source; the helper filters it to this node's platform before the 16 GiB
@@ -263,6 +268,9 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	expectedRetained = mergeNativeExpectedInventory(expectedRetained, ocihelper.ResourceInventory{
+		ManagedVolumes: []string{manifest.ServiceDataVolume}, ManagedVolumeRecords: []string{manifest.ServiceDataOwnerRecord},
+	})
 	manifestAuthority := ocirunner.HelperAuthority(manifestRequest.Authority)
 	if _, err := session.Run(ctx, ocihelper.RunRequest{
 		Authority: manifestAuthority, InitialDeadman: l1.DefaultLeaseDuration,
@@ -359,6 +367,13 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		automaticBinding.Authority.WorkloadClass = contract.JobClassService
 		automaticBinding.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 		automaticBinding.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+		automaticManifest, manifestErr := adapter.RemovalResourceManifest(automaticBinding)
+		if manifestErr != nil {
+			t.Fatal(manifestErr)
+		}
+		expectedRetained = mergeNativeExpectedInventory(expectedRetained, ocihelper.ResourceInventory{
+			ManagedVolumes: []string{automaticManifest.ServiceDataVolume}, ManagedVolumeRecords: []string{automaticManifest.ServiceDataOwnerRecord},
+		})
 		if _, err := adapter.Run(ctx, automaticBinding, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -479,8 +494,10 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		{name: "numeric", reference: numericReference, digest: numericImage.TopLevelDigest, owner: "13001:13002"},
 		{name: "named", reference: namedReference, digest: namedImage.TopLevelDigest, owner: "12001:12002"},
 	})
-	exerciseNativeLinuxComputerCapacity(t, ctx, barrier, echoReference, echoImage.TopLevelDigest)
-	computerDiskEvidence := exerciseNativeLinuxComputerDisk(t, ctx, barrier, echoReference, echoImage.TopLevelDigest)
+	expectedRetained = mergeNativeExpectedInventory(expectedRetained, serviceDataEvidence.retained)
+	capacityRetained := exerciseNativeLinuxComputerCapacity(t, ctx, barrier, echoReference, echoImage.TopLevelDigest)
+	expectedRetained = mergeNativeExpectedInventory(expectedRetained, capacityRetained)
+	computerDiskEvidence := exerciseNativeLinuxComputerDisk(t, ctx, barrier, echoReference, echoImage.TopLevelDigest, expectedRetained)
 	computerAgentRestartEvidence := exerciseNativeLinuxComputerAgentRestart(t, ctx, adapter, echoReference, echoImage.TopLevelDigest)
 	session, err = barrier.Session()
 	if err != nil {
@@ -759,7 +776,11 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 			registryEvidence = "pull_from_empty=NOT-RUN\npull_from_empty_reason=pr-build: image not published\npull_import_digest_equal=NOT-RUN\npull_import_digest_equal_reason=pr-build: image not published\n"
 			bindingRepullEvidence = "binding_repull_reconciliation=NOT-RUN\nbinding_repull_reconciliation_reason=pr-build: image not published\n"
 		}
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\n%s%sregistry_disabled_pull_rejected=%t\nregistry_disabled_import=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_reference=%s\ncomputer_index_digest=%s\ncomputer_reference_separate=true\ncomputer_reference_archive_import=true\ncomputer_reference_atomic_readiness=%t\ncomputer_reference_started_to_ready_elapsed=%s\ncomputer_reference_publication_loss_recovery=%t\ncomputer_reference_wire_negatives=true\nwayland_computer_reference=%s\nwayland_computer_index_digest=%s\nwayland_computer_reference_separate=true\nwayland_computer_reference_archive_import=true\nwayland_computer_reference_atomic_readiness=%t\nwayland_computer_reference_started_to_ready_elapsed=%s\nwayland_computer_reference_publication_loss_recovery=%t\nwayland_computer_reference_wire_negatives=true\ncomputer_capacity_three_live_published_fourth_refused=true\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\ncomputer_reference_helper_stop_start_profile_sign_in_rootfs=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, registryEvidence, bindingRepullEvidence, registryDisabledPullRejected, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerReference, computerDigest, referenceComputerReadiness.atomicPublication, referenceComputerReadiness.startedToReadyElapsed, referenceComputerReadiness.lossRecovery, waylandComputerReference, waylandComputerDigest, waylandComputerReadiness.atomicPublication, waylandComputerReadiness.startedToReadyElapsed, waylandComputerReadiness.lossRecovery, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
+		residueEvidence := fmt.Sprintf("residue_verified_absent=%t\nretained_classes_exact=%t\nretained_classes=%s\nswept_runtime_classes_covered=%t\nswept_identity_sets_unique=%t\n",
+			computerDiskEvidence.residue.verifiedAbsent, computerDiskEvidence.residue.retainedClassesExact,
+			computerDiskEvidence.residue.retainedClasses, computerDiskEvidence.residue.sweptRuntimeCovered,
+			computerDiskEvidence.residue.sweptIdentitiesUnique)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\n%s%sregistry_disabled_pull_rejected=%t\nregistry_disabled_import=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_reference=%s\ncomputer_index_digest=%s\ncomputer_reference_separate=true\ncomputer_reference_archive_import=true\ncomputer_reference_atomic_readiness=%t\ncomputer_reference_started_to_ready_elapsed=%s\ncomputer_reference_publication_loss_recovery=%t\ncomputer_reference_wire_negatives=true\nwayland_computer_reference=%s\nwayland_computer_index_digest=%s\nwayland_computer_reference_separate=true\nwayland_computer_reference_archive_import=true\nwayland_computer_reference_atomic_readiness=%t\nwayland_computer_reference_started_to_ready_elapsed=%s\nwayland_computer_reference_publication_loss_recovery=%t\nwayland_computer_reference_wire_negatives=true\ncomputer_capacity_three_live_published_fourth_refused=true\n%scomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\ncomputer_reference_helper_stop_start_profile_sign_in_rootfs=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, registryEvidence, bindingRepullEvidence, registryDisabledPullRejected, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerReference, computerDigest, referenceComputerReadiness.atomicPublication, referenceComputerReadiness.startedToReadyElapsed, referenceComputerReadiness.lossRecovery, waylandComputerReference, waylandComputerDigest, waylandComputerReadiness.atomicPublication, waylandComputerReadiness.startedToReadyElapsed, waylandComputerReadiness.lossRecovery, residueEvidence, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -1146,9 +1167,18 @@ type nativeComputerDiskEvidence struct {
 	cgroupPolicyReadback         bool
 	diskENOSPCLocal              bool
 	oomLocal                     bool
+	residue                      nativeResidueEvidence
 }
 
-func exerciseNativeLinuxComputerCapacity(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, reference, digest string) {
+type nativeResidueEvidence struct {
+	verifiedAbsent        bool
+	retainedClassesExact  bool
+	retainedClasses       string
+	sweptRuntimeCovered   bool
+	sweptIdentitiesUnique bool
+}
+
+func exerciseNativeLinuxComputerCapacity(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, reference, digest string) ocihelper.ResourceInventory {
 	t.Helper()
 	session, err := barrier.Session()
 	if err != nil {
@@ -1157,6 +1187,7 @@ func exerciseNativeLinuxComputerCapacity(t *testing.T, ctx context.Context, barr
 	requests := make([]ocihelper.RunRequest, 0, 3)
 	responses := make([]ocihelper.RunResponse, 0, 3)
 	inventories := make([]ocihelper.ResourceInventory, 0, 3)
+	retained := ocihelper.ResourceInventory{}
 	request := func(index int) ocihelper.RunRequest {
 		authority := nativeAuthority(fmt.Sprintf("capacity-%d", index))
 		authority.Class = contract.JobClassService
@@ -1192,6 +1223,14 @@ wait
 	}
 	for index := 1; index <= 3; index++ {
 		run := request(index)
+		diskName, identityErr := ocihelper.DeterministicComputerDiskName(*run.Workload.ManagedVolumes[0].ComputerStorage)
+		if identityErr != nil {
+			t.Fatal(identityErr)
+		}
+		retained = mergeNativeExpectedInventory(retained, ocihelper.ResourceInventory{
+			ComputerDiskImages: []string{diskName}, ComputerDiskAllocations: []string{diskName},
+			ComputerDiskQuotas: []string{diskName}, ComputerDiskManifests: []string{diskName},
+		})
 		response, runErr := session.Run(ctx, run)
 		if runErr != nil || !response.Started || !response.Admission.Admitted || len(response.Endpoints) != 2 {
 			t.Fatalf("capacity resident %d = response %+v err=%v", index, response, runErr)
@@ -1234,10 +1273,12 @@ wait
 			t.Fatalf("capacity resident cleanup = %+v err=%v", deleted, err)
 		}
 	}
+	return retained
 }
 
-func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, reference, digest string) nativeComputerDiskEvidence {
+func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, reference, digest string, expectedRetained ocihelper.ResourceInventory) nativeComputerDiskEvidence {
 	t.Helper()
+	evidence := nativeComputerDiskEvidence{}
 	session, err := barrier.Session()
 	if err != nil {
 		t.Fatal(err)
@@ -1245,6 +1286,14 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	storage := &ocihelper.ComputerStorageReference{
 		ComputerID: "native-computer", StorageID: "native-storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 32 << 20,
 	}
+	diskName, err := ocihelper.DeterministicComputerDiskName(*storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedRetained = mergeNativeExpectedInventory(expectedRetained, ocihelper.ResourceInventory{
+		ComputerDiskImages: []string{diskName}, ComputerDiskAllocations: []string{diskName},
+		ComputerDiskQuotas: []string{diskName}, ComputerDiskManifests: []string{diskName},
+	})
 	request := func(suffix string, argv []string) ocihelper.RunRequest {
 		authority := nativeAuthority("computer-disk-" + suffix)
 		authority.Class = contract.JobClassService
@@ -1267,6 +1316,9 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		!firstResponse.Admission.Admitted || firstResponse.Admission.RequestedMemoryBytes != 64<<20 || firstResponse.Admission.RequestedDiskBytes != storage.DiskBytes {
 		t.Fatalf("real Computer cgroup/admission readback = profile=%+v admission=%+v", firstResponse.Profile, firstResponse.Admission)
 	}
+	evidence.cgroupPolicyReadback = firstResponse.Profile.MemoryMaxBytes == 64<<20 && firstResponse.Profile.MemoryOOMGroup &&
+		firstResponse.Profile.MemorySwapMaxBytes == 0 && firstResponse.Admission.Admitted &&
+		firstResponse.Admission.RequestedMemoryBytes == 64<<20 && firstResponse.Admission.RequestedDiskBytes == storage.DiskBytes
 	if err := session.SetComputerControlState(ctx, ocihelper.SetComputerControlStateRequest{Authority: first.Authority, HumanDriving: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -1284,7 +1336,7 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	if !ok {
 		t.Fatalf("Computer helper-death sweep receipt = %+v present=%t", receipt, ok)
 	}
-	assertNativeComputerSweepReceipt(t, receipt)
+	evidence.residue = assertNativeComputerSweepReceipt(t, receipt, expectedRetained)
 	assertNativeComputerHostCleanup(t, first.Authority)
 	session, err = barrier.Session()
 	if err != nil {
@@ -1306,9 +1358,14 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	if result == nil || result.ExitCode == nil || *result.ExitCode != 42 || result.DiskExhausted {
 		t.Fatalf("real Computer persistent marker/tenant-local ENOSPC result = %+v", result)
 	}
+	evidence.shmModeFlagsSizeOneGiB = result.ExitCode != nil && *result.ExitCode == 42
+	evidence.shmCgroupCharged = evidence.shmModeFlagsSizeOneGiB
+	evidence.diskENOSPCLocal = evidence.shmModeFlagsSizeOneGiB && !result.DiskExhausted
+	replacementAttachConsumed := true
 	if _, err := session.Run(ctx, request("d", []string{"/bin/true"})); err == nil {
 		t.Fatal("sweep receipt authorized more than one replacement Computer attach")
 	}
+	extraAttachRefused := true
 	if deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: second.Authority}); err != nil || !deleted.Deleted {
 		t.Fatalf("real Computer attempt C reap = %+v err=%v", deleted, err)
 	}
@@ -1328,6 +1385,8 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		reset.Receipt.HelperGeneration != session.Handshake().SessionGeneration {
 		t.Fatalf("real Computer Storage reset = %+v err=%v", reset, err)
 	}
+	resetVerified := reset.Verified && reset.Receipt.Kind == "computer_storage_reset_verified" &&
+		reset.Receipt.HelperGeneration == session.Handshake().SessionGeneration
 	if _, err := session.Run(ctx, request("stale-after-reset", []string{"/bin/true"})); err == nil {
 		t.Fatal("real retired Computer Storage generation attached after reset")
 	}
@@ -1349,42 +1408,92 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	if freshResult == nil || !freshResult.OutOfMemory {
 		t.Fatalf("real reset generation/Computer-local OOM result = %+v", freshResult)
 	}
+	evidence.oomLocal = freshResult != nil && freshResult.OutOfMemory
 	if deleted, err := session.Delete(ctx, ocihelper.DeleteRequest{Authority: fresh.Authority}); err != nil || !deleted.Deleted {
 		t.Fatalf("real reset Computer cleanup = %+v err=%v", deleted, err)
 	}
-	// All receipt fields are assertion-derived: the guest's shm checks must
-	// reach the persistent marker, and every disk/reset assertion above must
-	// complete, before this evidence is emitted.
-	return nativeComputerDiskEvidence{exactlyOnePersistentAndReset: true, shmModeFlagsSizeOneGiB: true, shmCgroupCharged: true, cgroupPolicyReadback: true, diskENOSPCLocal: true, oomLocal: true}
+	evidence.exactlyOnePersistentAndReset = replacementAttachConsumed && extraAttachRefused && resetVerified
+	return evidence
 }
 
-func assertNativeComputerSweepReceipt(t *testing.T, receipt ocihelper.VerifiedSweepReceipt) {
+func assertNativeComputerSweepReceipt(t *testing.T, receipt ocihelper.VerifiedSweepReceipt, expectedRetained ocihelper.ResourceInventory) nativeResidueEvidence {
 	t.Helper()
 	retained := receipt.VerifiedRetained
 	retainedRuntimeEmpty := len(retained.Leases)+len(retained.Snapshots)+len(retained.Containers)+len(retained.Tasks)+
 		len(retained.Shims)+len(retained.Cgroups)+len(retained.LogSegments)+len(retained.ComputerDiskMounts)+
 		len(retained.ComputerDiskLoops)+len(retained.ComputerAttachments)+len(retained.ComputerResetManifests)+
 		len(retained.ComputerQuarantines)+len(retained.ComputerDiskAnomalies) == 0
-	wantRecords := make([]string, len(retained.ManagedVolumes))
-	for index, volume := range retained.ManagedVolumes {
-		wantRecords[index] = volume + ".owner"
+	serviceRecordsValid := true
+	for _, volume := range retained.ManagedVolumes {
+		if strings.HasPrefix(volume, "wefty-service-volume-") && !slices.Contains(retained.ManagedVolumeRecords, volume+".owner") {
+			serviceRecordsValid = false
+		}
 	}
-	slices.Sort(wantRecords)
-	computerDurableExact := len(retained.ComputerDiskImages) > 0 &&
-		slices.Equal(retained.ComputerDiskImages, retained.ComputerDiskAllocations) &&
-		slices.Equal(retained.ComputerDiskImages, retained.ComputerDiskQuotas) &&
-		slices.Equal(retained.ComputerDiskImages, retained.ComputerDiskManifests)
+	retainedExact := inventoryIdentitiesEqual(retained, expectedRetained)
 	sweptRuntimeCovered := len(receipt.SweptInventory.Leases) > 0 && len(receipt.SweptInventory.Snapshots) > 0 &&
 		len(receipt.SweptInventory.Containers) > 0 && len(receipt.SweptInventory.LogSegments) > 0 &&
 		len(receipt.SweptInventory.ComputerDiskMounts) > 0 && len(receipt.SweptInventory.ComputerDiskLoops) > 0 &&
 		len(receipt.SweptInventory.ComputerAttachments) > 0
+	uniqueSwept := !inventoryHasDuplicateIdentity(receipt.SweptInventory)
 	if !receipt.VerifiedAbsent || !ocihelper.InventoryEmpty(receipt.VerifiedResidue) ||
 		!inventoryIdentitiesEqual(receipt.VerifiedInventory, retained) || !retainedRuntimeEmpty ||
-		len(retained.ManagedVolumes) == 0 || !slices.Equal(wantRecords, retained.ManagedVolumeRecords) ||
-		!computerDurableExact || !sweptRuntimeCovered || inventoryHasDuplicateIdentity(receipt.SweptInventory) {
+		!serviceRecordsValid || !retainedExact || !sweptRuntimeCovered || !uniqueSwept {
 		t.Fatalf("Computer helper-death residue model = swept:%+v verified:%+v residue:%+v retained:%+v absent:%t",
 			receipt.SweptInventory, receipt.VerifiedInventory, receipt.VerifiedResidue, retained, receipt.VerifiedAbsent)
 	}
+	return nativeResidueEvidence{
+		verifiedAbsent:        receipt.VerifiedAbsent && ocihelper.InventoryEmpty(receipt.VerifiedResidue),
+		retainedClassesExact:  retainedExact,
+		retainedClasses:       strings.Join(nonEmptyInventoryClassNames(retained), ","),
+		sweptRuntimeCovered:   sweptRuntimeCovered,
+		sweptIdentitiesUnique: uniqueSwept,
+	}
+}
+
+func mergeNativeExpectedInventory(left, right ocihelper.ResourceInventory) ocihelper.ResourceInventory {
+	left.Leases = mergeNativeIdentityClass(left.Leases, right.Leases)
+	left.Snapshots = mergeNativeIdentityClass(left.Snapshots, right.Snapshots)
+	left.Containers = mergeNativeIdentityClass(left.Containers, right.Containers)
+	left.Tasks = mergeNativeIdentityClass(left.Tasks, right.Tasks)
+	left.Shims = mergeNativeIdentityClass(left.Shims, right.Shims)
+	left.Cgroups = mergeNativeIdentityClass(left.Cgroups, right.Cgroups)
+	left.LogSegments = mergeNativeIdentityClass(left.LogSegments, right.LogSegments)
+	left.ManagedVolumes = mergeNativeIdentityClass(left.ManagedVolumes, right.ManagedVolumes)
+	left.ManagedVolumeRecords = mergeNativeIdentityClass(left.ManagedVolumeRecords, right.ManagedVolumeRecords)
+	left.ComputerDiskImages = mergeNativeIdentityClass(left.ComputerDiskImages, right.ComputerDiskImages)
+	left.ComputerDiskAllocations = mergeNativeIdentityClass(left.ComputerDiskAllocations, right.ComputerDiskAllocations)
+	left.ComputerDiskQuotas = mergeNativeIdentityClass(left.ComputerDiskQuotas, right.ComputerDiskQuotas)
+	left.ComputerDiskManifests = mergeNativeIdentityClass(left.ComputerDiskManifests, right.ComputerDiskManifests)
+	left.ComputerDiskMounts = mergeNativeIdentityClass(left.ComputerDiskMounts, right.ComputerDiskMounts)
+	left.ComputerDiskLoops = mergeNativeIdentityClass(left.ComputerDiskLoops, right.ComputerDiskLoops)
+	left.ComputerAttachments = mergeNativeIdentityClass(left.ComputerAttachments, right.ComputerAttachments)
+	left.ComputerResetManifests = mergeNativeIdentityClass(left.ComputerResetManifests, right.ComputerResetManifests)
+	left.ComputerQuarantines = mergeNativeIdentityClass(left.ComputerQuarantines, right.ComputerQuarantines)
+	left.ComputerDiskAnomalies = mergeNativeIdentityClass(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
+	return left
+}
+
+func mergeNativeIdentityClass(left, right []string) []string {
+	merged := append(slices.Clone(left), right...)
+	slices.Sort(merged)
+	return slices.Compact(merged)
+}
+
+func nonEmptyInventoryClassNames(inventory ocihelper.ResourceInventory) []string {
+	var names []string
+	for _, class := range []struct {
+		name   string
+		values []string
+	}{
+		{"managed_volumes", inventory.ManagedVolumes}, {"managed_volume_records", inventory.ManagedVolumeRecords},
+		{"computer_disk_images", inventory.ComputerDiskImages}, {"computer_disk_allocations", inventory.ComputerDiskAllocations},
+		{"computer_disk_quotas", inventory.ComputerDiskQuotas}, {"computer_disk_manifests", inventory.ComputerDiskManifests},
+	} {
+		if len(class.values) > 0 {
+			names = append(names, class.name)
+		}
+	}
+	return names
 }
 
 func inventoryIdentitiesEqual(left, right ocihelper.ResourceInventory) bool {
@@ -1438,6 +1547,7 @@ type nativeServiceDataEvidence struct {
 	rootUser, numericUser, namedUser                        bool
 	restartPersistent, stopStartPersistent, rootfsDiscarded bool
 	sameDigestReplacementFresh                              bool
+	retained                                                ocihelper.ResourceInventory
 }
 
 func loadNativeImageArchive(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, reference, archivePath string) ocihelper.EnsureImageResponse {
@@ -1514,6 +1624,13 @@ func exerciseNativeLinuxServiceData(t *testing.T, ctx context.Context, barrier *
 	evidence := nativeServiceDataEvidence{}
 	for _, image := range images {
 		jobID := "service-data-" + image.name
+		volume, err := ocihelper.DeterministicServiceVolumeDirectory(jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evidence.retained = mergeNativeExpectedInventory(evidence.retained, ocihelper.ResourceInventory{
+			ManagedVolumes: []string{volume}, ManagedVolumeRecords: []string{volume + ".owner"},
+		})
 		for attempt := 1; attempt <= 3; attempt++ {
 			script := fmt.Sprintf(`
 set -eu
@@ -1550,6 +1667,13 @@ touch /tmp/wefty-rootfs-attempt-marker
 		if image.name == "root" {
 			replacement := nativeAdapterRequest(image.reference, image.digest, jobID+"-replacement-1", nil)
 			replacement.Authority.JobID = jobID + "-replacement"
+			replacementVolume, volumeErr := ocihelper.DeterministicServiceVolumeDirectory(replacement.Authority.JobID)
+			if volumeErr != nil {
+				t.Fatal(volumeErr)
+			}
+			evidence.retained = mergeNativeExpectedInventory(evidence.retained, ocihelper.ResourceInventory{
+				ManagedVolumes: []string{replacementVolume}, ManagedVolumeRecords: []string{replacementVolume + ".owner"},
+			})
 			replacement.Authority.WorkloadClass = contract.JobClassService
 			replacement.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 			replacement.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }

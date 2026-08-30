@@ -1,9 +1,12 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -147,14 +150,22 @@ func (tenure *controllerTenure) take(ctx context.Context, sessionID string) (net
 	}
 
 	dialContext, cancelDial := context.WithTimeout(operationContext, controllerControlDialLimit)
-	connection, websocketConnection, _, dialErr := dialComputerBackendWithLifetime(
+	connection, websocketConnection, banner, dialErr := dialComputerBackendWithLifetime(
 		dialContext, session.context, tenure.config.dial, workloadrunner.AttemptEndpointControl,
 	)
-	cancelDial()
 	if dialErr != nil {
+		cancelDial()
 		return nil, displacedSessionID, tenure.failTake(operation, session, serial, override, signalTrue, true,
 			fmt.Errorf("dial Computer control backend: %w", dialErr))
 	}
+	if err := negotiateReplacementComputerControl(dialContext, connection, banner); err != nil {
+		_ = websocketConnection.CloseNow()
+		_ = connection.Close()
+		cancelDial()
+		return nil, displacedSessionID, tenure.failTake(operation, session, serial, override, signalTrue, true,
+			fmt.Errorf("negotiate replacement Computer control backend: %w", err))
+	}
+	cancelDial()
 	managed := newControllerConn(connection, websocketConnection, tenure, sessionID)
 
 	if override {
@@ -179,6 +190,69 @@ func (tenure *controllerTenure) take(ctx context.Context, sessionID string) (net
 			&ComputerTenureError{Code: ComputerTenureSessionEnded})
 	}
 	return managed, displacedSessionID, nil
+}
+
+// negotiateReplacementComputerControl owns the fresh control backend's RFB
+// handshake before the relay leg swap. The already-negotiated client sees one
+// continuous RFB session and never receives a second banner or ServerInit.
+func negotiateReplacementComputerControl(ctx context.Context, connection net.Conn, banner []byte) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := connection.SetDeadline(deadline); err != nil {
+			return fmt.Errorf("bound replacement RFB handshake: %w", err)
+		}
+		defer connection.SetDeadline(time.Time{})
+	}
+	clientVersion := []byte("RFB 003.008\n")
+	version33 := string(banner) == "RFB 003.003\n"
+	if version33 {
+		clientVersion = banner
+	}
+	if _, err := connection.Write(clientVersion); err != nil {
+		return fmt.Errorf("write replacement RFB version: %w", err)
+	}
+	if version33 {
+		var securityType [4]byte
+		if _, err := io.ReadFull(connection, securityType[:]); err != nil {
+			return fmt.Errorf("read replacement RFB 3.3 security type: %w", err)
+		}
+		if binary.BigEndian.Uint32(securityType[:]) != 1 {
+			return errors.New("replacement RFB 3.3 backend does not select None security")
+		}
+	} else {
+		var count [1]byte
+		if _, err := io.ReadFull(connection, count[:]); err != nil || count[0] == 0 {
+			return fmt.Errorf("read replacement RFB security count: %w", err)
+		}
+		securityTypes := make([]byte, int(count[0]))
+		if _, err := io.ReadFull(connection, securityTypes); err != nil {
+			return fmt.Errorf("read replacement RFB security types: %w", err)
+		}
+		if !bytes.Contains(securityTypes, []byte{1}) {
+			return errors.New("replacement RFB backend does not offer None security")
+		}
+		if _, err := connection.Write([]byte{1}); err != nil {
+			return fmt.Errorf("select replacement RFB security: %w", err)
+		}
+		var securityResult [4]byte
+		if _, err := io.ReadFull(connection, securityResult[:]); err != nil {
+			return fmt.Errorf("read replacement RFB security result: %w", err)
+		}
+		if securityResult != [4]byte{} {
+			return fmt.Errorf("replacement RFB security failed: %x", securityResult)
+		}
+	}
+	if _, err := connection.Write([]byte{1}); err != nil {
+		return fmt.Errorf("write replacement RFB ClientInit: %w", err)
+	}
+	var serverInit [24]byte
+	if _, err := io.ReadFull(connection, serverInit[:]); err != nil {
+		return fmt.Errorf("read replacement RFB ServerInit: %w", err)
+	}
+	nameBytes := int64(binary.BigEndian.Uint32(serverInit[20:24]))
+	if _, err := io.CopyN(io.Discard, connection, nameBytes); err != nil {
+		return fmt.Errorf("read replacement RFB desktop name: %w", err)
+	}
+	return nil
 }
 
 func (tenure *controllerTenure) beginTake(

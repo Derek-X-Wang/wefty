@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -110,6 +111,9 @@ func TestServiceAcceptanceComputerTakeoverCLIRealFrontDoor(t *testing.T) {
 		if err := connection.Write(request.Context(), websocket.MessageBinary, []byte("RFB 003.008\n")); err != nil {
 			return
 		}
+		if !completeServiceAcceptanceRFBServerHandshake(request.Context(), connection) {
+			return
+		}
 		for {
 			messageType, payload, err := connection.Read(request.Context())
 			if err != nil {
@@ -183,6 +187,31 @@ func TestServiceAcceptanceComputerTakeoverCLIRealFrontDoor(t *testing.T) {
 	if len(signals) < 2 || !signals[0] || signals[len(signals)-1] {
 		t.Fatalf("driver signal history = %v", signals)
 	}
+}
+
+func completeServiceAcceptanceRFBServerHandshake(ctx context.Context, connection *websocket.Conn) bool {
+	kind, version, err := connection.Read(ctx)
+	if err != nil || kind != websocket.MessageBinary || string(version) != "RFB 003.008\n" {
+		return false
+	}
+	if err := connection.Write(ctx, websocket.MessageBinary, []byte{1, 1}); err != nil {
+		return false
+	}
+	kind, security, err := connection.Read(ctx)
+	if err != nil || kind != websocket.MessageBinary || !bytes.Equal(security, []byte{1}) {
+		return false
+	}
+	if err := connection.Write(ctx, websocket.MessageBinary, []byte{0, 0, 0, 0}); err != nil {
+		return false
+	}
+	kind, shared, err := connection.Read(ctx)
+	if err != nil || kind != websocket.MessageBinary || !bytes.Equal(shared, []byte{1}) {
+		return false
+	}
+	serverInit := make([]byte, 24)
+	binary.BigEndian.PutUint16(serverInit[0:2], 640)
+	binary.BigEndian.PutUint16(serverInit[2:4], 480)
+	return connection.Write(ctx, websocket.MessageBinary, serverInit) == nil
 }
 
 type acceptanceCLIFabric struct {

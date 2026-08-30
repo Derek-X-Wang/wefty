@@ -1398,13 +1398,13 @@ func proveLiveViewInputIsolation(t *testing.T, harness *acceptanceHarness, compu
 		t.Fatal("Computer omitted its live display endpoint")
 	}
 	before := readLiveInputObservation(t, computer.CurrentJobID)
-	viewPointer, controlPointer := freshPointerSentinels(before.PointerHistory)
-	if viewPointer == ([2]int{}) || controlPointer == ([2]int{}) {
+	freeViewPointer, heldViewPointer, controlPointer := freshPointerSentinels(before.PointerHistory)
+	if freeViewPointer == ([2]int{}) || heldViewPointer == ([2]int{}) || controlPointer == ([2]int{}) {
 		t.Fatal("Computer input history exhausted the isolation sentinels")
 	}
 	view := openLiveRFBSession(t, *computer.DisplayEndpoint, viewerUser, viewerDevice)
 	defer view.close()
-	view.sendPointer(t, viewPointer[0], viewPointer[1])
+	view.sendPointer(t, freeViewPointer[0], freeViewPointer[1])
 	control := openLiveRFBSession(t, *computer.DisplayEndpoint, "linux-admin", "linux-input-sentinel-device")
 	defer control.close()
 	controlCapability := control.capabilityFile(t)
@@ -1413,10 +1413,9 @@ func proveLiveViewInputIsolation(t *testing.T, harness *acceptanceHarness, compu
 	if take.TenureState != contract.ComputerControlTenureHeld {
 		t.Fatalf("control sentinel take = %#v", take)
 	}
-	// Takeover replaces the already-negotiated view backend with a fresh control
-	// backend after the agent has consumed its banner. Complete the remaining
-	// handshake before input; otherwise pointer bytes become its client version.
-	control.negotiate(t, false)
+	// The Held-tenure sentinel is the decisive isolation arm: the view-only
+	// session must remain unable to drive while another session owns the wheel.
+	view.sendPointer(t, heldViewPointer[0], heldViewPointer[1])
 	control.sendPointer(t, controlPointer[0], controlPointer[1])
 	var after liveInputObservation
 	deadline := time.Now().Add(10 * time.Second)
@@ -1430,7 +1429,8 @@ func proveLiveViewInputIsolation(t *testing.T, harness *acceptanceHarness, compu
 	_ = runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-admin", "linux-input-sentinel-device",
 		"services", "takeover", "release", computer.ComputerID, "--session-token-file", controlCapability)
 	return after.Generation > before.Generation && observationHasPointer(after, controlPointer[0], controlPointer[1]) &&
-		!observationHasPointer(after, viewPointer[0], viewPointer[1]) && after.KeyEvents == before.KeyEvents
+		!observationHasPointer(after, freeViewPointer[0], freeViewPointer[1]) &&
+		!observationHasPointer(after, heldViewPointer[0], heldViewPointer[1]) && after.KeyEvents == before.KeyEvents
 }
 
 func takeoverAuditEvidence(audit l1.ComputerTakeoverAuditList) (map[l1.ComputerTakeoverAuditEventKind]bool, int64) {

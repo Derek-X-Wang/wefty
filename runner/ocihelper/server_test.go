@@ -1332,8 +1332,9 @@ func TestAttemptPortSetupCancellationDoesNotDelayListenerRepublication(t *testin
 		probeDone <- err
 	}()
 	<-engine.firstEntered
-	if err := <-probeDone; err == nil || !errors.Is(probeContext.Err(), context.DeadlineExceeded) {
-		t.Fatalf("withdrawn-listener probe error = %v context=%v, want caller deadline", err, probeContext.Err())
+	probeErr := <-probeDone
+	if probeErr == nil || !errors.Is(probeContext.Err(), context.DeadlineExceeded) {
+		t.Fatalf("withdrawn-listener probe error = %v context=%v, want caller deadline", probeErr, probeContext.Err())
 	}
 	select {
 	case <-engine.firstCanceled:
@@ -1343,11 +1344,29 @@ func TestAttemptPortSetupCancellationDoesNotDelayListenerRepublication(t *testin
 
 	stream, err := session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Name: "service"})
 	if err != nil {
-		t.Fatalf("replacement listener was not reachable on the next probe: %v", err)
+		t.Fatalf("replacement listener was not reachable on the next probe: %v (withdrawn probe: %v)", err, probeErr)
 	}
 	assertStreamPayload(t, stream, "attempt-port")
 	if session.HealthError() != nil {
 		t.Fatalf("listener restart invalidated the admitting helper session: %v", session.HealthError())
+	}
+}
+
+func TestAttemptPortAcknowledgementWaitIsContextBoundAndIdempotent(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	stream := &attemptPortOperationStream{
+		operationStream: &operationStream{},
+		acknowledged:    make(chan error),
+		ctx:             ctx,
+		writeSetup:      func() error { return nil },
+	}
+	payload := []byte{attemptPortBackendReady}
+	for attempt := 1; attempt <= 2; attempt++ {
+		started := time.Now()
+		if _, err := stream.Write(payload); !errors.Is(err, context.Canceled) || time.Since(started) > time.Second {
+			t.Fatalf("acknowledgement attempt %d = %v elapsed=%s", attempt, err, time.Since(started))
+		}
 	}
 }
 
@@ -1383,6 +1402,15 @@ func TestMergeResourceInventoryDeduplicatesEveryIdentityClass(t *testing.T) {
 		if !slices.Equal(class, want) {
 			t.Fatalf("merged inventory class %d = %v, want %v", index, class, want)
 		}
+	}
+}
+
+func TestMergeSweepAttemptsUsesIdentitySetSemantics(t *testing.T) {
+	first := SweptAttemptAuthority{NodeID: "node", JobID: "job-a", RemovalGeneration: "1", AttemptID: "attempt-a", FencingToken: "fence-a", PriorBootSessionID: "boot-a", Class: contract.JobClassService}
+	second := SweptAttemptAuthority{NodeID: "node", JobID: "job-b", RemovalGeneration: "2", AttemptID: "attempt-b", FencingToken: "fence-b", PriorBootSessionID: "boot-b", Class: contract.JobClassOneShot}
+	merged := mergeSweepAttempts([]SweptAttemptAuthority{second, first}, []SweptAttemptAuthority{first, second})
+	if len(merged) != 2 || merged[0] != first || merged[1] != second {
+		t.Fatalf("merged swept attempts = %#v", merged)
 	}
 }
 
@@ -2132,6 +2160,58 @@ func TestOperationTransportFailureSynchronouslyInvalidatesSession(t *testing.T) 
 		t.Fatal("transport failure returned before session authority was withdrawn")
 	}
 }
+
+func TestOperationDeadlineClassifiesOnlyTimeoutAsCallerDeadline(t *testing.T) {
+	newSession := func() (*Session, net.Conn) {
+		control, peer := net.Pipe()
+		return &Session{control: control}, peer
+	}
+	deadline := time.Now().Add(-time.Millisecond)
+
+	t.Run("non-timeout transport loss", func(t *testing.T) {
+		session, peer := newSession()
+		defer peer.Close()
+		ctx, cancel := context.WithDeadline(t.Context(), deadline)
+		defer cancel()
+		err := session.markOperationFailure(ctx, io.EOF)
+		var loss *RuntimeLossError
+		if !errors.As(err, &loss) || session.HealthError() == nil {
+			t.Fatalf("deadline-adjacent EOF = %T %v health=%v, want runtime loss", err, err, session.HealthError())
+		}
+	})
+
+	t.Run("timeout belongs to caller deadline", func(t *testing.T) {
+		session, peer := newSession()
+		defer session.control.Close()
+		defer peer.Close()
+		ctx, cancel := context.WithDeadline(t.Context(), deadline)
+		defer cancel()
+		err := session.markOperationFailure(ctx, os.ErrDeadlineExceeded)
+		if !errors.Is(err, os.ErrDeadlineExceeded) || session.HealthError() != nil {
+			t.Fatalf("deadline timeout = %T %v health=%v, want caller deadline", err, err, session.HealthError())
+		}
+	})
+
+	t.Run("missing context fact is bounded and typed", func(t *testing.T) {
+		session, peer := newSession()
+		defer peer.Close()
+		ctx := deadlineOnlyContext{Context: t.Context(), deadline: deadline}
+		started := time.Now()
+		err := session.markOperationFailure(ctx, os.ErrDeadlineExceeded)
+		var pending *OperationDeadlineContextPendingError
+		var loss *RuntimeLossError
+		if !errors.As(err, &loss) || !errors.As(err, &pending) || time.Since(started) > time.Second {
+			t.Fatalf("unmatched deadline = %T %v elapsed=%s, want bounded typed runtime loss", err, err, time.Since(started))
+		}
+	})
+}
+
+type deadlineOnlyContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (ctx deadlineOnlyContext) Deadline() (time.Time, bool) { return ctx.deadline, true }
 
 func TestSessionReapJoinsEveryOperationBeforeExclusiveReap(t *testing.T) {
 	engine := newFakeEngine()

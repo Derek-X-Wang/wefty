@@ -398,6 +398,10 @@ nonadministrator receives typed `controller_busy`. An administrator still
 begins as a viewer and overrides only through an explicit take: the old input
 leg is closed and observed before the replacement backend is dialed. The server
 never consults client headers for role, mode, backend, or control authority.
+The agent owns replacement-leg handshake state: it completes RFB version,
+security, and ClientInit negotiation with the fresh control backend before the
+leg swap becomes visible. The client remains in its existing negotiated RFB
+session and never receives or answers a second banner during take or release.
 Text frames, machine principals, stale
 policy, identity revalidation failure, downgrade/revocation, attempt authority
 loss, and the one-hour cap all close both relay legs. The authorization lease

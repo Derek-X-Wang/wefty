@@ -195,12 +195,13 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	var serviceFreshAttemptReadmission bool
 	var serviceRecoveryElapsed, staleEvidenceElapsed time.Duration
 	var staleEvidenceLate bool
+	var staleEvidenceArm string
 	var removalManifestComplete, removalPending, removalEveryAttempt bool
 	var removalServiceDataVolume, removalServiceDataOwnerRecord bool
 	var removalCompleted, removalPriorBootSweep, removalPostDeleteAttestation, removalDeleteAttestInjection bool
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_elapsed=%s\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceFreshAttemptReadmission, serviceRecoveryElapsed, staleEvidenceLate, staleEvidenceElapsed, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
+			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_arm=%s\nservice_stale_evidence_elapsed=%s\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceFreshAttemptReadmission, serviceRecoveryElapsed, staleEvidenceLate, staleEvidenceArm, staleEvidenceElapsed, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-l1-agent-linux.txt"), []byte(payload), 0o600); err != nil {
 				t.Errorf("write OCI L1/agent evidence: %v", err)
 			}
@@ -365,8 +366,8 @@ while :; do sleep 1; done
 	serviceRecoveryElapsed = time.Since(recoveryStarted)
 	newGeneration, ready := barrier.Generation()
 	newAuthority := authorities.wait(t, readmitted.CurrentAttemptID, 5*time.Second)
-	stale, staleEvidenceElapsed, staleEvidenceLate := waitNativeRuntimeLossEvidence(
-		t, store, primary.JobID, firstAttempt, l1.DefaultLeaseDuration,
+	stale, staleEvidenceElapsed, staleEvidenceLate, staleEvidenceArm := waitNativeRuntimeLossEvidence(
+		t, store, primary.JobID, firstAttempt, recoveryStarted, l1.DefaultLeaseDuration,
 	)
 	serviceFreshAttemptReadmission = ready && newGeneration != oldGeneration &&
 		readmitted.CurrentAttemptID != firstAttempt && newAuthority.FencingToken != firstAuthority.FencingToken &&
@@ -374,6 +375,9 @@ while :; do sleep 1; done
 	if !serviceFreshAttemptReadmission {
 		t.Fatalf("runtime-loss service re-admission = old_generation:%+v new_generation:%+v ready:%t old_authority:%+v new_authority:%+v stale:%+v stale_evidence_late:%t stale_evidence_elapsed:%s current:%+v health_elapsed:%s",
 			oldGeneration, newGeneration, ready, firstAuthority, newAuthority, stale, staleEvidenceLate, staleEvidenceElapsed, readmitted, serviceRecoveryElapsed)
+	}
+	if staleEvidenceArm != "result" && staleEvidenceArm != "late_result" {
+		t.Fatalf("runtime-loss evidence receipt arm = %q", staleEvidenceArm)
 	}
 	firstRunning = readmitted
 	firstAttempt = readmitted.CurrentAttemptID
@@ -837,10 +841,9 @@ func waitNativeServiceAttempt(t *testing.T, store *l1.Store, jobID, priorAttempt
 	return l1.Job{}
 }
 
-func waitNativeRuntimeLossEvidence(t *testing.T, store *l1.Store, jobID, attemptID string, timeout time.Duration) (l1.Attempt, time.Duration, bool) {
+func waitNativeRuntimeLossEvidence(t *testing.T, store *l1.Store, jobID, attemptID string, anchor time.Time, timeout time.Duration) (l1.Attempt, time.Duration, bool, string) {
 	t.Helper()
-	started := time.Now()
-	deadline := started.Add(timeout)
+	deadline := anchor.Add(timeout)
 	var last *l1.Attempt
 	for time.Now().Before(deadline) {
 		attempts, err := store.ListJobAttempts(t.Context(), jobID)
@@ -855,18 +858,18 @@ func waitNativeRuntimeLossEvidence(t *testing.T, store *l1.Store, jobID, attempt
 			last = &attempt
 			if attempt.State == contract.AttemptFailed && attempt.Result != nil && attempt.Result.RuntimeFailure != nil &&
 				attempt.Result.RuntimeFailure.Code == contract.RuntimeFailureUnavailable {
-				return attempt, time.Since(started), false
+				return attempt, time.Since(anchor), false, "result"
 			}
 			if attempt.State == contract.AttemptLost && attempt.LateResult != nil && attempt.LateResult.Kind == l1.LateResultObservation &&
 				attempt.LateResult.Late && attempt.LateResult.Result != nil && attempt.LateResult.Result.RuntimeFailure != nil &&
 				attempt.LateResult.Result.RuntimeFailure.Code == contract.RuntimeFailureUnavailable {
-				return attempt, time.Since(started), true
+				return attempt, time.Since(anchor), true, "late_result"
 			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("attempt %s did not retain typed runtime-loss evidence within production lease %s: %+v", attemptID, timeout, last)
-	return l1.Attempt{}, time.Since(started), false
+	return l1.Attempt{}, time.Since(anchor), false, ""
 }
 
 type nativeOCIService struct {

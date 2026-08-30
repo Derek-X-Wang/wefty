@@ -1518,7 +1518,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				response.Removed += carriedSweep.Removed
 				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, carriedSweep.PriorBootSessionsSeen...)
 				response.Inventory = mergeResourceInventory(response.Inventory, carriedSweep.Inventory)
-				response.Attempts = append(response.Attempts, carriedSweep.Attempts...)
+				response.Attempts = mergeSweepAttempts(response.Attempts, carriedSweep.Attempts)
 			}
 			server.sessionMu.Lock()
 			startup := server.startupSweep
@@ -1536,13 +1536,13 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				response.Removed += startup.Removed
 				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, startup.PriorBootSessionsSeen...)
 				response.Inventory = mergeResourceInventory(response.Inventory, startup.Inventory)
-				response.Attempts = append(response.Attempts, startup.Attempts...)
+				response.Attempts = mergeSweepAttempts(response.Attempts, startup.Attempts)
 			}
 			if sessionReap != nil {
 				response.Removed += sessionReap.Removed
 				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, sessionReap.PriorBootSessionsSeen...)
 				response.Inventory = mergeResourceInventory(response.Inventory, sessionReap.Inventory)
-				response.Attempts = append(response.Attempts, sessionReap.Attempts...)
+				response.Attempts = mergeSweepAttempts(response.Attempts, sessionReap.Attempts)
 			}
 			slices.SortFunc(response.PriorBootSessionsSeen, compareSessionIdentity)
 			response.PriorBootSessionsSeen = slices.Compact(response.PriorBootSessionsSeen)
@@ -1574,6 +1574,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			operationStream: &operationStream{Conn: operation.conn, cancel: operation.cancel},
 			wire:            wire,
 			acknowledged:    operation.monitorAcknowledgement(),
+			ctx:             operation.ctx,
+			writeSetup:      func() error { return writeSuccess(wire, struct{}{}) },
 		}
 		err := server.engine.DialAttemptPort(operation.ctx, body, stream)
 		if err != nil && !stream.ready {
@@ -1606,6 +1608,10 @@ type attemptPortOperationStream struct {
 	*operationStream
 	wire         *framedConn
 	acknowledged <-chan error
+	ctx          context.Context
+	setupOnce    sync.Once
+	setupErr     error
+	writeSetup   func() error
 	ready        bool
 }
 
@@ -1614,11 +1620,22 @@ func (stream *attemptPortOperationStream) Write(payload []byte) (int, error) {
 		if len(payload) == 0 || payload[0] != attemptPortBackendReady {
 			return 0, errors.New("attempt-port stream omitted the backend-ready marker")
 		}
-		if err := writeSuccess(stream.wire, struct{}{}); err != nil {
-			return 0, err
-		}
-		if err := <-stream.acknowledged; err != nil {
-			return 0, fmt.Errorf("attempt-port client did not acknowledge stream setup: %w", err)
+		stream.setupOnce.Do(func() {
+			if err := stream.writeSetup(); err != nil {
+				stream.setupErr = err
+				return
+			}
+			select {
+			case err := <-stream.acknowledged:
+				if err != nil {
+					stream.setupErr = fmt.Errorf("attempt-port client did not acknowledge stream setup: %w", err)
+				}
+			case <-stream.ctx.Done():
+				stream.setupErr = fmt.Errorf("attempt-port client acknowledgement: %w", context.Cause(stream.ctx))
+			}
+		})
+		if stream.setupErr != nil {
+			return 0, stream.setupErr
 		}
 		stream.ready = true
 	}
@@ -1675,8 +1692,25 @@ func mergeSweepResponsePointer(target *SweepResponse, addition SweepResponse) *S
 	target.Removed += addition.Removed
 	target.PriorBootSessionsSeen = append(target.PriorBootSessionsSeen, addition.PriorBootSessionsSeen...)
 	target.Inventory = mergeResourceInventory(target.Inventory, addition.Inventory)
-	target.Attempts = append(target.Attempts, addition.Attempts...)
+	target.Attempts = mergeSweepAttempts(target.Attempts, addition.Attempts)
 	return target
+}
+
+func mergeSweepAttempts(left, right []SweptAttemptAuthority) []SweptAttemptAuthority {
+	merged := append(slices.Clone(left), right...)
+	slices.SortFunc(merged, func(left, right SweptAttemptAuthority) int {
+		for _, values := range [][2]string{
+			{left.NodeID, right.NodeID}, {left.JobID, right.JobID}, {left.RemovalGeneration, right.RemovalGeneration},
+			{left.AttemptID, right.AttemptID}, {left.FencingToken, right.FencingToken},
+			{left.PriorBootSessionID, right.PriorBootSessionID}, {left.Class, right.Class},
+		} {
+			if comparison := strings.Compare(values[0], values[1]); comparison != 0 {
+				return comparison
+			}
+		}
+		return 0
+	})
+	return slices.Compact(merged)
 }
 
 func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {

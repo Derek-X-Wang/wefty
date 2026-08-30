@@ -15,6 +15,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/coder/websocket"
@@ -244,7 +245,7 @@ func TestControllerTenureAcceptsSemanticReceiptFromRealL1Store(t *testing.T) {
 		t.Fatalf("claim = %#v err=%v", claim, err)
 	}
 
-	backend := newComputerBackend(t, computerBackendOptions{})
+	backend := newComputerBackend(t, computerBackendOptions{rfbHandshake: true})
 	defer backend.Close()
 	localClock := newManualClock(time.Date(2026, 8, 28, 5, 0, 0, 123, time.FixedZone("receipt-local", -7*60*60)))
 	tenure, err := newControllerTenure(controllerTenureConfig{
@@ -482,7 +483,7 @@ func TestControllerTenureRestartDoesNotRestoreHeldState(t *testing.T) {
 func TestComputerFrontDoorSidebandTakeAndReleaseReplaceRelayLeg(t *testing.T) {
 	fixture, _, auditor, _, originalServer, _ := computerFrontDoorFixture(t, l1.ComputerGrantControl)
 	originalServer.Close()
-	viewBackend := newComputerBackend(t, computerBackendOptions{echoPrefix: "view:"})
+	viewBackend := newComputerBackend(t, computerBackendOptions{echoPrefix: "view:", rfbHandshake: true})
 	defer viewBackend.Close()
 	controlBackend := newComputerBackend(t, computerBackendOptions{echoPrefix: "control:", rfbHandshake: true})
 	defer controlBackend.Close()
@@ -533,11 +534,11 @@ func TestComputerFrontDoorSidebandTakeAndReleaseReplaceRelayLeg(t *testing.T) {
 	if _, banner, err := client.Read(t.Context()); err != nil || string(banner) != "RFB 003.008\n" {
 		t.Fatalf("banner = %q err=%v", banner, err)
 	}
+	completeInitialRFBHandshake(t, client)
 	assertRelayRoundTrip(t, client, "before", "view:before")
 	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusOK {
 		t.Fatalf("take status = %d", status)
 	}
-	completeControlRFBHandshake(t, client)
 	assertRelayRoundTrip(t, client, "driving", "control:driving")
 	if status := postComputerControl(t, server.URL, computerControlReleasePath, token); status != http.StatusOK {
 		t.Fatalf("release status = %d", status)
@@ -561,25 +562,86 @@ func TestComputerFrontDoorSidebandTakeAndReleaseReplaceRelayLeg(t *testing.T) {
 	}
 }
 
-func completeControlRFBHandshake(t *testing.T, connection *websocket.Conn) {
+func TestFirstPartyTakeoverClientKeepsOneNegotiatedSessionAcrossTakeAndRelease(t *testing.T) {
+	fixture, _, auditor, _, originalServer, _ := computerFrontDoorFixture(t, l1.ComputerGrantControl)
+	originalServer.Close()
+	viewBackend := newComputerBackend(t, computerBackendOptions{})
+	defer viewBackend.Close()
+	controlBackend := newComputerBackend(t, computerBackendOptions{rfbHandshake: true})
+	defer controlBackend.Close()
+	config := fixture.frontDoor.config
+	config.dial = func(ctx context.Context, name string) (net.Conn, error) {
+		if name == workloadrunner.AttemptEndpointControl {
+			return controlBackend.dial(ctx)
+		}
+		return viewBackend.dial(ctx)
+	}
+	tenure, err := newControllerTenure(controllerTenureConfig{
+		authorityContext: config.authorityContext, clock: config.clock, dial: config.dial,
+		setControlState: func(context.Context, bool) error { return nil },
+		record: func(ctx context.Context, event l1.ComputerTakeoverAuditEvent) (l1.ComputerTakeoverAuditReceipt, error) {
+			return auditor.AppendComputerTakeoverAudit(ctx, config.computerID, config.jobID, config.attemptID,
+				l1.ComputerTakeoverAuditRequest{FencingToken: config.fencingToken, Event: event})
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.controlTenure = tenure
+	frontDoor, err := newComputerFrontDoor(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontDoor.SetReady(true)
+	server := httptest.NewServer(frontDoor)
+	defer server.Close()
+	participant := directTakeoverFabric{}
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
+	session, err := takeover.Open(t.Context(), participant, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- session.Wait(t.Context()) }()
+	if receipt, err := takeover.Perform(t.Context(), participant, endpoint, session.Token, "take"); err != nil || receipt.TenureState != contract.ComputerControlTenureHeld {
+		t.Fatalf("first-party take = %+v err=%v", receipt, err)
+	}
+	assertTakeoverSessionStillOpen(t, waitDone, "take")
+	if receipt, err := takeover.Perform(t.Context(), participant, endpoint, session.Token, "release"); err != nil || receipt.TenureState != contract.ComputerControlTenureFree {
+		t.Fatalf("first-party release = %+v err=%v", receipt, err)
+	}
+	assertTakeoverSessionStillOpen(t, waitDone, "release")
+}
+
+func assertTakeoverSessionStillOpen(t *testing.T, waitDone <-chan error, action string) {
+	t.Helper()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("first-party session ended during %s: %v", action, err)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func completeInitialRFBHandshake(t *testing.T, connection *websocket.Conn) {
 	t.Helper()
 	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("RFB 003.008\n")); err != nil {
 		t.Fatal(err)
 	}
 	if kind, securityTypes, err := connection.Read(t.Context()); err != nil || kind != websocket.MessageBinary || !bytes.Equal(securityTypes, []byte{1, 1}) {
-		t.Fatalf("control RFB security types = %x kind=%v err=%v", securityTypes, kind, err)
+		t.Fatalf("initial RFB security types = %x kind=%v err=%v", securityTypes, kind, err)
 	}
 	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte{1}); err != nil {
 		t.Fatal(err)
 	}
 	if kind, result, err := connection.Read(t.Context()); err != nil || kind != websocket.MessageBinary || !bytes.Equal(result, []byte{0, 0, 0, 0}) {
-		t.Fatalf("control RFB security result = %x kind=%v err=%v", result, kind, err)
+		t.Fatalf("initial RFB security result = %x kind=%v err=%v", result, kind, err)
 	}
 	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte{1}); err != nil {
 		t.Fatal(err)
 	}
 	if kind, serverInit, err := connection.Read(t.Context()); err != nil || kind != websocket.MessageBinary || len(serverInit) != 24 {
-		t.Fatalf("control RFB server init = %x kind=%v err=%v", serverInit, kind, err)
+		t.Fatalf("initial RFB server init = %x kind=%v err=%v", serverInit, kind, err)
 	}
 }
 
@@ -597,7 +659,7 @@ func assertRelayRoundTrip(t *testing.T, connection *websocket.Conn, input, want 
 func TestComputerFrontDoorRevocationWhileDrivingClosesControlBeforeSession(t *testing.T) {
 	fixture, cache, auditor, _, originalServer, identity := computerFrontDoorFixture(t, l1.ComputerGrantControl)
 	originalServer.Close()
-	controlBackend := newComputerBackend(t, computerBackendOptions{})
+	controlBackend := newComputerBackend(t, computerBackendOptions{rfbHandshake: true})
 	defer controlBackend.Close()
 	config := fixture.frontDoor.config
 	originalDial := config.dial
@@ -677,7 +739,7 @@ func TestComputerFrontDoorRevocationWhileDrivingClosesControlBeforeSession(t *te
 func TestComputerFrontDoorRegistersControlTokenBeforePublishingBanner(t *testing.T) {
 	fixture, _, auditor, _, originalServer, _ := computerFrontDoorFixture(t, l1.ComputerGrantControl)
 	originalServer.Close()
-	controlBackend := newComputerBackend(t, computerBackendOptions{})
+	controlBackend := newComputerBackend(t, computerBackendOptions{rfbHandshake: true})
 	defer controlBackend.Close()
 	config := fixture.frontDoor.config
 	originalDial := config.dial
@@ -767,7 +829,7 @@ type controllerTenureFixture struct {
 
 func newControllerTenureFixture(t *testing.T) *controllerTenureFixture {
 	t.Helper()
-	fixture := &controllerTenureFixture{testing: t, backend: newComputerBackend(t, computerBackendOptions{}),
+	fixture := &controllerTenureFixture{testing: t, backend: newComputerBackend(t, computerBackendOptions{rfbHandshake: true}),
 		clock: newManualClock(time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)), reaped: make(chan error, 1), reported: make(chan error, 4)}
 	t.Cleanup(fixture.backend.Close)
 	tenure, err := newControllerTenure(controllerTenureConfig{
