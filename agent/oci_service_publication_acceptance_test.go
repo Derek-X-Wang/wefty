@@ -25,6 +25,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/lima"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -103,7 +104,7 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	republicationObserved = primary.waitReachable(t, true, 5*time.Second)
 
 	timedOut := startNativeOCIService(t, ctx, adapter, reference, digest, "startup-timeout", "", []string{
-		"/bin/sh", "-c", `trap 'exit 143' TERM; while :; do sleep 1; done`,
+		"/bin/sh", "-c", `trap 'exit 143' TERM; while :; do sleep 0.1; done`,
 	}, false)
 	outcome := waitServiceOutcome(t, timedOut.done)
 	startupTimedOut = outcome.err != nil && outcome.result.SpawnError != nil && outcome.result.SpawnError.Code == contract.SpawnFailureStartupReadinessTimeout
@@ -227,12 +228,24 @@ while :; do sleep 1; done
 	if err != nil {
 		t.Fatal(err)
 	}
+	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	intentSource := lima.FileIntentSource{Path: intentPath}
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "native-service-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "native-service-node", BootSessionID: "native-service-boot", Version: "realtiming",
 		Capabilities: map[string]bool{"kind:process": true},
 		CapabilityProbe: capabilityProbeFunc(func(ctx context.Context) (CapabilityProbeResult, error) {
+			intent, err := intentSource.ReadIntent(ctx)
+			if err != nil || !intent.Enabled {
+				if err == nil {
+					err = errors.New("OCI intent is disabled")
+				}
+				return CapabilityProbeResult{MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonOCIIntentDisabled}, err
+			}
 			if err := adapter.Probe(ctx, "native-service-node", "native-service-boot", reference, digest, l1.DefaultLeaseDuration); err != nil {
 				return CapabilityProbeResult{MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonProbeFailed}, err
 			}
@@ -263,18 +276,26 @@ while :; do sleep 1; done
 		t.Fatalf("initial OCI binding pin=%+v err=%v", pinsBeforeStop, err)
 	}
 	stopContext, cancelStop := context.WithTimeout(t.Context(), 15*time.Second)
+	if _, err := lima.SetOCIIntent(stopContext, intentPath, 1, false, time.Now()); err != nil {
+		cancelStop()
+		t.Fatal(err)
+	}
 	if err := nodeAgent.StopOCIRuntime(stopContext); err != nil {
 		cancelStop()
 		t.Fatal(err)
 	}
 	cancelStop()
-	// The real two-second lease proves that local intent stop is neither an
-	// execution failure nor a hidden service restart. Observe L1's one-second
-	// background reconciler win, then prove a second serialized pass is
-	// idempotent instead of assuming this caller owns the transition count.
+	// The real two-second lease proves that local OCI intent stop is neither an
+	// execution failure nor a hidden service restart. L1's one-second
+	// background reconciler must record the attempt as lost before this
+	// second, idempotent pass reports no duplicate transition.
 	intentStopped := waitNativeServiceState(t, store, primary.JobID, contract.JobQueued, 5*time.Second)
 	if result, err := store.Reconcile(t.Context()); err != nil || result.ExpiredAttempts != 0 {
 		t.Fatalf("post-intent-stop idempotent reconciliation=%+v err=%v", result, err)
+	}
+	attempts, err := store.ListJobAttempts(t.Context(), primary.JobID)
+	if err != nil || len(attempts) != 1 || attempts[0].AttemptID != firstAttempt || attempts[0].State != contract.AttemptLost || attempts[0].Result != nil {
+		t.Fatalf("intent-stop expiry evidence=%+v err=%v", attempts, err)
 	}
 	if intentStopped.BoundNodeID != firstRunning.BoundNodeID || intentStopped.Spec.Execution.OCI == nil ||
 		intentStopped.Spec.Execution.OCI.Image.Digest == nil || *intentStopped.Spec.Execution.OCI.Image.Digest != digest ||
@@ -285,6 +306,9 @@ while :; do sleep 1; done
 	pinsAfterStop, err := nodeAgent.logSpool.ListOCIImageBindingPins(t.Context())
 	if err != nil || !containsBindingPin(pinsAfterStop, primary.JobID, digest) {
 		t.Fatalf("intent stop lost OCI binding pin=%+v err=%v", pinsAfterStop, err)
+	}
+	if _, err := lima.SetOCIIntent(t.Context(), intentPath, 2, true, time.Now()); err != nil {
+		t.Fatal(err)
 	}
 	if err := nodeAgent.RecoverOCIRuntimeCapabilities(t.Context()); err != nil {
 		t.Fatal(err)
@@ -773,8 +797,8 @@ trap terminate TERM
 while :; do
   /bin/httpd -f -p "127.0.0.1:$WEFTY_SERVICE_PORT" -h /tmp/wefty-www &
   server=$!
-  # Keep PID 1 available to run its TERM trap. The integer sleep is portable
-  # across BusyBox builds and WithKillAll interrupts both it and httpd.
+  # BusyBox ash runs TERM traps between commands. Polling at 100 ms keeps both
+  # listener withdrawal and TERM handling inside the measured outcome margin.
   restart_requested=false
   while kill -0 "$server" 2>/dev/null; do
     if test -f /tmp/wefty-listener-restart; then
@@ -782,7 +806,7 @@ while :; do
       kill "$server" 2>/dev/null || true
       break
     fi
-    sleep 1
+    sleep 0.1
   done
   wait "$server"
   status=$?

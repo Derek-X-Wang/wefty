@@ -579,7 +579,6 @@ func (a *Agent) RecoverOCIRuntimeCapabilities(ctx context.Context) error {
 	if a == nil || a.capabilities == nil || a.session == nil {
 		return nil
 	}
-	a.capabilities.clearOCIIntent()
 	if a.session.ociBootBarrier == nil {
 		return a.capabilities.refresh(ctx)
 	}
