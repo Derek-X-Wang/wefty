@@ -170,7 +170,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		t.Fatal("scheduled realtiming must remain manually dispatchable")
 	}
 	realtimeText := string(realtimingBytes)
-	for _, required := range []string{"workflow_run.head_sha", "workflow_run.id", "pull_request.head.sha", "pull_request.head.repo.full_name", "actions/download-artifact@", "run-id:", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT", "wefty-computer-wayland-reference-", "WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE"} {
+	for _, required := range []string{"workflow_run.head_sha", "workflow_run.id", "pull_request.head.sha", "pull_request.head.repo.full_name", "actions/download-artifact@", "run-id:", "acceptance-image-index-digest.txt", `test "$ECHO_REFERENCE" = "$IMAGE_NAME"`, `test "$ECHO_DIGEST" = "$(cat "$release/acceptance-image-index-digest.txt")"`, "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT", "wefty-computer-wayland-reference-", "WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE"} {
 		if !strings.Contains(realtimeText, required) {
 			t.Fatalf("realtiming is missing immutable artifact contract %q", required)
 		}
@@ -179,6 +179,14 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		if strings.Contains(realtimeText, forbidden) {
 			t.Fatalf("realtiming reintroduced mutable consumption %q", forbidden)
 		}
+	}
+	for _, required := range []string{"oci-archive:$ECHO_ARCHIVE", "docker-daemon:$BASE_REFERENCE", "docker build --pull=false", "oci-archive:/tmp/wefty-service-data-numeric.oci.tar", "oci-archive:/tmp/wefty-service-data-named.oci.tar"} {
+		if !strings.Contains(realtimeText, required) {
+			t.Fatalf("PR realtiming must derive service-data fixtures from the downloaded archive via %q", required)
+		}
+	}
+	if strings.Contains(realtimeText, "FROM $ECHO_REFERENCE@$ECHO_DIGEST") {
+		t.Fatal("PR realtiming must not pull its PR-only base digest from GHCR")
 	}
 	for _, required := range []string{"repository: ${{ needs.resolve-published-artifact.outputs.source-repository }}", "ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}", "source=pr-build", "source=published-artifact", "provenance-receipt.json", "EVIDENCE_SOURCE"} {
 		if !strings.Contains(realtimeText, required) {
