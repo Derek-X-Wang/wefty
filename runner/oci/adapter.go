@@ -1191,10 +1191,7 @@ func requiresOCIRuntimeRecovery(err error) bool {
 		return false
 	}
 	var runtimeLoss *ocihelper.RuntimeLossError
-	if errors.As(err, &runtimeLoss) {
-		return true
-	}
-	return false
+	return errors.As(err, &runtimeLoss)
 }
 
 func reportOCIRuntimeUnavailable(request workloadrunner.Request, generation ocihelper.HelperSession) {

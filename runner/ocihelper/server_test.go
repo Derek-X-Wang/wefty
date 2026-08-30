@@ -476,7 +476,7 @@ func TestDeleteReleasesAttemptAuthorityWhileOwnerHandoffRemainsRetained(t *testi
 	}
 }
 
-func TestRunAndWatchEngineFailuresCarryClosedMechanicsFacts(t *testing.T) {
+func TestRunEngineFailureCarriesDiagnosticDetailAndWatchKeepsClosedMechanics(t *testing.T) {
 	engine := newFakeEngine()
 	engine.runErr = errors.New("privileged host detail")
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -490,7 +490,8 @@ func TestRunAndWatchEngineFailuresCarryClosedMechanicsFacts(t *testing.T) {
 	_, err = session.Run(t.Context(), testRunRequest(testAuthority(), time.Second))
 	var runFailure *RPCError
 	if !errors.As(err, &runFailure) || runFailure.EngineFailure == nil ||
-		runFailure.EngineFailure.Operation != MethodRun || runFailure.EngineFailure.Reason != EngineFailureOperationFailed {
+		runFailure.EngineFailure.Operation != MethodRun || runFailure.EngineFailure.Reason != EngineFailureOperationFailed ||
+		!strings.Contains(runFailure.Message, "privileged host detail") || !strings.Contains(err.Error(), "privileged host detail") {
 		t.Fatalf("Run engine failure = %+v err=%v", runFailure, err)
 	}
 

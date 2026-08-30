@@ -1063,18 +1063,16 @@ func openLiveRFBSession(t *testing.T, endpoint, userID, deviceID string) *liveRF
 		t.Fatal("live RFB session omitted its control capability")
 	}
 	session := &liveRFBSession{endpoint: endpoint, token: token, websocket: connection, connection: network}
-	session.negotiate(t, true)
+	session.negotiate(t)
 	return session
 }
 
-func (session *liveRFBSession) negotiate(t *testing.T, readBanner bool) {
+func (session *liveRFBSession) negotiate(t *testing.T) {
 	t.Helper()
-	if readBanner {
-		banner := make([]byte, contract.ComputerRFBVersionBannerBytes)
-		if _, err := io.ReadFull(session.connection, banner); err != nil || !contract.ValidComputerRFBVersionBanner(banner) {
-			_ = session.websocket.CloseNow()
-			t.Fatalf("read live RFB banner: %v %q", err, banner)
-		}
+	banner := make([]byte, contract.ComputerRFBVersionBannerBytes)
+	if _, err := io.ReadFull(session.connection, banner); err != nil || !contract.ValidComputerRFBVersionBanner(banner) {
+		_ = session.websocket.CloseNow()
+		t.Fatalf("read live RFB banner: %v %q", err, banner)
 	}
 	if _, err := session.connection.Write([]byte("RFB 003.008\n")); err != nil {
 		t.Fatal(err)

@@ -94,7 +94,9 @@ const (
 	CodeSweepRequired        ErrorCode = "sweep_required"
 )
 
-// RPCError is safe to cross the private protocol. Raw engine detail remains local.
+// RPCError is safe to cross the private protocol. Engine failures may include
+// bounded one-line mechanics detail in Message so native diagnostics retain the
+// causal engine error; the closed EngineFailure fact remains policy authority.
 type RPCError struct {
 	Code          ErrorCode          `json:"code"`
 	Message       string             `json:"message"`

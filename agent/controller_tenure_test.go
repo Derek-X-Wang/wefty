@@ -3,13 +3,17 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +24,125 @@ import (
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/coder/websocket"
 )
+
+func TestNegotiateReplacementComputerControlUsesOfferedRFBVersionSemantics(t *testing.T) {
+	for _, test := range []struct {
+		name, offered, negotiated string
+		securityResult            bool
+	}{
+		{name: "3.3", offered: "RFB 003.003\n", negotiated: "RFB 003.003\n"},
+		{name: "3.7", offered: "RFB 003.007\n", negotiated: "RFB 003.007\n"},
+		{name: "3.8", offered: "RFB 003.008\n", negotiated: "RFB 003.008\n", securityResult: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			serverDone := make(chan error, 1)
+			go func() {
+				defer server.Close()
+				serverDone <- serveReplacementRFBHandshake(server, test.negotiated, test.securityResult, 0)
+			}()
+			if err := negotiateReplacementComputerControl(t.Context(), client, []byte(test.offered)); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-serverDone; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestNegotiateReplacementComputerControlSurfacesSecurityFailureReason(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		defer server.Close()
+		version := make([]byte, contract.ComputerRFBVersionBannerBytes)
+		if _, err := io.ReadFull(server, version); err != nil {
+			serverDone <- err
+			return
+		}
+		if string(version) != "RFB 003.008\n" {
+			serverDone <- fmt.Errorf("negotiated version = %q", version)
+			return
+		}
+		reason := []byte("backend policy refused None security")
+		failure := make([]byte, 5+len(reason))
+		binary.BigEndian.PutUint32(failure[1:5], uint32(len(reason)))
+		copy(failure[5:], reason)
+		_, err := server.Write(failure)
+		serverDone <- err
+	}()
+	err := negotiateReplacementComputerControl(t.Context(), client, []byte("RFB 003.008\n"))
+	if err == nil || !strings.Contains(err.Error(), "backend policy refused None security") || strings.Contains(err.Error(), "%!w") {
+		t.Fatalf("zero-security replacement error = %v", err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNegotiateReplacementComputerControlBoundsDesktopName(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		defer server.Close()
+		serverDone <- serveReplacementRFBHandshake(server, "RFB 003.008\n", true, replacementRFBStringLimit+1)
+	}()
+	err := negotiateReplacementComputerControl(t.Context(), client, []byte("RFB 003.008\n"))
+	if err == nil || !strings.Contains(err.Error(), "desktop name") || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("oversized replacement desktop name error = %v", err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func serveReplacementRFBHandshake(connection net.Conn, wantVersion string, securityResult bool, desktopNameLength uint32) error {
+	version := make([]byte, contract.ComputerRFBVersionBannerBytes)
+	if _, err := io.ReadFull(connection, version); err != nil {
+		return err
+	}
+	if string(version) != wantVersion {
+		return fmt.Errorf("negotiated version = %q, want %q", version, wantVersion)
+	}
+	if wantVersion == "RFB 003.003\n" {
+		var selected [4]byte
+		binary.BigEndian.PutUint32(selected[:], 1)
+		if _, err := connection.Write(selected[:]); err != nil {
+			return err
+		}
+	} else {
+		if _, err := connection.Write([]byte{1, 1}); err != nil {
+			return err
+		}
+		var selected [1]byte
+		if _, err := io.ReadFull(connection, selected[:]); err != nil {
+			return err
+		}
+		if selected[0] != 1 {
+			return fmt.Errorf("selected security = %d", selected[0])
+		}
+		if securityResult {
+			if _, err := connection.Write([]byte{0, 0, 0, 0}); err != nil {
+				return err
+			}
+		}
+	}
+	var shared [1]byte
+	if _, err := io.ReadFull(connection, shared[:]); err != nil {
+		return err
+	}
+	if shared[0] != 1 {
+		return fmt.Errorf("ClientInit shared flag = %d", shared[0])
+	}
+	serverInit := make([]byte, 24)
+	binary.BigEndian.PutUint32(serverInit[20:24], desktopNameLength)
+	_, err := connection.Write(serverInit)
+	return err
+}
 
 func TestControllerTenureFirstDriverRetainsWheelAndOperationsAreSessionBound(t *testing.T) {
 	fixture := newControllerTenureFixture(t)
@@ -565,7 +688,7 @@ func TestComputerFrontDoorSidebandTakeAndReleaseReplaceRelayLeg(t *testing.T) {
 func TestFirstPartyTakeoverClientKeepsOneNegotiatedSessionAcrossTakeAndRelease(t *testing.T) {
 	fixture, _, auditor, _, originalServer, _ := computerFrontDoorFixture(t, l1.ComputerGrantControl)
 	originalServer.Close()
-	viewBackend := newComputerBackend(t, computerBackendOptions{})
+	viewBackend := newComputerBackend(t, computerBackendOptions{rfbHandshake: true})
 	defer viewBackend.Close()
 	controlBackend := newComputerBackend(t, computerBackendOptions{rfbHandshake: true})
 	defer controlBackend.Close()
@@ -595,23 +718,88 @@ func TestFirstPartyTakeoverClientKeepsOneNegotiatedSessionAcrossTakeAndRelease(t
 	frontDoor.SetReady(true)
 	server := httptest.NewServer(frontDoor)
 	defer server.Close()
-	participant := directTakeoverFabric{}
+	participant := &countingTakeoverFabric{}
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
 	session, err := takeover.Open(t.Context(), participant, endpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer session.Close()
+	viewConnection := participant.firstConnection()
+	if viewConnection == nil {
+		t.Fatal("first-party takeover client did not expose its view transport to the fixture")
+	}
+	viewConnection.countReads.Store(true)
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- session.Wait(t.Context()) }()
 	if receipt, err := takeover.Perform(t.Context(), participant, endpoint, session.Token, "take"); err != nil || receipt.TenureState != contract.ComputerControlTenureHeld {
 		t.Fatalf("first-party take = %+v err=%v", receipt, err)
 	}
 	assertTakeoverSessionStillOpen(t, waitDone, "take")
+	assertTakeoverSessionReceivedNoBytes(t, viewConnection, "take")
 	if receipt, err := takeover.Perform(t.Context(), participant, endpoint, session.Token, "release"); err != nil || receipt.TenureState != contract.ComputerControlTenureFree {
 		t.Fatalf("first-party release = %+v err=%v", receipt, err)
 	}
 	assertTakeoverSessionStillOpen(t, waitDone, "release")
+	assertTakeoverSessionReceivedNoBytes(t, viewConnection, "release")
+}
+
+type countingTakeoverFabric struct {
+	mu          sync.Mutex
+	connections []*countingTakeoverConnection
+}
+
+func (*countingTakeoverFabric) Listen(string, string) (net.Listener, error) {
+	return nil, errors.New("listen is not used by takeover clients")
+}
+
+func (participant *countingTakeoverFabric) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	connection, err := (&net.Dialer{}).DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	observed := &countingTakeoverConnection{Conn: connection}
+	participant.mu.Lock()
+	participant.connections = append(participant.connections, observed)
+	participant.mu.Unlock()
+	return observed, nil
+}
+
+func (*countingTakeoverFabric) WhoIs(context.Context, string) (fabric.Identity, error) {
+	return fabric.Identity{}, errors.New("WhoIs is not used by takeover clients")
+}
+
+func (*countingTakeoverFabric) ConnectHost() string { return "" }
+
+func (participant *countingTakeoverFabric) firstConnection() *countingTakeoverConnection {
+	participant.mu.Lock()
+	defer participant.mu.Unlock()
+	if len(participant.connections) == 0 {
+		return nil
+	}
+	return participant.connections[0]
+}
+
+type countingTakeoverConnection struct {
+	net.Conn
+	countReads atomic.Bool
+	readBytes  atomic.Int64
+}
+
+func (connection *countingTakeoverConnection) Read(buffer []byte) (int, error) {
+	count, err := connection.Conn.Read(buffer)
+	if connection.countReads.Load() {
+		connection.readBytes.Add(int64(count))
+	}
+	return count, err
+}
+
+func assertTakeoverSessionReceivedNoBytes(t *testing.T, connection *countingTakeoverConnection, action string) {
+	t.Helper()
+	time.Sleep(50 * time.Millisecond)
+	if got := connection.readBytes.Load(); got != 0 {
+		t.Fatalf("first-party session received %d bytes during %s, want zero", got, action)
+	}
 }
 
 func assertTakeoverSessionStillOpen(t *testing.T, waitDone <-chan error, action string) {

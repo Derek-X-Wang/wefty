@@ -1004,28 +1004,7 @@ func newComputerBackend(t *testing.T, options computerBackendOptions) *computerB
 			return
 		}
 		if options.rfbHandshake {
-			kind, version, err := connection.Read(request.Context())
-			if err != nil || kind != websocket.MessageBinary || string(version) != "RFB 003.008\n" {
-				return
-			}
-			if err := connection.Write(request.Context(), websocket.MessageBinary, []byte{1, 1}); err != nil {
-				return
-			}
-			kind, security, err := connection.Read(request.Context())
-			if err != nil || kind != websocket.MessageBinary || !bytes.Equal(security, []byte{1}) {
-				return
-			}
-			if err := connection.Write(request.Context(), websocket.MessageBinary, []byte{0, 0, 0, 0}); err != nil {
-				return
-			}
-			kind, shared, err := connection.Read(request.Context())
-			if err != nil || kind != websocket.MessageBinary || !bytes.Equal(shared, []byte{1}) {
-				return
-			}
-			serverInit := make([]byte, 24)
-			binary.BigEndian.PutUint16(serverInit[0:2], 640)
-			binary.BigEndian.PutUint16(serverInit[2:4], 480)
-			if err := connection.Write(request.Context(), websocket.MessageBinary, serverInit); err != nil {
+			if !completeTestRFBServerHandshake(request.Context(), connection) {
 				return
 			}
 		}
@@ -1045,6 +1024,31 @@ func newComputerBackend(t *testing.T, options computerBackendOptions) *computerB
 		t.Fatal(err)
 	}
 	return &computerBackendServer{server: server, address: parsed.Host}
+}
+
+func completeTestRFBServerHandshake(ctx context.Context, connection *websocket.Conn) bool {
+	kind, version, err := connection.Read(ctx)
+	if err != nil || kind != websocket.MessageBinary || string(version) != "RFB 003.008\n" {
+		return false
+	}
+	if err := connection.Write(ctx, websocket.MessageBinary, []byte{1, 1}); err != nil {
+		return false
+	}
+	kind, security, err := connection.Read(ctx)
+	if err != nil || kind != websocket.MessageBinary || !bytes.Equal(security, []byte{1}) {
+		return false
+	}
+	if err := connection.Write(ctx, websocket.MessageBinary, []byte{0, 0, 0, 0}); err != nil {
+		return false
+	}
+	kind, shared, err := connection.Read(ctx)
+	if err != nil || kind != websocket.MessageBinary || !bytes.Equal(shared, []byte{1}) {
+		return false
+	}
+	serverInit := make([]byte, 24)
+	binary.BigEndian.PutUint16(serverInit[0:2], 640)
+	binary.BigEndian.PutUint16(serverInit[2:4], 480)
+	return connection.Write(ctx, websocket.MessageBinary, serverInit) == nil
 }
 
 func (backend *computerBackendServer) dial(ctx context.Context) (net.Conn, error) {

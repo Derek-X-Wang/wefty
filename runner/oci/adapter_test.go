@@ -874,7 +874,16 @@ func TestAdapterReapedTaskWithoutWaitConfirmationReportsRuntimeLoss(t *testing.T
 	}
 }
 
-func TestAdapterServiceSignalDeadlineReportsRuntimeLoss(t *testing.T) {
+func TestRequiresOCIRuntimeRecoveryKeepsRuntimeLossJoinedWithCallerCancellation(t *testing.T) {
+	for _, callerErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		failure := errors.Join(callerErr, &ocihelper.RuntimeLossError{Cause: errors.New("helper transport ended")})
+		if !requiresOCIRuntimeRecovery(failure) {
+			t.Fatalf("joined runtime loss %v was suppressed by caller context", failure)
+		}
+	}
+}
+
+func TestAdapterServiceSignalDeadlinePrefersRuntimeLossOverWatchCancellation(t *testing.T) {
 	engine := &adapterTestEngine{watchSignals: make(chan ocihelper.Signal, 2), blockSignal: true}
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
 	defer closeAdapter()
@@ -894,8 +903,10 @@ func TestAdapterServiceSignalDeadlineReportsRuntimeLoss(t *testing.T) {
 	}()
 	<-started
 	cancel()
-	if err := <-done; err == nil {
-		t.Fatal("helper-unreachable service stop returned no error")
+	err := <-done
+	var runtimeLoss *ocihelper.RuntimeLossError
+	if !errors.As(err, &runtimeLoss) {
+		t.Fatalf("helper-unreachable service stop = %T %v, want signal runtime loss", err, err)
 	}
 	if recoveries != 1 {
 		t.Fatalf("helper-unreachable service stop recoveries = %d, want 1", recoveries)

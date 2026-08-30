@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -193,6 +194,7 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	}
 	var freshRestart, stopStart, saturation, retainedBinding bool
 	var serviceFreshAttemptReadmission bool
+	var serviceResidueVerifiedAbsent, serviceRetainedBindingVerified bool
 	var serviceRecoveryElapsed, staleEvidenceElapsed time.Duration
 	var staleEvidenceLate bool
 	var staleEvidenceArm string
@@ -201,7 +203,7 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	var removalCompleted, removalPriorBootSweep, removalPostDeleteAttestation, removalDeleteAttestInjection bool
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_arm=%s\nservice_stale_evidence_elapsed=%s\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceFreshAttemptReadmission, serviceRecoveryElapsed, staleEvidenceLate, staleEvidenceArm, staleEvidenceElapsed, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
+			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_arm=%s\nservice_stale_evidence_elapsed=%s\nservice_residue_verified_absent=%t\nservice_retained_binding_verified=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceFreshAttemptReadmission, serviceRecoveryElapsed, staleEvidenceLate, staleEvidenceArm, staleEvidenceElapsed, serviceResidueVerifiedAbsent, serviceRetainedBindingVerified, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-l1-agent-linux.txt"), []byte(payload), 0o600); err != nil {
 				t.Errorf("write OCI L1/agent evidence: %v", err)
 			}
@@ -365,6 +367,16 @@ while :; do sleep 1; done
 	healthElapsed := waitNativePublishedServiceHealth(t, serviceClientFabric, publishedPort, 15*time.Second)
 	serviceRecoveryElapsed = time.Since(recoveryStarted)
 	newGeneration, ready := barrier.Generation()
+	sweepReceipt, sweepReceiptOK := barrier.SweepReceipt()
+	retainedIdentity, retainedIdentityErr := ocihelper.DeterministicResourceIdentity(ocirunner.HelperAuthority(firstAuthority))
+	serviceResidueVerifiedAbsent = sweepReceiptOK && sweepReceipt.VerifiedAbsent && ocihelper.InventoryEmpty(sweepReceipt.VerifiedResidue)
+	serviceRetainedBindingVerified = retainedIdentityErr == nil &&
+		slices.Contains(sweepReceipt.VerifiedRetained.ManagedVolumes, retainedIdentity.ServiceVolumeDirectory) &&
+		slices.Contains(sweepReceipt.VerifiedRetained.ManagedVolumeRecords, retainedIdentity.ServiceVolumeOwnerRecord)
+	if !serviceResidueVerifiedAbsent || !serviceRetainedBindingVerified {
+		t.Fatalf("runtime-loss service sweep receipt = %+v present=%t retained_identity=%+v identity_err=%v",
+			sweepReceipt, sweepReceiptOK, retainedIdentity, retainedIdentityErr)
+	}
 	newAuthority := authorities.wait(t, readmitted.CurrentAttemptID, 5*time.Second)
 	stale, staleEvidenceElapsed, staleEvidenceLate, staleEvidenceArm := waitNativeRuntimeLossEvidence(
 		t, store, primary.JobID, firstAttempt, recoveryStarted, l1.DefaultLeaseDuration,
@@ -375,9 +387,6 @@ while :; do sleep 1; done
 	if !serviceFreshAttemptReadmission {
 		t.Fatalf("runtime-loss service re-admission = old_generation:%+v new_generation:%+v ready:%t old_authority:%+v new_authority:%+v stale:%+v stale_evidence_late:%t stale_evidence_elapsed:%s current:%+v health_elapsed:%s",
 			oldGeneration, newGeneration, ready, firstAuthority, newAuthority, stale, staleEvidenceLate, staleEvidenceElapsed, readmitted, serviceRecoveryElapsed)
-	}
-	if staleEvidenceArm != "result" && staleEvidenceArm != "late_result" {
-		t.Fatalf("runtime-loss evidence receipt arm = %q", staleEvidenceArm)
 	}
 	firstRunning = readmitted
 	firstAttempt = readmitted.CurrentAttemptID

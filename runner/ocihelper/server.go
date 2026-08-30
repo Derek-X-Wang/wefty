@@ -1114,7 +1114,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			} else if errors.As(err, &imageUnavailable) {
 				_ = writeFailure(wire, CodeImageUnavailable, "pinned local OCI image is unavailable")
 			} else {
-				_ = writeRPCError(wire, engineFailureRPC(MethodRun, "OCI engine operation failed", engineFailureReason(err)))
+				_ = writeRPCError(wire, engineFailureRPC(MethodRun, "OCI engine operation failed", engineFailureReason(err), err))
 			}
 			return
 		}
@@ -1813,7 +1813,17 @@ func writeStreamResult(connection *framedConn, method Method, err error) {
 	_ = connection.write(frame{Version: ProtocolVersion, OK: true})
 }
 
-func engineFailureRPC(method Method, message string, reason EngineFailureReason) *RPCError {
+func engineFailureRPC(method Method, message string, reason EngineFailureReason, cause ...error) *RPCError {
+	const messageLimit = 1024
+	if len(cause) > 0 && cause[0] != nil {
+		detail := strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(cause[0].Error()))
+		if len(detail) > messageLimit {
+			detail = detail[:messageLimit]
+		}
+		if detail != "" {
+			message += ": " + detail
+		}
+	}
 	return &RPCError{Code: CodeEngineFailure, Message: message, EngineFailure: &EngineFailureFact{Operation: method, Reason: reason}}
 }
 
