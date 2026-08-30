@@ -28,6 +28,7 @@ cleanup() {
   trap - TERM INT EXIT
   for pid in $pids; do kill "$pid" 2>/dev/null || true; done
   wait || true
+  chmod -R u+rwX,go+rwX /wefty/service 2>/dev/null || true
 }
 trap cleanup TERM INT EXIT
 
