@@ -1,0 +1,469 @@
+name: "PROBE — hosted macOS Lima feasibility"
+
+# Throwaway evidence probe only. This must never become a push or pull-request gate.
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  probe-lima-hosted:
+    name: "PROBE / Lima / ${{ matrix.runner }} / ${{ matrix.driver }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            driver: vz
+            mount-type: virtiofs
+            archive-arch: arm64
+          - runner: macos-26-intel
+            driver: qemu
+            mount-type: 9p
+            archive-arch: amd64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      PROBE_INSTANCE: wefty-hosted-probe
+      RUNNER_LABEL: ${{ matrix.runner }}
+      LIMA_DRIVER: ${{ matrix.driver }}
+      LIMA_MOUNT_TYPE: ${{ matrix.mount-type }}
+      ARCHIVE_ARCH: ${{ matrix.archive-arch }}
+      CONTAINERD_VERSION: 2.3.4
+      RUNC_VERSION: 1.5.1
+    steps:
+      - name: Initialize probe receipt state
+        continue-on-error: true
+        env:
+          PROBE_ROOT: ${{ runner.temp }}/wefty-lima-probe
+        run: |
+          set +e
+          printf 'PROBE_ROOT=%s\n' "$PROBE_ROOT" >> "$GITHUB_ENV"
+          mkdir -p "$PROBE_ROOT/state" "$PROBE_ROOT/logs" "$PROBE_ROOT/download"
+          printf '%s\n' "$RUNNER_LABEL" > "$PROBE_ROOT/state/runner-label"
+          printf '%s\n' "$LIMA_DRIVER" > "$PROBE_ROOT/state/driver"
+          printf '%s\n' "$ARCHIVE_ARCH" > "$PROBE_ROOT/state/archive-arch"
+          printf '%s\n' "$(uname -m)" > "$PROBE_ROOT/state/host-arch"
+          printf '%s\n' "$(sw_vers -productVersion)" > "$PROBE_ROOT/state/macos-version"
+          printf '0\n' > "$PROBE_ROOT/state/initialize.status"
+          printf '0\n' > "$PROBE_ROOT/state/initialize.seconds"
+
+      - name: Inspect host virtualization surface
+        continue-on-error: true
+        run: |
+          set +e
+          started="$(date +%s)"
+          hv_support="$(sysctl -n kern.hv_support 2>/dev/null)"
+          hv_rc=$?
+          printf '%s\n' "${hv_support:-unavailable}" > "$PROBE_ROOT/state/host-hv-support"
+          sysctl -a 2>/dev/null | grep -E '(^kern\.hv_|machdep\.cpu\.(features|leaf7_features))' \
+            > "$PROBE_ROOT/logs/host-virtualization.txt"
+          rc=0
+          elapsed=$(( $(date +%s) - started ))
+          printf '%s\n' "$rc" > "$PROBE_ROOT/state/host-inspection.status"
+          printf '%s\n' "$elapsed" > "$PROBE_ROOT/state/host-inspection.seconds"
+          if [ "$hv_rc" -ne 0 ]; then
+            printf '%s\n' 'unavailable' > "$PROBE_ROOT/state/host-hv-support"
+          fi
+          exit 0
+
+      - name: Install Lima and timeout tooling with Homebrew
+        continue-on-error: true
+        run: |
+          set +e
+          started="$(date +%s)"
+          /usr/bin/python3 - "$PROBE_ROOT/logs/brew-install.txt" <<'PY'
+          import subprocess
+          import sys
+
+          with open(sys.argv[1], "wb") as log:
+              try:
+                  result = subprocess.run(
+                      ["brew", "install", "lima", "coreutils"],
+                      stdout=log,
+                      stderr=subprocess.STDOUT,
+                      timeout=600,
+                  )
+              except subprocess.TimeoutExpired:
+                  raise SystemExit(124)
+          raise SystemExit(result.returncode)
+          PY
+          rc=$?
+          elapsed=$(( $(date +%s) - started ))
+          printf '%s\n' "$rc" > "$PROBE_ROOT/state/install-lima.status"
+          printf '%s\n' "$elapsed" > "$PROBE_ROOT/state/install-lima.seconds"
+          if command -v limactl >/dev/null 2>&1; then
+            limactl --version > "$PROBE_ROOT/state/lima-version" 2>&1
+          fi
+          if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+            qemu-system-x86_64 -accel help > "$PROBE_ROOT/logs/qemu-accelerators.txt" 2>&1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            tail -n 20 "$PROBE_ROOT/logs/brew-install.txt" > "$PROBE_ROOT/state/install-lima.reason"
+          fi
+          exit 0
+
+      - name: Download the last successful main acceptance image
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          started="$(date +%s)"
+          published="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow acceptance-image.yml \
+            --branch main --status success --limit 1 --json databaseId,headSha 2> "$PROBE_ROOT/logs/resolve-image.stderr")"
+          rc=$?
+          if [ "$rc" -eq 0 ] && [ "$(jq 'length' <<<"$published")" -eq 1 ]; then
+            run_id="$(jq -r '.[0].databaseId' <<<"$published")"
+            published_sha="$(jq -r '.[0].headSha' <<<"$published")"
+            printf '%s\n' "$run_id" > "$PROBE_ROOT/state/acceptance-run-id"
+            printf '%s\n' "$published_sha" > "$PROBE_ROOT/state/acceptance-sha"
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+              --name "wefty-echo-service-$published_sha" --dir "$PROBE_ROOT/download" \
+              > "$PROBE_ROOT/logs/download-image.txt" 2>&1
+            rc=$?
+          elif [ "$rc" -eq 0 ]; then
+            rc=66
+            printf '%s\n' 'no successful acceptance-image run exists on main' \
+              > "$PROBE_ROOT/logs/download-image.txt"
+          fi
+          if [ "$rc" -eq 0 ]; then
+            tar -xf "$PROBE_ROOT/download/wefty-acceptance-image-release.tar" -C "$PROBE_ROOT/download" \
+              >> "$PROBE_ROOT/logs/download-image.txt" 2>&1
+            rc=$?
+          fi
+          if [ "$rc" -eq 0 ]; then
+            release="$PROBE_ROOT/download/acceptance-image-release"
+            published_sha="$(cat "$PROBE_ROOT/state/acceptance-sha")"
+            if ! test "$(jq -r .commit "$release/acceptance-image-receipt.json")" = "$published_sha"; then
+              rc=65
+            fi
+          fi
+          elapsed=$(( $(date +%s) - started ))
+          printf '%s\n' "$rc" > "$PROBE_ROOT/state/download-image.status"
+          printf '%s\n' "$elapsed" > "$PROBE_ROOT/state/download-image.seconds"
+          if [ "$rc" -ne 0 ]; then
+            { cat "$PROBE_ROOT/logs/resolve-image.stderr" 2>/dev/null; tail -n 20 "$PROBE_ROOT/logs/download-image.txt" 2>/dev/null; } \
+              | tail -n 20 > "$PROBE_ROOT/state/download-image.reason"
+          fi
+          exit 0
+
+      - name: Boot minimal Ubuntu with the selected Lima driver
+        continue-on-error: true
+        run: |
+          set +e
+          started="$(date +%s)"
+          if [ "$(cat "$PROBE_ROOT/state/install-lima.status" 2>/dev/null)" != 0 ]; then
+            rc=69
+            printf '%s\n' 'Lima installation did not succeed' > "$PROBE_ROOT/logs/lima-start.txt"
+          else
+            gtimeout 10m limactl start --name="$PROBE_INSTANCE" --tty=false --timeout=8m \
+              --vm-type="$LIMA_DRIVER" --mount-type="$LIMA_MOUNT_TYPE" \
+              --cpus=2 --memory=4 --disk=20 --containerd=none \
+              --mount-only="$PROBE_ROOT" template:ubuntu \
+              > "$PROBE_ROOT/logs/lima-start.txt" 2>&1
+            rc=$?
+          fi
+          elapsed=$(( $(date +%s) - started ))
+          printf '%s\n' "$rc" > "$PROBE_ROOT/state/boot.status"
+          printf '%s\n' "$elapsed" > "$PROBE_ROOT/state/boot.seconds"
+          limactl list --json > "$PROBE_ROOT/logs/lima-list.json" 2>&1 || true
+          if [ "$rc" -ne 0 ]; then
+            tail -n 30 "$PROBE_ROOT/logs/lima-start.txt" > "$PROBE_ROOT/state/boot.reason"
+          fi
+          exit 0
+
+      - name: Inspect guest kernel, CPU, and nested virtualization
+        continue-on-error: true
+        run: |
+          set +e
+          started="$(date +%s)"
+          if [ "$(cat "$PROBE_ROOT/state/boot.status" 2>/dev/null)" != 0 ]; then
+            rc=69
+            printf '%s\n' 'guest unavailable because Lima did not boot' > "$PROBE_ROOT/logs/guest-inspection.txt"
+          else
+            gtimeout 1m limactl shell "$PROBE_INSTANCE" -- bash -lc '
+              set +e
+              uname -a
+              cat /proc/cpuinfo | head -n 40
+              if [ -e /dev/kvm ]; then echo GUEST_DEV_KVM=true; else echo GUEST_DEV_KVM=false; fi
+              if grep -Eq "(^|[[:space:]])(vmx|svm)([[:space:]]|$)" /proc/cpuinfo; then
+                echo GUEST_CPU_VIRT_FLAG=true
+              else
+                echo GUEST_CPU_VIRT_FLAG=false
+              fi
+            ' > "$PROBE_ROOT/logs/guest-inspection.txt" 2>&1
+            rc=$?
+          fi
+          elapsed=$(( $(date +%s) - started ))
+          printf '%s\n' "$rc" > "$PROBE_ROOT/state/guest-inspection.status"
+          printf '%s\n' "$elapsed" > "$PROBE_ROOT/state/guest-inspection.seconds"
+          grep '^GUEST_DEV_KVM=' "$PROBE_ROOT/logs/guest-inspection.txt" | tail -n 1 | cut -d= -f2 \
+            > "$PROBE_ROOT/state/guest-dev-kvm" 2>/dev/null || true
+          grep '^GUEST_CPU_VIRT_FLAG=' "$PROBE_ROOT/logs/guest-inspection.txt" | tail -n 1 | cut -d= -f2 \
+            > "$PROBE_ROOT/state/guest-cpu-virt-flag" 2>/dev/null || true
+          if [ "$rc" -ne 0 ]; then
+            tail -n 20 "$PROBE_ROOT/logs/guest-inspection.txt" > "$PROBE_ROOT/state/guest-inspection.reason"
+          fi
+          exit 0
+
+      - name: Install and start pinned containerd and runc in the guest
+        continue-on-error: true
+        run: |
+          set +e
+          started="$(date +%s)"
+          if [ "$(cat "$PROBE_ROOT/state/boot.status" 2>/dev/null)" != 0 ]; then
+            rc=69
+            printf '%s\n' 'guest unavailable because Lima did not boot' > "$PROBE_ROOT/logs/containerd.txt"
+          else
+            gtimeout 9m limactl shell "$PROBE_INSTANCE" -- bash -s -- \
+              "$ARCHIVE_ARCH" "$CONTAINERD_VERSION" "$RUNC_VERSION" \
+              > "$PROBE_ROOT/logs/containerd.txt" 2>&1 <<'GUEST'
+          set -euo pipefail
+          arch="$1"
+          containerd_version="$2"
+          runc_version="$3"
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          cd "$work"
+          sudo apt-get update
+          sudo apt-get install --yes ca-certificates curl e2fsprogs jq
+          curl --fail --location --retry 5 --output containerd.tar.gz \
+            "https://github.com/containerd/containerd/releases/download/v${containerd_version}/containerd-${containerd_version}-linux-${arch}.tar.gz"
+          curl --fail --location --retry 5 --output containerd.sha256 \
+            "https://github.com/containerd/containerd/releases/download/v${containerd_version}/containerd-${containerd_version}-linux-${arch}.tar.gz.sha256sum"
+          sed -i "s/containerd-${containerd_version}-linux-${arch}.tar.gz/containerd.tar.gz/" containerd.sha256
+          sha256sum --check containerd.sha256
+          sudo tar --extract --gzip --file containerd.tar.gz --directory /usr/local
+          curl --fail --location --retry 5 --output "runc.${arch}" \
+            "https://github.com/opencontainers/runc/releases/download/v${runc_version}/runc.${arch}"
+          curl --fail --location --retry 5 --output runc.sha256sum \
+            "https://github.com/opencontainers/runc/releases/download/v${runc_version}/runc.sha256sum"
+          grep " runc.${arch}$" runc.sha256sum | sha256sum --check
+          sudo install --mode=0755 "runc.${arch}" /usr/local/sbin/runc
+          sudo modprobe overlay
+          grep -qw overlay /proc/filesystems
+          sudo install --directory --mode=0700 /var/lib/wefty-containerd /run/wefty-containerd
+          sudo tee /etc/systemd/system/wefty-probe-containerd.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Wefty hosted Lima probe pinned containerd
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/containerd --address /run/wefty-containerd/containerd.sock --root /var/lib/wefty-containerd/root --state /run/wefty-containerd/state
+          Restart=no
+          KillMode=control-group
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl start wefty-probe-containerd.service
+          for _ in $(seq 1 60); do
+            if sudo /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock version >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          sudo /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock version
+          /usr/local/sbin/runc --version
+          GUEST
+            rc=$?
+          fi
+          elapsed=$(( $(date +%s) - started ))
+          printf '%s\n' "$rc" > "$PROBE_ROOT/state/containerd.status"
+          printf '%s\n' "$elapsed" > "$PROBE_ROOT/state/containerd.seconds"
+          if [ "$rc" -ne 0 ]; then
+            tail -n 30 "$PROBE_ROOT/logs/containerd.txt" > "$PROBE_ROOT/state/containerd.reason"
+          fi
+          exit 0
+
+      - name: Import the pinned OCI archive and start the echo service
+        continue-on-error: true
+        run: |
+          set +e
+          started="$(date +%s)"
+          release="$PROBE_ROOT/download/acceptance-image-release"
+          if [ "$(cat "$PROBE_ROOT/state/containerd.status" 2>/dev/null)" != 0 ]; then
+            rc=69
+            printf '%s\n' 'containerd unavailable' > "$PROBE_ROOT/logs/echo.txt"
+          elif [ "$(cat "$PROBE_ROOT/state/download-image.status" 2>/dev/null)" != 0 ]; then
+            rc=69
+            printf '%s\n' 'acceptance image archive unavailable' > "$PROBE_ROOT/logs/echo.txt"
+          else
+            manifest="$release/linux-$ARCHIVE_ARCH/share/wefty/oci/manifest.json"
+            probe_reference="$(jq -r .probe_reference "$manifest")"
+            probe_digest="$(jq -r .probe_digest "$manifest")"
+            probe_archive="$release/linux-$ARCHIVE_ARCH/share/wefty/oci/$(jq -r .probe_archive_path "$manifest")"
+            gtimeout 3m limactl shell "$PROBE_INSTANCE" -- bash -s -- \
+              "$probe_archive" "$probe_reference" "$probe_digest" \
+              > "$PROBE_ROOT/logs/echo.txt" 2>&1 <<'GUEST'
+          set -euo pipefail
+          archive="$1"
+          reference="$2"
+          digest="$3"
+          address=/run/wefty-containerd/containerd.sock
+          namespace=wefty-probe
+          container=wefty-echo-probe
+          ctr() { sudo /usr/local/bin/ctr --address "$address" --namespace "$namespace" "$@"; }
+          cleanup() {
+            ctr tasks kill --signal KILL "$container" >/dev/null 2>&1 || true
+            ctr tasks delete "$container" >/dev/null 2>&1 || true
+            ctr containers delete "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          test -r "$archive"
+          ctr images import --no-unpack "$archive"
+          ctr images list
+          ctr images check "$reference@$digest"
+          ctr run --detach --net-host \
+            --env WEFTY_SERVICE_PORT=18156 --env WEFTY_SERVICE_DIR=/tmp/wefty-service \
+            "$reference@$digest" "$container"
+          for _ in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:18156/healthz > /tmp/wefty-probe-health.json; then
+              break
+            fi
+            sleep 1
+          done
+          jq -e '.service_directory == "/tmp/wefty-service" and .listening_port == 18156 and (.pid > 0)' \
+            /tmp/wefty-probe-health.json
+          printf '%s\n' 'hosted-lima-echo' > /tmp/wefty-probe-input.txt
+          curl --fail --silent --request POST --data-binary @/tmp/wefty-probe-input.txt \
+            http://127.0.0.1:18156/echo > /tmp/wefty-probe-output.txt
+          cmp /tmp/wefty-probe-input.txt /tmp/wefty-probe-output.txt
+          GUEST
+            rc=$?
+          fi
+          elapsed=$(( $(date +%s) - started ))
+          printf '%s\n' "$rc" > "$PROBE_ROOT/state/echo.status"
+          printf '%s\n' "$elapsed" > "$PROBE_ROOT/state/echo.seconds"
+          if [ "$rc" -ne 0 ]; then
+            tail -n 30 "$PROBE_ROOT/logs/echo.txt" > "$PROBE_ROOT/state/echo.reason"
+          fi
+          exit 0
+
+      - name: Stop and delete the probe VM
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          started="$(date +%s)"
+          rc=0
+          if command -v limactl >/dev/null 2>&1; then
+            gtimeout 1m limactl stop --force "$PROBE_INSTANCE" > "$PROBE_ROOT/logs/cleanup.txt" 2>&1
+            stop_rc=$?
+            gtimeout 1m limactl delete --force "$PROBE_INSTANCE" >> "$PROBE_ROOT/logs/cleanup.txt" 2>&1
+            delete_rc=$?
+            if [ "$stop_rc" -ne 0 ] && [ "$stop_rc" -ne 1 ]; then rc=$stop_rc; fi
+            if [ "$delete_rc" -ne 0 ]; then rc=$delete_rc; fi
+          fi
+          elapsed=$(( $(date +%s) - started ))
+          printf '%s\n' "$rc" > "$PROBE_ROOT/state/cleanup.status"
+          printf '%s\n' "$elapsed" > "$PROBE_ROOT/state/cleanup.seconds"
+          if [ "$rc" -ne 0 ]; then
+            tail -n 20 "$PROBE_ROOT/logs/cleanup.txt" > "$PROBE_ROOT/state/cleanup.reason"
+          fi
+          exit 0
+
+      - name: Assemble structured probe receipt
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          receipt="$PROBE_ROOT/probe-lima-$RUNNER_LABEL.json"
+          /usr/bin/python3 - "$PROBE_ROOT" "$receipt" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          state = root / "state"
+
+          def read(name, default=""):
+              path = state / name
+              return path.read_text(errors="replace").strip() if path.exists() else default
+
+          def status(phase):
+              value = read(f"{phase}.status", "255")
+              try:
+                  return int(value)
+              except ValueError:
+                  return 255
+
+          def seconds(phase):
+              value = read(f"{phase}.seconds", "0")
+              try:
+                  return int(value)
+              except ValueError:
+                  return 0
+
+          phases = [
+              "initialize",
+              "host-inspection",
+              "install-lima",
+              "download-image",
+              "boot",
+              "guest-inspection",
+              "containerd",
+              "echo",
+              "cleanup",
+          ]
+          failure_reason = ""
+          failure_priority = [
+              "install-lima",
+              "boot",
+              "guest-inspection",
+              "containerd",
+              "download-image",
+              "echo",
+              "cleanup",
+              "host-inspection",
+              "initialize",
+          ]
+          for phase in failure_priority:
+              if status(phase) != 0:
+                  reason = read(f"{phase}.reason", f"{phase} exited {status(phase)}")
+                  failure_reason = f"{phase}: {reason}"[:4000]
+                  break
+
+          receipt = {
+              "version": 1,
+              "probe": "hosted-macos-lima-feasibility",
+              "runner_label": read("runner-label", "unknown"),
+              "host_arch": read("host-arch", "unknown"),
+              "macos_version": read("macos-version", "unknown"),
+              "driver": read("driver", "unknown"),
+              "lima_version": read("lima-version", "unavailable"),
+              "boot_seconds": seconds("boot"),
+              "containerd_ok": status("containerd") == 0,
+              "echo_ok": status("echo") == 0,
+              "per_phase_seconds": {phase: seconds(phase) for phase in phases},
+              "per_phase_exit_status": {phase: status(phase) for phase in phases},
+              "virtualization": {
+                  "host_hv_support": read("host-hv-support", "unavailable"),
+                  "guest_dev_kvm": read("guest-dev-kvm", "unavailable") == "true",
+                  "guest_cpu_virtualization_flag": read("guest-cpu-virt-flag", "unavailable") == "true",
+              },
+              "acceptance_image": {
+                  "source_run_id": read("acceptance-run-id", "unavailable"),
+                  "source_sha": read("acceptance-sha", "unavailable"),
+                  "archive_arch": read("archive-arch", "unknown"),
+              },
+              "failure_reason": failure_reason or None,
+          }
+          pathlib.Path(sys.argv[2]).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+          PY
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            jq . "$receipt"
+          fi
+          exit 0
+
+      - name: Upload probe receipt and diagnostic logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: probe-lima-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/wefty-lima-probe/probe-lima-${{ matrix.runner }}.json
+            ${{ runner.temp }}/wefty-lima-probe/logs
+          if-no-files-found: warn
