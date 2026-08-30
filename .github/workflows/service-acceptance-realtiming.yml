@@ -55,6 +55,13 @@ jobs:
       source: ${{ steps.resolve.outputs.source }}
       source-repository: ${{ steps.resolve.outputs.source_repository }}
     steps:
+      - name: Check out trusted history for manual dispatch validation
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
       - name: Resolve the immutable artifact run
         id: resolve
         env:
@@ -65,6 +72,8 @@ jobs:
           PR_BUILD_RESULT: ${{ needs.build-pr-artifacts.result }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = workflow_run ]; then
@@ -84,15 +93,43 @@ jobs:
               exit 0
             fi
             run_id="$GITHUB_RUN_ID"
-            candidate_sha="${PR_HEAD_SHA:-$GITHUB_SHA}"
             source=pr-build
-            source_repository="${PR_HEAD_REPOSITORY:-$GITHUB_REPOSITORY}"
+            case "$EVENT_NAME" in
+              pull_request)
+                candidate_sha="$PR_HEAD_SHA"
+                source_repository="$PR_HEAD_REPOSITORY"
+                ;;
+              workflow_dispatch)
+                candidate_sha="$DISPATCH_SHA"
+                source_repository="$GITHUB_REPOSITORY"
+                ;;
+              *)
+                printf '%s\n' "::error::unsupported artifact source event $EVENT_NAME"
+                exit 64
+                ;;
+            esac
           fi
           case "$candidate_sha" in
             [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
             *) exit 64 ;;
           esac
           test -n "$source_repository"
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            case "$DISPATCH_REF" in
+              refs/heads/*) ;;
+              *)
+                printf '%s\n' "::error::manual realtiming accepts branch refs only, got $DISPATCH_REF"
+                exit 64
+                ;;
+            esac
+            git fetch --no-tags --force origin \
+              "$DISPATCH_REF:refs/remotes/origin/manual-dispatch"
+            dispatch_tip="$(git rev-parse 'refs/remotes/origin/manual-dispatch^{commit}')"
+            if ! git merge-base --is-ancestor "$candidate_sha" "$dispatch_tip"; then
+              printf '%s\n' "::error::manual candidate $candidate_sha is not contained in $DISPATCH_REF"
+              exit 1
+            fi
+          fi
           printf 'available=true\ncandidate_sha=%s\nrun_id=%s\nsource=%s\nsource_repository=%s\n' \
             "$candidate_sha" "$run_id" "$source" "$source_repository" >> "$GITHUB_OUTPUT"
 
@@ -174,7 +211,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
       - name: Provision pinned Linux OCI engine and probe
         if: runner.os == 'Linux'
         env:

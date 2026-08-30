@@ -160,6 +160,9 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if _, ok := realtiming.On["workflow_dispatch"]; !ok {
 		t.Fatal("realtiming must allow manual dispatch on a PR head")
 	}
+	if !maps.Equal(realtiming.Permissions, map[string]string{"actions": "read", "contents": "read"}) {
+		t.Fatalf("realtiming permissions = %#v, want actions: read and contents: read only", realtiming.Permissions)
+	}
 	if _, ok := scheduled.On["schedule"]; !ok {
 		t.Fatal("scheduled realtiming must retain its evidence cadence")
 	}
@@ -180,6 +183,23 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	for _, required := range []string{"repository: ${{ needs.resolve-published-artifact.outputs.source-repository }}", "ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}", "source=pr-build", "source=published-artifact", "provenance-receipt.json", "EVIDENCE_SOURCE"} {
 		if !strings.Contains(realtimeText, required) {
 			t.Fatalf("shared main/PR realtiming contract is missing %q", required)
+		}
+	}
+	for _, required := range []string{"github.event_name == 'workflow_dispatch'", "ref: refs/heads/main", "fetch-depth: 0", "DISPATCH_REF: ${{ github.ref }}", "refs/heads/*", "git merge-base --is-ancestor"} {
+		if !strings.Contains(realtimeText, required) {
+			t.Fatalf("manual realtiming trust guard is missing %q", required)
+		}
+	}
+	for workflowName, workflow := range map[string]workflowContract{"PR artifact build": build, "privileged realtiming": realtiming} {
+		for jobName, job := range workflow.Jobs {
+			for _, step := range job.Steps {
+				if strings.HasPrefix(step.Uses, "actions/cache@") {
+					t.Fatalf("%s job %s restores a shared Actions cache", workflowName, jobName)
+				}
+				if strings.HasPrefix(step.Uses, "actions/setup-go@") && step.With["cache"] != false {
+					t.Fatalf("%s job %s setup-go cache = %#v, want false", workflowName, jobName, step.With["cache"])
+				}
+			}
 		}
 	}
 	if strings.Contains(realtimeText, "ref: main") {
