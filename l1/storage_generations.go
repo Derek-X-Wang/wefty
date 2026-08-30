@@ -1,6 +1,7 @@
 package l1
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -89,6 +90,28 @@ type computerStorageResetRow struct {
 	AcknowledgementKey   sql.NullString
 	AcknowledgementHash  sql.NullString
 	ResumeDesiredRunning bool
+}
+
+func readComputerStorageCleanupQuarantine(ctx context.Context, q queryer, computerID string) (*ComputerStorageCleanupQuarantine, error) {
+	for _, query := range []string{
+		`SELECT cleanup_quarantine_json FROM computer_storage_resets WHERE computer_id=? AND cleanup_quarantine_json IS NOT NULL ORDER BY intent_revision DESC LIMIT 1`,
+		`SELECT cleanup_quarantine_json FROM computer_storage_copy_operations WHERE destination_computer_id=? AND cleanup_quarantine_json IS NOT NULL ORDER BY operation_revision DESC LIMIT 1`,
+	} {
+		var payload []byte
+		err := q.QueryRowContext(ctx, query, computerID).Scan(&payload)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		var receipt ComputerStorageCleanupQuarantine
+		if err := json.Unmarshal(payload, &receipt); err != nil {
+			return nil, err
+		}
+		return &receipt, nil
+	}
+	return nil, nil
 }
 
 func computerStorageResetRequestHash(request ComputerStorageResetRequest) (string, error) {
@@ -318,7 +341,7 @@ func (s *Store) ListNodeComputerStorageResetDirectives(ctx context.Context, iden
 	rows, err := s.db.QueryContext(ctx, `SELECT r.computer_id, r.bound_node_id, r.root_instance_id, r.job_id, r.intent_revision,
 		r.storage_id, r.old_generation, r.new_generation, r.disk_bytes, r.cleanup_fence, r.status
 		FROM computer_storage_resets r JOIN jobs j ON j.job_id=r.job_id
-		WHERE r.bound_node_id=? AND r.status IN ('reserved', 'prepared', 'published')
+		WHERE r.bound_node_id=? AND r.status IN ('reserved', 'prepared', 'published') AND r.cleanup_quarantine_json IS NULL
 		AND j.state IN (?, ?)
 		ORDER BY r.requested_ns, r.computer_id`, nodeID, contract.JobStopped, contract.JobFailed)
 	if err != nil {
@@ -440,6 +463,18 @@ func (s *Store) recordComputerStorageResetVerification(ctx context.Context, iden
 	}
 	if err := tx.Commit(); err != nil {
 		return internalError(err, "commit Computer Storage reset verification")
+	}
+	return nil
+}
+
+func validateComputerStorageCleanupQuarantine(receipt ComputerStorageCleanupQuarantine, computerID, storageID string,
+	storageGeneration int64, nodeID, bootSessionID, jobID string, removalGeneration uint64, cleanupFence string) error {
+	if receipt.Kind != "managed_volume_cleanup_quarantined" || receipt.ReceiptID == "" || receipt.VolumeKind != "computer_disk" ||
+		receipt.ComputerID != computerID || receipt.StorageID != storageID || receipt.StorageGeneration != storageGeneration ||
+		receipt.NodeID != nodeID || receipt.BootSessionID != bootSessionID || receipt.JobID != jobID ||
+		receipt.RemovalGeneration != removalGeneration || receipt.CleanupFence != cleanupFence ||
+		receipt.FailureReason != "operation_failed" || receipt.Attempts != 3 {
+		return protocolError(contract.ErrorInvalidRequest, "Computer Storage cleanup quarantine evidence does not match retirement authority")
 	}
 	return nil
 }
@@ -603,6 +638,43 @@ func (s *Store) AcknowledgeComputerStorageRetirement(ctx context.Context, identi
 	if currentRootInstanceID != reset.RootInstanceID {
 		return Computer{}, protocolError(contract.ErrorStaleFence,
 			"Computer Storage retirement managed-root authority changed")
+	}
+	if request.CleanupQuarantine != nil {
+		if reset.Status != "published" {
+			return Computer{}, protocolError(contract.ErrorStaleIntentRevision, "Computer Storage cleanup quarantine is not awaiting predecessor retirement")
+		}
+		if err := validateComputerStorageCleanupQuarantine(*request.CleanupQuarantine, computerID, reset.StorageID,
+			reset.OldGeneration, reset.BoundNodeID, request.BootSessionID, reset.JobID, request.RemovalGeneration, reset.CleanupFence); err != nil {
+			return Computer{}, err
+		}
+		payload, err := json.Marshal(request.CleanupQuarantine)
+		if err != nil {
+			return Computer{}, internalError(err, "encode Computer Storage cleanup quarantine")
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE computer_storage_resets SET cleanup_quarantine_json=?
+			WHERE computer_id=? AND intent_revision=? AND cleanup_quarantine_json IS NULL`, payload, computerID, reset.IntentRevision)
+		if err != nil {
+			return Computer{}, internalError(err, "record Computer Storage cleanup quarantine")
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return Computer{}, internalError(err, "inspect Computer Storage cleanup quarantine")
+		} else if affected == 0 {
+			var existing []byte
+			if err := tx.QueryRowContext(ctx, `SELECT cleanup_quarantine_json FROM computer_storage_resets WHERE computer_id=? AND intent_revision=?`, computerID, reset.IntentRevision).Scan(&existing); err != nil {
+				return Computer{}, internalError(err, "read Computer Storage cleanup quarantine replay")
+			}
+			if !bytes.Equal(existing, payload) {
+				return Computer{}, protocolError(contract.ErrorIdempotencyConflict, "Computer Storage cleanup quarantine replay differs from durable evidence")
+			}
+		}
+		computer, err := readComputerAuthority(ctx, tx, computerID, now)
+		if err != nil {
+			return Computer{}, internalError(err, "read quarantined Computer Storage cleanup")
+		}
+		if err := tx.Commit(); err != nil {
+			return Computer{}, internalError(err, "commit Computer Storage cleanup quarantine")
+		}
+		return computer, nil
 	}
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {

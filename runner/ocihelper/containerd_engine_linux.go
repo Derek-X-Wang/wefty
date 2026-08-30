@@ -1598,6 +1598,13 @@ func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request
 			return DeleteManagedVolumeResponse{}, errors.New("Computer disk deletion requires Storage and removal authority")
 		}
 		if err := engine.deleteComputerDisk(*request.ComputerStorage, *request.Removal); err != nil {
+			if request.QuarantineOnFailure && request.FailureAttempts > 0 {
+				receipt, quarantineErr := engine.quarantineComputerDiskCleanup(request)
+				if quarantineErr != nil {
+					return DeleteManagedVolumeResponse{}, errors.Join(err, quarantineErr)
+				}
+				return DeleteManagedVolumeResponse{Quarantine: &receipt}, nil
+			}
 			return DeleteManagedVolumeResponse{}, err
 		}
 		return DeleteManagedVolumeResponse{Deleted: true}, nil

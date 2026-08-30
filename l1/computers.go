@@ -90,28 +90,29 @@ type ComputerIntent struct {
 // Runtime state remains on CurrentJob; intent and identity survive projection
 // replacement.
 type Computer struct {
-	ComputerID              string                          `json:"computer_id"`
-	Name                    string                          `json:"name"`
-	PlacementNodeID         string                          `json:"placement_node_id"`
-	BoundNodeID             string                          `json:"bound_node_id,omitempty"`
-	Grants                  []ComputerGrant                 `json:"grants"`
-	StorageID               string                          `json:"storage_id"`
-	StorageGeneration       int64                           `json:"storage_generation"`
-	BackupCap               int64                           `json:"backup_cap"`
-	LastBackupOperation     *ComputerBackupOperationOutcome `json:"last_backup_operation,omitempty"`
-	DesiredDiskBytes        int64                           `json:"desired_disk_bytes"`
-	DesiredState            contract.ServiceDesiredState    `json:"desired_state"`
-	IntentRevision          int64                           `json:"intent_revision"`
-	AppliedRevision         int64                           `json:"applied_revision"`
-	CurrentJobID            string                          `json:"current_job_id"`
-	CurrentSpecRevision     int64                           `json:"current_spec_revision"`
-	ReconfigurationPhase    ComputerReconfigurationPhase    `json:"reconfiguration_phase"`
-	ReconfigurationRevision *int64                          `json:"reconfiguration_revision,omitempty"`
-	SubmitEnabled           bool                            `json:"submit_enabled"`
-	SubmitIntentRevision    int64                           `json:"submit_intent_revision"`
-	SubmitMaxInflight       int                             `json:"submit_max_inflight"`
-	SubmitPolicyRevision    int64                           `json:"submit_policy_revision"`
-	RemovalOutcome          string                          `json:"removal_outcome,omitempty"`
+	ComputerID               string                            `json:"computer_id"`
+	Name                     string                            `json:"name"`
+	PlacementNodeID          string                            `json:"placement_node_id"`
+	BoundNodeID              string                            `json:"bound_node_id,omitempty"`
+	Grants                   []ComputerGrant                   `json:"grants"`
+	StorageID                string                            `json:"storage_id"`
+	StorageGeneration        int64                             `json:"storage_generation"`
+	BackupCap                int64                             `json:"backup_cap"`
+	LastBackupOperation      *ComputerBackupOperationOutcome   `json:"last_backup_operation,omitempty"`
+	StorageCleanupQuarantine *ComputerStorageCleanupQuarantine `json:"storage_cleanup_quarantine,omitempty"`
+	DesiredDiskBytes         int64                             `json:"desired_disk_bytes"`
+	DesiredState             contract.ServiceDesiredState      `json:"desired_state"`
+	IntentRevision           int64                             `json:"intent_revision"`
+	AppliedRevision          int64                             `json:"applied_revision"`
+	CurrentJobID             string                            `json:"current_job_id"`
+	CurrentSpecRevision      int64                             `json:"current_spec_revision"`
+	ReconfigurationPhase     ComputerReconfigurationPhase      `json:"reconfiguration_phase"`
+	ReconfigurationRevision  *int64                            `json:"reconfiguration_revision,omitempty"`
+	SubmitEnabled            bool                              `json:"submit_enabled"`
+	SubmitIntentRevision     int64                             `json:"submit_intent_revision"`
+	SubmitMaxInflight        int                               `json:"submit_max_inflight"`
+	SubmitPolicyRevision     int64                             `json:"submit_policy_revision"`
+	RemovalOutcome           string                            `json:"removal_outcome,omitempty"`
 	// DisplayEndpoint remains explicitly null until an active private
 	// take-over front door has been published. It is never a placeholder URL.
 	DisplayEndpoint  *string                             `json:"display_endpoint"`
@@ -718,6 +719,10 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	computer.LastBackupOperation, err = readLastComputerBackupOperation(ctx, q, computerID)
 	if err != nil {
 		return Computer{}, fmt.Errorf("read last Computer Backup operation: %w", err)
+	}
+	computer.StorageCleanupQuarantine, err = readComputerStorageCleanupQuarantine(ctx, q, computerID)
+	if err != nil {
+		return Computer{}, fmt.Errorf("read Computer Storage cleanup quarantine: %w", err)
 	}
 	var displayEndpoint sql.NullString
 	err = q.QueryRowContext(ctx, `SELECT service_jobs.display_endpoint

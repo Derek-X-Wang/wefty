@@ -18,6 +18,20 @@ func resetReceipt(directive ComputerStorageResetDirective) ComputerStorageResetR
 		IntentRevision: directive.IntentRevision, CleanupFence: directive.CleanupFence, HelperGeneration: 1}
 }
 
+func TestComputerStorageCleanupQuarantineEvidenceIsAuthorityBound(t *testing.T) {
+	receipt := ComputerStorageCleanupQuarantine{Kind: "managed_volume_cleanup_quarantined", ReceiptID: "receipt",
+		VolumeKind: "computer_disk", ComputerID: "computer", StorageID: "storage", StorageGeneration: 1,
+		NodeID: "node", BootSessionID: "boot", JobID: "job", RemovalGeneration: 2, CleanupFence: "fence",
+		FailureReason: "operation_failed", Attempts: 3}
+	if err := validateComputerStorageCleanupQuarantine(receipt, "computer", "storage", 1, "node", "boot", "job", 2, "fence"); err != nil {
+		t.Fatal(err)
+	}
+	receipt.JobID = "other"
+	if err := validateComputerStorageCleanupQuarantine(receipt, "computer", "storage", 1, "node", "boot", "job", 2, "fence"); errorCode(err) != contract.ErrorInvalidRequest {
+		t.Fatalf("unbound cleanup quarantine error = %v", err)
+	}
+}
+
 func TestStorageResetAcknowledgementHashExcludesCurrentBootSession(t *testing.T) {
 	receipt := ComputerStorageResetReceipt{Kind: computerStorageResetReceiptKind, ReceiptID: "receipt",
 		ComputerID: "computer", StorageID: "storage", OldGeneration: 1, NewGeneration: 2,

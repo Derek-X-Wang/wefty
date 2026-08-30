@@ -47,6 +47,7 @@ const (
 	ComputerControlTakePath                   = "/wefty/control/take"
 	ComputerControlReleasePath                = "/wefty/control/release"
 	ComputerControlTokenHeader                = "X-Wefty-Control-Token"
+	ComputerPolicyRevisionHeader              = "X-Wefty-Policy-Revision"
 	ComputerRFBVersionBannerBytes             = 12
 	ComputerStartupReadinessTimeout           = 60 * time.Second
 	ComputerDevShmBytes                 int64 = 1 << 30

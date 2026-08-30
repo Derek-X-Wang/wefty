@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"slices"
 	"strconv"
@@ -504,6 +505,27 @@ type ManagedVolumeRemovalAuthority struct {
 	JobID             string
 	RemovalGeneration uint64
 	CleanupFence      string
+}
+
+type ManagedVolumeQuarantineReceipt struct {
+	Kind            string
+	ReceiptID       string
+	VolumeKind      ManagedVolumeKind
+	ComputerStorage ComputerStorage
+	Removal         ManagedVolumeRemovalAuthority
+	FailureReason   string
+	Attempts        int
+}
+
+type ManagedVolumeCleanupQuarantinedError struct {
+	Receipt ManagedVolumeQuarantineReceipt
+}
+
+func (failure *ManagedVolumeCleanupQuarantinedError) Error() string {
+	if failure == nil {
+		return "managed volume cleanup was quarantined"
+	}
+	return fmt.Sprintf("managed volume cleanup was quarantined after %d attempts (receipt %s)", failure.Receipt.Attempts, failure.Receipt.ReceiptID)
 }
 
 // ComputerStorageResetter prepares one detached Computer Storage successor.

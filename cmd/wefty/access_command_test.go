@@ -13,9 +13,48 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
+
+func TestTakeoverViewPolicyRetryIsTypedAndBounded(t *testing.T) {
+	t.Run("typed retry succeeds", func(t *testing.T) {
+		attempts := 0
+		session, err := retryTakeoverViewPolicyInstallation(t.Context(), time.Second, time.Millisecond,
+			func(context.Context) (*takeover.Session, error) {
+				attempts++
+				if attempts == 1 {
+					return nil, &takeover.ActionError{APIError: contract.APIError{Code: contract.ErrorStalePolicyRevision, Retryable: true}}
+				}
+				return &takeover.Session{}, nil
+			})
+		if err != nil || session == nil || attempts != 2 {
+			t.Fatalf("typed policy retry = session=%v attempts=%d err=%v", session, attempts, err)
+		}
+	})
+	t.Run("non matching error fails immediately", func(t *testing.T) {
+		attempts := 0
+		want := errors.New("permanent 403 control_not_authorized")
+		_, err := retryTakeoverViewPolicyInstallation(t.Context(), time.Second, time.Millisecond,
+			func(context.Context) (*takeover.Session, error) { attempts++; return nil, want })
+		if !errors.Is(err, want) || attempts != 1 {
+			t.Fatalf("permanent refusal = attempts=%d err=%v", attempts, err)
+		}
+	})
+	t.Run("deadline exhaustion returns typed refusal", func(t *testing.T) {
+		attempts := 0
+		_, err := retryTakeoverViewPolicyInstallation(t.Context(), 5*time.Millisecond, time.Millisecond,
+			func(context.Context) (*takeover.Session, error) {
+				attempts++
+				return nil, &takeover.ActionError{APIError: contract.APIError{Code: contract.ErrorStalePolicyRevision, Retryable: true}}
+			})
+		var actionErr *takeover.ActionError
+		if !errors.As(err, &actionErr) || actionErr.APIError.Code != contract.ErrorStalePolicyRevision || attempts < 2 {
+			t.Fatalf("exhausted typed retry = attempts=%d err=%v", attempts, err)
+		}
+	})
+}
 
 func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
 	network := plain.NewNetwork()

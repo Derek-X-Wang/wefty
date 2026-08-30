@@ -152,6 +152,10 @@ func (controller *storageCopyController) retirePredecessor(ctx context.Context, 
 			BootSessionID: controller.bootSessionID, JobID: directive.JobID,
 			RemovalGeneration: generation, CleanupFence: directive.CleanupFence},
 	}); err != nil {
+		if acknowledgement, quarantined := storageCleanupQuarantineAcknowledgement(err, directive.RootInstanceID); quarantined {
+			_, acknowledgementErr := controller.client.AcknowledgeComputerRestoreRetirement(ctx, directive.DestinationComputerID, acknowledgement)
+			return errors.Join(err, acknowledgementErr)
+		}
 		return fmt.Errorf("delete restore predecessor through shared removal machinery: %w", err)
 	}
 	manifest := workloadrunner.RuntimeResourceManifest{Version: 1, RuntimeKind: contract.JobKindOCI,

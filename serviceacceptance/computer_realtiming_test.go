@@ -117,7 +117,8 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	recordComputerAuthority(receipt, ready)
 	diskEvidence := inspectLiveComputerDisk(t, ready)
 	policy := bootstrapComputerAcceptanceAdmin(t, harness)
-	adminView := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-admin", "linux-admin-device-a", true)
+	adminView := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-admin", "linux-admin-device-a", takeoverViewRetryStalePolicy)
+	receipt.TakeoverRetryStderr = append(receipt.TakeoverRetryStderr, adminView.toleratedStderr...)
 	adminTake := runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-admin", "linux-admin-device-a",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", adminView.tokenFile)
 	adminRelease := contract.ComputerControlReceipt{}
@@ -150,14 +151,16 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		linuxComputerFabricIdentity{Role: "administrator", FabricID: policy.Admins[0].FabricID, UserID: "linux-admin", DeviceID: "linux-admin-device-a"},
 		linuxComputerFabricIdentity{Role: "viewer", FabricID: viewGrant.Grant.FabricID, UserID: "linux-viewer", DeviceID: "linux-viewer-device"})
 	inputIsolation := proveLiveViewInputIsolation(t, harness, ready, "linux-viewer", "linux-viewer-device")
-	viewerView := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-viewer", "linux-viewer-device", true)
+	viewerView := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-viewer", "linux-viewer-device", takeoverViewRetryStalePolicy)
+	receipt.TakeoverRetryStderr = append(receipt.TakeoverRetryStderr, viewerView.toleratedStderr...)
 	viewerTakeDenied := runComputerCLIPersonExpectError(t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", viewerView.tokenFile)
 	controlGrant := runComputerCLIPerson[l1.ComputerGrantMutationResult](t, harness, "linux-admin", "linux-admin-device-a",
 		"services", "grant", ready.ComputerID, "linux-viewer", "--permission", "control",
 		"--policy-revision", fmt.Sprint(viewGrant.Grant.PolicyRevision), "--idempotency-key", "linux-native-control-grant")
 	viewerView.stop(t)
-	viewerControl := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-viewer", "linux-viewer-device", true)
+	viewerControl := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-viewer", "linux-viewer-device", takeoverViewRetryStalePolicy)
+	receipt.TakeoverRetryStderr = append(receipt.TakeoverRetryStderr, viewerControl.toleratedStderr...)
 	viewerTake := runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", viewerControl.tokenFile)
 	viewerRelease := contract.ComputerControlReceipt{}
@@ -170,7 +173,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	}
 	viewerTake = runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", viewerControl.tokenFile)
-	adminOverrideView := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-admin", "linux-admin-device-b", false)
+	adminOverrideView := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-admin", "linux-admin-device-b", takeoverViewRetryNone)
 	adminOverride := runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-admin", "linux-admin-device-b",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", adminOverrideView.tokenFile)
 	revoked := runComputerCLIPerson[l1.ComputerGrantMutationResult](t, harness, "linux-admin", "linux-admin-device-a",
@@ -348,7 +351,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	if attestOutput.CustodyExport == nil || !attestOutput.CustodyExport.OperatorAttestedDeleted {
 		t.Fatalf("Computer custody attestation result = %#v", attestOutput)
 	}
-	staleCredential := startTakeoverViewCLI(t, harness, reimaged.ComputerID, "linux-admin", "linux-admin-device-a", false)
+	staleCredential := startTakeoverViewCLI(t, harness, reimaged.ComputerID, "linux-admin", "linux-admin-device-a", takeoverViewRetryNone)
 	restoreBaseline := reimaged.StorageGeneration
 	restoreOutput := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "restore", reimaged.ComputerID, backup.BackupID,
 		"--keep-old-as-backup", "--expect-current", "--idempotency-key", "linux-native-restore", "--wait", "4m")
@@ -639,22 +642,35 @@ func runComputerCLIPersonExpectError(t *testing.T, harness *acceptanceHarness, u
 }
 
 type takeoverViewProcess struct {
-	tokenFile string
-	admitted  bool
-	cancel    context.CancelFunc
-	done      chan error
-	stdout    bytes.Buffer
-	stderr    bytes.Buffer
+	tokenFile       string
+	admitted        bool
+	cancel          context.CancelFunc
+	done            chan error
+	stdout          bytes.Buffer
+	stderr          bytes.Buffer
+	toleratedStderr []string
 }
 
-func startTakeoverViewCLI(t *testing.T, harness *acceptanceHarness, computerID, userID, deviceID string, toleratePolicyInstallationRace bool) *takeoverViewProcess {
+type takeoverViewRetryMode string
+
+const (
+	takeoverViewRetryNone            takeoverViewRetryMode = "none"
+	takeoverViewRetryStalePolicy     takeoverViewRetryMode = "stale_policy_revision"
+	takeoverViewHarnessRetryAttempts                       = 3
+	takeoverViewHarnessRetryWindow                         = 6 * time.Second
+)
+
+func startTakeoverViewCLI(t *testing.T, harness *acceptanceHarness, computerID, userID, deviceID string, retryMode takeoverViewRetryMode) *takeoverViewProcess {
 	t.Helper()
 	view := &takeoverViewProcess{tokenFile: filepath.Join(t.TempDir(), "takeover-session.json"), done: make(chan error, 1)}
 	ctx, cancel := context.WithCancel(t.Context())
 	view.cancel = cancel
 	deadline := time.Now().Add(30 * time.Second)
+	retryDeadline := time.Now().Add(takeoverViewHarnessRetryWindow)
+	attempts := 0
 	running := false
 	for time.Now().Before(deadline) {
+		attempts++
 		stderrStart := view.stderr.Len()
 		command := exec.CommandContext(ctx, weftyBinaryPath, computerCLIArguments(harness, userID, deviceID,
 			"services", "takeover", "view", computerID, "--session-token-file", view.tokenFile)...)
@@ -673,7 +689,9 @@ func startTakeoverViewCLI(t *testing.T, harness *acceptanceHarness, computerID, 
 				// L1 availability is durable discovery, while the front door is
 				// live authority. A grant may be visible before the hosting agent
 				// acknowledges and installs that policy revision.
-				if toleratePolicyInstallationRace && strings.Contains(attemptStderr, "expected handshake response status code 101 but got 403") {
+				if retryMode == takeoverViewRetryStalePolicy && attempts < takeoverViewHarnessRetryAttempts && time.Now().Before(retryDeadline) &&
+					strings.Contains(attemptStderr, string(contract.ErrorStalePolicyRevision)) {
+					view.toleratedStderr = append(view.toleratedStderr, attemptStderr)
 					time.Sleep(25 * time.Millisecond)
 					break
 				}

@@ -114,8 +114,15 @@ is neither a bounded `Delete` cancellation/deadline nor any
 `DeleteManagedVolume` failure, or an explicit image `engine_loss` fact. A typed
 `Delete` `deadline_exceeded` or `canceled` fact is attempt-scoped cleanup
 failure. Every `DeleteManagedVolume` failure is scoped to its independently
-authorized durable resource and removal operation. Neither invalidates the
-live session.
+authorized durable resource and removal operation. An `operation_failed`
+Computer-disk deletion is retried at most three times with 100 ms between
+attempts. If the third attempt still fails, the helper durably writes an
+authority-bound `managed_volume_cleanup_quarantined` receipt, fences future
+attachment of that Storage generation, and returns the receipt to the agent.
+The agent records it on the standing reset/restore operation so Computer status
+surfaces the failure and L1 stops redispatching it; recovery requires a later
+helper sweep/operator workflow rather than an unbounded silent loop. Neither a
+retry nor quarantine invalidates the live helper session.
 Caller cancellation, deadlines owned by the
 caller, `sweep_required`, validation/policy refusals, digest disagreement, and
 unknown agent errors never manufacture runtime-loss evidence. A stop-specific
@@ -725,9 +732,14 @@ separate operation connections for image/watch streams so backpressure cannot
 starve session authority, and it locally verifies the returned helper checksum
 against a non-empty installed expectation before exposing the session.
 
-Prior-boot removal consumes a matching sweep attempt once. The match includes
-node, job, class, prior boot, attempt, fence, and removal generation, and the
-positive receipt is bound to both the sweep epoch and helper generation.
+Prior-boot removal consumes positive sweep evidence once. A swept attempt still
+requires node, job, class, prior boot, attempt, fence, and removal generation.
+When an older helper already reaped that attempt, a verified-empty replacement
+sweep may omit the attempt only if `PriorBootSessionsSeen` contains the removal
+intent's prior boot. Both forms remain bound to the sweep epoch and helper
+generation; a bare verified-empty sweep is insufficient. Legacy manifest
+reconstruction and replacement-sweep attempt recovery continue to require the
+complete authority match.
 
 When native OCI is configured, the production agent opens a boot barrier and
 installs the OCI adapter as one unit. It advertises `kind:oci`, `cgroup_v2`, and

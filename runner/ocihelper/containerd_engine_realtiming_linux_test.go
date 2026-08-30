@@ -888,14 +888,11 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 	case <-time.After(15 * time.Second):
 		t.Fatal("reference Computer agent service did not stop")
 	}
-	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: authority}); err != nil || !receipt.RuntimeQuiesced {
-		t.Fatalf("reference Computer runtime cleanup = %+v err=%v", receipt, err)
-	}
-	if err := adapter.FinalizeManagedVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
+	if receipt, err := adapter.ReapAndFinalizeManagedVolumes(ctx, workloadrunner.ReapRequest{Authority: authority}, workloadrunner.ManagedVolumeFinalizationRequest{
 		Authority: authority, Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
 		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "reference-" + identity + "-computer-cleanup"},
-	}); err != nil {
-		t.Fatal(err)
+	}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("reference Computer runtime and disk cleanup = %+v err=%v", receipt, err)
 	}
 	return referenceComputerEvidence{startedToReadyElapsed: readyAt.Sub(startedAt), atomicPublication: true, lossRecovery: true}
 }
@@ -987,7 +984,17 @@ func assertReferenceComputerWireNegatives(t *testing.T, ctx context.Context, ses
 		if errors.As(err, &timeout) && timeout.Timeout() {
 			t.Fatalf("reference Computer did not reject a text frame before the probe deadline: %v", err)
 		}
+		if !ocihelper.ConformantComputerImageTextFrameRejection(err) {
+			status := websocket.CloseStatus(err)
+			t.Fatalf("reference Computer text-frame rejection = %v status=%v, want unsupported-data or EOF", err, status)
+		}
 	}
+	live, err := openReferenceComputerEndpoint(probeContext, session, authority, contract.ComputerDisplayEndpointView,
+		contract.ComputerDisplayWebSocketPath, []string{contract.ComputerDisplayWebSocketSubprotocol})
+	if err != nil {
+		t.Fatalf("reference Computer display was not live after text-frame rejection: %v", err)
+	}
+	live.CloseNow()
 }
 
 func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, reference, digest string) bool {

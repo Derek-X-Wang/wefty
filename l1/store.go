@@ -927,6 +927,12 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	if err := s.ensureColumn(ctx, "computer_storage_resets", "resume_desired_running", "INTEGER NOT NULL DEFAULT 0 CHECK(resume_desired_running IN (0, 1))"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "computer_storage_resets", "cleanup_quarantine_json", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "cleanup_quarantine_json", "BLOB"); err != nil {
+		return err
+	}
 	if err := s.migrateComputerResetConstraints(ctx); err != nil {
 		return err
 	}

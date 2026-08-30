@@ -1676,6 +1676,17 @@ func (adapter *Adapter) ReapPriorBoot(_ context.Context, request workloadrunner.
 	if !receipt.VerifiedAbsent {
 		return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
 	}
+	matchedAttempt := false
+	for _, attempt := range receipt.Attempts {
+		if attempt.NodeID == request.NodeID && attempt.JobID == request.JobID && attempt.PriorBootSessionID == request.PriorBootSessionID {
+			matchedAttempt = true
+			break
+		}
+	}
+	priorBootSeen := slices.Contains(receipt.PriorBootSessionsSeen, request.PriorBootSessionID)
+	if !matchedAttempt && !priorBootSeen {
+		return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
+	}
 	key := priorBootSweepEvidenceKey{epoch: receipt.SweepEpoch, helper: receipt.HelperSession, jobID: request.JobID, priorBootSessionID: request.PriorBootSessionID}
 	adapter.mu.Lock()
 	defer adapter.mu.Unlock()
@@ -1722,20 +1733,76 @@ func (adapter *Adapter) FinalizeManagedVolumes(ctx context.Context, request work
 			}
 			input = ocihelper.DeleteManagedVolumeRequest{Kind: ocihelper.ManagedVolumeComputerDisk,
 				ComputerStorage: &ocihelper.ComputerStorageReference{ComputerID: volume.ComputerStorage.ComputerID, StorageID: volume.ComputerStorage.StorageID,
-					StorageGeneration: volume.ComputerStorage.StorageGeneration, IntentRevision: volume.ComputerStorage.IntentRevision},
+					StorageGeneration: volume.ComputerStorage.StorageGeneration, IntentRevision: volume.ComputerStorage.IntentRevision, DiskBytes: volume.ComputerStorage.DiskBytes},
 				Removal: &ocihelper.ManagedVolumeRemovalAuthority{NodeID: request.Removal.NodeID, BootSessionID: request.Removal.BootSessionID, JobID: request.Removal.JobID, RemovalGeneration: request.Removal.RemovalGeneration, CleanupFence: request.Removal.CleanupFence}}
 		default:
 			return fmt.Errorf("unsupported runtime-managed volume finalization: %+v", volume)
 		}
-		response, err := session.DeleteManagedVolume(ctx, input)
+		response, err := deleteManagedVolumeWithRecovery(ctx, session, input)
 		if err != nil {
 			return err
+		}
+		if response.Quarantine != nil {
+			quarantine := response.Quarantine
+			return &workloadrunner.ManagedVolumeCleanupQuarantinedError{Receipt: workloadrunner.ManagedVolumeQuarantineReceipt{
+				Kind: quarantine.Kind, ReceiptID: quarantine.ReceiptID, VolumeKind: workloadrunner.ManagedVolumeKind(quarantine.VolumeKind),
+				ComputerStorage: workloadrunner.ComputerStorage{ComputerID: quarantine.ComputerStorage.ComputerID, StorageID: quarantine.ComputerStorage.StorageID,
+					StorageGeneration: quarantine.ComputerStorage.StorageGeneration, IntentRevision: quarantine.ComputerStorage.IntentRevision, DiskBytes: quarantine.ComputerStorage.DiskBytes},
+				Removal: workloadrunner.ManagedVolumeRemovalAuthority{NodeID: quarantine.Removal.NodeID, BootSessionID: quarantine.Removal.BootSessionID,
+					JobID: quarantine.Removal.JobID, RemovalGeneration: quarantine.Removal.RemovalGeneration, CleanupFence: quarantine.Removal.CleanupFence},
+				FailureReason: string(quarantine.FailureReason), Attempts: quarantine.Attempts,
+			}}
 		}
 		if !response.Deleted {
 			return errors.New("OCI helper did not positively verify handoff-volume deletion")
 		}
 	}
 	return nil
+}
+
+const (
+	managedVolumeDeleteAttempts      = 3
+	managedVolumeDeleteRetryInterval = 100 * time.Millisecond
+)
+
+func deleteManagedVolumeWithRecovery(ctx context.Context, session *ocihelper.Session, request ocihelper.DeleteManagedVolumeRequest) (ocihelper.DeleteManagedVolumeResponse, error) {
+	for attempt := 1; attempt <= managedVolumeDeleteAttempts; attempt++ {
+		request.QuarantineOnFailure = request.Kind == ocihelper.ManagedVolumeComputerDisk && attempt == managedVolumeDeleteAttempts
+		if request.Kind == ocihelper.ManagedVolumeComputerDisk {
+			request.FailureAttempts = attempt
+		}
+		response, err := session.DeleteManagedVolume(ctx, request)
+		if err == nil {
+			return response, nil
+		}
+		var rpcErr *ocihelper.RPCError
+		if !errors.As(err, &rpcErr) || rpcErr.Code != ocihelper.CodeEngineFailure || rpcErr.EngineFailure == nil ||
+			rpcErr.EngineFailure.Operation != ocihelper.MethodDeleteVolume || rpcErr.EngineFailure.Reason != ocihelper.EngineFailureOperationFailed ||
+			attempt == managedVolumeDeleteAttempts {
+			return ocihelper.DeleteManagedVolumeResponse{}, err
+		}
+		timer := time.NewTimer(managedVolumeDeleteRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ocihelper.DeleteManagedVolumeResponse{}, context.Cause(ctx)
+		case <-timer.C:
+		}
+	}
+	return ocihelper.DeleteManagedVolumeResponse{}, errors.New("managed-volume deletion retry exhausted")
+}
+
+// ReapAndFinalizeManagedVolumes preserves the Computer cleanup barrier: the
+// attempt must be positively quiesced before an attached disk is finalized.
+func (adapter *Adapter) ReapAndFinalizeManagedVolumes(ctx context.Context, reap workloadrunner.ReapRequest, finalize workloadrunner.ManagedVolumeFinalizationRequest) (workloadrunner.ReapReceipt, error) {
+	receipt, err := adapter.ReapAndVerify(ctx, reap)
+	if err != nil {
+		return workloadrunner.ReapReceipt{}, err
+	}
+	if err := adapter.FinalizeManagedVolumes(ctx, finalize); err != nil {
+		return workloadrunner.ReapReceipt{}, err
+	}
+	return receipt, nil
 }
 
 func (adapter *Adapter) ResetComputerStorage(ctx context.Context, request workloadrunner.ComputerStorageResetRequest) (workloadrunner.ComputerStorageResetReceipt, error) {

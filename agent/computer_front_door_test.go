@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +21,46 @@ import (
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/coder/websocket"
 )
+
+func TestComputerFrontDoorReturnsTypedStalePolicyRefusal(t *testing.T) {
+	_, _, _, _, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantNone)
+	defer server.Close()
+	header := http.Header{}
+	header.Set(contract.ComputerPolicyRevisionHeader, "2")
+	connection, response, err := websocket.Dial(t.Context(), "ws"+server.URL[len("http"):]+computerWebSocketPath,
+		&websocket.DialOptions{Subprotocols: []string{computerWebSocketSubprotocol}, HTTPHeader: header})
+	if connection != nil {
+		connection.CloseNow()
+		t.Fatal("stale policy refusal upgraded the connection")
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("stale policy refusal = status=%v err=%v", response, err)
+	}
+	defer response.Body.Close()
+	body, readErr := io.ReadAll(response.Body)
+	var failure contract.ComputerControlErrorResponse
+	if readErr != nil || json.Unmarshal(body, &failure) != nil || failure.Error.Code != contract.ErrorStalePolicyRevision || !failure.Error.Retryable {
+		t.Fatalf("stale policy refusal body = %s readErr=%v decoded=%+v", body, readErr, failure)
+	}
+}
+
+func TestComputerFrontDoorKeepsPermanentDenialNonRetryable(t *testing.T) {
+	_, _, _, _, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantNone)
+	defer server.Close()
+	header := http.Header{}
+	header.Set(contract.ComputerPolicyRevisionHeader, "1")
+	_, response, err := websocket.Dial(t.Context(), "ws"+server.URL[len("http"):]+computerWebSocketPath,
+		&websocket.DialOptions{Subprotocols: []string{computerWebSocketSubprotocol}, HTTPHeader: header})
+	if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("permanent policy refusal = status=%v err=%v", response, err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	var failure contract.ComputerControlErrorResponse
+	if json.Unmarshal(body, &failure) != nil || failure.Error.Code != contract.ErrorControlNotAuthorized || failure.Error.Retryable {
+		t.Fatalf("permanent policy refusal body = %s decoded=%+v", body, failure)
+	}
+}
 
 func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.T) {
 	_, cache, auditor, controlDials, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantControl)
