@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -163,6 +164,10 @@ CREATE TABLE IF NOT EXISTS spool_acknowledgements (
   sequence INTEGER NOT NULL,
   PRIMARY KEY(attempt_id, stream)
 );
+	CREATE TABLE IF NOT EXISTS agent_secrets (
+	  name TEXT PRIMARY KEY,
+	  value BLOB NOT NULL
+	);
 	CREATE TABLE IF NOT EXISTS spool_removals (
 	  job_id TEXT PRIMARY KEY,
 	  runtime_kind TEXT NOT NULL,
@@ -247,6 +252,38 @@ WHERE phase=? AND absence_attestation_json IS NULL`, runtimeRemovalQuarantined, 
 		return fmt.Errorf("agent: migrate pre-attestation runtime removals: %w", err)
 	}
 	return nil
+}
+
+func (spool *logSpool) loadOrCreateSecret(ctx context.Context, name string, size int) ([]byte, error) {
+	if name == "" || size <= 0 {
+		return nil, errors.New("agent: durable secret identity and size are required")
+	}
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var value []byte
+	err = tx.QueryRowContext(ctx, "SELECT value FROM agent_secrets WHERE name=?", name).Scan(&value)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		value = make([]byte, size)
+		if _, err := rand.Read(value); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO agent_secrets(name, value) VALUES(?, ?)", name, value); err != nil {
+			return nil, err
+		}
+	}
+	if len(value) != size {
+		return nil, fmt.Errorf("agent: durable secret %q has %d bytes, want %d", name, len(value), size)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), value...), nil
 }
 
 func ensureLogSpoolColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {

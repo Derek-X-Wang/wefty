@@ -108,20 +108,21 @@ type Agent struct {
 	outbox              *evidenceOutbox
 	// logSpool is a compatibility view used by existing package tests. The
 	// process-lifetime evidenceOutbox is its sole owner.
-	logSpool            *logSpool
-	runtimes            workloadRuntimeSet
-	managedResource     managedResourceManager
-	outputSinkFactory   OutputSinkFactory
-	handoffs            *handoffManager
-	logf                func(string, ...any)
-	clock               Clock
-	observer            *lifecycleObserver
-	capabilities        *capabilityState
-	attemptDeadman      AttemptDeadmanRenewer
-	ociBridgeBinder     workloadrunner.WorkflowBridgeBinder
-	computerTokens      ComputerTokenMinter
-	computerTokenCloser interface{ Close() }
-	nodeLock            nodeLock
+	logSpool              *logSpool
+	runtimes              workloadRuntimeSet
+	managedResource       managedResourceManager
+	outputSinkFactory     OutputSinkFactory
+	handoffs              *handoffManager
+	logf                  func(string, ...any)
+	clock                 Clock
+	observer              *lifecycleObserver
+	capabilities          *capabilityState
+	attemptDeadman        AttemptDeadmanRenewer
+	ociBridgeBinder       workloadrunner.WorkflowBridgeBinder
+	computerTokens        ComputerTokenMinter
+	computerTokenCloser   interface{ Close() }
+	computerControlTokens *computerControlTokenCodec
+	nodeLock              nodeLock
 }
 
 func New(config Config) (*Agent, error) {
@@ -232,6 +233,20 @@ func New(config Config) (*Agent, error) {
 		logRetryInterval,
 	)
 	if err != nil {
+		_ = stableNodeLock.Close()
+		client.Close()
+		return nil, err
+	}
+	controlTokenKey, err := outbox.spool.loadOrCreateSecret(context.Background(), computerControlTokenKeyName, computerControlTokenKeySize)
+	if err != nil {
+		_ = outbox.Close()
+		_ = stableNodeLock.Close()
+		client.Close()
+		return nil, fmt.Errorf("agent: load Computer control token key: %w", err)
+	}
+	computerControlTokens, err := newComputerControlTokenCodec(controlTokenKey)
+	if err != nil {
+		_ = outbox.Close()
 		_ = stableNodeLock.Close()
 		client.Close()
 		return nil, err
@@ -367,7 +382,8 @@ func New(config Config) (*Agent, error) {
 		attemptDeadman:  config.AttemptDeadman,
 		ociBridgeBinder: config.OCIWorkflowBridgeBinder,
 		computerTokens:  computerTokens, computerTokenCloser: computerTokenCloser,
-		nodeLock: stableNodeLock,
+		computerControlTokens: computerControlTokens,
+		nodeLock:              stableNodeLock,
 	}, nil
 }
 
@@ -506,6 +522,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		runtimeReaped:              a.recordRuntimeReap,
 		attemptDeadman:             a.attemptDeadman,
 		computerTokens:             a.computerTokens,
+		computerControlTokens:      a.computerControlTokens,
 		computerHostBridgeFallback: a.ociBridgeBinder != nil,
 	})
 }

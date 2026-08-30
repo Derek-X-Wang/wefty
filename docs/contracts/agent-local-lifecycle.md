@@ -442,6 +442,20 @@ All other admission failures return immediately, and the native acceptance
 harness permits at most three typed stale-policy process attempts within a
 six-second sub-window while retaining each tolerated stderr in its receipt.
 
+The session-bound control bearer is authenticated by a Node-durable local key
+and binds the exact Computer, Storage identity and generation, attempt, Fabric
+person and device, admission authority, and policy revision that issued it.
+The sideband returns 401 for malformed bearers, bearers not issued by that Node
+lineage, and identity mismatches. An authentic lineage bearer with no matching
+live session is terminal by default and returns HTTP 410
+`takeover_session_ended` without consulting Controller tenure or admitting a
+replacement session. Its synchronous `ComputerControlReceipt` reports
+`session_end_reason=attempt_authority_lost`; an in-process close observation
+sharpens that reason (for example to `revoked`) and, for policy revocation,
+reports the installed revoking policy revision. View-only admission remains
+ineligible to take and returns `control_not_authorized` even after its session
+ends, so terminal recognition does not expand control authority.
+
 Take-over termination force-closes the client, `view`, and any active `control`
 WebSockets before invoking their handshake-capable `net.Conn` wrappers, so a
 peer close frame and goroutine scheduling cannot extend the authority boundary.

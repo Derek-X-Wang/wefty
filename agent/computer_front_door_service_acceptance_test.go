@@ -72,8 +72,9 @@ func TestServiceAcceptanceComputerFrontDoorRealProcessAuthorityLoss(t *testing.T
 	}
 	frontDoor, err := newComputerFrontDoor(computerFrontDoorConfig{
 		authorityContext: authority, fabric: identityFabric, authorizer: cache, auditor: auditor,
-		computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1",
-		dial: dialBackend,
+		computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
+		fencingToken: "fence-1",
+		dial:         dialBackend,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -164,8 +165,9 @@ func TestServiceAcceptanceControllerTenureRealProcessAuthorityLoss(t *testing.T)
 	}
 	frontDoor, err := newComputerFrontDoor(computerFrontDoorConfig{
 		authorityContext: authority, fabric: identityFabric, authorizer: cache, auditor: auditor,
-		computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1",
-		dial: dialBackend, controlTenure: tenure,
+		computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
+		fencingToken: "fence-1",
+		dial:         dialBackend, controlTenure: tenure,
 	})
 	if err != nil {
 		t.Fatal(err)

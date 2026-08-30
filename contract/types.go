@@ -77,7 +77,9 @@ type ComputerControlReceipt struct {
 	OverrideDisplacedSessionID string                     `json:"override_displaced_session_id,omitempty"`
 	HumanDriving               bool                       `json:"human_driving"`
 	SignalStayedTrue           bool                       `json:"signal_stayed_true"`
-	SessionEndReason           string                     `json:"session_end_reason,omitempty"`
+	// SessionEndReason is present only when a session-bound action observes
+	// terminal authority; it uses the durable take-over reason vocabulary.
+	SessionEndReason string `json:"session_end_reason,omitempty"`
 }
 
 var ociReservedEnvironmentNames = [...]string{

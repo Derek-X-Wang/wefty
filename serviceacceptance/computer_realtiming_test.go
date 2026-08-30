@@ -1293,37 +1293,7 @@ func (submission *liveComputerPausedSubmission) finish(t *testing.T) int {
 }
 
 func observationHasPointer(observation liveInputObservation, x, y int) bool {
-	for _, point := range observation.PointerHistory {
-		if point[0] == x && point[1] == y {
-			return true
-		}
-	}
-	return false
-}
-
-func freshPointerSentinels(observation liveInputObservation) ([2]int, [2]int) {
-	// PointerHistory is cumulative and already contains conformance-probe input.
-	// Choose this proof's coordinates after reading that baseline so an older
-	// control event cannot be attributed to the current view-only session.
-	candidates := [...][2]int{{313, 257}, {677, 389}, {853, 521}, {419, 683}}
-	fresh := make([][2]int, 0, 2)
-	for _, point := range candidates {
-		if !observationHasPointer(observation, point[0], point[1]) {
-			fresh = append(fresh, point)
-			if len(fresh) == 2 {
-				return fresh[0], fresh[1]
-			}
-		}
-	}
-	return [2]int{}, [2]int{}
-}
-
-func TestFreshPointerSentinelsIgnorePriorConformanceInput(t *testing.T) {
-	observation := liveInputObservation{PointerHistory: [][2]int{{211, 173}, {947, 611}, {313, 257}}}
-	view, control := freshPointerSentinels(observation)
-	if view != [2]int{677, 389} || control != [2]int{853, 521} {
-		t.Fatalf("fresh pointer sentinels = %v, %v", view, control)
-	}
+	return pointerHistoryHas(observation.PointerHistory, x, y)
 }
 
 func proveLiveViewInputIsolation(t *testing.T, harness *acceptanceHarness, computer l1.Computer, viewerUser, viewerDevice string) bool {
@@ -1332,7 +1302,7 @@ func proveLiveViewInputIsolation(t *testing.T, harness *acceptanceHarness, compu
 		t.Fatal("Computer omitted its live display endpoint")
 	}
 	before := readLiveInputObservation(t, computer.CurrentJobID)
-	viewPointer, controlPointer := freshPointerSentinels(before)
+	viewPointer, controlPointer := freshPointerSentinels(before.PointerHistory)
 	if viewPointer == ([2]int{}) || controlPointer == ([2]int{}) {
 		t.Fatal("Computer input history exhausted the isolation sentinels")
 	}

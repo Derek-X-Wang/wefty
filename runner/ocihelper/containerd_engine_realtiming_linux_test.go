@@ -1067,12 +1067,13 @@ func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, 
 			Argv: []string{"/bin/sh", "-c", `if test -f /wefty/service/home/wefty/.config/chromium/wefty-profile-marker; then
   test "$(cat /wefty/service/home/wefty/.config/chromium/wefty-profile-marker)" = persistent-profile
   test "$(cat /wefty/service/home/wefty/.config/chromium/wefty-sign-in-marker)" = persistent-sign-in
-  test ! -e /tmp/wefty-attempt-marker
+  # Computer /tmp is tmpfs, so only this distinct root path proves rootfs discard.
+  test ! -e /wefty-computer-rootfs-restart-witness
 else
   mkdir -p /wefty/service/home/wefty/.config/chromium
   printf persistent-profile > /wefty/service/home/wefty/.config/chromium/wefty-profile-marker
   printf persistent-sign-in > /wefty/service/home/wefty/.config/chromium/wefty-sign-in-marker
-  printf attempt-local > /tmp/wefty-attempt-marker
+  printf attempt-local > /wefty-computer-rootfs-restart-witness
   exit 17
 fi`},
 			Computer: &contract.OCIComputerSpec{Display: contract.OCIComputerDisplaySpec{Protocol: contract.ComputerDisplayProtocolRFBWebSocketV1}, DiskBytes: 32 << 20}, Limits: &contract.OCILimits{MemoryBytes: &memory}}}}

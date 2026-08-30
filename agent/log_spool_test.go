@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,8 +9,52 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
+
+func TestComputerControlTokenKeyPersistsAcrossAgentRestart(t *testing.T) {
+	directory := t.TempDir()
+	spool := openTestLogSpool(t, directory, "node-control-token", 1024)
+	keyBefore, err := spool.loadOrCreateSecret(t.Context(), computerControlTokenKeyName, computerControlTokenKeySize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	spool = openTestLogSpool(t, directory, "node-control-token", 1024)
+	defer spool.Close()
+	keyAfter, err := spool.loadOrCreateSecret(t.Context(), computerControlTokenKeyName, computerControlTokenKeySize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(keyBefore, keyAfter) {
+		t.Fatal("Computer control token key changed across durable spool reopen")
+	}
+	issuer, err := newComputerControlTokenCodec(keyBefore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := newComputerControlTokenCodec(keyAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := fabric.Identity{FabricID: "fabric-1", UserID: "person-1", DeviceID: "device-1"}
+	token, err := issuer.issue(computerControlTokenClaims{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1,
+		AttemptID: "attempt-1", FabricID: identity.FabricID, UserID: identity.UserID, DeviceID: identity.DeviceID,
+		CanTake: true, PolicyRevision: 1, Nonce: "nonce-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims, ok := verifier.authenticate(token, "computer-1", "storage-1", identity); !ok || claims.AttemptID != "attempt-1" ||
+		claims.StorageGeneration != 1 {
+		t.Fatalf("reopened token verifier = ok=%t claims=%+v", ok, claims)
+	}
+	if _, ok := verifier.authenticate(token, "computer-1", "different-storage", identity); ok {
+		t.Fatal("Computer control token crossed its Storage lineage")
+	}
+}
 
 func TestLogSpoolPersistsPendingEventsAndAcknowledgementHighWater(t *testing.T) {
 	directory := t.TempDir()
