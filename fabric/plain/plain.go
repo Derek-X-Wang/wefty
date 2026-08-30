@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -27,12 +28,23 @@ type Network struct {
 }
 
 const (
-	identityMagic   = "WEFTYPLAIN1"
-	maxIdentitySize = 64 << 10
+	identityMagic       = "WEFTYPLAIN1"
+	maxIdentitySize     = 64 << 10
+	FabricIDEnvironment = "WEFTY_PLAIN_FABRIC_ID"
 )
 
-// NewNetwork creates an isolated localhost fabric network.
+// NewNetwork creates an isolated localhost fabric network. Test harnesses
+// whose participants run in separate processes may set FabricIDEnvironment
+// so every process projects the same development-only Fabric authority.
 func NewNetwork() *Network {
+	fabricID := os.Getenv(FabricIDEnvironment)
+	if fabricID != "" {
+		return &Network{
+			names:    make(map[string]string),
+			peers:    make(map[string]fabric.Identity),
+			fabricID: fabricID,
+		}
+	}
 	identity := make([]byte, 32)
 	if _, err := rand.Read(identity); err != nil {
 		panic(fmt.Sprintf("plain fabric: generate network identity: %v", err))

@@ -75,6 +75,19 @@ func TestEchoWithInjectedIdentity(t *testing.T) {
 	}
 }
 
+func TestFabricIDEnvironmentJoinsSeparateProcessNetworks(t *testing.T) {
+	t.Setenv(FabricIDEnvironment, "plain-linux-computer-acceptance")
+	first := NewNetwork()
+	second := NewNetwork()
+	if first.fabricID != second.fabricID || first.fabricID != "plain-linux-computer-acceptance" {
+		t.Fatalf("plain Fabric IDs = %q and %q", first.fabricID, second.fabricID)
+	}
+	t.Setenv(FabricIDEnvironment, "")
+	if left, right := NewNetwork(), NewNetwork(); left.fabricID == right.fabricID {
+		t.Fatalf("unconfigured plain networks shared Fabric ID %q", left.fabricID)
+	}
+}
+
 func TestConnectionForwardsWriteHalfClose(t *testing.T) {
 	network := NewNetwork()
 	server := network.NewFabric(fabric.Identity{NodeID: "server"})

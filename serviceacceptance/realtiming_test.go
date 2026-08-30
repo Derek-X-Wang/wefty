@@ -141,7 +141,7 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 		}
 		importRealtimeProbeImage(t, archivePath,
 			os.Getenv("WEFTY_OCI_HELPER_SOCKET"), os.Getenv("WEFTY_OCI_HELPER_CHECKSUM"),
-			os.Getenv("WEFTY_OCI_PROBE_REFERENCE"), os.Getenv("WEFTY_OCI_PROBE_DIGEST"))
+			os.Getenv("WEFTY_OCI_PROBE_REFERENCE"), os.Getenv("WEFTY_OCI_PROBE_DIGEST"), nil)
 		agentArguments = append(agentArguments, "--oci-intent-file="+intentPath)
 	}
 	harness := newAcceptanceHarnessWithOptions(t, acceptanceHarnessOptions{
@@ -410,7 +410,7 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	evidence.recordResidue(t, harness)
 }
 
-func importRealtimeProbeImage(t *testing.T, archivePath, helperSocket, helperChecksum, reference, digest string) {
+func importRealtimeProbeImage(t *testing.T, archivePath, helperSocket, helperChecksum, reference, digest string, recordResidue func(*ocihelper.NamespaceResidueError)) {
 	t.Helper()
 	client := ocihelper.NewUnixClient(helperSocket, helperChecksum)
 	barrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{
@@ -423,6 +423,10 @@ func importRealtimeProbeImage(t *testing.T, archivePath, helperSocket, helperChe
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 	if err := barrier.Ensure(ctx); err != nil {
+		var residue *ocihelper.NamespaceResidueError
+		if recordResidue != nil && errors.As(err, &residue) {
+			recordResidue(residue)
+		}
 		t.Fatal(err)
 	}
 	session, err := barrier.Session()

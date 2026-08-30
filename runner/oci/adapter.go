@@ -1068,7 +1068,13 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 			}
 			endpointName := name
 			endpoint := workloadrunner.AttemptEndpoint{Port: port, Dial: func(dialContext context.Context) (net.Conn, error) {
-				return adapter.DialAttemptPort(dialContext, request.Authority, endpointName)
+				// Bind the endpoint to the exact helper session that admitted the
+				// attempt. Re-reading the boot barrier here can only produce a
+				// misleading readiness error or target a replacement generation
+				// that cannot own this authority.
+				return session.DialAttemptPort(dialContext, ocihelper.DialAttemptPortRequest{
+					Authority: HelperAuthority(request.Authority), Name: endpointName,
+				})
 			}}
 			if err := request.AttemptEndpointReady(name, endpoint); err != nil {
 				_ = reapAfterFailedStart(session, authority)

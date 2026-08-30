@@ -2012,7 +2012,12 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 	if absent && request.Scope == VerifyNamespace {
 		engine.releaseVerifiedNamespace()
 	}
-	return VerifyResponse{Absent: absent, Inventory: observed}, nil
+	return VerifyResponse{
+		Absent:          absent,
+		Inventory:       observed,
+		RuntimeResidue:  projected,
+		DurableRetained: subtractResourceInventory(observed, projected),
+	}, nil
 }
 
 func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
@@ -3211,6 +3216,46 @@ func projectRuntimeAbsenceInventory(inventory ResourceInventory, retainedHandoff
 	projected.ComputerDiskQuotas = []string{}
 	projected.ComputerDiskManifests = []string{}
 	return projected, nil
+}
+
+func subtractResourceInventory(observed, residue ResourceInventory) ResourceInventory {
+	subtract := func(values, excluded []string) []string {
+		if len(values) == 0 {
+			return nil
+		}
+		excludedSet := make(map[string]struct{}, len(excluded))
+		for _, value := range excluded {
+			excludedSet[value] = struct{}{}
+		}
+		result := make([]string, 0, len(values))
+		for _, value := range values {
+			if _, found := excludedSet[value]; !found {
+				result = append(result, value)
+			}
+		}
+		return result
+	}
+	return ResourceInventory{
+		Leases:                  subtract(observed.Leases, residue.Leases),
+		Snapshots:               subtract(observed.Snapshots, residue.Snapshots),
+		Containers:              subtract(observed.Containers, residue.Containers),
+		Tasks:                   subtract(observed.Tasks, residue.Tasks),
+		Shims:                   subtract(observed.Shims, residue.Shims),
+		Cgroups:                 subtract(observed.Cgroups, residue.Cgroups),
+		LogSegments:             subtract(observed.LogSegments, residue.LogSegments),
+		ManagedVolumes:          subtract(observed.ManagedVolumes, residue.ManagedVolumes),
+		ManagedVolumeRecords:    subtract(observed.ManagedVolumeRecords, residue.ManagedVolumeRecords),
+		ComputerDiskImages:      subtract(observed.ComputerDiskImages, residue.ComputerDiskImages),
+		ComputerDiskAllocations: subtract(observed.ComputerDiskAllocations, residue.ComputerDiskAllocations),
+		ComputerDiskQuotas:      subtract(observed.ComputerDiskQuotas, residue.ComputerDiskQuotas),
+		ComputerDiskManifests:   subtract(observed.ComputerDiskManifests, residue.ComputerDiskManifests),
+		ComputerDiskMounts:      subtract(observed.ComputerDiskMounts, residue.ComputerDiskMounts),
+		ComputerDiskLoops:       subtract(observed.ComputerDiskLoops, residue.ComputerDiskLoops),
+		ComputerAttachments:     subtract(observed.ComputerAttachments, residue.ComputerAttachments),
+		ComputerResetManifests:  subtract(observed.ComputerResetManifests, residue.ComputerResetManifests),
+		ComputerQuarantines:     subtract(observed.ComputerQuarantines, residue.ComputerQuarantines),
+		ComputerDiskAnomalies:   subtract(observed.ComputerDiskAnomalies, residue.ComputerDiskAnomalies),
+	}
 }
 
 func captureSweepAuthority(authority AttemptAuthority, prior map[string]struct{}, attempts map[string]SweptAttemptAuthority) {

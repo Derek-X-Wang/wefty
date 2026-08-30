@@ -920,6 +920,10 @@ func TestRetainedHandoffProjectionKeepsObservedInventoryAndExpiredResidue(t *tes
 	if !slices.Equal(inventory.ManagedVolumes, []string{handoff, "wefty-service-volume-retained", "unexpected-volume"}) {
 		t.Fatalf("projection mutated observed inventory: %+v", inventory)
 	}
+	retained := subtractResourceInventory(inventory, projected)
+	if !slices.Equal(retained.ManagedVolumes, []string{handoff, "wefty-service-volume-retained"}) || len(retained.Containers) != 0 {
+		t.Fatalf("durable retained inventory = %+v", retained)
+	}
 	expired, err := projectRuntimeAbsenceInventory(ResourceInventory{ManagedVolumes: []string{handoff}}, func(string) (bool, error) {
 		return false, nil
 	})

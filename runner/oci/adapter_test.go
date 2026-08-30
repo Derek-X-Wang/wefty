@@ -1087,6 +1087,39 @@ func TestPortfulRunTransfersExactAuthorityEndpoint(t *testing.T) {
 	}
 }
 
+func TestAttemptEndpointStaysBoundToAdmittingHelperSession(t *testing.T) {
+	base := &adapterTestEngine{watchSignals: make(chan ocihelper.Signal, 1)}
+	engine := &endpointAdapterTestEngine{adapterTestEngine: base}
+	adapter, _, source, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.Authority.WorkloadClass = contract.JobClassService
+	request.AttemptEndpoints = []string{workloadrunner.AttemptEndpointService}
+	endpointReady := make(chan workloadrunner.AttemptEndpoint, 1)
+	request.AttemptEndpointReady = func(_ string, endpoint workloadrunner.AttemptEndpoint) error {
+		endpointReady <- endpoint
+		return nil
+	}
+	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := adapter.Run(t.Context(), request, nil)
+		runDone <- err
+	}()
+	endpoint := <-endpointReady
+	source.setSessionError(errors.New("replacement barrier is still pending"))
+	connection, err := endpoint.Dial(t.Context())
+	if err != nil {
+		t.Fatalf("attempt endpoint re-read replacement barrier instead of its admitting session: %v", err)
+	}
+	_ = connection.Close()
+	source.setSessionError(nil)
+	base.watchSignals <- ocihelper.SignalTERM
+	if err := <-runDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAdapterImageBudgetExhaustionIsPermanentAndBounded(t *testing.T) {
 	engine := &adapterTestEngine{ensureErrors: []error{ocihelper.NewImageMechanicsError(ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureNetwork, TopLevelDigest: adapterTestDigest}, errors.New("temporary DNS"))}}
 	adapter, closeAdapter := startAdapterTestServerWithPolicy(t, engine, ImagePolicy{
@@ -1421,6 +1454,16 @@ type adapterTestEngine struct {
 	volumeDeleteBeforeReap        bool
 	volumeDeleteFailures          int
 	volumeDeleteCalls             int
+}
+
+type endpointAdapterTestEngine struct{ *adapterTestEngine }
+
+func (*endpointAdapterTestEngine) DialAttemptPort(ctx context.Context, _ ocihelper.DialAttemptPortRequest, stream io.ReadWriteCloser) error {
+	if _, err := stream.Write([]byte{1}); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (engine *adapterTestEngine) DoctorStatus(context.Context) (ocihelper.DoctorStatus, error) {
@@ -1833,12 +1876,19 @@ func (*failingSessionSource) ExecutionSnapshot() (*ocihelper.Session, ocihelper.
 }
 
 type adapterSnapshotSource struct {
-	barrier  *ocihelper.BootBarrier
-	mu       sync.Mutex
-	override *ocihelper.VerifiedSweepReceipt
+	barrier    *ocihelper.BootBarrier
+	mu         sync.Mutex
+	override   *ocihelper.VerifiedSweepReceipt
+	sessionErr error
 }
 
 func (source *adapterSnapshotSource) Session() (*ocihelper.Session, error) {
+	source.mu.Lock()
+	err := source.sessionErr
+	source.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	return source.barrier.Session()
 }
 
@@ -1869,6 +1919,12 @@ func (source *adapterSnapshotSource) setUnavailable(receipt ocihelper.VerifiedSw
 func (source *adapterSnapshotSource) clearUnavailable() {
 	source.mu.Lock()
 	source.override = nil
+	source.mu.Unlock()
+}
+
+func (source *adapterSnapshotSource) setSessionError(err error) {
+	source.mu.Lock()
+	source.sessionErr = err
 	source.mu.Unlock()
 }
 

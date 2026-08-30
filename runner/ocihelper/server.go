@@ -60,6 +60,7 @@ type Server struct {
 	fatalOnce             sync.Once
 	nextSessionGeneration uint64
 	startupSweep          *SweepResponse
+	reapedBootSessions    map[string]struct{}
 }
 
 type attemptState string
@@ -201,8 +202,9 @@ func NewServer(engine Engine, config ServerConfig) (*Server, error) {
 	}
 	return &Server{
 		engine: engine, config: config,
-		instanceID:  instanceID,
-		connections: make(chan struct{}, config.ConnectionLimit),
+		instanceID:         instanceID,
+		connections:        make(chan struct{}, config.ConnectionLimit),
+		reapedBootSessions: make(map[string]struct{}),
 	}, nil
 }
 
@@ -276,7 +278,7 @@ func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
 		return fmt.Errorf("startup verify OCI runtime namespace: %w", err)
 	}
 	if !verification.Absent {
-		return fmt.Errorf("startup verify OCI runtime namespace: residue remains after sweep: %+v", verification.Inventory)
+		return namespaceResidueError("startup verify OCI runtime namespace", verification)
 	}
 	server.sessionMu.Lock()
 	server.startupSweep = &sweep
@@ -556,6 +558,7 @@ func (session *serverSession) invalidate(reason string) {
 			return
 		}
 		session.server.sessionMu.Lock()
+		session.server.reapedBootSessions[session.identity.BootSessionID] = struct{}{}
 		if session.server.active == session {
 			session.server.active = nil
 		}
@@ -1497,6 +1500,11 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			server.sessionMu.Lock()
 			startup := server.startupSweep
 			server.startupSweep = nil
+			for bootSessionID := range server.reapedBootSessions {
+				if !slices.Contains(response.PriorBootSessionsSeen, bootSessionID) {
+					response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, bootSessionID)
+				}
+			}
 			server.sessionMu.Unlock()
 			if startup != nil {
 				response.Removed += startup.Removed
@@ -1504,6 +1512,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				response.Inventory = mergeResourceInventory(response.Inventory, startup.Inventory)
 				response.Attempts = append(response.Attempts, startup.Attempts...)
 			}
+			slices.Sort(response.PriorBootSessionsSeen)
+			response.PriorBootSessionsSeen = slices.Compact(response.PriorBootSessionsSeen)
 			session.mu.Lock()
 			session.sweepPending = true
 			session.sweepResponse = response

@@ -17,6 +17,35 @@ type BootBarrierConfig struct {
 	TakeoverRetry   time.Duration
 }
 
+// NamespaceResidueError preserves the distinction between resources that
+// block OCI admission and durable resources intentionally retained across a
+// quiescent namespace verification.
+type NamespaceResidueError struct {
+	Operation       string
+	Observed        ResourceInventory
+	RuntimeResidue  ResourceInventory
+	DurableRetained ResourceInventory
+}
+
+func (err *NamespaceResidueError) Error() string {
+	return fmt.Sprintf("%s: residue remains after sweep: runtime=%+v durable_retained=%+v observed=%+v", err.Operation, err.RuntimeResidue, err.DurableRetained, err.Observed)
+}
+
+func namespaceResidueError(operation string, verification VerifyResponse) error {
+	residue := verification.RuntimeResidue
+	if InventoryEmpty(residue) && !verification.Absent {
+		// Preserve truthful failure reporting for older engines and test doubles
+		// that only supplied the complete observed inventory.
+		residue = verification.Inventory
+	}
+	return &NamespaceResidueError{
+		Operation:       operation,
+		Observed:        cloneResourceInventory(verification.Inventory),
+		RuntimeResidue:  cloneResourceInventory(residue),
+		DurableRetained: cloneResourceInventory(verification.DurableRetained),
+	}
+}
+
 // BootBarrier owns one exclusive helper session and proves the wefty runtime
 // namespace empty before that session may be used. State readers never wait
 // for takeover RPCs: ensureMu serializes retries while mu protects snapshots.
@@ -149,7 +178,7 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 		return fmt.Errorf("verify OCI runtime namespace: %w", err)
 	}
 	if !verification.Absent {
-		return fmt.Errorf("verify OCI runtime namespace: residue remains after sweep: %+v", verification.Inventory)
+		return namespaceResidueError("verify OCI runtime namespace", verification)
 	}
 	receipt := VerifiedSweepReceipt{
 		SweepEpoch:            sweep.SweepEpoch,
@@ -158,6 +187,8 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 		SweptInventory:        cloneResourceInventory(sweep.Inventory),
 		VerifiedAbsent:        verification.Absent,
 		VerifiedInventory:     cloneResourceInventory(verification.Inventory),
+		VerifiedResidue:       cloneResourceInventory(verification.RuntimeResidue),
+		VerifiedRetained:      cloneResourceInventory(verification.DurableRetained),
 		Attempts:              slices.Clone(sweep.Attempts),
 	}
 	if receipt.SweepEpoch == "" {
@@ -259,6 +290,8 @@ func cloneVerifiedSweepReceipt(receipt VerifiedSweepReceipt) VerifiedSweepReceip
 	receipt.PriorBootSessionsSeen = slices.Clone(receipt.PriorBootSessionsSeen)
 	receipt.SweptInventory = cloneResourceInventory(receipt.SweptInventory)
 	receipt.VerifiedInventory = cloneResourceInventory(receipt.VerifiedInventory)
+	receipt.VerifiedResidue = cloneResourceInventory(receipt.VerifiedResidue)
+	receipt.VerifiedRetained = cloneResourceInventory(receipt.VerifiedRetained)
 	receipt.Attempts = slices.Clone(receipt.Attempts)
 	return receipt
 }

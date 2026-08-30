@@ -114,9 +114,14 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	defer barrier.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Minute)
 	defer cancel()
+	barrierStartedAt := time.Now()
 	if err := barrier.Ensure(ctx); err != nil {
 		t.Fatal(err)
 	}
+	barrierReadyAt := time.Now()
+	barrier.SetLossHandler(func(generation ocihelper.HelperSession, lossErr error) {
+		recordNativeBarrierLoss(generation, barrierStartedAt, barrierReadyAt, lossErr)
+	})
 	adapter := ocirunner.NewAdapter(barrier)
 	session, err := barrier.Session()
 	if err != nil {
@@ -756,6 +761,30 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+var nativeBarrierLossSequence atomic.Uint64
+
+func recordNativeBarrierLoss(generation ocihelper.HelperSession, barrierStartedAt, barrierReadyAt time.Time, lossErr error) {
+	evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR")
+	if evidenceDirectory == "" {
+		return
+	}
+	recordedAt := time.Now().UTC()
+	payload, err := json.MarshalIndent(map[string]any{
+		"helper_session":              generation,
+		"barrier_started_at":          barrierStartedAt.UTC(),
+		"barrier_ready_at":            barrierReadyAt.UTC(),
+		"barrier_establish_elapsed":   barrierReadyAt.Sub(barrierStartedAt).String(),
+		"healthy_before_loss_elapsed": recordedAt.Sub(barrierReadyAt).String(),
+		"loss_recorded_at":            recordedAt,
+		"loss_error":                  lossErr.Error(),
+	}, "", "  ")
+	if err != nil {
+		return
+	}
+	name := fmt.Sprintf("native-linux-oci-barrier-loss-%02d.json", nativeBarrierLossSequence.Add(1))
+	_ = os.WriteFile(filepath.Join(evidenceDirectory, name), append(payload, '\n'), 0o600)
 }
 
 type referenceComputerEvidence struct {

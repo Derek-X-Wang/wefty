@@ -581,7 +581,9 @@ func TestBootBarrierSweepsVerifiesAndRetriesExclusiveTakeover(t *testing.T) {
 	requireSweep(t, incumbent)
 
 	clock := &observedClock{manualClock: newManualClock(time.Unix(1_000, 0)), timerCreated: make(chan struct{}, 8)}
-	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{Clock: clock})
+	takeoverRequest := testSessionRequest()
+	takeoverRequest.BootSessionID = "boot-2"
+	barrier, err := NewBootBarrierWithConfig(client, takeoverRequest, BootBarrierConfig{Clock: clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -639,7 +641,7 @@ takeoverComplete:
 	}
 	receipt.PriorBootSessionsSeen = append(receipt.PriorBootSessionsSeen, "mutated")
 	retained, ok := barrier.SweepReceipt()
-	if !ok || len(retained.PriorBootSessionsSeen) != 0 {
+	if !ok || !slices.Equal(retained.PriorBootSessionsSeen, []string{testSessionRequest().BootSessionID}) {
 		t.Fatalf("barrier receipt was mutable through caller copy: %#v", retained)
 	}
 	before := engine.methods()
@@ -653,15 +655,28 @@ takeoverComplete:
 
 func TestBootBarrierRefusesResidueAndNeverExposesSession(t *testing.T) {
 	engine := newFakeEngine()
-	engine.verifyResponses = []VerifyResponse{{Absent: true}, {Absent: false}}
+	engine.verifyResponses = []VerifyResponse{{Absent: true}, {
+		Absent: false,
+		Inventory: ResourceInventory{
+			Cgroups: []string{"genuine-cgroup"}, ManagedVolumes: []string{"wefty-service-volume-retained"},
+		},
+		RuntimeResidue:  ResourceInventory{Cgroups: []string{"genuine-cgroup"}},
+		DurableRetained: ResourceInventory{ManagedVolumes: []string{"wefty-service-volume-retained"}},
+	}}
 	client, stop := startTestServer(t, engine, ServerConfig{})
 	defer stop()
 	barrier, err := NewBootBarrier(client, testSessionRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := barrier.Ensure(t.Context()); err == nil {
+	err = barrier.Ensure(t.Context())
+	if err == nil {
 		t.Fatal("barrier accepted residue after sweep")
+	}
+	var residue *NamespaceResidueError
+	if !errors.As(err, &residue) || !slices.Equal(residue.RuntimeResidue.Cgroups, []string{"genuine-cgroup"}) ||
+		!slices.Equal(residue.DurableRetained.ManagedVolumes, []string{"wefty-service-volume-retained"}) {
+		t.Fatalf("barrier residue error = %#v, err=%v", residue, err)
 	}
 	if barrier.Ready() {
 		t.Fatal("failed verification made barrier ready")
@@ -678,7 +693,9 @@ func TestBootBarrierReceiptsRetainedHandoffInventoryWithoutCallingItResidue(t *t
 		t.Fatal(err)
 	}
 	engine.verifyResponses = []VerifyResponse{{Absent: true}, {
-		Absent: true, Inventory: ResourceInventory{ManagedVolumes: []string{handoff}},
+		Absent:          true,
+		Inventory:       ResourceInventory{ManagedVolumes: []string{handoff}},
+		DurableRetained: ResourceInventory{ManagedVolumes: []string{handoff}},
 	}}
 	client, stop := startTestServer(t, engine, ServerConfig{})
 	defer stop()
@@ -690,7 +707,8 @@ func TestBootBarrierReceiptsRetainedHandoffInventoryWithoutCallingItResidue(t *t
 		t.Fatal(err)
 	}
 	receipt, ok := barrier.SweepReceipt()
-	if !ok || !receipt.VerifiedAbsent || !slices.Equal(receipt.VerifiedInventory.ManagedVolumes, []string{handoff}) {
+	if !ok || !receipt.VerifiedAbsent || !slices.Equal(receipt.VerifiedInventory.ManagedVolumes, []string{handoff}) ||
+		!InventoryEmpty(receipt.VerifiedResidue) || !slices.Equal(receipt.VerifiedRetained.ManagedVolumes, []string{handoff}) {
 		t.Fatalf("retained handoff verification receipt = %+v, ok=%t", receipt, ok)
 	}
 	session, err := barrier.Session()

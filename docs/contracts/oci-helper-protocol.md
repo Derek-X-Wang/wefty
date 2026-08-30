@@ -164,7 +164,8 @@ notifies the barrier synchronously when control authority is lost.
 Successful verification produces an immutable receipt retained by the client
 barrier. It names the sweep epoch and helper process/session generation and
 copies the prior boot sessions, class-separated swept inventory, independent
-post-sweep inventory, and recovered `(removal_generation, attempt_id,
+post-sweep observed inventory, runtime-residue projection, durable-retained
+projection, and recovered `(removal_generation, attempt_id,
 fencing_token, prior_boot_session_id)` tuples. A helper-startup sweep is folded
 into the first session receipt so evidence is not discarded before session
 acquisition. This is evidence for the later runtime/removal adapter; this
@@ -505,10 +506,12 @@ handoff volume. Session reap and boot sweep likewise leave unexpired handoffs
 intact; reuse refreshes the default 24-hour retry age, and sweep removes only
 expired direct children with the deterministic handoff prefix. Attempt and
 namespace quiescence therefore project only unexpired handoff volumes (the
-retained bindings) out of their absence decision. `Verify` returns the
-observed inventory unchanged, and the boot receipt records both
-`verified_absent` and that inventory, so an expired handoff left behind by a
-failed sweep remains visible residue rather than passing by name prefix. The
+retained bindings) out of their absence decision. `Verify` returns the observed
+inventory unchanged alongside the exact runtime-residue and durable-retained
+projections, and the boot receipt records all three with `verified_absent`.
+Thus stable service data and unexpired handoffs remain auditable without being
+mislabeled as runtime residue, while an expired handoff left behind by a failed
+sweep remains visible residue rather than passing by name prefix. The
 narrow
 `DeleteManagedVolume(kind, owner_key)` operation is closed to `handoff` and
 `service_data`. It derives exactly one helper-owned identity, removes only that
@@ -736,7 +739,11 @@ Prior-boot removal consumes positive sweep evidence once. A swept attempt still
 requires node, job, class, prior boot, attempt, fence, and removal generation.
 When an older helper already reaped that attempt, a verified-empty replacement
 sweep may omit the attempt only if `PriorBootSessionsSeen` contains the removal
-intent's prior boot. Both forms remain bound to the sweep epoch and helper
+intent's prior boot. A successful session reap records its boot-session ID in
+the running helper process, and every later session-generation sweep includes
+that process-local fact; a failed reap records nothing, and a restarted helper
+must recover evidence from its own startup sweep. Both forms remain bound to
+the sweep epoch and helper
 generation; a bare verified-empty sweep is insufficient. Legacy manifest
 reconstruction and replacement-sweep attempt recovery continue to require the
 complete authority match.
