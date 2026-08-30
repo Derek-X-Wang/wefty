@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -951,6 +953,7 @@ type computerBackendOptions struct {
 	httpOnly             bool
 	ignoreCloseHandshake bool
 	echoPrefix           string
+	rfbHandshake         bool
 }
 
 type computerBackendServer struct {
@@ -999,6 +1002,32 @@ func newComputerBackend(t *testing.T, options computerBackendOptions) *computerB
 			case <-time.After(time.Second):
 			}
 			return
+		}
+		if options.rfbHandshake {
+			kind, version, err := connection.Read(request.Context())
+			if err != nil || kind != websocket.MessageBinary || string(version) != "RFB 003.008\n" {
+				return
+			}
+			if err := connection.Write(request.Context(), websocket.MessageBinary, []byte{1, 1}); err != nil {
+				return
+			}
+			kind, security, err := connection.Read(request.Context())
+			if err != nil || kind != websocket.MessageBinary || !bytes.Equal(security, []byte{1}) {
+				return
+			}
+			if err := connection.Write(request.Context(), websocket.MessageBinary, []byte{0, 0, 0, 0}); err != nil {
+				return
+			}
+			kind, shared, err := connection.Read(request.Context())
+			if err != nil || kind != websocket.MessageBinary || !bytes.Equal(shared, []byte{1}) {
+				return
+			}
+			serverInit := make([]byte, 24)
+			binary.BigEndian.PutUint16(serverInit[0:2], 640)
+			binary.BigEndian.PutUint16(serverInit[2:4], 480)
+			if err := connection.Write(request.Context(), websocket.MessageBinary, serverInit); err != nil {
+				return
+			}
 		}
 		for {
 			kind, payload, err := connection.Read(request.Context())

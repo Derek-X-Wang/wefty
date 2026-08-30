@@ -652,6 +652,13 @@ func (session *Session) markOperationFailure(ctx context.Context, err error) err
 	if err == nil {
 		return nil
 	}
+	// applyContextDeadline arms the transport at the same instant as ctx. The
+	// socket timeout may win scheduler ordering by a few microseconds; once the
+	// deadline has arrived, wait for the matching context fact before deciding
+	// whether an operation-local timeout proves helper-session loss.
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) && ctx.Err() == nil {
+		<-ctx.Done()
+	}
 	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}

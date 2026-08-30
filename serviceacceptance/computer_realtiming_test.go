@@ -1058,44 +1058,53 @@ func openLiveRFBSession(t *testing.T, endpoint, userID, deviceID string) *liveRF
 	}
 	token := response.Header.Get(contract.ComputerControlTokenHeader)
 	network := websocket.NetConn(t.Context(), connection, websocket.MessageBinary)
-	banner := make([]byte, contract.ComputerRFBVersionBannerBytes)
-	if _, err := io.ReadFull(network, banner); err != nil || !contract.ValidComputerRFBVersionBanner(banner) {
+	if token == "" {
 		_ = connection.CloseNow()
-		t.Fatalf("read live RFB banner: %v %q", err, banner)
+		t.Fatal("live RFB session omitted its control capability")
 	}
-	if _, err := network.Write([]byte("RFB 003.008\n")); err != nil {
+	session := &liveRFBSession{endpoint: endpoint, token: token, websocket: connection, connection: network}
+	session.negotiate(t, true)
+	return session
+}
+
+func (session *liveRFBSession) negotiate(t *testing.T, readBanner bool) {
+	t.Helper()
+	if readBanner {
+		banner := make([]byte, contract.ComputerRFBVersionBannerBytes)
+		if _, err := io.ReadFull(session.connection, banner); err != nil || !contract.ValidComputerRFBVersionBanner(banner) {
+			_ = session.websocket.CloseNow()
+			t.Fatalf("read live RFB banner: %v %q", err, banner)
+		}
+	}
+	if _, err := session.connection.Write([]byte("RFB 003.008\n")); err != nil {
 		t.Fatal(err)
 	}
 	count := []byte{0}
-	if _, err := io.ReadFull(network, count); err != nil || count[0] == 0 {
+	if _, err := io.ReadFull(session.connection, count); err != nil || count[0] == 0 {
 		t.Fatalf("read live RFB security count: %v", err)
 	}
 	securityTypes := make([]byte, int(count[0]))
-	if _, err := io.ReadFull(network, securityTypes); err != nil || !bytes.Contains(securityTypes, []byte{1}) {
+	if _, err := io.ReadFull(session.connection, securityTypes); err != nil || !bytes.Contains(securityTypes, []byte{1}) {
 		t.Fatalf("live RFB None security unavailable: %v %x", err, securityTypes)
 	}
-	if _, err := network.Write([]byte{1}); err != nil {
+	if _, err := session.connection.Write([]byte{1}); err != nil {
 		t.Fatal(err)
 	}
 	securityResult := make([]byte, 4)
-	if _, err := io.ReadFull(network, securityResult); err != nil || !bytes.Equal(securityResult, []byte{0, 0, 0, 0}) {
+	if _, err := io.ReadFull(session.connection, securityResult); err != nil || !bytes.Equal(securityResult, []byte{0, 0, 0, 0}) {
 		t.Fatalf("live RFB security result: %v %x", err, securityResult)
 	}
-	if _, err := network.Write([]byte{1}); err != nil {
+	if _, err := session.connection.Write([]byte{1}); err != nil {
 		t.Fatal(err)
 	}
 	serverInit := make([]byte, 24)
-	if _, err := io.ReadFull(network, serverInit); err != nil {
+	if _, err := io.ReadFull(session.connection, serverInit); err != nil {
 		t.Fatal(err)
 	}
 	name := make([]byte, int(binary.BigEndian.Uint32(serverInit[20:24])))
-	if _, err := io.ReadFull(network, name); err != nil {
+	if _, err := io.ReadFull(session.connection, name); err != nil {
 		t.Fatal(err)
 	}
-	if token == "" {
-		t.Fatal("live RFB session omitted its control capability")
-	}
-	return &liveRFBSession{endpoint: endpoint, token: token, websocket: connection, connection: network}
 }
 
 func (session *liveRFBSession) sendPointer(t *testing.T, x, y int) {
@@ -1404,6 +1413,10 @@ func proveLiveViewInputIsolation(t *testing.T, harness *acceptanceHarness, compu
 	if take.TenureState != contract.ComputerControlTenureHeld {
 		t.Fatalf("control sentinel take = %#v", take)
 	}
+	// Takeover replaces the already-negotiated view backend with a fresh control
+	// backend after the agent has consumed its banner. Complete the remaining
+	// handshake before input; otherwise pointer bytes become its client version.
+	control.negotiate(t, false)
 	control.sendPointer(t, controlPointer[0], controlPointer[1])
 	var after liveInputObservation
 	deadline := time.Now().Add(10 * time.Second)

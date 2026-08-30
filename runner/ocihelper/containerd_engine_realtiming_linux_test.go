@@ -1281,12 +1281,10 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		t.Fatalf("Computer helper-death sweep failed: %v", err)
 	}
 	receipt, ok := barrier.SweepReceipt()
-	if !ok || !ocihelper.InventoryEmpty(receipt.VerifiedInventory) || len(receipt.SweptInventory.ComputerDiskImages) == 0 ||
-		len(receipt.SweptInventory.ComputerDiskAllocations) == 0 || len(receipt.SweptInventory.ComputerDiskQuotas) == 0 ||
-		len(receipt.SweptInventory.ComputerDiskManifests) == 0 || len(receipt.SweptInventory.ComputerDiskMounts) == 0 ||
-		len(receipt.SweptInventory.ComputerDiskLoops) == 0 || len(receipt.SweptInventory.ComputerAttachments) == 0 {
+	if !ok {
 		t.Fatalf("Computer helper-death sweep receipt = %+v present=%t", receipt, ok)
 	}
+	assertNativeComputerSweepReceipt(t, receipt)
 	assertNativeComputerHostCleanup(t, first.Authority)
 	session, err = barrier.Session()
 	if err != nil {
@@ -1358,6 +1356,55 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	// reach the persistent marker, and every disk/reset assertion above must
 	// complete, before this evidence is emitted.
 	return nativeComputerDiskEvidence{exactlyOnePersistentAndReset: true, shmModeFlagsSizeOneGiB: true, shmCgroupCharged: true, cgroupPolicyReadback: true, diskENOSPCLocal: true, oomLocal: true}
+}
+
+func assertNativeComputerSweepReceipt(t *testing.T, receipt ocihelper.VerifiedSweepReceipt) {
+	t.Helper()
+	retained := receipt.VerifiedRetained
+	retainedRuntimeEmpty := len(retained.Leases)+len(retained.Snapshots)+len(retained.Containers)+len(retained.Tasks)+
+		len(retained.Shims)+len(retained.Cgroups)+len(retained.LogSegments)+len(retained.ComputerDiskMounts)+
+		len(retained.ComputerDiskLoops)+len(retained.ComputerAttachments)+len(retained.ComputerResetManifests)+
+		len(retained.ComputerQuarantines)+len(retained.ComputerDiskAnomalies) == 0
+	wantRecords := make([]string, len(retained.ManagedVolumes))
+	for index, volume := range retained.ManagedVolumes {
+		wantRecords[index] = volume + ".owner"
+	}
+	slices.Sort(wantRecords)
+	computerDurableExact := len(retained.ComputerDiskImages) > 0 &&
+		slices.Equal(retained.ComputerDiskImages, retained.ComputerDiskAllocations) &&
+		slices.Equal(retained.ComputerDiskImages, retained.ComputerDiskQuotas) &&
+		slices.Equal(retained.ComputerDiskImages, retained.ComputerDiskManifests)
+	sweptRuntimeCovered := len(receipt.SweptInventory.Leases) > 0 && len(receipt.SweptInventory.Snapshots) > 0 &&
+		len(receipt.SweptInventory.Containers) > 0 && len(receipt.SweptInventory.LogSegments) > 0 &&
+		len(receipt.SweptInventory.ComputerDiskMounts) > 0 && len(receipt.SweptInventory.ComputerDiskLoops) > 0 &&
+		len(receipt.SweptInventory.ComputerAttachments) > 0
+	if !receipt.VerifiedAbsent || !ocihelper.InventoryEmpty(receipt.VerifiedResidue) ||
+		!reflect.DeepEqual(receipt.VerifiedInventory, retained) || !retainedRuntimeEmpty ||
+		len(retained.ManagedVolumes) == 0 || !slices.Equal(wantRecords, retained.ManagedVolumeRecords) ||
+		!computerDurableExact || !sweptRuntimeCovered || inventoryHasDuplicateIdentity(receipt.SweptInventory) {
+		t.Fatalf("Computer helper-death residue model = swept:%+v verified:%+v residue:%+v retained:%+v absent:%t",
+			receipt.SweptInventory, receipt.VerifiedInventory, receipt.VerifiedResidue, retained, receipt.VerifiedAbsent)
+	}
+}
+
+func inventoryHasDuplicateIdentity(inventory ocihelper.ResourceInventory) bool {
+	classes := [][]string{
+		inventory.Leases, inventory.Snapshots, inventory.Containers, inventory.Tasks, inventory.Shims, inventory.Cgroups,
+		inventory.LogSegments, inventory.ManagedVolumes, inventory.ManagedVolumeRecords, inventory.ComputerDiskImages,
+		inventory.ComputerDiskAllocations, inventory.ComputerDiskQuotas, inventory.ComputerDiskManifests,
+		inventory.ComputerDiskMounts, inventory.ComputerDiskLoops, inventory.ComputerAttachments,
+		inventory.ComputerResetManifests, inventory.ComputerQuarantines, inventory.ComputerDiskAnomalies,
+	}
+	for _, class := range classes {
+		seen := make(map[string]struct{}, len(class))
+		for _, identity := range class {
+			if _, exists := seen[identity]; exists {
+				return true
+			}
+			seen[identity] = struct{}{}
+		}
+	}
+	return false
 }
 
 func assertNativeComputerHostCleanup(t *testing.T, authority ocihelper.AttemptAuthority) {

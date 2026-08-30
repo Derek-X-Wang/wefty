@@ -1305,6 +1305,87 @@ func TestAttemptPortBackendRefusalDoesNotInvalidateHelperSession(t *testing.T) {
 	}
 }
 
+func TestAttemptPortSetupCancellationDoesNotDelayListenerRepublication(t *testing.T) {
+	base := newFakeEngine()
+	base.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}})
+	engine := &listenerRestartEngine{fakeEngine: base, firstEntered: make(chan struct{}), firstCanceled: make(chan struct{})}
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	authority := testAuthority()
+	request := testRunRequest(authority, time.Second)
+	request.AllocateEndpoints = []string{"service"}
+	if _, err := session.Run(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+
+	probeContext, cancelProbe := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancelProbe()
+	probeDone := make(chan error, 1)
+	go func() {
+		_, err := session.DialAttemptPort(probeContext, DialAttemptPortRequest{Authority: authority, Name: "service"})
+		probeDone <- err
+	}()
+	<-engine.firstEntered
+	if err := <-probeDone; err == nil || !errors.Is(probeContext.Err(), context.DeadlineExceeded) {
+		t.Fatalf("withdrawn-listener probe error = %v context=%v, want caller deadline", err, probeContext.Err())
+	}
+	select {
+	case <-engine.firstCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("withdrawn-listener probe remained live after its caller disconnected")
+	}
+
+	stream, err := session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Name: "service"})
+	if err != nil {
+		t.Fatalf("replacement listener was not reachable on the next probe: %v", err)
+	}
+	assertStreamPayload(t, stream, "attempt-port")
+	if session.HealthError() != nil {
+		t.Fatalf("listener restart invalidated the admitting helper session: %v", session.HealthError())
+	}
+}
+
+func TestMergeResourceInventoryDeduplicatesEveryIdentityClass(t *testing.T) {
+	left := ResourceInventory{
+		Leases: []string{"b", "a"}, Snapshots: []string{"b", "a"}, Containers: []string{"b", "a"},
+		Tasks: []string{"b", "a"}, Shims: []string{"b", "a"}, Cgroups: []string{"b", "a"},
+		LogSegments: []string{"b", "a"}, ManagedVolumes: []string{"b", "a"}, ManagedVolumeRecords: []string{"b", "a"},
+		ComputerDiskImages: []string{"b", "a"}, ComputerDiskAllocations: []string{"b", "a"}, ComputerDiskQuotas: []string{"b", "a"},
+		ComputerDiskManifests: []string{"b", "a"}, ComputerDiskMounts: []string{"b", "a"}, ComputerDiskLoops: []string{"b", "a"},
+		ComputerAttachments: []string{"b", "a"}, ComputerResetManifests: []string{"b", "a"}, ComputerQuarantines: []string{"b", "a"},
+		ComputerDiskAnomalies: []string{"b", "a"},
+	}
+	right := ResourceInventory{
+		Leases: []string{"a", "c"}, Snapshots: []string{"a", "c"}, Containers: []string{"a", "c"},
+		Tasks: []string{"a", "c"}, Shims: []string{"a", "c"}, Cgroups: []string{"a", "c"},
+		LogSegments: []string{"a", "c"}, ManagedVolumes: []string{"a", "c"}, ManagedVolumeRecords: []string{"a", "c"},
+		ComputerDiskImages: []string{"a", "c"}, ComputerDiskAllocations: []string{"a", "c"}, ComputerDiskQuotas: []string{"a", "c"},
+		ComputerDiskManifests: []string{"a", "c"}, ComputerDiskMounts: []string{"a", "c"}, ComputerDiskLoops: []string{"a", "c"},
+		ComputerAttachments: []string{"a", "c"}, ComputerResetManifests: []string{"a", "c"}, ComputerQuarantines: []string{"a", "c"},
+		ComputerDiskAnomalies: []string{"a", "c"},
+	}
+	merged := mergeResourceInventory(left, right)
+	want := []string{"a", "b", "c"}
+	classes := [][]string{
+		merged.Leases, merged.Snapshots, merged.Containers, merged.Tasks, merged.Shims, merged.Cgroups,
+		merged.LogSegments, merged.ManagedVolumes, merged.ManagedVolumeRecords, merged.ComputerDiskImages,
+		merged.ComputerDiskAllocations, merged.ComputerDiskQuotas, merged.ComputerDiskManifests,
+		merged.ComputerDiskMounts, merged.ComputerDiskLoops, merged.ComputerAttachments,
+		merged.ComputerResetManifests, merged.ComputerQuarantines, merged.ComputerDiskAnomalies,
+	}
+	for index, class := range classes {
+		if !slices.Equal(class, want) {
+			t.Fatalf("merged inventory class %d = %v, want %v", index, class, want)
+		}
+	}
+}
+
 func TestEndpointAdmittedByInvalidatedSessionRefusesWithTypedSessionStale(t *testing.T) {
 	engine := newFakeEngine()
 	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}}
@@ -2266,6 +2347,28 @@ type fakeEngine struct {
 type blockingWatchEngine struct {
 	*fakeEngine
 	entered chan struct{}
+}
+
+type listenerRestartEngine struct {
+	*fakeEngine
+	mu            sync.Mutex
+	first         bool
+	firstEntered  chan struct{}
+	firstCanceled chan struct{}
+}
+
+func (engine *listenerRestartEngine) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
+	engine.mu.Lock()
+	first := !engine.first
+	engine.first = true
+	engine.mu.Unlock()
+	if first {
+		close(engine.firstEntered)
+		<-ctx.Done()
+		close(engine.firstCanceled)
+		return ctx.Err()
+	}
+	return engine.fakeEngine.DialAttemptPort(ctx, request, stream)
 }
 
 type doctorEngine struct{ *fakeEngine }

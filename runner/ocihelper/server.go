@@ -149,6 +149,22 @@ func (operation *sessionOperation) monitorAcknowledgements() <-chan error {
 	return acknowledged
 }
 
+func (operation *sessionOperation) monitorAcknowledgement() <-chan error {
+	acknowledged := make(chan error, 1)
+	go func() {
+		var value [1]byte
+		_, err := io.ReadFull(operation.conn, value[:])
+		if err == nil && value[0] != 1 {
+			err = errors.New("invalid OCI stream acknowledgement")
+		}
+		if err != nil {
+			operation.cancel()
+		}
+		acknowledged <- err
+	}()
+	return acknowledged
+}
+
 type serverSession struct {
 	server     *Server
 	identity   SessionIdentity
@@ -1554,7 +1570,11 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		body.Port = port
 		body.CgroupID = attempt.cgroupID
-		stream := &attemptPortOperationStream{operationStream: &operationStream{Conn: operation.conn, cancel: operation.cancel}, wire: wire}
+		stream := &attemptPortOperationStream{
+			operationStream: &operationStream{Conn: operation.conn, cancel: operation.cancel},
+			wire:            wire,
+			acknowledged:    operation.monitorAcknowledgement(),
+		}
 		err := server.engine.DialAttemptPort(operation.ctx, body, stream)
 		if err != nil && !stream.ready {
 			_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, err)
@@ -1584,8 +1604,9 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 // instead of looking like helper-stream EOF and invalidating the whole session.
 type attemptPortOperationStream struct {
 	*operationStream
-	wire  *framedConn
-	ready bool
+	wire         *framedConn
+	acknowledged <-chan error
+	ready        bool
 }
 
 func (stream *attemptPortOperationStream) Write(payload []byte) (int, error) {
@@ -1596,8 +1617,8 @@ func (stream *attemptPortOperationStream) Write(payload []byte) (int, error) {
 		if err := writeSuccess(stream.wire, struct{}{}); err != nil {
 			return 0, err
 		}
-		if !readStreamAcknowledgement(stream.Conn) {
-			return 0, errors.New("attempt-port client did not acknowledge stream setup")
+		if err := <-stream.acknowledged; err != nil {
+			return 0, fmt.Errorf("attempt-port client did not acknowledge stream setup: %w", err)
 		}
 		stream.ready = true
 	}
@@ -1659,26 +1680,32 @@ func mergeSweepResponsePointer(target *SweepResponse, addition SweepResponse) *S
 }
 
 func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {
-	left.Leases = append(left.Leases, right.Leases...)
-	left.Snapshots = append(left.Snapshots, right.Snapshots...)
-	left.Containers = append(left.Containers, right.Containers...)
-	left.Tasks = append(left.Tasks, right.Tasks...)
-	left.Shims = append(left.Shims, right.Shims...)
-	left.Cgroups = append(left.Cgroups, right.Cgroups...)
-	left.LogSegments = append(left.LogSegments, right.LogSegments...)
-	left.ManagedVolumes = append(left.ManagedVolumes, right.ManagedVolumes...)
-	left.ManagedVolumeRecords = append(left.ManagedVolumeRecords, right.ManagedVolumeRecords...)
-	left.ComputerDiskImages = append(left.ComputerDiskImages, right.ComputerDiskImages...)
-	left.ComputerDiskAllocations = append(left.ComputerDiskAllocations, right.ComputerDiskAllocations...)
-	left.ComputerDiskQuotas = append(left.ComputerDiskQuotas, right.ComputerDiskQuotas...)
-	left.ComputerDiskManifests = append(left.ComputerDiskManifests, right.ComputerDiskManifests...)
-	left.ComputerDiskMounts = append(left.ComputerDiskMounts, right.ComputerDiskMounts...)
-	left.ComputerDiskLoops = append(left.ComputerDiskLoops, right.ComputerDiskLoops...)
-	left.ComputerAttachments = append(left.ComputerAttachments, right.ComputerAttachments...)
-	left.ComputerResetManifests = append(left.ComputerResetManifests, right.ComputerResetManifests...)
-	left.ComputerQuarantines = append(left.ComputerQuarantines, right.ComputerQuarantines...)
-	left.ComputerDiskAnomalies = append(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies...)
+	left.Leases = mergeInventoryClass(left.Leases, right.Leases)
+	left.Snapshots = mergeInventoryClass(left.Snapshots, right.Snapshots)
+	left.Containers = mergeInventoryClass(left.Containers, right.Containers)
+	left.Tasks = mergeInventoryClass(left.Tasks, right.Tasks)
+	left.Shims = mergeInventoryClass(left.Shims, right.Shims)
+	left.Cgroups = mergeInventoryClass(left.Cgroups, right.Cgroups)
+	left.LogSegments = mergeInventoryClass(left.LogSegments, right.LogSegments)
+	left.ManagedVolumes = mergeInventoryClass(left.ManagedVolumes, right.ManagedVolumes)
+	left.ManagedVolumeRecords = mergeInventoryClass(left.ManagedVolumeRecords, right.ManagedVolumeRecords)
+	left.ComputerDiskImages = mergeInventoryClass(left.ComputerDiskImages, right.ComputerDiskImages)
+	left.ComputerDiskAllocations = mergeInventoryClass(left.ComputerDiskAllocations, right.ComputerDiskAllocations)
+	left.ComputerDiskQuotas = mergeInventoryClass(left.ComputerDiskQuotas, right.ComputerDiskQuotas)
+	left.ComputerDiskManifests = mergeInventoryClass(left.ComputerDiskManifests, right.ComputerDiskManifests)
+	left.ComputerDiskMounts = mergeInventoryClass(left.ComputerDiskMounts, right.ComputerDiskMounts)
+	left.ComputerDiskLoops = mergeInventoryClass(left.ComputerDiskLoops, right.ComputerDiskLoops)
+	left.ComputerAttachments = mergeInventoryClass(left.ComputerAttachments, right.ComputerAttachments)
+	left.ComputerResetManifests = mergeInventoryClass(left.ComputerResetManifests, right.ComputerResetManifests)
+	left.ComputerQuarantines = mergeInventoryClass(left.ComputerQuarantines, right.ComputerQuarantines)
+	left.ComputerDiskAnomalies = mergeInventoryClass(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
 	return left
+}
+
+func mergeInventoryClass(left, right []string) []string {
+	merged := append(slices.Clone(left), right...)
+	slices.Sort(merged)
+	return slices.Compact(merged)
 }
 
 type operationStream struct {

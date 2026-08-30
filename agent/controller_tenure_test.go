@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -483,7 +484,7 @@ func TestComputerFrontDoorSidebandTakeAndReleaseReplaceRelayLeg(t *testing.T) {
 	originalServer.Close()
 	viewBackend := newComputerBackend(t, computerBackendOptions{echoPrefix: "view:"})
 	defer viewBackend.Close()
-	controlBackend := newComputerBackend(t, computerBackendOptions{echoPrefix: "control:"})
+	controlBackend := newComputerBackend(t, computerBackendOptions{echoPrefix: "control:", rfbHandshake: true})
 	defer controlBackend.Close()
 
 	config := fixture.frontDoor.config
@@ -536,6 +537,7 @@ func TestComputerFrontDoorSidebandTakeAndReleaseReplaceRelayLeg(t *testing.T) {
 	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusOK {
 		t.Fatalf("take status = %d", status)
 	}
+	completeControlRFBHandshake(t, client)
 	assertRelayRoundTrip(t, client, "driving", "control:driving")
 	if status := postComputerControl(t, server.URL, computerControlReleasePath, token); status != http.StatusOK {
 		t.Fatalf("release status = %d", status)
@@ -556,6 +558,28 @@ func TestComputerFrontDoorSidebandTakeAndReleaseReplaceRelayLeg(t *testing.T) {
 	}
 	if !acquired || !released {
 		t.Fatalf("sideband evidence = %#v", events)
+	}
+}
+
+func completeControlRFBHandshake(t *testing.T, connection *websocket.Conn) {
+	t.Helper()
+	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("RFB 003.008\n")); err != nil {
+		t.Fatal(err)
+	}
+	if kind, securityTypes, err := connection.Read(t.Context()); err != nil || kind != websocket.MessageBinary || !bytes.Equal(securityTypes, []byte{1, 1}) {
+		t.Fatalf("control RFB security types = %x kind=%v err=%v", securityTypes, kind, err)
+	}
+	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if kind, result, err := connection.Read(t.Context()); err != nil || kind != websocket.MessageBinary || !bytes.Equal(result, []byte{0, 0, 0, 0}) {
+		t.Fatalf("control RFB security result = %x kind=%v err=%v", result, kind, err)
+	}
+	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if kind, serverInit, err := connection.Read(t.Context()); err != nil || kind != websocket.MessageBinary || len(serverInit) != 24 {
+		t.Fatalf("control RFB server init = %x kind=%v err=%v", serverInit, kind, err)
 	}
 }
 
