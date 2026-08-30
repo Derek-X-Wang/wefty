@@ -2,11 +2,28 @@ name: acceptance-image-build
 
 on:
   workflow_call:
+    inputs:
+      candidate_sha:
+        description: Exact source commit represented by artifact names and receipts
+        required: false
+        type: string
+        default: ""
+      source_repository:
+        description: Repository containing candidate_sha (including a fork for pull_request)
+        required: false
+        type: string
+        default: ""
+      package_releases:
+        description: Assemble secretless multi-platform release artifacts for the realtiming lane
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 env:
+  CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
   IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
   COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-reference
   WAYLAND_COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-wayland-reference
@@ -25,6 +42,10 @@ jobs:
         ports: [5000:5000]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ inputs.source_repository || github.repository }}
+          ref: ${{ inputs.candidate_sha || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
@@ -42,7 +63,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          registry_reference="localhost:5000/wefty-echo-service:${GITHUB_SHA}-${ARCH}"
+          registry_reference="localhost:5000/wefty-echo-service:${CANDIDATE_SHA}-${ARCH}"
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
             --build-arg SOURCE_DATE_EPOCH=0 --file examples/oci-echo-service/Dockerfile \
             --output "type=oci,dest=$RUNNER_TEMP/acceptance-image.oci.tar,rewrite-timestamp=true" .
@@ -63,7 +84,7 @@ jobs:
           cp "$RUNNER_TEMP/acceptance-image.oci.tar" "$evidence/${ARCH}.oci.tar"
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
-          registry_reference="localhost:5000/wefty-echo-service:${GITHUB_SHA}-${ARCH}"
+          registry_reference="localhost:5000/wefty-echo-service:${CANDIDATE_SHA}-${ARCH}"
           platform_digest="$(cat "$evidence/${ARCH}.digest")"
           registry_digest="$("$crane" digest --insecure "$registry_reference")"
           test "$registry_digest" = "$platform_digest"
@@ -120,7 +141,7 @@ jobs:
       - name: Upload reproducibility and runtime evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: wefty-echo-service-platform-${{ matrix.arch }}-${{ github.sha }}
+          name: wefty-echo-service-platform-${{ matrix.arch }}-${{ env.CANDIDATE_SHA }}
           path: ${{ runner.temp }}/acceptance-image-linux
           if-no-files-found: error
 
@@ -141,6 +162,10 @@ jobs:
         ports: [5000:5000]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ inputs.source_repository || github.repository }}
+          ref: ${{ inputs.candidate_sha || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
@@ -162,7 +187,7 @@ jobs:
           LOCAL_NAME: ${{ matrix.local_name }}
         run: |
           set -euo pipefail
-          registry_reference="localhost:5000/${LOCAL_NAME}:${GITHUB_SHA}-${ARCH}"
+          registry_reference="localhost:5000/${LOCAL_NAME}:${CANDIDATE_SHA}-${ARCH}"
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
             --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" .
@@ -199,7 +224,7 @@ jobs:
           stage='crane-install'
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
-          registry_reference="localhost:5000/${LOCAL_NAME}:${GITHUB_SHA}-${ARCH}"
+          registry_reference="localhost:5000/${LOCAL_NAME}:${CANDIDATE_SHA}-${ARCH}"
           platform_digest="$(cat "$evidence/${ARCH}.digest")"
           stage='digest-compare'
           registry_digest="$("$crane" digest --insecure "$registry_reference")"
@@ -244,6 +269,157 @@ jobs:
       - name: Upload reference desktop evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ${{ matrix.artifact }}-platform-${{ matrix.arch }}-${{ github.sha }}
+          name: ${{ matrix.artifact }}-platform-${{ matrix.arch }}-${{ env.CANDIDATE_SHA }}
           path: ${{ runner.temp }}/computer-image-linux
+          if-no-files-found: error
+
+  package-pr-releases:
+    name: package-pr-releases
+    if: inputs.package_releases
+    needs: [reproducible-platform-build, reference-computer-platform-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ inputs.source_repository || github.repository }}
+          ref: ${{ inputs.candidate_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Download the PR-built platform artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: wefty-*-platform-*-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/platform-artifacts
+      - name: Assemble the echo release without a registry
+        run: |
+          set -euo pipefail
+          platforms="$RUNNER_TEMP/platform-artifacts"
+          echo_platforms="$RUNNER_TEMP/echo-platforms"
+          mkdir -p "$echo_platforms"
+          for arch in amd64 arm64; do
+            cp "$platforms/wefty-echo-service-platform-$arch-$CANDIDATE_SHA/$arch."* \
+              "$platforms/wefty-echo-service-platform-$arch-$CANDIDATE_SHA/${arch}-"* "$echo_platforms/"
+          done
+          archive="$RUNNER_TEMP/wefty-echo-service.oci.tar"
+          scripts/assemble-oci-index.sh --reference "$IMAGE_NAME" --output "$archive" \
+            --index-output "$RUNNER_TEMP/acceptance-image-index.json" \
+            --digest-output "$RUNNER_TEMP/acceptance-image-index-digest.txt" \
+            --image "linux/amd64=$echo_platforms/amd64.oci.tar" \
+            --image "linux/arm64=$echo_platforms/arm64.oci.tar"
+          index_digest="$(cat "$RUNNER_TEMP/acceptance-image-index-digest.txt")"
+          scripts/verify-acceptance-image.sh --archive "$archive" --expected-top-digest "$index_digest" \
+            --expected-platform linux/amd64 --expected-platform linux/arm64 \
+            --expected-platform-digest "linux/amd64=$(cat "$echo_platforms/amd64.digest")" \
+            --expected-platform-digest "linux/arm64=$(cat "$echo_platforms/arm64.digest")" \
+            --receipt-output "$RUNNER_TEMP/acceptance-image-archive-receipt.json"
+          jq -e --arg digest "$(cat "$echo_platforms/amd64.digest")" '.digest == $digest and .executed and .health and .echo and .elf_e_machine == 62' "$echo_platforms/amd64-runtime.json"
+          jq -e --arg digest "$(cat "$echo_platforms/arm64.digest")" '.digest == $digest and .executed and .health and .echo and .elf_e_machine == 183' "$echo_platforms/arm64-runtime.json"
+
+          release="$RUNNER_TEMP/acceptance-image-release"
+          package="$RUNNER_TEMP/acceptance-image-package"
+          mkdir -p "$release" "$package"
+          cp "$archive" "$release/wefty-echo-service.oci.tar"
+          for arch in amd64 arm64; do
+            root="$release/linux-$arch"
+            mkdir -p "$root/bin" "$root/libexec" "$root/share/wefty/oci"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false -ldflags='-buildid=' -o "$root/bin/wefty" ./cmd/wefty
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false -ldflags='-buildid=' -o "$root/libexec/wefty-agent" ./cmd/wefty-agent
+            scripts/build-oci-install-manifest.sh --helper "$root/libexec/wefty-agent" --probe-reference "$IMAGE_NAME" \
+              --probe-digest "$index_digest" --probe-archive "$release/wefty-echo-service.oci.tar" \
+              --output "$root/share/wefty/oci/manifest.json"
+            rm "$root/share/wefty/oci/wefty-echo-service.oci.tar"
+            ln "$release/wefty-echo-service.oci.tar" "$root/share/wefty/oci/wefty-echo-service.oci.tar"
+          done
+          cp "$RUNNER_TEMP/acceptance-image-index.json" "$release/"
+          cp "$RUNNER_TEMP/acceptance-image-index-digest.txt" "$release/"
+          cp "$RUNNER_TEMP/acceptance-image-archive-receipt.json" "$release/"
+          jq -n --arg commit "$CANDIDATE_SHA" --arg reference "$IMAGE_NAME" --arg index_digest "$index_digest" \
+            --arg amd64_digest "$(cat "$echo_platforms/amd64.digest")" --arg arm64_digest "$(cat "$echo_platforms/arm64.digest")" \
+            '{version:1,source:"pr-build",commit:$commit,reference:$reference,index_digest:$index_digest,platforms:{"linux/amd64":$amd64_digest,"linux/arm64":$arm64_digest},public_pull:false,archive_verified:true,runtime_verified:{"linux/amd64":true,"linux/arm64":true}}' \
+            > "$release/acceptance-image-receipt.json"
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$RUNNER_TEMP" \
+            -cf "$package/wefty-acceptance-image-release.tar" acceptance-image-release
+      - name: Assemble both Computer releases without a registry
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # $digest and $id are jq variables.
+          receipt_assertion='def pass($id): ([.checks[] | select(.id == $id and .status == "PASS")] | length) == 1; .digest == $digest and .image_status == "PASS" and .harness_status == "PASS" and .containerd_profile_status == "NOT-RUN" and (.checks | length) == 60 and pass("transport.view-ready") and pass("transport.control-ready") and pass("transport.text-frame-rejected") and pass("input.view-isolated") and pass("input.view-isolated-during-tenure") and pass("input.control-accepted") and pass("driver.true-consumed") and pass("driver.release-consumed") and pass("persistence.profile-survives") and pass("persistence.sign-in-survives") and pass("persistence.edge-recovers") and ([.checks[] | select(.scope != "containerd-profile" and .status != "PASS")] | length) == 0 and ([.checks[] | select(.scope == "containerd-profile" and .status != "NOT-RUN")] | length) == 0 and .readiness_seconds < 60'
+          furniture_assertion='.gpu_device_absent == true and .native_wayvnc_websocket == true and .view_disable_input == true and .agent_states_observed == ["idle","working","blocked","done"] and .self_reconfiguration_observed == true and .crash_briefing_observed == true and .mise_stubs_present == true and .license_manifest_present == true and .idle_rss_bytes > 0 and (.cold_start_seconds | type) == "number" and .cold_start_seconds < 60'
+          for variant in xfce wayland; do
+            if [ "$variant" = wayland ]; then
+              artifact=wefty-computer-wayland-reference
+              reference="$WAYLAND_COMPUTER_IMAGE_NAME"
+              prefix=wayland-computer
+              release_dir=wayland-computer-image-release
+            else
+              artifact=wefty-computer-reference
+              reference="$COMPUTER_IMAGE_NAME"
+              prefix=computer
+              release_dir=computer-image-release
+            fi
+            source_root="$RUNNER_TEMP/platform-artifacts"
+            platform_root="$RUNNER_TEMP/$prefix-platforms"
+            mkdir -p "$platform_root"
+            for arch in amd64 arm64; do
+              cp "$source_root/$artifact-platform-$arch-$CANDIDATE_SHA/$arch."* \
+                "$source_root/$artifact-platform-$arch-$CANDIDATE_SHA/${arch}-"* "$platform_root/"
+            done
+            archive="$RUNNER_TEMP/$artifact.oci.tar"
+            scripts/assemble-oci-index.sh --reference "$reference" --output "$archive" \
+              --index-output "$RUNNER_TEMP/$prefix-image-index.json" \
+              --digest-output "$RUNNER_TEMP/$prefix-image-index-digest.txt" \
+              --image "linux/amd64=$platform_root/amd64.oci.tar" \
+              --image "linux/arm64=$platform_root/arm64.oci.tar"
+            index_digest="$(cat "$RUNNER_TEMP/$prefix-image-index-digest.txt")"
+            scripts/verify-acceptance-image.sh --archive "$archive" --expected-top-digest "$index_digest" \
+              --expected-platform linux/amd64 --expected-platform linux/arm64 \
+              --expected-platform-digest "linux/amd64=$(cat "$platform_root/amd64.digest")" \
+              --expected-platform-digest "linux/arm64=$(cat "$platform_root/arm64.digest")" \
+              --receipt-output "$RUNNER_TEMP/$prefix-image-archive-receipt.json"
+            jq -e --arg digest "$(cat "$platform_root/amd64.digest")" "$receipt_assertion and .elf_e_machine == 62" "$platform_root/amd64-runtime.json"
+            jq -e --arg digest "$(cat "$platform_root/arm64.digest")" "$receipt_assertion and .elf_e_machine == 183" "$platform_root/arm64-runtime.json"
+            if [ "$variant" = wayland ]; then
+              jq -e "$furniture_assertion" "$platform_root/amd64-furniture.json"
+              jq -e "$furniture_assertion" "$platform_root/arm64-furniture.json"
+            fi
+
+            release="$RUNNER_TEMP/$release_dir"
+            package="$RUNNER_TEMP/$prefix-image-package"
+            mkdir -p "$release" "$package"
+            cp "$archive" "$release/"
+            cp "$RUNNER_TEMP/$prefix-image-index.json" "$release/"
+            cp "$RUNNER_TEMP/$prefix-image-index-digest.txt" "$release/"
+            cp "$RUNNER_TEMP/$prefix-image-archive-receipt.json" "$release/"
+            for arch in amd64 arm64; do
+              cp "$platform_root/$arch-runtime.json" "$release/$arch-runtime.json"
+              cp "$platform_root/$arch-metrics.json" "$release/$arch-metrics.json"
+              if [ "$variant" = wayland ]; then cp "$platform_root/$arch-furniture.json" "$release/$arch-furniture.json"; fi
+            done
+            jq -n --arg commit "$CANDIDATE_SHA" --arg reference "$reference" --arg index_digest "$index_digest" \
+              --arg amd64_digest "$(cat "$platform_root/amd64.digest")" --arg arm64_digest "$(cat "$platform_root/arm64.digest")" --arg variant "$variant" \
+              '{version:1,source:"pr-build",commit:$commit,reference:$reference,index_digest:$index_digest,platforms:{"linux/amd64":$amd64_digest,"linux/arm64":$arm64_digest},public_pull:false,archive_verified:true,runtime_verified:{"linux/amd64":true,"linux/arm64":true}} + (if $variant == "wayland" then {furniture_verified:{"linux/amd64":true,"linux/arm64":true}} else {} end)' \
+              > "$release/$prefix-image-receipt.json"
+            tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$RUNNER_TEMP" \
+              -cf "$package/$artifact-release.tar" "$release_dir"
+          done
+      - name: Upload the PR-built echo release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wefty-echo-service-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/acceptance-image-package
+          if-no-files-found: error
+      - name: Upload the PR-built Computer release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wefty-computer-reference-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/computer-image-package
+          if-no-files-found: error
+      - name: Upload the PR-built Wayland Computer release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wefty-computer-wayland-reference-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/wayland-computer-image-package
           if-no-files-found: error
