@@ -220,7 +220,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes e2fsprogs util-linux
+          sudo apt-get install --yes e2fsprogs skopeo util-linux
           if ! sudo iptables -I OUTPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT; then
             printf '%s\n' '::error::owner-scoped registry fault rule is unsupported'
             exit 1
@@ -307,21 +307,24 @@ jobs:
           WEFTY_AGENT="$release/linux-amd64/libexec/wefty-agent"
           WEFTY_CLI="$release/linux-amd64/bin/wefty"
           chmod 0755 "$WEFTY_AGENT" "$WEFTY_CLI"
-          docker buildx create --name wefty-realtiming --driver docker-container --use
-          docker buildx inspect --bootstrap
+          BASE_REFERENCE="wefty.local/echo-base:${CANDIDATE_SHA}"
+          skopeo copy --override-os linux --override-arch amd64 \
+            "oci-archive:$ECHO_ARCHIVE" "docker-daemon:$BASE_REFERENCE"
           NUMERIC_REFERENCE="wefty.local/service-data-numeric:${CANDIDATE_SHA}"
           NAMED_REFERENCE="wefty.local/service-data-named:${CANDIDATE_SHA}"
           install --directory --mode=0755 /tmp/wefty-service-data-numeric /tmp/wefty-service-data-named
-          printf '%s\n' "FROM $ECHO_REFERENCE@$ECHO_DIGEST" 'USER 13001:13002' > /tmp/wefty-service-data-numeric/Dockerfile
-          docker buildx build --platform linux/amd64 --tag "$NUMERIC_REFERENCE" \
-            --output type=oci,dest=/tmp/wefty-service-data-numeric.oci.tar /tmp/wefty-service-data-numeric
+          printf '%s\n' "FROM $BASE_REFERENCE" 'USER 13001:13002' > /tmp/wefty-service-data-numeric/Dockerfile
+          docker build --pull=false --platform linux/amd64 --tag "$NUMERIC_REFERENCE" /tmp/wefty-service-data-numeric
+          skopeo copy "docker-daemon:$NUMERIC_REFERENCE" \
+            "oci-archive:/tmp/wefty-service-data-numeric.oci.tar:$NUMERIC_REFERENCE"
           printf '%s\n' \
-            "FROM $ECHO_REFERENCE@$ECHO_DIGEST" \
+            "FROM $BASE_REFERENCE" \
             'RUN printf "wefty:x:12001:12002:wefty:/nonexistent:/bin/sh\n" >> /etc/passwd && printf "wefty:x:12002:\n" >> /etc/group' \
             'USER wefty:wefty' \
             > /tmp/wefty-service-data-named/Dockerfile
-          docker buildx build --platform linux/amd64 --tag "$NAMED_REFERENCE" \
-            --output type=oci,dest=/tmp/wefty-service-data-named.oci.tar /tmp/wefty-service-data-named
+          docker build --pull=false --platform linux/amd64 --tag "$NAMED_REFERENCE" /tmp/wefty-service-data-named
+          skopeo copy "docker-daemon:$NAMED_REFERENCE" \
+            "oci-archive:/tmp/wefty-service-data-named.oci.tar:$NAMED_REFERENCE"
           chmod 0644 /tmp/wefty-service-data-numeric.oci.tar /tmp/wefty-service-data-named.oci.tar
           sudo install --owner=root --group=root --mode=0755 "$WEFTY_AGENT" /usr/local/libexec/wefty-agent-oci-realtiming
           HELPER_CHECKSUM="sha256:$(sha256sum "$WEFTY_AGENT" | cut -d' ' -f1)"
