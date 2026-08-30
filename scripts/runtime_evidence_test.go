@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -46,7 +47,18 @@ func TestRuntimeEvidenceDiagnosticsNameEveryTerminalFailure(t *testing.T) {
 }
 
 func TestDriverWatcherUsesOneExactByteRead(t *testing.T) {
-	command := exec.Command("python3", "-m", "unittest", "../examples/computer/test_watch_driver.py")
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skipf("python3 unavailable; watcher exact-byte regression not run: %v", err)
+	}
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("could not resolve runtime_evidence_test.go path")
+	}
+	repositoryRoot := filepath.Dir(filepath.Dir(source))
+	testPath := filepath.Join(repositoryRoot, "examples", "computer", "test_watch_driver.py")
+	command := exec.Command(python, testPath)
+	command.Dir = repositoryRoot
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("driver watcher regression failed: %v\n%s", err, output)
 	}
