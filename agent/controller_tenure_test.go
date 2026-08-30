@@ -650,6 +650,76 @@ func TestComputerFrontDoorRevocationWhileDrivingClosesControlBeforeSession(t *te
 	}
 }
 
+func TestComputerFrontDoorRegistersControlTokenBeforePublishingBanner(t *testing.T) {
+	fixture, _, auditor, _, originalServer, _ := computerFrontDoorFixture(t, l1.ComputerGrantControl)
+	originalServer.Close()
+	controlBackend := newComputerBackend(t, computerBackendOptions{})
+	defer controlBackend.Close()
+	config := fixture.frontDoor.config
+	originalDial := config.dial
+	config.dial = func(ctx context.Context, name string) (net.Conn, error) {
+		if name == workloadrunner.AttemptEndpointControl {
+			return controlBackend.dial(ctx)
+		}
+		return originalDial(ctx, name)
+	}
+	tenure, err := newControllerTenure(controllerTenureConfig{
+		authorityContext: config.authorityContext, clock: config.clock, dial: config.dial,
+		setControlState: func(context.Context, bool) error { return nil },
+		record: func(ctx context.Context, event l1.ComputerTakeoverAuditEvent) (l1.ComputerTakeoverAuditReceipt, error) {
+			return auditor.AppendComputerTakeoverAudit(ctx, config.computerID, config.jobID, config.attemptID,
+				l1.ComputerTakeoverAuditRequest{FencingToken: config.fencingToken, Event: event})
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.controlTenure = tenure
+	registrationEntered := make(chan struct{})
+	releaseRegistration := make(chan struct{})
+	config.beforeControlSessionRegistration = func() {
+		close(registrationEntered)
+		<-releaseRegistration
+	}
+	frontDoor, err := newComputerFrontDoor(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontDoor.SetReady(true)
+	server := httptest.NewServer(frontDoor)
+	defer server.Close()
+	connection, token := dialComputerFrontDoorWithToken(t, server.URL, nil)
+	defer connection.CloseNow()
+	type bannerResult struct {
+		kind    websocket.MessageType
+		payload []byte
+		err     error
+	}
+	banner := make(chan bannerResult, 1)
+	go func() {
+		kind, payload, err := connection.Read(t.Context())
+		banner <- bannerResult{kind: kind, payload: payload, err: err}
+	}()
+	<-registrationEntered
+	var publishedBeforeRegistration bool
+	select {
+	case <-banner:
+		publishedBeforeRegistration = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseRegistration)
+	if publishedBeforeRegistration {
+		t.Fatal("Computer banner became actionable before control-token registration")
+	}
+	result := <-banner
+	if result.err != nil || result.kind != websocket.MessageBinary || string(result.payload) != "RFB 003.008\n" {
+		t.Fatalf("view banner = %q kind=%v err=%v", result.payload, result.kind, result.err)
+	}
+	if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusOK {
+		t.Fatalf("immediate take status = %d", status)
+	}
+}
+
 type controllerTenureFixture struct {
 	testing         *testing.T
 	tenure          *controllerTenure

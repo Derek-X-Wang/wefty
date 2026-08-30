@@ -813,12 +813,13 @@ func waitComputerAuditKind(t *testing.T, auditor *recordingComputerAuditor, kind
 }
 
 type computerBackendOptions struct {
-	requiredPath  string
-	subprotocol   string
-	noSubprotocol bool
-	textBanner    bool
-	httpOnly      bool
-	echoPrefix    string
+	requiredPath         string
+	subprotocol          string
+	noSubprotocol        bool
+	textBanner           bool
+	httpOnly             bool
+	ignoreCloseHandshake bool
+	echoPrefix           string
 }
 
 type computerBackendServer struct {
@@ -859,6 +860,13 @@ func newComputerBackend(t *testing.T, options computerBackendOptions) *computerB
 			messageType = websocket.MessageText
 		}
 		if err := connection.Write(request.Context(), messageType, []byte("RFB 003.008\n")); err != nil {
+			return
+		}
+		if options.ignoreCloseHandshake {
+			select {
+			case <-request.Context().Done():
+			case <-time.After(time.Second):
+			}
 			return
 		}
 		for {

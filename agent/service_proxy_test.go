@@ -18,6 +18,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -981,12 +982,29 @@ func (runner *readinessRunner) publishReadiness(t *testing.T, ready bool) {
 	}
 }
 
+const (
+	// The adapter can spend one second on each signal RPC and carries a
+	// separate one-second post-KILL margin after the helper release bound.
+	serviceOutcomeReleaseMargin = 3 * time.Second
+	serviceOutcomeTimeout       = processrunner.DefaultTerminationGraceTime + ocihelper.DefaultTaskReleaseTimeout + serviceOutcomeReleaseMargin
+)
+
+func TestServiceOutcomeWaitSeparatesTerminationAndTaskReleaseBounds(t *testing.T) {
+	const maximumFixtureTrapDelay = 100 * time.Millisecond
+	want := processrunner.DefaultTerminationGraceTime + ocihelper.DefaultTaskReleaseTimeout + serviceOutcomeReleaseMargin
+	if serviceOutcomeTimeout != want || serviceOutcomeReleaseMargin <= maximumFixtureTrapDelay {
+		t.Fatalf("service outcome timeout=%s margin=%s, want grace %s + release %s with margin above %s",
+			serviceOutcomeTimeout, serviceOutcomeReleaseMargin, processrunner.DefaultTerminationGraceTime,
+			ocihelper.DefaultTaskReleaseTimeout, maximumFixtureTrapDelay)
+	}
+}
+
 func waitServiceOutcome(t *testing.T, outcomes <-chan serviceRunOutcome) serviceRunOutcome {
 	t.Helper()
 	select {
 	case outcome := <-outcomes:
 		return outcome
-	case <-time.After(5 * time.Second):
+	case <-time.After(serviceOutcomeTimeout):
 		t.Fatal("timed out waiting for supervised service outcome")
 		return serviceRunOutcome{}
 	}

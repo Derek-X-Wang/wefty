@@ -20,6 +20,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/lima"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -42,6 +43,11 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
+	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	intentSource := lima.FileIntentSource{Path: intentPath}
 	runtime := newIntentStopRuntime()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "intent-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
@@ -54,7 +60,14 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 		Capabilities: map[string]bool{
 			"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
 		},
-		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		CapabilityProbe: capabilityProbeFunc(func(ctx context.Context) (CapabilityProbeResult, error) {
+			intent, err := intentSource.ReadIntent(ctx)
+			if err != nil || !intent.Enabled {
+				if err == nil {
+					err = errors.New("OCI intent is disabled")
+				}
+				return CapabilityProbeResult{MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonOCIIntentDisabled}, err
+			}
 			return CapabilityProbeResult{Capabilities: map[string]bool{
 				"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
 			}}, nil
@@ -83,7 +96,13 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 		t.Fatalf("intent-stop OCI service did not start: job=%+v nodes=%+v agent=%+v", current, nodes, nodeAgent.Status())
 	}
 	stopDone := make(chan error, 1)
-	go func() { stopDone <- nodeAgent.StopOCIRuntime(t.Context()) }()
+	go func() {
+		_, stopErr := lima.SetOCIIntent(t.Context(), intentPath, 1, false, time.Now())
+		if stopErr == nil {
+			stopErr = nodeAgent.StopOCIRuntime(t.Context())
+		}
+		stopDone <- stopErr
+	}()
 	runtime.waitCanceled(t)
 	// Cancellation is now the only ready lifecycle branch. Delay terminal
 	// publication until it has won, reproducing the native payload ordering.
@@ -92,18 +111,60 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 		cancelRun()
 		t.Fatal(err)
 	}
-	time.Sleep(600 * time.Millisecond)
-	reconciliation, err := store.Reconcile(t.Context())
-	if err != nil || reconciliation.ExpiredAttempts != 1 {
-		cancelRun()
-		t.Fatalf("intent-stop reconciliation=%+v err=%v", reconciliation, err)
+	convergenceResults := make(chan error, 4)
+	for range 4 {
+		go func() { convergenceResults <- nodeAgent.RecoverOCIRuntimeCapabilities(t.Context()) }()
 	}
-	queued, err := store.GetJob(t.Context(), job.JobID)
-	if err != nil || queued.State != contract.JobQueued || queued.CurrentAttemptID != attemptID ||
+	for range 4 {
+		if err := <-convergenceResults; err == nil {
+			cancelRun()
+			t.Fatal("background OCI convergence recovered across durable disabled intent")
+		}
+	}
+	if snapshot := nodeAgent.CapabilitySnapshot(); snapshot.Capabilities["kind:oci"] || snapshot.ReasonCode != contract.CapabilityReasonOCIIntentDisabled {
+		cancelRun()
+		t.Fatalf("disabled OCI intent capability snapshot=%+v", snapshot)
+	}
+	queued, err := waitForFailureJobState(store, job.JobID, contract.JobQueued, 3*time.Second)
+	if err != nil {
+		cancelRun()
+		t.Fatal(err)
+	}
+	reconciliation, err := store.Reconcile(t.Context())
+	// Observing queued above proves the server's periodic reconciler serialized
+	// first; a second pass must report no duplicate transition.
+	if err != nil || reconciliation.ExpiredAttempts != 0 {
+		cancelRun()
+		t.Fatalf("post-intent-stop idempotent reconciliation=%+v err=%v", reconciliation, err)
+	}
+	attempts, err := store.ListJobAttempts(t.Context(), job.JobID)
+	if err != nil || len(attempts) != 1 || attempts[0].AttemptID != attemptID || attempts[0].State != contract.AttemptLost || attempts[0].Result != nil {
+		cancelRun()
+		t.Fatalf("intent-stop expiry evidence=%+v err=%v", attempts, err)
+	}
+	if queued.State != contract.JobQueued || queued.CurrentAttemptID != attemptID ||
 		queued.BoundNodeID != "intent-node" || queued.RestartStreak != 0 ||
 		runtime.starts.Load() != 1 {
 		cancelRun()
 		t.Fatalf("intent-stop service=%+v starts=%d err=%v", queued, runtime.starts.Load(), err)
+	}
+	started, err := lima.SetOCIIntent(t.Context(), intentPath, 2, true, time.Now())
+	if err == nil {
+		err = nodeAgent.RecoverOCIRuntimeCapabilities(t.Context())
+	}
+	if err != nil || !started.Enabled || !nodeAgent.OCIRuntimeLive() {
+		cancelRun()
+		t.Fatalf("explicit OCI start intent=%+v live=%t err=%v", started, nodeAgent.OCIRuntimeLive(), err)
+	}
+	select {
+	case nextAttemptID := <-runtime.started:
+		if nextAttemptID == attemptID || runtime.starts.Load() != 2 {
+			cancelRun()
+			t.Fatalf("explicit OCI start attempt=%q prior=%q starts=%d", nextAttemptID, attemptID, runtime.starts.Load())
+		}
+	case <-time.After(5 * time.Second):
+		cancelRun()
+		t.Fatal("explicit OCI start did not restore service admission")
 	}
 	cancelRun()
 	if err := <-runDone; err != nil {
@@ -1620,7 +1681,7 @@ type finalizationAnchorRunner struct {
 
 type intentStopRuntime struct {
 	started  chan string
-	canceled chan struct{}
+	canceled chan string
 	releaseC chan struct{}
 	once     sync.Once
 	starts   atomic.Int32
@@ -1683,7 +1744,7 @@ func (runtime *outcomeFirstIntentRuntime) complete() {
 }
 
 func newIntentStopRuntime() *intentStopRuntime {
-	return &intentStopRuntime{started: make(chan string, 1), canceled: make(chan struct{}), releaseC: make(chan struct{})}
+	return &intentStopRuntime{started: make(chan string, 1), canceled: make(chan string, 2), releaseC: make(chan struct{})}
 }
 
 func (runtime *intentStopRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
@@ -1694,7 +1755,7 @@ func (runtime *intentStopRuntime) Run(ctx context.Context, request workloadrunne
 	runtime.starts.Add(1)
 	runtime.started <- request.Authority.AttemptID
 	<-ctx.Done()
-	close(runtime.canceled)
+	runtime.canceled <- request.Authority.AttemptID
 	<-runtime.releaseC
 	return workloadrunner.Result{Outcome: contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}}, context.Cause(ctx)
 }

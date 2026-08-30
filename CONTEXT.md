@@ -51,6 +51,12 @@ A boot-scoped monotonic revision over a node's complete observed capability
 set. Only a higher revision can replace the set within that boot session.
 _Avoid_: capability version, feature flag, health generation
 
+**OCI intent**:
+The revisioned node-local operator decision that the OCI runtime is enabled
+or disabled. Capability reports what the node can do now; OCI intent records
+whether the agent is allowed to make it available.
+_Avoid_: runtime status, capability toggle, autostart preference
+
 **Job**:
 The L1 schedulable unit, routed to nodes by subset tag matching.
 _Avoid_: task, work item
