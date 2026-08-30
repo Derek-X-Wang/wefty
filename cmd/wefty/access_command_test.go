@@ -296,15 +296,22 @@ func TestAccessCLIErrorProjectionAndScopedExitCodes(t *testing.T) {
 	}
 	receipt := contract.ComputerControlReceipt{ComputerID: "computer-1", Action: "take",
 		AdmittedMode: string(l1.ComputerAdmittedView), TenureState: contract.ComputerControlTenureFree,
-		PolicyRevision: 9, HumanDriving: false, SignalStayedTrue: false}
+		PolicyRevision: 9, HumanDriving: false, SignalStayedTrue: false,
+		SessionEndReason: string(l1.ComputerTakeoverRevoked)}
 	actionErr := &takeoverActionError{APIError: contract.APIError{Code: contract.ErrorTenureUnavailable,
 		Message: "replacement failed", Retryable: false}, Receipt: &receipt}
 	var failureJSON bytes.Buffer
 	writeCommandError(&failureJSON, actionErr, true)
 	var failure contract.ComputerControlErrorResponse
 	if err := json.Unmarshal(failureJSON.Bytes(), &failure); err != nil || failure.Receipt == nil ||
-		failure.Receipt.TenureState != contract.ComputerControlTenureFree || failure.Receipt.HumanDriving {
+		failure.Receipt.TenureState != contract.ComputerControlTenureFree || failure.Receipt.HumanDriving ||
+		failure.Receipt.SessionEndReason != string(l1.ComputerTakeoverRevoked) {
 		t.Fatalf("failed replacement JSON = %s err=%v", failureJSON.String(), err)
+	}
+	var failureText bytes.Buffer
+	writeCommandError(&failureText, actionErr, false)
+	if !strings.Contains(failureText.String(), "SESSION END REASON\trevoked") {
+		t.Fatalf("failed replacement text = %q", failureText.String())
 	}
 }
 

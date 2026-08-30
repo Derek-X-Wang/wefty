@@ -106,6 +106,13 @@ func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.
 			t.Fatalf("audit identity/privacy = %#v", event)
 		}
 	}
+	failure := postComputerControlFailure(t, server.URL, computerControlTakePath, token)
+	if failure.status != http.StatusGone || failure.body.Error.Code != contract.ErrorTakeoverSessionEnded || failure.body.Receipt == nil ||
+		failure.body.Receipt.ComputerID != "computer-1" || failure.body.Receipt.Action != "take" ||
+		failure.body.Receipt.TenureState != contract.ComputerControlTenureFree ||
+		failure.body.Receipt.SessionEndReason != string(l1.ComputerTakeoverRevoked) {
+		t.Fatalf("revoked session control response = status=%d body=%+v", failure.status, failure.body)
+	}
 }
 
 func TestComputerFrontDoorIgnoresClientAuthorityHeaders(t *testing.T) {
@@ -712,6 +719,30 @@ func postComputerControl(t *testing.T, serverURL, path, token string) int {
 	}
 	defer response.Body.Close()
 	return response.StatusCode
+}
+
+type computerControlFailure struct {
+	status int
+	body   contract.ComputerControlErrorResponse
+}
+
+func postComputerControlFailure(t *testing.T, serverURL, path, token string) computerControlFailure {
+	t.Helper()
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, serverURL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(computerControlTokenHeader, token)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var body contract.ComputerControlErrorResponse
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode Computer control error: %v", err)
+	}
+	return computerControlFailure{status: response.StatusCode, body: body}
 }
 
 type mutableWhoIsFabric struct {

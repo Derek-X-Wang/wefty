@@ -1456,12 +1456,13 @@ func exerciseNativeLinuxServiceData(t *testing.T, ctx context.Context, barrier *
 			script := fmt.Sprintf(`
 set -eu
 test "$(stat -c '%%u:%%g' /wefty/service)" = %q
-test ! -e /rootfs-attempt-marker
+# The rootfs-discard witness must remain writable by numeric and named image users.
+test ! -e /tmp/wefty-rootfs-attempt-marker
 prior=0
 if test -f /wefty/service/attempt-count; then prior="$(cat /wefty/service/attempt-count)"; fi
 test "$prior" -eq %d
 printf '%%d\n' %d > /wefty/service/attempt-count
-touch /rootfs-attempt-marker
+touch /tmp/wefty-rootfs-attempt-marker
 `, image.owner, attempt-1, attempt)
 			request := nativeAdapterRequest(image.reference, image.digest, fmt.Sprintf("%s-%d", jobID, attempt), nil)
 			request.Authority.JobID = jobID
@@ -1566,7 +1567,11 @@ func runNativeEchoService(t *testing.T, ctx context.Context, barrier *ocihelper.
 		if time.Now().After(deadline) {
 			t.Fatalf("echo service health did not become ready: %v", err)
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case result := <-runDone:
+			t.Fatalf("echo service exited before health readiness: result=%+v err=%v", result.result.Outcome, result.err)
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 	if health.ServiceDirectory != "/wefty/service" || health.ListeningPort != int(endpoint.Port) {
 		t.Fatalf("echo service health = %+v endpoint=%+v", health, endpoint)

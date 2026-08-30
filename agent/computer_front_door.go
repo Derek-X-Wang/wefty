@@ -144,11 +144,12 @@ type computerFrontDoorConfig struct {
 // Fabric front door; neither person identity nor policy role can name another
 // session's take or release operation.
 type computerSessionHandle struct {
-	id      string
-	canTake bool
-	admin   bool
-	tenure  ControlTenure
-	session context.Context
+	id             string
+	canTake        bool
+	admin          bool
+	policyRevision int64
+	tenure         ControlTenure
+	session        context.Context
 }
 
 type activeComputerSession struct {
@@ -160,13 +161,17 @@ type activeComputerSession struct {
 func (handle *computerSessionHandle) CanTake() bool { return handle != nil && handle.canTake }
 
 func (handle *computerSessionHandle) Take(ctx context.Context) (contract.ComputerControlReceipt, error) {
-	if !handle.CanTake() {
+	if handle == nil {
 		return contract.ComputerControlReceipt{}, &ComputerTenureError{Code: ComputerTenureUnauthorized}
 	}
 	select {
 	case <-handle.session.Done():
-		return contract.ComputerControlReceipt{}, &ComputerTenureError{Code: ComputerTenureSessionEnded}
+		return handle.terminalReceipt(computerSessionEndReason(handle.session, l1.ComputerTakeoverClientClosed)),
+			&ComputerTenureError{Code: ComputerTenureSessionEnded}
 	default:
+	}
+	if !handle.CanTake() {
+		return contract.ComputerControlReceipt{}, &ComputerTenureError{Code: ComputerTenureUnauthorized}
 	}
 	return handle.tenure.TakeReceipt(ctx, handle.id)
 }
@@ -176,8 +181,30 @@ func (handle *computerSessionHandle) Release(ctx context.Context) (contract.Comp
 		return contract.ComputerControlReceipt{AdmittedMode: string(l1.ComputerAdmittedView),
 			TenureState: contract.ComputerControlTenureFree}, nil
 	}
+	select {
+	case <-handle.session.Done():
+		return handle.terminalReceipt(computerSessionEndReason(handle.session, l1.ComputerTakeoverClientClosed)),
+			&ComputerTenureError{Code: ComputerTenureSessionEnded}
+	default:
+	}
 	return handle.tenure.ReleaseReceipt(ctx, handle.id, l1.ComputerTakeoverExplicitRelease)
 }
+
+func (handle *computerSessionHandle) terminalReceipt(reason l1.ComputerTakeoverReason) contract.ComputerControlReceipt {
+	return contract.ComputerControlReceipt{
+		AdmittedMode:     string(l1.ComputerAdmittedView),
+		TenureState:      contract.ComputerControlTenureFree,
+		PolicyRevision:   handle.policyRevision,
+		SessionEndReason: string(reason),
+	}
+}
+
+type closedComputerSession struct {
+	identity fabric.Identity
+	receipt  contract.ComputerControlReceipt
+}
+
+const maximumClosedComputerSessionTokens = 256
 
 type computerFrontDoor struct {
 	config        computerFrontDoorConfig
@@ -189,6 +216,8 @@ type computerFrontDoor struct {
 	ready         bool
 	active        map[string]*activeComputerSession
 	tokens        map[string]*activeComputerSession
+	closedTokens  map[string]closedComputerSession
+	closedOrder   []string
 	sessionCond   *sync.Cond
 	sessionCount  int
 }
@@ -238,7 +267,7 @@ func newComputerFrontDoor(config computerFrontDoorConfig) (*computerFrontDoor, e
 	}
 	frontDoor := &computerFrontDoor{
 		config: config, errors: make(chan error, 16), active: make(map[string]*activeComputerSession),
-		tokens: make(map[string]*activeComputerSession),
+		tokens: make(map[string]*activeComputerSession), closedTokens: make(map[string]closedComputerSession),
 	}
 	frontDoor.sessionCond = sync.NewCond(&frontDoor.mu)
 	frontDoor.denials = newComputerDenialCoalescer(frontDoor)
@@ -345,11 +374,24 @@ func (frontDoor *computerFrontDoor) serveControlAction(writer http.ResponseWrite
 			Message: "Computer control session token is required"}, nil)
 		return
 	}
+	token := values[0]
 	frontDoor.mu.Lock()
-	session := frontDoor.tokens[values[0]]
+	session := frontDoor.tokens[token]
+	closed, wasClosed := frontDoor.closedTokens[token]
 	frontDoor.mu.Unlock()
-	if session == nil || session.identity.Kind != identity.Kind || session.identity.FabricID != identity.FabricID ||
-		session.identity.UserID != identity.UserID || session.identity.DeviceID != identity.DeviceID {
+	if session == nil && wasClosed && sameComputerSessionIdentity(closed.identity, identity) {
+		action := "release"
+		if request.URL.Path == computerControlTakePath {
+			action = "take"
+		}
+		receipt := closed.receipt
+		receipt.ComputerID = frontDoor.config.computerID
+		receipt.Action = action
+		writeComputerControlError(writer, http.StatusGone, contract.APIError{Code: contract.ErrorTakeoverSessionEnded,
+			Message: "Computer " + action + " was refused because the session ended"}, &receipt)
+		return
+	}
+	if session == nil || !sameComputerSessionIdentity(session.identity, identity) {
 		writeComputerControlError(writer, http.StatusUnauthorized, contract.APIError{Code: contract.ErrorUnauthorized,
 			Message: "Computer control session is not active for this identity"}, nil)
 		return
@@ -392,6 +434,10 @@ func (frontDoor *computerFrontDoor) serveControlAction(writer http.ResponseWrite
 	frontDoor.report(fmt.Errorf("perform Computer control action: %w", err))
 	writeComputerControlError(writer, http.StatusServiceUnavailable, contract.APIError{Code: contract.ErrorTenureUnavailable,
 		Message: "Computer Controller tenure is unavailable"}, &receipt)
+}
+
+func sameComputerSessionIdentity(left, right fabric.Identity) bool {
+	return left.Kind == right.Kind && left.FabricID == right.FabricID && left.UserID == right.UserID && left.DeviceID == right.DeviceID
 }
 
 func writeComputerControlError(writer http.ResponseWriter, status int, apiError contract.APIError, receipt *contract.ComputerControlReceipt) {
@@ -478,7 +524,8 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 		return
 	}
 	relay := newComputerSessionRelay(client, backend, clientWebSocket, backendWebSocket)
-	handle := &computerSessionHandle{id: sessionID, canTake: authorization.CanTake(), admin: authorization.IsAdministrator(), tenure: frontDoor.config.controlTenure, session: sessionContext}
+	handle := &computerSessionHandle{id: sessionID, canTake: authorization.CanTake(), admin: authorization.IsAdministrator(),
+		policyRevision: authorization.PolicyRevision(), tenure: frontDoor.config.controlTenure, session: sessionContext}
 	if frontDoor.config.beforeControlSessionRegistration != nil {
 		frontDoor.config.beforeControlSessionRegistration()
 	}
@@ -507,10 +554,12 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	frontDoor.tokens[controlToken] = active
 	frontDoor.sessionCount++
 	frontDoor.mu.Unlock()
+	endReason := l1.ComputerTakeoverClientClosed
 	defer func() {
 		frontDoor.mu.Lock()
 		delete(frontDoor.active, sessionID)
 		delete(frontDoor.tokens, controlToken)
+		frontDoor.rememberClosedTokenLocked(controlToken, closedComputerSession{identity: identity, receipt: handle.terminalReceipt(endReason)})
 		frontDoor.sessionCount--
 		frontDoor.sessionCond.Broadcast()
 		frontDoor.mu.Unlock()
@@ -524,6 +573,7 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	relay.Start()
 
 	reason := frontDoor.waitForSessionEnd(sessionContext, request.RemoteAddr, identity, authorization, relay, admittedAt)
+	endReason = reason
 	cancelSession(&computerSessionEnd{reason: reason})
 	relay.Close()
 	// A policy drain acknowledges the observable socket boundary. Durable
@@ -533,6 +583,17 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 		frontDoor.report(fmt.Errorf("release Computer control tenure: %w", err))
 	}
 	frontDoor.finishSession(request.Context(), baseEvent, reason)
+}
+
+func (frontDoor *computerFrontDoor) rememberClosedTokenLocked(token string, session closedComputerSession) {
+	frontDoor.closedTokens[token] = session
+	frontDoor.closedOrder = append(frontDoor.closedOrder, token)
+	if len(frontDoor.closedOrder) <= maximumClosedComputerSessionTokens {
+		return
+	}
+	oldest := frontDoor.closedOrder[0]
+	frontDoor.closedOrder = frontDoor.closedOrder[1:]
+	delete(frontDoor.closedTokens, oldest)
 }
 
 // newComputerSessionContext translates generic parent cancellation into the

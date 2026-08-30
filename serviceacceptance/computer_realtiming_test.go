@@ -1301,15 +1301,44 @@ func observationHasPointer(observation liveInputObservation, x, y int) bool {
 	return false
 }
 
+func freshPointerSentinels(observation liveInputObservation) ([2]int, [2]int) {
+	// PointerHistory is cumulative and already contains conformance-probe input.
+	// Choose this proof's coordinates after reading that baseline so an older
+	// control event cannot be attributed to the current view-only session.
+	candidates := [...][2]int{{313, 257}, {677, 389}, {853, 521}, {419, 683}}
+	fresh := make([][2]int, 0, 2)
+	for _, point := range candidates {
+		if !observationHasPointer(observation, point[0], point[1]) {
+			fresh = append(fresh, point)
+			if len(fresh) == 2 {
+				return fresh[0], fresh[1]
+			}
+		}
+	}
+	return [2]int{}, [2]int{}
+}
+
+func TestFreshPointerSentinelsIgnorePriorConformanceInput(t *testing.T) {
+	observation := liveInputObservation{PointerHistory: [][2]int{{211, 173}, {947, 611}, {313, 257}}}
+	view, control := freshPointerSentinels(observation)
+	if view != [2]int{677, 389} || control != [2]int{853, 521} {
+		t.Fatalf("fresh pointer sentinels = %v, %v", view, control)
+	}
+}
+
 func proveLiveViewInputIsolation(t *testing.T, harness *acceptanceHarness, computer l1.Computer, viewerUser, viewerDevice string) bool {
 	t.Helper()
 	if computer.DisplayEndpoint == nil {
 		t.Fatal("Computer omitted its live display endpoint")
 	}
 	before := readLiveInputObservation(t, computer.CurrentJobID)
+	viewPointer, controlPointer := freshPointerSentinels(before)
+	if viewPointer == ([2]int{}) || controlPointer == ([2]int{}) {
+		t.Fatal("Computer input history exhausted the isolation sentinels")
+	}
 	view := openLiveRFBSession(t, *computer.DisplayEndpoint, viewerUser, viewerDevice)
 	defer view.close()
-	view.sendPointer(t, 211, 173)
+	view.sendPointer(t, viewPointer[0], viewPointer[1])
 	control := openLiveRFBSession(t, *computer.DisplayEndpoint, "linux-admin", "linux-input-sentinel-device")
 	defer control.close()
 	controlCapability := control.capabilityFile(t)
@@ -1318,20 +1347,20 @@ func proveLiveViewInputIsolation(t *testing.T, harness *acceptanceHarness, compu
 	if take.TenureState != contract.ComputerControlTenureHeld {
 		t.Fatalf("control sentinel take = %#v", take)
 	}
-	control.sendPointer(t, 947, 611)
+	control.sendPointer(t, controlPointer[0], controlPointer[1])
 	var after liveInputObservation
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		after = readLiveInputObservation(t, computer.CurrentJobID)
-		if after.Generation > before.Generation && observationHasPointer(after, 947, 611) {
+		if after.Generation > before.Generation && observationHasPointer(after, controlPointer[0], controlPointer[1]) {
 			break
 		}
 		time.Sleep(125 * time.Millisecond)
 	}
 	_ = runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-admin", "linux-input-sentinel-device",
 		"services", "takeover", "release", computer.ComputerID, "--session-token-file", controlCapability)
-	return after.Generation > before.Generation && observationHasPointer(after, 947, 611) &&
-		!observationHasPointer(after, 211, 173) && after.KeyEvents == before.KeyEvents
+	return after.Generation > before.Generation && observationHasPointer(after, controlPointer[0], controlPointer[1]) &&
+		!observationHasPointer(after, viewPointer[0], viewPointer[1]) && after.KeyEvents == before.KeyEvents
 }
 
 func takeoverAuditEvidence(audit l1.ComputerTakeoverAuditList) (map[l1.ComputerTakeoverAuditEventKind]bool, int64) {
