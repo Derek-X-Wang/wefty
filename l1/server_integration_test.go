@@ -3,6 +3,7 @@ package l1
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,52 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 )
+
+func TestServeTreatsInitialReconcileRollbackRaceAsShutdown(t *testing.T) {
+	testServeTreatsInitialReconcileCancellationArtifactAsShutdown(t, sql.ErrTxDone)
+}
+
+type sqliteInterruptTestError struct{}
+
+func (sqliteInterruptTestError) Error() string { return "interrupted (9)" }
+func (sqliteInterruptTestError) Code() int     { return sqliteInterruptPrimaryCode }
+
+func TestServeTreatsInitialReconcileSQLiteInterruptAsShutdown(t *testing.T) {
+	testServeTreatsInitialReconcileCancellationArtifactAsShutdown(t, sqliteInterruptTestError{})
+}
+
+func testServeTreatsInitialReconcileCancellationArtifactAsShutdown(t *testing.T, cause error) {
+	t.Helper()
+	network := plain.NewNetwork()
+	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
+	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := NewServer(serverFabric, store, ServerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	server.reconcile = func(ctx context.Context) (ReconcileResult, error) {
+		close(entered)
+		<-ctx.Done()
+		return ReconcileResult{}, internalError(cause, "commit L1 reconciliation")
+	}
+	listener, err := serverFabric.Listen("tcp", "wefty://control-plane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, listener) }()
+	<-entered
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Serve initial reconciliation shutdown race = %v", err)
+	}
+}
 
 func TestServeReportsReconcileFailureRacingShutdown(t *testing.T) {
 	network := plain.NewNetwork()

@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -225,8 +226,25 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	return err
 }
 
+const sqliteInterruptPrimaryCode = 9
+
+type sqliteErrorCoder interface {
+	Code() int
+}
+
 func reconciliationCanceledByShutdown(ctx context.Context, err error) bool {
-	return ctx.Err() != nil && errors.Is(err, ctx.Err())
+	if ctx.Err() == nil {
+		return false
+	}
+	// database/sql may win the cancellation race by rolling the transaction
+	// back before Commit observes the canceled context. Commit then reports
+	// ErrTxDone rather than wrapping the context error. The SQLite driver may
+	// instead report the interrupt it issued when that same context closed.
+	if errors.Is(err, ctx.Err()) || errors.Is(err, sql.ErrTxDone) {
+		return true
+	}
+	var sqliteErr sqliteErrorCoder
+	return errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqliteInterruptPrimaryCode
 }
 
 type principal int
