@@ -32,20 +32,17 @@ def read_document() -> tuple[bool, str, str]:
         return state, fingerprint, "valid"
     except FileNotFoundError:
         return False, "missing", "missing"
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        fingerprint = "malformed"
-        try:
-            with open(SOURCE, "rb") as source:
-                fingerprint = hashlib.sha256(source.read()).hexdigest()
-        except OSError:
-            pass
-        return MUTATION == "malformed-driver-accepted", fingerprint, "malformed"
+    except (UnicodeError, json.JSONDecodeError):
+        return MUTATION == "malformed-driver-accepted", hashlib.sha256(payload).hexdigest(), "malformed"
+    except OSError:
+        return MUTATION == "malformed-driver-accepted", "malformed", "malformed"
 
 
-def publish(state: bool, generation: int, classification: str) -> None:
+def publish(state: bool, generation: int, fingerprint: str, classification: str) -> None:
     temporary = TARGET + ".new"
     with open(temporary, "w", encoding="ascii") as target:
         json.dump({"version": 1, "human_driving": state, "generation": generation,
+                   "fingerprint": fingerprint,
                    "classification": classification}, target, separators=(",", ":"))
         target.write("\n")
     os.replace(temporary, TARGET)
@@ -58,7 +55,7 @@ def main() -> None:
         state, fingerprint, classification = read_document()
         if fingerprint != previous:
             generation += 1
-            publish(state, generation, classification)
+            publish(state, generation, fingerprint, classification)
             previous = fingerprint
         time.sleep(0.05)
 

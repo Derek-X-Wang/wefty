@@ -43,6 +43,7 @@ run_mutation() {
   fi
   docker build --platform "linux/$arch" --file "$fixture_dockerfile" \
     --build-arg "BASE_IMAGE=$image" --build-arg "MUTATION=$mutation" --tag "$tag" .
+  local checker_started=$SECONDS
   set +e
   "$checker" --image "$tag" --platform "linux/$arch" \
     --input-oracle-path /tmp/wefty-computer/input-oracle.json \
@@ -51,14 +52,27 @@ run_mutation() {
     --mutation-profile "$mutation" --receipt "$mutations/$mutation.json"
   local checker_status=$?
   set -e
+  local observed_window=$((SECONDS - checker_started))
   if ((checker_status == 64)); then
     printf 'checker usage failure for mutation %s\n' "$mutation" >&2
     exit 1
   fi
-  jq -e --arg cell "$cell" --arg detail "$detail" '
+  local failed_count
+  failed_count=$(jq '[.checks[] | select(.status == "FAIL")] | length' "$mutations/$mutation.json")
+  if ((failed_count == 0)); then
+    printf 'mutation %s produced zero FAILs after %ss checker observation window; expected exactly %s\n' \
+      "$mutation" "$observed_window" "$cell" >&2
+    exit 1
+  fi
+  if ! jq -e --arg cell "$cell" --arg detail "$detail" '
     [.checks[] | select(.status == "FAIL")] as $failed |
     ($failed | length) == 1 and $failed[0].id == $cell and $failed[0].detail == $detail
-  ' "$mutations/$mutation.json" >/dev/null
+  ' "$mutations/$mutation.json" >/dev/null; then
+    printf 'mutation %s produced an unexpected FAIL set after %ss checker observation window; expected exactly %s\n' \
+      "$mutation" "$observed_window" "$cell" >&2
+    jq -c '[.checks[] | select(.status == "FAIL") | {id,detail}]' "$mutations/$mutation.json" >&2
+    exit 1
+  fi
   executed_rows=$((executed_rows + 1))
 }
 

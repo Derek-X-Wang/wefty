@@ -2,6 +2,7 @@ package computerconformance
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +18,11 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-const missingEndpointObservationWindow = 15 * time.Second
+const (
+	missingEndpointObservationWindow = 15 * time.Second
+	driverObservationInterval        = 250 * time.Millisecond
+	driverObservationWindow          = 10 * time.Second
+)
 
 type RuntimeConfig struct {
 	Image              string
@@ -47,6 +52,8 @@ type runtimeRunner struct {
 	viewPort, controlPort, attempt           int
 	tools                                    map[string]bool
 	failed                                   bool
+	readDriverObservationHook                func(context.Context) (driverObservation, error)
+	writeDriverHook                          func(string) error
 }
 
 func Run(ctx context.Context, config RuntimeConfig) RuntimeResult {
@@ -465,9 +472,11 @@ func (r *runtimeRunner) checkTransportNegatives(ctx context.Context) {
 }
 
 type driverObservation struct {
-	Version      int    `json:"version"`
-	HumanDriving bool   `json:"human_driving"`
-	Generation   uint64 `json:"generation"`
+	Version        int    `json:"version"`
+	HumanDriving   bool   `json:"human_driving"`
+	Generation     uint64 `json:"generation"`
+	Fingerprint    string `json:"fingerprint"`
+	Classification string `json:"classification"`
 }
 
 func (r *runtimeRunner) readDriverObservation(ctx context.Context) (driverObservation, error) {
@@ -485,28 +494,61 @@ func (r *runtimeRunner) readDriverObservation(ctx context.Context) (driverObserv
 	return value, nil
 }
 
-func (r *runtimeRunner) waitDriverAdvance(ctx context.Context, after uint64, expected bool) bool {
-	for attempt := 0; attempt < 40; attempt++ {
-		value, err := r.readDriverObservation(ctx)
-		if err == nil && value.Generation > after {
-			return value.HumanDriving == expected
-		}
-		if r.config.Sleep(ctx, 250*time.Millisecond) != nil {
-			return false
-		}
-	}
-	return false
+func driverFingerprint(document string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(document)))
 }
 
-func (r *runtimeRunner) mutateAndObserveDriver(ctx context.Context, document string, expected bool) bool {
-	previous, err := r.readDriverObservation(ctx)
+func (r *runtimeRunner) observeDriver(ctx context.Context) (driverObservation, error) {
+	if r.readDriverObservationHook != nil {
+		return r.readDriverObservationHook(ctx)
+	}
+	return r.readDriverObservation(ctx)
+}
+
+func (r *runtimeRunner) writeObservedDriver(document string) error {
+	if r.writeDriverHook != nil {
+		return r.writeDriverHook(document)
+	}
+	return r.writeDriver(document)
+}
+
+func (r *runtimeRunner) waitDriverObservation(ctx context.Context, after uint64, fingerprint, classification string, requireAdvance bool) (driverObservation, bool) {
+	attempts := int(driverObservationWindow / driverObservationInterval)
+	var last driverObservation
+	for attempt := 0; attempt < attempts; attempt++ {
+		value, err := r.observeDriver(ctx)
+		if err == nil {
+			last = value
+			advanced := !requireAdvance || value.Generation > after
+			classified := classification == "" || value.Classification == classification
+			if advanced && classified && value.Fingerprint == fingerprint {
+				return value, true
+			}
+		}
+		if r.config.Sleep(ctx, driverObservationInterval) != nil {
+			return last, false
+		}
+	}
+	return last, false
+}
+
+func (r *runtimeRunner) mutateAndObserveDriver(ctx context.Context, document, classification string, expected bool) bool {
+	current, err := os.ReadFile(filepath.Join(r.controlDir, "driver.json"))
 	if err != nil {
 		return false
 	}
-	if err := r.writeDriver(document); err != nil {
+	// Prove the observer is attached to the exact current document before
+	// publishing the mutation. A generation alone can belong to an earlier
+	// document and let a late poll mistake unrelated state for this assertion.
+	previous, attached := r.waitDriverObservation(ctx, 0, driverFingerprint(string(current)), "", false)
+	if !attached {
 		return false
 	}
-	return r.waitDriverAdvance(ctx, previous.Generation, expected)
+	if err := r.writeObservedDriver(document); err != nil {
+		return false
+	}
+	observed, ok := r.waitDriverObservation(ctx, previous.Generation, driverFingerprint(document), classification, true)
+	return ok && observed.HumanDriving == expected
 }
 
 func (r *runtimeRunner) checkDriver(ctx context.Context) {
@@ -538,19 +580,19 @@ func (r *runtimeRunner) checkDriver(ctx context.Context) {
 	if !r.requireTools(ids, "cat") {
 		return
 	}
-	if r.mutateAndObserveDriver(ctx, `{"version":1,"human_driving":true}`, true) {
+	if r.mutateAndObserveDriver(ctx, `{"version":1,"human_driving":true}`, "valid", true) {
 		r.record("driver.true-consumed", StatusPass, "tenant observed the new generation and consumed true")
 	} else {
 		r.record("driver.true-consumed", StatusFail, "tenant ignored the true driver generation")
 	}
-	if r.mutateAndObserveDriver(ctx, falseDocument, false) {
+	if r.mutateAndObserveDriver(ctx, falseDocument, "valid", false) {
 		r.record("driver.release-consumed", StatusPass, "tenant observed the new generation and consumed release")
 	} else {
 		r.record("driver.release-consumed", StatusFail, "tenant did not consume the release generation")
 	}
 	malformed := true
 	for _, document := range []string{`{"version":true,"human_driving":true}`, `{"version":1,"human_driving":1}`, `{malformed`} {
-		if !r.mutateAndObserveDriver(ctx, document, false) {
+		if !r.mutateAndObserveDriver(ctx, document, "malformed", false) {
 			malformed = false
 			break
 		}
@@ -561,17 +603,30 @@ func (r *runtimeRunner) checkDriver(ctx context.Context) {
 		r.record("driver.malformed-fails-closed", StatusFail, "a malformed generation was accepted or not observed")
 		return
 	}
-	if r.mutateAndObserveDriver(ctx, `{"version":2,"human_driving":true}`, false) {
+	if r.mutateAndObserveDriver(ctx, `{"version":2,"human_driving":true}`, "unknown-version", false) {
 		r.record("driver.unknown-version-fails-closed", StatusPass, "unknown-version generation advanced and remained false")
 	} else {
 		r.record("driver.unknown-version-fails-closed", StatusFail, "unknown-version generation was accepted or not observed")
 		return
 	}
-	previous, readErr := r.readDriverObservation(ctx)
+	current, readErr := os.ReadFile(filepath.Join(r.controlDir, "driver.json"))
+	var previous driverObservation
+	attached := false
+	if readErr == nil {
+		previous, attached = r.waitDriverObservation(ctx, 0, driverFingerprint(string(current)), "", false)
+	}
 	missing := filepath.Join(r.controlDir, "driver.json.missing")
 	_ = os.Remove(missing)
-	renameErr := os.Rename(filepath.Join(r.controlDir, "driver.json"), missing)
-	if readErr == nil && renameErr == nil && r.waitDriverAdvance(ctx, previous.Generation, false) {
+	renameErr := errors.New("driver observer was not attached before removal")
+	if attached {
+		renameErr = os.Rename(filepath.Join(r.controlDir, "driver.json"), missing)
+	}
+	var missingObservation driverObservation
+	missingObserved := false
+	if renameErr == nil {
+		missingObservation, missingObserved = r.waitDriverObservation(ctx, previous.Generation, "missing", "missing", true)
+	}
+	if readErr == nil && attached && renameErr == nil && missingObserved && !missingObservation.HumanDriving {
 		r.record("driver.missing-fails-closed", StatusPass, "missing generation advanced and remained false")
 	} else {
 		r.record("driver.missing-fails-closed", StatusFail, "missing document was not observed fail-closed")
@@ -834,7 +889,7 @@ func (r *runtimeRunner) checkInput(ctx context.Context) {
 	if !r.proveViewIsolation(ctx, ids[0], 211, 173, 947, 411) {
 		return
 	}
-	if !r.mutateAndObserveDriver(ctx, `{"version":1,"human_driving":true}`, true) {
+	if !r.mutateAndObserveDriver(ctx, `{"version":1,"human_driving":true}`, "valid", true) {
 		r.record(ids[1], StatusNotRun, "driver tenure oracle was unavailable")
 		r.record(ids[2], StatusNotRun, "driver tenure oracle was unavailable")
 		return
