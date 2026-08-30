@@ -134,6 +134,8 @@ type computerFrontDoorConfig struct {
 	denialFlushInterval  time.Duration
 	newSessionID         func() (string, error)
 	newControlToken      func() (string, error)
+	// Tests use this hook to prove the client banner cannot overtake registration.
+	beforeControlSessionRegistration func()
 }
 
 // computerSessionHandle is the private sideband capability for one live
@@ -464,15 +466,11 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 		_ = backendWebSocket.CloseNow()
 		return
 	}
-	if _, err := client.Write(banner); err != nil {
-		_ = backend.Close()
-		release()
-		frontDoor.finishSession(request.Context(), baseEvent, l1.ComputerTakeoverClientClosed)
-		return
-	}
-
 	relay := newComputerSessionRelay(client, backend, clientWebSocket, backendWebSocket)
 	handle := &computerSessionHandle{id: sessionID, canTake: authorization.CanTake(), admin: authorization.IsAdministrator(), tenure: frontDoor.config.controlTenure, session: sessionContext}
+	if frontDoor.config.beforeControlSessionRegistration != nil {
+		frontDoor.config.beforeControlSessionRegistration()
+	}
 	if err := handle.tenure.Register(controlTenureSession{id: sessionID, context: sessionContext, canTake: handle.canTake,
 		administrator: handle.admin, event: baseEvent, relay: relay}); err != nil {
 		frontDoor.report(fmt.Errorf("register Computer control session: %w", err))
@@ -506,6 +504,12 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 		frontDoor.sessionCond.Broadcast()
 		frontDoor.mu.Unlock()
 	}()
+	if _, err := client.Write(banner); err != nil {
+		_ = backend.Close()
+		release()
+		frontDoor.finishSession(request.Context(), baseEvent, l1.ComputerTakeoverClientClosed)
+		return
+	}
 	relay.Start()
 
 	reason := frontDoor.waitForSessionEnd(sessionContext, request.RemoteAddr, identity, authorization, relay, admittedAt)
