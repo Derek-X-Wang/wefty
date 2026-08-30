@@ -21,6 +21,7 @@ type ServiceJob struct {
 	RestartSuppressed    string                       `json:"restart_suppressed_reason,omitempty"`
 	RestartStreak        int                          `json:"restart_streak"`
 	LifetimeRestartCount int                          `json:"lifetime_restart_count"`
+	LeaseLossCount       int                          `json:"lease_loss_count"`
 	NextRestartAt        *time.Time                   `json:"next_restart_at,omitempty"`
 	PublishedPort        *int                         `json:"published_port,omitempty"`
 	Ready                *bool                        `json:"ready,omitempty"`
@@ -34,6 +35,7 @@ type serviceJobColumns struct {
 	boundNodeID          sql.NullString
 	restartStreak        sql.NullInt64
 	lifetimeRestartCount sql.NullInt64
+	leaseLossCount       sql.NullInt64
 	nextRestartNS        sql.NullInt64
 	publishedPort        sql.NullInt64
 	lastFailure          []byte
@@ -45,7 +47,7 @@ type serviceJobColumns struct {
 func (columns *serviceJobColumns) scanDestinations() []any {
 	return []any{
 		&columns.desiredState, &columns.boundNodeID, &columns.restartStreak,
-		&columns.lifetimeRestartCount, &columns.nextRestartNS, &columns.publishedPort,
+		&columns.lifetimeRestartCount, &columns.leaseLossCount, &columns.nextRestartNS, &columns.publishedPort,
 		&columns.lastFailure, &columns.healthySinceNS, &columns.publishedAttemptID, &columns.ready,
 	}
 }
@@ -58,6 +60,7 @@ func (columns serviceJobColumns) projection() *ServiceJob {
 		DesiredState:         contract.ServiceDesiredState(columns.desiredState.String),
 		RestartStreak:        int(columns.restartStreak.Int64),
 		LifetimeRestartCount: int(columns.lifetimeRestartCount.Int64),
+		LeaseLossCount:       int(columns.leaseLossCount.Int64),
 	}
 	if columns.boundNodeID.Valid {
 		service.BoundNodeID = columns.boundNodeID.String

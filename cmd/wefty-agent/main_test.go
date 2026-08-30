@@ -33,13 +33,14 @@ func TestSecondShutdownSignalCancelsWhileGracefulDrainIsStillJoining(t *testing.
 	drainEntered := make(chan struct{})
 	releaseDrain := make(chan struct{})
 	canceled := make(chan struct{})
+	logs := make(chan string, 1)
 	done := make(chan struct{})
 	go func() {
 		handleShutdownSignals(ctx, signals, func(context.Context) error {
 			close(drainEntered)
 			<-releaseDrain
 			return nil
-		}, func() { close(canceled) }, func(string, ...any) {})
+		}, func() { close(canceled) }, func(format string, _ ...any) { logs <- format })
 		close(done)
 	}()
 	signals <- os.Interrupt
@@ -50,7 +51,43 @@ func TestSecondShutdownSignalCancelsWhileGracefulDrainIsStillJoining(t *testing.
 	case <-time.After(time.Second):
 		t.Fatal("second shutdown signal remained blocked behind graceful drain")
 	}
+	select {
+	case line := <-logs:
+		if !strings.Contains(line, "forced_shutdown") || !strings.Contains(line, "second_signal") {
+			t.Fatalf("forced shutdown evidence = %q", line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second shutdown signal emitted no typed forced-shutdown evidence")
+	}
 	close(releaseDrain)
+	<-done
+}
+
+func TestSingleShutdownSignalDrainsToCompletionWithoutForcingCancellation(t *testing.T) {
+	ctx, cancelContext := context.WithCancel(t.Context())
+	signals := make(chan os.Signal, 1)
+	drained := make(chan struct{})
+	canceled := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		handleShutdownSignals(ctx, signals, func(context.Context) error {
+			close(drained)
+			return nil
+		}, func() { canceled <- struct{}{} }, func(string, ...any) {})
+		close(done)
+	}()
+	signals <- os.Interrupt
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("single shutdown signal did not complete graceful drain")
+	}
+	select {
+	case <-canceled:
+		t.Fatal("single shutdown signal forced cancellation after successful drain")
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancelContext()
 	<-done
 }
 

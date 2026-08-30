@@ -2,12 +2,31 @@ package ocihelper
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
+
+const loggerChildEnvironment = "WEFTY_LOGGER_EXTRA_FILES_CHILD"
+
+func TestLoggerExtraFilesChild(t *testing.T) {
+	if os.Getenv(loggerChildEnvironment) == "" {
+		return
+	}
+	err := RunLoggerInvocation([]string{
+		"wefty-agent", "mode", LoggerInvocationArg,
+		"stdout", os.Getenv("WEFTY_LOGGER_STDOUT_SEGMENT"),
+		"stderr", os.Getenv("WEFTY_LOGGER_STDERR_SEGMENT"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestLoggerFramesDataAndPipeEOFSeal(t *testing.T) {
 	var segment bytes.Buffer
@@ -38,41 +57,70 @@ func TestLoggerTerminationPublishesIncompleteSealsWithoutSealTimeout(t *testing.
 		t.Fatal(err)
 	}
 	defer stderrWriter.Close()
-	stdoutTarget, err := os.Create(filepath.Join(t.TempDir(), "stdout.frames"))
+	readyReader, readyWriter, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer stdoutTarget.Close()
-	stderrTarget, err := os.Create(filepath.Join(t.TempDir(), "stderr.frames"))
-	if err != nil {
+	defer readyReader.Close()
+	directory := t.TempDir()
+	segments := map[string]string{
+		"stdout": filepath.Join(directory, "stdout.frames"),
+		"stderr": filepath.Join(directory, "stderr.frames"),
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestLoggerExtraFilesChild$")
+	command.Env = append(os.Environ(),
+		loggerChildEnvironment+"=1",
+		"WEFTY_LOGGER_STDOUT_SEGMENT="+segments["stdout"],
+		"WEFTY_LOGGER_STDERR_SEGMENT="+segments["stderr"],
+	)
+	// This is the containerd launch shape: StartProcess materializes these
+	// descriptors through ExtraFiles before the child recreates fds 3/4.
+	command.ExtraFiles = []*os.File{stdoutSource, stderrSource, readyWriter}
+	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer stderrTarget.Close()
-
-	interrupt := make(chan struct{})
+	_ = stdoutSource.Close()
+	_ = stderrSource.Close()
+	_ = readyWriter.Close()
+	if err := readyReader.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	ready := make([]byte, 1)
+	if _, err := io.ReadFull(readyReader, ready); err != nil {
+		_ = command.Process.Kill()
+		t.Fatalf("logger did not acknowledge readiness after installing SIGTERM handling: %v", err)
+	}
+	started := time.Now()
+	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
-	go func() {
-		done <- copyLoggerStreams([]loggerStream{
-			{"stdout", stdoutSource, stdoutTarget},
-			{"stderr", stderrSource, stderrTarget},
-		}, interrupt)
-	}()
-	close(interrupt)
+	go func() { done <- command.Wait() }()
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
+		_ = command.Process.Kill()
 		t.Fatal("logger termination waited for the post-terminal seal timeout")
 	}
-	for name, target := range map[string]*os.File{"stdout": stdoutTarget, "stderr": stderrTarget} {
-		if _, err := target.Seek(0, io.SeekStart); err != nil {
+	if elapsed := time.Since(started); elapsed < loggerTerminationDrainTimeout || elapsed >= time.Second {
+		t.Fatalf("logger termination elapsed %s, want drain deadline honored and prompt exit", elapsed)
+	}
+	for name, path := range segments {
+		target, err := os.Open(path)
+		if err != nil {
 			t.Fatal(err)
 		}
+		defer target.Close()
 		kind, sequence, payload, err := readLogRecord(target)
 		if err != nil || kind != logRecordIncomplete || sequence != 0 || len(payload) == 0 {
 			t.Fatalf("%s terminal record kind=%v sequence=%d payload=%q err=%v", name, kind, sequence, payload, err)
+		}
+		var evidence loggerIncompleteEvidence
+		if err := json.Unmarshal(payload, &evidence); err != nil || evidence.Reason == "" {
+			t.Fatalf("%s incomplete evidence = %q: %v", name, payload, err)
 		}
 	}
 }

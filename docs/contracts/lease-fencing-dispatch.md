@@ -245,8 +245,11 @@ back to `alive`, while a dead node must register its boot session again.
 `POST /v1/agent/nodes/{node_id}/drain` changes an alive or stale boot session
 to `draining` idempotently. Draining nodes continue heartbeating and retain
 authority for attempts they already own, but cannot claim another job. On
-SIGINT or SIGTERM the agent invokes this verb, waits for both class loops to
-finish the resident attempt each is already waiting on, and exits. This is only
+SIGINT or SIGTERM the agent invokes this verb and waits up to 30 seconds for
+both class loops to finish the resident attempt each is already waiting on. A
+second signal forces cancellation during that wait and emits typed
+`forced_shutdown` evidence; a single signal continues to prove graceful drain
+to completion. This is only
 a join around the pre-existing per-attempt wait; issue #88 owns service stop
 transitions, fenced shutdown completion, and forced-drain ordering. This route
 is session liveness, not operator intent: it leaves `claims_enabled` and every
@@ -334,7 +337,7 @@ visible with claims disabled.
 | --- | ---: | --- | --- | --- |
 | Attempt ID is not the job's current attempt | 409 | `attempt_mismatch` | false | No mutation. |
 | Fence is not current | 409 | `stale_fence` | false | No mutation. The stale worker must stop writing. |
-| Lease is expired | 409 | `lease_expired` | false | Attempt becomes terminal `lost` exactly once. A one-shot job fails; a desired-running service job requeues without incrementing its streak. |
+| Lease is expired | 409 | `lease_expired` | false | Attempt becomes terminal `lost` exactly once. A one-shot job fails; a desired-running service job requeues without incrementing its restart streak or lifetime restart count, increments `lease_loss_count`, and receives lease-loss backoff. |
 | Same idempotency identity and same body is replayed | original success | none | n/a | Return the original result; do not duplicate logs or completion. |
 | Same idempotency identity has a different body | 409 | `idempotency_conflict` | false | No mutation. |
 
@@ -342,8 +345,10 @@ Expiry never creates another attempt. A desired-running service job becomes
 eligible for its bound node again, while the ordinary atomic claim transaction
 is the only operation that can mint the fresh attempt ID and incremented fence.
 The expired attempt remains `lost`, `current_attempt_id` remains available for
-completion replay until a later claim wins, and the restart streak is frozen
-because lease loss is infrastructure suppression. One-shot jobs still fail
+completion replay until a later claim wins. Both `restart_streak` and
+`lifetime_restart_count` are frozen because lease loss is infrastructure
+suppression; the distinct durable `lease_loss_count` drives the bounded
+pre-start backoff so a lease-flapping node cannot hot-requeue invisibly. One-shot jobs still fail
 terminally. A partitioned node may still be running non-idempotent work, so
 later authority-changing writes receive `lease_expired` or `stale_fence` and
 cannot alter state. Evidence writes follow the provenance-only rules above.

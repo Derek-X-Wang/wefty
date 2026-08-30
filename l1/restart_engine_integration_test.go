@@ -360,10 +360,11 @@ func assertServiceLeaseExpiryRequeuesWithoutConsumingRestartBudget(t *testing.T)
 			h.clock.Advance(3 * time.Second)
 			test.expire(t, h, agent, job, claim)
 			requeued := getRestartService(t, h, job.JobID)
-			if requeued.State != contract.JobQueued || requeued.RestartStreak != 2 || requeued.LifetimeRestartCount != 7 {
-				t.Fatalf("expired service state/streak/lifetime = %q/%d/%d, want queued/2/7", requeued.State, requeued.RestartStreak, requeued.LifetimeRestartCount)
+			wantRestart := h.clock.Now().Add(time.Second)
+			if requeued.State != contract.JobQueued || requeued.RestartStreak != 2 || requeued.LifetimeRestartCount != 7 || requeued.LeaseLossCount != 1 {
+				t.Fatalf("expired service state/streak/lifetime/lease-loss = %q/%d/%d/%d, want queued/2/7/1", requeued.State, requeued.RestartStreak, requeued.LifetimeRestartCount, requeued.LeaseLossCount)
 			}
-			if requeued.NextRestartAt != nil || requeued.HealthySinceAt != nil || requeued.PublishedAttemptID != "" {
+			if requeued.NextRestartAt == nil || !requeued.NextRestartAt.Equal(wantRestart) || requeued.HealthySinceAt != nil || requeued.PublishedAttemptID != "" {
 				t.Fatalf("expired service retained restart/readiness state: %#v", requeued.ServiceJob)
 			}
 			if !bytes.Equal(requeued.LastFailure, lastFailure) {
@@ -374,6 +375,7 @@ func assertServiceLeaseExpiryRequeuesWithoutConsumingRestartBudget(t *testing.T)
 			}
 			assertAttemptState(t, h, claim.Lease.AttemptID, contract.AttemptLost)
 
+			h.clock.Advance(time.Second)
 			fresh := claimRestartService(t, h, agent, node)
 			if fresh.Job.JobID != job.JobID || fresh.Lease.AttemptID == claim.Lease.AttemptID || fresh.Lease.FencingToken == claim.Lease.FencingToken {
 				t.Fatalf("fresh restart identity = job:%q attempt:%q fence:%q; first=%#v", fresh.Job.JobID, fresh.Lease.AttemptID, fresh.Lease.FencingToken, claim.Lease)

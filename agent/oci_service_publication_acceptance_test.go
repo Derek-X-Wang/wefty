@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -822,7 +823,7 @@ done
 func verifyNativeOCIServiceKILLEscalation(t *testing.T, parent context.Context, adapter *ocirunner.Adapter, reference, digest string) bool {
 	t.Helper()
 	request := nativeOCIServiceRequest(reference, digest, "term-ignoring", []string{
-		"/bin/sh", "-c", `trap '' TERM; while :; do sleep 60; done`,
+		"/bin/sh", "-c", `printf 'kill-escalation-stdout\n'; printf 'kill-escalation-stderr\n' >&2; trap '' TERM; while :; do sleep 60; done`,
 	})
 	started := make(chan struct{})
 	request.Started = func() { close(started) }
@@ -831,8 +832,15 @@ func verifyNativeOCIServiceKILLEscalation(t *testing.T, parent context.Context, 
 		result workloadrunner.Result
 		err    error
 	}, 1)
+	var logMu sync.Mutex
+	var logs []contract.LogEvent
 	go func() {
-		result, err := adapter.Run(ctx, request, nil)
+		result, err := adapter.Run(ctx, request, workloadrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
+			logMu.Lock()
+			defer logMu.Unlock()
+			logs = append(logs, event)
+			return nil
+		}))
 		done <- struct {
 			result workloadrunner.Result
 			err    error
@@ -856,8 +864,15 @@ func verifyNativeOCIServiceKILLEscalation(t *testing.T, parent context.Context, 
 		t.Fatal("TERM-ignoring OCI service did not reach bounded KILL escalation")
 	}
 	elapsed := time.Since(stopStarted)
-	if outcome.err != nil || outcome.result.Outcome.Signal != "killed" || outcome.result.Outcome.TerminationCause != contract.TerminationCauseAgent {
+	if outcome.err != nil || outcome.result.Outcome.Signal != "killed" || outcome.result.Outcome.TerminationCause != contract.TerminationCauseAgent || !outcome.result.Outcome.LogEvidenceIncomplete {
 		t.Fatalf("TERM-ignoring OCI service escalation = (%+v, %v)", outcome.result.Outcome, outcome.err)
+	}
+	logMu.Lock()
+	stdoutLog := acceptanceLogContains(logs, contract.LogStdout, "kill-escalation-stdout")
+	stderrLog := acceptanceLogContains(logs, contract.LogStderr, "kill-escalation-stderr")
+	logMu.Unlock()
+	if !stdoutLog || !stderrLog {
+		t.Fatalf("TERM-ignoring OCI service receipt completeness = log_evidence_incomplete:%t stdout_log:%t stderr_log:%t", outcome.result.Outcome.LogEvidenceIncomplete, stdoutLog, stderrLog)
 	}
 	if elapsed < processrunner.DefaultTerminationGraceTime || elapsed >= 10*time.Second {
 		t.Fatalf("TERM-ignoring OCI service escalation elapsed %s, want grace honoured and completion inside stop budget", elapsed)
@@ -869,6 +884,15 @@ func verifyNativeOCIServiceKILLEscalation(t *testing.T, parent context.Context, 
 		t.Fatalf("TERM-ignoring OCI service cleanup = (%+v, %v)", receipt, err)
 	}
 	return true
+}
+
+func acceptanceLogContains(events []contract.LogEvent, stream contract.LogStream, value string) bool {
+	for _, event := range events {
+		if event.Stream == stream && bytes.Contains(event.Bytes, []byte(value)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (service *nativeOCIService) request(t *testing.T, method, path string, body []byte) []byte {

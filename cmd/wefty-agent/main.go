@@ -32,6 +32,8 @@ import (
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
+const gracefulDrainTimeout = 30 * time.Second
+
 var version = "dev"
 
 type repeatedStringFlag []string
@@ -724,7 +726,7 @@ func handleShutdownSignals(
 	}
 	drainDone := make(chan error, 1)
 	go func() {
-		drainContext, stopDrain := context.WithTimeout(context.Background(), 30*time.Second)
+		drainContext, stopDrain := context.WithTimeout(context.Background(), gracefulDrainTimeout)
 		defer stopDrain()
 		drainDone <- drain(drainContext)
 	}()
@@ -735,6 +737,7 @@ func handleShutdownSignals(
 		// A second signal is cancellation authority even while graceful drain is
 		// still joining a resident service. Waiting for Drain first made this
 		// signal unreachable for exactly the service it was intended to stop.
+		logf("wefty-agent: forced_shutdown transition=draining_to_forced reason=second_signal")
 		cancel()
 		return
 	case err := <-drainDone:

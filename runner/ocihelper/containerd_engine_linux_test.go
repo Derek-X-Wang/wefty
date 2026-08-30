@@ -1381,6 +1381,52 @@ func TestAttemptPortAcceptsListenerInNestedPayloadCgroup(t *testing.T) {
 	}
 }
 
+func TestCgroupSocketWalkIgnoresVanishedScopesAndHonorsBound(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "desktop.slice", "vanished.scope"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	owned, err := cgroupSubtreeOwnsSocket(t.Context(), root, "unused")
+	if err != nil || owned {
+		t.Fatalf("vanished cgroup scope ownership = %t, %v", owned, err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := cgroupSubtreeOwnsSocket(ctx, root, "unused"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("bounded cgroup walk error = %v, want context cancellation", err)
+	}
+}
+
+func TestIncompleteLoggerEvidencePublishesDiscardedByteGap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdout.frames")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(loggerIncompleteEvidence{Reason: "termination deadline", LostByteCount: 17})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeLogRecord(file, logIncompleteMagic, 0, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	terminal := make(chan struct{})
+	close(terminal)
+	events := make(chan logTailEvent, 2)
+	tailLogSegment(t.Context(), "stdout", path, terminal, time.Second, 0, events)
+	gap := <-events
+	seal := <-events
+	if gap.event.Log == nil || gap.event.Log.Gap == nil || gap.event.Log.Gap.ThroughSequence != 0 || gap.event.Log.Gap.LostByteCount != 17 || gap.event.Log.Gap.Reason != "logger_source_incomplete" {
+		t.Fatalf("discarded logger bytes gap = %+v", gap.event.Log)
+	}
+	if seal.event.Seal == nil || seal.event.Seal.Complete || seal.event.Seal.Reason != "termination deadline" {
+		t.Fatalf("incomplete logger seal = %+v", seal.event.Seal)
+	}
+}
+
 func TestPreparedMacFallbackRewritesEndpointOnlyWhenActivated(t *testing.T) {
 	original := []EnvironmentVariable{{Name: contract.EnvL3Endpoint, Value: "http://host.lima.internal:4242/l3"}}
 	address := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4343}

@@ -730,7 +730,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "node-doctor.json"), append(doctorBundle, '\n'), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_pull_rejected=%t\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_reference=%s\ncomputer_index_digest=%s\ncomputer_reference_separate=true\ncomputer_reference_archive_import=true\ncomputer_reference_atomic_readiness=%t\ncomputer_reference_readiness_elapsed=%s\ncomputer_reference_publication_loss_recovery=%t\ncomputer_reference_wire_negatives=true\nwayland_computer_reference=%s\nwayland_computer_index_digest=%s\nwayland_computer_reference_separate=true\nwayland_computer_reference_archive_import=true\nwayland_computer_reference_atomic_readiness=%t\nwayland_computer_reference_readiness_elapsed=%s\nwayland_computer_reference_publication_loss_recovery=%t\nwayland_computer_reference_wire_negatives=true\ncomputer_capacity_three_live_published_fourth_refused=true\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\ncomputer_reference_helper_stop_start_profile_sign_in_rootfs=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, registryDisabledPullRejected, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerReference, computerDigest, referenceComputerReadiness.atomicPublication, referenceComputerReadiness.elapsed, referenceComputerReadiness.lossRecovery, waylandComputerReference, waylandComputerDigest, waylandComputerReadiness.atomicPublication, waylandComputerReadiness.elapsed, waylandComputerReadiness.lossRecovery, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_pull_rejected=%t\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_reference=%s\ncomputer_index_digest=%s\ncomputer_reference_separate=true\ncomputer_reference_archive_import=true\ncomputer_reference_atomic_readiness=%t\ncomputer_reference_started_to_ready_elapsed=%s\ncomputer_reference_publication_loss_recovery=%t\ncomputer_reference_wire_negatives=true\nwayland_computer_reference=%s\nwayland_computer_index_digest=%s\nwayland_computer_reference_separate=true\nwayland_computer_reference_archive_import=true\nwayland_computer_reference_atomic_readiness=%t\nwayland_computer_reference_started_to_ready_elapsed=%s\nwayland_computer_reference_publication_loss_recovery=%t\nwayland_computer_reference_wire_negatives=true\ncomputer_capacity_three_live_published_fourth_refused=true\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\ncomputer_reference_helper_stop_start_profile_sign_in_rootfs=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, registryDisabledPullRejected, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerReference, computerDigest, referenceComputerReadiness.atomicPublication, referenceComputerReadiness.startedToReadyElapsed, referenceComputerReadiness.lossRecovery, waylandComputerReference, waylandComputerDigest, waylandComputerReadiness.atomicPublication, waylandComputerReadiness.startedToReadyElapsed, waylandComputerReadiness.lossRecovery, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -738,9 +738,9 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 }
 
 type referenceComputerEvidence struct {
-	elapsed           time.Duration
-	atomicPublication bool
-	lossRecovery      bool
+	startedToReadyElapsed time.Duration
+	atomicPublication     bool
+	lossRecovery          bool
 }
 
 func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, session *ocihelper.Session, adapter *ocirunner.Adapter, identity, reference, digest string) referenceComputerEvidence {
@@ -757,11 +757,13 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 	request.OCIStartedAt = func(startedAt time.Time) { helperStarted <- startedAt }
 	endpoints := make(map[string]workloadrunner.AttemptEndpoint)
 	endpointReady := make(chan struct{}, 2)
+	var endpointsBound atomic.Int32
 	var endpointMu sync.Mutex
 	request.AttemptEndpointReady = func(name string, endpoint workloadrunner.AttemptEndpoint) error {
 		endpointMu.Lock()
 		endpoints[name] = endpoint
 		endpointMu.Unlock()
+		endpointsBound.Add(1)
 		endpointReady <- struct{}{}
 		return nil
 	}
@@ -779,15 +781,24 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 		}
 		return endpoint.Dial(dialContext)
 	}
-	publications := make(chan bool, 8)
+	type referencePublication struct {
+		ready               bool
+		beforeBothEndpoints bool
+	}
+	publications := make(chan referencePublication, 8)
 	runContext, cancelRun := context.WithCancel(ctx)
 	runDone := make(chan error, 1)
 	network := plain.NewNetwork()
 	go func() {
 		_, err := agent.RunComputerServiceRealtiming(runContext, adapter, request, network.NewFabric(fabric.Identity{NodeID: "reference-" + identity + "-agent"}), dial,
-			func(_ context.Context, ready bool, _ string) error { publications <- ready; return nil })
+			func(_ context.Context, ready bool, _ string) error {
+				publications <- referencePublication{ready: ready, beforeBothEndpoints: endpointsBound.Load() < 2}
+				return nil
+			})
 		runDone <- err
 	}()
+	preparationDeadline := time.NewTimer(time.Minute)
+	defer preparationDeadline.Stop()
 	var startedAt time.Time
 	select {
 	case startedAt = <-helperStarted:
@@ -795,12 +806,20 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 		t.Fatalf("reference Computer ended before authoritative Started: %v", err)
 	case <-ctx.Done():
 		t.Fatalf("reference Computer helper setup before Started: %v", context.Cause(ctx))
+	case <-preparationDeadline.C:
+		t.Fatal("reference Computer helper setup did not reach authoritative Started within the dedicated preparation bound")
 	}
-	readinessDeadline := time.NewTimer(contract.ComputerStartupReadinessTimeout)
+	readinessRemaining := time.Until(startedAt.Add(contract.ComputerStartupReadinessTimeout))
+	if readinessRemaining < 0 {
+		readinessRemaining = 0
+	}
+	readinessDeadline := time.NewTimer(readinessRemaining)
 	defer readinessDeadline.Stop()
 	for range 2 {
 		select {
 		case <-endpointReady:
+		case publication := <-publications:
+			t.Fatalf("reference Computer published ready=%t before both helper endpoints were bound", publication.ready)
 		case err := <-runDone:
 			t.Fatalf("reference Computer ended before helper endpoints: %v", err)
 		case <-ctx.Done():
@@ -809,19 +828,33 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 			t.Fatal("helper did not return both reference endpoints after authoritative Started")
 		}
 	}
+	select {
+	case publication := <-publications:
+		if publication.beforeBothEndpoints {
+			t.Fatal("reference Computer publication was queued before both helper endpoints were bound")
+		}
+		if !publication.ready {
+			t.Fatal("reference Computer first publication was not ready")
+		}
+	case err := <-runDone:
+		t.Fatalf("reference Computer ended before atomic publication: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("reference Computer publication: %v", context.Cause(ctx))
+	case <-readinessDeadline.C:
+		t.Fatal("reference Computer did not publish both bound endpoints inside the Started-based readiness deadline")
+	}
+	readyAt := time.Now()
 	waitPublication := func(want bool) {
 		t.Helper()
 		select {
 		case got := <-publications:
-			if got != want {
-				t.Fatalf("Computer publication=%t, want %t", got, want)
+			if got.beforeBothEndpoints || got.ready != want {
+				t.Fatalf("Computer publication=%+v, want ready=%t after both endpoints", got, want)
 			}
 		case <-time.After(15 * time.Second):
 			t.Fatalf("Computer publication did not become %t", want)
 		}
 	}
-	waitPublication(true)
-	readyAt := time.Now()
 	helperAuthority := ocihelper.AttemptAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, AttemptID: authority.AttemptID, FencingToken: authority.FencingToken, Class: authority.WorkloadClass, RemovalGeneration: authority.RemovalGeneration}
 	assertReferenceComputerWireNegatives(t, ctx, session, helperAuthority)
 	available.Store(false)
@@ -840,7 +873,7 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return referenceComputerEvidence{elapsed: readyAt.Sub(startedAt), atomicPublication: true, lossRecovery: true}
+	return referenceComputerEvidence{startedToReadyElapsed: readyAt.Sub(startedAt), atomicPublication: true, lossRecovery: true}
 }
 
 func probeReferenceComputerPair(ctx context.Context, session *ocihelper.Session, authority ocihelper.AttemptAuthority) error {
