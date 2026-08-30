@@ -25,7 +25,9 @@ def read_document():
         return value["human_driving"], fingerprint, "valid"
     except FileNotFoundError:
         return False, "missing", "missing"
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (UnicodeError, json.JSONDecodeError):
+        return False, hashlib.sha256(payload).hexdigest(), "malformed"
+    except OSError:
         return False, "malformed", "malformed"
 
 
@@ -37,7 +39,7 @@ def main():
             generation += 1
             temporary = TARGET + ".new"
             with open(temporary, "w", encoding="ascii") as target:
-                json.dump({"version": 1, "human_driving": state, "generation": generation, "classification": classification}, target, separators=(",", ":"))
+                json.dump({"version": 1, "human_driving": state, "generation": generation, "fingerprint": fingerprint, "classification": classification}, target, separators=(",", ":"))
                 target.write("\n")
             os.replace(temporary, TARGET)
             previous = fingerprint

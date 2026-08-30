@@ -18,21 +18,63 @@ while (($# > 0)); do
   shift
 done
 [[ $image == *@sha256:* && $arch =~ ^(amd64|arm64)$ && -n $evidence && -n $edge_process_pattern ]] || exit 64
-mkdir -p "$evidence"
+stage_error() {
+  printf '::error title=computer runtime conformance::%s: %s\n' "$1" "$2" >&2
+}
+
+if ! mkdir -p "$evidence"; then
+  stage_error evidence-directory "could not create $evidence"
+  exit 1
+fi
 
 checker="$evidence/wefty-computer-conformance"
-go build -o "$checker" ./cmd/wefty-computer-conformance
+diagnostics=scripts/check-computer-image-runtime-evidence.sh
+if ! go build -o "$checker" ./cmd/wefty-computer-conformance; then
+  stage_error checker-build 'could not build wefty-computer-conformance'
+  exit 1
+fi
 
+set +e
+positive_stderr="$evidence/${arch}-runtime.stderr"
 "$checker" \
   --image "$image" \
   --platform "linux/$arch" \
   --input-oracle-path /tmp/wefty-computer/input-oracle.json \
   --driver-oracle-path /tmp/wefty-computer/driver-state.json \
   --edge-process-pattern "$edge_process_pattern" \
-  --receipt "$evidence/${arch}-runtime.json"
+  --receipt "$evidence/${arch}-runtime.json" 2> "$positive_stderr"
+positive_status=$?
+set -e
+sed -n '1,400p' "$positive_stderr" >&2
+if grep -Eq 'stop container|remove container|remove conformance temporary root' "$positive_stderr"; then
+  stage_error positive-runtime-teardown "checker reported container or temporary-root cleanup failure; see $positive_stderr"
+  exit 1
+fi
+if ((positive_status != 0)); then
+  stage_error positive-runtime "checker exited $positive_status; receipt=$evidence/${arch}-runtime.json"
+  exit 1
+fi
+if ! jq -e 'type == "object" and .status == "PASS" and (.checks | type == "array")' "$evidence/${arch}-runtime.json" >/dev/null 2>&1; then
+  stage_error receipt/positive-runtime "missing, malformed, or non-PASS receipt $evidence/${arch}-runtime.json"
+  exit 1
+fi
 
 mutations="$evidence/mutations"
-mkdir -p "$mutations"
+if ! mkdir -p "$mutations"; then
+  stage_error mutation-directory "could not create $mutations"
+  exit 1
+fi
+fixture_tags=()
+cleanup_fixture_images() {
+  local status=$?
+  trap - EXIT
+  if ((${#fixture_tags[@]} > 0)) && ! docker rmi "${fixture_tags[@]}"; then
+    stage_error fixture-image-cleanup "docker rmi failed for ${#fixture_tags[@]} broken fixture images"
+    status=1
+  fi
+  exit "$status"
+}
+trap cleanup_fixture_images EXIT
 executed_rows=0
 run_mutation() {
   local mutation=$1 cell=$2 detail=$3
@@ -41,24 +83,30 @@ run_mutation() {
   if [[ $mutation == text-frames-accepted && $edge_process_pattern == 'wayvnc -w' ]]; then
     fixture_dockerfile=examples/computer/fixtures/Dockerfile.wayland-text
   fi
-  docker build --platform "linux/$arch" --file "$fixture_dockerfile" \
-    --build-arg "BASE_IMAGE=$image" --build-arg "MUTATION=$mutation" --tag "$tag" .
+  if ! docker build --platform "linux/$arch" --file "$fixture_dockerfile" \
+    --build-arg "BASE_IMAGE=$image" --build-arg "MUTATION=$mutation" --tag "$tag" .; then
+    stage_error "fixture-build/$mutation" "docker build failed for $tag"
+    exit 1
+  fi
+  fixture_tags+=("$tag")
+  local checker_started=$SECONDS
+  local checker_stderr="$mutations/$mutation.stderr"
   set +e
   "$checker" --image "$tag" --platform "linux/$arch" \
     --input-oracle-path /tmp/wefty-computer/input-oracle.json \
     --driver-oracle-path /tmp/wefty-computer/driver-state.json \
     --edge-process-pattern "$edge_process_pattern" \
-    --mutation-profile "$mutation" --receipt "$mutations/$mutation.json"
+    --mutation-profile "$mutation" --receipt "$mutations/$mutation.json" 2> "$checker_stderr"
   local checker_status=$?
   set -e
-  if ((checker_status == 64)); then
-    printf 'checker usage failure for mutation %s\n' "$mutation" >&2
+  sed -n '1,400p' "$checker_stderr" >&2
+  if grep -Eq 'stop container|remove container|remove conformance temporary root' "$checker_stderr"; then
+    stage_error "runtime-teardown/$mutation" "checker reported container or temporary-root cleanup failure; see $checker_stderr"
     exit 1
   fi
-  jq -e --arg cell "$cell" --arg detail "$detail" '
-    [.checks[] | select(.status == "FAIL")] as $failed |
-    ($failed | length) == 1 and $failed[0].id == $cell and $failed[0].detail == $detail
-  ' "$mutations/$mutation.json" >/dev/null
+  local checker_wall_seconds=$((SECONDS - checker_started))
+  "$diagnostics" mutation "$mutations/$mutation.json" "$mutation" "$cell" "$detail" \
+    "$checker_status" "$checker_wall_seconds"
   executed_rows=$((executed_rows + 1))
 }
 
@@ -69,8 +117,8 @@ run_mutation plain-tcp-control transport.plain-tcp-rejected 'endpoint accepted T
 run_mutation view-accepts-input input.view-isolated 'view pointer or key input reached the guest before the control sentinel'
 run_mutation text-frames-accepted transport.text-frame-rejected 'one endpoint violated the negative wire assertion'
 run_mutation driver-json-ignored driver.true-consumed 'tenant ignored the true driver generation'
-run_mutation malformed-driver-accepted driver.malformed-fails-closed 'a malformed generation was accepted or not observed'
-run_mutation unknown-driver-version-accepted driver.unknown-version-fails-closed 'unknown-version generation was accepted or not observed'
+run_mutation malformed-driver-accepted driver.malformed-fails-closed 'a malformed generation was accepted'
+run_mutation unknown-driver-version-accepted driver.unknown-version-fails-closed 'unknown-version generation was accepted'
 run_mutation writable-driver driver.read-only 'tenant can write driver.json'
 run_mutation reserved-env-shadowed environment.view-port 'reserved environment did not match the authoritative value'
 run_mutation forbidden-privilege harness.forbidden-privilege 'forbidden SYS_ADMIN capability was added'
@@ -83,5 +131,8 @@ run_mutation profile-state-lost persistence.profile-survives 'profile marker und
 run_mutation sign-in-state-lost persistence.sign-in-survives 'sign-in marker under HOME was lost'
 run_mutation edge-does-not-recover persistence.edge-recovers 'both endpoints did not recover after edge withdrawal'
 jq -n --arg platform "linux/$arch" --argjson executed_rows "$executed_rows" \
-  '{version:1,platform:$platform,executed_rows:$executed_rows}' > "$mutations/summary.json"
-jq -e --arg platform "linux/$arch" '.platform == $platform and .executed_rows == 20' "$mutations/summary.json" >/dev/null
+  '{version:1,platform:$platform,executed_rows:$executed_rows}' > "$mutations/summary.json" || {
+    stage_error summary-write 'could not write mutation summary receipt'
+    exit 1
+  }
+"$diagnostics" summary "$mutations/summary.json" "linux/$arch" 20
