@@ -356,6 +356,30 @@ func TestAttemptOutsideSessionIsDistinctFromNonLiveAttempt(t *testing.T) {
 	assertRPCCode(t, err, CodeUnauthorizedAttempt)
 }
 
+func TestBindingImagePinOutsideSessionIsUnauthorized(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+
+	foreign := testAuthority()
+	foreign.Class = contract.JobClassService
+	foreign.NodeID = "foreign-node"
+	foreign.BootSessionID = "foreign-boot"
+	err = session.EnsureImage(t.Context(), EnsureImageRequest{
+		Reference: "example.invalid/pinned",
+		Digest:    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Platform:  testImagePlatform,
+		Pin:       &ImagePin{Authority: foreign, Binding: true},
+	}, nil)
+	assertRPCCode(t, err, CodeUnauthorizedAttempt)
+}
+
 func TestEngineFailureCarriesBoundedOperationMechanics(t *testing.T) {
 	engine := newFakeEngine()
 	engine.deleteErr = context.DeadlineExceeded

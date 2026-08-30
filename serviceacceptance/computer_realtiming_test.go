@@ -112,8 +112,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"--memory-bytes", fmt.Sprint(1<<30), "--disk-bytes", fmt.Sprint(128<<20), "--backup-cap", "4",
 		"--idempotency-key", "linux-native-computer-create")
 	ready := waitForComputerCLI(t, harness, created.ComputerID, 3*time.Minute, func(current l1.Computer) bool {
-		return current.CurrentJob.State == contract.JobRunning && current.CurrentJob.Ready != nil && *current.CurrentJob.Ready &&
-			current.DisplayEndpoint != nil && current.AppliedRevision == current.IntentRevision
+		return computerDisplayPublished(current) && current.AppliedRevision == current.IntentRevision
 	})
 	recordComputerAuthority(receipt, ready)
 	diskEvidence := inspectLiveComputerDisk(t, ready)
@@ -225,7 +224,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 			harness.restartAgent(t)
 		}
 		ready = waitForComputerCLI(t, harness, ready.ComputerID, 5*time.Minute, func(current l1.Computer) bool {
-			return current.CurrentJob.State == contract.JobRunning && current.CurrentJob.Ready != nil && *current.CurrentJob.Ready &&
+			return computerDisplayPublished(current) &&
 				current.CurrentJob.CurrentAttemptID != "" && current.CurrentJob.CurrentAttemptID != before
 		})
 		lossAttempts[action] = ready.CurrentJob.CurrentAttemptID
@@ -237,7 +236,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		harness.agent.kill(t)
 		harness.restartAgent(t)
 		restarted = waitForComputerCLI(t, harness, ready.ComputerID, 4*time.Minute, func(current l1.Computer) bool {
-			return current.CurrentJob.State == contract.JobRunning && current.CurrentJob.Ready != nil && *current.CurrentJob.Ready &&
+			return computerDisplayPublished(current) &&
 				current.CurrentJob.CurrentAttemptID != "" && current.CurrentJob.CurrentAttemptID != beforeAgentLoss
 		})
 	}
@@ -283,7 +282,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"--image", reference+"@"+digest, "--expect-current", "--idempotency-key", "linux-native-reimage")
 	reimaged = waitForComputerCLI(t, harness, reimaged.ComputerID, 4*time.Minute, func(current l1.Computer) bool {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision &&
-			current.CurrentSpecRevision > reset.CurrentSpecRevision && current.CurrentJob.Ready != nil && *current.CurrentJob.Ready
+			current.CurrentSpecRevision > reset.CurrentSpecRevision && computerDisplayPublished(current)
 	})
 	abortEvidence := exerciseLiveReconfigurationAbort(t, harness, reference, digest)
 	detachment := inspectLiveComputerDetachment(t, reimaged)
@@ -1287,13 +1286,19 @@ func waitForComputerCLI(t *testing.T, harness *acceptanceHarness, computerID str
 	return l1.Computer{}
 }
 
+func computerDisplayPublished(computer l1.Computer) bool {
+	// Computers forbid published_port, so ServiceJob.Ready is intentionally nil.
+	// The fenced, attempt-bound display_endpoint is their readiness projection.
+	return computer.CurrentJob.State == contract.JobRunning && computer.DisplayEndpoint != nil
+}
+
 func createReadyComputer(t *testing.T, harness *acceptanceHarness, reference, digest, name, key string) l1.Computer {
 	t.Helper()
 	created := runComputerCLI[l1.Computer](t, harness, false, "services", "create", "--computer", "--name", name,
 		"--image", reference+"@"+digest, "--node", "acceptance-node", "--memory-bytes", fmt.Sprint(1<<30),
 		"--disk-bytes", fmt.Sprint(64<<20), "--idempotency-key", key)
 	return waitForComputerCLI(t, harness, created.ComputerID, 3*time.Minute, func(current l1.Computer) bool {
-		return current.CurrentJob.State == contract.JobRunning && current.CurrentJob.Ready != nil && *current.CurrentJob.Ready
+		return computerDisplayPublished(current)
 	})
 }
 

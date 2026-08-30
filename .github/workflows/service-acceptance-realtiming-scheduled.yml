@@ -145,7 +145,8 @@ jobs:
           test "$(jq -r .commit "$RUNNER_TEMP/wayland-computer-image-release/wayland-computer-image-receipt.json")" = "$EXPECTED_SHA"
           candidate_sha="$(git rev-parse HEAD)"
           test "$candidate_sha" = "$EXPECTED_SHA"
-          printf 'CANDIDATE_SHA=%s\nPUBLISHED_SHA=%s\n' "$candidate_sha" "$EXPECTED_SHA" >> "$GITHUB_ENV"
+          printf 'CANDIDATE_SHA=%s\nPUBLISHED_SHA=%s\nWEFTY_REALTIME_EVIDENCE_SOURCE=published-artifact\n' \
+            "$candidate_sha" "$EXPECTED_SHA" >> "$GITHUB_ENV"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
@@ -558,3 +559,9 @@ jobs:
             "$RUNNER_TEMP/linux-computer-receipt-wayland/linux-computer-matrix.json" \
             "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" wayland \
             "${{ inputs.mutation_row != 'none' && inputs.mutation_row || '' }}"
+          scripts/check-native-linux-oci-receipt.sh \
+            "$RUNNER_TEMP/linux-computer-receipt-xfce/native-linux-oci.txt" published-artifact \
+            "$RUNNER_TEMP/linux-computer-receipt-xfce/oci-service-publication-linux.txt"
+          scripts/check-native-linux-oci-receipt.sh \
+            "$RUNNER_TEMP/linux-computer-receipt-wayland/native-linux-oci.txt" published-artifact \
+            "$RUNNER_TEMP/linux-computer-receipt-wayland/oci-service-publication-linux.txt"

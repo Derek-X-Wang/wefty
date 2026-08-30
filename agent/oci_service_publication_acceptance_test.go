@@ -45,11 +45,12 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 		t.Fatal("Linux OCI service publication realtiming provisioning is incomplete")
 	}
 	var healthOK, echoOK, startupTimedOut, withdrawalObserved, republicationObserved bool
-	var portCollisionAvoided, portlessOK, gracefulStopOK, killEscalationOK, restartIdentityOK bool
+	var portCollisionAvoided, portlessOK, gracefulStopOK, restartIdentityOK bool
+	var killEscalation nativeOCIServiceKILLEscalationEvidence
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
 			helperTunnelOK := healthOK && echoOK
-			evidence := fmt.Sprintf("platform=%s/%s\nhealth=%t\necho=%t\nstartup_timeout=%t\nwithdrawal=%t\nrepublication=%t\nport_collision_avoided=%t\nportless_started=%t\nhelper_tunnel=%t\nterm_cooperative_stop=%t\nterm_kill_escalation=%t\nterm_grace_stop=%t\nfresh_restart_authority=%t\n", runtime.GOOS, runtime.GOARCH, healthOK, echoOK, startupTimedOut, withdrawalObserved, republicationObserved, portCollisionAvoided, portlessOK, helperTunnelOK, gracefulStopOK, killEscalationOK, gracefulStopOK && killEscalationOK, restartIdentityOK)
+			evidence := fmt.Sprintf("platform=%s/%s\nhealth=%t\necho=%t\nstartup_timeout=%t\nwithdrawal=%t\nrepublication=%t\nport_collision_avoided=%t\nportless_started=%t\nhelper_tunnel=%t\nterm_cooperative_stop=%t\nterm_kill_escalation=%t\nterm_kill_log_evidence_incomplete=%t\nterm_kill_log_seal_pairing=%t\nterm_kill_stdout_log=%t\nterm_kill_stderr_log=%t\nterm_grace_stop=%t\nfresh_restart_authority=%t\n", runtime.GOOS, runtime.GOARCH, healthOK, echoOK, startupTimedOut, withdrawalObserved, republicationObserved, portCollisionAvoided, portlessOK, helperTunnelOK, gracefulStopOK, killEscalation.Escalated, killEscalation.LogEvidenceIncomplete, killEscalation.LogSealPairing, killEscalation.StdoutLog, killEscalation.StderrLog, gracefulStopOK && killEscalation.Escalated, restartIdentityOK)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-publication-"+runtime.GOOS+".txt"), []byte(evidence), 0o600); err != nil {
 				t.Errorf("write OCI service publication evidence: %v", err)
 			}
@@ -145,7 +146,7 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	}
 
 	gracefulStopOK = primary.stop(t, adapter)
-	killEscalationOK = verifyNativeOCIServiceKILLEscalation(t, ctx, adapter, reference, digest)
+	killEscalation = verifyNativeOCIServiceKILLEscalation(t, ctx, adapter, reference, digest)
 	restarted := startNativeOCIService(t, ctx, adapter, reference, digest, "primary-restart", primary.requestAuthority.JobID, nil, true)
 	primaryResources, primaryIdentityErr := ocihelper.DeterministicResourceIdentity(ocirunner.HelperAuthority(primary.requestAuthority))
 	restartedResources, restartedIdentityErr := ocihelper.DeterministicResourceIdentity(ocirunner.HelperAuthority(restarted.requestAuthority))
@@ -298,15 +299,25 @@ while :; do sleep 1; done
 	if err != nil || len(attempts) != 1 || attempts[0].AttemptID != firstAttempt || attempts[0].State != contract.AttemptLost || attempts[0].Result != nil {
 		t.Fatalf("intent-stop expiry evidence=%+v err=%v", attempts, err)
 	}
-	if intentStopped.BoundNodeID != firstRunning.BoundNodeID || intentStopped.Spec.Execution.OCI == nil ||
-		intentStopped.Spec.Execution.OCI.Image.Digest == nil || *intentStopped.Spec.Execution.OCI.Image.Digest != digest ||
-		intentStopped.RestartStreak != 0 || intentStopped.LifetimeRestartCount != 0 || intentStopped.NextRestartAt != nil ||
-		len(intentStopped.LastFailure) != 0 {
-		t.Fatalf("intent stop changed service binding/failure budget: before=%+v after=%+v", firstRunning, intentStopped)
-	}
 	pinsAfterStop, err := nodeAgent.logSpool.ListOCIImageBindingPins(t.Context())
-	if err != nil || !containsBindingPin(pinsAfterStop, primary.JobID, digest) {
-		t.Fatalf("intent stop lost OCI binding pin=%+v err=%v", pinsAfterStop, err)
+	bindingPinBefore := containsBindingPin(pinsBeforeStop, primary.JobID, digest)
+	bindingPinAfter := containsBindingPin(pinsAfterStop, primary.JobID, digest)
+	if intentStopped.ServiceJob == nil || firstRunning.ServiceJob == nil {
+		t.Fatalf("intent stop omitted service projection: before=%+v after=%+v", firstRunning.ServiceJob, intentStopped.ServiceJob)
+	}
+	if err != nil || intentStopped.BoundNodeID != firstRunning.BoundNodeID ||
+		intentStopped.Spec.Execution.OCI == nil || intentStopped.Spec.Execution.OCI.Image.Digest == nil ||
+		*intentStopped.Spec.Execution.OCI.Image.Digest != digest ||
+		intentStopped.RestartStreak != firstRunning.RestartStreak ||
+		intentStopped.LifetimeRestartCount != firstRunning.LifetimeRestartCount ||
+		!bytes.Equal(intentStopped.LastFailure, firstRunning.LastFailure) ||
+		intentStopped.LeaseLossCount != firstRunning.LeaseLossCount+1 || intentStopped.NextRestartAt == nil ||
+		!intentStopped.NextRestartAt.After(intentStopped.UpdatedAt) ||
+		intentStopped.NextRestartAt.After(intentStopped.UpdatedAt.Add(l1.MaximumServiceRestartDelay)) ||
+		!bindingPinBefore || !bindingPinAfter {
+		t.Fatalf("intent stop changed service binding/failure budget: before={binding_pin:%t BoundNodeID:%q digest:%q RestartStreak:%d LifetimeRestartCount:%d LeaseLossCount:%d LastFailure:%s NextRestartAt:%v} after={binding_pin:%t BoundNodeID:%q digest:%q RestartStreak:%d LifetimeRestartCount:%d LeaseLossCount:%d LastFailure:%s NextRestartAt:%v} pins_err=%v",
+			bindingPinBefore, firstRunning.BoundNodeID, nativeOCIJobDigest(firstRunning), firstRunning.RestartStreak, firstRunning.LifetimeRestartCount, firstRunning.LeaseLossCount, firstRunning.LastFailure, firstRunning.NextRestartAt,
+			bindingPinAfter, intentStopped.BoundNodeID, nativeOCIJobDigest(intentStopped), intentStopped.RestartStreak, intentStopped.LifetimeRestartCount, intentStopped.LeaseLossCount, intentStopped.LastFailure, intentStopped.NextRestartAt, err)
 	}
 	if _, err := lima.SetOCIIntent(t.Context(), intentPath, 2, true, time.Now()); err != nil {
 		t.Fatal(err)
@@ -548,6 +559,13 @@ func containsBindingPin(pins []workloadrunner.OCIImageBindingPin, jobID, digest 
 		}
 	}
 	return false
+}
+
+func nativeOCIJobDigest(job l1.Job) string {
+	if job.Spec.Execution.OCI == nil || job.Spec.Execution.OCI.Image.Digest == nil {
+		return ""
+	}
+	return *job.Spec.Execution.OCI.Image.Digest
 }
 
 func importRealtimeProbeImage(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, reference, digest string) {
@@ -820,7 +838,15 @@ while :; do
 done
 `
 
-func verifyNativeOCIServiceKILLEscalation(t *testing.T, parent context.Context, adapter *ocirunner.Adapter, reference, digest string) bool {
+type nativeOCIServiceKILLEscalationEvidence struct {
+	Escalated             bool
+	LogEvidenceIncomplete bool
+	LogSealPairing        bool
+	StdoutLog             bool
+	StderrLog             bool
+}
+
+func verifyNativeOCIServiceKILLEscalation(t *testing.T, parent context.Context, adapter *ocirunner.Adapter, reference, digest string) nativeOCIServiceKILLEscalationEvidence {
 	t.Helper()
 	request := nativeOCIServiceRequest(reference, digest, "term-ignoring", []string{
 		"/bin/sh", "-c", `printf 'kill-escalation-stdout\n'; printf 'kill-escalation-stderr\n' >&2; trap '' TERM; while :; do sleep 60; done`,
@@ -834,6 +860,12 @@ func verifyNativeOCIServiceKILLEscalation(t *testing.T, parent context.Context, 
 	}, 1)
 	var logMu sync.Mutex
 	var logs []contract.LogEvent
+	var seals []workloadrunner.OCILogSealObservation
+	request.OCILogSealObserved = func(observation workloadrunner.OCILogSealObservation) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		seals = append(seals, observation)
+	}
 	go func() {
 		result, err := adapter.Run(ctx, request, workloadrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
 			logMu.Lock()
@@ -864,15 +896,26 @@ func verifyNativeOCIServiceKILLEscalation(t *testing.T, parent context.Context, 
 		t.Fatal("TERM-ignoring OCI service did not reach bounded KILL escalation")
 	}
 	elapsed := time.Since(stopStarted)
-	if outcome.err != nil || outcome.result.Outcome.Signal != "killed" || outcome.result.Outcome.TerminationCause != contract.TerminationCauseAgent || !outcome.result.Outcome.LogEvidenceIncomplete {
+	// The logger can observe stream EOF before helper cleanup terminates it, or
+	// publish an incomplete seal first. Both orderings are valid, but the helper's
+	// aggregate ProcessResult must agree with the two per-stream seal records.
+	if outcome.err != nil || outcome.result.Outcome.Signal != "killed" || outcome.result.Outcome.TerminationCause != contract.TerminationCauseAgent {
 		t.Fatalf("TERM-ignoring OCI service escalation = (%+v, %v)", outcome.result.Outcome, outcome.err)
 	}
 	logMu.Lock()
 	stdoutLog := acceptanceLogContains(logs, contract.LogStdout, "kill-escalation-stdout")
 	stderrLog := acceptanceLogContains(logs, contract.LogStderr, "kill-escalation-stderr")
+	sealCounts := map[contract.LogStream]int{}
+	sealEvidenceIncomplete := false
+	for _, seal := range seals {
+		sealCounts[seal.Stream]++
+		sealEvidenceIncomplete = sealEvidenceIncomplete || !seal.Complete
+	}
 	logMu.Unlock()
-	if !stdoutLog || !stderrLog {
-		t.Fatalf("TERM-ignoring OCI service receipt completeness = log_evidence_incomplete:%t stdout_log:%t stderr_log:%t", outcome.result.Outcome.LogEvidenceIncomplete, stdoutLog, stderrLog)
+	logSealPairing := sealCounts[contract.LogStdout] == 1 && sealCounts[contract.LogStderr] == 1 &&
+		len(seals) == 2 && outcome.result.Outcome.LogEvidenceIncomplete == sealEvidenceIncomplete
+	if !logSealPairing || !stdoutLog || !stderrLog {
+		t.Fatalf("TERM-ignoring OCI service receipt completeness = log_evidence_incomplete:%t seal_incomplete:%t seals:%+v pairing:%t stdout_log:%t stderr_log:%t", outcome.result.Outcome.LogEvidenceIncomplete, sealEvidenceIncomplete, seals, logSealPairing, stdoutLog, stderrLog)
 	}
 	if elapsed < processrunner.DefaultTerminationGraceTime || elapsed >= 10*time.Second {
 		t.Fatalf("TERM-ignoring OCI service escalation elapsed %s, want grace honoured and completion inside stop budget", elapsed)
@@ -883,7 +926,13 @@ func verifyNativeOCIServiceKILLEscalation(t *testing.T, parent context.Context, 
 	if err != nil || !receipt.RuntimeQuiesced {
 		t.Fatalf("TERM-ignoring OCI service cleanup = (%+v, %v)", receipt, err)
 	}
-	return true
+	return nativeOCIServiceKILLEscalationEvidence{
+		Escalated:             true,
+		LogEvidenceIncomplete: outcome.result.Outcome.LogEvidenceIncomplete,
+		LogSealPairing:        logSealPairing,
+		StdoutLog:             stdoutLog,
+		StderrLog:             stderrLog,
+	}
 }
 
 func acceptanceLogContains(events []contract.LogEvent, stream contract.LogStream, value string) bool {

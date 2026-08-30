@@ -193,7 +193,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if strings.Contains(realtimeText, "FROM $ECHO_REFERENCE@$ECHO_DIGEST") {
 		t.Fatal("PR realtiming must not pull its PR-only base digest from GHCR")
 	}
-	for _, required := range []string{"repository: ${{ needs.resolve-published-artifact.outputs.source-repository }}", "ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}", "source=pr-build", "source=published-artifact", "provenance-receipt.json", "EVIDENCE_SOURCE"} {
+	for _, required := range []string{"repository: ${{ needs.resolve-published-artifact.outputs.source-repository }}", "ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}", "source=pr-build", "source=published-artifact", "provenance-receipt.json", "WEFTY_REALTIME_EVIDENCE_SOURCE"} {
 		if !strings.Contains(realtimeText, required) {
 			t.Fatalf("shared main/PR realtiming contract is missing %q", required)
 		}
@@ -349,7 +349,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 		resultText := marshalJob(t, result)
 		for _, required := range []string{"ARTIFACT_AVAILABLE", "$ARTIFACT_AVAILABLE", "= true",
-			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland"} {
+			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json",
+			"check-native-linux-oci-receipt.sh", "native-linux-oci.txt", "oci-service-publication-linux.txt", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland"} {
 			if !strings.Contains(resultText, required) {
 				t.Fatalf("%s realtiming result does not fail closed on %q", name, required)
 			}
@@ -371,12 +372,12 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 	}
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "exec /usr/local/bin/wefty-echo-service", "published-echo-service:", "clean-cache wefty node load-image")
-	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "CodeImageUnavailable", "ImageFailureNetwork", "WEFTY_OCI_PROVISION_RECEIPT", "pull_from_empty=true\\nregistry_disabled_pull_rejected=%t\\nregistry_disabled_import=true")
-	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "Wipe that repopulated cache", `requestRootFault(t, "reset-containerd")`, "wiped-cache binding reconciliation")
+	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "CodeImageUnavailable", "ImageFailureNetwork", "WEFTY_OCI_PROVISION_RECEIPT", `evidenceSource := os.Getenv("WEFTY_REALTIME_EVIDENCE_SOURCE")`, `registryEvidence := "pull_from_empty=true\npull_import_digest_equal=true\n"`, "pull_from_empty=NOT-RUN\\npull_from_empty_reason=pr-build: image not published")
+	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "Start the archive row from an empty root", `requestRootFault(t, "reset-containerd")`, "wiped-cache binding reconciliation")
 	assertFileNotContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", `strings.Replace(evidence, "pull_from_empty=true\\n"`)
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_COMPUTER_REFERENCE", "exerciseNativeLinuxReferenceComputer", "ComputerStartupReadinessTimeout", "assertReferenceComputerWireNegatives")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_WAYLAND_COMPUTER_REFERENCE", `exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, "wayland"`, "wayland_computer_reference_wire_negatives=true")
-	assertFileContains(t, "../agent/oci_service_publication_acceptance_test.go", `trap 'exit 143' TERM; while :; do sleep 0.1; done`, "restart_requested=true", `kill "$server" 2>/dev/null || true`)
+	assertFileContains(t, "../agent/oci_service_publication_acceptance_test.go", `trap 'exit 143' TERM; while :; do sleep 0.1; done`, "restart_requested=true", `kill "$server" 2>/dev/null || true`, "term_kill_log_evidence_incomplete=%t", "term_kill_log_seal_pairing=%t", "term_kill_stdout_log=%t", "term_kill_stderr_log=%t")
 	assertFileNotContains(t, "../agent/oci_service_publication_acceptance_test.go", `kill "$(cat /tmp/wefty-httpd.pid)"`)
 	assertFileMatches(t, "../examples/oci-echo-service/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG GO_IMAGE=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG BUSYBOX_IMAGE=.*@sha256:[0-9a-f]{64}$`)
 	assertFileMatches(t, "../examples/computer/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG DEBIAN_IMAGE=.*@sha256:[0-9a-f]{64}$`)
