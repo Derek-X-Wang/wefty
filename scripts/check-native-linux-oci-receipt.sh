@@ -40,22 +40,33 @@ require_duration_within() {
   value=$(awk -v prefix="$key=" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1) }' "$file")
   if [ "$count" -ne 1 ] || ! awk -v value="$value" -v limit="$max_seconds" '
     BEGIN {
-      if (value !~ /^[0-9]+([.][0-9]+)?(ns|us|µs|ms|s|m|h)$/) exit 1
-      unit = value
-      sub(/^[0-9]+([.][0-9]+)?/, "", unit)
-      number = value
-      sub(/(ns|us|µs|ms|s|m|h)$/, "", number)
-      multiplier = 1
-      if (unit == "ns") multiplier = 0.000000001
-      else if (unit == "us" || unit == "µs") multiplier = 0.000001
-      else if (unit == "ms") multiplier = 0.001
-      else if (unit == "m") multiplier = 60
-      else if (unit == "h") multiplier = 3600
-      seconds = number * multiplier
-      exit !(seconds > 0 && seconds <= limit)
+      remaining = value
+      total_ns = 0
+      components = 0
+      while (length(remaining) > 0) {
+        if (match(remaining, /^[0-9]+([.][0-9]+)?/) != 1) exit 1
+        number = substr(remaining, 1, RLENGTH) + 0
+        remaining = substr(remaining, RLENGTH + 1)
+        if (match(remaining, /^(ns|us|µs|ms|s|m|h)/) != 1) exit 1
+        unit = substr(remaining, 1, RLENGTH)
+        remaining = substr(remaining, RLENGTH + 1)
+        multiplier = 1
+        if (unit == "us" || unit == "µs") multiplier = 1000
+        else if (unit == "ms") multiplier = 1000000
+        else if (unit == "s") multiplier = 1000000000
+        else if (unit == "m") multiplier = 60000000000
+        else if (unit == "h") multiplier = 3600000000000
+        total_ns += number * multiplier
+        components++
+      }
+      limit_ns = (limit + 0) * 1000000000
+      # A 1ns literal is not credible elapsed-time evidence from this harness.
+      # One microsecond is the smallest accepted measurement quantum.
+      if (components == 0 || total_ns < 1000 || total_ns > limit_ns) exit 1
+      exit 0
     }
   '; then
-    printf 'receipt must contain exactly one positive %s duration within %ss\n' "$key" "$max_seconds" >&2
+    printf 'receipt must contain exactly one measured %s duration within %ss\n' "$key" "$max_seconds" >&2
     exit 1
   fi
 }

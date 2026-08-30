@@ -100,11 +100,25 @@ func TestNativeLinuxOCIReceiptDistinguishesPRDeviationFromPublishedProof(t *test
 			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=0s\n",
 		},
 		{
+			name:           "nanosecond literal is not measured evidence",
+			source:         "published-artifact",
+			receipt:        publishedNativeOCIReceipt(),
+			serviceReceipt: servicePublicationReceipt(false),
+			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=1ns\n",
+		},
+		{
 			name:           "recovery beyond production bound fails closed",
 			source:         "published-artifact",
 			receipt:        publishedNativeOCIReceipt(),
 			serviceReceipt: servicePublicationReceipt(false),
 			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=15.01s\n",
+		},
+		{
+			name:           "composite Go duration beyond bound fails closed",
+			source:         "published-artifact",
+			receipt:        publishedNativeOCIReceipt(),
+			serviceReceipt: servicePublicationReceipt(false),
+			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=1m24.78s\n",
 		},
 		{
 			name:           "republication beyond production bound fails closed",
