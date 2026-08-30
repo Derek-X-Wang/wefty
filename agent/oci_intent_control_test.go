@@ -45,6 +45,35 @@ func TestStopOCIRuntimeSuppressesAndJoinsOnlyOCIResidents(t *testing.T) {
 	}
 }
 
+func TestOCIIntentStopPersistsAcrossSuccessfulProbesUntilOperatorRecovery(t *testing.T) {
+	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+	})
+	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, probe, systemClock{}, time.Second)
+	if err := capabilities.refresh(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)
+	if err := session.stopOCIRuntime(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := capabilities.refresh(t.Context()); err != errOCIIntentDisabled {
+		t.Fatalf("automatic probe after intent stop error=%v, want %v", err, errOCIIntentDisabled)
+	}
+	stopped := capabilities.capabilitySnapshot()
+	if stopped.Capabilities["kind:oci"] || stopped.ReasonCode != contract.CapabilityReasonOCIIntentDisabled {
+		t.Fatalf("automatic probe released operator intent stop: %+v", stopped)
+	}
+
+	capabilities.clearOCIIntent()
+	if err := capabilities.refresh(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if recovered := capabilities.capabilitySnapshot(); !recovered.Capabilities["kind:oci"] {
+		t.Fatalf("operator recovery did not release intent stop: %+v", recovered)
+	}
+}
+
 func TestStopOCIRuntimeRejectsMissingReapProof(t *testing.T) {
 	capabilities := newCapabilityState(map[string]bool{"kind:process": true, "kind:oci": true}, nil, systemClock{}, time.Second)
 	session := newAgentSession(nil, contract.NodeRegistration{}, capabilities, time.Second, time.Second, systemClock{}, newLifecycleObserver(systemClock{}), nil, 1, 1)

@@ -354,6 +354,10 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if err := adapter.ReleaseOCIImageBindingPin(ctx, automaticBinding.Authority.JobID); err != nil {
 		t.Fatal(err)
 	}
+	// The automatic reconciliation above deliberately repulled the digest.
+	// Wipe that repopulated cache before isolating the registry so the direct
+	// reconciliation below observes the intended retained-but-missing binding.
+	requestRootFault(t, "reset-containerd")
 	requestRootFault(t, "disable-registry")
 	registryDisabled := true
 	t.Cleanup(func() {

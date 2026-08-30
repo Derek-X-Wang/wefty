@@ -102,7 +102,9 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	}
 	republicationObserved = primary.waitReachable(t, true, 5*time.Second)
 
-	timedOut := startNativeOCIService(t, ctx, adapter, reference, digest, "startup-timeout", "", []string{"/bin/sh", "-c", "sleep 600"}, false)
+	timedOut := startNativeOCIService(t, ctx, adapter, reference, digest, "startup-timeout", "", []string{
+		"/bin/sh", "-c", `trap 'exit 143' TERM; while :; do sleep 1; done`,
+	}, false)
 	outcome := waitServiceOutcome(t, timedOut.done)
 	startupTimedOut = outcome.err != nil && outcome.result.SpawnError != nil && outcome.result.SpawnError.Code == contract.SpawnFailureStartupReadinessTimeout
 	if !startupTimedOut {
@@ -267,13 +269,13 @@ while :; do sleep 1; done
 	}
 	cancelStop()
 	// The real two-second lease proves that local intent stop is neither an
-	// execution failure nor a hidden service restart. L1 retains the binding
-	// and digest pin when the quiesced attempt expires back to queued.
-	time.Sleep(2100 * time.Millisecond)
-	if result, err := store.Reconcile(t.Context()); err != nil || result.ExpiredAttempts != 1 {
-		t.Fatalf("intent-stop lease reconciliation=%+v err=%v", result, err)
-	}
+	// execution failure nor a hidden service restart. Observe L1's one-second
+	// background reconciler win, then prove a second serialized pass is
+	// idempotent instead of assuming this caller owns the transition count.
 	intentStopped := waitNativeServiceState(t, store, primary.JobID, contract.JobQueued, 5*time.Second)
+	if result, err := store.Reconcile(t.Context()); err != nil || result.ExpiredAttempts != 0 {
+		t.Fatalf("post-intent-stop idempotent reconciliation=%+v err=%v", result, err)
+	}
 	if intentStopped.BoundNodeID != firstRunning.BoundNodeID || intentStopped.Spec.Execution.OCI == nil ||
 		intentStopped.Spec.Execution.OCI.Image.Digest == nil || *intentStopped.Spec.Execution.OCI.Image.Digest != digest ||
 		intentStopped.RestartStreak != 0 || intentStopped.LifetimeRestartCount != 0 || intentStopped.NextRestartAt != nil ||
@@ -755,7 +757,7 @@ test "$WEFTY_SERVICE_DIR" = "/wefty/service" || exit 91
 mkdir -p /tmp/wefty-www/cgi-bin
 printf 'healthy\n' >/tmp/wefty-www/healthz
 printf '#!/bin/sh\nprintf "Content-Type: application/octet-stream\\r\\n\\r\\n"\ndd bs=1 count="${CONTENT_LENGTH:-0}" 2>/dev/null\n' >/tmp/wefty-www/cgi-bin/echo
-printf '#!/bin/sh\ntouch /tmp/wefty-listener-restart\nprintf "Status: 204 No Content\\r\\n\\r\\n"\nkill "$(cat /tmp/wefty-httpd.pid)" 2>/dev/null || true\n' >/tmp/wefty-www/cgi-bin/restart-listener
+printf '#!/bin/sh\ntouch /tmp/wefty-listener-restart\nprintf "Status: 204 No Content\\r\\n\\r\\n"\n' >/tmp/wefty-www/cgi-bin/restart-listener
 chmod 0755 /tmp/wefty-www/cgi-bin/echo
 chmod 0755 /tmp/wefty-www/cgi-bin/restart-listener
 server=
@@ -771,13 +773,20 @@ trap terminate TERM
 while :; do
   /bin/httpd -f -p "127.0.0.1:$WEFTY_SERVICE_PORT" -h /tmp/wefty-www &
   server=$!
-  printf '%s\n' "$server" >/tmp/wefty-httpd.pid
   # Keep PID 1 available to run its TERM trap. The integer sleep is portable
   # across BusyBox builds and WithKillAll interrupts both it and httpd.
-  while kill -0 "$server" 2>/dev/null; do sleep 1; done
+  restart_requested=false
+  while kill -0 "$server" 2>/dev/null; do
+    if test -f /tmp/wefty-listener-restart; then
+      restart_requested=true
+      kill "$server" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+  done
   wait "$server"
   status=$?
-  if test -f /tmp/wefty-listener-restart; then
+  if test "$restart_requested" = true; then
     sleep 1
     rm -f /tmp/wefty-listener-restart
   else

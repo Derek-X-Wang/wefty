@@ -92,14 +92,19 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 		cancelRun()
 		t.Fatal(err)
 	}
-	time.Sleep(600 * time.Millisecond)
-	reconciliation, err := store.Reconcile(t.Context())
-	if err != nil || reconciliation.ExpiredAttempts != 1 {
+	queued, err := waitForFailureJobState(store, job.JobID, contract.JobQueued, 3*time.Second)
+	if err != nil {
 		cancelRun()
-		t.Fatalf("intent-stop reconciliation=%+v err=%v", reconciliation, err)
+		t.Fatal(err)
 	}
-	queued, err := store.GetJob(t.Context(), job.JobID)
-	if err != nil || queued.State != contract.JobQueued || queued.CurrentAttemptID != attemptID ||
+	reconciliation, err := store.Reconcile(t.Context())
+	// Observing queued above proves the server's periodic reconciler serialized
+	// first; a second pass must report no duplicate transition.
+	if err != nil || reconciliation.ExpiredAttempts != 0 {
+		cancelRun()
+		t.Fatalf("post-intent-stop idempotent reconciliation=%+v err=%v", reconciliation, err)
+	}
+	if queued.State != contract.JobQueued || queued.CurrentAttemptID != attemptID ||
 		queued.BoundNodeID != "intent-node" || queued.RestartStreak != 0 ||
 		runtime.starts.Load() != 1 {
 		cancelRun()

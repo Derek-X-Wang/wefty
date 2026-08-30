@@ -86,6 +86,7 @@ type capabilityState struct {
 	lastProbe                  *contract.CapabilityObservation
 	pendingPublicationRevision int64
 	ociSuppressionSequence     atomic.Uint64
+	ociIntentDisabled          atomic.Bool
 }
 
 func newCapabilityState(configured map[string]bool, probe CapabilityProbe, clock Clock, timeout time.Duration) *capabilityState {
@@ -175,8 +176,23 @@ func (state *capabilityState) suppressOCILocked(reason contract.CapabilityReason
 	if err == nil {
 		err = errors.New("OCI runtime is not admitted")
 	}
+	if reason == contract.CapabilityReasonOCIIntentDisabled {
+		state.ociIntentDisabled.Store(true)
+	}
 	state.ociSuppressionSequence.Add(1)
 	state.recordLocked(CapabilityProbeResult{ReasonCode: reason}, err, false)
+}
+
+// clearOCIIntent authorizes successful probes to earn OCI capabilities again.
+// It shares the publication barrier with claims and probe commits so operator
+// start is the only transition that can release an intent-stop latch.
+func (state *capabilityState) clearOCIIntent() {
+	if state == nil {
+		return
+	}
+	state.claimPublication.Lock()
+	defer state.claimPublication.Unlock()
+	state.ociIntentDisabled.Store(false)
 }
 
 // recordProbeResult discards a positive result that began before a concurrent
@@ -193,6 +209,10 @@ func (state *capabilityState) recordProbeResult(
 	defer state.claimPublication.Unlock()
 	if probeErr == nil && state.ociSuppressionSequence.Load() != suppressionSequence {
 		return errors.New("capability probe was superseded by OCI runtime suppression")
+	}
+	if probeErr == nil && state.ociIntentDisabled.Load() {
+		probeErr = errOCIIntentDisabled
+		result = CapabilityProbeResult{ReasonCode: contract.CapabilityReasonOCIIntentDisabled}
 	}
 	if probeErr == nil && validate != nil {
 		probeErr = validate()

@@ -492,11 +492,11 @@ func contextWithClockTimeout(parent context.Context, clock Clock, timeout time.D
 func probeComputerBackendPairOnce(ctx context.Context, dial computerEndpointDial) error {
 	for _, name := range []string{workloadrunner.AttemptEndpointView, workloadrunner.AttemptEndpointControl} {
 		connection, websocketConnection, _, err := dialComputerBackend(ctx, dial, name)
-		if connection != nil {
-			_ = connection.Close()
-		}
 		if websocketConnection != nil {
 			_ = websocketConnection.CloseNow()
+		}
+		if connection != nil {
+			_ = connection.Close()
 		}
 		if err != nil {
 			return err

@@ -97,6 +97,20 @@ func TestComputerServicePublishesOnlyFabricFrontDoorAndAdmissionDialsView(t *tes
 	}
 }
 
+func TestComputerReadinessProbeDoesNotWaitForBackendCloseHandshake(t *testing.T) {
+	backend := newComputerBackend(t, computerBackendOptions{ignoreCloseHandshake: true})
+	defer backend.Close()
+	dial := func(ctx context.Context, _ string) (net.Conn, error) { return backend.dial(ctx) }
+
+	startedAt := time.Now()
+	if err := probeComputerBackendPairOnce(t.Context(), dial); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("successful Computer readiness probe cleanup took %s, want at most 500ms", elapsed)
+	}
+}
+
 func TestComputerReadinessIsAtomicAcrossPartialLossAndRecovery(t *testing.T) {
 	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 	clock := newManualClock(now)
