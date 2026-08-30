@@ -27,6 +27,7 @@ func main() {
 func run() error {
 	var (
 		fabricMode                = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
+		plainFabricID             = flag.String("plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain Fabric ID (must start with plain-)")
 		listenAddress             = flag.String("listen", l3.DefaultL3Address, "run-ledger Fabric listen address")
 		controlPlane              = flag.String("control-plane", l3.DefaultL1Address, "L1 control-plane Fabric address")
 		databasePath              = flag.String("db", "wefty-l3.sqlite", "SQLite database path")
@@ -46,7 +47,8 @@ func run() error {
 	}
 
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
-		Mode: *fabricMode,
+		Mode:          *fabricMode,
+		PlainFabricID: *plainFabricID,
 		Identity: fabric.Identity{
 			NodeID: "run-ledger",
 			Tags:   []string{l1.DefaultClientPrincipalTag},

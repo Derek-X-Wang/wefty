@@ -7,11 +7,12 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
-	"os"
+	"strings"
 	"sync"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -28,23 +29,12 @@ type Network struct {
 }
 
 const (
-	identityMagic       = "WEFTYPLAIN1"
-	maxIdentitySize     = 64 << 10
-	FabricIDEnvironment = "WEFTY_PLAIN_FABRIC_ID"
+	identityMagic   = "WEFTYPLAIN1"
+	maxIdentitySize = 64 << 10
 )
 
-// NewNetwork creates an isolated localhost fabric network. Test harnesses
-// whose participants run in separate processes may set FabricIDEnvironment
-// so every process projects the same development-only Fabric authority.
+// NewNetwork creates an isolated localhost fabric network.
 func NewNetwork() *Network {
-	fabricID := os.Getenv(FabricIDEnvironment)
-	if fabricID != "" {
-		return &Network{
-			names:    make(map[string]string),
-			peers:    make(map[string]fabric.Identity),
-			fabricID: fabricID,
-		}
-	}
 	identity := make([]byte, 32)
 	if _, err := rand.Read(identity); err != nil {
 		panic(fmt.Sprintf("plain fabric: generate network identity: %v", err))
@@ -54,6 +44,16 @@ func NewNetwork() *Network {
 		peers:    make(map[string]fabric.Identity),
 		fabricID: "plain-" + hex.EncodeToString(identity),
 	}
+}
+
+// NewNetworkWithID joins separate DEVELOPMENT ONLY plain-Fabric processes to
+// one explicit authority. The reserved prefix prevents plain identity from
+// being presented as a production Fabric implementation.
+func NewNetworkWithID(fabricID string) (*Network, error) {
+	if !strings.HasPrefix(fabricID, "plain-") || len(fabricID) <= len("plain-") || len(fabricID) > 255 || strings.TrimSpace(fabricID) != fabricID {
+		return nil, errors.New("plain fabric: explicit Fabric ID must use the bounded plain- prefix")
+	}
+	return &Network{names: make(map[string]string), peers: make(map[string]fabric.Identity), fabricID: fabricID}, nil
 }
 
 // Fabric is one identity-bearing participant in a plain Network.

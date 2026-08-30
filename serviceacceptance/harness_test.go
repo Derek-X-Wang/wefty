@@ -616,6 +616,18 @@ func (buffer *lockedBuffer) Write(payload []byte) (int, error) {
 	return buffer.b.Write(payload)
 }
 
+func (buffer *lockedBuffer) WriteString(payload string) (int, error) {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.b.WriteString(payload)
+}
+
+func (buffer *lockedBuffer) Len() int {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.b.Len()
+}
+
 func (buffer *lockedBuffer) String() string {
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()

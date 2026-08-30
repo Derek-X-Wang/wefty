@@ -354,6 +354,7 @@ func run() error {
 	}
 	var (
 		fabricMode            = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
+		plainFabricID         = flag.String("plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain Fabric ID (must start with plain-)")
 		controlPlane          = flag.String("control-plane", "wefty://control-plane", "control-plane Fabric address")
 		runLedger             = flag.String("run-ledger", "wefty://run-ledger", "run-ledger Fabric address used by workflow jobs")
 		nodeID                = flag.String("node-id", "", "stable operator-facing node ID")
@@ -422,7 +423,8 @@ func run() error {
 		identityID = *nodeID
 	}
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
-		Mode: *fabricMode,
+		Mode:          *fabricMode,
+		PlainFabricID: *plainFabricID,
 		Identity: fabric.Identity{
 			NodeID: identityID,
 			Tags:   []string{l1.DefaultAgentPrincipalTag},

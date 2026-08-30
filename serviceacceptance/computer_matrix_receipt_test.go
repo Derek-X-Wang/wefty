@@ -38,6 +38,7 @@ type linuxComputerMatrixReceipt struct {
 	StorageIDs           []string                               `json:"storage_ids"`
 	TakeoverRetryStderr  []string                               `json:"takeover_policy_retry_stderr"`
 	ResidueInventories   map[string]ocihelper.ResourceInventory `json:"residue_inventories"`
+	ResidueAssertions    map[string]bool                        `json:"residue_assertions"`
 	Timings              map[string]string                      `json:"timings"`
 	Deviations           []linuxComputerDeviation               `json:"deviations"`
 	Rows                 map[string]linuxComputerMatrixRow      `json:"rows"`
@@ -94,7 +95,7 @@ func newLinuxComputerMatrixReceipt() *linuxComputerMatrixReceipt {
 	}
 	return &linuxComputerMatrixReceipt{
 		Version: linuxComputerMatrixVersion, Status: "MISSING", Platform: runtime.GOOS + "/" + runtime.GOARCH,
-		Rows: rows, ResidueInventories: map[string]ocihelper.ResourceInventory{}, Timings: map[string]string{}, StartedAt: time.Now().UTC(),
+		Rows: rows, ResidueInventories: map[string]ocihelper.ResourceInventory{}, ResidueAssertions: map[string]bool{}, Timings: map[string]string{}, StartedAt: time.Now().UTC(),
 	}
 }
 
@@ -154,6 +155,11 @@ func (receipt *linuxComputerMatrixReceipt) finish() {
 				receipt.NotRunIssue = row.NotRunIssue
 				receipt.NotRunReason = row.NotRunReason
 			}
+		}
+	}
+	for _, passed := range receipt.ResidueAssertions {
+		if !passed {
+			receipt.Status = "FAIL"
 		}
 	}
 }

@@ -27,21 +27,35 @@ type NamespaceResidueError struct {
 	DurableRetained ResourceInventory
 }
 
+// ResidueClassificationError means an engine returned an absence verdict that
+// disagrees with its explicit runtime-residue projection. The barrier refuses
+// to guess which observed resources are durable.
+type ResidueClassificationError struct {
+	Operation      string
+	Absent         bool
+	Observed       ResourceInventory
+	RuntimeResidue ResourceInventory
+}
+
+func (err *ResidueClassificationError) Error() string {
+	return fmt.Sprintf("%s: inconsistent runtime-residue classification: absent=%t runtime=%+v observed=%+v", err.Operation, err.Absent, err.RuntimeResidue, err.Observed)
+}
+
 func (err *NamespaceResidueError) Error() string {
 	return fmt.Sprintf("%s: residue remains after sweep: runtime=%+v durable_retained=%+v observed=%+v", err.Operation, err.RuntimeResidue, err.DurableRetained, err.Observed)
 }
 
 func namespaceResidueError(operation string, verification VerifyResponse) error {
-	residue := verification.RuntimeResidue
-	if InventoryEmpty(residue) && !verification.Absent {
-		// Preserve truthful failure reporting for older engines and test doubles
-		// that only supplied the complete observed inventory.
-		residue = verification.Inventory
+	if verification.Absent != InventoryEmpty(verification.RuntimeResidue) {
+		return &ResidueClassificationError{
+			Operation: operation, Absent: verification.Absent,
+			Observed: cloneResourceInventory(verification.Inventory), RuntimeResidue: cloneResourceInventory(verification.RuntimeResidue),
+		}
 	}
 	return &NamespaceResidueError{
 		Operation:       operation,
 		Observed:        cloneResourceInventory(verification.Inventory),
-		RuntimeResidue:  cloneResourceInventory(residue),
+		RuntimeResidue:  cloneResourceInventory(verification.RuntimeResidue),
 		DurableRetained: cloneResourceInventory(verification.DurableRetained),
 	}
 }
@@ -176,6 +190,9 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 	verification, err := session.Verify(barrierContext, VerifyRequest{Scope: VerifyNamespace})
 	if err != nil {
 		return fmt.Errorf("verify OCI runtime namespace: %w", err)
+	}
+	if verification.Absent != InventoryEmpty(verification.RuntimeResidue) {
+		return namespaceResidueError("verify OCI runtime namespace", verification)
 	}
 	if !verification.Absent {
 		return namespaceResidueError("verify OCI runtime namespace", verification)
@@ -323,5 +340,5 @@ func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {
 func InventoryEmpty(inventory ResourceInventory) bool {
 	return len(inventory.Leases)+len(inventory.Snapshots)+len(inventory.Containers)+len(inventory.Tasks)+
 		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ManagedVolumes)+len(inventory.ManagedVolumeRecords)+
-		len(inventory.ComputerDiskImages)+len(inventory.ComputerDiskAllocations)+len(inventory.ComputerDiskQuotas)+len(inventory.ComputerDiskManifests)+len(inventory.ComputerDiskMounts)+len(inventory.ComputerDiskLoops)+len(inventory.ComputerAttachments)+len(inventory.ComputerResetManifests)+len(inventory.ComputerQuarantines) == 0
+		len(inventory.ComputerDiskImages)+len(inventory.ComputerDiskAllocations)+len(inventory.ComputerDiskQuotas)+len(inventory.ComputerDiskManifests)+len(inventory.ComputerDiskMounts)+len(inventory.ComputerDiskLoops)+len(inventory.ComputerAttachments)+len(inventory.ComputerResetManifests)+len(inventory.ComputerQuarantines)+len(inventory.ComputerDiskAnomalies) == 0
 }

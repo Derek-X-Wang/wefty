@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -53,7 +54,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		}
 		return
 	}
-	t.Setenv(plain.FabricIDEnvironment, "plain-linux-computer-acceptance")
+	t.Setenv("WEFTY_DEV_PLAIN_FABRIC_ID", "plain-linux-computer-acceptance")
 
 	reference := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_REFERENCE")
 	digest := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_DIGEST")
@@ -86,6 +87,9 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		receipt.ResidueInventories["between_package_runtime_residue"] = residue.RuntimeResidue
 		receipt.ResidueInventories["between_package_durable_retained"] = residue.DurableRetained
 		receipt.ResidueInventories["between_package_observed_inventory"] = residue.Observed
+		receipt.ResidueAssertions["between_package_absence_blocked_by_runtime_residue"] = !ocihelper.InventoryEmpty(residue.RuntimeResidue)
+		receipt.ResidueAssertions["between_package_observed_classified"] = reflect.DeepEqual(
+			residue.Observed, mergeAcceptanceInventory(residue.RuntimeResidue, residue.DurableRetained))
 	}
 	importRealtimeProbeImage(t, requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_PROBE_ARCHIVE"),
 		helperSocket, helperChecksum, probeReference, probeDigest, recordBarrierResidue)
@@ -143,6 +147,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"control_named_endpoint_dialed":   adminTake.TenureState == contract.ComputerControlTenureHeld,
 		"control_named_endpoint_released": adminRelease.TenureState == contract.ComputerControlTenureFree,
 		"helper_admitted_real_payload":    ready.CurrentJob.CurrentAttemptID != "",
+		"cross_process_plain_authority":   len(policy.Admins) == 1 && policy.Admins[0].FabricID == "plain-linux-computer-acceptance" && adminView.admitted,
 	}, map[string]string{"computer_id": ready.ComputerID, "job_id": ready.CurrentJobID,
 		"attempt_id": ready.CurrentJob.CurrentAttemptID, "storage_id": ready.StorageID,
 		"storage_generation": fmt.Sprint(ready.StorageGeneration), "intent_revision": fmt.Sprint(ready.IntentRevision),
@@ -500,17 +505,21 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	receipt.ResidueInventories["post_removal_observed_inventory"] = verification.Inventory
 	receipt.ResidueInventories["post_removal_runtime_residue"] = verification.RuntimeResidue
 	receipt.ResidueInventories["post_removal_durable_retained"] = verification.DurableRetained
+	receipt.ResidueAssertions["post_removal_observed_inventory_empty"] = ocihelper.InventoryEmpty(verification.Inventory)
+	receipt.ResidueAssertions["post_removal_runtime_residue_empty"] = ocihelper.InventoryEmpty(verification.RuntimeResidue)
+	receipt.ResidueAssertions["post_removal_durable_retained_matches_expected_empty_custody"] = ocihelper.InventoryEmpty(verification.DurableRetained)
 	archiveAfter := sha256File(t, archive)
 	cacheAfter := liveContainerdImagePresent(t, digest)
 	completeLinuxComputerRow(t, receipt, "linux.removal", map[string]bool{
 		"verified_absence_outcome_live":      verified.RemovalOutcome == "removed_verified",
 		"reduced_custody_outcome_live":       reduced.RemovalOutcome == "removed_reduced",
 		"reduced_bound_to_tainted_computer":  reduced.ComputerID == taintedComputerID,
-		"independent_helper_inventory_empty": ocihelper.InventoryEmpty(verification.RuntimeResidue),
-		"containers_absent":                  len(verification.RuntimeResidue.Containers) == 0,
-		"tasks_absent":                       len(verification.RuntimeResidue.Tasks) == 0,
-		"disks_loops_mounts_absent":          len(verification.RuntimeResidue.ComputerDiskImages)+len(verification.RuntimeResidue.ComputerDiskLoops)+len(verification.RuntimeResidue.ComputerDiskMounts) == 0,
-		"logs_and_control_absent":            len(verification.RuntimeResidue.LogSegments)+len(verification.RuntimeResidue.Cgroups) == 0,
+		"independent_helper_inventory_empty": ocihelper.InventoryEmpty(verification.Inventory),
+		"containers_absent":                  len(verification.Inventory.Containers) == 0,
+		"tasks_absent":                       len(verification.Inventory.Tasks) == 0,
+		"disks_loops_mounts_absent":          len(verification.Inventory.ComputerDiskImages)+len(verification.Inventory.ComputerDiskLoops)+len(verification.Inventory.ComputerDiskMounts) == 0,
+		"logs_and_control_absent":            len(verification.Inventory.LogSegments)+len(verification.Inventory.Cgroups) == 0,
+		"durable_retained_matches_custody":   ocihelper.InventoryEmpty(verification.DurableRetained),
 		"publication_withdrawn":              verified.DisplayEndpoint == nil,
 		"operator_bind_source_untouched":     archiveBefore == archiveAfter,
 		"shared_image_cache_untouched":       cacheBefore && cacheAfter,
@@ -523,6 +532,26 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 
 type publishedComputerRuntimeReceipt struct {
 	Digest string `json:"digest"`
+}
+
+func mergeAcceptanceInventory(left, right ocihelper.ResourceInventory) ocihelper.ResourceInventory {
+	return ocihelper.ResourceInventory{
+		Leases: append(left.Leases, right.Leases...), Snapshots: append(left.Snapshots, right.Snapshots...),
+		Containers: append(left.Containers, right.Containers...), Tasks: append(left.Tasks, right.Tasks...),
+		Shims: append(left.Shims, right.Shims...), Cgroups: append(left.Cgroups, right.Cgroups...),
+		LogSegments: append(left.LogSegments, right.LogSegments...), ManagedVolumes: append(left.ManagedVolumes, right.ManagedVolumes...),
+		ManagedVolumeRecords:    append(left.ManagedVolumeRecords, right.ManagedVolumeRecords...),
+		ComputerDiskImages:      append(left.ComputerDiskImages, right.ComputerDiskImages...),
+		ComputerDiskAllocations: append(left.ComputerDiskAllocations, right.ComputerDiskAllocations...),
+		ComputerDiskQuotas:      append(left.ComputerDiskQuotas, right.ComputerDiskQuotas...),
+		ComputerDiskManifests:   append(left.ComputerDiskManifests, right.ComputerDiskManifests...),
+		ComputerDiskMounts:      append(left.ComputerDiskMounts, right.ComputerDiskMounts...),
+		ComputerDiskLoops:       append(left.ComputerDiskLoops, right.ComputerDiskLoops...),
+		ComputerAttachments:     append(left.ComputerAttachments, right.ComputerAttachments...),
+		ComputerResetManifests:  append(left.ComputerResetManifests, right.ComputerResetManifests...),
+		ComputerQuarantines:     append(left.ComputerQuarantines, right.ComputerQuarantines...),
+		ComputerDiskAnomalies:   append(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies...),
+	}
 }
 
 func readPublishedComputerRuntimeReceipt(t *testing.T, path string) publishedComputerRuntimeReceipt {
@@ -657,7 +686,7 @@ type takeoverViewProcess struct {
 	cancel          context.CancelFunc
 	done            chan error
 	stdout          bytes.Buffer
-	stderr          bytes.Buffer
+	stderr          lockedBuffer
 	toleratedStderr []string
 	evidence        *realTimingEvidence
 	evidencePrefix  string
@@ -768,6 +797,7 @@ func (view *takeoverViewProcess) stop(t *testing.T) {
 	case err := <-view.done:
 		view.recordAttempt("success", "closed", err)
 	case <-time.After(10 * time.Second):
+		view.recordAttempt("success", "timeout", errors.New("takeover view did not stop"))
 		t.Fatal("takeover view did not stop")
 	}
 }
@@ -779,6 +809,7 @@ func (view *takeoverViewProcess) waitClosed(t *testing.T, timeout time.Duration)
 		view.recordAttempt("success", "closed", err)
 	case <-time.After(timeout):
 		view.cancel()
+		view.recordAttempt("success", "timeout", errors.New("takeover view remained open after authority revocation"))
 		t.Fatal("takeover view remained open after authority revocation")
 	}
 }
@@ -918,7 +949,11 @@ type liveRFBSession struct {
 
 func openLiveRFBSession(t *testing.T, endpoint, userID, deviceID string) *liveRFBSession {
 	t.Helper()
-	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: deviceID, UserID: userID, DeviceID: deviceID})
+	plainNetwork, err := plain.NewNetworkWithID("plain-linux-computer-acceptance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	participant := plainNetwork.NewFabric(fabric.Identity{NodeID: deviceID, UserID: userID, DeviceID: deviceID})
 	transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 		return participant.Dial(ctx, network, address)
 	}}

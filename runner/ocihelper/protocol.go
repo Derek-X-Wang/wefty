@@ -1248,7 +1248,7 @@ type SweepRequest struct {
 type SweepResponse struct {
 	SweepEpoch            string                  `json:"sweep_epoch"`
 	Removed               int                     `json:"removed"`
-	PriorBootSessionsSeen []string                `json:"prior_boot_sessions_seen"`
+	PriorBootSessionsSeen []SessionIdentity       `json:"prior_boot_sessions_seen"`
 	Inventory             ResourceInventory       `json:"inventory"`
 	Attempts              []SweptAttemptAuthority `json:"attempts"`
 }
@@ -1298,7 +1298,7 @@ type SweptAttemptAuthority struct {
 type VerifiedSweepReceipt struct {
 	SweepEpoch            string                  `json:"sweep_epoch"`
 	HelperSession         HelperSession           `json:"helper_session"`
-	PriorBootSessionsSeen []string                `json:"prior_boot_sessions_seen"`
+	PriorBootSessionsSeen []SessionIdentity       `json:"prior_boot_sessions_seen"`
 	SweptInventory        ResourceInventory       `json:"swept_inventory"`
 	VerifiedAbsent        bool                    `json:"verified_absent"`
 	VerifiedInventory     ResourceInventory       `json:"verified_inventory"`

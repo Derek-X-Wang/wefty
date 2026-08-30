@@ -12,6 +12,7 @@ import (
 type Config struct {
 	Mode           string
 	Identity       fabric.Identity
+	PlainFabricID  string
 	Name           string
 	StateDirectory string
 	AuthKey        string
@@ -25,7 +26,15 @@ type CloseFunc func() error
 func Open(config Config) (fabric.Fabric, CloseFunc, error) {
 	switch config.Mode {
 	case "plain":
-		participant := plain.NewNetwork().NewFabric(config.Identity)
+		network := plain.NewNetwork()
+		if config.PlainFabricID != "" {
+			var err error
+			network, err = plain.NewNetworkWithID(config.PlainFabricID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("fabric config: DEVELOPMENT ONLY plain Fabric ID: %w", err)
+			}
+		}
+		participant := network.NewFabric(config.Identity)
 		return participant, func() error { return nil }, nil
 	case "tsnet":
 		if config.Name == "" {

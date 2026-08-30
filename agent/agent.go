@@ -287,9 +287,26 @@ func New(config Config) (*Agent, error) {
 			}
 		}
 		if len(priorBootReapers) > 0 {
-			session.reapPriorBoot = func(ctx context.Context, jobID, kind string) (workloadrunner.ReapReceipt, error) {
-				request := workloadrunner.PriorBootReapRequest{NodeID: config.NodeID, JobID: jobID, PriorBootSessionID: resource.previousBootSessionID, CurrentBootSessionID: config.BootSessionID}
-				return reapPriorBootForKind(ctx, priorBootReapers, kind, request)
+			session.reapPriorBoot = func(ctx context.Context, jobID, kind string, attempts []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
+				base := workloadrunner.PriorBootReapRequest{NodeID: config.NodeID, JobID: jobID, PriorBootSessionID: resource.previousBootSessionID, CurrentBootSessionID: config.BootSessionID}
+				if kind == contract.JobKindOCI {
+					for _, attempt := range attempts {
+						if attempt.NodeID != base.NodeID || attempt.JobID != jobID || attempt.BootSessionID != base.PriorBootSessionID {
+							continue
+						}
+						request := base
+						request.AttemptID, request.FencingToken = attempt.AttemptID, attempt.FencingToken
+						request.WorkloadClass, request.RemovalGeneration = attempt.WorkloadClass, attempt.RemovalGeneration
+						receipt, err := reapPriorBootForKind(ctx, priorBootReapers, kind, request)
+						if err == nil {
+							return receipt, nil
+						}
+						if !errors.Is(err, workloadrunner.ErrPriorBootEvidenceUnavailable) {
+							return workloadrunner.ReapReceipt{}, err
+						}
+					}
+				}
+				return reapPriorBootForKind(ctx, priorBootReapers, kind, base)
 			}
 		}
 	}

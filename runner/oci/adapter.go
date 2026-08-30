@@ -1684,12 +1684,17 @@ func (adapter *Adapter) ReapPriorBoot(_ context.Context, request workloadrunner.
 	}
 	matchedAttempt := false
 	for _, attempt := range receipt.Attempts {
-		if attempt.NodeID == request.NodeID && attempt.JobID == request.JobID && attempt.PriorBootSessionID == request.PriorBootSessionID {
+		if request.AttemptID != "" && request.FencingToken != "" && request.WorkloadClass != "" && request.RemovalGeneration != "" &&
+			attempt.NodeID == request.NodeID && attempt.JobID == request.JobID && attempt.PriorBootSessionID == request.PriorBootSessionID &&
+			attempt.AttemptID == request.AttemptID && attempt.FencingToken == request.FencingToken &&
+			attempt.Class == request.WorkloadClass && attempt.RemovalGeneration == request.RemovalGeneration {
 			matchedAttempt = true
 			break
 		}
 	}
-	priorBootSeen := slices.Contains(receipt.PriorBootSessionsSeen, request.PriorBootSessionID)
+	priorBootSeen := slices.Contains(receipt.PriorBootSessionsSeen, ocihelper.SessionIdentity{
+		NodeID: request.NodeID, BootSessionID: request.PriorBootSessionID,
+	})
 	if !matchedAttempt && !priorBootSeen {
 		return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
 	}

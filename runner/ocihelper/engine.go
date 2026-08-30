@@ -101,7 +101,7 @@ type Engine interface {
 	DialAttemptPort(context.Context, DialAttemptPortRequest, io.ReadWriteCloser) error
 	DialHostBridge(context.Context, DialHostBridgeRequest, io.ReadWriteCloser) error
 	ReapAttempt(context.Context, AttemptAuthority) error
-	ReapSession(context.Context, SessionIdentity) error
+	ReapSession(context.Context, SessionIdentity) (SweepResponse, error)
 }
 
 type ImageCacheEngine interface {
@@ -195,4 +195,6 @@ func (UnavailableEngine) DialHostBridge(context.Context, DialHostBridgeRequest, 
 	return errEngineUnavailable
 }
 func (UnavailableEngine) ReapAttempt(context.Context, AttemptAuthority) error { return nil }
-func (UnavailableEngine) ReapSession(context.Context, SessionIdentity) error  { return nil }
+func (UnavailableEngine) ReapSession(context.Context, SessionIdentity) (SweepResponse, error) {
+	return SweepResponse{}, nil
+}

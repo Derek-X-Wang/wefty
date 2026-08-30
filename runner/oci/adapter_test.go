@@ -436,7 +436,10 @@ func TestAdapterConsumesMatchingPriorBootSweepEvidenceOnce(t *testing.T) {
 		Attempts:       []ocihelper.SweptAttemptAuthority{{NodeID: "node", JobID: "job", AttemptID: "attempt", FencingToken: "fence", PriorBootSessionID: "boot-old", Class: contract.JobClassService, RemovalGeneration: "remove-1"}},
 	}}
 	adapter := NewAdapter(source)
-	request := workloadrunner.PriorBootReapRequest{NodeID: "node", JobID: "job", PriorBootSessionID: "boot-old", CurrentBootSessionID: "boot-new"}
+	request := workloadrunner.PriorBootReapRequest{
+		NodeID: "node", JobID: "job", PriorBootSessionID: "boot-old", CurrentBootSessionID: "boot-new",
+		AttemptID: "attempt", FencingToken: "fence", WorkloadClass: contract.JobClassService, RemovalGeneration: "remove-1",
+	}
 	receipt, err := adapter.ReapPriorBoot(t.Context(), request)
 	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidencePriorBootOCISweep || receipt.SweepEpoch != "sweep-1" || receipt.HelperGeneration != 7 {
 		t.Fatalf("prior-boot receipt=%+v err=%v", receipt, err)
@@ -446,10 +449,45 @@ func TestAdapterConsumesMatchingPriorBootSweepEvidenceOnce(t *testing.T) {
 	}
 }
 
+func TestAdapterRejectsEveryIncompleteOrMismatchedSweptAttemptAuthorityField(t *testing.T) {
+	valid := workloadrunner.PriorBootReapRequest{
+		NodeID: "node", JobID: "job", PriorBootSessionID: "boot-old", CurrentBootSessionID: "boot-new",
+		AttemptID: "attempt", FencingToken: "fence", WorkloadClass: contract.JobClassService, RemovalGeneration: "remove-1",
+	}
+	receipt := ocihelper.VerifiedSweepReceipt{
+		SweepEpoch: "sweep-1", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-1", SessionGeneration: 7}, VerifiedAbsent: true,
+		Attempts: []ocihelper.SweptAttemptAuthority{{NodeID: "node", JobID: "job", AttemptID: "attempt", FencingToken: "fence", PriorBootSessionID: "boot-old", Class: contract.JobClassService, RemovalGeneration: "remove-1"}},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*workloadrunner.PriorBootReapRequest, string)
+	}{
+		{name: "node", mutate: func(request *workloadrunner.PriorBootReapRequest, value string) { request.NodeID = value }},
+		{name: "job", mutate: func(request *workloadrunner.PriorBootReapRequest, value string) { request.JobID = value }},
+		{name: "prior_boot", mutate: func(request *workloadrunner.PriorBootReapRequest, value string) { request.PriorBootSessionID = value }},
+		{name: "attempt", mutate: func(request *workloadrunner.PriorBootReapRequest, value string) { request.AttemptID = value }},
+		{name: "fence", mutate: func(request *workloadrunner.PriorBootReapRequest, value string) { request.FencingToken = value }},
+		{name: "class", mutate: func(request *workloadrunner.PriorBootReapRequest, value string) { request.WorkloadClass = value }},
+		{name: "removal_generation", mutate: func(request *workloadrunner.PriorBootReapRequest, value string) { request.RemovalGeneration = value }},
+	}
+	for _, test := range tests {
+		for _, variant := range []struct{ name, value string }{{name: "missing", value: ""}, {name: "mismatch", value: "different"}} {
+			t.Run(test.name+"_"+variant.name, func(t *testing.T) {
+				request := valid
+				test.mutate(&request, variant.value)
+				adapter := NewAdapter(&adapterReceiptSource{receipt: receipt})
+				if _, err := adapter.ReapPriorBoot(t.Context(), request); !errors.Is(err, workloadrunner.ErrPriorBootEvidenceUnavailable) {
+					t.Fatalf("ReapPriorBoot(%+v) error = %v", request, err)
+				}
+			})
+		}
+	}
+}
+
 func TestAdapterUsesVerifiedPriorBootNamespaceSweepAfterAttemptWasAlreadyReaped(t *testing.T) {
 	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
 		SweepEpoch: "sweep-empty", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-1", SessionGeneration: 8},
-		VerifiedAbsent: true, PriorBootSessionsSeen: []string{"boot-old"},
+		VerifiedAbsent: true, PriorBootSessionsSeen: []ocihelper.SessionIdentity{{NodeID: "node", BootSessionID: "boot-old"}},
 	}}
 	adapter := NewAdapter(source)
 	request := workloadrunner.PriorBootReapRequest{NodeID: "node", JobID: "job", PriorBootSessionID: "boot-old", CurrentBootSessionID: "boot-new"}
@@ -463,12 +501,24 @@ func TestAdapterUsesVerifiedPriorBootNamespaceSweepAfterAttemptWasAlreadyReaped(
 func TestAdapterRejectsUnboundVerifiedPriorBootNamespaceSweep(t *testing.T) {
 	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
 		SweepEpoch: "sweep-unbound", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-1", SessionGeneration: 9},
-		VerifiedAbsent: true, PriorBootSessionsSeen: []string{"another-boot"},
+		VerifiedAbsent: true, PriorBootSessionsSeen: []ocihelper.SessionIdentity{{NodeID: "node", BootSessionID: "another-boot"}},
 	}}
 	adapter := NewAdapter(source)
 	request := workloadrunner.PriorBootReapRequest{NodeID: "node", JobID: "job", PriorBootSessionID: "boot-old", CurrentBootSessionID: "boot-new"}
 	if _, err := adapter.ReapPriorBoot(t.Context(), request); !errors.Is(err, workloadrunner.ErrPriorBootEvidenceUnavailable) {
 		t.Fatalf("unbound prior-boot sweep error = %v", err)
+	}
+}
+
+func TestAdapterRejectsPriorBootNamespaceSweepForAnotherNode(t *testing.T) {
+	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
+		SweepEpoch: "sweep-other-node", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-1", SessionGeneration: 9},
+		VerifiedAbsent: true, PriorBootSessionsSeen: []ocihelper.SessionIdentity{{NodeID: "other-node", BootSessionID: "boot-old"}},
+	}}
+	adapter := NewAdapter(source)
+	request := workloadrunner.PriorBootReapRequest{NodeID: "node", JobID: "job", PriorBootSessionID: "boot-old", CurrentBootSessionID: "boot-new"}
+	if _, err := adapter.ReapPriorBoot(t.Context(), request); !errors.Is(err, workloadrunner.ErrPriorBootEvidenceUnavailable) {
+		t.Fatalf("cross-node prior-boot sweep error = %v", err)
 	}
 }
 
@@ -1681,7 +1731,9 @@ func (engine *adapterTestEngine) DialHostBridge(_ context.Context, _ ocihelper.D
 	return err
 }
 func (*adapterTestEngine) ReapAttempt(context.Context, ocihelper.AttemptAuthority) error { return nil }
-func (*adapterTestEngine) ReapSession(context.Context, ocihelper.SessionIdentity) error  { return nil }
+func (*adapterTestEngine) ReapSession(context.Context, ocihelper.SessionIdentity) (ocihelper.SweepResponse, error) {
+	return ocihelper.SweepResponse{}, nil
+}
 
 func startAdapterTestServer(t *testing.T, engine ocihelper.Engine) (*Adapter, func()) {
 	return startAdapterTestServerWithPolicy(t, engine, ImagePolicy{})

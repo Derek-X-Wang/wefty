@@ -187,6 +187,7 @@ type globalOptions struct {
 	plainIdentity  string
 	plainUserID    string
 	plainDeviceID  string
+	plainFabricID  string
 	fabricName     string
 	stateDirectory string
 	authKey        string
@@ -220,6 +221,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           options.fabricMode,
 		Identity:       plainIdentity,
+		PlainFabricID:  options.plainFabricID,
 		Name:           options.fabricName,
 		StateDirectory: options.stateDirectory,
 		AuthKey:        options.authKey,
@@ -265,6 +267,7 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.StringVar(&options.plainIdentity, "plain-identity", "wefty-cli", "plain Fabric identity node ID")
 	flags.StringVar(&options.plainUserID, "plain-user-id", os.Getenv("WEFTY_DEV_PLAIN_USER_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person user ID")
 	flags.StringVar(&options.plainDeviceID, "plain-device-id", os.Getenv("WEFTY_DEV_PLAIN_DEVICE_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person device ID")
+	flags.StringVar(&options.plainFabricID, "plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain- prefixed Fabric authority")
 	flags.StringVar(&options.fabricName, "fabric-name", "wefty-cli", "tsnet logical node name")
 	flags.StringVar(&options.stateDirectory, "state-dir", "", "tsnet state directory")
 	flags.StringVar(&options.authKey, "auth-key", os.Getenv("TS_AUTHKEY"), "tsnet auth key")
