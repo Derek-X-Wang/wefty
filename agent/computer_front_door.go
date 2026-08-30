@@ -127,6 +127,8 @@ type computerFrontDoorConfig struct {
 	computerID           string
 	jobID                string
 	attemptID            string
+	storageID            string
+	storageGeneration    int64
 	fencingToken         string
 	dial                 computerEndpointDial
 	controlTenure        ControlTenure
@@ -135,20 +137,26 @@ type computerFrontDoorConfig struct {
 	denialFlushInterval  time.Duration
 	newSessionID         func() (string, error)
 	newControlToken      func() (string, error)
+	controlTokens        *computerControlTokenCodec
 	// Tests use this hook to prove the client banner cannot overtake registration.
 	beforeControlSessionRegistration func()
 }
 
 // computerSessionHandle is the private sideband capability for one live
-// admission. The unguessable token resolves to this handle only inside the
-// Fabric front door; neither person identity nor policy role can name another
+// admission. A MAC-authenticated bearer resolves to this handle only while the
+// exact session is live; later doors recognize its Node lineage only to return
+// terminal evidence. Neither identity nor policy role can name another
 // session's take or release operation.
 type computerSessionHandle struct {
-	id      string
-	canTake bool
-	admin   bool
-	tenure  ControlTenure
-	session context.Context
+	id               string
+	canTake          bool
+	admin            bool
+	policyRevision   int64
+	tenure           ControlTenure
+	session          context.Context
+	terminalMu       sync.Mutex
+	terminalReason   l1.ComputerTakeoverReason
+	terminalRevision int64
 }
 
 type activeComputerSession struct {
@@ -157,15 +165,24 @@ type activeComputerSession struct {
 	cancel   context.CancelCauseFunc
 }
 
+func (session *activeComputerSession) end(reason l1.ComputerTakeoverReason, policyRevision int64) {
+	session.handle.markTerminal(reason, policyRevision)
+	session.cancel(&computerSessionEnd{reason: reason})
+}
+
 func (handle *computerSessionHandle) CanTake() bool { return handle != nil && handle.canTake }
 
 func (handle *computerSessionHandle) Take(ctx context.Context) (contract.ComputerControlReceipt, error) {
+	if handle == nil {
+		return contract.ComputerControlReceipt{}, &ComputerTenureError{Code: ComputerTenureUnauthorized}
+	}
 	if !handle.CanTake() {
 		return contract.ComputerControlReceipt{}, &ComputerTenureError{Code: ComputerTenureUnauthorized}
 	}
 	select {
 	case <-handle.session.Done():
-		return contract.ComputerControlReceipt{}, &ComputerTenureError{Code: ComputerTenureSessionEnded}
+		return handle.terminalReceipt(computerSessionEndReason(handle.session, l1.ComputerTakeoverClientClosed)),
+			&ComputerTenureError{Code: ComputerTenureSessionEnded}
 	default:
 	}
 	return handle.tenure.TakeReceipt(ctx, handle.id)
@@ -176,8 +193,52 @@ func (handle *computerSessionHandle) Release(ctx context.Context) (contract.Comp
 		return contract.ComputerControlReceipt{AdmittedMode: string(l1.ComputerAdmittedView),
 			TenureState: contract.ComputerControlTenureFree}, nil
 	}
+	select {
+	case <-handle.session.Done():
+		return handle.terminalReceipt(computerSessionEndReason(handle.session, l1.ComputerTakeoverClientClosed)),
+			&ComputerTenureError{Code: ComputerTenureSessionEnded}
+	default:
+	}
 	return handle.tenure.ReleaseReceipt(ctx, handle.id, l1.ComputerTakeoverExplicitRelease)
 }
+
+func (handle *computerSessionHandle) terminalReceipt(reason l1.ComputerTakeoverReason) contract.ComputerControlReceipt {
+	handle.terminalMu.Lock()
+	if handle.terminalReason != "" {
+		reason = handle.terminalReason
+	}
+	policyRevision := handle.terminalRevision
+	handle.terminalMu.Unlock()
+	if policyRevision == 0 {
+		policyRevision = handle.policyRevision
+	}
+	return contract.ComputerControlReceipt{
+		AdmittedMode:     string(l1.ComputerAdmittedView),
+		TenureState:      contract.ComputerControlTenureFree,
+		PolicyRevision:   policyRevision,
+		SessionEndReason: string(reason),
+	}
+}
+
+func (handle *computerSessionHandle) markTerminal(reason l1.ComputerTakeoverReason, policyRevision int64) {
+	if handle == nil {
+		return
+	}
+	handle.terminalMu.Lock()
+	handle.terminalReason = reason
+	if policyRevision > 0 {
+		handle.terminalRevision = policyRevision
+	}
+	handle.terminalMu.Unlock()
+}
+
+type closedComputerSession struct {
+	identity fabric.Identity
+	receipt  contract.ComputerControlReceipt
+	canTake  bool
+}
+
+const maximumClosedComputerSessionTokens = 256
 
 type computerFrontDoor struct {
 	config        computerFrontDoorConfig
@@ -189,6 +250,8 @@ type computerFrontDoor struct {
 	ready         bool
 	active        map[string]*activeComputerSession
 	tokens        map[string]*activeComputerSession
+	closedTokens  map[string]closedComputerSession
+	closedOrder   []string
 	sessionCond   *sync.Cond
 	sessionCount  int
 }
@@ -209,7 +272,8 @@ func newComputerFrontDoor(config computerFrontDoorConfig) (*computerFrontDoor, e
 	if config.auditor == nil {
 		return nil, errors.New("agent: Computer front door requires durable take-over audit")
 	}
-	if config.computerID == "" || config.jobID == "" || config.attemptID == "" || config.fencingToken == "" {
+	if config.computerID == "" || config.jobID == "" || config.attemptID == "" || config.storageID == "" ||
+		config.storageGeneration <= 0 || config.fencingToken == "" {
 		return nil, errors.New("agent: Computer front door requires complete attempt identity")
 	}
 	if config.dial == nil {
@@ -236,9 +300,20 @@ func newComputerFrontDoor(config computerFrontDoorConfig) (*computerFrontDoor, e
 	if config.newControlToken == nil {
 		config.newControlToken = newComputerControlToken
 	}
+	if config.controlTokens == nil {
+		key := make([]byte, computerControlTokenKeySize)
+		if _, err := rand.Read(key); err != nil {
+			return nil, fmt.Errorf("agent: generate Computer control token key: %w", err)
+		}
+		var err error
+		config.controlTokens, err = newComputerControlTokenCodec(key)
+		if err != nil {
+			return nil, err
+		}
+	}
 	frontDoor := &computerFrontDoor{
 		config: config, errors: make(chan error, 16), active: make(map[string]*activeComputerSession),
-		tokens: make(map[string]*activeComputerSession),
+		tokens: make(map[string]*activeComputerSession), closedTokens: make(map[string]closedComputerSession),
 	}
 	frontDoor.sessionCond = sync.NewCond(&frontDoor.mu)
 	frontDoor.denials = newComputerDenialCoalescer(frontDoor)
@@ -261,7 +336,7 @@ func (frontDoor *computerFrontDoor) SetReady(ready bool) {
 	frontDoor.ready = ready
 	if !ready {
 		for _, session := range frontDoor.active {
-			session.cancel(&computerSessionEnd{reason: l1.ComputerTakeoverViewBackendClosed})
+			session.end(l1.ComputerTakeoverViewBackendClosed, 0)
 		}
 	}
 	frontDoor.mu.Unlock()
@@ -271,7 +346,7 @@ func (frontDoor *computerFrontDoor) EndSessions(reason l1.ComputerTakeoverReason
 	frontDoor.mu.Lock()
 	defer frontDoor.mu.Unlock()
 	for _, session := range frontDoor.active {
-		session.cancel(&computerSessionEnd{reason: reason})
+		session.end(reason, 0)
 	}
 }
 
@@ -345,11 +420,49 @@ func (frontDoor *computerFrontDoor) serveControlAction(writer http.ResponseWrite
 			Message: "Computer control session token is required"}, nil)
 		return
 	}
+	token := values[0]
 	frontDoor.mu.Lock()
-	session := frontDoor.tokens[values[0]]
+	session := frontDoor.tokens[token]
+	closed, wasClosed := frontDoor.closedTokens[token]
 	frontDoor.mu.Unlock()
-	if session == nil || session.identity.Kind != identity.Kind || session.identity.FabricID != identity.FabricID ||
-		session.identity.UserID != identity.UserID || session.identity.DeviceID != identity.DeviceID {
+	if session == nil && wasClosed && sameComputerSessionIdentity(closed.identity, identity) {
+		action := "release"
+		if request.URL.Path == computerControlTakePath {
+			action = "take"
+			if !closed.canTake {
+				writeComputerControlError(writer, http.StatusForbidden, contract.APIError{Code: contract.ErrorControlNotAuthorized,
+					Message: "Computer access is not authorized for control"}, nil)
+				return
+			}
+		}
+		receipt := closed.receipt
+		receipt.ComputerID = frontDoor.config.computerID
+		receipt.Action = action
+		writeComputerControlError(writer, http.StatusGone, contract.APIError{Code: contract.ErrorTakeoverSessionEnded,
+			Message: "Computer " + action + " was refused because the session ended"}, &receipt)
+		return
+	}
+	if session == nil {
+		claims, issued := frontDoor.config.controlTokens.authenticate(token, frontDoor.config.computerID, frontDoor.config.storageID, identity)
+		if issued {
+			action := "release"
+			if request.URL.Path == computerControlTakePath {
+				action = "take"
+				if !claims.CanTake {
+					writeComputerControlError(writer, http.StatusForbidden, contract.APIError{Code: contract.ErrorControlNotAuthorized,
+						Message: "Computer access is not authorized for control"}, nil)
+					return
+				}
+			}
+			receipt := contract.ComputerControlReceipt{ComputerID: frontDoor.config.computerID, Action: action,
+				AdmittedMode: string(l1.ComputerAdmittedView), TenureState: contract.ComputerControlTenureFree,
+				PolicyRevision: claims.PolicyRevision, SessionEndReason: string(l1.ComputerTakeoverAttemptAuthorityLost)}
+			writeComputerControlError(writer, http.StatusGone, contract.APIError{Code: contract.ErrorTakeoverSessionEnded,
+				Message: "Computer " + action + " was refused because the session ended"}, &receipt)
+			return
+		}
+	}
+	if session == nil || !sameComputerSessionIdentity(session.identity, identity) {
 		writeComputerControlError(writer, http.StatusUnauthorized, contract.APIError{Code: contract.ErrorUnauthorized,
 			Message: "Computer control session is not active for this identity"}, nil)
 		return
@@ -394,6 +507,10 @@ func (frontDoor *computerFrontDoor) serveControlAction(writer http.ResponseWrite
 		Message: "Computer Controller tenure is unavailable"}, &receipt)
 }
 
+func sameComputerSessionIdentity(left, right fabric.Identity) bool {
+	return left.Kind == right.Kind && left.FabricID == right.FabricID && left.UserID == right.UserID && left.DeviceID == right.DeviceID
+}
+
 func writeComputerControlError(writer http.ResponseWriter, status int, apiError contract.APIError, receipt *contract.ComputerControlReceipt) {
 	writeComputerControlJSON(writer, status, contract.ComputerControlErrorResponse{Error: apiError, Receipt: receipt})
 }
@@ -427,9 +544,20 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 		http.Error(writer, "Computer session unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	controlToken, err := frontDoor.config.newControlToken()
+	controlNonce, err := frontDoor.config.newControlToken()
 	if err != nil {
 		frontDoor.report(fmt.Errorf("generate Computer control token: %w", err))
+		http.Error(writer, "Computer session unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	controlToken, err := frontDoor.config.controlTokens.issue(computerControlTokenClaims{
+		ComputerID: frontDoor.config.computerID, StorageID: frontDoor.config.storageID,
+		StorageGeneration: frontDoor.config.storageGeneration, AttemptID: frontDoor.config.attemptID,
+		FabricKind: string(identity.Kind), FabricID: identity.FabricID, UserID: identity.UserID, DeviceID: identity.DeviceID,
+		CanTake: authorization.CanTake(), PolicyRevision: authorization.PolicyRevision(), Nonce: controlNonce,
+	})
+	if err != nil {
+		frontDoor.report(fmt.Errorf("issue Computer control token: %w", err))
 		http.Error(writer, "Computer session unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -478,7 +606,8 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 		return
 	}
 	relay := newComputerSessionRelay(client, backend, clientWebSocket, backendWebSocket)
-	handle := &computerSessionHandle{id: sessionID, canTake: authorization.CanTake(), admin: authorization.IsAdministrator(), tenure: frontDoor.config.controlTenure, session: sessionContext}
+	handle := &computerSessionHandle{id: sessionID, canTake: authorization.CanTake(), admin: authorization.IsAdministrator(),
+		policyRevision: authorization.PolicyRevision(), tenure: frontDoor.config.controlTenure, session: sessionContext}
 	if frontDoor.config.beforeControlSessionRegistration != nil {
 		frontDoor.config.beforeControlSessionRegistration()
 	}
@@ -507,10 +636,13 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	frontDoor.tokens[controlToken] = active
 	frontDoor.sessionCount++
 	frontDoor.mu.Unlock()
+	endReason := l1.ComputerTakeoverClientClosed
 	defer func() {
 		frontDoor.mu.Lock()
 		delete(frontDoor.active, sessionID)
 		delete(frontDoor.tokens, controlToken)
+		frontDoor.rememberClosedTokenLocked(controlToken, closedComputerSession{identity: identity,
+			receipt: handle.terminalReceipt(endReason), canTake: handle.canTake})
 		frontDoor.sessionCount--
 		frontDoor.sessionCond.Broadcast()
 		frontDoor.mu.Unlock()
@@ -523,16 +655,29 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	}
 	relay.Start()
 
-	reason := frontDoor.waitForSessionEnd(sessionContext, request.RemoteAddr, identity, authorization, relay, admittedAt)
-	cancelSession(&computerSessionEnd{reason: reason})
+	end := frontDoor.waitForSessionEnd(sessionContext, request.RemoteAddr, identity, authorization, relay, admittedAt)
+	endReason = end.reason
+	handle.markTerminal(end.reason, end.policyRevision)
+	cancelSession(&computerSessionEnd{reason: end.reason})
 	relay.Close()
 	// A policy drain acknowledges the observable socket boundary. Durable
 	// control/session audit is finalized afterward and must not delay revocation.
 	release()
-	if err := handle.tenure.Release(context.WithoutCancel(request.Context()), sessionID, reason); err != nil {
+	if err := handle.tenure.Release(context.WithoutCancel(request.Context()), sessionID, end.reason); err != nil {
 		frontDoor.report(fmt.Errorf("release Computer control tenure: %w", err))
 	}
-	frontDoor.finishSession(request.Context(), baseEvent, reason)
+	frontDoor.finishSession(request.Context(), baseEvent, end.reason)
+}
+
+func (frontDoor *computerFrontDoor) rememberClosedTokenLocked(token string, session closedComputerSession) {
+	frontDoor.closedTokens[token] = session
+	frontDoor.closedOrder = append(frontDoor.closedOrder, token)
+	if len(frontDoor.closedOrder) <= maximumClosedComputerSessionTokens {
+		return
+	}
+	oldest := frontDoor.closedOrder[0]
+	frontDoor.closedOrder = frontDoor.closedOrder[1:]
+	delete(frontDoor.closedTokens, oldest)
 }
 
 // newComputerSessionContext translates generic parent cancellation into the
@@ -547,6 +692,11 @@ func newComputerSessionContext(authority context.Context) (context.Context, cont
 	return ctx, cancel, stop
 }
 
+type computerSessionEndEvidence struct {
+	reason         l1.ComputerTakeoverReason
+	policyRevision int64
+}
+
 func (frontDoor *computerFrontDoor) waitForSessionEnd(
 	ctx context.Context,
 	remoteAddress string,
@@ -554,7 +704,7 @@ func (frontDoor *computerFrontDoor) waitForSessionEnd(
 	authorization *ComputerGrantAuthorization,
 	relay *computerSessionRelay,
 	admittedAt time.Time,
-) l1.ComputerTakeoverReason {
+) computerSessionEndEvidence {
 	revalidation := make(chan l1.ComputerTakeoverReason, 1)
 	go frontDoor.revalidateIdentity(ctx, remoteAddress, identity, revalidation)
 	remaining := frontDoor.config.sessionCap - frontDoor.config.clock.Now().Sub(admittedAt)
@@ -564,11 +714,15 @@ func (frontDoor *computerFrontDoor) waitForSessionEnd(
 	capTimer := frontDoor.config.clock.NewTimer(remaining)
 	defer stopTimer(capTimer)
 	reason := l1.ComputerTakeoverClientClosed
+	policyRevision := authorization.PolicyRevision()
 	select {
 	case <-ctx.Done():
 		reason = computerSessionEndReason(ctx, l1.ComputerTakeoverAttemptAuthorityLost)
-	case <-authorization.Revocations():
+	case revocation := <-authorization.Revocations():
 		reason = l1.ComputerTakeoverRevoked
+		if revocation.PolicyRevision > 0 {
+			policyRevision = revocation.PolicyRevision
+		}
 	case reason = <-revalidation:
 	case reason = <-relay.Reasons():
 	case <-capTimer.C():
@@ -582,7 +736,7 @@ func (frontDoor *computerFrontDoor) waitForSessionEnd(
 		reason = computerSessionEndReason(ctx, l1.ComputerTakeoverAttemptAuthorityLost)
 	default:
 	}
-	return reason
+	return computerSessionEndEvidence{reason: reason, policyRevision: policyRevision}
 }
 
 func (frontDoor *computerFrontDoor) revalidateIdentity(ctx context.Context, remoteAddress string, original fabric.Identity, failed chan<- l1.ComputerTakeoverReason) {

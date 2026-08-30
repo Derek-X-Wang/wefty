@@ -421,6 +421,10 @@ func writeComputerControlReceipt(writer io.Writer, receipt contract.ComputerCont
 	_, err := fmt.Fprintf(writer, "COMPUTER ID\t%s\nACTION\t%s\nHOLDER SESSION ID\t%s\nADMITTED MODE\t%s\nTENURE STATE\t%s\nPOLICY REVISION\t%d\nOVERRIDE DISPLACED SESSION ID\t%s\nHUMAN DRIVING\t%t\nSIGNAL STAYED TRUE\t%t\n",
 		receipt.ComputerID, receipt.Action, valueOrNA(receipt.HolderSessionID), valueOrNA(receipt.AdmittedMode), receipt.TenureState,
 		receipt.PolicyRevision, valueOrNA(receipt.OverrideDisplacedSessionID), receipt.HumanDriving, receipt.SignalStayedTrue)
+	if err != nil || receipt.SessionEndReason == "" {
+		return err
+	}
+	_, err = fmt.Fprintf(writer, "SESSION END REASON\t%s\n", receipt.SessionEndReason)
 	return err
 }
 

@@ -76,6 +76,7 @@ type attemptLifecycleDependencies struct {
 	runtimeReaped              func(string, workloadrunner.ReapReceipt, error)
 	attemptDeadman             AttemptDeadmanRenewer
 	computerTokens             ComputerTokenMinter
+	computerControlTokens      *computerControlTokenCodec
 	computerHostBridgeFallback bool
 }
 
@@ -920,10 +921,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			clock: lifecycle.dependencies.clock, fabric: lifecycle.dependencies.fabric,
 			authorizer: lifecycle.dependencies.computerPolicy, auditor: lifecycle.dependencies.client,
 			computerTokens: lifecycle.dependencies.computerTokens, computerBridge: computerBridge,
+			controlTokens: lifecycle.dependencies.computerControlTokens,
 			submission: ComputerSubmissionAuthority{ComputerID: claim.ComputerStorage.ComputerID,
 				Enabled: claim.ComputerStorage.SubmitEnabled, SubmitIntentRevision: claim.ComputerStorage.SubmitIntentRevision,
 				SubmitMaxInflight: claim.ComputerStorage.SubmitMaxInflight, SubmitPolicyRevision: claim.ComputerStorage.SubmitPolicyRevision},
 			computerID: claim.ComputerStorage.ComputerID, jobID: claim.Job.JobID,
+			storageID: claim.ComputerStorage.StorageID, storageGeneration: claim.ComputerStorage.StorageGeneration,
 			attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken,
 			dial: func(dialContext context.Context, endpointName string) (net.Conn, error) {
 				return ociEndpointLatch.endpoint(endpointName).dial(dialContext)

@@ -1067,12 +1067,13 @@ func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, 
 			Argv: []string{"/bin/sh", "-c", `if test -f /wefty/service/home/wefty/.config/chromium/wefty-profile-marker; then
   test "$(cat /wefty/service/home/wefty/.config/chromium/wefty-profile-marker)" = persistent-profile
   test "$(cat /wefty/service/home/wefty/.config/chromium/wefty-sign-in-marker)" = persistent-sign-in
-  test ! -e /tmp/wefty-attempt-marker
+  # Computer /tmp is tmpfs, so only this distinct root path proves rootfs discard.
+  test ! -e /wefty-computer-rootfs-restart-witness
 else
   mkdir -p /wefty/service/home/wefty/.config/chromium
   printf persistent-profile > /wefty/service/home/wefty/.config/chromium/wefty-profile-marker
   printf persistent-sign-in > /wefty/service/home/wefty/.config/chromium/wefty-sign-in-marker
-  printf attempt-local > /tmp/wefty-attempt-marker
+  printf attempt-local > /wefty-computer-rootfs-restart-witness
   exit 17
 fi`},
 			Computer: &contract.OCIComputerSpec{Display: contract.OCIComputerDisplaySpec{Protocol: contract.ComputerDisplayProtocolRFBWebSocketV1}, DiskBytes: 32 << 20}, Limits: &contract.OCILimits{MemoryBytes: &memory}}}}
@@ -1456,12 +1457,13 @@ func exerciseNativeLinuxServiceData(t *testing.T, ctx context.Context, barrier *
 			script := fmt.Sprintf(`
 set -eu
 test "$(stat -c '%%u:%%g' /wefty/service)" = %q
-test ! -e /rootfs-attempt-marker
+# The rootfs-discard witness must remain writable by numeric and named image users.
+test ! -e /tmp/wefty-rootfs-attempt-marker
 prior=0
 if test -f /wefty/service/attempt-count; then prior="$(cat /wefty/service/attempt-count)"; fi
 test "$prior" -eq %d
 printf '%%d\n' %d > /wefty/service/attempt-count
-touch /rootfs-attempt-marker
+touch /tmp/wefty-rootfs-attempt-marker
 `, image.owner, attempt-1, attempt)
 			request := nativeAdapterRequest(image.reference, image.digest, fmt.Sprintf("%s-%d", jobID, attempt), nil)
 			request.Authority.JobID = jobID
@@ -1566,7 +1568,11 @@ func runNativeEchoService(t *testing.T, ctx context.Context, barrier *ocihelper.
 		if time.Now().After(deadline) {
 			t.Fatalf("echo service health did not become ready: %v", err)
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case result := <-runDone:
+			t.Fatalf("echo service exited before health readiness: result=%+v err=%v", result.result.Outcome, result.err)
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 	if health.ServiceDirectory != "/wefty/service" || health.ListeningPort != int(endpoint.Port) {
 		t.Fatalf("echo service health = %+v endpoint=%+v", health, endpoint)

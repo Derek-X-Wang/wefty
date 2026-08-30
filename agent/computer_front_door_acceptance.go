@@ -65,17 +65,19 @@ func NewComputerFrontDoorAcceptanceHandler(config ComputerFrontDoorAcceptanceCon
 		return nil, err
 	}
 	frontDoor, err := newComputerFrontDoor(computerFrontDoorConfig{
-		authorityContext: authority,
-		fabric:           config.Fabric,
-		authorizer:       cache,
-		auditor:          acceptanceComputerAuditor{record: record},
-		computerID:       config.ComputerID,
-		jobID:            config.JobID,
-		attemptID:        config.AttemptID,
-		fencingToken:     config.FencingToken,
-		dial:             config.Dial,
-		controlTenure:    tenure,
-		sessionCap:       time.Hour,
+		authorityContext:  authority,
+		fabric:            config.Fabric,
+		authorizer:        cache,
+		auditor:           acceptanceComputerAuditor{record: record},
+		computerID:        config.ComputerID,
+		jobID:             config.JobID,
+		attemptID:         config.AttemptID,
+		storageID:         config.ComputerID + "-acceptance-storage",
+		storageGeneration: 1,
+		fencingToken:      config.FencingToken,
+		dial:              config.Dial,
+		controlTenure:     tenure,
+		sessionCap:        time.Hour,
 	})
 	if err != nil {
 		return nil, err

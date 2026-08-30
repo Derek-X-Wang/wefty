@@ -25,9 +25,17 @@ func RunComputerServiceRealtiming(
 ) (contract.ProcessResult, error) {
 	cache := NewComputerPolicyCache(systemClock{}, request.Authority.NodeID, request.Authority.BootSessionID)
 	defer cache.Close()
+	storageID, storageGeneration := "reference-storage", int64(1)
+	for _, volume := range request.ManagedVolumes {
+		if volume.ComputerStorage != nil {
+			storageID, storageGeneration = volume.ComputerStorage.StorageID, volume.ComputerStorage.StorageGeneration
+			break
+		}
+	}
 	return runComputerService(ctx, runtimeAdapter, request, nil, computerServiceConfig{
 		clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: realtimingComputerAuditor{},
 		computerID: "reference-computer", jobID: request.Authority.JobID, attemptID: request.Authority.AttemptID,
+		storageID: storageID, storageGeneration: storageGeneration,
 		fencingToken: request.Authority.FencingToken, dial: dial, publish: publish,
 	})
 }

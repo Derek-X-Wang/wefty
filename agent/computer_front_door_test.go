@@ -106,6 +106,67 @@ func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.
 			t.Fatalf("audit identity/privacy = %#v", event)
 		}
 	}
+	failure := postComputerControlFailure(t, server.URL, computerControlTakePath, token)
+	if failure.status != http.StatusGone || failure.body.Error.Code != contract.ErrorTakeoverSessionEnded || failure.body.Receipt == nil ||
+		failure.body.Receipt.ComputerID != "computer-1" || failure.body.Receipt.Action != "take" ||
+		failure.body.Receipt.TenureState != contract.ComputerControlTenureFree ||
+		failure.body.Receipt.PolicyRevision != 2 ||
+		failure.body.Receipt.SessionEndReason != string(l1.ComputerTakeoverRevoked) {
+		t.Fatalf("revoked session control response = status=%d body=%+v", failure.status, failure.body)
+	}
+}
+
+func TestComputerFrontDoorClassifiesIssuedTokensAcrossFreshDoors(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		storageGeneration int64
+	}{
+		{name: "agent restart", storageGeneration: 1},
+		{name: "storage generation bump", storageGeneration: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, _, auditor, _, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantControl)
+			connection, token := dialComputerFrontDoorWithToken(t, server.URL, nil)
+			if _, _, err := connection.Read(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			connection.CloseNow()
+			waitComputerAuditKind(t, auditor, l1.ComputerTakeoverSessionClose)
+			server.Close()
+
+			config := fixture.frontDoor.config
+			config.attemptID = "attempt-2"
+			config.storageGeneration = test.storageGeneration
+			codec, err := newComputerControlTokenCodec(fixture.frontDoor.config.controlTokens.key[:])
+			if err != nil {
+				t.Fatal(err)
+			}
+			config.controlTokens = codec
+			fresh, err := newComputerFrontDoor(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fresh.SetReady(true)
+			freshServer := httptest.NewServer(fresh)
+			defer freshServer.Close()
+			failure := postComputerControlFailure(t, freshServer.URL, computerControlTakePath, token)
+			if failure.status != http.StatusGone || failure.body.Error.Code != contract.ErrorTakeoverSessionEnded || failure.body.Receipt == nil ||
+				failure.body.Receipt.SessionEndReason != string(l1.ComputerTakeoverAttemptAuthorityLost) {
+				t.Fatalf("fresh-door stale token response = status=%d body=%+v", failure.status, failure.body)
+			}
+			copiedIdentity := identity
+			copiedIdentity.DeviceID = "different-device"
+			fixture.identity.set(copiedIdentity, nil)
+			if status := postComputerControl(t, freshServer.URL, computerControlTakePath, token); status != http.StatusUnauthorized {
+				t.Fatalf("copied token status = %d", status)
+			}
+			fixture.identity.set(identity, nil)
+			if status := postComputerControl(t, freshServer.URL, computerControlTakePath,
+				"control_v1.eyJmYWJyaWNhdGVkIjp0cnVlfQ.invalid"); status != http.StatusUnauthorized {
+				t.Fatalf("fabricated token status = %d", status)
+			}
+		})
+	}
 }
 
 func TestComputerFrontDoorIgnoresClientAuthorityHeaders(t *testing.T) {
@@ -267,7 +328,7 @@ func TestComputerFrontDoorSessionCapAndTextFramesCloseBothLegs(t *testing.T) {
 		frontDoor.SetReady(true)
 		server = httptest.NewServer(frontDoor)
 		defer server.Close()
-		connection := dialComputerFrontDoor(t, server.URL, nil)
+		connection, token := dialComputerFrontDoorWithToken(t, server.URL, nil)
 		defer connection.CloseNow()
 		if _, _, err := connection.Read(t.Context()); err != nil {
 			t.Fatal(err)
@@ -278,6 +339,9 @@ func TestComputerFrontDoorSessionCapAndTextFramesCloseBothLegs(t *testing.T) {
 		events := auditor.snapshot()
 		if events[len(events)-1].Reason != "session_cap_expired" {
 			t.Fatalf("session cap close reason = %q", events[len(events)-1].Reason)
+		}
+		if status := postComputerControl(t, server.URL, computerControlTakePath, token); status != http.StatusForbidden {
+			t.Fatalf("ended view-only take status = %d", status)
 		}
 		callsBeforeReconnect := fixture.identity.callCount()
 		reconnected := dialComputerFrontDoor(t, server.URL, nil)
@@ -522,8 +586,8 @@ func TestComputerSessionAuthorityLossOwnsConcurrentRelayClosure(t *testing.T) {
 		cancel(&computerSessionEnd{reason: l1.ComputerTakeoverAttemptAuthorityLost})
 		relay := &computerSessionRelay{reason: make(chan l1.ComputerTakeoverReason, 1)}
 		relay.reason <- l1.ComputerTakeoverControlBackendClosed
-		if got := frontDoor.waitForSessionEnd(ctx, "127.0.0.1:1", fabric.Identity{}, authorization, relay, time.Now()); got != l1.ComputerTakeoverAttemptAuthorityLost {
-			t.Fatalf("concurrent authority loss reason = %q, want %q", got, l1.ComputerTakeoverAttemptAuthorityLost)
+		if got := frontDoor.waitForSessionEnd(ctx, "127.0.0.1:1", fabric.Identity{}, authorization, relay, time.Now()); got.reason != l1.ComputerTakeoverAttemptAuthorityLost {
+			t.Fatalf("concurrent authority loss reason = %q, want %q", got.reason, l1.ComputerTakeoverAttemptAuthorityLost)
 		}
 	}
 }
@@ -663,8 +727,9 @@ func computerFrontDoorFixture(t *testing.T, permission l1.ComputerGrantPermissio
 	}
 	frontDoor, err := newComputerFrontDoor(computerFrontDoorConfig{
 		authorityContext: t.Context(), fabric: identityFabric, authorizer: cache, auditor: auditor, clock: clock,
-		computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1",
-		dial: dial,
+		computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
+		fencingToken: "fence-1",
+		dial:         dial,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -712,6 +777,30 @@ func postComputerControl(t *testing.T, serverURL, path, token string) int {
 	}
 	defer response.Body.Close()
 	return response.StatusCode
+}
+
+type computerControlFailure struct {
+	status int
+	body   contract.ComputerControlErrorResponse
+}
+
+func postComputerControlFailure(t *testing.T, serverURL, path, token string) computerControlFailure {
+	t.Helper()
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, serverURL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(computerControlTokenHeader, token)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var body contract.ComputerControlErrorResponse
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode Computer control error: %v", err)
+	}
+	return computerControlFailure{status: response.StatusCode, body: body}
 }
 
 type mutableWhoIsFabric struct {

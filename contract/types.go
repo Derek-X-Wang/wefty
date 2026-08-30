@@ -65,8 +65,8 @@ const (
 )
 
 // ComputerControlReceipt is the front door's authoritative result for one
-// session-bound take or release. It contains tenure facts only, never the
-// session capability or either guest backend.
+// session-bound take or release. It contains tenure or terminal-session facts,
+// never the session capability or either guest backend.
 type ComputerControlReceipt struct {
 	ComputerID                 string                     `json:"computer_id"`
 	Action                     string                     `json:"action"`
@@ -77,6 +77,9 @@ type ComputerControlReceipt struct {
 	OverrideDisplacedSessionID string                     `json:"override_displaced_session_id,omitempty"`
 	HumanDriving               bool                       `json:"human_driving"`
 	SignalStayedTrue           bool                       `json:"signal_stayed_true"`
+	// SessionEndReason is present only when a session-bound action observes
+	// terminal authority; it uses the durable take-over reason vocabulary.
+	SessionEndReason string `json:"session_end_reason,omitempty"`
 }
 
 var ociReservedEnvironmentNames = [...]string{

@@ -51,7 +51,8 @@ func TestComputerServicePublishesOnlyFabricFrontDoorAndAdmissionDialsView(t *tes
 	go func() {
 		_, err := runComputerService(ctx, runtime, workloadrunner.Request{}, nil, computerServiceConfig{
 			clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: &recordingComputerAuditor{},
-			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1", dial: dial,
+			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
+			fencingToken: "fence-1", dial: dial,
 			publish: func(_ context.Context, ready bool, endpoint string) error {
 				publications <- publication{ready: ready, endpoint: endpoint}
 				return nil
@@ -203,7 +204,8 @@ func TestComputerBackendLossWithdrawsPublicationWithoutKillingPayload(t *testing
 	go func() {
 		_, err := runComputerService(ctx, runtime, workloadrunner.Request{}, nil, computerServiceConfig{
 			clock: clock, fabric: privateFabric, authorizer: cache, auditor: &recordingComputerAuditor{},
-			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1", dial: dial,
+			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
+			fencingToken: "fence-1", dial: dial,
 			publish: func(_ context.Context, ready bool, _ string) error {
 				publications <- publication{ready: ready}
 				return nil
@@ -362,7 +364,8 @@ func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T
 		go func() {
 			_, err := runComputerService(ctx, runtime, workloadrunner.Request{}, nil, computerServiceConfig{
 				clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: auditor,
-				computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1", dial: dial,
+				computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
+				fencingToken: "fence-1", dial: dial,
 				publish: func(_ context.Context, ready bool, endpoint string) error {
 					if ready {
 						published <- endpoint
@@ -457,8 +460,9 @@ func TestComputerServiceConsumesRetriedFrontDoorAuditFailure(t *testing.T) {
 	go func() {
 		_, err := runComputerService(t.Context(), runtime, workloadrunner.Request{}, nil, computerServiceConfig{
 			clock: systemClock{}, fabric: privateFabric, authorizer: cache, auditor: auditor,
-			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", fencingToken: "fence-1",
-			dial: func(ctx context.Context, _ string) (net.Conn, error) { return backend.dial(ctx) },
+			computerID: "computer-1", jobID: "job-1", attemptID: "attempt-1", storageID: "storage-1", storageGeneration: 1,
+			fencingToken: "fence-1",
+			dial:         func(ctx context.Context, _ string) (net.Conn, error) { return backend.dial(ctx) },
 			publish: func(_ context.Context, ready bool, endpoint string) error {
 				if ready {
 					published <- endpoint

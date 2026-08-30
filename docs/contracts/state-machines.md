@@ -434,6 +434,13 @@ authenticated by the attempt fence, but the durable row and response never
 contain that fence, display bytes, input data, or endpoint data. L1 derives the
 attempt authority generation; session events retain Fabric, person, device,
 authorized role, admitted mode, policy revision, time, session, and reason.
+The front door projects that same closed reason vocabulary onto synchronous
+sideband failure receipts: an issued bearer whose session is no longer live
+returns `takeover_session_ended` with `session_end_reason`, using
+`attempt_authority_lost` when only lineage terminality remains and a sharper
+observed reason such as `revoked` when the closing door still holds it. This
+projection is identity-scoped and does not create a second durable session
+store.
 Pre-authorization denials are locally coalesced into counted periodic evidence
 so unauthenticated peers cannot synchronously saturate L1. Audit rows never
 cascade with attempt or Job retention and have their own 90-day default

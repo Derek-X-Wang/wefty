@@ -19,19 +19,22 @@ import (
 )
 
 type computerServiceConfig struct {
-	clock          Clock
-	fabric         fabric.Fabric
-	authorizer     *ComputerPolicyCache
-	auditor        computerTakeoverAuditor
-	computerTokens ComputerTokenMinter
-	computerBridge *computerAttemptBridgeController
-	submission     ComputerSubmissionAuthority
-	computerID     string
-	jobID          string
-	attemptID      string
-	fencingToken   string
-	dial           computerEndpointDial
-	publish        func(context.Context, bool, string) error
+	clock             Clock
+	fabric            fabric.Fabric
+	authorizer        *ComputerPolicyCache
+	auditor           computerTakeoverAuditor
+	computerTokens    ComputerTokenMinter
+	controlTokens     *computerControlTokenCodec
+	computerBridge    *computerAttemptBridgeController
+	submission        ComputerSubmissionAuthority
+	computerID        string
+	jobID             string
+	attemptID         string
+	storageID         string
+	storageGeneration int64
+	fencingToken      string
+	dial              computerEndpointDial
+	publish           func(context.Context, bool, string) error
 }
 
 // computerAttemptBridgeController makes the transport follow Computer
@@ -189,7 +192,8 @@ func runComputerService(
 	frontDoor, err := newComputerFrontDoor(computerFrontDoorConfig{
 		authorityContext: runContext, fabric: config.fabric, authorizer: config.authorizer, auditor: config.auditor,
 		clock: clock, computerID: config.computerID, jobID: config.jobID, attemptID: config.attemptID,
-		fencingToken: config.fencingToken, dial: config.dial,
+		storageID: config.storageID, storageGeneration: config.storageGeneration,
+		fencingToken: config.fencingToken, dial: config.dial, controlTokens: config.controlTokens,
 	})
 	if err != nil {
 		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
