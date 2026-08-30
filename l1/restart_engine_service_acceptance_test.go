@@ -18,7 +18,7 @@ func TestServiceAcceptancePublishedListenerFailureRequeuesWithoutLatching(t *tes
 }
 
 func TestServiceAcceptanceClassAwareExpiryAtBothSites(t *testing.T) {
-	assertServiceLeaseExpiryRequeuesWithoutChangingStreak(t)
+	assertServiceLeaseExpiryRequeuesWithoutConsumingRestartBudget(t)
 	assertStoppedServiceLeaseExpiryLatchesWhenQuiescenceIsUnconfirmed(t)
 }
 

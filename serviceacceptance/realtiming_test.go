@@ -268,10 +268,11 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	assertStoppedService(t, harness, stopped, primaryHealth.PID, groupID, ports[0])
 	attemptCount := len(stopped.Attempts)
 	restartCount := stopped.LifetimeRestartCount
+	leaseLossCount := stopped.LeaseLossCount
 	time.Sleep(l1.DefaultLeaseDuration + 2*processrunner.DefaultReadinessProbeInterval + 500*time.Millisecond)
 	stillStopped := evidence.recordJob(t, harness, "status-after-stop-authority-window.json", primary.JobID)
 	if stillStopped.State != contract.JobStopped || len(stillStopped.Attempts) != attemptCount ||
-		stillStopped.LifetimeRestartCount != restartCount {
+		stillStopped.LifetimeRestartCount != restartCount || stillStopped.LeaseLossCount != leaseLossCount {
 		t.Fatalf("stopped service restarted after authority window: %#v", stillStopped)
 	}
 

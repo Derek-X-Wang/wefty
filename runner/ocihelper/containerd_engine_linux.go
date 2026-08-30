@@ -1104,7 +1104,7 @@ func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cg
 			return err
 		}
 		if found {
-			owned, err := cgroupOwnsSocket(filepath.Join(engine.config.CgroupRoot, cgroupID, "cgroup.procs"), inode)
+			owned, err := cgroupSubtreeOwnsSocket(ctx, filepath.Join(engine.config.CgroupRoot, cgroupID), inode)
 			if err != nil {
 				return err
 			}
@@ -1140,9 +1140,40 @@ func loopbackListenInode(port uint16) (string, bool, error) {
 	return "", false, scanner.Err()
 }
 
+func cgroupSubtreeOwnsSocket(ctx context.Context, cgroupPath, inode string) (bool, error) {
+	owned := false
+	err := filepath.WalkDir(cgroupPath, func(path string, entry os.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrNotExist) || errors.Is(walkErr, syscall.ESRCH) {
+				return nil
+			}
+			return walkErr
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		processOwnsSocket, err := cgroupOwnsSocket(filepath.Join(path, "cgroup.procs"), inode)
+		if err != nil {
+			return err
+		}
+		if processOwnsSocket {
+			owned = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return owned, err
+}
+
 func cgroupOwnsSocket(procsPath, inode string) (bool, error) {
 	payload, err := os.ReadFile(procsPath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+			return false, nil
+		}
 		return false, err
 	}
 	want := "socket:[" + inode + "]"
@@ -1152,7 +1183,7 @@ func cgroupOwnsSocket(procsPath, inode string) (bool, error) {
 		}
 		entries, err := os.ReadDir(filepath.Join("/proc", field, "fd"))
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
 				continue
 			}
 			return false, err
@@ -2821,7 +2852,18 @@ func tailLogSegment(ctx context.Context, stream, path string, terminal <-chan st
 					sendTailEvent(ctx, output, logTailEvent{event: WatchEvent{Kind: WatchProgress, Seal: &LogSeal{Stream: stream, Complete: true}}})
 					return
 				case logIncompleteMagic:
-					sendTailEvent(ctx, output, logTailEvent{event: incompleteLogSeal(stream, string(payload))})
+					var evidence loggerIncompleteEvidence
+					reason := string(payload)
+					if json.Unmarshal(payload, &evidence) == nil && evidence.Reason != "" {
+						reason = evidence.Reason
+						if evidence.LostByteCount > 0 {
+							gap := &LogGapFrame{ThroughSequence: expected, LostEventCount: 1, LostByteCount: evidence.LostByteCount, Reason: "logger_source_incomplete"}
+							if !sendTailEvent(ctx, output, logTailEvent{event: WatchEvent{Kind: WatchProgress, Log: &LogFrame{Stream: stream, Sequence: expected, Gap: gap}}}) {
+								return
+							}
+						}
+					}
+					sendTailEvent(ctx, output, logTailEvent{event: incompleteLogSeal(stream, reason)})
 					return
 				}
 			}

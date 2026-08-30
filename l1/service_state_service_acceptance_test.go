@@ -49,7 +49,7 @@ func TestServiceAcceptanceStateMetadataAndSlotLifecycle(t *testing.T) {
 		t.Fatalf("get one-shot status = %d body=%s", status, body)
 	}
 	for _, field := range []string{
-		"desired_state", "bound_node_id", "restart_streak", "lifetime_restart_count",
+		"desired_state", "bound_node_id", "restart_streak", "lifetime_restart_count", "lease_loss_count",
 		"next_restart_at", "published_port", "ready", "last_failure", "healthy_since_at", "published_attempt_id",
 	} {
 		if bytes.Contains(body, []byte(field)) {

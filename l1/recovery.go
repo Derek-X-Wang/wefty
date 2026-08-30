@@ -115,7 +115,7 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		if err != nil {
 			return ReconcileResult{}, err
 		}
-		if err := expireAttempt(ctx, tx, attempt, now); err != nil {
+		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return ReconcileResult{}, err
 		}
 	}

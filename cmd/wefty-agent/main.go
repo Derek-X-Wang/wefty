@@ -32,6 +32,8 @@ import (
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
+const gracefulDrainTimeout = 30 * time.Second
+
 var version = "dev"
 
 type repeatedStringFlag []string
@@ -700,28 +702,56 @@ func run() error {
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
 	go func() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-signals:
-		}
-		drainContext, stopDrain := context.WithTimeout(context.Background(), 30*time.Second)
-		_, err := nodeAgent.Drain(drainContext)
-		stopDrain()
-		if err != nil {
-			log.Printf("wefty-agent: graceful drain failed: %v", err)
-			cancel()
-			return
-		}
-		select {
-		case <-ctx.Done():
-		case <-signals:
-			cancel()
-		}
+		handleShutdownSignals(ctx, signals, func(drainContext context.Context) error {
+			_, err := nodeAgent.Drain(drainContext)
+			return err
+		}, cancel, log.Printf)
 	}()
 	err = nodeAgent.Run(ctx)
 	cancel()
 	return err
+}
+
+func handleShutdownSignals(
+	ctx context.Context,
+	signals <-chan os.Signal,
+	drain func(context.Context) error,
+	cancel context.CancelFunc,
+	logf func(string, ...any),
+) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-signals:
+	}
+	drainDone := make(chan error, 1)
+	go func() {
+		drainContext, stopDrain := context.WithTimeout(context.Background(), gracefulDrainTimeout)
+		defer stopDrain()
+		drainDone <- drain(drainContext)
+	}()
+	select {
+	case <-ctx.Done():
+		return
+	case <-signals:
+		// A second signal is cancellation authority even while graceful drain is
+		// still joining a resident service. Waiting for Drain first made this
+		// signal unreachable for exactly the service it was intended to stop.
+		logf("wefty-agent: forced_shutdown transition=draining_to_forced reason=second_signal")
+		cancel()
+		return
+	case err := <-drainDone:
+		if err != nil {
+			logf("wefty-agent: graceful drain failed: %v", err)
+			cancel()
+			return
+		}
+	}
+	select {
+	case <-ctx.Done():
+	case <-signals:
+		cancel()
+	}
 }
 
 func doctorHelperSource(adapter *ocirunner.Adapter) ocicontrol.HelperDoctorSource {

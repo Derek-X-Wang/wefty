@@ -556,11 +556,12 @@ func (process *managedProcess) stop(t *testing.T) {
 		select {
 		case <-process.done:
 			return
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(30 * time.Second):
 		}
 		// The agent treats the first TERM as a graceful drain and the second as
-		// cancellation. This guarantees a failed acceptance does not orphan the
-		// payload it was exercising.
+		// cancellation. Wait through the documented graceful-drain bound so an
+		// ordinary teardown proves the single-signal path and a hung drain cannot
+		// masquerade as clean completion through the forced-shutdown transition.
 		_ = process.command.Process.Signal(syscall.SIGTERM)
 		select {
 		case <-process.done:

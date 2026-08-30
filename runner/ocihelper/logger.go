@@ -4,20 +4,28 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
-	LoggerInvocationArg = "__wefty_oci_logger"
-	logFrameHeaderBytes = 4 + 8 + 4 + sha256.Size
-	logFrameMagic       = "WLF1"
-	logSealMagic        = "WLS1"
-	logIncompleteMagic  = "WLI1"
+	LoggerInvocationArg           = "__wefty_oci_logger"
+	logFrameHeaderBytes           = 4 + 8 + 4 + sha256.Size
+	logFrameMagic                 = "WLF1"
+	logSealMagic                  = "WLS1"
+	logIncompleteMagic            = "WLI1"
+	loggerTerminationDrainTimeout = 250 * time.Millisecond
 )
 
 type logRecordKind uint8
@@ -48,6 +56,16 @@ func RunLoggerInvocation(arguments []string) error {
 	if options["mode"] != LoggerInvocationArg || options["stdout"] == "" || options["stderr"] == "" {
 		return errors.New("invalid OCI logger invocation")
 	}
+	// ExtraFiles are materialized through File.Fd by os.StartProcess, which
+	// leaves their shared open-file descriptions blocking and detached from the
+	// Go poller. Restore non-blocking mode before NewFile so a read deadline can
+	// release the logger inside its termination drain bound.
+	if err := unix.SetNonblock(3, true); err != nil {
+		return fmt.Errorf("make OCI stdout logger descriptor non-blocking: %w", err)
+	}
+	if err := unix.SetNonblock(4, true); err != nil {
+		return fmt.Errorf("make OCI stderr logger descriptor non-blocking: %w", err)
+	}
 	stdout := os.NewFile(3, "oci-stdout")
 	stderr := os.NewFile(4, "oci-stderr")
 	ready := os.NewFile(5, "oci-logger-ready")
@@ -67,24 +85,62 @@ func RunLoggerInvocation(arguments []string) error {
 		return err
 	}
 	defer stderrFile.Close()
+	termination := make(chan os.Signal, 1)
+	signal.Notify(termination, syscall.SIGTERM)
+	defer signal.Stop(termination)
+	interrupt := make(chan struct{})
+	signalWaitDone := make(chan struct{})
+	defer close(signalWaitDone)
+	go func() {
+		select {
+		case <-termination:
+			close(interrupt)
+		case <-signalWaitDone:
+		}
+	}()
 	if _, err := ready.Write([]byte{1}); err != nil {
 		return fmt.Errorf("acknowledge OCI logger readiness: %w", err)
 	}
 	_ = ready.Close()
+	streams := []loggerStream{
+		{"stdout", stdout, stdoutFile},
+		{"stderr", stderr, stderrFile},
+	}
+	return copyLoggerStreams(streams, interrupt)
+}
+
+type loggerStream struct {
+	name   string
+	source *os.File
+	target *os.File
+}
+
+func copyLoggerStreams(streams []loggerStream, interrupt <-chan struct{}) error {
+	var terminated atomic.Bool
 	var group sync.WaitGroup
-	errorsByStream := make(chan error, 2)
-	for _, stream := range []struct {
-		name   string
-		source io.Reader
-		target *os.File
-	}{{"stdout", stdout, stdoutFile}, {"stderr", stderr, stderrFile}} {
+	errorsByStream := make(chan error, len(streams))
+	for _, stream := range streams {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			errorsByStream <- copyLogFrames(stream.source, stream.target)
+			errorsByStream <- copyLoggerStream(stream.source, stream.target, &terminated)
 		}()
 	}
-	group.Wait()
+	copyDone := make(chan struct{})
+	go func() {
+		group.Wait()
+		close(copyDone)
+	}()
+	select {
+	case <-copyDone:
+	case <-interrupt:
+		terminated.Store(true)
+		deadline := time.Now().Add(loggerTerminationDrainTimeout)
+		for _, stream := range streams {
+			_ = stream.source.SetReadDeadline(deadline)
+		}
+		<-copyDone
+	}
 	close(errorsByStream)
 	var failures []error
 	for err := range errorsByStream {
@@ -98,6 +154,37 @@ func RunLoggerInvocation(arguments []string) error {
 	return nil
 }
 
+type loggerIncompleteEvidence struct {
+	Reason        string `json:"reason"`
+	LostByteCount uint64 `json:"lost_byte_count"`
+}
+
+func copyLoggerStream(source *os.File, target io.Writer, terminated *atomic.Bool) error {
+	return copyLogFramesWithEvidence(source, target, func(readErr error) []byte {
+		reason := readErr.Error()
+		if terminated.Load() {
+			reason = "logger termination drain ended before pipe EOF"
+		}
+		payload, err := json.Marshal(loggerIncompleteEvidence{Reason: reason, LostByteCount: unreadLoggerBytes(source)})
+		if err != nil {
+			return []byte(reason)
+		}
+		return payload
+	}, terminated)
+}
+
+func unreadLoggerBytes(file *os.File) uint64 {
+	connection, err := file.SyscallConn()
+	if err != nil {
+		return 0
+	}
+	var unread int
+	if err := connection.Control(func(fd uintptr) { unread, _ = pipeUnreadBytes(fd) }); err != nil || unread < 0 {
+		return 0
+	}
+	return uint64(unread)
+}
+
 func openLogSegment(path string) (*os.File, error) {
 	if !filepath.IsAbs(path) {
 		return nil, errors.New("OCI log segment path must be absolute")
@@ -109,6 +196,10 @@ func openLogSegment(path string) (*os.File, error) {
 }
 
 func copyLogFrames(source io.Reader, target io.Writer) error {
+	return copyLogFramesWithEvidence(source, target, func(readErr error) []byte { return []byte(readErr.Error()) }, nil)
+}
+
+func copyLogFramesWithEvidence(source io.Reader, target io.Writer, incomplete func(error) []byte, terminated *atomic.Bool) error {
 	reader := bufio.NewReaderSize(source, 32<<10)
 	buffer := make([]byte, 32<<10)
 	sequence := uint64(0)
@@ -122,9 +213,16 @@ func copyLogFrames(source io.Reader, target io.Writer) error {
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
+				if terminated != nil && terminated.Load() {
+					payload, err := json.Marshal(loggerIncompleteEvidence{Reason: "logger terminated after draining pipe EOF"})
+					if err != nil {
+						payload = []byte("logger terminated after draining pipe EOF")
+					}
+					return writeLogRecord(target, logIncompleteMagic, sequence, payload)
+				}
 				return writeLogRecord(target, logSealMagic, sequence, nil)
 			}
-			if err := writeLogRecord(target, logIncompleteMagic, sequence, []byte(readErr.Error())); err != nil {
+			if err := writeLogRecord(target, logIncompleteMagic, sequence, incomplete(readErr)); err != nil {
 				return errors.Join(readErr, err)
 			}
 			return nil

@@ -37,7 +37,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 			"late_result_authority_lost_ns", "late_result_is_late",
 		},
 		"service_jobs": {
-			"job_id", "desired_state", "bound_node_id", "restart_streak", "lifetime_restart_count",
+			"job_id", "desired_state", "bound_node_id", "restart_streak", "lifetime_restart_count", "lease_loss_count",
 			"next_restart_at", "published_port", "last_failure", "healthy_since_ns", "published_attempt_id", "display_endpoint",
 		},
 		"computers": {

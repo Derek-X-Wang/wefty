@@ -12,13 +12,19 @@ reachability, while this surface describes what the local process is doing.
 | `ready` | The registered session can claim work. An empty attempt map means healthy idle. | The session loses reachability or authority, or drain begins. |
 | `rejoining` | Registration or another session operation is retrying with capped exponential backoff and jitter. | Registration and a session operation succeed, or a semantic rejection quarantines or drains the agent. |
 | `quarantined` | A non-retryable node-session rejection stopped autonomous work. | Outer cancellation or an operator-requested drain; the daemon does not exit merely because it is quarantined. |
-| `draining` | New claims are stopped while resident attempts are joined. | The drain completes and `Run` returns cleanly. |
+| `draining` | New claims are stopped while resident attempts are joined. | The drain completes and `Run` returns cleanly, or a second shutdown signal forces cancellation. |
 
 `session_backoff` is the current retry delay and is zero while ready. A
 quarantined session reports the maximum backoff so it cannot look like a
 healthy idle process. `last_semantic_error` retains the most recent L1 error
 code, message, and local observation time; transport errors do not invent a
 semantic code.
+
+The first SIGINT or SIGTERM starts a graceful drain with a 30-second bound. A
+second signal is an explicit forced-shutdown transition: it cancels resident
+attempts immediately and emits `forced_shutdown transition=draining_to_forced
+reason=second_signal`, distinguishing operator abort from clean drain
+completion.
 
 ## Capability observation and local admission
 
