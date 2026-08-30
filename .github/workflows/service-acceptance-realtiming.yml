@@ -21,7 +21,6 @@ on:
       - .github/workflows/service-acceptance-realtiming*.yml
       - .github/workflows/acceptance-image*.yml
       - docs/contracts/**
-  workflow_dispatch:
 
 permissions:
   actions: read
@@ -34,11 +33,11 @@ concurrency:
 jobs:
   build-pr-artifacts:
     name: build-pr-artifacts
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request'
     uses: ./.github/workflows/acceptance-image-build.yml
     with:
-      candidate_sha: ${{ github.event.pull_request.head.sha || github.sha }}
-      source_repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      candidate_sha: ${{ github.event.pull_request.head.sha }}
+      source_repository: ${{ github.event.pull_request.head.repo.full_name }}
       package_releases: true
     permissions:
       contents: read
@@ -55,13 +54,6 @@ jobs:
       source: ${{ steps.resolve.outputs.source }}
       source-repository: ${{ steps.resolve.outputs.source_repository }}
     steps:
-      - name: Check out trusted history for manual dispatch validation
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: refs/heads/main
-          fetch-depth: 0
-          persist-credentials: false
       - name: Resolve the immutable artifact run
         id: resolve
         env:
@@ -72,64 +64,41 @@ jobs:
           PR_BUILD_RESULT: ${{ needs.build-pr-artifacts.result }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          DISPATCH_REF: ${{ github.ref }}
-          DISPATCH_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = workflow_run ]; then
-            if [ "$TRIGGER_CONCLUSION" != success ]; then
-              printf '%s\n' "::notice::typed-skip: acceptance-image run $TRIGGER_RUN_ID concluded $TRIGGER_CONCLUSION; no published artifact exists"
-              printf 'available=false\n' >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            run_id="$TRIGGER_RUN_ID"
-            candidate_sha="$TRIGGER_SHA"
-            source=published-artifact
-            source_repository="$GITHUB_REPOSITORY"
-          else
-            if [ "$PR_BUILD_RESULT" != success ]; then
-              printf '%s\n' "::error::PR artifact build concluded $PR_BUILD_RESULT"
-              printf 'available=false\n' >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            run_id="$GITHUB_RUN_ID"
-            source=pr-build
-            case "$EVENT_NAME" in
-              pull_request)
-                candidate_sha="$PR_HEAD_SHA"
-                source_repository="$PR_HEAD_REPOSITORY"
-                ;;
-              workflow_dispatch)
-                candidate_sha="$DISPATCH_SHA"
-                source_repository="$GITHUB_REPOSITORY"
-                ;;
-              *)
-                printf '%s\n' "::error::unsupported artifact source event $EVENT_NAME"
-                exit 64
-                ;;
-            esac
-          fi
+          case "$EVENT_NAME" in
+            workflow_run)
+              if [ "$TRIGGER_CONCLUSION" != success ]; then
+                printf '%s\n' "::notice::typed-skip: acceptance-image run $TRIGGER_RUN_ID concluded $TRIGGER_CONCLUSION; no published artifact exists"
+                printf 'available=false\n' >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              run_id="$TRIGGER_RUN_ID"
+              candidate_sha="$TRIGGER_SHA"
+              source=published-artifact
+              source_repository="$GITHUB_REPOSITORY"
+              ;;
+            pull_request)
+              if [ "$PR_BUILD_RESULT" != success ]; then
+                printf '%s\n' "::error::PR artifact build concluded $PR_BUILD_RESULT"
+                printf 'available=false\n' >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              run_id="$GITHUB_RUN_ID"
+              candidate_sha="$PR_HEAD_SHA"
+              source=pr-build
+              source_repository="$PR_HEAD_REPOSITORY"
+              ;;
+            *)
+              printf '%s\n' "::error::unsupported artifact source event $EVENT_NAME"
+              exit 64
+              ;;
+          esac
           case "$candidate_sha" in
             [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
             *) exit 64 ;;
           esac
           test -n "$source_repository"
-          if [ "$EVENT_NAME" = workflow_dispatch ]; then
-            case "$DISPATCH_REF" in
-              refs/heads/*) ;;
-              *)
-                printf '%s\n' "::error::manual realtiming accepts branch refs only, got $DISPATCH_REF"
-                exit 64
-                ;;
-            esac
-            git fetch --no-tags --force origin \
-              "$DISPATCH_REF:refs/remotes/origin/manual-dispatch"
-            dispatch_tip="$(git rev-parse 'refs/remotes/origin/manual-dispatch^{commit}')"
-            if ! git merge-base --is-ancestor "$candidate_sha" "$dispatch_tip"; then
-              printf '%s\n' "::error::manual candidate $candidate_sha is not contained in $DISPATCH_REF"
-              exit 1
-            fi
-          fi
           printf 'available=true\ncandidate_sha=%s\nrun_id=%s\nsource=%s\nsource_repository=%s\n' \
             "$candidate_sha" "$run_id" "$source" "$source_repository" >> "$GITHUB_OUTPUT"
 
