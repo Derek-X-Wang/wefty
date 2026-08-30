@@ -38,6 +38,14 @@ func commandExitCodeForArgs(err error, args []string) int {
 }
 
 func isTypedExitCLIArgs(args []string) bool {
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") {
+			if arg == "whoami" {
+				return true
+			}
+			break
+		}
+	}
 	if isComputerCLIArgs(args) {
 		return true
 	}
@@ -241,7 +249,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 }
 
 func usesPersonProtocol(args []string) bool {
-	return requiresPersonCommand(args) ||
+	return (len(args) > 0 && args[0] == "whoami") || requiresPersonCommand(args) ||
 		(len(args) > 1 && args[0] == "services" && args[1] == "submission")
 }
 
@@ -312,6 +320,7 @@ func removeBoolFlag(args []string, name string) ([]string, bool) {
 const rootUsage = `Usage: wefty [global flags] <command>
 
 Commands:
+  whoami                    Observe the current Fabric-scoped person identity in L1
   admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
   admin policy get           Read the current administrator policy revision and members
   admin policy add|remove    Mutate administrator membership with an observed revision

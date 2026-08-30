@@ -672,6 +672,12 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 		return true
 	}
 	if err.Code == CodeEngineFailure {
+		// Attempt-port backend refusal is scoped to the already-authorized live
+		// attempt. The helper process and exclusive session remain authoritative;
+		// readiness probes may retry while the payload listener republishes.
+		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodDialAttemptPort {
+			return false
+		}
 		// Managed-volume deletion is independently authorized and verified for
 		// one durable resource. Its failure is scoped to that volume/removal
 		// operation; it does not prove that helper session authority disappeared.

@@ -22,6 +22,15 @@ import (
 
 func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	switch args[0] {
+	case "whoami":
+		if len(args) != 1 {
+			return usageError("usage: wefty whoami")
+		}
+		person, err := clients.whoAmI(ctx)
+		if err != nil {
+			return err
+		}
+		return writeWhoAmI(stdout, person, jsonOutput)
 	case "admin":
 		return executeAdmin(ctx, clients, jsonOutput, args[1:], stdout)
 	case "admins":
@@ -48,6 +57,15 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 	default:
 		return usageError(fmt.Sprintf("unknown command %q", args[0]))
 	}
+}
+
+func writeWhoAmI(writer io.Writer, person l1.AuthenticatedPerson, jsonOutput bool) error {
+	if jsonOutput {
+		return writeJSON(writer, person)
+	}
+	_, err := fmt.Fprintf(writer, "FABRIC ID\tUSER ID\tDEVICE ID\tSEEN\n%s\t%s\t%s\t%s\n",
+		person.FabricID, person.UserID, person.DeviceID, person.SeenAt.Format(time.RFC3339))
+	return err
 }
 
 func executeAdmin(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {

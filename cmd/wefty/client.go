@@ -95,6 +95,12 @@ func (c *apiClients) bootstrapAdmin(ctx context.Context, nonce string) (l1.Admin
 	return policy, err
 }
 
+func (c *apiClients) whoAmI(ctx context.Context) (l1.AuthenticatedPerson, error) {
+	var person l1.AuthenticatedPerson
+	err := c.l1.do(ctx, http.MethodGet, "/v1/whoami", nil, nil, &person, http.StatusOK)
+	return person, err
+}
+
 func (c *apiClients) getAdminPolicy(ctx context.Context) (l1.AdminPolicy, error) {
 	var policy l1.AdminPolicy
 	err := c.l1.do(ctx, http.MethodGet, "/v1/admin-policy", nil, nil, &policy, http.StatusOK)

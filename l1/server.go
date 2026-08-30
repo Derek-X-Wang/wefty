@@ -2,10 +2,12 @@ package l1
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"slices"
@@ -72,6 +74,8 @@ type Server struct {
 	computerTokenRevoker    ComputerTokenRevoker
 	runLedgerNodeID         string
 	handler                 http.Handler
+	reconcile               func(context.Context) (ReconcileResult, error)
+	logf                    func(string, ...any)
 }
 
 func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, error) {
@@ -129,6 +133,8 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 		computerPolicyWatchWait: policyWatchWait,
 		computerTokenRevoker:    config.ComputerTokenRevoker,
 		runLedgerNodeID:         runLedgerNodeID,
+		reconcile:               store.Reconcile,
+		logf:                    log.Printf,
 	}
 	s.handler = s.routes()
 	return s, nil
@@ -160,8 +166,8 @@ func (s *Server) ListenAndServe(ctx context.Context, network, address string) er
 
 // Serve runs the L1 HTTP protocols on an already-created Fabric listener.
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
-	if _, err := s.store.Reconcile(ctx); err != nil {
-		if ctx.Err() != nil {
+	if _, err := s.reconcile(ctx); err != nil {
+		if reconciliationCanceledByShutdown(ctx, err) {
 			return nil
 		}
 		return fmt.Errorf("l1: initial recovery: %w", err)
@@ -170,7 +176,9 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	reconcileFailures := make(chan error, 1)
 	reconcileContext, stopReconcile := context.WithCancel(ctx)
 	defer stopReconcile()
+	reconcileDone := make(chan struct{})
 	go func() {
+		defer close(reconcileDone)
 		ticker := time.NewTicker(s.reconcileInterval)
 		defer ticker.Stop()
 		for {
@@ -178,7 +186,16 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 			case <-reconcileContext.Done():
 				return
 			case <-ticker.C:
-				if _, err := s.store.Reconcile(reconcileContext); err != nil {
+				if _, err := s.reconcile(reconcileContext); err != nil {
+					if reconciliationCanceledByShutdown(reconcileContext, err) {
+						return
+					}
+					if errors.Is(err, context.Canceled) && reconcileContext.Err() == nil {
+						if s.logf != nil {
+							s.logf("event=l1_reconcile_live_context_canceled action=continue error=%v", err)
+						}
+						continue
+					}
 					reconcileFailures <- err
 					_ = httpServer.Close()
 					return
@@ -197,6 +214,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	err := httpServer.Serve(listener)
 	stopReconcile()
 	close(stopped)
+	<-reconcileDone
 	select {
 	case reconcileErr := <-reconcileFailures:
 		return fmt.Errorf("l1: reconcile failure state: %w", reconcileErr)
@@ -206,6 +224,27 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		return nil
 	}
 	return err
+}
+
+const sqliteInterruptPrimaryCode = 9
+
+type sqliteErrorCoder interface {
+	Code() int
+}
+
+func reconciliationCanceledByShutdown(ctx context.Context, err error) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	// database/sql may win the cancellation race by rolling the transaction
+	// back before Commit observes the canceled context. Commit then reports
+	// ErrTxDone rather than wrapping the context error. The SQLite driver may
+	// instead report the interrupt it issued when that same context closed.
+	if errors.Is(err, ctx.Err()) || errors.Is(err, sql.ErrTxDone) {
+		return true
+	}
+	var sqliteErr sqliteErrorCoder
+	return errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqliteInterruptPrimaryCode
 }
 
 type principal int

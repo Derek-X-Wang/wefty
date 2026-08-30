@@ -34,7 +34,11 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l1Store.Close()
+	t.Cleanup(func() {
+		if err := l1Store.Close(); err != nil {
+			t.Errorf("close L1 store: %v", err)
+		}
+	})
 	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{
 		AllowSelfAssertedPersonIdentities: true,
 		NodePolicies: map[string]l1.NodePolicy{
@@ -53,7 +57,11 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l3Store.Close()
+	t.Cleanup(func() {
+		if err := l3Store.Close(); err != nil {
+			t.Errorf("close L3 store: %v", err)
+		}
+	})
 	ledgerL1Client, err := l3.NewL1Client(ledgerFabric, l3.DefaultL1Address)
 	if err != nil {
 		t.Fatal(err)

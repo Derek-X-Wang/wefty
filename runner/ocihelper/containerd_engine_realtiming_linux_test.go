@@ -474,7 +474,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	waylandComputerReadiness := exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, "wayland", waylandComputerReference, waylandComputerDigest)
 	numericImage := loadNativeImageArchive(t, ctx, adapter, numericReference, numericArchivePath)
 	namedImage := loadNativeImageArchive(t, ctx, adapter, namedReference, namedArchivePath)
-	serviceDataEvidence := exerciseNativeLinuxServiceData(t, ctx, session, adapter, []nativeServiceDataImage{
+	serviceDataEvidence := exerciseNativeLinuxServiceData(t, ctx, barrier, adapter, []nativeServiceDataImage{
 		{name: "root", reference: echoReference, digest: echoImage.TopLevelDigest, owner: "0:0"},
 		{name: "numeric", reference: numericReference, digest: numericImage.TopLevelDigest, owner: "13001:13002"},
 		{name: "named", reference: namedReference, digest: namedImage.TopLevelDigest, owner: "12001:12002"},
@@ -1447,7 +1447,7 @@ func loadNativeImageThroughCLI(t *testing.T, ctx context.Context, adapter *ociru
 	return response
 }
 
-func exerciseNativeLinuxServiceData(t *testing.T, ctx context.Context, session *ocihelper.Session, adapter *ocirunner.Adapter, images []nativeServiceDataImage) nativeServiceDataEvidence {
+func exerciseNativeLinuxServiceData(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, adapter *ocirunner.Adapter, images []nativeServiceDataImage) nativeServiceDataEvidence {
 	t.Helper()
 	evidence := nativeServiceDataEvidence{}
 	for _, image := range images {
@@ -1468,7 +1468,7 @@ touch /rootfs-attempt-marker
 			request.Authority.WorkloadClass = contract.JobClassService
 			request.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 			request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-			runNativeEchoService(t, ctx, session, adapter, &request, script)
+			runNativeEchoService(t, ctx, barrier, adapter, &request, script)
 			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: request.Authority}); err != nil || !receipt.RuntimeQuiesced {
 				t.Fatalf("%s attempt %d cleanup = %+v err=%v", image.name, attempt, receipt, err)
 			}
@@ -1490,7 +1490,7 @@ touch /rootfs-attempt-marker
 			replacement.Authority.WorkloadClass = contract.JobClassService
 			replacement.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 			replacement.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-			runNativeEchoService(t, ctx, session, adapter, &replacement, "set -eu; test ! -e /wefty/service/attempt-count; printf 'replacement\\n' > /wefty/service/replacement")
+			runNativeEchoService(t, ctx, barrier, adapter, &replacement, "set -eu; test ! -e /wefty/service/attempt-count; printf 'replacement\\n' > /wefty/service/replacement")
 			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: replacement.Authority}); err != nil || !receipt.RuntimeQuiesced {
 				t.Fatalf("same-digest replacement cleanup = %+v err=%v", receipt, err)
 			}
@@ -1499,7 +1499,7 @@ touch /rootfs-attempt-marker
 			original.Authority.WorkloadClass = contract.JobClassService
 			original.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 			original.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-			runNativeEchoService(t, ctx, session, adapter, &original, "set -eu; test \"$(cat /wefty/service/attempt-count)\" -eq 3; test ! -e /wefty/service/replacement; printf '4\\n' > /wefty/service/attempt-count")
+			runNativeEchoService(t, ctx, barrier, adapter, &original, "set -eu; test \"$(cat /wefty/service/attempt-count)\" -eq 3; test ! -e /wefty/service/replacement; printf '4\\n' > /wefty/service/attempt-count")
 			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: original.Authority}); err != nil || !receipt.RuntimeQuiesced {
 				t.Fatalf("original same-digest service cleanup = %+v err=%v", receipt, err)
 			}
@@ -1515,7 +1515,7 @@ touch /rootfs-attempt-marker
 	return evidence
 }
 
-func runNativeEchoService(t *testing.T, ctx context.Context, session *ocihelper.Session, adapter *ocirunner.Adapter, request *workloadrunner.Request, prelude string) {
+func runNativeEchoService(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, adapter *ocirunner.Adapter, request *workloadrunner.Request, prelude string) {
 	t.Helper()
 	request.Execution.OCI.Argv = []string{"/bin/sh", "-c", prelude + "\nexec /usr/local/bin/wefty-echo-service"}
 	request.AttemptEndpoints = []string{workloadrunner.AttemptEndpointService}
@@ -1580,6 +1580,10 @@ func runNativeEchoService(t *testing.T, ctx context.Context, session *ocihelper.
 	closeErr := response.Body.Close()
 	if readErr != nil || closeErr != nil || response.StatusCode != http.StatusOK || !bytes.Equal(echoed, payload) {
 		t.Fatalf("echo response status=%d bytes=%q err=%v", response.StatusCode, echoed, errors.Join(readErr, closeErr))
+	}
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := session.Signal(ctx, ocihelper.SignalRequest{Authority: ocirunner.HelperAuthority(request.Authority), Signal: ocihelper.SignalTERM}); err != nil {
 		t.Fatal(err)

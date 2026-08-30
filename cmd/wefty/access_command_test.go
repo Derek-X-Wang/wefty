@@ -125,6 +125,34 @@ func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
 	if !requiresPersonCommand([]string{"services", "grant"}) || requiresPersonCommand([]string{"services", "status"}) {
 		t.Fatal("person-command routing does not isolate Computer access policy from ordinary service commands")
 	}
+	if !usesPersonProtocol([]string{"whoami"}) {
+		t.Fatal("whoami did not select the person-authenticated protocol")
+	}
+	if !usesPersonProtocol([]string{"whoami", "extra"}) {
+		t.Fatal("invalid whoami arguments escaped person-authenticated protocol selection")
+	}
+	var observedViewer l1.AuthenticatedPerson
+	if err := json.Unmarshal(runAccessCLI(t, ctx, viewerClients, true, "whoami"), &observedViewer); err != nil ||
+		observedViewer.UserID != viewerIdentity.UserID || observedViewer.DeviceID != viewerIdentity.DeviceID || observedViewer.FabricID == "" {
+		t.Fatalf("whoami observation = %#v err=%v", observedViewer, err)
+	}
+	viewerHuman := string(runAccessCLI(t, ctx, viewerClients, false, "whoami"))
+	if !strings.Contains(viewerHuman, "FABRIC ID\tUSER ID\tDEVICE ID\tSEEN") ||
+		!strings.Contains(viewerHuman, "person-viewer\tdevice-viewer") {
+		t.Fatalf("human whoami output omitted typed identity fields:\n%s", viewerHuman)
+	}
+	var invalidWhoAmI bytes.Buffer
+	err = execute(ctx, viewerClients, true, []string{"whoami", "extra"}, &invalidWhoAmI, &bytes.Buffer{})
+	var whoamiUsage usageError
+	if !errors.As(err, &whoamiUsage) || commandExitCodeForArgs(err, []string{"whoami", "extra"}) != exitUsage {
+		t.Fatalf("whoami extra = %v exit=%d, want typed usage", err, commandExitCodeForArgs(err, []string{"whoami", "extra"}))
+	}
+	var machineWhoAmI bytes.Buffer
+	err = execute(ctx, machineClients, true, []string{"whoami"}, &machineWhoAmI, &bytes.Buffer{})
+	assertCLIErrorCode(t, err, contract.ErrorPrincipalForbidden)
+	if commandExitCodeForArgs(err, []string{"whoami"}) != exitUnauthorized {
+		t.Fatalf("machine whoami exit = %d, want %d", commandExitCodeForArgs(err, []string{"whoami"}), exitUnauthorized)
+	}
 	var stdout, stderr bytes.Buffer
 	err = execute(ctx, viewerClients, true, []string{"admin", "policy", "add", "person-viewer", "--policy-revision", "1"}, &stdout, &stderr)
 	assertCLIErrorCode(t, err, contract.ErrorAdminRequired)
@@ -259,6 +287,12 @@ func TestAccessCLIErrorProjectionAndScopedExitCodes(t *testing.T) {
 	}
 	if got := commandExitCodeForArgs(usage, []string{"services", "status"}); got != exitFailure {
 		t.Fatalf("pre-existing command exit = %d, want historical %d", got, exitFailure)
+	}
+	for _, code := range []contract.ErrorCode{contract.ErrorPersonIdentityRequired, contract.ErrorPrincipalForbidden} {
+		err := &apiResponseError{APIError: contract.APIError{Code: code}}
+		if got := commandExitCodeForArgs(err, []string{"--json", "whoami"}); got != exitUnauthorized {
+			t.Fatalf("whoami %s exit = %d, want %d", code, got, exitUnauthorized)
+		}
 	}
 	receipt := contract.ComputerControlReceipt{ComputerID: "computer-1", Action: "take",
 		AdmittedMode: string(l1.ComputerAdmittedView), TenureState: contract.ComputerControlTenureFree,

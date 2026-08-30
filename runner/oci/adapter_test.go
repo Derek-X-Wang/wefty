@@ -1172,11 +1172,15 @@ func TestAttemptEndpointStaysBoundToAdmittingHelperSession(t *testing.T) {
 
 func TestAdapterImageBudgetExhaustionIsPermanentAndBounded(t *testing.T) {
 	engine := &adapterTestEngine{ensureErrors: []error{ocihelper.NewImageMechanicsError(ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureNetwork, TopLevelDigest: adapterTestDigest}, errors.New("temporary DNS"))}}
+	sleepCalls := 0
 	adapter, closeAdapter := startAdapterTestServerWithPolicy(t, engine, ImagePolicy{
-		Budget: 5 * time.Millisecond,
-		Sleep: func(ctx context.Context, _ time.Duration) error {
-			<-ctx.Done()
-			return ctx.Err()
+		Budget: time.Minute,
+		Sleep: func(_ context.Context, delay time.Duration) error {
+			sleepCalls++
+			if delay != time.Second {
+				t.Fatalf("budget exhaustion retry delay = %s, want 1s", delay)
+			}
+			return context.DeadlineExceeded
 		},
 	})
 	defer closeAdapter()
@@ -1189,6 +1193,9 @@ func TestAdapterImageBudgetExhaustionIsPermanentAndBounded(t *testing.T) {
 	}
 	if engine.ensureCalls != 1 {
 		t.Fatalf("budget exhaustion EnsureImage calls = %d, want 1", engine.ensureCalls)
+	}
+	if sleepCalls != 1 {
+		t.Fatalf("budget exhaustion sleep calls = %d, want 1", sleepCalls)
 	}
 	if recoveries != 0 {
 		t.Fatalf("delivery budget recovery calls = %d, want 0", recoveries)

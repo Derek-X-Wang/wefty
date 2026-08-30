@@ -45,12 +45,13 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 		t.Fatal("Linux OCI service publication realtiming provisioning is incomplete")
 	}
 	var healthOK, echoOK, startupTimedOut, withdrawalObserved, republicationObserved bool
+	var withdrawalElapsed, republicationElapsed time.Duration
 	var portCollisionAvoided, portlessOK, gracefulStopOK, restartIdentityOK bool
 	var killEscalation nativeOCIServiceKILLEscalationEvidence
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
 			helperTunnelOK := healthOK && echoOK
-			evidence := fmt.Sprintf("platform=%s/%s\nhealth=%t\necho=%t\nstartup_timeout=%t\nwithdrawal=%t\nrepublication=%t\nport_collision_avoided=%t\nportless_started=%t\nhelper_tunnel=%t\nterm_cooperative_stop=%t\nterm_kill_escalation=%t\nterm_kill_log_evidence_incomplete=%t\nterm_kill_log_seal_pairing=%t\nterm_kill_stdout_log=%t\nterm_kill_stderr_log=%t\nterm_grace_stop=%t\nfresh_restart_authority=%t\n", runtime.GOOS, runtime.GOARCH, healthOK, echoOK, startupTimedOut, withdrawalObserved, republicationObserved, portCollisionAvoided, portlessOK, helperTunnelOK, gracefulStopOK, killEscalation.Escalated, killEscalation.LogEvidenceIncomplete, killEscalation.LogSealPairing, killEscalation.StdoutLog, killEscalation.StderrLog, gracefulStopOK && killEscalation.Escalated, restartIdentityOK)
+			evidence := fmt.Sprintf("platform=%s/%s\nhealth=%t\necho=%t\nstartup_timeout=%t\nwithdrawal=%t\nwithdrawal_elapsed=%s\nrepublication=%t\nrepublication_elapsed=%s\nport_collision_avoided=%t\nportless_started=%t\nhelper_tunnel=%t\nterm_cooperative_stop=%t\nterm_kill_escalation=%t\nterm_kill_log_evidence_incomplete=%t\nterm_kill_log_seal_pairing=%t\nterm_kill_stdout_log=%t\nterm_kill_stderr_log=%t\nterm_grace_stop=%t\nfresh_restart_authority=%t\n", runtime.GOOS, runtime.GOARCH, healthOK, echoOK, startupTimedOut, withdrawalObserved, withdrawalElapsed, republicationObserved, republicationElapsed, portCollisionAvoided, portlessOK, helperTunnelOK, gracefulStopOK, killEscalation.Escalated, killEscalation.LogEvidenceIncomplete, killEscalation.LogSealPairing, killEscalation.StdoutLog, killEscalation.StderrLog, gracefulStopOK && killEscalation.Escalated, restartIdentityOK)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-publication-"+runtime.GOOS+".txt"), []byte(evidence), 0o600); err != nil {
 				t.Errorf("write OCI service publication evidence: %v", err)
 			}
@@ -97,13 +98,15 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	sibling.stop(t, adapter)
 
 	primary.triggerPayloadListenerRestart(t)
-	withdrawalObserved = primary.waitReachable(t, false, 5*time.Second)
+	withdrawalElapsed = primary.waitReachableMeasured(t, false, 5*time.Second)
+	withdrawalObserved = true
 	select {
 	case outcome := <-primary.done:
 		t.Fatalf("helper-tunnel withdrawal killed payload: (%#v, %v)", outcome.result, outcome.err)
 	default:
 	}
-	republicationObserved = primary.waitReachable(t, true, 5*time.Second)
+	republicationElapsed = primary.waitReachableMeasured(t, true, 5*time.Second)
+	republicationObserved = true
 
 	timedOut := startNativeOCIService(t, ctx, adapter, reference, digest, "startup-timeout", "", []string{
 		"/bin/sh", "-c", `trap 'exit 143' TERM; while :; do sleep 0.1; done`,
@@ -175,12 +178,14 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 		t.Fatal("Linux OCI L1/agent service realtiming provisioning is incomplete")
 	}
 	var freshRestart, stopStart, saturation, retainedBinding bool
+	var serviceFreshAttemptReadmission bool
+	var serviceRecoveryElapsed time.Duration
 	var removalManifestComplete, removalPending, removalEveryAttempt bool
 	var removalServiceDataVolume, removalServiceDataOwnerRecord bool
 	var removalCompleted, removalPriorBootSweep, removalPostDeleteAttestation, removalDeleteAttestInjection bool
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
+			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceFreshAttemptReadmission, serviceRecoveryElapsed, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-l1-agent-linux.txt"), []byte(payload), 0o600); err != nil {
 				t.Errorf("write OCI L1/agent evidence: %v", err)
 			}
@@ -192,11 +197,12 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 		"native-service-node": {Tags: []string{"native-service"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	}, 2*time.Second)
 	defer stopServer()
+	publishedPort := reserveNativePublishedPort(t)
 	serviceSpec := func(dispatchKey string) contract.JobSpec {
 		return contract.JobSpec{
 			SchemaVersion: contract.SchemaVersionV1, DispatchKey: dispatchKey, Kind: contract.JobKindOCI,
 			Class: contract.JobClassService, Restart: contract.RestartAlways, RoutingTags: []string{"native-service"},
-			RuntimeHandler: ocihelper.DefaultRuntimeHandler,
+			RuntimeHandler: ocihelper.DefaultRuntimeHandler, PublishedPort: &publishedPort,
 			Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
 				Image: contract.OCIImageSpec{Reference: reference, Digest: &digest},
 				Argv: []string{"/bin/sh", "-c", `
@@ -207,6 +213,7 @@ if test -f "$WEFTY_SERVICE_DIR/attempt-count"; then prior="$(cat "$WEFTY_SERVICE
 printf 'service-data-prior=%s\n' "$prior"
 printf '%s\n' "$((prior + 1))" >"$WEFTY_SERVICE_DIR/attempt-count"
 touch /rootfs-attempt-marker
+/usr/local/bin/wefty-echo-service &
 while :; do sleep 1; done
 `},
 			}},
@@ -235,6 +242,7 @@ while :; do sleep 1; done
 		t.Fatal(err)
 	}
 	intentSource := lima.FileIntentSource{Path: intentPath}
+	authorities := newNativeClaimAuthorityRecorder()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "native-service-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
@@ -254,7 +262,7 @@ while :; do sleep 1; done
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true}}, nil
 		}),
 		OCIBootBarrier: barrier, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: adapter},
-		AttemptDeadman:       nativeAcceptanceDeadman{barrier: barrier, nodeID: "native-service-node", bootSessionID: "native-service-boot"},
+		AttemptDeadman:       nativeAcceptanceDeadman{barrier: barrier, nodeID: "native-service-node", bootSessionID: "native-service-boot", observe: authorities.record},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: spoolDirectory, MaxServiceSlots: 1,
 		HeartbeatInterval: 2 * time.Second, ClaimInterval: 20 * time.Millisecond, RenewalInterval: 200 * time.Millisecond,
 		OperationTimeout: 5 * time.Second, FinalizationTimeout: 30 * time.Second, Logf: t.Logf,
@@ -273,6 +281,9 @@ while :; do sleep 1; done
 	if firstAttempt == "" || firstRunning.BoundNodeID != "native-service-node" || firstRunning.Spec.Execution.OCI == nil || firstRunning.Spec.Execution.OCI.Image.Digest == nil {
 		t.Fatalf("initial L1/agent OCI service = %+v", firstRunning)
 	}
+	firstAuthority := authorities.wait(t, firstAttempt, 5*time.Second)
+	serviceClientFabric := network.NewFabric(fabric.Identity{NodeID: "native-service-client"})
+	waitNativePublishedServiceHealth(t, serviceClientFabric, publishedPort, 15*time.Second)
 	pinsBeforeStop, err := nodeAgent.logSpool.ListOCIImageBindingPins(t.Context())
 	if err != nil || !containsBindingPin(pinsBeforeStop, primary.JobID, digest) {
 		t.Fatalf("initial OCI binding pin=%+v err=%v", pinsBeforeStop, err)
@@ -327,6 +338,39 @@ while :; do sleep 1; done
 	}
 	firstRunning = waitNativeServiceAttempt(t, store, primary.JobID, firstAttempt, 45*time.Second)
 	firstAttempt = firstRunning.CurrentAttemptID
+	firstAuthority = authorities.wait(t, firstAttempt, 5*time.Second)
+	oldGeneration, ready := barrier.Generation()
+	if !ready {
+		t.Fatal("service helper generation was not ready before runtime-loss injection")
+	}
+	recoveryStarted := time.Now()
+	barrier.Invalidate()
+	readmitted := waitNativeServiceAttempt(t, store, primary.JobID, firstAttempt, 15*time.Second)
+	healthElapsed := waitNativePublishedServiceHealth(t, serviceClientFabric, publishedPort, 15*time.Second)
+	serviceRecoveryElapsed = time.Since(recoveryStarted)
+	newGeneration, ready := barrier.Generation()
+	newAuthority := authorities.wait(t, readmitted.CurrentAttemptID, 5*time.Second)
+	attempts, err = store.ListJobAttempts(t.Context(), primary.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stale *l1.Attempt
+	for index := range attempts {
+		if attempts[index].AttemptID == firstAttempt {
+			stale = &attempts[index]
+			break
+		}
+	}
+	serviceFreshAttemptReadmission = ready && newGeneration != oldGeneration &&
+		readmitted.CurrentAttemptID != firstAttempt && newAuthority.FencingToken != firstAuthority.FencingToken &&
+		stale != nil && stale.State == contract.AttemptFailed && stale.Result != nil && stale.Result.RuntimeFailure != nil &&
+		stale.Result.RuntimeFailure.Code == contract.RuntimeFailureUnavailable && serviceRecoveryElapsed <= 15*time.Second && healthElapsed <= 15*time.Second
+	if !serviceFreshAttemptReadmission {
+		t.Fatalf("runtime-loss service re-admission = old_generation:%+v new_generation:%+v ready:%t old_authority:%+v new_authority:%+v stale:%+v current:%+v health_elapsed:%s",
+			oldGeneration, newGeneration, ready, firstAuthority, newAuthority, stale, readmitted, serviceRecoveryElapsed)
+	}
+	firstRunning = readmitted
+	firstAttempt = readmitted.CurrentAttemptID
 	sibling, _, err := store.CreateJob(t.Context(), serviceSpec("native-service-sibling"))
 	if err != nil {
 		t.Fatal(err)
@@ -653,6 +697,7 @@ FROM runtime_removal_manifests WHERE job_id=?`, jobID).Scan(&manifestJSON, &rece
 type nativeAcceptanceDeadman struct {
 	barrier               *ocihelper.BootBarrier
 	nodeID, bootSessionID string
+	observe               func(l1.Claim)
 }
 
 func (renewer nativeAcceptanceDeadman) QueueSuccessfulRenewal(claim l1.Claim, ttl time.Duration) error {
@@ -664,11 +709,96 @@ func (renewer nativeAcceptanceDeadman) QueueSuccessfulRenewal(claim l1.Claim, tt
 	if claim.Job.Spec.Class == contract.JobClassService {
 		removalGeneration = fmt.Sprint(l1.InitialServiceRemovalGeneration)
 	}
-	return session.QueueAttemptRenewal(ocihelper.AttemptAuthority{
+	err = session.QueueAttemptRenewal(ocihelper.AttemptAuthority{
 		NodeID: renewer.nodeID, BootSessionID: renewer.bootSessionID, JobID: claim.Job.JobID,
 		AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
 		Class: claim.Job.Spec.Class, RemovalGeneration: removalGeneration,
 	}, ttl)
+	if err == nil && renewer.observe != nil {
+		renewer.observe(claim)
+	}
+	return err
+}
+
+type nativeClaimAuthorityRecorder struct {
+	mu          sync.Mutex
+	authorities map[string]workloadrunner.AttemptAuthority
+}
+
+func newNativeClaimAuthorityRecorder() *nativeClaimAuthorityRecorder {
+	return &nativeClaimAuthorityRecorder{authorities: make(map[string]workloadrunner.AttemptAuthority)}
+}
+
+func (recorder *nativeClaimAuthorityRecorder) record(claim l1.Claim) {
+	recorder.mu.Lock()
+	recorder.authorities[claim.Lease.AttemptID] = workloadAuthority("native-service-node", "native-service-boot", claim)
+	recorder.mu.Unlock()
+}
+
+func (recorder *nativeClaimAuthorityRecorder) wait(t *testing.T, attemptID string, timeout time.Duration) workloadrunner.AttemptAuthority {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		recorder.mu.Lock()
+		authority, ok := recorder.authorities[attemptID]
+		recorder.mu.Unlock()
+		if ok {
+			return authority
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("attempt %s did not publish a successful helper deadman renewal", attemptID)
+	return workloadrunner.AttemptAuthority{}
+}
+
+func reserveNativePublishedPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return port
+}
+
+func waitNativePublishedServiceHealth(t *testing.T, clientFabric fabric.Fabric, port int, timeout time.Duration) time.Duration {
+	t.Helper()
+	address := net.JoinHostPort(clientFabric.ConnectHost(), fmt.Sprint(port))
+	transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return clientFabric.Dial(ctx, network, address)
+	}}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	started := time.Now()
+	deadline := started.Add(timeout)
+	for time.Now().Before(deadline) {
+		requestContext, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+		request, err := http.NewRequestWithContext(requestContext, http.MethodGet, "http://service.invalid/healthz", nil)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		response, responseErr := client.Do(request)
+		if responseErr == nil {
+			var health struct {
+				PID int `json:"pid"`
+			}
+			decodeErr := json.NewDecoder(response.Body).Decode(&health)
+			closeErr := response.Body.Close()
+			cancel()
+			if response.StatusCode == http.StatusOK && decodeErr == nil && closeErr == nil && health.PID > 0 {
+				return time.Since(started)
+			}
+		} else {
+			cancel()
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("published service health was not reachable within %s", timeout)
+	return 0
 }
 
 func waitNativeServiceState(t *testing.T, store *l1.Store, jobID string, state contract.JobState, timeout time.Duration) l1.Job {
@@ -827,8 +957,8 @@ while :; do
     fi
     sleep 0.1
   done
-  wait "$server"
-  status=$?
+  status=0
+  wait "$server" || status=$?
   if test "$restart_requested" = true; then
     sleep 1
     rm -f /tmp/wefty-listener-restart
@@ -980,25 +1110,44 @@ func (service *nativeOCIService) triggerPayloadListenerRestart(t *testing.T) {
 
 func (service *nativeOCIService) waitReachable(t *testing.T, want bool, timeout time.Duration) bool {
 	t.Helper()
+	reachable, _, matched := service.observeReachability(t, want, timeout)
+	if !matched {
+		t.Fatalf("OCI service reachability did not become %v", want)
+	}
+	return reachable
+}
+
+func (service *nativeOCIService) waitReachableMeasured(t *testing.T, want bool, timeout time.Duration) time.Duration {
+	t.Helper()
+	_, elapsed, matched := service.observeReachability(t, want, timeout)
+	if !matched {
+		t.Fatalf("OCI service reachability did not become %v", want)
+	}
+	return elapsed
+}
+
+func (service *nativeOCIService) observeReachability(t *testing.T, want bool, timeout time.Duration) (bool, time.Duration, bool) {
+	t.Helper()
+	started := time.Now()
 	deadline := time.Now().Add(timeout)
+	reachable := false
 	for time.Now().Before(deadline) {
 		request, err := http.NewRequest(http.MethodGet, "http://service.invalid/healthz", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		response, err := service.client.Do(request)
-		reachable := err == nil && response.StatusCode == http.StatusOK
+		reachable = err == nil && response.StatusCode == http.StatusOK
 		if response != nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
 			_ = response.Body.Close()
 		}
 		if reachable == want {
-			return true
+			return reachable, time.Since(started), true
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("OCI service reachability did not become %v", want)
-	return false
+	return reachable, time.Since(started), false
 }
 
 func (service *nativeOCIService) stop(t *testing.T, adapter *ocirunner.Adapter) bool {

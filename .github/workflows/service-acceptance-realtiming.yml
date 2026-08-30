@@ -592,7 +592,9 @@ jobs:
             "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" wayland
           scripts/check-native-linux-oci-receipt.sh \
             "$RUNNER_TEMP/linux-computer-receipt-xfce/native-linux-oci.txt" "$WEFTY_REALTIME_EVIDENCE_SOURCE" \
-            "$RUNNER_TEMP/linux-computer-receipt-xfce/oci-service-publication-linux.txt"
+            "$RUNNER_TEMP/linux-computer-receipt-xfce/oci-service-publication-linux.txt" \
+            "$RUNNER_TEMP/linux-computer-receipt-xfce/oci-service-l1-agent-linux.txt"
           scripts/check-native-linux-oci-receipt.sh \
             "$RUNNER_TEMP/linux-computer-receipt-wayland/native-linux-oci.txt" "$WEFTY_REALTIME_EVIDENCE_SOURCE" \
-            "$RUNNER_TEMP/linux-computer-receipt-wayland/oci-service-publication-linux.txt"
+            "$RUNNER_TEMP/linux-computer-receipt-wayland/oci-service-publication-linux.txt" \
+            "$RUNNER_TEMP/linux-computer-receipt-wayland/oci-service-l1-agent-linux.txt"
