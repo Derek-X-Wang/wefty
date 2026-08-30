@@ -8,6 +8,9 @@ import time
 
 SOURCE = "/wefty/control/driver.json"
 TARGET = "/tmp/wefty-computer/driver-state.json"
+MUTATION = os.environ.get("WEFTY_CONFORMANCE_MUTATION", "")
+
+
 def read_document() -> tuple[bool, str, str]:
     try:
         with open(SOURCE, "rb") as source:
@@ -19,16 +22,20 @@ def read_document() -> tuple[bool, str, str]:
         if type(value["version"]) is not int:
             return False, fingerprint, "malformed"
         if value["version"] != 1:
-            return False, fingerprint, "unknown-version"
+            accepted = MUTATION == "unknown-driver-version-accepted" and value.get("human_driving") is True
+            return accepted, fingerprint, "unknown-version"
         if type(value["human_driving"]) is not bool:
-            return False, fingerprint, "malformed"
-        return value["human_driving"], fingerprint, "valid"
+            return MUTATION == "malformed-driver-accepted", fingerprint, "malformed"
+        state = value["human_driving"]
+        if MUTATION == "driver-json-ignored":
+            state = False
+        return state, fingerprint, "valid"
     except FileNotFoundError:
         return False, "missing", "missing"
     except (UnicodeError, json.JSONDecodeError):
-        return False, hashlib.sha256(payload).hexdigest(), "malformed"
+        return MUTATION == "malformed-driver-accepted", hashlib.sha256(payload).hexdigest(), "malformed"
     except OSError:
-        return False, "malformed", "malformed"
+        return MUTATION == "malformed-driver-accepted", "malformed", "malformed"
 
 
 def publish(state: bool, generation: int, fingerprint: str, classification: str) -> None:

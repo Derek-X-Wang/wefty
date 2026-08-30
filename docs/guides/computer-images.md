@@ -190,6 +190,20 @@ stay byte-identical when input is discarded. A driver oracle similarly exposes
 the tenant agent's already-internal observation of `driver.json`. The reference
 image uses `/tmp/wefty-computer/input-oracle.json` and
 `/tmp/wefty-computer/driver-state.json`; other images choose their own paths.
+The driver oracle publishes one atomic JSON object with exactly
+`version`, `human_driving`, `generation`, `fingerprint`, and `classification`:
+
+```json
+{"version":1,"human_driving":false,"generation":7,"fingerprint":"2f05d4b689d270cafb02285f35f44866c422400c3c83397801d7d8f31c3d5f1b","classification":"valid"}
+```
+
+`version` is integer `1`; `human_driving` is fail-closed; `generation` rises
+monotonically for the observer process; and `fingerprint` is lowercase
+hexadecimal SHA-256 of the exact bytes classified by that observation.
+`classification` is exactly `valid`, `malformed`, `unknown-version`, or
+`missing`; missing input uses the literal fingerprint sentinel `missing`.
+Read and fingerprint once, publish by atomic rename, and do not reset the
+generation while the checker is attached.
 
 The checker is the sole transport and runtime harness. Its Docker/nerdctl
 profile cells are labelled `harness.*` and reported separately from image

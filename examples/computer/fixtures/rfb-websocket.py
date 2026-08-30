@@ -2,6 +2,7 @@
 """Expose one strict rfb-websocket-v1 edge over a Unix RFB backend."""
 
 import argparse
+import os
 from urllib.parse import urlsplit
 
 from websockify.websocketproxy import LibProxyServer, ProxyRequestHandler
@@ -16,8 +17,16 @@ class BinaryOnlyWebSocket(CompatibleWebSocket):
         return "binary"
 
 
+class TextAcceptingWebSocket(BinaryOnlyWebSocket):
+    """Deliberately broken fixture: translate text frames into binary data."""
+
+    def _recvmsg(self):
+        self._recv_queue = [frame for frame in self._recv_queue if frame["opcode"] != 0x1]
+        return super()._recvmsg()
+
+
 class RFBWebSocketHandler(ProxyRequestHandler):
-    SocketClass = BinaryOnlyWebSocket
+    SocketClass = TextAcceptingWebSocket if os.environ.get("WEFTY_CONFORMANCE_MUTATION") == "text-frames-accepted" else BinaryOnlyWebSocket
 
     def handle_upgrade(self):
         target = urlsplit(self.path)
@@ -38,9 +47,11 @@ def main() -> None:
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("port must be between 1 and 65535")
+    edge_role = os.environ.get("WEFTY_CONFORMANCE_EDGE_ROLE", "")
+    wildcard = os.environ.get("WEFTY_CONFORMANCE_MUTATION") == f"{edge_role}-wildcard-bind"
     server = LibProxyServer(
         RequestHandlerClass=RFBWebSocketHandler,
-        listen_host="127.0.0.1",
+        listen_host="0.0.0.0" if wildcard else "127.0.0.1",
         listen_port=args.port,
         unix_target=args.target,
         web="",

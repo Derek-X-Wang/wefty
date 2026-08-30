@@ -1,9 +1,11 @@
 #!/bin/sh
 set -eu
 
+mutation=${WEFTY_CONFORMANCE_MUTATION:-}
+
 case "${WEFTY_COMPUTER_VIEW_PORT:-}" in ''|*[!0-9]*) echo 'WEFTY_COMPUTER_VIEW_PORT must be a decimal port' >&2; exit 64 ;; esac
 case "${WEFTY_COMPUTER_CONTROL_PORT:-}" in ''|*[!0-9]*) echo 'WEFTY_COMPUTER_CONTROL_PORT must be a decimal port' >&2; exit 64 ;; esac
-if [ "$WEFTY_COMPUTER_VIEW_PORT" = "$WEFTY_COMPUTER_CONTROL_PORT" ]; then
+if [ "$WEFTY_COMPUTER_VIEW_PORT" = "$WEFTY_COMPUTER_CONTROL_PORT" ] && [ "$mutation" != duplicate-endpoint ]; then
   echo 'view and control ports must be distinct' >&2
   exit 64
 fi
@@ -14,10 +16,17 @@ fi
 
 view_port=$WEFTY_COMPUTER_VIEW_PORT
 control_port=$WEFTY_COMPUTER_CONTROL_PORT
+if [ "$mutation" = reserved-env-shadowed ]; then
+  # The fixture keeps the real listener authority but exposes a tenant value
+  # in PID 1's environment so the checker can prove stripping is load-bearing.
+  view_port=$WEFTY_CONFORMANCE_REAL_VIEW_PORT
+fi
 
 mkdir -p /wefty/service/home/wefty
 mkdir -p "$HOME/.config/chromium" "$XDG_RUNTIME_DIR" /tmp/wefty-computer
 chmod 0700 "$HOME" "$XDG_RUNTIME_DIR"
+if [ "$mutation" = profile-state-lost ]; then rm -f "$HOME/.config/wefty-conformance/profile"; fi
+if [ "$mutation" = sign-in-state-lost ]; then rm -f "$HOME/.local/share/wefty-conformance/sign-in"; fi
 
 pids=
 start() {
@@ -52,6 +61,10 @@ start dbus-run-session -- sh -c '
 '
 start /usr/local/libexec/wefty-watch-driver
 start /usr/local/libexec/wefty-pointer-oracle
+
+if [ "$mutation" = readiness-over-60s ]; then
+  sleep 61
+fi
 
 view_socket=/tmp/wefty-computer/view-rfb.sock
 control_socket=/tmp/wefty-computer/control-rfb.sock
@@ -100,19 +113,27 @@ supervise_edge() (
     wait "$backend_pid" 2>/dev/null || true
     websocket_pid=
     backend_pid=
+    if [ "$mutation" = edge-does-not-recover ] && [ "$role" = view ]; then exit 0; fi
     sleep 1
   done
 )
 
 view_flag=--view-only
-start supervise_edge view "$view_port" "$view_socket" "$view_flag"
-start supervise_edge control "$control_port" "$control_socket"
+if [ "$mutation" = view-accepts-input ]; then view_flag=; fi
+if [ "$mutation" != missing-view-endpoint ]; then
+  start supervise_edge view "$view_port" "$view_socket" "$view_flag"
+fi
+if [ "$mutation" = plain-tcp-control ]; then
+  start python3 -m http.server "$control_port" --bind 127.0.0.1
+elif [ "$mutation" != missing-control-endpoint ] && [ "$mutation" != duplicate-endpoint ]; then
+  start supervise_edge control "$control_port" "$control_socket"
+fi
 while [ "$startup_remaining" -gt 0 ]; do
-  if [ -S "$view_socket" ] && [ -S "$control_socket" ]; then break; fi
+  if { [ -S "$view_socket" ] || [ "$mutation" = missing-view-endpoint ]; } && { [ -S "$control_socket" ] || [ "$mutation" = plain-tcp-control ] || [ "$mutation" = missing-control-endpoint ] || [ "$mutation" = duplicate-endpoint ]; }; then break; fi
   sleep 1
   startup_remaining=$((startup_remaining - 1))
 done
-if [ ! -S "$view_socket" ] || [ ! -S "$control_socket" ]; then
+if [ "$mutation" != missing-control-endpoint ] && [ "$mutation" != missing-view-endpoint ] && [ "$mutation" != duplicate-endpoint ] && { [ ! -S "$view_socket" ] || { [ ! -S "$control_socket" ] && [ "$mutation" != plain-tcp-control ]; }; }; then
   echo 'RFB backends did not become ready within the 60 second startup budget' >&2
   exit 1
 fi

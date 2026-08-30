@@ -186,6 +186,18 @@ JSON types are exact: `version` is an integer (not a boolean) equal to `1`, and
 `human_driving` is a boolean (not `0` or `1`). A type mismatch is malformed and
 therefore fails closed to `human_driving=false`.
 
+When an image exposes the optional driver conformance oracle, every published
+observation has exactly these fields: `version`, `human_driving`, `generation`,
+`fingerprint`, and `classification`. Oracle `version` is integer `1`;
+`human_driving` is the fail-closed state; `generation` is a monotonically
+increasing integer for the lifetime of the observer process; `fingerprint` is
+the lowercase hexadecimal SHA-256 of the exact bytes read from `driver.json`;
+and `classification` is exactly one of `valid`, `malformed`,
+`unknown-version`, or `missing`. A missing source uses the literal fingerprint
+sentinel `missing`. The observer must fingerprint and classify the same single
+read, publish atomically, and never reset `generation` while an assertion is in
+flight. This oracle is diagnostic image-owned evidence, not runtime authority.
+
 ## Conformance seam and evidence
 
 The transport-neutral Go contract exports the endpoint names, path,

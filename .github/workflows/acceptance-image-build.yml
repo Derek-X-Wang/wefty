@@ -178,35 +178,55 @@ jobs:
           EDGE_PROCESS_PATTERN: ${{ matrix.edge }}
           ELF_PATH: ${{ matrix.elf_path }}
         run: |
-          set -euo pipefail
+          set -eEuo pipefail
+          stage='initialize'
+          report_stage_failure() {
+            status=$?
+            trap - ERR
+            printf '::error title=computer image runtime::stage %s failed (exit %s)\n' "$stage" "$status" >&2
+            exit "$status"
+          }
+          trap report_stage_failure ERR
+          stage='evidence-directory'
           evidence="$RUNNER_TEMP/computer-image-linux"
           mkdir -p "$evidence"
+          stage='archive-verification'
           scripts/verify-acceptance-image.sh --archive "$RUNNER_TEMP/computer-image.oci.tar" \
             --expected-platform "$PLATFORM" --platform-digest-output "$evidence/${ARCH}.digest" \
             --receipt-output "$evidence/${ARCH}-oci.json"
+          stage='archive-evidence-copy'
           cp "$RUNNER_TEMP/computer-image.oci.tar" "$evidence/${ARCH}.oci.tar"
+          stage='crane-install'
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           registry_reference="localhost:5000/${LOCAL_NAME}:${GITHUB_SHA}-${ARCH}"
           platform_digest="$(cat "$evidence/${ARCH}.digest")"
+          stage='digest-compare'
           registry_digest="$("$crane" digest --insecure "$registry_reference")"
           test "$registry_digest" = "$platform_digest"
           printf '%s\n' "$registry_digest" > "$evidence/${ARCH}-registry.digest"
           pinned_reference="${registry_reference}@${platform_digest}"
+          stage='image-pull'
           docker pull --platform "$PLATFORM" "$pinned_reference"
+          stage='runtime-conformance'
           scripts/test-computer-image-runtime.sh --image "$pinned_reference" --arch "$ARCH" --evidence "$evidence" \
             --edge-process-pattern "$EDGE_PROCESS_PATTERN"
           if [[ $VARIANT == wayland ]]; then
+            stage='wayland-furniture'
             scripts/test-computer-wayland-furniture.sh --image "$pinned_reference" --arch "$ARCH" \
               --conformance-receipt "$evidence/${ARCH}-runtime.json" --output "$evidence/${ARCH}-furniture.json" \
               --metrics-output "$evidence/${ARCH}-metrics.json"
           else
+            stage='image-measurement'
             scripts/measure-computer-image.sh --image "$pinned_reference" --arch "$ARCH" \
               --conformance-receipt "$evidence/${ARCH}-runtime.json" --output "$evidence/${ARCH}-metrics.json"
           fi
 
+          stage='rootfs-export'
           "$crane" export --insecure --platform "$PLATFORM" "$pinned_reference" "$RUNNER_TEMP/computer-rootfs.tar"
+          stage='elf-extract'
           tar -xOf "$RUNNER_TEMP/computer-rootfs.tar" "$ELF_PATH" > "$RUNNER_TEMP/computer-elf"
+          stage='elf-validate'
           python3 - "$RUNNER_TEMP/computer-elf" "$ARCH" <<'PY'
           import struct, sys
           payload = open(sys.argv[1], "rb").read(20)
@@ -215,6 +235,7 @@ jobs:
           expected = {"amd64": 62, "arm64": 183}[sys.argv[2]]
           if machine != expected: raise SystemExit(f"ELF e_machine={machine}, want {expected}")
           PY
+          stage='receipt-finalize'
           machine="$(test "$ARCH" = amd64 && printf 62 || printf 183)"
           jq --arg digest "$platform_digest" --argjson e_machine "$machine" \
             '.digest = $digest | .elf_e_machine = $e_machine' "$evidence/${ARCH}-runtime.json" \

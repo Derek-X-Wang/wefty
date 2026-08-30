@@ -53,6 +53,7 @@ func run(arguments []string) int {
 	writeSummary(result.Receipt, config.ReceiptPath)
 	if result.Err != nil {
 		fmt.Fprintf(os.Stderr, "conformance stopped: %v\n", result.Err)
+		return 1
 	}
 	switch result.Receipt.Status {
 	case computerconformance.StatusPass:
