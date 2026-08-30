@@ -349,7 +349,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 		resultText := marshalJob(t, result)
 		for _, required := range []string{"ARTIFACT_AVAILABLE", "$ARTIFACT_AVAILABLE", "= true",
-			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland"} {
+			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json",
+			"check-native-linux-oci-receipt.sh", "native-linux-oci.txt", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland"} {
 			if !strings.Contains(resultText, required) {
 				t.Fatalf("%s realtiming result does not fail closed on %q", name, required)
 			}
@@ -371,8 +372,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 	}
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "exec /usr/local/bin/wefty-echo-service", "published-echo-service:", "clean-cache wefty node load-image")
-	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "CodeImageUnavailable", "ImageFailureNetwork", "WEFTY_OCI_PROVISION_RECEIPT", "pull_from_empty=true\\nregistry_disabled_pull_rejected=%t\\nregistry_disabled_import=true")
-	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "Wipe that repopulated cache", `requestRootFault(t, "reset-containerd")`, "wiped-cache binding reconciliation")
+	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "CodeImageUnavailable", "ImageFailureNetwork", "WEFTY_OCI_PROVISION_RECEIPT", `evidenceSource := os.Getenv("EVIDENCE_SOURCE")`, `registryEvidence := "pull_from_empty=true\npull_import_digest_equal=true\n"`, "pull_from_empty=NOT-RUN\\npull_from_empty_reason=pr-build: image not published")
+	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "Start the archive row from an empty root", `requestRootFault(t, "reset-containerd")`, "wiped-cache binding reconciliation")
 	assertFileNotContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", `strings.Replace(evidence, "pull_from_empty=true\\n"`)
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_COMPUTER_REFERENCE", "exerciseNativeLinuxReferenceComputer", "ComputerStartupReadinessTimeout", "assertReferenceComputerWireNegatives")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_WAYLAND_COMPUTER_REFERENCE", `exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, "wayland"`, "wayland_computer_reference_wire_negatives=true")

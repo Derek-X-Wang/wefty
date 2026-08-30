@@ -74,9 +74,14 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	waylandComputerDigest := os.Getenv("WEFTY_OCI_WAYLAND_COMPUTER_DIGEST")
 	waylandComputerArchivePath := os.Getenv("WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE")
 	provisionReceipt := os.Getenv("WEFTY_OCI_PROVISION_RECEIPT")
+	evidenceSource := os.Getenv("EVIDENCE_SOURCE")
 	if address == "" || helperSocket == "" || helperChecksum == "" || reference == "" || digest == "" || archivePath == "" || echoReference == "" || echoDigest == "" || echoArchivePath == "" || weftyCLI == "" || numericReference == "" || numericArchivePath == "" || namedReference == "" || namedArchivePath == "" || computerReference == "" || computerDigest == "" || computerArchivePath == "" || computerVariant == "" || waylandComputerReference == "" || waylandComputerDigest == "" || waylandComputerArchivePath == "" || provisionReceipt == "" {
 		t.Fatal("Linux OCI realtiming provisioning is incomplete")
 	}
+	if evidenceSource != "pr-build" && evidenceSource != "published-artifact" {
+		t.Fatalf("Linux OCI realtiming evidence source = %q, want pr-build or published-artifact", evidenceSource)
+	}
+	prBuildRegistryNotRun := evidenceSource == "pr-build"
 	if reference != echoReference || digest != echoDigest || archivePath != echoArchivePath || reference != "ghcr.io/derek-x-wang/wefty-echo-service" {
 		t.Fatalf("probe and workload did not consume one canonical public artifact: probe=%s@%s archive=%s echo=%s@%s archive=%s", reference, digest, archivePath, echoReference, echoDigest, echoArchivePath)
 	}
@@ -291,18 +296,20 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	// tar stream is the only possible source of the imported bytes.
 	requestRootFault(t, "reset-containerd")
 	var pulled ocihelper.EnsureImageResponse
-	err = session.EnsureImage(ctx, ocihelper.EnsureImageRequest{
-		Reference: reference, Digest: digest, Source: ocihelper.ImageSourceRegistry,
-		Platform:         ocihelper.OCIPlatform{OS: "linux", Architecture: runtime.GOARCH},
-		OperationTimeout: 2 * time.Minute,
-	}, func(event ocihelper.EnsureImageEvent) error {
-		if event.Result != nil {
-			pulled = *event.Result
+	if !prBuildRegistryNotRun {
+		err = session.EnsureImage(ctx, ocihelper.EnsureImageRequest{
+			Reference: reference, Digest: digest, Source: ocihelper.ImageSourceRegistry,
+			Platform:         ocihelper.OCIPlatform{OS: "linux", Architecture: runtime.GOARCH},
+			OperationTimeout: 2 * time.Minute,
+		}, func(event ocihelper.EnsureImageEvent) error {
+			if event.Result != nil {
+				pulled = *event.Result
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
 		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
 
 	// Real cache pressure uses three independently named top-level roots. The
@@ -335,28 +342,29 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatalf("second LRU eviction record = %+v", secondEviction)
 	}
 
-	// Establish a durable service binding, wipe containerd behind the helper,
-	// and require adapter-owned reconciliation to repull and reattach it.
-	automaticBinding := nativeAdapterRequest(reference, digest, "automatic-repull", []string{"/bin/true"})
-	automaticBinding.Authority.WorkloadClass = contract.JobClassService
-	automaticBinding.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
-	automaticBinding.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-	if _, err := adapter.Run(ctx, automaticBinding, nil); err != nil {
-		t.Fatal(err)
+	if !prBuildRegistryNotRun {
+		// Establish a durable service binding, wipe containerd behind the helper,
+		// and require adapter-owned reconciliation to repull and reattach it.
+		automaticBinding := nativeAdapterRequest(reference, digest, "automatic-repull", []string{"/bin/true"})
+		automaticBinding.Authority.WorkloadClass = contract.JobClassService
+		automaticBinding.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
+		automaticBinding.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+		if _, err := adapter.Run(ctx, automaticBinding, nil); err != nil {
+			t.Fatal(err)
+		}
+		if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: automaticBinding.Authority}); err != nil || !receipt.RuntimeQuiesced {
+			t.Fatalf("automatic-repull seed cleanup = %+v err=%v", receipt, err)
+		}
+		requestRootFault(t, "reset-containerd")
+		if failures, err := adapter.ReconcileOCIImagePins(ctx, func(context.Context, string) (bool, error) { return true, nil }); err != nil || len(failures) != 0 {
+			t.Fatalf("automatic wipe/repull reconciliation = failures %+v err=%v", failures, err)
+		}
+		if err := adapter.ReleaseOCIImageBindingPin(ctx, automaticBinding.Authority.JobID); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: automaticBinding.Authority}); err != nil || !receipt.RuntimeQuiesced {
-		t.Fatalf("automatic-repull seed cleanup = %+v err=%v", receipt, err)
-	}
-	requestRootFault(t, "reset-containerd")
-	if failures, err := adapter.ReconcileOCIImagePins(ctx, func(context.Context, string) (bool, error) { return true, nil }); err != nil || len(failures) != 0 {
-		t.Fatalf("automatic wipe/repull reconciliation = failures %+v err=%v", failures, err)
-	}
-	if err := adapter.ReleaseOCIImageBindingPin(ctx, automaticBinding.Authority.JobID); err != nil {
-		t.Fatal(err)
-	}
-	// The automatic reconciliation above deliberately repulled the digest.
-	// Wipe that repopulated cache before isolating the registry so the direct
-	// reconciliation below observes the intended retained-but-missing binding.
+	// Start the archive row from an empty root before isolating the registry so
+	// the direct reconciliation observes the intended retained-but-missing binding.
 	requestRootFault(t, "reset-containerd")
 	requestRootFault(t, "disable-registry")
 	registryDisabled := true
@@ -398,7 +406,11 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	if importErr != nil || closeErr != nil {
 		t.Fatal(errors.Join(importErr, closeErr))
 	}
-	if !reflect.DeepEqual(pulled, imported) || pulled.TopLevelDigest != digest || pulled.PlatformDigest == "" {
+	if prBuildRegistryNotRun {
+		if imported.TopLevelDigest != digest || imported.PlatformDigest == "" {
+			t.Fatalf("PR archive import evidence = %+v, want immutable digest %s", imported, digest)
+		}
+	} else if !reflect.DeepEqual(pulled, imported) || pulled.TopLevelDigest != digest || pulled.PlatformDigest == "" {
 		t.Fatalf("pull/import evidence differs: pull=%+v import=%+v", pulled, imported)
 	}
 	reconciled, err := session.ReconcileImagePins(ctx, reconcileRequest)
@@ -730,7 +742,11 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "node-doctor.json"), append(doctorBundle, '\n'), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\npull_from_empty=true\nregistry_disabled_pull_rejected=%t\nregistry_disabled_import=true\npull_import_digest_equal=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_reference=%s\ncomputer_index_digest=%s\ncomputer_reference_separate=true\ncomputer_reference_archive_import=true\ncomputer_reference_atomic_readiness=%t\ncomputer_reference_started_to_ready_elapsed=%s\ncomputer_reference_publication_loss_recovery=%t\ncomputer_reference_wire_negatives=true\nwayland_computer_reference=%s\nwayland_computer_index_digest=%s\nwayland_computer_reference_separate=true\nwayland_computer_reference_archive_import=true\nwayland_computer_reference_atomic_readiness=%t\nwayland_computer_reference_started_to_ready_elapsed=%s\nwayland_computer_reference_publication_loss_recovery=%t\nwayland_computer_reference_wire_negatives=true\ncomputer_capacity_three_live_published_fourth_refused=true\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\ncomputer_reference_helper_stop_start_profile_sign_in_rootfs=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, registryDisabledPullRejected, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerReference, computerDigest, referenceComputerReadiness.atomicPublication, referenceComputerReadiness.startedToReadyElapsed, referenceComputerReadiness.lossRecovery, waylandComputerReference, waylandComputerDigest, waylandComputerReadiness.atomicPublication, waylandComputerReadiness.startedToReadyElapsed, waylandComputerReadiness.lossRecovery, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
+		registryEvidence := "pull_from_empty=true\npull_import_digest_equal=true\n"
+		if prBuildRegistryNotRun {
+			registryEvidence = "pull_from_empty=NOT-RUN\npull_from_empty_reason=pr-build: image not published\npull_import_digest_equal=NOT-RUN\npull_import_digest_equal_reason=pr-build: image not published\n"
+		}
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\n%sregistry_disabled_pull_rejected=%t\nregistry_disabled_import=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_reference=%s\ncomputer_index_digest=%s\ncomputer_reference_separate=true\ncomputer_reference_archive_import=true\ncomputer_reference_atomic_readiness=%t\ncomputer_reference_started_to_ready_elapsed=%s\ncomputer_reference_publication_loss_recovery=%t\ncomputer_reference_wire_negatives=true\nwayland_computer_reference=%s\nwayland_computer_index_digest=%s\nwayland_computer_reference_separate=true\nwayland_computer_reference_archive_import=true\nwayland_computer_reference_atomic_readiness=%t\nwayland_computer_reference_started_to_ready_elapsed=%s\nwayland_computer_reference_publication_loss_recovery=%t\nwayland_computer_reference_wire_negatives=true\ncomputer_capacity_three_live_published_fourth_refused=true\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\ncomputer_reference_helper_stop_start_profile_sign_in_rootfs=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, registryEvidence, registryDisabledPullRejected, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerReference, computerDigest, referenceComputerReadiness.atomicPublication, referenceComputerReadiness.startedToReadyElapsed, referenceComputerReadiness.lossRecovery, waylandComputerReference, waylandComputerDigest, waylandComputerReadiness.atomicPublication, waylandComputerReadiness.startedToReadyElapsed, waylandComputerReadiness.lossRecovery, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
