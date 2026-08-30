@@ -32,40 +32,92 @@ require_unique_boolean() {
   fi
 }
 
+duration_within_bound() {
+  duration_remaining=$1
+  duration_limit_seconds=$2
+  case "$duration_limit_seconds" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  while [ "${duration_limit_seconds#0}" != "$duration_limit_seconds" ]; do
+    duration_limit_seconds=${duration_limit_seconds#0}
+  done
+  [ -n "$duration_limit_seconds" ] || duration_limit_seconds=0
+  [ "${#duration_limit_seconds}" -le 9 ] || return 1
+  duration_limit_ns=$((duration_limit_seconds * 1000000000))
+  duration_total_ns=0
+  duration_components=0
+
+  while [ -n "$duration_remaining" ]; do
+    duration_number=
+    while [ -n "$duration_remaining" ]; do
+      duration_first=${duration_remaining%"${duration_remaining#?}"}
+      case "$duration_first" in
+        [0-9]|.)
+          duration_number=$duration_number$duration_first
+          duration_remaining=${duration_remaining#?}
+          ;;
+        *) break ;;
+      esac
+    done
+    case "$duration_number" in
+      ''|.*|*.|*.*.*|*[!0-9.]*) return 1 ;;
+    esac
+
+    case "$duration_number" in
+      *.*)
+        duration_integer=${duration_number%%.*}
+        duration_fraction=${duration_number#*.}
+        ;;
+      *)
+        duration_integer=$duration_number
+        duration_fraction=
+        ;;
+    esac
+    while [ "${duration_integer#0}" != "$duration_integer" ]; do
+      duration_integer=${duration_integer#0}
+    done
+    [ -n "$duration_integer" ] || duration_integer=0
+    [ "${#duration_integer}" -le 18 ] || return 1
+
+    case "$duration_remaining" in
+      ns*) duration_multiplier=1; duration_remaining=${duration_remaining#ns} ;;
+      us*) duration_multiplier=1000; duration_remaining=${duration_remaining#us} ;;
+      µs*) duration_multiplier=1000; duration_remaining=${duration_remaining#µs} ;;
+      ms*) duration_multiplier=1000000; duration_remaining=${duration_remaining#ms} ;;
+      s*) duration_multiplier=1000000000; duration_remaining=${duration_remaining#s} ;;
+      m*) duration_multiplier=60000000000; duration_remaining=${duration_remaining#m} ;;
+      h*) duration_multiplier=3600000000000; duration_remaining=${duration_remaining#h} ;;
+      *) return 1 ;;
+    esac
+
+    duration_max_integer=$((duration_limit_ns / duration_multiplier))
+    [ "$duration_integer" -le "$duration_max_integer" ] || return 1
+    duration_component_ns=$((duration_integer * duration_multiplier))
+    duration_fraction_scale=$duration_multiplier
+    while [ -n "$duration_fraction" ]; do
+      duration_first=${duration_fraction%"${duration_fraction#?}"}
+      duration_fraction=${duration_fraction#?}
+      duration_fraction_scale=$((duration_fraction_scale / 10))
+      [ "$duration_fraction_scale" -gt 0 ] || return 1
+      duration_component_ns=$((duration_component_ns + duration_first * duration_fraction_scale))
+    done
+    [ "$duration_component_ns" -le $((duration_limit_ns - duration_total_ns)) ] || return 1
+    duration_total_ns=$((duration_total_ns + duration_component_ns))
+    duration_components=$((duration_components + 1))
+  done
+
+  # A 1ns literal is not credible elapsed-time evidence from this harness.
+  # One microsecond is the smallest accepted measurement quantum.
+  [ "$duration_components" -gt 0 ] && [ "$duration_total_ns" -ge 1000 ] && [ "$duration_total_ns" -le "$duration_limit_ns" ]
+}
+
 require_duration_within() {
   file=$1
   key=$2
   max_seconds=$3
-  count=$(awk -v prefix="$key=" 'index($0, prefix) == 1 { count++ } END { print count + 0 }' "$file")
-  value=$(awk -v prefix="$key=" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1) }' "$file")
-  if [ "$count" -ne 1 ] || ! awk -v value="$value" -v limit="$max_seconds" '
-    BEGIN {
-      remaining = value
-      total_ns = 0
-      components = 0
-      while (length(remaining) > 0) {
-        if (match(remaining, /^[0-9]+([.][0-9]+)?/) != 1) exit 1
-        number = substr(remaining, 1, RLENGTH) + 0
-        remaining = substr(remaining, RLENGTH + 1)
-        if (match(remaining, /^(ns|us|µs|ms|s|m|h)/) != 1) exit 1
-        unit = substr(remaining, 1, RLENGTH)
-        remaining = substr(remaining, RLENGTH + 1)
-        multiplier = 1
-        if (unit == "us" || unit == "µs") multiplier = 1000
-        else if (unit == "ms") multiplier = 1000000
-        else if (unit == "s") multiplier = 1000000000
-        else if (unit == "m") multiplier = 60000000000
-        else if (unit == "h") multiplier = 3600000000000
-        total_ns += number * multiplier
-        components++
-      }
-      limit_ns = (limit + 0) * 1000000000
-      # A 1ns literal is not credible elapsed-time evidence from this harness.
-      # One microsecond is the smallest accepted measurement quantum.
-      if (components == 0 || total_ns < 1000 || total_ns > limit_ns) exit 1
-      exit 0
-    }
-  '; then
+  count=$(grep -c "^${key}=" "$file" || true)
+  value=$(sed -n "s/^${key}=//p" "$file")
+  if [ "$count" -ne 1 ] || ! duration_within_bound "$value" "$max_seconds"; then
     printf 'receipt must contain exactly one measured %s duration within %ss\n' "$key" "$max_seconds" >&2
     exit 1
   fi

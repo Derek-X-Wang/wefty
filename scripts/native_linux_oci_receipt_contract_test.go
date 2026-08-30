@@ -131,22 +131,26 @@ func TestNativeLinuxOCIReceiptDistinguishesPRDeviationFromPublishedProof(t *test
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			receipt := filepath.Join(t.TempDir(), "native-linux-oci.txt")
-			if err := os.WriteFile(receipt, []byte(test.receipt), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			serviceReceipt := filepath.Join(t.TempDir(), "oci-service-publication-linux.txt")
-			if err := os.WriteFile(serviceReceipt, []byte(test.serviceReceipt), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			l1Receipt := filepath.Join(t.TempDir(), "oci-service-l1-agent-linux.txt")
-			if err := os.WriteFile(l1Receipt, []byte(test.l1Receipt), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			command := exec.Command("../scripts/check-native-linux-oci-receipt.sh", receipt, test.source, serviceReceipt, l1Receipt)
-			err := command.Run()
-			if (err == nil) != test.wantOK {
-				t.Fatalf("receipt gate error = %v, want success %t", err, test.wantOK)
+			for _, shell := range []string{"/bin/bash", "/bin/sh"} {
+				t.Run(filepath.Base(shell), func(t *testing.T) {
+					receipt := filepath.Join(t.TempDir(), "native-linux-oci.txt")
+					if err := os.WriteFile(receipt, []byte(test.receipt), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					serviceReceipt := filepath.Join(t.TempDir(), "oci-service-publication-linux.txt")
+					if err := os.WriteFile(serviceReceipt, []byte(test.serviceReceipt), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					l1Receipt := filepath.Join(t.TempDir(), "oci-service-l1-agent-linux.txt")
+					if err := os.WriteFile(l1Receipt, []byte(test.l1Receipt), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					command := exec.Command(shell, "../scripts/check-native-linux-oci-receipt.sh", receipt, test.source, serviceReceipt, l1Receipt)
+					err := command.Run()
+					if (err == nil) != test.wantOK {
+						t.Fatalf("%s receipt gate error = %v, want success %t", shell, err, test.wantOK)
+					}
+				})
 			}
 		})
 	}
