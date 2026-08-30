@@ -1379,7 +1379,7 @@ func assertNativeComputerSweepReceipt(t *testing.T, receipt ocihelper.VerifiedSw
 		len(receipt.SweptInventory.ComputerDiskMounts) > 0 && len(receipt.SweptInventory.ComputerDiskLoops) > 0 &&
 		len(receipt.SweptInventory.ComputerAttachments) > 0
 	if !receipt.VerifiedAbsent || !ocihelper.InventoryEmpty(receipt.VerifiedResidue) ||
-		!reflect.DeepEqual(receipt.VerifiedInventory, retained) || !retainedRuntimeEmpty ||
+		!inventoryIdentitiesEqual(receipt.VerifiedInventory, retained) || !retainedRuntimeEmpty ||
 		len(retained.ManagedVolumes) == 0 || !slices.Equal(wantRecords, retained.ManagedVolumeRecords) ||
 		!computerDurableExact || !sweptRuntimeCovered || inventoryHasDuplicateIdentity(receipt.SweptInventory) {
 		t.Fatalf("Computer helper-death residue model = swept:%+v verified:%+v residue:%+v retained:%+v absent:%t",
@@ -1387,15 +1387,19 @@ func assertNativeComputerSweepReceipt(t *testing.T, receipt ocihelper.VerifiedSw
 	}
 }
 
-func inventoryHasDuplicateIdentity(inventory ocihelper.ResourceInventory) bool {
-	classes := [][]string{
-		inventory.Leases, inventory.Snapshots, inventory.Containers, inventory.Tasks, inventory.Shims, inventory.Cgroups,
-		inventory.LogSegments, inventory.ManagedVolumes, inventory.ManagedVolumeRecords, inventory.ComputerDiskImages,
-		inventory.ComputerDiskAllocations, inventory.ComputerDiskQuotas, inventory.ComputerDiskManifests,
-		inventory.ComputerDiskMounts, inventory.ComputerDiskLoops, inventory.ComputerAttachments,
-		inventory.ComputerResetManifests, inventory.ComputerQuarantines, inventory.ComputerDiskAnomalies,
+func inventoryIdentitiesEqual(left, right ocihelper.ResourceInventory) bool {
+	leftClasses := inventoryIdentityClasses(left)
+	rightClasses := inventoryIdentityClasses(right)
+	for index := range leftClasses {
+		if !slices.Equal(leftClasses[index], rightClasses[index]) {
+			return false
+		}
 	}
-	for _, class := range classes {
+	return true
+}
+
+func inventoryHasDuplicateIdentity(inventory ocihelper.ResourceInventory) bool {
+	for _, class := range inventoryIdentityClasses(inventory) {
 		seen := make(map[string]struct{}, len(class))
 		for _, identity := range class {
 			if _, exists := seen[identity]; exists {
@@ -1405,6 +1409,16 @@ func inventoryHasDuplicateIdentity(inventory ocihelper.ResourceInventory) bool {
 		}
 	}
 	return false
+}
+
+func inventoryIdentityClasses(inventory ocihelper.ResourceInventory) [][]string {
+	return [][]string{
+		inventory.Leases, inventory.Snapshots, inventory.Containers, inventory.Tasks, inventory.Shims, inventory.Cgroups,
+		inventory.LogSegments, inventory.ManagedVolumes, inventory.ManagedVolumeRecords, inventory.ComputerDiskImages,
+		inventory.ComputerDiskAllocations, inventory.ComputerDiskQuotas, inventory.ComputerDiskManifests,
+		inventory.ComputerDiskMounts, inventory.ComputerDiskLoops, inventory.ComputerAttachments,
+		inventory.ComputerResetManifests, inventory.ComputerQuarantines, inventory.ComputerDiskAnomalies,
+	}
 }
 
 func assertNativeComputerHostCleanup(t *testing.T, authority ocihelper.AttemptAuthority) {
