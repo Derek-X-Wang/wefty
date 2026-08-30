@@ -19,10 +19,18 @@ jobs:
             driver: vz
             mount-type: virtiofs
             archive-arch: arm64
+            guest-image-location: https://cloud-images.ubuntu.com/releases/resolute/release-20260720/ubuntu-26.04-server-cloudimg-arm64.img
+            guest-image-arch: aarch64
+            guest-image-digest: sha256:7bcf159e29ad0000bfed9c57875908c39268f5ed1257f4958fa6a9f5f60edd54
+            install-qemu: "false"
           - runner: macos-26-intel
             driver: qemu
             mount-type: 9p
             archive-arch: amd64
+            guest-image-location: https://cloud-images.ubuntu.com/releases/resolute/release-20260720/ubuntu-26.04-server-cloudimg-amd64.img
+            guest-image-arch: x86_64
+            guest-image-digest: sha256:117816726abbdefc5ef3e38902e81a76f1c76c3610e709999d0885f9d5d9b477
+            install-qemu: "true"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     env:
@@ -31,6 +39,10 @@ jobs:
       LIMA_DRIVER: ${{ matrix.driver }}
       LIMA_MOUNT_TYPE: ${{ matrix.mount-type }}
       ARCHIVE_ARCH: ${{ matrix.archive-arch }}
+      GUEST_IMAGE_LOCATION: ${{ matrix.guest-image-location }}
+      GUEST_IMAGE_ARCH: ${{ matrix.guest-image-arch }}
+      GUEST_IMAGE_DIGEST: ${{ matrix.guest-image-digest }}
+      INSTALL_QEMU: ${{ matrix.install-qemu }}
       CONTAINERD_VERSION: 2.3.4
       RUNC_VERSION: 1.5.1
     steps:
@@ -45,6 +57,9 @@ jobs:
           printf '%s\n' "$RUNNER_LABEL" > "$PROBE_ROOT/state/runner-label"
           printf '%s\n' "$LIMA_DRIVER" > "$PROBE_ROOT/state/driver"
           printf '%s\n' "$ARCHIVE_ARCH" > "$PROBE_ROOT/state/archive-arch"
+          printf '%s\n' "$GUEST_IMAGE_LOCATION" > "$PROBE_ROOT/state/requested-image-location"
+          printf '%s\n' "$GUEST_IMAGE_ARCH" > "$PROBE_ROOT/state/requested-image-arch"
+          printf '%s\n' "$GUEST_IMAGE_DIGEST" > "$PROBE_ROOT/state/requested-image-digest"
           printf '%s\n' "$(uname -m)" > "$PROBE_ROOT/state/host-arch"
           printf '%s\n' "$(sw_vers -productVersion)" > "$PROBE_ROOT/state/macos-version"
           printf '0\n' > "$PROBE_ROOT/state/initialize.status"
@@ -57,7 +72,10 @@ jobs:
           started="$(date +%s)"
           hv_support="$(sysctl -n kern.hv_support 2>/dev/null)"
           hv_rc=$?
+          hv_vmm_present="$(sysctl -n kern.hv_vmm_present 2>/dev/null)"
+          hv_vmm_rc=$?
           printf '%s\n' "${hv_support:-unavailable}" > "$PROBE_ROOT/state/host-hv-support"
+          printf '%s\n' "${hv_vmm_present:-unavailable}" > "$PROBE_ROOT/state/host-hv-vmm-present"
           sysctl -a 2>/dev/null | grep -E '(^kern\.hv_|machdep\.cpu\.(features|leaf7_features))' \
             > "$PROBE_ROOT/logs/host-virtualization.txt"
           rc=0
@@ -67,21 +85,27 @@ jobs:
           if [ "$hv_rc" -ne 0 ]; then
             printf '%s\n' 'unavailable' > "$PROBE_ROOT/state/host-hv-support"
           fi
+          if [ "$hv_vmm_rc" -ne 0 ]; then
+            printf '%s\n' 'unavailable' > "$PROBE_ROOT/state/host-hv-vmm-present"
+          fi
           exit 0
 
-      - name: Install Lima and timeout tooling with Homebrew
+      - name: Install Lima, QEMU when needed, and timeout tooling
         continue-on-error: true
         run: |
           set +e
           started="$(date +%s)"
-          /usr/bin/python3 - "$PROBE_ROOT/logs/brew-install.txt" <<'PY'
+          /usr/bin/python3 - "$PROBE_ROOT/logs/brew-install.txt" "$INSTALL_QEMU" <<'PY'
           import subprocess
           import sys
 
+          packages = ["lima", "coreutils"]
+          if sys.argv[2] == "true":
+              packages.append("qemu")
           with open(sys.argv[1], "wb") as log:
               try:
                   result = subprocess.run(
-                      ["brew", "install", "lima", "coreutils"],
+                      ["brew", "install", *packages],
                       stdout=log,
                       stderr=subprocess.STDOUT,
                       timeout=600,
@@ -91,17 +115,23 @@ jobs:
           raise SystemExit(result.returncode)
           PY
           rc=$?
-          elapsed=$(( $(date +%s) - started ))
-          printf '%s\n' "$rc" > "$PROBE_ROOT/state/install-lima.status"
-          printf '%s\n' "$elapsed" > "$PROBE_ROOT/state/install-lima.seconds"
           if command -v limactl >/dev/null 2>&1; then
             limactl --version > "$PROBE_ROOT/state/lima-version" 2>&1
           fi
           if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+            qemu-system-x86_64 --version | head -n 1 > "$PROBE_ROOT/state/qemu-version"
             qemu-system-x86_64 -accel help > "$PROBE_ROOT/logs/qemu-accelerators.txt" 2>&1
+          elif [ "$INSTALL_QEMU" = true ] && [ "$rc" -eq 0 ]; then
+            rc=69
+            printf '%s\n' 'Homebrew completed but qemu-system-x86_64 is unavailable' \
+              > "$PROBE_ROOT/logs/qemu-missing.txt"
           fi
+          elapsed=$(( $(date +%s) - started ))
+          printf '%s\n' "$rc" > "$PROBE_ROOT/state/install-lima.status"
+          printf '%s\n' "$elapsed" > "$PROBE_ROOT/state/install-lima.seconds"
           if [ "$rc" -ne 0 ]; then
-            tail -n 20 "$PROBE_ROOT/logs/brew-install.txt" > "$PROBE_ROOT/state/install-lima.reason"
+            { tail -n 20 "$PROBE_ROOT/logs/brew-install.txt" 2>/dev/null; cat "$PROBE_ROOT/logs/qemu-missing.txt" 2>/dev/null; } \
+              | tail -n 20 > "$PROBE_ROOT/state/install-lima.reason"
           fi
           exit 0
 
@@ -159,12 +189,32 @@ jobs:
             rc=69
             printf '%s\n' 'Lima installation did not succeed' > "$PROBE_ROOT/logs/lima-start.txt"
           else
-            gtimeout 10m limactl start --name="$PROBE_INSTANCE" --tty=false --timeout=8m \
-              --vm-type="$LIMA_DRIVER" --mount-type="$LIMA_MOUNT_TYPE" \
-              --cpus=2 --memory=4 --disk=20 --containerd=none \
-              --mount-only="$PROBE_ROOT" template:ubuntu \
-              > "$PROBE_ROOT/logs/lima-start.txt" 2>&1
-            rc=$?
+            /usr/bin/python3 - "$PROBE_ROOT/lima-probe.yaml" \
+              "$GUEST_IMAGE_LOCATION" "$GUEST_IMAGE_ARCH" "$GUEST_IMAGE_DIGEST" <<'PY'
+          import pathlib
+          import sys
+
+          pathlib.Path(sys.argv[1]).write_text(
+              "minimumLimaVersion: 2.0.0\n"
+              "images:\n"
+              f'  - location: "{sys.argv[2]}"\n'
+              f'    arch: "{sys.argv[3]}"\n'
+              f'    digest: "{sys.argv[4]}"\n'
+          )
+          PY
+            config_rc=$?
+            if [ "$config_rc" -ne 0 ]; then
+              rc=$config_rc
+              printf '%s\n' 'failed to write the pinned Lima image configuration' \
+                > "$PROBE_ROOT/logs/lima-start.txt"
+            else
+              gtimeout 10m limactl --debug start --name="$PROBE_INSTANCE" --tty=false --timeout=8m \
+                --vm-type="$LIMA_DRIVER" --mount-type="$LIMA_MOUNT_TYPE" \
+                --cpus=2 --memory=4 --disk=20 --containerd=none \
+                --mount-only="$PROBE_ROOT" "$PROBE_ROOT/lima-probe.yaml" \
+                > "$PROBE_ROOT/logs/lima-start.txt" 2>&1
+              rc=$?
+            fi
           fi
           elapsed=$(( $(date +%s) - started ))
           printf '%s\n' "$rc" > "$PROBE_ROOT/state/boot.status"
@@ -173,6 +223,85 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             tail -n 30 "$PROBE_ROOT/logs/lima-start.txt" > "$PROBE_ROOT/state/boot.reason"
           fi
+          exit 0
+
+      - name: Capture resolved Lima image and accelerator evidence
+        continue-on-error: true
+        run: |
+          set +e
+          started="$(date +%s)"
+          rc=0
+          instance_dir="${LIMA_HOME:-$HOME/.lima}/$PROBE_INSTANCE"
+          limactl list --json > "$PROBE_ROOT/logs/lima-list.json" 2>&1
+          list_rc=$?
+          if [ "$list_rc" -eq 0 ]; then
+            jq -rs --arg name "$PROBE_INSTANCE" --arg arch "$GUEST_IMAGE_ARCH" '
+              [.[] | select(.name == $name)][0].config.images[] | select(.arch == $arch)
+            ' "$PROBE_ROOT/logs/lima-list.json" > "$PROBE_ROOT/logs/resolved-image.json"
+            image_rc=$?
+            if [ "$image_rc" -eq 0 ] && [ "$(jq -r '.location // empty' "$PROBE_ROOT/logs/resolved-image.json")" != "" ]; then
+              jq -r .location "$PROBE_ROOT/logs/resolved-image.json" \
+                > "$PROBE_ROOT/state/resolved-image-location"
+              jq -r .arch "$PROBE_ROOT/logs/resolved-image.json" \
+                > "$PROBE_ROOT/state/resolved-image-arch"
+              jq -r '.digest // "unavailable"' "$PROBE_ROOT/logs/resolved-image.json" \
+                > "$PROBE_ROOT/state/resolved-image-digest"
+            else
+              rc=66
+              printf '%s\n' 'Lima did not report the pinned guest image' \
+                > "$PROBE_ROOT/state/capture-instance.reason"
+            fi
+          else
+            rc=$list_rc
+            printf '%s\n' 'limactl list could not resolve the created instance' \
+              > "$PROBE_ROOT/state/capture-instance.reason"
+          fi
+
+          if [ -d "$instance_dir" ]; then
+            for diagnostic in ha.stderr.log ha.stdout.log serial.log serialv.log; do
+              if [ -f "$instance_dir/$diagnostic" ]; then
+                cp "$instance_dir/$diagnostic" "$PROBE_ROOT/logs/instance-$diagnostic"
+              fi
+            done
+          fi
+
+          if [ "$LIMA_DRIVER" = qemu ]; then
+            qemu_command_log="$PROBE_ROOT/logs/qemu-command-line.txt"
+            qemu_pid="$(cat "$instance_dir/qemu.pid" 2>/dev/null)"
+            if [ -n "$qemu_pid" ]; then
+              ps -ww -p "$qemu_pid" -o command= > "$qemu_command_log" 2>/dev/null
+              command_rc=$?
+              if [ "$command_rc" -eq 0 ]; then
+                printf '%s\n' 'qemu.pid + ps' > "$PROBE_ROOT/state/qemu-command-source"
+              fi
+            else
+              command_rc=66
+            fi
+            if [ "$command_rc" -ne 0 ] || [ ! -s "$qemu_command_log" ]; then
+              awk '/qCmd.Args/{line=$0} END{if(line == "") exit 1; print line}' \
+                "$instance_dir/ha.stderr.log" > "$qemu_command_log" 2>/dev/null
+              command_rc=$?
+              if [ "$command_rc" -eq 0 ]; then
+                printf '%s\n' ha.stderr.log > "$PROBE_ROOT/state/qemu-command-source"
+              fi
+            fi
+            if [ "$command_rc" -eq 0 ] && \
+                grep -Eq -- '(^|[[:space:]"])(-accel[=[:space:]]+hvf|-machine[[:space:]][^[:space:]"]*accel=hvf)' \
+                  "$qemu_command_log"; then
+              printf '%s\n' hvf > "$PROBE_ROOT/state/accelerator"
+            else
+              if [ "$rc" -eq 0 ]; then rc=65; fi
+              printf '%s\n' unavailable > "$PROBE_ROOT/state/accelerator"
+              printf '%s\n' 'QEMU command line did not confirm the HVF accelerator' \
+                > "$PROBE_ROOT/state/capture-instance.reason"
+            fi
+          else
+            printf '%s\n' vz > "$PROBE_ROOT/state/accelerator"
+          fi
+
+          elapsed=$(( $(date +%s) - started ))
+          printf '%s\n' "$rc" > "$PROBE_ROOT/state/capture-instance.status"
+          printf '%s\n' "$elapsed" > "$PROBE_ROOT/state/capture-instance.seconds"
           exit 0
 
       - name: Inspect guest kernel, CPU, and nested virtualization
@@ -401,6 +530,7 @@ jobs:
               "install-lima",
               "download-image",
               "boot",
+              "capture-instance",
               "guest-inspection",
               "containerd",
               "echo",
@@ -410,6 +540,7 @@ jobs:
           failure_priority = [
               "install-lima",
               "boot",
+              "capture-instance",
               "guest-inspection",
               "containerd",
               "download-image",
@@ -431,7 +562,10 @@ jobs:
               "host_arch": read("host-arch", "unknown"),
               "macos_version": read("macos-version", "unknown"),
               "driver": read("driver", "unknown"),
+              "accelerator": read("accelerator", "unavailable"),
               "lima_version": read("lima-version", "unavailable"),
+              "qemu_version": read("qemu-version", "not-installed"),
+              "qemu_command_source": read("qemu-command-source", "unavailable"),
               "boot_seconds": seconds("boot"),
               "containerd_ok": status("containerd") == 0,
               "echo_ok": status("echo") == 0,
@@ -439,8 +573,19 @@ jobs:
               "per_phase_exit_status": {phase: status(phase) for phase in phases},
               "virtualization": {
                   "host_hv_support": read("host-hv-support", "unavailable"),
+                  "host_hv_vmm_present": read("host-hv-vmm-present", "unavailable"),
                   "guest_dev_kvm": read("guest-dev-kvm", "unavailable") == "true",
                   "guest_cpu_virtualization_flag": read("guest-cpu-virt-flag", "unavailable") == "true",
+              },
+              "resolved_guest_image": {
+                  "location": read("resolved-image-location", "unavailable"),
+                  "arch": read("resolved-image-arch", "unavailable"),
+                  "digest": read("resolved-image-digest", "unavailable"),
+              },
+              "requested_guest_image": {
+                  "location": read("requested-image-location", "unavailable"),
+                  "arch": read("requested-image-arch", "unavailable"),
+                  "digest": read("requested-image-digest", "unavailable"),
               },
               "acceptance_image": {
                   "source_run_id": read("acceptance-run-id", "unavailable"),
