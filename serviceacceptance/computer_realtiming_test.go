@@ -154,7 +154,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"disk_path": diskEvidence.Path, "disk_blocks_bytes": fmt.Sprint(diskEvidence.BlocksBytes)})
 
 	receipt.begin("linux.remote_takeover")
-	viewerIdentity := runComputerCLIPerson[l1.AuthenticatedPerson](t, harness, "linux-viewer", "linux-viewer-device", "whoami")
+	viewerIdentity := runComputerCLIPersonWithEvidence[l1.AuthenticatedPerson](t, evidence, "whoami-cli-viewer.json", harness, "linux-viewer", "linux-viewer-device", "whoami")
 	if viewerIdentity.FabricID != policy.Admins[0].FabricID || viewerIdentity.UserID != "linux-viewer" || viewerIdentity.DeviceID != "linux-viewer-device" {
 		t.Fatalf("viewer whoami observation = %#v", viewerIdentity)
 	}
@@ -648,48 +648,45 @@ type computerCLIEvidence struct {
 
 func runComputerCLIPersonWithEvidence[T any](t *testing.T, evidence *realTimingEvidence, evidenceName string, harness *acceptanceHarness, userID, deviceID string, arguments ...string) T {
 	t.Helper()
-	args := computerCLIArguments(harness, userID, deviceID, arguments...)
-	ctx, cancel := context.WithTimeout(t.Context(), 6*time.Minute)
-	defer cancel()
-	command := exec.CommandContext(ctx, weftyBinaryPath, args...)
-	var stdout, stderr bytes.Buffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
-	err := command.Run()
-	exitCode := 0
-	if err != nil {
-		exitCode = -1
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		}
-	}
-	evidence.recordJSON(evidenceName, computerCLIEvidence{
-		Arguments: append([]string(nil), arguments...), Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: exitCode,
-	})
-	if err != nil {
-		t.Fatalf("run Computer CLI %v: %v\nstdout:\n%s\nstderr:\n%s", arguments, err, stdout.String(), stderr.String())
-	}
-	var result T
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		t.Fatalf("decode Computer CLI %v: %v\n%s", arguments, err, stdout.String())
-	}
-	return result
+	return runComputerCLIWithIdentityObserved[T](t, harness, userID, deviceID, func(observation computerCLIEvidence) {
+		evidence.recordJSON(evidenceName, observation)
+	}, arguments...)
 }
 
 func runComputerCLIWithIdentity[T any](t *testing.T, harness *acceptanceHarness, userID, deviceID string, arguments ...string) T {
 	t.Helper()
-	args := computerCLIArguments(harness, userID, deviceID, arguments...)
+	return runComputerCLIWithIdentityObserved[T](t, harness, userID, deviceID, nil, arguments...)
+}
+
+func runComputerCLIWithIdentityObserved[T any](t *testing.T, harness *acceptanceHarness, userID, deviceID string, observe func(computerCLIEvidence), arguments ...string) T {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 6*time.Minute)
 	defer cancel()
-	command := exec.CommandContext(ctx, weftyBinaryPath, args...)
-	output, err := command.CombinedOutput()
+	command := exec.CommandContext(ctx, weftyBinaryPath, computerCLIArguments(harness, userID, deviceID, arguments...)...)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	if observe != nil {
+		exitCode := 0
+		if err != nil {
+			exitCode = -1
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				exitCode = exitErr.ExitCode()
+			}
+		}
+		observe(computerCLIEvidence{Arguments: append([]string(nil), arguments...), Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: exitCode})
+	}
 	if err != nil {
-		t.Fatalf("run Computer CLI %v: %v\n%s", arguments, err, output)
+		t.Fatalf("run Computer CLI %v: %v\nstdout:\n%s\nstderr:\n%s", arguments, err, stdout.String(), stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("run Computer CLI %v emitted unexpected stderr:\n%s", arguments, stderr.String())
 	}
 	var result T
-	if err := json.Unmarshal(output, &result); err != nil {
-		t.Fatalf("decode Computer CLI %v: %v\n%s", arguments, err, output)
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode Computer CLI %v: %v\n%s", arguments, err, stdout.String())
 	}
 	return result
 }

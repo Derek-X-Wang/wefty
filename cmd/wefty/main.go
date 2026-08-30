@@ -38,6 +38,14 @@ func commandExitCodeForArgs(err error, args []string) int {
 }
 
 func isTypedExitCLIArgs(args []string) bool {
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") {
+			if arg == "whoami" {
+				return true
+			}
+			break
+		}
+	}
 	if isComputerCLIArgs(args) {
 		return true
 	}
@@ -241,7 +249,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 }
 
 func usesPersonProtocol(args []string) bool {
-	return (len(args) == 1 && args[0] == "whoami") || requiresPersonCommand(args) ||
+	return (len(args) > 0 && args[0] == "whoami") || requiresPersonCommand(args) ||
 		(len(args) > 1 && args[0] == "services" && args[1] == "submission")
 }
 

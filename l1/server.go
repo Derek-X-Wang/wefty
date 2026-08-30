@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"slices"
@@ -72,6 +73,8 @@ type Server struct {
 	computerTokenRevoker    ComputerTokenRevoker
 	runLedgerNodeID         string
 	handler                 http.Handler
+	reconcile               func(context.Context) (ReconcileResult, error)
+	logf                    func(string, ...any)
 }
 
 func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, error) {
@@ -129,6 +132,8 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 		computerPolicyWatchWait: policyWatchWait,
 		computerTokenRevoker:    config.ComputerTokenRevoker,
 		runLedgerNodeID:         runLedgerNodeID,
+		reconcile:               store.Reconcile,
+		logf:                    log.Printf,
 	}
 	s.handler = s.routes()
 	return s, nil
@@ -160,8 +165,8 @@ func (s *Server) ListenAndServe(ctx context.Context, network, address string) er
 
 // Serve runs the L1 HTTP protocols on an already-created Fabric listener.
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
-	if _, err := s.store.Reconcile(ctx); err != nil {
-		if ctx.Err() != nil {
+	if _, err := s.reconcile(ctx); err != nil {
+		if reconciliationCanceledByShutdown(ctx, err) {
 			return nil
 		}
 		return fmt.Errorf("l1: initial recovery: %w", err)
@@ -170,7 +175,9 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	reconcileFailures := make(chan error, 1)
 	reconcileContext, stopReconcile := context.WithCancel(ctx)
 	defer stopReconcile()
+	reconcileDone := make(chan struct{})
 	go func() {
+		defer close(reconcileDone)
 		ticker := time.NewTicker(s.reconcileInterval)
 		defer ticker.Stop()
 		for {
@@ -178,15 +185,17 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 			case <-reconcileContext.Done():
 				return
 			case <-ticker.C:
-				if _, err := s.store.Reconcile(reconcileContext); err != nil {
-					if suppressReconcileFailure(reconcileContext, err) {
+				if _, err := s.reconcile(reconcileContext); err != nil {
+					if reconciliationCanceledByShutdown(reconcileContext, err) {
 						return
 					}
-					select {
-					case reconcileFailures <- err:
-					case <-reconcileContext.Done():
-						return
+					if errors.Is(err, context.Canceled) && reconcileContext.Err() == nil {
+						if s.logf != nil {
+							s.logf("event=l1_reconcile_live_context_canceled action=continue error=%v", err)
+						}
+						continue
 					}
+					reconcileFailures <- err
 					_ = httpServer.Close()
 					return
 				}
@@ -204,9 +213,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	err := httpServer.Serve(listener)
 	stopReconcile()
 	close(stopped)
-	if ctx.Err() != nil {
-		return nil
-	}
+	<-reconcileDone
 	select {
 	case reconcileErr := <-reconcileFailures:
 		return fmt.Errorf("l1: reconcile failure state: %w", reconcileErr)
@@ -218,8 +225,8 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	return err
 }
 
-func suppressReconcileFailure(ctx context.Context, err error) bool {
-	return ctx.Err() != nil || errors.Is(err, context.Canceled)
+func reconciliationCanceledByShutdown(ctx context.Context, err error) bool {
+	return ctx.Err() != nil && errors.Is(err, ctx.Err())
 }
 
 type principal int

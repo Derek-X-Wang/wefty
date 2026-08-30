@@ -21,14 +21,98 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 )
 
-func TestServeShutdownDoesNotPromoteCanceledReconciliation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if !suppressReconcileFailure(ctx, internalError(context.Canceled, "read service log retention applicability")) {
-		t.Fatal("shutdown cancellation was promoted to an L1 reconcile failure")
+func TestServeReportsReconcileFailureRacingShutdown(t *testing.T) {
+	network := plain.NewNetwork()
+	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
+	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if suppressReconcileFailure(context.Background(), errors.New("durable reconcile failure")) {
-		t.Fatal("live durable reconcile failure was suppressed")
+	defer store.Close()
+	server, err := NewServer(serverFabric, store, ServerConfig{ReconcileInterval: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	durableFailure := errors.New("SQLITE_CORRUPT")
+	calls := 0
+	server.reconcile = func(ctx context.Context) (ReconcileResult, error) {
+		calls++
+		if calls == 1 {
+			return store.Reconcile(ctx)
+		}
+		close(entered)
+		<-release
+		return ReconcileResult{}, internalError(durableFailure, "resume removal after attestation crash")
+	}
+	listener, err := serverFabric.Listen("tcp", "wefty://control-plane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, listener) }()
+	<-entered
+	cancel()
+	close(release)
+	serveErr := <-done
+	if serveErr == nil || !errors.Is(serveErr, durableFailure) ||
+		!strings.Contains(serveErr.Error(), "resume removal after attestation crash") {
+		t.Fatalf("Serve shutdown race = %v, want durable reconcile failure", serveErr)
+	}
+}
+
+func TestServeContinuesAfterCanceledReconcileErrorUnderLiveContext(t *testing.T) {
+	network := plain.NewNetwork()
+	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
+	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := NewServer(serverFabric, store, ServerConfig{ReconcileInterval: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	continued := make(chan struct{})
+	calls := 0
+	server.reconcile = func(ctx context.Context) (ReconcileResult, error) {
+		calls++
+		switch calls {
+		case 1:
+			return store.Reconcile(ctx)
+		case 2:
+			return ReconcileResult{}, internalError(context.Canceled, "read service log retention applicability")
+		default:
+			select {
+			case <-continued:
+			default:
+				close(continued)
+			}
+			return store.Reconcile(ctx)
+		}
+	}
+	var logs bytes.Buffer
+	server.logf = func(format string, args ...any) { fmt.Fprintf(&logs, format, args...) }
+	listener, err := serverFabric.Listen("tcp", "wefty://control-plane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, listener) }()
+	select {
+	case <-continued:
+	case <-time.After(time.Second):
+		t.Fatal("reconciliation did not resume after a live-context cancellation")
+	}
+	if !strings.Contains(logs.String(), "event=l1_reconcile_live_context_canceled") {
+		t.Fatalf("live-context cancellation log = %q", logs.String())
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Serve shutdown after recovered reconciliation = %v", err)
 	}
 }
 

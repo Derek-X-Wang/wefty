@@ -1554,10 +1554,11 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		body.Port = port
 		body.CgroupID = attempt.cgroupID
-		if err := writeSuccess(wire, struct{}{}); err != nil || !readStreamAcknowledgement(operation.conn) {
-			return
+		stream := &attemptPortOperationStream{operationStream: &operationStream{Conn: operation.conn, cancel: operation.cancel}, wire: wire}
+		err := server.engine.DialAttemptPort(operation.ctx, body, stream)
+		if err != nil && !stream.ready {
+			_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, err)
 		}
-		_ = server.engine.DialAttemptPort(operation.ctx, body, &operationStream{Conn: operation.conn, cancel: operation.cancel})
 	case MethodDialHostBridge:
 		var body DialHostBridgeRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1575,6 +1576,32 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 	default:
 		_ = writeFailure(wire, CodeUnsupportedOperation, "unknown OCI helper method")
 	}
+}
+
+// attemptPortOperationStream withholds the RPC success frame until the engine
+// has connected the attempt backend and emits its ready marker. A refused
+// payload listener therefore remains a typed, attempt-scoped engine error
+// instead of looking like helper-stream EOF and invalidating the whole session.
+type attemptPortOperationStream struct {
+	*operationStream
+	wire  *framedConn
+	ready bool
+}
+
+func (stream *attemptPortOperationStream) Write(payload []byte) (int, error) {
+	if !stream.ready {
+		if len(payload) == 0 || payload[0] != attemptPortBackendReady {
+			return 0, errors.New("attempt-port stream omitted the backend-ready marker")
+		}
+		if err := writeSuccess(stream.wire, struct{}{}); err != nil {
+			return 0, err
+		}
+		if !readStreamAcknowledgement(stream.Conn) {
+			return 0, errors.New("attempt-port client did not acknowledge stream setup")
+		}
+		stream.ready = true
+	}
+	return stream.Conn.Write(payload)
 }
 
 func validComputerBackupRequest(backupID, copyID string, storage ComputerStorageReference, authority ComputerBackupAuthority, session *serverSession, requireJob bool) bool {
