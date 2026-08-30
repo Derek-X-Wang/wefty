@@ -279,7 +279,8 @@ jobs:
           echo_platforms="$RUNNER_TEMP/echo-platforms"
           mkdir -p "$echo_platforms"
           for arch in amd64 arm64; do
-            cp "$platforms/wefty-echo-service-platform-$arch-$CANDIDATE_SHA/$arch."* "$echo_platforms/"
+            cp "$platforms/wefty-echo-service-platform-$arch-$CANDIDATE_SHA/$arch."* \
+              "$platforms/wefty-echo-service-platform-$arch-$CANDIDATE_SHA/${arch}-"* "$echo_platforms/"
           done
           archive="$RUNNER_TEMP/wefty-echo-service.oci.tar"
           scripts/assemble-oci-index.sh --reference "$IMAGE_NAME" --output "$archive" \
@@ -342,7 +343,8 @@ jobs:
             platform_root="$RUNNER_TEMP/$prefix-platforms"
             mkdir -p "$platform_root"
             for arch in amd64 arm64; do
-              cp "$source_root/$artifact-platform-$arch-$CANDIDATE_SHA/$arch."* "$platform_root/"
+              cp "$source_root/$artifact-platform-$arch-$CANDIDATE_SHA/$arch."* \
+                "$source_root/$artifact-platform-$arch-$CANDIDATE_SHA/${arch}-"* "$platform_root/"
             done
             archive="$RUNNER_TEMP/$artifact.oci.tar"
             scripts/assemble-oci-index.sh --reference "$reference" --output "$archive" \

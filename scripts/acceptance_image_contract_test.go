@@ -229,6 +229,9 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if strings.Contains(packageText, "crane") || strings.Contains(packageText, "docker login") {
 		t.Fatal("PR release packaging must assemble build artifacts without a registry")
 	}
+	if strings.Count(packageText, `${arch}-"*`) != 2 {
+		t.Fatal("PR release packaging must copy hyphenated runtime evidence for echo and Computer artifacts")
+	}
 	scheduledText := string(scheduledBytes)
 	for _, required := range []string{"ref: refs/heads/main", "fetch-depth: 0", "git merge-base --is-ancestor", "git checkout --detach", "typed-skip: no successful acceptance-image publication exists", "acceptance-image-index-digest.txt", "$ECHO_REFERENCE@$ECHO_DIGEST", "wefty-computer-reference-", "WEFTY_OCI_COMPUTER_ARCHIVE", "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT", "wefty-computer-wayland-reference-", "WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE"} {
 		if !strings.Contains(scheduledText, required) {
