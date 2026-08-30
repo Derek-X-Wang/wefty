@@ -162,8 +162,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if _, ok := realtiming.On["pull_request"]; !ok {
 		t.Fatal("realtiming must expose the secretless pull_request lane")
 	}
-	if _, ok := realtiming.On["workflow_dispatch"]; !ok {
-		t.Fatal("realtiming must allow manual dispatch on a PR head")
+	if _, ok := realtiming.On["workflow_dispatch"]; ok {
+		t.Fatal("privileged realtiming must not expose an arbitrary-SHA manual dispatch path")
 	}
 	if !maps.Equal(realtiming.Permissions, map[string]string{"actions": "read", "contents": "read"}) {
 		t.Fatalf("realtiming permissions = %#v, want actions: read and contents: read only", realtiming.Permissions)
@@ -198,9 +198,9 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			t.Fatalf("shared main/PR realtiming contract is missing %q", required)
 		}
 	}
-	for _, required := range []string{"github.event_name == 'workflow_dispatch'", "ref: refs/heads/main", "fetch-depth: 0", "DISPATCH_REF: ${{ github.ref }}", "refs/heads/*", "git merge-base --is-ancestor"} {
-		if !strings.Contains(realtimeText, required) {
-			t.Fatalf("manual realtiming trust guard is missing %q", required)
+	for _, forbidden := range []string{"workflow_dispatch", "DISPATCH_REF", "DISPATCH_SHA", "manual-dispatch", "git merge-base --is-ancestor"} {
+		if strings.Contains(realtimeText, forbidden) {
+			t.Fatalf("privileged realtiming retains manual dispatch path %q", forbidden)
 		}
 	}
 	for workflowName, workflow := range map[string]workflowContract{"PR artifact build": build, "privileged realtiming": realtiming} {
@@ -226,6 +226,9 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	prBuild := realtiming.Jobs["build-pr-artifacts"]
 	if prBuild.Uses != "./.github/workflows/acceptance-image-build.yml" || prBuild.With["package_releases"] != true {
 		t.Fatalf("PR realtiming artifact build = uses %q with %#v", prBuild.Uses, prBuild.With)
+	}
+	if prBuild.If != "github.event_name == 'pull_request'" || prBuild.With["candidate_sha"] != "${{ github.event.pull_request.head.sha }}" || prBuild.With["source_repository"] != "${{ github.event.pull_request.head.repo.full_name }}" {
+		t.Fatalf("PR realtiming artifact source guard = if %q with %#v", prBuild.If, prBuild.With)
 	}
 	for _, sharedAnchor := range []string{"Provision pinned Linux OCI engine and probe", "Run service acceptance at production timings", "Capture Linux OCI service diagnostics", "Upload service acceptance evidence", "name: realtiming-result"} {
 		if strings.Count(realtimeText, sharedAnchor) != 1 {
