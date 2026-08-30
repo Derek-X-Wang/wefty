@@ -1222,9 +1222,14 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		case ManagedVolumeComputerDisk:
 			if body.ComputerStorage == nil || body.Removal == nil || !validCurrentRemovalAuthority(*body.Removal, session.identity) {
 				identityErr = errors.New("complete current-session Computer removal authority is required")
+			} else if body.QuarantineOnFailure && body.FailureAttempts < 1 {
+				identityErr = errors.New("Computer cleanup quarantine requires a positive bounded attempt count")
 			}
 		default:
 			identityErr = fmt.Errorf("managed volume kind %q cannot be deleted", body.Kind)
+		}
+		if body.Kind != ManagedVolumeComputerDisk && (body.QuarantineOnFailure || body.FailureAttempts != 0) {
+			identityErr = errors.New("cleanup quarantine evidence is closed to Computer disks")
 		}
 		if identityErr != nil {
 			_ = writeFailure(wire, CodeInvalidRequest, identityErr.Error())

@@ -83,14 +83,18 @@ The roles are fixed:
 
 ## `rfb-websocket-v1`
 
-Both named endpoints implement the same exact transport contract:
+Both image-side named endpoints implement the same request, subprotocol,
+binary-payload, and greeting contract:
 
 - WebSocket request path `/websockify`; query and fragment components are
   accepted and ignored, so viewer-added values such as `?token=` do not change
   routing.
 - Exactly negotiated `binary` WebSocket subprotocol.
-- RFB bytes in binary frames only; a text frame is rejected and closes the
-  connection.
+- RFB bytes in binary frames only. An image-side text-frame rejection is
+  conformant only when the read observes RFC 6455 `unsupported data` or
+  immediate EOF before the probe deadline; any other read failure is not
+  rejection evidence. A fresh connection must still return a valid RFB
+  greeting, proving that rejection did not crash the display bridge.
 - The first 12 payload bytes are an RFB version greeting of the form
   `RFB ddd.ddd\n`.
 
@@ -98,6 +102,14 @@ A TCP accept, an HTTP response without a WebSocket upgrade, a different path,
 a missing or different subprotocol, a text greeting, or an invalid/missing RFB
 banner is not readiness. Tenant-agent, framebuffer-content, browser, and
 desktop-health checks are deliberately outside this screen-door contract.
+
+The agent Fabric front door is a distinct admission surface over the same RFB
+stream. It closes client text frames with RFC 6455 `unsupported data`; EOF is
+not the portable front-door assertion. Before upgrade, authorization failures
+are typed JSON. When the CLI presents L1 policy revision `N` and the hosting
+agent has installed an older revision, the front door returns HTTP 403 with
+retryable `stale_policy_revision`; an installed-current permanent denial is
+non-retryable `control_not_authorized`.
 
 ## Atomic readiness
 

@@ -84,6 +84,10 @@ func (controller *storageResetController) retirePredecessor(ctx context.Context,
 			BootSessionID: controller.bootSessionID, JobID: directive.JobID,
 			RemovalGeneration: generation, CleanupFence: directive.CleanupFence},
 	}); err != nil {
+		if acknowledgement, quarantined := storageCleanupQuarantineAcknowledgement(err, directive.RootInstanceID); quarantined {
+			_, acknowledgementErr := controller.client.AcknowledgeComputerStorageRetirement(ctx, directive.ComputerID, acknowledgement)
+			return errors.Join(err, acknowledgementErr)
+		}
 		return fmt.Errorf("delete reset predecessor through shared removal machinery: %w", err)
 	}
 	manifest := workloadrunner.RuntimeResourceManifest{

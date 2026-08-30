@@ -68,7 +68,7 @@ type agentSession struct {
 	serviceReaps      map[string]runtimeReapOutcome
 	serviceBoots      map[string]string
 	residentChanged   chan struct{}
-	reapPriorBoot     func(context.Context, string) (workloadrunner.ReapReceipt, error)
+	reapPriorBoot     func(context.Context, string, string) (workloadrunner.ReapReceipt, error)
 	removals          *removalController
 	storageResets     *storageResetController
 	storageGrows      *storageGrowController
@@ -1198,7 +1198,7 @@ func (session *agentSession) claim(
 	return claim, true, nil
 }
 
-func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID string) (workloadrunner.ReapReceipt, error) {
+func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID, kind string) (workloadrunner.ReapReceipt, error) {
 	for {
 		session.claimMu.Lock()
 		resident, active := session.resident[jobID]
@@ -1207,6 +1207,10 @@ func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID st
 			if resident.class != contract.JobClassService {
 				session.claimMu.Unlock()
 				return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: removal target %q is not a resident service", jobID)
+			}
+			if resident.kind != kind {
+				session.claimMu.Unlock()
+				return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: removal target %q kind changed from %q to %q", jobID, resident.kind, kind)
 			}
 			resident.cancel(errServiceRemovalRequested)
 			done := resident.done
@@ -1237,7 +1241,7 @@ func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID st
 			if serviceBoot == session.registration.BootSessionID || priorBootReap == nil {
 				return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: service %q has no runtime reap receipt", jobID)
 			}
-			receipt, err := priorBootReap(ctx, jobID)
+			receipt, err := priorBootReap(ctx, jobID, kind)
 			return verifiedRuntimeReap(jobID, runtimeReapOutcome{receipt: receipt, err: err})
 		}
 		changed := session.residentChanged

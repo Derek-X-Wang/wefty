@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
@@ -275,7 +277,7 @@ func executeComputerTakeoverAction(
 			return &takeoverActionError{APIError: contract.APIError{Code: contract.ErrorPassUnavailable,
 				Message: "Computer display is not ready; retry after services status reports a display endpoint", Retryable: true}}
 		}
-		session, err := takeover.Open(ctx, clients.fabric, *availability.DisplayEndpoint)
+		session, err := openTakeoverViewWithPolicyRetry(ctx, clients.fabric, *availability.DisplayEndpoint, availability.PolicyRevision)
 		if err != nil {
 			return err
 		}
@@ -305,6 +307,45 @@ func executeComputerTakeoverAction(
 		return err
 	}
 	return writeComputerControlReceipt(stdout, receipt, jsonOutput)
+}
+
+const (
+	// The durable L1 mutation can briefly lead the hosting agent's policy
+	// installation. Admission retries only the typed stale-policy refusal and
+	// never extends the caller's larger command deadline.
+	takeoverPolicyInstallRetryWindow   = 2 * time.Second
+	takeoverPolicyInstallRetryInterval = 100 * time.Millisecond
+)
+
+type takeoverViewOpen func(context.Context) (*takeover.Session, error)
+
+func openTakeoverViewWithPolicyRetry(ctx context.Context, participant fabric.Fabric, endpoint string, policyRevision int64) (*takeover.Session, error) {
+	return retryTakeoverViewPolicyInstallation(ctx, takeoverPolicyInstallRetryWindow, takeoverPolicyInstallRetryInterval,
+		func(openContext context.Context) (*takeover.Session, error) {
+			return takeover.OpenAtPolicyRevision(openContext, participant, endpoint, policyRevision)
+		})
+}
+
+func retryTakeoverViewPolicyInstallation(ctx context.Context, window, interval time.Duration, open takeoverViewOpen) (*takeover.Session, error) {
+	retryContext, cancel := context.WithTimeout(ctx, window)
+	defer cancel()
+	for {
+		session, err := open(retryContext)
+		if err == nil {
+			return session, nil
+		}
+		var actionErr *takeover.ActionError
+		if !errors.As(err, &actionErr) || actionErr.APIError.Code != contract.ErrorStalePolicyRevision || !actionErr.APIError.Retryable {
+			return nil, err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-retryContext.Done():
+			timer.Stop()
+			return nil, err
+		case <-timer.C:
+		}
+	}
 }
 
 func readTakeoverSessionCapability(path string) (takeoverSessionCapability, error) {

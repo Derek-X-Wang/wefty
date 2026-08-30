@@ -371,6 +371,64 @@ func TestAdapterRequiresPositiveDeleteReceipt(t *testing.T) {
 	}
 }
 
+func TestReferenceComputerCleanupReapsBeforeDiskFinalization(t *testing.T) {
+	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}, requireReapBeforeVolumeDelete: true}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
+	if _, err := adapter.Run(t.Context(), request, nil); err != nil {
+		t.Fatal(err)
+	}
+	storage := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 1}
+	finalize := workloadrunner.ManagedVolumeFinalizationRequest{Authority: request.Authority,
+		Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
+		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: request.Authority.NodeID, BootSessionID: request.Authority.BootSessionID,
+			JobID: request.Authority.JobID, RemovalGeneration: 1, CleanupFence: "cleanup"}}
+	if err := adapter.FinalizeManagedVolumes(t.Context(), finalize); err == nil {
+		t.Fatal("attached Computer disk deletion unexpectedly succeeded")
+	} else {
+		var rpcErr *ocihelper.RPCError
+		if !errors.As(err, &rpcErr) || rpcErr.EngineFailure == nil || rpcErr.EngineFailure.Operation != ocihelper.MethodDeleteVolume {
+			t.Fatalf("attached Computer disk refusal = %v, want typed DeleteManagedVolume failure", err)
+		}
+	}
+	receipt, err := adapter.ReapAndFinalizeManagedVolumes(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority}, finalize)
+	if err != nil || !receipt.RuntimeQuiesced || engine.runtimeDeletes != 1 || !engine.volumeDeleteBeforeReap {
+		t.Fatalf("ordered Computer cleanup = receipt=%+v runtimeDeletes=%d refusedBeforeReap=%t err=%v",
+			receipt, engine.runtimeDeletes, engine.volumeDeleteBeforeReap, err)
+	}
+}
+
+func TestManagedVolumeCleanupRetriesThenQuarantinesWithTypedEvidence(t *testing.T) {
+	finalization := func(authority workloadrunner.AttemptAuthority) workloadrunner.ManagedVolumeFinalizationRequest {
+		storage := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, IntentRevision: 2, DiskBytes: 4096}
+		return workloadrunner.ManagedVolumeFinalizationRequest{Authority: authority,
+			Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
+			Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID,
+				JobID: authority.JobID, RemovalGeneration: 2, CleanupFence: "cleanup"}}
+	}
+	t.Run("transient operation failure", func(t *testing.T) {
+		engine := &adapterTestEngine{volumeDeleteFailures: 2}
+		adapter, closeAdapter := startAdapterTestServer(t, engine)
+		defer closeAdapter()
+		if err := adapter.FinalizeManagedVolumes(t.Context(), finalization(adapterTestRequest().Authority)); err != nil || engine.volumeDeleteCalls != 3 {
+			t.Fatalf("bounded volume retry = calls=%d err=%v", engine.volumeDeleteCalls, err)
+		}
+	})
+	t.Run("exhausted operation failure", func(t *testing.T) {
+		engine := &adapterTestEngine{volumeDeleteFailures: 3}
+		adapter, closeAdapter := startAdapterTestServer(t, engine)
+		defer closeAdapter()
+		err := adapter.FinalizeManagedVolumes(t.Context(), finalization(adapterTestRequest().Authority))
+		var quarantined *workloadrunner.ManagedVolumeCleanupQuarantinedError
+		if !errors.As(err, &quarantined) || quarantined.Receipt.Kind != "managed_volume_cleanup_quarantined" ||
+			quarantined.Receipt.FailureReason != string(ocihelper.EngineFailureOperationFailed) || quarantined.Receipt.Attempts != 3 || engine.volumeDeleteCalls != 3 {
+			t.Fatalf("quarantined cleanup = calls=%d err=%#v", engine.volumeDeleteCalls, err)
+		}
+	})
+}
+
 func TestAdapterConsumesMatchingPriorBootSweepEvidenceOnce(t *testing.T) {
 	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
 		SweepEpoch: "sweep-1", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-1", SessionGeneration: 7},
@@ -385,6 +443,32 @@ func TestAdapterConsumesMatchingPriorBootSweepEvidenceOnce(t *testing.T) {
 	}
 	if _, err := adapter.ReapPriorBoot(t.Context(), request); !errors.Is(err, workloadrunner.ErrPriorBootEvidenceUnavailable) {
 		t.Fatalf("reused sweep receipt error = %v", err)
+	}
+}
+
+func TestAdapterUsesVerifiedPriorBootNamespaceSweepAfterAttemptWasAlreadyReaped(t *testing.T) {
+	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
+		SweepEpoch: "sweep-empty", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-1", SessionGeneration: 8},
+		VerifiedAbsent: true, PriorBootSessionsSeen: []string{"boot-old"},
+	}}
+	adapter := NewAdapter(source)
+	request := workloadrunner.PriorBootReapRequest{NodeID: "node", JobID: "job", PriorBootSessionID: "boot-old", CurrentBootSessionID: "boot-new"}
+	receipt, err := adapter.ReapPriorBoot(t.Context(), request)
+	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidencePriorBootOCISweep ||
+		receipt.SweepEpoch != "sweep-empty" || receipt.HelperGeneration != 8 {
+		t.Fatalf("empty prior-boot namespace receipt=%+v err=%v", receipt, err)
+	}
+}
+
+func TestAdapterRejectsUnboundVerifiedPriorBootNamespaceSweep(t *testing.T) {
+	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
+		SweepEpoch: "sweep-unbound", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-1", SessionGeneration: 9},
+		VerifiedAbsent: true, PriorBootSessionsSeen: []string{"another-boot"},
+	}}
+	adapter := NewAdapter(source)
+	request := workloadrunner.PriorBootReapRequest{NodeID: "node", JobID: "job", PriorBootSessionID: "boot-old", CurrentBootSessionID: "boot-new"}
+	if _, err := adapter.ReapPriorBoot(t.Context(), request); !errors.Is(err, workloadrunner.ErrPriorBootEvidenceUnavailable) {
+		t.Fatalf("unbound prior-boot sweep error = %v", err)
 	}
 }
 
@@ -1299,40 +1383,44 @@ func TestServiceRestartRejectsChangedProbePlatformWithoutMutatingFirstBinding(t 
 }
 
 type adapterTestEngine struct {
-	mu                    sync.Mutex
-	watch                 ocihelper.WatchResponse
-	deletes               int
-	runtimeDeletes        int
-	refuseDelete          bool
-	runErr                error
-	startedAt             time.Time
-	ensureErrors          []error
-	ensureCalls           int
-	responseDigest        string
-	responsePlatform      ocihelper.OCIPlatform
-	ensureEntered         chan struct{}
-	releaseEnsure         chan struct{}
-	lastRun               ocihelper.RunRequest
-	lastEnsure            ocihelper.EnsureImageRequest
-	bridgeExchange        chan error
-	missingUntilEnsure    bool
-	reconcileCalls        int
-	watchSignals          chan ocihelper.Signal
-	ignoreTERM            bool
-	ignoreKILL            bool
-	exitOnKillRace        bool
-	killAlreadyTerminated bool
-	releaseDelay          time.Duration
-	blockSignal           bool
-	signals               []ocihelper.Signal
-	watchErrorOnCancel    bool
-	inventoryRemoval      ocihelper.InventoryRemovalResponse
-	inventoryErr          error
-	attestRemoval         ocihelper.AttestRemovalResponse
-	attestErr             error
-	doctorPlatform        ocihelper.OCIPlatform
-	doctorErr             error
-	doctorCalls           int
+	mu                            sync.Mutex
+	watch                         ocihelper.WatchResponse
+	deletes                       int
+	runtimeDeletes                int
+	refuseDelete                  bool
+	runErr                        error
+	startedAt                     time.Time
+	ensureErrors                  []error
+	ensureCalls                   int
+	responseDigest                string
+	responsePlatform              ocihelper.OCIPlatform
+	ensureEntered                 chan struct{}
+	releaseEnsure                 chan struct{}
+	lastRun                       ocihelper.RunRequest
+	lastEnsure                    ocihelper.EnsureImageRequest
+	bridgeExchange                chan error
+	missingUntilEnsure            bool
+	reconcileCalls                int
+	watchSignals                  chan ocihelper.Signal
+	ignoreTERM                    bool
+	ignoreKILL                    bool
+	exitOnKillRace                bool
+	killAlreadyTerminated         bool
+	releaseDelay                  time.Duration
+	blockSignal                   bool
+	signals                       []ocihelper.Signal
+	watchErrorOnCancel            bool
+	inventoryRemoval              ocihelper.InventoryRemovalResponse
+	inventoryErr                  error
+	attestRemoval                 ocihelper.AttestRemovalResponse
+	attestErr                     error
+	doctorPlatform                ocihelper.OCIPlatform
+	doctorErr                     error
+	doctorCalls                   int
+	requireReapBeforeVolumeDelete bool
+	volumeDeleteBeforeReap        bool
+	volumeDeleteFailures          int
+	volumeDeleteCalls             int
 }
 
 func (engine *adapterTestEngine) DoctorStatus(context.Context) (ocihelper.DoctorStatus, error) {
@@ -1498,7 +1586,25 @@ func (engine *adapterTestEngine) Delete(context.Context, ocihelper.DeleteRequest
 	engine.mu.Unlock()
 	return ocihelper.DeleteResponse{Deleted: !engine.refuseDelete}, nil
 }
-func (*adapterTestEngine) DeleteManagedVolume(context.Context, ocihelper.DeleteManagedVolumeRequest) (ocihelper.DeleteManagedVolumeResponse, error) {
+
+func (engine *adapterTestEngine) DeleteManagedVolume(_ context.Context, request ocihelper.DeleteManagedVolumeRequest) (ocihelper.DeleteManagedVolumeResponse, error) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.volumeDeleteCalls++
+	if engine.requireReapBeforeVolumeDelete && engine.runtimeDeletes == 0 {
+		engine.volumeDeleteBeforeReap = true
+		return ocihelper.DeleteManagedVolumeResponse{}, errors.New("Computer disk remains mounted during deletion")
+	}
+	if engine.volumeDeleteCalls <= engine.volumeDeleteFailures {
+		if request.QuarantineOnFailure {
+			return ocihelper.DeleteManagedVolumeResponse{Quarantine: &ocihelper.ManagedVolumeQuarantineReceipt{
+				Kind: "managed_volume_cleanup_quarantined", ReceiptID: "quarantine-receipt", VolumeKind: request.Kind,
+				ComputerStorage: *request.ComputerStorage, Removal: *request.Removal,
+				FailureReason: ocihelper.EngineFailureOperationFailed, Attempts: request.FailureAttempts,
+			}}, nil
+		}
+		return ocihelper.DeleteManagedVolumeResponse{}, errors.New("loop remained attached")
+	}
 	return ocihelper.DeleteManagedVolumeResponse{Deleted: true}, nil
 }
 func (engine *adapterTestEngine) InventoryRemoval(context.Context, ocihelper.InventoryRemovalRequest) (ocihelper.InventoryRemovalResponse, error) {

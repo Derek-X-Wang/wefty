@@ -798,10 +798,12 @@ type DeleteResponse struct {
 // DeleteManagedVolumeRequest names durable helper-owned state independently
 // from an attempt. OwnerKey is an opaque stable handoff-owner identity.
 type DeleteManagedVolumeRequest struct {
-	Kind            ManagedVolumeKind              `json:"kind"`
-	OwnerKey        string                         `json:"owner_key"`
-	ComputerStorage *ComputerStorageReference      `json:"computer_storage,omitempty"`
-	Removal         *ManagedVolumeRemovalAuthority `json:"removal,omitempty"`
+	Kind                ManagedVolumeKind              `json:"kind"`
+	OwnerKey            string                         `json:"owner_key"`
+	ComputerStorage     *ComputerStorageReference      `json:"computer_storage,omitempty"`
+	Removal             *ManagedVolumeRemovalAuthority `json:"removal,omitempty"`
+	QuarantineOnFailure bool                           `json:"quarantine_on_failure,omitempty"`
+	FailureAttempts     int                            `json:"failure_attempts,omitempty"`
 }
 
 type ManagedVolumeRemovalAuthority struct {
@@ -813,7 +815,18 @@ type ManagedVolumeRemovalAuthority struct {
 }
 
 type DeleteManagedVolumeResponse struct {
-	Deleted bool `json:"deleted"`
+	Deleted    bool                            `json:"deleted"`
+	Quarantine *ManagedVolumeQuarantineReceipt `json:"quarantine,omitempty"`
+}
+
+type ManagedVolumeQuarantineReceipt struct {
+	Kind            string                        `json:"kind"`
+	ReceiptID       string                        `json:"receipt_id"`
+	VolumeKind      ManagedVolumeKind             `json:"volume_kind"`
+	ComputerStorage ComputerStorageReference      `json:"computer_storage"`
+	Removal         ManagedVolumeRemovalAuthority `json:"removal"`
+	FailureReason   EngineFailureReason           `json:"failure_reason"`
+	Attempts        int                           `json:"attempts"`
 }
 
 // RemovalResourceClass is the helper inventory registry used for compound

@@ -1,6 +1,7 @@
 package l1
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -457,7 +458,7 @@ func (s *Store) ListNodeComputerStorageCopyDirectives(ctx context.Context, ident
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+storageCopyColumns+` FROM computer_storage_copy_operations
-		WHERE bound_node_id=? AND status IN ('reserved', 'prepared', 'published')
+		WHERE bound_node_id=? AND status IN ('reserved', 'prepared', 'published') AND cleanup_quarantine_json IS NULL
 		AND (operation IN ('clone', 'import') OR authority_revoked_ns IS NOT NULL)
 		AND (operation, destination_computer_id, operation_revision) IN (
 			SELECT CASE reconfiguration_phase WHEN 'cloning' THEN 'clone' WHEN 'importing' THEN 'import' ELSE 'restore' END,
@@ -919,6 +920,43 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 		request.RootInstanceID != row.RootInstanceID || request.CleanupFence != row.CleanupFence ||
 		request.RemovalGeneration != uint64(row.OperationRevision) {
 		return Computer{}, protocolError(contract.ErrorStaleFence, "Computer restore retirement authority does not match")
+	}
+	if request.CleanupQuarantine != nil {
+		if row.Status != "published" {
+			return Computer{}, protocolError(contract.ErrorStaleIntentRevision, "restore cleanup quarantine is not awaiting predecessor retirement")
+		}
+		if err := validateComputerStorageCleanupQuarantine(*request.CleanupQuarantine, computerID, row.DestinationStorageID,
+			row.OldGeneration, row.BoundNodeID, request.BootSessionID, row.JobID, request.RemovalGeneration, row.CleanupFence); err != nil {
+			return Computer{}, err
+		}
+		payload, err := json.Marshal(request.CleanupQuarantine)
+		if err != nil {
+			return Computer{}, internalError(err, "encode restore cleanup quarantine")
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET cleanup_quarantine_json=?
+			WHERE destination_computer_id=? AND operation_revision=? AND cleanup_quarantine_json IS NULL`, payload, computerID, row.OperationRevision)
+		if err != nil {
+			return Computer{}, internalError(err, "record restore cleanup quarantine")
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return Computer{}, internalError(err, "inspect restore cleanup quarantine")
+		} else if affected == 0 {
+			var existing []byte
+			if err := tx.QueryRowContext(ctx, `SELECT cleanup_quarantine_json FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?`, computerID, row.OperationRevision).Scan(&existing); err != nil {
+				return Computer{}, internalError(err, "read restore cleanup quarantine replay")
+			}
+			if !bytes.Equal(existing, payload) {
+				return Computer{}, protocolError(contract.ErrorIdempotencyConflict, "restore cleanup quarantine replay differs from durable evidence")
+			}
+		}
+		computer, err := readComputerAuthority(ctx, tx, computerID, now)
+		if err != nil {
+			return Computer{}, internalError(err, "read quarantined restore cleanup")
+		}
+		if err := tx.Commit(); err != nil {
+			return Computer{}, internalError(err, "commit restore cleanup quarantine")
+		}
+		return computer, nil
 	}
 	if row.Status == "retired" {
 		var key, hash sql.NullString

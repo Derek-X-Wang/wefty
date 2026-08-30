@@ -34,17 +34,35 @@ type Session struct {
 }
 
 func Open(ctx context.Context, participant fabric.Fabric, endpoint string) (*Session, error) {
+	return OpenAtPolicyRevision(ctx, participant, endpoint, 0)
+}
+
+func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoint string, policyRevision int64) (*Session, error) {
 	parsed, err := parseEndpoint(endpoint)
 	if err != nil {
 		return nil, err
 	}
 	transport := transportFor(participant, parsed.Host)
+	header := http.Header{}
+	if policyRevision > 0 {
+		header.Set(contract.ComputerPolicyRevisionHeader, fmt.Sprint(policyRevision))
+	}
 	connection, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
 		HTTPClient:   &http.Client{Transport: transport},
+		HTTPHeader:   header,
 		Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol},
 	})
 	if err != nil {
 		transport.CloseIdleConnections()
+		if response != nil {
+			defer response.Body.Close()
+			body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+			var failure contract.ComputerControlErrorResponse
+			if readErr == nil && json.Unmarshal(body, &failure) == nil && failure.Error.Code != "" {
+				failure.Error.Message = fmt.Sprintf("%s (HTTP %d)", failure.Error.Message, response.StatusCode)
+				return nil, &ActionError{APIError: failure.Error, Receipt: failure.Receipt}
+			}
+		}
 		return nil, fmt.Errorf("open Computer view session: %w", err)
 	}
 	token := response.Header.Get(contract.ComputerControlTokenHeader)

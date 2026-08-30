@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -317,7 +318,17 @@ func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, reques
 	authorization, err := frontDoor.config.authorizer.AcquireGrant(frontDoor.config.computerID, identity)
 	if err != nil || authorization == nil {
 		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverUnauthorizedIdentity)
-		http.Error(writer, "Computer access is not authorized", http.StatusForbidden)
+		requestedRevision, revisionErr := strconv.ParseInt(request.Header.Get(contract.ComputerPolicyRevisionHeader), 10, 64)
+		installedRevision := frontDoor.config.authorizer.Revision()
+		if revisionErr == nil && requestedRevision > installedRevision {
+			writeComputerControlError(writer, http.StatusForbidden, contract.APIError{
+				Code: contract.ErrorStalePolicyRevision, Message: "Computer policy revision is not installed at the hosting agent", Retryable: true,
+				Details: map[string]any{"requested_policy_revision": requestedRevision, "installed_policy_revision": installedRevision},
+			}, nil)
+			return
+		}
+		writeComputerControlError(writer, http.StatusForbidden, contract.APIError{Code: contract.ErrorControlNotAuthorized,
+			Message: "Computer access is not authorized", Retryable: false}, nil)
 		return
 	}
 	frontDoor.serveAuthorized(writer, request, identity, authorization, admittedAt)

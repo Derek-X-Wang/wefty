@@ -36,6 +36,7 @@ type linuxComputerMatrixReceipt struct {
 	JobIDs               []string                               `json:"job_ids"`
 	AttemptIDs           []string                               `json:"attempt_ids"`
 	StorageIDs           []string                               `json:"storage_ids"`
+	TakeoverRetryStderr  []string                               `json:"takeover_policy_retry_stderr"`
 	ResidueInventories   map[string]ocihelper.ResourceInventory `json:"residue_inventories"`
 	Timings              map[string]string                      `json:"timings"`
 	Deviations           []linuxComputerDeviation               `json:"deviations"`

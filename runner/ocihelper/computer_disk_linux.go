@@ -145,6 +145,11 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 	if err != nil {
 		return nil, err
 	}
+	if quarantined, err := computerDiskCleanupQuarantined(engine.config.RuntimeRoot, name); err != nil {
+		return nil, err
+	} else if quarantined {
+		return nil, errors.New("Computer Storage generation is quarantined after cleanup failure")
+	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
 	mountPath := filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)
 	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
@@ -326,6 +331,67 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		return nil, err
 	}
 	return attachment, nil
+}
+
+func computerDiskCleanupQuarantined(runtimeRoot, name string) (bool, error) {
+	entries, err := readDirectoryIfPresent(filepath.Join(runtimeRoot, "computer-disk-quarantine"))
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), name+"-cleanup-") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (engine *ContainerdEngine) quarantineComputerDiskCleanup(request DeleteManagedVolumeRequest) (ManagedVolumeQuarantineReceipt, error) {
+	name, err := deterministicComputerDiskName(*request.ComputerStorage)
+	if err != nil {
+		return ManagedVolumeQuarantineReceipt{}, err
+	}
+	receiptID, err := randomCapability()
+	if err != nil {
+		return ManagedVolumeQuarantineReceipt{}, err
+	}
+	receipt := ManagedVolumeQuarantineReceipt{Kind: "managed_volume_cleanup_quarantined", ReceiptID: receiptID,
+		VolumeKind: request.Kind, ComputerStorage: *request.ComputerStorage, Removal: *request.Removal,
+		FailureReason: EngineFailureOperationFailed, Attempts: request.FailureAttempts}
+	root := filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return ManagedVolumeQuarantineReceipt{}, err
+	}
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		return ManagedVolumeQuarantineReceipt{}, err
+	}
+	payload = append(payload, '\n')
+	temporary, err := os.CreateTemp(root, ".cleanup-quarantine.tmp-")
+	if err != nil {
+		return ManagedVolumeQuarantineReceipt{}, err
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	writeErr := temporary.Chmod(0o600)
+	if writeErr == nil {
+		_, writeErr = temporary.Write(payload)
+	}
+	if writeErr == nil {
+		writeErr = temporary.Sync()
+	}
+	writeErr = errors.Join(writeErr, temporary.Close())
+	if writeErr != nil {
+		return ManagedVolumeQuarantineReceipt{}, writeErr
+	}
+	path := filepath.Join(root, fmt.Sprintf("%s-cleanup-%d.json", name, request.Removal.RemovalGeneration))
+	if err := os.Rename(temporaryName, path); err != nil {
+		return ManagedVolumeQuarantineReceipt{}, err
+	}
+	if err := syncDirectory(root); err != nil {
+		return ManagedVolumeQuarantineReceipt{}, err
+	}
+	return receipt, nil
 }
 
 func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageReference, removal ManagedVolumeRemovalAuthority) error {

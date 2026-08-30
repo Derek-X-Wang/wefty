@@ -164,12 +164,29 @@ type ComputerStorageGenerationClaim struct {
 }
 
 type RemovalAcknowledgementRequest struct {
+	NodeID            string                            `json:"node_id"`
+	BootSessionID     string                            `json:"boot_session_id"`
+	RemovalGeneration uint64                            `json:"removal_generation"`
+	CleanupFence      string                            `json:"cleanup_fence"`
+	RootInstanceID    string                            `json:"root_instance_id"`
+	IdempotencyKey    string                            `json:"idempotency_key"`
+	CleanupQuarantine *ComputerStorageCleanupQuarantine `json:"cleanup_quarantine,omitempty"`
+}
+
+type ComputerStorageCleanupQuarantine struct {
+	Kind              string `json:"kind"`
+	ReceiptID         string `json:"receipt_id"`
+	VolumeKind        string `json:"volume_kind"`
+	ComputerID        string `json:"computer_id"`
+	StorageID         string `json:"storage_id"`
+	StorageGeneration int64  `json:"storage_generation"`
 	NodeID            string `json:"node_id"`
 	BootSessionID     string `json:"boot_session_id"`
+	JobID             string `json:"job_id"`
 	RemovalGeneration uint64 `json:"removal_generation"`
 	CleanupFence      string `json:"cleanup_fence"`
-	RootInstanceID    string `json:"root_instance_id"`
-	IdempotencyKey    string `json:"idempotency_key"`
+	FailureReason     string `json:"failure_reason"`
+	Attempts          int    `json:"attempts"`
 }
 
 type ForceForgetRequest struct {

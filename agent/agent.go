@@ -278,31 +278,18 @@ func New(config Config) (*Agent, error) {
 		})
 	}
 	if resource, ok := managedResource.(*processManagedResource); ok && resource.previousBootSessionID != "" {
-		var priorBootReapers []workloadrunner.PriorBootReaper
+		priorBootReapers := make(map[string]workloadrunner.PriorBootReaper)
 		for _, kind := range []string{contract.JobKindOCI, contract.JobKindProcess} {
 			if adapter, found := runtimes.selectKind(kind); found {
 				if reaper, supported := adapter.(workloadrunner.PriorBootReaper); supported {
-					priorBootReapers = append(priorBootReapers, reaper)
+					priorBootReapers[kind] = reaper
 				}
 			}
 		}
 		if len(priorBootReapers) > 0 {
-			session.reapPriorBoot = func(ctx context.Context, jobID string) (workloadrunner.ReapReceipt, error) {
+			session.reapPriorBoot = func(ctx context.Context, jobID, kind string) (workloadrunner.ReapReceipt, error) {
 				request := workloadrunner.PriorBootReapRequest{NodeID: config.NodeID, JobID: jobID, PriorBootSessionID: resource.previousBootSessionID, CurrentBootSessionID: config.BootSessionID}
-				var failures []error
-				for _, reaper := range priorBootReapers {
-					receipt, reapErr := reaper.ReapPriorBoot(ctx, request)
-					if reapErr == nil {
-						return receipt, nil
-					}
-					if !errors.Is(reapErr, workloadrunner.ErrPriorBootEvidenceUnavailable) {
-						failures = append(failures, reapErr)
-					}
-				}
-				if len(failures) > 0 {
-					return workloadrunner.ReapReceipt{}, errors.Join(failures...)
-				}
-				return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
+				return reapPriorBootForKind(ctx, priorBootReapers, kind, request)
 			}
 		}
 	}
@@ -365,6 +352,19 @@ func New(config Config) (*Agent, error) {
 		computerTokens:  computerTokens, computerTokenCloser: computerTokenCloser,
 		nodeLock: stableNodeLock,
 	}, nil
+}
+
+func reapPriorBootForKind(
+	ctx context.Context,
+	reapers map[string]workloadrunner.PriorBootReaper,
+	kind string,
+	request workloadrunner.PriorBootReapRequest,
+) (workloadrunner.ReapReceipt, error) {
+	reaper, found := reapers[kind]
+	if !found {
+		return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
+	}
+	return reaper.ReapPriorBoot(ctx, request)
 }
 
 type processClockAdapter struct{ clock Clock }

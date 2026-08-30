@@ -340,6 +340,18 @@ adapter could report a generation. A typed loss returned by `ReapAndVerify`
 uses the same embargo and a separately bounded recovery before one retry or an
 exact sweep receipt; absent positive quiescence remains a failed stop latch.
 
+Prior-boot removal dispatches to the runtime recorded by the removal intent;
+an OCI job can never consume process Guardian evidence, or vice versa. A
+verified-absent new-boot OCI namespace sweep can prove prior-boot quiescence
+even when its swept-attempt list omits the job because the old helper already
+reaped that attempt before the agent lost its in-memory receipt, but only when
+`PriorBootSessionsSeen` names the removal intent's prior boot. A sweep that
+names neither the exact attempt nor that prior boot is unbound and fails. The
+frozen
+removal manifest still binds every subsequent durable-data deletion and
+post-delete assertion; legacy inventory reconstruction continues to require
+matching attempt authority and cannot upgrade an empty sweep into a manifest.
+
 For a Mac OCI one-shot that needs the run bridge, the agent asks Lima itself to
 resolve `host.lima.internal`, binds only that discovered guest-visible host
 address, and injects the hostname plus the allocated port. It never binds a
@@ -417,6 +429,15 @@ successful functional probe through such a negotiated version may add the
 boot-scoped `computer` capability; an unsupported helper major is not admitted
 by this agent and cannot satisfy a Computer claim. Display readiness and
 publication remain a separate consumer of the returned opaque endpoints.
+
+Take-over discovery returns L1's durable policy revision. The CLI carries that
+revision to the private front door; if the live cache is older and therefore
+does not yet contain the identity, the refusal is typed retryable
+`stale_policy_revision`, not an undifferentiated 403. The CLI retries only that
+code every 100 ms for at most two seconds inside its existing command context.
+All other admission failures return immediately, and the native acceptance
+harness permits at most three typed stale-policy process attempts within a
+six-second sub-window while retaining each tolerated stderr in its receipt.
 
 Take-over termination force-closes the client, `view`, and any active `control`
 WebSockets before invoking their handshake-capable `net.Conn` wrappers, so a
