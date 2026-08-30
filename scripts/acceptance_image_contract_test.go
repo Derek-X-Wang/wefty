@@ -230,6 +230,29 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if prBuild.If != "github.event_name == 'pull_request'" || prBuild.With["candidate_sha"] != "${{ github.event.pull_request.head.sha }}" || prBuild.With["source_repository"] != "${{ github.event.pull_request.head.repo.full_name }}" {
 		t.Fatalf("PR realtiming artifact source guard = if %q with %#v", prBuild.If, prBuild.With)
 	}
+	dependsOnPRBuild := map[string]bool{"build-pr-artifacts": true}
+	for changed := true; changed; {
+		changed = false
+		for jobName, job := range realtiming.Jobs {
+			if dependsOnPRBuild[jobName] {
+				continue
+			}
+			for _, need := range workflowNeeds(t, job.Needs) {
+				if dependsOnPRBuild[need] {
+					dependsOnPRBuild[jobName] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+	delete(dependsOnPRBuild, "build-pr-artifacts")
+	for jobName := range dependsOnPRBuild {
+		guard := realtiming.Jobs[jobName].If
+		if !strings.Contains(guard, "always()") && !strings.Contains(guard, "!cancelled()") {
+			t.Fatalf("realtiming job %s transitively needs PR-only build-pr-artifacts but its guard %q does not tolerate that job being skipped", jobName, guard)
+		}
+	}
 	for _, sharedAnchor := range []string{"Provision pinned Linux OCI engine and probe", "Run service acceptance at production timings", "Capture Linux OCI service diagnostics", "Upload service acceptance evidence", "name: realtiming-result"} {
 		if strings.Count(realtimeText, sharedAnchor) != 1 {
 			t.Fatalf("main and PR lanes must share exactly one %q block", sharedAnchor)
@@ -698,6 +721,29 @@ func stringSlice(t *testing.T, value any) []string {
 		result = append(result, text)
 	}
 	return result
+}
+
+func workflowNeeds(t *testing.T, value any) []string {
+	t.Helper()
+	switch value := value.(type) {
+	case nil:
+		return nil
+	case string:
+		return []string{value}
+	case []any:
+		result := make([]string, 0, len(value))
+		for _, need := range value {
+			text, ok := need.(string)
+			if !ok {
+				t.Fatalf("workflow need has type %T", need)
+			}
+			result = append(result, text)
+		}
+		return result
+	default:
+		t.Fatalf("workflow needs has type %T", value)
+		return nil
+	}
 }
 
 func assertFileContains(t *testing.T, path string, values ...string) {
