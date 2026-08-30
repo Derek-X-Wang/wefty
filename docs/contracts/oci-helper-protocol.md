@@ -164,7 +164,8 @@ notifies the barrier synchronously when control authority is lost.
 Successful verification produces an immutable receipt retained by the client
 barrier. It names the sweep epoch and helper process/session generation and
 copies the prior boot sessions, class-separated swept inventory, independent
-post-sweep inventory, and recovered `(removal_generation, attempt_id,
+post-sweep observed inventory, runtime-residue projection, durable-retained
+projection, and recovered `(removal_generation, attempt_id,
 fencing_token, prior_boot_session_id)` tuples. A helper-startup sweep is folded
 into the first session receipt so evidence is not discarded before session
 acquisition. This is evidence for the later runtime/removal adapter; this
@@ -505,10 +506,14 @@ handoff volume. Session reap and boot sweep likewise leave unexpired handoffs
 intact; reuse refreshes the default 24-hour retry age, and sweep removes only
 expired direct children with the deterministic handoff prefix. Attempt and
 namespace quiescence therefore project only unexpired handoff volumes (the
-retained bindings) out of their absence decision. `Verify` returns the
-observed inventory unchanged, and the boot receipt records both
-`verified_absent` and that inventory, so an expired handoff left behind by a
-failed sweep remains visible residue rather than passing by name prefix. The
+retained bindings) out of their absence decision. `Verify` returns the observed
+inventory unchanged alongside the exact runtime-residue and durable-retained
+projections, and the boot receipt records all three with `verified_absent`.
+Thus service data is durable-retained only while its paired owner record still
+matches the no-follow directory identity, and an unexpired handoff is retained
+only while its retention authority is live. An orphan directory, orphan owner
+record, mismatched binding, or expired handoff remains runtime residue rather
+than passing by name prefix. The
 narrow
 `DeleteManagedVolume(kind, owner_key)` operation is closed to `handoff` and
 `service_data`. It derives exactly one helper-owned identity, removes only that
@@ -522,7 +527,8 @@ root, outside the attempt inventory swept during boot takeover. They and their
 owner records remain visible as separate inventory classes so explicit job
 removal can positively verify both absent; attempt verification reports them
 even though attempt deletion treats them as allowed job-lifetime residue.
-Namespace boot-sweep verification projects them out. Before the first mount, the helper
+Namespace boot-sweep verification projects a service-data pair out only while
+that ownership binding is valid or an authorized removal still owns it. Before the first mount, the helper
 resolves the image `USER` once while building the runtime spec, sets the new
 directory's primary UID:GID through its no-follow directory descriptor, and
 atomically publishes and fsyncs an owner record containing the directory
@@ -735,9 +741,14 @@ against a non-empty installed expectation before exposing the session.
 Prior-boot removal consumes positive sweep evidence once. A swept attempt still
 requires node, job, class, prior boot, attempt, fence, and removal generation.
 When an older helper already reaped that attempt, a verified-empty replacement
-sweep may omit the attempt only if `PriorBootSessionsSeen` contains the removal
-intent's prior boot. Both forms remain bound to the sweep epoch and helper
-generation; a bare verified-empty sweep is insufficient. Legacy manifest
+sweep may omit the attempt only if `PriorBootSessionsSeen` contains the exact
+`(NodeID, BootSessionID)` from the removal intent. A successful session reap records that session identity in
+the running helper process, and every later session-generation sweep includes
+that process-local fact; a failed reap records nothing, and a restarted helper
+must recover evidence from its own startup sweep. Both forms remain bound to
+the sweep epoch and helper
+generation. The helper retains a bounded process-local history of these
+identities across session generations; a bare verified-empty sweep is insufficient. Legacy manifest
 reconstruction and replacement-sweep attempt recovery continue to require the
 complete authority match.
 

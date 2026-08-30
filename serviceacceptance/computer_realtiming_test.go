@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,9 +18,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,6 +54,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		}
 		return
 	}
+	t.Setenv("WEFTY_DEV_PLAIN_FABRIC_ID", "plain-linux-computer-acceptance")
 
 	reference := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_REFERENCE")
 	digest := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_DIGEST")
@@ -79,9 +83,17 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	helperChecksum := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_HELPER_CHECKSUM")
 	probeReference := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_PROBE_REFERENCE")
 	probeDigest := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_PROBE_DIGEST")
+	recordBarrierResidue := func(residue *ocihelper.NamespaceResidueError) {
+		receipt.ResidueInventories["between_package_runtime_residue"] = residue.RuntimeResidue
+		receipt.ResidueInventories["between_package_durable_retained"] = residue.DurableRetained
+		receipt.ResidueInventories["between_package_observed_inventory"] = residue.Observed
+		receipt.ResidueAssertions["between_package_absence_blocked_by_runtime_residue"] = !ocihelper.InventoryEmpty(residue.RuntimeResidue)
+		receipt.ResidueAssertions["between_package_observed_classified"] = reflect.DeepEqual(
+			residue.Observed, mergeAcceptanceInventory(residue.RuntimeResidue, residue.DurableRetained))
+	}
 	importRealtimeProbeImage(t, requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_PROBE_ARCHIVE"),
-		helperSocket, helperChecksum, probeReference, probeDigest)
-	importRealtimeProbeImage(t, archive, helperSocket, helperChecksum, reference, digest)
+		helperSocket, helperChecksum, probeReference, probeDigest, recordBarrierResidue)
+	importRealtimeProbeImage(t, archive, helperSocket, helperChecksum, reference, digest, recordBarrierResidue)
 	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
 	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
 		t.Fatal(err)
@@ -117,7 +129,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	recordComputerAuthority(receipt, ready)
 	diskEvidence := inspectLiveComputerDisk(t, ready)
 	policy := bootstrapComputerAcceptanceAdmin(t, harness)
-	adminView := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-admin", "linux-admin-device-a", takeoverViewRetryStalePolicy)
+	adminView := startTakeoverViewCLI(t, evidence, harness, ready.ComputerID, "linux-admin", "linux-admin-device-a", takeoverViewRetryStalePolicy)
 	receipt.TakeoverRetryStderr = append(receipt.TakeoverRetryStderr, adminView.toleratedStderr...)
 	adminTake := runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-admin", "linux-admin-device-a",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", adminView.tokenFile)
@@ -135,6 +147,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"control_named_endpoint_dialed":   adminTake.TenureState == contract.ComputerControlTenureHeld,
 		"control_named_endpoint_released": adminRelease.TenureState == contract.ComputerControlTenureFree,
 		"helper_admitted_real_payload":    ready.CurrentJob.CurrentAttemptID != "",
+		"cross_process_plain_authority":   len(policy.Admins) == 1 && policy.Admins[0].FabricID == "plain-linux-computer-acceptance" && adminView.admitted,
 	}, map[string]string{"computer_id": ready.ComputerID, "job_id": ready.CurrentJobID,
 		"attempt_id": ready.CurrentJob.CurrentAttemptID, "storage_id": ready.StorageID,
 		"storage_generation": fmt.Sprint(ready.StorageGeneration), "intent_revision": fmt.Sprint(ready.IntentRevision),
@@ -151,7 +164,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		linuxComputerFabricIdentity{Role: "administrator", FabricID: policy.Admins[0].FabricID, UserID: "linux-admin", DeviceID: "linux-admin-device-a"},
 		linuxComputerFabricIdentity{Role: "viewer", FabricID: viewGrant.Grant.FabricID, UserID: "linux-viewer", DeviceID: "linux-viewer-device"})
 	inputIsolation := proveLiveViewInputIsolation(t, harness, ready, "linux-viewer", "linux-viewer-device")
-	viewerView := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-viewer", "linux-viewer-device", takeoverViewRetryStalePolicy)
+	viewerView := startTakeoverViewCLI(t, evidence, harness, ready.ComputerID, "linux-viewer", "linux-viewer-device", takeoverViewRetryStalePolicy)
 	receipt.TakeoverRetryStderr = append(receipt.TakeoverRetryStderr, viewerView.toleratedStderr...)
 	viewerTakeDenied := runComputerCLIPersonExpectError(t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", viewerView.tokenFile)
@@ -159,7 +172,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"services", "grant", ready.ComputerID, "linux-viewer", "--permission", "control",
 		"--policy-revision", fmt.Sprint(viewGrant.Grant.PolicyRevision), "--idempotency-key", "linux-native-control-grant")
 	viewerView.stop(t)
-	viewerControl := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-viewer", "linux-viewer-device", takeoverViewRetryStalePolicy)
+	viewerControl := startTakeoverViewCLI(t, evidence, harness, ready.ComputerID, "linux-viewer", "linux-viewer-device", takeoverViewRetryStalePolicy)
 	receipt.TakeoverRetryStderr = append(receipt.TakeoverRetryStderr, viewerControl.toleratedStderr...)
 	viewerTake := runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", viewerControl.tokenFile)
@@ -173,7 +186,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	}
 	viewerTake = runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", viewerControl.tokenFile)
-	adminOverrideView := startTakeoverViewCLI(t, harness, ready.ComputerID, "linux-admin", "linux-admin-device-b", takeoverViewRetryNone)
+	adminOverrideView := startTakeoverViewCLI(t, evidence, harness, ready.ComputerID, "linux-admin", "linux-admin-device-b", takeoverViewRetryNone)
 	adminOverride := runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-admin", "linux-admin-device-b",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", adminOverrideView.tokenFile)
 	revoked := runComputerCLIPerson[l1.ComputerGrantMutationResult](t, harness, "linux-admin", "linux-admin-device-a",
@@ -351,7 +364,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	if attestOutput.CustodyExport == nil || !attestOutput.CustodyExport.OperatorAttestedDeleted {
 		t.Fatalf("Computer custody attestation result = %#v", attestOutput)
 	}
-	staleCredential := startTakeoverViewCLI(t, harness, reimaged.ComputerID, "linux-admin", "linux-admin-device-a", takeoverViewRetryNone)
+	staleCredential := startTakeoverViewCLI(t, evidence, harness, reimaged.ComputerID, "linux-admin", "linux-admin-device-a", takeoverViewRetryNone)
 	restoreBaseline := reimaged.StorageGeneration
 	restoreOutput := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "restore", reimaged.ComputerID, backup.BackupID,
 		"--keep-old-as-backup", "--expect-current", "--idempotency-key", "linux-native-restore", "--wait", "4m")
@@ -488,19 +501,25 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		t.Fatalf("Computer removal outcomes verified=%q reduced=%q", verified.RemovalOutcome, reduced.RemovalOutcome)
 	}
 	harness.agent.kill(t)
-	inventory := inspectHelperNamespaceInventory(t, helperSocket, helperChecksum)
-	receipt.ResidueInventories["post_removal_helper_namespace"] = inventory
+	verification := inspectHelperNamespaceInventory(t, helperSocket, helperChecksum)
+	receipt.ResidueInventories["post_removal_observed_inventory"] = verification.Inventory
+	receipt.ResidueInventories["post_removal_runtime_residue"] = verification.RuntimeResidue
+	receipt.ResidueInventories["post_removal_durable_retained"] = verification.DurableRetained
+	receipt.ResidueAssertions["post_removal_observed_inventory_empty"] = ocihelper.InventoryEmpty(verification.Inventory)
+	receipt.ResidueAssertions["post_removal_runtime_residue_empty"] = ocihelper.InventoryEmpty(verification.RuntimeResidue)
+	receipt.ResidueAssertions["post_removal_durable_retained_matches_expected_empty_custody"] = ocihelper.InventoryEmpty(verification.DurableRetained)
 	archiveAfter := sha256File(t, archive)
 	cacheAfter := liveContainerdImagePresent(t, digest)
 	completeLinuxComputerRow(t, receipt, "linux.removal", map[string]bool{
 		"verified_absence_outcome_live":      verified.RemovalOutcome == "removed_verified",
 		"reduced_custody_outcome_live":       reduced.RemovalOutcome == "removed_reduced",
 		"reduced_bound_to_tainted_computer":  reduced.ComputerID == taintedComputerID,
-		"independent_helper_inventory_empty": ocihelper.InventoryEmpty(inventory),
-		"containers_absent":                  len(inventory.Containers) == 0,
-		"tasks_absent":                       len(inventory.Tasks) == 0,
-		"disks_loops_mounts_absent":          len(inventory.ComputerDiskImages)+len(inventory.ComputerDiskLoops)+len(inventory.ComputerDiskMounts) == 0,
-		"logs_and_control_absent":            len(inventory.LogSegments)+len(inventory.Cgroups) == 0,
+		"independent_helper_inventory_empty": ocihelper.InventoryEmpty(verification.Inventory),
+		"containers_absent":                  len(verification.Inventory.Containers) == 0,
+		"tasks_absent":                       len(verification.Inventory.Tasks) == 0,
+		"disks_loops_mounts_absent":          len(verification.Inventory.ComputerDiskImages)+len(verification.Inventory.ComputerDiskLoops)+len(verification.Inventory.ComputerDiskMounts) == 0,
+		"logs_and_control_absent":            len(verification.Inventory.LogSegments)+len(verification.Inventory.Cgroups) == 0,
+		"durable_retained_matches_custody":   ocihelper.InventoryEmpty(verification.DurableRetained),
 		"publication_withdrawn":              verified.DisplayEndpoint == nil,
 		"operator_bind_source_untouched":     archiveBefore == archiveAfter,
 		"shared_image_cache_untouched":       cacheBefore && cacheAfter,
@@ -513,6 +532,26 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 
 type publishedComputerRuntimeReceipt struct {
 	Digest string `json:"digest"`
+}
+
+func mergeAcceptanceInventory(left, right ocihelper.ResourceInventory) ocihelper.ResourceInventory {
+	return ocihelper.ResourceInventory{
+		Leases: append(left.Leases, right.Leases...), Snapshots: append(left.Snapshots, right.Snapshots...),
+		Containers: append(left.Containers, right.Containers...), Tasks: append(left.Tasks, right.Tasks...),
+		Shims: append(left.Shims, right.Shims...), Cgroups: append(left.Cgroups, right.Cgroups...),
+		LogSegments: append(left.LogSegments, right.LogSegments...), ManagedVolumes: append(left.ManagedVolumes, right.ManagedVolumes...),
+		ManagedVolumeRecords:    append(left.ManagedVolumeRecords, right.ManagedVolumeRecords...),
+		ComputerDiskImages:      append(left.ComputerDiskImages, right.ComputerDiskImages...),
+		ComputerDiskAllocations: append(left.ComputerDiskAllocations, right.ComputerDiskAllocations...),
+		ComputerDiskQuotas:      append(left.ComputerDiskQuotas, right.ComputerDiskQuotas...),
+		ComputerDiskManifests:   append(left.ComputerDiskManifests, right.ComputerDiskManifests...),
+		ComputerDiskMounts:      append(left.ComputerDiskMounts, right.ComputerDiskMounts...),
+		ComputerDiskLoops:       append(left.ComputerDiskLoops, right.ComputerDiskLoops...),
+		ComputerAttachments:     append(left.ComputerAttachments, right.ComputerAttachments...),
+		ComputerResetManifests:  append(left.ComputerResetManifests, right.ComputerResetManifests...),
+		ComputerQuarantines:     append(left.ComputerQuarantines, right.ComputerQuarantines...),
+		ComputerDiskAnomalies:   append(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies...),
+	}
 }
 
 func readPublishedComputerRuntimeReceipt(t *testing.T, path string) publishedComputerRuntimeReceipt {
@@ -647,8 +686,32 @@ type takeoverViewProcess struct {
 	cancel          context.CancelFunc
 	done            chan error
 	stdout          bytes.Buffer
-	stderr          bytes.Buffer
+	stderr          lockedBuffer
 	toleratedStderr []string
+	evidence        *realTimingEvidence
+	evidencePrefix  string
+	computerID      string
+	userID          string
+	deviceID        string
+	retryMode       takeoverViewRetryMode
+	activeAttempt   int
+	stderrStart     int
+	attemptStarted  time.Time
+}
+
+type takeoverViewAttemptEvidence struct {
+	ComputerID       string    `json:"computer_id"`
+	UserID           string    `json:"user_id"`
+	DeviceID         string    `json:"device_id"`
+	RetryMode        string    `json:"retry_mode"`
+	Attempt          int       `json:"attempt"`
+	AdmissionOutcome string    `json:"admission_outcome"`
+	ExitOutcome      string    `json:"exit_outcome"`
+	ExitCode         int       `json:"exit_code"`
+	Error            string    `json:"error,omitempty"`
+	Stderr           string    `json:"stderr"`
+	StartedAt        time.Time `json:"started_at"`
+	RecordedAt       time.Time `json:"recorded_at"`
 }
 
 type takeoverViewRetryMode string
@@ -660,9 +723,15 @@ const (
 	takeoverViewHarnessRetryWindow                         = 6 * time.Second
 )
 
-func startTakeoverViewCLI(t *testing.T, harness *acceptanceHarness, computerID, userID, deviceID string, retryMode takeoverViewRetryMode) *takeoverViewProcess {
+var takeoverViewEvidenceSequence atomic.Uint64
+
+func startTakeoverViewCLI(t *testing.T, evidence *realTimingEvidence, harness *acceptanceHarness, computerID, userID, deviceID string, retryMode takeoverViewRetryMode) *takeoverViewProcess {
 	t.Helper()
-	view := &takeoverViewProcess{tokenFile: filepath.Join(t.TempDir(), "takeover-session.json"), done: make(chan error, 1)}
+	view := &takeoverViewProcess{
+		tokenFile: filepath.Join(t.TempDir(), "takeover-session.json"), done: make(chan error, 1), evidence: evidence,
+		evidencePrefix: fmt.Sprintf("takeover-cli-%03d", takeoverViewEvidenceSequence.Add(1)),
+		computerID:     computerID, userID: userID, deviceID: deviceID, retryMode: retryMode,
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 	view.cancel = cancel
 	deadline := time.Now().Add(30 * time.Second)
@@ -672,6 +741,7 @@ func startTakeoverViewCLI(t *testing.T, harness *acceptanceHarness, computerID, 
 	for time.Now().Before(deadline) {
 		attempts++
 		stderrStart := view.stderr.Len()
+		view.activeAttempt, view.stderrStart, view.attemptStarted = attempts, stderrStart, time.Now().UTC()
 		command := exec.CommandContext(ctx, weftyBinaryPath, computerCLIArguments(harness, userID, deviceID,
 			"services", "takeover", "view", computerID, "--session-token-file", view.tokenFile)...)
 		command.Stdout, command.Stderr = &view.stdout, &view.stderr
@@ -680,12 +750,14 @@ func startTakeoverViewCLI(t *testing.T, harness *acceptanceHarness, computerID, 
 		for time.Now().Before(deadline) {
 			if info, err := os.Stat(view.tokenFile); err == nil && info.Size() > 0 {
 				view.admitted = true
+				view.recordAttempt("success", "pending", nil)
 				return view
 			}
 			select {
 			case err := <-view.done:
 				running = false
 				attemptStderr := view.stderr.String()[stderrStart:]
+				view.recordAttempt("failure", "failure", err)
 				// L1 availability is durable discovery, while the front door is
 				// live authority. A grant may be visible before the hosting agent
 				// acknowledges and installs that policy revision.
@@ -695,6 +767,7 @@ func startTakeoverViewCLI(t *testing.T, harness *acceptanceHarness, computerID, 
 					time.Sleep(25 * time.Millisecond)
 					break
 				}
+				cancel()
 				t.Fatalf("takeover view exited before admission: %v\n%s", err, view.stderr.String())
 			default:
 				time.Sleep(25 * time.Millisecond)
@@ -706,8 +779,10 @@ func startTakeoverViewCLI(t *testing.T, harness *acceptanceHarness, computerID, 
 	cancel()
 	if running {
 		select {
-		case <-view.done:
+		case err := <-view.done:
+			view.recordAttempt("failure", "failure", err)
 		case <-time.After(10 * time.Second):
+			view.recordAttempt("failure", "timeout", errors.New("takeover view did not stop after its admission deadline"))
 			t.Fatal("takeover view did not stop after its admission deadline")
 		}
 	}
@@ -719,8 +794,10 @@ func (view *takeoverViewProcess) stop(t *testing.T) {
 	t.Helper()
 	view.cancel()
 	select {
-	case <-view.done:
+	case err := <-view.done:
+		view.recordAttempt("success", "closed", err)
 	case <-time.After(10 * time.Second):
+		view.recordAttempt("success", "timeout", errors.New("takeover view did not stop"))
 		t.Fatal("takeover view did not stop")
 	}
 }
@@ -728,10 +805,64 @@ func (view *takeoverViewProcess) stop(t *testing.T) {
 func (view *takeoverViewProcess) waitClosed(t *testing.T, timeout time.Duration) {
 	t.Helper()
 	select {
-	case <-view.done:
+	case err := <-view.done:
+		view.recordAttempt("success", "closed", err)
 	case <-time.After(timeout):
 		view.cancel()
+		view.recordAttempt("success", "timeout", errors.New("takeover view remained open after authority revocation"))
 		t.Fatal("takeover view remained open after authority revocation")
+	}
+}
+
+func (view *takeoverViewProcess) recordAttempt(admissionOutcome, exitOutcome string, err error) {
+	if view.evidence == nil || view.activeAttempt == 0 {
+		return
+	}
+	exitCode := 0
+	errorText := ""
+	if exitOutcome == "pending" {
+		exitCode = -1
+	} else if err != nil {
+		exitCode = -1
+		errorText = err.Error()
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) {
+			exitCode = exitError.ExitCode()
+		}
+	}
+	stderr := view.stderr.String()
+	if view.stderrStart < len(stderr) {
+		stderr = stderr[view.stderrStart:]
+	} else {
+		stderr = ""
+	}
+	view.evidence.recordJSON(fmt.Sprintf("%s-attempt-%02d.json", view.evidencePrefix, view.activeAttempt), takeoverViewAttemptEvidence{
+		ComputerID: view.computerID, UserID: view.userID, DeviceID: view.deviceID, RetryMode: string(view.retryMode),
+		Attempt: view.activeAttempt, AdmissionOutcome: admissionOutcome, ExitOutcome: exitOutcome, ExitCode: exitCode,
+		Error: errorText, Stderr: stderr, StartedAt: view.attemptStarted, RecordedAt: time.Now().UTC(),
+	})
+}
+
+func TestTakeoverViewAttemptEvidenceIncludesFailureExitAndStderr(t *testing.T) {
+	directory := t.TempDir()
+	evidence := &realTimingEvidence{t: t, directory: directory}
+	view := &takeoverViewProcess{
+		evidence: evidence, evidencePrefix: "takeover-cli-test", computerID: "computer-1", userID: "user-1", deviceID: "device-1",
+		retryMode: takeoverViewRetryNone, activeAttempt: 1, attemptStarted: time.Now().UTC(),
+	}
+	_, _ = view.stderr.WriteString(`{"code":"control_not_authorized"}`)
+	exitErr := exec.Command("/bin/sh", "-c", "exit 3").Run()
+	view.recordAttempt("failure", "failure", exitErr)
+	payload, err := os.ReadFile(filepath.Join(directory, "takeover-cli-test-attempt-01.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorded takeoverViewAttemptEvidence
+	if err := json.Unmarshal(payload, &recorded); err != nil {
+		t.Fatal(err)
+	}
+	if recorded.ExitCode != 3 || recorded.AdmissionOutcome != "failure" || !strings.Contains(recorded.Stderr, "control_not_authorized") {
+		t.Fatalf("takeover CLI failure evidence = %+v", recorded)
 	}
 }
 
@@ -818,7 +949,11 @@ type liveRFBSession struct {
 
 func openLiveRFBSession(t *testing.T, endpoint, userID, deviceID string) *liveRFBSession {
 	t.Helper()
-	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: deviceID, UserID: userID, DeviceID: deviceID})
+	plainNetwork, err := plain.NewNetworkWithID("plain-linux-computer-acceptance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	participant := plainNetwork.NewFabric(fabric.Identity{NodeID: deviceID, UserID: userID, DeviceID: deviceID})
 	transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 		return participant.Dial(ctx, network, address)
 	}}
@@ -1245,7 +1380,7 @@ func exerciseLiveComputerENOSPC(t *testing.T, harness *acceptanceHarness, refere
 		Detail: fmt.Sprintf("requested=%d observed_available=%d", requested, available)}
 }
 
-func inspectHelperNamespaceInventory(t *testing.T, socketPath, checksum string) ocihelper.ResourceInventory {
+func inspectHelperNamespaceInventory(t *testing.T, socketPath, checksum string) ocihelper.VerifyResponse {
 	t.Helper()
 	client := ocihelper.NewUnixClient(socketPath, checksum)
 	deadline := time.Now().Add(30 * time.Second)
@@ -1261,15 +1396,15 @@ func inspectHelperNamespaceInventory(t *testing.T, socketPath, checksum string) 
 				t.Fatalf("verify helper namespace inventory: %v", verifyErr)
 			}
 			if !verification.Absent {
-				t.Fatalf("helper namespace retained residue: %#v", verification.Inventory)
+				t.Fatalf("helper namespace runtime residue=%#v durable retained=%#v observed=%#v", verification.RuntimeResidue, verification.DurableRetained, verification.Inventory)
 			}
-			return verification.Inventory
+			return verification
 		}
 		lastErr = err
 		time.Sleep(250 * time.Millisecond)
 	}
 	t.Fatalf("acquire independent helper inventory session: %v", lastErr)
-	return ocihelper.ResourceInventory{}
+	return ocihelper.VerifyResponse{}
 }
 
 func sha256File(t *testing.T, path string) string {

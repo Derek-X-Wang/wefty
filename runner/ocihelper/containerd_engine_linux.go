@@ -1952,9 +1952,9 @@ func (engine *ContainerdEngine) ReapAttempt(ctx context.Context, authority Attem
 	return engine.deleteResources(engineContext(ctx), authority, resources, computerDisk)
 }
 
-func (engine *ContainerdEngine) ReapSession(ctx context.Context, _ SessionIdentity) error {
+func (engine *ContainerdEngine) ReapSession(ctx context.Context, _ SessionIdentity) (SweepResponse, error) {
 	if err := engine.imageOperations.CancelAll(ctx); err != nil {
-		return err
+		return SweepResponse{}, err
 	}
 	engine.mu.Lock()
 	attempts := make([]*containerdAttempt, 0, len(engine.attempts))
@@ -1969,18 +1969,17 @@ func (engine *ContainerdEngine) ReapSession(ctx context.Context, _ SessionIdenti
 			attempt.signalCause = "guardian"
 			attempt.mu.Unlock()
 		} else if !errdefs.IsNotFound(err) {
-			return err
+			return SweepResponse{}, err
 		}
 		select {
 		case <-attempt.terminalReady:
 		case <-ctx.Done():
-			return ctx.Err()
+			return SweepResponse{}, ctx.Err()
 		}
 	}
 	// Whole-namespace reaping is safe only under the protocol's one-agent-per-
 	// node exclusive helper-session assumption.
-	_, err := engine.Sweep(ctx, SweepRequest{})
-	return err
+	return engine.Sweep(ctx, SweepRequest{})
 }
 
 func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyRequest) (VerifyResponse, error) {
@@ -2012,7 +2011,12 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 	if absent && request.Scope == VerifyNamespace {
 		engine.releaseVerifiedNamespace()
 	}
-	return VerifyResponse{Absent: absent, Inventory: observed}, nil
+	return VerifyResponse{
+		Absent:          absent,
+		Inventory:       observed,
+		RuntimeResidue:  projected,
+		DurableRetained: subtractResourceInventory(observed, projected),
+	}, nil
 }
 
 func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
@@ -2043,12 +2047,12 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err != nil {
 		return SweepResponse{}, err
 	}
-	inventory = withoutServiceDataInventory(inventory)
+	observedInventory := cloneResourceInventory(inventory)
 	containersList, err := engine.client.Containers(ctx)
 	if err != nil {
 		return SweepResponse{}, err
 	}
-	prior := map[string]struct{}{}
+	prior := map[SessionIdentity]struct{}{}
 	attempts := map[string]SweptAttemptAuthority{}
 	for _, container := range containersList {
 		info, infoErr := container.Info(ctx)
@@ -2081,7 +2085,9 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err := engine.sweepComputerDisks(request.SweepEpoch); err != nil {
 		return SweepResponse{}, err
 	}
-	return engine.finishSweep(ctx, inventory, prior, attempts)
+	response, err := engine.finishSweep(ctx, inventory, prior, attempts)
+	response.Inventory = observedInventory
+	return response, err
 }
 
 func (engine *ContainerdEngine) cleanupExpiredHandoffs(now time.Time) error {
@@ -2128,7 +2134,7 @@ func (engine *ContainerdEngine) sweepImageSpools() error {
 	return nil
 }
 
-func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory ResourceInventory, prior map[string]struct{}, attempts map[string]SweptAttemptAuthority) (SweepResponse, error) {
+func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory ResourceInventory, prior map[SessionIdentity]struct{}, attempts map[string]SweptAttemptAuthority) (SweepResponse, error) {
 	snapshotter := engine.client.SnapshotService(DefaultSnapshotter)
 	var snapshotNames []string
 	if err := snapshotter.Walk(ctx, func(_ context.Context, info snapshots.Info) error {
@@ -2209,13 +2215,29 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 			}
 		}
 	}
-	priorList := mapKeys(prior)
+	priorList := make([]SessionIdentity, 0, len(prior))
+	for identity := range prior {
+		priorList = append(priorList, identity)
+	}
+	slices.SortFunc(priorList, func(left, right SessionIdentity) int {
+		if order := strings.Compare(left.NodeID, right.NodeID); order != 0 {
+			return order
+		}
+		return strings.Compare(left.BootSessionID, right.BootSessionID)
+	})
 	attemptList := make([]SweptAttemptAuthority, 0, len(attempts))
 	for _, attempt := range attempts {
 		attemptList = append(attemptList, attempt)
 	}
 	sort.Slice(attemptList, func(i, j int) bool { return attemptList[i].AttemptID < attemptList[j].AttemptID })
-	return SweepResponse{Removed: inventoryCount(withoutRetainedBindingInventory(inventory)), PriorBootSessionsSeen: priorList, Inventory: inventory, Attempts: attemptList}, nil
+	removedInventory, err := projectRuntimeAbsenceInventory(inventory,
+		func(_, _ string) (bool, error) { return true, nil },
+		func(string) (bool, error) { return true, nil },
+	)
+	if err != nil {
+		return SweepResponse{}, err
+	}
+	return SweepResponse{Removed: inventoryCount(removedInventory), PriorBootSessionsSeen: priorList, Inventory: inventory, Attempts: attemptList}, nil
 }
 
 func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
@@ -3149,32 +3171,12 @@ func filterInventory(inventory ResourceInventory, resources ResourceIdentity, at
 	return filtered
 }
 
-func withoutServiceDataInventory(inventory ResourceInventory) ResourceInventory {
-	inventory.ManagedVolumes = slices.DeleteFunc(inventory.ManagedVolumes, func(name string) bool {
-		return strings.HasPrefix(name, "wefty-service-volume-")
-	})
-	inventory.ManagedVolumeRecords = []string{}
-	return inventory
-}
-
-func withoutRetainedBindingInventory(inventory ResourceInventory) ResourceInventory {
-	inventory = withoutServiceDataInventory(inventory)
-	inventory.ManagedVolumes = slices.DeleteFunc(inventory.ManagedVolumes, func(name string) bool {
-		return strings.HasPrefix(name, "wefty-handoff-volume-")
-	})
-	inventory.ComputerDiskImages = []string{}
-	inventory.ComputerDiskAllocations = []string{}
-	inventory.ComputerDiskQuotas = []string{}
-	inventory.ComputerDiskManifests = []string{}
-	return inventory
-}
-
 func (engine *ContainerdEngine) runtimeAbsenceInventory(inventory ResourceInventory, now time.Time) (ResourceInventory, error) {
 	retention := engine.config.HandoffRetention
 	if retention <= 0 {
 		retention = defaultHandoffRetention
 	}
-	return projectRuntimeAbsenceInventory(inventory, func(name string) (bool, error) {
+	return projectRuntimeAbsenceInventory(inventory, engine.retainedServiceDataBinding, func(name string) (bool, error) {
 		info, err := os.Stat(filepath.Join(engine.config.RuntimeRoot, "handoffs", name))
 		if errors.Is(err, os.ErrNotExist) {
 			// A concurrently removed inventory entry cannot be retained evidence;
@@ -3189,10 +3191,65 @@ func (engine *ContainerdEngine) runtimeAbsenceInventory(inventory ResourceInvent
 	})
 }
 
-func projectRuntimeAbsenceInventory(inventory ResourceInventory, retainedHandoff func(string) (bool, error)) (ResourceInventory, error) {
-	projected := withoutServiceDataInventory(cloneResourceInventory(inventory))
+func (engine *ContainerdEngine) retainedServiceDataBinding(volumeName, recordName string) (bool, error) {
+	engine.serviceVolumeMu.Lock()
+	defer engine.serviceVolumeMu.Unlock()
+	volumePath := filepath.Join(engine.config.RuntimeRoot, "service-data", volumeName)
+	recordPath := filepath.Join(engine.config.RuntimeRoot, "service-data-state", recordName)
+	info, err := os.Lstat(volumePath)
+	if errors.Is(err, os.ErrNotExist) || err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	payload, err := os.ReadFile(recordPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var record serviceVolumeOwnerRecord
+	if json.Unmarshal(payload, &record) != nil || record.Version != 1 {
+		return false, nil
+	}
+	file, err := os.OpenFile(volumePath, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false, nil
+	}
+	defer file.Close()
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return false, err
+	}
+	return record.Device == uint64(stat.Dev) && record.Inode == stat.Ino && record.UID == stat.Uid && record.GID == stat.Gid, nil
+}
+
+func projectRuntimeAbsenceInventory(inventory ResourceInventory, retainedServiceData func(string, string) (bool, error), retainedHandoff func(string) (bool, error)) (ResourceInventory, error) {
+	projected := cloneResourceInventory(inventory)
+	records := make(map[string]struct{}, len(projected.ManagedVolumeRecords))
+	for _, record := range projected.ManagedVolumeRecords {
+		records[record] = struct{}{}
+	}
+	retainedRecords := make(map[string]struct{})
 	volumes := make([]string, 0, len(projected.ManagedVolumes))
 	for _, name := range projected.ManagedVolumes {
+		if strings.HasPrefix(name, "wefty-service-volume-") {
+			recordName := name + ".owner"
+			if _, present := records[recordName]; present {
+				retained, err := retainedServiceData(name, recordName)
+				if err != nil {
+					return ResourceInventory{}, err
+				}
+				if retained {
+					retainedRecords[recordName] = struct{}{}
+					continue
+				}
+			}
+			volumes = append(volumes, name)
+			continue
+		}
 		if !strings.HasPrefix(name, "wefty-handoff-volume-") {
 			volumes = append(volumes, name)
 			continue
@@ -3206,17 +3263,75 @@ func projectRuntimeAbsenceInventory(inventory ResourceInventory, retainedHandoff
 		}
 	}
 	projected.ManagedVolumes = volumes
-	projected.ComputerDiskImages = []string{}
-	projected.ComputerDiskAllocations = []string{}
-	projected.ComputerDiskQuotas = []string{}
-	projected.ComputerDiskManifests = []string{}
+	projected.ManagedVolumeRecords = slices.DeleteFunc(projected.ManagedVolumeRecords, func(name string) bool {
+		_, retained := retainedRecords[name]
+		return retained
+	})
+	manifestNames := make(map[string]struct{}, len(projected.ComputerDiskManifests))
+	for _, name := range projected.ComputerDiskManifests {
+		manifestNames[name] = struct{}{}
+	}
+	anomalousNames := make(map[string]struct{}, len(projected.ComputerDiskAnomalies))
+	for _, anomaly := range projected.ComputerDiskAnomalies {
+		name, _, _ := strings.Cut(anomaly, ":")
+		anomalousNames[name] = struct{}{}
+	}
+	retainedComputerDisk := func(name string) bool {
+		_, manifestPresent := manifestNames[name]
+		_, anomalous := anomalousNames[name]
+		return manifestPresent && !anomalous
+	}
+	projected.ComputerDiskImages = slices.DeleteFunc(projected.ComputerDiskImages, retainedComputerDisk)
+	projected.ComputerDiskAllocations = slices.DeleteFunc(projected.ComputerDiskAllocations, retainedComputerDisk)
+	projected.ComputerDiskQuotas = slices.DeleteFunc(projected.ComputerDiskQuotas, retainedComputerDisk)
+	projected.ComputerDiskManifests = slices.DeleteFunc(projected.ComputerDiskManifests, retainedComputerDisk)
 	return projected, nil
 }
 
-func captureSweepAuthority(authority AttemptAuthority, prior map[string]struct{}, attempts map[string]SweptAttemptAuthority) {
+func subtractResourceInventory(observed, residue ResourceInventory) ResourceInventory {
+	subtract := func(values, excluded []string) []string {
+		if len(values) == 0 {
+			return nil
+		}
+		excludedSet := make(map[string]struct{}, len(excluded))
+		for _, value := range excluded {
+			excludedSet[value] = struct{}{}
+		}
+		result := make([]string, 0, len(values))
+		for _, value := range values {
+			if _, found := excludedSet[value]; !found {
+				result = append(result, value)
+			}
+		}
+		return result
+	}
+	return ResourceInventory{
+		Leases:                  subtract(observed.Leases, residue.Leases),
+		Snapshots:               subtract(observed.Snapshots, residue.Snapshots),
+		Containers:              subtract(observed.Containers, residue.Containers),
+		Tasks:                   subtract(observed.Tasks, residue.Tasks),
+		Shims:                   subtract(observed.Shims, residue.Shims),
+		Cgroups:                 subtract(observed.Cgroups, residue.Cgroups),
+		LogSegments:             subtract(observed.LogSegments, residue.LogSegments),
+		ManagedVolumes:          subtract(observed.ManagedVolumes, residue.ManagedVolumes),
+		ManagedVolumeRecords:    subtract(observed.ManagedVolumeRecords, residue.ManagedVolumeRecords),
+		ComputerDiskImages:      subtract(observed.ComputerDiskImages, residue.ComputerDiskImages),
+		ComputerDiskAllocations: subtract(observed.ComputerDiskAllocations, residue.ComputerDiskAllocations),
+		ComputerDiskQuotas:      subtract(observed.ComputerDiskQuotas, residue.ComputerDiskQuotas),
+		ComputerDiskManifests:   subtract(observed.ComputerDiskManifests, residue.ComputerDiskManifests),
+		ComputerDiskMounts:      subtract(observed.ComputerDiskMounts, residue.ComputerDiskMounts),
+		ComputerDiskLoops:       subtract(observed.ComputerDiskLoops, residue.ComputerDiskLoops),
+		ComputerAttachments:     subtract(observed.ComputerAttachments, residue.ComputerAttachments),
+		ComputerResetManifests:  subtract(observed.ComputerResetManifests, residue.ComputerResetManifests),
+		ComputerQuarantines:     subtract(observed.ComputerQuarantines, residue.ComputerQuarantines),
+		ComputerDiskAnomalies:   subtract(observed.ComputerDiskAnomalies, residue.ComputerDiskAnomalies),
+	}
+}
+
+func captureSweepAuthority(authority AttemptAuthority, prior map[SessionIdentity]struct{}, attempts map[string]SweptAttemptAuthority) {
 	boot := authority.BootSessionID
-	if boot != "" {
-		prior[boot] = struct{}{}
+	if authority.NodeID != "" && boot != "" {
+		prior[SessionIdentity{NodeID: authority.NodeID, BootSessionID: boot}] = struct{}{}
 	}
 	attempt := authority.AttemptID
 	if attempt != "" {
@@ -3243,16 +3358,8 @@ func readDirectoryIfPresent(path string) ([]os.DirEntry, error) {
 	return entries, nil
 }
 
-func mapKeys(values map[string]struct{}) []string {
-	result := make([]string, 0, len(values))
-	for value := range values {
-		result = append(result, value)
-	}
-	sort.Strings(result)
-	return result
-}
 func inventoryCount(inventory ResourceInventory) int {
-	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) + len(inventory.ComputerQuarantines)
+	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) + len(inventory.ComputerQuarantines) + len(inventory.ComputerDiskAnomalies)
 }
 
 func kernelRelease() string {

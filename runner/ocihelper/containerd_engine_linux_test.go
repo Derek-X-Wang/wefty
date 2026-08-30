@@ -901,10 +901,13 @@ func TestRetainedHandoffProjectionKeepsObservedInventoryAndExpiredResidue(t *tes
 		t.Fatal(err)
 	}
 	inventory := ResourceInventory{
-		ManagedVolumes: []string{handoff, "wefty-service-volume-retained", "unexpected-volume"},
-		Containers:     []string{"unexpected-container"},
+		ManagedVolumes:       []string{handoff, "wefty-service-volume-retained", "wefty-service-volume-orphan", "unexpected-volume"},
+		ManagedVolumeRecords: []string{"wefty-service-volume-retained.owner", "wefty-service-volume-record-only.owner"},
+		Containers:           []string{"unexpected-container"},
 	}
-	projected, err := projectRuntimeAbsenceInventory(inventory, func(name string) (bool, error) {
+	projected, err := projectRuntimeAbsenceInventory(inventory, func(volume, record string) (bool, error) {
+		return volume == "wefty-service-volume-retained" && record == "wefty-service-volume-retained.owner", nil
+	}, func(name string) (bool, error) {
 		return name == handoff, nil
 	})
 	if err != nil {
@@ -913,18 +916,51 @@ func TestRetainedHandoffProjectionKeepsObservedInventoryAndExpiredResidue(t *tes
 	if slices.Contains(projected.ManagedVolumes, handoff) || slices.Contains(projected.ManagedVolumes, "wefty-service-volume-retained") {
 		t.Fatalf("retained binding or service data remained in quiescence projection: %+v", projected)
 	}
-	if !slices.Equal(projected.ManagedVolumes, []string{"unexpected-volume"}) ||
+	if !slices.Equal(projected.ManagedVolumes, []string{"wefty-service-volume-orphan", "unexpected-volume"}) ||
+		!slices.Equal(projected.ManagedVolumeRecords, []string{"wefty-service-volume-record-only.owner"}) ||
 		!slices.Equal(projected.Containers, []string{"unexpected-container"}) {
 		t.Fatalf("quiescence projection hid runtime residue: %+v", projected)
 	}
-	if !slices.Equal(inventory.ManagedVolumes, []string{handoff, "wefty-service-volume-retained", "unexpected-volume"}) {
+	if !slices.Equal(inventory.ManagedVolumes, []string{handoff, "wefty-service-volume-retained", "wefty-service-volume-orphan", "unexpected-volume"}) {
 		t.Fatalf("projection mutated observed inventory: %+v", inventory)
 	}
-	expired, err := projectRuntimeAbsenceInventory(ResourceInventory{ManagedVolumes: []string{handoff}}, func(string) (bool, error) {
+	retained := subtractResourceInventory(inventory, projected)
+	if !slices.Equal(retained.ManagedVolumes, []string{handoff, "wefty-service-volume-retained"}) ||
+		!slices.Equal(retained.ManagedVolumeRecords, []string{"wefty-service-volume-retained.owner"}) || len(retained.Containers) != 0 {
+		t.Fatalf("durable retained inventory = %+v", retained)
+	}
+	expired, err := projectRuntimeAbsenceInventory(ResourceInventory{ManagedVolumes: []string{handoff}}, func(string, string) (bool, error) {
+		return false, nil
+	}, func(string) (bool, error) {
 		return false, nil
 	})
 	if err != nil || !slices.Equal(expired.ManagedVolumes, []string{handoff}) {
 		t.Fatalf("expired handoff was projected as retained: inventory=%+v err=%v", expired, err)
+	}
+}
+
+func TestComputerDiskProjectionRetainsOnlyManifestOwnedNonAnomalousLineage(t *testing.T) {
+	inventory := ResourceInventory{
+		ComputerDiskImages:      []string{"wefty-computer-disk-live", "wefty-computer-disk-orphan", "wefty-computer-disk-anomaly"},
+		ComputerDiskAllocations: []string{"wefty-computer-disk-live", "wefty-computer-disk-anomaly"},
+		ComputerDiskQuotas:      []string{"wefty-computer-disk-live", "wefty-computer-disk-anomaly"},
+		ComputerDiskManifests:   []string{"wefty-computer-disk-live", "wefty-computer-disk-anomaly"},
+		ComputerDiskAnomalies:   []string{"wefty-computer-disk-anomaly:allocation_mismatch"},
+	}
+	projected, err := projectRuntimeAbsenceInventory(inventory, func(string, string) (bool, error) { return false, nil }, func(string) (bool, error) { return false, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(projected.ComputerDiskImages, []string{"wefty-computer-disk-orphan", "wefty-computer-disk-anomaly"}) ||
+		!slices.Equal(projected.ComputerDiskAllocations, []string{"wefty-computer-disk-anomaly"}) ||
+		!slices.Equal(projected.ComputerDiskManifests, []string{"wefty-computer-disk-anomaly"}) ||
+		!slices.Equal(projected.ComputerDiskAnomalies, inventory.ComputerDiskAnomalies) || InventoryEmpty(projected) {
+		t.Fatalf("Computer disk projection hid orphan or anomalous residue: %+v", projected)
+	}
+	retained := subtractResourceInventory(inventory, projected)
+	if !slices.Equal(retained.ComputerDiskImages, []string{"wefty-computer-disk-live"}) ||
+		!slices.Equal(retained.ComputerDiskManifests, []string{"wefty-computer-disk-live"}) || len(retained.ComputerDiskAnomalies) != 0 {
+		t.Fatalf("Computer disk retained projection = %+v", retained)
 	}
 }
 

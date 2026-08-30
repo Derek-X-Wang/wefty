@@ -345,8 +345,11 @@ an OCI job can never consume process Guardian evidence, or vice versa. A
 verified-absent new-boot OCI namespace sweep can prove prior-boot quiescence
 even when its swept-attempt list omits the job because the old helper already
 reaped that attempt before the agent lost its in-memory receipt, but only when
-`PriorBootSessionsSeen` names the removal intent's prior boot. A sweep that
+`PriorBootSessionsSeen` names the removal intent's exact Node and prior boot pair. A sweep that
 names neither the exact attempt nor that prior boot is unbound and fails. The
+helper may carry the boot ID across its own session generations only after a
+successful session reap; a failed reap or an unseen boot never manufactures
+that fact. The
 frozen
 removal manifest still binds every subsequent durable-data deletion and
 post-delete assertion; legacy inventory reconstruction continues to require

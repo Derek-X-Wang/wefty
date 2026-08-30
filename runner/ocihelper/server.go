@@ -22,6 +22,7 @@ const (
 	defaultMaximumDeadman   = 2 * time.Minute
 	defaultReapTimeout      = 10 * time.Second
 	defaultConnectionLimit  = 64
+	maximumReapedBoots      = 256
 )
 
 type Peer struct {
@@ -60,6 +61,9 @@ type Server struct {
 	fatalOnce             sync.Once
 	nextSessionGeneration uint64
 	startupSweep          *SweepResponse
+	sessionReapSweep      *SweepResponse
+	reapedBootSessions    map[SessionIdentity]uint64
+	reapedBootSequence    uint64
 }
 
 type attemptState string
@@ -201,8 +205,9 @@ func NewServer(engine Engine, config ServerConfig) (*Server, error) {
 	}
 	return &Server{
 		engine: engine, config: config,
-		instanceID:  instanceID,
-		connections: make(chan struct{}, config.ConnectionLimit),
+		instanceID:         instanceID,
+		connections:        make(chan struct{}, config.ConnectionLimit),
+		reapedBootSessions: make(map[SessionIdentity]uint64),
 	}, nil
 }
 
@@ -275,8 +280,11 @@ func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("startup verify OCI runtime namespace: %w", err)
 	}
+	if verification.Absent != InventoryEmpty(verification.RuntimeResidue) {
+		return namespaceResidueError("startup verify OCI runtime namespace", verification)
+	}
 	if !verification.Absent {
-		return fmt.Errorf("startup verify OCI runtime namespace: residue remains after sweep: %+v", verification.Inventory)
+		return namespaceResidueError("startup verify OCI runtime namespace", verification)
 	}
 	server.sessionMu.Lock()
 	server.startupSweep = &sweep
@@ -548,7 +556,7 @@ func (session *serverSession) invalidate(reason string) {
 		session.internalReaps.Wait()
 		session.server.createSweep.Lock()
 		ctx, cancel := session.server.reapContext()
-		reapErr := session.server.engine.ReapSession(ctx, session.identity)
+		reapSweep, reapErr := session.server.engine.ReapSession(ctx, session.identity)
 		cancel()
 		session.server.createSweep.Unlock()
 		if reapErr != nil {
@@ -556,6 +564,8 @@ func (session *serverSession) invalidate(reason string) {
 			return
 		}
 		session.server.sessionMu.Lock()
+		session.server.rememberReapedBootsLocked(append(reapSweep.PriorBootSessionsSeen, session.identity)...)
+		session.server.sessionReapSweep = mergeSweepResponsePointer(session.server.sessionReapSweep, reapSweep)
 		if session.server.active == session {
 			session.server.active = nil
 		}
@@ -1497,6 +1507,14 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			server.sessionMu.Lock()
 			startup := server.startupSweep
 			server.startupSweep = nil
+			sessionReap := server.sessionReapSweep
+			server.sessionReapSweep = nil
+			if startup != nil {
+				server.rememberReapedBootsLocked(startup.PriorBootSessionsSeen...)
+			}
+			for identity := range server.reapedBootSessions {
+				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, identity)
+			}
 			server.sessionMu.Unlock()
 			if startup != nil {
 				response.Removed += startup.Removed
@@ -1504,6 +1522,14 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				response.Inventory = mergeResourceInventory(response.Inventory, startup.Inventory)
 				response.Attempts = append(response.Attempts, startup.Attempts...)
 			}
+			if sessionReap != nil {
+				response.Removed += sessionReap.Removed
+				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, sessionReap.PriorBootSessionsSeen...)
+				response.Inventory = mergeResourceInventory(response.Inventory, sessionReap.Inventory)
+				response.Attempts = append(response.Attempts, sessionReap.Attempts...)
+			}
+			slices.SortFunc(response.PriorBootSessionsSeen, compareSessionIdentity)
+			response.PriorBootSessionsSeen = slices.Compact(response.PriorBootSessionsSeen)
 			session.mu.Lock()
 			session.sweepPending = true
 			session.sweepResponse = response
@@ -1564,6 +1590,45 @@ func validComputerBackupRequest(backupID, copyID string, storage ComputerStorage
 func validCurrentRemovalAuthority(removal ManagedVolumeRemovalAuthority, identity SessionIdentity) bool {
 	return removal.NodeID == identity.NodeID && removal.BootSessionID == identity.BootSessionID &&
 		strings.TrimSpace(removal.JobID) != "" && removal.RemovalGeneration > 0 && strings.TrimSpace(removal.CleanupFence) != ""
+}
+
+func compareSessionIdentity(left, right SessionIdentity) int {
+	if order := strings.Compare(left.NodeID, right.NodeID); order != 0 {
+		return order
+	}
+	return strings.Compare(left.BootSessionID, right.BootSessionID)
+}
+
+func (server *Server) rememberReapedBootsLocked(identities ...SessionIdentity) {
+	for _, identity := range identities {
+		if identity.NodeID == "" || identity.BootSessionID == "" {
+			continue
+		}
+		server.reapedBootSequence++
+		server.reapedBootSessions[identity] = server.reapedBootSequence
+	}
+	for len(server.reapedBootSessions) > maximumReapedBoots {
+		var oldest SessionIdentity
+		var oldestSequence uint64
+		for identity, sequence := range server.reapedBootSessions {
+			if oldestSequence == 0 || sequence < oldestSequence {
+				oldest, oldestSequence = identity, sequence
+			}
+		}
+		delete(server.reapedBootSessions, oldest)
+	}
+}
+
+func mergeSweepResponsePointer(target *SweepResponse, addition SweepResponse) *SweepResponse {
+	if target == nil {
+		copy := addition
+		return &copy
+	}
+	target.Removed += addition.Removed
+	target.PriorBootSessionsSeen = append(target.PriorBootSessionsSeen, addition.PriorBootSessionsSeen...)
+	target.Inventory = mergeResourceInventory(target.Inventory, addition.Inventory)
+	target.Attempts = append(target.Attempts, addition.Attempts...)
+	return target
 }
 
 func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {

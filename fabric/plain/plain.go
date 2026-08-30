@@ -7,10 +7,12 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -42,6 +44,16 @@ func NewNetwork() *Network {
 		peers:    make(map[string]fabric.Identity),
 		fabricID: "plain-" + hex.EncodeToString(identity),
 	}
+}
+
+// NewNetworkWithID joins separate DEVELOPMENT ONLY plain-Fabric processes to
+// one explicit authority. The reserved prefix prevents plain identity from
+// being presented as a production Fabric implementation.
+func NewNetworkWithID(fabricID string) (*Network, error) {
+	if !strings.HasPrefix(fabricID, "plain-") || len(fabricID) <= len("plain-") || len(fabricID) > 255 || strings.TrimSpace(fabricID) != fabricID {
+		return nil, errors.New("plain fabric: explicit Fabric ID must use the bounded plain- prefix")
+	}
+	return &Network{names: make(map[string]string), peers: make(map[string]fabric.Identity), fabricID: fabricID}, nil
 }
 
 // Fabric is one identity-bearing participant in a plain Network.

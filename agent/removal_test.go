@@ -27,7 +27,7 @@ func TestRemovalControllerPersistsReapsDeletesThenAcknowledges(t *testing.T) {
 		stages = append(stages, "persist")
 		return nil
 	}
-	controller.reapService = func(context.Context, string, string) (workloadrunner.ReapReceipt, error) {
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
 		stages = append(stages, "withdraw-and-reap")
 		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
 	}
@@ -99,7 +99,7 @@ func TestComputerRemovalDeletesDiskBeforeAcknowledgement(t *testing.T) {
 		frozen = true
 		return nil
 	}
-	controller.reapService = func(context.Context, string, string) (workloadrunner.ReapReceipt, error) {
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
 		stages = append(stages, "reap")
 		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt, BootSessionID: "boot"}, nil
 	}
@@ -179,7 +179,7 @@ func TestFrozenRuntimeRemovalRejectsNonOCIKindBeforeReap(t *testing.T) {
 	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
 		return runtimeRemovalRecord{manifest: manifest, phase: runtimeRemovalPrepared}, true, nil
 	}
-	controller.reapService = func(context.Context, string, string) (workloadrunner.ReapReceipt, error) {
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
 		reaped = true
 		return workloadrunner.ReapReceipt{}, nil
 	}
@@ -244,7 +244,7 @@ func TestRemovalControllerNeverAcknowledgesFailedDeletion(t *testing.T) {
 	acknowledged := false
 	controller := &removalController{nodeID: "node"}
 	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
-	controller.reapService = func(context.Context, string, string) (workloadrunner.ReapReceipt, error) {
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
 		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
 	}
 	controller.purgeJob = func(context.Context, string) error { return nil }
@@ -279,7 +279,7 @@ func TestRemovalControllerBlocksWithoutPositiveRuntimeReceipt(t *testing.T) {
 			downstream := false
 			controller := &removalController{nodeID: "node"}
 			controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
-			controller.reapService = func(context.Context, string, string) (workloadrunner.ReapReceipt, error) {
+			controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
 				return test.receipt, test.err
 			}
 			controller.purgeJob = func(context.Context, string) error { downstream = true; return nil }
@@ -312,7 +312,7 @@ func TestRemovalControllerCompletesRuntimeManifestThenDeletesAndAcknowledges(t *
 	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
 		return runtimeRemovalRecord{removal: testRuntimeRemoval(directive.JobID), manifest: manifest, phase: runtimeRemovalPrepared}, true, nil
 	}
-	controller.reapService = func(context.Context, string, string) (workloadrunner.ReapReceipt, error) {
+	controller.reapService = func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
 		stages = append(stages, "quiesce")
 		return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
 	}
@@ -387,11 +387,13 @@ func TestRemovalControllerResumesEveryRuntimeManifestPhase(t *testing.T) {
 				record.receipt = receipt
 			}
 			reaped := false
+			var reapedAttempts []workloadrunner.RuntimeResourceManifest
 			recorded := false
 			controller := &removalController{managed: &resumedManagedResource{}}
 			controller.listRuntimeRemovals = func(context.Context) ([]runtimeRemovalRecord, error) { return []runtimeRemovalRecord{record}, nil }
-			controller.reapService = func(context.Context, string, string) (workloadrunner.ReapReceipt, error) {
+			controller.reapService = func(_ context.Context, _ string, _ string, attempts []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
 				reaped = true
+				reapedAttempts = append([]workloadrunner.RuntimeResourceManifest(nil), attempts...)
 				return receipt, nil
 			}
 			controller.recordRuntimeQuiesced = func(context.Context, localRemoval, workloadrunner.ReapReceipt) error {
@@ -413,6 +415,9 @@ func TestRemovalControllerResumesEveryRuntimeManifestPhase(t *testing.T) {
 			}
 			if reaped != test.wantReap || recorded != test.wantRecord {
 				t.Fatalf("resume phase %s = reaped %t recorded %t, want %t/%t", test.phase, reaped, recorded, test.wantReap, test.wantRecord)
+			}
+			if test.wantReap && !reflect.DeepEqual(reapedAttempts, manifest.Attempts) {
+				t.Fatalf("resume phase %s reaped attempts = %+v, want %+v", test.phase, reapedAttempts, manifest.Attempts)
 			}
 		})
 	}
@@ -472,7 +477,7 @@ func TestSessionRoutesRuntimeReceiptIntoLiveRemoval(t *testing.T) {
 	}
 	want := workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}
 	session.recordRuntimeReap("service", want, nil)
-	got, err := session.reapServiceForRemoval(context.Background(), "service", contract.JobKindProcess)
+	got, err := session.reapServiceForRemoval(context.Background(), "service", contract.JobKindProcess, nil)
 	if err != nil || got != want {
 		t.Fatalf("routed runtime receipt = %#v err=%v, want %#v", got, err, want)
 	}
@@ -484,7 +489,7 @@ func TestReturningNodeRemovalUsesPriorBootGuardianReceipt(t *testing.T) {
 		registration: contract.NodeRegistration{BootSessionID: "boot-current"},
 		resident:     make(map[string]*residentAttempt), residentJobID: make(map[string]struct{}),
 		serviceReaps: make(map[string]runtimeReapOutcome), serviceBoots: make(map[string]string),
-		reapPriorBoot: func(_ context.Context, jobID, kind string) (workloadrunner.ReapReceipt, error) {
+		reapPriorBoot: func(_ context.Context, jobID, kind string, _ []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
 			called = true
 			if jobID != "offline-service" {
 				t.Fatalf("prior-boot reap job = %q", jobID)
@@ -498,7 +503,7 @@ func TestReturningNodeRemovalUsesPriorBootGuardianReceipt(t *testing.T) {
 			}, nil
 		},
 	}
-	receipt, err := session.reapServiceForRemoval(context.Background(), "offline-service", contract.JobKindProcess)
+	receipt, err := session.reapServiceForRemoval(context.Background(), "offline-service", contract.JobKindProcess, nil)
 	if err != nil || !called || receipt.Evidence != workloadrunner.ReapEvidencePriorBootGuardian {
 		t.Fatalf("returning-node receipt = %#v err=%v called=%t", receipt, err, called)
 	}

@@ -17,6 +17,49 @@ type BootBarrierConfig struct {
 	TakeoverRetry   time.Duration
 }
 
+// NamespaceResidueError preserves the distinction between resources that
+// block OCI admission and durable resources intentionally retained across a
+// quiescent namespace verification.
+type NamespaceResidueError struct {
+	Operation       string
+	Observed        ResourceInventory
+	RuntimeResidue  ResourceInventory
+	DurableRetained ResourceInventory
+}
+
+// ResidueClassificationError means an engine returned an absence verdict that
+// disagrees with its explicit runtime-residue projection. The barrier refuses
+// to guess which observed resources are durable.
+type ResidueClassificationError struct {
+	Operation      string
+	Absent         bool
+	Observed       ResourceInventory
+	RuntimeResidue ResourceInventory
+}
+
+func (err *ResidueClassificationError) Error() string {
+	return fmt.Sprintf("%s: inconsistent runtime-residue classification: absent=%t runtime=%+v observed=%+v", err.Operation, err.Absent, err.RuntimeResidue, err.Observed)
+}
+
+func (err *NamespaceResidueError) Error() string {
+	return fmt.Sprintf("%s: residue remains after sweep: runtime=%+v durable_retained=%+v observed=%+v", err.Operation, err.RuntimeResidue, err.DurableRetained, err.Observed)
+}
+
+func namespaceResidueError(operation string, verification VerifyResponse) error {
+	if verification.Absent != InventoryEmpty(verification.RuntimeResidue) {
+		return &ResidueClassificationError{
+			Operation: operation, Absent: verification.Absent,
+			Observed: cloneResourceInventory(verification.Inventory), RuntimeResidue: cloneResourceInventory(verification.RuntimeResidue),
+		}
+	}
+	return &NamespaceResidueError{
+		Operation:       operation,
+		Observed:        cloneResourceInventory(verification.Inventory),
+		RuntimeResidue:  cloneResourceInventory(verification.RuntimeResidue),
+		DurableRetained: cloneResourceInventory(verification.DurableRetained),
+	}
+}
+
 // BootBarrier owns one exclusive helper session and proves the wefty runtime
 // namespace empty before that session may be used. State readers never wait
 // for takeover RPCs: ensureMu serializes retries while mu protects snapshots.
@@ -148,8 +191,11 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("verify OCI runtime namespace: %w", err)
 	}
+	if verification.Absent != InventoryEmpty(verification.RuntimeResidue) {
+		return namespaceResidueError("verify OCI runtime namespace", verification)
+	}
 	if !verification.Absent {
-		return fmt.Errorf("verify OCI runtime namespace: residue remains after sweep: %+v", verification.Inventory)
+		return namespaceResidueError("verify OCI runtime namespace", verification)
 	}
 	receipt := VerifiedSweepReceipt{
 		SweepEpoch:            sweep.SweepEpoch,
@@ -158,6 +204,8 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 		SweptInventory:        cloneResourceInventory(sweep.Inventory),
 		VerifiedAbsent:        verification.Absent,
 		VerifiedInventory:     cloneResourceInventory(verification.Inventory),
+		VerifiedResidue:       cloneResourceInventory(verification.RuntimeResidue),
+		VerifiedRetained:      cloneResourceInventory(verification.DurableRetained),
 		Attempts:              slices.Clone(sweep.Attempts),
 	}
 	if receipt.SweepEpoch == "" {
@@ -259,6 +307,8 @@ func cloneVerifiedSweepReceipt(receipt VerifiedSweepReceipt) VerifiedSweepReceip
 	receipt.PriorBootSessionsSeen = slices.Clone(receipt.PriorBootSessionsSeen)
 	receipt.SweptInventory = cloneResourceInventory(receipt.SweptInventory)
 	receipt.VerifiedInventory = cloneResourceInventory(receipt.VerifiedInventory)
+	receipt.VerifiedResidue = cloneResourceInventory(receipt.VerifiedResidue)
+	receipt.VerifiedRetained = cloneResourceInventory(receipt.VerifiedRetained)
 	receipt.Attempts = slices.Clone(receipt.Attempts)
 	return receipt
 }
@@ -290,5 +340,5 @@ func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {
 func InventoryEmpty(inventory ResourceInventory) bool {
 	return len(inventory.Leases)+len(inventory.Snapshots)+len(inventory.Containers)+len(inventory.Tasks)+
 		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ManagedVolumes)+len(inventory.ManagedVolumeRecords)+
-		len(inventory.ComputerDiskImages)+len(inventory.ComputerDiskAllocations)+len(inventory.ComputerDiskQuotas)+len(inventory.ComputerDiskManifests)+len(inventory.ComputerDiskMounts)+len(inventory.ComputerDiskLoops)+len(inventory.ComputerAttachments)+len(inventory.ComputerResetManifests)+len(inventory.ComputerQuarantines) == 0
+		len(inventory.ComputerDiskImages)+len(inventory.ComputerDiskAllocations)+len(inventory.ComputerDiskQuotas)+len(inventory.ComputerDiskManifests)+len(inventory.ComputerDiskMounts)+len(inventory.ComputerDiskLoops)+len(inventory.ComputerAttachments)+len(inventory.ComputerResetManifests)+len(inventory.ComputerQuarantines)+len(inventory.ComputerDiskAnomalies) == 0
 }

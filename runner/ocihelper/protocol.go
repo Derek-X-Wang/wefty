@@ -1231,8 +1231,10 @@ type VerifyRequest struct {
 }
 
 type VerifyResponse struct {
-	Absent    bool              `json:"absent"`
-	Inventory ResourceInventory `json:"inventory"`
+	Absent          bool              `json:"absent"`
+	Inventory       ResourceInventory `json:"inventory"`
+	RuntimeResidue  ResourceInventory `json:"runtime_residue"`
+	DurableRetained ResourceInventory `json:"durable_retained"`
 }
 
 // SweepRequest is intentionally empty: the boot barrier always sweeps the
@@ -1246,7 +1248,7 @@ type SweepRequest struct {
 type SweepResponse struct {
 	SweepEpoch            string                  `json:"sweep_epoch"`
 	Removed               int                     `json:"removed"`
-	PriorBootSessionsSeen []string                `json:"prior_boot_sessions_seen"`
+	PriorBootSessionsSeen []SessionIdentity       `json:"prior_boot_sessions_seen"`
 	Inventory             ResourceInventory       `json:"inventory"`
 	Attempts              []SweptAttemptAuthority `json:"attempts"`
 }
@@ -1296,10 +1298,12 @@ type SweptAttemptAuthority struct {
 type VerifiedSweepReceipt struct {
 	SweepEpoch            string                  `json:"sweep_epoch"`
 	HelperSession         HelperSession           `json:"helper_session"`
-	PriorBootSessionsSeen []string                `json:"prior_boot_sessions_seen"`
+	PriorBootSessionsSeen []SessionIdentity       `json:"prior_boot_sessions_seen"`
 	SweptInventory        ResourceInventory       `json:"swept_inventory"`
 	VerifiedAbsent        bool                    `json:"verified_absent"`
 	VerifiedInventory     ResourceInventory       `json:"verified_inventory"`
+	VerifiedResidue       ResourceInventory       `json:"verified_residue"`
+	VerifiedRetained      ResourceInventory       `json:"verified_retained"`
 	Attempts              []SweptAttemptAuthority `json:"attempts"`
 }
 

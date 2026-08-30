@@ -581,7 +581,9 @@ func TestBootBarrierSweepsVerifiesAndRetriesExclusiveTakeover(t *testing.T) {
 	requireSweep(t, incumbent)
 
 	clock := &observedClock{manualClock: newManualClock(time.Unix(1_000, 0)), timerCreated: make(chan struct{}, 8)}
-	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{Clock: clock})
+	takeoverRequest := testSessionRequest()
+	takeoverRequest.BootSessionID = "boot-2"
+	barrier, err := NewBootBarrierWithConfig(client, takeoverRequest, BootBarrierConfig{Clock: clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -637,9 +639,9 @@ takeoverComplete:
 	if receipt.HelperSession.SessionGeneration <= incumbentGeneration {
 		t.Fatalf("takeover generation = %d, want newer than %d", receipt.HelperSession.SessionGeneration, incumbentGeneration)
 	}
-	receipt.PriorBootSessionsSeen = append(receipt.PriorBootSessionsSeen, "mutated")
+	receipt.PriorBootSessionsSeen = append(receipt.PriorBootSessionsSeen, SessionIdentity{NodeID: "mutated", BootSessionID: "mutated"})
 	retained, ok := barrier.SweepReceipt()
-	if !ok || len(retained.PriorBootSessionsSeen) != 0 {
+	if !ok || !slices.Equal(retained.PriorBootSessionsSeen, []SessionIdentity{{NodeID: testSessionRequest().NodeID, BootSessionID: testSessionRequest().BootSessionID}}) {
 		t.Fatalf("barrier receipt was mutable through caller copy: %#v", retained)
 	}
 	before := engine.methods()
@@ -653,21 +655,58 @@ takeoverComplete:
 
 func TestBootBarrierRefusesResidueAndNeverExposesSession(t *testing.T) {
 	engine := newFakeEngine()
-	engine.verifyResponses = []VerifyResponse{{Absent: true}, {Absent: false}}
+	engine.verifyResponses = []VerifyResponse{{Absent: true}, {
+		Absent: false,
+		Inventory: ResourceInventory{
+			Cgroups: []string{"genuine-cgroup"}, ManagedVolumes: []string{"wefty-service-volume-retained"},
+		},
+		RuntimeResidue:  ResourceInventory{Cgroups: []string{"genuine-cgroup"}},
+		DurableRetained: ResourceInventory{ManagedVolumes: []string{"wefty-service-volume-retained"}},
+	}}
 	client, stop := startTestServer(t, engine, ServerConfig{})
 	defer stop()
 	barrier, err := NewBootBarrier(client, testSessionRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := barrier.Ensure(t.Context()); err == nil {
+	err = barrier.Ensure(t.Context())
+	if err == nil {
 		t.Fatal("barrier accepted residue after sweep")
+	}
+	var residue *NamespaceResidueError
+	if !errors.As(err, &residue) || !slices.Equal(residue.RuntimeResidue.Cgroups, []string{"genuine-cgroup"}) ||
+		!slices.Equal(residue.DurableRetained.ManagedVolumes, []string{"wefty-service-volume-retained"}) {
+		t.Fatalf("barrier residue error = %#v, err=%v", residue, err)
 	}
 	if barrier.Ready() {
 		t.Fatal("failed verification made barrier ready")
 	}
 	if _, err := barrier.Session(); err == nil {
 		t.Fatal("failed verification exposed a helper session")
+	}
+}
+
+func TestBootBarrierRefusesInconsistentResidueClassificationWithTypedError(t *testing.T) {
+	for _, verification := range []VerifyResponse{
+		{Absent: true, Inventory: ResourceInventory{ComputerDiskAnomalies: []string{"disk:allocation_mismatch"}}, RuntimeResidue: ResourceInventory{ComputerDiskAnomalies: []string{"disk:allocation_mismatch"}}},
+		{Absent: false, Inventory: ResourceInventory{Containers: []string{"observed-without-classification"}}},
+	} {
+		engine := newFakeEngine()
+		engine.verifyResponses = []VerifyResponse{{Absent: true}, verification}
+		client, stop := startTestServer(t, engine, ServerConfig{})
+		barrier, err := NewBootBarrier(client, testSessionRequest())
+		if err != nil {
+			stop()
+			t.Fatal(err)
+		}
+		err = barrier.Ensure(t.Context())
+		var classification *ResidueClassificationError
+		if !errors.As(err, &classification) {
+			stop()
+			t.Fatalf("inconsistent verification error = %v", err)
+		}
+		_ = barrier.Close()
+		stop()
 	}
 }
 
@@ -678,7 +717,9 @@ func TestBootBarrierReceiptsRetainedHandoffInventoryWithoutCallingItResidue(t *t
 		t.Fatal(err)
 	}
 	engine.verifyResponses = []VerifyResponse{{Absent: true}, {
-		Absent: true, Inventory: ResourceInventory{ManagedVolumes: []string{handoff}},
+		Absent:          true,
+		Inventory:       ResourceInventory{ManagedVolumes: []string{handoff}},
+		DurableRetained: ResourceInventory{ManagedVolumes: []string{handoff}},
 	}}
 	client, stop := startTestServer(t, engine, ServerConfig{})
 	defer stop()
@@ -690,7 +731,8 @@ func TestBootBarrierReceiptsRetainedHandoffInventoryWithoutCallingItResidue(t *t
 		t.Fatal(err)
 	}
 	receipt, ok := barrier.SweepReceipt()
-	if !ok || !receipt.VerifiedAbsent || !slices.Equal(receipt.VerifiedInventory.ManagedVolumes, []string{handoff}) {
+	if !ok || !receipt.VerifiedAbsent || !slices.Equal(receipt.VerifiedInventory.ManagedVolumes, []string{handoff}) ||
+		!InventoryEmpty(receipt.VerifiedResidue) || !slices.Equal(receipt.VerifiedRetained.ManagedVolumes, []string{handoff}) {
 		t.Fatalf("retained handoff verification receipt = %+v, ok=%t", receipt, ok)
 	}
 	session, err := barrier.Session()
@@ -735,7 +777,7 @@ func TestHelperRestartSweepsAndVerifiesBeforeAcceptingSession(t *testing.T) {
 
 func TestHelperStartupResidueFailsServeBeforeSessionAuthority(t *testing.T) {
 	engine := newFakeEngine()
-	engine.verifyResponses = []VerifyResponse{{Absent: false}}
+	engine.verifyResponses = []VerifyResponse{{Absent: false, RuntimeResidue: ResourceInventory{Leases: []string{"wefty-residue"}}}}
 	server, err := NewServer(engine, ServerConfig{
 		HelperChecksum: "checksum-test", AllowedUIDs: []uint32{uint32(os.Getuid())},
 	})
@@ -757,6 +799,68 @@ func TestHelperStartupResidueFailsServeBeforeSessionAuthority(t *testing.T) {
 	}
 	if got := engine.methods(); !equalStrings(got, []string{"Sweep", "Verify"}) {
 		t.Fatalf("failed helper startup operations = %v", got)
+	}
+}
+
+func TestPriorBootEvidenceSurvivesStartupConsumptionAndSessionReapGeneration(t *testing.T) {
+	boot0 := SessionIdentity{NodeID: "node-1", BootSessionID: "boot-0"}
+	reapedBeyondSession := SessionIdentity{NodeID: "node-1", BootSessionID: "boot-extra"}
+	engine := newFakeEngine()
+	engine.sweepResponses = []SweepResponse{{PriorBootSessionsSeen: []SessionIdentity{boot0}}, {}, {}}
+	engine.sessionReapResponse = SweepResponse{PriorBootSessionsSeen: []SessionIdentity{reapedBeyondSession}}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+
+	gen1, err := client.OpenSession(t.Context(), AcquireSessionRequest{NodeID: "node-1", BootSessionID: "boot-1", ExpectedHelperChecksum: "checksum-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSweep, err := gen1.Sweep(t.Context(), SweepRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gen1.Verify(t.Context(), VerifyRequest{Scope: VerifyNamespace}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(firstSweep.PriorBootSessionsSeen, boot0) {
+		t.Fatalf("generation 1 did not consume startup boot evidence: %+v", firstSweep.PriorBootSessionsSeen)
+	}
+	if err := gen1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 1 }, "generation 1 session reap")
+
+	gen2, err := client.OpenSession(t.Context(), AcquireSessionRequest{NodeID: "node-1", BootSessionID: "boot-2", ExpectedHelperChecksum: "checksum-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gen2.Close()
+	secondSweep, err := gen2.Sweep(t.Context(), SweepRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, identity := range []SessionIdentity{boot0, reapedBeyondSession, {NodeID: "node-1", BootSessionID: "boot-1"}} {
+		if !slices.Contains(secondSweep.PriorBootSessionsSeen, identity) {
+			t.Fatalf("generation 2 lost prior boot %+v: %+v", identity, secondSweep.PriorBootSessionsSeen)
+		}
+	}
+}
+
+func TestPriorBootEvidenceHistoryIsBoundedByExactSessionIdentity(t *testing.T) {
+	exact := &Server{reapedBootSessions: make(map[SessionIdentity]uint64)}
+	exact.rememberReapedBootsLocked(SessionIdentity{NodeID: "node-a", BootSessionID: "shared-boot"}, SessionIdentity{NodeID: "node-b", BootSessionID: "shared-boot"})
+	if len(exact.reapedBootSessions) != 2 {
+		t.Fatalf("reaped boot history collapsed Node identity: %+v", exact.reapedBootSessions)
+	}
+	server := &Server{reapedBootSessions: make(map[SessionIdentity]uint64)}
+	for index := 0; index <= maximumReapedBoots; index++ {
+		server.rememberReapedBootsLocked(SessionIdentity{NodeID: "node", BootSessionID: fmt.Sprintf("boot-%03d", index)})
+	}
+	if len(server.reapedBootSessions) != maximumReapedBoots {
+		t.Fatalf("reaped boot history size = %d", len(server.reapedBootSessions))
+	}
+	if _, retained := server.reapedBootSessions[SessionIdentity{NodeID: "node", BootSessionID: "boot-000"}]; retained {
+		t.Fatal("reaped boot history did not prune its oldest identity")
 	}
 }
 
@@ -1148,6 +1252,29 @@ func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertStreamPayload(t, bridge, "host-bridge")
+}
+
+func TestEndpointAdmittedByInvalidatedSessionRefusesWithTypedSessionStale(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}}
+	clock := newManualClock(time.Unix(30_000, 0))
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: time.Second, Clock: clock})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Minute)
+	request.AllocateEndpoints = []string{"service"}
+	if _, err := session.Run(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 1 }, "invalidated admitting session reap")
+	_, err = session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: request.Authority, Name: "service"})
+	assertRPCCode(t, err, CodeSessionStale)
 }
 
 func TestNamedEndpointAuthorizationResolvesOnlyTheRequestedName(t *testing.T) {
@@ -2070,6 +2197,8 @@ type fakeEngine struct {
 	releaseSignal            chan struct{}
 	signalErr                error
 	sessionReapErr           error
+	sessionReapResponse      SweepResponse
+	sweepResponses           []SweepResponse
 	verifyResponses          []VerifyResponse
 	dialAttemptWithoutMarker bool
 	dialHostBridgeRead       bool
@@ -2322,7 +2451,7 @@ func (engine *crashBoundaryEngine) Sweep(context.Context, SweepRequest) (SweepRe
 	engine.stateMu.Unlock()
 	response := SweepResponse{SweepEpoch: "fake-sweep", Removed: removed, Inventory: inventory}
 	if removed != 0 && authority.AttemptID != "" {
-		response.PriorBootSessionsSeen = []string{authority.BootSessionID}
+		response.PriorBootSessionsSeen = []SessionIdentity{{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID}}
 		response.Attempts = []SweptAttemptAuthority{{
 			RemovalGeneration: authority.RemovalGeneration, AttemptID: authority.AttemptID,
 			FencingToken: authority.FencingToken, PriorBootSessionID: authority.BootSessionID,
@@ -2373,18 +2502,18 @@ func (engine *crashBoundaryEngine) ReapAttempt(context.Context, AttemptAuthority
 	return errors.New("simulated helper crash prevented attempt reap")
 }
 
-func (engine *crashBoundaryEngine) ReapSession(context.Context, SessionIdentity) error {
+func (engine *crashBoundaryEngine) ReapSession(context.Context, SessionIdentity) (SweepResponse, error) {
 	engine.stateMu.Lock()
 	defer engine.stateMu.Unlock()
 	if engine.crashAfter == 0 {
 		clear(engine.residues)
 		clear(engine.live)
-		return nil
+		return SweepResponse{}, nil
 	}
 	if len(engine.residues) != 0 {
-		return errors.New("simulated crashed session retained residue")
+		return SweepResponse{}, errors.New("simulated crashed session retained residue")
 	}
-	return nil
+	return SweepResponse{}, nil
 }
 
 func (engine *crashBoundaryEngine) restartAfterCrash() *crashBoundaryEngine {
@@ -2628,6 +2757,13 @@ func (engine *fakeEngine) Sweep(context.Context, SweepRequest) (SweepResponse, e
 		<-releaseSweep
 	}
 	engine.record("Sweep")
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if len(engine.sweepResponses) > 0 {
+		response := engine.sweepResponses[0]
+		engine.sweepResponses = engine.sweepResponses[1:]
+		return response, nil
+	}
 	return SweepResponse{Removed: 1}, nil
 }
 func (engine *fakeEngine) DialAttemptPort(_ context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
@@ -2657,11 +2793,11 @@ func (engine *fakeEngine) ReapAttempt(_ context.Context, authority AttemptAuthor
 	engine.mu.Unlock()
 	return nil
 }
-func (engine *fakeEngine) ReapSession(_ context.Context, identity SessionIdentity) error {
+func (engine *fakeEngine) ReapSession(_ context.Context, identity SessionIdentity) (SweepResponse, error) {
 	engine.mu.Lock()
+	defer engine.mu.Unlock()
 	engine.sessionReaps = append(engine.sessionReaps, identity)
-	engine.mu.Unlock()
-	return engine.sessionReapErr
+	return engine.sessionReapResponse, engine.sessionReapErr
 }
 func (engine *fakeEngine) methods() []string {
 	engine.mu.Lock()

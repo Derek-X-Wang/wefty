@@ -83,6 +83,7 @@ func run() error {
 	nodePolicies := make(map[string]l1.NodePolicy)
 	var (
 		fabricMode               = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
+		plainFabricID            = flag.String("plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain Fabric ID (must start with plain-)")
 		listenAddress            = flag.String("listen", "wefty://control-plane", "control-plane Fabric listen address")
 		databasePath             = flag.String("db", "wefty-l1.sqlite", "SQLite database path")
 		leaseDuration            = flag.Duration("lease-duration", l1.DefaultLeaseDuration, "attempt lease duration")
@@ -142,6 +143,7 @@ func run() error {
 
 	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
 		Mode:           *fabricMode,
+		PlainFabricID:  *plainFabricID,
 		Identity:       fabric.Identity{NodeID: "control-plane"},
 		Name:           *fabricName,
 		StateDirectory: *stateDirectory,

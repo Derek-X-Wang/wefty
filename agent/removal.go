@@ -36,7 +36,7 @@ type removalController struct {
 	recordRuntimeAttested func(context.Context, localRemoval, workloadrunner.RuntimeRemovalAttestation) error
 	persistRuntimeRemoval func(context.Context, localRemoval, []workloadrunner.RuntimeResourceManifest) error
 	loadRemovalIntent     func(context.Context, string) (localRemoval, bool, error)
-	reapService           func(context.Context, string, string) (workloadrunner.ReapReceipt, error)
+	reapService           func(context.Context, string, string, []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error)
 	clearReap             func(string)
 	purgeJob              func(context.Context, string) error
 	removeResource        func(context.Context, localRemoval) error
@@ -178,7 +178,7 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	if removal.kind == contract.JobKindOCI {
 		return fmt.Errorf("agent: legacy OCI removal %q has no persisted helper-owned inventory", removal.jobID)
 	}
-	receipt, err := controller.reapService(ctx, directive.JobID, directive.Kind)
+	receipt, err := controller.reapService(ctx, directive.JobID, directive.Kind, nil)
 	if err != nil {
 		return err
 	}
@@ -310,7 +310,7 @@ func (controller *removalController) continueRuntimeRemoval(ctx context.Context,
 	case runtimeRemovalQuarantined:
 		// Runtime quiescence is durable; local and helper deletion may resume.
 	case runtimeRemovalPrepared:
-		receipt, err := controller.reapService(ctx, removal.jobID, removal.kind)
+		receipt, err := controller.reapService(ctx, removal.jobID, removal.kind, runtimeRemoval.manifest.Attempts)
 		if err != nil {
 			return err
 		}

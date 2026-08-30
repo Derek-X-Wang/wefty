@@ -478,6 +478,10 @@ type PriorBootReapRequest struct {
 	JobID                string
 	PriorBootSessionID   string
 	CurrentBootSessionID string
+	AttemptID            string
+	FencingToken         string
+	WorkloadClass        string
+	RemovalGeneration    string
 }
 
 // PriorBootReaper is optional because not every runtime has boot-barrier

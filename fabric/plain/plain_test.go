@@ -75,6 +75,39 @@ func TestEchoWithInjectedIdentity(t *testing.T) {
 	}
 }
 
+func TestExplicitFabricIDJoinsSeparateProcessNetworks(t *testing.T) {
+	first, err := NewNetworkWithID("plain-linux-computer-acceptance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewNetworkWithID("plain-linux-computer-acceptance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.fabricID != second.fabricID || first.fabricID != "plain-linux-computer-acceptance" {
+		t.Fatalf("plain Fabric IDs = %q and %q", first.fabricID, second.fabricID)
+	}
+	if left, right := NewNetwork(), NewNetwork(); left.fabricID == right.fabricID {
+		t.Fatalf("unconfigured plain networks shared Fabric ID %q", left.fabricID)
+	}
+}
+
+func TestNewNetworkDoesNotReadProcessEnvironmentAuthority(t *testing.T) {
+	t.Setenv("WEFTY_DEV_PLAIN_FABRIC_ID", "plain-library-must-ignore-environment")
+	left, right := NewNetwork(), NewNetwork()
+	if left.fabricID == "plain-library-must-ignore-environment" || right.fabricID == "plain-library-must-ignore-environment" || left.fabricID == right.fabricID {
+		t.Fatalf("isolated library networks inherited environment authority: %q %q", left.fabricID, right.fabricID)
+	}
+}
+
+func TestExplicitFabricIDRejectsNonPlainAuthority(t *testing.T) {
+	for _, value := range []string{"", "fabric-production", "plain-", " plain-dev", "plain-dev "} {
+		if _, err := NewNetworkWithID(value); err == nil {
+			t.Fatalf("NewNetworkWithID(%q) succeeded", value)
+		}
+	}
+}
+
 func TestConnectionForwardsWriteHalfClose(t *testing.T) {
 	network := NewNetwork()
 	server := network.NewFabric(fabric.Identity{NodeID: "server"})

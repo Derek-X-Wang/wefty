@@ -45,6 +45,7 @@ export WEFTY_ROOT="$(git rev-parse --show-toplevel)"
 export WEFTY_STATE_ROOT="${TMPDIR:-/tmp}/wefty-quickstart"
 export WEFTY_L1_ADDR=127.0.0.1:42101
 export WEFTY_L3_ADDR=127.0.0.1:42102
+export WEFTY_DEV_PLAIN_FABRIC_ID=plain-local-quickstart
 
 mkdir -p "$WEFTY_ROOT/.bin" "$WEFTY_STATE_ROOT"
 go build -o "$WEFTY_ROOT/.bin/wefty-l1" ./cmd/wefty-l1
@@ -56,6 +57,10 @@ cd "$WEFTY_ROOT/workflows/dogfood"
 npm ci
 npm run build
 ```
+
+`WEFTY_DEV_PLAIN_FABRIC_ID` is a DEVELOPMENT ONLY seam for separate local
+plain-Fabric processes. Every participant must use the same `plain-`-prefixed
+value; production authority must use the configured non-plain Fabric instead.
 
 Pre-1.0 schema changes are applied only to newly created databases; there is
 no migration mechanism: L1 and the agent's durable evidence schema are edited

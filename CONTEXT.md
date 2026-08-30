@@ -94,6 +94,19 @@ The helper-owned, guest-native `/wefty/service` storage that belongs to one
 service-class job.
 _Avoid_: working directory, bind mount, container writable layer, shared volume
 
+**Runtime residue**:
+Helper-observed OCI state that lacks live runtime authority or legitimate
+retention authority and therefore blocks namespace absence and new admission.
+An orphaned or anomalous resource remains residue even when its name matches a
+wefty-managed prefix.
+_Avoid_: all observed inventory, durable data, harmless leftovers
+
+**Durable retained**:
+Helper-observed state intentionally preserved by a currently valid ownership
+or retention binding, reported separately from runtime residue. Retained state
+is auditable but does not by itself block runtime namespace absence.
+_Avoid_: ignored residue, projected inventory, leaked data
+
 **Storage generation**:
 One immutable allocation generation of a Computer's durable Storage identity.
 Exactly one generation is current; reset may temporarily add one staging

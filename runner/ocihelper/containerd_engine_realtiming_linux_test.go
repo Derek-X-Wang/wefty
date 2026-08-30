@@ -114,9 +114,17 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	defer barrier.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Minute)
 	defer cancel()
+	barrierStartedAt := time.Now()
+	var barrierReadyAt atomic.Int64
+	barrier.SetLossHandler(func(generation ocihelper.HelperSession, lossErr error) {
+		if err := recordNativeBarrierLoss(generation, barrierStartedAt, barrierReadyAt.Load(), lossErr); err != nil {
+			t.Errorf("record native barrier loss evidence: %v", err)
+		}
+	})
 	if err := barrier.Ensure(ctx); err != nil {
 		t.Fatal(err)
 	}
+	barrierReadyAt.Store(time.Now().UTC().UnixNano())
 	adapter := ocirunner.NewAdapter(barrier)
 	session, err := barrier.Session()
 	if err != nil {
@@ -756,6 +764,46 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+var nativeBarrierLossSequence atomic.Uint64
+
+func recordNativeBarrierLoss(generation ocihelper.HelperSession, barrierStartedAt time.Time, barrierReadyUnixNano int64, lossErr error) error {
+	evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR")
+	if evidenceDirectory == "" {
+		return nil
+	}
+	recordedAt := time.Now().UTC()
+	readyAt := time.Time{}
+	healthyElapsed := "not_ready"
+	establishElapsed := "not_ready"
+	if barrierReadyUnixNano != 0 {
+		readyAt = time.Unix(0, barrierReadyUnixNano).UTC()
+		healthyElapsed = recordedAt.Sub(readyAt).String()
+		establishElapsed = readyAt.Sub(barrierStartedAt).String()
+	}
+	lossText := "OCI helper session lost without an error value"
+	if lossErr != nil {
+		lossText = lossErr.Error()
+	}
+	payload, err := json.MarshalIndent(map[string]any{
+		"helper_session":              generation,
+		"barrier_started_at":          barrierStartedAt.UTC(),
+		"barrier_ready_at":            readyAt,
+		"barrier_ready_recorded":      barrierReadyUnixNano != 0,
+		"barrier_establish_elapsed":   establishElapsed,
+		"healthy_before_loss_elapsed": healthyElapsed,
+		"loss_recorded_at":            recordedAt,
+		"loss_error":                  lossText,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	name := fmt.Sprintf("native-linux-oci-barrier-loss-%02d.json", nativeBarrierLossSequence.Add(1))
+	if err := os.WriteFile(filepath.Join(evidenceDirectory, name), append(payload, '\n'), 0o600); err != nil {
+		return err
+	}
+	return nil
 }
 
 type referenceComputerEvidence struct {

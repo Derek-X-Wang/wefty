@@ -1068,7 +1068,13 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 			}
 			endpointName := name
 			endpoint := workloadrunner.AttemptEndpoint{Port: port, Dial: func(dialContext context.Context) (net.Conn, error) {
-				return adapter.DialAttemptPort(dialContext, request.Authority, endpointName)
+				// Bind the endpoint to the exact helper session that admitted the
+				// attempt. Re-reading the boot barrier here can only produce a
+				// misleading readiness error or target a replacement generation
+				// that cannot own this authority.
+				return session.DialAttemptPort(dialContext, ocihelper.DialAttemptPortRequest{
+					Authority: HelperAuthority(request.Authority), Name: endpointName,
+				})
 			}}
 			if err := request.AttemptEndpointReady(name, endpoint); err != nil {
 				_ = reapAfterFailedStart(session, authority)
@@ -1678,12 +1684,17 @@ func (adapter *Adapter) ReapPriorBoot(_ context.Context, request workloadrunner.
 	}
 	matchedAttempt := false
 	for _, attempt := range receipt.Attempts {
-		if attempt.NodeID == request.NodeID && attempt.JobID == request.JobID && attempt.PriorBootSessionID == request.PriorBootSessionID {
+		if request.AttemptID != "" && request.FencingToken != "" && request.WorkloadClass != "" && request.RemovalGeneration != "" &&
+			attempt.NodeID == request.NodeID && attempt.JobID == request.JobID && attempt.PriorBootSessionID == request.PriorBootSessionID &&
+			attempt.AttemptID == request.AttemptID && attempt.FencingToken == request.FencingToken &&
+			attempt.Class == request.WorkloadClass && attempt.RemovalGeneration == request.RemovalGeneration {
 			matchedAttempt = true
 			break
 		}
 	}
-	priorBootSeen := slices.Contains(receipt.PriorBootSessionsSeen, request.PriorBootSessionID)
+	priorBootSeen := slices.Contains(receipt.PriorBootSessionsSeen, ocihelper.SessionIdentity{
+		NodeID: request.NodeID, BootSessionID: request.PriorBootSessionID,
+	})
 	if !matchedAttempt && !priorBootSeen {
 		return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
 	}
