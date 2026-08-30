@@ -474,11 +474,21 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	waylandComputerReadiness := exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, "wayland", waylandComputerReference, waylandComputerDigest)
 	numericImage := loadNativeImageArchive(t, ctx, adapter, numericReference, numericArchivePath)
 	namedImage := loadNativeImageArchive(t, ctx, adapter, namedReference, namedArchivePath)
-	serviceDataEvidence := exerciseNativeLinuxServiceData(t, ctx, session, adapter, []nativeServiceDataImage{
+	serviceReadmissionStarted := time.Now()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatalf("establish replacement helper session before service re-admission: %v", err)
+	}
+	if err := adapter.Probe(ctx, "native-node", "native-boot", reference, digest, l1.DefaultLeaseDuration); err != nil {
+		t.Fatalf("positive capability handshake before service re-admission: %v", err)
+	}
+	serviceRecoveryElapsed := time.Since(serviceReadmissionStarted)
+	serviceDataEvidence := exerciseNativeLinuxServiceData(t, ctx, barrier, adapter, []nativeServiceDataImage{
 		{name: "root", reference: echoReference, digest: echoImage.TopLevelDigest, owner: "0:0"},
 		{name: "numeric", reference: numericReference, digest: numericImage.TopLevelDigest, owner: "13001:13002"},
 		{name: "named", reference: namedReference, digest: namedImage.TopLevelDigest, owner: "12001:12002"},
 	})
+	serviceDataEvidence.recoveryElapsed = serviceRecoveryElapsed
+	serviceDataEvidence.freshAttemptReadmission = true
 	exerciseNativeLinuxComputerCapacity(t, ctx, barrier, echoReference, echoImage.TopLevelDigest)
 	computerDiskEvidence := exerciseNativeLinuxComputerDisk(t, ctx, barrier, echoReference, echoImage.TopLevelDigest)
 	computerAgentRestartEvidence := exerciseNativeLinuxComputerAgentRestart(t, ctx, adapter, echoReference, echoImage.TopLevelDigest)
@@ -759,7 +769,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 			registryEvidence = "pull_from_empty=NOT-RUN\npull_from_empty_reason=pr-build: image not published\npull_import_digest_equal=NOT-RUN\npull_import_digest_equal_reason=pr-build: image not published\n"
 			bindingRepullEvidence = "binding_repull_reconciliation=NOT-RUN\nbinding_repull_reconciliation_reason=pr-build: image not published\n"
 		}
-		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\n%s%sregistry_disabled_pull_rejected=%t\nregistry_disabled_import=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\ncomputer_reference=%s\ncomputer_index_digest=%s\ncomputer_reference_separate=true\ncomputer_reference_archive_import=true\ncomputer_reference_atomic_readiness=%t\ncomputer_reference_started_to_ready_elapsed=%s\ncomputer_reference_publication_loss_recovery=%t\ncomputer_reference_wire_negatives=true\nwayland_computer_reference=%s\nwayland_computer_index_digest=%s\nwayland_computer_reference_separate=true\nwayland_computer_reference_archive_import=true\nwayland_computer_reference_atomic_readiness=%t\nwayland_computer_reference_started_to_ready_elapsed=%s\nwayland_computer_reference_publication_loss_recovery=%t\nwayland_computer_reference_wire_negatives=true\ncomputer_capacity_three_live_published_fourth_refused=true\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\ncomputer_reference_helper_stop_start_profile_sign_in_rootfs=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, registryEvidence, bindingRepullEvidence, registryDisabledPullRejected, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, computerReference, computerDigest, referenceComputerReadiness.atomicPublication, referenceComputerReadiness.startedToReadyElapsed, referenceComputerReadiness.lossRecovery, waylandComputerReference, waylandComputerDigest, waylandComputerReadiness.atomicPublication, waylandComputerReadiness.startedToReadyElapsed, waylandComputerReadiness.lossRecovery, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
+		evidence := fmt.Sprintf("agent_uid=%d\nhelper_uid=0\nhelper_socket_root_owned=true\nraw_socket_denied=true\nacceptance_reference=%s\nacceptance_index_digest=%s\npublic_acceptance_image=true\nnode_load_image=true\narchive_platform_filtered=true\ncache_cap_bytes=%d\nprobe_elapsed=%s\nproduction_deadman=%s\n%s%sregistry_disabled_pull_rejected=%t\nregistry_disabled_import=true\nimport_run=true\nprestart_requeue_pinned=true\ntag_refloat_resolved_once=true\nservice_echo_health=true\nservice_echo_body=true\nservice_data_root_user=%t\nservice_data_numeric_user=%t\nservice_data_named_user=%t\nservice_data_restart_persistent=%t\nservice_data_stop_start_persistent=%t\nservice_rootfs_discarded=%t\nservice_data_same_digest_replacement_fresh=%t\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\ncomputer_reference=%s\ncomputer_index_digest=%s\ncomputer_reference_separate=true\ncomputer_reference_archive_import=true\ncomputer_reference_atomic_readiness=%t\ncomputer_reference_started_to_ready_elapsed=%s\ncomputer_reference_publication_loss_recovery=%t\ncomputer_reference_wire_negatives=true\nwayland_computer_reference=%s\nwayland_computer_index_digest=%s\nwayland_computer_reference_separate=true\nwayland_computer_reference_archive_import=true\nwayland_computer_reference_atomic_readiness=%t\nwayland_computer_reference_started_to_ready_elapsed=%s\nwayland_computer_reference_publication_loss_recovery=%t\nwayland_computer_reference_wire_negatives=true\ncomputer_capacity_three_live_published_fourth_refused=true\ncomputer_disk_exactly_one_persistent_and_reset=%t\ncomputer_shm_mode_flags_size_1g=%t\ncomputer_shm_cgroup_charged=%t\ncomputer_cgroup_policy_readback=%t\ncomputer_disk_enospc_local=%t\ncomputer_oom_local=%t\ncomputer_agent_restart_same_generation=%t\ncomputer_reference_helper_stop_start_profile_sign_in_rootfs=%t\noneshot_handoff_marker_bytes=%t\noneshot_bridge_once=true\noneshot_split_streams=true\noneshot_digest_evidence=true\nordinary_l3_oci_submission=true\nordinary_l3_frozen_rerun=true\nwait_before_start=true\nlive_log_delivery=true\nexit_code=7\nplain_137_exit=true\nsignal=KILL\nsignal_cause=agent\noom_kill=true\nshim_loss=runtime_failure\ncontainerd_stop=runtime_failure\ncontrol_loss_reaped=true\nstdout_log=true\nstderr_log=true\nnamespace_absent=true\n", os.Getuid(), echoReference, echoDigest, acceptanceCacheCap, probeElapsed, l1.DefaultLeaseDuration, registryEvidence, bindingRepullEvidence, registryDisabledPullRejected, serviceDataEvidence.rootUser, serviceDataEvidence.numericUser, serviceDataEvidence.namedUser, serviceDataEvidence.restartPersistent, serviceDataEvidence.stopStartPersistent, serviceDataEvidence.rootfsDiscarded, serviceDataEvidence.sameDigestReplacementFresh, serviceDataEvidence.freshAttemptReadmission, serviceDataEvidence.recoveryElapsed, computerReference, computerDigest, referenceComputerReadiness.atomicPublication, referenceComputerReadiness.startedToReadyElapsed, referenceComputerReadiness.lossRecovery, waylandComputerReference, waylandComputerDigest, waylandComputerReadiness.atomicPublication, waylandComputerReadiness.startedToReadyElapsed, waylandComputerReadiness.lossRecovery, computerDiskEvidence.exactlyOnePersistentAndReset, computerDiskEvidence.shmModeFlagsSizeOneGiB, computerDiskEvidence.shmCgroupCharged, computerDiskEvidence.cgroupPolicyReadback, computerDiskEvidence.diskENOSPCLocal, computerDiskEvidence.oomLocal, computerAgentRestartEvidence, computerAgentRestartEvidence, handoffMarkerBytes)
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "native-linux-oci.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -1376,6 +1386,8 @@ type nativeServiceDataEvidence struct {
 	rootUser, numericUser, namedUser                        bool
 	restartPersistent, stopStartPersistent, rootfsDiscarded bool
 	sameDigestReplacementFresh                              bool
+	freshAttemptReadmission                                 bool
+	recoveryElapsed                                         time.Duration
 }
 
 func loadNativeImageArchive(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, reference, archivePath string) ocihelper.EnsureImageResponse {
@@ -1447,7 +1459,7 @@ func loadNativeImageThroughCLI(t *testing.T, ctx context.Context, adapter *ociru
 	return response
 }
 
-func exerciseNativeLinuxServiceData(t *testing.T, ctx context.Context, session *ocihelper.Session, adapter *ocirunner.Adapter, images []nativeServiceDataImage) nativeServiceDataEvidence {
+func exerciseNativeLinuxServiceData(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, adapter *ocirunner.Adapter, images []nativeServiceDataImage) nativeServiceDataEvidence {
 	t.Helper()
 	evidence := nativeServiceDataEvidence{}
 	for _, image := range images {
@@ -1468,7 +1480,7 @@ touch /rootfs-attempt-marker
 			request.Authority.WorkloadClass = contract.JobClassService
 			request.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 			request.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-			runNativeEchoService(t, ctx, session, adapter, &request, script)
+			runNativeEchoService(t, ctx, barrier, adapter, &request, script)
 			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: request.Authority}); err != nil || !receipt.RuntimeQuiesced {
 				t.Fatalf("%s attempt %d cleanup = %+v err=%v", image.name, attempt, receipt, err)
 			}
@@ -1490,7 +1502,7 @@ touch /rootfs-attempt-marker
 			replacement.Authority.WorkloadClass = contract.JobClassService
 			replacement.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 			replacement.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-			runNativeEchoService(t, ctx, session, adapter, &replacement, "set -eu; test ! -e /wefty/service/attempt-count; printf 'replacement\\n' > /wefty/service/replacement")
+			runNativeEchoService(t, ctx, barrier, adapter, &replacement, "set -eu; test ! -e /wefty/service/attempt-count; printf 'replacement\\n' > /wefty/service/replacement")
 			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: replacement.Authority}); err != nil || !receipt.RuntimeQuiesced {
 				t.Fatalf("same-digest replacement cleanup = %+v err=%v", receipt, err)
 			}
@@ -1499,7 +1511,7 @@ touch /rootfs-attempt-marker
 			original.Authority.WorkloadClass = contract.JobClassService
 			original.ManagedVolumes = []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeServiceData}}
 			original.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-			runNativeEchoService(t, ctx, session, adapter, &original, "set -eu; test \"$(cat /wefty/service/attempt-count)\" -eq 3; test ! -e /wefty/service/replacement; printf '4\\n' > /wefty/service/attempt-count")
+			runNativeEchoService(t, ctx, barrier, adapter, &original, "set -eu; test \"$(cat /wefty/service/attempt-count)\" -eq 3; test ! -e /wefty/service/replacement; printf '4\\n' > /wefty/service/attempt-count")
 			if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: original.Authority}); err != nil || !receipt.RuntimeQuiesced {
 				t.Fatalf("original same-digest service cleanup = %+v err=%v", receipt, err)
 			}
@@ -1515,7 +1527,7 @@ touch /rootfs-attempt-marker
 	return evidence
 }
 
-func runNativeEchoService(t *testing.T, ctx context.Context, session *ocihelper.Session, adapter *ocirunner.Adapter, request *workloadrunner.Request, prelude string) {
+func runNativeEchoService(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, adapter *ocirunner.Adapter, request *workloadrunner.Request, prelude string) {
 	t.Helper()
 	request.Execution.OCI.Argv = []string{"/bin/sh", "-c", prelude + "\nexec /usr/local/bin/wefty-echo-service"}
 	request.AttemptEndpoints = []string{workloadrunner.AttemptEndpointService}
@@ -1580,6 +1592,10 @@ func runNativeEchoService(t *testing.T, ctx context.Context, session *ocihelper.
 	closeErr := response.Body.Close()
 	if readErr != nil || closeErr != nil || response.StatusCode != http.StatusOK || !bytes.Equal(echoed, payload) {
 		t.Fatalf("echo response status=%d bytes=%q err=%v", response.StatusCode, echoed, errors.Join(readErr, closeErr))
+	}
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := session.Signal(ctx, ocihelper.SignalRequest{Authority: ocirunner.HelperAuthority(request.Authority), Signal: ocihelper.SignalTERM}); err != nil {
 		t.Fatal(err)

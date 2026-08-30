@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -19,6 +20,17 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 )
+
+func TestServeShutdownDoesNotPromoteCanceledReconciliation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !suppressReconcileFailure(ctx, internalError(context.Canceled, "read service log retention applicability")) {
+		t.Fatal("shutdown cancellation was promoted to an L1 reconcile failure")
+	}
+	if suppressReconcileFailure(context.Background(), errors.New("durable reconcile failure")) {
+		t.Fatal("live durable reconcile failure was suppressed")
+	}
+}
 
 type fakeClock struct {
 	mu     sync.Mutex

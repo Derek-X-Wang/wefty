@@ -31,6 +31,16 @@ require_unique_boolean() {
   fi
 }
 
+require_unique_measurement() {
+  file=$1
+  key=$2
+  count=$(awk -v prefix="$key=" 'index($0, prefix) == 1 { count++ } END { print count + 0 }' "$file")
+  if [ "$count" -ne 1 ] || ! grep -Eq "^${key}=.+$" "$file" || grep -Fqx "$key=0s" "$file"; then
+    printf 'receipt must contain exactly one non-zero %s measurement\n' "$key" >&2
+    exit 1
+  fi
+}
+
 case "$evidence_source" in
   pr-build)
     require_unique_value "$receipt" pull_from_empty NOT-RUN
@@ -55,8 +65,14 @@ case "$evidence_source" in
     ;;
 esac
 
+require_unique_value "$receipt" service_fresh_attempt_readmission true
+require_unique_measurement "$receipt" service_recovery_elapsed
 require_unique_value "$service_receipt" term_kill_escalation true
 require_unique_boolean "$service_receipt" term_kill_log_evidence_incomplete
 require_unique_value "$service_receipt" term_kill_log_seal_pairing true
 require_unique_value "$service_receipt" term_kill_stdout_log true
 require_unique_value "$service_receipt" term_kill_stderr_log true
+require_unique_value "$service_receipt" withdrawal true
+require_unique_measurement "$service_receipt" withdrawal_elapsed
+require_unique_value "$service_receipt" republication true
+require_unique_measurement "$service_receipt" republication_elapsed

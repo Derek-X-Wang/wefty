@@ -179,7 +179,14 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 				return
 			case <-ticker.C:
 				if _, err := s.store.Reconcile(reconcileContext); err != nil {
-					reconcileFailures <- err
+					if suppressReconcileFailure(reconcileContext, err) {
+						return
+					}
+					select {
+					case reconcileFailures <- err:
+					case <-reconcileContext.Done():
+						return
+					}
 					_ = httpServer.Close()
 					return
 				}
@@ -197,6 +204,9 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	err := httpServer.Serve(listener)
 	stopReconcile()
 	close(stopped)
+	if ctx.Err() != nil {
+		return nil
+	}
 	select {
 	case reconcileErr := <-reconcileFailures:
 		return fmt.Errorf("l1: reconcile failure state: %w", reconcileErr)
@@ -206,6 +216,10 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		return nil
 	}
 	return err
+}
+
+func suppressReconcileFailure(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled)
 }
 
 type principal int

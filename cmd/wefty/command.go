@@ -22,6 +22,15 @@ import (
 
 func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	switch args[0] {
+	case "whoami":
+		if len(args) != 1 {
+			return usageError("usage: wefty whoami")
+		}
+		person, err := clients.whoAmI(ctx)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, person)
 	case "admin":
 		return executeAdmin(ctx, clients, jsonOutput, args[1:], stdout)
 	case "admins":

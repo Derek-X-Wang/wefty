@@ -154,7 +154,11 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"disk_path": diskEvidence.Path, "disk_blocks_bytes": fmt.Sprint(diskEvidence.BlocksBytes)})
 
 	receipt.begin("linux.remote_takeover")
-	viewGrant := runComputerCLIPerson[l1.ComputerGrantMutationResult](t, harness, "linux-admin", "linux-admin-device-a",
+	viewerIdentity := runComputerCLIPerson[l1.AuthenticatedPerson](t, harness, "linux-viewer", "linux-viewer-device", "whoami")
+	if viewerIdentity.FabricID != policy.Admins[0].FabricID || viewerIdentity.UserID != "linux-viewer" || viewerIdentity.DeviceID != "linux-viewer-device" {
+		t.Fatalf("viewer whoami observation = %#v", viewerIdentity)
+	}
+	viewGrant := runComputerCLIPersonWithEvidence[l1.ComputerGrantMutationResult](t, evidence, "grant-cli-view.json", harness, "linux-admin", "linux-admin-device-a",
 		"services", "grant", ready.ComputerID, "linux-viewer", "--permission", "view",
 		"--policy-revision", fmt.Sprint(policy.Revision), "--idempotency-key", "linux-native-view-grant")
 	if !viewGrant.MutationApplied || viewGrant.Grant.Permission != l1.ComputerGrantView {
@@ -168,7 +172,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	receipt.TakeoverRetryStderr = append(receipt.TakeoverRetryStderr, viewerView.toleratedStderr...)
 	viewerTakeDenied := runComputerCLIPersonExpectError(t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", viewerView.tokenFile)
-	controlGrant := runComputerCLIPerson[l1.ComputerGrantMutationResult](t, harness, "linux-admin", "linux-admin-device-a",
+	controlGrant := runComputerCLIPersonWithEvidence[l1.ComputerGrantMutationResult](t, evidence, "grant-cli-control.json", harness, "linux-admin", "linux-admin-device-a",
 		"services", "grant", ready.ComputerID, "linux-viewer", "--permission", "control",
 		"--policy-revision", fmt.Sprint(viewGrant.Grant.PolicyRevision), "--idempotency-key", "linux-native-control-grant")
 	viewerView.stop(t)
@@ -633,6 +637,44 @@ func validateLinuxComputerLaneMutation(t *testing.T, receipt *linuxComputerMatri
 func runComputerCLIPerson[T any](t *testing.T, harness *acceptanceHarness, userID, deviceID string, arguments ...string) T {
 	t.Helper()
 	return runComputerCLIWithIdentity[T](t, harness, userID, deviceID, arguments...)
+}
+
+type computerCLIEvidence struct {
+	Arguments []string `json:"arguments"`
+	Stdout    string   `json:"stdout"`
+	Stderr    string   `json:"stderr"`
+	ExitCode  int      `json:"exit_code"`
+}
+
+func runComputerCLIPersonWithEvidence[T any](t *testing.T, evidence *realTimingEvidence, evidenceName string, harness *acceptanceHarness, userID, deviceID string, arguments ...string) T {
+	t.Helper()
+	args := computerCLIArguments(harness, userID, deviceID, arguments...)
+	ctx, cancel := context.WithTimeout(t.Context(), 6*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, weftyBinaryPath, args...)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	exitCode := 0
+	if err != nil {
+		exitCode = -1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+	evidence.recordJSON(evidenceName, computerCLIEvidence{
+		Arguments: append([]string(nil), arguments...), Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: exitCode,
+	})
+	if err != nil {
+		t.Fatalf("run Computer CLI %v: %v\nstdout:\n%s\nstderr:\n%s", arguments, err, stdout.String(), stderr.String())
+	}
+	var result T
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode Computer CLI %v: %v\n%s", arguments, err, stdout.String())
+	}
+	return result
 }
 
 func runComputerCLIWithIdentity[T any](t *testing.T, harness *acceptanceHarness, userID, deviceID string, arguments ...string) T {

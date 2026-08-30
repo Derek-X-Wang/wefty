@@ -217,6 +217,47 @@ func TestComputerRemovalResumesFromDurableAttestationWithoutRepeatingHelperDelet
 	}
 }
 
+func TestServiceRemovalResumesAfterAttestationCrash(t *testing.T) {
+	removal := testRuntimeRemoval("attestation-crash-job")
+	manifest := runtimeRemovalManifest{
+		Version: 1, JobID: removal.jobID, RemovalGeneration: removal.generation,
+		Attempts: []workloadrunner.RuntimeResourceManifest{testRuntimeResourceManifest(removal.jobID, "attempt")},
+	}
+	record := runtimeRemovalRecord{
+		removal: removal, phase: runtimeRemovalQuarantined, manifest: manifest,
+		receipt: workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidencePriorBootOCISweep,
+			BootSessionID: "prior-boot", SweepEpoch: "sweep", HelperGeneration: 2},
+	}
+	attestCalls := 0
+	acknowledged := false
+	controller := &removalController{managed: &resumedManagedResource{}, nodeID: "node", bootSessionID: "replacement-boot"}
+	controller.listRuntimeRemovals = func(context.Context) ([]runtimeRemovalRecord, error) { return []runtimeRemovalRecord{record}, nil }
+	controller.purgeJob = func(context.Context, string) error { return nil }
+	controller.removeResource = func(context.Context, localRemoval) error { return nil }
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error { return nil }
+	controller.attestRuntimeRemoval = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		attestCalls++
+		if attestCalls == 1 {
+			return workloadrunner.RuntimeRemovalAttestation{}, errInjectedRuntimeRemovalCrash
+		}
+		return testRuntimeRemovalAttestation(manifest), nil
+	}
+	controller.recordRuntimeAttested = func(context.Context, localRemoval, workloadrunner.RuntimeRemovalAttestation) error {
+		record.phase = runtimeRemovalComplete
+		return nil
+	}
+	controller.releaseImagePin = func(context.Context, string) error { return nil }
+	controller.ackRemoval = func(context.Context, localRemoval) error { acknowledged = true; return nil }
+	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
+
+	if err := controller.resume(t.Context()); !errors.Is(err, errInjectedRuntimeRemovalCrash) || acknowledged {
+		t.Fatalf("attestation crash = err %v acknowledged %t", err, acknowledged)
+	}
+	if err := controller.resume(t.Context()); err != nil || !acknowledged || attestCalls != 2 {
+		t.Fatalf("attestation resume = err %v acknowledged %t calls %d", err, acknowledged, attestCalls)
+	}
+}
+
 func TestComputerRemovalAcceptsHistoricalGenerationsAndIgnoresIntentRevisionIdentity(t *testing.T) {
 	manifest := runtimeRemovalManifest{Version: 1, JobID: "computer-job", RemovalGeneration: 1,
 		Attempts: []workloadrunner.RuntimeResourceManifest{

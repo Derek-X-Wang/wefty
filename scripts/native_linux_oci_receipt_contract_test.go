@@ -96,16 +96,21 @@ func TestNativeLinuxOCIReceiptDistinguishesPRDeviationFromPublishedProof(t *test
 }
 
 func publishedNativeOCIReceipt() string {
-	return "pull_from_empty=true\npull_import_digest_equal=true\nbinding_repull_reconciliation=true\n"
+	return "pull_from_empty=true\npull_import_digest_equal=true\nbinding_repull_reconciliation=true\n" + serviceReadmissionReceipt()
 }
 
 func prNativeOCIReceipt() string {
 	return "pull_from_empty=NOT-RUN\npull_from_empty_reason=pr-build: image not published\n" +
 		"pull_import_digest_equal=NOT-RUN\npull_import_digest_equal_reason=pr-build: image not published\n" +
-		"binding_repull_reconciliation=NOT-RUN\nbinding_repull_reconciliation_reason=pr-build: image not published\n"
+		"binding_repull_reconciliation=NOT-RUN\nbinding_repull_reconciliation_reason=pr-build: image not published\n" + serviceReadmissionReceipt()
+}
+
+func serviceReadmissionReceipt() string {
+	return "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=127ms\n"
 }
 
 func servicePublicationReceipt(logEvidenceIncomplete bool) string {
 	return "term_kill_escalation=true\nterm_kill_log_evidence_incomplete=" + strconv.FormatBool(logEvidenceIncomplete) +
-		"\nterm_kill_log_seal_pairing=true\nterm_kill_stdout_log=true\nterm_kill_stderr_log=true\n"
+		"\nterm_kill_log_seal_pairing=true\nterm_kill_stdout_log=true\nterm_kill_stderr_log=true\n" +
+		"withdrawal=true\nwithdrawal_elapsed=83ms\nrepublication=true\nrepublication_elapsed=1.13s\n"
 }

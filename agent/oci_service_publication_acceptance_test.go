@@ -45,12 +45,13 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 		t.Fatal("Linux OCI service publication realtiming provisioning is incomplete")
 	}
 	var healthOK, echoOK, startupTimedOut, withdrawalObserved, republicationObserved bool
+	var withdrawalElapsed, republicationElapsed time.Duration
 	var portCollisionAvoided, portlessOK, gracefulStopOK, restartIdentityOK bool
 	var killEscalation nativeOCIServiceKILLEscalationEvidence
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
 			helperTunnelOK := healthOK && echoOK
-			evidence := fmt.Sprintf("platform=%s/%s\nhealth=%t\necho=%t\nstartup_timeout=%t\nwithdrawal=%t\nrepublication=%t\nport_collision_avoided=%t\nportless_started=%t\nhelper_tunnel=%t\nterm_cooperative_stop=%t\nterm_kill_escalation=%t\nterm_kill_log_evidence_incomplete=%t\nterm_kill_log_seal_pairing=%t\nterm_kill_stdout_log=%t\nterm_kill_stderr_log=%t\nterm_grace_stop=%t\nfresh_restart_authority=%t\n", runtime.GOOS, runtime.GOARCH, healthOK, echoOK, startupTimedOut, withdrawalObserved, republicationObserved, portCollisionAvoided, portlessOK, helperTunnelOK, gracefulStopOK, killEscalation.Escalated, killEscalation.LogEvidenceIncomplete, killEscalation.LogSealPairing, killEscalation.StdoutLog, killEscalation.StderrLog, gracefulStopOK && killEscalation.Escalated, restartIdentityOK)
+			evidence := fmt.Sprintf("platform=%s/%s\nhealth=%t\necho=%t\nstartup_timeout=%t\nwithdrawal=%t\nwithdrawal_elapsed=%s\nrepublication=%t\nrepublication_elapsed=%s\nport_collision_avoided=%t\nportless_started=%t\nhelper_tunnel=%t\nterm_cooperative_stop=%t\nterm_kill_escalation=%t\nterm_kill_log_evidence_incomplete=%t\nterm_kill_log_seal_pairing=%t\nterm_kill_stdout_log=%t\nterm_kill_stderr_log=%t\nterm_grace_stop=%t\nfresh_restart_authority=%t\n", runtime.GOOS, runtime.GOARCH, healthOK, echoOK, startupTimedOut, withdrawalObserved, withdrawalElapsed, republicationObserved, republicationElapsed, portCollisionAvoided, portlessOK, helperTunnelOK, gracefulStopOK, killEscalation.Escalated, killEscalation.LogEvidenceIncomplete, killEscalation.LogSealPairing, killEscalation.StdoutLog, killEscalation.StderrLog, gracefulStopOK && killEscalation.Escalated, restartIdentityOK)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-publication-"+runtime.GOOS+".txt"), []byte(evidence), 0o600); err != nil {
 				t.Errorf("write OCI service publication evidence: %v", err)
 			}
@@ -97,13 +98,15 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	sibling.stop(t, adapter)
 
 	primary.triggerPayloadListenerRestart(t)
-	withdrawalObserved = primary.waitReachable(t, false, 5*time.Second)
+	withdrawalElapsed = primary.waitReachableMeasured(t, false, 5*time.Second)
+	withdrawalObserved = true
 	select {
 	case outcome := <-primary.done:
 		t.Fatalf("helper-tunnel withdrawal killed payload: (%#v, %v)", outcome.result, outcome.err)
 	default:
 	}
-	republicationObserved = primary.waitReachable(t, true, 5*time.Second)
+	republicationElapsed = primary.waitReachableMeasured(t, true, 5*time.Second)
+	republicationObserved = true
 
 	timedOut := startNativeOCIService(t, ctx, adapter, reference, digest, "startup-timeout", "", []string{
 		"/bin/sh", "-c", `trap 'exit 143' TERM; while :; do sleep 0.1; done`,
@@ -827,8 +830,8 @@ while :; do
     fi
     sleep 0.1
   done
-  wait "$server"
-  status=$?
+	status=0
+	wait "$server" || status=$?
   if test "$restart_requested" = true; then
     sleep 1
     rm -f /tmp/wefty-listener-restart
@@ -979,7 +982,13 @@ func (service *nativeOCIService) triggerPayloadListenerRestart(t *testing.T) {
 }
 
 func (service *nativeOCIService) waitReachable(t *testing.T, want bool, timeout time.Duration) bool {
+	service.waitReachableMeasured(t, want, timeout)
+	return true
+}
+
+func (service *nativeOCIService) waitReachableMeasured(t *testing.T, want bool, timeout time.Duration) time.Duration {
 	t.Helper()
+	started := time.Now()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		request, err := http.NewRequest(http.MethodGet, "http://service.invalid/healthz", nil)
@@ -993,12 +1002,12 @@ func (service *nativeOCIService) waitReachable(t *testing.T, want bool, timeout 
 			_ = response.Body.Close()
 		}
 		if reachable == want {
-			return true
+			return time.Since(started)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("OCI service reachability did not become %v", want)
-	return false
+	return 0
 }
 
 func (service *nativeOCIService) stop(t *testing.T, adapter *ocirunner.Adapter) bool {

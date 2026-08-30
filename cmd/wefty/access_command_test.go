@@ -125,6 +125,14 @@ func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
 	if !requiresPersonCommand([]string{"services", "grant"}) || requiresPersonCommand([]string{"services", "status"}) {
 		t.Fatal("person-command routing does not isolate Computer access policy from ordinary service commands")
 	}
+	if !usesPersonProtocol([]string{"whoami"}) {
+		t.Fatal("whoami did not select the person-authenticated protocol")
+	}
+	var observedViewer l1.AuthenticatedPerson
+	if err := json.Unmarshal(runAccessCLI(t, ctx, viewerClients, true, "whoami"), &observedViewer); err != nil ||
+		observedViewer.UserID != viewerIdentity.UserID || observedViewer.DeviceID != viewerIdentity.DeviceID || observedViewer.FabricID == "" {
+		t.Fatalf("whoami observation = %#v err=%v", observedViewer, err)
+	}
 	var stdout, stderr bytes.Buffer
 	err = execute(ctx, viewerClients, true, []string{"admin", "policy", "add", "person-viewer", "--policy-revision", "1"}, &stdout, &stderr)
 	assertCLIErrorCode(t, err, contract.ErrorAdminRequired)
