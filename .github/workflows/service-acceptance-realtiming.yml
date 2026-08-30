@@ -105,7 +105,7 @@ jobs:
   service-acceptance-realtiming:
     name: service-acceptance-realtiming / ${{ matrix.os }} / ${{ matrix.image }}
     needs: [resolve-published-artifact]
-    if: needs.resolve-published-artifact.outputs.available == 'true'
+    if: ${{ !cancelled() && needs.resolve-published-artifact.outputs.available == 'true' }}
     strategy:
       fail-fast: false
       matrix:
