@@ -1372,6 +1372,9 @@ func TestAttemptPortAcceptsListenerInNestedPayloadCgroup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "desktop.slice", "cgroup.procs"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(nestedPath, "cgroup.procs"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1386,6 +1389,13 @@ func TestCgroupSocketWalkIgnoresVanishedScopesAndHonorsBound(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "desktop.slice", "vanished.scope"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	for _, path := range []string{filepath.Join(root, "cgroup.procs"), filepath.Join(root, "desktop.slice", "cgroup.procs")} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// WalkDir observed this descendant, but its cgroup.procs disappeared before
+	// ownership proof. That session churn is "not here", not a proof failure.
 	owned, err := cgroupSubtreeOwnsSocket(t.Context(), root, "unused")
 	if err != nil || owned {
 		t.Fatalf("vanished cgroup scope ownership = %t, %v", owned, err)

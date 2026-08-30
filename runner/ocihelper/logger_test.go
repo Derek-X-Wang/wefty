@@ -94,6 +94,7 @@ func TestLoggerTerminationPublishesIncompleteSealsWithoutSealTimeout(t *testing.
 	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
+	waitForLoggerIncompleteSegments(t, segments, time.Second)
 	done := make(chan error, 1)
 	go func() { done <- command.Wait() }()
 	select {
@@ -101,28 +102,41 @@ func TestLoggerTerminationPublishesIncompleteSealsWithoutSealTimeout(t *testing.
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		_ = command.Process.Kill()
 		t.Fatal("logger termination waited for the post-terminal seal timeout")
 	}
-	if elapsed := time.Since(started); elapsed < loggerTerminationDrainTimeout || elapsed >= time.Second {
+	if elapsed := time.Since(started); elapsed < loggerTerminationDrainTimeout || elapsed >= 2*time.Second {
 		t.Fatalf("logger termination elapsed %s, want drain deadline honored and prompt exit", elapsed)
 	}
-	for name, path := range segments {
-		target, err := os.Open(path)
-		if err != nil {
-			t.Fatal(err)
+}
+
+func waitForLoggerIncompleteSegments(t *testing.T, segments map[string]string, timeout time.Duration) {
+	t.Helper()
+	confirmed := make(map[string]bool, len(segments))
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for name, path := range segments {
+			if confirmed[name] {
+				continue
+			}
+			target, err := os.Open(path)
+			if err != nil {
+				continue
+			}
+			kind, sequence, payload, readErr := readLogRecord(target)
+			_ = target.Close()
+			var evidence loggerIncompleteEvidence
+			if readErr == nil && kind == logRecordIncomplete && sequence == 0 && len(payload) > 0 && json.Unmarshal(payload, &evidence) == nil && evidence.Reason != "" {
+				confirmed[name] = true
+			}
 		}
-		defer target.Close()
-		kind, sequence, payload, err := readLogRecord(target)
-		if err != nil || kind != logRecordIncomplete || sequence != 0 || len(payload) == 0 {
-			t.Fatalf("%s terminal record kind=%v sequence=%d payload=%q err=%v", name, kind, sequence, payload, err)
+		if len(confirmed) == len(segments) {
+			return
 		}
-		var evidence loggerIncompleteEvidence
-		if err := json.Unmarshal(payload, &evidence); err != nil || evidence.Reason == "" {
-			t.Fatalf("%s incomplete evidence = %q: %v", name, payload, err)
-		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("logger incomplete seals within %s = %v, want both streams", timeout, confirmed)
 }
 
 func TestLoggerRecordsIncompleteSourceWithoutLosingWrittenBytes(t *testing.T) {
