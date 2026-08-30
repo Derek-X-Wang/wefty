@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -23,6 +24,34 @@ import (
 type capabilityProbeAdapterStub struct {
 	err   error
 	calls *int
+}
+
+func TestSecondShutdownSignalCancelsWhileGracefulDrainIsStillJoining(t *testing.T) {
+	ctx, cancelContext := context.WithCancel(t.Context())
+	defer cancelContext()
+	signals := make(chan os.Signal, 2)
+	drainEntered := make(chan struct{})
+	releaseDrain := make(chan struct{})
+	canceled := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		handleShutdownSignals(ctx, signals, func(context.Context) error {
+			close(drainEntered)
+			<-releaseDrain
+			return nil
+		}, func() { close(canceled) }, func(string, ...any) {})
+		close(done)
+	}()
+	signals <- os.Interrupt
+	<-drainEntered
+	signals <- os.Interrupt
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("second shutdown signal remained blocked behind graceful drain")
+	}
+	close(releaseDrain)
+	<-done
 }
 
 type readyMainTestOCIBootBarrier struct{}

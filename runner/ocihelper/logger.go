@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
 )
 
 const (
@@ -71,13 +73,52 @@ func RunLoggerInvocation(arguments []string) error {
 		return fmt.Errorf("acknowledge OCI logger readiness: %w", err)
 	}
 	_ = ready.Close()
+	streams := []loggerStream{
+		{"stdout", stdout, stdoutFile},
+		{"stderr", stderr, stderrFile},
+	}
+	interrupt := make(chan struct{})
+	termination := make(chan os.Signal, 1)
+	signal.Notify(termination, syscall.SIGTERM)
+	defer signal.Stop(termination)
+	signalWaitDone := make(chan struct{})
+	defer close(signalWaitDone)
+	go func() {
+		select {
+		case <-termination:
+			close(interrupt)
+		case <-signalWaitDone:
+		}
+	}()
+	return copyLoggerStreams(streams, interrupt)
+}
+
+type loggerStream struct {
+	name   string
+	source io.ReadCloser
+	target *os.File
+}
+
+func copyLoggerStreams(streams []loggerStream, interrupt <-chan struct{}) error {
+	copyDone := make(chan struct{})
+	defer close(copyDone)
+	go func() {
+		select {
+		case <-interrupt:
+			// containerd terminates its binary-v2 logger while deleting an exited
+			// task. Closing the read sides converts that lifecycle signal into
+			// explicit incomplete seals instead of making Watch spend its entire
+			// post-terminal seal bound waiting for records the killed logger can
+			// no longer write.
+			for _, stream := range streams {
+				_ = stream.source.Close()
+			}
+		case <-copyDone:
+		}
+	}()
 	var group sync.WaitGroup
-	errorsByStream := make(chan error, 2)
-	for _, stream := range []struct {
-		name   string
-		source io.Reader
-		target *os.File
-	}{{"stdout", stdout, stdoutFile}, {"stderr", stderr, stderrFile}} {
+	errorsByStream := make(chan error, len(streams))
+	for _, stream := range streams {
 		group.Add(1)
 		go func() {
 			defer group.Done()

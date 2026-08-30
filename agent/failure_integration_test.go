@@ -143,7 +143,8 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 		t.Fatalf("intent-stop expiry evidence=%+v err=%v", attempts, err)
 	}
 	if queued.State != contract.JobQueued || queued.CurrentAttemptID != attemptID ||
-		queued.BoundNodeID != "intent-node" || queued.RestartStreak != 0 ||
+		queued.BoundNodeID != "intent-node" || queued.RestartStreak != 0 || queued.LifetimeRestartCount != 0 ||
+		queued.NextRestartAt != nil || len(queued.LastFailure) != 0 ||
 		runtime.starts.Load() != 1 {
 		cancelRun()
 		t.Fatalf("intent-stop service=%+v starts=%d err=%v", queued, runtime.starts.Load(), err)

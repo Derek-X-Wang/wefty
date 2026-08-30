@@ -1104,7 +1104,7 @@ func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cg
 			return err
 		}
 		if found {
-			owned, err := cgroupOwnsSocket(filepath.Join(engine.config.CgroupRoot, cgroupID, "cgroup.procs"), inode)
+			owned, err := cgroupSubtreeOwnsSocket(filepath.Join(engine.config.CgroupRoot, cgroupID), inode)
 			if err != nil {
 				return err
 			}
@@ -1138,6 +1138,25 @@ func loopbackListenInode(port uint16) (string, bool, error) {
 		}
 	}
 	return "", false, scanner.Err()
+}
+
+func cgroupSubtreeOwnsSocket(cgroupPath, inode string) (bool, error) {
+	owned := false
+	err := filepath.WalkDir(cgroupPath, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if owned || !entry.IsDir() {
+			return nil
+		}
+		processOwnsSocket, err := cgroupOwnsSocket(filepath.Join(path, "cgroup.procs"), inode)
+		if err != nil {
+			return err
+		}
+		owned = processOwnsSocket
+		return nil
+	})
+	return owned, err
 }
 
 func cgroupOwnsSocket(procsPath, inode string) (bool, error) {

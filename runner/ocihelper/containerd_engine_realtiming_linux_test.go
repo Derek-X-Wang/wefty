@@ -753,6 +753,8 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 		Execution:      contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Image: contract.OCIImageSpec{Reference: reference, Digest: &digestCopy}, Computer: &contract.OCIComputerSpec{Display: contract.OCIComputerDisplaySpec{Protocol: contract.ComputerDisplayProtocolRFBWebSocketV1}, DiskBytes: storage.DiskBytes}, Limits: &contract.OCILimits{MemoryBytes: &memory}}},
 		ManagedVolumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}}, AttemptEndpoints: []string{workloadrunner.AttemptEndpointView, workloadrunner.AttemptEndpointControl},
 		OCIImageResolved: func(context.Context, workloadrunner.OCIImageObservation) error { return nil }, OCIStarted: func(context.Context, workloadrunner.OCIImageObservation) error { return nil }}
+	helperStarted := make(chan time.Time, 1)
+	request.OCIStartedAt = func(startedAt time.Time) { helperStarted <- startedAt }
 	endpoints := make(map[string]workloadrunner.AttemptEndpoint)
 	endpointReady := make(chan struct{}, 2)
 	var endpointMu sync.Mutex
@@ -780,18 +782,31 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 	publications := make(chan bool, 8)
 	runContext, cancelRun := context.WithCancel(ctx)
 	runDone := make(chan error, 1)
-	startedAt := time.Now()
 	network := plain.NewNetwork()
 	go func() {
 		_, err := agent.RunComputerServiceRealtiming(runContext, adapter, request, network.NewFabric(fabric.Identity{NodeID: "reference-" + identity + "-agent"}), dial,
 			func(_ context.Context, ready bool, _ string) error { publications <- ready; return nil })
 		runDone <- err
 	}()
+	var startedAt time.Time
+	select {
+	case startedAt = <-helperStarted:
+	case err := <-runDone:
+		t.Fatalf("reference Computer ended before authoritative Started: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("reference Computer helper setup before Started: %v", context.Cause(ctx))
+	}
+	readinessDeadline := time.NewTimer(contract.ComputerStartupReadinessTimeout)
+	defer readinessDeadline.Stop()
 	for range 2 {
 		select {
 		case <-endpointReady:
-		case <-time.After(contract.ComputerStartupReadinessTimeout):
-			t.Fatal("helper did not return both reference endpoints")
+		case err := <-runDone:
+			t.Fatalf("reference Computer ended before helper endpoints: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("reference Computer helper endpoint setup: %v", context.Cause(ctx))
+		case <-readinessDeadline.C:
+			t.Fatal("helper did not return both reference endpoints after authoritative Started")
 		}
 	}
 	waitPublication := func(want bool) {

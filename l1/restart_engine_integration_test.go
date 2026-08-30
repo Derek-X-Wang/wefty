@@ -305,11 +305,11 @@ func TestServiceBackoffDrawsJitterOnceAndAppliesFloorAfterCap(t *testing.T) {
 	})
 }
 
-func TestServiceLeaseExpiryRequeuesWithoutChangingStreak(t *testing.T) {
-	assertServiceLeaseExpiryRequeuesWithoutChangingStreak(t)
+func TestServiceLeaseExpiryRequeuesWithoutConsumingRestartBudget(t *testing.T) {
+	assertServiceLeaseExpiryRequeuesWithoutConsumingRestartBudget(t)
 }
 
-func assertServiceLeaseExpiryRequeuesWithoutChangingStreak(t *testing.T) {
+func assertServiceLeaseExpiryRequeuesWithoutConsumingRestartBudget(t *testing.T) {
 	t.Helper()
 	tests := []struct {
 		name   string
@@ -350,20 +350,24 @@ func assertServiceLeaseExpiryRequeuesWithoutChangingStreak(t *testing.T) {
 			node := h.register(agent, "service-node")
 			job := submitRestartService(t, h, client, "expiry-"+test.name, []string{"service"}, nil)
 			claim := claimRestartService(t, h, agent, node)
+			lastFailure := []byte(`{"code":"prior_failure"}`)
 			if _, err := h.store.db.Exec(`UPDATE service_jobs SET bound_node_id=?, restart_streak=2,
-				lifetime_restart_count=7, healthy_since_ns=?, published_attempt_id=? WHERE job_id=?`,
-				node.NodeID, h.clock.Now().UnixNano(), claim.Lease.AttemptID, job.JobID); err != nil {
+				lifetime_restart_count=7, last_failure=?, healthy_since_ns=?, published_attempt_id=? WHERE job_id=?`,
+				node.NodeID, lastFailure, h.clock.Now().UnixNano(), claim.Lease.AttemptID, job.JobID); err != nil {
 				t.Fatal(err)
 			}
 
 			h.clock.Advance(3 * time.Second)
 			test.expire(t, h, agent, job, claim)
 			requeued := getRestartService(t, h, job.JobID)
-			if requeued.State != contract.JobQueued || requeued.RestartStreak != 2 || requeued.LifetimeRestartCount != 8 {
-				t.Fatalf("expired service state/streak/lifetime = %q/%d/%d, want queued/2/8", requeued.State, requeued.RestartStreak, requeued.LifetimeRestartCount)
+			if requeued.State != contract.JobQueued || requeued.RestartStreak != 2 || requeued.LifetimeRestartCount != 7 {
+				t.Fatalf("expired service state/streak/lifetime = %q/%d/%d, want queued/2/7", requeued.State, requeued.RestartStreak, requeued.LifetimeRestartCount)
 			}
 			if requeued.NextRestartAt != nil || requeued.HealthySinceAt != nil || requeued.PublishedAttemptID != "" {
 				t.Fatalf("expired service retained restart/readiness state: %#v", requeued.ServiceJob)
+			}
+			if !bytes.Equal(requeued.LastFailure, lastFailure) {
+				t.Fatalf("expired service changed prior failure evidence = %s, want %s", requeued.LastFailure, lastFailure)
 			}
 			if requeued.CurrentAttemptID != claim.Lease.AttemptID {
 				t.Fatalf("expired current attempt = %q, want replayable %q", requeued.CurrentAttemptID, claim.Lease.AttemptID)

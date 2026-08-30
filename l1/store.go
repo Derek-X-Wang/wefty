@@ -3563,14 +3563,13 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 			return internalError(err, "transition job after lease expiry")
 		}
 		if desiredState.Valid {
-			lifetimeIncrement := 0
-			if nextState == contract.JobQueued {
-				lifetimeIncrement = 1
-			}
+			// Lease loss proves that execution authority ended, not that the
+			// service process failed. Clear attempt-scoped publication/backoff
+			// state while retaining every failure and restart-budget fact.
 			if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
-				SET lifetime_restart_count=lifetime_restart_count+?, next_restart_at=NULL,
+				SET next_restart_at=NULL,
 					healthy_since_ns=NULL, published_attempt_id=NULL
-				WHERE job_id=?`, lifetimeIncrement, attempt.jobID); err != nil {
+				WHERE job_id=?`, attempt.jobID); err != nil {
 				return internalError(err, "clear service authority after lease expiry")
 			}
 		}

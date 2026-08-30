@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -1351,6 +1352,32 @@ func TestAttemptPortRejectsAdversarialBindOutsidePayloadCgroup(t *testing.T) {
 	err = engine.waitAttemptPortOwnership(t.Context(), cgroupID, port)
 	if err == nil || !strings.Contains(err.Error(), "outside the attempt cgroup") {
 		t.Fatalf("adversarial bind error = %v", err)
+	}
+}
+
+func TestAttemptPortAcceptsListenerInNestedPayloadCgroup(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+	cgroupRoot := t.TempDir()
+	cgroupID := "attempt-cgroup"
+	cgroupPath := filepath.Join(cgroupRoot, cgroupID)
+	nestedPath := filepath.Join(cgroupPath, "desktop.slice", "session.scope")
+	if err := os.MkdirAll(nestedPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nestedPath, "cgroup.procs"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{CgroupRoot: cgroupRoot}}
+	if err := engine.waitAttemptPortOwnership(t.Context(), cgroupID, port); err != nil {
+		t.Fatalf("nested payload listener ownership: %v", err)
 	}
 }
 
