@@ -16,6 +16,7 @@ func TestNativeLinuxOCIReceiptDistinguishesPRDeviationFromPublishedProof(t *test
 		receipt        string
 		serviceReceipt string
 		l1Receipt      string
+		traceContains  string
 		wantOK         bool
 	}{
 		{
@@ -24,6 +25,7 @@ func TestNativeLinuxOCIReceiptDistinguishesPRDeviationFromPublishedProof(t *test
 			receipt:        publishedNativeOCIReceipt(),
 			serviceReceipt: servicePublicationReceipt(false),
 			l1Receipt:      serviceReadmissionReceipt(),
+			traceContains:  "key=service_recovery_elapsed value=127ms parsed_ns=127000000 bound_ns=15000000000 result=accepted",
 			wantOK:         true,
 		},
 		{
@@ -121,6 +123,14 @@ func TestNativeLinuxOCIReceiptDistinguishesPRDeviationFromPublishedProof(t *test
 			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=1m24.78s\n",
 		},
 		{
+			name:           "exact lane recovery duration beyond bound fails closed",
+			source:         "published-artifact",
+			receipt:        publishedNativeOCIReceipt(),
+			serviceReceipt: servicePublicationReceipt(false),
+			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=1m24.782166924s\n",
+			traceContains:  "key=service_recovery_elapsed value=1m24.782166924s parsed_ns=84782166924 bound_ns=15000000000 result=rejected",
+		},
+		{
 			name:           "republication beyond production bound fails closed",
 			source:         "published-artifact",
 			receipt:        publishedNativeOCIReceipt(),
@@ -146,9 +156,14 @@ func TestNativeLinuxOCIReceiptDistinguishesPRDeviationFromPublishedProof(t *test
 						t.Fatal(err)
 					}
 					command := exec.Command(shell, "../scripts/check-native-linux-oci-receipt.sh", receipt, test.source, serviceReceipt, l1Receipt)
-					err := command.Run()
+					command.Env = append(os.Environ(), "WEFTY_RECEIPT_GATE_TRACE=1")
+					output, err := command.CombinedOutput()
+					t.Logf("%s receipt trace:\n%s", shell, output)
 					if (err == nil) != test.wantOK {
-						t.Fatalf("%s receipt gate error = %v, want success %t", shell, err, test.wantOK)
+						t.Fatalf("%s receipt gate error = %v, want success %t\n%s", shell, err, test.wantOK, output)
+					}
+					if test.traceContains != "" && !strings.Contains(string(output), test.traceContains) {
+						t.Fatalf("%s receipt trace omitted %q:\n%s", shell, test.traceContains, output)
 					}
 				})
 			}

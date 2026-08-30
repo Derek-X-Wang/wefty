@@ -35,6 +35,8 @@ require_unique_boolean() {
 duration_within_bound() {
   duration_remaining=$1
   duration_limit_seconds=$2
+  duration_trace_parsed_ns=UNPARSED
+  duration_trace_bound_ns=UNPARSED
   case "$duration_limit_seconds" in
     ''|*[!0-9]*) return 1 ;;
   esac
@@ -44,8 +46,10 @@ duration_within_bound() {
   [ -n "$duration_limit_seconds" ] || duration_limit_seconds=0
   [ "${#duration_limit_seconds}" -le 9 ] || return 1
   duration_limit_ns=$((duration_limit_seconds * 1000000000))
+  duration_trace_bound_ns=$duration_limit_ns
   duration_total_ns=0
   duration_components=0
+  duration_max_ns=9223372036854775807
 
   while [ -n "$duration_remaining" ]; do
     duration_number=
@@ -90,7 +94,7 @@ duration_within_bound() {
       *) return 1 ;;
     esac
 
-    duration_max_integer=$((duration_limit_ns / duration_multiplier))
+    duration_max_integer=$((duration_max_ns / duration_multiplier))
     [ "$duration_integer" -le "$duration_max_integer" ] || return 1
     duration_component_ns=$((duration_integer * duration_multiplier))
     duration_fraction_scale=$duration_multiplier
@@ -99,16 +103,25 @@ duration_within_bound() {
       duration_fraction=${duration_fraction#?}
       duration_fraction_scale=$((duration_fraction_scale / 10))
       [ "$duration_fraction_scale" -gt 0 ] || return 1
-      duration_component_ns=$((duration_component_ns + duration_first * duration_fraction_scale))
+      duration_fraction_ns=$((duration_first * duration_fraction_scale))
+      [ "$duration_fraction_ns" -le $((duration_max_ns - duration_component_ns)) ] || return 1
+      duration_component_ns=$((duration_component_ns + duration_fraction_ns))
     done
-    [ "$duration_component_ns" -le $((duration_limit_ns - duration_total_ns)) ] || return 1
+    [ "$duration_component_ns" -le $((duration_max_ns - duration_total_ns)) ] || return 1
     duration_total_ns=$((duration_total_ns + duration_component_ns))
     duration_components=$((duration_components + 1))
   done
 
+  duration_trace_parsed_ns=$duration_total_ns
   # A 1ns literal is not credible elapsed-time evidence from this harness.
   # One microsecond is the smallest accepted measurement quantum.
   [ "$duration_components" -gt 0 ] && [ "$duration_total_ns" -ge 1000 ] && [ "$duration_total_ns" -le "$duration_limit_ns" ]
+}
+
+trace_duration_result() {
+  [ "${WEFTY_RECEIPT_GATE_TRACE:-0}" = 1 ] || return 0
+  printf 'receipt_duration key=%s value=%s parsed_ns=%s bound_ns=%s result=%s\n' \
+    "$key" "$value" "${duration_trace_parsed_ns:-UNPARSED}" "${duration_trace_bound_ns:-UNPARSED}" "$1" >&2
 }
 
 require_duration_within() {
@@ -117,10 +130,15 @@ require_duration_within() {
   max_seconds=$3
   count=$(grep -c "^${key}=" "$file" || true)
   value=$(sed -n "s/^${key}=//p" "$file")
-  if [ "$count" -ne 1 ] || ! duration_within_bound "$value" "$max_seconds"; then
-    printf 'receipt must contain exactly one measured %s duration within %ss\n' "$key" "$max_seconds" >&2
-    exit 1
+  duration_trace_parsed_ns=UNPARSED
+  duration_trace_bound_ns=UNPARSED
+  if [ "$count" -eq 1 ] && duration_within_bound "$value" "$max_seconds"; then
+    trace_duration_result accepted
+    return
   fi
+  trace_duration_result rejected
+  printf 'receipt must contain exactly one measured %s duration within %ss\n' "$key" "$max_seconds" >&2
+  exit 1
 }
 
 case "$evidence_source" in
