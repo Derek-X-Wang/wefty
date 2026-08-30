@@ -863,7 +863,10 @@ func newComputerBackend(t *testing.T, options computerBackendOptions) *computerB
 			return
 		}
 		if options.ignoreCloseHandshake {
-			<-request.Context().Done()
+			select {
+			case <-request.Context().Done():
+			case <-time.After(time.Second):
+			}
 			return
 		}
 		for {
