@@ -377,7 +377,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileNotContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", `strings.Replace(evidence, "pull_from_empty=true\\n"`)
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_COMPUTER_REFERENCE", "exerciseNativeLinuxReferenceComputer", "ComputerStartupReadinessTimeout", "assertReferenceComputerWireNegatives")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_WAYLAND_COMPUTER_REFERENCE", `exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, "wayland"`, "wayland_computer_reference_wire_negatives=true")
-	assertFileContains(t, "../agent/oci_service_publication_acceptance_test.go", `trap 'exit 143' TERM; while :; do sleep 0.1; done`, "restart_requested=true", `kill "$server" 2>/dev/null || true`)
+	assertFileContains(t, "../agent/oci_service_publication_acceptance_test.go", `trap 'exit 143' TERM; while :; do sleep 0.1; done`, "restart_requested=true", `kill "$server" 2>/dev/null || true`, "term_kill_log_evidence_incomplete=%t", "term_kill_stdout_log=%t", "term_kill_stderr_log=%t")
 	assertFileNotContains(t, "../agent/oci_service_publication_acceptance_test.go", `kill "$(cat /tmp/wefty-httpd.pid)"`)
 	assertFileMatches(t, "../examples/oci-echo-service/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG GO_IMAGE=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG BUSYBOX_IMAGE=.*@sha256:[0-9a-f]{64}$`)
 	assertFileMatches(t, "../examples/computer/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG DEBIAN_IMAGE=.*@sha256:[0-9a-f]{64}$`)

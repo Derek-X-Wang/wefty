@@ -291,8 +291,9 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pull and offline import each start from an empty containerd root. The
-	// second row also rejects root-owned helper/containerd registry HTTPS so the
+	// Published-artifact runs prove public pull from an empty containerd root;
+	// PR builds record that row as NOT-RUN because their digest is not published.
+	// The offline import row always starts empty and rejects registry HTTPS so the
 	// tar stream is the only possible source of the imported bytes.
 	requestRootFault(t, "reset-containerd")
 	var pulled ocihelper.EnsureImageResponse
