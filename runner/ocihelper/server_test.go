@@ -1255,9 +1255,10 @@ func TestAttemptPortAndMacBridgeRequireExactAttemptCapabilities(t *testing.T) {
 }
 
 func TestAttemptPortBackendRefusalDoesNotInvalidateHelperSession(t *testing.T) {
-	engine := newFakeEngine()
-	engine.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}})
-	engine.dialAttemptErr = errors.New("payload listener is not published")
+	base := newFakeEngine()
+	base.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}})
+	base.dialAttemptErr = errors.New("payload listener is not published")
+	engine := &blockingWatchEngine{fakeEngine: base, entered: make(chan struct{})}
 	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
 	defer stop()
 	session, err := client.OpenSession(t.Context(), testSessionRequest())
@@ -1272,11 +1273,22 @@ func TestAttemptPortBackendRefusalDoesNotInvalidateHelperSession(t *testing.T) {
 	if _, err := session.Run(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
+	watchContext, cancelWatch := context.WithCancel(t.Context())
+	watchDone := make(chan error, 1)
+	go func() {
+		watchDone <- session.Watch(watchContext, WatchRequest{Authority: authority}, nil)
+	}()
+	<-engine.entered
 	_, err = session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Name: "service"})
 	var rpcErr *RPCError
 	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeEngineFailure || rpcErr.EngineFailure == nil ||
 		rpcErr.EngineFailure.Operation != MethodDialAttemptPort || session.HealthError() != nil {
 		t.Fatalf("attempt-port refusal = %v health=%v, want scoped typed failure", err, session.HealthError())
+	}
+	select {
+	case err := <-watchDone:
+		t.Fatalf("attempt-port refusal terminated sibling Watch: %v", err)
+	case <-time.After(50 * time.Millisecond):
 	}
 	engine.mu.Lock()
 	engine.dialAttemptErr = nil
@@ -1286,6 +1298,11 @@ func TestAttemptPortBackendRefusalDoesNotInvalidateHelperSession(t *testing.T) {
 		t.Fatalf("healthy helper session did not permit endpoint republication retry: %v", err)
 	}
 	assertStreamPayload(t, stream, "attempt-port")
+	cancelWatch()
+	<-watchDone
+	if session.HealthError() != nil {
+		t.Fatalf("caller-canceled Watch invalidated helper session: %v", session.HealthError())
+	}
 }
 
 func TestEndpointAdmittedByInvalidatedSessionRefusesWithTypedSessionStale(t *testing.T) {

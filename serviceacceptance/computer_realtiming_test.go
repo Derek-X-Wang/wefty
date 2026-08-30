@@ -193,43 +193,60 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	adminOverrideView := startTakeoverViewCLI(t, evidence, harness, ready.ComputerID, "linux-admin", "linux-admin-device-b", takeoverViewRetryNone)
 	adminOverride := runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-admin", "linux-admin-device-b",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", adminOverrideView.tokenFile)
+	adminOverrideRelease := runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-admin", "linux-admin-device-b",
+		"services", "takeover", "release", ready.ComputerID, "--session-token-file", adminOverrideView.tokenFile)
+	viewerTake = runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-viewer", "linux-viewer-device",
+		"services", "takeover", "take", ready.ComputerID, "--session-token-file", viewerControl.tokenFile)
+	viewerDrivingBeforeRevoke := viewerTake.TenureState == contract.ComputerControlTenureHeld && viewerTake.HumanDriving &&
+		readLiveComputerHumanDriving(t, ready.CurrentJobID)
 	revoked := runComputerCLIPerson[l1.ComputerGrantMutationResult](t, harness, "linux-admin", "linux-admin-device-a",
 		"services", "revoke", ready.ComputerID, "linux-viewer", "--policy-revision", fmt.Sprint(controlGrant.Grant.PolicyRevision),
 		"--idempotency-key", "linux-native-control-revoke", "--wait", "--wait-timeout", "3m")
 	viewerControl.waitClosed(t, 30*time.Second)
-	staleSessionDenied := runComputerCLIPersonExpectError(t, harness, "linux-viewer", "linux-viewer-device",
+	staleSessionDenied := runComputerCLIPersonExpectControlError(t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", viewerControl.tokenFile)
+	if staleSessionDenied.Receipt == nil {
+		t.Fatalf("revoked take-over session omitted its typed terminal receipt: %#v", staleSessionDenied)
+	}
+	viewerDrivingAfterRevoke := waitLiveComputerHumanDriving(t, ready.CurrentJobID, false, 10*time.Second)
 	adminOverrideView.stop(t)
 	audit := runComputerCLIPerson[l1.ComputerTakeoverAuditList](t, harness, "linux-admin", "linux-admin-device-a",
 		"services", "takeover", "audit", "tail", ready.ComputerID, "--limit", "100")
 	auditKinds, auditAuthority := takeoverAuditEvidence(audit)
+	revokedControlBeforeSession := takeoverAuditReleasePrecedesClose(audit, viewerTake.HolderSessionID, l1.ComputerTakeoverRevoked)
 	receipt.AuthorityGenerations = appendUniqueInt64(receipt.AuthorityGenerations, auditAuthority)
 	completeLinuxComputerRow(t, receipt, "linux.remote_takeover", map[string]bool{
-		"cli_view_grant_cas":          viewGrant.MutationApplied,
-		"view_admission_live":         viewerView.admitted,
-		"view_only_take_refused":      strings.Contains(viewerTakeDenied, string(contract.ErrorControlNotAuthorized)),
-		"view_pointer_isolation_live": inputIsolation,
-		"cli_control_grant_cas":       controlGrant.MutationApplied,
-		"cli_take_live":               viewerTake.TenureState == contract.ComputerControlTenureHeld,
-		"cli_release_live":            viewerRelease.TenureState == contract.ComputerControlTenureFree,
-		"admin_override_live":         adminOverride.OverrideDisplacedSessionID != "" && adminOverride.SignalStayedTrue,
-		"cli_revoke_installed":        revoked.ObservationState == "completed",
-		"revocation_closed_session":   strings.Contains(staleSessionDenied, string(contract.ErrorTakeoverSessionEnded)),
-		"audit_tail_session_open":     auditKinds[l1.ComputerTakeoverSessionOpen],
-		"audit_tail_session_close":    auditKinds[l1.ComputerTakeoverSessionClose],
-		"audit_tail_control_acquired": auditKinds[l1.ComputerTakeoverControlAcquired],
-		"audit_tail_control_released": auditKinds[l1.ComputerTakeoverControlReleased],
-		"audit_tail_admin_overrode":   auditKinds[l1.ComputerTakeoverAdminOverrode],
+		"cli_view_grant_cas":           viewGrant.MutationApplied,
+		"view_admission_live":          viewerView.admitted,
+		"view_only_take_refused":       strings.Contains(viewerTakeDenied, string(contract.ErrorControlNotAuthorized)),
+		"view_pointer_isolation_live":  inputIsolation,
+		"cli_control_grant_cas":        controlGrant.MutationApplied,
+		"cli_take_live":                viewerTake.TenureState == contract.ComputerControlTenureHeld,
+		"cli_release_live":             viewerRelease.TenureState == contract.ComputerControlTenureFree,
+		"admin_override_live":          adminOverride.OverrideDisplacedSessionID != "" && adminOverride.SignalStayedTrue && adminOverrideRelease.TenureState == contract.ComputerControlTenureFree,
+		"cli_revoke_installed":         revoked.ObservationState == "completed",
+		"revoked_while_driving":        viewerDrivingBeforeRevoke,
+		"revocation_closed_session":    staleSessionDenied.Error.Code == contract.ErrorTakeoverSessionEnded && staleSessionDenied.Receipt.SessionEndReason == string(l1.ComputerTakeoverRevoked),
+		"revocation_cleared_driver":    !viewerDrivingAfterRevoke,
+		"revoked_release_before_close": revokedControlBeforeSession,
+		"audit_tail_session_open":      auditKinds[l1.ComputerTakeoverSessionOpen],
+		"audit_tail_session_close":     auditKinds[l1.ComputerTakeoverSessionClose],
+		"audit_tail_control_acquired":  auditKinds[l1.ComputerTakeoverControlAcquired],
+		"audit_tail_control_released":  auditKinds[l1.ComputerTakeoverControlReleased],
+		"audit_tail_admin_overrode":    auditKinds[l1.ComputerTakeoverAdminOverrode],
 	}, map[string]string{
 		"policy_revision":      fmt.Sprint(revoked.Grant.PolicyRevision),
 		"authority_generation": fmt.Sprint(auditAuthority),
 		"viewer_fabric_id":     viewGrant.Grant.FabricID,
+		"revoked_session_id":   viewerTake.HolderSessionID,
+		"session_end_reason":   staleSessionDenied.Receipt.SessionEndReason,
 	})
 
 	receipt.begin("linux.restart_survival")
 	oldAttempt, oldStorage, oldGeneration := ready.CurrentJob.CurrentAttemptID, ready.StorageID, ready.StorageGeneration
 	profileMarker := plantLiveProfileMarker(t, ready, "restart-survival-marker")
 	lossAttempts := map[string]string{}
+	var helperLossTerminal *l1.Attempt
 	for _, action := range []string{"kill-payload", "kill-shim", "kill-helper", "stop-containerd"} {
 		before := ready.CurrentJob.CurrentAttemptID
 		faultAction := action
@@ -248,6 +265,10 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 				current.CurrentJob.CurrentAttemptID != "" && current.CurrentJob.CurrentAttemptID != before
 		})
 		lossAttempts[action] = ready.CurrentJob.CurrentAttemptID
+		if action == "kill-helper" {
+			terminal := waitForComputerAttemptTerminal(t, harness, ready.CurrentJobID, before, 30*time.Second)
+			helperLossTerminal = &terminal
+		}
 		assertLiveProfileMarker(t, ready, profileMarker)
 	}
 	beforeAgentLoss := ready.CurrentJob.CurrentAttemptID
@@ -264,10 +285,20 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	oldAuthorityRejected := runComputerCLIPersonExpectError(t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", restarted.ComputerID, "--session-token-file", viewerControl.tokenFile)
 	recordComputerAuthority(receipt, restarted)
+	helperLossTerminalCode, helperLossTerminalID := "", ""
+	if helperLossTerminal != nil {
+		helperLossTerminalID = helperLossTerminal.AttemptID
+		if helperLossTerminal.Result != nil && helperLossTerminal.Result.RuntimeFailure != nil {
+			helperLossTerminalCode = string(helperLossTerminal.Result.RuntimeFailure.Code)
+		}
+	}
 	completeLinuxComputerRow(t, receipt, "linux.restart_survival", map[string]bool{
-		"payload_loss_fresh_attempt":     lossAttempts["kill-payload"] != "" && lossAttempts["kill-payload"] != oldAttempt,
-		"shim_loss_fresh_attempt":        lossAttempts["kill-shim"] != "" && lossAttempts["kill-shim"] != lossAttempts["kill-payload"],
-		"helper_loss_fresh_attempt":      lossAttempts["kill-helper"] != "" && lossAttempts["kill-helper"] != lossAttempts["kill-shim"],
+		"payload_loss_fresh_attempt": lossAttempts["kill-payload"] != "" && lossAttempts["kill-payload"] != oldAttempt,
+		"shim_loss_fresh_attempt":    lossAttempts["kill-shim"] != "" && lossAttempts["kill-shim"] != lossAttempts["kill-payload"],
+		"helper_loss_fresh_attempt":  lossAttempts["kill-helper"] != "" && lossAttempts["kill-helper"] != lossAttempts["kill-shim"],
+		"helper_loss_prior_attempt_typed_terminal": helperLossTerminal != nil && helperLossTerminal.AttemptID == lossAttempts["kill-shim"] &&
+			helperLossTerminal.State == contract.AttemptFailed && helperLossTerminal.Result != nil && helperLossTerminal.Result.RuntimeFailure != nil &&
+			helperLossTerminal.Result.RuntimeFailure.Code == contract.RuntimeFailureUnavailable,
 		"runtime_loss_fresh_attempt":     lossAttempts["stop-containerd"] != "" && lossAttempts["stop-containerd"] != lossAttempts["kill-helper"],
 		"agent_loss_fresh_attempt":       restarted.CurrentJob.CurrentAttemptID != beforeAgentLoss,
 		"same_storage_generation":        restarted.StorageID == oldStorage && restarted.StorageGeneration == oldGeneration,
@@ -276,7 +307,8 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"old_session_authority_rejected": strings.Contains(oldAuthorityRejected, string(contract.ErrorTakeoverSessionEnded)),
 	}, map[string]string{"old_attempt_id": oldAttempt, "new_attempt_id": restarted.CurrentJob.CurrentAttemptID,
 		"storage_id": restarted.StorageID, "storage_generation": fmt.Sprint(restarted.StorageGeneration),
-		"profile_marker": filepath.Base(profileMarker)})
+		"profile_marker": filepath.Base(profileMarker), "helper_loss_terminal_attempt_id": helperLossTerminalID,
+		"helper_loss_terminal_code": helperLossTerminalCode})
 
 	receipt.begin("linux.reconfiguration")
 	resized := runComputerCLI[l1.Computer](t, harness, false, "services", "resize", restarted.ComputerID,
@@ -719,6 +751,27 @@ func runComputerCLIPersonExpectError(t *testing.T, harness *acceptanceHarness, u
 	return string(output)
 }
 
+func runComputerCLIPersonExpectControlError(
+	t *testing.T,
+	harness *acceptanceHarness,
+	userID, deviceID string,
+	arguments ...string,
+) contract.ComputerControlErrorResponse {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 6*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, weftyBinaryPath, computerCLIArguments(harness, userID, deviceID, arguments...)...)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("Computer CLI %v unexpectedly succeeded:\n%s", arguments, output)
+	}
+	var response contract.ComputerControlErrorResponse
+	if decodeErr := json.Unmarshal(output, &response); decodeErr != nil || response.Error.Code == "" {
+		t.Fatalf("decode Computer control error %v: %v\n%s", arguments, decodeErr, output)
+	}
+	return response
+}
+
 type takeoverViewProcess struct {
 	tokenFile       string
 	admitted        bool
@@ -1083,6 +1136,40 @@ type liveInputObservation struct {
 	PointerHistory [][2]int `json:"pointer_history"`
 }
 
+type liveComputerDriverObservation struct {
+	Version      int  `json:"version"`
+	HumanDriving bool `json:"human_driving"`
+}
+
+func readLiveComputerHumanDriving(t *testing.T, jobID string) bool {
+	t.Helper()
+	containerID := liveComputerContainerID(t, jobID)
+	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
+	execID := fmt.Sprintf("driver-oracle-%d", time.Now().UnixNano())
+	payload, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+		"tasks", "exec", "--exec-id", execID, containerID, "/bin/cat", "/wefty/control/driver.json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("read live Computer driver state: %v\n%s", err, payload)
+	}
+	var observation liveComputerDriverObservation
+	if err := json.Unmarshal(payload, &observation); err != nil || observation.Version != 1 {
+		t.Fatalf("decode live Computer driver state: %v\n%s", err, payload)
+	}
+	return observation.HumanDriving
+}
+
+func waitLiveComputerHumanDriving(t *testing.T, jobID string, want bool, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		observed := readLiveComputerHumanDriving(t, jobID)
+		if observed == want || !time.Now().Before(deadline) {
+			return observed
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func readLiveInputObservation(t *testing.T, jobID string) liveInputObservation {
 	t.Helper()
 	containerID := liveComputerContainerID(t, jobID)
@@ -1343,6 +1430,55 @@ func takeoverAuditEvidence(audit l1.ComputerTakeoverAuditList) (map[l1.ComputerT
 		}
 	}
 	return kinds, generation
+}
+
+func takeoverAuditReleasePrecedesClose(
+	audit l1.ComputerTakeoverAuditList,
+	sessionID string,
+	reason l1.ComputerTakeoverReason,
+) bool {
+	releaseIndex, closeIndex := -1, -1
+	for index, event := range audit.Events {
+		if event.SessionID != sessionID || event.Reason != reason {
+			continue
+		}
+		switch event.Kind {
+		case l1.ComputerTakeoverControlReleased:
+			if releaseIndex == -1 {
+				releaseIndex = index
+			}
+		case l1.ComputerTakeoverSessionClose:
+			if closeIndex == -1 {
+				closeIndex = index
+			}
+		}
+	}
+	return sessionID != "" && releaseIndex >= 0 && closeIndex > releaseIndex
+}
+
+func waitForComputerAttemptTerminal(
+	t *testing.T,
+	harness *acceptanceHarness,
+	jobID, attemptID string,
+	timeout time.Duration,
+) l1.Attempt {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var job l1.Job
+		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID+"?class=service", nil, &job)
+		if status != http.StatusOK {
+			t.Fatalf("get Computer Job attempts = %d body=%s", status, body)
+		}
+		for _, attempt := range job.Attempts {
+			if attempt.AttemptID == attemptID && attempt.Result != nil {
+				return attempt
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for authority-bound terminal result for attempt %q", attemptID)
+	return l1.Attempt{}
 }
 
 func appendUniqueInt64(values []int64, value int64) []int64 {

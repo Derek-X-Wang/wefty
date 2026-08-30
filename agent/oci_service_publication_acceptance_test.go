@@ -32,6 +32,17 @@ import (
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
+const (
+	nativeOCIReadinessProbeInterval    = 50 * time.Millisecond
+	nativeOCIReadinessConnectTimeout   = 200 * time.Millisecond
+	nativeOCIPayloadListenerRestartGap = time.Second
+	// Observation begins after withdrawal. The replacement listener can still
+	// owe its scripted restart gap, one in-flight connect timeout, and four probe
+	// ticks before the production recovery window starts.
+	nativeOCIRepublicationDeadline = DefaultPublicationRecoveryWindow + nativeOCIPayloadListenerRestartGap +
+		nativeOCIReadinessConnectTimeout + 4*nativeOCIReadinessProbeInterval
+)
+
 func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	helperSocket := os.Getenv("WEFTY_OCI_HELPER_SOCKET")
 	helperChecksum := os.Getenv("WEFTY_OCI_HELPER_CHECKSUM")
@@ -51,7 +62,7 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
 			helperTunnelOK := healthOK && echoOK
-			evidence := fmt.Sprintf("platform=%s/%s\nhealth=%t\necho=%t\nstartup_timeout=%t\nwithdrawal=%t\nwithdrawal_elapsed=%s\nrepublication=%t\nrepublication_elapsed=%s\nport_collision_avoided=%t\nportless_started=%t\nhelper_tunnel=%t\nterm_cooperative_stop=%t\nterm_kill_escalation=%t\nterm_kill_log_evidence_incomplete=%t\nterm_kill_log_seal_pairing=%t\nterm_kill_stdout_log=%t\nterm_kill_stderr_log=%t\nterm_grace_stop=%t\nfresh_restart_authority=%t\n", runtime.GOOS, runtime.GOARCH, healthOK, echoOK, startupTimedOut, withdrawalObserved, withdrawalElapsed, republicationObserved, republicationElapsed, portCollisionAvoided, portlessOK, helperTunnelOK, gracefulStopOK, killEscalation.Escalated, killEscalation.LogEvidenceIncomplete, killEscalation.LogSealPairing, killEscalation.StdoutLog, killEscalation.StderrLog, gracefulStopOK && killEscalation.Escalated, restartIdentityOK)
+			evidence := fmt.Sprintf("platform=%s/%s\nhealth=%t\necho=%t\nstartup_timeout=%t\nwithdrawal=%t\nwithdrawal_elapsed=%s\nrepublication=%t\nrepublication_elapsed=%s\npublication_recovery_bound=%s\nrepublication_observation_deadline=%s\nport_collision_avoided=%t\nportless_started=%t\nhelper_tunnel=%t\nterm_cooperative_stop=%t\nterm_kill_escalation=%t\nterm_kill_log_evidence_incomplete=%t\nterm_kill_log_seal_pairing=%t\nterm_kill_stdout_log=%t\nterm_kill_stderr_log=%t\nterm_grace_stop=%t\nfresh_restart_authority=%t\n", runtime.GOOS, runtime.GOARCH, healthOK, echoOK, startupTimedOut, withdrawalObserved, withdrawalElapsed, republicationObserved, republicationElapsed, DefaultPublicationRecoveryWindow, nativeOCIRepublicationDeadline, portCollisionAvoided, portlessOK, helperTunnelOK, gracefulStopOK, killEscalation.Escalated, killEscalation.LogEvidenceIncomplete, killEscalation.LogSealPairing, killEscalation.StdoutLog, killEscalation.StderrLog, gracefulStopOK && killEscalation.Escalated, restartIdentityOK)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-publication-"+runtime.GOOS+".txt"), []byte(evidence), 0o600); err != nil {
 				t.Errorf("write OCI service publication evidence: %v", err)
 			}
@@ -105,8 +116,11 @@ func TestOCIServicePublicationThroughHelperTunnel(t *testing.T) {
 		t.Fatalf("helper-tunnel withdrawal killed payload: (%#v, %v)", outcome.result, outcome.err)
 	default:
 	}
-	republicationElapsed = primary.waitReachableMeasured(t, true, 5*time.Second)
-	republicationObserved = true
+	republicationElapsed = primary.waitReachableMeasured(t, true, nativeOCIRepublicationDeadline)
+	republicationObserved = republicationElapsed >= DefaultPublicationRecoveryWindow
+	if !republicationObserved {
+		t.Fatalf("OCI republication elapsed %s, want production recovery bound %s", republicationElapsed, DefaultPublicationRecoveryWindow)
+	}
 
 	timedOut := startNativeOCIService(t, ctx, adapter, reference, digest, "startup-timeout", "", []string{
 		"/bin/sh", "-c", `trap 'exit 143' TERM; while :; do sleep 0.1; done`,
@@ -888,9 +902,9 @@ func startNativeOCIService(
 			runContext, adapter, request, nil, listener, endpoint,
 			serviceSupervisorConfig{
 				startupReadinessDeadline:  750 * time.Millisecond,
-				readinessProbeInterval:    50 * time.Millisecond,
-				readinessConnectTimeout:   200 * time.Millisecond,
-				publicationRecoveryWindow: 250 * time.Millisecond,
+				readinessProbeInterval:    nativeOCIReadinessProbeInterval,
+				readinessConnectTimeout:   nativeOCIReadinessConnectTimeout,
+				publicationRecoveryWindow: DefaultPublicationRecoveryWindow,
 			},
 		)
 		service.done <- serviceRunOutcome{result: result, err: runErr}

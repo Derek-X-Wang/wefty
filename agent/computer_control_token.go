@@ -12,10 +12,10 @@ import (
 )
 
 const (
-	computerControlTokenVersion = 1
-	computerControlTokenPrefix  = "control_v1."
-	computerControlTokenKeySize = 32
-	computerControlTokenKeyName = "computer_control_token_hmac_v1"
+	computerControlTokenVersion      = 1
+	computerControlTokenPrefix       = "control_v1."
+	computerControlTokenKeySize      = 32
+	computerControlTokenKeyName      = "computer_control_token_hmac_v1"
 	maximumComputerControlTokenBytes = 4096
 )
 
