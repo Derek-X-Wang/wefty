@@ -410,6 +410,32 @@ func TestEngineFailureCarriesBoundedOperationMechanics(t *testing.T) {
 	}
 }
 
+func TestManagedVolumeEngineFailureDoesNotInvalidateSession(t *testing.T) {
+	engine := newFakeEngine()
+	engine.managedVolumeErr = errors.New("volume remains busy")
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	_, err = session.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{Kind: ManagedVolumeHandoff, OwnerKey: "scoped-volume-failure"})
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeEngineFailure || rpcErr.EngineFailure == nil ||
+		rpcErr.EngineFailure.Operation != MethodDeleteVolume || rpcErr.EngineFailure.Reason != EngineFailureOperationFailed {
+		t.Fatalf("DeleteManagedVolume engine mechanics = %#v err=%v", rpcErr, err)
+	}
+	var runtimeLoss *RuntimeLossError
+	if errors.As(err, &runtimeLoss) {
+		t.Fatalf("volume-scoped DeleteManagedVolume failure became runtime loss: %v", err)
+	}
+	if err := session.flushHeartbeat(t.Context()); err != nil {
+		t.Fatalf("volume-scoped DeleteManagedVolume failure marked the live helper session lost: %v", err)
+	}
+}
+
 func TestEngineFailureReasonRejectsUnknownWireValue(t *testing.T) {
 	var response frame
 	err := json.Unmarshal([]byte(`{"version":2,"error":{"code":"engine_failure","message":"failed","engine_failure":{"operation":"Delete","reason":"host_specific"}}}`), &response)
@@ -2035,6 +2061,7 @@ type fakeEngine struct {
 	lastRunRequest           RunRequest
 	runErr                   error
 	deleteErr                error
+	managedVolumeErr         error
 	runEntered               chan struct{}
 	releaseRun               chan struct{}
 	sweepEntered             chan struct{}
@@ -2539,8 +2566,11 @@ func (engine *fakeEngine) Delete(context.Context, DeleteRequest) (DeleteResponse
 	engine.mu.Unlock()
 	return DeleteResponse{Deleted: err == nil}, err
 }
-func (*fakeEngine) DeleteManagedVolume(context.Context, DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
-	return DeleteManagedVolumeResponse{Deleted: true}, nil
+func (engine *fakeEngine) DeleteManagedVolume(context.Context, DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
+	engine.mu.Lock()
+	err := engine.managedVolumeErr
+	engine.mu.Unlock()
+	return DeleteManagedVolumeResponse{Deleted: err == nil}, err
 }
 func (engine *fakeEngine) AttestRemoval(_ context.Context, request AttestRemovalRequest) (AttestRemovalResponse, error) {
 	engine.record("AttestRemoval")

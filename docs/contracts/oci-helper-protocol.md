@@ -110,9 +110,12 @@ never restores authority or remains indefinitely `session_busy`.
 
 The client boundary exposes runtime loss as a typed error only for an active
 session's transport disappearance, `session_stale`, an `engine_failure` that
-is not a bounded `Delete` cancellation/deadline, or an explicit image
-`engine_loss` fact. A typed `Delete` `deadline_exceeded` or `canceled` fact is
-attempt-scoped cleanup failure and does not invalidate the live session.
+is neither a bounded `Delete` cancellation/deadline nor any
+`DeleteManagedVolume` failure, or an explicit image `engine_loss` fact. A typed
+`Delete` `deadline_exceeded` or `canceled` fact is attempt-scoped cleanup
+failure. Every `DeleteManagedVolume` failure is scoped to its independently
+authorized durable resource and removal operation. Neither invalidates the
+live session.
 Caller cancellation, deadlines owned by the
 caller, `sweep_required`, validation/policy refusals, digest disagreement, and
 unknown agent errors never manufacture runtime-loss evidence. A stop-specific

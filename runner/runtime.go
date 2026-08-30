@@ -466,8 +466,8 @@ type ReapReceipt struct {
 	HelperGeneration uint64
 }
 
-// ErrPriorBootEvidenceUnavailable lets the agent try the other kind-specific
-// reaper without treating absence of OCI sweep evidence as positive proof.
+// ErrPriorBootEvidenceUnavailable reports that the removal intent's exact
+// kind-specific runtime cannot supply prior-boot quiescence evidence.
 var ErrPriorBootEvidenceUnavailable = errors.New("prior-boot runtime evidence is unavailable")
 
 // PriorBootReapRequest asks a runtime to verify the boot boundary for a

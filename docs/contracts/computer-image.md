@@ -90,7 +90,8 @@ Both named endpoints implement the same exact transport contract:
   routing.
 - Exactly negotiated `binary` WebSocket subprotocol.
 - RFB bytes in binary frames only; a text frame is rejected and closes the
-  connection.
+  connection. The rejection need not deliver an RFC 6455 close control frame;
+  an immediate EOF is equally conformant because no text payload is accepted.
 - The first 12 payload bytes are an RFB version greeting of the form
   `RFB ddd.ddd\n`.
 

@@ -888,6 +888,9 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 	case <-time.After(15 * time.Second):
 		t.Fatal("reference Computer agent service did not stop")
 	}
+	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: authority}); err != nil || !receipt.RuntimeQuiesced {
+		t.Fatalf("reference Computer runtime cleanup = %+v err=%v", receipt, err)
+	}
 	if err := adapter.FinalizeManagedVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
 		Authority: authority, Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
 		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "reference-" + identity + "-computer-cleanup"},
@@ -974,8 +977,16 @@ func assertReferenceComputerWireNegatives(t *testing.T, ctx context.Context, ses
 	if err := connection.Write(probeContext, websocket.MessageText, []byte("forbidden")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := connection.Read(probeContext); err == nil || websocket.CloseStatus(err) != websocket.StatusUnsupportedData {
-		t.Fatalf("reference Computer text-frame close = %v status=%v", err, websocket.CloseStatus(err))
+	if _, _, err := connection.Read(probeContext); err == nil {
+		t.Fatal("reference Computer accepted a text frame and kept the connection open")
+	} else {
+		if probeContext.Err() != nil {
+			t.Fatalf("reference Computer did not reject a text frame before the probe deadline: %v", err)
+		}
+		var timeout net.Error
+		if errors.As(err, &timeout) && timeout.Timeout() {
+			t.Fatalf("reference Computer did not reject a text frame before the probe deadline: %v", err)
+		}
 	}
 }
 

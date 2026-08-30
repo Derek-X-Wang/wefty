@@ -672,6 +672,12 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 		return true
 	}
 	if err.Code == CodeEngineFailure {
+		// Managed-volume deletion is independently authorized and verified for
+		// one durable resource. Its failure is scoped to that volume/removal
+		// operation; it does not prove that helper session authority disappeared.
+		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodDeleteVolume {
+			return false
+		}
 		// Delete is independently bounded and followed by attempt-scoped
 		// verification. Cancellation or deadline expiry here is failed cleanup
 		// for this attempt, not proof that the helper session or namespace

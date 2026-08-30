@@ -21,6 +21,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -65,6 +66,41 @@ func TestMain(main *testing.M) {
 
 func TestAgentTakesStableNodeLockBeforeOpeningSpool(t *testing.T) {
 	assertAgentTakesStableNodeLockBeforeOpeningSpool(t)
+}
+
+type priorBootReaperFunc func(context.Context, workloadrunner.PriorBootReapRequest) (workloadrunner.ReapReceipt, error)
+
+func (reaper priorBootReaperFunc) ReapPriorBoot(ctx context.Context, request workloadrunner.PriorBootReapRequest) (workloadrunner.ReapReceipt, error) {
+	return reaper(ctx, request)
+}
+
+func TestPriorBootReaperDispatchesOnlyRemovalKind(t *testing.T) {
+	calls := map[string]int{}
+	reapers := map[string]workloadrunner.PriorBootReaper{
+		contract.JobKindProcess: priorBootReaperFunc(func(context.Context, workloadrunner.PriorBootReapRequest) (workloadrunner.ReapReceipt, error) {
+			calls[contract.JobKindProcess]++
+			return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidencePriorBootGuardian}, nil
+		}),
+		contract.JobKindOCI: priorBootReaperFunc(func(context.Context, workloadrunner.PriorBootReapRequest) (workloadrunner.ReapReceipt, error) {
+			calls[contract.JobKindOCI]++
+			return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidencePriorBootOCISweep}, nil
+		}),
+	}
+	request := workloadrunner.PriorBootReapRequest{NodeID: "node", JobID: "job", PriorBootSessionID: "old", CurrentBootSessionID: "new"}
+
+	receipt, err := reapPriorBootForKind(t.Context(), reapers, contract.JobKindOCI, request)
+	if err != nil || receipt.Evidence != workloadrunner.ReapEvidencePriorBootOCISweep {
+		t.Fatalf("OCI prior-boot receipt = %+v err=%v", receipt, err)
+	}
+	if calls[contract.JobKindOCI] != 1 || calls[contract.JobKindProcess] != 0 {
+		t.Fatalf("prior-boot reaper calls = %+v, want only OCI", calls)
+	}
+	if _, err := reapPriorBootForKind(t.Context(), reapers, "future.microvm", request); !errors.Is(err, workloadrunner.ErrPriorBootEvidenceUnavailable) {
+		t.Fatalf("missing-kind prior-boot error = %v", err)
+	}
+	if calls[contract.JobKindOCI] != 1 || calls[contract.JobKindProcess] != 0 {
+		t.Fatalf("unsupported kind crossed runtime authority: %+v", calls)
+	}
 }
 
 func assertAgentTakesStableNodeLockBeforeOpeningSpool(t *testing.T) {

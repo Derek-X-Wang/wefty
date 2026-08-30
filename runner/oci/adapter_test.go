@@ -388,6 +388,20 @@ func TestAdapterConsumesMatchingPriorBootSweepEvidenceOnce(t *testing.T) {
 	}
 }
 
+func TestAdapterUsesVerifiedPriorBootNamespaceSweepAfterAttemptWasAlreadyReaped(t *testing.T) {
+	source := &adapterReceiptSource{receipt: ocihelper.VerifiedSweepReceipt{
+		SweepEpoch: "sweep-empty", HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-1", SessionGeneration: 8},
+		VerifiedAbsent: true,
+	}}
+	adapter := NewAdapter(source)
+	request := workloadrunner.PriorBootReapRequest{NodeID: "node", JobID: "job", PriorBootSessionID: "boot-old", CurrentBootSessionID: "boot-new"}
+	receipt, err := adapter.ReapPriorBoot(t.Context(), request)
+	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidencePriorBootOCISweep ||
+		receipt.SweepEpoch != "sweep-empty" || receipt.HelperGeneration != 8 {
+		t.Fatalf("empty prior-boot namespace receipt=%+v err=%v", receipt, err)
+	}
+}
+
 func TestAdapterRefreshesRunSweepBaselineAndRetainsItUntilRecovery(t *testing.T) {
 	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{ExitCode: intPointer(0)}}
 	adapter, barrier, source, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})

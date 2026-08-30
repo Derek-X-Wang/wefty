@@ -1673,14 +1673,7 @@ func (adapter *Adapter) ReapPriorBoot(_ context.Context, request workloadrunner.
 	if !ok || receipt.SweepEpoch == "" || receipt.HelperSession.HelperInstanceID == "" || receipt.HelperSession.SessionGeneration == 0 {
 		return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
 	}
-	found := false
-	for _, attempt := range receipt.Attempts {
-		if attempt.NodeID == request.NodeID && attempt.JobID == request.JobID && attempt.PriorBootSessionID == request.PriorBootSessionID && attempt.Class == contract.JobClassService {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !receipt.VerifiedAbsent {
 		return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
 	}
 	key := priorBootSweepEvidenceKey{epoch: receipt.SweepEpoch, helper: receipt.HelperSession, jobID: request.JobID, priorBootSessionID: request.PriorBootSessionID}
