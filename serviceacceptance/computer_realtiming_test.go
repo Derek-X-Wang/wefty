@@ -59,8 +59,21 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	reference := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_REFERENCE")
 	digest := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_DIGEST")
 	archive := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_ARCHIVE")
+	variant := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_VARIANT")
+	reimagePrefix := "WEFTY_OCI_WAYLAND_COMPUTER_"
+	if variant == "wayland" {
+		reimagePrefix = "WEFTY_OCI_XFCE_COMPUTER_"
+	} else if variant != "xfce" {
+		t.Fatalf("unknown Computer matrix variant %q", variant)
+	}
+	reimageReference := requiredComputerRealtimeEnvironment(t, reimagePrefix+"REFERENCE")
+	reimageDigest := requiredComputerRealtimeEnvironment(t, reimagePrefix+"DIGEST")
+	reimageArchive := requiredComputerRealtimeEnvironment(t, reimagePrefix+"ARCHIVE")
+	if reimageDigest == digest {
+		t.Fatalf("Computer reimage artifact aliases the current %s image digest %s", variant, digest)
+	}
 	imageRuntime := readPublishedComputerRuntimeReceipt(t, requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT"))
-	receipt.Image = linuxComputerImageEvidence{Variant: requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_VARIANT"), Reference: reference, IndexDigest: digest,
+	receipt.Image = linuxComputerImageEvidence{Variant: variant, Reference: reference, IndexDigest: digest,
 		PlatformDigest: imageRuntime.Digest, Archive: filepath.Base(archive)}
 	candidate, err := exec.Command("git", "rev-parse", "HEAD").Output()
 	if err != nil || strings.TrimSpace(string(candidate)) == "" {
@@ -94,6 +107,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	importRealtimeProbeImage(t, requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_PROBE_ARCHIVE"),
 		helperSocket, helperChecksum, probeReference, probeDigest, recordBarrierResidue)
 	importRealtimeProbeImage(t, archive, helperSocket, helperChecksum, reference, digest, recordBarrierResidue)
+	importRealtimeProbeImage(t, reimageArchive, helperSocket, helperChecksum, reimageReference, reimageDigest, recordBarrierResidue)
 	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
 	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
 		t.Fatal(err)
@@ -344,7 +358,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision && current.StorageGeneration > resized.StorageGeneration
 	})
 	reimaged := runComputerCLI[l1.Computer](t, harness, false, "services", "reimage", reset.ComputerID,
-		"--image", reference+"@"+digest, "--expect-current", "--idempotency-key", "linux-native-reimage")
+		"--image", reimageReference+"@"+reimageDigest, "--expect-current", "--idempotency-key", "linux-native-reimage")
 	reimaged = waitForComputerCLI(t, harness, reimaged.ComputerID, 4*time.Minute, func(current l1.Computer) bool {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision &&
 			current.CurrentSpecRevision > reset.CurrentSpecRevision && computerDisplayPublished(current)
@@ -362,7 +376,8 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"stale_cas_rejected_live":     abortEvidence.StaleCASRejected,
 		"no_automatic_rollback_live":  abortEvidence.NoAutoRollback,
 	}, map[string]string{"intent_revision": fmt.Sprint(reimaged.IntentRevision), "spec_revision": fmt.Sprint(reimaged.CurrentSpecRevision),
-		"storage_generation": fmt.Sprint(reimaged.StorageGeneration), "aborted_computer_id": abortEvidence.ComputerID})
+		"storage_generation": fmt.Sprint(reimaged.StorageGeneration), "reimage_reference": reimageReference,
+		"reimage_digest": reimageDigest, "aborted_computer_id": abortEvidence.ComputerID})
 
 	receipt.begin("linux.storage_provenance")
 	backupOutput := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "backup", "create", reimaged.ComputerID,

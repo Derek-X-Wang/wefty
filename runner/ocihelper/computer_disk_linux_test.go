@@ -204,6 +204,19 @@ func TestComputerDiskRejectsDisappearedLockWhileManifestAttached(t *testing.T) {
 	}
 }
 
+func TestComputerDiskRejectsConcurrentAttachmentAsScopedConflict(t *testing.T) {
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: t.TempDir()}, diskSystem: newFakeComputerDiskSystem()}
+	first, err := engine.attachComputerDisk(t.Context(), testComputerStorage(), testComputerAuthority("attempt-a", "fence-a", "boot-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.detachComputerDisk(first, computerDiskReapReceipt, "") })
+	_, err = engine.attachComputerDisk(t.Context(), testComputerStorage(), testComputerAuthority("attempt-b", "fence-b", "boot-a"))
+	if !errors.Is(err, errComputerStorageAttachmentOwned) {
+		t.Fatalf("concurrent Computer attachment = %v, want scoped ownership conflict", err)
+	}
+}
+
 func TestComputerDiskRejectsMismatchedManifestAndStaleGenerationReceipt(t *testing.T) {
 	for _, mutate := range []func(*computerDiskManifest){
 		func(manifest *computerDiskManifest) { manifest.Storage.StorageID = "foreign-storage" },

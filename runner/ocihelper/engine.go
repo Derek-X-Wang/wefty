@@ -15,6 +15,8 @@ const DefaultContainerdAddress = "/run/containerd/containerd.sock"
 // terminal evidence instead of treating this as engine loss.
 var ErrTaskAlreadyTerminated = errors.New("OCI task already terminated")
 
+var errComputerStorageAttachmentOwned = errors.New("Computer Storage generation already has an attachment owner")
+
 // NativeEngineConfig contains only host-side helper configuration. The agent
 // never supplies these values over the helper protocol.
 type NativeEngineConfig struct {

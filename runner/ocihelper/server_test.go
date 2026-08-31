@@ -509,6 +509,41 @@ func TestRunEngineFailureCarriesDiagnosticDetailAndWatchKeepsClosedMechanics(t *
 	}
 }
 
+func TestComputerAttachmentConflictDoesNotInvalidateSession(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runErr = fmt.Errorf("attach Computer disk: %w", errComputerStorageAttachmentOwned)
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.Authority.Class = contract.JobClassService
+	request.Workload.Computer = true
+	request.Workload.Limits.MemoryBytes = 64 << 20
+	request.Workload.ManagedVolumes = []ManagedVolumeDescriptor{{
+		Kind: ManagedVolumeComputerDisk,
+		ComputerStorage: &ComputerStorageReference{
+			ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 32 << 20,
+		},
+	}}
+	request.AllocateEndpoints = []string{contract.ComputerDisplayEndpointView, contract.ComputerDisplayEndpointControl}
+	_, err = session.Run(t.Context(), request)
+	var refusal *RPCError
+	if !errors.As(err, &refusal) || refusal.Code != CodeUnauthorizedAttempt {
+		t.Fatalf("Computer attachment conflict = %+v err=%v, want attempt-scoped refusal", refusal, err)
+	}
+	if session.HealthError() != nil {
+		t.Fatalf("Computer attachment conflict invalidated helper session: %v", session.HealthError())
+	}
+	if _, err := session.Verify(t.Context(), VerifyRequest{Scope: VerifyNamespace}); err != nil {
+		t.Fatalf("helper session unusable after Computer attachment conflict: %v", err)
+	}
+}
+
 func TestRemovalAttestationRequiresExactNodeJobGenerationAndResourceInventory(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})

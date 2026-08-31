@@ -119,7 +119,7 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		}
 	}()
 	if err = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return nil, errors.New("Computer Storage generation already has an attachment owner")
+		return nil, errComputerStorageAttachmentOwned
 	}
 	manifestPath := filepath.Join(diskRoot, "attachment.json")
 	manifest, present, err := readComputerDiskManifest(manifestPath)

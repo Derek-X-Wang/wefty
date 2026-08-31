@@ -1103,6 +1103,10 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			var imageUnavailable *ImageUnavailableError
 			if errors.As(err, &rpcErr) {
 				_ = writeRPCError(wire, rpcErr)
+			} else if errors.Is(err, errComputerStorageAttachmentOwned) {
+				// A live owner refusing a second Computer attachment is an
+				// attempt-scoped admission result, not loss of helper authority.
+				_ = writeFailure(wire, CodeUnauthorizedAttempt, errComputerStorageAttachmentOwned.Error())
 			} else if errors.As(err, &specRejection) {
 				_ = writeFailure(wire, CodeOCISpecRejected, "OCI runtime spec was rejected")
 			} else if errors.As(err, &serviceDataRejection) {
