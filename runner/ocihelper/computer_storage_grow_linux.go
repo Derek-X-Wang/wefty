@@ -56,6 +56,13 @@ func (engine *ContainerdEngine) reserveGrowCapacity(request GrowComputerStorageR
 	if reservation != nil && reservation.diskBytes != request.Storage.DiskBytes && reservation.diskBytes != request.NewDiskBytes {
 		return 0, false, errors.New("Computer grow conflicts with its atomic capacity reservation")
 	}
+	for jobID, existing := range engine.capacityReservations {
+		if jobID != request.Authority.JobID && existing.pendingDiskBytes != 0 &&
+			existing.pendingDiskAdmissionCeiling > 0 && available > existing.pendingDiskAdmissionCeiling {
+			available = existing.pendingDiskAdmissionCeiling
+		}
+	}
+	admissionCeiling := available
 	gate := delta
 	if imageSize == request.NewDiskBytes {
 		// A retry after filesystem expansion must not charge the already
@@ -93,11 +100,18 @@ func (engine *ContainerdEngine) reserveGrowCapacity(request GrowComputerStorageR
 			diskMaterialized: true, attempts: make(map[string]struct{})}
 		engine.capacityReservations[request.Authority.JobID] = reservation
 	}
-	if imageSize == request.NewDiskBytes {
+	if imageSize == request.NewDiskBytes && reservation.diskBytes == request.NewDiskBytes {
 		reservation.diskBytes = request.NewDiskBytes
 		reservation.pendingDiskBytes = 0
+		reservation.pendingDiskAdmissionCeiling = 0
 	} else {
+		// An expanded image is not materialized capacity proof: reassertion may
+		// still fail on sparse ranges. Keep the delta charged to other newcomers
+		// until the successful grow path verifies allocation and publishes it.
 		reservation.pendingDiskBytes = delta
+		if reservation.pendingDiskAdmissionCeiling == 0 {
+			reservation.pendingDiskAdmissionCeiling = admissionCeiling
+		}
 	}
 	return available, true, nil
 }
@@ -115,6 +129,7 @@ func (engine *ContainerdEngine) rollbackGrowCapacity(jobID string, oldBytes int6
 	}
 	reservation.diskBytes = oldBytes
 	reservation.pendingDiskBytes = 0
+	reservation.pendingDiskAdmissionCeiling = 0
 	reservation.diskMaterialized = imagePresent
 }
 

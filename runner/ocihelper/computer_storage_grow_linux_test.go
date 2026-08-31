@@ -261,6 +261,15 @@ func TestComputerGrowPostExpansionAllocationFailureIsUncertainAndNeverTruncates(
 		reservation.pendingDiskBytes != request.NewDiskBytes-request.Storage.DiskBytes {
 		t.Fatalf("uncertain grow lost resumable reservation: %#v", reservation)
 	}
+	response, err = engine.GrowComputerStorage(t.Context(), request)
+	if !errors.As(err, &uncertain) || response.Receipt.Kind == "computer_storage_grow_failed_unchanged" {
+		t.Fatalf("expanded-image uncertain retry = %#v err=%v, want uncertain outcome", response, err)
+	}
+	reservation = engine.capacityReservations[request.Authority.JobID]
+	if reservation == nil || reservation.diskBytes != request.Storage.DiskBytes ||
+		reservation.pendingDiskBytes != request.NewDiskBytes-request.Storage.DiskBytes {
+		t.Fatalf("expanded-image uncertain retry released held delta: %#v", reservation)
+	}
 	engine.computerGrowAllocate = nil
 	response, err = engine.GrowComputerStorage(t.Context(), request)
 	if err != nil || !response.Receipt.Applied || response.Receipt.Kind != "computer_storage_grow_applied" {

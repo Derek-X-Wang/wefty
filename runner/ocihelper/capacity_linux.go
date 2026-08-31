@@ -18,11 +18,12 @@ type memoryFacts struct {
 }
 
 type capacityReservation struct {
-	memoryBytes      int64
-	diskBytes        int64
-	pendingDiskBytes int64
-	diskMaterialized bool
-	attempts         map[string]struct{}
+	memoryBytes                 int64
+	diskBytes                   int64
+	pendingDiskBytes            int64
+	pendingDiskAdmissionCeiling int64
+	diskMaterialized            bool
+	attempts                    map[string]struct{}
 }
 
 func readMemoryFacts(path string) (memoryFacts, error) {
@@ -164,6 +165,13 @@ func (engine *ContainerdEngine) admitResources(request RunRequest) (ResourceAdmi
 	if err != nil {
 		return ResourceAdmissionReceipt{}, fmt.Errorf("read Computer disk admission facts: %w", err)
 	}
+	diskAdmissionAvailable := filesystemAvailable
+	for _, reservation := range engine.capacityReservations {
+		if reservation.pendingDiskBytes != 0 && reservation.pendingDiskAdmissionCeiling > 0 &&
+			diskAdmissionAvailable > reservation.pendingDiskAdmissionCeiling {
+			diskAdmissionAvailable = reservation.pendingDiskAdmissionCeiling
+		}
+	}
 	memoryCommitted, diskCommitted, diskPending := int64(0), int64(0), int64(0)
 	for _, reservation := range engine.capacityReservations {
 		if reservation.memoryBytes > int64(^uint64(0)>>1)-memoryCommitted || reservation.diskBytes > int64(^uint64(0)>>1)-diskCommitted ||
@@ -219,7 +227,7 @@ func (engine *ContainerdEngine) admitResources(request RunRequest) (ResourceAdmi
 		engine.lastAdmission = &record
 		return receipt, &insufficientMemoryError{RequestedBytes: requestedMemory, ObservedAvailableBytes: memoryAvailable}
 	}
-	diskAvailable := filesystemAvailable - diskPending
+	diskAvailable := diskAdmissionAvailable - diskPending
 	if diskAvailable < 0 {
 		diskAvailable = 0
 	}
@@ -250,6 +258,7 @@ func (engine *ContainerdEngine) markCapacityDiskMaterialized(jobID string) {
 	if reservation := engine.capacityReservations[jobID]; reservation != nil {
 		reservation.diskBytes += reservation.pendingDiskBytes
 		reservation.pendingDiskBytes = 0
+		reservation.pendingDiskAdmissionCeiling = 0
 		reservation.diskMaterialized = true
 	}
 	engine.capacityMu.Unlock()
