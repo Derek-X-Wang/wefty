@@ -275,6 +275,64 @@ func TestComputerStorageResetResumesEveryPreparationBoundaryThenUsesSharedRemova
 	}
 }
 
+func TestComputerStorageResetSweepDropsOnlyUnverifiedSuccessorPreparation(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	prior := testComputerAuthority("attempt-a", "fence-a", "boot-a")
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	request := resetTestRequest(storage, prior)
+	request.Storage.IntentRevision = request.Authority.IntentRevision
+	injected := errors.New("helper died after publishing successor image")
+	engine.storageResetHook = func(phase computerStorageResetPhase) error {
+		if phase == computerStorageResetImagePublished {
+			return injected
+		}
+		return nil
+	}
+	if _, err := engine.ResetComputerStorage(t.Context(), request); !errors.Is(err, injected) {
+		t.Fatalf("interrupted reset = %v, want injected helper death", err)
+	}
+	successor := storage
+	successor.StorageGeneration = request.NewGeneration
+	successor.IntentRevision = request.Authority.IntentRevision
+	name, err := deterministicComputerDiskName(successor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successorRoot := filepath.Join(root, "computer-disks", name)
+	if _, err := os.Lstat(filepath.Join(successorRoot, "disk.ext4")); err != nil {
+		t.Fatalf("interrupted reset did not reach published image: %v", err)
+	}
+
+	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	if err := engine.sweepComputerDisks("replacement-sweep"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(successorRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unverified reset successor survived helper sweep: %v", err)
+	}
+	request.Authority.BootSessionID = "boot-b"
+	request.Authority.HelperGeneration = 2
+	response, err := engine.ResetComputerStorage(t.Context(), request)
+	if err != nil || !response.Verified || response.Receipt.HelperGeneration != 2 {
+		t.Fatalf("reset did not recreate swept successor: %+v err=%v", response, err)
+	}
+	if err := engine.sweepComputerDisks("post-verification-sweep"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(successorRoot); err != nil {
+		t.Fatalf("verified reset successor was removed by helper sweep: %v", err)
+	}
+}
+
 func TestComputerStorageResetRefusesAttachedGenerationAndAuthorityReuse(t *testing.T) {
 	root := t.TempDir()
 	system := newFakeComputerDiskSystem()

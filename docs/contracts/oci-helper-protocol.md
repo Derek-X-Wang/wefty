@@ -258,6 +258,17 @@ proves the losing `Run` has no remaining runtime and therefore needs no second
 The helper holds a kernel listener through runtime-spec construction, transfers
 it directly into payload start, and retains the logical allocation until
 independent absence verification; failed verification cannot recycle the port.
+
+An interrupted Computer Storage reset successor remains disposable until its
+preparation receipt is durably published. A replacement helper removes that
+exact unverified successor during its sweep, allowing the standing L1 reset
+authority to recreate it; verified successors and tenant-bearing generations
+remain retained inventory.
+A verified reset successor that has never been attached may use its exact
+preparation receipt as Computer reimage quiescence evidence. The receipt binds
+the current Storage generation, prior Job, Node, managed root, and reset fence;
+once any attempt attaches, the ordinary detach or prior-boot sweep receipt is
+required instead.
 `DialHostBridge` pairs one authorized host
 stream with one accepted connection on that attempt's helper-owned guest
 listener; the host agent dials only its already-created loopback run bridge.

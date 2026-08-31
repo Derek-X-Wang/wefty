@@ -1055,6 +1055,31 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 			}
 			continue
 		}
+		// A reset successor has no tenant bytes before its preparation receipt is
+		// durably published. If the helper died anywhere in that preparation, drop
+		// the exact unverified generation so the standing L1 reset authority can
+		// recreate it; retaining a half-published image would instead make startup
+		// verification fail closed forever on allocation_mismatch/image_missing.
+		if unverifiedComputerStorageResetPreparation(manifest) {
+			lock, lockErr := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+			if lockErr != nil {
+				return lockErr
+			}
+			if lockErr = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); lockErr != nil {
+				_ = lock.Close()
+				return errors.New("unverified Computer Storage reset preparation lock remained owned after sweep")
+			}
+			removeErr := os.RemoveAll(root)
+			_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+			_ = lock.Close()
+			if removeErr != nil {
+				return removeErr
+			}
+			if err := syncDirectory(diskRoot); err != nil {
+				return err
+			}
+			continue
+		}
 		refreshDetachedReap := manifest.Attached == nil && manifest.Pending == nil &&
 			manifest.PreviousDetachment != nil && manifest.PreviousDetachment.Kind == computerDiskReapReceipt
 		if manifest.Attached == nil && manifest.Pending == nil && !refreshDetachedReap {

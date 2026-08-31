@@ -65,12 +65,37 @@ func readExt4RootOwner(ctx context.Context, imagePath string) (uint32, uint32, e
 	return uint32(uid), uint32(gid), nil
 }
 
-func validReimageDetachment(evidence *computerDiskEvidence, request PreflightComputerReimageRequest) bool {
-	return evidence != nil && evidence.ReceiptID != "" && evidence.ComputerID == request.Storage.ComputerID &&
-		evidence.StorageID == request.Storage.StorageID && evidence.StorageGeneration == request.Storage.StorageGeneration &&
-		evidence.NodeID == request.Authority.NodeID && evidence.JobID == request.Authority.OldJobID &&
-		evidence.AttemptID != "" && evidence.FencingToken != "" && evidence.BootSessionID != "" &&
-		(evidence.Kind == computerDiskReapReceipt || evidence.Kind == computerDiskSweepReceipt)
+type computerReimageDetachmentEvidence struct {
+	receiptID, attemptID, fencingToken string
+}
+
+func reimageDetachmentEvidence(manifest computerDiskManifest, request PreflightComputerReimageRequest) (computerReimageDetachmentEvidence, bool) {
+	if evidence := manifest.PreviousDetachment; evidence != nil && evidence.ReceiptID != "" &&
+		evidence.ComputerID == request.Storage.ComputerID && evidence.StorageID == request.Storage.StorageID &&
+		evidence.StorageGeneration == request.Storage.StorageGeneration && evidence.NodeID == request.Authority.NodeID &&
+		evidence.JobID == request.Authority.OldJobID && evidence.AttemptID != "" && evidence.FencingToken != "" &&
+		evidence.BootSessionID != "" && (evidence.Kind == computerDiskReapReceipt || evidence.Kind == computerDiskSweepReceipt) {
+		return computerReimageDetachmentEvidence{evidence.ReceiptID, evidence.AttemptID, evidence.FencingToken}, true
+	}
+	// A newly published reset generation can be reimaged before its first
+	// attachment. Its verified preparation receipt is stronger than a detach
+	// receipt: it proves that this exact generation contains fresh helper-owned
+	// bytes and has never carried an attempt.
+	preparation, receipt := manifest.Preparation, manifest.PreparationReceipt
+	if !manifest.Prepared || preparation == nil || receipt == nil || manifest.PreviousDetachment != nil ||
+		receipt.Kind != "computer_storage_reset_verified" || receipt.ReceiptID == "" || receipt.HelperGeneration == 0 ||
+		receipt.ComputerID != request.Storage.ComputerID || receipt.StorageID != request.Storage.StorageID ||
+		receipt.NewGeneration != request.Storage.StorageGeneration || receipt.OldGeneration+1 != receipt.NewGeneration ||
+		receipt.NodeID != request.Authority.NodeID || receipt.RootInstanceID != request.Authority.RootInstanceID ||
+		receipt.JobID != request.Authority.OldJobID || receipt.IntentRevision != manifest.Storage.IntentRevision ||
+		receipt.CleanupFence == "" || preparation.NodeID != receipt.NodeID ||
+		preparation.RootInstanceID != receipt.RootInstanceID || preparation.JobID != receipt.JobID ||
+		preparation.PriorJobID != receipt.JobID || preparation.IntentRevision != receipt.IntentRevision ||
+		preparation.CleanupFence != receipt.CleanupFence || preparation.HelperGeneration != receipt.HelperGeneration {
+		return computerReimageDetachmentEvidence{}, false
+	}
+	return computerReimageDetachmentEvidence{receipt.ReceiptID,
+		fmt.Sprintf("storage-reset-%d", receipt.IntentRevision), receipt.CleanupFence}, true
 }
 
 func (engine *ContainerdEngine) PreflightComputerReimage(ctx context.Context, request PreflightComputerReimageRequest) (PreflightComputerReimageResponse, error) {
@@ -93,8 +118,9 @@ func (engine *ContainerdEngine) PreflightComputerReimage(ctx context.Context, re
 	if err != nil {
 		return PreflightComputerReimageResponse{}, err
 	}
+	detachment, detached := reimageDetachmentEvidence(manifest, request)
 	if !present || !sameComputerStorageIdentity(manifest.Storage, request.Storage) ||
-		manifest.Attached != nil || manifest.Pending != nil || !validReimageDetachment(manifest.PreviousDetachment, request) {
+		manifest.Attached != nil || manifest.Pending != nil || !detached {
 		return PreflightComputerReimageResponse{}, errComputerReimageDetachmentRequired
 	}
 	if err := verifyComputerDiskAllocation(imagePath, request.Storage.DiskBytes); err != nil {
@@ -111,9 +137,9 @@ func (engine *ContainerdEngine) PreflightComputerReimage(ctx context.Context, re
 		RootInstanceID: request.Authority.RootInstanceID, OperationRevision: request.Authority.OperationRevision,
 		OperationFence: request.Authority.OperationFence, TargetDigest: request.TargetImage.Digest,
 		PlatformOS: request.TargetImage.Platform.OS, PlatformArchitecture: request.TargetImage.Platform.Architecture,
-		DetachmentReceiptID:    manifest.PreviousDetachment.ReceiptID,
-		DetachmentAttemptID:    manifest.PreviousDetachment.AttemptID,
-		DetachmentFencingToken: manifest.PreviousDetachment.FencingToken,
+		DetachmentReceiptID:    detachment.receiptID,
+		DetachmentAttemptID:    detachment.attemptID,
+		DetachmentFencingToken: detachment.fencingToken,
 		HelperGeneration:       request.Authority.HelperGeneration}
 	platform := platforms.OnlyStrict(platforms.Normalize(ocispec.Platform{OS: request.TargetImage.Platform.OS,
 		Architecture: request.TargetImage.Platform.Architecture, Variant: request.TargetImage.Platform.Variant}))

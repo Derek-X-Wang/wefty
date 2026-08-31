@@ -499,6 +499,9 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	capacityRetained := exerciseNativeLinuxComputerCapacity(t, ctx, barrier, echoReference, echoImage.TopLevelDigest)
 	expectedRetained = mergeNativeExpectedInventory(expectedRetained, capacityRetained)
 	computerDiskEvidence := exerciseNativeLinuxComputerDisk(t, ctx, barrier, echoReference, echoImage.TopLevelDigest, retainedBaseline, expectedRetained)
+	if err := adapter.Probe(ctx, "native-node", "native-boot", reference, digest, l1.DefaultLeaseDuration); err != nil {
+		t.Fatalf("re-probe OCI adapter after Computer helper-death sweep: %v", err)
+	}
 	computerAgentRestartEvidence := exerciseNativeLinuxComputerAgentRestart(t, ctx, adapter, echoReference, echoImage.TopLevelDigest)
 	session, err = barrier.Session()
 	if err != nil {
