@@ -89,6 +89,32 @@ func TestComputerStorageResetMarksSuccessorFreshForFirstAttach(t *testing.T) {
 	}
 }
 
+func TestComputerStorageResetPredecessorAttachIsDefinitivelyRetired(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	prior := testComputerAuthority("attempt-a", "fence-a", "boot-a")
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	request := resetTestRequest(storage, prior)
+	request.Storage.IntentRevision = request.Authority.IntentRevision
+	if _, err := engine.ResetComputerStorage(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	_, err = engine.attachComputerDisk(t.Context(), request.Storage,
+		testComputerAuthority("stale-after-reset", "stale-fence", "boot-a"))
+	var retired *computerStorageRetiredError
+	if !errors.As(err, &retired) {
+		t.Fatalf("reset predecessor attach = %v, want definitive retirement", err)
+	}
+}
+
 func TestComputerStorageResetFreshnessSurvivesFailedFirstAttach(t *testing.T) {
 	root := t.TempDir()
 	system := newFakeComputerDiskSystem()

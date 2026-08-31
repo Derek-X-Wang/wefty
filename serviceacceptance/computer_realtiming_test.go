@@ -358,7 +358,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision && current.StorageGeneration > resized.StorageGeneration
 	})
 	reimaged := runComputerCLI[l1.Computer](t, harness, false, "services", "reimage", reset.ComputerID,
-		"--image", reimageReference+"@"+reimageDigest, "--expect-current", "--idempotency-key", "linux-native-reimage")
+		"--image", reimageReference+"@"+reimageDigest, "--expect-current", "--idempotency-key", "linux-native-reimage", "--terminate-sessions")
 	reimaged = waitForComputerCLI(t, harness, reimaged.ComputerID, 4*time.Minute, func(current l1.Computer) bool {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision &&
 			current.CurrentSpecRevision > reset.CurrentSpecRevision && computerDisplayPublished(current)

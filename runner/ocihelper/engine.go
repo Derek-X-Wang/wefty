@@ -17,6 +17,18 @@ var ErrTaskAlreadyTerminated = errors.New("OCI task already terminated")
 
 var errComputerStorageAttachmentOwned = errors.New("Computer Storage generation already has an attachment owner")
 
+var errComputerReimageDetachmentRequired = errors.New("Computer reimage requires exact positive detachment evidence")
+
+// computerStorageRetiredError is a definitive attachment refusal for a
+// generation whose durable reset fence prevents it from ever becoming current
+// again. It is distinct from an engine failure: the attempted successor has no
+// runtime, and the helper session remains authoritative after positive reap.
+type computerStorageRetiredError struct{}
+
+func (*computerStorageRetiredError) Error() string {
+	return "Computer Storage generation is fenced for retirement"
+}
+
 // ComputerStorageGrowUncertainError means the filesystem may already have
 // expanded and the same durable grow authority must inspect and resume it.
 type ComputerStorageGrowUncertainError struct{ Cause error }

@@ -79,6 +79,7 @@ const (
 	CodeSessionBusy                  ErrorCode = "session_busy"
 	CodeSessionStale                 ErrorCode = "session_stale"
 	CodeComputerStorageBusy          ErrorCode = "computer_storage_busy"
+	CodeComputerStorageRetired       ErrorCode = "computer_storage_retired"
 	CodeComputerStorageGrowUncertain ErrorCode = "computer_storage_grow_uncertain"
 	CodeUnauthorizedAttempt          ErrorCode = "unauthorized_attempt"
 	CodeAttemptOutsideSession        ErrorCode = "attempt_outside_session"

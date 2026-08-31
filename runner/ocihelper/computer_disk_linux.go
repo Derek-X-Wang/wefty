@@ -131,7 +131,7 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 			return nil, errors.New("Computer disk manifest does not match its durable Storage identity")
 		}
 		if manifest.Retirement != nil {
-			return nil, errors.New("Computer Storage generation is fenced for retirement")
+			return nil, &computerStorageRetiredError{}
 		}
 		if manifest.Attached != nil {
 			return nil, errors.New("Computer Storage generation remains attached; lock disappearance is not detachment proof")

@@ -95,7 +95,7 @@ func (engine *ContainerdEngine) PreflightComputerReimage(ctx context.Context, re
 	}
 	if !present || !sameComputerStorageIdentity(manifest.Storage, request.Storage) ||
 		manifest.Attached != nil || manifest.Pending != nil || !validReimageDetachment(manifest.PreviousDetachment, request) {
-		return PreflightComputerReimageResponse{}, errors.New("Computer reimage requires exact positive detachment evidence")
+		return PreflightComputerReimageResponse{}, errComputerReimageDetachmentRequired
 	}
 	if err := verifyComputerDiskAllocation(imagePath, request.Storage.DiskBytes); err != nil {
 		return PreflightComputerReimageResponse{}, err

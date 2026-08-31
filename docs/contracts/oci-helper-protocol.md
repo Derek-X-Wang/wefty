@@ -123,11 +123,13 @@ The agent records it on the standing reset/restore operation so Computer status
 surfaces the failure and L1 stops redispatching it; recovery requires a later
 helper sweep/operator workflow rather than an unbounded silent loop. Neither a
 retry nor quarantine invalidates the live helper session.
-`computer_storage_busy` is a definitive attempt-scoped `Run` refusal only after
-the helper positively reaps the losing attempt and verifies no runtime remains;
+`computer_storage_busy` and `computer_storage_retired` are definitive
+attempt-scoped `Run` refusals only after the helper positively reaps the losing
+attempt and verifies no runtime remains. The retired form means a durable reset
+fence makes that Storage generation permanently ineligible for attachment;
 `computer_storage_grow_uncertain` keeps the same grow
 authority pending for inspection and retry after the filesystem may have
-expanded. Neither code invalidates the helper session.
+expanded. None of these codes invalidates the helper session.
 If the losing attempt cannot be positively reaped, the helper invalidates its
 session and returns `session_stale` instead of manufacturing the busy proof.
 Caller cancellation, deadlines owned by the
@@ -140,9 +142,10 @@ failed quiescence proof and does not authorize a namespace sweep.
 Unary `engine_failure` responses include only a closed mechanics fact naming
 the helper method and one sanitized reason (`deadline_exceeded`, `canceled`,
 `permission_denied`, or `operation_failed`). Raw privileged error text,
-containerd types, and host paths remain local, while CI and callers can still
-distinguish the operation and bounded failure class before applying the
-runtime-loss rule above.
+containerd types, and host paths remain local. The Computer reimage preflight
+may additionally report the fixed positive-detachment refusal so native
+evidence distinguishes that durable authority mismatch; the closed fact,
+never that detail, remains policy authority.
 
 ## Boot sweep barrier
 
@@ -248,9 +251,10 @@ established, and the client consumes it before returning the opaque stream.
 This makes an agent-side connect probe cover the payload, helper session, and
 tunnel rather than merely the helper's authorization check.
 Like the attempt-scoped `DialAttemptPort` backend refusal,
-`computer_storage_busy` does not invalidate the helper session; unlike that
-retryable readiness refusal, it definitively proves the losing `Run` has no
-remaining runtime and therefore needs no second `Delete`.
+`computer_storage_busy` and `computer_storage_retired` do not invalidate the
+helper session; unlike that retryable readiness refusal, each definitively
+proves the losing `Run` has no remaining runtime and therefore needs no second
+`Delete`.
 The helper holds a kernel listener through runtime-spec construction, transfers
 it directly into payload start, and retains the logical allocation until
 independent absence verification; failed verification cannot recycle the port.

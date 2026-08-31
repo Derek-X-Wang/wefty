@@ -1297,7 +1297,8 @@ func helperRunDefinitivelyRejected(err error) bool {
 	switch rpcErr.Code {
 	case ocihelper.CodeEngineFailure, ocihelper.CodeOCISpecRejected, ocihelper.CodeImageUnavailable,
 		ocihelper.CodeInsufficientMemory, ocihelper.CodeInsufficientDisk, ocihelper.CodeInvalidRequest,
-		ocihelper.CodeSweepRequired, ocihelper.CodeUnsupportedOperation, ocihelper.CodeComputerStorageBusy:
+		ocihelper.CodeSweepRequired, ocihelper.CodeUnsupportedOperation, ocihelper.CodeComputerStorageBusy,
+		ocihelper.CodeComputerStorageRetired:
 		return true
 	default:
 		return false
