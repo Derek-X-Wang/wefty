@@ -282,8 +282,16 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		})
 	}
 	assertLiveProfileMarker(t, restarted, profileMarker)
-	oldAuthorityRejected := runComputerCLIPersonExpectError(t, harness, "linux-viewer", "linux-viewer-device",
+	// The live-session file retains the old door's ephemeral endpoint. Present
+	// the unchanged bearer to the republished door so this row tests Node-lineage
+	// terminality rather than a TCP refusal from the dead listener.
+	oldSessionEndpoint, currentSessionEndpoint := retargetTakeoverSessionCapability(t, viewerControl.tokenFile, restarted.DisplayEndpoint)
+	oldAuthorityRejected := runComputerCLIPersonExpectControlError(t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", restarted.ComputerID, "--session-token-file", viewerControl.tokenFile)
+	oldSessionEndReason := ""
+	if oldAuthorityRejected.Receipt != nil {
+		oldSessionEndReason = oldAuthorityRejected.Receipt.SessionEndReason
+	}
 	recordComputerAuthority(receipt, restarted)
 	helperLossTerminalCode, helperLossTerminalID := "", ""
 	if helperLossTerminal != nil {
@@ -303,12 +311,14 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"agent_loss_fresh_attempt":       restarted.CurrentJob.CurrentAttemptID != beforeAgentLoss,
 		"same_storage_generation":        restarted.StorageID == oldStorage && restarted.StorageGeneration == oldGeneration,
 		"profile_marker_survived_losses": true,
-		"readiness_republished":          restarted.DisplayEndpoint != nil,
-		"old_session_authority_rejected": strings.Contains(oldAuthorityRejected, string(contract.ErrorTakeoverSessionEnded)),
+		"readiness_republished":          currentSessionEndpoint != "",
+		"old_session_authority_rejected": oldAuthorityRejected.Error.Code == contract.ErrorTakeoverSessionEnded &&
+			oldAuthorityRejected.Receipt != nil && oldAuthorityRejected.Receipt.SessionEndReason == string(l1.ComputerTakeoverAttemptAuthorityLost),
 	}, map[string]string{"old_attempt_id": oldAttempt, "new_attempt_id": restarted.CurrentJob.CurrentAttemptID,
 		"storage_id": restarted.StorageID, "storage_generation": fmt.Sprint(restarted.StorageGeneration),
 		"profile_marker": filepath.Base(profileMarker), "helper_loss_terminal_attempt_id": helperLossTerminalID,
-		"helper_loss_terminal_code": helperLossTerminalCode})
+		"helper_loss_terminal_code": helperLossTerminalCode, "old_session_endpoint": oldSessionEndpoint,
+		"current_session_endpoint": currentSessionEndpoint, "old_session_end_reason": oldSessionEndReason})
 
 	receipt.begin("linux.reconfiguration")
 	resized := runComputerCLI[l1.Computer](t, harness, false, "services", "resize", restarted.ComputerID,
@@ -770,6 +780,53 @@ func runComputerCLIPersonExpectControlError(
 		t.Fatalf("decode Computer control error %v: %v\n%s", arguments, decodeErr, output)
 	}
 	return response
+}
+
+func retargetTakeoverSessionCapability(t *testing.T, path string, endpoint *string) (string, string) {
+	t.Helper()
+	if endpoint == nil || strings.TrimSpace(*endpoint) == "" {
+		t.Fatal("Computer restart omitted its current display endpoint")
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read old Computer session capability: %v", err)
+	}
+	var capability struct {
+		Endpoint string `json:"endpoint"`
+		Token    string `json:"token"`
+	}
+	if err := json.Unmarshal(payload, &capability); err != nil || strings.TrimSpace(capability.Endpoint) == "" || strings.TrimSpace(capability.Token) == "" {
+		t.Fatalf("decode old Computer session capability: %v", err)
+	}
+	oldEndpoint := capability.Endpoint
+	capability.Endpoint = *endpoint
+	updated, err := json.Marshal(capability)
+	if err != nil {
+		t.Fatalf("encode retargeted Computer session capability: %v", err)
+	}
+	updated = append(updated, '\n')
+	if err := os.WriteFile(path, updated, 0o600); err != nil {
+		t.Fatalf("retarget old Computer session capability: %v", err)
+	}
+	return oldEndpoint, capability.Endpoint
+}
+
+func TestRetargetTakeoverSessionCapabilityPreservesOldBearer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(path, []byte(`{"endpoint":"ws://127.0.0.1:10001/wefty/computer/v1","token":"old-node-lineage-bearer"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current := "ws://127.0.0.1:10002/wefty/computer/v1"
+	old, updated := retargetTakeoverSessionCapability(t, path, &current)
+	var capability struct {
+		Endpoint string `json:"endpoint"`
+		Token    string `json:"token"`
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(payload, &capability) != nil || old != "ws://127.0.0.1:10001/wefty/computer/v1" ||
+		updated != current || capability.Endpoint != current || capability.Token != "old-node-lineage-bearer" {
+		t.Fatalf("retargeted capability = old=%q updated=%q capability=%+v err=%v", old, updated, capability, err)
+	}
 }
 
 type takeoverViewProcess struct {

@@ -1340,7 +1340,11 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	if err != nil {
 		t.Fatal(err)
 	}
-	second := request("c", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' && test "$(cat /wefty/service/marker)" = computer-disk-marker || exit 30; dd if=/dev/zero of=/wefty/service/fill bs=1048576 count=64 2>/tmp/disk-error && exit 31; grep -q 'No space left on device' /tmp/disk-error || exit 32; exit 42`})
+	// Force writeback before trusting dd's status. Without conv=fsync, ext4
+	// delayed allocation can accept every buffered write and surface ENOSPC only
+	// after the process exits. The helper intentionally leaves DiskExhausted
+	// absent because payload stderr and an exit code are not runtime observation.
+	second := request("c", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' && test "$(cat /wefty/service/marker)" = computer-disk-marker || exit 30; dd if=/dev/zero of=/wefty/service/fill bs=1048576 count=64 conv=fsync 2>/tmp/disk-error && exit 31; grep -q 'No space left on device' /tmp/disk-error || exit 32; exit 42`})
 	if _, err := session.Run(ctx, second); err != nil {
 		t.Fatalf("real Computer attempt C did not consume A's helper-sweep detachment: %v", err)
 	}
@@ -1353,8 +1357,12 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	}); err != nil {
 		t.Fatal(err)
 	}
+	observedExitCode := -1
+	if result != nil && result.ExitCode != nil {
+		observedExitCode = *result.ExitCode
+	}
 	if result == nil || result.ExitCode == nil || *result.ExitCode != 42 || result.DiskExhausted {
-		t.Fatalf("real Computer persistent marker/tenant-local ENOSPC result = %+v", result)
+		t.Fatalf("real Computer persistent marker/tenant-local ENOSPC result = %+v exit_code=%d", result, observedExitCode)
 	}
 	evidence.shmModeFlagsSizeOneGiB = result.ExitCode != nil && *result.ExitCode == 42
 	evidence.diskENOSPCLocal = evidence.shmModeFlagsSizeOneGiB && !result.DiskExhausted
