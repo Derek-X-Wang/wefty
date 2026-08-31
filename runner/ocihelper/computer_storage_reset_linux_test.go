@@ -14,8 +14,45 @@ import (
 func resetTestRequest(storage ComputerStorageReference, authority AttemptAuthority) ResetComputerStorageRequest {
 	return ResetComputerStorageRequest{Storage: storage, NewGeneration: storage.StorageGeneration + 1,
 		Authority: ComputerStorageResetAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID,
-			HelperGeneration: 1, RootInstanceID: "managed-root-a", JobID: authority.JobID,
+			HelperGeneration: 1, RootInstanceID: "managed-root-a", JobID: "reset-job", PriorJobID: authority.JobID,
 			IntentRevision: storage.IntentRevision + 1, CleanupFence: "reset-fence"}}
+}
+
+func TestComputerStorageResetBindsSweepReceiptToNamedPriorJob(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		priorJobID    string
+		mutateReceipt func(*computerDiskEvidence)
+		wantErr       bool
+	}{
+		{name: "same-boot helper sweep", priorJobID: "job-1"},
+		{name: "wrong prior Job", priorJobID: "job-other", wantErr: true},
+		{name: "unnamed prior Job", wantErr: true},
+		{name: "missing receipt capability", priorJobID: "job-1", mutateReceipt: func(evidence *computerDiskEvidence) { evidence.ReceiptID = "" }, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine, storage, prior := prepareSameBootSweptComputerDisk(t)
+			if test.mutateReceipt != nil {
+				name, _ := deterministicComputerDiskName(storage)
+				root := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+				manifest, present, err := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
+				if err != nil || !present || manifest.PreviousDetachment == nil {
+					t.Fatalf("swept manifest = %+v present=%t err=%v", manifest, present, err)
+				}
+				test.mutateReceipt(manifest.PreviousDetachment)
+				if err := writeComputerDiskManifest(root, manifest); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := resetTestRequest(storage, prior)
+			request.Authority.PriorJobID = test.priorJobID
+			request.Storage.IntentRevision = request.Authority.IntentRevision
+			_, err := engine.ResetComputerStorage(t.Context(), request)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("reset Computer Storage error = %v, wantErr=%t", err, test.wantErr)
+			}
+		})
+	}
 }
 
 func TestComputerStorageResetResumesEveryPreparationBoundaryThenUsesSharedRemoval(t *testing.T) {
@@ -90,7 +127,7 @@ func TestComputerStorageResetResumesEveryPreparationBoundaryThenUsesSharedRemova
 			}
 
 			removal := ManagedVolumeRemovalAuthority{NodeID: request.Authority.NodeID,
-				BootSessionID: request.Authority.BootSessionID, JobID: request.Authority.JobID,
+				BootSessionID: request.Authority.BootSessionID, JobID: request.Authority.JobID, PriorJobID: authority.JobID,
 				RemovalGeneration: uint64(request.Authority.IntentRevision), CleanupFence: request.Authority.CleanupFence}
 			oldName, _ := deterministicComputerDiskName(storage)
 			legacyManifestRoot := filepath.Join(root, "computer-storage-resets")

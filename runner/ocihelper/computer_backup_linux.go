@@ -84,24 +84,14 @@ func deterministicComputerBackupCopyName(copyID string) (string, error) {
 
 func sameComputerBackupAuthority(left, right ComputerBackupAuthority) bool {
 	return left.NodeID == right.NodeID && left.RootInstanceID == right.RootInstanceID &&
-		left.JobID == right.JobID && left.OperationRevision == right.OperationRevision &&
+		left.JobID == right.JobID && left.PriorJobID == right.PriorJobID && left.OperationRevision == right.OperationRevision &&
 		left.CleanupFence == right.CleanupFence
 }
 
 func validBackupDetachmentEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority ComputerBackupAuthority) bool {
-	if evidence == nil || evidence.ReceiptID == "" || evidence.NodeID != authority.NodeID ||
-		evidence.JobID != authority.JobID || evidence.ComputerID != storage.ComputerID ||
-		evidence.StorageID != storage.StorageID || evidence.StorageGeneration != storage.StorageGeneration {
-		return false
-	}
-	switch evidence.Kind {
-	case computerDiskReapReceipt:
-		return evidence.BootSessionID == authority.BootSessionID && evidence.SweepEpoch == ""
-	case computerDiskSweepReceipt:
-		return evidence.BootSessionID != authority.BootSessionID && evidence.SweepEpoch != ""
-	default:
-		return false
-	}
+	return validComputerDiskConsumerDetachmentEvidence(evidence, storage, computerDiskDetachmentAuthority{
+		NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, PriorJobID: authority.PriorJobID,
+	})
 }
 
 // lockDetachedBackupSource holds the same attachment flock used by attach and
@@ -540,7 +530,7 @@ func (engine *ContainerdEngine) CreateComputerBackup(ctx context.Context, reques
 	defer engine.computerBackupMu.Unlock()
 	if request.Storage.DiskBytes <= 0 || request.Storage.IntentRevision != request.Authority.OperationRevision ||
 		request.Authority.NodeID == "" || request.Authority.BootSessionID == "" ||
-		request.Authority.RootInstanceID == "" || request.Authority.JobID == "" ||
+		request.Authority.RootInstanceID == "" || request.Authority.JobID == "" || request.Authority.PriorJobID == "" ||
 		request.Authority.HelperGeneration == 0 || request.Authority.OperationRevision < 1 ||
 		request.Authority.CleanupFence == "" || request.BackupID == "" || request.CopyID == "" {
 		return CreateComputerBackupResponse{}, errors.New("Computer Backup request is incomplete")

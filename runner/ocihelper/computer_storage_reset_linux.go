@@ -29,24 +29,14 @@ const (
 
 func sameComputerStorageResetAuthority(left, right ComputerStorageResetAuthority) bool {
 	return left.NodeID == right.NodeID && left.RootInstanceID == right.RootInstanceID &&
-		left.JobID == right.JobID && left.IntentRevision == right.IntentRevision &&
+		left.JobID == right.JobID && left.PriorJobID == right.PriorJobID && left.IntentRevision == right.IntentRevision &&
 		left.CleanupFence == right.CleanupFence
 }
 
 func validResetDetachmentEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority ComputerStorageResetAuthority) bool {
-	if evidence == nil || evidence.ReceiptID == "" || evidence.NodeID != authority.NodeID ||
-		evidence.JobID != authority.JobID || evidence.ComputerID != storage.ComputerID ||
-		evidence.StorageID != storage.StorageID || evidence.StorageGeneration != storage.StorageGeneration {
-		return false
-	}
-	switch evidence.Kind {
-	case computerDiskReapReceipt:
-		return evidence.BootSessionID == authority.BootSessionID && evidence.SweepEpoch == ""
-	case computerDiskSweepReceipt:
-		return evidence.BootSessionID != authority.BootSessionID && evidence.SweepEpoch != ""
-	default:
-		return false
-	}
+	return validComputerDiskConsumerDetachmentEvidence(evidence, storage, computerDiskDetachmentAuthority{
+		NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, PriorJobID: authority.PriorJobID,
+	})
 }
 
 func (engine *ContainerdEngine) storageResetCheckpoint(phase computerStorageResetPhase) error {
@@ -266,7 +256,7 @@ func (engine *ContainerdEngine) ResetComputerStorage(ctx context.Context, reques
 	if request.Storage.DiskBytes <= 0 || request.Storage.IntentRevision != request.Authority.IntentRevision ||
 		request.NewGeneration != request.Storage.StorageGeneration+1 || request.Authority.NodeID == "" ||
 		request.Authority.BootSessionID == "" || request.Authority.RootInstanceID == "" ||
-		request.Authority.JobID == "" || request.Authority.HelperGeneration == 0 ||
+		request.Authority.JobID == "" || request.Authority.PriorJobID == "" || request.Authority.HelperGeneration == 0 ||
 		request.Authority.IntentRevision < 1 || strings.TrimSpace(request.Authority.CleanupFence) == "" {
 		return ResetComputerStorageResponse{}, errors.New("Computer Storage reset request is incomplete")
 	}

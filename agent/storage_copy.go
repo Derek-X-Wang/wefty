@@ -61,7 +61,7 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 				StorageID: directive.DestinationStorageID, StorageGeneration: directive.OldGeneration,
 				IntentRevision: directive.OperationRevision, DiskBytes: directive.DestinationSize},
 			NodeID: controller.nodeID, BootSessionID: controller.bootSessionID,
-			RootInstanceID: directive.RootInstanceID, JobID: directive.JobID,
+			RootInstanceID: directive.RootInstanceID, JobID: directive.JobID, PriorJobID: directive.JobID,
 			OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence,
 		})
 		if err != nil {
@@ -114,7 +114,7 @@ func (controller *storageCopyController) attestFailedImportCleanup(ctx context.C
 	if err := controller.finalizeVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
 		Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
 		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: controller.nodeID,
-			BootSessionID: controller.bootSessionID, JobID: directive.JobID,
+			BootSessionID: controller.bootSessionID, JobID: directive.JobID, PriorJobID: directive.JobID,
 			RemovalGeneration: generation, CleanupFence: directive.CleanupFence},
 	}); err != nil {
 		return fmt.Errorf("delete failed Custody import staging through shared removal machinery: %w", err)
@@ -149,7 +149,7 @@ func (controller *storageCopyController) retirePredecessor(ctx context.Context, 
 	if err := controller.finalizeVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
 		Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
 		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: controller.nodeID,
-			BootSessionID: controller.bootSessionID, JobID: directive.JobID,
+			BootSessionID: controller.bootSessionID, JobID: directive.JobID, PriorJobID: directive.JobID,
 			RemovalGeneration: generation, CleanupFence: directive.CleanupFence},
 	}); err != nil {
 		if acknowledgement, quarantined := storageCleanupQuarantineAcknowledgement(err, directive.RootInstanceID); quarantined {

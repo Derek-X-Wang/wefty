@@ -507,6 +507,7 @@ type ManagedVolumeRemovalAuthority struct {
 	NodeID            string
 	BootSessionID     string
 	JobID             string
+	PriorJobID        string
 	RemovalGeneration uint64
 	CleanupFence      string
 }
@@ -546,6 +547,7 @@ type ComputerStorageResetRequest struct {
 	BootSessionID  string
 	RootInstanceID string
 	JobID          string
+	PriorJobID     string
 	IntentRevision int64
 	CleanupFence   string
 }
@@ -630,6 +632,7 @@ type ComputerBackupRequest struct {
 	BootSessionID     string
 	RootInstanceID    string
 	JobID             string
+	PriorJobID        string
 	OperationRevision int64
 	CleanupFence      string
 }

@@ -384,7 +384,7 @@ func TestReferenceComputerCleanupReapsBeforeDiskFinalization(t *testing.T) {
 	finalize := workloadrunner.ManagedVolumeFinalizationRequest{Authority: request.Authority,
 		Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
 		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: request.Authority.NodeID, BootSessionID: request.Authority.BootSessionID,
-			JobID: request.Authority.JobID, RemovalGeneration: 1, CleanupFence: "cleanup"}}
+			JobID: request.Authority.JobID, PriorJobID: request.Authority.JobID, RemovalGeneration: 1, CleanupFence: "cleanup"}}
 	if err := adapter.FinalizeManagedVolumes(t.Context(), finalize); err == nil {
 		t.Fatal("attached Computer disk deletion unexpectedly succeeded")
 	} else {
@@ -406,7 +406,7 @@ func TestManagedVolumeCleanupRetriesThenQuarantinesWithTypedEvidence(t *testing.
 		return workloadrunner.ManagedVolumeFinalizationRequest{Authority: authority,
 			Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
 			Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID,
-				JobID: authority.JobID, RemovalGeneration: 2, CleanupFence: "cleanup"}}
+				JobID: authority.JobID, PriorJobID: authority.JobID, RemovalGeneration: 2, CleanupFence: "cleanup"}}
 	}
 	t.Run("transient operation failure", func(t *testing.T) {
 		engine := &adapterTestEngine{volumeDeleteFailures: 2}

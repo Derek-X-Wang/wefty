@@ -86,7 +86,7 @@ func TestServiceAcceptanceRealtimeRunsHelperChildWithFakeEngine(t *testing.T) {
 			StorageGeneration: 1, IntentRevision: 2, DiskBytes: 8 << 30},
 		Authority: ComputerBackupAuthority{NodeID: "realtime-node", BootSessionID: "realtime-boot",
 			HelperGeneration: session.Handshake().SessionGeneration, RootInstanceID: "realtime-root",
-			JobID: "realtime-computer-job", OperationRevision: 2, CleanupFence: "realtime-backup-fence"}}
+			JobID: "realtime-backup-job", PriorJobID: "realtime-computer-job", OperationRevision: 2, CleanupFence: "realtime-backup-fence"}}
 	if _, err := session.CreateComputerBackup(ctx, backupRequest); err != nil {
 		t.Fatal(err)
 	}

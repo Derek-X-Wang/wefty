@@ -959,7 +959,7 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 	}
 	if receipt, err := adapter.ReapAndFinalizeManagedVolumes(ctx, workloadrunner.ReapRequest{Authority: authority}, workloadrunner.ManagedVolumeFinalizationRequest{
 		Authority: authority, Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
-		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "reference-" + identity + "-computer-cleanup"},
+		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, PriorJobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "reference-" + identity + "-computer-cleanup"},
 	}); err != nil || !receipt.RuntimeQuiesced {
 		t.Fatalf("reference Computer runtime and disk cleanup = %+v err=%v", receipt, err)
 	}
@@ -1342,7 +1342,7 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	}
 	second := request("c", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' && test "$(cat /wefty/service/marker)" = computer-disk-marker || exit 30; dd if=/dev/zero of=/wefty/service/fill bs=1048576 count=64 2>/tmp/disk-error && exit 31; grep -q 'No space left on device' /tmp/disk-error || exit 32; exit 42`})
 	if _, err := session.Run(ctx, second); err != nil {
-		t.Fatalf("real Computer attempt C did not consume A's reap receipt: %v", err)
+		t.Fatalf("real Computer attempt C did not consume A's helper-sweep detachment: %v", err)
 	}
 	var result *ocihelper.WatchResponse
 	if err := session.Watch(ctx, ocihelper.WatchRequest{Authority: second.Authority}, func(event ocihelper.WatchEvent) error {
@@ -1375,7 +1375,8 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		Authority: ocihelper.ComputerStorageResetAuthority{
 			NodeID: second.Authority.NodeID, BootSessionID: second.Authority.BootSessionID,
 			HelperGeneration: session.Handshake().SessionGeneration, RootInstanceID: "native-managed-root",
-			JobID:          second.Authority.JobID,
+			JobID:          "native-storage-reset-job",
+			PriorJobID:     second.Authority.JobID,
 			IntentRevision: 2, CleanupFence: "native-storage-reset",
 		},
 	})

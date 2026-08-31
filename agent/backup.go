@@ -43,7 +43,7 @@ func (controller *backupController) processCreate(ctx context.Context, directive
 			StorageGeneration: directive.StorageGeneration, IntentRevision: directive.OperationRevision,
 			DiskBytes: directive.AllocatedSize},
 		NodeID: controller.nodeID, BootSessionID: controller.bootSessionID,
-		RootInstanceID: directive.RootInstanceID, JobID: directive.JobID,
+		RootInstanceID: directive.RootInstanceID, JobID: directive.JobID, PriorJobID: directive.JobID,
 		OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence,
 	})
 	if err != nil {

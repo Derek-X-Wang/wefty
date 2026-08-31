@@ -52,7 +52,8 @@ func (controller *storageResetController) process(ctx context.Context, directive
 		Storage: workloadrunner.ComputerStorage{ComputerID: directive.ComputerID, StorageID: directive.StorageID,
 			StorageGeneration: directive.OldGeneration, IntentRevision: directive.IntentRevision, DiskBytes: directive.DiskBytes},
 		NewGeneration: directive.NewGeneration, NodeID: controller.nodeID, BootSessionID: controller.bootSessionID,
-		RootInstanceID: directive.RootInstanceID, JobID: directive.JobID, IntentRevision: directive.IntentRevision, CleanupFence: directive.CleanupFence,
+		RootInstanceID: directive.RootInstanceID, JobID: directive.JobID, PriorJobID: directive.JobID,
+		IntentRevision: directive.IntentRevision, CleanupFence: directive.CleanupFence,
 	})
 	if err != nil {
 		return err
@@ -81,7 +82,7 @@ func (controller *storageResetController) retirePredecessor(ctx context.Context,
 	if err := controller.finalizeVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
 		Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
 		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: controller.nodeID,
-			BootSessionID: controller.bootSessionID, JobID: directive.JobID,
+			BootSessionID: controller.bootSessionID, JobID: directive.JobID, PriorJobID: directive.JobID,
 			RemovalGeneration: generation, CleanupFence: directive.CleanupFence},
 	}); err != nil {
 		if acknowledgement, quarantined := storageCleanupQuarantineAcknowledgement(err, directive.RootInstanceID); quarantined {

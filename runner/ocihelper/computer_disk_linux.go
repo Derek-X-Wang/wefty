@@ -39,20 +39,6 @@ func (engine *ContainerdEngine) computerDiskCheckpoint(checkpoint computerDiskCh
 	return engine.computerDiskHook(checkpoint)
 }
 
-type computerDiskEvidence struct {
-	Kind              string `json:"kind"`
-	ReceiptID         string `json:"receipt_id"`
-	ComputerID        string `json:"computer_id"`
-	StorageID         string `json:"storage_id"`
-	StorageGeneration int64  `json:"storage_generation"`
-	NodeID            string `json:"node_id"`
-	JobID             string `json:"job_id"`
-	AttemptID         string `json:"attempt_id"`
-	FencingToken      string `json:"fencing_token"`
-	BootSessionID     string `json:"boot_session_id"`
-	SweepEpoch        string `json:"sweep_epoch,omitempty"`
-}
-
 type computerDiskManifest struct {
 	Version            int                            `json:"version"`
 	Storage            ComputerStorageReference       `json:"storage"`
@@ -88,40 +74,6 @@ type computerDiskSystem interface {
 	mountedSource(string) (string, bool, error)
 	loopBackingFile(string) (string, bool, error)
 	loopsForRoot(string) (map[string]string, error)
-}
-
-const (
-	computerDiskReapReceipt  = "same_boot_reap"
-	computerDiskSweepReceipt = "prior_boot_sweep"
-)
-
-func sameComputerStorageIdentity(left, right ComputerStorageReference) bool {
-	return left.ComputerID == right.ComputerID && left.StorageID == right.StorageID && left.StorageGeneration == right.StorageGeneration
-}
-
-func validComputerDiskEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority AttemptAuthority) bool {
-	if evidence == nil || evidence.ReceiptID == "" || evidence.ComputerID != storage.ComputerID || evidence.StorageID != storage.StorageID || evidence.StorageGeneration != storage.StorageGeneration ||
-		evidence.NodeID != authority.NodeID || evidence.JobID != authority.JobID || evidence.AttemptID == "" || evidence.FencingToken == "" || evidence.BootSessionID == "" {
-		return false
-	}
-	switch evidence.Kind {
-	case computerDiskReapReceipt:
-		return evidence.SweepEpoch == "" && evidence.BootSessionID == authority.BootSessionID
-	case computerDiskSweepReceipt:
-		return evidence.SweepEpoch != "" && evidence.BootSessionID != authority.BootSessionID
-	default:
-		return false
-	}
-}
-
-func newComputerDiskEvidence(kind, sweepEpoch string, storage ComputerStorageReference, authority AttemptAuthority) (computerDiskEvidence, error) {
-	receiptID, err := randomCapability()
-	if err != nil {
-		return computerDiskEvidence{}, err
-	}
-	return computerDiskEvidence{Kind: kind, ReceiptID: receiptID, ComputerID: storage.ComputerID, StorageID: storage.StorageID,
-		StorageGeneration: storage.StorageGeneration, NodeID: authority.NodeID, JobID: authority.JobID, AttemptID: authority.AttemptID,
-		FencingToken: authority.FencingToken, BootSessionID: authority.BootSessionID, SweepEpoch: sweepEpoch}, nil
 }
 
 type linuxComputerDiskSystem struct{}
@@ -427,10 +379,9 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 			return errors.New("Computer disk deletion lacks exact detached manifest authority")
 		}
 		if manifest.Retirement == nil && !manifest.Prepared && manifest.PreviousDetachment != nil {
-			evidence := manifest.PreviousDetachment
-			if evidence.NodeID != removal.NodeID || evidence.JobID != removal.JobID || evidence.ComputerID != storage.ComputerID || evidence.StorageID != storage.StorageID || evidence.StorageGeneration != storage.StorageGeneration || evidence.ReceiptID == "" ||
-				!((evidence.Kind == computerDiskReapReceipt && evidence.BootSessionID == removal.BootSessionID && evidence.SweepEpoch == "") ||
-					(evidence.Kind == computerDiskSweepReceipt && evidence.BootSessionID != removal.BootSessionID && evidence.SweepEpoch != "")) {
+			if !validComputerDiskConsumerDetachmentEvidence(manifest.PreviousDetachment, storage, computerDiskDetachmentAuthority{
+				NodeID: removal.NodeID, BootSessionID: removal.BootSessionID, PriorJobID: removal.PriorJobID,
+			}) {
 				return errors.New("Computer disk deletion receipt does not match removal authority")
 			}
 		} else if manifest.Retirement == nil && !manifest.Prepared {
@@ -1100,7 +1051,9 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 			}
 			continue
 		}
-		if manifest.Attached == nil && manifest.Pending == nil {
+		refreshDetachedReap := manifest.Attached == nil && manifest.Pending == nil &&
+			manifest.PreviousDetachment != nil && manifest.PreviousDetachment.Kind == computerDiskReapReceipt
+		if manifest.Attached == nil && manifest.Pending == nil && !refreshDetachedReap {
 			continue
 		}
 		lock, err := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
@@ -1110,6 +1063,10 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 		if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 			_ = lock.Close()
 			return errors.New("Computer attachment lock remained owned after sweep")
+		}
+		if manifest.DiskImage != "disk.ext4" || manifest.MountDirectory != entry.Name() {
+			_ = lock.Close()
+			return errors.New("Computer disk manifest does not match its deterministic sweep identity")
 		}
 		mountPath := filepath.Join(mountRoot, manifest.MountDirectory)
 		if _, mounted, err := engine.computerDiskSystem().mountedSource(mountPath); err != nil {
@@ -1129,9 +1086,31 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 				return errors.New("Computer disk loop remained after sweep")
 			}
 		}
+		rootLoops, err := engine.computerDiskSystem().loopsForRoot(root)
+		if err != nil {
+			_ = lock.Close()
+			return err
+		}
+		if len(rootLoops) != 0 {
+			_ = lock.Close()
+			return errors.New("Computer disk loop remained after sweep")
+		}
 		priorAuthority := manifest.Attached
 		if priorAuthority == nil {
 			priorAuthority = manifest.Pending
+		}
+		if priorAuthority == nil {
+			priorEvidence := manifest.PreviousDetachment
+			if !validComputerDiskDetachmentEvidence(priorEvidence, manifest.Storage, computerDiskDetachmentAuthority{
+				NodeID: priorEvidence.NodeID, BootSessionID: priorEvidence.BootSessionID,
+			}) {
+				_ = lock.Close()
+				return errors.New("Computer disk clean-reap evidence is invalid during sweep")
+			}
+			priorAuthority = &AttemptAuthority{
+				NodeID: priorEvidence.NodeID, JobID: priorEvidence.JobID, AttemptID: priorEvidence.AttemptID,
+				FencingToken: priorEvidence.FencingToken, BootSessionID: priorEvidence.BootSessionID,
+			}
 		}
 		evidence, err := newComputerDiskEvidence(computerDiskSweepReceipt, sweepEpoch, manifest.Storage, *priorAuthority)
 		if err == nil {
