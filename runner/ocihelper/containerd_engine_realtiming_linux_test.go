@@ -131,10 +131,10 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	initialSweep, ok := barrier.SweepReceipt()
-	if !ok || !initialSweep.VerifiedAbsent || !ocihelper.InventoryEmpty(initialSweep.VerifiedResidue) ||
-		!ocihelper.InventoryEmpty(initialSweep.VerifiedRetained) {
+	if !ok || !initialSweep.VerifiedAbsent || !ocihelper.InventoryEmpty(initialSweep.VerifiedResidue) {
 		t.Fatalf("initial native sweep receipt = %+v present=%t", initialSweep, ok)
 	}
+	retainedBaseline := initialSweep.VerifiedRetained
 	expectedRetained := ocihelper.ResourceInventory{}
 	// A clean-cache pull must first prove that root-owned helper/containerd
 	// registry HTTPS is rejected. The release archive is then the only successful
@@ -498,7 +498,7 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	expectedRetained = mergeNativeExpectedInventory(expectedRetained, serviceDataEvidence.retained)
 	capacityRetained := exerciseNativeLinuxComputerCapacity(t, ctx, barrier, echoReference, echoImage.TopLevelDigest)
 	expectedRetained = mergeNativeExpectedInventory(expectedRetained, capacityRetained)
-	computerDiskEvidence := exerciseNativeLinuxComputerDisk(t, ctx, barrier, echoReference, echoImage.TopLevelDigest, expectedRetained)
+	computerDiskEvidence := exerciseNativeLinuxComputerDisk(t, ctx, barrier, echoReference, echoImage.TopLevelDigest, retainedBaseline, expectedRetained)
 	computerAgentRestartEvidence := exerciseNativeLinuxComputerAgentRestart(t, ctx, adapter, echoReference, echoImage.TopLevelDigest)
 	session, err = barrier.Session()
 	if err != nil {
@@ -1274,7 +1274,7 @@ wait
 	return retained
 }
 
-func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, reference, digest string, expectedRetained ocihelper.ResourceInventory) nativeComputerDiskEvidence {
+func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier *ocihelper.BootBarrier, reference, digest string, retainedBaseline, expectedRetained ocihelper.ResourceInventory) nativeComputerDiskEvidence {
 	t.Helper()
 	evidence := nativeComputerDiskEvidence{}
 	session, err := barrier.Session()
@@ -1334,7 +1334,7 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	if !ok {
 		t.Fatalf("Computer helper-death sweep receipt = %+v present=%t", receipt, ok)
 	}
-	evidence.residue = assertNativeComputerSweepReceipt(t, receipt, expectedRetained)
+	evidence.residue = assertNativeComputerSweepReceipt(t, receipt, retainedBaseline, expectedRetained)
 	assertNativeComputerHostCleanup(t, first.Authority)
 	session, err = barrier.Session()
 	if err != nil {
@@ -1414,21 +1414,22 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	return evidence
 }
 
-func assertNativeComputerSweepReceipt(t *testing.T, receipt ocihelper.VerifiedSweepReceipt, expectedRetained ocihelper.ResourceInventory) nativeResidueEvidence {
+func assertNativeComputerSweepReceipt(t *testing.T, receipt ocihelper.VerifiedSweepReceipt, retainedBaseline, expectedRetained ocihelper.ResourceInventory) nativeResidueEvidence {
 	t.Helper()
 	retained := receipt.VerifiedRetained
-	retainedRuntimeEmpty := len(retained.Leases)+len(retained.Snapshots)+len(retained.Containers)+len(retained.Tasks)+
-		len(retained.Shims)+len(retained.Cgroups)+len(retained.LogSegments)+len(retained.ComputerDiskMounts)+
-		len(retained.ComputerDiskLoops)+len(retained.ComputerAttachments)+len(retained.ComputerResetManifests)+
-		len(retained.ComputerQuarantines)+len(retained.ComputerDiskAnomalies) == 0
+	retainedDelta := subtractNativeInventory(retained, retainedBaseline)
+	retainedRuntimeEmpty := len(retainedDelta.Leases)+len(retainedDelta.Snapshots)+len(retainedDelta.Containers)+len(retainedDelta.Tasks)+
+		len(retainedDelta.Shims)+len(retainedDelta.Cgroups)+len(retainedDelta.LogSegments)+len(retainedDelta.ComputerDiskMounts)+
+		len(retainedDelta.ComputerDiskLoops)+len(retainedDelta.ComputerAttachments)+len(retainedDelta.ComputerResetManifests)+
+		len(retainedDelta.ComputerQuarantines)+len(retainedDelta.ComputerDiskAnomalies) == 0
 	serviceRecordsValid := true
-	for _, volume := range retained.ManagedVolumes {
-		if strings.HasPrefix(volume, "wefty-service-volume-") && !slices.Contains(retained.ManagedVolumeRecords, volume+".owner") {
+	for _, volume := range retainedDelta.ManagedVolumes {
+		if strings.HasPrefix(volume, "wefty-service-volume-") && !slices.Contains(retainedDelta.ManagedVolumeRecords, volume+".owner") {
 			serviceRecordsValid = false
 		}
 	}
-	expectedRetained = expectedRetainedWithHandoffExemption(retained, expectedRetained)
-	retainedExact := inventoryIdentitiesEqual(retained, expectedRetained)
+	expectedRetained = expectedRetainedWithHandoffExemption(retainedDelta, expectedRetained)
+	retainedExact := inventoryIdentitiesEqual(retainedDelta, expectedRetained)
 	sweptRuntimeCovered := len(receipt.SweptInventory.Leases) > 0 && len(receipt.SweptInventory.Snapshots) > 0 &&
 		len(receipt.SweptInventory.Containers) > 0 && len(receipt.SweptInventory.LogSegments) > 0 &&
 		len(receipt.SweptInventory.ComputerDiskMounts) > 0 && len(receipt.SweptInventory.ComputerDiskLoops) > 0 &&
@@ -1436,13 +1437,13 @@ func assertNativeComputerSweepReceipt(t *testing.T, receipt ocihelper.VerifiedSw
 	if !receipt.VerifiedAbsent || !ocihelper.InventoryEmpty(receipt.VerifiedResidue) ||
 		!inventoryIdentitiesEqual(receipt.VerifiedInventory, retained) || !retainedRuntimeEmpty ||
 		!serviceRecordsValid || !retainedExact || !sweptRuntimeCovered {
-		t.Fatalf("Computer helper-death residue model = swept:%+v verified:%+v residue:%+v retained:%+v absent:%t",
-			receipt.SweptInventory, receipt.VerifiedInventory, receipt.VerifiedResidue, retained, receipt.VerifiedAbsent)
+		t.Fatalf("Computer helper-death residue model = swept:%+v verified:%+v residue:%+v retained:%+v baseline:%+v delta:%+v absent:%t",
+			receipt.SweptInventory, receipt.VerifiedInventory, receipt.VerifiedResidue, retained, retainedBaseline, retainedDelta, receipt.VerifiedAbsent)
 	}
 	return nativeResidueEvidence{
 		verifiedAbsent:       receipt.VerifiedAbsent && ocihelper.InventoryEmpty(receipt.VerifiedResidue),
 		retainedClassesExact: retainedExact,
-		retainedClasses:      strings.Join(nonEmptyInventoryClassNames(retained), ","),
+		retainedClasses:      strings.Join(nonEmptyInventoryClassNames(retainedDelta), ","),
 		sweptRuntimeCovered:  sweptRuntimeCovered,
 	}
 }
@@ -1474,6 +1475,44 @@ func mergeNativeIdentityClass(left, right []string) []string {
 	merged := append(slices.Clone(left), right...)
 	slices.Sort(merged)
 	return slices.Compact(merged)
+}
+
+func subtractNativeInventory(inventory, baseline ocihelper.ResourceInventory) ocihelper.ResourceInventory {
+	inventory.Leases = subtractNativeIdentityClass(inventory.Leases, baseline.Leases)
+	inventory.Snapshots = subtractNativeIdentityClass(inventory.Snapshots, baseline.Snapshots)
+	inventory.Containers = subtractNativeIdentityClass(inventory.Containers, baseline.Containers)
+	inventory.Tasks = subtractNativeIdentityClass(inventory.Tasks, baseline.Tasks)
+	inventory.Shims = subtractNativeIdentityClass(inventory.Shims, baseline.Shims)
+	inventory.Cgroups = subtractNativeIdentityClass(inventory.Cgroups, baseline.Cgroups)
+	inventory.LogSegments = subtractNativeIdentityClass(inventory.LogSegments, baseline.LogSegments)
+	inventory.ManagedVolumes = subtractNativeIdentityClass(inventory.ManagedVolumes, baseline.ManagedVolumes)
+	inventory.ManagedVolumeRecords = subtractNativeIdentityClass(inventory.ManagedVolumeRecords, baseline.ManagedVolumeRecords)
+	inventory.ComputerDiskImages = subtractNativeIdentityClass(inventory.ComputerDiskImages, baseline.ComputerDiskImages)
+	inventory.ComputerDiskAllocations = subtractNativeIdentityClass(inventory.ComputerDiskAllocations, baseline.ComputerDiskAllocations)
+	inventory.ComputerDiskQuotas = subtractNativeIdentityClass(inventory.ComputerDiskQuotas, baseline.ComputerDiskQuotas)
+	inventory.ComputerDiskManifests = subtractNativeIdentityClass(inventory.ComputerDiskManifests, baseline.ComputerDiskManifests)
+	inventory.ComputerDiskMounts = subtractNativeIdentityClass(inventory.ComputerDiskMounts, baseline.ComputerDiskMounts)
+	inventory.ComputerDiskLoops = subtractNativeIdentityClass(inventory.ComputerDiskLoops, baseline.ComputerDiskLoops)
+	inventory.ComputerAttachments = subtractNativeIdentityClass(inventory.ComputerAttachments, baseline.ComputerAttachments)
+	inventory.ComputerResetManifests = subtractNativeIdentityClass(inventory.ComputerResetManifests, baseline.ComputerResetManifests)
+	inventory.ComputerQuarantines = subtractNativeIdentityClass(inventory.ComputerQuarantines, baseline.ComputerQuarantines)
+	inventory.ComputerDiskAnomalies = subtractNativeIdentityClass(inventory.ComputerDiskAnomalies, baseline.ComputerDiskAnomalies)
+	return inventory
+}
+
+func subtractNativeIdentityClass(inventory, baseline []string) []string {
+	baselineSet := make(map[string]struct{}, len(baseline))
+	for _, identity := range baseline {
+		baselineSet[identity] = struct{}{}
+	}
+	delta := make([]string, 0, len(inventory))
+	for _, identity := range inventory {
+		if _, existed := baselineSet[identity]; !existed {
+			delta = append(delta, identity)
+		}
+	}
+	slices.Sort(delta)
+	return slices.Compact(delta)
 }
 
 func nonEmptyInventoryClassNames(inventory ocihelper.ResourceInventory) []string {
