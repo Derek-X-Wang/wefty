@@ -109,11 +109,15 @@ func (engine *ContainerdEngine) PreflightComputerReimage(ctx context.Context, re
 	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
 	imagePath := filepath.Join(diskRoot, "disk.ext4")
-	_, release, err := engine.acquireComputerGrowLock(diskRoot, request.Storage)
+	// Reimage preflight requires detached Storage. Use the generation flock
+	// directly: a completed detach can leave its immutable attempt record in the
+	// engine map, and the grow helper intentionally treats that record as a race
+	// because grow is also allowed while attached.
+	lock, err := openComputerDiskLock(diskRoot)
 	if err != nil {
 		return PreflightComputerReimageResponse{}, err
 	}
-	defer release()
+	defer closeComputerDiskLock(lock)
 	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
 	if err != nil {
 		return PreflightComputerReimageResponse{}, err

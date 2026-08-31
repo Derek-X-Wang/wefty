@@ -1073,7 +1073,7 @@ func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, 
 		t.Fatal(err)
 	}
 	defer store.Close()
-	registration := contract.NodeRegistration{NodeID: "native-computer-node", BootSessionID: "native-boot", OS: "linux", Architecture: "amd64", AgentVersion: "realtiming",
+	registration := contract.NodeRegistration{NodeID: "native-node", BootSessionID: "native-boot", OS: "linux", Architecture: "amd64", AgentVersion: "realtiming",
 		Capabilities:       map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true},
 		CapabilityRevision: 1, CapabilityObservedAt: time.Now().UTC(), MissingCapabilities: []string{}}
 	policy := l1.NodePolicy{Tags: []string{contract.StableNodeTagPrefix + registration.NodeID}, MaxOneshotSlots: 1, MaxServiceSlots: 1}
