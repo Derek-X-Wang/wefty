@@ -23,19 +23,26 @@ func sameComputerStorageIdentity(left, right ComputerStorageReference) bool {
 	return left.ComputerID == right.ComputerID && left.StorageID == right.StorageID && left.StorageGeneration == right.StorageGeneration
 }
 
+type computerDiskDetachmentAuthority struct {
+	NodeID        string
+	BootSessionID string
+	PriorJobID    string
+}
+
 // validComputerDiskDetachmentEvidence validates a prior attachment's positive
-// detach fact against durable Storage and Node identity. The evidence names
-// the prior Job/attempt/fence; those fields must be present but must not equal
-// successor authority because a Computer can replace its helper within one
-// agent boot or replace its Job while retaining the same Storage generation.
-func validComputerDiskDetachmentEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, nodeID, bootSessionID string) bool {
-	if evidence == nil || evidence.ReceiptID == "" || evidence.ComputerID != storage.ComputerID || evidence.StorageID != storage.StorageID || evidence.StorageGeneration != storage.StorageGeneration ||
-		evidence.NodeID != nodeID || evidence.JobID == "" || evidence.AttemptID == "" || evidence.FencingToken == "" || evidence.BootSessionID == "" {
+// detach fact against durable Storage and Node identity. The prior
+// Job/attempt/fence are retained as historical evidence and are not compared
+// to successor authority; consumers that can mutate or copy detached bytes
+// additionally bind the named prior Job through
+// validComputerDiskConsumerDetachmentEvidence.
+func validComputerDiskDetachmentEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority computerDiskDetachmentAuthority) bool {
+	if evidence == nil || authority.NodeID == "" || authority.BootSessionID == "" || evidence.ReceiptID == "" || evidence.ComputerID != storage.ComputerID || evidence.StorageID != storage.StorageID || evidence.StorageGeneration != storage.StorageGeneration ||
+		evidence.NodeID != authority.NodeID || evidence.JobID == "" || evidence.AttemptID == "" || evidence.FencingToken == "" || evidence.BootSessionID == "" {
 		return false
 	}
 	switch evidence.Kind {
 	case computerDiskReapReceipt:
-		return evidence.SweepEpoch == "" && evidence.BootSessionID == bootSessionID
+		return evidence.SweepEpoch == "" && evidence.BootSessionID == authority.BootSessionID
 	case computerDiskSweepReceipt:
 		return evidence.SweepEpoch != ""
 	default:
@@ -43,8 +50,15 @@ func validComputerDiskDetachmentEvidence(evidence *computerDiskEvidence, storage
 	}
 }
 
+func validComputerDiskConsumerDetachmentEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority computerDiskDetachmentAuthority) bool {
+	return authority.PriorJobID != "" && evidence != nil && evidence.JobID == authority.PriorJobID &&
+		validComputerDiskDetachmentEvidence(evidence, storage, authority)
+}
+
 func validComputerDiskEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority AttemptAuthority) bool {
-	return validComputerDiskDetachmentEvidence(evidence, storage, authority.NodeID, authority.BootSessionID)
+	return validComputerDiskDetachmentEvidence(evidence, storage, computerDiskDetachmentAuthority{
+		NodeID: authority.NodeID, BootSessionID: authority.BootSessionID,
+	})
 }
 
 func newComputerDiskEvidence(kind, sweepEpoch string, storage ComputerStorageReference, authority AttemptAuthority) (computerDiskEvidence, error) {

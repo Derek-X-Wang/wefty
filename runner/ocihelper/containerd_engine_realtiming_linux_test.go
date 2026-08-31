@@ -959,7 +959,7 @@ func exerciseNativeLinuxReferenceComputer(t *testing.T, ctx context.Context, ses
 	}
 	if receipt, err := adapter.ReapAndFinalizeManagedVolumes(ctx, workloadrunner.ReapRequest{Authority: authority}, workloadrunner.ManagedVolumeFinalizationRequest{
 		Authority: authority, Volumes: []workloadrunner.ManagedVolume{{Kind: workloadrunner.ManagedVolumeComputerDisk, ComputerStorage: storage}},
-		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "reference-" + identity + "-computer-cleanup"},
+		Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, PriorJobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "reference-" + identity + "-computer-cleanup"},
 	}); err != nil || !receipt.RuntimeQuiesced {
 		t.Fatalf("reference Computer runtime and disk cleanup = %+v err=%v", receipt, err)
 	}
@@ -1375,7 +1375,8 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		Authority: ocihelper.ComputerStorageResetAuthority{
 			NodeID: second.Authority.NodeID, BootSessionID: second.Authority.BootSessionID,
 			HelperGeneration: session.Handshake().SessionGeneration, RootInstanceID: "native-managed-root",
-			JobID:          second.Authority.JobID,
+			JobID:          "native-storage-reset-job",
+			PriorJobID:     second.Authority.JobID,
 			IntentRevision: 2, CleanupFence: "native-storage-reset",
 		},
 	})

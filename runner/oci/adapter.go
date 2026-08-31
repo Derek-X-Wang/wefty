@@ -1752,7 +1752,7 @@ func (adapter *Adapter) FinalizeManagedVolumes(ctx context.Context, request work
 			input = ocihelper.DeleteManagedVolumeRequest{Kind: ocihelper.ManagedVolumeComputerDisk,
 				ComputerStorage: &ocihelper.ComputerStorageReference{ComputerID: volume.ComputerStorage.ComputerID, StorageID: volume.ComputerStorage.StorageID,
 					StorageGeneration: volume.ComputerStorage.StorageGeneration, IntentRevision: volume.ComputerStorage.IntentRevision, DiskBytes: volume.ComputerStorage.DiskBytes},
-				Removal: &ocihelper.ManagedVolumeRemovalAuthority{NodeID: request.Removal.NodeID, BootSessionID: request.Removal.BootSessionID, JobID: request.Removal.JobID, RemovalGeneration: request.Removal.RemovalGeneration, CleanupFence: request.Removal.CleanupFence}}
+				Removal: &ocihelper.ManagedVolumeRemovalAuthority{NodeID: request.Removal.NodeID, BootSessionID: request.Removal.BootSessionID, JobID: request.Removal.JobID, PriorJobID: request.Removal.PriorJobID, RemovalGeneration: request.Removal.RemovalGeneration, CleanupFence: request.Removal.CleanupFence}}
 		default:
 			return fmt.Errorf("unsupported runtime-managed volume finalization: %+v", volume)
 		}
@@ -1767,7 +1767,7 @@ func (adapter *Adapter) FinalizeManagedVolumes(ctx context.Context, request work
 				ComputerStorage: workloadrunner.ComputerStorage{ComputerID: quarantine.ComputerStorage.ComputerID, StorageID: quarantine.ComputerStorage.StorageID,
 					StorageGeneration: quarantine.ComputerStorage.StorageGeneration, IntentRevision: quarantine.ComputerStorage.IntentRevision, DiskBytes: quarantine.ComputerStorage.DiskBytes},
 				Removal: workloadrunner.ManagedVolumeRemovalAuthority{NodeID: quarantine.Removal.NodeID, BootSessionID: quarantine.Removal.BootSessionID,
-					JobID: quarantine.Removal.JobID, RemovalGeneration: quarantine.Removal.RemovalGeneration, CleanupFence: quarantine.Removal.CleanupFence},
+					JobID: quarantine.Removal.JobID, PriorJobID: quarantine.Removal.PriorJobID, RemovalGeneration: quarantine.Removal.RemovalGeneration, CleanupFence: quarantine.Removal.CleanupFence},
 				FailureReason: string(quarantine.FailureReason), Attempts: quarantine.Attempts,
 			}}
 		}
@@ -1839,6 +1839,7 @@ func (adapter *Adapter) ResetComputerStorage(ctx context.Context, request worklo
 		NewGeneration: request.NewGeneration,
 		Authority: ocihelper.ComputerStorageResetAuthority{NodeID: request.NodeID, BootSessionID: request.BootSessionID,
 			HelperGeneration: handshake.SessionGeneration, RootInstanceID: request.RootInstanceID, JobID: request.JobID,
+			PriorJobID:     request.PriorJobID,
 			IntentRevision: request.IntentRevision, CleanupFence: request.CleanupFence},
 	})
 	if err != nil {
@@ -1957,7 +1958,7 @@ func (adapter *Adapter) CreateComputerBackup(ctx context.Context, request worklo
 			IntentRevision: request.Storage.IntentRevision, DiskBytes: request.Storage.DiskBytes},
 		Authority: ocihelper.ComputerBackupAuthority{NodeID: request.NodeID, BootSessionID: request.BootSessionID,
 			HelperGeneration: handshake.SessionGeneration, RootInstanceID: request.RootInstanceID,
-			JobID: request.JobID, OperationRevision: request.OperationRevision, CleanupFence: request.CleanupFence},
+			JobID: request.JobID, PriorJobID: request.PriorJobID, OperationRevision: request.OperationRevision, CleanupFence: request.CleanupFence},
 	})
 	if err != nil {
 		return workloadrunner.ComputerBackupCopyReceipt{}, err

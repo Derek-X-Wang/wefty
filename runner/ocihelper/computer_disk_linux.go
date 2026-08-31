@@ -379,7 +379,9 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 			return errors.New("Computer disk deletion lacks exact detached manifest authority")
 		}
 		if manifest.Retirement == nil && !manifest.Prepared && manifest.PreviousDetachment != nil {
-			if !validComputerDiskDetachmentEvidence(manifest.PreviousDetachment, storage, removal.NodeID, removal.BootSessionID) {
+			if !validComputerDiskConsumerDetachmentEvidence(manifest.PreviousDetachment, storage, computerDiskDetachmentAuthority{
+				NodeID: removal.NodeID, BootSessionID: removal.BootSessionID, PriorJobID: removal.PriorJobID,
+			}) {
 				return errors.New("Computer disk deletion receipt does not match removal authority")
 			}
 		} else if manifest.Retirement == nil && !manifest.Prepared {
@@ -1049,7 +1051,9 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 			}
 			continue
 		}
-		if manifest.Attached == nil && manifest.Pending == nil {
+		refreshDetachedReap := manifest.Attached == nil && manifest.Pending == nil &&
+			manifest.PreviousDetachment != nil && manifest.PreviousDetachment.Kind == computerDiskReapReceipt
+		if manifest.Attached == nil && manifest.Pending == nil && !refreshDetachedReap {
 			continue
 		}
 		lock, err := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
@@ -1059,6 +1063,10 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 		if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 			_ = lock.Close()
 			return errors.New("Computer attachment lock remained owned after sweep")
+		}
+		if manifest.DiskImage != "disk.ext4" || manifest.MountDirectory != entry.Name() {
+			_ = lock.Close()
+			return errors.New("Computer disk manifest does not match its deterministic sweep identity")
 		}
 		mountPath := filepath.Join(mountRoot, manifest.MountDirectory)
 		if _, mounted, err := engine.computerDiskSystem().mountedSource(mountPath); err != nil {
@@ -1078,9 +1086,31 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 				return errors.New("Computer disk loop remained after sweep")
 			}
 		}
+		rootLoops, err := engine.computerDiskSystem().loopsForRoot(root)
+		if err != nil {
+			_ = lock.Close()
+			return err
+		}
+		if len(rootLoops) != 0 {
+			_ = lock.Close()
+			return errors.New("Computer disk loop remained after sweep")
+		}
 		priorAuthority := manifest.Attached
 		if priorAuthority == nil {
 			priorAuthority = manifest.Pending
+		}
+		if priorAuthority == nil {
+			priorEvidence := manifest.PreviousDetachment
+			if !validComputerDiskDetachmentEvidence(priorEvidence, manifest.Storage, computerDiskDetachmentAuthority{
+				NodeID: priorEvidence.NodeID, BootSessionID: priorEvidence.BootSessionID,
+			}) {
+				_ = lock.Close()
+				return errors.New("Computer disk clean-reap evidence is invalid during sweep")
+			}
+			priorAuthority = &AttemptAuthority{
+				NodeID: priorEvidence.NodeID, JobID: priorEvidence.JobID, AttemptID: priorEvidence.AttemptID,
+				FencingToken: priorEvidence.FencingToken, BootSessionID: priorEvidence.BootSessionID,
+			}
 		}
 		evidence, err := newComputerDiskEvidence(computerDiskSweepReceipt, sweepEpoch, manifest.Storage, *priorAuthority)
 		if err == nil {

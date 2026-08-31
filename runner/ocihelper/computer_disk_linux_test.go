@@ -108,6 +108,27 @@ func testComputerAuthority(attempt, fence, boot string) AttemptAuthority {
 	return AttemptAuthority{NodeID: "node-1", JobID: "job-1", AttemptID: attempt, FencingToken: fence, BootSessionID: boot, Class: "service", RemovalGeneration: "attempt"}
 }
 
+func prepareSameBootSweptComputerDisk(t *testing.T) (*ContainerdEngine, ComputerStorageReference, AttemptAuthority) {
+	t.Helper()
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	prior := testComputerAuthority("attempt-a", "fence-a", "boot-a")
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	if err := engine.sweepComputerDisks("same-boot-helper-sweep"); err != nil {
+		t.Fatal(err)
+	}
+	return engine, storage, prior
+}
+
 func TestComputerDiskENOSPCLeavesNoPublishedResource(t *testing.T) {
 	root := t.TempDir()
 	system := newFakeComputerDiskSystem()
@@ -532,10 +553,28 @@ func TestComputerDiskSweepAuthorizesSuccessorAcrossHelperAndJobReplacement(t *te
 			if err != nil {
 				t.Fatalf("successor did not consume the exact helper sweep detachment: %v", err)
 			}
+			if _, err := engine.attachComputerDisk(t.Context(), storage, successor); err == nil {
+				t.Fatal("helper sweep detachment authorized a second successor")
+			}
 			if err := engine.detachComputerDisk(reattached, computerDiskReapReceipt, ""); err != nil {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestComputerDiskCleanReapThenBootSweepAuthorizesNextBoot(t *testing.T) {
+	engine, storage, prior := prepareSameBootSweptComputerDisk(t)
+	successor := prior
+	successor.AttemptID = "attempt-b"
+	successor.FencingToken = "fence-b"
+	successor.BootSessionID = "boot-b"
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, successor)
+	if err != nil {
+		t.Fatalf("boot sweep did not refresh the clean reap receipt: %v", err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -589,7 +628,7 @@ func TestComputerDiskRemovalRequiresReceiptAndVerifiesAbsence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	removal := ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "cleanup"}
+	removal := ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, PriorJobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "cleanup"}
 	if err := engine.deleteComputerDisk(storage, removal); err == nil {
 		t.Fatal("attached Computer disk was deleted")
 	}
@@ -603,5 +642,41 @@ func TestComputerDiskRemovalRequiresReceiptAndVerifiesAbsence(t *testing.T) {
 		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("Computer removal left %s: %v", path, err)
 		}
+	}
+}
+
+func TestComputerDiskRemovalBindsSweepReceiptToNamedPriorJob(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		priorJobID    string
+		mutateReceipt func(*computerDiskEvidence)
+		wantErr       bool
+	}{
+		{name: "same-boot helper sweep", priorJobID: "job-1"},
+		{name: "wrong prior Job", priorJobID: "job-other", wantErr: true},
+		{name: "unnamed prior Job", wantErr: true},
+		{name: "missing receipt capability", priorJobID: "job-1", mutateReceipt: func(evidence *computerDiskEvidence) { evidence.ReceiptID = "" }, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine, storage, prior := prepareSameBootSweptComputerDisk(t)
+			if test.mutateReceipt != nil {
+				name, _ := deterministicComputerDiskName(storage)
+				root := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+				manifest, present, err := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
+				if err != nil || !present || manifest.PreviousDetachment == nil {
+					t.Fatalf("swept manifest = %+v present=%t err=%v", manifest, present, err)
+				}
+				test.mutateReceipt(manifest.PreviousDetachment)
+				if err := writeComputerDiskManifest(root, manifest); err != nil {
+					t.Fatal(err)
+				}
+			}
+			removal := ManagedVolumeRemovalAuthority{NodeID: prior.NodeID, BootSessionID: prior.BootSessionID,
+				JobID: "removal-job", PriorJobID: test.priorJobID, RemovalGeneration: 1, CleanupFence: "cleanup"}
+			err := engine.deleteComputerDisk(storage, removal)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("delete Computer disk error = %v, wantErr=%t", err, test.wantErr)
+			}
+		})
 	}
 }

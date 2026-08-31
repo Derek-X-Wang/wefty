@@ -117,3 +117,27 @@ func TestComputerDiskSweepEvidenceRejectsIncompleteOrForeignDetachment(t *testin
 		})
 	}
 }
+
+func TestComputerDiskConsumerEvidenceBindsNamedPriorJobNotConsumerJob(t *testing.T) {
+	storage := ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1}
+	evidence := computerDiskEvidence{
+		Kind: computerDiskSweepReceipt, ReceiptID: "receipt-1", ComputerID: storage.ComputerID,
+		StorageID: storage.StorageID, StorageGeneration: storage.StorageGeneration,
+		NodeID: "node-1", JobID: "prior-job", AttemptID: "attempt-a",
+		FencingToken: "fence-a", BootSessionID: "boot-a", SweepEpoch: "same-boot-helper-sweep",
+	}
+	consumer := computerDiskDetachmentAuthority{
+		NodeID: "node-1", BootSessionID: "boot-a", PriorJobID: "prior-job",
+	}
+	if !validComputerDiskConsumerDetachmentEvidence(&evidence, storage, consumer) {
+		t.Fatal("same-boot helper sweep did not authorize the consumer naming the prior Job")
+	}
+	consumer.PriorJobID = "consumer-job"
+	if validComputerDiskConsumerDetachmentEvidence(&evidence, storage, consumer) {
+		t.Fatal("consumer Job substituted for the named prior Job")
+	}
+	consumer.PriorJobID = ""
+	if validComputerDiskConsumerDetachmentEvidence(&evidence, storage, consumer) {
+		t.Fatal("unnamed prior Job authorized detached Storage consumption")
+	}
+}

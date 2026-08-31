@@ -1246,7 +1246,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				identityErr = errors.New("complete current-session service-data removal authority is required")
 			}
 		case ManagedVolumeComputerDisk:
-			if body.ComputerStorage == nil || body.Removal == nil || !validCurrentRemovalAuthority(*body.Removal, session.identity) {
+			if body.ComputerStorage == nil || body.Removal == nil || body.Removal.PriorJobID == "" || !validCurrentRemovalAuthority(*body.Removal, session.identity) {
 				identityErr = errors.New("complete current-session Computer removal authority is required")
 			} else if body.QuarantineOnFailure && body.FailureAttempts < 1 {
 				identityErr = errors.New("Computer cleanup quarantine requires a positive bounded attempt count")
@@ -1320,7 +1320,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		if body.Authority.NodeID != session.identity.NodeID || body.Authority.BootSessionID != session.identity.BootSessionID || body.Authority.NodeID == "" ||
 			body.Authority.HelperGeneration != session.helper.SessionGeneration || body.Authority.HelperGeneration == 0 ||
-			body.Authority.RootInstanceID == "" || body.Authority.JobID == "" || body.Authority.IntentRevision < 1 || body.Authority.CleanupFence == "" ||
+			body.Authority.RootInstanceID == "" || body.Authority.JobID == "" || body.Authority.PriorJobID == "" || body.Authority.IntentRevision < 1 || body.Authority.CleanupFence == "" ||
 			body.Storage.ComputerID == "" || body.Storage.StorageID == "" || body.Storage.StorageGeneration < 1 ||
 			body.Storage.IntentRevision != body.Authority.IntentRevision || body.NewGeneration != body.Storage.StorageGeneration+1 {
 			_ = writeFailure(wire, CodeInvalidRequest, "complete current-session Computer Storage reset authority is required")
@@ -1648,7 +1648,7 @@ func validComputerBackupRequest(backupID, copyID string, storage ComputerStorage
 		storage.DiskBytes > 0 && storage.IntentRevision == authority.OperationRevision &&
 		authority.NodeID == session.identity.NodeID && authority.BootSessionID == session.identity.BootSessionID &&
 		authority.HelperGeneration == session.helper.SessionGeneration && authority.HelperGeneration > 0 &&
-		authority.RootInstanceID != "" && (!requireJob || authority.JobID != "") && authority.OperationRevision > 0 &&
+		authority.RootInstanceID != "" && (!requireJob || authority.JobID != "") && (!requireJob || authority.PriorJobID != "") && authority.OperationRevision > 0 &&
 		authority.CleanupFence != ""
 }
 

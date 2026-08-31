@@ -556,9 +556,11 @@ the image through one loop device and mounts that filesystem as the source of
 `/wefty/service`. `ENOSPC` before image publication leaves no image, loop,
 mount, or attachment; a reset successor remains a tracked L1 staging generation
 whose helper manifest can be retried. The first attach records pending
-attempt authority before mounting; a crash before the attached manifest is
-published is recovered only by a prior-boot sweep receipt after mount and loop
-absence are proved.
+attempt authority before mounting. A helper sweep recovers a pending or
+attached manifest only after mount and loop absence are proved. It also
+refreshes an already-detached `same_boot_reap` manifest into a sweep receipt
+after the same absence proof, so a clean reap followed by an agent reboot does
+not strand the Storage generation.
 The read-only root and fixed-size `/dev`, `/dev/shm`, `/run`, `/tmp`, and
 `/var/tmp` tmpfs mounts leave the Computer disk as the only unbounded writable
 filesystem; Computer operator mounts are therefore required to be read-only.
@@ -596,6 +598,16 @@ so successor admission instead requires the same durable Computer/Storage
 generation and Node plus the independently authenticated fresh attempt. The
 persisted `prior_boot_sweep` kind distinguishes a helper sweep from a
 same-session reap; it does not assert that the agent boot-session ID changed.
+All consumers require the exact durable Computer/Storage generation, Node,
+complete historical Job/attempt/fence/boot fields, and kind-specific proof: a
+`same_boot_reap` receipt must match the consumer's boot and carry no sweep
+epoch, while a `prior_boot_sweep` receipt must carry a sweep epoch and is not
+compared to the consumer's boot. Attach does not compare the historical Job to
+the authenticated successor Job. Reset, Backup creation, and removal instead
+carry a separately named prior Job and require the historical receipt Job to
+equal it; reimage applies the same rule through `OldJobID`. Thus a replacement
+Job can consume its predecessor's proof without allowing an unrelated Job to
+copy, retire, or delete the Storage bytes.
 Inventory separately enumerates disk
 images, verified full allocations, fixed filesystem quotas, manifests, mounts,
 loop devices, and live attachments; namespace quiescence projects out only
@@ -611,10 +623,11 @@ durable retirement fence therefore blocks a delayed attach without deleting
 the current generation before successor publication.
 
 `ResetComputerStorage` accepts only the authenticated current helper session
-plus exact Node, managed-root instance, Job, reset-intent revision, cleanup
-fence, old generation, and successor generation. It requires the predecessor's
-same-boot detach receipt or prior-boot sweep receipt, writes its retirement
-fence under the attachment flock, then resumes successor
+plus exact Node, managed-root instance, consumer Job, named prior Job,
+reset-intent revision, cleanup fence, old generation, and successor generation.
+It requires either a same-boot reap receipt for the current boot or a
+sweep-epoch receipt whose historical Job equals that named prior Job, writes
+its retirement fence under the attachment flock, then resumes successor
 `allocation_manifest_written → allocated_and_formatted → image_published →
 verified`. The verified receipt is stable across retries and binds every input
 above plus both generations and the helper generation that performed positive
@@ -648,17 +661,19 @@ platform, the helper returns a typed `failed_unchanged` receipt only after the
 same detachment and disk-allocation checks. L1 then retires the refused staging
 projection while preserving the stopped current Job and disk generation.
 
-Computer removal carries the same exact Storage identity plus current node,
-boot, Job, removal-generation, and cleanup-fence authority to the helper. The
-helper requires a matching detached receipt, verifies mount and loop absence,
+Computer removal carries the same exact Storage identity plus current Node,
+boot, consumer Job, named prior Job, removal-generation, and cleanup-fence
+authority to the helper. The helper requires a matching detached receipt whose
+historical Job equals the named prior Job, verifies mount and loop absence,
 deletes the image, manifest, and generation quota directory, and positively
 checks their absence before the agent may acknowledge `removed_verified`.
 
 `CreateComputerBackup` is narrow privileged mechanics for one source-node cold
 copy. Its authority binds Backup, copy, Computer, `storage_id@generation`,
-allocated size, Node, boot, root instance, Job, operation revision, cleanup
-fence, and helper generation. Before reading, the helper requires the exact
-source lock, an accepted detach receipt, and positive mount and loop absence.
+allocated size, Node, boot, root instance, consumer Job, named prior Job,
+operation revision, cleanup fence, and helper generation. Before reading, the
+helper requires the exact source lock, an accepted detach receipt whose
+historical Job equals the named prior Job, and positive mount and loop absence.
 It writes a durable copy manifest before bytes, uses full allocation, copies
 under the attachment fence, compares source and destination SHA-256 digests,
 publishes by rename, and records `encryption=none`. Durable phases cover

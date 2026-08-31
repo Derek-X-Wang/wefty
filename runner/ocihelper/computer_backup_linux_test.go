@@ -53,8 +53,44 @@ func backupTestRequest(storage ComputerStorageReference, sourceAuthority Attempt
 	storage.IntentRevision = 2
 	return CreateComputerBackupRequest{BackupID: "backup-1", CopyID: "copy-1", Storage: storage,
 		Authority: ComputerBackupAuthority{NodeID: sourceAuthority.NodeID, BootSessionID: sourceAuthority.BootSessionID,
-			HelperGeneration: 1, RootInstanceID: "managed-root-1", JobID: sourceAuthority.JobID,
+			HelperGeneration: 1, RootInstanceID: "managed-root-1", JobID: "backup-job", PriorJobID: sourceAuthority.JobID,
 			OperationRevision: 2, CleanupFence: "backup-fence-1"}}
+}
+
+func TestComputerBackupBindsSweepReceiptToNamedPriorJob(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		priorJobID    string
+		mutateReceipt func(*computerDiskEvidence)
+		wantErr       bool
+	}{
+		{name: "same-boot helper sweep", priorJobID: "job-1"},
+		{name: "wrong prior Job", priorJobID: "job-other", wantErr: true},
+		{name: "unnamed prior Job", wantErr: true},
+		{name: "missing receipt capability", priorJobID: "job-1", mutateReceipt: func(evidence *computerDiskEvidence) { evidence.ReceiptID = "" }, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine, storage, prior := prepareSameBootSweptComputerDisk(t)
+			if test.mutateReceipt != nil {
+				name, _ := deterministicComputerDiskName(storage)
+				root := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+				manifest, present, err := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
+				if err != nil || !present || manifest.PreviousDetachment == nil {
+					t.Fatalf("swept manifest = %+v present=%t err=%v", manifest, present, err)
+				}
+				test.mutateReceipt(manifest.PreviousDetachment)
+				if err := writeComputerDiskManifest(root, manifest); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := backupTestRequest(storage, prior)
+			request.Authority.PriorJobID = test.priorJobID
+			_, err := engine.CreateComputerBackup(t.Context(), request)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("create Computer Backup error = %v, wantErr=%t", err, test.wantErr)
+			}
+		})
+	}
 }
 
 func TestComputerBackupResumesEveryTrackedCrashBoundary(t *testing.T) {

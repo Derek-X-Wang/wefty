@@ -812,6 +812,7 @@ type ManagedVolumeRemovalAuthority struct {
 	NodeID            string `json:"node_id"`
 	BootSessionID     string `json:"boot_session_id"`
 	JobID             string `json:"job_id"`
+	PriorJobID        string `json:"prior_job_id,omitempty"`
 	RemovalGeneration uint64 `json:"removal_generation"`
 	CleanupFence      string `json:"cleanup_fence"`
 }
@@ -1036,6 +1037,7 @@ type ComputerStorageResetAuthority struct {
 	HelperGeneration uint64 `json:"helper_generation"`
 	RootInstanceID   string `json:"root_instance_id"`
 	JobID            string `json:"job_id"`
+	PriorJobID       string `json:"prior_job_id"`
 	IntentRevision   int64  `json:"intent_revision"`
 	CleanupFence     string `json:"cleanup_fence"`
 }
@@ -1129,6 +1131,7 @@ type ComputerBackupAuthority struct {
 	HelperGeneration  uint64 `json:"helper_generation"`
 	RootInstanceID    string `json:"root_instance_id"`
 	JobID             string `json:"job_id"`
+	PriorJobID        string `json:"prior_job_id"`
 	OperationRevision int64  `json:"operation_revision"`
 	CleanupFence      string `json:"cleanup_fence"`
 }

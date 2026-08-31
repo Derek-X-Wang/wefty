@@ -209,7 +209,7 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 		}
 		if err := controller.finalizeVolumes(ctx, workloadrunner.ManagedVolumeFinalizationRequest{
 			Volumes: volumes,
-			Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID, RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence},
+			Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID, PriorJobID: removal.jobID, RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence},
 		}); err != nil {
 			return fmt.Errorf("delete Computer disk resource: %w", err)
 		}

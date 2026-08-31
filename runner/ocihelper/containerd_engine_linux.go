@@ -1594,7 +1594,7 @@ func validateRuntimeResourceLabels(kind, observedID, expectedID string, labels m
 func (engine *ContainerdEngine) DeleteManagedVolume(ctx context.Context, request DeleteManagedVolumeRequest) (DeleteManagedVolumeResponse, error) {
 	switch request.Kind {
 	case ManagedVolumeComputerDisk:
-		if request.ComputerStorage == nil || request.Removal == nil {
+		if request.ComputerStorage == nil || request.Removal == nil || request.Removal.PriorJobID == "" {
 			return DeleteManagedVolumeResponse{}, errors.New("Computer disk deletion requires Storage and removal authority")
 		}
 		if err := engine.deleteComputerDisk(*request.ComputerStorage, *request.Removal); err != nil {

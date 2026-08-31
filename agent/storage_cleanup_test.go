@@ -10,7 +10,7 @@ func TestStorageCleanupQuarantineAcknowledgementPreservesTypedEvidence(t *testin
 	err := &workloadrunner.ManagedVolumeCleanupQuarantinedError{Receipt: workloadrunner.ManagedVolumeQuarantineReceipt{
 		Kind: "managed_volume_cleanup_quarantined", ReceiptID: "receipt", VolumeKind: workloadrunner.ManagedVolumeComputerDisk,
 		ComputerStorage: workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 4},
-		Removal: workloadrunner.ManagedVolumeRemovalAuthority{NodeID: "node", BootSessionID: "boot", JobID: "job",
+		Removal: workloadrunner.ManagedVolumeRemovalAuthority{NodeID: "node", BootSessionID: "boot", JobID: "job", PriorJobID: "job",
 			RemovalGeneration: 9, CleanupFence: "fence"}, FailureReason: "operation_failed", Attempts: 3,
 	}}
 	acknowledgement, ok := storageCleanupQuarantineAcknowledgement(err, "root")

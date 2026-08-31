@@ -184,7 +184,7 @@ func TestComputerStorageResetRequiresCurrentHelperGeneration(t *testing.T) {
 		NewGeneration: 2,
 		Authority: ComputerStorageResetAuthority{NodeID: "node-1", BootSessionID: "boot-1",
 			HelperGeneration: session.Handshake().SessionGeneration + 1, RootInstanceID: "managed-root-1",
-			JobID: "job-1", IntentRevision: 2, CleanupFence: "reset-fence"},
+			JobID: "reset-job", PriorJobID: "job-1", IntentRevision: 2, CleanupFence: "reset-fence"},
 	}
 	if _, err := session.ResetComputerStorage(t.Context(), request); err == nil {
 		t.Fatal("stale helper generation authorized Computer Storage reset")
@@ -213,7 +213,7 @@ func TestComputerBackupRequiresCurrentSessionAndReturnsBoundReceipts(t *testing.
 			StorageGeneration: 1, IntentRevision: 2, DiskBytes: 8 << 30},
 		Authority: ComputerBackupAuthority{NodeID: "node-1", BootSessionID: "boot-1",
 			HelperGeneration: session.Handshake().SessionGeneration + 1, RootInstanceID: "managed-root-1",
-			JobID: "job-1", OperationRevision: 2, CleanupFence: "backup-fence"}}
+			JobID: "backup-job", PriorJobID: "job-1", OperationRevision: 2, CleanupFence: "backup-fence"}}
 	if _, err := session.CreateComputerBackup(t.Context(), request); err == nil {
 		t.Fatal("stale helper generation authorized Computer Backup")
 	} else {
