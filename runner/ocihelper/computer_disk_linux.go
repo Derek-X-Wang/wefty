@@ -240,9 +240,9 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		if err = writeComputerDiskManifest(diskRoot, manifest); err != nil {
 			return nil, err
 		}
-		if err = engine.computerDiskCheckpoint(computerDiskPendingBeforeAttach); err != nil {
-			return nil, err
-		}
+		// Arm in-process rollback before exposing the pending checkpoint. A
+		// returned checkpoint failure must not strand the generation as pending;
+		// an actual process crash is instead reconciled by the next boot sweep.
 		defer func() {
 			if err != nil {
 				manifest.Pending = nil
@@ -250,6 +250,9 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 				_ = writeComputerDiskManifest(diskRoot, manifest)
 			}
 		}()
+		if err = engine.computerDiskCheckpoint(computerDiskPendingBeforeAttach); err != nil {
+			return nil, err
+		}
 	}
 	if err = os.MkdirAll(mountPath, 0o700); err != nil {
 		if createdImage {
