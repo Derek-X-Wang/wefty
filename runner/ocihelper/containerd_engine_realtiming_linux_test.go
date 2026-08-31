@@ -499,9 +499,6 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	capacityRetained := exerciseNativeLinuxComputerCapacity(t, ctx, barrier, echoReference, echoImage.TopLevelDigest)
 	expectedRetained = mergeNativeExpectedInventory(expectedRetained, capacityRetained)
 	computerDiskEvidence := exerciseNativeLinuxComputerDisk(t, ctx, barrier, echoReference, echoImage.TopLevelDigest, retainedBaseline, expectedRetained)
-	if err := adapter.Probe(ctx, "native-node", "native-boot", reference, digest, l1.DefaultLeaseDuration); err != nil {
-		t.Fatalf("re-probe OCI adapter after Computer helper-death sweep: %v", err)
-	}
 	computerAgentRestartEvidence := exerciseNativeLinuxComputerAgentRestart(t, ctx, adapter, echoReference, echoImage.TopLevelDigest)
 	session, err = barrier.Session()
 	if err != nil {
@@ -1082,6 +1079,12 @@ func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, 
 	policy := l1.NodePolicy{Tags: []string{contract.StableNodeTagPrefix + registration.NodeID}, MaxOneshotSlots: 1, MaxServiceSlots: 1}
 	if _, err := store.RegisterNode(ctx, fabric.Identity{NodeID: "native-agent"}, registration, policy, true); err != nil {
 		t.Fatal(err)
+	}
+	// The preceding Computer-disk exercise deliberately replaces the helper.
+	// Re-establish platform and image-pin authority for the exact Node/boot that
+	// owns this L1 exercise rather than borrowing the earlier probe identity.
+	if err := adapter.Probe(ctx, registration.NodeID, registration.BootSessionID, reference, digest, l1.DefaultLeaseDuration); err != nil {
+		t.Fatalf("re-probe OCI adapter after Computer helper-death sweep: %v", err)
 	}
 	memory := int64(1 << 30)
 	digestCopy := digest

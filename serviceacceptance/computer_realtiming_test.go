@@ -357,8 +357,12 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	reset = waitForComputerCLI(t, harness, reset.ComputerID, 3*time.Minute, func(current l1.Computer) bool {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision && current.StorageGeneration > resized.StorageGeneration
 	})
+	// Reset can publish its verified empty successor before the first attempt
+	// initializes that filesystem root for the image user. Reimage therefore
+	// carries the explicit one-shot ownership authority instead of depending on
+	// an incidental attach winning this race.
 	reimaged := runComputerCLI[l1.Computer](t, harness, false, "services", "reimage", reset.ComputerID,
-		"--image", reimageReference+"@"+reimageDigest, "--expect-current", "--idempotency-key", "linux-native-reimage", "--terminate-sessions")
+		"--image", reimageReference+"@"+reimageDigest, "--expect-current", "--idempotency-key", "linux-native-reimage", "--terminate-sessions", "--chown")
 	reimaged = waitForComputerCLI(t, harness, reimaged.ComputerID, 4*time.Minute, func(current l1.Computer) bool {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision &&
 			current.CurrentSpecRevision > reset.CurrentSpecRevision && computerDisplayPublished(current)
