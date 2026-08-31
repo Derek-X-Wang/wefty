@@ -1814,7 +1814,8 @@ func writeEngineResponseWithMethod(connection *framedConn, method Method, respon
 		if errors.As(err, &serviceDataRejection) {
 			return writeFailure(connection, CodeOCISpecRejected, serviceDataRejection.Error())
 		}
-		if method == MethodPreflightReimage && errors.Is(err, errComputerReimageDetachmentRequired) {
+		var preflightStage *computerReimagePreflightStageError
+		if method == MethodPreflightReimage && (errors.Is(err, errComputerReimageDetachmentRequired) || errors.As(err, &preflightStage)) {
 			return writeRPCError(connection, engineFailureRPC(method, "OCI engine operation failed", engineFailureReason(err), err))
 		}
 		return writeRPCError(connection, engineFailureRPC(method, "OCI engine operation failed", engineFailureReason(err)))

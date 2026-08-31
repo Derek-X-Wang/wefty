@@ -115,12 +115,12 @@ func (engine *ContainerdEngine) PreflightComputerReimage(ctx context.Context, re
 	// because grow is also allowed while attached.
 	lock, err := openComputerDiskLock(diskRoot)
 	if err != nil {
-		return PreflightComputerReimageResponse{}, err
+		return PreflightComputerReimageResponse{}, reimagePreflightStageError("generation_lock", err)
 	}
 	defer closeComputerDiskLock(lock)
 	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
 	if err != nil {
-		return PreflightComputerReimageResponse{}, err
+		return PreflightComputerReimageResponse{}, reimagePreflightStageError("manifest_read", err)
 	}
 	detachment, detached := reimageDetachmentEvidence(manifest, request)
 	if !present || !sameComputerStorageIdentity(manifest.Storage, request.Storage) ||
@@ -128,11 +128,11 @@ func (engine *ContainerdEngine) PreflightComputerReimage(ctx context.Context, re
 		return PreflightComputerReimageResponse{}, errComputerReimageDetachmentRequired
 	}
 	if err := verifyComputerDiskAllocation(imagePath, request.Storage.DiskBytes); err != nil {
-		return PreflightComputerReimageResponse{}, err
+		return PreflightComputerReimageResponse{}, reimagePreflightStageError("allocation_verify", err)
 	}
 	receiptID, err := randomCapability()
 	if err != nil {
-		return PreflightComputerReimageResponse{}, err
+		return PreflightComputerReimageResponse{}, reimagePreflightStageError("receipt_create", err)
 	}
 	receipt := ComputerReimagePreflightReceipt{ReceiptID: receiptID,
 		ComputerID: request.Storage.ComputerID, StorageID: request.Storage.StorageID,
@@ -160,22 +160,24 @@ func (engine *ContainerdEngine) PreflightComputerReimage(ctx context.Context, re
 	}
 	if evidence.TopLevelDigest != request.TargetImage.Digest ||
 		evidence.Platform != request.TargetImage.Platform {
-		return PreflightComputerReimageResponse{}, errors.New("Computer reimage image preflight did not verify exact platform identity")
+		return PreflightComputerReimageResponse{}, reimagePreflightStageError("image_identity",
+			errors.New("Computer reimage image preflight did not verify exact platform identity"))
 	}
 	imageConfig, err := readImageRuntimeConfig(engineContext(ctx), engine.client.ContentStore(), image)
 	if err != nil {
-		return PreflightComputerReimageResponse{}, err
+		return PreflightComputerReimageResponse{}, reimagePreflightStageError("image_config", err)
 	}
 	imageUID, imageGID, err := numericImageOwner(imageConfig.User)
 	if err != nil {
-		return PreflightComputerReimageResponse{}, err
+		return PreflightComputerReimageResponse{}, reimagePreflightStageError("image_owner", err)
 	}
 	diskUID, diskGID, err := readExt4RootOwner(ctx, imagePath)
 	if err != nil {
-		return PreflightComputerReimageResponse{}, err
+		return PreflightComputerReimageResponse{}, reimagePreflightStageError("disk_owner", err)
 	}
 	if !request.Chown && (imageUID != diskUID || imageGID != diskGID) {
-		return PreflightComputerReimageResponse{}, errors.New("Computer reimage image user does not own the detached disk root")
+		return PreflightComputerReimageResponse{}, reimagePreflightStageError("ownership_match",
+			errors.New("Computer reimage image user does not own the detached disk root"))
 	}
 	receipt.Kind = "computer_reimage_preflight_verified"
 	receipt.PlatformOS = evidence.Platform.OS

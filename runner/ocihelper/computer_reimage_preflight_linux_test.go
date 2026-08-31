@@ -2,7 +2,22 @@
 
 package ocihelper
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestReimagePreflightStageErrorIsBoundedAndPreservesCause(t *testing.T) {
+	cause := errors.New("private /host/path detail")
+	err := reimagePreflightStageError("disk_owner", cause)
+	if !errors.Is(err, cause) {
+		t.Fatal("preflight stage error did not preserve its cause for local classification")
+	}
+	if got := err.Error(); got != "Computer reimage preflight failed at disk_owner" || strings.Contains(got, "/host/path") {
+		t.Fatalf("preflight stage error crossed private mechanics: %q", got)
+	}
+}
 
 func TestReimageAcceptsVerifiedNeverAttachedResetSuccessor(t *testing.T) {
 	storage := testComputerStorage()
