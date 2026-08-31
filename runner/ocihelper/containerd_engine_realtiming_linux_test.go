@@ -711,7 +711,11 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		if _, err := session.Run(ctx, ocihelper.RunRequest{Authority: authority, InitialDeadman: l1.DefaultLeaseDuration, Workload: ocihelper.WorkloadInput{ImageReference: reference, ImageDigest: digest, Argv: []string{"/bin/sh", "-c", "exec sleep 60"}}}); err != nil {
 			t.Fatal(err)
 		}
-		requestRootFault(t, loss)
+		fault := loss
+		if loss == "kill-shim" {
+			fault += ":" + authority.JobID
+		}
+		requestRootFault(t, fault)
 		var lossResult *ocihelper.WatchResponse
 		if err := session.Watch(ctx, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
 			if event.Result != nil {
@@ -2396,8 +2400,21 @@ func requestRootFault(t *testing.T, action string) {
 	failure := filepath.Join(directory, action+".failed")
 	_ = os.Remove(ack)
 	_ = os.Remove(failure)
-	if err := os.WriteFile(fifo, []byte(action+"\n"), 0o600); err != nil {
-		t.Fatal(err)
+	writeDeadline := time.Now().Add(2 * time.Second)
+	for {
+		writer, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			_, writeErr := writer.Write([]byte(action + "\n"))
+			closeErr := writer.Close()
+			if writeErr == nil && closeErr == nil {
+				break
+			}
+			err = errors.Join(writeErr, closeErr)
+		}
+		if time.Now().After(writeDeadline) {
+			t.Fatalf("write root fault %s before deadline: %v", action, err)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {

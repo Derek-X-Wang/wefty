@@ -361,27 +361,42 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	// initializes that filesystem root for the image user. Reimage therefore
 	// carries the explicit one-shot ownership authority instead of depending on
 	// an incidental attach winning this race.
+	reimageStarted := time.Now()
 	reimaged := runComputerCLI[l1.Computer](t, harness, false, "services", "reimage", reset.ComputerID,
 		"--image", reimageReference+"@"+reimageDigest, "--expect-current", "--idempotency-key", "linux-native-reimage", "--terminate-sessions", "--chown")
 	reimaged = waitForComputerCLI(t, harness, reimaged.ComputerID, 4*time.Minute, func(current l1.Computer) bool {
+		failOnTypedReimagePreflight(t, current, reset.CurrentSpecRevision)
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision &&
 			current.CurrentSpecRevision > reset.CurrentSpecRevision && computerDisplayPublished(current)
 	})
+	chownReimaged := reimaged
+	chownReimageElapsed := time.Since(reimageStarted)
+	ownershipMatchStarted := time.Now()
+	reimaged = runComputerCLI[l1.Computer](t, harness, false, "services", "reimage", reimaged.ComputerID,
+		"--image", reference+"@"+digest, "--expect-current", "--idempotency-key", "linux-native-reimage-ownership-match", "--terminate-sessions")
+	reimaged = waitForComputerCLI(t, harness, reimaged.ComputerID, 4*time.Minute, func(current l1.Computer) bool {
+		failOnTypedReimagePreflight(t, current, chownReimaged.CurrentSpecRevision)
+		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision &&
+			current.CurrentSpecRevision > chownReimaged.CurrentSpecRevision && computerDisplayPublished(current)
+	})
+	ownershipMatchElapsed := time.Since(ownershipMatchStarted)
 	abortEvidence := exerciseLiveReconfigurationAbort(t, harness, reference, digest)
 	detachment := inspectLiveComputerDetachment(t, reimaged)
 	recordComputerAuthority(receipt, reimaged)
 	completeLinuxComputerRow(t, receipt, "linux.reconfiguration", map[string]bool{
-		"grow_applied_live":           resized.DesiredDiskBytes == 160<<20,
-		"reset_crash_phase_live":      resetCrashObserved && reset.IntentRevision >= resetIntent,
-		"reset_fresh_generation_live": reset.StorageGeneration > resized.StorageGeneration,
-		"reimage_new_projection_live": reimaged.CurrentSpecRevision > reset.CurrentSpecRevision,
-		"detachment_receipt_live":     detachment,
-		"abort_after_dead_node_live":  abortEvidence.Aborted,
-		"stale_cas_rejected_live":     abortEvidence.StaleCASRejected,
-		"no_automatic_rollback_live":  abortEvidence.NoAutoRollback,
+		"grow_applied_live":            resized.DesiredDiskBytes == 160<<20,
+		"reset_crash_phase_live":       resetCrashObserved && reset.IntentRevision >= resetIntent,
+		"reset_fresh_generation_live":  reset.StorageGeneration > resized.StorageGeneration,
+		"reimage_new_projection_live":  reimaged.CurrentSpecRevision > chownReimaged.CurrentSpecRevision && chownReimaged.CurrentSpecRevision > reset.CurrentSpecRevision,
+		"reimage_ownership_match_live": ownershipMatchElapsed > 0,
+		"detachment_receipt_live":      detachment,
+		"abort_after_dead_node_live":   abortEvidence.Aborted,
+		"stale_cas_rejected_live":      abortEvidence.StaleCASRejected,
+		"no_automatic_rollback_live":   abortEvidence.NoAutoRollback,
 	}, map[string]string{"intent_revision": fmt.Sprint(reimaged.IntentRevision), "spec_revision": fmt.Sprint(reimaged.CurrentSpecRevision),
 		"storage_generation": fmt.Sprint(reimaged.StorageGeneration), "reimage_reference": reimageReference,
-		"reimage_digest": reimageDigest, "aborted_computer_id": abortEvidence.ComputerID})
+		"reimage_digest": reimageDigest, "reimage_chown_elapsed": chownReimageElapsed.String(),
+		"reimage_ownership_match_elapsed": ownershipMatchElapsed.String(), "aborted_computer_id": abortEvidence.ComputerID})
 
 	receipt.begin("linux.storage_provenance")
 	backupOutput := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "backup", "create", reimaged.ComputerID,
@@ -1730,6 +1745,23 @@ func computerDisplayPublished(computer l1.Computer) bool {
 	// Computers forbid published_port, so ServiceJob.Ready is intentionally nil.
 	// The fenced, attempt-bound display_endpoint is their readiness projection.
 	return computer.CurrentJob.State == contract.JobRunning && computer.DisplayEndpoint != nil
+}
+
+func failOnTypedReimagePreflight(t *testing.T, computer l1.Computer, priorSpecRevision int64) {
+	t.Helper()
+	if computer.ReconfigurationPhase != l1.ComputerReconfigurationStable ||
+		computer.CurrentSpecRevision > priorSpecRevision || len(computer.CurrentJob.LastFailure) == 0 {
+		return
+	}
+	var failure contract.SpawnFailure
+	if json.Unmarshal(computer.CurrentJob.LastFailure, &failure) != nil {
+		return
+	}
+	if failure.Code == contract.SpawnFailureReimagePreflight || failure.Code == contract.SpawnFailureImageUnavailable ||
+		failure.Code == contract.SpawnFailureImagePlatformUnsupported {
+		t.Fatalf("Computer reimage returned typed preflight failure instead of timing out: code=%s message=%s",
+			failure.Code, failure.Message)
+	}
 }
 
 func createReadyComputer(t *testing.T, harness *acceptanceHarness, reference, digest, name, key string) l1.Computer {

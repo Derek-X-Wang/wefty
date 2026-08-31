@@ -15,7 +15,20 @@ import (
 const (
 	computerReimagePreflightReceiptKind       = "computer_reimage_preflight_verified"
 	computerReimagePreflightFailedReceiptKind = "computer_reimage_preflight_failed_unchanged"
+	computerReimageDetachmentEvidenceKind     = "computer_reimage_detachment"
+	computerReimageResetEvidenceKind          = "computer_reimage_reset_preparation"
 )
+
+var computerReimagePreflightStages = map[string]bool{
+	"generation_lock": true, "manifest_read": true, "allocation_verify": true,
+	"receipt_create": true, "image_identity": true, "image_config": true,
+	"image_owner": true, "disk_owner": true, "ownership_match": true,
+}
+
+var computerReimagePreflightFailureReasons = map[string]bool{
+	"operation_failed": true, "deadline_exceeded": true, "detachment_required": true,
+	"image_unavailable": true, "image_platform_unsupported": true,
+}
 
 type computerReimageOperation struct {
 	ComputerID, OldJobID, StagingJobID, StorageID, BoundNodeID, RootInstanceID string
@@ -44,11 +57,13 @@ func (s *Store) ListNodeComputerReimagePreflightDirectives(ctx context.Context, 
 	if err := validateStorageResetNode(ctx, s.db, identityNodeID, nodeID, bootSessionID); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT r.computer_id, r.storage_id, r.storage_generation,
+	rows, err := s.db.QueryContext(ctx, `SELECT r.computer_id, r.storage_id, r.storage_generation, g.disk_bytes,
 		r.old_job_id, r.staging_job_id, r.bound_node_id, r.root_instance_id, r.operation_revision,
 		r.operation_fence, r.target_reference, r.target_digest, r.chown
 		FROM computer_reimage_operations r JOIN computers c ON c.computer_id=r.computer_id
 		JOIN jobs j ON j.job_id=r.old_job_id
+		JOIN computer_storage_generations g ON g.computer_id=r.computer_id
+		AND g.storage_id=r.storage_id AND g.storage_generation=r.storage_generation
 		WHERE r.bound_node_id=? AND r.status='planned' AND c.reconfiguration_phase='reimaging'
 		AND c.reconfiguration_revision=r.operation_revision AND j.state='stopped'
 		ORDER BY r.requested_ns, r.computer_id`, nodeID)
@@ -60,7 +75,7 @@ func (s *Store) ListNodeComputerReimagePreflightDirectives(ctx context.Context, 
 	for rows.Next() {
 		var directive ComputerReimagePreflightDirective
 		var reference, digest string
-		if err := rows.Scan(&directive.ComputerID, &directive.StorageID, &directive.StorageGeneration,
+		if err := rows.Scan(&directive.ComputerID, &directive.StorageID, &directive.StorageGeneration, &directive.DiskBytes,
 			&directive.OldJobID, &directive.StagingJobID, &directive.BoundNodeID,
 			&directive.RootInstanceID, &directive.OperationRevision, &directive.OperationFence,
 			&reference, &digest, &directive.Chown); err != nil {
@@ -94,27 +109,60 @@ func validateComputerReimagePreflight(row computerReimageOperation, receipt Comp
 		receipt.OldJobID != row.OldJobID || receipt.StagingJobID != row.StagingJobID ||
 		receipt.NodeID != row.BoundNodeID || receipt.RootInstanceID != row.RootInstanceID ||
 		receipt.OperationRevision != row.OperationRevision || receipt.OperationFence != row.OperationFence ||
-		receipt.TargetDigest != row.TargetDigest || receipt.DetachmentReceiptID == "" ||
-		receipt.DetachmentAttemptID == "" || receipt.DetachmentFencingToken == "" {
+		receipt.TargetDigest != row.TargetDigest {
 		return protocolError(contract.ErrorConflict, "Computer reimage preflight receipt does not match current authority")
 	}
 	if receipt.PlatformOS != nodeOS || receipt.PlatformArchitecture != nodeArchitecture {
 		return protocolError(contract.ErrorConflict, "Computer reimage image platform does not match its bound Node")
 	}
 	if receipt.Kind == computerReimagePreflightFailedReceiptKind {
-		if receipt.FailureCode != string(contract.SpawnFailureImageUnavailable) &&
-			receipt.FailureCode != string(contract.SpawnFailureImagePlatformUnsupported) {
+		if !computerReimagePreflightStages[receipt.FailureStage] ||
+			!computerReimagePreflightFailureReasons[receipt.FailureReason] ||
+			(receipt.FailureCode != string(contract.SpawnFailureImageUnavailable) &&
+				receipt.FailureCode != string(contract.SpawnFailureImagePlatformUnsupported) &&
+				receipt.FailureCode != string(contract.SpawnFailureReimagePreflight)) {
 			return protocolError(contract.ErrorConflict, "Computer reimage preflight failure code is not supported")
+		}
+		switch receipt.FailureCode {
+		case string(contract.SpawnFailureImageUnavailable):
+			if receipt.FailureStage != "image_identity" || receipt.FailureReason != "image_unavailable" {
+				return protocolError(contract.ErrorConflict, "Computer reimage image-unavailable failure facts are inconsistent")
+			}
+		case string(contract.SpawnFailureImagePlatformUnsupported):
+			if receipt.FailureStage != "image_identity" || receipt.FailureReason != "image_platform_unsupported" {
+				return protocolError(contract.ErrorConflict, "Computer reimage platform failure facts are inconsistent")
+			}
+		case string(contract.SpawnFailureReimagePreflight):
+			if receipt.FailureReason == "image_unavailable" || receipt.FailureReason == "image_platform_unsupported" {
+				return protocolError(contract.ErrorConflict, "Computer reimage mechanics failure facts are inconsistent")
+			}
+		}
+		if receipt.StorageEvidenceKind != "" && !validComputerReimageStorageEvidence(receipt) {
+			return protocolError(contract.ErrorConflict, "Computer reimage preflight failure storage evidence is invalid")
 		}
 		return nil
 	}
-	if receipt.FailureCode != "" {
+	if receipt.FailureCode != "" || receipt.FailureStage != "" || receipt.FailureReason != "" ||
+		!validComputerReimageStorageEvidence(receipt) {
 		return protocolError(contract.ErrorConflict, "successful Computer reimage preflight cannot carry a failure")
 	}
 	if !row.Chown && (receipt.ImageUID != receipt.DiskRootUID || receipt.ImageGID != receipt.DiskRootGID) {
 		return protocolError(contract.ErrorConflict, "Computer reimage image user does not own the current disk root")
 	}
 	return nil
+}
+
+func validComputerReimageStorageEvidence(receipt ComputerReimagePreflightReceipt) bool {
+	switch receipt.StorageEvidenceKind {
+	case computerReimageDetachmentEvidenceKind:
+		return receipt.DetachmentReceiptID != "" && receipt.DetachmentAttemptID != "" &&
+			receipt.DetachmentFencingToken != "" && receipt.ResetPreparationReceiptID == ""
+	case computerReimageResetEvidenceKind:
+		return receipt.ResetPreparationReceiptID != "" && receipt.DetachmentReceiptID == "" &&
+			receipt.DetachmentAttemptID == "" && receipt.DetachmentFencingToken == ""
+	default:
+		return false
+	}
 }
 
 func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identityNodeID, computerID string,
@@ -181,7 +229,8 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 	if request.Receipt.Kind == computerReimagePreflightFailedReceiptKind {
 		failureCode := contract.SpawnFailureCode(request.Receipt.FailureCode)
 		lastFailure, marshalErr := json.Marshal(contract.SpawnFailure{Code: failureCode,
-			Message: "Computer reimage target could not be verified for the bound Node", NodeID: row.BoundNodeID})
+			Message: "Computer reimage preflight failed at " + request.Receipt.FailureStage + ": " + request.Receipt.FailureReason,
+			NodeID:  row.BoundNodeID})
 		if marshalErr != nil {
 			return Computer{}, internalError(marshalErr, "encode Computer reimage preflight failure")
 		}

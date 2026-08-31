@@ -1176,13 +1176,14 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "computer_id", "storage_id", "storage_generation", "old_job_id", "staging_job_id",
+          "computer_id", "storage_id", "storage_generation", "disk_bytes", "old_job_id", "staging_job_id",
           "bound_node_id", "root_instance_id", "operation_revision", "operation_fence", "target_image", "chown"
         ],
         "properties": {
           "computer_id": { "type": "string", "minLength": 1 },
           "storage_id": { "type": "string", "minLength": 1 },
           "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
           "old_job_id": { "type": "string", "minLength": 1 },
           "staging_job_id": { "type": "string", "minLength": 1 },
           "bound_node_id": { "type": "string", "minLength": 1 },

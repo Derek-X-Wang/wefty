@@ -1938,9 +1938,10 @@ func (adapter *Adapter) PreflightComputerReimage(ctx context.Context, request wo
 		OperationFence: r.OperationFence, TargetDigest: r.TargetDigest, PlatformOS: r.PlatformOS,
 		PlatformArchitecture: r.PlatformArchitecture, ImageUID: r.ImageUID, ImageGID: r.ImageGID,
 		DiskRootUID: r.DiskRootUID, DiskRootGID: r.DiskRootGID,
-		DetachmentReceiptID: r.DetachmentReceiptID, DetachmentAttemptID: r.DetachmentAttemptID,
-		DetachmentFencingToken: r.DetachmentFencingToken, HelperGeneration: r.HelperGeneration,
-		FailureCode: r.FailureCode}, nil
+		StorageEvidenceKind: r.StorageEvidenceKind, DetachmentReceiptID: r.DetachmentReceiptID,
+		DetachmentAttemptID: r.DetachmentAttemptID, DetachmentFencingToken: r.DetachmentFencingToken,
+		ResetPreparationReceiptID: r.ResetPreparationReceiptID, HelperGeneration: r.HelperGeneration,
+		FailureCode: r.FailureCode, FailureStage: r.FailureStage, FailureReason: r.FailureReason}, nil
 }
 
 func (adapter *Adapter) CreateComputerBackup(ctx context.Context, request workloadrunner.ComputerBackupRequest) (workloadrunner.ComputerBackupCopyReceipt, error) {

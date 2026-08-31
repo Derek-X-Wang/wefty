@@ -42,26 +42,27 @@ func (err *ComputerStorageGrowUncertainError) Unwrap() error { return err.Cause 
 // NativeEngineConfig contains only host-side helper configuration. The agent
 // never supplies these values over the helper protocol.
 type NativeEngineConfig struct {
-	Address                string
-	LoggerExecutable       string
-	RuntimeRoot            string
-	ContainerdStateRoot    string
-	CgroupRoot             string
-	ResolverPath           string
-	HostsPath              string
-	AllowedMountRoots      []string
-	RuncExecutable         string
-	HostMountRoot          string
-	GuestMountRoot         string
-	AttemptPortMin         uint16
-	AttemptPortMax         uint16
-	AttemptPortBindTimeout time.Duration
-	LogSealTimeout         time.Duration
-	TaskReleaseTimeout     time.Duration
-	HandoffRetention       time.Duration
-	MemoryCapacityBytes    int64
-	MemoryReserveBytes     int64
-	Clock                  Clock
+	Address                         string
+	LoggerExecutable                string
+	RuntimeRoot                     string
+	ContainerdStateRoot             string
+	CgroupRoot                      string
+	ResolverPath                    string
+	HostsPath                       string
+	AllowedMountRoots               []string
+	RuncExecutable                  string
+	HostMountRoot                   string
+	GuestMountRoot                  string
+	AttemptPortMin                  uint16
+	AttemptPortMax                  uint16
+	AttemptPortBindTimeout          time.Duration
+	LogSealTimeout                  time.Duration
+	TaskReleaseTimeout              time.Duration
+	HandoffRetention                time.Duration
+	ComputerReimagePreflightTimeout time.Duration
+	MemoryCapacityBytes             int64
+	MemoryReserveBytes              int64
+	Clock                           Clock
 }
 
 // GuardianReaper preserves the helper deadman's signal initiator when the

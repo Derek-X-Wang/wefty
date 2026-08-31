@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -313,6 +314,24 @@ func TestComputerStorageResetSweepDropsOnlyUnverifiedSuccessorPreparation(t *tes
 	}
 
 	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	manifest, present, err := readComputerDiskManifest(filepath.Join(successorRoot, "attachment.json"))
+	if err != nil || !present {
+		t.Fatalf("read interrupted reset manifest: present=%t err=%v", present, err)
+	}
+	manifest.DiskImage = "corrupted.ext4"
+	if err := writeComputerDiskManifest(successorRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.sweepComputerDisks("corrupted-preparation-sweep"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(successorRoot); err != nil {
+		t.Fatalf("corrupted preparation-shaped anomaly was deleted: %v", err)
+	}
+	manifest.DiskImage = "disk.ext4"
+	if err := writeComputerDiskManifest(successorRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
 	if err := engine.sweepComputerDisks("replacement-sweep"); err != nil {
 		t.Fatal(err)
 	}
@@ -330,6 +349,41 @@ func TestComputerStorageResetSweepDropsOnlyUnverifiedSuccessorPreparation(t *tes
 	}
 	if _, err := os.Lstat(successorRoot); err != nil {
 		t.Fatalf("verified reset successor was removed by helper sweep: %v", err)
+	}
+}
+
+func TestComputerDiskRejectsHalfPreparedResetSuccessorBeforeSweep(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	prior := testComputerAuthority("attempt-a", "fence-a", "boot-a")
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	request := resetTestRequest(storage, prior)
+	request.Storage.IntentRevision = request.Authority.IntentRevision
+	crash := errors.New("helper died after publishing successor image")
+	engine.storageResetHook = func(phase computerStorageResetPhase) error {
+		if phase == computerStorageResetImagePublished {
+			return crash
+		}
+		return nil
+	}
+	if _, err := engine.ResetComputerStorage(t.Context(), request); !errors.Is(err, crash) {
+		t.Fatalf("interrupted reset = %v, want injected crash", err)
+	}
+	successor := storage
+	successor.StorageGeneration = request.NewGeneration
+	successor.IntentRevision = request.Authority.IntentRevision
+	if _, err := engine.attachComputerDisk(t.Context(), successor,
+		testComputerAuthority("same-session", "same-session-fence", prior.BootSessionID)); err == nil ||
+		!strings.Contains(err.Error(), "preparation is not verified") {
+		t.Fatalf("half-prepared reset successor attachment = %v", err)
 	}
 }
 

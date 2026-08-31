@@ -237,7 +237,7 @@ heartbeats.
 | `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves OS identity; clone/import narrowly rekey it and may expand a larger filesystem. |
 | `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path outside the managed root. L1 has already committed the permanent custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, and manifest-digest evidence. |
 | `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A failure after ext4 may have expanded returns `computer_storage_grow_uncertain`, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
-| `PreflightComputerReimage` | Session-authorized exact current Storage generation, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. It requires positive detachment evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived evidence before L1 may publish the staging projection. |
+| `PreflightComputerReimage` | Session-authorized exact current Storage generation and byte budget, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. Under the generation flock it requires real detachment or explicit verified never-attached reset-preparation evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived success or closed stage/reason failure evidence before L1 may publish or refuse the staging projection. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend. A refused payload listener is a typed, attempt-scoped `engine_failure` and does not invalidate the healthy helper session, so readiness can observe withdrawal and retry republication. Only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
@@ -699,7 +699,30 @@ digest and verifies its manifest platform before reading image-user metadata.
 It reads the detached ext4 root UID:GID without following tenant paths, refuses
 an ownership mismatch unless the durable operation explicitly carries `chown`,
 and binds the receipt to both Jobs, the operation revision/fence, Node,
-managed-root instance, helper generation, and consumed detachment receipt.
+managed-root instance, helper generation, and one explicit Storage proof kind:
+`computer_reimage_detachment` carries the real reap/sweep receipt plus its
+historical attempt and fence, while `computer_reimage_reset_preparation`
+carries only the verified never-attached reset-preparation receipt. Reset
+preparation is never recast as an invented detachment attempt.
+
+The operation takes the exact generation flock while it reads the manifest,
+verifies the manifest's durable byte budget, and reads the ext4 root owner. It
+releases that flock before publishing the receipt. The whole helper operation,
+including context-free filesystem reads executed behind cancellable joins, has
+a 10-second deadline. The tagged native lane logs the measured helper duration
+for each reimage; its 160 MiB acceptance disk metadata path is expected to stay
+below 100 milliseconds, leaving two orders of magnitude of deadline headroom
+without widening the four-minute end-to-end Computer transition budget.
+
+Every refusal is a `computer_reimage_preflight_failed_unchanged` receipt with
+one closed stage and a bounded reason. The stage vocabulary is exactly
+`generation_lock`, `manifest_read`, `allocation_verify`, `receipt_create`,
+`image_identity`, `image_config`, `image_owner`, `disk_owner`, and
+`ownership_match`. Reasons are `operation_failed`, `deadline_exceeded`,
+`detachment_required`, `image_unavailable`, or
+`image_platform_unsupported`. L1 accepts these fail-closed receipts, releases
+the refused staging projection, and surfaces the stage and reason on the
+stopped current Job instead of redispatching the operation indefinitely.
 If the exact digest is unavailable or has no manifest for the bound Node's
 platform, the helper returns a typed `failed_unchanged` receipt only after the
 same detachment and disk-allocation checks. L1 then retires the refused staging

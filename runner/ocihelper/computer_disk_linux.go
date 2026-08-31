@@ -90,6 +90,8 @@ func (engine *ContainerdEngine) computerDiskSystem() computerDiskSystem {
 }
 
 func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage ComputerStorageReference, authority AttemptAuthority) (_ *computerDiskAttachment, err error) {
+	engine.computerReimageMu.Lock()
+	defer engine.computerReimageMu.Unlock()
 	if storage.DiskBytes <= 0 || storage.IntentRevision < 1 {
 		return nil, errors.New("Computer disk requires a positive allocation")
 	}
@@ -138,6 +140,9 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		}
 		if manifest.Pending != nil {
 			return nil, errors.New("Computer Storage generation has an unresolved pending attachment")
+		}
+		if manifest.Preparation != nil && manifest.PreparationReceipt == nil {
+			return nil, errors.New("Computer Storage reset preparation is not verified for attachment")
 		}
 		// An authority manifest with no attachment history is the durable first-
 		// allocation checkpoint. It may be resumed whether the image rename has
@@ -351,6 +356,8 @@ func (engine *ContainerdEngine) quarantineComputerDiskCleanup(request DeleteMana
 }
 
 func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageReference, removal ManagedVolumeRemovalAuthority) error {
+	engine.computerReimageMu.Lock()
+	defer engine.computerReimageMu.Unlock()
 	name, err := deterministicComputerDiskName(storage)
 	if err != nil {
 		return err
@@ -1061,6 +1068,14 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 		// recreate it; retaining a half-published image would instead make startup
 		// verification fail closed forever on allocation_mismatch/image_missing.
 		if unverifiedComputerStorageResetPreparation(manifest) {
+			expectedName, identityErr := deterministicComputerDiskName(manifest.Storage)
+			if identityErr != nil || expectedName != entry.Name() || manifest.DiskImage != "disk.ext4" ||
+				manifest.MountDirectory != entry.Name() || manifest.Storage.StorageGeneration < 2 {
+				// A preparation-shaped record with corrupted directory, image, or
+				// generation identity is retained as an inventory anomaly. It is not
+				// safe to reinterpret it as the exact disposable reset successor.
+				continue
+			}
 			lock, lockErr := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 			if lockErr != nil {
 				return lockErr

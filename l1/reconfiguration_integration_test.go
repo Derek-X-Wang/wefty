@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,7 +42,8 @@ func acknowledgeReimagePreflight(t *testing.T, h *integrationHarness, node Node,
 		OperationFence: directive.OperationFence, TargetDigest: *directive.TargetImage.Digest,
 		PlatformOS: "linux", PlatformArchitecture: "amd64", ImageUID: 1000, ImageGID: 1000,
 		DiskRootUID: 1000, DiskRootGID: 1000, DetachmentReceiptID: "detach-" + attemptID,
-		DetachmentAttemptID: attemptID, DetachmentFencingToken: fencingToken, HelperGeneration: 7}
+		StorageEvidenceKind: computerReimageDetachmentEvidenceKind, DetachmentAttemptID: attemptID,
+		DetachmentFencingToken: fencingToken, HelperGeneration: 7}
 	if _, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
 		computerID, ComputerReimagePreflightAcknowledgementRequest{NodeID: node.NodeID,
 			BootSessionID: node.BootSessionID, IdempotencyKey: "ack-" + directive.OperationFence,
@@ -61,6 +63,7 @@ func TestComputerReimagePreflightReceiptFailsEveryNegativeRow(t *testing.T) {
 		OperationFence: row.OperationFence, TargetDigest: row.TargetDigest, PlatformOS: "linux",
 		PlatformArchitecture: "amd64", ImageUID: 1000, ImageGID: 1000, DiskRootUID: 1000,
 		DiskRootGID: 1000, DetachmentReceiptID: "detach", DetachmentAttemptID: "attempt",
+		StorageEvidenceKind:    computerReimageDetachmentEvidenceKind,
 		DetachmentFencingToken: "attempt-fence", HelperGeneration: 9}
 	mutations := []struct {
 		name   string
@@ -98,6 +101,15 @@ func TestComputerReimagePreflightReceiptFailsEveryNegativeRow(t *testing.T) {
 				t.Fatal("mutated reimage preflight receipt passed")
 			}
 		})
+	}
+	resetPreparation := valid
+	resetPreparation.StorageEvidenceKind = computerReimageResetEvidenceKind
+	resetPreparation.DetachmentReceiptID = ""
+	resetPreparation.DetachmentAttemptID = ""
+	resetPreparation.DetachmentFencingToken = ""
+	resetPreparation.ResetPreparationReceiptID = "reset-preparation"
+	if err := validateComputerReimagePreflight(row, resetPreparation, "linux", "amd64"); err != nil {
+		t.Fatalf("explicit reset-preparation evidence was rejected: %v", err)
 	}
 }
 
@@ -221,15 +233,19 @@ func TestComputerReimageFailedDigestKeepsPriorProjectionOperable(t *testing.T) {
 		t.Fatalf("reimage directives = %#v err=%v", directives, err)
 	}
 	directive := directives[0]
+	if directive.DiskBytes != computer.DesiredDiskBytes {
+		t.Fatalf("reimage directive disk_bytes = %d, want durable generation budget %d", directive.DiskBytes, computer.DesiredDiskBytes)
+	}
 	receipt := ComputerReimagePreflightReceipt{Kind: computerReimagePreflightFailedReceiptKind,
 		ReceiptID: "failed-" + directive.OperationFence, ComputerID: directive.ComputerID,
 		StorageID: directive.StorageID, StorageGeneration: directive.StorageGeneration,
 		OldJobID: directive.OldJobID, StagingJobID: directive.StagingJobID, NodeID: directive.BoundNodeID,
 		RootInstanceID: directive.RootInstanceID, OperationRevision: directive.OperationRevision,
 		OperationFence: directive.OperationFence, TargetDigest: *directive.TargetImage.Digest,
-		PlatformOS: "linux", PlatformArchitecture: "amd64", DetachmentReceiptID: "detach",
-		DetachmentAttemptID: "attempt", DetachmentFencingToken: "attempt-fence", HelperGeneration: 7,
-		FailureCode: string(contract.SpawnFailureImageUnavailable)}
+		PlatformOS: "linux", PlatformArchitecture: "amd64", StorageEvidenceKind: computerReimageDetachmentEvidenceKind,
+		DetachmentReceiptID: "detach", DetachmentAttemptID: "attempt", DetachmentFencingToken: "attempt-fence",
+		HelperGeneration: 7, FailureCode: string(contract.SpawnFailureImageUnavailable),
+		FailureStage: "image_identity", FailureReason: "image_unavailable"}
 	failed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
 		computer.ComputerID, ComputerReimagePreflightAcknowledgementRequest{NodeID: node.NodeID,
 			BootSessionID: node.BootSessionID, IdempotencyKey: "ack-failed-digest", Receipt: receipt})
@@ -266,6 +282,30 @@ func TestComputerReimageFailedDigestKeepsPriorProjectionOperable(t *testing.T) {
 		WHERE computer_id=? AND job_id<>? AND retired_ns IS NULL`, computer.ComputerID, oldJobID).Scan(&retrySpecRevision); err != nil ||
 		retrySpecRevision != oldSpecRevision+2 {
 		t.Fatalf("retry spec revision = %d err=%v", retrySpecRevision, err)
+	}
+	directives, err = h.store.ListNodeComputerReimagePreflightDirectives(t.Context(),
+		"fabric-"+node.NodeID, node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("retry reimage directives = %#v err=%v", directives, err)
+	}
+	directive = directives[0]
+	receipt = ComputerReimagePreflightReceipt{Kind: computerReimagePreflightFailedReceiptKind,
+		ReceiptID: "failed-allocation-" + directive.OperationFence, ComputerID: directive.ComputerID,
+		StorageID: directive.StorageID, StorageGeneration: directive.StorageGeneration,
+		OldJobID: directive.OldJobID, StagingJobID: directive.StagingJobID, NodeID: directive.BoundNodeID,
+		RootInstanceID: directive.RootInstanceID, OperationRevision: directive.OperationRevision,
+		OperationFence: directive.OperationFence, TargetDigest: *directive.TargetImage.Digest,
+		PlatformOS: "linux", PlatformArchitecture: "amd64", HelperGeneration: 8,
+		FailureCode: string(contract.SpawnFailureReimagePreflight), FailureStage: "allocation_verify",
+		FailureReason: "operation_failed"}
+	failed, err = h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+		computer.ComputerID, ComputerReimagePreflightAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: "ack-failed-allocation", Receipt: receipt})
+	if err != nil || json.Unmarshal(failed.CurrentJob.LastFailure, &failure) != nil ||
+		failure.Code != contract.SpawnFailureReimagePreflight ||
+		!strings.Contains(failure.Message, "allocation_verify: operation_failed") ||
+		failed.ReconfigurationPhase != ComputerReconfigurationStable {
+		t.Fatalf("typed mechanics failure = %#v failure=%#v err=%v", failed, failure, err)
 	}
 }
 

@@ -342,9 +342,8 @@ jobs:
             if IFS= read -r action < /tmp/wefty-oci-faults/control; then
               case "$action" in
                 kill-shim)
-                  shim_pid="$(pgrep -f 'containerd-shim-runc-v2.*-namespace wefty' | head -n 1)"
-                  test -n "$shim_pid"
-                  kill -KILL "$shim_pid"
+                  printf '%s\n' 'kill-shim requires an exact workload Job binding' > "/tmp/wefty-oci-faults/$action.failed"
+                  continue
                   ;;
                 kill-payload:*|kill-shim:*)
                   job_id="${action#*:}"

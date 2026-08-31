@@ -710,6 +710,7 @@ const (
 	SpawnFailureInsufficientMemory         SpawnFailureCode = "insufficient_memory"
 	SpawnFailureInsufficientDisk           SpawnFailureCode = "insufficient_disk"
 	SpawnFailureReconfigurationAborted     SpawnFailureCode = "reconfiguration_aborted"
+	SpawnFailureReimagePreflight           SpawnFailureCode = "computer_reimage_preflight_failed"
 	SpawnFailurePassUnavailable            SpawnFailureCode = "pass_unavailable"
 )
 

@@ -814,7 +814,7 @@
       "post": {
         "operationId": "acknowledgeComputerReimagePreflight",
         "summary": "Accept assertion-derived Computer reimage preflight evidence",
-        "description": "The authenticated current node submits helper evidence binding the exact managed-root instance, old and staging Jobs, operation revision and fence, target digest and platform, image and disk-root ownership, and positive detachment receipt. A typed image failure proves the detached disk remained unchanged and releases the refused staging projection.",
+        "description": "The authenticated current node submits helper evidence binding the exact managed-root instance, old and staging Jobs, operation revision and fence, target digest and platform, image and disk-root ownership, and either positive detachment or verified reset-preparation evidence. Every bounded preflight refusal carries a closed stage and reason so L1 can release the refused staging projection with typed status instead of redispatching indefinitely.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
@@ -824,7 +824,7 @@
             "idempotency_key": { "type": "string", "minLength": 1 },
             "receipt": {
               "type": "object", "additionalProperties": false,
-              "required": ["kind", "receipt_id", "computer_id", "storage_id", "storage_generation", "old_job_id", "staging_job_id", "node_id", "root_instance_id", "operation_revision", "operation_fence", "target_digest", "platform_os", "platform_architecture", "image_uid", "image_gid", "disk_root_uid", "disk_root_gid", "detachment_receipt_id", "detachment_attempt_id", "detachment_fencing_token", "helper_generation", "failure_code"],
+              "required": ["kind", "receipt_id", "computer_id", "storage_id", "storage_generation", "old_job_id", "staging_job_id", "node_id", "root_instance_id", "operation_revision", "operation_fence", "target_digest", "platform_os", "platform_architecture", "image_uid", "image_gid", "disk_root_uid", "disk_root_gid", "storage_evidence_kind", "detachment_receipt_id", "detachment_attempt_id", "detachment_fencing_token", "reset_preparation_receipt_id", "helper_generation", "failure_code", "failure_stage", "failure_reason"],
               "properties": {
                 "kind": { "enum": ["computer_reimage_preflight_verified", "computer_reimage_preflight_failed_unchanged"] },
                 "receipt_id": { "type": "string", "minLength": 1 },
@@ -844,11 +844,15 @@
                 "image_gid": { "type": "integer", "minimum": 0 },
                 "disk_root_uid": { "type": "integer", "minimum": 0 },
                 "disk_root_gid": { "type": "integer", "minimum": 0 },
-                "detachment_receipt_id": { "type": "string", "minLength": 1 },
-                "detachment_attempt_id": { "type": "string", "minLength": 1 },
-                "detachment_fencing_token": { "type": "string", "minLength": 1 },
+                "storage_evidence_kind": { "type": "string", "enum": ["", "computer_reimage_detachment", "computer_reimage_reset_preparation"] },
+                "detachment_receipt_id": { "type": "string" },
+                "detachment_attempt_id": { "type": "string" },
+                "detachment_fencing_token": { "type": "string" },
+                "reset_preparation_receipt_id": { "type": "string" },
                 "helper_generation": { "type": "integer", "minimum": 1 },
-                "failure_code": { "type": "string", "enum": ["", "image_unavailable", "image_platform_unsupported"] }
+                "failure_code": { "type": "string", "enum": ["", "image_unavailable", "image_platform_unsupported", "computer_reimage_preflight_failed"] },
+                "failure_stage": { "type": "string", "enum": ["", "generation_lock", "manifest_read", "allocation_verify", "receipt_create", "image_identity", "image_config", "image_owner", "disk_owner", "ownership_match"] },
+                "failure_reason": { "type": "string", "enum": ["", "operation_failed", "deadline_exceeded", "detachment_required", "image_unavailable", "image_platform_unsupported"] }
               }
             }
           }
