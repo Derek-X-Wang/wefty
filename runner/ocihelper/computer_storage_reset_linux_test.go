@@ -89,6 +89,52 @@ func TestComputerStorageResetMarksSuccessorFreshForFirstAttach(t *testing.T) {
 	}
 }
 
+func TestComputerStorageResetFreshnessSurvivesFailedFirstAttach(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	prior := testComputerAuthority("attempt-a", "fence-a", "boot-a")
+	request := resetTestRequest(storage, prior)
+	request.Storage.IntentRevision = request.Authority.IntentRevision
+	if _, err := engine.ResetComputerStorage(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	successor := storage
+	successor.StorageGeneration = request.NewGeneration
+	successor.IntentRevision = request.Authority.IntentRevision
+	injected := errors.New("injected pending attach failure")
+	engine.computerDiskHook = func(checkpoint computerDiskCheckpoint) error {
+		if checkpoint == computerDiskPendingBeforeAttach {
+			return injected
+		}
+		return nil
+	}
+	if _, err := engine.attachComputerDisk(t.Context(), successor,
+		testComputerAuthority("attempt-b", "fence-b", "boot-a")); !errors.Is(err, injected) {
+		t.Fatalf("injected first attach = %v", err)
+	}
+	name, err := deterministicComputerDiskName(successor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, present, err := readComputerDiskManifest(filepath.Join(root, "computer-disks", name, "attachment.json"))
+	if err != nil || !present || !manifest.Prepared || manifest.Preparation == nil || manifest.PreparationReceipt == nil {
+		t.Fatalf("failed attach freshness = %#v present=%t err=%v", manifest, present, err)
+	}
+	engine.computerDiskHook = nil
+	attachment, err := engine.attachComputerDisk(t.Context(), successor,
+		testComputerAuthority("attempt-c", "fence-c", "boot-a"))
+	if err != nil || !attachment.fresh {
+		t.Fatalf("retried reset successor attach = %+v err=%v", attachment, err)
+	}
+	manifest, present, err = readComputerDiskManifest(filepath.Join(root, "computer-disks", name, "attachment.json"))
+	if err != nil || !present || manifest.Attached == nil || manifest.Prepared ||
+		manifest.Preparation != nil || manifest.PreparationReceipt != nil {
+		t.Fatalf("attached successor freshness was not atomically consumed = %#v present=%t err=%v", manifest, present, err)
+	}
+}
+
 func TestComputerStorageResetResumesEveryPreparationBoundaryThenUsesSharedRemoval(t *testing.T) {
 	for _, checkpoint := range []computerStorageResetPhase{
 		computerStorageResetRetirementFenced,

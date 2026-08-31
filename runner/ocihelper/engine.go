@@ -17,6 +17,16 @@ var ErrTaskAlreadyTerminated = errors.New("OCI task already terminated")
 
 var errComputerStorageAttachmentOwned = errors.New("Computer Storage generation already has an attachment owner")
 
+// ComputerStorageGrowUncertainError means the filesystem may already have
+// expanded and the same durable grow authority must inspect and resume it.
+type ComputerStorageGrowUncertainError struct{ Cause error }
+
+func (err *ComputerStorageGrowUncertainError) Error() string {
+	return "Computer Storage grow requires authoritative retry: " + err.Cause.Error()
+}
+
+func (err *ComputerStorageGrowUncertainError) Unwrap() error { return err.Cause }
+
 // NativeEngineConfig contains only host-side helper configuration. The agent
 // never supplies these values over the helper protocol.
 type NativeEngineConfig struct {

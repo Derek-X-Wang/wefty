@@ -236,6 +236,38 @@ func TestComputerGrowENOSPCRollsBackDeltaAndReturnsReceipt(t *testing.T) {
 	}
 }
 
+func TestComputerGrowPostExpansionAllocationFailureIsUncertainAndNeverTruncates(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root},
+		capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt),
+		computerGrowResize: func(_ context.Context, path, _ string, _, newBytes int64) error {
+			return os.Truncate(path, newBytes)
+		},
+		computerGrowFilesystemBytes: func(context.Context, string) (int64, error) { return request.NewDiskBytes, nil },
+		computerGrowAllocate:        func(string, int64) error { return unix.ENOSPC },
+	}
+	response, err := engine.GrowComputerStorage(t.Context(), request)
+	var uncertain *ComputerStorageGrowUncertainError
+	if !errors.As(err, &uncertain) || response.Receipt.Kind == "computer_storage_grow_failed_unchanged" {
+		t.Fatalf("post-expansion allocation failure = %#v err=%v, want uncertain outcome", response, err)
+	}
+	if info, statErr := os.Stat(imagePath); statErr != nil || info.Size() != request.NewDiskBytes {
+		t.Fatalf("post-expansion image was truncated: size=%v err=%v", info, statErr)
+	}
+	reservation := engine.capacityReservations[request.Authority.JobID]
+	if reservation == nil || reservation.diskBytes != request.Storage.DiskBytes ||
+		reservation.pendingDiskBytes != request.NewDiskBytes-request.Storage.DiskBytes {
+		t.Fatalf("uncertain grow lost resumable reservation: %#v", reservation)
+	}
+	engine.computerGrowAllocate = nil
+	response, err = engine.GrowComputerStorage(t.Context(), request)
+	if err != nil || !response.Receipt.Applied || response.Receipt.Kind != "computer_storage_grow_applied" {
+		t.Fatalf("uncertain grow retry = %#v err=%v", response, err)
+	}
+}
+
 func TestComputerGrowHeldDeltaChargesOnlyNewcomer(t *testing.T) {
 	root := t.TempDir()
 	available, err := filesystemAvailableBytes(root)

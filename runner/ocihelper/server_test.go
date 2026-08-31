@@ -533,7 +533,7 @@ func TestComputerAttachmentConflictDoesNotInvalidateSession(t *testing.T) {
 	request.AllocateEndpoints = []string{contract.ComputerDisplayEndpointView, contract.ComputerDisplayEndpointControl}
 	_, err = session.Run(t.Context(), request)
 	var refusal *RPCError
-	if !errors.As(err, &refusal) || refusal.Code != CodeUnauthorizedAttempt {
+	if !errors.As(err, &refusal) || refusal.Code != CodeComputerStorageBusy {
 		t.Fatalf("Computer attachment conflict = %+v err=%v, want attempt-scoped refusal", refusal, err)
 	}
 	if session.HealthError() != nil {
@@ -541,6 +541,68 @@ func TestComputerAttachmentConflictDoesNotInvalidateSession(t *testing.T) {
 	}
 	if _, err := session.Verify(t.Context(), VerifyRequest{Scope: VerifyNamespace}); err != nil {
 		t.Fatalf("helper session unusable after Computer attachment conflict: %v", err)
+	}
+}
+
+func TestComputerAttachmentConflictWithoutPositiveReapIsNotDefinitive(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runErr = fmt.Errorf("attach Computer disk: %w", errComputerStorageAttachmentOwned)
+	engine.attemptReapErr = errors.New("attempt cleanup failed")
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.Authority.Class = contract.JobClassService
+	request.Workload.Computer = true
+	request.Workload.Limits.MemoryBytes = 64 << 20
+	request.Workload.ManagedVolumes = []ManagedVolumeDescriptor{{
+		Kind: ManagedVolumeComputerDisk,
+		ComputerStorage: &ComputerStorageReference{
+			ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 32 << 20,
+		},
+	}}
+	request.AllocateEndpoints = []string{contract.ComputerDisplayEndpointView, contract.ComputerDisplayEndpointControl}
+	_, err = session.Run(t.Context(), request)
+	var refusal *RPCError
+	if !errors.As(err, &refusal) || refusal.Code != CodeSessionStale {
+		t.Fatalf("Computer attachment conflict without positive reap = %+v err=%v, want runtime-loss refusal", refusal, err)
+	}
+}
+
+type uncertainGrowTestEngine struct{ *fakeEngine }
+
+func (engine *uncertainGrowTestEngine) GrowComputerStorage(context.Context, GrowComputerStorageRequest) (GrowComputerStorageResponse, error) {
+	return GrowComputerStorageResponse{}, &ComputerStorageGrowUncertainError{Cause: errors.New("allocation reassertion failed")}
+}
+
+func TestComputerStorageGrowUncertainIsTypedAndDoesNotInvalidateSession(t *testing.T) {
+	engine := &uncertainGrowTestEngine{fakeEngine: newFakeEngine()}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	handshake := session.Handshake()
+	_, err = session.GrowComputerStorage(t.Context(), GrowComputerStorageRequest{
+		Storage:      ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, IntentRevision: 2, DiskBytes: 8 << 20},
+		NewDiskBytes: 16 << 20,
+		Authority: ComputerStorageGrowAuthority{NodeID: "node-1", BootSessionID: "boot-1",
+			HelperGeneration: handshake.SessionGeneration, RootInstanceID: "root", JobID: "job", OperationRevision: 2, OperationFence: "fence"},
+	})
+	var refusal *RPCError
+	if !errors.As(err, &refusal) || refusal.Code != CodeComputerStorageGrowUncertain {
+		t.Fatalf("uncertain Computer grow = %+v err=%v", refusal, err)
+	}
+	if session.HealthError() != nil {
+		t.Fatalf("uncertain Computer grow invalidated helper session: %v", session.HealthError())
 	}
 }
 
@@ -2436,6 +2498,7 @@ type fakeEngine struct {
 	lastRunRequest           RunRequest
 	runErr                   error
 	deleteErr                error
+	attemptReapErr           error
 	managedVolumeErr         error
 	runEntered               chan struct{}
 	releaseRun               chan struct{}
@@ -3064,9 +3127,10 @@ func (engine *fakeEngine) DialHostBridge(_ context.Context, _ DialHostBridgeRequ
 }
 func (engine *fakeEngine) ReapAttempt(_ context.Context, authority AttemptAuthority) error {
 	engine.mu.Lock()
+	err := engine.attemptReapErr
 	engine.attemptReaps = append(engine.attemptReaps, authority)
 	engine.mu.Unlock()
-	return nil
+	return err
 }
 func (engine *fakeEngine) ReapSession(_ context.Context, identity SessionIdentity) (SweepResponse, error) {
 	engine.mu.Lock()

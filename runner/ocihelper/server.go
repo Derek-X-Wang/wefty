@@ -1104,9 +1104,14 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			if errors.As(err, &rpcErr) {
 				_ = writeRPCError(wire, rpcErr)
 			} else if errors.Is(err, errComputerStorageAttachmentOwned) {
-				// A live owner refusing a second Computer attachment is an
-				// attempt-scoped admission result, not loss of helper authority.
-				_ = writeFailure(wire, CodeUnauthorizedAttempt, errComputerStorageAttachmentOwned.Error())
+				if reapErr == nil {
+					// A live owner refusing a second Computer attachment is an
+					// attempt-scoped admission result only after the helper has
+					// positively reaped the losing attempt's runtime resources.
+					_ = writeFailure(wire, CodeComputerStorageBusy, errComputerStorageAttachmentOwned.Error())
+				} else {
+					_ = writeFailure(wire, CodeSessionStale, "Computer Storage conflict cleanup could not verify runtime absence")
+				}
 			} else if errors.As(err, &specRejection) {
 				_ = writeFailure(wire, CodeOCISpecRejected, "OCI runtime spec was rejected")
 			} else if errors.As(err, &serviceDataRejection) {
@@ -1359,7 +1364,12 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		operation.monitorEOF()
 		response, err := engine.GrowComputerStorage(operation.ctx, body)
-		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
+		var uncertain *ComputerStorageGrowUncertainError
+		if errors.As(err, &uncertain) {
+			_ = writeFailure(wire, CodeComputerStorageGrowUncertain, uncertain.Error())
+		} else {
+			_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
+		}
 	case MethodPreflightReimage:
 		var body PreflightComputerReimageRequest
 		if !decodeRequest(wire, request.Body, &body) {

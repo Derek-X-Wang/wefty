@@ -227,19 +227,16 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 			return nil, err
 		}
 	}
-	// Reset prepares and publishes the successor image before its first attach.
-	// Its bytes therefore exist, but its empty filesystem root is still fresh
-	// and must receive the resolved image user's ownership exactly once.
-	freshRoot := createdImage || manifest.Prepared
+	// Only Reset's verified preparation proves an existing image still contains
+	// a freshly formatted empty filesystem. Copy and grow also publish Prepared
+	// manifests, but their bytes are already tenant-owned.
+	freshRoot := createdImage || (manifest.Prepared && manifest.PreparationReceipt != nil)
 	{
 		previousDetachment := manifest.PreviousDetachment
 		storage.DiskBytes = manifest.Storage.DiskBytes
 		manifest.Storage = storage
 		manifest.Pending = &authority
 		manifest.PreviousDetachment = nil
-		manifest.Prepared = false
-		manifest.Preparation = nil
-		manifest.PreparationReceipt = nil
 		if err = writeComputerDiskManifest(diskRoot, manifest); err != nil {
 			return nil, err
 		}

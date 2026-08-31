@@ -288,6 +288,43 @@ func TestComputerDiskRootOwnershipInitializesOnlyFreshFormat(t *testing.T) {
 	}
 }
 
+func TestPreparedTenantDataIsNotFreshComputerStorage(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	name, err := deterministicComputerDiskName(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	imagePath := filepath.Join(diskRoot, "disk.ext4")
+	if err := os.WriteFile(imagePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.allocateAndFormat(t.Context(), imagePath, storage.DiskBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeComputerDiskManifest(diskRoot, computerDiskManifest{
+		Version: computerDiskManifestVersion, Storage: storage, DiskImage: "disk.ext4", MountDirectory: name, Prepared: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, testComputerAuthority("attempt", "fence", "boot-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachment.fresh {
+		t.Fatal("copy/grow prepared tenant data was classified as a fresh empty filesystem")
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestComputerDiskOwnershipMigrationNeverFollowsSymlinks(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
