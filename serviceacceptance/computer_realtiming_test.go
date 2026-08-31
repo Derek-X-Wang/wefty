@@ -330,7 +330,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision && current.DesiredDiskBytes == 160<<20
 	})
 	reset := runComputerCLI[l1.Computer](t, harness, false, "services", "reset", resized.ComputerID,
-		"--expect-current", "--idempotency-key", "linux-native-reset")
+		"--expect-current", "--idempotency-key", "linux-native-reset", "--terminate-sessions")
 	resetIntent := reset.IntentRevision
 	resetCrashObserved := false
 	if !mutatingLinuxComputerRow("linux.reconfiguration") {

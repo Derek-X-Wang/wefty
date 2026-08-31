@@ -1305,7 +1305,12 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 			},
 		}
 	}
-	first := request("a", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' && grep -q ' /wefty/control tmpfs ' /proc/mounts && test ! -w /wefty/control/driver.json || exit 18; test "$(stat -c %a /dev/shm)" = 1777 || exit 20; awk '$2 == "/dev/shm" && $3 == "tmpfs" && index("," $4 ",", ",nosuid,") && index("," $4 ",", ",nodev,") && index("," $4 ",", ",noexec,") && index($4, "size=1048576k") { found=1 } END { exit !found }' /proc/mounts || exit 21; before=$(cat /sys/fs/cgroup/memory.current) || exit 22; dd if=/dev/zero of=/dev/shm/wefty-memory-charge bs=1048576 count=16 2>/dev/null || exit 23; after=$(cat /sys/fs/cgroup/memory.current) || exit 24; test "$after" -gt "$before" || exit 25; rm /dev/shm/wefty-memory-charge || exit 26; for i in $(seq 1 50); do test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' && break; sleep .1; done; test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' || exit 19; printf computer-disk-marker > /wefty/service/marker; sync; printf 'computer-disk-ready\n'; exec sleep 60`})
+	// Keep the long-lived ownership attempt focused on the control-state
+	// handshake and readiness marker. The successor attempt below performs the
+	// one-shot /dev/shm and cgroup charge assertions before its distinguished
+	// exit, so an unrelated profile assertion cannot silently prevent this
+	// attempt from publishing the readiness line needed to kill the helper.
+	first := request("a", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' || { printf 'initial driver state mismatch\n' >&2; exit 18; }; i=0; while test "$i" -lt 50; do test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' && break; i=$((i + 1)); sleep .1; done; test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' || { printf 'human-driving state not observed\n' >&2; exit 19; }; printf computer-disk-marker > /wefty/service/marker || { printf 'persistent marker write failed\n' >&2; exit 27; }; sync || { printf 'persistent marker sync failed\n' >&2; exit 28; }; printf 'computer-disk-ready\n'; exec sleep 60`})
 	firstResponse, err := session.Run(ctx, first)
 	if err != nil {
 		t.Fatal(err)
@@ -1344,7 +1349,7 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	// delayed allocation can accept every buffered write and surface ENOSPC only
 	// after the process exits. The helper intentionally leaves DiskExhausted
 	// absent because payload stderr and an exit code are not runtime observation.
-	second := request("c", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' || exit 30; test "$(cat /wefty/service/marker)" = computer-disk-marker || exit 33; dd if=/dev/zero of=/wefty/service/fill bs=1048576 count=64 conv=fsync 2>/tmp/disk-error && exit 31; grep -q 'No space left on device' /tmp/disk-error || exit 32; exit 42`})
+	second := request("c", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' || exit 30; test "$(stat -c %a /dev/shm)" = 1777 || exit 20; awk '$2 == "/dev/shm" && $3 == "tmpfs" && index("," $4 ",", ",nosuid,") && index("," $4 ",", ",nodev,") && index("," $4 ",", ",noexec,") && index($4, "size=1048576k") { found=1 } END { exit !found }' /proc/mounts || exit 21; before=$(cat /sys/fs/cgroup/memory.current) || exit 22; dd if=/dev/zero of=/dev/shm/wefty-memory-charge bs=1048576 count=16 2>/dev/null || exit 23; after=$(cat /sys/fs/cgroup/memory.current) || exit 24; test "$after" -gt "$before" || exit 25; rm /dev/shm/wefty-memory-charge || exit 26; test "$(cat /wefty/service/marker)" = computer-disk-marker || exit 33; dd if=/dev/zero of=/wefty/service/fill bs=1048576 count=64 conv=fsync 2>/tmp/disk-error && exit 31; grep -q 'No space left on device' /tmp/disk-error || exit 32; exit 42`})
 	if _, err := session.Run(ctx, second); err != nil {
 		t.Fatalf("real Computer attempt C did not consume A's helper-sweep detachment: %v", err)
 	}
@@ -1471,18 +1476,25 @@ func waitForNativeAttemptLog(t *testing.T, ctx context.Context, session *ocihelp
 	case err := <-watchDone:
 		cancelWatch()
 		if !bytes.Contains(stdout.Bytes(), needle) {
-			t.Fatalf("native attempt ended before readiness log %q: watch_err=%v result=%+v stdout=%q stderr=%q seals=%+v gaps=%+v",
-				needle, err, result, stdout.String(), stderr.String(), seals, gaps)
+			t.Fatalf("native attempt ended before readiness log %q: watch_err=%v result=%+v exit_code=%d stdout=%q stderr=%q seals=%+v gaps=%+v",
+				needle, err, result, nativeAttemptExitCode(result), stdout.String(), stderr.String(), seals, gaps)
 		}
 	case <-watchContext.Done():
 		cancelWatch()
 		err := <-watchDone
-		t.Fatalf("native attempt did not emit readiness log %q: watch_err=%v result=%+v stdout=%q stderr=%q seals=%+v gaps=%+v",
-			needle, err, result, stdout.String(), stderr.String(), seals, gaps)
+		t.Fatalf("native attempt did not emit readiness log %q: watch_err=%v result=%+v exit_code=%d stdout=%q stderr=%q seals=%+v gaps=%+v",
+			needle, err, result, nativeAttemptExitCode(result), stdout.String(), stderr.String(), seals, gaps)
 	}
 	if err := session.HealthError(); err != nil {
 		t.Fatalf("caller-canceled readiness Watch invalidated helper session: %v", err)
 	}
+}
+
+func nativeAttemptExitCode(result *ocihelper.WatchResponse) int {
+	if result == nil || result.ExitCode == nil {
+		return -1
+	}
+	return *result.ExitCode
 }
 
 func assertNativeComputerSweepReceipt(t *testing.T, receipt ocihelper.VerifiedSweepReceipt, retainedBaseline, expectedRetained ocihelper.ResourceInventory) nativeResidueEvidence {
