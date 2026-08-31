@@ -59,8 +59,21 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	reference := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_REFERENCE")
 	digest := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_DIGEST")
 	archive := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_ARCHIVE")
+	variant := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_VARIANT")
+	reimagePrefix := "WEFTY_OCI_WAYLAND_COMPUTER_"
+	if variant == "wayland" {
+		reimagePrefix = "WEFTY_OCI_XFCE_COMPUTER_"
+	} else if variant != "xfce" {
+		t.Fatalf("unknown Computer matrix variant %q", variant)
+	}
+	reimageReference := requiredComputerRealtimeEnvironment(t, reimagePrefix+"REFERENCE")
+	reimageDigest := requiredComputerRealtimeEnvironment(t, reimagePrefix+"DIGEST")
+	reimageArchive := requiredComputerRealtimeEnvironment(t, reimagePrefix+"ARCHIVE")
+	if reimageDigest == digest {
+		t.Fatalf("Computer reimage artifact aliases the current %s image digest %s", variant, digest)
+	}
 	imageRuntime := readPublishedComputerRuntimeReceipt(t, requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT"))
-	receipt.Image = linuxComputerImageEvidence{Variant: requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_COMPUTER_VARIANT"), Reference: reference, IndexDigest: digest,
+	receipt.Image = linuxComputerImageEvidence{Variant: variant, Reference: reference, IndexDigest: digest,
 		PlatformDigest: imageRuntime.Digest, Archive: filepath.Base(archive)}
 	candidate, err := exec.Command("git", "rev-parse", "HEAD").Output()
 	if err != nil || strings.TrimSpace(string(candidate)) == "" {
@@ -94,6 +107,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	importRealtimeProbeImage(t, requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_PROBE_ARCHIVE"),
 		helperSocket, helperChecksum, probeReference, probeDigest, recordBarrierResidue)
 	importRealtimeProbeImage(t, archive, helperSocket, helperChecksum, reference, digest, recordBarrierResidue)
+	importRealtimeProbeImage(t, reimageArchive, helperSocket, helperChecksum, reimageReference, reimageDigest, recordBarrierResidue)
 	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
 	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
 		t.Fatal(err)
@@ -167,9 +181,12 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	receipt.FabricIdentities = append(receipt.FabricIdentities,
 		linuxComputerFabricIdentity{Role: "administrator", FabricID: policy.Admins[0].FabricID, UserID: "linux-admin", DeviceID: "linux-admin-device-a"},
 		linuxComputerFabricIdentity{Role: "viewer", FabricID: viewGrant.Grant.FabricID, UserID: "linux-viewer", DeviceID: "linux-viewer-device"})
-	inputIsolation := proveLiveViewInputIsolation(t, harness, ready, "linux-viewer", "linux-viewer-device")
+	// L1 publishes the durable grant before the hosting agent can acknowledge
+	// and install that policy revision. Establish live viewer admission through
+	// the typed stale-policy retry path before the direct RFB isolation probe.
 	viewerView := startTakeoverViewCLI(t, evidence, harness, ready.ComputerID, "linux-viewer", "linux-viewer-device", takeoverViewRetryStalePolicy)
 	receipt.TakeoverRetryStderr = append(receipt.TakeoverRetryStderr, viewerView.toleratedStderr...)
+	inputIsolation := proveLiveViewInputIsolation(t, harness, ready, "linux-viewer", "linux-viewer-device")
 	viewerTakeDenied := runComputerCLIPersonExpectError(t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", ready.ComputerID, "--session-token-file", viewerView.tokenFile)
 	controlGrant := runComputerCLIPersonWithEvidence[l1.ComputerGrantMutationResult](t, evidence, "grant-cli-control.json", harness, "linux-admin", "linux-admin-device-a",
@@ -282,8 +299,16 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		})
 	}
 	assertLiveProfileMarker(t, restarted, profileMarker)
-	oldAuthorityRejected := runComputerCLIPersonExpectError(t, harness, "linux-viewer", "linux-viewer-device",
+	// The live-session file retains the old door's ephemeral endpoint. Present
+	// the unchanged bearer to the republished door so this row tests Node-lineage
+	// terminality rather than a TCP refusal from the dead listener.
+	oldSessionEndpoint, currentSessionEndpoint := retargetTakeoverSessionCapability(t, viewerControl.tokenFile, restarted.DisplayEndpoint)
+	oldAuthorityRejected := runComputerCLIPersonExpectControlError(t, harness, "linux-viewer", "linux-viewer-device",
 		"services", "takeover", "take", restarted.ComputerID, "--session-token-file", viewerControl.tokenFile)
+	oldSessionEndReason := ""
+	if oldAuthorityRejected.Receipt != nil {
+		oldSessionEndReason = oldAuthorityRejected.Receipt.SessionEndReason
+	}
 	recordComputerAuthority(receipt, restarted)
 	helperLossTerminalCode, helperLossTerminalID := "", ""
 	if helperLossTerminal != nil {
@@ -303,12 +328,14 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"agent_loss_fresh_attempt":       restarted.CurrentJob.CurrentAttemptID != beforeAgentLoss,
 		"same_storage_generation":        restarted.StorageID == oldStorage && restarted.StorageGeneration == oldGeneration,
 		"profile_marker_survived_losses": true,
-		"readiness_republished":          restarted.DisplayEndpoint != nil,
-		"old_session_authority_rejected": strings.Contains(oldAuthorityRejected, string(contract.ErrorTakeoverSessionEnded)),
+		"readiness_republished":          oldSessionEndpoint != currentSessionEndpoint,
+		"old_session_authority_rejected": oldAuthorityRejected.Error.Code == contract.ErrorTakeoverSessionEnded &&
+			oldAuthorityRejected.Receipt != nil && oldAuthorityRejected.Receipt.SessionEndReason == string(l1.ComputerTakeoverAttemptAuthorityLost),
 	}, map[string]string{"old_attempt_id": oldAttempt, "new_attempt_id": restarted.CurrentJob.CurrentAttemptID,
 		"storage_id": restarted.StorageID, "storage_generation": fmt.Sprint(restarted.StorageGeneration),
 		"profile_marker": filepath.Base(profileMarker), "helper_loss_terminal_attempt_id": helperLossTerminalID,
-		"helper_loss_terminal_code": helperLossTerminalCode})
+		"helper_loss_terminal_code": helperLossTerminalCode, "old_session_endpoint": oldSessionEndpoint,
+		"current_session_endpoint": currentSessionEndpoint, "old_session_end_reason": oldSessionEndReason})
 
 	receipt.begin("linux.reconfiguration")
 	resized := runComputerCLI[l1.Computer](t, harness, false, "services", "resize", restarted.ComputerID,
@@ -317,7 +344,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision && current.DesiredDiskBytes == 160<<20
 	})
 	reset := runComputerCLI[l1.Computer](t, harness, false, "services", "reset", resized.ComputerID,
-		"--expect-current", "--idempotency-key", "linux-native-reset")
+		"--expect-current", "--idempotency-key", "linux-native-reset", "--terminate-sessions")
 	resetIntent := reset.IntentRevision
 	resetCrashObserved := false
 	if !mutatingLinuxComputerRow("linux.reconfiguration") {
@@ -331,7 +358,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision && current.StorageGeneration > resized.StorageGeneration
 	})
 	reimaged := runComputerCLI[l1.Computer](t, harness, false, "services", "reimage", reset.ComputerID,
-		"--image", reference+"@"+digest, "--expect-current", "--idempotency-key", "linux-native-reimage")
+		"--image", reimageReference+"@"+reimageDigest, "--expect-current", "--idempotency-key", "linux-native-reimage")
 	reimaged = waitForComputerCLI(t, harness, reimaged.ComputerID, 4*time.Minute, func(current l1.Computer) bool {
 		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision &&
 			current.CurrentSpecRevision > reset.CurrentSpecRevision && computerDisplayPublished(current)
@@ -349,7 +376,8 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"stale_cas_rejected_live":     abortEvidence.StaleCASRejected,
 		"no_automatic_rollback_live":  abortEvidence.NoAutoRollback,
 	}, map[string]string{"intent_revision": fmt.Sprint(reimaged.IntentRevision), "spec_revision": fmt.Sprint(reimaged.CurrentSpecRevision),
-		"storage_generation": fmt.Sprint(reimaged.StorageGeneration), "aborted_computer_id": abortEvidence.ComputerID})
+		"storage_generation": fmt.Sprint(reimaged.StorageGeneration), "reimage_reference": reimageReference,
+		"reimage_digest": reimageDigest, "aborted_computer_id": abortEvidence.ComputerID})
 
 	receipt.begin("linux.storage_provenance")
 	backupOutput := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "backup", "create", reimaged.ComputerID,
@@ -770,6 +798,53 @@ func runComputerCLIPersonExpectControlError(
 		t.Fatalf("decode Computer control error %v: %v\n%s", arguments, decodeErr, output)
 	}
 	return response
+}
+
+func retargetTakeoverSessionCapability(t *testing.T, path string, endpoint *string) (string, string) {
+	t.Helper()
+	if endpoint == nil || strings.TrimSpace(*endpoint) == "" {
+		t.Fatal("Computer restart omitted its current display endpoint")
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read old Computer session capability: %v", err)
+	}
+	var capability struct {
+		Endpoint string `json:"endpoint"`
+		Token    string `json:"token"`
+	}
+	if err := json.Unmarshal(payload, &capability); err != nil || strings.TrimSpace(capability.Endpoint) == "" || strings.TrimSpace(capability.Token) == "" {
+		t.Fatalf("decode old Computer session capability: %v", err)
+	}
+	oldEndpoint := capability.Endpoint
+	capability.Endpoint = *endpoint
+	updated, err := json.Marshal(capability)
+	if err != nil {
+		t.Fatalf("encode retargeted Computer session capability: %v", err)
+	}
+	updated = append(updated, '\n')
+	if err := os.WriteFile(path, updated, 0o600); err != nil {
+		t.Fatalf("retarget old Computer session capability: %v", err)
+	}
+	return oldEndpoint, capability.Endpoint
+}
+
+func TestRetargetTakeoverSessionCapabilityPreservesOldBearer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(path, []byte(`{"endpoint":"ws://127.0.0.1:10001/wefty/computer/v1","token":"old-node-lineage-bearer"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current := "ws://127.0.0.1:10002/wefty/computer/v1"
+	old, updated := retargetTakeoverSessionCapability(t, path, &current)
+	var capability struct {
+		Endpoint string `json:"endpoint"`
+		Token    string `json:"token"`
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(payload, &capability) != nil || old != "ws://127.0.0.1:10001/wefty/computer/v1" ||
+		updated != current || capability.Endpoint != current || capability.Token != "old-node-lineage-bearer" {
+		t.Fatalf("retargeted capability = old=%q updated=%q capability=%+v err=%v", old, updated, capability, err)
+	}
 }
 
 type takeoverViewProcess struct {

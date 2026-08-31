@@ -434,6 +434,9 @@ jobs:
               printf 'WEFTY_OCI_COMPUTER_RUNTIME_RECEIPT=%s\n' "$computer_release/amd64-runtime.json"
             fi
             printf 'WEFTY_OCI_COMPUTER_VARIANT=%s\n' "$COMPUTER_VARIANT"
+            printf 'WEFTY_OCI_XFCE_COMPUTER_REFERENCE=%s\n' "$COMPUTER_REFERENCE"
+            printf 'WEFTY_OCI_XFCE_COMPUTER_DIGEST=%s\n' "$COMPUTER_DIGEST"
+            printf 'WEFTY_OCI_XFCE_COMPUTER_ARCHIVE=%s\n' "$COMPUTER_ARCHIVE"
             printf 'WEFTY_OCI_WAYLAND_COMPUTER_REFERENCE=%s\n' "$WAYLAND_COMPUTER_REFERENCE"
             printf 'WEFTY_OCI_WAYLAND_COMPUTER_DIGEST=%s\n' "$WAYLAND_COMPUTER_DIGEST"
             printf 'WEFTY_OCI_WAYLAND_COMPUTER_ARCHIVE=%s\n' "$WAYLAND_COMPUTER_ARCHIVE"

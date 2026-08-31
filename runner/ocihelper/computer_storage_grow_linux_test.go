@@ -182,6 +182,34 @@ func TestComputerGrowNoopResizeFailsReadback(t *testing.T) {
 	}
 }
 
+func TestComputerGrowReassertsAllocationAfterFilesystemResize(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root},
+		capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt),
+		computerGrowResize: func(_ context.Context, path, _ string, _, newBytes int64) error {
+			if err := fullyAllocateComputerDisk(path, newBytes); err != nil {
+				return err
+			}
+			file, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				return err
+			}
+			err = unix.Fallocate(int(file.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, 0, 1<<20)
+			return errors.Join(err, file.Close())
+		},
+		computerGrowFilesystemBytes: func(context.Context, string) (int64, error) { return request.NewDiskBytes, nil },
+	}
+	response, err := engine.GrowComputerStorage(t.Context(), request)
+	if err != nil || !response.Receipt.Applied {
+		t.Fatalf("grow after filesystem sparse write = %#v err=%v", response, err)
+	}
+	if err := verifyComputerDiskAllocation(imagePath, request.NewDiskBytes); err != nil {
+		t.Fatalf("grown image allocation = %v", err)
+	}
+}
+
 func TestComputerGrowENOSPCRollsBackDeltaAndReturnsReceipt(t *testing.T) {
 	root := t.TempDir()
 	request := growTestRequest(16 << 20)
@@ -205,6 +233,47 @@ func TestComputerGrowENOSPCRollsBackDeltaAndReturnsReceipt(t *testing.T) {
 	reservation := engine.capacityReservations[request.Authority.JobID]
 	if reservation == nil || reservation.diskBytes != request.Storage.DiskBytes || reservation.pendingDiskBytes != 0 {
 		t.Fatalf("ENOSPC reservation = %#v", reservation)
+	}
+}
+
+func TestComputerGrowPostExpansionAllocationFailureIsUncertainAndNeverTruncates(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root},
+		capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt),
+		computerGrowResize: func(_ context.Context, path, _ string, _, newBytes int64) error {
+			return os.Truncate(path, newBytes)
+		},
+		computerGrowFilesystemBytes: func(context.Context, string) (int64, error) { return request.NewDiskBytes, nil },
+		computerGrowAllocate:        func(string, int64) error { return unix.ENOSPC },
+	}
+	response, err := engine.GrowComputerStorage(t.Context(), request)
+	var uncertain *ComputerStorageGrowUncertainError
+	if !errors.As(err, &uncertain) || response.Receipt.Kind == "computer_storage_grow_failed_unchanged" {
+		t.Fatalf("post-expansion allocation failure = %#v err=%v, want uncertain outcome", response, err)
+	}
+	if info, statErr := os.Stat(imagePath); statErr != nil || info.Size() != request.NewDiskBytes {
+		t.Fatalf("post-expansion image was truncated: size=%v err=%v", info, statErr)
+	}
+	reservation := engine.capacityReservations[request.Authority.JobID]
+	if reservation == nil || reservation.diskBytes != request.Storage.DiskBytes ||
+		reservation.pendingDiskBytes != request.NewDiskBytes-request.Storage.DiskBytes {
+		t.Fatalf("uncertain grow lost resumable reservation: %#v", reservation)
+	}
+	response, err = engine.GrowComputerStorage(t.Context(), request)
+	if !errors.As(err, &uncertain) || response.Receipt.Kind == "computer_storage_grow_failed_unchanged" {
+		t.Fatalf("expanded-image uncertain retry = %#v err=%v, want uncertain outcome", response, err)
+	}
+	reservation = engine.capacityReservations[request.Authority.JobID]
+	if reservation == nil || reservation.diskBytes != request.Storage.DiskBytes ||
+		reservation.pendingDiskBytes != request.NewDiskBytes-request.Storage.DiskBytes {
+		t.Fatalf("expanded-image uncertain retry released held delta: %#v", reservation)
+	}
+	engine.computerGrowAllocate = nil
+	response, err = engine.GrowComputerStorage(t.Context(), request)
+	if err != nil || !response.Receipt.Applied || response.Receipt.Kind != "computer_storage_grow_applied" {
+		t.Fatalf("uncertain grow retry = %#v err=%v", response, err)
 	}
 }
 

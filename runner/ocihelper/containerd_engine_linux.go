@@ -128,6 +128,7 @@ type ContainerdEngine struct {
 	computerGrowHook            func(string) error
 	computerGrowResize          func(context.Context, string, string, int64, int64) error
 	computerGrowFilesystemBytes func(context.Context, string) (int64, error)
+	computerGrowAllocate        func(string, int64) error
 	lastProfile                 *ProfileReceipt
 	capacityMu                  sync.Mutex
 	capacityReservations        map[string]*capacityReservation

@@ -1354,6 +1354,43 @@ func TestTypedCapacityRefusalSurvivesAdapterFinalizationWithoutSecondDelete(t *t
 	}
 }
 
+func TestComputerStorageBusyHasPositiveNoRuntimeReapEvidence(t *testing.T) {
+	engine := &adapterTestEngine{runErr: &ocihelper.RPCError{
+		Code: ocihelper.CodeComputerStorageBusy, Message: "Computer Storage generation already has an attachment owner",
+	}, refuseDelete: true}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	if _, err := adapter.Run(t.Context(), request, nil); err == nil {
+		t.Fatal("Computer Storage ownership conflict unexpectedly started")
+	}
+	receipt, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
+	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime {
+		t.Fatalf("Computer Storage conflict finalization = %+v err=%v", receipt, err)
+	}
+	if engine.runtimeDeletes != 0 {
+		t.Fatalf("Computer Storage conflict attempted %d runtime deletes", engine.runtimeDeletes)
+	}
+}
+
+func TestAttemptAuthorityReplayIsNotDefinitiveBeforeRuntimeCreation(t *testing.T) {
+	engine := &adapterTestEngine{runErr: &ocihelper.RPCError{
+		Code: ocihelper.CodeUnauthorizedAttempt, Message: "attempt authority has already been used in this session",
+	}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	if _, err := adapter.Run(t.Context(), request, nil); err == nil {
+		t.Fatal("attempt authority replay unexpectedly started")
+	}
+	adapter.mu.Lock()
+	entry := adapter.runEntered[request.Authority]
+	adapter.mu.Unlock()
+	if !entry.entered {
+		t.Fatal("attempt authority replay was marked never-entered and could leak the live attempt")
+	}
+}
+
 func TestAdapterReleasesAttachedAttemptPinAfterPreRunAbandonment(t *testing.T) {
 	engine := &adapterTestEngine{}
 	adapter, closeAdapter := startAdapterTestServer(t, engine)

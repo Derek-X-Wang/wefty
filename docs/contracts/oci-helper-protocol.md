@@ -123,6 +123,13 @@ The agent records it on the standing reset/restore operation so Computer status
 surfaces the failure and L1 stops redispatching it; recovery requires a later
 helper sweep/operator workflow rather than an unbounded silent loop. Neither a
 retry nor quarantine invalidates the live helper session.
+`computer_storage_busy` is a definitive attempt-scoped `Run` refusal only after
+the helper positively reaps the losing attempt and verifies no runtime remains;
+`computer_storage_grow_uncertain` keeps the same grow
+authority pending for inspection and retry after the filesystem may have
+expanded. Neither code invalidates the helper session.
+If the losing attempt cannot be positively reaped, the helper invalidates its
+session and returns `session_stale` instead of manufacturing the busy proof.
 Caller cancellation, deadlines owned by the
 caller, `sweep_required`, validation/policy refusals, digest disagreement, and
 unknown agent errors never manufacture runtime-loss evidence. A stop-specific
@@ -193,7 +200,11 @@ the session lifetime. Expiry cancels a blocked start, and replay of an
 identical fenced tuple is refused. Authoritative `Started` evidence must be
 delivered to the agent; a write failure reaps and tombstones the attempt.
 Later attempt RPCs require an exact live tuple; a stale fence or changed label
-is `unauthorized_attempt`.
+is `unauthorized_attempt`. A replayed `Run` tuple remains
+`unauthorized_attempt` because the matching live attempt may still own runtime;
+a different attempt refused by that live Computer Storage owner is instead
+`computer_storage_busy` only after the helper positively verifies that the
+losing attempt has no remaining runtime.
 
 `Run` establishes an initial attempt deadman within the helper's configured
 maximum. The control heartbeat may carry exact attempt renewals, each with a
@@ -213,7 +224,7 @@ heartbeats.
 | `EnsureImage` | Session-authorized, typed progress/result stream on a dedicated connection. The agent supplies the canonical platform retained from the successful probe for this helper generation; manifest selection and image singleflight are keyed by it. The sole offline-bootstrap exception is the clean-cache `node load-image` archive import that must precede that probe: it may use the current helper diagnostic OS/architecture after OCI default-variant normalization, but it does not retain or promote that diagnostic fact as probe evidence. Every registry delivery, binding pin, and other caller remains gated on the probe-retained canonical platform, and later probe evidence must select the same archived platform digest. Registry mode resolves only a public reference, pins the returned top-level digest, pulls into the fixed namespace, and unpacks that platform. Archive mode receives an OCI-layout tar stream, recomputes every blob digest, validates descriptor sizes and reachability, admits exactly that platform, and imports/unpacks it. Both modes return the same complete image evidence used by `Run`, including top-level/platform digests, platform, runtime handler, and snapshotter; no containerd type, private registry credential, or retry policy crosses the boundary. |
 | `ImageCacheStatus` | Session-authorized read of namespace content bytes, applied cap, and the last completed eviction. It never enforces the cap or changes a pin. |
 | `DoctorStatus` | Session-authorized read of runtime platform, containerd/runc versions, allowed mount roots, and bounded `ImageCacheStatus`. Each sub-read carries its own assertion-derived receipt, so a partial failure does not erase the authenticated handshake or successful siblings. Runc comes only from containerd runtime info or a setup-resolved absolute executable path; the privileged helper never performs an operator-triggered PATH lookup. A whole-RPC failure uses `diagnostic_failure`, which is explicitly not runtime-loss evidence: the client does not invalidate the session, reap attempts, or withdraw capability. It never acquires a session, probes, sweeps, starts a task, mutates policy, or evicts content. |
-| `Run` | Exact attempt authority, initial deadman, a bounded requested endpoint-name list, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started`, the helper-captured `started_at` timestamp from that exact edge, assertion-derived profile evidence, helper-observed image evidence, and a map from every requested endpoint name to its allocated loopback port. Ordinary attempts request either no endpoint or exactly `service`; a Computer requests exactly the distinct `{view, control}` set, receives authoritative `WEFTY_COMPUTER_VIEW_PORT` and `WEFTY_COMPUTER_CONTROL_PORT`, and cannot retain `WEFTY_SERVICE_PORT`. An explicit Mac bridge-fallback preparation creates a separate guest loopback listener and capability; activation rewrites the start-time endpoint, while a dormant preparation exposes nothing to a default-off Computer and remains available for a later policy enable. |
+| `Run` | Exact attempt authority, initial deadman, a bounded requested endpoint-name list, and closed workload inputs enter. The helper validates the immutable digest, argv, working directory, explicit environment list, enumerated managed volumes, and operator mounts against configured roots, then constructs the runtime spec itself. Only a successful runc-v2 `Start` after `Wait` registration returns authoritative `Started`, the helper-captured `started_at` timestamp from that exact edge, assertion-derived profile evidence, helper-observed image evidence, and a map from every requested endpoint name to its allocated loopback port. Ordinary attempts request either no endpoint or exactly `service`; a Computer requests exactly the distinct `{view, control}` set, receives authoritative `WEFTY_COMPUTER_VIEW_PORT` and `WEFTY_COMPUTER_CONTROL_PORT`, and cannot retain `WEFTY_SERVICE_PORT`. A live Computer Storage attachment refuses a different attempt with `computer_storage_busy`; this is definitive no-runtime evidence for only the losing attempt and never changes the live owner's authority. An explicit Mac bridge-fallback preparation creates a separate guest loopback listener and capability; activation rewrites the start-time endpoint, while a dormant preparation exposes nothing to a default-off Computer and remains available for a later policy enable. |
 | `Signal` | Exact live attempt and only enumerated `TERM` or `KILL`. A containerd `NotFound` after authorization is the closed `task already terminated` mechanics fact: the helper returns `already_terminated=true` without recording delivery of that signal, and `Watch` remains authoritative for the terminal arm. This race alone is not `engine_failure` or runtime-loss evidence; if `Watch` then cannot publish terminal evidence inside the fixed post-KILL release bound, the positive reaped-task fact makes the missing Wait confirmation typed runtime loss. |
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only, except that one tombstoned attempt whose helper deadman completed a successful guardian reap may authorize exactly one later `Delete` with full seven-field attempt-authority equality and the current node/boot-session gate. That exception still calls engine `Delete`, repeats independent absence verification, and releases image pins, capacity, ports, and retained runtime state before returning positive deletion; it never treats the earlier reap alone as the response. The helper consumes the guardian evidence when that call completes, so a second exact call, stale fence, foreign attempt, different removal generation or boot session, and every failed guardian reap remain refused. In every path, a positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments while retaining any stable handoff volume; only then does the server tombstone authorization. |
@@ -222,7 +233,7 @@ heartbeats.
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
 | `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves OS identity; clone/import narrowly rekey it and may expand a larger filesystem. |
 | `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path outside the managed root. L1 has already committed the permanent custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, and manifest-digest evidence. |
-| `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. |
+| `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A failure after ext4 may have expanded returns `computer_storage_grow_uncertain`, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
 | `PreflightComputerReimage` | Session-authorized exact current Storage generation, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. It requires positive detachment evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived evidence before L1 may publish the staging projection. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
@@ -236,6 +247,10 @@ The helper emits an internal backend-ready marker only after that connection is
 established, and the client consumes it before returning the opaque stream.
 This makes an agent-side connect probe cover the payload, helper session, and
 tunnel rather than merely the helper's authorization check.
+Like the attempt-scoped `DialAttemptPort` backend refusal,
+`computer_storage_busy` does not invalidate the helper session; unlike that
+retryable readiness refusal, it definitively proves the losing `Run` has no
+remaining runtime and therefore needs no second `Delete`.
 The helper holds a kernel listener through runtime-spec construction, transfers
 it directly into payload start, and retains the logical allocation until
 independent absence verification; failed verification cannot recycle the port.
@@ -622,6 +637,16 @@ per-generation flock and attach revalidates the manifest after acquisition. A
 durable retirement fence therefore blocks a delayed attach without deleting
 the current generation before successor publication.
 
+Fresh ownership initialization is closed to two classes: an image newly
+formatted by the first attach, and an empty Reset successor whose prepared
+manifest carries its verified `PreparationReceipt`. Copy, restore, clone,
+import, and grow destinations are already tenant-owned even when their
+manifests say `Prepared`; without explicit `chown` they must refuse a root
+ownership mismatch, and with `chown` they recursively migrate every tenant
+entry. Reset freshness survives the pending-attach and mount boundaries and is
+cleared only by the same durable manifest write that publishes `Attached`, so
+a failed or crashed first attach cannot silently consume the one-time fact.
+
 `ResetComputerStorage` accepts only the authenticated current helper session
 plus exact Node, managed-root instance, consumer Job, named prior Job,
 reset-intent revision, cleanup fence, old generation, and successor generation.
@@ -647,6 +672,10 @@ never reports applied before full allocation plus filesystem expansion. The
 capacity decision includes unmaterialized admitted reservations under the same
 lock, so existing workloads retain their reservations and the newcomer pays.
 An insufficient-capacity receipt is valid only before bytes change.
+After ext4 expansion begins, failure is instead the typed resumable
+`computer_storage_grow_uncertain` outcome: the helper never truncates the image
+or reports `failed_unchanged`, and retry inspects the expanded image before it
+publishes a receipt.
 
 `PreflightComputerReimage` runs only after the old Job is stopped and the disk
 manifest contains exact same-boot reap or prior-boot sweep evidence. Image

@@ -119,7 +119,7 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		}
 	}()
 	if err = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return nil, errors.New("Computer Storage generation already has an attachment owner")
+		return nil, errComputerStorageAttachmentOwned
 	}
 	manifestPath := filepath.Join(diskRoot, "attachment.json")
 	manifest, present, err := readComputerDiskManifest(manifestPath)
@@ -227,21 +227,22 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 			return nil, err
 		}
 	}
+	// Only Reset's verified preparation proves an existing image still contains
+	// a freshly formatted empty filesystem. Copy and grow also publish Prepared
+	// manifests, but their bytes are already tenant-owned.
+	freshRoot := createdImage || (manifest.Prepared && manifest.PreparationReceipt != nil)
 	{
 		previousDetachment := manifest.PreviousDetachment
 		storage.DiskBytes = manifest.Storage.DiskBytes
 		manifest.Storage = storage
 		manifest.Pending = &authority
 		manifest.PreviousDetachment = nil
-		manifest.Prepared = false
-		manifest.Preparation = nil
-		manifest.PreparationReceipt = nil
 		if err = writeComputerDiskManifest(diskRoot, manifest); err != nil {
 			return nil, err
 		}
-		if err = engine.computerDiskCheckpoint(computerDiskPendingBeforeAttach); err != nil {
-			return nil, err
-		}
+		// Arm in-process rollback before exposing the pending checkpoint. A
+		// returned checkpoint failure must not strand the generation as pending;
+		// an actual process crash is instead reconciled by the next boot sweep.
 		defer func() {
 			if err != nil {
 				manifest.Pending = nil
@@ -249,6 +250,9 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 				_ = writeComputerDiskManifest(diskRoot, manifest)
 			}
 		}()
+		if err = engine.computerDiskCheckpoint(computerDiskPendingBeforeAttach); err != nil {
+			return nil, err
+		}
 	}
 	if err = os.MkdirAll(mountPath, 0o700); err != nil {
 		if createdImage {
@@ -269,7 +273,7 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		_ = engine.computerDiskSystem().detach(mountPath, loopDevice, imagePath)
 		return nil, err
 	}
-	attachment := &computerDiskAttachment{name: name, storage: manifest.Storage, imagePath: imagePath, mountPath: mountPath, loopDevice: loopDevice, authority: authority, lock: lock, fresh: createdImage}
+	attachment := &computerDiskAttachment{name: name, storage: manifest.Storage, imagePath: imagePath, mountPath: mountPath, loopDevice: loopDevice, authority: authority, lock: lock, fresh: freshRoot}
 	manifest = computerDiskManifest{
 		Version: computerDiskManifestVersion, Storage: attachment.storage, DiskImage: "disk.ext4", MountDirectory: name,
 		LoopDevice: loopDevice, Attached: &authority,
