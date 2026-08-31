@@ -398,6 +398,14 @@ nonadministrator receives typed `controller_busy`. An administrator still
 begins as a viewer and overrides only through an explicit take: the old input
 leg is closed and observed before the replacement backend is dialed. The server
 never consults client headers for role, mode, backend, or control authority.
+The agent owns replacement-leg handshake state: it completes RFB version,
+security, and ClientInit negotiation with the fresh control backend before the
+leg swap becomes visible. The client keeps its existing handshake state and
+never receives or answers a second banner during take or release. The agent
+does not replay client-selected display state such as SetPixelFormat,
+SetEncodings, or a pending FramebufferUpdateRequest onto the replacement leg;
+clients that depart from ServerInit defaults may therefore require display-state
+replay before a future contract can promise seamless decoded frames after take.
 Text frames, machine principals, stale
 policy, identity revalidation failure, downgrade/revocation, attempt authority
 loss, and the one-hour cap all close both relay legs. The authorization lease

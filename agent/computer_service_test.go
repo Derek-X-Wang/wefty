@@ -341,7 +341,7 @@ func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T
 	}
 	viewBackend := newComputerBackend(t, computerBackendOptions{})
 	defer viewBackend.Close()
-	controlBackend := newComputerBackend(t, computerBackendOptions{})
+	controlBackend := newComputerBackend(t, computerBackendOptions{rfbHandshake: true})
 	defer controlBackend.Close()
 	dial := func(ctx context.Context, name string) (net.Conn, error) {
 		if name == workloadrunner.AttemptEndpointControl {

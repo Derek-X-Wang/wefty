@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -551,6 +553,7 @@ func (session *Session) call(ctx context.Context, method Method, request, respon
 	}
 	defer connection.Close()
 	err = decodeResponse(wire, response)
+	err = classifyContextClosedOperation(connection, ctx, err)
 	return session.markOperationFailure(ctx, err)
 }
 
@@ -564,6 +567,7 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 		var response frame
 		if err := wire.read(&response); err != nil {
 			err = fmt.Errorf("receive OCI helper stream: %w", err)
+			err = classifyContextClosedOperation(connection, ctx, err)
 			return session.markOperationFailure(ctx, err)
 		}
 		if response.Version != session.client.protocolVersion() {
@@ -584,6 +588,7 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 		if acknowledge {
 			if err := writeAll(connection, []byte{1}); err != nil {
 				err = fmt.Errorf("acknowledge OCI helper stream event: %w", err)
+				err = classifyContextClosedOperation(connection, ctx, err)
 				return session.markOperationFailure(ctx, err)
 			}
 		}
@@ -596,6 +601,7 @@ func (session *Session) openStream(ctx context.Context, method Method, request a
 		return nil, err
 	}
 	if err := decodeResponse(wire, &struct{}{}); err != nil {
+		err = classifyContextClosedOperation(connection, ctx, err)
 		err = session.markOperationFailure(ctx, err)
 		_ = connection.Close()
 		return nil, err
@@ -603,6 +609,7 @@ func (session *Session) openStream(ctx context.Context, method Method, request a
 	if _, err := connection.Write([]byte{1}); err != nil {
 		_ = connection.Close()
 		err = fmt.Errorf("acknowledge OCI helper stream: %w", err)
+		err = classifyContextClosedOperation(connection, ctx, err)
 		err = session.markOperationFailure(ctx, err)
 		return nil, err
 	}
@@ -611,6 +618,7 @@ func (session *Session) openStream(ctx context.Context, method Method, request a
 		if _, err := io.ReadFull(connection, marker[:]); err != nil {
 			_ = connection.Close()
 			err = fmt.Errorf("await OCI helper stream backend: %w", err)
+			err = classifyContextClosedOperation(connection, ctx, err)
 			err = session.markOperationFailure(ctx, err)
 			return nil, err
 		}
@@ -645,6 +653,18 @@ func (err *StreamSetupCancelledError) Error() string {
 }
 func (err *StreamSetupCancelledError) Unwrap() error { return err.Cause }
 
+const operationDeadlineContextObservationLimit = 25 * time.Millisecond
+
+// OperationDeadlineContextPendingError records that a socket timeout reached
+// its deadline but the matching caller context did not become terminal within
+// the bounded scheduler-race observation window.
+type OperationDeadlineContextPendingError struct{ Cause error }
+
+func (err *OperationDeadlineContextPendingError) Error() string {
+	return "OCI helper transport deadline arrived without matching caller deadline: " + err.Cause.Error()
+}
+func (err *OperationDeadlineContextPendingError) Unwrap() error { return err.Cause }
+
 // markOperationFailure turns transport replacement/error into a synchronous
 // loss of session authority. Caller cancellation and ordinary helper RPC
 // refusals do not invalidate an otherwise healthy helper session.
@@ -652,7 +672,33 @@ func (session *Session) markOperationFailure(ctx context.Context, err error) err
 	if err == nil {
 		return nil
 	}
-	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	// applyContextDeadline arms the transport at the same instant as ctx. The
+	// socket timeout may win scheduler ordering by a few microseconds; once the
+	// deadline has arrived, wait for the matching context fact before deciding
+	// whether an operation-local timeout proves helper-session loss.
+	deadline, hasDeadline := ctx.Deadline()
+	deadlineArrived := hasDeadline && !time.Now().Before(deadline)
+	if deadlineArrived && operationTransportTimeout(err) {
+		if ctx.Err() == nil {
+			timer := time.NewTimer(operationDeadlineContextObservationLimit)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+			case <-timer.C:
+				err = &OperationDeadlineContextPendingError{Cause: err}
+			}
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+	}
+	// Before the deadline, caller cancellation owns any resulting transport
+	// error. At or after the deadline, only an actual timeout may be attributed
+	// to the caller; EOF, reset, and typed helper failures still prove loss.
+	if !deadlineArrived && (ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded)) {
 		return err
 	}
 	var rpcErr *RPCError
@@ -662,6 +708,14 @@ func (session *Session) markOperationFailure(ctx context.Context, err error) err
 	loss := runtimeLossError(err)
 	session.markLost(loss)
 	return loss
+}
+
+func operationTransportTimeout(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var timeout net.Error
+	return errors.As(err, &timeout) && timeout.Timeout()
 }
 
 func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
@@ -746,8 +800,12 @@ func (session *Session) dialRequestInternal(ctx context.Context, method Method, 
 		return nil, nil, err
 	}
 	rawConnection := connection
-	stop := context.AfterFunc(ctx, func() { _ = rawConnection.Close() })
-	connection = &clientOperationConn{Conn: rawConnection, stop: stop}
+	operationConnection := &clientOperationConn{Conn: rawConnection}
+	operationConnection.stop = context.AfterFunc(ctx, func() {
+		operationConnection.closedByContext.Store(true)
+		_ = rawConnection.Close()
+	})
+	connection = operationConnection
 	body, err := marshalBody(request)
 	if err != nil {
 		_ = connection.Close()
@@ -760,6 +818,7 @@ func (session *Session) dialRequestInternal(ctx context.Context, method Method, 
 	}); err != nil {
 		_ = connection.Close()
 		err = fmt.Errorf("send OCI helper %s: %w", method, err)
+		err = classifyContextClosedOperation(connection, ctx, err)
 		if classifyTransportLoss {
 			err = session.markOperationFailure(ctx, err)
 		}
@@ -770,7 +829,19 @@ func (session *Session) dialRequestInternal(ctx context.Context, method Method, 
 
 type clientOperationConn struct {
 	net.Conn
-	stop func() bool
+	stop            func() bool
+	closedByContext atomic.Bool
+}
+
+func classifyContextClosedOperation(connection net.Conn, ctx context.Context, err error) error {
+	if err == nil || ctx.Err() == nil || !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	operation, ok := connection.(*clientOperationConn)
+	if !ok || !operation.closedByContext.Load() {
+		return err
+	}
+	return context.Cause(ctx)
 }
 
 func (connection *clientOperationConn) detachSetupContext(ctx context.Context) error {

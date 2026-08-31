@@ -476,7 +476,7 @@ func TestDeleteReleasesAttemptAuthorityWhileOwnerHandoffRemainsRetained(t *testi
 	}
 }
 
-func TestRunAndWatchEngineFailuresCarryClosedMechanicsFacts(t *testing.T) {
+func TestRunEngineFailureCarriesDiagnosticDetailAndWatchKeepsClosedMechanics(t *testing.T) {
 	engine := newFakeEngine()
 	engine.runErr = errors.New("privileged host detail")
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -490,7 +490,8 @@ func TestRunAndWatchEngineFailuresCarryClosedMechanicsFacts(t *testing.T) {
 	_, err = session.Run(t.Context(), testRunRequest(testAuthority(), time.Second))
 	var runFailure *RPCError
 	if !errors.As(err, &runFailure) || runFailure.EngineFailure == nil ||
-		runFailure.EngineFailure.Operation != MethodRun || runFailure.EngineFailure.Reason != EngineFailureOperationFailed {
+		runFailure.EngineFailure.Operation != MethodRun || runFailure.EngineFailure.Reason != EngineFailureOperationFailed ||
+		!strings.Contains(runFailure.Message, "privileged host detail") || !strings.Contains(err.Error(), "privileged host detail") {
 		t.Fatalf("Run engine failure = %+v err=%v", runFailure, err)
 	}
 
@@ -1305,6 +1306,115 @@ func TestAttemptPortBackendRefusalDoesNotInvalidateHelperSession(t *testing.T) {
 	}
 }
 
+func TestAttemptPortSetupCancellationDoesNotDelayListenerRepublication(t *testing.T) {
+	base := newFakeEngine()
+	base.setRunResponse(RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}})
+	engine := &listenerRestartEngine{fakeEngine: base, firstEntered: make(chan struct{}), firstCanceled: make(chan struct{})}
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: 2 * time.Second})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	authority := testAuthority()
+	request := testRunRequest(authority, time.Second)
+	request.AllocateEndpoints = []string{"service"}
+	if _, err := session.Run(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+
+	probeContext, cancelProbe := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancelProbe()
+	probeDone := make(chan error, 1)
+	go func() {
+		_, err := session.DialAttemptPort(probeContext, DialAttemptPortRequest{Authority: authority, Name: "service"})
+		probeDone <- err
+	}()
+	<-engine.firstEntered
+	probeErr := <-probeDone
+	if probeErr == nil || !errors.Is(probeContext.Err(), context.DeadlineExceeded) {
+		t.Fatalf("withdrawn-listener probe error = %v context=%v, want caller deadline", probeErr, probeContext.Err())
+	}
+	select {
+	case <-engine.firstCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("withdrawn-listener probe remained live after its caller disconnected")
+	}
+
+	stream, err := session.DialAttemptPort(t.Context(), DialAttemptPortRequest{Authority: authority, Name: "service"})
+	if err != nil {
+		t.Fatalf("replacement listener was not reachable on the next probe: %v (withdrawn probe: %v)", err, probeErr)
+	}
+	assertStreamPayload(t, stream, "attempt-port")
+	if session.HealthError() != nil {
+		t.Fatalf("listener restart invalidated the admitting helper session: %v", session.HealthError())
+	}
+}
+
+func TestAttemptPortAcknowledgementWaitIsContextBoundAndIdempotent(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	stream := &attemptPortOperationStream{
+		operationStream: &operationStream{},
+		acknowledged:    make(chan error),
+		ctx:             ctx,
+		writeSetup:      func() error { return nil },
+	}
+	payload := []byte{attemptPortBackendReady}
+	for attempt := 1; attempt <= 2; attempt++ {
+		started := time.Now()
+		if _, err := stream.Write(payload); !errors.Is(err, context.Canceled) || time.Since(started) > time.Second {
+			t.Fatalf("acknowledgement attempt %d = %v elapsed=%s", attempt, err, time.Since(started))
+		}
+	}
+}
+
+func TestMergeResourceInventoryDeduplicatesEveryIdentityClass(t *testing.T) {
+	left := ResourceInventory{
+		Leases: []string{"b", "a"}, Snapshots: []string{"b", "a"}, Containers: []string{"b", "a"},
+		Tasks: []string{"b", "a"}, Shims: []string{"b", "a"}, Cgroups: []string{"b", "a"},
+		LogSegments: []string{"b", "a"}, ManagedVolumes: []string{"b", "a"}, ManagedVolumeRecords: []string{"b", "a"},
+		ComputerDiskImages: []string{"b", "a"}, ComputerDiskAllocations: []string{"b", "a"}, ComputerDiskQuotas: []string{"b", "a"},
+		ComputerDiskManifests: []string{"b", "a"}, ComputerDiskMounts: []string{"b", "a"}, ComputerDiskLoops: []string{"b", "a"},
+		ComputerAttachments: []string{"b", "a"}, ComputerResetManifests: []string{"b", "a"}, ComputerQuarantines: []string{"b", "a"},
+		ComputerDiskAnomalies: []string{"b", "a"},
+	}
+	right := ResourceInventory{
+		Leases: []string{"a", "c"}, Snapshots: []string{"a", "c"}, Containers: []string{"a", "c"},
+		Tasks: []string{"a", "c"}, Shims: []string{"a", "c"}, Cgroups: []string{"a", "c"},
+		LogSegments: []string{"a", "c"}, ManagedVolumes: []string{"a", "c"}, ManagedVolumeRecords: []string{"a", "c"},
+		ComputerDiskImages: []string{"a", "c"}, ComputerDiskAllocations: []string{"a", "c"}, ComputerDiskQuotas: []string{"a", "c"},
+		ComputerDiskManifests: []string{"a", "c"}, ComputerDiskMounts: []string{"a", "c"}, ComputerDiskLoops: []string{"a", "c"},
+		ComputerAttachments: []string{"a", "c"}, ComputerResetManifests: []string{"a", "c"}, ComputerQuarantines: []string{"a", "c"},
+		ComputerDiskAnomalies: []string{"a", "c"},
+	}
+	merged := mergeResourceInventory(left, right)
+	want := []string{"a", "b", "c"}
+	classes := [][]string{
+		merged.Leases, merged.Snapshots, merged.Containers, merged.Tasks, merged.Shims, merged.Cgroups,
+		merged.LogSegments, merged.ManagedVolumes, merged.ManagedVolumeRecords, merged.ComputerDiskImages,
+		merged.ComputerDiskAllocations, merged.ComputerDiskQuotas, merged.ComputerDiskManifests,
+		merged.ComputerDiskMounts, merged.ComputerDiskLoops, merged.ComputerAttachments,
+		merged.ComputerResetManifests, merged.ComputerQuarantines, merged.ComputerDiskAnomalies,
+	}
+	for index, class := range classes {
+		if !slices.Equal(class, want) {
+			t.Fatalf("merged inventory class %d = %v, want %v", index, class, want)
+		}
+	}
+}
+
+func TestMergeSweepAttemptsUsesIdentitySetSemantics(t *testing.T) {
+	first := SweptAttemptAuthority{NodeID: "node", JobID: "job-a", RemovalGeneration: "1", AttemptID: "attempt-a", FencingToken: "fence-a", PriorBootSessionID: "boot-a", Class: contract.JobClassService}
+	second := SweptAttemptAuthority{NodeID: "node", JobID: "job-b", RemovalGeneration: "2", AttemptID: "attempt-b", FencingToken: "fence-b", PriorBootSessionID: "boot-b", Class: contract.JobClassOneShot}
+	merged := mergeSweepAttempts([]SweptAttemptAuthority{second, first}, []SweptAttemptAuthority{first, second})
+	if len(merged) != 2 || merged[0] != first || merged[1] != second {
+		t.Fatalf("merged swept attempts = %#v", merged)
+	}
+}
+
 func TestEndpointAdmittedByInvalidatedSessionRefusesWithTypedSessionStale(t *testing.T) {
 	engine := newFakeEngine()
 	engine.runResponse = RunResponse{Started: true, StartedAt: testStartedAt(), Endpoints: map[string]uint16{"service": 42001}}
@@ -2052,6 +2162,58 @@ func TestOperationTransportFailureSynchronouslyInvalidatesSession(t *testing.T) 
 	}
 }
 
+func TestOperationDeadlineClassifiesOnlyTimeoutAsCallerDeadline(t *testing.T) {
+	newSession := func() (*Session, net.Conn) {
+		control, peer := net.Pipe()
+		return &Session{control: control}, peer
+	}
+	deadline := time.Now().Add(-time.Millisecond)
+
+	t.Run("non-timeout transport loss", func(t *testing.T) {
+		session, peer := newSession()
+		defer peer.Close()
+		ctx, cancel := context.WithDeadline(t.Context(), deadline)
+		defer cancel()
+		err := session.markOperationFailure(ctx, io.EOF)
+		var loss *RuntimeLossError
+		if !errors.As(err, &loss) || session.HealthError() == nil {
+			t.Fatalf("deadline-adjacent EOF = %T %v health=%v, want runtime loss", err, err, session.HealthError())
+		}
+	})
+
+	t.Run("timeout belongs to caller deadline", func(t *testing.T) {
+		session, peer := newSession()
+		defer session.control.Close()
+		defer peer.Close()
+		ctx, cancel := context.WithDeadline(t.Context(), deadline)
+		defer cancel()
+		err := session.markOperationFailure(ctx, os.ErrDeadlineExceeded)
+		if !errors.Is(err, os.ErrDeadlineExceeded) || session.HealthError() != nil {
+			t.Fatalf("deadline timeout = %T %v health=%v, want caller deadline", err, err, session.HealthError())
+		}
+	})
+
+	t.Run("missing context fact is bounded and typed", func(t *testing.T) {
+		session, peer := newSession()
+		defer peer.Close()
+		ctx := deadlineOnlyContext{Context: t.Context(), deadline: deadline}
+		started := time.Now()
+		err := session.markOperationFailure(ctx, os.ErrDeadlineExceeded)
+		var pending *OperationDeadlineContextPendingError
+		var loss *RuntimeLossError
+		if !errors.As(err, &loss) || !errors.As(err, &pending) || time.Since(started) > time.Second {
+			t.Fatalf("unmatched deadline = %T %v elapsed=%s, want bounded typed runtime loss", err, err, time.Since(started))
+		}
+	})
+}
+
+type deadlineOnlyContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (ctx deadlineOnlyContext) Deadline() (time.Time, bool) { return ctx.deadline, true }
+
 func TestSessionReapJoinsEveryOperationBeforeExclusiveReap(t *testing.T) {
 	engine := newFakeEngine()
 	engine.signalEntered = make(chan struct{})
@@ -2266,6 +2428,28 @@ type fakeEngine struct {
 type blockingWatchEngine struct {
 	*fakeEngine
 	entered chan struct{}
+}
+
+type listenerRestartEngine struct {
+	*fakeEngine
+	mu            sync.Mutex
+	first         bool
+	firstEntered  chan struct{}
+	firstCanceled chan struct{}
+}
+
+func (engine *listenerRestartEngine) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
+	engine.mu.Lock()
+	first := !engine.first
+	engine.first = true
+	engine.mu.Unlock()
+	if first {
+		close(engine.firstEntered)
+		<-ctx.Done()
+		close(engine.firstCanceled)
+		return ctx.Err()
+	}
+	return engine.fakeEngine.DialAttemptPort(ctx, request, stream)
 }
 
 type doctorEngine struct{ *fakeEngine }

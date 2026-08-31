@@ -1058,44 +1058,51 @@ func openLiveRFBSession(t *testing.T, endpoint, userID, deviceID string) *liveRF
 	}
 	token := response.Header.Get(contract.ComputerControlTokenHeader)
 	network := websocket.NetConn(t.Context(), connection, websocket.MessageBinary)
-	banner := make([]byte, contract.ComputerRFBVersionBannerBytes)
-	if _, err := io.ReadFull(network, banner); err != nil || !contract.ValidComputerRFBVersionBanner(banner) {
+	if token == "" {
 		_ = connection.CloseNow()
+		t.Fatal("live RFB session omitted its control capability")
+	}
+	session := &liveRFBSession{endpoint: endpoint, token: token, websocket: connection, connection: network}
+	session.negotiate(t)
+	return session
+}
+
+func (session *liveRFBSession) negotiate(t *testing.T) {
+	t.Helper()
+	banner := make([]byte, contract.ComputerRFBVersionBannerBytes)
+	if _, err := io.ReadFull(session.connection, banner); err != nil || !contract.ValidComputerRFBVersionBanner(banner) {
+		_ = session.websocket.CloseNow()
 		t.Fatalf("read live RFB banner: %v %q", err, banner)
 	}
-	if _, err := network.Write([]byte("RFB 003.008\n")); err != nil {
+	if _, err := session.connection.Write([]byte("RFB 003.008\n")); err != nil {
 		t.Fatal(err)
 	}
 	count := []byte{0}
-	if _, err := io.ReadFull(network, count); err != nil || count[0] == 0 {
+	if _, err := io.ReadFull(session.connection, count); err != nil || count[0] == 0 {
 		t.Fatalf("read live RFB security count: %v", err)
 	}
 	securityTypes := make([]byte, int(count[0]))
-	if _, err := io.ReadFull(network, securityTypes); err != nil || !bytes.Contains(securityTypes, []byte{1}) {
+	if _, err := io.ReadFull(session.connection, securityTypes); err != nil || !bytes.Contains(securityTypes, []byte{1}) {
 		t.Fatalf("live RFB None security unavailable: %v %x", err, securityTypes)
 	}
-	if _, err := network.Write([]byte{1}); err != nil {
+	if _, err := session.connection.Write([]byte{1}); err != nil {
 		t.Fatal(err)
 	}
 	securityResult := make([]byte, 4)
-	if _, err := io.ReadFull(network, securityResult); err != nil || !bytes.Equal(securityResult, []byte{0, 0, 0, 0}) {
+	if _, err := io.ReadFull(session.connection, securityResult); err != nil || !bytes.Equal(securityResult, []byte{0, 0, 0, 0}) {
 		t.Fatalf("live RFB security result: %v %x", err, securityResult)
 	}
-	if _, err := network.Write([]byte{1}); err != nil {
+	if _, err := session.connection.Write([]byte{1}); err != nil {
 		t.Fatal(err)
 	}
 	serverInit := make([]byte, 24)
-	if _, err := io.ReadFull(network, serverInit); err != nil {
+	if _, err := io.ReadFull(session.connection, serverInit); err != nil {
 		t.Fatal(err)
 	}
 	name := make([]byte, int(binary.BigEndian.Uint32(serverInit[20:24])))
-	if _, err := io.ReadFull(network, name); err != nil {
+	if _, err := io.ReadFull(session.connection, name); err != nil {
 		t.Fatal(err)
 	}
-	if token == "" {
-		t.Fatal("live RFB session omitted its control capability")
-	}
-	return &liveRFBSession{endpoint: endpoint, token: token, websocket: connection, connection: network}
 }
 
 func (session *liveRFBSession) sendPointer(t *testing.T, x, y int) {
@@ -1389,13 +1396,13 @@ func proveLiveViewInputIsolation(t *testing.T, harness *acceptanceHarness, compu
 		t.Fatal("Computer omitted its live display endpoint")
 	}
 	before := readLiveInputObservation(t, computer.CurrentJobID)
-	viewPointer, controlPointer := freshPointerSentinels(before.PointerHistory)
-	if viewPointer == ([2]int{}) || controlPointer == ([2]int{}) {
+	freeViewPointer, heldViewPointer, controlPointer := freshPointerSentinels(before.PointerHistory)
+	if freeViewPointer == ([2]int{}) || heldViewPointer == ([2]int{}) || controlPointer == ([2]int{}) {
 		t.Fatal("Computer input history exhausted the isolation sentinels")
 	}
 	view := openLiveRFBSession(t, *computer.DisplayEndpoint, viewerUser, viewerDevice)
 	defer view.close()
-	view.sendPointer(t, viewPointer[0], viewPointer[1])
+	view.sendPointer(t, freeViewPointer[0], freeViewPointer[1])
 	control := openLiveRFBSession(t, *computer.DisplayEndpoint, "linux-admin", "linux-input-sentinel-device")
 	defer control.close()
 	controlCapability := control.capabilityFile(t)
@@ -1404,6 +1411,9 @@ func proveLiveViewInputIsolation(t *testing.T, harness *acceptanceHarness, compu
 	if take.TenureState != contract.ComputerControlTenureHeld {
 		t.Fatalf("control sentinel take = %#v", take)
 	}
+	// The Held-tenure sentinel is the decisive isolation arm: the view-only
+	// session must remain unable to drive while another session owns the wheel.
+	view.sendPointer(t, heldViewPointer[0], heldViewPointer[1])
 	control.sendPointer(t, controlPointer[0], controlPointer[1])
 	var after liveInputObservation
 	deadline := time.Now().Add(10 * time.Second)
@@ -1417,7 +1427,8 @@ func proveLiveViewInputIsolation(t *testing.T, harness *acceptanceHarness, compu
 	_ = runComputerCLIPerson[contract.ComputerControlReceipt](t, harness, "linux-admin", "linux-input-sentinel-device",
 		"services", "takeover", "release", computer.ComputerID, "--session-token-file", controlCapability)
 	return after.Generation > before.Generation && observationHasPointer(after, controlPointer[0], controlPointer[1]) &&
-		!observationHasPointer(after, viewPointer[0], viewPointer[1]) && after.KeyEvents == before.KeyEvents
+		!observationHasPointer(after, freeViewPointer[0], freeViewPointer[1]) &&
+		!observationHasPointer(after, heldViewPointer[0], heldViewPointer[1]) && after.KeyEvents == before.KeyEvents
 }
 
 func takeoverAuditEvidence(audit l1.ComputerTakeoverAuditList) (map[l1.ComputerTakeoverAuditEventKind]bool, int64) {

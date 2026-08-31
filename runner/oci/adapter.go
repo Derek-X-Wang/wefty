@@ -1183,7 +1183,7 @@ func (failure *outputSinkError) Error() string { return failure.err.Error() }
 func (failure *outputSinkError) Unwrap() error { return failure.err }
 
 func requiresOCIRuntimeRecovery(err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if err == nil {
 		return false
 	}
 	var sinkFailure *outputSinkError
@@ -1252,6 +1252,13 @@ func terminateAndWait(
 	} else {
 		select {
 		case err := <-watchDone:
+			// A signal deadline proves that this helper generation stopped
+			// answering control RPCs. Its connection teardown can concurrently
+			// cancel Watch; do not let that secondary cancellation erase the
+			// stronger runtime-loss fact established by the control path.
+			if requiresOCIRuntimeRecovery(termErr) && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+				return termErr
+			}
 			return err
 		default:
 		}

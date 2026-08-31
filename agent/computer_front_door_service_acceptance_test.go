@@ -236,6 +236,9 @@ func TestComputerFrontDoorBackendProcess(t *testing.T) {
 		if err := connection.Write(request.Context(), websocket.MessageBinary, []byte("RFB 003.008\n")); err != nil {
 			return
 		}
+		if !completeTestRFBServerHandshake(request.Context(), connection) {
+			return
+		}
 		for {
 			kind, payload, err := connection.Read(request.Context())
 			if err != nil {

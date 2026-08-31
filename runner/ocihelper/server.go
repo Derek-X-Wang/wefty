@@ -149,6 +149,22 @@ func (operation *sessionOperation) monitorAcknowledgements() <-chan error {
 	return acknowledged
 }
 
+func (operation *sessionOperation) monitorAcknowledgement() <-chan error {
+	acknowledged := make(chan error, 1)
+	go func() {
+		var value [1]byte
+		_, err := io.ReadFull(operation.conn, value[:])
+		if err == nil && value[0] != 1 {
+			err = errors.New("invalid OCI stream acknowledgement")
+		}
+		if err != nil {
+			operation.cancel()
+		}
+		acknowledged <- err
+	}()
+	return acknowledged
+}
+
 type serverSession struct {
 	server     *Server
 	identity   SessionIdentity
@@ -1098,7 +1114,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			} else if errors.As(err, &imageUnavailable) {
 				_ = writeFailure(wire, CodeImageUnavailable, "pinned local OCI image is unavailable")
 			} else {
-				_ = writeRPCError(wire, engineFailureRPC(MethodRun, "OCI engine operation failed", engineFailureReason(err)))
+				_ = writeRPCError(wire, engineFailureRPC(MethodRun, "OCI engine operation failed", engineFailureReason(err), err))
 			}
 			return
 		}
@@ -1502,7 +1518,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				response.Removed += carriedSweep.Removed
 				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, carriedSweep.PriorBootSessionsSeen...)
 				response.Inventory = mergeResourceInventory(response.Inventory, carriedSweep.Inventory)
-				response.Attempts = append(response.Attempts, carriedSweep.Attempts...)
+				response.Attempts = mergeSweepAttempts(response.Attempts, carriedSweep.Attempts)
 			}
 			server.sessionMu.Lock()
 			startup := server.startupSweep
@@ -1520,13 +1536,13 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				response.Removed += startup.Removed
 				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, startup.PriorBootSessionsSeen...)
 				response.Inventory = mergeResourceInventory(response.Inventory, startup.Inventory)
-				response.Attempts = append(response.Attempts, startup.Attempts...)
+				response.Attempts = mergeSweepAttempts(response.Attempts, startup.Attempts)
 			}
 			if sessionReap != nil {
 				response.Removed += sessionReap.Removed
 				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, sessionReap.PriorBootSessionsSeen...)
 				response.Inventory = mergeResourceInventory(response.Inventory, sessionReap.Inventory)
-				response.Attempts = append(response.Attempts, sessionReap.Attempts...)
+				response.Attempts = mergeSweepAttempts(response.Attempts, sessionReap.Attempts)
 			}
 			slices.SortFunc(response.PriorBootSessionsSeen, compareSessionIdentity)
 			response.PriorBootSessionsSeen = slices.Compact(response.PriorBootSessionsSeen)
@@ -1554,7 +1570,13 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		body.Port = port
 		body.CgroupID = attempt.cgroupID
-		stream := &attemptPortOperationStream{operationStream: &operationStream{Conn: operation.conn, cancel: operation.cancel}, wire: wire}
+		stream := &attemptPortOperationStream{
+			operationStream: &operationStream{Conn: operation.conn, cancel: operation.cancel},
+			wire:            wire,
+			acknowledged:    operation.monitorAcknowledgement(),
+			ctx:             operation.ctx,
+			writeSetup:      func() error { return writeSuccess(wire, struct{}{}) },
+		}
 		err := server.engine.DialAttemptPort(operation.ctx, body, stream)
 		if err != nil && !stream.ready {
 			_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, err)
@@ -1584,8 +1606,13 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 // instead of looking like helper-stream EOF and invalidating the whole session.
 type attemptPortOperationStream struct {
 	*operationStream
-	wire  *framedConn
-	ready bool
+	wire         *framedConn
+	acknowledged <-chan error
+	ctx          context.Context
+	setupOnce    sync.Once
+	setupErr     error
+	writeSetup   func() error
+	ready        bool
 }
 
 func (stream *attemptPortOperationStream) Write(payload []byte) (int, error) {
@@ -1593,11 +1620,22 @@ func (stream *attemptPortOperationStream) Write(payload []byte) (int, error) {
 		if len(payload) == 0 || payload[0] != attemptPortBackendReady {
 			return 0, errors.New("attempt-port stream omitted the backend-ready marker")
 		}
-		if err := writeSuccess(stream.wire, struct{}{}); err != nil {
-			return 0, err
-		}
-		if !readStreamAcknowledgement(stream.Conn) {
-			return 0, errors.New("attempt-port client did not acknowledge stream setup")
+		stream.setupOnce.Do(func() {
+			if err := stream.writeSetup(); err != nil {
+				stream.setupErr = err
+				return
+			}
+			select {
+			case err := <-stream.acknowledged:
+				if err != nil {
+					stream.setupErr = fmt.Errorf("attempt-port client did not acknowledge stream setup: %w", err)
+				}
+			case <-stream.ctx.Done():
+				stream.setupErr = fmt.Errorf("attempt-port client acknowledgement: %w", context.Cause(stream.ctx))
+			}
+		})
+		if stream.setupErr != nil {
+			return 0, stream.setupErr
 		}
 		stream.ready = true
 	}
@@ -1654,31 +1692,54 @@ func mergeSweepResponsePointer(target *SweepResponse, addition SweepResponse) *S
 	target.Removed += addition.Removed
 	target.PriorBootSessionsSeen = append(target.PriorBootSessionsSeen, addition.PriorBootSessionsSeen...)
 	target.Inventory = mergeResourceInventory(target.Inventory, addition.Inventory)
-	target.Attempts = append(target.Attempts, addition.Attempts...)
+	target.Attempts = mergeSweepAttempts(target.Attempts, addition.Attempts)
 	return target
 }
 
+func mergeSweepAttempts(left, right []SweptAttemptAuthority) []SweptAttemptAuthority {
+	merged := append(slices.Clone(left), right...)
+	slices.SortFunc(merged, func(left, right SweptAttemptAuthority) int {
+		for _, values := range [][2]string{
+			{left.NodeID, right.NodeID}, {left.JobID, right.JobID}, {left.RemovalGeneration, right.RemovalGeneration},
+			{left.AttemptID, right.AttemptID}, {left.FencingToken, right.FencingToken},
+			{left.PriorBootSessionID, right.PriorBootSessionID}, {left.Class, right.Class},
+		} {
+			if comparison := strings.Compare(values[0], values[1]); comparison != 0 {
+				return comparison
+			}
+		}
+		return 0
+	})
+	return slices.Compact(merged)
+}
+
 func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {
-	left.Leases = append(left.Leases, right.Leases...)
-	left.Snapshots = append(left.Snapshots, right.Snapshots...)
-	left.Containers = append(left.Containers, right.Containers...)
-	left.Tasks = append(left.Tasks, right.Tasks...)
-	left.Shims = append(left.Shims, right.Shims...)
-	left.Cgroups = append(left.Cgroups, right.Cgroups...)
-	left.LogSegments = append(left.LogSegments, right.LogSegments...)
-	left.ManagedVolumes = append(left.ManagedVolumes, right.ManagedVolumes...)
-	left.ManagedVolumeRecords = append(left.ManagedVolumeRecords, right.ManagedVolumeRecords...)
-	left.ComputerDiskImages = append(left.ComputerDiskImages, right.ComputerDiskImages...)
-	left.ComputerDiskAllocations = append(left.ComputerDiskAllocations, right.ComputerDiskAllocations...)
-	left.ComputerDiskQuotas = append(left.ComputerDiskQuotas, right.ComputerDiskQuotas...)
-	left.ComputerDiskManifests = append(left.ComputerDiskManifests, right.ComputerDiskManifests...)
-	left.ComputerDiskMounts = append(left.ComputerDiskMounts, right.ComputerDiskMounts...)
-	left.ComputerDiskLoops = append(left.ComputerDiskLoops, right.ComputerDiskLoops...)
-	left.ComputerAttachments = append(left.ComputerAttachments, right.ComputerAttachments...)
-	left.ComputerResetManifests = append(left.ComputerResetManifests, right.ComputerResetManifests...)
-	left.ComputerQuarantines = append(left.ComputerQuarantines, right.ComputerQuarantines...)
-	left.ComputerDiskAnomalies = append(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies...)
+	left.Leases = mergeInventoryClass(left.Leases, right.Leases)
+	left.Snapshots = mergeInventoryClass(left.Snapshots, right.Snapshots)
+	left.Containers = mergeInventoryClass(left.Containers, right.Containers)
+	left.Tasks = mergeInventoryClass(left.Tasks, right.Tasks)
+	left.Shims = mergeInventoryClass(left.Shims, right.Shims)
+	left.Cgroups = mergeInventoryClass(left.Cgroups, right.Cgroups)
+	left.LogSegments = mergeInventoryClass(left.LogSegments, right.LogSegments)
+	left.ManagedVolumes = mergeInventoryClass(left.ManagedVolumes, right.ManagedVolumes)
+	left.ManagedVolumeRecords = mergeInventoryClass(left.ManagedVolumeRecords, right.ManagedVolumeRecords)
+	left.ComputerDiskImages = mergeInventoryClass(left.ComputerDiskImages, right.ComputerDiskImages)
+	left.ComputerDiskAllocations = mergeInventoryClass(left.ComputerDiskAllocations, right.ComputerDiskAllocations)
+	left.ComputerDiskQuotas = mergeInventoryClass(left.ComputerDiskQuotas, right.ComputerDiskQuotas)
+	left.ComputerDiskManifests = mergeInventoryClass(left.ComputerDiskManifests, right.ComputerDiskManifests)
+	left.ComputerDiskMounts = mergeInventoryClass(left.ComputerDiskMounts, right.ComputerDiskMounts)
+	left.ComputerDiskLoops = mergeInventoryClass(left.ComputerDiskLoops, right.ComputerDiskLoops)
+	left.ComputerAttachments = mergeInventoryClass(left.ComputerAttachments, right.ComputerAttachments)
+	left.ComputerResetManifests = mergeInventoryClass(left.ComputerResetManifests, right.ComputerResetManifests)
+	left.ComputerQuarantines = mergeInventoryClass(left.ComputerQuarantines, right.ComputerQuarantines)
+	left.ComputerDiskAnomalies = mergeInventoryClass(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
 	return left
+}
+
+func mergeInventoryClass(left, right []string) []string {
+	merged := append(slices.Clone(left), right...)
+	slices.Sort(merged)
+	return slices.Compact(merged)
 }
 
 type operationStream struct {
@@ -1752,7 +1813,17 @@ func writeStreamResult(connection *framedConn, method Method, err error) {
 	_ = connection.write(frame{Version: ProtocolVersion, OK: true})
 }
 
-func engineFailureRPC(method Method, message string, reason EngineFailureReason) *RPCError {
+func engineFailureRPC(method Method, message string, reason EngineFailureReason, cause ...error) *RPCError {
+	const messageLimit = 1024
+	if len(cause) > 0 && cause[0] != nil {
+		detail := strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(cause[0].Error()))
+		if len(detail) > messageLimit {
+			detail = detail[:messageLimit]
+		}
+		if detail != "" {
+			message += ": " + detail
+		}
+	}
 	return &RPCError{Code: CodeEngineFailure, Message: message, EngineFailure: &EngineFailureFact{Operation: method, Reason: reason}}
 }
 

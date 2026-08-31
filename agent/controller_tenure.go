@@ -1,9 +1,12 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -17,6 +20,7 @@ import (
 const (
 	controllerTenureFinalizationLimit = 30 * time.Second
 	controllerControlDialLimit        = 5 * time.Second
+	replacementRFBStringLimit         = 1 << 20
 )
 
 type controllerTenureConfig struct {
@@ -147,14 +151,22 @@ func (tenure *controllerTenure) take(ctx context.Context, sessionID string) (net
 	}
 
 	dialContext, cancelDial := context.WithTimeout(operationContext, controllerControlDialLimit)
-	connection, websocketConnection, _, dialErr := dialComputerBackendWithLifetime(
+	connection, websocketConnection, banner, dialErr := dialComputerBackendWithLifetime(
 		dialContext, session.context, tenure.config.dial, workloadrunner.AttemptEndpointControl,
 	)
-	cancelDial()
 	if dialErr != nil {
+		cancelDial()
 		return nil, displacedSessionID, tenure.failTake(operation, session, serial, override, signalTrue, true,
 			fmt.Errorf("dial Computer control backend: %w", dialErr))
 	}
+	if err := negotiateReplacementComputerControl(dialContext, connection, banner); err != nil {
+		_ = websocketConnection.CloseNow()
+		_ = connection.Close()
+		cancelDial()
+		return nil, displacedSessionID, tenure.failTake(operation, session, serial, override, signalTrue, true,
+			fmt.Errorf("negotiate replacement Computer control backend: %w", err))
+	}
+	cancelDial()
 	managed := newControllerConn(connection, websocketConnection, tenure, sessionID)
 
 	if override {
@@ -179,6 +191,123 @@ func (tenure *controllerTenure) take(ctx context.Context, sessionID string) (net
 			&ComputerTenureError{Code: ComputerTenureSessionEnded})
 	}
 	return managed, displacedSessionID, nil
+}
+
+// negotiateReplacementComputerControl owns the fresh control backend's RFB
+// handshake before the relay leg swap. The already-negotiated client sees one
+// continuous RFB session and never receives a second banner or ServerInit.
+func negotiateReplacementComputerControl(ctx context.Context, connection net.Conn, banner []byte) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := connection.SetDeadline(deadline); err != nil {
+			return fmt.Errorf("bound replacement RFB handshake: %w", err)
+		}
+		defer connection.SetDeadline(time.Time{})
+	}
+	clientVersion, negotiatedMinor, err := replacementComputerRFBVersion(banner)
+	if err != nil {
+		return err
+	}
+	if _, err := connection.Write(clientVersion); err != nil {
+		return fmt.Errorf("write replacement RFB version: %w", err)
+	}
+	if negotiatedMinor == 3 {
+		var securityType [4]byte
+		if _, err := io.ReadFull(connection, securityType[:]); err != nil {
+			return fmt.Errorf("read replacement RFB 3.3 security type: %w", err)
+		}
+		selected := binary.BigEndian.Uint32(securityType[:])
+		if selected == 0 {
+			reason, err := readBoundedRFBString(connection, replacementRFBStringLimit)
+			if err != nil {
+				return fmt.Errorf("read replacement RFB 3.3 security failure reason: %w", err)
+			}
+			return fmt.Errorf("replacement RFB 3.3 security failed: %s", reason)
+		}
+		if selected != 1 {
+			return errors.New("replacement RFB 3.3 backend does not select None security")
+		}
+	} else {
+		var count [1]byte
+		if _, err := io.ReadFull(connection, count[:]); err != nil {
+			return fmt.Errorf("read replacement RFB security count: %w", err)
+		}
+		if count[0] == 0 {
+			reason, err := readBoundedRFBString(connection, replacementRFBStringLimit)
+			if err != nil {
+				return fmt.Errorf("read replacement RFB security failure reason: %w", err)
+			}
+			return fmt.Errorf("replacement RFB security failed: %s", reason)
+		}
+		securityTypes := make([]byte, int(count[0]))
+		if _, err := io.ReadFull(connection, securityTypes); err != nil {
+			return fmt.Errorf("read replacement RFB security types: %w", err)
+		}
+		if !bytes.Contains(securityTypes, []byte{1}) {
+			return errors.New("replacement RFB backend does not offer None security")
+		}
+		if _, err := connection.Write([]byte{1}); err != nil {
+			return fmt.Errorf("select replacement RFB security: %w", err)
+		}
+		if negotiatedMinor >= 8 {
+			var securityResult [4]byte
+			if _, err := io.ReadFull(connection, securityResult[:]); err != nil {
+				return fmt.Errorf("read replacement RFB security result: %w", err)
+			}
+			if securityResult != [4]byte{} {
+				return fmt.Errorf("replacement RFB security failed: %x", securityResult)
+			}
+		}
+	}
+	if _, err := connection.Write([]byte{1}); err != nil {
+		return fmt.Errorf("write replacement RFB ClientInit: %w", err)
+	}
+	var serverInit [24]byte
+	if _, err := io.ReadFull(connection, serverInit[:]); err != nil {
+		return fmt.Errorf("read replacement RFB ServerInit: %w", err)
+	}
+	nameBytes := binary.BigEndian.Uint32(serverInit[20:24])
+	if nameBytes > replacementRFBStringLimit {
+		return fmt.Errorf("replacement RFB desktop name is %d bytes, limit %d", nameBytes, replacementRFBStringLimit)
+	}
+	if _, err := io.CopyN(io.Discard, connection, int64(nameBytes)); err != nil {
+		return fmt.Errorf("read replacement RFB desktop name: %w", err)
+	}
+	return nil
+}
+
+func replacementComputerRFBVersion(banner []byte) ([]byte, int, error) {
+	if !contract.ValidComputerRFBVersionBanner(banner) {
+		return nil, 0, errors.New("replacement RFB backend sent an invalid version banner")
+	}
+	major := 100*int(banner[4]-'0') + 10*int(banner[5]-'0') + int(banner[6]-'0')
+	minor := 100*int(banner[8]-'0') + 10*int(banner[9]-'0') + int(banner[10]-'0')
+	if major < 3 || (major == 3 && minor < 3) {
+		return nil, 0, fmt.Errorf("replacement RFB backend version %03d.%03d predates supported version 003.003", major, minor)
+	}
+	negotiatedMinor := 8
+	if major == 3 && minor < 8 {
+		negotiatedMinor = 7
+	}
+	if major == 3 && minor < 7 {
+		negotiatedMinor = 3
+	}
+	return []byte(fmt.Sprintf("RFB 003.%03d\n", negotiatedMinor)), negotiatedMinor, nil
+}
+
+func readBoundedRFBString(connection io.Reader, limit uint32) (string, error) {
+	var encodedLength [4]byte
+	if _, err := io.ReadFull(connection, encodedLength[:]); err != nil {
+		return "", err
+	}
+	length := binary.BigEndian.Uint32(encodedLength[:])
+	if length > limit {
+		return "", fmt.Errorf("RFB string is %d bytes, limit %d", length, limit)
+	}
+	value := make([]byte, int(length))
+	if _, err := io.ReadFull(connection, value); err != nil {
+		return "", err
+	}
+	return string(value), nil
 }
 
 func (tenure *controllerTenure) beginTake(
