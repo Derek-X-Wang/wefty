@@ -378,9 +378,12 @@ while :; do sleep 1; done
 			sweepReceipt, sweepReceiptOK, retainedIdentity, retainedIdentityErr)
 	}
 	newAuthority := authorities.wait(t, readmitted.CurrentAttemptID, 5*time.Second)
-	stale, staleEvidenceElapsed, staleEvidenceLate, staleEvidenceArm := waitNativeRuntimeLossEvidence(
+	stale, staleEvidenceElapsed, staleEvidenceLate, staleEvidenceArm, staleEvidenceObserved := waitNativeRuntimeLossEvidence(
 		t, store, primary.JobID, firstAttempt, recoveryStarted, l1.DefaultLeaseDuration,
 	)
+	if !staleEvidenceObserved {
+		t.Fatalf("attempt %s did not retain typed runtime-loss evidence within production lease %s: %+v", firstAttempt, l1.DefaultLeaseDuration, stale)
+	}
 	serviceFreshAttemptReadmission = ready && newGeneration != oldGeneration &&
 		readmitted.CurrentAttemptID != firstAttempt && newAuthority.FencingToken != firstAuthority.FencingToken &&
 		serviceRecoveryElapsed <= 15*time.Second && healthElapsed <= 15*time.Second
@@ -850,7 +853,7 @@ func waitNativeServiceAttempt(t *testing.T, store *l1.Store, jobID, priorAttempt
 	return l1.Job{}
 }
 
-func waitNativeRuntimeLossEvidence(t *testing.T, store *l1.Store, jobID, attemptID string, anchor time.Time, timeout time.Duration) (l1.Attempt, time.Duration, bool, string) {
+func waitNativeRuntimeLossEvidence(t *testing.T, store *l1.Store, jobID, attemptID string, anchor time.Time, timeout time.Duration) (l1.Attempt, time.Duration, bool, string, bool) {
 	t.Helper()
 	deadline := anchor.Add(timeout)
 	var last *l1.Attempt
@@ -867,18 +870,20 @@ func waitNativeRuntimeLossEvidence(t *testing.T, store *l1.Store, jobID, attempt
 			last = &attempt
 			if attempt.State == contract.AttemptFailed && attempt.Result != nil && attempt.Result.RuntimeFailure != nil &&
 				attempt.Result.RuntimeFailure.Code == contract.RuntimeFailureUnavailable {
-				return attempt, time.Since(anchor), false, "result"
+				return attempt, time.Since(anchor), false, "result", true
 			}
 			if attempt.State == contract.AttemptLost && attempt.LateResult != nil && attempt.LateResult.Kind == l1.LateResultObservation &&
 				attempt.LateResult.Late && attempt.LateResult.Result != nil && attempt.LateResult.Result.RuntimeFailure != nil &&
 				attempt.LateResult.Result.RuntimeFailure.Code == contract.RuntimeFailureUnavailable {
-				return attempt, time.Since(anchor), true, "late_result"
+				return attempt, time.Since(anchor), true, "late_result", true
 			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("attempt %s did not retain typed runtime-loss evidence within production lease %s: %+v", attemptID, timeout, last)
-	return l1.Attempt{}, time.Since(anchor), false, ""
+	if last != nil {
+		return *last, time.Since(anchor), false, "not_observed", false
+	}
+	return l1.Attempt{}, time.Since(anchor), false, "not_observed", false
 }
 
 type nativeOCIService struct {
