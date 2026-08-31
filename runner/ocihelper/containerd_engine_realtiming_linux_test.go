@@ -1306,11 +1306,12 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		}
 	}
 	// Keep the long-lived ownership attempt focused on the control-state
-	// handshake and readiness marker. The successor attempt below performs the
-	// one-shot /dev/shm and cgroup charge assertions before its distinguished
-	// exit, so an unrelated profile assertion cannot silently prevent this
-	// attempt from publishing the readiness line needed to kill the helper.
-	first := request("a", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' || { printf 'initial driver state mismatch\n' >&2; exit 18; }; i=0; while test "$i" -lt 50; do test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' && break; i=$((i + 1)); sleep .1; done; test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' || { printf 'human-driving state not observed\n' >&2; exit 19; }; printf computer-disk-marker > /wefty/service/marker || { printf 'persistent marker write failed\n' >&2; exit 27; }; sync || { printf 'persistent marker sync failed\n' >&2; exit 28; }; printf 'computer-disk-ready\n'; exec sleep 60`})
+	// handshake and readiness marker. Run may return closely enough to the
+	// payload start that SetComputerControlState wins the race with its first
+	// read, so the payload waits for true without requiring that it first
+	// observe the already-proven fresh false state. The successor attempt below
+	// performs the one-shot /dev/shm and cgroup charge assertions.
+	first := request("a", []string{"/bin/sh", "-c", `i=0; while test "$i" -lt 50; do test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' && break; i=$((i + 1)); sleep .1; done; test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":true}' || { printf 'human-driving state not observed\n' >&2; exit 19; }; printf computer-disk-marker > /wefty/service/marker || { printf 'persistent marker write failed\n' >&2; exit 27; }; sync || { printf 'persistent marker sync failed\n' >&2; exit 28; }; printf 'computer-disk-ready\n'; exec sleep 60`})
 	firstResponse, err := session.Run(ctx, first)
 	if err != nil {
 		t.Fatal(err)

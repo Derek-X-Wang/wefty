@@ -55,6 +55,40 @@ func TestComputerStorageResetBindsSweepReceiptToNamedPriorJob(t *testing.T) {
 	}
 }
 
+func TestComputerStorageResetMarksSuccessorFreshForFirstAttach(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	prior := testComputerAuthority("attempt-a", "fence-a", "boot-a")
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	request := resetTestRequest(storage, prior)
+	request.Storage.IntentRevision = request.Authority.IntentRevision
+	if _, err := engine.ResetComputerStorage(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	successor := storage
+	successor.StorageGeneration = request.NewGeneration
+	successor.IntentRevision = request.Authority.IntentRevision
+	fresh, err := engine.attachComputerDisk(t.Context(), successor,
+		testComputerAuthority("attempt-b", "fence-b", "boot-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fresh.fresh {
+		t.Fatal("prepared reset successor was treated as an existing tenant-owned disk")
+	}
+	if err := engine.detachComputerDisk(fresh, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestComputerStorageResetResumesEveryPreparationBoundaryThenUsesSharedRemoval(t *testing.T) {
 	for _, checkpoint := range []computerStorageResetPhase{
 		computerStorageResetRetirementFenced,

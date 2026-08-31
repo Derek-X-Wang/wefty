@@ -227,6 +227,10 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 			return nil, err
 		}
 	}
+	// Reset prepares and publishes the successor image before its first attach.
+	// Its bytes therefore exist, but its empty filesystem root is still fresh
+	// and must receive the resolved image user's ownership exactly once.
+	freshRoot := createdImage || manifest.Prepared
 	{
 		previousDetachment := manifest.PreviousDetachment
 		storage.DiskBytes = manifest.Storage.DiskBytes
@@ -269,7 +273,7 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		_ = engine.computerDiskSystem().detach(mountPath, loopDevice, imagePath)
 		return nil, err
 	}
-	attachment := &computerDiskAttachment{name: name, storage: manifest.Storage, imagePath: imagePath, mountPath: mountPath, loopDevice: loopDevice, authority: authority, lock: lock, fresh: createdImage}
+	attachment := &computerDiskAttachment{name: name, storage: manifest.Storage, imagePath: imagePath, mountPath: mountPath, loopDevice: loopDevice, authority: authority, lock: lock, fresh: freshRoot}
 	manifest = computerDiskManifest{
 		Version: computerDiskManifestVersion, Storage: attachment.storage, DiskImage: "disk.ext4", MountDirectory: name,
 		LoopDevice: loopDevice, Attached: &authority,
