@@ -495,6 +495,50 @@ func TestComputerDiskSweepRetainsBytesAndAuthorizesOneFreshAttach(t *testing.T) 
 	}
 }
 
+func TestComputerDiskSweepAuthorizesSuccessorAcrossHelperAndJobReplacement(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		successorJob  string
+		successorBoot string
+	}{
+		{name: "helper replacement within agent boot", successorJob: "job-1", successorBoot: "boot-a"},
+		{name: "replacement Job within agent boot", successorJob: "job-2", successorBoot: "boot-a"},
+		{name: "same Job after agent boot", successorJob: "job-1", successorBoot: "boot-b"},
+		{name: "replacement Job after agent boot", successorJob: "job-2", successorBoot: "boot-b"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			system := newFakeComputerDiskSystem()
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system, attempts: make(map[string]*containerdAttempt)}
+			storage := testComputerStorage()
+			attachment, err := engine.attachComputerDisk(t.Context(), storage,
+				testComputerAuthority("attempt-a", "fence-a", "boot-a"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := unix.Flock(int(attachment.lock.Fd()), unix.LOCK_UN); err != nil {
+				t.Fatal(err)
+			}
+			if err := attachment.lock.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.sweepComputerDisks("helper-replacement-sweep"); err != nil {
+				t.Fatal(err)
+			}
+
+			successor := testComputerAuthority("attempt-b", "fence-b", test.successorBoot)
+			successor.JobID = test.successorJob
+			reattached, err := engine.attachComputerDisk(t.Context(), storage, successor)
+			if err != nil {
+				t.Fatalf("successor did not consume the exact helper sweep detachment: %v", err)
+			}
+			if err := engine.detachComputerDisk(reattached, computerDiskReapReceipt, ""); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestComputerDiskInventoryEnumeratesAllocationAndAttachmentClasses(t *testing.T) {
 	root := t.TempDir()
 	system := newFakeComputerDiskSystem()

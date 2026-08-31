@@ -589,7 +589,14 @@ lock disappearance and helper death do not authorize another attach. Exact
 same-boot `Delete`/`ReapAndVerify` writes a single-use detachment receipt; boot
 sweep positively unmounts and detaches every helper-owned Computer disk,
 retains image bytes, and writes a receipt bound to its sweep epoch. The next
-attach consumes exactly one such receipt. Inventory separately enumerates disk
+attach consumes exactly one such receipt. A boot-sweep receipt names the prior
+Job/attempt/fence rather than the successor: helper replacement may happen
+within the same agent boot, and Computer reconfiguration may replace the Job,
+so successor admission instead requires the same durable Computer/Storage
+generation and Node plus the independently authenticated fresh attempt. The
+persisted `prior_boot_sweep` kind distinguishes a helper sweep from a
+same-session reap; it does not assert that the agent boot-session ID changed.
+Inventory separately enumerates disk
 images, verified full allocations, fixed filesystem quotas, manifests, mounts,
 loop devices, and live attachments; namespace quiescence projects out only
 durable images/allocations/quotas/manifests, never live attachment mechanics.

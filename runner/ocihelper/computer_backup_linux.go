@@ -89,19 +89,7 @@ func sameComputerBackupAuthority(left, right ComputerBackupAuthority) bool {
 }
 
 func validBackupDetachmentEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority ComputerBackupAuthority) bool {
-	if evidence == nil || evidence.ReceiptID == "" || evidence.NodeID != authority.NodeID ||
-		evidence.JobID != authority.JobID || evidence.ComputerID != storage.ComputerID ||
-		evidence.StorageID != storage.StorageID || evidence.StorageGeneration != storage.StorageGeneration {
-		return false
-	}
-	switch evidence.Kind {
-	case computerDiskReapReceipt:
-		return evidence.BootSessionID == authority.BootSessionID && evidence.SweepEpoch == ""
-	case computerDiskSweepReceipt:
-		return evidence.BootSessionID != authority.BootSessionID && evidence.SweepEpoch != ""
-	default:
-		return false
-	}
+	return validComputerDiskDetachmentEvidence(evidence, storage, authority.NodeID, authority.BootSessionID)
 }
 
 // lockDetachedBackupSource holds the same attachment flock used by attach and

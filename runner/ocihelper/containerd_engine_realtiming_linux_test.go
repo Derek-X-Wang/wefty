@@ -1342,7 +1342,7 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	}
 	second := request("c", []string{"/bin/sh", "-c", `test "$(cat /wefty/control/driver.json)" = '{"version":1,"human_driving":false}' && test "$(cat /wefty/service/marker)" = computer-disk-marker || exit 30; dd if=/dev/zero of=/wefty/service/fill bs=1048576 count=64 2>/tmp/disk-error && exit 31; grep -q 'No space left on device' /tmp/disk-error || exit 32; exit 42`})
 	if _, err := session.Run(ctx, second); err != nil {
-		t.Fatalf("real Computer attempt C did not consume A's reap receipt: %v", err)
+		t.Fatalf("real Computer attempt C did not consume A's helper-sweep detachment: %v", err)
 	}
 	var result *ocihelper.WatchResponse
 	if err := session.Watch(ctx, ocihelper.WatchRequest{Authority: second.Authority}, func(event ocihelper.WatchEvent) error {
