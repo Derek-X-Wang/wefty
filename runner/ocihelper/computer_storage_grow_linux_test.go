@@ -182,6 +182,34 @@ func TestComputerGrowNoopResizeFailsReadback(t *testing.T) {
 	}
 }
 
+func TestComputerGrowReassertsAllocationAfterFilesystemResize(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root},
+		capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt),
+		computerGrowResize: func(_ context.Context, path, _ string, _, newBytes int64) error {
+			if err := fullyAllocateComputerDisk(path, newBytes); err != nil {
+				return err
+			}
+			file, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				return err
+			}
+			err = unix.Fallocate(int(file.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, 0, 1<<20)
+			return errors.Join(err, file.Close())
+		},
+		computerGrowFilesystemBytes: func(context.Context, string) (int64, error) { return request.NewDiskBytes, nil },
+	}
+	response, err := engine.GrowComputerStorage(t.Context(), request)
+	if err != nil || !response.Receipt.Applied {
+		t.Fatalf("grow after filesystem sparse write = %#v err=%v", response, err)
+	}
+	if err := verifyComputerDiskAllocation(imagePath, request.NewDiskBytes); err != nil {
+		t.Fatalf("grown image allocation = %v", err)
+	}
+}
+
 func TestComputerGrowENOSPCRollsBackDeltaAndReturnsReceipt(t *testing.T) {
 	root := t.TempDir()
 	request := growTestRequest(16 << 20)

@@ -1428,11 +1428,30 @@ func waitForNativeAttemptLog(t *testing.T, ctx context.Context, session *ocihelp
 	watchContext, cancelWatch := context.WithTimeout(ctx, 10*time.Second)
 	observed := make(chan struct{}, 1)
 	watchDone := make(chan error, 1)
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
+	var result *ocihelper.WatchResponse
+	var seals []ocihelper.LogSeal
+	var gaps []string
 	go func() {
 		watchDone <- session.Watch(watchContext, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
-			if event.Log != nil && event.Log.Stream == "stdout" && event.Log.Gap == nil {
-				_, _ = stdout.Write(event.Log.Bytes)
+			if event.Log != nil {
+				if event.Log.Gap != nil {
+					gaps = append(gaps, fmt.Sprintf("%s:%+v", event.Log.Stream, *event.Log.Gap))
+				} else {
+					switch event.Log.Stream {
+					case "stdout":
+						_, _ = stdout.Write(event.Log.Bytes)
+					case "stderr":
+						_, _ = stderr.Write(event.Log.Bytes)
+					}
+				}
+			}
+			if event.Seal != nil {
+				seals = append(seals, *event.Seal)
+			}
+			if event.Result != nil {
+				terminal := *event.Result
+				result = &terminal
 			}
 			if bytes.Contains(stdout.Bytes(), needle) {
 				select {
@@ -1451,10 +1470,15 @@ func waitForNativeAttemptLog(t *testing.T, ctx context.Context, session *ocihelp
 		}
 	case err := <-watchDone:
 		cancelWatch()
-		t.Fatalf("native attempt ended before readiness log %q: %v", needle, err)
+		if !bytes.Contains(stdout.Bytes(), needle) {
+			t.Fatalf("native attempt ended before readiness log %q: watch_err=%v result=%+v stdout=%q stderr=%q seals=%+v gaps=%+v",
+				needle, err, result, stdout.String(), stderr.String(), seals, gaps)
+		}
 	case <-watchContext.Done():
 		cancelWatch()
-		t.Fatalf("native attempt did not emit readiness log %q: %v", needle, watchContext.Err())
+		err := <-watchDone
+		t.Fatalf("native attempt did not emit readiness log %q: watch_err=%v result=%+v stdout=%q stderr=%q seals=%+v gaps=%+v",
+			needle, err, result, stdout.String(), stderr.String(), seals, gaps)
 	}
 	if err := session.HealthError(); err != nil {
 		t.Fatalf("caller-canceled readiness Watch invalidated helper session: %v", err)

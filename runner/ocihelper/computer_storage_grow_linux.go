@@ -248,6 +248,23 @@ func growExt4(ctx context.Context, imagePath, loopDevice string, oldBytes, newBy
 		}
 		return fmt.Errorf("ext4 Computer filesystem size readback = %d, want at least %d", observed, newBytes)
 	}
+	return reassertComputerGrowAllocation(imagePath, newBytes)
+}
+
+func reassertComputerGrowAllocation(imagePath string, newBytes int64) error {
+	info, err := os.Lstat(imagePath)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() != newBytes {
+		return fmt.Errorf("Computer disk allocation does not match its %d-byte grow target", newBytes)
+	}
+	// Like mkfs, resize2fs may discard or sparse-write ranges in the backing
+	// file. Reassert allocation after the filesystem operation so a successful
+	// grow cannot strand a manifest whose image has fewer blocks than its budget.
+	if err := fullyAllocateComputerDisk(imagePath, newBytes); err != nil {
+		return err
+	}
 	return verifyComputerDiskAllocation(imagePath, newBytes)
 }
 
@@ -271,7 +288,7 @@ func (engine *ContainerdEngine) resizeComputerStorage(ctx context.Context, image
 		if observed < newBytes {
 			return fmt.Errorf("ext4 Computer filesystem size readback = %d, want at least %d", observed, newBytes)
 		}
-		return verifyComputerDiskAllocation(imagePath, newBytes)
+		return reassertComputerGrowAllocation(imagePath, newBytes)
 	}
 	reader := engine.computerGrowFilesystemBytes
 	if reader == nil {
