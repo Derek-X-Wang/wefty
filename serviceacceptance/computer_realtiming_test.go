@@ -311,7 +311,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"agent_loss_fresh_attempt":       restarted.CurrentJob.CurrentAttemptID != beforeAgentLoss,
 		"same_storage_generation":        restarted.StorageID == oldStorage && restarted.StorageGeneration == oldGeneration,
 		"profile_marker_survived_losses": true,
-		"readiness_republished":          currentSessionEndpoint != "",
+		"readiness_republished":          oldSessionEndpoint != currentSessionEndpoint,
 		"old_session_authority_rejected": oldAuthorityRejected.Error.Code == contract.ErrorTakeoverSessionEnded &&
 			oldAuthorityRejected.Receipt != nil && oldAuthorityRejected.Receipt.SessionEndReason == string(l1.ComputerTakeoverAttemptAuthorityLost),
 	}, map[string]string{"old_attempt_id": oldAttempt, "new_attempt_id": restarted.CurrentJob.CurrentAttemptID,
