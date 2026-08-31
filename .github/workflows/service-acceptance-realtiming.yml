@@ -341,6 +341,11 @@ jobs:
           while true; do
             if IFS= read -r action < /tmp/wefty-oci-faults/control; then
               case "$action" in
+                kill-shim)
+                  shim_pid="$(pgrep -f 'containerd-shim-runc-v2.*-namespace wefty' | head -n 1)"
+                  test -n "$shim_pid"
+                  kill -KILL "$shim_pid"
+                  ;;
                 kill-payload:*|kill-shim:*)
                   job_id="${action#*:}"
                   container=""
