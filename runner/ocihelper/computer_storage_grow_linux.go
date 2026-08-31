@@ -38,6 +38,28 @@ func growReceipt(request GrowComputerStorageRequest, kind string, applied bool, 
 		ObservedAvailableBytes: available}, nil
 }
 
+type computerGrowCapacityState uint8
+
+const (
+	computerGrowCapacityCurrent computerGrowCapacityState = iota
+	computerGrowCapacityPending
+	computerGrowCapacityMaterialized
+)
+
+func classifyComputerGrowCapacity(reservation *capacityReservation, oldBytes, newBytes int64) (computerGrowCapacityState, error) {
+	if reservation == nil || (reservation.diskBytes == oldBytes && reservation.pendingDiskBytes == 0) {
+		return computerGrowCapacityCurrent, nil
+	}
+	delta := newBytes - oldBytes
+	if reservation.diskBytes == oldBytes && reservation.pendingDiskBytes == delta {
+		return computerGrowCapacityPending, nil
+	}
+	if reservation.diskBytes == newBytes && reservation.pendingDiskBytes == 0 {
+		return computerGrowCapacityMaterialized, nil
+	}
+	return 0, errors.New("Computer grow conflicts with its atomic capacity reservation")
+}
+
 func (engine *ContainerdEngine) reserveGrowCapacity(request GrowComputerStorageRequest, diskRoot string, imageSize int64) (int64, bool, error) {
 	engine.capacityMu.Lock()
 	defer engine.capacityMu.Unlock()
@@ -53,8 +75,12 @@ func (engine *ContainerdEngine) reserveGrowCapacity(request GrowComputerStorageR
 	if delta <= 0 {
 		return 0, false, errors.New("Computer grow delta must be positive")
 	}
-	if reservation != nil && reservation.diskBytes != request.Storage.DiskBytes && reservation.diskBytes != request.NewDiskBytes {
-		return 0, false, errors.New("Computer grow conflicts with its atomic capacity reservation")
+	state, err := classifyComputerGrowCapacity(reservation, request.Storage.DiskBytes, request.NewDiskBytes)
+	if err != nil {
+		return 0, false, err
+	}
+	if state == computerGrowCapacityMaterialized && imageSize != request.NewDiskBytes {
+		return 0, false, errors.New("Computer grow materialized capacity conflicts with the disk image")
 	}
 	for jobID, existing := range engine.capacityReservations {
 		if jobID != request.Authority.JobID && existing.pendingDiskBytes != 0 &&
@@ -64,14 +90,9 @@ func (engine *ContainerdEngine) reserveGrowCapacity(request GrowComputerStorageR
 	}
 	admissionCeiling := available
 	gate := delta
-	if imageSize == request.NewDiskBytes {
+	if imageSize == request.NewDiskBytes || state == computerGrowCapacityPending {
 		// A retry after filesystem expansion must not charge the already
-		// materialized delta a second time.
-		gate = 0
-	} else if reservation != nil && reservation.pendingDiskBytes != 0 {
-		if reservation.pendingDiskBytes != delta {
-			return 0, false, errors.New("Computer grow conflicts with its pending delta reservation")
-		}
+		// admitted delta a second time.
 		gate = 0
 	}
 	pending := int64(0)
@@ -100,7 +121,7 @@ func (engine *ContainerdEngine) reserveGrowCapacity(request GrowComputerStorageR
 			diskMaterialized: true, attempts: make(map[string]struct{})}
 		engine.capacityReservations[request.Authority.JobID] = reservation
 	}
-	if imageSize == request.NewDiskBytes && reservation.diskBytes == request.NewDiskBytes {
+	if imageSize == request.NewDiskBytes && state != computerGrowCapacityPending {
 		reservation.diskBytes = request.NewDiskBytes
 		reservation.pendingDiskBytes = 0
 		reservation.pendingDiskAdmissionCeiling = 0
