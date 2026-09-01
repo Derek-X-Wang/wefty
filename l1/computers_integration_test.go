@@ -275,8 +275,17 @@ func TestComputerIntentOwnsLifecycleAndSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if stopped.CurrentJob.State != contract.JobStopped || stopped.CurrentJob.HoldsSlot(stopped.CurrentJob.State) ||
-		stopped.BoundNodeID != node.NodeID || stopped.StorageID != retainedStorage || len(stopped.Grants) != 0 {
+		stopped.CurrentJob.CurrentAttemptID != "" || stopped.BoundNodeID != node.NodeID ||
+		stopped.StorageID != retainedStorage || len(stopped.Grants) != 0 {
 		t.Fatalf("stopped Computer did not release only its Slot: %#v", stopped)
+	}
+	if replayed, err := h.store.CompleteAttempt(context.Background(), "fabric-computer-node", claim.Job.JobID,
+		claim.Lease.AttemptID, CompletionRequest{
+			FencingToken: claim.Lease.FencingToken, IdempotencyKey: "computer-stop",
+			Result:                    ProcessResult{OutputError: "logs finalized after positive reap"},
+			RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt,
+		}); err != nil || replayed.State != contract.JobStopped || replayed.CurrentAttemptID != "" {
+		t.Fatalf("detached Computer completion replay = %#v err=%v", replayed, err)
 	}
 
 	wrongStorage := computerDesiredRequest(stopped, contract.ServiceDesiredRunning, "wrong-storage")

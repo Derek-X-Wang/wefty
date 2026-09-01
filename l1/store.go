@@ -3358,6 +3358,11 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 	jobUpdate := "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?"
 	if prestartRequeue && finalJobState == contract.JobQueued {
 		jobUpdate = "UPDATE jobs SET state=?, updated_ns=?, current_attempt_id=NULL WHERE job_id=?"
+	} else if jobBeforeCompletion.ComputerID != "" && finalJobState == contract.JobStopped {
+		// A Computer reaches stopped only after accepted runtime-quiescence
+		// evidence. Publish that positive detachment by clearing the runtime
+		// owner while retaining the terminal attempt row for completion replay.
+		jobUpdate = "UPDATE jobs SET state=?, updated_ns=?, current_attempt_id=NULL WHERE job_id=?"
 	}
 	_, err = tx.ExecContext(ctx, jobUpdate, finalJobState, now.UnixNano(), jobID)
 	if err != nil {

@@ -243,10 +243,9 @@ func validServiceStatePair(desired contract.ServiceDesiredState, state contract.
 }
 
 // transitionServiceJob persists one service state-machine edge inside the
-// caller's transaction. It intentionally leaves current_attempt_id untouched:
-// stop completion can be replayed only while that attempt remains current.
-// Callers own edge-specific side effects such as publication clearing and
-// capacity reacquisition in this same transaction.
+// caller's transaction. It intentionally leaves current_attempt_id untouched;
+// callers own edge-specific side effects such as publication clearing,
+// capacity reacquisition, and publishing a positively detached Computer.
 func transitionServiceJob(
 	ctx context.Context,
 	tx *sql.Tx,

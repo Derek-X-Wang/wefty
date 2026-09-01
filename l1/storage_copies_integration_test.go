@@ -437,6 +437,54 @@ func TestComputerStorageCopyReceiptMutationRowsFailTwentyOfTwenty(t *testing.T) 
 }
 
 func TestRestoreAndCloneFailClosedOnRunningAttachedAndStaleAuthority(t *testing.T) {
+	t.Run("restore after runtime stop", func(t *testing.T) {
+		h, node, computer, source, _ := publishedBackupForStorageCopy(t, 2)
+		resumed, err := h.store.SetComputerDesiredState(context.Background(), computer.ComputerID,
+			computerDesiredRequest(computer, contract.ServiceDesiredRunning, "resume-before-restore"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resumed, claim := startBackupComputer(t, h, node, resumed)
+		if _, err := h.store.SetComputerDesiredState(context.Background(), resumed.ComputerID,
+			computerDesiredRequest(resumed, contract.ServiceDesiredStopped, "stop-before-restore")); err != nil {
+			t.Fatal(err)
+		}
+		finishBackupQuiescence(t, h, claim, "restore-source-detached")
+		stopped, err := h.store.GetComputer(context.Background(), resumed.ComputerID)
+		if err != nil || stopped.CurrentJob.State != contract.JobStopped || stopped.CurrentJob.CurrentAttemptID != "" {
+			t.Fatalf("runtime-stopped restore source = %#v err=%v", stopped, err)
+		}
+		if _, replayed, err := h.store.BeginComputerRestore(context.Background(), stopped.ComputerID,
+			ComputerRestoreRequest{ComputerMutationPrecondition: computerPrecondition(stopped, "operator"), BackupID: source.BackupID, IdempotencyKey: "runtime-stopped"}); err != nil || replayed {
+			t.Fatalf("runtime-stopped restore replayed=%t err=%v", replayed, err)
+		}
+	})
+	t.Run("restore after unverified runtime stop", func(t *testing.T) {
+		h, node, computer, source, _ := publishedBackupForStorageCopy(t, 2)
+		resumed, err := h.store.SetComputerDesiredState(context.Background(), computer.ComputerID,
+			computerDesiredRequest(computer, contract.ServiceDesiredRunning, "resume-before-unverified-stop"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resumed, claim := startBackupComputer(t, h, node, resumed)
+		if _, err := h.store.SetComputerDesiredState(context.Background(), resumed.ComputerID,
+			computerDesiredRequest(resumed, contract.ServiceDesiredStopped, "unverified-stop-before-restore")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.store.CompleteAttempt(context.Background(), "fabric-computer-node", claim.Job.JobID,
+			claim.Lease.AttemptID, CompletionRequest{FencingToken: claim.Lease.FencingToken,
+				IdempotencyKey: "restore-source-unverified", Result: ProcessResult{OutputError: "runtime detach was not proven"}}); err != nil {
+			t.Fatal(err)
+		}
+		failed, err := h.store.GetComputer(context.Background(), resumed.ComputerID)
+		if err != nil || failed.CurrentJob.State != contract.JobFailed || failed.CurrentJob.CurrentAttemptID != claim.Lease.AttemptID {
+			t.Fatalf("unverified runtime-stopped restore source = %#v err=%v", failed, err)
+		}
+		if _, _, err := h.store.BeginComputerRestore(context.Background(), failed.ComputerID,
+			ComputerRestoreRequest{ComputerMutationPrecondition: computerPrecondition(failed, "operator"), BackupID: source.BackupID, IdempotencyKey: "unverified-runtime-stop"}); errorCode(err) != contract.ErrorConflict {
+			t.Fatalf("unverified runtime-stopped restore error = %v, want %q", err, contract.ErrorConflict)
+		}
+	})
 	t.Run("restore running", func(t *testing.T) {
 		h, _, computer, source, _ := publishedBackupForStorageCopy(t, 2)
 		if _, err := h.store.db.Exec(`UPDATE computers SET desired_state='running' WHERE computer_id=?`, computer.ComputerID); err != nil {
