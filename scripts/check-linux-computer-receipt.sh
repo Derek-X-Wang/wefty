@@ -29,7 +29,7 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
   .candidate_sha == $candidate and
   .image.variant == $image and
   (.candidate_sha | test("^[0-9a-f]{40}$")) and
-  (if $mutated == "" then .status == "NOT-RUN" and .not_run_issue == 157 else .status == "FAIL" end) and
+  (if $mutated == "" then .status == "NOT-RUN" and .not_run_issue == 286 else .status == "FAIL" end) and
   (.image.index_digest | test("^sha256:[0-9a-f]{64}$")) and
   (.image.platform_digest | test("^sha256:[0-9a-f]{64}$")) and
   (.fabric_identities | length >= 2) and
@@ -55,7 +55,15 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows[$mutated].status == "FAIL" and
     ([.rows[$mutated].assertions[] | select(. != true)] | length == 1)
    end) and
-  ([required_rows[] | select(. != "linux.guest_authority" and . != $mutated) as $id | $root.rows[$id].status == "PASS"] | all) and
+  ([required_rows[] | select(. != "linux.storage_provenance" and . != "linux.guest_authority" and . != $mutated) as $id | $root.rows[$id].status == "PASS"] | all) and
+  (if $mutated == "linux.storage_provenance" then
+    .rows["linux.storage_provenance"].status == "FAIL"
+   else
+    .rows["linux.storage_provenance"].status == "NOT-RUN" and
+    .rows["linux.storage_provenance"].not_run_issue == 286 and
+    (.rows["linux.storage_provenance"].not_run_reason | contains("restore publishes no receipt-derived")) and
+    (.rows["linux.storage_provenance"].evidence.restore_session_revocation_evidence | contains("unavailable"))
+   end) and
   (if $mutated == "linux.guest_authority" then
     .rows["linux.guest_authority"].status == "FAIL"
    else

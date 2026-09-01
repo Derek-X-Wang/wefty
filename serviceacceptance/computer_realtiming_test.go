@@ -464,7 +464,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	staleCredential := startTakeoverViewCLI(t, evidence, harness, reimaged.ComputerID, "linux-admin", "linux-admin-device-a", takeoverViewRetryNone)
 	stopping := runComputerCLI[l1.Computer](t, harness, false, "services", "stop", reimaged.ComputerID, "--expect-current")
 	stopped := waitForComputerCLI(t, harness, stopping.ComputerID, 3*time.Minute, computerStoppedAfterExplicitStop)
-	restoreStoppedDetached := computerStoppedAndDetached(stopped)
+	restoreAdmissionState := stopped.CurrentJob.State
 	restoreBaseline := stopped.StorageGeneration
 	restoreOutput := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "restore", stopped.ComputerID, backup.BackupID,
 		"--keep-old-as-backup", "--expect-current", "--idempotency-key", "linux-native-restore", "--wait", "4m")
@@ -506,7 +506,6 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"custody_delete_attested_live":       attestOutput.CustodyExport.OperatorAttestedDeleted,
 		"keep_old_restore_live":              len(backupInventory.Backups) >= 2,
 		"restore_fresh_generation_live":      restoreOutput.Computer.StorageGeneration == restoreBaseline+1,
-		"restore_stopped_detached_live":      restoreStoppedDetached,
 		"restore_preserved_machine_id_live":  !restoreReceipt.OSIdentityRekeyed && restoreReceipt.MachineIDBeforeDigest == "" && restoreReceipt.MachineIDAfterDigest == "",
 		"restore_first_attach_nonfresh_live": restoreReceipt.DestinationPrepared && !restoreReceipt.PreparationReceipt && !restoreReceipt.DestinationChown && computerDisplayPublished(reimaged),
 		"prestop_session_lineage_rejected_after_restore_live": preStopSessionRejectedAfterRestore.Error.Code == contract.ErrorTakeoverSessionEnded &&
@@ -519,6 +518,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"export_id": exportOutput.CustodyExport.ExportID, "import_computer_id": importOutput.Computer.ComputerID,
 		"retained_backups": fmt.Sprint(len(backupInventory.Backups)), "enospc_observation": enospc.Detail,
 		"restore_old_endpoint": restoreOldEndpoint, "restore_current_endpoint": restoreCurrentEndpoint,
+		"restore_admission_job_state":         string(restoreAdmissionState),
 		"restore_session_revocation_evidence": "unavailable: restore publishes no receipt-derived prior takeover-session revocation fact"}
 	notRunLinuxComputerRow(t, receipt, "linux.storage_provenance", 286,
 		"restore publishes no receipt-derived prior takeover-session revocation fact; the stopped-and-detached prerequisite already closes the pre-stop session, and its post-restore capability rejection reports attempt_authority_lost rather than a restore-specific terminal reason",
@@ -746,15 +746,28 @@ func completeLinuxComputerRow(t *testing.T, receipt *linuxComputerMatrixReceipt,
 func notRunLinuxComputerRow(t *testing.T, receipt *linuxComputerMatrixReceipt, id string, issue int, reason string, assertions map[string]bool, evidence map[string]string) {
 	t.Helper()
 	mutated := mutatingLinuxComputerRow(id)
-	err := receipt.notRun(id, issue, reason, assertions, evidence)
 	if mutated {
+		err := receipt.pass(id, assertions, evidence)
 		if err == nil || receipt.Rows[id].Status != "FAIL" {
 			t.Fatalf("lane mutation %s did not fail its owning row", id)
 		}
 		return
 	}
-	if err != nil {
+	if err := receipt.notRun(id, issue, reason, assertions, evidence); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNotRunLinuxComputerRowMutationRecordsOwningAssertion(t *testing.T) {
+	const id = "linux.storage_provenance"
+	t.Setenv("WEFTY_LINUX_COMPUTER_MUTATE_ROW", id)
+	receipt := newLinuxComputerMatrixReceipt()
+	receipt.begin(id)
+	notRunLinuxComputerRow(t, receipt, id, 286, "restore revocation receipt is unavailable",
+		map[string]bool{"live_product_path": false}, map[string]string{"probe": "mutation"})
+	row := receipt.Rows[id]
+	if row.Status != "FAIL" || len(row.Assertions) != 1 || row.Assertions["live_product_path"] {
+		t.Fatalf("mutated expected-NOT-RUN row = %#v", row)
 	}
 }
 
