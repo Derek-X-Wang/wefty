@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
@@ -39,6 +40,18 @@ type ComputerStorageGrowAcknowledgementRequest struct {
 	Receipt        ComputerStorageGrowReceipt `json:"receipt"`
 }
 
+// ComputerStorageGrowOutcome projects the latest durable grow operation. The
+// optional available-byte fact is populated only from a validated helper
+// refusal receipt, so zero remains distinguishable from missing evidence.
+type ComputerStorageGrowOutcome struct {
+	OperationRevision      int64      `json:"operation_revision"`
+	Status                 string     `json:"status"`
+	RequestedBytes         int64      `json:"requested_bytes"`
+	ObservedAvailableBytes *int64     `json:"observed_available_bytes,omitempty"`
+	FailureCode            string     `json:"failure_code,omitempty"`
+	CompletedAt            *time.Time `json:"completed_at,omitempty"`
+}
+
 type computerStorageGrowRow struct {
 	ComputerID, StorageID, BoundNodeID, RootInstanceID, JobID string
 	OperationFence, IdempotencyKey, RequestHash, Status       string
@@ -46,6 +59,49 @@ type computerStorageGrowRow struct {
 	OperationRevision, StorageGeneration                      int64
 	OldDiskBytes, NewDiskBytes                                int64
 	AcknowledgementKey, AcknowledgementHash                   sql.NullString
+}
+
+func readLastComputerStorageGrowOutcome(ctx context.Context, q queryer, computerID string) (*ComputerStorageGrowOutcome, error) {
+	return scanComputerStorageGrowOutcome(q.QueryRowContext(ctx, `SELECT operation_revision, status, new_disk_bytes, failure_code,
+		receipt_json, completed_ns FROM computer_storage_grows WHERE computer_id=?
+		ORDER BY operation_revision DESC LIMIT 1`, computerID))
+}
+
+func readComputerStorageGrowOutcomeByRevision(ctx context.Context, q queryer, computerID string, operationRevision int64) (*ComputerStorageGrowOutcome, error) {
+	return scanComputerStorageGrowOutcome(q.QueryRowContext(ctx, `SELECT operation_revision, status, new_disk_bytes, failure_code,
+		receipt_json, completed_ns FROM computer_storage_grows WHERE computer_id=? AND operation_revision=?`,
+		computerID, operationRevision))
+}
+
+func scanComputerStorageGrowOutcome(row interface{ Scan(...any) error }) (*ComputerStorageGrowOutcome, error) {
+	var outcome ComputerStorageGrowOutcome
+	var receiptJSON []byte
+	var completedNS sql.NullInt64
+	err := row.Scan(&outcome.OperationRevision, &outcome.Status,
+		&outcome.RequestedBytes, &outcome.FailureCode, &receiptJSON, &completedNS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if completedNS.Valid {
+		completed := time.Unix(0, completedNS.Int64).UTC()
+		outcome.CompletedAt = &completed
+	}
+	if len(receiptJSON) != 0 {
+		var acknowledgement struct {
+			Receipt ComputerStorageGrowReceipt `json:"receipt"`
+		}
+		if err := json.Unmarshal(receiptJSON, &acknowledgement); err != nil {
+			return nil, err
+		}
+		if outcome.Status == "failed" && acknowledgement.Receipt.FailureCode != "" {
+			available := acknowledgement.Receipt.ObservedAvailableBytes
+			outcome.ObservedAvailableBytes = &available
+		}
+	}
+	return &outcome, nil
 }
 
 func growRequestHash(request ComputerGrowRequest) (string, error) {
@@ -120,6 +176,11 @@ func (s *Store) BeginComputerGrow(ctx context.Context, computerID string, reques
 			return Computer{}, false, protocolError(contract.ErrorIdempotencyConflict,
 				"Computer grow idempotency key was reused with different authority")
 		}
+		outcome, outcomeErr := readComputerStorageGrowOutcomeByRevision(ctx, tx, computerID, replay.OperationRevision)
+		if outcomeErr != nil {
+			return Computer{}, false, internalError(outcomeErr, "read Computer grow replay outcome")
+		}
+		computer.LastGrowOperation = outcome
 		return computer, true, tx.Commit()
 	} else if !errors.Is(replayErr, sql.ErrNoRows) {
 		return Computer{}, false, internalError(replayErr, "read Computer grow replay")

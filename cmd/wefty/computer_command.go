@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -21,20 +24,25 @@ const (
 )
 
 type computerEvidenceCell struct {
-	Status string `json:"status"`
-	Code   string `json:"code,omitempty"`
-	Reason string `json:"reason,omitempty"`
+	Status                 string `json:"status"`
+	Code                   string `json:"code,omitempty"`
+	Reason                 string `json:"reason,omitempty"`
+	RequestedBytes         *int64 `json:"requested_bytes,omitempty"`
+	ObservedAvailableBytes *int64 `json:"observed_available_bytes,omitempty"`
+	FailureCode            string `json:"failure_code,omitempty"`
 }
 
 type computerCapacityProjection struct {
 	RequestedMemoryBytes *int64               `json:"requested_memory_bytes,omitempty"`
 	RequestedDiskBytes   int64                `json:"requested_disk_bytes"`
-	Admission            computerEvidenceCell `json:"admission"`
+	LastGrow             computerEvidenceCell `json:"last_grow"`
+	ActiveFailure        computerEvidenceCell `json:"active_failure"`
 }
 
 type computerOperatorProjection struct {
 	l1.Computer
 	Capacity         computerCapacityProjection `json:"capacity"`
+	Observation      *storageWaitObservation    `json:"observation,omitempty"`
 	MutationApplied  *bool                      `json:"mutation_applied,omitempty"`
 	IdempotentReplay *bool                      `json:"idempotent_replay,omitempty"`
 }
@@ -45,13 +53,45 @@ func newComputerProjection(computer l1.Computer, mutationApplied, replay *bool) 
 		value := *oci.Limits.MemoryBytes
 		memoryBytes = &value
 	}
+	lastGrow := computerEvidenceCell{Status: "NOT-RUN", Code: "grow_receipt_absent",
+		Reason: "no completed Computer Storage grow receipt is available"}
+	if grow := computer.LastGrowOperation; grow != nil {
+		switch grow.Status {
+		case "applied":
+			requested := grow.RequestedBytes
+			lastGrow = computerEvidenceCell{Status: "PASS", Code: "computer_storage_grow_applied", RequestedBytes: &requested}
+		case "failed":
+			requested := grow.RequestedBytes
+			lastGrow = computerEvidenceCell{Status: "FAIL", Code: grow.FailureCode, FailureCode: grow.FailureCode,
+				RequestedBytes: &requested, ObservedAvailableBytes: grow.ObservedAvailableBytes}
+		case "planned":
+			lastGrow = computerEvidenceCell{Status: "NOT-RUN", Code: "grow_pending",
+				Reason: "the latest Computer Storage grow has no terminal helper receipt"}
+		case "superseded":
+			lastGrow = computerEvidenceCell{Status: "NOT-RUN", Code: "grow_superseded",
+				Reason: "the latest Computer Storage grow was superseded without a terminal helper receipt"}
+		}
+	}
+	activeFailure := computerEvidenceCell{Status: "NOT-RUN", Code: "capacity_failure_absent",
+		Reason: "the current Computer Job has no active capacity failure latch"}
+	if computer.CurrentJob.ServiceJob != nil && len(computer.CurrentJob.LastFailure) != 0 {
+		var failure contract.SpawnFailure
+		if err := json.Unmarshal(computer.CurrentJob.LastFailure, &failure); err != nil {
+			activeFailure = computerEvidenceCell{Status: "NOT-RUN", Code: "capacity_failure_unreadable",
+				Reason: "the current Computer Job failure is not a typed spawn failure"}
+		} else if failure.Code == contract.SpawnFailureInsufficientMemory || failure.Code == contract.SpawnFailureInsufficientDisk {
+			requested, observed := failure.RequestedBytes, failure.ObservedAvailableBytes
+			activeFailure = computerEvidenceCell{Status: "FAIL", Code: string(failure.Code), FailureCode: string(failure.Code),
+				RequestedBytes: &requested, ObservedAvailableBytes: &observed}
+		}
+	}
 	return computerOperatorProjection{
 		Computer: computer,
 		Capacity: computerCapacityProjection{
 			RequestedMemoryBytes: memoryBytes,
 			RequestedDiskBytes:   computer.DesiredDiskBytes,
-			Admission: computerEvidenceCell{Status: "NOT-RUN", Code: "admission_receipt_not_projected",
-				Reason: "the current L1 Computer route does not retain helper-local admission receipts"},
+			LastGrow:             lastGrow,
+			ActiveFailure:        activeFailure,
 		},
 		MutationApplied: mutationApplied, IdempotentReplay: replay,
 	}
@@ -332,13 +372,18 @@ func executeComputerResize(ctx context.Context, clients *apiClients, jsonOutput 
 	flags.SetOutput(stderr)
 	var mutation computerMutationFlags
 	var diskBytes optionalInt64Flag
+	var wait storageWaitFlags
 	mutation.bind(flags, true)
+	wait.bind(flags)
 	flags.Var(&diskBytes, "disk-bytes", "new fully allocated disk budget")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 1 || !diskBytes.set {
-		return usageError("usage: wefty services resize COMPUTER_ID --disk-bytes BYTES --idempotency-key KEY [CAS flags | --expect-current]")
+		return usageError("usage: wefty services resize COMPUTER_ID --disk-bytes BYTES --idempotency-key KEY [CAS flags | --expect-current] [--wait DURATION]")
+	}
+	if err := wait.validate(flags); err != nil {
+		return err
 	}
 	if err := mutation.validate(true); err != nil {
 		return err
@@ -361,7 +406,99 @@ func executeComputerResize(ctx context.Context, clients *apiClients, jsonOutput 
 	if err != nil {
 		return err
 	}
+	if wait.timeout > 0 {
+		operationRevision := computer.IntentRevision
+		if receipt.Replay {
+			if computer.LastGrowOperation == nil {
+				projection := newComputerProjection(computer, &receipt.Applied, &receipt.Replay)
+				return writeComputerProjectionThenError(stdout, projection, jsonOutput,
+					computerGrowOutcomeMismatch(operationRevision, "idempotent replay omitted its durable grow operation"))
+			}
+			operationRevision = computer.LastGrowOperation.OperationRevision
+		}
+		projection := newComputerProjection(computer, &receipt.Applied, &receipt.Replay)
+		if receipt.Replay && operationRevision != computer.IntentRevision {
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			projection.Observation = &storageWaitObservation{Status: "observed", StartedAt: now, EndedAt: now}
+			if failureErr := awaitedComputerGrowFailure(computer, operationRevision, true); failureErr != nil {
+				return writeComputerProjectionThenError(stdout, projection, jsonOutput, failureErr)
+			}
+			return writeComputerProjection(stdout, projection, jsonOutput)
+		}
+		observed, observation, waitErr := waitForComputerGrowRevision(ctx, clients, computerID, operationRevision, wait)
+		if waitErr != nil && observed.ComputerID == "" {
+			return waitErr
+		}
+		projection = newComputerProjection(observed, &receipt.Applied, &receipt.Replay)
+		projection.Observation = &observation
+		if waitErr != nil {
+			return writeComputerProjectionThenError(stdout, projection, jsonOutput, waitErr)
+		}
+		computer = observed
+		if failureErr := awaitedComputerGrowFailure(computer, operationRevision, false); failureErr != nil {
+			return writeComputerProjectionThenError(stdout, projection, jsonOutput, failureErr)
+		}
+		return writeComputerProjection(stdout, projection, jsonOutput)
+	}
 	return writeComputerMutation(stdout, computer, receipt, jsonOutput)
+}
+
+func waitForComputerGrowRevision(ctx context.Context, clients *apiClients, computerID string, operationRevision int64, wait storageWaitFlags) (l1.Computer, storageWaitObservation, error) {
+	var observed l1.Computer
+	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
+		var readErr error
+		observed, readErr = clients.getComputerStorageAuthority(ctx, computerID)
+		if readErr != nil {
+			return false, readErr
+		}
+		if observed.AppliedRevision > operationRevision {
+			return false, fmt.Errorf("Computer grow revision %d was superseded by applied revision %d", operationRevision, observed.AppliedRevision)
+		}
+		return observed.AppliedRevision == operationRevision && observed.ReconfigurationPhase == l1.ComputerReconfigurationStable, nil
+	})
+	return observed, observation, err
+}
+
+func awaitedComputerGrowFailure(computer l1.Computer, operationRevision int64, historicalReplay bool) error {
+	grow := computer.LastGrowOperation
+	if grow == nil || grow.OperationRevision != operationRevision {
+		return computerGrowOutcomeMismatch(operationRevision, "Computer projection omitted the awaited grow operation")
+	}
+	if grow.Status == "applied" {
+		return nil
+	}
+	if grow.Status != "failed" {
+		return computerGrowOutcomeMismatch(operationRevision, "awaited Computer grow has no receipt-derived terminal outcome")
+	}
+	var failure contract.SpawnFailure
+	if grow.FailureCode != string(contract.SpawnFailureInsufficientDisk) ||
+		grow.ObservedAvailableBytes == nil {
+		return computerGrowOutcomeMismatch(operationRevision, "awaited Computer grow failure lacks receipt-derived capacity facts")
+	}
+	if !historicalReplay && (json.Unmarshal(computer.CurrentJob.LastFailure, &failure) != nil ||
+		failure.Code != contract.SpawnFailureInsufficientDisk || failure.RequestedBytes != grow.RequestedBytes ||
+		failure.ObservedAvailableBytes != *grow.ObservedAvailableBytes) {
+		return computerGrowOutcomeMismatch(operationRevision, "awaited Computer grow failure does not match the active typed latch")
+	}
+	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
+		Code: contract.ErrorCapacityExhausted, Message: "Computer grow failed: insufficient_disk", Retryable: false,
+		Details: map[string]any{"failure_code": grow.FailureCode, "requested_bytes": grow.RequestedBytes,
+			"observed_available_bytes": *grow.ObservedAvailableBytes},
+	}}
+}
+
+func computerGrowOutcomeMismatch(operationRevision int64, message string) error {
+	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
+		Code: contract.ErrorConflict, Message: message, Retryable: false,
+		Details: map[string]any{"operation_revision": operationRevision},
+	}}
+}
+
+func writeComputerProjectionThenError(writer io.Writer, projection computerOperatorProjection, jsonOutput bool, err error) error {
+	if writeErr := writeComputerProjection(writer, projection, jsonOutput); writeErr != nil {
+		return errors.Join(err, writeErr)
+	}
+	return err
 }
 
 func executeComputerAbort(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
@@ -409,17 +546,19 @@ func writeComputerProjection(writer io.Writer, computer computerOperatorProjecti
 
 func writeComputersTable(writer io.Writer, computers []computerOperatorProjection) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "COMPUTER ID\tNAME\tDESIRED\tOBSERVED\tSTORAGE\tINTENT/APPLIED\tPHASE\tJOB ID\tATTEMPT\tNODE\tMEMORY\tDISK\tBACKUP CAP\tADMISSION\tREADY\tDISPLAY ENDPOINT\tCONTROLLER TENURE\tLAST FAILURE\tREMOVAL\tMUTATION APPLIED\tIDEMPOTENT REPLAY"); err != nil {
+	if _, err := fmt.Fprintln(table, "COMPUTER ID\tNAME\tDESIRED\tOBSERVED\tSTORAGE\tINTENT/APPLIED\tPHASE\tJOB ID\tATTEMPT\tNODE\tMEMORY\tDISK\tBACKUP CAP\tLAST GROW\tACTIVE CAPACITY FAILURE\tREADY\tDISPLAY ENDPOINT\tCONTROLLER TENURE\tLAST FAILURE\tREMOVAL\tMUTATION APPLIED\tIDEMPOTENT REPLAY"); err != nil {
 		return err
 	}
 	for _, computer := range computers {
 		job := computer.CurrentJob
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			computer.ComputerID, computer.Name, computer.DesiredState, job.State,
 			computer.StorageID, computer.StorageGeneration, computer.IntentRevision, computer.AppliedRevision,
 			computer.ReconfigurationPhase, computer.CurrentJobID, valueOrNA(job.CurrentAttemptID),
 			valueOrNA(computer.BoundNodeID), int64PointerOrNA(computer.Capacity.RequestedMemoryBytes), computer.Capacity.RequestedDiskBytes, computer.BackupCap,
-			computer.Capacity.Admission.Status+"("+computer.Capacity.Admission.Code+")", boolOrNA(job.Ready), pointerOrNA(computer.DisplayEndpoint, ""),
+			computer.Capacity.LastGrow.Status+"("+computer.Capacity.LastGrow.Code+")",
+			computer.Capacity.ActiveFailure.Status+"("+computer.Capacity.ActiveFailure.Code+")",
+			boolOrNA(job.Ready), pointerOrNA(computer.DisplayEndpoint, ""),
 			computer.ControllerTenure,
 			jsonOrNA(job.LastFailure), valueOrNA(computer.RemovalOutcome), boolPointerOrNA(computer.MutationApplied),
 			boolPointerOrNA(computer.IdempotentReplay)); err != nil {

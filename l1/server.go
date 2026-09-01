@@ -1267,15 +1267,21 @@ func (s *Server) removeComputer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) revokeComputerAuthority(ctx context.Context, computerID, reason string) error {
+	_, err := s.revokeComputerAuthorityWithReceipt(ctx, computerID, reason)
+	return err
+}
+
+func (s *Server) revokeComputerAuthorityWithReceipt(ctx context.Context, computerID, reason string) (*contract.ComputerTokenRevocationReceipt, error) {
 	if s.computerTokenRevoker == nil {
-		return nil
+		return nil, nil
 	}
-	if _, err := s.computerTokenRevoker.RevokeComputerTokens(ctx, ComputerTokenRevocation{
+	receipt, err := s.computerTokenRevoker.RevokeComputerTokens(ctx, ComputerTokenRevocation{
 		ComputerID: computerID, NewSubmitIntentRevision: 1, RevokeAll: true, Reason: reason,
-	}); err != nil {
-		return internalError(err, "revoke Computer token grants after authority loss")
+	})
+	if err != nil {
+		return nil, internalError(err, "revoke Computer token grants after authority loss")
 	}
-	return nil
+	return &receipt, nil
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
@@ -1512,17 +1518,25 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	for _, computerID := range restoreRevocations {
+	for _, revocation := range restoreRevocations {
 		if s.computerTokenRevoker == nil {
 			writeError(w, internalError(errors.New("L3 Computer token revoker is not configured"),
 				"revoke pre-restore Computer authority"))
 			return
 		}
-		if err := s.revokeComputerAuthority(r.Context(), computerID, "computer_restoring"); err != nil {
+		tokenReceipt, err := s.revokeComputerAuthorityWithReceipt(r.Context(), revocation.ComputerID, "computer_restoring")
+		if err != nil {
 			writeError(w, err)
 			return
 		}
-		if err := s.store.RecordComputerRestoreAuthorityRevoked(r.Context(), computerID); err != nil {
+		if tokenReceipt == nil {
+			writeError(w, internalError(errors.New("L3 Computer token revocation returned no receipt"),
+				"revoke pre-restore Computer authority"))
+			return
+		}
+		if err := s.store.RecordComputerRestoreAuthorityRevoked(r.Context(), revocation.ComputerID, revocation.OperationRevision, ComputerRestoreRevocationEvidence{
+			RevokeAll: true, TokenRevocation: *tokenReceipt,
+		}); err != nil {
 			writeError(w, err)
 			return
 		}
