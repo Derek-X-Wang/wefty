@@ -155,7 +155,25 @@ A Computer keeps the ordinary `wefty-v1` isolation walls: resolved image user,
 `noNewPrivileges`, containerd's generated seccomp profile, private
 PID/IPC/UTS/mount/cgroup namespaces, shared networking, and deny-all devices
 plus the six pseudo-devices. The root filesystem is read-only; the Computer
-disk at `/wefty/service` is the persistent writable path.
+disk at `/wefty/service` is the persistent writable path. After attaching the
+disk and before retaining profile sources, the helper creates `etc/machine-id`
+when absent or repairs it when invalid, and records the repair in helper logs.
+The same file remains writable through `/wefty/service/etc/machine-id` but is
+mounted read-only at its canonical `/etc/machine-id` path. Root ownership is
+verified after identity repair and before the task starts. Restore preserves
+the same machine identity, while clone and import initialize a legacy missing
+identity and then rekey the copied identity before the destination can attach. A copied
+`Prepared` manifest is tenant-owned data, not fresh-root authority; its first
+attach verifies the existing disk-root owner and does not recursively re-own
+the copied bytes.
+
+Computers share the Node network namespace even though PID, IPC, UTS, mount,
+and cgroup namespaces remain private. Image-side local or abstract socket names
+should therefore be attempt-unique. The XFCE reference derives its X display
+number from the helper-reserved view port instead of claiming a fixed `:99`;
+this prevents accidental display-name collisions. It does not isolate X11:
+co-located processes in the shared Node network namespace can still reach the
+node-wide abstract X socket, which remains a separate isolation risk.
 
 The Computer-specific profile adds a private `/dev/shm` tmpfs with a 1 GiB
 size ceiling, mode `1777`, and `nosuid,nodev,noexec`. It is created in the

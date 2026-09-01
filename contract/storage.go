@@ -119,6 +119,13 @@ type ComputerStorageCopyReceipt struct {
 	SourceDigest          string `json:"source_digest"`
 	DestinationDigest     string `json:"destination_digest"`
 	OSIdentityRekeyed     bool   `json:"os_identity_rekeyed"`
+	MachineIDBeforeDigest string `json:"machine_id_before_digest,omitempty"`
+	MachineIDAfterDigest  string `json:"machine_id_after_digest,omitempty"`
+	MachineIDRepaired     bool   `json:"machine_id_repaired,omitempty"`
+	SourceUnchanged       bool   `json:"source_unchanged"`
+	DestinationPrepared   bool   `json:"destination_prepared"`
+	PreparationReceipt    bool   `json:"preparation_receipt"`
+	DestinationChown      bool   `json:"destination_chown"`
 	FilesystemExpanded    bool   `json:"filesystem_expanded"`
 	FailureCode           string `json:"failure_code,omitempty"`
 	DestinationAbsent     bool   `json:"destination_absent,omitempty"`

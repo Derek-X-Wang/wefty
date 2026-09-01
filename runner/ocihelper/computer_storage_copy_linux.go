@@ -4,7 +4,6 @@ package ocihelper
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -35,19 +34,26 @@ const (
 )
 
 type computerStorageCopyFacts struct {
-	OSIdentityRekeyed  bool
-	FilesystemExpanded bool
+	OSIdentityRekeyed     bool
+	MachineIDBeforeDigest string
+	MachineIDAfterDigest  string
+	MachineIDRepaired     bool
+	FilesystemExpanded    bool
 }
 
 type computerStorageCopyManifest struct {
-	Version            int                         `json:"version"`
-	Request            CopyComputerStorageRequest  `json:"request"`
-	Phase              computerStorageCopyPhase    `json:"phase"`
-	SourceDigest       string                      `json:"source_digest,omitempty"`
-	DestinationDigest  string                      `json:"destination_digest,omitempty"`
-	OSIdentityRekeyed  bool                        `json:"os_identity_rekeyed,omitempty"`
-	FilesystemExpanded bool                        `json:"filesystem_expanded,omitempty"`
-	Receipt            *ComputerStorageCopyReceipt `json:"receipt,omitempty"`
+	Version               int                         `json:"version"`
+	Request               CopyComputerStorageRequest  `json:"request"`
+	Phase                 computerStorageCopyPhase    `json:"phase"`
+	SourceDigest          string                      `json:"source_digest,omitempty"`
+	DestinationDigest     string                      `json:"destination_digest,omitempty"`
+	OSIdentityRekeyed     bool                        `json:"os_identity_rekeyed,omitempty"`
+	MachineIDBeforeDigest string                      `json:"machine_id_before_digest,omitempty"`
+	MachineIDAfterDigest  string                      `json:"machine_id_after_digest,omitempty"`
+	MachineIDRepaired     bool                        `json:"machine_id_repaired,omitempty"`
+	SourceUnchanged       bool                        `json:"source_unchanged,omitempty"`
+	FilesystemExpanded    bool                        `json:"filesystem_expanded,omitempty"`
+	Receipt               *ComputerStorageCopyReceipt `json:"receipt,omitempty"`
 }
 
 func (engine *ContainerdEngine) storageCopyCheckpoint(phase computerStorageCopyPhase) error {
@@ -62,32 +68,7 @@ func writeComputerStorageCopyManifest(root string, manifest computerStorageCopyM
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(root, "storage-copy.json")
-	temporary, err := os.CreateTemp(root, ".storage-copy.json.tmp-")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(payload); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return err
-	}
-	return syncDirectory(root)
+	return writeDurableFile(root, ".storage-copy.json.tmp-", "storage-copy.json", payload, 0o600)
 }
 
 func readComputerStorageCopyManifest(path string) (computerStorageCopyManifest, bool, error) {
@@ -189,94 +170,53 @@ func ensureRealDirectory(path string) error {
 
 func readRegularFile(path string) ([]byte, error) {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("identity evidence is not a regular file")
 	}
 	return os.ReadFile(path)
 }
 
-func rekeyCloneIdentity(ctx context.Context, mountPath string) (bool, error) {
-	etc := filepath.Join(mountPath, "etc")
-	if err := ensureRealDirectory(etc); err != nil {
-		return false, err
-	}
-	machineIDPath := filepath.Join(etc, "machine-id")
-	if info, err := os.Lstat(machineIDPath); err == nil && (info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular()) {
-		return false, errors.New("clone machine-id is not a regular file")
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return false, err
-	}
-	oldMachineID, err := readRegularFile(machineIDPath)
+func rekeyCloneIdentity(mountPath string) (computerStorageCopyFacts, error) {
+	facts := computerStorageCopyFacts{}
+	current, err := ensureComputerStorageIdentity(mountPath)
 	if err != nil {
-		return false, err
+		return facts, err
 	}
-	identity := make([]byte, 16)
-	if _, err := rand.Read(identity); err != nil {
-		return false, err
-	}
-	if err := os.WriteFile(machineIDPath, []byte(hex.EncodeToString(identity)+"\n"), 0o444); err != nil {
-		return false, err
-	}
-	oldKeys := map[string]string{}
-	ssh := filepath.Join(etc, "ssh")
-	if info, err := os.Lstat(ssh); err == nil {
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return false, errors.New("clone SSH configuration path is not a real directory")
-		}
-		matches, err := filepath.Glob(filepath.Join(ssh, "ssh_host_*"))
+	paths := computerStorageIdentityAt(mountPath)
+	for {
+		identity, err := newComputerMachineID()
 		if err != nil {
-			return false, err
+			return facts, err
 		}
-		for _, path := range matches {
-			info, err := os.Lstat(path)
-			if err != nil {
-				return false, err
-			}
-			if !info.Mode().IsRegular() {
-				return false, fmt.Errorf("clone SSH host identity %q is not a regular file", path)
-			}
-			payload, err := os.ReadFile(path)
-			if err != nil {
-				return false, err
-			}
-			oldKeys[filepath.Base(path)] = string(payload)
-			if err := os.Remove(path); err != nil {
-				return false, err
-			}
+		if computerMachineIDDigest(identity) == current.MachineIDDigest {
+			continue
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return false, err
-	}
-	sshKeygen, err := findRootTool("ssh-keygen")
-	if err != nil {
-		return false, err
-	}
-	if _, err := runFilesystemTool(ctx, sshKeygen, "-A", "-f", mountPath); err != nil {
-		return false, err
-	}
-	newMachineID, err := readRegularFile(machineIDPath)
-	if err != nil || string(newMachineID) == string(oldMachineID) {
-		return false, errors.New("clone machine-id was not observably rekeyed")
-	}
-	newKeys, err := filepath.Glob(filepath.Join(ssh, "ssh_host_*_key"))
-	if err != nil || len(newKeys) == 0 {
-		return false, errors.New("clone SSH host keys were not regenerated")
-	}
-	for _, path := range newKeys {
-		payload, err := readRegularFile(path)
-		if err != nil {
-			return false, err
+		if err := writeDurableFile(paths.Directory, ".machine-id.tmp-", computerStorageMachineIDName, identity, 0o444); err != nil {
+			return facts, err
 		}
-		if old, existed := oldKeys[filepath.Base(path)]; existed && old == string(payload) {
-			return false, errors.New("clone SSH host key did not change")
-		}
+		break
+	}
+	newMachineID, err := readRegularFile(paths.MachineID)
+	if err != nil || !validComputerMachineID(newMachineID) {
+		return facts, errors.New("clone machine-id was not well-formed after rekey")
+	}
+	newDigest := computerMachineIDDigest(newMachineID)
+	if newDigest == current.MachineIDDigest {
+		return facts, errors.New("clone machine-id was not observably rekeyed")
 	}
 	root, err := os.Open(mountPath)
 	if err != nil {
-		return false, err
+		return facts, err
 	}
 	defer root.Close()
-	return true, unix.Syncfs(int(root.Fd()))
+	facts.OSIdentityRekeyed = true
+	facts.MachineIDBeforeDigest = current.MachineIDDigest
+	facts.MachineIDAfterDigest = newDigest
+	facts.MachineIDRepaired = current.Repaired
+	return facts, unix.Syncfs(int(root.Fd()))
 }
 
 func ext4Geometry(ctx context.Context, imagePath string) (blocks, blockSize int64, returnedErr error) {
@@ -359,8 +299,9 @@ func (engine *ContainerdEngine) finalizeComputerStorageCopy(ctx context.Context,
 	if err := engine.storageCopyCheckpoint(computerStorageCopyMountedRekey); err != nil {
 		return facts, err
 	}
-	facts.OSIdentityRekeyed, err = rekeyCloneIdentity(ctx, mountPath)
-	return facts, err
+	rekeyFacts, err := rekeyCloneIdentity(mountPath)
+	rekeyFacts.FilesystemExpanded = facts.FilesystemExpanded
+	return rekeyFacts, err
 }
 
 func custodyImportFailureReceipt(runtimeRoot string, request CopyComputerStorageRequest, code string) (CopyComputerStorageResponse, error) {
@@ -579,6 +520,9 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 			return CopyComputerStorageResponse{}, err
 		}
 		manifest.OSIdentityRekeyed = facts.OSIdentityRekeyed
+		manifest.MachineIDBeforeDigest = facts.MachineIDBeforeDigest
+		manifest.MachineIDAfterDigest = facts.MachineIDAfterDigest
+		manifest.MachineIDRepaired = facts.MachineIDRepaired
 		manifest.FilesystemExpanded = facts.FilesystemExpanded
 		manifest.Phase = computerStorageCopyIdentityRekeyed
 		if err := writeComputerStorageCopyManifest(destinationRoot, manifest); err != nil {
@@ -626,6 +570,14 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	if request.Operation == "restore" && request.Destination.DiskBytes == request.SourceSize && destinationDigest != sourceDigest {
 		return CopyComputerStorageResponse{}, errors.New("Computer restore destination digest mismatch")
 	}
+	postMutationSourceDigest, err := digestFile(sourcePath)
+	if err != nil {
+		return CopyComputerStorageResponse{}, err
+	}
+	if postMutationSourceDigest != sourceDigest {
+		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy source changed during destination mutation")
+	}
+	manifest.SourceUnchanged = true
 	manifest.DestinationDigest = destinationDigest
 	manifest.Phase = computerStorageCopyManifestWritten
 	if err := writeComputerStorageCopyManifest(destinationRoot, manifest); err != nil {
@@ -665,8 +617,15 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		CleanupFence: request.Authority.CleanupFence, HelperGeneration: request.Authority.HelperGeneration,
 		SourceSize: request.SourceSize, DestinationSize: request.Destination.DiskBytes,
 		SourceDigest: sourceDigest, DestinationDigest: destinationDigest,
-		OSIdentityRekeyed:  manifest.OSIdentityRekeyed,
-		FilesystemExpanded: manifest.FilesystemExpanded}
+		OSIdentityRekeyed:     manifest.OSIdentityRekeyed,
+		MachineIDBeforeDigest: manifest.MachineIDBeforeDigest,
+		MachineIDAfterDigest:  manifest.MachineIDAfterDigest,
+		MachineIDRepaired:     manifest.MachineIDRepaired,
+		SourceUnchanged:       manifest.SourceUnchanged,
+		DestinationPrepared:   diskManifest.Prepared,
+		PreparationReceipt:    diskManifest.PreparationReceipt != nil,
+		DestinationChown:      request.Destination.Chown,
+		FilesystemExpanded:    manifest.FilesystemExpanded}
 	manifest.Phase, manifest.Receipt = computerStorageCopyPublished, &receipt
 	if err := writeComputerStorageCopyManifest(destinationRoot, manifest); err != nil {
 		return CopyComputerStorageResponse{}, err

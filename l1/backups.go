@@ -25,15 +25,16 @@ const (
 var backupDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 type StorageProvenance struct {
-	ProvenanceID          string    `json:"provenance_id"`
-	Kind                  string    `json:"kind"`
-	SourceStorageID       string    `json:"source_storage_id"`
-	SourceGeneration      int64     `json:"source_generation"`
-	BackupID              string    `json:"backup_id"`
-	DestinationComputerID string    `json:"destination_computer_id,omitempty"`
-	DestinationStorageID  string    `json:"destination_storage_id,omitempty"`
-	DestinationGeneration int64     `json:"destination_generation,omitempty"`
-	CreatedAt             time.Time `json:"created_at"`
+	ProvenanceID          string                      `json:"provenance_id"`
+	Kind                  string                      `json:"kind"`
+	SourceStorageID       string                      `json:"source_storage_id"`
+	SourceGeneration      int64                       `json:"source_generation"`
+	BackupID              string                      `json:"backup_id"`
+	DestinationComputerID string                      `json:"destination_computer_id,omitempty"`
+	DestinationStorageID  string                      `json:"destination_storage_id,omitempty"`
+	DestinationGeneration int64                       `json:"destination_generation,omitempty"`
+	CopyReceipt           *ComputerStorageCopyReceipt `json:"copy_receipt,omitempty"`
+	CreatedAt             time.Time                   `json:"created_at"`
 }
 
 type Backup struct {

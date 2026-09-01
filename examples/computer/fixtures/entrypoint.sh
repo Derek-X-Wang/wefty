@@ -16,6 +16,8 @@ fi
 
 view_port=$WEFTY_COMPUTER_VIEW_PORT
 control_port=$WEFTY_COMPUTER_CONTROL_PORT
+DISPLAY=:$view_port
+export DISPLAY
 if [ "$mutation" = reserved-env-shadowed ]; then
   # The fixture keeps the real listener authority but exposes a tenant value
   # in PID 1's environment so the checker can prove stripping is load-bearing.

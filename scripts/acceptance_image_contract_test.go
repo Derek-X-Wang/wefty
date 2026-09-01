@@ -383,12 +383,15 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileMatches(t, "../examples/computer/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG DEBIAN_IMAGE=.*@sha256:[0-9a-f]{64}$`)
 	assertFileMatches(t, "../examples/computer-wayland/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG DEBIAN_IMAGE=.*@sha256:[0-9a-f]{64}$`)
 	assertFileContains(t, "../examples/computer/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "ARG SOURCE_DATE_EPOCH=0", "chromium=", "/var/log/dpkg.log", "/var/log/alternatives.log", "/var/log/apt/*")
-	assertFileContains(t, "../examples/computer/entrypoint.sh", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "/wefty/service")
+	assertFileContains(t, "../examples/computer/entrypoint.sh", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "/wefty/service", "DISPLAY=:$view_port", "export DISPLAY")
+	assertFileContains(t, "../examples/computer/fixtures/entrypoint.sh", "DISPLAY=:$view_port", "export DISPLAY")
 	for _, path := range []string{"../examples/computer/entrypoint.sh", "../examples/computer/fixtures/entrypoint.sh", "../examples/computer-wayland/entrypoint.sh", "../examples/computer-wayland/entrypoint-fixture.sh"} {
 		assertFileContains(t, path, "wait || true\n  chmod -R u+rwX,go+rwX /wefty/service")
 	}
 	assertFileContains(t, "../examples/computer/rfb-websocket.py", `target.path != "/websockify"`, `"binary" not in offered`, "BinaryOnlyWebSocket")
 	assertFileContains(t, "../examples/computer/rfb-backend.py", `command.append("-viewonly")`, "socket.AF_UNIX")
+	assertFileContains(t, "../examples/computer/rfb-backend.py", `os.environ["WEFTY_COMPUTER_VIEW_PORT"]`)
+	assertFileNotContains(t, "../examples/computer/Dockerfile", "DISPLAY=:99")
 	assertFileContains(t, "../examples/computer/watch-driver.py", "/wefty/control/driver.json", "fingerprint", "os.replace", `type(value["version"]) is not int`, `type(value["human_driving"]) is not bool`)
 	for _, path := range []string{"../examples/computer/entrypoint.sh", "../examples/computer/watch-driver.py", "../examples/computer/rfb-websocket.py"} {
 		assertFileNotContains(t, path, "WEFTY_CONFORMANCE_MUTATION")
@@ -398,6 +401,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	}
 	assertFileContains(t, "../examples/computer/oracle.html", `data-wefty-input-oracle="v1"`, "events=0 bytes=0 hash=00000000")
 	assertFileContains(t, "../examples/computer/pointer-oracle.py", "XQueryPointer", "input-oracle.json", "os.replace")
+	assertFileContains(t, "../examples/computer/pointer-oracle.py", `os.environ["WEFTY_COMPUTER_VIEW_PORT"]`)
 	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "wayvnc=0.9.1-1", "sway=1.10.1-2", "wev=", "mise-v2026.8.14", "wefty-verify-licenses", "ldconfig -p", "/usr/local/lib/libneatvnc.so.0", "non-dpkg-components.tsv", "mise-MIT.txt", "wefty-Apache-2.0.txt", "rm -f \"/usr/lib/$multiarch/libneatvnc.so\"*")
 	assertFileNotContains(t, "../examples/computer-wayland/Dockerfile", "LD_LIBRARY_PATH", "ADD --chmod")
 	waylandDockerfile, err := os.ReadFile("../examples/computer-wayland/Dockerfile")

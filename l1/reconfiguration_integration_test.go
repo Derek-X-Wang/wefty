@@ -864,6 +864,70 @@ func TestReconfigurationAbortRequiresDeadBoundNodeAndLeavesExplicitRestart(t *te
 	}
 }
 
+func TestRemovalAcceptsAbortedComputerWithStoppedProjection(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
+		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	})
+	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
+		Name: "remove-aborted", Spec: computerCapabilityJobSpec("computer:remove-aborted"), Actor: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := h.store.ClaimJob(t.Context(), "fabric-computer-node", node.NodeID, node.BootSessionID, contract.JobClassService)
+	if err != nil || claim == nil {
+		t.Fatalf("claim = %#v err=%v", claim, err)
+	}
+	if _, err := h.store.ObserveAttemptImage(t.Context(), "fabric-computer-node", claim.Job.JobID,
+		claim.Lease.AttemptID, testImageObservation(claim.Lease.FencingToken)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.StartAttempt(t.Context(), "fabric-computer-node", claim.Job.JobID,
+		claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
+		t.Fatal(err)
+	}
+	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reimaging, err := h.store.ReimageComputer(t.Context(), computer.ComputerID, ComputerReimageRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "operator"), Image: reimageTarget('f'),
+		TerminateSessions: true, IdempotencyKey: "abort-before-remove"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`UPDATE nodes SET state=? WHERE node_id=?`, contract.NodeDead, node.NodeID); err != nil {
+		t.Fatal(err)
+	}
+	aborted, _, err := h.store.AbortComputerReconfiguration(t.Context(), computer.ComputerID,
+		ComputerReconfigurationAbortRequest{ComputerMutationPrecondition: computerPrecondition(reimaging, "operator"), IdempotencyKey: "abort-before-remove"})
+	if err != nil || aborted.CurrentJob.State != contract.JobStopped || aborted.CurrentJob.DesiredState != contract.ServiceDesiredStopped {
+		t.Fatalf("aborted Computer = %#v err=%v", aborted, err)
+	}
+	priorJobID, priorBoundNodeID := aborted.CurrentJobID, aborted.BoundNodeID
+	removed, err := h.store.RemoveComputer(t.Context(), computer.ComputerID,
+		ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(aborted, "operator")})
+	if err != nil || removed.DesiredState != contract.ServiceDesiredRemoved ||
+		removed.ReconfigurationPhase != ComputerReconfigurationRemoving || removed.CurrentJob.State != contract.JobRemovalPending {
+		t.Fatalf("removed aborted Computer = %#v err=%v", removed, err)
+	}
+	if removed.CurrentJobID != priorJobID || removed.BoundNodeID != priorBoundNodeID {
+		t.Fatalf("removal changed aborted lineage: job %q/%q node %q/%q", removed.CurrentJobID, priorJobID, removed.BoundNodeID, priorBoundNodeID)
+	}
+	var removalJobID, removalBoundNodeID string
+	if err := h.store.db.QueryRow(`SELECT job_id, bound_node_id FROM service_removals WHERE job_id=?`, priorJobID).
+		Scan(&removalJobID, &removalBoundNodeID); err != nil || removalJobID != priorJobID || removalBoundNodeID != priorBoundNodeID {
+		t.Fatalf("durable removal lineage = job %q node %q err=%v", removalJobID, removalBoundNodeID, err)
+	}
+	var projectionDesiredState contract.ServiceDesiredState
+	if err := h.store.db.QueryRow(`SELECT desired_state FROM service_jobs WHERE job_id=?`, removed.CurrentJobID).Scan(&projectionDesiredState); err != nil ||
+		projectionDesiredState != contract.ServiceDesiredStopped {
+		t.Fatalf("removed aborted projection desired state = %q err=%v", projectionDesiredState, err)
+	}
+}
+
 func TestResetAndGrowAbortRemainRetryableAndFenceLateAcknowledgement(t *testing.T) {
 	for _, operation := range []string{"reset", "grow"} {
 		t.Run(operation, func(t *testing.T) {

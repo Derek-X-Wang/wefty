@@ -632,7 +632,20 @@ func (h *storageCLIHarness) startStorageCopyHelper(operation, destinationCompute
 					OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence, HelperGeneration: 9,
 					SourceSize: directive.SourceSize, DestinationSize: directive.DestinationSize,
 					SourceDigest: directive.SourceDigest, DestinationDigest: destinationDigest,
-					OSIdentityRekeyed:  operation == "clone" || operation == "import",
+					OSIdentityRekeyed: operation == "clone" || operation == "import",
+					MachineIDBeforeDigest: func() string {
+						if operation == "restore" {
+							return ""
+						}
+						return "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+					}(),
+					MachineIDAfterDigest: func() string {
+						if operation == "restore" {
+							return ""
+						}
+						return "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+					}(),
+					SourceUnchanged: true, DestinationPrepared: true,
 					FilesystemExpanded: (operation == "clone" || operation == "import") && directive.DestinationSize > directive.SourceSize}
 				request := l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
 					IdempotencyKey: receipt.ReceiptID, Receipt: receipt}

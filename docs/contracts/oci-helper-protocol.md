@@ -234,7 +234,7 @@ heartbeats.
 | `DeleteManagedVolume` | Session-authorized and closed to a derived `handoff` or `service_data` owner key, or exact Computer-removal Storage and cleanup authority. The helper derives the source, deletes only that resource (plus any paired owner record), independently verifies absence, and returns no general path authority. |
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. After separate stable service-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
-| `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves OS identity; clone/import narrowly rekey it and may expand a larger filesystem. |
+| `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves machine identity; clone/import narrowly rekey it and may expand a larger filesystem. |
 | `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path outside the managed root. L1 has already committed the permanent custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, and manifest-digest evidence. |
 | `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A failure after ext4 may have expanded returns `computer_storage_grow_uncertain`, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
 | `PreflightComputerReimage` | Session-authorized exact current Storage generation and byte budget, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. Under the generation flock it requires real detachment or explicit verified never-attached reset-preparation evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived success or closed stage/reason failure evidence before L1 may publish or refuse the staging projection. |
@@ -661,6 +661,15 @@ ownership mismatch, and with `chown` they recursively migrate every tenant
 entry. Reset freshness survives the pending-attach and mount boundaries and is
 cleared only by the same durable manifest write that publishes `Attached`, so
 a failed or crashed first attach cannot silently consume the one-time fact.
+After attachment and before runtime-profile source retention, the helper
+creates a storage-local machine ID when absent or repairs it when malformed,
+logs that repair, and then verifies root ownership before task start. The
+canonical `/etc/machine-id` mount is read-only, while the same persistent file
+remains writable through `/wefty/service/etc/machine-id`. Backup and restore
+preserve those bytes; clone and import initialize legacy storage when needed
+and then replace the machine ID while the copied filesystem is detached. The identity path remains part of the tenant disk image, so the
+helper's positive rekey receipt describes bytes the destination attempt
+actually consumes rather than immutable image-layer lookalikes.
 
 `ResetComputerStorage` accepts only the authenticated current helper session
 plus exact Node, managed-root instance, consumer Job, named prior Job,
@@ -790,7 +799,9 @@ retains partial bytes after interruption, and returns a receipt only after
 size, content digest, and manifest digest are observed. `CopyComputerStorage`
 also accepts `import`: it verifies the recorded manifest digest and full disk
 digest before creating a managed destination, then applies the same narrow OS
-identity rekey and optional filesystem expansion as clone. Both receipts bind
+machine-ID rekey and optional filesystem expansion as clone. Successful
+receipts record distinct well-formed pre/post identity digests, unchanged
+source bytes, and the prepared/no-freshness/no-chown destination facts. Both receipts bind
 the Node, managed-root instance, operation revision, cleanup/custody fence,
 and helper generation; neither helper call decides removal truth.
 

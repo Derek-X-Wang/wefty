@@ -2613,6 +2613,13 @@ func (engine *ContainerdEngine) managedVolumeSources(ctx context.Context, reques
 			if err != nil {
 				return nil, nil, nil, err
 			}
+			// The runtime profile retains authority over the identity bind
+			// sources while it is built, so they must exist before spec
+			// construction. Existing identities are only verified here; a
+			// missing legacy identity is initialized on the attached disk.
+			if _, err := ensureComputerStorageIdentity(attachment.mountPath); err != nil {
+				return nil, nil, nil, fmt.Errorf("prepare Computer disk persistent OS identity: %w", err)
+			}
 			computerDisk = attachment
 			result[volume.Kind] = attachment.mountPath
 			continue

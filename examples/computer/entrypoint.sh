@@ -14,6 +14,11 @@ fi
 
 view_port=$WEFTY_COMPUTER_VIEW_PORT
 control_port=$WEFTY_COMPUTER_CONTROL_PORT
+# Computers share the Node network namespace, including Linux abstract Unix
+# sockets. Reuse the helper-reserved view port as the X display number so two
+# live XFCE Computers cannot both claim the fixed @/tmp/.X11-unix/X99 socket.
+DISPLAY=:$view_port
+export DISPLAY
 
 mkdir -p /wefty/service/home/wefty
 mkdir -p "$HOME/.config/chromium" "$XDG_RUNTIME_DIR" /tmp/wefty-computer

@@ -51,7 +51,6 @@ LABEL org.opencontainers.image.source="https://github.com/Derek-X-Wang/wefty" \
       org.opencontainers.image.description="Optional Wefty reference Computer desktop for acceptance and image-author examples"
 
 ENV HOME=/home/wefty \
-    DISPLAY=:99 \
     XDG_RUNTIME_DIR=/tmp/wefty-runtime
 USER 12000:12000
 WORKDIR /

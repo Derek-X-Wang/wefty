@@ -36,7 +36,7 @@ def main() -> None:
         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint),
     ]
     x11.XQueryPointer.restype = ctypes.c_int
-    display = x11.XOpenDisplay(os.environ.get("DISPLAY", ":99").encode("ascii"))
+    display = x11.XOpenDisplay(os.environ.get("DISPLAY", ":" + os.environ["WEFTY_COMPUTER_VIEW_PORT"]).encode("ascii"))
     if not display:
         raise SystemExit("cannot open X display")
     root = x11.XDefaultRootWindow(display)

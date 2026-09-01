@@ -412,6 +412,14 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	if cloneOutput.Computer == nil || cloneOutput.Computer.ComputerID == "" {
 		t.Fatalf("Computer clone result = %#v", cloneOutput)
 	}
+	cloneReceipt := requiredStorageCopyReceipt(t, cloneOutput.StorageProvenance, "clone", cloneOutput.Computer.ComputerID)
+	if cloneReceipt.MachineIDBeforeDigest == cloneReceipt.MachineIDAfterDigest || !cloneReceipt.SourceUnchanged ||
+		!cloneReceipt.DestinationPrepared || cloneReceipt.PreparationReceipt || cloneReceipt.DestinationChown {
+		t.Fatalf("Computer clone receipt = %#v", cloneReceipt)
+	}
+	startedClone := runComputerCLI[l1.Computer](t, harness, false, "services", "start", cloneOutput.Computer.ComputerID, "--expect-current")
+	startedClone = waitForComputerCLI(t, harness, startedClone.ComputerID, 3*time.Minute, computerDisplayPublished)
+	cloneOutput.Computer = &startedClone
 	recordComputerAuthority(receipt, *cloneOutput.Computer)
 	exportDirectory := filepath.Join(t.TempDir(), "custody-export")
 	if err := os.MkdirAll(exportDirectory, 0o700); err != nil {
@@ -438,6 +446,11 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"--idempotency-key", "linux-native-import", "--wait", "4m")
 	if importOutput.Computer == nil || importOutput.StorageProvenance == nil || !importOutput.StorageProvenance.CustodyTainted {
 		t.Fatalf("Computer custody import result = %#v", importOutput)
+	}
+	importReceipt := requiredStorageCopyReceipt(t, importOutput.StorageProvenance, "import", importOutput.Computer.ComputerID)
+	if importReceipt.MachineIDBeforeDigest == importReceipt.MachineIDAfterDigest || !importReceipt.SourceUnchanged ||
+		!importReceipt.DestinationPrepared || importReceipt.PreparationReceipt || importReceipt.DestinationChown {
+		t.Fatalf("Computer import receipt = %#v", importReceipt)
 	}
 	recordComputerAuthority(receipt, *importOutput.Computer)
 	if err := os.RemoveAll(exportDirectory); err != nil {
@@ -472,8 +485,13 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	completeLinuxComputerRow(t, receipt, "linux.storage_provenance", map[string]bool{
 		"cold_backup_available_live":          backup.Status == "available",
 		"clone_fork_created_live":             cloneOutput.Computer.ComputerID != reimaged.ComputerID,
+		"clone_machine_id_rekeyed_live":       cloneReceipt.MachineIDBeforeDigest != cloneReceipt.MachineIDAfterDigest,
+		"clone_source_unchanged_live":         cloneReceipt.SourceUnchanged,
+		"clone_first_attach_nonfresh_live":    cloneReceipt.DestinationPrepared && !cloneReceipt.PreparationReceipt && !cloneReceipt.DestinationChown && computerDisplayPublished(*cloneOutput.Computer),
 		"custody_export_manifest_bound_live":  manifestDigest == exportOutput.CustodyExport.ManifestDigest,
 		"custody_import_tainted_live":         importOutput.StorageProvenance.CustodyTainted,
+		"import_machine_id_rekeyed_live":      importReceipt.MachineIDBeforeDigest != importReceipt.MachineIDAfterDigest,
+		"import_source_unchanged_live":        importReceipt.SourceUnchanged,
 		"custody_delete_attested_live":        attestOutput.CustodyExport.OperatorAttestedDeleted,
 		"keep_old_restore_live":               len(backupInventory.Backups) >= 2,
 		"restore_fresh_generation_live":       restoreOutput.Computer.StorageGeneration > restoreBaseline,
@@ -481,6 +499,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"backup_cap_pressure_live":            capSet.Computer != nil && strings.Contains(capPressure, string(contract.ErrorConflict)),
 		"real_disk_enospc_live":               enospc.Observed,
 	}, map[string]string{"backup_id": backup.BackupID, "clone_computer_id": cloneOutput.Computer.ComputerID,
+		"clone_machine_id_before": cloneReceipt.MachineIDBeforeDigest, "clone_machine_id_after": cloneReceipt.MachineIDAfterDigest,
 		"export_id": exportOutput.CustodyExport.ExportID, "import_computer_id": importOutput.Computer.ComputerID,
 		"retained_backups": fmt.Sprint(len(backupInventory.Backups)), "enospc_observation": enospc.Detail})
 
@@ -660,6 +679,19 @@ type storageCLIMutationReceipt struct {
 	Backups           *l1.BackupList                `json:"backups,omitempty"`
 	CustodyExport     *l1.ComputerCustodyExport     `json:"custody_export,omitempty"`
 	StorageProvenance *l1.ComputerStorageProvenance `json:"storage_provenance,omitempty"`
+}
+
+func requiredStorageCopyReceipt(t *testing.T, projection *l1.ComputerStorageProvenance, kind, destinationComputerID string) contract.ComputerStorageCopyReceipt {
+	t.Helper()
+	if projection != nil {
+		for _, provenance := range projection.Provenance {
+			if provenance.Kind == kind && provenance.DestinationComputerID == destinationComputerID && provenance.CopyReceipt != nil {
+				return *provenance.CopyReceipt
+			}
+		}
+	}
+	t.Fatalf("%s provenance omitted copy receipt for %s: %#v", kind, destinationComputerID, projection)
+	return contract.ComputerStorageCopyReceipt{}
 }
 
 type computerBackupInventoryReceipt struct {

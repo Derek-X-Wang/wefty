@@ -204,8 +204,8 @@ Clone uses the same cold-copy primitive but creates a new `computer_id`,
 `storage_id`, required name, dispatch authority, and generation one with no
 grants. A smaller destination is refused; a larger one is fully allocated and
 its filesystem expanded. The helper narrowly regenerates `/etc/machine-id`
-and SSH host keys and does not alter browser profile data. Immutable Storage
-provenance records the source Backup and destination as a custody fork. If one
+and does not alter browser profile data. Immutable Storage provenance records
+the source Backup and destination as a custody fork. If one
 managed branch is removed while another secret-bearing branch survives, the
 Computer outcome is `removed_reduced`; after coordinated positive removal of
 every managed branch, retained Computer outcomes may advance to

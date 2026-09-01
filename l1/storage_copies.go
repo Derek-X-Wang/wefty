@@ -542,7 +542,9 @@ func validateStorageCopyReceipt(row computerStorageCopyRow, receipt ComputerStor
 	}
 	if receipt.Kind == "computer_storage_copy_failed_absent" {
 		if row.Operation != "import" || !receipt.DestinationAbsent || receipt.DestinationDigest != "" ||
-			receipt.OSIdentityRekeyed || receipt.FilesystemExpanded ||
+			receipt.OSIdentityRekeyed || receipt.MachineIDBeforeDigest != "" || receipt.MachineIDAfterDigest != "" ||
+			receipt.MachineIDRepaired || receipt.SourceUnchanged || receipt.DestinationPrepared ||
+			receipt.PreparationReceipt || receipt.DestinationChown || receipt.FilesystemExpanded ||
 			(receipt.FailureCode != "manifest_invalid" && receipt.FailureCode != "digest_mismatch" &&
 				receipt.FailureCode != "insufficient_disk" && receipt.FailureCode != "cancelled") {
 			return protocolError(contract.ErrorInvalidRequest, "Custody import failure receipt lacks positive staging absence")
@@ -550,21 +552,29 @@ func validateStorageCopyReceipt(row computerStorageCopyRow, receipt ComputerStor
 		return nil
 	}
 	if receipt.Kind != computerStorageCopyReceiptKind || receipt.FailureCode != "" || receipt.DestinationAbsent ||
-		!backupDigestPattern.MatchString(receipt.DestinationDigest) {
+		!backupDigestPattern.MatchString(receipt.DestinationDigest) || !receipt.SourceUnchanged ||
+		!receipt.DestinationPrepared || receipt.PreparationReceipt || receipt.DestinationChown {
 		return protocolError(contract.ErrorStorageReferenceConflict, "Computer Storage copy receipt outcome is invalid")
 	}
 	switch row.Operation {
 	case "restore":
-		if receipt.OSIdentityRekeyed || receipt.FilesystemExpanded != (row.DestinationSize > row.SourceSize) ||
+		if receipt.OSIdentityRekeyed || receipt.MachineIDBeforeDigest != "" || receipt.MachineIDAfterDigest != "" ||
+			receipt.MachineIDRepaired || receipt.FilesystemExpanded != (row.DestinationSize > row.SourceSize) ||
 			(row.DestinationSize == row.SourceSize && receipt.SourceDigest != receipt.DestinationDigest) {
 			return protocolError(contract.ErrorConflict, "Computer restore receipt lacks required byte preservation or expansion evidence")
 		}
 	case "clone":
-		if !receipt.OSIdentityRekeyed || receipt.FilesystemExpanded != (row.DestinationSize > row.SourceSize) {
+		if !receipt.OSIdentityRekeyed || !backupDigestPattern.MatchString(receipt.MachineIDBeforeDigest) ||
+			!backupDigestPattern.MatchString(receipt.MachineIDAfterDigest) ||
+			receipt.MachineIDBeforeDigest == receipt.MachineIDAfterDigest ||
+			receipt.FilesystemExpanded != (row.DestinationSize > row.SourceSize) {
 			return protocolError(contract.ErrorConflict, "Computer clone receipt lacks required rekey or expansion evidence")
 		}
 	case "import":
-		if !receipt.OSIdentityRekeyed || receipt.FilesystemExpanded != (row.DestinationSize > row.SourceSize) {
+		if !receipt.OSIdentityRekeyed || !backupDigestPattern.MatchString(receipt.MachineIDBeforeDigest) ||
+			!backupDigestPattern.MatchString(receipt.MachineIDAfterDigest) ||
+			receipt.MachineIDBeforeDigest == receipt.MachineIDAfterDigest ||
+			receipt.FilesystemExpanded != (row.DestinationSize > row.SourceSize) {
 			return protocolError(contract.ErrorStorageReferenceConflict, "Custody import receipt lacks required rekey or expansion evidence")
 		}
 	default:

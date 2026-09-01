@@ -84,7 +84,20 @@ func successfulStorageCopyReceipt(directive ComputerStorageCopyDirective) Comput
 		OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence, HelperGeneration: 9,
 		SourceSize: directive.SourceSize, DestinationSize: directive.DestinationSize,
 		SourceDigest: directive.SourceDigest, DestinationDigest: destinationDigest,
-		OSIdentityRekeyed:  directive.Operation == "clone" || directive.Operation == "import",
+		OSIdentityRekeyed: directive.Operation == "clone" || directive.Operation == "import",
+		MachineIDBeforeDigest: func() string {
+			if directive.Operation == "restore" {
+				return ""
+			}
+			return "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		}(),
+		MachineIDAfterDigest: func() string {
+			if directive.Operation == "restore" {
+				return ""
+			}
+			return "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		}(),
+		SourceUnchanged: true, DestinationPrepared: true,
 		FilesystemExpanded: (directive.Operation == "clone" || directive.Operation == "import") && directive.DestinationSize > directive.SourceSize}
 }
 
@@ -290,6 +303,16 @@ func TestComputerCloneCreatesNewStoppedIdentityWithoutGrantsAndExpands(t *testin
 	if kind != "clone" || destinationComputerID != clone.ComputerID || destinationStorageID != clone.StorageID || destinationGeneration != 1 {
 		t.Fatalf("clone Storage provenance = %q/%q/%q/%d", kind, destinationComputerID, destinationStorageID, destinationGeneration)
 	}
+	projection, err := h.store.ListComputerStorageProvenance(context.Background(), clone.ComputerID)
+	var observedReceipt *ComputerStorageCopyReceipt
+	for _, provenance := range projection.Provenance {
+		if provenance.Kind == "clone" {
+			observedReceipt = provenance.CopyReceipt
+		}
+	}
+	if err != nil || observedReceipt == nil || observedReceipt.ReceiptID != receipt.ReceiptID {
+		t.Fatalf("clone receipt provenance = %#v err=%v", projection.Provenance, err)
+	}
 }
 
 func TestComputerCloneCustodyRemovalReducesThenCoordinatedRemovalVerifies(t *testing.T) {
@@ -387,10 +410,16 @@ func TestComputerStorageCopyReceiptMutationRowsFailTwentyOfTwenty(t *testing.T) 
 		func(r *ComputerStorageCopyReceipt) { r.SourceDigest = "sha256:short" },
 		func(r *ComputerStorageCopyReceipt) { r.DestinationDigest = "sha256:short" },
 		func(r *ComputerStorageCopyReceipt) { r.OSIdentityRekeyed = false },
+		func(r *ComputerStorageCopyReceipt) { r.MachineIDBeforeDigest = "sha256:short" },
+		func(r *ComputerStorageCopyReceipt) { r.MachineIDAfterDigest = r.MachineIDBeforeDigest },
+		func(r *ComputerStorageCopyReceipt) { r.SourceUnchanged = false },
+		func(r *ComputerStorageCopyReceipt) { r.DestinationPrepared = false },
+		func(r *ComputerStorageCopyReceipt) { r.PreparationReceipt = true },
+		func(r *ComputerStorageCopyReceipt) { r.DestinationChown = true },
 		func(r *ComputerStorageCopyReceipt) { r.FilesystemExpanded = true },
 	}
-	if len(mutations) != 23 {
-		t.Fatalf("negative rows = %d, want 23", len(mutations))
+	if len(mutations) != 29 {
+		t.Fatalf("negative rows = %d, want 29", len(mutations))
 	}
 	for index, mutate := range mutations {
 		receipt := valid

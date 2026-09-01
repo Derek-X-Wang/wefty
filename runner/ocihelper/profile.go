@@ -517,6 +517,12 @@ func validateRuntimeSpecInput(input RuntimeSpecInput, validateSource func(string
 		if err := validateSource(source, []string{input.ManagedRoot}, false); err != nil {
 			return fmt.Errorf("managed volume %q source is not permitted: %w", volume.Kind, err)
 		}
+		if volume.Kind == ManagedVolumeComputerDisk {
+			identity := computerStorageIdentityAt(source)
+			if err := validateSource(identity.MachineID, []string{input.ManagedRoot}, true); err != nil {
+				return fmt.Errorf("Computer machine-id source is not permitted: %w", err)
+			}
+		}
 	}
 	computerDisk := input.Workload.Computer
 	if computerDisk {
@@ -673,6 +679,10 @@ func isolationMounts(input RuntimeSpecInput) ([]specs.Mount, error) {
 			return nil, fmt.Errorf("managed volume kind %q is unsupported", volume.Kind)
 		}
 		mounts = append(mounts, bindMount(input.ManagedVolumeSources[volume.Kind], destination, volume.ReadOnly))
+		if volume.Kind == ManagedVolumeComputerDisk {
+			identity := computerStorageIdentityAt(input.ManagedVolumeSources[volume.Kind])
+			mounts = append(mounts, readonlyBindMount(identity.MachineID, computerMachineIDDestination))
+		}
 	}
 	type translatedMount struct {
 		mount  OperatorMount
