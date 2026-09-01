@@ -164,6 +164,12 @@ CREATE TABLE IF NOT EXISTS spool_acknowledgements (
   sequence INTEGER NOT NULL,
   PRIMARY KEY(attempt_id, stream)
 );
+CREATE TABLE IF NOT EXISTS spool_completion_receipts (
+  attempt_id TEXT PRIMARY KEY,
+  disposition TEXT NOT NULL CHECK (disposition IN ('delivered', 'suppressed')),
+  reason TEXT NOT NULL,
+  observed_ns INTEGER NOT NULL
+);
 	CREATE TABLE IF NOT EXISTS agent_secrets (
 	  name TEXT PRIMARY KEY,
 	  value BLOB NOT NULL
@@ -779,6 +785,66 @@ type durableCompletion struct {
 	RuntimeQuiescenceEvidence l1.RuntimeQuiescenceEvidence `json:"runtime_quiescence_evidence,omitempty"`
 }
 
+type completionInspectionReceipt struct {
+	State              string
+	Result             l1.ProcessResult
+	QuiescenceEvidence l1.RuntimeQuiescenceEvidence
+	FinishedAt         time.Time
+	Incomplete         incompleteEvidenceTombstone
+	EventCount         int64
+	Reason             string
+	InspectionError    string
+}
+
+func (spool *logSpool) inspectCompletion(ctx context.Context, attemptID string) completionInspectionReceipt {
+	var resultJSON, incompleteJSON []byte
+	var finishedNS sql.NullInt64
+	var disposition, dispositionReason sql.NullString
+	var eventCount int64
+	err := spool.db.QueryRowContext(ctx, `SELECT a.result_json, a.finished_ns, a.incomplete_json,
+  (SELECT COUNT(*) FROM spool_events WHERE attempt_id=?), r.disposition, r.reason
+FROM (SELECT 1) seed
+LEFT JOIN spool_attempts a ON a.attempt_id=?
+LEFT JOIN spool_completion_receipts r ON r.attempt_id=?`, attemptID, attemptID, attemptID).
+		Scan(&resultJSON, &finishedNS, &incompleteJSON, &eventCount, &disposition, &dispositionReason)
+	if err != nil {
+		return completionInspectionReceipt{State: "inspection_error", InspectionError: err.Error()}
+	}
+	receipt := completionInspectionReceipt{EventCount: eventCount}
+	if len(incompleteJSON) != 0 {
+		var tombstone incompleteEvidenceTombstone
+		if err := json.Unmarshal(incompleteJSON, &tombstone); err != nil {
+			return completionInspectionReceipt{State: "inspection_error", InspectionError: err.Error()}
+		}
+		receipt.State, receipt.Incomplete, receipt.Reason = "sealed_incomplete", tombstone, tombstone.Reason
+		return receipt
+	}
+	if len(resultJSON) != 0 {
+		var completion durableCompletion
+		if err := json.Unmarshal(resultJSON, &completion); err != nil {
+			receipt.State, receipt.Reason = "dead_undecodable_completion", err.Error()
+			return receipt
+		}
+		if completion.Result == (l1.ProcessResult{}) {
+			if err := json.Unmarshal(resultJSON, &completion.Result); err != nil {
+				receipt.State, receipt.Reason = "dead_undecodable_completion", err.Error()
+				return receipt
+			}
+		}
+		receipt.State, receipt.Result, receipt.QuiescenceEvidence = "durable_completion", completion.Result, completion.RuntimeQuiescenceEvidence
+		if finishedNS.Valid {
+			receipt.FinishedAt = time.Unix(0, finishedNS.Int64).UTC()
+		}
+		return receipt
+	}
+	if disposition.Valid {
+		receipt.State, receipt.Reason = disposition.String, dispositionReason.String
+		return receipt
+	}
+	receipt.State, receipt.Reason = "never_persisted", "no durable completion, tombstone, or delivery marker"
+	return receipt
+}
+
 func (spool *logSpool) storeCompletion(ctx context.Context, attemptID string, result l1.ProcessResult, finishedAt time.Time, evidence ...l1.RuntimeQuiescenceEvidence) error {
 	var quiescenceEvidence l1.RuntimeQuiescenceEvidence
 	if len(evidence) > 0 {
@@ -841,6 +907,12 @@ func (spool *logSpool) completionDelivered(ctx context.Context, attemptID string
 		return fmt.Errorf("agent: begin durable completion acknowledgement: %w", err)
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO spool_completion_receipts(attempt_id, disposition, reason, observed_ns)
+VALUES(?, 'delivered', 'acknowledged_by_l1', ?)
+ON CONFLICT(attempt_id) DO UPDATE SET disposition=excluded.disposition, reason=excluded.reason, observed_ns=excluded.observed_ns`,
+		attemptID, time.Now().UTC().UnixNano()); err != nil {
+		return fmt.Errorf("agent: record delivered completion receipt: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts SET result_json=NULL, finished_ns=NULL WHERE attempt_id=?`, attemptID); err != nil {
 		return fmt.Errorf("agent: release delivered completion: %w", err)
 	}
@@ -852,6 +924,10 @@ WHERE attempt_id=? AND result_json IS NULL AND incomplete_json IS NULL
   AND NOT EXISTS (SELECT 1 FROM spool_events WHERE attempt_id=?)`, attemptID, attemptID); err != nil {
 		return fmt.Errorf("agent: clean delivered spool attempt: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM spool_completion_receipts WHERE attempt_id IN (
+SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT -1 OFFSET 1024)`); err != nil {
+		return fmt.Errorf("agent: bound delivered completion receipts: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("agent: commit durable completion acknowledgement: %w", err)
 	}
@@ -862,8 +938,26 @@ WHERE attempt_id=? AND result_json IS NULL AND incomplete_json IS NULL
 // service intent-stop still needs the attempt identity, logs, and runtime
 // manifest to survive until lease expiry and any later removal/finalization.
 func (spool *logSpool) suppressCompletion(ctx context.Context, attemptID string) error {
-	if _, err := spool.db.ExecContext(ctx, `UPDATE spool_attempts SET result_json=NULL, finished_ns=NULL WHERE attempt_id=?`, attemptID); err != nil {
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("agent: begin durable completion suppression: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO spool_completion_receipts(attempt_id, disposition, reason, observed_ns)
+VALUES(?, 'suppressed', 'service_intent_stop', ?)
+ON CONFLICT(attempt_id) DO UPDATE SET disposition=excluded.disposition, reason=excluded.reason, observed_ns=excluded.observed_ns`,
+		attemptID, time.Now().UTC().UnixNano()); err != nil {
+		return fmt.Errorf("agent: record suppressed completion receipt: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts SET result_json=NULL, finished_ns=NULL WHERE attempt_id=?`, attemptID); err != nil {
 		return fmt.Errorf("agent: suppress durable completion replay: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM spool_completion_receipts WHERE attempt_id IN (
+SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT -1 OFFSET 1024)`); err != nil {
+		return fmt.Errorf("agent: bound suppressed completion receipts: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("agent: commit durable completion suppression: %w", err)
 	}
 	return nil
 }

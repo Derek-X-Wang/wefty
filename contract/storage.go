@@ -170,22 +170,26 @@ func DigestComputerCustodyManifest(manifest ComputerCustodyManifest) (string, er
 // L1 custody event predates this receipt: even a missing receipt cannot undo
 // the fact that an external write was authorized and may contain secrets.
 type ComputerCustodyExportReceipt struct {
-	Kind              string `json:"kind"`
-	ReceiptID         string `json:"receipt_id"`
-	ExportID          string `json:"export_id"`
-	BackupID          string `json:"backup_id"`
-	CopyID            string `json:"copy_id"`
-	ComputerID        string `json:"computer_id"`
-	StorageID         string `json:"storage_id"`
-	StorageGeneration int64  `json:"storage_generation"`
-	NodeID            string `json:"node_id"`
-	RootInstanceID    string `json:"root_instance_id"`
-	OperationRevision int64  `json:"operation_revision"`
-	CustodyFence      string `json:"custody_fence"`
-	HelperGeneration  uint64 `json:"helper_generation"`
-	ExternalPath      string `json:"external_path"`
-	AllocatedSize     int64  `json:"allocated_size"`
-	ContentDigest     string `json:"content_digest"`
-	ManifestDigest    string `json:"manifest_digest"`
-	FailureCode       string `json:"failure_code,omitempty"`
+	Kind               string `json:"kind"`
+	ReceiptID          string `json:"receipt_id"`
+	ExportID           string `json:"export_id"`
+	BackupID           string `json:"backup_id"`
+	CopyID             string `json:"copy_id"`
+	ComputerID         string `json:"computer_id"`
+	StorageID          string `json:"storage_id"`
+	StorageGeneration  int64  `json:"storage_generation"`
+	NodeID             string `json:"node_id"`
+	RootInstanceID     string `json:"root_instance_id"`
+	OperationRevision  int64  `json:"operation_revision"`
+	CustodyFence       string `json:"custody_fence"`
+	HelperGeneration   uint64 `json:"helper_generation"`
+	ExternalPath       string `json:"external_path"`
+	AllocatedSize      int64  `json:"allocated_size"`
+	ContentDigest      string `json:"content_digest"`
+	ManifestDigest     string `json:"manifest_digest"`
+	ExternalOwnerUID   uint32 `json:"external_owner_uid"`
+	ExternalOwnerGID   uint32 `json:"external_owner_gid"`
+	OwnershipApplied   bool   `json:"ownership_applied"`
+	PrivateModeApplied bool   `json:"private_mode_applied"`
+	FailureCode        string `json:"failure_code,omitempty"`
 }

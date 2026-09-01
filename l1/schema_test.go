@@ -5,12 +5,36 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestCustodyExportSQLAndOpenAPIStatusEnumsStayBound(t *testing.T) {
+	openAPI, err := os.ReadFile(filepath.Join("..", "api", "openapi", "common.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `"status": { "enum": ["planned", "available", "failed", "superseded"] }`
+	if !strings.Contains(string(openAPI), want) {
+		t.Fatalf("OpenAPI Custody export status enum does not contain %s", want)
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "status-enum.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var tableSQL string
+	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_custody_exports'`).Scan(&tableSQL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(tableSQL, "status IN ('planned', 'available', 'failed', 'superseded')") {
+		t.Fatal("SQLite Custody export status CHECK diverged from the OpenAPI enum")
+	}
+}
 
 func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "schema.sqlite"), StoreOptions{})
@@ -365,7 +389,8 @@ func TestStoreMigratesExportedCustodyStatusWithoutDroppingFutureColumns(t *testi
 		t.Fatal(err)
 	}
 	oldSQL, err := migratedSQLiteCreateTable(currentSQL, "computer_custody_exports_old_status", map[string]string{
-		"status IN ('planned', 'available', 'failed', 'superseded')": "status IN ('planned', 'exported', 'failed', 'superseded')",
+		"status IN ('planned', 'available', 'failed', 'superseded')": "status IN ('planned', 'exported', 'superseded')",
+		"external_path TEXT NOT NULL":                                "external_path TEXT NOT NULL UNIQUE",
 	})
 	if err != nil {
 		database.Close()
@@ -406,6 +431,7 @@ func TestStoreMigratesExportedCustodyStatusWithoutDroppingFutureColumns(t *testi
 		t.Fatal(err)
 	}
 	if !strings.Contains(tableSQL, "'available'") || strings.Contains(tableSQL, "'exported'") ||
+		strings.Contains(tableSQL, "external_path TEXT NOT NULL UNIQUE") || !strings.Contains(tableSQL, "'failed'") ||
 		!strings.Contains(tableSQL, "future_custody_fact") || status != "available" || futureFact != "still-preserved" {
 		t.Fatalf("Custody availability migration = schema:%s status:%q future:%q", tableSQL, status, futureFact)
 	}

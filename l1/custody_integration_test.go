@@ -36,7 +36,8 @@ func successfulCustodyExportReceipt(directive ComputerCustodyExportDirective) Co
 		RootInstanceID: directive.RootInstanceID, OperationRevision: directive.OperationRevision,
 		CustodyFence: directive.CustodyFence, HelperGeneration: 9, ExternalPath: directive.ExternalPath,
 		AllocatedSize: directive.AllocatedSize, ContentDigest: directive.ContentDigest,
-		ManifestDigest: manifestDigest}
+		ManifestDigest: manifestDigest, ExternalOwnerUID: 1000, ExternalOwnerGID: 1000,
+		OwnershipApplied: true, PrivateModeApplied: true}
 }
 
 func custodyManifest(directive ComputerCustodyExportDirective) contract.ComputerCustodyManifest {
@@ -270,6 +271,8 @@ func TestCustodyExportReceiptMutationRowsFail(t *testing.T) {
 			r.ContentDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 		},
 		func(r *ComputerCustodyExportReceipt) { r.ManifestDigest = "" },
+		func(r *ComputerCustodyExportReceipt) { r.OwnershipApplied = false },
+		func(r *ComputerCustodyExportReceipt) { r.PrivateModeApplied = false },
 	}
 	for index, mutate := range mutations {
 		receipt := valid
@@ -292,6 +295,8 @@ func TestCustodyExportFailureClosesPhaseAndPathCanBeReused(t *testing.T) {
 	}
 	failure := successfulCustodyExportReceipt(directive)
 	failure.Kind, failure.ManifestDigest, failure.FailureCode = "computer_custody_export_failed", "", "cancelled"
+	failure.ExternalOwnerUID, failure.ExternalOwnerGID = 0, 0
+	failure.OwnershipApplied, failure.PrivateModeApplied = false, false
 	failed, err := h.store.AcknowledgeComputerCustodyExport(context.Background(), "fabric-computer-node",
 		computer.ComputerID, ComputerCustodyExportAcknowledgementRequest{NodeID: node.NodeID,
 			BootSessionID: node.BootSessionID, IdempotencyKey: failure.ReceiptID, Receipt: failure})

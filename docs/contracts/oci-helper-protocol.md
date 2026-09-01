@@ -235,7 +235,7 @@ heartbeats.
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. After separate stable service-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
 | `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves machine identity; clone/import narrowly rekey it and may expand a larger filesystem. |
-| `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path outside the managed root. L1 has already committed the permanent custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, and manifest-digest evidence. |
+| `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path outside the managed root. L1 has already committed the permanent custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, manifest-digest, path-derived owner UID/GID, ownership-applied, and private-mode-applied evidence. |
 | `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A failure after ext4 may have expanded returns `computer_storage_grow_uncertain`, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
 | `PreflightComputerReimage` | Session-authorized exact current Storage generation and byte budget, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. Under the generation flock it requires real detachment or explicit verified never-attached reset-preparation evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived success or closed stage/reason failure evidence before L1 may publish or refuse the staging projection. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
@@ -797,11 +797,21 @@ already-recorded event bound to one published Backup copy and rejects paths
 inside the managed root. It writes the external manifest before the disk,
 retains partial bytes after interruption, and returns a receipt only after
 size, content digest, and manifest digest are observed. Files remain mode
-`0600` but inherit the owner and group of the operator-owned export directory,
+`0600` but inherit the owner and group of the nearest existing ancestor of the
+operator-selected path; every missing directory is created `0700` with that
+owner. The owner is path-derived, not identity-bound. The helper refuses
+symlink, non-regular, or unexpectedly owned replacement inodes, and truncates,
+chowns, writes, syncs, and hashes only the `O_NOFOLLOW`-opened file descriptor,
 so a privileged helper does not strand the portable result under helper
-identity; L1 maps the verified receipt to durable status `available`.
+identity or follow a substituted target. Receipt ownership and private-mode
+facts make those mechanics acceptance-visible. L1 maps the verified receipt to
+durable status `available`; here `available` means verified portable external
+bytes, whereas Backup `available` means a verified wefty-managed copy.
 `CopyComputerStorage` also accepts `import`: it verifies the recorded manifest
-digest and full disk digest before creating a managed destination, then applies
+digest and reopens the external disk without following links to verify the full
+disk digest before creating a managed destination. Those post-copy and import
+digest reads are load-bearing because path-derived ownership is not identity
+authority. Import then applies
 the same narrow OS machine-ID rekey and optional filesystem expansion as clone.
 Successful receipts record distinct well-formed pre/post identity digests,
 unchanged source bytes, and the prepared/no-freshness/no-chown destination
