@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -381,7 +382,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	})
 	ownershipMatchElapsed := time.Since(ownershipMatchStarted)
 	abortEvidence := exerciseLiveReconfigurationAbort(t, harness, reference, digest)
-	detachment := inspectLiveComputerDetachment(t, reimaged)
+	detachment := inspectLiveComputerReimageDetachment(t, harness, reimaged)
 	recordComputerAuthority(receipt, reimaged)
 	completeLinuxComputerRow(t, receipt, "linux.reconfiguration", map[string]bool{
 		"grow_applied_live":            resized.DesiredDiskBytes == 160<<20,
@@ -1598,11 +1599,33 @@ func appendUniqueInt64(values []int64, value int64) []int64 {
 	return append(values, value)
 }
 
-func inspectLiveComputerDetachment(t *testing.T, computer l1.Computer) bool {
+func inspectLiveComputerReimageDetachment(t *testing.T, harness *acceptanceHarness, computer l1.Computer) bool {
 	t.Helper()
-	output, err := exec.Command("sudo", "grep", "-R", "-l", `\"previous_detachment\"\|\"preparation_receipt\"`,
-		"/var/lib/wefty/oci/computer-disks").CombinedOutput()
-	return err == nil && len(bytes.TrimSpace(output)) > 0 && computer.StorageGeneration > 1
+	database, err := sql.Open("sqlite", harness.l1Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var payload []byte
+	var status string
+	if err := database.QueryRow(`SELECT preflight_receipt_json, status FROM computer_reimage_operations
+		WHERE computer_id=? AND operation_revision=?`, computer.ComputerID, computer.AppliedRevision).
+		Scan(&payload, &status); err != nil {
+		t.Fatal(err)
+	}
+	var acknowledgement struct {
+		Receipt l1.ComputerReimagePreflightReceipt `json:"receipt"`
+	}
+	if err := json.Unmarshal(payload, &acknowledgement); err != nil {
+		t.Fatal(err)
+	}
+	receipt := acknowledgement.Receipt
+	return status == "completed" && receipt.Kind == "computer_reimage_preflight_verified" &&
+		receipt.ComputerID == computer.ComputerID && receipt.StorageID == computer.StorageID &&
+		receipt.StorageGeneration == computer.StorageGeneration && receipt.OperationRevision == computer.AppliedRevision &&
+		receipt.StagingJobID == computer.CurrentJobID && receipt.StorageEvidenceKind == "computer_reimage_detachment" &&
+		receipt.DetachmentReceiptID != "" && receipt.DetachmentAttemptID != "" && receipt.DetachmentFencingToken != "" &&
+		receipt.ResetPreparationReceiptID == ""
 }
 
 type liveAbortEvidence struct {
