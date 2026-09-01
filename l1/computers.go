@@ -1802,22 +1802,11 @@ func validatePendingComputerProjection(
 
 func quiesceComputerProjectionTx(ctx context.Context, tx *sql.Tx, job Job, now time.Time) (bool, error) {
 	switch job.State {
-	case contract.JobQueued:
-		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?`,
-			contract.JobStopped, now.UnixNano(), job.JobID); err != nil {
-			return false, internalError(err, "quiesce queued Computer projection")
+	case contract.JobQueued, contract.JobClaimed, contract.JobRunning, contract.JobStopping, contract.JobStopped:
+		if err := setComputerServiceDesiredState(ctx, tx, job, contract.ServiceDesiredStopped, now); err != nil {
+			return false, err
 		}
-		return true, nil
-	case contract.JobClaimed, contract.JobRunning:
-		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?`,
-			contract.JobStopping, now.UnixNano(), job.JobID); err != nil {
-			return false, internalError(err, "quiesce active Computer projection")
-		}
-		return false, nil
-	case contract.JobStopping:
-		return false, nil
-	case contract.JobStopped:
-		return true, nil
+		return job.State == contract.JobQueued || job.State == contract.JobStopped, nil
 	case contract.JobFailed:
 		return true, nil
 	default:

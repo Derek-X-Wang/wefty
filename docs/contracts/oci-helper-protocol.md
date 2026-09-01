@@ -734,7 +734,10 @@ L1 records a successful preflight receipt and activates the staged Computer
 projection in the same acknowledgement transaction. The agent does not wait
 for an operator replay or a later heartbeat to move the Computer out of
 `reimaging`; an identical acknowledgement replay returns the already-completed
-projection.
+projection. When the retiring projection is live, L1 preserves the Computer's
+running intent but writes that service projection desired-stopped, so its next
+fenced lease renewal carries the stop directive and reaches the stopped
+preflight precondition.
 
 Computer removal carries the same exact Storage identity plus current Node,
 boot, consumer Job, named prior Job, removal-generation, and cleanup-fence

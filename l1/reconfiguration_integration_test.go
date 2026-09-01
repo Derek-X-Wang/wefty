@@ -374,8 +374,13 @@ func TestRunningComputerReimageUsesInternalQuiescence(t *testing.T) {
 		t.Fatal(err)
 	}
 	if reimaging.DesiredState != contract.ServiceDesiredRunning || reimaging.CurrentJob.State != contract.JobStopping ||
-		reimaging.CurrentJob.DesiredState != contract.ServiceDesiredRunning || reimaging.ReconfigurationPhase != ComputerReconfigurationReimaging {
+		reimaging.CurrentJob.DesiredState != contract.ServiceDesiredStopped || reimaging.ReconfigurationPhase != ComputerReconfigurationReimaging {
 		t.Fatalf("reimaging Computer = %#v", reimaging)
+	}
+	renewed, err := h.store.RenewLease(t.Context(), "fabric-computer-node", claim.Job.JobID,
+		claim.Lease.AttemptID, claim.Lease.FencingToken)
+	if err != nil || renewed.Directive != AttemptDirectiveStop {
+		t.Fatalf("running Computer reimage renewal = %#v err=%v, want stop directive", renewed, err)
 	}
 	if _, err := h.store.CompleteAttempt(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID,
 		CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "reimage-quiesced",
@@ -652,7 +657,7 @@ func TestReconfigurationAbortRequiresDeadBoundNodeAndLeavesExplicitRestart(t *te
 	if aborted.ReconfigurationPhase != ComputerReconfigurationStable || aborted.DesiredState != contract.ServiceDesiredRunning ||
 		aborted.IntentRevision != reimaging.IntentRevision+1 || aborted.AppliedRevision != aborted.IntentRevision ||
 		aborted.CurrentJobID != computer.CurrentJobID || aborted.CurrentJob.State != contract.JobStopped ||
-		aborted.CurrentJob.DesiredState != contract.ServiceDesiredRunning || len(aborted.CurrentJob.LastFailure) == 0 {
+		aborted.CurrentJob.DesiredState != contract.ServiceDesiredStopped || len(aborted.CurrentJob.LastFailure) == 0 {
 		t.Fatalf("aborted Computer = %#v", aborted)
 	}
 	var retired int64
