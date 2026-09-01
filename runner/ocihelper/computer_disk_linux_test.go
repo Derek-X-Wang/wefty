@@ -300,6 +300,9 @@ func TestComputerDiskRootOwnershipInitializesOnlyFreshFormat(t *testing.T) {
 	if err != nil || !validComputerMachineID(machineID) {
 		t.Fatalf("fresh Computer machine-id = %q err=%v", machineID, err)
 	}
+	if err := os.Chmod(machineIDPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(machineIDPath, []byte("tenant-corruption"), 0o444); err != nil {
 		t.Fatal(err)
 	}
@@ -314,6 +317,72 @@ func TestComputerDiskRootOwnershipInitializesOnlyFreshFormat(t *testing.T) {
 	if err := initializeComputerDiskRoot(&computerDiskAttachment{mountPath: mountPath, fresh: false}, wrongUID, gid, false); err == nil {
 		t.Fatal("existing Computer disk was silently re-owned")
 	}
+}
+
+func TestComputerStorageIdentityPermissionFailureIsTyped(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires an unprivileged test process")
+	}
+
+	t.Run("unreadable identity", func(t *testing.T) {
+		root := t.TempDir()
+		paths := computerStorageIdentityAt(root)
+		if err := os.Mkdir(paths.Directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		machineID := []byte("0123456789abcdef0123456789abcdef\n")
+		if err := os.WriteFile(paths.MachineID, machineID, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(paths.MachineID, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(paths.MachineID, 0o600) })
+
+		_, err := ensureComputerStorageIdentity(root)
+		var permission *computerStorageIdentityPermissionError
+		if !errors.As(err, &permission) || permission.Operation != "read machine-id" ||
+			!errors.Is(err, os.ErrPermission) || engineFailureReason(err) != EngineFailurePermissionDenied {
+			t.Fatalf("unreadable Computer machine-id error = %v, want typed permission failure", err)
+		}
+		if err := os.Chmod(paths.MachineID, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		preserved, err := os.ReadFile(paths.MachineID)
+		if err != nil || string(preserved) != string(machineID) {
+			t.Fatalf("unreadable Computer machine-id was replaced = %q err=%v", preserved, err)
+		}
+	})
+
+	t.Run("unwritable identity directory", func(t *testing.T) {
+		root := t.TempDir()
+		paths := computerStorageIdentityAt(root)
+		if err := os.Mkdir(paths.Directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		malformed := []byte("tenant-corruption")
+		if err := os.WriteFile(paths.MachineID, malformed, 0o400); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(paths.Directory, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(paths.Directory, 0o700) })
+
+		_, err := ensureComputerStorageIdentity(root)
+		var permission *computerStorageIdentityPermissionError
+		if !errors.As(err, &permission) || permission.Operation != "remove invalid machine-id" ||
+			!errors.Is(err, os.ErrPermission) || engineFailureReason(err) != EngineFailurePermissionDenied {
+			t.Fatalf("unwritable Computer identity directory error = %v, want typed permission failure", err)
+		}
+		if err := os.Chmod(paths.Directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		preserved, err := os.ReadFile(paths.MachineID)
+		if err != nil || string(preserved) != string(malformed) {
+			t.Fatalf("unwritable Computer machine-id was replaced = %q err=%v", preserved, err)
+		}
+	})
 }
 
 func TestComputerStorageIdentityRepairsTenantReplacedEtc(t *testing.T) {
