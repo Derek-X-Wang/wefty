@@ -906,7 +906,7 @@
       "post": {
         "operationId": "reimageComputer",
         "summary": "Replace a Computer image while retaining its disk",
-        "description": "CAS-guarded reimage creates a new immutable Job projection for the same Computer and Storage generation. A running Computer is internally quiesced only with explicit session termination; authoritative desired state is preserved. chown authorizes one crash-resumable, symlink-safe ownership migration.",
+        "description": "CAS-guarded reimage creates a new immutable Job projection for the same Computer and Storage generation. A running Computer is internally quiesced only with explicit session termination: the retained Computer desired state remains running while the retiring service projection becomes desired stopped so its next fenced renewal carries the stop directive. chown authorizes one crash-resumable, symlink-safe ownership migration.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["intent_revision", "storage_id", "storage_generation", "image", "idempotency_key"],

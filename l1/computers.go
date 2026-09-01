@@ -170,6 +170,7 @@ type ComputerReimagePreflightDirective struct {
 	ComputerID        string                `json:"computer_id"`
 	StorageID         string                `json:"storage_id"`
 	StorageGeneration int64                 `json:"storage_generation"`
+	DiskBytes         int64                 `json:"disk_bytes"`
 	OldJobID          string                `json:"old_job_id"`
 	StagingJobID      string                `json:"staging_job_id"`
 	BoundNodeID       string                `json:"bound_node_id"`
@@ -181,29 +182,33 @@ type ComputerReimagePreflightDirective struct {
 }
 
 type ComputerReimagePreflightReceipt struct {
-	Kind                   string `json:"kind"`
-	ReceiptID              string `json:"receipt_id"`
-	ComputerID             string `json:"computer_id"`
-	StorageID              string `json:"storage_id"`
-	StorageGeneration      int64  `json:"storage_generation"`
-	OldJobID               string `json:"old_job_id"`
-	StagingJobID           string `json:"staging_job_id"`
-	NodeID                 string `json:"node_id"`
-	RootInstanceID         string `json:"root_instance_id"`
-	OperationRevision      int64  `json:"operation_revision"`
-	OperationFence         string `json:"operation_fence"`
-	TargetDigest           string `json:"target_digest"`
-	PlatformOS             string `json:"platform_os"`
-	PlatformArchitecture   string `json:"platform_architecture"`
-	ImageUID               uint32 `json:"image_uid"`
-	ImageGID               uint32 `json:"image_gid"`
-	DiskRootUID            uint32 `json:"disk_root_uid"`
-	DiskRootGID            uint32 `json:"disk_root_gid"`
-	DetachmentReceiptID    string `json:"detachment_receipt_id"`
-	DetachmentAttemptID    string `json:"detachment_attempt_id"`
-	DetachmentFencingToken string `json:"detachment_fencing_token"`
-	HelperGeneration       uint64 `json:"helper_generation"`
-	FailureCode            string `json:"failure_code"`
+	Kind                      string `json:"kind"`
+	ReceiptID                 string `json:"receipt_id"`
+	ComputerID                string `json:"computer_id"`
+	StorageID                 string `json:"storage_id"`
+	StorageGeneration         int64  `json:"storage_generation"`
+	OldJobID                  string `json:"old_job_id"`
+	StagingJobID              string `json:"staging_job_id"`
+	NodeID                    string `json:"node_id"`
+	RootInstanceID            string `json:"root_instance_id"`
+	OperationRevision         int64  `json:"operation_revision"`
+	OperationFence            string `json:"operation_fence"`
+	TargetDigest              string `json:"target_digest"`
+	PlatformOS                string `json:"platform_os"`
+	PlatformArchitecture      string `json:"platform_architecture"`
+	ImageUID                  uint32 `json:"image_uid"`
+	ImageGID                  uint32 `json:"image_gid"`
+	DiskRootUID               uint32 `json:"disk_root_uid"`
+	DiskRootGID               uint32 `json:"disk_root_gid"`
+	StorageEvidenceKind       string `json:"storage_evidence_kind"`
+	DetachmentReceiptID       string `json:"detachment_receipt_id"`
+	DetachmentAttemptID       string `json:"detachment_attempt_id"`
+	DetachmentFencingToken    string `json:"detachment_fencing_token"`
+	ResetPreparationReceiptID string `json:"reset_preparation_receipt_id"`
+	HelperGeneration          uint64 `json:"helper_generation"`
+	FailureCode               string `json:"failure_code"`
+	FailureStage              string `json:"failure_stage"`
+	FailureReason             string `json:"failure_reason"`
 }
 
 type ComputerReimagePreflightAcknowledgementRequest struct {
@@ -1797,24 +1802,23 @@ func validatePendingComputerProjection(
 
 func quiesceComputerProjectionTx(ctx context.Context, tx *sql.Tx, job Job, now time.Time) (bool, error) {
 	switch job.State {
-	case contract.JobQueued:
-		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?`,
-			contract.JobStopped, now.UnixNano(), job.JobID); err != nil {
-			return false, internalError(err, "quiesce queued Computer projection")
+	case contract.JobQueued, contract.JobClaimed, contract.JobRunning:
+		if err := setComputerServiceDesiredState(ctx, tx, job, contract.ServiceDesiredStopped, now); err != nil {
+			return false, err
 		}
-		return true, nil
-	case contract.JobClaimed, contract.JobRunning:
-		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?`,
-			contract.JobStopping, now.UnixNano(), job.JobID); err != nil {
-			return false, internalError(err, "quiesce active Computer projection")
+		return job.State == contract.JobQueued, nil
+	case contract.JobStopping, contract.JobStopped, contract.JobFailed:
+		// RestartComputer deliberately leaves an active resource latch in
+		// stopping/running-desired until its current attempt reports terminal.
+		// Projection replacement still owns a stop intent in that state. Write
+		// the internal desired state directly instead of asking the public
+		// transition helper to reject the stale observation.
+		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET desired_state=?, next_restart_at=NULL,
+			published_attempt_id=NULL, healthy_since_ns=NULL WHERE job_id=?`,
+			contract.ServiceDesiredStopped, job.JobID); err != nil {
+			return false, internalError(err, "quiesce terminal Computer projection")
 		}
-		return false, nil
-	case contract.JobStopping:
-		return false, nil
-	case contract.JobStopped:
-		return true, nil
-	case contract.JobFailed:
-		return true, nil
+		return job.State == contract.JobStopped || job.State == contract.JobFailed, nil
 	default:
 		return false, protocolError(contract.ErrorConflict,
 			"Computer Job %q cannot enter projection from %q", job.JobID, job.State)

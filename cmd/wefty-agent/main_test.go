@@ -265,7 +265,8 @@ func TestDurableOCIIntentGatesBackgroundRecoveryUntilControllerStart(t *testing.
 	started, err := controller.Start(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 2})
 	if err != nil || !started.Intent.Enabled || !started.CapabilityPublished {
 		cancelAgent()
-		t.Fatalf("explicit OCI start=%+v err=%v", started, err)
+		t.Fatalf("explicit OCI start=%+v err=%v cause=%v agent_status=%+v capability=%+v probe_calls=%d",
+			started, err, errors.Unwrap(err), nodeAgent.Status(), nodeAgent.CapabilitySnapshot(), probeAdapter.calls.Load())
 	}
 	waitForMainTestNode(t, store, "intent-node", func(node l1.Node) bool { return node.Capabilities["kind:oci"] })
 	if probeAdapter.calls.Load() == 0 {

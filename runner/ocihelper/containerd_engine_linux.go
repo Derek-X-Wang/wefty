@@ -113,6 +113,7 @@ type ContainerdEngine struct {
 	serviceVolumeMu             sync.Mutex
 	storageResetMu              sync.Mutex
 	computerBackupMu            sync.Mutex
+	computerReimageMu           sync.Mutex
 	storageCopyMu               sync.Mutex
 	diskSystem                  computerDiskSystem
 	storageResetHook            func(computerStorageResetPhase) error
@@ -129,6 +130,8 @@ type ContainerdEngine struct {
 	computerGrowResize          func(context.Context, string, string, int64, int64) error
 	computerGrowFilesystemBytes func(context.Context, string) (int64, error)
 	computerGrowAllocate        func(string, int64) error
+	computerReimageImageInspect func(context.Context, PreflightComputerReimageRequest) (computerReimageImageFacts, error)
+	computerReimageDiskOwner    func(context.Context, string) (uint32, uint32, error)
 	lastProfile                 *ProfileReceipt
 	capacityMu                  sync.Mutex
 	capacityReservations        map[string]*capacityReservation
@@ -137,10 +140,11 @@ type ContainerdEngine struct {
 }
 
 const (
-	defaultAttemptPortMin    uint16 = 42000
-	defaultAttemptPortMax    uint16 = 42999
-	defaultHandoffRetention         = 24 * time.Hour
-	doctorRuntimeReadTimeout        = 2 * time.Second
+	defaultAttemptPortMin                  uint16 = 42000
+	defaultAttemptPortMax                  uint16 = 42999
+	defaultHandoffRetention                       = 24 * time.Hour
+	defaultComputerReimagePreflightTimeout        = 10 * time.Second
+	doctorRuntimeReadTimeout                      = 2 * time.Second
 )
 
 func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
@@ -173,6 +177,9 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	}
 	if config.HandoffRetention <= 0 {
 		config.HandoffRetention = defaultHandoffRetention
+	}
+	if config.ComputerReimagePreflightTimeout <= 0 {
+		config.ComputerReimagePreflightTimeout = defaultComputerReimagePreflightTimeout
 	}
 	if config.AttemptPortMin == 0 {
 		config.AttemptPortMin = defaultAttemptPortMin

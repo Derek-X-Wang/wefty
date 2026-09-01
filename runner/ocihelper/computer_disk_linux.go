@@ -90,6 +90,13 @@ func (engine *ContainerdEngine) computerDiskSystem() computerDiskSystem {
 }
 
 func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage ComputerStorageReference, authority AttemptAuthority) (_ *computerDiskAttachment, err error) {
+	engine.computerReimageMu.Lock()
+	reimageLocked := true
+	defer func() {
+		if reimageLocked {
+			engine.computerReimageMu.Unlock()
+		}
+	}()
 	if storage.DiskBytes <= 0 || storage.IntentRevision < 1 {
 		return nil, errors.New("Computer disk requires a positive allocation")
 	}
@@ -121,6 +128,11 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 	if err = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return nil, errComputerStorageAttachmentOwned
 	}
+	// The node-wide mutex only orders manifest/flock admission against
+	// preflight. The generation flock now owns this disk, so formatting and
+	// mounting it must not freeze unrelated Computers on the node.
+	engine.computerReimageMu.Unlock()
+	reimageLocked = false
 	manifestPath := filepath.Join(diskRoot, "attachment.json")
 	manifest, present, err := readComputerDiskManifest(manifestPath)
 	if err != nil {
@@ -131,13 +143,16 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 			return nil, errors.New("Computer disk manifest does not match its durable Storage identity")
 		}
 		if manifest.Retirement != nil {
-			return nil, errors.New("Computer Storage generation is fenced for retirement")
+			return nil, &computerStorageRetiredError{}
 		}
 		if manifest.Attached != nil {
 			return nil, errors.New("Computer Storage generation remains attached; lock disappearance is not detachment proof")
 		}
 		if manifest.Pending != nil {
 			return nil, errors.New("Computer Storage generation has an unresolved pending attachment")
+		}
+		if manifest.Preparation != nil && manifest.PreparationReceipt == nil {
+			return nil, errors.New("Computer Storage reset preparation is not verified for attachment")
 		}
 		// An authority manifest with no attachment history is the durable first-
 		// allocation checkpoint. It may be resumed whether the image rename has
@@ -351,6 +366,13 @@ func (engine *ContainerdEngine) quarantineComputerDiskCleanup(request DeleteMana
 }
 
 func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageReference, removal ManagedVolumeRemovalAuthority) error {
+	engine.computerReimageMu.Lock()
+	reimageLocked := true
+	defer func() {
+		if reimageLocked {
+			engine.computerReimageMu.Unlock()
+		}
+	}()
 	name, err := deterministicComputerDiskName(storage)
 	if err != nil {
 		return err
@@ -374,6 +396,11 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
+	// The per-generation flock, when present, now excludes preflight and
+	// attachment for this disk. Release the node-wide admission mutex before
+	// filesystem inspection and deletion so other Computers remain live.
+	engine.computerReimageMu.Unlock()
+	reimageLocked = false
 	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
 	if err != nil {
 		return err
@@ -1051,6 +1078,39 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 				return err
 			}
 			if err := syncDirectory(root); err != nil {
+				return err
+			}
+			continue
+		}
+		// A reset successor has no tenant bytes before its preparation receipt is
+		// durably published. If the helper died anywhere in that preparation, drop
+		// the exact unverified generation so the standing L1 reset authority can
+		// recreate it; retaining a half-published image would instead make startup
+		// verification fail closed forever on allocation_mismatch/image_missing.
+		if unverifiedComputerStorageResetPreparation(manifest) {
+			expectedName, identityErr := deterministicComputerDiskName(manifest.Storage)
+			if identityErr != nil || expectedName != entry.Name() || manifest.DiskImage != "disk.ext4" ||
+				manifest.MountDirectory != entry.Name() || manifest.Storage.StorageGeneration < 2 {
+				// A preparation-shaped record with corrupted directory, image, or
+				// generation identity is retained as an inventory anomaly. It is not
+				// safe to reinterpret it as the exact disposable reset successor.
+				continue
+			}
+			lock, lockErr := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+			if lockErr != nil {
+				return lockErr
+			}
+			if lockErr = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); lockErr != nil {
+				_ = lock.Close()
+				return errors.New("unverified Computer Storage reset preparation lock remained owned after sweep")
+			}
+			removeErr := os.RemoveAll(root)
+			_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+			_ = lock.Close()
+			if removeErr != nil {
+				return removeErr
+			}
+			if err := syncDirectory(diskRoot); err != nil {
 				return err
 			}
 			continue

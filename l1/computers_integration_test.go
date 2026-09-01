@@ -468,7 +468,7 @@ func TestComputerProjectionRetirementAndRemovalForecloseClaims(t *testing.T) {
 	}
 }
 
-func TestComputerProjectionQuiescesRunningObservationWithoutStopIntent(t *testing.T) {
+func TestComputerProjectionQuiescesRunningObservationWithInternalServiceStop(t *testing.T) {
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
 		"computer-node": {
 			Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1,
@@ -512,7 +512,7 @@ func TestComputerProjectionQuiescesRunningObservationWithoutStopIntent(t *testin
 	if projecting.DesiredState != contract.ServiceDesiredRunning ||
 		projecting.ReconfigurationPhase != ComputerReconfigurationProjecting ||
 		projecting.CurrentJobID != oldJobID || projecting.CurrentJob.State != contract.JobStopping ||
-		projecting.CurrentJob.DesiredState != contract.ServiceDesiredRunning ||
+		projecting.CurrentJob.DesiredState != contract.ServiceDesiredStopped ||
 		projecting.IntentRevision != computer.IntentRevision+1 || projecting.AppliedRevision != computer.AppliedRevision {
 		t.Fatalf("projecting Computer = %#v", projecting)
 	}

@@ -33,6 +33,16 @@ func sameComputerStorageResetAuthority(left, right ComputerStorageResetAuthority
 		left.CleanupFence == right.CleanupFence
 }
 
+func unverifiedComputerStorageResetPreparation(manifest computerDiskManifest) bool {
+	authority := manifest.Preparation
+	return authority != nil && manifest.PreparationReceipt == nil && !manifest.Prepared && manifest.Retirement == nil &&
+		manifest.Attached == nil && manifest.Pending == nil && manifest.PreviousDetachment == nil &&
+		authority.NodeID != "" && authority.BootSessionID != "" && authority.RootInstanceID != "" &&
+		authority.JobID != "" && authority.PriorJobID != "" && authority.HelperGeneration != 0 &&
+		authority.IntentRevision == manifest.Storage.IntentRevision && authority.IntentRevision > 0 &&
+		strings.TrimSpace(authority.CleanupFence) != ""
+}
+
 func validResetDetachmentEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority ComputerStorageResetAuthority) bool {
 	return validComputerDiskConsumerDetachmentEvidence(evidence, storage, computerDiskDetachmentAuthority{
 		NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, PriorJobID: authority.PriorJobID,

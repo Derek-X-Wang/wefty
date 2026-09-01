@@ -78,6 +78,7 @@ type capabilityState struct {
 	claimPublication           sync.RWMutex
 	probeMu                    sync.Mutex
 	probeActive                bool
+	probeDone                  chan struct{}
 	clock                      Clock
 	probe                      CapabilityProbe
 	timeout                    time.Duration
@@ -123,13 +124,19 @@ func (state *capabilityState) refreshValidated(ctx context.Context, validate fun
 		return nil
 	}
 	state.probeMu.Lock()
-	if state.probeActive {
+	for state.probeActive {
+		probeDone := state.probeDone
 		state.probeMu.Unlock()
-		probeErr := errors.New("capability probe is still running")
-		state.record(CapabilityProbeResult{}, probeErr)
-		return probeErr
+		select {
+		case <-probeDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		state.probeMu.Lock()
 	}
 	state.probeActive = true
+	probeDone := make(chan struct{})
+	state.probeDone = probeDone
 	state.probeMu.Unlock()
 	suppressionSequence := state.ociSuppressionSequence.Load()
 	probeContext, cancel := context.WithTimeout(ctx, state.timeout)
@@ -142,6 +149,8 @@ func (state *capabilityState) refreshValidated(ctx context.Context, validate fun
 		result, err := state.probe.Probe(probeContext)
 		state.probeMu.Lock()
 		state.probeActive = false
+		state.probeDone = nil
+		close(probeDone)
 		state.probeMu.Unlock()
 		completed <- probeResult{result: result, err: err}
 	}()

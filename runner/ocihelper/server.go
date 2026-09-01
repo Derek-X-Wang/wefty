@@ -1101,6 +1101,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			var insufficientMemory *insufficientMemoryError
 			var insufficientDisk *insufficientDiskError
 			var imageUnavailable *ImageUnavailableError
+			var storageRetired *computerStorageRetiredError
 			if errors.As(err, &rpcErr) {
 				_ = writeRPCError(wire, rpcErr)
 			} else if errors.Is(err, errComputerStorageAttachmentOwned) {
@@ -1111,6 +1112,12 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 					_ = writeFailure(wire, CodeComputerStorageBusy, errComputerStorageAttachmentOwned.Error())
 				} else {
 					_ = writeFailure(wire, CodeSessionStale, "Computer Storage conflict cleanup could not verify runtime absence")
+				}
+			} else if errors.As(err, &storageRetired) {
+				if reapErr == nil {
+					_ = writeFailure(wire, CodeComputerStorageRetired, storageRetired.Error())
+				} else {
+					_ = writeFailure(wire, CodeSessionStale, "retired Computer Storage refusal could not verify runtime absence")
 				}
 			} else if errors.As(err, &specRejection) {
 				_ = writeFailure(wire, CodeOCISpecRejected, "OCI runtime spec was rejected")
@@ -1806,6 +1813,10 @@ func writeEngineResponseWithMethod(connection *framedConn, method Method, respon
 		var serviceDataRejection *ServiceDataRejectionError
 		if errors.As(err, &serviceDataRejection) {
 			return writeFailure(connection, CodeOCISpecRejected, serviceDataRejection.Error())
+		}
+		var preflightStage *computerReimagePreflightStageError
+		if method == MethodPreflightReimage && (errors.Is(err, errComputerReimageDetachmentRequired) || errors.As(err, &preflightStage)) {
+			return writeRPCError(connection, engineFailureRPC(method, "OCI engine operation failed", engineFailureReason(err), err))
 		}
 		return writeRPCError(connection, engineFailureRPC(method, "OCI engine operation failed", engineFailureReason(err)))
 	}

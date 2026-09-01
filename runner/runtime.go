@@ -592,29 +592,33 @@ type ComputerReimagePreflightRequest struct {
 }
 
 type ComputerReimagePreflightReceipt struct {
-	Kind                   string
-	ReceiptID              string
-	ComputerID             string
-	StorageID              string
-	StorageGeneration      int64
-	OldJobID               string
-	StagingJobID           string
-	NodeID                 string
-	RootInstanceID         string
-	OperationRevision      int64
-	OperationFence         string
-	TargetDigest           string
-	PlatformOS             string
-	PlatformArchitecture   string
-	ImageUID               uint32
-	ImageGID               uint32
-	DiskRootUID            uint32
-	DiskRootGID            uint32
-	DetachmentReceiptID    string
-	DetachmentAttemptID    string
-	DetachmentFencingToken string
-	HelperGeneration       uint64
-	FailureCode            string
+	Kind                      string
+	ReceiptID                 string
+	ComputerID                string
+	StorageID                 string
+	StorageGeneration         int64
+	OldJobID                  string
+	StagingJobID              string
+	NodeID                    string
+	RootInstanceID            string
+	OperationRevision         int64
+	OperationFence            string
+	TargetDigest              string
+	PlatformOS                string
+	PlatformArchitecture      string
+	ImageUID                  uint32
+	ImageGID                  uint32
+	DiskRootUID               uint32
+	DiskRootGID               uint32
+	StorageEvidenceKind       string
+	DetachmentReceiptID       string
+	DetachmentAttemptID       string
+	DetachmentFencingToken    string
+	ResetPreparationReceiptID string
+	HelperGeneration          uint64
+	FailureCode               string
+	FailureStage              string
+	FailureReason             string
 }
 
 // ComputerBackupper owns the physical source-node copy mechanics behind the

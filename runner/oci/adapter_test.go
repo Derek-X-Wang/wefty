@@ -1373,6 +1373,25 @@ func TestComputerStorageBusyHasPositiveNoRuntimeReapEvidence(t *testing.T) {
 	}
 }
 
+func TestComputerStorageRetiredHasPositiveNoRuntimeReapEvidence(t *testing.T) {
+	engine := &adapterTestEngine{runErr: &ocihelper.RPCError{
+		Code: ocihelper.CodeComputerStorageRetired, Message: "Computer Storage generation is fenced for retirement",
+	}, refuseDelete: true}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	if _, err := adapter.Run(t.Context(), request, nil); err == nil {
+		t.Fatal("retired Computer Storage generation unexpectedly started")
+	}
+	receipt, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
+	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime {
+		t.Fatalf("retired Computer Storage finalization = %+v err=%v", receipt, err)
+	}
+	if engine.runtimeDeletes != 0 {
+		t.Fatalf("retired Computer Storage refusal attempted %d runtime deletes", engine.runtimeDeletes)
+	}
+}
+
 func TestAttemptAuthorityReplayIsNotDefinitiveBeforeRuntimeCreation(t *testing.T) {
 	engine := &adapterTestEngine{runErr: &ocihelper.RPCError{
 		Code: ocihelper.CodeUnauthorizedAttempt, Message: "attempt authority has already been used in this session",

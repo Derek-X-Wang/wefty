@@ -711,7 +711,11 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		if _, err := session.Run(ctx, ocihelper.RunRequest{Authority: authority, InitialDeadman: l1.DefaultLeaseDuration, Workload: ocihelper.WorkloadInput{ImageReference: reference, ImageDigest: digest, Argv: []string{"/bin/sh", "-c", "exec sleep 60"}}}); err != nil {
 			t.Fatal(err)
 		}
-		requestRootFault(t, loss)
+		fault := loss
+		if loss == "kill-shim" {
+			fault += ":" + authority.JobID
+		}
+		requestRootFault(t, fault)
 		var lossResult *ocihelper.WatchResponse
 		if err := session.Watch(ctx, ocihelper.WatchRequest{Authority: authority}, func(event ocihelper.WatchEvent) error {
 			if event.Result != nil {
@@ -1073,12 +1077,18 @@ func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, 
 		t.Fatal(err)
 	}
 	defer store.Close()
-	registration := contract.NodeRegistration{NodeID: "native-computer-node", BootSessionID: "native-boot", OS: "linux", Architecture: "amd64", AgentVersion: "realtiming",
+	registration := contract.NodeRegistration{NodeID: "native-node", BootSessionID: "native-boot", OS: "linux", Architecture: "amd64", AgentVersion: "realtiming",
 		Capabilities:       map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true},
 		CapabilityRevision: 1, CapabilityObservedAt: time.Now().UTC(), MissingCapabilities: []string{}}
 	policy := l1.NodePolicy{Tags: []string{contract.StableNodeTagPrefix + registration.NodeID}, MaxOneshotSlots: 1, MaxServiceSlots: 1}
 	if _, err := store.RegisterNode(ctx, fabric.Identity{NodeID: "native-agent"}, registration, policy, true); err != nil {
 		t.Fatal(err)
+	}
+	// The preceding Computer-disk exercise deliberately replaces the helper.
+	// Re-establish platform and image-pin authority for the exact Node/boot that
+	// owns this L1 exercise rather than borrowing the earlier probe identity.
+	if err := adapter.Probe(ctx, registration.NodeID, registration.BootSessionID, reference, digest, l1.DefaultLeaseDuration); err != nil {
+		t.Fatalf("re-probe OCI adapter after Computer helper-death sweep: %v", err)
 	}
 	memory := int64(1 << 30)
 	digestCopy := digest
@@ -1996,7 +2006,7 @@ func exerciseNativeLinuxOneshotContract(t *testing.T, ctx context.Context, adapt
 	postStarted.Execution.Env = map[string]string{contract.EnvRunID: "native-one-shot-loss", contract.EnvL3Endpoint: bridge.URL}
 	postStarted.Execution.SensitiveEnv = map[string]string{contract.EnvRunToken: token}
 	postStarted.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
-		requestRootFault(t, "kill-shim")
+		requestRootFault(t, "kill-shim:"+postStarted.Authority.JobID)
 		return nil
 	}
 	postResult, postErr := adapter.Run(ctx, postStarted, nil)
@@ -2390,8 +2400,21 @@ func requestRootFault(t *testing.T, action string) {
 	failure := filepath.Join(directory, action+".failed")
 	_ = os.Remove(ack)
 	_ = os.Remove(failure)
-	if err := os.WriteFile(fifo, []byte(action+"\n"), 0o600); err != nil {
-		t.Fatal(err)
+	writeDeadline := time.Now().Add(2 * time.Second)
+	for {
+		writer, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			_, writeErr := writer.Write([]byte(action + "\n"))
+			closeErr := writer.Close()
+			if writeErr == nil && closeErr == nil {
+				break
+			}
+			err = errors.Join(writeErr, closeErr)
+		}
+		if time.Now().After(writeDeadline) {
+			t.Fatalf("write root fault %s before deadline: %v", action, err)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {

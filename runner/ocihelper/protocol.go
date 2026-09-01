@@ -79,6 +79,7 @@ const (
 	CodeSessionBusy                  ErrorCode = "session_busy"
 	CodeSessionStale                 ErrorCode = "session_stale"
 	CodeComputerStorageBusy          ErrorCode = "computer_storage_busy"
+	CodeComputerStorageRetired       ErrorCode = "computer_storage_retired"
 	CodeComputerStorageGrowUncertain ErrorCode = "computer_storage_grow_uncertain"
 	CodeUnauthorizedAttempt          ErrorCode = "unauthorized_attempt"
 	CodeAttemptOutsideSession        ErrorCode = "attempt_outside_session"
@@ -1098,29 +1099,33 @@ type PreflightComputerReimageRequest struct {
 }
 
 type ComputerReimagePreflightReceipt struct {
-	Kind                   string `json:"kind"`
-	ReceiptID              string `json:"receipt_id"`
-	ComputerID             string `json:"computer_id"`
-	StorageID              string `json:"storage_id"`
-	StorageGeneration      int64  `json:"storage_generation"`
-	OldJobID               string `json:"old_job_id"`
-	StagingJobID           string `json:"staging_job_id"`
-	NodeID                 string `json:"node_id"`
-	RootInstanceID         string `json:"root_instance_id"`
-	OperationRevision      int64  `json:"operation_revision"`
-	OperationFence         string `json:"operation_fence"`
-	TargetDigest           string `json:"target_digest"`
-	PlatformOS             string `json:"platform_os"`
-	PlatformArchitecture   string `json:"platform_architecture"`
-	ImageUID               uint32 `json:"image_uid"`
-	ImageGID               uint32 `json:"image_gid"`
-	DiskRootUID            uint32 `json:"disk_root_uid"`
-	DiskRootGID            uint32 `json:"disk_root_gid"`
-	DetachmentReceiptID    string `json:"detachment_receipt_id"`
-	DetachmentAttemptID    string `json:"detachment_attempt_id"`
-	DetachmentFencingToken string `json:"detachment_fencing_token"`
-	HelperGeneration       uint64 `json:"helper_generation"`
-	FailureCode            string `json:"failure_code"`
+	Kind                      string `json:"kind"`
+	ReceiptID                 string `json:"receipt_id"`
+	ComputerID                string `json:"computer_id"`
+	StorageID                 string `json:"storage_id"`
+	StorageGeneration         int64  `json:"storage_generation"`
+	OldJobID                  string `json:"old_job_id"`
+	StagingJobID              string `json:"staging_job_id"`
+	NodeID                    string `json:"node_id"`
+	RootInstanceID            string `json:"root_instance_id"`
+	OperationRevision         int64  `json:"operation_revision"`
+	OperationFence            string `json:"operation_fence"`
+	TargetDigest              string `json:"target_digest"`
+	PlatformOS                string `json:"platform_os"`
+	PlatformArchitecture      string `json:"platform_architecture"`
+	ImageUID                  uint32 `json:"image_uid"`
+	ImageGID                  uint32 `json:"image_gid"`
+	DiskRootUID               uint32 `json:"disk_root_uid"`
+	DiskRootGID               uint32 `json:"disk_root_gid"`
+	StorageEvidenceKind       string `json:"storage_evidence_kind"`
+	DetachmentReceiptID       string `json:"detachment_receipt_id"`
+	DetachmentAttemptID       string `json:"detachment_attempt_id"`
+	DetachmentFencingToken    string `json:"detachment_fencing_token"`
+	ResetPreparationReceiptID string `json:"reset_preparation_receipt_id"`
+	HelperGeneration          uint64 `json:"helper_generation"`
+	FailureCode               string `json:"failure_code"`
+	FailureStage              string `json:"failure_stage"`
+	FailureReason             string `json:"failure_reason"`
 }
 
 type PreflightComputerReimageResponse struct {

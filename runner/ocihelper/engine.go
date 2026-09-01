@@ -17,6 +17,18 @@ var ErrTaskAlreadyTerminated = errors.New("OCI task already terminated")
 
 var errComputerStorageAttachmentOwned = errors.New("Computer Storage generation already has an attachment owner")
 
+var errComputerReimageDetachmentRequired = errors.New("Computer reimage requires exact positive detachment evidence")
+
+// computerStorageRetiredError is a definitive attachment refusal for a
+// generation whose durable reset fence prevents it from ever becoming current
+// again. It is distinct from an engine failure: the attempted successor has no
+// runtime, and the helper session remains authoritative after positive reap.
+type computerStorageRetiredError struct{}
+
+func (*computerStorageRetiredError) Error() string {
+	return "Computer Storage generation is fenced for retirement"
+}
+
 // ComputerStorageGrowUncertainError means the filesystem may already have
 // expanded and the same durable grow authority must inspect and resume it.
 type ComputerStorageGrowUncertainError struct{ Cause error }
@@ -30,26 +42,27 @@ func (err *ComputerStorageGrowUncertainError) Unwrap() error { return err.Cause 
 // NativeEngineConfig contains only host-side helper configuration. The agent
 // never supplies these values over the helper protocol.
 type NativeEngineConfig struct {
-	Address                string
-	LoggerExecutable       string
-	RuntimeRoot            string
-	ContainerdStateRoot    string
-	CgroupRoot             string
-	ResolverPath           string
-	HostsPath              string
-	AllowedMountRoots      []string
-	RuncExecutable         string
-	HostMountRoot          string
-	GuestMountRoot         string
-	AttemptPortMin         uint16
-	AttemptPortMax         uint16
-	AttemptPortBindTimeout time.Duration
-	LogSealTimeout         time.Duration
-	TaskReleaseTimeout     time.Duration
-	HandoffRetention       time.Duration
-	MemoryCapacityBytes    int64
-	MemoryReserveBytes     int64
-	Clock                  Clock
+	Address                         string
+	LoggerExecutable                string
+	RuntimeRoot                     string
+	ContainerdStateRoot             string
+	CgroupRoot                      string
+	ResolverPath                    string
+	HostsPath                       string
+	AllowedMountRoots               []string
+	RuncExecutable                  string
+	HostMountRoot                   string
+	GuestMountRoot                  string
+	AttemptPortMin                  uint16
+	AttemptPortMax                  uint16
+	AttemptPortBindTimeout          time.Duration
+	LogSealTimeout                  time.Duration
+	TaskReleaseTimeout              time.Duration
+	HandoffRetention                time.Duration
+	ComputerReimagePreflightTimeout time.Duration
+	MemoryCapacityBytes             int64
+	MemoryReserveBytes              int64
+	Clock                           Clock
 }
 
 // GuardianReaper preserves the helper deadman's signal initiator when the

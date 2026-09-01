@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -86,6 +87,32 @@ func TestComputerStorageResetMarksSuccessorFreshForFirstAttach(t *testing.T) {
 	}
 	if err := engine.detachComputerDisk(fresh, computerDiskReapReceipt, ""); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestComputerStorageResetPredecessorAttachIsDefinitivelyRetired(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	prior := testComputerAuthority("attempt-a", "fence-a", "boot-a")
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	request := resetTestRequest(storage, prior)
+	request.Storage.IntentRevision = request.Authority.IntentRevision
+	if _, err := engine.ResetComputerStorage(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	_, err = engine.attachComputerDisk(t.Context(), request.Storage,
+		testComputerAuthority("stale-after-reset", "stale-fence", "boot-a"))
+	var retired *computerStorageRetiredError
+	if !errors.As(err, &retired) {
+		t.Fatalf("reset predecessor attach = %v, want definitive retirement", err)
 	}
 }
 
@@ -246,6 +273,117 @@ func TestComputerStorageResetResumesEveryPreparationBoundaryThenUsesSharedRemova
 				t.Fatalf("old generation survived shared removal: %v", err)
 			}
 		})
+	}
+}
+
+func TestComputerStorageResetSweepDropsOnlyUnverifiedSuccessorPreparation(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	prior := testComputerAuthority("attempt-a", "fence-a", "boot-a")
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	request := resetTestRequest(storage, prior)
+	request.Storage.IntentRevision = request.Authority.IntentRevision
+	injected := errors.New("helper died after publishing successor image")
+	engine.storageResetHook = func(phase computerStorageResetPhase) error {
+		if phase == computerStorageResetImagePublished {
+			return injected
+		}
+		return nil
+	}
+	if _, err := engine.ResetComputerStorage(t.Context(), request); !errors.Is(err, injected) {
+		t.Fatalf("interrupted reset = %v, want injected helper death", err)
+	}
+	successor := storage
+	successor.StorageGeneration = request.NewGeneration
+	successor.IntentRevision = request.Authority.IntentRevision
+	name, err := deterministicComputerDiskName(successor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successorRoot := filepath.Join(root, "computer-disks", name)
+	if _, err := os.Lstat(filepath.Join(successorRoot, "disk.ext4")); err != nil {
+		t.Fatalf("interrupted reset did not reach published image: %v", err)
+	}
+
+	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	manifest, present, err := readComputerDiskManifest(filepath.Join(successorRoot, "attachment.json"))
+	if err != nil || !present {
+		t.Fatalf("read interrupted reset manifest: present=%t err=%v", present, err)
+	}
+	manifest.DiskImage = "corrupted.ext4"
+	if err := writeComputerDiskManifest(successorRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.sweepComputerDisks("corrupted-preparation-sweep"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(successorRoot); err != nil {
+		t.Fatalf("corrupted preparation-shaped anomaly was deleted: %v", err)
+	}
+	manifest.DiskImage = "disk.ext4"
+	if err := writeComputerDiskManifest(successorRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.sweepComputerDisks("replacement-sweep"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(successorRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unverified reset successor survived helper sweep: %v", err)
+	}
+	request.Authority.BootSessionID = "boot-b"
+	request.Authority.HelperGeneration = 2
+	response, err := engine.ResetComputerStorage(t.Context(), request)
+	if err != nil || !response.Verified || response.Receipt.HelperGeneration != 2 {
+		t.Fatalf("reset did not recreate swept successor: %+v err=%v", response, err)
+	}
+	if err := engine.sweepComputerDisks("post-verification-sweep"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(successorRoot); err != nil {
+		t.Fatalf("verified reset successor was removed by helper sweep: %v", err)
+	}
+}
+
+func TestComputerDiskRejectsHalfPreparedResetSuccessorBeforeSweep(t *testing.T) {
+	root := t.TempDir()
+	system := newFakeComputerDiskSystem()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	storage := testComputerStorage()
+	prior := testComputerAuthority("attempt-a", "fence-a", "boot-a")
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	request := resetTestRequest(storage, prior)
+	request.Storage.IntentRevision = request.Authority.IntentRevision
+	crash := errors.New("helper died after publishing successor image")
+	engine.storageResetHook = func(phase computerStorageResetPhase) error {
+		if phase == computerStorageResetImagePublished {
+			return crash
+		}
+		return nil
+	}
+	if _, err := engine.ResetComputerStorage(t.Context(), request); !errors.Is(err, crash) {
+		t.Fatalf("interrupted reset = %v, want injected crash", err)
+	}
+	successor := storage
+	successor.StorageGeneration = request.NewGeneration
+	successor.IntentRevision = request.Authority.IntentRevision
+	if _, err := engine.attachComputerDisk(t.Context(), successor,
+		testComputerAuthority("same-session", "same-session-fence", prior.BootSessionID)); err == nil ||
+		!strings.Contains(err.Error(), "preparation is not verified") {
+		t.Fatalf("half-prepared reset successor attachment = %v", err)
 	}
 }
 

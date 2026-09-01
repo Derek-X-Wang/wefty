@@ -574,6 +574,71 @@ func TestComputerAttachmentConflictWithoutPositiveReapIsNotDefinitive(t *testing
 	}
 }
 
+func TestRetiredComputerStorageRefusalDoesNotInvalidateSession(t *testing.T) {
+	engine := newFakeEngine()
+	engine.runErr = fmt.Errorf("attach Computer disk: %w", &computerStorageRetiredError{})
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := testRunRequest(testAuthority(), time.Second)
+	request.Authority.Class = contract.JobClassService
+	request.Workload.Computer = true
+	request.Workload.Limits.MemoryBytes = 64 << 20
+	request.Workload.ManagedVolumes = []ManagedVolumeDescriptor{{
+		Kind: ManagedVolumeComputerDisk,
+		ComputerStorage: &ComputerStorageReference{
+			ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 32 << 20,
+		},
+	}}
+	request.AllocateEndpoints = []string{contract.ComputerDisplayEndpointView, contract.ComputerDisplayEndpointControl}
+	_, err = session.Run(t.Context(), request)
+	var refusal *RPCError
+	if !errors.As(err, &refusal) || refusal.Code != CodeComputerStorageRetired {
+		t.Fatalf("retired Computer Storage = %+v err=%v, want definitive refusal", refusal, err)
+	}
+	if session.HealthError() != nil {
+		t.Fatalf("retired Computer Storage refusal invalidated helper session: %v", session.HealthError())
+	}
+	if _, err := session.Verify(t.Context(), VerifyRequest{Scope: VerifyNamespace}); err != nil {
+		t.Fatalf("helper session unusable after retired Computer Storage refusal: %v", err)
+	}
+}
+
+type failingReimagePreflightEngine struct{ *fakeEngine }
+
+func (*failingReimagePreflightEngine) PreflightComputerReimage(context.Context, PreflightComputerReimageRequest) (PreflightComputerReimageResponse, error) {
+	return PreflightComputerReimageResponse{}, errComputerReimageDetachmentRequired
+}
+
+func TestComputerReimagePreflightFailureCarriesBoundedMechanics(t *testing.T) {
+	engine := &failingReimagePreflightEngine{fakeEngine: newFakeEngine()}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	handshake := session.Handshake()
+	_, err = session.PreflightComputerReimage(t.Context(), PreflightComputerReimageRequest{
+		Storage:     ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, IntentRevision: 4, DiskBytes: 32 << 20},
+		TargetImage: EnsureImageRequest{Reference: "example.invalid/computer", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Platform: testImagePlatform},
+		Authority: ComputerReimagePreflightAuthority{NodeID: "node-1", BootSessionID: "boot-1", HelperGeneration: handshake.SessionGeneration,
+			RootInstanceID: "root", OldJobID: "old-job", StagingJobID: "staging-job", OperationRevision: 4, OperationFence: "fence"},
+	})
+	var failure *RPCError
+	if !errors.As(err, &failure) || failure.EngineFailure == nil || failure.EngineFailure.Operation != MethodPreflightReimage ||
+		!strings.Contains(failure.Message, "Computer reimage requires exact positive detachment evidence") {
+		t.Fatalf("Computer reimage preflight mechanics = %+v err=%v", failure, err)
+	}
+}
+
 type uncertainGrowTestEngine struct{ *fakeEngine }
 
 func (engine *uncertainGrowTestEngine) GrowComputerStorage(context.Context, GrowComputerStorageRequest) (GrowComputerStorageResponse, error) {

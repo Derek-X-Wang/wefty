@@ -354,7 +354,7 @@ while :; do sleep 1; done
 	if err := nodeAgent.RecoverOCIRuntimeCapabilities(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	firstRunning = waitNativeServiceAttempt(t, store, primary.JobID, firstAttempt, 45*time.Second)
+	firstRunning = waitNativeServiceAttempt(t, store, nodeAgent, barrier, primary.JobID, firstAttempt, 45*time.Second)
 	firstAttempt = firstRunning.CurrentAttemptID
 	firstAuthority = authorities.wait(t, firstAttempt, 5*time.Second)
 	oldGeneration, ready := barrier.Generation()
@@ -363,7 +363,7 @@ while :; do sleep 1; done
 	}
 	recoveryStarted := time.Now()
 	barrier.Invalidate()
-	readmitted := waitNativeServiceAttempt(t, store, primary.JobID, firstAttempt, 15*time.Second)
+	readmitted := waitNativeServiceAttempt(t, store, nodeAgent, barrier, primary.JobID, firstAttempt, 15*time.Second)
 	healthElapsed := waitNativePublishedServiceHealth(t, serviceClientFabric, publishedPort, 15*time.Second)
 	serviceRecoveryElapsed = time.Since(recoveryStarted)
 	newGeneration, ready := barrier.Generation()
@@ -407,7 +407,7 @@ while :; do sleep 1; done
 	if _, _, err := store.RestartService(t.Context(), primary.JobID, l1.ServiceRestartRequest{IdempotencyKey: "native-fresh-restart"}); err != nil {
 		t.Fatal(err)
 	}
-	restarted := waitNativeServiceAttempt(t, store, primary.JobID, firstAttempt, 45*time.Second)
+	restarted := waitNativeServiceAttempt(t, store, nodeAgent, barrier, primary.JobID, firstAttempt, 45*time.Second)
 	freshRestart = restarted.State == contract.JobRunning && restarted.CurrentAttemptID != firstAttempt
 	retainedBinding = restarted.BoundNodeID == firstRunning.BoundNodeID && restarted.Spec.Execution.OCI != nil &&
 		restarted.Spec.Execution.OCI.Image.Digest != nil && *restarted.Spec.Execution.OCI.Image.Digest == digest
@@ -431,7 +431,7 @@ while :; do sleep 1; done
 	if err != nil || queued.State != contract.JobQueued {
 		t.Fatalf("start did not transition through queued = %+v err %v", queued, err)
 	}
-	startedAgain := waitNativeServiceAttempt(t, store, primary.JobID, stopped.CurrentAttemptID, 45*time.Second)
+	startedAgain := waitNativeServiceAttempt(t, store, nodeAgent, barrier, primary.JobID, stopped.CurrentAttemptID, 45*time.Second)
 	stopStart = startedAgain.State == contract.JobRunning && startedAgain.CurrentAttemptID != stopped.CurrentAttemptID && siblingRunning.CurrentAttemptID != ""
 	if !stopStart {
 		t.Fatalf("stop/start did not reacquire a fresh attempt = stopped %+v started %+v", stopped, startedAgain)
@@ -832,7 +832,7 @@ func waitNativeServiceState(t *testing.T, store *l1.Store, jobID string, state c
 	return job
 }
 
-func waitNativeServiceAttempt(t *testing.T, store *l1.Store, jobID, priorAttemptID string, timeout time.Duration) l1.Job {
+func waitNativeServiceAttempt(t *testing.T, store *l1.Store, nodeAgent *Agent, barrier *ocihelper.BootBarrier, jobID, priorAttemptID string, timeout time.Duration) l1.Job {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -849,7 +849,11 @@ func waitNativeServiceAttempt(t *testing.T, store *l1.Store, jobID, priorAttempt
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Fatalf("service %s did not reach a fresh running attempt after %s: %+v", jobID, priorAttemptID, job)
+	attempts, attemptsErr := store.ListJobAttempts(t.Context(), jobID)
+	generation, generationReady := barrier.Generation()
+	sweep, sweepReady := barrier.SweepReceipt()
+	t.Fatalf("service %s did not reach a fresh running attempt after %s: job=%+v attempts=%+v attempts_err=%v agent_status=%+v capability=%+v helper_generation=%+v helper_ready=%t sweep=%+v sweep_ready=%t",
+		jobID, priorAttemptID, job, attempts, attemptsErr, nodeAgent.Status(), nodeAgent.CapabilitySnapshot(), generation, generationReady, sweep, sweepReady)
 	return l1.Job{}
 }
 

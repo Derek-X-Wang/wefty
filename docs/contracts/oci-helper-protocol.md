@@ -123,11 +123,13 @@ The agent records it on the standing reset/restore operation so Computer status
 surfaces the failure and L1 stops redispatching it; recovery requires a later
 helper sweep/operator workflow rather than an unbounded silent loop. Neither a
 retry nor quarantine invalidates the live helper session.
-`computer_storage_busy` is a definitive attempt-scoped `Run` refusal only after
-the helper positively reaps the losing attempt and verifies no runtime remains;
+`computer_storage_busy` and `computer_storage_retired` are definitive
+attempt-scoped `Run` refusals only after the helper positively reaps the losing
+attempt and verifies no runtime remains. The retired form means a durable reset
+fence makes that Storage generation permanently ineligible for attachment;
 `computer_storage_grow_uncertain` keeps the same grow
 authority pending for inspection and retry after the filesystem may have
-expanded. Neither code invalidates the helper session.
+expanded. None of these codes invalidates the helper session.
 If the losing attempt cannot be positively reaped, the helper invalidates its
 session and returns `session_stale` instead of manufacturing the busy proof.
 Caller cancellation, deadlines owned by the
@@ -140,9 +142,10 @@ failed quiescence proof and does not authorize a namespace sweep.
 Unary `engine_failure` responses include only a closed mechanics fact naming
 the helper method and one sanitized reason (`deadline_exceeded`, `canceled`,
 `permission_denied`, or `operation_failed`). Raw privileged error text,
-containerd types, and host paths remain local, while CI and callers can still
-distinguish the operation and bounded failure class before applying the
-runtime-loss rule above.
+containerd types, and host paths remain local. The Computer reimage preflight
+may additionally report the fixed positive-detachment refusal so native
+evidence distinguishes that durable authority mismatch; the closed fact,
+never that detail, remains policy authority.
 
 ## Boot sweep barrier
 
@@ -234,7 +237,7 @@ heartbeats.
 | `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves OS identity; clone/import narrowly rekey it and may expand a larger filesystem. |
 | `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path outside the managed root. L1 has already committed the permanent custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, and manifest-digest evidence. |
 | `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A failure after ext4 may have expanded returns `computer_storage_grow_uncertain`, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
-| `PreflightComputerReimage` | Session-authorized exact current Storage generation, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. It requires positive detachment evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived evidence before L1 may publish the staging projection. |
+| `PreflightComputerReimage` | Session-authorized exact current Storage generation and byte budget, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. Under the generation flock it requires real detachment or explicit verified never-attached reset-preparation evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived success or closed stage/reason failure evidence before L1 may publish or refuse the staging projection. |
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend. A refused payload listener is a typed, attempt-scoped `engine_failure` and does not invalidate the healthy helper session, so readiness can observe withdrawal and retry republication. Only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
@@ -248,12 +251,24 @@ established, and the client consumes it before returning the opaque stream.
 This makes an agent-side connect probe cover the payload, helper session, and
 tunnel rather than merely the helper's authorization check.
 Like the attempt-scoped `DialAttemptPort` backend refusal,
-`computer_storage_busy` does not invalidate the helper session; unlike that
-retryable readiness refusal, it definitively proves the losing `Run` has no
-remaining runtime and therefore needs no second `Delete`.
+`computer_storage_busy` and `computer_storage_retired` do not invalidate the
+helper session; unlike that retryable readiness refusal, each definitively
+proves the losing `Run` has no remaining runtime and therefore needs no second
+`Delete`.
 The helper holds a kernel listener through runtime-spec construction, transfers
 it directly into payload start, and retains the logical allocation until
 independent absence verification; failed verification cannot recycle the port.
+
+An interrupted Computer Storage reset successor remains disposable until its
+preparation receipt is durably published. A replacement helper removes that
+exact unverified successor during its sweep, allowing the standing L1 reset
+authority to recreate it; verified successors and tenant-bearing generations
+remain retained inventory.
+A verified reset successor that has never been attached may use its exact
+preparation receipt as Computer reimage quiescence evidence. The receipt binds
+the current Storage generation, prior Job, Node, managed root, and reset fence;
+once any attempt attaches, the ordinary detach or prior-boot sweep receipt is
+required instead.
 `DialHostBridge` pairs one authorized host
 stream with one accepted connection on that attempt's helper-owned guest
 listener; the host agent dials only its already-created loopback run bridge.
@@ -684,11 +699,63 @@ digest and verifies its manifest platform before reading image-user metadata.
 It reads the detached ext4 root UID:GID without following tenant paths, refuses
 an ownership mismatch unless the durable operation explicitly carries `chown`,
 and binds the receipt to both Jobs, the operation revision/fence, Node,
-managed-root instance, helper generation, and consumed detachment receipt.
+managed-root instance, helper generation, and one explicit Storage proof kind:
+`computer_reimage_detachment` carries the real reap/sweep receipt plus its
+historical attempt and fence, while `computer_reimage_reset_preparation`
+carries only the verified never-attached reset-preparation receipt. Reset
+preparation is never recast as an invented detachment attempt.
+
+Attach and delete hold the node-global reimage mutex only through manifest/flock
+admission. After they acquire the exact generation flock, that flock owns the
+remaining disk work so a slow attach or delete for one Computer cannot block
+preflight admission for every other Computer on the Node. Preflight retains its
+admission locks and the exact generation flock while it reads the manifest,
+verifies its durable byte budget, and reads the ext4 root owner, then releases
+the flock before publishing the receipt. The whole helper operation, including
+context-free filesystem reads executed behind cancellation-aware joins, has a
+10-second deadline; cancellation joins each worker and closes any late-opened
+lock descriptor before returning and releasing the flock. The tagged native lane
+logs the measured helper duration
+for each reimage. On the 2026-08-31 PR lane, the complete adapter/helper
+preflight against the 160 MiB acceptance disk measured 27.263 milliseconds for
+XFCE and 22.245 milliseconds for Wayland; the 10-second bound leaves more than
+366 times the slower measured duration without widening the four-minute
+end-to-end Computer transition budget.
+
+Every refusal is a `computer_reimage_preflight_failed_unchanged` receipt with
+one closed stage and a bounded reason. The stage vocabulary is exactly
+`generation_lock`, `manifest_read`, `allocation_verify`, `receipt_create`,
+`image_identity`, `image_config`, `image_owner`, `disk_owner`, and
+`ownership_match`. Reasons are `operation_failed`, `deadline_exceeded`,
+`detachment_required`, `image_unavailable`, or
+`image_platform_unsupported`. L1 accepts these fail-closed receipts, releases
+the refused staging projection, and surfaces the stage and reason on the
+stopped current Job instead of redispatching the operation indefinitely. The
+agent alone treats `detachment_required` and `generation_lock` plus
+`deadline_exceeded` as transient: it retries them on the next two polls and
+makes the third receipt definitive. Every other stage/reason pair remains
+immediately definitive.
 If the exact digest is unavailable or has no manifest for the bound Node's
 platform, the helper returns a typed `failed_unchanged` receipt only after the
 same detachment and disk-allocation checks. L1 then retires the refused staging
 projection while preserving the stopped current Job and disk generation.
+If the durable generation row is missing, L1 still dispatches the operation
+with a zero byte budget and the helper returns a typed `allocation_verify`
+refusal; the directive is never silently omitted. Image-stage failure
+acknowledgements must carry the same valid detachment or reset-preparation
+evidence as success.
+
+L1 records a successful preflight receipt and activates the staged Computer
+projection in the same acknowledgement transaction. The agent does not wait
+for an operator replay or a later heartbeat to move the Computer out of
+`reimaging`; an identical acknowledgement replay returns the already-completed
+projection. When the retiring projection is live, L1 preserves the Computer's
+running intent but writes that service projection desired-stopped, so its next
+fenced lease renewal carries the stop directive and reaches the stopped
+preflight precondition.
+An acknowledgement-time capacity refusal is persisted in that transaction as
+a typed reimage-preflight failure and releases the staging projection instead
+of leaving the agent to retry an unobservable transaction error.
 
 Computer removal carries the same exact Storage identity plus current Node,
 boot, consumer Job, named prior Job, removal-generation, and cleanup-fence
