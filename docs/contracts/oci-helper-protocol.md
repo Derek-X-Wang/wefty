@@ -710,9 +710,11 @@ verifies the manifest's durable byte budget, and reads the ext4 root owner. It
 releases that flock before publishing the receipt. The whole helper operation,
 including context-free filesystem reads executed behind cancellable joins, has
 a 10-second deadline. The tagged native lane logs the measured helper duration
-for each reimage; its 160 MiB acceptance disk metadata path is expected to stay
-below 100 milliseconds, leaving two orders of magnitude of deadline headroom
-without widening the four-minute end-to-end Computer transition budget.
+for each reimage. On the 2026-08-31 PR lane, the complete adapter/helper
+preflight against the 160 MiB acceptance disk measured 27.263 milliseconds for
+XFCE and 22.245 milliseconds for Wayland; the 10-second bound leaves more than
+366 times the slower measured duration without widening the four-minute
+end-to-end Computer transition budget.
 
 Every refusal is a `computer_reimage_preflight_failed_unchanged` receipt with
 one closed stage and a bounded reason. The stage vocabulary is exactly

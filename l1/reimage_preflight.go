@@ -278,5 +278,6 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 	if err := tx.Commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer reimage preflight")
 	}
+	s.notifyComputerPolicyChanged()
 	return computer, nil
 }

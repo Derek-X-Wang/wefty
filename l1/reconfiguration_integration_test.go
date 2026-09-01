@@ -44,11 +44,17 @@ func acknowledgeReimagePreflight(t *testing.T, h *integrationHarness, node Node,
 		DiskRootUID: 1000, DiskRootGID: 1000, DetachmentReceiptID: "detach-" + attemptID,
 		StorageEvidenceKind: computerReimageDetachmentEvidenceKind, DetachmentAttemptID: attemptID,
 		DetachmentFencingToken: fencingToken, HelperGeneration: 7}
+	policyChanged := h.store.computerPolicyChangeChannel()
 	if _, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
 		computerID, ComputerReimagePreflightAcknowledgementRequest{NodeID: node.NodeID,
 			BootSessionID: node.BootSessionID, IdempotencyKey: "ack-" + directive.OperationFence,
 			Receipt: receipt}); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-policyChanged:
+	default:
+		t.Fatal("verified Computer reimage preflight did not wake policy reconciliation")
 	}
 }
 

@@ -2006,7 +2006,7 @@ func exerciseNativeLinuxOneshotContract(t *testing.T, ctx context.Context, adapt
 	postStarted.Execution.Env = map[string]string{contract.EnvRunID: "native-one-shot-loss", contract.EnvL3Endpoint: bridge.URL}
 	postStarted.Execution.SensitiveEnv = map[string]string{contract.EnvRunToken: token}
 	postStarted.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error {
-		requestRootFault(t, "kill-shim")
+		requestRootFault(t, "kill-shim:"+postStarted.Authority.JobID)
 		return nil
 	}
 	postResult, postErr := adapter.Run(ctx, postStarted, nil)
