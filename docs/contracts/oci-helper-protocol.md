@@ -700,6 +700,10 @@ After ext4 expansion begins, failure is instead the typed resumable
 `computer_storage_grow_uncertain` outcome: the helper never truncates the image
 or reports `failed_unchanged`, and retry inspects the expanded image before it
 publishes a receipt.
+L1 persists the validated receipt with the grow outcome. Computer operator
+projections expose requested, observed-available, and failure-code admission
+facts only from that persisted receipt; while no completed receipt exists the
+admission cell remains `NOT-RUN`.
 
 `PreflightComputerReimage` runs only after the old Job is stopped and the disk
 manifest contains exact same-boot reap or prior-boot sweep evidence. Image

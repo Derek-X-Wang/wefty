@@ -99,6 +99,8 @@ type Computer struct {
 	StorageGeneration        int64                             `json:"storage_generation"`
 	BackupCap                int64                             `json:"backup_cap"`
 	LastBackupOperation      *ComputerBackupOperationOutcome   `json:"last_backup_operation,omitempty"`
+	LastGrowOperation        *ComputerStorageGrowOutcome       `json:"last_grow_operation,omitempty"`
+	LastRestoreRevocation    *ComputerRestoreRevocationReceipt `json:"last_restore_revocation,omitempty"`
 	StorageCleanupQuarantine *ComputerStorageCleanupQuarantine `json:"storage_cleanup_quarantine,omitempty"`
 	DesiredDiskBytes         int64                             `json:"desired_disk_bytes"`
 	DesiredState             contract.ServiceDesiredState      `json:"desired_state"`
@@ -724,6 +726,14 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	computer.LastBackupOperation, err = readLastComputerBackupOperation(ctx, q, computerID)
 	if err != nil {
 		return Computer{}, fmt.Errorf("read last Computer Backup operation: %w", err)
+	}
+	computer.LastGrowOperation, err = readLastComputerStorageGrowOutcome(ctx, q, computerID)
+	if err != nil {
+		return Computer{}, fmt.Errorf("read last Computer Storage grow operation: %w", err)
+	}
+	computer.LastRestoreRevocation, err = readLastComputerRestoreRevocation(ctx, q, computerID)
+	if err != nil {
+		return Computer{}, fmt.Errorf("read last Computer restore revocation: %w", err)
 	}
 	computer.StorageCleanupQuarantine, err = readComputerStorageCleanupQuarantine(ctx, q, computerID)
 	if err != nil {

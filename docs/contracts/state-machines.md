@@ -205,7 +205,9 @@ L1 preserves `computer_id`
 and `storage_id`, reserves exactly current generation plus one, and commits any
 "keep predecessor as Backup" choice and Backup identity before helper work.
 Before the successor can attach, L1 revokes prior Computer, session, and L3
-authority. The helper copies only from the selected published Backup copy,
+authority and durably records a restore-revision-bound receipt containing the
+session identifiers open at cutover plus L3's token-revocation receipt. The
+helper copies only from the selected published Backup copy,
 verifies source size and digest before publication, and returns exact
 Node/root/operation-bound evidence. L1 records that evidence before publishing
 the staging generation and retiring its predecessor. The source Backup is
@@ -283,12 +285,17 @@ image pin. Start performs the existing bound-node capacity check inside the
 same CAS transaction and reacquires one Slot exactly once. Explicit Computer
 restart is valid from stopped or latched failed, clears the ordinary service
 restart latch/policy state, and authorizes a fresh attempt without allowing a
-direct Job restart. `insufficient_memory` and `insufficient_disk` are exact
-terminal latches: desired state remains `running`, `next_restart_at` is null,
-restart streak and lifetime restart count do not advance, publication and Slot
-occupancy are released, and binding, Storage charge, image pin, and grants are
-retained. They never enter the infrastructure retry allowlist; recovery needs
-changed resource facts plus this explicit Computer restart. Post-`Started`
+direct Job restart. `insufficient_memory` and `insufficient_disk` from launch
+or runtime are exact terminal latches: desired state remains `running`,
+`next_restart_at` is null, restart streak and lifetime restart count do not
+advance, publication and Slot occupancy are released, and binding, Storage
+charge, image pin, and grants are retained. A grow-time `insufficient_disk`
+refusal is instead an active reconfiguration latch: the current running
+attempt, publication, and Slot stay in place, `last_failure` records the
+receipt-derived requested and observed bytes, and the grow revision returns to
+`stable` without changing `desired_disk_bytes`. Neither form enters the
+infrastructure retry allowlist; recovery needs changed resource facts plus an
+explicit Computer restart. Post-`Started`
 whole-cgroup OOM and a positively observed attempt-local ENOSPC event enter
 those same latches with the declared memory/disk cap as the bounded requested
 fact. Filesystem-free samples remain advisory; exit codes and error strings do

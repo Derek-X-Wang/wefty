@@ -351,34 +351,54 @@ func TestComputerCLIRunningReconfigurationAndRemovalSupersession(t *testing.T) {
 func TestComputerCLIInsufficientDiskLatchRequiresExplicitRestart(t *testing.T) {
 	harness, computer, node, claim := newRunningComputerCLIFixture(t, "insufficient-restart")
 	ctx := context.Background()
-	resizeBytes := runServiceCLI(t, ctx, harness.clients, true, "services", "resize", computer.CurrentJobID,
-		"--expect-current", "--disk-bytes", fmt.Sprint(computer.DesiredDiskBytes+(1<<30)), "--idempotency-key", "insufficient-resize")
-	var resizing computerOperatorProjection
-	if err := json.Unmarshal(resizeBytes, &resizing); err != nil {
+	acknowledged := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			directives, err := harness.store.ListNodeComputerStorageGrowDirectives(ctx, "fabric-"+node.NodeID, node.NodeID, node.BootSessionID)
+			if err == nil && len(directives) == 1 {
+				directive := directives[0]
+				receipt := l1.ComputerStorageGrowReceipt{
+					Kind: "computer_storage_grow_failed_unchanged", ReceiptID: "insufficient-receipt",
+					ComputerID: directive.ComputerID, StorageID: directive.StorageID, StorageGeneration: directive.StorageGeneration,
+					NodeID: directive.BoundNodeID, RootInstanceID: directive.RootInstanceID, JobID: directive.JobID,
+					OperationRevision: directive.OperationRevision, OperationFence: directive.OperationFence, HelperGeneration: 1,
+					OldDiskBytes: directive.OldDiskBytes, NewDiskBytes: directive.NewDiskBytes, Applied: false,
+					FailureCode: "insufficient_disk", ObservedAvailableBytes: 512 << 20,
+				}
+				_, err = harness.store.AcknowledgeComputerStorageGrow(ctx, "fabric-"+node.NodeID, computer.ComputerID,
+					l1.ComputerStorageGrowAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+						IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+				acknowledged <- err
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		acknowledged <- errors.New("timed out waiting for Computer grow directive")
+	}()
+	var stdout, stderr bytes.Buffer
+	err := execute(ctx, harness.clients, true, []string{"services", "resize", computer.CurrentJobID,
+		"--expect-current", "--disk-bytes", fmt.Sprint(computer.DesiredDiskBytes + (1 << 30)),
+		"--idempotency-key", "insufficient-resize", "--wait", "2s", "--poll-interval", "1ms"}, &stdout, &stderr)
+	var responseErr *apiResponseError
+	if !errors.As(err, &responseErr) || responseErr.APIError.Code != contract.ErrorCapacityExhausted || commandExitCode(err) != exitConflict {
+		t.Fatalf("awaited grow error = %T %v, want typed capacity exit", err, err)
+	}
+	if err := <-acknowledged; err != nil {
 		t.Fatal(err)
 	}
-	directives, err := harness.store.ListNodeComputerStorageGrowDirectives(ctx, "fabric-"+node.NodeID, node.NodeID, node.BootSessionID)
-	if err != nil || len(directives) != 1 {
-		t.Fatalf("grow directives = %#v err=%v", directives, err)
-	}
-	directive := directives[0]
-	receipt := l1.ComputerStorageGrowReceipt{
-		Kind: "computer_storage_grow_failed_unchanged", ReceiptID: "insufficient-receipt",
-		ComputerID: directive.ComputerID, StorageID: directive.StorageID, StorageGeneration: directive.StorageGeneration,
-		NodeID: directive.BoundNodeID, RootInstanceID: directive.RootInstanceID, JobID: directive.JobID,
-		OperationRevision: directive.OperationRevision, OperationFence: directive.OperationFence, HelperGeneration: 1,
-		OldDiskBytes: directive.OldDiskBytes, NewDiskBytes: directive.NewDiskBytes, Applied: false,
-		FailureCode: "insufficient_disk", ObservedAvailableBytes: 512 << 20,
-	}
-	failed, err := harness.store.AcknowledgeComputerStorageGrow(ctx, "fabric-"+node.NodeID, computer.ComputerID,
-		l1.ComputerStorageGrowAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
-	if err != nil {
-		t.Fatal(err)
+	var failed computerOperatorProjection
+	if err := json.Unmarshal(stdout.Bytes(), &failed); err != nil {
+		t.Fatalf("decode awaited grow projection: %v\n%s", err, stdout.String())
 	}
 	var failure contract.SpawnFailure
 	if failed.CurrentJob.State != contract.JobRunning || json.Unmarshal(failed.CurrentJob.LastFailure, &failure) != nil ||
-		failure.Code != contract.SpawnFailureInsufficientDisk || failed.CurrentJob.CurrentAttemptID != claim.Lease.AttemptID {
+		failure.Code != contract.SpawnFailureInsufficientDisk || failed.CurrentJob.CurrentAttemptID != claim.Lease.AttemptID ||
+		failed.ReconfigurationPhase != l1.ComputerReconfigurationStable || failed.AppliedRevision != failed.IntentRevision ||
+		failed.DesiredDiskBytes != computer.DesiredDiskBytes || failed.Capacity.Admission.Status != "FAIL" ||
+		failed.Capacity.Admission.FailureCode != "insufficient_disk" || failed.Capacity.Admission.RequestedBytes == nil ||
+		*failed.Capacity.Admission.RequestedBytes != computer.DesiredDiskBytes+(1<<30) ||
+		failed.Capacity.Admission.ObservedAvailableBytes == nil || *failed.Capacity.Admission.ObservedAvailableBytes != 512<<20 {
 		t.Fatalf("latched failure = %#v failure=%#v", failed, failure)
 	}
 	restartedBytes := runServiceCLI(t, ctx, harness.clients, true, "services", "restart", failed.CurrentJobID,
@@ -387,6 +407,60 @@ func TestComputerCLIInsufficientDiskLatchRequiresExplicitRestart(t *testing.T) {
 	if err := json.Unmarshal(restartedBytes, &restarted); err != nil || restarted.CurrentJob.State != contract.JobStopping ||
 		len(restarted.CurrentJob.LastFailure) != 0 || restarted.MutationApplied == nil || !*restarted.MutationApplied {
 		t.Fatalf("explicit restart = %#v err=%v", restarted, err)
+	}
+}
+
+func TestComputerCLIResizePollIntervalRequiresWait(t *testing.T) {
+	harness, computer, _, _ := newRunningComputerCLIFixture(t, "resize-poll-without-wait")
+	err := execute(context.Background(), harness.clients, true, []string{"services", "resize", computer.ComputerID,
+		"--expect-current", "--disk-bytes", fmt.Sprint(computer.DesiredDiskBytes + (1 << 30)),
+		"--idempotency-key", "resize-poll-without-wait", "--poll-interval", "1ms"}, &bytes.Buffer{}, &bytes.Buffer{})
+	var usage usageError
+	if !errors.As(err, &usage) || commandExitCode(err) != exitUsage {
+		t.Fatalf("poll without wait error = %T %v", err, err)
+	}
+}
+
+func TestComputerCLIResizeWaitsForAppliedReceipt(t *testing.T) {
+	harness, computer, node, _ := newRunningComputerCLIFixture(t, "resize-wait-applied")
+	ctx := context.Background()
+	requested := computer.DesiredDiskBytes + (1 << 30)
+	acknowledged := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			directives, err := harness.store.ListNodeComputerStorageGrowDirectives(ctx, "fabric-"+node.NodeID, node.NodeID, node.BootSessionID)
+			if err == nil && len(directives) == 1 {
+				directive := directives[0]
+				receipt := l1.ComputerStorageGrowReceipt{
+					Kind: "computer_storage_grow_applied", ReceiptID: "applied-receipt",
+					ComputerID: directive.ComputerID, StorageID: directive.StorageID, StorageGeneration: directive.StorageGeneration,
+					NodeID: directive.BoundNodeID, RootInstanceID: directive.RootInstanceID, JobID: directive.JobID,
+					OperationRevision: directive.OperationRevision, OperationFence: directive.OperationFence, HelperGeneration: 1,
+					OldDiskBytes: directive.OldDiskBytes, NewDiskBytes: directive.NewDiskBytes, Applied: true,
+				}
+				_, err = harness.store.AcknowledgeComputerStorageGrow(ctx, "fabric-"+node.NodeID, computer.ComputerID,
+					l1.ComputerStorageGrowAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+						IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+				acknowledged <- err
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		acknowledged <- errors.New("timed out waiting for Computer grow directive")
+	}()
+	output := runServiceCLI(t, ctx, harness.clients, true, "services", "resize", computer.ComputerID,
+		"--expect-current", "--disk-bytes", fmt.Sprint(requested), "--idempotency-key", "resize-wait-applied",
+		"--wait", "2s", "--poll-interval", "1ms")
+	if err := <-acknowledged; err != nil {
+		t.Fatal(err)
+	}
+	var grown computerOperatorProjection
+	if err := json.Unmarshal(output, &grown); err != nil || grown.ReconfigurationPhase != l1.ComputerReconfigurationStable ||
+		grown.AppliedRevision != grown.IntentRevision || grown.DesiredDiskBytes != requested ||
+		grown.Capacity.Admission.Status != "PASS" || grown.Capacity.Admission.RequestedBytes == nil ||
+		*grown.Capacity.Admission.RequestedBytes != requested || grown.Capacity.Admission.ObservedAvailableBytes != nil {
+		t.Fatalf("awaited applied grow = %#v err=%v", grown, err)
 	}
 }
 

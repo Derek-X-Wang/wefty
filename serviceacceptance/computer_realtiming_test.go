@@ -1743,6 +1743,18 @@ type liveENOSPCEvidence struct {
 	Detail   string
 }
 
+type liveResizeOutcome struct {
+	l1.Computer
+	Capacity struct {
+		Admission struct {
+			Status                 string `json:"status"`
+			FailureCode            string `json:"failure_code"`
+			RequestedBytes         *int64 `json:"requested_bytes"`
+			ObservedAvailableBytes *int64 `json:"observed_available_bytes"`
+		} `json:"admission"`
+	} `json:"capacity"`
+}
+
 func exerciseLiveComputerENOSPC(t *testing.T, harness *acceptanceHarness, reference, digest string) liveENOSPCEvidence {
 	t.Helper()
 	target := createReadyComputer(t, harness, reference, digest, "linux-native-enospc", "linux-native-enospc-create")
@@ -1756,11 +1768,46 @@ func exerciseLiveComputerENOSPC(t *testing.T, harness *acceptanceHarness, refere
 		t.Fatal(err)
 	}
 	requested := available + 1<<30
-	failure := runComputerCLIExpectError(t, harness, "", "", "services", "resize", target.ComputerID,
-		"--disk-bytes", fmt.Sprint(requested), "--expect-current", "--idempotency-key", "linux-native-enospc-grow")
+	ctx, cancel := context.WithTimeout(t.Context(), 6*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, weftyBinaryPath, computerCLIArguments(harness, "", "", "services", "resize", target.ComputerID,
+		"--disk-bytes", fmt.Sprint(requested), "--expect-current", "--idempotency-key", "linux-native-enospc-grow",
+		"--wait", "5m", "--poll-interval", "250ms")...)
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	commandErr := command.Run()
+	if commandErr == nil {
+		t.Fatalf("awaited Computer ENOSPC grow unexpectedly succeeded:\n%s", stdout.String())
+	}
+	var outcome liveResizeOutcome
+	if err := json.Unmarshal(stdout.Bytes(), &outcome); err != nil {
+		t.Fatalf("decode awaited Computer ENOSPC projection: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(stderr.Bytes(), &response); err != nil {
+		t.Fatalf("decode awaited Computer ENOSPC error: %v\n%s", err, stderr.String())
+	}
+	var failure contract.SpawnFailure
+	failureDecoded := json.Unmarshal(outcome.CurrentJob.LastFailure, &failure) == nil
+	admission := outcome.Capacity.Admission
+	observed := response.Error.Code == contract.ErrorCapacityExhausted &&
+		outcome.ReconfigurationPhase == l1.ComputerReconfigurationStable && outcome.AppliedRevision == outcome.IntentRevision &&
+		outcome.DesiredDiskBytes == target.DesiredDiskBytes && failureDecoded && failure.Code == contract.SpawnFailureInsufficientDisk &&
+		admission.Status == "FAIL" && admission.FailureCode == string(contract.SpawnFailureInsufficientDisk) &&
+		admission.RequestedBytes != nil && admission.ObservedAvailableBytes != nil &&
+		*admission.RequestedBytes == requested && failure.RequestedBytes == *admission.RequestedBytes &&
+		failure.ObservedAvailableBytes == *admission.ObservedAvailableBytes && *admission.ObservedAvailableBytes < *admission.RequestedBytes
 	_ = removeAndWaitComputer(t, harness, target, 5*time.Minute)
-	return liveENOSPCEvidence{Observed: strings.Contains(failure, string(contract.SpawnFailureInsufficientDisk)) || strings.Contains(failure, "insufficient_disk"),
-		Detail: fmt.Sprintf("requested=%d observed_available=%d", requested, available)}
+	return liveENOSPCEvidence{Observed: observed,
+		Detail: fmt.Sprintf("requested=%d helper_observed_available=%d host_sample_available=%d error_code=%s",
+			requested, valueOrNegative(admission.ObservedAvailableBytes), available, response.Error.Code)}
+}
+
+func valueOrNegative(value *int64) int64 {
+	if value == nil {
+		return -1
+	}
+	return *value
 }
 
 func inspectHelperNamespaceInventory(t *testing.T, socketPath, checksum string) ocihelper.VerifyResponse {

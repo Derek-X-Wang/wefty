@@ -582,6 +582,7 @@ CREATE TABLE IF NOT EXISTS computer_storage_copy_operations (
   acknowledgement_key TEXT,
   acknowledgement_hash TEXT,
   authority_revoked_ns INTEGER,
+	authority_revocation_receipt_json BLOB,
 	  retirement_acknowledgement_key TEXT,
 	  retirement_acknowledgement_hash TEXT,
   requested_ns INTEGER NOT NULL,
@@ -899,6 +900,9 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 		return err
 	}
 	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "authority_revoked_ns", "INTEGER"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "authority_revocation_receipt_json", "BLOB"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "retirement_acknowledgement_key", "TEXT"); err != nil {
