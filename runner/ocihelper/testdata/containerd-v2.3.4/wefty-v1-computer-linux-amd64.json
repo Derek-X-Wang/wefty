@@ -853,19 +853,6 @@
       ],
       "source": "/run/wefty/fixtures/computer-disk/etc/machine-id",
       "type": "bind"
-    },
-    {
-      "destination": "/etc/ssh",
-      "options": [
-        "rbind",
-        "rro",
-        "rprivate",
-        "nosuid",
-        "nodev",
-        "noexec"
-      ],
-      "source": "/run/wefty/fixtures/computer-disk/etc/ssh",
-      "type": "bind"
     }
   ],
   "ociVersion": "1.3.0",

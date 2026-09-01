@@ -5,15 +5,12 @@ package ocihelper
 import (
 	"bytes"
 	"context"
-	"crypto"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"golang.org/x/crypto/ssh"
 )
 
 func publishedStorageCopySource(t *testing.T) (string, *fakeComputerDiskSystem, CreateComputerBackupResponse) {
@@ -27,67 +24,48 @@ func publishedStorageCopySource(t *testing.T) (string, *fakeComputerDiskSystem, 
 	return root, system, response
 }
 
-func TestRealCloneIdentityRekeyRegeneratesHostKeysAndPreservesBrowserProfile(t *testing.T) {
+func TestRealCloneIdentityRekeyChangesMachineIDAndPreservesBrowserProfile(t *testing.T) {
 	root := t.TempDir()
-	etcSSH := filepath.Join(root, "etc", "ssh")
 	profile := filepath.Join(root, "home", "agent", ".config", "chromium", "Default")
-	if err := os.MkdirAll(etcSSH, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(profile, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	oldMachineID := []byte("0123456789abcdef0123456789abcdef\n")
-	oldHostKey := []byte("planted-old-host-private-key")
 	browserSecret := []byte("browser-profile-secret-must-remain-byte-identical")
 	if err := os.WriteFile(filepath.Join(root, "etc", "machine-id"), oldMachineID, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(etcSSH, "ssh_host_ed25519_key"), oldHostKey, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(etcSSH, "ssh_host_ed25519_key.pub"), []byte("old-public"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	markerPath := filepath.Join(profile, "Login Data")
 	if err := os.WriteFile(markerPath, browserSecret, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	rekeyed, err := rekeyCloneIdentity(t.Context(), root)
-	if err != nil || !rekeyed {
-		t.Fatalf("real identity rekey = %t err=%v", rekeyed, err)
+	rekeyed, err := rekeyCloneIdentity(root)
+	if err != nil || !rekeyed.OSIdentityRekeyed || rekeyed.MachineIDBeforeDigest == rekeyed.MachineIDAfterDigest {
+		t.Fatalf("real identity rekey = %+v err=%v", rekeyed, err)
 	}
 	newMachineID, err := os.ReadFile(filepath.Join(root, "etc", "machine-id"))
 	if err != nil || bytes.Equal(newMachineID, oldMachineID) || len(strings.TrimSpace(string(newMachineID))) != 32 {
 		t.Fatalf("observed machine-id = %q err=%v", newMachineID, err)
 	}
-	newHostKey, err := os.ReadFile(filepath.Join(etcSSH, "ssh_host_ed25519_key"))
-	if err != nil || bytes.Equal(newHostKey, oldHostKey) {
-		t.Fatalf("observed regenerated host key err=%v", err)
-	}
-	newHostPublic, err := os.ReadFile(filepath.Join(etcSSH, "ssh_host_ed25519_key.pub"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsedPrivate, err := ssh.ParseRawPrivateKey(newHostKey)
-	if err != nil {
-		t.Fatalf("regenerated private host key is invalid: %v", err)
-	}
-	signer, ok := parsedPrivate.(crypto.Signer)
-	if !ok {
-		t.Fatalf("regenerated private host key type = %T, want crypto.Signer", parsedPrivate)
-	}
-	derivedPublic, err := ssh.NewPublicKey(signer.Public())
-	if err != nil {
-		t.Fatalf("derive regenerated public host key: %v", err)
-	}
-	parsedPublic, _, _, _, err := ssh.ParseAuthorizedKey(newHostPublic)
-	if err != nil || !bytes.Equal(parsedPublic.Marshal(), derivedPublic.Marshal()) {
-		t.Fatalf("regenerated public host key does not match private key: %v", err)
-	}
 	marker, err := os.ReadFile(markerPath)
 	if err != nil || !bytes.Equal(marker, browserSecret) {
 		t.Fatalf("browser marker changed: %q err=%v", marker, err)
+	}
+}
+
+func TestCloneIdentityRekeyInitializesLegacyStorageWithoutMachineID(t *testing.T) {
+	root := t.TempDir()
+	facts, err := rekeyCloneIdentity(root)
+	if err != nil || !facts.OSIdentityRekeyed || !facts.MachineIDRepaired ||
+		facts.MachineIDBeforeDigest == facts.MachineIDAfterDigest {
+		t.Fatalf("legacy identity rekey = %+v err=%v", facts, err)
+	}
+	identity, err := readRegularFile(computerStorageIdentityAt(root).MachineID)
+	if err != nil || !validComputerMachineID(identity) {
+		t.Fatalf("legacy machine-id = %q err=%v", identity, err)
 	}
 }
 
@@ -137,6 +115,10 @@ func storageCopyTestRequest(response CreateComputerBackupResponse, operation str
 func fakeCloneFinalize(_ *testing.T) func(context.Context, string, string, string, int64, bool) (computerStorageCopyFacts, error) {
 	return func(_ context.Context, operation, imagePath, _ string, _ int64, expanded bool) (computerStorageCopyFacts, error) {
 		facts := computerStorageCopyFacts{OSIdentityRekeyed: operation == "clone", FilesystemExpanded: expanded}
+		if operation == "clone" {
+			facts.MachineIDBeforeDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+			facts.MachineIDAfterDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		}
 		file, err := os.OpenFile(imagePath, os.O_WRONLY, 0)
 		if err != nil {
 			return facts, err
@@ -144,7 +126,7 @@ func fakeCloneFinalize(_ *testing.T) func(context.Context, string, string, strin
 		if operation != "clone" {
 			return facts, file.Close()
 		}
-		_, writeErr := file.WriteAt([]byte("machine-id=rekeyed\nssh-host-keys=regenerated\n"), 8192)
+		_, writeErr := file.WriteAt([]byte("machine-id=rekeyed\n"), 8192)
 		return facts, errors.Join(writeErr, file.Sync(), file.Close())
 	}
 }
@@ -190,6 +172,8 @@ func TestComputerStorageCopyResumesEveryCrashBoundaryAndPreservesBrowserBytes(t 
 				response, err := engine.CopyComputerStorage(t.Context(), request)
 				if err != nil || response.Receipt.Kind != "computer_storage_copy_verified" ||
 					response.Receipt.OSIdentityRekeyed != (operation == "clone") ||
+					!response.Receipt.SourceUnchanged || !response.Receipt.DestinationPrepared ||
+					response.Receipt.PreparationReceipt || response.Receipt.DestinationChown ||
 					response.Receipt.FilesystemExpanded != (operation == "clone") ||
 					response.Receipt.SourceDigest != source.Receipt.ContentDigest {
 					t.Fatalf("resumed Storage copy = %+v err=%v", response, err)
@@ -203,8 +187,7 @@ func TestComputerStorageCopyResumesEveryCrashBoundaryAndPreservesBrowserBytes(t 
 					!bytes.Contains(payload, []byte("old-credential=copied-but-not-authority")) {
 					t.Fatal("Storage copy did not preserve user, browser, and deliberately copied old credential bytes")
 				}
-				if operation == "clone" && (!bytes.Contains(payload, []byte("machine-id=rekeyed")) ||
-					!bytes.Contains(payload, []byte("ssh-host-keys=regenerated"))) {
+				if operation == "clone" && !bytes.Contains(payload, []byte("machine-id=rekeyed")) {
 					t.Fatal("clone did not narrowly rekey OS identity")
 				}
 			})

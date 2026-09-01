@@ -162,6 +162,12 @@ func TestCustodyImportValidatesReceiptCreatesNoGrantIdentityAndTaintsDescendants
 		},
 		func(value *ComputerStorageCopyReceipt) { value.DestinationDigest = "sha256:short" },
 		func(value *ComputerStorageCopyReceipt) { value.OSIdentityRekeyed = false },
+		func(value *ComputerStorageCopyReceipt) { value.MachineIDBeforeDigest = "sha256:short" },
+		func(value *ComputerStorageCopyReceipt) { value.MachineIDAfterDigest = value.MachineIDBeforeDigest },
+		func(value *ComputerStorageCopyReceipt) { value.SourceUnchanged = false },
+		func(value *ComputerStorageCopyReceipt) { value.DestinationPrepared = false },
+		func(value *ComputerStorageCopyReceipt) { value.PreparationReceipt = true },
+		func(value *ComputerStorageCopyReceipt) { value.DestinationChown = true },
 		func(value *ComputerStorageCopyReceipt) { value.FilesystemExpanded = true },
 	}
 	for index, mutate := range mutations {
@@ -326,6 +332,10 @@ func TestCustodyImportFailureUsesStoredVerbAndReleasesName(t *testing.T) {
 	failure.Operation = "clone"
 	failure.DestinationDigest = ""
 	failure.OSIdentityRekeyed = false
+	failure.MachineIDBeforeDigest = ""
+	failure.MachineIDAfterDigest = ""
+	failure.SourceUnchanged = false
+	failure.DestinationPrepared = false
 	failure.FilesystemExpanded = false
 	failure.FailureCode = "manifest_invalid"
 	failure.DestinationAbsent = true

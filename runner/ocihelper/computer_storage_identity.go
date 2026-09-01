@@ -1,9 +1,19 @@
 package ocihelper
 
+import "path/filepath"
+
 const (
-	computerStorageEtcDirectory = "etc"
-	computerStorageMachineID    = "machine-id"
-	computerStorageSSHDirectory = "ssh"
-	computerStorageSSHPrivate   = "ssh_host_ed25519_key"
-	computerStorageSSHPublic    = "ssh_host_ed25519_key.pub"
+	computerStorageIdentityDirectory = "etc"
+	computerStorageMachineIDName     = "machine-id"
+	computerMachineIDDestination     = "/etc/machine-id"
 )
+
+type computerStorageIdentityPaths struct {
+	Directory string
+	MachineID string
+}
+
+func computerStorageIdentityAt(root string) computerStorageIdentityPaths {
+	directory := filepath.Join(root, computerStorageIdentityDirectory)
+	return computerStorageIdentityPaths{Directory: directory, MachineID: filepath.Join(directory, computerStorageMachineIDName)}
+}

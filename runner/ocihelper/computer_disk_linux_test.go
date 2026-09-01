@@ -3,7 +3,6 @@
 package ocihelper
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -289,41 +288,46 @@ func TestComputerDiskResizeIntentDoesNotChangeGenerationIdentity(t *testing.T) {
 func TestComputerDiskRootOwnershipInitializesOnlyFreshFormat(t *testing.T) {
 	mountPath := t.TempDir()
 	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	identity, err := ensureComputerStorageIdentity(mountPath)
+	if err != nil || !identity.Repaired {
+		t.Fatalf("initialize missing Computer machine-id = %+v err=%v", identity, err)
+	}
 	if err := initializeComputerDiskRoot(&computerDiskAttachment{mountPath: mountPath, fresh: true}, uid, gid, false); err != nil {
 		t.Fatal(err)
 	}
-	machineIDPath := filepath.Join(mountPath, computerStorageEtcDirectory, computerStorageMachineID)
-	privateKeyPath := filepath.Join(mountPath, computerStorageEtcDirectory, computerStorageSSHDirectory, computerStorageSSHPrivate)
-	publicKeyPath := filepath.Join(mountPath, computerStorageEtcDirectory, computerStorageSSHDirectory, computerStorageSSHPublic)
+	machineIDPath := computerStorageIdentityAt(mountPath).MachineID
 	machineID, err := readRegularFile(machineIDPath)
 	if err != nil || !validComputerMachineID(machineID) {
 		t.Fatalf("fresh Computer machine-id = %q err=%v", machineID, err)
 	}
-	privateKey, err := readRegularFile(privateKeyPath)
-	if err != nil || !strings.Contains(string(privateKey), "BEGIN OPENSSH PRIVATE KEY") {
-		t.Fatalf("fresh Computer SSH host key is absent or invalid: %v", err)
-	}
-	if err := os.Remove(publicKeyPath); err != nil {
+	if err := os.WriteFile(machineIDPath, []byte("tenant-corruption"), 0o444); err != nil {
 		t.Fatal(err)
+	}
+	repaired, err := ensureComputerStorageIdentity(mountPath)
+	if err != nil || !repaired.Repaired || repaired.MachineIDDigest == identity.MachineIDDigest {
+		t.Fatalf("repair malformed Computer machine-id = %+v err=%v", repaired, err)
 	}
 	if err := initializeComputerDiskRoot(&computerDiskAttachment{mountPath: mountPath, fresh: false}, uid, gid, false); err != nil {
 		t.Fatal(err)
 	}
-	preservedMachineID, err := readRegularFile(machineIDPath)
-	if err != nil || string(preservedMachineID) != string(machineID) {
-		t.Fatalf("existing Computer machine-id changed: %q err=%v", preservedMachineID, err)
-	}
-	preservedPrivateKey, err := readRegularFile(privateKeyPath)
-	if err != nil || !bytes.Equal(preservedPrivateKey, privateKey) {
-		t.Fatalf("incomplete Computer SSH identity rotated its committed private key: %v", err)
-	}
-	recoveredPublicKey, err := readRegularFile(publicKeyPath)
-	if err != nil || len(recoveredPublicKey) == 0 {
-		t.Fatalf("incomplete Computer SSH identity did not recover its public key: %v", err)
-	}
 	wrongUID := uid + 1
 	if err := initializeComputerDiskRoot(&computerDiskAttachment{mountPath: mountPath, fresh: false}, wrongUID, gid, false); err == nil {
 		t.Fatal("existing Computer disk was silently re-owned")
+	}
+}
+
+func TestComputerStorageIdentityRepairsTenantReplacedEtc(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, computerStorageIdentityDirectory), []byte("tenant-junk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	facts, err := ensureComputerStorageIdentity(root)
+	if err != nil || !facts.Repaired || facts.RepairReason != "identity directory was not a real directory" {
+		t.Fatalf("repaired identity = %+v err=%v", facts, err)
+	}
+	payload, err := readRegularFile(computerStorageIdentityAt(root).MachineID)
+	if err != nil || !validComputerMachineID(payload) {
+		t.Fatalf("repaired machine-id = %q err=%v", payload, err)
 	}
 }
 

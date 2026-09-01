@@ -518,12 +518,9 @@ func validateRuntimeSpecInput(input RuntimeSpecInput, validateSource func(string
 			return fmt.Errorf("managed volume %q source is not permitted: %w", volume.Kind, err)
 		}
 		if volume.Kind == ManagedVolumeComputerDisk {
-			identityRoot := filepath.Join(source, computerStorageEtcDirectory)
-			if err := validateSource(filepath.Join(identityRoot, computerStorageMachineID), []string{input.ManagedRoot}, true); err != nil {
+			identity := computerStorageIdentityAt(source)
+			if err := validateSource(identity.MachineID, []string{input.ManagedRoot}, true); err != nil {
 				return fmt.Errorf("Computer machine-id source is not permitted: %w", err)
-			}
-			if err := validateSource(filepath.Join(identityRoot, computerStorageSSHDirectory), []string{input.ManagedRoot}, false); err != nil {
-				return fmt.Errorf("Computer SSH identity source is not permitted: %w", err)
 			}
 		}
 	}
@@ -683,11 +680,8 @@ func isolationMounts(input RuntimeSpecInput) ([]specs.Mount, error) {
 		}
 		mounts = append(mounts, bindMount(input.ManagedVolumeSources[volume.Kind], destination, volume.ReadOnly))
 		if volume.Kind == ManagedVolumeComputerDisk {
-			identityRoot := filepath.Join(input.ManagedVolumeSources[volume.Kind], computerStorageEtcDirectory)
-			mounts = append(mounts,
-				readonlyBindMount(filepath.Join(identityRoot, computerStorageMachineID), "/etc/machine-id"),
-				readonlyBindMount(filepath.Join(identityRoot, computerStorageSSHDirectory), "/etc/ssh"),
-			)
+			identity := computerStorageIdentityAt(input.ManagedVolumeSources[volume.Kind])
+			mounts = append(mounts, readonlyBindMount(identity.MachineID, computerMachineIDDestination))
 		}
 	}
 	type translatedMount struct {

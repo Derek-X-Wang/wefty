@@ -555,27 +555,10 @@ func writeComputerDiskManifest(root string, manifest computerDiskManifest) error
 		return err
 	}
 	payload = append(payload, '\n')
-	temporary, err := os.CreateTemp(root, ".attachment.json.tmp-")
-	if err != nil {
-		return fmt.Errorf("create Computer disk manifest: %w", err)
+	if err := writeDurableFile(root, ".attachment.json.tmp-", "attachment.json", payload, 0o600); err != nil {
+		return fmt.Errorf("write Computer disk manifest: %w", err)
 	}
-	name := temporary.Name()
-	defer os.Remove(name)
-	writeErr := temporary.Chmod(0o600)
-	if writeErr == nil {
-		_, writeErr = temporary.Write(payload)
-	}
-	if writeErr == nil {
-		writeErr = temporary.Sync()
-	}
-	writeErr = errors.Join(writeErr, temporary.Close())
-	if writeErr != nil {
-		return fmt.Errorf("write Computer disk manifest: %w", writeErr)
-	}
-	if err := os.Rename(name, filepath.Join(root, "attachment.json")); err != nil {
-		return fmt.Errorf("publish Computer disk manifest: %w", err)
-	}
-	return syncDirectory(root)
+	return nil
 }
 
 func syncDirectory(path string) error {
@@ -645,9 +628,6 @@ func initializeComputerDiskRoot(attachment *computerDiskAttachment, uid, gid uin
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Uid != uid || stat.Gid != gid {
 		return errors.New("Computer disk root ownership does not match image process owner")
-	}
-	if err := ensureComputerStorageIdentity(attachment.mountPath); err != nil {
-		return fmt.Errorf("initialize Computer disk persistent OS identity: %w", err)
 	}
 	return nil
 }

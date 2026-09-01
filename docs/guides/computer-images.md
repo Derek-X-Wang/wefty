@@ -236,9 +236,10 @@ Both reference images demonstrate the minimum contract shape:
   sign-in state persist there. Attempt-local rootfs and tmpfs writes do not.
 
 The first image runs Xvfb/XFCE and Chromium with CPU rendering. Its X display
-number is derived from the helper-reserved view port because Computers share
-the Node network namespace and Linux abstract X sockets are network-scoped;
-two live reference Computers therefore never contend for a fixed `:99`.
+number is derived from the helper-reserved view port, avoiding accidental
+contention for a fixed `:99`. This naming convention is not X11 isolation:
+Computers share the Node network namespace, so a co-located process can still
+reach another display's node-wide Linux abstract socket.
 Chromium is launched with `--no-sandbox`; that is a disclosed limitation of
 this example, not an expansion of the OCI security profile. Wefty adds no GPU,
 device, capability,

@@ -3,6 +3,7 @@ package l1
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"time"
 )
 
@@ -70,7 +71,13 @@ func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID st
 
 	rows, err = s.db.QueryContext(ctx, computerCustodyGraph+`
 		SELECT p.provenance_id, p.kind, p.source_storage_id, p.source_generation, p.backup_id,
-			p.destination_computer_id, p.destination_storage_id, p.destination_generation, p.created_ns
+			p.destination_computer_id, p.destination_storage_id, p.destination_generation, p.created_ns,
+			(SELECT o.verification_receipt_json FROM computer_storage_copy_operations o
+			 WHERE o.destination_computer_id=p.destination_computer_id
+			   AND o.destination_storage_id=p.destination_storage_id
+			   AND o.destination_generation=p.destination_generation
+			   AND o.operation=p.kind
+			 ORDER BY o.operation_revision DESC LIMIT 1)
 		FROM storage_provenance p
 		WHERE p.source_storage_id IN (SELECT storage_id FROM custody)
 			OR p.destination_storage_id IN (SELECT storage_id FROM custody)
@@ -81,11 +88,12 @@ func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID st
 	for rows.Next() {
 		var provenance StorageProvenance
 		var destinationComputer, destinationStorage sql.NullString
+		var receiptJSON []byte
 		var destinationGeneration sql.NullInt64
 		var createdNS int64
 		if err := rows.Scan(&provenance.ProvenanceID, &provenance.Kind, &provenance.SourceStorageID,
 			&provenance.SourceGeneration, &provenance.BackupID, &destinationComputer, &destinationStorage,
-			&destinationGeneration, &createdNS); err != nil {
+			&destinationGeneration, &createdNS, &receiptJSON); err != nil {
 			rows.Close()
 			return ComputerStorageProvenance{}, internalError(err, "scan Storage provenance")
 		}
@@ -93,6 +101,14 @@ func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID st
 		provenance.DestinationStorageID = destinationStorage.String
 		provenance.DestinationGeneration = destinationGeneration.Int64
 		provenance.CreatedAt = time.Unix(0, createdNS).UTC()
+		if len(receiptJSON) > 0 {
+			var receipt ComputerStorageCopyReceipt
+			if err := json.Unmarshal(receiptJSON, &receipt); err != nil {
+				rows.Close()
+				return ComputerStorageProvenance{}, internalError(err, "decode Storage copy receipt")
+			}
+			provenance.CopyReceipt = &receipt
+		}
 		if provenance.Kind == "import" {
 			projection.CustodyTainted = true
 		}

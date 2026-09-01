@@ -222,7 +222,6 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 	controlReadOnly := false
 	identityMounts := map[string]string{
 		"/etc/machine-id": "/run/wefty/fixtures/computer-disk/etc/machine-id",
-		"/etc/ssh":        "/run/wefty/fixtures/computer-disk/etc/ssh",
 	}
 	identityReadOnly := map[string]bool{}
 	for _, mount := range spec.Mounts {
@@ -706,22 +705,18 @@ func TestComputerIdentityMountSourcesCrossValidationBoundary(t *testing.T) {
 		}
 	}
 	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.4", "seccomp-linux-amd64.json"))
-	machineID := filepath.Join(input.ManagedVolumeSources[ManagedVolumeComputerDisk], computerStorageEtcDirectory, computerStorageMachineID)
-	sshIdentity := filepath.Join(input.ManagedVolumeSources[ManagedVolumeComputerDisk], computerStorageEtcDirectory, computerStorageSSHDirectory)
+	machineID := computerStorageIdentityAt(input.ManagedVolumeSources[ManagedVolumeComputerDisk]).MachineID
 	seen := map[string]bool{}
 	dependencies.validateSource = func(path string, _ []string, regularOnly bool) error {
 		if path == machineID {
 			seen[path] = regularOnly
-		}
-		if path == sshIdentity {
-			seen[path] = !regularOnly
 		}
 		return nil
 	}
 	if _, err := buildRuntimeSpec(context.Background(), input, dependencies); err != nil {
 		t.Fatal(err)
 	}
-	if !seen[machineID] || !seen[sshIdentity] {
+	if !seen[machineID] {
 		t.Fatalf("Computer identity validation = %#v", seen)
 	}
 	dependencies.validateSource = func(path string, _ []string, _ bool) error {

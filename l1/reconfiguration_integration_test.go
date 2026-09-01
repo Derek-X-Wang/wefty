@@ -906,11 +906,20 @@ func TestRemovalAcceptsAbortedComputerWithStoppedProjection(t *testing.T) {
 	if err != nil || aborted.CurrentJob.State != contract.JobStopped || aborted.CurrentJob.DesiredState != contract.ServiceDesiredStopped {
 		t.Fatalf("aborted Computer = %#v err=%v", aborted, err)
 	}
+	priorJobID, priorBoundNodeID := aborted.CurrentJobID, aborted.BoundNodeID
 	removed, err := h.store.RemoveComputer(t.Context(), computer.ComputerID,
 		ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(aborted, "operator")})
 	if err != nil || removed.DesiredState != contract.ServiceDesiredRemoved ||
 		removed.ReconfigurationPhase != ComputerReconfigurationRemoving || removed.CurrentJob.State != contract.JobRemovalPending {
 		t.Fatalf("removed aborted Computer = %#v err=%v", removed, err)
+	}
+	if removed.CurrentJobID != priorJobID || removed.BoundNodeID != priorBoundNodeID {
+		t.Fatalf("removal changed aborted lineage: job %q/%q node %q/%q", removed.CurrentJobID, priorJobID, removed.BoundNodeID, priorBoundNodeID)
+	}
+	var removalJobID, removalBoundNodeID string
+	if err := h.store.db.QueryRow(`SELECT job_id, bound_node_id FROM service_removals WHERE job_id=?`, priorJobID).
+		Scan(&removalJobID, &removalBoundNodeID); err != nil || removalJobID != priorJobID || removalBoundNodeID != priorBoundNodeID {
+		t.Fatalf("durable removal lineage = job %q node %q err=%v", removalJobID, removalBoundNodeID, err)
 	}
 	var projectionDesiredState contract.ServiceDesiredState
 	if err := h.store.db.QueryRow(`SELECT desired_state FROM service_jobs WHERE job_id=?`, removed.CurrentJobID).Scan(&projectionDesiredState); err != nil ||
