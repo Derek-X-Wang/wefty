@@ -457,6 +457,17 @@ func TestRestoreAndCloneFailClosedOnRunningAttachedAndStaleAuthority(t *testing.
 			t.Fatalf("attached restore error = %v", err)
 		}
 	})
+	t.Run("restore while reconfiguring", func(t *testing.T) {
+		h, _, computer, source, _ := publishedBackupForStorageCopy(t, 2)
+		if _, err := h.store.db.Exec(`UPDATE computers SET reconfiguration_phase=? WHERE computer_id=?`,
+			ComputerReconfigurationReimaging, computer.ComputerID); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := h.store.BeginComputerRestore(context.Background(), computer.ComputerID,
+			ComputerRestoreRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), BackupID: source.BackupID, IdempotencyKey: "reconfiguring"}); errorCode(err) != contract.ErrorConflict {
+			t.Fatalf("reconfiguring restore error = %v", err)
+		}
+	})
 	t.Run("restore stale revision", func(t *testing.T) {
 		h, _, computer, source, _ := publishedBackupForStorageCopy(t, 2)
 		precondition := computerPrecondition(computer, "operator")
