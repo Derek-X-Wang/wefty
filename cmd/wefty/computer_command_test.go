@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -49,7 +50,7 @@ func TestComputerCLIRealRoutesDefaultsLifecycleAndReplay(t *testing.T) {
 		t.Fatalf("creation mutation receipt = applied %v replay %v", created.MutationApplied, created.IdempotentReplay)
 	}
 	if created.DisplayEndpoint != nil || created.ControllerTenure != contract.ComputerControlTenureFree ||
-		created.Capacity.Admission.Status != "NOT-RUN" {
+		created.Capacity.LastGrow.Status != "NOT-RUN" || created.Capacity.ActiveFailure.Status != "NOT-RUN" {
 		t.Fatalf("unavailable projection facts were overstated: %#v", created)
 	}
 
@@ -395,10 +396,12 @@ func TestComputerCLIInsufficientDiskLatchRequiresExplicitRestart(t *testing.T) {
 	if failed.CurrentJob.State != contract.JobRunning || json.Unmarshal(failed.CurrentJob.LastFailure, &failure) != nil ||
 		failure.Code != contract.SpawnFailureInsufficientDisk || failed.CurrentJob.CurrentAttemptID != claim.Lease.AttemptID ||
 		failed.ReconfigurationPhase != l1.ComputerReconfigurationStable || failed.AppliedRevision != failed.IntentRevision ||
-		failed.DesiredDiskBytes != computer.DesiredDiskBytes || failed.Capacity.Admission.Status != "FAIL" ||
-		failed.Capacity.Admission.FailureCode != "insufficient_disk" || failed.Capacity.Admission.RequestedBytes == nil ||
-		*failed.Capacity.Admission.RequestedBytes != computer.DesiredDiskBytes+(1<<30) ||
-		failed.Capacity.Admission.ObservedAvailableBytes == nil || *failed.Capacity.Admission.ObservedAvailableBytes != 512<<20 {
+		failed.DesiredDiskBytes != computer.DesiredDiskBytes || failed.Capacity.LastGrow.Status != "FAIL" ||
+		failed.Capacity.LastGrow.FailureCode != "insufficient_disk" || failed.Capacity.LastGrow.RequestedBytes == nil ||
+		*failed.Capacity.LastGrow.RequestedBytes != computer.DesiredDiskBytes+(1<<30) ||
+		failed.Capacity.LastGrow.ObservedAvailableBytes == nil || *failed.Capacity.LastGrow.ObservedAvailableBytes != 512<<20 ||
+		failed.Capacity.ActiveFailure.Status != "FAIL" || failed.Capacity.ActiveFailure.FailureCode != "insufficient_disk" ||
+		failed.Observation == nil || failed.Observation.Status != "observed" {
 		t.Fatalf("latched failure = %#v failure=%#v", failed, failure)
 	}
 	restartedBytes := runServiceCLI(t, ctx, harness.clients, true, "services", "restart", failed.CurrentJobID,
@@ -407,6 +410,23 @@ func TestComputerCLIInsufficientDiskLatchRequiresExplicitRestart(t *testing.T) {
 	if err := json.Unmarshal(restartedBytes, &restarted); err != nil || restarted.CurrentJob.State != contract.JobStopping ||
 		len(restarted.CurrentJob.LastFailure) != 0 || restarted.MutationApplied == nil || !*restarted.MutationApplied {
 		t.Fatalf("explicit restart = %#v err=%v", restarted, err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	err = execute(ctx, harness.clients, true, []string{"services", "resize", computer.CurrentJobID,
+		"--intent-revision", fmt.Sprint(computer.IntentRevision), "--storage-id", computer.StorageID,
+		"--storage-generation", fmt.Sprint(computer.StorageGeneration),
+		"--disk-bytes", fmt.Sprint(computer.DesiredDiskBytes + (1 << 30)),
+		"--idempotency-key", "insufficient-resize", "--wait", "2s", "--poll-interval", "1ms"}, &stdout, &stderr)
+	if !errors.As(err, &responseErr) || responseErr.APIError.Code != contract.ErrorCapacityExhausted || commandExitCode(err) != exitConflict {
+		t.Fatalf("replayed refused grow after revision advance = %T %v, want typed capacity exit", err, err)
+	}
+	var replayed computerOperatorProjection
+	if decodeErr := json.Unmarshal(stdout.Bytes(), &replayed); decodeErr != nil || replayed.LastGrowOperation == nil ||
+		replayed.LastGrowOperation.OperationRevision != computer.IntentRevision+1 || replayed.IntentRevision != restarted.IntentRevision ||
+		replayed.IdempotentReplay == nil || !*replayed.IdempotentReplay || replayed.Observation == nil ||
+		replayed.Observation.Status != "observed" {
+		t.Fatalf("replayed refused grow projection = %#v decode=%v", replayed, decodeErr)
 	}
 }
 
@@ -458,9 +478,55 @@ func TestComputerCLIResizeWaitsForAppliedReceipt(t *testing.T) {
 	var grown computerOperatorProjection
 	if err := json.Unmarshal(output, &grown); err != nil || grown.ReconfigurationPhase != l1.ComputerReconfigurationStable ||
 		grown.AppliedRevision != grown.IntentRevision || grown.DesiredDiskBytes != requested ||
-		grown.Capacity.Admission.Status != "PASS" || grown.Capacity.Admission.RequestedBytes == nil ||
-		*grown.Capacity.Admission.RequestedBytes != requested || grown.Capacity.Admission.ObservedAvailableBytes != nil {
+		grown.Capacity.LastGrow.Status != "PASS" || grown.Capacity.LastGrow.RequestedBytes == nil ||
+		*grown.Capacity.LastGrow.RequestedBytes != requested || grown.Capacity.LastGrow.ObservedAvailableBytes != nil ||
+		grown.Capacity.ActiveFailure.Status != "NOT-RUN" || grown.Observation == nil || grown.Observation.Status != "observed" {
 		t.Fatalf("awaited applied grow = %#v err=%v", grown, err)
+	}
+}
+
+func TestComputerCLIResizeFirstPollFailureDoesNotEmitComputerDocument(t *testing.T) {
+	harness, computer, _, _ := newRunningComputerCLIFixture(t, "resize-first-poll-failure")
+	baseTransport := harness.clients.l1.client.Transport
+	computerReads := 0
+	harness.clients.l1.client.Transport = storageRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodGet && request.URL.Path == "/v1/computers/"+computer.ComputerID {
+			computerReads++
+			if computerReads == 2 {
+				return nil, errors.New("poll transport unavailable")
+			}
+		}
+		return baseTransport.RoundTrip(request)
+	})
+	var stdout, stderr bytes.Buffer
+	err := execute(context.Background(), harness.clients, true, []string{"services", "resize", computer.ComputerID,
+		"--intent-revision", fmt.Sprint(computer.IntentRevision), "--storage-id", computer.StorageID,
+		"--storage-generation", fmt.Sprint(computer.StorageGeneration),
+		"--disk-bytes", fmt.Sprint(computer.DesiredDiskBytes + (1 << 30)),
+		"--idempotency-key", "resize-first-poll-failure", "--wait", "2s", "--poll-interval", "1ms"}, &stdout, &stderr)
+	var observationErr *storageObservationError
+	if !errors.As(err, &observationErr) || stdout.Len() != 0 {
+		t.Fatalf("first poll failure err=%T %v stdout=%q", err, err, stdout.String())
+	}
+}
+
+func TestComputerCapacityProjectionSeparatesLastGrowFromActiveFailure(t *testing.T) {
+	completed := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	lastFailure, err := json.Marshal(contract.SpawnFailure{Code: contract.SpawnFailureInsufficientMemory,
+		RequestedBytes: 2 << 30, ObservedAvailableBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection := newComputerProjection(l1.Computer{
+		LastGrowOperation: &l1.ComputerStorageGrowOutcome{OperationRevision: 7, Status: "superseded",
+			RequestedBytes: 12 << 30, CompletedAt: &completed},
+		CurrentJob: l1.Job{ServiceJob: &l1.ServiceJob{LastFailure: lastFailure}},
+	}, nil, nil)
+	if projection.Capacity.LastGrow.Status != "NOT-RUN" || projection.Capacity.LastGrow.Code != "grow_superseded" ||
+		projection.Capacity.ActiveFailure.Status != "FAIL" ||
+		projection.Capacity.ActiveFailure.FailureCode != string(contract.SpawnFailureInsufficientMemory) ||
+		projection.Capacity.ActiveFailure.RequestedBytes == nil || *projection.Capacity.ActiveFailure.RequestedBytes != 2<<30 {
+		t.Fatalf("capacity projection = %#v", projection.Capacity)
 	}
 }
 

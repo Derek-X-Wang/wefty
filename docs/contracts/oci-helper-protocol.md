@@ -701,9 +701,12 @@ After ext4 expansion begins, failure is instead the typed resumable
 or reports `failed_unchanged`, and retry inspects the expanded image before it
 publishes a receipt.
 L1 persists the validated receipt with the grow outcome. Computer operator
-projections expose requested, observed-available, and failure-code admission
-facts only from that persisted receipt; while no completed receipt exists the
-admission cell remains `NOT-RUN`.
+projections expose it as `capacity.last_grow`; requested,
+observed-available, and failure-code facts come only from that persisted
+receipt. `capacity.active_failure` separately projects current launch/runtime
+resource latches from `last_failure`. A pending, superseded, or absent grow
+receipt remains `NOT-RUN` with `grow_pending`, `grow_superseded`, or
+`grow_receipt_absent`, respectively.
 
 `PreflightComputerReimage` runs only after the old Job is stopped and the disk
 manifest contains exact same-boot reap or prior-boot sweep evidence. Image

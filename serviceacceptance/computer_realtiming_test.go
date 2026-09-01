@@ -476,6 +476,17 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		!restoreReceipt.SourceUnchanged || !restoreReceipt.DestinationPrepared || restoreReceipt.PreparationReceipt || restoreReceipt.DestinationChown {
 		t.Fatalf("Computer restore receipt = %#v", restoreReceipt)
 	}
+	restoreRevocation := restoreOutput.Computer.LastRestoreRevocation
+	restoreTokenRevoked := restoreRevocation != nil &&
+		restoreRevocation.OperationRevision == restoreOutput.Computer.IntentRevision && restoreRevocation.RevokeAll &&
+		restoreRevocation.TokenRevocation.ComputerID == reimaged.ComputerID &&
+		!restoreRevocation.TokenRevocation.CommittedAt.IsZero()
+	restoreTokenRevocationDetail := "absent"
+	if restoreRevocation != nil {
+		restoreTokenRevocationDetail = fmt.Sprintf("operation_revision=%d revoke_all=%t computer_id=%s committed_at=%s",
+			restoreRevocation.OperationRevision, restoreRevocation.RevokeAll,
+			restoreRevocation.TokenRevocation.ComputerID, restoreRevocation.TokenRevocation.CommittedAt.Format(time.RFC3339Nano))
+	}
 	staleCredential.waitClosed(t, 30*time.Second)
 	reimaged = *restoreOutput.Computer
 	backupInventory := runComputerCLI[computerBackupInventoryReceipt](t, harness, false, "services", "backup", "list", reimaged.ComputerID)
@@ -508,6 +519,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"restore_fresh_generation_live":      restoreOutput.Computer.StorageGeneration == restoreBaseline+1,
 		"restore_preserved_machine_id_live":  !restoreReceipt.OSIdentityRekeyed && restoreReceipt.MachineIDBeforeDigest == "" && restoreReceipt.MachineIDAfterDigest == "",
 		"restore_first_attach_nonfresh_live": restoreReceipt.DestinationPrepared && !restoreReceipt.PreparationReceipt && !restoreReceipt.DestinationChown && computerDisplayPublished(reimaged),
+		"restore_token_revocation_live":      restoreTokenRevoked,
 		"prestop_session_lineage_rejected_after_restore_live": preStopSessionRejectedAfterRestore.Error.Code == contract.ErrorTakeoverSessionEnded &&
 			preStopSessionRejectedAfterRestore.Receipt != nil && preStopSessionRejectedAfterRestore.Receipt.SessionEndReason == string(l1.ComputerTakeoverAttemptAuthorityLost),
 		"backup_cap_pressure_live": capSet.Computer != nil && strings.Contains(capPressure, string(contract.ErrorConflict)),
@@ -518,11 +530,9 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"export_id": exportOutput.CustodyExport.ExportID, "import_computer_id": importOutput.Computer.ComputerID,
 		"retained_backups": fmt.Sprint(len(backupInventory.Backups)), "enospc_observation": enospc.Detail,
 		"restore_old_endpoint": restoreOldEndpoint, "restore_current_endpoint": restoreCurrentEndpoint,
-		"restore_admission_job_state":         string(restoreAdmissionState),
-		"restore_session_revocation_evidence": "unavailable: restore publishes no receipt-derived prior takeover-session revocation fact"}
-	notRunLinuxComputerRow(t, receipt, "linux.storage_provenance", 286,
-		"restore publishes no receipt-derived prior takeover-session revocation fact; the stopped-and-detached prerequisite already closes the pre-stop session, and its post-restore capability rejection reports attempt_authority_lost rather than a restore-specific terminal reason",
-		storageAssertions, storageEvidence)
+		"restore_admission_job_state":      string(restoreAdmissionState),
+		"restore_token_revocation_receipt": restoreTokenRevocationDetail}
+	completeLinuxComputerRow(t, receipt, "linux.storage_provenance", storageAssertions, storageEvidence)
 
 	receipt.begin("linux.guest_authority")
 	defaultOff := !reimaged.SubmitEnabled && reimaged.SubmitMaxInflight == l1.DefaultComputerSubmitMaxInflight
@@ -740,34 +750,6 @@ func completeLinuxComputerRow(t *testing.T, receipt *linuxComputerMatrixReceipt,
 	}
 	if err != nil {
 		t.Fatal(err)
-	}
-}
-
-func notRunLinuxComputerRow(t *testing.T, receipt *linuxComputerMatrixReceipt, id string, issue int, reason string, assertions map[string]bool, evidence map[string]string) {
-	t.Helper()
-	mutated := mutatingLinuxComputerRow(id)
-	if mutated {
-		err := receipt.pass(id, assertions, evidence)
-		if err == nil || receipt.Rows[id].Status != "FAIL" {
-			t.Fatalf("lane mutation %s did not fail its owning row", id)
-		}
-		return
-	}
-	if err := receipt.notRun(id, issue, reason, assertions, evidence); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestNotRunLinuxComputerRowMutationRecordsOwningAssertion(t *testing.T) {
-	const id = "linux.storage_provenance"
-	t.Setenv("WEFTY_LINUX_COMPUTER_MUTATE_ROW", id)
-	receipt := newLinuxComputerMatrixReceipt()
-	receipt.begin(id)
-	notRunLinuxComputerRow(t, receipt, id, 286, "restore revocation receipt is unavailable",
-		map[string]bool{"live_product_path": false}, map[string]string{"probe": "mutation"})
-	row := receipt.Rows[id]
-	if row.Status != "FAIL" || len(row.Assertions) != 1 || row.Assertions["live_product_path"] {
-		t.Fatalf("mutated expected-NOT-RUN row = %#v", row)
 	}
 }
 
@@ -1746,12 +1728,12 @@ type liveENOSPCEvidence struct {
 type liveResizeOutcome struct {
 	l1.Computer
 	Capacity struct {
-		Admission struct {
+		LastGrow struct {
 			Status                 string `json:"status"`
 			FailureCode            string `json:"failure_code"`
 			RequestedBytes         *int64 `json:"requested_bytes"`
 			ObservedAvailableBytes *int64 `json:"observed_available_bytes"`
-		} `json:"admission"`
+		} `json:"last_grow"`
 	} `json:"capacity"`
 }
 
@@ -1789,18 +1771,18 @@ func exerciseLiveComputerENOSPC(t *testing.T, harness *acceptanceHarness, refere
 	}
 	var failure contract.SpawnFailure
 	failureDecoded := json.Unmarshal(outcome.CurrentJob.LastFailure, &failure) == nil
-	admission := outcome.Capacity.Admission
+	lastGrow := outcome.Capacity.LastGrow
 	observed := response.Error.Code == contract.ErrorCapacityExhausted &&
 		outcome.ReconfigurationPhase == l1.ComputerReconfigurationStable && outcome.AppliedRevision == outcome.IntentRevision &&
 		outcome.DesiredDiskBytes == target.DesiredDiskBytes && failureDecoded && failure.Code == contract.SpawnFailureInsufficientDisk &&
-		admission.Status == "FAIL" && admission.FailureCode == string(contract.SpawnFailureInsufficientDisk) &&
-		admission.RequestedBytes != nil && admission.ObservedAvailableBytes != nil &&
-		*admission.RequestedBytes == requested && failure.RequestedBytes == *admission.RequestedBytes &&
-		failure.ObservedAvailableBytes == *admission.ObservedAvailableBytes && *admission.ObservedAvailableBytes < *admission.RequestedBytes
+		lastGrow.Status == "FAIL" && lastGrow.FailureCode == string(contract.SpawnFailureInsufficientDisk) &&
+		lastGrow.RequestedBytes != nil && lastGrow.ObservedAvailableBytes != nil &&
+		*lastGrow.RequestedBytes == requested && failure.RequestedBytes == *lastGrow.RequestedBytes &&
+		failure.ObservedAvailableBytes == *lastGrow.ObservedAvailableBytes && *lastGrow.ObservedAvailableBytes < *lastGrow.RequestedBytes
 	_ = removeAndWaitComputer(t, harness, target, 5*time.Minute)
 	return liveENOSPCEvidence{Observed: observed,
 		Detail: fmt.Sprintf("requested=%d helper_observed_available=%d host_sample_available=%d error_code=%s",
-			requested, valueOrNegative(admission.ObservedAvailableBytes), available, response.Error.Code)}
+			requested, valueOrNegative(lastGrow.ObservedAvailableBytes), available, response.Error.Code)}
 }
 
 func valueOrNegative(value *int64) int64 {

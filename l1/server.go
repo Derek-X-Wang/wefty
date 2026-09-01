@@ -1518,18 +1518,13 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	for _, computerID := range restoreRevocations {
+	for _, revocation := range restoreRevocations {
 		if s.computerTokenRevoker == nil {
 			writeError(w, internalError(errors.New("L3 Computer token revoker is not configured"),
 				"revoke pre-restore Computer authority"))
 			return
 		}
-		sessionIDs, err := s.store.listOpenComputerTakeoverSessionIDs(r.Context(), computerID)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		tokenReceipt, err := s.revokeComputerAuthorityWithReceipt(r.Context(), computerID, "computer_restoring")
+		tokenReceipt, err := s.revokeComputerAuthorityWithReceipt(r.Context(), revocation.ComputerID, "computer_restoring")
 		if err != nil {
 			writeError(w, err)
 			return
@@ -1539,8 +1534,8 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 				"revoke pre-restore Computer authority"))
 			return
 		}
-		if err := s.store.RecordComputerRestoreAuthorityRevoked(r.Context(), computerID, ComputerRestoreRevocationEvidence{
-			RevokedSessionIDs: sessionIDs, TokenRevocation: *tokenReceipt,
+		if err := s.store.RecordComputerRestoreAuthorityRevoked(r.Context(), revocation.ComputerID, revocation.OperationRevision, ComputerRestoreRevocationEvidence{
+			RevokeAll: true, TokenRevocation: *tokenReceipt,
 		}); err != nil {
 			writeError(w, err)
 			return

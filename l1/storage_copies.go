@@ -108,24 +108,28 @@ type computerStorageCopyRow struct {
 	AcknowledgementHash   sql.NullString
 }
 
-const computerRestoreRevocationReceiptKind = "computer_restore_authority_revoked"
+const computerRestoreRevocationReceiptKind = "computer_restore_token_authority_revoked"
+
+type ComputerRestoreRevocationDirective struct {
+	ComputerID        string `json:"computer_id"`
+	OperationRevision int64  `json:"operation_revision"`
+}
 
 // ComputerRestoreRevocationEvidence is the cross-service evidence supplied
-// after L1 has made every currently open take-over session stale and L3 has
-// durably revoked prior Computer token grants.
+// after L3 has durably revoked prior Computer token grants.
 type ComputerRestoreRevocationEvidence struct {
-	RevokedSessionIDs []string                                `json:"revoked_session_ids"`
-	TokenRevocation   contract.ComputerTokenRevocationReceipt `json:"token_revocation"`
+	RevokeAll       bool                                    `json:"revoke_all"`
+	TokenRevocation contract.ComputerTokenRevocationReceipt `json:"token_revocation"`
 }
 
 // ComputerRestoreRevocationReceipt attributes the authority cutover to one
-// exact restore revision. Session identifiers are facts observed before the
-// successor Storage generation becomes attachable.
+// exact restore revision. It records only the L3 revocation act that restore
+// performed; take-over session termination remains attempt-lineage evidence.
 type ComputerRestoreRevocationReceipt struct {
 	Kind               string                                  `json:"kind"`
 	ComputerID         string                                  `json:"computer_id"`
 	OperationRevision  int64                                   `json:"operation_revision"`
-	RevokedSessionIDs  []string                                `json:"revoked_session_ids"`
+	RevokeAll          bool                                    `json:"revoke_all"`
 	TokenRevocation    contract.ComputerTokenRevocationReceipt `json:"token_revocation"`
 	AuthorityRevokedAt time.Time                               `json:"authority_revoked_at"`
 }
@@ -481,7 +485,8 @@ func (s *Store) ListNodeComputerStorageCopyDirectives(ctx context.Context, ident
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+storageCopyColumns+` FROM computer_storage_copy_operations
 		WHERE bound_node_id=? AND status IN ('reserved', 'prepared', 'published') AND cleanup_quarantine_json IS NULL
-		AND (operation IN ('clone', 'import') OR authority_revoked_ns IS NOT NULL)
+		AND (operation IN ('clone', 'import') OR
+			(authority_revoked_ns IS NOT NULL AND authority_revocation_receipt_json IS NOT NULL))
 		AND (operation, destination_computer_id, operation_revision) IN (
 			SELECT CASE reconfiguration_phase WHEN 'cloning' THEN 'clone' WHEN 'importing' THEN 'import' ELSE 'restore' END,
 				computer_id, reconfiguration_revision FROM computers
@@ -509,48 +514,26 @@ func (s *Store) ListNodeComputerStorageCopyDirectives(ctx context.Context, ident
 	return directives, nil
 }
 
-func (s *Store) ListNodeComputerRestoreRevocations(ctx context.Context, nodeID string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT destination_computer_id FROM computer_storage_copy_operations
+func (s *Store) ListNodeComputerRestoreRevocations(ctx context.Context, nodeID string) ([]ComputerRestoreRevocationDirective, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT destination_computer_id, operation_revision FROM computer_storage_copy_operations
 		WHERE bound_node_id=? AND operation='restore' AND status IN ('reserved', 'prepared')
+		AND authority_revocation_receipt_json IS NULL
+		AND (destination_computer_id, operation_revision) IN (SELECT computer_id, reconfiguration_revision
+			FROM computers WHERE reconfiguration_phase='restoring')
 		ORDER BY requested_ns, destination_computer_id`, nodeID)
 	if err != nil {
 		return nil, internalError(err, "list pending restore authority revocations")
 	}
 	defer rows.Close()
-	var computerIDs []string
+	directives := []ComputerRestoreRevocationDirective{}
 	for rows.Next() {
-		var computerID string
-		if err := rows.Scan(&computerID); err != nil {
+		var directive ComputerRestoreRevocationDirective
+		if err := rows.Scan(&directive.ComputerID, &directive.OperationRevision); err != nil {
 			return nil, internalError(err, "scan pending restore authority revocation")
 		}
-		computerIDs = append(computerIDs, computerID)
+		directives = append(directives, directive)
 	}
-	return computerIDs, rows.Err()
-}
-
-func (s *Store) listOpenComputerTakeoverSessionIDs(ctx context.Context, computerID string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT opened.session_id FROM computer_takeover_audit opened
-		WHERE opened.computer_id=? AND opened.event_kind='session_open' AND opened.session_id<>''
-		AND NOT EXISTS (SELECT 1 FROM computer_takeover_audit closed
-			WHERE closed.attempt_id=opened.attempt_id AND closed.session_id=opened.session_id
-			AND closed.event_kind='session_close' AND closed.rowid>opened.rowid)
-		ORDER BY opened.rowid`, computerID)
-	if err != nil {
-		return nil, internalError(err, "list open Computer take-over sessions for restore")
-	}
-	defer rows.Close()
-	sessionIDs := []string{}
-	for rows.Next() {
-		var sessionID string
-		if err := rows.Scan(&sessionID); err != nil {
-			return nil, internalError(err, "scan open Computer take-over session for restore")
-		}
-		sessionIDs = append(sessionIDs, sessionID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, internalError(err, "read open Computer take-over sessions for restore")
-	}
-	return sessionIDs, nil
+	return directives, rows.Err()
 }
 
 func readLastComputerRestoreRevocation(ctx context.Context, q queryer, computerID string) (*ComputerRestoreRevocationReceipt, error) {
@@ -571,44 +554,45 @@ func readLastComputerRestoreRevocation(ctx context.Context, q queryer, computerI
 	return &receipt, nil
 }
 
-func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, computerID string, evidence ComputerRestoreRevocationEvidence) error {
-	if evidence.RevokedSessionIDs == nil || evidence.TokenRevocation.ComputerID != computerID ||
-		evidence.TokenRevocation.SubmitIntentRevision != 1 || evidence.TokenRevocation.RevokedGrantCount < 0 ||
-		evidence.TokenRevocation.CommittedAt.IsZero() {
+func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, computerID string, operationRevision int64, evidence ComputerRestoreRevocationEvidence) error {
+	if operationRevision < 1 || !evidence.RevokeAll || evidence.TokenRevocation.ComputerID != computerID ||
+		evidence.TokenRevocation.RevokedGrantCount < 0 || evidence.TokenRevocation.CommittedAt.IsZero() {
 		return protocolError(contract.ErrorInvalidRequest, "Computer restore authority revocation evidence is incomplete")
 	}
-	seen := make(map[string]struct{}, len(evidence.RevokedSessionIDs))
-	for _, sessionID := range evidence.RevokedSessionIDs {
-		if sessionID == "" || sessionID != strings.TrimSpace(sessionID) {
-			return protocolError(contract.ErrorInvalidRequest, "Computer restore revoked session identity is invalid")
-		}
-		if _, duplicate := seen[sessionID]; duplicate {
-			return protocolError(contract.ErrorInvalidRequest, "Computer restore revoked session identity is duplicated")
-		}
-		seen[sessionID] = struct{}{}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin restore authority revocation receipt")
 	}
-	var operationRevision int64
-	if err := s.db.QueryRowContext(ctx, `SELECT operation_revision FROM computer_storage_copy_operations
-		WHERE destination_computer_id=? AND operation='restore' AND status IN ('reserved', 'prepared')`, computerID).Scan(&operationRevision); err != nil {
+	defer tx.Rollback()
+	var requestedNS int64
+	if err := tx.QueryRowContext(ctx, `SELECT requested_ns FROM computer_storage_copy_operations
+		WHERE destination_computer_id=? AND operation_revision=? AND operation='restore'
+		AND status IN ('reserved', 'prepared')`, computerID, operationRevision).Scan(&requestedNS); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return protocolError(contract.ErrorStaleIntentRevision, "Computer restore no longer owns authority revocation")
 		}
 		return internalError(err, "read restore authority revocation operation")
 	}
-	now := canonicalTime(s.clock.Now())
+	if evidence.TokenRevocation.CommittedAt.Before(time.Unix(0, requestedNS).UTC()) {
+		return protocolError(contract.ErrorConflict, "Computer token revocation predates the restore reservation")
+	}
+	revokedAt := canonicalTime(evidence.TokenRevocation.CommittedAt)
 	receipt := ComputerRestoreRevocationReceipt{Kind: computerRestoreRevocationReceiptKind,
 		ComputerID: computerID, OperationRevision: operationRevision,
-		RevokedSessionIDs: append([]string(nil), evidence.RevokedSessionIDs...), TokenRevocation: evidence.TokenRevocation,
-		AuthorityRevokedAt: now}
+		RevokeAll: true, TokenRevocation: evidence.TokenRevocation,
+		AuthorityRevokedAt: revokedAt}
 	payload, err := json.Marshal(receipt)
 	if err != nil {
 		return internalError(err, "encode restore authority revocation receipt")
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET
+	result, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET
 		authority_revoked_ns=COALESCE(authority_revoked_ns, ?),
 		authority_revocation_receipt_json=COALESCE(authority_revocation_receipt_json, ?)
-		WHERE destination_computer_id=? AND operation='restore' AND status IN ('reserved', 'prepared')`,
-		now.UnixNano(), payload, computerID)
+		WHERE destination_computer_id=? AND operation_revision=? AND operation='restore'
+		AND status IN ('reserved', 'prepared') AND EXISTS (
+			SELECT 1 FROM computers WHERE computer_id=? AND intent_revision=?
+			AND reconfiguration_revision=? AND reconfiguration_phase='restoring')`,
+		revokedAt.UnixNano(), payload, computerID, operationRevision, computerID, operationRevision, operationRevision)
 	if err != nil {
 		return internalError(err, "record restore authority revocation")
 	}
@@ -618,6 +602,9 @@ func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, compu
 	}
 	if affected != 1 {
 		return protocolError(contract.ErrorStaleIntentRevision, "Computer restore no longer owns authority revocation")
+	}
+	if err := tx.Commit(); err != nil {
+		return internalError(err, "commit restore authority revocation receipt")
 	}
 	return nil
 }
@@ -859,11 +846,18 @@ func (s *Store) publishVerifiedComputerStorageCopy(ctx context.Context, destinat
 	}
 	if row.Operation == "restore" {
 		var revoked sql.NullInt64
-		if err := tx.QueryRowContext(ctx, `SELECT authority_revoked_ns FROM computer_storage_copy_operations
-			WHERE destination_computer_id=? AND operation_revision=?`, destinationComputerID, operationRevision).Scan(&revoked); err != nil {
+		var revocationJSON []byte
+		if err := tx.QueryRowContext(ctx, `SELECT authority_revoked_ns, authority_revocation_receipt_json
+			FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?`,
+			destinationComputerID, operationRevision).Scan(&revoked, &revocationJSON); err != nil {
 			return Computer{}, internalError(err, "read durable restore authority revocation")
 		}
-		if !revoked.Valid || revoked.Int64 <= 0 {
+		var revocation ComputerRestoreRevocationReceipt
+		if !revoked.Valid || revoked.Int64 <= 0 || len(revocationJSON) == 0 ||
+			json.Unmarshal(revocationJSON, &revocation) != nil ||
+			revocation.Kind != computerRestoreRevocationReceiptKind || revocation.ComputerID != destinationComputerID ||
+			revocation.OperationRevision != operationRevision || !revocation.RevokeAll ||
+			revocation.TokenRevocation.ComputerID != destinationComputerID || revocation.TokenRevocation.CommittedAt.IsZero() {
 			return Computer{}, protocolError(contract.ErrorConflict, "Computer restore authority was not durably revoked before publication")
 		}
 	}

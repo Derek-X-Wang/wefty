@@ -73,12 +73,9 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 			receipt["rows"].(map[string]any)["linux.create_boot"].(map[string]any)["status"] = "NOT-RUN"
 		},
 		"wrong aggregate not-run issue": func(receipt map[string]any) {
-			receipt["not_run_issue"] = 157
+			receipt["not_run_issue"] = 286
 		},
-		"wrong storage not-run issue": func(receipt map[string]any) {
-			receipt["rows"].(map[string]any)["linux.storage_provenance"].(map[string]any)["not_run_issue"] = 999
-		},
-		"missing storage revocation evidence": func(receipt map[string]any) {
+		"missing restore token revocation evidence": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.storage_provenance"].(map[string]any)["evidence"] = map[string]string{}
 		},
 		"false assertion": func(receipt map[string]any) {
@@ -124,16 +121,13 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 	guest["not_run_reason"] = "complete M3 OCI matrix root result is not published"
 	guest["evidence"] = map[string]string{"blocked_assertion": "candidate-bound root Run route"}
 	storage := rows["linux.storage_provenance"].(map[string]any)
-	storage["status"] = "NOT-RUN"
-	storage["not_run_issue"] = 286
-	storage["not_run_reason"] = "restore publishes no receipt-derived prior takeover-session revocation fact"
-	storage["evidence"] = map[string]string{"restore_session_revocation_evidence": "unavailable: restore publishes no receipt-derived prior takeover-session revocation fact"}
+	storage["evidence"] = map[string]string{"restore_token_revocation_receipt": "operation_revision=9 revoke_all=true computer_id=computer-1"}
 	rows["linux.removal"].(map[string]any)["evidence"] = map[string]string{"inventory_source": "helper VerifyNamespace route"}
 	digest := "sha256:" + strings.Repeat("a", 64)
 	return map[string]any{
 		"version":       2,
 		"status":        "NOT-RUN",
-		"not_run_issue": 286,
+		"not_run_issue": 157,
 		"candidate_sha": candidate,
 		"platform":      "linux/amd64",
 		"image": map[string]any{

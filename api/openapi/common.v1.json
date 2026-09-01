@@ -680,7 +680,7 @@
           "status": { "enum": ["planned", "applied", "failed", "superseded"] },
           "requested_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
           "observed_available_bytes": { "type": "integer", "format": "int64", "minimum": 0 },
-          "failure_code": { "enum": ["insufficient_disk", "aborted_dead_node"] },
+          "failure_code": { "const": "insufficient_disk" },
           "completed_at": { "type": "string", "format": "date-time" }
         },
         "description": "Latest durable Computer Storage grow observation. Available bytes exist only when a validated helper refusal receipt supplied them."
@@ -688,16 +688,16 @@
       "ComputerRestoreRevocationReceipt": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["kind", "computer_id", "operation_revision", "revoked_session_ids", "token_revocation", "authority_revoked_at"],
+        "required": ["kind", "computer_id", "operation_revision", "revoke_all", "token_revocation", "authority_revoked_at"],
         "properties": {
-          "kind": { "const": "computer_restore_authority_revoked" },
+          "kind": { "const": "computer_restore_token_authority_revoked" },
           "computer_id": { "type": "string", "minLength": 1 },
           "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
-          "revoked_session_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+          "revoke_all": { "const": true },
           "token_revocation": { "$ref": "#/components/schemas/ComputerTokenRevocationReceipt" },
           "authority_revoked_at": { "type": "string", "format": "date-time" }
         },
-        "description": "Restore-attributable proof that every take-over session open at the authority cutover became stale and prior L3 Computer token grants were durably revoked before successor attachment."
+        "description": "Restore-attributable proof that L1 requested RevokeAll and L3 durably revoked prior Computer token grants before successor attachment. Take-over session termination is attempt-lineage-bound and is evidenced separately by takeover_session_ended."
       },
       "ComputerBackupDirective": {
         "type": "object",

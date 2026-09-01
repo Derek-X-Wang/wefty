@@ -602,8 +602,8 @@ func (h *storageCLIHarness) startStorageCopyHelper(operation, destinationCompute
 			if operation == "restore" {
 				computer, err := h.store.GetComputer(h.ctx, destinationComputerID)
 				if err == nil && computer.ReconfigurationPhase == l1.ComputerReconfigurationRestoring {
-					if err := h.store.RecordComputerRestoreAuthorityRevoked(h.ctx, destinationComputerID, l1.ComputerRestoreRevocationEvidence{
-						RevokedSessionIDs: []string{}, TokenRevocation: contract.ComputerTokenRevocationReceipt{
+					if err := h.store.RecordComputerRestoreAuthorityRevoked(h.ctx, destinationComputerID, computer.IntentRevision, l1.ComputerRestoreRevocationEvidence{
+						RevokeAll: true, TokenRevocation: contract.ComputerTokenRevocationReceipt{
 							ComputerID: destinationComputerID, SubmitIntentRevision: 1, CommittedAt: time.Now().UTC(),
 						},
 					}); err != nil {
