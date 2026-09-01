@@ -730,6 +730,12 @@ platform, the helper returns a typed `failed_unchanged` receipt only after the
 same detachment and disk-allocation checks. L1 then retires the refused staging
 projection while preserving the stopped current Job and disk generation.
 
+L1 records a successful preflight receipt and activates the staged Computer
+projection in the same acknowledgement transaction. The agent does not wait
+for an operator replay or a later heartbeat to move the Computer out of
+`reimaging`; an identical acknowledgement replay returns the already-completed
+projection.
+
 Computer removal carries the same exact Storage identity plus current Node,
 boot, consumer Job, named prior Job, removal-generation, and cleanup-fence
 authority to the helper. The helper requires a matching detached receipt whose

@@ -814,7 +814,7 @@
       "post": {
         "operationId": "acknowledgeComputerReimagePreflight",
         "summary": "Accept assertion-derived Computer reimage preflight evidence",
-        "description": "The authenticated current node submits helper evidence binding the exact managed-root instance, old and staging Jobs, operation revision and fence, target digest and platform, image and disk-root ownership, and either positive detachment or verified reset-preparation evidence. Every bounded preflight refusal carries a closed stage and reason so L1 can release the refused staging projection with typed status instead of redispatching indefinitely.",
+        "description": "The authenticated current node submits helper evidence binding the exact managed-root instance, old and staging Jobs, operation revision and fence, target digest and platform, image and disk-root ownership, and either positive detachment or verified reset-preparation evidence. L1 atomically records successful evidence and activates the staged projection in the acknowledgement transaction; no client replay is required to leave reimaging. Every bounded preflight refusal carries a closed stage and reason so L1 can release the refused staging projection with typed status instead of redispatching indefinitely.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],

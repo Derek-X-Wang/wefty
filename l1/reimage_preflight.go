@@ -212,7 +212,7 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 		return Computer{}, err
 	}
 	if row.Status != "planned" {
-		if (row.Status == "preflight_verified" || row.Status == "failed") && row.AcknowledgementKey.Valid &&
+		if (row.Status == "preflight_verified" || row.Status == "completed" || row.Status == "failed") && row.AcknowledgementKey.Valid &&
 			row.AcknowledgementKey.String == request.IdempotencyKey && row.AcknowledgementHash.Valid &&
 			row.AcknowledgementHash.String == bodyHash {
 			return computer, tx.Commit()
@@ -275,9 +275,16 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 		request.IdempotencyKey, bodyHash, now.UnixNano(), computerID, row.OperationRevision); err != nil {
 		return Computer{}, internalError(err, "persist Computer reimage preflight")
 	}
+	if err := s.finalizeComputerProjectionTx(ctx, tx, computer, ComputerReconfigurationReimaging, now); err != nil {
+		return Computer{}, err
+	}
+	updated, err := readComputerAuthority(ctx, tx, computerID, now)
+	if err != nil {
+		return Computer{}, internalError(err, "read completed Computer reimage")
+	}
 	if err := tx.Commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer reimage preflight")
 	}
 	s.notifyComputerPolicyChanged()
-	return computer, nil
+	return updated, nil
 }

@@ -25,6 +25,35 @@ func acknowledgeReimagePreflight(t *testing.T, h *integrationHarness, node Node,
 	attemptID, fencingToken string,
 ) {
 	t.Helper()
+	directive, request := reimagePreflightAcknowledgement(t, h, node, computerID, attemptID, fencingToken)
+	policyChanged := h.store.computerPolicyChangeChannel()
+	completed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+		computerID, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.ReconfigurationPhase != ComputerReconfigurationStable ||
+		completed.ReconfigurationRevision != nil || completed.AppliedRevision != directive.OperationRevision ||
+		completed.CurrentJobID != directive.StagingJobID {
+		t.Fatalf("verified Computer reimage did not atomically activate its staged projection: %#v", completed)
+	}
+	select {
+	case <-policyChanged:
+	default:
+		t.Fatal("verified Computer reimage preflight did not wake policy reconciliation")
+	}
+	replayed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+		computerID, request)
+	if err != nil || replayed.ReconfigurationPhase != ComputerReconfigurationStable ||
+		replayed.CurrentJobID != directive.StagingJobID {
+		t.Fatalf("completed Computer reimage acknowledgement replay = %#v err=%v", replayed, err)
+	}
+}
+
+func reimagePreflightAcknowledgement(t *testing.T, h *integrationHarness, node Node, computerID,
+	attemptID, fencingToken string,
+) (ComputerReimagePreflightDirective, ComputerReimagePreflightAcknowledgementRequest) {
+	t.Helper()
 	directives, err := h.store.ListNodeComputerReimagePreflightDirectives(t.Context(),
 		"fabric-"+node.NodeID, node.NodeID, node.BootSessionID)
 	if err != nil || len(directives) != 1 {
@@ -44,18 +73,9 @@ func acknowledgeReimagePreflight(t *testing.T, h *integrationHarness, node Node,
 		DiskRootUID: 1000, DiskRootGID: 1000, DetachmentReceiptID: "detach-" + attemptID,
 		StorageEvidenceKind: computerReimageDetachmentEvidenceKind, DetachmentAttemptID: attemptID,
 		DetachmentFencingToken: fencingToken, HelperGeneration: 7}
-	policyChanged := h.store.computerPolicyChangeChannel()
-	if _, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
-		computerID, ComputerReimagePreflightAcknowledgementRequest{NodeID: node.NodeID,
-			BootSessionID: node.BootSessionID, IdempotencyKey: "ack-" + directive.OperationFence,
-			Receipt: receipt}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-policyChanged:
-	default:
-		t.Fatal("verified Computer reimage preflight did not wake policy reconciliation")
-	}
+	return directive, ComputerReimagePreflightAcknowledgementRequest{NodeID: node.NodeID,
+		BootSessionID: node.BootSessionID, IdempotencyKey: "ack-" + directive.OperationFence,
+		Receipt: receipt}
 }
 
 func TestComputerReimagePreflightReceiptFailsEveryNegativeRow(t *testing.T) {
@@ -856,9 +876,10 @@ func TestReimageCrashBoundariesResumeWithoutPartialProjection(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		acknowledgeReimagePreflight(t, h, node, computer.ComputerID, "", "")
 		active = "projection_finalized"
-		if _, err := h.store.ReimageComputer(t.Context(), computer.ComputerID, request); !errors.Is(err, injected) {
+		_, acknowledgement := reimagePreflightAcknowledgement(t, h, node, computer.ComputerID, "", "")
+		if _, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+			computer.ComputerID, acknowledgement); !errors.Is(err, injected) {
 			t.Fatalf("injected finalize error = %v", err)
 		}
 		unchanged, _ := h.store.GetComputer(t.Context(), computer.ComputerID)
@@ -866,7 +887,8 @@ func TestReimageCrashBoundariesResumeWithoutPartialProjection(t *testing.T) {
 			t.Fatalf("partial finalize = %#v", unchanged)
 		}
 		active = ""
-		if completed, err := h.store.ReimageComputer(t.Context(), computer.ComputerID, request); err != nil ||
+		if completed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+			computer.ComputerID, acknowledgement); err != nil ||
 			completed.ReconfigurationPhase != ComputerReconfigurationStable || completed.CurrentJobID == staged.CurrentJobID {
 			t.Fatalf("resumed finalize = %#v err=%v", completed, err)
 		}
