@@ -8,8 +8,23 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 )
+
+func custodyFileOwner(t *testing.T, path string) (uint32, uint32) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("Custody path %s has no Linux ownership", path)
+	}
+	return stat.Uid, stat.Gid
+}
 
 func custodyExportTestRequest(source CreateComputerBackupResponse, externalPath string) ExportComputerCustodyRequest {
 	receipt := source.Receipt
@@ -59,7 +74,16 @@ func TestComputerCustodyExportCrashLeavesPermanentExternalBytesAndResumes(t *tes
 	if err != nil || partial.Size() == 0 || partial.Size() >= request.SourceSize {
 		t.Fatalf("mid-export partial bytes = %#v err=%v", partial, err)
 	}
-	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	type chownCall struct {
+		name     string
+		uid, gid int
+	}
+	var chownCalls []chownCall
+	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerCustodyChown: func(file *os.File, uid, gid int) error {
+			chownCalls = append(chownCalls, chownCall{name: filepath.Base(file.Name()), uid: uid, gid: gid})
+			return file.Chown(uid, gid)
+		}}
 	completed, err := engine.ExportComputerCustody(t.Context(), request)
 	if err != nil || completed.Receipt.Kind != "computer_custody_export_verified" ||
 		completed.Receipt.ManifestDigest == "" || completed.Receipt.ContentDigest != request.SourceDigest {
@@ -67,6 +91,18 @@ func TestComputerCustodyExportCrashLeavesPermanentExternalBytesAndResumes(t *tes
 	}
 	if digest, err := digestFile(filepath.Join(externalRoot, "storage.ext4")); err != nil || digest != request.SourceDigest {
 		t.Fatalf("resumed Custody bytes digest = %s err=%v", digest, err)
+	}
+	wantUID, wantGID := custodyFileOwner(t, externalRoot)
+	for _, path := range []string{filepath.Join(externalRoot, "custody.json"), filepath.Join(externalRoot, "storage.ext4")} {
+		uid, gid := custodyFileOwner(t, path)
+		if uid != wantUID || gid != wantGID {
+			t.Fatalf("Custody file %s owner = %d:%d, want operator directory owner %d:%d", path, uid, gid, wantUID, wantGID)
+		}
+	}
+	if len(chownCalls) != 2 || chownCalls[0].name != "storage.ext4" || !strings.HasPrefix(chownCalls[1].name, ".custody-manifest.tmp-") ||
+		chownCalls[0].uid != int(wantUID) || chownCalls[0].gid != int(wantGID) ||
+		chownCalls[1].uid != int(wantUID) || chownCalls[1].gid != int(wantGID) {
+		t.Fatalf("resumed Custody export ownership calls = %v, want disk then durable manifest temp", chownCalls)
 	}
 }
 
@@ -84,6 +120,115 @@ func TestComputerCustodyExportRejectsSymlinkBackIntoManagedRoot(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(root, "operator-custody")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("rejected Custody path created managed bytes: %v", err)
+	}
+}
+
+func TestComputerCustodyExportRefusesSymlinkDestinationWithoutTouchingTarget(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	externalRoot := filepath.Join(t.TempDir(), "operator-custody")
+	request := custodyExportTestRequest(source, externalRoot)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	if _, err := engine.ExportComputerCustody(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte("do-not-touch"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(externalRoot, "storage.ext4")
+	if err := os.Remove(destination); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, destination); err != nil {
+		t.Fatal(err)
+	}
+	response, err := engine.ExportComputerCustody(t.Context(), request)
+	if err != nil || response.Receipt.Kind != "computer_custody_export_failed" || response.Receipt.FailureCode != "destination_substituted" {
+		t.Fatalf("symlink substitution response = %+v err=%v", response, err)
+	}
+	payload, err := os.ReadFile(victim)
+	if err != nil || string(payload) != "do-not-touch" {
+		t.Fatalf("symlink target payload = %q err=%v", payload, err)
+	}
+	info, err := os.Stat(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Fatalf("symlink target mode = %v err=%v", info.Mode(), err)
+	}
+}
+
+func TestComputerCustodyExportReassertsPrivateModeAndTypesChownFailure(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	externalRoot := filepath.Join(t.TempDir(), "operator-custody")
+	request := custodyExportTestRequest(source, externalRoot)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	if _, err := engine.ExportComputerCustody(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(externalRoot, "storage.ext4")
+	if err := os.Chmod(destination, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.ExportComputerCustody(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("resumed destination mode = %v err=%v, want 0600", info.Mode(), err)
+	}
+	engine.computerCustodyChown = func(file *os.File, uid, gid int) error {
+		if filepath.Base(file.Name()) == "storage.ext4" {
+			return syscall.EPERM
+		}
+		return file.Chown(uid, gid)
+	}
+	response, err := engine.ExportComputerCustody(t.Context(), request)
+	if err != nil || response.Receipt.Kind != "computer_custody_export_failed" || response.Receipt.FailureCode != "ownership_failed" {
+		t.Fatalf("chown failure response = %+v err=%v", response, err)
+	}
+}
+
+func TestComputerCustodyExportInheritsNearestAncestorOwnerForCreatedDirectories(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	ancestor := t.TempDir()
+	externalRoot := filepath.Join(ancestor, "operator", "custody")
+	request := custodyExportTestRequest(source, externalRoot)
+	type ownershipCall struct {
+		name     string
+		uid, gid int
+	}
+	var calls []ownershipCall
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerCustodyOwner: func(path string) (custodyExternalOwner, error) {
+			if path != ancestor {
+				t.Fatalf("owner resolved from %q, want nearest existing ancestor %q", path, ancestor)
+			}
+			return custodyExternalOwner{uid: 12345, gid: 23456}, nil
+		},
+		computerCustodyChown: func(file *os.File, uid, gid int) error {
+			calls = append(calls, ownershipCall{name: file.Name(), uid: uid, gid: gid})
+			return nil
+		}}
+	response, err := engine.ExportComputerCustody(t.Context(), request)
+	if err != nil || !response.Receipt.OwnershipApplied || !response.Receipt.PrivateModeApplied ||
+		response.Receipt.ExternalOwnerUID != 12345 || response.Receipt.ExternalOwnerGID != 23456 {
+		t.Fatalf("separate-owner export = %+v err=%v", response, err)
+	}
+	for _, component := range []string{"operator", "custody"} {
+		found := false
+		for _, call := range calls {
+			if filepath.Base(call.name) == component && call.uid == 12345 && call.gid == 23456 {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("ownership calls %v omit created directory %q with inherited owner", calls, component)
+		}
 	}
 }
 

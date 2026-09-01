@@ -265,7 +265,9 @@ Ticket 20 applies this owner-ratified patch to `CONTEXT.md` with the milestone r
 +
 +**Custody export**:
 +The recorded transfer of storage bytes outside wefty ownership, permanently
-+reducing what removal can prove.
++reducing what removal can prove. Its `available` status means verified
++portable external bytes; Backup `available` instead means a verified
++wefty-managed copy.
 +_Avoid_: Backup, managed copy, verified deletion
 +
 +### Human take-over

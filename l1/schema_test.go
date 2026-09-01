@@ -5,12 +5,36 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestCustodyExportSQLAndOpenAPIStatusEnumsStayBound(t *testing.T) {
+	openAPI, err := os.ReadFile(filepath.Join("..", "api", "openapi", "common.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `"status": { "enum": ["planned", "available", "failed", "superseded"] }`
+	if !strings.Contains(string(openAPI), want) {
+		t.Fatalf("OpenAPI Custody export status enum does not contain %s", want)
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "status-enum.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var tableSQL string
+	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_custody_exports'`).Scan(&tableSQL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(tableSQL, "status IN ('planned', 'available', 'failed', 'superseded')") {
+		t.Fatal("SQLite Custody export status CHECK diverged from the OpenAPI enum")
+	}
+}
 
 func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "schema.sqlite"), StoreOptions{})
@@ -337,6 +361,79 @@ func TestStoreMigratesStorageProvenanceWithoutDroppingFutureColumns(t *testing.T
 		VALUES('future-provenance', 'import', 'source-storage', 1, 'portable-backup-id',
 			'destination-storage', 1, 1, 'still-preserved')`); err != nil {
 		t.Fatalf("Storage provenance rejected a portable import source after L1 loss: %v", err)
+	}
+}
+
+func TestStoreMigratesExportedCustodyStatusWithoutDroppingFutureColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "exported-custody.sqlite")
+	store, err := OpenStore(path, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`ALTER TABLE computer_custody_exports
+		ADD COLUMN future_custody_fact TEXT NOT NULL DEFAULT 'preserved'`); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	var currentSQL string
+	if err := database.QueryRow(`SELECT sql FROM sqlite_master
+		WHERE type='table' AND name='computer_custody_exports'`).Scan(&currentSQL); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	oldSQL, err := migratedSQLiteCreateTable(currentSQL, "computer_custody_exports_old_status", map[string]string{
+		"status IN ('planned', 'available', 'failed', 'superseded')": "status IN ('planned', 'exported', 'superseded')",
+		"external_path TEXT NOT NULL":                                "external_path TEXT NOT NULL UNIQUE",
+	})
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	_, err = database.Exec(`PRAGMA foreign_keys=OFF; ` + oldSQL + `;
+		DROP TABLE computer_custody_exports;
+		ALTER TABLE computer_custody_exports_old_status RENAME TO computer_custody_exports;
+		INSERT INTO computer_custody_exports(
+			export_id, computer_id, operation_revision, backup_id, copy_id,
+			source_storage_id, source_generation, allocated_size, content_digest,
+			bound_node_id, root_instance_id, external_path, custody_fence,
+			source_spec_json, source_spec_hash, idempotency_key, request_hash,
+			status, requested_ns, future_custody_fact)
+		VALUES(
+			'legacy-export', 'legacy-computer', 1, 'legacy-backup', 'legacy-copy',
+			'legacy-storage', 1, 1, 'sha256:legacy',
+			'legacy-node', 'legacy-root', '/operator/export', 'legacy-fence',
+			X'7B7D', 'sha256:spec', 'legacy-key', 'sha256:request',
+			'exported', 1, 'still-preserved');
+		PRAGMA foreign_keys=ON;`)
+	closeErr := database.Close()
+	if err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	store, err = OpenStore(path, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var tableSQL, status, futureFact string
+	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master
+		WHERE type='table' AND name='computer_custody_exports'`).Scan(&tableSQL); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT status, future_custody_fact FROM computer_custody_exports
+		WHERE export_id='legacy-export'`).Scan(&status, &futureFact); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(tableSQL, "'available'") || strings.Contains(tableSQL, "'exported'") ||
+		strings.Contains(tableSQL, "external_path TEXT NOT NULL UNIQUE") || !strings.Contains(tableSQL, "'failed'") ||
+		!strings.Contains(tableSQL, "future_custody_fact") || status != "available" || futureFact != "still-preserved" {
+		t.Fatalf("Custody availability migration = schema:%s status:%q future:%q", tableSQL, status, futureFact)
 	}
 }
 

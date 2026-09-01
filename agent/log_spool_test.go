@@ -380,6 +380,18 @@ func TestLogSpoolPersistsFinalizedCompletionAcrossRestart(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("delivered completion retained %d attempt rows", count)
 	}
+	var disposition, reason string
+	if err := spool.db.QueryRow(`SELECT disposition, reason FROM spool_completion_receipts WHERE attempt_id=?`, claim.Lease.AttemptID).
+		Scan(&disposition, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if disposition != "delivered" || reason != "acknowledged_by_l1" {
+		t.Fatalf("completion receipt = %q/%q, want delivered/acknowledged_by_l1", disposition, reason)
+	}
+	inspection := spool.inspectCompletion(context.Background(), claim.Lease.AttemptID)
+	if inspection.State != "delivered" || inspection.Reason != "acknowledged_by_l1" || inspection.EventCount != 0 {
+		t.Fatalf("delivered completion inspection = %+v", inspection)
+	}
 	if err := spool.db.QueryRow("SELECT COUNT(*) FROM runtime_attempt_manifests WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
@@ -391,6 +403,26 @@ func TestLogSpoolPersistsFinalizedCompletionAcrossRestart(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("delivered service completion retained %d current service manifests, want one bounded removal source", count)
+	}
+}
+
+func TestLogSpoolInspectionDistinguishesSuppressedAndNeverPersistedCompletion(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "node-completion-disposition", 1024)
+	defer spool.Close()
+	claim := serviceSpoolTestClaim("attempt-suppressed")
+	if err := spool.ensureAttempt(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	before := spool.inspectCompletion(context.Background(), claim.Lease.AttemptID)
+	if before.State != "never_persisted" {
+		t.Fatalf("pre-completion inspection = %+v", before)
+	}
+	if err := spool.suppressCompletion(context.Background(), claim.Lease.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	after := spool.inspectCompletion(context.Background(), claim.Lease.AttemptID)
+	if after.State != "suppressed" || after.Reason != "service_intent_stop" {
+		t.Fatalf("suppressed completion inspection = %+v", after)
 	}
 }
 

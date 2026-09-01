@@ -123,6 +123,8 @@ type ContainerdEngine struct {
 	computerBackupRemovalHook   func()
 	computerCustodyHook         func(string) error
 	computerCustodyCopyN        func(io.Writer, io.Reader, int64) (int64, error)
+	computerCustodyChown        func(*os.File, int, int) error
+	computerCustodyOwner        func(string) (custodyExternalOwner, error)
 	storageCopyHook             func(computerStorageCopyPhase) error
 	storageCopyFinalize         func(context.Context, string, string, string, int64, bool) (computerStorageCopyFacts, error)
 	computerDiskHook            func(computerDiskCheckpoint) error

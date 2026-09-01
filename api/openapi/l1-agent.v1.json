@@ -713,7 +713,7 @@
             "idempotency_key": { "type": "string", "minLength": 1 },
             "receipt": {
               "type": "object", "additionalProperties": false,
-              "required": ["kind", "receipt_id", "export_id", "backup_id", "copy_id", "computer_id", "storage_id", "storage_generation", "node_id", "root_instance_id", "operation_revision", "custody_fence", "helper_generation", "external_path", "allocated_size", "content_digest", "manifest_digest"],
+              "required": ["kind", "receipt_id", "export_id", "backup_id", "copy_id", "computer_id", "storage_id", "storage_generation", "node_id", "root_instance_id", "operation_revision", "custody_fence", "helper_generation", "external_path", "allocated_size", "content_digest", "manifest_digest", "external_owner_uid", "external_owner_gid", "ownership_applied", "private_mode_applied"],
               "properties": {
                 "kind": { "enum": ["computer_custody_export_verified", "computer_custody_export_failed"] }, "receipt_id": { "type": "string", "minLength": 1 },
                 "export_id": { "type": "string", "minLength": 1 }, "backup_id": { "type": "string", "minLength": 1 }, "copy_id": { "type": "string", "minLength": 1 },
@@ -723,7 +723,9 @@
                 "custody_fence": { "type": "string", "minLength": 1 }, "helper_generation": { "type": "integer", "minimum": 1 },
                 "external_path": { "type": "string", "minLength": 1 }, "allocated_size": { "type": "integer", "format": "int64", "minimum": 1 },
                 "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "manifest_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-                "failure_code": { "enum": ["insufficient_disk", "destination_not_empty", "managed_root_path", "cancelled"] }
+                "external_owner_uid": { "type": "integer", "minimum": 0 }, "external_owner_gid": { "type": "integer", "minimum": 0 },
+                "ownership_applied": { "type": "boolean" }, "private_mode_applied": { "type": "boolean" },
+                "failure_code": { "enum": ["insufficient_disk", "destination_not_empty", "managed_root_path", "destination_substituted", "ownership_failed", "cancelled"] }
               }
             }
           }

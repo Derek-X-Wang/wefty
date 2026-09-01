@@ -305,12 +305,15 @@ func validateCustodyExportReceipt(export ComputerCustodyExportDirective, receipt
 	}
 	switch receipt.Kind {
 	case "computer_custody_export_verified":
-		if receipt.FailureCode != "" || !backupDigestPattern.MatchString(receipt.ManifestDigest) {
+		if receipt.FailureCode != "" || !backupDigestPattern.MatchString(receipt.ManifestDigest) ||
+			!receipt.OwnershipApplied || !receipt.PrivateModeApplied {
 			return protocolError(contract.ErrorInvalidRequest, "successful Custody export receipt is incomplete")
 		}
 	case "computer_custody_export_failed":
-		if receipt.ManifestDigest != "" || (receipt.FailureCode != "insufficient_disk" &&
+		if receipt.ManifestDigest != "" || receipt.OwnershipApplied || receipt.PrivateModeApplied ||
+			receipt.ExternalOwnerUID != 0 || receipt.ExternalOwnerGID != 0 || (receipt.FailureCode != "insufficient_disk" &&
 			receipt.FailureCode != "destination_not_empty" && receipt.FailureCode != "managed_root_path" &&
+			receipt.FailureCode != "destination_substituted" && receipt.FailureCode != "ownership_failed" &&
 			receipt.FailureCode != "cancelled") {
 			return protocolError(contract.ErrorInvalidRequest, "failed Custody export receipt is incomplete")
 		}
@@ -373,7 +376,7 @@ func (s *Store) AcknowledgeComputerCustodyExport(ctx context.Context, identityNo
 	if status != "planned" {
 		return ComputerCustodyExport{}, protocolError(contract.ErrorConflict, "Custody export is no longer awaiting completion")
 	}
-	completedStatus := "exported"
+	completedStatus := "available"
 	if request.Receipt.Kind == "computer_custody_export_failed" {
 		completedStatus = "failed"
 	}

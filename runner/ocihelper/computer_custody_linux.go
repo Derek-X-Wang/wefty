@@ -16,9 +16,27 @@ import (
 	"syscall"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"golang.org/x/sys/unix"
 )
 
 type computerCustodyManifest = contract.ComputerCustodyManifest
+
+type custodyExternalOwner struct {
+	uid int
+	gid int
+}
+
+type custodyExportMechanicsError struct {
+	code string
+	err  error
+}
+
+func (err *custodyExportMechanicsError) Error() string { return err.err.Error() }
+func (err *custodyExportMechanicsError) Unwrap() error { return err.err }
+
+func custodyMechanicsError(code string, err error) error {
+	return &custodyExportMechanicsError{code: code, err: err}
+}
 
 func custodyManifestDigest(payload []byte) string {
 	digest := sha256.Sum256(payload)
@@ -38,51 +56,168 @@ func sameCustodyManifest(manifest computerCustodyManifest, request ExportCompute
 }
 
 func safeExternalCustodyRoot(runtimeRoot, externalPath string) (string, error) {
+	root, _, err := resolveSafeExternalCustodyRoot(runtimeRoot, externalPath)
+	return root, err
+}
+
+func resolveSafeExternalCustodyRoot(runtimeRoot, externalPath string) (string, string, error) {
 	if !filepath.IsAbs(externalPath) {
-		return "", errors.New("Custody path must be absolute")
+		return "", "", errors.New("Custody path must be absolute")
 	}
 	root := filepath.Clean(externalPath)
 	runtime, err := filepath.Abs(runtimeRoot)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	runtime, err = filepath.EvalSymlinks(runtime)
 	if err != nil {
-		return "", fmt.Errorf("resolve managed root: %w", err)
+		return "", "", fmt.Errorf("resolve managed root: %w", err)
 	}
 	ancestor := root
+	existingAncestor := ""
 	for {
 		if _, err := os.Lstat(ancestor); err == nil {
 			resolved, resolveErr := filepath.EvalSymlinks(ancestor)
 			if resolveErr != nil {
-				return "", resolveErr
+				return "", "", resolveErr
 			}
 			suffix, suffixErr := filepath.Rel(ancestor, root)
 			if suffixErr != nil {
-				return "", suffixErr
+				return "", "", suffixErr
 			}
 			root = filepath.Join(resolved, suffix)
+			existingAncestor = resolved
 			break
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return "", err
+			return "", "", err
 		}
 		parent := filepath.Dir(ancestor)
 		if parent == ancestor {
-			return "", errors.New("Custody path has no existing ancestor")
+			return "", "", errors.New("Custody path has no existing ancestor")
 		}
 		ancestor = parent
 	}
 	relative, err := filepath.Rel(runtime, root)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
-		return "", errors.New("Custody path must be outside the managed root")
+		return "", "", errors.New("Custody path must be outside the managed root")
 	}
-	return root, nil
+	return root, existingAncestor, nil
 }
 
-func writeCustodyManifest(root string, manifest computerCustodyManifest) ([]byte, error) {
+func readCustodyExternalOwner(root string) (custodyExternalOwner, error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		return custodyExternalOwner{}, err
+	}
+	if !info.IsDir() {
+		return custodyExternalOwner{}, errors.New("Custody path is not a directory")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return custodyExternalOwner{}, errors.New("Custody path ownership is unavailable")
+	}
+	return custodyExternalOwner{uid: int(stat.Uid), gid: int(stat.Gid)}, nil
+}
+
+func prepareCustodyExternalRoot(root, existingAncestor string, owner custodyExternalOwner, chown func(*os.File, int, int) error) error {
+	relative, err := filepath.Rel(existingAncestor, root)
+	if err != nil {
+		return err
+	}
+	ancestor, err := os.Open(existingAncestor)
+	if err != nil {
+		return err
+	}
+	defer ancestor.Close()
+	current := ancestor
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		if component == "" || component == "." {
+			continue
+		}
+		if err := unix.Mkdirat(int(current.Fd()), component, 0o700); err != nil && !errors.Is(err, syscall.EEXIST) {
+			return err
+		}
+		fd, err := unix.Openat(int(current.Fd()), component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return custodyMechanicsError("destination_substituted", fmt.Errorf("open created Custody directory: %w", err))
+		}
+		next := os.NewFile(uintptr(fd), filepath.Join(current.Name(), component))
+		if err := next.Chmod(0o700); err != nil {
+			_ = next.Close()
+			return custodyMechanicsError("ownership_failed", fmt.Errorf("protect Custody directory: %w", err))
+		}
+		if err := chown(next, owner.uid, owner.gid); err != nil {
+			_ = next.Close()
+			return custodyMechanicsError("ownership_failed", fmt.Errorf("assign Custody directory ownership: %w", err))
+		}
+		if current != ancestor {
+			_ = current.Close()
+		}
+		current = next
+	}
+	if current != ancestor {
+		return current.Close()
+	}
+	return nil
+}
+
+func openCustodyDestination(path string, owner custodyExternalOwner, chown func(*os.File, int, int) error) (*os.File, error) {
+	flags := unix.O_RDWR | unix.O_CREAT | unix.O_EXCL | unix.O_NOFOLLOW | unix.O_CLOEXEC
+	fd, err := unix.Open(path, flags, 0o600)
+	created := err == nil
+	if errors.Is(err, syscall.EEXIST) {
+		fd, err = unix.Open(path, unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	}
+	if err != nil {
+		code := "ownership_failed"
+		if errors.Is(err, syscall.ELOOP) {
+			code = "destination_substituted"
+		}
+		return nil, custodyMechanicsError(code, fmt.Errorf("open Custody destination without following links: %w", err))
+	}
+	file := os.NewFile(uintptr(fd), path)
+	closeOnError := func(err error) (*os.File, error) {
+		_ = file.Close()
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return closeOnError(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || (!created && (int(stat.Uid) != owner.uid || int(stat.Gid) != owner.gid)) {
+		return closeOnError(custodyMechanicsError("destination_substituted", errors.New("Custody destination is not the expected operator-owned regular inode")))
+	}
+	if err := file.Chmod(0o600); err != nil {
+		return closeOnError(custodyMechanicsError("ownership_failed", fmt.Errorf("protect Custody destination: %w", err)))
+	}
+	if err := chown(file, owner.uid, owner.gid); err != nil {
+		return closeOnError(custodyMechanicsError("ownership_failed", fmt.Errorf("assign Custody destination ownership: %w", err)))
+	}
+	if err := file.Truncate(0); err != nil {
+		return closeOnError(err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return closeOnError(err)
+	}
+	return file, nil
+}
+
+func digestCustodyFile(file *os.File) (string, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return "", err
+	}
+	return "sha256:" + hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func writeCustodyManifest(root string, owner custodyExternalOwner, chown func(*os.File, int, int) error, manifest computerCustodyManifest) ([]byte, error) {
 	payload, err := json.Marshal(manifest)
 	if err != nil {
 		return nil, err
@@ -96,6 +231,10 @@ func writeCustodyManifest(root string, manifest computerCustodyManifest) ([]byte
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
 		return nil, err
+	}
+	if err := chown(file, owner.uid, owner.gid); err != nil {
+		_ = file.Close()
+		return nil, custodyMechanicsError("ownership_failed", fmt.Errorf("assign Custody manifest ownership: %w", err))
 	}
 	writeErr := error(nil)
 	if _, writeErr = file.Write(payload); writeErr == nil {
@@ -153,11 +292,19 @@ func validateImportCustodySource(runtimeRoot string, request CopyComputerStorage
 		return "", errors.New("Custody import manifest conflicts with recorded export evidence")
 	}
 	disk := filepath.Join(root, manifest.DiskFile)
-	info, err := os.Stat(disk)
+	fd, err := unix.Open(disk, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return "", errors.New("Custody import disk size conflicts with its manifest")
+	}
+	diskFile := os.NewFile(uintptr(fd), disk)
+	defer diskFile.Close()
+	info, err := diskFile.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() != request.SourceSize {
 		return "", errors.New("Custody import disk size conflicts with its manifest")
 	}
-	digest, err := digestFile(disk)
+	// This re-verification is load-bearing: import trusts neither a path-derived
+	// owner nor prior export time once the portable bytes are operator-owned.
+	digest, err := digestCustodyFile(diskFile)
 	if err != nil || digest != request.SourceDigest {
 		return "", errors.New("Custody import disk digest conflicts with its manifest")
 	}
@@ -204,6 +351,10 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 		case errors.Is(returnedErr, syscall.ENOSPC):
 			code = "insufficient_disk"
 		}
+		var mechanics *custodyExportMechanicsError
+		if errors.As(returnedErr, &mechanics) {
+			code = mechanics.code
+		}
 		if code != "" {
 			response, returnedErr = custodyExportFailure(request, code)
 		}
@@ -214,7 +365,7 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 		request.SourceDigest == "" || request.Authority.HelperGeneration == 0 || request.JobSpecHash == "" {
 		return ExportComputerCustodyResponse{}, errors.New("Custody export request is incomplete")
 	}
-	externalRoot, err := safeExternalCustodyRoot(engine.config.RuntimeRoot, request.ExternalPath)
+	externalRoot, existingAncestor, err := resolveSafeExternalCustodyRoot(engine.config.RuntimeRoot, request.ExternalPath)
 	if err != nil {
 		if strings.Contains(err.Error(), "outside the managed root") {
 			return custodyExportFailure(request, "managed_root_path")
@@ -244,10 +395,21 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 			return ExportComputerCustodyResponse{}, err
 		}
 	}
-	if err := os.MkdirAll(externalRoot, 0o700); err != nil {
-		if errors.Is(err, syscall.ENOSPC) {
-			return custodyExportFailure(request, "insufficient_disk")
-		}
+	chown := func(file *os.File, uid, gid int) error { return file.Chown(uid, gid) }
+	if engine.computerCustodyChown != nil {
+		chown = engine.computerCustodyChown
+	}
+	readOwner := readCustodyExternalOwner
+	if engine.computerCustodyOwner != nil {
+		readOwner = engine.computerCustodyOwner
+	}
+	// Ownership is deliberately inherited from the nearest existing ancestor,
+	// before any root-created path components can obscure the operator identity.
+	externalOwner, err := readOwner(existingAncestor)
+	if err != nil {
+		return ExportComputerCustodyResponse{}, err
+	}
+	if err := prepareCustodyExternalRoot(externalRoot, existingAncestor, externalOwner, chown); err != nil {
 		return ExportComputerCustodyResponse{}, err
 	}
 	manifest, _, exists, err := readCustodyManifest(externalRoot)
@@ -272,7 +434,7 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 			RootInstanceID: request.Authority.RootInstanceID, OperationRevision: request.Authority.OperationRevision,
 			CustodyFence: request.Authority.CustodyFence, JobSpec: request.JobSpec, JobSpecHash: request.JobSpecHash,
 			DiskFile: "storage.ext4", Phase: "writing"}
-		if _, err := writeCustodyManifest(externalRoot, manifest); err != nil {
+		if _, err := writeCustodyManifest(externalRoot, externalOwner, chown, manifest); err != nil {
 			return ExportComputerCustodyResponse{}, err
 		}
 		if engine.computerCustodyHook != nil {
@@ -282,7 +444,7 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 		}
 	}
 	destinationPath := filepath.Join(externalRoot, manifest.DiskFile)
-	destination, err := os.OpenFile(destinationPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	destination, err := openCustodyDestination(destinationPath, externalOwner, chown)
 	if err != nil {
 		return ExportComputerCustodyResponse{}, err
 	}
@@ -299,8 +461,9 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 	if copyErr == nil {
 		copyErr = destination.Sync()
 	}
-	copyErr = errors.Join(copyErr, sourceFile.Close(), destination.Close())
+	copyErr = errors.Join(copyErr, sourceFile.Close())
 	if copyErr != nil {
+		_ = destination.Close()
 		if errors.Is(copyErr, context.Canceled) || errors.Is(copyErr, context.DeadlineExceeded) {
 			return custodyExportFailure(request, "cancelled")
 		}
@@ -311,17 +474,25 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 	}
 	if engine.computerCustodyHook != nil {
 		if err := engine.computerCustodyHook("copy"); err != nil {
+			_ = destination.Close()
 			return ExportComputerCustodyResponse{}, err
 		}
 	}
 	if written != request.SourceSize {
+		_ = destination.Close()
 		return ExportComputerCustodyResponse{}, fmt.Errorf("Custody export wrote %d bytes, want %d", written, request.SourceSize)
 	}
-	if digest, err := digestFile(destinationPath); err != nil || digest != request.SourceDigest {
+	// The post-copy digest is load-bearing evidence and is read back through
+	// the same O_NOFOLLOW-opened inode that was truncated and written.
+	if digest, err := digestCustodyFile(destination); err != nil || digest != request.SourceDigest {
+		_ = destination.Close()
 		return ExportComputerCustodyResponse{}, errors.New("Custody export destination digest mismatch")
 	}
+	if err := destination.Close(); err != nil {
+		return ExportComputerCustodyResponse{}, err
+	}
 	manifest.Phase = "complete"
-	payload, err := writeCustodyManifest(externalRoot, manifest)
+	payload, err := writeCustodyManifest(externalRoot, externalOwner, chown, manifest)
 	if err != nil {
 		return ExportComputerCustodyResponse{}, err
 	}
@@ -336,6 +507,7 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 		RootInstanceID: request.Authority.RootInstanceID, OperationRevision: request.Authority.OperationRevision,
 		CustodyFence: request.Authority.CustodyFence, HelperGeneration: request.Authority.HelperGeneration,
 		ExternalPath: request.ExternalPath, AllocatedSize: request.SourceSize, ContentDigest: request.SourceDigest,
-		ManifestDigest: custodyManifestDigest(payload)}
+		ManifestDigest: custodyManifestDigest(payload), ExternalOwnerUID: uint32(externalOwner.uid),
+		ExternalOwnerGID: uint32(externalOwner.gid), OwnershipApplied: true, PrivateModeApplied: true}
 	return ExportComputerCustodyResponse{Receipt: receipt}, nil
 }

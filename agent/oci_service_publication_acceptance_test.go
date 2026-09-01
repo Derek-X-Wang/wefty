@@ -198,12 +198,13 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	var serviceRecoveryElapsed, staleEvidenceElapsed time.Duration
 	var staleEvidenceLate bool
 	var staleEvidenceArm string
+	var staleOutboxState, staleOutboxReason string
 	var removalManifestComplete, removalPending, removalEveryAttempt bool
 	var removalServiceDataVolume, removalServiceDataOwnerRecord bool
 	var removalCompleted, removalPriorBootSweep, removalPostDeleteAttestation, removalDeleteAttestInjection bool
 	defer func() {
 		if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_arm=%s\nservice_stale_evidence_elapsed=%s\nservice_residue_verified_absent=%t\nservice_retained_binding_verified=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceFreshAttemptReadmission, serviceRecoveryElapsed, staleEvidenceLate, staleEvidenceArm, staleEvidenceElapsed, serviceResidueVerifiedAbsent, serviceRetainedBindingVerified, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
+			payload := fmt.Sprintf("fresh_restart=%t\nstop_start=%t\nslot_saturation=%t\nretained_binding_digest=%t\nservice_fresh_attempt_readmission=%t\nservice_recovery_elapsed=%s\nservice_stale_evidence_late=%t\nservice_stale_evidence_arm=%s\nservice_stale_evidence_elapsed=%s\nservice_stale_outbox_state=%s\nservice_stale_outbox_reason=%s\nservice_residue_verified_absent=%t\nservice_retained_binding_verified=%t\nremoval_manifest_complete=%t\nremoval_pending=%t\nremoval_every_attempt=%t\nremoval_service_data_volume=%t\nremoval_service_data_owner_record=%t\nremoval_post_delete_attestation=%t\nremoval_delete_attest_crash_injected=%t\nremoval_delete_attest_restart=NOT-RUN_hosted_lane\nremoval_completed=%t\nremoval_prior_boot_oci_sweep=%t\n", freshRestart, stopStart, saturation, retainedBinding, serviceFreshAttemptReadmission, serviceRecoveryElapsed, staleEvidenceLate, staleEvidenceArm, staleEvidenceElapsed, staleOutboxState, staleOutboxReason, serviceResidueVerifiedAbsent, serviceRetainedBindingVerified, removalManifestComplete, removalPending, removalEveryAttempt, removalServiceDataVolume, removalServiceDataOwnerRecord, removalPostDeleteAttestation, removalDeleteAttestInjection, removalCompleted, removalPriorBootSweep)
 			if err := os.WriteFile(filepath.Join(evidenceDirectory, "oci-service-l1-agent-linux.txt"), []byte(payload), 0o600); err != nil {
 				t.Errorf("write OCI L1/agent evidence: %v", err)
 			}
@@ -381,8 +382,12 @@ while :; do sleep 1; done
 	stale, staleEvidenceElapsed, staleEvidenceLate, staleEvidenceArm, staleEvidenceObserved := waitNativeRuntimeLossEvidence(
 		t, store, primary.JobID, firstAttempt, recoveryStarted, l1.DefaultLeaseDuration,
 	)
+	staleOutbox := nodeAgent.logSpool.inspectCompletion(t.Context(), firstAttempt)
+	staleOutboxState = staleOutbox.State
+	staleOutboxReason = staleOutbox.Reason
 	if !staleEvidenceObserved {
-		t.Fatalf("attempt %s did not retain typed runtime-loss evidence within production lease %s: %+v", firstAttempt, l1.DefaultLeaseDuration, stale)
+		t.Fatalf("attempt %s did not retain typed runtime-loss evidence within production lease %s: l1=%+v outbox=%+v agent_status=%+v capability=%+v old_generation=%+v new_generation=%+v sweep=%+v",
+			firstAttempt, l1.DefaultLeaseDuration, stale, staleOutbox, nodeAgent.Status(), nodeAgent.CapabilitySnapshot(), oldGeneration, newGeneration, sweepReceipt)
 	}
 	serviceFreshAttemptReadmission = ready && newGeneration != oldGeneration &&
 		readmitted.CurrentAttemptID != firstAttempt && newAuthority.FencingToken != firstAuthority.FencingToken &&

@@ -667,7 +667,7 @@ CREATE TABLE IF NOT EXISTS computer_custody_exports (
   source_spec_hash TEXT NOT NULL,
   idempotency_key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('planned', 'exported', 'failed', 'superseded')),
+  status TEXT NOT NULL CHECK(status IN ('planned', 'available', 'failed', 'superseded')),
 	failure_code TEXT NOT NULL DEFAULT '',
   manifest_digest TEXT NOT NULL DEFAULT '',
   receipt_json BLOB,
@@ -1080,6 +1080,32 @@ func copySQLiteTableColumns(ctx context.Context, tx *sql.Tx, sourceTable, target
 	return err
 }
 
+func copySQLiteTableColumnsReplacingText(ctx context.Context, tx *sql.Tx, sourceTable, targetTable, column, oldValue, newValue string) error {
+	columns, err := sqliteTableColumns(ctx, tx, sourceTable)
+	if err != nil {
+		return err
+	}
+	if len(columns) == 0 {
+		return fmt.Errorf("SQLite table %s has no columns", sourceTable)
+	}
+	quoted := make([]string, len(columns))
+	selected := make([]string, len(columns))
+	found := false
+	for index, name := range columns {
+		quoted[index] = quoteSQLiteIdentifier(name)
+		selected[index] = quoted[index]
+		if name == column {
+			selected[index] = "CASE " + quoted[index] + " WHEN ? THEN ? ELSE " + quoted[index] + " END"
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("SQLite table %s has no column %s", sourceTable, column)
+	}
+	_, err = tx.ExecContext(ctx, "INSERT INTO "+quoteSQLiteIdentifier(targetTable)+" ("+strings.Join(quoted, ", ")+") SELECT "+strings.Join(selected, ", ")+" FROM "+quoteSQLiteIdentifier(sourceTable), oldValue, newValue)
+	return err
+}
+
 // migrateComputerResetConstraints widens the two CHECK constraints introduced
 // before Storage reset existed. CREATE TABLE IF NOT EXISTS cannot change those
 // constraints in an already durable L1 database.
@@ -1291,10 +1317,26 @@ func (s *Store) migrateCustodyExportConstraints(ctx context.Context) error {
 	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_custody_exports'`).Scan(&sourceSQL); err != nil {
 		return fmt.Errorf("l1: inspect Custody export schema: %w", err)
 	}
-	if strings.Contains(sourceSQL, "'failed'") && !strings.Contains(sourceSQL, "external_path TEXT NOT NULL UNIQUE") {
+	const availableConstraint = "status IN ('planned', 'available', 'failed', 'superseded')"
+	const exportedConstraint = "status IN ('planned', 'exported', 'failed', 'superseded')"
+	const legacyConstraint = "status IN ('planned', 'exported', 'superseded')"
+	externalPathUnique := strings.Contains(sourceSQL, "external_path TEXT NOT NULL UNIQUE")
+	if strings.Contains(sourceSQL, availableConstraint) && !externalPathUnique {
 		_, err := connection.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS custody_export_event_path
 			ON computer_custody_exports(external_path, export_id)`)
 		return err
+	}
+	replacements := make(map[string]string, 2)
+	switch {
+	case strings.Contains(sourceSQL, exportedConstraint):
+		replacements[exportedConstraint] = availableConstraint
+	case strings.Contains(sourceSQL, legacyConstraint):
+		replacements[legacyConstraint] = availableConstraint
+	case !strings.Contains(sourceSQL, availableConstraint):
+		return fmt.Errorf("l1: rewrite Custody export schema: unrecognized status constraint")
+	}
+	if externalPathUnique {
+		replacements["external_path TEXT NOT NULL UNIQUE"] = "external_path TEXT NOT NULL"
 	}
 	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 		return err
@@ -1305,21 +1347,18 @@ func (s *Store) migrateCustodyExportConstraints(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
-	createSQL, err := migratedSQLiteCreateTable(sourceSQL, "computer_custody_exports_failure_migration", map[string]string{
-		"status IN ('planned', 'exported', 'superseded')": "status IN ('planned', 'exported', 'failed', 'superseded')",
-		"external_path TEXT NOT NULL UNIQUE":              "external_path TEXT NOT NULL",
-	})
+	createSQL, err := migratedSQLiteCreateTable(sourceSQL, "computer_custody_exports_availability_migration", replacements)
 	if err != nil {
 		return fmt.Errorf("l1: rewrite Custody export schema: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, createSQL); err != nil {
 		return fmt.Errorf("l1: create widened Custody export schema: %w", err)
 	}
-	if err := copySQLiteTableColumns(ctx, tx, "computer_custody_exports", "computer_custody_exports_failure_migration"); err != nil {
+	if err := copySQLiteTableColumnsReplacingText(ctx, tx, "computer_custody_exports", "computer_custody_exports_availability_migration", "status", "exported", "available"); err != nil {
 		return fmt.Errorf("l1: copy Custody exports during migration: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE computer_custody_exports;
-		ALTER TABLE computer_custody_exports_failure_migration RENAME TO computer_custody_exports;
+		ALTER TABLE computer_custody_exports_availability_migration RENAME TO computer_custody_exports;
 		CREATE INDEX custody_exports_storage ON computer_custody_exports(source_storage_id, source_generation);
 		CREATE UNIQUE INDEX custody_export_event_path ON computer_custody_exports(external_path, export_id)`); err != nil {
 		return fmt.Errorf("l1: publish widened Custody export schema: %w", err)

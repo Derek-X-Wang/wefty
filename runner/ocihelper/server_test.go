@@ -548,14 +548,7 @@ func TestComputerAttachmentConflictWithoutPositiveReapIsNotDefinitive(t *testing
 	engine := newFakeEngine()
 	engine.runErr = fmt.Errorf("attach Computer disk: %w", errComputerStorageAttachmentOwned)
 	engine.attemptReapErr = errors.New("attempt cleanup failed")
-	client, stop := startTestServer(t, engine, ServerConfig{})
-	defer stop()
-	session, err := client.OpenSession(t.Context(), testSessionRequest())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-	requireSweep(t, session)
+	session, responseRead, serverDone := startAcknowledgedOperationSession(t, engine)
 	request := testRunRequest(testAuthority(), time.Second)
 	request.Authority.Class = contract.JobClassService
 	request.Workload.Computer = true
@@ -567,7 +560,11 @@ func TestComputerAttachmentConflictWithoutPositiveReapIsNotDefinitive(t *testing
 		},
 	}}
 	request.AllocateEndpoints = []string{contract.ComputerDisplayEndpointView, contract.ComputerDisplayEndpointControl}
-	_, err = session.Run(t.Context(), request)
+	_, err := session.Run(t.Context(), request)
+	close(responseRead)
+	if serveErr := <-serverDone; serveErr != nil {
+		t.Fatal(serveErr)
+	}
 	var refusal *RPCError
 	if !errors.As(err, &refusal) || refusal.Code != CodeSessionStale {
 		t.Fatalf("Computer attachment conflict without positive reap = %+v err=%v, want runtime-loss refusal", refusal, err)
@@ -2518,6 +2515,70 @@ func startTestServer(t *testing.T, engine Engine, config ServerConfig) (*Client,
 	client := NewUnixClient(path, "checksum-test")
 	client.disableHeartbeatPump = true
 	return client, stop
+}
+
+// startAcknowledgedOperationSession drives one operation over a pipe whose
+// server close waits until the client has consumed the complete response frame.
+// This keeps session invalidation from racing the typed refusal under test.
+func startAcknowledgedOperationSession(t *testing.T, engine Engine) (*Session, chan<- struct{}, <-chan error) {
+	t.Helper()
+	server, err := NewServer(engine, ServerConfig{AllowedUIDs: []uint32{uint32(os.Getuid())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.serveCtx = context.Background()
+	helperControl, agentControl := net.Pipe()
+	t.Cleanup(func() {
+		_ = helperControl.Close()
+		_ = agentControl.Close()
+	})
+	serverSession := &serverSession{
+		server: server, identity: SessionIdentity{NodeID: "node-1", BootSessionID: "boot-1"},
+		helper:     HelperSession{HelperInstanceID: "helper-test", SessionGeneration: 1},
+		capability: "capability-test", control: helperControl,
+		heartbeatChanged: make(chan struct{}, 1), done: make(chan struct{}),
+		attempts: make(map[string]*serverAttempt), operations: make(map[*sessionOperation]struct{}),
+		sweepVerified: true,
+	}
+	server.active = serverSession
+	serverDone := make(chan error, 1)
+	responseRead := make(chan struct{})
+	client := &Client{Version: ProtocolVersion, ExpectedChecksum: "checksum-test"}
+	client.Dial = func(ctx context.Context) (net.Conn, error) {
+		agentConnection, rawHelperConnection := net.Pipe()
+		helper := &closeAfterResponseAcknowledgedConn{Conn: rawHelperConnection, acknowledged: responseRead}
+		go func() {
+			wire := newFramedConn(helper)
+			var request frame
+			if err := wire.read(&request); err != nil {
+				serverDone <- err
+				return
+			}
+			operation, rpcErr := serverSession.beginOperation(ctx, helper)
+			if rpcErr != nil {
+				serverDone <- writeRPCError(wire, rpcErr)
+				return
+			}
+			defer operation.finish()
+			server.dispatch(operation, wire, request)
+			serverDone <- nil
+		}()
+		return agentConnection, nil
+	}
+	return &Session{client: client, capability: serverSession.capability, control: agentControl}, responseRead, serverDone
+}
+
+type closeAfterResponseAcknowledgedConn struct {
+	net.Conn
+	acknowledged chan struct{}
+	once         sync.Once
+	err          error
+}
+
+func (connection *closeAfterResponseAcknowledgedConn) Close() error {
+	<-connection.acknowledged
+	connection.once.Do(func() { connection.err = connection.Conn.Close() })
+	return connection.err
 }
 
 func assertRPCCode(t *testing.T, err error, code ErrorCode) {
