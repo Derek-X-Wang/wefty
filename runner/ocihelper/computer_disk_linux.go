@@ -646,6 +646,9 @@ func initializeComputerDiskRoot(attachment *computerDiskAttachment, uid, gid uin
 	if !ok || stat.Uid != uid || stat.Gid != gid {
 		return errors.New("Computer disk root ownership does not match image process owner")
 	}
+	if err := ensureComputerStorageIdentity(attachment.mountPath); err != nil {
+		return fmt.Errorf("initialize Computer disk persistent OS identity: %w", err)
+	}
 	return nil
 }
 

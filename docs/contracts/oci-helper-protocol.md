@@ -661,6 +661,14 @@ ownership mismatch, and with `chown` they recursively migrate every tenant
 entry. Reset freshness survives the pending-attach and mount boundaries and is
 cleared only by the same durable manifest write that publishes `Attached`, so
 a failed or crashed first attach cannot silently consume the one-time fact.
+As part of attachment, the helper initializes a storage-local machine ID and
+Ed25519 SSH host identity exactly once; admission completes only after root
+ownership and that identity are verified. The helper bind-mounts those paths
+read-only into the attempt root. Backup and restore preserve those bytes;
+clone and import replace both identities while the copied filesystem is
+detached. The identity paths remain part of the tenant disk image, so the
+helper's positive rekey receipt describes bytes the destination attempt
+actually consumes rather than immutable image-layer lookalikes.
 
 `ResetComputerStorage` accepts only the authenticated current helper session
 plus exact Node, managed-root instance, consumer Job, named prior Job,

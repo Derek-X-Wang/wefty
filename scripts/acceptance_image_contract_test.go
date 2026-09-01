@@ -383,7 +383,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileMatches(t, "../examples/computer/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG DEBIAN_IMAGE=.*@sha256:[0-9a-f]{64}$`)
 	assertFileMatches(t, "../examples/computer-wayland/Dockerfile", `(?m)^# syntax=.*@sha256:[0-9a-f]{64}$`, `(?m)^ARG DEBIAN_IMAGE=.*@sha256:[0-9a-f]{64}$`)
 	assertFileContains(t, "../examples/computer/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "ARG SOURCE_DATE_EPOCH=0", "chromium=", "/var/log/dpkg.log", "/var/log/alternatives.log", "/var/log/apt/*")
-	assertFileContains(t, "../examples/computer/entrypoint.sh", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "/wefty/service")
+	assertFileContains(t, "../examples/computer/entrypoint.sh", "WEFTY_COMPUTER_VIEW_PORT", "WEFTY_COMPUTER_CONTROL_PORT", "/wefty/service", "DISPLAY=:$view_port", "export DISPLAY")
+	assertFileContains(t, "../examples/computer/fixtures/entrypoint.sh", "DISPLAY=:$view_port", "export DISPLAY")
 	for _, path := range []string{"../examples/computer/entrypoint.sh", "../examples/computer/fixtures/entrypoint.sh", "../examples/computer-wayland/entrypoint.sh", "../examples/computer-wayland/entrypoint-fixture.sh"} {
 		assertFileContains(t, path, "wait || true\n  chmod -R u+rwX,go+rwX /wefty/service")
 	}

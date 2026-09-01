@@ -220,6 +220,11 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 	writable := map[string]string{"/wefty/service": "", "/dev/shm": "size=1048576k", "/tmp": "size=524288k", "/var/tmp": "size=65536k"}
 	bounded := map[string]bool{}
 	controlReadOnly := false
+	identityMounts := map[string]string{
+		"/etc/machine-id": "/run/wefty/fixtures/computer-disk/etc/machine-id",
+		"/etc/ssh":        "/run/wefty/fixtures/computer-disk/etc/ssh",
+	}
+	identityReadOnly := map[string]bool{}
 	for _, mount := range spec.Mounts {
 		if mount.Destination == contract.OCIContainerControlDirectory {
 			controlReadOnly = mount.Source == input.ComputerControlSource && slices.Contains(mount.Options, "rro") &&
@@ -228,6 +233,10 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 		if size, expected := writable[mount.Destination]; expected {
 			bounded[mount.Destination] = mount.Destination == "/wefty/service" ||
 				(mount.Type == "tmpfs" && slices.Contains(mount.Options, size))
+		}
+		if source, expected := identityMounts[mount.Destination]; expected {
+			identityReadOnly[mount.Destination] = mount.Source == source && slices.Contains(mount.Options, "rro") &&
+				slices.Contains(mount.Options, "nosuid") && slices.Contains(mount.Options, "nodev") && slices.Contains(mount.Options, "noexec")
 		}
 		if mount.Destination == "/dev/shm" && (mount.Source != "shm" ||
 			!slices.Contains(mount.Options, "mode=1777") || !slices.Contains(mount.Options, "nosuid") ||
@@ -241,6 +250,11 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 	for path := range writable {
 		if !bounded[path] {
 			t.Fatalf("Computer writable path %s is absent or unbounded: %+v", path, spec.Mounts)
+		}
+	}
+	for path := range identityMounts {
+		if !identityReadOnly[path] {
+			t.Fatalf("Computer persistent identity mount %s is absent or writable: %+v", path, spec.Mounts)
 		}
 	}
 	if spec.Process == nil || spec.Process.User.UID != 1001 || spec.Process.User.GID != 1002 ||
@@ -680,6 +694,44 @@ func TestRuntimeSpecValidationUsesGuestTranslatedAndManagedRoots(t *testing.T) {
 	input.ManagedVolumeSources[ManagedVolumeHandoff] = translatedSource
 	if err := validateRuntimeSpecInput(input, validateMountSource); err == nil {
 		t.Fatal("managed volume source outside the helper-managed root was accepted")
+	}
+}
+
+func TestComputerIdentityMountSourcesCrossValidationBoundary(t *testing.T) {
+	input := goldenRuntimeSpecInput(t, "amd64")
+	for _, fixture := range runtimeSpecGoldenCases() {
+		if fixture.computer {
+			fixture.configure(&input)
+			break
+		}
+	}
+	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.4", "seccomp-linux-amd64.json"))
+	machineID := filepath.Join(input.ManagedVolumeSources[ManagedVolumeComputerDisk], computerStorageEtcDirectory, computerStorageMachineID)
+	sshIdentity := filepath.Join(input.ManagedVolumeSources[ManagedVolumeComputerDisk], computerStorageEtcDirectory, computerStorageSSHDirectory)
+	seen := map[string]bool{}
+	dependencies.validateSource = func(path string, _ []string, regularOnly bool) error {
+		if path == machineID {
+			seen[path] = regularOnly
+		}
+		if path == sshIdentity {
+			seen[path] = !regularOnly
+		}
+		return nil
+	}
+	if _, err := buildRuntimeSpec(context.Background(), input, dependencies); err != nil {
+		t.Fatal(err)
+	}
+	if !seen[machineID] || !seen[sshIdentity] {
+		t.Fatalf("Computer identity validation = %#v", seen)
+	}
+	dependencies.validateSource = func(path string, _ []string, _ bool) error {
+		if path == machineID {
+			return errors.New("identity source rejected")
+		}
+		return nil
+	}
+	if _, err := buildRuntimeSpec(context.Background(), input, dependencies); err == nil || !strings.Contains(err.Error(), "Computer machine-id source is not permitted") {
+		t.Fatalf("unretained Computer identity source error = %v", err)
 	}
 }
 

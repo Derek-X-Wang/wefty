@@ -3,6 +3,7 @@
 package ocihelper
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -290,6 +291,35 @@ func TestComputerDiskRootOwnershipInitializesOnlyFreshFormat(t *testing.T) {
 	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
 	if err := initializeComputerDiskRoot(&computerDiskAttachment{mountPath: mountPath, fresh: true}, uid, gid, false); err != nil {
 		t.Fatal(err)
+	}
+	machineIDPath := filepath.Join(mountPath, computerStorageEtcDirectory, computerStorageMachineID)
+	privateKeyPath := filepath.Join(mountPath, computerStorageEtcDirectory, computerStorageSSHDirectory, computerStorageSSHPrivate)
+	publicKeyPath := filepath.Join(mountPath, computerStorageEtcDirectory, computerStorageSSHDirectory, computerStorageSSHPublic)
+	machineID, err := readRegularFile(machineIDPath)
+	if err != nil || !validComputerMachineID(machineID) {
+		t.Fatalf("fresh Computer machine-id = %q err=%v", machineID, err)
+	}
+	privateKey, err := readRegularFile(privateKeyPath)
+	if err != nil || !strings.Contains(string(privateKey), "BEGIN OPENSSH PRIVATE KEY") {
+		t.Fatalf("fresh Computer SSH host key is absent or invalid: %v", err)
+	}
+	if err := os.Remove(publicKeyPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializeComputerDiskRoot(&computerDiskAttachment{mountPath: mountPath, fresh: false}, uid, gid, false); err != nil {
+		t.Fatal(err)
+	}
+	preservedMachineID, err := readRegularFile(machineIDPath)
+	if err != nil || string(preservedMachineID) != string(machineID) {
+		t.Fatalf("existing Computer machine-id changed: %q err=%v", preservedMachineID, err)
+	}
+	preservedPrivateKey, err := readRegularFile(privateKeyPath)
+	if err != nil || !bytes.Equal(preservedPrivateKey, privateKey) {
+		t.Fatalf("incomplete Computer SSH identity rotated its committed private key: %v", err)
+	}
+	recoveredPublicKey, err := readRegularFile(publicKeyPath)
+	if err != nil || len(recoveredPublicKey) == 0 {
+		t.Fatalf("incomplete Computer SSH identity did not recover its public key: %v", err)
 	}
 	wrongUID := uid + 1
 	if err := initializeComputerDiskRoot(&computerDiskAttachment{mountPath: mountPath, fresh: false}, wrongUID, gid, false); err == nil {

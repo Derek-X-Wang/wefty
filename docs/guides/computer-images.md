@@ -235,9 +235,13 @@ Both reference images demonstrate the minimum contract shape:
 - `/home/wefty` is an image-owned symlink into `/wefty/service`; profile and
   sign-in state persist there. Attempt-local rootfs and tmpfs writes do not.
 
-The first image runs Xvfb/XFCE and Chromium with CPU rendering. Chromium is launched
-with `--no-sandbox`; that is a disclosed limitation of this example, not an
-expansion of the OCI security profile. Wefty adds no GPU, device, capability,
+The first image runs Xvfb/XFCE and Chromium with CPU rendering. Its X display
+number is derived from the helper-reserved view port because Computers share
+the Node network namespace and Linux abstract X sockets are network-scoped;
+two live reference Computers therefore never contend for a fixed `:99`.
+Chromium is launched with `--no-sandbox`; that is a disclosed limitation of
+this example, not an expansion of the OCI security profile. Wefty adds no GPU,
+device, capability,
 ptrace, privilege, browser-sandbox exception, font, locale, or D-Bus policy.
 The helper retains the ordinary `wefty-v1` walls and supplies the private 1 GiB
 `/dev/shm` defined by the Computer image contract.

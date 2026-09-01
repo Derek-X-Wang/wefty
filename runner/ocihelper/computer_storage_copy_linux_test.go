@@ -5,12 +5,15 @@ package ocihelper
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 )
 
 func publishedStorageCopySource(t *testing.T) (string, *fakeComputerDiskSystem, CreateComputerBackupResponse) {
@@ -61,6 +64,26 @@ func TestRealCloneIdentityRekeyRegeneratesHostKeysAndPreservesBrowserProfile(t *
 	newHostKey, err := os.ReadFile(filepath.Join(etcSSH, "ssh_host_ed25519_key"))
 	if err != nil || bytes.Equal(newHostKey, oldHostKey) {
 		t.Fatalf("observed regenerated host key err=%v", err)
+	}
+	newHostPublic, err := os.ReadFile(filepath.Join(etcSSH, "ssh_host_ed25519_key.pub"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedPrivate, err := ssh.ParseRawPrivateKey(newHostKey)
+	if err != nil {
+		t.Fatalf("regenerated private host key is invalid: %v", err)
+	}
+	signer, ok := parsedPrivate.(crypto.Signer)
+	if !ok {
+		t.Fatalf("regenerated private host key type = %T, want crypto.Signer", parsedPrivate)
+	}
+	derivedPublic, err := ssh.NewPublicKey(signer.Public())
+	if err != nil {
+		t.Fatalf("derive regenerated public host key: %v", err)
+	}
+	parsedPublic, _, _, _, err := ssh.ParseAuthorizedKey(newHostPublic)
+	if err != nil || !bytes.Equal(parsedPublic.Marshal(), derivedPublic.Marshal()) {
+		t.Fatalf("regenerated public host key does not match private key: %v", err)
 	}
 	marker, err := os.ReadFile(markerPath)
 	if err != nil || !bytes.Equal(marker, browserSecret) {

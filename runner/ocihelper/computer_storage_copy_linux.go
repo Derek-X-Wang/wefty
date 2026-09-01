@@ -4,7 +4,6 @@ package ocihelper
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -189,13 +188,16 @@ func ensureRealDirectory(path string) error {
 
 func readRegularFile(path string) ([]byte, error) {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("identity evidence is not a regular file")
 	}
 	return os.ReadFile(path)
 }
 
-func rekeyCloneIdentity(ctx context.Context, mountPath string) (bool, error) {
+func rekeyCloneIdentity(_ context.Context, mountPath string) (bool, error) {
 	etc := filepath.Join(mountPath, "etc")
 	if err := ensureRealDirectory(etc); err != nil {
 		return false, err
@@ -210,11 +212,11 @@ func rekeyCloneIdentity(ctx context.Context, mountPath string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	identity := make([]byte, 16)
-	if _, err := rand.Read(identity); err != nil {
+	identity, err := newComputerMachineID()
+	if err != nil {
 		return false, err
 	}
-	if err := os.WriteFile(machineIDPath, []byte(hex.EncodeToString(identity)+"\n"), 0o444); err != nil {
+	if err := writeIdentityFile(etc, computerStorageMachineID, identity, 0o444); err != nil {
 		return false, err
 	}
 	oldKeys := map[string]string{}
@@ -247,11 +249,7 @@ func rekeyCloneIdentity(ctx context.Context, mountPath string) (bool, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
-	sshKeygen, err := findRootTool("ssh-keygen")
-	if err != nil {
-		return false, err
-	}
-	if _, err := runFilesystemTool(ctx, sshKeygen, "-A", "-f", mountPath); err != nil {
+	if err := writeFreshComputerSSHHostKey(ssh); err != nil {
 		return false, err
 	}
 	newMachineID, err := readRegularFile(machineIDPath)
