@@ -10,6 +10,8 @@ import (
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
+const computerReimagePreflightRetryLimit = 3
+
 type reimagePreflightController struct {
 	client         *Client
 	preflighter    workloadrunner.ComputerReimagePreflighter
@@ -19,6 +21,7 @@ type reimagePreflightController struct {
 	logf           func(string, ...any)
 	mu             sync.Mutex
 	inflight       map[string]struct{}
+	retryCounts    map[string]int
 	wg             sync.WaitGroup
 }
 
@@ -30,7 +33,32 @@ func newReimagePreflightController(client *Client, preflighter workloadrunner.Co
 	}
 	return &reimagePreflightController{client: client, preflighter: preflighter, nodeID: nodeID,
 		bootSessionID: bootSessionID, rootInstanceID: rootInstanceID, logf: logf,
-		inflight: make(map[string]struct{})}
+		inflight: make(map[string]struct{}), retryCounts: make(map[string]int)}
+}
+
+func (controller *reimagePreflightController) deferTransientFailure(
+	directive l1.ComputerReimagePreflightDirective,
+	receipt l1.ComputerReimagePreflightReceipt,
+) bool {
+	key := fmt.Sprintf("%s\x00%d", directive.ComputerID, directive.OperationRevision)
+	retryable := receipt.Kind == "computer_reimage_preflight_failed_unchanged" &&
+		(receipt.FailureReason == "detachment_required" ||
+			(receipt.FailureStage == "generation_lock" && receipt.FailureReason == "deadline_exceeded"))
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.retryCounts == nil {
+		controller.retryCounts = make(map[string]int)
+	}
+	if !retryable {
+		delete(controller.retryCounts, key)
+		return false
+	}
+	controller.retryCounts[key]++
+	if controller.retryCounts[key] < computerReimagePreflightRetryLimit {
+		return true
+	}
+	delete(controller.retryCounts, key)
+	return false
 }
 
 func (controller *reimagePreflightController) process(ctx context.Context, directive l1.ComputerReimagePreflightDirective) error {
@@ -46,6 +74,15 @@ func (controller *reimagePreflightController) process(ctx context.Context, direc
 	if controller.logf != nil {
 		controller.logf("agent: Computer reimage preflight %q completed stage=%q kind=%q in %s",
 			directive.ComputerID, receipt.FailureStage, receipt.Kind, time.Since(started))
+	}
+	if controller.deferTransientFailure(directive, l1.ComputerReimagePreflightReceipt{
+		Kind: receipt.Kind, FailureStage: receipt.FailureStage, FailureReason: receipt.FailureReason,
+	}) {
+		if controller.logf != nil {
+			controller.logf("agent: Computer reimage preflight %q deferred retryable stage=%q reason=%q until next poll",
+				directive.ComputerID, receipt.FailureStage, receipt.FailureReason)
+		}
+		return nil
 	}
 	l1Receipt := l1.ComputerReimagePreflightReceipt{Kind: receipt.Kind, ReceiptID: receipt.ReceiptID,
 		ComputerID: receipt.ComputerID, StorageID: receipt.StorageID, StorageGeneration: receipt.StorageGeneration,

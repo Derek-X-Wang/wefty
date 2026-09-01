@@ -155,13 +155,7 @@ func openExistingComputerDiskLock(ctx context.Context, root string) (*os.File, e
 	opened := make(chan openResult, 1)
 	go func() {
 		lock, err := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_RDWR, 0)
-		select {
-		case opened <- openResult{lock: lock, err: err}:
-		case <-ctx.Done():
-			if lock != nil {
-				_ = lock.Close()
-			}
-		}
+		opened <- openResult{lock: lock, err: err}
 	}()
 	var lock *os.File
 	select {
@@ -171,6 +165,12 @@ func openExistingComputerDiskLock(ctx context.Context, root string) (*os.File, e
 		}
 		lock = result.lock
 	case <-ctx.Done():
+		// Join the open before returning so a descriptor cannot arrive after
+		// cancellation and become stranded in the buffered result channel.
+		result := <-opened
+		if result.lock != nil {
+			_ = result.lock.Close()
+		}
 		return nil, ctx.Err()
 	}
 	ticker := time.NewTicker(5 * time.Millisecond)
@@ -206,6 +206,9 @@ func readComputerDiskManifestContext(ctx context.Context, path string) (computer
 	case read := <-result:
 		return read.manifest, read.present, read.err
 	case <-ctx.Done():
+		// The caller still owns the generation flock. Join every filesystem
+		// reader before cancellation can release that authority.
+		<-result
 		return computerDiskManifest{}, false, ctx.Err()
 	}
 }
@@ -217,6 +220,7 @@ func verifyComputerDiskAllocationContext(ctx context.Context, path string, bytes
 	case err := <-result:
 		return err
 	case <-ctx.Done():
+		<-result
 		return ctx.Err()
 	}
 }
@@ -236,6 +240,7 @@ func readComputerReimageDiskOwnerContext(ctx context.Context, readOwner func(con
 	case owner := <-result:
 		return owner.uid, owner.gid, owner.err
 	case <-ctx.Done():
+		<-result
 		return 0, 0, ctx.Err()
 	}
 }
@@ -282,6 +287,7 @@ func (engine *ContainerdEngine) inspectComputerReimageImageContext(ctx context.C
 	case inspected := <-result:
 		return inspected.facts, inspected.err
 	case <-ctx.Done():
+		<-result
 		return computerReimageImageFacts{}, reimagePreflightStageError("image_identity", ctx.Err())
 	}
 }
@@ -316,6 +322,9 @@ func (engine *ContainerdEngine) PreflightComputerReimage(ctx context.Context, re
 	preflightCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	receipt := computerReimageReceipt(request)
+	if request.Storage.DiskBytes <= 0 {
+		return failedComputerReimagePreflight(receipt, "allocation_verify", "operation_failed", "computer_reimage_preflight_failed"), nil
+	}
 	if !lockComputerReimageMutex(preflightCtx, &engine.computerReimageMu) {
 		return failedComputerReimagePreflight(receipt, "generation_lock", "deadline_exceeded", "computer_reimage_preflight_failed"), nil
 	}

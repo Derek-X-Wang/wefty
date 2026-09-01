@@ -1802,13 +1802,23 @@ func validatePendingComputerProjection(
 
 func quiesceComputerProjectionTx(ctx context.Context, tx *sql.Tx, job Job, now time.Time) (bool, error) {
 	switch job.State {
-	case contract.JobQueued, contract.JobClaimed, contract.JobRunning, contract.JobStopping, contract.JobStopped:
+	case contract.JobQueued, contract.JobClaimed, contract.JobRunning:
 		if err := setComputerServiceDesiredState(ctx, tx, job, contract.ServiceDesiredStopped, now); err != nil {
 			return false, err
 		}
-		return job.State == contract.JobQueued || job.State == contract.JobStopped, nil
-	case contract.JobFailed:
-		return true, nil
+		return job.State == contract.JobQueued, nil
+	case contract.JobStopping, contract.JobStopped, contract.JobFailed:
+		// RestartComputer deliberately leaves an active resource latch in
+		// stopping/running-desired until its current attempt reports terminal.
+		// Projection replacement still owns a stop intent in that state. Write
+		// the internal desired state directly instead of asking the public
+		// transition helper to reject the stale observation.
+		if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET desired_state=?, next_restart_at=NULL,
+			published_attempt_id=NULL, healthy_since_ns=NULL WHERE job_id=?`,
+			contract.ServiceDesiredStopped, job.JobID); err != nil {
+			return false, internalError(err, "quiesce terminal Computer projection")
+		}
+		return job.State == contract.JobStopped || job.State == contract.JobFailed, nil
 	default:
 		return false, protocolError(contract.ErrorConflict,
 			"Computer Job %q cannot enter projection from %q", job.JobID, job.State)

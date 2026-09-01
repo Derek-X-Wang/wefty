@@ -111,6 +111,18 @@ func TestPreflightComputerReimageDoesNotCreateMissingDiskRoot(t *testing.T) {
 	}
 }
 
+func TestPreflightComputerReimageMissingTransportBudgetReturnsTypedRefusal(t *testing.T) {
+	engine, storage, prior := prepareSameBootSweptComputerDisk(t)
+	request := testComputerReimageRequest(storage, prior)
+	request.Storage.DiskBytes = 0
+	response, err := engine.PreflightComputerReimage(t.Context(), request)
+	if err != nil || response.Receipt.Kind != "computer_reimage_preflight_failed_unchanged" ||
+		response.Receipt.FailureStage != "allocation_verify" || response.Receipt.FailureReason != "operation_failed" ||
+		response.Receipt.FailureCode != "computer_reimage_preflight_failed" {
+		t.Fatalf("missing transport budget refusal = %+v err=%v", response.Receipt, err)
+	}
+}
+
 func TestPreflightComputerReimageSerializesTransientAttachAndDeleteContention(t *testing.T) {
 	for _, operation := range []string{"attach", "delete"} {
 		t.Run(operation, func(t *testing.T) {
@@ -157,5 +169,73 @@ func TestPreflightComputerReimageSerializesTransientAttachAndDeleteContention(t 
 				t.Fatalf("serialized %s = %v", operation, err)
 			}
 		})
+	}
+}
+
+func TestSlowAttachOnAnotherComputerDoesNotBlockReimagePreflight(t *testing.T) {
+	engine, storage, prior := prepareSameBootSweptComputerDisk(t)
+	system := engine.diskSystem.(*fakeComputerDiskSystem)
+	other := storage
+	other.ComputerID = "computer-other"
+	other.StorageID = "storage-other"
+	other.IntentRevision = 2
+	system.allocationHit = make(chan struct{})
+	system.allocationGate = make(chan struct{})
+	attachDone := make(chan error, 1)
+	go func() {
+		attachment, err := engine.attachComputerDisk(t.Context(), other,
+			testComputerAuthority("other-attempt", "other-fence", prior.BootSessionID))
+		if err == nil {
+			err = engine.detachComputerDisk(attachment, computerDiskReapReceipt, "")
+		}
+		attachDone <- err
+	}()
+	<-system.allocationHit
+	engine.config.ComputerReimagePreflightTimeout = 75 * time.Millisecond
+	engine.computerReimageImageInspect = func(context.Context, PreflightComputerReimageRequest) (computerReimageImageFacts, error) {
+		return computerReimageImageFacts{platform: OCIPlatform{OS: "linux", Architecture: "amd64"}, uid: 1000, gid: 1000}, nil
+	}
+	engine.computerReimageDiskOwner = func(context.Context, string) (uint32, uint32, error) { return 1000, 1000, nil }
+	response, err := engine.PreflightComputerReimage(t.Context(), testComputerReimageRequest(storage, prior))
+	close(system.allocationGate)
+	if attachErr := <-attachDone; attachErr != nil {
+		t.Fatal(attachErr)
+	}
+	if err != nil || response.Receipt.Kind != "computer_reimage_preflight_verified" {
+		t.Fatalf("unrelated slow attach blocked reimage preflight: receipt=%+v err=%v", response.Receipt, err)
+	}
+}
+
+func TestReimageContextReadJoinsWorkerBeforeReturning(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() {
+		_, _, err := readComputerReimageDiskOwnerContext(ctx, func(context.Context, string) (uint32, uint32, error) {
+			close(started)
+			<-release
+			close(finished)
+			return 0, 0, nil
+		}, "disk")
+		returned <- err
+	}()
+	<-started
+	<-ctx.Done()
+	select {
+	case err := <-returned:
+		t.Fatalf("context wrapper returned before joining its worker: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-returned; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("joined context read error = %v", err)
+	}
+	select {
+	case <-finished:
+	default:
+		t.Fatal("context wrapper returned before the worker finished")
 	}
 }

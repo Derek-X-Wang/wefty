@@ -347,20 +347,37 @@ jobs:
                   ;;
                 kill-payload:*|kill-shim:*)
                   job_id="${action#*:}"
-                  container=""
+                  containers=""
                   for candidate in $(/usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock --namespace wefty tasks list --quiet); do
-                    if /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock --namespace wefty containers info "$candidate" | grep -F "$job_id" >/dev/null; then
-                      container="$candidate"
-                      break
+                    candidate_job_id="$(/usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock --namespace wefty containers info "$candidate" | jq -r '.Labels["io.wefty/job_id"] // empty')"
+                    if [ "$candidate_job_id" = "$job_id" ]; then
+                      containers="$containers $candidate"
                     fi
                   done
-                  test -n "$container"
+                  set -- $containers
+                  if [ "$#" -ne 1 ]; then
+                    printf 'exact Job binding matched %s workloads\n' "$#" > "/tmp/wefty-oci-faults/$action.failed"
+                    continue
+                  fi
+                  container="$1"
                   if [ "${action%%:*}" = kill-payload ]; then
                     /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock --namespace wefty tasks kill --signal KILL "$container"
                   else
-                    shim_pid="$(pgrep -f "containerd-shim-runc-v2.*-id $container" | head -n 1)"
-                    test -n "$shim_pid"
-                    kill -KILL "$shim_pid"
+                    shim_pids=""
+                    for command_line in /proc/[0-9]*/cmdline; do
+                      [ -r "$command_line" ] || continue
+                      if tr '\0' '\n' < "$command_line" | awk -v container="$container" 'previous == "-id" && $0 == container { found=1 } { previous=$0 } END { exit !found }'; then
+                        shim_pid="${command_line#/proc/}"
+                        shim_pid="${shim_pid%/cmdline}"
+                        shim_pids="$shim_pids $shim_pid"
+                      fi
+                    done
+                    set -- $shim_pids
+                    if [ "$#" -ne 1 ]; then
+                      printf 'exact workload shim binding matched %s processes\n' "$#" > "/tmp/wefty-oci-faults/$action.failed"
+                      continue
+                    fi
+                    kill -KILL "$1"
                   fi
                   ;;
                 stop-containerd)

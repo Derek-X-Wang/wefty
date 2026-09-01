@@ -25,6 +25,45 @@ func (probe capabilityProbeFunc) Probe(ctx context.Context) (CapabilityProbeResu
 	return probe(ctx)
 }
 
+func TestConcurrentCapabilityRefreshWaitsForProbeOwnership(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var calls atomic.Int32
+	probe := capabilityProbeFunc(func(ctx context.Context) (CapabilityProbeResult, error) {
+		if calls.Add(1) == 1 {
+			close(firstStarted)
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return CapabilityProbeResult{}, ctx.Err()
+			}
+		}
+		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
+	})
+	state := newCapabilityState(map[string]bool{"kind:process": true}, probe, systemClock{}, time.Second)
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- state.refresh(t.Context()) }()
+	<-firstStarted
+
+	secondResult := make(chan error, 1)
+	go func() { secondResult <- state.refresh(t.Context()) }()
+	select {
+	case err := <-secondResult:
+		t.Fatalf("contending refresh returned before probe ownership was available: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("probe calls = %d, want 2 serialized observations", got)
+	}
+}
+
 func TestCapabilityRevisionChangesOnlyOnPublishableTransition(t *testing.T) {
 	clock := newManualClock(time.Date(2026, 8, 22, 11, 0, 0, 0, time.UTC))
 	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {

@@ -19,6 +19,9 @@ type fakeComputerDiskSystem struct {
 	mu             sync.Mutex
 	allocationErr  error
 	allocationRuns int
+	allocationGate chan struct{}
+	allocationHit  chan struct{}
+	allocationOnce sync.Once
 	mounts         map[string]string
 	loops          map[string]string
 	nextLoop       int
@@ -29,6 +32,12 @@ func newFakeComputerDiskSystem() *fakeComputerDiskSystem {
 }
 
 func (system *fakeComputerDiskSystem) allocateAndFormat(_ context.Context, path string, bytes int64) error {
+	if system.allocationHit != nil {
+		system.allocationOnce.Do(func() { close(system.allocationHit) })
+	}
+	if system.allocationGate != nil {
+		<-system.allocationGate
+	}
 	system.mu.Lock()
 	defer system.mu.Unlock()
 	system.allocationRuns++

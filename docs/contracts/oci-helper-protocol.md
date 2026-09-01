@@ -705,11 +705,17 @@ historical attempt and fence, while `computer_reimage_reset_preparation`
 carries only the verified never-attached reset-preparation receipt. Reset
 preparation is never recast as an invented detachment attempt.
 
-The operation takes the exact generation flock while it reads the manifest,
-verifies the manifest's durable byte budget, and reads the ext4 root owner. It
-releases that flock before publishing the receipt. The whole helper operation,
-including context-free filesystem reads executed behind cancellable joins, has
-a 10-second deadline. The tagged native lane logs the measured helper duration
+Attach and delete hold the node-global reimage mutex only through manifest/flock
+admission. After they acquire the exact generation flock, that flock owns the
+remaining disk work so a slow attach or delete for one Computer cannot block
+preflight admission for every other Computer on the Node. Preflight retains its
+admission locks and the exact generation flock while it reads the manifest,
+verifies its durable byte budget, and reads the ext4 root owner, then releases
+the flock before publishing the receipt. The whole helper operation, including
+context-free filesystem reads executed behind cancellation-aware joins, has a
+10-second deadline; cancellation joins each worker and closes any late-opened
+lock descriptor before returning and releasing the flock. The tagged native lane
+logs the measured helper duration
 for each reimage. On the 2026-08-31 PR lane, the complete adapter/helper
 preflight against the 160 MiB acceptance disk measured 27.263 milliseconds for
 XFCE and 22.245 milliseconds for Wayland; the 10-second bound leaves more than
@@ -724,11 +730,20 @@ one closed stage and a bounded reason. The stage vocabulary is exactly
 `detachment_required`, `image_unavailable`, or
 `image_platform_unsupported`. L1 accepts these fail-closed receipts, releases
 the refused staging projection, and surfaces the stage and reason on the
-stopped current Job instead of redispatching the operation indefinitely.
+stopped current Job instead of redispatching the operation indefinitely. The
+agent alone treats `detachment_required` and `generation_lock` plus
+`deadline_exceeded` as transient: it retries them on the next two polls and
+makes the third receipt definitive. Every other stage/reason pair remains
+immediately definitive.
 If the exact digest is unavailable or has no manifest for the bound Node's
 platform, the helper returns a typed `failed_unchanged` receipt only after the
 same detachment and disk-allocation checks. L1 then retires the refused staging
 projection while preserving the stopped current Job and disk generation.
+If the durable generation row is missing, L1 still dispatches the operation
+with a zero byte budget and the helper returns a typed `allocation_verify`
+refusal; the directive is never silently omitted. Image-stage failure
+acknowledgements must carry the same valid detachment or reset-preparation
+evidence as success.
 
 L1 records a successful preflight receipt and activates the staged Computer
 projection in the same acknowledgement transaction. The agent does not wait
@@ -738,6 +753,9 @@ projection. When the retiring projection is live, L1 preserves the Computer's
 running intent but writes that service projection desired-stopped, so its next
 fenced lease renewal carries the stop directive and reaches the stopped
 preflight precondition.
+An acknowledgement-time capacity refusal is persisted in that transaction as
+a typed reimage-preflight failure and releases the staging projection instead
+of leaving the agent to retry an unobservable transaction error.
 
 Computer removal carries the same exact Storage identity plus current Node,
 boot, consumer Job, named prior Job, removal-generation, and cleanup-fence

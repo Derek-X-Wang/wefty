@@ -1625,7 +1625,7 @@ func inspectLiveComputerReimageDetachment(t *testing.T, harness *acceptanceHarne
 		receipt.StorageGeneration == computer.StorageGeneration && receipt.OperationRevision == computer.AppliedRevision &&
 		receipt.StagingJobID == computer.CurrentJobID && receipt.StorageEvidenceKind == "computer_reimage_detachment" &&
 		receipt.DetachmentReceiptID != "" && receipt.DetachmentAttemptID != "" && receipt.DetachmentFencingToken != "" &&
-		receipt.ResetPreparationReceiptID == ""
+		receipt.ResetPreparationReceiptID == "" && receipt.ImageUID == receipt.DiskRootUID && receipt.ImageGID == receipt.DiskRootGID
 }
 
 type liveAbortEvidence struct {

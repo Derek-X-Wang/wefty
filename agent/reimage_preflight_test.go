@@ -20,3 +20,24 @@ func TestComputerReimagePreflightDirectivePropagatesDiskBudget(t *testing.T) {
 			request.Storage, directive.DiskBytes, directive.StorageGeneration, directive.OperationRevision)
 	}
 }
+
+func TestComputerReimageTransientFailuresUseBoundedNextPollBudget(t *testing.T) {
+	controller := &reimagePreflightController{retryCounts: make(map[string]int)}
+	directive := l1.ComputerReimagePreflightDirective{ComputerID: "computer", OperationRevision: 7}
+	for _, receipt := range []l1.ComputerReimagePreflightReceipt{
+		{Kind: "computer_reimage_preflight_failed_unchanged", FailureStage: "manifest_read", FailureReason: "detachment_required"},
+		{Kind: "computer_reimage_preflight_failed_unchanged", FailureStage: "generation_lock", FailureReason: "deadline_exceeded"},
+	} {
+		for attempt := 1; attempt <= computerReimagePreflightRetryLimit; attempt++ {
+			deferred := controller.deferTransientFailure(directive, receipt)
+			if deferred != (attempt < computerReimagePreflightRetryLimit) {
+				t.Fatalf("transient attempt %d deferred=%t", attempt, deferred)
+			}
+		}
+	}
+	definitive := l1.ComputerReimagePreflightReceipt{Kind: "computer_reimage_preflight_failed_unchanged",
+		FailureStage: "image_identity", FailureReason: "deadline_exceeded"}
+	if controller.deferTransientFailure(directive, definitive) {
+		t.Fatal("non-generation image deadline was treated as retryable")
+	}
+}

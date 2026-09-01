@@ -137,6 +137,187 @@ func TestComputerReimagePreflightReceiptFailsEveryNegativeRow(t *testing.T) {
 	if err := validateComputerReimagePreflight(row, resetPreparation, "linux", "amd64"); err != nil {
 		t.Fatalf("explicit reset-preparation evidence was rejected: %v", err)
 	}
+	for _, test := range []struct {
+		code   contract.SpawnFailureCode
+		reason string
+	}{
+		{contract.SpawnFailureImageUnavailable, "image_unavailable"},
+		{contract.SpawnFailureImagePlatformUnsupported, "image_platform_unsupported"},
+	} {
+		failed := valid
+		failed.Kind = computerReimagePreflightFailedReceiptKind
+		failed.FailureCode = string(test.code)
+		failed.FailureStage = "image_identity"
+		failed.FailureReason = test.reason
+		failed.StorageEvidenceKind = ""
+		failed.DetachmentReceiptID = ""
+		failed.DetachmentAttemptID = ""
+		failed.DetachmentFencingToken = ""
+		if err := validateComputerReimagePreflight(row, failed, "linux", "amd64"); err == nil {
+			t.Fatalf("%s failure without storage evidence passed", test.code)
+		}
+	}
+}
+
+func TestRestartedResourceLatchCanEnterReimageWithoutSecondRestart(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
+		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	})
+	registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
+		Name: "restart-then-reimage", Spec: computerCapabilityJobSpec("computer:restart-then-reimage"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure, err := json.Marshal(contract.SpawnFailure{Code: contract.SpawnFailureInsufficientDisk,
+		Message: "durable allocation is latched"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`UPDATE jobs SET state='running' WHERE job_id=?`, computer.CurrentJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`UPDATE service_jobs SET desired_state='running', last_failure=? WHERE job_id=?`,
+		failure, computer.CurrentJobID); err != nil {
+		t.Fatal(err)
+	}
+	latched, err := h.store.GetComputer(t.Context(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, _, err := h.store.RestartComputer(t.Context(), computer.ComputerID, ComputerRestartRequest{
+		ComputerMutationPrecondition: computerPrecondition(latched, "operator"), IdempotencyKey: "restart-latch",
+	})
+	if err != nil || restarted.CurrentJob.State != contract.JobStopping ||
+		restarted.CurrentJob.DesiredState != contract.ServiceDesiredRunning {
+		t.Fatalf("active resource restart = %#v err=%v", restarted, err)
+	}
+	reimaged, err := h.store.ReimageComputer(t.Context(), computer.ComputerID, ComputerReimageRequest{
+		ComputerMutationPrecondition: computerPrecondition(restarted, "operator"), Image: reimageTarget('9'),
+		TerminateSessions: true, IdempotencyKey: "reimage-after-restart",
+	})
+	if err != nil || reimaged.ReconfigurationPhase != ComputerReconfigurationReimaging ||
+		reimaged.CurrentJob.State != contract.JobStopping || reimaged.CurrentJob.DesiredState != contract.ServiceDesiredStopped {
+		t.Fatalf("restart-then-reimage = %#v err=%v", reimaged, err)
+	}
+}
+
+func TestComputerReimageMissingGenerationBudgetFailsClosed(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
+		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	})
+	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
+		Name: "missing-reimage-budget", Spec: computerCapabilityJobSpec("computer:missing-reimage-budget"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	computer, err = h.store.SetComputerDesiredState(t.Context(), computer.ComputerID,
+		computerDesiredRequest(computer, contract.ServiceDesiredStopped, "stop"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`UPDATE computers SET bound_node_id=? WHERE computer_id=?`, node.NodeID, computer.ComputerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`UPDATE service_jobs SET bound_node_id=? WHERE job_id=?`, node.NodeID, computer.CurrentJobID); err != nil {
+		t.Fatal(err)
+	}
+	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := h.store.ReimageComputer(t.Context(), computer.ComputerID, ComputerReimageRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "operator"), Image: reimageTarget('6'),
+		IdempotencyKey: "missing-generation-budget",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`DELETE FROM computer_storage_generations WHERE computer_id=? AND storage_id=? AND storage_generation=?`,
+		computer.ComputerID, computer.StorageID, computer.StorageGeneration); err != nil {
+		t.Fatal(err)
+	}
+	directives, err := h.store.ListNodeComputerReimagePreflightDirectives(t.Context(),
+		"fabric-"+node.NodeID, node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 || directives[0].DiskBytes != 0 {
+		t.Fatalf("missing-budget reimage directives = %#v err=%v", directives, err)
+	}
+	directive := directives[0]
+	receipt := ComputerReimagePreflightReceipt{Kind: computerReimagePreflightFailedReceiptKind,
+		ReceiptID: "missing-budget-" + directive.OperationFence, ComputerID: directive.ComputerID,
+		StorageID: directive.StorageID, StorageGeneration: directive.StorageGeneration,
+		OldJobID: directive.OldJobID, StagingJobID: directive.StagingJobID, NodeID: directive.BoundNodeID,
+		RootInstanceID: directive.RootInstanceID, OperationRevision: directive.OperationRevision,
+		OperationFence: directive.OperationFence, TargetDigest: *directive.TargetImage.Digest,
+		PlatformOS: "linux", PlatformArchitecture: "amd64", HelperGeneration: 7,
+		FailureCode: string(contract.SpawnFailureReimagePreflight), FailureStage: "allocation_verify",
+		FailureReason: "operation_failed"}
+	failed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+		computer.ComputerID, ComputerReimagePreflightAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: "missing-budget-refusal", Receipt: receipt})
+	if err != nil || failed.ReconfigurationPhase != ComputerReconfigurationStable || failed.AppliedRevision != staged.IntentRevision {
+		t.Fatalf("missing-budget typed refusal = %#v err=%v", failed, err)
+	}
+}
+
+func TestComputerReimageAcknowledgementCapacityRefusalIsTypedOutcome(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
+		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	})
+	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
+		Name: "ack-capacity-refusal", Spec: computerCapabilityJobSpec("computer:ack-capacity-refusal"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	computer, err = h.store.SetComputerDesiredState(t.Context(), computer.ComputerID,
+		computerDesiredRequest(computer, contract.ServiceDesiredStopped, "stop"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`UPDATE computers SET bound_node_id=? WHERE computer_id=?`, node.NodeID, computer.ComputerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`UPDATE service_jobs SET bound_node_id=? WHERE job_id=?`, node.NodeID, computer.CurrentJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`UPDATE computers SET desired_state='running' WHERE computer_id=?`, computer.ComputerID); err != nil {
+		t.Fatal(err)
+	}
+	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := h.store.ReimageComputer(t.Context(), computer.ComputerID, ComputerReimageRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "operator"), Image: reimageTarget('5'),
+		IdempotencyKey: "ack-capacity-refusal",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, acknowledgement := reimagePreflightAcknowledgement(t, h, node, computer.ComputerID, "attempt", "attempt-fence")
+	if _, err := h.store.db.Exec(`UPDATE nodes SET max_service_slots=0 WHERE node_id=?`, node.NodeID); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := h.store.AcknowledgeComputerReimagePreflight(t.Context(), "fabric-"+node.NodeID,
+		computer.ComputerID, acknowledgement)
+	var failure contract.SpawnFailure
+	if err != nil || failed.ReconfigurationPhase != ComputerReconfigurationStable ||
+		failed.AppliedRevision != staged.IntentRevision || failed.CurrentJobID != computer.CurrentJobID ||
+		json.Unmarshal(failed.CurrentJob.LastFailure, &failure) != nil ||
+		failure.Code != contract.SpawnFailureReimagePreflight || !strings.Contains(failure.Message, string(contract.ErrorCapacityExhausted)) {
+		t.Fatalf("ack-time capacity refusal = %#v failure=%#v err=%v", failed, failure, err)
+	}
 }
 
 func TestComputerReimagePreservesIdentityStorageAndIntent(t *testing.T) {

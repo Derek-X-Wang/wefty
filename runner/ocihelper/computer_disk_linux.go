@@ -91,7 +91,12 @@ func (engine *ContainerdEngine) computerDiskSystem() computerDiskSystem {
 
 func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage ComputerStorageReference, authority AttemptAuthority) (_ *computerDiskAttachment, err error) {
 	engine.computerReimageMu.Lock()
-	defer engine.computerReimageMu.Unlock()
+	reimageLocked := true
+	defer func() {
+		if reimageLocked {
+			engine.computerReimageMu.Unlock()
+		}
+	}()
 	if storage.DiskBytes <= 0 || storage.IntentRevision < 1 {
 		return nil, errors.New("Computer disk requires a positive allocation")
 	}
@@ -123,6 +128,11 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 	if err = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return nil, errComputerStorageAttachmentOwned
 	}
+	// The node-wide mutex only orders manifest/flock admission against
+	// preflight. The generation flock now owns this disk, so formatting and
+	// mounting it must not freeze unrelated Computers on the node.
+	engine.computerReimageMu.Unlock()
+	reimageLocked = false
 	manifestPath := filepath.Join(diskRoot, "attachment.json")
 	manifest, present, err := readComputerDiskManifest(manifestPath)
 	if err != nil {
@@ -357,7 +367,12 @@ func (engine *ContainerdEngine) quarantineComputerDiskCleanup(request DeleteMana
 
 func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageReference, removal ManagedVolumeRemovalAuthority) error {
 	engine.computerReimageMu.Lock()
-	defer engine.computerReimageMu.Unlock()
+	reimageLocked := true
+	defer func() {
+		if reimageLocked {
+			engine.computerReimageMu.Unlock()
+		}
+	}()
 	name, err := deterministicComputerDiskName(storage)
 	if err != nil {
 		return err
@@ -381,6 +396,11 @@ func (engine *ContainerdEngine) deleteComputerDisk(storage ComputerStorageRefere
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
+	// The per-generation flock, when present, now excludes preflight and
+	// attachment for this disk. Release the node-wide admission mutex before
+	// filesystem inspection and deletion so other Computers remain live.
+	engine.computerReimageMu.Unlock()
+	reimageLocked = false
 	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
 	if err != nil {
 		return err

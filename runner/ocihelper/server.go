@@ -1387,7 +1387,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			body.Authority.HelperGeneration == 0 || body.Authority.RootInstanceID == "" || body.Authority.OldJobID == "" ||
 			body.Authority.StagingJobID == "" || body.Authority.OperationRevision < 1 || body.Authority.OperationFence == "" ||
 			body.Storage.ComputerID == "" || body.Storage.StorageID == "" || body.Storage.StorageGeneration < 1 ||
-			body.Storage.DiskBytes <= 0 || body.Storage.IntentRevision != body.Authority.OperationRevision || body.TargetImage.Reference == "" ||
+			body.Storage.IntentRevision != body.Authority.OperationRevision || body.TargetImage.Reference == "" ||
 			body.TargetImage.Digest == "" || body.TargetImage.Platform.OS == "" || body.TargetImage.Platform.Architecture == "" {
 			_ = writeFailure(wire, CodeInvalidRequest, "complete current-session Computer reimage preflight authority is required")
 			return
