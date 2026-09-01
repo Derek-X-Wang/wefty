@@ -462,17 +462,22 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		t.Fatalf("Computer custody attestation result = %#v", attestOutput)
 	}
 	staleCredential := startTakeoverViewCLI(t, evidence, harness, reimaged.ComputerID, "linux-admin", "linux-admin-device-a", takeoverViewRetryNone)
-	restoreBaseline := reimaged.StorageGeneration
-	restoreOutput := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "restore", reimaged.ComputerID, backup.BackupID,
+	stopping := runComputerCLI[l1.Computer](t, harness, false, "services", "stop", reimaged.ComputerID, "--expect-current")
+	stopped := waitForComputerCLI(t, harness, stopping.ComputerID, 3*time.Minute, computerStoppedAfterExplicitStop)
+	restoreAdmissionState := stopped.CurrentJob.State
+	restoreBaseline := stopped.StorageGeneration
+	restoreOutput := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "restore", stopped.ComputerID, backup.BackupID,
 		"--keep-old-as-backup", "--expect-current", "--idempotency-key", "linux-native-restore", "--wait", "4m")
-	if restoreOutput.Computer == nil || restoreOutput.Computer.StorageGeneration <= reimaged.StorageGeneration {
+	if restoreOutput.Computer == nil || restoreOutput.Computer.StorageGeneration != restoreBaseline+1 {
 		t.Fatalf("Computer restore result = %#v", restoreOutput)
 	}
+	restoreReceipt := requiredStorageCopyReceipt(t, restoreOutput.StorageProvenance, "restore", restoreOutput.Computer.ComputerID)
+	if restoreReceipt.OSIdentityRekeyed || restoreReceipt.MachineIDBeforeDigest != "" || restoreReceipt.MachineIDAfterDigest != "" ||
+		!restoreReceipt.SourceUnchanged || !restoreReceipt.DestinationPrepared || restoreReceipt.PreparationReceipt || restoreReceipt.DestinationChown {
+		t.Fatalf("Computer restore receipt = %#v", restoreReceipt)
+	}
 	staleCredential.waitClosed(t, 30*time.Second)
-	staleCredentialRejected := runComputerCLIPersonExpectError(t, harness, "linux-admin", "linux-admin-device-a",
-		"services", "takeover", "take", reimaged.ComputerID, "--session-token-file", staleCredential.tokenFile)
 	reimaged = *restoreOutput.Computer
-	recordComputerAuthority(receipt, reimaged)
 	backupInventory := runComputerCLI[computerBackupInventoryReceipt](t, harness, false, "services", "backup", "list", reimaged.ComputerID)
 	capSet := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "backup", "set-cap", reimaged.ComputerID,
 		"--cap", fmt.Sprint(len(backupInventory.Backups)), "--expect-current")
@@ -482,26 +487,42 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 			"--expect-current", "--allow-power-off", "--idempotency-key", "linux-native-cap-pressure", "--wait", "4m")
 	}
 	enospc := exerciseLiveComputerENOSPC(t, harness, reference, digest)
-	completeLinuxComputerRow(t, receipt, "linux.storage_provenance", map[string]bool{
-		"cold_backup_available_live":          backup.Status == "available",
-		"clone_fork_created_live":             cloneOutput.Computer.ComputerID != reimaged.ComputerID,
-		"clone_machine_id_rekeyed_live":       cloneReceipt.MachineIDBeforeDigest != cloneReceipt.MachineIDAfterDigest,
-		"clone_source_unchanged_live":         cloneReceipt.SourceUnchanged,
-		"clone_first_attach_nonfresh_live":    cloneReceipt.DestinationPrepared && !cloneReceipt.PreparationReceipt && !cloneReceipt.DestinationChown && computerDisplayPublished(*cloneOutput.Computer),
-		"custody_export_manifest_bound_live":  manifestDigest == exportOutput.CustodyExport.ManifestDigest,
-		"custody_import_tainted_live":         importOutput.StorageProvenance.CustodyTainted,
-		"import_machine_id_rekeyed_live":      importReceipt.MachineIDBeforeDigest != importReceipt.MachineIDAfterDigest,
-		"import_source_unchanged_live":        importReceipt.SourceUnchanged,
-		"custody_delete_attested_live":        attestOutput.CustodyExport.OperatorAttestedDeleted,
-		"keep_old_restore_live":               len(backupInventory.Backups) >= 2,
-		"restore_fresh_generation_live":       restoreOutput.Computer.StorageGeneration > restoreBaseline,
-		"planted_stale_session_rejected_live": strings.Contains(staleCredentialRejected, string(contract.ErrorTakeoverSessionEnded)),
-		"backup_cap_pressure_live":            capSet.Computer != nil && strings.Contains(capPressure, string(contract.ErrorConflict)),
-		"real_disk_enospc_live":               enospc.Observed,
-	}, map[string]string{"backup_id": backup.BackupID, "clone_computer_id": cloneOutput.Computer.ComputerID,
+	reimaged = runComputerCLI[l1.Computer](t, harness, false, "services", "start", reimaged.ComputerID, "--expect-current")
+	reimaged = waitForComputerCLI(t, harness, reimaged.ComputerID, 3*time.Minute, computerDisplayPublished)
+	restoreOldEndpoint, restoreCurrentEndpoint := retargetTakeoverSessionCapability(t, staleCredential.tokenFile, reimaged.DisplayEndpoint)
+	preStopSessionRejectedAfterRestore := runComputerCLIPersonExpectControlError(t, harness, "linux-admin", "linux-admin-device-a",
+		"services", "takeover", "take", reimaged.ComputerID, "--session-token-file", staleCredential.tokenFile)
+	recordComputerAuthority(receipt, reimaged)
+	storageAssertions := map[string]bool{
+		"cold_backup_available_live":         backup.Status == "available",
+		"clone_fork_created_live":            cloneOutput.Computer.ComputerID != reimaged.ComputerID,
+		"clone_machine_id_rekeyed_live":      cloneReceipt.MachineIDBeforeDigest != cloneReceipt.MachineIDAfterDigest,
+		"clone_source_unchanged_live":        cloneReceipt.SourceUnchanged,
+		"clone_first_attach_nonfresh_live":   cloneReceipt.DestinationPrepared && !cloneReceipt.PreparationReceipt && !cloneReceipt.DestinationChown && computerDisplayPublished(*cloneOutput.Computer),
+		"custody_export_manifest_bound_live": manifestDigest == exportOutput.CustodyExport.ManifestDigest,
+		"custody_import_tainted_live":        importOutput.StorageProvenance.CustodyTainted,
+		"import_machine_id_rekeyed_live":     importReceipt.MachineIDBeforeDigest != importReceipt.MachineIDAfterDigest,
+		"import_source_unchanged_live":       importReceipt.SourceUnchanged,
+		"custody_delete_attested_live":       attestOutput.CustodyExport.OperatorAttestedDeleted,
+		"keep_old_restore_live":              len(backupInventory.Backups) >= 2,
+		"restore_fresh_generation_live":      restoreOutput.Computer.StorageGeneration == restoreBaseline+1,
+		"restore_preserved_machine_id_live":  !restoreReceipt.OSIdentityRekeyed && restoreReceipt.MachineIDBeforeDigest == "" && restoreReceipt.MachineIDAfterDigest == "",
+		"restore_first_attach_nonfresh_live": restoreReceipt.DestinationPrepared && !restoreReceipt.PreparationReceipt && !restoreReceipt.DestinationChown && computerDisplayPublished(reimaged),
+		"prestop_session_lineage_rejected_after_restore_live": preStopSessionRejectedAfterRestore.Error.Code == contract.ErrorTakeoverSessionEnded &&
+			preStopSessionRejectedAfterRestore.Receipt != nil && preStopSessionRejectedAfterRestore.Receipt.SessionEndReason == string(l1.ComputerTakeoverAttemptAuthorityLost),
+		"backup_cap_pressure_live": capSet.Computer != nil && strings.Contains(capPressure, string(contract.ErrorConflict)),
+		"real_disk_enospc_live":    enospc.Observed,
+	}
+	storageEvidence := map[string]string{"backup_id": backup.BackupID, "clone_computer_id": cloneOutput.Computer.ComputerID,
 		"clone_machine_id_before": cloneReceipt.MachineIDBeforeDigest, "clone_machine_id_after": cloneReceipt.MachineIDAfterDigest,
 		"export_id": exportOutput.CustodyExport.ExportID, "import_computer_id": importOutput.Computer.ComputerID,
-		"retained_backups": fmt.Sprint(len(backupInventory.Backups)), "enospc_observation": enospc.Detail})
+		"retained_backups": fmt.Sprint(len(backupInventory.Backups)), "enospc_observation": enospc.Detail,
+		"restore_old_endpoint": restoreOldEndpoint, "restore_current_endpoint": restoreCurrentEndpoint,
+		"restore_admission_job_state":         string(restoreAdmissionState),
+		"restore_session_revocation_evidence": "unavailable: restore publishes no receipt-derived prior takeover-session revocation fact"}
+	notRunLinuxComputerRow(t, receipt, "linux.storage_provenance", 286,
+		"restore publishes no receipt-derived prior takeover-session revocation fact; the stopped-and-detached prerequisite already closes the pre-stop session, and its post-restore capability rejection reports attempt_authority_lost rather than a restore-specific terminal reason",
+		storageAssertions, storageEvidence)
 
 	receipt.begin("linux.guest_authority")
 	defaultOff := !reimaged.SubmitEnabled && reimaged.SubmitMaxInflight == l1.DefaultComputerSubmitMaxInflight
@@ -719,6 +740,34 @@ func completeLinuxComputerRow(t *testing.T, receipt *linuxComputerMatrixReceipt,
 	}
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func notRunLinuxComputerRow(t *testing.T, receipt *linuxComputerMatrixReceipt, id string, issue int, reason string, assertions map[string]bool, evidence map[string]string) {
+	t.Helper()
+	mutated := mutatingLinuxComputerRow(id)
+	if mutated {
+		err := receipt.pass(id, assertions, evidence)
+		if err == nil || receipt.Rows[id].Status != "FAIL" {
+			t.Fatalf("lane mutation %s did not fail its owning row", id)
+		}
+		return
+	}
+	if err := receipt.notRun(id, issue, reason, assertions, evidence); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNotRunLinuxComputerRowMutationRecordsOwningAssertion(t *testing.T) {
+	const id = "linux.storage_provenance"
+	t.Setenv("WEFTY_LINUX_COMPUTER_MUTATE_ROW", id)
+	receipt := newLinuxComputerMatrixReceipt()
+	receipt.begin(id)
+	notRunLinuxComputerRow(t, receipt, id, 286, "restore revocation receipt is unavailable",
+		map[string]bool{"live_product_path": false}, map[string]string{"probe": "mutation"})
+	row := receipt.Rows[id]
+	if row.Status != "FAIL" || len(row.Assertions) != 1 || row.Assertions["live_product_path"] {
+		t.Fatalf("mutated expected-NOT-RUN row = %#v", row)
 	}
 }
 
@@ -1800,6 +1849,18 @@ func computerDisplayPublished(computer l1.Computer) bool {
 	// Computers forbid published_port, so ServiceJob.Ready is intentionally nil.
 	// The fenced, attempt-bound display_endpoint is their readiness projection.
 	return computer.CurrentJob.State == contract.JobRunning && computer.DisplayEndpoint != nil
+}
+
+func computerStoppedAndDetached(computer l1.Computer) bool {
+	return computer.DesiredState == contract.ServiceDesiredStopped &&
+		(computer.CurrentJob.State == contract.JobStopped || computer.CurrentJob.State == contract.JobFailed) &&
+		computer.CurrentJob.CurrentAttemptID == "" && computer.ReconfigurationPhase == l1.ComputerReconfigurationStable
+}
+
+func computerStoppedAfterExplicitStop(computer l1.Computer) bool {
+	return computer.DesiredState == contract.ServiceDesiredStopped &&
+		computer.CurrentJob.State == contract.JobStopped && computer.CurrentJob.CurrentAttemptID == "" &&
+		computer.ReconfigurationPhase == l1.ComputerReconfigurationStable
 }
 
 func failOnTypedReimagePreflight(t *testing.T, computer l1.Computer, priorSpecRevision int64) {

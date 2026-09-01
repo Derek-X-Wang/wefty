@@ -275,8 +275,17 @@ func TestComputerIntentOwnsLifecycleAndSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if stopped.CurrentJob.State != contract.JobStopped || stopped.CurrentJob.HoldsSlot(stopped.CurrentJob.State) ||
-		stopped.BoundNodeID != node.NodeID || stopped.StorageID != retainedStorage || len(stopped.Grants) != 0 {
+		stopped.CurrentJob.CurrentAttemptID != "" || stopped.BoundNodeID != node.NodeID ||
+		stopped.StorageID != retainedStorage || len(stopped.Grants) != 0 {
 		t.Fatalf("stopped Computer did not release only its Slot: %#v", stopped)
+	}
+	if replayed, err := h.store.CompleteAttempt(context.Background(), "fabric-computer-node", claim.Job.JobID,
+		claim.Lease.AttemptID, CompletionRequest{
+			FencingToken: claim.Lease.FencingToken, IdempotencyKey: "computer-stop",
+			Result:                    ProcessResult{OutputError: "logs finalized after positive reap"},
+			RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt,
+		}); err != nil || replayed.State != contract.JobStopped || replayed.CurrentAttemptID != "" {
+		t.Fatalf("detached Computer completion replay = %#v err=%v", replayed, err)
 	}
 
 	wrongStorage := computerDesiredRequest(stopped, contract.ServiceDesiredRunning, "wrong-storage")
@@ -332,6 +341,88 @@ func TestComputerIntentOwnsLifecycleAndSlot(t *testing.T) {
 	}
 	if !started.CurrentJob.HoldsSlot(started.CurrentJob.State) || started.BoundNodeID != node.NodeID {
 		t.Fatalf("started Computer did not reacquire exactly one Slot: %#v", started)
+	}
+}
+
+func TestStoppedComputerCompletionReplayRejectsSupersededAttempt(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{
+		LeaseDuration: 3 * time.Second,
+		Jitter:        func(delay time.Duration) time.Duration { return delay },
+	}, map[string]NodePolicy{
+		"computer-node": {
+			Tags:            []string{contract.StableNodeTagPrefix + "computer-node"},
+			MaxOneshotSlots: 1, MaxServiceSlots: 1,
+		},
+	})
+	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	computer, _, err := h.store.CreateComputer(context.Background(), CreateComputerRequest{
+		Name: "replay-fenced", Spec: computerCapabilityJobSpec("computer:replay-fenced"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := h.store.ClaimJob(context.Background(), "fabric-computer-node", node.NodeID,
+		node.BootSessionID, contract.JobClassService)
+	if err != nil || first == nil {
+		t.Fatalf("first Computer claim = %#v err=%v", first, err)
+	}
+	if _, err := h.store.ObserveAttemptImage(context.Background(), "fabric-computer-node", first.Job.JobID,
+		first.Lease.AttemptID, testImageObservation(first.Lease.FencingToken)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.StartAttempt(context.Background(), "fabric-computer-node", first.Job.JobID,
+		first.Lease.AttemptID, StartedRequest{FencingToken: first.Lease.FencingToken}); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 1
+	firstCompletion := CompletionRequest{
+		FencingToken: first.Lease.FencingToken, IdempotencyKey: "first-restartable-failure",
+		Result: ProcessResult{ExitCode: &exitCode},
+	}
+	queued, err := h.store.CompleteAttempt(context.Background(), "fabric-computer-node", first.Job.JobID,
+		first.Lease.AttemptID, firstCompletion)
+	if err != nil || queued.State != contract.JobQueued || queued.CurrentAttemptID != first.Lease.AttemptID {
+		t.Fatalf("restartable first completion = %#v err=%v", queued, err)
+	}
+
+	h.clock.Advance(2 * time.Second)
+	second, err := h.store.ClaimJob(context.Background(), "fabric-computer-node", node.NodeID,
+		node.BootSessionID, contract.JobClassService)
+	if err != nil || second == nil || second.Lease.AttemptID == first.Lease.AttemptID {
+		t.Fatalf("replacement Computer claim = %#v err=%v", second, err)
+	}
+	if _, err := h.store.ObserveAttemptImage(context.Background(), "fabric-computer-node", second.Job.JobID,
+		second.Lease.AttemptID, testImageObservation(second.Lease.FencingToken)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.StartAttempt(context.Background(), "fabric-computer-node", second.Job.JobID,
+		second.Lease.AttemptID, StartedRequest{FencingToken: second.Lease.FencingToken}); err != nil {
+		t.Fatal(err)
+	}
+	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.SetComputerDesiredState(context.Background(), computer.ComputerID,
+		computerDesiredRequest(computer, contract.ServiceDesiredStopped, "stop-replacement")); err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := h.store.CompleteAttempt(context.Background(), "fabric-computer-node", second.Job.JobID,
+		second.Lease.AttemptID, CompletionRequest{
+			FencingToken: second.Lease.FencingToken, IdempotencyKey: "stop-replacement",
+			Result:                    ProcessResult{OutputError: "logs finalized after positive reap"},
+			RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt,
+		})
+	if err != nil || stopped.State != contract.JobStopped || stopped.CurrentAttemptID != "" {
+		t.Fatalf("replacement stop completion = %#v err=%v", stopped, err)
+	}
+
+	if _, err := h.store.CompleteAttempt(context.Background(), "fabric-computer-node", first.Job.JobID,
+		first.Lease.AttemptID, firstCompletion); errorCode(err) != contract.ErrorAttemptMismatch {
+		t.Fatalf("superseded completion replay error = %v, want %q", err, contract.ErrorAttemptMismatch)
 	}
 }
 

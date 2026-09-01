@@ -238,6 +238,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   spec_json BLOB NOT NULL,
   state TEXT NOT NULL,
   current_attempt_id TEXT,
+  completion_replay_attempt_id TEXT,
   fence_counter INTEGER NOT NULL DEFAULT 0,
   prestart_retry_count INTEGER NOT NULL DEFAULT 0 CHECK(prestart_retry_count >= 0),
   prestart_budget_deadline_ns INTEGER,
@@ -870,6 +871,9 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "display_endpoint", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "jobs", "completion_replay_attempt_id", "TEXT"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "lease_loss_count", "INTEGER NOT NULL DEFAULT 0 CHECK(lease_loss_count >= 0)"); err != nil {
@@ -2105,7 +2109,8 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	// transactions so concurrent claims cannot over-admit either class.
 	claimQuery := `
 UPDATE jobs
-SET state=@job_claimed, current_attempt_id=@attempt_id, fence_counter=fence_counter+1, updated_ns=@now_ns
+SET state=@job_claimed, current_attempt_id=@attempt_id, completion_replay_attempt_id=NULL,
+    fence_counter=fence_counter+1, updated_ns=@now_ns
 WHERE job_id=(
   SELECT j.job_id
 	  FROM jobs j
@@ -3356,10 +3361,19 @@ func (s *Store) CompleteAttempt(ctx context.Context, identityNodeID, jobID, atte
 		return Job{}, internalError(err, "complete attempt")
 	}
 	jobUpdate := "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?"
+	jobUpdateArgs := []any{finalJobState, now.UnixNano(), jobID}
 	if prestartRequeue && finalJobState == contract.JobQueued {
-		jobUpdate = "UPDATE jobs SET state=?, updated_ns=?, current_attempt_id=NULL WHERE job_id=?"
+		jobUpdate = "UPDATE jobs SET state=?, updated_ns=?, current_attempt_id=NULL, completion_replay_attempt_id=? WHERE job_id=?"
+		jobUpdateArgs = []any{finalJobState, now.UnixNano(), attemptID, jobID}
+	} else if jobBeforeCompletion.ComputerID != "" && servicePolicy != nil && finalJobState == contract.JobStopped &&
+		validRuntimeQuiescenceEvidence(request.RuntimeQuiescenceEvidence) {
+		// A Computer reaches stopped only after accepted runtime-quiescence
+		// evidence. Publish that positive detachment by clearing the runtime
+		// owner while retaining an exact completion replay binding.
+		jobUpdate = "UPDATE jobs SET state=?, updated_ns=?, current_attempt_id=NULL, completion_replay_attempt_id=? WHERE job_id=?"
+		jobUpdateArgs = []any{finalJobState, now.UnixNano(), attemptID, jobID}
 	}
-	_, err = tx.ExecContext(ctx, jobUpdate, finalJobState, now.UnixNano(), jobID)
+	_, err = tx.ExecContext(ctx, jobUpdate, jobUpdateArgs...)
 	if err != nil {
 		return Job{}, internalError(err, "complete job")
 	}
@@ -3459,6 +3473,7 @@ type attemptAuthority struct {
 	leaseExpires               time.Time
 	updatedAt                  time.Time
 	currentAttempt             sql.NullString
+	completionReplayAttempt    sql.NullString
 	completionKey              sql.NullString
 	completionHash             sql.NullString
 	spec                       contract.JobSpec
@@ -3475,7 +3490,8 @@ func readAttemptAuthority(ctx context.Context, q queryer, attemptID string) (att
 	err := q.QueryRowContext(ctx, `
 	SELECT a.attempt_id, a.job_id, a.node_id, n.identity_node_id, a.boot_session_id, n.boot_session_id,
 	       a.authority_generation, n.authority_generation, a.state, a.fencing_token,
-	       a.lease_expires_ns, a.updated_ns, j.current_attempt_id, a.completion_key, a.completion_hash,
+	       a.lease_expires_ns, a.updated_ns, j.current_attempt_id, j.completion_replay_attempt_id,
+	       a.completion_key, a.completion_hash,
 	       j.spec_json, a.image_observation_json, a.image_observation_hash,
 	       j.image_resolution_hash, a.started_ns
 FROM attempts a
@@ -3483,7 +3499,8 @@ JOIN jobs j ON j.job_id=a.job_id
 JOIN nodes n ON n.node_id=a.node_id
 	WHERE a.attempt_id=?`, attemptID).Scan(&a.attemptID, &a.jobID, &a.nodeID, &a.identityNodeID,
 		&a.bootSessionID, &a.currentBootSessionID, &a.authorityGeneration, &a.currentAuthorityGeneration,
-		&a.state, &a.fencingToken, &leaseNS, &updatedNS, &a.currentAttempt, &a.completionKey, &a.completionHash,
+		&a.state, &a.fencingToken, &leaseNS, &updatedNS, &a.currentAttempt, &a.completionReplayAttempt,
+		&a.completionKey, &a.completionHash,
 		&specJSON, &a.imageObservationJSON, &a.imageObservationHash,
 		&a.jobImageResolutionHash, &a.startedNS)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -3538,6 +3555,9 @@ func validateCompletionReplayAuthority(attemptID string, a attemptAuthority) err
 	}
 	if a.currentAttempt.Valid && a.currentAttempt.String != attemptID {
 		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's current attempt")
+	}
+	if !a.currentAttempt.Valid && (!a.completionReplayAttempt.Valid || a.completionReplayAttempt.String != attemptID) {
+		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's retained completion replay attempt")
 	}
 	return nil
 }
@@ -3733,7 +3753,7 @@ func getJobByDispatchKey(ctx context.Context, q queryer, dispatchKey string, now
 	var failureReason sql.NullString
 	var serviceColumns serviceJobColumns
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
-COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id), ''),
+COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id AND current=1), ''),
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
 state, spec_json, current_attempt_id, created_ns, updated_ns, request_hash, prestart_terminal_reason,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,
@@ -3785,7 +3805,7 @@ func getJobByID(ctx context.Context, q queryer, jobID string, now time.Time) (Jo
 	var failureReason sql.NullString
 	var serviceColumns serviceJobColumns
 	err := q.QueryRowContext(ctx, `SELECT jobs.job_id,
-COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id), ''),
+COALESCE((SELECT computer_id FROM computer_job_projections WHERE job_id=jobs.job_id AND current=1), ''),
 COALESCE((SELECT node_id FROM attempts WHERE attempt_id=jobs.current_attempt_id), ''),
 state, spec_json, current_attempt_id, created_ns, updated_ns, prestart_terminal_reason,
 service_jobs.desired_state, service_jobs.bound_node_id, service_jobs.restart_streak,

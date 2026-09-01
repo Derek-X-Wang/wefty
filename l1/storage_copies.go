@@ -143,7 +143,7 @@ func validateStoppedDetachedComputer(computer Computer, action string) error {
 	if computer.DesiredState != contract.ServiceDesiredStopped ||
 		(computer.CurrentJob.State != contract.JobStopped && computer.CurrentJob.State != contract.JobFailed) ||
 		computer.CurrentJob.CurrentAttemptID != "" {
-		return protocolError(contract.ErrorConflict, "Computer %q must be stopped and positively detached before %s", computer.ComputerID, action)
+		return protocolError(contract.ErrorConflict, "Computer %q must be stopped or failed with no current attempt before %s", computer.ComputerID, action)
 	}
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
 		return protocolError(contract.ErrorConflict, "Computer %q is in reconfiguration phase %q", computer.ComputerID, computer.ReconfigurationPhase)

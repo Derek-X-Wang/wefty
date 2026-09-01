@@ -18,7 +18,7 @@ const (
 	DefaultServiceStabilityWindow                  = 2 * time.Minute
 	DefaultServiceLogRetentionAge                  = 7 * 24 * time.Hour
 	DefaultServiceLogRetentionBytes          int64 = 32 << 20
-	DefaultServiceAttemptSummaries                 = 32
+	DefaultServiceAttemptSummaries                 = 32 // A detached Computer's replay-bound terminal attempt consumes one non-current slot.
 	DefaultMaxOneshotSlots                         = 4
 	DefaultMaxServiceSlots                         = 2
 	DefaultPrestartInfrastructureBudget            = 10 * time.Minute

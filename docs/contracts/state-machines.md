@@ -69,9 +69,9 @@ A service binding is also its service-slot reservation and, for `kind=oci`, a
 durable node-local image pin. A bound service holds
 the slot while queued for restart, claimed, running, or stopping. It releases
 the slot only after reaching stopped, latched failed, or verified removal; the
-binding itself remains durable. Reaching stopped never clears
-`current_attempt_id`, because an idempotent completion replay must still match
-the attempt that positively reaped the payload.
+binding itself remains durable. For non-Computer services, reaching stopped
+never clears `current_attempt_id`; the terminal attempt remains the
+runtime-history projection.
 
 Verified OCI removal releases the binding image pin only after runtime and
 managed service data are positively absent in a helper-generation receipt that
@@ -189,7 +189,19 @@ mutation. Capacity never auto-deletes: pruning is explicit, retains the immutabl
 `published → removal_pending → removed` only after a positive absence receipt.
 ENOSPC and digest mismatch publish no Backup and require positive copy absence.
 
-Restore is stopped-only and positively detached. L1 preserves `computer_id`
+Restore is stopped-only. For a Computer with a current attempt, an accepted
+stop completion's runtime-quiescence evidence atomically clears the current
+runtime owner while recording that terminal attempt as the exact idempotent
+completion replay binding; a stopped projection with a current attempt is not
+detached. An ordinary runtime failure retains its current attempt and is
+therefore not detached even though restore also admits a failed projection
+whose current attempt has been cleared. The L1 stopped-or-failed projection
+with no current attempt is a necessary restore-admission condition, not proof
+of node-local absence: helper-side `computer_storage_busy` remains the
+authoritative sufficiency check and refuses any still-attached or busy Storage,
+including after reconfiguration abort clears the projection without
+manufacturing absence evidence.
+L1 preserves `computer_id`
 and `storage_id`, reserves exactly current generation plus one, and commits any
 "keep predecessor as Backup" choice and Backup identity before helper work.
 Before the successor can attach, L1 revokes prior Computer, session, and L3
