@@ -477,7 +477,6 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		t.Fatalf("Computer restore receipt = %#v", restoreReceipt)
 	}
 	staleCredential.waitClosed(t, 30*time.Second)
-	preRestoreSessionClosed := true
 	reimaged = *restoreOutput.Computer
 	backupInventory := runComputerCLI[computerBackupInventoryReceipt](t, harness, false, "services", "backup", "list", reimaged.ComputerID)
 	capSet := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "backup", "set-cap", reimaged.ComputerID,
@@ -495,22 +494,21 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"services", "takeover", "take", reimaged.ComputerID, "--session-token-file", staleCredential.tokenFile)
 	recordComputerAuthority(receipt, reimaged)
 	storageAssertions := map[string]bool{
-		"cold_backup_available_live":                 backup.Status == "available",
-		"clone_fork_created_live":                    cloneOutput.Computer.ComputerID != reimaged.ComputerID,
-		"clone_machine_id_rekeyed_live":              cloneReceipt.MachineIDBeforeDigest != cloneReceipt.MachineIDAfterDigest,
-		"clone_source_unchanged_live":                cloneReceipt.SourceUnchanged,
-		"clone_first_attach_nonfresh_live":           cloneReceipt.DestinationPrepared && !cloneReceipt.PreparationReceipt && !cloneReceipt.DestinationChown && computerDisplayPublished(*cloneOutput.Computer),
-		"custody_export_manifest_bound_live":         manifestDigest == exportOutput.CustodyExport.ManifestDigest,
-		"custody_import_tainted_live":                importOutput.StorageProvenance.CustodyTainted,
-		"import_machine_id_rekeyed_live":             importReceipt.MachineIDBeforeDigest != importReceipt.MachineIDAfterDigest,
-		"import_source_unchanged_live":               importReceipt.SourceUnchanged,
-		"custody_delete_attested_live":               attestOutput.CustodyExport.OperatorAttestedDeleted,
-		"keep_old_restore_live":                      len(backupInventory.Backups) >= 2,
-		"restore_fresh_generation_live":              restoreOutput.Computer.StorageGeneration == restoreBaseline+1,
-		"restore_stopped_detached_live":              restoreStoppedDetached,
-		"restore_preserved_machine_id_live":          !restoreReceipt.OSIdentityRekeyed && restoreReceipt.MachineIDBeforeDigest == "" && restoreReceipt.MachineIDAfterDigest == "",
-		"restore_first_attach_nonfresh_live":         restoreReceipt.DestinationPrepared && !restoreReceipt.PreparationReceipt && !restoreReceipt.DestinationChown && computerDisplayPublished(reimaged),
-		"prestop_session_closed_before_restore_live": preRestoreSessionClosed,
+		"cold_backup_available_live":         backup.Status == "available",
+		"clone_fork_created_live":            cloneOutput.Computer.ComputerID != reimaged.ComputerID,
+		"clone_machine_id_rekeyed_live":      cloneReceipt.MachineIDBeforeDigest != cloneReceipt.MachineIDAfterDigest,
+		"clone_source_unchanged_live":        cloneReceipt.SourceUnchanged,
+		"clone_first_attach_nonfresh_live":   cloneReceipt.DestinationPrepared && !cloneReceipt.PreparationReceipt && !cloneReceipt.DestinationChown && computerDisplayPublished(*cloneOutput.Computer),
+		"custody_export_manifest_bound_live": manifestDigest == exportOutput.CustodyExport.ManifestDigest,
+		"custody_import_tainted_live":        importOutput.StorageProvenance.CustodyTainted,
+		"import_machine_id_rekeyed_live":     importReceipt.MachineIDBeforeDigest != importReceipt.MachineIDAfterDigest,
+		"import_source_unchanged_live":       importReceipt.SourceUnchanged,
+		"custody_delete_attested_live":       attestOutput.CustodyExport.OperatorAttestedDeleted,
+		"keep_old_restore_live":              len(backupInventory.Backups) >= 2,
+		"restore_fresh_generation_live":      restoreOutput.Computer.StorageGeneration == restoreBaseline+1,
+		"restore_stopped_detached_live":      restoreStoppedDetached,
+		"restore_preserved_machine_id_live":  !restoreReceipt.OSIdentityRekeyed && restoreReceipt.MachineIDBeforeDigest == "" && restoreReceipt.MachineIDAfterDigest == "",
+		"restore_first_attach_nonfresh_live": restoreReceipt.DestinationPrepared && !restoreReceipt.PreparationReceipt && !restoreReceipt.DestinationChown && computerDisplayPublished(reimaged),
 		"prestop_session_lineage_rejected_after_restore_live": preStopSessionRejectedAfterRestore.Error.Code == contract.ErrorTakeoverSessionEnded &&
 			preStopSessionRejectedAfterRestore.Receipt != nil && preStopSessionRejectedAfterRestore.Receipt.SessionEndReason == string(l1.ComputerTakeoverAttemptAuthorityLost),
 		"backup_cap_pressure_live": capSet.Computer != nil && strings.Contains(capPressure, string(contract.ErrorConflict)),
