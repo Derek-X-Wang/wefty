@@ -8,8 +8,23 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 )
+
+func custodyFileOwner(t *testing.T, path string) (uint32, uint32) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("Custody path %s has no Linux ownership", path)
+	}
+	return stat.Uid, stat.Gid
+}
 
 func custodyExportTestRequest(source CreateComputerBackupResponse, externalPath string) ExportComputerCustodyRequest {
 	receipt := source.Receipt
@@ -59,7 +74,12 @@ func TestComputerCustodyExportCrashLeavesPermanentExternalBytesAndResumes(t *tes
 	if err != nil || partial.Size() == 0 || partial.Size() >= request.SourceSize {
 		t.Fatalf("mid-export partial bytes = %#v err=%v", partial, err)
 	}
-	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	var chownCalls []string
+	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerCustodyChown: func(file *os.File, uid, gid int) error {
+			chownCalls = append(chownCalls, filepath.Base(file.Name()))
+			return file.Chown(uid, gid)
+		}}
 	completed, err := engine.ExportComputerCustody(t.Context(), request)
 	if err != nil || completed.Receipt.Kind != "computer_custody_export_verified" ||
 		completed.Receipt.ManifestDigest == "" || completed.Receipt.ContentDigest != request.SourceDigest {
@@ -67,6 +87,16 @@ func TestComputerCustodyExportCrashLeavesPermanentExternalBytesAndResumes(t *tes
 	}
 	if digest, err := digestFile(filepath.Join(externalRoot, "storage.ext4")); err != nil || digest != request.SourceDigest {
 		t.Fatalf("resumed Custody bytes digest = %s err=%v", digest, err)
+	}
+	wantUID, wantGID := custodyFileOwner(t, externalRoot)
+	for _, path := range []string{filepath.Join(externalRoot, "custody.json"), filepath.Join(externalRoot, "storage.ext4")} {
+		uid, gid := custodyFileOwner(t, path)
+		if uid != wantUID || gid != wantGID {
+			t.Fatalf("Custody file %s owner = %d:%d, want operator directory owner %d:%d", path, uid, gid, wantUID, wantGID)
+		}
+	}
+	if len(chownCalls) != 2 || chownCalls[0] != "storage.ext4" || !strings.HasPrefix(chownCalls[1], ".custody-manifest.tmp-") {
+		t.Fatalf("resumed Custody export ownership calls = %v, want disk then durable manifest temp", chownCalls)
 	}
 }
 

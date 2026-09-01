@@ -131,10 +131,14 @@ func TestCustodyImportValidatesReceiptCreatesNoGrantIdentityAndTaintsDescendants
 	h, node, source, backup, _ := publishedBackupForStorageCopy(t, 3)
 	export, directive := beginCustodyExport(t, h, node, source, backup, "import")
 	exportReceipt := successfulCustodyExportReceipt(directive)
-	if _, err := h.store.AcknowledgeComputerCustodyExport(context.Background(), "fabric-computer-node",
+	completedExport, err := h.store.AcknowledgeComputerCustodyExport(context.Background(), "fabric-computer-node",
 		source.ComputerID, ComputerCustodyExportAcknowledgementRequest{NodeID: node.NodeID,
-			BootSessionID: node.BootSessionID, IdempotencyKey: exportReceipt.ReceiptID, Receipt: exportReceipt}); err != nil {
+			BootSessionID: node.BootSessionID, IdempotencyKey: exportReceipt.ReceiptID, Receipt: exportReceipt})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if completedExport.Status != "available" || completedExport.ManifestDigest != exportReceipt.ManifestDigest {
+		t.Fatalf("verified Custody export = %#v, want available with manifest evidence", completedExport)
 	}
 	manifest := custodyManifest(directive)
 	operation, replayed, err := h.store.BeginComputerCustodyImport(context.Background(), export.ExportID,

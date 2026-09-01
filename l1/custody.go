@@ -373,7 +373,7 @@ func (s *Store) AcknowledgeComputerCustodyExport(ctx context.Context, identityNo
 	if status != "planned" {
 		return ComputerCustodyExport{}, protocolError(contract.ErrorConflict, "Custody export is no longer awaiting completion")
 	}
-	completedStatus := "exported"
+	completedStatus := "available"
 	if request.Receipt.Kind == "computer_custody_export_failed" {
 		completedStatus = "failed"
 	}

@@ -20,6 +20,11 @@ import (
 
 type computerCustodyManifest = contract.ComputerCustodyManifest
 
+type custodyExternalOwner struct {
+	uid int
+	gid int
+}
+
 func custodyManifestDigest(payload []byte) string {
 	digest := sha256.Sum256(payload)
 	return "sha256:" + hex.EncodeToString(digest[:])
@@ -82,7 +87,22 @@ func safeExternalCustodyRoot(runtimeRoot, externalPath string) (string, error) {
 	return root, nil
 }
 
-func writeCustodyManifest(root string, manifest computerCustodyManifest) ([]byte, error) {
+func readCustodyExternalOwner(root string) (custodyExternalOwner, error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		return custodyExternalOwner{}, err
+	}
+	if !info.IsDir() {
+		return custodyExternalOwner{}, errors.New("Custody path is not a directory")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return custodyExternalOwner{}, errors.New("Custody path ownership is unavailable")
+	}
+	return custodyExternalOwner{uid: int(stat.Uid), gid: int(stat.Gid)}, nil
+}
+
+func writeCustodyManifest(root string, owner custodyExternalOwner, chown func(*os.File, int, int) error, manifest computerCustodyManifest) ([]byte, error) {
 	payload, err := json.Marshal(manifest)
 	if err != nil {
 		return nil, err
@@ -94,6 +114,10 @@ func writeCustodyManifest(root string, manifest computerCustodyManifest) ([]byte
 	name := file.Name()
 	defer os.Remove(name)
 	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if err := chown(file, owner.uid, owner.gid); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
@@ -250,6 +274,14 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 		}
 		return ExportComputerCustodyResponse{}, err
 	}
+	externalOwner, err := readCustodyExternalOwner(externalRoot)
+	if err != nil {
+		return ExportComputerCustodyResponse{}, err
+	}
+	chown := func(file *os.File, uid, gid int) error { return file.Chown(uid, gid) }
+	if engine.computerCustodyChown != nil {
+		chown = engine.computerCustodyChown
+	}
 	manifest, _, exists, err := readCustodyManifest(externalRoot)
 	if err != nil {
 		return ExportComputerCustodyResponse{}, err
@@ -272,7 +304,7 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 			RootInstanceID: request.Authority.RootInstanceID, OperationRevision: request.Authority.OperationRevision,
 			CustodyFence: request.Authority.CustodyFence, JobSpec: request.JobSpec, JobSpecHash: request.JobSpecHash,
 			DiskFile: "storage.ext4", Phase: "writing"}
-		if _, err := writeCustodyManifest(externalRoot, manifest); err != nil {
+		if _, err := writeCustodyManifest(externalRoot, externalOwner, chown, manifest); err != nil {
 			return ExportComputerCustodyResponse{}, err
 		}
 		if engine.computerCustodyHook != nil {
@@ -284,6 +316,10 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 	destinationPath := filepath.Join(externalRoot, manifest.DiskFile)
 	destination, err := os.OpenFile(destinationPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
+		return ExportComputerCustodyResponse{}, err
+	}
+	if err := chown(destination, externalOwner.uid, externalOwner.gid); err != nil {
+		_ = destination.Close()
 		return ExportComputerCustodyResponse{}, err
 	}
 	sourceFile, err := os.Open(source)
@@ -321,7 +357,7 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 		return ExportComputerCustodyResponse{}, errors.New("Custody export destination digest mismatch")
 	}
 	manifest.Phase = "complete"
-	payload, err := writeCustodyManifest(externalRoot, manifest)
+	payload, err := writeCustodyManifest(externalRoot, externalOwner, chown, manifest)
 	if err != nil {
 		return ExportComputerCustodyResponse{}, err
 	}

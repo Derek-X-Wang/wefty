@@ -796,14 +796,18 @@ encryption, or replica policy. `ExportComputerCustody` accepts only an
 already-recorded event bound to one published Backup copy and rejects paths
 inside the managed root. It writes the external manifest before the disk,
 retains partial bytes after interruption, and returns a receipt only after
-size, content digest, and manifest digest are observed. `CopyComputerStorage`
-also accepts `import`: it verifies the recorded manifest digest and full disk
-digest before creating a managed destination, then applies the same narrow OS
-machine-ID rekey and optional filesystem expansion as clone. Successful
-receipts record distinct well-formed pre/post identity digests, unchanged
-source bytes, and the prepared/no-freshness/no-chown destination facts. Both receipts bind
-the Node, managed-root instance, operation revision, cleanup/custody fence,
-and helper generation; neither helper call decides removal truth.
+size, content digest, and manifest digest are observed. Files remain mode
+`0600` but inherit the owner and group of the operator-owned export directory,
+so a privileged helper does not strand the portable result under helper
+identity; L1 maps the verified receipt to durable status `available`.
+`CopyComputerStorage` also accepts `import`: it verifies the recorded manifest
+digest and full disk digest before creating a managed destination, then applies
+the same narrow OS machine-ID rekey and optional filesystem expansion as clone.
+Successful receipts record distinct well-formed pre/post identity digests,
+unchanged source bytes, and the prepared/no-freshness/no-chown destination
+facts. Both receipts bind the Node, managed-root instance, operation revision,
+cleanup/custody fence, and helper generation; neither helper call decides
+removal truth.
 
 `AttestRemoval` accepts only an exact service Job/generation plus reconstructed
 attempt authorities and their deterministic resource rows, and is called after

@@ -217,9 +217,12 @@ managed-root, path, and fence evidence and moves the Computer through
 write the external manifest or its first storage byte. Missing or late helper
 completion cannot retract the event. Removal supersedes a still-planned export
 and closes its directive fence; the already-committed event remains permanent
-taint. Typed helper failure evidence closes `exporting`, and a dead bound Node
-permits an explicit abort. `operator_attested_deleted` is append-only operator
-evidence and never changes `removed_reduced`.
+taint. A verified helper receipt advances the durable export from `planned` to
+`available`, meaning the complete external disk and `custody.json` manifest
+were both digest-verified. Typed helper failure evidence records `failed` and
+closes `exporting`, and a dead bound Node permits an explicit abort.
+`operator_attested_deleted` is append-only operator evidence and never changes
+`removed_reduced`.
 
 `custody.json` is the portable import authority: it contains the sanitized Job
 specification, manifest digest inputs, immutable source digest, and Storage

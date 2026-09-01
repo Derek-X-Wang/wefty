@@ -1122,7 +1122,7 @@
                     "export_id": { "type": "string", "minLength": 1 },
                     "source_storage_id": { "type": "string", "minLength": 1 },
                     "source_generation": { "type": "integer", "format": "int64", "minimum": 1 },
-                    "status": { "enum": ["planned", "exported", "superseded"] },
+                    "status": { "enum": ["planned", "available", "failed", "superseded"] },
                     "operator_attested_deleted": { "type": "boolean" }
                   }
                 }
