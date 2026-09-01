@@ -48,7 +48,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 	}
 
 	wantColumns := map[string][]string{
-		"jobs":                      {"image_resolution_json", "image_resolution_hash", "prestart_budget_deadline_ns", "prestart_terminal_reason"},
+		"jobs":                      {"image_resolution_json", "image_resolution_hash", "prestart_budget_deadline_ns", "prestart_terminal_reason", "completion_replay_attempt_id"},
 		"log_events":                {"sequence_end"},
 		"job_required_capabilities": {"job_id", "capability"},
 		"nodes": {

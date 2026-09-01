@@ -189,13 +189,18 @@ mutation. Capacity never auto-deletes: pruning is explicit, retains the immutabl
 `published → removal_pending → removed` only after a positive absence receipt.
 ENOSPC and digest mismatch publish no Backup and require positive copy absence.
 
-Restore is stopped-only and positively detached. For a running Computer, the
-accepted stop completion's runtime-quiescence evidence atomically clears the
-current runtime owner while retaining the terminal attempt for idempotent
-completion replay; a stopped projection with a current attempt is not detached.
-An ordinary runtime failure retains its current attempt and is therefore not
-positive detachment even though restore also admits a separately detached
-failed projection.
+Restore is stopped-only. For a Computer with a current attempt, an accepted
+stop completion's runtime-quiescence evidence atomically clears the current
+runtime owner while recording that terminal attempt as the exact idempotent
+completion replay binding; a stopped projection with a current attempt is not
+detached. An ordinary runtime failure retains its current attempt and is
+therefore not detached even though restore also admits a failed projection
+whose current attempt has been cleared. The L1 stopped-or-failed projection
+with no current attempt is a necessary restore-admission condition, not proof
+of node-local absence: helper-side `computer_storage_busy` remains the
+authoritative sufficiency check and refuses any still-attached or busy Storage,
+including after reconfiguration abort clears the projection without
+manufacturing absence evidence.
 L1 preserves `computer_id`
 and `storage_id`, reserves exactly current generation plus one, and commits any
 "keep predecessor as Backup" choice and Backup identity before helper work.
