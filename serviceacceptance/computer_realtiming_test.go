@@ -110,6 +110,10 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		helperSocket, helperChecksum, probeReference, probeDigest, recordBarrierResidue)
 	importRealtimeProbeImage(t, archive, helperSocket, helperChecksum, reference, digest, recordBarrierResidue)
 	importRealtimeProbeImage(t, reimageArchive, helperSocket, helperChecksum, reimageReference, reimageDigest, recordBarrierResidue)
+	removalBaseline := inspectHelperNamespaceInventory(t, helperSocket, helperChecksum)
+	receipt.ResidueInventories["pre_matrix_observed_inventory"] = removalBaseline.Inventory
+	receipt.ResidueInventories["pre_matrix_runtime_residue"] = removalBaseline.RuntimeResidue
+	receipt.ResidueInventories["pre_matrix_durable_retained"] = removalBaseline.DurableRetained
 	intentPath := filepath.Join(t.TempDir(), "oci-intent.json")
 	if _, err := lima.InitializeOCIIntent(intentPath, time.Now()); err != nil {
 		t.Fatal(err)
@@ -656,25 +660,28 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	receipt.ResidueInventories["post_removal_observed_inventory"] = verification.Inventory
 	receipt.ResidueInventories["post_removal_runtime_residue"] = verification.RuntimeResidue
 	receipt.ResidueInventories["post_removal_durable_retained"] = verification.DurableRetained
-	receipt.ResidueAssertions["post_removal_observed_inventory_empty"] = ocihelper.InventoryEmpty(verification.Inventory)
-	receipt.ResidueAssertions["post_removal_runtime_residue_empty"] = ocihelper.InventoryEmpty(verification.RuntimeResidue)
-	receipt.ResidueAssertions["post_removal_durable_retained_matches_expected_empty_custody"] = ocihelper.InventoryEmpty(verification.DurableRetained)
+	receipt.ResidueAssertions["post_removal_observed_inventory_restored"] = reflect.DeepEqual(verification.Inventory, removalBaseline.Inventory)
+	receipt.ResidueAssertions["post_removal_runtime_residue_restored"] = reflect.DeepEqual(verification.RuntimeResidue, removalBaseline.RuntimeResidue)
+	receipt.ResidueAssertions["post_removal_durable_retained_restored"] = reflect.DeepEqual(verification.DurableRetained, removalBaseline.DurableRetained)
 	archiveAfter := sha256File(t, archive)
 	cacheAfter := liveContainerdImagePresent(t, digest)
 	completeLinuxComputerRow(t, receipt, "linux.removal", map[string]bool{
-		"verified_absence_outcome_live":      verified.RemovalOutcome == "removed_verified",
-		"reduced_custody_outcome_live":       reduced.RemovalOutcome == "removed_reduced",
-		"reduced_bound_to_tainted_computer":  reduced.ComputerID == taintedComputerID,
-		"independent_helper_inventory_empty": ocihelper.InventoryEmpty(verification.Inventory),
-		"containers_absent":                  len(verification.Inventory.Containers) == 0,
-		"tasks_absent":                       len(verification.Inventory.Tasks) == 0,
-		"disks_loops_mounts_absent":          len(verification.Inventory.ComputerDiskImages)+len(verification.Inventory.ComputerDiskLoops)+len(verification.Inventory.ComputerDiskMounts) == 0,
-		"logs_and_control_absent":            len(verification.Inventory.LogSegments)+len(verification.Inventory.Cgroups) == 0,
-		"durable_retained_matches_custody":   ocihelper.InventoryEmpty(verification.DurableRetained),
-		"publication_withdrawn":              verified.DisplayEndpoint == nil,
-		"operator_bind_source_untouched":     archiveBefore == archiveAfter,
-		"shared_image_cache_untouched":       cacheBefore && cacheAfter,
-		"removal_command_intact":             removalCommandIntact,
+		"verified_absence_outcome_live":         verified.RemovalOutcome == "removed_verified",
+		"reduced_custody_outcome_live":          reduced.RemovalOutcome == "removed_reduced",
+		"reduced_bound_to_tainted_computer":     reduced.ComputerID == taintedComputerID,
+		"independent_helper_inventory_restored": reflect.DeepEqual(verification.Inventory, removalBaseline.Inventory),
+		"containers_restored":                   reflect.DeepEqual(verification.Inventory.Containers, removalBaseline.Inventory.Containers),
+		"tasks_restored":                        reflect.DeepEqual(verification.Inventory.Tasks, removalBaseline.Inventory.Tasks),
+		"disks_loops_mounts_restored": reflect.DeepEqual(verification.Inventory.ComputerDiskImages, removalBaseline.Inventory.ComputerDiskImages) &&
+			reflect.DeepEqual(verification.Inventory.ComputerDiskLoops, removalBaseline.Inventory.ComputerDiskLoops) &&
+			reflect.DeepEqual(verification.Inventory.ComputerDiskMounts, removalBaseline.Inventory.ComputerDiskMounts),
+		"logs_and_control_restored": reflect.DeepEqual(verification.Inventory.LogSegments, removalBaseline.Inventory.LogSegments) &&
+			reflect.DeepEqual(verification.Inventory.Cgroups, removalBaseline.Inventory.Cgroups),
+		"durable_retained_restored":      reflect.DeepEqual(verification.DurableRetained, removalBaseline.DurableRetained),
+		"publication_withdrawn":          verified.DisplayEndpoint == nil,
+		"operator_bind_source_untouched": archiveBefore == archiveAfter,
+		"shared_image_cache_untouched":   cacheBefore && cacheAfter,
+		"removal_command_intact":         removalCommandIntact,
 	}, map[string]string{"verified_computer_id": verified.ComputerID, "reduced_computer_id": reduced.ComputerID,
 		"custody_tainted_computer_id": taintedComputerID, "verified_outcome": verified.RemovalOutcome,
 		"reduced_outcome": reduced.RemovalOutcome, "inventory_source": "helper VerifyNamespace route"})
