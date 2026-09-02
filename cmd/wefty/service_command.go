@@ -492,7 +492,7 @@ func executeServiceRemove(
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services remove JOB_ID [--wait DURATION]")
 	}
-	if err := wait.validate(flags); err != nil {
+	if err := wait.validateDurations(); err != nil {
 		return err
 	}
 	if computerMutationFlagsSet(mutation) {
@@ -506,6 +506,9 @@ func executeServiceRemove(
 		return err
 	}
 	if computer != nil {
+		if err := wait.validate(flags); err != nil {
+			return err
+		}
 		precondition, resolveErr := mutation.resolve(ctx, clients, computer.ComputerID)
 		if resolveErr != nil {
 			return resolveErr

@@ -131,7 +131,7 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 	if _, embedded := properties["intent_history"]; embedded {
 		t.Fatal("Computer authority response must not materialize unbounded intent history")
 	}
-	if _, present := properties["storage_cleanup_quarantine"]; !present {
+	if _, present := properties["storage_cleanup_quarantines"]; !present {
 		t.Fatal("Computer authority response omits typed Storage cleanup quarantine evidence")
 	}
 	if _, present := schemas["ComputerIntentList"]; !present {

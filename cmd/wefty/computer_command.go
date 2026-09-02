@@ -467,7 +467,7 @@ func waitForComputerRemoval(ctx context.Context, clients *apiClients, computerID
 		if readErr != nil {
 			return false, readErr
 		}
-		return computerRemovalTerminal(observed) || computerRemovalQuarantined(observed), nil
+		return computerRemovalTerminal(observed) || computerRemovalQuarantine(observed) != nil, nil
 	})
 	return observed, observation, err
 }
@@ -481,43 +481,55 @@ func computerRemovalTerminal(computer l1.Computer) bool {
 	// A never-bound Computer cannot have created node-owned resources, so L1
 	// finalizes it without creating a removal directive or cleanup receipt.
 	if job.Removal == nil {
-		return computer.BoundNodeID == "" && job.BoundNodeID == ""
+		return computer.BoundNodeID == "" && (job.ServiceJob == nil || job.ServiceJob.BoundNodeID == "")
 	}
 	return job.Removal.RemovalBoundNodeID == "" || job.Removal.CleanupAcknowledgedAt != nil
 }
 
-func computerRemovalQuarantined(computer l1.Computer) bool {
-	quarantine := computer.StorageCleanupQuarantine
+func computerRemovalQuarantine(computer l1.Computer) *l1.ComputerStorageCleanupQuarantine {
 	removal := computer.CurrentJob.Removal
-	return quarantine != nil && removal != nil && computer.DesiredState == contract.ServiceDesiredRemoved &&
-		quarantine.JobID == computer.CurrentJobID && quarantine.RemovalGeneration == removal.RemovalGeneration
+	if removal == nil || computer.DesiredState != contract.ServiceDesiredRemoved ||
+		computer.CurrentJob.State != contract.JobRemovalPending ||
+		removal.CleanupStatus != l1.ServiceRemovalCleanupQuarantined ||
+		removal.RemovalOutcome != l1.ServiceRemovalOutcomeCleanupQuarantined {
+		return nil
+	}
+	for index := range computer.StorageCleanupQuarantines {
+		quarantine := &computer.StorageCleanupQuarantines[index]
+		if quarantine.Operation == l1.ComputerStorageCleanupRemoval && quarantine.JobID == computer.CurrentJobID &&
+			quarantine.RemovalGeneration == removal.RemovalGeneration {
+			return quarantine
+		}
+	}
+	return nil
 }
 
 func awaitedComputerRemovalOutcome(computer l1.Computer) error {
-	if computerRemovalQuarantined(computer) {
-		quarantine := computer.StorageCleanupQuarantine
+	if computerRemovalTerminal(computer) {
+		return nil
+	}
+	if quarantine := computerRemovalQuarantine(computer); quarantine != nil {
 		if quarantine.Kind != "managed_volume_cleanup_quarantined" || quarantine.ReceiptID == "" ||
 			quarantine.VolumeKind != "computer_disk" || quarantine.FailureReason != "operation_failed" || quarantine.Attempts != 3 {
 			return computerRemovalOutcomeMismatch(computer, "Computer removal cleanup quarantine lacks complete receipt-derived facts")
 		}
 		return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
 			Code: contract.ErrorConflict, Message: "Computer removal cleanup quarantined: operation_failed", Retryable: false,
-			Details: map[string]any{"computer_id": computer.ComputerID, "job_id": computer.CurrentJobID,
+			Details: map[string]any{"removal_computer_id": computer.ComputerID, "computer_id": quarantine.ComputerID,
+				"job_id":     computer.CurrentJobID,
 				"receipt_id": quarantine.ReceiptID, "storage_id": quarantine.StorageID,
 				"storage_generation": quarantine.StorageGeneration, "failure_reason": quarantine.FailureReason,
 				"attempts": quarantine.Attempts},
 		}}
 	}
-	if !computerRemovalTerminal(computer) {
-		return computerRemovalOutcomeMismatch(computer, "awaited Computer removal lacks receipt-derived terminal Slot release")
-	}
-	return nil
+	return computerRemovalOutcomeMismatch(computer, "awaited Computer removal lacks receipt-derived terminal Slot release")
 }
 
 func computerRemovalOutcomeMismatch(computer l1.Computer, message string) error {
 	details := map[string]any{"computer_id": computer.ComputerID, "job_id": computer.CurrentJobID,
 		"job_state": computer.CurrentJob.State, "removal_outcome": computer.RemovalOutcome}
-	details["holds_slot"] = computer.CurrentJob.ServiceJob != nil && computer.CurrentJob.SlotHeld
+	details["holds_slot"] = computer.CurrentJob.State == contract.JobRemovalPending ||
+		computer.CurrentJob.State == contract.JobAgentCleaned
 	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
 		Code: contract.ErrorConflict, Message: message, Retryable: false, Details: details,
 	}}

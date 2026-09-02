@@ -20,14 +20,14 @@ func resetReceipt(directive ComputerStorageResetDirective) ComputerStorageResetR
 
 func TestComputerStorageCleanupQuarantineEvidenceIsAuthorityBound(t *testing.T) {
 	receipt := ComputerStorageCleanupQuarantine{Kind: "managed_volume_cleanup_quarantined", ReceiptID: "receipt",
-		VolumeKind: "computer_disk", ComputerID: "computer", StorageID: "storage", StorageGeneration: 1,
+		Operation: ComputerStorageCleanupReset, VolumeKind: "computer_disk", ComputerID: "computer", StorageID: "storage", StorageGeneration: 1,
 		NodeID: "node", BootSessionID: "boot", JobID: "job", RemovalGeneration: 2, CleanupFence: "fence",
 		FailureReason: "operation_failed", Attempts: 3}
-	if err := validateComputerStorageCleanupQuarantine(receipt, "computer", "storage", 1, "node", "boot", "job", 2, "fence"); err != nil {
+	if err := validateComputerStorageCleanupQuarantine(receipt, ComputerStorageCleanupReset, "computer", "storage", 1, "node", "boot", "job", 2, "fence"); err != nil {
 		t.Fatal(err)
 	}
 	receipt.JobID = "other"
-	if err := validateComputerStorageCleanupQuarantine(receipt, "computer", "storage", 1, "node", "boot", "job", 2, "fence"); errorCode(err) != contract.ErrorInvalidRequest {
+	if err := validateComputerStorageCleanupQuarantine(receipt, ComputerStorageCleanupReset, "computer", "storage", 1, "node", "boot", "job", 2, "fence"); errorCode(err) != contract.ErrorInvalidRequest {
 		t.Fatalf("unbound cleanup quarantine error = %v", err)
 	}
 }

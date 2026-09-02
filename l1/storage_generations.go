@@ -92,30 +92,42 @@ type computerStorageResetRow struct {
 	ResumeDesiredRunning bool
 }
 
-func readComputerStorageCleanupQuarantine(ctx context.Context, q queryer, computerID string) (*ComputerStorageCleanupQuarantine, error) {
+func readComputerStorageCleanupQuarantines(ctx context.Context, q nodeQueryer, computerID string) ([]ComputerStorageCleanupQuarantine, error) {
+	var receipts []ComputerStorageCleanupQuarantine
 	for _, query := range []string{
 		`SELECT service_removals.cleanup_quarantine_json FROM service_removals
 			JOIN computer_job_projections ON computer_job_projections.job_id=service_removals.job_id
 			WHERE computer_job_projections.computer_id=? AND service_removals.cleanup_quarantine_json IS NOT NULL
-			ORDER BY service_removals.requested_ns DESC LIMIT 1`,
-		`SELECT cleanup_quarantine_json FROM computer_storage_resets WHERE computer_id=? AND cleanup_quarantine_json IS NOT NULL ORDER BY intent_revision DESC LIMIT 1`,
-		`SELECT cleanup_quarantine_json FROM computer_storage_copy_operations WHERE destination_computer_id=? AND cleanup_quarantine_json IS NOT NULL ORDER BY operation_revision DESC LIMIT 1`,
+			ORDER BY service_removals.requested_ns DESC`,
+		`SELECT cleanup_quarantine_json FROM computer_storage_resets WHERE computer_id=? AND cleanup_quarantine_json IS NOT NULL ORDER BY intent_revision DESC`,
+		`SELECT cleanup_quarantine_json FROM computer_storage_copy_operations WHERE destination_computer_id=? AND cleanup_quarantine_json IS NOT NULL ORDER BY operation_revision DESC`,
 	} {
-		var payload []byte
-		err := q.QueryRowContext(ctx, query, computerID).Scan(&payload)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
+		rows, err := q.QueryContext(ctx, query, computerID)
 		if err != nil {
 			return nil, err
 		}
-		var receipt ComputerStorageCleanupQuarantine
-		if err := json.Unmarshal(payload, &receipt); err != nil {
+		for rows.Next() {
+			var payload []byte
+			if err := rows.Scan(&payload); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			var receipt ComputerStorageCleanupQuarantine
+			if err := json.Unmarshal(payload, &receipt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			receipts = append(receipts, receipt)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		return &receipt, nil
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
 	}
-	return nil, nil
+	return receipts, nil
 }
 
 func computerStorageResetRequestHash(request ComputerStorageResetRequest) (string, error) {
@@ -471,9 +483,11 @@ func (s *Store) recordComputerStorageResetVerification(ctx context.Context, iden
 	return nil
 }
 
-func validateComputerStorageCleanupQuarantine(receipt ComputerStorageCleanupQuarantine, computerID, storageID string,
+func validateComputerStorageCleanupQuarantine(receipt ComputerStorageCleanupQuarantine, operation ComputerStorageCleanupOperation,
+	computerID, storageID string,
 	storageGeneration int64, nodeID, bootSessionID, jobID string, removalGeneration uint64, cleanupFence string) error {
 	if receipt.Kind != "managed_volume_cleanup_quarantined" || receipt.ReceiptID == "" || receipt.VolumeKind != "computer_disk" ||
+		receipt.Operation != operation ||
 		receipt.ComputerID != computerID || receipt.StorageID != storageID || receipt.StorageGeneration != storageGeneration ||
 		receipt.NodeID != nodeID || receipt.BootSessionID != bootSessionID || receipt.JobID != jobID ||
 		receipt.RemovalGeneration != removalGeneration || receipt.CleanupFence != cleanupFence ||
@@ -647,7 +661,7 @@ func (s *Store) AcknowledgeComputerStorageRetirement(ctx context.Context, identi
 		if reset.Status != "published" {
 			return Computer{}, protocolError(contract.ErrorStaleIntentRevision, "Computer Storage cleanup quarantine is not awaiting predecessor retirement")
 		}
-		if err := validateComputerStorageCleanupQuarantine(*request.CleanupQuarantine, computerID, reset.StorageID,
+		if err := validateComputerStorageCleanupQuarantine(*request.CleanupQuarantine, ComputerStorageCleanupReset, computerID, reset.StorageID,
 			reset.OldGeneration, reset.BoundNodeID, request.BootSessionID, reset.JobID, request.RemovalGeneration, reset.CleanupFence); err != nil {
 			return Computer{}, err
 		}

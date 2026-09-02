@@ -282,11 +282,16 @@ supersession tombstone under the Backup mutex before it proves absence. A late
 create must observe that tombstone and refuse to publish bytes.
 If bounded Computer-disk deletion instead produces
 `managed_volume_cleanup_quarantined`, the agent records that exact receipt on
-the standing removal operation. The Job remains `removal_pending`, retains its
-Slot, and L1 stops ordinary redispatch of that quarantined directive; the
-operator surface returns a typed conflict carrying the receipt facts instead
-of claiming removal or waiting until timeout. Recovery requires the later
-helper-sweep/operator workflow that can resolve the quarantined Storage.
+the standing removal operation with `cleanup_status=quarantined` and
+`removal_outcome=cleanup_quarantined`. The Job remains `removal_pending`,
+retains its Slot, and L1 stops ordinary redispatch of that quarantined
+directive. An ordinary success acknowledgement is a typed conflict and cannot
+clear or finalize the quarantine; recovery requires a later explicit
+helper-sweep/operator resolution receipt. The operator surface returns the
+quarantined operation and exact receipt facts instead of claiming removal or
+waiting until timeout. Every unresolved reset, restore, and removal receipt is
+listed independently on Computer authority, so one operation cannot shadow
+another.
 Cross-node replicas remain a later contract.
 
 The first successful claim copies the ordinary service binding to the Computer

@@ -105,6 +105,7 @@ type ServiceRemoval struct {
 	RemovalBoundNodeID    string                       `json:"bound_node_id,omitempty"`
 	RemovalGeneration     uint64                       `json:"removal_generation"`
 	RemovalRequestedAt    time.Time                    `json:"removal_requested_at"`
+	CleanupStatus         ServiceRemovalCleanupStatus  `json:"cleanup_status"`
 	RemovalOutcome        ServiceRemovalOutcome        `json:"removal_outcome,omitempty"`
 	RemovedAt             *time.Time                   `json:"removed_at,omitempty"`
 	CleanupAcknowledgedAt *time.Time                   `json:"cleanup_acknowledged_at,omitempty"`
@@ -113,8 +114,18 @@ type ServiceRemoval struct {
 type ServiceRemovalOutcome string
 
 const (
-	ServiceRemovalVerified  ServiceRemovalOutcome = "verified_removed"
-	ServiceRemovalForgotten ServiceRemovalOutcome = "force_forgotten"
+	ServiceRemovalVerified                  ServiceRemovalOutcome = "verified_removed"
+	ServiceRemovalForgotten                 ServiceRemovalOutcome = "force_forgotten"
+	ServiceRemovalOutcomeCleanupQuarantined ServiceRemovalOutcome = "cleanup_quarantined"
+)
+
+type ServiceRemovalCleanupStatus string
+
+const (
+	ServiceRemovalCleanupPending      ServiceRemovalCleanupStatus = "pending"
+	ServiceRemovalCleanupQuarantined  ServiceRemovalCleanupStatus = "quarantined"
+	ServiceRemovalCleanupAcknowledged ServiceRemovalCleanupStatus = "acknowledged"
+	ServiceRemovalCleanupNotRequired  ServiceRemovalCleanupStatus = "not_required"
 )
 
 // RemovalDirective is durable node-scoped cleanup authority. Unlike an
@@ -174,20 +185,29 @@ type RemovalAcknowledgementRequest struct {
 }
 
 type ComputerStorageCleanupQuarantine struct {
-	Kind              string `json:"kind"`
-	ReceiptID         string `json:"receipt_id"`
-	VolumeKind        string `json:"volume_kind"`
-	ComputerID        string `json:"computer_id"`
-	StorageID         string `json:"storage_id"`
-	StorageGeneration int64  `json:"storage_generation"`
-	NodeID            string `json:"node_id"`
-	BootSessionID     string `json:"boot_session_id"`
-	JobID             string `json:"job_id"`
-	RemovalGeneration uint64 `json:"removal_generation"`
-	CleanupFence      string `json:"cleanup_fence"`
-	FailureReason     string `json:"failure_reason"`
-	Attempts          int    `json:"attempts"`
+	Kind              string                          `json:"kind"`
+	Operation         ComputerStorageCleanupOperation `json:"operation"`
+	ReceiptID         string                          `json:"receipt_id"`
+	VolumeKind        string                          `json:"volume_kind"`
+	ComputerID        string                          `json:"computer_id"`
+	StorageID         string                          `json:"storage_id"`
+	StorageGeneration int64                           `json:"storage_generation"`
+	NodeID            string                          `json:"node_id"`
+	BootSessionID     string                          `json:"boot_session_id"`
+	JobID             string                          `json:"job_id"`
+	RemovalGeneration uint64                          `json:"removal_generation"`
+	CleanupFence      string                          `json:"cleanup_fence"`
+	FailureReason     string                          `json:"failure_reason"`
+	Attempts          int                             `json:"attempts"`
 }
+
+type ComputerStorageCleanupOperation string
+
+const (
+	ComputerStorageCleanupRemoval ComputerStorageCleanupOperation = "removal"
+	ComputerStorageCleanupReset   ComputerStorageCleanupOperation = "reset"
+	ComputerStorageCleanupRestore ComputerStorageCleanupOperation = "restore"
+)
 
 type ForceForgetRequest struct {
 	Force bool `json:"force"`

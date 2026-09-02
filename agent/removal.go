@@ -564,7 +564,7 @@ func (controller *removalController) acknowledge(ctx context.Context, removal lo
 }
 
 func (controller *removalController) acknowledgeQuarantine(ctx context.Context, removal localRemoval, cleanupErr error) error {
-	request, quarantined := storageCleanupQuarantineAcknowledgement(cleanupErr, removal.rootInstanceID)
+	request, quarantined := storageCleanupQuarantineAcknowledgement(cleanupErr, removal.rootInstanceID, l1.ComputerStorageCleanupRemoval)
 	if !quarantined {
 		return errors.New("acknowledge Computer removal quarantine requires typed cleanup evidence")
 	}

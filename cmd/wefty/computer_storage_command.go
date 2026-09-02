@@ -82,11 +82,18 @@ func (wait *storageWaitFlags) bind(flags *flag.FlagSet) {
 
 func (wait *storageWaitFlags) validate(flags *flag.FlagSet) error {
 	flags.Visit(func(visited *flag.Flag) { wait.pollSet = wait.pollSet || visited.Name == "poll-interval" })
-	if wait.timeout < 0 || wait.pollInterval <= 0 {
-		return usageError("--wait cannot be negative and --poll-interval must be positive")
+	if err := wait.validateDurations(); err != nil {
+		return err
 	}
 	if wait.pollSet && wait.timeout == 0 {
 		return usageError("--poll-interval requires --wait DURATION")
+	}
+	return nil
+}
+
+func (wait storageWaitFlags) validateDurations() error {
+	if wait.timeout < 0 || wait.pollInterval <= 0 {
+		return usageError("--wait cannot be negative and --poll-interval must be positive")
 	}
 	return nil
 }
