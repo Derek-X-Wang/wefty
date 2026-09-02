@@ -51,7 +51,9 @@ URL at `/wefty/control/l3-endpoint`, each by same-directory atomic replacement,
 mode `0400`, and owned by the resolved image tenant uid/gid. Mid-attempt enable
 starts the bridge and publishes both files; disable, revocation, or authority
 loss closes the bridge and removes both. A tenant must reopen or watch both
-paths and treat either missing file as submission disabled. The files remain
+paths and treat either missing file as submission disabled. An in-flight
+request canceled by that authority closure receives HTTP 401 with typed
+`unauthorized`; transport failure alone is not revocation evidence. The files remain
 attempt-local tmpfs and never enter `/wefty/service`, a JobSpec, logs,
 inspection, or removal evidence.
 

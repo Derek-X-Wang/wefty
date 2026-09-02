@@ -584,7 +584,9 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	paused := startLiveComputerPausedSubmission(t, reimaged, "linux-native-revocation-race", liveComputerRunRequest(300*time.Second))
 	disabled := runComputerCLI[l1.ComputerSubmissionMutationResult](t, harness, true, "services", "submission", "disable", reimaged.ComputerID,
 		"--expect-current", "--idempotency-key", "linux-native-submission-disable")
-	pausedStatus := paused.finish(t)
+	pausedResult := paused.finish(t)
+	var pausedError contract.ErrorResponse
+	pausedErrorDecoded := json.Unmarshal([]byte(pausedResult.Body), &pausedError) == nil
 	guestAssertions := map[string]bool{
 		"live_default_off":                    defaultOff,
 		"live_submission_enabled":             submission.SubmitEnabled && submission.Revoked != nil,
@@ -597,12 +599,15 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"live_twenty_inflight_boundary":       limited.Status == http.StatusConflict && limitedError.Error.Code == contract.ErrorSubmitInflightLimit,
 		"live_submission_revoked":             !disabled.SubmitEnabled && disabled.Revoked != nil,
 		"live_revocation_revision_advanced":   disabled.SubmitIntentRevision > submission.SubmitIntentRevision,
-		"live_revocation_race_closed":         pausedStatus == http.StatusUnauthorized || pausedStatus == 0,
+		"live_revocation_race_closed": pausedResult.Status == http.StatusUnauthorized && pausedErrorDecoded &&
+			pausedError.Error.Code == contract.ErrorUnauthorized && pausedResult.TransportError == "",
 	}
 	guestEvidence := map[string]string{"policy_revision": fmt.Sprint(submission.PolicyRevision),
 		"submit_intent_revision": fmt.Sprint(submission.SubmitIntentRevision),
 		"root_run_id":            accepted[0].RunID,
-		"blocked_assertion":      "candidate-bound complete M3 OCI matrix root Run execution result"}
+		"revocation_race_result": fmt.Sprintf("status=%d code=%s transport_error=%s", pausedResult.Status,
+			pausedError.Error.Code, pausedResult.TransportError),
+		"blocked_assertion": "candidate-bound complete M3 OCI matrix root Run execution result"}
 	if mutatingLinuxComputerRow("linux.guest_authority") {
 		if err := receipt.pass("linux.guest_authority", guestAssertions, guestEvidence); err == nil {
 			t.Fatal("guest-authority lane mutation did not fail")
@@ -1376,8 +1381,9 @@ func liveComputerContainerID(t *testing.T, jobID string) string {
 }
 
 type liveComputerHTTPResult struct {
-	Status int    `json:"status"`
-	Body   string `json:"body"`
+	Status         int    `json:"status"`
+	Body           string `json:"body"`
+	TransportError string `json:"transport_error,omitempty"`
 }
 
 const liveComputerHTTPPython = `
@@ -1464,7 +1470,7 @@ func waitForLiveComputerHTTP(t *testing.T, computer l1.Computer, method, path, i
 }
 
 const liveComputerPausedHTTPPython = `
-import json, socket, sys, time, urllib.parse
+import http.client, json, socket, sys, urllib.parse
 path, key, body = sys.argv[1:4]
 endpoint = urllib.parse.urlsplit(open("/wefty/control/l3-endpoint", encoding="utf-8").read().strip())
 token = open("/wefty/control/computer-token", encoding="utf-8").read().strip()
@@ -1472,30 +1478,26 @@ payload = body.encode()
 request = ("POST " + path + " HTTP/1.1\r\nHost: " + endpoint.netloc + "\r\nAuthorization: Bearer " + token +
            "\r\nContent-Type: application/json\r\nIdempotency-Key: " + key + "\r\nConnection: close\r\nContent-Length: " +
            str(len(payload)) + "\r\n\r\n").encode()
-status = 0
+status, response_body, transport_error = 0, "", ""
 try:
     connection = socket.create_connection((endpoint.hostname, endpoint.port), timeout=30)
     split = len(payload) // 2
     connection.sendall(request + payload[:split])
     print("PAUSED", flush=True)
-    time.sleep(8)
+    sys.stdin.readline()
     connection.sendall(payload[split:])
-    response = b""
-    while True:
-        chunk = connection.recv(65536)
-        if not chunk:
-            break
-        response += chunk
-    if response:
-        status = int(response.split(b" ", 2)[1])
-except Exception:
-    pass
-print(json.dumps({"status": status, "body": "revocation-race"}), flush=True)
+    response = http.client.HTTPResponse(connection)
+    response.begin()
+    status, response_body = response.status, response.read().decode()
+except Exception as error:
+    transport_error = type(error).__name__
+print(json.dumps({"status": status, "body": response_body, "transport_error": transport_error}), flush=True)
 `
 
 type liveComputerPausedSubmission struct {
 	command *exec.Cmd
 	scanner *bufio.Scanner
+	stdin   io.WriteCloser
 	stderr  *bytes.Buffer
 }
 
@@ -1515,6 +1517,10 @@ func startLiveComputerPausedSubmission(t *testing.T, computer l1.Computer, idemp
 	if err != nil {
 		t.Fatal(err)
 	}
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	stderr := &bytes.Buffer{}
 	command.Stderr = stderr
 	if err := command.Start(); err != nil {
@@ -1525,11 +1531,17 @@ func startLiveComputerPausedSubmission(t *testing.T, computer l1.Computer, idemp
 		_ = command.Wait()
 		t.Fatalf("Computer revocation race did not pause after authentication: stdout=%q stderr=%q", scanner.Text(), stderr.String())
 	}
-	return &liveComputerPausedSubmission{command: command, scanner: scanner, stderr: stderr}
+	return &liveComputerPausedSubmission{command: command, scanner: scanner, stdin: stdin, stderr: stderr}
 }
 
-func (submission *liveComputerPausedSubmission) finish(t *testing.T) int {
+func (submission *liveComputerPausedSubmission) finish(t *testing.T) liveComputerHTTPResult {
 	t.Helper()
+	if _, err := io.WriteString(submission.stdin, "release\n"); err != nil {
+		t.Fatalf("release Computer revocation race: %v", err)
+	}
+	if err := submission.stdin.Close(); err != nil {
+		t.Fatalf("close Computer revocation race release: %v", err)
+	}
 	if !submission.scanner.Scan() {
 		_ = submission.command.Wait()
 		t.Fatalf("Computer revocation race omitted its result: %s", submission.stderr.String())
@@ -1542,7 +1554,7 @@ func (submission *liveComputerPausedSubmission) finish(t *testing.T) int {
 	if err := submission.command.Wait(); err != nil {
 		t.Fatalf("Computer revocation race process: %v: %s", err, submission.stderr.String())
 	}
-	return result.Status
+	return result
 }
 
 func observationHasPointer(observation liveInputObservation, x, y int) bool {

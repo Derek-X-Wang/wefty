@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -460,13 +461,20 @@ func TestComputerSubmissionPolicyLossCancelsInflightAndReenableRestoresTransport
 		syncDone <- syncComputerTokenFile(ctx, runtime, workloadrunner.AttemptAuthority{}, systemClock{}, minter,
 			controller, "computer-1", "attempt-1", enabled, enabled, updates)
 	}()
-	requestDone := make(chan error, 1)
+	type bridgeResponse struct {
+		status int
+		body   contract.ErrorResponse
+		err    error
+	}
+	requestDone := make(chan bridgeResponse, 1)
 	go func() {
 		response, err := http.Get(endpoint + "/v1/runs/run-1")
+		result := bridgeResponse{err: err}
 		if response != nil {
-			response.Body.Close()
+			result.status = response.StatusCode
+			result.err = errors.Join(result.err, json.NewDecoder(response.Body).Decode(&result.body), response.Body.Close())
 		}
-		requestDone <- err
+		requestDone <- result
 	}()
 	select {
 	case <-started:
@@ -481,7 +489,10 @@ func TestComputerSubmissionPolicyLossCancelsInflightAndReenableRestoresTransport
 		t.Fatal("disable did not cancel in-flight L3 traffic")
 	}
 	select {
-	case <-requestDone:
+	case result := <-requestDone:
+		if result.err != nil || result.status != http.StatusUnauthorized || result.body.Error.Code != contract.ErrorUnauthorized {
+			t.Fatalf("canceled bridge response = status %d code %q err %v, want typed revocation", result.status, result.body.Error.Code, result.err)
+		}
 	case <-t.Context().Done():
 		t.Fatal("canceled bridge request did not return")
 	}
