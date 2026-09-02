@@ -152,6 +152,40 @@ func TestComputerRemovalDeletesDiskBeforeAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestComputerRemovalPublishesTypedCleanupQuarantineWithoutSuccessAcknowledgement(t *testing.T) {
+	removal := localRemoval{jobID: "computer-job", kind: contract.JobKindOCI, generation: 4,
+		cleanupFence: "cleanup", rootInstanceID: "root", processTreeReaped: true}
+	storage := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30}
+	receipt := workloadrunner.ManagedVolumeQuarantineReceipt{
+		Kind: "managed_volume_cleanup_quarantined", ReceiptID: "remove-quarantine", VolumeKind: workloadrunner.ManagedVolumeComputerDisk,
+		ComputerStorage: *storage,
+		Removal: workloadrunner.ManagedVolumeRemovalAuthority{NodeID: "node", BootSessionID: "boot", JobID: removal.jobID,
+			RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence},
+		FailureReason: "operation_failed", Attempts: 3,
+	}
+	cleanupErr := &workloadrunner.ManagedVolumeCleanupQuarantinedError{Receipt: receipt}
+	quarantineAcknowledged, successAcknowledged := false, false
+	controller := &removalController{nodeID: "node", bootSessionID: "boot"}
+	controller.purgeJob = func(context.Context, string) error { return nil }
+	controller.removeResource = func(context.Context, localRemoval) error { return nil }
+	controller.finalizeVolumes = func(context.Context, workloadrunner.ManagedVolumeFinalizationRequest) error { return cleanupErr }
+	controller.ackRemovalQuarantine = func(_ context.Context, gotRemoval localRemoval, gotErr error) error {
+		var quarantined *workloadrunner.ManagedVolumeCleanupQuarantinedError
+		if gotRemoval.jobID != removal.jobID || !errors.As(gotErr, &quarantined) || quarantined.Receipt.ReceiptID != receipt.ReceiptID {
+			t.Fatalf("quarantine acknowledgement = removal %+v err %#v", gotRemoval, gotErr)
+		}
+		quarantineAcknowledged = true
+		return nil
+	}
+	controller.ackRemoval = func(context.Context, localRemoval) error { successAcknowledged = true; return nil }
+	record := runtimeRemovalRecord{removal: removal, phase: runtimeRemovalQuarantined}
+	err := controller.completeLocalRemoval(t.Context(), removal, &record, []*workloadrunner.ComputerStorage{storage})
+	var quarantined *workloadrunner.ManagedVolumeCleanupQuarantinedError
+	if !errors.As(err, &quarantined) || !quarantineAcknowledged || successAcknowledged {
+		t.Fatalf("quarantined removal = err %#v quarantine_ack=%t success_ack=%t", err, quarantineAcknowledged, successAcknowledged)
+	}
+}
+
 func TestComputerRemovalRejectsNonOCIKind(t *testing.T) {
 	controller := &removalController{nodeID: "node"}
 	began := false

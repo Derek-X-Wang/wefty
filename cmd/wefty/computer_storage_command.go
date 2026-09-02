@@ -72,8 +72,12 @@ type storageWaitFlags struct {
 }
 
 func (wait *storageWaitFlags) bind(flags *flag.FlagSet) {
+	defaultPollInterval := 250 * time.Millisecond
+	if wait.pollInterval > 0 {
+		defaultPollInterval = wait.pollInterval
+	}
 	flags.DurationVar(&wait.timeout, "wait", 0, "wait up to this duration for L1 to observe the operation finishing")
-	flags.DurationVar(&wait.pollInterval, "poll-interval", 250*time.Millisecond, "interval between L1 observations")
+	flags.DurationVar(&wait.pollInterval, "poll-interval", defaultPollInterval, "interval between L1 observations")
 }
 
 func (wait *storageWaitFlags) validate(flags *flag.FlagSet) error {

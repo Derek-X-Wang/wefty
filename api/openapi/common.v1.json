@@ -497,6 +497,7 @@
           "last_backup_operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome" },
           "last_grow_operation": { "$ref": "#/components/schemas/ComputerStorageGrowOutcome" },
           "last_restore_revocation": { "$ref": "#/components/schemas/ComputerRestoreRevocationReceipt" },
+          "storage_cleanup_quarantine": { "$ref": "#/components/schemas/ComputerStorageCleanupQuarantine" },
           "reconfiguration_phase": { "enum": ["stable", "projecting", "resetting", "backing_up", "restoring", "cloning", "exporting", "importing", "reimaging", "growing", "removing"] },
           "reconfiguration_revision": { "type": "integer", "minimum": 1 },
           "submit_enabled": { "type": "boolean", "default": false },
@@ -684,6 +685,27 @@
           "completed_at": { "type": "string", "format": "date-time" }
         },
         "description": "Latest durable Computer Storage grow observation. Available bytes exist only when a validated helper refusal receipt supplied them."
+      },
+      "ComputerStorageCleanupQuarantine": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "receipt_id", "volume_kind", "computer_id", "storage_id", "storage_generation", "node_id", "boot_session_id", "job_id", "removal_generation", "cleanup_fence", "failure_reason", "attempts"],
+        "properties": {
+          "kind": { "const": "managed_volume_cleanup_quarantined" },
+          "receipt_id": { "type": "string", "minLength": 1 },
+          "volume_kind": { "const": "computer_disk" },
+          "computer_id": { "type": "string", "minLength": 1 },
+          "storage_id": { "type": "string", "minLength": 1 },
+          "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "node_id": { "type": "string", "minLength": 1 },
+          "boot_session_id": { "type": "string", "minLength": 1 },
+          "job_id": { "type": "string", "minLength": 1 },
+          "removal_generation": { "type": "integer", "minimum": 1 },
+          "cleanup_fence": { "type": "string", "minLength": 1 },
+          "failure_reason": { "const": "operation_failed" },
+          "attempts": { "const": 3 }
+        },
+        "description": "Authority-bound terminal evidence that bounded Computer-disk cleanup exhausted three attempts. The owning operation remains pending and must not be redispatched as ordinary cleanup."
       },
       "ComputerRestoreRevocationReceipt": {
         "type": "object",

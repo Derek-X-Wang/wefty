@@ -771,6 +771,74 @@ func TestComputerRemovalDirectiveCompletionReleasesSlot(t *testing.T) {
 	assertComputerRemovalDirectiveCompletionReleasesSlot(t)
 }
 
+func TestComputerRemovalCleanupQuarantineStopsRedispatchAndHoldsSlot(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
+		"computer-node": {
+			Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1,
+		},
+	})
+	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
+		"kind:oci": true, "cgroup_v2": true, "computer": true,
+	}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	computer, _, err := h.store.CreateComputer(context.Background(), CreateComputerRequest{
+		Name: "quarantined-removal", Spec: computerCapabilityJobSpec("computer:remove-quarantine"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := h.store.ClaimJob(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID, contract.JobClassService)
+	if err != nil || claim == nil {
+		t.Fatalf("claim = %#v err=%v", claim, err)
+	}
+	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := h.store.RemoveComputer(context.Background(), computer.ComputerID, ComputerRemoveRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directives, err := h.store.ListNodeRemovalDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("Computer removal directives = %#v err=%v", directives, err)
+	}
+	directive := directives[0]
+	receipt := ComputerStorageCleanupQuarantine{
+		Kind: "managed_volume_cleanup_quarantined", ReceiptID: "remove-quarantine-receipt", VolumeKind: "computer_disk",
+		ComputerID: computer.ComputerID, StorageID: computer.StorageID, StorageGeneration: computer.StorageGeneration,
+		NodeID: node.NodeID, BootSessionID: node.BootSessionID, JobID: computer.CurrentJobID,
+		RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+		FailureReason: "operation_failed", Attempts: 3,
+	}
+	quarantined, err := h.store.AcknowledgeServiceRemoval(context.Background(), "fabric-computer-node", computer.CurrentJobID,
+		RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+			RootInstanceID: directive.RootInstanceID, IdempotencyKey: receipt.ReceiptID, CleanupQuarantine: &receipt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := h.store.ListNodeRemovalDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentNode, err := getNode(context.Background(), h.store.db, node.NodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quarantined.State != contract.JobRemovalPending || removed.CurrentJob.State != contract.JobRemovalPending ||
+		computer.StorageCleanupQuarantine == nil || computer.StorageCleanupQuarantine.ReceiptID != receipt.ReceiptID ||
+		len(remaining) != 0 || currentNode.ServiceOccupancy != 1 {
+		t.Fatalf("quarantined Computer removal = job %#v Computer %#v directives %#v occupancy %d",
+			quarantined, computer, remaining, currentNode.ServiceOccupancy)
+	}
+}
+
 func assertComputerRemovalDirectiveCompletionReleasesSlot(t *testing.T) {
 	t.Helper()
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{

@@ -250,6 +250,7 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 		LEFT JOIN computer_job_projections ON computer_job_projections.job_id=service_removals.job_id
 		LEFT JOIN computers ON computers.computer_id=computer_job_projections.computer_id
 		WHERE service_removals.bound_node_id=? AND service_removals.status IN (?, ?)
+		AND service_removals.cleanup_quarantine_json IS NULL
 		ORDER BY service_removals.requested_ns, service_removals.job_id`, nodeID, contract.JobRemovalPending, contract.JobForgottenCleanupUnverified)
 	if err != nil {
 		return nil, internalError(err, "list service removal directives")
@@ -447,9 +448,28 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 	if err := validateMutableAcknowledgement(ctx, tx, identityNodeID, request, removal); err != nil {
 		return Job{}, err
 	}
-	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
+	computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID)
+	if mapErr != nil {
 		return Job{}, mapErr
-	} else if mapped {
+	}
+	if request.CleanupQuarantine != nil {
+		if !mapped {
+			return Job{}, protocolError(contract.ErrorInvalidRequest, "cleanup quarantine evidence is valid only for Computer removal")
+		}
+		if err := recordComputerRemovalCleanupQuarantine(ctx, tx, jobID, computerID, removal, request); err != nil {
+			return Job{}, err
+		}
+		job, err := getJobByID(ctx, tx, jobID, now)
+		if err != nil {
+			return Job{}, internalError(err, "read quarantined Computer removal")
+		}
+		applyServiceRemoval(&job, removal)
+		if err := tx.Commit(); err != nil {
+			return Job{}, internalError(err, "commit Computer removal cleanup quarantine")
+		}
+		return job, nil
+	}
+	if mapped {
 		var outstandingCopies, outstandingSuperseded, outstandingRestorePrecommits int64
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backup_copies bc
 			JOIN backups b ON b.backup_id=bc.backup_id
@@ -513,6 +533,59 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 		return Job{}, internalError(err, "commit removal acknowledgement")
 	}
 	return job, nil
+}
+
+func recordComputerRemovalCleanupQuarantine(ctx context.Context, tx *sql.Tx, jobID, computerID string,
+	removal serviceRemovalRow, request RemovalAcknowledgementRequest) error {
+	receipt := request.CleanupQuarantine
+	if receipt == nil {
+		return protocolError(contract.ErrorInvalidRequest, "Computer removal cleanup quarantine receipt is required")
+	}
+	var owned int
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM computer_storage_generations
+		WHERE computer_id=? AND computer_id=? AND storage_id=? AND storage_generation=?
+		UNION ALL
+		SELECT 1 FROM computer_storage_copy_operations
+		WHERE source_computer_id=? AND operation='clone' AND status='superseded'
+			AND destination_computer_id=? AND destination_storage_id=? AND destination_generation=?)`,
+		computerID, receipt.ComputerID, receipt.StorageID, receipt.StorageGeneration,
+		computerID, receipt.ComputerID, receipt.StorageID, receipt.StorageGeneration).Scan(&owned)
+	if err != nil {
+		return internalError(err, "validate quarantined Computer removal Storage identity")
+	}
+	if owned == 0 {
+		return protocolError(contract.ErrorInvalidRequest, "Computer removal cleanup quarantine names unowned Storage")
+	}
+	if err := validateComputerStorageCleanupQuarantine(*receipt, receipt.ComputerID, receipt.StorageID,
+		receipt.StorageGeneration, removal.boundNodeID, request.BootSessionID, jobID,
+		removal.generation, removal.cleanupFence); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		return internalError(err, "encode Computer removal cleanup quarantine")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE service_removals SET cleanup_quarantine_json=?
+		WHERE job_id=? AND status=? AND cleanup_quarantine_json IS NULL`, payload, jobID, contract.JobRemovalPending)
+	if err != nil {
+		return internalError(err, "record Computer removal cleanup quarantine")
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "inspect Computer removal cleanup quarantine")
+	}
+	if affected == 1 {
+		return nil
+	}
+	var existing []byte
+	if err := tx.QueryRowContext(ctx, `SELECT cleanup_quarantine_json FROM service_removals WHERE job_id=?`, jobID).Scan(&existing); err != nil {
+		return internalError(err, "read Computer removal cleanup quarantine replay")
+	}
+	if string(existing) != string(payload) {
+		return protocolError(contract.ErrorIdempotencyConflict, "Computer removal cleanup quarantine replay differs from durable evidence")
+	}
+	return nil
 }
 
 // FinalizeServiceRemoval performs phase four in a transaction separate from

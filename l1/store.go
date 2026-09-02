@@ -850,6 +850,7 @@ CREATE TABLE IF NOT EXISTS service_removals (
   requested_ns INTEGER NOT NULL,
   cleanup_acknowledgement_key TEXT,
   cleanup_acknowledgement_hash TEXT,
+  cleanup_quarantine_json BLOB,
   agent_cleaned_ns INTEGER,
   removed_ns INTEGER
 );
@@ -939,6 +940,9 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 		return err
 	}
 	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "cleanup_quarantine_json", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "service_removals", "cleanup_quarantine_json", "BLOB"); err != nil {
 		return err
 	}
 	if err := s.migrateComputerResetConstraints(ctx); err != nil {

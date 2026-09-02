@@ -46,6 +46,7 @@ type removalController struct {
 	deleteRuntimeData     func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error
 	attestRuntimeRemoval  func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error)
 	ackRemoval            func(context.Context, localRemoval) error
+	ackRemovalQuarantine  func(context.Context, localRemoval, error) error
 	finishRemoval         func(context.Context, localRemoval) error
 	removeBackupCopies    func(context.Context, []l1.ComputerBackupPruneDirective) error
 
@@ -86,6 +87,7 @@ func newRemovalController(
 		controller.removeResource = managed.remove
 	}
 	controller.ackRemoval = controller.acknowledge
+	controller.ackRemovalQuarantine = controller.acknowledgeQuarantine
 	return controller
 }
 
@@ -211,6 +213,12 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 			Volumes: volumes,
 			Removal: &workloadrunner.ManagedVolumeRemovalAuthority{NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID, PriorJobID: removal.jobID, RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence},
 		}); err != nil {
+			var quarantined *workloadrunner.ManagedVolumeCleanupQuarantinedError
+			if errors.As(err, &quarantined) && controller.ackRemovalQuarantine != nil {
+				if ackErr := controller.ackRemovalQuarantine(ctx, removal, err); ackErr != nil {
+					return errors.Join(fmt.Errorf("delete Computer disk resource: %w", err), ackErr)
+				}
+			}
 			return fmt.Errorf("delete Computer disk resource: %w", err)
 		}
 	}
@@ -551,6 +559,20 @@ func (controller *removalController) acknowledge(ctx context.Context, removal lo
 	}
 	if _, err := controller.client.AcknowledgeRemoval(ctx, removal.jobID, request); err != nil {
 		return fmt.Errorf("acknowledge completed service removal: %w", err)
+	}
+	return nil
+}
+
+func (controller *removalController) acknowledgeQuarantine(ctx context.Context, removal localRemoval, cleanupErr error) error {
+	request, quarantined := storageCleanupQuarantineAcknowledgement(cleanupErr, removal.rootInstanceID)
+	if !quarantined {
+		return errors.New("acknowledge Computer removal quarantine requires typed cleanup evidence")
+	}
+	if controller.client == nil {
+		return errors.New("acknowledge Computer removal quarantine requires an L1 client")
+	}
+	if _, err := controller.client.AcknowledgeRemoval(ctx, removal.jobID, request); err != nil {
+		return fmt.Errorf("acknowledge quarantined Computer removal: %w", err)
 	}
 	return nil
 }

@@ -1921,10 +1921,14 @@ func createReadyComputer(t *testing.T, harness *acceptanceHarness, reference, di
 
 func removeAndWaitComputer(t *testing.T, harness *acceptanceHarness, computer l1.Computer, timeout time.Duration) l1.Computer {
 	t.Helper()
-	removed := runComputerCLI[l1.Computer](t, harness, false, "services", "remove", computer.ComputerID, "--expect-current")
-	return waitForComputerCLI(t, harness, removed.ComputerID, timeout, func(current l1.Computer) bool {
-		return current.RemovalOutcome != ""
-	})
+	removed := runComputerCLI[l1.Computer](t, harness, false, "services", "remove", computer.ComputerID,
+		"--expect-current", "--wait", timeout.String(), "--poll-interval", "500ms")
+	if removed.CurrentJob.State != contract.JobRemovedVerified || removed.CurrentJob.Removal == nil ||
+		removed.CurrentJob.Removal.CleanupAcknowledgedAt == nil ||
+		(removed.RemovalOutcome != "removed_verified" && removed.RemovalOutcome != "removed_reduced") {
+		t.Fatalf("Computer removal returned without receipt-derived terminal Slot release: %#v", removed)
+	}
+	return removed
 }
 
 func recordComputerAuthority(receipt *linuxComputerMatrixReceipt, computer l1.Computer) {

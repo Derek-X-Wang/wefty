@@ -94,6 +94,10 @@ type computerStorageResetRow struct {
 
 func readComputerStorageCleanupQuarantine(ctx context.Context, q queryer, computerID string) (*ComputerStorageCleanupQuarantine, error) {
 	for _, query := range []string{
+		`SELECT service_removals.cleanup_quarantine_json FROM service_removals
+			JOIN computer_job_projections ON computer_job_projections.job_id=service_removals.job_id
+			WHERE computer_job_projections.computer_id=? AND service_removals.cleanup_quarantine_json IS NOT NULL
+			ORDER BY service_removals.requested_ns DESC LIMIT 1`,
 		`SELECT cleanup_quarantine_json FROM computer_storage_resets WHERE computer_id=? AND cleanup_quarantine_json IS NOT NULL ORDER BY intent_revision DESC LIMIT 1`,
 		`SELECT cleanup_quarantine_json FROM computer_storage_copy_operations WHERE destination_computer_id=? AND cleanup_quarantine_json IS NOT NULL ORDER BY operation_revision DESC LIMIT 1`,
 	} {
