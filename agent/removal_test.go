@@ -558,6 +558,29 @@ func TestSessionRoutesRuntimeReceiptIntoLiveRemoval(t *testing.T) {
 	}
 }
 
+func TestPreparedComputerStorageRemovalNeedsNoRuntimeReap(t *testing.T) {
+	manifest := runtimeRemovalManifest{Version: 1, JobID: "prepared-computer", RemovalGeneration: 1,
+		Attempts: addStorageOnlyRemovalManifests(nil, []*workloadrunner.ComputerStorage{{
+			ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30,
+		}}, "node", "boot", "prepared-computer", 1, "cleanup")}
+	removal := localRemoval{jobID: manifest.JobID, generation: manifest.RemovalGeneration, cleanupFence: "cleanup"}
+	receipt, ok := storageOnlyRemovalReceipt(manifest, removal, "node", "boot")
+	if !ok || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime || receipt.BootSessionID != "boot" {
+		t.Fatalf("prepared Computer no-runtime receipt = %+v ok=%t", receipt, ok)
+	}
+	mixed := manifest
+	mixed.Attempts = append(mixed.Attempts, testRuntimeResourceManifest(manifest.JobID, "attempt"))
+	if receipt, ok := storageOnlyRemovalReceipt(mixed, removal, "node", "boot"); ok {
+		t.Fatalf("mixed runtime/storage manifest skipped reap: %+v", receipt)
+	}
+	wrongFence := manifest
+	wrongFence.Attempts = append([]workloadrunner.RuntimeResourceManifest(nil), manifest.Attempts...)
+	wrongFence.Attempts[0].FencingToken = "stale-cleanup"
+	if receipt, ok := storageOnlyRemovalReceipt(wrongFence, removal, "node", "boot"); ok {
+		t.Fatalf("storage-only manifest with stale cleanup fence skipped reap: %+v", receipt)
+	}
+}
+
 func TestReturningNodeRemovalUsesPriorBootGuardianReceipt(t *testing.T) {
 	called := false
 	session := &agentSession{

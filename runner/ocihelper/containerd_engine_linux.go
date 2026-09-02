@@ -1730,6 +1730,7 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 		}
 	}
 	var computerStorage *ComputerStorageReference
+	var storageOnlyAttempt *RemovalAttemptManifest
 	if request.ComputerStorage != nil {
 		name, nameErr := DeterministicComputerDiskName(*request.ComputerStorage)
 		if nameErr != nil {
@@ -1750,6 +1751,11 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 		}
 		storage := manifest.Storage
 		computerStorage = &storage
+		if attempt, eligible, attemptErr := preparedComputerStorageRemovalAttempt(request.Removal, manifest); attemptErr != nil {
+			return InventoryRemovalResponse{}, attemptErr
+		} else if eligible {
+			storageOnlyAttempt = &attempt
+		}
 		for _, authority := range []*AttemptAuthority{manifest.Attached, manifest.Pending} {
 			if authority != nil {
 				if err := add(*authority, "computer", name); err != nil {
@@ -1759,6 +1765,9 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 		}
 	}
 	if len(authorities) == 0 {
+		if storageOnlyAttempt != nil {
+			return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{*storageOnlyAttempt}}, nil
+		}
 		return InventoryRemovalResponse{}, errors.New("legacy OCI removal current scan found no matching helper-owned attempt authority")
 	}
 	attempts := make([]RemovalAttemptManifest, 0, len(authorities))
@@ -1774,6 +1783,25 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 	}
 	sort.Slice(attempts, func(i, j int) bool { return attempts[i].Authority.AttemptID < attempts[j].Authority.AttemptID })
 	return InventoryRemovalResponse{Attempts: attempts}, nil
+}
+
+func preparedComputerStorageRemovalAttempt(removal ManagedVolumeRemovalAuthority, manifest computerDiskManifest) (RemovalAttemptManifest, bool, error) {
+	if !manifest.Prepared || manifest.Attached != nil || manifest.Pending != nil || manifest.PreviousDetachment != nil || manifest.Retirement != nil {
+		return RemovalAttemptManifest{}, false, nil
+	}
+	storage := manifest.Storage
+	authority := AttemptAuthority{
+		NodeID: removal.NodeID, BootSessionID: removal.BootSessionID, JobID: removal.JobID,
+		AttemptID: fmt.Sprintf("storage-removal-%d", storage.StorageGeneration), FencingToken: removal.CleanupFence,
+		Class: contract.JobClassService, RemovalGeneration: fmt.Sprint(removal.RemovalGeneration),
+	}
+	if err := authority.validate(); err != nil {
+		return RemovalAttemptManifest{}, false, err
+	}
+	return RemovalAttemptManifest{
+		Authority: authority, ComputerStorage: &storage, StorageOnly: true,
+		Resources: expectedComputerStorageRemovalResources(&storage),
+	}, true, nil
 }
 
 func (engine *ContainerdEngine) deleteServiceDataVolume(jobID string) error {

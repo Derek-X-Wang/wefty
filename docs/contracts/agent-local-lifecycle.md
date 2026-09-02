@@ -350,10 +350,14 @@ names neither the exact attempt nor that prior boot is unbound and fails. The
 helper may carry the boot ID across its own session generations only after a
 successful session reap; a failed reap or an unseen boot never manufactures
 that fact. The
-frozen
-removal manifest still binds every subsequent durable-data deletion and
-post-delete assertion; legacy inventory reconstruction continues to require
+frozen removal manifest still binds every subsequent durable-data deletion and
+post-delete assertion. Legacy inventory reconstruction continues to require
 matching attempt authority and cannot upgrade an empty sweep into a manifest.
+The one no-attempt case is a Computer generation whose exact helper manifest is
+prepared, unattached, and has no prior attachment or retirement evidence. A
+current authenticated helper inventory may freeze that generation as
+Storage-only removal evidence; the agent records `no_runtime_resources` and
+does not manufacture lease, task, container, or other attempt rows.
 
 For a Mac OCI one-shot that needs the run bridge, the agent asks Lima itself to
 resolve `host.lima.internal`, binds only that discovered guest-visible host

@@ -493,6 +493,18 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 		if authority.NodeID != request.NodeID || authority.JobID != request.JobID || authority.Class != contract.JobClassService || authority.RemovalGeneration != fmt.Sprint(request.RemovalGeneration) {
 			return nil, errors.New("legacy OCI removal inventory returned conflicting attempt authority")
 		}
+		if helperAttempt.StorageOnly && helperAttempt.ComputerStorage == nil {
+			return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence without Computer Storage identity")
+		}
+		if helperAttempt.StorageOnly && (authority.BootSessionID != request.BootSessionID || authority.FencingToken != request.CleanupFence ||
+			authority.AttemptID != fmt.Sprintf("storage-removal-%d", helperAttempt.ComputerStorage.StorageGeneration)) {
+			return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence without current cleanup authority")
+		}
+		if helperAttempt.StorageOnly && (request.ComputerStorage == nil || helperAttempt.ComputerStorage.ComputerID != request.ComputerStorage.ComputerID ||
+			helperAttempt.ComputerStorage.StorageID != request.ComputerStorage.StorageID ||
+			helperAttempt.ComputerStorage.StorageGeneration != request.ComputerStorage.StorageGeneration) {
+			return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence for conflicting Computer Storage identity")
+		}
 		identity, identityErr := ocihelper.DeterministicResourceIdentity(authority)
 		if identityErr != nil {
 			return nil, identityErr
@@ -505,6 +517,7 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 			LeaseID: identity.LeaseID, TaskID: identity.TaskID, ContainerID: identity.ContainerID,
 			SnapshotID: identity.SnapshotID, ShimID: identity.ShimID, CgroupID: identity.CgroupID,
 			LogSegmentDirectory: identity.LogSegmentDirectory, HandoffVolume: helperAttempt.HandoffVolume,
+			StorageOnly: helperAttempt.StorageOnly,
 		}
 		if helperAttempt.ComputerStorage == nil {
 			manifest.ServiceDataVolume = identity.ServiceVolumeDirectory

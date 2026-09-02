@@ -233,6 +233,7 @@ heartbeats.
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only, except that one tombstoned attempt whose helper deadman completed a successful guardian reap may authorize exactly one later `Delete` with full seven-field attempt-authority equality and the current node/boot-session gate. That exception still calls engine `Delete`, repeats independent absence verification, and releases image pins, capacity, ports, and retained runtime state before returning positive deletion; it never treats the earlier reap alone as the response. The helper consumes the guardian evidence when that call completes, so a second exact call, stale fence, foreign attempt, different removal generation or boot session, and every failed guardian reap remain refused. In every path, a positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments while retaining any stable handoff volume; only then does the server tombstone authorization. |
 | `DeleteManagedVolume` | Session-authorized and closed to a derived `handoff` or `service_data` owner key, or exact Computer-removal Storage and cleanup authority. The helper derives the source, deletes only that resource (plus any paired owner record), independently verifies absence, and returns no general path authority. |
+| `InventoryRemoval` | Session-authorized current inventory for legacy removal reconstruction. Ordinary results require exact observed attempt authority. A prepared, unattached Computer generation with no attachment history may instead return one Storage-only manifest bound to the current Node, boot, Job, removal generation, cleanup fence, and exact disk identity; it never invents runtime resource rows. |
 | `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. After separate stable service-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
 | `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves machine identity; clone/import narrowly rekey it and may expand a larger filesystem. |
@@ -827,6 +828,14 @@ facts. Both receipts bind the Node, managed-root instance, operation revision,
 cleanup/custody fence, and helper generation; neither helper call decides
 removal truth.
 
+`InventoryRemoval` normally reconstructs exact observed attempt authority. Its
+only no-attempt result is an exact Computer disk manifest marked prepared with
+no attached, pending, previously detached, or retired authority. That result
+contains only the deterministic Computer Storage removal rows and remains
+bound to the authenticated current helper session and durable removal fence.
+Every malformed, anomalous, historically attached, or identity-mismatched disk
+still fails closed.
+
 `AttestRemoval` accepts only an exact service Job/generation plus reconstructed
 attempt authorities and their deterministic resource rows, and is called after
 the separate idempotent `DeleteManagedVolume(service_data, job_id)` succeeds.
@@ -905,7 +914,8 @@ the sweep epoch and helper
 generation. The helper retains a bounded process-local history of these
 identities across session generations; a bare verified-empty sweep is insufficient. Legacy manifest
 reconstruction and replacement-sweep attempt recovery continue to require the
-complete authority match.
+complete authority match, except for the current-session prepared Computer
+Storage-only inventory described above.
 
 When native OCI is configured, the production agent opens a boot barrier and
 installs the OCI adapter as one unit. It advertises `kind:oci`, `cgroup_v2`, and

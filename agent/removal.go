@@ -318,9 +318,13 @@ func (controller *removalController) continueRuntimeRemoval(ctx context.Context,
 	case runtimeRemovalQuarantined:
 		// Runtime quiescence is durable; local and helper deletion may resume.
 	case runtimeRemovalPrepared:
-		receipt, err := controller.reapService(ctx, removal.jobID, removal.kind, runtimeRemoval.manifest.Attempts)
-		if err != nil {
-			return err
+		receipt, storageOnly := storageOnlyRemovalReceipt(runtimeRemoval.manifest, removal, controller.nodeID, controller.bootSessionID)
+		if !storageOnly {
+			var err error
+			receipt, err = controller.reapService(ctx, removal.jobID, removal.kind, runtimeRemoval.manifest.Attempts)
+			if err != nil {
+				return err
+			}
 		}
 		if !receipt.RuntimeQuiesced || receipt.Evidence == "" {
 			return fmt.Errorf("service %q removal has no positive runtime reap receipt", removal.jobID)
@@ -335,6 +339,24 @@ func (controller *removalController) continueRuntimeRemoval(ctx context.Context,
 	}
 	removal.processTreeReaped = true
 	return controller.completeLocalRemoval(ctx, removal, runtimeRemoval, computerStorages)
+}
+
+func storageOnlyRemovalReceipt(manifest runtimeRemovalManifest, removal localRemoval, nodeID, bootSessionID string) (workloadrunner.ReapReceipt, bool) {
+	if len(manifest.Attempts) == 0 || nodeID == "" || bootSessionID == "" || manifest.JobID != removal.jobID ||
+		manifest.RemovalGeneration != removal.generation || removal.cleanupFence == "" {
+		return workloadrunner.ReapReceipt{}, false
+	}
+	for _, attempt := range manifest.Attempts {
+		if !attempt.StorageOnly || attempt.NodeID != nodeID || attempt.BootSessionID != bootSessionID ||
+			attempt.JobID != manifest.JobID || attempt.WorkloadClass != contract.JobClassService ||
+			attempt.RemovalGeneration != fmt.Sprint(manifest.RemovalGeneration) || attempt.FencingToken != removal.cleanupFence ||
+			attempt.ComputerStorage == nil || attempt.AttemptID != fmt.Sprintf("storage-removal-%d", attempt.ComputerStorage.StorageGeneration) {
+			return workloadrunner.ReapReceipt{}, false
+		}
+	}
+	return workloadrunner.ReapReceipt{
+		RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime, BootSessionID: bootSessionID,
+	}, true
 }
 
 // prepareAuthorityLoss closes the renewal-vs-heartbeat race for a running

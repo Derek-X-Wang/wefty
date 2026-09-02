@@ -625,6 +625,35 @@ func TestComputerRemovalReceiptAssertsEveryDiskInventoryClass(t *testing.T) {
 	}
 }
 
+func TestPreparedComputerStorageRemovalInventoryCarriesOnlyStorageRows(t *testing.T) {
+	storage := &ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 3, DiskBytes: 8 << 30}
+	removal := ManagedVolumeRemovalAuthority{NodeID: "node", BootSessionID: "boot", JobID: "prepared-computer", RemovalGeneration: 2, CleanupFence: "cleanup"}
+	attempt, eligible, err := preparedComputerStorageRemovalAttempt(removal, computerDiskManifest{
+		Version: computerDiskManifestVersion, Storage: *storage, DiskImage: "disk.ext4", MountDirectory: "disk", Prepared: true,
+	})
+	if err != nil || !eligible {
+		t.Fatalf("prepared Computer Storage-only inventory = %+v eligible=%t err=%v", attempt, eligible, err)
+	}
+	request := AttestRemovalRequest{JobID: removal.JobID, RemovalGeneration: "2", Attempts: []RemovalAttemptManifest{attempt}}
+	if err := validateAttestRemovalRequest(request, removal.NodeID); err != nil {
+		t.Fatalf("prepared Computer Storage-only inventory rejected: %v", err)
+	}
+	if len(attempt.Resources) != 9 {
+		t.Fatalf("prepared Computer Storage-only rows = %+v", attempt.Resources)
+	}
+	for _, resource := range attempt.Resources {
+		switch resource.Class {
+		case RemovalResourceLease, RemovalResourceSnapshot, RemovalResourceContainer, RemovalResourceTask,
+			RemovalResourceShim, RemovalResourceCgroup, RemovalResourceLogSegments, RemovalResourceHandoffVolume:
+			t.Fatalf("prepared Computer inventory invented runtime row: %+v", resource)
+		}
+	}
+	notPrepared := computerDiskManifest{Version: computerDiskManifestVersion, Storage: *storage, PreviousDetachment: &computerDiskEvidence{ReceiptID: "prior"}}
+	if attempt, eligible, err := preparedComputerStorageRemovalAttempt(removal, notPrepared); err != nil || eligible {
+		t.Fatalf("historically attached Computer became Storage-only inventory: %+v eligible=%t err=%v", attempt, eligible, err)
+	}
+}
+
 func TestServiceDataVolumeInitializesOwnerOnlyOnce(t *testing.T) {
 	root := t.TempDir()
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}}
