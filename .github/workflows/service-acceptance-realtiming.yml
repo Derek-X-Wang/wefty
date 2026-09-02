@@ -295,7 +295,7 @@ jobs:
           skopeo copy "docker-daemon:$NAMED_REFERENCE" \
             "oci-archive:/tmp/wefty-service-data-named.oci.tar:$NAMED_REFERENCE"
           chmod 0644 /tmp/wefty-service-data-numeric.oci.tar /tmp/wefty-service-data-named.oci.tar
-          sudo install --owner=root --group=root --mode=0755 "$WEFTY_AGENT" /usr/local/libexec/wefty-agent-oci-realtiming
+          sudo install -D --owner=root --group=root --mode=0755 "$WEFTY_AGENT" /usr/local/libexec/wefty-agent-oci-realtiming
           HELPER_CHECKSUM="sha256:$(sha256sum "$WEFTY_AGENT" | cut -d' ' -f1)"
           test "$HELPER_CHECKSUM" = "$(jq -r .helper_checksum "$manifest")"
           AGENT_UID="$(id -u)"
