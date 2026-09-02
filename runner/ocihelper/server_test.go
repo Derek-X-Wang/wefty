@@ -718,6 +718,86 @@ func TestRemovalAttestationRequiresExactNodeJobGenerationAndResourceInventory(t 
 	assertRPCCode(t, err, CodeInvalidRequest)
 }
 
+func TestResetPredecessorAttestationCompletesAfterHelperRestart(t *testing.T) {
+	engine := newFakeEngine()
+	storage := ComputerStorageReference{
+		ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1,
+		IntentRevision: 2, DiskBytes: 8 << 30,
+	}
+	func() {
+		client, stop := startTestServer(t, engine, ServerConfig{})
+		defer stop()
+		first, err := client.OpenSession(t.Context(), testSessionRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer first.Close()
+		requireSweep(t, first)
+		reset, err := first.ResetComputerStorage(t.Context(), ResetComputerStorageRequest{
+			Storage: storage, NewGeneration: 2,
+			Authority: ComputerStorageResetAuthority{
+				NodeID: "node-1", BootSessionID: "boot-1", HelperGeneration: first.Handshake().SessionGeneration,
+				RootInstanceID: "managed-root-1", JobID: "reset-job", PriorJobID: "job-1",
+				IntentRevision: 2, CleanupFence: "reset-fence",
+			},
+		})
+		if err != nil || !reset.Verified {
+			t.Fatalf("Computer Storage reset = %+v err=%v", reset, err)
+		}
+	}()
+
+	restartedClient, stopRestarted := startTestServer(t, engine, ServerConfig{})
+	defer stopRestarted()
+	restarted, err := restartedClient.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	requireSweep(t, restarted)
+	resources := expectedComputerStorageRemovalResources(&storage)
+	request := AttestRemovalRequest{
+		JobID: "reset-job", RemovalGeneration: "2",
+		Attempts: []RemovalAttemptManifest{{
+			Authority: AttemptAuthority{
+				NodeID: "node-1", BootSessionID: "boot-1", JobID: "reset-job",
+				AttemptID: contract.ComputerStorageResetRetirementAttemptID(2), FencingToken: "reset-fence",
+				Class: contract.JobClassService, RemovalGeneration: "2",
+			},
+			ComputerStorage: &storage, StorageOnly: true, Resources: resources,
+		}},
+	}
+	attestation, err := restarted.AttestRemoval(t.Context(), request)
+	if err != nil || len(attestation.Assertions) != len(resources) {
+		t.Fatalf("reset predecessor attestation after helper restart = %+v err=%v", attestation, err)
+	}
+
+	request.Attempts[0].StoragePreparation = &contract.ComputerStoragePreparationWitness{
+		Kind: contract.ComputerStorageResetVerifiedKind, ReceiptID: "reset-receipt",
+		NodeID: "node-1", RootInstanceID: "managed-root-1", JobID: "reset-job",
+		ComputerID: storage.ComputerID, StorageID: storage.StorageID,
+		StorageGeneration: storage.StorageGeneration, Revision: 2,
+		Fence: "reset-fence", HelperGeneration: restarted.Handshake().SessionGeneration,
+	}
+	if _, err := restarted.AttestRemoval(t.Context(), request); err == nil {
+		t.Fatal("reset retirement authority claimed never-attached preparation evidence")
+	} else {
+		assertRPCCode(t, err, CodeInvalidRequest)
+	}
+	request.Attempts[0].StoragePreparation = nil
+	request.Attempts[0].Authority.AttemptID = contract.StorageOnlyRemovalAttemptID(storage.StorageGeneration)
+	if _, err := restarted.AttestRemoval(t.Context(), request); err == nil {
+		t.Fatal("prepared-removal authority without its durable witness was accepted")
+	} else {
+		assertRPCCode(t, err, CodeInvalidRequest)
+	}
+	request.Attempts[0].Authority.AttemptID = "invented-storage-cleanup-2"
+	if _, err := restarted.AttestRemoval(t.Context(), request); err == nil {
+		t.Fatal("untyped Storage-only cleanup authority was accepted")
+	} else {
+		assertRPCCode(t, err, CodeInvalidRequest)
+	}
+}
+
 func TestServiceDataDeletionRequiresCurrentRemovalAuthority(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})

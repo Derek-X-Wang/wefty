@@ -94,7 +94,7 @@ func (controller *storageResetController) retirePredecessor(ctx context.Context,
 	manifest := workloadrunner.RuntimeResourceManifest{
 		Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: controller.nodeID,
 		BootSessionID: controller.bootSessionID, JobID: directive.JobID,
-		AttemptID:    "storage-reset-" + fmt.Sprint(directive.IntentRevision),
+		AttemptID:    contract.ComputerStorageResetRetirementAttemptID(directive.IntentRevision),
 		FencingToken: directive.CleanupFence, WorkloadClass: contract.JobClassService,
 		RemovalGeneration: fmt.Sprint(generation), ComputerStorage: storage, StorageOnly: true,
 	}

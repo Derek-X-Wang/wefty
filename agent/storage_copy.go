@@ -121,7 +121,7 @@ func (controller *storageCopyController) attestFailedImportCleanup(ctx context.C
 	}
 	manifest := workloadrunner.RuntimeResourceManifest{Version: 1, RuntimeKind: contract.JobKindOCI,
 		NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: directive.JobID,
-		AttemptID:    "storage-import-failed-" + fmt.Sprint(directive.OperationRevision),
+		AttemptID:    contract.ComputerStorageFailedImportCleanupAttemptID(directive.OperationRevision),
 		FencingToken: directive.CleanupFence, WorkloadClass: contract.JobClassService,
 		RemovalGeneration: fmt.Sprint(generation), ComputerStorage: storage, StorageOnly: true}
 	attestation, err := controller.attestRuntimeRemoval(ctx, workloadrunner.RuntimeRemovalProofRequest{
@@ -160,7 +160,7 @@ func (controller *storageCopyController) retirePredecessor(ctx context.Context, 
 	}
 	manifest := workloadrunner.RuntimeResourceManifest{Version: 1, RuntimeKind: contract.JobKindOCI,
 		NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: directive.JobID,
-		AttemptID:    "storage-restore-" + fmt.Sprint(directive.OperationRevision),
+		AttemptID:    contract.ComputerStorageRestoreRetirementAttemptID(directive.OperationRevision),
 		FencingToken: directive.CleanupFence, WorkloadClass: contract.JobClassService,
 		RemovalGeneration: fmt.Sprint(generation), ComputerStorage: storage, StorageOnly: true}
 	attestation, err := controller.attestRuntimeRemoval(ctx, workloadrunner.RuntimeRemovalProofRequest{

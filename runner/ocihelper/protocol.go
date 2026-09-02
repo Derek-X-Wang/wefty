@@ -1011,13 +1011,24 @@ func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) e
 		}
 		want := ExpectedRemovalResources(identity, attempt.HandoffVolume, attempt.ComputerStorage)
 		if attempt.StorageOnly {
-			if attempt.ComputerStorage == nil || attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
-				!contract.ValidStorageOnlyRemovalAttemptID(authority.AttemptID, attempt.ComputerStorage.StorageGeneration) ||
-				attempt.StoragePreparation.NodeID != authority.NodeID || attempt.StoragePreparation.JobID != authority.JobID ||
-				attempt.StoragePreparation.ComputerID != attempt.ComputerStorage.ComputerID ||
-				attempt.StoragePreparation.StorageID != attempt.ComputerStorage.StorageID ||
-				attempt.StoragePreparation.StorageGeneration != attempt.ComputerStorage.StorageGeneration {
-				return errors.New("storage-only removal attestation requires matching durable Computer Storage preparation evidence")
+			if attempt.ComputerStorage == nil {
+				return errors.New("storage-only removal attestation requires Computer Storage")
+			}
+			switch {
+			case contract.ValidStorageOnlyRemovalAttemptID(authority.AttemptID, attempt.ComputerStorage.StorageGeneration):
+				if attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
+					attempt.StoragePreparation.NodeID != authority.NodeID || attempt.StoragePreparation.JobID != authority.JobID ||
+					attempt.StoragePreparation.ComputerID != attempt.ComputerStorage.ComputerID ||
+					attempt.StoragePreparation.StorageID != attempt.ComputerStorage.StorageID ||
+					attempt.StoragePreparation.StorageGeneration != attempt.ComputerStorage.StorageGeneration {
+					return errors.New("storage-only removal attestation requires matching durable Computer Storage preparation evidence")
+				}
+			case generation <= uint64(1<<63-1) && contract.ValidComputerStorageCleanupAttemptID(authority.AttemptID, int64(generation)):
+				if attempt.StoragePreparation != nil {
+					return errors.New("storage cleanup attestation cannot claim never-attached preparation evidence")
+				}
+			default:
+				return errors.New("storage-only removal attestation requires typed prepared-removal or storage-cleanup authority")
 			}
 			want = expectedComputerStorageRemovalResources(attempt.ComputerStorage)
 		}

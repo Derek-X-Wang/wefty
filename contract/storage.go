@@ -9,9 +9,12 @@ import (
 )
 
 const (
-	StorageOnlyRemovalAttemptPrefix  = "storage-removal-"
-	ComputerStorageCopyVerifiedKind  = "computer_storage_copy_verified"
-	ComputerStorageResetVerifiedKind = "computer_storage_reset_verified"
+	StorageOnlyRemovalAttemptPrefix          = "storage-removal-"
+	ComputerStorageResetRetirementPrefix     = "storage-reset-"
+	ComputerStorageRestoreRetirementPrefix   = "storage-restore-"
+	ComputerStorageFailedImportCleanupPrefix = "storage-import-failed-"
+	ComputerStorageCopyVerifiedKind          = "computer_storage_copy_verified"
+	ComputerStorageResetVerifiedKind         = "computer_storage_reset_verified"
 )
 
 func StorageOnlyRemovalAttemptID(generation int64) string {
@@ -20,6 +23,24 @@ func StorageOnlyRemovalAttemptID(generation int64) string {
 
 func ValidStorageOnlyRemovalAttemptID(attemptID string, generation int64) bool {
 	return generation > 0 && attemptID == StorageOnlyRemovalAttemptID(generation)
+}
+
+func ComputerStorageResetRetirementAttemptID(revision int64) string {
+	return fmt.Sprintf("%s%d", ComputerStorageResetRetirementPrefix, revision)
+}
+
+func ComputerStorageRestoreRetirementAttemptID(revision int64) string {
+	return fmt.Sprintf("%s%d", ComputerStorageRestoreRetirementPrefix, revision)
+}
+
+func ComputerStorageFailedImportCleanupAttemptID(revision int64) string {
+	return fmt.Sprintf("%s%d", ComputerStorageFailedImportCleanupPrefix, revision)
+}
+
+func ValidComputerStorageCleanupAttemptID(attemptID string, revision int64) bool {
+	return revision > 0 && (attemptID == ComputerStorageResetRetirementAttemptID(revision) ||
+		attemptID == ComputerStorageRestoreRetirementAttemptID(revision) ||
+		attemptID == ComputerStorageFailedImportCleanupAttemptID(revision))
 }
 
 // ComputerStoragePreparationWitness is helper-originated durable evidence
