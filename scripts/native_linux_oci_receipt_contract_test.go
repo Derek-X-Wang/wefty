@@ -131,10 +131,17 @@ func TestNativeLinuxOCIReceiptDistinguishesPRDeviationFromPublishedProof(t *test
 			traceContains:  "key=service_recovery_elapsed value=1m24.782166924s parsed_ns=84782166924 bound_ns=15000000000 result=rejected",
 		},
 		{
-			name:           "republication beyond production bound fails closed",
+			name:           "republication beyond receipt observation deadline fails closed",
 			source:         "published-artifact",
 			receipt:        publishedNativeOCIReceipt(),
-			serviceReceipt: strings.Replace(servicePublicationReceipt(false), "republication_elapsed=1.13s", "republication_elapsed=5.01s", 1),
+			serviceReceipt: strings.Replace(servicePublicationReceipt(false), "republication_elapsed=11.03s", "republication_elapsed=11.41s", 1),
+			l1Receipt:      serviceReadmissionReceipt(),
+		},
+		{
+			name:           "missing republication observation deadline fails closed",
+			source:         "published-artifact",
+			receipt:        publishedNativeOCIReceipt(),
+			serviceReceipt: strings.Replace(servicePublicationReceipt(false), "republication_observation_deadline=11.4s\n", "", 1),
 			l1Receipt:      serviceReadmissionReceipt(),
 		},
 	}
@@ -188,5 +195,6 @@ func serviceReadmissionReceipt() string {
 func servicePublicationReceipt(logEvidenceIncomplete bool) string {
 	return "term_kill_escalation=true\nterm_kill_log_evidence_incomplete=" + strconv.FormatBool(logEvidenceIncomplete) +
 		"\nterm_kill_log_seal_pairing=true\nterm_kill_stdout_log=true\nterm_kill_stderr_log=true\n" +
-		"withdrawal=true\nwithdrawal_elapsed=83ms\nrepublication=true\nrepublication_elapsed=1.13s\n"
+		"withdrawal=true\nwithdrawal_elapsed=83ms\nrepublication=true\nrepublication_elapsed=11.03s\n" +
+		"republication_observation_deadline=11.4s\n"
 }

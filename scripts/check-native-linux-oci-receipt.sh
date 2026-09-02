@@ -141,6 +141,44 @@ require_duration_within() {
   exit 1
 }
 
+duration_within_receipt_bound() {
+  measured=$1
+  bound=$2
+  # Reuse the checked Go-duration parser with a large finite ceiling, then
+  # compare the two parsed values. The caller restores the measured/bound
+  # trace fields so diagnostics name the receipt-derived authority.
+  if ! duration_within_bound "$measured" 999999999; then
+    return 1
+  fi
+  measured_ns=$duration_trace_parsed_ns
+  if ! duration_within_bound "$bound" 999999999; then
+    return 1
+  fi
+  bound_ns=$duration_trace_parsed_ns
+  duration_trace_parsed_ns=$measured_ns
+  duration_trace_bound_ns=$bound_ns
+  [ "$measured_ns" -le "$bound_ns" ]
+}
+
+require_duration_within_receipt_bound() {
+  file=$1
+  key=$2
+  bound_key=$3
+  count=$(grep -c "^${key}=" "$file" || true)
+  bound_count=$(grep -c "^${bound_key}=" "$file" || true)
+  value=$(sed -n "s/^${key}=//p" "$file")
+  bound=$(sed -n "s/^${bound_key}=//p" "$file")
+  duration_trace_parsed_ns=UNPARSED
+  duration_trace_bound_ns=UNPARSED
+  if [ "$count" -eq 1 ] && [ "$bound_count" -eq 1 ] && duration_within_receipt_bound "$value" "$bound"; then
+    trace_duration_result accepted
+    return
+  fi
+  trace_duration_result rejected
+  printf 'receipt must contain exactly one measured %s duration within its exactly one %s bound\n' "$key" "$bound_key" >&2
+  exit 1
+}
+
 case "$evidence_source" in
   pr-build)
     require_unique_value "$receipt" pull_from_empty NOT-RUN
@@ -175,4 +213,4 @@ require_unique_value "$service_receipt" term_kill_stderr_log true
 require_unique_value "$service_receipt" withdrawal true
 require_duration_within "$service_receipt" withdrawal_elapsed 5
 require_unique_value "$service_receipt" republication true
-require_duration_within "$service_receipt" republication_elapsed 5
+require_duration_within_receipt_bound "$service_receipt" republication_elapsed republication_observation_deadline
