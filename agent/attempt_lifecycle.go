@@ -844,7 +844,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	var computerBridge *computerAttemptBridgeController
 	if computerService {
 		computerBridge = newComputerAttemptBridgeController(ctx, lifecycle.dependencies.workflowBridge, claim.Job.Spec.Kind, executionSpec)
-		defer computerBridge.disable()
+		defer computerBridge.disable(errComputerAttemptClosed)
 		if claim.ComputerStorage.SubmitEnabled {
 			endpoint, bridgeErr := computerBridge.enable(executionSpec.SensitiveEnv[contract.EnvComputerToken])
 			if bridgeErr != nil {
