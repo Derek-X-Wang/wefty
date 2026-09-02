@@ -12,13 +12,41 @@ require_receipt() {
     error "receipt/$row" "missing receipt $receipt"
     return 1
   fi
-  if ! jq -e 'type == "object" and (.checks | type == "array")' "$receipt" >/dev/null 2>&1; then
+  if ! jq -e '
+    type == "object" and (.checks | type == "array") and
+    (.teardown | type == "object") and
+    (.teardown.retries_used | type == "number" and . >= 0 and floor == .) and
+    (.teardown.permission_repair_performed | type == "boolean") and
+    ((.teardown.permission_repair_seconds // 0) | type == "number" and . >= 0) and
+    (.teardown.observations | type == "array" and all(.[]; type == "object" and (.reason | type == "string") and ((.detail // "") | type == "string"))) and
+    (.teardown.leftovers | type == "array" and all(.[]; type == "string")) and
+    (.teardown.leftovers | length) == 0
+  ' "$receipt" >/dev/null 2>&1; then
     error "receipt/$row" "malformed receipt $receipt"
     return 1
   fi
 }
 
 case ${1:-} in
+  teardown-repair)
+    [[ $# == 3 ]] || { error diagnostics-usage 'teardown-repair requires RECEIPT CHECKER_STATUS'; exit 64; }
+    receipt=$2 checker_status=$3
+    require_receipt "$receipt" teardown-repair || exit 1
+    if [[ $checker_status != 2 ]]; then
+      error teardown-repair "checker exited $checker_status; expected 2 for the teardown-only fixture"
+      exit 1
+    fi
+    if ! jq -e '
+      .teardown.permission_repair_performed == true and
+      (.teardown.permission_repair_seconds | type == "number") and
+      .teardown.permission_repair_seconds > 0 and
+      .teardown.permission_repair_seconds <= 15 and
+      (.teardown.leftovers | length) == 0
+    ' "$receipt" >/dev/null; then
+      error teardown-repair 'receipt did not prove bounded permission repair without leftovers'
+      exit 1
+    fi
+    ;;
   mutation)
     [[ $# == 7 ]] || { error diagnostics-usage 'mutation requires RECEIPT MUTATION CELL DETAIL CHECKER_STATUS CHECKER_WALL_SECONDS'; exit 64; }
     receipt=$2 mutation=$3 cell=$4 detail=$5 checker_status=$6 checker_wall_seconds=$7
@@ -64,7 +92,7 @@ case ${1:-} in
     fi
     ;;
   *)
-    error diagnostics-usage 'expected mutation or summary'
+    error diagnostics-usage 'expected teardown-repair, mutation, or summary'
     exit 64
     ;;
 esac

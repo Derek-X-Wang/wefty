@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Derek-X-Wang/wefty/internal/computerconformance"
 )
@@ -20,6 +21,7 @@ func run(arguments []string) int {
 	flags := flag.NewFlagSet("wefty-computer-conformance", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	flags.StringVar(&config.Image, "image", "", "OCI image reference or digest to check (required)")
+	flags.StringVar(&config.RepairImage, "repair-image", "", "known-good immutable image used only for detached-root permission repair (required)")
 	flags.StringVar(&config.Runtime, "runtime", "docker", "OCI command-line runtime: docker or nerdctl")
 	flags.StringVar(&config.Platform, "platform", "", "optional Linux platform, for example linux/amd64")
 	flags.StringVar(&config.InputOraclePath, "input-oracle-path", "", "absolute image path to an input receipt; omission reports input checks NOT-RUN")
@@ -33,10 +35,10 @@ func run(arguments []string) int {
 		}
 		return 64
 	}
-	if flags.NArg() != 0 || config.Image == "" || (config.Runtime != "docker" && config.Runtime != "nerdctl") ||
+	if flags.NArg() != 0 || config.Image == "" || !strings.Contains(config.RepairImage, "@sha256:") || (config.Runtime != "docker" && config.Runtime != "nerdctl") ||
 		(config.InputOraclePath != "" && !filepath.IsAbs(config.InputOraclePath)) ||
 		(config.DriverOraclePath != "" && !filepath.IsAbs(config.DriverOraclePath)) {
-		fmt.Fprintln(os.Stderr, "usage: wefty-computer-conformance --image IMAGE [options]")
+		fmt.Fprintln(os.Stderr, "usage: wefty-computer-conformance --image IMAGE --repair-image IMAGE@DIGEST [options]")
 		return 64
 	}
 

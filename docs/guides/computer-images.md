@@ -168,6 +168,7 @@ and run the checker against those immutable bytes:
 go build -o ./wefty-computer-conformance ./cmd/wefty-computer-conformance
 ./wefty-computer-conformance \
   --image registry.example/operator/computer@sha256:<platform-digest> \
+  --repair-image registry.example/operator/computer@sha256:<platform-digest> \
   --platform linux/amd64 \
   --input-oracle-path /path/inside/image/to/input-receipt \
   --driver-oracle-path /path/inside/image/to/observed-driver-state \
@@ -183,6 +184,11 @@ test the persistence boundary. It prints a human summary and writes a
 machine-readable receipt with stable check IDs. Every cell starts `NOT-RUN`;
 omitting either explicit oracle never becomes `PASS`, and the process exits 2
 when no check failed but at least one remains `NOT-RUN`.
+
+`--repair-image` is the immutable, known-good image whose `/bin/sh` the checker
+may use after container removal to repair permissions under only its detached
+temporary root. Keep it pinned to trusted bytes rather than replacing it with
+an intentionally broken derivative under test.
 
 An input oracle is image-owned observation, not a new Wefty wire protocol. It
 must expose a deterministic file whose bytes change after accepted input and

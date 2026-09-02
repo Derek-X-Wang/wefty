@@ -15,3 +15,13 @@ func TestUsageErrorExits64WithoutReceipt(t *testing.T) {
 		t.Fatalf("usage error emitted receipt: %v", err)
 	}
 }
+
+func TestMutableRepairImageIsUsageError(t *testing.T) {
+	receipt := filepath.Join(t.TempDir(), "must-not-exist.json")
+	if code := run([]string{"--image", "broken:local", "--repair-image", "reference:latest", "--receipt", receipt}); code != 64 {
+		t.Fatalf("mutable repair-image usage exit = %d, want 64", code)
+	}
+	if _, err := os.Stat(receipt); !os.IsNotExist(err) {
+		t.Fatalf("usage error emitted receipt: %v", err)
+	}
+}

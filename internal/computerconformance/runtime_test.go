@@ -2,8 +2,13 @@ package computerconformance
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -16,6 +21,39 @@ func TestMissingEndpointObservationWindowStaysInsideReadinessBudget(t *testing.T
 	}
 	if missingEndpointObservationWindow >= contract.ComputerStartupReadinessTimeout {
 		t.Fatal("missing endpoint observation window exhausted the contract readiness budget")
+	}
+}
+
+func TestTeardownDetachFailureDoesNotInventUnconfirmedContainerLeftover(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "checker-root")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recorder := NewRecorder("image", "docker", "linux/amd64", time.Unix(100, 0))
+	runner := runtimeRunner{
+		root:        root,
+		containerID: "already-absent",
+		recorder:    recorder,
+		config:      RuntimeConfig{Runtime: "docker", Image: "image", RepairImage: "reference@sha256:abc"},
+		runCommandHook: func(_ context.Context, arguments ...string) (commandResult, error) {
+			if arguments[0] == "rm" || arguments[0] == "inspect" {
+				return commandResult{stderr: "not found"}, errors.New("runtime command failed")
+			}
+			return commandResult{}, nil
+		},
+		teardownLogHook: func(string) {},
+	}
+	err := runner.cleanup()
+	var failure *TeardownFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("detach failure = %v", err)
+	}
+	want := "temporary-root:" + root
+	if failure.Leftover != want {
+		t.Fatalf("unconfirmed typed leftover = %q, want %q", failure.Leftover, want)
+	}
+	if got := recorder.Finish(time.Unix(101, 0)).Teardown.Leftovers; len(got) != 1 || got[0] != want {
+		t.Fatalf("unconfirmed receipt leftovers = %v, want %q", got, want)
 	}
 }
 
@@ -203,5 +241,326 @@ func TestInputObserverAdvanceRequiresKeyAndObserverProgress(t *testing.T) {
 	}
 	if !inputObserverAdvanced(inputObservation{KeyEvents: 7}, inputObservation{KeyEvents: 8}) {
 		t.Fatal("inputObserverAdvanced rejected a key-only legacy oracle")
+	}
+}
+
+func TestTeardownWaitsForSlowStopBeforeDetachingMounts(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "checker-root")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stopEntered := make(chan struct{})
+	allowExit := make(chan struct{})
+	removeCalled := make(chan struct{}, 1)
+	runner := runtimeRunner{
+		root:        root,
+		containerID: "slow-container",
+		config:      RuntimeConfig{Runtime: "docker", Image: "reference-image", RepairImage: "reference-image@sha256:abc"},
+		runCommandHook: func(_ context.Context, arguments ...string) (commandResult, error) {
+			switch arguments[0] {
+			case "exec":
+				return commandResult{}, nil
+			case "stop":
+				close(stopEntered)
+				<-allowExit
+				return commandResult{}, nil
+			case "rm":
+				removeCalled <- struct{}{}
+				return commandResult{}, nil
+			default:
+				return commandResult{}, fmt.Errorf("unexpected runtime command %q", arguments[0])
+			}
+		},
+		teardownLogHook: func(string) {},
+	}
+	done := make(chan error, 1)
+	go func() { done <- runner.cleanup() }()
+	select {
+	case <-stopEntered:
+	case <-time.After(time.Second):
+		t.Fatal("stop command did not start")
+	}
+	select {
+	case <-removeCalled:
+		t.Fatal("container mounts detached before the slow container exit was observed")
+	default:
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("temporary root changed before container exit: %v", err)
+	}
+	close(allowExit)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("teardown did not finish after stop returned")
+	}
+	select {
+	case <-removeCalled:
+	default:
+		t.Fatal("container was not removed after its exit was observed")
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary root still exists after teardown: %v", err)
+	}
+}
+
+func TestTeardownSuccessfulRemovalMakesStopFailureNonFatal(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "checker-root")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recorder := NewRecorder("broken-image", "docker", "linux/amd64", time.Unix(100, 0))
+	var logs []string
+	runner := runtimeRunner{
+		root:        root,
+		containerID: "eventually-removed",
+		recorder:    recorder,
+		config:      RuntimeConfig{Runtime: "docker", Image: "broken-image", RepairImage: "reference@sha256:abc"},
+		runCommandHook: func(_ context.Context, arguments ...string) (commandResult, error) {
+			switch arguments[0] {
+			case "exec":
+				return commandResult{}, nil
+			case "stop":
+				return commandResult{stderr: "daemon response"}, errors.New("stop command failed")
+			case "rm":
+				return commandResult{}, nil
+			default:
+				return commandResult{}, fmt.Errorf("unexpected runtime command %q", arguments[0])
+			}
+		},
+		teardownLogHook: func(message string) { logs = append(logs, message) },
+	}
+	if err := runner.cleanup(); err != nil {
+		t.Fatalf("successful detach and root removal remained fatal: %v", err)
+	}
+	receipt := recorder.Finish(time.Unix(101, 0))
+	if len(receipt.Teardown.Leftovers) != 0 {
+		t.Fatalf("successful teardown leftovers = %v", receipt.Teardown.Leftovers)
+	}
+	if len(receipt.Teardown.Observations) != 1 || receipt.Teardown.Observations[0].Reason != string(TeardownContainerStopFailed) {
+		t.Fatalf("stop diagnostic observations = %+v", receipt.Teardown.Observations)
+	}
+	if joined := strings.Join(logs, "\n"); !strings.Contains(joined, "teardown observation: reason=container_stop_failed") || strings.Contains(joined, "runtime teardown failed") {
+		t.Fatalf("non-fatal teardown log = %q", joined)
+	}
+}
+
+func TestTeardownRepairsDetachedTemporaryRootPermissions(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "checker-root")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	removeAttempts := 0
+	var repairCommand string
+	var logs []string
+	var events []string
+	runner := runtimeRunner{
+		root:        root,
+		containerID: "mutation-container",
+		config: RuntimeConfig{
+			Runtime: "docker", Image: "broken-fixture", RepairImage: "reference-image@sha256:abc", Platform: "linux/amd64",
+		},
+		removeAllHook: func(path string) error {
+			removeAttempts++
+			if removeAttempts == 1 {
+				return &os.PathError{Op: "openfdat", Path: filepath.Join(path, "service/home/wefty/.config/xfce4/panel/launcher-19"), Err: syscall.EACCES}
+			}
+			return os.RemoveAll(path)
+		},
+		runCommandHook: func(_ context.Context, arguments ...string) (commandResult, error) {
+			events = append(events, arguments[0])
+			if arguments[0] == "run" {
+				repairCommand = strings.Join(arguments, " ")
+				if len(events) < 4 || events[len(events)-2] != "rm" {
+					t.Fatalf("permission repair ran before detach: events=%v", events)
+				}
+			}
+			return commandResult{}, nil
+		},
+		teardownLogHook: func(message string) { logs = append(logs, message) },
+	}
+	if err := runner.cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"run --rm", "--network none", "--user 0:0", "--cap-drop ALL", "--cap-add DAC_OVERRIDE", "--cap-add FOWNER", "type=bind,src=" + root, "--platform linux/amd64", "reference-image@sha256:abc", "chmod -R"} {
+		if !strings.Contains(repairCommand, required) {
+			t.Fatalf("permission repair command %q is missing %q", repairCommand, required)
+		}
+	}
+	if removeAttempts != 2 {
+		t.Fatalf("temporary-root removal attempts = %d, want 2", removeAttempts)
+	}
+	if joined := strings.Join(logs, "\n"); !strings.Contains(joined, "reason=temporary_root_permission") || !strings.Contains(joined, "permission_repair=true") {
+		t.Fatalf("permission repair evidence = %q", joined)
+	}
+}
+
+func TestPermissionRepairScriptMakesRestrictiveTreeRemovable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("real-filesystem permission regression requires a non-root test user")
+	}
+	root := filepath.Join(t.TempDir(), "checker-root")
+	locked := filepath.Join(root, "service", "home", "wefty", ".config", "xfce4", "panel", "launcher-17")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "launcher.desktop"), []byte("late write"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	command := exec.Command("sh", "-c", permissionRepairScript, "wefty-repair", root)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("permission repair script failed: %v: %s", err, output)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatalf("repaired restrictive tree remained non-removable: %v", err)
+	}
+}
+
+func TestTeardownRetriesTemporaryRootBusyWithinStatedBudget(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "checker-root")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	removeAttempts, sleeps := 0, 0
+	var logs []string
+	runner := runtimeRunner{
+		root:     root,
+		recorder: NewRecorder("image", "docker", "linux/amd64", time.Unix(100, 0)),
+		config: RuntimeConfig{Sleep: func(_ context.Context, duration time.Duration) error {
+			if duration != teardownRemoveRetryInterval {
+				return fmt.Errorf("busy retry interval = %s", duration)
+			}
+			sleeps++
+			return nil
+		}},
+		removeAllHook: func(path string) error {
+			removeAttempts++
+			if removeAttempts <= 2 {
+				return &os.PathError{Op: "remove", Path: path, Err: syscall.EBUSY}
+			}
+			return os.RemoveAll(path)
+		},
+		teardownLogHook: func(message string) { logs = append(logs, message) },
+	}
+	if err := runner.cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if removeAttempts != 3 || sleeps != 2 {
+		t.Fatalf("busy teardown attempts=%d sleeps=%d, want 3 and 2", removeAttempts, sleeps)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "reason=temporary_root_busy") || !strings.Contains(joined, "budget=2s") || !strings.Contains(joined, "removal_retries=2") {
+		t.Fatalf("busy retry evidence = %q", joined)
+	}
+	if evidence := runner.recorder.Finish(time.Unix(101, 0)).Teardown; evidence.RetriesUsed != 2 || len(evidence.Leftovers) != 0 {
+		t.Fatalf("busy retry receipt evidence = %+v", evidence)
+	}
+}
+
+func TestTeardownRetriesTemporaryRootNotEmptyWithinStatedBudget(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "checker-root")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	removeAttempts := 0
+	runner := runtimeRunner{
+		root: root,
+		config: RuntimeConfig{Sleep: func(context.Context, time.Duration) error {
+			return nil
+		}},
+		removeAllHook: func(path string) error {
+			removeAttempts++
+			if removeAttempts == 1 {
+				return &os.PathError{Op: "remove", Path: path, Err: syscall.ENOTEMPTY}
+			}
+			return os.RemoveAll(path)
+		},
+		teardownLogHook: func(string) {},
+	}
+	if err := runner.cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if removeAttempts != 2 {
+		t.Fatalf("not-empty removal attempts = %d, want 2", removeAttempts)
+	}
+}
+
+func TestTeardownBusyExhaustionNamesTypedLeftover(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "checker-root")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	removeAttempts := 0
+	runner := runtimeRunner{
+		root: root,
+		config: RuntimeConfig{Sleep: func(context.Context, time.Duration) error {
+			return nil
+		}},
+		removeAllHook: func(path string) error {
+			removeAttempts++
+			return &os.PathError{Op: "remove", Path: path, Err: syscall.EBUSY}
+		},
+		teardownLogHook: func(string) {},
+	}
+	err := runner.cleanup()
+	var failure *TeardownFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("busy teardown error = %v, want typed failure", err)
+	}
+	if failure.Reason != TeardownTemporaryRootBusy || failure.Leftover != "temporary-root:"+root {
+		t.Fatalf("busy teardown failure = %+v", failure)
+	}
+	wantAttempts := int(teardownRemoveRetryBudget/teardownRemoveRetryInterval) + 1
+	if removeAttempts != wantAttempts {
+		t.Fatalf("busy teardown attempts = %d, want %d", removeAttempts, wantAttempts)
+	}
+}
+
+func TestTeardownDetachFailureRetainsRootAndNamesBothLeftovers(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "checker-root")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recorder := NewRecorder("image", "docker", "linux/amd64", time.Unix(100, 0))
+	removeRootCalled := false
+	runner := runtimeRunner{
+		root:        root,
+		containerID: "still-mounted",
+		recorder:    recorder,
+		config:      RuntimeConfig{Runtime: "docker", Image: "image", RepairImage: "reference@sha256:abc"},
+		runCommandHook: func(_ context.Context, arguments ...string) (commandResult, error) {
+			if arguments[0] == "rm" {
+				return commandResult{stderr: "daemon busy"}, errors.New("remove failed")
+			}
+			return commandResult{}, nil
+		},
+		removeAllHook: func(string) error {
+			removeRootCalled = true
+			return nil
+		},
+		teardownLogHook: func(string) {},
+	}
+	err := runner.cleanup()
+	var failure *TeardownFailure
+	if !errors.As(err, &failure) || failure.Reason != TeardownContainerDetachFailed {
+		t.Fatalf("detach failure = %v", err)
+	}
+	if removeRootCalled {
+		t.Fatal("temporary root removal ran without proven bind detachment")
+	}
+	want := "container:still-mounted,temporary-root:" + root
+	if failure.Leftover != want {
+		t.Fatalf("typed leftover = %q, want %q", failure.Leftover, want)
+	}
+	evidence := recorder.Finish(time.Unix(101, 0)).Teardown
+	if strings.Join(evidence.Leftovers, ",") != want {
+		t.Fatalf("receipt leftovers = %v, want %q", evidence.Leftovers, want)
 	}
 }

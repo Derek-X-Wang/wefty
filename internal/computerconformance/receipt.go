@@ -66,6 +66,20 @@ type Receipt struct {
 	AttemptTmpfsDiscarded bool                   `json:"attempt_tmpfs_discarded"`
 	Shm                   CompatibilityShm       `json:"shm"`
 	ReadinessSeconds      float64                `json:"readiness_seconds"`
+	Teardown              TeardownEvidence       `json:"teardown"`
+}
+
+type TeardownEvidence struct {
+	RetriesUsed               int                   `json:"retries_used"`
+	PermissionRepairPerformed bool                  `json:"permission_repair_performed"`
+	PermissionRepairSeconds   float64               `json:"permission_repair_seconds,omitempty"`
+	Observations              []TeardownObservation `json:"observations"`
+	Leftovers                 []string              `json:"leftovers"`
+}
+
+type TeardownObservation struct {
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
 }
 
 type CompatibilityNegatives struct {
@@ -99,7 +113,19 @@ func NewRecorder(image, runtimeName, platform string, startedAt time.Time) *Reco
 		checks[i] = Check{ID: definition.ID, Scope: definition.Scope, Status: StatusNotRun, Summary: definition.Summary}
 		index[definition.ID] = i
 	}
-	return &Recorder{receipt: Receipt{Version: ReceiptVersion, Image: image, Runtime: runtimeName, Platform: platform, StartedAt: startedAt.UTC(), Status: StatusNotRun, Checks: checks}, index: index}
+	return &Recorder{receipt: Receipt{
+		Version:   ReceiptVersion,
+		Image:     image,
+		Runtime:   runtimeName,
+		Platform:  platform,
+		StartedAt: startedAt.UTC(),
+		Status:    StatusNotRun,
+		Checks:    checks,
+		Teardown: TeardownEvidence{
+			Observations: make([]TeardownObservation, 0),
+			Leftovers:    make([]string, 0),
+		},
+	}, index: index}
 }
 
 func (r *Recorder) Record(id string, status Status, detail string) error {
@@ -168,6 +194,24 @@ func (r *Recorder) RecordPersistence(profile, signIn bool) {
 	r.receipt.ProfilePersistent, r.receipt.SignInPersistent = &profile, &signIn
 }
 func (r *Recorder) RecordEdgeRecovery(value bool) { r.receipt.RestartedEdgeRecovered = &value }
+
+func (r *Recorder) RecordTeardownObservation(reason, detail string) {
+	r.receipt.Teardown.Observations = append(r.receipt.Teardown.Observations, TeardownObservation{Reason: reason, Detail: detail})
+}
+
+func (r *Recorder) RecordTeardownRetry(reason, detail string) {
+	r.receipt.Teardown.RetriesUsed++
+	r.RecordTeardownObservation(reason, detail)
+}
+
+func (r *Recorder) RecordPermissionRepair(duration time.Duration) {
+	r.receipt.Teardown.PermissionRepairPerformed = true
+	r.receipt.Teardown.PermissionRepairSeconds += duration.Seconds()
+}
+
+func (r *Recorder) RecordTeardownLeftovers(leftovers []string) {
+	r.receipt.Teardown.Leftovers = slices.Clone(leftovers)
+}
 
 func Aggregate(checks []Check) Status {
 	status := StatusPass
