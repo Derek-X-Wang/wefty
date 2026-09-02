@@ -582,6 +582,9 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	limited := runLiveComputerHTTP(t, reimaged, http.MethodPost, "/v1/runs", "linux-native-root-over-limit", liveComputerRunRequest(300*time.Second))
 	var limitedError contract.ErrorResponse
 	_ = json.Unmarshal([]byte(limited.Body), &limitedError)
+	raceCapacity := runComputerCLI[l1.ComputerSubmissionMutationResult](t, harness, true, "services", "submission", "set-inflight", reimaged.ComputerID,
+		"--max-inflight", "21", "--expect-current", "--idempotency-key", "linux-native-submission-race-capacity")
+	_ = waitForLiveComputerHTTP(t, reimaged, http.MethodGet, "/v1/computer/self", "", nil, 30*time.Second)
 	authorityRunsBefore := listComputerRunsFromAuthority(t, harness, reimaged.ComputerID)
 	paused := startLiveComputerPausedSubmission(t, reimaged, "linux-native-revocation-race", liveComputerRunRequest(300*time.Second))
 	disabled := runComputerCLI[l1.ComputerSubmissionMutationResult](t, harness, true, "services", "submission", "disable", reimaged.ComputerID,
@@ -604,12 +607,14 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"live_one_inflight_policy_transition": limitOne.SubmitMaxInflight == 1 && limitOne.Revoked != nil,
 		"live_exact_inflight_policy_set":      inflight.SubmitMaxInflight == 20 && inflight.Revoked != nil,
 		"live_twenty_inflight_boundary":       limited.Status == http.StatusConflict && limitedError.Error.Code == contract.ErrorSubmitInflightLimit,
+		"live_revocation_race_capacity":       raceCapacity.SubmitMaxInflight == 21 && raceCapacity.Revoked != nil,
 		"live_submission_revoked":             !disabled.SubmitEnabled && disabled.Revoked != nil,
-		"live_revocation_revision_advanced":   disabled.SubmitIntentRevision > submission.SubmitIntentRevision,
+		"live_revocation_revision_advanced":   disabled.SubmitIntentRevision > raceCapacity.SubmitIntentRevision,
 		"live_revocation_race_closed":         guestTypedOutcome && authorityRace.Closed,
 	}
 	guestEvidence := map[string]string{"policy_revision": fmt.Sprint(submission.PolicyRevision),
 		"submit_intent_revision": fmt.Sprint(submission.SubmitIntentRevision),
+		"race_capacity_revision": fmt.Sprint(raceCapacity.SubmitIntentRevision),
 		"root_run_id":            accepted[0].RunID,
 		"revocation_race_result": fmt.Sprintf("guest_status=%d guest_code=%s transport_error=%s authority_outcome=%s authority_before=%d authority_after=%d race_run_id=%s race_run_created_at=%s revocation_committed_at=%s",
 			pausedResult.Status, pausedError.Error.Code, pausedResult.TransportError, authorityRace.Outcome,
@@ -1621,7 +1626,7 @@ try:
     response.begin()
     status, response_body = response.status, response.read().decode()
 except Exception as error:
-    transport_error = type(error).__name__
+    transport_error = type(error).__name__ + ":" + str(error)
 print(json.dumps({"status": status, "body": response_body, "transport_error": transport_error}), flush=True)
 `
 
