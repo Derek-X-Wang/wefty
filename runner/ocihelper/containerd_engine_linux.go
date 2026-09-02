@@ -139,6 +139,9 @@ type ContainerdEngine struct {
 	capacityReservations        map[string]*capacityReservation
 	lastAdmission               *ResourceAdmissionReceipt
 	memoryFactsPath             string
+	cgroupKill                  func(string) error
+	cgroupPopulated             func(string) (bool, error)
+	cgroupRemove                func(string) error
 }
 
 const (
@@ -2125,7 +2128,7 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 		inventory = filterInventory(inventory, resources, computerDisk)
 	}
 	observed := inventory
-	projected, err := engine.runtimeAbsenceInventory(observed, time.Now())
+	projected, retentions, err := engine.runtimeAbsenceInventory(observed, time.Now())
 	if err != nil {
 		return VerifyResponse{}, err
 	}
@@ -2134,10 +2137,11 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 		engine.releaseVerifiedNamespace()
 	}
 	return VerifyResponse{
-		Absent:          absent,
-		Inventory:       observed,
-		RuntimeResidue:  projected,
-		DurableRetained: subtractResourceInventory(observed, projected),
+		Absent:            absent,
+		Inventory:         observed,
+		RuntimeResidue:    projected,
+		DurableRetained:   subtractResourceInventory(observed, projected),
+		DurableRetentions: retentions,
 	}, nil
 }
 
@@ -2208,8 +2212,22 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 		return SweepResponse{}, err
 	}
 	response, err := engine.finishSweep(ctx, inventory, prior, attempts)
+	if err != nil {
+		return response, err
+	}
+	if _, err := engine.sweepLostAttemptLogSegments(ctx, inventory.LogSegments); err != nil {
+		return SweepResponse{}, err
+	}
+	if err := engine.sweepLostAttemptCgroups(ctx, inventory.Cgroups); err != nil {
+		return SweepResponse{}, err
+	}
+	remaining, err := engine.inventory(ctx)
+	if err != nil {
+		return SweepResponse{}, err
+	}
+	response.Removed = inventoryCount(subtractResourceInventory(observedInventory, remaining))
 	response.Inventory = observedInventory
-	return response, err
+	return response, nil
 }
 
 func (engine *ContainerdEngine) cleanupExpiredHandoffs(now time.Time) error {
@@ -2326,15 +2344,11 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 		if err := unmountComputerControlTmpfs(filepath.Join(logDirectory, "control")); err != nil {
 			return SweepResponse{}, err
 		}
-		for _, path := range []string{
-			logDirectory,
-			// M3 handoffs now live under the durable handoffs root. Sweep this
-			// legacy attempt-scoped location so upgrades do not strand residue.
-			filepath.Join(engine.config.RuntimeRoot, "handoffs", identity.HandoffVolumeDirectory),
-		} {
-			if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return SweepResponse{}, err
-			}
+		// M3 handoffs now live under the durable handoffs root. Sweep this
+		// legacy attempt-scoped location so upgrades do not strand residue.
+		path := filepath.Join(engine.config.RuntimeRoot, "handoffs", identity.HandoffVolumeDirectory)
+		if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return SweepResponse{}, err
 		}
 	}
 	priorList := make([]SessionIdentity, 0, len(prior))
@@ -3308,12 +3322,338 @@ func filterInventory(inventory ResourceInventory, resources ResourceIdentity, at
 	return filtered
 }
 
-func (engine *ContainerdEngine) runtimeAbsenceInventory(inventory ResourceInventory, now time.Time) (ResourceInventory, error) {
+func (engine *ContainerdEngine) sweepLostAttemptLogSegments(ctx context.Context, names []string) ([]DurableRetention, error) {
+	timeout := engine.config.LogSealTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	waitContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	pending := make(map[string]string)
+	for _, name := range names {
+		path := filepath.Join(engine.config.RuntimeRoot, "logs", name)
+		owned, err := helperOwnedAttemptDirectory(path, "wefty-log-segments-", name)
+		if err != nil {
+			return nil, err
+		}
+		if owned {
+			pending[name] = path
+		}
+	}
+	for len(pending) > 0 {
+		for name, path := range pending {
+			sealed, err := logSegmentDirectorySealed(path)
+			if err != nil {
+				return nil, fmt.Errorf("inspect lost-attempt log spool %s: %w", name, err)
+			}
+			if !sealed {
+				if _, statErr := os.Lstat(path); errors.Is(statErr, os.ErrNotExist) {
+					delete(pending, name)
+				} else if statErr != nil {
+					return nil, statErr
+				}
+				continue
+			}
+			if err := unmountComputerControlTmpfs(filepath.Join(path, "control")); err != nil {
+				return nil, err
+			}
+			if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
+			delete(pending, name)
+		}
+		if len(pending) == 0 {
+			break
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-waitContext.Done():
+			timer.Stop()
+			retained := make([]DurableRetention, 0, len(pending))
+			for name := range pending {
+				retained = append(retained, DurableRetention{
+					Class: RemovalResourceLogSegments, ID: name,
+					Owner: DurableRetentionOwnerOCIHelper, Reason: DurableRetentionReasonLogSpoolSealing,
+				})
+			}
+			slices.SortFunc(retained, func(left, right DurableRetention) int { return strings.Compare(left.ID, right.ID) })
+			return retained, nil
+		case <-timer.C:
+		}
+	}
+	return nil, nil
+}
+
+func helperOwnedAttemptDirectory(path, prefix, name string) (bool, error) {
+	if !managedAttemptResourceName(name, prefix) {
+		return false, nil
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, nil
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == uint32(os.Geteuid()), nil
+}
+
+func managedAttemptResourceName(name, prefix string) bool {
+	suffix, found := strings.CutPrefix(name, prefix)
+	if !found || len(suffix) != 32 {
+		return false
+	}
+	for _, character := range suffix {
+		if character < '0' || character > '9' {
+			if character < 'a' || character > 'f' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func logSegmentDirectorySealed(directory string) (bool, error) {
+	for _, stream := range []string{"stdout.frames", "stderr.frames"} {
+		file, err := os.Open(filepath.Join(directory, stream))
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		sealed := false
+		for {
+			kind, _, _, readErr := readLogRecord(file)
+			if readErr != nil {
+				if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+					break
+				}
+				_ = file.Close()
+				return false, readErr
+			}
+			if kind == logRecordSeal || kind == logRecordIncomplete {
+				sealed = true
+				break
+			}
+		}
+		if err := file.Close(); err != nil {
+			return false, err
+		}
+		if !sealed {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (engine *ContainerdEngine) sweepLostAttemptCgroups(ctx context.Context, names []string) error {
+	targets := make(map[string]struct{})
+	for _, name := range names {
+		if managedAttemptResourceName(name, "wefty-cgroup-") {
+			targets[name] = struct{}{}
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	paths := make(map[string][]string)
+	if err := filepath.WalkDir(engine.config.CgroupRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
+			return walkErr
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		if _, selected := targets[entry.Name()]; selected {
+			paths[entry.Name()] = append(paths[entry.Name()], path)
+			return filepath.SkipDir
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	kill := engine.cgroupKill
+	if kill == nil {
+		kill = killCgroupTree
+	}
+	populated := engine.cgroupPopulated
+	if populated == nil {
+		populated = cgroupTreePopulated
+	}
+	remove := engine.cgroupRemove
+	if remove == nil {
+		remove = removeCgroupTree
+	}
+	for name, matches := range paths {
+		for _, path := range matches {
+			if err := kill(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("KILL helper-owned cgroup %s: %w", name, err)
+			}
+		}
+	}
+	timeout := engine.config.TaskReleaseTimeout
+	if timeout <= 0 {
+		timeout = DefaultTaskReleaseTimeout
+	}
+	waitContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for name, matches := range paths {
+		for _, path := range matches {
+			for {
+				live, err := populated(path)
+				if errors.Is(err, os.ErrNotExist) {
+					break
+				}
+				if err != nil {
+					return fmt.Errorf("verify helper-owned cgroup %s after KILL: %w", name, err)
+				}
+				if !live {
+					removeErr := remove(path)
+					if removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
+						break
+					}
+					if !errors.Is(removeErr, syscall.EBUSY) && !errors.Is(removeErr, syscall.ENOTEMPTY) {
+						return fmt.Errorf("remove helper-owned cgroup %s: %w", name, removeErr)
+					}
+				}
+				if live {
+					if err := kill(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+						return fmt.Errorf("repeat KILL for helper-owned cgroup %s: %w", name, err)
+					}
+				}
+				timer := time.NewTimer(10 * time.Millisecond)
+				select {
+				case <-waitContext.Done():
+					timer.Stop()
+					return fmt.Errorf("helper-owned cgroup %s remained after KILL: %w", name, waitContext.Err())
+				case <-timer.C:
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func killCgroupTree(path string) error {
+	killFile, err := os.OpenFile(filepath.Join(path, "cgroup.kill"), os.O_WRONLY, 0)
+	if err == nil {
+		err = writeAll(killFile, []byte("1\n"))
+		err = errors.Join(err, killFile.Close())
+		return err
+	}
+	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.EOPNOTSUPP) {
+		return err
+	}
+	return filepath.WalkDir(path, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if entry.Name() != "cgroup.procs" {
+			return nil
+		}
+		payload, err := os.ReadFile(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		for _, field := range strings.Fields(string(payload)) {
+			pid, err := strconv.Atoi(field)
+			if err != nil || pid <= 0 {
+				return fmt.Errorf("invalid pid %q in %s", field, current)
+			}
+			if err := unix.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func cgroupTreePopulated(path string) (bool, error) {
+	if payload, err := os.ReadFile(filepath.Join(path, "cgroup.events")); err == nil {
+		for _, line := range strings.Split(string(payload), "\n") {
+			field, value, found := strings.Cut(line, " ")
+			if found && field == "populated" {
+				return strings.TrimSpace(value) != "0", nil
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	populated := false
+	err := filepath.WalkDir(path, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() || entry.Name() != "cgroup.procs" {
+			return nil
+		}
+		payload, err := os.ReadFile(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		populated = populated || len(strings.Fields(string(payload))) > 0
+		return nil
+	})
+	return populated, err
+}
+
+func removeCgroupTree(path string) error {
+	paths := make([]string, 0)
+	if err := filepath.WalkDir(path, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() {
+			paths = append(paths, current)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	slices.SortFunc(paths, func(left, right string) int { return len(right) - len(left) })
+	for _, current := range paths {
+		if err := unix.Rmdir(current); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (engine *ContainerdEngine) runtimeAbsenceInventory(inventory ResourceInventory, now time.Time) (ResourceInventory, []DurableRetention, error) {
 	retention := engine.config.HandoffRetention
 	if retention <= 0 {
 		retention = defaultHandoffRetention
 	}
-	return projectRuntimeAbsenceInventory(inventory, engine.retainedServiceDataBinding, func(name string) (bool, error) {
+	projected, err := projectRuntimeAbsenceInventory(inventory, engine.retainedServiceDataBinding, func(name string) (bool, error) {
 		info, err := os.Stat(filepath.Join(engine.config.RuntimeRoot, "handoffs", name))
 		if errors.Is(err, os.ErrNotExist) {
 			// A concurrently removed inventory entry cannot be retained evidence;
@@ -3326,6 +3666,36 @@ func (engine *ContainerdEngine) runtimeAbsenceInventory(inventory ResourceInvent
 		}
 		return now.Sub(info.ModTime()) < retention, nil
 	})
+	if err != nil {
+		return ResourceInventory{}, nil, err
+	}
+	retentions := make([]DurableRetention, 0)
+	logSegments := projected.LogSegments[:0]
+	for _, name := range projected.LogSegments {
+		path := filepath.Join(engine.config.RuntimeRoot, "logs", name)
+		owned, ownershipErr := helperOwnedAttemptDirectory(path, "wefty-log-segments-", name)
+		if ownershipErr != nil {
+			return ResourceInventory{}, nil, ownershipErr
+		}
+		if !owned {
+			logSegments = append(logSegments, name)
+			continue
+		}
+		sealed, sealErr := logSegmentDirectorySealed(path)
+		if sealErr != nil {
+			return ResourceInventory{}, nil, sealErr
+		}
+		if sealed {
+			logSegments = append(logSegments, name)
+			continue
+		}
+		retentions = append(retentions, DurableRetention{
+			Class: RemovalResourceLogSegments, ID: name,
+			Owner: DurableRetentionOwnerOCIHelper, Reason: DurableRetentionReasonLogSpoolSealing,
+		})
+	}
+	projected.LogSegments = logSegments
+	return projected, retentions, nil
 }
 
 func (engine *ContainerdEngine) retainedServiceDataBinding(volumeName, recordName string) (bool, error) {

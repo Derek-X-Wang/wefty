@@ -143,6 +143,155 @@ func TestOOMEvidenceUsesConfiguredCgroupRoot(t *testing.T) {
 	}
 }
 
+func TestSweepLostAttemptLogSegmentsWaitsForSealThenRemoves(t *testing.T) {
+	authority := testAuthority()
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeRoot := t.TempDir()
+	directory := filepath.Join(runtimeRoot, "logs", resources.LogSegmentDirectory)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, stream := range []string{"stdout", "stderr"} {
+		file, err := os.Create(filepath.Join(directory, stream+".frames"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeLogFrame(file, 0, []byte(stream+" live")); err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seal := make(chan struct{})
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		defer close(seal)
+		for _, stream := range []string{"stdout", "stderr"} {
+			file, openErr := os.OpenFile(filepath.Join(directory, stream+".frames"), os.O_WRONLY|os.O_APPEND, 0)
+			if openErr == nil {
+				openErr = writeLogRecord(file, logSealMagic, 1, nil)
+			}
+			if file != nil {
+				openErr = errors.Join(openErr, file.Close())
+			}
+			if openErr != nil {
+				t.Errorf("seal %s: %v", stream, openErr)
+			}
+		}
+	}()
+
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot, LogSealTimeout: time.Second}}
+	started := time.Now()
+	retained, err := engine.sweepLostAttemptLogSegments(t.Context(), []string{resources.LogSegmentDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-seal
+	if len(retained) != 0 {
+		t.Fatalf("sealed lost-attempt spool retained = %+v", retained)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("log sweep elapsed = %s, want bounded wait for sealing", elapsed)
+	}
+	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sealed lost-attempt spool remained: %v", err)
+	}
+}
+
+func TestSweepLostAttemptLogSegmentsRetainsPendingSealWithOwnerAndReason(t *testing.T) {
+	authority := testAuthority()
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeRoot := t.TempDir()
+	directory := filepath.Join(runtimeRoot, "logs", resources.LogSegmentDirectory)
+	foreignName := "wefty-log-segments-foreign"
+	foreignDirectory := filepath.Join(runtimeRoot, "logs", foreignName)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(foreignDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, stream := range []string{"stdout", "stderr"} {
+		if err := os.WriteFile(filepath.Join(directory, stream+".frames"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot, LogSealTimeout: 20 * time.Millisecond}}
+	retained, err := engine.sweepLostAttemptLogSegments(t.Context(), []string{foreignName, resources.LogSegmentDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []DurableRetention{{
+		Class: RemovalResourceLogSegments,
+		ID:    resources.LogSegmentDirectory, Owner: DurableRetentionOwnerOCIHelper,
+		Reason: DurableRetentionReasonLogSpoolSealing,
+	}}
+	if !slices.Equal(retained, want) {
+		t.Fatalf("pending lost-attempt spool retention = %+v, want %+v", retained, want)
+	}
+	if _, err := os.Stat(directory); err != nil {
+		t.Fatalf("pending lost-attempt spool was not retained: %v", err)
+	}
+	if _, err := os.Stat(foreignDirectory); err != nil {
+		t.Fatalf("foreign prefix-shaped log directory was removed: %v", err)
+	}
+	residue, verifiedRetained, err := engine.runtimeAbsenceInventory(ResourceInventory{LogSegments: []string{foreignName, resources.LogSegmentDirectory}}, time.Now())
+	if err != nil || !slices.Equal(residue.LogSegments, []string{foreignName}) || !slices.Equal(verifiedRetained, want) {
+		t.Fatalf("pending spool classification = residue %+v retained %+v err %v", residue, verifiedRetained, err)
+	}
+}
+
+func TestSweepLostAttemptCgroupKillsPopulatedOwnedTree(t *testing.T) {
+	authority := testAuthority()
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cgroupRoot := t.TempDir()
+	owned := filepath.Join(cgroupRoot, resources.CgroupID)
+	foreign := filepath.Join(cgroupRoot, "wefty-cgroup-foreign")
+	for _, directory := range []string{filepath.Join(owned, "nested.scope"), foreign} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	killed := false
+	engine := &ContainerdEngine{
+		config: NativeEngineConfig{CgroupRoot: cgroupRoot, TaskReleaseTimeout: time.Second},
+		cgroupKill: func(path string) error {
+			if path != owned {
+				t.Fatalf("killed cgroup %q, want %q", path, owned)
+			}
+			killed = true
+			return nil
+		},
+		cgroupPopulated: func(path string) (bool, error) { return !killed, nil },
+		cgroupRemove:    os.RemoveAll,
+	}
+	if err := engine.sweepLostAttemptCgroups(t.Context(), []string{resources.CgroupID, filepath.Base(foreign)}); err != nil {
+		t.Fatal(err)
+	}
+	if !killed {
+		t.Fatal("populated helper-owned cgroup did not receive KILL escalation")
+	}
+	if _, err := os.Stat(owned); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("helper-owned cgroup remained: %v", err)
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Fatalf("foreign prefix-shaped cgroup was removed: %v", err)
+	}
+}
+
 func TestParseRetryAfterAcceptsSecondsAndHTTPDate(t *testing.T) {
 	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
 	if delay := parseRetryAfter("17", now); delay != 17*time.Second {

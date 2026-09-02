@@ -1076,6 +1076,29 @@ func TestBootBarrierReceiptsRetainedHandoffInventoryWithoutCallingItResidue(t *t
 	}
 }
 
+func TestNamespaceVerificationRequiresExactLogRetentionOwnerAndReason(t *testing.T) {
+	const logSegment = "wefty-log-segments-0123456789abcdef0123456789abcdef"
+	verification := VerifyResponse{
+		Absent:          true,
+		Inventory:       ResourceInventory{LogSegments: []string{logSegment}},
+		DurableRetained: ResourceInventory{LogSegments: []string{logSegment}},
+	}
+	if err := validateNamespaceVerification("test verify", verification); err == nil || !strings.Contains(err.Error(), "lack exact owner/reason bindings") {
+		t.Fatalf("unbound retained log segment = %v", err)
+	}
+	verification.DurableRetentions = []DurableRetention{{
+		Class: RemovalResourceLogSegments, ID: logSegment,
+		Owner: DurableRetentionOwnerOCIHelper, Reason: DurableRetentionReasonLogSpoolSealing,
+	}}
+	if err := validateNamespaceVerification("test verify", verification); err != nil {
+		t.Fatalf("exact retained log binding rejected: %v", err)
+	}
+	verification.DurableRetentions[0].Reason = "unknown"
+	if err := validateNamespaceVerification("test verify", verification); err == nil || !strings.Contains(err.Error(), "invalid durable-retention binding") {
+		t.Fatalf("unknown retained log reason = %v", err)
+	}
+}
+
 func TestHelperRestartSweepsAndVerifiesBeforeAcceptingSession(t *testing.T) {
 	engine := newFakeEngine()
 	engine.sweepEntered = make(chan struct{})

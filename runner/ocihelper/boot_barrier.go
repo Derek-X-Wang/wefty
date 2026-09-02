@@ -21,10 +21,11 @@ type BootBarrierConfig struct {
 // block OCI admission and durable resources intentionally retained across a
 // quiescent namespace verification.
 type NamespaceResidueError struct {
-	Operation       string
-	Observed        ResourceInventory
-	RuntimeResidue  ResourceInventory
-	DurableRetained ResourceInventory
+	Operation         string
+	Observed          ResourceInventory
+	RuntimeResidue    ResourceInventory
+	DurableRetained   ResourceInventory
+	DurableRetentions []DurableRetention
 }
 
 // ResidueClassificationError means an engine returned an absence verdict that
@@ -42,21 +43,40 @@ func (err *ResidueClassificationError) Error() string {
 }
 
 func (err *NamespaceResidueError) Error() string {
-	return fmt.Sprintf("%s: residue remains after sweep: runtime=%+v durable_retained=%+v observed=%+v", err.Operation, err.RuntimeResidue, err.DurableRetained, err.Observed)
+	return fmt.Sprintf("%s: residue remains after sweep: runtime=%+v durable_retained=%+v retention_bindings=%+v observed=%+v", err.Operation, err.RuntimeResidue, err.DurableRetained, err.DurableRetentions, err.Observed)
 }
 
-func namespaceResidueError(operation string, verification VerifyResponse) error {
+func validateNamespaceVerification(operation string, verification VerifyResponse) error {
 	if verification.Absent != InventoryEmpty(verification.RuntimeResidue) {
 		return &ResidueClassificationError{
 			Operation: operation, Absent: verification.Absent,
 			Observed: cloneResourceInventory(verification.Inventory), RuntimeResidue: cloneResourceInventory(verification.RuntimeResidue),
 		}
 	}
+	retainedLogs := slices.Clone(verification.DurableRetained.LogSegments)
+	slices.Sort(retainedLogs)
+	boundLogs := make([]string, 0, len(verification.DurableRetentions))
+	for _, retention := range verification.DurableRetentions {
+		if retention.Class != RemovalResourceLogSegments || retention.ID == "" ||
+			retention.Owner != DurableRetentionOwnerOCIHelper || retention.Reason != DurableRetentionReasonLogSpoolSealing {
+			return fmt.Errorf("%s: invalid durable-retention binding: %+v", operation, retention)
+		}
+		boundLogs = append(boundLogs, retention.ID)
+	}
+	slices.Sort(boundLogs)
+	if !slices.Equal(retainedLogs, boundLogs) {
+		return fmt.Errorf("%s: durable-retained log segments lack exact owner/reason bindings: retained=%v bindings=%v", operation, retainedLogs, boundLogs)
+	}
+	return nil
+}
+
+func namespaceResidueError(operation string, verification VerifyResponse) error {
 	return &NamespaceResidueError{
-		Operation:       operation,
-		Observed:        cloneResourceInventory(verification.Inventory),
-		RuntimeResidue:  cloneResourceInventory(verification.RuntimeResidue),
-		DurableRetained: cloneResourceInventory(verification.DurableRetained),
+		Operation:         operation,
+		Observed:          cloneResourceInventory(verification.Inventory),
+		RuntimeResidue:    cloneResourceInventory(verification.RuntimeResidue),
+		DurableRetained:   cloneResourceInventory(verification.DurableRetained),
+		DurableRetentions: slices.Clone(verification.DurableRetentions),
 	}
 }
 
@@ -191,8 +211,8 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("verify OCI runtime namespace: %w", err)
 	}
-	if verification.Absent != InventoryEmpty(verification.RuntimeResidue) {
-		return namespaceResidueError("verify OCI runtime namespace", verification)
+	if err := validateNamespaceVerification("verify OCI runtime namespace", verification); err != nil {
+		return err
 	}
 	if !verification.Absent {
 		return namespaceResidueError("verify OCI runtime namespace", verification)
@@ -206,6 +226,7 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 		VerifiedInventory:     cloneResourceInventory(verification.Inventory),
 		VerifiedResidue:       cloneResourceInventory(verification.RuntimeResidue),
 		VerifiedRetained:      cloneResourceInventory(verification.DurableRetained),
+		DurableRetentions:     slices.Clone(verification.DurableRetentions),
 		Attempts:              slices.Clone(sweep.Attempts),
 	}
 	if receipt.SweepEpoch == "" {
@@ -309,6 +330,7 @@ func cloneVerifiedSweepReceipt(receipt VerifiedSweepReceipt) VerifiedSweepReceip
 	receipt.VerifiedInventory = cloneResourceInventory(receipt.VerifiedInventory)
 	receipt.VerifiedResidue = cloneResourceInventory(receipt.VerifiedResidue)
 	receipt.VerifiedRetained = cloneResourceInventory(receipt.VerifiedRetained)
+	receipt.DurableRetentions = slices.Clone(receipt.DurableRetentions)
 	receipt.Attempts = slices.Clone(receipt.Attempts)
 	return receipt
 }

@@ -330,6 +330,11 @@ finish. `ReapAndVerify` may consume that same-boot sweep once only when its
 complete attempt authority matches and the independently verified namespace
 inventory is empty. Replacement claims remain embargoed until the ordinary
 capability publication handshake acknowledges the recovered generation.
+An exact helper-owned log spool still finishing its bounded seal is durable
+retained only with the helper owner and `log_spool_sealing` reason; it does not
+manufacture runtime residue or withdraw `kind:oci`. Exact helper-owned
+populated cgroups are KILL-reaped by sweep before verification and cannot cross
+this boundary as unexplained residue.
 Concurrent attempts that observed the same lost generation serialize recovery;
 after one establishes a newer sweep, siblings consume that proof instead of
 invalidating the recovered generation again.

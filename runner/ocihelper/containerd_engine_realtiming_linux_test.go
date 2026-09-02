@@ -791,6 +791,113 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	}
 }
 
+func TestNativeLinuxSweepClearsLostAttemptLogSpoolAndPopulatedCgroup(t *testing.T) {
+	helperSocket := os.Getenv("WEFTY_OCI_HELPER_SOCKET")
+	helperChecksum := os.Getenv("WEFTY_OCI_HELPER_CHECKSUM")
+	reference := os.Getenv("WEFTY_OCI_ECHO_REFERENCE")
+	archivePath := os.Getenv("WEFTY_OCI_ECHO_ARCHIVE")
+	if helperSocket == "" || helperChecksum == "" || reference == "" || archivePath == "" {
+		t.Fatal("Linux OCI lost-attempt sweep provisioning is incomplete")
+	}
+	client := ocihelper.NewUnixClient(helperSocket, helperChecksum)
+	client.HeartbeatInterval = time.Second
+	barrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{NodeID: "native-flake-node", BootSessionID: "native-flake-boot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer barrier.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	adapter := ocirunner.NewAdapter(barrier)
+	image := loadNativeImageArchive(t, ctx, adapter, reference, archivePath)
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := ocihelper.AttemptAuthority{
+		NodeID: "native-flake-node", BootSessionID: "native-flake-boot", JobID: "lost-log-job",
+		AttemptID: "lost-log-attempt", FencingToken: "lost-log-fence", Class: "one-shot", RemovalGeneration: "attempt",
+	}
+	identity, err := ocihelper.DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Run(ctx, ocihelper.RunRequest{
+		Authority: authority, InitialDeadman: time.Second,
+		Workload: ocihelper.WorkloadInput{
+			ImageReference: reference, ImageDigest: image.TopLevelDigest,
+			Argv: []string{"/bin/sh", "-c", "while true; do printf 'lost-attempt-log\\n'; sleep .05; done"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if err := session.Signal(ctx, ocihelper.SignalRequest{Authority: authority, Signal: ocihelper.SignalTERM}); err == nil {
+		t.Fatal("expired attempt retained signal authority")
+	} else {
+		var rpc *ocihelper.RPCError
+		if !errors.As(err, &rpc) || rpc.Code != ocihelper.CodeUnauthorizedAttempt {
+			t.Fatalf("expired attempt signal = %v, want unauthorized_attempt", err)
+		}
+	}
+	requestRootFault(t, "inject-live-log:"+identity.LogSegmentDirectory)
+	logSweepStarted := time.Now()
+	logSweepBound := session.Handshake().ReapTimeout
+	barrier.Invalidate()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatalf("sweep live lost-attempt log spool: %v", err)
+	}
+	logSweepElapsed := time.Since(logSweepStarted)
+	if logSweepElapsed > logSweepBound {
+		t.Fatalf("lost-attempt log sweep took %s, want within advertised reap bound %s", logSweepElapsed, logSweepBound)
+	}
+	logReceipt, ok := barrier.SweepReceipt()
+	if !ok || !logReceipt.VerifiedAbsent || !slices.Contains(logReceipt.SweptInventory.LogSegments, identity.LogSegmentDirectory) ||
+		slices.Contains(logReceipt.VerifiedInventory.LogSegments, identity.LogSegmentDirectory) ||
+		slices.Contains(logReceipt.VerifiedRetained.LogSegments, identity.LogSegmentDirectory) {
+		t.Fatalf("lost-attempt log sweep receipt = %+v present=%t", logReceipt, ok)
+	}
+
+	cgroupAuthority := authority
+	cgroupAuthority.JobID = "lost-cgroup-job"
+	cgroupAuthority.AttemptID = "lost-cgroup-attempt"
+	cgroupAuthority.FencingToken = "lost-cgroup-fence"
+	cgroupIdentity, err := ocihelper.DeterministicResourceIdentity(cgroupAuthority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestRootFault(t, "populate-cgroup:"+cgroupIdentity.CgroupID)
+	session, err = barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cgroupSweepStarted := time.Now()
+	cgroupSweepBound := session.Handshake().ReapTimeout
+	barrier.Invalidate()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatalf("sweep populated lost-attempt cgroup: %v", err)
+	}
+	cgroupSweepElapsed := time.Since(cgroupSweepStarted)
+	if cgroupSweepElapsed > cgroupSweepBound {
+		t.Fatalf("lost-attempt cgroup sweep took %s, want within advertised reap bound %s", cgroupSweepElapsed, cgroupSweepBound)
+	}
+	cgroupReceipt, ok := barrier.SweepReceipt()
+	if !ok || !cgroupReceipt.VerifiedAbsent || !slices.Contains(cgroupReceipt.SweptInventory.Cgroups, cgroupIdentity.CgroupID) ||
+		slices.Contains(cgroupReceipt.VerifiedInventory.Cgroups, cgroupIdentity.CgroupID) {
+		t.Fatalf("lost-attempt cgroup sweep receipt = %+v present=%t", cgroupReceipt, ok)
+	}
+	t.Logf("lost-attempt sweep cleared sealed log spool in %s and KILL-reaped populated cgroup in %s", logSweepElapsed, cgroupSweepElapsed)
+	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
+		evidence := fmt.Sprintf("lost_attempt_log_segment=%s\nlog_sweep_elapsed=%s\nlog_sweep_bound=%s\nlog_verified_absent=true\npopulated_cgroup=%s\ncgroup_sweep_elapsed=%s\ncgroup_sweep_bound=%s\ncgroup_verified_absent=true\n", identity.LogSegmentDirectory, logSweepElapsed, logSweepBound, cgroupIdentity.CgroupID, cgroupSweepElapsed, cgroupSweepBound)
+		if err := os.WriteFile(filepath.Join(evidenceDirectory, "lost-attempt-sweep.txt"), []byte(evidence), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 var nativeBarrierLossSequence atomic.Uint64
 
 func recordNativeBarrierLoss(generation ocihelper.HelperSession, barrierStartedAt time.Time, barrierReadyUnixNano int64, lossErr error) error {

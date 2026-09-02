@@ -176,7 +176,7 @@ Successful verification produces an immutable receipt retained by the client
 barrier. It names the sweep epoch and helper process/session generation and
 copies the prior boot sessions, class-separated swept inventory, independent
 post-sweep observed inventory, runtime-residue projection, durable-retained
-projection, and recovered `(removal_generation, attempt_id,
+projection, exact durable-retention bindings, and recovered `(removal_generation, attempt_id,
 fencing_token, prior_boot_session_id)` tuples. A helper-startup sweep is folded
 into the first session receipt so evidence is not discarded before session
 acquisition. This is evidence for the later runtime/removal adapter; this
@@ -536,6 +536,21 @@ io.wefty/class
 io.wefty/removal_generation
 ```
 
+Sweep recognizes an otherwise-unbound cgroup or log directory as helper-owned
+only when its direct resource name is the exact deterministic prefix followed
+by 32 lowercase hexadecimal characters. A log directory must additionally be
+a real directory owned by the helper UID beneath the configured log root;
+symlinks, malformed names, and directories owned by another UID remain runtime
+residue. After containerd teardown, sweep waits at most the configured log-seal
+bound for both framed streams to end in either a complete or explicit
+incomplete seal, then removes the directory. While that bounded wait expires
+with sealing still in progress, namespace verification reports the visible log
+directory as durable retained and emits the exact binding
+`class=log_segments, owner=oci_helper, reason=log_spool_sealing`; a retained log
+without that closed owner/reason binding is inconsistent verification and the
+boot barrier fails closed. A later sweep retries sealing and removes the
+directory once both terminal records exist.
+
 Handoff volumes live under a distinct helper-owned durable root, not the
 attempt namespace. `Delete` reaps and verifies the attempt while retaining its
 handoff volume. Session reap and boot sweep likewise leave unexpired handoffs
@@ -892,7 +907,15 @@ single total. All seven authority labels must reconstruct the deterministic
 identity exactly; unexpected containerd resources in namespace `wefty`, shim
 bundle entries under containerd's runtime-v2 state root, and cgroups found by a
 recursive scan of the configured cgroup hierarchy make absence verification
-fail. Filesystem and deletion errors are fatal except verified `NotFound`.
+fail. After containerd task deletion, sweep treats an exact deterministic
+cgroup name as helper-owned, sends recursive `KILL` through cgroup v2's
+`cgroup.kill` (falling back to `SIGKILL` for every PID in the subtree), waits
+within the existing task-release bound for the subtree to become unpopulated,
+and removes its directories bottom-up. Failure to kill, reap, or remove that
+owned subtree is a sweep mechanics failure; it is never returned as
+unclearable runtime residue. Prefix-shaped or malformed cgroups remain residue
+because helper ownership was not established. Filesystem and deletion errors
+are fatal except verified `NotFound`.
 Whole-namespace session reaping relies on the exclusive one-agent-per-node
 helper-session assumption, while volume deletion is scoped to identities
 recovered from swept attempts and never removes the whole `volumes/` tree.

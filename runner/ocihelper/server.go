@@ -297,8 +297,8 @@ func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("startup verify OCI runtime namespace: %w", err)
 	}
-	if verification.Absent != InventoryEmpty(verification.RuntimeResidue) {
-		return namespaceResidueError("startup verify OCI runtime namespace", verification)
+	if err := validateNamespaceVerification("startup verify OCI runtime namespace", verification); err != nil {
+		return err
 	}
 	if !verification.Absent {
 		return namespaceResidueError("startup verify OCI runtime namespace", verification)

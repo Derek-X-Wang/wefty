@@ -1272,10 +1272,29 @@ type VerifyRequest struct {
 }
 
 type VerifyResponse struct {
-	Absent          bool              `json:"absent"`
-	Inventory       ResourceInventory `json:"inventory"`
-	RuntimeResidue  ResourceInventory `json:"runtime_residue"`
-	DurableRetained ResourceInventory `json:"durable_retained"`
+	Absent            bool               `json:"absent"`
+	Inventory         ResourceInventory  `json:"inventory"`
+	RuntimeResidue    ResourceInventory  `json:"runtime_residue"`
+	DurableRetained   ResourceInventory  `json:"durable_retained"`
+	DurableRetentions []DurableRetention `json:"durable_retentions"`
+}
+
+type DurableRetentionOwner string
+
+const DurableRetentionOwnerOCIHelper DurableRetentionOwner = "oci_helper"
+
+type DurableRetentionReason string
+
+const DurableRetentionReasonLogSpoolSealing DurableRetentionReason = "log_spool_sealing"
+
+// DurableRetention binds a projected-out namespace resource to the authority
+// retaining it and a closed reason. The resource remains visible in
+// DurableRetained; this record explains why it does not block admission.
+type DurableRetention struct {
+	Class  RemovalResourceClass   `json:"class"`
+	ID     string                 `json:"id"`
+	Owner  DurableRetentionOwner  `json:"owner"`
+	Reason DurableRetentionReason `json:"reason"`
 }
 
 // SweepRequest is intentionally empty: the boot barrier always sweeps the
@@ -1346,6 +1365,7 @@ type VerifiedSweepReceipt struct {
 	VerifiedInventory     ResourceInventory       `json:"verified_inventory"`
 	VerifiedResidue       ResourceInventory       `json:"verified_residue"`
 	VerifiedRetained      ResourceInventory       `json:"verified_retained"`
+	DurableRetentions     []DurableRetention      `json:"durable_retentions"`
 	Attempts              []SweptAttemptAuthority `json:"attempts"`
 }
 
