@@ -17,10 +17,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"golang.org/x/sys/unix"
 )
 
-const computerDiskManifestVersion = 1
+const (
+	computerDiskManifestVersion          = 1
+	computerStoragePreparationRecordName = "storage-preparation.json"
+)
 
 type computerDiskCheckpoint string
 
@@ -52,6 +56,40 @@ type computerDiskManifest struct {
 	Attached           *AttemptAuthority              `json:"attached,omitempty"`
 	Pending            *AttemptAuthority              `json:"pending,omitempty"`
 	PreviousDetachment *computerDiskEvidence          `json:"previous_detachment,omitempty"`
+}
+
+func readComputerStoragePreparationWitness(root string) (*contract.ComputerStoragePreparationWitness, bool, error) {
+	payload, err := os.ReadFile(filepath.Join(root, computerStoragePreparationRecordName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var witness contract.ComputerStoragePreparationWitness
+	if json.Unmarshal(payload, &witness) != nil || !witness.Valid() {
+		return nil, false, errors.New("Computer Storage preparation record is corrupt")
+	}
+	return &witness, true, nil
+}
+
+func persistComputerStoragePreparationWitness(root string, witness contract.ComputerStoragePreparationWitness) error {
+	if !witness.Valid() {
+		return errors.New("Computer Storage preparation witness is incomplete")
+	}
+	if existing, present, err := readComputerStoragePreparationWitness(root); err != nil {
+		return err
+	} else if present {
+		if *existing != witness {
+			return errors.New("Computer Storage preparation witness conflicts with its immutable record")
+		}
+		return nil
+	}
+	payload, err := json.Marshal(witness)
+	if err != nil {
+		return err
+	}
+	return writeDurableFile(root, ".storage-preparation.json.tmp-", computerStoragePreparationRecordName, payload, 0o600)
 }
 
 type computerDiskAttachment struct {

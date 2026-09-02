@@ -365,6 +365,15 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 	if err != nil {
 		return GrowComputerStorageResponse{}, err
 	}
+	if !present {
+		prepared, err := durableComputerStoragePreparationExists(diskRoot, request.Storage)
+		if err != nil {
+			return GrowComputerStorageResponse{}, err
+		}
+		if prepared {
+			return GrowComputerStorageResponse{}, &ComputerStorageGrowUncertainError{Cause: errors.New("Computer grow refuses to reconstruct a missing attachment manifest over durable preparation evidence")}
+		}
+	}
 	if present && (!sameComputerStorageIdentity(manifest.Storage, request.Storage) ||
 		(manifest.Storage.DiskBytes != request.Storage.DiskBytes && manifest.Storage.DiskBytes != request.NewDiskBytes)) {
 		return GrowComputerStorageResponse{}, errors.New("Computer grow manifest conflicts with exact Storage authority")
@@ -437,4 +446,27 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 		return GrowComputerStorageResponse{}, err
 	}
 	return GrowComputerStorageResponse{Receipt: receipt}, nil
+}
+
+func durableComputerStoragePreparationExists(root string, storage ComputerStorageReference) (bool, error) {
+	if witness, present, err := readComputerStoragePreparationWitness(root); err != nil {
+		return false, err
+	} else if present {
+		if witness.ComputerID != storage.ComputerID || witness.StorageID != storage.StorageID || witness.StorageGeneration != storage.StorageGeneration {
+			return false, errors.New("Computer grow found a conflicting durable Storage preparation witness")
+		}
+		return true, nil
+	}
+	copyManifest, present, err := readComputerStorageCopyManifest(filepath.Join(root, "storage-copy.json"))
+	if err != nil {
+		return false, err
+	}
+	if !present || copyManifest.Phase != computerStorageCopyPublished || copyManifest.Receipt == nil {
+		return false, nil
+	}
+	receipt := copyManifest.Receipt
+	if receipt.DestinationComputerID != storage.ComputerID || receipt.DestinationStorageID != storage.StorageID || receipt.DestinationGeneration != storage.StorageGeneration {
+		return false, errors.New("Computer grow found a conflicting durable Storage copy receipt")
+	}
+	return true, nil
 }

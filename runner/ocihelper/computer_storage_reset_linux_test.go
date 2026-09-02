@@ -145,6 +145,10 @@ func TestComputerStorageResetFreshnessSurvivesFailedFirstAttach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	witness, witnessPresent, err := readComputerStoragePreparationWitness(filepath.Join(root, "computer-disks", name))
+	if err != nil || !witnessPresent || witness.ReceiptID == "" || witness.StorageGeneration != successor.StorageGeneration {
+		t.Fatalf("durable reset preparation witness = %+v present=%t err=%v", witness, witnessPresent, err)
+	}
 	manifest, present, err := readComputerDiskManifest(filepath.Join(root, "computer-disks", name, "attachment.json"))
 	if err != nil || !present || !manifest.Prepared || manifest.Preparation == nil || manifest.PreparationReceipt == nil {
 		t.Fatalf("failed attach freshness = %#v present=%t err=%v", manifest, present, err)
