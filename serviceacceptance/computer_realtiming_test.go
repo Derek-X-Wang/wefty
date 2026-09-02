@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -581,12 +582,18 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	limited := runLiveComputerHTTP(t, reimaged, http.MethodPost, "/v1/runs", "linux-native-root-over-limit", liveComputerRunRequest(300*time.Second))
 	var limitedError contract.ErrorResponse
 	_ = json.Unmarshal([]byte(limited.Body), &limitedError)
+	authorityRunsBefore := listComputerRunsFromAuthority(t, harness, reimaged.ComputerID)
 	paused := startLiveComputerPausedSubmission(t, reimaged, "linux-native-revocation-race", liveComputerRunRequest(300*time.Second))
 	disabled := runComputerCLI[l1.ComputerSubmissionMutationResult](t, harness, true, "services", "submission", "disable", reimaged.ComputerID,
 		"--expect-current", "--idempotency-key", "linux-native-submission-disable")
 	pausedResult := paused.finish(t)
+	authorityRunsAfter := listComputerRunsFromAuthority(t, harness, reimaged.ComputerID)
 	var pausedError contract.ErrorResponse
 	pausedErrorDecoded := json.Unmarshal([]byte(pausedResult.Body), &pausedError) == nil
+	guestTypedOutcome := pausedResult.TransportError == "" && pausedErrorDecoded &&
+		((pausedResult.Status == http.StatusUnauthorized && pausedError.Error.Code == contract.ErrorUnauthorized) ||
+			(pausedResult.Status == http.StatusBadGateway && pausedError.Error.Code == contract.ErrorPassUnavailable))
+	authorityRace := classifyComputerRevocationRaceAuthority(authorityRunsBefore.Runs, authorityRunsAfter.Runs, disabled.Revoked)
 	guestAssertions := map[string]bool{
 		"live_default_off":                    defaultOff,
 		"live_submission_enabled":             submission.SubmitEnabled && submission.Revoked != nil,
@@ -599,14 +606,14 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"live_twenty_inflight_boundary":       limited.Status == http.StatusConflict && limitedError.Error.Code == contract.ErrorSubmitInflightLimit,
 		"live_submission_revoked":             !disabled.SubmitEnabled && disabled.Revoked != nil,
 		"live_revocation_revision_advanced":   disabled.SubmitIntentRevision > submission.SubmitIntentRevision,
-		"live_revocation_race_closed": pausedResult.Status == http.StatusUnauthorized && pausedErrorDecoded &&
-			pausedError.Error.Code == contract.ErrorUnauthorized && pausedResult.TransportError == "",
+		"live_revocation_race_closed":         guestTypedOutcome && authorityRace.Closed,
 	}
 	guestEvidence := map[string]string{"policy_revision": fmt.Sprint(submission.PolicyRevision),
 		"submit_intent_revision": fmt.Sprint(submission.SubmitIntentRevision),
 		"root_run_id":            accepted[0].RunID,
-		"revocation_race_result": fmt.Sprintf("status=%d code=%s transport_error=%s", pausedResult.Status,
-			pausedError.Error.Code, pausedResult.TransportError),
+		"revocation_race_result": fmt.Sprintf("guest_status=%d guest_code=%s transport_error=%s authority_outcome=%s authority_before=%d authority_after=%d race_run_id=%s race_run_created_at=%s revocation_committed_at=%s",
+			pausedResult.Status, pausedError.Error.Code, pausedResult.TransportError, authorityRace.Outcome,
+			len(authorityRunsBefore.Runs), len(authorityRunsAfter.Runs), authorityRace.RunID, authorityRace.RunCreatedAt, authorityRace.RevocationCommittedAt),
 		"blocked_assertion": "candidate-bound complete M3 OCI matrix root Run execution result"}
 	if mutatingLinuxComputerRow("linux.guest_authority") {
 		if err := receipt.pass("linux.guest_authority", guestAssertions, guestEvidence); err == nil {
@@ -615,7 +622,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	} else if err := receipt.notRun("linux.guest_authority", 157,
 		"the complete M3 OCI matrix does not yet publish the single candidate-bound root Run execution result required to join this live Computer authority proof",
 		guestAssertions, guestEvidence); err != nil {
-		t.Fatal(err)
+		t.Fatalf("%v; revocation_race_result=%s", err, guestEvidence["revocation_race_result"])
 	}
 
 	receipt.begin("linux.removal")
@@ -1449,6 +1456,111 @@ func runLiveComputerHTTP(t *testing.T, computer l1.Computer, method, path, idemp
 	return result
 }
 
+func listComputerRunsFromAuthority(t *testing.T, harness *acceptanceHarness, computerID string) l3.ComputerRunPage {
+	t.Helper()
+	plainNetwork, err := plain.NewNetworkWithID("plain-linux-computer-acceptance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	participant := plainNetwork.NewFabric(fabric.Identity{NodeID: "linux-computer-run-auditor"})
+	transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return participant.Dial(ctx, network, harness.runLedgerAddress)
+	}}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Timeout: 30 * time.Second, Transport: transport}
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet,
+		"http://run-ledger.invalid/v1/runs?origin="+url.QueryEscape("computer:"+computerID)+"&limit=1000", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("list Computer Runs from L3 authority: %v", err)
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("list Computer Runs from L3 authority status=%d body=%s", response.StatusCode, payload)
+	}
+	var page l3.ComputerRunPage
+	if err := json.Unmarshal(payload, &page); err != nil {
+		t.Fatalf("decode Computer Runs from L3 authority: %v body=%s", err, payload)
+	}
+	return page
+}
+
+type computerRevocationRaceAuthorityResult struct {
+	Outcome               string
+	Closed                bool
+	RunID                 string
+	RunCreatedAt          string
+	RevocationCommittedAt string
+}
+
+func classifyComputerRevocationRaceAuthority(before, after []contract.RunRecord,
+	revocation *contract.ComputerTokenRevocationReceipt,
+) computerRevocationRaceAuthorityResult {
+	result := computerRevocationRaceAuthorityResult{Outcome: "unexpected_run_set_change"}
+	if revocation == nil || revocation.CommittedAt.IsZero() {
+		return result
+	}
+	result.RevocationCommittedAt = revocation.CommittedAt.Format(time.RFC3339Nano)
+	beforeRunIDs := make(map[string]struct{}, len(before))
+	for _, run := range before {
+		beforeRunIDs[run.RunID] = struct{}{}
+	}
+	newRuns := make([]contract.RunRecord, 0, 1)
+	for _, run := range after {
+		if _, existed := beforeRunIDs[run.RunID]; !existed {
+			newRuns = append(newRuns, run)
+		}
+	}
+	if len(after) == len(before) && len(newRuns) == 0 {
+		result.Outcome = "no_commit"
+		result.Closed = true
+		return result
+	}
+	if len(after) != len(before)+1 || len(newRuns) != 1 {
+		return result
+	}
+	result.RunID = newRuns[0].RunID
+	result.RunCreatedAt = newRuns[0].CreatedAt.Format(time.RFC3339Nano)
+	result.Outcome = "committed_after_revocation"
+	if !newRuns[0].CreatedAt.After(revocation.CommittedAt) {
+		result.Outcome = "committed_before_revocation"
+		result.Closed = true
+	}
+	return result
+}
+
+func TestClassifyComputerRevocationRaceAuthorityOrder(t *testing.T) {
+	revokedAt := time.Date(2026, 9, 2, 4, 0, 0, 0, time.UTC)
+	baseline := []contract.RunRecord{{RunID: "run-before", CreatedAt: revokedAt.Add(-time.Minute)}}
+	tests := []struct {
+		name    string
+		after   []contract.RunRecord
+		outcome string
+		closed  bool
+	}{
+		{name: "no commit", after: baseline, outcome: "no_commit", closed: true},
+		{name: "commit won fence", after: append(append([]contract.RunRecord(nil), baseline...), contract.RunRecord{RunID: "run-race", CreatedAt: revokedAt.Add(-time.Nanosecond)}), outcome: "committed_before_revocation", closed: true},
+		{name: "commit after revocation", after: append(append([]contract.RunRecord(nil), baseline...), contract.RunRecord{RunID: "run-race", CreatedAt: revokedAt.Add(time.Nanosecond)}), outcome: "committed_after_revocation", closed: false},
+		{name: "multiple unexpected commits", after: append(append([]contract.RunRecord(nil), baseline...), contract.RunRecord{RunID: "run-race-1", CreatedAt: revokedAt}, contract.RunRecord{RunID: "run-race-2", CreatedAt: revokedAt}), outcome: "unexpected_run_set_change", closed: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := classifyComputerRevocationRaceAuthority(baseline, test.after,
+				&contract.ComputerTokenRevocationReceipt{CommittedAt: revokedAt})
+			if result.Outcome != test.outcome || result.Closed != test.closed {
+				t.Fatalf("authority result = %#v, want outcome=%q closed=%t", result, test.outcome, test.closed)
+			}
+		})
+	}
+}
+
 func waitForLiveComputerHTTP(t *testing.T, computer l1.Computer, method, path, idempotencyKey string, body any, timeout time.Duration) liveComputerHTTPResult {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -1469,23 +1581,42 @@ func waitForLiveComputerHTTP(t *testing.T, computer l1.Computer, method, path, i
 	return liveComputerHTTPResult{}
 }
 
+// Run 33585098509 traversed the entire native guest-authority phase in 5.14s.
+// The guest's 30s release wait and this 45s process bound leave measured
+// disable headroom without allowing a stuck ctr stdin or response read to hang
+// the 75-minute lane.
+const liveComputerPausedHTTPTimeout = 45 * time.Second
+
 const liveComputerPausedHTTPPython = `
-import http.client, json, socket, sys, urllib.parse
+import http.client, json, select, socket, sys, urllib.parse
 path, key, body = sys.argv[1:4]
 endpoint = urllib.parse.urlsplit(open("/wefty/control/l3-endpoint", encoding="utf-8").read().strip())
 token = open("/wefty/control/computer-token", encoding="utf-8").read().strip()
 payload = body.encode()
 request = ("POST " + path + " HTTP/1.1\r\nHost: " + endpoint.netloc + "\r\nAuthorization: Bearer " + token +
-           "\r\nContent-Type: application/json\r\nIdempotency-Key: " + key + "\r\nConnection: close\r\nContent-Length: " +
+           "\r\nContent-Type: application/json\r\nIdempotency-Key: " + key + "\r\nExpect: 100-continue\r\nConnection: close\r\nContent-Length: " +
            str(len(payload)) + "\r\n\r\n").encode()
 status, response_body, transport_error = 0, "", ""
 try:
     connection = socket.create_connection((endpoint.hostname, endpoint.port), timeout=30)
-    split = len(payload) // 2
-    connection.sendall(request + payload[:split])
+    connection.sendall(request)
+    interim = b""
+    while b"\r\n\r\n" not in interim:
+        chunk = connection.recv(1024)
+        if not chunk:
+            raise ConnectionError("bridge closed before admission acknowledgement")
+        interim += chunk
+        if len(interim) > 8192:
+            raise ValueError("oversized admission acknowledgement")
+    if not interim.startswith(b"HTTP/1.1 100 Continue\r\n"):
+        raise RuntimeError("unexpected admission acknowledgement: " + interim.decode(errors="replace"))
     print("PAUSED", flush=True)
-    sys.stdin.readline()
-    connection.sendall(payload[split:])
+    ready, _, _ = select.select([sys.stdin], [], [], 30)
+    if not ready:
+        raise TimeoutError("release was not received within 30 seconds")
+    if not sys.stdin.readline():
+        raise EOFError("release input closed without a signal")
+    connection.sendall(payload)
     response = http.client.HTTPResponse(connection)
     response.begin()
     status, response_body = response.status, response.read().decode()
@@ -1494,7 +1625,21 @@ except Exception as error:
 print(json.dumps({"status": status, "body": response_body, "transport_error": transport_error}), flush=True)
 `
 
+func TestLiveComputerPausedHTTPProbeWaitsForServerAdmission(t *testing.T) {
+	expect := strings.Index(liveComputerPausedHTTPPython, `Expect: 100-continue`)
+	acknowledged := strings.Index(liveComputerPausedHTTPPython, `HTTP/1.1 100 Continue`)
+	paused := strings.Index(liveComputerPausedHTTPPython, `print("PAUSED"`)
+	bounded := strings.Index(liveComputerPausedHTTPPython, `select.select([sys.stdin], [], [], 30)`)
+	released := strings.Index(liveComputerPausedHTTPPython, `sys.stdin.readline()`)
+	bodySent := strings.LastIndex(liveComputerPausedHTTPPython, `connection.sendall(payload)`)
+	if expect < 0 || acknowledged < expect || paused < acknowledged || bounded < paused || released < bounded || bodySent < released {
+		t.Fatalf("Computer revocation probe ordering expect=%d acknowledged=%d paused=%d bounded=%d released=%d body_sent=%d", expect, acknowledged, paused, bounded, released, bodySent)
+	}
+}
+
 type liveComputerPausedSubmission struct {
+	context context.Context
+	cancel  context.CancelFunc
 	command *exec.Cmd
 	scanner *bufio.Scanner
 	stdin   io.WriteCloser
@@ -1510,49 +1655,77 @@ func startLiveComputerPausedSubmission(t *testing.T, computer l1.Computer, idemp
 	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
 	containerID := liveComputerContainerID(t, computer.CurrentJobID)
 	execID := fmt.Sprintf("computer-race-%d", time.Now().UnixNano())
-	command := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+	probeContext, cancel := context.WithTimeout(t.Context(), liveComputerPausedHTTPTimeout)
+	command := exec.CommandContext(probeContext, "sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
 		"tasks", "exec", "--exec-id", execID, containerID, "/usr/bin/python3", "-c", liveComputerPausedHTTPPython,
 		"/v1/runs", idempotencyKey, string(payload))
 	stdout, err := command.StdoutPipe()
 	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
 	stdin, err := command.StdinPipe()
 	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
 	stderr := &bytes.Buffer{}
 	command.Stderr = stderr
 	if err := command.Start(); err != nil {
+		cancel()
 		t.Fatal(err)
 	}
 	scanner := bufio.NewScanner(stdout)
 	if !scanner.Scan() || scanner.Text() != "PAUSED" {
+		cancel()
 		_ = command.Wait()
-		t.Fatalf("Computer revocation race did not pause after authentication: stdout=%q stderr=%q", scanner.Text(), stderr.String())
+		t.Fatalf("Computer revocation race did not receive its admission acknowledgement: stdout=%q stderr=%q", scanner.Text(), stderr.String())
 	}
-	return &liveComputerPausedSubmission{command: command, scanner: scanner, stdin: stdin, stderr: stderr}
+	return &liveComputerPausedSubmission{context: probeContext, cancel: cancel, command: command, scanner: scanner, stdin: stdin, stderr: stderr}
 }
 
 func (submission *liveComputerPausedSubmission) finish(t *testing.T) liveComputerHTTPResult {
 	t.Helper()
+	defer submission.cancel()
+	releaseErr := error(nil)
 	if _, err := io.WriteString(submission.stdin, "release\n"); err != nil {
-		t.Fatalf("release Computer revocation race: %v", err)
+		releaseErr = fmt.Errorf("write release: %w", err)
 	}
 	if err := submission.stdin.Close(); err != nil {
-		t.Fatalf("close Computer revocation race release: %v", err)
+		releaseErr = errors.Join(releaseErr, fmt.Errorf("close release: %w", err))
 	}
-	if !submission.scanner.Scan() {
+	type scanResult struct {
+		line string
+		ok   bool
+	}
+	scanned := make(chan scanResult, 1)
+	go func() {
+		ok := submission.scanner.Scan()
+		scanned <- scanResult{line: submission.scanner.Text(), ok: ok && submission.scanner.Err() == nil}
+	}()
+	var line string
+	select {
+	case result := <-scanned:
+		line = result.line
+		if !result.ok || line == "" {
+			_ = submission.command.Wait()
+			t.Fatalf("Computer revocation race omitted its result: release_error=%v stderr=%s", releaseErr, submission.stderr.String())
+		}
+	case <-submission.context.Done():
 		_ = submission.command.Wait()
-		t.Fatalf("Computer revocation race omitted its result: %s", submission.stderr.String())
+		t.Fatalf("Computer revocation race exceeded %s: release_error=%v stderr=%s", liveComputerPausedHTTPTimeout, releaseErr, submission.stderr.String())
 	}
 	var result liveComputerHTTPResult
-	if err := json.Unmarshal([]byte(submission.scanner.Text()), &result); err != nil {
+	if err := json.Unmarshal([]byte(line), &result); err != nil {
+		submission.cancel()
 		_ = submission.command.Wait()
-		t.Fatalf("decode Computer revocation race: %v line=%q", err, submission.scanner.Text())
+		t.Fatalf("decode Computer revocation race: %v line=%q release_error=%v stderr=%s", err, line, releaseErr, submission.stderr.String())
 	}
 	if err := submission.command.Wait(); err != nil {
-		t.Fatalf("Computer revocation race process: %v: %s", err, submission.stderr.String())
+		result.TransportError = strings.TrimSpace(strings.Join([]string{result.TransportError, fmt.Sprintf("process=%v", err), "stderr=" + submission.stderr.String()}, " "))
+	}
+	if releaseErr != nil {
+		result.TransportError = strings.TrimSpace(strings.Join([]string{result.TransportError, "release=" + releaseErr.Error(), "stderr=" + submission.stderr.String()}, " "))
 	}
 	return result
 }

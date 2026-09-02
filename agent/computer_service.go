@@ -84,7 +84,7 @@ func (controller *computerAttemptBridgeController) enable(token string) (string,
 	}
 	if bridge == nil || bridge.surface != workflowBridgeSurfaceComputer {
 		if bridge != nil {
-			_ = bridge.close()
+			_ = bridge.closeWithCause(errComputerAttemptClosed)
 		}
 		return "", errors.New("Computer attempt bridge factory returned no Computer transport")
 	}
@@ -97,7 +97,7 @@ func (controller *computerAttemptBridgeController) enable(token string) (string,
 	return endpoint, nil
 }
 
-func (controller *computerAttemptBridgeController) disable() error {
+func (controller *computerAttemptBridgeController) disable(cause error) error {
 	if controller == nil {
 		return nil
 	}
@@ -109,7 +109,7 @@ func (controller *computerAttemptBridgeController) disable() error {
 	if bridge == nil {
 		return nil
 	}
-	return bridge.close()
+	return bridge.closeWithCause(cause)
 }
 
 func (controller *computerAttemptBridgeController) setGuestEndpoint(endpoint string) error {
@@ -299,7 +299,7 @@ func runComputerService(
 	}()
 
 	stop := func(publicationFinished bool, publicationErr error) error {
-		bridgeErr := config.computerBridge.disable()
+		bridgeErr := config.computerBridge.disable(errComputerAttemptClosed)
 		publication.Stop()
 		frontDoor.EndSessions(l1.ComputerTakeoverAttemptAuthorityLost)
 		frontDoor.SetReady(false)
@@ -382,7 +382,11 @@ func syncComputerTokenFile(
 			next.SubmitMaxInflight == last.SubmitMaxInflight {
 			return nil
 		}
-		bridgeErr := bridge.disable()
+		closureCause := errComputerSubmissionPolicyReminted
+		if !next.Enabled {
+			closureCause = errComputerSubmissionRevoked
+		}
+		bridgeErr := bridge.disable(closureCause)
 		fileErr := runtime.SetComputerSubmission(ctx, authority, "", "")
 		if err := errors.Join(bridgeErr, fileErr); err != nil {
 			return fmt.Errorf("remove superseded Computer submission transport and files: %w", err)
@@ -418,7 +422,7 @@ func syncComputerTokenFile(
 			return fmt.Errorf("start Computer attempt bridge: %w", err)
 		}
 		if err := runtime.SetComputerSubmission(ctx, authority, grant.Token, endpoint); err != nil {
-			_ = bridge.disable()
+			_ = bridge.disable(errComputerAttemptClosed)
 			return fmt.Errorf("publish re-minted Computer submission files: %w", err)
 		}
 		return nil

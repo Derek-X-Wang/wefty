@@ -40,6 +40,46 @@ func TestComputerAttemptBridgeAllowlistExactlyMirrorsL3ComputerRoutes(t *testing
 	}
 }
 
+func TestComputerBridgeCancellationCausesRemainDistinct(t *testing.T) {
+	bridge := &workflowBridge{surface: workflowBridgeSurfaceComputer}
+	bridge.setReachable(true)
+	reminted, cancelReminted, ok := bridge.reachableRequestContext(t.Context())
+	if !ok {
+		t.Fatal("reachable bridge omitted policy re-mint context")
+	}
+	defer cancelReminted()
+	bridge.setReachable(true)
+	<-reminted.Done()
+	if !errors.Is(context.Cause(reminted), errComputerSubmissionPolicyReminted) {
+		t.Fatalf("policy re-mint cause = %v", context.Cause(reminted))
+	}
+
+	revoked, cancelRevoked, ok := bridge.reachableRequestContext(t.Context())
+	if !ok {
+		t.Fatal("re-minted bridge omitted revocation context")
+	}
+	defer cancelRevoked()
+	bridge.setReachable(false)
+	<-revoked.Done()
+	if !errors.Is(context.Cause(revoked), errComputerSubmissionRevoked) {
+		t.Fatalf("revocation cause = %v", context.Cause(revoked))
+	}
+
+	bridge.setReachable(true)
+	closed, cancelClosed, ok := bridge.reachableRequestContext(t.Context())
+	if !ok {
+		t.Fatal("re-enabled bridge omitted attempt-close context")
+	}
+	defer cancelClosed()
+	bridge.mu.Lock()
+	bridge.setReachabilityLocked(false, errComputerAttemptClosed)
+	bridge.mu.Unlock()
+	<-closed.Done()
+	if !errors.Is(context.Cause(closed), errComputerAttemptClosed) {
+		t.Fatalf("attempt-close cause = %v", context.Cause(closed))
+	}
+}
+
 func TestStartWorkflowBridgeSelectsComputerSurfaceOnForcedMacFallback(t *testing.T) {
 	network := plain.NewNetwork()
 	l3Fabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
@@ -450,7 +490,7 @@ func TestComputerSubmissionPolicyLossCancelsInflightAndReenableRestoresTransport
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer controller.disable()
+	defer controller.disable(errComputerAttemptClosed)
 	runtime := &recordingComputerTokenFileRuntime{writes: make(chan computerSubmissionWrite, 4)}
 	minter := &recordingComputerTokenMinter{grant: l3.ComputerTokenGrant{Token: "replacement-pass", ComputerID: "computer-1",
 		ComputerAttemptID: "attempt-1", SubmitIntentRevision: 3, SubmitMaxInflight: 20}}
@@ -490,8 +530,9 @@ func TestComputerSubmissionPolicyLossCancelsInflightAndReenableRestoresTransport
 	}
 	select {
 	case result := <-requestDone:
-		if result.err != nil || result.status != http.StatusUnauthorized || result.body.Error.Code != contract.ErrorUnauthorized {
-			t.Fatalf("canceled bridge response = status %d code %q err %v, want typed revocation", result.status, result.body.Error.Code, result.err)
+		if result.err != nil || result.status != http.StatusBadGateway || result.body.Error.Code != contract.ErrorPassUnavailable ||
+			result.body.Error.Message != errComputerSubmissionRevoked.Error() {
+			t.Fatalf("canceled bridge response = status %d error %#v err %v, want typed indeterminate revocation cancellation", result.status, result.body.Error, result.err)
 		}
 	case <-t.Context().Done():
 		t.Fatal("canceled bridge request did not return")
@@ -514,6 +555,68 @@ func TestComputerSubmissionPolicyLossCancelsInflightAndReenableRestoresTransport
 	cancel()
 	if err := <-syncDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestComputerBridgeNeverSynthesizesAuthorizationAfterUpstreamCommit(t *testing.T) {
+	network := plain.NewNetwork()
+	l3Fabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "agent"})
+	l3Listener, err := l3Fabric.Listen("tcp", "wefty://run-ledger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed := make(chan struct{})
+	canceled := make(chan struct{})
+	l3Server := &http.Server{Handler: http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		close(committed)
+		<-request.Context().Done()
+		close(canceled)
+	})}
+	go func() { _ = l3Server.Serve(l3Listener) }()
+	defer l3Server.Close()
+	bridge, err := newComputerAttemptBridge(t.Context(), agentFabric, "wefty://run-ledger", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type bridgeResponse struct {
+		status int
+		body   contract.ErrorResponse
+		err    error
+	}
+	requestDone := make(chan bridgeResponse, 1)
+	go func() {
+		response, requestErr := http.Get(bridge.l3Endpoint + "/v1/runs/run-committed")
+		result := bridgeResponse{err: requestErr}
+		if response != nil {
+			result.status = response.StatusCode
+			result.err = errors.Join(result.err, json.NewDecoder(response.Body).Decode(&result.body), response.Body.Close())
+		}
+		requestDone <- result
+	}()
+	select {
+	case <-committed:
+	case <-t.Context().Done():
+		t.Fatal("fake L3 did not commit before bridge closure")
+	}
+	if err := bridge.closeWithCause(errComputerSubmissionRevoked); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-canceled:
+	case <-t.Context().Done():
+		t.Fatal("fake L3 did not observe cancellation after commit")
+	}
+	select {
+	case result := <-requestDone:
+		if result.err != nil || result.status != http.StatusBadGateway || result.body.Error.Code != contract.ErrorPassUnavailable {
+			t.Fatalf("post-commit cancellation response = status %d error %#v err %v, want typed indeterminate outcome", result.status, result.body.Error, result.err)
+		}
+		if result.status == http.StatusUnauthorized || result.body.Error.Code == contract.ErrorUnauthorized {
+			t.Fatalf("bridge fabricated authorization verdict after upstream commit: status %d error %#v", result.status, result.body.Error)
+		}
+	case <-t.Context().Done():
+		t.Fatal("post-commit cancellation did not return to the guest")
 	}
 }
 

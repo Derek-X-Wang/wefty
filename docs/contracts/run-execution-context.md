@@ -168,10 +168,12 @@ allowlist exactly mirrors L3's Computer-token surface: self, self-scoped Run
 list, root submission, scoped Run read (including accepted Envelopes), lineage,
 and logs. It closes and cancels in-flight traffic at attempt cancellation,
 policy/lease/authority/helper loss, agent restart, reimage/reset, and removal;
-L3 revocation remains the authority and closure only removes reachability. A
-request canceled specifically by that closure receives HTTP 401 with typed
-`unauthorized`; a generic bridge/proxy failure cannot stand in for revocation
-evidence.
+L3 revocation remains the authority and closure only removes reachability.
+Bridge cancellation is a typed retryable `pass_unavailable` with an
+indeterminate outcome, never an authorization verdict: a Run that acquired the
+L3 write fence first may have committed. The caller reopens the attempt-local
+token and endpoint files and retries with the same idempotency key; only L3 may
+return `unauthorized`.
 
 Computer submission idempotency binds the stable principal (`ComputerID`) and
 normalized request only. Attempt, grant, Storage, intent, and L3 authority

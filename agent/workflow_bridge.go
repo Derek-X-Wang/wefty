@@ -20,7 +20,11 @@ import (
 
 const workflowBridgeCloseTimeout = 2 * time.Second
 
-var errComputerSubmissionRevoked = errors.New("Computer submission authority revoked")
+var (
+	errComputerSubmissionRevoked        = errors.New("Computer submission authority revoked")
+	errComputerSubmissionPolicyReminted = errors.New("Computer submission policy re-minted")
+	errComputerAttemptClosed            = errors.New("Computer attempt closed")
+)
 
 type workflowBridgeSurface uint8
 
@@ -127,11 +131,17 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 	var handler http.Handler
 	if surface == workflowBridgeSurfaceComputer {
 		l3Proxy.ErrorHandler = func(w http.ResponseWriter, request *http.Request, err error) {
-			if errors.Is(context.Cause(request.Context()), errComputerSubmissionRevoked) {
-				writeWorkflowBridgeError(w, http.StatusUnauthorized, contract.ErrorUnauthorized, errComputerSubmissionRevoked.Error())
-				return
+			message := err.Error()
+			if errors.Is(err, context.Canceled) {
+				cause := context.Cause(request.Context())
+				for _, known := range []error{errComputerSubmissionRevoked, errComputerSubmissionPolicyReminted, errComputerAttemptClosed} {
+					if errors.Is(cause, known) {
+						message = cause.Error()
+						break
+					}
+				}
 			}
-			writeWorkflowBridgeError(w, http.StatusBadGateway, contract.ErrorPassUnavailable, err.Error())
+			writeWorkflowBridgeError(w, http.StatusBadGateway, contract.ErrorPassUnavailable, message)
 		}
 		computer := bridge.computerHandler(l3Proxy)
 		handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -217,8 +227,16 @@ func (b *workflowBridge) setReachable(reachable bool) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	cause := errComputerSubmissionRevoked
+	if reachable {
+		cause = errComputerSubmissionPolicyReminted
+	}
+	b.setReachabilityLocked(reachable, cause)
+}
+
+func (b *workflowBridge) setReachabilityLocked(reachable bool, cause error) {
 	if b.cancelReachability != nil {
-		b.cancelReachability(errComputerSubmissionRevoked)
+		b.cancelReachability(cause)
 		b.cancelReachability = nil
 		b.reachability = nil
 	}
@@ -271,15 +289,14 @@ func writeWorkflowBridgeError(w http.ResponseWriter, status int, code contract.E
 }
 
 func (b *workflowBridge) close() error {
+	return b.closeWithCause(errComputerAttemptClosed)
+}
+
+func (b *workflowBridge) closeWithCause(cause error) error {
 	if b.surface == workflowBridgeSurfaceComputer {
 		b.mu.Lock()
 		b.closed = true
-		if b.cancelReachability != nil {
-			b.cancelReachability(errComputerSubmissionRevoked)
-			b.cancelReachability = nil
-			b.reachability = nil
-		}
-		b.reachable = false
+		b.setReachabilityLocked(false, cause)
 		b.mu.Unlock()
 	}
 	closeContext, cancel := context.WithTimeout(context.Background(), workflowBridgeCloseTimeout)

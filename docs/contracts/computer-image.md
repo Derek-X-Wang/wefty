@@ -52,8 +52,11 @@ mode `0400`, and owned by the resolved image tenant uid/gid. Mid-attempt enable
 starts the bridge and publishes both files; disable, revocation, or authority
 loss closes the bridge and removes both. A tenant must reopen or watch both
 paths and treat either missing file as submission disabled. An in-flight
-request canceled by that authority closure receives HTTP 401 with typed
-`unauthorized`; transport failure alone is not revocation evidence. The files remain
+request canceled by bridge closure has an indeterminate outcome and, when the
+bridge can still produce a response, receives typed retryable
+`pass_unavailable`; only L3 may return an authorization verdict. The tenant
+must reopen both files and retry with the same idempotency key to resolve
+whether L3 committed the request before revocation. The files remain
 attempt-local tmpfs and never enter `/wefty/service`, a JobSpec, logs,
 inspection, or removal evidence.
 

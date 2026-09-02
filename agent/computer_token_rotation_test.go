@@ -53,7 +53,7 @@ func TestComputerSubmissionPolicyChangeRotatesAttemptTokenFile(t *testing.T) {
 	updates <- ComputerSubmissionAuthority{ComputerID: "computer-1", Enabled: false, SubmitIntentRevision: 3, SubmitMaxInflight: 7}
 	assertTokenFileWrite(t, runtime.writes, "", "")
 	cancel()
-	_ = controller.disable()
+	_ = controller.disable(errComputerAttemptClosed)
 	select {
 	case err := <-done:
 		if err != nil {
