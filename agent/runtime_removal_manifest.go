@@ -120,7 +120,14 @@ func validateRuntimeResourceManifest(manifest workloadrunner.RuntimeResourceMani
 		return errors.New("agent: runtime attempt manifest is incomplete")
 	}
 	if manifest.StorageOnly {
-		if manifest.StoragePreparation == nil || !manifest.StoragePreparation.Valid() || manifest.ComputerStorage == nil ||
+		if manifest.ComputerStorage == nil {
+			return errors.New("agent: Storage-only removal manifest lacks durable preparation evidence")
+		}
+		if manifest.StorageAbsent {
+			if manifest.StoragePreparation != nil || !contract.ValidStorageAbsentRemovalAttemptID(manifest.AttemptID, manifest.ComputerStorage.StorageGeneration) {
+				return errors.New("agent: already-absent Storage manifest lacks typed helper evidence")
+			}
+		} else if manifest.StoragePreparation == nil || !manifest.StoragePreparation.Valid() ||
 			!contract.ValidStorageOnlyRemovalAttemptID(manifest.AttemptID, manifest.ComputerStorage.StorageGeneration) ||
 			manifest.StoragePreparation.NodeID != manifest.NodeID || manifest.StoragePreparation.JobID != manifest.JobID ||
 			manifest.StoragePreparation.ComputerID != manifest.ComputerStorage.ComputerID ||
@@ -128,7 +135,7 @@ func validateRuntimeResourceManifest(manifest workloadrunner.RuntimeResourceMani
 			manifest.StoragePreparation.StorageGeneration != manifest.ComputerStorage.StorageGeneration {
 			return errors.New("agent: Storage-only removal manifest lacks durable preparation evidence")
 		}
-	} else if strings.TrimSpace(manifest.LeaseID) == "" || strings.TrimSpace(manifest.TaskID) == "" ||
+	} else if manifest.StorageAbsent || strings.TrimSpace(manifest.LeaseID) == "" || strings.TrimSpace(manifest.TaskID) == "" ||
 		strings.TrimSpace(manifest.ContainerID) == "" || strings.TrimSpace(manifest.SnapshotID) == "" ||
 		strings.TrimSpace(manifest.ShimID) == "" || strings.TrimSpace(manifest.CgroupID) == "" ||
 		strings.TrimSpace(manifest.LogSegmentDirectory) == "" {
@@ -289,8 +296,14 @@ func sameStorageOnlyInventory(left, right runtimeRemovalManifest) bool {
 	for index := range left.Attempts {
 		oldAttempt, newAttempt := left.Attempts[index], right.Attempts[index]
 		if !oldAttempt.StorageOnly || !newAttempt.StorageOnly || oldAttempt.ComputerStorage == nil || newAttempt.ComputerStorage == nil ||
-			oldAttempt.StoragePreparation == nil || newAttempt.StoragePreparation == nil ||
-			*oldAttempt.ComputerStorage != *newAttempt.ComputerStorage || *oldAttempt.StoragePreparation != *newAttempt.StoragePreparation {
+			oldAttempt.StorageAbsent != newAttempt.StorageAbsent || *oldAttempt.ComputerStorage != *newAttempt.ComputerStorage {
+			return false
+		}
+		if oldAttempt.StorageAbsent {
+			if oldAttempt.StoragePreparation != nil || newAttempt.StoragePreparation != nil {
+				return false
+			}
+		} else if oldAttempt.StoragePreparation == nil || newAttempt.StoragePreparation == nil || *oldAttempt.StoragePreparation != *newAttempt.StoragePreparation {
 			return false
 		}
 	}
@@ -379,9 +392,17 @@ func validRuntimeRemovalRecord(record runtimeRemovalRecord) bool {
 		return false
 	}
 	for _, attempt := range record.manifest.Attempts {
-		if attempt.StorageOnly && (attempt.FencingToken != record.removal.cleanupFence || attempt.StoragePreparation == nil ||
-			attempt.StoragePreparation.RootInstanceID != record.removal.rootInstanceID) {
-			return false
+		if attempt.StorageOnly {
+			if attempt.FencingToken != record.removal.cleanupFence {
+				return false
+			}
+			if attempt.StorageAbsent {
+				if attempt.StoragePreparation != nil {
+					return false
+				}
+			} else if attempt.StoragePreparation == nil || attempt.StoragePreparation.RootInstanceID != record.removal.rootInstanceID {
+				return false
+			}
 		}
 	}
 	if record.receipt.Evidence == workloadrunner.ReapEvidenceNoRuntime {

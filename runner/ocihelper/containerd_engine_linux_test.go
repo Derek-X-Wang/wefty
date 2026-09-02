@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -687,6 +688,45 @@ func TestPreparedComputerStorageRemovalInventoryCarriesOnlyStorageRows(t *testin
 			t.Fatalf("published copy witness = %+v eligible=%t err=%v", attempt, eligible, err)
 		}
 	})
+}
+
+func TestAbsentComputerStorageRemovalInventoryIsTypedAndAttestable(t *testing.T) {
+	storage := ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30}
+	request := InventoryRemovalRequest{Removal: ManagedVolumeRemovalAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "prepared-computer", RemovalGeneration: 3, CleanupFence: "cleanup",
+	}, RootInstanceID: "root", ComputerStorage: &storage}
+	attempt, err := absentComputerStorageRemovalAttempt(request, storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !attempt.StorageOnly || !attempt.StorageAbsent || attempt.StoragePreparation != nil ||
+		attempt.Authority.AttemptID != contract.StorageAbsentRemovalAttemptID(storage.StorageGeneration) || len(attempt.Resources) != 9 {
+		t.Fatalf("already-deleted Storage evidence = %+v", attempt)
+	}
+	attest := AttestRemovalRequest{JobID: request.Removal.JobID, RemovalGeneration: "3", Attempts: []RemovalAttemptManifest{attempt}}
+	if err := validateAttestRemovalRequest(attest, request.Removal.NodeID); err != nil {
+		t.Fatalf("already-deleted Storage evidence was not attestable: %v", err)
+	}
+	attempt.StorageAbsent = false
+	if err := validateAttestRemovalRequest(AttestRemovalRequest{JobID: request.Removal.JobID, RemovalGeneration: "3", Attempts: []RemovalAttemptManifest{attempt}}, request.Removal.NodeID); err == nil {
+		t.Fatal("already-deleted Storage authority was accepted without its typed evidence bit")
+	}
+}
+
+func TestComputerRemovalInventoryReimageSerializationIsContextBounded(t *testing.T) {
+	var mutex sync.Mutex
+	mutex.Lock()
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if lockComputerReimageMutex(ctx, &mutex) {
+		mutex.Unlock()
+		t.Fatal("context-bounded Computer removal serialization acquired an owned reimage mutex")
+	}
+	mutex.Unlock()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Computer removal serialization ignored context for %s", elapsed)
+	}
 }
 
 func TestServiceDataVolumeInitializesOwnerOnlyOnce(t *testing.T) {

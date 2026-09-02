@@ -1953,6 +1953,38 @@ func TestLegacyComputerRemovalReconstructsPreparedStorageWithoutRuntimeAttempt(t
 	}
 }
 
+func TestLegacyComputerRemovalReconstructsNoRuntimeAndAlreadyDeletedGenerationEvidence(t *testing.T) {
+	engine := &adapterTestEngine{inventoryRemoval: ocihelper.InventoryRemovalResponse{NoRuntimeAttempts: true}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := workloadrunner.RuntimeRemovalProofRequest{
+		NodeID: "node", BootSessionID: "boot", RootInstanceID: "root", JobID: "prepared-computer",
+		RemovalGeneration: 3, CleanupFence: "cleanup",
+	}
+	attempts, err := adapter.ReconstructRuntimeRemoval(t.Context(), request)
+	if err != nil || len(attempts) != 0 {
+		t.Fatalf("positive no-runtime inventory = %+v err=%v", attempts, err)
+	}
+	storage := &ocihelper.ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30}
+	authority := ocihelper.AttemptAuthority{
+		NodeID: request.NodeID, BootSessionID: request.BootSessionID, JobID: request.JobID,
+		AttemptID: contract.StorageAbsentRemovalAttemptID(storage.StorageGeneration), FencingToken: request.CleanupFence,
+		Class: contract.JobClassService, RemovalGeneration: "3",
+	}
+	engine.inventoryRemoval = ocihelper.InventoryRemovalResponse{Attempts: []ocihelper.RemovalAttemptManifest{{
+		Authority: authority, ComputerStorage: storage, StorageOnly: true, StorageAbsent: true,
+		Resources: ocihelper.ExpectedRemovalResources(ocihelper.ResourceIdentity{}, "", storage),
+	}}}
+	request.ComputerStorage = &workloadrunner.ComputerStorage{
+		ComputerID: storage.ComputerID, StorageID: storage.StorageID,
+		StorageGeneration: storage.StorageGeneration, DiskBytes: storage.DiskBytes,
+	}
+	attempts, err = adapter.ReconstructRuntimeRemoval(t.Context(), request)
+	if err != nil || len(attempts) != 1 || !attempts[0].StorageOnly || !attempts[0].StorageAbsent || attempts[0].StoragePreparation != nil {
+		t.Fatalf("already-deleted generation reconstruction = %+v err=%v", attempts, err)
+	}
+}
+
 func mustComputerDiskName(t *testing.T, storage ocihelper.ComputerStorageReference) string {
 	t.Helper()
 	name, err := ocihelper.DeterministicComputerDiskName(storage)

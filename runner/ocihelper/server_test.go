@@ -81,6 +81,82 @@ func TestRemovalInventorySeesReservedComputerAttemptBeforeEngineRun(t *testing.T
 	}
 }
 
+func TestRemovalInventoryDispatchKeepsHeartbeatsLiveAndRechecksRunAdmission(t *testing.T) {
+	engine := &blockingRemovalInventoryEngine{
+		fakeEngine: newFakeEngine(), entered: make(chan struct{}),
+	}
+	engine.reimageMu.Lock()
+	releaseReimage := sync.OnceFunc(engine.reimageMu.Unlock)
+	defer releaseReimage()
+	engine.runEntered = make(chan struct{})
+	engine.releaseRun = make(chan struct{})
+	client, stop := startTestServer(t, engine, ServerConfig{HeartbeatTimeout: time.Second})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+
+	storage := testComputerManagedVolumes()[0].ComputerStorage
+	removalErr := make(chan error, 1)
+	go func() {
+		_, err := session.InventoryRemoval(t.Context(), InventoryRemovalRequest{
+			Removal: ManagedVolumeRemovalAuthority{
+				NodeID: "node-1", BootSessionID: "boot-1", JobID: "computer-job",
+				RemovalGeneration: 1, CleanupFence: "cleanup",
+			},
+			RootInstanceID: "root", ComputerStorage: storage,
+		})
+		removalErr <- err
+	}()
+	select {
+	case <-engine.entered:
+	case <-time.After(time.Second):
+		t.Fatal("InventoryRemoval did not enter the engine through dispatch")
+	}
+	heartbeatContext, cancelHeartbeat := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancelHeartbeat()
+	if err := session.flushHeartbeat(heartbeatContext); err != nil {
+		t.Fatalf("InventoryRemoval blocked the session heartbeat: %v", err)
+	}
+
+	authority := testAuthority()
+	authority.JobID = "computer-job"
+	authority.AttemptID = "computer-attempt"
+	authority.Class = contract.JobClassService
+	authority.RemovalGeneration = "1"
+	runRequest := testRunRequest(authority, time.Second)
+	runRequest.Workload.Computer = true
+	runRequest.Workload.Limits.MemoryBytes = 64 << 20
+	runRequest.Workload.ManagedVolumes = testComputerManagedVolumes()
+	runRequest.AllocateEndpoints = []string{contract.ComputerDisplayEndpointView, contract.ComputerDisplayEndpointControl}
+	engine.runResponse.Endpoints = map[string]uint16{contract.ComputerDisplayEndpointView: 31001, contract.ComputerDisplayEndpointControl: 31002}
+	runErr := make(chan error, 1)
+	go func() {
+		_, err := session.Run(t.Context(), runRequest)
+		runErr <- err
+	}()
+	select {
+	case <-engine.runEntered:
+	case err := <-runErr:
+		t.Fatalf("Run admission failed before entering engine: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("Run admission remained blocked behind InventoryRemoval")
+	}
+	releaseReimage()
+	if err := <-removalErr; err == nil {
+		t.Fatal("InventoryRemoval published stale no-attempt evidence after Run admission")
+	} else {
+		assertRPCCode(t, err, CodeComputerStorageBusy)
+	}
+	close(engine.releaseRun)
+	if err := <-runErr; err != nil {
+		t.Fatalf("admitted Run failed after inventory fence: %v", err)
+	}
+}
+
 func TestProcessAttemptIdentityDoesNotRequireServiceVolumeJobID(t *testing.T) {
 	authority := testAuthority()
 	authority.JobID = strings.Repeat("x", 256)
@@ -1628,7 +1704,7 @@ func TestMergeResourceInventoryDeduplicatesEveryIdentityClass(t *testing.T) {
 	left := ResourceInventory{
 		Leases: []string{"b", "a"}, Snapshots: []string{"b", "a"}, Containers: []string{"b", "a"},
 		Tasks: []string{"b", "a"}, Shims: []string{"b", "a"}, Cgroups: []string{"b", "a"},
-		LogSegments: []string{"b", "a"}, ManagedVolumes: []string{"b", "a"}, ManagedVolumeRecords: []string{"b", "a"},
+		LogSegments: []string{"b", "a"}, ImageSpools: []string{"b", "a"}, ManagedVolumes: []string{"b", "a"}, ManagedVolumeRecords: []string{"b", "a"},
 		ComputerDiskImages: []string{"b", "a"}, ComputerDiskAllocations: []string{"b", "a"}, ComputerDiskQuotas: []string{"b", "a"},
 		ComputerDiskManifests: []string{"b", "a"}, ComputerDiskMounts: []string{"b", "a"}, ComputerDiskLoops: []string{"b", "a"},
 		ComputerAttachments: []string{"b", "a"}, ComputerResetManifests: []string{"b", "a"}, ComputerQuarantines: []string{"b", "a"},
@@ -1637,7 +1713,7 @@ func TestMergeResourceInventoryDeduplicatesEveryIdentityClass(t *testing.T) {
 	right := ResourceInventory{
 		Leases: []string{"a", "c"}, Snapshots: []string{"a", "c"}, Containers: []string{"a", "c"},
 		Tasks: []string{"a", "c"}, Shims: []string{"a", "c"}, Cgroups: []string{"a", "c"},
-		LogSegments: []string{"a", "c"}, ManagedVolumes: []string{"a", "c"}, ManagedVolumeRecords: []string{"a", "c"},
+		LogSegments: []string{"a", "c"}, ImageSpools: []string{"a", "c"}, ManagedVolumes: []string{"a", "c"}, ManagedVolumeRecords: []string{"a", "c"},
 		ComputerDiskImages: []string{"a", "c"}, ComputerDiskAllocations: []string{"a", "c"}, ComputerDiskQuotas: []string{"a", "c"},
 		ComputerDiskManifests: []string{"a", "c"}, ComputerDiskMounts: []string{"a", "c"}, ComputerDiskLoops: []string{"a", "c"},
 		ComputerAttachments: []string{"a", "c"}, ComputerResetManifests: []string{"a", "c"}, ComputerQuarantines: []string{"a", "c"},
@@ -1647,7 +1723,7 @@ func TestMergeResourceInventoryDeduplicatesEveryIdentityClass(t *testing.T) {
 	want := []string{"a", "b", "c"}
 	classes := [][]string{
 		merged.Leases, merged.Snapshots, merged.Containers, merged.Tasks, merged.Shims, merged.Cgroups,
-		merged.LogSegments, merged.ManagedVolumes, merged.ManagedVolumeRecords, merged.ComputerDiskImages,
+		merged.LogSegments, merged.ImageSpools, merged.ManagedVolumes, merged.ManagedVolumeRecords, merged.ComputerDiskImages,
 		merged.ComputerDiskAllocations, merged.ComputerDiskQuotas, merged.ComputerDiskManifests,
 		merged.ComputerDiskMounts, merged.ComputerDiskLoops, merged.ComputerAttachments,
 		merged.ComputerResetManifests, merged.ComputerQuarantines, merged.ComputerDiskAnomalies,
@@ -2248,6 +2324,23 @@ func TestSweepEmbargoesRunUntilNamespaceVerificationCompletes(t *testing.T) {
 	}
 }
 
+func TestReadOnlyNamespaceInventoryDoesNotSatisfyBootBarrier(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	verification, err := session.Verify(t.Context(), VerifyRequest{Scope: VerifyNamespaceReadOnly})
+	if err != nil || !verification.Absent {
+		t.Fatalf("read-only namespace inventory = %+v err=%v", verification, err)
+	}
+	_, err = session.Run(t.Context(), testRunRequest(testAuthority(), time.Second))
+	assertRPCCode(t, err, CodeSweepRequired)
+}
+
 func TestPreadmittedRunRechecksSweepBarrierUnderCreationLock(t *testing.T) {
 	engine := newFakeEngine()
 	runPoised := make(chan struct{})
@@ -2741,6 +2834,26 @@ type fakeEngine struct {
 	deleteBackupResponse     DeleteComputerBackupCopyResponse
 	copyStorageResponse      CopyComputerStorageResponse
 	exportCustodyResponse    ExportComputerCustodyResponse
+}
+
+type blockingRemovalInventoryEngine struct {
+	*fakeEngine
+	entered   chan struct{}
+	once      sync.Once
+	reimageMu sync.Mutex
+}
+
+func (engine *blockingRemovalInventoryEngine) InventoryRemoval(ctx context.Context, _ InventoryRemovalRequest) (InventoryRemovalResponse, error) {
+	engine.once.Do(func() { close(engine.entered) })
+	for !engine.reimageMu.TryLock() {
+		select {
+		case <-ctx.Done():
+			return InventoryRemovalResponse{}, context.Cause(ctx)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	engine.reimageMu.Unlock()
+	return InventoryRemovalResponse{}, nil
 }
 
 type blockingWatchEngine struct {

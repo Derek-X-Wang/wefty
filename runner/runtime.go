@@ -207,6 +207,9 @@ type RuntimeResourceManifest struct {
 	// StorageOnly reuses the shared removal manifest for a reset predecessor
 	// after successor publication. No synthetic runtime rows are invented.
 	StorageOnly bool `json:"storage_only,omitempty"`
+	// StorageAbsent is helper-observed evidence that an exact retired
+	// generation root was already deleted before legacy reconstruction.
+	StorageAbsent bool `json:"storage_absent,omitempty"`
 }
 
 // RuntimeRemovalManifestProvider freezes deterministic resource names before

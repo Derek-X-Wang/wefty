@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -148,7 +149,7 @@ func TestComputerRemovalDeletesDiskBeforeAcknowledgement(t *testing.T) {
 	if err := controller.process(t.Context(), directive); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"scan", "freeze", "reap", "managed", "disk", "delete-data", "attest", "ack"}; !reflect.DeepEqual(stages, want) {
+	if want := []string{"scan", "scan", "freeze", "reap", "managed", "disk", "delete-data", "attest", "ack"}; !reflect.DeepEqual(stages, want) {
 		t.Fatalf("Computer removal stages = %v, want %v", stages, want)
 	}
 }
@@ -384,6 +385,144 @@ func TestComputerRemovalNoRuntimeReceiptRequiresEveryClaimedStorage(t *testing.T
 	})
 	if err == nil || !strings.Contains(err.Error(), "lacks helper inventory") || mutated {
 		t.Fatalf("incomplete no-runtime inventory = err %v mutated=%t", err, mutated)
+	}
+}
+
+func TestLegacyNeverRunComputerRemovalSurvivesRetiredAbsentGeneration(t *testing.T) {
+	removal := localRemoval{jobID: "prepared-computer", kind: contract.JobKindOCI, generation: 3, rootInstanceID: "root", cleanupFence: "cleanup"}
+	storages := []*workloadrunner.ComputerStorage{
+		{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30},
+		{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30},
+	}
+	absent := workloadrunner.RuntimeResourceManifest{
+		Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: "node", BootSessionID: "boot", JobID: removal.jobID,
+		AttemptID: contract.StorageAbsentRemovalAttemptID(1), FencingToken: removal.cleanupFence,
+		WorkloadClass: contract.JobClassService, RemovalGeneration: "3", ComputerStorage: storages[0],
+		StorageOnly: true, StorageAbsent: true,
+	}
+	prepared := workloadrunner.RuntimeResourceManifest{
+		Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: "node", BootSessionID: "boot", JobID: removal.jobID,
+		AttemptID: contract.StorageOnlyRemovalAttemptID(2), FencingToken: removal.cleanupFence,
+		WorkloadClass: contract.JobClassService, RemovalGeneration: "3", ComputerStorage: storages[1], StorageOnly: true,
+		StoragePreparation: &contract.ComputerStoragePreparationWitness{
+			Kind: contract.ComputerStorageResetVerifiedKind, ReceiptID: "reset-receipt", NodeID: "node", RootInstanceID: removal.rootInstanceID,
+			JobID: removal.jobID, ComputerID: "computer", StorageID: "storage", StorageGeneration: 2,
+			Revision: 2, Fence: "reset", HelperGeneration: 1,
+		},
+	}
+	directive := l1.RemovalDirective{
+		JobID: removal.jobID, BoundNodeID: "node", Kind: removal.kind, RemovalGeneration: removal.generation,
+		CleanupFence: removal.cleanupFence, RootInstanceID: removal.rootInstanceID,
+		ComputerStorageGenerations: &l1.ComputerStorageGenerationClaims{Generations: []l1.ComputerStorageGenerationClaim{
+			{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30},
+			{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30},
+		}},
+	}
+	var record runtimeRemovalRecord
+	found := false
+	var requests []*workloadrunner.ComputerStorage
+	acknowledged := false
+	controller := &removalController{nodeID: "node", bootSessionID: "boot"}
+	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) { return record, found, nil }
+	controller.reconstructRuntime = func(_ context.Context, request workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error) {
+		requests = append(requests, request.ComputerStorage)
+		if request.ComputerStorage == nil {
+			return nil, nil
+		}
+		switch request.ComputerStorage.StorageGeneration {
+		case 1:
+			return []workloadrunner.RuntimeResourceManifest{absent}, nil
+		case 2:
+			return []workloadrunner.RuntimeResourceManifest{prepared}, nil
+		default:
+			return nil, errors.New("unexpected Storage generation")
+		}
+	}
+	controller.persistRuntimeRemoval = func(_ context.Context, got localRemoval, attempts []workloadrunner.RuntimeResourceManifest) error {
+		manifest := runtimeRemovalManifest{Version: 1, JobID: got.jobID, RemovalGeneration: got.generation, Attempts: slices.Clone(attempts)}
+		slices.SortFunc(manifest.Attempts, func(left, right workloadrunner.RuntimeResourceManifest) int {
+			return strings.Compare(left.AttemptID, right.AttemptID)
+		})
+		record = runtimeRemovalRecord{removal: got, manifest: manifest, phase: runtimeRemovalPrepared}
+		found = true
+		return nil
+	}
+	controller.reapService = func(_ context.Context, jobID, _ string, attempts []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, error) {
+		receipt, ok := storageOnlyAttemptsReceipt(jobID, "boot", attempts)
+		if !ok {
+			return workloadrunner.ReapReceipt{}, errors.New("typed Storage inventory did not prove no runtime")
+		}
+		return receipt, nil
+	}
+	controller.recordRuntimeQuiesced = func(_ context.Context, _ localRemoval, receipt workloadrunner.ReapReceipt) error {
+		record.phase = runtimeRemovalQuarantined
+		record.receipt = receipt
+		return nil
+	}
+	controller.purgeJob = func(context.Context, string) error { return nil }
+	controller.removeResource = func(context.Context, localRemoval) error {
+		t.Fatal("never-run Computer attempted managed service-resource deletion")
+		return nil
+	}
+	controller.finalizeVolumes = func(_ context.Context, request workloadrunner.ManagedVolumeFinalizationRequest) error {
+		if len(request.Volumes) != 2 {
+			t.Fatalf("finalized Storage generations = %d, want 2", len(request.Volumes))
+		}
+		return nil
+	}
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error { return nil }
+	controller.attestRuntimeRemoval = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		return testRuntimeRemovalAttestation(record.manifest), nil
+	}
+	controller.recordRuntimeAttested = func(context.Context, localRemoval, workloadrunner.RuntimeRemovalAttestation) error { return nil }
+	controller.ackRemoval = func(context.Context, localRemoval) error { acknowledged = true; return nil }
+	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
+	if err := controller.process(t.Context(), directive); err != nil {
+		t.Fatal(err)
+	}
+	if !acknowledged || len(requests) != 3 || requests[0] != nil || requests[1].StorageGeneration != 1 || requests[2].StorageGeneration != 2 {
+		t.Fatalf("legacy reconstruction requests=%+v acknowledged=%t", requests, acknowledged)
+	}
+}
+
+func TestLegacyRemovalReconstructionDeduplicatesOnlyIdenticalAuthorities(t *testing.T) {
+	removal := localRemoval{jobID: "legacy-computer", generation: 2, rootInstanceID: "root", cleanupFence: "cleanup"}
+	storages := []*workloadrunner.ComputerStorage{
+		{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30},
+		{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30},
+	}
+	authority := testRuntimeResourceManifest(removal.jobID, "attempt")
+	var persisted []workloadrunner.RuntimeResourceManifest
+	calls := 0
+	controller := &removalController{nodeID: "node", bootSessionID: "boot"}
+	controller.reconstructRuntime = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error) {
+		calls++
+		return []workloadrunner.RuntimeResourceManifest{authority}, nil
+	}
+	controller.persistRuntimeRemoval = func(_ context.Context, _ localRemoval, attempts []workloadrunner.RuntimeResourceManifest) error {
+		persisted = slices.Clone(attempts)
+		return nil
+	}
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
+		return runtimeRemovalRecord{manifest: runtimeRemovalManifest{Attempts: slices.Clone(persisted)}}, true, nil
+	}
+	record, err := controller.reconstructAndPersistRuntimeRemoval(t.Context(), removal, storages)
+	if err != nil || calls != 3 || len(record.manifest.Attempts) != 1 {
+		t.Fatalf("identical legacy authorities = calls:%d attempts:%+v err:%v", calls, record.manifest.Attempts, err)
+	}
+
+	calls = 0
+	controller.reconstructRuntime = func(_ context.Context, request workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error) {
+		calls++
+		candidate := authority
+		if request.ComputerStorage != nil && request.ComputerStorage.StorageGeneration == 2 {
+			candidate.LeaseID = "conflicting-lease"
+		}
+		return []workloadrunner.RuntimeResourceManifest{candidate}, nil
+	}
+	if _, err := controller.reconstructAndPersistRuntimeRemoval(t.Context(), removal, storages); err == nil || !strings.Contains(err.Error(), "conflicting duplicate attempt") {
+		t.Fatalf("conflicting legacy authority = calls:%d err:%v", calls, err)
 	}
 }
 
@@ -631,28 +770,50 @@ func TestSessionRoutesRuntimeReceiptIntoLiveRemoval(t *testing.T) {
 	}
 }
 
-func TestPreparedComputerStorageRemovalNeedsNoRuntimeReap(t *testing.T) {
-	manifest := runtimeRemovalManifest{Version: 1, JobID: "prepared-computer", RemovalGeneration: 1,
-		Attempts: []workloadrunner.RuntimeResourceManifest{{Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: "node", BootSessionID: "boot",
-			JobID: "prepared-computer", AttemptID: contract.StorageOnlyRemovalAttemptID(1), FencingToken: "cleanup",
-			WorkloadClass: contract.JobClassService, RemovalGeneration: "1", StorageOnly: true,
-			ComputerStorage:    &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30},
-			StoragePreparation: &contract.ComputerStoragePreparationWitness{Kind: "computer_storage_copy_verified", ReceiptID: "receipt", NodeID: "node", RootInstanceID: "root", JobID: "prepared-computer", ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, Revision: 1, Fence: "copy", HelperGeneration: 1}}}}
-	removal := localRemoval{jobID: manifest.JobID, generation: manifest.RemovalGeneration, cleanupFence: "cleanup"}
-	receipt, ok := storageOnlyRemovalReceipt(manifest, removal, "node", "boot")
-	if !ok || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime || receipt.BootSessionID != "boot" {
-		t.Fatalf("prepared Computer no-runtime receipt = %+v ok=%t", receipt, ok)
+func TestMixedRuntimeAndComputerStorageRemovalCannotBypassControllerReap(t *testing.T) {
+	jobID := "mixed-computer"
+	storageAttempt := workloadrunner.RuntimeResourceManifest{Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: "node", BootSessionID: "boot",
+		JobID: jobID, AttemptID: contract.StorageOnlyRemovalAttemptID(1), FencingToken: "cleanup",
+		WorkloadClass: contract.JobClassService, RemovalGeneration: "1", StorageOnly: true,
+		ComputerStorage:    &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30},
+		StoragePreparation: &contract.ComputerStoragePreparationWitness{Kind: contract.ComputerStorageCopyVerifiedKind, ReceiptID: "receipt", NodeID: "node", RootInstanceID: "root", JobID: jobID, ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, Revision: 1, Fence: "copy", HelperGeneration: 1}}
+	manifest := runtimeRemovalManifest{Version: 1, JobID: jobID, RemovalGeneration: 1,
+		Attempts: []workloadrunner.RuntimeResourceManifest{testRuntimeResourceManifest(jobID, "attempt"), storageAttempt}}
+	record := runtimeRemovalRecord{manifest: manifest, phase: runtimeRemovalPrepared}
+	changed := make(chan struct{})
+	session := &agentSession{
+		registration: contract.NodeRegistration{BootSessionID: "boot"}, resident: make(map[string]*residentAttempt),
+		residentJobID: map[string]struct{}{jobID: {}}, residentChanged: changed,
+		serviceReaps: make(map[string]runtimeReapOutcome), serviceBoots: make(map[string]string),
 	}
-	mixed := manifest
-	mixed.Attempts = append(mixed.Attempts, testRuntimeResourceManifest(manifest.JobID, "attempt"))
-	if receipt, ok := storageOnlyRemovalReceipt(mixed, removal, "node", "boot"); ok {
-		t.Fatalf("mixed runtime/storage manifest skipped reap: %+v", receipt)
+	recorded := false
+	controller := &removalController{session: session, reapService: session.reapServiceForRemoval,
+		recordRuntimeQuiesced: func(context.Context, localRemoval, workloadrunner.ReapReceipt) error {
+			recorded = true
+			return nil
+		}}
+	removal := localRemoval{jobID: jobID, kind: contract.JobKindOCI, generation: 1, cleanupFence: "cleanup"}
+	done := make(chan error, 1)
+	go func() { done <- controller.continueRuntimeRemoval(t.Context(), removal, &record, nil) }()
+	select {
+	case err := <-done:
+		t.Fatalf("mixed manifest bypassed admission barrier: %v", err)
+	case <-time.After(20 * time.Millisecond):
 	}
-	wrongFence := manifest
-	wrongFence.Attempts = append([]workloadrunner.RuntimeResourceManifest(nil), manifest.Attempts...)
-	wrongFence.Attempts[0].FencingToken = "stale-cleanup"
-	if receipt, ok := storageOnlyRemovalReceipt(wrongFence, removal, "node", "boot"); ok {
-		t.Fatalf("storage-only manifest with stale cleanup fence skipped reap: %+v", receipt)
+	session.claimMu.Lock()
+	delete(session.residentJobID, jobID)
+	close(changed)
+	session.claimMu.Unlock()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "no runtime reap receipt") {
+			t.Fatalf("mixed manifest controller reap = %v, want missing runtime receipt", err)
+		}
+		if recorded {
+			t.Fatal("mixed manifest recorded quiescence without a runtime receipt")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("mixed manifest controller reap did not resume after admission cleared")
 	}
 }
 

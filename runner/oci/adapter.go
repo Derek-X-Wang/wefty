@@ -428,6 +428,7 @@ func (adapter *Adapter) AttestRuntimeRemoval(ctx context.Context, request worklo
 			HandoffVolume:      attempt.HandoffVolume,
 			ComputerStorage:    computerStorage,
 			StorageOnly:        attempt.StorageOnly,
+			StorageAbsent:      attempt.StorageAbsent,
 			StoragePreparation: attempt.StoragePreparation,
 			Resources:          helperResources,
 		})
@@ -485,8 +486,17 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 	if err != nil {
 		return nil, err
 	}
-	if response.JobID != request.JobID || response.RemovalGeneration != request.RemovalGeneration || response.HelperSession != helperSession(session) || len(response.Attempts) == 0 {
+	if response.JobID != request.JobID || response.RemovalGeneration != request.RemovalGeneration || response.HelperSession != helperSession(session) {
 		return nil, errors.New("legacy OCI removal inventory receipt is not bound to the current helper, job, and generation")
+	}
+	if response.NoRuntimeAttempts {
+		if request.ComputerStorage != nil || len(response.Attempts) != 0 {
+			return nil, errors.New("legacy OCI removal no-runtime receipt has conflicting Storage or attempt evidence")
+		}
+		return nil, nil
+	}
+	if len(response.Attempts) == 0 {
+		return nil, errors.New("legacy OCI removal inventory omitted helper-owned attempt evidence")
 	}
 	attempts := make([]workloadrunner.RuntimeResourceManifest, 0, len(response.Attempts))
 	for _, helperAttempt := range response.Attempts {
@@ -497,11 +507,19 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 		if helperAttempt.StorageOnly && helperAttempt.ComputerStorage == nil {
 			return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence without Computer Storage identity")
 		}
-		if helperAttempt.StorageOnly && (authority.BootSessionID != request.BootSessionID || authority.FencingToken != request.CleanupFence ||
-			!contract.ValidStorageOnlyRemovalAttemptID(authority.AttemptID, helperAttempt.ComputerStorage.StorageGeneration)) {
+		if request.ComputerStorage != nil && !helperAttempt.StorageOnly {
+			return nil, errors.New("legacy OCI per-generation inventory returned runtime attempt evidence")
+		}
+		validStorageAttempt := helperAttempt.StorageOnly &&
+			((helperAttempt.StorageAbsent && contract.ValidStorageAbsentRemovalAttemptID(authority.AttemptID, helperAttempt.ComputerStorage.StorageGeneration)) ||
+				(!helperAttempt.StorageAbsent && contract.ValidStorageOnlyRemovalAttemptID(authority.AttemptID, helperAttempt.ComputerStorage.StorageGeneration)))
+		if helperAttempt.StorageOnly && (authority.BootSessionID != request.BootSessionID || authority.FencingToken != request.CleanupFence || !validStorageAttempt) {
 			return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence without current cleanup authority")
 		}
-		if helperAttempt.StorageOnly && (helperAttempt.StoragePreparation == nil || !helperAttempt.StoragePreparation.Valid() ||
+		if helperAttempt.StorageOnly && helperAttempt.StorageAbsent && helperAttempt.StoragePreparation != nil {
+			return nil, errors.New("legacy OCI removal inventory returned already-absent Storage with preparation evidence")
+		}
+		if helperAttempt.StorageOnly && !helperAttempt.StorageAbsent && (helperAttempt.StoragePreparation == nil || !helperAttempt.StoragePreparation.Valid() ||
 			helperAttempt.StoragePreparation.NodeID != request.NodeID || helperAttempt.StoragePreparation.RootInstanceID != request.RootInstanceID ||
 			helperAttempt.StoragePreparation.JobID != request.JobID || helperAttempt.StoragePreparation.ComputerID != helperAttempt.ComputerStorage.ComputerID ||
 			helperAttempt.StoragePreparation.StorageID != helperAttempt.ComputerStorage.StorageID ||
@@ -518,7 +536,7 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 			NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID,
 			AttemptID: authority.AttemptID, FencingToken: authority.FencingToken,
 			WorkloadClass: authority.Class, RemovalGeneration: authority.RemovalGeneration,
-			HandoffVolume: helperAttempt.HandoffVolume, StorageOnly: helperAttempt.StorageOnly,
+			HandoffVolume: helperAttempt.HandoffVolume, StorageOnly: helperAttempt.StorageOnly, StorageAbsent: helperAttempt.StorageAbsent,
 			StoragePreparation: helperAttempt.StoragePreparation,
 		}
 		if !helperAttempt.StorageOnly {

@@ -321,6 +321,7 @@ func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {
 	inventory.Shims = slices.Clone(inventory.Shims)
 	inventory.Cgroups = slices.Clone(inventory.Cgroups)
 	inventory.LogSegments = slices.Clone(inventory.LogSegments)
+	inventory.ImageSpools = slices.Clone(inventory.ImageSpools)
 	inventory.ManagedVolumes = slices.Clone(inventory.ManagedVolumes)
 	inventory.ManagedVolumeRecords = slices.Clone(inventory.ManagedVolumeRecords)
 	inventory.ComputerDiskImages = slices.Clone(inventory.ComputerDiskImages)
@@ -339,6 +340,6 @@ func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {
 // InventoryEmpty reports whether every runtime-owned namespace class is absent.
 func InventoryEmpty(inventory ResourceInventory) bool {
 	return len(inventory.Leases)+len(inventory.Snapshots)+len(inventory.Containers)+len(inventory.Tasks)+
-		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ManagedVolumes)+len(inventory.ManagedVolumeRecords)+
+		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ImageSpools)+len(inventory.ManagedVolumes)+len(inventory.ManagedVolumeRecords)+
 		len(inventory.ComputerDiskImages)+len(inventory.ComputerDiskAllocations)+len(inventory.ComputerDiskQuotas)+len(inventory.ComputerDiskManifests)+len(inventory.ComputerDiskMounts)+len(inventory.ComputerDiskLoops)+len(inventory.ComputerAttachments)+len(inventory.ComputerResetManifests)+len(inventory.ComputerQuarantines)+len(inventory.ComputerDiskAnomalies) == 0
 }

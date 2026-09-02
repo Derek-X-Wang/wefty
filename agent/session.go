@@ -1267,8 +1267,10 @@ func storageOnlyAttemptsReceipt(jobID, bootSessionID string, attempts []workload
 	for _, attempt := range attempts {
 		if !attempt.StorageOnly || attempt.NodeID == "" || attempt.BootSessionID != bootSessionID || attempt.JobID != jobID ||
 			attempt.WorkloadClass != contract.JobClassService || attempt.ComputerStorage == nil ||
-			attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
-			!contract.ValidStorageOnlyRemovalAttemptID(attempt.AttemptID, attempt.ComputerStorage.StorageGeneration) {
+			(!attempt.StorageAbsent && (attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
+				!contract.ValidStorageOnlyRemovalAttemptID(attempt.AttemptID, attempt.ComputerStorage.StorageGeneration))) ||
+			(attempt.StorageAbsent && (attempt.StoragePreparation != nil ||
+				!contract.ValidStorageAbsentRemovalAttemptID(attempt.AttemptID, attempt.ComputerStorage.StorageGeneration))) {
 			return workloadrunner.ReapReceipt{}, false
 		}
 	}

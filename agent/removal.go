@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"sync"
 
@@ -300,10 +301,13 @@ func (controller *removalController) reconstructAndPersistRuntimeRemoval(ctx con
 		return runtimeRemovalRecord{}, errors.New("agent: legacy OCI removal inventory reconstruction is unavailable")
 	}
 	var attempts []workloadrunner.RuntimeResourceManifest
-	requests := computerStorages
-	if len(requests) == 0 {
-		requests = []*workloadrunner.ComputerStorage{nil}
+	requests := []*workloadrunner.ComputerStorage{nil}
+	if len(computerStorages) != 0 {
+		// Inventory runtime authorities once, then ask per generation only for
+		// prepared/never-attached or already-deleted Storage evidence.
+		requests = append(requests, computerStorages...)
 	}
+	seenAttempts := make(map[string]workloadrunner.RuntimeResourceManifest)
 	for _, computerStorage := range requests {
 		request := workloadrunner.RuntimeRemovalProofRequest{
 			NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID,
@@ -314,7 +318,16 @@ func (controller *removalController) reconstructAndPersistRuntimeRemoval(ctx con
 		if err != nil {
 			return runtimeRemovalRecord{}, fmt.Errorf("agent: legacy OCI removal %q remains pending because helper inventory reconstruction failed: %w", removal.jobID, err)
 		}
-		attempts = append(attempts, reconstructed...)
+		for _, attempt := range reconstructed {
+			if prior, exists := seenAttempts[attempt.AttemptID]; exists {
+				if !reflect.DeepEqual(prior, attempt) {
+					return runtimeRemovalRecord{}, fmt.Errorf("agent: legacy OCI removal %q returned conflicting duplicate attempt %q", removal.jobID, attempt.AttemptID)
+				}
+				continue
+			}
+			seenAttempts[attempt.AttemptID] = attempt
+			attempts = append(attempts, attempt)
+		}
 	}
 	if err := controller.persistRuntimeRemoval(ctx, removal, attempts); err != nil {
 		return runtimeRemovalRecord{}, err
@@ -360,25 +373,6 @@ func (controller *removalController) continueRuntimeRemoval(ctx context.Context,
 	}
 	removal.processTreeReaped = true
 	return controller.completeLocalRemoval(ctx, removal, runtimeRemoval, computerStorages)
-}
-
-func storageOnlyRemovalReceipt(manifest runtimeRemovalManifest, removal localRemoval, nodeID, bootSessionID string) (workloadrunner.ReapReceipt, bool) {
-	if len(manifest.Attempts) == 0 || nodeID == "" || bootSessionID == "" || manifest.JobID != removal.jobID ||
-		manifest.RemovalGeneration != removal.generation || removal.cleanupFence == "" {
-		return workloadrunner.ReapReceipt{}, false
-	}
-	for _, attempt := range manifest.Attempts {
-		if !attempt.StorageOnly || attempt.NodeID != nodeID || attempt.BootSessionID != bootSessionID ||
-			attempt.JobID != manifest.JobID || attempt.WorkloadClass != contract.JobClassService ||
-			attempt.RemovalGeneration != fmt.Sprint(manifest.RemovalGeneration) || attempt.FencingToken != removal.cleanupFence ||
-			attempt.ComputerStorage == nil || attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
-			!contract.ValidStorageOnlyRemovalAttemptID(attempt.AttemptID, attempt.ComputerStorage.StorageGeneration) {
-			return workloadrunner.ReapReceipt{}, false
-		}
-	}
-	return workloadrunner.ReapReceipt{
-		RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime, BootSessionID: bootSessionID,
-	}, true
 }
 
 func storageOnlyManifestNeedsRefresh(manifest runtimeRemovalManifest, bootSessionID string) bool {

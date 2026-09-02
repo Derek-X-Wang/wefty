@@ -10,6 +10,7 @@ import (
 
 const (
 	StorageOnlyRemovalAttemptPrefix          = "storage-removal-"
+	StorageAbsentRemovalAttemptPrefix        = "storage-absent-"
 	ComputerStorageResetRetirementPrefix     = "storage-reset-"
 	ComputerStorageRestoreRetirementPrefix   = "storage-restore-"
 	ComputerStorageFailedImportCleanupPrefix = "storage-import-failed-"
@@ -23,6 +24,14 @@ func StorageOnlyRemovalAttemptID(generation int64) string {
 
 func ValidStorageOnlyRemovalAttemptID(attemptID string, generation int64) bool {
 	return generation > 0 && attemptID == StorageOnlyRemovalAttemptID(generation)
+}
+
+func StorageAbsentRemovalAttemptID(generation int64) string {
+	return fmt.Sprintf("%s%d", StorageAbsentRemovalAttemptPrefix, generation)
+}
+
+func ValidStorageAbsentRemovalAttemptID(attemptID string, generation int64) bool {
+	return generation > 0 && attemptID == StorageAbsentRemovalAttemptID(generation)
 }
 
 func ComputerStorageResetRetirementAttemptID(revision int64) string {
