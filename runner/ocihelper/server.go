@@ -77,6 +77,7 @@ const (
 
 type serverAttempt struct {
 	authority        AttemptAuthority
+	computerStorage  *ComputerStorageReference
 	state            attemptState
 	endpoints        map[string]uint16
 	cgroupID         string
@@ -626,6 +627,13 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 		deadlineChanged: make(chan struct{}, 1), watchDone: make(chan struct{}), reaped: make(chan struct{}),
 		runCancel: runCancel,
 	}
+	for _, volume := range request.Workload.ManagedVolumes {
+		if volume.Kind == ManagedVolumeComputerDisk && volume.ComputerStorage != nil {
+			storage := *volume.ComputerStorage
+			attempt.computerStorage = &storage
+			break
+		}
+	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.closed {
@@ -638,6 +646,21 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 	session.attempts[key] = attempt
 	go session.watchAttempt(attempt)
 	return attempt, nil
+}
+
+// hasLiveRemovalAttemptLocked is called while session.mu excludes Run's
+// reserveAttempt edge. Tombstones are already positively reaped and do not
+// fence read-only inventory.
+func (session *serverSession) hasLiveRemovalAttemptLocked(jobID string, storage *ComputerStorageReference) bool {
+	for _, attempt := range session.attempts {
+		if attempt.state == attemptTombstoned || attempt.authority.JobID != jobID {
+			continue
+		}
+		if storage == nil || attempt.computerStorage == nil || sameComputerStorageIdentity(*attempt.computerStorage, *storage) {
+			return true
+		}
+	}
+	return false
 }
 
 const maximumAttemptEndpoints = 8
@@ -1300,7 +1323,17 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
+		// Serialize the helper-owned attempt registry with inventory. Run reserves
+		// here before it can create runtime or attach Storage resources, so an
+		// admitted attempt can never be misreported as Storage-only.
+		session.mu.Lock()
+		if session.hasLiveRemovalAttemptLocked(body.Removal.JobID, body.ComputerStorage) {
+			session.mu.Unlock()
+			_ = writeFailure(wire, CodeComputerStorageBusy, "removal inventory is fenced by a live attempt authority")
+			return
+		}
 		response, err := engine.InventoryRemoval(operation.ctx, body)
+		session.mu.Unlock()
 		if err == nil {
 			response.JobID = body.Removal.JobID
 			response.RemovalGeneration = body.Removal.RemovalGeneration

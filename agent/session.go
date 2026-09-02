@@ -1234,9 +1234,15 @@ func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID, k
 			outcome, found := session.serviceReaps[jobID]
 			serviceBoot := session.serviceBoots[jobID]
 			priorBootReap := session.reapPriorBoot
+			bootSessionID := session.registration.BootSessionID
 			session.claimMu.Unlock()
 			if found {
 				return verifiedRuntimeReap(jobID, outcome)
+			}
+			// Only after the admission and residency gates are both clear may a
+			// current-helper Storage-only inventory prove that no guardian exists.
+			if receipt, ok := storageOnlyAttemptsReceipt(jobID, bootSessionID, attempts); ok {
+				return receipt, nil
 			}
 			if serviceBoot == session.registration.BootSessionID || priorBootReap == nil {
 				return workloadrunner.ReapReceipt{}, fmt.Errorf("agent: service %q has no runtime reap receipt", jobID)
@@ -1252,6 +1258,21 @@ func (session *agentSession) reapServiceForRemoval(ctx context.Context, jobID, k
 		case <-changed:
 		}
 	}
+}
+
+func storageOnlyAttemptsReceipt(jobID, bootSessionID string, attempts []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, bool) {
+	if jobID == "" || bootSessionID == "" || len(attempts) == 0 {
+		return workloadrunner.ReapReceipt{}, false
+	}
+	for _, attempt := range attempts {
+		if !attempt.StorageOnly || attempt.NodeID == "" || attempt.BootSessionID != bootSessionID || attempt.JobID != jobID ||
+			attempt.WorkloadClass != contract.JobClassService || attempt.ComputerStorage == nil ||
+			attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
+			!contract.ValidStorageOnlyRemovalAttemptID(attempt.AttemptID, attempt.ComputerStorage.StorageGeneration) {
+			return workloadrunner.ReapReceipt{}, false
+		}
+	}
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime, BootSessionID: bootSessionID}, true
 }
 
 func (session *agentSession) recordRuntimeReap(jobID string, receipt workloadrunner.ReapReceipt, err error) {

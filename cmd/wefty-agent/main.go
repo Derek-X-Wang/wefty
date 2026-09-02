@@ -752,6 +752,7 @@ func handleShutdownSignals(
 	select {
 	case <-ctx.Done():
 	case <-signals:
+		logf("wefty-agent: forced_shutdown transition=drained_to_forced reason=second_signal")
 		cancel()
 	}
 }

@@ -425,10 +425,11 @@ func (adapter *Adapter) AttestRuntimeRemoval(ctx context.Context, request worklo
 				AttemptID: attempt.AttemptID, FencingToken: attempt.FencingToken,
 				WorkloadClass: attempt.WorkloadClass, RemovalGeneration: attempt.RemovalGeneration,
 			}),
-			HandoffVolume:   attempt.HandoffVolume,
-			ComputerStorage: computerStorage,
-			StorageOnly:     attempt.StorageOnly,
-			Resources:       helperResources,
+			HandoffVolume:      attempt.HandoffVolume,
+			ComputerStorage:    computerStorage,
+			StorageOnly:        attempt.StorageOnly,
+			StoragePreparation: attempt.StoragePreparation,
+			Resources:          helperResources,
 		})
 	}
 	session, _, err := adapter.sessions.ExecutionSnapshot()
@@ -459,7 +460,7 @@ func (adapter *Adapter) AttestRuntimeRemoval(ctx context.Context, request worklo
 }
 
 func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error) {
-	if adapter == nil || adapter.sessions == nil || request.NodeID == "" || request.BootSessionID == "" || request.JobID == "" || request.RemovalGeneration == 0 || request.CleanupFence == "" {
+	if adapter == nil || adapter.sessions == nil || request.NodeID == "" || request.BootSessionID == "" || request.JobID == "" || request.RemovalGeneration == 0 || request.CleanupFence == "" || (request.ComputerStorage != nil && request.RootInstanceID == "") {
 		return nil, errors.New("legacy OCI removal inventory requires exact durable removal authority")
 	}
 	session, _, err := adapter.sessions.ExecutionSnapshot()
@@ -479,7 +480,7 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 			NodeID: request.NodeID, BootSessionID: request.BootSessionID, JobID: request.JobID,
 			RemovalGeneration: request.RemovalGeneration, CleanupFence: request.CleanupFence,
 		},
-		ComputerStorage: computerStorage,
+		ComputerStorage: computerStorage, RootInstanceID: request.RootInstanceID,
 	})
 	if err != nil {
 		return nil, err
@@ -497,29 +498,43 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 			return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence without Computer Storage identity")
 		}
 		if helperAttempt.StorageOnly && (authority.BootSessionID != request.BootSessionID || authority.FencingToken != request.CleanupFence ||
-			authority.AttemptID != fmt.Sprintf("storage-removal-%d", helperAttempt.ComputerStorage.StorageGeneration)) {
+			!contract.ValidStorageOnlyRemovalAttemptID(authority.AttemptID, helperAttempt.ComputerStorage.StorageGeneration)) {
 			return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence without current cleanup authority")
+		}
+		if helperAttempt.StorageOnly && (helperAttempt.StoragePreparation == nil || !helperAttempt.StoragePreparation.Valid() ||
+			helperAttempt.StoragePreparation.NodeID != request.NodeID || helperAttempt.StoragePreparation.RootInstanceID != request.RootInstanceID ||
+			helperAttempt.StoragePreparation.JobID != request.JobID || helperAttempt.StoragePreparation.ComputerID != helperAttempt.ComputerStorage.ComputerID ||
+			helperAttempt.StoragePreparation.StorageID != helperAttempt.ComputerStorage.StorageID ||
+			helperAttempt.StoragePreparation.StorageGeneration != helperAttempt.ComputerStorage.StorageGeneration) {
+			return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence without a matching durable preparation witness")
 		}
 		if helperAttempt.StorageOnly && (request.ComputerStorage == nil || helperAttempt.ComputerStorage.ComputerID != request.ComputerStorage.ComputerID ||
 			helperAttempt.ComputerStorage.StorageID != request.ComputerStorage.StorageID ||
 			helperAttempt.ComputerStorage.StorageGeneration != request.ComputerStorage.StorageGeneration) {
 			return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence for conflicting Computer Storage identity")
 		}
-		identity, identityErr := ocihelper.DeterministicResourceIdentity(authority)
-		if identityErr != nil {
-			return nil, identityErr
-		}
 		manifest := workloadrunner.RuntimeResourceManifest{
 			Version: 1, RuntimeKind: contract.JobKindOCI,
 			NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID,
 			AttemptID: authority.AttemptID, FencingToken: authority.FencingToken,
 			WorkloadClass: authority.Class, RemovalGeneration: authority.RemovalGeneration,
-			LeaseID: identity.LeaseID, TaskID: identity.TaskID, ContainerID: identity.ContainerID,
-			SnapshotID: identity.SnapshotID, ShimID: identity.ShimID, CgroupID: identity.CgroupID,
-			LogSegmentDirectory: identity.LogSegmentDirectory, HandoffVolume: helperAttempt.HandoffVolume,
-			StorageOnly: helperAttempt.StorageOnly,
+			HandoffVolume: helperAttempt.HandoffVolume, StorageOnly: helperAttempt.StorageOnly,
+			StoragePreparation: helperAttempt.StoragePreparation,
+		}
+		if !helperAttempt.StorageOnly {
+			identity, identityErr := ocihelper.DeterministicResourceIdentity(authority)
+			if identityErr != nil {
+				return nil, identityErr
+			}
+			manifest.LeaseID, manifest.TaskID, manifest.ContainerID = identity.LeaseID, identity.TaskID, identity.ContainerID
+			manifest.SnapshotID, manifest.ShimID, manifest.CgroupID = identity.SnapshotID, identity.ShimID, identity.CgroupID
+			manifest.LogSegmentDirectory = identity.LogSegmentDirectory
 		}
 		if helperAttempt.ComputerStorage == nil {
+			identity, identityErr := ocihelper.DeterministicResourceIdentity(authority)
+			if identityErr != nil {
+				return nil, identityErr
+			}
 			manifest.ServiceDataVolume = identity.ServiceVolumeDirectory
 			manifest.ServiceDataOwnerRecord = identity.ServiceVolumeOwnerRecord
 		} else {

@@ -868,15 +868,17 @@ type RemovalResource struct {
 }
 
 type RemovalAttemptManifest struct {
-	Authority       AttemptAuthority          `json:"authority"`
-	HandoffVolume   string                    `json:"handoff_volume,omitempty"`
-	ComputerStorage *ComputerStorageReference `json:"computer_storage,omitempty"`
-	StorageOnly     bool                      `json:"storage_only,omitempty"`
-	Resources       []RemovalResource         `json:"resources"`
+	Authority          AttemptAuthority                            `json:"authority"`
+	HandoffVolume      string                                      `json:"handoff_volume,omitempty"`
+	ComputerStorage    *ComputerStorageReference                   `json:"computer_storage,omitempty"`
+	StorageOnly        bool                                        `json:"storage_only,omitempty"`
+	StoragePreparation *contract.ComputerStoragePreparationWitness `json:"storage_preparation,omitempty"`
+	Resources          []RemovalResource                           `json:"resources"`
 }
 
 type InventoryRemovalRequest struct {
 	Removal         ManagedVolumeRemovalAuthority `json:"removal"`
+	RootInstanceID  string                        `json:"root_instance_id"`
 	ComputerStorage *ComputerStorageReference     `json:"computer_storage,omitempty"`
 }
 
@@ -995,9 +997,12 @@ func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) e
 			return errors.New("removal attestation repeats an attempt authority")
 		}
 		seenAttempts[authority.key()] = struct{}{}
-		identity, err := DeterministicResourceIdentity(authority)
-		if err != nil {
-			return err
+		var identity ResourceIdentity
+		if !attempt.StorageOnly {
+			identity, err = DeterministicResourceIdentity(authority)
+			if err != nil {
+				return err
+			}
 		}
 		if attempt.ComputerStorage != nil {
 			if _, err := DeterministicComputerDiskName(*attempt.ComputerStorage); err != nil || attempt.ComputerStorage.DiskBytes <= 0 {
@@ -1006,8 +1011,13 @@ func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) e
 		}
 		want := ExpectedRemovalResources(identity, attempt.HandoffVolume, attempt.ComputerStorage)
 		if attempt.StorageOnly {
-			if attempt.ComputerStorage == nil {
-				return errors.New("storage-only removal attestation requires Computer Storage")
+			if attempt.ComputerStorage == nil || attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
+				!contract.ValidStorageOnlyRemovalAttemptID(authority.AttemptID, attempt.ComputerStorage.StorageGeneration) ||
+				attempt.StoragePreparation.NodeID != authority.NodeID || attempt.StoragePreparation.JobID != authority.JobID ||
+				attempt.StoragePreparation.ComputerID != attempt.ComputerStorage.ComputerID ||
+				attempt.StoragePreparation.StorageID != attempt.ComputerStorage.StorageID ||
+				attempt.StoragePreparation.StorageGeneration != attempt.ComputerStorage.StorageGeneration {
+				return errors.New("storage-only removal attestation requires matching durable Computer Storage preparation evidence")
 			}
 			want = expectedComputerStorageRemovalResources(attempt.ComputerStorage)
 		}

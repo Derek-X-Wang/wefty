@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -560,9 +561,11 @@ func TestSessionRoutesRuntimeReceiptIntoLiveRemoval(t *testing.T) {
 
 func TestPreparedComputerStorageRemovalNeedsNoRuntimeReap(t *testing.T) {
 	manifest := runtimeRemovalManifest{Version: 1, JobID: "prepared-computer", RemovalGeneration: 1,
-		Attempts: addStorageOnlyRemovalManifests(nil, []*workloadrunner.ComputerStorage{{
-			ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30,
-		}}, "node", "boot", "prepared-computer", 1, "cleanup")}
+		Attempts: []workloadrunner.RuntimeResourceManifest{{Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: "node", BootSessionID: "boot",
+			JobID: "prepared-computer", AttemptID: contract.StorageOnlyRemovalAttemptID(1), FencingToken: "cleanup",
+			WorkloadClass: contract.JobClassService, RemovalGeneration: "1", StorageOnly: true,
+			ComputerStorage:    &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30},
+			StoragePreparation: &contract.ComputerStoragePreparationWitness{Kind: "computer_storage_copy_verified", ReceiptID: "receipt", NodeID: "node", RootInstanceID: "root", JobID: "prepared-computer", ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, Revision: 1, Fence: "copy", HelperGeneration: 1}}}}
 	removal := localRemoval{jobID: manifest.JobID, generation: manifest.RemovalGeneration, cleanupFence: "cleanup"}
 	receipt, ok := storageOnlyRemovalReceipt(manifest, removal, "node", "boot")
 	if !ok || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime || receipt.BootSessionID != "boot" {
@@ -578,6 +581,71 @@ func TestPreparedComputerStorageRemovalNeedsNoRuntimeReap(t *testing.T) {
 	wrongFence.Attempts[0].FencingToken = "stale-cleanup"
 	if receipt, ok := storageOnlyRemovalReceipt(wrongFence, removal, "node", "boot"); ok {
 		t.Fatalf("storage-only manifest with stale cleanup fence skipped reap: %+v", receipt)
+	}
+}
+
+func TestPreparedComputerStorageRemovalWaitsForAdmissionBarrier(t *testing.T) {
+	changed := make(chan struct{})
+	session := &agentSession{
+		registration: contract.NodeRegistration{BootSessionID: "boot"},
+		resident:     make(map[string]*residentAttempt), residentJobID: map[string]struct{}{"prepared-computer": {}},
+		residentChanged: changed, serviceReaps: make(map[string]runtimeReapOutcome), serviceBoots: make(map[string]string),
+	}
+	attempts := []workloadrunner.RuntimeResourceManifest{{Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: "node", BootSessionID: "boot",
+		JobID: "prepared-computer", AttemptID: contract.StorageOnlyRemovalAttemptID(1), FencingToken: "cleanup",
+		WorkloadClass: contract.JobClassService, RemovalGeneration: "1", StorageOnly: true,
+		ComputerStorage:    &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30},
+		StoragePreparation: &contract.ComputerStoragePreparationWitness{Kind: "computer_storage_copy_verified", ReceiptID: "receipt", NodeID: "node", RootInstanceID: "root", JobID: "prepared-computer", ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, Revision: 1, Fence: "copy", HelperGeneration: 1}}}
+	done := make(chan workloadrunner.ReapReceipt, 1)
+	go func() {
+		receipt, _ := session.reapServiceForRemoval(context.Background(), "prepared-computer", contract.JobKindOCI, attempts)
+		done <- receipt
+	}()
+	select {
+	case <-done:
+		t.Fatal("Storage-only inventory bypassed admitted service")
+	case <-time.After(20 * time.Millisecond):
+	}
+	session.claimMu.Lock()
+	delete(session.residentJobID, "prepared-computer")
+	close(changed)
+	session.claimMu.Unlock()
+	select {
+	case receipt := <-done:
+		if receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime {
+			t.Fatalf("post-barrier receipt = %+v", receipt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Storage-only reap did not resume after admission cleared")
+	}
+}
+
+func TestPreparedComputerRemovalDoesNotRequireManagedrootOwnership(t *testing.T) {
+	storage := &workloadrunner.ComputerStorage{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30}
+	attempt := workloadrunner.RuntimeResourceManifest{Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: "node", BootSessionID: "boot",
+		JobID: "prepared-computer", AttemptID: contract.StorageOnlyRemovalAttemptID(1), FencingToken: "cleanup",
+		WorkloadClass: contract.JobClassService, RemovalGeneration: "1", StorageOnly: true, ComputerStorage: storage,
+		StoragePreparation: &contract.ComputerStoragePreparationWitness{Kind: contract.ComputerStorageCopyVerifiedKind, ReceiptID: "receipt", NodeID: "node", RootInstanceID: "root", JobID: "prepared-computer", ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, Revision: 1, Fence: "copy", HelperGeneration: 1}}
+	manifest := runtimeRemovalManifest{Version: 1, JobID: attempt.JobID, RemovalGeneration: 1, Attempts: []workloadrunner.RuntimeResourceManifest{attempt}}
+	record := runtimeRemovalRecord{manifest: manifest, phase: runtimeRemovalQuarantined,
+		receipt: workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceNoRuntime, BootSessionID: "boot"}}
+	removal := localRemoval{jobID: attempt.JobID, kind: contract.JobKindOCI, generation: 1, rootInstanceID: "root", cleanupFence: "cleanup"}
+	controller := &removalController{nodeID: "node", bootSessionID: "boot"}
+	controller.purgeJob = func(context.Context, string) error { return nil }
+	controller.removeResource = func(context.Context, localRemoval) error {
+		t.Fatal("never-started Computer required a managedroot ownership manifest")
+		return nil
+	}
+	controller.finalizeVolumes = func(context.Context, workloadrunner.ManagedVolumeFinalizationRequest) error { return nil }
+	controller.deleteRuntimeData = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error { return nil }
+	controller.attestRuntimeRemoval = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error) {
+		return testRuntimeRemovalAttestation(manifest), nil
+	}
+	controller.recordRuntimeAttested = func(context.Context, localRemoval, workloadrunner.RuntimeRemovalAttestation) error { return nil }
+	controller.ackRemoval = func(context.Context, localRemoval) error { return nil }
+	controller.finishRemoval = func(context.Context, localRemoval) error { return nil }
+	if err := controller.completeLocalRemoval(t.Context(), removal, &record, []*workloadrunner.ComputerStorage{storage}); err != nil {
+		t.Fatal(err)
 	}
 }
 

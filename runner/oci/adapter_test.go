@@ -1909,8 +1909,11 @@ func TestLegacyRemovalReconstructsFrozenInventoryFromCurrentHelperScan(t *testin
 func TestLegacyComputerRemovalReconstructsPreparedStorageWithoutRuntimeAttempt(t *testing.T) {
 	authority := ocihelper.AttemptAuthority{NodeID: "node", BootSessionID: "boot", JobID: "prepared-computer", AttemptID: "storage-removal-1", FencingToken: "cleanup", Class: contract.JobClassService, RemovalGeneration: "1"}
 	storage := &ocihelper.ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30}
+	witness := &contract.ComputerStoragePreparationWitness{Kind: "computer_storage_copy_verified", ReceiptID: "receipt", NodeID: "node", RootInstanceID: "root",
+		JobID: authority.JobID, ComputerID: storage.ComputerID, StorageID: storage.StorageID, StorageGeneration: storage.StorageGeneration,
+		Revision: 1, Fence: "copy", HelperGeneration: 1}
 	engine := &adapterTestEngine{inventoryRemoval: ocihelper.InventoryRemovalResponse{Attempts: []ocihelper.RemovalAttemptManifest{{
-		Authority: authority, ComputerStorage: storage, StorageOnly: true,
+		Authority: authority, ComputerStorage: storage, StorageOnly: true, StoragePreparation: witness,
 		Resources: []ocihelper.RemovalResource{
 			{Class: ocihelper.RemovalResourceComputerDiskImage, ID: mustComputerDiskName(t, *storage)},
 			{Class: ocihelper.RemovalResourceComputerDiskAllocation, ID: mustComputerDiskName(t, *storage)},
@@ -1925,7 +1928,7 @@ func TestLegacyComputerRemovalReconstructsPreparedStorageWithoutRuntimeAttempt(t
 	}}}}
 	adapter, closeAdapter := startAdapterTestServer(t, engine)
 	defer closeAdapter()
-	request := workloadrunner.RuntimeRemovalProofRequest{NodeID: "node", BootSessionID: "boot", JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "cleanup",
+	request := workloadrunner.RuntimeRemovalProofRequest{NodeID: "node", BootSessionID: "boot", RootInstanceID: "root", JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "cleanup",
 		ComputerStorage: &workloadrunner.ComputerStorage{ComputerID: storage.ComputerID, StorageID: storage.StorageID, StorageGeneration: storage.StorageGeneration}}
 	attempts, err := adapter.ReconstructRuntimeRemoval(t.Context(), request)
 	if err != nil || len(attempts) != 1 {
@@ -1939,6 +1942,11 @@ func TestLegacyComputerRemovalReconstructsPreparedStorageWithoutRuntimeAttempt(t
 		t.Fatal("prepared Computer reconstruction accepted stale cleanup authority")
 	}
 	engine.inventoryRemoval.Attempts[0].Authority.FencingToken = authority.FencingToken
+	engine.inventoryRemoval.Attempts[0].Authority.BootSessionID = "stale-boot"
+	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
+		t.Fatal("prepared Computer reconstruction accepted stale helper boot")
+	}
+	engine.inventoryRemoval.Attempts[0].Authority.BootSessionID = authority.BootSessionID
 	engine.inventoryRemoval.Attempts[0].ComputerStorage.StorageID = "other-storage"
 	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
 		t.Fatal("prepared Computer reconstruction accepted conflicting Storage identity")

@@ -1742,6 +1742,22 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 			}
 		}
 		root := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+		engine.computerReimageMu.Lock()
+		lock, lockErr := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+		if lockErr != nil {
+			engine.computerReimageMu.Unlock()
+			return InventoryRemovalResponse{}, fmt.Errorf("open Computer removal inventory lock: %w", lockErr)
+		}
+		if lockErr = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); lockErr != nil {
+			_ = lock.Close()
+			engine.computerReimageMu.Unlock()
+			return InventoryRemovalResponse{}, errComputerStorageAttachmentOwned
+		}
+		engine.computerReimageMu.Unlock()
+		defer func() {
+			_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+			_ = lock.Close()
+		}()
 		manifest, present, manifestErr := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
 		if manifestErr != nil || !present {
 			return InventoryRemovalResponse{}, errors.Join(manifestErr, errors.New("legacy Computer removal has no readable disk manifest"))
@@ -1749,9 +1765,14 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 		if !sameComputerStorageIdentity(manifest.Storage, *request.ComputerStorage) {
 			return InventoryRemovalResponse{}, errors.New("legacy Computer removal disk manifest does not match L1 Storage identity")
 		}
+		if _, mounted, mountErr := engine.computerDiskSystem().mountedSource(filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)); mountErr != nil {
+			return InventoryRemovalResponse{}, mountErr
+		} else if mounted {
+			return InventoryRemovalResponse{}, errors.New("legacy Computer removal disk remains mounted")
+		}
 		storage := manifest.Storage
 		computerStorage = &storage
-		if attempt, eligible, attemptErr := preparedComputerStorageRemovalAttempt(request.Removal, manifest); attemptErr != nil {
+		if attempt, eligible, attemptErr := preparedComputerStorageRemovalAttempt(request, root, manifest); attemptErr != nil {
 			return InventoryRemovalResponse{}, attemptErr
 		} else if eligible {
 			storageOnlyAttempt = &attempt
@@ -1785,23 +1806,54 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 	return InventoryRemovalResponse{Attempts: attempts}, nil
 }
 
-func preparedComputerStorageRemovalAttempt(removal ManagedVolumeRemovalAuthority, manifest computerDiskManifest) (RemovalAttemptManifest, bool, error) {
-	if !manifest.Prepared || manifest.Attached != nil || manifest.Pending != nil || manifest.PreviousDetachment != nil || manifest.Retirement != nil {
+func preparedComputerStorageRemovalAttempt(request InventoryRemovalRequest, root string, manifest computerDiskManifest) (RemovalAttemptManifest, bool, error) {
+	if !manifest.Prepared || manifest.Attached != nil || manifest.Pending != nil || manifest.PreviousDetachment != nil || manifest.Retirement != nil || manifest.LoopDevice != "" {
 		return RemovalAttemptManifest{}, false, nil
 	}
 	storage := manifest.Storage
+	witness, err := preparedComputerStorageWitness(root, manifest)
+	if err != nil {
+		return RemovalAttemptManifest{}, false, err
+	}
+	if witness == nil || !witness.Valid() || witness.NodeID != request.Removal.NodeID || witness.RootInstanceID != request.RootInstanceID ||
+		witness.JobID != request.Removal.JobID || witness.ComputerID != storage.ComputerID || witness.StorageID != storage.StorageID ||
+		witness.StorageGeneration != storage.StorageGeneration {
+		return RemovalAttemptManifest{}, false, nil
+	}
 	authority := AttemptAuthority{
-		NodeID: removal.NodeID, BootSessionID: removal.BootSessionID, JobID: removal.JobID,
-		AttemptID: fmt.Sprintf("storage-removal-%d", storage.StorageGeneration), FencingToken: removal.CleanupFence,
-		Class: contract.JobClassService, RemovalGeneration: fmt.Sprint(removal.RemovalGeneration),
+		NodeID: request.Removal.NodeID, BootSessionID: request.Removal.BootSessionID, JobID: request.Removal.JobID,
+		AttemptID: contract.StorageOnlyRemovalAttemptID(storage.StorageGeneration), FencingToken: request.Removal.CleanupFence,
+		Class: contract.JobClassService, RemovalGeneration: fmt.Sprint(request.Removal.RemovalGeneration),
 	}
 	if err := authority.validate(); err != nil {
 		return RemovalAttemptManifest{}, false, err
 	}
 	return RemovalAttemptManifest{
-		Authority: authority, ComputerStorage: &storage, StorageOnly: true,
+		Authority: authority, ComputerStorage: &storage, StorageOnly: true, StoragePreparation: witness,
 		Resources: expectedComputerStorageRemovalResources(&storage),
 	}, true, nil
+}
+
+func preparedComputerStorageWitness(root string, manifest computerDiskManifest) (*contract.ComputerStoragePreparationWitness, error) {
+	if receipt := manifest.PreparationReceipt; receipt != nil {
+		return &contract.ComputerStoragePreparationWitness{
+			Kind: receipt.Kind, ReceiptID: receipt.ReceiptID, NodeID: receipt.NodeID, RootInstanceID: receipt.RootInstanceID,
+			JobID: receipt.JobID, ComputerID: receipt.ComputerID, StorageID: receipt.StorageID,
+			StorageGeneration: receipt.NewGeneration, Revision: receipt.IntentRevision, Fence: receipt.CleanupFence,
+			HelperGeneration: receipt.HelperGeneration,
+		}, nil
+	}
+	copyManifest, present, err := readComputerStorageCopyManifest(filepath.Join(root, "storage-copy.json"))
+	if err != nil || !present || copyManifest.Phase != computerStorageCopyPublished || copyManifest.Receipt == nil {
+		return nil, err
+	}
+	receipt := copyManifest.Receipt
+	return &contract.ComputerStoragePreparationWitness{
+		Kind: receipt.Kind, ReceiptID: receipt.ReceiptID, NodeID: receipt.NodeID, RootInstanceID: receipt.RootInstanceID,
+		JobID: receipt.JobID, ComputerID: receipt.DestinationComputerID, StorageID: receipt.DestinationStorageID,
+		StorageGeneration: receipt.DestinationGeneration, Revision: receipt.OperationRevision, Fence: receipt.CleanupFence,
+		HelperGeneration: receipt.HelperGeneration,
+	}, nil
 }
 
 func (engine *ContainerdEngine) deleteServiceDataVolume(jobID string) error {

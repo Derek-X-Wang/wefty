@@ -67,6 +67,20 @@ func TestDeterministicResourceIdentityCarriesCompleteAuthority(t *testing.T) {
 	}
 }
 
+func TestRemovalInventorySeesReservedComputerAttemptBeforeEngineRun(t *testing.T) {
+	storage := &ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1}
+	session := &serverSession{attempts: map[string]*serverAttempt{
+		"reserved": {authority: AttemptAuthority{JobID: "service"}, state: attemptStarting, computerStorage: storage},
+	}}
+	if !session.hasLiveRemovalAttemptLocked("service", storage) {
+		t.Fatal("reserved attempt did not fence Storage-only inventory")
+	}
+	session.attempts["reserved"].state = attemptTombstoned
+	if session.hasLiveRemovalAttemptLocked("service", storage) {
+		t.Fatal("positively reaped tombstone still fenced inventory")
+	}
+}
+
 func TestProcessAttemptIdentityDoesNotRequireServiceVolumeJobID(t *testing.T) {
 	authority := testAuthority()
 	authority.JobID = strings.Repeat("x", 256)

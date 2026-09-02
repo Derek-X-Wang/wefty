@@ -22,9 +22,9 @@ semantic code.
 
 The first SIGINT or SIGTERM starts a graceful drain with a 30-second bound. A
 second signal is an explicit forced-shutdown transition: it cancels resident
-attempts immediately and emits `forced_shutdown transition=draining_to_forced
-reason=second_signal`, distinguishing operator abort from clean drain
-completion.
+attempts immediately and emits `forced_shutdown ... reason=second_signal`
+whether it arrives while Drain is joining residents or after Drain returns,
+distinguishing operator abort from clean drain completion.
 
 ## Capability observation and local admission
 
@@ -354,10 +354,16 @@ frozen removal manifest still binds every subsequent durable-data deletion and
 post-delete assertion. Legacy inventory reconstruction continues to require
 matching attempt authority and cannot upgrade an empty sweep into a manifest.
 The one no-attempt case is a Computer generation whose exact helper manifest is
-prepared, unattached, and has no prior attachment or retirement evidence. A
-current authenticated helper inventory may freeze that generation as
-Storage-only removal evidence; the agent records `no_runtime_resources` and
-does not manufacture lease, task, container, or other attempt rows.
+prepared by a durable reset/copy receipt, unattached, has no loop or mount, and
+has no prior attachment or retirement evidence. A current authenticated helper
+inventory may freeze that generation as Storage-only removal evidence only for
+every Storage generation claimed by the directive. The session still passes
+that evidence through the resident/admitted service barrier; only after both
+are clear may it record `no_runtime_resources` without signalling a guardian.
+The frozen manifest contains empty runtime identifiers and does not manufacture
+lease, task, container, or other attempt rows. After a reboot, prepared
+Storage-only evidence is re-inventoried and refreshed under the current helper
+session before it can produce a no-runtime receipt.
 
 For a Mac OCI one-shot that needs the run bridge, the agent asks Lima itself to
 resolve `host.lima.internal`, binds only that discovered guest-visible host

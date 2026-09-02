@@ -91,6 +91,35 @@ func TestSingleShutdownSignalDrainsToCompletionWithoutForcingCancellation(t *tes
 	<-done
 }
 
+func TestSecondShutdownSignalAfterDrainStillEmitsForcedShutdownEvidence(t *testing.T) {
+	ctx, cancelContext := context.WithCancel(t.Context())
+	defer cancelContext()
+	signals := make(chan os.Signal, 2)
+	drained := make(chan struct{})
+	canceled := make(chan struct{})
+	logs := make(chan string, 1)
+	go handleShutdownSignals(ctx, signals, func(context.Context) error {
+		close(drained)
+		return nil
+	}, func() { close(canceled) }, func(format string, _ ...any) { logs <- format })
+	signals <- os.Interrupt
+	<-drained
+	signals <- os.Interrupt
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("post-drain second signal did not cancel")
+	}
+	select {
+	case line := <-logs:
+		if !strings.Contains(line, "forced_shutdown") || !strings.Contains(line, "second_signal") {
+			t.Fatalf("forced shutdown evidence = %q", line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-drain second signal emitted no typed evidence")
+	}
+}
+
 type readyMainTestOCIBootBarrier struct{}
 
 func (readyMainTestOCIBootBarrier) Ready() bool                  { return true }

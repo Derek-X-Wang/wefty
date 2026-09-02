@@ -116,10 +116,22 @@ func validateRuntimeResourceManifest(manifest workloadrunner.RuntimeResourceMani
 		strings.TrimSpace(manifest.NodeID) == "" || strings.TrimSpace(manifest.BootSessionID) == "" ||
 		strings.TrimSpace(manifest.JobID) == "" || strings.TrimSpace(manifest.AttemptID) == "" ||
 		strings.TrimSpace(manifest.FencingToken) == "" || manifest.WorkloadClass != contract.JobClassService ||
-		strings.TrimSpace(manifest.RemovalGeneration) == "" || strings.TrimSpace(manifest.LeaseID) == "" ||
-		strings.TrimSpace(manifest.TaskID) == "" || strings.TrimSpace(manifest.ContainerID) == "" ||
-		strings.TrimSpace(manifest.SnapshotID) == "" || strings.TrimSpace(manifest.ShimID) == "" ||
-		strings.TrimSpace(manifest.CgroupID) == "" || strings.TrimSpace(manifest.LogSegmentDirectory) == "" {
+		strings.TrimSpace(manifest.RemovalGeneration) == "" {
+		return errors.New("agent: runtime attempt manifest is incomplete")
+	}
+	if manifest.StorageOnly {
+		if manifest.StoragePreparation == nil || !manifest.StoragePreparation.Valid() || manifest.ComputerStorage == nil ||
+			!contract.ValidStorageOnlyRemovalAttemptID(manifest.AttemptID, manifest.ComputerStorage.StorageGeneration) ||
+			manifest.StoragePreparation.NodeID != manifest.NodeID || manifest.StoragePreparation.JobID != manifest.JobID ||
+			manifest.StoragePreparation.ComputerID != manifest.ComputerStorage.ComputerID ||
+			manifest.StoragePreparation.StorageID != manifest.ComputerStorage.StorageID ||
+			manifest.StoragePreparation.StorageGeneration != manifest.ComputerStorage.StorageGeneration {
+			return errors.New("agent: Storage-only removal manifest lacks durable preparation evidence")
+		}
+	} else if strings.TrimSpace(manifest.LeaseID) == "" || strings.TrimSpace(manifest.TaskID) == "" ||
+		strings.TrimSpace(manifest.ContainerID) == "" || strings.TrimSpace(manifest.SnapshotID) == "" ||
+		strings.TrimSpace(manifest.ShimID) == "" || strings.TrimSpace(manifest.CgroupID) == "" ||
+		strings.TrimSpace(manifest.LogSegmentDirectory) == "" {
 		return errors.New("agent: runtime attempt manifest is incomplete")
 	}
 	hasServiceData := strings.TrimSpace(manifest.ServiceDataVolume) != "" || strings.TrimSpace(manifest.ServiceDataOwnerRecord) != ""
@@ -243,13 +255,21 @@ ON CONFLICT(job_id) DO NOTHING`, removal.jobID, removal.generation, removal.clea
 		return fmt.Errorf("agent: persist reconstructed runtime removal manifest: %w", err)
 	}
 	var persisted []byte
-	if err := tx.QueryRowContext(ctx, `SELECT manifest_json FROM runtime_removal_manifests
+	var persistedPhase runtimeRemovalPhase
+	if err := tx.QueryRowContext(ctx, `SELECT manifest_json, phase FROM runtime_removal_manifests
 WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id=?`, removal.jobID,
-		removal.generation, removal.cleanupFence, removal.rootInstanceID).Scan(&persisted); err != nil {
+		removal.generation, removal.cleanupFence, removal.rootInstanceID).Scan(&persisted, &persistedPhase); err != nil {
 		return fmt.Errorf("agent: read reconstructed runtime removal manifest: %w", err)
 	}
 	if !bytes.Equal(persisted, payload) {
-		return fmt.Errorf("agent: reconstructed runtime removal manifest for job %q conflicts with persisted inventory", removal.jobID)
+		var prior runtimeRemovalManifest
+		if json.Unmarshal(persisted, &prior) != nil || persistedPhase != runtimeRemovalPrepared || !sameStorageOnlyInventory(prior, manifest) {
+			return fmt.Errorf("agent: reconstructed runtime removal manifest for job %q conflicts with persisted inventory", removal.jobID)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE runtime_removal_manifests SET manifest_json=?, prepared_ns=?
+WHERE job_id=? AND phase=?`, payload, preparedAt.UTC().Round(0).UnixNano(), removal.jobID, runtimeRemovalPrepared); err != nil {
+			return fmt.Errorf("agent: refresh reconstructed runtime removal manifest: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("agent: commit reconstructed runtime removal manifest: %w", err)
@@ -260,6 +280,21 @@ WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id
 		}
 	}
 	return nil
+}
+
+func sameStorageOnlyInventory(left, right runtimeRemovalManifest) bool {
+	if left.JobID != right.JobID || left.RemovalGeneration != right.RemovalGeneration || len(left.Attempts) != len(right.Attempts) {
+		return false
+	}
+	for index := range left.Attempts {
+		oldAttempt, newAttempt := left.Attempts[index], right.Attempts[index]
+		if !oldAttempt.StorageOnly || !newAttempt.StorageOnly || oldAttempt.ComputerStorage == nil || newAttempt.ComputerStorage == nil ||
+			oldAttempt.StoragePreparation == nil || newAttempt.StoragePreparation == nil ||
+			*oldAttempt.ComputerStorage != *newAttempt.ComputerStorage || *oldAttempt.StoragePreparation != *newAttempt.StoragePreparation {
+			return false
+		}
+	}
+	return true
 }
 
 func (spool *logSpool) runtimeRemoval(ctx context.Context, jobID string) (runtimeRemovalRecord, bool, error) {
@@ -342,6 +377,19 @@ func validRuntimeRemovalRecord(record runtimeRemovalRecord) bool {
 	if record.removal.jobID == "" || record.removal.generation == 0 || record.removal.cleanupFence == "" || record.removal.rootInstanceID == "" ||
 		record.manifest.JobID != record.removal.jobID || record.manifest.RemovalGeneration != record.removal.generation {
 		return false
+	}
+	for _, attempt := range record.manifest.Attempts {
+		if attempt.StorageOnly && (attempt.FencingToken != record.removal.cleanupFence || attempt.StoragePreparation == nil ||
+			attempt.StoragePreparation.RootInstanceID != record.removal.rootInstanceID) {
+			return false
+		}
+	}
+	if record.receipt.Evidence == workloadrunner.ReapEvidenceNoRuntime {
+		for _, attempt := range record.manifest.Attempts {
+			if !attempt.StorageOnly || attempt.BootSessionID != record.receipt.BootSessionID {
+				return false
+			}
+		}
 	}
 	switch record.phase {
 	case runtimeRemovalPrepared:

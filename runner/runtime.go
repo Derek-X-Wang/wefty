@@ -183,26 +183,27 @@ type ComputerStorage struct {
 // bind source paths are deliberately absent because removal must never traverse
 // or delete them.
 type RuntimeResourceManifest struct {
-	Version                int              `json:"version"`
-	RuntimeKind            string           `json:"runtime_kind"`
-	NodeID                 string           `json:"node_id"`
-	BootSessionID          string           `json:"boot_session_id"`
-	JobID                  string           `json:"job_id"`
-	AttemptID              string           `json:"attempt_id"`
-	FencingToken           string           `json:"fencing_token"`
-	WorkloadClass          string           `json:"workload_class"`
-	RemovalGeneration      string           `json:"removal_generation"`
-	LeaseID                string           `json:"lease_id"`
-	TaskID                 string           `json:"task_id"`
-	ContainerID            string           `json:"container_id"`
-	SnapshotID             string           `json:"snapshot_id"`
-	ShimID                 string           `json:"shim_id"`
-	CgroupID               string           `json:"cgroup_id"`
-	LogSegmentDirectory    string           `json:"log_segment_directory"`
-	HandoffVolume          string           `json:"handoff_volume,omitempty"`
-	ServiceDataVolume      string           `json:"service_data_volume,omitempty"`
-	ServiceDataOwnerRecord string           `json:"service_data_owner_record,omitempty"`
-	ComputerStorage        *ComputerStorage `json:"computer_storage,omitempty"`
+	Version                int                                         `json:"version"`
+	RuntimeKind            string                                      `json:"runtime_kind"`
+	NodeID                 string                                      `json:"node_id"`
+	BootSessionID          string                                      `json:"boot_session_id"`
+	JobID                  string                                      `json:"job_id"`
+	AttemptID              string                                      `json:"attempt_id"`
+	FencingToken           string                                      `json:"fencing_token"`
+	WorkloadClass          string                                      `json:"workload_class"`
+	RemovalGeneration      string                                      `json:"removal_generation"`
+	LeaseID                string                                      `json:"lease_id"`
+	TaskID                 string                                      `json:"task_id"`
+	ContainerID            string                                      `json:"container_id"`
+	SnapshotID             string                                      `json:"snapshot_id"`
+	ShimID                 string                                      `json:"shim_id"`
+	CgroupID               string                                      `json:"cgroup_id"`
+	LogSegmentDirectory    string                                      `json:"log_segment_directory"`
+	HandoffVolume          string                                      `json:"handoff_volume,omitempty"`
+	ServiceDataVolume      string                                      `json:"service_data_volume,omitempty"`
+	ServiceDataOwnerRecord string                                      `json:"service_data_owner_record,omitempty"`
+	ComputerStorage        *ComputerStorage                            `json:"computer_storage,omitempty"`
+	StoragePreparation     *contract.ComputerStoragePreparationWitness `json:"storage_preparation,omitempty"`
 	// StorageOnly reuses the shared removal manifest for a reset predecessor
 	// after successor publication. No synthetic runtime rows are invented.
 	StorageOnly bool `json:"storage_only,omitempty"`
@@ -299,6 +300,7 @@ type RuntimeRemovalProofRequest struct {
 	JobID             string
 	RemovalGeneration uint64
 	CleanupFence      string
+	RootInstanceID    string
 	ComputerStorage   *ComputerStorage
 	Attempts          []RuntimeResourceManifest
 }
