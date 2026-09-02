@@ -70,6 +70,6 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     (.rows["linux.guest_authority"].not_run_reason | contains("complete M3 OCI matrix")) and
     (.rows["linux.guest_authority"].evidence.blocked_assertion | contains("root Run"))
    end) and
-  (.rows["linux.removal"].evidence.inventory_source == "helper VerifyNamespace route") and
+  (.rows["linux.removal"].evidence.inventory_source == "helper VerifyNamespaceReadOnly route") and
   (.residue_inventories.post_removal_helper_namespace | type == "object")
 ' "$receipt" >/dev/null
