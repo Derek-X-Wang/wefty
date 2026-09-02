@@ -847,9 +847,11 @@ CREATE TABLE IF NOT EXISTS service_removals (
   cleanup_fence TEXT NOT NULL,
   root_instance_id TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('removal_pending', 'agent_cleaned', 'removed_verified', 'forgotten_cleanup_unverified')),
+  cleanup_status TEXT NOT NULL DEFAULT 'pending' CHECK(cleanup_status IN ('pending', 'quarantined', 'acknowledged')),
   requested_ns INTEGER NOT NULL,
   cleanup_acknowledgement_key TEXT,
   cleanup_acknowledgement_hash TEXT,
+  cleanup_quarantine_json BLOB,
   agent_cleaned_ns INTEGER,
   removed_ns INTEGER
 );
@@ -940,6 +942,20 @@ INSERT OR IGNORE INTO job_log_jsonl(job_id, jsonl) SELECT job_id, X'' FROM jobs;
 	}
 	if err := s.ensureColumn(ctx, "computer_storage_copy_operations", "cleanup_quarantine_json", "BLOB"); err != nil {
 		return err
+	}
+	if err := s.ensureColumn(ctx, "service_removals", "cleanup_quarantine_json", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "service_removals", "cleanup_status", "TEXT NOT NULL DEFAULT 'pending' CHECK(cleanup_status IN ('pending', 'quarantined', 'acknowledged'))"); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE service_removals SET cleanup_status='acknowledged'
+		WHERE cleanup_acknowledgement_key IS NOT NULL AND cleanup_status='pending'`); err != nil {
+		return fmt.Errorf("l1: backfill service removal cleanup status: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE service_removals SET cleanup_status='quarantined'
+		WHERE cleanup_quarantine_json IS NOT NULL AND cleanup_acknowledgement_key IS NULL AND cleanup_status='pending'`); err != nil {
+		return fmt.Errorf("l1: backfill quarantined service removal cleanup status: %w", err)
 	}
 	if err := s.migrateComputerResetConstraints(ctx); err != nil {
 		return err

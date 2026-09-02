@@ -7,7 +7,8 @@ import (
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
-func storageCleanupQuarantineAcknowledgement(err error, rootInstanceID string) (l1.RemovalAcknowledgementRequest, bool) {
+func storageCleanupQuarantineAcknowledgement(err error, rootInstanceID string,
+	operation l1.ComputerStorageCleanupOperation) (l1.RemovalAcknowledgementRequest, bool) {
 	var quarantined *workloadrunner.ManagedVolumeCleanupQuarantinedError
 	if !errors.As(err, &quarantined) {
 		return l1.RemovalAcknowledgementRequest{}, false
@@ -16,7 +17,7 @@ func storageCleanupQuarantineAcknowledgement(err error, rootInstanceID string) (
 	return l1.RemovalAcknowledgementRequest{NodeID: receipt.Removal.NodeID, BootSessionID: receipt.Removal.BootSessionID,
 		RemovalGeneration: receipt.Removal.RemovalGeneration, CleanupFence: receipt.Removal.CleanupFence,
 		RootInstanceID: rootInstanceID, IdempotencyKey: receipt.ReceiptID,
-		CleanupQuarantine: &l1.ComputerStorageCleanupQuarantine{Kind: receipt.Kind, ReceiptID: receipt.ReceiptID,
+		CleanupQuarantine: &l1.ComputerStorageCleanupQuarantine{Kind: receipt.Kind, Operation: operation, ReceiptID: receipt.ReceiptID,
 			VolumeKind: string(receipt.VolumeKind), ComputerID: receipt.ComputerStorage.ComputerID, StorageID: receipt.ComputerStorage.StorageID,
 			StorageGeneration: receipt.ComputerStorage.StorageGeneration, NodeID: receipt.Removal.NodeID,
 			BootSessionID: receipt.Removal.BootSessionID, JobID: receipt.Removal.JobID,

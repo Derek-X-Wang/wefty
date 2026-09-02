@@ -20,6 +20,7 @@ type serviceRemovalRow struct {
 	cleanupFence        string
 	rootInstanceID      string
 	status              contract.JobState
+	cleanupStatus       ServiceRemovalCleanupStatus
 	requestedAt         time.Time
 	acknowledgedAt      *time.Time
 	removedAt           *time.Time
@@ -143,7 +144,7 @@ func (s *Store) RemoveService(ctx context.Context, jobID string) (Job, error) {
 	removal := serviceRemovalRow{
 		boundNodeID: boundNodeID.String, generation: InitialServiceRemovalGeneration,
 		cleanupFence: newID("cleanup"), rootInstanceID: rootInstanceID.String,
-		status: contract.JobRemovalPending, requestedAt: now,
+		status: contract.JobRemovalPending, cleanupStatus: ServiceRemovalCleanupPending, requestedAt: now,
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO service_removals(
 		job_id, bound_node_id, removal_generation, cleanup_fence, root_instance_id, status, requested_ns
@@ -250,7 +251,9 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 		LEFT JOIN computer_job_projections ON computer_job_projections.job_id=service_removals.job_id
 		LEFT JOIN computers ON computers.computer_id=computer_job_projections.computer_id
 		WHERE service_removals.bound_node_id=? AND service_removals.status IN (?, ?)
-		ORDER BY service_removals.requested_ns, service_removals.job_id`, nodeID, contract.JobRemovalPending, contract.JobForgottenCleanupUnverified)
+		AND service_removals.cleanup_status=?
+		ORDER BY service_removals.requested_ns, service_removals.job_id`, nodeID, contract.JobRemovalPending,
+		contract.JobForgottenCleanupUnverified, ServiceRemovalCleanupPending)
 	if err != nil {
 		return nil, internalError(err, "list service removal directives")
 	}
@@ -279,28 +282,11 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 			}
 			directive.ComputerStorage = &ComputerStorageClaim{ComputerID: computerID.String, StorageID: storageID.String,
 				StorageGeneration: storageGeneration.Int64}
-			directive.ComputerStorageGenerations = &ComputerStorageGenerationClaims{Generations: []ComputerStorageGenerationClaim{}}
-			generationRows, generationErr := s.db.QueryContext(ctx, `SELECT computer_id, storage_id, storage_generation, disk_bytes
-				FROM computer_storage_generations WHERE computer_id=?
-				UNION
-				SELECT destination_computer_id, destination_storage_id, destination_generation, destination_size
-				FROM computer_storage_copy_operations
-				WHERE source_computer_id=? AND operation='clone' AND status='superseded'
-				ORDER BY storage_generation`, computerID.String, computerID.String)
+			generations, generationErr := listComputerRemovalStorageGenerations(ctx, s.db, computerID.String)
 			if generationErr != nil {
-				return nil, internalError(generationErr, "list Computer Storage removal generations")
+				return nil, generationErr
 			}
-			for generationRows.Next() {
-				var generation ComputerStorageGenerationClaim
-				if err := generationRows.Scan(&generation.ComputerID, &generation.StorageID, &generation.StorageGeneration, &generation.DiskBytes); err != nil {
-					generationRows.Close()
-					return nil, internalError(err, "scan Computer Storage removal generation")
-				}
-				directive.ComputerStorageGenerations.Generations = append(directive.ComputerStorageGenerations.Generations, generation)
-			}
-			if err := generationRows.Close(); err != nil {
-				return nil, internalError(err, "close Computer Storage removal generations")
-			}
+			directive.ComputerStorageGenerations = &ComputerStorageGenerationClaims{Generations: generations}
 			if len(directive.ComputerStorageGenerations.Generations) == 0 {
 				return nil, internalError(errors.New("Computer removal has no Storage generations"), "list Computer Storage removal generations")
 			}
@@ -376,6 +362,32 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 	return directives, nil
 }
 
+func listComputerRemovalStorageGenerations(ctx context.Context, q nodeQueryer, computerID string) ([]ComputerStorageGenerationClaim, error) {
+	rows, err := q.QueryContext(ctx, `SELECT computer_id, storage_id, storage_generation, disk_bytes
+		FROM computer_storage_generations WHERE computer_id=?
+		UNION
+		SELECT destination_computer_id, destination_storage_id, destination_generation, destination_size
+		FROM computer_storage_copy_operations
+		WHERE source_computer_id=? AND operation='clone' AND status='superseded'
+		ORDER BY storage_generation`, computerID, computerID)
+	if err != nil {
+		return nil, internalError(err, "list Computer Storage removal generations")
+	}
+	defer rows.Close()
+	var generations []ComputerStorageGenerationClaim
+	for rows.Next() {
+		var generation ComputerStorageGenerationClaim
+		if err := rows.Scan(&generation.ComputerID, &generation.StorageID, &generation.StorageGeneration, &generation.DiskBytes); err != nil {
+			return nil, internalError(err, "scan Computer Storage removal generation")
+		}
+		generations = append(generations, generation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate Computer Storage removal generations")
+	}
+	return generations, nil
+}
+
 // AcknowledgeServiceRemoval records a deletion attestation. It never performs
 // filesystem inspection or deletion; the authenticated node asserts that
 // those operations already completed.
@@ -447,9 +459,37 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 	if err := validateMutableAcknowledgement(ctx, tx, identityNodeID, request, removal); err != nil {
 		return Job{}, err
 	}
-	if computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID); mapErr != nil {
+	if removal.cleanupStatus == ServiceRemovalCleanupQuarantined && request.CleanupQuarantine == nil {
+		return Job{}, protocolError(contract.ErrorConflict,
+			"Computer removal cleanup is quarantined; ordinary acknowledgement cannot resolve it")
+	}
+	if request.CleanupQuarantine != nil && removal.status != contract.JobRemovalPending {
+		return Job{}, protocolError(contract.ErrorConflict,
+			"service removal state %q cannot accept cleanup quarantine evidence", removal.status)
+	}
+	computerID, mapped, mapErr := computerIDForJob(ctx, tx, jobID)
+	if mapErr != nil {
 		return Job{}, mapErr
-	} else if mapped {
+	}
+	if request.CleanupQuarantine != nil {
+		if !mapped {
+			return Job{}, protocolError(contract.ErrorInvalidRequest, "cleanup quarantine evidence is valid only for Computer removal")
+		}
+		if err := recordComputerRemovalCleanupQuarantine(ctx, tx, jobID, computerID, removal, request); err != nil {
+			return Job{}, err
+		}
+		removal.cleanupStatus = ServiceRemovalCleanupQuarantined
+		job, err := getJobByID(ctx, tx, jobID, now)
+		if err != nil {
+			return Job{}, internalError(err, "read quarantined Computer removal")
+		}
+		applyServiceRemoval(&job, removal)
+		if err := tx.Commit(); err != nil {
+			return Job{}, internalError(err, "commit Computer removal cleanup quarantine")
+		}
+		return job, nil
+	}
+	if mapped {
 		var outstandingCopies, outstandingSuperseded, outstandingRestorePrecommits int64
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backup_copies bc
 			JOIN backups b ON b.backup_id=bc.backup_id
@@ -492,8 +532,8 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 	if removal.status == contract.JobForgottenCleanupUnverified {
 		nextStatus = contract.JobForgottenCleanupUnverified
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE service_removals SET status=?, cleanup_acknowledgement_key=?,
-		cleanup_acknowledgement_hash=?, agent_cleaned_ns=? WHERE job_id=?`, nextStatus,
+	if _, err := tx.ExecContext(ctx, `UPDATE service_removals SET status=?, cleanup_status=?, cleanup_acknowledgement_key=?,
+		cleanup_acknowledgement_hash=?, agent_cleaned_ns=? WHERE job_id=?`, nextStatus, ServiceRemovalCleanupAcknowledged,
 		request.IdempotencyKey, bodyHash, now.UnixNano(), jobID); err != nil {
 		return Job{}, internalError(err, "persist removal acknowledgement")
 	}
@@ -501,6 +541,7 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 		return Job{}, internalError(err, "project removal acknowledgement")
 	}
 	removal.status = nextStatus
+	removal.cleanupStatus = ServiceRemovalCleanupAcknowledged
 	removal.acknowledgementKey = sql.NullString{String: request.IdempotencyKey, Valid: true}
 	removal.acknowledgementHash = sql.NullString{String: bodyHash, Valid: true}
 	removal.acknowledgedAt = &now
@@ -513,6 +554,60 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 		return Job{}, internalError(err, "commit removal acknowledgement")
 	}
 	return job, nil
+}
+
+func recordComputerRemovalCleanupQuarantine(ctx context.Context, tx *sql.Tx, jobID, computerID string,
+	removal serviceRemovalRow, request RemovalAcknowledgementRequest) error {
+	receipt := request.CleanupQuarantine
+	if receipt == nil {
+		return protocolError(contract.ErrorInvalidRequest, "Computer removal cleanup quarantine receipt is required")
+	}
+	claims, err := listComputerRemovalStorageGenerations(ctx, tx, computerID)
+	if err != nil {
+		return err
+	}
+	var authorized *ComputerStorageGenerationClaim
+	for index := range claims {
+		claim := &claims[index]
+		if claim.ComputerID == receipt.ComputerID && claim.StorageID == receipt.StorageID &&
+			claim.StorageGeneration == receipt.StorageGeneration {
+			authorized = claim
+			break
+		}
+	}
+	if authorized == nil {
+		return protocolError(contract.ErrorInvalidRequest, "Computer removal cleanup quarantine names unowned Storage")
+	}
+	if err := validateComputerStorageCleanupQuarantine(*receipt, ComputerStorageCleanupRemoval,
+		authorized.ComputerID, authorized.StorageID, authorized.StorageGeneration, removal.boundNodeID,
+		request.BootSessionID, jobID, removal.generation, removal.cleanupFence); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		return internalError(err, "encode Computer removal cleanup quarantine")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE service_removals SET cleanup_status=?, cleanup_quarantine_json=?
+		WHERE job_id=? AND status=? AND cleanup_quarantine_json IS NULL`, ServiceRemovalCleanupQuarantined,
+		payload, jobID, contract.JobRemovalPending)
+	if err != nil {
+		return internalError(err, "record Computer removal cleanup quarantine")
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "inspect Computer removal cleanup quarantine")
+	}
+	if affected == 1 {
+		return nil
+	}
+	var existing []byte
+	if err := tx.QueryRowContext(ctx, `SELECT cleanup_quarantine_json FROM service_removals WHERE job_id=?`, jobID).Scan(&existing); err != nil {
+		return internalError(err, "read Computer removal cleanup quarantine replay")
+	}
+	if string(existing) != string(payload) {
+		return protocolError(contract.ErrorIdempotencyConflict, "Computer removal cleanup quarantine replay differs from durable evidence")
+	}
+	return nil
 }
 
 // FinalizeServiceRemoval performs phase four in a transaction separate from
@@ -553,8 +648,9 @@ func finalizeServiceRemovalTx(ctx context.Context, tx *sql.Tx, jobID string, now
 	if err != nil {
 		return Job{}, false, internalError(err, "read service removal finalization")
 	}
-	eligible := removal.status == contract.JobAgentCleaned ||
-		(removal.status == contract.JobForgottenCleanupUnverified && removal.acknowledgedAt != nil)
+	eligible := removal.cleanupStatus == ServiceRemovalCleanupAcknowledged &&
+		(removal.status == contract.JobAgentCleaned ||
+			(removal.status == contract.JobForgottenCleanupUnverified && removal.acknowledgedAt != nil))
 	if !eligible {
 		job, readErr := getJobByID(ctx, tx, jobID, now)
 		if readErr != nil {
@@ -747,14 +843,14 @@ func readServiceRemoval(ctx context.Context, q queryer, jobID string) (serviceRe
 	var acknowledgedNS, removedNS sql.NullInt64
 	var outcome sql.NullString
 	err := q.QueryRowContext(ctx, `SELECT service_removals.bound_node_id, service_removals.removal_generation,
-		service_removals.cleanup_fence, service_removals.root_instance_id, service_removals.status,
+		service_removals.cleanup_fence, service_removals.root_instance_id, service_removals.status, service_removals.cleanup_status,
 		service_removals.requested_ns, service_removals.cleanup_acknowledgement_key,
 		service_removals.cleanup_acknowledgement_hash, service_removals.agent_cleaned_ns,
 		service_removals.removed_ns, service_tombstones.outcome
 		FROM service_removals
 		LEFT JOIN service_tombstones ON service_tombstones.job_id=service_removals.job_id
 		WHERE service_removals.job_id=?`, jobID).Scan(&row.boundNodeID, &row.generation,
-		&row.cleanupFence, &row.rootInstanceID, &row.status, &requestedNS,
+		&row.cleanupFence, &row.rootInstanceID, &row.status, &row.cleanupStatus, &requestedNS,
 		&row.acknowledgementKey, &row.acknowledgementHash, &acknowledgedNS, &removedNS, &outcome)
 	if err != nil {
 		return serviceRemovalRow{}, err
@@ -779,10 +875,14 @@ func applyServiceRemoval(job *Job, removal serviceRemovalRow) {
 	job.NodeID = ""
 	job.CurrentAttemptID = ""
 	job.ServiceJob = nil
+	outcome := removal.outcome
+	if removal.cleanupStatus == ServiceRemovalCleanupQuarantined {
+		outcome = ServiceRemovalOutcomeCleanupQuarantined
+	}
 	job.Removal = &ServiceRemoval{
 		RemovalDesiredState: contract.ServiceDesiredRemoved, RemovalBoundNodeID: removal.boundNodeID,
 		RemovalGeneration: removal.generation, RemovalRequestedAt: removal.requestedAt,
-		RemovalOutcome: removal.outcome, RemovedAt: removal.removedAt,
+		CleanupStatus: removal.cleanupStatus, RemovalOutcome: outcome, RemovedAt: removal.removedAt,
 		CleanupAcknowledgedAt: removal.acknowledgedAt,
 	}
 }
@@ -840,12 +940,18 @@ func (row serviceTombstoneRow) job() Job {
 		state = contract.JobForgottenCleanupUnverified
 	}
 	removedAt := row.removedAt
+	cleanupStatus := ServiceRemovalCleanupPending
+	if row.lastBoundNodeID == "" {
+		cleanupStatus = ServiceRemovalCleanupNotRequired
+	} else if row.cleanupAcknowledgedAt != nil {
+		cleanupStatus = ServiceRemovalCleanupAcknowledged
+	}
 	return Job{
 		JobID: row.jobID, State: state, CreatedAt: row.createdAt, UpdatedAt: row.removedAt,
 		Removal: &ServiceRemoval{
 			RemovalDesiredState: contract.ServiceDesiredRemoved, RemovalBoundNodeID: row.lastBoundNodeID,
 			RemovalGeneration: row.removalGeneration, RemovalRequestedAt: row.removalRequestedAt,
-			RemovalOutcome: row.outcome, RemovedAt: &removedAt,
+			CleanupStatus: cleanupStatus, RemovalOutcome: row.outcome, RemovedAt: &removedAt,
 			CleanupAcknowledgedAt: row.cleanupAcknowledgedAt,
 		},
 	}

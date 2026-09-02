@@ -131,13 +131,16 @@ func TestL1ClientPublishesDurableComputerIntentSurface(t *testing.T) {
 	if _, embedded := properties["intent_history"]; embedded {
 		t.Fatal("Computer authority response must not materialize unbounded intent history")
 	}
+	if _, present := properties["storage_cleanup_quarantines"]; !present {
+		t.Fatal("Computer authority response omits typed Storage cleanup quarantine evidence")
+	}
 	if _, present := schemas["ComputerIntentList"]; !present {
 		t.Fatal("common schema is missing paginated ComputerIntentList")
 	}
 	if _, present := schemas["ComputerStorageGenerationList"]; !present {
 		t.Fatal("common schema is missing Computer Storage generation evidence")
 	}
-	for _, name := range []string{"StorageProvenance", "ComputerCustodyBranch", "ComputerStorageProvenance", "BackupCopy", "Backup", "BackupList", "ComputerBackupOperationOutcome", "ComputerBackupDirective", "ComputerBackupPruneDirective"} {
+	for _, name := range []string{"StorageProvenance", "ComputerCustodyBranch", "ComputerStorageProvenance", "ComputerStorageCleanupQuarantine", "BackupCopy", "Backup", "BackupList", "ComputerBackupOperationOutcome", "ComputerBackupDirective", "ComputerBackupPruneDirective"} {
 		if _, present := schemas[name]; !present {
 			t.Errorf("common schema is missing %s", name)
 		}

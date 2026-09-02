@@ -152,7 +152,7 @@ func (controller *storageCopyController) retirePredecessor(ctx context.Context, 
 			BootSessionID: controller.bootSessionID, JobID: directive.JobID, PriorJobID: directive.JobID,
 			RemovalGeneration: generation, CleanupFence: directive.CleanupFence},
 	}); err != nil {
-		if acknowledgement, quarantined := storageCleanupQuarantineAcknowledgement(err, directive.RootInstanceID); quarantined {
+		if acknowledgement, quarantined := storageCleanupQuarantineAcknowledgement(err, directive.RootInstanceID, l1.ComputerStorageCleanupRestore); quarantined {
 			_, acknowledgementErr := controller.client.AcknowledgeComputerRestoreRetirement(ctx, directive.DestinationComputerID, acknowledgement)
 			return errors.Join(err, acknowledgementErr)
 		}

@@ -171,16 +171,189 @@ func TestComputerCLIRealRoutesDefaultsLifecycleAndReplay(t *testing.T) {
 	}
 
 	removeSubject := createComputerCLIProjection(t, ctx, harness.clients, "remove-subject", "remove-subject")
-	removeBytes := runServiceCLI(t, ctx, harness.clients, true, "services", "remove", removeSubject.ComputerID, "--expect-current")
+	removeBytes := runServiceCLI(t, ctx, harness.clients, true, "services", "remove", removeSubject.ComputerID,
+		"--expect-current", "--wait", "100ms", "--poll-interval", "1ms")
 	var removed computerOperatorProjection
 	if err := json.Unmarshal(removeBytes, &removed); err != nil || removed.DesiredState != contract.ServiceDesiredRemoved ||
 		removed.CurrentJob.State != contract.JobRemovedVerified || removed.RemovalOutcome != "removed_verified" ||
-		removed.MutationApplied == nil || !*removed.MutationApplied {
+		removed.MutationApplied == nil || !*removed.MutationApplied || removed.Observation == nil || removed.Observation.Status != "observed" {
 		t.Fatalf("remove projection = %#v, err=%v", removed, err)
 	}
 	removeReplay := runServiceCLI(t, ctx, harness.clients, true, "services", "remove", removeSubject.ComputerID, "--expect-current")
 	if err := json.Unmarshal(removeReplay, &removed); err != nil || removed.MutationApplied == nil || *removed.MutationApplied {
 		t.Fatalf("remove replay projection = %#v, err=%v", removed, err)
+	}
+}
+
+func TestComputerCLIRemoveWaitsForDefinitiveSlotReleasingOutcome(t *testing.T) {
+	harness, computer, node, _ := newRunningComputerCLIFixture(t, "remove-wait")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	finalized := make(chan error, 1)
+	pendingObserved := make(chan struct{})
+	allowFinalize := make(chan struct{})
+	go func() {
+		for {
+			directives, err := harness.store.ListNodeRemovalDirectives(ctx, "fabric-"+node.NodeID, node.NodeID, node.BootSessionID)
+			if err != nil {
+				finalized <- err
+				return
+			}
+			if len(directives) == 0 {
+				if err := harness.clients.wait(ctx, time.Millisecond); err != nil {
+					finalized <- err
+					return
+				}
+				continue
+			}
+			directive := directives[0]
+			nodes, err := harness.clients.listNodes(ctx)
+			if err != nil || len(nodes.Nodes) != 1 || nodes.Nodes[0].NodeID != node.NodeID || nodes.Nodes[0].ServiceOccupancy != 1 {
+				finalized <- fmt.Errorf("pending removal nodes = %#v err=%v", nodes, err)
+				return
+			}
+			close(pendingObserved)
+			select {
+			case <-allowFinalize:
+			case <-ctx.Done():
+				finalized <- ctx.Err()
+				return
+			}
+			_, err = harness.store.AcknowledgeServiceRemoval(ctx, "fabric-"+node.NodeID, computer.CurrentJobID,
+				l1.RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+					RootInstanceID: directive.RootInstanceID, IdempotencyKey: "remove-wait-cleaned"})
+			if err != nil {
+				finalized <- err
+				return
+			}
+			_, changed, err := harness.store.FinalizeServiceRemoval(ctx, computer.CurrentJobID)
+			if err == nil && !changed {
+				err = errors.New("Computer removal acknowledgement did not finalize")
+			}
+			finalized <- err
+			return
+		}
+	}()
+
+	var stdout, stderr bytes.Buffer
+	executeDone := make(chan error, 1)
+	go func() {
+		executeDone <- execute(ctx, harness.clients, true, []string{"services", "remove", computer.ComputerID,
+			"--expect-current", "--wait", "1s", "--poll-interval", "1ms"}, &stdout, &stderr)
+	}()
+	select {
+	case <-pendingObserved:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case err := <-executeDone:
+		t.Fatalf("Computer remove returned while the pending removal held its Slot: %v", err)
+	default:
+	}
+	close(allowFinalize)
+	err := <-executeDone
+	if err != nil {
+		t.Fatalf("await Computer removal: %v stderr=%s", err, stderr.String())
+	}
+	if err := <-finalized; err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := harness.clients.listNodes(ctx)
+	if err != nil || len(nodes.Nodes) != 1 || nodes.Nodes[0].NodeID != node.NodeID || nodes.Nodes[0].ServiceOccupancy != 0 {
+		t.Fatalf("awaited removal nodes = %#v err=%v", nodes, err)
+	}
+	var removed computerOperatorProjection
+	if err := json.Unmarshal(stdout.Bytes(), &removed); err != nil || removed.CurrentJob.State != contract.JobRemovedVerified ||
+		removed.RemovalOutcome != "removed_verified" ||
+		removed.CurrentJob.Removal == nil || removed.CurrentJob.Removal.CleanupAcknowledgedAt == nil ||
+		removed.Observation == nil || removed.Observation.Status != "observed" {
+		t.Fatalf("awaited Computer removal = %#v decode=%v output=%s", removed, err, stdout.String())
+	}
+}
+
+func TestComputerCLIRemoveWaitReturnsTypedCleanupQuarantine(t *testing.T) {
+	harness, computer, node, _ := newRunningComputerCLIFixture(t, "remove-quarantine")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	acknowledged := make(chan error, 1)
+	go func() {
+		for {
+			directives, err := harness.store.ListNodeRemovalDirectives(ctx, "fabric-"+node.NodeID, node.NodeID, node.BootSessionID)
+			if err != nil {
+				acknowledged <- err
+				return
+			}
+			if len(directives) == 0 {
+				if err := harness.clients.wait(ctx, time.Millisecond); err != nil {
+					acknowledged <- err
+					return
+				}
+				continue
+			}
+			directive := directives[0]
+			receipt := l1.ComputerStorageCleanupQuarantine{
+				Kind: "managed_volume_cleanup_quarantined", Operation: l1.ComputerStorageCleanupRemoval,
+				ReceiptID: "remove-quarantine-receipt", VolumeKind: "computer_disk",
+				ComputerID: computer.ComputerID, StorageID: computer.StorageID, StorageGeneration: computer.StorageGeneration,
+				NodeID: node.NodeID, BootSessionID: node.BootSessionID, JobID: computer.CurrentJobID,
+				RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+				FailureReason: "operation_failed", Attempts: 3,
+			}
+			_, err = harness.store.AcknowledgeServiceRemoval(ctx, "fabric-"+node.NodeID, computer.CurrentJobID,
+				l1.RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+					RootInstanceID: directive.RootInstanceID, IdempotencyKey: receipt.ReceiptID, CleanupQuarantine: &receipt})
+			acknowledged <- err
+			return
+		}
+	}()
+
+	var stdout, stderr bytes.Buffer
+	err := execute(ctx, harness.clients, true, []string{"services", "remove", computer.ComputerID,
+		"--expect-current", "--wait", "1s", "--poll-interval", "1ms"}, &stdout, &stderr)
+	if ackErr := <-acknowledged; ackErr != nil {
+		t.Fatal(ackErr)
+	}
+	var responseErr *apiResponseError
+	if !errors.As(err, &responseErr) || responseErr.APIError.Code != contract.ErrorConflict || commandExitCode(err) != exitConflict {
+		t.Fatalf("quarantined Computer removal = %T %v, want typed conflict", err, err)
+	}
+	var quarantined computerOperatorProjection
+	if decodeErr := json.Unmarshal(stdout.Bytes(), &quarantined); decodeErr != nil || len(quarantined.StorageCleanupQuarantines) != 1 ||
+		quarantined.StorageCleanupQuarantines[0].ReceiptID != "remove-quarantine-receipt" ||
+		quarantined.CurrentJob.State != contract.JobRemovalPending || quarantined.CurrentJob.Removal == nil ||
+		quarantined.CurrentJob.Removal.CleanupStatus != l1.ServiceRemovalCleanupQuarantined ||
+		quarantined.CurrentJob.Removal.RemovalOutcome != l1.ServiceRemovalOutcomeCleanupQuarantined ||
+		quarantined.Observation == nil || quarantined.Observation.Status != "observed" {
+		t.Fatalf("quarantined Computer projection = %#v decode=%v output=%s", quarantined, decodeErr, stdout.String())
+	}
+}
+
+func TestComputerRemovalTerminalWinsOverStaleQuarantineEvidence(t *testing.T) {
+	removedAt := time.Now().UTC()
+	computer := l1.Computer{ComputerID: "computer", CurrentJobID: "job", DesiredState: contract.ServiceDesiredRemoved,
+		RemovalOutcome: "removed_verified", CurrentJob: l1.Job{JobID: "job", State: contract.JobRemovedVerified,
+			Removal: &l1.ServiceRemoval{RemovalDesiredState: contract.ServiceDesiredRemoved, RemovalBoundNodeID: "node",
+				RemovalGeneration: 1, CleanupStatus: l1.ServiceRemovalCleanupAcknowledged,
+				RemovalOutcome: l1.ServiceRemovalVerified, CleanupAcknowledgedAt: &removedAt}},
+		StorageCleanupQuarantines: []l1.ComputerStorageCleanupQuarantine{{Kind: "managed_volume_cleanup_quarantined",
+			Operation: l1.ComputerStorageCleanupRemoval, ReceiptID: "stale", JobID: "job", RemovalGeneration: 1}}}
+	if err := awaitedComputerRemovalOutcome(computer); err != nil {
+		t.Fatalf("verified removal was shadowed by stale quarantine: %v", err)
+	}
+}
+
+func TestComputerRemovalMismatchReportsPendingSlotWithoutServiceProjection(t *testing.T) {
+	computer := l1.Computer{ComputerID: "computer", CurrentJobID: "job", CurrentJob: l1.Job{
+		JobID: "job", State: contract.JobRemovalPending, Removal: &l1.ServiceRemoval{
+			RemovalDesiredState: contract.ServiceDesiredRemoved, RemovalGeneration: 1,
+			CleanupStatus: l1.ServiceRemovalCleanupPending}}}
+	err := computerRemovalOutcomeMismatch(computer, "not terminal")
+	var responseErr *apiResponseError
+	if !errors.As(err, &responseErr) || responseErr.APIError.Details["holds_slot"] != true {
+		t.Fatalf("pending removal diagnostic = %#v", err)
 	}
 }
 

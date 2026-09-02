@@ -1028,7 +1028,7 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 		if row.Status != "published" {
 			return Computer{}, protocolError(contract.ErrorStaleIntentRevision, "restore cleanup quarantine is not awaiting predecessor retirement")
 		}
-		if err := validateComputerStorageCleanupQuarantine(*request.CleanupQuarantine, computerID, row.DestinationStorageID,
+		if err := validateComputerStorageCleanupQuarantine(*request.CleanupQuarantine, ComputerStorageCleanupRestore, computerID, row.DestinationStorageID,
 			row.OldGeneration, row.BoundNodeID, request.BootSessionID, row.JobID, request.RemovalGeneration, row.CleanupFence); err != nil {
 			return Computer{}, err
 		}

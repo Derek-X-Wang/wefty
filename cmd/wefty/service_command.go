@@ -481,10 +481,10 @@ func executeServiceRemove(
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services remove", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	var wait, pollInterval time.Duration
+	var wait storageWaitFlags
 	var mutation computerMutationFlags
-	flags.DurationVar(&wait, "wait", 0, "wait up to this duration for verified removal")
-	flags.DurationVar(&pollInterval, "poll-interval", defaultServicePollInterval, "wait polling interval")
+	wait.pollInterval = defaultServicePollInterval
+	wait.bind(flags)
 	mutation.bind(flags, false)
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -492,11 +492,8 @@ func executeServiceRemove(
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services remove JOB_ID [--wait DURATION]")
 	}
-	if wait < 0 {
-		return usageError("--wait cannot be negative")
-	}
-	if pollInterval <= 0 {
-		return usageError("--poll-interval must be positive")
+	if err := wait.validateDurations(); err != nil {
+		return err
 	}
 	if computerMutationFlagsSet(mutation) {
 		if err := mutation.validate(false); err != nil {
@@ -509,8 +506,8 @@ func executeServiceRemove(
 		return err
 	}
 	if computer != nil {
-		if wait != 0 || pollInterval != defaultServicePollInterval {
-			return usageError("--wait and --poll-interval are not valid for Computer removal")
+		if err := wait.validate(flags); err != nil {
+			return err
 		}
 		precondition, resolveErr := mutation.resolve(ctx, clients, computer.ComputerID)
 		if resolveErr != nil {
@@ -520,7 +517,22 @@ func executeServiceRemove(
 		if mutationErr != nil {
 			return mutationErr
 		}
-		return writeComputerMutation(stdout, updated, receipt, jsonOutput)
+		projection := newComputerProjection(updated, &receipt.Applied, &receipt.Replay)
+		if wait.timeout > 0 {
+			observed, observation, waitErr := waitForComputerRemoval(ctx, clients, computer.ComputerID, wait)
+			if waitErr != nil && observed.ComputerID == "" {
+				return waitErr
+			}
+			projection = newComputerProjection(observed, &receipt.Applied, &receipt.Replay)
+			projection.Observation = &observation
+			if waitErr != nil {
+				return writeComputerProjectionThenError(stdout, projection, jsonOutput, waitErr)
+			}
+			if outcomeErr := awaitedComputerRemovalOutcome(observed); outcomeErr != nil {
+				return writeComputerProjectionThenError(stdout, projection, jsonOutput, outcomeErr)
+			}
+		}
+		return writeComputerProjection(stdout, projection, jsonOutput)
 	}
 	if computerMutationFlagsSet(mutation) {
 		return usageError("Computer CAS flags are valid only for a Computer-owned service")
@@ -529,8 +541,8 @@ func executeServiceRemove(
 	if err != nil {
 		return err
 	}
-	if wait > 0 {
-		job, err = waitForService(ctx, clients, job, wait, pollInterval, "removed", serviceRemovalComplete)
+	if wait.timeout > 0 {
+		job, err = waitForService(ctx, clients, job, wait.timeout, wait.pollInterval, "removed", serviceRemovalComplete)
 		if err != nil {
 			return err
 		}

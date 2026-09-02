@@ -527,7 +527,8 @@
                   "removal_generation": { "type": "integer", "minimum": 1 },
                   "cleanup_fence": { "type": "string", "minLength": 1 },
                   "root_instance_id": { "type": "string", "minLength": 1 },
-                  "idempotency_key": { "type": "string", "minLength": 1 }
+                  "idempotency_key": { "type": "string", "minLength": 1 },
+                  "cleanup_quarantine": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageCleanupQuarantine" }
                 }
               }
             }
@@ -535,7 +536,7 @@
         },
         "responses": {
           "200": {
-            "description": "Deletion attestation accepted, identically replayed, or already finalized without mutation.",
+            "description": "Deletion attestation accepted, identically replayed, already finalized, or a Computer cleanup quarantine recorded without finalization.",
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } }
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
@@ -751,7 +752,8 @@
           "properties": {
             "node_id": { "type": "string", "minLength": 1 }, "boot_session_id": { "type": "string", "minLength": 1 },
             "removal_generation": { "type": "integer", "minimum": 1 }, "cleanup_fence": { "type": "string", "minLength": 1 },
-            "root_instance_id": { "type": "string", "minLength": 1 }, "idempotency_key": { "type": "string", "minLength": 1 }
+            "root_instance_id": { "type": "string", "minLength": 1 }, "idempotency_key": { "type": "string", "minLength": 1 },
+            "cleanup_quarantine": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageCleanupQuarantine" }
           }
         } } } },
         "responses": {
@@ -945,7 +947,8 @@
 			  "removal_generation": { "type": "integer", "minimum": 1 },
 			  "cleanup_fence": { "type": "string", "minLength": 1 },
 			  "root_instance_id": { "type": "string", "minLength": 1 },
-			  "idempotency_key": { "type": "string", "minLength": 1 }
+			  "idempotency_key": { "type": "string", "minLength": 1 },
+			  "cleanup_quarantine": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageCleanupQuarantine" }
 			}
 		  } } }
 		},

@@ -531,7 +531,9 @@ func assertServiceCLIRemoveAndForceForget(t *testing.T) {
 		t.Fatalf("claim removal service = %#v, %v", claim, err)
 	}
 
-	removedOutput := runServiceCLI(t, ctx, harness.clients, false, "services", "remove", job.JobID)
+	// Ordinary service removal accepted a standalone poll interval before the
+	// Computer wait surface existed; preserve that compatibility.
+	removedOutput := runServiceCLI(t, ctx, harness.clients, false, "services", "remove", job.JobID, "--poll-interval", "5ms")
 	managedDataPath := filepath.ToSlash(filepath.Join(
 		"<managed-root>", "agent", "nodes", managedroot.EncodeID(node.NodeID),
 		"services", managedroot.EncodeID(job.JobID), "data",

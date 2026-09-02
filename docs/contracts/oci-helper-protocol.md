@@ -119,8 +119,9 @@ Computer-disk deletion is retried at most three times with 100 ms between
 attempts. If the third attempt still fails, the helper durably writes an
 authority-bound `managed_volume_cleanup_quarantined` receipt, fences future
 attachment of that Storage generation, and returns the receipt to the agent.
-The agent records it on the standing reset/restore operation so Computer status
-surfaces the failure and L1 stops redispatching it; recovery requires a later
+The agent records it with an explicit `reset`, `restore`, or `removal`
+operation on the standing operation so Computer status surfaces every failure
+without cross-operation shadowing and L1 stops redispatching it; recovery requires a later
 helper sweep/operator workflow rather than an unbounded silent loop. Neither a
 retry nor quarantine invalidates the live helper session.
 `computer_storage_busy` and `computer_storage_retired` are definitive

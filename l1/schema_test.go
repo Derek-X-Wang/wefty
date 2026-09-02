@@ -147,7 +147,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 		},
 		"service_removals": {
 			"job_id", "bound_node_id", "removal_generation", "cleanup_fence", "root_instance_id", "status",
-			"requested_ns", "cleanup_acknowledgement_key", "cleanup_acknowledgement_hash", "agent_cleaned_ns", "removed_ns",
+			"cleanup_status", "requested_ns", "cleanup_acknowledgement_key", "cleanup_acknowledgement_hash", "cleanup_quarantine_json", "agent_cleaned_ns", "removed_ns",
 		},
 		"service_tombstones": {
 			"job_id", "dispatch_key_hash", "request_hash", "created_ns", "removal_requested_ns", "removed_ns",

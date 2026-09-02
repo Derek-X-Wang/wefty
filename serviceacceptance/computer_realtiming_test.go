@@ -1381,10 +1381,11 @@ type liveComputerHTTPResult struct {
 }
 
 const liveComputerHTTPPython = `
-import json, os, sys, urllib.error, urllib.request
+import json, sys, urllib.error, urllib.request
 method, path, key, body = sys.argv[1:5]
 payload = body.encode() if body else None
-request = urllib.request.Request(os.environ["WEFTY_L3_ENDPOINT"] + path, data=payload, method=method)
+endpoint = open("/wefty/control/l3-endpoint", encoding="utf-8").read().strip()
+request = urllib.request.Request(endpoint + path, data=payload, method=method)
 request.add_header("Authorization", "Bearer " + open("/wefty/control/computer-token", encoding="utf-8").read().strip())
 if payload is not None:
     request.add_header("Content-Type", "application/json")
@@ -1463,9 +1464,9 @@ func waitForLiveComputerHTTP(t *testing.T, computer l1.Computer, method, path, i
 }
 
 const liveComputerPausedHTTPPython = `
-import json, os, socket, sys, time, urllib.parse
+import json, socket, sys, time, urllib.parse
 path, key, body = sys.argv[1:4]
-endpoint = urllib.parse.urlsplit(os.environ["WEFTY_L3_ENDPOINT"])
+endpoint = urllib.parse.urlsplit(open("/wefty/control/l3-endpoint", encoding="utf-8").read().strip())
 token = open("/wefty/control/computer-token", encoding="utf-8").read().strip()
 payload = body.encode()
 request = ("POST " + path + " HTTP/1.1\r\nHost: " + endpoint.netloc + "\r\nAuthorization: Bearer " + token +
@@ -1921,10 +1922,18 @@ func createReadyComputer(t *testing.T, harness *acceptanceHarness, reference, di
 
 func removeAndWaitComputer(t *testing.T, harness *acceptanceHarness, computer l1.Computer, timeout time.Duration) l1.Computer {
 	t.Helper()
-	removed := runComputerCLI[l1.Computer](t, harness, false, "services", "remove", computer.ComputerID, "--expect-current")
-	return waitForComputerCLI(t, harness, removed.ComputerID, timeout, func(current l1.Computer) bool {
-		return current.RemovalOutcome != ""
-	})
+	startedAt := time.Now()
+	removed := runComputerCLI[l1.Computer](t, harness, false, "services", "remove", computer.ComputerID,
+		"--expect-current", "--wait", timeout.String(), "--poll-interval", "500ms")
+	elapsed := time.Since(startedAt)
+	if removed.CurrentJob.State != contract.JobRemovedVerified || removed.CurrentJob.Removal == nil ||
+		removed.CurrentJob.Removal.CleanupStatus != l1.ServiceRemovalCleanupAcknowledged ||
+		removed.CurrentJob.Removal.CleanupAcknowledgedAt == nil ||
+		(removed.RemovalOutcome != "removed_verified" && removed.RemovalOutcome != "removed_reduced") {
+		t.Fatalf("Computer removal returned without receipt-derived terminal Slot release: %#v", removed)
+	}
+	t.Logf("Computer removal reached receipt-derived Slot release in %s (bound %s)", elapsed, timeout)
+	return removed
 }
 
 func recordComputerAuthority(receipt *linuxComputerMatrixReceipt, computer l1.Computer) {

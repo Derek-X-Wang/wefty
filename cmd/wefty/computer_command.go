@@ -459,6 +459,82 @@ func waitForComputerGrowRevision(ctx context.Context, clients *apiClients, compu
 	return observed, observation, err
 }
 
+func waitForComputerRemoval(ctx context.Context, clients *apiClients, computerID string, wait storageWaitFlags) (l1.Computer, storageWaitObservation, error) {
+	var observed l1.Computer
+	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
+		var readErr error
+		observed, readErr = clients.getComputerStorageAuthority(ctx, computerID)
+		if readErr != nil {
+			return false, readErr
+		}
+		return computerRemovalTerminal(observed) || computerRemovalQuarantine(observed) != nil, nil
+	})
+	return observed, observation, err
+}
+
+func computerRemovalTerminal(computer l1.Computer) bool {
+	job := computer.CurrentJob
+	if job.State != contract.JobRemovedVerified ||
+		(computer.RemovalOutcome != "removed_verified" && computer.RemovalOutcome != "removed_reduced") {
+		return false
+	}
+	// A never-bound Computer cannot have created node-owned resources, so L1
+	// finalizes it without creating a removal directive or cleanup receipt.
+	if job.Removal == nil {
+		return computer.BoundNodeID == "" && (job.ServiceJob == nil || job.ServiceJob.BoundNodeID == "")
+	}
+	return job.Removal.RemovalBoundNodeID == "" || job.Removal.CleanupAcknowledgedAt != nil
+}
+
+func computerRemovalQuarantine(computer l1.Computer) *l1.ComputerStorageCleanupQuarantine {
+	removal := computer.CurrentJob.Removal
+	if removal == nil || computer.DesiredState != contract.ServiceDesiredRemoved ||
+		computer.CurrentJob.State != contract.JobRemovalPending ||
+		removal.CleanupStatus != l1.ServiceRemovalCleanupQuarantined ||
+		removal.RemovalOutcome != l1.ServiceRemovalOutcomeCleanupQuarantined {
+		return nil
+	}
+	for index := range computer.StorageCleanupQuarantines {
+		quarantine := &computer.StorageCleanupQuarantines[index]
+		if quarantine.Operation == l1.ComputerStorageCleanupRemoval && quarantine.JobID == computer.CurrentJobID &&
+			quarantine.RemovalGeneration == removal.RemovalGeneration {
+			return quarantine
+		}
+	}
+	return nil
+}
+
+func awaitedComputerRemovalOutcome(computer l1.Computer) error {
+	if computerRemovalTerminal(computer) {
+		return nil
+	}
+	if quarantine := computerRemovalQuarantine(computer); quarantine != nil {
+		if quarantine.Kind != "managed_volume_cleanup_quarantined" || quarantine.ReceiptID == "" ||
+			quarantine.VolumeKind != "computer_disk" || quarantine.FailureReason != "operation_failed" || quarantine.Attempts != 3 {
+			return computerRemovalOutcomeMismatch(computer, "Computer removal cleanup quarantine lacks complete receipt-derived facts")
+		}
+		return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
+			Code: contract.ErrorConflict, Message: "Computer removal cleanup quarantined: operation_failed", Retryable: false,
+			Details: map[string]any{"removal_computer_id": computer.ComputerID, "computer_id": quarantine.ComputerID,
+				"job_id":     computer.CurrentJobID,
+				"receipt_id": quarantine.ReceiptID, "storage_id": quarantine.StorageID,
+				"storage_generation": quarantine.StorageGeneration, "failure_reason": quarantine.FailureReason,
+				"attempts": quarantine.Attempts},
+		}}
+	}
+	return computerRemovalOutcomeMismatch(computer, "awaited Computer removal lacks receipt-derived terminal Slot release")
+}
+
+func computerRemovalOutcomeMismatch(computer l1.Computer, message string) error {
+	details := map[string]any{"computer_id": computer.ComputerID, "job_id": computer.CurrentJobID,
+		"job_state": computer.CurrentJob.State, "removal_outcome": computer.RemovalOutcome}
+	details["holds_slot"] = computer.CurrentJob.State == contract.JobRemovalPending ||
+		computer.CurrentJob.State == contract.JobAgentCleaned
+	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
+		Code: contract.ErrorConflict, Message: message, Retryable: false, Details: details,
+	}}
+}
+
 func awaitedComputerGrowFailure(computer l1.Computer, operationRevision int64, historicalReplay bool) error {
 	grow := computer.LastGrowOperation
 	if grow == nil || grow.OperationRevision != operationRevision {
