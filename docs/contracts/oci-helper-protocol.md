@@ -837,8 +837,10 @@ Every malformed, anomalous, historically attached, or identity-mismatched disk
 still fails closed.
 
 `AttestRemoval` accepts only an exact service Job/generation plus reconstructed
-attempt authorities and their deterministic resource rows, and is called after
-the separate idempotent `DeleteManagedVolume(service_data, job_id)` succeeds.
+attempt authorities and their deterministic resource rows. Ordinary services
+call it after the separate idempotent
+`DeleteManagedVolume(service_data, job_id)` succeeds; Computer operation
+cleanup calls it after the corresponding Computer disk deletion succeeds.
 Storage-only attestation has two closed authority shapes: the prepared-removal
 shape carries the exact helper-originated never-attached witness returned by
 `InventoryRemoval`, while reset/restore predecessor and failed-import cleanup
