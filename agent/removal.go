@@ -201,16 +201,28 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 }
 
 func (controller *removalController) completeLocalRemoval(ctx context.Context, removal localRemoval, runtimeRemoval *runtimeRemovalRecord, computerStorages []*workloadrunner.ComputerStorage) error {
+	noRuntime := runtimeRemoval != nil && runtimeRemoval.receipt.Evidence == workloadrunner.ReapEvidenceNoRuntime
+	needsRuntimeProof := removal.kind == contract.JobKindOCI && (runtimeRemoval == nil || runtimeRemoval.phase != runtimeRemovalComplete)
+	attempts := []workloadrunner.RuntimeResourceManifest(nil)
+	if runtimeRemoval != nil {
+		attempts = runtimeRemoval.manifest.Attempts
+	}
+	// A no-runtime receipt skips guardian reaping, so it is authoritative
+	// only for the exact Storage generations in the frozen helper inventory.
+	// Refuse incomplete coverage before any durable cleanup begins. A real
+	// runtime reap covers the job-wide guardian while finalizeVolumes
+	// independently deletes every L1-claimed generation.
+	if needsRuntimeProof && noRuntime && len(computerStorages) != 0 && !computerStorageInventoryComplete(attempts, computerStorages) {
+		return errors.New("agent: Computer removal lacks helper inventory for every claimed Storage generation")
+	}
 	if err := controller.purgeJob(ctx, removal.jobID); err != nil {
 		return err
 	}
-	noRuntime := runtimeRemoval != nil && runtimeRemoval.receipt.Evidence == workloadrunner.ReapEvidenceNoRuntime
 	if !noRuntime {
 		if err := controller.removeResource(ctx, removal); err != nil {
 			return fmt.Errorf("delete managed service resource: %w", err)
 		}
 	}
-	needsRuntimeProof := removal.kind == contract.JobKindOCI && (runtimeRemoval == nil || runtimeRemoval.phase != runtimeRemovalComplete)
 	if len(computerStorages) != 0 && needsRuntimeProof {
 		if controller.finalizeVolumes == nil {
 			return errors.New("Computer removal requires OCI disk finalization")
@@ -236,13 +248,6 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 		if needsRuntimeProof {
 			if controller.deleteRuntimeData == nil || controller.attestRuntimeRemoval == nil {
 				return errors.New("OCI service removal proof runtime is unavailable")
-			}
-			attempts := []workloadrunner.RuntimeResourceManifest(nil)
-			if runtimeRemoval != nil {
-				attempts = runtimeRemoval.manifest.Attempts
-			}
-			if len(computerStorages) != 0 && !computerStorageInventoryComplete(attempts, computerStorages) {
-				return errors.New("agent: Computer removal lacks helper inventory for every claimed Storage generation")
 			}
 			proofRequest := workloadrunner.RuntimeRemovalProofRequest{
 				NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID,

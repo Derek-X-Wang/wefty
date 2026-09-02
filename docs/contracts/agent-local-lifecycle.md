@@ -360,6 +360,11 @@ inventory may freeze that generation as Storage-only removal evidence only for
 every Storage generation claimed by the directive. The session still passes
 that evidence through the resident/admitted service barrier; only after both
 are clear may it record `no_runtime_resources` without signalling a guardian.
+That complete-generation requirement is specific to the no-runtime shortcut.
+When the session instead returns a positive runtime reap receipt, the guardian
+receipt covers the Job while the helper independently finalizes every Storage
+generation claimed by L1; historical generations do not need to be relabelled
+as members of the current runtime attempt.
 The frozen manifest contains empty runtime identifiers and does not manufacture
 lease, task, container, or other attempt rows. After a reboot, prepared
 Storage-only evidence is re-inventoried and refreshed under the current helper
