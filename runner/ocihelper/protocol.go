@@ -888,6 +888,7 @@ type InventoryRemovalResponse struct {
 	RemovalGeneration uint64                   `json:"removal_generation"`
 	HelperSession     HelperSession            `json:"helper_session"`
 	NoRuntimeAttempts bool                     `json:"no_runtime_attempts,omitempty"`
+	NoStorageEvidence bool                     `json:"no_storage_evidence,omitempty"`
 	Attempts          []RemovalAttemptManifest `json:"attempts"`
 }
 

@@ -526,6 +526,58 @@ func TestLegacyRemovalReconstructionDeduplicatesOnlyIdenticalAuthorities(t *test
 	}
 }
 
+func TestLegacyComputerRemovalRefusesEmptyJobAndGenerationInventories(t *testing.T) {
+	removal := localRemoval{jobID: "detached-computer", generation: 2, rootInstanceID: "root", cleanupFence: "cleanup"}
+	storages := []*workloadrunner.ComputerStorage{{
+		ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30,
+	}}
+	persisted := false
+	controller := &removalController{nodeID: "node", bootSessionID: "boot"}
+	controller.reconstructRuntime = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error) {
+		return nil, nil
+	}
+	controller.persistRuntimeRemoval = func(context.Context, localRemoval, []workloadrunner.RuntimeResourceManifest) error {
+		persisted = true
+		return nil
+	}
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
+		return runtimeRemovalRecord{}, false, nil
+	}
+
+	_, err := controller.reconstructAndPersistRuntimeRemoval(t.Context(), removal, storages)
+	if err == nil || !strings.Contains(err.Error(), "found neither runtime authority nor Storage evidence") || persisted {
+		t.Fatalf("empty legacy Computer reconstruction = err:%v persisted:%t", err, persisted)
+	}
+}
+
+func TestLegacyComputerRemovalCombinesJobRuntimeWithEmptyGenerationEvidence(t *testing.T) {
+	removal := localRemoval{jobID: "detached-computer", generation: 2, rootInstanceID: "root", cleanupFence: "cleanup"}
+	storage := &workloadrunner.ComputerStorage{
+		ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30,
+	}
+	runtimeAttempt := testRuntimeResourceManifest(removal.jobID, "detached-attempt")
+	var persisted []workloadrunner.RuntimeResourceManifest
+	controller := &removalController{nodeID: "node", bootSessionID: "boot"}
+	controller.reconstructRuntime = func(_ context.Context, request workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error) {
+		if request.ComputerStorage == nil {
+			return []workloadrunner.RuntimeResourceManifest{runtimeAttempt}, nil
+		}
+		return nil, nil
+	}
+	controller.persistRuntimeRemoval = func(_ context.Context, _ localRemoval, attempts []workloadrunner.RuntimeResourceManifest) error {
+		persisted = slices.Clone(attempts)
+		return nil
+	}
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
+		return runtimeRemovalRecord{manifest: runtimeRemovalManifest{Attempts: slices.Clone(persisted)}}, true, nil
+	}
+
+	record, err := controller.reconstructAndPersistRuntimeRemoval(t.Context(), removal, []*workloadrunner.ComputerStorage{storage})
+	if err != nil || len(record.manifest.Attempts) != 1 || record.manifest.Attempts[0].AttemptID != runtimeAttempt.AttemptID {
+		t.Fatalf("job runtime plus empty generation evidence = %+v err:%v", record.manifest.Attempts, err)
+	}
+}
+
 func TestRemovalControllerNeverAcknowledgesFailedDeletion(t *testing.T) {
 	errDelete := errors.New("injected deletion failure")
 	acknowledged := false

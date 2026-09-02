@@ -690,6 +690,51 @@ func TestPreparedComputerStorageRemovalInventoryCarriesOnlyStorageRows(t *testin
 	})
 }
 
+func TestDetachedComputerStorageRemovalInventoryReturnsTypedEmptyEvidence(t *testing.T) {
+	runtimeRoot := t.TempDir()
+	storage := ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 3, DiskBytes: 8 << 30}
+	name, err := DeterministicComputerDiskName(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskRoot := filepath.Join(runtimeRoot, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeComputerDiskManifest(diskRoot, computerDiskManifest{
+		Version: computerDiskManifestVersion, Storage: storage, DiskImage: "disk.ext4", MountDirectory: name,
+		PreviousDetachment: &computerDiskEvidence{ReceiptID: "detached"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot}, diskSystem: newFakeComputerDiskSystem()}
+	request := InventoryRemovalRequest{Removal: ManagedVolumeRemovalAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "detached-computer", RemovalGeneration: 2, CleanupFence: "cleanup",
+	}, RootInstanceID: "root", ComputerStorage: &storage}
+
+	response, err := engine.inventoryComputerStorageRemoval(t.Context(), request, ResourceInventory{})
+	if err != nil || !response.NoStorageEvidence || response.NoRuntimeAttempts || len(response.Attempts) != 0 {
+		t.Fatalf("detached Computer Storage inventory = %+v err=%v", response, err)
+	}
+}
+
+func TestAbsentComputerStorageInventoryWaitsForReimageSerialization(t *testing.T) {
+	runtimeRoot := t.TempDir()
+	storage := ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 3, DiskBytes: 8 << 30}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot}, diskSystem: newFakeComputerDiskSystem()}
+	request := InventoryRemovalRequest{Removal: ManagedVolumeRemovalAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "detached-computer", RemovalGeneration: 2, CleanupFence: "cleanup",
+	}, RootInstanceID: "root", ComputerStorage: &storage}
+	engine.computerReimageMu.Lock()
+	defer engine.computerReimageMu.Unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	got, err := engine.inventoryComputerStorageRemoval(ctx, request, ResourceInventory{})
+	if !errors.Is(err, context.DeadlineExceeded) || got.NoStorageEvidence || len(got.Attempts) != 0 {
+		t.Fatalf("absence was determined outside reimage serialization: response=%+v err=%v", got, err)
+	}
+}
+
 func TestAbsentComputerStorageRemovalInventoryIsTypedAndAttestable(t *testing.T) {
 	storage := ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30}
 	request := InventoryRemovalRequest{Removal: ManagedVolumeRemovalAuthority{

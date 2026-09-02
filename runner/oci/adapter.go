@@ -490,8 +490,14 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 		return nil, errors.New("legacy OCI removal inventory receipt is not bound to the current helper, job, and generation")
 	}
 	if response.NoRuntimeAttempts {
-		if request.ComputerStorage != nil || len(response.Attempts) != 0 {
+		if response.NoStorageEvidence || request.ComputerStorage != nil || len(response.Attempts) != 0 {
 			return nil, errors.New("legacy OCI removal no-runtime receipt has conflicting Storage or attempt evidence")
+		}
+		return nil, nil
+	}
+	if response.NoStorageEvidence {
+		if request.ComputerStorage == nil || len(response.Attempts) != 0 {
+			return nil, errors.New("legacy OCI removal empty Storage receipt has conflicting scope or attempt evidence")
 		}
 		return nil, nil
 	}

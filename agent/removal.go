@@ -308,7 +308,9 @@ func (controller *removalController) reconstructAndPersistRuntimeRemoval(ctx con
 		requests = append(requests, computerStorages...)
 	}
 	seenAttempts := make(map[string]workloadrunner.RuntimeResourceManifest)
-	for _, computerStorage := range requests {
+	jobScopedRuntimeFound := false
+	missingStorageEvidence := false
+	for index, computerStorage := range requests {
 		request := workloadrunner.RuntimeRemovalProofRequest{
 			NodeID: controller.nodeID, BootSessionID: controller.bootSessionID, JobID: removal.jobID,
 			RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence, RootInstanceID: removal.rootInstanceID,
@@ -317,6 +319,11 @@ func (controller *removalController) reconstructAndPersistRuntimeRemoval(ctx con
 		reconstructed, err := controller.reconstructRuntime(ctx, request)
 		if err != nil {
 			return runtimeRemovalRecord{}, fmt.Errorf("agent: legacy OCI removal %q remains pending because helper inventory reconstruction failed: %w", removal.jobID, err)
+		}
+		if index == 0 {
+			jobScopedRuntimeFound = len(reconstructed) != 0
+		} else if len(reconstructed) == 0 {
+			missingStorageEvidence = true
 		}
 		for _, attempt := range reconstructed {
 			if prior, exists := seenAttempts[attempt.AttemptID]; exists {
@@ -328,6 +335,9 @@ func (controller *removalController) reconstructAndPersistRuntimeRemoval(ctx con
 			seenAttempts[attempt.AttemptID] = attempt
 			attempts = append(attempts, attempt)
 		}
+	}
+	if !jobScopedRuntimeFound && missingStorageEvidence {
+		return runtimeRemovalRecord{}, fmt.Errorf("agent: legacy OCI removal %q found neither runtime authority nor Storage evidence", removal.jobID)
 	}
 	if err := controller.persistRuntimeRemoval(ctx, removal, attempts); err != nil {
 		return runtimeRemovalRecord{}, err

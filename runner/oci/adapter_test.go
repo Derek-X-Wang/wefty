@@ -1985,6 +1985,27 @@ func TestLegacyComputerRemovalReconstructsNoRuntimeAndAlreadyDeletedGenerationEv
 	}
 }
 
+func TestLegacyComputerRemovalAcceptsTypedEmptyPerGenerationInventory(t *testing.T) {
+	engine := &adapterTestEngine{inventoryRemoval: ocihelper.InventoryRemovalResponse{NoStorageEvidence: true}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := workloadrunner.RuntimeRemovalProofRequest{
+		NodeID: "node", BootSessionID: "boot", RootInstanceID: "root", JobID: "detached-computer",
+		RemovalGeneration: 3, CleanupFence: "cleanup",
+		ComputerStorage: &workloadrunner.ComputerStorage{
+			ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30,
+		},
+	}
+	attempts, err := adapter.ReconstructRuntimeRemoval(t.Context(), request)
+	if err != nil || len(attempts) != 0 {
+		t.Fatalf("typed empty per-generation inventory = %+v err=%v", attempts, err)
+	}
+	engine.inventoryRemoval = ocihelper.InventoryRemovalResponse{}
+	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
+		t.Fatal("untyped empty per-generation inventory was accepted")
+	}
+}
+
 func mustComputerDiskName(t *testing.T, storage ocihelper.ComputerStorageReference) string {
 	t.Helper()
 	name, err := ocihelper.DeterministicComputerDiskName(storage)

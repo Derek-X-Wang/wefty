@@ -1735,81 +1735,11 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 			return InventoryRemovalResponse{}, err
 		}
 	}
-	var computerStorage *ComputerStorageReference
-	var storageOnlyAttempt *RemovalAttemptManifest
 	if request.ComputerStorage != nil {
-		name, nameErr := DeterministicComputerDiskName(*request.ComputerStorage)
-		if nameErr != nil {
-			return InventoryRemovalResponse{}, nameErr
-		}
-		for _, anomaly := range inventory.ComputerDiskAnomalies {
-			if strings.HasPrefix(anomaly, name+":") {
-				return InventoryRemovalResponse{}, fmt.Errorf("legacy Computer removal inventory is anomalous: %s", anomaly)
-			}
-		}
-		root := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
-		if _, statErr := os.Lstat(root); errors.Is(statErr, os.ErrNotExist) {
-			attempt, attemptErr := absentComputerStorageRemovalAttempt(request, *request.ComputerStorage)
-			if attemptErr != nil {
-				return InventoryRemovalResponse{}, attemptErr
-			}
-			return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
-		} else if statErr != nil {
-			return InventoryRemovalResponse{}, fmt.Errorf("inspect Computer removal inventory root: %w", statErr)
-		}
-		if !lockComputerReimageMutex(ctx, &engine.computerReimageMu) {
-			return InventoryRemovalResponse{}, fmt.Errorf("acquire Computer removal inventory serialization: %w", context.Cause(ctx))
-		}
-		lock, lockErr := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
-		if lockErr != nil {
-			engine.computerReimageMu.Unlock()
-			return InventoryRemovalResponse{}, fmt.Errorf("open Computer removal inventory lock: %w", lockErr)
-		}
-		if lockErr = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); lockErr != nil {
-			_ = lock.Close()
-			engine.computerReimageMu.Unlock()
-			return InventoryRemovalResponse{}, errComputerStorageAttachmentOwned
-		}
-		engine.computerReimageMu.Unlock()
-		defer func() {
-			_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-			_ = lock.Close()
-		}()
-		manifest, present, manifestErr := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
-		if manifestErr != nil || !present {
-			return InventoryRemovalResponse{}, errors.Join(manifestErr, errors.New("legacy Computer removal has no readable disk manifest"))
-		}
-		if !sameComputerStorageIdentity(manifest.Storage, *request.ComputerStorage) {
-			return InventoryRemovalResponse{}, errors.New("legacy Computer removal disk manifest does not match L1 Storage identity")
-		}
-		if _, mounted, mountErr := engine.computerDiskSystem().mountedSource(filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)); mountErr != nil {
-			return InventoryRemovalResponse{}, mountErr
-		} else if mounted {
-			return InventoryRemovalResponse{}, errors.New("legacy Computer removal disk remains mounted")
-		}
-		storage := manifest.Storage
-		computerStorage = &storage
-		if attempt, eligible, attemptErr := preparedComputerStorageRemovalAttempt(request, root, manifest); attemptErr != nil {
-			return InventoryRemovalResponse{}, attemptErr
-		} else if eligible {
-			storageOnlyAttempt = &attempt
-		}
-		for _, authority := range []*AttemptAuthority{manifest.Attached, manifest.Pending} {
-			if authority != nil {
-				if err := add(*authority, "computer", name); err != nil {
-					return InventoryRemovalResponse{}, err
-				}
-			}
-		}
+		return engine.inventoryComputerStorageRemoval(ctx, request, inventory)
 	}
 	if len(authorities) == 0 {
-		if storageOnlyAttempt != nil {
-			return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{*storageOnlyAttempt}}, nil
-		}
-		if request.ComputerStorage == nil {
-			return InventoryRemovalResponse{NoRuntimeAttempts: true}, nil
-		}
-		return InventoryRemovalResponse{}, errors.New("legacy OCI removal current scan found no matching helper-owned attempt authority")
+		return InventoryRemovalResponse{NoRuntimeAttempts: true}, nil
 	}
 	attempts := make([]RemovalAttemptManifest, 0, len(authorities))
 	for _, authority := range authorities {
@@ -1818,12 +1748,76 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 			return InventoryRemovalResponse{}, identityErr
 		}
 		attempts = append(attempts, RemovalAttemptManifest{
-			Authority: authority, ComputerStorage: computerStorage,
-			Resources: ExpectedRemovalResources(identity, "", computerStorage),
+			Authority: authority,
+			Resources: ExpectedRemovalResources(identity, "", nil),
 		})
 	}
 	sort.Slice(attempts, func(i, j int) bool { return attempts[i].Authority.AttemptID < attempts[j].Authority.AttemptID })
 	return InventoryRemovalResponse{Attempts: attempts}, nil
+}
+
+func (engine *ContainerdEngine) inventoryComputerStorageRemoval(ctx context.Context, request InventoryRemovalRequest, inventory ResourceInventory) (_ InventoryRemovalResponse, err error) {
+	storage := *request.ComputerStorage
+	name, err := DeterministicComputerDiskName(storage)
+	if err != nil {
+		return InventoryRemovalResponse{}, err
+	}
+	for _, anomaly := range inventory.ComputerDiskAnomalies {
+		if strings.HasPrefix(anomaly, name+":") {
+			return InventoryRemovalResponse{}, fmt.Errorf("legacy Computer removal inventory is anomalous: %s", anomaly)
+		}
+	}
+	if !lockComputerReimageMutex(ctx, &engine.computerReimageMu) {
+		return InventoryRemovalResponse{}, fmt.Errorf("acquire Computer removal inventory serialization: %w", context.Cause(ctx))
+	}
+	reimageLocked := true
+	defer func() {
+		if reimageLocked {
+			engine.computerReimageMu.Unlock()
+		}
+	}()
+	root := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+	if _, statErr := os.Lstat(root); errors.Is(statErr, os.ErrNotExist) {
+		attempt, attemptErr := absentComputerStorageRemovalAttempt(request, storage)
+		if attemptErr != nil {
+			return InventoryRemovalResponse{}, attemptErr
+		}
+		return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
+	} else if statErr != nil {
+		return InventoryRemovalResponse{}, fmt.Errorf("inspect Computer removal inventory root: %w", statErr)
+	}
+	lock, lockErr := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if lockErr != nil {
+		return InventoryRemovalResponse{}, fmt.Errorf("open Computer removal inventory lock: %w", lockErr)
+	}
+	if lockErr = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); lockErr != nil {
+		_ = lock.Close()
+		return InventoryRemovalResponse{}, errComputerStorageAttachmentOwned
+	}
+	engine.computerReimageMu.Unlock()
+	reimageLocked = false
+	defer func() {
+		_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+		_ = lock.Close()
+	}()
+	manifest, present, manifestErr := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
+	if manifestErr != nil || !present {
+		return InventoryRemovalResponse{}, errors.Join(manifestErr, errors.New("legacy Computer removal has no readable disk manifest"))
+	}
+	if !sameComputerStorageIdentity(manifest.Storage, storage) {
+		return InventoryRemovalResponse{}, errors.New("legacy Computer removal disk manifest does not match L1 Storage identity")
+	}
+	if _, mounted, mountErr := engine.computerDiskSystem().mountedSource(filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)); mountErr != nil {
+		return InventoryRemovalResponse{}, mountErr
+	} else if mounted {
+		return InventoryRemovalResponse{}, errors.New("legacy Computer removal disk remains mounted")
+	}
+	if attempt, eligible, attemptErr := preparedComputerStorageRemovalAttempt(request, root, manifest); attemptErr != nil {
+		return InventoryRemovalResponse{}, attemptErr
+	} else if eligible {
+		return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
+	}
+	return InventoryRemovalResponse{NoStorageEvidence: true}, nil
 }
 
 func absentComputerStorageRemovalAttempt(request InventoryRemovalRequest, storage ComputerStorageReference) (RemovalAttemptManifest, error) {
