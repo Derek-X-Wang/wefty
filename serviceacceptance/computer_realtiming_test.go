@@ -1462,7 +1462,7 @@ func listComputerRunsFromAuthority(t *testing.T, harness *acceptanceHarness, com
 	if err != nil {
 		t.Fatal(err)
 	}
-	participant := plainNetwork.NewFabric(fabric.Identity{NodeID: "linux-computer-run-auditor"})
+	participant := plainNetwork.NewFabric(fabric.Identity{NodeID: "linux-computer-run-auditor", Tags: []string{l3.DefaultCallerPrincipalTag}})
 	transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return participant.Dial(ctx, network, harness.runLedgerAddress)
 	}}
