@@ -661,16 +661,21 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	receipt.ResidueInventories["post_removal_helper_namespace"] = verification.Inventory
 	receipt.ResidueInventories["post_removal_runtime_residue"] = verification.RuntimeResidue
 	receipt.ResidueInventories["post_removal_durable_retained"] = verification.DurableRetained
-	receipt.ResidueAssertions["post_removal_observed_inventory_restored"] = reflect.DeepEqual(verification.Inventory, removalBaseline.Inventory)
+	observedExact, observedGCNoNew, observedGCRemoved := compareRemovalInventoryBaseline(removalBaseline.Inventory, verification.Inventory)
+	retainedExact, retainedGCNoNew, _ := compareRemovalInventoryBaseline(removalBaseline.DurableRetained, verification.DurableRetained)
+	receipt.ResidueInventories["post_removal_self_gc_removed"] = observedGCRemoved
+	receipt.ResidueAssertions["post_removal_observed_inventory_restored"] = observedExact && observedGCNoNew
 	receipt.ResidueAssertions["post_removal_runtime_residue_restored"] = reflect.DeepEqual(verification.RuntimeResidue, removalBaseline.RuntimeResidue)
-	receipt.ResidueAssertions["post_removal_durable_retained_restored"] = reflect.DeepEqual(verification.DurableRetained, removalBaseline.DurableRetained)
+	receipt.ResidueAssertions["post_removal_durable_retained_restored"] = retainedExact && retainedGCNoNew
+	receipt.ResidueAssertions["post_removal_self_gc_no_new"] = observedGCNoNew && retainedGCNoNew
 	archiveAfter := sha256File(t, archive)
 	cacheAfter := liveContainerdImagePresent(t, digest)
 	completeLinuxComputerRow(t, receipt, "linux.removal", map[string]bool{
 		"verified_absence_outcome_live":         verified.RemovalOutcome == "removed_verified",
 		"reduced_custody_outcome_live":          reduced.RemovalOutcome == "removed_reduced",
 		"reduced_bound_to_tainted_computer":     reduced.ComputerID == taintedComputerID,
-		"independent_helper_inventory_restored": reflect.DeepEqual(verification.Inventory, removalBaseline.Inventory),
+		"independent_helper_inventory_restored": observedExact && observedGCNoNew,
+		"helper_self_gc_no_new":                 observedGCNoNew && retainedGCNoNew,
 		"containers_restored":                   reflect.DeepEqual(verification.Inventory.Containers, removalBaseline.Inventory.Containers),
 		"tasks_restored":                        reflect.DeepEqual(verification.Inventory.Tasks, removalBaseline.Inventory.Tasks),
 		"disks_loops_mounts_restored": reflect.DeepEqual(verification.Inventory.ComputerDiskImages, removalBaseline.Inventory.ComputerDiskImages) &&
@@ -678,14 +683,17 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 			reflect.DeepEqual(verification.Inventory.ComputerDiskMounts, removalBaseline.Inventory.ComputerDiskMounts),
 		"logs_and_control_restored": reflect.DeepEqual(verification.Inventory.LogSegments, removalBaseline.Inventory.LogSegments) &&
 			reflect.DeepEqual(verification.Inventory.Cgroups, removalBaseline.Inventory.Cgroups),
-		"durable_retained_restored":      reflect.DeepEqual(verification.DurableRetained, removalBaseline.DurableRetained),
+		"durable_retained_restored":      retainedExact && retainedGCNoNew,
 		"publication_withdrawn":          verified.DisplayEndpoint == nil,
 		"operator_bind_source_untouched": archiveBefore == archiveAfter,
 		"shared_image_cache_untouched":   cacheBefore && cacheAfter,
 		"removal_command_intact":         removalCommandIntact,
 	}, map[string]string{"verified_computer_id": verified.ComputerID, "reduced_computer_id": reduced.ComputerID,
 		"custody_tainted_computer_id": taintedComputerID, "verified_outcome": verified.RemovalOutcome,
-		"reduced_outcome": reduced.RemovalOutcome, "inventory_source": "helper VerifyNamespace route"})
+		"reduced_outcome": reduced.RemovalOutcome, "inventory_source": "helper VerifyNamespaceReadOnly route",
+		"self_gc_classes":                 "managed_volumes:wefty-handoff-volume-,image_spools",
+		"self_gc_removed_managed_volumes": strings.Join(observedGCRemoved.ManagedVolumes, ","),
+		"self_gc_removed_image_spools":    strings.Join(observedGCRemoved.ImageSpools, ",")})
 	validateLinuxComputerLaneMutation(t, receipt)
 }
 
@@ -699,6 +707,7 @@ func mergeAcceptanceInventory(left, right ocihelper.ResourceInventory) ocihelper
 		Containers: append(left.Containers, right.Containers...), Tasks: append(left.Tasks, right.Tasks...),
 		Shims: append(left.Shims, right.Shims...), Cgroups: append(left.Cgroups, right.Cgroups...),
 		LogSegments: append(left.LogSegments, right.LogSegments...), ManagedVolumes: append(left.ManagedVolumes, right.ManagedVolumes...),
+		ImageSpools:             append(left.ImageSpools, right.ImageSpools...),
 		ManagedVolumeRecords:    append(left.ManagedVolumeRecords, right.ManagedVolumeRecords...),
 		ComputerDiskImages:      append(left.ComputerDiskImages, right.ComputerDiskImages...),
 		ComputerDiskAllocations: append(left.ComputerDiskAllocations, right.ComputerDiskAllocations...),
@@ -710,6 +719,97 @@ func mergeAcceptanceInventory(left, right ocihelper.ResourceInventory) ocihelper
 		ComputerResetManifests:  append(left.ComputerResetManifests, right.ComputerResetManifests...),
 		ComputerQuarantines:     append(left.ComputerQuarantines, right.ComputerQuarantines...),
 		ComputerDiskAnomalies:   append(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies...),
+	}
+}
+
+// compareRemovalInventoryBaseline keeps the post-removal gate exact for every
+// resource class except the two explicitly self-GC classes. Those may shrink
+// while the matrix is running, but may never gain an ID relative to baseline.
+func compareRemovalInventoryBaseline(before, after ocihelper.ResourceInventory) (exactNonGC, noNewSelfGC bool, removed ocihelper.ResourceInventory) {
+	beforeNonGC, beforeHandoffs := inventoryWithoutSelfGC(before)
+	afterNonGC, afterHandoffs := inventoryWithoutSelfGC(after)
+	return reflect.DeepEqual(beforeNonGC, afterNonGC),
+		stringSetSubset(afterHandoffs, beforeHandoffs) && stringSetSubset(after.ImageSpools, before.ImageSpools),
+		ocihelper.ResourceInventory{
+			ManagedVolumes: stringSetDifference(beforeHandoffs, afterHandoffs),
+			ImageSpools:    stringSetDifference(before.ImageSpools, after.ImageSpools),
+		}
+}
+
+func inventoryWithoutSelfGC(in ocihelper.ResourceInventory) (ocihelper.ResourceInventory, []string) {
+	out := in
+	handoffs := make([]string, 0, len(in.ManagedVolumes))
+	managed := make([]string, 0, len(in.ManagedVolumes))
+	for _, id := range in.ManagedVolumes {
+		if strings.HasPrefix(id, "wefty-handoff-volume-") {
+			handoffs = append(handoffs, id)
+			continue
+		}
+		managed = append(managed, id)
+	}
+	if len(managed) == 0 {
+		managed = nil
+	}
+	out.ManagedVolumes = managed
+	out.ImageSpools = nil
+	return out, handoffs
+}
+
+func stringSetSubset(candidate, baseline []string) bool {
+	allowed := make(map[string]struct{}, len(baseline))
+	for _, id := range baseline {
+		allowed[id] = struct{}{}
+	}
+	for _, id := range candidate {
+		if _, ok := allowed[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func stringSetDifference(before, after []string) []string {
+	retained := make(map[string]struct{}, len(after))
+	for _, id := range after {
+		retained[id] = struct{}{}
+	}
+	var removed []string
+	for _, id := range before {
+		if _, ok := retained[id]; !ok {
+			removed = append(removed, id)
+		}
+	}
+	return removed
+}
+
+func TestCompareRemovalInventoryBaselineAllowsOnlySelfGCContraction(t *testing.T) {
+	baseline := ocihelper.ResourceInventory{
+		Containers:  []string{"preexisting-container"},
+		ImageSpools: []string{"expired-import", "retained-import"},
+		ManagedVolumes: []string{
+			"wefty-handoff-volume-expired",
+			"wefty-handoff-volume-retained",
+			"wefty-service-volume-retained",
+		},
+	}
+	after := ocihelper.ResourceInventory{
+		Containers:     []string{"preexisting-container"},
+		ImageSpools:    []string{"retained-import"},
+		ManagedVolumes: []string{"wefty-handoff-volume-retained", "wefty-service-volume-retained"},
+	}
+	exact, noNew, removed := compareRemovalInventoryBaseline(baseline, after)
+	if !exact || !noNew || !reflect.DeepEqual(removed.ImageSpools, []string{"expired-import"}) ||
+		!reflect.DeepEqual(removed.ManagedVolumes, []string{"wefty-handoff-volume-expired"}) {
+		t.Fatalf("self-GC contraction = exact:%t no_new:%t removed:%+v", exact, noNew, removed)
+	}
+	after.ImageSpools = append(after.ImageSpools, "new-import")
+	if exact, noNew, _ := compareRemovalInventoryBaseline(baseline, after); !exact || noNew {
+		t.Fatalf("new self-GC identity = exact:%t no_new:%t", exact, noNew)
+	}
+	after.ImageSpools = []string{"retained-import"}
+	after.Containers = []string{"replacement-container"}
+	if exact, _, _ := compareRemovalInventoryBaseline(baseline, after); exact {
+		t.Fatal("non-GC identity change was accepted")
 	}
 }
 
@@ -2004,7 +2104,7 @@ func inspectHelperNamespaceInventory(t *testing.T, socketPath, checksum string) 
 		session, err := client.OpenSession(ctx, ocihelper.AcquireSessionRequest{NodeID: "acceptance-inventory", BootSessionID: "acceptance-inventory-boot"})
 		cancel()
 		if err == nil {
-			verification, verifyErr := session.Verify(t.Context(), ocihelper.VerifyRequest{Scope: ocihelper.VerifyNamespace})
+			verification, verifyErr := session.Verify(t.Context(), ocihelper.VerifyRequest{Scope: ocihelper.VerifyNamespaceReadOnly})
 			_ = session.Close()
 			if verifyErr != nil {
 				t.Fatalf("verify helper namespace inventory: %v", verifyErr)

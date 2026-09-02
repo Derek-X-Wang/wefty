@@ -22,9 +22,11 @@ semantic code.
 
 The first SIGINT or SIGTERM starts a graceful drain with a 30-second bound. A
 second signal is an explicit forced-shutdown transition: it cancels resident
-attempts immediately and emits `forced_shutdown ... reason=second_signal`
-whether it arrives while Drain is joining residents or after Drain returns,
-distinguishing operator abort from clean drain completion.
+attempts immediately. While Drain is joining residents it emits
+`forced_shutdown transition=draining_to_forced reason=second_signal`; after
+Drain returns it emits
+`forced_shutdown transition=drained_to_forced reason=second_signal`. These
+exact tokens distinguish operator abort from clean drain completion.
 
 ## Capability observation and local admission
 
@@ -353,13 +355,17 @@ that fact. The
 frozen removal manifest still binds every subsequent durable-data deletion and
 post-delete assertion. Legacy inventory reconstruction continues to require
 matching attempt authority and cannot upgrade an empty sweep into a manifest.
-The one no-attempt case is a Computer generation whose exact helper manifest is
-prepared by a durable reset/copy receipt, unattached, has no loop or mount, and
-has no prior attachment or retirement evidence. A current authenticated helper
-inventory may freeze that generation as Storage-only removal evidence only for
-every Storage generation claimed by the directive. The session still passes
-that evidence through the resident/admitted service barrier; only after both
-are clear may it record `no_runtime_resources` without signalling a guardian.
+The no-attempt cases are closed per Computer generation. A generation whose
+exact helper manifest is prepared by a durable reset/copy receipt, unattached,
+has no loop or mount, and has no prior attachment or retirement evidence is
+frozen as prepared Storage-only evidence. A generation whose exact managed
+disk root is already absent is frozen as distinct typed absent-Storage
+evidence; the helper never creates the missing root to prove that fact. Legacy
+reconstruction scans the Job's runtime authorities once and each L1-claimed
+Storage generation once, then deduplicates only byte-identical authorities.
+The session still passes the complete generation inventory through the
+resident/admitted service barrier; only after both are clear may it durably
+record `no_runtime_resources` without signalling a guardian.
 That complete-generation requirement is specific to the no-runtime shortcut.
 When the session instead returns a positive runtime reap receipt, the guardian
 receipt covers the Job while the helper independently finalizes every Storage
@@ -369,6 +375,12 @@ The frozen manifest contains empty runtime identifiers and does not manufacture
 lease, task, container, or other attempt rows. After a reboot, prepared
 Storage-only evidence is re-inventoried and refreshed under the current helper
 session before it can produce a no-runtime receipt.
+
+Only that durable `no_runtime_resources` receipt permits the local managed
+service-resource deletion step to be skipped. Purging the Job spool, finalizing
+every claimed Computer disk generation, helper removal attestation, L1
+acknowledgement, and durable completion remain mandatory; a merely empty scan
+or absent disk path grants none of those shortcuts.
 
 For a Mac OCI one-shot that needs the run bridge, the agent asks Lima itself to
 resolve `host.lima.internal`, binds only that discovered guest-visible host
