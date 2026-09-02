@@ -658,6 +658,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	harness.agent.kill(t)
 	verification := inspectHelperNamespaceInventory(t, helperSocket, helperChecksum)
 	receipt.ResidueInventories["post_removal_observed_inventory"] = verification.Inventory
+	receipt.ResidueInventories["post_removal_helper_namespace"] = verification.Inventory
 	receipt.ResidueInventories["post_removal_runtime_residue"] = verification.RuntimeResidue
 	receipt.ResidueInventories["post_removal_durable_retained"] = verification.DurableRetained
 	receipt.ResidueAssertions["post_removal_observed_inventory_restored"] = reflect.DeepEqual(verification.Inventory, removalBaseline.Inventory)
