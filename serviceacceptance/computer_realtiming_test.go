@@ -1598,7 +1598,8 @@ path, key, body = sys.argv[1:4]
 endpoint = urllib.parse.urlsplit(open("/wefty/control/l3-endpoint", encoding="utf-8").read().strip())
 token = open("/wefty/control/computer-token", encoding="utf-8").read().strip()
 payload = body.encode()
-request = ("POST " + path + " HTTP/1.1\r\nHost: " + endpoint.netloc + "\r\nAuthorization: Bearer " + token +
+request_path = endpoint.path.rstrip("/") + path
+request = ("POST " + request_path + " HTTP/1.1\r\nHost: " + endpoint.netloc + "\r\nAuthorization: Bearer " + token +
            "\r\nContent-Type: application/json\r\nIdempotency-Key: " + key + "\r\nExpect: 100-continue\r\nConnection: close\r\nContent-Length: " +
            str(len(payload)) + "\r\n\r\n").encode()
 status, response_body, transport_error = 0, "", ""
@@ -1631,14 +1632,16 @@ print(json.dumps({"status": status, "body": response_body, "transport_error": tr
 `
 
 func TestLiveComputerPausedHTTPProbeWaitsForServerAdmission(t *testing.T) {
+	endpointPath := strings.Index(liveComputerPausedHTTPPython, `endpoint.path.rstrip("/") + path`)
+	requestPath := strings.Index(liveComputerPausedHTTPPython, `"POST " + request_path`)
 	expect := strings.Index(liveComputerPausedHTTPPython, `Expect: 100-continue`)
 	acknowledged := strings.Index(liveComputerPausedHTTPPython, `HTTP/1.1 100 Continue`)
 	paused := strings.Index(liveComputerPausedHTTPPython, `print("PAUSED"`)
 	bounded := strings.Index(liveComputerPausedHTTPPython, `select.select([sys.stdin], [], [], 30)`)
 	released := strings.Index(liveComputerPausedHTTPPython, `sys.stdin.readline()`)
 	bodySent := strings.LastIndex(liveComputerPausedHTTPPython, `connection.sendall(payload)`)
-	if expect < 0 || acknowledged < expect || paused < acknowledged || bounded < paused || released < bounded || bodySent < released {
-		t.Fatalf("Computer revocation probe ordering expect=%d acknowledged=%d paused=%d bounded=%d released=%d body_sent=%d", expect, acknowledged, paused, bounded, released, bodySent)
+	if endpointPath < 0 || requestPath < endpointPath || expect < requestPath || acknowledged < expect || paused < acknowledged || bounded < paused || released < bounded || bodySent < released {
+		t.Fatalf("Computer revocation probe ordering endpoint_path=%d request_path=%d expect=%d acknowledged=%d paused=%d bounded=%d released=%d body_sent=%d", endpointPath, requestPath, expect, acknowledged, paused, bounded, released, bodySent)
 	}
 }
 
