@@ -186,6 +186,13 @@ func (engine *ContainerdEngine) prepareResetSuccessor(ctx context.Context, reque
 			if err := verifyComputerDiskAllocation(filepath.Join(diskRoot, "disk.ext4"), storage.DiskBytes); err != nil {
 				return ComputerStorageResetReceipt{}, err
 			}
+			witness, err := preparedComputerStorageWitness(diskRoot, manifest)
+			if err != nil || witness == nil {
+				return ComputerStorageResetReceipt{}, errors.Join(err, errors.New("replacement Computer Storage lacks durable preparation evidence"))
+			}
+			if err := persistComputerStoragePreparationWitness(diskRoot, *witness); err != nil {
+				return ComputerStorageResetReceipt{}, err
+			}
 			return *manifest.PreparationReceipt, nil
 		}
 	} else {
@@ -249,6 +256,13 @@ func (engine *ContainerdEngine) prepareResetSuccessor(ctx context.Context, reque
 	manifest.Prepared = true
 	manifest.PreparationReceipt = &receipt
 	if err := writeComputerDiskManifest(diskRoot, manifest); err != nil {
+		return ComputerStorageResetReceipt{}, err
+	}
+	witness, err := preparedComputerStorageWitness(diskRoot, manifest)
+	if err != nil || witness == nil {
+		return ComputerStorageResetReceipt{}, errors.Join(err, errors.New("replacement Computer Storage lacks durable preparation evidence"))
+	}
+	if err := persistComputerStoragePreparationWitness(diskRoot, *witness); err != nil {
 		return ComputerStorageResetReceipt{}, err
 	}
 	if err := engine.storageResetCheckpoint(computerStorageResetVerified); err != nil {

@@ -91,6 +91,46 @@ func TestRuntimeRemovalManifestAcceptsComputerStorageInsteadOfPhantomServiceData
 	}
 }
 
+func TestReconstructedStorageOnlyManifestRefreshesAfterHelperBoot(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "refresh-node", 1024)
+	defer spool.Close()
+	removal := testRuntimeRemoval("prepared-computer")
+	startedAt := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	if err := spool.beginRemoval(t.Context(), removal, startedAt); err != nil {
+		t.Fatal(err)
+	}
+	storage := &workloadrunner.ComputerStorage{
+		ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30,
+	}
+	witness := &contract.ComputerStoragePreparationWitness{
+		Kind: contract.ComputerStorageCopyVerifiedKind, ReceiptID: "copy-receipt",
+		NodeID: "refresh-node", RootInstanceID: removal.rootInstanceID, JobID: removal.jobID,
+		ComputerID: storage.ComputerID, StorageID: storage.StorageID,
+		StorageGeneration: storage.StorageGeneration, Revision: 1,
+		Fence: "copy-fence", HelperGeneration: 1,
+	}
+	attempt := workloadrunner.RuntimeResourceManifest{
+		Version: 1, RuntimeKind: contract.JobKindOCI, NodeID: "refresh-node",
+		BootSessionID: "boot-old", JobID: removal.jobID,
+		AttemptID:    contract.StorageOnlyRemovalAttemptID(storage.StorageGeneration),
+		FencingToken: removal.cleanupFence, WorkloadClass: contract.JobClassService,
+		RemovalGeneration: fmt.Sprint(removal.generation), StorageOnly: true,
+		ComputerStorage: storage, StoragePreparation: witness,
+	}
+	if err := spool.storeReconstructedRuntimeRemoval(t.Context(), removal, []workloadrunner.RuntimeResourceManifest{attempt}, startedAt); err != nil {
+		t.Fatal(err)
+	}
+	attempt.BootSessionID = "boot-current"
+	if err := spool.storeReconstructedRuntimeRemoval(t.Context(), removal, []workloadrunner.RuntimeResourceManifest{attempt}, startedAt.Add(time.Minute)); err != nil {
+		t.Fatalf("refresh Storage-only inventory after helper boot: %v", err)
+	}
+	record, found, err := spool.runtimeRemoval(t.Context(), removal.jobID)
+	if err != nil || !found || record.phase != runtimeRemovalPrepared || len(record.manifest.Attempts) != 1 ||
+		record.manifest.Attempts[0].BootSessionID != "boot-current" {
+		t.Fatalf("refreshed Storage-only removal = %+v found=%t err=%v", record, found, err)
+	}
+}
+
 func TestRuntimeRemovalManifestResumesCrashBoundaries(t *testing.T) {
 	directory := t.TempDir()
 	createdAt := time.Date(2026, 8, 27, 13, 0, 0, 0, time.UTC)

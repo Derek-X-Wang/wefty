@@ -4,7 +4,78 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"strings"
 )
+
+const (
+	StorageOnlyRemovalAttemptPrefix          = "storage-removal-"
+	StorageAbsentRemovalAttemptPrefix        = "storage-absent-"
+	ComputerStorageResetRetirementPrefix     = "storage-reset-"
+	ComputerStorageRestoreRetirementPrefix   = "storage-restore-"
+	ComputerStorageFailedImportCleanupPrefix = "storage-import-failed-"
+	ComputerStorageCopyVerifiedKind          = "computer_storage_copy_verified"
+	ComputerStorageResetVerifiedKind         = "computer_storage_reset_verified"
+)
+
+func StorageOnlyRemovalAttemptID(generation int64) string {
+	return fmt.Sprintf("%s%d", StorageOnlyRemovalAttemptPrefix, generation)
+}
+
+func ValidStorageOnlyRemovalAttemptID(attemptID string, generation int64) bool {
+	return generation > 0 && attemptID == StorageOnlyRemovalAttemptID(generation)
+}
+
+func StorageAbsentRemovalAttemptID(generation int64) string {
+	return fmt.Sprintf("%s%d", StorageAbsentRemovalAttemptPrefix, generation)
+}
+
+func ValidStorageAbsentRemovalAttemptID(attemptID string, generation int64) bool {
+	return generation > 0 && attemptID == StorageAbsentRemovalAttemptID(generation)
+}
+
+func ComputerStorageResetRetirementAttemptID(revision int64) string {
+	return fmt.Sprintf("%s%d", ComputerStorageResetRetirementPrefix, revision)
+}
+
+func ComputerStorageRestoreRetirementAttemptID(revision int64) string {
+	return fmt.Sprintf("%s%d", ComputerStorageRestoreRetirementPrefix, revision)
+}
+
+func ComputerStorageFailedImportCleanupAttemptID(revision int64) string {
+	return fmt.Sprintf("%s%d", ComputerStorageFailedImportCleanupPrefix, revision)
+}
+
+func ValidComputerStorageCleanupAttemptID(attemptID string, revision int64) bool {
+	return revision > 0 && (attemptID == ComputerStorageResetRetirementAttemptID(revision) ||
+		attemptID == ComputerStorageRestoreRetirementAttemptID(revision) ||
+		attemptID == ComputerStorageFailedImportCleanupAttemptID(revision))
+}
+
+// ComputerStoragePreparationWitness is helper-originated durable evidence
+// that a Storage generation was published without ever being attached.
+type ComputerStoragePreparationWitness struct {
+	Kind              string `json:"kind"`
+	ReceiptID         string `json:"receipt_id"`
+	NodeID            string `json:"node_id"`
+	RootInstanceID    string `json:"root_instance_id"`
+	JobID             string `json:"job_id"`
+	ComputerID        string `json:"computer_id"`
+	StorageID         string `json:"storage_id"`
+	StorageGeneration int64  `json:"storage_generation"`
+	Revision          int64  `json:"revision"`
+	Fence             string `json:"fence"`
+	HelperGeneration  uint64 `json:"helper_generation"`
+}
+
+func (w ComputerStoragePreparationWitness) Valid() bool {
+	validKind := w.Kind == ComputerStorageCopyVerifiedKind || w.Kind == ComputerStorageResetVerifiedKind
+	return validKind && strings.TrimSpace(w.ReceiptID) != "" &&
+		strings.TrimSpace(w.NodeID) != "" && strings.TrimSpace(w.RootInstanceID) != "" &&
+		strings.TrimSpace(w.JobID) != "" && strings.TrimSpace(w.ComputerID) != "" &&
+		strings.TrimSpace(w.StorageID) != "" && w.StorageGeneration > 0 && w.Revision > 0 &&
+		strings.TrimSpace(w.Fence) != "" && w.HelperGeneration > 0
+}
 
 // ComputerStorageResetReceipt is the one cross-boundary witness for a
 // prepared replacement generation. Keeping the wire shape in contract avoids

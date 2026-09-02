@@ -1550,6 +1550,7 @@ func mergeNativeExpectedInventory(left, right ocihelper.ResourceInventory) ocihe
 	left.Shims = mergeNativeIdentityClass(left.Shims, right.Shims)
 	left.Cgroups = mergeNativeIdentityClass(left.Cgroups, right.Cgroups)
 	left.LogSegments = mergeNativeIdentityClass(left.LogSegments, right.LogSegments)
+	left.ImageSpools = mergeNativeIdentityClass(left.ImageSpools, right.ImageSpools)
 	left.ManagedVolumes = mergeNativeIdentityClass(left.ManagedVolumes, right.ManagedVolumes)
 	left.ManagedVolumeRecords = mergeNativeIdentityClass(left.ManagedVolumeRecords, right.ManagedVolumeRecords)
 	left.ComputerDiskImages = mergeNativeIdentityClass(left.ComputerDiskImages, right.ComputerDiskImages)
@@ -1579,6 +1580,7 @@ func subtractNativeInventory(inventory, baseline ocihelper.ResourceInventory) oc
 	inventory.Shims = subtractNativeIdentityClass(inventory.Shims, baseline.Shims)
 	inventory.Cgroups = subtractNativeIdentityClass(inventory.Cgroups, baseline.Cgroups)
 	inventory.LogSegments = subtractNativeIdentityClass(inventory.LogSegments, baseline.LogSegments)
+	inventory.ImageSpools = subtractNativeIdentityClass(inventory.ImageSpools, baseline.ImageSpools)
 	inventory.ManagedVolumes = subtractNativeIdentityClass(inventory.ManagedVolumes, baseline.ManagedVolumes)
 	inventory.ManagedVolumeRecords = subtractNativeIdentityClass(inventory.ManagedVolumeRecords, baseline.ManagedVolumeRecords)
 	inventory.ComputerDiskImages = subtractNativeIdentityClass(inventory.ComputerDiskImages, baseline.ComputerDiskImages)
@@ -1615,6 +1617,7 @@ func nonEmptyInventoryClassNames(inventory ocihelper.ResourceInventory) []string
 		name   string
 		values []string
 	}{
+		{"image_spools", inventory.ImageSpools},
 		{"managed_volumes", inventory.ManagedVolumes}, {"managed_volume_records", inventory.ManagedVolumeRecords},
 		{"computer_disk_images", inventory.ComputerDiskImages}, {"computer_disk_allocations", inventory.ComputerDiskAllocations},
 		{"computer_disk_quotas", inventory.ComputerDiskQuotas}, {"computer_disk_manifests", inventory.ComputerDiskManifests},
@@ -1652,7 +1655,7 @@ func inventoryIdentitiesEqual(left, right ocihelper.ResourceInventory) bool {
 func inventoryIdentityClasses(inventory ocihelper.ResourceInventory) [][]string {
 	return [][]string{
 		inventory.Leases, inventory.Snapshots, inventory.Containers, inventory.Tasks, inventory.Shims, inventory.Cgroups,
-		inventory.LogSegments, inventory.ManagedVolumes, inventory.ManagedVolumeRecords, inventory.ComputerDiskImages,
+		inventory.LogSegments, inventory.ImageSpools, inventory.ManagedVolumes, inventory.ManagedVolumeRecords, inventory.ComputerDiskImages,
 		inventory.ComputerDiskAllocations, inventory.ComputerDiskQuotas, inventory.ComputerDiskManifests,
 		inventory.ComputerDiskMounts, inventory.ComputerDiskLoops, inventory.ComputerAttachments,
 		inventory.ComputerResetManifests, inventory.ComputerQuarantines, inventory.ComputerDiskAnomalies,

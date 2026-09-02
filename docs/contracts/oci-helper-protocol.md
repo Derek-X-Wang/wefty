@@ -233,13 +233,14 @@ heartbeats.
 | `Watch` | Exact live attempt; live-tails checksum-protected stdout/stderr frames, requires an agent acknowledgement after each event, emits per-stream EOF/incomplete seals, and then exactly one structured exit, signal, OOM-additive, or runtime-failure result on a dedicated connection. Log incompleteness is additive and never replaces the real terminal arm. |
 | `Delete` | Exact live attempt only, except that one tombstoned attempt whose helper deadman completed a successful guardian reap may authorize exactly one later `Delete` with full seven-field attempt-authority equality and the current node/boot-session gate. That exception still calls engine `Delete`, repeats independent absence verification, and releases image pins, capacity, ports, and retained runtime state before returning positive deletion; it never treats the earlier reap alone as the response. The helper consumes the guardian evidence when that call completes, so a second exact call, stale fence, foreign attempt, different removal generation or boot session, and every failed guardian reap remain refused. In every path, a positive deletion means the engine has removed and independently verified absence of the attempt's task, container, overlayfs snapshot, lease, and log segments while retaining any stable handoff volume; only then does the server tombstone authorization. |
 | `DeleteManagedVolume` | Session-authorized and closed to a derived `handoff` or `service_data` owner key, or exact Computer-removal Storage and cleanup authority. The helper derives the source, deletes only that resource (plus any paired owner record), independently verifies absence, and returns no general path authority. |
-| `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. After separate stable service-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
+| `InventoryRemoval` | Session-authorized current inventory for legacy removal reconstruction. The server snapshots the live-attempt registry, releases its mutex for the engine scan, then rechecks the registry before returning; heartbeat and Run dispatch stay live throughout the scan, and a new matching attempt fails the inventory closed. Computer reimage serialization is context-bounded. A Job-scoped scan returns runtime authorities once. Each per-generation scan returns only Storage proof and never repeats runtime authorities: either a prepared disk backed by a durable copy/reset receipt and no attachment lineage, loop, mount, pending attachment, or retirement, or a distinct typed already-absent disk-root authority. The helper never creates a missing root while proving absence. Every result is bound to the current Node, boot, Job, removal generation, cleanup fence, and exact disk identity. |
+| `AttestRemoval` | Session-authorized exact Job/removal generation plus reconstructed attempt authorities and deterministic resource rows. A prepared-removal Storage-only authority requires its helper-originated never-attached witness; reset/restore predecessor and failed-import cleanup use separate typed operation authorities and cannot claim that witness. After separate durable-data deletion, the helper inventories every row and returns only assertion-derived positive absence evidence. |
 | `ResetComputerStorage` | Session-authorized exact reset revision and old/new Storage generations. Under the predecessor attachment flock it records a durable retirement fence, then fully allocates, formats, and verifies the successor from a manifest published before its image. It does not delete, publish, attach, or start; predecessor deletion and attestation reuse `DeleteManagedVolume` and `AttestRemoval` after L1 publication. |
 | `CopyComputerStorage` | Session-authorized exact restore, clone, or import operation; binds its managed Backup source or immutable external manifest, destination Computer/Storage generation, Node/root instance, Job, revision, and cleanup fence. It verifies source bytes before destination creation. Restore preserves machine identity; clone/import narrowly rekey it and may expand a larger filesystem. |
 | `ExportComputerCustody` | Session-authorized transfer of one published Backup copy to an absolute operator-owned path outside the managed root. L1 has already committed the permanent custody event. The helper retains partial bytes on interruption and returns only observed size, content-digest, manifest-digest, path-derived owner UID/GID, ownership-applied, and private-mode-applied evidence. |
-| `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A failure after ext4 may have expanded returns `computer_storage_grow_uncertain`, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
+| `GrowComputerStorage` | Session-authorized exact current Storage generation, managed-root instance, Job, operation revision/fence, and old/new byte counts. Under attachment/detachment serialization it makes one newcomer-pays admission decision, fully allocates the final image size, refreshes an attached loop device when present, expands ext4, and only then publishes the new manifest size and assertion-derived receipt. A missing manifest cannot be reconstructed as empty lineage when an immutable copy receipt or durable reset-preparation record proves prior storage preparation; that contradiction returns typed `computer_storage_grow_uncertain` before reserving capacity or mutating bytes. A failure after ext4 may have expanded returns the same typed uncertainty, preserves the expanded image, and leaves the exact authority resumable; it never claims `failed_unchanged`. |
 | `PreflightComputerReimage` | Session-authorized exact current Storage generation and byte budget, managed-root instance, old/staging Jobs, operation revision/fence, and target digest. Under the generation flock it requires real detachment or explicit verified never-attached reset-preparation evidence, verifies the locally selected manifest platform, reads image and ext4-root UID:GID, and returns assertion-derived success or closed stage/reason failure evidence before L1 may publish or refuse the staging projection. |
-| `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace for boot-barrier absence proof. |
+| `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace. `namespace` is the mutating boot-barrier proof that may update pins, cache state, and sweep completion. `namespace_read_only` is an observation-only inventory route for acceptance baselines; it cannot satisfy the boot barrier or update helper policy state. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. Success is withheld until the helper has connected that backend. A refused payload listener is a typed, attempt-scoped `engine_failure` and does not invalidate the healthy helper session, so readiness can observe withdrawal and retry republication. Only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
 | `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the Mac bind-failure fallback and the helper issued that attempt's separate bridge capability. It never accepts an arbitrary host address or port. |
@@ -827,9 +828,28 @@ facts. Both receipts bind the Node, managed-root instance, operation revision,
 cleanup/custody fence, and helper generation; neither helper call decides
 removal truth.
 
+`InventoryRemoval` normally reconstructs exact observed attempt authority from
+one Job-scoped scan. Each subsequent Computer-generation request returns only
+that generation's deterministic Storage rows, so the adapter cannot duplicate
+runtime authority across generations. Its no-runtime results are either an
+exact prepared disk with no attached, pending, previously detached, or retired
+authority, or an exact typed absent-disk-root authority. The latter is absence
+evidence, not preparation evidence, and does not create filesystem state.
+Every result remains bound to the authenticated current helper session and
+durable removal fence; malformed, anomalous, historically attached, or
+identity-mismatched disks still fail closed.
+
 `AttestRemoval` accepts only an exact service Job/generation plus reconstructed
-attempt authorities and their deterministic resource rows, and is called after
-the separate idempotent `DeleteManagedVolume(service_data, job_id)` succeeds.
+attempt authorities and their deterministic resource rows. Ordinary services
+call it after the separate idempotent
+`DeleteManagedVolume(service_data, job_id)` succeeds; Computer operation
+cleanup calls it after the corresponding Computer disk deletion succeeds.
+Storage-only attestation has two closed authority shapes: the prepared-removal
+shape carries the exact helper-originated never-attached witness returned by
+`InventoryRemoval`, while reset/restore predecessor and failed-import cleanup
+carry a typed operation/revision attempt identity after their separately
+authorized `DeleteManagedVolume` call. The operation shapes cannot claim the
+never-attached witness, and an arbitrary synthetic attempt identity is refused.
 It inventories every named lease, snapshot, container, task, shim, cgroup,
 framed-log directory, and durable-data class. Ordinary services assert both
 their service-data directory and owner record; Computers instead assert disk
@@ -905,7 +925,8 @@ the sweep epoch and helper
 generation. The helper retains a bounded process-local history of these
 identities across session generations; a bare verified-empty sweep is insufficient. Legacy manifest
 reconstruction and replacement-sweep attempt recovery continue to require the
-complete authority match.
+complete authority match, except for the current-session prepared Computer
+Storage-only inventory described above.
 
 When native OCI is configured, the production agent opens a boot barrier and
 installs the OCI adapter as one unit. It advertises `kind:oci`, `cgroup_v2`, and

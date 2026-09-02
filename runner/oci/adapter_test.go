@@ -1906,6 +1906,115 @@ func TestLegacyRemovalReconstructsFrozenInventoryFromCurrentHelperScan(t *testin
 	}
 }
 
+func TestLegacyComputerRemovalReconstructsPreparedStorageWithoutRuntimeAttempt(t *testing.T) {
+	authority := ocihelper.AttemptAuthority{NodeID: "node", BootSessionID: "boot", JobID: "prepared-computer", AttemptID: "storage-removal-1", FencingToken: "cleanup", Class: contract.JobClassService, RemovalGeneration: "1"}
+	storage := &ocihelper.ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30}
+	witness := &contract.ComputerStoragePreparationWitness{Kind: "computer_storage_copy_verified", ReceiptID: "receipt", NodeID: "node", RootInstanceID: "root",
+		JobID: authority.JobID, ComputerID: storage.ComputerID, StorageID: storage.StorageID, StorageGeneration: storage.StorageGeneration,
+		Revision: 1, Fence: "copy", HelperGeneration: 1}
+	engine := &adapterTestEngine{inventoryRemoval: ocihelper.InventoryRemovalResponse{Attempts: []ocihelper.RemovalAttemptManifest{{
+		Authority: authority, ComputerStorage: storage, StorageOnly: true, StoragePreparation: witness,
+		Resources: []ocihelper.RemovalResource{
+			{Class: ocihelper.RemovalResourceComputerDiskImage, ID: mustComputerDiskName(t, *storage)},
+			{Class: ocihelper.RemovalResourceComputerDiskAllocation, ID: mustComputerDiskName(t, *storage)},
+			{Class: ocihelper.RemovalResourceComputerDiskQuota, ID: mustComputerDiskName(t, *storage)},
+			{Class: ocihelper.RemovalResourceComputerDiskManifest, ID: mustComputerDiskName(t, *storage)},
+			{Class: ocihelper.RemovalResourceComputerDiskMount, ID: mustComputerDiskName(t, *storage)},
+			{Class: ocihelper.RemovalResourceComputerDiskLoop, ID: mustComputerDiskName(t, *storage)},
+			{Class: ocihelper.RemovalResourceComputerAttachment, ID: mustComputerDiskName(t, *storage)},
+			{Class: ocihelper.RemovalResourceComputerResetManifest, ID: mustComputerDiskName(t, *storage)},
+			{Class: ocihelper.RemovalResourceComputerQuarantine, ID: mustComputerDiskName(t, *storage)},
+		},
+	}}}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := workloadrunner.RuntimeRemovalProofRequest{NodeID: "node", BootSessionID: "boot", RootInstanceID: "root", JobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "cleanup",
+		ComputerStorage: &workloadrunner.ComputerStorage{ComputerID: storage.ComputerID, StorageID: storage.StorageID, StorageGeneration: storage.StorageGeneration}}
+	attempts, err := adapter.ReconstructRuntimeRemoval(t.Context(), request)
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("prepared Computer reconstruction = %+v err=%v", attempts, err)
+	}
+	if !attempts[0].StorageOnly || attempts[0].ComputerStorage == nil || len(attempts[0].RemovalResources()) != 9 {
+		t.Fatalf("prepared Computer reconstruction invented runtime rows: %+v", attempts[0])
+	}
+	engine.inventoryRemoval.Attempts[0].Authority.FencingToken = "stale-cleanup"
+	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
+		t.Fatal("prepared Computer reconstruction accepted stale cleanup authority")
+	}
+	engine.inventoryRemoval.Attempts[0].Authority.FencingToken = authority.FencingToken
+	engine.inventoryRemoval.Attempts[0].Authority.BootSessionID = "stale-boot"
+	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
+		t.Fatal("prepared Computer reconstruction accepted stale helper boot")
+	}
+	engine.inventoryRemoval.Attempts[0].Authority.BootSessionID = authority.BootSessionID
+	engine.inventoryRemoval.Attempts[0].ComputerStorage.StorageID = "other-storage"
+	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
+		t.Fatal("prepared Computer reconstruction accepted conflicting Storage identity")
+	}
+}
+
+func TestLegacyComputerRemovalReconstructsNoRuntimeAndAlreadyDeletedGenerationEvidence(t *testing.T) {
+	engine := &adapterTestEngine{inventoryRemoval: ocihelper.InventoryRemovalResponse{NoRuntimeAttempts: true}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := workloadrunner.RuntimeRemovalProofRequest{
+		NodeID: "node", BootSessionID: "boot", RootInstanceID: "root", JobID: "prepared-computer",
+		RemovalGeneration: 3, CleanupFence: "cleanup",
+	}
+	attempts, err := adapter.ReconstructRuntimeRemoval(t.Context(), request)
+	if err != nil || len(attempts) != 0 {
+		t.Fatalf("positive no-runtime inventory = %+v err=%v", attempts, err)
+	}
+	storage := &ocihelper.ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30}
+	authority := ocihelper.AttemptAuthority{
+		NodeID: request.NodeID, BootSessionID: request.BootSessionID, JobID: request.JobID,
+		AttemptID: contract.StorageAbsentRemovalAttemptID(storage.StorageGeneration), FencingToken: request.CleanupFence,
+		Class: contract.JobClassService, RemovalGeneration: "3",
+	}
+	engine.inventoryRemoval = ocihelper.InventoryRemovalResponse{Attempts: []ocihelper.RemovalAttemptManifest{{
+		Authority: authority, ComputerStorage: storage, StorageOnly: true, StorageAbsent: true,
+		Resources: ocihelper.ExpectedRemovalResources(ocihelper.ResourceIdentity{}, "", storage),
+	}}}
+	request.ComputerStorage = &workloadrunner.ComputerStorage{
+		ComputerID: storage.ComputerID, StorageID: storage.StorageID,
+		StorageGeneration: storage.StorageGeneration, DiskBytes: storage.DiskBytes,
+	}
+	attempts, err = adapter.ReconstructRuntimeRemoval(t.Context(), request)
+	if err != nil || len(attempts) != 1 || !attempts[0].StorageOnly || !attempts[0].StorageAbsent || attempts[0].StoragePreparation != nil {
+		t.Fatalf("already-deleted generation reconstruction = %+v err=%v", attempts, err)
+	}
+}
+
+func TestLegacyComputerRemovalAcceptsTypedEmptyPerGenerationInventory(t *testing.T) {
+	engine := &adapterTestEngine{inventoryRemoval: ocihelper.InventoryRemovalResponse{NoStorageEvidence: true}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := workloadrunner.RuntimeRemovalProofRequest{
+		NodeID: "node", BootSessionID: "boot", RootInstanceID: "root", JobID: "detached-computer",
+		RemovalGeneration: 3, CleanupFence: "cleanup",
+		ComputerStorage: &workloadrunner.ComputerStorage{
+			ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30,
+		},
+	}
+	attempts, err := adapter.ReconstructRuntimeRemoval(t.Context(), request)
+	if err != nil || len(attempts) != 0 {
+		t.Fatalf("typed empty per-generation inventory = %+v err=%v", attempts, err)
+	}
+	engine.inventoryRemoval = ocihelper.InventoryRemovalResponse{}
+	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
+		t.Fatal("untyped empty per-generation inventory was accepted")
+	}
+}
+
+func mustComputerDiskName(t *testing.T, storage ocihelper.ComputerStorageReference) string {
+	t.Helper()
+	name, err := ocihelper.DeterministicComputerDiskName(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return name
+}
+
 func TestRemovalManifestRegistriesMatchHelperForEveryKind(t *testing.T) {
 	authority := ocihelper.AttemptAuthority{NodeID: "node", BootSessionID: "boot", JobID: "service", AttemptID: "attempt", FencingToken: "fence", Class: contract.JobClassService, RemovalGeneration: "1"}
 	identity, err := ocihelper.DeterministicResourceIdentity(authority)

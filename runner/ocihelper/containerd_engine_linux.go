@@ -1652,6 +1652,12 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 	}
 	authorities := make(map[string]AttemptAuthority)
 	add := func(authority AttemptAuthority, kind, observedID string) error {
+		// Per-generation calls prove only prepared or already-deleted Storage.
+		// Runtime authorities are inventoried once by the job-scoped call so they
+		// cannot be repeated for every historical generation.
+		if request.ComputerStorage != nil {
+			return nil
+		}
 		if authority.JobID != request.Removal.JobID {
 			return nil
 		}
@@ -1729,37 +1735,11 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 			return InventoryRemovalResponse{}, err
 		}
 	}
-	var computerStorage *ComputerStorageReference
 	if request.ComputerStorage != nil {
-		name, nameErr := DeterministicComputerDiskName(*request.ComputerStorage)
-		if nameErr != nil {
-			return InventoryRemovalResponse{}, nameErr
-		}
-		for _, anomaly := range inventory.ComputerDiskAnomalies {
-			if strings.HasPrefix(anomaly, name+":") {
-				return InventoryRemovalResponse{}, fmt.Errorf("legacy Computer removal inventory is anomalous: %s", anomaly)
-			}
-		}
-		root := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
-		manifest, present, manifestErr := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
-		if manifestErr != nil || !present {
-			return InventoryRemovalResponse{}, errors.Join(manifestErr, errors.New("legacy Computer removal has no readable disk manifest"))
-		}
-		if !sameComputerStorageIdentity(manifest.Storage, *request.ComputerStorage) {
-			return InventoryRemovalResponse{}, errors.New("legacy Computer removal disk manifest does not match L1 Storage identity")
-		}
-		storage := manifest.Storage
-		computerStorage = &storage
-		for _, authority := range []*AttemptAuthority{manifest.Attached, manifest.Pending} {
-			if authority != nil {
-				if err := add(*authority, "computer", name); err != nil {
-					return InventoryRemovalResponse{}, err
-				}
-			}
-		}
+		return engine.inventoryComputerStorageRemoval(ctx, request, inventory)
 	}
 	if len(authorities) == 0 {
-		return InventoryRemovalResponse{}, errors.New("legacy OCI removal current scan found no matching helper-owned attempt authority")
+		return InventoryRemovalResponse{NoRuntimeAttempts: true}, nil
 	}
 	attempts := make([]RemovalAttemptManifest, 0, len(authorities))
 	for _, authority := range authorities {
@@ -1768,12 +1748,144 @@ func (engine *ContainerdEngine) InventoryRemoval(ctx context.Context, request In
 			return InventoryRemovalResponse{}, identityErr
 		}
 		attempts = append(attempts, RemovalAttemptManifest{
-			Authority: authority, ComputerStorage: computerStorage,
-			Resources: ExpectedRemovalResources(identity, "", computerStorage),
+			Authority: authority,
+			Resources: ExpectedRemovalResources(identity, "", nil),
 		})
 	}
 	sort.Slice(attempts, func(i, j int) bool { return attempts[i].Authority.AttemptID < attempts[j].Authority.AttemptID })
 	return InventoryRemovalResponse{Attempts: attempts}, nil
+}
+
+func (engine *ContainerdEngine) inventoryComputerStorageRemoval(ctx context.Context, request InventoryRemovalRequest, inventory ResourceInventory) (_ InventoryRemovalResponse, err error) {
+	storage := *request.ComputerStorage
+	name, err := DeterministicComputerDiskName(storage)
+	if err != nil {
+		return InventoryRemovalResponse{}, err
+	}
+	for _, anomaly := range inventory.ComputerDiskAnomalies {
+		if strings.HasPrefix(anomaly, name+":") {
+			return InventoryRemovalResponse{}, fmt.Errorf("legacy Computer removal inventory is anomalous: %s", anomaly)
+		}
+	}
+	if !lockComputerReimageMutex(ctx, &engine.computerReimageMu) {
+		return InventoryRemovalResponse{}, fmt.Errorf("acquire Computer removal inventory serialization: %w", context.Cause(ctx))
+	}
+	reimageLocked := true
+	defer func() {
+		if reimageLocked {
+			engine.computerReimageMu.Unlock()
+		}
+	}()
+	root := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+	if _, statErr := os.Lstat(root); errors.Is(statErr, os.ErrNotExist) {
+		attempt, attemptErr := absentComputerStorageRemovalAttempt(request, storage)
+		if attemptErr != nil {
+			return InventoryRemovalResponse{}, attemptErr
+		}
+		return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
+	} else if statErr != nil {
+		return InventoryRemovalResponse{}, fmt.Errorf("inspect Computer removal inventory root: %w", statErr)
+	}
+	lock, lockErr := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if lockErr != nil {
+		return InventoryRemovalResponse{}, fmt.Errorf("open Computer removal inventory lock: %w", lockErr)
+	}
+	if lockErr = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); lockErr != nil {
+		_ = lock.Close()
+		return InventoryRemovalResponse{}, errComputerStorageAttachmentOwned
+	}
+	engine.computerReimageMu.Unlock()
+	reimageLocked = false
+	defer func() {
+		_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+		_ = lock.Close()
+	}()
+	manifest, present, manifestErr := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
+	if manifestErr != nil || !present {
+		return InventoryRemovalResponse{}, errors.Join(manifestErr, errors.New("legacy Computer removal has no readable disk manifest"))
+	}
+	if !sameComputerStorageIdentity(manifest.Storage, storage) {
+		return InventoryRemovalResponse{}, errors.New("legacy Computer removal disk manifest does not match L1 Storage identity")
+	}
+	if _, mounted, mountErr := engine.computerDiskSystem().mountedSource(filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)); mountErr != nil {
+		return InventoryRemovalResponse{}, mountErr
+	} else if mounted {
+		return InventoryRemovalResponse{}, errors.New("legacy Computer removal disk remains mounted")
+	}
+	if attempt, eligible, attemptErr := preparedComputerStorageRemovalAttempt(request, root, manifest); attemptErr != nil {
+		return InventoryRemovalResponse{}, attemptErr
+	} else if eligible {
+		return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
+	}
+	return InventoryRemovalResponse{NoStorageEvidence: true}, nil
+}
+
+func absentComputerStorageRemovalAttempt(request InventoryRemovalRequest, storage ComputerStorageReference) (RemovalAttemptManifest, error) {
+	if _, err := DeterministicComputerDiskName(storage); err != nil {
+		return RemovalAttemptManifest{}, err
+	}
+	authority := AttemptAuthority{
+		NodeID: request.Removal.NodeID, BootSessionID: request.Removal.BootSessionID, JobID: request.Removal.JobID,
+		AttemptID: contract.StorageAbsentRemovalAttemptID(storage.StorageGeneration), FencingToken: request.Removal.CleanupFence,
+		Class: contract.JobClassService, RemovalGeneration: fmt.Sprint(request.Removal.RemovalGeneration),
+	}
+	if err := authority.validate(); err != nil {
+		return RemovalAttemptManifest{}, err
+	}
+	return RemovalAttemptManifest{
+		Authority: authority, ComputerStorage: &storage, StorageOnly: true, StorageAbsent: true,
+		Resources: expectedComputerStorageRemovalResources(&storage),
+	}, nil
+}
+
+func preparedComputerStorageRemovalAttempt(request InventoryRemovalRequest, root string, manifest computerDiskManifest) (RemovalAttemptManifest, bool, error) {
+	if !manifest.Prepared || manifest.Attached != nil || manifest.Pending != nil || manifest.PreviousDetachment != nil || manifest.Retirement != nil || manifest.LoopDevice != "" {
+		return RemovalAttemptManifest{}, false, nil
+	}
+	storage := manifest.Storage
+	witness, err := preparedComputerStorageWitness(root, manifest)
+	if err != nil {
+		return RemovalAttemptManifest{}, false, err
+	}
+	if witness == nil || !witness.Valid() || witness.NodeID != request.Removal.NodeID || witness.RootInstanceID != request.RootInstanceID ||
+		witness.JobID != request.Removal.JobID || witness.ComputerID != storage.ComputerID || witness.StorageID != storage.StorageID ||
+		witness.StorageGeneration != storage.StorageGeneration {
+		return RemovalAttemptManifest{}, false, nil
+	}
+	authority := AttemptAuthority{
+		NodeID: request.Removal.NodeID, BootSessionID: request.Removal.BootSessionID, JobID: request.Removal.JobID,
+		AttemptID: contract.StorageOnlyRemovalAttemptID(storage.StorageGeneration), FencingToken: request.Removal.CleanupFence,
+		Class: contract.JobClassService, RemovalGeneration: fmt.Sprint(request.Removal.RemovalGeneration),
+	}
+	if err := authority.validate(); err != nil {
+		return RemovalAttemptManifest{}, false, err
+	}
+	return RemovalAttemptManifest{
+		Authority: authority, ComputerStorage: &storage, StorageOnly: true, StoragePreparation: witness,
+		Resources: expectedComputerStorageRemovalResources(&storage),
+	}, true, nil
+}
+
+func preparedComputerStorageWitness(root string, manifest computerDiskManifest) (*contract.ComputerStoragePreparationWitness, error) {
+	if receipt := manifest.PreparationReceipt; receipt != nil {
+		return &contract.ComputerStoragePreparationWitness{
+			Kind: receipt.Kind, ReceiptID: receipt.ReceiptID, NodeID: receipt.NodeID, RootInstanceID: receipt.RootInstanceID,
+			JobID: receipt.JobID, ComputerID: receipt.ComputerID, StorageID: receipt.StorageID,
+			StorageGeneration: receipt.NewGeneration, Revision: receipt.IntentRevision, Fence: receipt.CleanupFence,
+			HelperGeneration: receipt.HelperGeneration,
+		}, nil
+	}
+	copyManifest, present, err := readComputerStorageCopyManifest(filepath.Join(root, "storage-copy.json"))
+	if err != nil || !present || copyManifest.Phase != computerStorageCopyPublished || copyManifest.Receipt == nil {
+		return nil, err
+	}
+	receipt := copyManifest.Receipt
+	return &contract.ComputerStoragePreparationWitness{
+		Kind: receipt.Kind, ReceiptID: receipt.ReceiptID, NodeID: receipt.NodeID, RootInstanceID: receipt.RootInstanceID,
+		JobID: receipt.JobID, ComputerID: receipt.DestinationComputerID, StorageID: receipt.DestinationStorageID,
+		StorageGeneration: receipt.DestinationGeneration, Revision: receipt.OperationRevision, Fence: receipt.CleanupFence,
+		HelperGeneration: receipt.HelperGeneration,
+	}, nil
 }
 
 func (engine *ContainerdEngine) deleteServiceDataVolume(jobID string) error {
@@ -3012,7 +3124,7 @@ func (engine *ContainerdEngine) watchOOM(attempt *containerdAttempt) {
 }
 
 func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventory, error) {
-	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerDiskAnomalies: []string{}}
+	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ImageSpools: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerDiskAnomalies: []string{}}
 	leaseList, err := engine.client.LeasesService().List(ctx)
 	if err != nil {
 		return result, err
@@ -3082,6 +3194,13 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 			result.LogSegments = append(result.LogSegments, entry.Name())
 		}
 	}
+	spoolEntries, err := readDirectoryIfPresent(filepath.Join(engine.config.RuntimeRoot, "imports"))
+	if err != nil {
+		return result, err
+	}
+	for _, entry := range spoolEntries {
+		result.ImageSpools = append(result.ImageSpools, entry.Name())
+	}
 	shimEntries, err := readDirectoryIfPresent(filepath.Join(engine.config.ContainerdStateRoot, "io.containerd.runtime.v2.task", ContainerdNamespace))
 	if err != nil {
 		return result, err
@@ -3113,6 +3232,7 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 	sort.Strings(result.Shims)
 	sort.Strings(result.Cgroups)
 	sort.Strings(result.LogSegments)
+	sort.Strings(result.ImageSpools)
 	sort.Strings(result.ManagedVolumes)
 	sort.Strings(result.ManagedVolumeRecords)
 	sort.Strings(result.ComputerDiskImages)
@@ -3160,7 +3280,7 @@ func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInvento
 }
 
 func filterInventory(inventory ResourceInventory, resources ResourceIdentity, attachment *computerDiskAttachment) ResourceInventory {
-	filtered := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerDiskAnomalies: []string{}}
+	filtered := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ImageSpools: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerDiskAnomalies: []string{}}
 	for _, pair := range []struct {
 		values []string
 		target string
@@ -3284,6 +3404,10 @@ func projectRuntimeAbsenceInventory(inventory ResourceInventory, retainedService
 		_, retained := retainedRecords[name]
 		return retained
 	})
+	// Import spools are helper-owned durable scratch. Sweep may collect them on
+	// its own schedule, so they are observed but never classified as runtime
+	// residue for namespace absence.
+	projected.ImageSpools = nil
 	manifestNames := make(map[string]struct{}, len(projected.ComputerDiskManifests))
 	for _, name := range projected.ComputerDiskManifests {
 		manifestNames[name] = struct{}{}
@@ -3330,6 +3454,7 @@ func subtractResourceInventory(observed, residue ResourceInventory) ResourceInve
 		Shims:                   subtract(observed.Shims, residue.Shims),
 		Cgroups:                 subtract(observed.Cgroups, residue.Cgroups),
 		LogSegments:             subtract(observed.LogSegments, residue.LogSegments),
+		ImageSpools:             subtract(observed.ImageSpools, residue.ImageSpools),
 		ManagedVolumes:          subtract(observed.ManagedVolumes, residue.ManagedVolumes),
 		ManagedVolumeRecords:    subtract(observed.ManagedVolumeRecords, residue.ManagedVolumeRecords),
 		ComputerDiskImages:      subtract(observed.ComputerDiskImages, residue.ComputerDiskImages),
@@ -3376,7 +3501,7 @@ func readDirectoryIfPresent(path string) ([]os.DirEntry, error) {
 }
 
 func inventoryCount(inventory ResourceInventory) int {
-	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) + len(inventory.ComputerQuarantines) + len(inventory.ComputerDiskAnomalies)
+	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ImageSpools) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) + len(inventory.ComputerQuarantines) + len(inventory.ComputerDiskAnomalies)
 }
 
 func kernelRelease() string {

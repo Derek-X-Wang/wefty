@@ -868,15 +868,18 @@ type RemovalResource struct {
 }
 
 type RemovalAttemptManifest struct {
-	Authority       AttemptAuthority          `json:"authority"`
-	HandoffVolume   string                    `json:"handoff_volume,omitempty"`
-	ComputerStorage *ComputerStorageReference `json:"computer_storage,omitempty"`
-	StorageOnly     bool                      `json:"storage_only,omitempty"`
-	Resources       []RemovalResource         `json:"resources"`
+	Authority          AttemptAuthority                            `json:"authority"`
+	HandoffVolume      string                                      `json:"handoff_volume,omitempty"`
+	ComputerStorage    *ComputerStorageReference                   `json:"computer_storage,omitempty"`
+	StorageOnly        bool                                        `json:"storage_only,omitempty"`
+	StorageAbsent      bool                                        `json:"storage_absent,omitempty"`
+	StoragePreparation *contract.ComputerStoragePreparationWitness `json:"storage_preparation,omitempty"`
+	Resources          []RemovalResource                           `json:"resources"`
 }
 
 type InventoryRemovalRequest struct {
 	Removal         ManagedVolumeRemovalAuthority `json:"removal"`
+	RootInstanceID  string                        `json:"root_instance_id"`
 	ComputerStorage *ComputerStorageReference     `json:"computer_storage,omitempty"`
 }
 
@@ -884,6 +887,8 @@ type InventoryRemovalResponse struct {
 	JobID             string                   `json:"job_id"`
 	RemovalGeneration uint64                   `json:"removal_generation"`
 	HelperSession     HelperSession            `json:"helper_session"`
+	NoRuntimeAttempts bool                     `json:"no_runtime_attempts,omitempty"`
+	NoStorageEvidence bool                     `json:"no_storage_evidence,omitempty"`
 	Attempts          []RemovalAttemptManifest `json:"attempts"`
 }
 
@@ -995,9 +1000,12 @@ func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) e
 			return errors.New("removal attestation repeats an attempt authority")
 		}
 		seenAttempts[authority.key()] = struct{}{}
-		identity, err := DeterministicResourceIdentity(authority)
-		if err != nil {
-			return err
+		var identity ResourceIdentity
+		if !attempt.StorageOnly {
+			identity, err = DeterministicResourceIdentity(authority)
+			if err != nil {
+				return err
+			}
 		}
 		if attempt.ComputerStorage != nil {
 			if _, err := DeterministicComputerDiskName(*attempt.ComputerStorage); err != nil || attempt.ComputerStorage.DiskBytes <= 0 {
@@ -1008,6 +1016,26 @@ func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) e
 		if attempt.StorageOnly {
 			if attempt.ComputerStorage == nil {
 				return errors.New("storage-only removal attestation requires Computer Storage")
+			}
+			switch {
+			case attempt.StorageAbsent && contract.ValidStorageAbsentRemovalAttemptID(authority.AttemptID, attempt.ComputerStorage.StorageGeneration):
+				if attempt.StoragePreparation != nil {
+					return errors.New("already-absent storage removal evidence cannot claim preparation authority")
+				}
+			case !attempt.StorageAbsent && contract.ValidStorageOnlyRemovalAttemptID(authority.AttemptID, attempt.ComputerStorage.StorageGeneration):
+				if attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
+					attempt.StoragePreparation.NodeID != authority.NodeID || attempt.StoragePreparation.JobID != authority.JobID ||
+					attempt.StoragePreparation.ComputerID != attempt.ComputerStorage.ComputerID ||
+					attempt.StoragePreparation.StorageID != attempt.ComputerStorage.StorageID ||
+					attempt.StoragePreparation.StorageGeneration != attempt.ComputerStorage.StorageGeneration {
+					return errors.New("storage-only removal attestation requires matching durable Computer Storage preparation evidence")
+				}
+			case !attempt.StorageAbsent && generation <= uint64(1<<63-1) && contract.ValidComputerStorageCleanupAttemptID(authority.AttemptID, int64(generation)):
+				if attempt.StoragePreparation != nil {
+					return errors.New("storage cleanup attestation cannot claim never-attached preparation evidence")
+				}
+			default:
+				return errors.New("storage-only removal attestation requires typed prepared-removal or storage-cleanup authority")
 			}
 			want = expectedComputerStorageRemovalResources(attempt.ComputerStorage)
 		}
@@ -1233,8 +1261,9 @@ type ExportComputerCustodyResponse struct {
 type VerifyScope string
 
 const (
-	VerifyAttempt   VerifyScope = "attempt"
-	VerifyNamespace VerifyScope = "namespace"
+	VerifyAttempt           VerifyScope = "attempt"
+	VerifyNamespace         VerifyScope = "namespace"
+	VerifyNamespaceReadOnly VerifyScope = "namespace_read_only"
 )
 
 type VerifyRequest struct {
@@ -1276,6 +1305,7 @@ type ResourceInventory struct {
 	Shims                   []string `json:"shims"`
 	Cgroups                 []string `json:"cgroups"`
 	LogSegments             []string `json:"log_segments"`
+	ImageSpools             []string `json:"image_spools"`
 	ManagedVolumes          []string `json:"managed_volumes"`
 	ManagedVolumeRecords    []string `json:"managed_volume_records"`
 	ComputerDiskImages      []string `json:"computer_disk_images"`

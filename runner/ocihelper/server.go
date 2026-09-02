@@ -77,6 +77,7 @@ const (
 
 type serverAttempt struct {
 	authority        AttemptAuthority
+	computerStorage  *ComputerStorageReference
 	state            attemptState
 	endpoints        map[string]uint16
 	cgroupID         string
@@ -626,6 +627,13 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 		deadlineChanged: make(chan struct{}, 1), watchDone: make(chan struct{}), reaped: make(chan struct{}),
 		runCancel: runCancel,
 	}
+	for _, volume := range request.Workload.ManagedVolumes {
+		if volume.Kind == ManagedVolumeComputerDisk && volume.ComputerStorage != nil {
+			storage := *volume.ComputerStorage
+			attempt.computerStorage = &storage
+			break
+		}
+	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.closed {
@@ -638,6 +646,21 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 	session.attempts[key] = attempt
 	go session.watchAttempt(attempt)
 	return attempt, nil
+}
+
+// hasLiveRemovalAttemptLocked is called while session.mu excludes Run's
+// reserveAttempt edge. Tombstones are already positively reaped and do not
+// fence read-only inventory.
+func (session *serverSession) hasLiveRemovalAttemptLocked(jobID string, storage *ComputerStorageReference) bool {
+	for _, attempt := range session.attempts {
+		if attempt.state == attemptTombstoned || attempt.authority.JobID != jobID {
+			continue
+		}
+		if storage == nil || attempt.computerStorage == nil || sameComputerStorageIdentity(*attempt.computerStorage, *storage) {
+			return true
+		}
+	}
+	return false
 }
 
 const maximumAttemptEndpoints = 8
@@ -1300,11 +1323,36 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
+		// Snapshot the helper-owned attempt registry before inventory, then check
+		// it again after the engine scan. Run reserves under the same mutex before
+		// it can create runtime or attach Storage resources, so either edge fences
+		// Storage-only evidence without holding the session-wide heartbeat mutex
+		// across filesystem and containerd I/O.
+		session.mu.Lock()
+		busy := session.hasLiveRemovalAttemptLocked(body.Removal.JobID, body.ComputerStorage)
+		session.mu.Unlock()
+		if busy {
+			_ = writeFailure(wire, CodeComputerStorageBusy, "removal inventory is fenced by a live attempt authority")
+			return
+		}
 		response, err := engine.InventoryRemoval(operation.ctx, body)
 		if err == nil {
+			session.mu.Lock()
+			busy = session.hasLiveRemovalAttemptLocked(body.Removal.JobID, body.ComputerStorage)
+			closed := session.closed
+			helper := session.helper
+			session.mu.Unlock()
+			if closed {
+				_ = writeFailure(wire, CodeSessionStale, "OCI helper session ended during removal inventory")
+				return
+			}
+			if busy {
+				_ = writeFailure(wire, CodeComputerStorageBusy, "removal inventory raced a live attempt authority")
+				return
+			}
 			response.JobID = body.Removal.JobID
 			response.RemovalGeneration = body.Removal.RemovalGeneration
-			response.HelperSession = session.helper
+			response.HelperSession = helper
 		}
 		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodAttestRemoval:
@@ -1492,7 +1540,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			if body.Authority == nil || !authorizeRequest(wire, session, *body.Authority) {
 				return
 			}
-		} else if body.Scope != VerifyNamespace || body.Authority != nil {
+		} else if (body.Scope != VerifyNamespace && body.Scope != VerifyNamespaceReadOnly) || body.Authority != nil {
 			_ = writeFailure(wire, CodeInvalidRequest, "Verify requires exactly one valid scope")
 			return
 		}
@@ -1742,6 +1790,7 @@ func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {
 	left.Shims = mergeInventoryClass(left.Shims, right.Shims)
 	left.Cgroups = mergeInventoryClass(left.Cgroups, right.Cgroups)
 	left.LogSegments = mergeInventoryClass(left.LogSegments, right.LogSegments)
+	left.ImageSpools = mergeInventoryClass(left.ImageSpools, right.ImageSpools)
 	left.ManagedVolumes = mergeInventoryClass(left.ManagedVolumes, right.ManagedVolumes)
 	left.ManagedVolumeRecords = mergeInventoryClass(left.ManagedVolumeRecords, right.ManagedVolumeRecords)
 	left.ComputerDiskImages = mergeInventoryClass(left.ComputerDiskImages, right.ComputerDiskImages)

@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -622,6 +623,154 @@ func TestComputerRemovalReceiptAssertsEveryDiskInventoryClass(t *testing.T) {
 	response, err := attestRemovalInventory(ResourceInventory{}, request)
 	if err != nil || len(response.Assertions) != len(resources) {
 		t.Fatalf("Computer absence receipt = %+v err=%v, want %d rows", response, err, len(resources))
+	}
+}
+
+func TestPreparedComputerStorageRemovalInventoryCarriesOnlyStorageRows(t *testing.T) {
+	storage := &ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 3, DiskBytes: 8 << 30}
+	removal := ManagedVolumeRemovalAuthority{NodeID: "node", BootSessionID: "boot", JobID: "prepared-computer", RemovalGeneration: 2, CleanupFence: "cleanup"}
+	request := InventoryRemovalRequest{Removal: removal, RootInstanceID: "root"}
+	receipt := &ComputerStorageResetReceipt{Kind: "computer_storage_reset_verified", ReceiptID: "receipt", ComputerID: storage.ComputerID,
+		StorageID: storage.StorageID, NewGeneration: storage.StorageGeneration, NodeID: removal.NodeID, RootInstanceID: "root",
+		JobID: removal.JobID, IntentRevision: 1, CleanupFence: "preparation", HelperGeneration: 1}
+	attempt, eligible, err := preparedComputerStorageRemovalAttempt(request, t.TempDir(), computerDiskManifest{
+		Version: computerDiskManifestVersion, Storage: *storage, DiskImage: "disk.ext4", MountDirectory: "disk", Prepared: true,
+		PreparationReceipt: receipt,
+	})
+	if err != nil || !eligible {
+		t.Fatalf("prepared Computer Storage-only inventory = %+v eligible=%t err=%v", attempt, eligible, err)
+	}
+	attest := AttestRemovalRequest{JobID: removal.JobID, RemovalGeneration: "2", Attempts: []RemovalAttemptManifest{attempt}}
+	if err := validateAttestRemovalRequest(attest, removal.NodeID); err != nil {
+		t.Fatalf("prepared Computer Storage-only inventory rejected: %v", err)
+	}
+	if len(attempt.Resources) != 9 {
+		t.Fatalf("prepared Computer Storage-only rows = %+v", attempt.Resources)
+	}
+	for _, resource := range attempt.Resources {
+		switch resource.Class {
+		case RemovalResourceLease, RemovalResourceSnapshot, RemovalResourceContainer, RemovalResourceTask,
+			RemovalResourceShim, RemovalResourceCgroup, RemovalResourceLogSegments, RemovalResourceHandoffVolume:
+			t.Fatalf("prepared Computer inventory invented runtime row: %+v", resource)
+		}
+	}
+	notPrepared := computerDiskManifest{Version: computerDiskManifestVersion, Storage: *storage, Prepared: true, PreparationReceipt: receipt,
+		PreviousDetachment: &computerDiskEvidence{ReceiptID: "prior"}}
+	if attempt, eligible, err := preparedComputerStorageRemovalAttempt(request, t.TempDir(), notPrepared); err != nil || eligible {
+		t.Fatalf("historically attached Computer became Storage-only inventory: %+v eligible=%t err=%v", attempt, eligible, err)
+	}
+	for name, mutate := range map[string]func(*computerDiskManifest){
+		"attached":   func(m *computerDiskManifest) { m.Attached = &AttemptAuthority{AttemptID: "attached"} },
+		"pending":    func(m *computerDiskManifest) { m.Pending = &AttemptAuthority{AttemptID: "pending"} },
+		"retirement": func(m *computerDiskManifest) { m.Retirement = &ComputerStorageResetAuthority{JobID: "retire"} },
+		"loop":       func(m *computerDiskManifest) { m.LoopDevice = "/dev/loop0" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			manifest := computerDiskManifest{Version: computerDiskManifestVersion, Storage: *storage, Prepared: true, PreparationReceipt: receipt}
+			mutate(&manifest)
+			if attempt, eligible, err := preparedComputerStorageRemovalAttempt(request, t.TempDir(), manifest); err != nil || eligible {
+				t.Fatalf("attachment lineage became Storage-only: %+v eligible=%t err=%v", attempt, eligible, err)
+			}
+		})
+	}
+	t.Run("copy-published-import-witness", func(t *testing.T) {
+		root := t.TempDir()
+		copyReceipt := ComputerStorageCopyReceipt{Kind: contract.ComputerStorageCopyVerifiedKind, ReceiptID: "copy-receipt",
+			DestinationComputerID: storage.ComputerID, DestinationStorageID: storage.StorageID,
+			DestinationGeneration: storage.StorageGeneration, NodeID: removal.NodeID, RootInstanceID: "root",
+			JobID: removal.JobID, OperationRevision: 2, CleanupFence: "copy-fence", HelperGeneration: 3}
+		if err := writeComputerStorageCopyManifest(root, computerStorageCopyManifest{Version: 1, Phase: computerStorageCopyPublished, Receipt: &copyReceipt}); err != nil {
+			t.Fatal(err)
+		}
+		manifest := computerDiskManifest{Version: computerDiskManifestVersion, Storage: *storage, Prepared: true}
+		attempt, eligible, err := preparedComputerStorageRemovalAttempt(request, root, manifest)
+		if err != nil || !eligible || attempt.StoragePreparation == nil || attempt.StoragePreparation.ReceiptID != copyReceipt.ReceiptID {
+			t.Fatalf("published copy witness = %+v eligible=%t err=%v", attempt, eligible, err)
+		}
+	})
+}
+
+func TestDetachedComputerStorageRemovalInventoryReturnsTypedEmptyEvidence(t *testing.T) {
+	runtimeRoot := t.TempDir()
+	storage := ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 3, DiskBytes: 8 << 30}
+	name, err := DeterministicComputerDiskName(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskRoot := filepath.Join(runtimeRoot, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeComputerDiskManifest(diskRoot, computerDiskManifest{
+		Version: computerDiskManifestVersion, Storage: storage, DiskImage: "disk.ext4", MountDirectory: name,
+		PreviousDetachment: &computerDiskEvidence{ReceiptID: "detached"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot}, diskSystem: newFakeComputerDiskSystem()}
+	request := InventoryRemovalRequest{Removal: ManagedVolumeRemovalAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "detached-computer", RemovalGeneration: 2, CleanupFence: "cleanup",
+	}, RootInstanceID: "root", ComputerStorage: &storage}
+
+	response, err := engine.inventoryComputerStorageRemoval(t.Context(), request, ResourceInventory{})
+	if err != nil || !response.NoStorageEvidence || response.NoRuntimeAttempts || len(response.Attempts) != 0 {
+		t.Fatalf("detached Computer Storage inventory = %+v err=%v", response, err)
+	}
+}
+
+func TestAbsentComputerStorageInventoryWaitsForReimageSerialization(t *testing.T) {
+	runtimeRoot := t.TempDir()
+	storage := ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 3, DiskBytes: 8 << 30}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot}, diskSystem: newFakeComputerDiskSystem()}
+	request := InventoryRemovalRequest{Removal: ManagedVolumeRemovalAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "detached-computer", RemovalGeneration: 2, CleanupFence: "cleanup",
+	}, RootInstanceID: "root", ComputerStorage: &storage}
+	engine.computerReimageMu.Lock()
+	defer engine.computerReimageMu.Unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	got, err := engine.inventoryComputerStorageRemoval(ctx, request, ResourceInventory{})
+	if !errors.Is(err, context.DeadlineExceeded) || got.NoStorageEvidence || len(got.Attempts) != 0 {
+		t.Fatalf("absence was determined outside reimage serialization: response=%+v err=%v", got, err)
+	}
+}
+
+func TestAbsentComputerStorageRemovalInventoryIsTypedAndAttestable(t *testing.T) {
+	storage := ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 2, DiskBytes: 8 << 30}
+	request := InventoryRemovalRequest{Removal: ManagedVolumeRemovalAuthority{
+		NodeID: "node", BootSessionID: "boot", JobID: "prepared-computer", RemovalGeneration: 3, CleanupFence: "cleanup",
+	}, RootInstanceID: "root", ComputerStorage: &storage}
+	attempt, err := absentComputerStorageRemovalAttempt(request, storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !attempt.StorageOnly || !attempt.StorageAbsent || attempt.StoragePreparation != nil ||
+		attempt.Authority.AttemptID != contract.StorageAbsentRemovalAttemptID(storage.StorageGeneration) || len(attempt.Resources) != 9 {
+		t.Fatalf("already-deleted Storage evidence = %+v", attempt)
+	}
+	attest := AttestRemovalRequest{JobID: request.Removal.JobID, RemovalGeneration: "3", Attempts: []RemovalAttemptManifest{attempt}}
+	if err := validateAttestRemovalRequest(attest, request.Removal.NodeID); err != nil {
+		t.Fatalf("already-deleted Storage evidence was not attestable: %v", err)
+	}
+	attempt.StorageAbsent = false
+	if err := validateAttestRemovalRequest(AttestRemovalRequest{JobID: request.Removal.JobID, RemovalGeneration: "3", Attempts: []RemovalAttemptManifest{attempt}}, request.Removal.NodeID); err == nil {
+		t.Fatal("already-deleted Storage authority was accepted without its typed evidence bit")
+	}
+}
+
+func TestComputerRemovalInventoryReimageSerializationIsContextBounded(t *testing.T) {
+	var mutex sync.Mutex
+	mutex.Lock()
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if lockComputerReimageMutex(ctx, &mutex) {
+		mutex.Unlock()
+		t.Fatal("context-bounded Computer removal serialization acquired an owned reimage mutex")
+	}
+	mutex.Unlock()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Computer removal serialization ignored context for %s", elapsed)
 	}
 }
 

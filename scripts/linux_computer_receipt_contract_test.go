@@ -122,7 +122,7 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 	guest["evidence"] = map[string]string{"blocked_assertion": "candidate-bound root Run route"}
 	storage := rows["linux.storage_provenance"].(map[string]any)
 	storage["evidence"] = map[string]string{"restore_token_revocation_receipt": "operation_revision=9 revoke_all=true computer_id=computer-1"}
-	rows["linux.removal"].(map[string]any)["evidence"] = map[string]string{"inventory_source": "helper VerifyNamespace route"}
+	rows["linux.removal"].(map[string]any)["evidence"] = map[string]string{"inventory_source": "helper VerifyNamespaceReadOnly route"}
 	digest := "sha256:" + strings.Repeat("a", 64)
 	return map[string]any{
 		"version":       2,

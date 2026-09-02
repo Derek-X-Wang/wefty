@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"golang.org/x/sys/unix"
 )
 
@@ -162,6 +163,59 @@ func TestComputerGrowRefusesMissingCurrentImage(t *testing.T) {
 	}
 	if len(engine.capacityReservations) != 0 {
 		t.Fatalf("missing-image grow reserved capacity: %#v", engine.capacityReservations)
+	}
+}
+
+func TestComputerGrowRefusesMissingManifestWithDurablePreparationEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		prepare func(*testing.T, string, GrowComputerStorageRequest)
+	}{
+		{name: "copy receipt", prepare: func(t *testing.T, root string, request GrowComputerStorageRequest) {
+			receipt := ComputerStorageCopyReceipt{
+				Kind: contract.ComputerStorageCopyVerifiedKind, ReceiptID: "copy-receipt",
+				DestinationComputerID: request.Storage.ComputerID, DestinationStorageID: request.Storage.StorageID,
+				DestinationGeneration: request.Storage.StorageGeneration, NodeID: "node", RootInstanceID: "root",
+				JobID: "job", OperationRevision: 7, CleanupFence: "copy", HelperGeneration: 1,
+			}
+			if err := writeComputerStorageCopyManifest(root, computerStorageCopyManifest{Version: 1, Phase: computerStorageCopyPublished, Receipt: &receipt}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "reset receipt", prepare: func(t *testing.T, root string, request GrowComputerStorageRequest) {
+			witness := contract.ComputerStoragePreparationWitness{
+				Kind: contract.ComputerStorageResetVerifiedKind, ReceiptID: "reset-receipt", NodeID: "node", RootInstanceID: "root",
+				JobID: "job", ComputerID: request.Storage.ComputerID, StorageID: request.Storage.StorageID,
+				StorageGeneration: request.Storage.StorageGeneration, Revision: 7, Fence: "reset", HelperGeneration: 1,
+			}
+			if err := persistComputerStoragePreparationWitness(root, witness); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			request := growTestRequest(16 << 20)
+			imagePath := prepareGrowTestImage(t, root, request)
+			diskRoot := filepath.Dir(imagePath)
+			test.prepare(t, diskRoot, request)
+			if err := os.Remove(filepath.Join(diskRoot, "attachment.json")); err != nil {
+				t.Fatal(err)
+			}
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root},
+				capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt)}
+			response, err := engine.GrowComputerStorage(t.Context(), request)
+			var uncertain *ComputerStorageGrowUncertainError
+			if !errors.As(err, &uncertain) || response.Receipt.Applied {
+				t.Fatalf("missing manifest with %s = %#v err=%v", test.name, response, err)
+			}
+			if len(engine.capacityReservations) != 0 {
+				t.Fatalf("missing manifest with %s reserved capacity: %#v", test.name, engine.capacityReservations)
+			}
+			if info, statErr := os.Stat(imagePath); statErr != nil || info.Size() != request.Storage.DiskBytes {
+				t.Fatalf("missing manifest with %s mutated image: info=%v err=%v", test.name, info, statErr)
+			}
+		})
 	}
 }
 
