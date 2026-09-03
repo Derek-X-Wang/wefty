@@ -71,6 +71,109 @@ func TestBoundedFinalizationDeadlineThroughDurableLogSinkPreservesPayload(t *tes
 	}
 }
 
+func TestLogFinalizationDeadlineHandsCompletionToOrderedRecovery(t *testing.T) {
+	var mu sync.Mutex
+	var callOrder []string
+	logCalls := 0
+	completionRejected := 0
+	completionSeen := make(chan l1.CompletionRequest, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/logs"):
+			var appendRequest l1.AppendLogsRequest
+			if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			logCalls++
+			call := logCalls
+			callOrder = append(callOrder, "logs")
+			mu.Unlock()
+			if call == 1 {
+				<-request.Context().Done()
+				return
+			}
+			acknowledged := make(map[contract.LogStream]uint64)
+			for _, event := range appendRequest.Events {
+				acknowledged[event.Stream] = eventEndSequence(event)
+			}
+			_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{
+				Acknowledged: acknowledged,
+				AttemptState: contract.AttemptRunning,
+			})
+		case strings.HasSuffix(request.URL.Path, "/complete"):
+			var completion l1.CompletionRequest
+			if err := json.NewDecoder(request.Body).Decode(&completion); err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			callOrder = append(callOrder, "completion")
+			logsReplayed := logCalls >= 2
+			if !logsReplayed {
+				completionRejected++
+			}
+			mu.Unlock()
+			if !logsReplayed {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+					Code: contract.ErrorConflict, Message: "completion closed the live attempt before log recovery",
+				}})
+				return
+			}
+			completionSeen <- completion
+			_ = json.NewEncoder(w).Encode(l1.Job{})
+		default:
+			http.NotFound(w, request)
+		}
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "ordered-deadline-node", 1024*1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "ordered-deadline-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+		}},
+		Lease: l1.AttemptLease{
+			AttemptID: "ordered-deadline-attempt", FencingToken: "ordered-deadline-fence", LeaseTTL: time.Minute,
+		},
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox,
+		runtimes:            workloadRuntimeSet{contract.JobKindProcess: &restartableCrashRuntime{}},
+		clock:               systemClock{},
+		renewalInterval:     10 * time.Second,
+		completionRetry:     time.Millisecond,
+		finalizationTimeout: 25 * time.Millisecond,
+		observer:            newLifecycleObserver(systemClock{}),
+	})
+	if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case completion := <-completionSeen:
+		if completion.Result.Signal != "killed" || !completion.Result.LogEvidenceIncomplete || completion.Result.OutputError != "" {
+			t.Fatalf("ordered recovery completion = %#v", completion.Result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ordered recovery did not deliver completion")
+	}
+	waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
+	mu.Lock()
+	defer mu.Unlock()
+	if completionRejected != 0 || !reflect.DeepEqual(callOrder, []string{"logs", "logs", "completion"}) {
+		t.Fatalf("deadline recovery order = %v with %d rejected completions, want logs/logs/completion and no rejection", callOrder, completionRejected)
+	}
+}
+
 func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 	firstCompletionStarted := make(chan struct{}, 1)
 	replayed := make(chan l1.CompletionRequest, 1)

@@ -633,6 +633,7 @@ const (
 	LogGapReplayRejected            LogGapReason = "replay_rejected"
 	LogGapLateEvidenceWindowExpired LogGapReason = "late_evidence_window_expired"
 	LogGapLoggerSourceIncomplete    LogGapReason = "logger_source_incomplete"
+	LogGapLogEvidenceIncomplete     LogGapReason = "log_evidence_incomplete"
 )
 
 // LogGapReasons returns the complete closed vocabulary accepted on the wire.
@@ -644,6 +645,7 @@ func LogGapReasons() []LogGapReason {
 		LogGapReplayRejected,
 		LogGapLateEvidenceWindowExpired,
 		LogGapLoggerSourceIncomplete,
+		LogGapLogEvidenceIncomplete,
 	}
 }
 

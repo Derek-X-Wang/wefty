@@ -1716,6 +1716,124 @@ func TestConcurrentLogDeadlineAndGenuineOutputFailureStayTerminal(t *testing.T) 
 	}
 }
 
+func TestConcurrentLogDeadlineAndGenuineOutputFailureStayTerminalThroughRecovery(t *testing.T) {
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "terminal-output-recovery.sqlite"), l1.StoreOptions{
+		Jitter: func(delay time.Duration) time.Duration { return delay },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	identity := fabric.Identity{NodeID: "agent"}
+	registration := contract.NodeRegistration{
+		NodeID: "terminal-output-node", BootSessionID: "terminal-output-boot",
+		OS: "linux", Architecture: "amd64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true},
+	}
+	if _, err := store.RegisterNode(t.Context(), identity, registration, l1.DefaultNodePolicy("linux"), true); err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1,
+		DispatchKey:   "terminal-output-recovery",
+		Kind:          contract.JobKindProcess,
+		Class:         contract.JobClassService,
+		Restart:       contract.RestartAlways,
+		Execution: contract.ExecutionSpec{
+			Executable:       contract.ExecutableSpec{Path: "/bin/true"},
+			Argv:             []string{"true"},
+			WorkingDirectory: t.TempDir(),
+			SensitiveEnv:     map[string]string{"secret": "long-secret-value"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimJob(t.Context(), identity.NodeID, registration.NodeID, registration.BootSessionID, contract.JobClassService)
+	if err != nil || claim == nil || claim.Job.JobID != job.JobID {
+		t.Fatalf("claim terminal-output service = %#v err=%v", claim, err)
+	}
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedResource, err := initializeManagedResource(managedRoot, registration.NodeID, registration.BootSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/complete") {
+			http.NotFound(w, request)
+			return
+		}
+		var completion l1.CompletionRequest
+		if err := json.NewDecoder(request.Body).Decode(&completion); err != nil {
+			t.Error(err)
+			return
+		}
+		completed, completeErr := store.CompleteAttempt(request.Context(), identity.NodeID, job.JobID, claim.Lease.AttemptID, completion)
+		if completeErr != nil {
+			var protocolErr *l1.Error
+			if !errors.As(completeErr, &protocolErr) {
+				t.Errorf("complete terminal-output evidence: %v", completeErr)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+				Code: protocolErr.Code, Message: protocolErr.Error(),
+			}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(completed)
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), registration.NodeID, 1024*1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover terminal output evidence: %v", err) })
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox,
+		runtimes:            workloadRuntimeSet{contract.JobKindProcess: instantWorkloadRuntime{}},
+		clock:               systemClock{},
+		renewalInterval:     10 * time.Second,
+		completionRetry:     time.Millisecond,
+		finalizationTimeout: 25 * time.Millisecond,
+		managedResource:     managedResource,
+		observer:            newLifecycleObserver(systemClock{}),
+		logSinkFactory: func(context.Context, l1.Claim) (attemptLogSink, error) {
+			return &compoundFinalizationLogSink{}, nil
+		},
+	})
+	if _, err := lifecycle.execute(t.Context(), *claim, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
+	failed, err := store.GetJob(t.Context(), job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.State != contract.JobFailed || failed.NextRestartAt != nil {
+		t.Fatalf("terminal output failure after recovery = %#v, want failed without restart", failed)
+	}
+	var failure l1.ProcessResult
+	if err := json.Unmarshal(failed.LastFailure, &failure); err != nil {
+		t.Fatal(err)
+	}
+	if failure.OutputError == "" || !failure.LogEvidenceIncomplete || failure.ExitCode != nil || failure.Signal != "" {
+		t.Fatalf("terminal output failure evidence = %#v raw=%s job=%#v", failure, failed.LastFailure, failed)
+	}
+	readmitted, err := store.ClaimJob(t.Context(), identity.NodeID, registration.NodeID, registration.BootSessionID, contract.JobClassService)
+	if err != nil || readmitted != nil {
+		t.Fatalf("terminal output failure readmission = %#v err=%v, want none", readmitted, err)
+	}
+}
+
 type blockingFinalizationLogSink struct{}
 
 func (blockingFinalizationLogSink) WriteOutput(context.Context, contract.LogEvent) error { return nil }

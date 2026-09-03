@@ -415,6 +415,15 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		<-renewalDone
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", cause)
 	}
+	if outcome.result.LogEvidenceIncomplete && lifecycle.dependencies.outbox != nil {
+		// A bounded log finalization deadline can leave durable events behind.
+		// Hand the persisted result to the outbox while L1 still holds the
+		// attempt live so recovery drains those logs strictly before completion.
+		reconcileCompletion = true
+		cancelAttempt(nil)
+		<-renewalDone
+		return errorDestinationUnclassified, nil
+	}
 	lifecycle.dependencies.observer.setAttempt(attemptID, AttemptFinalizing, outcome.err)
 	if outcome.err != nil {
 		lifecycle.log("attempt %s execution: %v", claim.Lease.AttemptID, outcome.err)

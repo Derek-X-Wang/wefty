@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -141,7 +142,11 @@ func TestLogReplayIsIdempotentAndRawJSONLMatchesRows(t *testing.T) {
 
 func TestAgentLogGapReasonsPassL1Validation(t *testing.T) {
 	reasons := contract.LogGapReasons()
+	foundLogEvidenceIncomplete := false
 	for _, reason := range reasons {
+		if reason == contract.LogGapLogEvidenceIncomplete {
+			foundLogEvidenceIncomplete = true
+		}
 		t.Run(string(reason), func(t *testing.T) {
 			gap := &contract.LogGap{
 				ThroughSequence: 0,
@@ -163,6 +168,27 @@ func TestAgentLogGapReasonsPassL1Validation(t *testing.T) {
 				t.Fatalf("L1 rejected agent log gap reason %q: %v", reason, err)
 			}
 		})
+	}
+	if !foundLogEvidenceIncomplete {
+		t.Fatal("contract log gap vocabulary omits log_evidence_incomplete")
+	}
+
+	unknown := contract.LogEvent{
+		AttemptID: "attempt-gap-reasons",
+		Stream:    contract.LogStdout,
+		Sequence:  0,
+		Timestamp: time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC),
+		Gap: &contract.LogGap{
+			ThroughSequence: 0,
+			LostEventCount:  1,
+			LostByteCount:   1,
+			Reason:          contract.LogGapReason("future_unknown_reason"),
+		},
+	}
+	err := validateLogEvent(unknown.AttemptID, unknown)
+	var protocolErr *Error
+	if !errors.As(err, &protocolErr) || protocolErr.Code != contract.ErrorInvalidRequest {
+		t.Fatalf("unknown log gap reason = %v, want invalid_request", err)
 	}
 }
 

@@ -229,9 +229,11 @@ promotes: only `Started` does.
 A gap declaration uses `LogEvent.sequence` as the first lost sequence and
 `gap.through_sequence` as the inclusive last sequence. Gaps advance continuity
 only for their declared stream. A truncated or corrupt helper segment sends
-`logger_source_incomplete`; agent spool eviction sends `spool_eviction`; an
-event larger than the entire service spool budget is converted whole into one
-`oversized_event` gap rather than chunked or partially retained. A locally
+`logger_source_incomplete`; a bounded agent finalization that can identify the
+unavailable range sends `log_evidence_incomplete`; agent spool eviction sends
+`spool_eviction`; an event larger than the entire service spool budget is
+converted whole into one `oversized_event` gap rather than chunked or partially
+retained. A locally
 durable event that L1 permanently rejects while its attempt is still
 authoritative is replaced by a `replay_rejected` gap before replay continues.
 L1-generated window gaps include the source event's SHA-256 so identical raw replay is
