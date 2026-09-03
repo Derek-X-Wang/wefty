@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"path/filepath"
@@ -8,9 +9,82 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	_ "modernc.org/sqlite"
 )
+
+func TestMigrateCompletionReceiptDispositions(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "receipts.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE spool_completion_receipts (
+  attempt_id TEXT PRIMARY KEY,
+  disposition TEXT NOT NULL CHECK (disposition IN ('delivered', 'suppressed')),
+  reason TEXT NOT NULL,
+  observed_ns INTEGER NOT NULL
+);
+INSERT INTO spool_completion_receipts VALUES('old', 'suppressed', 'service_intent_stop', 1);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateCompletionReceiptDispositions(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	var disposition, reason string
+	if err := db.QueryRow(`SELECT disposition, reason FROM spool_completion_receipts WHERE attempt_id='old'`).Scan(&disposition, &reason); err != nil || disposition != "suppressed" || reason != "service_intent_stop" {
+		t.Fatalf("migrated old receipt=%q/%q err=%v", disposition, reason, err)
+	}
+	if _, err := db.Exec(`INSERT INTO spool_completion_receipts(attempt_id, disposition, reason, observed_ns, intent_revision)
+VALUES('new', 'withheld', 'intent_authority_unavailable', 2, 7)`); err != nil {
+		t.Fatalf("migrated receipt schema rejected withheld disposition: %v", err)
+	}
+}
+
+func TestLogSpoolJoinsLegacySuppressionToRetainedPayload(t *testing.T) {
+	directory := t.TempDir()
+	nodeID := "legacy-suppression-node"
+	db, err := sql.Open("sqlite", filepath.Join(directory, spoolFileName(nodeID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE spool_attempts (
+  attempt_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, fencing_token TEXT NOT NULL,
+  class TEXT NOT NULL, created_ns INTEGER NOT NULL, result_json BLOB, finished_ns INTEGER, incomplete_json BLOB
+);
+CREATE TABLE spool_completion_receipts (
+  attempt_id TEXT PRIMARY KEY,
+  disposition TEXT NOT NULL CHECK (disposition IN ('delivered', 'suppressed')),
+  reason TEXT NOT NULL, observed_ns INTEGER NOT NULL
+);`); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 7
+	payload, err := json.Marshal(durableCompletion{Result: l1.ProcessResult{ExitCode: &exitCode}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO spool_attempts VALUES('attempt','job','fence',?,1,?,2,NULL);
+INSERT INTO spool_completion_receipts VALUES('attempt','suppressed','service_intent_stop',3);`, contract.JobClassService, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	spool, err := openLogSpool(directory, nodeID, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close()
+	disposition, reason, revision, err := spool.completionDisposition(t.Context(), "attempt")
+	if err != nil || disposition != "suppressed" || reason != "service_intent_stop" || revision != 0 {
+		t.Fatalf("joined disposition=%q/%q revision=%d err=%v", disposition, reason, revision, err)
+	}
+	if attempts, err := spool.pendingAttempts(t.Context()); err != nil || len(attempts) != 0 {
+		t.Fatalf("legacy suppressed payload became replayable=%+v err=%v", attempts, err)
+	}
+}
 
 func TestLogSpoolMigratesPreRemovalProofSchema(t *testing.T) {
 	directory := t.TempDir()

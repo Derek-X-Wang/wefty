@@ -2,9 +2,12 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 // OCIIntentObservation is the durable intent state that fenced completion
@@ -50,6 +53,12 @@ func (gate *ociIntentCompletionGate) beginCompletion(ctx context.Context) (OCIIn
 		gate.mu.RUnlock()
 		return OCIIntentObservation{}, nil, &OCIIntentAuthorityUnavailableError{Err: err}
 	}
+	if observation.Revision == 0 {
+		gate.mu.RUnlock()
+		return OCIIntentObservation{}, nil, &OCIIntentAuthorityUnavailableError{
+			Err: errors.New("durable OCI intent marker is absent"),
+		}
+	}
 	if gate.observed != nil {
 		gate.observed(observation)
 	}
@@ -60,8 +69,29 @@ func (gate *ociIntentCompletionGate) allows(observation OCIIntentObservation) bo
 	return observation.Enabled && observation.Revision > gate.disabledRevision.Load()
 }
 
-func (gate *ociIntentCompletionGate) beginStop(revision uint64) func() {
+func (gate *ociIntentCompletionGate) beginStop(ctx context.Context, revision uint64) (func(), error) {
 	gate.disabledRevision.Store(revision)
-	gate.mu.Lock()
-	return gate.mu.Unlock
+	acquired := make(chan struct{})
+	canceled := make(chan struct{})
+	go func() {
+		// A queued writer prevents new readers from overtaking the drain. The
+		// only existing readers span an operation-timeout-bounded L1 request.
+		gate.mu.Lock()
+		select {
+		case acquired <- struct{}{}:
+		case <-canceled:
+			gate.mu.Unlock()
+		}
+	}()
+	select {
+	case <-acquired:
+		return gate.mu.Unlock, nil
+	case <-ctx.Done():
+		close(canceled)
+		return nil, ctx.Err()
+	}
+}
+
+func requiresOCIIntentFence(kind, class string) bool {
+	return class == contract.JobClassService && (kind == contract.JobKindOCI || kind == legacyUnclassifiedKind)
 }

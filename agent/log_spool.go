@@ -36,6 +36,8 @@ type logSpoolAttempt struct {
 	kind         string
 }
 
+const legacyUnclassifiedKind = "unclassified"
+
 type durableSpoolEvent struct {
 	ordinal int64
 	event   contract.LogEvent
@@ -146,6 +148,9 @@ CREATE TABLE IF NOT EXISTS spool_attempts (
   result_json BLOB,
   finished_ns INTEGER,
   incomplete_json BLOB,
+	completion_disposition TEXT,
+	completion_reason TEXT,
+	intent_revision INTEGER,
   CHECK ((result_json IS NULL) = (finished_ns IS NULL))
 );
 CREATE TABLE IF NOT EXISTS spool_events (
@@ -237,6 +242,9 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 	}{
 		{table: "spool_removals", column: "runtime_kind", definition: "TEXT"},
 		{table: "spool_attempts", column: "kind", definition: "TEXT"},
+		{table: "spool_attempts", column: "completion_disposition", definition: "TEXT"},
+		{table: "spool_attempts", column: "completion_reason", definition: "TEXT"},
+		{table: "spool_attempts", column: "intent_revision", definition: "INTEGER"},
 		{table: "spool_completion_receipts", column: "intent_revision", definition: "INTEGER"},
 		{table: "runtime_removal_manifests", column: "absence_attestation_json", definition: "BLOB"},
 		{table: "runtime_removal_manifests", column: "attested_ns", definition: "INTEGER"},
@@ -244,6 +252,17 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 		if err := ensureLogSpoolColumn(ctx, spool.db, migration.table, migration.column, migration.definition); err != nil {
 			return fmt.Errorf("agent: migrate log spool %s.%s: %w", migration.table, migration.column, err)
 		}
+	}
+	// Join legacy suppression/withholding authority to the retained payload so
+	// pruning the bounded audit table can never make that payload replayable.
+	if _, err := spool.db.ExecContext(ctx, `UPDATE spool_attempts
+SET completion_disposition=(SELECT disposition FROM spool_completion_receipts r WHERE r.attempt_id=spool_attempts.attempt_id),
+    completion_reason=(SELECT reason FROM spool_completion_receipts r WHERE r.attempt_id=spool_attempts.attempt_id),
+    intent_revision=(SELECT intent_revision FROM spool_completion_receipts r WHERE r.attempt_id=spool_attempts.attempt_id)
+WHERE result_json IS NOT NULL AND completion_disposition IS NULL
+  AND EXISTS (SELECT 1 FROM spool_completion_receipts r
+              WHERE r.attempt_id=spool_attempts.attempt_id AND r.disposition IN ('suppressed', 'withheld'))`); err != nil {
+		return fmt.Errorf("agent: join legacy completion dispositions to payloads: %w", err)
 	}
 	// Older evidence rows did not carry workload kind. OCI attempt manifests
 	// and binding pins identify OCI rows. Plain one-shots retain process
@@ -253,8 +272,8 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 SET kind=CASE
   WHEN EXISTS (SELECT 1 FROM runtime_attempt_manifests WHERE runtime_attempt_manifests.attempt_id=spool_attempts.attempt_id AND runtime_attempt_manifests.runtime_kind=?)
     OR EXISTS (SELECT 1 FROM oci_binding_pins WHERE oci_binding_pins.job_id=spool_attempts.job_id)
-  THEN ? WHEN class=? THEN 'unclassified' ELSE ? END
-WHERE kind IS NULL OR kind=''`, contract.JobKindOCI, contract.JobKindOCI, contract.JobClassService, contract.JobKindProcess); err != nil {
+  THEN ? WHEN class=? THEN ? ELSE ? END
+WHERE kind IS NULL OR kind=''`, contract.JobKindOCI, contract.JobKindOCI, contract.JobClassService, legacyUnclassifiedKind, contract.JobKindProcess); err != nil {
 		return fmt.Errorf("agent: migrate log spool attempt kinds: %w", err)
 	}
 	// Pre-proof spools did not record the workload kind. Existing OCI
@@ -819,8 +838,8 @@ func (spool *logSpool) pendingAttempts(ctx context.Context) ([]logSpoolAttempt, 
 	rows, err := spool.db.QueryContext(ctx, `SELECT a.job_id, a.attempt_id, a.fencing_token, a.class, a.kind
 FROM spool_attempts a
 WHERE a.incomplete_json IS NULL
-  AND (a.result_json IS NOT NULL OR EXISTS (SELECT 1 FROM spool_events e WHERE e.attempt_id=a.attempt_id))
-  AND NOT EXISTS (SELECT 1 FROM spool_completion_receipts r WHERE r.attempt_id=a.attempt_id AND r.disposition='suppressed')
+  AND (EXISTS (SELECT 1 FROM spool_events e WHERE e.attempt_id=a.attempt_id)
+       OR (a.result_json IS NOT NULL AND COALESCE(a.completion_disposition, '') != 'suppressed'))
 ORDER BY a.created_ns, a.attempt_id`)
 	if err != nil {
 		return nil, fmt.Errorf("agent: list pending log spool attempts: %w", err)
@@ -864,7 +883,9 @@ func (spool *logSpool) inspectCompletion(ctx context.Context, attemptID string) 
 	var intentRevision sql.NullInt64
 	var eventCount int64
 	err := spool.db.QueryRowContext(ctx, `SELECT a.result_json, a.finished_ns, a.incomplete_json,
-  (SELECT COUNT(*) FROM spool_events WHERE attempt_id=?), r.disposition, r.reason, r.intent_revision
+  (SELECT COUNT(*) FROM spool_events WHERE attempt_id=?),
+  COALESCE(a.completion_disposition, r.disposition), COALESCE(a.completion_reason, r.reason),
+  COALESCE(a.intent_revision, r.intent_revision)
 FROM (SELECT 1) seed
 LEFT JOIN spool_attempts a ON a.attempt_id=?
 LEFT JOIN spool_completion_receipts r ON r.attempt_id=?`, attemptID, attemptID, attemptID).
@@ -991,7 +1012,8 @@ ON CONFLICT(attempt_id) DO UPDATE SET disposition=excluded.disposition, reason=e
 		attemptID, time.Now().UTC().UnixNano(), revision); err != nil {
 		return fmt.Errorf("agent: record delivered completion receipt: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts SET result_json=NULL, finished_ns=NULL WHERE attempt_id=?`, attemptID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts SET result_json=NULL, finished_ns=NULL,
+completion_disposition=NULL, completion_reason=NULL, intent_revision=NULL WHERE attempt_id=?`, attemptID); err != nil {
 		return fmt.Errorf("agent: release delivered completion: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM runtime_attempt_manifests WHERE attempt_id=?`, attemptID); err != nil {
@@ -1031,6 +1053,11 @@ ON CONFLICT(attempt_id) DO UPDATE SET disposition=excluded.disposition, reason=e
 		attemptID, disposition, reason, time.Now().UTC().UnixNano(), storedRevision); err != nil {
 		return fmt.Errorf("agent: record completion disposition: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE spool_attempts
+SET completion_disposition=?, completion_reason=?, intent_revision=? WHERE attempt_id=? AND result_json IS NOT NULL`,
+		disposition, reason, storedRevision, attemptID); err != nil {
+		return fmt.Errorf("agent: join completion disposition to payload: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM spool_completion_receipts WHERE attempt_id IN (
 SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT -1 OFFSET 1024)`); err != nil {
 		return fmt.Errorf("agent: bound completion dispositions: %w", err)
@@ -1039,6 +1066,27 @@ SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT
 		return fmt.Errorf("agent: commit durable completion disposition: %w", err)
 	}
 	return nil
+}
+
+func (spool *logSpool) completionDisposition(ctx context.Context, attemptID string) (string, string, uint64, error) {
+	var disposition, reason sql.NullString
+	var revision sql.NullInt64
+	err := spool.db.QueryRowContext(ctx, `SELECT completion_disposition, completion_reason, intent_revision
+FROM spool_attempts WHERE attempt_id=?`, attemptID).Scan(&disposition, &reason, &revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", 0, nil
+	}
+	if err != nil {
+		return "", "", 0, fmt.Errorf("agent: read completion disposition: %w", err)
+	}
+	if !disposition.Valid {
+		return "", "", 0, nil
+	}
+	var observed uint64
+	if revision.Valid {
+		observed = uint64(revision.Int64)
+	}
+	return disposition.String, reason.String, observed, nil
 }
 
 func (spool *logSpool) replaceBatchWithReplayGaps(ctx context.Context, attemptID string, batch []durableSpoolEvent) error {

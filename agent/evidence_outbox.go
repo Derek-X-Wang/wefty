@@ -393,7 +393,14 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 	}
 	var observation OCIIntentObservation
 	var releaseIntent func()
-	if attempt.class == contract.JobClassService && attempt.kind != contract.JobKindProcess {
+	if requiresOCIIntentFence(attempt.kind, attempt.class) {
+		disposition, _, dispositionRevision, dispositionErr := outbox.spool.completionDisposition(ctx, attempt.attemptID)
+		if dispositionErr != nil {
+			return dispositionErr
+		}
+		if disposition == "suppressed" {
+			return nil
+		}
 		var intentErr error
 		if outbox.ociIntentGate == nil {
 			intentErr = &OCIIntentAuthorityUnavailableError{}
@@ -401,6 +408,9 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 			observation, releaseIntent, intentErr = outbox.ociIntentGate.beginCompletion(ctx)
 		}
 		if intentErr != nil {
+			if disposition == "withheld" && dispositionRevision == 0 {
+				return intentErr
+			}
 			if receiptErr := outbox.withholdCompletion(context.WithoutCancel(ctx), attempt.attemptID, "intent_authority_unavailable", 0); receiptErr != nil {
 				return errors.Join(intentErr, receiptErr)
 			}

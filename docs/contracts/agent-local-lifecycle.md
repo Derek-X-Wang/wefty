@@ -260,8 +260,9 @@ obligated not to publish the intent-stopped result and to let lease expiry
 produce the ordinary `lost`/no-result outcome; L1 has other explicit lost paths
 and is not claimed to enforce this node-local marker itself. This fence does not
 suppress OCI one-shot completion or any process-kind workload. An
-unclassifiable legacy service spool row is withheld rather than allowed to
-bypass the fence.
+unclassifiable legacy service spool row is fenced by the same durable marker
+rather than allowed to bypass it: enabled intent permits publication, disabled
+intent suppresses it, and unavailable authority withholds it.
 
 Linux privileged `setup-oci` renders and writes one unprivileged `wefty-agent.service` with
 `SupplementaryGroups=wefty-oci` and one root socket-activated helper pair. The

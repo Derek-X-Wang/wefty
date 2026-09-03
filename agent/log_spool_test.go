@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -403,6 +404,47 @@ func TestLogSpoolPersistsFinalizedCompletionAcrossRestart(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("delivered service completion retained %d current service manifests, want one bounded removal source", count)
+	}
+}
+
+func TestSuppressedCompletionSurvivesReceiptPruning(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "suppression-prune-node", 1024)
+	defer spool.Close()
+	claim := serviceSpoolTestClaim("suppression-prune")
+	claim.Job.Spec.Kind = contract.JobKindOCI
+	if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 7
+	if err := spool.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.recordCompletionDisposition(t.Context(), claim.Lease.AttemptID, "suppressed", "service_intent_stop", 2); err != nil {
+		t.Fatal(err)
+	}
+	newerObservedAt := time.Now().Add(time.Hour).UnixNano()
+	for index := range 1025 {
+		if _, err := spool.db.ExecContext(t.Context(), `INSERT INTO spool_completion_receipts(attempt_id, disposition, reason, observed_ns)
+VALUES(?, 'delivered', 'test', ?)`, fmt.Sprintf("newer-%04d", index), newerObservedAt+int64(index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := spool.recordCompletionDisposition(t.Context(), claim.Lease.AttemptID, "suppressed", "service_intent_stop", 2); err != nil {
+		t.Fatal(err)
+	}
+	var receiptCount int
+	if err := spool.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM spool_completion_receipts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&receiptCount); err != nil {
+		t.Fatal(err)
+	}
+	if receiptCount != 0 {
+		t.Fatalf("old audit receipt was not pruned: count=%d", receiptCount)
+	}
+	inspection := spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+	if inspection.State != "suppressed" || inspection.IntentRevision != 2 || inspection.Result.ExitCode == nil || *inspection.Result.ExitCode != 7 {
+		t.Fatalf("payload-owned suppression after pruning=%+v", inspection)
+	}
+	if attempts, err := spool.pendingAttempts(t.Context()); err != nil || len(attempts) != 0 {
+		t.Fatalf("pruned suppressed payload became replayable=%+v err=%v", attempts, err)
 	}
 }
 

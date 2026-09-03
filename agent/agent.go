@@ -638,12 +638,13 @@ func (a *Agent) StopOCIRuntime(ctx context.Context) error {
 
 // FenceOCIIntentStop joins any completion request that already observed the
 // prior enabled revision. The OCI controller calls this after durably writing
-// disabled intent and holds it until runtime stop has joined resident work.
-func (a *Agent) FenceOCIIntentStop(revision uint64) func() {
+// disabled intent, waits for readers to drain, then releases the barrier before
+// StopOCIRuntime joins resident work.
+func (a *Agent) FenceOCIIntentStop(ctx context.Context, revision uint64) (func(), error) {
 	if a == nil || a.ociIntentGate == nil {
-		return func() {}
+		return func() {}, nil
 	}
-	return a.ociIntentGate.beginStop(revision)
+	return a.ociIntentGate.beginStop(ctx, revision)
 }
 
 // OCIRuntimeLive reports the already-earned, locally current OCI state used

@@ -492,7 +492,7 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 	for {
 		var observation OCIIntentObservation
 		var releaseIntent func()
-		if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassService {
+		if requiresOCIIntentFence(claim.Job.Spec.Kind, claim.Job.Spec.Class) {
 			var intentErr error
 			if lifecycle.dependencies.ociIntentGate == nil {
 				intentErr = &OCIIntentAuthorityUnavailableError{}

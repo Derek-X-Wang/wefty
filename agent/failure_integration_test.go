@@ -252,9 +252,12 @@ func TestOCIIntentStopOutcomeWinsSuppressesRestartReplay(t *testing.T) {
 	nodeAgent.outbox.completionStored = func() {
 		intentEnabled.Store(false)
 		go func() {
-			releaseFence := nodeAgent.FenceOCIIntentStop(2)
-			releaseFence()
-			stopDone <- nodeAgent.StopOCIRuntime(t.Context())
+			releaseFence, err := nodeAgent.FenceOCIIntentStop(t.Context(), 2)
+			if err == nil {
+				releaseFence()
+				err = nodeAgent.StopOCIRuntime(t.Context())
+			}
+			stopDone <- err
 		}()
 		deadline := time.Now().Add(time.Second)
 		for time.Now().Before(deadline) {
@@ -386,9 +389,12 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 	go func() {
 		intent, stopErr := lima.SetOCIIntent(t.Context(), intentPath, 1, false, time.Now())
 		if stopErr == nil {
-			releaseFence := nodeAgent.FenceOCIIntentStop(intent.Revision)
-			releaseFence()
-			stopErr = nodeAgent.StopOCIRuntime(t.Context())
+			var releaseFence func()
+			releaseFence, stopErr = nodeAgent.FenceOCIIntentStop(t.Context(), intent.Revision)
+			if stopErr == nil {
+				releaseFence()
+				stopErr = nodeAgent.StopOCIRuntime(t.Context())
+			}
 		}
 		stopDone <- stopErr
 	}()
@@ -698,35 +704,16 @@ func TestDurableOCIIntentStopSuppressesSpooledServiceCompletion(t *testing.T) {
 
 	var receipt completionInspectionReceipt
 	deadline := time.Now().Add(3 * time.Second)
-	for receipt.State != "suppressed" && receipt.State != "delivered" {
+	for receipt.State != "suppressed" {
 		receipt = outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
 		if time.Now().After(deadline) {
 			t.Fatalf("intent-spool completion disposition=%+v", receipt)
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if receipt.State == "suppressed" && (receipt.Reason != "service_intent_stop" || receipt.IntentRevision != 2 ||
-		receipt.Result.ExitCode == nil || *receipt.Result.ExitCode != 1) {
+	if receipt.Reason != "service_intent_stop" || receipt.IntentRevision != 2 ||
+		receipt.Result.ExitCode == nil || *receipt.Result.ExitCode != 1 {
 		t.Fatalf("suppressed late evidence was not retained and typed: %+v", receipt)
-	}
-	var secondAttempt string
-	if receipt.State == "delivered" {
-		deadline = time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) {
-			second, claimErr := client.Claim(t.Context(), registration.NodeID, registration.BootSessionID, contract.JobClassService)
-			if claimErr != nil {
-				t.Fatal(claimErr)
-			}
-			if second != nil {
-				secondAttempt = second.Lease.AttemptID
-				start(second)
-				break
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-		if secondAttempt == "" {
-			t.Fatal("failed spooled completion did not readmit the service")
-		}
 	}
 	deadline = time.Now().Add(3 * time.Second)
 	for {
@@ -735,14 +722,123 @@ func TestDurableOCIIntentStopSuppressesSpooledServiceCompletion(t *testing.T) {
 		lastLost := listErr == nil && len(attempts) > 0 && attempts[len(attempts)-1].State == contract.AttemptLost
 		if lastLost {
 			if len(attempts) != 1 || attempts[0].AttemptID != claim.Lease.AttemptID || attempts[0].Result != nil {
-				t.Fatalf("intent-spool expiry evidence=%+v second_attempt=%q receipt=%+v err=%v", attempts, secondAttempt, receipt, listErr)
+				t.Fatalf("intent-spool expiry evidence=%+v receipt=%+v err=%v", attempts, receipt, listErr)
 			}
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("intent-spool attempt did not become lost: attempts=%+v second_attempt=%q receipt=%+v err=%v", attempts, secondAttempt, receipt, listErr)
+			t.Fatalf("intent-spool attempt did not become lost: attempts=%+v receipt=%+v err=%v", attempts, receipt, listErr)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+		"authority-recovery-node": {Tags: []string{"authority-recovery"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	}, 500*time.Millisecond)
+	defer stopServer()
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	service, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "authority-recovery-service",
+		Kind: contract.JobKindOCI, Class: contract.JobClassService, Restart: contract.RestartAlways,
+		RoutingTags: []string{"authority-recovery"}, RuntimeHandler: "io.containerd.runc.v2",
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/authority-recovery:v1", Digest: &digest}, Argv: []string{"/payload"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newLiveIntentAuthorityRuntime()
+	var authorityAvailable atomic.Bool
+	authorityAvailable.Store(true)
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "authority-recovery-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAgent, err := New(Config{
+		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		NodeID: "authority-recovery-node", BootSessionID: "authority-recovery-boot", Version: "test",
+		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true},
+		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
+			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true}}, nil
+		}),
+		OCIIntent: func(context.Context) (OCIIntentObservation, error) {
+			if !authorityAvailable.Load() {
+				return OCIIntentObservation{}, errors.New("transient intent authority read failure")
+			}
+			return OCIIntentObservation{Enabled: true, Revision: 1}, nil
+		},
+		OCIBootBarrier: readyOCIBootBarrier{}, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
+		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
+		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
+		LogRetryInterval: 20 * time.Millisecond, Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	runContext, cancelRun := context.WithCancel(t.Context())
+	defer cancelRun()
+	runDone := make(chan error, 1)
+	go func() { runDone <- nodeAgent.Run(runContext) }()
+	var attemptID string
+	select {
+	case attemptID = <-runtime.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OCI service did not start")
+	}
+	if _, err := store.SetNodeClaimsByOperator(t.Context(), "authority-recovery-node", "operator", l1.NodeIntentRequest{
+		ClaimsEnabled: false, IntentRevision: 0, Reason: "hold replacement while observing late evidence",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	authorityAvailable.Store(false)
+	runtime.complete()
+	waitCompletionReceiptState(t, nodeAgent.outbox, attemptID, "withheld", 3*time.Second)
+
+	var lost l1.Attempt
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, _ = store.Reconcile(t.Context())
+		attempts, listErr := store.ListJobAttempts(t.Context(), service.JobID)
+		if listErr == nil && len(attempts) == 1 && attempts[0].State == contract.AttemptLost {
+			lost = attempts[0]
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("withheld live completion did not become lost: attempts=%+v err=%v", attempts, listErr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if lost.Result != nil || lost.LateResult != nil {
+		t.Fatalf("authority-unavailable completion published before recovery: %+v", lost)
+	}
+	authorityAvailable.Store(true)
+	nodeAgent.outbox.scheduleRecovery()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		attempts, listErr := store.ListJobAttempts(t.Context(), service.JobID)
+		if listErr == nil && len(attempts) == 1 && attempts[0].LateResult != nil {
+			late := attempts[0].LateResult
+			if late.Kind != l1.LateResultObservation || !late.Late || late.Result == nil || late.Result.ExitCode == nil || *late.Result.ExitCode != 7 {
+				t.Fatalf("recovered late result=%+v", late)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retained completion did not publish after authority recovery: attempts=%+v err=%v", attempts, listErr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	waitCompletionReceiptState(t, nodeAgent.outbox, attemptID, "delivered", 3*time.Second)
+	cancelRun()
+	var unavailable *OCIIntentAuthorityUnavailableError
+	if runErr := <-runDone; runErr != nil && !errors.As(runErr, &unavailable) {
+		t.Fatalf("agent shutdown after unavailable completion authority: %v", runErr)
 	}
 }
 
@@ -2604,6 +2700,40 @@ type intentMarkerRaceRuntime struct {
 	*intentStopRuntime
 	firstFinished chan struct{}
 	finishOnce    sync.Once
+}
+
+type liveIntentAuthorityRuntime struct {
+	*intentStopRuntime
+	finish chan struct{}
+}
+
+func newLiveIntentAuthorityRuntime() *liveIntentAuthorityRuntime {
+	return &liveIntentAuthorityRuntime{intentStopRuntime: newIntentStopRuntime(), finish: make(chan struct{})}
+}
+
+func (runtime *liveIntentAuthorityRuntime) Run(ctx context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	observation := workloadrunner.OCIImageObservation{
+		SubmittedReference: request.Execution.OCI.Image.Reference,
+		TopLevelDigest:     digest, TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json",
+		PlatformManifestDigest: digest, PlatformOS: "linux", PlatformArchitecture: "amd64",
+		RuntimeHandler: "io.containerd.runc.v2", Snapshotter: "overlayfs",
+	}
+	if err := request.OCIImageResolved(ctx, observation); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	if err := request.OCIStarted(ctx, observation); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	runtime.starts.Add(1)
+	runtime.started <- request.Authority.AttemptID
+	<-runtime.finish
+	exitCode := 7
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+}
+
+func (runtime *liveIntentAuthorityRuntime) complete() {
+	runtime.once.Do(func() { close(runtime.finish) })
 }
 
 func newIntentMarkerRaceRuntime() *intentMarkerRaceRuntime {

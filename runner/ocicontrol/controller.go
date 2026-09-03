@@ -16,7 +16,7 @@ import (
 type AgentRuntime interface {
 	RecoverOCIRuntimeCapabilities(context.Context) error
 	StopOCIRuntime(context.Context) error
-	FenceOCIIntentStop(uint64) func()
+	FenceOCIIntentStop(context.Context, uint64) (func(), error)
 	OCIRuntimeLive() bool
 }
 
@@ -129,7 +129,12 @@ func (controller *Controller) Stop(ctx context.Context, request IntentMutationRe
 	if controller.config.Runtime == nil {
 		return IntentResponse{Intent: intent}, runtimeUnavailable("OCI runtime is unavailable", nil)
 	}
-	releaseFence := controller.config.Runtime.FenceOCIIntentStop(intent.Revision)
+	releaseFence, err := controller.config.Runtime.FenceOCIIntentStop(ctx, intent.Revision)
+	if err != nil {
+		return IntentResponse{Intent: intent, RuntimeQuiesced: false}, controlError(ErrorRuntimeQuiescenceFailed, http.StatusConflict, "OCI completion drain was not proven", err)
+	}
+	// The exclusive acquisition is a drain barrier, not a lock around runtime
+	// teardown. Publishing is already fenced by the durable disabled revision.
 	releaseFence()
 	quiesce := controller.config.Runtime.StopOCIRuntime
 	if controller.config.StopCycle != nil {
