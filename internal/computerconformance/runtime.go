@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -25,18 +26,54 @@ const (
 	// also performs up to 40 runtime exec round-trips; attach plus mutation can
 	// therefore take twice this sleep budget plus runtime latency.
 	driverObservationSleepBudget = 10 * time.Second
+	containerStopGrace           = 15 * time.Second
+	// Run 33695618869 measured permission repair at 118-206 ms across the
+	// four reference image/platform builds; 15 seconds retains QEMU margin.
+	permissionRepairBudget      = 15 * time.Second
+	teardownRemoveRetryInterval = 250 * time.Millisecond
+	// teardownRemoveRetryBudget bounds only retries after the runtime has
+	// detached every bind mount. It is not a blanket teardown delay.
+	teardownRemoveRetryBudget = 2 * time.Second
+	permissionRepairScript    = `chmod -R u+rwX,go+rwX "$1"`
+	teardownPermissionFixture = "teardown-permission-repair"
 )
+
+type TeardownFailureReason string
+
+const (
+	TeardownContainerStopFailed    TeardownFailureReason = "container_stop_failed"
+	TeardownContainerDetachFailed  TeardownFailureReason = "container_detach_failed"
+	TeardownPermissionRepairFailed TeardownFailureReason = "temporary_root_permission_repair_failed"
+	TeardownTemporaryRootBusy      TeardownFailureReason = "temporary_root_busy"
+	TeardownTemporaryRootNotEmpty  TeardownFailureReason = "temporary_root_not_empty"
+	TeardownTemporaryRootRemove    TeardownFailureReason = "temporary_root_remove_failed"
+)
+
+// TeardownFailure keeps cleanup failures machine-classifiable while naming
+// the exact runtime or filesystem object that remains.
+type TeardownFailure struct {
+	Reason   TeardownFailureReason
+	Leftover string
+	Err      error
+}
+
+func (e *TeardownFailure) Error() string {
+	return fmt.Sprintf("runtime teardown failed: reason=%s leftover=%q: %v", e.Reason, e.Leftover, e.Err)
+}
+
+func (e *TeardownFailure) Unwrap() error { return e.Err }
 
 type RuntimeConfig struct {
 	Image              string
+	RepairImage        string
 	Runtime            string
 	Platform           string
 	InputOraclePath    string
 	DriverOraclePath   string
 	EdgeProcessPattern string
 	ReceiptPath        string
-	// MutationProfile is used only by the repository's broken-image lane to
-	// mutate Docker's approximation of the production profile.
+	// MutationProfile is used only by repository acceptance fixtures to mutate
+	// Docker's approximation of the production profile or teardown state.
 	MutationProfile string
 	Now             func() time.Time
 	Sleep           func(context.Context, time.Duration) error
@@ -52,11 +89,15 @@ type runtimeRunner struct {
 	recorder                                 *Recorder
 	root, serviceDir, controlDir, handoffDir string
 	containerID                              string
+	containerLeftoverConfirmed               bool
 	viewPort, controlPort, attempt           int
 	tools                                    map[string]bool
 	failed                                   bool
 	readDriverObservationHook                func(context.Context) (driverObservation, error)
 	writeDriverHook                          func(string) error
+	runCommandHook                           func(context.Context, ...string) (commandResult, error)
+	removeAllHook                            func(string) error
+	teardownLogHook                          func(string)
 }
 
 func Run(ctx context.Context, config RuntimeConfig) RuntimeResult {
@@ -75,6 +116,9 @@ func Run(ctx context.Context, config RuntimeConfig) RuntimeResult {
 func (r *runtimeRunner) run(ctx context.Context) (err error) {
 	if r.config.Image == "" {
 		return errors.New("--image is required")
+	}
+	if !strings.Contains(r.config.RepairImage, "@sha256:") {
+		return errors.New("--repair-image must be an immutable sha256 digest reference")
 	}
 	if r.config.Runtime != "docker" && r.config.Runtime != "nerdctl" {
 		return errors.New("--runtime must be docker or nerdctl")
@@ -122,6 +166,9 @@ func (r *runtimeRunner) run(ctx context.Context) (err error) {
 	r.record("runtime.started", StatusPass, "container task started")
 	if err := r.waitReady(ctx, startedAt, false); err != nil {
 		return r.withStartupLogs(ctx, err)
+	}
+	if r.config.MutationProfile == teardownPermissionFixture {
+		return nil
 	}
 	if r.config.MutationProfile == "duplicate-endpoint" {
 		r.record("endpoints.distinct", StatusFail, "view and control received the same attempt-local port")
@@ -1175,6 +1222,9 @@ type commandResult struct {
 }
 
 func (r *runtimeRunner) runCommand(ctx context.Context, arguments ...string) (commandResult, error) {
+	if r.runCommandHook != nil {
+		return r.runCommandHook(ctx, arguments...)
+	}
 	command := exec.CommandContext(ctx, r.config.Runtime, arguments...)
 	var stdout, stderr strings.Builder
 	command.Stdout, command.Stderr = &stdout, &stderr
@@ -1232,26 +1282,183 @@ func (r *runtimeRunner) stopContainer(ctx context.Context) error {
 	id := r.containerID
 	// Ask the already-running tenant to make only its own bind content removable.
 	_ = r.execShell(ctx, `chmod -R u+rwX,go+rwX /wefty/service 2>/dev/null || true`, "")
-	result, stopErr := r.runCommand(ctx, "stop", "--time", "15", id)
-	_, rmErr := r.runCommand(ctx, "rm", "--force", id)
-	r.containerID = ""
-	var resultErr error
+	result, stopErr := r.runCommand(ctx, "stop", "--time", strconv.Itoa(int(containerStopGrace/time.Second)), id)
 	if stopErr != nil {
-		resultErr = fmt.Errorf("stop container: %s", r.runtimeDetail("runtime stop failed", errWithOutput(stopErr, result)))
+		detail := r.runtimeDetail("runtime stop did not confirm exit", errWithOutput(stopErr, result))
+		r.teardownObserve(TeardownContainerStopFailed, detail)
 	}
+
+	removeResult, rmErr := r.runCommand(ctx, "rm", "--force", id)
 	if rmErr != nil {
-		resultErr = errors.Join(resultErr, fmt.Errorf("remove container %s: %w", id, rmErr))
+		r.containerLeftoverConfirmed = false
+		inspectResult, inspectErr := r.runCommand(ctx, "inspect", id)
+		if inspectErr == nil {
+			r.containerLeftoverConfirmed = true
+		} else if runtimeObjectAbsent(inspectResult) {
+			r.teardownObserve(TeardownContainerDetachFailed, r.runtimeDetail("runtime remove failed but inspect proved container absent", errWithOutput(rmErr, removeResult)))
+			r.containerID = ""
+			return nil
+		}
+		leftovers := make([]string, 0, 2)
+		if r.containerLeftoverConfirmed {
+			leftovers = append(leftovers, "container:"+id)
+		}
+		leftovers = append(leftovers, "temporary-root:"+r.root)
+		return &TeardownFailure{Reason: TeardownContainerDetachFailed,
+			Leftover: strings.Join(leftovers, ","),
+			Err:      errors.New(r.runtimeDetail("runtime remove did not detach mounts", errWithOutput(rmErr, removeResult)))}
 	}
-	return resultErr
+	r.containerID = ""
+	r.containerLeftoverConfirmed = false
+	return nil
 }
+
+func runtimeObjectAbsent(result commandResult) bool {
+	detail := strings.ToLower(result.stdout + "\n" + result.stderr)
+	return strings.Contains(detail, "no such object") ||
+		strings.Contains(detail, "no such container")
+}
+
 func (r *runtimeRunner) cleanup() error {
-	err := r.stopContainer(context.Background())
-	if r.root != "" {
-		if removeErr := os.RemoveAll(r.root); removeErr != nil {
-			err = errors.Join(err, fmt.Errorf("remove conformance temporary root: %w", removeErr))
+	defer r.recordTeardownLeftovers()
+	ctx := context.Background()
+	err := r.stopContainer(ctx)
+	if r.containerID != "" || r.root == "" {
+		return err
+	}
+	return errors.Join(err, r.removeTemporaryRoot(ctx))
+}
+
+func (r *runtimeRunner) removeTemporaryRoot(ctx context.Context) error {
+	root := r.root
+	if r.config.MutationProfile == teardownPermissionFixture {
+		fixture := filepath.Join(root, "service", "teardown-permission-fixture")
+		if err := os.MkdirAll(fixture, 0o755); err != nil {
+			return &TeardownFailure{Reason: TeardownTemporaryRootRemove, Leftover: "temporary-root:" + root, Err: fmt.Errorf("prepare permission-repair fixture: %w", err)}
+		}
+		if err := os.WriteFile(filepath.Join(fixture, "late-write"), []byte("fixture"), 0o600); err != nil {
+			return &TeardownFailure{Reason: TeardownTemporaryRootRemove, Leftover: "temporary-root:" + root, Err: fmt.Errorf("prepare permission-repair fixture: %w", err)}
+		}
+		if err := os.Chmod(fixture, 0); err != nil {
+			return &TeardownFailure{Reason: TeardownTemporaryRootRemove, Leftover: "temporary-root:" + root, Err: fmt.Errorf("prepare permission-repair fixture: %w", err)}
 		}
 	}
-	return err
+	permissionRepairAttempted := false
+	removeRetries := 0
+	removeRetryLimit := int(teardownRemoveRetryBudget / teardownRemoveRetryInterval)
+	for {
+		removeErr := r.removeAll(root)
+		if removeErr == nil {
+			r.root = ""
+			r.teardownLog(fmt.Sprintf("teardown complete: removed=%q permission_repair=%t removal_retries=%d", root, permissionRepairAttempted, removeRetries))
+			return nil
+		}
+		if errors.Is(removeErr, os.ErrPermission) && !permissionRepairAttempted {
+			permissionRepairAttempted = true
+			r.teardownLog(fmt.Sprintf("teardown repair: reason=temporary_root_permission target=%q", root))
+			if repairErr := r.repairTemporaryRootPermissions(ctx); repairErr != nil {
+				return &TeardownFailure{Reason: TeardownPermissionRepairFailed, Leftover: "temporary-root:" + root, Err: repairErr}
+			}
+			continue
+		}
+		retryReason := TeardownFailureReason("")
+		switch {
+		case errors.Is(removeErr, syscall.EBUSY):
+			retryReason = TeardownTemporaryRootBusy
+		case errors.Is(removeErr, syscall.ENOTEMPTY):
+			retryReason = TeardownTemporaryRootNotEmpty
+		}
+		if retryReason != "" && removeRetries < removeRetryLimit {
+			removeRetries++
+			detail := fmt.Sprintf("target=%q retry=%d/%d budget=%s", root, removeRetries, removeRetryLimit, teardownRemoveRetryBudget)
+			r.teardownRetry(retryReason, detail)
+			if sleepErr := r.teardownSleep(ctx, teardownRemoveRetryInterval); sleepErr != nil {
+				return &TeardownFailure{Reason: retryReason, Leftover: "temporary-root:" + root, Err: errors.Join(removeErr, sleepErr)}
+			}
+			continue
+		}
+		reason := TeardownTemporaryRootRemove
+		if retryReason != "" {
+			reason = retryReason
+		}
+		return &TeardownFailure{Reason: reason, Leftover: "temporary-root:" + root, Err: removeErr}
+	}
+}
+
+func (r *runtimeRunner) repairTemporaryRootPermissions(ctx context.Context) error {
+	repairCtx, cancel := context.WithTimeout(ctx, permissionRepairBudget)
+	defer cancel()
+	startedAt := time.Now()
+	arguments := []string{
+		"run", "--rm", "--network", "none", "--user", "0:0", "--read-only",
+		"--security-opt", "no-new-privileges:true", "--cap-drop", "ALL",
+		"--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
+		"--mount", "type=bind,src=" + r.root + ",dst=/wefty-cleanup",
+	}
+	if r.config.Platform != "" {
+		arguments = append(arguments, "--platform", r.config.Platform)
+	}
+	arguments = append(arguments, "--entrypoint", "/bin/sh", r.config.RepairImage, "-c", permissionRepairScript, "wefty-repair", "/wefty-cleanup")
+	result, err := r.runCommand(repairCtx, arguments...)
+	duration := time.Since(startedAt)
+	if r.recorder != nil {
+		r.recorder.RecordPermissionRepair(duration)
+	}
+	r.teardownLog(fmt.Sprintf("teardown repair complete: duration=%s budget=%s", duration.Round(time.Millisecond), permissionRepairBudget))
+	if err != nil {
+		return errors.New(r.runtimeDetail("detached permission repair failed", errWithOutput(err, result)))
+	}
+	return nil
+}
+
+func (r *runtimeRunner) removeAll(path string) error {
+	if r.removeAllHook != nil {
+		return r.removeAllHook(path)
+	}
+	return os.RemoveAll(path)
+}
+
+func (r *runtimeRunner) teardownSleep(ctx context.Context, duration time.Duration) error {
+	if r.config.Sleep != nil {
+		return r.config.Sleep(ctx, duration)
+	}
+	return sleepContext(ctx, duration)
+}
+
+func (r *runtimeRunner) teardownLog(message string) {
+	if r.teardownLogHook != nil {
+		r.teardownLogHook(message)
+		return
+	}
+	fmt.Fprintln(os.Stderr, message)
+}
+
+func (r *runtimeRunner) teardownObserve(reason TeardownFailureReason, detail string) {
+	if r.recorder != nil {
+		r.recorder.RecordTeardownObservation(string(reason), detail)
+	}
+	r.teardownLog(fmt.Sprintf("teardown observation: reason=%s detail=%q", reason, detail))
+}
+
+func (r *runtimeRunner) teardownRetry(reason TeardownFailureReason, detail string) {
+	if r.recorder != nil {
+		r.recorder.RecordTeardownRetry(string(reason), detail)
+	}
+	r.teardownLog(fmt.Sprintf("teardown retry: reason=%s %s", reason, detail))
+}
+
+func (r *runtimeRunner) recordTeardownLeftovers() {
+	if r.recorder == nil {
+		return
+	}
+	leftovers := make([]string, 0, 2)
+	if r.containerID != "" && r.containerLeftoverConfirmed {
+		leftovers = append(leftovers, "container:"+r.containerID)
+	}
+	if r.root != "" {
+		leftovers = append(leftovers, "temporary-root:"+r.root)
+	}
+	r.recorder.RecordTeardownLeftovers(leftovers)
 }
 
 func availablePort() (int, error) {

@@ -6,7 +6,10 @@ import (
 	"time"
 )
 
-func TestReceiptV1CatalogIDsArePinned(t *testing.T) {
+func TestReceiptV2CatalogIDsArePinned(t *testing.T) {
+	if ReceiptVersion != 2 {
+		t.Fatalf("receipt version = %d, want 2", ReceiptVersion)
+	}
 	expected := strings.Fields(`
 		runtime.started runtime.image-config
 		environment.service-dir environment.view-port environment.control-port environment.service-port-omitted environment.handoff-dir-omitted environment.authority-omitted environment.other-wefty-preserved
@@ -21,11 +24,11 @@ func TestReceiptV1CatalogIDsArePinned(t *testing.T) {
 		persistence.service-survives persistence.profile-survives persistence.sign-in-survives persistence.rootfs-discarded persistence.edge-recovers targets.control-nonpersistent
 	`)
 	if len(CheckCatalog) != len(expected) {
-		t.Fatalf("receipt v1 catalog length = %d, want %d", len(CheckCatalog), len(expected))
+		t.Fatalf("receipt v2 catalog length = %d, want %d", len(CheckCatalog), len(expected))
 	}
 	for index, definition := range CheckCatalog {
 		if definition.ID != expected[index] {
-			t.Fatalf("receipt v1 catalog id[%d] = %q, want %q", index, definition.ID, expected[index])
+			t.Fatalf("receipt v2 catalog id[%d] = %q, want %q", index, definition.ID, expected[index])
 		}
 	}
 }
@@ -40,10 +43,28 @@ func TestRecorderStartsEveryCheckNotRunAndUsesInjectedClock(t *testing.T) {
 	if !receipt.StartedAt.Equal(start) || !receipt.FinishedAt.Equal(start.Add(5*time.Second)) {
 		t.Fatalf("injected timestamps changed: %+v", receipt)
 	}
+	if receipt.Teardown.Observations == nil || receipt.Teardown.Leftovers == nil || len(receipt.Teardown.Leftovers) != 0 {
+		t.Fatalf("initial teardown evidence = %+v", receipt.Teardown)
+	}
 	for _, check := range receipt.Checks {
 		if check.Status != StatusNotRun {
 			t.Fatalf("initial check %s = %s", check.ID, check.Status)
 		}
+	}
+}
+
+func TestRecorderPreservesTypedTeardownEvidence(t *testing.T) {
+	recorder := NewRecorder("image", "docker", "linux/arm64", time.Unix(100, 0))
+	recorder.RecordTeardownObservation("container_stop_failed", "daemon response")
+	recorder.RecordTeardownRetry("temporary_root_not_empty", "retry=1/8")
+	recorder.RecordPermissionRepair(1250 * time.Millisecond)
+	recorder.RecordTeardownLeftovers([]string{"temporary-root:/tmp/checker"})
+	receipt := recorder.Finish(time.Unix(101, 0))
+	if receipt.Teardown.RetriesUsed != 1 || !receipt.Teardown.PermissionRepairPerformed || receipt.Teardown.PermissionRepairSeconds != 1.25 {
+		t.Fatalf("teardown counters = %+v", receipt.Teardown)
+	}
+	if len(receipt.Teardown.Observations) != 2 || len(receipt.Teardown.Leftovers) != 1 {
+		t.Fatalf("teardown evidence = %+v", receipt.Teardown)
 	}
 }
 

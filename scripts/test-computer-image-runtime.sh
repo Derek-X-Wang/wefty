@@ -38,6 +38,7 @@ set +e
 positive_stderr="$evidence/${arch}-runtime.stderr"
 "$checker" \
   --image "$image" \
+  --repair-image "$image" \
   --platform "linux/$arch" \
   --input-oracle-path /tmp/wefty-computer/input-oracle.json \
   --driver-oracle-path /tmp/wefty-computer/driver-state.json \
@@ -46,7 +47,7 @@ positive_stderr="$evidence/${arch}-runtime.stderr"
 positive_status=$?
 set -e
 sed -n '1,400p' "$positive_stderr" >&2
-if grep -Eq 'stop container|remove container|remove conformance temporary root' "$positive_stderr"; then
+if grep -Fq 'runtime teardown failed' "$positive_stderr"; then
   stage_error positive-runtime-teardown "checker reported container or temporary-root cleanup failure; see $positive_stderr"
   exit 1
 fi
@@ -54,10 +55,20 @@ if ((positive_status != 0)); then
   stage_error positive-runtime "checker exited $positive_status; receipt=$evidence/${arch}-runtime.json"
   exit 1
 fi
-if ! jq -e 'type == "object" and .status == "PASS" and (.checks | type == "array")' "$evidence/${arch}-runtime.json" >/dev/null 2>&1; then
-  stage_error receipt/positive-runtime "missing, malformed, or non-PASS receipt $evidence/${arch}-runtime.json"
-  exit 1
-fi
+"$diagnostics" positive "$evidence/${arch}-runtime.json"
+
+repair_probe_stderr="$evidence/${arch}-teardown-repair.stderr"
+set +e
+"$checker" \
+  --image "$image" \
+  --repair-image "$image" \
+  --platform "linux/$arch" \
+  --mutation-profile teardown-permission-repair \
+  --receipt "$evidence/${arch}-teardown-repair.json" 2> "$repair_probe_stderr"
+repair_probe_status=$?
+set -e
+sed -n '1,400p' "$repair_probe_stderr" >&2
+"$diagnostics" teardown-repair "$evidence/${arch}-teardown-repair.json" "$repair_probe_status"
 
 mutations="$evidence/mutations"
 if ! mkdir -p "$mutations"; then
@@ -92,7 +103,7 @@ run_mutation() {
   local checker_started=$SECONDS
   local checker_stderr="$mutations/$mutation.stderr"
   set +e
-  "$checker" --image "$tag" --platform "linux/$arch" \
+  "$checker" --image "$tag" --repair-image "$image" --platform "linux/$arch" \
     --input-oracle-path /tmp/wefty-computer/input-oracle.json \
     --driver-oracle-path /tmp/wefty-computer/driver-state.json \
     --edge-process-pattern "$edge_process_pattern" \
@@ -100,7 +111,7 @@ run_mutation() {
   local checker_status=$?
   set -e
   sed -n '1,400p' "$checker_stderr" >&2
-  if grep -Eq 'stop container|remove container|remove conformance temporary root' "$checker_stderr"; then
+  if grep -Fq 'runtime teardown failed' "$checker_stderr"; then
     stage_error "runtime-teardown/$mutation" "checker reported container or temporary-root cleanup failure; see $checker_stderr"
     exit 1
   fi

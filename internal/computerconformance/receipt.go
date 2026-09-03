@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const ReceiptVersion = 1
+const ReceiptVersion = 2
 const ContainerdProfileNotRun = "harness profile is not the containerd wefty-v1 profile"
 
 type Status string
@@ -66,6 +66,20 @@ type Receipt struct {
 	AttemptTmpfsDiscarded bool                   `json:"attempt_tmpfs_discarded"`
 	Shm                   CompatibilityShm       `json:"shm"`
 	ReadinessSeconds      float64                `json:"readiness_seconds"`
+	Teardown              TeardownEvidence       `json:"teardown"`
+}
+
+type TeardownEvidence struct {
+	RetriesUsed               int                   `json:"retries_used"`
+	PermissionRepairPerformed bool                  `json:"permission_repair_performed"`
+	PermissionRepairSeconds   float64               `json:"permission_repair_seconds,omitempty"`
+	Observations              []TeardownObservation `json:"observations"`
+	Leftovers                 []string              `json:"leftovers"`
+}
+
+type TeardownObservation struct {
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
 }
 
 type CompatibilityNegatives struct {
@@ -99,7 +113,19 @@ func NewRecorder(image, runtimeName, platform string, startedAt time.Time) *Reco
 		checks[i] = Check{ID: definition.ID, Scope: definition.Scope, Status: StatusNotRun, Summary: definition.Summary}
 		index[definition.ID] = i
 	}
-	return &Recorder{receipt: Receipt{Version: ReceiptVersion, Image: image, Runtime: runtimeName, Platform: platform, StartedAt: startedAt.UTC(), Status: StatusNotRun, Checks: checks}, index: index}
+	return &Recorder{receipt: Receipt{
+		Version:   ReceiptVersion,
+		Image:     image,
+		Runtime:   runtimeName,
+		Platform:  platform,
+		StartedAt: startedAt.UTC(),
+		Status:    StatusNotRun,
+		Checks:    checks,
+		Teardown: TeardownEvidence{
+			Observations: make([]TeardownObservation, 0),
+			Leftovers:    make([]string, 0),
+		},
+	}, index: index}
 }
 
 func (r *Recorder) Record(id string, status Status, detail string) error {
@@ -169,6 +195,24 @@ func (r *Recorder) RecordPersistence(profile, signIn bool) {
 }
 func (r *Recorder) RecordEdgeRecovery(value bool) { r.receipt.RestartedEdgeRecovered = &value }
 
+func (r *Recorder) RecordTeardownObservation(reason, detail string) {
+	r.receipt.Teardown.Observations = append(r.receipt.Teardown.Observations, TeardownObservation{Reason: reason, Detail: detail})
+}
+
+func (r *Recorder) RecordTeardownRetry(reason, detail string) {
+	r.receipt.Teardown.RetriesUsed++
+	r.RecordTeardownObservation(reason, detail)
+}
+
+func (r *Recorder) RecordPermissionRepair(duration time.Duration) {
+	r.receipt.Teardown.PermissionRepairPerformed = true
+	r.receipt.Teardown.PermissionRepairSeconds += duration.Seconds()
+}
+
+func (r *Recorder) RecordTeardownLeftovers(leftovers []string) {
+	r.receipt.Teardown.Leftovers = slices.Clone(leftovers)
+}
+
 func Aggregate(checks []Check) Status {
 	status := StatusPass
 	for _, check := range checks {
@@ -201,7 +245,7 @@ type CheckDefinition struct {
 	Summary string
 }
 
-// CheckCatalog is append-only within receipt version 1. Stable IDs let CI and
+// CheckCatalog is append-only within receipt version 2. Stable IDs let CI and
 // image authors compare evidence without scraping human prose.
 var CheckCatalog = []CheckDefinition{
 	{ID: "runtime.started", Scope: ScopeImage, Summary: "image starts under the Computer harness profile"},

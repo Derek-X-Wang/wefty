@@ -262,3 +262,24 @@ Docker-harness cell `PASS`. Capability-set, seccomp, namespace, device, and
 cgroup/OOM/swap read-backs remain explicit `NOT-RUN` cells with the stable
 reason `harness profile is not the containerd wefty-v1 profile`; native
 containerd acceptance owns those assertions.
+
+Checker teardown asks Docker to stop the container and then removes it so every
+bind mount is detached before the checker-owned temporary root is removed. The
+pre-stop in-container chmod can race a desktop process creating a later path;
+if the detached root is still restrictive, the checker uses an explicitly
+supplied, known-good reference digest in a networkless, read-only-root repair
+container running as uid 0 with only `DAC_OVERRIDE` and `FOWNER`. Every image
+platform job exercises that repair under its actual runtime platform, records
+its duration, and enforces the 15-second deadline measured against 118-206 ms
+repairs across the four builds in run 33695618869. `EBUSY` and
+`ENOTEMPTY` removals are retried every 250 milliseconds within a two-second
+scheduled-sleep budget.
+
+The versioned receipt records retry count, permission-repair timing, non-fatal
+stop observations, and exact remaining objects. A failed stop is diagnostic
+when forced removal succeeds and the root is gone; fail-closed typed errors are
+keyed only to a container or temporary root that remains. When container
+removal cannot prove bind detachment, the checker deliberately retains the
+temporary root under `/tmp/wefty-computer-conformance-*` and names both objects
+in the typed error for later runner cleanup. Teardown never changes the row's
+assertion result into a non-fatal pass.
