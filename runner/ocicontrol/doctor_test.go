@@ -74,7 +74,8 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 		ReadDesiredSetupState: func(string) (SetupState, error) {
 			return SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: "/srv/wefty", ProbeDigest: "sha256:probe", SystemdVersion: 255, HelperRestartPolicy: "geometric_capped_1s"}, nil
 		},
-		InstalledSystemdVersion: func(context.Context) (int, error) { return 255, nil },
+		InstalledSystemdVersion:       func(context.Context) (int, error) { return 255, nil },
+		HelperHandshakeStalledWindows: func() uint64 { return 0 },
 	}
 }
 
