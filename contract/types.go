@@ -646,10 +646,11 @@ const (
 // one process. ExitCode is a pointer so a successful exit code of zero remains
 // present on the wire when omitempty is applied. OutputError supersedes an
 // otherwise-successful exit when durable output fails for a reason other than
-// the bounded log-finalization deadline. Deadline expiry preserves the payload
-// result and sets LogEvidenceIncomplete. A signal outcome always names its
+// the bounded log-finalization deadline. Deadline expiry after a payload result
+// preserves that result and sets LogEvidenceIncomplete; a pre-Started
+// SpawnError remains a sole spawn arm. A signal outcome always names its
 // structured initiator in TerminationCause. OOM, DiskExhausted, and
-// LogEvidenceIncomplete are additive evidence and never replace the primary
+// LogEvidenceIncomplete are additive evidence alongside one valid primary
 // terminal arm.
 type ProcessResult struct {
 	SpawnError            *SpawnFailure    `json:"spawn_error,omitempty"`

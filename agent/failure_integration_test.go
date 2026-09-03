@@ -1408,13 +1408,165 @@ func TestServiceCrashWithExpiredLogUploadStillRestarts(t *testing.T) {
 	}
 }
 
+func TestTypedNilLogSinkSetupFailureRemainsSpawnFailure(t *testing.T) {
+	setupErr := errors.New("log spool unavailable")
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindProcess: &restartableCrashRuntime{}},
+		clock:    systemClock{},
+		logSinkFactory: func(context.Context, l1.Claim) (attemptLogSink, error) {
+			var sink *batchingLogSink
+			return sink, setupErr
+		},
+	})
+	result, err := lifecycle.runWorkload(t.Context(), l1.Claim{
+		Job: l1.Job{JobID: "typed-nil-log-sink", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+		}},
+		Lease: l1.AttemptLease{AttemptID: "typed-nil-log-sink-attempt"},
+	})
+	if !errors.Is(err, setupErr) {
+		t.Fatalf("log sink setup error = %v, want %v", err, setupErr)
+	}
+	if result.SpawnError == nil || result.SpawnError.Code != contract.SpawnFailureLogSinkSetup {
+		t.Fatalf("log sink setup result = %#v, want spawn failure", result)
+	}
+}
+
+func TestOCIPreStartSpawnFailureIgnoresExpiredLogFinalization(t *testing.T) {
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "pre-start-log-finalization.sqlite"), l1.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_, err = store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-pre-start-node"}, contract.NodeRegistration{
+		NodeID: "pre-start-node", BootSessionID: "pre-start-boot", OS: "linux", Architecture: "amd64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:oci": true, "runtime_handler:io.containerd.runc.v2": true}, CapabilityRevision: 1,
+		CapabilityObservedAt: time.Now(),
+	}, l1.DefaultNodePolicy("linux"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "pre-start-expired-log-finalization",
+		Kind: contract.JobKindOCI, Class: contract.JobClassOneShot, RuntimeHandler: "io.containerd.runc.v2",
+		Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/pre-start:v1"}, Argv: []string{"/payload"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimJob(t.Context(), "fabric-pre-start-node", "pre-start-node", "pre-start-boot", contract.JobClassOneShot)
+	if err != nil || claim == nil {
+		stored, _ := store.GetJob(t.Context(), job.JobID)
+		nodes, _ := store.ListNodes(t.Context())
+		t.Fatalf("claim pre-start job = %#v err=%v job=%+v nodes=%+v", claim, err, stored, nodes)
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindOCI: &preStartSpawnFailureRuntime{}},
+		clock:    systemClock{}, finalizationTimeout: 25 * time.Millisecond,
+		logSinkFactory: func(context.Context, l1.Claim) (attemptLogSink, error) {
+			return blockingFinalizationLogSink{}, nil
+		},
+	})
+	result, runErr := lifecycle.runWorkload(t.Context(), *claim)
+	if runErr != nil || result.SpawnError == nil || result.LogEvidenceIncomplete {
+		t.Fatalf("pre-start result = %#v err=%v, want sole spawn_error", result, runErr)
+	}
+	completed, err := store.CompleteAttempt(t.Context(), "fabric-pre-start-node", job.JobID, claim.Lease.AttemptID, l1.CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
+		Result: toL1Result(result), RuntimeQuiescenceEvidence: l1.RuntimeQuiescenceAttempt,
+	})
+	if err != nil || completed.State != contract.JobQueued {
+		t.Fatalf("pre-start completion = %#v err=%v, want accepted infrastructure retry", completed, err)
+	}
+}
+
+func TestInnerLogUploadDeadlineRemainsTerminal(t *testing.T) {
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindProcess: &restartableCrashRuntime{}},
+		clock:    systemClock{}, finalizationTimeout: time.Second,
+		logSinkFactory: func(context.Context, l1.Claim) (attemptLogSink, error) {
+			return innerDeadlineLogSink{}, nil
+		},
+	})
+	result, err := lifecycle.runWorkload(t.Context(), l1.Claim{
+		Job: l1.Job{JobID: "inner-log-deadline", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+		}},
+		Lease: l1.AttemptLease{AttemptID: "inner-log-deadline-attempt"},
+	})
+	if err == nil || result.OutputError == "" || result.Signal != "" || result.LogEvidenceIncomplete {
+		t.Fatalf("inner log deadline result = %#v err=%v, want terminal output_error", result, err)
+	}
+}
+
+func TestOneShotExitZeroSurvivesBoundedLogFinalizationDeadline(t *testing.T) {
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindProcess: instantWorkloadRuntime{}},
+		clock:    systemClock{}, finalizationTimeout: 25 * time.Millisecond,
+		logSinkFactory: func(context.Context, l1.Claim) (attemptLogSink, error) {
+			return blockingFinalizationLogSink{}, nil
+		},
+	})
+	result, err := lifecycle.runWorkload(t.Context(), l1.Claim{
+		Job: l1.Job{JobID: "one-shot-log-deadline", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+		}},
+		Lease: l1.AttemptLease{AttemptID: "one-shot-log-deadline-attempt"},
+	})
+	if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.OutputError != "" || !result.LogEvidenceIncomplete {
+		t.Fatalf("one-shot bounded log finalization = %#v err=%v", result, err)
+	}
+}
+
+func TestConcurrentLogDeadlineAndGenuineOutputFailureStayTerminal(t *testing.T) {
+	sink := &compoundFinalizationLogSink{}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindProcess: instantWorkloadRuntime{}},
+		clock:    systemClock{}, finalizationTimeout: 25 * time.Millisecond,
+		logSinkFactory: func(context.Context, l1.Claim) (attemptLogSink, error) {
+			return sink, nil
+		},
+	})
+	result, err := lifecycle.runWorkload(t.Context(), l1.Claim{
+		Job: l1.Job{JobID: "compound-log-finalization", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+			Execution: contract.ExecutionSpec{SensitiveEnv: map[string]string{"secret": "long-secret-value"}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "compound-log-finalization-attempt"},
+	})
+	if err == nil || result.OutputError == "" || result.ExitCode != nil || !result.LogEvidenceIncomplete {
+		t.Fatalf("compound log finalization = %#v err=%v, want terminal output_error plus incomplete evidence", result, err)
+	}
+}
+
 type blockingFinalizationLogSink struct{}
 
 func (blockingFinalizationLogSink) WriteOutput(context.Context, contract.LogEvent) error { return nil }
 
 func (blockingFinalizationLogSink) CloseContext(ctx context.Context) error {
 	<-ctx.Done()
+	return &logFinalizationDeadlineError{stage: logFinalizationStageUpload, cause: context.Cause(ctx)}
+}
+
+type innerDeadlineLogSink struct{}
+
+func (innerDeadlineLogSink) WriteOutput(context.Context, contract.LogEvent) error { return nil }
+
+func (innerDeadlineLogSink) CloseContext(context.Context) error {
+	return fmt.Errorf("log destination request: %w", context.DeadlineExceeded)
+}
+
+type compoundFinalizationLogSink struct{}
+
+func (*compoundFinalizationLogSink) WriteOutput(ctx context.Context, _ contract.LogEvent) error {
+	<-ctx.Done()
 	return context.Cause(ctx)
+}
+
+func (*compoundFinalizationLogSink) CloseContext(context.Context) error {
+	return errors.New("durable uploader corruption")
 }
 
 type restartableCrashRuntime struct{}
@@ -1435,6 +1587,40 @@ func (*restartableCrashRuntime) Run(ctx context.Context, request workloadrunner.
 }
 
 func (*restartableCrashRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+}
+
+type preStartSpawnFailureRuntime struct{}
+
+func (*preStartSpawnFailureRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (*preStartSpawnFailureRuntime) Run(context.Context, workloadrunner.Request, workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	return workloadrunner.Result{Outcome: spawnFailure(contract.SpawnFailureRuntimeUnavailable, errors.New("runtime unavailable before start"))}, nil
+}
+
+func (*preStartSpawnFailureRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+}
+
+type instantWorkloadRuntime struct{}
+
+func (instantWorkloadRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (instantWorkloadRuntime) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	if err := sink.WriteOutput(ctx, contract.LogEvent{
+		AttemptID: request.Authority.AttemptID, Stream: contract.LogStdout, Bytes: []byte("tail"),
+	}); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	exitCode := 0
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+}
+
+func (instantWorkloadRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
 	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
 }
 

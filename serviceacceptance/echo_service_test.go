@@ -103,12 +103,39 @@ func TestServiceCrashAfterFinalizationBudgetRestarts(t *testing.T) {
 			break
 		}
 	}
-	if !foundAttemptEvent && !failure.LogEvidenceIncomplete {
-		t.Fatalf("service logs omitted durable events for attempt %q without log_evidence_incomplete: %#v", running.CurrentAttemptID, logs.Events)
-	}
 	if restarted := waitForFreshRunningAttempt(t, harness, job.JobID, running.CurrentAttemptID, 5*time.Second); restarted.JobID != job.JobID {
 		t.Fatalf("restarted service job ID = %q, want %q", restarted.JobID, job.JobID)
 	}
+	if !foundAttemptEvent {
+		if !failure.LogEvidenceIncomplete {
+			t.Fatalf("service logs omitted durable events for attempt %q without log_evidence_incomplete: %#v", running.CurrentAttemptID, logs.Events)
+		}
+		// Recovery owns durable spool replay on agent startup. Prove the typed
+		// incomplete fact corresponds to recoverable evidence instead of merely
+		// accepting an empty log page.
+		harness.agent.kill(t)
+		harness.restartAgent(t)
+		waitForAttemptLogEvidence(t, harness, job.JobID, running.CurrentAttemptID, 5*time.Second)
+	}
+}
+
+func waitForAttemptLogEvidence(t *testing.T, harness *acceptanceHarness, jobID, attemptID string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var logs l1.LogPage
+		status, body := harness.doJSON(t, http.MethodGet, "/v1/jobs/"+jobID+"/logs?class=service&limit=100", nil, &logs)
+		if status != http.StatusOK {
+			t.Fatalf("get recovered service logs status = %d body=%s", status, body)
+		}
+		for _, event := range logs.Events {
+			if event.AttemptID == attemptID {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for durable log recovery for attempt %q", attemptID)
 }
 
 func waitForServiceStatus(t *testing.T, harness *acceptanceHarness, jobID, wantStatus string, timeout time.Duration) l1.Job {

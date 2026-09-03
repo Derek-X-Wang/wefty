@@ -21,6 +21,53 @@ func TestAttemptPersistsCompletionBeforeDelivery(t *testing.T) {
 	assertAttemptPersistsCompletionBeforeDelivery(t)
 }
 
+func TestBoundedFinalizationDeadlineThroughDurableLogSinkPreservesPayload(t *testing.T) {
+	uploadStarted := make(chan struct{}, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/logs") {
+			http.NotFound(w, request)
+			return
+		}
+		select {
+		case uploadStarted <- struct{}{}:
+		default:
+		}
+		<-request.Context().Done()
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "bounded-log-node", 1024*1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "bounded-log-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+		}},
+		Lease: l1.AttemptLease{AttemptID: "bounded-log-attempt", FencingToken: "fence"},
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox,
+		runtimes: workloadRuntimeSet{contract.JobKindProcess: &restartableCrashRuntime{}},
+		clock:    systemClock{}, finalizationTimeout: 25 * time.Millisecond,
+	})
+	result, runErr := lifecycle.runWorkload(t.Context(), claim)
+	if runErr != nil || result.Signal != "killed" || result.OutputError != "" || !result.LogEvidenceIncomplete {
+		t.Fatalf("bounded production log finalization = %#v err=%v", result, runErr)
+	}
+	select {
+	case <-uploadStarted:
+	default:
+		t.Fatal("durable log sink never attempted AppendLogs")
+	}
+	pending, err := outbox.spool.pending(t.Context(), claim.Lease.AttemptID, 8)
+	if err != nil || len(pending) != 1 || string(pending[0].Bytes) != "before crash" {
+		t.Fatalf("recoverable spooled log events = %#v err=%v", pending, err)
+	}
+}
+
 func assertAttemptPersistsCompletionBeforeDelivery(t *testing.T) {
 	t.Helper()
 	completionStarted := make(chan struct{}, 1)

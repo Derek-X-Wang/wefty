@@ -967,7 +967,7 @@
           },
           "log_evidence_incomplete": {
             "type": "boolean",
-            "description": "Additive evidence that a helper log segment was lost, corrupt, or truncated, or that the bounded agent log-finalization deadline expired. The real terminal arm remains authoritative."
+            "description": "Additive evidence alongside one valid primary arm that a helper log segment was lost, corrupt, or truncated, or that the bounded agent log-finalization deadline expired after a payload result. It is not attached to a pre-Started OCI spawn_error."
           }
         },
         "dependentRequired": {

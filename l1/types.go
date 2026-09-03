@@ -343,8 +343,9 @@ type NodeList struct {
 // ProcessResult matches the M0 completion contract. Pointer fields preserve
 // the distinction between an omitted exit code and exit code zero. OutputError
 // makes a genuine durable-output failure terminal rather than false success.
-// Bounded log-finalization deadline expiry instead preserves the payload arm
-// and sets LogEvidenceIncomplete. Signal outcomes carry a structured
+// Bounded log-finalization deadline expiry after a payload result instead
+// preserves that payload arm and sets LogEvidenceIncomplete. A pre-Started OCI
+// SpawnError remains a sole spawn arm. Signal outcomes carry a structured
 // termination initiator.
 type ProcessResult struct {
 	SpawnError            *contract.SpawnFailure    `json:"spawn_error,omitempty"`
