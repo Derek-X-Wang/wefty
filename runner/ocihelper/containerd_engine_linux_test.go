@@ -205,7 +205,7 @@ func TestSweepLostAttemptLogSegmentsWaitsForSealThenRemoves(t *testing.T) {
 	}
 }
 
-func TestSweepLostAttemptLogSegmentsResetsOffsetAfterTruncation(t *testing.T) {
+func TestSweepLostAttemptLogSegmentsResetsOffsetAfterTruncateAndRegrow(t *testing.T) {
 	authority := testAuthority()
 	resources, err := DeterministicResourceIdentity(authority)
 	if err != nil {
@@ -234,7 +234,10 @@ func TestSweepLostAttemptLogSegmentsResetsOffsetAfterTruncation(t *testing.T) {
 		for _, stream := range []string{"stdout.frames", "stderr.frames"} {
 			file, openErr := os.OpenFile(filepath.Join(directory, stream), os.O_WRONLY|os.O_TRUNC, 0)
 			if openErr == nil {
-				openErr = writeLogRecord(file, logSealMagic, 1, nil)
+				openErr = writeLogFrame(file, 1, bytes.Repeat([]byte("replacement"), 32))
+			}
+			if openErr == nil {
+				openErr = writeLogRecord(file, logSealMagic, 2, nil)
 			}
 			if file != nil {
 				openErr = errors.Join(openErr, file.Close())
@@ -304,6 +307,33 @@ func TestLoadAttemptOwnershipRecordsIgnoresUnknownAndStaleEntries(t *testing.T) 
 	records, err := engine.loadAttemptOwnershipRecords()
 	if err != nil || len(records) != 0 {
 		t.Fatalf("unknown ownership entries records=%v err=%v", records, err)
+	}
+}
+
+func TestUnknownVersionOwnershipStaysUnboundUntilResourcesAreAbsentThenGCs(t *testing.T) {
+	authority := testAuthority()
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: t.TempDir()}}
+	record := durableAttemptOwnership{Version: durableAttemptOwnershipVersion + 1, Authority: authority, Resources: resources}
+	if err := engine.writeAttemptOwnershipRecord(record); err != nil {
+		t.Fatal(err)
+	}
+	observed := ResourceInventory{Cgroups: []string{resources.CgroupID}}
+	projected, retained, err := engine.runtimeAbsenceInventory(observed, time.Now())
+	if err != nil || !slices.Equal(projected.Cgroups, observed.Cgroups) || len(retained) != 0 {
+		t.Fatalf("unknown-version ownership classification projected=%+v retained=%+v err=%v", projected, retained, err)
+	}
+	if _, err := os.Stat(engine.attemptOwnershipPath(resources)); err != nil {
+		t.Fatalf("unknown-version record was GC'd while resource remained: %v", err)
+	}
+	if _, _, err := engine.runtimeAbsenceInventory(ResourceInventory{}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(engine.attemptOwnershipPath(resources)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("quiescent unknown-version record was not GC'd: %v", err)
 	}
 }
 
@@ -497,6 +527,14 @@ func TestDeleteSweepKillsOwnedCgroupAndQuiescentReleaseKeepsRecordUntilItIsGone(
 	record, retention, err := engine.retainAttemptResource(record, RemovalResourceCgroup, resources.CgroupID, DurableRetentionReasonCgroupReaping, DurableRetentionStatePopulated, time.Now())
 	if err != nil || retention.Bound <= 0 {
 		t.Fatalf("create retained cgroup binding: retention=%+v err=%v", retention, err)
+	}
+	retryErr := engine.removeAttemptOwnershipRecordAfterInventory(record, ResourceInventory{}, errors.New("inventory unavailable"))
+	var retryable *AttemptOwnershipInventoryRetryError
+	if !errors.As(retryErr, &retryable) || !retryable.Retryable() || deferRetryableAttemptOwnershipRelease(retryErr) != nil {
+		t.Fatalf("inventory release outcome = %T %v", retryErr, retryErr)
+	}
+	if _, err := os.Stat(engine.attemptOwnershipPath(resources)); err != nil {
+		t.Fatalf("retryable inventory failure removed ownership record: %v", err)
 	}
 	if err := engine.removeAttemptOwnershipRecordIfInventoryQuiescent(record, ResourceInventory{Cgroups: []string{resources.CgroupID}}); err != nil {
 		t.Fatal(err)
@@ -1528,7 +1566,12 @@ func TestFilterInventoryMatchesOnlyExactCgroupOrSystemdScope(t *testing.T) {
 	}
 }
 
-func TestCgroupInventoryPreservesBroadObservationButSkipsMatchedSubtree(t *testing.T) {
+func TestCgroupInventoryDescendsThroughBroadWrapperAndSweepsBoundChild(t *testing.T) {
+	authority := testAuthority()
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
 	root := t.TempDir()
 	broad := "system.slice-cri-wefty-cgroup-legacy.scope"
 	for _, name := range []string{broad, "unrelated"} {
@@ -1536,15 +1579,35 @@ func TestCgroupInventoryPreservesBroadObservationButSkipsMatchedSubtree(t *testi
 			t.Fatal(err)
 		}
 	}
-	if err := os.Mkdir(filepath.Join(root, broad, "nested-wefty-cgroup-hidden"), 0o700); err != nil {
+	if err := os.Mkdir(filepath.Join(root, broad, resources.CgroupID), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	inventory := ResourceInventory{}
 	if err := inventoryAttemptCgroups(root, &inventory); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(inventory.Cgroups, []string{broad}) {
+	want := []string{broad, filepath.Join(broad, resources.CgroupID)}
+	if !slices.Equal(inventory.Cgroups, want) {
 		t.Fatalf("broad cgroup inventory = %v", inventory.Cgroups)
+	}
+	engine := &ContainerdEngine{
+		config:          NativeEngineConfig{RuntimeRoot: t.TempDir(), CgroupRoot: root, TaskReleaseTimeout: time.Second},
+		cgroupKill:      func(string) (cgroupKillResult, error) { return cgroupKillResult{Method: "test"}, nil },
+		cgroupPopulated: func(string) (bool, error) { return false, nil },
+		cgroupRemove:    os.RemoveAll,
+	}
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := engine.loadAttemptOwnershipRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, evidence, err := engine.sweepLostAttemptCgroups(t.Context(), inventory.Cgroups, ownership); err != nil || len(evidence) != 1 || evidence[0].ID != filepath.Join(broad, resources.CgroupID) {
+		t.Fatalf("nested bound sweep evidence=%+v err=%v", evidence, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, broad)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty broad wrapper remained after bound child reap: %v", err)
 	}
 }
 

@@ -16,9 +16,19 @@ func takeoverTimeoutForReap(reapTimeout time.Duration) time.Duration {
 }
 
 type BootBarrierConfig struct {
-	Clock           Clock
-	TakeoverTimeout time.Duration
-	TakeoverRetry   time.Duration
+	Clock               Clock
+	TakeoverTimeout     time.Duration
+	TakeoverReapTimeout time.Duration
+	TakeoverRetry       time.Duration
+}
+
+type ReapTimeoutConfigurationError struct {
+	AdvertisedReapTimeout time.Duration
+	TakeoverReapTimeout   time.Duration
+}
+
+func (err *ReapTimeoutConfigurationError) Error() string {
+	return fmt.Sprintf("OCI helper reap timeout configuration mismatch: advertised=%s takeover_derived_from=%s", err.AdvertisedReapTimeout, err.TakeoverReapTimeout)
 }
 
 // NamespaceResidueError preserves the distinction between resources that
@@ -47,7 +57,11 @@ func (err *ResidueClassificationError) Error() string {
 }
 
 func (err *NamespaceResidueError) Error() string {
-	return fmt.Sprintf("%s: residue remains after sweep: runtime=%+v durable_retained=%+v retention_bindings=%+v observed=%+v", err.Operation, err.RuntimeResidue, err.DurableRetained, err.DurableRetentions, err.Observed)
+	cgroupGuidance := ""
+	if len(err.RuntimeResidue.Cgroups) > 0 {
+		cgroupGuidance = fmt.Sprintf(" unbound_cgroups={paths:%v reason:%q}", err.RuntimeResidue.Cgroups, "unbound wefty-shaped cgroup; not helper-owned; remove manually or bind")
+	}
+	return fmt.Sprintf("%s: residue remains after sweep: runtime=%+v durable_retained=%+v retention_bindings=%+v observed=%+v%s", err.Operation, err.RuntimeResidue, err.DurableRetained, err.DurableRetentions, err.Observed, cgroupGuidance)
 }
 
 func validateNamespaceVerification(operation string, verification VerifyResponse) error {
@@ -149,8 +163,11 @@ func NewBootBarrierWithConfig(client *Client, request AcquireSessionRequest, con
 	if config.Clock == nil {
 		config.Clock = systemClock{}
 	}
+	if config.TakeoverReapTimeout <= 0 {
+		config.TakeoverReapTimeout = defaultReapTimeout
+	}
 	if config.TakeoverTimeout <= 0 {
-		config.TakeoverTimeout = takeoverTimeoutForReap(defaultReapTimeout)
+		config.TakeoverTimeout = takeoverTimeoutForReap(config.TakeoverReapTimeout)
 	}
 	if config.TakeoverRetry <= 0 {
 		config.TakeoverRetry = defaultTakeoverRetryInterval
@@ -239,6 +256,9 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 	handshake := session.Handshake()
 	if handshake.HelperInstanceID == "" || handshake.SessionGeneration == 0 || handshake.ReapTimeout <= 0 {
 		return errors.New("OCI helper handshake omitted barrier authority")
+	}
+	if handshake.ReapTimeout > barrier.config.TakeoverReapTimeout {
+		return &ReapTimeoutConfigurationError{AdvertisedReapTimeout: handshake.ReapTimeout, TakeoverReapTimeout: barrier.config.TakeoverReapTimeout}
 	}
 	barrierContext, barrierCancel := context.WithTimeout(ctx, handshake.ReapTimeout)
 	defer barrierCancel()

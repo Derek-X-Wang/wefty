@@ -169,11 +169,17 @@ authority and performs sweep plus verification. It reuses that proof only while
 the acquired session remains healthy; replacement authority always repeats the
 whole barrier and never adopts a survivor. Helper startup and client takeover
 use separate bounds under the caller's earlier deadline. Startup sweep retains
-the unchanged ten-second reap bound; the default client takeover window is two
-reap bounds (20 seconds), reserving one full reap interval for socket/session
-admission after startup cleanup. This follows the measured 9.646-second
-kill-helper-to-takeover path that consumed 96 percent of the former shared
-ten-second window.
+the unchanged ten-second reap bound. A client may connect into the Unix listen
+backlog, but its handshake blocks until the helper enters Accept after startup
+cleanup, so the default takeover window is `reap + reap` (20 seconds): one
+interval for the newly blocking startup work and one for takeover. After
+handshake, an advertised reap timeout above the ten-second value used for this
+derivation is a typed configuration error naming both values, never a silent
+desynchronization. This follows the measured 9.646-second kill-helper-to-
+takeover path and is re-observed by the lane's
+`startup_sweep_to_takeover_elapsed` receipt. The preferred design—answering
+handshakes during startup while gating admission on verified cleanup—is deferred
+to #301 because it changes startup concurrency and authority publication.
 The takeover retry timer uses the injected helper clock. The heartbeat pump
 notifies the barrier synchronously when control authority is lost.
 
@@ -555,15 +561,18 @@ Unexpected, unreadable, stale-version, or invalid ownership entries emit a
 typed `invalid_entry`, `unreadable`, or `invalid_record` operator outcome with
 `disposition=resources_unbound`; they cannot authorize removal and therefore do
 not turn any observed resource into retained state. Each Verify reads this
-directory once and uses that snapshot for its complete retention projection.
+directory once and uses that snapshot for its complete retention projection. A
+structurally valid unknown-version record is `unknown_version` and remains
+unbound until its named resources are absent, when Verify garbage-collects it;
+invalid records that cannot safely name resources remain operator-owned.
 
 After containerd teardown, sweep gives log sealing at most the configured
 five-second cap, further reduced to half of the usable time remaining before
 the caller's barrier deadline. Twenty percent of the then-remaining barrier
 time, capped at one second, is reserved for later cgroup/final-inventory and
 Verify work. Scanning resumes from the last complete framed-record offset on
-each poll, resets the offset after truncation, and checks cancellation inside
-the scan. A directory with neither frames file has nothing to seal and is
+each poll, resets the offset after shrink or a changed first frame header, and
+checks cancellation inside the scan. A directory with neither frames file has nothing to seal and is
 removed immediately. A corrupt frame likewise has no trustworthy seal work
 left: sweep removes the spool with `method=corrupt_frames` evidence instead of
 failing the boot barrier. If the phase budget
@@ -935,9 +944,13 @@ bundle entries under containerd's runtime-v2 state root, and cgroups found by a
 recursive scan of the configured cgroup hierarchy make absence verification
 fail. After containerd task deletion, sweep acts only on a cgroup bound to a
 durable LOST Attempt record. Observation remains broad for compatible CRI,
-systemd-composed, and pre-upgrade names containing `wefty-cgroup-`; a matched
-directory is recorded once and its subtree is skipped. Only the direct
-deterministic name and its single `.scope` form are sweepable. With the live registry
+systemd-composed, and pre-upgrade names containing `wefty-cgroup-`; inventory
+and sweep both descend through broad matches so an exact bound child cannot be
+hidden. Only the direct deterministic name and its single `.scope` form are
+sweepable. After a bound child is reaped, its broad wrapper is removed only when
+empty; a nonempty wrapper remains residue. The barrier names its relative path
+with the typed operator outcome `unbound wefty-shaped cgroup; not helper-owned;
+remove manually or bind`. With the live registry
 locked and rechecked, the helper sends `SIGKILL` through cgroup v2's
 `cgroup.kill` (falling back on open, write, or close `EOPNOTSUPP` to `SIGKILL`
 for every PID in the subtree), then removes directories bottom-up. This is
@@ -955,6 +968,12 @@ evidence or returns `retention bound exceeded`. Every KILL receipt records the
 observed PID set, `cgroup.kill` versus `recursive_signal`, and duration. An
 unbound exact collision remains operator-visible runtime residue. Filesystem
 errors other than verified `NotFound` still fail closed.
+Attempt Delete gives this cgroup poll at most half of its remaining cleanup
+budget, leaving time for final verification. If the inventory needed to decide
+whether the ownership record is quiescent is temporarily unavailable, release
+succeeds with typed `inventory_retryable` evidence and keeps the record for a
+later Verify or sweep rather than converting observation failure into an
+attempt-release failure.
 
 `SweepResponse.removed` is the number of identities in the initial observed
 inventory that are absent from the final observed inventory. Retained resources

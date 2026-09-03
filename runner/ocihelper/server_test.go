@@ -1016,6 +1016,19 @@ func TestBootBarrierRefusesResidueAndNeverExposesSession(t *testing.T) {
 	}
 }
 
+func TestNamespaceResidueErrorNamesUnboundCgroupPathAndOperatorAction(t *testing.T) {
+	path := "system.slice-cri-wefty-cgroup-legacy.scope/child"
+	err := namespaceResidueError("verify OCI runtime namespace", VerifyResponse{
+		Absent:         false,
+		Inventory:      ResourceInventory{Cgroups: []string{path}},
+		RuntimeResidue: ResourceInventory{Cgroups: []string{path}},
+	})
+	message := err.Error()
+	if !strings.Contains(message, path) || !strings.Contains(message, "unbound wefty-shaped cgroup; not helper-owned; remove manually or bind") {
+		t.Fatalf("unbound cgroup operator outcome = %q", message)
+	}
+}
+
 func TestBootBarrierDefaultTakeoverReservesAStartupReapWindow(t *testing.T) {
 	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{})
 	defer stop()
@@ -1029,37 +1042,78 @@ func TestBootBarrierDefaultTakeoverReservesAStartupReapWindow(t *testing.T) {
 }
 
 func TestBootBarrierTakeoverIncludesSlowStartupAndAdmissionSweeps(t *testing.T) {
-	const reapTimeout = 250 * time.Millisecond
-	engine := &stagedSweepEngine{
-		fakeEngine: newFakeEngine(),
-		entered:    []chan struct{}{make(chan struct{}), make(chan struct{})},
-		release:    []chan struct{}{make(chan struct{}), make(chan struct{})},
+	const (
+		reapTimeout     = 500 * time.Millisecond
+		startupDuration = reapTimeout - 75*time.Millisecond
+		responseDelay   = 125 * time.Millisecond
+	)
+	for _, test := range []struct {
+		name            string
+		takeoverTimeout time.Duration
+		wantReady       bool
+	}{
+		{name: "former one-reap window expires", takeoverTimeout: reapTimeout},
+		{name: "derived two-reap window passes", takeoverTimeout: takeoverTimeoutForReap(reapTimeout), wantReady: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine := newFakeEngine()
+			engine.sweepEntered = make(chan struct{})
+			engine.releaseSweep = make(chan struct{})
+			client, stop := startTestServer(t, engine, ServerConfig{ReapTimeout: reapTimeout})
+			defer stop()
+			baseDial := client.Dial
+			client.Dial = func(ctx context.Context) (net.Conn, error) {
+				connection, err := baseDial(ctx)
+				if err != nil {
+					return nil, err
+				}
+				return newDelayedFirstResponseConn(connection, responseDelay), nil
+			}
+			barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+				TakeoverTimeout:     test.takeoverTimeout,
+				TakeoverReapTimeout: reapTimeout,
+				TakeoverRetry:       time.Millisecond,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			releaseStartup := engine.releaseSweep
+			go func() {
+				<-engine.sweepEntered
+				engine.mu.Lock()
+				engine.sweepEntered = nil
+				engine.releaseSweep = nil
+				engine.mu.Unlock()
+				time.Sleep(startupDuration)
+				close(releaseStartup)
+			}()
+			err = barrier.Ensure(t.Context())
+			if test.wantReady {
+				if err != nil || !barrier.Ready() {
+					t.Fatalf("two-reap takeover did not publish authority: ready=%t err=%v", barrier.Ready(), err)
+				}
+				t.Logf("GREEN: derived two-reap takeover published authority after startup=%s and handshake delay=%s", startupDuration, responseDelay)
+			} else if err == nil || barrier.Ready() {
+				t.Fatalf("one-reap takeover unexpectedly survived startup=%s plus handshake=%s", startupDuration, responseDelay)
+			} else {
+				t.Logf("RED: former one-reap takeover refused authority after startup=%s and handshake delay=%s: %v", startupDuration, responseDelay, err)
+			}
+			_ = barrier.Close()
+		})
 	}
-	client, stop := startTestServer(t, engine, ServerConfig{ReapTimeout: reapTimeout})
+}
+
+func TestBootBarrierRejectsAdvertisedReapTimeoutAboveTakeoverDerivation(t *testing.T) {
+	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{ReapTimeout: defaultReapTimeout + time.Second})
 	defer stop()
-	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
-		TakeoverTimeout: takeoverTimeoutForReap(reapTimeout),
-		TakeoverRetry:   time.Millisecond,
-	})
+	barrier, err := NewBootBarrier(client, testSessionRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ensured := make(chan error, 1)
-	go func() { ensured <- barrier.Ensure(t.Context()) }()
-	for index := range engine.entered {
-		select {
-		case <-engine.entered[index]:
-		case <-time.After(time.Second):
-			t.Fatalf("sweep %d did not start", index+1)
-		}
-		time.Sleep(150 * time.Millisecond)
-		close(engine.release[index])
-	}
-	if err := <-ensured; err != nil {
-		t.Fatalf("startup plus admission sweeps exhausted derived takeover allowance: %v", err)
-	}
-	if !barrier.Ready() {
-		t.Fatal("barrier did not publish authority after slow startup and admission sweeps")
+	err = barrier.Ensure(t.Context())
+	var mismatch *ReapTimeoutConfigurationError
+	if !errors.As(err, &mismatch) || mismatch.AdvertisedReapTimeout != defaultReapTimeout+time.Second || mismatch.TakeoverReapTimeout != defaultReapTimeout || barrier.Ready() {
+		t.Fatalf("reap-timeout mismatch = %+v err=%v ready=%t", mismatch, err, barrier.Ready())
 	}
 }
 
@@ -1068,6 +1122,11 @@ func TestServerAndBootBarrierRefuseInconsistentResidueClassification(t *testing.
 		{Absent: true, Inventory: ResourceInventory{ComputerDiskAnomalies: []string{"disk:allocation_mismatch"}}, RuntimeResidue: ResourceInventory{ComputerDiskAnomalies: []string{"disk:allocation_mismatch"}}},
 		{Absent: false, Inventory: ResourceInventory{Containers: []string{"observed-without-classification"}}},
 	} {
+		validationErr := validateNamespaceVerification("server Verify", verification)
+		var classification *ResidueClassificationError
+		if !errors.As(validationErr, &classification) {
+			t.Fatalf("inconsistent verification did not produce typed classification error: %v", validationErr)
+		}
 		engine := newFakeEngine()
 		engine.verifyResponses = []VerifyResponse{{Absent: true}, verification}
 		client, stop := startTestServer(t, engine, ServerConfig{})
@@ -1077,7 +1136,8 @@ func TestServerAndBootBarrierRefuseInconsistentResidueClassification(t *testing.
 			t.Fatal(err)
 		}
 		err = barrier.Ensure(t.Context())
-		if err == nil || !strings.Contains(err.Error(), "operation=Verify") || barrier.Ready() {
+		var rpcErr *RPCError
+		if !errors.As(err, &rpcErr) || rpcErr.Code != CodeEngineFailure || rpcErr.EngineFailure == nil || rpcErr.EngineFailure.Operation != MethodVerify || barrier.Ready() {
 			stop()
 			t.Fatalf("inconsistent verification error = %v", err)
 		}
@@ -2920,12 +2980,43 @@ type fakeEngine struct {
 	exportCustodyResponse    ExportComputerCustodyResponse
 }
 
-type stagedSweepEngine struct {
-	*fakeEngine
-	mu      sync.Mutex
-	entered []chan struct{}
-	release []chan struct{}
-	calls   int
+type delayedFirstResponseConn struct {
+	net.Conn
+	delay     time.Duration
+	mu        sync.Mutex
+	delayed   bool
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newDelayedFirstResponseConn(connection net.Conn, delay time.Duration) *delayedFirstResponseConn {
+	return &delayedFirstResponseConn{Conn: connection, delay: delay, closed: make(chan struct{})}
+}
+
+func (connection *delayedFirstResponseConn) Read(buffer []byte) (int, error) {
+	count, err := connection.Conn.Read(buffer)
+	connection.mu.Lock()
+	first := !connection.delayed && count > 0
+	if first {
+		connection.delayed = true
+	}
+	connection.mu.Unlock()
+	if !first {
+		return count, err
+	}
+	timer := time.NewTimer(connection.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return count, err
+	case <-connection.closed:
+		return 0, net.ErrClosed
+	}
+}
+
+func (connection *delayedFirstResponseConn) Close() error {
+	connection.closeOnce.Do(func() { close(connection.closed) })
+	return connection.Conn.Close()
 }
 
 type blockingRemovalInventoryEngine struct {
@@ -3523,27 +3614,6 @@ func (engine *fakeEngine) Sweep(context.Context, SweepRequest) (SweepResponse, e
 		engine.sweepResponses = engine.sweepResponses[1:]
 		return response, nil
 	}
-	return SweepResponse{Removed: 1}, nil
-}
-
-func (engine *stagedSweepEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
-	engine.mu.Lock()
-	index := engine.calls
-	engine.calls++
-	if index >= len(engine.entered) || index >= len(engine.release) {
-		engine.mu.Unlock()
-		return engine.fakeEngine.Sweep(ctx, request)
-	}
-	entered := engine.entered[index]
-	release := engine.release[index]
-	engine.mu.Unlock()
-	close(entered)
-	select {
-	case <-release:
-	case <-ctx.Done():
-		return SweepResponse{}, ctx.Err()
-	}
-	engine.record("Sweep")
 	return SweepResponse{Removed: 1}, nil
 }
 
