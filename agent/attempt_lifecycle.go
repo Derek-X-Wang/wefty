@@ -422,7 +422,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		reconcileCompletion = true
 		cancelAttempt(nil)
 		<-renewalDone
-		return errorDestinationUnclassified, nil
+		return lifecycle.finishCompletedAttempt(ctx, claim, outcome.result, outcome.err)
 	}
 	lifecycle.dependencies.observer.setAttempt(attemptID, AttemptFinalizing, outcome.err)
 	if outcome.err != nil {

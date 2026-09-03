@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
 
@@ -172,6 +174,145 @@ func TestLogFinalizationDeadlineHandsCompletionToOrderedRecovery(t *testing.T) {
 	if completionRejected != 0 || !reflect.DeepEqual(callOrder, []string{"logs", "logs", "completion"}) {
 		t.Fatalf("deadline recovery order = %v with %d rejected completions, want logs/logs/completion and no rejection", callOrder, completionRejected)
 	}
+}
+
+func TestLogFinalizationDeadlineStillFinishesProcessHandoff(t *testing.T) {
+	tests := []struct {
+		name      string
+		runtime   WorkloadRuntime
+		succeeded bool
+	}{
+		{name: "successful handoff is removed", runtime: instantWorkloadRuntime{}, succeeded: true},
+		{name: "failed handoff is retained with deadline", runtime: &restartableCrashRuntime{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+				<-request.Context().Done()
+			})
+			client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+			defer stopServer()
+			defer client.Close()
+			outbox, err := newEvidenceOutbox(t.TempDir(), "handoff-deadline-node", 1024*1024, systemClock{}, 8, time.Hour, time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer outbox.Close()
+			root := filepath.Join(t.TempDir(), "handoffs")
+			runID := "run-handoff-deadline"
+			path := filepath.Join(root, runID)
+			preparedAt := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+			finishedAt := preparedAt.Add(time.Minute)
+			nowCalls := 0
+			handoffs := newHandoffManager(root, time.Hour)
+			handoffs.now = func() time.Time {
+				nowCalls++
+				if nowCalls == 1 {
+					return preparedAt
+				}
+				return finishedAt
+			}
+			claim := l1.Claim{
+				Job: l1.Job{JobID: "handoff-deadline-job", Spec: contract.JobSpec{
+					Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+					Labels:    map[string]string{"run_id": runID},
+					Execution: contract.ExecutionSpec{WorkingDirectory: t.TempDir(), HandoffDirectory: path},
+				}},
+				Lease: l1.AttemptLease{AttemptID: "handoff-deadline-attempt", FencingToken: "handoff-deadline-fence", LeaseTTL: time.Minute},
+			}
+			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+				client: client, outbox: outbox, handoffs: handoffs,
+				runtimes: workloadRuntimeSet{contract.JobKindProcess: test.runtime},
+				clock:    systemClock{}, nodeID: "handoff-deadline-node", bootSessionID: "handoff-deadline-boot",
+				renewalInterval: 10 * time.Second, finalizationTimeout: 25 * time.Millisecond,
+				observer: newLifecycleObserver(systemClock{}),
+			})
+			if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if test.succeeded {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("successful deadline handoff still exists: %v", err)
+				}
+				return
+			}
+			marker, exists, err := readHandoffMarker(path)
+			if err != nil || !exists {
+				t.Fatalf("retained deadline handoff marker exists=%t err=%v", exists, err)
+			}
+			if want := finishedAt.Add(time.Hour); !marker.RetainUntil.Equal(want) {
+				t.Fatalf("retained deadline handoff expires at %s, want %s", marker.RetainUntil, want)
+			}
+		})
+	}
+}
+
+func TestLogFinalizationDeadlineStillFinalizesOCIManagedVolumes(t *testing.T) {
+	handler := http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "oci-deadline-node", 1024*1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	runtime := &deadlineManagedVolumeRuntime{}
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "oci-deadline-job", Spec: contract.JobSpec{
+			Kind: contract.JobKindOCI, Class: contract.JobClassOneShot,
+			Labels: map[string]string{"run_id": "run-oci-deadline"},
+			Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+				Image: contract.OCIImageSpec{Reference: "example.invalid/deadline:v1"},
+			}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "oci-deadline-attempt", FencingToken: "oci-deadline-fence", LeaseTTL: time.Minute},
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, outbox: outbox,
+		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime},
+		clock:    systemClock{}, nodeID: "oci-deadline-node", bootSessionID: "oci-deadline-boot",
+		renewalInterval: 10 * time.Second, finalizationTimeout: 25 * time.Millisecond,
+		observer: newLifecycleObserver(systemClock{}),
+	})
+	if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if len(runtime.finalizations) != 1 {
+		t.Fatalf("managed-volume finalizations = %d, want 1", len(runtime.finalizations))
+	}
+	request := runtime.finalizations[0]
+	if request.Authority.AttemptID != claim.Lease.AttemptID || len(request.Volumes) != 1 ||
+		request.Volumes[0].Kind != workloadrunner.ManagedVolumeHandoff || request.Volumes[0].OwnerKey != "run-oci-deadline" {
+		t.Fatalf("managed-volume finalization = %+v", request)
+	}
+}
+
+type deadlineManagedVolumeRuntime struct {
+	finalizations []workloadrunner.ManagedVolumeFinalizationRequest
+}
+
+func (*deadlineManagedVolumeRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (*deadlineManagedVolumeRuntime) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	if err := sink.WriteOutput(ctx, contract.LogEvent{AttemptID: request.Authority.AttemptID, Stream: contract.LogStdout, Bytes: []byte("tail")}); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	exitCode := 0
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &exitCode}}, nil
+}
+
+func (*deadlineManagedVolumeRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+}
+
+func (runtime *deadlineManagedVolumeRuntime) FinalizeManagedVolumes(_ context.Context, request workloadrunner.ManagedVolumeFinalizationRequest) error {
+	runtime.finalizations = append(runtime.finalizations, request)
+	return nil
 }
 
 func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
