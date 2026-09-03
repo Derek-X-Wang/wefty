@@ -53,21 +53,56 @@ func validateNamespaceVerification(operation string, verification VerifyResponse
 			Observed: cloneResourceInventory(verification.Inventory), RuntimeResidue: cloneResourceInventory(verification.RuntimeResidue),
 		}
 	}
-	retainedLogs := slices.Clone(verification.DurableRetained.LogSegments)
-	slices.Sort(retainedLogs)
-	boundLogs := make([]string, 0, len(verification.DurableRetentions))
+	observed := mergeResourceInventory(ResourceInventory{}, verification.Inventory)
+	residue := mergeResourceInventory(ResourceInventory{}, verification.RuntimeResidue)
+	retained := mergeResourceInventory(ResourceInventory{}, verification.DurableRetained)
+	partition := mergeResourceInventory(residue, retained)
+	if !inventoryIdentitySetsEqual(observed, partition) || !inventoryPartitionsDisjoint(residue, retained) {
+		return fmt.Errorf("%s: observed inventory is not the exact disjoint runtime-residue/durable-retained partition: observed=%+v runtime=%+v durable_retained=%+v", operation, observed, residue, retained)
+	}
+	retainedTransient := append(slices.Clone(verification.DurableRetained.LogSegments), verification.DurableRetained.Cgroups...)
+	slices.Sort(retainedTransient)
+	boundTransient := make([]string, 0, len(verification.DurableRetentions))
 	for _, retention := range verification.DurableRetentions {
-		if retention.Class != RemovalResourceLogSegments || retention.ID == "" ||
-			retention.Owner != DurableRetentionOwnerOCIHelper || retention.Reason != DurableRetentionReasonLogSpoolSealing {
+		validClassReason := retention.Class == RemovalResourceLogSegments && retention.Reason == DurableRetentionReasonLogSpoolSealing && retention.State == DurableRetentionStateUnsealed ||
+			retention.Class == RemovalResourceCgroup && retention.Reason == DurableRetentionReasonCgroupReaping && retention.State == DurableRetentionStatePopulated
+		if !validClassReason || retention.ID == "" || retention.AttemptID == "" || retention.Owner != DurableRetentionOwnerOCIHelper ||
+			retention.Bound <= 0 || retention.RecordedAt.IsZero() || retention.Deadline.IsZero() || !retention.Deadline.Equal(retention.RecordedAt.Add(retention.Bound)) {
 			return fmt.Errorf("%s: invalid durable-retention binding: %+v", operation, retention)
 		}
-		boundLogs = append(boundLogs, retention.ID)
+		boundTransient = append(boundTransient, retention.ID)
 	}
-	slices.Sort(boundLogs)
-	if !slices.Equal(retainedLogs, boundLogs) {
-		return fmt.Errorf("%s: durable-retained log segments lack exact owner/reason bindings: retained=%v bindings=%v", operation, retainedLogs, boundLogs)
+	slices.Sort(boundTransient)
+	if !slices.Equal(retainedTransient, boundTransient) {
+		return fmt.Errorf("%s: transient durable-retained resources lack exact bindings: retained=%v bindings=%v", operation, retainedTransient, boundTransient)
 	}
 	return nil
+}
+
+func inventoryIdentitySetsEqual(left, right ResourceInventory) bool {
+	return slices.Equal(left.Leases, right.Leases) && slices.Equal(left.Snapshots, right.Snapshots) &&
+		slices.Equal(left.Containers, right.Containers) && slices.Equal(left.Tasks, right.Tasks) &&
+		slices.Equal(left.Shims, right.Shims) && slices.Equal(left.Cgroups, right.Cgroups) &&
+		slices.Equal(left.LogSegments, right.LogSegments) && slices.Equal(left.ImageSpools, right.ImageSpools) &&
+		slices.Equal(left.ManagedVolumes, right.ManagedVolumes) && slices.Equal(left.ManagedVolumeRecords, right.ManagedVolumeRecords) &&
+		slices.Equal(left.ComputerDiskImages, right.ComputerDiskImages) && slices.Equal(left.ComputerDiskAllocations, right.ComputerDiskAllocations) &&
+		slices.Equal(left.ComputerDiskQuotas, right.ComputerDiskQuotas) && slices.Equal(left.ComputerDiskManifests, right.ComputerDiskManifests) &&
+		slices.Equal(left.ComputerDiskMounts, right.ComputerDiskMounts) && slices.Equal(left.ComputerDiskLoops, right.ComputerDiskLoops) &&
+		slices.Equal(left.ComputerAttachments, right.ComputerAttachments) && slices.Equal(left.ComputerResetManifests, right.ComputerResetManifests) &&
+		slices.Equal(left.ComputerQuarantines, right.ComputerQuarantines) && slices.Equal(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
+}
+
+func inventoryPartitionsDisjoint(left, right ResourceInventory) bool {
+	merged := mergeResourceInventory(left, right)
+	return inventoryIdentityCountPortable(merged) == inventoryIdentityCountPortable(left)+inventoryIdentityCountPortable(right)
+}
+
+func inventoryIdentityCountPortable(inventory ResourceInventory) int {
+	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) +
+		len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ImageSpools) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) +
+		len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) +
+		len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) +
+		len(inventory.ComputerQuarantines) + len(inventory.ComputerDiskAnomalies)
 }
 
 func namespaceResidueError(operation string, verification VerifyResponse) error {
@@ -227,6 +262,7 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 		VerifiedResidue:       cloneResourceInventory(verification.RuntimeResidue),
 		VerifiedRetained:      cloneResourceInventory(verification.DurableRetained),
 		DurableRetentions:     slices.Clone(verification.DurableRetentions),
+		SweepEvidence:         cloneSweepEvidence(sweep.Evidence),
 		Attempts:              slices.Clone(sweep.Attempts),
 	}
 	if receipt.SweepEpoch == "" {
@@ -331,8 +367,17 @@ func cloneVerifiedSweepReceipt(receipt VerifiedSweepReceipt) VerifiedSweepReceip
 	receipt.VerifiedResidue = cloneResourceInventory(receipt.VerifiedResidue)
 	receipt.VerifiedRetained = cloneResourceInventory(receipt.VerifiedRetained)
 	receipt.DurableRetentions = slices.Clone(receipt.DurableRetentions)
+	receipt.SweepEvidence = cloneSweepEvidence(receipt.SweepEvidence)
 	receipt.Attempts = slices.Clone(receipt.Attempts)
 	return receipt
+}
+
+func cloneSweepEvidence(evidence []SweepEvidence) []SweepEvidence {
+	cloned := slices.Clone(evidence)
+	for index := range cloned {
+		cloned[index].PIDs = slices.Clone(cloned[index].PIDs)
+	}
+	return cloned
 }
 
 func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {

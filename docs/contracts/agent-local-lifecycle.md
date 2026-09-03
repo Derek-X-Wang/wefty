@@ -318,8 +318,12 @@ signal and `Watch` reports the task's ordinary `ExitCode` arm. If containerd has
 reaped the task but its Wait stream never supplies that terminal evidence, the
 agent treats the missing confirmation as typed runtime loss and performs the
 replacement-generation sweep.
-`Delete` must subsequently verify task, container, snapshot,
-lease, cgroup, shim, and log absence before L1 may observe `stopped`.
+An ordinary attempt `Delete` must subsequently verify task, container,
+snapshot, lease, cgroup, shim, and log absence before L1 may observe `stopped`.
+The distinct replacement-generation namespace sweep may instead report a
+still-finishing LOST-Attempt log or cgroup only from its unexpired durable
+retention receipt; its exact observed/residue/retained partition is validated
+before that receipt can authorize admission.
 
 Helper/session or engine loss takes a different positive-proof path. The OCI
 adapter invokes the agent recovery hook only for helper/engine evidence, never
@@ -330,11 +334,13 @@ finish. `ReapAndVerify` may consume that same-boot sweep once only when its
 complete attempt authority matches and the independently verified namespace
 inventory is empty. Replacement claims remain embargoed until the ordinary
 capability publication handshake acknowledges the recovered generation.
-An exact helper-owned log spool still finishing its bounded seal is durable
-retained only with the helper owner and `log_spool_sealing` reason; it does not
-manufacture runtime residue or withdraw `kind:oci`. Exact helper-owned
-populated cgroups are KILL-reaped by sweep before verification and cannot cross
-this boundary as unexplained residue.
+A LOST-Attempt log spool still finishing its bounded seal is durable retained
+only from the sweep's fsynced, unexpired helper-owner/`log_spool_sealing`
+receipt; Verify never fabricates that authority from its name or contents. A
+proven LOST-Attempt populated cgroup is SIGKILL-reaped by sweep (without adding
+the agent's live-service TERM grace) or receives the same bounded typed
+retention treatment. Exact-shaped unbound or live-Attempt collisions remain
+operator-visible runtime residue and are never killed.
 Concurrent attempts that observed the same lost generation serialize recovery;
 after one establishes a newer sweep, siblings consume that proof instead of
 invalidating the recovered generation again.

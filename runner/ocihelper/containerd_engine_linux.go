@@ -79,6 +79,7 @@ type containerdAttempt struct {
 	computerUID      uint32
 	computerGID      uint32
 	controlMu        sync.Mutex
+	lost             bool
 	mu               sync.Mutex
 }
 
@@ -139,15 +140,18 @@ type ContainerdEngine struct {
 	capacityReservations        map[string]*capacityReservation
 	lastAdmission               *ResourceAdmissionReceipt
 	memoryFactsPath             string
-	cgroupKill                  func(string) error
+	cgroupKill                  func(string) (cgroupKillResult, error)
 	cgroupPopulated             func(string) (bool, error)
 	cgroupRemove                func(string) error
+	afterLogSealObservation     func()
+	afterCgroupObservation      func()
 }
 
 const (
 	defaultAttemptPortMin                  uint16 = 42000
 	defaultAttemptPortMax                  uint16 = 42999
 	defaultHandoffRetention                       = 24 * time.Hour
+	defaultLostAttemptRetention                   = 5 * time.Minute
 	defaultComputerReimagePreflightTimeout        = 10 * time.Second
 	doctorRuntimeReadTimeout                      = 2 * time.Second
 )
@@ -176,6 +180,9 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	}
 	if config.LogSealTimeout <= 0 {
 		config.LogSealTimeout = 5 * time.Second
+	}
+	if config.LostAttemptRetention <= 0 {
+		config.LostAttemptRetention = defaultLostAttemptRetention
 	}
 	if config.TaskReleaseTimeout <= 0 {
 		config.TaskReleaseTimeout = DefaultTaskReleaseTimeout
@@ -1052,6 +1059,9 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if err := os.MkdirAll(logDirectory, 0o700); err != nil {
 		return RunResponse{}, err
 	}
+	if err := engine.ensureAttemptOwnershipRecord(request.Authority, request.Resources); err != nil {
+		return RunResponse{}, err
+	}
 	stdout := filepath.Join(logDirectory, "stdout.frames")
 	stderr := filepath.Join(logDirectory, "stderr.frames")
 	task, err := container.NewTask(leaseContext, binaryLogCreator(engine.config.LoggerExecutable, stdout, stderr))
@@ -1535,6 +1545,7 @@ func (engine *ContainerdEngine) validateAttemptResourceIdentity(ctx context.Cont
 	if err != nil {
 		return err
 	}
+	expected.HandoffVolumeDirectory = resources.HandoffVolumeDirectory
 	// Handoff volumes are keyed by the stable owner key, not attempt
 	// authority. The authenticated Run request derived this live name before
 	// the engine retained it, so compare the remaining authority-derived names.
@@ -2088,6 +2099,9 @@ func (engine *ContainerdEngine) ReapSession(ctx context.Context, _ SessionIdenti
 	}
 	engine.mu.Unlock()
 	for _, attempt := range attempts {
+		attempt.mu.Lock()
+		attempt.lost = true
+		attempt.mu.Unlock()
 		if err := attempt.task.Kill(engineContext(ctx), syscall.SIGKILL, containerd.WithKillAll); err == nil {
 			attempt.mu.Lock()
 			attempt.signal = SignalKILL
@@ -2133,16 +2147,20 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 		return VerifyResponse{}, err
 	}
 	absent := InventoryEmpty(projected)
-	if absent && request.Scope == VerifyNamespace {
-		engine.releaseVerifiedNamespace()
-	}
-	return VerifyResponse{
+	response := VerifyResponse{
 		Absent:            absent,
 		Inventory:         observed,
 		RuntimeResidue:    projected,
 		DurableRetained:   subtractResourceInventory(observed, projected),
 		DurableRetentions: retentions,
-	}, nil
+	}
+	if err := validateNamespaceVerification("verify OCI runtime state", response); err != nil {
+		return VerifyResponse{}, err
+	}
+	if absent && request.Scope == VerifyNamespace {
+		engine.releaseVerifiedNamespace()
+	}
+	return response, nil
 }
 
 func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
@@ -2197,6 +2215,9 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 			return SweepResponse{}, fmt.Errorf("container %s labels do not match its deterministic identity", info.ID)
 		}
 		captureSweepAuthority(authority, prior, attempts)
+		if err := engine.ensureAttemptOwnershipRecord(authority, expected); err != nil {
+			return SweepResponse{}, err
+		}
 		if task, taskErr := container.Task(ctx, nil); taskErr == nil {
 			if _, deleteErr := task.Delete(ctx, containerd.WithProcessKill); deleteErr != nil && !errdefs.IsNotFound(deleteErr) {
 				return SweepResponse{}, deleteErr
@@ -2215,10 +2236,16 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err != nil {
 		return response, err
 	}
-	if _, err := engine.sweepLostAttemptLogSegments(ctx, inventory.LogSegments); err != nil {
+	ownership, err := engine.loadAttemptOwnershipRecords()
+	if err != nil {
 		return SweepResponse{}, err
 	}
-	if err := engine.sweepLostAttemptCgroups(ctx, inventory.Cgroups); err != nil {
+	logRetentions, logEvidence, err := engine.sweepLostAttemptLogSegments(ctx, inventory.LogSegments, ownership)
+	if err != nil {
+		return SweepResponse{}, err
+	}
+	cgroupRetentions, cgroupEvidence, err := engine.sweepLostAttemptCgroups(ctx, inventory.Cgroups, ownership)
+	if err != nil {
 		return SweepResponse{}, err
 	}
 	remaining, err := engine.inventory(ctx)
@@ -2227,6 +2254,11 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	}
 	response.Removed = inventoryCount(subtractResourceInventory(observedInventory, remaining))
 	response.Inventory = observedInventory
+	response.DurableRetentions = append(logRetentions, cgroupRetentions...)
+	response.Evidence = append(logEvidence, cgroupEvidence...)
+	if err := engine.removeQuiescentAttemptOwnershipRecords(ownership, remaining); err != nil {
+		return SweepResponse{}, err
+	}
 	return response, nil
 }
 
@@ -2288,6 +2320,9 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 				return fmt.Errorf("snapshot %s labels do not match its deterministic identity", info.Name)
 			}
 			captureSweepAuthority(authority, prior, attempts)
+			if err := engine.ensureAttemptOwnershipRecord(authority, expected); err != nil {
+				return err
+			}
 			snapshotNames = append(snapshotNames, info.Name)
 		}
 		return nil
@@ -2326,6 +2361,9 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 				return SweepResponse{}, fmt.Errorf("lease %s labels do not match its deterministic identity", lease.ID)
 			}
 			captureSweepAuthority(authority, prior, attempts)
+			if err := engine.ensureAttemptOwnershipRecord(authority, expected); err != nil {
+				return SweepResponse{}, err
+			}
 			if err := engine.client.LeasesService().Delete(ctx, lease); err != nil && !errdefs.IsNotFound(err) {
 				return SweepResponse{}, err
 			}
@@ -2558,7 +2596,19 @@ func (engine *ContainerdEngine) releaseVerifiedAttempt(ctx context.Context, auth
 	pinErr := engine.releaseAttemptImagePin(ctx, authorityKey)
 	engine.releaseAttemptRuntimeState(authorityKey)
 	engine.releaseCapacityReservation(authorityKey)
-	return pinErr
+	return errors.Join(pinErr, engine.removeAttemptOwnershipRecordByKey(authorityKey))
+}
+
+func (engine *ContainerdEngine) removeAttemptOwnershipRecordByKey(authorityKey string) error {
+	records, err := engine.loadAttemptOwnershipRecords()
+	if err != nil {
+		return err
+	}
+	record, ok := records[authorityKey]
+	if !ok {
+		return nil
+	}
+	return engine.removeAttemptOwnershipRecord(record)
 }
 
 func (engine *ContainerdEngine) releaseAttemptImagePin(ctx context.Context, authorityKey string) error {
@@ -3226,7 +3276,7 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 		if walkErr != nil {
 			return walkErr
 		}
-		if entry.IsDir() && strings.Contains(entry.Name(), "wefty-cgroup-") {
+		if _, managed := cgroupAttemptResourceID(entry.Name()); entry.IsDir() && managed {
 			result.Cgroups = append(result.Cgroups, entry.Name())
 		}
 		return nil
@@ -3299,11 +3349,16 @@ func filterInventory(inventory ResourceInventory, resources ResourceIdentity, at
 		values []string
 		target string
 		output *[]string
-	}{{inventory.Leases, resources.LeaseID, &filtered.Leases}, {inventory.Snapshots, resources.SnapshotID, &filtered.Snapshots}, {inventory.Containers, resources.ContainerID, &filtered.Containers}, {inventory.Tasks, resources.ContainerID, &filtered.Tasks}, {inventory.Shims, resources.ContainerID, &filtered.Shims}, {inventory.Cgroups, resources.CgroupID, &filtered.Cgroups}, {inventory.LogSegments, resources.LogSegmentDirectory, &filtered.LogSegments}, {inventory.ManagedVolumes, resources.HandoffVolumeDirectory, &filtered.ManagedVolumes}, {inventory.ManagedVolumes, resources.ServiceVolumeDirectory, &filtered.ManagedVolumes}, {inventory.ManagedVolumeRecords, resources.ServiceVolumeOwnerRecord, &filtered.ManagedVolumeRecords}} {
+	}{{inventory.Leases, resources.LeaseID, &filtered.Leases}, {inventory.Snapshots, resources.SnapshotID, &filtered.Snapshots}, {inventory.Containers, resources.ContainerID, &filtered.Containers}, {inventory.Tasks, resources.ContainerID, &filtered.Tasks}, {inventory.Shims, resources.ContainerID, &filtered.Shims}, {inventory.LogSegments, resources.LogSegmentDirectory, &filtered.LogSegments}, {inventory.ManagedVolumes, resources.HandoffVolumeDirectory, &filtered.ManagedVolumes}, {inventory.ManagedVolumes, resources.ServiceVolumeDirectory, &filtered.ManagedVolumes}, {inventory.ManagedVolumeRecords, resources.ServiceVolumeOwnerRecord, &filtered.ManagedVolumeRecords}} {
 		for _, value := range pair.values {
-			if value == pair.target || (pair.target == resources.CgroupID && strings.Contains(value, pair.target)) {
+			if value == pair.target {
 				*pair.output = append(*pair.output, value)
 			}
+		}
+	}
+	for _, value := range inventory.Cgroups {
+		if logical, managed := cgroupAttemptResourceID(value); managed && logical == resources.CgroupID {
+			filtered.Cgroups = append(filtered.Cgroups, value)
 		}
 	}
 	if attachment != nil {
@@ -3322,69 +3377,329 @@ func filterInventory(inventory ResourceInventory, resources ResourceIdentity, at
 	return filtered
 }
 
-func (engine *ContainerdEngine) sweepLostAttemptLogSegments(ctx context.Context, names []string) ([]DurableRetention, error) {
+const durableAttemptOwnershipVersion = 1
+
+type durableAttemptOwnership struct {
+	Version    int                `json:"version"`
+	Authority  AttemptAuthority   `json:"authority"`
+	Resources  ResourceIdentity   `json:"resources"`
+	Retentions []DurableRetention `json:"retentions,omitempty"`
+}
+
+type RetentionBoundExceededError struct {
+	Class     RemovalResourceClass
+	ID        string
+	AttemptID string
+	Deadline  time.Time
+	Cause     error
+}
+
+func (err *RetentionBoundExceededError) Error() string {
+	return fmt.Sprintf("lost-attempt retention bound exceeded: class=%s id=%s attempt_id=%s deadline=%s: %v", err.Class, err.ID, err.AttemptID, err.Deadline.UTC().Format(time.RFC3339Nano), err.Cause)
+}
+
+func (err *RetentionBoundExceededError) Unwrap() error                { return err.Cause }
+func (err *RetentionBoundExceededError) RetentionBoundExceeded() bool { return true }
+
+func (engine *ContainerdEngine) attemptOwnershipRoot() string {
+	return filepath.Join(engine.config.RuntimeRoot, "attempt-ownership")
+}
+
+func (engine *ContainerdEngine) attemptOwnershipPath(resources ResourceIdentity) string {
+	return filepath.Join(engine.attemptOwnershipRoot(), resources.ContainerID+".json")
+}
+
+func (engine *ContainerdEngine) ensureAttemptOwnershipRecord(authority AttemptAuthority, resources ResourceIdentity) error {
+	expected, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		return err
+	}
+	expected.HandoffVolumeDirectory = resources.HandoffVolumeDirectory
+	if !sameRuntimeResourceNames(resources, expected) {
+		return errors.New("durable Attempt ownership resource names do not match fenced authority")
+	}
+	record := durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources}
+	path := engine.attemptOwnershipPath(resources)
+	if payload, readErr := os.ReadFile(path); readErr == nil {
+		var existing durableAttemptOwnership
+		if json.Unmarshal(payload, &existing) != nil || !validDurableAttemptOwnership(existing, filepath.Base(path)) || existing.Authority != authority || !sameRuntimeResourceNames(existing.Resources, resources) {
+			return fmt.Errorf("durable Attempt ownership record %s conflicts with fenced authority", filepath.Base(path))
+		}
+		return nil
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	return engine.writeAttemptOwnershipRecord(record)
+}
+
+func validDurableAttemptOwnership(record durableAttemptOwnership, filename string) bool {
+	if record.Version != durableAttemptOwnershipVersion || record.Authority.validate() != nil {
+		return false
+	}
+	expected, err := DeterministicResourceIdentity(record.Authority)
+	expected.HandoffVolumeDirectory = record.Resources.HandoffVolumeDirectory
+	return err == nil && sameRuntimeResourceNames(record.Resources, expected) && filename == expected.ContainerID+".json"
+}
+
+func (engine *ContainerdEngine) writeAttemptOwnershipRecord(record durableAttemptOwnership) error {
+	root := engine.attemptOwnershipRoot()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return fmt.Errorf("create durable Attempt ownership root: %w", err)
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	temporary, err := os.CreateTemp(root, ".attempt.tmp-")
+	if err != nil {
+		return err
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	writeErr := temporary.Chmod(0o600)
+	if writeErr == nil {
+		_, writeErr = temporary.Write(payload)
+	}
+	if writeErr == nil {
+		writeErr = temporary.Sync()
+	}
+	writeErr = errors.Join(writeErr, temporary.Close())
+	if writeErr != nil {
+		return fmt.Errorf("write durable Attempt ownership: %w", writeErr)
+	}
+	if err := os.Rename(temporaryName, engine.attemptOwnershipPath(record.Resources)); err != nil {
+		return fmt.Errorf("publish durable Attempt ownership: %w", err)
+	}
+	directory, err := os.Open(root)
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
+}
+
+func (engine *ContainerdEngine) loadAttemptOwnershipRecords() (map[string]durableAttemptOwnership, error) {
+	records := make(map[string]durableAttemptOwnership)
+	entries, err := readDirectoryIfPresent(engine.attemptOwnershipRoot())
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".attempt.tmp-") && !entry.IsDir() && entry.Type()&os.ModeSymlink == 0 {
+			if err := os.Remove(filepath.Join(engine.attemptOwnershipRoot(), entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
+			continue
+		}
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(entry.Name(), ".json") {
+			return nil, fmt.Errorf("invalid durable Attempt ownership entry %q", entry.Name())
+		}
+		payload, err := os.ReadFile(filepath.Join(engine.attemptOwnershipRoot(), entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		var record durableAttemptOwnership
+		if json.Unmarshal(payload, &record) != nil || !validDurableAttemptOwnership(record, entry.Name()) {
+			return nil, fmt.Errorf("invalid durable Attempt ownership record %q", entry.Name())
+		}
+		records[record.Authority.key()] = record
+	}
+	return records, nil
+}
+
+func (engine *ContainerdEngine) attemptOwnershipIsLive(record durableAttemptOwnership) bool {
+	engine.mu.Lock()
+	attempt := engine.attempts[record.Authority.key()]
+	if attempt == nil || attempt.authority != record.Authority {
+		engine.mu.Unlock()
+		return false
+	}
+	attempt.mu.Lock()
+	live := !attempt.lost && !attempt.deleted
+	attempt.mu.Unlock()
+	engine.mu.Unlock()
+	return live
+}
+
+func ownershipByLogName(records map[string]durableAttemptOwnership, name string) (durableAttemptOwnership, bool) {
+	for _, record := range records {
+		if record.Resources.LogSegmentDirectory == name {
+			return record, true
+		}
+	}
+	return durableAttemptOwnership{}, false
+}
+
+func ownershipByCgroupName(records map[string]durableAttemptOwnership, name string) (durableAttemptOwnership, bool) {
+	logical, ok := cgroupAttemptResourceID(name)
+	if !ok {
+		return durableAttemptOwnership{}, false
+	}
+	for _, record := range records {
+		if record.Resources.CgroupID == logical {
+			return record, true
+		}
+	}
+	return durableAttemptOwnership{}, false
+}
+
+func retentionFor(record durableAttemptOwnership, class RemovalResourceClass, id string) (DurableRetention, bool) {
+	for _, retention := range record.Retentions {
+		if retention.Class == class && retention.ID == id {
+			return retention, true
+		}
+	}
+	return DurableRetention{}, false
+}
+
+func (engine *ContainerdEngine) retainAttemptResource(record durableAttemptOwnership, class RemovalResourceClass, id string, reason DurableRetentionReason, state DurableRetentionState, now time.Time) (durableAttemptOwnership, DurableRetention, error) {
+	if existing, ok := retentionFor(record, class, id); ok {
+		return record, existing, nil
+	}
+	bound := engine.config.LostAttemptRetention
+	if bound <= 0 {
+		bound = defaultLostAttemptRetention
+	}
+	retention := DurableRetention{Class: class, ID: id, Owner: DurableRetentionOwnerOCIHelper, Reason: reason, AttemptID: record.Authority.AttemptID, State: state, Bound: bound, RecordedAt: now.UTC().Round(0), Deadline: now.Add(bound).UTC().Round(0)}
+	record.Retentions = append(record.Retentions, retention)
+	if err := engine.writeAttemptOwnershipRecord(record); err != nil {
+		return durableAttemptOwnership{}, DurableRetention{}, err
+	}
+	return record, retention, nil
+}
+
+func (engine *ContainerdEngine) clearAttemptRetention(record durableAttemptOwnership, class RemovalResourceClass, id string) error {
+	retained := record.Retentions[:0]
+	for _, retention := range record.Retentions {
+		if retention.Class != class || retention.ID != id {
+			retained = append(retained, retention)
+		}
+	}
+	if len(retained) == len(record.Retentions) {
+		return nil
+	}
+	record.Retentions = retained
+	return engine.writeAttemptOwnershipRecord(record)
+}
+
+func cgroupAttemptResourceID(name string) (string, bool) {
+	logical := name
+	if strings.HasSuffix(logical, ".scope") {
+		logical = strings.TrimSuffix(logical, ".scope")
+	}
+	return logical, managedAttemptResourceName(logical, "wefty-cgroup-")
+}
+
+func (engine *ContainerdEngine) sweepLostAttemptLogSegments(ctx context.Context, names []string, ownership map[string]durableAttemptOwnership) ([]DurableRetention, []SweepEvidence, error) {
 	timeout := engine.config.LogSealTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	waitContext, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	pending := make(map[string]string)
+	budget := remainingSweepPhaseBudget(ctx, timeout, 2)
+	clock := engine.config.Clock
+	if clock == nil {
+		clock = systemClock{}
+	}
+	started := clock.Now()
+	timer := clock.NewTimerAt(started.Add(budget))
+	defer timer.Stop()
+	type pendingLog struct {
+		path   string
+		record durableAttemptOwnership
+	}
+	pending := make(map[string]pendingLog)
+	progress := make(map[string]logSealScanState)
+	var evidence []SweepEvidence
 	for _, name := range names {
 		path := filepath.Join(engine.config.RuntimeRoot, "logs", name)
+		record, bound := ownershipByLogName(ownership, name)
 		owned, err := helperOwnedAttemptDirectory(path, "wefty-log-segments-", name)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if owned {
-			pending[name] = path
+		if !bound || !owned || engine.attemptOwnershipIsLive(record) {
+			continue
 		}
-	}
-	for len(pending) > 0 {
-		for name, path := range pending {
-			sealed, err := logSegmentDirectorySealed(path)
-			if err != nil {
-				return nil, fmt.Errorf("inspect lost-attempt log spool %s: %w", name, err)
-			}
-			if !sealed {
-				if _, statErr := os.Lstat(path); errors.Is(statErr, os.ErrNotExist) {
-					delete(pending, name)
-				} else if statErr != nil {
-					return nil, statErr
-				}
+		if retention, retained := retentionFor(record, RemovalResourceLogSegments, name); retained && !clock.Now().Before(retention.Deadline) {
+			if engine.attemptOwnershipIsLive(record) {
 				continue
 			}
 			if err := unmountComputerControlTmpfs(filepath.Join(path, "control")); err != nil {
-				return nil, err
+				return nil, nil, &RetentionBoundExceededError{Class: RemovalResourceLogSegments, ID: name, AttemptID: record.Authority.AttemptID, Deadline: retention.Deadline, Cause: err}
 			}
 			if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return nil, err
+				return nil, nil, &RetentionBoundExceededError{Class: RemovalResourceLogSegments, ID: name, AttemptID: record.Authority.AttemptID, Deadline: retention.Deadline, Cause: err}
 			}
+			if err := engine.clearAttemptRetention(record, RemovalResourceLogSegments, name); err != nil {
+				return nil, nil, err
+			}
+			evidence = append(evidence, SweepEvidence{Class: RemovalResourceLogSegments, ID: name, AttemptID: record.Authority.AttemptID, Action: SweepActionRetentionBoundReaped, Method: "remove_all", Duration: clock.Now().Sub(started)})
+			continue
+		}
+		pending[name] = pendingLog{path: path, record: record}
+	}
+	for len(pending) > 0 {
+		for name, candidate := range pending {
+			sealed, err := logSegmentDirectorySealed(ctx, candidate.path, progress)
+			if err != nil {
+				return nil, nil, fmt.Errorf("inspect lost-attempt log spool %s: %w", name, err)
+			}
+			if !sealed {
+				if _, statErr := os.Lstat(candidate.path); errors.Is(statErr, os.ErrNotExist) {
+					delete(pending, name)
+				} else if statErr != nil {
+					return nil, nil, statErr
+				}
+				continue
+			}
+			if engine.attemptOwnershipIsLive(candidate.record) {
+				delete(pending, name)
+				continue
+			}
+			if err := unmountComputerControlTmpfs(filepath.Join(candidate.path, "control")); err != nil {
+				return nil, nil, err
+			}
+			if err := os.RemoveAll(candidate.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, nil, err
+			}
+			if err := engine.clearAttemptRetention(candidate.record, RemovalResourceLogSegments, name); err != nil {
+				return nil, nil, err
+			}
+			evidence = append(evidence, SweepEvidence{Class: RemovalResourceLogSegments, ID: name, AttemptID: candidate.record.Authority.AttemptID, Action: SweepActionRemoved, Method: "sealed_or_empty", Duration: clock.Now().Sub(started)})
 			delete(pending, name)
 		}
 		if len(pending) == 0 {
 			break
 		}
-		timer := time.NewTimer(10 * time.Millisecond)
+		if engine.afterLogSealObservation != nil {
+			engine.afterLogSealObservation()
+		}
+		poll := clock.NewTimerAt(clock.Now().Add(10 * time.Millisecond))
 		select {
 		case <-ctx.Done():
-			timer.Stop()
-			return nil, ctx.Err()
-		case <-waitContext.Done():
-			timer.Stop()
+			poll.Stop()
+			return nil, nil, ctx.Err()
+		case <-timer.C():
+			poll.Stop()
 			retained := make([]DurableRetention, 0, len(pending))
-			for name := range pending {
-				retained = append(retained, DurableRetention{
-					Class: RemovalResourceLogSegments, ID: name,
-					Owner: DurableRetentionOwnerOCIHelper, Reason: DurableRetentionReasonLogSpoolSealing,
-				})
+			for name, candidate := range pending {
+				if engine.attemptOwnershipIsLive(candidate.record) {
+					continue
+				}
+				updated, retention, err := engine.retainAttemptResource(candidate.record, RemovalResourceLogSegments, name, DurableRetentionReasonLogSpoolSealing, DurableRetentionStateUnsealed, clock.Now())
+				if err != nil {
+					return nil, nil, err
+				}
+				ownership[updated.Authority.key()] = updated
+				retained = append(retained, retention)
+				evidence = append(evidence, SweepEvidence{Class: RemovalResourceLogSegments, ID: name, AttemptID: candidate.record.Authority.AttemptID, Action: SweepActionRetained, Method: "bounded_seal_wait", Duration: clock.Now().Sub(started)})
 			}
 			slices.SortFunc(retained, func(left, right DurableRetention) int { return strings.Compare(left.ID, right.ID) })
-			return retained, nil
-		case <-timer.C:
+			return retained, evidence, nil
+		case <-poll.C():
 		}
 	}
-	return nil, nil
+	return nil, evidence, nil
 }
 
 func helperOwnedAttemptDirectory(path, prefix, name string) (bool, error) {
@@ -3420,51 +3735,114 @@ func managedAttemptResourceName(name, prefix string) bool {
 	return true
 }
 
-func logSegmentDirectorySealed(directory string) (bool, error) {
+type logSealScanState struct {
+	offset int64
+	sealed bool
+}
+
+func logSegmentDirectorySealed(ctx context.Context, directory string, progress map[string]logSealScanState) (bool, error) {
 	for _, stream := range []string{"stdout.frames", "stderr.frames"} {
-		file, err := os.Open(filepath.Join(directory, stream))
+		path := filepath.Join(directory, stream)
+		state := progress[path]
+		if state.sealed {
+			continue
+		}
+		file, err := os.Open(path)
 		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+			state.sealed = true
+			progress[path] = state
+			continue
 		}
 		if err != nil {
 			return false, err
 		}
-		sealed := false
+		if _, err := file.Seek(state.offset, io.SeekStart); err != nil {
+			_ = file.Close()
+			return false, err
+		}
 		for {
+			if err := ctx.Err(); err != nil {
+				_ = file.Close()
+				return false, err
+			}
+			start, seekErr := file.Seek(0, io.SeekCurrent)
+			if seekErr != nil {
+				_ = file.Close()
+				return false, seekErr
+			}
 			kind, _, _, readErr := readLogRecord(file)
 			if readErr != nil {
 				if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+					state.offset = start
+					progress[path] = state
 					break
 				}
 				_ = file.Close()
 				return false, readErr
 			}
+			offset, seekErr := file.Seek(0, io.SeekCurrent)
+			if seekErr != nil {
+				_ = file.Close()
+				return false, seekErr
+			}
+			state.offset = offset
 			if kind == logRecordSeal || kind == logRecordIncomplete {
-				sealed = true
+				state.sealed = true
+				progress[path] = state
 				break
 			}
 		}
 		if err := file.Close(); err != nil {
 			return false, err
 		}
-		if !sealed {
+		if !state.sealed {
 			return false, nil
 		}
 	}
 	return true, nil
 }
 
-func (engine *ContainerdEngine) sweepLostAttemptCgroups(ctx context.Context, names []string) error {
-	targets := make(map[string]struct{})
+func remainingSweepPhaseBudget(ctx context.Context, configured time.Duration, divisor int) time.Duration {
+	if configured < 0 {
+		configured = 0
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return configured
+	}
+	remaining := time.Until(deadline)
+	reserve := remaining / 5
+	if reserve > time.Second {
+		reserve = time.Second
+	}
+	usable := remaining - reserve
+	if usable <= 0 {
+		return 0
+	}
+	if divisor > 1 {
+		usable /= time.Duration(divisor)
+	}
+	if configured < usable {
+		return configured
+	}
+	return usable
+}
+
+func (engine *ContainerdEngine) sweepLostAttemptCgroups(ctx context.Context, names []string, ownership map[string]durableAttemptOwnership) ([]DurableRetention, []SweepEvidence, error) {
+	targets := make(map[string]durableAttemptOwnership)
 	for _, name := range names {
-		if managedAttemptResourceName(name, "wefty-cgroup-") {
-			targets[name] = struct{}{}
+		if record, bound := ownershipByCgroupName(ownership, name); bound && !engine.attemptOwnershipIsLive(record) {
+			targets[name] = record
 		}
 	}
 	if len(targets) == 0 {
-		return nil
+		return nil, nil, nil
 	}
-	paths := make(map[string][]string)
+	type cgroupTarget struct {
+		path   string
+		record durableAttemptOwnership
+	}
+	paths := make(map[string][]cgroupTarget)
 	if err := filepath.WalkDir(engine.config.CgroupRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if errors.Is(walkErr, os.ErrNotExist) {
@@ -3475,13 +3853,13 @@ func (engine *ContainerdEngine) sweepLostAttemptCgroups(ctx context.Context, nam
 		if !entry.IsDir() {
 			return nil
 		}
-		if _, selected := targets[entry.Name()]; selected {
-			paths[entry.Name()] = append(paths[entry.Name()], path)
+		if record, selected := targets[entry.Name()]; selected {
+			paths[entry.Name()] = append(paths[entry.Name()], cgroupTarget{path: path, record: record})
 			return filepath.SkipDir
 		}
 		return nil
 	}); err != nil {
-		return err
+		return nil, nil, err
 	}
 	kill := engine.cgroupKill
 	if kill == nil {
@@ -3495,67 +3873,129 @@ func (engine *ContainerdEngine) sweepLostAttemptCgroups(ctx context.Context, nam
 	if remove == nil {
 		remove = removeCgroupTree
 	}
-	for name, matches := range paths {
-		for _, path := range matches {
-			if err := kill(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("KILL helper-owned cgroup %s: %w", name, err)
-			}
-		}
-	}
 	timeout := engine.config.TaskReleaseTimeout
 	if timeout <= 0 {
 		timeout = DefaultTaskReleaseTimeout
 	}
-	waitContext, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	budget := remainingSweepPhaseBudget(ctx, timeout, 1)
+	clock := engine.config.Clock
+	if clock == nil {
+		clock = systemClock{}
+	}
+	deadline := clock.Now().Add(budget)
+	var retentions []DurableRetention
+	var evidence []SweepEvidence
 	for name, matches := range paths {
-		for _, path := range matches {
+		for _, candidate := range matches {
+			started := clock.Now()
+			if engine.attemptOwnershipIsLive(candidate.record) {
+				continue
+			}
+			existing, wasRetained := retentionFor(candidate.record, RemovalResourceCgroup, name)
+			boundExpired := wasRetained && !clock.Now().Before(existing.Deadline)
+			killResult, err := kill(candidate.path)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				if boundExpired {
+					return nil, nil, &RetentionBoundExceededError{Class: RemovalResourceCgroup, ID: name, AttemptID: candidate.record.Authority.AttemptID, Deadline: existing.Deadline, Cause: err}
+				}
+				return nil, nil, fmt.Errorf("KILL helper-owned cgroup %s: %w", name, err)
+			}
 			for {
-				live, err := populated(path)
+				live, err := populated(candidate.path)
 				if errors.Is(err, os.ErrNotExist) {
+					evidence = append(evidence, SweepEvidence{Class: RemovalResourceCgroup, ID: name, AttemptID: candidate.record.Authority.AttemptID, Action: SweepActionKillReaped, Method: killResult.Method, PIDs: killResult.PIDs, Duration: clock.Now().Sub(started)})
 					break
 				}
 				if err != nil {
-					return fmt.Errorf("verify helper-owned cgroup %s after KILL: %w", name, err)
+					return nil, nil, fmt.Errorf("verify helper-owned cgroup %s after KILL: %w", name, err)
 				}
 				if !live {
-					removeErr := remove(path)
+					if engine.attemptOwnershipIsLive(candidate.record) {
+						break
+					}
+					removeErr := remove(candidate.path)
 					if removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
+						if err := engine.clearAttemptRetention(candidate.record, RemovalResourceCgroup, name); err != nil {
+							return nil, nil, err
+						}
+						action := SweepActionKillReaped
+						if boundExpired {
+							action = SweepActionRetentionBoundReaped
+						}
+						evidence = append(evidence, SweepEvidence{Class: RemovalResourceCgroup, ID: name, AttemptID: candidate.record.Authority.AttemptID, Action: action, Method: killResult.Method, PIDs: killResult.PIDs, Duration: clock.Now().Sub(started)})
 						break
 					}
 					if !errors.Is(removeErr, syscall.EBUSY) && !errors.Is(removeErr, syscall.ENOTEMPTY) {
-						return fmt.Errorf("remove helper-owned cgroup %s: %w", name, removeErr)
+						return nil, nil, fmt.Errorf("remove helper-owned cgroup %s: %w", name, removeErr)
 					}
 				}
 				if live {
-					if err := kill(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-						return fmt.Errorf("repeat KILL for helper-owned cgroup %s: %w", name, err)
+					if _, err := kill(candidate.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+						return nil, nil, fmt.Errorf("repeat KILL for helper-owned cgroup %s: %w", name, err)
 					}
 				}
-				timer := time.NewTimer(10 * time.Millisecond)
+				if engine.afterCgroupObservation != nil {
+					engine.afterCgroupObservation()
+				}
+				if !clock.Now().Before(deadline) {
+					if boundExpired {
+						return nil, nil, &RetentionBoundExceededError{Class: RemovalResourceCgroup, ID: name, AttemptID: candidate.record.Authority.AttemptID, Deadline: existing.Deadline, Cause: errors.New("cgroup remained populated after SIGKILL")}
+					}
+					updated, retention, err := engine.retainAttemptResource(candidate.record, RemovalResourceCgroup, name, DurableRetentionReasonCgroupReaping, DurableRetentionStatePopulated, clock.Now())
+					if err != nil {
+						return nil, nil, err
+					}
+					ownership[updated.Authority.key()] = updated
+					retentions = append(retentions, retention)
+					evidence = append(evidence, SweepEvidence{Class: RemovalResourceCgroup, ID: name, AttemptID: candidate.record.Authority.AttemptID, Action: SweepActionRetained, Method: killResult.Method, PIDs: killResult.PIDs, Duration: clock.Now().Sub(started)})
+					break
+				}
+				poll := clock.NewTimerAt(clock.Now().Add(10 * time.Millisecond))
 				select {
-				case <-waitContext.Done():
-					timer.Stop()
-					return fmt.Errorf("helper-owned cgroup %s remained after KILL: %w", name, waitContext.Err())
-				case <-timer.C:
+				case <-ctx.Done():
+					poll.Stop()
+					return nil, nil, ctx.Err()
+				case <-poll.C():
 				}
 			}
 		}
 	}
-	return nil
+	slices.SortFunc(retentions, func(left, right DurableRetention) int { return strings.Compare(left.ID, right.ID) })
+	return retentions, evidence, nil
 }
 
-func killCgroupTree(path string) error {
-	killFile, err := os.OpenFile(filepath.Join(path, "cgroup.kill"), os.O_WRONLY, 0)
+type cgroupKillResult struct {
+	Method string
+	PIDs   []int
+}
+
+func killCgroupTree(path string) (cgroupKillResult, error) {
+	return killCgroupTreeWithOpen(path, func(path string) (io.WriteCloser, error) {
+		return os.OpenFile(path, os.O_WRONLY, 0)
+	})
+}
+
+func killCgroupTreeWithOpen(path string, openKill func(string) (io.WriteCloser, error)) (cgroupKillResult, error) {
+	pids, err := cgroupTreePIDs(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return cgroupKillResult{}, err
+	}
+	killFile, err := openKill(filepath.Join(path, "cgroup.kill"))
 	if err == nil {
-		err = writeAll(killFile, []byte("1\n"))
-		err = errors.Join(err, killFile.Close())
-		return err
+		writeErr := writeAll(killFile, []byte("1\n"))
+		closeErr := killFile.Close()
+		if writeErr == nil && closeErr == nil {
+			return cgroupKillResult{Method: "cgroup.kill", PIDs: pids}, nil
+		}
+		if !errors.Is(writeErr, syscall.EOPNOTSUPP) && !errors.Is(closeErr, syscall.EOPNOTSUPP) {
+			return cgroupKillResult{}, errors.Join(writeErr, closeErr)
+		}
+		err = syscall.EOPNOTSUPP
 	}
 	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.EOPNOTSUPP) {
-		return err
+		return cgroupKillResult{}, err
 	}
-	return filepath.WalkDir(path, func(current string, entry os.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(path, func(current string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if errors.Is(walkErr, os.ErrNotExist) {
 				return nil
@@ -3586,6 +4026,43 @@ func killCgroupTree(path string) error {
 		}
 		return nil
 	})
+	return cgroupKillResult{Method: "recursive_signal", PIDs: pids}, err
+}
+
+func cgroupTreePIDs(path string) ([]int, error) {
+	seen := make(map[int]struct{})
+	err := filepath.WalkDir(path, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() || entry.Name() != "cgroup.procs" {
+			return nil
+		}
+		payload, err := os.ReadFile(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		for _, field := range strings.Fields(string(payload)) {
+			pid, err := strconv.Atoi(field)
+			if err != nil || pid <= 0 {
+				return fmt.Errorf("invalid pid %q in %s", field, current)
+			}
+			seen[pid] = struct{}{}
+		}
+		return nil
+	})
+	pids := make([]int, 0, len(seen))
+	for pid := range seen {
+		pids = append(pids, pid)
+	}
+	slices.Sort(pids)
+	return pids, err
 }
 
 func cgroupTreePopulated(path string) (bool, error) {
@@ -3669,33 +4146,68 @@ func (engine *ContainerdEngine) runtimeAbsenceInventory(inventory ResourceInvent
 	if err != nil {
 		return ResourceInventory{}, nil, err
 	}
+	ownership, err := engine.loadAttemptOwnershipRecords()
+	if err != nil {
+		return ResourceInventory{}, nil, err
+	}
 	retentions := make([]DurableRetention, 0)
 	logSegments := projected.LogSegments[:0]
 	for _, name := range projected.LogSegments {
-		path := filepath.Join(engine.config.RuntimeRoot, "logs", name)
-		owned, ownershipErr := helperOwnedAttemptDirectory(path, "wefty-log-segments-", name)
-		if ownershipErr != nil {
-			return ResourceInventory{}, nil, ownershipErr
-		}
-		if !owned {
+		record, bound := ownershipByLogName(ownership, name)
+		retention, retained := retentionFor(record, RemovalResourceLogSegments, name)
+		if !bound || engine.attemptOwnershipIsLive(record) || !retained || !now.Before(retention.Deadline) {
 			logSegments = append(logSegments, name)
 			continue
 		}
-		sealed, sealErr := logSegmentDirectorySealed(path)
-		if sealErr != nil {
-			return ResourceInventory{}, nil, sealErr
-		}
-		if sealed {
-			logSegments = append(logSegments, name)
-			continue
-		}
-		retentions = append(retentions, DurableRetention{
-			Class: RemovalResourceLogSegments, ID: name,
-			Owner: DurableRetentionOwnerOCIHelper, Reason: DurableRetentionReasonLogSpoolSealing,
-		})
+		retentions = append(retentions, retention)
 	}
 	projected.LogSegments = logSegments
+	cgroups := projected.Cgroups[:0]
+	for _, name := range projected.Cgroups {
+		record, bound := ownershipByCgroupName(ownership, name)
+		retention, retained := retentionFor(record, RemovalResourceCgroup, name)
+		if !bound || engine.attemptOwnershipIsLive(record) || !retained || !now.Before(retention.Deadline) {
+			cgroups = append(cgroups, name)
+			continue
+		}
+		retentions = append(retentions, retention)
+	}
+	projected.Cgroups = cgroups
+	slices.SortFunc(retentions, func(left, right DurableRetention) int {
+		if order := strings.Compare(string(left.Class), string(right.Class)); order != 0 {
+			return order
+		}
+		return strings.Compare(left.ID, right.ID)
+	})
 	return projected, retentions, nil
+}
+
+func (engine *ContainerdEngine) removeQuiescentAttemptOwnershipRecords(records map[string]durableAttemptOwnership, remaining ResourceInventory) error {
+	for key, record := range records {
+		filtered := filterInventory(remaining, record.Resources, nil)
+		if len(filtered.Leases)+len(filtered.Snapshots)+len(filtered.Containers)+len(filtered.Tasks)+len(filtered.Shims)+len(filtered.Cgroups)+len(filtered.LogSegments) != 0 {
+			continue
+		}
+		if err := engine.removeAttemptOwnershipRecord(record); err != nil {
+			return err
+		}
+		delete(records, key)
+	}
+	return nil
+}
+
+func (engine *ContainerdEngine) removeAttemptOwnershipRecord(record durableAttemptOwnership) error {
+	if err := os.Remove(engine.attemptOwnershipPath(record.Resources)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	directory, err := os.Open(engine.attemptOwnershipRoot())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
 }
 
 func (engine *ContainerdEngine) retainedServiceDataBinding(volumeName, recordName string) (bool, error) {

@@ -125,12 +125,13 @@ const (
 	EngineFailureDeadlineExceeded EngineFailureReason = "deadline_exceeded"
 	EngineFailureCanceled         EngineFailureReason = "canceled"
 	EngineFailurePermissionDenied EngineFailureReason = "permission_denied"
+	EngineFailureRetentionBound   EngineFailureReason = "retention_bound_exceeded"
 	EngineFailureOperationFailed  EngineFailureReason = "operation_failed"
 )
 
 func (reason EngineFailureReason) valid() bool {
 	switch reason {
-	case EngineFailureDeadlineExceeded, EngineFailureCanceled, EngineFailurePermissionDenied, EngineFailureOperationFailed:
+	case EngineFailureDeadlineExceeded, EngineFailureCanceled, EngineFailurePermissionDenied, EngineFailureRetentionBound, EngineFailureOperationFailed:
 		return true
 	default:
 		return false
@@ -1285,16 +1286,53 @@ const DurableRetentionOwnerOCIHelper DurableRetentionOwner = "oci_helper"
 
 type DurableRetentionReason string
 
-const DurableRetentionReasonLogSpoolSealing DurableRetentionReason = "log_spool_sealing"
+const (
+	DurableRetentionReasonLogSpoolSealing DurableRetentionReason = "log_spool_sealing"
+	DurableRetentionReasonCgroupReaping   DurableRetentionReason = "cgroup_reaping"
+)
+
+type DurableRetentionState string
+
+const (
+	DurableRetentionStateUnsealed  DurableRetentionState = "unsealed"
+	DurableRetentionStatePopulated DurableRetentionState = "populated"
+)
 
 // DurableRetention binds a projected-out namespace resource to the authority
 // retaining it and a closed reason. The resource remains visible in
 // DurableRetained; this record explains why it does not block admission.
 type DurableRetention struct {
-	Class  RemovalResourceClass   `json:"class"`
-	ID     string                 `json:"id"`
-	Owner  DurableRetentionOwner  `json:"owner"`
-	Reason DurableRetentionReason `json:"reason"`
+	Class      RemovalResourceClass   `json:"class"`
+	ID         string                 `json:"id"`
+	Owner      DurableRetentionOwner  `json:"owner"`
+	Reason     DurableRetentionReason `json:"reason"`
+	AttemptID  string                 `json:"attempt_id"`
+	State      DurableRetentionState  `json:"state"`
+	Bound      time.Duration          `json:"bound"`
+	RecordedAt time.Time              `json:"recorded_at"`
+	Deadline   time.Time              `json:"deadline"`
+}
+
+type SweepAction string
+
+const (
+	SweepActionRemoved              SweepAction = "removed"
+	SweepActionKillReaped           SweepAction = "kill_reaped"
+	SweepActionRetained             SweepAction = "retained"
+	SweepActionRetentionBoundReaped SweepAction = "retention_bound_reaped"
+)
+
+// SweepEvidence is assertion-derived mechanics evidence for a helper-owned
+// lost Attempt resource. It does not grant ownership; the durable Attempt
+// record and the helper's live-attempt registry do that before any mutation.
+type SweepEvidence struct {
+	Class     RemovalResourceClass `json:"class"`
+	ID        string               `json:"id"`
+	AttemptID string               `json:"attempt_id"`
+	Action    SweepAction          `json:"action"`
+	Method    string               `json:"method,omitempty"`
+	PIDs      []int                `json:"pids,omitempty"`
+	Duration  time.Duration        `json:"duration"`
 }
 
 // SweepRequest is intentionally empty: the boot barrier always sweeps the
@@ -1311,6 +1349,8 @@ type SweepResponse struct {
 	PriorBootSessionsSeen []SessionIdentity       `json:"prior_boot_sessions_seen"`
 	Inventory             ResourceInventory       `json:"inventory"`
 	Attempts              []SweptAttemptAuthority `json:"attempts"`
+	DurableRetentions     []DurableRetention      `json:"durable_retentions"`
+	Evidence              []SweepEvidence         `json:"evidence"`
 }
 
 // ResourceInventory is the engine's complete, class-separated namespace
@@ -1366,6 +1406,7 @@ type VerifiedSweepReceipt struct {
 	VerifiedResidue       ResourceInventory       `json:"verified_residue"`
 	VerifiedRetained      ResourceInventory       `json:"verified_retained"`
 	DurableRetentions     []DurableRetention      `json:"durable_retentions"`
+	SweepEvidence         []SweepEvidence         `json:"sweep_evidence"`
 	Attempts              []SweptAttemptAuthority `json:"attempts"`
 }
 

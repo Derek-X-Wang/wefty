@@ -302,6 +302,7 @@ jobs:
           sudo install --directory --mode=0777 /tmp/wefty-oci-faults
           sudo mkfifo /tmp/wefty-oci-faults/control
           sudo chmod 0666 /tmp/wefty-oci-faults/control
+          sudo install --owner=root --group=root --mode=0755 scripts/oci-lost-attempt-fault.sh /usr/local/libexec/wefty-oci-lost-attempt-fault
           sudo tee /usr/local/libexec/wefty-oci-fault-supervisor >/dev/null <<'SCRIPT'
           #!/bin/sh
           set -eu
@@ -382,43 +383,10 @@ jobs:
                 enable-registry)
                   iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT
                   ;;
-                inject-live-log:wefty-log-segments-*)
-                  name="${action#inject-live-log:}"
-                  if ! printf '%s\n' "$name" | grep -Eq '^wefty-log-segments-[0-9a-f]{32}$'; then
-                    printf 'invalid helper log identity %s\n' "$name" > "/tmp/wefty-oci-faults/$action.failed"
+                inject-live-log:wefty-log-segments-*|populate-cgroup:wefty-cgroup-*|save-attempt-record:wefty-container-*|restore-never-seal-log:wefty-container-*:wefty-log-segments-*|restore-populated-cgroup:wefty-container-*:wefty-cgroup-*|remove-lost-log:wefty-container-*:wefty-log-segments-*)
+                  if ! /usr/local/libexec/wefty-oci-lost-attempt-fault "$action" 2> "/tmp/wefty-oci-faults/$action.failed"; then
                     continue
                   fi
-                  path="/var/lib/wefty/oci/logs/$name"
-                  install --directory --owner=root --group=root --mode=0700 "$path"
-                  : > "$path/stdout.frames"
-                  : > "$path/stderr.frames"
-                  python3 - "$path" <<'PY' &
-          import hashlib
-          import pathlib
-          import struct
-          import sys
-          import time
-
-          root = pathlib.Path(sys.argv[1])
-          time.sleep(1)
-          seal = struct.pack(">4sQI", b"WLS1", 0, 0) + hashlib.sha256(b"").digest()
-          for stream in ("stdout.frames", "stderr.frames"):
-              with (root / stream).open("ab") as target:
-                  target.write(seal)
-                  target.flush()
-          PY
-                  ;;
-                populate-cgroup:wefty-cgroup-*)
-                  name="${action#populate-cgroup:}"
-                  if ! printf '%s\n' "$name" | grep -Eq '^wefty-cgroup-[0-9a-f]{32}$'; then
-                    printf 'invalid helper cgroup identity %s\n' "$name" > "/tmp/wefty-oci-faults/$action.failed"
-                    continue
-                  fi
-                  path="/sys/fs/cgroup/$name"
-                  mkdir "$path"
-                  sleep 300 &
-                  pid="$!"
-                  printf '%s\n' "$pid" > "$path/cgroup.procs"
                   ;;
                 assert-computer-clean:wefty-log-segments-*)
                   name="${action#assert-computer-clean:}"

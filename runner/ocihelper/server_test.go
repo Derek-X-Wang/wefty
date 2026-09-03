@@ -1083,12 +1083,15 @@ func TestNamespaceVerificationRequiresExactLogRetentionOwnerAndReason(t *testing
 		Inventory:       ResourceInventory{LogSegments: []string{logSegment}},
 		DurableRetained: ResourceInventory{LogSegments: []string{logSegment}},
 	}
-	if err := validateNamespaceVerification("test verify", verification); err == nil || !strings.Contains(err.Error(), "lack exact owner/reason bindings") {
+	if err := validateNamespaceVerification("test verify", verification); err == nil || !strings.Contains(err.Error(), "lack exact bindings") {
 		t.Fatalf("unbound retained log segment = %v", err)
 	}
+	recordedAt := time.Unix(1_000, 0).UTC()
 	verification.DurableRetentions = []DurableRetention{{
 		Class: RemovalResourceLogSegments, ID: logSegment,
 		Owner: DurableRetentionOwnerOCIHelper, Reason: DurableRetentionReasonLogSpoolSealing,
+		AttemptID: "attempt-1", State: DurableRetentionStateUnsealed, Bound: time.Minute,
+		RecordedAt: recordedAt, Deadline: recordedAt.Add(time.Minute),
 	}}
 	if err := validateNamespaceVerification("test verify", verification); err != nil {
 		t.Fatalf("exact retained log binding rejected: %v", err)
@@ -1096,6 +1099,18 @@ func TestNamespaceVerificationRequiresExactLogRetentionOwnerAndReason(t *testing
 	verification.DurableRetentions[0].Reason = "unknown"
 	if err := validateNamespaceVerification("test verify", verification); err == nil || !strings.Contains(err.Error(), "invalid durable-retention binding") {
 		t.Fatalf("unknown retained log reason = %v", err)
+	}
+}
+
+func TestNamespaceVerificationRequiresExactDisjointPartition(t *testing.T) {
+	const container = "wefty-container-0123456789abcdef0123456789abcdef"
+	for _, verification := range []VerifyResponse{
+		{Absent: true, Inventory: ResourceInventory{Containers: []string{container}}},
+		{Absent: false, Inventory: ResourceInventory{Containers: []string{container}}, RuntimeResidue: ResourceInventory{Containers: []string{container}}, DurableRetained: ResourceInventory{Containers: []string{container}}},
+	} {
+		if err := validateNamespaceVerification("test verify", verification); err == nil || !strings.Contains(err.Error(), "exact disjoint") {
+			t.Fatalf("invalid inventory partition accepted: %+v err=%v", verification, err)
+		}
 	}
 }
 
@@ -1130,7 +1145,7 @@ func TestHelperRestartSweepsAndVerifiesBeforeAcceptingSession(t *testing.T) {
 
 func TestHelperStartupResidueFailsServeBeforeSessionAuthority(t *testing.T) {
 	engine := newFakeEngine()
-	engine.verifyResponses = []VerifyResponse{{Absent: false, RuntimeResidue: ResourceInventory{Leases: []string{"wefty-residue"}}}}
+	engine.verifyResponses = []VerifyResponse{{Absent: false, Inventory: ResourceInventory{Leases: []string{"wefty-residue"}}, RuntimeResidue: ResourceInventory{Leases: []string{"wefty-residue"}}}}
 	server, err := NewServer(engine, ServerConfig{
 		HelperChecksum: "checksum-test", AllowedUIDs: []uint32{uint32(os.Getuid())},
 	})
@@ -3083,7 +3098,7 @@ func (engine *retainedHandoffEngine) Verify(context.Context, VerifyRequest) (Ver
 	if name == "" {
 		return VerifyResponse{Absent: true}, nil
 	}
-	return VerifyResponse{Absent: true, Inventory: ResourceInventory{ManagedVolumes: []string{name}}}, nil
+	return VerifyResponse{Absent: true, Inventory: ResourceInventory{ManagedVolumes: []string{name}}, DurableRetained: ResourceInventory{ManagedVolumes: []string{name}}}, nil
 }
 
 func (engine *retainedHandoffEngine) handoffName() string {
@@ -3156,7 +3171,7 @@ func (engine *crashBoundaryEngine) Verify(context.Context, VerifyRequest) (Verif
 	inventory := engine.inventoryLocked()
 	absent := InventoryEmpty(inventory)
 	engine.stateMu.Unlock()
-	return VerifyResponse{Absent: absent, Inventory: inventory}, nil
+	return VerifyResponse{Absent: absent, Inventory: inventory, RuntimeResidue: inventory}, nil
 }
 
 func (engine *crashBoundaryEngine) inventoryLocked() ResourceInventory {
