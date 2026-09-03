@@ -13,7 +13,7 @@ require_receipt() {
     return 1
   fi
   if ! jq -e '
-    type == "object" and (.checks | type == "array") and
+    type == "object" and .version == 2 and (.checks | type == "array") and
     (.teardown | type == "object") and
     (.teardown.retries_used | type == "number" and . >= 0 and floor == .) and
     (.teardown.permission_repair_performed | type == "boolean") and
@@ -28,6 +28,15 @@ require_receipt() {
 }
 
 case ${1:-} in
+  positive)
+    [[ $# == 2 ]] || { error diagnostics-usage 'positive requires RECEIPT'; exit 64; }
+    receipt=$2
+    require_receipt "$receipt" positive-runtime || exit 1
+    if ! jq -e '.status == "PASS"' "$receipt" >/dev/null 2>&1; then
+      error receipt/positive-runtime "non-PASS receipt $receipt"
+      exit 1
+    fi
+    ;;
   teardown-repair)
     [[ $# == 3 ]] || { error diagnostics-usage 'teardown-repair requires RECEIPT CHECKER_STATUS'; exit 64; }
     receipt=$2 checker_status=$3
@@ -92,7 +101,7 @@ case ${1:-} in
     fi
     ;;
   *)
-    error diagnostics-usage 'expected teardown-repair, mutation, or summary'
+    error diagnostics-usage 'expected positive, teardown-repair, mutation, or summary'
     exit 64
     ;;
 esac

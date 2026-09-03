@@ -47,7 +47,7 @@ positive_stderr="$evidence/${arch}-runtime.stderr"
 positive_status=$?
 set -e
 sed -n '1,400p' "$positive_stderr" >&2
-if grep -Eq 'stop container|remove container|remove conformance temporary root|runtime teardown failed' "$positive_stderr"; then
+if grep -Eq '^runtime teardown failed' "$positive_stderr"; then
   stage_error positive-runtime-teardown "checker reported container or temporary-root cleanup failure; see $positive_stderr"
   exit 1
 fi
@@ -55,10 +55,7 @@ if ((positive_status != 0)); then
   stage_error positive-runtime "checker exited $positive_status; receipt=$evidence/${arch}-runtime.json"
   exit 1
 fi
-if ! jq -e 'type == "object" and .status == "PASS" and (.checks | type == "array")' "$evidence/${arch}-runtime.json" >/dev/null 2>&1; then
-  stage_error receipt/positive-runtime "missing, malformed, or non-PASS receipt $evidence/${arch}-runtime.json"
-  exit 1
-fi
+"$diagnostics" positive "$evidence/${arch}-runtime.json"
 
 repair_probe_stderr="$evidence/${arch}-teardown-repair.stderr"
 set +e
@@ -114,7 +111,7 @@ run_mutation() {
   local checker_status=$?
   set -e
   sed -n '1,400p' "$checker_stderr" >&2
-  if grep -Eq 'stop container|remove container|remove conformance temporary root|runtime teardown failed' "$checker_stderr"; then
+  if grep -Eq '^runtime teardown failed' "$checker_stderr"; then
     stage_error "runtime-teardown/$mutation" "checker reported container or temporary-root cleanup failure; see $checker_stderr"
     exit 1
   fi

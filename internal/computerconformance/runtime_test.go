@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
@@ -24,36 +25,63 @@ func TestMissingEndpointObservationWindowStaysInsideReadinessBudget(t *testing.T
 	}
 }
 
-func TestTeardownDetachFailureDoesNotInventUnconfirmedContainerLeftover(t *testing.T) {
+func TestTeardownRemoveFailureIsNonFatalWhenInspectProvesContainerAbsent(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "checker-root")
 	if err := os.Mkdir(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	recorder := NewRecorder("image", "docker", "linux/amd64", time.Unix(100, 0))
+	var logs []string
 	runner := runtimeRunner{
 		root:        root,
 		containerID: "already-absent",
 		recorder:    recorder,
 		config:      RuntimeConfig{Runtime: "docker", Image: "image", RepairImage: "reference@sha256:abc"},
 		runCommandHook: func(_ context.Context, arguments ...string) (commandResult, error) {
-			if arguments[0] == "rm" || arguments[0] == "inspect" {
-				return commandResult{stderr: "not found"}, errors.New("runtime command failed")
+			switch arguments[0] {
+			case "exec", "stop":
+				return commandResult{}, nil
+			case "rm":
+				return commandResult{stderr: "Error response from daemon: removal of container already-absent failed"}, errors.New("runtime command failed")
+			case "inspect":
+				return commandResult{stderr: "Error: No such object: already-absent"}, errors.New("runtime command failed")
+			default:
+				return commandResult{}, fmt.Errorf("unexpected runtime command %q", arguments[0])
 			}
-			return commandResult{}, nil
 		},
-		teardownLogHook: func(string) {},
+		teardownLogHook: func(message string) { logs = append(logs, message) },
 	}
-	err := runner.cleanup()
-	var failure *TeardownFailure
-	if !errors.As(err, &failure) {
-		t.Fatalf("detach failure = %v", err)
+	if err := runner.cleanup(); err != nil {
+		t.Fatalf("absent container remained fatal: %v", err)
 	}
-	want := "temporary-root:" + root
-	if failure.Leftover != want {
-		t.Fatalf("unconfirmed typed leftover = %q, want %q", failure.Leftover, want)
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary root remained after absent container: %v", err)
 	}
-	if got := recorder.Finish(time.Unix(101, 0)).Teardown.Leftovers; len(got) != 1 || got[0] != want {
-		t.Fatalf("unconfirmed receipt leftovers = %v, want %q", got, want)
+	receipt := recorder.Finish(time.Unix(101, 0))
+	if len(receipt.Teardown.Leftovers) != 0 {
+		t.Fatalf("absent container receipt leftovers = %v", receipt.Teardown.Leftovers)
+	}
+	if len(receipt.Teardown.Observations) != 1 || receipt.Teardown.Observations[0].Reason != string(TeardownContainerDetachFailed) {
+		t.Fatalf("remove diagnostic observations = %+v", receipt.Teardown.Observations)
+	}
+	if joined := strings.Join(logs, "\n"); !strings.Contains(joined, "teardown observation: reason=container_detach_failed") {
+		t.Fatalf("remove diagnostic log = %q", joined)
+	}
+}
+
+func TestRuntimeObjectAbsentDoesNotTreatUnknownInspectFailureAsAbsence(t *testing.T) {
+	for name, stderr := range map[string]string{
+		"docker":       "Error: No such object: absent",
+		"nerdctl":      "FATA[0000] no such container absent",
+		"runtime down": "runtime endpoint not found",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := runtimeObjectAbsent(commandResult{stderr: stderr})
+			want := name != "runtime down"
+			if got != want {
+				t.Fatalf("runtimeObjectAbsent(%q) = %t, want %t", stderr, got, want)
+			}
+		})
 	}
 }
 
@@ -324,7 +352,7 @@ func TestTeardownSuccessfulRemovalMakesStopFailureNonFatal(t *testing.T) {
 			case "exec":
 				return commandResult{}, nil
 			case "stop":
-				return commandResult{stderr: "daemon response"}, errors.New("stop command failed")
+				return commandResult{stderr: "Error response from daemon: cannot stop container: eventually-removed: tried to kill container, but did not receive an exit event"}, errors.New("stop command failed")
 			case "rm":
 				return commandResult{}, nil
 			default:
@@ -343,8 +371,13 @@ func TestTeardownSuccessfulRemovalMakesStopFailureNonFatal(t *testing.T) {
 	if len(receipt.Teardown.Observations) != 1 || receipt.Teardown.Observations[0].Reason != string(TeardownContainerStopFailed) {
 		t.Fatalf("stop diagnostic observations = %+v", receipt.Teardown.Observations)
 	}
-	if joined := strings.Join(logs, "\n"); !strings.Contains(joined, "teardown observation: reason=container_stop_failed") || strings.Contains(joined, "runtime teardown failed") {
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "teardown observation: reason=container_stop_failed") {
 		t.Fatalf("non-fatal teardown log = %q", joined)
+	}
+	wrapperFatalPattern := regexp.MustCompile(`(?m)^runtime teardown failed`)
+	if wrapperFatalPattern.MatchString(joined) {
+		t.Fatalf("wrapper fatal pattern matched non-fatal teardown observation %q", joined)
 	}
 }
 

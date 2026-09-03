@@ -27,8 +27,10 @@ const (
 	// therefore take twice this sleep budget plus runtime latency.
 	driverObservationSleepBudget = 10 * time.Second
 	containerStopGrace           = 15 * time.Second
-	permissionRepairBudget       = 15 * time.Second
-	teardownRemoveRetryInterval  = 250 * time.Millisecond
+	// Run 33695618869 measured permission repair at 118-206 ms across the
+	// four reference image/platform builds; 15 seconds retains QEMU margin.
+	permissionRepairBudget      = 15 * time.Second
+	teardownRemoveRetryInterval = 250 * time.Millisecond
 	// teardownRemoveRetryBudget bounds only retries after the runtime has
 	// detached every bind mount. It is not a blanket teardown delay.
 	teardownRemoveRetryBudget = 2 * time.Second
@@ -1289,8 +1291,13 @@ func (r *runtimeRunner) stopContainer(ctx context.Context) error {
 	removeResult, rmErr := r.runCommand(ctx, "rm", "--force", id)
 	if rmErr != nil {
 		r.containerLeftoverConfirmed = false
-		if _, inspectErr := r.runCommand(ctx, "inspect", id); inspectErr == nil {
+		inspectResult, inspectErr := r.runCommand(ctx, "inspect", id)
+		if inspectErr == nil {
 			r.containerLeftoverConfirmed = true
+		} else if runtimeObjectAbsent(inspectResult) {
+			r.teardownObserve(TeardownContainerDetachFailed, r.runtimeDetail("runtime remove failed but inspect proved container absent", errWithOutput(rmErr, removeResult)))
+			r.containerID = ""
+			return nil
 		}
 		leftovers := make([]string, 0, 2)
 		if r.containerLeftoverConfirmed {
@@ -1304,6 +1311,12 @@ func (r *runtimeRunner) stopContainer(ctx context.Context) error {
 	r.containerID = ""
 	r.containerLeftoverConfirmed = false
 	return nil
+}
+
+func runtimeObjectAbsent(result commandResult) bool {
+	detail := strings.ToLower(result.stdout + "\n" + result.stderr)
+	return strings.Contains(detail, "no such object") ||
+		strings.Contains(detail, "no such container")
 }
 
 func (r *runtimeRunner) cleanup() error {

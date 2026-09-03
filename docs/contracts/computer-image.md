@@ -270,7 +270,8 @@ if the detached root is still restrictive, the checker uses an explicitly
 supplied, known-good reference digest in a networkless, read-only-root repair
 container running as uid 0 with only `DAC_OVERRIDE` and `FOWNER`. Every image
 platform job exercises that repair under its actual runtime platform, records
-its duration, and enforces the measured 15-second deadline. `EBUSY` and
+its duration, and enforces the 15-second deadline measured against 118-206 ms
+repairs across the four builds in run 33695618869. `EBUSY` and
 `ENOTEMPTY` removals are retried every 250 milliseconds within a two-second
 scheduled-sleep budget.
 

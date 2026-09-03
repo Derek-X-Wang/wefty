@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const ReceiptVersion = 1
+const ReceiptVersion = 2
 const ContainerdProfileNotRun = "harness profile is not the containerd wefty-v1 profile"
 
 type Status string
@@ -245,7 +245,7 @@ type CheckDefinition struct {
 	Summary string
 }
 
-// CheckCatalog is append-only within receipt version 1. Stable IDs let CI and
+// CheckCatalog is append-only within receipt version 2. Stable IDs let CI and
 // image authors compare evidence without scraping human prose.
 var CheckCatalog = []CheckDefinition{
 	{ID: "runtime.started", Scope: ScopeImage, Summary: "image starts under the Computer harness profile"},

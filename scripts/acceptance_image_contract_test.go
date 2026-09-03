@@ -427,6 +427,13 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../examples/computer-wayland/LICENSES.md", "Herdr", "Apache-2.0", "no code or assets copied", "no code, assets, installer, name, or branding copied")
 	assertFileContains(t, "../scripts/test-computer-wayland-furniture.sh", "gpu_device_absent=$(docker exec", "agent_states_observed=$(docker exec", "agent_states_observed:$agent_states_observed", "self_reconfiguration_observed=$(docker exec", "crash_briefing_observed=$(docker exec", "mise_stubs_present=$(docker exec", "license_manifest_present=$(docker exec", "test ! -e /dev/dri", "agent-state-surface.json", "theme-surface.json", "crash-briefing.json", "idle_rss_bytes", "wefty-verify-licenses --check", `type == "number"`)
 	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", "cmd/wefty-computer-conformance", "--input-oracle-path", "--driver-oracle-path", "--repair-image", "teardown-permission-repair", "executed_rows", "check-computer-image-runtime-evidence.sh", "Dockerfile.wayland-text", "checker_wall_seconds", "runtime teardown failed", "docker rmi")
+	runtimeWrapper, err := os.ReadFile("../scripts/test-computer-image-runtime.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(runtimeWrapper), "grep -Eq '^runtime teardown failed'"); got != 2 {
+		t.Fatalf("runtime wrapper fatal teardown patterns = %d, want 2 exact anchored patterns", got)
+	}
 	for _, path := range []string{"../docs/contracts/computer-image.md", "../docs/guides/computer-images.md"} {
 		assertFileContains(t, path, "version", "human_driving", "generation", "fingerprint", "classification", "lowercase", "exact bytes", "valid", "malformed", "unknown-version", "missing", "sentinel")
 	}

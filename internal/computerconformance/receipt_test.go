@@ -6,7 +6,10 @@ import (
 	"time"
 )
 
-func TestReceiptV1CatalogIDsArePinned(t *testing.T) {
+func TestReceiptV2CatalogIDsArePinned(t *testing.T) {
+	if ReceiptVersion != 2 {
+		t.Fatalf("receipt version = %d, want 2", ReceiptVersion)
+	}
 	expected := strings.Fields(`
 		runtime.started runtime.image-config
 		environment.service-dir environment.view-port environment.control-port environment.service-port-omitted environment.handoff-dir-omitted environment.authority-omitted environment.other-wefty-preserved
@@ -21,11 +24,11 @@ func TestReceiptV1CatalogIDsArePinned(t *testing.T) {
 		persistence.service-survives persistence.profile-survives persistence.sign-in-survives persistence.rootfs-discarded persistence.edge-recovers targets.control-nonpersistent
 	`)
 	if len(CheckCatalog) != len(expected) {
-		t.Fatalf("receipt v1 catalog length = %d, want %d", len(CheckCatalog), len(expected))
+		t.Fatalf("receipt v2 catalog length = %d, want %d", len(CheckCatalog), len(expected))
 	}
 	for index, definition := range CheckCatalog {
 		if definition.ID != expected[index] {
-			t.Fatalf("receipt v1 catalog id[%d] = %q, want %q", index, definition.ID, expected[index])
+			t.Fatalf("receipt v2 catalog id[%d] = %q, want %q", index, definition.ID, expected[index])
 		}
 	}
 }
