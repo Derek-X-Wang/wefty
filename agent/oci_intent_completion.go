@@ -30,6 +30,14 @@ func (err *OCIIntentAuthorityUnavailableError) Error() string {
 
 func (err *OCIIntentAuthorityUnavailableError) Unwrap() error { return err.Err }
 
+// OCIIntentAuthorityRequiredError means an agent configuration offered OCI
+// execution without the durable node-local control surface that fences it.
+type OCIIntentAuthorityRequiredError struct{}
+
+func (*OCIIntentAuthorityRequiredError) Error() string {
+	return "agent: OCI runtime or capability requires an OCI intent authority"
+}
+
 // ociIntentCompletionGate orders same-process completion publication against
 // the node-local stop controller. Readers hold the gate only across one final
 // durable observation and one L1 response; retries release it between calls.

@@ -41,14 +41,14 @@ func TestOCIServiceCompletionAuthorityUnavailableRetainsEvidence(t *testing.T) {
 	defer stopServer()
 	defer client.Close()
 
-	newPending := func(t *testing.T, attemptID string) (*evidenceOutbox, l1.Claim, logSpoolAttempt) {
+	newPending := func(t *testing.T, attemptID, kind string) (*evidenceOutbox, l1.Claim, logSpoolAttempt) {
 		t.Helper()
 		outbox, err := newEvidenceOutbox(t.TempDir(), "intent-authority-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
 		if err != nil {
 			t.Fatal(err)
 		}
 		claim := l1.Claim{Job: l1.Job{JobID: "intent-authority-job-" + attemptID, Spec: contract.JobSpec{
-			Kind: contract.JobKindOCI, Class: contract.JobClassService,
+			Kind: kind, Class: contract.JobClassService,
 		}}, Lease: l1.AttemptLease{AttemptID: attemptID, FencingToken: "fence-" + attemptID}}
 		if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
 			t.Fatal(err)
@@ -57,11 +57,11 @@ func TestOCIServiceCompletionAuthorityUnavailableRetainsEvidence(t *testing.T) {
 		if err := outbox.storeCompletion(t.Context(), attemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now(), l1.RuntimeQuiescenceAttempt); err != nil {
 			t.Fatal(err)
 		}
-		return outbox, claim, logSpoolAttempt{jobID: claim.Job.JobID, attemptID: attemptID, fencingToken: claim.Lease.FencingToken, class: contract.JobClassService, kind: contract.JobKindOCI}
+		return outbox, claim, logSpoolAttempt{jobID: claim.Job.JobID, attemptID: attemptID, fencingToken: claim.Lease.FencingToken, class: contract.JobClassService, kind: kind}
 	}
 
 	t.Run("transient read error retries intact payload", func(t *testing.T) {
-		outbox, _, attempt := newPending(t, "transient")
+		outbox, _, attempt := newPending(t, "transient", contract.JobKindOCI)
 		defer outbox.Close()
 		reads := 0
 		outbox.ociIntentGate = &ociIntentCompletionGate{observe: func(context.Context) (OCIIntentObservation, error) {
@@ -103,22 +103,25 @@ func TestOCIServiceCompletionAuthorityUnavailableRetainsEvidence(t *testing.T) {
 		}
 	})
 
-	t.Run("nil authority is typed and withheld", func(t *testing.T) {
-		outbox, _, attempt := newPending(t, "nil")
-		defer outbox.Close()
-		err := outbox.recoverCompletion(t.Context(), client, attempt)
-		var unavailable *OCIIntentAuthorityUnavailableError
-		if !errors.As(err, &unavailable) {
-			t.Fatalf("nil authority err=%T %v", err, err)
-		}
-		receipt := outbox.spool.inspectCompletion(t.Context(), attempt.attemptID)
-		if receipt.State != "withheld" || receipt.Result.ExitCode == nil || *receipt.Result.ExitCode != 7 {
-			t.Fatalf("nil-authority receipt=%+v", receipt)
+	t.Run("nil authority leaves the fence inapplicable", func(t *testing.T) {
+		for _, kind := range []string{contract.JobKindProcess, contract.JobKindOCI} {
+			t.Run(kind, func(t *testing.T) {
+				outbox, _, attempt := newPending(t, "nil-"+kind, kind)
+				defer outbox.Close()
+				callsBefore := completionCalls
+				if err := outbox.recoverCompletion(t.Context(), client, attempt); err != nil {
+					t.Fatalf("nil authority %s completion: %v", kind, err)
+				}
+				receipt := outbox.spool.inspectCompletion(t.Context(), attempt.attemptID)
+				if receipt.State != "delivered" || completionCalls != callsBefore+1 {
+					t.Fatalf("nil-authority %s receipt=%+v calls=%d", kind, receipt, completionCalls)
+				}
+			})
 		}
 	})
 
 	t.Run("absent production marker is typed and withheld", func(t *testing.T) {
-		outbox, _, attempt := newPending(t, "absent")
+		outbox, _, attempt := newPending(t, "absent", contract.JobKindOCI)
 		defer outbox.Close()
 		source := lima.FileIntentSource{Path: filepath.Join(t.TempDir(), "missing-intent.json")}
 		outbox.ociIntentGate = &ociIntentCompletionGate{observe: func(ctx context.Context) (OCIIntentObservation, error) {

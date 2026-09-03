@@ -492,13 +492,9 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 	for {
 		var observation OCIIntentObservation
 		var releaseIntent func()
-		if requiresOCIIntentFence(claim.Job.Spec.Kind, claim.Job.Spec.Class) {
+		if requiresOCIIntentFence(claim.Job.Spec.Kind, claim.Job.Spec.Class) && lifecycle.dependencies.ociIntentGate != nil {
 			var intentErr error
-			if lifecycle.dependencies.ociIntentGate == nil {
-				intentErr = &OCIIntentAuthorityUnavailableError{}
-			} else {
-				observation, releaseIntent, intentErr = lifecycle.dependencies.ociIntentGate.beginCompletion(context.WithoutCancel(ctx))
-			}
+			observation, releaseIntent, intentErr = lifecycle.dependencies.ociIntentGate.beginCompletion(context.WithoutCancel(ctx))
 			if intentErr != nil {
 				lifecycle.log("attempt %s withheld completion: %v", claim.Lease.AttemptID, intentErr)
 				if lifecycle.dependencies.outbox != nil {

@@ -252,7 +252,7 @@ func TestDurableOCIIntentGatesBackgroundRecoveryUntilControllerStart(t *testing.
 	nodeAgent, err := agent.New(agent.Config{
 		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "intent-node", BootSessionID: "intent-boot", Version: "test", OS: "linux", Architecture: "amd64",
-		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe,
+		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe, OCIIntent: probe.intentObservation,
 		OCIBootBarrier: readyMainTestOCIBootBarrier{}, HeartbeatInterval: 10 * time.Millisecond, ClaimInterval: time.Second,
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
 	})

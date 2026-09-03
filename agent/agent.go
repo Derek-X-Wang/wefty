@@ -58,8 +58,9 @@ type Config struct {
 	CapabilityProbe CapabilityProbe
 	// CapabilityProbeTimeout bounds one functional probe. Zero uses ten seconds.
 	CapabilityProbeTimeout time.Duration
-	// OCIIntent reads the durable node-local OCI intent marker. Nil is an
-	// unavailable authority and therefore withholds OCI service completion.
+	// OCIIntent reads the durable node-local OCI intent marker. It is required
+	// when this configuration offers an OCI runtime or capability; otherwise a
+	// nil reader means the completion fence is not applicable.
 	OCIIntent func(context.Context) (OCIIntentObservation, error)
 	// OCIBootBarrier must prove exclusive sweep and namespace absence before
 	// the functional probe can earn OCI capability publication.
@@ -151,6 +152,10 @@ func New(config Config) (*Agent, error) {
 	if config.CapabilityProbe != nil && config.OCIBootBarrier == nil {
 		return nil, errors.New("agent: OCI capability probe requires a boot barrier")
 	}
+	_, offersOCIRuntime := config.WorkloadRuntimes[contract.JobKindOCI]
+	if config.OCIIntent == nil && (config.Capabilities["kind:oci"] || offersOCIRuntime) {
+		return nil, &OCIIntentAuthorityRequiredError{}
+	}
 	osName := config.OS
 	if osName == "" {
 		osName = runtime.GOOS
@@ -241,7 +246,10 @@ func New(config Config) (*Agent, error) {
 		client.Close()
 		return nil, err
 	}
-	intentGate := &ociIntentCompletionGate{observe: config.OCIIntent}
+	var intentGate *ociIntentCompletionGate
+	if config.OCIIntent != nil {
+		intentGate = &ociIntentCompletionGate{observe: config.OCIIntent}
+	}
 	outbox.ociIntentGate = intentGate
 	controlTokenKey, err := outbox.spool.loadOrCreateSecret(context.Background(), computerControlTokenKeyName, computerControlTokenKeySize)
 	if err != nil {

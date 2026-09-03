@@ -250,12 +250,14 @@ side, and only then stops the runtime. An enabled completion that linearized
 before the stop may land; every later completion observes the disabled revision
 and is suppressed. The receipt retains the observed intent revision.
 
-Only an authoritative `enabled=false` suppresses a payload. An unavailable or
-malformed marker withholds publication, records
-`intent_authority_unavailable`, keeps the serialized exit evidence intact, and
-retries with outbox backoff; a nil marker reader is the same typed fail-closed
-case. Suppression likewise retains the payload as typed late evidence and
-records `service_intent_stop`, but excludes it from replay. The agent is
+Only an authoritative `enabled=false` suppresses a payload. On a node with an
+intent authority, an unavailable or malformed marker withholds publication,
+records `intent_authority_unavailable`, keeps the serialized exit evidence
+intact, and retries with outbox backoff. A nil marker reader means the fence is
+not applicable and publication proceeds; construction rejects configurations
+that offer an OCI runtime or `kind:oci` capability without an authority.
+Suppression likewise retains the payload as typed late evidence and records
+`service_intent_stop`, but excludes it from replay. The agent is
 obligated not to publish the intent-stopped result and to let lease expiry
 produce the ordinary `lost`/no-result outcome; L1 has other explicit lost paths
 and is not claimed to enforce this node-local marker itself. This fence does not
