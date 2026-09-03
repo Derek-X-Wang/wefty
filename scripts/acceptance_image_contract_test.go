@@ -291,6 +291,9 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 		for _, required := range []string{
 			"StandardError=append:/tmp/wefty-oci-helper-realtiming.stderr",
+			"StartLimitIntervalSec=0",
+			"Restart=on-failure",
+			"RestartSec=250ms",
 			"if: ${{ always() && runner.os == 'Linux' }}",
 			"journalctl --boot --no-pager --utc --output=short-precise",
 			"-u wefty-oci-helper-realtiming.service",
@@ -350,7 +353,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		resultText := marshalJob(t, result)
 		for _, required := range []string{"ARTIFACT_AVAILABLE", "$ARTIFACT_AVAILABLE", "= true",
 			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json",
-			"check-native-linux-oci-receipt.sh", "native-linux-oci.txt", "oci-service-publication-linux.txt", "oci-service-l1-agent-linux.txt", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland"} {
+			"check-native-linux-oci-receipt.sh", "native-linux-oci.txt", "oci-service-publication-linux.txt", "oci-service-l1-agent-linux.txt", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland",
+			"helper-restart-timeline.txt", "established_lane_helper_kills=4", "candidate_lane_total_helper_kills=8", "all_helper_restarts_within_takeover=true"} {
 			if !strings.Contains(resultText, required) {
 				t.Fatalf("%s realtiming result does not fail closed on %q", name, required)
 			}
@@ -374,6 +378,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "exec /usr/local/bin/wefty-echo-service", "published-echo-service:", "clean-cache wefty node load-image")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "CodeImageUnavailable", "ImageFailureNetwork", "WEFTY_OCI_PROVISION_RECEIPT", `evidenceSource := os.Getenv("WEFTY_REALTIME_EVIDENCE_SOURCE")`, `registryEvidence := "pull_from_empty=true\npull_import_digest_equal=true\n"`, "pull_from_empty=NOT-RUN\\npull_from_empty_reason=pr-build: image not published")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "Start the archive row from an empty root", `requestRootFault(t, "reset-containerd")`, "wiped-cache binding reconciliation")
+	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "TestNativeLinuxHelperRestartsAcrossLaneFaultBudget", "establishedLaneHelperKills = 4", "all_helper_restarts_within_takeover=true")
 	assertFileNotContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", `strings.Replace(evidence, "pull_from_empty=true\\n"`)
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_COMPUTER_REFERENCE", "exerciseNativeLinuxReferenceComputer", "ComputerStartupReadinessTimeout", "assertReferenceComputerWireNegatives")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_WAYLAND_COMPUTER_REFERENCE", `exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, "wayland"`, "wayland_computer_reference_wire_negatives=true")

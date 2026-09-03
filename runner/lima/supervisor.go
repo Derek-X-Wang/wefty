@@ -741,6 +741,10 @@ func classifyHelperBarrierError(err error) contract.CapabilityReasonCode {
 	if err == nil {
 		return ""
 	}
+	var unavailable *ocihelper.HelperUnitUnavailableError
+	if errors.As(err, &unavailable) {
+		return contract.CapabilityReasonHelperUnreachable
+	}
 	var rpcErr *ocihelper.RPCError
 	if errors.As(err, &rpcErr) {
 		switch rpcErr.Code {

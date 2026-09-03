@@ -42,7 +42,16 @@ sidecar is installed because the authenticated handshake is the checksum
 authority. The socket unit creates
 `/run/wefty/oci-helper.sock` as exactly `0660 root:wefty-oci`; the Lima guest
 user is added to that group, while the service runs the private helper mode as
-root with a narrow UID allowlist. When setup adds that supplementary group for
+root with a narrow UID allowlist. Every shipped systemd helper service, native
+Linux and Lima, sets `Restart=on-failure`, a bounded `RestartSec=250ms`, and
+`StartLimitIntervalSec=0`; the workflow-written realtiming units use the same
+policy. A Linux realtiming job has four established helper kills (Computer
+disk recovery, lost Attempt recovery, Computer restart survival, and Computer
+reset), and the restart regression repeats those four back-to-back, for eight
+deliberate kills per Ubuntu job. Disabling the interval, rather than sizing a
+finite burst to that current count, keeps an expected fault from permanently
+removing the helper when socket activation races an explicit restart. When
+setup adds that supplementary group for
 the first time, it performs one ordinary stop/start so Lima's guest agent picks
 up membership; an already-member rerun does not restart the VM. The host
 verifies socket ownership, protocol major, helper version, and checksum
@@ -180,6 +189,11 @@ takeover path and is re-observed by the lane's
 `startup_sweep_to_takeover_elapsed` receipt. The preferred design—answering
 handshakes during startup while gating admission on verified cleanup—is deferred
 to #301 because it changes startup concurrency and authority publication.
+While taking over, the client also retries a missing helper socket within that
+same fixed window. Two or more `ENOENT` dials followed by window expiry return
+the typed, operator-visible `helper_unit_unavailable` outcome with the observed
+dial count; they are not collapsed into a generic context deadline or treated
+as runtime-loss evidence.
 The takeover retry timer uses the injected helper clock. The heartbeat pump
 notifies the barrier synchronously when control authority is lost.
 

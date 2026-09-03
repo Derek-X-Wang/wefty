@@ -1041,6 +1041,56 @@ func TestBootBarrierDefaultTakeoverReservesAStartupReapWindow(t *testing.T) {
 	}
 }
 
+func TestBootBarrierClassifiesRepeatedMissingSocketAsHelperUnitUnavailable(t *testing.T) {
+	dials := 0
+	client := &Client{
+		ExpectedChecksum: "checksum-test",
+		Dial: func(context.Context) (net.Conn, error) {
+			dials++
+			return nil, fmt.Errorf("socket activation: %w", syscall.ENOENT)
+		},
+	}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: 100 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var unavailable *HelperUnitUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.Code() != HelperUnitUnavailable || unavailable.DialAttempts < 2 || dials < 2 || barrier.Ready() {
+		t.Fatalf("missing helper socket outcome = %#v err=%v dials=%d ready=%t", unavailable, err, dials, barrier.Ready())
+	}
+}
+
+func TestBootBarrierDoesNotReclassifyCallerCancellationAsUnavailableUnit(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	dials := 0
+	client := &Client{
+		ExpectedChecksum: "checksum-test",
+		Dial: func(context.Context) (net.Conn, error) {
+			dials++
+			if dials == 2 {
+				cancel()
+			}
+			return nil, fmt.Errorf("socket activation: %w", syscall.ENOENT)
+		},
+	}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: time.Second,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(ctx)
+	var unavailable *HelperUnitUnavailableError
+	if errors.As(err, &unavailable) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("caller cancellation was reclassified: unavailable=%#v err=%v", unavailable, err)
+	}
+}
+
 func TestBootBarrierTakeoverIncludesSlowStartupAndAdmissionSweeps(t *testing.T) {
 	const (
 		reapTimeout     = 500 * time.Millisecond

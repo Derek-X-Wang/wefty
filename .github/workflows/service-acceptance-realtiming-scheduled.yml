@@ -284,6 +284,7 @@ jobs:
           [Unit]
           Description=Wefty OCI helper realtiming service
           After=wefty-test-containerd.service
+          StartLimitIntervalSec=0
           [Service]
           Type=simple
           Environment=WEFTY_OCI_HELPER_ALLOWED_UIDS=$AGENT_UID
@@ -291,6 +292,8 @@ jobs:
           User=root
           Group=root
           StandardError=append:/tmp/wefty-oci-helper-realtiming.stderr
+          Restart=on-failure
+          RestartSec=250ms
           UNIT
           sudo systemctl daemon-reload
           sudo systemctl start wefty-oci-helper-realtiming.socket
@@ -597,3 +600,14 @@ jobs:
             "$RUNNER_TEMP/linux-computer-receipt-wayland/native-linux-oci.txt" published-artifact \
             "$RUNNER_TEMP/linux-computer-receipt-wayland/oci-service-publication-linux.txt" \
             "$RUNNER_TEMP/linux-computer-receipt-wayland/oci-service-l1-agent-linux.txt"
+          for variant in xfce wayland; do
+            timeline="$RUNNER_TEMP/linux-computer-receipt-$variant/helper-restart-timeline.txt"
+            grep -Fx 'established_lane_helper_kills=4' "$timeline"
+            grep -Fx 'candidate_lane_total_helper_kills=8' "$timeline"
+            grep -Fx 'all_helper_restarts_within_takeover=true' "$timeline"
+            for fault in 1 2 3 4; do
+              grep -Eq "^fault_${fault}_takeover_elapsed=[^[:space:]]+$" "$timeline"
+              grep -Eq "^fault_${fault}_takeover_bound=[^[:space:]]+$" "$timeline"
+              grep -Eq "^fault_${fault}_helper_instance=[^[:space:]]+$" "$timeline"
+            done
+          done

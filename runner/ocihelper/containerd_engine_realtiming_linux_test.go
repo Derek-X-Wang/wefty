@@ -912,6 +912,65 @@ func TestNativeLinuxSweepClearsLostAttemptLogSpoolAndPopulatedCgroup(t *testing.
 	}
 }
 
+func TestNativeLinuxHelperRestartsAcrossLaneFaultBudget(t *testing.T) {
+	const establishedLaneHelperKills = 4
+	helperSocket := os.Getenv("WEFTY_OCI_HELPER_SOCKET")
+	helperChecksum := os.Getenv("WEFTY_OCI_HELPER_CHECKSUM")
+	evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR")
+	if helperSocket == "" || helperChecksum == "" || evidenceDirectory == "" {
+		t.Fatal("Linux OCI helper restart provisioning is incomplete")
+	}
+	client := ocihelper.NewUnixClient(helperSocket, helperChecksum)
+	client.HeartbeatInterval = time.Second
+	barrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{
+		NodeID: "native-helper-restart-node", BootSessionID: "native-helper-restart-boot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer barrier.Close()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	previous, ok := barrier.Generation()
+	if !ok {
+		t.Fatal("initial helper generation was not published")
+	}
+	var evidence strings.Builder
+	fmt.Fprintf(&evidence, "established_lane_helper_kills=%d\n", establishedLaneHelperKills)
+	fmt.Fprintf(&evidence, "candidate_lane_total_helper_kills=%d\n", establishedLaneHelperKills*2)
+	for fault := 1; fault <= establishedLaneHelperKills; fault++ {
+		session, err := barrier.Session()
+		if err != nil {
+			t.Fatal(err)
+		}
+		takeoverBound := 2 * session.Handshake().ReapTimeout
+		killStarted := time.Now()
+		requestRootFault(t, "kill-helper")
+		supervisorElapsed := time.Since(killStarted)
+		barrier.Invalidate()
+		takeoverStarted := time.Now()
+		if err := barrier.Ensure(t.Context()); err != nil {
+			t.Fatalf("helper fault %d/%d did not recover: %v", fault, establishedLaneHelperKills, err)
+		}
+		takeoverElapsed := time.Since(takeoverStarted)
+		current, ok := barrier.Generation()
+		if !ok || current.HelperInstanceID == previous.HelperInstanceID {
+			t.Fatalf("helper fault %d/%d did not publish a replacement generation: previous=%+v current=%+v present=%t", fault, establishedLaneHelperKills, previous, current, ok)
+		}
+		if takeoverElapsed > takeoverBound {
+			t.Fatalf("helper fault %d/%d takeover took %s, exceeds %s", fault, establishedLaneHelperKills, takeoverElapsed, takeoverBound)
+		}
+		fmt.Fprintf(&evidence, "fault_%d_supervisor_elapsed=%s\nfault_%d_takeover_elapsed=%s\nfault_%d_kill_to_takeover_elapsed=%s\nfault_%d_takeover_bound=%s\nfault_%d_helper_instance=%s\n",
+			fault, supervisorElapsed, fault, takeoverElapsed, fault, time.Since(killStarted), fault, takeoverBound, fault, current.HelperInstanceID)
+		previous = current
+	}
+	evidence.WriteString("all_helper_restarts_within_takeover=true\n")
+	if err := os.WriteFile(filepath.Join(evidenceDirectory, "helper-restart-timeline.txt"), []byte(evidence.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 var nativeBarrierLossSequence atomic.Uint64
 
 func recordNativeBarrierLoss(generation ocihelper.HelperSession, barrierStartedAt time.Time, barrierReadyUnixNano int64, lossErr error) error {

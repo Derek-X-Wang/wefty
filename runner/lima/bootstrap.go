@@ -275,6 +275,7 @@ func renderGuestServiceUnit(config GuestHelperInstallConfig) []byte {
 	return []byte(`[Unit]
 Description=Wefty privileged OCI helper
 After=containerd.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -284,6 +285,8 @@ Environment=` + ocihelper.AllowedUIDsEnvironment + `=` + strconv.FormatUint(uint
 ExecStart=` + strings.Join(arguments, " ") + `
 StandardOutput=journal
 StandardError=journal
+Restart=on-failure
+RestartSec=250ms
 NoNewPrivileges=false
 `)
 }

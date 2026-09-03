@@ -132,6 +132,7 @@ WantedBy=sockets.target
 Description=Wefty privileged OCI helper
 After=containerd.service
 Requires=containerd.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -141,6 +142,8 @@ Group=root
 ExecStart=` + quoteArguments(helperArguments) + `
 StandardOutput=journal
 StandardError=journal
+Restart=on-failure
+RestartSec=250ms
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectHome=true
