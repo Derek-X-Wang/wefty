@@ -30,6 +30,8 @@ const (
 
 type logRecordKind uint8
 
+var errCorruptLogRecord = errors.New("corrupt OCI log record")
+
 const (
 	logRecordData logRecordKind = iota
 	logRecordSeal
@@ -273,12 +275,12 @@ func readLogRecord(reader io.Reader) (logRecordKind, uint64, []byte, error) {
 	case logIncompleteMagic:
 		kind = logRecordIncomplete
 	default:
-		return 0, 0, nil, errors.New("OCI log segment has invalid frame magic")
+		return 0, 0, nil, fmt.Errorf("%w: invalid frame magic", errCorruptLogRecord)
 	}
 	sequence := binary.BigEndian.Uint64(header[4:12])
 	length := binary.BigEndian.Uint32(header[12:16])
 	if length > MaxFrameBytes {
-		return 0, 0, nil, errors.New("OCI log segment frame exceeds protocol bound")
+		return 0, 0, nil, fmt.Errorf("%w: frame exceeds protocol bound", errCorruptLogRecord)
 	}
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(reader, payload); err != nil {
@@ -286,7 +288,7 @@ func readLogRecord(reader io.Reader) (logRecordKind, uint64, []byte, error) {
 	}
 	want := sha256.Sum256(payload)
 	if !equalBytes(header[16:], want[:]) {
-		return 0, 0, nil, errors.New("OCI log segment frame checksum mismatch")
+		return 0, 0, nil, fmt.Errorf("%w: frame checksum mismatch", errCorruptLogRecord)
 	}
 	return kind, sequence, payload, nil
 }

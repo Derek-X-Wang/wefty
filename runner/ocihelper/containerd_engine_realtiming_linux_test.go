@@ -791,6 +791,127 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	}
 }
 
+func TestNativeLinuxSweepClearsLostAttemptLogSpoolAndPopulatedCgroup(t *testing.T) {
+	helperSocket := os.Getenv("WEFTY_OCI_HELPER_SOCKET")
+	helperChecksum := os.Getenv("WEFTY_OCI_HELPER_CHECKSUM")
+	reference := os.Getenv("WEFTY_OCI_ECHO_REFERENCE")
+	archivePath := os.Getenv("WEFTY_OCI_ECHO_ARCHIVE")
+	if helperSocket == "" || helperChecksum == "" || reference == "" || archivePath == "" {
+		t.Fatal("Linux OCI lost-attempt sweep provisioning is incomplete")
+	}
+	client := ocihelper.NewUnixClient(helperSocket, helperChecksum)
+	client.HeartbeatInterval = time.Second
+	barrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{NodeID: "native-flake-node", BootSessionID: "native-flake-boot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer barrier.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	adapter := ocirunner.NewAdapter(barrier)
+	image := loadNativeImageArchive(t, ctx, adapter, reference, archivePath)
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := ocihelper.AttemptAuthority{NodeID: "native-flake-node", BootSessionID: "native-flake-boot", JobID: "lost-attempt-job", AttemptID: "lost-attempt", FencingToken: "lost-attempt-fence", Class: "one-shot", RemovalGeneration: "attempt"}
+	identity, err := ocihelper.DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Run(ctx, ocihelper.RunRequest{
+		Authority: authority, InitialDeadman: 10 * time.Second,
+		Workload: ocihelper.WorkloadInput{
+			ImageReference: reference, ImageDigest: image.TopLevelDigest,
+			Argv: []string{"/bin/sh", "-c", "while true; do printf 'lost-attempt-log\\n'; sleep .05; done"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	requestRootFault(t, "save-attempt-record:"+identity.ContainerID)
+	sweepStarted := time.Now()
+	sweepBound := session.Handshake().ReapTimeout
+	requestRootFault(t, "kill-helper")
+	startupSweepToTakeoverStarted := time.Now()
+	barrier.Invalidate()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatalf("sweep runtime after helper loss: %v", err)
+	}
+	startupSweepToTakeoverElapsed := time.Since(startupSweepToTakeoverStarted)
+	sweepElapsed := time.Since(sweepStarted)
+	receipt, ok := barrier.SweepReceipt()
+	if !ok || !receipt.VerifiedAbsent || len(receipt.VerifiedRetained.Cgroups) != 0 || !slices.Contains(receipt.SweptInventory.LogSegments, identity.LogSegmentDirectory) || !slices.Contains(receipt.SweptInventory.Cgroups, identity.CgroupID) {
+		t.Fatalf("lost-attempt sweep receipt = %+v present=%t", receipt, ok)
+	}
+	var logEvidence *ocihelper.SweepEvidence
+	for index := range receipt.SweepEvidence {
+		evidence := &receipt.SweepEvidence[index]
+		if evidence.Class == ocihelper.RemovalResourceLogSegments && evidence.ID == identity.LogSegmentDirectory {
+			logEvidence = evidence
+		}
+	}
+	if logEvidence == nil || logEvidence.Duration > sweepBound {
+		t.Fatalf("lost-attempt typed log sweep evidence=%+v bound=%s", logEvidence, sweepBound)
+	}
+	t.Logf("lost-attempt sweep completed in %s (startup sweep to takeover %s) with log=%+v", sweepElapsed, startupSweepToTakeoverElapsed, logEvidence)
+
+	requestRootFault(t, "restore-populated-cgroup:"+identity.ContainerID+":"+identity.CgroupID)
+	cgroupSweepStarted := time.Now()
+	barrier.Invalidate()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatalf("sweep restored populated cgroup: %v", err)
+	}
+	cgroupSweepElapsed := time.Since(cgroupSweepStarted)
+	cgroupReceipt, ok := barrier.SweepReceipt()
+	if !ok || !cgroupReceipt.VerifiedAbsent || !slices.Contains(cgroupReceipt.SweptInventory.Cgroups, identity.CgroupID) {
+		t.Fatalf("restored populated cgroup receipt = %+v present=%t", cgroupReceipt, ok)
+	}
+	var cgroupEvidence *ocihelper.SweepEvidence
+	for index := range cgroupReceipt.SweepEvidence {
+		evidence := &cgroupReceipt.SweepEvidence[index]
+		if evidence.Class == ocihelper.RemovalResourceCgroup && evidence.ID == identity.CgroupID {
+			cgroupEvidence = evidence
+		}
+	}
+	if cgroupEvidence == nil || cgroupEvidence.Method == "" || len(cgroupEvidence.PIDs) == 0 || cgroupEvidence.Duration > sweepBound {
+		t.Fatalf("lost-attempt typed cgroup sweep evidence=%+v bound=%s", cgroupEvidence, sweepBound)
+	}
+
+	requestRootFault(t, "restore-never-seal-log:"+identity.ContainerID+":"+identity.LogSegmentDirectory)
+	barrier.Invalidate()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatalf("retain never-sealing lost-attempt spool: %v", err)
+	}
+	retentionReceipt, ok := barrier.SweepReceipt()
+	if !ok || !retentionReceipt.VerifiedAbsent || !slices.Contains(retentionReceipt.VerifiedRetained.LogSegments, identity.LogSegmentDirectory) {
+		t.Fatalf("never-sealing lost-attempt receipt = %+v present=%t", retentionReceipt, ok)
+	}
+	var logRetention *ocihelper.DurableRetention
+	for index := range retentionReceipt.DurableRetentions {
+		candidate := &retentionReceipt.DurableRetentions[index]
+		if candidate.Class == ocihelper.RemovalResourceLogSegments && candidate.ID == identity.LogSegmentDirectory {
+			logRetention = candidate
+		}
+	}
+	if logRetention == nil || logRetention.AttemptID != authority.AttemptID || logRetention.Reason != ocihelper.DurableRetentionReasonLogSpoolSealing || logRetention.Bound <= 0 || !logRetention.Deadline.Equal(logRetention.RecordedAt.Add(logRetention.Bound)) {
+		t.Fatalf("never-sealing lost-attempt retention = %+v", logRetention)
+	}
+	requestRootFault(t, "remove-lost-log:"+identity.ContainerID+":"+identity.LogSegmentDirectory)
+	barrier.Invalidate()
+	if err := barrier.Ensure(ctx); err != nil {
+		t.Fatalf("clean never-sealing lost-attempt fixture: %v", err)
+	}
+	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
+		evidence := fmt.Sprintf("lost_attempt_id=%s\nlost_attempt_log_segment=%s\npopulated_cgroup=%s\nkill_helper_to_takeover_elapsed=%s\nstartup_sweep_to_takeover_elapsed=%s\ncgroup_sweep_elapsed=%s\nsweep_bound=%s\nlog_action=%s\nlog_duration=%s\ncgroup_action=%s\ncgroup_method=%s\ncgroup_pids=%v\ncgroup_duration=%s\nretention_reason=%s\nretention_bound=%s\nretention_deadline=%s\nunbound_cgroup_operator_guidance=unbound wefty-shaped cgroup; not helper-owned; remove manually or bind\nverified_absent=true\n", authority.AttemptID, identity.LogSegmentDirectory, identity.CgroupID, sweepElapsed, startupSweepToTakeoverElapsed, cgroupSweepElapsed, sweepBound, logEvidence.Action, logEvidence.Duration, cgroupEvidence.Action, cgroupEvidence.Method, cgroupEvidence.PIDs, cgroupEvidence.Duration, logRetention.Reason, logRetention.Bound, logRetention.Deadline.Format(time.RFC3339Nano))
+		if err := os.WriteFile(filepath.Join(evidenceDirectory, "lost-attempt-sweep.txt"), []byte(evidence), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 var nativeBarrierLossSequence atomic.Uint64
 
 func recordNativeBarrierLoss(generation ocihelper.HelperSession, barrierStartedAt time.Time, barrierReadyUnixNano int64, lossErr error) error {

@@ -297,8 +297,8 @@ func (server *Server) sweepAndVerifyStartup(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("startup verify OCI runtime namespace: %w", err)
 	}
-	if verification.Absent != InventoryEmpty(verification.RuntimeResidue) {
-		return namespaceResidueError("startup verify OCI runtime namespace", verification)
+	if err := validateNamespaceVerification("startup verify OCI runtime namespace", verification); err != nil {
+		return err
 	}
 	if !verification.Absent {
 		return namespaceResidueError("startup verify OCI runtime namespace", verification)
@@ -1549,7 +1549,11 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			server.createSweep.Lock()
 		}
 		response, err := server.engine.Verify(operation.ctx, body)
-		if err == nil && body.Scope == VerifyNamespace && response.Absent {
+		validationErr := err
+		if validationErr == nil {
+			validationErr = validateNamespaceVerification("verify OCI runtime state", response)
+		}
+		if validationErr == nil && body.Scope == VerifyNamespace && response.Absent {
 			session.mu.Lock()
 			if session.sweepPending {
 				session.sweepPending = false
@@ -1561,7 +1565,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if body.Scope == VerifyNamespace {
 			server.createSweep.Unlock()
 		}
-		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, validationErr)
 	case MethodSweep:
 		var body SweepRequest
 		if !decodeRequest(wire, request.Body, &body) {
@@ -1588,6 +1592,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, carriedSweep.PriorBootSessionsSeen...)
 				response.Inventory = mergeResourceInventory(response.Inventory, carriedSweep.Inventory)
 				response.Attempts = mergeSweepAttempts(response.Attempts, carriedSweep.Attempts)
+				response.DurableRetentions = mergeDurableRetentions(response.DurableRetentions, carriedSweep.DurableRetentions)
+				response.Evidence = append(response.Evidence, carriedSweep.Evidence...)
 			}
 			server.sessionMu.Lock()
 			startup := server.startupSweep
@@ -1606,12 +1612,16 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, startup.PriorBootSessionsSeen...)
 				response.Inventory = mergeResourceInventory(response.Inventory, startup.Inventory)
 				response.Attempts = mergeSweepAttempts(response.Attempts, startup.Attempts)
+				response.DurableRetentions = mergeDurableRetentions(response.DurableRetentions, startup.DurableRetentions)
+				response.Evidence = append(response.Evidence, startup.Evidence...)
 			}
 			if sessionReap != nil {
 				response.Removed += sessionReap.Removed
 				response.PriorBootSessionsSeen = append(response.PriorBootSessionsSeen, sessionReap.PriorBootSessionsSeen...)
 				response.Inventory = mergeResourceInventory(response.Inventory, sessionReap.Inventory)
 				response.Attempts = mergeSweepAttempts(response.Attempts, sessionReap.Attempts)
+				response.DurableRetentions = mergeDurableRetentions(response.DurableRetentions, sessionReap.DurableRetentions)
+				response.Evidence = append(response.Evidence, sessionReap.Evidence...)
 			}
 			slices.SortFunc(response.PriorBootSessionsSeen, compareSessionIdentity)
 			response.PriorBootSessionsSeen = slices.Compact(response.PriorBootSessionsSeen)
@@ -1762,7 +1772,20 @@ func mergeSweepResponsePointer(target *SweepResponse, addition SweepResponse) *S
 	target.PriorBootSessionsSeen = append(target.PriorBootSessionsSeen, addition.PriorBootSessionsSeen...)
 	target.Inventory = mergeResourceInventory(target.Inventory, addition.Inventory)
 	target.Attempts = mergeSweepAttempts(target.Attempts, addition.Attempts)
+	target.DurableRetentions = mergeDurableRetentions(target.DurableRetentions, addition.DurableRetentions)
+	target.Evidence = append(target.Evidence, addition.Evidence...)
 	return target
+}
+
+func mergeDurableRetentions(left, right []DurableRetention) []DurableRetention {
+	merged := append(slices.Clone(left), right...)
+	slices.SortFunc(merged, func(left, right DurableRetention) int {
+		if order := strings.Compare(string(left.Class), string(right.Class)); order != 0 {
+			return order
+		}
+		return strings.Compare(left.ID, right.ID)
+	})
+	return slices.CompactFunc(merged, func(left, right DurableRetention) bool { return left.Class == right.Class && left.ID == right.ID })
 }
 
 func mergeSweepAttempts(left, right []SweptAttemptAuthority) []SweptAttemptAuthority {
@@ -1902,6 +1925,7 @@ func engineFailureRPC(method Method, message string, reason EngineFailureReason,
 }
 
 func engineFailureReason(err error) EngineFailureReason {
+	var retentionBound interface{ RetentionBoundExceeded() bool }
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return EngineFailureDeadlineExceeded
@@ -1909,6 +1933,8 @@ func engineFailureReason(err error) EngineFailureReason {
 		return EngineFailureCanceled
 	case errors.Is(err, os.ErrPermission):
 		return EngineFailurePermissionDenied
+	case errors.As(err, &retentionBound) && retentionBound.RetentionBoundExceeded():
+		return EngineFailureRetentionBound
 	default:
 		return EngineFailureOperationFailed
 	}

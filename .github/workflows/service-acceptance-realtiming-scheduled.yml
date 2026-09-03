@@ -302,6 +302,7 @@ jobs:
           sudo install --directory --mode=0777 /tmp/wefty-oci-faults
           sudo mkfifo /tmp/wefty-oci-faults/control
           sudo chmod 0666 /tmp/wefty-oci-faults/control
+          sudo install --owner=root --group=root --mode=0755 scripts/oci-lost-attempt-fault.sh /usr/local/libexec/wefty-oci-lost-attempt-fault
           sudo tee /usr/local/libexec/wefty-oci-fault-supervisor >/dev/null <<'SCRIPT'
           #!/bin/sh
           set -eu
@@ -381,6 +382,11 @@ jobs:
                   ;;
                 enable-registry)
                   iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT
+                  ;;
+                save-attempt-record:wefty-container-*|restore-never-seal-log:wefty-container-*:wefty-log-segments-*|restore-populated-cgroup:wefty-container-*:wefty-cgroup-*|remove-lost-log:wefty-container-*:wefty-log-segments-*)
+                  if ! /usr/local/libexec/wefty-oci-lost-attempt-fault "$action" 2> "/tmp/wefty-oci-faults/$action.failed"; then
+                    continue
+                  fi
                   ;;
                 assert-computer-clean:wefty-log-segments-*)
                   name="${action#assert-computer-clean:}"

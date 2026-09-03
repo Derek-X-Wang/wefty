@@ -529,6 +529,9 @@ func (session *Session) ExportComputerCustody(ctx context.Context, request Expor
 func (session *Session) Verify(ctx context.Context, request VerifyRequest) (VerifyResponse, error) {
 	var response VerifyResponse
 	err := session.call(ctx, MethodVerify, request, &response)
+	if err == nil {
+		err = validateNamespaceVerification("verify OCI runtime state", response)
+	}
 	return response, err
 }
 

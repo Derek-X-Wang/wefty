@@ -1016,11 +1016,117 @@ func TestBootBarrierRefusesResidueAndNeverExposesSession(t *testing.T) {
 	}
 }
 
-func TestBootBarrierRefusesInconsistentResidueClassificationWithTypedError(t *testing.T) {
+func TestNamespaceResidueErrorNamesUnboundCgroupPathAndOperatorAction(t *testing.T) {
+	path := "system.slice-cri-wefty-cgroup-legacy.scope/child"
+	err := namespaceResidueError("verify OCI runtime namespace", VerifyResponse{
+		Absent:         false,
+		Inventory:      ResourceInventory{Cgroups: []string{path}},
+		RuntimeResidue: ResourceInventory{Cgroups: []string{path}},
+	})
+	message := err.Error()
+	if !strings.Contains(message, path) || !strings.Contains(message, "unbound wefty-shaped cgroup; not helper-owned; remove manually or bind") {
+		t.Fatalf("unbound cgroup operator outcome = %q", message)
+	}
+}
+
+func TestBootBarrierDefaultTakeoverReservesAStartupReapWindow(t *testing.T) {
+	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{})
+	defer stop()
+	barrier, err := NewBootBarrier(client, testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if barrier.config.TakeoverTimeout != 2*defaultReapTimeout {
+		t.Fatalf("default takeover timeout = %s, want startup reap plus admission reap %s", barrier.config.TakeoverTimeout, 2*defaultReapTimeout)
+	}
+}
+
+func TestBootBarrierTakeoverIncludesSlowStartupAndAdmissionSweeps(t *testing.T) {
+	const (
+		reapTimeout     = 500 * time.Millisecond
+		startupDuration = reapTimeout - 75*time.Millisecond
+		responseDelay   = 125 * time.Millisecond
+	)
+	for _, test := range []struct {
+		name            string
+		takeoverTimeout time.Duration
+		wantReady       bool
+	}{
+		{name: "former one-reap window expires", takeoverTimeout: reapTimeout},
+		{name: "derived two-reap window passes", takeoverTimeout: takeoverTimeoutForReap(reapTimeout), wantReady: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine := newFakeEngine()
+			engine.sweepEntered = make(chan struct{})
+			engine.releaseSweep = make(chan struct{})
+			client, stop := startTestServer(t, engine, ServerConfig{ReapTimeout: reapTimeout})
+			defer stop()
+			baseDial := client.Dial
+			client.Dial = func(ctx context.Context) (net.Conn, error) {
+				connection, err := baseDial(ctx)
+				if err != nil {
+					return nil, err
+				}
+				return newDelayedFirstResponseConn(connection, responseDelay), nil
+			}
+			barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+				TakeoverTimeout:     test.takeoverTimeout,
+				TakeoverReapTimeout: reapTimeout,
+				TakeoverRetry:       time.Millisecond,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			releaseStartup := engine.releaseSweep
+			go func() {
+				<-engine.sweepEntered
+				engine.mu.Lock()
+				engine.sweepEntered = nil
+				engine.releaseSweep = nil
+				engine.mu.Unlock()
+				time.Sleep(startupDuration)
+				close(releaseStartup)
+			}()
+			err = barrier.Ensure(t.Context())
+			if test.wantReady {
+				if err != nil || !barrier.Ready() {
+					t.Fatalf("two-reap takeover did not publish authority: ready=%t err=%v", barrier.Ready(), err)
+				}
+				t.Logf("GREEN: derived two-reap takeover published authority after startup=%s and handshake delay=%s", startupDuration, responseDelay)
+			} else if err == nil || barrier.Ready() {
+				t.Fatalf("one-reap takeover unexpectedly survived startup=%s plus handshake=%s", startupDuration, responseDelay)
+			} else {
+				t.Logf("RED: former one-reap takeover refused authority after startup=%s and handshake delay=%s: %v", startupDuration, responseDelay, err)
+			}
+			_ = barrier.Close()
+		})
+	}
+}
+
+func TestBootBarrierRejectsAdvertisedReapTimeoutAboveTakeoverDerivation(t *testing.T) {
+	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{ReapTimeout: defaultReapTimeout + time.Second})
+	defer stop()
+	barrier, err := NewBootBarrier(client, testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var mismatch *ReapTimeoutConfigurationError
+	if !errors.As(err, &mismatch) || mismatch.AdvertisedReapTimeout != defaultReapTimeout+time.Second || mismatch.TakeoverReapTimeout != defaultReapTimeout || barrier.Ready() {
+		t.Fatalf("reap-timeout mismatch = %+v err=%v ready=%t", mismatch, err, barrier.Ready())
+	}
+}
+
+func TestServerAndBootBarrierRefuseInconsistentResidueClassification(t *testing.T) {
 	for _, verification := range []VerifyResponse{
 		{Absent: true, Inventory: ResourceInventory{ComputerDiskAnomalies: []string{"disk:allocation_mismatch"}}, RuntimeResidue: ResourceInventory{ComputerDiskAnomalies: []string{"disk:allocation_mismatch"}}},
 		{Absent: false, Inventory: ResourceInventory{Containers: []string{"observed-without-classification"}}},
 	} {
+		validationErr := validateNamespaceVerification("server Verify", verification)
+		var classification *ResidueClassificationError
+		if !errors.As(validationErr, &classification) {
+			t.Fatalf("inconsistent verification did not produce typed classification error: %v", validationErr)
+		}
 		engine := newFakeEngine()
 		engine.verifyResponses = []VerifyResponse{{Absent: true}, verification}
 		client, stop := startTestServer(t, engine, ServerConfig{})
@@ -1030,8 +1136,8 @@ func TestBootBarrierRefusesInconsistentResidueClassificationWithTypedError(t *te
 			t.Fatal(err)
 		}
 		err = barrier.Ensure(t.Context())
-		var classification *ResidueClassificationError
-		if !errors.As(err, &classification) {
+		var rpcErr *RPCError
+		if !errors.As(err, &rpcErr) || rpcErr.Code != CodeEngineFailure || rpcErr.EngineFailure == nil || rpcErr.EngineFailure.Operation != MethodVerify || barrier.Ready() {
 			stop()
 			t.Fatalf("inconsistent verification error = %v", err)
 		}
@@ -1076,6 +1182,44 @@ func TestBootBarrierReceiptsRetainedHandoffInventoryWithoutCallingItResidue(t *t
 	}
 }
 
+func TestNamespaceVerificationRequiresExactLogRetentionOwnerAndReason(t *testing.T) {
+	const logSegment = "wefty-log-segments-0123456789abcdef0123456789abcdef"
+	verification := VerifyResponse{
+		Absent:          true,
+		Inventory:       ResourceInventory{LogSegments: []string{logSegment}},
+		DurableRetained: ResourceInventory{LogSegments: []string{logSegment}},
+	}
+	if err := validateNamespaceVerification("test verify", verification); err == nil || !strings.Contains(err.Error(), "lack exact bindings") {
+		t.Fatalf("unbound retained log segment = %v", err)
+	}
+	recordedAt := time.Unix(1_000, 0).UTC()
+	verification.DurableRetentions = []DurableRetention{{
+		Class: RemovalResourceLogSegments, ID: logSegment,
+		Owner: DurableRetentionOwnerOCIHelper, Reason: DurableRetentionReasonLogSpoolSealing,
+		AttemptID: "attempt-1", State: DurableRetentionStateUnsealed, Bound: time.Minute,
+		RecordedAt: recordedAt, Deadline: recordedAt.Add(time.Minute),
+	}}
+	if err := validateNamespaceVerification("test verify", verification); err != nil {
+		t.Fatalf("exact retained log binding rejected: %v", err)
+	}
+	verification.DurableRetentions[0].Reason = "unknown"
+	if err := validateNamespaceVerification("test verify", verification); err == nil || !strings.Contains(err.Error(), "invalid durable-retention binding") {
+		t.Fatalf("unknown retained log reason = %v", err)
+	}
+}
+
+func TestNamespaceVerificationRequiresExactDisjointPartition(t *testing.T) {
+	const container = "wefty-container-0123456789abcdef0123456789abcdef"
+	for _, verification := range []VerifyResponse{
+		{Absent: true, Inventory: ResourceInventory{Containers: []string{container}}},
+		{Absent: false, Inventory: ResourceInventory{Containers: []string{container}}, RuntimeResidue: ResourceInventory{Containers: []string{container}}, DurableRetained: ResourceInventory{Containers: []string{container}}},
+	} {
+		if err := validateNamespaceVerification("test verify", verification); err == nil || !strings.Contains(err.Error(), "exact disjoint") {
+			t.Fatalf("invalid inventory partition accepted: %+v err=%v", verification, err)
+		}
+	}
+}
+
 func TestHelperRestartSweepsAndVerifiesBeforeAcceptingSession(t *testing.T) {
 	engine := newFakeEngine()
 	engine.sweepEntered = make(chan struct{})
@@ -1107,7 +1251,7 @@ func TestHelperRestartSweepsAndVerifiesBeforeAcceptingSession(t *testing.T) {
 
 func TestHelperStartupResidueFailsServeBeforeSessionAuthority(t *testing.T) {
 	engine := newFakeEngine()
-	engine.verifyResponses = []VerifyResponse{{Absent: false, RuntimeResidue: ResourceInventory{Leases: []string{"wefty-residue"}}}}
+	engine.verifyResponses = []VerifyResponse{{Absent: false, Inventory: ResourceInventory{Leases: []string{"wefty-residue"}}, RuntimeResidue: ResourceInventory{Leases: []string{"wefty-residue"}}}}
 	server, err := NewServer(engine, ServerConfig{
 		HelperChecksum: "checksum-test", AllowedUIDs: []uint32{uint32(os.Getuid())},
 	})
@@ -2836,6 +2980,45 @@ type fakeEngine struct {
 	exportCustodyResponse    ExportComputerCustodyResponse
 }
 
+type delayedFirstResponseConn struct {
+	net.Conn
+	delay     time.Duration
+	mu        sync.Mutex
+	delayed   bool
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newDelayedFirstResponseConn(connection net.Conn, delay time.Duration) *delayedFirstResponseConn {
+	return &delayedFirstResponseConn{Conn: connection, delay: delay, closed: make(chan struct{})}
+}
+
+func (connection *delayedFirstResponseConn) Read(buffer []byte) (int, error) {
+	count, err := connection.Conn.Read(buffer)
+	connection.mu.Lock()
+	first := !connection.delayed && count > 0
+	if first {
+		connection.delayed = true
+	}
+	connection.mu.Unlock()
+	if !first {
+		return count, err
+	}
+	timer := time.NewTimer(connection.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return count, err
+	case <-connection.closed:
+		return 0, net.ErrClosed
+	}
+}
+
+func (connection *delayedFirstResponseConn) Close() error {
+	connection.closeOnce.Do(func() { close(connection.closed) })
+	return connection.Conn.Close()
+}
+
 type blockingRemovalInventoryEngine struct {
 	*fakeEngine
 	entered   chan struct{}
@@ -3060,7 +3243,7 @@ func (engine *retainedHandoffEngine) Verify(context.Context, VerifyRequest) (Ver
 	if name == "" {
 		return VerifyResponse{Absent: true}, nil
 	}
-	return VerifyResponse{Absent: true, Inventory: ResourceInventory{ManagedVolumes: []string{name}}}, nil
+	return VerifyResponse{Absent: true, Inventory: ResourceInventory{ManagedVolumes: []string{name}}, DurableRetained: ResourceInventory{ManagedVolumes: []string{name}}}, nil
 }
 
 func (engine *retainedHandoffEngine) handoffName() string {
@@ -3133,7 +3316,7 @@ func (engine *crashBoundaryEngine) Verify(context.Context, VerifyRequest) (Verif
 	inventory := engine.inventoryLocked()
 	absent := InventoryEmpty(inventory)
 	engine.stateMu.Unlock()
-	return VerifyResponse{Absent: absent, Inventory: inventory}, nil
+	return VerifyResponse{Absent: absent, Inventory: inventory, RuntimeResidue: inventory}, nil
 }
 
 func (engine *crashBoundaryEngine) inventoryLocked() ResourceInventory {
@@ -3433,6 +3616,7 @@ func (engine *fakeEngine) Sweep(context.Context, SweepRequest) (SweepResponse, e
 	}
 	return SweepResponse{Removed: 1}, nil
 }
+
 func (engine *fakeEngine) DialAttemptPort(_ context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
 	engine.record("DialAttemptPort")
 	engine.mu.Lock()

@@ -11,20 +11,35 @@ import (
 
 const defaultTakeoverRetryInterval = 25 * time.Millisecond
 
+func takeoverTimeoutForReap(reapTimeout time.Duration) time.Duration {
+	return reapTimeout + reapTimeout
+}
+
 type BootBarrierConfig struct {
-	Clock           Clock
-	TakeoverTimeout time.Duration
-	TakeoverRetry   time.Duration
+	Clock               Clock
+	TakeoverTimeout     time.Duration
+	TakeoverReapTimeout time.Duration
+	TakeoverRetry       time.Duration
+}
+
+type ReapTimeoutConfigurationError struct {
+	AdvertisedReapTimeout time.Duration
+	TakeoverReapTimeout   time.Duration
+}
+
+func (err *ReapTimeoutConfigurationError) Error() string {
+	return fmt.Sprintf("OCI helper reap timeout configuration mismatch: advertised=%s takeover_derived_from=%s", err.AdvertisedReapTimeout, err.TakeoverReapTimeout)
 }
 
 // NamespaceResidueError preserves the distinction between resources that
 // block OCI admission and durable resources intentionally retained across a
 // quiescent namespace verification.
 type NamespaceResidueError struct {
-	Operation       string
-	Observed        ResourceInventory
-	RuntimeResidue  ResourceInventory
-	DurableRetained ResourceInventory
+	Operation         string
+	Observed          ResourceInventory
+	RuntimeResidue    ResourceInventory
+	DurableRetained   ResourceInventory
+	DurableRetentions []DurableRetention
 }
 
 // ResidueClassificationError means an engine returned an absence verdict that
@@ -42,21 +57,79 @@ func (err *ResidueClassificationError) Error() string {
 }
 
 func (err *NamespaceResidueError) Error() string {
-	return fmt.Sprintf("%s: residue remains after sweep: runtime=%+v durable_retained=%+v observed=%+v", err.Operation, err.RuntimeResidue, err.DurableRetained, err.Observed)
+	cgroupGuidance := ""
+	if len(err.RuntimeResidue.Cgroups) > 0 {
+		cgroupGuidance = fmt.Sprintf(" unbound_cgroups={paths:%v reason:%q}", err.RuntimeResidue.Cgroups, "unbound wefty-shaped cgroup; not helper-owned; remove manually or bind")
+	}
+	return fmt.Sprintf("%s: residue remains after sweep: runtime=%+v durable_retained=%+v retention_bindings=%+v observed=%+v%s", err.Operation, err.RuntimeResidue, err.DurableRetained, err.DurableRetentions, err.Observed, cgroupGuidance)
 }
 
-func namespaceResidueError(operation string, verification VerifyResponse) error {
+func validateNamespaceVerification(operation string, verification VerifyResponse) error {
 	if verification.Absent != InventoryEmpty(verification.RuntimeResidue) {
 		return &ResidueClassificationError{
 			Operation: operation, Absent: verification.Absent,
 			Observed: cloneResourceInventory(verification.Inventory), RuntimeResidue: cloneResourceInventory(verification.RuntimeResidue),
 		}
 	}
+	observed := mergeResourceInventory(ResourceInventory{}, verification.Inventory)
+	residue := mergeResourceInventory(ResourceInventory{}, verification.RuntimeResidue)
+	retained := mergeResourceInventory(ResourceInventory{}, verification.DurableRetained)
+	partition := mergeResourceInventory(residue, retained)
+	if !inventoryIdentitySetsEqual(observed, partition) || !inventoryPartitionsDisjoint(residue, retained) {
+		return fmt.Errorf("%s: observed inventory is not the exact disjoint runtime-residue/durable-retained partition: observed=%+v runtime=%+v durable_retained=%+v", operation, observed, residue, retained)
+	}
+	retainedTransient := append(slices.Clone(verification.DurableRetained.LogSegments), verification.DurableRetained.Cgroups...)
+	slices.Sort(retainedTransient)
+	boundTransient := make([]string, 0, len(verification.DurableRetentions))
+	for _, retention := range verification.DurableRetentions {
+		validClassReason := retention.Class == RemovalResourceLogSegments && retention.Reason == DurableRetentionReasonLogSpoolSealing && retention.State == DurableRetentionStateUnsealed ||
+			retention.Class == RemovalResourceCgroup && retention.Reason == DurableRetentionReasonCgroupReaping && retention.State == DurableRetentionStatePopulated
+		if !validClassReason || retention.ID == "" || retention.AttemptID == "" || retention.Owner != DurableRetentionOwnerOCIHelper ||
+			retention.Bound <= 0 || retention.RecordedAt.IsZero() || retention.Deadline.IsZero() || !retention.Deadline.Equal(retention.RecordedAt.Add(retention.Bound)) {
+			return fmt.Errorf("%s: invalid durable-retention binding: %+v", operation, retention)
+		}
+		boundTransient = append(boundTransient, retention.ID)
+	}
+	slices.Sort(boundTransient)
+	if !slices.Equal(retainedTransient, boundTransient) {
+		return fmt.Errorf("%s: transient durable-retained resources lack exact bindings: retained=%v bindings=%v", operation, retainedTransient, boundTransient)
+	}
+	return nil
+}
+
+func inventoryIdentitySetsEqual(left, right ResourceInventory) bool {
+	return slices.Equal(left.Leases, right.Leases) && slices.Equal(left.Snapshots, right.Snapshots) &&
+		slices.Equal(left.Containers, right.Containers) && slices.Equal(left.Tasks, right.Tasks) &&
+		slices.Equal(left.Shims, right.Shims) && slices.Equal(left.Cgroups, right.Cgroups) &&
+		slices.Equal(left.LogSegments, right.LogSegments) && slices.Equal(left.ImageSpools, right.ImageSpools) &&
+		slices.Equal(left.ManagedVolumes, right.ManagedVolumes) && slices.Equal(left.ManagedVolumeRecords, right.ManagedVolumeRecords) &&
+		slices.Equal(left.ComputerDiskImages, right.ComputerDiskImages) && slices.Equal(left.ComputerDiskAllocations, right.ComputerDiskAllocations) &&
+		slices.Equal(left.ComputerDiskQuotas, right.ComputerDiskQuotas) && slices.Equal(left.ComputerDiskManifests, right.ComputerDiskManifests) &&
+		slices.Equal(left.ComputerDiskMounts, right.ComputerDiskMounts) && slices.Equal(left.ComputerDiskLoops, right.ComputerDiskLoops) &&
+		slices.Equal(left.ComputerAttachments, right.ComputerAttachments) && slices.Equal(left.ComputerResetManifests, right.ComputerResetManifests) &&
+		slices.Equal(left.ComputerQuarantines, right.ComputerQuarantines) && slices.Equal(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
+}
+
+func inventoryPartitionsDisjoint(left, right ResourceInventory) bool {
+	merged := mergeResourceInventory(left, right)
+	return inventoryIdentityCountPortable(merged) == inventoryIdentityCountPortable(left)+inventoryIdentityCountPortable(right)
+}
+
+func inventoryIdentityCountPortable(inventory ResourceInventory) int {
+	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) +
+		len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ImageSpools) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) +
+		len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) +
+		len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) +
+		len(inventory.ComputerQuarantines) + len(inventory.ComputerDiskAnomalies)
+}
+
+func namespaceResidueError(operation string, verification VerifyResponse) error {
 	return &NamespaceResidueError{
-		Operation:       operation,
-		Observed:        cloneResourceInventory(verification.Inventory),
-		RuntimeResidue:  cloneResourceInventory(verification.RuntimeResidue),
-		DurableRetained: cloneResourceInventory(verification.DurableRetained),
+		Operation:         operation,
+		Observed:          cloneResourceInventory(verification.Inventory),
+		RuntimeResidue:    cloneResourceInventory(verification.RuntimeResidue),
+		DurableRetained:   cloneResourceInventory(verification.DurableRetained),
+		DurableRetentions: slices.Clone(verification.DurableRetentions),
 	}
 }
 
@@ -90,8 +163,11 @@ func NewBootBarrierWithConfig(client *Client, request AcquireSessionRequest, con
 	if config.Clock == nil {
 		config.Clock = systemClock{}
 	}
+	if config.TakeoverReapTimeout <= 0 {
+		config.TakeoverReapTimeout = defaultReapTimeout
+	}
 	if config.TakeoverTimeout <= 0 {
-		config.TakeoverTimeout = defaultReapTimeout
+		config.TakeoverTimeout = takeoverTimeoutForReap(config.TakeoverReapTimeout)
 	}
 	if config.TakeoverRetry <= 0 {
 		config.TakeoverRetry = defaultTakeoverRetryInterval
@@ -181,6 +257,9 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 	if handshake.HelperInstanceID == "" || handshake.SessionGeneration == 0 || handshake.ReapTimeout <= 0 {
 		return errors.New("OCI helper handshake omitted barrier authority")
 	}
+	if handshake.ReapTimeout > barrier.config.TakeoverReapTimeout {
+		return &ReapTimeoutConfigurationError{AdvertisedReapTimeout: handshake.ReapTimeout, TakeoverReapTimeout: barrier.config.TakeoverReapTimeout}
+	}
 	barrierContext, barrierCancel := context.WithTimeout(ctx, handshake.ReapTimeout)
 	defer barrierCancel()
 	sweep, err := session.Sweep(barrierContext, SweepRequest{})
@@ -191,8 +270,8 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("verify OCI runtime namespace: %w", err)
 	}
-	if verification.Absent != InventoryEmpty(verification.RuntimeResidue) {
-		return namespaceResidueError("verify OCI runtime namespace", verification)
+	if err := validateNamespaceVerification("verify OCI runtime namespace", verification); err != nil {
+		return err
 	}
 	if !verification.Absent {
 		return namespaceResidueError("verify OCI runtime namespace", verification)
@@ -206,6 +285,8 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 		VerifiedInventory:     cloneResourceInventory(verification.Inventory),
 		VerifiedResidue:       cloneResourceInventory(verification.RuntimeResidue),
 		VerifiedRetained:      cloneResourceInventory(verification.DurableRetained),
+		DurableRetentions:     slices.Clone(verification.DurableRetentions),
+		SweepEvidence:         cloneSweepEvidence(sweep.Evidence),
 		Attempts:              slices.Clone(sweep.Attempts),
 	}
 	if receipt.SweepEpoch == "" {
@@ -309,8 +390,18 @@ func cloneVerifiedSweepReceipt(receipt VerifiedSweepReceipt) VerifiedSweepReceip
 	receipt.VerifiedInventory = cloneResourceInventory(receipt.VerifiedInventory)
 	receipt.VerifiedResidue = cloneResourceInventory(receipt.VerifiedResidue)
 	receipt.VerifiedRetained = cloneResourceInventory(receipt.VerifiedRetained)
+	receipt.DurableRetentions = slices.Clone(receipt.DurableRetentions)
+	receipt.SweepEvidence = cloneSweepEvidence(receipt.SweepEvidence)
 	receipt.Attempts = slices.Clone(receipt.Attempts)
 	return receipt
+}
+
+func cloneSweepEvidence(evidence []SweepEvidence) []SweepEvidence {
+	cloned := slices.Clone(evidence)
+	for index := range cloned {
+		cloned[index].PIDs = slices.Clone(cloned[index].PIDs)
+	}
+	return cloned
 }
 
 func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {

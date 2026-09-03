@@ -142,7 +142,7 @@ failed quiescence proof and does not authorize a namespace sweep.
 
 Unary `engine_failure` responses include only a closed mechanics fact naming
 the helper method and one sanitized reason (`deadline_exceeded`, `canceled`,
-`permission_denied`, or `operation_failed`). Raw privileged error text,
+`permission_denied`, `retention_bound_exceeded`, or `operation_failed`). Raw privileged error text,
 containerd types, and host paths remain local. The Computer reimage preflight
 may additionally report the fixed positive-detachment refusal so native
 evidence distinguishes that durable authority mismatch; the closed fact,
@@ -168,7 +168,18 @@ heartbeat deadline and reap rather than preempting it, then acquires exclusive
 authority and performs sweep plus verification. It reuses that proof only while
 the acquired session remains healthy; replacement authority always repeats the
 whole barrier and never adopts a survivor. Helper startup and client takeover
-are bounded by the configured reap deadline and the caller's earlier deadline.
+use separate bounds under the caller's earlier deadline. Startup sweep retains
+the unchanged ten-second reap bound. A client may connect into the Unix listen
+backlog, but its handshake blocks until the helper enters Accept after startup
+cleanup, so the default takeover window is `reap + reap` (20 seconds): one
+interval for the newly blocking startup work and one for takeover. After
+handshake, an advertised reap timeout above the ten-second value used for this
+derivation is a typed configuration error naming both values, never a silent
+desynchronization. This follows the measured 9.646-second kill-helper-to-
+takeover path and is re-observed by the lane's
+`startup_sweep_to_takeover_elapsed` receipt. The preferred design—answering
+handshakes during startup while gating admission on verified cleanup—is deferred
+to #301 because it changes startup concurrency and authority publication.
 The takeover retry timer uses the injected helper clock. The heartbeat pump
 notifies the barrier synchronously when control authority is lost.
 
@@ -176,7 +187,7 @@ Successful verification produces an immutable receipt retained by the client
 barrier. It names the sweep epoch and helper process/session generation and
 copies the prior boot sessions, class-separated swept inventory, independent
 post-sweep observed inventory, runtime-residue projection, durable-retained
-projection, and recovered `(removal_generation, attempt_id,
+projection, exact durable-retention bindings, and recovered `(removal_generation, attempt_id,
 fencing_token, prior_boot_session_id)` tuples. A helper-startup sweep is folded
 into the first session receipt so evidence is not discarded before session
 acquisition. This is evidence for the later runtime/removal adapter; this
@@ -536,6 +547,43 @@ io.wefty/class
 io.wefty/removal_generation
 ```
 
+Before task creation, the helper fsyncs a versioned Attempt-ownership record
+containing the complete seven-field authority and its derived resource
+identities. Labelled containerd metadata may reconstruct the same record before
+that metadata is deleted during sweep. A deterministic-looking name is never
+ownership: sweep mutates a log directory or cgroup only when the exact resource
+identity is bound by that durable record and the helper's locked registry says
+the Attempt is no longer live. It rechecks that registry immediately before
+each remove or KILL. An exact 32-hex collision without the binding, a binding
+for a live Attempt, a symlink, or a foreign-owned directory remains typed
+runtime residue; the helper fails closed instead of guessing ownership.
+Unexpected, unreadable, stale-version, or invalid ownership entries emit a
+typed `invalid_entry`, `unreadable`, or `invalid_record` operator outcome with
+`disposition=resources_unbound`; they cannot authorize removal and therefore do
+not turn any observed resource into retained state. Each Verify reads this
+directory once and uses that snapshot for its complete retention projection. A
+structurally valid unknown-version record is `unknown_version` and remains
+unbound until its named resources are absent, when Verify garbage-collects it;
+invalid records that cannot safely name resources remain operator-owned.
+
+After containerd teardown, sweep gives log sealing at most the configured
+five-second cap, further reduced to half of the usable time remaining before
+the caller's barrier deadline. Twenty percent of the then-remaining barrier
+time, capped at one second, is reserved for later cgroup/final-inventory and
+Verify work. Scanning resumes from the last complete framed-record offset on
+each poll, resets the offset after shrink or a changed first frame header, and
+checks cancellation inside the scan. A directory with neither frames file has nothing to seal and is
+removed immediately. A corrupt frame likewise has no trustworthy seal work
+left: sweep removes the spool with `method=corrupt_frames` evidence instead of
+failing the boot barrier. If the phase budget
+expires, sweep fsyncs and returns an exact retention receipt containing class,
+resource and Attempt IDs, observed `unsealed` state, owner, reason, recorded
+time, five-minute bound, and absolute deadline. Verify may classify that visible
+directory as durable retained only by reading the unexpired receipt; it never
+reconstructs retention from a name, UID, or bytes. A later sweep removes a
+sealed directory, and expiry of the five-minute bound forces removal with typed
+evidence or returns the typed `retention bound exceeded` operator outcome.
+
 Handoff volumes live under a distinct helper-owned durable root, not the
 attempt namespace. `Delete` reaps and verifies the attempt while retaining its
 handoff volume. Session reap and boot sweep likewise leave unexpired handoffs
@@ -543,8 +591,10 @@ intact; reuse refreshes the default 24-hour retry age, and sweep removes only
 expired direct children with the deterministic handoff prefix. Attempt and
 namespace quiescence therefore project only unexpired handoff volumes (the
 retained bindings) out of their absence decision. `Verify` returns the observed
-inventory unchanged alongside the exact runtime-residue and durable-retained
-projections, and the boot receipt records all three with `verified_absent`.
+inventory unchanged alongside the exact, disjoint runtime-residue and
+durable-retained projections. Every consumer of `Absent` validates that their
+union is exactly the observation, and the boot receipt records all three with
+`verified_absent`.
 Thus service data is durable-retained only while its paired owner record still
 matches the no-follow directory identity, and an unexpired handoff is retained
 only while its retention authority is live. An orphan directory, orphan owner
@@ -892,7 +942,44 @@ single total. All seven authority labels must reconstruct the deterministic
 identity exactly; unexpected containerd resources in namespace `wefty`, shim
 bundle entries under containerd's runtime-v2 state root, and cgroups found by a
 recursive scan of the configured cgroup hierarchy make absence verification
-fail. Filesystem and deletion errors are fatal except verified `NotFound`.
+fail. After containerd task deletion, sweep acts only on a cgroup bound to a
+durable LOST Attempt record. Observation remains broad for compatible CRI,
+systemd-composed, and pre-upgrade names containing `wefty-cgroup-`; inventory
+and sweep both descend through broad matches so an exact bound child cannot be
+hidden. Only the direct deterministic name and its single `.scope` form are
+sweepable. After a bound child is reaped, its broad wrapper is removed only when
+empty; a nonempty wrapper remains residue. The barrier names its relative path
+with the typed operator outcome `unbound wefty-shaped cgroup; not helper-owned;
+remove manually or bind`. With the live registry
+locked and rechecked, the helper sends `SIGKILL` through cgroup v2's
+`cgroup.kill` (falling back on open, write, or close `EOPNOTSUPP` to `SIGKILL`
+for every PID in the subtree), then removes directories bottom-up. This is
+helper cleanup of proven LOST authority, not service-stop policy: as stated
+above in the Attempt authority section, only the agent chooses TERM grace and
+KILL escalation for a live service.
+
+The cgroup wait uses the configured five-second task-release cap reduced to
+the usable barrier time remaining after the same twenty-percent/max-one-second
+Verify reserve. Budget expiry is not a generic sweep failure: it fsyncs a
+five-minute `cgroup_reaping` retention receipt with observed `populated` state,
+and Verify reads that receipt to classify the cgroup as durable retained. At
+retention expiry, sweep retries KILL/removal and either emits typed bound-reap
+evidence or returns `retention bound exceeded`. Every KILL receipt records the
+observed PID set, `cgroup.kill` versus `recursive_signal`, and duration. An
+unbound exact collision remains operator-visible runtime residue. Filesystem
+errors other than verified `NotFound` still fail closed.
+Attempt Delete gives this cgroup poll at most half of its remaining cleanup
+budget, leaving time for final verification. If the inventory needed to decide
+whether the ownership record is quiescent is temporarily unavailable, release
+succeeds with typed `inventory_retryable` evidence and keeps the record for a
+later Verify or sweep rather than converting observation failure into an
+attempt-release failure.
+
+`SweepResponse.removed` is the number of identities in the initial observed
+inventory that are absent from the final observed inventory. Retained resources
+are therefore not counted as removed. The response also carries durable
+retention receipts and typed per-resource sweep evidence; startup/session-reap
+folding preserves those fields in the client's verified receipt.
 Whole-namespace session reaping relies on the exclusive one-agent-per-node
 helper-session assumption, while volume deletion is scoped to identities
 recovered from swept attempts and never removes the whole `volumes/` tree.
