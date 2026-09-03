@@ -290,6 +290,11 @@ to form a truthful gap, the attempt is sealed with a typed incomplete-evidence
 tombstone instead of retrying forever. The reconciler sends the
 identical durable completion body and retains a matching post-lease result as
 typed L1 observation without delaying fresh service admission.
+For a healthy-lease hand-off, renewal is already stopped: logs still precede
+completion only while L1 reports the attempt live, but if the remaining lease
+expires mid-drain L1 seals by expiry without `completion_replay_attempt_id` and
+the reconciler's lost-at-L1 path is thereafter bounded to eight log batches per
+pass.
 
 The generic agent handoff manager remains the owner of process one-shot host
 directories. An OCI one-shot does not reinterpret the forbidden flat
