@@ -12,6 +12,8 @@ import (
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
+const maxEvidenceRecoveryWorkers = 8
+
 // evidenceOutbox owns durable evidence for the lifetime of the agent process.
 // Sessions borrow it; ending or replacing a session must not discard evidence
 // that still needs delivery.
@@ -24,10 +26,16 @@ type evidenceOutbox struct {
 	// completionStored is a test seam for ordering cancellation against the
 	// durable commit edge. Production construction leaves it nil.
 	completionStored func()
+	// recoveryAttemptFinished is a test seam for ordering a wake against the
+	// scheduler's active-attempt retirement edge. Production leaves it nil.
+	recoveryAttemptFinished func(string)
 
 	recoveryMu     sync.Mutex
 	recoveryCancel context.CancelFunc
 	recoveryWG     sync.WaitGroup
+	recoveryWake   chan struct{}
+	ownershipMu    sync.RWMutex
+	liveAttempts   map[string]struct{}
 }
 
 func newEvidenceOutbox(directory, nodeID string, maxBytes int64, clock Clock, batchSize int, flushInterval, retryInterval time.Duration) (*evidenceOutbox, error) {
@@ -38,6 +46,8 @@ func newEvidenceOutbox(directory, nodeID string, maxBytes int64, clock Clock, ba
 	return &evidenceOutbox{
 		spool: spool, clock: clock, batchSize: batchSize,
 		flushInterval: flushInterval, retryInterval: retryInterval,
+		recoveryWake: make(chan struct{}, 1),
+		liveAttempts: make(map[string]struct{}),
 	}, nil
 }
 
@@ -122,10 +132,112 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 
 	go func() {
 		defer outbox.recoveryWG.Done()
-		if err := outbox.recover(recoveryContext, client); err != nil && recoveryContext.Err() == nil && report != nil {
-			report(err)
+		type recoveryResult struct {
+			attemptID string
+			err       error
+		}
+		active := make(map[string]struct{})
+		dirty := make(map[string]struct{})
+		finished := make(chan recoveryResult)
+		launchPending := func() {
+			attempts, err := outbox.spool.pendingAttempts(recoveryContext)
+			if err != nil {
+				if recoveryContext.Err() == nil && report != nil {
+					report(err)
+				}
+				return
+			}
+			for _, attempt := range attempts {
+				if _, running := active[attempt.attemptID]; running {
+					dirty[attempt.attemptID] = struct{}{}
+					continue
+				}
+				if len(active) >= maxEvidenceRecoveryWorkers {
+					break
+				}
+				if outbox.attemptIsLive(attempt.attemptID) {
+					continue
+				}
+				active[attempt.attemptID] = struct{}{}
+				outbox.recoveryWG.Add(1)
+				go func(attempt logSpoolAttempt) {
+					defer outbox.recoveryWG.Done()
+					result := recoveryResult{attemptID: attempt.attemptID, err: outbox.recoverAttempt(recoveryContext, client, attempt)}
+					if outbox.recoveryAttemptFinished != nil {
+						outbox.recoveryAttemptFinished(attempt.attemptID)
+					}
+					select {
+					case finished <- result:
+					case <-recoveryContext.Done():
+					}
+				}(attempt)
+			}
+		}
+
+		launchPending()
+		for {
+			select {
+			case <-recoveryContext.Done():
+				return
+			case <-outbox.recoveryWake:
+				launchPending()
+			case result := <-finished:
+				delete(active, result.attemptID)
+				_, rescan := dirty[result.attemptID]
+				delete(dirty, result.attemptID)
+				if result.err != nil && recoveryContext.Err() == nil && report != nil {
+					report(fmt.Errorf("attempt %s: %w", result.attemptID, result.err))
+				}
+				if rescan || result.err == nil {
+					outbox.scheduleRecovery()
+				} else {
+					time.AfterFunc(outbox.retryInterval, outbox.scheduleRecovery)
+				}
+			}
 		}
 	}()
+}
+
+func (outbox *evidenceOutbox) ownAttempt(attemptID string) {
+	if outbox == nil {
+		return
+	}
+	outbox.ownershipMu.Lock()
+	outbox.liveAttempts[attemptID] = struct{}{}
+	outbox.ownershipMu.Unlock()
+}
+
+func (outbox *evidenceOutbox) releaseAttempt(attemptID string, reconcile bool) {
+	if outbox == nil {
+		return
+	}
+	outbox.ownershipMu.Lock()
+	delete(outbox.liveAttempts, attemptID)
+	outbox.ownershipMu.Unlock()
+	if reconcile {
+		outbox.scheduleRecovery()
+	}
+}
+
+func (outbox *evidenceOutbox) attemptIsLive(attemptID string) bool {
+	outbox.ownershipMu.RLock()
+	_, live := outbox.liveAttempts[attemptID]
+	outbox.ownershipMu.RUnlock()
+	return live
+}
+
+// scheduleRecovery wakes the process-lifetime outbox reconciler after the
+// attempt lifecycle has decided that a durable completion is eligible for L1
+// delivery. Persistence itself cannot wake recovery: OCI intent-stop may still
+// suppress an outcome that raced the local stop boundary.
+func (outbox *evidenceOutbox) scheduleRecovery() {
+	if outbox == nil {
+		return
+	}
+	select {
+	case outbox.recoveryWake <- struct{}{}:
+	default:
+	}
 }
 
 // recover fans replay out by attempt. A transient or poisoned old attempt can

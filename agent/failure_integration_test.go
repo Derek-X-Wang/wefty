@@ -281,6 +281,181 @@ func TestOCIIntentStopOutcomeWinsSuppressesRestartReplay(t *testing.T) {
 	restarted.Close()
 }
 
+func TestLostLeaseCompletionReconcilesAfterFreshServiceReadmission(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
+		"lease-loss-node": {Tags: []string{"lease-loss"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
+	}, time.Second)
+	defer stopServer()
+	agentFabric := network.NewFabric(fabric.Identity{NodeID: "lease-loss-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
+	client, err := newClient(agentFabric, "wefty://control-plane", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	registration := contract.NodeRegistration{
+		NodeID: "lease-loss-node", BootSessionID: "lease-loss-boot", OS: "linux", Architecture: "amd64", AgentVersion: "test",
+		Capabilities: map[string]bool{
+			"kind:process": true, "kind:oci": true, "runtime_handler:io.containerd.runc.v2": true,
+		},
+		CapabilityRevision: 1, CapabilityObservedAt: time.Now(), MissingCapabilities: []string{},
+	}
+	if _, err := client.Register(t.Context(), registration); err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := newEvidenceOutbox(t.TempDir(), registration.NodeID, 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+
+	// Seed one completion before startup and wait for its delivery. This proves
+	// the initial outbox snapshot finished before the lease-loss completion is
+	// inserted, reproducing the post-startup timing that used to strand it.
+	sentinelDirectory := t.TempDir()
+	if _, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "lease-loss-sentinel", Kind: contract.JobKindProcess,
+		Class: contract.JobClassOneShot, RoutingTags: []string{"lease-loss"},
+		Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"},
+			WorkingDirectory: sentinelDirectory, HandoffDirectory: sentinelDirectory},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sentinel, err := client.Claim(t.Context(), registration.NodeID, registration.BootSessionID, contract.JobClassOneShot)
+	if err != nil || sentinel == nil {
+		t.Fatalf("sentinel claim = %+v err=%v", sentinel, err)
+	}
+	if err := outbox.ensureAttempt(t.Context(), *sentinel); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 0
+	if err := outbox.storeCompletion(t.Context(), sentinel.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now(), l1.RuntimeQuiescenceAttempt); err != nil {
+		t.Fatal(err)
+	}
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
+	waitCompletionReceiptState(t, outbox, sentinel.Lease.AttemptID, "delivered", 3*time.Second)
+
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	service, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "lease-loss-service", Kind: contract.JobKindOCI,
+		Class: contract.JobClassService, Restart: contract.RestartAlways, RoutingTags: []string{"lease-loss"},
+		RuntimeHandler: "io.containerd.runc.v2", Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+			Image: contract.OCIImageSpec{Reference: "example.invalid/lease-loss:v1", Digest: &digest}, Argv: []string{"/payload"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := client.Claim(t.Context(), registration.NodeID, registration.BootSessionID, contract.JobClassService)
+	if err != nil || first == nil || first.Job.JobID != service.JobID {
+		t.Fatalf("first service claim = %+v err=%v", first, err)
+	}
+	observe := func(claim *l1.Claim) {
+		t.Helper()
+		observation := l1.ImageObservationRequest{
+			FencingToken: claim.Lease.FencingToken, SubmittedReference: "example.invalid/lease-loss:v1", TopLevelDigest: digest,
+			TopLevelMediaType: "application/vnd.oci.image.manifest.v1+json", PlatformManifestDigest: digest,
+			Platform: l1.OCIPlatform{OS: "linux", Architecture: "amd64"}, RuntimeHandler: "io.containerd.runc.v2", Snapshotter: "overlayfs",
+		}
+		if _, err := client.ObserveAttemptImage(t.Context(), claim.Job.JobID, claim.Lease.AttemptID, observation); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.StartAttempt(t.Context(), claim.Job.JobID, claim.Lease.AttemptID, l1.StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	observe(first)
+	if err := outbox.ensureAttempt(t.Context(), *first); err != nil {
+		t.Fatal(err)
+	}
+	completionFinishedAt := time.Now().UTC()
+	result := l1.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{
+		Code: contract.RuntimeFailureUnavailable, Message: "helper generation lost under load",
+	}}
+	if err := outbox.storeCompletion(t.Context(), first.Lease.AttemptID, result, completionFinishedAt, l1.RuntimeQuiescenceOCISweep); err != nil {
+		t.Fatal(err)
+	}
+
+	var lost l1.Attempt
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, _ = store.Reconcile(t.Context())
+		attempts, listErr := store.ListJobAttempts(t.Context(), service.JobID)
+		if listErr == nil && len(attempts) > 0 && attempts[0].State == contract.AttemptLost {
+			lost = attempts[0]
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("first attempt did not lose its lease: attempts=%+v err=%v", attempts, listErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	var second *l1.Claim
+	deadline = time.Now().Add(5 * time.Second)
+	for second == nil && time.Now().Before(deadline) {
+		second, err = client.Claim(t.Context(), registration.NodeID, registration.BootSessionID, contract.JobClassService)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if second == nil {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if second == nil || second.Lease.AttemptID == first.Lease.AttemptID {
+		t.Fatalf("fresh service claim = %+v after lost attempt %s", second, first.Lease.AttemptID)
+	}
+	observe(second)
+	freshRunning, err := store.GetJob(t.Context(), service.JobID)
+	if err != nil || freshRunning.State != contract.JobRunning || freshRunning.CurrentAttemptID != second.Lease.AttemptID {
+		t.Fatalf("fresh running service = %+v err=%v", freshRunning, err)
+	}
+
+	outbox.scheduleRecovery()
+	var late l1.Attempt
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		attempts, listErr := store.ListJobAttempts(t.Context(), service.JobID)
+		if listErr == nil && len(attempts) >= 2 && attempts[0].LateResult != nil {
+			late = attempts[0]
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lost attempt did not receive typed evidence: attempts=%+v err=%v", attempts, listErr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if late.LateResult.Kind != l1.LateResultObservation || !late.LateResult.Late || late.LateResult.Result == nil ||
+		late.LateResult.Result.RuntimeFailure == nil || late.LateResult.Result.RuntimeFailure.Code != contract.RuntimeFailureUnavailable {
+		t.Fatalf("lost-attempt evidence = %+v", late.LateResult)
+	}
+	freshElapsed := freshRunning.UpdatedAt.Sub(lost.UpdatedAt)
+	evidenceElapsed := late.LateResult.ObservedAt.Sub(late.LateResult.AuthorityLostAt)
+	const measuredRecoveryBound = 3 * time.Second
+	if freshElapsed < 0 || freshElapsed > measuredRecoveryBound || evidenceElapsed < 0 || evidenceElapsed > measuredRecoveryBound {
+		t.Fatalf("lease-loss timeline exceeded measured recovery bound %s: fresh=%s evidence=%s", measuredRecoveryBound, freshElapsed, evidenceElapsed)
+	}
+	waitCompletionReceiptState(t, outbox, first.Lease.AttemptID, "delivered", 3*time.Second)
+	t.Logf("lease-loss receipt: completion_finished=%s lease_lost=%s fresh_running=%s evidence_observed=%s fresh_elapsed=%s evidence_elapsed=%s measured_bound=%s production_lease=%s",
+		completionFinishedAt.Format(time.RFC3339Nano), lost.UpdatedAt.Format(time.RFC3339Nano), freshRunning.UpdatedAt.Format(time.RFC3339Nano),
+		late.LateResult.ObservedAt.Format(time.RFC3339Nano), freshElapsed, evidenceElapsed, measuredRecoveryBound, l1.DefaultLeaseDuration)
+}
+
+func waitCompletionReceiptState(t *testing.T, outbox *evidenceOutbox, attemptID, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		receipt := outbox.spool.inspectCompletion(t.Context(), attemptID)
+		if receipt.State == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("completion receipt for %s = %+v, want %s", attemptID, receipt, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T) {
 	network := plain.NewNetwork()
 	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{

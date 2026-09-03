@@ -68,6 +68,87 @@ func TestBoundedFinalizationDeadlineThroughDurableLogSinkPreservesPayload(t *tes
 	}
 }
 
+func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
+	firstCompletionStarted := make(chan struct{}, 1)
+	replayed := make(chan l1.CompletionRequest, 1)
+	var mu sync.Mutex
+	completionCalls := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/complete") {
+			http.NotFound(w, request)
+			return
+		}
+		mu.Lock()
+		completionCalls++
+		call := completionCalls
+		mu.Unlock()
+		if call == 1 {
+			firstCompletionStarted <- struct{}{}
+			<-request.Context().Done()
+			return
+		}
+		var completion l1.CompletionRequest
+		if err := json.NewDecoder(request.Body).Decode(&completion); err != nil {
+			t.Error(err)
+			return
+		}
+		replayed <- completion
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+			Code: contract.ErrorLeaseExpired, Message: "attempt lease has expired",
+		}})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "job-live-handoff", Spec: contract.JobSpec{
+			Class: contract.JobClassOneShot, Kind: contract.JobKindProcess,
+			Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "ignored-by-fake-runner"},
+				Argv: []string{"ignored-by-fake-runner"}, WorkingDirectory: t.TempDir()},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "attempt-live-handoff", FencingToken: "fence-live-handoff", LeaseTTL: time.Minute},
+	}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, runtimes: testRuntimeSet(instantResultRunner{}), outbox: outbox,
+		clock: systemClock{}, renewalInterval: 10 * time.Second, completionRetry: time.Millisecond,
+		observer: newLifecycleObserver(systemClock{}),
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	executeDone := make(chan error, 1)
+	go func() {
+		_, executeErr := lifecycle.execute(ctx, claim, time.Now())
+		executeDone <- executeErr
+	}()
+	select {
+	case <-firstCompletionStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("live completion did not start")
+	}
+	cancel()
+	select {
+	case <-executeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lifecycle did not abandon canceled live completion")
+	}
+	select {
+	case completion := <-replayed:
+		if completion.Result.ExitCode == nil || *completion.Result.ExitCode != 0 {
+			t.Fatalf("replayed result = %+v", completion.Result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("abandoned lifecycle completion was not reconciled")
+	}
+	waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
+}
+
 func assertAttemptPersistsCompletionBeforeDelivery(t *testing.T) {
 	t.Helper()
 	completionStarted := make(chan struct{}, 1)
@@ -151,6 +232,148 @@ func (instantResultRunner) Run(_ context.Context, request processrunner.Request,
 
 func TestEvidenceRecoveryIsolatesTransientPoisonAttempt(t *testing.T) {
 	assertEvidenceRecoveryIsolatesTransientPoisonAttempt(t)
+}
+
+func TestEvidenceRecoveryWakesForCompletionStoredAfterInitialScan(t *testing.T) {
+	initialRecoveryFinished := make(chan struct{})
+	releaseInitialRecovery := make(chan struct{})
+	var finishOnce sync.Once
+	var releaseOnce sync.Once
+	releaseRecovery := func() { releaseOnce.Do(func() { close(releaseInitialRecovery) }) }
+	completionReceived := make(chan l1.CompletionRequest, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if strings.HasSuffix(request.URL.Path, "/logs") {
+			_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0}})
+			return
+		}
+		var completion l1.CompletionRequest
+		if err := json.NewDecoder(request.Body).Decode(&completion); err != nil {
+			t.Error(err)
+			return
+		}
+		completionReceived <- completion
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+			Code: contract.ErrorLeaseExpired, Message: "attempt lease has expired",
+		}})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	defer releaseRecovery()
+	claim := spoolTestClaim("attempt-completion-after-scan")
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.spool.append(t.Context(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, 0, "load")); err != nil {
+		t.Fatal(err)
+	}
+	outbox.recoveryAttemptFinished = func(attemptID string) {
+		if attemptID != claim.Lease.AttemptID {
+			return
+		}
+		finishOnce.Do(func() {
+			close(initialRecoveryFinished)
+			<-releaseInitialRecovery
+		})
+	}
+
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
+	select {
+	case <-initialRecoveryFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial recovery did not reach its active-attempt retirement edge")
+	}
+	result := l1.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{
+		Code: contract.RuntimeFailureUnavailable, Message: "helper generation lost",
+	}}
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, result, time.Now(), l1.RuntimeQuiescenceOCISweep); err != nil {
+		t.Fatal(err)
+	}
+	outbox.scheduleRecovery()
+	releaseRecovery()
+
+	select {
+	case delivered := <-completionReceived:
+		if delivered.Result.RuntimeFailure == nil || delivered.Result.RuntimeFailure.Code != contract.RuntimeFailureUnavailable ||
+			delivered.RuntimeQuiescenceEvidence != l1.RuntimeQuiescenceOCISweep {
+			t.Fatalf("replayed completion = %+v", delivered)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("same-attempt completion wake was swallowed at active recovery retirement")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+		if receipt.State == "delivered" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("late completion receipt = %+v, want delivered", receipt)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestEvidenceRecoveryDoesNotReplayLiveAttempt(t *testing.T) {
+	liveRequest := make(chan string, 1)
+	lateCompletion := make(chan struct{}, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if strings.Contains(request.URL.Path, "attempt-live") {
+			liveRequest <- request.URL.Path
+			http.Error(w, "live evidence must stay with its sink", http.StatusInternalServerError)
+			return
+		}
+		lateCompletion <- struct{}{}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+			Code: contract.ErrorLeaseExpired, Message: "attempt lease has expired",
+		}})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	live := spoolTestClaim("attempt-live")
+	if err := outbox.ensureAttempt(t.Context(), live); err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.spool.append(t.Context(), spoolTestEvent(live.Lease.AttemptID, contract.LogStdout, 0, "owned")); err != nil {
+		t.Fatal(err)
+	}
+	outbox.ownAttempt(live.Lease.AttemptID)
+	defer outbox.releaseAttempt(live.Lease.AttemptID, false)
+	late := spoolTestClaim("attempt-late")
+	if err := outbox.ensureAttempt(t.Context(), late); err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.storeCompletion(t.Context(), late.Lease.AttemptID, l1.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{
+		Code: contract.RuntimeFailureUnavailable, Message: "authority lost",
+	}}, time.Now(), l1.RuntimeQuiescenceOCISweep); err != nil {
+		t.Fatal(err)
+	}
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
+	select {
+	case <-lateCompletion:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unowned late completion was not reconciled")
+	}
+	select {
+	case path := <-liveRequest:
+		t.Fatalf("reconciler touched live attempt at %s", path)
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
 func TestPendingEvidenceDoesNotBlockRegistration(t *testing.T) {

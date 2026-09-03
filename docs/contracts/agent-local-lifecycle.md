@@ -269,7 +269,15 @@ resources, published ports, workflow bridges, handoffs, or log sinks. The
 adapter then returns a structured attempt outcome and implements
 `ReapAndVerify`. The attempt lifecycle requests a positive `runtimeQuiesced`
 receipt after `Run` returns and treats its absence as an `output_error`
-finalization failure before durable completion is stored.
+finalization failure before durable completion is stored. A live lifecycle
+owns its spool attempt, so process-lifetime recovery cannot race its log sink,
+completion delivery, or node-local intent-suppression decision. If authority
+loss or cancellation abandons live delivery after suppression is ruled out,
+the lifecycle releases that ownership and wakes the bounded outbox reconciler.
+The reconciler survives the attempt authority context, retries independently
+per attempt, replays logs before the identical durable completion body, and
+retains a matching post-lease result as typed L1 observation without delaying
+fresh service admission.
 
 The generic agent handoff manager remains the owner of process one-shot host
 directories. An OCI one-shot does not reinterpret the forbidden flat

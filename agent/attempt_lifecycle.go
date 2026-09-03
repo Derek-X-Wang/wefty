@@ -197,6 +197,11 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()
 	attemptID := claim.Lease.AttemptID
+	reconcileCompletion := false
+	if lifecycle.dependencies.outbox != nil {
+		lifecycle.dependencies.outbox.ownAttempt(attemptID)
+		defer func() { lifecycle.dependencies.outbox.releaseAttempt(attemptID, reconcileCompletion) }()
+	}
 	if claim.ComputerStorage != nil {
 		if revoker, ok := lifecycle.dependencies.computerTokens.(ComputerTokenRevoker); ok {
 			defer func() {
@@ -297,6 +302,11 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			// terminal result and finish any handoff or volume finalization.
 			return errorDestinationUnclassified, nil
 		}
+		result := outcome.result
+		if result == (contract.ProcessResult{}) {
+			result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
+		}
+		outcome.result = result
 		if err := persistCompletion(&outcome); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
 		}
@@ -306,10 +316,6 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			// reap before it purges spool metadata or invokes managedroot.Remove.
 			return errorDestinationUnclassified, nil
 		}
-		result := outcome.result
-		if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
-			result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
-		}
 		request := l1.CompletionRequest{
 			FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
 			Result: toL1Result(result), RuntimeQuiescenceEvidence: toL1QuiescenceEvidence(outcome.reapEvidence),
@@ -318,6 +324,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		defer cancelFinalization()
 		failure := lifecycle.completeWithRetry(finalizationContext, claim, request)
 		if failure.err != nil && protocolErrorCode(failure.err) != contract.ErrorLeaseExpired {
+			reconcileCompletion = true
 			return failure.destination, fmt.Errorf("agent: shutdown completion: %w", failure.err)
 		}
 		if failure.err == nil {
@@ -333,18 +340,20 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			cancelAttempt(failure.err)
 			outcome := <-completed
 			<-renewalDone
+			result := outcome.result
+			if result == (contract.ProcessResult{}) {
+				result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
+			}
+			outcome.result = result
 			if err := persistCompletion(&outcome); err != nil {
 				return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
-			}
-			result := outcome.result
-			if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
-				result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
 			}
 			request := l1.CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID, Result: toL1Result(result), RuntimeQuiescenceEvidence: toL1QuiescenceEvidence(outcome.reapEvidence)}
 			finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 			defer cancelFinalization()
 			completionFailure := lifecycle.completeWithRetry(finalizationContext, claim, request)
 			if completionFailure.err != nil {
+				reconcileCompletion = true
 				return completionFailure.destination, fmt.Errorf("agent: directive completion: %w", completionFailure.err)
 			}
 			return errorDestinationUnclassified, nil
@@ -362,6 +371,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		if err := persistCompletion(&outcome); err != nil {
 			return errorDestinationUnclassified, errors.Join(fmt.Errorf("agent: renew lease: %w", failure.err), fmt.Errorf("agent: persist durable completion: %w", err))
 		}
+		reconcileCompletion = true
 		return failure.destination, fmt.Errorf("agent: renew lease: %w", failure.err)
 	case err := <-watch.Failures():
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, err)
@@ -372,6 +382,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		if durabilityErr := persistCompletion(&outcome); durabilityErr != nil {
 			return errorDestinationAttemptAuthority, errors.Join(fmt.Errorf("agent: authority watchdog: %w", err), fmt.Errorf("agent: persist durable completion: %w", durabilityErr))
 		}
+		reconcileCompletion = true
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", err)
 	case outcome = <-completed:
 		cancelExecution()
@@ -398,12 +409,14 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	}
 	var routed *routedDestinationError
 	if errors.As(outcome.err, &routed) && routed.destination != errorDestinationUnclassified {
+		reconcileCompletion = true
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, outcome.err)
 		cancelAttempt(outcome.err)
 		<-renewalDone
 		return routed.destination, outcome.err
 	}
 	if cause := context.Cause(attemptContext); errors.Is(cause, errAuthorityDeadlineExceeded) {
+		reconcileCompletion = true
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
 		<-renewalDone
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", cause)
@@ -439,20 +452,24 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		cancelAttempt(err)
 		<-completionDone
 		<-renewalDone
+		reconcileCompletion = true
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog while completing: %w", err)
 	case <-ctx.Done():
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, ctx.Err())
 		cancelAttempt(ctx.Err())
 		<-completionDone
 		<-renewalDone
+		reconcileCompletion = true
 		return errorDestinationUnclassified, ctx.Err()
 	}
 	<-renewalDone
 	if cause := context.Cause(attemptContext); errors.Is(cause, errAuthorityDeadlineExceeded) {
+		reconcileCompletion = true
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog while completing: %w", cause)
 	}
 	if completionFailure.err != nil {
+		reconcileCompletion = true
 		return completionFailure.destination, fmt.Errorf("agent: complete attempt: %w", completionFailure.err)
 	}
 	return lifecycle.finishCompletedAttempt(ctx, claim, outcome.result, outcome.err)
