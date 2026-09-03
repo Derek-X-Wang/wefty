@@ -43,14 +43,20 @@ authority. The socket unit creates
 `/run/wefty/oci-helper.sock` as exactly `0660 root:wefty-oci`; the Lima guest
 user is added to that group, while the service runs the private helper mode as
 root with a narrow UID allowlist. Every shipped systemd helper service, native
-Linux and Lima, sets `Restart=on-failure`, a bounded `RestartSec=250ms`, and
-`StartLimitIntervalSec=0`; the workflow-written realtiming units use the same
-policy. A Linux realtiming job has four established helper kills (Computer
-disk recovery, lost Attempt recovery, Computer restart survival, and Computer
-reset), and the restart regression repeats those four back-to-back, for eight
-deliberate kills per Ubuntu job. Disabling the interval, rather than sizing a
-finite burst to that current count, keeps an expected fault from permanently
-removing the helper when socket activation races an explicit restart. When
+Linux and Lima, sets `StartLimitIntervalSec=0` under `[Unit]` and
+`Restart=on-failure`, `RestartSec=250ms`, `RestartSteps=6`, and
+`RestartMaxDelaySec=10s` under `[Service]`; the workflow-written realtiming
+units use the same policy. `RestartSteps` and `RestartMaxDelaySec` require
+systemd 254; `ubuntu-latest` and the Lima `template:_images/ubuntu-24.04`
+baseline both provide systemd 255, and the Linux receipt records the executing
+version. The six steps are derived from the incident's six service starts in
+610 ms. They expand a deterministic crash from the 250 ms first retry toward a
+ten-second ceiling instead of sustaining a four-Hz journal loop. Disabling the
+start-limit interval prevents service exhaustion from failing the triggering
+socket with `service-start-limit-hit`; the socket therefore needs no separate
+start-limit override and retains the default policy. The lane records and
+derives its total helper-kill count from the root fault-action journal rather
+than duplicating a source constant. When
 setup adds that supplementary group for
 the first time, it performs one ordinary stop/start so Lima's guest agent picks
 up membership; an already-member rerun does not restart the VM. The host
@@ -189,11 +195,17 @@ takeover path and is re-observed by the lane's
 `startup_sweep_to_takeover_elapsed` receipt. The preferred design—answering
 handshakes during startup while gating admission on verified cleanup—is deferred
 to #301 because it changes startup concurrency and authority publication.
-While taking over, the client also retries a missing helper socket within that
-same fixed window. Two or more `ENOENT` dials followed by window expiry return
-the typed, operator-visible `helper_unit_unavailable` outcome with the observed
-dial count; they are not collapsed into a generic context deadline or treated
-as runtime-loss evidence.
+While taking over, the client retries dial-time `ENOENT`, `ECONNREFUSED`, and
+`ECONNRESET` within that same fixed window. Handshake and typed RPC errors stay
+hard and immediate. Two or more unavailable dials followed by window expiry
+return `helper_unit_unavailable` with the observed dial count. `BootBarrier`
+publishes that distinct closed-vocabulary reason through the native agent
+capability receipt, and Lima preserves it rather than collapsing it into
+`helper_unreachable`. A fully missing socket therefore now costs the complete
+20-second takeover window before the typed failure is published; sweep and
+verification may then use one fresh ten-second reap window, so the composed
+kill-to-verified-ready success bound is 30 seconds. An earlier caller deadline
+or cancellation remains distinct.
 The takeover retry timer uses the injected helper clock. The heartbeat pump
 notifies the barrier synchronously when control authority is lost.
 

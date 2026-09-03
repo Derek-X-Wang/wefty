@@ -220,6 +220,9 @@ func TestDoctorGoldenParityCoversEveryReasonAndL1MetadataTuple(t *testing.T) {
 				return HelperDoctorSnapshot{}, errors.New("dial refused")
 			}
 		}},
+		{contract.CapabilityReasonHelperUnitUnavailable, passThrough, func(config *DoctorConfig) {
+			setProbeReason(config, contract.CapabilityReasonHelperUnitUnavailable)
+		}},
 		{contract.CapabilityReasonHelperVersionMismatch, direct, func(config *DoctorConfig) {
 			mutateHelper(config, func(snapshot *HelperDoctorSnapshot) { snapshot.ProtocolVersion++ })
 		}},

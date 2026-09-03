@@ -294,6 +294,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			"StartLimitIntervalSec=0",
 			"Restart=on-failure",
 			"RestartSec=250ms",
+			"RestartSteps=6",
+			"RestartMaxDelaySec=10s",
 			"if: ${{ always() && runner.os == 'Linux' }}",
 			"journalctl --boot --no-pager --utc --output=short-precise",
 			"-u wefty-oci-helper-realtiming.service",
@@ -325,10 +327,18 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			"::error::Runner.Listener owner could not be read", "::error::Runner.Listener is unexpectedly running as root",
 			"runner_job_uid=%s\\nrunner_listener_uid=%s\\nrunner_listener_owner=%s\\n",
 			"WEFTY_OCI_PROVISION_RECEIPT=%s\\n",
+			"systemctl is-active --quiet wefty-oci-helper-realtiming.socket",
+			"reproduce-helper-start-burst:[1-9]*",
+			"assert-helper-units-active",
+			"stop-helper-topology",
+			"start-helper-topology",
 		} {
 			if !strings.Contains(fixture.text, required) {
 				t.Fatalf("%s realtiming provisioning is missing %q", name, required)
 			}
+		}
+		if strings.Contains(fixture.text, "systemctl reset-failed wefty-oci-helper-realtiming.service") {
+			t.Fatalf("%s helper fault path masks the service start counter", name)
 		}
 	}
 	for name, workflow := range map[string]workflowContract{"workflow-run": realtiming, "scheduled": scheduled} {
@@ -354,7 +364,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		for _, required := range []string{"ARTIFACT_AVAILABLE", "$ARTIFACT_AVAILABLE", "= true",
 			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json",
 			"check-native-linux-oci-receipt.sh", "native-linux-oci.txt", "oci-service-publication-linux.txt", "oci-service-l1-agent-linux.txt", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland",
-			"helper-restart-timeline.txt", "established_lane_helper_kills=4", "candidate_lane_total_helper_kills=8", "all_helper_restarts_within_takeover=true"} {
+			"helper-restart-timeline.txt", "historical_rapid_started_lines=6", "fault_1_kill_to_verified_ready_elapsed_ns", "fault_1_kill_to_verified_ready_bound_ns",
+			"capability_reason=helper_unit_unavailable", "lane_helper_kill_actions", "elapsed <= bound"} {
 			if !strings.Contains(resultText, required) {
 				t.Fatalf("%s realtiming result does not fail closed on %q", name, required)
 			}
@@ -378,7 +389,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "exec /usr/local/bin/wefty-echo-service", "published-echo-service:", "clean-cache wefty node load-image")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "CodeImageUnavailable", "ImageFailureNetwork", "WEFTY_OCI_PROVISION_RECEIPT", `evidenceSource := os.Getenv("WEFTY_REALTIME_EVIDENCE_SOURCE")`, `registryEvidence := "pull_from_empty=true\npull_import_digest_equal=true\n"`, "pull_from_empty=NOT-RUN\\npull_from_empty_reason=pr-build: image not published")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "Start the archive row from an empty root", `requestRootFault(t, "reset-containerd")`, "wiped-cache binding reconciliation")
-	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "TestNativeLinuxHelperRestartsAcrossLaneFaultBudget", "establishedLaneHelperKills = 4", "all_helper_restarts_within_takeover=true")
+	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "TestNativeLinuxHelperRestartsAcrossLaneFaultBudget", "historicalRapidStartupFailures = 6", "fault_1_kill_to_verified_ready_elapsed_ns", "CapabilityReasonHelperUnitUnavailable")
 	assertFileNotContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", `strings.Replace(evidence, "pull_from_empty=true\\n"`)
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_COMPUTER_REFERENCE", "exerciseNativeLinuxReferenceComputer", "ComputerStartupReadinessTimeout", "assertReferenceComputerWireNegatives")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_WAYLAND_COMPUTER_REFERENCE", `exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, "wayland"`, "wayland_computer_reference_wire_negatives=true")
@@ -447,6 +458,71 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "RunComputerServiceRealtiming", "computer_reference_publication_loss_recovery=%t", "computer_reference_helper_stop_start_profile_sign_in_rootfs=%t")
 	assertFileContains(t, "../docs/runbooks/oci-node.md", "wefty node load-image", "acceptance-image-index-digest.txt")
 	assertFileContains(t, "../docs/acceptance/m3-lima-transport.md", "acceptance-image-index-digest.txt", "computer-image-index-digest.txt", "wefty-computer-reference.oci.tar", "atomically within 60 seconds")
+}
+
+func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
+	want := map[string]map[string]string{
+		"Unit": {
+			"StartLimitIntervalSec": "0",
+		},
+		"Service": {
+			"Restart":            "on-failure",
+			"RestartSec":         "250ms",
+			"RestartSteps":       "6",
+			"RestartMaxDelaySec": "10s",
+		},
+	}
+	for name, path := range map[string]string{
+		"native-linux":  "../runner/linuxunit/units.go",
+		"lima-guest":    "../runner/lima/bootstrap.go",
+		"pr-realtiming": "../.github/workflows/service-acceptance-realtiming.yml",
+		"scheduled":     "../.github/workflows/service-acceptance-realtiming-scheduled.yml",
+	} {
+		got := helperServicePolicySections(t, path)
+		if !maps.Equal(got["Unit"], want["Unit"]) || !maps.Equal(got["Service"], want["Service"]) {
+			t.Fatalf("%s helper policy sections = %#v, want %#v", name, got, want)
+		}
+	}
+}
+
+func helperServicePolicySections(t *testing.T, path string) map[string]map[string]string {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(payload)
+	description := strings.Index(text, "Description=Wefty privileged OCI helper")
+	if description < 0 {
+		description = strings.Index(text, "Description=Wefty OCI helper realtiming service")
+	}
+	if description < 0 {
+		t.Fatalf("%s has no privileged helper unit", path)
+	}
+	start := strings.LastIndex(text[:description], "[Unit]")
+	endOffset := strings.Index(text[description:], "RestartMaxDelaySec=10s")
+	if start < 0 || endOffset < 0 {
+		t.Fatalf("%s helper policy bounds were not found", path)
+	}
+	end := description + endOffset + len("RestartMaxDelaySec=10s")
+	sections := map[string]map[string]string{"Unit": {}, "Service": {}}
+	section := ""
+	for _, raw := range strings.Split(text[start:end], "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "[Unit]" || line == "[Service]" {
+			section = strings.Trim(line, "[]")
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || section == "" {
+			continue
+		}
+		switch key {
+		case "StartLimitIntervalSec", "Restart", "RestartSec", "RestartSteps", "RestartMaxDelaySec":
+			sections[section][key] = value
+		}
+	}
+	return sections
 }
 
 func assertWaylandFurnitureInvocations(t *testing.T, workflowName string, workflow workflowContract) {

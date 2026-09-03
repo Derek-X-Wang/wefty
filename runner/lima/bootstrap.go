@@ -287,6 +287,8 @@ StandardOutput=journal
 StandardError=journal
 Restart=on-failure
 RestartSec=250ms
+RestartSteps=6
+RestartMaxDelaySec=10s
 NoNewPrivileges=false
 `)
 }

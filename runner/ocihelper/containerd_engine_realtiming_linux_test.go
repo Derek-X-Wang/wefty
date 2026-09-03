@@ -913,7 +913,7 @@ func TestNativeLinuxSweepClearsLostAttemptLogSpoolAndPopulatedCgroup(t *testing.
 }
 
 func TestNativeLinuxHelperRestartsAcrossLaneFaultBudget(t *testing.T) {
-	const establishedLaneHelperKills = 4
+	const historicalRapidStartupFailures = 6
 	helperSocket := os.Getenv("WEFTY_OCI_HELPER_SOCKET")
 	helperChecksum := os.Getenv("WEFTY_OCI_HELPER_CHECKSUM")
 	evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR")
@@ -936,39 +936,80 @@ func TestNativeLinuxHelperRestartsAcrossLaneFaultBudget(t *testing.T) {
 	if !ok {
 		t.Fatal("initial helper generation was not published")
 	}
-	var evidence strings.Builder
-	fmt.Fprintf(&evidence, "established_lane_helper_kills=%d\n", establishedLaneHelperKills)
-	fmt.Fprintf(&evidence, "candidate_lane_total_helper_kills=%d\n", establishedLaneHelperKills*2)
-	for fault := 1; fault <= establishedLaneHelperKills; fault++ {
-		session, err := barrier.Session()
-		if err != nil {
-			t.Fatal(err)
-		}
-		takeoverBound := 2 * session.Handshake().ReapTimeout
-		killStarted := time.Now()
-		requestRootFault(t, "kill-helper")
-		supervisorElapsed := time.Since(killStarted)
-		barrier.Invalidate()
-		takeoverStarted := time.Now()
-		if err := barrier.Ensure(t.Context()); err != nil {
-			t.Fatalf("helper fault %d/%d did not recover: %v", fault, establishedLaneHelperKills, err)
-		}
-		takeoverElapsed := time.Since(takeoverStarted)
-		current, ok := barrier.Generation()
-		if !ok || current.HelperInstanceID == previous.HelperInstanceID {
-			t.Fatalf("helper fault %d/%d did not publish a replacement generation: previous=%+v current=%+v present=%t", fault, establishedLaneHelperKills, previous, current, ok)
-		}
-		if takeoverElapsed > takeoverBound {
-			t.Fatalf("helper fault %d/%d takeover took %s, exceeds %s", fault, establishedLaneHelperKills, takeoverElapsed, takeoverBound)
-		}
-		fmt.Fprintf(&evidence, "fault_%d_supervisor_elapsed=%s\nfault_%d_takeover_elapsed=%s\nfault_%d_kill_to_takeover_elapsed=%s\nfault_%d_takeover_bound=%s\nfault_%d_helper_instance=%s\n",
-			fault, supervisorElapsed, fault, takeoverElapsed, fault, time.Since(killStarted), fault, takeoverBound, fault, current.HelperInstanceID)
-		previous = current
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
 	}
-	evidence.WriteString("all_helper_restarts_within_takeover=true\n")
+	reapTimeout := session.Handshake().ReapTimeout
+	readyBound := ocihelper.VerifiedReadyTimeoutForReap(reapTimeout)
+	stderrPath := "/tmp/wefty-oci-helper-realtiming.stderr"
+	beforeFailures := countHelperStartupFailureInjections(t, stderrPath)
+	faultStarted := time.Now()
+	requestRootFault(t, fmt.Sprintf("reproduce-helper-start-burst:%d", historicalRapidStartupFailures))
+	barrier.Invalidate()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatalf("helper did not recover from the measured rapid startup-failure sequence: %v", err)
+	}
+	killToReadyElapsed := time.Since(faultStarted)
+	current, ok := barrier.Generation()
+	if !ok || current.HelperInstanceID == previous.HelperInstanceID {
+		t.Fatalf("rapid startup-failure sequence did not publish a replacement generation: previous=%+v current=%+v present=%t", previous, current, ok)
+	}
+	if killToReadyElapsed > readyBound {
+		t.Fatalf("kill to verified-ready took %s, exceeds composed takeover-plus-admission bound %s", killToReadyElapsed, readyBound)
+	}
+	requestRootFault(t, "assert-helper-units-active")
+	if info, err := os.Stat(helperSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("helper socket path is not active after burst recovery: info=%v err=%v", info, err)
+	}
+	afterFailures := countHelperStartupFailureInjections(t, stderrPath)
+	observedFailures := afterFailures - beforeFailures
+	if observedFailures != historicalRapidStartupFailures {
+		t.Fatalf("injected startup failure count = %d, want measured incident count %d", observedFailures, historicalRapidStartupFailures)
+	}
+
+	barrier.Invalidate()
+	requestRootFault(t, "stop-helper-topology")
+	topologyStopped := true
+	defer func() {
+		if topologyStopped {
+			requestRootFault(t, "start-helper-topology")
+		}
+	}()
+	unavailableBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{
+		NodeID: "native-helper-unavailable-node", BootSessionID: "native-helper-unavailable-boot",
+	}, ocihelper.BootBarrierConfig{TakeoverReapTimeout: reapTimeout})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailableStarted := time.Now()
+	err = unavailableBarrier.Ensure(t.Context())
+	unavailableElapsed := time.Since(unavailableStarted)
+	var unavailable *ocihelper.HelperUnitUnavailableError
+	if !errors.As(err, &unavailable) || unavailableBarrier.CapabilityReasonCode() != contract.CapabilityReasonHelperUnitUnavailable {
+		t.Fatalf("stopped helper topology outcome = %#v err=%v capability_reason=%q", unavailable, err, unavailableBarrier.CapabilityReasonCode())
+	}
+	_ = unavailableBarrier.Close()
+	requestRootFault(t, "start-helper-topology")
+	topologyStopped = false
+
+	var evidence strings.Builder
+	fmt.Fprintf(&evidence, "historical_rapid_started_lines=%d\n", historicalRapidStartupFailures)
+	fmt.Fprintf(&evidence, "injected_startup_failures=%d\nobserved_startup_failures=%d\n", historicalRapidStartupFailures, observedFailures)
+	fmt.Fprintf(&evidence, "fault_1_kill_to_verified_ready_elapsed_ns=%d\nfault_1_kill_to_verified_ready_bound_ns=%d\nfault_1_within_verified_ready_bound=true\nfault_1_helper_instance=%s\n", killToReadyElapsed.Nanoseconds(), readyBound.Nanoseconds(), current.HelperInstanceID)
+	fmt.Fprintf(&evidence, "unavailable_elapsed_ns=%d\nunavailable_takeover_window_ns=%d\ncapability_reason=%s\nsocket_and_service_active_after_recovery=true\n", unavailableElapsed.Nanoseconds(), ocihelper.TakeoverTimeoutForReap(reapTimeout).Nanoseconds(), unavailableBarrier.CapabilityReasonCode())
 	if err := os.WriteFile(filepath.Join(evidenceDirectory, "helper-restart-timeline.txt"), []byte(evidence.String()), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func countHelperStartupFailureInjections(t *testing.T, path string) int {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(payload), "injected helper startup failure remaining=")
 }
 
 var nativeBarrierLossSequence atomic.Uint64

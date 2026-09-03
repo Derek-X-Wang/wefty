@@ -738,6 +738,7 @@ const (
 	CapabilityReasonPrerequisiteMissing       CapabilityReasonCode = "prerequisite_missing"
 	CapabilityReasonRuntimeVersionUnsupported CapabilityReasonCode = "runtime_version_unsupported"
 	CapabilityReasonHelperUnreachable         CapabilityReasonCode = "helper_unreachable"
+	CapabilityReasonHelperUnitUnavailable     CapabilityReasonCode = "helper_unit_unavailable"
 	CapabilityReasonHelperVersionMismatch     CapabilityReasonCode = "helper_version_mismatch"
 	CapabilityReasonHelperHandshakeFailed     CapabilityReasonCode = "helper_handshake_failed"
 	CapabilityReasonBootSweepFailed           CapabilityReasonCode = "boot_sweep_failed"
@@ -757,6 +758,7 @@ func (code CapabilityReasonCode) Valid() bool {
 		CapabilityReasonPrerequisiteMissing,
 		CapabilityReasonRuntimeVersionUnsupported,
 		CapabilityReasonHelperUnreachable,
+		CapabilityReasonHelperUnitUnavailable,
 		CapabilityReasonHelperVersionMismatch,
 		CapabilityReasonHelperHandshakeFailed,
 		CapabilityReasonBootSweepFailed,
@@ -782,6 +784,7 @@ func (code CapabilityReasonCode) ValidOCIRestriction() bool {
 		CapabilityReasonPrerequisiteMissing,
 		CapabilityReasonRuntimeVersionUnsupported,
 		CapabilityReasonHelperUnreachable,
+		CapabilityReasonHelperUnitUnavailable,
 		CapabilityReasonHelperVersionMismatch,
 		CapabilityReasonHelperHandshakeFailed,
 		CapabilityReasonBootSweepFailed,

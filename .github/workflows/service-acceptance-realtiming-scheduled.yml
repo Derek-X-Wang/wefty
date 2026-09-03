@@ -263,6 +263,23 @@ jobs:
             --output type=oci,dest=/tmp/wefty-service-data-named.oci.tar /tmp/wefty-service-data-named
           chmod 0644 /tmp/wefty-service-data-numeric.oci.tar /tmp/wefty-service-data-named.oci.tar
           sudo install -D --owner=root --group=root --mode=0755 "$WEFTY_AGENT" /usr/local/libexec/wefty-agent-oci-realtiming
+          sudo tee /usr/local/libexec/wefty-oci-helper-realtiming-wrapper >/dev/null <<'SCRIPT'
+          #!/bin/sh
+          set -eu
+          failures=/tmp/wefty-oci-faults/helper-startup-failures
+          if test -s "$failures"; then
+            remaining="$(cat "$failures")"
+            case "$remaining" in ''|*[!0-9]*) exit 78 ;; esac
+            if test "$remaining" -gt 0; then
+              remaining=$((remaining - 1))
+              printf '%s\n' "$remaining" > "$failures"
+              printf 'injected helper startup failure remaining=%s\n' "$remaining" >&2
+              exit 75
+            fi
+          fi
+          exec /usr/local/libexec/wefty-agent-oci-realtiming "$@"
+          SCRIPT
+          sudo chmod 0755 /usr/local/libexec/wefty-oci-helper-realtiming-wrapper
           HELPER_CHECKSUM="sha256:$(sha256sum "$WEFTY_AGENT" | cut -d' ' -f1)"
           test "$HELPER_CHECKSUM" = "$(jq -r .helper_checksum "$manifest")"
           AGENT_UID="$(id -u)"
@@ -288,12 +305,14 @@ jobs:
           [Service]
           Type=simple
           Environment=WEFTY_OCI_HELPER_ALLOWED_UIDS=$AGENT_UID
-          ExecStart=/usr/local/libexec/wefty-agent-oci-realtiming __wefty_oci_helper --oci-containerd-address /run/wefty-containerd/containerd.sock --oci-containerd-state-root /run/wefty-containerd/state --oci-runtime-root /var/lib/wefty/oci --oci-memory-capacity-bytes 4294967296 --oci-memory-reserve-bytes 1073741824
+          ExecStart=/usr/local/libexec/wefty-oci-helper-realtiming-wrapper __wefty_oci_helper --oci-containerd-address /run/wefty-containerd/containerd.sock --oci-containerd-state-root /run/wefty-containerd/state --oci-runtime-root /var/lib/wefty/oci --oci-memory-capacity-bytes 4294967296 --oci-memory-reserve-bytes 1073741824
           User=root
           Group=root
           StandardError=append:/tmp/wefty-oci-helper-realtiming.stderr
           Restart=on-failure
           RestartSec=250ms
+          RestartSteps=6
+          RestartMaxDelaySec=10s
           UNIT
           sudo systemctl daemon-reload
           sudo systemctl start wefty-oci-helper-realtiming.socket
@@ -311,6 +330,7 @@ jobs:
           set -eu
           while true; do
             if IFS= read -r action < /tmp/wefty-oci-faults/control; then
+              printf '%s\n' "$action" >> /tmp/wefty-oci-faults/actions.log
               case "$action" in
                 kill-shim)
                   printf '%s\n' 'kill-shim requires an exact workload Job binding' > "/tmp/wefty-oci-faults/$action.failed"
@@ -365,9 +385,36 @@ jobs:
                   ;;
                 kill-helper)
                   systemctl kill --kill-who=all --signal=KILL wefty-oci-helper-realtiming.service
-                  systemctl reset-failed wefty-oci-helper-realtiming.service
-                  systemctl start wefty-oci-helper-realtiming.service
+                  for _ in $(seq 1 300); do
+                    if systemctl is-active --quiet wefty-oci-helper-realtiming.socket && systemctl is-active --quiet wefty-oci-helper-realtiming.service; then break; fi
+                    sleep .1
+                  done
+                  systemctl is-active --quiet wefty-oci-helper-realtiming.socket
                   systemctl is-active --quiet wefty-oci-helper-realtiming.service
+                  ;;
+                reproduce-helper-start-burst:[1-9]*)
+                  failures="${action##*:}"
+                  case "$failures" in *[!0-9]*) exit 64 ;; esac
+                  printf '%s\n' "$failures" > /tmp/wefty-oci-faults/helper-startup-failures
+                  systemctl kill --kill-who=all --signal=KILL wefty-oci-helper-realtiming.service
+                  systemctl is-active --quiet wefty-oci-helper-realtiming.socket
+                  ;;
+                assert-helper-units-active)
+                  systemctl is-active --quiet wefty-oci-helper-realtiming.socket
+                  systemctl is-active --quiet wefty-oci-helper-realtiming.service
+                  ;;
+                stop-helper-topology)
+                  systemctl stop wefty-oci-helper-realtiming.service wefty-oci-helper-realtiming.socket
+                  systemctl is-active --quiet wefty-oci-helper-realtiming.service && exit 1 || true
+                  systemctl is-active --quiet wefty-oci-helper-realtiming.socket && exit 1 || true
+                  test ! -S /run/wefty-oci-helper/helper.sock
+                  ;;
+                start-helper-topology)
+                  systemctl start wefty-oci-helper-realtiming.socket
+                  systemctl start wefty-oci-helper-realtiming.service
+                  systemctl is-active --quiet wefty-oci-helper-realtiming.socket
+                  systemctl is-active --quiet wefty-oci-helper-realtiming.service
+                  test -S /run/wefty-oci-helper/helper.sock
                   ;;
                 reset-containerd)
                   systemctl stop wefty-test-containerd.service
@@ -428,7 +475,10 @@ jobs:
             printf '%s\n' '::error::Runner.Listener is unexpectedly running as root'
             exit 1
           fi
+          systemd_major="$(systemd --version | awk 'NR == 1 { print $2 }')"
+          test "$systemd_major" -ge 254
           {
+            systemd --version
             /usr/local/bin/containerd --version
             /usr/local/sbin/runc --version
             grep -w overlay /proc/filesystems
@@ -490,6 +540,16 @@ jobs:
           printf 'commit=%s\nrunner=%s\n' "$CANDIDATE_SHA" "$RUNNER_NAME" > "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
           go version >> "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
           go test -count=1 -p 1 -timeout=75m -v -tags=service_acceptance_realtiming ./...
+          if [ "$RUNNER_OS" = Linux ]; then
+            lane_helper_kills="$(grep -c '^kill-helper$' /tmp/wefty-oci-faults/actions.log)"
+            lane_reproduction_faults="$(grep -c '^reproduce-helper-start-burst:' /tmp/wefty-oci-faults/actions.log)"
+            test "$lane_helper_kills" -gt 0
+            test "$lane_reproduction_faults" -eq 1
+            printf 'lane_helper_kill_actions=%s\nlane_reproduction_fault_actions=%s\n' \
+              "$lane_helper_kills" "$lane_reproduction_faults" \
+              >> "$WEFTY_REALTIME_EVIDENCE_DIR/helper-restart-timeline.txt"
+            cp /tmp/wefty-oci-faults/actions.log "$WEFTY_REALTIME_EVIDENCE_DIR/root-fault-actions.log"
+          fi
       - name: Capture Linux OCI service diagnostics
         if: ${{ always() && runner.os == 'Linux' }}
         env:
@@ -602,12 +662,17 @@ jobs:
             "$RUNNER_TEMP/linux-computer-receipt-wayland/oci-service-l1-agent-linux.txt"
           for variant in xfce wayland; do
             timeline="$RUNNER_TEMP/linux-computer-receipt-$variant/helper-restart-timeline.txt"
-            grep -Fx 'established_lane_helper_kills=4' "$timeline"
-            grep -Fx 'candidate_lane_total_helper_kills=8' "$timeline"
-            grep -Fx 'all_helper_restarts_within_takeover=true' "$timeline"
-            for fault in 1 2 3 4; do
-              grep -Eq "^fault_${fault}_takeover_elapsed=[^[:space:]]+$" "$timeline"
-              grep -Eq "^fault_${fault}_takeover_bound=[^[:space:]]+$" "$timeline"
-              grep -Eq "^fault_${fault}_helper_instance=[^[:space:]]+$" "$timeline"
-            done
+            grep -Fx 'historical_rapid_started_lines=6' "$timeline"
+            grep -Fx 'injected_startup_failures=6' "$timeline"
+            grep -Fx 'observed_startup_failures=6' "$timeline"
+            grep -Fx 'fault_1_within_verified_ready_bound=true' "$timeline"
+            grep -Fx 'capability_reason=helper_unit_unavailable' "$timeline"
+            grep -Fx 'socket_and_service_active_after_recovery=true' "$timeline"
+            grep -Eq '^lane_helper_kill_actions=[1-9][0-9]*$' "$timeline"
+            grep -Fx 'lane_reproduction_fault_actions=1' "$timeline"
+            awk -F= '
+              $1 == "fault_1_kill_to_verified_ready_elapsed_ns" { elapsed=$2 }
+              $1 == "fault_1_kill_to_verified_ready_bound_ns" { bound=$2 }
+              END { exit !(elapsed > 0 && bound > 0 && elapsed <= bound) }
+            ' "$timeline"
           done

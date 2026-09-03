@@ -1039,6 +1039,9 @@ func TestBootBarrierDefaultTakeoverReservesAStartupReapWindow(t *testing.T) {
 	if barrier.config.TakeoverTimeout != 2*defaultReapTimeout {
 		t.Fatalf("default takeover timeout = %s, want startup reap plus admission reap %s", barrier.config.TakeoverTimeout, 2*defaultReapTimeout)
 	}
+	if got := VerifiedReadyTimeoutForReap(defaultReapTimeout); got != 3*defaultReapTimeout {
+		t.Fatalf("verified-ready timeout = %s, want takeover plus fresh admission reap %s", got, 3*defaultReapTimeout)
+	}
 }
 
 func TestBootBarrierClassifiesRepeatedMissingSocketAsHelperUnitUnavailable(t *testing.T) {
@@ -1061,6 +1064,58 @@ func TestBootBarrierClassifiesRepeatedMissingSocketAsHelperUnitUnavailable(t *te
 	var unavailable *HelperUnitUnavailableError
 	if !errors.As(err, &unavailable) || unavailable.Code() != HelperUnitUnavailable || unavailable.DialAttempts < 2 || dials < 2 || barrier.Ready() {
 		t.Fatalf("missing helper socket outcome = %#v err=%v dials=%d ready=%t", unavailable, err, dials, barrier.Ready())
+	}
+	if reason := barrier.CapabilityReasonCode(); reason != contract.CapabilityReasonHelperUnitUnavailable {
+		t.Fatalf("missing helper socket capability reason = %q", reason)
+	}
+}
+
+func TestBootBarrierRetriesRefusedDialThenPublishesTypedUnavailable(t *testing.T) {
+	dials := 0
+	client := &Client{
+		ExpectedChecksum: "checksum-test",
+		Dial: func(context.Context) (net.Conn, error) {
+			dials++
+			return nil, syscall.ECONNREFUSED
+		},
+	}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: 50 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var unavailable *HelperUnitUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.DialAttempts < 2 || dials < 2 ||
+		barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperUnitUnavailable {
+		t.Fatalf("refused helper socket outcome = %#v err=%v dials=%d reason=%q", unavailable, err, dials, barrier.CapabilityReasonCode())
+	}
+}
+
+func TestBootBarrierDoesNotRetryProtocolRPCError(t *testing.T) {
+	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{})
+	defer stop()
+	dials := 0
+	originalDial := client.Dial
+	client.Dial = func(ctx context.Context) (net.Conn, error) {
+		dials++
+		return originalDial(ctx)
+	}
+	client.Version = ProtocolVersion + 1
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: 50 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var rpcErr *RPCError
+	var unavailable *HelperUnitUnavailableError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeVersionMismatch || errors.As(err, &unavailable) || dials != 1 {
+		t.Fatalf("protocol mismatch outcome = rpc=%#v unavailable=%#v err=%v dials=%d", rpcErr, unavailable, err, dials)
 	}
 }
 
@@ -1103,7 +1158,7 @@ func TestBootBarrierTakeoverIncludesSlowStartupAndAdmissionSweeps(t *testing.T) 
 		wantReady       bool
 	}{
 		{name: "former one-reap window expires", takeoverTimeout: reapTimeout},
-		{name: "derived two-reap window passes", takeoverTimeout: takeoverTimeoutForReap(reapTimeout), wantReady: true},
+		{name: "derived two-reap window passes", takeoverTimeout: TakeoverTimeoutForReap(reapTimeout), wantReady: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			engine := newFakeEngine()

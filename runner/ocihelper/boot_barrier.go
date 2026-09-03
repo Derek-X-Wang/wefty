@@ -7,7 +7,10 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const defaultTakeoverRetryInterval = 25 * time.Millisecond
@@ -16,8 +19,16 @@ const HelperUnitUnavailable = "helper_unit_unavailable"
 
 var errTakeoverWindowExpired = errors.New("OCI helper takeover window expired")
 
-func takeoverTimeoutForReap(reapTimeout time.Duration) time.Duration {
+// TakeoverTimeoutForReap is the exclusive-session window: one reap interval
+// for helper startup cleanup plus one for an incumbent authority to expire.
+func TakeoverTimeoutForReap(reapTimeout time.Duration) time.Duration {
 	return reapTimeout + reapTimeout
+}
+
+// VerifiedReadyTimeoutForReap composes takeover with the fresh admission
+// sweep-and-verify interval that begins only after the handshake succeeds.
+func VerifiedReadyTimeoutForReap(reapTimeout time.Duration) time.Duration {
+	return TakeoverTimeoutForReap(reapTimeout) + reapTimeout
 }
 
 type BootBarrierConfig struct {
@@ -36,9 +47,10 @@ func (err *ReapTimeoutConfigurationError) Error() string {
 	return fmt.Sprintf("OCI helper reap timeout configuration mismatch: advertised=%s takeover_derived_from=%s", err.AdvertisedReapTimeout, err.TakeoverReapTimeout)
 }
 
-// HelperUnitUnavailableError means the helper's socket remained absent across
-// the complete takeover window. It distinguishes a stopped or start-limited
-// systemd unit from an incumbent helper that is still releasing authority.
+// HelperUnitUnavailableError means the helper's socket remained absent or
+// refused/reset connections across the complete takeover window. It
+// distinguishes a stopped or start-limited systemd topology from an incumbent
+// helper that is still releasing authority.
 type HelperUnitUnavailableError struct {
 	DialAttempts int
 	Cause        error
@@ -50,7 +62,7 @@ func (err *HelperUnitUnavailableError) Error() string {
 	if err == nil || err.Cause == nil {
 		return HelperUnitUnavailable
 	}
-	return fmt.Sprintf("%s: OCI helper socket remained absent after %d takeover dials: %v", HelperUnitUnavailable, err.DialAttempts, err.Cause)
+	return fmt.Sprintf("%s: OCI helper socket remained unavailable after %d takeover dials: %v", HelperUnitUnavailable, err.DialAttempts, err.Cause)
 }
 
 func (err *HelperUnitUnavailableError) Unwrap() error {
@@ -176,6 +188,7 @@ type BootBarrier struct {
 	prepared bool
 	receipt  VerifiedSweepReceipt
 	loss     func(HelperSession, error)
+	reason   contract.CapabilityReasonCode
 }
 
 func NewBootBarrier(client *Client, request AcquireSessionRequest) (*BootBarrier, error) {
@@ -196,7 +209,7 @@ func NewBootBarrierWithConfig(client *Client, request AcquireSessionRequest, con
 		config.TakeoverReapTimeout = defaultReapTimeout
 	}
 	if config.TakeoverTimeout <= 0 {
-		config.TakeoverTimeout = takeoverTimeoutForReap(config.TakeoverReapTimeout)
+		config.TakeoverTimeout = TakeoverTimeoutForReap(config.TakeoverReapTimeout)
 	}
 	if config.TakeoverRetry <= 0 {
 		config.TakeoverRetry = defaultTakeoverRetryInterval
@@ -260,10 +273,11 @@ func (barrier *BootBarrier) SetLossHandler(handler func(HelperSession, error)) {
 	barrier.mu.Unlock()
 }
 
-func (barrier *BootBarrier) Ensure(ctx context.Context) error {
+func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 	if barrier == nil {
 		return errors.New("OCI boot barrier is unavailable")
 	}
+	defer func() { barrier.recordCapabilityReason(ensureErr) }()
 	barrier.ensureMu.Lock()
 	defer barrier.ensureMu.Unlock()
 	if barrier.Ready() {
@@ -334,14 +348,40 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 	return nil
 }
 
+// CapabilityReasonCode exposes the last Ensure outcome through the agent's
+// bounded capability-restriction surface. A healthy barrier has no reason.
+func (barrier *BootBarrier) CapabilityReasonCode() contract.CapabilityReasonCode {
+	if barrier == nil {
+		return contract.CapabilityReasonBootSweepFailed
+	}
+	barrier.mu.RLock()
+	defer barrier.mu.RUnlock()
+	return barrier.reason
+}
+
+func (barrier *BootBarrier) recordCapabilityReason(err error) {
+	reason := contract.CapabilityReasonCode("")
+	if err != nil {
+		var unavailable *HelperUnitUnavailableError
+		if errors.As(err, &unavailable) {
+			reason = contract.CapabilityReasonHelperUnitUnavailable
+		} else {
+			reason = contract.CapabilityReasonBootSweepFailed
+		}
+	}
+	barrier.mu.Lock()
+	barrier.reason = reason
+	barrier.mu.Unlock()
+}
+
 func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context) (*Session, error) {
-	missingSocketDials := 0
-	var lastMissingSocketError error
+	unavailableDials := 0
+	var lastUnavailableError error
 	takeoverError := func(contextError error) error {
-		if missingSocketDials >= 2 && errors.Is(context.Cause(ctx), errTakeoverWindowExpired) {
+		if unavailableDials >= 2 && errors.Is(context.Cause(ctx), errTakeoverWindowExpired) {
 			return &HelperUnitUnavailableError{
-				DialAttempts: missingSocketDials,
-				Cause:        errors.Join(contextError, lastMissingSocketError),
+				DialAttempts: unavailableDials,
+				Cause:        errors.Join(contextError, lastUnavailableError),
 			}
 		}
 		return fmt.Errorf("acquire exclusive OCI helper session: %w", contextError)
@@ -358,12 +398,13 @@ func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context) (*Session,
 			return nil, takeoverError(contextError)
 		}
 		var rpcErr *RPCError
-		if errors.Is(err, os.ErrNotExist) {
-			missingSocketDials++
-			lastMissingSocketError = err
+		var dialErr *helperDialError
+		if errors.As(err, &dialErr) && (errors.Is(dialErr, os.ErrNotExist) || errors.Is(dialErr, syscall.ECONNREFUSED) || errors.Is(dialErr, syscall.ECONNRESET)) {
+			unavailableDials++
+			lastUnavailableError = err
 		} else if errors.As(err, &rpcErr) && rpcErr.Code == CodeSessionBusy {
-			missingSocketDials = 0
-			lastMissingSocketError = nil
+			unavailableDials = 0
+			lastUnavailableError = nil
 		} else {
 			return nil, fmt.Errorf("acquire exclusive OCI helper session: %w", err)
 		}

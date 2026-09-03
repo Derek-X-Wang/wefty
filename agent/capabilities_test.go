@@ -455,30 +455,30 @@ func TestProcessOnlyAgentRegistersWithoutCapabilitySupersede(t *testing.T) {
 	}
 }
 
-func TestSpecializedBarrierReasonPublishesRestrictiveThenReearnsAfterEnsureAndProbe(t *testing.T) {
+func TestHelperUnitUnavailableBarrierReasonPublishesRestrictiveThenReearnsAfterEnsureAndProbe(t *testing.T) {
 	network := plain.NewNetwork()
-	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-lima-broken": nil})
+	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-helper-unit-unavailable": nil})
 	defer stopServer()
 	var events []string
 	barrier := &recordingOCIBootBarrier{
-		reason:     contract.CapabilityReasonLimaBroken,
+		reason:     contract.CapabilityReasonHelperUnitUnavailable,
 		invalidate: func() { events = append(events, "invalidate") },
 		ensure: func(context.Context) error {
 			events = append(events, "ensure-failed")
-			return errors.New("Lima is Broken")
+			return errors.New("helper socket unit is start-limited")
 		},
 	}
 	probe := capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 		events = append(events, "probe")
 		return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
 	})
-	nodeAgent := newBootBarrierTestAgent(t, network, "node-lima-broken", barrier, probe)
+	nodeAgent := newBootBarrierTestAgent(t, network, "node-helper-unit-unavailable", barrier, probe)
 	defer nodeAgent.Close()
 	node, err := nodeAgent.Register(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if node.Capabilities["kind:oci"] || node.CapabilityReasonCode != contract.CapabilityReasonLimaBroken || !reflect.DeepEqual(events, []string{"ensure-failed"}) {
+	if node.Capabilities["kind:oci"] || node.CapabilityReasonCode != contract.CapabilityReasonHelperUnitUnavailable || !reflect.DeepEqual(events, []string{"ensure-failed"}) {
 		t.Fatalf("restrictive specialized registration = node=%+v events=%v", node, events)
 	}
 	barrier.mu.Lock()
@@ -493,7 +493,7 @@ func TestSpecializedBarrierReasonPublishesRestrictiveThenReearnsAfterEnsureAndPr
 	if !reflect.DeepEqual(events, []string{"ensure-failed", "invalidate", "ensure-succeeded", "probe"}) {
 		t.Fatalf("republication ordering = %v", events)
 	}
-	node = waitForAgentNode(t, store, "node-lima-broken", func(node l1.Node) bool {
+	node = waitForAgentNode(t, store, "node-helper-unit-unavailable", func(node l1.Node) bool {
 		return node.Capabilities["kind:oci"] && node.CapabilityReasonCode == ""
 	})
 	if node.CapabilityRevision < 3 {
