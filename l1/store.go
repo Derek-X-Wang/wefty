@@ -2980,7 +2980,7 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		if err := tx.Commit(); err != nil {
 			return AppendLogsResponse{}, internalError(err, "commit log replay")
 		}
-		return AppendLogsResponse{Acknowledged: acknowledged}, nil
+		return AppendLogsResponse{Acknowledged: acknowledged, AttemptState: attempt.state}, nil
 	}
 	if attempt.state == contract.AttemptLost {
 	} else if attempt.state != contract.AttemptClaimed && attempt.state != contract.AttemptRunning && attempt.state != contract.AttemptAwaitingInput {
@@ -3011,6 +3011,9 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 			return AppendLogsResponse{}, err
 		}
 	}
+	if attempt.state == contract.AttemptClaimed && hasAuthority && attempt.spec.Kind != contract.JobKindOCI {
+		attempt.state = contract.AttemptRunning
+	}
 	if _, err := s.enforceServiceLogByteRetention(ctx, tx, jobID, now); err != nil {
 		return AppendLogsResponse{}, err
 	}
@@ -3023,7 +3026,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 	if err := tx.Commit(); err != nil {
 		return AppendLogsResponse{}, internalError(err, "commit log append")
 	}
-	return AppendLogsResponse{Acknowledged: acknowledged}, nil
+	return AppendLogsResponse{Acknowledged: acknowledged, AttemptState: attempt.state}, nil
 }
 
 func readLogAcknowledgements(ctx context.Context, q queryer, attemptID string, streams map[contract.LogStream]struct{}, acknowledgements map[contract.LogStream]uint64) error {
@@ -3134,9 +3137,7 @@ func validateLogEvent(attemptID string, event contract.LogEvent) error {
 	if gap.ThroughSequence < event.Sequence || gap.LostEventCount != gap.ThroughSequence-event.Sequence+1 || gap.LostByteCount == 0 {
 		return protocolError(contract.ErrorInvalidRequest, "log gap range, event count, and byte count are inconsistent")
 	}
-	switch gap.Reason {
-	case contract.LogGapSpoolEviction, contract.LogGapOversizedEvent, contract.LogGapReplayRejected, contract.LogGapLateEvidenceWindowExpired, contract.LogGapRecoveryReplayBound, contract.LogGapLoggerSourceIncomplete:
-	default:
+	if !gap.Reason.Valid() {
 		return protocolError(contract.ErrorInvalidRequest, "log gap reason %q is invalid", gap.Reason)
 	}
 	if gap.SourceEventSHA256 != "" && !validSHA256(gap.SourceEventSHA256) {

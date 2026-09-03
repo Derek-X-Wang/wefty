@@ -631,10 +631,30 @@ const (
 	LogGapSpoolEviction             LogGapReason = "spool_eviction"
 	LogGapOversizedEvent            LogGapReason = "oversized_event"
 	LogGapReplayRejected            LogGapReason = "replay_rejected"
-	LogGapRecoveryReplayBound       LogGapReason = "recovery_replay_bound"
 	LogGapLateEvidenceWindowExpired LogGapReason = "late_evidence_window_expired"
 	LogGapLoggerSourceIncomplete    LogGapReason = "logger_source_incomplete"
 )
+
+// LogGapReasons returns the complete closed vocabulary accepted on the wire.
+// Callers receive a fresh slice so validation cannot drift through mutation.
+func LogGapReasons() []LogGapReason {
+	return []LogGapReason{
+		LogGapSpoolEviction,
+		LogGapOversizedEvent,
+		LogGapReplayRejected,
+		LogGapLateEvidenceWindowExpired,
+		LogGapLoggerSourceIncomplete,
+	}
+}
+
+func (reason LogGapReason) Valid() bool {
+	for _, candidate := range LogGapReasons() {
+		if reason == candidate {
+			return true
+		}
+	}
+	return false
+}
 
 type LogStream string
 

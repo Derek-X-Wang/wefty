@@ -276,17 +276,18 @@ loss or cancellation abandons live delivery after suppression is ruled out,
 the lifecycle does not classify the cancellation cause as a `/complete`
 response: it releases that ownership and wakes the bounded outbox reconciler.
 The reconciler survives the attempt authority context, runs at most eight
-attempt workers and eight log batches per attempt pass, and retries both spool
-scan failures and per-attempt failures after the configured injected-clock
-backoff. Each pass replays at most eight durable log batches, then delivers the
-completion without discarding the remaining backlog; later passes continue the
-raw log stream from its acknowledged high-water mark. Reaching the per-pass
-bound alone never creates a gap. A `recovery_replay_bound` gap is valid only
-when recovery has positive evidence that the covered raw events cannot be
-replayed, and L1 accepts that typed reason. A permanently rejected raw batch is
-likewise replaced by an accepted `replay_rejected` gap; if the durable sequence
-is not contiguous enough to form a truthful gap, the attempt is sealed with a
-typed incomplete-evidence tombstone instead of retrying forever. The reconciler sends the
+attempt workers, and retries both spool scan failures and per-attempt failures
+after the configured injected-clock backoff. While L1 reports the attempt as
+live, recovery drains every durable log batch before delivering the single
+completion; an accepted completion closes that attempt's log stream at L1
+(`l1/store.go`, `AppendLogs`). Once L1 reports the attempt as `lost`, the
+completion is late evidence, so recovery may yield after eight log batches,
+deliver the completion, and continue the remaining raw log stream on later
+passes from its acknowledged high-water mark. Reaching that per-pass bound
+never creates a gap. A permanently rejected raw batch is replaced by an
+accepted `replay_rejected` gap; if the durable sequence is not contiguous enough
+to form a truthful gap, the attempt is sealed with a typed incomplete-evidence
+tombstone instead of retrying forever. The reconciler sends the
 identical durable completion body and retains a matching post-lease result as
 typed L1 observation without delaying fresh service admission.
 

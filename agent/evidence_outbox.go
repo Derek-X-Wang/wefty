@@ -309,14 +309,18 @@ func (outbox *evidenceOutbox) recoverAttempt(ctx context.Context, client *Client
 	if err := outbox.recoverCompletion(ctx, client, attempt); err != nil {
 		return err
 	}
-	// A bounded pass is a scheduling yield, not evidence truncation. When logs
-	// remain, completion is no longer held behind the backlog; the manager's
-	// post-pass scan launches a later pass for the same durable attempt.
 	return nil
 }
 
 func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, attempt logSpoolAttempt) error {
-	for range maxEvidenceLogReplayBatchesPerPass {
+	lostBatches := 0
+	for {
+		if lostBatches >= maxEvidenceLogReplayBatchesPerPass {
+			// L1 has positively reported AttemptLost. A bounded pass may yield to
+			// completion because L1 treats it as late evidence and continues to
+			// admit this attempt's logs on later passes.
+			return nil
+		}
 		batch, err := outbox.spool.pendingBatch(ctx, attempt.attemptID, outbox.batchSize)
 		if err != nil {
 			return err
@@ -338,6 +342,9 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 			}
 			if err := outbox.spool.acknowledge(ctx, attempt.attemptID, response.Acknowledged); err != nil {
 				return err
+			}
+			if response.AttemptState == contract.AttemptLost {
+				lostBatches++
 			}
 			continue
 		}
@@ -368,7 +375,6 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 			return err
 		}
 	}
-	return nil
 }
 
 func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Client, attempt logSpoolAttempt) error {

@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 var protocolFiles = []string{
@@ -420,6 +422,24 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	if _, arbitraryPort := publicationProperties["published_port"]; arbitraryPort {
 		t.Fatal("publication request must not accept an agent-supplied port")
 	}
+	logsPath := object(t, paths["/v1/agent/jobs/{job_id}/attempts/{attempt_id}/logs"], "logs path")
+	logs := object(t, logsPath["post"], "logs POST")
+	logsResponses := object(t, logs["responses"], "logs responses")
+	logsOK := object(t, logsResponses["200"], "logs 200 response")
+	logsContent := object(t, logsOK["content"], "logs 200 content")
+	logsMedia := object(t, logsContent["application/json"], "logs 200 media type")
+	logsSchema := object(t, logsMedia["schema"], "logs 200 schema")
+	logsRequired := stringSet(t, logsSchema["required"])
+	if !logsRequired["acknowledged"] || !logsRequired["attempt_state"] {
+		t.Fatal("log append response must require acknowledgements and L1 attempt state")
+	}
+	logsProperties := object(t, logsSchema["properties"], "logs 200 properties")
+	responseStates := stringSet(t, object(t, logsProperties["attempt_state"], "logs attempt_state")["enum"])
+	for state := range contract.AttemptTransitions {
+		if !responseStates[string(state)] {
+			t.Errorf("log append response attempt_state is missing %q", state)
+		}
+	}
 
 	common := readObject(t, "common.v1.json")
 	components := object(t, common["components"], "components")
@@ -461,10 +481,13 @@ func TestAgentProtocolCarriesAttemptFenceAndLogContract(t *testing.T) {
 	}
 	gapReason := object(t, object(t, logGap["properties"], "LogGap.properties")["reason"], "LogGap.reason")
 	gapReasons := stringSet(t, gapReason["enum"])
-	for _, reason := range []string{"spool_eviction", "oversized_event", "replay_rejected", "late_evidence_window_expired", "recovery_replay_bound", "logger_source_incomplete"} {
-		if !gapReasons[reason] {
+	for _, reason := range contract.LogGapReasons() {
+		if !gapReasons[string(reason)] {
 			t.Errorf("LogGap reason is missing %q", reason)
 		}
+	}
+	if len(gapReasons) != len(contract.LogGapReasons()) {
+		t.Errorf("LogGap reason enum = %v, want exactly %v", gapReasons, contract.LogGapReasons())
 	}
 	serviceTruncation := object(t, schemas["ServiceLogTruncation"], "ServiceLogTruncation")
 	truncationRequired := stringSet(t, serviceTruncation["required"])

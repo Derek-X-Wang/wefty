@@ -750,6 +750,12 @@ ON CONFLICT(attempt_id, stream) DO UPDATE SET sequence=MAX(sequence, excluded.se
 			return fmt.Errorf("agent: release acknowledged log retention: %w", err)
 		}
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM spool_attempts
+WHERE attempt_id=? AND result_json IS NULL AND incomplete_json IS NULL
+  AND NOT EXISTS (SELECT 1 FROM spool_events WHERE attempt_id=?)
+  AND EXISTS (SELECT 1 FROM spool_completion_receipts WHERE attempt_id=? AND disposition='delivered')`, attemptID, attemptID, attemptID); err != nil {
+		return fmt.Errorf("agent: clean drained delivered spool attempt: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("agent: commit log spool acknowledgement: %w", err)
 	}

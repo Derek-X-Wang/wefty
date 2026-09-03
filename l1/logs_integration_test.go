@@ -39,6 +39,9 @@ func TestTailRunningJobWithOpaqueCursorAndPerStreamOrder(t *testing.T) {
 	if acknowledgement.Acknowledged[contract.LogStdout] != 1 || acknowledgement.Acknowledged[contract.LogStderr] != 0 {
 		t.Fatalf("acknowledged = %#v", acknowledgement.Acknowledged)
 	}
+	if acknowledgement.AttemptState != contract.AttemptRunning {
+		t.Fatalf("append attempt state = %q, want %q", acknowledgement.AttemptState, contract.AttemptRunning)
+	}
 
 	storedJob, err := h.store.GetJob(context.Background(), job.JobID)
 	if err != nil {
@@ -137,14 +140,7 @@ func TestLogReplayIsIdempotentAndRawJSONLMatchesRows(t *testing.T) {
 }
 
 func TestAgentLogGapReasonsPassL1Validation(t *testing.T) {
-	reasons := []contract.LogGapReason{
-		contract.LogGapSpoolEviction,
-		contract.LogGapOversizedEvent,
-		contract.LogGapReplayRejected,
-		contract.LogGapLateEvidenceWindowExpired,
-		contract.LogGapRecoveryReplayBound,
-		contract.LogGapLoggerSourceIncomplete,
-	}
+	reasons := contract.LogGapReasons()
 	for _, reason := range reasons {
 		t.Run(string(reason), func(t *testing.T) {
 			gap := &contract.LogGap{
