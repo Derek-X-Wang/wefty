@@ -1321,6 +1321,7 @@ const (
 	SweepActionRetained             SweepAction = "retained"
 	SweepActionRetentionBoundReaped SweepAction = "retention_bound_reaped"
 	SweepActionResumed              SweepAction = "resumed"
+	SweepActionResumeDeferred       SweepAction = "resume_deferred"
 	SweepActionRolledBack           SweepAction = "rolled_back"
 	SweepActionQuarantined          SweepAction = "quarantined"
 )

@@ -254,7 +254,8 @@ func TestComputerStorageResetResumesEveryPreparationBoundaryThenUsesSharedRemova
 			}
 			before := ResourceInventory{}
 			if err := engine.inventoryComputerDiskResources(&before); err != nil ||
-				!slices.Contains(before.ComputerResetManifests, oldName) || !slices.Contains(before.ComputerQuarantines, oldName) {
+				!slices.Contains(before.ComputerResetManifests, oldName) || len(before.ComputerQuarantines) != 0 ||
+				!slices.Contains(before.ComputerDiskAnomalies, oldName+"-reset-2:quarantine_authority_invalid") {
 				t.Fatalf("legacy reset residue was not inventoried: %+v err=%v", before, err)
 			}
 			if err := engine.deleteComputerDisk(storage, removal); err != nil {
@@ -262,7 +263,8 @@ func TestComputerStorageResetResumesEveryPreparationBoundaryThenUsesSharedRemova
 			}
 			after := ResourceInventory{}
 			if err := engine.inventoryComputerDiskResources(&after); err != nil ||
-				slices.Contains(after.ComputerResetManifests, oldName) || slices.Contains(after.ComputerQuarantines, oldName) {
+				slices.Contains(after.ComputerResetManifests, oldName) || slices.Contains(after.ComputerQuarantines, oldName) ||
+				slices.Contains(after.ComputerDiskAnomalies, oldName+"-reset-2:quarantine_authority_invalid") {
 				t.Fatalf("legacy reset residue survived shared removal: %+v err=%v", after, err)
 			}
 			resources := expectedComputerStorageRemovalResources(&storage)

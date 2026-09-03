@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -732,6 +733,67 @@ func (engine *uncertainGrowTestEngine) GrowComputerStorage(context.Context, Grow
 	return GrowComputerStorageResponse{}, &ComputerStorageGrowUncertainError{Cause: errors.New("allocation reassertion failed")}
 }
 
+type blockingGrowTestEngine struct {
+	*fakeEngine
+	growEntered chan struct{}
+	releaseGrow chan struct{}
+	growRuns    atomic.Int32
+}
+
+func (engine *blockingGrowTestEngine) GrowComputerStorage(ctx context.Context, request GrowComputerStorageRequest) (GrowComputerStorageResponse, error) {
+	engine.growRuns.Add(1)
+	close(engine.growEntered)
+	select {
+	case <-engine.releaseGrow:
+		return GrowComputerStorageResponse{Receipt: ComputerStorageGrowReceipt{Kind: "computer_storage_grow_applied", Applied: true}}, nil
+	case <-ctx.Done():
+		return GrowComputerStorageResponse{}, ctx.Err()
+	}
+}
+
+func TestSweepCannotOverlapSameSessionGrow(t *testing.T) {
+	base := newFakeEngine()
+	engine := &blockingGrowTestEngine{fakeEngine: base, growEntered: make(chan struct{}), releaseGrow: make(chan struct{})}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	// The admission sweep precedes the test overlap and must not use the probe channel.
+	requireSweep(t, session)
+	base.mu.Lock()
+	base.sweepEntered = make(chan struct{})
+	sweepEntered := base.sweepEntered
+	base.mu.Unlock()
+	handshake := session.Handshake()
+	request := GrowComputerStorageRequest{Storage: ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, IntentRevision: 2, DiskBytes: 8 << 20}, NewDiskBytes: 16 << 20,
+		Authority: ComputerStorageGrowAuthority{NodeID: "node-1", BootSessionID: "boot-1", HelperGeneration: handshake.SessionGeneration, RootInstanceID: "root", JobID: "job", OperationRevision: 2, OperationFence: "fence"}}
+	growDone := make(chan error, 1)
+	go func() { _, err := session.GrowComputerStorage(t.Context(), request); growDone <- err }()
+	<-engine.growEntered
+	sweepDone := make(chan error, 1)
+	go func() { _, err := session.Sweep(t.Context(), SweepRequest{}); sweepDone <- err }()
+	select {
+	case <-sweepEntered:
+		t.Fatal("Sweep overlapped Grow")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(engine.releaseGrow)
+	if err := <-growDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sweepEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Sweep did not proceed after Grow")
+	}
+	if err := <-sweepDone; err != nil || engine.growRuns.Load() != 1 {
+		t.Fatalf("sweep err=%v grow runs=%d", err, engine.growRuns.Load())
+	}
+}
+
 func TestComputerStorageGrowUncertainIsTypedAndDoesNotInvalidateSession(t *testing.T) {
 	engine := &uncertainGrowTestEngine{fakeEngine: newFakeEngine()}
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -1094,7 +1156,7 @@ func TestBootBarrierRetriesRefusedDialThenPublishesTypedUnavailable(t *testing.T
 	}
 }
 
-func TestBootBarrierClassifiesSocketBacklogWithoutCompletedHandshakeAsUnitUnavailable(t *testing.T) {
+func TestBootBarrierClassifiesSocketBacklogWithoutCompletedHandshakeAsStalled(t *testing.T) {
 	dials := 0
 	client := &Client{
 		ExpectedChecksum: "checksum-test",
@@ -1116,10 +1178,10 @@ func TestBootBarrierClassifiesSocketBacklogWithoutCompletedHandshakeAsUnitUnavai
 		t.Fatal(err)
 	}
 	err = barrier.Ensure(t.Context())
-	var unavailable *HelperUnitUnavailableError
-	if !errors.As(err, &unavailable) || unavailable.DialAttempts != 1 || dials != 1 ||
-		barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperUnitUnavailable {
-		t.Fatalf("backlogged helper socket outcome = %#v err=%v dials=%d reason=%q", unavailable, err, dials, barrier.CapabilityReasonCode())
+	var stalled *HelperHandshakeStalledError
+	if !errors.As(err, &stalled) || stalled.DialAttempts != 1 || dials != 1 ||
+		barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperHandshakeStalled {
+		t.Fatalf("backlogged helper socket outcome = %#v err=%v dials=%d reason=%q", stalled, err, dials, barrier.CapabilityReasonCode())
 	}
 }
 

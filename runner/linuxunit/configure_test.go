@@ -16,6 +16,8 @@ type configureTestRunner struct{ commands [][]string }
 func (runner *configureTestRunner) Run(_ context.Context, command string, arguments ...string) ([]byte, error) {
 	runner.commands = append(runner.commands, append([]string{command}, arguments...))
 	switch command {
+	case "systemctl":
+		return []byte("systemd 255 (255.4)\n"), nil
 	case "getent":
 		return nil, errors.New("group absent")
 	case "id":
@@ -48,7 +50,7 @@ func TestConfigureWritesUnitsAndConfigButOnlyPrintsServiceCommands(t *testing.T)
 		t.Fatalf("configure receipt=%+v", receipt)
 	}
 	for _, command := range runner.commands {
-		if command[0] == "systemctl" {
+		if command[0] == "systemctl" && !reflect.DeepEqual(command, []string{"systemctl", "--version"}) {
 			t.Fatalf("configure executed service convergence: %v", runner.commands)
 		}
 	}
@@ -63,6 +65,7 @@ func TestConfigureWritesUnitsAndConfigButOnlyPrintsServiceCommands(t *testing.T)
 		}
 	}
 	if len(chowns) != 3 || !reflect.DeepEqual(runner.commands, [][]string{
+		{"systemctl", "--version"},
 		{"getent", "group", HelperGroup}, {"groupadd", "--system", HelperGroup},
 		{"id", "-nG", "wefty"}, {"usermod", "-a", "-G", HelperGroup, "wefty"},
 	}) {

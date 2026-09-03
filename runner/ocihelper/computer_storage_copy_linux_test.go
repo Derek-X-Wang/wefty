@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -192,6 +193,43 @@ func TestComputerStorageCopyResumesEveryCrashBoundaryAndPreservesBrowserBytes(t 
 				}
 			})
 		}
+	}
+}
+
+func TestStartupCompletesCopyKilledAfterAttachmentPublication(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "restore", source.Receipt.AllocatedSize)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		storageCopyFinalize: fakeCloneFinalize(t), capacityReservations: make(map[string]*capacityReservation),
+		attempts: make(map[string]*containerdAttempt)}
+	crash := errors.New("killed after attachment publication")
+	engine.storageCopyHook = func(phase computerStorageCopyPhase) error {
+		if phase == computerStorageCopyPublished {
+			return crash
+		}
+		return nil
+	}
+	if _, err := engine.CopyComputerStorage(t.Context(), request); !errors.Is(err, crash) {
+		t.Fatalf("copy checkpoint error = %v", err)
+	}
+	name, _ := deterministicComputerDiskName(request.Destination)
+	destinationRoot := filepath.Join(root, "computer-disks", name)
+	if _, present, err := readComputerDiskManifest(filepath.Join(destinationRoot, "attachment.json")); err != nil || !present {
+		t.Fatalf("published attachment present=%t err=%v", present, err)
+	}
+	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt)}
+	if err := engine.sweepComputerDisks(t.Context(), "startup-copy"); err != nil {
+		t.Fatal(err)
+	}
+	manifest, present, err := readComputerStorageCopyManifest(filepath.Join(destinationRoot, "storage-copy.json"))
+	if err != nil || !present || manifest.Phase != computerStorageCopyPublished || manifest.Receipt == nil {
+		t.Fatalf("startup copy record = %+v present=%t err=%v", manifest, present, err)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionResumed && item.Method == "computer_storage_copy"
+	}) {
+		t.Fatalf("startup copy evidence = %+v", engine.computerDiskSweepEvidence)
 	}
 }
 

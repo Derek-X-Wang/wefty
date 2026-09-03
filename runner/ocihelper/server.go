@@ -20,7 +20,8 @@ import (
 const (
 	defaultHeartbeatTimeout = 3 * time.Second
 	defaultMaximumDeadman   = 2 * time.Minute
-	defaultReapTimeout      = 10 * time.Second
+	DefaultReapTimeout      = 10 * time.Second
+	defaultReapTimeout      = DefaultReapTimeout
 	defaultConnectionLimit  = 64
 	maximumReapedBoots      = 256
 )
@@ -1418,6 +1419,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
+		server.createSweep.RLock()
+		defer server.createSweep.RUnlock()
 		response, err := engine.GrowComputerStorage(operation.ctx, body)
 		var uncertain *ComputerStorageGrowUncertainError
 		if errors.As(err, &uncertain) {
@@ -1507,6 +1510,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
+		server.createSweep.RLock()
+		defer server.createSweep.RUnlock()
 		response, err := engine.CopyComputerStorage(operation.ctx, body)
 		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodExportCustody:

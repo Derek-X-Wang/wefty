@@ -372,6 +372,11 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		request.Authority.JobID == "" || request.Authority.OperationRevision < 1 || request.Authority.CleanupFence == "" {
 		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy request is incomplete")
 	}
+	if quarantined, err := computerDiskQuarantined(engine.config.RuntimeRoot, request.Destination); err != nil {
+		return CopyComputerStorageResponse{}, err
+	} else if quarantined {
+		return CopyComputerStorageResponse{}, &ComputerStorageQuarantinedError{Storage: request.Destination}
+	}
 	var sourcePath string
 	var err error
 	if importSource {

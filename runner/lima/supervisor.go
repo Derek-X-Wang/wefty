@@ -606,6 +606,8 @@ func lockSupervisorCycle(ctx context.Context, mutex *sync.Mutex) error {
 
 func (barrier *SupervisedBootBarrier) ensureHelperReady(ctx context.Context, expected OCIIntent) error {
 	backoff := barrier.Supervisor.config.InitialBackoff
+	lastReason := contract.CapabilityReasonCode("")
+	var lastErr error
 	for {
 		err := barrier.Barrier.Ensure(ctx)
 		if err == nil {
@@ -616,6 +618,8 @@ func (barrier *SupervisedBootBarrier) ensureHelperReady(ctx context.Context, exp
 			return nil
 		}
 		reason := classifyHelperBarrierError(err)
+		lastReason = reason
+		lastErr = err
 		if reason == contract.CapabilityReasonHelperVersionMismatch || reason == contract.CapabilityReasonLocalPermissionDenied ||
 			reason == contract.CapabilityReasonBootSweepFailed {
 			return err
@@ -631,6 +635,9 @@ func (barrier *SupervisedBootBarrier) ensureHelperReady(ctx context.Context, exp
 		if backoff > maximumLimaRepairBackoff {
 			backoff = maximumLimaRepairBackoff
 		}
+	}
+	if lastReason == contract.CapabilityReasonHelperHandshakeStalled {
+		return errors.Join(errors.New("Lima helper handshake remained stalled across recovery deadline"), lastErr, ctx.Err())
 	}
 	barrier.Barrier.Invalidate()
 	stopContext, cancel := barrier.Supervisor.config.withTimeout(context.WithoutCancel(ctx), barrier.Supervisor.config.CommandTimeout)
@@ -747,6 +754,10 @@ func classifyHelperBarrierError(err error) contract.CapabilityReasonCode {
 	var unavailable *ocihelper.HelperUnitUnavailableError
 	if errors.As(err, &unavailable) {
 		return contract.CapabilityReasonHelperUnitUnavailable
+	}
+	var stalled *ocihelper.HelperHandshakeStalledError
+	if errors.As(err, &stalled) {
+		return contract.CapabilityReasonHelperHandshakeStalled
 	}
 	var rpcErr *ocihelper.RPCError
 	if errors.As(err, &rpcErr) {

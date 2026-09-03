@@ -177,6 +177,7 @@ type GuestHelperInstallConfig struct {
 	BootSessionID       string
 	MemoryCapacityBytes int64
 	MemoryReserveBytes  int64
+	SystemdVersion      int
 }
 
 type GuestHelperRemovalConfig struct {
@@ -272,6 +273,7 @@ func renderGuestServiceUnit(config GuestHelperInstallConfig) []byte {
 	for index := range arguments {
 		arguments[index] = systemdQuote(arguments[index])
 	}
+	restartPolicy := guestHelperRestartPolicy(config.SystemdVersion)
 	return []byte(`[Unit]
 Description=Wefty privileged OCI helper
 After=containerd.service
@@ -286,11 +288,15 @@ ExecStart=` + strings.Join(arguments, " ") + `
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure
-RestartSec=250ms
-RestartSteps=6
-RestartMaxDelaySec=2s
-NoNewPrivileges=false
+` + restartPolicy + `NoNewPrivileges=false
 `)
+}
+
+func guestHelperRestartPolicy(systemdVersion int) string {
+	if systemdVersion == 0 || systemdVersion >= 254 {
+		return "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n"
+	}
+	return "RestartSec=1s\n"
 }
 
 func systemdQuote(value string) string {

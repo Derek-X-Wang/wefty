@@ -300,7 +300,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			"Restart=on-failure",
 			"RestartSec=250ms",
 			"RestartSteps=6",
-			"RestartMaxDelaySec=2s",
+			"RestartMaxDelaySec=1s",
 			"if: ${{ always() && runner.os == 'Linux' }}",
 			"journalctl --boot --no-pager --utc --output=short-precise",
 			"-u wefty-oci-helper-realtiming.service",
@@ -486,8 +486,6 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 		},
 	}
 	for name, path := range map[string]string{
-		"native-linux":  "../runner/linuxunit/units.go",
-		"lima-guest":    "../runner/lima/bootstrap.go",
 		"pr-realtiming": "../.github/workflows/service-acceptance-realtiming.yml",
 		"scheduled":     "../.github/workflows/service-acceptance-realtiming-scheduled.yml",
 	} {
@@ -496,11 +494,17 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 			t.Fatalf("%s helper policy sections = %#v, want %#v", name, got, want)
 		}
 	}
-	takeover := ocihelper.TakeoverTimeoutForReap(10 * time.Second)
-	composed := linuxunit.HelperSaturatedRestartDelaySum + linuxunit.HelperStartupListenBudget + linuxunit.HelperRestartTakeoverMargin
-	if composed > takeover || linuxunit.HelperSaturatedRestartDelaySum != 14*time.Second {
-		t.Fatalf("saturated helper restart derivation = delays %s + listen %s + margin %s = %s, takeover %s",
-			linuxunit.HelperSaturatedRestartDelaySum, linuxunit.HelperStartupListenBudget, linuxunit.HelperRestartTakeoverMargin, composed, takeover)
+	if got := linuxunit.HelperRestartPolicy(255); got != "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n" {
+		t.Fatalf("modern systemd helper policy = %q", got)
+	}
+	if got := linuxunit.HelperRestartPolicy(252); got != "RestartSec=1s\n" || strings.Contains(got, "RestartSteps") {
+		t.Fatalf("legacy systemd helper policy = %q", got)
+	}
+	takeover := ocihelper.TakeoverTimeoutForReap(ocihelper.DefaultReapTimeout)
+	composed := linuxunit.HelperSaturatedRestartDelaySum + ocihelper.DefaultReapTimeout + linuxunit.HelperRestartTakeoverMargin
+	if composed > takeover || linuxunit.HelperSaturatedRestartDelaySum != 7*time.Second {
+		t.Fatalf("saturated helper restart derivation = delays %s + reap %s + margin %s = %s, takeover %s",
+			linuxunit.HelperSaturatedRestartDelaySum, ocihelper.DefaultReapTimeout, linuxunit.HelperRestartTakeoverMargin, composed, takeover)
 	}
 }
 
@@ -531,14 +535,25 @@ func parseHelperServicePolicySections(text string) (map[string]map[string]string
 	}
 	sections := map[string]map[string]string{"Unit": {}, "Service": {}}
 	seen := map[string]map[string]int{"Unit": {}, "Service": {}}
+	seenSections := map[string]bool{}
+	installSeen := false
 	section := ""
 	for _, raw := range strings.Split(text[start:], "\n") {
 		line := strings.TrimSpace(raw)
-		if line == "[Install]" || line == "UNIT" || line == "`)" || line == "`)," {
+		if line == "UNIT" || line == "`)" || line == "`)," {
 			break
+		}
+		if line == "[Install]" {
+			installSeen = true
+			section = "Install"
+			continue
 		}
 		if line == "[Unit]" || line == "[Service]" {
 			section = strings.Trim(line, "[]")
+			if seenSections[section] || installSeen {
+				return nil, fmt.Errorf("helper policy repeats or reopens [%s] after [Install]", section)
+			}
+			seenSections[section] = true
 			continue
 		}
 		key, value, ok := strings.Cut(line, "=")
@@ -547,6 +562,9 @@ func parseHelperServicePolicySections(text string) (map[string]map[string]string
 		}
 		switch key {
 		case "StartLimitIntervalSec", "StartLimitBurst", "Restart", "RestartSec", "RestartSteps", "RestartMaxDelaySec":
+			if installSeen {
+				return nil, fmt.Errorf("helper policy key %s appears after [Install]", key)
+			}
 			seen[section][key]++
 			if seen[section][key] != 1 {
 				return nil, fmt.Errorf("helper policy duplicates %s in [%s]", key, section)
@@ -565,7 +583,7 @@ StartLimitIntervalSec=0
 Restart=on-failure
 RestartSec=250ms
 RestartSteps=6
-RestartMaxDelaySec=2s
+RestartMaxDelaySec=1s
 RestartSec=30s
 StartLimitBurst=1
 [Install]
@@ -573,6 +591,26 @@ WantedBy=multi-user.target
 `)
 	if err == nil || !strings.Contains(err.Error(), "duplicates RestartSec") {
 		t.Fatalf("late last-wins override was accepted: %v", err)
+	}
+}
+
+func TestHelperSystemdPolicyParserRejectsServiceReopenedAfterInstall(t *testing.T) {
+	_, err := parseHelperServicePolicySections(`[Unit]
+Description=Wefty privileged OCI helper
+StartLimitIntervalSec=0
+[Service]
+Restart=on-failure
+RestartSec=250ms
+RestartSteps=6
+RestartMaxDelaySec=1s
+[Install]
+WantedBy=multi-user.target
+[Service]
+RestartMaxDelaySec=9s
+UNIT
+`)
+	if err == nil || !strings.Contains(err.Error(), "after [Install]") {
+		t.Fatalf("post-install service override was accepted: %v", err)
 	}
 }
 

@@ -45,16 +45,18 @@ user is added to that group, while the service runs the private helper mode as
 root with a narrow UID allowlist. Every shipped systemd helper service, native
 Linux and Lima, sets `StartLimitIntervalSec=0` under `[Unit]` and
 `Restart=on-failure`, `RestartSec=250ms`, `RestartSteps=6`, and
-`RestartMaxDelaySec=2s` under `[Service]`; the workflow-written realtiming
+`RestartMaxDelaySec=1s` under `[Service]`; systemd versions before 254 use a fixed
+`RestartSec=1s` because the geometric directives are unavailable. The workflow-written realtiming
 units use the same policy. `RestartSteps` and `RestartMaxDelaySec` require
 systemd 254; `ubuntu-latest` and the Lima `template:_images/ubuntu-24.04`
 baseline both provide systemd 255, and the Linux receipt records the executing
-version. The six steps are derived from the incident's six service starts in
+version and selected rendering. The six steps are derived from the incident's six service starts in
 610 ms. At a saturated production restart counter, the kill plus six injected
-exits incur seven delays capped at two seconds: 14 seconds total. The fixed
-startup-to-listen budget is four seconds and the stated margin is two seconds,
-so `14 s + 4 s + 2 s = 20 s`, exactly the unchanged
-`TakeoverTimeoutForReap(10 s)` window; earlier geometric steps are faster.
+exits incur seven delays capped at one second: seven seconds total. Startup
+recovery is bounded by the enforced ten-second `ReapTimeout`; with the stated
+two-second margin, `7 s + 10 s + 2 s = 19 s`, within the unchanged
+`TakeoverTimeoutForReap(10 s)` window. The helper-exec-to-ready observation is
+reported as a measurement, not treated as a separate unenforced bound.
 This bounds saturated deterministic-failure churn at no more than 0.5 Hz
 instead of sustaining a four-Hz journal loop. Disabling the
 start-limit interval prevents service exhaustion from failing the triggering
@@ -205,9 +207,10 @@ to #301 because it changes startup concurrency and authority publication.
 While taking over, the client retries dial-time `ENOENT`, `ECONNREFUSED`, and
 `ECONNRESET` within that same fixed window. Protocol, authentication, and typed
 RPC errors after a completed handshake stay hard and immediate. Window expiry
-with zero completed handshakes returns `helper_unit_unavailable` with the
-observed connection-attempt count, including the live-socket/crash-loop case
-where `connect()` enters the socket backlog but startup never reaches Accept.
+returns `helper_unit_unavailable` only when every dial positively observed
+`ENOENT`, `ECONNREFUSED`, or `ECONNRESET`. A connected socket backlog that never
+completes a handshake returns retryable `helper_handshake_stalled`; Lima
+rechecks and backs off but never force-stops the VM for that reason.
 `BootBarrier`
 publishes that distinct closed-vocabulary reason through the native agent
 capability receipt, and Lima preserves it while still running the same bounded
@@ -807,13 +810,21 @@ staged or renamed image digest as resumable authority, completes the atomic
 rename when needed, verifies allocation, and publishes `attachment.json`
 before inventory admission; an earlier staged phase is rolled back because no
 destination generation was published. Grow and copy recovery emit typed
-`resumed` or `rolled_back` sweep evidence. A size/allocation mismatch without matching durable operation
+`resumed` or `rolled_back` sweep evidence. Operational recovery failures with
+valid durable authority emit `resume_deferred`, retain the disk and recovery
+record, keep that Computer generation unattachable, and retry on the next
+sweep; grow recovery preens ext4 with `e2fsck -f -p` before resizing. A
+size/allocation mismatch without matching durable operation
 authority is never reinterpreted as a successful operation: startup moves the
 whole generation into `computer-disk-quarantine`, writes a typed
 `computer_disk_anomaly_quarantined` record, and emits `quarantined` sweep
 evidence with the closed reason. Quarantined generations remain visible in
 `ComputerQuarantines` and operator/removal surfaces but are durable retained
-state, not runnable namespace residue. The affected Computer therefore stays
+state, not runnable namespace residue. Quarantine receipts retain the full
+payload for 24 hours; bounded GC may remove the payload after that point but
+retains the typed tombstone, so generation N is never admissible again. The
+authorized recovery path is a reset that prepares and admits generation N+1,
+followed by normal removal authority for N. The affected Computer therefore stays
 fail-closed while the helper continues serving the rest of the Node. Startup's
 namespace-absence promise remains exact for every non-quarantined generation.
 

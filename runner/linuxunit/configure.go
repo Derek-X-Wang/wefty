@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -19,9 +20,11 @@ type ConfigurePaths struct {
 }
 
 type ConfigureReceipt struct {
-	GroupCreated bool       `json:"group_created"`
-	UserAdded    bool       `json:"user_added"`
-	Commands     [][]string `json:"systemctl_commands"`
+	GroupCreated   bool       `json:"group_created"`
+	UserAdded      bool       `json:"user_added"`
+	Commands       [][]string `json:"systemctl_commands"`
+	SystemdVersion int        `json:"systemd_version"`
+	RestartPolicy  string     `json:"helper_restart_policy"`
 }
 
 type CommandRunner interface {
@@ -38,11 +41,26 @@ func Configure(ctx context.Context, config Config, paths ConfigurePaths, runner 
 	if runner == nil || !filepath.IsAbs(paths.UnitDirectory) || !filepath.IsAbs(paths.NodeConfig) || !filepath.IsAbs(paths.ControlSocket) {
 		return ConfigureReceipt{}, fmt.Errorf("Linux OCI setup requires absolute install paths and a command runner")
 	}
+	versionOutput, err := runner.Run(ctx, "systemctl", "--version")
+	if err != nil {
+		return ConfigureReceipt{}, fmt.Errorf("inspect systemd version: %w", err)
+	}
+	fields := strings.Fields(string(versionOutput))
+	if len(fields) < 2 || fields[0] != "systemd" {
+		return ConfigureReceipt{}, fmt.Errorf("inspect systemd version: unexpected output")
+	}
+	config.SystemdVersion, err = strconv.Atoi(fields[1])
+	if err != nil {
+		return ConfigureReceipt{}, fmt.Errorf("inspect systemd version: %w", err)
+	}
 	units, err := Render(config)
 	if err != nil {
 		return ConfigureReceipt{}, err
 	}
-	receipt := ConfigureReceipt{}
+	receipt := ConfigureReceipt{SystemdVersion: config.SystemdVersion, RestartPolicy: "legacy_fixed_1s"}
+	if config.SystemdVersion >= 254 {
+		receipt.RestartPolicy = "geometric_capped_1s"
+	}
 	if paths.chown == nil {
 		paths.chown = os.Chown
 	}

@@ -223,6 +223,9 @@ func TestDoctorGoldenParityCoversEveryReasonAndL1MetadataTuple(t *testing.T) {
 		{contract.CapabilityReasonHelperUnitUnavailable, passThrough, func(config *DoctorConfig) {
 			setProbeReason(config, contract.CapabilityReasonHelperUnitUnavailable)
 		}},
+		{contract.CapabilityReasonHelperHandshakeStalled, passThrough, func(config *DoctorConfig) {
+			setProbeReason(config, contract.CapabilityReasonHelperHandshakeStalled)
+		}},
 		{contract.CapabilityReasonHelperVersionMismatch, direct, func(config *DoctorConfig) {
 			mutateHelper(config, func(snapshot *HelperDoctorSnapshot) { snapshot.ProtocolVersion++ })
 		}},

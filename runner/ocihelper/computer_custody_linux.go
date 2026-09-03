@@ -365,6 +365,11 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 		request.SourceDigest == "" || request.Authority.HelperGeneration == 0 || request.JobSpecHash == "" {
 		return ExportComputerCustodyResponse{}, errors.New("Custody export request is incomplete")
 	}
+	if quarantined, err := computerDiskQuarantined(engine.config.RuntimeRoot, request.Storage); err != nil {
+		return ExportComputerCustodyResponse{}, err
+	} else if quarantined {
+		return ExportComputerCustodyResponse{}, &ComputerStorageQuarantinedError{Storage: request.Storage}
+	}
 	externalRoot, existingAncestor, err := resolveSafeExternalCustodyRoot(engine.config.RuntimeRoot, request.ExternalPath)
 	if err != nil {
 		if strings.Contains(err.Error(), "outside the managed root") {

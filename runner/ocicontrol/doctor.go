@@ -753,6 +753,7 @@ func StableDoctorReasonCodes() []contract.CapabilityReasonCode {
 		contract.CapabilityReasonOCIIntentDisabled, contract.CapabilityReasonPrerequisiteMissing,
 		contract.CapabilityReasonRuntimeVersionUnsupported, contract.CapabilityReasonHelperUnreachable,
 		contract.CapabilityReasonHelperUnitUnavailable,
+		contract.CapabilityReasonHelperHandshakeStalled,
 		contract.CapabilityReasonHelperVersionMismatch, contract.CapabilityReasonHelperHandshakeFailed,
 		contract.CapabilityReasonBootSweepFailed, contract.CapabilityReasonProbeFailed,
 		contract.CapabilityReasonLimaStopped, contract.CapabilityReasonLimaBroken,

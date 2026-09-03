@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -253,6 +254,40 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 	}
 }
 
+func TestSupervisedBarrierNeverForceStopsStalledHandshake(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceRunning, InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	supervisor.config.RecoveryTimeout = 100 * time.Millisecond
+	supervisor.config.wait = func(ctx context.Context, _ time.Duration) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	client := &ocihelper.Client{Version: ocihelper.ProtocolVersion, ExpectedChecksum: "sha256:" + strings.Repeat("a", 64),
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			clientSide, serverSide := net.Pipe()
+			go func() { <-ctx.Done(); _ = serverSide.Close() }()
+			return clientSide, nil
+		}}
+	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{
+		TakeoverTimeout: 20 * time.Millisecond, TakeoverRetry: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+	err = barrier.Ensure(t.Context())
+	var stalled *ocihelper.HelperHandshakeStalledError
+	if !errors.As(err, &stalled) || barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperHandshakeStalled {
+		t.Fatalf("stalled handshake err=%v reason=%q", err, barrier.CapabilityReasonCode())
+	}
+	for _, command := range runner.commandsSnapshot() {
+		if slices.Contains(command, "stop") {
+			t.Fatalf("stalled handshake force-stopped Lima: %v", command)
+		}
+	}
+}
+
 func TestSupervisedBarrierHoldsCycleLockAcrossLimaAndHelperBarrier(t *testing.T) {
 	intent := newMutableIntent(true)
 	runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
@@ -428,6 +463,7 @@ func TestSupervisedBarrierReasonsStayInStableVocabulary(t *testing.T) {
 		{err: &ocihelper.RPCError{Code: ocihelper.CodeVersionMismatch}, want: contract.CapabilityReasonHelperVersionMismatch},
 		{err: &ocihelper.RPCError{Code: ocihelper.CodePeerUnauthenticated}, want: contract.CapabilityReasonLocalPermissionDenied},
 		{err: &ocihelper.HelperUnitUnavailableError{DialAttempts: 4, Cause: os.ErrNotExist}, want: contract.CapabilityReasonHelperUnitUnavailable},
+		{err: &ocihelper.HelperHandshakeStalledError{DialAttempts: 1, Cause: context.DeadlineExceeded}, want: contract.CapabilityReasonHelperHandshakeStalled},
 		{err: errors.New("acquire: dial OCI helper: connection refused at private path"), want: contract.CapabilityReasonHelperUnreachable},
 		{err: errors.New("send OCI helper handshake: reset"), want: contract.CapabilityReasonHelperHandshakeFailed},
 		{err: errors.New("verify OCI runtime namespace: residue"), want: contract.CapabilityReasonBootSweepFailed},

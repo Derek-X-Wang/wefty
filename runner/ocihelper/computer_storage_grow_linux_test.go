@@ -30,6 +30,7 @@ func TestStartupResumesDurableComputerGrowBeforeInventoryVerification(t *testing
 		capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt),
 		computerGrowResize:          func(context.Context, string, string, int64, int64) error { return nil },
 		computerGrowFilesystemBytes: func(context.Context, string) (int64, error) { return request.NewDiskBytes, nil },
+		computerGrowPreen:           func(context.Context, string) error { return nil },
 	}
 	if err := engine.sweepComputerDisks(t.Context(), "startup-sweep"); err != nil {
 		t.Fatal(err)
@@ -51,6 +52,85 @@ func TestStartupResumesDurableComputerGrowBeforeInventoryVerification(t *testing
 		return item.ID == name && item.Action == SweepActionResumed && item.Method == "computer_storage_grow"
 	}) {
 		t.Fatalf("recovered grow evidence = %+v", evidence)
+	}
+}
+
+func TestStartupDefersTransientGrowRecoveryAndNextSweepCompletes(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	diskRoot := filepath.Dir(imagePath)
+	if err := writeComputerStorageGrowIntent(diskRoot, request); err != nil {
+		t.Fatal(err)
+	}
+	if err := fullyAllocateComputerDisk(imagePath, request.NewDiskBytes); err != nil {
+		t.Fatal(err)
+	}
+	transient := errors.New("transient e2fsck failure")
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem(),
+		capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt),
+		computerGrowPreen:           func(context.Context, string) error { return transient },
+		computerGrowResize:          func(context.Context, string, string, int64, int64) error { return nil },
+		computerGrowFilesystemBytes: func(context.Context, string) (int64, error) { return request.NewDiskBytes, nil },
+	}
+	if err := engine.sweepComputerDisks(t.Context(), "deferred"); err != nil {
+		t.Fatal(err)
+	}
+	name, _ := deterministicComputerDiskName(request.Storage)
+	if _, err := os.Stat(diskRoot); err != nil {
+		t.Fatalf("deferred generation moved: %v", err)
+	}
+	if _, present, err := readComputerStorageGrowIntent(diskRoot); err != nil || !present {
+		t.Fatalf("deferred grow record present=%t err=%v", present, err)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionResumeDeferred
+	}) {
+		t.Fatalf("deferred evidence = %+v", engine.computerDiskSweepEvidence)
+	}
+	if _, err := engine.attachComputerDisk(t.Context(), request.Storage, testComputerAuthority("deferred", "fence", "boot")); !errors.As(err, new(*ComputerStorageResumeDeferredError)) {
+		t.Fatalf("deferred generation was attachable: %v", err)
+	}
+	inventory := ResourceInventory{}
+	if err := engine.inventoryComputerDiskResources(&inventory); err != nil || len(inventory.ComputerDiskAnomalies) != 0 {
+		t.Fatalf("deferred namespace inventory = %+v err=%v", inventory, err)
+	}
+	engine.computerGrowPreen = func(context.Context, string) error { return nil }
+	if err := engine.sweepComputerDisks(t.Context(), "retry"); err != nil {
+		t.Fatal(err)
+	}
+	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
+	if err != nil || !present || manifest.Storage.DiskBytes != request.NewDiskBytes {
+		t.Fatalf("retried grow = %+v present=%t err=%v", manifest, present, err)
+	}
+}
+
+func TestStartupContextExpiryDefersGrowWithoutQuarantine(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	diskRoot := filepath.Dir(imagePath)
+	if err := writeComputerStorageGrowIntent(diskRoot, request); err != nil {
+		t.Fatal(err)
+	}
+	if err := fullyAllocateComputerDisk(imagePath, request.NewDiskBytes); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem(),
+		capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt),
+		computerGrowPreen: func(ctx context.Context, _ string) error { return ctx.Err() },
+	}
+	if err := engine.sweepComputerDisks(ctx, "expired"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(diskRoot); err != nil {
+		t.Fatalf("expired recovery moved generation: %v", err)
+	}
+	entries, err := readDirectoryIfPresent(filepath.Join(root, "computer-disk-quarantine"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("expired recovery quarantine=%v err=%v", entries, err)
 	}
 }
 
@@ -274,6 +354,37 @@ func TestComputerGrowNoopResizeFailsReadback(t *testing.T) {
 	}
 	if info, err := os.Stat(imagePath); err != nil || info.Size() != request.Storage.DiskBytes {
 		t.Fatalf("rolled-back image size = %v err=%v", info, err)
+	}
+}
+
+func TestComputerGrowFailureRemovesIntentSoSmallerGrowCanSucceed(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	resizeRuns := 0
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt),
+		computerGrowResize: func(_ context.Context, path, _ string, _, newBytes int64) error {
+			resizeRuns++
+			if resizeRuns == 1 {
+				return unix.ENOSPC
+			}
+			return fullyAllocateComputerDisk(path, newBytes)
+		},
+		computerGrowFilesystemBytes: func(context.Context, string) (int64, error) { return 12 << 20, nil },
+	}
+	if response, err := engine.GrowComputerStorage(t.Context(), request); err != nil || response.Receipt.FailureCode != "insufficient_disk" {
+		t.Fatalf("first grow = %+v err=%v", response, err)
+	}
+	if _, present, err := readComputerStorageGrowIntent(filepath.Dir(imagePath)); err != nil || present {
+		t.Fatalf("failed grow intent present=%t err=%v", present, err)
+	}
+	request.NewDiskBytes = 12 << 20
+	request.Storage.IntentRevision = 8
+	request.Authority.OperationRevision = 8
+	request.Authority.OperationFence = "fence-2"
+	response, err := engine.GrowComputerStorage(t.Context(), request)
+	if err != nil || !response.Receipt.Applied {
+		t.Fatalf("smaller retry grow = %+v err=%v", response, err)
 	}
 }
 

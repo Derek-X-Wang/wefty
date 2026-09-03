@@ -133,6 +133,8 @@ type ContainerdEngine struct {
 	computerGrowResize          func(context.Context, string, string, int64, int64) error
 	computerGrowFilesystemBytes func(context.Context, string) (int64, error)
 	computerGrowAllocate        func(string, int64) error
+	computerGrowPreen           func(context.Context, string) error
+	computerQuarantineHook      func(computerDiskQuarantinePhase) error
 	computerDiskSweepMu         sync.Mutex
 	computerDiskSweepEvidence   []SweepEvidence
 	computerReimageImageInspect func(context.Context, PreflightComputerReimageRequest) (computerReimageImageFacts, error)

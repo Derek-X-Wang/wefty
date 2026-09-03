@@ -403,6 +403,11 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 	if err != nil {
 		return GrowComputerStorageResponse{}, err
 	}
+	if quarantined, quarantineErr := computerDiskQuarantined(engine.config.RuntimeRoot, request.Storage); quarantineErr != nil {
+		return GrowComputerStorageResponse{}, quarantineErr
+	} else if quarantined {
+		return GrowComputerStorageResponse{}, &ComputerStorageQuarantinedError{Storage: request.Storage}
+	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
 	imagePath := filepath.Join(diskRoot, "disk.ext4")
 	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
@@ -473,6 +478,9 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 		}
 		engine.rollbackGrowCapacity(request.Authority.JobID, request.Storage.DiskBytes, true)
 		_ = os.Truncate(imagePath, request.Storage.DiskBytes)
+		if removeErr := removeComputerStorageGrowIntent(diskRoot); removeErr != nil {
+			return GrowComputerStorageResponse{}, errors.Join(err, removeErr)
+		}
 		if errors.Is(err, unix.ENOSPC) || strings.Contains(strings.ToLower(err.Error()), "no space left on device") {
 			receipt, receiptErr := growReceipt(request, "computer_storage_grow_failed_unchanged", false, "insufficient_disk", available)
 			return GrowComputerStorageResponse{Receipt: receipt}, receiptErr

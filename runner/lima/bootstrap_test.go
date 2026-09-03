@@ -223,7 +223,7 @@ func TestGuestHelperUnitsPinSocketAuthorityAndPrivateMode(t *testing.T) {
 		"User=root", "Group=root", "WEFTY_OCI_HELPER_ALLOWED_UIDS=501", `"` + GuestHelperPath + `" "` + ocihelper.InvocationArg + `"`,
 		"--oci-allowed-mount-root=/mnt/wefty-host", "--oci-lima-host-mount-root=/Users/operator/wefty-mounts",
 		"--oci-memory-capacity-bytes=4294967296", "--oci-memory-reserve-bytes=1073741824",
-		"StartLimitIntervalSec=0", "Restart=on-failure", "RestartSec=250ms", "RestartSteps=6", "RestartMaxDelaySec=2s",
+		"StartLimitIntervalSec=0", "Restart=on-failure", "RestartSec=250ms", "RestartSteps=6", "RestartMaxDelaySec=1s",
 	} {
 		if !strings.Contains(service, want) {
 			t.Fatalf("service unit missing %q:\n%s", want, service)
@@ -231,6 +231,13 @@ func TestGuestHelperUnitsPinSocketAuthorityAndPrivateMode(t *testing.T) {
 	}
 	if strings.Contains(socket+service, "containerd.sock\nHost") {
 		t.Fatalf("guest units expose raw containerd:\n%s\n%s", socket, service)
+	}
+}
+
+func TestGuestHelperUnitUsesBoundedLegacySystemdRestartPolicy(t *testing.T) {
+	service := string(renderGuestServiceUnit(GuestHelperInstallConfig{HostMountRoot: "/Users/operator/wefty-mounts", GuestUID: 501, SystemdVersion: 252}))
+	if !strings.Contains(service, "RestartSec=1s") || strings.Contains(service, "RestartSteps=") || strings.Contains(service, "RestartMaxDelaySec=") {
+		t.Fatalf("legacy guest helper policy = %s", service)
 	}
 }
 
@@ -476,5 +483,6 @@ func validGuestHelperInstallConfig(t *testing.T) GuestHelperInstallConfig {
 		ProbeArchive: archive, ProbeReference: "example.invalid/probe", ProbeDigest: "sha256:" + strings.Repeat("a", 64),
 		NodeID: "node-mac", BootSessionID: "boot-mac",
 		MemoryCapacityBytes: 4 << 30, MemoryReserveBytes: 1 << 30,
+		SystemdVersion: 255,
 	}
 }

@@ -15,7 +15,10 @@ import (
 
 const defaultTakeoverRetryInterval = 25 * time.Millisecond
 
-const HelperUnitUnavailable = "helper_unit_unavailable"
+const (
+	HelperUnitUnavailable  = "helper_unit_unavailable"
+	HelperHandshakeStalled = "helper_handshake_stalled"
+)
 
 var errTakeoverWindowExpired = errors.New("OCI helper takeover window expired")
 
@@ -47,13 +50,26 @@ func (err *ReapTimeoutConfigurationError) Error() string {
 	return fmt.Sprintf("OCI helper reap timeout configuration mismatch: advertised=%s takeover_derived_from=%s", err.AdvertisedReapTimeout, err.TakeoverReapTimeout)
 }
 
-// HelperUnitUnavailableError means the helper completed no handshake across
-// the complete takeover window. It includes absent/refused sockets and a live
-// socket backlog whose crash-looping service never reaches Accept.
+// HelperUnitUnavailableError means every dial across the complete takeover
+// window positively proved that the socket unit was absent or refusing/resetting.
 type HelperUnitUnavailableError struct {
 	DialAttempts int
 	Cause        error
 }
+
+type HelperHandshakeStalledError struct {
+	DialAttempts int
+	Cause        error
+}
+
+func (err *HelperHandshakeStalledError) Code() string { return HelperHandshakeStalled }
+func (err *HelperHandshakeStalledError) Error() string {
+	if err == nil || err.Cause == nil {
+		return HelperHandshakeStalled
+	}
+	return fmt.Sprintf("%s: OCI helper completed no handshake after %d takeover attempts: %v", HelperHandshakeStalled, err.DialAttempts, err.Cause)
+}
+func (err *HelperHandshakeStalledError) Unwrap() error { return err.Cause }
 
 func (err *HelperUnitUnavailableError) Code() string { return HelperUnitUnavailable }
 
@@ -364,6 +380,8 @@ func (barrier *BootBarrier) recordCapabilityReason(err error) {
 		var unavailable *HelperUnitUnavailableError
 		if errors.As(err, &unavailable) {
 			reason = contract.CapabilityReasonHelperUnitUnavailable
+		} else if errors.As(err, new(*HelperHandshakeStalledError)) {
+			reason = contract.CapabilityReasonHelperHandshakeStalled
 		} else {
 			reason = contract.CapabilityReasonBootSweepFailed
 		}
@@ -379,11 +397,14 @@ func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context) (*Session,
 	unavailableDials := 0
 	var lastUnavailableError error
 	takeoverError := func(contextError error) error {
-		if dialAttempts > 0 && completedHandshakes == 0 && errors.Is(context.Cause(ctx), errTakeoverWindowExpired) {
+		if dialAttempts > 0 && completedHandshakes == 0 && unavailableDials == dialAttempts && errors.Is(context.Cause(ctx), errTakeoverWindowExpired) {
 			return &HelperUnitUnavailableError{
 				DialAttempts: dialAttempts,
 				Cause:        errors.Join(contextError, lastUnavailableError),
 			}
+		}
+		if dialAttempts > 0 && completedHandshakes == 0 && errors.Is(context.Cause(ctx), errTakeoverWindowExpired) {
+			return &HelperHandshakeStalledError{DialAttempts: dialAttempts, Cause: contextError}
 		}
 		return fmt.Errorf("acquire exclusive OCI helper session: %w", contextError)
 	}

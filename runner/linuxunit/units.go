@@ -24,8 +24,7 @@ const (
 	HelperRestartInitialDelay      = 250 * time.Millisecond
 	HelperRestartSteps             = 6
 	HelperStartupFailureBurst      = 6
-	HelperRestartMaximumDelay      = 2 * time.Second
-	HelperStartupListenBudget      = 4 * time.Second
+	HelperRestartMaximumDelay      = time.Second
 	HelperRestartTakeoverMargin    = 2 * time.Second
 	HelperSaturatedRestartDelaySum = (HelperStartupFailureBurst + 1) * HelperRestartMaximumDelay
 )
@@ -47,12 +46,22 @@ type Config struct {
 	RuncExecutable      string
 	MemoryCapacityBytes int64
 	MemoryReserveBytes  int64
+	SystemdVersion      int
 }
 
 type Units struct {
 	Agent         []byte
 	HelperSocket  []byte
 	HelperService []byte
+}
+
+// HelperRestartPolicy returns the bounded service policy supported by the
+// installed systemd. Debian 12's systemd 252 lacks the geometric directives.
+func HelperRestartPolicy(systemdVersion int) string {
+	if systemdVersion == 0 || systemdVersion >= 254 {
+		return "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n"
+	}
+	return "RestartSec=1s\n"
 }
 
 func Render(config Config) (Units, error) {
@@ -93,6 +102,7 @@ func Render(config Config) (Units, error) {
 	for _, root := range config.AllowedMountRoots {
 		helperArguments = append(helperArguments, "--oci-allowed-mount-root="+filepath.Clean(root))
 	}
+	restartPolicy := HelperRestartPolicy(config.SystemdVersion)
 	return Units{
 		Agent: []byte(`[Unit]
 Description=Wefty node agent
@@ -152,10 +162,7 @@ ExecStart=` + quoteArguments(helperArguments) + `
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure
-RestartSec=250ms
-RestartSteps=6
-RestartMaxDelaySec=2s
-NoNewPrivileges=false
+` + restartPolicy + `NoNewPrivileges=false
 PrivateTmp=true
 ProtectHome=true
 `),

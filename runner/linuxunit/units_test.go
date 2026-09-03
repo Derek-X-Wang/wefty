@@ -26,7 +26,7 @@ func TestRenderLinuxUnitsKeepsAgentUnprivilegedAndHelperNarrow(t *testing.T) {
 			t.Fatalf("agent unit missing %q:\n%s", want, agent)
 		}
 	}
-	for _, want := range []string{"User=root", "WEFTY_OCI_HELPER_ALLOWED_UIDS=1001", "__wefty_oci_helper", "--oci-allowed-mount-root=/srv/wefty", "--oci-runc-executable=/usr/local/sbin/runc", "--oci-memory-capacity-bytes=0", "--oci-memory-reserve-bytes=0", "StartLimitIntervalSec=0", "Restart=on-failure", "RestartSec=250ms", "RestartSteps=6", "RestartMaxDelaySec=2s"} {
+	for _, want := range []string{"User=root", "WEFTY_OCI_HELPER_ALLOWED_UIDS=1001", "__wefty_oci_helper", "--oci-allowed-mount-root=/srv/wefty", "--oci-runc-executable=/usr/local/sbin/runc", "--oci-memory-capacity-bytes=0", "--oci-memory-reserve-bytes=0", "StartLimitIntervalSec=0", "Restart=on-failure", "RestartSec=250ms", "RestartSteps=6", "RestartMaxDelaySec=1s"} {
 		if !strings.Contains(helper, want) {
 			t.Fatalf("helper unit missing %q:\n%s", want, helper)
 		}
@@ -40,6 +40,21 @@ func TestRenderLinuxUnitsKeepsAgentUnprivilegedAndHelperNarrow(t *testing.T) {
 		if strings.Contains(strings.ToLower(value), "auth-key") || strings.Contains(value, "TS_AUTHKEY") {
 			t.Fatalf("%s unit contains a credential source", name)
 		}
+	}
+}
+
+func TestRenderUsesBoundedLegacySystemdRestartPolicy(t *testing.T) {
+	config := Config{AgentPath: "/usr/local/libexec/wefty-agent", OperatorUser: "wefty", OperatorGroup: "wefty",
+		OperatorUID: 1001, OperatorGID: 1001, WorkingDirectory: "/var/lib/wefty",
+		ContainerdAddress: "/run/containerd/containerd.sock", ContainerdStateRoot: "/run/containerd",
+		RuntimeRoot: "/var/lib/wefty/oci", AllowedMountRoots: []string{"/srv/wefty"}, SystemdVersion: 252}
+	units, err := Render(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := string(units.HelperService)
+	if !strings.Contains(service, "RestartSec=1s") || strings.Contains(service, "RestartSteps=") || strings.Contains(service, "RestartMaxDelaySec=") {
+		t.Fatalf("legacy helper policy = %s", service)
 	}
 }
 

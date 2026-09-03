@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +41,20 @@ func (installer guestHelperInstaller) install(ctx context.Context, config GuestH
 		return errors.New("cannot inspect Lima guest helper group membership")
 	}
 	needsGroupRefresh := !slices.Contains(strings.Fields(string(groups)), "wefty-oci")
+	if config.SystemdVersion == 0 {
+		versionOutput, versionErr := installer.run(ctx, config.Limactl, "--tty=false", "shell", "--workdir=/", config.Instance, "systemctl", "--version")
+		if versionErr != nil {
+			return errors.New("cannot inspect Lima guest systemd version")
+		}
+		fields := strings.Fields(string(versionOutput))
+		if len(fields) < 2 || fields[0] != "systemd" {
+			return errors.New("cannot parse Lima guest systemd version")
+		}
+		config.SystemdVersion, err = strconv.Atoi(fields[1])
+		if err != nil {
+			return errors.New("cannot parse Lima guest systemd version")
+		}
+	}
 	staging, err := os.MkdirTemp("", "wefty-lima-helper-*")
 	if err != nil {
 		return err
