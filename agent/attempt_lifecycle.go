@@ -185,9 +185,8 @@ func (finalization *attemptFinalization) stop() {
 }
 
 var (
-	errAttemptDirectiveStop        = errors.New("attempt directive: stop")
-	errAttemptDirectiveRestart     = errors.New("attempt directive: restart")
-	errCompletionDeliveryAbandoned = errors.New("attempt completion delivery abandoned")
+	errAttemptDirectiveStop    = errors.New("attempt directive: stop")
+	errAttemptDirectiveRestart = errors.New("attempt directive: restart")
 )
 
 const ociRuntimeRecoveryTimeout = 10 * time.Second
@@ -502,12 +501,14 @@ func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, c
 func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) destinationError {
 	for {
 		if _, err := lifecycle.dependencies.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request); err != nil {
-			_, ownProtocolResponse := err.(*ProtocolError)
-			if cause := context.Cause(ctx); cause != nil && !ownProtocolResponse {
+			var ownProtocolResponse *ProtocolError
+			cause := context.Cause(ctx)
+			hasOwnProtocolResponse := errors.As(err, &ownProtocolResponse) && (cause == nil || !errors.Is(err, cause))
+			if cause != nil && !hasOwnProtocolResponse {
 				// A canceled HTTP request has no L1 delivery verdict. Its cause may
 				// itself be a ProtocolError from renewal, but classifying that cause
 				// as the /complete response can falsely acknowledge or seal evidence.
-				return destinationError{destination: errorDestinationUnclassified, err: fmt.Errorf("%w: %v", errCompletionDeliveryAbandoned, cause)}
+				return destinationError{destination: errorDestinationUnclassified, err: fmt.Errorf("attempt completion delivery abandoned after %v: %w", cause, err)}
 			}
 			if protocolErrorCode(err) == contract.ErrorLeaseExpired {
 				if lifecycle.dependencies.outbox != nil {

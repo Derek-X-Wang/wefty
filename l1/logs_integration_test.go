@@ -136,6 +136,40 @@ func TestLogReplayIsIdempotentAndRawJSONLMatchesRows(t *testing.T) {
 	}
 }
 
+func TestAgentLogGapReasonsPassL1Validation(t *testing.T) {
+	reasons := []contract.LogGapReason{
+		contract.LogGapSpoolEviction,
+		contract.LogGapOversizedEvent,
+		contract.LogGapReplayRejected,
+		contract.LogGapLateEvidenceWindowExpired,
+		contract.LogGapRecoveryReplayBound,
+		contract.LogGapLoggerSourceIncomplete,
+	}
+	for _, reason := range reasons {
+		t.Run(string(reason), func(t *testing.T) {
+			gap := &contract.LogGap{
+				ThroughSequence: 0,
+				LostEventCount:  1,
+				LostByteCount:   1,
+				Reason:          reason,
+			}
+			if reason == contract.LogGapLateEvidenceWindowExpired {
+				gap.SourceEventSHA256 = strings.Repeat("a", 64)
+			}
+			event := contract.LogEvent{
+				AttemptID: "attempt-gap-reasons",
+				Stream:    contract.LogStdout,
+				Sequence:  0,
+				Timestamp: time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC),
+				Gap:       gap,
+			}
+			if err := validateLogEvent(event.AttemptID, event); err != nil {
+				t.Fatalf("L1 rejected agent log gap reason %q: %v", reason, err)
+			}
+		})
+	}
+}
+
 func TestLogBytesPreserveLongPartialAndInvalidUTF8Data(t *testing.T) {
 	h := newIntegrationHarness(t, map[string][]string{"node-1": nil})
 	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})

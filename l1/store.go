@@ -3135,7 +3135,7 @@ func validateLogEvent(attemptID string, event contract.LogEvent) error {
 		return protocolError(contract.ErrorInvalidRequest, "log gap range, event count, and byte count are inconsistent")
 	}
 	switch gap.Reason {
-	case contract.LogGapSpoolEviction, contract.LogGapOversizedEvent, contract.LogGapReplayRejected, contract.LogGapLateEvidenceWindowExpired, contract.LogGapLoggerSourceIncomplete:
+	case contract.LogGapSpoolEviction, contract.LogGapOversizedEvent, contract.LogGapReplayRejected, contract.LogGapLateEvidenceWindowExpired, contract.LogGapRecoveryReplayBound, contract.LogGapLoggerSourceIncomplete:
 	default:
 		return protocolError(contract.ErrorInvalidRequest, "log gap reason %q is invalid", gap.Reason)
 	}

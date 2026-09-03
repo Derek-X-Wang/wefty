@@ -3,8 +3,10 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -430,15 +432,71 @@ func TestEvidenceRecoveryWakesForCompletionStoredAfterInitialScan(t *testing.T) 
 	}
 }
 
+type boundedReplayL1Clock struct{ now time.Time }
+
+func (clock *boundedReplayL1Clock) Now() time.Time { return clock.now }
+
 func TestEvidenceRecoveryBoundsLogReplayBeforeCompletion(t *testing.T) {
 	firstPassFinished := make(chan struct{})
 	releaseFirstPass := make(chan struct{})
+	var releaseFirstPassOnce sync.Once
+	releaseFirstPassNow := func() { releaseFirstPassOnce.Do(func() { close(releaseFirstPass) }) }
 	completionSeen := make(chan struct{}, 1)
 	var finishOnce sync.Once
 	var mu sync.Mutex
 	logCalls := 0
 	completionCalls := 0
 	var logUploads []l1.AppendLogsRequest
+	l1Clock := &boundedReplayL1Clock{now: time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)}
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "bounded-replay-l1.sqlite"), l1.StoreOptions{Clock: l1Clock, LeaseDuration: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	identity := fabric.Identity{NodeID: "bounded-replay-agent"}
+	registration := contract.NodeRegistration{
+		NodeID: "bounded-replay-node", BootSessionID: "bounded-replay-boot",
+		OS: "linux", Architecture: "amd64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true},
+	}
+	if _, err := store.RegisterNode(t.Context(), identity, registration, l1.NodePolicy{MaxOneshotSlots: 1}, true); err != nil {
+		t.Fatal(err)
+	}
+	workingDirectory := t.TempDir()
+	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1, DispatchKey: "bounded-log-replay",
+		Kind: contract.JobKindProcess, Class: contract.JobClassOneShot,
+		Execution: contract.ExecutionSpec{
+			Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"},
+			WorkingDirectory: workingDirectory, HandoffDirectory: workingDirectory,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimJob(t.Context(), identity.NodeID, registration.NodeID, registration.BootSessionID, contract.JobClassOneShot)
+	if err != nil || claim == nil || claim.Job.JobID != job.JobID {
+		t.Fatalf("bounded replay claim = %+v, err = %v", claim, err)
+	}
+	l1Clock.now = l1Clock.now.Add(11 * time.Second)
+	if _, err := store.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	writeL1Error := func(w http.ResponseWriter, err error) {
+		var protocolErr *l1.Error
+		if !errors.As(err, &protocolErr) {
+			t.Errorf("unexpected L1 error: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		status := http.StatusConflict
+		if protocolErr.Code == contract.ErrorInvalidRequest {
+			status = http.StatusBadRequest
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: protocolErr.Code, Message: protocolErr.Error()}})
+	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if strings.HasSuffix(request.URL.Path, "/logs") {
 			var appendRequest l1.AppendLogsRequest
@@ -450,18 +508,29 @@ func TestEvidenceRecoveryBoundsLogReplayBeforeCompletion(t *testing.T) {
 			logCalls++
 			logUploads = append(logUploads, appendRequest)
 			mu.Unlock()
-			acknowledged := map[contract.LogStream]uint64{}
-			for _, event := range appendRequest.Events {
-				acknowledged[event.Stream] = eventEndSequence(event)
+			response, appendErr := store.AppendLogs(request.Context(), identity.NodeID, job.JobID, claim.Lease.AttemptID, appendRequest)
+			if appendErr != nil {
+				writeL1Error(w, appendErr)
+				return
 			}
-			_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{Acknowledged: acknowledged})
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
+		var completion l1.CompletionRequest
+		if err := json.NewDecoder(request.Body).Decode(&completion); err != nil {
+			t.Error(err)
 			return
 		}
 		mu.Lock()
 		completionCalls++
 		mu.Unlock()
 		completionSeen <- struct{}{}
-		_ = json.NewEncoder(w).Encode(l1.Job{})
+		completed, completionErr := store.CompleteAttempt(request.Context(), identity.NodeID, job.JobID, claim.Lease.AttemptID, completion)
+		if completionErr != nil {
+			writeL1Error(w, completionErr)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(completed)
 	})
 	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
 	defer stopServer()
@@ -471,8 +540,8 @@ func TestEvidenceRecoveryBoundsLogReplayBeforeCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer outbox.Close()
-	claim := spoolTestClaim("attempt-bounded-log-replay")
-	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+	defer releaseFirstPassNow()
+	if err := outbox.ensureAttempt(t.Context(), *claim); err != nil {
 		t.Fatal(err)
 	}
 	for sequence := uint64(0); sequence < maxEvidenceLogReplayBatchesPerPass+1; sequence++ {
@@ -502,14 +571,27 @@ func TestEvidenceRecoveryBoundsLogReplayBeforeCompletion(t *testing.T) {
 	firstPassLogCalls := logCalls
 	firstPassCompletionCalls := completionCalls
 	mu.Unlock()
-	if firstPassLogCalls != maxEvidenceLogReplayBatchesPerPass || firstPassCompletionCalls != 0 {
-		t.Fatalf("first recovery pass = %d log calls, %d completion calls; want %d and 0", firstPassLogCalls, firstPassCompletionCalls, maxEvidenceLogReplayBatchesPerPass)
+	if firstPassLogCalls != maxEvidenceLogReplayBatchesPerPass || firstPassCompletionCalls != 1 {
+		t.Fatalf("first recovery pass = %d log calls, %d completion calls; want %d and 1", firstPassLogCalls, firstPassCompletionCalls, maxEvidenceLogReplayBatchesPerPass)
 	}
-	close(releaseFirstPass)
 	select {
 	case <-completionSeen:
-	case <-time.After(2 * time.Second):
-		t.Fatal("completion did not follow the remaining durable log batch")
+	default:
+		t.Fatal("completion was not delivered at the bounded first-pass edge")
+	}
+	releaseFirstPassNow()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		calls := logCalls
+		mu.Unlock()
+		if calls == maxEvidenceLogReplayBatchesPerPass+1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("remaining durable log batch was not continued on a later pass")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -517,10 +599,72 @@ func TestEvidenceRecoveryBoundsLogReplayBeforeCompletion(t *testing.T) {
 		t.Fatalf("complete recovery = %d log calls, %d completion calls; want %d and 1", logCalls, completionCalls, maxEvidenceLogReplayBatchesPerPass+1)
 	}
 	finalUpload := logUploads[len(logUploads)-1]
-	if len(finalUpload.Events) != 1 || finalUpload.Events[0].Gap == nil ||
-		finalUpload.Events[0].Gap.Reason != contract.LogGapRecoveryReplayBound ||
-		finalUpload.Events[0].Gap.ThroughSequence != maxEvidenceLogReplayBatchesPerPass {
-		t.Fatalf("bounded recovery final upload = %#v, want recovery replay gap through sequence %d", finalUpload.Events, maxEvidenceLogReplayBatchesPerPass)
+	if len(finalUpload.Events) != 1 || finalUpload.Events[0].Gap != nil ||
+		finalUpload.Events[0].Sequence != maxEvidenceLogReplayBatchesPerPass || string(finalUpload.Events[0].Bytes) != "load" {
+		t.Fatalf("bounded recovery final upload = %#v, want raw continuation at sequence %d", finalUpload.Events, maxEvidenceLogReplayBatchesPerPass)
+	}
+}
+
+func TestEvidenceRecoverySealsNonContiguousBacklogInsteadOfRetryingForever(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		var appendRequest l1.AppendLogsRequest
+		if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+			t.Error(err)
+			return
+		}
+		if len(appendRequest.Events) == 0 {
+			t.Error("empty recovery upload")
+			return
+		}
+		if appendRequest.Events[0].Sequence >= 18 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+				Code: contract.ErrorInvalidRequest, Message: "non-contiguous recovery replay",
+			}})
+			return
+		}
+		acknowledged := map[contract.LogStream]uint64{}
+		for _, event := range appendRequest.Events {
+			acknowledged[event.Stream] = eventEndSequence(event)
+		}
+		_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{Acknowledged: acknowledged})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1<<20, systemClock{}, 2, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := spoolTestClaim("attempt-non-contiguous-recovery")
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	for sequence := uint64(0); sequence < 16; sequence++ {
+		if err := outbox.spool.append(t.Context(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, sequence, "load")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, sequence := range []uint64{18, 20} {
+		if err := outbox.spool.append(t.Context(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, sequence, "corrupt")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reports := make(chan error, 1)
+	outbox.startRecovery(t.Context(), client, func(err error) { reports <- err })
+	select {
+	case err := <-reports:
+		if !strings.Contains(err.Error(), "durable evidence sealed incomplete") {
+			t.Fatalf("non-contiguous recovery report = %v, want terminal incomplete-evidence seal", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("non-contiguous recovery backlog was not terminally sealed")
+	}
+	receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+	if receipt.State != "sealed_incomplete" || receipt.Incomplete.LostEventCount != 2 {
+		t.Fatalf("non-contiguous recovery receipt = %+v", receipt)
 	}
 }
 

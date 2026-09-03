@@ -278,12 +278,15 @@ response: it releases that ownership and wakes the bounded outbox reconciler.
 The reconciler survives the attempt authority context, runs at most eight
 attempt workers and eight log batches per attempt pass, and retries both spool
 scan failures and per-attempt failures after the configured injected-clock
-backoff. Completion replay begins only after the durable log stream through its
-completion boundary has been acknowledged. When that would exceed the per-pass
-bound, remaining pre-completion events are replaced by a truthful
-`recovery_replay_bound` gap which L1 must accept before completion. A
-permanently rejected raw batch is likewise replaced by an accepted
-`replay_rejected` gap. The reconciler sends the
+backoff. Each pass replays at most eight durable log batches, then delivers the
+completion without discarding the remaining backlog; later passes continue the
+raw log stream from its acknowledged high-water mark. Reaching the per-pass
+bound alone never creates a gap. A `recovery_replay_bound` gap is valid only
+when recovery has positive evidence that the covered raw events cannot be
+replayed, and L1 accepts that typed reason. A permanently rejected raw batch is
+likewise replaced by an accepted `replay_rejected` gap; if the durable sequence
+is not contiguous enough to form a truthful gap, the attempt is sealed with a
+typed incomplete-evidence tombstone instead of retrying forever. The reconciler sends the
 identical durable completion body and retains a matching post-lease result as
 typed L1 observation without delaying fresh service admission.
 

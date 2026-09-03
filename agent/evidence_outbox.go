@@ -303,21 +303,26 @@ func (outbox *evidenceOutbox) scheduleRecovery() {
 }
 
 func (outbox *evidenceOutbox) recoverAttempt(ctx context.Context, client *Client, attempt logSpoolAttempt) error {
-	logsComplete, err := outbox.recoverLogs(ctx, client, attempt)
-	if err != nil || !logsComplete {
+	if err := outbox.recoverLogs(ctx, client, attempt); err != nil {
 		return err
 	}
-	return outbox.recoverCompletion(ctx, client, attempt)
+	if err := outbox.recoverCompletion(ctx, client, attempt); err != nil {
+		return err
+	}
+	// A bounded pass is a scheduling yield, not evidence truncation. When logs
+	// remain, completion is no longer held behind the backlog; the manager's
+	// post-pass scan launches a later pass for the same durable attempt.
+	return nil
 }
 
-func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, attempt logSpoolAttempt) (bool, error) {
+func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, attempt logSpoolAttempt) error {
 	for range maxEvidenceLogReplayBatchesPerPass {
 		batch, err := outbox.spool.pendingBatch(ctx, attempt.attemptID, outbox.batchSize)
 		if err != nil {
-			return false, err
+			return err
 		}
 		if len(batch) == 0 {
-			return true, nil
+			return nil
 		}
 		events := make([]contract.LogEvent, 0, len(batch))
 		for _, stored := range batch {
@@ -329,10 +334,10 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 		})
 		if err == nil {
 			if err := validateLogAcknowledgement(events, response.Acknowledged); err != nil {
-				return false, err
+				return err
 			}
 			if err := outbox.spool.acknowledge(ctx, attempt.attemptID, response.Acknowledged); err != nil {
-				return false, err
+				return err
 			}
 			continue
 		}
@@ -340,10 +345,10 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 		code := protocolErrorCode(err)
 		if permanentEvidenceRejection(code) {
 			if eventsContainGap(events) {
-				return false, outbox.sealIncomplete(ctx, attempt.attemptID, "replacement gap was rejected", code)
+				return outbox.sealIncomplete(ctx, attempt.attemptID, "replacement gap was rejected", code)
 			}
 			if err := outbox.spool.replaceBatchWithReplayGaps(ctx, attempt.attemptID, batch); err != nil {
-				return false, outbox.sealIncomplete(ctx, attempt.attemptID, "rejected replay could not be replaced with a gap", code)
+				return outbox.sealIncomplete(ctx, attempt.attemptID, "rejected replay could not be replaced with a gap", code)
 			}
 			continue
 		}
@@ -351,29 +356,19 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 		classification := classifyAgentProtocolError(err)
 		switch classification.destination {
 		case errorDestinationTransient:
-			return false, err
+			return err
 		case errorDestinationAttemptAuthority:
-			return false, outbox.sealIncomplete(ctx, attempt.attemptID, "attempt authority no longer accepts evidence", code)
+			return outbox.sealIncomplete(ctx, attempt.attemptID, "attempt authority no longer accepts evidence", code)
 		case errorDestinationNodeSession:
 			if classification.nodeSessionReaction == nodeSessionReregister {
-				return false, err
+				return err
 			}
-			return false, err
+			return err
 		default:
-			return false, err
+			return err
 		}
 	}
-	remaining, err := outbox.spool.pendingBatch(ctx, attempt.attemptID, 1)
-	if err != nil {
-		return false, err
-	}
-	if len(remaining) == 0 {
-		return true, nil
-	}
-	if err := outbox.spool.replacePendingWithRecoveryReplayGaps(ctx, attempt.attemptID); err != nil {
-		return false, err
-	}
-	return false, nil
+	return nil
 }
 
 func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Client, attempt logSpoolAttempt) error {
