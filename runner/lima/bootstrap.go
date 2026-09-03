@@ -288,7 +288,7 @@ StandardError=journal
 Restart=on-failure
 RestartSec=250ms
 RestartSteps=6
-RestartMaxDelaySec=10s
+RestartMaxDelaySec=2s
 NoNewPrivileges=false
 `)
 }

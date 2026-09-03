@@ -4,6 +4,7 @@ package ocihelper
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +16,58 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+const computerStorageGrowIntentName = "storage-grow.json"
+
+type computerStorageGrowIntent struct {
+	Version int                        `json:"version"`
+	Request GrowComputerStorageRequest `json:"request"`
+}
+
+func writeComputerStorageGrowIntent(root string, request GrowComputerStorageRequest) error {
+	if existing, present, err := readComputerStorageGrowIntent(root); err != nil {
+		return err
+	} else if present {
+		if existing.Request != request {
+			return errors.New("Computer Storage grow intent conflicts with its immutable authority")
+		}
+		return nil
+	}
+	payload, err := json.Marshal(computerStorageGrowIntent{Version: 1, Request: request})
+	if err != nil {
+		return err
+	}
+	return writeDurableFile(root, ".storage-grow.json.tmp-", computerStorageGrowIntentName, payload, 0o600)
+}
+
+func readComputerStorageGrowIntent(root string) (computerStorageGrowIntent, bool, error) {
+	payload, err := os.ReadFile(filepath.Join(root, computerStorageGrowIntentName))
+	if errors.Is(err, os.ErrNotExist) {
+		return computerStorageGrowIntent{}, false, nil
+	}
+	if err != nil {
+		return computerStorageGrowIntent{}, false, err
+	}
+	var intent computerStorageGrowIntent
+	if json.Unmarshal(payload, &intent) != nil || intent.Version != 1 {
+		return computerStorageGrowIntent{}, false, errors.New("Computer Storage grow intent is corrupt")
+	}
+	request := intent.Request
+	if request.Storage.ComputerID == "" || request.Storage.StorageID == "" || request.Storage.StorageGeneration == 0 || request.Storage.IntentRevision < 1 ||
+		request.Storage.DiskBytes <= 0 || request.NewDiskBytes <= request.Storage.DiskBytes || request.Authority.JobID == "" || request.Authority.BootSessionID == "" ||
+		request.Authority.NodeID == "" || request.Authority.HelperGeneration == 0 || request.Authority.RootInstanceID == "" ||
+		request.Authority.OperationRevision < 1 || request.Authority.OperationFence == "" {
+		return computerStorageGrowIntent{}, false, errors.New("Computer Storage grow intent is incomplete")
+	}
+	return intent, true, nil
+}
+
+func removeComputerStorageGrowIntent(root string) error {
+	if err := os.Remove(filepath.Join(root, computerStorageGrowIntentName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDirectory(root)
+}
 
 func (engine *ContainerdEngine) growCheckpoint(name string) error {
 	if engine.computerGrowHook != nil {
@@ -404,6 +457,9 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 	if err := engine.growCheckpoint("capacity_reserved"); err != nil {
 		return GrowComputerStorageResponse{}, err
 	}
+	if err := writeComputerStorageGrowIntent(diskRoot, request); err != nil {
+		return GrowComputerStorageResponse{}, err
+	}
 	loopDevice := ""
 	if attachment != nil {
 		loopDevice = attachment.loopDevice
@@ -435,6 +491,9 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 		return GrowComputerStorageResponse{}, err
 	}
 	if err := engine.growCheckpoint("manifest_published"); err != nil {
+		return GrowComputerStorageResponse{}, err
+	}
+	if err := removeComputerStorageGrowIntent(diskRoot); err != nil {
 		return GrowComputerStorageResponse{}, err
 	}
 	if attachment != nil {

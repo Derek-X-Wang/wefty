@@ -1094,6 +1094,35 @@ func TestBootBarrierRetriesRefusedDialThenPublishesTypedUnavailable(t *testing.T
 	}
 }
 
+func TestBootBarrierClassifiesSocketBacklogWithoutCompletedHandshakeAsUnitUnavailable(t *testing.T) {
+	dials := 0
+	client := &Client{
+		ExpectedChecksum: "checksum-test",
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			dials++
+			clientSide, serverSide := net.Pipe()
+			go func() {
+				<-ctx.Done()
+				_ = serverSide.Close()
+			}()
+			return clientSide, nil
+		},
+	}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: 50 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var unavailable *HelperUnitUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.DialAttempts != 1 || dials != 1 ||
+		barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperUnitUnavailable {
+		t.Fatalf("backlogged helper socket outcome = %#v err=%v dials=%d reason=%q", unavailable, err, dials, barrier.CapabilityReasonCode())
+	}
+}
+
 func TestBootBarrierDoesNotRetryProtocolRPCError(t *testing.T) {
 	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{})
 	defer stop()

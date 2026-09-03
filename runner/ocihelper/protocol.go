@@ -1320,6 +1320,9 @@ const (
 	SweepActionKillReaped           SweepAction = "kill_reaped"
 	SweepActionRetained             SweepAction = "retained"
 	SweepActionRetentionBoundReaped SweepAction = "retention_bound_reaped"
+	SweepActionResumed              SweepAction = "resumed"
+	SweepActionRolledBack           SweepAction = "rolled_back"
+	SweepActionQuarantined          SweepAction = "quarantined"
 )
 
 // SweepEvidence is assertion-derived mechanics evidence for a helper-owned

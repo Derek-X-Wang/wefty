@@ -275,6 +275,8 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		faultAction := action
 		if action == "kill-payload" || action == "kill-shim" {
 			faultAction += ":" + ready.CurrentJobID
+		} else if action == "kill-helper" {
+			faultAction += ":service-restart-survival"
 		}
 		triggerLinuxComputerFault(t, harness, faultAction)
 		if action == "stop-containerd" {
@@ -354,7 +356,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	resetIntent := reset.IntentRevision
 	resetCrashObserved := false
 	if !mutatingLinuxComputerRow("linux.reconfiguration") {
-		triggerLinuxComputerFault(t, harness, "kill-helper")
+		triggerLinuxComputerFault(t, harness, "kill-helper:service-reconfiguration-reset")
 		resetCrashObserved = true
 		if harness.agent.exited() {
 			harness.restartAgent(t)
@@ -1299,7 +1301,9 @@ func triggerLinuxComputerFault(t *testing.T, harness *acceptanceHarness, action 
 	fifo := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_FAULT_FIFO")
 	directory := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_FAULT_DIR")
 	done := filepath.Join(directory, action+".done")
+	failure := filepath.Join(directory, action+".failed")
 	_ = os.Remove(done)
+	_ = os.Remove(failure)
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, "sh", "-c", `printf '%s\n' "$1" > "$2"`, "wefty-fault", action, fifo)
@@ -1309,6 +1313,9 @@ func triggerLinuxComputerFault(t *testing.T, harness *acceptanceHarness, action 
 	for ctx.Err() == nil {
 		if _, err := os.Stat(done); err == nil {
 			return
+		}
+		if payload, err := os.ReadFile(failure); err == nil {
+			t.Fatalf("root assertion %s failed: %s", action, payload)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

@@ -133,6 +133,8 @@ type ContainerdEngine struct {
 	computerGrowResize          func(context.Context, string, string, int64, int64) error
 	computerGrowFilesystemBytes func(context.Context, string) (int64, error)
 	computerGrowAllocate        func(string, int64) error
+	computerDiskSweepMu         sync.Mutex
+	computerDiskSweepEvidence   []SweepEvidence
 	computerReimageImageInspect func(context.Context, PreflightComputerReimageRequest) (computerReimageImageFacts, error)
 	computerReimageDiskOwner    func(context.Context, string) (uint32, uint32, error)
 	lastProfile                 *ProfileReceipt
@@ -2233,8 +2235,12 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 			return SweepResponse{}, err
 		}
 	}
-	if err := engine.sweepComputerDisks(request.SweepEpoch); err != nil {
-		return SweepResponse{}, err
+	engine.computerDiskSweepMu.Lock()
+	sweepComputerDiskErr := engine.sweepComputerDisks(ctx, request.SweepEpoch)
+	computerDiskEvidence := slices.Clone(engine.computerDiskSweepEvidence)
+	engine.computerDiskSweepMu.Unlock()
+	if sweepComputerDiskErr != nil {
+		return SweepResponse{}, sweepComputerDiskErr
 	}
 	response, err := engine.finishSweep(ctx, inventory, prior, attempts)
 	if err != nil {
@@ -2259,7 +2265,8 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	response.Removed = inventoryCount(subtractResourceInventory(observedInventory, remaining))
 	response.Inventory = observedInventory
 	response.DurableRetentions = append(logRetentions, cgroupRetentions...)
-	response.Evidence = append(logEvidence, cgroupEvidence...)
+	response.Evidence = append(computerDiskEvidence, logEvidence...)
+	response.Evidence = append(response.Evidence, cgroupEvidence...)
 	if err := engine.removeQuiescentAttemptOwnershipRecords(ownership, remaining); err != nil {
 		return SweepResponse{}, err
 	}
@@ -4511,6 +4518,10 @@ func projectRuntimeAbsenceInventory(inventory ResourceInventory, retainedService
 	projected.ComputerDiskAllocations = slices.DeleteFunc(projected.ComputerDiskAllocations, retainedComputerDisk)
 	projected.ComputerDiskQuotas = slices.DeleteFunc(projected.ComputerDiskQuotas, retainedComputerDisk)
 	projected.ComputerDiskManifests = slices.DeleteFunc(projected.ComputerDiskManifests, retainedComputerDisk)
+	// Quarantined generations are durable, operator-visible evidence. They do
+	// not represent runnable namespace state and therefore do not block the
+	// helper from serving unaffected Computers.
+	projected.ComputerQuarantines = nil
 	return projected, nil
 }
 

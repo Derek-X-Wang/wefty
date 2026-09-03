@@ -133,7 +133,7 @@ func prepareSameBootSweptComputerDisk(t *testing.T) (*ContainerdEngine, Computer
 		t.Fatal(err)
 	}
 	engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
-	if err := engine.sweepComputerDisks("same-boot-helper-sweep"); err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "same-boot-helper-sweep"); err != nil {
 		t.Fatal(err)
 	}
 	return engine, storage, prior
@@ -512,7 +512,7 @@ func TestComputerDiskSweepIgnoresRecycledForeignLoopNumber(t *testing.T) {
 	_ = attachment.lock.Close()
 	delete(system.mounts, attachment.mountPath)
 	system.loops[attachment.loopDevice] = "/var/lib/foreign/disk.ext4"
-	if err := engine.sweepComputerDisks("sweep-boot-b"); err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "sweep-boot-b"); err != nil {
 		t.Fatalf("recycled foreign loop bricked sweep: %v", err)
 	}
 	if system.loops[attachment.loopDevice] != "/var/lib/foreign/disk.ext4" {
@@ -547,7 +547,7 @@ func TestComputerDiskSweepRecoversCrashBeforeAttachedManifestWrite(t *testing.T)
 	if err := writeComputerDiskManifest(diskRoot, manifest); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.sweepComputerDisks("sweep-boot-b"); err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "sweep-boot-b"); err != nil {
 		t.Fatal(err)
 	}
 	manifest, _, _ = readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
@@ -578,7 +578,7 @@ func TestComputerDiskSweepDetachesCrashedStorageCopyMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.sweepComputerDisks("copy-sweep"); err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "copy-sweep"); err != nil {
 		t.Fatal(err)
 	}
 	if _, mounted, err := system.mountedSource(mountPath); err != nil || mounted {
@@ -654,7 +654,7 @@ func TestComputerDiskSweepRetainsBytesAndAuthorizesOneFreshAttach(t *testing.T) 
 	if err := attachmentA.lock.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.sweepComputerDisks("sweep-boot-b"); err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "sweep-boot-b"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(attachmentA.imagePath); err != nil {
@@ -706,7 +706,7 @@ func TestComputerDiskSweepAuthorizesSuccessorAcrossHelperAndJobReplacement(t *te
 			if err := attachment.lock.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if err := engine.sweepComputerDisks("helper-replacement-sweep"); err != nil {
+			if err := engine.sweepComputerDisks(t.Context(), "helper-replacement-sweep"); err != nil {
 				t.Fatal(err)
 			}
 
@@ -789,10 +789,10 @@ func TestStartupQuarantinesUnrecordedAllocationMismatchAndKeepsNamespaceAdmissib
 		t.Fatal(err)
 	}
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem()}
-	evidence, err := engine.sweepComputerDisks(t.Context(), "startup-sweep")
-	if err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "startup-sweep"); err != nil {
 		t.Fatal(err)
 	}
+	evidence := engine.computerDiskSweepEvidence
 	name, _ := deterministicComputerDiskName(request.Storage)
 	if !slices.ContainsFunc(evidence, func(item SweepEvidence) bool {
 		return item.ID == name && item.Action == SweepActionQuarantined && item.Method == "allocation_mismatch"
@@ -809,6 +809,9 @@ func TestStartupQuarantinesUnrecordedAllocationMismatchAndKeepsNamespaceAdmissib
 	projected, err := projectRuntimeAbsenceInventory(inventory, func(string, string) (bool, error) { return false, nil }, func(string) (bool, error) { return false, nil })
 	if err != nil || !InventoryEmpty(projected) {
 		t.Fatalf("quarantine blocked namespace admission: projected=%+v err=%v", projected, err)
+	}
+	if _, err := engine.attachComputerDisk(t.Context(), request.Storage, testComputerAuthority("quarantined", "fence", "boot")); err == nil || !strings.Contains(err.Error(), "quarantined") {
+		t.Fatalf("quarantined generation was attachable: %v", err)
 	}
 }
 

@@ -47,10 +47,9 @@ func (err *ReapTimeoutConfigurationError) Error() string {
 	return fmt.Sprintf("OCI helper reap timeout configuration mismatch: advertised=%s takeover_derived_from=%s", err.AdvertisedReapTimeout, err.TakeoverReapTimeout)
 }
 
-// HelperUnitUnavailableError means the helper's socket remained absent or
-// refused/reset connections across the complete takeover window. It
-// distinguishes a stopped or start-limited systemd topology from an incumbent
-// helper that is still releasing authority.
+// HelperUnitUnavailableError means the helper completed no handshake across
+// the complete takeover window. It includes absent/refused sockets and a live
+// socket backlog whose crash-looping service never reaches Accept.
 type HelperUnitUnavailableError struct {
 	DialAttempts int
 	Cause        error
@@ -62,7 +61,7 @@ func (err *HelperUnitUnavailableError) Error() string {
 	if err == nil || err.Cause == nil {
 		return HelperUnitUnavailable
 	}
-	return fmt.Sprintf("%s: OCI helper socket remained unavailable after %d takeover dials: %v", HelperUnitUnavailable, err.DialAttempts, err.Cause)
+	return fmt.Sprintf("%s: OCI helper completed no handshake after %d takeover attempts: %v", HelperUnitUnavailable, err.DialAttempts, err.Cause)
 }
 
 func (err *HelperUnitUnavailableError) Unwrap() error {
@@ -375,12 +374,14 @@ func (barrier *BootBarrier) recordCapabilityReason(err error) {
 }
 
 func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context) (*Session, error) {
+	dialAttempts := 0
+	completedHandshakes := 0
 	unavailableDials := 0
 	var lastUnavailableError error
 	takeoverError := func(contextError error) error {
-		if unavailableDials >= 2 && errors.Is(context.Cause(ctx), errTakeoverWindowExpired) {
+		if dialAttempts > 0 && completedHandshakes == 0 && errors.Is(context.Cause(ctx), errTakeoverWindowExpired) {
 			return &HelperUnitUnavailableError{
-				DialAttempts: unavailableDials,
+				DialAttempts: dialAttempts,
 				Cause:        errors.Join(contextError, lastUnavailableError),
 			}
 		}
@@ -390,6 +391,7 @@ func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context) (*Session,
 		if err := ctx.Err(); err != nil {
 			return nil, takeoverError(err)
 		}
+		dialAttempts++
 		session, err := barrier.client.OpenSession(ctx, barrier.request)
 		if err == nil {
 			return session, nil
@@ -397,12 +399,21 @@ func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context) (*Session,
 		if contextError := ctx.Err(); contextError != nil {
 			return nil, takeoverError(contextError)
 		}
+		// A socket-backlog connection can reach its I/O deadline immediately
+		// before the context timer publishes Done. OpenSession applies this
+		// context's deadline to the connection, so synchronize that edge before
+		// classifying a handshake transport error.
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) && errors.Is(err, os.ErrDeadlineExceeded) {
+			<-ctx.Done()
+			return nil, takeoverError(ctx.Err())
+		}
 		var rpcErr *RPCError
 		var dialErr *helperDialError
 		if errors.As(err, &dialErr) && (errors.Is(dialErr, os.ErrNotExist) || errors.Is(dialErr, syscall.ECONNREFUSED) || errors.Is(dialErr, syscall.ECONNRESET)) {
 			unavailableDials++
 			lastUnavailableError = err
 		} else if errors.As(err, &rpcErr) && rpcErr.Code == CodeSessionBusy {
+			completedHandshakes++
 			unavailableDials = 0
 			lastUnavailableError = nil
 		} else {

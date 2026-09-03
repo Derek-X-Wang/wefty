@@ -31,10 +31,10 @@ func TestStartupResumesDurableComputerGrowBeforeInventoryVerification(t *testing
 		computerGrowResize:          func(context.Context, string, string, int64, int64) error { return nil },
 		computerGrowFilesystemBytes: func(context.Context, string) (int64, error) { return request.NewDiskBytes, nil },
 	}
-	evidence, err := engine.sweepComputerDisks(t.Context(), "startup-sweep")
-	if err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "startup-sweep"); err != nil {
 		t.Fatal(err)
 	}
+	evidence := engine.computerDiskSweepEvidence
 	name, _ := deterministicComputerDiskName(request.Storage)
 	manifest, present, err := readComputerDiskManifest(filepath.Join(root, "computer-disks", name, "attachment.json"))
 	if err != nil || !present || manifest.Storage.DiskBytes != request.NewDiskBytes {

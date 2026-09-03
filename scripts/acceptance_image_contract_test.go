@@ -3,16 +3,21 @@ package scripts
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"os/exec"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/internal/computerconformance"
+	"github.com/Derek-X-Wang/wefty/runner/linuxunit"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 
 	"gopkg.in/yaml.v3"
 )
@@ -295,7 +300,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			"Restart=on-failure",
 			"RestartSec=250ms",
 			"RestartSteps=6",
-			"RestartMaxDelaySec=10s",
+			"RestartMaxDelaySec=2s",
 			"if: ${{ always() && runner.os == 'Linux' }}",
 			"journalctl --boot --no-pager --utc --output=short-precise",
 			"-u wefty-oci-helper-realtiming.service",
@@ -329,8 +334,12 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			"WEFTY_OCI_PROVISION_RECEIPT=%s\\n",
 			"systemctl is-active --quiet wefty-oci-helper-realtiming.socket",
 			"reproduce-helper-start-burst:[1-9]*",
+			"manufacture-computer-allocation-mismatch:wefty-computer-disk-*",
+			"kill-helper:native-lost-attempt-sweep", "kill-helper:native-computer-helper-death",
+			"kill-helper:service-restart-survival", "kill-helper:service-reconfiguration-reset",
 			"assert-helper-units-active",
 			"stop-helper-topology",
+			`"/tmp/wefty-oci-faults/$action.failed"`,
 			"start-helper-topology",
 		} {
 			if !strings.Contains(fixture.text, required) {
@@ -339,6 +348,10 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 		if strings.Contains(fixture.text, "systemctl reset-failed wefty-oci-helper-realtiming.service") {
 			t.Fatalf("%s helper fault path masks the service start counter", name)
+		}
+		if strings.Contains(fixture.text, "systemctl is-active --quiet wefty-oci-helper-realtiming.service && exit 1 || true") ||
+			strings.Contains(fixture.text, "systemctl is-active --quiet wefty-oci-helper-realtiming.socket && exit 1 || true") {
+			t.Fatalf("%s topology fault exits its long-lived supervisor instead of recording .failed", name)
 		}
 	}
 	for name, workflow := range map[string]workflowContract{"workflow-run": realtiming, "scheduled": scheduled} {
@@ -364,8 +377,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		for _, required := range []string{"ARTIFACT_AVAILABLE", "$ARTIFACT_AVAILABLE", "= true",
 			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json",
 			"check-native-linux-oci-receipt.sh", "native-linux-oci.txt", "oci-service-publication-linux.txt", "oci-service-l1-agent-linux.txt", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland",
-			"helper-restart-timeline.txt", "historical_rapid_started_lines=6", "fault_1_kill_to_verified_ready_elapsed_ns", "fault_1_kill_to_verified_ready_bound_ns",
-			"capability_reason=helper_unit_unavailable", "lane_helper_kill_actions", "elapsed <= bound"} {
+			"helper-restart-timeline.txt", "observed_startup_failures=6", "startup_failure_arm=6", "fault_1_kill_to_verified_ready_elapsed_ns", "fault_1_kill_to_verified_ready_bound_ns",
+			"capability_reason=helper_unit_unavailable", "lane_helper_kill_action_set", "lane_product_path_fault_actions=1", "disk_quarantine_action=quarantined", "elapsed <= bound"} {
 			if !strings.Contains(resultText, required) {
 				t.Fatalf("%s realtiming result does not fail closed on %q", name, required)
 			}
@@ -467,9 +480,9 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 		},
 		"Service": {
 			"Restart":            "on-failure",
-			"RestartSec":         "250ms",
-			"RestartSteps":       "6",
-			"RestartMaxDelaySec": "10s",
+			"RestartSec":         linuxunit.HelperRestartInitialDelay.String(),
+			"RestartSteps":       strconv.Itoa(linuxunit.HelperRestartSteps),
+			"RestartMaxDelaySec": linuxunit.HelperRestartMaximumDelay.String(),
 		},
 	}
 	for name, path := range map[string]string{
@@ -483,6 +496,12 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 			t.Fatalf("%s helper policy sections = %#v, want %#v", name, got, want)
 		}
 	}
+	takeover := ocihelper.TakeoverTimeoutForReap(10 * time.Second)
+	composed := linuxunit.HelperSaturatedRestartDelaySum + linuxunit.HelperStartupListenBudget + linuxunit.HelperRestartTakeoverMargin
+	if composed > takeover || linuxunit.HelperSaturatedRestartDelaySum != 14*time.Second {
+		t.Fatalf("saturated helper restart derivation = delays %s + listen %s + margin %s = %s, takeover %s",
+			linuxunit.HelperSaturatedRestartDelaySum, linuxunit.HelperStartupListenBudget, linuxunit.HelperRestartTakeoverMargin, composed, takeover)
+	}
 }
 
 func helperServicePolicySections(t *testing.T, path string) map[string]map[string]string {
@@ -491,24 +510,33 @@ func helperServicePolicySections(t *testing.T, path string) map[string]map[strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(payload)
+	sections, err := parseHelperServicePolicySections(string(payload))
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	return sections
+}
+
+func parseHelperServicePolicySections(text string) (map[string]map[string]string, error) {
 	description := strings.Index(text, "Description=Wefty privileged OCI helper")
 	if description < 0 {
 		description = strings.Index(text, "Description=Wefty OCI helper realtiming service")
 	}
 	if description < 0 {
-		t.Fatalf("%s has no privileged helper unit", path)
+		return nil, errors.New("no privileged helper unit")
 	}
 	start := strings.LastIndex(text[:description], "[Unit]")
-	endOffset := strings.Index(text[description:], "RestartMaxDelaySec=10s")
-	if start < 0 || endOffset < 0 {
-		t.Fatalf("%s helper policy bounds were not found", path)
+	if start < 0 {
+		return nil, errors.New("helper policy bounds were not found")
 	}
-	end := description + endOffset + len("RestartMaxDelaySec=10s")
 	sections := map[string]map[string]string{"Unit": {}, "Service": {}}
+	seen := map[string]map[string]int{"Unit": {}, "Service": {}}
 	section := ""
-	for _, raw := range strings.Split(text[start:end], "\n") {
+	for _, raw := range strings.Split(text[start:], "\n") {
 		line := strings.TrimSpace(raw)
+		if line == "[Install]" || line == "UNIT" || line == "`)" || line == "`)," {
+			break
+		}
 		if line == "[Unit]" || line == "[Service]" {
 			section = strings.Trim(line, "[]")
 			continue
@@ -518,11 +546,34 @@ func helperServicePolicySections(t *testing.T, path string) map[string]map[strin
 			continue
 		}
 		switch key {
-		case "StartLimitIntervalSec", "Restart", "RestartSec", "RestartSteps", "RestartMaxDelaySec":
+		case "StartLimitIntervalSec", "StartLimitBurst", "Restart", "RestartSec", "RestartSteps", "RestartMaxDelaySec":
+			seen[section][key]++
+			if seen[section][key] != 1 {
+				return nil, fmt.Errorf("helper policy duplicates %s in [%s]", key, section)
+			}
 			sections[section][key] = value
 		}
 	}
-	return sections
+	return sections, nil
+}
+
+func TestHelperSystemdPolicyParserRejectsLateLastWinsOverrides(t *testing.T) {
+	_, err := parseHelperServicePolicySections(`[Unit]
+Description=Wefty privileged OCI helper
+StartLimitIntervalSec=0
+[Service]
+Restart=on-failure
+RestartSec=250ms
+RestartSteps=6
+RestartMaxDelaySec=2s
+RestartSec=30s
+StartLimitBurst=1
+[Install]
+WantedBy=multi-user.target
+`)
+	if err == nil || !strings.Contains(err.Error(), "duplicates RestartSec") {
+		t.Fatalf("late last-wins override was accepted: %v", err)
+	}
 }
 
 func assertWaylandFurnitureInvocations(t *testing.T, workflowName string, workflow workflowContract) {

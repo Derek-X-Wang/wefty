@@ -616,7 +616,7 @@ func (barrier *SupervisedBootBarrier) ensureHelperReady(ctx context.Context, exp
 			return nil
 		}
 		reason := classifyHelperBarrierError(err)
-		if reason == contract.CapabilityReasonHelperUnitUnavailable || reason == contract.CapabilityReasonHelperVersionMismatch || reason == contract.CapabilityReasonLocalPermissionDenied ||
+		if reason == contract.CapabilityReasonHelperVersionMismatch || reason == contract.CapabilityReasonLocalPermissionDenied ||
 			reason == contract.CapabilityReasonBootSweepFailed {
 			return err
 		}
@@ -715,6 +715,9 @@ func (barrier *SupervisedBootBarrier) Close() error {
 func (barrier *SupervisedBootBarrier) CapabilityReasonCode() contract.CapabilityReasonCode {
 	if barrier == nil || barrier.Supervisor == nil {
 		return contract.CapabilityReasonBootSweepFailed
+	}
+	if barrier.Ready() {
+		return ""
 	}
 	if reason := barrier.Supervisor.Facts().ReasonCode; reason.Valid() {
 		return reason

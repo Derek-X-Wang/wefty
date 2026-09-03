@@ -326,7 +326,7 @@ func TestComputerStorageResetSweepDropsOnlyUnverifiedSuccessorPreparation(t *tes
 	if err := writeComputerDiskManifest(successorRoot, manifest); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.sweepComputerDisks("corrupted-preparation-sweep"); err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "corrupted-preparation-sweep"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(successorRoot); err != nil {
@@ -336,7 +336,7 @@ func TestComputerStorageResetSweepDropsOnlyUnverifiedSuccessorPreparation(t *tes
 	if err := writeComputerDiskManifest(successorRoot, manifest); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.sweepComputerDisks("replacement-sweep"); err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "replacement-sweep"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(successorRoot); !errors.Is(err, os.ErrNotExist) {
@@ -348,7 +348,7 @@ func TestComputerStorageResetSweepDropsOnlyUnverifiedSuccessorPreparation(t *tes
 	if err != nil || !response.Verified || response.Receipt.HelperGeneration != 2 {
 		t.Fatalf("reset did not recreate swept successor: %+v err=%v", response, err)
 	}
-	if err := engine.sweepComputerDisks("post-verification-sweep"); err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "post-verification-sweep"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(successorRoot); err != nil {

@@ -45,18 +45,25 @@ user is added to that group, while the service runs the private helper mode as
 root with a narrow UID allowlist. Every shipped systemd helper service, native
 Linux and Lima, sets `StartLimitIntervalSec=0` under `[Unit]` and
 `Restart=on-failure`, `RestartSec=250ms`, `RestartSteps=6`, and
-`RestartMaxDelaySec=10s` under `[Service]`; the workflow-written realtiming
+`RestartMaxDelaySec=2s` under `[Service]`; the workflow-written realtiming
 units use the same policy. `RestartSteps` and `RestartMaxDelaySec` require
 systemd 254; `ubuntu-latest` and the Lima `template:_images/ubuntu-24.04`
 baseline both provide systemd 255, and the Linux receipt records the executing
 version. The six steps are derived from the incident's six service starts in
-610 ms. They expand a deterministic crash from the 250 ms first retry toward a
-ten-second ceiling instead of sustaining a four-Hz journal loop. Disabling the
+610 ms. At a saturated production restart counter, the kill plus six injected
+exits incur seven delays capped at two seconds: 14 seconds total. The fixed
+startup-to-listen budget is four seconds and the stated margin is two seconds,
+so `14 s + 4 s + 2 s = 20 s`, exactly the unchanged
+`TakeoverTimeoutForReap(10 s)` window; earlier geometric steps are faster.
+This bounds saturated deterministic-failure churn at no more than 0.5 Hz
+instead of sustaining a four-Hz journal loop. Disabling the
 start-limit interval prevents service exhaustion from failing the triggering
-socket with `service-start-limit-hit`; the socket therefore needs no separate
-start-limit override and retains the default policy. The lane records and
-derives its total helper-kill count from the root fault-action journal rather
-than duplicating a source constant. When
+socket with `service-start-limit-hit`. The socket retains systemd's default
+trigger-limit policy; the current lane proves service recovery and active
+socket topology, but does not claim a separate trigger-limit proof. The lane
+records the exact helper-kill action-name set
+`{native-computer-helper-death,native-lost-attempt-sweep,service-reconfiguration-reset,service-restart-survival}`
+from the root fault-action journal. When
 setup adds that supplementary group for
 the first time, it performs one ordinary stop/start so Lima's guest agent picks
 up membership; an already-member rerun does not restart the VM. The host
@@ -196,12 +203,15 @@ takeover path and is re-observed by the lane's
 handshakes during startup while gating admission on verified cleanup—is deferred
 to #301 because it changes startup concurrency and authority publication.
 While taking over, the client retries dial-time `ENOENT`, `ECONNREFUSED`, and
-`ECONNRESET` within that same fixed window. Handshake and typed RPC errors stay
-hard and immediate. Two or more unavailable dials followed by window expiry
-return `helper_unit_unavailable` with the observed dial count. `BootBarrier`
+`ECONNRESET` within that same fixed window. Protocol, authentication, and typed
+RPC errors after a completed handshake stay hard and immediate. Window expiry
+with zero completed handshakes returns `helper_unit_unavailable` with the
+observed connection-attempt count, including the live-socket/crash-loop case
+where `connect()` enters the socket backlog but startup never reaches Accept.
+`BootBarrier`
 publishes that distinct closed-vocabulary reason through the native agent
-capability receipt, and Lima preserves it rather than collapsing it into
-`helper_unreachable`. A fully missing socket therefore now costs the complete
+capability receipt, and Lima preserves it while still running the same bounded
+automated repair loop as `helper_unreachable`. A fully missing socket therefore now costs the complete
 20-second takeover window before the typed failure is published; sweep and
 verification may then use one fresh ten-second reap window, so the composed
 kill-to-verified-ready success bound is 30 seconds. An earlier caller deadline
@@ -768,8 +778,13 @@ replay that receipt but cannot restamp it with a newer generation.
 `GrowComputerStorage` binds its receipt to Computer, Storage generation, Node,
 managed-root instance, Job, operation revision and fence, helper generation,
 and both byte counts. Grow serializes with reset, Backup, attach, detach, and
-removal. Its crash boundaries are capacity reservation, filesystem expansion,
-and manifest publication; retry inspects durable image and manifest facts and
+removal. Before filesystem expansion it durably writes `storage-grow.json`
+with the exact old and target sizes and operation authority. Startup reconciles
+that record before namespace verification: an untouched old-size image rolls
+back by removing the intent, while a target-size image is idempotently resized,
+allocation-verified, and published in `attachment.json`. Its crash boundaries
+are therefore capacity reservation, durable intent, filesystem expansion, and
+manifest publication; retry inspects durable image and manifest facts and
 never reports applied before full allocation plus filesystem expansion. The
 capacity decision includes unmaterialized admitted reservations under the same
 lock, so existing workloads retain their reservations and the newcomer pays.
@@ -785,6 +800,22 @@ receipt. `capacity.active_failure` separately projects current launch/runtime
 resource latches from `last_failure`. A pending, superseded, or absent grow
 receipt remains `NOT-RUN` with `grow_pending`, `grow_superseded`, or
 `grow_receipt_absent`, respectively.
+
+`CopyComputerStorage` records its staged identity and phases in
+`storage-copy.json`. Startup treats the `manifest_written` phase plus the exact
+staged or renamed image digest as resumable authority, completes the atomic
+rename when needed, verifies allocation, and publishes `attachment.json`
+before inventory admission; an earlier staged phase is rolled back because no
+destination generation was published. Grow and copy recovery emit typed
+`resumed` or `rolled_back` sweep evidence. A size/allocation mismatch without matching durable operation
+authority is never reinterpreted as a successful operation: startup moves the
+whole generation into `computer-disk-quarantine`, writes a typed
+`computer_disk_anomaly_quarantined` record, and emits `quarantined` sweep
+evidence with the closed reason. Quarantined generations remain visible in
+`ComputerQuarantines` and operator/removal surfaces but are durable retained
+state, not runnable namespace residue. The affected Computer therefore stays
+fail-closed while the helper continues serving the rest of the Node. Startup's
+namespace-absence promise remains exact for every non-quarantined generation.
 
 `PreflightComputerReimage` runs only after the old Job is stopped and the disk
 manifest contains exact same-boot reap or prior-boot sweep evidence. Image

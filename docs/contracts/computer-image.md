@@ -172,6 +172,17 @@ identity and then rekey the copied identity before the destination can attach. A
 attach verifies the existing disk-root owner and does not recursively re-own
 the copied bytes.
 
+Computer disk publication is crash-resumable across its image/manifest pair.
+Grow writes exact durable operation intent before resizing in place; copy
+retains its staged identity and phase before the staged image can replace the
+published image. Helper startup completes or rolls back only a matching record.
+An allocation or image/manifest anomaly without that authority quarantines the
+exact disk generation through `computer-disk-quarantine` and
+`ComputerQuarantines`. The quarantined Computer cannot attach, while its typed
+quarantine remains operator-visible and does not withdraw OCI service from
+unaffected Computers on the Node. Namespace absence remains verified for all
+non-quarantined generations.
+
 Computers share the Node network namespace even though PID, IPC, UTS, mount,
 and cgroup namespaces remain private. Image-side local or abstract socket names
 should therefore be attempt-unique. The XFCE reference derives its X display

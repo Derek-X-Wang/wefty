@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -19,6 +20,14 @@ const (
 	HelperServiceUnit = "wefty-oci-helper.service"
 	HelperSocketPath  = "/run/wefty-oci/oci-helper.sock"
 	HelperGroup       = "wefty-oci"
+
+	HelperRestartInitialDelay      = 250 * time.Millisecond
+	HelperRestartSteps             = 6
+	HelperStartupFailureBurst      = 6
+	HelperRestartMaximumDelay      = 2 * time.Second
+	HelperStartupListenBudget      = 4 * time.Second
+	HelperRestartTakeoverMargin    = 2 * time.Second
+	HelperSaturatedRestartDelaySum = (HelperStartupFailureBurst + 1) * HelperRestartMaximumDelay
 )
 
 var userPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]{0,63}$`)
@@ -145,7 +154,7 @@ StandardError=journal
 Restart=on-failure
 RestartSec=250ms
 RestartSteps=6
-RestartMaxDelaySec=10s
+RestartMaxDelaySec=2s
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectHome=true

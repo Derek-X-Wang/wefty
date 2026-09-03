@@ -367,10 +367,10 @@ func TestStartupPublishesDurableComputerCopyAfterImageRename(t *testing.T) {
 	}
 
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
-	evidence, err := engine.sweepComputerDisks(t.Context(), "startup-sweep")
-	if err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "startup-sweep"); err != nil {
 		t.Fatal(err)
 	}
+	evidence := engine.computerDiskSweepEvidence
 	diskManifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
 	if err != nil || !present || !sameComputerStorageIdentity(diskManifest.Storage, request.Destination) {
 		t.Fatalf("recovered copy manifest = %+v present=%t err=%v", diskManifest, present, err)

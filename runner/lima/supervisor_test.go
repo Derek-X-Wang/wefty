@@ -172,18 +172,72 @@ func TestRunningLimaWithUnreadyHelperIsBoundedAndForceStoppedOnce(t *testing.T) 
 	}
 }
 
-func TestSupervisedBarrierPublishesHelperUnitUnavailableWithoutGenericRetry(t *testing.T) {
+type readyLimaHelperEngine struct{ ocihelper.UnavailableEngine }
+
+func (readyLimaHelperEngine) Sweep(_ context.Context, request ocihelper.SweepRequest) (ocihelper.SweepResponse, error) {
+	return ocihelper.SweepResponse{SweepEpoch: request.SweepEpoch}, nil
+}
+
+func (readyLimaHelperEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+	return ocihelper.VerifyResponse{Absent: true}, nil
+}
+
+func startReadyLimaHelper(t *testing.T, checksum string) string {
+	t.Helper()
+	temporary, err := os.CreateTemp("/tmp", "wefty-lima-helper-*.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := temporary.Name()
+	if err := temporary.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := ocihelper.NewServer(readyLimaHelperEngine{}, ocihelper.ServerConfig{
+		HelperVersion: "test", HelperChecksum: checksum, AllowedUIDs: []uint32{uint32(os.Getuid())},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, listener) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = listener.Close()
+		<-done
+		_ = os.Remove(path)
+	})
+	return path
+}
+
+func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T) {
 	intent := newMutableIntent(true)
 	runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
 	supervisor := newTestSupervisor(t, intent, runner)
 	waits := 0
+	ready := false
+	checksum := "sha256:" + strings.Repeat("a", 64)
+	socketPath := startReadyLimaHelper(t, checksum)
 	supervisor.config.wait = func(context.Context, time.Duration) error {
 		waits++
+		ready = true
 		return nil
 	}
 	client := &ocihelper.Client{
-		Version: ocihelper.ProtocolVersion, ExpectedChecksum: "sha256:" + strings.Repeat("a", 64),
-		Dial: func(context.Context) (net.Conn, error) { return nil, syscall.ECONNREFUSED },
+		Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum,
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			if !ready {
+				return nil, syscall.ECONNREFUSED
+			}
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		},
 	}
 	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{
 		TakeoverTimeout: 25 * time.Millisecond,
@@ -194,9 +248,8 @@ func TestSupervisedBarrierPublishesHelperUnitUnavailableWithoutGenericRetry(t *t
 	}
 	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
 	err = barrier.Ensure(t.Context())
-	var unavailable *ocihelper.HelperUnitUnavailableError
-	if !errors.As(err, &unavailable) || barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperUnitUnavailable || waits != 0 {
-		t.Fatalf("supervised unavailable helper = %#v err=%v reason=%q generic_waits=%d", unavailable, err, barrier.CapabilityReasonCode(), waits)
+	if err != nil || !barrier.Ready() || barrier.CapabilityReasonCode() != "" || waits != 1 {
+		t.Fatalf("supervised repaired helper err=%v ready=%t reason=%q repair_waits=%d", err, barrier.Ready(), barrier.CapabilityReasonCode(), waits)
 	}
 }
 
