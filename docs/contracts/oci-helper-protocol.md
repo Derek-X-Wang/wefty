@@ -168,7 +168,12 @@ heartbeat deadline and reap rather than preempting it, then acquires exclusive
 authority and performs sweep plus verification. It reuses that proof only while
 the acquired session remains healthy; replacement authority always repeats the
 whole barrier and never adopts a survivor. Helper startup and client takeover
-are bounded by the configured reap deadline and the caller's earlier deadline.
+use separate bounds under the caller's earlier deadline. Startup sweep retains
+the unchanged ten-second reap bound; the default client takeover window is two
+reap bounds (20 seconds), reserving one full reap interval for socket/session
+admission after startup cleanup. This follows the measured 9.646-second
+kill-helper-to-takeover path that consumed 96 percent of the former shared
+ten-second window.
 The takeover retry timer uses the injected helper clock. The heartbeat pump
 notifies the barrier synchronously when control authority is lost.
 
@@ -546,14 +551,22 @@ the Attempt is no longer live. It rechecks that registry immediately before
 each remove or KILL. An exact 32-hex collision without the binding, a binding
 for a live Attempt, a symlink, or a foreign-owned directory remains typed
 runtime residue; the helper fails closed instead of guessing ownership.
+Unexpected, unreadable, stale-version, or invalid ownership entries emit a
+typed `invalid_entry`, `unreadable`, or `invalid_record` operator outcome with
+`disposition=resources_unbound`; they cannot authorize removal and therefore do
+not turn any observed resource into retained state. Each Verify reads this
+directory once and uses that snapshot for its complete retention projection.
 
 After containerd teardown, sweep gives log sealing at most the configured
 five-second cap, further reduced to half of the usable time remaining before
 the caller's barrier deadline. Twenty percent of the then-remaining barrier
 time, capped at one second, is reserved for later cgroup/final-inventory and
 Verify work. Scanning resumes from the last complete framed-record offset on
-each poll and checks cancellation inside the scan. A directory with neither
-frames file has nothing to seal and is removed immediately. If the phase budget
+each poll, resets the offset after truncation, and checks cancellation inside
+the scan. A directory with neither frames file has nothing to seal and is
+removed immediately. A corrupt frame likewise has no trustworthy seal work
+left: sweep removes the spool with `method=corrupt_frames` evidence instead of
+failing the boot barrier. If the phase budget
 expires, sweep fsyncs and returns an exact retention receipt containing class,
 resource and Attempt IDs, observed `unsealed` state, owner, reason, recorded
 time, five-minute bound, and absolute deadline. Verify may classify that visible
@@ -921,8 +934,10 @@ identity exactly; unexpected containerd resources in namespace `wefty`, shim
 bundle entries under containerd's runtime-v2 state root, and cgroups found by a
 recursive scan of the configured cgroup hierarchy make absence verification
 fail. After containerd task deletion, sweep acts only on a cgroup bound to a
-durable LOST Attempt record. The direct deterministic name and its single
-`.scope` form are the authoritative inventory spellings. With the live registry
+durable LOST Attempt record. Observation remains broad for compatible CRI,
+systemd-composed, and pre-upgrade names containing `wefty-cgroup-`; a matched
+directory is recorded once and its subtree is skipped. Only the direct
+deterministic name and its single `.scope` form are sweepable. With the live registry
 locked and rechecked, the helper sends `SIGKILL` through cgroup v2's
 `cgroup.kill` (falling back on open, write, or close `EOPNOTSUPP` to `SIGKILL`
 for every PID in the subtree), then removes directories bottom-up. This is

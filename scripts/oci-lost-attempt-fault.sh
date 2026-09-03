@@ -3,44 +3,6 @@ set -eu
 
 action="${1:-}"
 case "$action" in
-  inject-live-log:wefty-log-segments-*)
-    name="${action#inject-live-log:}"
-    if ! printf '%s\n' "$name" | grep -Eq '^wefty-log-segments-[0-9a-f]{32}$'; then
-      printf 'invalid helper log identity %s\n' "$name" >&2
-      exit 64
-    fi
-    path="/var/lib/wefty/oci/logs/$name"
-    install --directory --owner=root --group=root --mode=0700 "$path"
-    : > "$path/stdout.frames"
-    : > "$path/stderr.frames"
-    python3 - "$path" <<'PY' &
-import hashlib
-import pathlib
-import struct
-import sys
-import time
-
-root = pathlib.Path(sys.argv[1])
-time.sleep(1)
-seal = struct.pack(">4sQI", b"WLS1", 0, 0) + hashlib.sha256(b"").digest()
-for stream in ("stdout.frames", "stderr.frames"):
-    with (root / stream).open("ab") as target:
-        target.write(seal)
-        target.flush()
-PY
-    ;;
-  populate-cgroup:wefty-cgroup-*)
-    name="${action#populate-cgroup:}"
-    if ! printf '%s\n' "$name" | grep -Eq '^wefty-cgroup-[0-9a-f]{32}$'; then
-      printf 'invalid helper cgroup identity %s\n' "$name" >&2
-      exit 64
-    fi
-    path="/sys/fs/cgroup/$name"
-    mkdir "$path"
-    sleep 300 &
-    pid="$!"
-    printf '%s\n' "$pid" > "$path/cgroup.procs"
-    ;;
   save-attempt-record:wefty-container-*)
     container="${action#save-attempt-record:}"
     if ! printf '%s\n' "$container" | grep -Eq '^wefty-container-[0-9a-f]{32}$'; then

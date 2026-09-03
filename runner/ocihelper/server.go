@@ -1565,7 +1565,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if body.Scope == VerifyNamespace {
 			server.createSweep.Unlock()
 		}
-		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, validationErr)
 	case MethodSweep:
 		var body SweepRequest
 		if !decodeRequest(wire, request.Body, &body) {

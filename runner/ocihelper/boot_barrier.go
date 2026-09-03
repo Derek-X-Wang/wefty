@@ -11,6 +11,10 @@ import (
 
 const defaultTakeoverRetryInterval = 25 * time.Millisecond
 
+func takeoverTimeoutForReap(reapTimeout time.Duration) time.Duration {
+	return reapTimeout + reapTimeout
+}
+
 type BootBarrierConfig struct {
 	Clock           Clock
 	TakeoverTimeout time.Duration
@@ -146,7 +150,7 @@ func NewBootBarrierWithConfig(client *Client, request AcquireSessionRequest, con
 		config.Clock = systemClock{}
 	}
 	if config.TakeoverTimeout <= 0 {
-		config.TakeoverTimeout = defaultReapTimeout
+		config.TakeoverTimeout = takeoverTimeoutForReap(defaultReapTimeout)
 	}
 	if config.TakeoverRetry <= 0 {
 		config.TakeoverRetry = defaultTakeoverRetryInterval

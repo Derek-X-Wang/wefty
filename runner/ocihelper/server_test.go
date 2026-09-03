@@ -1016,7 +1016,54 @@ func TestBootBarrierRefusesResidueAndNeverExposesSession(t *testing.T) {
 	}
 }
 
-func TestBootBarrierRefusesInconsistentResidueClassificationWithTypedError(t *testing.T) {
+func TestBootBarrierDefaultTakeoverReservesAStartupReapWindow(t *testing.T) {
+	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{})
+	defer stop()
+	barrier, err := NewBootBarrier(client, testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if barrier.config.TakeoverTimeout != 2*defaultReapTimeout {
+		t.Fatalf("default takeover timeout = %s, want startup reap plus admission reap %s", barrier.config.TakeoverTimeout, 2*defaultReapTimeout)
+	}
+}
+
+func TestBootBarrierTakeoverIncludesSlowStartupAndAdmissionSweeps(t *testing.T) {
+	const reapTimeout = 250 * time.Millisecond
+	engine := &stagedSweepEngine{
+		fakeEngine: newFakeEngine(),
+		entered:    []chan struct{}{make(chan struct{}), make(chan struct{})},
+		release:    []chan struct{}{make(chan struct{}), make(chan struct{})},
+	}
+	client, stop := startTestServer(t, engine, ServerConfig{ReapTimeout: reapTimeout})
+	defer stop()
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: takeoverTimeoutForReap(reapTimeout),
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ensured := make(chan error, 1)
+	go func() { ensured <- barrier.Ensure(t.Context()) }()
+	for index := range engine.entered {
+		select {
+		case <-engine.entered[index]:
+		case <-time.After(time.Second):
+			t.Fatalf("sweep %d did not start", index+1)
+		}
+		time.Sleep(150 * time.Millisecond)
+		close(engine.release[index])
+	}
+	if err := <-ensured; err != nil {
+		t.Fatalf("startup plus admission sweeps exhausted derived takeover allowance: %v", err)
+	}
+	if !barrier.Ready() {
+		t.Fatal("barrier did not publish authority after slow startup and admission sweeps")
+	}
+}
+
+func TestServerAndBootBarrierRefuseInconsistentResidueClassification(t *testing.T) {
 	for _, verification := range []VerifyResponse{
 		{Absent: true, Inventory: ResourceInventory{ComputerDiskAnomalies: []string{"disk:allocation_mismatch"}}, RuntimeResidue: ResourceInventory{ComputerDiskAnomalies: []string{"disk:allocation_mismatch"}}},
 		{Absent: false, Inventory: ResourceInventory{Containers: []string{"observed-without-classification"}}},
@@ -1030,8 +1077,7 @@ func TestBootBarrierRefusesInconsistentResidueClassificationWithTypedError(t *te
 			t.Fatal(err)
 		}
 		err = barrier.Ensure(t.Context())
-		var classification *ResidueClassificationError
-		if !errors.As(err, &classification) {
+		if err == nil || !strings.Contains(err.Error(), "operation=Verify") || barrier.Ready() {
 			stop()
 			t.Fatalf("inconsistent verification error = %v", err)
 		}
@@ -2874,6 +2920,14 @@ type fakeEngine struct {
 	exportCustodyResponse    ExportComputerCustodyResponse
 }
 
+type stagedSweepEngine struct {
+	*fakeEngine
+	mu      sync.Mutex
+	entered []chan struct{}
+	release []chan struct{}
+	calls   int
+}
+
 type blockingRemovalInventoryEngine struct {
 	*fakeEngine
 	entered   chan struct{}
@@ -3471,6 +3525,28 @@ func (engine *fakeEngine) Sweep(context.Context, SweepRequest) (SweepResponse, e
 	}
 	return SweepResponse{Removed: 1}, nil
 }
+
+func (engine *stagedSweepEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
+	engine.mu.Lock()
+	index := engine.calls
+	engine.calls++
+	if index >= len(engine.entered) || index >= len(engine.release) {
+		engine.mu.Unlock()
+		return engine.fakeEngine.Sweep(ctx, request)
+	}
+	entered := engine.entered[index]
+	release := engine.release[index]
+	engine.mu.Unlock()
+	close(entered)
+	select {
+	case <-release:
+	case <-ctx.Done():
+		return SweepResponse{}, ctx.Err()
+	}
+	engine.record("Sweep")
+	return SweepResponse{Removed: 1}, nil
+}
+
 func (engine *fakeEngine) DialAttemptPort(_ context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
 	engine.record("DialAttemptPort")
 	engine.mu.Lock()

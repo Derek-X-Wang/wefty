@@ -319,11 +319,11 @@ reaped the task but its Wait stream never supplies that terminal evidence, the
 agent treats the missing confirmation as typed runtime loss and performs the
 replacement-generation sweep.
 An ordinary attempt `Delete` must subsequently verify task, container,
-snapshot, lease, cgroup, shim, and log absence before L1 may observe `stopped`.
-The distinct replacement-generation namespace sweep may instead report a
-still-finishing LOST-Attempt log or cgroup only from its unexpired durable
-retention receipt; its exact observed/residue/retained partition is validated
-before that receipt can authorize admission.
+snapshot, lease, cgroup, shim, and log runtime absence before L1 may observe
+`stopped`. Both attempt and namespace verification may project a still-finishing
+LOST-Attempt log or cgroup from runtime residue only when an unexpired durable
+retention receipt supplies the exact authority; every consumer validates the
+observed/residue/retained partition before accepting that absence.
 
 Helper/session or engine loss takes a different positive-proof path. The OCI
 adapter invokes the agent recovery hook only for helper/engine evidence, never

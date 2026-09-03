@@ -835,10 +835,12 @@ func TestNativeLinuxSweepClearsLostAttemptLogSpoolAndPopulatedCgroup(t *testing.
 	sweepStarted := time.Now()
 	sweepBound := session.Handshake().ReapTimeout
 	requestRootFault(t, "kill-helper")
+	startupSweepToTakeoverStarted := time.Now()
 	barrier.Invalidate()
 	if err := barrier.Ensure(ctx); err != nil {
 		t.Fatalf("sweep runtime after helper loss: %v", err)
 	}
+	startupSweepToTakeoverElapsed := time.Since(startupSweepToTakeoverStarted)
 	sweepElapsed := time.Since(sweepStarted)
 	receipt, ok := barrier.SweepReceipt()
 	if !ok || !receipt.VerifiedAbsent || len(receipt.VerifiedRetained.Cgroups) != 0 || !slices.Contains(receipt.SweptInventory.LogSegments, identity.LogSegmentDirectory) || !slices.Contains(receipt.SweptInventory.Cgroups, identity.CgroupID) {
@@ -854,7 +856,7 @@ func TestNativeLinuxSweepClearsLostAttemptLogSpoolAndPopulatedCgroup(t *testing.
 	if logEvidence == nil || logEvidence.Duration > sweepBound {
 		t.Fatalf("lost-attempt typed log sweep evidence=%+v bound=%s", logEvidence, sweepBound)
 	}
-	t.Logf("lost-attempt sweep completed in %s with log=%+v", sweepElapsed, logEvidence)
+	t.Logf("lost-attempt sweep completed in %s (startup sweep to takeover %s) with log=%+v", sweepElapsed, startupSweepToTakeoverElapsed, logEvidence)
 
 	requestRootFault(t, "restore-populated-cgroup:"+identity.ContainerID+":"+identity.CgroupID)
 	cgroupSweepStarted := time.Now()
@@ -903,7 +905,7 @@ func TestNativeLinuxSweepClearsLostAttemptLogSpoolAndPopulatedCgroup(t *testing.
 		t.Fatalf("clean never-sealing lost-attempt fixture: %v", err)
 	}
 	if evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR"); evidenceDirectory != "" {
-		evidence := fmt.Sprintf("lost_attempt_id=%s\nlost_attempt_log_segment=%s\npopulated_cgroup=%s\nsweep_elapsed=%s\ncgroup_sweep_elapsed=%s\nsweep_bound=%s\nlog_action=%s\nlog_duration=%s\ncgroup_action=%s\ncgroup_method=%s\ncgroup_pids=%v\ncgroup_duration=%s\nretention_reason=%s\nretention_bound=%s\nretention_deadline=%s\nverified_absent=true\n", authority.AttemptID, identity.LogSegmentDirectory, identity.CgroupID, sweepElapsed, cgroupSweepElapsed, sweepBound, logEvidence.Action, logEvidence.Duration, cgroupEvidence.Action, cgroupEvidence.Method, cgroupEvidence.PIDs, cgroupEvidence.Duration, logRetention.Reason, logRetention.Bound, logRetention.Deadline.Format(time.RFC3339Nano))
+		evidence := fmt.Sprintf("lost_attempt_id=%s\nlost_attempt_log_segment=%s\npopulated_cgroup=%s\nkill_helper_to_takeover_elapsed=%s\nstartup_sweep_to_takeover_elapsed=%s\ncgroup_sweep_elapsed=%s\nsweep_bound=%s\nlog_action=%s\nlog_duration=%s\ncgroup_action=%s\ncgroup_method=%s\ncgroup_pids=%v\ncgroup_duration=%s\nretention_reason=%s\nretention_bound=%s\nretention_deadline=%s\nverified_absent=true\n", authority.AttemptID, identity.LogSegmentDirectory, identity.CgroupID, sweepElapsed, startupSweepToTakeoverElapsed, cgroupSweepElapsed, sweepBound, logEvidence.Action, logEvidence.Duration, cgroupEvidence.Action, cgroupEvidence.Method, cgroupEvidence.PIDs, cgroupEvidence.Duration, logRetention.Reason, logRetention.Bound, logRetention.Deadline.Format(time.RFC3339Nano))
 		if err := os.WriteFile(filepath.Join(evidenceDirectory, "lost-attempt-sweep.txt"), []byte(evidence), 0o600); err != nil {
 			t.Fatal(err)
 		}

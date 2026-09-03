@@ -2532,6 +2532,13 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 	var failures []error
 	var container containerd.Container
 	if attempt != nil {
+		// Delete owns the transition out of live attempt authority. This lets the
+		// durable ownership record authorize an exact cgroup reap below without
+		// making a concurrent namespace sweep mistake the deleting attempt for a
+		// still-live one.
+		attempt.mu.Lock()
+		attempt.deleted = true
+		attempt.mu.Unlock()
 		if attempt.cancel != nil {
 			attempt.cancel()
 		}
@@ -2583,6 +2590,9 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 	if err := engine.client.LeasesService().Delete(ctx, lease); err != nil && !errdefs.IsNotFound(err) {
 		failures = append(failures, err)
 	}
+	if err := engine.sweepDeletedAttemptCgroup(ctx, resources); err != nil {
+		failures = append(failures, err)
+	}
 	for _, path := range []string{
 		filepath.Join(engine.config.RuntimeRoot, "logs", resources.LogSegmentDirectory),
 	} {
@@ -2596,20 +2606,44 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 	return errors.Join(failures...)
 }
 
+func (engine *ContainerdEngine) sweepDeletedAttemptCgroup(ctx context.Context, resources ResourceIdentity) error {
+	ownership, err := engine.loadAttemptOwnershipRecords()
+	if err != nil {
+		return err
+	}
+	// Unlike logs, a cgroup cannot be removed with RemoveAll. Run the same
+	// bounded kill/reap path used by startup recovery. A still-populated tree
+	// is retained durably and releaseVerifiedAttempt keeps its owner record.
+	_, _, err = engine.sweepLostAttemptCgroups(ctx, []string{resources.CgroupID, resources.CgroupID + ".scope"}, ownership)
+	return err
+}
+
 func (engine *ContainerdEngine) releaseVerifiedAttempt(ctx context.Context, authorityKey string) error {
 	pinErr := engine.releaseAttemptImagePin(ctx, authorityKey)
 	engine.releaseAttemptRuntimeState(authorityKey)
 	engine.releaseCapacityReservation(authorityKey)
-	return errors.Join(pinErr, engine.removeAttemptOwnershipRecordByKey(authorityKey))
+	return errors.Join(pinErr, engine.removeAttemptOwnershipRecordByKeyIfQuiescent(ctx, authorityKey))
 }
 
-func (engine *ContainerdEngine) removeAttemptOwnershipRecordByKey(authorityKey string) error {
+func (engine *ContainerdEngine) removeAttemptOwnershipRecordByKeyIfQuiescent(ctx context.Context, authorityKey string) error {
 	records, err := engine.loadAttemptOwnershipRecords()
 	if err != nil {
 		return err
 	}
 	record, ok := records[authorityKey]
 	if !ok {
+		return nil
+	}
+	inventory, err := engine.inventory(ctx)
+	if err != nil {
+		return err
+	}
+	return engine.removeAttemptOwnershipRecordIfInventoryQuiescent(record, inventory)
+}
+
+func (engine *ContainerdEngine) removeAttemptOwnershipRecordIfInventoryQuiescent(record durableAttemptOwnership, inventory ResourceInventory) error {
+	filtered := filterInventory(inventory, record.Resources, nil)
+	if len(filtered.Leases)+len(filtered.Snapshots)+len(filtered.Containers)+len(filtered.Tasks)+len(filtered.Shims)+len(filtered.Cgroups)+len(filtered.LogSegments) != 0 {
 		return nil
 	}
 	return engine.removeAttemptOwnershipRecord(record)
@@ -3276,15 +3310,7 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 	for _, entry := range shimEntries {
 		result.Shims = append(result.Shims, entry.Name())
 	}
-	if err := filepath.WalkDir(engine.config.CgroupRoot, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if _, managed := cgroupAttemptResourceID(entry.Name()); entry.IsDir() && managed {
-			result.Cgroups = append(result.Cgroups, entry.Name())
-		}
-		return nil
-	}); err != nil {
+	if err := inventoryAttemptCgroups(engine.config.CgroupRoot, &result); err != nil {
 		return result, err
 	}
 	if err := inventoryManagedVolumeResources(engine.config.RuntimeRoot, &result); err != nil {
@@ -3293,6 +3319,24 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 	if err := engine.inventoryComputerDiskResources(&result); err != nil {
 		return result, err
 	}
+	sortResourceInventory(&result)
+	return result, nil
+}
+
+func inventoryAttemptCgroups(root string, result *ResourceInventory) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() && strings.Contains(entry.Name(), "wefty-cgroup-") {
+			result.Cgroups = append(result.Cgroups, entry.Name())
+			return filepath.SkipDir
+		}
+		return nil
+	})
+}
+
+func sortResourceInventory(result *ResourceInventory) {
 	sort.Strings(result.Leases)
 	sort.Strings(result.Snapshots)
 	sort.Strings(result.Containers)
@@ -3313,7 +3357,6 @@ func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventor
 	sort.Strings(result.ComputerResetManifests)
 	sort.Strings(result.ComputerQuarantines)
 	sort.Strings(result.ComputerDiskAnomalies)
-	return result, nil
 }
 
 func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInventory) error {
@@ -3382,6 +3425,14 @@ func filterInventory(inventory ResourceInventory, resources ResourceIdentity, at
 }
 
 const durableAttemptOwnershipVersion = 1
+
+type attemptOwnershipEntryOutcome string
+
+const (
+	attemptOwnershipInvalidEntry  attemptOwnershipEntryOutcome = "invalid_entry"
+	attemptOwnershipUnreadable    attemptOwnershipEntryOutcome = "unreadable"
+	attemptOwnershipInvalidRecord attemptOwnershipEntryOutcome = "invalid_record"
+)
 
 type durableAttemptOwnership struct {
 	Version    int                `json:"version"`
@@ -3496,19 +3547,26 @@ func (engine *ContainerdEngine) loadAttemptOwnershipRecords() (map[string]durabl
 			continue
 		}
 		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(entry.Name(), ".json") {
-			return nil, fmt.Errorf("invalid durable Attempt ownership entry %q", entry.Name())
+			logAttemptOwnershipEntryOutcome(entry.Name(), attemptOwnershipInvalidEntry)
+			continue
 		}
 		payload, err := os.ReadFile(filepath.Join(engine.attemptOwnershipRoot(), entry.Name()))
 		if err != nil {
-			return nil, err
+			logAttemptOwnershipEntryOutcome(entry.Name(), attemptOwnershipUnreadable)
+			continue
 		}
 		var record durableAttemptOwnership
 		if json.Unmarshal(payload, &record) != nil || !validDurableAttemptOwnership(record, entry.Name()) {
-			return nil, fmt.Errorf("invalid durable Attempt ownership record %q", entry.Name())
+			logAttemptOwnershipEntryOutcome(entry.Name(), attemptOwnershipInvalidRecord)
+			continue
 		}
 		records[record.Authority.key()] = record
 	}
 	return records, nil
+}
+
+func logAttemptOwnershipEntryOutcome(name string, outcome attemptOwnershipEntryOutcome) {
+	log.Printf("durable Attempt ownership entry ignored name=%q outcome=%s disposition=resources_unbound", name, outcome)
 }
 
 func (engine *ContainerdEngine) attemptOwnershipIsLive(record durableAttemptOwnership) bool {
@@ -3644,7 +3702,7 @@ func (engine *ContainerdEngine) sweepLostAttemptLogSegments(ctx context.Context,
 	}
 	for len(pending) > 0 {
 		for name, candidate := range pending {
-			sealed, err := logSegmentDirectorySealed(ctx, candidate.path, progress)
+			sealed, method, err := logSegmentDirectorySealed(ctx, candidate.path, progress)
 			if err != nil {
 				return nil, nil, fmt.Errorf("inspect lost-attempt log spool %s: %w", name, err)
 			}
@@ -3669,7 +3727,7 @@ func (engine *ContainerdEngine) sweepLostAttemptLogSegments(ctx context.Context,
 			if err := engine.clearAttemptRetention(candidate.record, RemovalResourceLogSegments, name); err != nil {
 				return nil, nil, err
 			}
-			evidence = append(evidence, SweepEvidence{Class: RemovalResourceLogSegments, ID: name, AttemptID: candidate.record.Authority.AttemptID, Action: SweepActionRemoved, Method: "sealed_or_empty", Duration: clock.Now().Sub(started)})
+			evidence = append(evidence, SweepEvidence{Class: RemovalResourceLogSegments, ID: name, AttemptID: candidate.record.Authority.AttemptID, Action: SweepActionRemoved, Method: method, Duration: clock.Now().Sub(started)})
 			delete(pending, name)
 		}
 		if len(pending) == 0 {
@@ -3744,7 +3802,7 @@ type logSealScanState struct {
 	sealed bool
 }
 
-func logSegmentDirectorySealed(ctx context.Context, directory string, progress map[string]logSealScanState) (bool, error) {
+func logSegmentDirectorySealed(ctx context.Context, directory string, progress map[string]logSealScanState) (bool, string, error) {
 	for _, stream := range []string{"stdout.frames", "stderr.frames"} {
 		path := filepath.Join(directory, stream)
 		state := progress[path]
@@ -3758,36 +3816,49 @@ func logSegmentDirectorySealed(ctx context.Context, directory string, progress m
 			continue
 		}
 		if err != nil {
-			return false, err
+			return false, "", err
+		}
+		info, err := file.Stat()
+		if err != nil {
+			_ = file.Close()
+			return false, "", err
+		}
+		if info.Size() < state.offset {
+			state = logSealScanState{}
+			progress[path] = state
 		}
 		if _, err := file.Seek(state.offset, io.SeekStart); err != nil {
 			_ = file.Close()
-			return false, err
+			return false, "", err
 		}
 		for {
 			if err := ctx.Err(); err != nil {
 				_ = file.Close()
-				return false, err
+				return false, "", err
 			}
 			start, seekErr := file.Seek(0, io.SeekCurrent)
 			if seekErr != nil {
 				_ = file.Close()
-				return false, seekErr
+				return false, "", seekErr
 			}
 			kind, _, _, readErr := readLogRecord(file)
 			if readErr != nil {
+				if errors.Is(readErr, errCorruptLogRecord) {
+					_ = file.Close()
+					return true, "corrupt_frames", nil
+				}
 				if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
 					state.offset = start
 					progress[path] = state
 					break
 				}
 				_ = file.Close()
-				return false, readErr
+				return false, "", readErr
 			}
 			offset, seekErr := file.Seek(0, io.SeekCurrent)
 			if seekErr != nil {
 				_ = file.Close()
-				return false, seekErr
+				return false, "", seekErr
 			}
 			state.offset = offset
 			if kind == logRecordSeal || kind == logRecordIncomplete {
@@ -3797,13 +3868,13 @@ func logSegmentDirectorySealed(ctx context.Context, directory string, progress m
 			}
 		}
 		if err := file.Close(); err != nil {
-			return false, err
+			return false, "", err
 		}
 		if !state.sealed {
-			return false, nil
+			return false, "", nil
 		}
 	}
-	return true, nil
+	return true, "sealed_or_empty", nil
 }
 
 func remainingSweepPhaseBudget(ctx context.Context, configured time.Duration, divisor int) time.Duration {

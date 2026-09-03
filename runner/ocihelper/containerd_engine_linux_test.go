@@ -205,6 +205,108 @@ func TestSweepLostAttemptLogSegmentsWaitsForSealThenRemoves(t *testing.T) {
 	}
 }
 
+func TestSweepLostAttemptLogSegmentsResetsOffsetAfterTruncation(t *testing.T) {
+	authority := testAuthority()
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeRoot := t.TempDir()
+	directory := filepath.Join(runtimeRoot, "logs", resources.LogSegmentDirectory)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, stream := range []string{"stdout.frames", "stderr.frames"} {
+		file, createErr := os.Create(filepath.Join(directory, stream))
+		if createErr == nil {
+			createErr = writeLogFrame(file, 0, []byte("long frame contents before truncation"))
+		}
+		if file != nil {
+			createErr = errors.Join(createErr, file.Close())
+		}
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot, LogSealTimeout: time.Second}}
+	engine.afterLogSealObservation = func() {
+		engine.afterLogSealObservation = nil
+		for _, stream := range []string{"stdout.frames", "stderr.frames"} {
+			file, openErr := os.OpenFile(filepath.Join(directory, stream), os.O_WRONLY|os.O_TRUNC, 0)
+			if openErr == nil {
+				openErr = writeLogRecord(file, logSealMagic, 1, nil)
+			}
+			if file != nil {
+				openErr = errors.Join(openErr, file.Close())
+			}
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+		}
+	}
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := engine.loadAttemptOwnershipRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, evidence, err := engine.sweepLostAttemptLogSegments(t.Context(), []string{resources.LogSegmentDirectory}, ownership)
+	if err != nil || len(retained) != 0 || len(evidence) != 1 || evidence[0].Method != "sealed_or_empty" {
+		t.Fatalf("truncated spool retained=%+v evidence=%+v err=%v", retained, evidence, err)
+	}
+}
+
+func TestSweepLostAttemptLogSegmentsRemovesCorruptFramesWithEvidence(t *testing.T) {
+	authority := testAuthority()
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeRoot := t.TempDir()
+	directory := filepath.Join(runtimeRoot, "logs", resources.LogSegmentDirectory)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "stdout.frames"), make([]byte, logFrameHeaderBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot, LogSealTimeout: time.Second}}
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := engine.loadAttemptOwnershipRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, evidence, err := engine.sweepLostAttemptLogSegments(t.Context(), []string{resources.LogSegmentDirectory}, ownership)
+	if err != nil || len(evidence) != 1 || evidence[0].Method != "corrupt_frames" || evidence[0].Action != SweepActionRemoved {
+		t.Fatalf("corrupt spool evidence=%+v err=%v", evidence, err)
+	}
+	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("corrupt spool remained: %v", err)
+	}
+}
+
+func TestLoadAttemptOwnershipRecordsIgnoresUnknownAndStaleEntries(t *testing.T) {
+	runtimeRoot := t.TempDir()
+	root := filepath.Join(runtimeRoot, "attempt-ownership")
+	if err := os.MkdirAll(filepath.Join(root, "unexpected-dir"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "unknown"), []byte("unknown\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "stale.json"), []byte(`{"version":0}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: runtimeRoot}}
+	records, err := engine.loadAttemptOwnershipRecords()
+	if err != nil || len(records) != 0 {
+		t.Fatalf("unknown ownership entries records=%v err=%v", records, err)
+	}
+}
+
 func TestSweepLostAttemptLogSegmentsRetainsPendingSealWithOwnerAndReason(t *testing.T) {
 	authority := testAuthority()
 	resources, err := DeterministicResourceIdentity(authority)
@@ -358,6 +460,64 @@ func TestSweepLostAttemptCgroupBudgetExpiryCreatesBoundedRetention(t *testing.T)
 	residue, verifiedRetained, err := engine.runtimeAbsenceInventory(ResourceInventory{Cgroups: []string{resources.CgroupID}}, retained[0].RecordedAt)
 	if err != nil || len(residue.Cgroups) != 0 || !slices.Equal(verifiedRetained, retained) {
 		t.Fatalf("cgroup retention verification residue=%+v retained=%+v err=%v", residue, verifiedRetained, err)
+	}
+}
+
+func TestDeleteSweepKillsOwnedCgroupAndQuiescentReleaseKeepsRecordUntilItIsGone(t *testing.T) {
+	authority := testAuthority()
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeRoot := t.TempDir()
+	cgroupRoot := t.TempDir()
+	cgroupPath := filepath.Join(cgroupRoot, resources.CgroupID)
+	if err := os.Mkdir(cgroupPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	killed := false
+	engine := &ContainerdEngine{
+		config:   NativeEngineConfig{RuntimeRoot: runtimeRoot, CgroupRoot: cgroupRoot, TaskReleaseTimeout: time.Second},
+		attempts: map[string]*containerdAttempt{authority.key(): {authority: authority, resources: resources, deleted: true}},
+		cgroupKill: func(string) (cgroupKillResult, error) {
+			killed = true
+			return cgroupKillResult{Method: "test", PIDs: []int{42}}, nil
+		},
+		cgroupPopulated: func(string) (bool, error) { return !killed, nil },
+		cgroupRemove:    os.RemoveAll,
+	}
+	if err := engine.ensureAttemptOwnershipRecord(authority, resources); err != nil {
+		t.Fatal(err)
+	}
+	records, err := engine.loadAttemptOwnershipRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := records[authority.key()]
+	record, retention, err := engine.retainAttemptResource(record, RemovalResourceCgroup, resources.CgroupID, DurableRetentionReasonCgroupReaping, DurableRetentionStatePopulated, time.Now())
+	if err != nil || retention.Bound <= 0 {
+		t.Fatalf("create retained cgroup binding: retention=%+v err=%v", retention, err)
+	}
+	if err := engine.removeAttemptOwnershipRecordIfInventoryQuiescent(record, ResourceInventory{Cgroups: []string{resources.CgroupID}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(engine.attemptOwnershipPath(resources)); err != nil {
+		t.Fatalf("release removed ownership while retained cgroup remained: %v", err)
+	}
+	if err := engine.sweepDeletedAttemptCgroup(t.Context(), resources); err != nil {
+		t.Fatal(err)
+	}
+	if !killed {
+		t.Fatal("Delete cgroup sweep did not issue KILL")
+	}
+	if _, err := os.Stat(cgroupPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Delete cgroup sweep left cgroup behind: %v", err)
+	}
+	if err := engine.removeAttemptOwnershipRecordIfInventoryQuiescent(record, ResourceInventory{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(engine.attemptOwnershipPath(resources)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("quiescent release kept ownership record: %v", err)
 	}
 }
 
@@ -1365,6 +1525,26 @@ func TestFilterInventoryMatchesOnlyExactCgroupOrSystemdScope(t *testing.T) {
 	filtered := filterInventory(inventory, resources, nil)
 	if !slices.Equal(filtered.Cgroups, []string{resources.CgroupID, resources.CgroupID + ".scope"}) {
 		t.Fatalf("filtered cgroups = %v", filtered.Cgroups)
+	}
+}
+
+func TestCgroupInventoryPreservesBroadObservationButSkipsMatchedSubtree(t *testing.T) {
+	root := t.TempDir()
+	broad := "system.slice-cri-wefty-cgroup-legacy.scope"
+	for _, name := range []string{broad, "unrelated"} {
+		if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(root, broad, "nested-wefty-cgroup-hidden"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inventory := ResourceInventory{}
+	if err := inventoryAttemptCgroups(root, &inventory); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(inventory.Cgroups, []string{broad}) {
+		t.Fatalf("broad cgroup inventory = %v", inventory.Cgroups)
 	}
 }
 
