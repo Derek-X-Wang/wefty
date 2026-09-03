@@ -50,8 +50,8 @@ func writeComputerStorageGrowIntentRecord(root string, intent computerStorageGro
 }
 
 func readComputerStorageGrowIntent(root string) (computerStorageGrowIntent, bool, error) {
-	payload, err := os.ReadFile(filepath.Join(root, computerStorageGrowIntentName))
-	if errors.Is(err, os.ErrNotExist) {
+	payload, present, err := readComputerRecoveryRecord(filepath.Join(root, computerStorageGrowIntentName))
+	if !present && err == nil {
 		return computerStorageGrowIntent{}, false, nil
 	}
 	if err != nil {

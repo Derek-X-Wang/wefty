@@ -152,6 +152,40 @@ func TestServeQuarantinesIdentityMismatchedManifestAndAdmitsBarrier(t *testing.T
 	assertServeQuarantinesAndAdmits(t, root, storage, name, "identity_mismatch")
 }
 
+func TestServeQuarantinesNonRegularRecoveryRecordsAndAdmitsBarrier(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		write func(*testing.T, string)
+	}{
+		{name: "directory", write: func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "symlink", write: func(t *testing.T, path string) {
+			target := filepath.Join(t.TempDir(), "attachment.json")
+			if err := os.WriteFile(target, []byte(`{"version":1}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			storage := testComputerStorage()
+			name, _ := deterministicComputerDiskName(storage)
+			diskRoot := filepath.Join(root, "computer-disks", name)
+			if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			test.write(t, filepath.Join(diskRoot, "attachment.json"))
+			assertServeQuarantinesAndAdmits(t, root, storage, name, "record_not_regular")
+		})
+	}
+}
+
 func assertServeQuarantinesAndAdmits(t *testing.T, root string, storage ComputerStorageReference, name, wantReason string) {
 	t.Helper()
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem(),

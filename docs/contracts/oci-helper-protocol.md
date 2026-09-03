@@ -846,7 +846,8 @@ Required-file recovery classification is exact:
 | Observation | Classification | Startup action |
 | --- | --- | --- |
 | `ENOENT` or `ENOTDIR` for a required file | structural absence | quarantine with a typed missing/authority reason |
-| non-absence read or stat error, including `EIO` or `EACCES` | operational | retain and emit `resume_deferred` |
+| non-absence read or stat error on a regular required file, including `EIO` or `EACCES` | operational | retain and emit `resume_deferred` |
+| required recovery record is a directory, symlink, or other non-regular file | structural invalidity | quarantine with `record_not_regular` |
 | bytes read completely but invalid JSON, version, or fields | structural invalidity | quarantine with typed authority-invalid evidence |
 | verified size, allocation, or digest mismatch | structural mismatch | quarantine the generation |
 

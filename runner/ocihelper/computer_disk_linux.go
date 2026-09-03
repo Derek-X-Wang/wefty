@@ -599,8 +599,8 @@ func (engine *ContainerdEngine) detachComputerDisk(attachment *computerDiskAttac
 }
 
 func readComputerDiskManifest(path string) (computerDiskManifest, bool, error) {
-	payload, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	payload, present, err := readComputerRecoveryRecord(path)
+	if !present && err == nil {
 		return computerDiskManifest{}, false, nil
 	}
 	if err != nil {
@@ -1238,12 +1238,13 @@ func (engine *ContainerdEngine) sweepComputerDisksWithRecoveryAttempt(ctx contex
 				closeComputerDiskLock(recoveryLock)
 				continue
 			}
-			if quarantineErr := engine.quarantineComputerDiskAuthorityFailure(root, entry.Name(), "manifest_invalid"); quarantineErr != nil {
+			reason := computerRecoveryStructuralReason(err, "manifest_invalid")
+			if quarantineErr := engine.quarantineComputerDiskAuthorityFailure(root, entry.Name(), reason); quarantineErr != nil {
 				closeComputerDiskLock(recoveryLock)
 				return errors.Join(err, quarantineErr)
 			}
 			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
-				Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionQuarantined, Method: "manifest_invalid",
+				Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionQuarantined, Method: reason,
 			})
 			closeComputerDiskLock(recoveryLock)
 			continue

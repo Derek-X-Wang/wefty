@@ -73,8 +73,8 @@ func writeComputerStorageCopyManifest(root string, manifest computerStorageCopyM
 }
 
 func readComputerStorageCopyManifest(path string) (computerStorageCopyManifest, bool, error) {
-	payload, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	payload, present, err := readComputerRecoveryRecord(path)
+	if !present && err == nil {
 		return computerStorageCopyManifest{}, false, nil
 	}
 	if err != nil {

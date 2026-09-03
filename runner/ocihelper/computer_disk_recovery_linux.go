@@ -206,10 +206,38 @@ const (
 	computerRecoveryFileOperational
 )
 
+type computerRecoveryRecordNotRegularError struct{ path string }
+
+func (err *computerRecoveryRecordNotRegularError) Error() string {
+	return fmt.Sprintf("Computer recovery record %q is not a regular file", err.path)
+}
+
+func readComputerRecoveryRecord(path string) ([]byte, bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, false, &computerRecoveryRecordNotRegularError{path: path}
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	return payload, true, nil
+}
+
 // classifyComputerRecoveryFileFailure keeps successful reads with invalid
 // content structural, while read/stat failures remain retryable. ENOENT and
 // ENOTDIR are positive structural absence rather than transient I/O.
 func classifyComputerRecoveryFileFailure(err error) computerRecoveryFileFailure {
+	var notRegular *computerRecoveryRecordNotRegularError
+	if errors.As(err, &notRegular) {
+		return computerRecoveryFileInvalid
+	}
 	if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR) {
 		return computerRecoveryFileMissing
 	}
@@ -218,6 +246,14 @@ func classifyComputerRecoveryFileFailure(err error) computerRecoveryFileFailure 
 		return computerRecoveryFileOperational
 	}
 	return computerRecoveryFileInvalid
+}
+
+func computerRecoveryStructuralReason(err error, fallback string) string {
+	var notRegular *computerRecoveryRecordNotRegularError
+	if errors.As(err, &notRegular) {
+		return "record_not_regular"
+	}
+	return fallback
 }
 
 func (engine *ContainerdEngine) resumeComputerStorageGrow(ctx context.Context, root, name string, manifest *computerDiskManifest) (bool, error) {
@@ -485,6 +521,7 @@ func (engine *ContainerdEngine) resolveComputerStorageRecoveryFailure(root, name
 	if reason == "" {
 		reason = "recovery_authority_invalid"
 	}
+	reason = computerRecoveryStructuralReason(recoveryErr, reason)
 	storage := fallbackStorage
 	var recordErr *computerDiskRecoveryRecordError
 	var structuralErr *computerDiskRecoveryStructuralError
@@ -603,7 +640,8 @@ func validComputerDiskDirectoryName(name string) bool {
 
 func validComputerDiskAuthorityFailureReason(reason string) bool {
 	return reason == "manifest_invalid" || reason == "quarantine_authority_invalid" ||
-		reason == "copy_recovery_authority_invalid" || reason == "grow_recovery_authority_invalid" || reason == "identity_mismatch"
+		reason == "copy_recovery_authority_invalid" || reason == "grow_recovery_authority_invalid" ||
+		reason == "identity_mismatch" || reason == "record_not_regular"
 }
 
 func validateComputerDiskQuarantineReceipt(receipt computerDiskQuarantineReceipt) error {
