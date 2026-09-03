@@ -87,7 +87,7 @@ func TestServiceCrashAfterFinalizationBudgetRestarts(t *testing.T) {
 	if err := json.Unmarshal(restartPending.LastFailure, &failure); err != nil {
 		t.Fatalf("decode last_failure: %v", err)
 	}
-	if failure.OutputError != "" || failure.Signal == "" {
+	if failure.OutputError != "" || failure.Signal == "" || failure.TerminationCause != contract.TerminationCauseSpontaneous {
 		t.Fatalf("service failure = %#v, want spontaneous signal without output_error", failure)
 	}
 
@@ -103,8 +103,8 @@ func TestServiceCrashAfterFinalizationBudgetRestarts(t *testing.T) {
 			break
 		}
 	}
-	if !foundAttemptEvent {
-		t.Fatalf("service logs omitted durable events for attempt %q: %#v", running.CurrentAttemptID, logs.Events)
+	if !foundAttemptEvent && !failure.LogEvidenceIncomplete {
+		t.Fatalf("service logs omitted durable events for attempt %q without log_evidence_incomplete: %#v", running.CurrentAttemptID, logs.Events)
 	}
 	if restarted := waitForFreshRunningAttempt(t, harness, job.JobID, running.CurrentAttemptID, 5*time.Second); restarted.JobID != job.JobID {
 		t.Fatalf("restarted service job ID = %q, want %q", restarted.JobID, job.JobID)

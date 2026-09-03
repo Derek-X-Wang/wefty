@@ -51,6 +51,7 @@ type attemptLifecycleDependencies struct {
 	client                     *Client
 	runtimes                   workloadRuntimeSet
 	outbox                     *evidenceOutbox
+	logSinkFactory             attemptLogSinkFactory
 	watchdog                   attemptWatchdog
 	clock                      Clock
 	renewalInterval            time.Duration
@@ -79,6 +80,13 @@ type attemptLifecycleDependencies struct {
 	computerControlTokens      *computerControlTokenCodec
 	computerHostBridgeFallback bool
 }
+
+type attemptLogSink interface {
+	processrunner.OutputSink
+	CloseContext(context.Context) error
+}
+
+type attemptLogSinkFactory func(context.Context, l1.Claim) (attemptLogSink, error)
 
 // attemptLifecycle owns one attempt from renewal startup through process/log
 // finalization, fenced completion, and handoff finalization. Every dependency
@@ -667,7 +675,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		defer admission.Release()
 	}
 	request = admission.Request
-	var uploader *batchingLogSink
+	var uploader attemptLogSink
 	var redactingSink *redactingOutputSink
 	var managedResources workloadrunner.ManagedResources
 	finish := func(result contract.ProcessResult, runErr error) (contract.ProcessResult, error) {
@@ -736,6 +744,15 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		if uploadErr != nil {
 			uploadErr = fmt.Errorf("upload logs: %w", uploadErr)
+		}
+		outputIncomplete, outputErr := classifyLogFinalizationError(outputErr)
+		uploadIncomplete, uploadErr := classifyLogFinalizationError(uploadErr)
+		if outputIncomplete || uploadIncomplete {
+			// The spool retains unacknowledged events for later recovery. A busy
+			// destination consuming the bounded finalization window is therefore
+			// evidence incompleteness, not a replacement for the payload's
+			// already-observed terminal result.
+			result.LogEvidenceIncomplete = true
 		}
 		finalizationErr := errors.Join(recoveryErr, reapErr, outputErr, uploadErr)
 		if finalizationErr != nil {
@@ -875,7 +892,13 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 	}
 	var sinks multiOutputSink
-	if lifecycle.dependencies.client != nil && lifecycle.dependencies.outbox != nil {
+	if lifecycle.dependencies.logSinkFactory != nil {
+		uploader, err = lifecycle.dependencies.logSinkFactory(finalization.context, claim)
+		if err != nil {
+			return finish(spawnFailure(contract.SpawnFailureLogSinkSetup, err), err)
+		}
+		sinks = append(sinks, uploader)
+	} else if lifecycle.dependencies.client != nil && lifecycle.dependencies.outbox != nil {
 		uploader, err = lifecycle.dependencies.outbox.newLogSink(finalization.context, lifecycle.dependencies.client, claim)
 		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureLogSinkSetup, err), err)
@@ -969,6 +992,13 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		result, runErr = runtimeResult.Outcome, err
 	}
 	return finish(result, runErr)
+}
+
+func classifyLogFinalizationError(err error) (bool, error) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true, nil
+	}
+	return false, err
 }
 
 // withoutComputerReservedOperatorEnvironment removes every tenant-supplied

@@ -562,6 +562,13 @@ A runner that does not return after cancellation stays visible as `reaping`;
 the daemon remains alive rather than claiming a process exit can make an
 unreaped payload safe. Completed attempt entries are removed.
 
+The final redaction flush and log upload share the bounded finalization
+context. If that deadline expires after the payload has returned, the agent
+preserves the payload's exit or signal, records additive
+`log_evidence_incomplete`, and leaves unacknowledged spool events available for
+later durable recovery. A non-deadline redaction, spool, or uploader failure
+remains a genuine `output_error`.
+
 `one_shot` and `services` report independent occupied/limit pairs. They are
 local admission counts, not slot identities and not L1 state.
 

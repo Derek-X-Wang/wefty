@@ -1323,6 +1323,121 @@ func TestFinalizationTimeoutStartsAfterServicePayloadStops(t *testing.T) {
 	assertFinalizationTimeoutStartsAfterServicePayloadStops(t)
 }
 
+func TestServiceCrashWithExpiredLogUploadStillRestarts(t *testing.T) {
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "restart-after-log-upload-timeout.sqlite"), l1.StoreOptions{
+		Jitter: func(delay time.Duration) time.Duration { return delay },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	_, err = store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-log-gap-node"}, contract.NodeRegistration{
+		NodeID: "log-gap-node", BootSessionID: "log-gap-boot", OS: "linux", Architecture: "amd64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true},
+	}, l1.DefaultNodePolicy("linux"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
+		SchemaVersion: contract.SchemaVersionV1,
+		DispatchKey:   "restart-after-log-upload-timeout",
+		Kind:          contract.JobKindProcess,
+		Class:         contract.JobClassService,
+		Restart:       contract.RestartAlways,
+		RoutingTags:   []string{"linux"},
+		Execution: contract.ExecutionSpec{
+			Executable:       contract.ExecutableSpec{Path: "/bin/false"},
+			Argv:             []string{"false"},
+			WorkingDirectory: t.TempDir(),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimJob(t.Context(), "fabric-log-gap-node", "log-gap-node", "log-gap-boot", contract.JobClassService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim == nil || claim.Job.JobID != job.JobID {
+		t.Fatalf("claim = %#v, want service %q", claim, job.JobID)
+	}
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedResource, err := initializeManagedResource(managedRoot, "log-gap-node", "log-gap-boot")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		runtimes: workloadRuntimeSet{contract.JobKindProcess: &restartableCrashRuntime{}},
+		clock:    systemClock{}, nodeID: "log-gap-node", bootSessionID: "log-gap-boot",
+		finalizationTimeout: 25 * time.Millisecond, managedResource: managedResource,
+		logSinkFactory: func(context.Context, l1.Claim) (attemptLogSink, error) {
+			return blockingFinalizationLogSink{}, nil
+		},
+	})
+	result, runErr := lifecycle.runWorkload(t.Context(), *claim)
+	if runErr != nil {
+		t.Fatalf("restartable crash finalization = %v, want typed incomplete-log evidence", runErr)
+	}
+	if result.Signal != "killed" || result.TerminationCause != contract.TerminationCauseSpontaneous ||
+		result.OutputError != "" || !result.LogEvidenceIncomplete {
+		t.Fatalf("restartable crash result = %#v, want spontaneous signal plus log_evidence_incomplete", result)
+	}
+
+	restarted, err := store.CompleteAttempt(t.Context(), "fabric-log-gap-node", job.JobID, claim.Lease.AttemptID, l1.CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
+		Result: toL1Result(result), RuntimeQuiescenceEvidence: l1.RuntimeQuiescenceAttempt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.State != contract.JobQueued || restarted.RestartStreak != 1 || restarted.NextRestartAt == nil ||
+		!restarted.RestartPending(restarted.State, time.Now()) {
+		t.Fatalf("service after crash with expired log upload = %#v, want restart-pending", restarted)
+	}
+	var failure l1.ProcessResult
+	if err := json.Unmarshal(restarted.LastFailure, &failure); err != nil {
+		t.Fatal(err)
+	}
+	if failure.Signal != "killed" || failure.OutputError != "" || !failure.LogEvidenceIncomplete {
+		t.Fatalf("last_failure = %#v, want payload signal plus typed incomplete-log evidence", failure)
+	}
+}
+
+type blockingFinalizationLogSink struct{}
+
+func (blockingFinalizationLogSink) WriteOutput(context.Context, contract.LogEvent) error { return nil }
+
+func (blockingFinalizationLogSink) CloseContext(ctx context.Context) error {
+	<-ctx.Done()
+	return context.Cause(ctx)
+}
+
+type restartableCrashRuntime struct{}
+
+func (*restartableCrashRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request, Release: func() {}}, workloadrunner.Result{}, nil
+}
+
+func (*restartableCrashRuntime) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	if err := sink.WriteOutput(ctx, contract.LogEvent{
+		AttemptID: request.Authority.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("before crash"),
+	}); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	return workloadrunner.Result{Outcome: contract.ProcessResult{
+		Signal: "killed", TerminationCause: contract.TerminationCauseSpontaneous,
+	}}, nil
+}
+
+func (*restartableCrashRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+}
+
 func assertFinalizationTimeoutStartsAfterServicePayloadStops(t *testing.T) {
 	t.Helper()
 	network := plain.NewNetwork()
