@@ -7,11 +7,52 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"golang.org/x/sys/unix"
 )
+
+func TestStartupResumesDurableComputerGrowBeforeInventoryVerification(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	diskRoot := filepath.Dir(imagePath)
+	if err := writeComputerStorageGrowIntent(diskRoot, request); err != nil {
+		t.Fatal(err)
+	}
+	if err := fullyAllocateComputerDisk(imagePath, request.NewDiskBytes); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem(),
+		capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt),
+		computerGrowResize:          func(context.Context, string, string, int64, int64) error { return nil },
+		computerGrowFilesystemBytes: func(context.Context, string) (int64, error) { return request.NewDiskBytes, nil },
+	}
+	evidence, err := engine.sweepComputerDisks(t.Context(), "startup-sweep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, _ := deterministicComputerDiskName(request.Storage)
+	manifest, present, err := readComputerDiskManifest(filepath.Join(root, "computer-disks", name, "attachment.json"))
+	if err != nil || !present || manifest.Storage.DiskBytes != request.NewDiskBytes {
+		t.Fatalf("recovered grow manifest = %+v present=%t err=%v", manifest, present, err)
+	}
+	inventory := ResourceInventory{}
+	if err := engine.inventoryComputerDiskResources(&inventory); err != nil {
+		t.Fatal(err)
+	}
+	if len(inventory.ComputerDiskAnomalies) != 0 || !slices.Contains(inventory.ComputerDiskAllocations, name) {
+		t.Fatalf("recovered grow inventory = %+v", inventory)
+	}
+	if !slices.ContainsFunc(evidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionResumed && item.Method == "computer_storage_grow"
+	}) {
+		t.Fatalf("recovered grow evidence = %+v", evidence)
+	}
+}
 
 func growTestRequest(newBytes int64) GrowComputerStorageRequest {
 	return GrowComputerStorageRequest{

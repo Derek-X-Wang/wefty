@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -777,6 +778,37 @@ func TestComputerDiskInventoryContainsPerDiskAllocationAnomaly(t *testing.T) {
 	}
 	if len(inventory.ComputerDiskAnomalies) != 1 || !strings.Contains(inventory.ComputerDiskAnomalies[0], "allocation_mismatch") {
 		t.Fatalf("Computer anomaly inventory = %+v", inventory)
+	}
+}
+
+func TestStartupQuarantinesUnrecordedAllocationMismatchAndKeepsNamespaceAdmissible(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	if err := os.Truncate(imagePath, request.NewDiskBytes); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem()}
+	evidence, err := engine.sweepComputerDisks(t.Context(), "startup-sweep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, _ := deterministicComputerDiskName(request.Storage)
+	if !slices.ContainsFunc(evidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionQuarantined && item.Method == "allocation_mismatch"
+	}) {
+		t.Fatalf("quarantine evidence = %+v", evidence)
+	}
+	inventory := ResourceInventory{}
+	if err := engine.inventoryComputerDiskResources(&inventory); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(inventory.ComputerQuarantines, []string{name}) || len(inventory.ComputerDiskAnomalies) != 0 {
+		t.Fatalf("quarantined inventory = %+v", inventory)
+	}
+	projected, err := projectRuntimeAbsenceInventory(inventory, func(string, string) (bool, error) { return false, nil }, func(string) (bool, error) { return false, nil })
+	if err != nil || !InventoryEmpty(projected) {
+		t.Fatalf("quarantine blocked namespace admission: projected=%+v err=%v", projected, err)
 	}
 }
 

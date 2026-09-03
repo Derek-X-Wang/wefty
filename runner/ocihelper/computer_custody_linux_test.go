@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -333,5 +334,50 @@ func TestComputerCustodyImportRejectsTamperThenResumesMidImport(t *testing.T) {
 	if err != nil || imported.Receipt.Operation != "import" || !imported.Receipt.OSIdentityRekeyed ||
 		imported.Receipt.ExportID != exportRequest.ExportID || imported.Receipt.ManifestDigest != exported.Receipt.ManifestDigest {
 		t.Fatalf("resumed Custody import = %+v err=%v", imported, err)
+	}
+}
+
+func TestStartupPublishesDurableComputerCopyAfterImageRename(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+	request.Destination.ComputerID = "startup-copy-computer"
+	request.Destination.StorageID = "startup-copy-storage"
+	request.Destination.StorageGeneration = 1
+	request.Authority.JobID = "startup-copy-job"
+	name, err := deterministicComputerDiskName(request.Destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	published := filepath.Join(diskRoot, "disk.ext4")
+	if err := fullyAllocateComputerDisk(published, request.Destination.DiskBytes); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := digestFile(published)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := computerStorageCopyManifest{Version: 1, Request: request, Phase: computerStorageCopyManifestWritten,
+		SourceDigest: request.SourceDigest, DestinationDigest: digest, SourceUnchanged: true}
+	if err := writeComputerStorageCopyManifest(diskRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	evidence, err := engine.sweepComputerDisks(t.Context(), "startup-sweep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskManifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
+	if err != nil || !present || !sameComputerStorageIdentity(diskManifest.Storage, request.Destination) {
+		t.Fatalf("recovered copy manifest = %+v present=%t err=%v", diskManifest, present, err)
+	}
+	if !slices.ContainsFunc(evidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionResumed && item.Method == "computer_storage_copy"
+	}) {
+		t.Fatalf("recovered copy evidence = %+v", evidence)
 	}
 }
