@@ -3,9 +3,11 @@
 Computer Storage recovery is fail-closed per generation. A valid interrupted
 grow or copy record that cannot yet resume remains in place as
 `resume_deferred` with an attempt count, first-deferred time, and closed reason.
-Twenty-four failed helper-start sweeps or 24 hours terminates it as
-`resume_abandoned`; structural image/record mismatch and invalid authority
-quarantine immediately. Quarantine retains its
+Only boot-barrier startup sweeps increment the attempt count; in-session reap
+sweeps do not. Recovery terminates as `resume_abandoned` only after both
+twenty-four failed agent boot-barrier sweeps and 24 elapsed hours, so a helper
+restart storm cannot consume the bound in minutes. Structural image/record
+mismatch and invalid authority quarantine immediately. Quarantine retains its
 payload for 24 hours and its typed tombstone thereafter, so N is never
 admissible again; the supported recovery path prepares and admits reset
 generation N+1 and clears N only through authorized removal.

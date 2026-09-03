@@ -41,6 +41,17 @@ func InspectGuestSystemdVersion(ctx context.Context, instance, limactl string) (
 	return version, nil
 }
 
+func InspectGuestHelperServiceUnit(ctx context.Context, instance, limactl string) (string, error) {
+	if limactl == "" {
+		limactl = "limactl"
+	}
+	output, err := runCommand(ctx, limactl, "--tty=false", "shell", "--workdir=/", instance, "systemctl", "cat", GuestHelperServiceUnit)
+	if err != nil {
+		return "", errors.New("cannot inspect Lima guest helper service unit")
+	}
+	return string(output), nil
+}
+
 func InstallGuestHelper(ctx context.Context, config GuestHelperInstallConfig) error {
 	return (guestHelperInstaller{run: runCommand}).install(ctx, config)
 }

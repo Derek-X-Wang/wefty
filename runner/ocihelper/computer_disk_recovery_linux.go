@@ -14,14 +14,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
 const (
 	defaultComputerDiskQuarantineRetention = 24 * time.Hour
-	// Recovery is retried once per helper startup sweep. Twenty-four failed
-	// activations is the attempt bound; the independent 24-hour elapsed bound
-	// prevents sparse restart schedules from retaining an opaque state forever.
+	// Recovery is counted once per agent boot-barrier sweep. Twenty-four failed
+	// barrier observations is the attempt bound; the independent 24-hour elapsed
+	// floor prevents rapid barrier retries from abandoning live tenant bytes.
 	defaultComputerStorageRecoveryAttempts = 24
 )
 
@@ -83,11 +84,11 @@ func advanceRecoveryDeferral(now time.Time, state computerStorageRecoveryDeferra
 	}
 	state.Attempts++
 	state.Reason = reason
-	abandoned := state.Attempts >= defaultComputerStorageRecoveryAttempts || !now.Before(state.FirstDeferredAt.Add(defaultComputerDiskQuarantineRetention))
+	abandoned := state.Attempts >= defaultComputerStorageRecoveryAttempts && !now.Before(state.FirstDeferredAt.Add(defaultComputerDiskQuarantineRetention))
 	return state, abandoned
 }
 
-func (engine *ContainerdEngine) deferComputerStorageRecovery(root, operation string, cause error) (ComputerStorageReference, computerStorageRecoveryDeferral, bool, error) {
+func (engine *ContainerdEngine) deferComputerStorageRecovery(root, operation string, cause error, countAttempt bool) (ComputerStorageReference, computerStorageRecoveryDeferral, bool, error) {
 	now := time.Now()
 	if engine.config.Clock != nil {
 		now = engine.config.Clock.Now()
@@ -99,12 +100,18 @@ func (engine *ContainerdEngine) deferComputerStorageRecovery(root, operation str
 		if err != nil || !present {
 			return ComputerStorageReference{}, computerStorageRecoveryDeferral{}, false, errors.Join(err, errors.New("deferred grow authority is unavailable"))
 		}
+		if !countAttempt {
+			return intent.Request.Storage, intent.Recovery, false, nil
+		}
 		intent.Recovery, present = advanceRecoveryDeferral(now, intent.Recovery, reason)
 		return intent.Request.Storage, intent.Recovery, present, writeComputerStorageGrowIntentRecord(root, intent)
 	case "computer_storage_copy":
 		manifest, present, err := readComputerStorageCopyManifest(filepath.Join(root, "storage-copy.json"))
 		if err != nil || !present {
 			return ComputerStorageReference{}, computerStorageRecoveryDeferral{}, false, errors.Join(err, errors.New("deferred copy authority is unavailable"))
+		}
+		if !countAttempt {
+			return manifest.Request.Destination, manifest.Recovery, false, nil
 		}
 		manifest.Recovery, present = advanceRecoveryDeferral(now, manifest.Recovery, reason)
 		return manifest.Request.Destination, manifest.Recovery, present, writeComputerStorageCopyManifest(root, manifest)
@@ -167,9 +174,58 @@ func recoveryInventoryEntry(name, operation string, storage ComputerStorageRefer
 		Reason: recovery.Reason, Attempts: recovery.Attempts, FirstDeferredAt: recovery.FirstDeferredAt}
 }
 
+func (engine *ContainerdEngine) resetOperationalComputerRecoveryDeferrals() {
+	engine.computerRecoveryMu.Lock()
+	engine.computerOperationalDeferred = make(map[string]ComputerStorageRecoveryInventoryEntry)
+	engine.computerRecoveryMu.Unlock()
+}
+
+func (engine *ContainerdEngine) rememberOperationalComputerRecoveryDeferral(name, operation string, storage ComputerStorageReference, cause error) {
+	engine.computerRecoveryMu.Lock()
+	defer engine.computerRecoveryMu.Unlock()
+	if engine.computerOperationalDeferred == nil {
+		engine.computerOperationalDeferred = make(map[string]ComputerStorageRecoveryInventoryEntry)
+	}
+	engine.computerOperationalDeferred[name] = ComputerStorageRecoveryInventoryEntry{
+		Storage: storage, DiskName: name, Operation: operation, Reason: recoveryDeferralReason(cause),
+	}
+}
+
+func (engine *ContainerdEngine) operationalComputerRecoveryDeferral(name string) (ComputerStorageRecoveryInventoryEntry, bool) {
+	engine.computerRecoveryMu.Lock()
+	defer engine.computerRecoveryMu.Unlock()
+	entry, present := engine.computerOperationalDeferred[name]
+	return entry, present
+}
+
+type computerRecoveryFileFailure uint8
+
+const (
+	computerRecoveryFileInvalid computerRecoveryFileFailure = iota
+	computerRecoveryFileMissing
+	computerRecoveryFileOperational
+)
+
+// classifyComputerRecoveryFileFailure keeps successful reads with invalid
+// content structural, while read/stat failures remain retryable. ENOENT and
+// ENOTDIR are positive structural absence rather than transient I/O.
+func classifyComputerRecoveryFileFailure(err error) computerRecoveryFileFailure {
+	if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR) {
+		return computerRecoveryFileMissing
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return computerRecoveryFileOperational
+	}
+	return computerRecoveryFileInvalid
+}
+
 func (engine *ContainerdEngine) resumeComputerStorageGrow(ctx context.Context, root, name string, manifest *computerDiskManifest) (bool, error) {
 	intent, present, err := readComputerStorageGrowIntent(root)
 	if err != nil {
+		if classifyComputerRecoveryFileFailure(err) == computerRecoveryFileOperational {
+			return false, err
+		}
 		return false, &computerDiskRecoveryRecordError{Operation: "computer_storage_grow", Cause: err}
 	}
 	if !present {
@@ -193,6 +249,9 @@ func (engine *ContainerdEngine) resumeComputerStorageGrow(ctx context.Context, r
 	}
 	if manifest.Storage.DiskBytes == request.NewDiskBytes {
 		if err := verifyComputerDiskAllocation(imagePath, request.NewDiskBytes); err != nil {
+			if classifyComputerRecoveryFileFailure(err) == computerRecoveryFileOperational {
+				return false, err
+			}
 			return false, &computerDiskRecoveryStructuralError{Reason: "allocation_mismatch", Cause: err}
 		}
 		return true, removeComputerStorageGrowIntent(root)
@@ -238,6 +297,9 @@ func (engine *ContainerdEngine) resumeComputerStorageGrow(ctx context.Context, r
 func (engine *ContainerdEngine) resumeComputerStorageCopy(ctx context.Context, root, name string) (string, error) {
 	copyManifest, present, err := readComputerStorageCopyManifest(filepath.Join(root, "storage-copy.json"))
 	if err != nil {
+		if classifyComputerRecoveryFileFailure(err) == computerRecoveryFileOperational {
+			return "", err
+		}
 		return "", &computerDiskRecoveryRecordError{Operation: "computer_storage_copy", Cause: err}
 	}
 	if !present {
@@ -257,13 +319,13 @@ func (engine *ContainerdEngine) resumeComputerStorageCopy(ctx context.Context, r
 	if copyManifest.Phase == computerStorageCopyPublished && copyManifest.Receipt != nil {
 		return "", nil
 	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
 	switch copyManifest.Phase {
 	case computerStorageCopyReserved, computerStorageCopyAllocated, computerStorageCopyCopied,
 		computerStorageCopySourceVerified, computerStorageCopyMountedRekey, computerStorageCopyIdentityRekeyed,
 		computerStorageCopyExpanded:
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		// No destination manifest has been published in these phases. Removing
 		// the staged/premature image and operation record is an exact rollback;
 		// the immutable source remains available for a fresh copy directive.
@@ -304,6 +366,9 @@ func (engine *ContainerdEngine) resumeComputerStorageCopy(ctx context.Context, r
 		return "", err
 	}
 	if err := verifyComputerDiskAllocation(publishedPath, request.Destination.DiskBytes); err != nil {
+		if classifyComputerRecoveryFileFailure(err) == computerRecoveryFileOperational {
+			return "", err
+		}
 		return "", &computerDiskRecoveryStructuralError{Reason: "allocation_mismatch", Cause: err}
 	}
 	digestFileRecovery := engine.computerRecoveryDigest
@@ -415,7 +480,7 @@ func (engine *ContainerdEngine) quarantineComputerDiskAnomalyWithDeferral(root, 
 	return engine.quarantineComputerDisk(root, name, receipt)
 }
 
-func (engine *ContainerdEngine) resolveComputerStorageRecoveryFailure(root, name, operation string, fallbackStorage ComputerStorageReference, recoveryErr error) (SweepEvidence, error) {
+func (engine *ContainerdEngine) resolveComputerStorageRecoveryFailure(root, name, operation string, fallbackStorage ComputerStorageReference, recoveryErr error, countAttempt bool) (SweepEvidence, error) {
 	reason := map[string]string{"computer_storage_copy": "copy_recovery_authority_invalid", "computer_storage_grow": "grow_recovery_authority_invalid"}[operation]
 	if reason == "" {
 		reason = "recovery_authority_invalid"
@@ -433,7 +498,14 @@ func (engine *ContainerdEngine) resolveComputerStorageRecoveryFailure(root, name
 		var deferral computerStorageRecoveryDeferral
 		var abandoned bool
 		var err error
-		storage, deferral, abandoned, err = engine.deferComputerStorageRecovery(root, operation, recoveryErr)
+		// A read/stat failure can be retried but cannot safely rewrite the record
+		// that could not be read. Retain it and emit typed deferral evidence.
+		if classifyComputerRecoveryFileFailure(recoveryErr) == computerRecoveryFileOperational {
+			engine.rememberOperationalComputerRecoveryDeferral(name, operation, storage, recoveryErr)
+			return SweepEvidence{Class: RemovalResourceComputerDiskManifest, ID: name, Action: SweepActionResumeDeferred,
+				Method: operation}, nil
+		}
+		storage, deferral, abandoned, err = engine.deferComputerStorageRecovery(root, operation, recoveryErr, countAttempt)
 		if err != nil {
 			return SweepEvidence{}, errors.Join(recoveryErr, err)
 		}
@@ -454,7 +526,17 @@ func (engine *ContainerdEngine) resolveComputerStorageRecoveryFailure(root, name
 		}
 	}
 	if storage.ComputerID == "" {
-		return SweepEvidence{}, errors.Join(recoveryErr, errors.New("Computer Storage recovery corruption lacks generation identity"))
+		if err := engine.quarantineComputerDiskAuthorityFailure(root, name, reason); err != nil {
+			return SweepEvidence{}, errors.Join(recoveryErr, err)
+		}
+		return SweepEvidence{Class: RemovalResourceComputerQuarantine, ID: name, Action: SweepActionQuarantined, Method: reason}, nil
+	}
+	expected, identityErr := deterministicComputerDiskName(storage)
+	if identityErr != nil || expected != name {
+		if err := engine.quarantineComputerDiskAuthorityFailure(root, name, "identity_mismatch"); err != nil {
+			return SweepEvidence{}, errors.Join(recoveryErr, identityErr, err)
+		}
+		return SweepEvidence{Class: RemovalResourceComputerQuarantine, ID: name, Action: SweepActionQuarantined, Method: "identity_mismatch"}, nil
 	}
 	if err := engine.quarantineComputerDiskAnomaly(root, name, storage, reason); err != nil {
 		return SweepEvidence{}, errors.Join(recoveryErr, err)
@@ -520,7 +602,8 @@ func validComputerDiskDirectoryName(name string) bool {
 }
 
 func validComputerDiskAuthorityFailureReason(reason string) bool {
-	return reason == "manifest_invalid" || reason == "quarantine_authority_invalid"
+	return reason == "manifest_invalid" || reason == "quarantine_authority_invalid" ||
+		reason == "copy_recovery_authority_invalid" || reason == "grow_recovery_authority_invalid" || reason == "identity_mismatch"
 }
 
 func validateComputerDiskQuarantineReceipt(receipt computerDiskQuarantineReceipt) error {
@@ -604,7 +687,14 @@ func (engine *ContainerdEngine) expireComputerDiskQuarantinePayloads(ctx context
 			continue
 		}
 		receipt, readErr := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(root, "quarantine.json"))
-		if readErr != nil || entry.Name() != receipt.DiskName+"-anomaly-"+receipt.ReceiptID || now.Before(receipt.RetainUntil) || receipt.PayloadDroppedAt != nil {
+		if readErr != nil || entry.Name() != receipt.DiskName+"-anomaly-"+receipt.ReceiptID {
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+				Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionRetained, Method: "quarantine_authority_invalid",
+			})
+			closeComputerDiskLock(lock)
+			continue
+		}
+		if now.Before(receipt.RetainUntil) || receipt.PayloadDroppedAt != nil {
 			closeComputerDiskLock(lock)
 			continue
 		}

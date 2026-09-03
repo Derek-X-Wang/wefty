@@ -849,6 +849,14 @@ func TestComputerDiskInventoryRejectsUntypedQuarantineEntries(t *testing.T) {
 				!strings.Contains(inventory.ComputerDiskAnomalies[0], "quarantine_authority_invalid") {
 				t.Fatalf("invalid quarantine inventory = %+v", inventory)
 			}
+			if err := engine.sweepComputerDisks(t.Context(), "invalid-quarantine"); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+				return item.ID == filepath.Base(entry) && item.Action == SweepActionRetained && item.Method == "quarantine_authority_invalid"
+			}) {
+				t.Fatalf("invalid quarantine evidence = %+v", engine.computerDiskSweepEvidence)
+			}
 		})
 	}
 }
@@ -1021,6 +1029,11 @@ func TestComputerDiskQuarantineExpiryDropsPayloadButKeepsGenerationTombstone(t *
 	}
 	if quarantined, err := computerDiskQuarantined(root, storage); err != nil || !quarantined {
 		t.Fatalf("expired generation tombstone=%t err=%v", quarantined, err)
+	}
+	inventory := ResourceInventory{}
+	if err := engine.inventoryComputerDiskResources(&inventory); err != nil || len(inventory.ComputerStorageQuarantined) != 1 ||
+		inventory.ComputerStorageQuarantined[0].PayloadDroppedAt != updated.PayloadDroppedAt.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("payload drop inventory=%+v err=%v", inventory.ComputerStorageQuarantined, err)
 	}
 }
 

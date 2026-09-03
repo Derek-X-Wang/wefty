@@ -1350,6 +1350,10 @@ type SweepRequest struct {
 	// SweepEpoch is helper-derived before engine entry and never decoded from
 	// the wire. Computer attachment receipts bind to this exact sweep.
 	SweepEpoch string `json:"-"`
+	// countComputerStorageRecoveryAttempt is helper-derived. Only the
+	// agent-requested boot-barrier sweep consumes the durable recovery-attempt
+	// budget; helper startup and in-session ReapSession sweeps do not advance it.
+	countComputerStorageRecoveryAttempt bool
 }
 
 type SweepResponse struct {
@@ -1393,16 +1397,19 @@ type ResourceInventory struct {
 }
 
 // ComputerStorageRecoveryInventoryEntry gives deferred and quarantined disk
-// generations a typed, identity-bound operator surface. DiskName remains only
-// corroborating physical custody; Storage is the generation authority.
+// generations a typed operator surface. DiskName remains corroborating
+// physical custody and Storage is the generation authority when readable; an
+// operational record-read deferral leaves Storage zero rather than inventing
+// identity from the directory name.
 type ComputerStorageRecoveryInventoryEntry struct {
-	Storage         ComputerStorageReference `json:"storage"`
-	DiskName        string                   `json:"disk_name"`
-	Operation       string                   `json:"operation"`
-	Reason          string                   `json:"reason"`
-	DeferredReason  string                   `json:"deferred_reason,omitempty"`
-	Attempts        int                      `json:"attempts"`
-	FirstDeferredAt time.Time                `json:"first_deferred_at,omitempty"`
+	Storage          ComputerStorageReference `json:"storage"`
+	DiskName         string                   `json:"disk_name"`
+	Operation        string                   `json:"operation"`
+	Reason           string                   `json:"reason"`
+	DeferredReason   string                   `json:"deferred_reason,omitempty"`
+	Attempts         int                      `json:"attempts"`
+	FirstDeferredAt  time.Time                `json:"first_deferred_at,omitempty"`
+	PayloadDroppedAt string                   `json:"payload_dropped_at,omitempty"`
 }
 
 type ComputerStorageResumeDeferredError struct{ Storage ComputerStorageReference }
@@ -1418,7 +1425,7 @@ func (err *ComputerStorageQuarantinedError) Error() string {
 }
 
 func recoveryInventoryEntryKey(entry ComputerStorageRecoveryInventoryEntry) string {
-	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%020d", entry.DiskName, entry.Operation, entry.Reason, entry.FirstDeferredAt.UTC().Format(time.RFC3339Nano), entry.Attempts)
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%020d\x00%s", entry.DiskName, entry.Operation, entry.Reason, entry.FirstDeferredAt.UTC().Format(time.RFC3339Nano), entry.Attempts, entry.PayloadDroppedAt)
 }
 
 // SweptAttemptAuthority is the immutable removal-validation subset recovered

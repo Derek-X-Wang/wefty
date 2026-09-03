@@ -17,42 +17,55 @@ import (
 )
 
 func TestStartupAbandonsBoundedGrowDeferralIntoTypedQuarantine(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		recovery computerStorageRecoveryDeferral
-	}{
-		{name: "attempt bound", recovery: computerStorageRecoveryDeferral{Attempts: defaultComputerStorageRecoveryAttempts - 1, FirstDeferredAt: time.Now().UTC(), Reason: "operational_failure"}},
-		{name: "elapsed bound", recovery: computerStorageRecoveryDeferral{Attempts: 1, FirstDeferredAt: time.Now().Add(-defaultComputerDiskQuarantineRetention).UTC(), Reason: "operational_failure"}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			root := t.TempDir()
-			request := growTestRequest(16 << 20)
-			imagePath := prepareGrowTestImage(t, root, request)
-			if err := fullyAllocateComputerDisk(imagePath, request.NewDiskBytes); err != nil {
-				t.Fatal(err)
-			}
-			if err := writeComputerStorageGrowIntentRecord(filepath.Dir(imagePath), computerStorageGrowIntent{Version: 1, Request: request, Recovery: test.recovery}); err != nil {
-				t.Fatal(err)
-			}
-			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem(),
-				computerGrowPreen: func(context.Context, string) error { return errors.New("transient") }}
-			if err := engine.sweepComputerDisks(t.Context(), "abandon"); err != nil {
-				t.Fatal(err)
-			}
-			name, _ := deterministicComputerDiskName(request.Storage)
-			if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
-				return item.ID == name && item.Action == SweepActionQuarantined && strings.HasPrefix(item.Method, "resume_abandoned:")
-			}) {
-				t.Fatalf("abandon evidence = %+v", engine.computerDiskSweepEvidence)
-			}
-			inventory := ResourceInventory{}
-			if err := engine.inventoryComputerDiskResources(&inventory); err != nil || !slices.ContainsFunc(inventory.ComputerStorageQuarantined, func(entry ComputerStorageRecoveryInventoryEntry) bool {
-				return entry.Storage == request.Storage && entry.Reason == "resume_abandoned" && entry.DeferredReason == "operational_failure" &&
-					entry.Attempts == test.recovery.Attempts+1 && entry.FirstDeferredAt.Equal(test.recovery.FirstDeferredAt)
-			}) {
-				t.Fatalf("abandoned inventory = %+v err=%v", inventory, err)
-			}
-		})
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	if err := fullyAllocateComputerDisk(imagePath, request.NewDiskBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeComputerStorageGrowIntent(filepath.Dir(imagePath), request); err != nil {
+		t.Fatal(err)
+	}
+	clock := newManualClock(time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC))
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root, Clock: clock}, diskSystem: newFakeComputerDiskSystem(),
+		computerGrowPreen: func(context.Context, string) error { return errors.New("transient") }}
+	for sweep := 0; sweep < 10; sweep++ {
+		if err := engine.sweepComputerDisksWithRecoveryAttempt(t.Context(), "session-reap", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	intent, present, err := readComputerStorageGrowIntent(filepath.Dir(imagePath))
+	if err != nil || !present || intent.Recovery.Attempts != 0 {
+		t.Fatalf("in-session reap consumed recovery attempts: intent=%+v present=%t err=%v", intent, present, err)
+	}
+	for sweep := 0; sweep < 100; sweep++ {
+		if err := engine.sweepComputerDisks(t.Context(), "rapid-start"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	intent, present, err = readComputerStorageGrowIntent(filepath.Dir(imagePath))
+	if err != nil || !present || intent.Recovery.Attempts != 100 || !intent.Recovery.FirstDeferredAt.Equal(clock.Now()) {
+		t.Fatalf("rapid recovery deferral = %+v present=%t err=%v", intent, present, err)
+	}
+	if _, err := os.Stat(filepath.Dir(imagePath)); err != nil {
+		t.Fatalf("100 rapid sweeps abandoned recovery before wall-clock floor: %v", err)
+	}
+	clock.Advance(defaultComputerDiskQuarantineRetention)
+	if err := engine.sweepComputerDisks(t.Context(), "elapsed-start"); err != nil {
+		t.Fatal(err)
+	}
+	name, _ := deterministicComputerDiskName(request.Storage)
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionQuarantined && strings.HasPrefix(item.Method, "resume_abandoned:")
+	}) {
+		t.Fatalf("abandon evidence = %+v", engine.computerDiskSweepEvidence)
+	}
+	inventory := ResourceInventory{}
+	if err := engine.inventoryComputerDiskResources(&inventory); err != nil || !slices.ContainsFunc(inventory.ComputerStorageQuarantined, func(entry ComputerStorageRecoveryInventoryEntry) bool {
+		return entry.Storage == request.Storage && entry.Reason == "resume_abandoned" && entry.DeferredReason == "operational_failure" &&
+			entry.Attempts == 101 && entry.FirstDeferredAt.Equal(time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC))
+	}) {
+		t.Fatalf("abandoned inventory = %+v err=%v", inventory, err)
 	}
 }
 

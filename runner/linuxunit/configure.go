@@ -60,6 +60,17 @@ func InspectSystemdVersion(ctx context.Context, runner CommandRunner) (int, erro
 	return version, nil
 }
 
+func InspectHelperServiceUnit(ctx context.Context, runner CommandRunner) (string, error) {
+	if runner == nil {
+		return "", errors.New("inspect helper service unit requires a command runner")
+	}
+	output, err := runner.Run(ctx, "systemctl", "cat", HelperServiceUnit)
+	if err != nil {
+		return "", fmt.Errorf("inspect helper service unit: %w", err)
+	}
+	return string(output), nil
+}
+
 func Configure(ctx context.Context, config Config, paths ConfigurePaths, runner CommandRunner) (ConfigureReceipt, error) {
 	if runner == nil || !filepath.IsAbs(paths.UnitDirectory) || !filepath.IsAbs(paths.NodeConfig) || !filepath.IsAbs(paths.ControlSocket) {
 		return ConfigureReceipt{}, fmt.Errorf("Linux OCI setup requires absolute install paths and a command runner")

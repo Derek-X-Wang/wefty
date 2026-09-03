@@ -813,12 +813,15 @@ destination generation was published. Grow and copy recovery emit typed
 `resumed` or `rolled_back` sweep evidence. Operational recovery failures with
 valid durable authority increment `attempts`, preserve `first_deferred_at` and
 a closed reason, emit `resume_deferred`, and keep that Computer generation
-unattachable. Recovery becomes terminal after 24 failed helper-start sweeps or
-24 hours, whichever arrives first: `resume_abandoned` quarantines the
+unattachable. Only boot-barrier startup sweeps increment the durable attempt
+count; in-session `ReapSession` sweeps retain state without consuming it.
+Recovery becomes terminal only after both 24 failed helper-start sweeps and 24
+elapsed hours: `resume_abandoned` quarantines the
 generation while preserving its last deferral reason and original
-`first_deferred_at` timestamp in the receipt and typed inventory. The 24-attempt cap is
-the 24-hour retention window divided by the operator repair cadence of one
-helper-start retry per hour; faster restart storms cannot enlarge it. Grow recovery preens
+`first_deferred_at` timestamp in the receipt and typed inventory. The 24-attempt
+cap is a minimum repeated-observation bound, not an assumed hourly cadence; the
+independent wall-clock floor prevents rapid helper flaps or barrier retries from
+consuming that budget in minutes. Grow recovery preens
 ext4 with `e2fsck -f -p` before resizing, and exit 1 is recorded as corrected
 filesystem sweep evidence. A
 size/allocation mismatch without matching durable operation
@@ -837,6 +840,15 @@ authorized recovery path is a reset that prepares and admits generation N+1,
 followed by normal removal authority for N. The affected Computer therefore stays
 fail-closed while the helper continues serving the rest of the Node. Startup's
 namespace-absence promise remains exact for every non-quarantined generation.
+
+Required-file recovery classification is exact:
+
+| Observation | Classification | Startup action |
+| --- | --- | --- |
+| `ENOENT` or `ENOTDIR` for a required file | structural absence | quarantine with a typed missing/authority reason |
+| non-absence read or stat error, including `EIO` or `EACCES` | operational | retain and emit `resume_deferred` |
+| bytes read completely but invalid JSON, version, or fields | structural invalidity | quarantine with typed authority-invalid evidence |
+| verified size, allocation, or digest mismatch | structural mismatch | quarantine the generation |
 
 `PreflightComputerReimage` runs only after the old Job is stopped and the disk
 manifest contains exact same-boot reap or prior-boot sweep evidence. Image

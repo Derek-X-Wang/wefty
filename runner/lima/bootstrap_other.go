@@ -25,6 +25,10 @@ func InspectGuestSystemdVersion(context.Context, string, string) (int, error) {
 	return 0, errMacBootstrapUnsupported
 }
 
+func InspectGuestHelperServiceUnit(context.Context, string, string) (string, error) {
+	return "", errMacBootstrapUnsupported
+}
+
 func RemoveGuestHelper(context.Context, GuestHelperRemovalConfig) (GuestHelperRemovalEvidence, error) {
 	return GuestHelperRemovalEvidence{}, errMacBootstrapUnsupported
 }

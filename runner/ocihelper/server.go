@@ -1600,6 +1600,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		session.mu.Unlock()
 		sweepEpoch, err := randomCapability()
 		body.SweepEpoch = sweepEpoch
+		body.countComputerStorageRecoveryAttempt = true
 		var response SweepResponse
 		if err == nil {
 			response, err = server.engine.Sweep(operation.ctx, body)

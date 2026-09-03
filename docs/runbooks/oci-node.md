@@ -105,7 +105,7 @@ ceiling and stronger live-attempt, service-binding, and probe holds.
 wefty --json node doctor
 ```
 
-Each finding has `OK`, `FAILED`, or `NOT-RUN`, a stable `oci_*` code, severity, sanitized detail, and this runbook anchor. Capability restriction includes `helper_handshake_stalled_persistent` for a connected socket that completed no handshake through the five-minute Lima `RecoveryTimeout`. `helper_unit_unavailable` means the final dial of the takeover window positively observed an absent, refused, or reset socket and no handshake completed; `helper_handshake_stalled` means the final dial connected but completed no handshake. A transient stall is retried; a persistent Lima stall force-stops the instance once, while native doctor evidence carries the consecutive window count. `helper_unreachable` remains the generic transport failure. Unknown local failures collapse to `probe_failed`; do not invent a reason from raw text. Native and Lima setup persist the observed systemd version and rendered helper restart policy: version 254 or newer receives capped geometric restart directives, Debian 12/systemd 252 receives fixed `RestartSec=1s`, and unknown version zero renders the conservative fixed policy.
+Each finding has `OK`, `FAILED`, or `NOT-RUN`, a stable `oci_*` code, severity, sanitized detail, and this runbook anchor. Capability restriction includes `helper_handshake_stalled_persistent` for a connected socket that completed no handshake through the five-minute Lima `RecoveryTimeout`. `helper_unit_unavailable` means the final dial of the takeover window positively observed an absent, refused, or reset socket and no handshake completed; `helper_handshake_stalled` means the final dial connected but completed no handshake. A transient stall is retried; a persistent Lima stall force-stops the instance once, while native doctor evidence carries the consecutive window count. Stall counters are process-local and reset when the agent restarts. An unknown final dial is reported as `boot_sweep_failed`, never inferred to be positive absence. `helper_unreachable` remains the generic transport failure. Unknown local failures collapse to `probe_failed`; do not invent a reason from raw text. Native and Lima setup persist the observed systemd version and rendered helper restart policy: version 254 or newer receives capped geometric restart directives, Debian 12/systemd 252 receives fixed `RestartSec=1s`, and unknown version zero renders the conservative fixed policy.
 
 Doctor also reports the documented #220 limitation: process-kind payloads currently share the agent user, so local peer credentials do not distinguish those payloads from the operator. Do not treat the operator-only control socket as process-payload UID isolation until #220 lands.
 
@@ -229,7 +229,7 @@ Meaning: no verified boot-sweep receipt was available to classify Computer Stora
 
 ## doctor-code-oci-computer-storage-recovery-retained
 
-Meaning: typed deferred or quarantined generations remain. Evidence: preserve Storage identity, reason, attempt count, and first-deferred timestamp.
+Meaning: typed deferred or quarantined generations remain. Evidence: preserve Storage identity, reason, attempt count, first-deferred timestamp, and `payload_dropped_at`; its presence distinguishes a receipt-only tombstone from retained tenant bytes. A `quarantine_authority_invalid` entry inside the quarantine root is deliberately retained and emits evidence on every sweep; authorized removal is the only supported action that clears it.
 
 ## doctor-code-oci-helper-restart-policy-not-read
 
@@ -237,11 +237,11 @@ Meaning: durable systemd and helper-policy facts were unavailable. First action:
 
 ## doctor-code-oci-helper-restart-policy-current
 
-Meaning: the live installed systemd version matches the durable rendered helper restart policy. First action: none.
+Meaning: the live installed systemd version and installed unit keys match the durable rendered helper restart policy. First action: none.
 
 ## doctor-code-oci-helper-restart-policy-drift
 
-Meaning: the live installed systemd version differs from the durable rendered helper policy. First action: rerun setup and apply restart convergence.
+Meaning: the live installed systemd version, policy name, or installed unit keys differ from the durable rendered helper policy. First action: rerun setup and apply restart convergence.
 
 ## doctor-code-oci-boot-sweep-not-recorded
 

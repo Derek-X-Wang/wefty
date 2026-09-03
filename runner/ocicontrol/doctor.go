@@ -2,8 +2,10 @@ package ocicontrol
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -240,6 +242,7 @@ type DoctorConfig struct {
 	DesiredSetupStatePath         string
 	ReadDesiredSetupState         func(string) (SetupState, error)
 	InstalledSystemdVersion       func(context.Context) (int, error)
+	InstalledHelperServiceUnit    func(context.Context) (string, error)
 }
 
 type diagnosticReceipt struct {
@@ -728,13 +731,71 @@ func buildConvergence(ctx context.Context, config DoctorConfig, report *DoctorRe
 		appendHelperRestartPolicyNotRun(report, NotRunSourceUnavailable, "the installed systemd version could not be read")
 		return
 	}
-	policyMatched := current.SystemdVersion == installedSystemdVersion && current.HelperRestartPolicy == setupStateRestartPolicy(installedSystemdVersion)
+	if config.InstalledHelperServiceUnit == nil {
+		appendHelperRestartPolicyNotRun(report, NotRunSourceUnavailable, "the installed helper service unit source was unavailable")
+		return
+	}
+	installedUnit, unitErr := config.InstalledHelperServiceUnit(ctx)
+	if unitErr != nil {
+		appendHelperRestartPolicyNotRun(report, NotRunSourceUnavailable, "the installed helper service unit could not be read")
+		return
+	}
+	unitPolicy, unitPolicyErr := helperRestartPolicyFromUnit(installedUnit)
+	expectedUnitPolicy := expectedHelperRestartUnitPolicy(installedSystemdVersion)
+	policyMatched := current.SystemdVersion == installedSystemdVersion &&
+		current.HelperRestartPolicy == setupStateRestartPolicy(installedSystemdVersion) && unitPolicyErr == nil && maps.Equal(unitPolicy, expectedUnitPolicy)
 	policyCode := "oci_helper_restart_policy_current"
 	if !policyMatched {
 		policyCode = "oci_helper_restart_policy_drift"
 	}
 	report.Findings = append(report.Findings, finding("helper-restart-policy", diagnosticReceipt{ran: true, passed: policyMatched, code: policyCode,
-		reasonCode: reasonUnless(policyMatched, contract.CapabilityReasonPrerequisiteMissing), detail: fmt.Sprintf("installed systemd_version=%d durable systemd_version=%d helper restart policy=%s", installedSystemdVersion, current.SystemdVersion, current.HelperRestartPolicy)}))
+		reasonCode: reasonUnless(policyMatched, contract.CapabilityReasonPrerequisiteMissing), detail: fmt.Sprintf("installed systemd_version=%d durable systemd_version=%d helper restart policy=%s installed unit policy matched=%t", installedSystemdVersion, current.SystemdVersion, current.HelperRestartPolicy, unitPolicyErr == nil && maps.Equal(unitPolicy, expectedUnitPolicy))}))
+}
+
+func expectedHelperRestartUnitPolicy(systemdVersion int) map[string]string {
+	policy := map[string]string{
+		"Unit.StartLimitIntervalSec": "0",
+		"Service.Restart":            "on-failure",
+		"Service.RestartSec":         "1s",
+	}
+	if systemdVersion >= 254 {
+		policy["Service.RestartSec"] = "250ms"
+		policy["Service.RestartSteps"] = "6"
+		policy["Service.RestartMaxDelaySec"] = "1s"
+	}
+	return policy
+}
+
+func helperRestartPolicyFromUnit(unit string) (map[string]string, error) {
+	wanted := map[string]struct{}{
+		"Unit.StartLimitIntervalSec": {},
+		"Service.Restart":            {}, "Service.RestartSec": {}, "Service.RestartSteps": {}, "Service.RestartMaxDelaySec": {},
+	}
+	result := make(map[string]string)
+	section := ""
+	for _, raw := range strings.Split(unit, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		qualified := section + "." + strings.TrimSpace(key)
+		if _, tracked := wanted[qualified]; !tracked {
+			continue
+		}
+		if _, duplicate := result[qualified]; duplicate {
+			return nil, errors.New("installed helper service unit repeats a restart-policy key")
+		}
+		result[qualified] = strings.TrimSpace(value)
+	}
+	return result, nil
 }
 
 func appendHelperRestartPolicyNotRun(report *DoctorResponse, cause NotRunCause, detail string) {

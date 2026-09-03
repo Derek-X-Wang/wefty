@@ -18,7 +18,7 @@ type serveRecoveryEngine struct {
 }
 
 func (engine *serveRecoveryEngine) Sweep(ctx context.Context, request SweepRequest) (SweepResponse, error) {
-	if err := engine.disk.sweepComputerDisks(ctx, request.SweepEpoch); err != nil {
+	if err := engine.disk.sweepComputerDisksWithRecoveryAttempt(ctx, request.SweepEpoch, request.countComputerStorageRecoveryAttempt); err != nil {
 		return SweepResponse{}, err
 	}
 	inventory := ResourceInventory{}
@@ -101,6 +101,55 @@ func TestServeQuarantinesInvalidPendingQuarantineAuthorityAndAdmitsBarrier(t *te
 		t.Fatal(err)
 	}
 	assertServeQuarantinesAndAdmits(t, root, storage, name, "quarantine_authority_invalid")
+}
+
+func TestServeQuarantinesMalformedIdentitylessCopyRecordAndAdmitsBarrier(t *testing.T) {
+	root := t.TempDir()
+	storage := testComputerStorage()
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(diskRoot, "storage-copy.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertServeQuarantinesAndAdmits(t, root, storage, name, "copy_recovery_authority_invalid")
+}
+
+func TestServeQuarantinesIncompleteIdentitylessCopyRecordAndAdmitsBarrier(t *testing.T) {
+	root := t.TempDir()
+	storage := testComputerStorage()
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(diskRoot, "storage-copy.json"), []byte(`{"version":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertServeQuarantinesAndAdmits(t, root, storage, name, "copy_recovery_authority_invalid")
+}
+
+func TestServeQuarantinesIdentityMismatchedManifestAndAdmitsBarrier(t *testing.T) {
+	root := t.TempDir()
+	storage := testComputerStorage()
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(diskRoot, "disk.ext4"), make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mismatched := storage
+	mismatched.ComputerID = "different-computer"
+	mismatched.DiskBytes = 8192
+	if err := writeComputerDiskManifest(diskRoot, computerDiskManifest{Version: computerDiskManifestVersion,
+		Storage: mismatched, DiskImage: "disk.ext4", MountDirectory: name, Prepared: true}); err != nil {
+		t.Fatal(err)
+	}
+	assertServeQuarantinesAndAdmits(t, root, storage, name, "identity_mismatch")
 }
 
 func assertServeQuarantinesAndAdmits(t *testing.T, root string, storage ComputerStorageReference, name, wantReason string) {

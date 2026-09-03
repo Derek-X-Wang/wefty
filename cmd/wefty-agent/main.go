@@ -597,13 +597,22 @@ func run() error {
 					}
 					return 0, errors.New("installed systemd inspection is unsupported on this platform")
 				}
+				installedHelperServiceUnit := func(ctx context.Context) (string, error) {
+					if runtime.GOOS == "darwin" {
+						return limarunner.InspectGuestHelperServiceUnit(ctx, *ociLimaInstance, "")
+					}
+					if runtime.GOOS == "linux" {
+						return linuxunit.InspectHelperServiceUnit(ctx, linuxunit.ExecRunner{})
+					}
+					return "", errors.New("installed helper unit inspection is unsupported on this platform")
+				}
 				report := ocicontrol.BuildDoctor(doctorContext, ocicontrol.DoctorConfig{
 					HostPlatform: ocicontrol.PlatformFacts{OS: runtime.GOOS, Architecture: runtime.GOARCH},
 					AgentUser:    agentUser, LaunchUnit: os.Getenv("WEFTY_LAUNCH_UNIT"),
 					CapabilitySnapshot: nodeAgent.CapabilitySnapshot,
 					Intent:             (limarunner.FileIntentSource{Path: *ociIntentFile}).ReadIntent,
 					LimaFacts:          limaFacts, Helper: doctorHelperSource(ociAdapter), HelperHandshakeStalledWindows: stalledWindows, SetupStatePath: *ociSetupState,
-					InstalledSystemdVersion: installedSystemdVersion,
+					InstalledSystemdVersion: installedSystemdVersion, InstalledHelperServiceUnit: installedHelperServiceUnit,
 				})
 				return report, report.Validate()
 			},

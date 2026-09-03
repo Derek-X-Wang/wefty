@@ -139,6 +139,8 @@ type ContainerdEngine struct {
 	computerQuarantineRemoveAll func(string) error
 	computerDiskSweepMu         sync.Mutex
 	computerDiskSweepEvidence   []SweepEvidence
+	computerRecoveryMu          sync.Mutex
+	computerOperationalDeferred map[string]ComputerStorageRecoveryInventoryEntry
 	computerReimageImageInspect func(context.Context, PreflightComputerReimageRequest) (computerReimageImageFacts, error)
 	computerReimageDiskOwner    func(context.Context, string) (uint32, uint32, error)
 	lastProfile                 *ProfileReceipt
@@ -2240,7 +2242,7 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 		}
 	}
 	engine.computerDiskSweepMu.Lock()
-	sweepComputerDiskErr := engine.sweepComputerDisks(ctx, request.SweepEpoch)
+	sweepComputerDiskErr := engine.sweepComputerDisksWithRecoveryAttempt(ctx, request.SweepEpoch, request.countComputerStorageRecoveryAttempt)
 	computerDiskEvidence := slices.Clone(engine.computerDiskSweepEvidence)
 	engine.computerDiskSweepMu.Unlock()
 	if sweepComputerDiskErr != nil {

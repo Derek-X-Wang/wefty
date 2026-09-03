@@ -74,7 +74,10 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 		ReadDesiredSetupState: func(string) (SetupState, error) {
 			return SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: "/srv/wefty", ProbeDigest: "sha256:probe", SystemdVersion: 255, HelperRestartPolicy: "geometric_capped_1s"}, nil
 		},
-		InstalledSystemdVersion:       func(context.Context) (int, error) { return 255, nil },
+		InstalledSystemdVersion: func(context.Context) (int, error) { return 255, nil },
+		InstalledHelperServiceUnit: func(context.Context) (string, error) {
+			return "[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=on-failure\nRestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n", nil
+		},
 		HelperHandshakeStalledWindows: func() uint64 { return 0 },
 	}
 }
@@ -123,6 +126,46 @@ func TestDoctorSurfacesDurableHelperRestartPolicyDrift(t *testing.T) {
 		return item.Check == "helper-restart-policy" && item.Code == "oci_helper_restart_policy_drift" && item.Outcome == DiagnosticFailed
 	}) {
 		t.Fatalf("policy drift findings=%+v", report.Findings)
+	}
+}
+
+func TestDoctorDetectsInstalledHelperUnitPolicyDrift(t *testing.T) {
+	config := healthyDoctorConfig(time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC), "")
+	config.InstalledHelperServiceUnit = func(context.Context) (string, error) {
+		return "[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=on-failure\nRestartSec=2s\nRestartSteps=6\nRestartMaxDelaySec=1s\n", nil
+	}
+	report := BuildDoctor(t.Context(), config)
+	if !slices.ContainsFunc(report.Findings, func(item DiagnosticFinding) bool {
+		return item.Check == "helper-restart-policy" && item.Code == "oci_helper_restart_policy_drift" && item.Outcome == DiagnosticFailed
+	}) {
+		t.Fatalf("installed unit drift findings=%+v", report.Findings)
+	}
+}
+
+func TestDoctorReportsNonzeroNativeHelperHandshakeStallCount(t *testing.T) {
+	config := healthyDoctorConfig(time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC), "")
+	config.HelperHandshakeStalledWindows = func() uint64 { return 3 }
+	report := BuildDoctor(t.Context(), config)
+	if report.Helper.HandshakeStalledWindows != 3 || !slices.ContainsFunc(report.Findings, func(item DiagnosticFinding) bool {
+		return item.Check == "helper-handshake-stalls" && item.Code == "oci_helper_handshake_stalls_observed" && item.Outcome == DiagnosticFailed
+	}) {
+		t.Fatalf("nonzero stall count was not typed: helper=%+v findings=%+v", report.Helper, report.Findings)
+	}
+}
+
+func TestDoctorReportsQuarantinePayloadDropTimestamp(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	config := healthyDoctorConfig(now, "")
+	mutateHelper(&config, func(snapshot *HelperDoctorSnapshot) {
+		droppedAt := now.Add(-time.Hour)
+		snapshot.SweepReceipt.VerifiedRetained.ComputerStorageQuarantined = []ocihelper.ComputerStorageRecoveryInventoryEntry{{
+			DiskName: "wefty-computer-disk-example", Operation: "quarantine", Reason: "allocation_mismatch", PayloadDroppedAt: droppedAt.Format(time.RFC3339Nano),
+		}}
+		snapshot.SweepReceipt.ComputerStorageQuarantinedCount = 1
+	})
+	report := BuildDoctor(t.Context(), config)
+	if len(report.ComputerStorageRecovery.Quarantined) != 1 || report.ComputerStorageRecovery.Quarantined[0].PayloadDroppedAt != now.Add(-time.Hour).Format(time.RFC3339Nano) {
+		t.Fatalf("payload drop doctor facts=%+v", report.ComputerStorageRecovery)
 	}
 }
 
