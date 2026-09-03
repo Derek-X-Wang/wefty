@@ -3903,7 +3903,14 @@ func (engine *ContainerdEngine) sweepLostAttemptCgroups(ctx context.Context, nam
 			for {
 				live, err := populated(candidate.path)
 				if errors.Is(err, os.ErrNotExist) {
-					evidence = append(evidence, SweepEvidence{Class: RemovalResourceCgroup, ID: name, AttemptID: candidate.record.Authority.AttemptID, Action: SweepActionKillReaped, Method: killResult.Method, PIDs: killResult.PIDs, Duration: clock.Now().Sub(started)})
+					if err := engine.clearAttemptRetention(candidate.record, RemovalResourceCgroup, name); err != nil {
+						return nil, nil, err
+					}
+					action := SweepActionKillReaped
+					if boundExpired {
+						action = SweepActionRetentionBoundReaped
+					}
+					evidence = append(evidence, SweepEvidence{Class: RemovalResourceCgroup, ID: name, AttemptID: candidate.record.Authority.AttemptID, Action: action, Method: killResult.Method, PIDs: killResult.PIDs, Duration: clock.Now().Sub(started)})
 					break
 				}
 				if err != nil {
@@ -3930,6 +3937,9 @@ func (engine *ContainerdEngine) sweepLostAttemptCgroups(ctx context.Context, nam
 					}
 				}
 				if live {
+					if engine.attemptOwnershipIsLive(candidate.record) {
+						break
+					}
 					if _, err := kill(candidate.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 						return nil, nil, fmt.Errorf("repeat KILL for helper-owned cgroup %s: %w", name, err)
 					}
