@@ -2142,7 +2142,11 @@ func (engine *ContainerdEngine) Verify(ctx context.Context, request VerifyReques
 		inventory = filterInventory(inventory, resources, computerDisk)
 	}
 	observed := inventory
-	projected, retentions, err := engine.runtimeAbsenceInventory(observed, time.Now())
+	now := time.Now()
+	if engine.config.Clock != nil {
+		now = engine.config.Clock.Now()
+	}
+	projected, retentions, err := engine.runtimeAbsenceInventory(observed, now)
 	if err != nil {
 		return VerifyResponse{}, err
 	}
