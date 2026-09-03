@@ -375,7 +375,7 @@ func TestTeardownSuccessfulRemovalMakesStopFailureNonFatal(t *testing.T) {
 	if !strings.Contains(joined, "teardown observation: reason=container_stop_failed") {
 		t.Fatalf("non-fatal teardown log = %q", joined)
 	}
-	wrapperFatalPattern := regexp.MustCompile(`(?m)^runtime teardown failed`)
+	wrapperFatalPattern := regexp.MustCompile(`runtime teardown failed`)
 	if wrapperFatalPattern.MatchString(joined) {
 		t.Fatalf("wrapper fatal pattern matched non-fatal teardown observation %q", joined)
 	}

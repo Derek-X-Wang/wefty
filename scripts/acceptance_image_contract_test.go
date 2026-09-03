@@ -431,7 +431,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Count(string(runtimeWrapper), "grep -Eq '^runtime teardown failed'"); got != 2 {
+	if got := strings.Count(string(runtimeWrapper), "grep -Fq 'runtime teardown failed'"); got != 2 {
 		t.Fatalf("runtime wrapper fatal teardown patterns = %d, want 2 exact anchored patterns", got)
 	}
 	for _, path := range []string{"../docs/contracts/computer-image.md", "../docs/guides/computer-images.md"} {

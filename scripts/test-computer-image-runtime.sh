@@ -47,7 +47,7 @@ positive_stderr="$evidence/${arch}-runtime.stderr"
 positive_status=$?
 set -e
 sed -n '1,400p' "$positive_stderr" >&2
-if grep -Eq '^runtime teardown failed' "$positive_stderr"; then
+if grep -Fq 'runtime teardown failed' "$positive_stderr"; then
   stage_error positive-runtime-teardown "checker reported container or temporary-root cleanup failure; see $positive_stderr"
   exit 1
 fi
@@ -111,7 +111,7 @@ run_mutation() {
   local checker_status=$?
   set -e
   sed -n '1,400p' "$checker_stderr" >&2
-  if grep -Eq '^runtime teardown failed' "$checker_stderr"; then
+  if grep -Fq 'runtime teardown failed' "$checker_stderr"; then
     stage_error "runtime-teardown/$mutation" "checker reported container or temporary-root cleanup failure; see $checker_stderr"
     exit 1
   fi
