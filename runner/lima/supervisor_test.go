@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -168,6 +169,34 @@ func TestRunningLimaWithUnreadyHelperIsBoundedAndForceStoppedOnce(t *testing.T) 
 	}
 	if facts := supervisor.Facts(); facts.State != InstanceStopped || facts.ReasonCode != contract.CapabilityReasonLimaStartTimeout {
 		t.Fatalf("stuck helper facts = %+v", facts)
+	}
+}
+
+func TestSupervisedBarrierPublishesHelperUnitUnavailableWithoutGenericRetry(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	waits := 0
+	supervisor.config.wait = func(context.Context, time.Duration) error {
+		waits++
+		return nil
+	}
+	client := &ocihelper.Client{
+		Version: ocihelper.ProtocolVersion, ExpectedChecksum: "sha256:" + strings.Repeat("a", 64),
+		Dial: func(context.Context) (net.Conn, error) { return nil, syscall.ECONNREFUSED },
+	}
+	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{
+		TakeoverTimeout: 25 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+	err = barrier.Ensure(t.Context())
+	var unavailable *ocihelper.HelperUnitUnavailableError
+	if !errors.As(err, &unavailable) || barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperUnitUnavailable || waits != 0 {
+		t.Fatalf("supervised unavailable helper = %#v err=%v reason=%q generic_waits=%d", unavailable, err, barrier.CapabilityReasonCode(), waits)
 	}
 }
 
