@@ -42,18 +42,19 @@ type computerStorageCopyFacts struct {
 }
 
 type computerStorageCopyManifest struct {
-	Version               int                         `json:"version"`
-	Request               CopyComputerStorageRequest  `json:"request"`
-	Phase                 computerStorageCopyPhase    `json:"phase"`
-	SourceDigest          string                      `json:"source_digest,omitempty"`
-	DestinationDigest     string                      `json:"destination_digest,omitempty"`
-	OSIdentityRekeyed     bool                        `json:"os_identity_rekeyed,omitempty"`
-	MachineIDBeforeDigest string                      `json:"machine_id_before_digest,omitempty"`
-	MachineIDAfterDigest  string                      `json:"machine_id_after_digest,omitempty"`
-	MachineIDRepaired     bool                        `json:"machine_id_repaired,omitempty"`
-	SourceUnchanged       bool                        `json:"source_unchanged,omitempty"`
-	FilesystemExpanded    bool                        `json:"filesystem_expanded,omitempty"`
-	Receipt               *ComputerStorageCopyReceipt `json:"receipt,omitempty"`
+	Version               int                             `json:"version"`
+	Request               CopyComputerStorageRequest      `json:"request"`
+	Phase                 computerStorageCopyPhase        `json:"phase"`
+	SourceDigest          string                          `json:"source_digest,omitempty"`
+	DestinationDigest     string                          `json:"destination_digest,omitempty"`
+	OSIdentityRekeyed     bool                            `json:"os_identity_rekeyed,omitempty"`
+	MachineIDBeforeDigest string                          `json:"machine_id_before_digest,omitempty"`
+	MachineIDAfterDigest  string                          `json:"machine_id_after_digest,omitempty"`
+	MachineIDRepaired     bool                            `json:"machine_id_repaired,omitempty"`
+	SourceUnchanged       bool                            `json:"source_unchanged,omitempty"`
+	FilesystemExpanded    bool                            `json:"filesystem_expanded,omitempty"`
+	Receipt               *ComputerStorageCopyReceipt     `json:"receipt,omitempty"`
+	Recovery              computerStorageRecoveryDeferral `json:"recovery,omitempty"`
 }
 
 func (engine *ContainerdEngine) storageCopyCheckpoint(phase computerStorageCopyPhase) error {

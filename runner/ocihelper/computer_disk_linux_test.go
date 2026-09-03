@@ -1002,20 +1002,92 @@ func TestComputerDiskQuarantineExpiryDropsPayloadButKeepsGenerationTombstone(t *
 	if err := json.Unmarshal(payload, &receipt); err != nil {
 		t.Fatal(err)
 	}
-	receipt.RetainUntil = time.Now().Add(-time.Minute)
+	receipt.CreatedAt = time.Now().Add(-defaultComputerDiskQuarantineRetention - time.Hour)
+	receipt.RetainUntil = receipt.CreatedAt.Add(defaultComputerDiskQuarantineRetention)
 	payload, _ = json.Marshal(receipt)
 	if err := os.WriteFile(receiptPath, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.expireComputerDiskQuarantinePayloads(); err != nil {
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	children, err := os.ReadDir(quarantineRoot)
-	if err != nil || len(children) != 1 || children[0].Name() != "quarantine.json" {
+	if err != nil || len(children) != 2 || children[0].Name() != "attachment.lock" || children[1].Name() != "quarantine.json" {
 		t.Fatalf("expired quarantine children=%v err=%v", children, err)
+	}
+	updated, err := readAndValidateComputerDiskQuarantineReceipt(receiptPath)
+	if err != nil || updated.PayloadDroppedAt == nil || !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool { return item.Action == SweepActionQuarantinePayloadDropped }) {
+		t.Fatalf("payload drop receipt=%+v evidence=%+v err=%v", updated, engine.computerDiskSweepEvidence, err)
 	}
 	if quarantined, err := computerDiskQuarantined(root, storage); err != nil || !quarantined {
 		t.Fatalf("expired generation tombstone=%t err=%v", quarantined, err)
+	}
+}
+
+func TestComputerDiskQuarantineExpiryNeverDeletesPayloadUnderInvalidAuthority(t *testing.T) {
+	root := t.TempDir()
+	entry := filepath.Join(root, "computer-disk-quarantine", "wefty-computer-disk-forged-anomaly-receipt")
+	if err := os.MkdirAll(entry, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payloadPath := filepath.Join(entry, "disk.ext4")
+	if err := os.WriteFile(payloadPath, []byte("tenant bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	receipt := computerDiskQuarantineReceipt{Kind: computerDiskQuarantineKindGeneration, ReceiptID: "receipt", DiskName: "wefty-computer-disk-forged",
+		Reason: "allocation_mismatch", CreatedAt: time.Now().Add(-48 * time.Hour), RetainUntil: time.Now().Add(-24 * time.Hour)}
+	payload, _ := json.Marshal(receipt)
+	if err := os.WriteFile(filepath.Join(entry, "quarantine.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}}
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(payloadPath); err != nil || string(got) != "tenant bytes" {
+		t.Fatalf("invalid authority payload = %q err=%v", got, err)
+	}
+}
+
+func TestComputerDiskQuarantineGCFailureIsEvidenceNotSweepFailure(t *testing.T) {
+	root := t.TempDir()
+	storage := testComputerStorage()
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(diskRoot, "disk.ext4"), []byte("tenant bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}}
+	if err := engine.quarantineComputerDiskAnomaly(diskRoot, name, storage, "allocation_mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := os.ReadDir(filepath.Join(root, "computer-disk-quarantine"))
+	quarantineRoot := filepath.Join(root, "computer-disk-quarantine", entries[0].Name())
+	receiptPath := filepath.Join(quarantineRoot, "quarantine.json")
+	receipt, err := readAndValidateComputerDiskQuarantineReceipt(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.CreatedAt = time.Now().Add(-defaultComputerDiskQuarantineRetention - time.Hour)
+	receipt.RetainUntil = receipt.CreatedAt.Add(defaultComputerDiskQuarantineRetention)
+	payload, _ := json.Marshal(receipt)
+	if err := os.WriteFile(receiptPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine.computerQuarantineRemoveAll = func(string) error { return errors.New("injected remove failure") }
+	if err := engine.expireComputerDiskQuarantinePayloads(t.Context()); err != nil {
+		t.Fatalf("GC failed whole sweep: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(quarantineRoot, "disk.ext4")); err != nil {
+		t.Fatalf("failed GC removed payload: %v", err)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.Action == SweepActionQuarantineGCFailed && item.Method == "remove_payload"
+	}) {
+		t.Fatalf("GC failure evidence = %+v", engine.computerDiskSweepEvidence)
 	}
 }
 

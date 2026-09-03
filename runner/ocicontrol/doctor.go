@@ -6,6 +6,7 @@ import (
 	"io"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -86,12 +87,13 @@ type AgentFacts struct {
 }
 
 type HelperDoctorFacts struct {
-	Outcome           DiagnosticOutcome `json:"outcome"`
-	ProtocolVersion   int               `json:"protocol_version"`
-	Version           string            `json:"version,omitempty"`
-	Checksum          string            `json:"checksum,omitempty"`
-	InstanceID        string            `json:"instance_id,omitempty"`
-	SessionGeneration uint64            `json:"session_generation,omitempty"`
+	Outcome                 DiagnosticOutcome `json:"outcome"`
+	ProtocolVersion         int               `json:"protocol_version"`
+	Version                 string            `json:"version,omitempty"`
+	Checksum                string            `json:"checksum,omitempty"`
+	InstanceID              string            `json:"instance_id,omitempty"`
+	SessionGeneration       uint64            `json:"session_generation,omitempty"`
+	HandshakeStalledWindows uint64            `json:"handshake_stalled_windows"`
 }
 
 type VersionFacts struct {
@@ -162,6 +164,14 @@ type LimaDoctorFacts struct {
 	Facts      lima.SupervisorFacts `json:"facts,omitempty"`
 }
 
+type ComputerStorageRecoveryFacts struct {
+	Outcome          DiagnosticOutcome                                 `json:"outcome"`
+	DeferredCount    int                                               `json:"deferred_count"`
+	QuarantinedCount int                                               `json:"quarantined_count"`
+	Deferred         []ocihelper.ComputerStorageRecoveryInventoryEntry `json:"deferred"`
+	Quarantined      []ocihelper.ComputerStorageRecoveryInventoryEntry `json:"quarantined"`
+}
+
 type DiagnosticFinding struct {
 	Check       string                        `json:"check"`
 	Outcome     DiagnosticOutcome             `json:"outcome"`
@@ -180,23 +190,24 @@ type DoctorLimitation struct {
 }
 
 type DoctorResponse struct {
-	Version           int                                 `json:"version"`
-	ObservedAt        time.Time                           `json:"observed_at"`
-	HostPlatform      PlatformFacts                       `json:"host_platform"`
-	RuntimePlatform   *PlatformFacts                      `json:"runtime_platform,omitempty"`
-	Agent             AgentFacts                          `json:"agent"`
-	Lima              LimaDoctorFacts                     `json:"lima"`
-	Helper            HelperDoctorFacts                   `json:"helper"`
-	Versions          VersionFacts                        `json:"versions"`
-	Probe             ProbeDoctorFacts                    `json:"probe"`
-	Intent            IntentDoctorFacts                   `json:"intent"`
-	Cache             CacheDoctorFacts                    `json:"cache"`
-	Mounts            MountDoctorFacts                    `json:"mounts"`
-	Profile           ProfileDoctorFacts                  `json:"profile"`
-	ResourceAdmission *ocihelper.ResourceAdmissionReceipt `json:"resource_admission,omitempty"`
-	Convergence       ConvergenceDoctorFacts              `json:"convergence"`
-	Findings          []DiagnosticFinding                 `json:"findings"`
-	Limitations       []DoctorLimitation                  `json:"limitations"`
+	Version                 int                                 `json:"version"`
+	ObservedAt              time.Time                           `json:"observed_at"`
+	HostPlatform            PlatformFacts                       `json:"host_platform"`
+	RuntimePlatform         *PlatformFacts                      `json:"runtime_platform,omitempty"`
+	Agent                   AgentFacts                          `json:"agent"`
+	Lima                    LimaDoctorFacts                     `json:"lima"`
+	Helper                  HelperDoctorFacts                   `json:"helper"`
+	Versions                VersionFacts                        `json:"versions"`
+	Probe                   ProbeDoctorFacts                    `json:"probe"`
+	Intent                  IntentDoctorFacts                   `json:"intent"`
+	Cache                   CacheDoctorFacts                    `json:"cache"`
+	Mounts                  MountDoctorFacts                    `json:"mounts"`
+	Profile                 ProfileDoctorFacts                  `json:"profile"`
+	ResourceAdmission       *ocihelper.ResourceAdmissionReceipt `json:"resource_admission,omitempty"`
+	Convergence             ConvergenceDoctorFacts              `json:"convergence"`
+	ComputerStorageRecovery ComputerStorageRecoveryFacts        `json:"computer_storage_recovery"`
+	Findings                []DiagnosticFinding                 `json:"findings"`
+	Limitations             []DoctorLimitation                  `json:"limitations"`
 }
 
 type HelperDoctorSource func(context.Context) (HelperDoctorSnapshot, error)
@@ -215,18 +226,20 @@ type HelperDoctorSnapshot struct {
 }
 
 type DoctorConfig struct {
-	Clock                 Clock
-	HostPlatform          PlatformFacts
-	AgentUser             string
-	LaunchUnit            string
-	CapabilitySnapshot    func() agent.CapabilitySnapshot
-	Intent                func(context.Context) (lima.OCIIntent, error)
-	LimaFacts             func() lima.SupervisorFacts
-	Helper                HelperDoctorSource
-	SetupStatePath        string
-	ReadSetupState        func(string) (SetupState, error)
-	DesiredSetupStatePath string
-	ReadDesiredSetupState func(string) (SetupState, error)
+	Clock                         Clock
+	HostPlatform                  PlatformFacts
+	AgentUser                     string
+	LaunchUnit                    string
+	CapabilitySnapshot            func() agent.CapabilitySnapshot
+	Intent                        func(context.Context) (lima.OCIIntent, error)
+	LimaFacts                     func() lima.SupervisorFacts
+	Helper                        HelperDoctorSource
+	HelperHandshakeStalledWindows func() uint64
+	SetupStatePath                string
+	ReadSetupState                func(string) (SetupState, error)
+	DesiredSetupStatePath         string
+	ReadDesiredSetupState         func(string) (SetupState, error)
+	InstalledSystemdVersion       func(context.Context) (int, error)
 }
 
 type diagnosticReceipt struct {
@@ -303,7 +316,9 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 		Mounts:      MountDoctorFacts{Outcome: DiagnosticNotRun, AllowedRoots: []string{}},
 		Profile:     ProfileDoctorFacts{Outcome: DiagnosticNotRun, Warnings: []ocihelper.ProfileWarning{}},
 		Convergence: ConvergenceDoctorFacts{Outcome: DiagnosticNotRun},
-		Findings:    []DiagnosticFinding{},
+		ComputerStorageRecovery: ComputerStorageRecoveryFacts{Outcome: DiagnosticNotRun,
+			Deferred: []ocihelper.ComputerStorageRecoveryInventoryEntry{}, Quarantined: []ocihelper.ComputerStorageRecoveryInventoryEntry{}},
+		Findings: []DiagnosticFinding{},
 		Limitations: []DoctorLimitation{{
 			Code:   DoctorUIDLimitation,
 			Detail: "process-kind payloads currently share the agent user; operator peer credentials do not distinguish them",
@@ -320,9 +335,28 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 	buildIntent(ctx, config, &report)
 	buildCapability(config, now, &report)
 	buildLima(config, &report)
-	buildConvergence(config, &report)
+	buildConvergence(ctx, config, &report)
+	buildHelperHandshakeStalls(config, &report)
 	buildHelper(ctx, config, &report)
 	return report
+}
+
+func buildHelperHandshakeStalls(config DoctorConfig, report *DoctorResponse) {
+	if config.HelperHandshakeStalledWindows == nil {
+		report.Findings = append(report.Findings, finding("helper-handshake-stalls", diagnosticReceipt{code: "oci_helper_handshake_stalls_not_read", notRunCause: NotRunSourceUnavailable, detail: "consecutive helper handshake stall windows were unavailable"}))
+		return
+	}
+	count := config.HelperHandshakeStalledWindows()
+	report.Helper.HandshakeStalledWindows = count
+	passed := count == 0
+	reason := contract.CapabilityReasonCode("")
+	code := "oci_helper_handshake_stalls_clear"
+	if !passed {
+		reason = contract.CapabilityReasonHelperHandshakeStalled
+		code = "oci_helper_handshake_stalls_observed"
+	}
+	report.Findings = append(report.Findings, finding("helper-handshake-stalls", diagnosticReceipt{ran: true, passed: passed, code: code, reasonCode: reason,
+		detail: fmt.Sprintf("consecutive bounded helper handshake stall windows: %d", count)}))
 }
 
 func buildIntent(ctx context.Context, config DoctorConfig, report *DoctorResponse) {
@@ -474,7 +508,7 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 	report.Helper = HelperDoctorFacts{
 		Outcome: outcomeFor(true, validHandshake), ProtocolVersion: snapshot.ProtocolVersion,
 		Version: snapshot.Version, Checksum: snapshot.Checksum, InstanceID: snapshot.InstanceID,
-		SessionGeneration: snapshot.SessionGeneration,
+		SessionGeneration: snapshot.SessionGeneration, HandshakeStalledWindows: report.Helper.HandshakeStalledWindows,
 	}
 	report.Findings = append(report.Findings, finding("helper-handshake", diagnosticReceipt{ran: true, passed: validHandshake, code: code, reasonCode: reason, detail: "the existing authenticated helper handshake was read; no session was acquired"}))
 	if !validHandshake {
@@ -485,11 +519,28 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 	sweepOK := snapshot.SweepReceiptRecorded && snapshot.SweepReceipt.SweepEpoch != "" &&
 		snapshot.SweepReceipt.HelperSession.HelperInstanceID == snapshot.InstanceID &&
 		snapshot.SweepReceipt.HelperSession.SessionGeneration == snapshot.SessionGeneration &&
-		snapshot.SweepReceipt.VerifiedAbsent
+		snapshot.SweepReceipt.VerifiedAbsent &&
+		snapshot.SweepReceipt.ComputerStorageDeferredCount == len(snapshot.SweepReceipt.VerifiedRetained.ComputerStorageDeferred) &&
+		snapshot.SweepReceipt.ComputerStorageQuarantinedCount == len(snapshot.SweepReceipt.VerifiedRetained.ComputerStorageQuarantined)
 	if snapshot.SweepReceiptRecorded {
 		report.Findings = append(report.Findings, finding("boot-sweep", diagnosticReceipt{ran: true, passed: sweepOK, code: map[bool]string{true: "oci_boot_sweep_verified", false: "oci_boot_sweep_failed"}[sweepOK], reasonCode: reasonUnless(sweepOK, contract.CapabilityReasonBootSweepFailed), detail: "the barrier-pinned namespace sweep receipt was checked without running a sweep"}))
+		if sweepOK {
+			deferred := slices.Clone(snapshot.SweepReceipt.VerifiedRetained.ComputerStorageDeferred)
+			quarantined := slices.Clone(snapshot.SweepReceipt.VerifiedRetained.ComputerStorageQuarantined)
+			clear := len(deferred) == 0 && len(quarantined) == 0
+			report.ComputerStorageRecovery = ComputerStorageRecoveryFacts{Outcome: outcomeFor(true, clear), DeferredCount: len(deferred), QuarantinedCount: len(quarantined), Deferred: deferred, Quarantined: quarantined}
+			code := "oci_computer_storage_recovery_clear"
+			if !clear {
+				code = "oci_computer_storage_recovery_retained"
+			}
+			report.Findings = append(report.Findings, finding("computer-storage-recovery", diagnosticReceipt{ran: true, passed: clear, code: code, severity: DiagnosticWarn,
+				detail: fmt.Sprintf("typed retained Computer Storage generations: deferred=%d quarantined=%d", len(deferred), len(quarantined))}))
+		} else {
+			appendComputerStorageRecoveryNotRun(report, NotRunDependencyMissing, "the boot-sweep receipt did not validate")
+		}
 	} else {
 		report.Findings = append(report.Findings, finding("boot-sweep", diagnosticReceipt{code: "oci_boot_sweep_not_recorded", notRunCause: NotRunSourceUnavailable, detail: "no barrier-pinned namespace sweep receipt was available"}))
+		appendComputerStorageRecoveryNotRun(report, NotRunSourceUnavailable, "no barrier-pinned namespace sweep receipt was available")
 	}
 
 	runtimeStatus := snapshot.Runtime
@@ -590,12 +641,21 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 func appendHelperNotRun(report *DoctorResponse, detail string) {
 	report.Findings = append(report.Findings, finding("helper-handshake", diagnosticReceipt{code: "oci_helper_not_read", notRunCause: NotRunNotConfigured, detail: detail}))
 	report.Findings = append(report.Findings, finding("boot-sweep", diagnosticReceipt{code: "oci_boot_sweep_not_recorded", notRunCause: NotRunDependencyMissing, detail: "the helper handshake did not run"}))
+	appendComputerStorageRecoveryNotRun(report, NotRunDependencyMissing, "the dependent boot-sweep receipt was unavailable")
 	appendRuntimeDependentsNotRun(report, NotRunDependencyMissing)
 }
 
 func appendHelperDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
 	report.Findings = append(report.Findings, finding("boot-sweep", diagnosticReceipt{code: "oci_boot_sweep_not_recorded", notRunCause: cause, detail: "the dependent helper receipt read did not run"}))
+	appendComputerStorageRecoveryNotRun(report, cause, "the dependent boot-sweep receipt read did not run")
 	appendRuntimeDependentsNotRun(report, cause)
+}
+
+func appendComputerStorageRecoveryNotRun(report *DoctorResponse, cause NotRunCause, detail string) {
+	report.ComputerStorageRecovery.Outcome = DiagnosticNotRun
+	report.Findings = append(report.Findings, finding("computer-storage-recovery", diagnosticReceipt{
+		code: "oci_computer_storage_recovery_not_read", notRunCause: cause, detail: detail,
+	}))
 }
 
 func appendRuntimeDependentsNotRun(report *DoctorResponse, cause NotRunCause) {
@@ -610,9 +670,10 @@ func appendMechanicsDependentsNotRun(report *DoctorResponse, cause NotRunCause) 
 	}
 }
 
-func buildConvergence(config DoctorConfig, report *DoctorResponse) {
+func buildConvergence(ctx context.Context, config DoctorConfig, report *DoctorResponse) {
 	if config.SetupStatePath == "" {
 		report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{code: "oci_convergence_not_read", notRunCause: NotRunNotConfigured, detail: "durable setup convergence state was not configured"}))
+		appendHelperRestartPolicyNotRun(report, NotRunNotConfigured, "durable systemd and helper restart-policy state was not configured")
 		return
 	}
 	read := config.ReadSetupState
@@ -623,6 +684,7 @@ func buildConvergence(config DoctorConfig, report *DoctorResponse) {
 	if err != nil {
 		report.Convergence.Outcome = DiagnosticFailed
 		report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{ran: true, code: "oci_convergence_state_unavailable", reasonCode: contract.CapabilityReasonPrerequisiteMissing, detail: "durable setup convergence state is missing, unreadable, or malformed"}))
+		appendHelperRestartPolicyNotRun(report, NotRunSourceUnavailable, "installed systemd and helper restart-policy state was unavailable")
 		return
 	}
 	report.Convergence.State = &current
@@ -636,11 +698,13 @@ func buildConvergence(config DoctorConfig, report *DoctorResponse) {
 	}
 	if desiredPath == "" {
 		report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{code: "oci_convergence_desired_not_read", notRunCause: NotRunDesiredUnavailable, detail: "desired setup state was not configured"}))
+		appendHelperRestartPolicyNotRun(report, NotRunDesiredUnavailable, "desired systemd and helper restart-policy state was not configured")
 		return
 	}
 	desired, desiredErr := readDesired(desiredPath)
 	if desiredErr != nil {
 		report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{code: "oci_convergence_desired_not_read", notRunCause: NotRunDesiredUnavailable, detail: "desired setup state was unavailable"}))
+		appendHelperRestartPolicyNotRun(report, NotRunDesiredUnavailable, "desired systemd and helper restart-policy state was unavailable")
 		return
 	}
 	report.Convergence.Desired = &desired
@@ -655,6 +719,28 @@ func buildConvergence(config DoctorConfig, report *DoctorResponse) {
 	report.Convergence.Outcome = outcomeFor(true, passed)
 	report.Convergence.Class = class
 	report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{ran: true, passed: passed, code: "oci_convergence_" + string(class), reasonCode: reason, detail: "current and desired durable setup states were compared without applying them"}))
+	if config.InstalledSystemdVersion == nil {
+		appendHelperRestartPolicyNotRun(report, NotRunSourceUnavailable, "the installed systemd version source was unavailable")
+		return
+	}
+	installedSystemdVersion, versionErr := config.InstalledSystemdVersion(ctx)
+	if versionErr != nil || installedSystemdVersion <= 0 {
+		appendHelperRestartPolicyNotRun(report, NotRunSourceUnavailable, "the installed systemd version could not be read")
+		return
+	}
+	policyMatched := current.SystemdVersion == installedSystemdVersion && current.HelperRestartPolicy == setupStateRestartPolicy(installedSystemdVersion)
+	policyCode := "oci_helper_restart_policy_current"
+	if !policyMatched {
+		policyCode = "oci_helper_restart_policy_drift"
+	}
+	report.Findings = append(report.Findings, finding("helper-restart-policy", diagnosticReceipt{ran: true, passed: policyMatched, code: policyCode,
+		reasonCode: reasonUnless(policyMatched, contract.CapabilityReasonPrerequisiteMissing), detail: fmt.Sprintf("installed systemd_version=%d durable systemd_version=%d helper restart policy=%s", installedSystemdVersion, current.SystemdVersion, current.HelperRestartPolicy)}))
+}
+
+func appendHelperRestartPolicyNotRun(report *DoctorResponse, cause NotRunCause, detail string) {
+	report.Findings = append(report.Findings, finding("helper-restart-policy", diagnosticReceipt{
+		code: "oci_helper_restart_policy_not_read", notRunCause: cause, detail: detail,
+	}))
 }
 
 func buildMountRoots(runtimeStatus ocihelper.DoctorStatus, report *DoctorResponse) {
@@ -754,6 +840,7 @@ func StableDoctorReasonCodes() []contract.CapabilityReasonCode {
 		contract.CapabilityReasonRuntimeVersionUnsupported, contract.CapabilityReasonHelperUnreachable,
 		contract.CapabilityReasonHelperUnitUnavailable,
 		contract.CapabilityReasonHelperHandshakeStalled,
+		contract.CapabilityReasonHelperHandshakeStalledPersistent,
 		contract.CapabilityReasonHelperVersionMismatch, contract.CapabilityReasonHelperHandshakeFailed,
 		contract.CapabilityReasonBootSweepFailed, contract.CapabilityReasonProbeFailed,
 		contract.CapabilityReasonLimaStopped, contract.CapabilityReasonLimaBroken,
@@ -772,7 +859,9 @@ func StableDoctorCodes() []string {
 		"oci_probe_not_recorded", "oci_probe_passed", "oci_probe_failed",
 		"oci_lima_not_applicable", "oci_lima_not_observed", "oci_lima_state",
 		"oci_helper_not_read", "oci_helper_unreachable", "oci_helper_handshake_ok", "oci_helper_handshake_failed", "oci_helper_version_mismatch",
+		"oci_helper_handshake_stalls_not_read", "oci_helper_handshake_stalls_clear", "oci_helper_handshake_stalls_observed",
 		"oci_boot_sweep_not_recorded", "oci_boot_sweep_verified", "oci_boot_sweep_failed",
+		"oci_computer_storage_recovery_not_read", "oci_computer_storage_recovery_clear", "oci_computer_storage_recovery_retained",
 		"oci_runtime_platform_not_run", "oci_runtime_platform_not_recorded", "oci_runtime_platform_observed",
 		"oci_runtime_versions_not_run", "oci_runtime_versions_unavailable", "oci_runtime_versions_unsupported", "oci_runtime_versions_observed", "oci_runtime_versions_outside_tested_range",
 		"oci_cache_not_run", "oci_cache_status_unavailable", "oci_cache_within_bound", "oci_cache_over_bound", "oci_cache_eviction_failed",
@@ -781,6 +870,7 @@ func StableDoctorCodes() []string {
 		"oci_mount_roots_not_run", "oci_mount_roots_unavailable", "oci_mount_roots_observed", "oci_mount_root_unavailable",
 		"oci_convergence_not_read", "oci_convergence_state_unavailable", "oci_convergence_desired_not_read",
 		"oci_convergence_unchanged", "oci_convergence_live_safe", "oci_convergence_restart_required", "oci_convergence_recreate_required",
+		"oci_helper_restart_policy_not_read", "oci_helper_restart_policy_current", "oci_helper_restart_policy_drift",
 	}
 }
 
@@ -788,7 +878,8 @@ func (report DoctorResponse) Validate() error {
 	if report.Version != DoctorVersion || report.ObservedAt.IsZero() || report.HostPlatform.OS == "" || report.HostPlatform.Architecture == "" {
 		return fmt.Errorf("invalid doctor header")
 	}
-	if len(report.Findings) == 0 || report.Probe.Capabilities == nil || report.Probe.MissingCapabilities == nil || report.Mounts.AllowedRoots == nil {
+	if len(report.Findings) == 0 || report.Probe.Capabilities == nil || report.Probe.MissingCapabilities == nil || report.Mounts.AllowedRoots == nil ||
+		!report.ComputerStorageRecovery.Outcome.Valid() {
 		return fmt.Errorf("doctor report is incomplete")
 	}
 	if len(report.Limitations) != 1 || report.Limitations[0].Code != DoctorUIDLimitation || report.Limitations[0].Issue != DoctorUIDIssue || report.Limitations[0].Detail == "" {
@@ -818,7 +909,7 @@ func (report DoctorResponse) Validate() error {
 		}
 		seen[item.Check] = struct{}{}
 	}
-	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake", "boot-sweep", "runtime-platform", "runtime-versions", "cache", "resource-admission", "mount-roots", "convergence"} {
+	for _, check := range []string{"host-platform", "agent-user", "intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "resource-admission", "mount-roots", "convergence", "helper-restart-policy"} {
 		if _, ok := seen[check]; !ok {
 			return fmt.Errorf("doctor finding %q is missing", check)
 		}

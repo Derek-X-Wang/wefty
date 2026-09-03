@@ -1837,6 +1837,8 @@ func mergeNativeExpectedInventory(left, right ocihelper.ResourceInventory) ocihe
 	left.ComputerAttachments = mergeNativeIdentityClass(left.ComputerAttachments, right.ComputerAttachments)
 	left.ComputerResetManifests = mergeNativeIdentityClass(left.ComputerResetManifests, right.ComputerResetManifests)
 	left.ComputerQuarantines = mergeNativeIdentityClass(left.ComputerQuarantines, right.ComputerQuarantines)
+	left.ComputerStorageDeferred = append(left.ComputerStorageDeferred, right.ComputerStorageDeferred...)
+	left.ComputerStorageQuarantined = append(left.ComputerStorageQuarantined, right.ComputerStorageQuarantined...)
 	left.ComputerDiskAnomalies = mergeNativeIdentityClass(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
 	return left
 }
@@ -1867,8 +1869,20 @@ func subtractNativeInventory(inventory, baseline ocihelper.ResourceInventory) oc
 	inventory.ComputerAttachments = subtractNativeIdentityClass(inventory.ComputerAttachments, baseline.ComputerAttachments)
 	inventory.ComputerResetManifests = subtractNativeIdentityClass(inventory.ComputerResetManifests, baseline.ComputerResetManifests)
 	inventory.ComputerQuarantines = subtractNativeIdentityClass(inventory.ComputerQuarantines, baseline.ComputerQuarantines)
+	inventory.ComputerStorageDeferred = subtractNativeRecoveryInventory(inventory.ComputerStorageDeferred, baseline.ComputerStorageDeferred)
+	inventory.ComputerStorageQuarantined = subtractNativeRecoveryInventory(inventory.ComputerStorageQuarantined, baseline.ComputerStorageQuarantined)
 	inventory.ComputerDiskAnomalies = subtractNativeIdentityClass(inventory.ComputerDiskAnomalies, baseline.ComputerDiskAnomalies)
 	return inventory
+}
+
+func subtractNativeRecoveryInventory(values, baseline []ocihelper.ComputerStorageRecoveryInventoryEntry) []ocihelper.ComputerStorageRecoveryInventoryEntry {
+	result := make([]ocihelper.ComputerStorageRecoveryInventoryEntry, 0, len(values))
+	for _, value := range values {
+		if !slices.Contains(baseline, value) {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func subtractNativeIdentityClass(inventory, baseline []string) []string {

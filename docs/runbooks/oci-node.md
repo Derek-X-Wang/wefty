@@ -25,7 +25,7 @@ sudo bash scripts/install-oci-deps.sh
 
 The Linux install stages the complete pinned containerd bundle under `/usr/local/lib/wefty/oci-runtime`, moves that directory into place as one unit, and publishes root-owned links in `/usr/local/bin`; runc uses the matching versioned directory and `/usr/local/sbin/runc`. A partial or conflicting managed install exits `65` until an operator reviews it and explicitly passes `--repair`. The script resolves privileged tools to absolute root-owned executables, preserves a `containerd.service` found anywhere in systemd's unit search path, and otherwise writes an inactive `/etc/systemd/system/containerd.service` with the resolved `ExecStart`, `Type=notify`, and `Restart=always`.
 
-Every written path, owner, and mode appears in the dry-run or completion receipt. To uninstall a wefty-managed runtime, first stop dependent wefty/containerd services, remove only the disclosed links and wefty-authored unit, then remove `/usr/local/lib/wefty/oci-runtime`; never remove a preserved packaged unit. Exit `0` means prerequisites are ready, `64` means invalid input/unsupported prerequisites before mutation, `65` requires explicit repair authority, and any other nonzero status means the operation did not complete and its receipt must be inspected before rerun. The script prints the platform-correct setup, service-convergence, then doctor order and never starts containerd, Lima, the helper, or the agent.
+Every written path, owner, and mode appears in the dry-run or completion receipt. Native and Lima nodes require `e2fsprogs` (`e2fsck`) so crash recovery can preen interrupted ext4 growth; setup reports its absence as `prerequisite_missing` before installing the helper. To uninstall a wefty-managed runtime, first stop dependent wefty/containerd services, remove only the disclosed links and wefty-authored unit, then remove `/usr/local/lib/wefty/oci-runtime`; never remove a preserved packaged unit. Exit `0` means prerequisites are ready, `64` means invalid input/unsupported prerequisites before mutation, `65` requires explicit repair authority, and any other nonzero status means the operation did not complete and its receipt must be inspected before rerun. The script prints the platform-correct setup, service-convergence, then doctor order and never starts containerd, Lima, the helper, or the agent.
 
 ## Configure the installed node
 
@@ -105,7 +105,7 @@ ceiling and stronger live-attempt, service-binding, and probe holds.
 wefty --json node doctor
 ```
 
-Each finding has `OK`, `FAILED`, or `NOT-RUN`, a stable `oci_*` code, severity, sanitized detail, and this runbook anchor. Capability restriction uses only the ratified reason codes: `oci_intent_disabled`, `prerequisite_missing`, `runtime_version_unsupported`, `helper_unreachable`, `helper_unit_unavailable`, `helper_handshake_stalled`, `helper_version_mismatch`, `helper_handshake_failed`, `boot_sweep_failed`, `probe_failed`, `lima_stopped`, `lima_broken`, `lima_start_timeout`, `template_restart_required`, `template_recreate_required`, `mount_root_unavailable`, and `local_permission_denied`. `helper_unit_unavailable` means the socket-activated helper topology stayed absent, refused, or reset every dial across the takeover window; `helper_handshake_stalled` means a socket accepted a connection but no handshake completed and is retried without a Lima force-stop. `helper_unreachable` remains the generic transport failure. Unknown local failures collapse to `probe_failed`; do not invent a reason from raw text. Native and Lima setup inspect systemd: version 254 or newer receives capped geometric restart directives, while Debian 12/systemd 252 receives the equivalent bounded fixed `RestartSec=1s` policy.
+Each finding has `OK`, `FAILED`, or `NOT-RUN`, a stable `oci_*` code, severity, sanitized detail, and this runbook anchor. Capability restriction includes `helper_handshake_stalled_persistent` for a connected socket that completed no handshake through the five-minute Lima `RecoveryTimeout`. `helper_unit_unavailable` means the final dial of the takeover window positively observed an absent, refused, or reset socket and no handshake completed; `helper_handshake_stalled` means the final dial connected but completed no handshake. A transient stall is retried; a persistent Lima stall force-stops the instance once, while native doctor evidence carries the consecutive window count. `helper_unreachable` remains the generic transport failure. Unknown local failures collapse to `probe_failed`; do not invent a reason from raw text. Native and Lima setup persist the observed systemd version and rendered helper restart policy: version 254 or newer receives capped geometric restart directives, Debian 12/systemd 252 receives fixed `RestartSec=1s`, and unknown version zero renders the conservative fixed policy.
 
 Doctor also reports the documented #220 limitation: process-kind payloads currently share the agent user, so local peer credentials do not distinguish those payloads from the operator. Do not treat the operator-only control socket as process-payload UID isolation until #220 lands.
 
@@ -206,6 +206,42 @@ Meaning: the handshake was incomplete or malformed. Evidence: compare installed 
 ## doctor-code-oci-helper-version-mismatch
 
 Meaning: helper protocol or checksum differs from the agent. Evidence: record both installed revisions and the expected checksum. First action: replace the helper with the candidate-matching binary. Escalation: include immutable build provenance.
+
+## doctor-code-oci-helper-handshake-stalls-not-read
+
+Meaning: the native barrier stall counter was unavailable. First action: rerun doctor from the configured agent process.
+
+## doctor-code-oci-helper-handshake-stalls-clear
+
+Meaning: no consecutive bounded helper handshake stall window is recorded. First action: continue with downstream findings.
+
+## doctor-code-oci-helper-handshake-stalls-observed
+
+Meaning: one or more takeover windows connected without a handshake. Evidence: preserve the count; Lima escalates at `RecoveryTimeout`.
+
+## doctor-code-oci-computer-storage-recovery-clear
+
+Meaning: the verified sweep retained no deferred or quarantined Computer Storage generation. First action: none.
+
+## doctor-code-oci-computer-storage-recovery-not-read
+
+Meaning: no verified boot-sweep receipt was available to classify Computer Storage recovery. First action: restore the helper handshake and boot sweep; do not infer zero retained generations.
+
+## doctor-code-oci-computer-storage-recovery-retained
+
+Meaning: typed deferred or quarantined generations remain. Evidence: preserve Storage identity, reason, attempt count, and first-deferred timestamp.
+
+## doctor-code-oci-helper-restart-policy-not-read
+
+Meaning: durable systemd and helper-policy facts were unavailable. First action: rerun setup.
+
+## doctor-code-oci-helper-restart-policy-current
+
+Meaning: the live installed systemd version matches the durable rendered helper restart policy. First action: none.
+
+## doctor-code-oci-helper-restart-policy-drift
+
+Meaning: the live installed systemd version differs from the durable rendered helper policy. First action: rerun setup and apply restart convergence.
 
 ## doctor-code-oci-boot-sweep-not-recorded
 

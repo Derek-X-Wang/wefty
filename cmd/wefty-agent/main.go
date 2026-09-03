@@ -26,6 +26,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	limarunner "github.com/Derek-X-Wang/wefty/runner/lima"
+	"github.com/Derek-X-Wang/wefty/runner/linuxunit"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -277,6 +278,11 @@ func runMacBootstrap(arguments []string) error {
 	if err := supervisor.Ensure(ctx); err != nil {
 		return fmt.Errorf("prepare Lima for bootstrap: %w", err)
 	}
+	guestSystemdVersion, err := limarunner.InspectGuestSystemdVersion(ctx, *instance, *limactl)
+	if err != nil {
+		return err
+	}
+	guestConfig.SystemdVersion = guestSystemdVersion
 	if err := limarunner.InstallGuestHelper(ctx, guestConfig); err != nil {
 		return err
 	}
@@ -296,6 +302,16 @@ func runMacBootstrap(arguments []string) error {
 	}
 	if err := os.Chown(*nodeConfig, operatorUID, operatorGID); err != nil {
 		return fmt.Errorf("set installed node configuration owner: %w", err)
+	}
+	setup := ocicontrol.SetupState{VMMemory: defaultSizing.Memory, VMCPUs: defaultSizing.CPUs, VMDisk: defaultSizing.Disk,
+		VMType: "vz", HostMountRoot: *hostMountRoot, ProbeDigest: *probeDigest, MemoryCapacityBytes: *memoryCapacityBytes,
+		MemoryReserveBytes: configuredReserveBytes, SystemdVersion: guestSystemdVersion,
+		HelperRestartPolicy: limarunner.GuestHelperRestartPolicyName(guestSystemdVersion)}
+	if err := ocicontrol.WriteSetupState(*setupState, setup); err != nil {
+		return err
+	}
+	if err := ocicontrol.WriteSetupState(ocicontrol.DesiredSetupStatePath(*setupState), setup); err != nil {
+		return err
 	}
 	return nil
 }
@@ -568,12 +584,26 @@ func run() error {
 				if limaSupervisor != nil {
 					limaFacts = limaSupervisor.Facts
 				}
+				var stalledWindows func() uint64
+				if bootBarrier != nil {
+					stalledWindows = bootBarrier.HandshakeStalledWindows
+				}
+				installedSystemdVersion := func(ctx context.Context) (int, error) {
+					if runtime.GOOS == "darwin" {
+						return limarunner.InspectGuestSystemdVersion(ctx, *ociLimaInstance, "")
+					}
+					if runtime.GOOS == "linux" {
+						return linuxunit.InspectSystemdVersion(ctx, linuxunit.ExecRunner{})
+					}
+					return 0, errors.New("installed systemd inspection is unsupported on this platform")
+				}
 				report := ocicontrol.BuildDoctor(doctorContext, ocicontrol.DoctorConfig{
 					HostPlatform: ocicontrol.PlatformFacts{OS: runtime.GOOS, Architecture: runtime.GOARCH},
 					AgentUser:    agentUser, LaunchUnit: os.Getenv("WEFTY_LAUNCH_UNIT"),
 					CapabilitySnapshot: nodeAgent.CapabilitySnapshot,
 					Intent:             (limarunner.FileIntentSource{Path: *ociIntentFile}).ReadIntent,
-					LimaFacts:          limaFacts, Helper: doctorHelperSource(ociAdapter), SetupStatePath: *ociSetupState,
+					LimaFacts:          limaFacts, Helper: doctorHelperSource(ociAdapter), HelperHandshakeStalledWindows: stalledWindows, SetupStatePath: *ociSetupState,
+					InstalledSystemdVersion: installedSystemdVersion,
 				})
 				return report, report.Validate()
 			},
@@ -599,6 +629,11 @@ func run() error {
 				}
 				current, stateErr := ocicontrol.ReadSetupState(*ociSetupState)
 				if stateErr == nil {
+					// Setup changes the requested sizing and probe, not the guest's
+					// observed systemd capability. Preserve the installed facts until
+					// a bootstrap or configure operation observes new ones.
+					desired.SystemdVersion = current.SystemdVersion
+					desired.HelperRestartPolicy = current.HelperRestartPolicy
 					response.Convergence = ocicontrol.ClassifyConvergence(current, desired)
 				} else if !errors.Is(stateErr, os.ErrNotExist) {
 					return response, stateErr

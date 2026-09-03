@@ -811,9 +811,16 @@ rename when needed, verifies allocation, and publishes `attachment.json`
 before inventory admission; an earlier staged phase is rolled back because no
 destination generation was published. Grow and copy recovery emit typed
 `resumed` or `rolled_back` sweep evidence. Operational recovery failures with
-valid durable authority emit `resume_deferred`, retain the disk and recovery
-record, keep that Computer generation unattachable, and retry on the next
-sweep; grow recovery preens ext4 with `e2fsck -f -p` before resizing. A
+valid durable authority increment `attempts`, preserve `first_deferred_at` and
+a closed reason, emit `resume_deferred`, and keep that Computer generation
+unattachable. Recovery becomes terminal after 24 failed helper-start sweeps or
+24 hours, whichever arrives first: `resume_abandoned` quarantines the
+generation while preserving its last deferral reason and original
+`first_deferred_at` timestamp in the receipt and typed inventory. The 24-attempt cap is
+the 24-hour retention window divided by the operator repair cadence of one
+helper-start retry per hour; faster restart storms cannot enlarge it. Grow recovery preens
+ext4 with `e2fsck -f -p` before resizing, and exit 1 is recorded as corrected
+filesystem sweep evidence. A
 size/allocation mismatch without matching durable operation
 authority is never reinterpreted as a successful operation: startup moves the
 whole generation into `computer-disk-quarantine`, writes a typed
@@ -821,8 +828,11 @@ whole generation into `computer-disk-quarantine`, writes a typed
 evidence with the closed reason. Quarantined generations remain visible in
 `ComputerQuarantines` and operator/removal surfaces but are durable retained
 state, not runnable namespace residue. Quarantine receipts retain the full
-payload for 24 hours; bounded GC may remove the payload after that point but
-retains the typed tombstone, so generation N is never admissible again. The
+payload for 24 hours. GC revalidates the complete receipt under the generation
+flock, records `payload_dropped_at` and typed evidence, and keeps the receipt
+and lock tombstone until authorized removal. Invalid authority never permits
+byte deletion, and GC failure does not fail helper startup, so generation N is
+never admissible again. The
 authorized recovery path is a reset that prepares and admits generation N+1,
 followed by normal removal authority for N. The affected Computer therefore stays
 fail-closed while the helper continues serving the rest of the Node. Startup's

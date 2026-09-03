@@ -8,11 +8,53 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"golang.org/x/sys/unix"
 )
+
+func TestStartupAbandonsBoundedGrowDeferralIntoTypedQuarantine(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		recovery computerStorageRecoveryDeferral
+	}{
+		{name: "attempt bound", recovery: computerStorageRecoveryDeferral{Attempts: defaultComputerStorageRecoveryAttempts - 1, FirstDeferredAt: time.Now().UTC(), Reason: "operational_failure"}},
+		{name: "elapsed bound", recovery: computerStorageRecoveryDeferral{Attempts: 1, FirstDeferredAt: time.Now().Add(-defaultComputerDiskQuarantineRetention).UTC(), Reason: "operational_failure"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			request := growTestRequest(16 << 20)
+			imagePath := prepareGrowTestImage(t, root, request)
+			if err := fullyAllocateComputerDisk(imagePath, request.NewDiskBytes); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeComputerStorageGrowIntentRecord(filepath.Dir(imagePath), computerStorageGrowIntent{Version: 1, Request: request, Recovery: test.recovery}); err != nil {
+				t.Fatal(err)
+			}
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem(),
+				computerGrowPreen: func(context.Context, string) error { return errors.New("transient") }}
+			if err := engine.sweepComputerDisks(t.Context(), "abandon"); err != nil {
+				t.Fatal(err)
+			}
+			name, _ := deterministicComputerDiskName(request.Storage)
+			if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+				return item.ID == name && item.Action == SweepActionQuarantined && strings.HasPrefix(item.Method, "resume_abandoned:")
+			}) {
+				t.Fatalf("abandon evidence = %+v", engine.computerDiskSweepEvidence)
+			}
+			inventory := ResourceInventory{}
+			if err := engine.inventoryComputerDiskResources(&inventory); err != nil || !slices.ContainsFunc(inventory.ComputerStorageQuarantined, func(entry ComputerStorageRecoveryInventoryEntry) bool {
+				return entry.Storage == request.Storage && entry.Reason == "resume_abandoned" && entry.DeferredReason == "operational_failure" &&
+					entry.Attempts == test.recovery.Attempts+1 && entry.FirstDeferredAt.Equal(test.recovery.FirstDeferredAt)
+			}) {
+				t.Fatalf("abandoned inventory = %+v err=%v", inventory, err)
+			}
+		})
+	}
+}
 
 func TestStartupResumesDurableComputerGrowBeforeInventoryVerification(t *testing.T) {
 	root := t.TempDir()
@@ -131,6 +173,52 @@ func TestStartupContextExpiryDefersGrowWithoutQuarantine(t *testing.T) {
 	entries, err := readDirectoryIfPresent(filepath.Join(root, "computer-disk-quarantine"))
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("expired recovery quarantine=%v err=%v", entries, err)
+	}
+}
+
+func TestStartupStructuralGrowImageLossQuarantinesImmediately(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	if err := writeComputerStorageGrowIntent(filepath.Dir(imagePath), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(imagePath); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem()}
+	if err := engine.sweepComputerDisks(t.Context(), "structural"); err != nil {
+		t.Fatal(err)
+	}
+	name, _ := deterministicComputerDiskName(request.Storage)
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionQuarantined && item.Method == "image_missing"
+	}) {
+		t.Fatalf("structural recovery evidence = %+v", engine.computerDiskSweepEvidence)
+	}
+}
+
+func TestStartupPreenCorrectionEmitsTypedSweepEvidence(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	if err := writeComputerStorageGrowIntent(filepath.Dir(imagePath), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := fullyAllocateComputerDisk(imagePath, request.NewDiskBytes); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem(),
+		computerGrowPreen:           func(context.Context, string) error { return errComputerStoragePreenCorrected },
+		computerGrowResize:          func(context.Context, string, string, int64, int64) error { return nil },
+		computerGrowFilesystemBytes: func(context.Context, string) (int64, error) { return request.NewDiskBytes, nil }}
+	if err := engine.sweepComputerDisks(t.Context(), "preen"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.Action == SweepActionPreenCorrected && item.Method == "e2fsck_exit_1"
+	}) {
+		t.Fatalf("preen correction evidence = %+v", engine.computerDiskSweepEvidence)
 	}
 }
 

@@ -72,24 +72,26 @@ const attemptPortBackendReady byte = 1
 type ErrorCode string
 
 const (
-	CodeInvalidRequest               ErrorCode = "invalid_request"
-	CodePeerUnauthenticated          ErrorCode = "peer_unauthenticated"
-	CodeVersionMismatch              ErrorCode = "version_mismatch"
-	CodeChecksumMismatch             ErrorCode = "checksum_mismatch"
-	CodeSessionBusy                  ErrorCode = "session_busy"
-	CodeSessionStale                 ErrorCode = "session_stale"
-	CodeComputerStorageBusy          ErrorCode = "computer_storage_busy"
-	CodeComputerStorageRetired       ErrorCode = "computer_storage_retired"
-	CodeComputerStorageGrowUncertain ErrorCode = "computer_storage_grow_uncertain"
-	CodeUnauthorizedAttempt          ErrorCode = "unauthorized_attempt"
-	CodeAttemptOutsideSession        ErrorCode = "attempt_outside_session"
-	CodeUnauthorizedPort             ErrorCode = "unauthorized_port"
-	CodeUnauthorizedBridge           ErrorCode = "unauthorized_bridge"
-	CodeOCISpecRejected              ErrorCode = "oci_spec_rejected"
-	CodeImageUnavailable             ErrorCode = "image_unavailable"
-	CodeInsufficientMemory           ErrorCode = "insufficient_memory"
-	CodeInsufficientDisk             ErrorCode = "insufficient_disk"
-	CodeEngineFailure                ErrorCode = "engine_failure"
+	CodeInvalidRequest                ErrorCode = "invalid_request"
+	CodePeerUnauthenticated           ErrorCode = "peer_unauthenticated"
+	CodeVersionMismatch               ErrorCode = "version_mismatch"
+	CodeChecksumMismatch              ErrorCode = "checksum_mismatch"
+	CodeSessionBusy                   ErrorCode = "session_busy"
+	CodeSessionStale                  ErrorCode = "session_stale"
+	CodeComputerStorageBusy           ErrorCode = "computer_storage_busy"
+	CodeComputerStorageRetired        ErrorCode = "computer_storage_retired"
+	CodeComputerStorageResumeDeferred ErrorCode = "computer_storage_resume_deferred"
+	CodeComputerStorageQuarantined    ErrorCode = "computer_storage_quarantined"
+	CodeComputerStorageGrowUncertain  ErrorCode = "computer_storage_grow_uncertain"
+	CodeUnauthorizedAttempt           ErrorCode = "unauthorized_attempt"
+	CodeAttemptOutsideSession         ErrorCode = "attempt_outside_session"
+	CodeUnauthorizedPort              ErrorCode = "unauthorized_port"
+	CodeUnauthorizedBridge            ErrorCode = "unauthorized_bridge"
+	CodeOCISpecRejected               ErrorCode = "oci_spec_rejected"
+	CodeImageUnavailable              ErrorCode = "image_unavailable"
+	CodeInsufficientMemory            ErrorCode = "insufficient_memory"
+	CodeInsufficientDisk              ErrorCode = "insufficient_disk"
+	CodeEngineFailure                 ErrorCode = "engine_failure"
 	// CodeDiagnosticFailure is a read-only observation failure. It is never
 	// evidence that the helper session or runtime authority was lost.
 	CodeDiagnosticFailure    ErrorCode = "diagnostic_failure"
@@ -1316,14 +1318,17 @@ type DurableRetention struct {
 type SweepAction string
 
 const (
-	SweepActionRemoved              SweepAction = "removed"
-	SweepActionKillReaped           SweepAction = "kill_reaped"
-	SweepActionRetained             SweepAction = "retained"
-	SweepActionRetentionBoundReaped SweepAction = "retention_bound_reaped"
-	SweepActionResumed              SweepAction = "resumed"
-	SweepActionResumeDeferred       SweepAction = "resume_deferred"
-	SweepActionRolledBack           SweepAction = "rolled_back"
-	SweepActionQuarantined          SweepAction = "quarantined"
+	SweepActionRemoved                  SweepAction = "removed"
+	SweepActionKillReaped               SweepAction = "kill_reaped"
+	SweepActionRetained                 SweepAction = "retained"
+	SweepActionRetentionBoundReaped     SweepAction = "retention_bound_reaped"
+	SweepActionResumed                  SweepAction = "resumed"
+	SweepActionResumeDeferred           SweepAction = "resume_deferred"
+	SweepActionRolledBack               SweepAction = "rolled_back"
+	SweepActionQuarantined              SweepAction = "quarantined"
+	SweepActionQuarantinePayloadDropped SweepAction = "quarantine_payload_dropped"
+	SweepActionQuarantineGCFailed       SweepAction = "quarantine_gc_failed"
+	SweepActionPreenCorrected           SweepAction = "preen_corrected"
 )
 
 // SweepEvidence is assertion-derived mechanics evidence for a helper-owned
@@ -1361,28 +1366,59 @@ type SweepResponse struct {
 // observation. Empty slices are retained in receipts so every inventory class
 // is explicitly verified, rather than inferred from a total count.
 type ResourceInventory struct {
-	Leases                  []string `json:"leases"`
-	Snapshots               []string `json:"snapshots"`
-	Containers              []string `json:"containers"`
-	Tasks                   []string `json:"tasks"`
-	Shims                   []string `json:"shims"`
-	Cgroups                 []string `json:"cgroups"`
-	LogSegments             []string `json:"log_segments"`
-	ImageSpools             []string `json:"image_spools"`
-	ManagedVolumes          []string `json:"managed_volumes"`
-	ManagedVolumeRecords    []string `json:"managed_volume_records"`
-	ComputerDiskImages      []string `json:"computer_disk_images"`
-	ComputerDiskAllocations []string `json:"computer_disk_allocations"`
-	ComputerDiskQuotas      []string `json:"computer_disk_quotas"`
-	ComputerDiskManifests   []string `json:"computer_disk_manifests"`
-	ComputerDiskMounts      []string `json:"computer_disk_mounts"`
-	ComputerDiskLoops       []string `json:"computer_disk_loops"`
-	ComputerAttachments     []string `json:"computer_attachments"`
-	ComputerResetManifests  []string `json:"computer_reset_manifests"`
-	ComputerQuarantines     []string `json:"computer_quarantines"`
+	Leases                     []string                                `json:"leases"`
+	Snapshots                  []string                                `json:"snapshots"`
+	Containers                 []string                                `json:"containers"`
+	Tasks                      []string                                `json:"tasks"`
+	Shims                      []string                                `json:"shims"`
+	Cgroups                    []string                                `json:"cgroups"`
+	LogSegments                []string                                `json:"log_segments"`
+	ImageSpools                []string                                `json:"image_spools"`
+	ManagedVolumes             []string                                `json:"managed_volumes"`
+	ManagedVolumeRecords       []string                                `json:"managed_volume_records"`
+	ComputerDiskImages         []string                                `json:"computer_disk_images"`
+	ComputerDiskAllocations    []string                                `json:"computer_disk_allocations"`
+	ComputerDiskQuotas         []string                                `json:"computer_disk_quotas"`
+	ComputerDiskManifests      []string                                `json:"computer_disk_manifests"`
+	ComputerDiskMounts         []string                                `json:"computer_disk_mounts"`
+	ComputerDiskLoops          []string                                `json:"computer_disk_loops"`
+	ComputerAttachments        []string                                `json:"computer_attachments"`
+	ComputerResetManifests     []string                                `json:"computer_reset_manifests"`
+	ComputerQuarantines        []string                                `json:"computer_quarantines"`
+	ComputerStorageDeferred    []ComputerStorageRecoveryInventoryEntry `json:"computer_storage_deferred"`
+	ComputerStorageQuarantined []ComputerStorageRecoveryInventoryEntry `json:"computer_storage_quarantined"`
 	// ComputerDiskAnomalies are per-disk observations. They remain auditable
 	// without turning one durable disk's accounting drift into node-wide helper failure.
 	ComputerDiskAnomalies []string `json:"computer_disk_anomalies"`
+}
+
+// ComputerStorageRecoveryInventoryEntry gives deferred and quarantined disk
+// generations a typed, identity-bound operator surface. DiskName remains only
+// corroborating physical custody; Storage is the generation authority.
+type ComputerStorageRecoveryInventoryEntry struct {
+	Storage         ComputerStorageReference `json:"storage"`
+	DiskName        string                   `json:"disk_name"`
+	Operation       string                   `json:"operation"`
+	Reason          string                   `json:"reason"`
+	DeferredReason  string                   `json:"deferred_reason,omitempty"`
+	Attempts        int                      `json:"attempts"`
+	FirstDeferredAt time.Time                `json:"first_deferred_at,omitempty"`
+}
+
+type ComputerStorageResumeDeferredError struct{ Storage ComputerStorageReference }
+
+func (err *ComputerStorageResumeDeferredError) Error() string {
+	return "Computer Storage recovery is resume_deferred"
+}
+
+type ComputerStorageQuarantinedError struct{ Storage ComputerStorageReference }
+
+func (err *ComputerStorageQuarantinedError) Error() string {
+	return "Computer Storage generation is quarantined"
+}
+
+func recoveryInventoryEntryKey(entry ComputerStorageRecoveryInventoryEntry) string {
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%020d", entry.DiskName, entry.Operation, entry.Reason, entry.FirstDeferredAt.UTC().Format(time.RFC3339Nano), entry.Attempts)
 }
 
 // SweptAttemptAuthority is the immutable removal-validation subset recovered
@@ -1401,17 +1437,19 @@ type SweptAttemptAuthority struct {
 // VerifiedSweepReceipt joins the engine's sweep inventory with an independent
 // empty namespace observation and the exact helper session that performed it.
 type VerifiedSweepReceipt struct {
-	SweepEpoch            string                  `json:"sweep_epoch"`
-	HelperSession         HelperSession           `json:"helper_session"`
-	PriorBootSessionsSeen []SessionIdentity       `json:"prior_boot_sessions_seen"`
-	SweptInventory        ResourceInventory       `json:"swept_inventory"`
-	VerifiedAbsent        bool                    `json:"verified_absent"`
-	VerifiedInventory     ResourceInventory       `json:"verified_inventory"`
-	VerifiedResidue       ResourceInventory       `json:"verified_residue"`
-	VerifiedRetained      ResourceInventory       `json:"verified_retained"`
-	DurableRetentions     []DurableRetention      `json:"durable_retentions"`
-	SweepEvidence         []SweepEvidence         `json:"sweep_evidence"`
-	Attempts              []SweptAttemptAuthority `json:"attempts"`
+	SweepEpoch                      string                  `json:"sweep_epoch"`
+	HelperSession                   HelperSession           `json:"helper_session"`
+	PriorBootSessionsSeen           []SessionIdentity       `json:"prior_boot_sessions_seen"`
+	SweptInventory                  ResourceInventory       `json:"swept_inventory"`
+	VerifiedAbsent                  bool                    `json:"verified_absent"`
+	VerifiedInventory               ResourceInventory       `json:"verified_inventory"`
+	VerifiedResidue                 ResourceInventory       `json:"verified_residue"`
+	VerifiedRetained                ResourceInventory       `json:"verified_retained"`
+	ComputerStorageDeferredCount    int                     `json:"computer_storage_deferred_count"`
+	ComputerStorageQuarantinedCount int                     `json:"computer_storage_quarantined_count"`
+	DurableRetentions               []DurableRetention      `json:"durable_retentions"`
+	SweepEvidence                   []SweepEvidence         `json:"sweep_evidence"`
+	Attempts                        []SweptAttemptAuthority `json:"attempts"`
 }
 
 type DialAttemptPortRequest struct {

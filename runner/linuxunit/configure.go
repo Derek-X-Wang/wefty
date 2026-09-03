@@ -2,6 +2,7 @@ package linuxunit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -37,30 +38,42 @@ func (ExecRunner) Run(ctx context.Context, command string, arguments ...string) 
 	return exec.CommandContext(ctx, command, arguments...).CombinedOutput()
 }
 
+func InspectSystemdVersion(ctx context.Context, runner CommandRunner) (int, error) {
+	if runner == nil {
+		return 0, errors.New("inspect systemd version requires a command runner")
+	}
+	versionOutput, err := runner.Run(ctx, "systemctl", "--version")
+	if err != nil {
+		return 0, fmt.Errorf("inspect systemd version: %w", err)
+	}
+	fields := strings.Fields(string(versionOutput))
+	if len(fields) < 2 || fields[0] != "systemd" {
+		return 0, errors.New("inspect systemd version: unexpected output")
+	}
+	version, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0, fmt.Errorf("inspect systemd version: %w", err)
+	}
+	if version <= 0 {
+		return 0, errors.New("inspect systemd version: invalid version")
+	}
+	return version, nil
+}
+
 func Configure(ctx context.Context, config Config, paths ConfigurePaths, runner CommandRunner) (ConfigureReceipt, error) {
 	if runner == nil || !filepath.IsAbs(paths.UnitDirectory) || !filepath.IsAbs(paths.NodeConfig) || !filepath.IsAbs(paths.ControlSocket) {
 		return ConfigureReceipt{}, fmt.Errorf("Linux OCI setup requires absolute install paths and a command runner")
 	}
-	versionOutput, err := runner.Run(ctx, "systemctl", "--version")
+	var err error
+	config.SystemdVersion, err = InspectSystemdVersion(ctx, runner)
 	if err != nil {
-		return ConfigureReceipt{}, fmt.Errorf("inspect systemd version: %w", err)
-	}
-	fields := strings.Fields(string(versionOutput))
-	if len(fields) < 2 || fields[0] != "systemd" {
-		return ConfigureReceipt{}, fmt.Errorf("inspect systemd version: unexpected output")
-	}
-	config.SystemdVersion, err = strconv.Atoi(fields[1])
-	if err != nil {
-		return ConfigureReceipt{}, fmt.Errorf("inspect systemd version: %w", err)
+		return ConfigureReceipt{}, err
 	}
 	units, err := Render(config)
 	if err != nil {
 		return ConfigureReceipt{}, err
 	}
-	receipt := ConfigureReceipt{SystemdVersion: config.SystemdVersion, RestartPolicy: "legacy_fixed_1s"}
-	if config.SystemdVersion >= 254 {
-		receipt.RestartPolicy = "geometric_capped_1s"
-	}
+	receipt := ConfigureReceipt{SystemdVersion: config.SystemdVersion, RestartPolicy: HelperRestartPolicyName(config.SystemdVersion)}
 	if paths.chown == nil {
 		paths.chown = os.Chown
 	}

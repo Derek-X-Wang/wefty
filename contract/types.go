@@ -734,23 +734,24 @@ const (
 type CapabilityReasonCode string
 
 const (
-	CapabilityReasonOCIIntentDisabled         CapabilityReasonCode = "oci_intent_disabled"
-	CapabilityReasonPrerequisiteMissing       CapabilityReasonCode = "prerequisite_missing"
-	CapabilityReasonRuntimeVersionUnsupported CapabilityReasonCode = "runtime_version_unsupported"
-	CapabilityReasonHelperUnreachable         CapabilityReasonCode = "helper_unreachable"
-	CapabilityReasonHelperUnitUnavailable     CapabilityReasonCode = "helper_unit_unavailable"
-	CapabilityReasonHelperHandshakeStalled    CapabilityReasonCode = "helper_handshake_stalled"
-	CapabilityReasonHelperVersionMismatch     CapabilityReasonCode = "helper_version_mismatch"
-	CapabilityReasonHelperHandshakeFailed     CapabilityReasonCode = "helper_handshake_failed"
-	CapabilityReasonBootSweepFailed           CapabilityReasonCode = "boot_sweep_failed"
-	CapabilityReasonProbeFailed               CapabilityReasonCode = "probe_failed"
-	CapabilityReasonLimaStopped               CapabilityReasonCode = "lima_stopped"
-	CapabilityReasonLimaBroken                CapabilityReasonCode = "lima_broken"
-	CapabilityReasonLimaStartTimeout          CapabilityReasonCode = "lima_start_timeout"
-	CapabilityReasonTemplateRestartRequired   CapabilityReasonCode = "template_restart_required"
-	CapabilityReasonTemplateRecreateRequired  CapabilityReasonCode = "template_recreate_required"
-	CapabilityReasonMountRootUnavailable      CapabilityReasonCode = "mount_root_unavailable"
-	CapabilityReasonLocalPermissionDenied     CapabilityReasonCode = "local_permission_denied"
+	CapabilityReasonOCIIntentDisabled                CapabilityReasonCode = "oci_intent_disabled"
+	CapabilityReasonPrerequisiteMissing              CapabilityReasonCode = "prerequisite_missing"
+	CapabilityReasonRuntimeVersionUnsupported        CapabilityReasonCode = "runtime_version_unsupported"
+	CapabilityReasonHelperUnreachable                CapabilityReasonCode = "helper_unreachable"
+	CapabilityReasonHelperUnitUnavailable            CapabilityReasonCode = "helper_unit_unavailable"
+	CapabilityReasonHelperHandshakeStalled           CapabilityReasonCode = "helper_handshake_stalled"
+	CapabilityReasonHelperHandshakeStalledPersistent CapabilityReasonCode = "helper_handshake_stalled_persistent"
+	CapabilityReasonHelperVersionMismatch            CapabilityReasonCode = "helper_version_mismatch"
+	CapabilityReasonHelperHandshakeFailed            CapabilityReasonCode = "helper_handshake_failed"
+	CapabilityReasonBootSweepFailed                  CapabilityReasonCode = "boot_sweep_failed"
+	CapabilityReasonProbeFailed                      CapabilityReasonCode = "probe_failed"
+	CapabilityReasonLimaStopped                      CapabilityReasonCode = "lima_stopped"
+	CapabilityReasonLimaBroken                       CapabilityReasonCode = "lima_broken"
+	CapabilityReasonLimaStartTimeout                 CapabilityReasonCode = "lima_start_timeout"
+	CapabilityReasonTemplateRestartRequired          CapabilityReasonCode = "template_restart_required"
+	CapabilityReasonTemplateRecreateRequired         CapabilityReasonCode = "template_recreate_required"
+	CapabilityReasonMountRootUnavailable             CapabilityReasonCode = "mount_root_unavailable"
+	CapabilityReasonLocalPermissionDenied            CapabilityReasonCode = "local_permission_denied"
 )
 
 func (code CapabilityReasonCode) Valid() bool {
@@ -761,6 +762,7 @@ func (code CapabilityReasonCode) Valid() bool {
 		CapabilityReasonHelperUnreachable,
 		CapabilityReasonHelperUnitUnavailable,
 		CapabilityReasonHelperHandshakeStalled,
+		CapabilityReasonHelperHandshakeStalledPersistent,
 		CapabilityReasonHelperVersionMismatch,
 		CapabilityReasonHelperHandshakeFailed,
 		CapabilityReasonBootSweepFailed,
@@ -788,6 +790,7 @@ func (code CapabilityReasonCode) ValidOCIRestriction() bool {
 		CapabilityReasonHelperUnreachable,
 		CapabilityReasonHelperUnitUnavailable,
 		CapabilityReasonHelperHandshakeStalled,
+		CapabilityReasonHelperHandshakeStalledPersistent,
 		CapabilityReasonHelperVersionMismatch,
 		CapabilityReasonHelperHandshakeFailed,
 		CapabilityReasonBootSweepFailed,

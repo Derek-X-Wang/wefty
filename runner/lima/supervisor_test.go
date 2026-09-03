@@ -254,7 +254,7 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 	}
 }
 
-func TestSupervisedBarrierNeverForceStopsStalledHandshake(t *testing.T) {
+func TestSupervisedBarrierPersistentStalledHandshakeForceStopsAtRecoveryTimeout(t *testing.T) {
 	intent := newMutableIntent(true)
 	runner := &supervisorRunner{states: []InstanceState{InstanceRunning, InstanceRunning}}
 	supervisor := newTestSupervisor(t, intent, runner)
@@ -278,13 +278,43 @@ func TestSupervisedBarrierNeverForceStopsStalledHandshake(t *testing.T) {
 	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
 	err = barrier.Ensure(t.Context())
 	var stalled *ocihelper.HelperHandshakeStalledError
-	if !errors.As(err, &stalled) || barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperHandshakeStalled {
+	if !errors.As(err, &stalled) || barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperHandshakeStalledPersistent || supervisor.Facts().StalledWindows == 0 {
 		t.Fatalf("stalled handshake err=%v reason=%q", err, barrier.CapabilityReasonCode())
 	}
+	stopped := false
 	for _, command := range runner.commandsSnapshot() {
 		if slices.Contains(command, "stop") {
-			t.Fatalf("stalled handshake force-stopped Lima: %v", command)
+			stopped = true
 		}
+	}
+	if !stopped {
+		t.Fatalf("persistent stalled handshake did not force-stop Lima: %v", runner.commandsSnapshot())
+	}
+}
+
+func TestSupervisedBarrierStalledHandshakeRecoversBeforeRecoveryTimeout(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	ready := false
+	checksum := "sha256:" + strings.Repeat("a", 64)
+	socketPath := startReadyLimaHelper(t, checksum)
+	supervisor.config.wait = func(context.Context, time.Duration) error { ready = true; return nil }
+	client := &ocihelper.Client{Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum, Dial: func(ctx context.Context) (net.Conn, error) {
+		if ready {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		}
+		clientSide, serverSide := net.Pipe()
+		go func() { <-ctx.Done(); _ = serverSide.Close() }()
+		return clientSide, nil
+	}}
+	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{TakeoverTimeout: 20 * time.Millisecond, TakeoverRetry: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+	if err := barrier.Ensure(t.Context()); err != nil || !barrier.Ready() || supervisor.Facts().StalledWindows != 0 {
+		t.Fatalf("stalled recovery err=%v ready=%t facts=%+v", err, barrier.Ready(), supervisor.Facts())
 	}
 }
 

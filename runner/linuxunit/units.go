@@ -58,10 +58,20 @@ type Units struct {
 // HelperRestartPolicy returns the bounded service policy supported by the
 // installed systemd. Debian 12's systemd 252 lacks the geometric directives.
 func HelperRestartPolicy(systemdVersion int) string {
-	if systemdVersion == 0 || systemdVersion >= 254 {
+	if systemdVersion >= 254 {
 		return "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n"
 	}
 	return "RestartSec=1s\n"
+}
+
+func HelperRestartPolicyName(systemdVersion int) string {
+	if systemdVersion == 0 {
+		return "conservative_fixed_1s"
+	}
+	if systemdVersion >= 254 {
+		return "geometric_capped_1s"
+	}
+	return "legacy_fixed_1s"
 }
 
 func Render(config Config) (Units, error) {

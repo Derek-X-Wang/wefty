@@ -71,6 +71,10 @@ func (client *Client) protocolVersion() int {
 }
 
 func (client *Client) OpenSession(ctx context.Context, request AcquireSessionRequest) (*Session, error) {
+	return client.openSession(ctx, request, nil)
+}
+
+func (client *Client) openSession(ctx context.Context, request AcquireSessionRequest, connected *bool) (*Session, error) {
 	if client == nil || client.ExpectedChecksum == "" {
 		return nil, errors.New("OCI helper checksum verification is required")
 	}
@@ -83,6 +87,9 @@ func (client *Client) OpenSession(ctx context.Context, request AcquireSessionReq
 	connection, err := client.Dial(ctx)
 	if err != nil {
 		return nil, &helperDialError{cause: err}
+	}
+	if connected != nil {
+		*connected = true
 	}
 	stopCancellation := context.AfterFunc(ctx, func() { _ = connection.Close() })
 	defer stopCancellation()

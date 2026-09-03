@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/internal/computerconformance"
+	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/linuxunit"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 
@@ -474,7 +475,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 }
 
 func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
-	want := map[string]map[string]string{
+	modernWant := map[string]map[string]string{
 		"Unit": {
 			"StartLimitIntervalSec": "0",
 		},
@@ -490,8 +491,33 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 		"scheduled":     "../.github/workflows/service-acceptance-realtiming-scheduled.yml",
 	} {
 		got := helperServicePolicySections(t, path)
-		if !maps.Equal(got["Unit"], want["Unit"]) || !maps.Equal(got["Service"], want["Service"]) {
-			t.Fatalf("%s helper policy sections = %#v, want %#v", name, got, want)
+		if !maps.Equal(got["Unit"], modernWant["Unit"]) || !maps.Equal(got["Service"], modernWant["Service"]) {
+			t.Fatalf("%s helper policy sections = %#v, want %#v", name, got, modernWant)
+		}
+		assertHelperPolicyMutationRejected(t, name, string(mustReadFile(t, path)))
+	}
+	nativeConfig := linuxunit.Config{AgentPath: "/usr/local/bin/wefty-agent", OperatorUser: "wefty", OperatorGroup: "wefty", OperatorUID: 1000, OperatorGID: 1000,
+		WorkingDirectory: "/var/lib/wefty", ContainerdAddress: "/run/containerd/containerd.sock", ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci"}
+	for _, version := range []int{255, 252} {
+		nativeConfig.SystemdVersion = version
+		units, err := linuxunit.Render(nativeConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		limaUnit := lima.RenderGuestHelperServiceUnit(lima.GuestHelperInstallConfig{HostMountRoot: "/Users/operator/mounts", GuestUID: 1000, SystemdVersion: version})
+		for name, text := range map[string]string{fmt.Sprintf("native-systemd-%d", version): string(units.HelperService), fmt.Sprintf("lima-systemd-%d", version): string(limaUnit)} {
+			got, err := parseHelperServicePolicySections(text)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			wantService := map[string]string{"Restart": "on-failure", "RestartSec": "1s"}
+			if version >= 254 {
+				wantService = modernWant["Service"]
+			}
+			if !maps.Equal(got["Unit"], modernWant["Unit"]) || !maps.Equal(got["Service"], wantService) {
+				t.Fatalf("%s policy=%#v", name, got)
+			}
+			assertHelperPolicyMutationRejected(t, name, text)
 		}
 	}
 	if got := linuxunit.HelperRestartPolicy(255); got != "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n" {
@@ -505,6 +531,27 @@ func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
 	if composed > takeover || linuxunit.HelperSaturatedRestartDelaySum != 7*time.Second {
 		t.Fatalf("saturated helper restart derivation = delays %s + reap %s + margin %s = %s, takeover %s",
 			linuxunit.HelperSaturatedRestartDelaySum, ocihelper.DefaultReapTimeout, linuxunit.HelperRestartTakeoverMargin, composed, takeover)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func assertHelperPolicyMutationRejected(t *testing.T, name, text string) {
+	t.Helper()
+	needle := "RestartSec=250ms"
+	if !strings.Contains(text, needle) {
+		needle = "RestartSec=1s"
+	}
+	mutated := strings.Replace(text, needle, needle+"\nRestartSec=30s", 1)
+	if _, err := parseHelperServicePolicySections(mutated); err == nil {
+		t.Fatalf("%s late policy mutation was accepted", name)
 	}
 }
 

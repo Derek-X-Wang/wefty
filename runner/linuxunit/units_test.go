@@ -10,6 +10,7 @@ func TestRenderLinuxUnitsKeepsAgentUnprivilegedAndHelperNarrow(t *testing.T) {
 		AgentPath: "/usr/local/libexec/wefty-agent", OperatorUser: "wefty", OperatorGroup: "wefty", OperatorUID: 1001, OperatorGID: 1001,
 		WorkingDirectory: "/var/lib/wefty", ContainerdAddress: "/run/containerd/containerd.sock",
 		ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci", RuncExecutable: "/usr/local/sbin/runc",
+		SystemdVersion:    255,
 		AllowedMountRoots: []string{"/srv/wefty"}, AgentArguments: []string{
 			"--node-id=node-linux", "--oci-helper-socket=" + HelperSocketPath,
 			"--oci-intent-file=/var/lib/wefty/oci-intent.json", "--oci-control-socket=/run/wefty-agent/control.sock",
@@ -55,6 +56,12 @@ func TestRenderUsesBoundedLegacySystemdRestartPolicy(t *testing.T) {
 	service := string(units.HelperService)
 	if !strings.Contains(service, "RestartSec=1s") || strings.Contains(service, "RestartSteps=") || strings.Contains(service, "RestartMaxDelaySec=") {
 		t.Fatalf("legacy helper policy = %s", service)
+	}
+}
+
+func TestUnknownSystemdVersionUsesConservativeRestartPolicy(t *testing.T) {
+	if got := HelperRestartPolicy(0); got != "RestartSec=1s\n" || HelperRestartPolicyName(0) != "conservative_fixed_1s" {
+		t.Fatalf("unknown systemd policy = %q name=%q", got, HelperRestartPolicyName(0))
 	}
 }
 

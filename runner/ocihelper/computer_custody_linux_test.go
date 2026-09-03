@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func custodyFileOwner(t *testing.T, path string) (uint32, uint32) {
@@ -382,5 +383,92 @@ func TestStartupPublishesDurableComputerCopyAfterImageRename(t *testing.T) {
 		return item.ID == name && item.Action == SweepActionResumed && item.Method == "computer_storage_copy"
 	}) {
 		t.Fatalf("recovered copy evidence = %+v", evidence)
+	}
+}
+
+func TestStartupCopyDigestHonorsSweepContextAndDefers(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+	request.Destination.ComputerID = "bounded-copy-computer"
+	request.Destination.StorageID = "bounded-copy-storage"
+	request.Authority.JobID = "bounded-copy-job"
+	name, _ := deterministicComputerDiskName(request.Destination)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	published := filepath.Join(diskRoot, "disk.ext4")
+	if err := os.WriteFile(published, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fullyAllocateComputerDisk(published, request.Destination.DiskBytes); err != nil {
+		t.Fatal(err)
+	}
+	manifest := computerStorageCopyManifest{Version: 1, Request: request, Phase: computerStorageCopyManifestWritten,
+		DestinationDigest: "sha256:" + strings.Repeat("a", 64), SourceUnchanged: true}
+	if err := writeComputerStorageCopyManifest(diskRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerRecoveryDigest: func(ctx context.Context, _ string) (string, error) {
+			close(started)
+			<-ctx.Done()
+			return "", ctx.Err()
+		}}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if err := engine.sweepComputerDisks(ctx, "bounded-digest"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	default:
+		t.Fatal("recovery digest was not attempted")
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionResumeDeferred && item.Method == "computer_storage_copy"
+	}) {
+		t.Fatalf("bounded recovery evidence = %+v", engine.computerDiskSweepEvidence)
+	}
+	if _, err := os.Stat(diskRoot); err != nil {
+		t.Fatalf("deferred copy was not retained: %v", err)
+	}
+	inventory := ResourceInventory{}
+	if err := engine.inventoryComputerDiskResources(&inventory); err != nil {
+		t.Fatal(err)
+	}
+	projected, _, err := engine.runtimeAbsenceInventory(inventory, time.Now())
+	if err != nil || !InventoryEmpty(projected) || !slices.ContainsFunc(inventory.ComputerStorageDeferred, func(entry ComputerStorageRecoveryInventoryEntry) bool {
+		return entry.DiskName == name && entry.Operation == "computer_storage_copy"
+	}) {
+		t.Fatalf("published-before-attachment copy retention inventory=%+v residue=%+v err=%v", inventory, projected, err)
+	}
+}
+
+func TestStartupStructuralCopyImageLossQuarantinesImmediately(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+	request.Destination.ComputerID = "missing-copy-computer"
+	request.Destination.StorageID = "missing-copy-storage"
+	request.Authority.JobID = "missing-copy-job"
+	name, _ := deterministicComputerDiskName(request.Destination)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := computerStorageCopyManifest{Version: 1, Request: request, Phase: computerStorageCopyManifestWritten,
+		DestinationDigest: "sha256:" + strings.Repeat("a", 64), SourceUnchanged: true}
+	if err := writeComputerStorageCopyManifest(diskRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+	if err := engine.sweepComputerDisks(t.Context(), "structural-copy"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(engine.computerDiskSweepEvidence, func(item SweepEvidence) bool {
+		return item.ID == name && item.Action == SweepActionQuarantined && item.Method == "image_missing"
+	}) {
+		t.Fatalf("structural copy evidence = %+v", engine.computerDiskSweepEvidence)
 	}
 }

@@ -108,7 +108,7 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 		}
 	}
 	executablePaths := make(map[string]string)
-	for _, executable := range []string{"containerd", "runc", "systemctl", "groupadd", "usermod", "getent", "id"} {
+	for _, executable := range []string{"containerd", "runc", "systemctl", "groupadd", "usermod", "getent", "id", "e2fsck"} {
 		resolvedPath, err := exec.LookPath(executable)
 		if err != nil {
 			return missing(executable)
@@ -158,6 +158,14 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 	}, linuxunit.ConfigurePaths{UnitDirectory: *unitDirectory, NodeConfig: nodeConfig, ControlSocket: controlSocket}, linuxunit.ExecRunner{})
 	if err != nil {
 		return true, err
+	}
+	desired.SystemdVersion = receipt.SystemdVersion
+	desired.HelperRestartPolicy = receipt.RestartPolicy
+	class = ocicontrol.ConvergenceLiveSafe
+	if current, readErr := ocicontrol.ReadSetupState(*setupStatePath); readErr == nil {
+		class = ocicontrol.ClassifyConvergence(current, desired)
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return true, readErr
 	}
 	if err := ocicontrol.WriteSetupState(ocicontrol.DesiredSetupStatePath(*setupStatePath), desired); err != nil {
 		return true, err

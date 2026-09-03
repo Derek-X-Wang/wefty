@@ -292,11 +292,27 @@ Restart=on-failure
 `)
 }
 
+// RenderGuestHelperServiceUnit exposes the installed guest unit to contract
+// drift tests without duplicating its source template.
+func RenderGuestHelperServiceUnit(config GuestHelperInstallConfig) []byte {
+	return renderGuestServiceUnit(config)
+}
+
 func guestHelperRestartPolicy(systemdVersion int) string {
-	if systemdVersion == 0 || systemdVersion >= 254 {
+	if systemdVersion >= 254 {
 		return "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n"
 	}
 	return "RestartSec=1s\n"
+}
+
+func GuestHelperRestartPolicyName(systemdVersion int) string {
+	if systemdVersion == 0 {
+		return "conservative_fixed_1s"
+	}
+	if systemdVersion >= 254 {
+		return "geometric_capped_1s"
+	}
+	return "legacy_fixed_1s"
 }
 
 func systemdQuote(value string) string {

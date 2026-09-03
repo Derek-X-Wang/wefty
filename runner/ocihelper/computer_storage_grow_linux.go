@@ -20,8 +20,9 @@ import (
 const computerStorageGrowIntentName = "storage-grow.json"
 
 type computerStorageGrowIntent struct {
-	Version int                        `json:"version"`
-	Request GrowComputerStorageRequest `json:"request"`
+	Version  int                             `json:"version"`
+	Request  GrowComputerStorageRequest      `json:"request"`
+	Recovery computerStorageRecoveryDeferral `json:"recovery,omitempty"`
 }
 
 func writeComputerStorageGrowIntent(root string, request GrowComputerStorageRequest) error {
@@ -34,6 +35,14 @@ func writeComputerStorageGrowIntent(root string, request GrowComputerStorageRequ
 		return nil
 	}
 	payload, err := json.Marshal(computerStorageGrowIntent{Version: 1, Request: request})
+	if err != nil {
+		return err
+	}
+	return writeDurableFile(root, ".storage-grow.json.tmp-", computerStorageGrowIntentName, payload, 0o600)
+}
+
+func writeComputerStorageGrowIntentRecord(root string, intent computerStorageGrowIntent) error {
+	payload, err := json.Marshal(intent)
 	if err != nil {
 		return err
 	}

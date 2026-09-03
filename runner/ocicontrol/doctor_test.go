@@ -69,11 +69,12 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 		},
 		SetupStatePath: "/var/lib/wefty/setup.json",
 		ReadSetupState: func(string) (SetupState, error) {
-			return SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: "/srv/wefty", ProbeDigest: "sha256:probe"}, nil
+			return SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: "/srv/wefty", ProbeDigest: "sha256:probe", SystemdVersion: 255, HelperRestartPolicy: "geometric_capped_1s"}, nil
 		},
 		ReadDesiredSetupState: func(string) (SetupState, error) {
-			return SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: "/srv/wefty", ProbeDigest: "sha256:probe"}, nil
+			return SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: "/srv/wefty", ProbeDigest: "sha256:probe", SystemdVersion: 255, HelperRestartPolicy: "geometric_capped_1s"}, nil
 		},
+		InstalledSystemdVersion: func(context.Context) (int, error) { return 255, nil },
 	}
 }
 
@@ -103,6 +104,24 @@ func TestDoctorSurfacesComputerTmpfsCeilingPressureAsWarning(t *testing.T) {
 	}
 	if !found || report.Profile.MemoryLimitBytes != 512<<20 || report.Profile.ComputerTmpfsCeilingBytes != 1600<<20 || len(report.Profile.Warnings) != 2 {
 		t.Fatalf("profile warning was not assertion-derived: profile=%+v findings=%+v", report.Profile, report.Findings)
+	}
+}
+
+func TestDoctorSurfacesDurableHelperRestartPolicyDrift(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	config := healthyDoctorConfig(now, "")
+	config.ReadSetupState = func(string) (SetupState, error) {
+		return SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: "/srv/wefty", ProbeDigest: "sha256:probe", SystemdVersion: 252, HelperRestartPolicy: "legacy_fixed_1s"}, nil
+	}
+	config.ReadDesiredSetupState = func(string) (SetupState, error) {
+		return SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: "/srv/wefty", ProbeDigest: "sha256:probe", SystemdVersion: 252, HelperRestartPolicy: "legacy_fixed_1s"}, nil
+	}
+	config.InstalledSystemdVersion = func(context.Context) (int, error) { return 255, nil }
+	report := BuildDoctor(t.Context(), config)
+	if !slices.ContainsFunc(report.Findings, func(item DiagnosticFinding) bool {
+		return item.Check == "helper-restart-policy" && item.Code == "oci_helper_restart_policy_drift" && item.Outcome == DiagnosticFailed
+	}) {
+		t.Fatalf("policy drift findings=%+v", report.Findings)
 	}
 }
 
@@ -225,6 +244,9 @@ func TestDoctorGoldenParityCoversEveryReasonAndL1MetadataTuple(t *testing.T) {
 		}},
 		{contract.CapabilityReasonHelperHandshakeStalled, passThrough, func(config *DoctorConfig) {
 			setProbeReason(config, contract.CapabilityReasonHelperHandshakeStalled)
+		}},
+		{contract.CapabilityReasonHelperHandshakeStalledPersistent, passThrough, func(config *DoctorConfig) {
+			setProbeReason(config, contract.CapabilityReasonHelperHandshakeStalledPersistent)
 		}},
 		{contract.CapabilityReasonHelperVersionMismatch, direct, func(config *DoctorConfig) {
 			mutateHelper(config, func(snapshot *HelperDoctorSnapshot) { snapshot.ProtocolVersion++ })
@@ -436,9 +458,14 @@ func TestDoctorAdversarialRowsFailClosedWithoutMutation(t *testing.T) {
 	t.Run("desired convergence unavailable", func(t *testing.T) {
 		config := healthyDoctorConfig(now, "")
 		config.ReadDesiredSetupState = func(string) (SetupState, error) { return SetupState{}, os.ErrNotExist }
-		item := find(t, BuildDoctor(t.Context(), config), "convergence")
+		report := BuildDoctor(t.Context(), config)
+		item := find(t, report, "convergence")
 		if item.Outcome != DiagnosticNotRun || item.ReasonCode != "" || item.NotRunCause != NotRunDesiredUnavailable {
 			t.Fatalf("missing desired setup = %+v", item)
+		}
+		policy := find(t, report, "helper-restart-policy")
+		if policy.Outcome != DiagnosticNotRun || policy.Code != "oci_helper_restart_policy_not_read" || policy.NotRunCause != NotRunDesiredUnavailable {
+			t.Fatalf("missing desired policy = %+v", policy)
 		}
 	})
 }
@@ -451,7 +478,7 @@ func TestDoctorNotRunIsFirstClassAndNeverTurnsIntoOK(t *testing.T) {
 	if err := report.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	for _, check := range []string{"intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake", "boot-sweep", "runtime-platform", "runtime-versions", "cache", "mount-roots", "convergence"} {
+	for _, check := range []string{"intent", "capability-revision", "capability-observation", "probe", "lima", "helper-handshake", "boot-sweep", "computer-storage-recovery", "runtime-platform", "runtime-versions", "cache", "mount-roots", "convergence", "helper-restart-policy"} {
 		found := false
 		for _, item := range report.Findings {
 			if item.Check == check {
@@ -464,6 +491,9 @@ func TestDoctorNotRunIsFirstClassAndNeverTurnsIntoOK(t *testing.T) {
 		if !found {
 			t.Fatalf("unexecuted check %s missing", check)
 		}
+	}
+	if report.ComputerStorageRecovery.Outcome != DiagnosticNotRun {
+		t.Fatalf("unread recovery facts = %+v", report.ComputerStorageRecovery)
 	}
 }
 
