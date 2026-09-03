@@ -353,6 +353,9 @@ func TestStartupPublishesDurableComputerCopyAfterImageRename(t *testing.T) {
 		t.Fatal(err)
 	}
 	published := filepath.Join(diskRoot, "disk.ext4")
+	if err := os.WriteFile(published, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := fullyAllocateComputerDisk(published, request.Destination.DiskBytes); err != nil {
 		t.Fatal(err)
 	}
