@@ -370,7 +370,7 @@ func TestLogSpoolPersistsFinalizedCompletionAcrossRestart(t *testing.T) {
 	if len(attempts) != 1 || attempts[0].attemptID != claim.Lease.AttemptID {
 		t.Fatalf("completion recovery attempts = %#v", attempts)
 	}
-	if err := spool.completionDelivered(context.Background(), claim.Lease.AttemptID); err != nil {
+	if err := spool.completionDelivered(context.Background(), claim.Lease.AttemptID, 0); err != nil {
 		t.Fatal(err)
 	}
 	var count int
@@ -422,7 +422,7 @@ func TestLogSpoolDeletesDeliveredAttemptWhenLastEventDrains(t *testing.T) {
 	if err := spool.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := spool.completionDelivered(t.Context(), claim.Lease.AttemptID); err != nil {
+	if err := spool.completionDelivered(t.Context(), claim.Lease.AttemptID, 0); err != nil {
 		t.Fatal(err)
 	}
 	var rows int
@@ -458,7 +458,7 @@ func TestLogSpoolInspectionDistinguishesSuppressedAndNeverPersistedCompletion(t 
 	if before.State != "never_persisted" {
 		t.Fatalf("pre-completion inspection = %+v", before)
 	}
-	if err := spool.suppressCompletion(context.Background(), claim.Lease.AttemptID); err != nil {
+	if err := spool.recordCompletionDisposition(context.Background(), claim.Lease.AttemptID, "suppressed", "service_intent_stop", 2); err != nil {
 		t.Fatal(err)
 	}
 	after := spool.inspectCompletion(context.Background(), claim.Lease.AttemptID)

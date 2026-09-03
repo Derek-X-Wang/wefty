@@ -25,11 +25,20 @@ type controlTestRuntime struct {
 	mu         sync.Mutex
 	recovered  int
 	stopped    int
+	fenced     bool
 	stopErr    error
 	live       bool
 }
 
 func (runtime *controlTestRuntime) OCIRuntimeLive() bool { return runtime.live }
+
+func (runtime *controlTestRuntime) FenceOCIIntentStop(revision uint64) func() {
+	intent, err := (lima.FileIntentSource{Path: runtime.intentPath}).ReadIntent(context.Background())
+	if err == nil && !intent.Enabled && intent.Revision == revision {
+		runtime.fenced = true
+	}
+	return func() {}
+}
 
 func (runtime *controlTestRuntime) RecoverOCIRuntimeCapabilities(context.Context) error {
 	runtime.mu.Lock()
@@ -48,6 +57,9 @@ func (runtime *controlTestRuntime) StopOCIRuntime(context.Context) error {
 	intent, err := (lima.FileIntentSource{Path: runtime.intentPath}).ReadIntent(context.Background())
 	if err != nil || intent.Enabled {
 		return errors.New("runtime stop preceded durable disable")
+	}
+	if !runtime.fenced {
+		return errors.New("runtime stop preceded completion fence")
 	}
 	runtime.stopped++
 	return runtime.stopErr

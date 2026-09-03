@@ -71,7 +71,7 @@ type attemptLifecycleDependencies struct {
 	prepareServiceEndpoint     func(context.Context) (serviceRuntimeEndpoint, error)
 	prepareAuthorityLoss       func(context.Context, string) error
 	allowsStart                func(contract.JobSpec) bool
-	ociIntentEnabled           func(context.Context) (bool, error)
+	ociIntentGate              *ociIntentCompletionGate
 	currentOCIGeneration       func() (workloadrunner.RuntimeGeneration, bool)
 	embargoOCIRuntime          func(workloadrunner.RuntimeGeneration)
 	recoverOCIRuntime          func(context.Context, workloadrunner.RuntimeGeneration) error
@@ -271,20 +271,6 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		)
 		return outcome.durabilityErr
 	}
-	withholdOCIIntentCompletion := func() bool {
-		if claim.Job.Spec.Kind != contract.JobKindOCI || claim.Job.Spec.Class != contract.JobClassService {
-			return false
-		}
-		if errors.Is(context.Cause(attemptContext), errOCIIntentDisabled) {
-			return true
-		}
-		if lifecycle.dependencies.ociIntentEnabled == nil {
-			return false
-		}
-		enabled, err := lifecycle.dependencies.ociIntentEnabled(context.WithoutCancel(attemptContext))
-		return err != nil || !enabled
-	}
-
 	var outcome runOutcome
 	select {
 	case <-ctx.Done():
@@ -305,14 +291,6 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 		outcome := <-completed
 		<-renewalDone
-		if withholdOCIIntentCompletion() {
-			// The stop command has already joined the runtime reap. Do not race
-			// that node-local intent with either a durable or live L1 completion:
-			// the lease must expire back to the retained service binding without
-			// consuming restart budget. One-shots still publish their genuine
-			// terminal result and finish any handoff or volume finalization.
-			return errorDestinationUnclassified, nil
-		}
 		result := agentTerminatedResult(outcome.result)
 		outcome.result = result
 		if err := persistCompletion(&outcome); err != nil {
@@ -331,6 +309,9 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 		defer cancelFinalization()
 		failure := lifecycle.completeWithRetry(finalizationContext, claim, request)
+		if errors.Is(failure.err, errOCIIntentDisabled) {
+			return errorDestinationUnclassified, nil
+		}
 		if failure.err != nil && protocolErrorCode(failure.err) != contract.ErrorLeaseExpired {
 			reconcileCompletion = true
 			return failure.destination, fmt.Errorf("agent: shutdown completion: %w", failure.err)
@@ -357,6 +338,9 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 			defer cancelFinalization()
 			completionFailure := lifecycle.completeWithRetry(finalizationContext, claim, request)
+			if errors.Is(completionFailure.err, errOCIIntentDisabled) {
+				return errorDestinationUnclassified, nil
+			}
 			if completionFailure.err != nil {
 				reconcileCompletion = true
 				return completionFailure.destination, fmt.Errorf("agent: directive completion: %w", completionFailure.err)
@@ -392,27 +376,8 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	case outcome = <-completed:
 		cancelExecution()
 	}
-	if withholdOCIIntentCompletion() {
-		// This is the ordering where terminal outcome won the select while the
-		// service-stop cancellation was already observable. Withhold the spool
-		// record as well as the live completion so restart replay cannot consume
-		// the retained binding's lease or restart budget.
-		cancelAttempt(errOCIIntentDisabled)
-		<-renewalDone
-		return errorDestinationUnclassified, nil
-	}
 	if err := persistCompletion(&outcome); err != nil {
 		return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
-	}
-	if withholdOCIIntentCompletion() {
-		if lifecycle.dependencies.outbox != nil {
-			if err := lifecycle.dependencies.outbox.suppressCompletion(context.WithoutCancel(attemptContext), attemptID); err != nil {
-				return errorDestinationUnclassified, err
-			}
-		}
-		cancelAttempt(errOCIIntentDisabled)
-		<-renewalDone
-		return errorDestinationUnclassified, nil
 	}
 	var routed *routedDestinationError
 	if errors.As(outcome.err, &routed) && routed.destination != errorDestinationUnclassified {
@@ -480,6 +445,9 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		return errorDestinationUnclassified, ctx.Err()
 	}
 	<-renewalDone
+	if errors.Is(completionFailure.err, errOCIIntentDisabled) {
+		return errorDestinationUnclassified, nil
+	}
 	if cause := context.Cause(attemptContext); errors.Is(cause, errAuthorityDeadlineExceeded) {
 		reconcileCompletion = true
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
@@ -522,7 +490,39 @@ func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, c
 
 func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) destinationError {
 	for {
-		if _, err := lifecycle.dependencies.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request); err != nil {
+		var observation OCIIntentObservation
+		var releaseIntent func()
+		if claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassService {
+			var intentErr error
+			if lifecycle.dependencies.ociIntentGate == nil {
+				intentErr = &OCIIntentAuthorityUnavailableError{}
+			} else {
+				observation, releaseIntent, intentErr = lifecycle.dependencies.ociIntentGate.beginCompletion(context.WithoutCancel(ctx))
+			}
+			if intentErr != nil {
+				lifecycle.log("attempt %s withheld completion: %v", claim.Lease.AttemptID, intentErr)
+				if lifecycle.dependencies.outbox != nil {
+					if receiptErr := lifecycle.dependencies.outbox.withholdCompletion(context.WithoutCancel(ctx), claim.Lease.AttemptID, "intent_authority_unavailable", 0); receiptErr != nil {
+						intentErr = errors.Join(intentErr, receiptErr)
+					}
+				}
+				return destinationError{destination: errorDestinationUnclassified, err: intentErr}
+			}
+			if !lifecycle.dependencies.ociIntentGate.allows(observation) {
+				releaseIntent()
+				if lifecycle.dependencies.outbox != nil {
+					if err := lifecycle.dependencies.outbox.suppressCompletion(context.WithoutCancel(ctx), claim.Lease.AttemptID, observation.Revision); err != nil {
+						return destinationError{destination: errorDestinationUnclassified, err: err}
+					}
+				}
+				return destinationError{destination: errorDestinationUnclassified, err: errOCIIntentDisabled}
+			}
+		}
+		_, err := lifecycle.dependencies.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request)
+		if releaseIntent != nil {
+			releaseIntent()
+		}
+		if err != nil {
 			var ownProtocolResponse *ProtocolError
 			cause := context.Cause(ctx)
 			hasOwnProtocolResponse := errors.As(err, &ownProtocolResponse) && (cause == nil || !errors.Is(err, cause))
@@ -534,7 +534,7 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 			}
 			if protocolErrorCode(err) == contract.ErrorLeaseExpired {
 				if lifecycle.dependencies.outbox != nil {
-					if releaseErr := lifecycle.dependencies.outbox.completionDelivered(context.WithoutCancel(ctx), claim.Lease.AttemptID); releaseErr != nil {
+					if releaseErr := lifecycle.dependencies.outbox.completionDelivered(context.WithoutCancel(ctx), claim.Lease.AttemptID, observation.Revision); releaseErr != nil {
 						return destinationError{destination: errorDestinationUnclassified, err: releaseErr}
 					}
 				}
@@ -562,7 +562,7 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 			continue
 		}
 		if lifecycle.dependencies.outbox != nil {
-			if err := lifecycle.dependencies.outbox.completionDelivered(context.WithoutCancel(ctx), claim.Lease.AttemptID); err != nil {
+			if err := lifecycle.dependencies.outbox.completionDelivered(context.WithoutCancel(ctx), claim.Lease.AttemptID, observation.Revision); err != nil {
 				return destinationError{destination: errorDestinationUnclassified, err: err}
 			}
 		}

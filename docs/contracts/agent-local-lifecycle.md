@@ -243,12 +243,25 @@ reacquires the helper, completes the boot barrier and probe, and only then
 publishes the positive Capability revision.
 
 The durable marker also fences terminal evidence for a resident OCI service.
-After disable is durable, neither the live completion path nor process-lifetime
-outbox recovery may publish that attempt's payload result to L1; an unavailable
-or malformed marker fails closed in the same way. Any already-spooled payload
-completion is recorded locally as suppressed, while L1's lease clock remains
-the sole authority that can classify the attempt `lost` without a result. This
-fence does not suppress OCI one-shot completion or any process-kind workload.
+The live completion path and process-lifetime outbox take the shared read side
+from their final marker observation through one L1 response; after persisting
+disable, the controller publishes that revision to the gate, takes the write
+side, and only then stops the runtime. An enabled completion that linearized
+before the stop may land; every later completion observes the disabled revision
+and is suppressed. The receipt retains the observed intent revision.
+
+Only an authoritative `enabled=false` suppresses a payload. An unavailable or
+malformed marker withholds publication, records
+`intent_authority_unavailable`, keeps the serialized exit evidence intact, and
+retries with outbox backoff; a nil marker reader is the same typed fail-closed
+case. Suppression likewise retains the payload as typed late evidence and
+records `service_intent_stop`, but excludes it from replay. The agent is
+obligated not to publish the intent-stopped result and to let lease expiry
+produce the ordinary `lost`/no-result outcome; L1 has other explicit lost paths
+and is not claimed to enforce this node-local marker itself. This fence does not
+suppress OCI one-shot completion or any process-kind workload. An
+unclassifiable legacy service spool row is withheld rather than allowed to
+bypass the fence.
 
 Linux privileged `setup-oci` renders and writes one unprivileged `wefty-agent.service` with
 `SupplementaryGroups=wefty-oci` and one root socket-activated helper pair. The

@@ -16,6 +16,7 @@ import (
 type AgentRuntime interface {
 	RecoverOCIRuntimeCapabilities(context.Context) error
 	StopOCIRuntime(context.Context) error
+	FenceOCIIntentStop(uint64) func()
 	OCIRuntimeLive() bool
 }
 
@@ -128,6 +129,8 @@ func (controller *Controller) Stop(ctx context.Context, request IntentMutationRe
 	if controller.config.Runtime == nil {
 		return IntentResponse{Intent: intent}, runtimeUnavailable("OCI runtime is unavailable", nil)
 	}
+	releaseFence := controller.config.Runtime.FenceOCIIntentStop(intent.Revision)
+	releaseFence()
 	quiesce := controller.config.Runtime.StopOCIRuntime
 	if controller.config.StopCycle != nil {
 		err = controller.config.StopCycle.Stop(ctx, quiesce)

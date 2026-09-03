@@ -26,6 +26,83 @@ func TestAttemptPersistsCompletionBeforeDelivery(t *testing.T) {
 	assertAttemptPersistsCompletionBeforeDelivery(t)
 }
 
+func TestOCIServiceCompletionAuthorityUnavailableRetainsEvidence(t *testing.T) {
+	var completionCalls int
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/complete") {
+			http.NotFound(w, request)
+			return
+		}
+		completionCalls++
+		_ = json.NewEncoder(w).Encode(l1.Job{})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+
+	newPending := func(t *testing.T, attemptID string) (*evidenceOutbox, l1.Claim, logSpoolAttempt) {
+		t.Helper()
+		outbox, err := newEvidenceOutbox(t.TempDir(), "intent-authority-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim := l1.Claim{Job: l1.Job{JobID: "intent-authority-job-" + attemptID, Spec: contract.JobSpec{
+			Kind: contract.JobKindOCI, Class: contract.JobClassService,
+		}}, Lease: l1.AttemptLease{AttemptID: attemptID, FencingToken: "fence-" + attemptID}}
+		if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+			t.Fatal(err)
+		}
+		exitCode := 7
+		if err := outbox.storeCompletion(t.Context(), attemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now(), l1.RuntimeQuiescenceAttempt); err != nil {
+			t.Fatal(err)
+		}
+		return outbox, claim, logSpoolAttempt{jobID: claim.Job.JobID, attemptID: attemptID, fencingToken: claim.Lease.FencingToken, class: contract.JobClassService, kind: contract.JobKindOCI}
+	}
+
+	t.Run("transient read error retries intact payload", func(t *testing.T) {
+		outbox, _, attempt := newPending(t, "transient")
+		defer outbox.Close()
+		reads := 0
+		outbox.ociIntentGate = &ociIntentCompletionGate{observe: func(context.Context) (OCIIntentObservation, error) {
+			reads++
+			if reads == 1 {
+				return OCIIntentObservation{}, errors.New("transient EIO")
+			}
+			return OCIIntentObservation{Enabled: true, Revision: 9}, nil
+		}}
+		err := outbox.recoverCompletion(t.Context(), client, attempt)
+		var unavailable *OCIIntentAuthorityUnavailableError
+		if !errors.As(err, &unavailable) || completionCalls != 0 {
+			t.Fatalf("first recovery err=%v calls=%d", err, completionCalls)
+		}
+		receipt := outbox.spool.inspectCompletion(t.Context(), attempt.attemptID)
+		if receipt.State != "withheld" || receipt.Reason != "intent_authority_unavailable" || receipt.Result.ExitCode == nil || *receipt.Result.ExitCode != 7 {
+			t.Fatalf("withheld completion receipt=%+v", receipt)
+		}
+		if err := outbox.recoverCompletion(t.Context(), client, attempt); err != nil {
+			t.Fatal(err)
+		}
+		receipt = outbox.spool.inspectCompletion(t.Context(), attempt.attemptID)
+		if receipt.State != "delivered" || receipt.IntentRevision != 9 || completionCalls != 1 {
+			t.Fatalf("retried completion receipt=%+v calls=%d", receipt, completionCalls)
+		}
+	})
+
+	t.Run("nil authority is typed and withheld", func(t *testing.T) {
+		outbox, _, attempt := newPending(t, "nil")
+		defer outbox.Close()
+		err := outbox.recoverCompletion(t.Context(), client, attempt)
+		var unavailable *OCIIntentAuthorityUnavailableError
+		if !errors.As(err, &unavailable) {
+			t.Fatalf("nil authority err=%T %v", err, err)
+		}
+		receipt := outbox.spool.inspectCompletion(t.Context(), attempt.attemptID)
+		if receipt.State != "withheld" || receipt.Result.ExitCode == nil || *receipt.Result.ExitCode != 7 {
+			t.Fatalf("nil-authority receipt=%+v", receipt)
+		}
+	})
+}
+
 func TestBoundedFinalizationDeadlineThroughDurableLogSinkPreservesPayload(t *testing.T) {
 	uploadStarted := make(chan struct{}, 1)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {

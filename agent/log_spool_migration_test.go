@@ -101,3 +101,66 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, removal.jobID, removal.generation, remova
 		t.Fatalf("migrated runtime removal = %+v found=%t err=%v", record, found, err)
 	}
 }
+
+func TestLogSpoolMigratesLegacyAttemptKind(t *testing.T) {
+	tests := []struct {
+		name, class, evidence, want string
+	}{
+		{name: "manifest derived OCI", class: contract.JobClassService, evidence: "manifest", want: contract.JobKindOCI},
+		{name: "pin derived OCI", class: contract.JobClassService, evidence: "pin", want: contract.JobKindOCI},
+		{name: "plain process", class: contract.JobClassOneShot, want: contract.JobKindProcess},
+		{name: "unclassifiable service fails closed", class: contract.JobClassService, want: "unclassified"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			nodeID := "attempt-kind-node"
+			db, err := sql.Open("sqlite", filepath.Join(directory, spoolFileName(nodeID)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			const oldSchema = `
+CREATE TABLE spool_attempts (
+  attempt_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, fencing_token TEXT NOT NULL,
+  class TEXT NOT NULL, created_ns INTEGER NOT NULL, result_json BLOB, finished_ns INTEGER, incomplete_json BLOB
+);
+CREATE TABLE runtime_attempt_manifests (
+  attempt_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, runtime_kind TEXT NOT NULL,
+  removal_generation TEXT NOT NULL, manifest_json BLOB NOT NULL, created_ns INTEGER NOT NULL
+);
+CREATE TABLE oci_binding_pins (
+  job_id TEXT PRIMARY KEY, reference TEXT NOT NULL, digest TEXT NOT NULL,
+  platform_os TEXT NOT NULL, platform_architecture TEXT NOT NULL, platform_variant TEXT NOT NULL,
+  snapshotter TEXT NOT NULL, updated_ns INTEGER NOT NULL
+);`
+			if _, err := db.Exec(oldSchema); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`INSERT INTO spool_attempts(attempt_id, job_id, fencing_token, class, created_ns)
+VALUES('attempt', 'job', 'fence', ?, 1)`, test.class); err != nil {
+				t.Fatal(err)
+			}
+			switch test.evidence {
+			case "manifest":
+				_, err = db.Exec(`INSERT INTO runtime_attempt_manifests VALUES('attempt','job',?,'1','{}',1)`, contract.JobKindOCI)
+			case "pin":
+				_, err = db.Exec(`INSERT INTO oci_binding_pins VALUES('job','ref','sha256:digest','linux','amd64','','overlayfs',1)`)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			spool, err := openLogSpool(directory, nodeID, 1024)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer spool.Close()
+			var got string
+			if err := spool.db.QueryRowContext(t.Context(), `SELECT kind FROM spool_attempts WHERE attempt_id='attempt'`).Scan(&got); err != nil || got != test.want {
+				t.Fatalf("migrated kind=%q want=%q err=%v", got, test.want, err)
+			}
+		})
+	}
+}

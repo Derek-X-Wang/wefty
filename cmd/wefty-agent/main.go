@@ -466,7 +466,7 @@ func run() error {
 	var bootBarrier *ocihelper.BootBarrier
 	var agentBootBarrier agent.OCIBootBarrier
 	var capabilityProbe agent.CapabilityProbe
-	var ociIntentEnabled func(context.Context) (bool, error)
+	var ociIntent func(context.Context) (agent.OCIIntentObservation, error)
 	var deadman agent.AttemptDeadmanRenewer
 	var ociBridgeBinder workloadrunner.WorkflowBridgeBinder
 	var limaSupervisor *limarunner.Supervisor
@@ -529,7 +529,7 @@ func run() error {
 			intent: limarunner.FileIntentSource{Path: *ociIntentFile},
 		}
 		capabilityProbe = probe
-		ociIntentEnabled = probe.intentEnabled
+		ociIntent = probe.intentObservation
 		deadman = ociAttemptDeadman{barrier: bootBarrier, nodeID: *nodeID, bootSessionID: bootSessionID}
 	}
 	nodeAgent, err := agent.New(agent.Config{
@@ -541,7 +541,7 @@ func run() error {
 		Version:                 version,
 		Capabilities:            capabilities,
 		CapabilityProbe:         capabilityProbe,
-		OCIIntentEnabled:        ociIntentEnabled,
+		OCIIntent:               ociIntent,
 		OCIBootBarrier:          agentBootBarrier,
 		WorkloadRuntimes:        runtimes,
 		AttemptDeadman:          deadman,
@@ -884,6 +884,14 @@ func (probe ociCapabilityProbe) intentEnabled(ctx context.Context) (bool, error)
 	}
 	intent, err := probe.intent.ReadIntent(ctx)
 	return err == nil && intent.Version == limarunner.OCIIntentVersion && intent.Revision > 0 && intent.Enabled, err
+}
+
+func (probe ociCapabilityProbe) intentObservation(ctx context.Context) (agent.OCIIntentObservation, error) {
+	if probe.intent == nil {
+		return agent.OCIIntentObservation{}, nil
+	}
+	intent, err := probe.intent.ReadIntent(ctx)
+	return agent.OCIIntentObservation{Enabled: intent.Enabled, Revision: intent.Revision}, err
 }
 
 type ociAttemptDeadman struct {

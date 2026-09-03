@@ -21,12 +21,12 @@ const (
 // Sessions borrow it; ending or replacing a session must not discard evidence
 // that still needs delivery.
 type evidenceOutbox struct {
-	spool            *logSpool
-	clock            Clock
-	batchSize        int
-	flushInterval    time.Duration
-	retryInterval    time.Duration
-	ociIntentEnabled func(context.Context) (bool, error)
+	spool         *logSpool
+	clock         Clock
+	batchSize     int
+	flushInterval time.Duration
+	retryInterval time.Duration
+	ociIntentGate *ociIntentCompletionGate
 	// completionStored is a test seam for ordering cancellation against the
 	// durable commit edge. Production construction leaves it nil.
 	completionStored func()
@@ -73,12 +73,20 @@ func (outbox *evidenceOutbox) storeCompletion(ctx context.Context, attemptID str
 	return nil
 }
 
-func (outbox *evidenceOutbox) completionDelivered(ctx context.Context, attemptID string) error {
-	return outbox.spool.completionDelivered(ctx, attemptID)
+func (outbox *evidenceOutbox) completionDelivered(ctx context.Context, attemptID string, revision ...uint64) error {
+	var observed uint64
+	if len(revision) > 0 {
+		observed = revision[0]
+	}
+	return outbox.spool.completionDelivered(ctx, attemptID, observed)
 }
 
-func (outbox *evidenceOutbox) suppressCompletion(ctx context.Context, attemptID string) error {
-	return outbox.spool.suppressCompletion(ctx, attemptID)
+func (outbox *evidenceOutbox) suppressCompletion(ctx context.Context, attemptID string, revision uint64) error {
+	return outbox.spool.recordCompletionDisposition(ctx, attemptID, "suppressed", "service_intent_stop", revision)
+}
+
+func (outbox *evidenceOutbox) withholdCompletion(ctx context.Context, attemptID, reason string, revision uint64) error {
+	return outbox.spool.recordCompletionDisposition(ctx, attemptID, "withheld", reason, revision)
 }
 
 func (outbox *evidenceOutbox) beginRemoval(ctx context.Context, removal localRemoval) error {
@@ -383,10 +391,24 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 	if err != nil || !present {
 		return err
 	}
-	if attempt.kind == contract.JobKindOCI && attempt.class == contract.JobClassService && outbox.ociIntentEnabled != nil {
-		enabled, intentErr := outbox.ociIntentEnabled(ctx)
-		if intentErr != nil || !enabled {
-			return outbox.suppressCompletion(context.WithoutCancel(ctx), attempt.attemptID)
+	var observation OCIIntentObservation
+	var releaseIntent func()
+	if attempt.class == contract.JobClassService && attempt.kind != contract.JobKindProcess {
+		var intentErr error
+		if outbox.ociIntentGate == nil {
+			intentErr = &OCIIntentAuthorityUnavailableError{}
+		} else {
+			observation, releaseIntent, intentErr = outbox.ociIntentGate.beginCompletion(ctx)
+		}
+		if intentErr != nil {
+			if receiptErr := outbox.withholdCompletion(context.WithoutCancel(ctx), attempt.attemptID, "intent_authority_unavailable", 0); receiptErr != nil {
+				return errors.Join(intentErr, receiptErr)
+			}
+			return intentErr
+		}
+		if !outbox.ociIntentGate.allows(observation) {
+			releaseIntent()
+			return outbox.suppressCompletion(context.WithoutCancel(ctx), attempt.attemptID, observation.Revision)
 		}
 	}
 	request := l1.CompletionRequest{
@@ -394,8 +416,11 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 		Result: result, RuntimeQuiescenceEvidence: evidence,
 	}
 	_, err = client.Complete(ctx, attempt.jobID, attempt.attemptID, request)
+	if releaseIntent != nil {
+		releaseIntent()
+	}
 	if err == nil || protocolErrorCode(err) == contract.ErrorLeaseExpired {
-		return outbox.spool.completionDelivered(ctx, attempt.attemptID)
+		return outbox.spool.completionDelivered(ctx, attempt.attemptID, observation.Revision)
 	}
 	code := protocolErrorCode(err)
 	if permanentEvidenceRejection(code) {
