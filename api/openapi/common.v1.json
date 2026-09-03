@@ -949,7 +949,7 @@
           "output_error": {
             "type": "string",
             "minLength": 1,
-            "description": "Output redaction, durable spooling, or upload finalization failed; the process exit code is not authoritative success."
+            "description": "Output redaction, durable spooling, or upload finalization failed for a reason other than the bounded log-finalization deadline; the process exit code is not authoritative success."
           },
           "exit_code": { "type": "integer" },
           "signal": { "type": "string", "minLength": 1 },
@@ -967,7 +967,7 @@
           },
           "log_evidence_incomplete": {
             "type": "boolean",
-            "description": "Additive evidence that a helper log segment was lost, corrupt, or truncated. The real terminal arm remains authoritative."
+            "description": "Additive evidence alongside one valid primary arm that a helper log segment was lost, corrupt, or truncated, or that the bounded agent log-finalization deadline expired after a payload result. It is not attached to a pre-Started OCI spawn_error."
           }
         },
         "dependentRequired": {

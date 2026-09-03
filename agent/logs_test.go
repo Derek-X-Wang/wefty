@@ -115,3 +115,20 @@ func TestBatchingLogSinkRetriesTheIdenticalBatch(t *testing.T) {
 		t.Fatalf("uploaded event count = %d, want one three-event batch", len(uploaded.Events))
 	}
 }
+
+func TestExpiredFinalizationWithNoPendingLogsIsCompleteEvidence(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "no-pending-node", 1<<20)
+	defer spool.Close()
+	sink, err := newBatchingLogSink(
+		t.Context(), nil, spoolTestClaim("no-pending-attempt"), spool,
+		systemClock{}, 8, time.Hour, time.Millisecond,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := sink.CloseContext(ctx); err != nil {
+		t.Fatalf("empty sink close after finalization expiry = %v, want complete evidence", err)
+	}
+}

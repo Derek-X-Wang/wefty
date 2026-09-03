@@ -240,6 +240,40 @@ func TestRunWorkloadReportsOutputFinalizationFailureInsteadOfExitZero(t *testing
 	}
 }
 
+func TestRedactionFlushRetainsTailUntilDurableSinkAcceptsIt(t *testing.T) {
+	sink := &failOnceOutputSink{err: context.DeadlineExceeded}
+	redacting := newRedactingOutputSink(sink, map[string]string{"secret": "tail-secret"})
+	if err := redacting.WriteOutput(t.Context(), contract.LogEvent{
+		AttemptID: "attempt-redaction-retry", Stream: contract.LogStdout, Bytes: []byte("tail-secret"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := redacting.Flush(t.Context()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first flush = %v, want deadline", err)
+	}
+	if err := redacting.Flush(t.Context()); err != nil {
+		t.Fatalf("retry flush = %v", err)
+	}
+	if len(sink.events) != 1 || sink.events[0].Sequence != 0 || string(sink.events[0].Bytes) != "[REDACTED]" {
+		t.Fatalf("retried redacted events = %#v", sink.events)
+	}
+}
+
+type failOnceOutputSink struct {
+	err    error
+	events []contract.LogEvent
+}
+
+func (sink *failOnceOutputSink) WriteOutput(_ context.Context, event contract.LogEvent) error {
+	if sink.err != nil {
+		err := sink.err
+		sink.err = nil
+		return err
+	}
+	sink.events = append(sink.events, event)
+	return nil
+}
+
 func TestToL1ResultPreservesIncompleteOCILogEvidence(t *testing.T) {
 	exitCode := 7
 	result := toL1Result(contract.ProcessResult{ExitCode: &exitCode, DiskExhausted: true, LogEvidenceIncomplete: true})

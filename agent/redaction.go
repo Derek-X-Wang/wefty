@@ -70,11 +70,11 @@ func (s *redactingOutputSink) Flush(ctx context.Context) error {
 		event := stream.template
 		event.Bytes = replaceSecrets(stream.buffer, s.secrets)
 		event.Sequence = stream.next
+		if err := s.sink.WriteOutput(ctx, event); err != nil {
+			return markLogFinalizationDeadline(ctx, logFinalizationStageRedaction, err)
+		}
 		stream.next++
 		stream.buffer = nil
-		if err := s.sink.WriteOutput(ctx, event); err != nil {
-			return err
-		}
 	}
 	return nil
 }

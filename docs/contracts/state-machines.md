@@ -521,12 +521,22 @@ log finalization. Its finalization-related classifier rows are explicit:
 
 | Completion fact | Service treatment | Restart streak |
 | --- | --- | ---: |
-| Genuine `output_error` (corruption, disk, redaction, or uploader failure) | Latch `failed`, even when the payload exit would otherwise be restartable. | unchanged |
+| Bounded log flush/upload deadline expiry after a payload result | Preserve the payload's primary arm, record additive `log_evidence_incomplete`, and classify restartability from the payload. | follows the payload arm |
+| Genuine `output_error` (corruption, disk, redaction, or uploader failure other than that bounded deadline) | Latch `failed`, even when the payload exit would otherwise be restartable. | unchanged |
+| Pre-`Started` OCI `spawn_error` plus an expired log-finalization context | Preserve the sole `spawn_error`; runtime log evidence is not attached to an attempt that never started. | follows pre-start infrastructure policy |
+| Bounded deadline plus a genuine output failure | Keep `output_error` terminal and retain `log_evidence_incomplete` as a concurrent evidence fact. | unchanged |
 | Expected service-spool capacity eviction | Not a termination cause; it never produces `output_error` or reaches the classifier. | n/a |
 
 The finalization timeout begins only after the payload returns; payload uptime
 can never consume that bound. Finalization remains uncancelable by ordinary
 execution cancellation, but authority loss and removal cancel it immediately.
+If its bounded log flush or upload expires, events already accepted by the
+durable spool remain available for later recovery while the completion records
+`log_evidence_incomplete`; a redaction tail that could not reach the spool is
+covered by that same incomplete-evidence fact. The deadline does not replace an
+observed exit or signal with `output_error`. This rule also applies to one-shot
+payload exit: exit zero remains authoritative when the only finalization error
+is expiry of the agent-owned bound.
 
 ## Attempt
 

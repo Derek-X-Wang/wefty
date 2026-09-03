@@ -51,6 +51,7 @@ type attemptLifecycleDependencies struct {
 	client                     *Client
 	runtimes                   workloadRuntimeSet
 	outbox                     *evidenceOutbox
+	logSinkFactory             attemptLogSinkFactory
 	watchdog                   attemptWatchdog
 	clock                      Clock
 	renewalInterval            time.Duration
@@ -79,6 +80,15 @@ type attemptLifecycleDependencies struct {
 	computerControlTokens      *computerControlTokenCodec
 	computerHostBridgeFallback bool
 }
+
+type attemptLogSink interface {
+	processrunner.OutputSink
+	CloseContext(context.Context) error
+}
+
+// attemptLogSinkFactory is a test seam for deterministic finalization faults.
+// Production construction leaves it nil and uses the durable evidence outbox.
+type attemptLogSinkFactory func(context.Context, l1.Claim) (attemptLogSink, error)
 
 // attemptLifecycle owns one attempt from renewal startup through process/log
 // finalization, fenced completion, and handoff finalization. Every dependency
@@ -667,7 +677,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		defer admission.Release()
 	}
 	request = admission.Request
-	var uploader *batchingLogSink
+	var uploader attemptLogSink
 	var redactingSink *redactingOutputSink
 	var managedResources workloadrunner.ManagedResources
 	finish := func(result contract.ProcessResult, runErr error) (contract.ProcessResult, error) {
@@ -737,10 +747,25 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if uploadErr != nil {
 			uploadErr = fmt.Errorf("upload logs: %w", uploadErr)
 		}
+		outputIncomplete, outputStage, outputErr := classifyLogFinalizationError(outputErr)
+		uploadIncomplete, uploadStage, uploadErr := classifyLogFinalizationError(uploadErr)
+		if outputIncomplete {
+			lifecycle.log("agent: %s exceeded the bounded finalization deadline for attempt %s", outputStage, claim.Lease.AttemptID)
+		}
+		if uploadIncomplete {
+			lifecycle.log("agent: %s exceeded the bounded finalization deadline for attempt %s", uploadStage, claim.Lease.AttemptID)
+		}
+		if (outputIncomplete || uploadIncomplete) && (result.ExitCode != nil || result.Signal != "") {
+			// The spool retains unacknowledged events for later recovery. A busy
+			// destination consuming the bounded finalization window is therefore
+			// evidence incompleteness, not a replacement for the payload's
+			// already-observed terminal result.
+			result.LogEvidenceIncomplete = true
+		}
 		finalizationErr := errors.Join(recoveryErr, reapErr, outputErr, uploadErr)
 		if finalizationErr != nil {
 			if result.RuntimeFailure == nil {
-				result = contract.ProcessResult{OutputError: finalizationErr.Error()}
+				result = contract.ProcessResult{OutputError: finalizationErr.Error(), LogEvidenceIncomplete: result.LogEvidenceIncomplete}
 			}
 		}
 		return result, errors.Join(runErr, finalizationErr)
@@ -875,11 +900,21 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 	}
 	var sinks multiOutputSink
-	if lifecycle.dependencies.client != nil && lifecycle.dependencies.outbox != nil {
-		uploader, err = lifecycle.dependencies.outbox.newLogSink(finalization.context, lifecycle.dependencies.client, claim)
+	if lifecycle.dependencies.logSinkFactory != nil {
+		var candidate attemptLogSink
+		candidate, err = lifecycle.dependencies.logSinkFactory(finalization.context, claim)
 		if err != nil {
 			return finish(spawnFailure(contract.SpawnFailureLogSinkSetup, err), err)
 		}
+		uploader = candidate
+		sinks = append(sinks, uploader)
+	} else if lifecycle.dependencies.client != nil && lifecycle.dependencies.outbox != nil {
+		var candidate *batchingLogSink
+		candidate, err = lifecycle.dependencies.outbox.newLogSink(finalization.context, lifecycle.dependencies.client, claim)
+		if err != nil {
+			return finish(spawnFailure(contract.SpawnFailureLogSinkSetup, err), err)
+		}
+		uploader = candidate
 		sinks = append(sinks, uploader)
 	}
 	var localSink processrunner.OutputSink
@@ -969,6 +1004,14 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		result, runErr = runtimeResult.Outcome, err
 	}
 	return finish(result, runErr)
+}
+
+func classifyLogFinalizationError(err error) (bool, logFinalizationStage, error) {
+	var deadline *logFinalizationDeadlineError
+	if errors.As(err, &deadline) {
+		return true, deadline.stage, nil
+	}
+	return false, "", err
 }
 
 // withoutComputerReservedOperatorEnvironment removes every tenant-supplied

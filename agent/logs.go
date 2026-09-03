@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -33,6 +34,7 @@ type batchingLogSink struct {
 	terminalErr   error
 	closeOnce     sync.Once
 	closeErr      error
+	pendingEvents atomic.Int64
 }
 
 type logSinkCloseRequest struct {
@@ -40,8 +42,46 @@ type logSinkCloseRequest struct {
 	response chan error
 }
 
+type logFinalizationStage string
+
+const (
+	logFinalizationStageRedaction logFinalizationStage = "redaction flush"
+	logFinalizationStageUpload    logFinalizationStage = "log upload"
+)
+
+// logFinalizationDeadlineError marks only the agent-owned bounded
+// finalization deadline. An HTTP client's independent operation deadline is
+// deliberately left as a normal output failure.
+type logFinalizationDeadlineError struct {
+	stage logFinalizationStage
+	cause error
+}
+
+func (err *logFinalizationDeadlineError) Error() string {
+	return fmt.Sprintf("%s exceeded the bounded finalization deadline: %v", err.stage, err.cause)
+}
+
+func (err *logFinalizationDeadlineError) Unwrap() error { return err.cause }
+
+func markLogFinalizationDeadline(ctx context.Context, stage logFinalizationStage, err error) error {
+	if err == nil {
+		return nil
+	}
+	// Require the finalization context itself to have expired and the stage to
+	// have returned that exact cause. This intentionally does not match an
+	// arbitrary wrapped/joined DeadlineExceeded from a destination.
+	if cause := context.Cause(ctx); cause == context.DeadlineExceeded && err == cause {
+		return &logFinalizationDeadlineError{stage: stage, cause: cause}
+	}
+	return err
+}
+
 func newBatchingLogSink(ctx context.Context, client *Client, claim l1.Claim, spool *logSpool, clock Clock, batchSize int, flushInterval, retryInterval time.Duration) (*batchingLogSink, error) {
 	if err := spool.ensureAttempt(ctx, claim); err != nil {
+		return nil, err
+	}
+	pending, err := spool.pendingCount(ctx, claim.Lease.AttemptID)
+	if err != nil {
 		return nil, err
 	}
 	sink := &batchingLogSink{
@@ -51,6 +91,7 @@ func newBatchingLogSink(ctx context.Context, client *Client, claim l1.Claim, spo
 		closeRequests: make(chan logSinkCloseRequest),
 		done:          make(chan struct{}),
 	}
+	sink.pendingEvents.Store(int64(pending))
 	go sink.run()
 	return sink, nil
 }
@@ -66,6 +107,7 @@ func (sink *batchingLogSink) WriteOutput(ctx context.Context, event contract.Log
 	if err := sink.spool.append(ctx, event); err != nil {
 		return err
 	}
+	sink.pendingEvents.Add(1)
 	pending, err := sink.spool.pendingCount(ctx, event.AttemptID)
 	if err != nil {
 		return err
@@ -94,14 +136,21 @@ func (sink *batchingLogSink) CloseContext(ctx context.Context) error {
 			// Once the run loop receives the close request it always publishes
 			// the flush result before exiting, so prefer that exact result over
 			// racing the done channel.
-			sink.closeErr = <-response
+			sink.closeErr = sink.classifyCloseError(ctx, <-response)
 		case <-ctx.Done():
-			sink.closeErr = context.Cause(ctx)
+			sink.closeErr = sink.classifyCloseError(ctx, context.Cause(ctx))
 		case <-sink.done:
-			sink.closeErr = sink.err()
+			sink.closeErr = sink.classifyCloseError(ctx, sink.err())
 		}
 	})
 	return sink.closeErr
+}
+
+func (sink *batchingLogSink) classifyCloseError(ctx context.Context, err error) error {
+	if context.Cause(ctx) == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) && sink.pendingEvents.Load() == 0 {
+		return nil
+	}
+	return markLogFinalizationDeadline(ctx, logFinalizationStageUpload, err)
 }
 
 func (sink *batchingLogSink) run() {
@@ -174,7 +223,11 @@ func (sink *batchingLogSink) uploadContext(ctx context.Context, events []contrac
 			if err := validateLogAcknowledgement(batch, response.Acknowledged); err != nil {
 				return err
 			}
-			return sink.spool.acknowledge(ctx, sink.claim.Lease.AttemptID, response.Acknowledged)
+			if err := sink.spool.acknowledge(ctx, sink.claim.Lease.AttemptID, response.Acknowledged); err != nil {
+				return err
+			}
+			sink.pendingEvents.Add(-int64(len(batch)))
+			return nil
 		}
 		if classifyAgentProtocolError(err).destination != errorDestinationTransient {
 			return err
