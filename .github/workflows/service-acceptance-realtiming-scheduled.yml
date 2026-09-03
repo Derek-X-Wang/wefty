@@ -384,7 +384,14 @@ jobs:
                   iptables -D OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -m owner --uid-owner 0 -j REJECT
                   ;;
                 save-attempt-record:wefty-container-*|restore-never-seal-log:wefty-container-*:wefty-log-segments-*|restore-populated-cgroup:wefty-container-*:wefty-cgroup-*|remove-lost-log:wefty-container-*:wefty-log-segments-*)
-                  if ! /usr/local/libexec/wefty-oci-lost-attempt-fault "$action" 2> "/tmp/wefty-oci-faults/$action.failed"; then
+                  # stderr goes to a scratch file first: the test treats the mere existence of
+                  # .failed as a verdict, so it must only appear once the fault has failed.
+                  if /usr/local/libexec/wefty-oci-lost-attempt-fault "$action" 2> "/tmp/wefty-oci-faults/$action.stderr"; then
+                    rm -f "/tmp/wefty-oci-faults/$action.stderr"
+                  else
+                    fault_status="$?"
+                    printf 'fault %s exited %s\n' "$action" "$fault_status" >> "/tmp/wefty-oci-faults/$action.stderr"
+                    mv "/tmp/wefty-oci-faults/$action.stderr" "/tmp/wefty-oci-faults/$action.failed"
                     continue
                   fi
                   ;;
