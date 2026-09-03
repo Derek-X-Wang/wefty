@@ -591,6 +591,7 @@ type AppendLogsRequest struct {
 
 type AppendLogsResponse struct {
 	Acknowledged map[contract.LogStream]uint64 `json:"acknowledged"`
+	AttemptState contract.AttemptState         `json:"attempt_state"`
 }
 
 type LogPage struct {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -38,6 +39,9 @@ func TestTailRunningJobWithOpaqueCursorAndPerStreamOrder(t *testing.T) {
 	}
 	if acknowledgement.Acknowledged[contract.LogStdout] != 1 || acknowledgement.Acknowledged[contract.LogStderr] != 0 {
 		t.Fatalf("acknowledged = %#v", acknowledgement.Acknowledged)
+	}
+	if acknowledgement.AttemptState != contract.AttemptRunning {
+		t.Fatalf("append attempt state = %q, want %q", acknowledgement.AttemptState, contract.AttemptRunning)
 	}
 
 	storedJob, err := h.store.GetJob(context.Background(), job.JobID)
@@ -133,6 +137,51 @@ func TestLogReplayIsIdempotentAndRawJSONLMatchesRows(t *testing.T) {
 	}
 	if !bytes.Equal(raw, rows.Bytes()) {
 		t.Fatalf("authoritative JSONL does not match stored rows\njsonl=%s\nrows=%s", raw, rows.Bytes())
+	}
+}
+
+func TestAgentLogGapReasonsPassL1Validation(t *testing.T) {
+	reasons := contract.LogGapReasons()
+	for _, reason := range reasons {
+		t.Run(string(reason), func(t *testing.T) {
+			gap := &contract.LogGap{
+				ThroughSequence: 0,
+				LostEventCount:  1,
+				LostByteCount:   1,
+				Reason:          reason,
+			}
+			if reason == contract.LogGapLateEvidenceWindowExpired {
+				gap.SourceEventSHA256 = strings.Repeat("a", 64)
+			}
+			event := contract.LogEvent{
+				AttemptID: "attempt-gap-reasons",
+				Stream:    contract.LogStdout,
+				Sequence:  0,
+				Timestamp: time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC),
+				Gap:       gap,
+			}
+			if err := validateLogEvent(event.AttemptID, event); err != nil {
+				t.Fatalf("L1 rejected agent log gap reason %q: %v", reason, err)
+			}
+		})
+	}
+
+	unknown := contract.LogEvent{
+		AttemptID: "attempt-gap-reasons",
+		Stream:    contract.LogStdout,
+		Sequence:  0,
+		Timestamp: time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC),
+		Gap: &contract.LogGap{
+			ThroughSequence: 0,
+			LostEventCount:  1,
+			LostByteCount:   1,
+			Reason:          contract.LogGapReason("future_unknown_reason"),
+		},
+	}
+	err := validateLogEvent(unknown.AttemptID, unknown)
+	var protocolErr *Error
+	if !errors.As(err, &protocolErr) || protocolErr.Code != contract.ErrorInvalidRequest {
+		t.Fatalf("unknown log gap reason = %v, want invalid_request", err)
 	}
 }
 

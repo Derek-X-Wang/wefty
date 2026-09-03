@@ -432,18 +432,22 @@
         },
         "responses": {
           "200": {
-            "description": "Batch accepted or identically replayed. Ack sequences are per stream and are upload acknowledgements, not reader cursors.",
+            "description": "Batch accepted or identically replayed. Ack sequences are per stream and are upload acknowledgements, not reader cursors; attempt_state is L1's durable state after the append.",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["acknowledged"],
+                  "required": ["acknowledged", "attempt_state"],
                   "properties": {
                     "acknowledged": {
                       "type": "object",
                       "additionalProperties": { "type": "integer", "minimum": 0 },
                       "example": { "stdout": 12, "stderr": 7 }
+                    },
+                    "attempt_state": {
+                      "type": "string",
+                      "enum": ["claimed", "running", "awaiting-input", "succeeded", "failed", "lost"]
                     }
                   }
                 }

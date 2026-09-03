@@ -190,8 +190,13 @@ func TestAgentRestartRecoversOriginalAttemptSpool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restarted.Close()
-	if err := restarted.recoverPendingLogs(ctx); err != nil {
-		t.Fatal(err)
+	recovered := make(chan struct{}, 1)
+	restarted.outbox.recoveryAttemptFinished = func(string) { recovered <- struct{}{} }
+	restarted.outbox.startRecovery(ctx, restarted.session.client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
+	select {
+	case <-recovered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for process-lifetime evidence recovery")
 	}
 	node, err := restarted.Register(ctx)
 	if err != nil {
@@ -206,9 +211,6 @@ func TestAgentRestartRecoversOriginalAttemptSpool(t *testing.T) {
 	}
 	if len(page.Events) != 1 || page.Events[0].AttemptID != claim.Lease.AttemptID || string(page.Events[0].Bytes) != "before-crash" {
 		t.Fatalf("recovered events = %#v", page.Events)
-	}
-	if err := restarted.recoverPendingLogs(ctx); err != nil {
-		t.Fatal(err)
 	}
 	replayed, err := store.GetJobLogs(ctx, claim.Job.JobID, "", 10)
 	if err != nil {

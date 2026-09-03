@@ -269,7 +269,32 @@ resources, published ports, workflow bridges, handoffs, or log sinks. The
 adapter then returns a structured attempt outcome and implements
 `ReapAndVerify`. The attempt lifecycle requests a positive `runtimeQuiesced`
 receipt after `Run` returns and treats its absence as an `output_error`
-finalization failure before durable completion is stored.
+finalization failure before durable completion is stored. A live lifecycle
+owns its spool attempt, so process-lifetime recovery cannot race its log sink,
+completion delivery, or node-local intent-suppression decision. If authority
+loss or cancellation abandons live delivery after suppression is ruled out,
+the lifecycle does not classify the cancellation cause as a `/complete`
+response: it releases that ownership and wakes the bounded outbox reconciler.
+The reconciler survives the attempt authority context, runs at most eight
+attempt workers, and retries both spool scan failures and per-attempt failures
+after the configured injected-clock backoff. While L1 reports the attempt as
+live, recovery drains every durable log batch before delivering the single
+completion; an accepted completion closes that attempt's log stream at L1
+(`l1/store.go`, `AppendLogs`). Once L1 reports the attempt as `lost`, the
+completion is late evidence, so recovery may yield after eight log batches,
+deliver the completion, and continue the remaining raw log stream on later
+passes from its acknowledged high-water mark. Reaching that per-pass bound
+never creates a gap. A permanently rejected raw batch is replaced by an
+accepted `replay_rejected` gap; if the durable sequence is not contiguous enough
+to form a truthful gap, the attempt is sealed with a typed incomplete-evidence
+tombstone instead of retrying forever. The reconciler sends the
+identical durable completion body and retains a matching post-lease result as
+typed L1 observation without delaying fresh service admission.
+For a healthy-lease hand-off, renewal is already stopped: logs still precede
+completion only while L1 reports the attempt live, but if the remaining lease
+expires mid-drain L1 seals by expiry without `completion_replay_attempt_id` and
+the reconciler's lost-at-L1 path is thereafter bounded to eight log batches per
+pass.
 
 The generic agent handoff manager remains the owner of process one-shot host
 directories. An OCI one-shot does not reinterpret the forbidden flat

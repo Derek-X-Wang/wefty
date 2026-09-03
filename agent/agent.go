@@ -478,13 +478,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	})
 }
 
-func (a *Agent) recoverPendingLogs(ctx context.Context) error {
-	if a.outbox == nil || a.session == nil {
-		return nil
-	}
-	return a.outbox.recover(ctx, a.session.client)
-}
-
 func (a *Agent) executeClaim(ctx context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
 	return a.newAttemptLifecycle().execute(ctx, claim, claimStarted)
 }

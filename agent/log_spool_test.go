@@ -406,6 +406,47 @@ func TestLogSpoolPersistsFinalizedCompletionAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestLogSpoolDeletesDeliveredAttemptWhenLastEventDrains(t *testing.T) {
+	spool := openTestLogSpool(t, t.TempDir(), "node-delivered-backlog", 1024)
+	defer spool.Close()
+	claim := spoolTestClaim("attempt-delivered-backlog")
+	if err := spool.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	for sequence, payload := range []string{"one", "two"} {
+		if err := spool.append(t.Context(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, uint64(sequence), payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exitCode := 0
+	if err := spool.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.completionDelivered(t.Context(), claim.Lease.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := spool.db.QueryRow("SELECT COUNT(*) FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("delivered attempt with pending events retained %d rows, want 1", rows)
+	}
+	if err := spool.acknowledge(t.Context(), claim.Lease.AttemptID, map[contract.LogStream]uint64{contract.LogStdout: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.db.QueryRow("SELECT COUNT(*) FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("drained delivered attempt retained %d spool rows", rows)
+	}
+	receipt := spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+	if receipt.State != "delivered" || receipt.EventCount != 0 {
+		t.Fatalf("drained delivered attempt receipt = %+v", receipt)
+	}
+}
+
 func TestLogSpoolInspectionDistinguishesSuppressedAndNeverPersistedCompletion(t *testing.T) {
 	spool := openTestLogSpool(t, t.TempDir(), "node-completion-disposition", 1024)
 	defer spool.Close()
