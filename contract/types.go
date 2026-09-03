@@ -754,58 +754,46 @@ const (
 	CapabilityReasonLocalPermissionDenied            CapabilityReasonCode = "local_permission_denied"
 )
 
+var capabilityReasonCodes = []CapabilityReasonCode{
+	CapabilityReasonOCIIntentDisabled,
+	CapabilityReasonPrerequisiteMissing,
+	CapabilityReasonRuntimeVersionUnsupported,
+	CapabilityReasonHelperUnreachable,
+	CapabilityReasonHelperUnitUnavailable,
+	CapabilityReasonHelperHandshakeStalled,
+	CapabilityReasonHelperHandshakeStalledPersistent,
+	CapabilityReasonHelperVersionMismatch,
+	CapabilityReasonHelperHandshakeFailed,
+	CapabilityReasonBootSweepFailed,
+	CapabilityReasonProbeFailed,
+	CapabilityReasonLimaStopped,
+	CapabilityReasonLimaBroken,
+	CapabilityReasonLimaStartTimeout,
+	CapabilityReasonTemplateRestartRequired,
+	CapabilityReasonTemplateRecreateRequired,
+	CapabilityReasonMountRootUnavailable,
+	CapabilityReasonLocalPermissionDenied,
+}
+
+// CapabilityReasonCodes returns the complete wire vocabulary accepted by
+// CapabilityReasonCode.Valid. Callers may modify the returned slice.
+func CapabilityReasonCodes() []CapabilityReasonCode {
+	return append([]CapabilityReasonCode(nil), capabilityReasonCodes...)
+}
+
 func (code CapabilityReasonCode) Valid() bool {
-	switch code {
-	case CapabilityReasonOCIIntentDisabled,
-		CapabilityReasonPrerequisiteMissing,
-		CapabilityReasonRuntimeVersionUnsupported,
-		CapabilityReasonHelperUnreachable,
-		CapabilityReasonHelperUnitUnavailable,
-		CapabilityReasonHelperHandshakeStalled,
-		CapabilityReasonHelperHandshakeStalledPersistent,
-		CapabilityReasonHelperVersionMismatch,
-		CapabilityReasonHelperHandshakeFailed,
-		CapabilityReasonBootSweepFailed,
-		CapabilityReasonProbeFailed,
-		CapabilityReasonLimaStopped,
-		CapabilityReasonLimaBroken,
-		CapabilityReasonLimaStartTimeout,
-		CapabilityReasonTemplateRestartRequired,
-		CapabilityReasonTemplateRecreateRequired,
-		CapabilityReasonMountRootUnavailable,
-		CapabilityReasonLocalPermissionDenied:
-		return true
-	default:
-		return false
+	for _, valid := range capabilityReasonCodes {
+		if code == valid {
+			return true
+		}
 	}
+	return false
 }
 
 // ValidOCIRestriction reports whether code can explain an observation that
 // has atomically withdrawn kind:oci during registration or recovery.
 func (code CapabilityReasonCode) ValidOCIRestriction() bool {
-	switch code {
-	case CapabilityReasonOCIIntentDisabled,
-		CapabilityReasonPrerequisiteMissing,
-		CapabilityReasonRuntimeVersionUnsupported,
-		CapabilityReasonHelperUnreachable,
-		CapabilityReasonHelperUnitUnavailable,
-		CapabilityReasonHelperHandshakeStalled,
-		CapabilityReasonHelperHandshakeStalledPersistent,
-		CapabilityReasonHelperVersionMismatch,
-		CapabilityReasonHelperHandshakeFailed,
-		CapabilityReasonBootSweepFailed,
-		CapabilityReasonProbeFailed,
-		CapabilityReasonLimaStopped,
-		CapabilityReasonLimaBroken,
-		CapabilityReasonLimaStartTimeout,
-		CapabilityReasonTemplateRestartRequired,
-		CapabilityReasonTemplateRecreateRequired,
-		CapabilityReasonMountRootUnavailable,
-		CapabilityReasonLocalPermissionDenied:
-		return true
-	default:
-		return false
-	}
+	return code.Valid()
 }
 
 // CapabilityObservation is one immutable, boot-scoped observation of the

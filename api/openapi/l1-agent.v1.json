@@ -76,7 +76,8 @@
                     "type": "string",
                     "enum": [
                       "oci_intent_disabled", "prerequisite_missing", "runtime_version_unsupported",
-                      "helper_unreachable", "helper_unit_unavailable", "helper_version_mismatch", "helper_handshake_failed",
+                      "helper_unreachable", "helper_unit_unavailable", "helper_handshake_stalled", "helper_handshake_stalled_persistent",
+                      "helper_version_mismatch", "helper_handshake_failed",
                       "boot_sweep_failed", "probe_failed", "lima_stopped", "lima_broken",
                       "lima_start_timeout", "template_restart_required", "template_recreate_required",
                       "mount_root_unavailable", "local_permission_denied"
