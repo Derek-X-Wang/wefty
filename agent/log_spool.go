@@ -33,6 +33,7 @@ type logSpoolAttempt struct {
 	attemptID    string
 	fencingToken string
 	class        string
+	kind         string
 }
 
 type durableSpoolEvent struct {
@@ -140,6 +141,7 @@ CREATE TABLE IF NOT EXISTS spool_attempts (
   job_id TEXT NOT NULL,
   fencing_token TEXT NOT NULL,
   class TEXT NOT NULL,
+  kind TEXT NOT NULL,
   created_ns INTEGER NOT NULL,
   result_json BLOB,
   finished_ns INTEGER,
@@ -230,12 +232,24 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 		table, column, definition string
 	}{
 		{table: "spool_removals", column: "runtime_kind", definition: "TEXT"},
+		{table: "spool_attempts", column: "kind", definition: "TEXT"},
 		{table: "runtime_removal_manifests", column: "absence_attestation_json", definition: "BLOB"},
 		{table: "runtime_removal_manifests", column: "attested_ns", definition: "INTEGER"},
 	} {
 		if err := ensureLogSpoolColumn(ctx, spool.db, migration.table, migration.column, migration.definition); err != nil {
 			return fmt.Errorf("agent: migrate log spool %s.%s: %w", migration.table, migration.column, err)
 		}
+	}
+	// Older evidence rows did not carry workload kind. OCI attempt manifests
+	// and binding pins identify the rows that must remain subordinate to durable
+	// OCI intent; all other legacy rows retain process semantics.
+	if _, err := spool.db.ExecContext(ctx, `UPDATE spool_attempts
+SET kind=CASE
+  WHEN EXISTS (SELECT 1 FROM runtime_attempt_manifests WHERE runtime_attempt_manifests.attempt_id=spool_attempts.attempt_id AND runtime_attempt_manifests.runtime_kind=?)
+    OR EXISTS (SELECT 1 FROM oci_binding_pins WHERE oci_binding_pins.job_id=spool_attempts.job_id)
+  THEN ? ELSE ? END
+WHERE kind IS NULL OR kind=''`, contract.JobKindOCI, contract.JobKindOCI, contract.JobKindProcess); err != nil {
+		return fmt.Errorf("agent: migrate log spool attempt kinds: %w", err)
 	}
 	// Pre-proof spools did not record the workload kind. Existing OCI
 	// removals can be identified without guessing from their durable runtime
@@ -479,21 +493,22 @@ WHERE job_id=? AND removal_generation=? AND cleanup_fence=? AND root_instance_id
 }
 
 func (spool *logSpool) ensureAttempt(ctx context.Context, claim l1.Claim) error {
-	_, err := spool.db.ExecContext(ctx, `INSERT INTO spool_attempts(attempt_id, job_id, fencing_token, class, created_ns)
-VALUES(?, ?, ?, ?, ?)
-ON CONFLICT(attempt_id) DO UPDATE SET job_id=excluded.job_id, fencing_token=excluded.fencing_token, class=excluded.class
+	_, err := spool.db.ExecContext(ctx, `INSERT INTO spool_attempts(attempt_id, job_id, fencing_token, class, kind, created_ns)
+VALUES(?, ?, ?, ?, ?, ?)
+ON CONFLICT(attempt_id) DO UPDATE SET job_id=excluded.job_id, fencing_token=excluded.fencing_token, class=excluded.class, kind=excluded.kind
 WHERE spool_attempts.job_id=excluded.job_id
   AND spool_attempts.fencing_token=excluded.fencing_token
-  AND spool_attempts.class=excluded.class`,
-		claim.Lease.AttemptID, claim.Job.JobID, claim.Lease.FencingToken, claim.Job.Spec.Class, claim.Job.CreatedAt.UTC().Round(0).UnixNano())
+	AND spool_attempts.class=excluded.class
+	AND spool_attempts.kind=excluded.kind`,
+		claim.Lease.AttemptID, claim.Job.JobID, claim.Lease.FencingToken, claim.Job.Spec.Class, claim.Job.Spec.Kind, claim.Job.CreatedAt.UTC().Round(0).UnixNano())
 	if err != nil {
 		return fmt.Errorf("agent: store log spool attempt: %w", err)
 	}
-	var jobID, fencingToken, class string
-	if err := spool.db.QueryRowContext(ctx, "SELECT job_id, fencing_token, class FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&jobID, &fencingToken, &class); err != nil {
+	var jobID, fencingToken, class, kind string
+	if err := spool.db.QueryRowContext(ctx, "SELECT job_id, fencing_token, class, kind FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&jobID, &fencingToken, &class, &kind); err != nil {
 		return fmt.Errorf("agent: verify log spool attempt: %w", err)
 	}
-	if jobID != claim.Job.JobID || fencingToken != claim.Lease.FencingToken || class != claim.Job.Spec.Class {
+	if jobID != claim.Job.JobID || fencingToken != claim.Lease.FencingToken || class != claim.Job.Spec.Class || kind != claim.Job.Spec.Kind {
 		return fmt.Errorf("agent: log spool attempt %q conflicts with stored authority", claim.Lease.AttemptID)
 	}
 	return nil
@@ -763,7 +778,7 @@ WHERE attempt_id=? AND result_json IS NULL AND incomplete_json IS NULL
 }
 
 func (spool *logSpool) pendingAttempts(ctx context.Context) ([]logSpoolAttempt, error) {
-	rows, err := spool.db.QueryContext(ctx, `SELECT a.job_id, a.attempt_id, a.fencing_token, a.class
+	rows, err := spool.db.QueryContext(ctx, `SELECT a.job_id, a.attempt_id, a.fencing_token, a.class, a.kind
 FROM spool_attempts a
 WHERE a.incomplete_json IS NULL
   AND (a.result_json IS NOT NULL OR EXISTS (SELECT 1 FROM spool_events e WHERE e.attempt_id=a.attempt_id))
@@ -775,7 +790,7 @@ ORDER BY a.created_ns, a.attempt_id`)
 	var attempts []logSpoolAttempt
 	for rows.Next() {
 		var attempt logSpoolAttempt
-		if err := rows.Scan(&attempt.jobID, &attempt.attemptID, &attempt.fencingToken, &attempt.class); err != nil {
+		if err := rows.Scan(&attempt.jobID, &attempt.attemptID, &attempt.fencingToken, &attempt.class, &attempt.kind); err != nil {
 			return nil, fmt.Errorf("agent: scan pending log spool attempt: %w", err)
 		}
 		attempts = append(attempts, attempt)

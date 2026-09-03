@@ -21,11 +21,12 @@ const (
 // Sessions borrow it; ending or replacing a session must not discard evidence
 // that still needs delivery.
 type evidenceOutbox struct {
-	spool         *logSpool
-	clock         Clock
-	batchSize     int
-	flushInterval time.Duration
-	retryInterval time.Duration
+	spool            *logSpool
+	clock            Clock
+	batchSize        int
+	flushInterval    time.Duration
+	retryInterval    time.Duration
+	ociIntentEnabled func(context.Context) (bool, error)
 	// completionStored is a test seam for ordering cancellation against the
 	// durable commit edge. Production construction leaves it nil.
 	completionStored func()
@@ -381,6 +382,12 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 	result, evidence, _, present, err := outbox.spool.completionWithEvidence(ctx, attempt.attemptID)
 	if err != nil || !present {
 		return err
+	}
+	if attempt.kind == contract.JobKindOCI && attempt.class == contract.JobClassService && outbox.ociIntentEnabled != nil {
+		enabled, intentErr := outbox.ociIntentEnabled(ctx)
+		if intentErr != nil || !enabled {
+			return outbox.suppressCompletion(context.WithoutCancel(ctx), attempt.attemptID)
+		}
 	}
 	request := l1.CompletionRequest{
 		FencingToken: attempt.fencingToken, IdempotencyKey: "completion:" + attempt.attemptID,

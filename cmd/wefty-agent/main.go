@@ -466,6 +466,7 @@ func run() error {
 	var bootBarrier *ocihelper.BootBarrier
 	var agentBootBarrier agent.OCIBootBarrier
 	var capabilityProbe agent.CapabilityProbe
+	var ociIntentEnabled func(context.Context) (bool, error)
 	var deadman agent.AttemptDeadmanRenewer
 	var ociBridgeBinder workloadrunner.WorkflowBridgeBinder
 	var limaSupervisor *limarunner.Supervisor
@@ -522,11 +523,13 @@ func run() error {
 		capabilities["kind:oci"] = true
 		capabilities["runtime_handler:"+ocihelper.DefaultRuntimeHandler] = true
 		capabilities["cgroup_v2"] = true
-		capabilityProbe = ociCapabilityProbe{
+		probe := ociCapabilityProbe{
 			adapter: adapter, nodeID: *nodeID, bootSessionID: bootSessionID,
 			reference: *ociProbeImage, digest: *ociProbeDigest,
 			intent: limarunner.FileIntentSource{Path: *ociIntentFile},
 		}
+		capabilityProbe = probe
+		ociIntentEnabled = probe.intentEnabled
 		deadman = ociAttemptDeadman{barrier: bootBarrier, nodeID: *nodeID, bootSessionID: bootSessionID}
 	}
 	nodeAgent, err := agent.New(agent.Config{
@@ -538,6 +541,7 @@ func run() error {
 		Version:                 version,
 		Capabilities:            capabilities,
 		CapabilityProbe:         capabilityProbe,
+		OCIIntentEnabled:        ociIntentEnabled,
 		OCIBootBarrier:          agentBootBarrier,
 		WorkloadRuntimes:        runtimes,
 		AttemptDeadman:          deadman,
@@ -848,8 +852,8 @@ type ociCapabilityAdapter interface {
 
 func (probe ociCapabilityProbe) Probe(ctx context.Context) (agent.CapabilityProbeResult, error) {
 	if probe.intent != nil {
-		intent, err := probe.intent.ReadIntent(ctx)
-		if err != nil || intent.Version != limarunner.OCIIntentVersion || intent.Revision == 0 || !intent.Enabled {
+		enabled, err := probe.intentEnabled(ctx)
+		if err != nil || !enabled {
 			if err == nil {
 				err = errors.New("OCI intent is disabled")
 			}
@@ -872,6 +876,14 @@ func (probe ociCapabilityProbe) Probe(ctx context.Context) (agent.CapabilityProb
 	// unreachable version comparison here.
 	capabilities["computer"] = true
 	return agent.CapabilityProbeResult{Capabilities: capabilities}, nil
+}
+
+func (probe ociCapabilityProbe) intentEnabled(ctx context.Context) (bool, error) {
+	if probe.intent == nil {
+		return true, nil
+	}
+	intent, err := probe.intent.ReadIntent(ctx)
+	return err == nil && intent.Version == limarunner.OCIIntentVersion && intent.Revision > 0 && intent.Enabled, err
 }
 
 type ociAttemptDeadman struct {

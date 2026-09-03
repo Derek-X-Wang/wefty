@@ -58,6 +58,9 @@ type Config struct {
 	CapabilityProbe CapabilityProbe
 	// CapabilityProbeTimeout bounds one functional probe. Zero uses ten seconds.
 	CapabilityProbeTimeout time.Duration
+	// OCIIntentEnabled reads the durable node-local OCI intent marker. Nil means
+	// this agent has no node-local OCI intent control surface.
+	OCIIntentEnabled func(context.Context) (bool, error)
 	// OCIBootBarrier must prove exclusive sweep and namespace absence before
 	// the functional probe can earn OCI capability publication.
 	OCIBootBarrier       OCIBootBarrier
@@ -122,6 +125,7 @@ type Agent struct {
 	computerTokens        ComputerTokenMinter
 	computerTokenCloser   interface{ Close() }
 	computerControlTokens *computerControlTokenCodec
+	ociIntentEnabled      func(context.Context) (bool, error)
 	nodeLock              nodeLock
 }
 
@@ -237,6 +241,7 @@ func New(config Config) (*Agent, error) {
 		client.Close()
 		return nil, err
 	}
+	outbox.ociIntentEnabled = config.OCIIntentEnabled
 	controlTokenKey, err := outbox.spool.loadOrCreateSecret(context.Background(), computerControlTokenKeyName, computerControlTokenKeySize)
 	if err != nil {
 		_ = outbox.Close()
@@ -383,6 +388,7 @@ func New(config Config) (*Agent, error) {
 		ociBridgeBinder: config.OCIWorkflowBridgeBinder,
 		computerTokens:  computerTokens, computerTokenCloser: computerTokenCloser,
 		computerControlTokens: computerControlTokens,
+		ociIntentEnabled:      config.OCIIntentEnabled,
 		nodeLock:              stableNodeLock,
 	}, nil
 }
@@ -509,6 +515,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		prepareServiceEndpoint:     prepareProcessServiceEndpoint,
 		prepareAuthorityLoss:       a.prepareAuthorityLoss,
 		allowsStart:                allowsStart,
+		ociIntentEnabled:           a.ociIntentEnabled,
 		currentOCIGeneration:       a.currentOCIRuntimeGeneration,
 		embargoOCIRuntime:          a.embargoOCIRuntimeLoss,
 		recoverOCIRuntime:          a.recoverOCIRuntimeAfterLoss,

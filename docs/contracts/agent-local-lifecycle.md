@@ -242,6 +242,14 @@ post-persistence action never rolls the intent bit back. Start persists enabled,
 reacquires the helper, completes the boot barrier and probe, and only then
 publishes the positive Capability revision.
 
+The durable marker also fences terminal evidence for a resident OCI service.
+After disable is durable, neither the live completion path nor process-lifetime
+outbox recovery may publish that attempt's payload result to L1; an unavailable
+or malformed marker fails closed in the same way. Any already-spooled payload
+completion is recorded locally as suppressed, while L1's lease clock remains
+the sole authority that can classify the attempt `lost` without a result. This
+fence does not suppress OCI one-shot completion or any process-kind workload.
+
 Linux privileged `setup-oci` renders and writes one unprivileged `wefty-agent.service` with
 `SupplementaryGroups=wefty-oci` and one root socket-activated helper pair. The
 socket is exactly `0660 root:wefty-oci`; the helper UID allowlist names only the

@@ -71,6 +71,7 @@ type attemptLifecycleDependencies struct {
 	prepareServiceEndpoint     func(context.Context) (serviceRuntimeEndpoint, error)
 	prepareAuthorityLoss       func(context.Context, string) error
 	allowsStart                func(contract.JobSpec) bool
+	ociIntentEnabled           func(context.Context) (bool, error)
 	currentOCIGeneration       func() (workloadrunner.RuntimeGeneration, bool)
 	embargoOCIRuntime          func(workloadrunner.RuntimeGeneration)
 	recoverOCIRuntime          func(context.Context, workloadrunner.RuntimeGeneration) error
@@ -271,7 +272,17 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		return outcome.durabilityErr
 	}
 	withholdOCIIntentCompletion := func() bool {
-		return claim.Job.Spec.Class == contract.JobClassService && errors.Is(context.Cause(attemptContext), errOCIIntentDisabled)
+		if claim.Job.Spec.Kind != contract.JobKindOCI || claim.Job.Spec.Class != contract.JobClassService {
+			return false
+		}
+		if errors.Is(context.Cause(attemptContext), errOCIIntentDisabled) {
+			return true
+		}
+		if lifecycle.dependencies.ociIntentEnabled == nil {
+			return false
+		}
+		enabled, err := lifecycle.dependencies.ociIntentEnabled(context.WithoutCancel(attemptContext))
+		return err != nil || !enabled
 	}
 
 	var outcome runOutcome
@@ -386,6 +397,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		// service-stop cancellation was already observable. Withhold the spool
 		// record as well as the live completion so restart replay cannot consume
 		// the retained binding's lease or restart budget.
+		cancelAttempt(errOCIIntentDisabled)
 		<-renewalDone
 		return errorDestinationUnclassified, nil
 	}
@@ -398,6 +410,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 				return errorDestinationUnclassified, err
 			}
 		}
+		cancelAttempt(errOCIIntentDisabled)
 		<-renewalDone
 		return errorDestinationUnclassified, nil
 	}
