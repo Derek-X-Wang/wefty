@@ -12,7 +12,10 @@ import (
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
-const maxEvidenceRecoveryWorkers = 8
+const (
+	maxEvidenceRecoveryWorkers         = 8
+	maxEvidenceLogReplayBatchesPerPass = 8
+)
 
 // evidenceOutbox owns durable evidence for the lifetime of the agent process.
 // Sessions borrow it; ending or replacing a session must not discard evidence
@@ -137,19 +140,67 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 			err       error
 		}
 		active := make(map[string]struct{})
-		dirty := make(map[string]struct{})
+		retryAt := make(map[string]time.Time)
+		var scanRetryAt time.Time
+		var retryTimer Timer
+		var retryWake <-chan time.Time
 		finished := make(chan recoveryResult)
-		launchPending := func() {
+		armRetry := func() {
+			var earliest time.Time
+			if !scanRetryAt.IsZero() {
+				earliest = scanRetryAt
+			}
+			for _, deadline := range retryAt {
+				if earliest.IsZero() || deadline.Before(earliest) {
+					earliest = deadline
+				}
+			}
+			if retryTimer != nil {
+				stopTimer(retryTimer)
+				retryTimer = nil
+				retryWake = nil
+			}
+			if earliest.IsZero() {
+				return
+			}
+			delay := earliest.Sub(outbox.clock.Now())
+			if delay < 0 {
+				delay = 0
+			}
+			retryTimer = outbox.clock.NewTimer(delay)
+			retryWake = retryTimer.C()
+		}
+		var launchPending func()
+		launchPending = func() {
+			now := outbox.clock.Now()
+			if !scanRetryAt.IsZero() && now.Before(scanRetryAt) {
+				armRetry()
+				return
+			}
 			attempts, err := outbox.spool.pendingAttempts(recoveryContext)
 			if err != nil {
 				if recoveryContext.Err() == nil && report != nil {
 					report(err)
 				}
+				scanRetryAt = now.Add(outbox.retryInterval)
+				armRetry()
 				return
+			}
+			scanRetryAt = time.Time{}
+			pending := make(map[string]struct{}, len(attempts))
+			for _, attempt := range attempts {
+				pending[attempt.attemptID] = struct{}{}
+			}
+			for attemptID := range retryAt {
+				if _, present := pending[attemptID]; !present {
+					delete(retryAt, attemptID)
+				}
 			}
 			for _, attempt := range attempts {
 				if _, running := active[attempt.attemptID]; running {
-					dirty[attempt.attemptID] = struct{}{}
+					continue
+				}
+				if deadline, waiting := retryAt[attempt.attemptID]; waiting && now.Before(deadline) {
 					continue
 				}
 				if len(active) >= maxEvidenceRecoveryWorkers {
@@ -158,6 +209,7 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 				if outbox.attemptIsLive(attempt.attemptID) {
 					continue
 				}
+				delete(retryAt, attempt.attemptID)
 				active[attempt.attemptID] = struct{}{}
 				outbox.recoveryWG.Add(1)
 				go func(attempt logSpoolAttempt) {
@@ -172,27 +224,37 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 					}
 				}(attempt)
 			}
+			armRetry()
 		}
 
 		launchPending()
 		for {
 			select {
 			case <-recoveryContext.Done():
+				if retryTimer != nil {
+					stopTimer(retryTimer)
+				}
 				return
 			case <-outbox.recoveryWake:
 				launchPending()
+			case <-retryWake:
+				retryTimer = nil
+				retryWake = nil
+				launchPending()
 			case result := <-finished:
 				delete(active, result.attemptID)
-				_, rescan := dirty[result.attemptID]
-				delete(dirty, result.attemptID)
 				if result.err != nil && recoveryContext.Err() == nil && report != nil {
 					report(fmt.Errorf("attempt %s: %w", result.attemptID, result.err))
 				}
-				if rescan || result.err == nil {
-					outbox.scheduleRecovery()
+				if result.err != nil {
+					retryAt[result.attemptID] = outbox.clock.Now().Add(outbox.retryInterval)
 				} else {
-					time.AfterFunc(outbox.retryInterval, outbox.scheduleRecovery)
+					delete(retryAt, result.attemptID)
 				}
+				// Fill the released worker slot immediately. A failed attempt is
+				// skipped until its own injected-clock backoff expires.
+				outbox.scheduleRecovery()
+				armRetry()
 			}
 		}
 	}()
@@ -240,49 +302,22 @@ func (outbox *evidenceOutbox) scheduleRecovery() {
 	}
 }
 
-// recover fans replay out by attempt. A transient or poisoned old attempt can
-// therefore never prevent later outbox entries from being considered.
-func (outbox *evidenceOutbox) recover(ctx context.Context, client *Client) error {
-	attempts, err := outbox.spool.pendingAttempts(ctx)
-	if err != nil {
-		return err
-	}
-	results := make(chan error, len(attempts))
-	var attemptsWG sync.WaitGroup
-	for _, attempt := range attempts {
-		attempt := attempt
-		attemptsWG.Add(1)
-		go func() {
-			defer attemptsWG.Done()
-			if err := outbox.recoverAttempt(ctx, client, attempt); err != nil {
-				results <- fmt.Errorf("attempt %s: %w", attempt.attemptID, err)
-			}
-		}()
-	}
-	attemptsWG.Wait()
-	close(results)
-	var recoveredErrors []error
-	for recoveredErr := range results {
-		recoveredErrors = append(recoveredErrors, recoveredErr)
-	}
-	return errors.Join(recoveredErrors...)
-}
-
 func (outbox *evidenceOutbox) recoverAttempt(ctx context.Context, client *Client, attempt logSpoolAttempt) error {
-	if err := outbox.recoverLogs(ctx, client, attempt); err != nil {
+	logsComplete, err := outbox.recoverLogs(ctx, client, attempt)
+	if err != nil || !logsComplete {
 		return err
 	}
 	return outbox.recoverCompletion(ctx, client, attempt)
 }
 
-func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, attempt logSpoolAttempt) error {
-	for {
+func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, attempt logSpoolAttempt) (bool, error) {
+	for range maxEvidenceLogReplayBatchesPerPass {
 		batch, err := outbox.spool.pendingBatch(ctx, attempt.attemptID, outbox.batchSize)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if len(batch) == 0 {
-			return nil
+			return true, nil
 		}
 		events := make([]contract.LogEvent, 0, len(batch))
 		for _, stored := range batch {
@@ -294,10 +329,10 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 		})
 		if err == nil {
 			if err := validateLogAcknowledgement(events, response.Acknowledged); err != nil {
-				return err
+				return false, err
 			}
 			if err := outbox.spool.acknowledge(ctx, attempt.attemptID, response.Acknowledged); err != nil {
-				return err
+				return false, err
 			}
 			continue
 		}
@@ -305,10 +340,10 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 		code := protocolErrorCode(err)
 		if permanentEvidenceRejection(code) {
 			if eventsContainGap(events) {
-				return outbox.sealIncomplete(ctx, attempt.attemptID, "replacement gap was rejected", code)
+				return false, outbox.sealIncomplete(ctx, attempt.attemptID, "replacement gap was rejected", code)
 			}
 			if err := outbox.spool.replaceBatchWithReplayGaps(ctx, attempt.attemptID, batch); err != nil {
-				return outbox.sealIncomplete(ctx, attempt.attemptID, "rejected replay could not be replaced with a gap", code)
+				return false, outbox.sealIncomplete(ctx, attempt.attemptID, "rejected replay could not be replaced with a gap", code)
 			}
 			continue
 		}
@@ -316,23 +351,29 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 		classification := classifyAgentProtocolError(err)
 		switch classification.destination {
 		case errorDestinationTransient:
-			if err := outbox.waitRetry(ctx); err != nil {
-				return err
-			}
+			return false, err
 		case errorDestinationAttemptAuthority:
-			return outbox.sealIncomplete(ctx, attempt.attemptID, "attempt authority no longer accepts evidence", code)
+			return false, outbox.sealIncomplete(ctx, attempt.attemptID, "attempt authority no longer accepts evidence", code)
 		case errorDestinationNodeSession:
 			if classification.nodeSessionReaction == nodeSessionReregister {
-				if err := outbox.waitRetry(ctx); err != nil {
-					return err
-				}
-				continue
+				return false, err
 			}
-			return err
+			return false, err
 		default:
-			return err
+			return false, err
 		}
 	}
+	remaining, err := outbox.spool.pendingBatch(ctx, attempt.attemptID, 1)
+	if err != nil {
+		return false, err
+	}
+	if len(remaining) == 0 {
+		return true, nil
+	}
+	if err := outbox.spool.replacePendingWithRecoveryReplayGaps(ctx, attempt.attemptID); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Client, attempt logSpoolAttempt) error {
@@ -344,34 +385,24 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 		FencingToken: attempt.fencingToken, IdempotencyKey: "completion:" + attempt.attemptID,
 		Result: result, RuntimeQuiescenceEvidence: evidence,
 	}
-	for {
-		_, err := client.Complete(ctx, attempt.jobID, attempt.attemptID, request)
-		if err == nil || protocolErrorCode(err) == contract.ErrorLeaseExpired {
-			return outbox.spool.completionDelivered(ctx, attempt.attemptID)
-		}
-		code := protocolErrorCode(err)
-		if permanentEvidenceRejection(code) {
-			return outbox.sealIncomplete(ctx, attempt.attemptID, "completion was permanently rejected", code)
-		}
-		classification := classifyAgentProtocolError(err)
-		switch classification.destination {
-		case errorDestinationTransient:
-			if err := outbox.waitRetry(ctx); err != nil {
-				return err
-			}
-		case errorDestinationAttemptAuthority:
-			return outbox.sealIncomplete(ctx, attempt.attemptID, "attempt authority no longer accepts completion evidence", code)
-		case errorDestinationNodeSession:
-			if classification.nodeSessionReaction == nodeSessionReregister {
-				if err := outbox.waitRetry(ctx); err != nil {
-					return err
-				}
-				continue
-			}
-			return err
-		default:
-			return err
-		}
+	_, err = client.Complete(ctx, attempt.jobID, attempt.attemptID, request)
+	if err == nil || protocolErrorCode(err) == contract.ErrorLeaseExpired {
+		return outbox.spool.completionDelivered(ctx, attempt.attemptID)
+	}
+	code := protocolErrorCode(err)
+	if permanentEvidenceRejection(code) {
+		return outbox.sealIncomplete(ctx, attempt.attemptID, "completion was permanently rejected", code)
+	}
+	classification := classifyAgentProtocolError(err)
+	switch classification.destination {
+	case errorDestinationTransient:
+		return err
+	case errorDestinationAttemptAuthority:
+		return outbox.sealIncomplete(ctx, attempt.attemptID, "attempt authority no longer accepts completion evidence", code)
+	case errorDestinationNodeSession:
+		return err
+	default:
+		return err
 	}
 }
 
@@ -384,17 +415,6 @@ func (outbox *evidenceOutbox) sealIncomplete(ctx context.Context, attemptID, rea
 
 func (outbox *evidenceOutbox) sealAttemptEvidence(ctx context.Context, attemptID, reason string, code contract.ErrorCode) error {
 	return outbox.spool.sealIncomplete(ctx, attemptID, reason, code, outbox.clock.Now())
-}
-
-func (outbox *evidenceOutbox) waitRetry(ctx context.Context) error {
-	timer := outbox.clock.NewTimer(outbox.retryInterval)
-	select {
-	case <-ctx.Done():
-		stopTimer(timer)
-		return ctx.Err()
-	case <-timer.C():
-		return nil
-	}
 }
 
 func protocolErrorCode(err error) contract.ErrorCode {

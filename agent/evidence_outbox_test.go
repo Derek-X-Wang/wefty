@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -149,6 +150,103 @@ func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 	waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
 }
 
+func TestAttemptRenewalFailureAbandonsInFlightCompletionToRecovery(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		code contract.ErrorCode
+	}{
+		{name: "attempt mismatch", code: contract.ErrorAttemptMismatch},
+		{name: "lease expired", code: contract.ErrorLeaseExpired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			firstCompletion := make(chan l1.CompletionRequest, 1)
+			replayedCompletion := make(chan l1.CompletionRequest, 1)
+			var mu sync.Mutex
+			completionCalls := 0
+			handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				switch {
+				case strings.HasSuffix(request.URL.Path, "/complete"):
+					var completion l1.CompletionRequest
+					if err := json.NewDecoder(request.Body).Decode(&completion); err != nil {
+						t.Error(err)
+						return
+					}
+					mu.Lock()
+					completionCalls++
+					call := completionCalls
+					mu.Unlock()
+					if call == 1 {
+						firstCompletion <- completion
+						<-request.Context().Done()
+						return
+					}
+					replayedCompletion <- completion
+					_ = json.NewEncoder(w).Encode(l1.Job{})
+				case strings.HasSuffix(request.URL.Path, "/lease"):
+					select {
+					case completion := <-firstCompletion:
+						firstCompletion <- completion
+					case <-time.After(2 * time.Second):
+						t.Error("renewal arrived before the live completion request")
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusConflict)
+					_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+						Code: test.code, Message: "renewal no longer owns the attempt",
+					}})
+				default:
+					http.NotFound(w, request)
+				}
+			})
+			client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+			defer stopServer()
+			defer client.Close()
+			outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024, systemClock{}, 8, time.Hour, time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer outbox.Close()
+			outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
+			claim := spoolTestClaim("attempt-renewal-" + strings.ReplaceAll(test.name, " ", "-"))
+			claim.Lease.LeaseTTL = time.Second
+			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+				client: client, runtimes: testRuntimeSet(runtimeFailureResultRunner{}), outbox: outbox,
+				clock: systemClock{}, renewalInterval: time.Millisecond, completionRetry: time.Millisecond,
+				observer: newLifecycleObserver(systemClock{}),
+			})
+			executeDone := make(chan error, 1)
+			go func() {
+				_, executeErr := lifecycle.execute(t.Context(), claim, time.Now())
+				executeDone <- executeErr
+			}()
+			select {
+			case err := <-executeDone:
+				if err == nil {
+					t.Fatal("renewal authority loss did not terminate the lifecycle")
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("lifecycle did not abandon the in-flight completion")
+			}
+			var live l1.CompletionRequest
+			select {
+			case live = <-firstCompletion:
+			case <-time.After(2 * time.Second):
+				t.Fatal("live completion did not reach L1")
+			}
+			select {
+			case replayed := <-replayedCompletion:
+				if !reflect.DeepEqual(replayed, live) {
+					t.Fatalf("replayed completion = %+v, want exact live body %+v", replayed, live)
+				}
+			case <-time.After(2 * time.Second):
+				receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+				t.Fatalf("abandoned completion was not reconciled; receipt=%+v", receipt)
+			}
+			waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
+		})
+	}
+}
+
 func assertAttemptPersistsCompletionBeforeDelivery(t *testing.T) {
 	t.Helper()
 	completionStarted := make(chan struct{}, 1)
@@ -228,6 +326,17 @@ func (instantResultRunner) Run(_ context.Context, request processrunner.Request,
 	}
 	exitCode := 0
 	return contract.ProcessResult{ExitCode: &exitCode}, nil
+}
+
+type runtimeFailureResultRunner struct{}
+
+func (runtimeFailureResultRunner) Run(_ context.Context, request processrunner.Request, _ processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
+	return contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{
+		Code: contract.RuntimeFailureUnavailable, Message: "helper generation lost",
+	}}, nil
 }
 
 func TestEvidenceRecoveryIsolatesTransientPoisonAttempt(t *testing.T) {
@@ -321,13 +430,138 @@ func TestEvidenceRecoveryWakesForCompletionStoredAfterInitialScan(t *testing.T) 
 	}
 }
 
+func TestEvidenceRecoveryBoundsLogReplayBeforeCompletion(t *testing.T) {
+	firstPassFinished := make(chan struct{})
+	releaseFirstPass := make(chan struct{})
+	completionSeen := make(chan struct{}, 1)
+	var finishOnce sync.Once
+	var mu sync.Mutex
+	logCalls := 0
+	completionCalls := 0
+	var logUploads []l1.AppendLogsRequest
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if strings.HasSuffix(request.URL.Path, "/logs") {
+			var appendRequest l1.AppendLogsRequest
+			if err := json.NewDecoder(request.Body).Decode(&appendRequest); err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			logCalls++
+			logUploads = append(logUploads, appendRequest)
+			mu.Unlock()
+			acknowledged := map[contract.LogStream]uint64{}
+			for _, event := range appendRequest.Events {
+				acknowledged[event.Stream] = eventEndSequence(event)
+			}
+			_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{Acknowledged: acknowledged})
+			return
+		}
+		mu.Lock()
+		completionCalls++
+		mu.Unlock()
+		completionSeen <- struct{}{}
+		_ = json.NewEncoder(w).Encode(l1.Job{})
+	})
+	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	defer stopServer()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1<<20, systemClock{}, 1, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := spoolTestClaim("attempt-bounded-log-replay")
+	if err := outbox.ensureAttempt(t.Context(), claim); err != nil {
+		t.Fatal(err)
+	}
+	for sequence := uint64(0); sequence < maxEvidenceLogReplayBatchesPerPass+1; sequence++ {
+		if err := outbox.spool.append(t.Context(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, sequence, "load")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exitCode := 0
+	if err := outbox.storeCompletion(t.Context(), claim.Lease.AttemptID, l1.ProcessResult{ExitCode: &exitCode}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	outbox.recoveryAttemptFinished = func(attemptID string) {
+		if attemptID == claim.Lease.AttemptID {
+			finishOnce.Do(func() {
+				close(firstPassFinished)
+				<-releaseFirstPass
+			})
+		}
+	}
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
+	select {
+	case <-firstPassFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bounded recovery pass did not finish")
+	}
+	mu.Lock()
+	firstPassLogCalls := logCalls
+	firstPassCompletionCalls := completionCalls
+	mu.Unlock()
+	if firstPassLogCalls != maxEvidenceLogReplayBatchesPerPass || firstPassCompletionCalls != 0 {
+		t.Fatalf("first recovery pass = %d log calls, %d completion calls; want %d and 0", firstPassLogCalls, firstPassCompletionCalls, maxEvidenceLogReplayBatchesPerPass)
+	}
+	close(releaseFirstPass)
+	select {
+	case <-completionSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("completion did not follow the remaining durable log batch")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if logCalls != maxEvidenceLogReplayBatchesPerPass+1 || completionCalls != 1 {
+		t.Fatalf("complete recovery = %d log calls, %d completion calls; want %d and 1", logCalls, completionCalls, maxEvidenceLogReplayBatchesPerPass+1)
+	}
+	finalUpload := logUploads[len(logUploads)-1]
+	if len(finalUpload.Events) != 1 || finalUpload.Events[0].Gap == nil ||
+		finalUpload.Events[0].Gap.Reason != contract.LogGapRecoveryReplayBound ||
+		finalUpload.Events[0].Gap.ThroughSequence != maxEvidenceLogReplayBatchesPerPass {
+		t.Fatalf("bounded recovery final upload = %#v, want recovery replay gap through sequence %d", finalUpload.Events, maxEvidenceLogReplayBatchesPerPass)
+	}
+}
+
+func TestEvidenceRecoveryRetriesScanErrorsWithInjectedClock(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC))
+	retryInterval := 25 * time.Millisecond
+	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1024, clock, 1, time.Hour, retryInterval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	if err := outbox.spool.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reports := make(chan error, 2)
+	outbox.startRecovery(t.Context(), nil, func(err error) { reports <- err })
+	select {
+	case <-reports:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial spool scan error was not reported")
+	}
+	clock.waitForDeadline(t, clock.Now().Add(retryInterval))
+	clock.Advance(retryInterval)
+	select {
+	case <-reports:
+	case <-time.After(2 * time.Second):
+		t.Fatal("spool scan was not retried after injected-clock backoff")
+	}
+}
+
 func TestEvidenceRecoveryDoesNotReplayLiveAttempt(t *testing.T) {
 	liveRequest := make(chan string, 1)
 	lateCompletion := make(chan struct{}, 1)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if strings.Contains(request.URL.Path, "attempt-live") {
 			liveRequest <- request.URL.Path
-			http.Error(w, "live evidence must stay with its sink", http.StatusInternalServerError)
+			if strings.HasSuffix(request.URL.Path, "/logs") {
+				_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(l1.Job{})
 			return
 		}
 		lateCompletion <- struct{}{}
@@ -346,14 +580,31 @@ func TestEvidenceRecoveryDoesNotReplayLiveAttempt(t *testing.T) {
 	}
 	defer outbox.Close()
 	live := spoolTestClaim("attempt-live")
-	if err := outbox.ensureAttempt(t.Context(), live); err != nil {
-		t.Fatal(err)
+	live.Job.Spec.Kind = contract.JobKindProcess
+	live.Job.Spec.Execution = contract.ExecutionSpec{
+		Executable: contract.ExecutableSpec{Path: "ignored-by-fake-runner"},
+		Argv:       []string{"ignored-by-fake-runner"}, WorkingDirectory: t.TempDir(),
 	}
-	if err := outbox.spool.append(t.Context(), spoolTestEvent(live.Lease.AttemptID, contract.LogStdout, 0, "owned")); err != nil {
-		t.Fatal(err)
+	live.Lease.LeaseTTL = time.Minute
+	runner := &liveEvidenceRunner{started: make(chan struct{})}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		client: client, runtimes: testRuntimeSet(runner), outbox: outbox,
+		clock: systemClock{}, renewalInterval: 10 * time.Second, completionRetry: time.Millisecond,
+		observer: newLifecycleObserver(systemClock{}),
+	})
+	liveContext, cancelLive := context.WithCancel(t.Context())
+	executeDone := make(chan error, 1)
+	go func() {
+		_, executeErr := lifecycle.execute(liveContext, live, time.Now())
+		executeDone <- executeErr
+	}()
+	select {
+	case <-runner.started:
+	case err := <-executeDone:
+		t.Fatalf("live lifecycle exited before emitting its log event: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("live lifecycle did not durably emit its log event")
 	}
-	outbox.ownAttempt(live.Lease.AttemptID)
-	defer outbox.releaseAttempt(live.Lease.AttemptID, false)
 	late := spoolTestClaim("attempt-late")
 	if err := outbox.ensureAttempt(t.Context(), late); err != nil {
 		t.Fatal(err)
@@ -374,6 +625,31 @@ func TestEvidenceRecoveryDoesNotReplayLiveAttempt(t *testing.T) {
 		t.Fatalf("reconciler touched live attempt at %s", path)
 	case <-time.After(50 * time.Millisecond):
 	}
+	cancelLive()
+	select {
+	case <-executeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("live lifecycle did not stop")
+	}
+}
+
+type liveEvidenceRunner struct {
+	started chan struct{}
+}
+
+func (runner *liveEvidenceRunner) Run(ctx context.Context, request processrunner.Request, sink processrunner.OutputSink) (contract.ProcessResult, error) {
+	if request.Started != nil {
+		request.Started()
+	}
+	if err := sink.WriteOutput(ctx, contract.LogEvent{
+		AttemptID: request.AttemptID, Stream: contract.LogStdout, Sequence: 0,
+		Timestamp: time.Now().UTC(), Bytes: []byte("owned"),
+	}); err != nil {
+		return contract.ProcessResult{}, err
+	}
+	close(runner.started)
+	<-ctx.Done()
+	return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}, ctx.Err()
 }
 
 func TestPendingEvidenceDoesNotBlockRegistration(t *testing.T) {
@@ -524,8 +800,7 @@ func assertEvidenceRecoveryIsolatesTransientPoisonAttempt(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	recoveryDone := make(chan error, 1)
-	go func() { recoveryDone <- outbox.recover(ctx, client) }()
+	outbox.startRecovery(ctx, client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
 	select {
 	case <-poisonRequestStarted:
 	case <-time.After(2 * time.Second):
@@ -533,11 +808,6 @@ func assertEvidenceRecoveryIsolatesTransientPoisonAttempt(t *testing.T) {
 	}
 	waitForSpoolHighWater(t, outbox.spool, "attempt-good", contract.LogStdout, 0)
 	cancel()
-	select {
-	case <-recoveryDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("recovery did not stop after cancellation")
-	}
 }
 
 func TestEvidenceRecoveryReplacesPermanentReplayRejectionWithGap(t *testing.T) {
@@ -621,8 +891,15 @@ func assertEvidenceRecoverySealsAuthorityLossIncomplete(t *testing.T) {
 	if err := outbox.spool.append(context.Background(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, 0, "raw")); err != nil {
 		t.Fatal(err)
 	}
-	if err := outbox.recover(context.Background(), client); err == nil || !strings.Contains(err.Error(), "sealed incomplete") {
-		t.Fatalf("recovery error = %v, want sealed-incomplete report", err)
+	reports := make(chan error, 1)
+	outbox.startRecovery(t.Context(), client, func(err error) { reports <- err })
+	select {
+	case err := <-reports:
+		if !strings.Contains(err.Error(), "sealed incomplete") {
+			t.Fatalf("recovery error = %v, want sealed-incomplete report", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sealed-incomplete report")
 	}
 	var eventCount int
 	var incompleteJSON []byte
@@ -640,6 +917,7 @@ func assertEvidenceRecoveryReplacesPermanentReplayRejectionWithGap(t *testing.T)
 	t.Helper()
 	var mu sync.Mutex
 	var uploads []l1.AppendLogsRequest
+	uploadSeen := make(chan struct{}, 2)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		payload, err := io.ReadAll(request.Body)
 		if err != nil {
@@ -655,6 +933,7 @@ func assertEvidenceRecoveryReplacesPermanentReplayRejectionWithGap(t *testing.T)
 		uploads = append(uploads, appendRequest)
 		requestNumber := len(uploads)
 		mu.Unlock()
+		uploadSeen <- struct{}{}
 		if requestNumber == 1 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
@@ -684,9 +963,15 @@ func assertEvidenceRecoveryReplacesPermanentReplayRejectionWithGap(t *testing.T)
 	if err := outbox.spool.append(context.Background(), spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, 0, "raw")); err != nil {
 		t.Fatal(err)
 	}
-	if err := outbox.recover(context.Background(), client); err != nil {
-		t.Fatal(err)
+	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
+	for range 2 {
+		select {
+		case <-uploadSeen:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for rejected raw event and replacement gap")
+		}
 	}
+	waitForSpoolHighWater(t, outbox.spool, claim.Lease.AttemptID, contract.LogStdout, 0)
 
 	mu.Lock()
 	defer mu.Unlock()

@@ -631,6 +631,7 @@ const (
 	LogGapSpoolEviction             LogGapReason = "spool_eviction"
 	LogGapOversizedEvent            LogGapReason = "oversized_event"
 	LogGapReplayRejected            LogGapReason = "replay_rejected"
+	LogGapRecoveryReplayBound       LogGapReason = "recovery_replay_bound"
 	LogGapLateEvidenceWindowExpired LogGapReason = "late_evidence_window_expired"
 	LogGapLoggerSourceIncomplete    LogGapReason = "logger_source_incomplete"
 )

@@ -1015,6 +1015,107 @@ SET bytes=X'', gap_json=?, payload_bytes=0 WHERE ordinal=? AND attempt_id=? AND 
 	return nil
 }
 
+// replacePendingWithRecoveryReplayGaps bounds recovery work without silently
+// dropping the completion's preceding log stream. Each remaining stream is
+// collapsed to one truthful gap which must itself be accepted before completion
+// replay can proceed.
+func (spool *logSpool) replacePendingWithRecoveryReplayGaps(ctx context.Context, attemptID string) error {
+	type streamGap struct {
+		stream          contract.LogStream
+		firstOrdinal    int64
+		throughSequence uint64
+		lostEventCount  uint64
+		lostByteCount   uint64
+	}
+	rows, err := spool.db.QueryContext(ctx, `SELECT ordinal, stream, sequence, bytes, gap_json
+FROM spool_events WHERE attempt_id=? ORDER BY stream, sequence`, attemptID)
+	if err != nil {
+		return fmt.Errorf("agent: select recovery replay gap input: %w", err)
+	}
+	var gaps []streamGap
+	for rows.Next() {
+		var ordinal, sequence int64
+		var stream contract.LogStream
+		var payload, gapJSON []byte
+		if err := rows.Scan(&ordinal, &stream, &sequence, &payload, &gapJSON); err != nil {
+			rows.Close()
+			return fmt.Errorf("agent: scan recovery replay gap input: %w", err)
+		}
+		if sequence < 0 {
+			rows.Close()
+			return fmt.Errorf("agent: recovery replay sequence %d is negative", sequence)
+		}
+		through := uint64(sequence)
+		lostEvents := uint64(1)
+		lostBytes := uint64(len(payload))
+		if len(gapJSON) != 0 {
+			var existing contract.LogGap
+			if err := json.Unmarshal(gapJSON, &existing); err != nil {
+				rows.Close()
+				return fmt.Errorf("agent: decode recovery replay gap input: %w", err)
+			}
+			through = existing.ThroughSequence
+			lostEvents = existing.LostEventCount
+			lostBytes = existing.LostByteCount
+		}
+		if len(gaps) == 0 || gaps[len(gaps)-1].stream != stream {
+			gaps = append(gaps, streamGap{
+				stream: stream, firstOrdinal: ordinal, throughSequence: through,
+				lostEventCount: lostEvents, lostByteCount: lostBytes,
+			})
+			continue
+		}
+		gap := &gaps[len(gaps)-1]
+		if uint64(sequence) != gap.throughSequence+1 {
+			rows.Close()
+			return fmt.Errorf("agent: recovery replay for %s is not a contiguous sequence", stream)
+		}
+		gap.throughSequence = through
+		gap.lostEventCount += lostEvents
+		gap.lostByteCount += lostBytes
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("agent: iterate recovery replay gap input: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("agent: close recovery replay gap input: %w", err)
+	}
+	if len(gaps) == 0 {
+		return nil
+	}
+
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("agent: begin recovery replay gap replacement: %w", err)
+	}
+	defer tx.Rollback()
+	for _, gap := range gaps {
+		gapJSON, err := json.Marshal(contract.LogGap{
+			ThroughSequence: gap.throughSequence,
+			LostEventCount:  gap.lostEventCount,
+			LostByteCount:   gap.lostByteCount,
+			Reason:          contract.LogGapRecoveryReplayBound,
+		})
+		if err != nil {
+			return fmt.Errorf("agent: encode recovery replay gap: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE spool_events
+SET bytes=X'', gap_json=?, payload_bytes=0 WHERE ordinal=? AND attempt_id=? AND stream=?`,
+			gapJSON, gap.firstOrdinal, attemptID, gap.stream); err != nil {
+			return fmt.Errorf("agent: store recovery replay gap: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM spool_events
+WHERE attempt_id=? AND stream=? AND ordinal<>?`, attemptID, gap.stream, gap.firstOrdinal); err != nil {
+			return fmt.Errorf("agent: release recovery replay payload: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("agent: commit recovery replay gap replacement: %w", err)
+	}
+	return nil
+}
+
 func (spool *logSpool) sealIncomplete(ctx context.Context, attemptID, reason string, code contract.ErrorCode, sealedAt time.Time) error {
 	tx, err := spool.db.BeginTx(ctx, nil)
 	if err != nil {

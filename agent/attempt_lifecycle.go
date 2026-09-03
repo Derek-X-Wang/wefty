@@ -185,8 +185,9 @@ func (finalization *attemptFinalization) stop() {
 }
 
 var (
-	errAttemptDirectiveStop    = errors.New("attempt directive: stop")
-	errAttemptDirectiveRestart = errors.New("attempt directive: restart")
+	errAttemptDirectiveStop        = errors.New("attempt directive: stop")
+	errAttemptDirectiveRestart     = errors.New("attempt directive: restart")
+	errCompletionDeliveryAbandoned = errors.New("attempt completion delivery abandoned")
 )
 
 const ociRuntimeRecoveryTimeout = 10 * time.Second
@@ -302,10 +303,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			// terminal result and finish any handoff or volume finalization.
 			return errorDestinationUnclassified, nil
 		}
-		result := outcome.result
-		if result == (contract.ProcessResult{}) {
-			result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
-		}
+		result := agentTerminatedResult(outcome.result)
 		outcome.result = result
 		if err := persistCompletion(&outcome); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
@@ -340,10 +338,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			cancelAttempt(failure.err)
 			outcome := <-completed
 			<-renewalDone
-			result := outcome.result
-			if result == (contract.ProcessResult{}) {
-				result = contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
-			}
+			result := agentTerminatedResult(outcome.result)
 			outcome.result = result
 			if err := persistCompletion(&outcome); err != nil {
 				return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
@@ -445,6 +440,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		completionFailure = <-completionDone
 		<-renewalDone
 		if completionFailure.err != nil {
+			reconcileCompletion = true
 			return renewalFailure.destination, fmt.Errorf("agent: renew lease while completing: %w", renewalFailure.err)
 		}
 	case err := <-watch.Failures():
@@ -506,6 +502,13 @@ func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, c
 func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) destinationError {
 	for {
 		if _, err := lifecycle.dependencies.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request); err != nil {
+			_, ownProtocolResponse := err.(*ProtocolError)
+			if cause := context.Cause(ctx); cause != nil && !ownProtocolResponse {
+				// A canceled HTTP request has no L1 delivery verdict. Its cause may
+				// itself be a ProtocolError from renewal, but classifying that cause
+				// as the /complete response can falsely acknowledge or seal evidence.
+				return destinationError{destination: errorDestinationUnclassified, err: fmt.Errorf("%w: %v", errCompletionDeliveryAbandoned, cause)}
+			}
 			if protocolErrorCode(err) == contract.ErrorLeaseExpired {
 				if lifecycle.dependencies.outbox != nil {
 					if releaseErr := lifecycle.dependencies.outbox.completionDelivered(context.WithoutCancel(ctx), claim.Lease.AttemptID); releaseErr != nil {
@@ -542,6 +545,13 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 		}
 		return destinationError{}
 	}
+}
+
+func agentTerminatedResult(result contract.ProcessResult) contract.ProcessResult {
+	if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.OutputError == "" {
+		return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
+	}
+	return result
 }
 
 func (lifecycle *attemptLifecycle) runWorkload(ctx context.Context, claim l1.Claim) (contract.ProcessResult, error) {
