@@ -261,9 +261,14 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 		t.Fatalf("Computer changed image USER/ENTRYPOINT/CMD or privilege boundary: %+v", spec.Process)
 	}
 	if spec.Process.Capabilities == nil || !slices.Equal(spec.Process.Capabilities.Bounding, isolationCapabilities) ||
-		spec.Linux == nil || spec.Linux.Seccomp == nil || !slices.Equal(spec.Linux.Namespaces, isolationNamespaces()) ||
+		spec.Linux == nil || spec.Linux.Seccomp == nil || !slices.Equal(spec.Linux.Namespaces, isolationNamespaces(true)) ||
 		len(spec.Linux.Devices) != len(isolationDevices()) {
 		t.Fatal("Computer profile diverged from the ordinary M3 isolation walls")
+	}
+	if !slices.ContainsFunc(spec.Linux.Namespaces, func(namespace specs.LinuxNamespace) bool {
+		return namespace.Type == specs.NetworkNamespace
+	}) {
+		t.Fatalf("Computer profile omitted its private network namespace: %#v", spec.Linux.Namespaces)
 	}
 	for _, device := range spec.Linux.Devices {
 		if strings.Contains(device.Path, "dri") || strings.Contains(device.Path, "nvidia") {

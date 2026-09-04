@@ -53,34 +53,35 @@ import (
 )
 
 type containerdAttempt struct {
-	authority        AttemptAuthority
-	resources        ResourceIdentity
-	computerDisk     *computerDiskAttachment
-	container        containerd.Container
-	task             containerd.Task
-	signaler         containerdTaskSignaler
-	releaseTask      func(context.Context) error
-	terminalReady    chan struct{}
-	terminalCode     uint32
-	terminalErr      error
-	stdout           string
-	stderr           string
-	oom              bool
-	oomCancel        context.CancelFunc
-	cancel           context.CancelFunc
-	signal           Signal
-	signalCause      string
-	deleted          bool
-	logAcknowledged  map[string]uint64
-	hostBridge       net.Listener
-	endpoints        map[string]uint16
-	endpointHolds    map[string]net.Listener
-	controlDirectory string
-	computerUID      uint32
-	computerGID      uint32
-	controlMu        sync.Mutex
-	lost             bool
-	mu               sync.Mutex
+	authority           AttemptAuthority
+	resources           ResourceIdentity
+	computerDisk        *computerDiskAttachment
+	container           containerd.Container
+	task                containerd.Task
+	signaler            containerdTaskSignaler
+	releaseTask         func(context.Context) error
+	terminalReady       chan struct{}
+	terminalCode        uint32
+	terminalErr         error
+	stdout              string
+	stderr              string
+	oom                 bool
+	oomCancel           context.CancelFunc
+	cancel              context.CancelFunc
+	signal              Signal
+	signalCause         string
+	deleted             bool
+	logAcknowledged     map[string]uint64
+	hostBridge          net.Listener
+	endpoints           map[string]uint16
+	endpointHolds       map[string]net.Listener
+	controlDirectory    string
+	computerUID         uint32
+	computerGID         uint32
+	networkNamespacePID uint32
+	controlMu           sync.Mutex
+	lost                bool
+	mu                  sync.Mutex
 }
 
 type containerdTaskSignaler interface {
@@ -1077,6 +1078,35 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		return RunResponse{}, fmt.Errorf("create runc v2 task with binary-v2 logs: %w", err)
 	}
 	if computer {
+		if err := bringUpTaskLoopback(task.Pid()); err != nil {
+			return RunResponse{}, fmt.Errorf("prepare Computer network namespace: %w", err)
+		}
+		for name, hold := range endpointHolds {
+			port := endpoints[name]
+			if err := hold.Close(); err != nil {
+				return RunResponse{}, fmt.Errorf("release host Computer endpoint reservation %q: %w", name, err)
+			}
+			privateHold, err := listenTaskLoopback(task.Pid(), port)
+			if err != nil {
+				return RunResponse{}, fmt.Errorf("reserve private Computer endpoint %q: %w", name, err)
+			}
+			endpointHolds[name] = privateHold
+		}
+		if hostBridge != nil {
+			address, ok := hostBridge.Addr().(*net.TCPAddr)
+			if !ok || address.Port <= 0 || address.Port > 65535 {
+				return RunResponse{}, errors.New("Computer host bridge reservation is not TCP")
+			}
+			if err := hostBridge.Close(); err != nil {
+				return RunResponse{}, fmt.Errorf("release host Computer bridge reservation: %w", err)
+			}
+			hostBridge, err = listenTaskLoopback(task.Pid(), uint16(address.Port))
+			if err != nil {
+				return RunResponse{}, fmt.Errorf("reserve private Computer bridge: %w", err)
+			}
+		}
+	}
+	if computer {
 		memoryMax, oomGroup, swapMax, verifyErr := verifyComputerCgroupMemoryPolicy(engine.config.CgroupRoot, request.Resources.CgroupID, request.Workload.Limits.MemoryBytes)
 		profile.MemoryMaxBytes = memoryMax
 		profile.MemoryOOMGroup = oomGroup
@@ -1101,6 +1131,9 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		}
 		return deleteErr
 	}, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID}
+	if computer {
+		attempt.networkNamespacePID = task.Pid()
+	}
 	engine.watchOOM(attempt)
 	engine.mu.Lock()
 	engine.attempts[request.Authority.key()] = attempt
@@ -1128,9 +1161,9 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	return RunResponse{Started: true, StartedAt: startedAt, Image: &evidence, Endpoints: endpoints, HostBridgeReady: hostBridge != nil, HostBridgeEndpoint: hostBridgeEndpoint, Profile: profile, Admission: admission}, nil
 }
 
-func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cgroupID string, port uint16) error {
+func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cgroupID string, networkNamespacePID uint32, port uint16) error {
 	for {
-		inode, found, err := loopbackListenInode(port)
+		inode, found, err := loopbackListenInode(networkNamespacePID, port)
 		if err != nil {
 			return err
 		}
@@ -1154,8 +1187,12 @@ func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cg
 	}
 }
 
-func loopbackListenInode(port uint16) (string, bool, error) {
-	file, err := os.Open("/proc/net/tcp")
+func loopbackListenInode(networkNamespacePID uint32, port uint16) (string, bool, error) {
+	path := "/proc/net/tcp"
+	if networkNamespacePID != 0 {
+		path = fmt.Sprintf("/proc/%d/net/tcp", networkNamespacePID)
+	}
+	file, err := os.Open(path)
 	if err != nil {
 		return "", false, err
 	}
@@ -2432,16 +2469,29 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 }
 
 func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
+	var networkNamespacePID uint32
+	if request.Authority.validate() == nil {
+		attempt, err := engine.attempt(request.Authority)
+		if err != nil {
+			return err
+		}
+		networkNamespacePID = attempt.networkNamespacePID
+	}
 	if request.CgroupID != "" {
 		bindContext, cancelBind := context.WithTimeout(ctx, engine.config.AttemptPortBindTimeout)
-		err := engine.waitAttemptPortOwnership(bindContext, request.CgroupID, request.Port)
+		err := engine.waitAttemptPortOwnership(bindContext, request.CgroupID, networkNamespacePID, request.Port)
 		cancelBind()
 		if err != nil {
 			return fmt.Errorf("verify payload attempt endpoint ownership: %w", err)
 		}
 	}
-	dialer := &net.Dialer{}
-	backend, err := dialer.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(request.Port)))
+	var backend net.Conn
+	var err error
+	if networkNamespacePID != 0 {
+		backend, err = dialTaskLoopback(ctx, networkNamespacePID, request.Port)
+	} else {
+		backend, err = (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(request.Port)))
+	}
 	if err != nil {
 		return fmt.Errorf("dial attempt loopback port: %w", err)
 	}

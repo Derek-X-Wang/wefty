@@ -14,9 +14,9 @@ fi
 
 view_port=$WEFTY_COMPUTER_VIEW_PORT
 control_port=$WEFTY_COMPUTER_CONTROL_PORT
-# Computers share the Node network namespace, including Linux abstract Unix
-# sockets. Reuse the helper-reserved view port as the X display number so two
-# live XFCE Computers cannot both claim the fixed @/tmp/.X11-unix/X99 socket.
+# Reuse the helper-reserved view port as the X display number. The profile's
+# per-Computer network namespace keeps the matching Linux abstract X socket
+# private; the derived name also avoids a fixed :99 within that namespace.
 DISPLAY=:$view_port
 export DISPLAY
 

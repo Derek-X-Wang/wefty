@@ -243,9 +243,10 @@ Both reference images demonstrate the minimum contract shape:
 
 The first image runs Xvfb/XFCE and Chromium with CPU rendering. Its X display
 number is derived from the helper-reserved view port, avoiding accidental
-contention for a fixed `:99`. This naming convention is not X11 isolation:
-Computers share the Node network namespace, so a co-located process can still
-reach another display's node-wide Linux abstract socket.
+contention for a fixed `:99`. The Computer profile supplies a private network
+namespace, so the matching Linux abstract X socket is neither enumerable nor
+connectable from a co-located Computer. The helper reaches the image only
+through its authority-bound named view/control streams.
 Chromium is launched with `--no-sandbox`; that is a disclosed limitation of
 this example, not an expansion of the OCI security profile. Wefty adds no GPU,
 device, capability,

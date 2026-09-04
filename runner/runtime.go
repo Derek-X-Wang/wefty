@@ -410,16 +410,18 @@ type Request struct {
 	OCILogSealObserved func(OCILogSealObservation)
 	OCIImageDeadline   time.Time
 	InitialDeadman     time.Duration
-	// HostBridgeDial is set only for Lima's bind-failure reverse-tunnel path.
-	// It dials the host-local run bridge and never accepts an arbitrary target.
+	// HostBridgeDial dials the host-local run bridge and never accepts an
+	// arbitrary target. Computers always use it so their private network
+	// namespace does not widen the orchestrator channel; ordinary OCI uses it
+	// only for Lima's bind-failure reverse-tunnel path.
 	HostBridgeDial func(context.Context) (net.Conn, error)
-	// HostBridgeFallbackActive selects the prepared helper listener as the
-	// start-time endpoint. Computer attempts may prepare it dormant so a later
-	// policy enable can still use the constrained fallback.
+	// HostBridgeFallbackActive selects the helper listener as the start-time
+	// endpoint. Computer attempts always select their private-namespace bridge;
+	// ordinary OCI uses it only for the constrained Lima fallback.
 	HostBridgeFallbackActive bool
-	// HostBridgeEndpointReady reports the helper-owned guest loopback endpoint
-	// for the constrained Lima fallback. It does not make the endpoint visible
-	// to the workload; the Computer authority lifecycle publishes it separately.
+	// HostBridgeEndpointReady reports the helper-owned guest loopback endpoint.
+	// It does not make the endpoint visible to the workload; the Computer
+	// authority lifecycle publishes it separately.
 	HostBridgeEndpointReady func(string) error
 	// AttemptEndpoints asks an OCI runtime to allocate a bounded named endpoint
 	// set. AttemptEndpointReady transfers each exact-authority dialer to the

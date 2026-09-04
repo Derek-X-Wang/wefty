@@ -339,6 +339,25 @@ func TestComputerAttemptBridgeProjectsOnlyTheL3OwnedSurface(t *testing.T) {
 	}
 }
 
+func TestComputerAttemptBridgePublishesPrivateNamespaceEndpoint(t *testing.T) {
+	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "agent"})
+	controller := newComputerAttemptBridgeController(t.Context(), func(ctx context.Context, _ string, _ contract.ExecutionSpec) (*workflowBridge, error) {
+		return newComputerAttemptBridge(ctx, participant, "wefty://run-ledger", true)
+	}, contract.JobKindOCI, contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}}})
+	const guestEndpoint = "http://127.0.0.1:42424/l3"
+	if err := controller.setGuestEndpoint(guestEndpoint); err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := controller.enable("computer-pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.disable(errComputerAttemptClosed)
+	if endpoint != guestEndpoint {
+		t.Fatalf("Computer bridge endpoint = %q, want private namespace endpoint %q", endpoint, guestEndpoint)
+	}
+}
+
 func TestComputerAttemptBridgeNegativeRouteReceiptIsAssertionDerived(t *testing.T) {
 	network := plain.NewNetwork()
 	l3Fabric := network.NewFabric(fabric.Identity{NodeID: "run-ledger"})

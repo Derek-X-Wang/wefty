@@ -436,7 +436,7 @@ func buildRuntimeSpec(ctx context.Context, input RuntimeSpecInput, dependencies 
 	spec.Linux = &specs.Linux{
 		Devices:       isolationDevices(),
 		CgroupsPath:   input.CgroupPath,
-		Namespaces:    isolationNamespaces(),
+		Namespaces:    isolationNamespaces(input.Workload.Computer),
 		Resources:     resources,
 		MaskedPaths:   isolationMaskedPaths(),
 		ReadonlyPaths: isolationReadonlyPaths(),
@@ -589,14 +589,18 @@ func explicitIsolationCapabilities() *specs.LinuxCapabilities {
 	}
 }
 
-func isolationNamespaces() []specs.LinuxNamespace {
-	return []specs.LinuxNamespace{
+func isolationNamespaces(computer bool) []specs.LinuxNamespace {
+	namespaces := []specs.LinuxNamespace{
 		{Type: specs.PIDNamespace},
 		{Type: specs.IPCNamespace},
 		{Type: specs.UTSNamespace},
 		{Type: specs.MountNamespace},
 		{Type: specs.CgroupNamespace},
 	}
+	if computer {
+		namespaces = append(namespaces, specs.LinuxNamespace{Type: specs.NetworkNamespace})
+	}
+	return namespaces
 }
 
 func isolationDevices() []specs.LinuxDevice {

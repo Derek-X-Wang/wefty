@@ -650,6 +650,9 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 	if computer && request.Authority.Class != contract.JobClassService {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: "Computer mechanics require service attempt authority"}
 	}
+	if computer && (!request.EnableHostBridgeFallback || !request.ActivateHostBridgeFallback) {
+		return nil, &RPCError{Code: CodeInvalidRequest, Message: "Computer mechanics require the private network namespace bridge"}
+	}
 	if err := validateRunEndpointContract(computer, request.AllocateEndpoints); err != nil {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: err.Error()}
 	}

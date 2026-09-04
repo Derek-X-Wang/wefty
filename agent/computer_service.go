@@ -89,7 +89,7 @@ func (controller *computerAttemptBridgeController) enable(token string) (string,
 		return "", errors.New("Computer attempt bridge factory returned no Computer transport")
 	}
 	endpoint := bridge.l3Endpoint
-	if bridge.hostBridgeFallback && controller.guestEndpoint != "" {
+	if controller.guestEndpoint != "" {
 		endpoint = controller.guestEndpoint
 	}
 	controller.bridge = bridge
@@ -128,21 +128,12 @@ func (controller *computerAttemptBridgeController) setGuestEndpoint(endpoint str
 	return nil
 }
 
-func (controller *computerAttemptBridgeController) usesHostBridgeFallback() bool {
-	if controller == nil {
-		return false
-	}
-	controller.mu.Lock()
-	defer controller.mu.Unlock()
-	return controller.bridge != nil && controller.bridge.hostBridgeFallback
-}
-
 func (controller *computerAttemptBridgeController) dial(ctx context.Context) (net.Conn, error) {
 	for {
 		controller.mu.Lock()
 		bridge, changed := controller.bridge, controller.changed
 		controller.mu.Unlock()
-		if bridge != nil && bridge.hostBridgeFallback {
+		if bridge != nil {
 			return bridge.dial(ctx)
 		}
 		select {
