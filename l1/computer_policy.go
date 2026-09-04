@@ -552,8 +552,10 @@ func (s *Store) ResolvePersonComputerHandle(
 	}
 	var result ComputerHandleResolution
 	var currentJobID string
+	// Durable IDs continue to address retained take-over evidence after removal;
+	// the reusable friendly name is only actionable for a live Computer.
 	err = tx.QueryRowContext(ctx, `SELECT computer_id, name, current_job_id FROM computers
-		WHERE desired_state<>'removed' AND (computer_id=? OR current_job_id=? OR name=?)
+		WHERE computer_id=? OR current_job_id=? OR (name=? AND desired_state<>'removed')
 		ORDER BY CASE WHEN computer_id=? THEN 0 WHEN current_job_id=? THEN 1 ELSE 2 END LIMIT 1`,
 		handle, handle, handle, handle, handle).Scan(&result.ComputerID, &result.FriendlyName, &currentJobID)
 	if errors.Is(err, sql.ErrNoRows) {

@@ -41,6 +41,42 @@ func TestComputerCLIResolvesFriendlyNameAfterExactID(t *testing.T) {
 	}
 }
 
+func TestComputerVerbResolvesExactIDBeforeCollidingFriendlyName(t *testing.T) {
+	harness, computer, _, _ := newRunningComputerCLIFixture(t, "exact-id-target")
+	ctx := context.Background()
+	collision := createComputerCLIProjection(t, ctx, harness.clients, computer.ComputerID, "exact-id-collision")
+
+	output := runServiceCLI(t, ctx, harness.clients, true, "services", "reimage", computer.ComputerID,
+		"--expect-current", "--image", "ghcr.io/example/exact-id@"+computerCLITestDigestB,
+		"--idempotency-key", "exact-id-reimage", "--terminate-sessions")
+	var projected computerOperatorProjection
+	if err := json.Unmarshal(output, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if projected.ComputerID != computer.ComputerID || projected.ComputerID == collision.ComputerID {
+		t.Fatalf("Computer reimage selected %q, want exact ID %q ahead of same-shaped friendly name on %q",
+			projected.ComputerID, computer.ComputerID, collision.ComputerID)
+	}
+}
+
+func TestClientPrincipalResolvesComputerNameForReimageAndBackupList(t *testing.T) {
+	harness, computer, _, _ := newRunningComputerCLIFixture(t, "client-name-target")
+	ctx := context.Background()
+
+	backupOutput := runServiceCLI(t, ctx, harness.clients, true, "services", "backup", "list", computer.Name)
+	var backups computerBackupInventory
+	if err := json.Unmarshal(backupOutput, &backups); err != nil || backups.Backups == nil {
+		t.Fatalf("Backup list by friendly name = %#v err=%v output=%s", backups, err, backupOutput)
+	}
+	reimageOutput := runServiceCLI(t, ctx, harness.clients, true, "services", "reimage", computer.Name,
+		"--expect-current", "--image", "ghcr.io/example/client-name@"+computerCLITestDigestB,
+		"--idempotency-key", "client-name-reimage", "--terminate-sessions")
+	var reimaged computerOperatorProjection
+	if err := json.Unmarshal(reimageOutput, &reimaged); err != nil || reimaged.ComputerID != computer.ComputerID {
+		t.Fatalf("Computer reimage by friendly name = %#v err=%v output=%s", reimaged, err, reimageOutput)
+	}
+}
+
 func TestComputerCLIRealRoutesDefaultsLifecycleAndReplay(t *testing.T) {
 	harness := newServiceCLIHarness(t)
 	harness.clients.images = &fakeImageResolver{digest: computerCLITestDigest}

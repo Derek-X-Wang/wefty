@@ -330,6 +330,10 @@ func resolveServiceTarget(ctx context.Context, clients *apiClients, target strin
 }
 
 func findComputerByName(ctx context.Context, clients *apiClients, name string) (l1.Computer, bool, error) {
+	// Client principals cannot call the person-authorized handle route, so this
+	// O(n) fallback mirrors its final friendly-name arm after exact Computer and
+	// current Job lookups fail. ListComputers excludes removed Computers, and the
+	// database keeps friendly names unique.
 	for cursor := ""; ; {
 		page, err := clients.listComputers(ctx, cursor, l1.MaxJobPageLimit)
 		if err != nil {

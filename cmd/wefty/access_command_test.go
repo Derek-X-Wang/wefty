@@ -5,6 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,6 +22,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
+	"github.com/coder/websocket"
 )
 
 func TestTakeoverViewPolicyRetryIsTypedAndBounded(t *testing.T) {
@@ -109,6 +116,108 @@ func TestComputerTakeoverViewProjectsFriendlyNameBeforeRawConnectHost(t *testing
 		}
 	})
 }
+
+func TestComputerTakeoverViewProjectsAvailabilityAndSessionAddress(t *testing.T) {
+	const (
+		computerID      = "computer-1"
+		friendlyName    = "alice"
+		localCLIHost    = "local-cli-host.example.test"
+		sessionToken    = "secret-session-token"
+		sessionFileName = "live-session.json"
+	)
+	frontDoor := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set(contract.ComputerControlTokenHeader, sessionToken)
+		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{
+			Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		_ = connection.Write(request.Context(), websocket.MessageBinary, []byte("RFB 003.008\n"))
+		<-request.Context().Done()
+	}))
+	defer frontDoor.Close()
+	endpoint := "ws" + strings.TrimPrefix(frontDoor.URL, "http") + contract.ComputerDisplayWebSocketPath
+	frontDoorHost := strings.TrimPrefix(frontDoor.URL, "http://")
+
+	l1Transport := forwardingRoundTripper(func(request *http.Request) (*http.Response, error) {
+		var payload any
+		switch request.URL.Path {
+		case "/v1/computers/" + computerID:
+			payload = l1.Computer{ComputerID: computerID, Name: friendlyName}
+		case "/v1/computers/" + computerID + "/takeover":
+			payload = l1.ComputerTakeoverAvailability{ComputerID: computerID, FriendlyName: friendlyName, DisplayEndpoint: &endpoint}
+		default:
+			return nil, fmt.Errorf("unexpected L1 request path %q", request.URL.Path)
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})
+	clients := &apiClients{
+		l1:     &apiClient{name: "L1", client: &http.Client{Transport: l1Transport}},
+		fabric: directDialFabric{connectHost: localCLIHost},
+		wait:   waitForContext,
+	}
+	viewContext, cancelView := context.WithCancel(t.Context())
+	defer cancelView()
+	tokenFile := filepath.Join(t.TempDir(), sessionFileName)
+	var stdout, stderr bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- executeComputerTakeoverAction(viewContext, clients, true, "view",
+			[]string{computerID, "--session-token-file", tokenFile}, &stdout, &stderr)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if info, err := os.Stat(tokenFile); err == nil && info.Size() > 0 {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("view ended before projection: %v stderr=%s", err, stderr.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for view projection: stderr=%s", stderr.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancelView()
+	if err := <-done; err != nil {
+		t.Fatalf("view command: %v stderr=%s", err, stderr.String())
+	}
+	var projected computerTakeoverViewResult
+	if err := json.Unmarshal(stdout.Bytes(), &projected); err != nil {
+		t.Fatalf("decode projection: %v output=%s", err, stdout.String())
+	}
+	if projected.FriendlyName != friendlyName || projected.ConnectHost != frontDoorHost ||
+		projected.DisplayEndpoint != frontDoorHost || projected.ConnectHost == localCLIHost {
+		t.Fatalf("take-over projection = %#v, want friendly name %q and front door host %q, not local CLI host %q",
+			projected, friendlyName, frontDoorHost, localCLIHost)
+	}
+}
+
+type directDialFabric struct {
+	connectHost string
+}
+
+func (f directDialFabric) Listen(network, address string) (net.Listener, error) {
+	return net.Listen(network, address)
+}
+
+func (f directDialFabric) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, address)
+}
+
+func (f directDialFabric) WhoIs(context.Context, string) (fabric.Identity, error) {
+	return fabric.Identity{}, nil
+}
+
+func (f directDialFabric) ConnectHost() string { return f.connectHost }
 
 func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
 	network := plain.NewNetwork()
@@ -315,8 +424,29 @@ func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
 	if !strings.Contains(auditHuman, "OCCURRED") || !strings.Contains(auditHuman, "AUTHORIZED ROLE") {
 		t.Fatalf("human take-over audit omitted evidence columns:\n%s", auditHuman)
 	}
+	removed, err := store.RemoveComputer(ctx, computer.ComputerID, l1.ComputerRemoveRequest{
+		ComputerMutationPrecondition: l1.ComputerMutationPrecondition{
+			IntentRevision: computer.IntentRevision, StorageID: computer.StorageID,
+			StorageGeneration: computer.StorageGeneration, Actor: "test",
+		},
+	})
+	if err != nil || removed.DesiredState != contract.ServiceDesiredRemoved {
+		t.Fatalf("remove Computer before durable take-over reads = %#v err=%v", removed, err)
+	}
+	removedSessionsJSON := runAccessCLI(t, ctx, adminClients, true,
+		"services", "takeover", "sessions", "list", computer.CurrentJobID)
+	var removedSessions l1.ComputerTakeoverSessionList
+	if err := json.Unmarshal(removedSessionsJSON, &removedSessions); err != nil || removedSessions.Sessions == nil {
+		t.Fatalf("removed Computer sessions by current Job ID = %#v err=%v", removedSessions, err)
+	}
+	removedAuditJSON := runAccessCLI(t, ctx, adminClients, true,
+		"services", "takeover", "audit", "tail", computer.ComputerID, "--limit", "1")
+	var removedAudit l1.ComputerTakeoverAuditList
+	if err := json.Unmarshal(removedAuditJSON, &removedAudit); err != nil || removedAudit.Events == nil {
+		t.Fatalf("removed Computer audit by Computer ID = %#v err=%v", removedAudit, err)
+	}
 	allAccessOutput := bytes.Join([][]byte{bootstrap, []byte(human), grantJSON, replayedJSON, []byte(grantsHuman),
-		revokeJSON, sessionsJSON, []byte(auditHuman)}, []byte("\n"))
+		revokeJSON, sessionsJSON, []byte(auditHuman), removedSessionsJSON, removedAuditJSON}, []byte("\n"))
 	for _, forbidden := range []string{"bearer", "fencing_token", "framebuffer", "pointer", "hidden_backend", "idempotency_key"} {
 		if bytes.Contains(bytes.ToLower(allAccessOutput), []byte(forbidden)) {
 			t.Fatalf("access output leaked forbidden surface %q: %s", forbidden, allAccessOutput)
