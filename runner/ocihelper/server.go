@@ -2008,6 +2008,7 @@ func engineFailureRPC(method Method, message string, reason EngineFailureReason,
 
 func engineFailureReason(err error) EngineFailureReason {
 	var retentionBound interface{ RetentionBoundExceeded() bool }
+	var egressDNSUnavailable interface{ EgressDNSUnavailable() bool }
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return EngineFailureDeadlineExceeded
@@ -2017,6 +2018,8 @@ func engineFailureReason(err error) EngineFailureReason {
 		return EngineFailurePermissionDenied
 	case errors.As(err, &retentionBound) && retentionBound.RetentionBoundExceeded():
 		return EngineFailureRetentionBound
+	case errors.As(err, &egressDNSUnavailable) && egressDNSUnavailable.EgressDNSUnavailable():
+		return EngineFailureEgressDNS
 	default:
 		return EngineFailureOperationFailed
 	}

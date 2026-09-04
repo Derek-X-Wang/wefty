@@ -80,8 +80,10 @@ and record the refusal through receipts.
   Node-listener paths if a future image re-enables it. A helper DNS proxy selected from the exact
   resolver snapshot mounted into the Computer preserves a Node-loopback resolver
   without exposing that or any other Node listener. It forwards from the Node
-  namespace to systemd-resolved's advertised non-loopback uplink when present and
-  falls back to the Node stub otherwise; routable resolvers use the veth. Ordinary
+  namespace to systemd-resolved's advertised non-loopback uplink after a bounded
+  lookup proves it reachable and falls back only to a Node stub that answers the
+  same probe; neither candidate answering is typed `egress_dns_unavailable`.
+  Routable resolvers use the veth. Ordinary
   OCI remains on shared networking.
 - Computer networking uses disjoint `/30` allocations in the RFC 2544
   benchmarking range `198.18.0.0/15`; the endpoint range is therefore capped at

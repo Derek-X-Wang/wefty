@@ -182,13 +182,25 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	egress := probeComputerNetworkEgress(t, ready, readyEndpoints, nodeGatewayIPv6, nodeListenerPort)
 	completeLinuxComputerRow(t, receipt, "linux.network_egress", map[string]bool{
 		"private_veth_address_present": egress.Address != "" && egress.Gateway != "" && egress.Address != egress.Gateway,
-		"resolver_reachable":           egress.ResolvedName == "example.com" && egress.ResolvedAddress != "",
+		"mounted_resolver_recorded":    egress.ResolverSnapshot != "" && egress.ResolverAddress != "",
+		"loopback_proxy_listening":     !net.ParseIP(egress.ResolverAddress).IsLoopback() || egress.ProxyUDPListening && egress.ProxyTCPListening,
+		"proxy_upstream_reachable":     !net.ParseIP(egress.ResolverAddress).IsLoopback() || egress.ProxyUpstreamReachable,
+		"default_route_present":        egress.DefaultRouteInterface == "eth0" && egress.DefaultRouteGateway == egress.Gateway,
+		"public_ipv4_connected":        egress.PublicIPv4.Outcome == "connected",
+		"resolver_reachable":           egress.DNSOutcome == "resolved" && egress.ResolvedName == "example.com" && egress.ResolvedAddress != "",
 		"helper_http_through_veth":     egress.HelperHTTPStatus == 200 && egress.HelperHTTPBody == "wefty-computer-egress-v1" && !mutatingLinuxComputerRow("linux.network_egress"),
 		"node_listener_ipv4_refused":   egress.NodeListenerIPv4.Outcome == "refused" && egress.NodeListenerIPv4.ErrnoName == "ECONNREFUSED",
 		"node_listener_ipv6_refused":   egress.NodeListenerIPv6.Outcome == "refused" && slices.Contains([]string{"EADDRNOTAVAIL", "ENETUNREACH", "EHOSTUNREACH", "ECONNREFUSED"}, egress.NodeListenerIPv6.ErrnoName),
 	}, map[string]string{
 		"computer_id": ready.ComputerID, "attempt_id": ready.CurrentJob.CurrentAttemptID,
 		"veth_address": egress.Address, "veth_gateway": egress.Gateway,
+		"resolver_snapshot": egress.ResolverSnapshot, "resolver_address": egress.ResolverAddress,
+		"proxy_udp_listening": strconv.FormatBool(egress.ProxyUDPListening), "proxy_tcp_listening": strconv.FormatBool(egress.ProxyTCPListening),
+		"proxy_upstream_address": egress.ProxyUpstreamAddress, "proxy_upstream_source": egress.ProxyUpstreamSource,
+		"proxy_upstream_reachable": strconv.FormatBool(egress.ProxyUpstreamReachable),
+		"default_route_interface":  egress.DefaultRouteInterface, "default_route_gateway": egress.DefaultRouteGateway,
+		"public_ipv4_address": egress.PublicIPv4.Address, "public_ipv4_outcome": egress.PublicIPv4.Outcome,
+		"public_ipv4_errno": egress.PublicIPv4.ErrnoName, "dns_outcome": egress.DNSOutcome,
 		"resolved_name": egress.ResolvedName, "resolved_address": egress.ResolvedAddress,
 		"helper_http_status": fmt.Sprint(egress.HelperHTTPStatus), "helper_http_body": egress.HelperHTTPBody,
 		"node_listener_ipv4_address": egress.NodeListenerIPv4.Address, "node_listener_ipv4_outcome": egress.NodeListenerIPv4.Outcome,
@@ -889,16 +901,27 @@ type liveComputerEndpointEnvironment struct {
 }
 
 type computerNetworkEgressReceipt struct {
-	Version          int                    `json:"version"`
-	ComputerID       string                 `json:"computer_id"`
-	Address          string                 `json:"address"`
-	Gateway          string                 `json:"gateway"`
-	ResolvedName     string                 `json:"resolved_name"`
-	ResolvedAddress  string                 `json:"resolved_address"`
-	HelperHTTPStatus int                    `json:"helper_http_status"`
-	HelperHTTPBody   string                 `json:"helper_http_body"`
-	NodeListenerIPv4 screenCrossoverAttempt `json:"node_listener_ipv4"`
-	NodeListenerIPv6 screenCrossoverAttempt `json:"node_listener_ipv6"`
+	Version                int                    `json:"version"`
+	ComputerID             string                 `json:"computer_id"`
+	Address                string                 `json:"address"`
+	Gateway                string                 `json:"gateway"`
+	ResolverSnapshot       string                 `json:"resolver_snapshot"`
+	ResolverAddress        string                 `json:"resolver_address"`
+	ProxyUDPListening      bool                   `json:"proxy_udp_listening"`
+	ProxyTCPListening      bool                   `json:"proxy_tcp_listening"`
+	ProxyUpstreamAddress   string                 `json:"proxy_upstream_address"`
+	ProxyUpstreamSource    string                 `json:"proxy_upstream_source"`
+	ProxyUpstreamReachable bool                   `json:"proxy_upstream_reachable"`
+	DefaultRouteInterface  string                 `json:"default_route_interface"`
+	DefaultRouteGateway    string                 `json:"default_route_gateway"`
+	PublicIPv4             screenCrossoverAttempt `json:"public_ipv4"`
+	DNSOutcome             string                 `json:"dns_outcome"`
+	ResolvedName           string                 `json:"resolved_name"`
+	ResolvedAddress        string                 `json:"resolved_address"`
+	HelperHTTPStatus       int                    `json:"helper_http_status"`
+	HelperHTTPBody         string                 `json:"helper_http_body"`
+	NodeListenerIPv4       screenCrossoverAttempt `json:"node_listener_ipv4"`
+	NodeListenerIPv6       screenCrossoverAttempt `json:"node_listener_ipv6"`
 }
 
 type screenCrossoverAttempt struct {
@@ -1004,7 +1027,7 @@ print(json.dumps({
 `
 
 const liveComputerNetworkEgressPython = `
-import errno, http.client, json, socket, sys
+import errno, http.client, json, socket, struct, sys
 computer_id, address, gateway, view_text, node_ipv6, node_port_text = sys.argv[1:7]
 view_port, node_port = int(view_text), int(node_port_text)
 
@@ -1013,13 +1036,65 @@ def refused(target, error):
     return {"address": target, "outcome": "refused", "errno": number,
             "errno_name": errno.errorcode.get(number, type(error).__name__), "detail": str(error)}
 
-resolved = socket.getaddrinfo("example.com", 443, family=socket.AF_INET, type=socket.SOCK_STREAM)[0][4][0]
+def attempted_connect(host, port):
+    target = host + ":" + str(port)
+    connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(5)
+        connection.connect((host, port))
+        return {"address": target, "outcome": "connected"}
+    except OSError as error:
+        return refused(target, error)
+    finally:
+        connection.close()
+
+def socket_present(path, host, port, tcp):
+    encoded = "%08X:%04X" % (struct.unpack("<I", socket.inet_aton(host))[0], port)
+    with open(path, "r", encoding="ascii") as table:
+        for line in table.readlines()[1:]:
+            fields = line.split()
+            if len(fields) > 3 and fields[1] == encoded and (not tcp or fields[3] == "0A"):
+                return True
+    return False
+
+with open("/etc/resolv.conf", "r", encoding="utf-8") as resolver_file:
+    resolver_snapshot = resolver_file.read()
+resolver_address = ""
+for line in resolver_snapshot.splitlines():
+    fields = line.split()
+    if len(fields) >= 2 and fields[0] == "nameserver":
+        try:
+            if socket.inet_aton(fields[1]):
+                resolver_address = fields[1]
+                break
+        except OSError:
+            pass
+proxy_udp = bool(resolver_address) and socket_present("/proc/net/udp", resolver_address, 53, False)
+proxy_tcp = bool(resolver_address) and socket_present("/proc/net/tcp", resolver_address, 53, True)
+
+route_interface, route_gateway = "", ""
+with open("/proc/net/route", "r", encoding="ascii") as route_file:
+    for line in route_file.readlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 3 and fields[1] == "00000000":
+            route_interface = fields[0]
+            route_gateway = socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
+            break
+
 helper = http.client.HTTPConnection(gateway, view_port, timeout=5)
 helper.request("GET", "/health")
 response = helper.getresponse()
 helper_status = response.status
 helper_body = response.read().decode().strip()
 helper.close()
+public_ipv4 = attempted_connect("1.1.1.1", 443)
+
+dns_outcome, resolved = "egress_dns_unavailable", ""
+try:
+    resolved = socket.getaddrinfo("example.com", 443, family=socket.AF_INET, type=socket.SOCK_STREAM)[0][4][0]
+    dns_outcome = "resolved"
+except socket.gaierror:
+    pass
 node_ipv4_address = gateway + ":" + str(node_port)
 connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 try:
@@ -1041,10 +1116,18 @@ except OSError as error:
 finally:
     connection.close()
 print(json.dumps({
-    "version": 1,
+    "version": 2,
     "computer_id": computer_id,
     "address": address,
     "gateway": gateway,
+    "resolver_snapshot": resolver_snapshot,
+    "resolver_address": resolver_address,
+    "proxy_udp_listening": proxy_udp,
+    "proxy_tcp_listening": proxy_tcp,
+    "default_route_interface": route_interface,
+    "default_route_gateway": route_gateway,
+    "public_ipv4": public_ipv4,
+    "dns_outcome": dns_outcome,
     "resolved_name": "example.com",
     "resolved_address": resolved,
     "helper_http_status": helper_status,
@@ -1067,11 +1150,22 @@ func probeComputerNetworkEgress(t *testing.T, computer l1.Computer, endpoints li
 	}
 	var receipt computerNetworkEgressReceipt
 	lines := bytes.Split(bytes.TrimSpace(output), []byte("\n"))
-	if len(lines) == 0 || json.Unmarshal(lines[len(lines)-1], &receipt) != nil || receipt.Version != 1 || receipt.ComputerID != computer.ComputerID {
+	if len(lines) == 0 || json.Unmarshal(lines[len(lines)-1], &receipt) != nil || receipt.Version != 2 || receipt.ComputerID != computer.ComputerID {
 		t.Fatalf("decode Computer network egress receipt: %s", output)
 	}
-	t.Logf("Computer egress computer=%s address=%s gateway=%s resolved=%s helper_status=%d node_v4=%s errno=%s node_v6=%s errno=%s",
-		receipt.ComputerID, receipt.Address, receipt.Gateway, receipt.ResolvedAddress, receipt.HelperHTTPStatus,
+	resolverIP := net.ParseIP(receipt.ResolverAddress)
+	if resolverIP != nil && resolverIP.IsLoopback() {
+		upstream, upstreamErr := ocihelper.ObserveComputerDNSUpstream(t.Context(), receipt.ResolverAddress)
+		if upstreamErr == nil {
+			receipt.ProxyUpstreamAddress = upstream.Address
+			receipt.ProxyUpstreamSource = upstream.Source
+			receipt.ProxyUpstreamReachable = upstream.Reachable
+		}
+	}
+	t.Logf("Computer egress computer=%s address=%s gateway=%s route=%s/%s resolver=%s proxy_udp=%t proxy_tcp=%t upstream=%s source=%s reachable=%t dns=%s resolved=%s public=%s helper_status=%d node_v4=%s errno=%s node_v6=%s errno=%s",
+		receipt.ComputerID, receipt.Address, receipt.Gateway, receipt.DefaultRouteInterface, receipt.DefaultRouteGateway,
+		receipt.ResolverAddress, receipt.ProxyUDPListening, receipt.ProxyTCPListening, receipt.ProxyUpstreamAddress,
+		receipt.ProxyUpstreamSource, receipt.ProxyUpstreamReachable, receipt.DNSOutcome, receipt.ResolvedAddress, receipt.PublicIPv4.Outcome, receipt.HelperHTTPStatus,
 		receipt.NodeListenerIPv4.Outcome, receipt.NodeListenerIPv4.ErrnoName, receipt.NodeListenerIPv6.Outcome, receipt.NodeListenerIPv6.ErrnoName)
 	return receipt
 }

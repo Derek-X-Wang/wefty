@@ -354,12 +354,96 @@ func TestComputerNetworkUsesMountedResolverForLoopbackProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer attachment.close()
-	if attachment.dns == nil {
-		t.Fatal("Computer mounted loopback resolver did not start a private DNS proxy")
+	if attachment.resolverAddress != "127.0.0.53" || attachment.dns == nil || attachment.dns.udp == nil || attachment.dns.tcp == nil ||
+		attachment.dnsUpstreamAddress == "" || attachment.dnsUpstreamSource != "systemd_uplink" || !attachment.dnsUpstreamReachable {
+		t.Fatalf("Computer mounted loopback resolver facts = %+v", attachment)
 	}
 	output, err := exec.Command("nsenter", "--target", strconv.Itoa(command.Process.Pid), "--net", "--mount", "--", "getent", "ahostsv4", "example.com").CombinedOutput()
 	if err != nil || len(strings.TrimSpace(string(output))) == 0 {
 		t.Fatalf("Computer mounted loopback resolver lookup failed: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	var route string
+	var publicConnected, helperFetched bool
+	err = inNetworkNamespace(namespace, func() error {
+		routeOutput, routeErr := exec.Command("ip", "-4", "route", "show", "default").CombinedOutput()
+		if routeErr != nil {
+			return routeErr
+		}
+		route = strings.TrimSpace(string(routeOutput))
+		public, dialErr := net.DialTimeout("tcp4", "1.1.1.1:443", 5*time.Second)
+		if dialErr != nil {
+			return dialErr
+		}
+		publicConnected = true
+		_ = public.Close()
+		probeURL := "http://" + net.JoinHostPort(attachment.gateway, "42120") + "/health"
+		probeOutput, probeErr := exec.Command("curl", "--fail", "--silent", "--show-error", "--max-time", "5", probeURL).CombinedOutput()
+		if probeErr != nil || string(probeOutput) != computerEgressProbeBody {
+			return fmt.Errorf("helper egress probe: %v: %s", probeErr, strings.TrimSpace(string(probeOutput)))
+		}
+		helperFetched = true
+		return nil
+	})
+	if err != nil || !strings.Contains(route, "default via "+attachment.gateway+" dev eth0") || !publicConnected || !helperFetched {
+		t.Fatalf("Computer stub egress route=%q public=%t helper=%t err=%v", route, publicConnected, helperFetched, err)
+	}
+	t.Logf("Computer stub egress resolver=%s proxy_udp=%t proxy_tcp=%t upstream=%s source=%s reachable=%t address=%s gateway=%s route=%q public_tcp=%t helper_http=%t",
+		attachment.resolverAddress, attachment.dns.udp != nil, attachment.dns.tcp != nil, attachment.dnsUpstreamAddress,
+		attachment.dnsUpstreamSource, attachment.dnsUpstreamReachable, attachment.guestAddress, attachment.gateway, route, publicConnected, helperFetched)
+}
+
+func TestComputerNetworkFallsBackToReachableNodeStub(t *testing.T) {
+	requireRootNetworkNamespaceTest(t)
+	resetComputerFirewallChainsForTest(t)
+	stub := net.JoinHostPort("127.0.0.53", "53")
+	connection, err := net.DialTimeout("udp4", stub, time.Second)
+	if err != nil {
+		t.Skipf("systemd-resolved Node stub is unavailable: %v", err)
+	}
+	_ = connection.Close()
+
+	directory := t.TempDir()
+	resolverPath := filepath.Join(directory, "resolv.conf")
+	if err := os.WriteFile(resolverPath, []byte("nameserver 127.0.0.53\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uplinkPath := filepath.Join(directory, "uplink-resolv.conf")
+	if err := os.WriteFile(uplinkPath, []byte("nameserver 192.0.2.1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := startIsolatedNetworkTaskWithResolver(t, resolverPath)
+	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.close()
+	engine := &ContainerdEngine{config: NativeEngineConfig{ResolverPath: resolverPath, AttemptPortMin: 42124}, computerResolverUplinkPath: uplinkPath}
+	attachment, err := engine.prepareComputerNetwork(t.Context(), namespace, 42124)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer attachment.close()
+	if attachment.dns == nil || attachment.dns.upstream != stub {
+		t.Fatalf("Computer DNS proxy upstream = %v, want reachable Node stub %s", attachment.dns, stub)
+	}
+	output, err := exec.Command("nsenter", "--target", strconv.Itoa(command.Process.Pid), "--net", "--mount", "--", "getent", "ahostsv4", "example.com").CombinedOutput()
+	if err != nil || len(strings.TrimSpace(string(output))) == 0 {
+		t.Fatalf("Computer Node-stub fallback lookup failed: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+}
+
+func TestComputerDNSUnavailableIsTyped(t *testing.T) {
+	directory := t.TempDir()
+	uplinkPath := filepath.Join(directory, "uplink-resolv.conf")
+	if err := os.WriteFile(uplinkPath, []byte("nameserver 192.0.2.1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := selectComputerDNSUpstream(t.Context(), "127.0.0.53", uplinkPath, func(context.Context, string) error {
+		return errors.New("unreachable")
+	})
+	var unavailable *ComputerDNSUnavailableError
+	if !errors.As(err, &unavailable) || engineFailureReason(err) != EngineFailureEgressDNS {
+		t.Fatalf("Computer DNS failure = %T %v reason=%s", err, err, engineFailureReason(err))
 	}
 }
 

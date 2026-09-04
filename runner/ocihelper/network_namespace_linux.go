@@ -162,17 +162,21 @@ func inNetworkNamespace(namespace *pinnedNetworkNamespace, operation func() erro
 }
 
 type computerNetworkAttachment struct {
-	hostLink      string
-	hostAddress   string
-	guestAddress  string
-	gateway       string
-	ipPath        string
-	iptablesPath  string
-	ip6tablesPath string
-	probePort     uint16
-	probe         net.Listener
-	dns           *computerDNSProxy
-	ipv6State     computerIPv6DisableState
+	hostLink             string
+	hostAddress          string
+	guestAddress         string
+	gateway              string
+	ipPath               string
+	iptablesPath         string
+	ip6tablesPath        string
+	probePort            uint16
+	probe                net.Listener
+	dns                  *computerDNSProxy
+	resolverAddress      string
+	dnsUpstreamAddress   string
+	dnsUpstreamSource    string
+	dnsUpstreamReachable bool
+	ipv6State            computerIPv6DisableState
 }
 
 type computerIPv6DisableState string
@@ -192,6 +196,34 @@ type computerDNSProxy struct {
 	rateCount int
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// ComputerDNSUnavailableError means neither an advertised systemd-resolved
+// uplink nor the mounted loopback address answered from the Node namespace.
+type ComputerDNSUnavailableError struct{}
+
+func (*ComputerDNSUnavailableError) Error() string {
+	return "Computer egress DNS unavailable after validating the advertised uplink and Node stub"
+}
+
+func (*ComputerDNSUnavailableError) EgressDNSUnavailable() bool { return true }
+
+// ComputerDNSUpstreamObservation repeats the helper's ordered reachability
+// selection for acceptance evidence without exposing a general DNS dialer.
+type ComputerDNSUpstreamObservation struct {
+	Address   string
+	Source    string
+	Reachable bool
+}
+
+// ObserveComputerDNSUpstream reports the first currently reachable upstream
+// that a loopback Computer resolver proxy would select.
+func ObserveComputerDNSUpstream(ctx context.Context, resolverAddress string) (ComputerDNSUpstreamObservation, error) {
+	address, source, err := selectComputerDNSUpstream(ctx, resolverAddress, computerResolverUplink, probeComputerDNSUpstream)
+	if err != nil {
+		return ComputerDNSUpstreamObservation{}, err
+	}
+	return ComputerDNSUpstreamObservation{Address: address, Source: source, Reachable: true}, nil
 }
 
 func resolveRootOwnedNetworkTool(configured, name string, candidates ...string) (string, error) {
@@ -242,7 +274,11 @@ func (engine *ContainerdEngine) prepareComputerNetwork(ctx context.Context, name
 	if err := engine.reconcileComputerFirewallLocked(ctx, iptablesPath, ip6tablesPath); err != nil {
 		return nil, err
 	}
-	return setupComputerNetworkWithTools(ctx, namespace, port, engine.config.AttemptPortMin, ipPath, iptablesPath, ip6tablesPath, engine.config.ResolverPath)
+	uplinkPath := engine.computerResolverUplinkPath
+	if uplinkPath == "" {
+		uplinkPath = computerResolverUplink
+	}
+	return setupComputerNetworkWithResolverUplink(ctx, namespace, port, engine.config.AttemptPortMin, ipPath, iptablesPath, ip6tablesPath, engine.config.ResolverPath, uplinkPath)
 }
 
 func computerNetworkAddresses(port, minimum uint16) (host, guest net.IP, err error) {
@@ -269,6 +305,10 @@ func setupComputerNetwork(ctx context.Context, namespace *pinnedNetworkNamespace
 }
 
 func setupComputerNetworkWithTools(ctx context.Context, namespace *pinnedNetworkNamespace, port, minimum uint16, ipPath, iptablesPath, ip6tablesPath, resolverPath string) (_ *computerNetworkAttachment, err error) {
+	return setupComputerNetworkWithResolverUplink(ctx, namespace, port, minimum, ipPath, iptablesPath, ip6tablesPath, resolverPath, computerResolverUplink)
+}
+
+func setupComputerNetworkWithResolverUplink(ctx context.Context, namespace *pinnedNetworkNamespace, port, minimum uint16, ipPath, iptablesPath, ip6tablesPath, resolverPath, resolverUplinkPath string) (_ *computerNetworkAttachment, err error) {
 	if namespace == nil || port == 0 || ipPath == "" || iptablesPath == "" || ip6tablesPath == "" || resolverPath == "" {
 		return nil, errors.New("Computer network setup requires namespace, port, ip, iptables, ip6tables, and resolver configuration")
 	}
@@ -345,11 +385,15 @@ func setupComputerNetworkWithTools(ctx context.Context, namespace *pinnedNetwork
 	if err != nil {
 		return nil, err
 	}
+	attachment.resolverAddress = resolverAddress
 	if net.ParseIP(resolverAddress).IsLoopback() {
-		upstreamAddress := resolverAddress
-		if uplinkAddress, uplinkErr := computerNonLoopbackResolverAddress(computerResolverUplink); uplinkErr == nil {
-			upstreamAddress = uplinkAddress
+		upstreamAddress, upstreamSource, upstreamErr := selectComputerDNSUpstream(ctx, resolverAddress, resolverUplinkPath, probeComputerDNSUpstream)
+		if upstreamErr != nil {
+			return nil, upstreamErr
 		}
+		attachment.dnsUpstreamAddress = upstreamAddress
+		attachment.dnsUpstreamSource = upstreamSource
+		attachment.dnsUpstreamReachable = true
 		attachment.dns, err = startComputerDNSProxy(namespace, net.JoinHostPort(resolverAddress, "53"), net.JoinHostPort(upstreamAddress, "53"))
 		if err != nil {
 			return nil, fmt.Errorf("start Computer loopback resolver proxy: %w", err)
@@ -436,6 +480,55 @@ func computerNonLoopbackResolverAddress(path string) (string, error) {
 		return "", fmt.Errorf("read Computer resolver uplink configuration: %w", err)
 	}
 	return "", errors.New("Computer resolver uplink configuration has no non-loopback IPv4 nameserver")
+}
+
+func selectComputerDNSUpstream(ctx context.Context, resolverAddress, uplinkPath string, probe func(context.Context, string) error) (string, string, error) {
+	if probe == nil {
+		return "", "", &ComputerDNSUnavailableError{}
+	}
+	type candidate struct {
+		address string
+		source  string
+	}
+	var candidates []candidate
+	if uplinkAddress, err := computerNonLoopbackResolverAddress(uplinkPath); err == nil {
+		candidates = append(candidates, candidate{address: uplinkAddress, source: "systemd_uplink"})
+	}
+	if net.ParseIP(resolverAddress) != nil {
+		candidates = append(candidates, candidate{address: resolverAddress, source: "node_stub"})
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if _, duplicate := seen[candidate.address]; duplicate {
+			continue
+		}
+		seen[candidate.address] = struct{}{}
+		probeContext, cancel := context.WithTimeout(ctx, time.Second)
+		err := probe(probeContext, net.JoinHostPort(candidate.address, "53"))
+		cancel()
+		if err == nil {
+			return candidate.address, candidate.source, nil
+		}
+	}
+	return "", "", &ComputerDNSUnavailableError{}
+}
+
+func probeComputerDNSUpstream(ctx context.Context, address string) error {
+	dialer := &net.Dialer{}
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(dialContext context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(dialContext, "udp4", address)
+		},
+	}
+	addresses, err := resolver.LookupIP(ctx, "ip4", "example.com")
+	if err != nil {
+		return err
+	}
+	if len(addresses) == 0 {
+		return errors.New("resolver returned no IPv4 address")
+	}
+	return nil
 }
 
 func startComputerDNSProxy(namespace *pinnedNetworkNamespace, listenAddress, upstreamAddress string) (_ *computerDNSProxy, err error) {

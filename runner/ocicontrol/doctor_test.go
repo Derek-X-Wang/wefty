@@ -58,7 +58,10 @@ func healthyDoctorConfig(now time.Time, reason contract.CapabilityReasonCode) Do
 					AllowedMountRoots: []string{"/srv/wefty", "/worktrees"}, MountRootsRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					Cache: ocihelper.ImageCacheStatus{Bytes: 8 << 30, CapBytes: 16 << 30}, CacheRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
 					ComputerFirewallPresent: true, ComputerAttemptsLive: true, ComputerFirewallRead: ocihelper.DiagnosticReadReceipt{Outcome: ocihelper.DiagnosticReadOK},
-					LastProfile:   &ocihelper.ProfileReceipt{Computer: true, NetworkNamespacePresent: true, HelperNetworkNamespaceInode: "4026531992", TaskNetworkNamespaceInode: "4026532992", HostAbstractSocketVisible: false, ComputerNetworkAddress: "198.18.0.2", ComputerNetworkGateway: "198.18.0.1", MemoryLimitBytes: 2 << 30, MemoryMaxBytes: 2 << 30, MemoryOOMGroup: true, MemorySwapMaxBytes: 0, ComputerTmpfsCeilingBytes: 1600 << 20, LargestTmpfsCeilingBytes: 1 << 30, Warnings: []ocihelper.ProfileWarning{}},
+					LastProfile: &ocihelper.ProfileReceipt{Computer: true, NetworkNamespacePresent: true, HelperNetworkNamespaceInode: "4026531992", TaskNetworkNamespaceInode: "4026532992", HostAbstractSocketVisible: false,
+						ComputerNetworkAddress: "198.18.0.2", ComputerNetworkGateway: "198.18.0.1", ComputerResolverAddress: "127.0.0.53",
+						ComputerDNSProxyUDP: true, ComputerDNSProxyTCP: true, ComputerDNSUpstreamAddress: "168.63.129.16", ComputerDNSUpstreamSource: "systemd_uplink", ComputerDNSUpstreamReachable: true,
+						MemoryLimitBytes: 2 << 30, MemoryMaxBytes: 2 << 30, MemoryOOMGroup: true, MemorySwapMaxBytes: 0, ComputerTmpfsCeilingBytes: 1600 << 20, LargestTmpfsCeilingBytes: 1 << 30, Warnings: []ocihelper.ProfileWarning{}},
 					LastAdmission: &ocihelper.ResourceAdmissionReceipt{ObservedAt: now.Add(-30 * time.Second), Admitted: true, MemoryCapacityBytes: 4 << 30, MemoryReserveBytes: 1 << 30, MemoryCommittedBeforeBytes: 1 << 30, RequestedMemoryBytes: 1 << 30, MemoryCommittedAfterBytes: 2 << 30, MemTotalBytes: 4 << 30, MemAvailableBytes: 64 << 20, RequestedDiskBytes: 8 << 30, FilesystemAvailableBytes: 12 << 30, ComputerTmpfsCeilingBytes: 1600 << 20},
 				},
 				SweepReceiptRecorded: true,
@@ -105,7 +108,8 @@ func TestDoctorSurfacesComputerScreenIsolationReceipt(t *testing.T) {
 	if err := report.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if report.ComputerScreenIsolation.Outcome != DiagnosticOK || !report.ComputerScreenIsolation.NetworkNamespacePresent || report.ComputerScreenIsolation.HostAbstractSocketVisible {
+	if report.ComputerScreenIsolation.Outcome != DiagnosticOK || !report.ComputerScreenIsolation.NetworkNamespacePresent || report.ComputerScreenIsolation.HostAbstractSocketVisible ||
+		!report.ComputerScreenIsolation.ComputerDNSProxyUDP || !report.ComputerScreenIsolation.ComputerDNSProxyTCP || !report.ComputerScreenIsolation.ComputerDNSUpstreamReachable {
 		t.Fatalf("screen isolation fact was not receipt-derived: %+v", report.ComputerScreenIsolation)
 	}
 	if !slices.ContainsFunc(report.Findings, func(item DiagnosticFinding) bool {
@@ -117,7 +121,7 @@ func TestDoctorSurfacesComputerScreenIsolationReceipt(t *testing.T) {
 	if err := WriteDoctorHuman(&human, report); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(human.String(), "SCREEN ISOLATION\tOK network_namespace_present=true helper_inode=4026531992 task_inode=4026532992 host_abstract_socket_visible=false address=198.18.0.2 gateway=198.18.0.1 computer_firewall_present=true computer_attempts_live=true") {
+	if !strings.Contains(human.String(), "SCREEN ISOLATION\tOK network_namespace_present=true helper_inode=4026531992 task_inode=4026532992 host_abstract_socket_visible=false address=198.18.0.2 gateway=198.18.0.1 resolver=127.0.0.53 dns_proxy_udp=true dns_proxy_tcp=true dns_upstream=168.63.129.16 dns_source=systemd_uplink dns_reachable=true computer_firewall_present=true computer_attempts_live=true") {
 		t.Fatalf("human doctor omitted screen isolation fact:\n%s", human.String())
 	}
 }

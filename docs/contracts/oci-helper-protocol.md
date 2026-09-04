@@ -183,7 +183,10 @@ failed quiescence proof and does not authorize a namespace sweep.
 
 Unary `engine_failure` responses include only a closed mechanics fact naming
 the helper method and one sanitized reason (`deadline_exceeded`, `canceled`,
-`permission_denied`, `retention_bound_exceeded`, or `operation_failed`). Raw privileged error text,
+`permission_denied`, `retention_bound_exceeded`, `egress_dns_unavailable`, or
+`operation_failed`). The DNS reason means neither the advertised non-loopback
+resolver nor the Node-loopback stub answered the helper's bounded preflight.
+Raw privileged error text,
 containerd types, and host paths remain local. The Computer reimage preflight
 may additionally report the fixed positive-detachment refusal so native
 evidence distinguishes that durable authority mismatch; the closed fact,
@@ -512,7 +515,8 @@ route. A
 Node-loopback resolver in the exact mounted snapshot is mirrored by an
 attempt-private UDP/TCP helper proxy at the same address inside the Computer
 namespace. The proxy forwards from the Node namespace to systemd-resolved's
-advertised non-loopback uplink when present and otherwise to the Node stub; a
+advertised non-loopback uplink after a bounded lookup proves it reachable,
+then falls back to the Node stub only after that stub answers the same probe; a
 routable resolver traverses the veth directly. The proxy validates DNS framing,
 rate limits each attempt, and bounds concurrent TCP clients. Mirrored
 `ip6tables` chains retain the same boundary if an image re-enables IPv6. The
@@ -666,7 +670,10 @@ io.wefty/removal_generation
 
 Before task creation, the helper fsyncs a versioned Attempt-ownership record
 containing the complete seven-field authority and its derived resource
-identities. Labelled containerd metadata may reconstruct the same record before
+identities. Publication, snapshot loading, stale-temp cleanup, record removal,
+and unknown-version GC share one engine lock, so no sweep or read-only Verify
+can unlink an in-flight publication. Removing the final record preserves the
+`attempt-ownership` parent directory. Labelled containerd metadata may reconstruct the same record before
 that metadata is deleted during sweep. A deterministic-looking name is never
 ownership: sweep mutates a log directory or cgroup only when the exact resource
 identity is bound by that durable record and the helper's locked registry says
@@ -783,7 +790,8 @@ memory cgroup remains the enforcement boundary. The node doctor repeats the
 last assertion-derived comparison as `WARN` when applicable and exposes the
 last atomic admission facts. The post-start runtime receipt records the helper
 and task network namespace inodes, their observed inequality, the veth
-address/gateway, and whether the exact abstract X11 socket token is visible from
+address/gateway, mounted resolver address, UDP/TCP proxy listeners, selected
+upstream address/source/reachability, and whether the exact abstract X11 socket token is visible from
 the helper namespace. The node doctor reports screen isolation as `OK` only for
 distinct non-empty inodes, `present=true`, and `visible=false`; a missing
 Computer receipt remains `NOT-RUN`, and any other combination is `FAILED`.

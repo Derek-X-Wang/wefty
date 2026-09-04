@@ -251,8 +251,10 @@ range is capped at 32,768 disjoint `/30`s and helper startup refuses a
 conflicting non-Wefty Node route. If the mounted
 resolver snapshot names a Node-loopback stub such as `127.0.0.53`, the helper
 binds that address only inside the Computer namespace and proxies DNS from the
-Node namespace to systemd-resolved's advertised non-loopback uplink when present,
-falling back to the Node stub otherwise; a routable resolver continues over the
+Node namespace to systemd-resolved's advertised non-loopback uplink after a
+bounded lookup proves it reachable, falling back only to a Node stub that
+answers the same probe. If neither candidate answers, `Run` fails as
+`egress_dns_unavailable`; a routable resolver continues over the
 veth. The proxy admits only minimally valid DNS queries and responses, rate
 limits each attempt, and bounds concurrent TCP connections. Firewall policy
 rejects veth-to-veth forwarding, unsolicited traffic toward a Computer veth,

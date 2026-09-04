@@ -156,6 +156,7 @@ type ContainerdEngine struct {
 	afterCgroupObservation      func()
 	afterAttemptOwnershipSync   func()
 	attemptOwnershipMu          sync.Mutex
+	computerResolverUplinkPath  string
 	computerNetworkMu           sync.Mutex
 	computerForwardingObserved  bool
 	computerForwardingOwned     bool
@@ -1133,6 +1134,12 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		}
 		profile.ComputerNetworkAddress = computerNetwork.guestAddress
 		profile.ComputerNetworkGateway = computerNetwork.gateway
+		profile.ComputerResolverAddress = computerNetwork.resolverAddress
+		profile.ComputerDNSProxyUDP = computerNetwork.dns != nil && computerNetwork.dns.udp != nil
+		profile.ComputerDNSProxyTCP = computerNetwork.dns != nil && computerNetwork.dns.tcp != nil
+		profile.ComputerDNSUpstreamAddress = computerNetwork.dnsUpstreamAddress
+		profile.ComputerDNSUpstreamSource = computerNetwork.dnsUpstreamSource
+		profile.ComputerDNSUpstreamReachable = computerNetwork.dnsUpstreamReachable
 		for name, hold := range endpointHolds {
 			port := endpoints[name]
 			if err := hold.Close(); err != nil {
