@@ -360,6 +360,63 @@ func TestLoadAttemptOwnershipRecordsIgnoresUnknownAndStaleEntries(t *testing.T) 
 	}
 }
 
+func TestAttemptOwnershipSnapshotCannotOverlapPublication(t *testing.T) {
+	authority := testAuthority()
+	resources, err := DeterministicResourceIdentity(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicationEntered := make(chan struct{})
+	releasePublication := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(releasePublication) })
+	defer releaseOnce()
+	engine := &ContainerdEngine{
+		config: NativeEngineConfig{RuntimeRoot: t.TempDir()},
+		afterAttemptOwnershipSync: func() {
+			close(publicationEntered)
+			<-releasePublication
+		},
+	}
+	record := durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources}
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- engine.ensureAttemptOwnershipRecord(authority, resources) }()
+	<-publicationEntered
+
+	type snapshotResult struct {
+		records map[string]durableAttemptOwnership
+		err     error
+	}
+	snapshotDone := make(chan snapshotResult, 1)
+	go func() {
+		records, err := engine.loadAttemptOwnershipRecords()
+		snapshotDone <- snapshotResult{records: records, err: err}
+	}()
+	select {
+	case result := <-snapshotDone:
+		t.Fatalf("Attempt ownership snapshot overlapped publication: records=%v err=%v", result.records, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseOnce()
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-snapshotDone:
+		if result.err != nil || len(result.records) != 1 || result.records[authority.key()].Authority != authority {
+			t.Fatalf("serialized Attempt ownership snapshot = records=%v err=%v", result.records, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Attempt ownership snapshot did not proceed after publication")
+	}
+	if err := engine.removeAttemptOwnershipRecord(record); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(engine.attemptOwnershipRoot()); err != nil || !info.IsDir() {
+		t.Fatalf("removing the final Attempt ownership record removed its parent: info=%v err=%v", info, err)
+	}
+}
+
 func TestUnknownVersionOwnershipStaysUnboundUntilResourcesAreAbsentThenGCs(t *testing.T) {
 	authority := testAuthority()
 	resources, err := DeterministicResourceIdentity(authority)

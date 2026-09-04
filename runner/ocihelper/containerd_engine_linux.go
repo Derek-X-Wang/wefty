@@ -154,6 +154,8 @@ type ContainerdEngine struct {
 	cgroupRemove                func(string) error
 	afterLogSealObservation     func()
 	afterCgroupObservation      func()
+	afterAttemptOwnershipSync   func()
+	attemptOwnershipMu          sync.Mutex
 	computerNetworkMu           sync.Mutex
 	computerForwardingObserved  bool
 	computerForwardingOwned     bool
@@ -3687,6 +3689,8 @@ func (engine *ContainerdEngine) ensureAttemptOwnershipRecord(authority AttemptAu
 	}
 	record := durableAttemptOwnership{Version: durableAttemptOwnershipVersion, Authority: authority, Resources: resources}
 	path := engine.attemptOwnershipPath(resources)
+	engine.attemptOwnershipMu.Lock()
+	defer engine.attemptOwnershipMu.Unlock()
 	if payload, readErr := os.ReadFile(path); readErr == nil {
 		var existing durableAttemptOwnership
 		if json.Unmarshal(payload, &existing) != nil || !validDurableAttemptOwnership(existing, filepath.Base(path)) || existing.Authority != authority || !sameRuntimeResourceNames(existing.Resources, resources) {
@@ -3696,7 +3700,7 @@ func (engine *ContainerdEngine) ensureAttemptOwnershipRecord(authority AttemptAu
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		return readErr
 	}
-	return engine.writeAttemptOwnershipRecord(record)
+	return engine.writeAttemptOwnershipRecordLocked(record)
 }
 
 func validDurableAttemptOwnership(record durableAttemptOwnership, filename string) bool {
@@ -3713,6 +3717,12 @@ func validDurableAttemptOwnershipIdentity(record durableAttemptOwnership, filena
 }
 
 func (engine *ContainerdEngine) writeAttemptOwnershipRecord(record durableAttemptOwnership) error {
+	engine.attemptOwnershipMu.Lock()
+	defer engine.attemptOwnershipMu.Unlock()
+	return engine.writeAttemptOwnershipRecordLocked(record)
+}
+
+func (engine *ContainerdEngine) writeAttemptOwnershipRecordLocked(record durableAttemptOwnership) error {
 	root := engine.attemptOwnershipRoot()
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return fmt.Errorf("create durable Attempt ownership root: %w", err)
@@ -3739,6 +3749,9 @@ func (engine *ContainerdEngine) writeAttemptOwnershipRecord(record durableAttemp
 	if writeErr != nil {
 		return fmt.Errorf("write durable Attempt ownership: %w", writeErr)
 	}
+	if engine.afterAttemptOwnershipSync != nil {
+		engine.afterAttemptOwnershipSync()
+	}
 	if err := os.Rename(temporaryName, engine.attemptOwnershipPath(record.Resources)); err != nil {
 		return fmt.Errorf("publish durable Attempt ownership: %w", err)
 	}
@@ -3760,6 +3773,8 @@ type ignoredAttemptOwnershipRecord struct {
 }
 
 func (engine *ContainerdEngine) loadAttemptOwnershipSnapshot() (map[string]durableAttemptOwnership, []ignoredAttemptOwnershipRecord, error) {
+	engine.attemptOwnershipMu.Lock()
+	defer engine.attemptOwnershipMu.Unlock()
 	records := make(map[string]durableAttemptOwnership)
 	var ignored []ignoredAttemptOwnershipRecord
 	entries, err := readDirectoryIfPresent(engine.attemptOwnershipRoot())
@@ -3806,6 +3821,8 @@ func logAttemptOwnershipEntryOutcome(name string, outcome attemptOwnershipEntryO
 }
 
 func (engine *ContainerdEngine) garbageCollectQuiescentIgnoredOwnership(records []ignoredAttemptOwnershipRecord, inventory ResourceInventory) {
+	engine.attemptOwnershipMu.Lock()
+	defer engine.attemptOwnershipMu.Unlock()
 	removed := false
 	for _, record := range records {
 		if !InventoryEmpty(filterInventory(inventory, record.resources, nil)) {
@@ -4578,6 +4595,8 @@ func (engine *ContainerdEngine) removeQuiescentAttemptOwnershipRecords(records m
 }
 
 func (engine *ContainerdEngine) removeAttemptOwnershipRecord(record durableAttemptOwnership) error {
+	engine.attemptOwnershipMu.Lock()
+	defer engine.attemptOwnershipMu.Unlock()
 	if err := os.Remove(engine.attemptOwnershipPath(record.Resources)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
