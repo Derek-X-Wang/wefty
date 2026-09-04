@@ -259,6 +259,7 @@ type AcquireSessionResponse struct {
 	HeartbeatTimeout      time.Duration `json:"heartbeat_timeout"`
 	MaximumAttemptDeadman time.Duration `json:"maximum_attempt_deadman"`
 	ReapTimeout           time.Duration `json:"reap_timeout"`
+	StartupInProgress     bool          `json:"startup_in_progress"`
 }
 
 // HelperSession identifies one opaque helper process/session generation
@@ -1447,6 +1448,12 @@ type BootBarrierTimelineReceipt struct {
 	AdvertisedReapTimeout   time.Duration `json:"advertised_reap_timeout"`
 	TakeoverBound           time.Duration `json:"takeover_bound"`
 	VerifiedReadyBound      time.Duration `json:"verified_ready_bound"`
+	HelperLossObservedAt    time.Time     `json:"helper_loss_observed_at,omitempty"`
+	BarrierStartedAt        time.Time     `json:"barrier_started_at"`
+	PrefaceCompletedAt      time.Time     `json:"preface_completed_at"`
+	SessionAdmittedAt       time.Time     `json:"session_admitted_at"`
+	VerifiedReadyAt         time.Time     `json:"verified_ready_at"`
+	PrefacedDuringStartup   bool          `json:"prefaced_during_startup"`
 	HandshakeElapsed        time.Duration `json:"handshake_elapsed"`
 	SessionAdmissionElapsed time.Duration `json:"session_admission_elapsed"`
 	SweepElapsed            time.Duration `json:"sweep_elapsed"`

@@ -1140,6 +1140,176 @@ func TestBootBarrierDefaultTakeoverReservesAStartupReapWindow(t *testing.T) {
 	}
 }
 
+func TestBootBarrierRejectsAdvertisedReapTimeoutAboveConfiguredMaximum(t *testing.T) {
+	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{ReapTimeout: defaultReapTimeout + time.Second})
+	defer stop()
+	barrier, err := NewBootBarrier(client, testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var mismatch *ReapTimeoutConfigurationError
+	if !errors.As(err, &mismatch) || mismatch.AdvertisedReapTimeout != defaultReapTimeout+time.Second ||
+		mismatch.MaximumReapTimeout != defaultReapTimeout || barrier.Ready() {
+		t.Fatalf("reap-timeout maximum outcome = %+v err=%v ready=%t", mismatch, err, barrier.Ready())
+	}
+}
+
+func TestBootBarrierUsesSmallerAdvertisedTakeoverWindow(t *testing.T) {
+	client := scriptedAcquireClient(t, []scriptedAcquireAttempt{{
+		handshake:      validAcquireResponse("helper-smaller", time.Second),
+		stallAdmission: true,
+	}})
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout:    5 * time.Second,
+		MaximumReapTimeout: defaultReapTimeout,
+		TakeoverRetry:      time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err = barrier.Ensure(t.Context())
+	elapsed := time.Since(started)
+	var stalled *HelperHandshakeStalledError
+	if !errors.As(err, &stalled) || elapsed < time.Second || elapsed >= 4*time.Second || barrier.Ready() ||
+		barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperHandshakeStalled || barrier.HandshakeStalledWindows() != 1 {
+		t.Fatalf("smaller advertised takeover outcome = stalled=%+v elapsed=%s err=%v ready=%t reason=%q windows=%d", stalled, elapsed, err, barrier.Ready(), barrier.CapabilityReasonCode(), barrier.HandshakeStalledWindows())
+	}
+}
+
+func TestBootBarrierDoesNotWidenConfiguredTakeoverWindow(t *testing.T) {
+	client := scriptedAcquireClient(t, []scriptedAcquireAttempt{{
+		handshake:      validAcquireResponse("helper-configured-window", 2*time.Second),
+		stallAdmission: true,
+	}})
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout:    time.Second,
+		MaximumReapTimeout: defaultReapTimeout,
+		TakeoverRetry:      time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err = barrier.Ensure(t.Context())
+	elapsed := time.Since(started)
+	var stalled *HelperHandshakeStalledError
+	if !errors.As(err, &stalled) || elapsed < time.Second || elapsed >= 3*time.Second || barrier.Ready() {
+		t.Fatalf("configured takeover outcome = stalled=%+v elapsed=%s err=%v ready=%t", stalled, elapsed, err, barrier.Ready())
+	}
+}
+
+func TestBootBarrierRejectsReapTimeoutDriftAcrossPrefacedRetries(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		first  time.Duration
+		second time.Duration
+	}{
+		{name: "increases", first: time.Second, second: 2 * time.Second},
+		{name: "decreases", first: 2 * time.Second, second: time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			first := validAcquireResponse("helper-drift", test.first)
+			second := first
+			second.ReapTimeout = test.second
+			client := scriptedAcquireClient(t, []scriptedAcquireAttempt{
+				{handshake: first, admissionError: &RPCError{Code: CodeSessionBusy, Message: "incumbent"}},
+				{handshake: second, stallAdmission: true},
+			})
+			barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+				TakeoverTimeout:    5 * time.Second,
+				MaximumReapTimeout: defaultReapTimeout,
+				TakeoverRetry:      time.Millisecond,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = barrier.Ensure(t.Context())
+			if err == nil || !strings.Contains(err.Error(), "reap timeout changed during takeover") || barrier.Ready() {
+				t.Fatalf("reap-timeout drift outcome = err=%v ready=%t", err, barrier.Ready())
+			}
+		})
+	}
+}
+
+func TestClientRejectsHandshakeFactDriftBeforeSessionAdmission(t *testing.T) {
+	handshake := validAcquireResponse("helper-facts", time.Second)
+	admission := handshake
+	admission.HelperVersion = "changed"
+	admission.SessionCapability = "capability"
+	admission.SessionGeneration = 1
+	client := scriptedAcquireClient(t, []scriptedAcquireAttempt{{handshake: handshake, admission: &admission}})
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if session != nil {
+		_ = session.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "changed handshake facts before session admission") {
+		t.Fatalf("handshake fact drift outcome = session=%+v err=%v", session, err)
+	}
+}
+
+func TestClientRejectsAdmissionWithoutAuthority(t *testing.T) {
+	handshake := validAcquireResponse("helper-invalid-admission", time.Second)
+	admission := handshake
+	client := scriptedAcquireClient(t, []scriptedAcquireAttempt{{handshake: handshake, admission: &admission}})
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if session != nil {
+		_ = session.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "invalid session admission") {
+		t.Fatalf("authority-free admission outcome = session=%+v err=%v", session, err)
+	}
+}
+
+func TestClientRejectsPartialAuthorityInFirstResponse(t *testing.T) {
+	handshake := validAcquireResponse("helper-partial", time.Second)
+	handshake.SessionCapability = "capability-without-generation"
+	client := scriptedAcquireClient(t, []scriptedAcquireAttempt{{handshake: handshake}})
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if session != nil {
+		_ = session.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "partial session authority") {
+		t.Fatalf("partial first-response authority outcome = session=%+v err=%v", session, err)
+	}
+}
+
+func TestClientAcceptsChecksumAuthenticatedLegacySingleResponse(t *testing.T) {
+	response := validAcquireResponse("helper-legacy", time.Second)
+	response.SessionCapability = "legacy-capability"
+	response.SessionGeneration = 7
+	client := scriptedAcquireClient(t, []scriptedAcquireAttempt{{handshake: response}})
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if handshake := session.Handshake(); handshake.HelperChecksum != "checksum-test" || handshake.SessionGeneration != 7 {
+		t.Fatalf("legacy authenticated acquisition = %+v", handshake)
+	}
+}
+
+func TestBootBarrierDoesNotRetryTypedAdmissionErrorAfterPreface(t *testing.T) {
+	client := scriptedAcquireClient(t, []scriptedAcquireAttempt{{
+		handshake:      validAcquireResponse("helper-typed-admission", time.Second),
+		admissionError: &RPCError{Code: CodeInvalidRequest, Message: "typed admission refusal"},
+	}})
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout:    5 * time.Second,
+		MaximumReapTimeout: defaultReapTimeout,
+		TakeoverRetry:      time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeInvalidRequest || client.scriptedDials() != 1 {
+		t.Fatalf("typed admission outcome = rpc=%+v err=%v dials=%d", rpcErr, err, client.scriptedDials())
+	}
+}
+
 func TestBootBarrierClassifiesRepeatedMissingSocketAsHelperUnitUnavailable(t *testing.T) {
 	dials := 0
 	client := &Client{
@@ -1315,11 +1485,11 @@ func TestBootBarrierDoesNotReclassifyCallerCancellationAsUnavailableUnit(t *test
 	}
 }
 
-func TestBootBarrierDerivesTakeoverFromHandshakeDuringSlowStartup(t *testing.T) {
+func TestBootBarrierReceiptsAuthorityFreePrefaceDuringSlowStartup(t *testing.T) {
 	const (
-		reapTimeout     = 500 * time.Millisecond
-		startupDuration = reapTimeout - 75*time.Millisecond
-		responseDelay   = 125 * time.Millisecond
+		reapTimeout     = 2 * time.Second
+		startupDuration = time.Second
+		responseDelay   = time.Second
 	)
 	engine := newFakeEngine()
 	engine.sweepEntered = make(chan struct{})
@@ -1327,16 +1497,21 @@ func TestBootBarrierDerivesTakeoverFromHandshakeDuringSlowStartup(t *testing.T) 
 	client, stop := startTestServer(t, engine, ServerConfig{ReapTimeout: reapTimeout})
 	defer stop()
 	baseDial := client.Dial
+	var dials atomic.Int32
 	client.Dial = func(ctx context.Context) (net.Conn, error) {
 		connection, err := baseDial(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return newDelayedFirstResponseConn(connection, responseDelay), nil
+		if dials.Add(1) == 1 {
+			return newDelayedFirstResponseConn(connection, responseDelay), nil
+		}
+		return connection, nil
 	}
 	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
-		TakeoverTimeout: 250 * time.Millisecond,
-		TakeoverRetry:   time.Millisecond,
+		TakeoverTimeout:    TakeoverTimeoutForReap(reapTimeout),
+		MaximumReapTimeout: reapTimeout,
+		TakeoverRetry:      time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1357,12 +1532,42 @@ func TestBootBarrierDerivesTakeoverFromHandshakeDuringSlowStartup(t *testing.T) 
 	receipt, ok := barrier.SweepReceipt()
 	timeline := receipt.BarrierTimeline
 	if !ok || timeline.AdvertisedReapTimeout != reapTimeout || timeline.TakeoverBound != 2*reapTimeout || timeline.VerifiedReadyBound != 3*reapTimeout ||
+		!timeline.PrefacedDuringStartup || timeline.BarrierStartedAt.IsZero() || timeline.PrefaceCompletedAt.Before(timeline.BarrierStartedAt) ||
+		timeline.SessionAdmittedAt.Before(timeline.PrefaceCompletedAt) || timeline.VerifiedReadyAt.Before(timeline.SessionAdmittedAt) ||
 		timeline.HandshakeElapsed <= 0 || timeline.SessionAdmissionElapsed < timeline.HandshakeElapsed ||
 		timeline.VerifiedReadyElapsed < timeline.SessionAdmissionElapsed || timeline.VerifiedReadyElapsed > timeline.VerifiedReadyBound {
 		t.Fatalf("barrier timeline receipt = %+v present=%t", timeline, ok)
 	}
 	t.Logf("GREEN: authority-free handshake derived takeover from reap=%s during startup=%s and response delay=%s", reapTimeout, startupDuration, responseDelay)
 	_ = barrier.Close()
+}
+
+func TestBootBarrierHandshakeElapsedBelongsToAdmittedConnection(t *testing.T) {
+	first := validAcquireResponse("helper-admitted-handshake", 2*time.Second)
+	admitted := first
+	admitted.SessionCapability = "admitted-capability"
+	admitted.SessionGeneration = 1
+	client := scriptedAcquireClient(t, []scriptedAcquireAttempt{
+		{handshake: first, admissionError: &RPCError{Code: CodeSessionBusy, Message: "incumbent"}},
+		{handshake: first, prefaceDelay: time.Second, admission: &admitted},
+	})
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout:    4 * time.Second,
+		MaximumReapTimeout: 2 * time.Second,
+		TakeoverRetry:      time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer barrier.Close()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	receipt, ok := barrier.SweepReceipt()
+	if !ok || receipt.BarrierTimeline.HandshakeElapsed < time.Second ||
+		receipt.BarrierTimeline.SessionAdmissionElapsed < receipt.BarrierTimeline.HandshakeElapsed {
+		t.Fatalf("admitted-connection handshake receipt = %+v present=%t", receipt.BarrierTimeline, ok)
+	}
 }
 
 func TestServerAndBootBarrierRefuseInconsistentResidueClassification(t *testing.T) {
@@ -1564,6 +1769,81 @@ func TestHelperHandshakeReportsReapTimeoutWhileStartupSweepBlocksAuthority(t *te
 	}
 	if admitted.SessionCapability == "" || admitted.SessionGeneration == 0 || admitted.ReapTimeout != handshake.ReapTimeout {
 		t.Fatalf("verified startup admission = %+v, handshake=%+v", admitted, handshake)
+	}
+}
+
+func TestHelperStartupAdmitsExactlyOneOfTwoPrefacedClients(t *testing.T) {
+	engine := newFakeEngine()
+	engine.sweepEntered = make(chan struct{})
+	engine.releaseSweep = make(chan struct{})
+	client, stop := startTestServer(t, engine, ServerConfig{ReapTimeout: time.Second})
+	defer stop()
+	releaseStartup := sync.OnceFunc(func() { close(engine.releaseSweep) })
+	defer releaseStartup()
+	<-engine.sweepEntered
+
+	type prefacedAcquisition struct {
+		connection net.Conn
+		wire       *framedConn
+		handshake  AcquireSessionResponse
+	}
+	acquisitions := make([]prefacedAcquisition, 2)
+	for index := range acquisitions {
+		connection, err := client.Dial(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer connection.Close()
+		wire := newFramedConn(connection)
+		request := testSessionRequest()
+		request.BootSessionID = fmt.Sprintf("prefaced-boot-%d", index)
+		body, err := marshalBody(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.write(frame{Version: ProtocolVersion, Method: MethodAcquireSession, Body: body}); err != nil {
+			t.Fatal(err)
+		}
+		var handshake AcquireSessionResponse
+		if err := decodeResponse(wire, &handshake); err != nil {
+			t.Fatalf("client %d did not receive a startup preface: %v", index, err)
+		}
+		if !handshake.StartupInProgress || handshake.SessionCapability != "" || handshake.SessionGeneration != 0 {
+			t.Fatalf("client %d preface = %+v", index, handshake)
+		}
+		acquisitions[index] = prefacedAcquisition{connection: connection, wire: wire, handshake: handshake}
+	}
+	releaseStartup()
+
+	type result struct {
+		response AcquireSessionResponse
+		err      error
+	}
+	results := make(chan result, len(acquisitions))
+	for _, acquisition := range acquisitions {
+		go func(acquisition prefacedAcquisition) {
+			var response AcquireSessionResponse
+			err := decodeResponse(acquisition.wire, &response)
+			results <- result{response: response, err: err}
+		}(acquisition)
+	}
+	admitted := 0
+	busy := 0
+	for range acquisitions {
+		result := <-results
+		if result.err == nil && result.response.SessionCapability != "" && result.response.SessionGeneration == 1 {
+			admitted++
+			continue
+		}
+		var rpcErr *RPCError
+		if errors.As(result.err, &rpcErr) && rpcErr.Code == CodeSessionBusy {
+			busy++
+			continue
+		}
+		t.Fatalf("prefaced acquisition outcome = response=%+v err=%v", result.response, result.err)
+	}
+	if admitted != 1 || busy != 1 {
+		t.Fatalf("prefaced acquisition counts = admitted:%d busy:%d", admitted, busy)
 	}
 }
 
@@ -3184,6 +3464,95 @@ func requireSweep(t *testing.T, session *Session) {
 
 func testSessionRequest() AcquireSessionRequest {
 	return AcquireSessionRequest{NodeID: "node-1", BootSessionID: "boot-1", ExpectedHelperChecksum: "checksum-test"}
+}
+
+type scriptedAcquireAttempt struct {
+	handshake      AcquireSessionResponse
+	admission      *AcquireSessionResponse
+	admissionError *RPCError
+	stallAdmission bool
+	prefaceDelay   time.Duration
+}
+
+var scriptedAcquireDialCounts sync.Map
+
+func validAcquireResponse(instanceID string, reapTimeout time.Duration) AcquireSessionResponse {
+	return AcquireSessionResponse{
+		ProtocolVersion:       ProtocolVersion,
+		HelperVersion:         "test-helper",
+		HelperChecksum:        "checksum-test",
+		HelperInstanceID:      instanceID,
+		HeartbeatTimeout:      time.Second,
+		MaximumAttemptDeadman: time.Second,
+		ReapTimeout:           reapTimeout,
+	}
+}
+
+func scriptedAcquireClient(t *testing.T, attempts []scriptedAcquireAttempt) *Client {
+	t.Helper()
+	var next atomic.Int32
+	dials := new(atomic.Int32)
+	client := &Client{ExpectedChecksum: "checksum-test", disableHeartbeatPump: true}
+	client.Dial = func(ctx context.Context) (net.Conn, error) {
+		dials.Add(1)
+		index := int(next.Add(1)) - 1
+		if index >= len(attempts) {
+			agentConnection, helperConnection := net.Pipe()
+			go func() {
+				defer helperConnection.Close()
+				wire := newFramedConn(helperConnection)
+				var request frame
+				if err := wire.read(&request); err != nil {
+					return
+				}
+				switch request.Method {
+				case MethodSweep:
+					_ = writeSuccess(wire, SweepResponse{SweepEpoch: "scripted-sweep"})
+				case MethodVerify:
+					_ = writeSuccess(wire, VerifyResponse{Absent: true})
+				default:
+					_ = writeFailure(wire, CodeInvalidRequest, "unexpected scripted method")
+				}
+			}()
+			return agentConnection, nil
+		}
+		agentConnection, helperConnection := net.Pipe()
+		attempt := attempts[index]
+		go func() {
+			defer helperConnection.Close()
+			wire := newFramedConn(helperConnection)
+			var request frame
+			if err := wire.read(&request); err != nil {
+				return
+			}
+			if attempt.prefaceDelay > 0 {
+				time.Sleep(attempt.prefaceDelay)
+			}
+			if err := writeSuccess(wire, attempt.handshake); err != nil {
+				return
+			}
+			switch {
+			case attempt.admission != nil:
+				_ = writeSuccess(wire, *attempt.admission)
+			case attempt.admissionError != nil:
+				_ = writeRPCError(wire, attempt.admissionError)
+			case attempt.stallAdmission:
+				_, _ = io.Copy(io.Discard, helperConnection)
+			}
+		}()
+		return agentConnection, nil
+	}
+	scriptedAcquireDialCounts.Store(client, dials)
+	t.Cleanup(func() { scriptedAcquireDialCounts.Delete(client) })
+	return client
+}
+
+func (client *Client) scriptedDials() int {
+	count, ok := scriptedAcquireDialCounts.Load(client)
+	if !ok {
+		return 0
+	}
+	return int(count.(*atomic.Int32).Load())
 }
 
 func startTestServer(t *testing.T, engine Engine, config ServerConfig) (*Client, func()) {

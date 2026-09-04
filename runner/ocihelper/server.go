@@ -387,11 +387,17 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 		_ = writeFailure(wire, CodeChecksumMismatch, "helper checksum does not match agent expectation")
 		return
 	}
+	startupInProgress := true
+	select {
+	case <-server.startupDone:
+		startupInProgress = false
+	default:
+	}
 	handshake := AcquireSessionResponse{
 		ProtocolVersion: ProtocolVersion, HelperVersion: server.config.HelperVersion,
 		HelperChecksum: server.config.HelperChecksum, HelperInstanceID: server.instanceID,
 		HeartbeatTimeout: server.config.HeartbeatTimeout, MaximumAttemptDeadman: server.config.MaximumAttemptDeadman,
-		ReapTimeout: server.config.ReapTimeout,
+		ReapTimeout: server.config.ReapTimeout, StartupInProgress: startupInProgress,
 	}
 	if err := writeSuccess(wire, handshake); err != nil {
 		return

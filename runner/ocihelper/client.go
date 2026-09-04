@@ -147,7 +147,10 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 	if response.SessionCapability == "" && response.SessionGeneration == 0 {
 		if err := decodeResponse(wire, &response); err != nil {
 			_ = connection.Close()
-			return nil, &sessionAdmissionTransportError{cause: err}
+			if helperHandshakeTransportFailure(err) {
+				return nil, &sessionAdmissionTransportError{cause: err}
+			}
+			return nil, err
 		}
 		if err := validateSessionHandshake(client, response, true); err != nil {
 			_ = connection.Close()
@@ -156,7 +159,7 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 		if response.ProtocolVersion != handshake.ProtocolVersion || response.HelperVersion != handshake.HelperVersion ||
 			response.HelperChecksum != handshake.HelperChecksum || response.HelperInstanceID != handshake.HelperInstanceID ||
 			response.HeartbeatTimeout != handshake.HeartbeatTimeout || response.MaximumAttemptDeadman != handshake.MaximumAttemptDeadman ||
-			response.ReapTimeout != handshake.ReapTimeout {
+			response.ReapTimeout != handshake.ReapTimeout || response.StartupInProgress != handshake.StartupInProgress {
 			_ = connection.Close()
 			return nil, errors.New("OCI helper changed handshake facts before session admission")
 		}

@@ -94,8 +94,21 @@ helper-instance ID and configured reap timeout. It contains no session
 capability or session generation. A second response returns the process-local
 session generation and opaque capability only after the startup barrier is
 verified. The client uses the first response's advertised timeout to derive
-takeover, sweep, and verification bounds, and rejects changed facts between the
-two responses.
+takeover, sweep, and verification bounds, rejects an advertised timeout above
+its configured contract maximum, and rejects changed facts between the two
+responses.
+
+Protocol-major-2 rollout permits one narrow compatibility case: a new client
+may accept a legacy helper's first response when it carries both capability and
+generation. The client sends and locally verifies the expected helper checksum
+before interpreting that response; a legacy helper also completed startup
+Sweep+Verify before it entered the accept loop, so its early authority is not
+pre-verification authority. Partial authority is always invalid. A new helper
+always emits the authority-free preface followed by admission. Rollout is
+client-first: the dual-form client must be installed before replacing the
+helper. An old client rejects a new helper's authority-free first frame, while a
+new client can safely operate either helper form and therefore permits helper
+rollback without weakening authority ordering.
 
 Wire major `2` is carried on every request and response. It is the first major
 that carries the complete Computer endpoint, control-state, and attachment
@@ -202,21 +215,30 @@ the acquired session remains healthy; replacement authority always repeats the
 whole barrier and never adopts a survivor. Startup sweep retains the unchanged
 ten-second reap bound. The authority-free first response makes that configured
 bound observable while startup cleanup is still running. From the first
-handshake in a takeover, the client fixes the exclusive-session deadline at
-`reap + reap` (20 seconds with the production reap timeout): one interval for
-startup cleanup and one for an incumbent authority to expire. It never extends
-the window across retries and no longer compares the helper's advertised value
-to a compile-time expected reap timeout. The initial no-handshake discovery
-window remains bounded so wholly unavailable units and connected-but-silent
-socket backlogs retain their typed outcomes. This implements #301 and addresses
+handshake in a takeover, the client fixes the exclusive-session deadline at the
+smaller of the configured takeover window and `reap + reap`. Production
+configures a ten-second maximum advertised reap and a 20-second takeover, so
+the arithmetic remains 20 seconds: one interval for startup cleanup and one for
+an incumbent authority to expire. A helper advertising above the configured
+maximum is rejected with `ReapTimeoutConfigurationError`; any advertised drift
+in either direction across retries is rejected. A smaller valid advertisement
+shortens but never extends the configured window. The initial no-handshake
+discovery window remains bounded so wholly unavailable units and
+connected-but-silent socket backlogs retain their typed outcomes. This
+implements #301 and addresses
 the measured #307 path where helper EOF at `08:19:14.844` was followed by new
 startup-sweep runtime activity only at `08:19:24.458`, leaving no barrier
 authority at `08:19:29.851`; round-4 #304 measured ordinary lost-attempt cleanup
 at 595.949 ms (XFCE) and 588.031 ms (Wayland), so widening the lease is neither
 needed nor authorized.
 While taking over, the client retries dial-time `ENOENT`, `ECONNREFUSED`, and
-`ECONNRESET` within that same fixed window. Protocol, authentication, and typed
-RPC errors after a completed handshake stay hard and immediate. Window expiry
+`ECONNRESET` within that same fixed window. `session_busy` is the sole typed
+admission response retried inside that window; every other protocol,
+authentication, or typed RPC error is hard and immediate. Transport loss while
+waiting for the second frame may retry, but a helper that completes the preface
+and never supplies admission before the window expires is
+`helper_handshake_stalled`, preserving Lima's
+`helper_handshake_stalled_persistent` escalation. Window expiry
 returns `helper_unit_unavailable` only when every dial positively observed
 `ENOENT`, `ECONNREFUSED`, or `ECONNRESET`. A connected socket backlog that never
 completes a handshake returns retryable `helper_handshake_stalled`; Lima
@@ -242,9 +264,17 @@ into the first session receipt so evidence is not discarded before session
 acquisition. This is evidence for the later runtime/removal adapter; this
 protocol ticket does not itself persist a deletion manifest or removal receipt.
 The receipt also records the advertised reap timeout, derived takeover and
-verified-ready bounds, and measured handshake, session-admission, session-sweep,
-verification, and verified-ready durations. Hosted gates compare measured
-fresh-attempt admission to the receipt-derived 30-second bound.
+verified-ready bounds; absolute helper-loss, barrier-start, preface, admission,
+and verified-ready observations; whether the admitted connection was prefaced
+while startup was still in progress; and measured handshake,
+session-admission, session-sweep, verification, and verified-ready durations.
+The Linux L1 receipt adds the fresh-attempt admission observation. Its
+production lease remains 30 seconds, while both kill-to-fresh-admission and
+kill-to-healthy recovery must complete within 28 seconds. The two-second margin
+is derived from round-4 #304 cleanup below 600 ms, rounded to a one-second
+cleanup ceiling, plus a one-second preface/admission ceiling. The literal
+10-second reap, 20-second takeover, and 30-second verified-ready relationships
+remain separate production configuration checks.
 Every swept and verified inventory class has identity-set semantics: merges are
 sorted and compacted per class, never counted as a multiset. Recovered Attempt
 authority tuples use the same set semantics across startup, session-reap, and
