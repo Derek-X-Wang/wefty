@@ -173,6 +173,50 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"storage_generation": fmt.Sprint(ready.StorageGeneration), "intent_revision": fmt.Sprint(ready.IntentRevision),
 		"disk_path": diskEvidence.Path, "disk_blocks_bytes": fmt.Sprint(diskEvidence.BlocksBytes)})
 
+	receipt.begin("linux.screen_crossover_refused")
+	neighbour := createReadyComputer(t, harness, reference, digest, "linux-native-crossover-neighbour", "linux-native-crossover-neighbour-create")
+	recordComputerAuthority(receipt, neighbour)
+	probeTarget := neighbour
+	if mutatingLinuxComputerRow("linux.screen_crossover_refused") {
+		// The negative lane targets the source Computer's own endpoints. Those
+		// must remain readable/controllable, proving the refusal assertions are
+		// sensitive to a real reachable screen rather than fixed receipt values.
+		probeTarget = ready
+	}
+	targetEndpoints := readLiveComputerEndpointEnvironment(t, probeTarget)
+	crossover := probeComputerScreenCrossover(t, ready, probeTarget, variant, targetEndpoints)
+	removedNeighbour := removeAndWaitComputer(t, harness, neighbour, 4*time.Minute)
+	crossoverRefused := crossover.ViewRead.Outcome == "refused" && crossover.ViewRead.ErrnoName == "ECONNREFUSED" &&
+		crossover.ControlInject.Outcome == "refused" && crossover.ControlInject.ErrnoName == "ECONNREFUSED"
+	if variant == "xfce" {
+		crossoverRefused = crossoverRefused && !crossover.AbstractSocketVisible &&
+			crossover.AbstractSocket.Outcome == "refused" && crossover.AbstractSocket.ErrnoName == "ENOENT" &&
+			crossover.DerivedDisplay.Outcome == "refused"
+	}
+	completeLinuxComputerRow(t, receipt, "linux.screen_crossover_refused", map[string]bool{
+		"two_colocated_computers_live": ready.CurrentJob.CurrentAttemptID != "" && neighbour.CurrentJob.CurrentAttemptID != "" && ready.ComputerID != neighbour.ComputerID,
+		"crossover_refused":            crossoverRefused,
+		"neighbour_removed_verified":   removedNeighbour.RemovalOutcome == "removed_verified",
+	}, map[string]string{
+		"source_computer_id":        ready.ComputerID,
+		"source_attempt_id":         ready.CurrentJob.CurrentAttemptID,
+		"target_computer_id":        probeTarget.ComputerID,
+		"target_attempt_id":         probeTarget.CurrentJob.CurrentAttemptID,
+		"target_view_port":          fmt.Sprint(targetEndpoints.ViewPort),
+		"target_control_port":       fmt.Sprint(targetEndpoints.ControlPort),
+		"abstract_socket":           crossover.AbstractSocketName,
+		"abstract_socket_visible":   strconv.FormatBool(crossover.AbstractSocketVisible),
+		"abstract_socket_outcome":   crossover.AbstractSocket.Outcome,
+		"abstract_socket_errno":     crossover.AbstractSocket.ErrnoName,
+		"derived_display":           crossover.DerivedDisplay.Address,
+		"derived_display_outcome":   crossover.DerivedDisplay.Outcome,
+		"view_read_outcome":         crossover.ViewRead.Outcome,
+		"view_read_errno":           crossover.ViewRead.ErrnoName,
+		"control_inject_outcome":    crossover.ControlInject.Outcome,
+		"control_inject_errno":      crossover.ControlInject.ErrnoName,
+		"neighbour_removal_outcome": removedNeighbour.RemovalOutcome,
+	})
+
 	receipt.begin("linux.remote_takeover")
 	viewerIdentity := runComputerCLIPersonWithEvidence[l1.AuthenticatedPerson](t, evidence, "whoami-cli-viewer.json", harness, "linux-viewer", "linux-viewer-device", "whoami")
 	if viewerIdentity.FabricID != policy.Admins[0].FabricID || viewerIdentity.UserID != "linux-viewer" || viewerIdentity.DeviceID != "linux-viewer-device" {
@@ -784,6 +828,259 @@ func stringSetDifference(before, after []string) []string {
 		}
 	}
 	return removed
+}
+
+type liveComputerEndpointEnvironment struct {
+	ViewPort    int `json:"view_port"`
+	ControlPort int `json:"control_port"`
+}
+
+type screenCrossoverAttempt struct {
+	Address   string `json:"address"`
+	Outcome   string `json:"outcome"`
+	Errno     int    `json:"errno,omitempty"`
+	ErrnoName string `json:"errno_name,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+type screenCrossoverReceipt struct {
+	Version               int                    `json:"version"`
+	Variant               string                 `json:"variant"`
+	SourceComputerID      string                 `json:"source_computer_id"`
+	TargetComputerID      string                 `json:"target_computer_id"`
+	AbstractSocketName    string                 `json:"abstract_socket_name"`
+	AbstractSocketVisible bool                   `json:"abstract_socket_visible"`
+	AbstractSocket        screenCrossoverAttempt `json:"abstract_socket"`
+	DerivedDisplay        screenCrossoverAttempt `json:"derived_display"`
+	ViewRead              screenCrossoverAttempt `json:"view_read"`
+	ControlInject         screenCrossoverAttempt `json:"control_inject"`
+}
+
+const liveComputerEndpointEnvironmentPython = `
+import json
+values = {}
+for item in open("/proc/1/environ", "rb").read().split(b"\0"):
+    if b"=" in item:
+        key, value = item.split(b"=", 1)
+        values[key.decode()] = value.decode()
+print(json.dumps({
+    "view_port": int(values["WEFTY_COMPUTER_VIEW_PORT"]),
+    "control_port": int(values["WEFTY_COMPUTER_CONTROL_PORT"]),
+}))
+`
+
+const liveComputerScreenCrossoverPython = `
+import base64, errno, json, os, socket, struct, subprocess, sys
+
+variant, source_id, target_id, view_text, control_text = sys.argv[1:6]
+view_port, control_port = int(view_text), int(control_text)
+
+def refused(address, error):
+    number = error.errno or 0
+    return {"address": address, "outcome": "refused", "errno": number,
+            "errno_name": errno.errorcode.get(number, type(error).__name__), "detail": str(error)}
+
+def recv_exact(connection, count):
+    result = b""
+    while len(result) < count:
+        chunk = connection.recv(count - len(result))
+        if not chunk:
+            raise EOFError("peer closed the WebSocket stream")
+        result += chunk
+    return result
+
+class websocket_stream:
+    def __init__(self, connection):
+        self.connection = connection
+        self.buffer = b""
+
+    def send(self, payload):
+        mask = os.urandom(4)
+        length = len(payload)
+        if length < 126:
+            header = bytes([0x82, 0x80 | length])
+        elif length < 65536:
+            header = bytes([0x82, 0x80 | 126]) + struct.pack("!H", length)
+        else:
+            header = bytes([0x82, 0x80 | 127]) + struct.pack("!Q", length)
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        self.connection.sendall(header + mask + masked)
+
+    def frame(self):
+        first, second = recv_exact(self.connection, 2)
+        opcode, length = first & 0x0f, second & 0x7f
+        if length == 126:
+            length = struct.unpack("!H", recv_exact(self.connection, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", recv_exact(self.connection, 8))[0]
+        if second & 0x80:
+            mask = recv_exact(self.connection, 4)
+            payload = recv_exact(self.connection, length)
+            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        else:
+            payload = recv_exact(self.connection, length)
+        if opcode == 0x8:
+            raise EOFError("peer closed the WebSocket")
+        if opcode == 0x9:
+            self.send(payload)
+            return self.frame()
+        return payload
+
+    def read(self, count):
+        while len(self.buffer) < count:
+            self.buffer += self.frame()
+        result, self.buffer = self.buffer[:count], self.buffer[count:]
+        return result
+
+def rfb_attempt(port, inject):
+    address = "127.0.0.1:" + str(port)
+    connection = None
+    try:
+        connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+        key = base64.b64encode(os.urandom(16)).decode()
+        request = ("GET /websockify HTTP/1.1\r\nHost: " + address +
+                   "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+                   "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key +
+                   "\r\nSec-WebSocket-Protocol: binary\r\n\r\n").encode()
+        connection.sendall(request)
+        response = b""
+        while b"\r\n\r\n" not in response:
+            response += connection.recv(1)
+            if len(response) > 16384:
+                raise ValueError("oversized WebSocket response")
+        if not response.startswith(b"HTTP/1.1 101"):
+            raise RuntimeError("WebSocket upgrade refused: " + response.decode(errors="replace"))
+        stream = websocket_stream(connection)
+        if not stream.read(12).startswith(b"RFB 003."):
+            raise RuntimeError("RFB banner missing")
+        stream.send(b"RFB 003.008\n")
+        count = stream.read(1)[0]
+        security = stream.read(count)
+        if 1 not in security:
+            raise RuntimeError("RFB None security unavailable")
+        stream.send(b"\x01")
+        if stream.read(4) != b"\x00\x00\x00\x00":
+            raise RuntimeError("RFB security failed")
+        stream.send(b"\x01")
+        server_init = stream.read(24)
+        stream.read(struct.unpack("!I", server_init[20:24])[0])
+        if inject:
+            stream.send(b"\x05\x01\x00\x11\x00\x13")
+            stream.send(b"\x05\x00\x00\x11\x00\x13")
+            outcome = "inject_succeeded"
+        else:
+            outcome = "read_succeeded"
+        return {"address": address, "outcome": outcome}
+    except OSError as error:
+        return refused(address, error)
+    except Exception as error:
+        return {"address": address, "outcome": "protocol_error", "detail": type(error).__name__ + ":" + str(error)}
+    finally:
+        if connection is not None:
+            connection.close()
+
+abstract_name = "@/tmp/.X11-unix/X" + str(view_port)
+abstract_visible = False
+abstract_attempt = {"address": abstract_name, "outcome": "not_applicable"}
+display_attempt = {"address": ":" + str(view_port), "outcome": "not_applicable"}
+if variant == "xfce":
+    abstract_visible = abstract_name in open("/proc/net/unix", encoding="utf-8").read()
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(5)
+        connection.connect("\0/tmp/.X11-unix/X" + str(view_port))
+        abstract_attempt = {"address": abstract_name, "outcome": "connected"}
+    except OSError as error:
+        abstract_attempt = refused(abstract_name, error)
+    finally:
+        connection.close()
+    display = subprocess.run(["/usr/bin/xdpyinfo", "-display", ":" + str(view_port)],
+                             text=True, capture_output=True, timeout=5)
+    display_attempt = {"address": ":" + str(view_port),
+                       "outcome": "read_succeeded" if display.returncode == 0 else "refused",
+                       "detail": display.stderr.strip()[-512:]}
+
+print(json.dumps({
+    "version": 1,
+    "variant": variant,
+    "source_computer_id": source_id,
+    "target_computer_id": target_id,
+    "abstract_socket_name": abstract_name,
+    "abstract_socket_visible": abstract_visible,
+    "abstract_socket": abstract_attempt,
+    "derived_display": display_attempt,
+    "view_read": rfb_attempt(view_port, False),
+    "control_inject": rfb_attempt(control_port, True),
+}, sort_keys=True))
+`
+
+func readLiveComputerEndpointEnvironment(t *testing.T, computer l1.Computer) liveComputerEndpointEnvironment {
+	t.Helper()
+	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
+	containerID := liveComputerContainerID(t, computer.CurrentJobID)
+	execID := fmt.Sprintf("computer-endpoints-%d", time.Now().UnixNano())
+	output, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+		"tasks", "exec", "--exec-id", execID, containerID, "/usr/bin/python3", "-c", liveComputerEndpointEnvironmentPython).CombinedOutput()
+	if err != nil {
+		t.Fatalf("read live Computer endpoint environment: %v\n%s", err, output)
+	}
+	var environment liveComputerEndpointEnvironment
+	lines := bytes.Split(bytes.TrimSpace(output), []byte("\n"))
+	if len(lines) == 0 || json.Unmarshal(lines[len(lines)-1], &environment) != nil || environment.ViewPort <= 0 || environment.ControlPort <= 0 || environment.ViewPort == environment.ControlPort {
+		t.Fatalf("decode live Computer endpoint environment: %s", output)
+	}
+	return environment
+}
+
+func probeComputerScreenCrossover(t *testing.T, source, target l1.Computer, variant string, endpoints liveComputerEndpointEnvironment) screenCrossoverReceipt {
+	t.Helper()
+	containerdAddress := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_CONTAINERD_ADDRESS")
+	containerID := liveComputerContainerID(t, source.CurrentJobID)
+	execID := fmt.Sprintf("screen-crossover-%d", time.Now().UnixNano())
+	output, err := exec.Command("sudo", "/usr/local/bin/ctr", "--address", containerdAddress, "--namespace", ocihelper.ContainerdNamespace,
+		"tasks", "exec", "--exec-id", execID, containerID, "/usr/bin/python3", "-c", liveComputerScreenCrossoverPython,
+		variant, source.ComputerID, target.ComputerID, fmt.Sprint(endpoints.ViewPort), fmt.Sprint(endpoints.ControlPort)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("execute Computer screen crossover probe: %v\n%s", err, output)
+	}
+	var receipt screenCrossoverReceipt
+	lines := bytes.Split(bytes.TrimSpace(output), []byte("\n"))
+	if len(lines) == 0 || json.Unmarshal(lines[len(lines)-1], &receipt) != nil || receipt.Version != 1 || receipt.SourceComputerID != source.ComputerID || receipt.TargetComputerID != target.ComputerID {
+		t.Fatalf("decode Computer screen crossover receipt: %s", output)
+	}
+	t.Logf("screen crossover source=%s target=%s abstract=%s errno=%s display=%s view=%s errno=%s control=%s errno=%s",
+		receipt.SourceComputerID, receipt.TargetComputerID, receipt.AbstractSocket.Outcome, receipt.AbstractSocket.ErrnoName,
+		receipt.DerivedDisplay.Outcome, receipt.ViewRead.Outcome, receipt.ViewRead.ErrnoName,
+		receipt.ControlInject.Outcome, receipt.ControlInject.ErrnoName)
+	return receipt
+}
+
+func TestScreenCrossoverProbeRecordsTypedTransportRefusal(t *testing.T) {
+	ports := make([]int, 0, 2)
+	for range 2 {
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ports = append(ports, listener.Addr().(*net.TCPAddr).Port)
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	output, err := exec.Command("python3", "-c", liveComputerScreenCrossoverPython,
+		"wayland", "source", "target", fmt.Sprint(ports[0]), fmt.Sprint(ports[1])).CombinedOutput()
+	if err != nil {
+		t.Fatalf("execute crossover probe contract: %v\n%s", err, output)
+	}
+	var receipt screenCrossoverReceipt
+	if err := json.Unmarshal(bytes.TrimSpace(output), &receipt); err != nil {
+		t.Fatalf("decode crossover probe contract: %v\n%s", err, output)
+	}
+	if receipt.ViewRead.Outcome != "refused" || receipt.ViewRead.ErrnoName != "ECONNREFUSED" ||
+		receipt.ControlInject.Outcome != "refused" || receipt.ControlInject.ErrnoName != "ECONNREFUSED" ||
+		receipt.AbstractSocket.Outcome != "not_applicable" || receipt.DerivedDisplay.Outcome != "not_applicable" {
+		t.Fatalf("typed crossover refusal = %+v", receipt)
+	}
 }
 
 func TestCompareRemovalInventoryBaselineAllowsOnlySelfGCContraction(t *testing.T) {

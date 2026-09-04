@@ -11,6 +11,7 @@ import (
 
 var linuxComputerReceiptRows = []string{
 	"linux.create_boot",
+	"linux.screen_crossover_refused",
 	"linux.remote_takeover",
 	"linux.restart_survival",
 	"linux.reconfiguration",
@@ -122,10 +123,23 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 	guest["evidence"] = map[string]string{"blocked_assertion": "candidate-bound root Run route"}
 	storage := rows["linux.storage_provenance"].(map[string]any)
 	storage["evidence"] = map[string]string{"restore_token_revocation_receipt": "operation_revision=9 revoke_all=true computer_id=computer-1"}
+	crossover := rows["linux.screen_crossover_refused"].(map[string]any)
+	crossover["assertions"] = map[string]bool{"crossover_refused": true}
+	crossoverEvidence := map[string]string{
+		"view_read_outcome": "refused", "view_read_errno": "ECONNREFUSED",
+		"control_inject_outcome": "refused", "control_inject_errno": "ECONNREFUSED",
+		"abstract_socket_outcome": "refused", "abstract_socket_errno": "ENOENT",
+		"abstract_socket_visible": "false", "derived_display_outcome": "refused",
+	}
+	if variant == "wayland" {
+		crossoverEvidence["abstract_socket_outcome"] = "not_applicable"
+		crossoverEvidence["derived_display_outcome"] = "not_applicable"
+	}
+	crossover["evidence"] = crossoverEvidence
 	rows["linux.removal"].(map[string]any)["evidence"] = map[string]string{"inventory_source": "helper VerifyNamespaceReadOnly route"}
 	digest := "sha256:" + strings.Repeat("a", 64)
 	return map[string]any{
-		"version":       2,
+		"version":       3,
 		"status":        "NOT-RUN",
 		"not_run_issue": 157,
 		"candidate_sha": candidate,
