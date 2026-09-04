@@ -82,7 +82,7 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows["linux.network_egress"].evidence.node_listener_ipv4_errno == "ECONNREFUSED" and
     (.rows["linux.network_egress"].evidence.node_listener_ipv6_address | test("^\\[fe80:.*%eth0\\]:[0-9]+$")) and
     .rows["linux.network_egress"].evidence.node_listener_ipv6_outcome == "refused" and
-    (["ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"] | index($root.rows["linux.network_egress"].evidence.node_listener_ipv6_errno)) != null
+    (["EADDRNOTAVAIL", "ENETUNREACH", "EHOSTUNREACH", "ECONNREFUSED"] | index($root.rows["linux.network_egress"].evidence.node_listener_ipv6_errno)) != null
    end) and
   (if $mutated == "linux.screen_crossover_refused" then
     .rows["linux.screen_crossover_refused"].status == "FAIL"
@@ -118,7 +118,7 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows["linux.screen_crossover_refused"].evidence.egress_address_errno == "ECONNREFUSED" and
     (.rows["linux.screen_crossover_refused"].evidence.node_listener_ipv6_address | test("^\\[fe80:.*%eth0\\]:[0-9]+$")) and
     .rows["linux.screen_crossover_refused"].evidence.node_listener_ipv6_outcome == "refused" and
-    (["ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"] | index($root.rows["linux.screen_crossover_refused"].evidence.node_listener_ipv6_errno)) != null and
+    (["EADDRNOTAVAIL", "ENETUNREACH", "EHOSTUNREACH", "ECONNREFUSED"] | index($root.rows["linux.screen_crossover_refused"].evidence.node_listener_ipv6_errno)) != null and
     (if .image.variant == "xfce" then
       .rows["linux.screen_crossover_refused"].evidence.abstract_socket_visible == "false" and
       .rows["linux.screen_crossover_refused"].evidence.abstract_socket_outcome == "refused" and

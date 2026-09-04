@@ -122,6 +122,12 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		"wrong crossover egress errno": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["egress_address_errno"] = "EHOSTUNREACH"
 		},
+		"wrong crossover IPv6 refusal errno": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["node_listener_ipv6_errno"] = "EACCES"
+		},
+		"wrong network IPv6 refusal errno": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.network_egress"].(map[string]any)["evidence"].(map[string]string)["node_listener_ipv6_errno"] = "EACCES"
+		},
 		"wrong crossover target control liveness": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.screen_crossover_refused"].(map[string]any)["evidence"].(map[string]string)["target_liveness_control"] = "refused"
 		},
@@ -228,7 +234,7 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 		"target_liveness_view": "read_succeeded", "target_liveness_control": "inject_succeeded", "target_liveness_x": "read_succeeded", "target_liveness_egress": "connected",
 		"egress_address_outcome": "refused", "egress_address_errno": "ECONNREFUSED",
 		"egress_address_target":      "198.18.0.6:43999",
-		"node_listener_ipv6_address": "[fe80::1%eth0]:45000", "node_listener_ipv6_outcome": "refused", "node_listener_ipv6_errno": "ENETUNREACH",
+		"node_listener_ipv6_address": "[fe80::1%eth0]:45000", "node_listener_ipv6_outcome": "refused", "node_listener_ipv6_errno": "EADDRNOTAVAIL",
 	}
 	crossover["assertions"] = map[string]bool{"crossover_refused": true, "target_alive_at_refusal_edge": true}
 	if variant == "wayland" {
@@ -242,7 +248,7 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 		"computer_id": "computer-1", "attempt_id": "attempt-1", "veth_address": "198.18.0.2", "veth_gateway": "198.18.0.1",
 		"resolved_name": "example.com", "resolved_address": "192.0.2.1", "helper_http_status": "200",
 		"helper_http_body": "wefty-computer-egress-v1", "node_listener_ipv4_address": "198.18.0.1:45000", "node_listener_ipv4_outcome": "refused", "node_listener_ipv4_errno": "ECONNREFUSED",
-		"node_listener_ipv6_address": "[fe80::1%eth0]:45000", "node_listener_ipv6_outcome": "refused", "node_listener_ipv6_errno": "ENETUNREACH",
+		"node_listener_ipv6_address": "[fe80::1%eth0]:45000", "node_listener_ipv6_outcome": "refused", "node_listener_ipv6_errno": "EADDRNOTAVAIL",
 	}
 	rows["linux.removal"].(map[string]any)["evidence"] = map[string]string{"inventory_source": "helper VerifyNamespaceReadOnly route"}
 	digest := "sha256:" + strings.Repeat("a", 64)

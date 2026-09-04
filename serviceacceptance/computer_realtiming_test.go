@@ -185,7 +185,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"resolver_reachable":           egress.ResolvedName == "example.com" && egress.ResolvedAddress != "",
 		"helper_http_through_veth":     egress.HelperHTTPStatus == 200 && egress.HelperHTTPBody == "wefty-computer-egress-v1" && !mutatingLinuxComputerRow("linux.network_egress"),
 		"node_listener_ipv4_refused":   egress.NodeListenerIPv4.Outcome == "refused" && egress.NodeListenerIPv4.ErrnoName == "ECONNREFUSED",
-		"node_listener_ipv6_refused":   egress.NodeListenerIPv6.Outcome == "refused" && slices.Contains([]string{"ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"}, egress.NodeListenerIPv6.ErrnoName),
+		"node_listener_ipv6_refused":   egress.NodeListenerIPv6.Outcome == "refused" && slices.Contains([]string{"EADDRNOTAVAIL", "ENETUNREACH", "EHOSTUNREACH", "ECONNREFUSED"}, egress.NodeListenerIPv6.ErrnoName),
 	}, map[string]string{
 		"computer_id": ready.ComputerID, "attempt_id": ready.CurrentJob.CurrentAttemptID,
 		"veth_address": egress.Address, "veth_gateway": egress.Gateway,
@@ -219,7 +219,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	crossoverRefused := crossover.ViewRead.Outcome == "refused" && crossover.ViewRead.ErrnoName == "ECONNREFUSED" &&
 		crossover.ControlInject.Outcome == "refused" && crossover.ControlInject.ErrnoName == "ECONNREFUSED" &&
 		crossover.EgressAddress.Outcome == "refused" && crossover.EgressAddress.ErrnoName == "ECONNREFUSED" &&
-		crossover.NodeListenerIPv6.Outcome == "refused" && slices.Contains([]string{"ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"}, crossover.NodeListenerIPv6.ErrnoName)
+		crossover.NodeListenerIPv6.Outcome == "refused" && slices.Contains([]string{"EADDRNOTAVAIL", "ENETUNREACH", "EHOSTUNREACH", "ECONNREFUSED"}, crossover.NodeListenerIPv6.ErrnoName)
 	targetAlive := egressAlive && liveness.ViewRead.Outcome == "read_succeeded" && liveness.ControlInject.Outcome == "inject_succeeded" && liveness.EgressAddress.Outcome == "connected"
 	if variant == "xfce" {
 		crossoverRefused = crossoverRefused && !crossover.AbstractSocketVisible &&
