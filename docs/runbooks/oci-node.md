@@ -83,11 +83,14 @@ authorization, placement, or scheduling facts from it.
 
 The full private front-door endpoint and session bearer remain together only
 in the owner-readable file supplied with `--session-token-file`; neither is
-printed. Open a view session with `wefty services takeover view COMPUTER_ID
---session-token-file ./computer-session.json`.
+printed. Open a view session by friendly name with `wefty services takeover
+view FRIENDLY_NAME --session-token-file ./computer-session.json`.
 
 Use the printed friendly name to identify the Computer. Use `connect_host`
-only when a downstream connection field explicitly accepts a raw host.
+only when a downstream connection field explicitly accepts the exact dialable
+`host:port` form. `display_endpoint` is a deprecated alias of `connect_host`
+through 2026-10-04; it is not the private endpoint stored in the capability
+file.
 
 ## FileVault, TCC, and the attended Mac boundary
 

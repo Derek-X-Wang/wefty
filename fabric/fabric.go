@@ -1,5 +1,8 @@
 // Package fabric is wefty's only network-layer seam. Public types are owned by
-// wefty and do not expose implementation-specific networking types or names.
+// wefty and do not expose implementation-specific networking types. As the
+// exact #266 exception, a raw Fabric address may appear as a clearly labelled
+// secondary connection field behind a wefty-owned friendly name; it is never
+// the only handle and callers must not interpret it.
 package fabric
 
 import (

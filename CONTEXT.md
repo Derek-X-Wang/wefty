@@ -200,6 +200,8 @@ _Avoid_: connect host, hostname, network name, display name
 **Connect host**:
 The raw Fabric-produced address used to reach a published listener. It is a
 secondary connection field and never identity, authority, or a primary handle.
+Node registration publishes this node's hostname; Computer take-over output
+instead shows the remote Computer front door's dialable host-and-port address.
 _Avoid_: friendly name, Computer name, Node identity
 
 **Slot**:
