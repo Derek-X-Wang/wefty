@@ -245,9 +245,10 @@ The helper attaches one point-to-point `/30` veth to the private namespace,
 installs a default route, retains the helper-managed resolver and hosts mounts,
 disables IPv6 through both the namespace `all` and `default` sysctls, and
 masquerades the exact Computer IPv4 address through the Node or Lima VM. The
-address is allocated from RFC 2544 benchmarking space `198.18.0.0/15`; the
-attempt port range is capped at 32,768 disjoint `/30`s and helper startup refuses
-a conflicting non-Wefty Node route. If the mounted
+address is allocated from RFC 2544 benchmarking space `198.18.0.0/15`; port
+`p` uses the `/30` at byte offset `(p - AttemptPortMin) * 4`. The attempt port
+range is capped at 32,768 disjoint `/30`s and helper startup refuses a
+conflicting non-Wefty Node route. If the mounted
 resolver snapshot names a Node-loopback stub such as `127.0.0.53`, the helper
 binds that address only inside the Computer namespace and proxies DNS from the
 Node namespace to systemd-resolved's advertised non-loopback uplink when present,
@@ -262,9 +263,14 @@ foreign binder. Mirrored `ip6tables` chains enforce the same refusal if a future
 image re-enables IPv6. The endpoint is bound only to the attempt's
 gateway/interface tuple and returns no tenant or Node data. The helper verifies
 and repairs both chain sets at every Computer start and on its periodic sweep
-cadence; startup sweep removes unowned `wftch*` links and attempt rules, while
+cadence. Each INPUT, FORWARD, and POSTROUTING jump must be the first rule in
+its base chain; a merely present later jump does not prove isolation. Startup
+sweep removes unowned `wftch*`/`wftcg*` links and IPv4/IPv6 attempt rules, while
 orderly helper close tears down live network state and helper-owned Node-wide
-firewall/forwarding state. The authority-bound
+firewall/forwarding state. If the helper process crashes after enabling
+`net.ipv4.ip_forward`, startup sweep cannot prove its prior Node-wide value and
+therefore leaves it enabled; an orderly close restores only a value this helper
+observed as disabled. The authority-bound
 view, control, and directive paths remain private loopback bridges. Ordinary OCI
 jobs keep shared networking unchanged.
 

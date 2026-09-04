@@ -172,7 +172,15 @@ type computerNetworkAttachment struct {
 	probePort     uint16
 	probe         net.Listener
 	dns           *computerDNSProxy
+	ipv6State     computerIPv6DisableState
 }
+
+type computerIPv6DisableState string
+
+const (
+	computerIPv6DisabledByHelper computerIPv6DisableState = "disabled_by_helper"
+	computerIPv6DisabledByKernel computerIPv6DisableState = "already_disabled_by_kernel"
+)
 
 type computerDNSProxy struct {
 	udp       net.PacketConn
@@ -313,10 +321,9 @@ func setupComputerNetworkWithTools(ctx context.Context, namespace *pinnedNetwork
 		return nil, err
 	}
 	err = inNetworkNamespace(namespace, func() error {
-		for _, name := range []string{"all", "default"} {
-			if writeErr := os.WriteFile("/proc/sys/net/ipv6/conf/"+name+"/disable_ipv6", []byte("1\n"), 0); writeErr != nil {
-				return fmt.Errorf("disable Computer IPv6 for %s: %w", name, writeErr)
-			}
+		attachment.ipv6State, err = disableComputerIPv6("/proc/sys/net/ipv6/conf")
+		if err != nil {
+			return err
 		}
 		for _, arguments := range [][]string{
 			{"link", "set", "lo", "up"},
@@ -366,6 +373,21 @@ func setupComputerNetworkWithTools(ctx context.Context, namespace *pinnedNetwork
 	}
 	go serveComputerEgressProbe(attachment.probe)
 	return attachment, nil
+}
+
+func disableComputerIPv6(sysctlRoot string) (computerIPv6DisableState, error) {
+	state := computerIPv6DisabledByHelper
+	for _, name := range []string{"all", "default"} {
+		path := sysctlRoot + "/" + name + "/disable_ipv6"
+		if err := os.WriteFile(path, []byte("1\n"), 0); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				state = computerIPv6DisabledByKernel
+				continue
+			}
+			return "", fmt.Errorf("disable Computer IPv6 for %s: %w", name, err)
+		}
+	}
+	return state, nil
 }
 
 func computerResolverAddress(path string) (string, error) {
@@ -636,6 +658,7 @@ type computerFirewallRule struct {
 	chain      string
 	arguments  []string
 	insert     bool
+	first      bool
 }
 
 func (rule computerFirewallRule) prefix() []string {
@@ -655,6 +678,28 @@ func runComputerFirewallCommand(ctx context.Context, executable string, argument
 
 func ensureComputerFirewallRule(ctx context.Context, rule computerFirewallRule) error {
 	prefix := rule.prefix()
+	if rule.first {
+		first, err := computerFirewallRuleFirst(ctx, rule)
+		if err != nil {
+			return err
+		}
+		if first {
+			return nil
+		}
+		for {
+			remove := append(append(slices.Clone(prefix), "-D", rule.chain), rule.arguments...)
+			output, removeErr := exec.CommandContext(ctx, rule.executable, append([]string{"-w", "5"}, remove...)...).CombinedOutput()
+			if removeErr == nil {
+				continue
+			}
+			if !computerFirewallRuleAbsent(output) {
+				return fmt.Errorf("%s %s: %w: %s", rule.executable, strings.Join(remove, " "), removeErr, strings.TrimSpace(string(output)))
+			}
+			break
+		}
+		add := append(append(append(slices.Clone(prefix), "-I", rule.chain), "1"), rule.arguments...)
+		return runComputerFirewallCommand(ctx, rule.executable, add...)
+	}
 	check := append(append(slices.Clone(prefix), "-C", rule.chain), rule.arguments...)
 	if err := runComputerFirewallCommand(ctx, rule.executable, check...); err == nil {
 		return nil
@@ -667,6 +712,25 @@ func ensureComputerFirewallRule(ctx context.Context, rule computerFirewallRule) 
 	}
 	add := append(append(append(slices.Clone(prefix), action, rule.chain), position...), rule.arguments...)
 	return runComputerFirewallCommand(ctx, rule.executable, add...)
+}
+
+func computerFirewallRuleFirst(ctx context.Context, rule computerFirewallRule) (bool, error) {
+	arguments := append(rule.prefix(), "-S", rule.chain)
+	output, err := exec.CommandContext(ctx, rule.executable, append([]string{"-w", "5"}, arguments...)...).CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("%s %s: %w: %s", rule.executable, strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "-A" || fields[1] != rule.chain {
+			continue
+		}
+		for index := range fields[2:] {
+			fields[index+2] = strings.Trim(fields[index+2], "\"")
+		}
+		return slices.Equal(fields[2:], rule.arguments), nil
+	}
+	return false, nil
 }
 
 func ensureComputerFirewallFamilies(ctx context.Context, iptablesPath, ip6tablesPath string) error {
@@ -699,7 +763,7 @@ func ensureComputerFirewallFamilies(ctx context.Context, iptablesPath, ip6tables
 		for _, jump := range []struct {
 			table, chain, target string
 		}{{"filter", "INPUT", computerFirewallInput}, {"filter", "FORWARD", computerFirewallForward}, {"nat", "POSTROUTING", computerFirewallNAT}} {
-			if err := ensureComputerFirewallRule(ctx, computerFirewallRule{executable: executable, table: jump.table, chain: jump.chain, arguments: []string{"-j", jump.target}, insert: true}); err != nil {
+			if err := ensureComputerFirewallRule(ctx, computerFirewallRule{executable: executable, table: jump.table, chain: jump.chain, arguments: []string{"-j", jump.target}, insert: true, first: true}); err != nil {
 				return err
 			}
 		}
@@ -818,7 +882,7 @@ func observeComputerFirewall(ctx context.Context, iptablesPath, ip6tablesPath st
 		for _, jump := range []struct {
 			table, chain, target string
 		}{{"filter", "INPUT", computerFirewallInput}, {"filter", "FORWARD", computerFirewallForward}, {"nat", "POSTROUTING", computerFirewallNAT}} {
-			rules = append(rules, computerFirewallRule{executable: executable, table: jump.table, chain: jump.chain, arguments: []string{"-j", jump.target}})
+			rules = append(rules, computerFirewallRule{executable: executable, table: jump.table, chain: jump.chain, arguments: []string{"-j", jump.target}, first: true})
 		}
 	}
 	rules = append(rules, computerBaseFirewallRules(iptablesPath, "icmp-port-unreachable")...)
@@ -827,6 +891,16 @@ func observeComputerFirewall(ctx context.Context, iptablesPath, ip6tablesPath st
 		rules = append(rules, computerAttemptFirewallRules(&attachments[index])...)
 	}
 	for _, rule := range rules {
+		if rule.first {
+			first, err := computerFirewallRuleFirst(ctx, rule)
+			if err != nil {
+				return false, err
+			}
+			if !first {
+				return false, nil
+			}
+			continue
+		}
 		arguments := append(rule.prefix(), "-C", rule.chain)
 		arguments = append(arguments, rule.arguments...)
 		if err := runComputerFirewallCommand(ctx, rule.executable, arguments...); err != nil {
@@ -914,7 +988,7 @@ func (engine *ContainerdEngine) sweepComputerNetworkResidue(ctx context.Context)
 	}
 	for _, link := range links {
 		name := link.Attrs().Name
-		if !strings.HasPrefix(name, computerHostLinkPrefix) {
+		if !strings.HasPrefix(name, computerHostLinkPrefix) && !strings.HasPrefix(name, computerGuestLinkPrefix) {
 			continue
 		}
 		if _, owned := active[name]; !owned {
@@ -929,7 +1003,11 @@ func (engine *ContainerdEngine) sweepComputerNetworkResidue(ctx context.Context)
 	if err != nil {
 		return inventory, nil, err
 	}
-	rules, err := computerResidueFirewallRules(ctx, iptablesPath)
+	ip6tablesPath, err := resolveRootOwnedNetworkTool(engine.config.IP6TablesExecutable, "ip6tables", "/usr/sbin/ip6tables", "/usr/bin/ip6tables", "/sbin/ip6tables")
+	if err != nil {
+		return inventory, nil, err
+	}
+	rules, err := computerResidueFirewallRules(ctx, iptablesPath, ip6tablesPath)
 	if err != nil {
 		return inventory, nil, err
 	}
@@ -951,7 +1029,11 @@ func (engine *ContainerdEngine) sweepComputerNetworkResidue(ctx context.Context)
 		if err := runComputerFirewallCommand(ctx, rule.executable, arguments...); err != nil {
 			return inventory, evidence, err
 		}
-		evidence = append(evidence, SweepEvidence{Class: RemovalResourceComputerFirewallRule, ID: inventory.ComputerFirewallRules[index], Action: SweepActionRemoved, Method: "iptables_delete", Duration: time.Since(started)})
+		method := "iptables_delete"
+		if rule.executable == ip6tablesPath {
+			method = "ip6tables_delete"
+		}
+		evidence = append(evidence, SweepEvidence{Class: RemovalResourceComputerFirewallRule, ID: inventory.ComputerFirewallRules[index], Action: SweepActionRemoved, Method: method, Duration: time.Since(started)})
 	}
 	for _, name := range inventory.ComputerNetworkLinks {
 		started := time.Now()
@@ -966,35 +1048,37 @@ func (engine *ContainerdEngine) sweepComputerNetworkResidue(ctx context.Context)
 	return inventory, evidence, nil
 }
 
-func computerResidueFirewallRules(ctx context.Context, iptablesPath string) ([]computerFirewallRule, error) {
+func computerResidueFirewallRules(ctx context.Context, iptablesPath, ip6tablesPath string) ([]computerFirewallRule, error) {
 	queries := []struct{ table, chain string }{{"filter", computerFirewallInput}, {"nat", computerFirewallNAT}}
 	var rules []computerFirewallRule
-	for _, query := range queries {
-		prefix := []string{}
-		if query.table != "filter" {
-			prefix = []string{"-t", query.table}
-		}
-		arguments := append(slices.Clone(prefix), "-S", query.chain)
-		output, err := exec.CommandContext(ctx, iptablesPath, append([]string{"-w", "5"}, arguments...)...).CombinedOutput()
-		if err != nil {
-			if computerFirewallRuleAbsent(output) {
-				continue
+	for _, executable := range []string{iptablesPath, ip6tablesPath} {
+		for _, query := range queries {
+			prefix := []string{}
+			if query.table != "filter" {
+				prefix = []string{"-t", query.table}
 			}
-			return nil, fmt.Errorf("inventory Computer firewall rules: %w: %s", err, strings.TrimSpace(string(output)))
-		}
-		for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 3 || fields[0] != "-A" || fields[1] != query.chain {
-				continue
+			arguments := append(slices.Clone(prefix), "-S", query.chain)
+			output, err := exec.CommandContext(ctx, executable, append([]string{"-w", "5"}, arguments...)...).CombinedOutput()
+			if err != nil {
+				if computerFirewallRuleAbsent(output) {
+					continue
+				}
+				return nil, fmt.Errorf("inventory Computer firewall rules: %w: %s", err, strings.TrimSpace(string(output)))
 			}
-			for index := range fields {
-				fields[index] = strings.Trim(fields[index], "\"")
-			}
-			rule := computerFirewallRule{executable: iptablesPath, table: query.table, chain: query.chain, arguments: fields[2:]}
-			link := computerFirewallRuleLink(rule.arguments)
-			legacyMasquerade := query.table == "nat" && slices.Equal(rule.arguments, []string{"-s", "198.18.0.0/15", "-j", "MASQUERADE"})
-			if (strings.HasPrefix(link, computerHostLinkPrefix) && link != computerHostLinkPrefix+"+") || legacyMasquerade {
-				rules = append(rules, rule)
+			for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) < 3 || fields[0] != "-A" || fields[1] != query.chain {
+					continue
+				}
+				for index := range fields {
+					fields[index] = strings.Trim(fields[index], "\"")
+				}
+				rule := computerFirewallRule{executable: executable, table: query.table, chain: query.chain, arguments: fields[2:]}
+				link := computerFirewallRuleLink(rule.arguments)
+				legacyMasquerade := query.table == "nat" && slices.Equal(rule.arguments, []string{"-s", "198.18.0.0/15", "-j", "MASQUERADE"})
+				if (strings.HasPrefix(link, computerHostLinkPrefix) && link != computerHostLinkPrefix+"+") || legacyMasquerade {
+					rules = append(rules, rule)
+				}
 			}
 		}
 	}

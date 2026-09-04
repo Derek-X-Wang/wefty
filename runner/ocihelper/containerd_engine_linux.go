@@ -2531,7 +2531,9 @@ func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request Dia
 		if err != nil {
 			return err
 		}
+		attempt.mu.Lock()
 		networkNamespace = attempt.networkNamespace
+		attempt.mu.Unlock()
 	} else if request.Name == contract.ComputerDisplayEndpointView || request.Name == contract.ComputerDisplayEndpointControl {
 		return &ComputerAttemptAuthorityRefusalError{Cause: authorityErr}
 	}

@@ -505,8 +505,9 @@ known profile gap, not an implicit default. The helper attaches a point-to-point
 veth, brings the Computer namespace's loopback and veth interfaces up, installs
 a default route, disables IPv6 through the namespace `all` and `default`
 sysctls, and masquerades the exact Computer IPv4 address through the Node/VM.
-Computer `/30`s use RFC 2544 benchmarking space `198.18.0.0/15`; the helper
-admits at most 32,768 endpoint ports and refuses a conflicting non-Wefty Node
+Computer `/30`s use RFC 2544 benchmarking space `198.18.0.0/15`; endpoint port
+`p` selects byte offset `(p - AttemptPortMin) * 4`. The helper admits at most
+32,768 endpoint ports and refuses a conflicting non-Wefty Node
 route. A
 Node-loopback resolver in the exact mounted snapshot is mirrored by an
 attempt-private UDP/TCP helper proxy at the same address inside the Computer
@@ -519,7 +520,9 @@ firewall rejects Computer-to-Computer, Node-local, and unsolicited inbound
 traffic except the attempt/interface-bound helper egress proof endpoint, whose
 ACCEPT additionally requires the owning transparent helper socket. The helper
 reconciles both chain sets at every Computer start and on its periodic sweep
-cadence, removes unowned link/rule residue at startup, and tears down live
+cadence. The INPUT, FORWARD, and POSTROUTING jumps must each be the first base
+chain rule; later presence is reported absent and repaired. Startup removes
+unowned host/guest link ends and IPv4/IPv6 rule residue, and tears down live
 network state plus helper-owned Node-wide state on close. It creates the `view`,
 `control`, and Computer submission listeners inside that namespace, then enters
 it only to create an exact-authority named-endpoint dial. The resulting socket

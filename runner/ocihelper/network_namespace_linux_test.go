@@ -33,6 +33,32 @@ func requireRootNetworkNamespaceTest(t *testing.T) {
 	}
 }
 
+func resetComputerFirewallChainsForTest(t *testing.T) {
+	t.Helper()
+	for _, tool := range []struct {
+		name       string
+		candidates []string
+	}{
+		{name: "iptables", candidates: []string{"/usr/sbin/iptables", "/usr/bin/iptables", "/sbin/iptables"}},
+		{name: "ip6tables", candidates: []string{"/usr/sbin/ip6tables", "/usr/bin/ip6tables", "/sbin/ip6tables"}},
+	} {
+		executable, err := resolveRootOwnedNetworkTool("", tool.name, tool.candidates...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, chain := range []struct{ table, name string }{{"filter", computerFirewallInput}, {"filter", computerFirewallForward}, {"nat", computerFirewallNAT}} {
+			arguments := []string{"-w", "5"}
+			if chain.table != "filter" {
+				arguments = append(arguments, "-t", chain.table)
+			}
+			arguments = append(arguments, "-F", chain.name)
+			if output, err := exec.Command(executable, arguments...).CombinedOutput(); err != nil && !computerFirewallRuleAbsent(output) {
+				t.Fatalf("flush test Computer firewall chain through %s: %v: %s", executable, err, strings.TrimSpace(string(output)))
+			}
+		}
+	}
+}
+
 func startIsolatedNetworkTask(t *testing.T) *exec.Cmd {
 	t.Helper()
 	return startIsolatedNetworkTaskCommand(t, exec.Command("unshare", "--net", "--", "sh", "-c", "ip link set lo up; readlink /proc/self/ns/net; exec sleep 30"))
@@ -311,6 +337,7 @@ func TestComputerDNSProxyRateLimitIsAttemptLocalAndBounded(t *testing.T) {
 
 func TestComputerNetworkUsesMountedResolverForLoopbackProxy(t *testing.T) {
 	requireRootNetworkNamespaceTest(t)
+	resetComputerFirewallChainsForTest(t)
 	resolverPath := filepath.Join(t.TempDir(), "resolv.conf")
 	if err := os.WriteFile(resolverPath, []byte("nameserver 127.0.0.53\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -386,6 +413,7 @@ func TestAbstractSocketObservationMatchesExactToken(t *testing.T) {
 
 func TestComputerVethPreservesDNSAndOutbound(t *testing.T) {
 	requireRootNetworkNamespaceTest(t)
+	resetComputerFirewallChainsForTest(t)
 	if os.Getenv("WEFTY_RUN_NETWORK_NAMESPACE_EGRESS_TEST") != "1" {
 		t.Skip("set WEFTY_RUN_NETWORK_NAMESPACE_EGRESS_TEST=1 for the networked Linux proof")
 	}
@@ -451,6 +479,7 @@ func TestComputerVethPreservesDNSAndOutbound(t *testing.T) {
 
 func TestComputerNetworkDisablesIPv6(t *testing.T) {
 	requireRootNetworkNamespaceTest(t)
+	resetComputerFirewallChainsForTest(t)
 	command := startIsolatedNetworkTask(t)
 	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
 	if err != nil {
@@ -473,6 +502,9 @@ func TestComputerNetworkDisablesIPv6(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer attachment.close()
+	if attachment.ipv6State != computerIPv6DisabledByHelper {
+		t.Fatalf("Computer IPv6 disable state = %q, want %q", attachment.ipv6State, computerIPv6DisabledByHelper)
+	}
 
 	for _, name := range []string{"all", "default"} {
 		var value string
@@ -489,8 +521,16 @@ func TestComputerNetworkDisablesIPv6(t *testing.T) {
 	}
 }
 
+func TestComputerNetworkTreatsMissingIPv6SysctlsAsKernelDisabled(t *testing.T) {
+	state, err := disableComputerIPv6(filepath.Join(t.TempDir(), "missing", "ipv6", "conf"))
+	if err != nil || state != computerIPv6DisabledByKernel {
+		t.Fatalf("missing IPv6 sysctls state = %q, err %v; want %q", state, err, computerIPv6DisabledByKernel)
+	}
+}
+
 func TestComputerIPv4FirewallRejectsLiveNodeListener(t *testing.T) {
 	requireRootNetworkNamespaceTest(t)
+	resetComputerFirewallChainsForTest(t)
 	command := startIsolatedNetworkTask(t)
 	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
 	if err != nil {
@@ -533,6 +573,7 @@ func TestComputerIPv4FirewallRejectsLiveNodeListener(t *testing.T) {
 
 func TestComputerFirewallReconcilesOnEveryAttemptStart(t *testing.T) {
 	requireRootNetworkNamespaceTest(t)
+	resetComputerFirewallChainsForTest(t)
 	ipPath, err := resolveRootOwnedNetworkTool("", "ip", "/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip")
 	if err != nil {
 		t.Fatal(err)
@@ -564,14 +605,11 @@ func TestComputerFirewallReconcilesOnEveryAttemptStart(t *testing.T) {
 	defer listener.Close()
 	port := listener.Addr().(*net.TCPAddr).Port
 	assertNamespaceTCPRefused(t, namespaceA, "tcp4", net.JoinHostPort(attachmentA.gateway, strconv.Itoa(port)))
-	if output, err := exec.CommandContext(t.Context(), iptablesPath, "-w", "5", "-F", "INPUT").CombinedOutput(); err != nil {
-		t.Fatalf("flush INPUT: %v: %s", err, strings.TrimSpace(string(output)))
-	}
-	t.Cleanup(func() { _ = ensureComputerFirewall(context.Background(), iptablesPath) })
+	prependForeignAccept(t, iptablesPath, "filter", "INPUT")
 	assertNamespaceTCPConnected(t, namespaceA, "tcp4", net.JoinHostPort(attachmentA.gateway, strconv.Itoa(port)))
 	present, err := observeComputerFirewall(t.Context(), iptablesPath, ip6tablesPath, []computerNetworkAttachment{*attachmentA})
 	if err != nil || present {
-		t.Fatalf("Computer firewall observation after INPUT flush = present %t, err %v; want absent without read failure", present, err)
+		t.Fatalf("Computer firewall observation after INPUT prepend = present %t, err %v; want absent without read failure", present, err)
 	}
 
 	commandB := startIsolatedNetworkTask(t)
@@ -587,10 +625,20 @@ func TestComputerFirewallReconcilesOnEveryAttemptStart(t *testing.T) {
 	defer attachmentB.close()
 	assertNamespaceTCPRefused(t, namespaceA, "tcp4", net.JoinHostPort(attachmentA.gateway, strconv.Itoa(port)))
 
-	if output, err := exec.CommandContext(t.Context(), iptablesPath, "-w", "5", "-F", "INPUT").CombinedOutput(); err != nil {
-		t.Fatalf("flush INPUT before periodic reconciliation: %v: %s", err, strings.TrimSpace(string(output)))
+	var peerListener net.Listener
+	if err := inNetworkNamespace(namespaceB, func() error {
+		var listenErr error
+		peerListener, listenErr = net.Listen("tcp4", net.JoinHostPort(attachmentB.guestAddress, "0"))
+		return listenErr
+	}); err != nil {
+		t.Fatal(err)
 	}
-	assertNamespaceTCPConnected(t, namespaceA, "tcp4", net.JoinHostPort(attachmentA.gateway, strconv.Itoa(port)))
+	defer peerListener.Close()
+	peerPort := peerListener.Addr().(*net.TCPAddr).Port
+	peerAddress := net.JoinHostPort(attachmentB.guestAddress, strconv.Itoa(peerPort))
+	assertNamespaceTCPRefused(t, namespaceA, "tcp4", peerAddress)
+	prependForeignAccept(t, iptablesPath, "filter", "FORWARD")
+	assertNamespaceTCPConnected(t, namespaceA, "tcp4", peerAddress)
 	if err := engine.reconcileComputerFirewall(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -598,11 +646,65 @@ func TestComputerFirewallReconcilesOnEveryAttemptStart(t *testing.T) {
 	if err != nil || !present {
 		t.Fatalf("Computer firewall observation after periodic reconcile = present %t, err %v; want present", present, err)
 	}
-	assertNamespaceTCPRefused(t, namespaceA, "tcp4", net.JoinHostPort(attachmentA.gateway, strconv.Itoa(port)))
+	assertNamespaceTCPRefused(t, namespaceA, "tcp4", peerAddress)
+}
+
+func TestComputerFirewallObservationAndRepairRequireFirstJump(t *testing.T) {
+	requireRootNetworkNamespaceTest(t)
+	resetComputerFirewallChainsForTest(t)
+	iptablesPath, err := resolveRootOwnedNetworkTool("", "iptables", "/usr/sbin/iptables", "/usr/bin/iptables", "/sbin/iptables")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip6tablesPath, err := resolveRootOwnedNetworkTool("", "ip6tables", "/usr/sbin/ip6tables", "/usr/bin/ip6tables", "/sbin/ip6tables")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureComputerFirewallFamilies(t.Context(), iptablesPath, ip6tablesPath); err != nil {
+		t.Fatal(err)
+	}
+	for _, executable := range []string{iptablesPath, ip6tablesPath} {
+		for _, chain := range []struct {
+			table string
+			name  string
+		}{{"filter", "INPUT"}, {"filter", "FORWARD"}, {"nat", "POSTROUTING"}} {
+			t.Run(filepath.Base(executable)+"/"+chain.name, func(t *testing.T) {
+				prependForeignAccept(t, executable, chain.table, chain.name)
+				present, err := observeComputerFirewall(t.Context(), iptablesPath, ip6tablesPath, nil)
+				if err != nil || present {
+					t.Fatalf("Computer firewall with foreign first rule = present %t, err %v; want absent", present, err)
+				}
+				if err := ensureComputerFirewallFamilies(t.Context(), iptablesPath, ip6tablesPath); err != nil {
+					t.Fatal(err)
+				}
+				present, err = observeComputerFirewall(t.Context(), iptablesPath, ip6tablesPath, nil)
+				if err != nil || !present {
+					t.Fatalf("Computer firewall after ordered repair = present %t, err %v; want present", present, err)
+				}
+			})
+		}
+	}
+}
+
+func prependForeignAccept(t *testing.T, executable, table, chain string) {
+	t.Helper()
+	prefix := []string{"-w", "5"}
+	if table != "filter" {
+		prefix = append(prefix, "-t", table)
+	}
+	arguments := append(slices.Clone(prefix), "-I", chain, "1", "-j", "ACCEPT")
+	if output, err := exec.CommandContext(t.Context(), executable, arguments...).CombinedOutput(); err != nil {
+		t.Fatalf("prepend foreign %s/%s ACCEPT through %s: %v: %s", table, chain, executable, err, strings.TrimSpace(string(output)))
+	}
+	t.Cleanup(func() {
+		arguments := append(slices.Clone(prefix), "-D", chain, "-j", "ACCEPT")
+		_, _ = exec.Command(executable, arguments...).CombinedOutput()
+	})
 }
 
 func TestComputerIPv6FirewallRejectsLiveNodeListenerWhenGuestReenablesIPv6(t *testing.T) {
 	requireRootNetworkNamespaceTest(t)
+	resetComputerFirewallChainsForTest(t)
 	command := startIsolatedNetworkTask(t)
 	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
 	if err != nil {
@@ -671,6 +773,7 @@ func TestComputerIPv6FirewallRejectsLiveNodeListenerWhenGuestReenablesIPv6(t *te
 
 func TestComputerProbeRuleRejectsForeignBinderAfterHelperListenerCloses(t *testing.T) {
 	requireRootNetworkNamespaceTest(t)
+	resetComputerFirewallChainsForTest(t)
 	command := startIsolatedNetworkTask(t)
 	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
 	if err != nil {
@@ -707,6 +810,7 @@ func TestComputerProbeRuleRejectsForeignBinderAfterHelperListenerCloses(t *testi
 
 func TestComputerNetworkCrashResidueIsSweptWithTypedEvidence(t *testing.T) {
 	requireRootNetworkNamespaceTest(t)
+	resetComputerFirewallChainsForTest(t)
 	command := startIsolatedNetworkTask(t)
 	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
 	if err != nil {
@@ -745,25 +849,41 @@ func TestComputerNetworkCrashResidueIsSweptWithTypedEvidence(t *testing.T) {
 		}
 		attachment.dns = nil
 	}
-	engine := &ContainerdEngine{config: NativeEngineConfig{IPExecutable: ipPath, IPTablesExecutable: iptablesPath}, attempts: map[string]*containerdAttempt{}}
+	staleGuestLink := computerGuestLinkPrefix + "64998"
+	if output, err := exec.CommandContext(t.Context(), ipPath, "link", "add", staleGuestLink, "type", "dummy").CombinedOutput(); err != nil {
+		t.Fatalf("create stale Computer guest link: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	t.Cleanup(func() { _, _ = exec.Command(ipPath, "link", "del", staleGuestLink).CombinedOutput() })
+	staleIPv6Link := computerHostLinkPrefix + "64999"
+	staleIPv6Rule := []string{"-w", "5", "-A", computerFirewallInput, "-i", staleIPv6Link, "-j", "REJECT", "--reject-with", "icmp6-port-unreachable"}
+	if output, err := exec.CommandContext(t.Context(), ip6tablesPath, staleIPv6Rule...).CombinedOutput(); err != nil {
+		t.Fatalf("create stale Computer IPv6 firewall rule: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	t.Cleanup(func() {
+		staleIPv6Rule[2] = "-D"
+		_, _ = exec.Command(ip6tablesPath, staleIPv6Rule...).CombinedOutput()
+	})
+	engine := &ContainerdEngine{config: NativeEngineConfig{IPExecutable: ipPath, IPTablesExecutable: iptablesPath, IP6TablesExecutable: ip6tablesPath}, attempts: map[string]*containerdAttempt{}}
 	inventory, evidence, err := engine.sweepComputerNetworkResidue(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(inventory.ComputerNetworkLinks, staleLink) || len(inventory.ComputerFirewallRules) < 2 {
+	if !slices.Contains(inventory.ComputerNetworkLinks, staleLink) || !slices.Contains(inventory.ComputerNetworkLinks, staleGuestLink) || len(inventory.ComputerFirewallRules) < 3 {
 		t.Fatalf("crash residue inventory = %+v", inventory)
 	}
 	if !slices.ContainsFunc(evidence, func(item SweepEvidence) bool {
 		return item.Class == RemovalResourceComputerNetworkLink && item.ID == staleLink && item.Action == SweepActionRemoved && item.Method == "ip_link_delete"
 	}) || !slices.ContainsFunc(evidence, func(item SweepEvidence) bool {
 		return item.Class == RemovalResourceComputerFirewallRule && item.Action == SweepActionRemoved && item.Method == "iptables_delete"
+	}) || !slices.ContainsFunc(evidence, func(item SweepEvidence) bool {
+		return item.Class == RemovalResourceComputerFirewallRule && item.Action == SweepActionRemoved && item.Method == "ip6tables_delete"
 	}) {
 		t.Fatalf("crash residue evidence = %+v", evidence)
 	}
 	if _, err := netlink.LinkByName(staleLink); err == nil {
 		t.Fatalf("stale Computer link %s remained", staleLink)
 	}
-	remaining, err := computerResidueFirewallRules(t.Context(), iptablesPath)
+	remaining, err := computerResidueFirewallRules(t.Context(), iptablesPath, ip6tablesPath)
 	if err != nil || len(remaining) != 0 {
 		t.Fatalf("stale Computer firewall rules remained: %+v err=%v", remaining, err)
 	}
@@ -772,6 +892,7 @@ func TestComputerNetworkCrashResidueIsSweptWithTypedEvidence(t *testing.T) {
 
 func TestContainerdEngineCloseTearsDownComputerNetworkState(t *testing.T) {
 	requireRootNetworkNamespaceTest(t)
+	resetComputerFirewallChainsForTest(t)
 	command := startIsolatedNetworkTask(t)
 	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
 	if err != nil {

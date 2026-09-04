@@ -90,9 +90,13 @@ and record the refusal through receipts.
   benchmarking range.
 - The helper owns the Node-wide forwarding and firewall state while Computers
   are live. It verifies and repairs the IPv4 and IPv6 chains on each Computer
-  start and on its periodic sweep cadence, reports their observed state through
-  doctor, removes unowned veth/rule residue during startup sweep, and restores
-  helper-enabled forwarding on orderly close.
+  start and on its periodic sweep cadence. Their INPUT, FORWARD, and
+  POSTROUTING jumps must be first in each base chain; presence at a later
+  position is not authority. Doctor reports that observed state, startup sweep
+  removes unowned veth/rule residue, and orderly close restores forwarding only
+  when the live helper observed and changed it. A helper crash loses the prior
+  `net.ipv4.ip_forward` observation, so startup sweep leaves an enabled value in
+  place rather than guessing at Node-wide policy.
 - Runtime isolation evidence is observed after `task.Start`: the helper records
   both namespace inodes and scans its own `/proc/net/unix` for the exact X token.
   Serialized-profile inference cannot earn the doctor verdict.

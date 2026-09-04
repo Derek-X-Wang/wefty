@@ -295,6 +295,14 @@ func TestComputerProfileReceiptExposesTmpfsCeilingsWithoutAdmissionRejection(t *
 	}
 }
 
+func TestIsolationCapabilitiesExcludeNetworkAdministration(t *testing.T) {
+	for _, capability := range []string{"CAP_NET_ADMIN", "CAP_NET_RAW"} {
+		if slices.Contains(isolationCapabilities, capability) {
+			t.Fatalf("ordinary OCI capability policy includes %s; Computer transparent-socket isolation depends on its absence", capability)
+		}
+	}
+}
+
 func TestOperatorMountsSortParentsBeforeChildren(t *testing.T) {
 	input := goldenRuntimeSpecInput(t, "amd64")
 	input.Workload.OperatorMounts = []OperatorMount{
