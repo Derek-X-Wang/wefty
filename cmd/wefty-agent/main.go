@@ -613,10 +613,16 @@ func run() error {
 				report := ocicontrol.BuildDoctor(doctorContext, ocicontrol.DoctorConfig{
 					HostPlatform: ocicontrol.PlatformFacts{OS: runtime.GOOS, Architecture: runtime.GOARCH},
 					AgentUser:    agentUser, LaunchUnit: os.Getenv("WEFTY_LAUNCH_UNIT"),
-					CapabilitySnapshot: nodeAgent.CapabilitySnapshot,
-					Intent:             (limarunner.FileIntentSource{Path: *ociIntentFile}).ReadIntent,
-					LimaFacts:          limaFacts, Helper: doctorHelperSource(ociAdapter), HelperHandshakeStalledWindows: stalledWindows, SetupStatePath: *ociSetupState,
-					InstalledSystemdVersion: installedSystemdVersion, InstalledHelperServiceUnit: installedHelperServiceUnit,
+					CapabilitySnapshot: func() ocicontrol.CapabilitySnapshot {
+						return ocicontrol.CapabilitySnapshot(nodeAgent.CapabilitySnapshot())
+					},
+					Intent:                        (limarunner.FileIntentSource{Path: *ociIntentFile}).ReadIntent,
+					LimaFacts:                     limaFacts,
+					Helper:                        doctorHelperSource(ociAdapter),
+					HelperHandshakeStalledWindows: stalledWindows,
+					SetupStatePath:                *ociSetupState,
+					InstalledSystemdVersion:       installedSystemdVersion,
+					InstalledHelperServiceUnit:    installedHelperServiceUnit,
 				})
 				return report, report.Validate()
 			},

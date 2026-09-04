@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -227,12 +226,21 @@ type HelperDoctorSnapshot struct {
 	SweepReceiptRecorded    bool
 }
 
+// CapabilitySnapshot is the immutable capability view consumed by doctor.
+// Keeping this transport shape local prevents the operator-control package
+// from depending on the agent implementation it controls.
+type CapabilitySnapshot struct {
+	contract.CapabilityObservation
+	LastProbe                  *contract.CapabilityObservation `json:"last_probe,omitempty"`
+	PendingPublicationRevision int64                           `json:"pending_publication_revision"`
+}
+
 type DoctorConfig struct {
 	Clock                         Clock
 	HostPlatform                  PlatformFacts
 	AgentUser                     string
 	LaunchUnit                    string
-	CapabilitySnapshot            func() agent.CapabilitySnapshot
+	CapabilitySnapshot            func() CapabilitySnapshot
 	Intent                        func(context.Context) (lima.OCIIntent, error)
 	LimaFacts                     func() lima.SupervisorFacts
 	Helper                        HelperDoctorSource

@@ -152,8 +152,10 @@ func New(config Config) (*Agent, error) {
 	if config.CapabilityProbe != nil && config.OCIBootBarrier == nil {
 		return nil, errors.New("agent: OCI capability probe requires a boot barrier")
 	}
+	normalizedCapabilities := normalizeConfiguredCapabilities(config.Capabilities)
 	_, offersOCIRuntime := config.WorkloadRuntimes[contract.JobKindOCI]
-	if config.OCIIntent == nil && (config.Capabilities["kind:oci"] || offersOCIRuntime) {
+	if config.OCIIntent == nil && (normalizedCapabilities["kind:oci"] || normalizedCapabilities[contract.JobKindOCI] ||
+		config.CapabilityProbe != nil || offersOCIRuntime) {
 		return nil, &OCIIntentAuthorityRequiredError{}
 	}
 	osName := config.OS

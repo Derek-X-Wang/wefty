@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -182,9 +181,9 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 			report := ocicontrol.BuildDoctor(ctx, ocicontrol.DoctorConfig{
 				HostPlatform: ocicontrol.PlatformFacts{OS: "linux", Architecture: "amd64"},
 				AgentUser:    "operator", LaunchUnit: "wefty-agent.service",
-				CapabilitySnapshot: func() agent.CapabilitySnapshot {
+				CapabilitySnapshot: func() ocicontrol.CapabilitySnapshot {
 					probeAt := time.Now()
-					return agent.CapabilitySnapshot{CapabilityObservation: contract.CapabilityObservation{
+					return ocicontrol.CapabilitySnapshot{CapabilityObservation: contract.CapabilityObservation{
 						Revision: 3, ObservedAt: time.Now(), Capabilities: map[string]bool{"kind:process": true},
 						MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonProbeFailed,
 					}, LastProbe: &contract.CapabilityObservation{Revision: 3, ObservedAt: probeAt, Capabilities: map[string]bool{"kind:process": true}, MissingCapabilities: []string{"kind:oci"}, ReasonCode: contract.CapabilityReasonProbeFailed}}

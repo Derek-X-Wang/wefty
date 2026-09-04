@@ -254,8 +254,8 @@ Only an authoritative `enabled=false` suppresses a payload. On a node with an
 intent authority, an unavailable or malformed marker withholds publication,
 records `intent_authority_unavailable`, keeps the serialized exit evidence
 intact, and retries with outbox backoff. A nil marker reader means the fence is
-not applicable and publication proceeds; construction rejects configurations
-that offer an OCI runtime or `kind:oci` capability without an authority.
+not applicable and publication proceeds; construction requires an authority
+for an OCI probe, runtime, normalized `kind:oci` capability, or bare `oci` key.
 Suppression likewise retains the payload as typed late evidence and records
 `service_intent_stop`, but excludes it from replay. The agent is
 obligated not to publish the intent-stopped result and to let lease expiry
@@ -265,6 +265,12 @@ suppress OCI one-shot completion or any process-kind workload. An
 unclassifiable legacy service spool row is fenced by the same durable marker
 rather than allowed to bypass it: enabled intent permits publication, disabled
 intent suppresses it, and unavailable authority withholds it.
+
+A suppressed attempt drains retained logs under the same policy as other
+evidence: while L1 reports the attempt live, logs remain strictly before
+completion and drain before recovery advances; after L1 reports the attempt
+lost, each recovery pass is bounded by the configured lost-log batch limit.
+Suppression does not introduce a separate live-drain bound.
 
 Linux privileged `setup-oci` renders and writes one unprivileged `wefty-agent.service` with
 `SupplementaryGroups=wefty-oci` and one root socket-activated helper pair. The
