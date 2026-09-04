@@ -757,7 +757,11 @@ memory limit, and typed ceiling-over-limit warnings. These tmpfs values are
 caps rather than reservations, so the warnings do not reject admission; the
 memory cgroup remains the enforcement boundary. The node doctor repeats the
 last assertion-derived comparison as `WARN` when applicable and exposes the
-last atomic admission facts. A missing receipt remains `NOT-RUN`.
+last atomic admission facts. The same exact-profile receipt records whether
+the Computer network namespace is present and whether its abstract X11 socket
+is visible from the host namespace. The node doctor reports those two screen
+isolation facts as `OK` only for `present=true` and `visible=false`; a missing
+Computer receipt remains `NOT-RUN`, and any other combination is `FAILED`.
 
 The helper holds an exclusive per-generation file lock for the attachment
 lifetime and durably records exact attempt/fence/boot authority beside the

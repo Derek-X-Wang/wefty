@@ -343,6 +343,22 @@ Meaning: each Computer tmpfs ceiling and their combined ceiling fit within the r
 
 Meaning: one or more Computer tmpfs caps exceed the recorded cgroup memory limit. Evidence: preserve the typed warnings and exact bytes. First action: treat the cgroup memory limit as enforcement because tmpfs ceilings are not reservations. Escalation: carry the OWNER-CALL on production memory sizing without weakening the cgroup.
 
+## doctor-code-oci-computer-screen-isolation-not-run
+
+Meaning: the Computer screen-isolation receipt read lacked a helper dependency. Evidence: inspect the `not_run_cause`. First action: restore helper diagnostics. Escalation: do not infer screen isolation from absent profile evidence.
+
+## doctor-code-oci-computer-screen-isolation-not-recorded
+
+Meaning: the helper has no completed Computer profile receipt in its current generation. Evidence: preserve the absence as `NOT-RUN`. First action: inspect doctor again after the next Computer reaches runtime profile construction. Escalation: do not substitute an ordinary OCI profile receipt.
+
+## doctor-code-oci-computer-screen-isolation-enforced
+
+Meaning: the last assertion-derived Computer profile contains a private network namespace and does not expose its abstract X11 socket to the host namespace. Evidence: preserve both Boolean facts. First action: none. Escalation: pair the receipt with the crossover acceptance row when enforcement is disputed.
+
+## doctor-code-oci-computer-screen-isolation-not-enforced
+
+Meaning: the last Computer profile omitted its private network namespace or left its abstract X11 socket host-visible. Evidence: preserve both Boolean facts and the exact profile receipt. First action: stop admitting Computers on the Node and repair the helper profile. Escalation: treat co-located screen isolation as failed.
+
 ## doctor-code-oci-resource-admission-not-run
 
 Meaning: the helper resource-admission read did not run because an upstream helper/runtime fact was unavailable. Evidence: preserve the NOT-RUN cause. First action: restore the named dependency. Escalation: do not infer an empty or healthy capacity snapshot.

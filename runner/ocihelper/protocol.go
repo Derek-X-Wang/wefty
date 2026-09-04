@@ -681,6 +681,8 @@ type ProfileWarning struct {
 // /var/tmp; ordinary baseline tmpfs mounts remain outside that product delta.
 type ProfileReceipt struct {
 	Computer                  bool             `json:"computer"`
+	NetworkNamespacePresent   bool             `json:"network_namespace_present"`
+	HostAbstractSocketVisible bool             `json:"host_abstract_socket_visible"`
 	MemoryLimitBytes          int64            `json:"memory_limit_bytes"`
 	MemoryMaxBytes            int64            `json:"memory_max_bytes"`
 	MemoryOOMGroup            bool             `json:"memory_oom_group"`

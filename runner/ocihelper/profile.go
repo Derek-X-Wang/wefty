@@ -280,7 +280,14 @@ func BuildRuntimeSpec(ctx context.Context, input RuntimeSpecInput) (*RuntimeSpec
 		_ = retained.close()
 		return nil, &RuntimeSpecRejectionError{err: err}
 	}
-	return &RuntimeSpecDocument{payload: payload, mounts: retained, ownerUID: spec.Process.User.UID, ownerGID: spec.Process.User.GID, profile: profileReceipt(input.Workload)}, nil
+	receipt := profileReceipt(input.Workload)
+	if input.Workload.Computer {
+		receipt.NetworkNamespacePresent = slices.ContainsFunc(spec.Linux.Namespaces, func(namespace specs.LinuxNamespace) bool {
+			return namespace.Type == specs.NetworkNamespace
+		})
+		receipt.HostAbstractSocketVisible = !receipt.NetworkNamespacePresent
+	}
+	return &RuntimeSpecDocument{payload: payload, mounts: retained, ownerUID: spec.Process.User.UID, ownerGID: spec.Process.User.GID, profile: receipt}, nil
 }
 
 func profileReceipt(workload WorkloadInput) ProfileReceipt {
