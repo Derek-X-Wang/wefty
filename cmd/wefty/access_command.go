@@ -83,7 +83,7 @@ func executeComputerGrants(ctx context.Context, clients *apiClients, jsonOutput 
 	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
 		return usageError("usage: wefty services grants COMPUTER")
 	}
-	computerID, err := resolveComputerID(ctx, clients, args[0])
+	computerID, err := resolveAdminComputerID(ctx, clients, args[0])
 	if err != nil {
 		return err
 	}
@@ -144,7 +144,7 @@ func executeComputerGrant(
 	if err != nil {
 		return err
 	}
-	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	computerID, err := resolveAdminComputerID(ctx, clients, flags.Arg(0))
 	if err != nil {
 		return err
 	}
@@ -211,7 +211,7 @@ func executeComputerTakeover(
 		if len(args) != 2 || strings.TrimSpace(args[1]) == "" {
 			return usageError("usage: wefty services takeover sessions COMPUTER")
 		}
-		computerID, err := resolveComputerID(ctx, clients, args[1])
+		computerID, err := resolveAdminComputerID(ctx, clients, args[1])
 		if err != nil {
 			return err
 		}
@@ -237,7 +237,7 @@ func executeComputerTakeover(
 		if tailAudit && cursor != "" {
 			return usageError("takeover audit tail does not accept --cursor")
 		}
-		computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+		computerID, err := resolveAdminComputerID(ctx, clients, flags.Arg(0))
 		if err != nil {
 			return err
 		}

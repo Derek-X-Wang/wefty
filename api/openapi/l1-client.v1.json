@@ -9,7 +9,10 @@
   "security": [{ "fabricIdentity": [] }],
   "paths": {
     "/v1/computer-handle-resolutions/{computer}": {
-      "parameters": [{ "name": "computer", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
+      "parameters": [
+        { "name": "computer", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "administrator_required", "in": "query", "schema": { "type": "boolean", "default": false }, "description": "Require current-administrator authority before resolving an admin-only command target." }
+      ],
       "get": {
         "operationId": "resolvePersonComputerHandle",
         "summary": "Resolve a person-authorized Computer handle",

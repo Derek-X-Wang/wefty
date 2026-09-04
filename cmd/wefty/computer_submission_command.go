@@ -101,7 +101,7 @@ func executeComputerSubmission(ctx context.Context, clients *apiClients, jsonOut
 		return usageError("Computer submission mutations require --policy-revision and --submit-intent-revision, or --expect-current")
 	}
 
-	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	computerID, err := resolveAdminComputerID(ctx, clients, flags.Arg(0))
 	if err != nil {
 		return err
 	}

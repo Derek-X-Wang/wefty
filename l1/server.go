@@ -692,7 +692,17 @@ func (s *Server) listComputerGrants(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) resolvePersonComputerHandle(w http.ResponseWriter, r *http.Request) {
-	resolution, err := s.store.ResolvePersonComputerHandle(r.Context(), identityFromRequest(r), r.PathValue("computer"))
+	administratorRequired := false
+	if value := r.URL.Query().Get("administrator_required"); value != "" {
+		var err error
+		administratorRequired, err = strconv.ParseBool(value)
+		if err != nil {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "administrator_required must be true or false"))
+			return
+		}
+	}
+	resolution, err := s.store.ResolvePersonComputerHandle(r.Context(), identityFromRequest(r),
+		r.PathValue("computer"), administratorRequired)
 	if err != nil {
 		writeError(w, err)
 		return

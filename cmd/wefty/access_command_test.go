@@ -233,7 +233,7 @@ func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
 	if err != nil || resolvedByName != computer.ComputerID {
 		t.Fatalf("person-authorized friendly-name resolution = %q err=%v, want %q", resolvedByName, err, computer.ComputerID)
 	}
-	resolution, err := adminClients.resolvePersonComputerHandle(ctx, computer.Name)
+	resolution, err := adminClients.resolvePersonComputerHandle(ctx, computer.Name, false)
 	if err != nil || resolution.ComputerID != computer.ComputerID || resolution.MatchedBy != "friendly_name" {
 		t.Fatalf("person handle resolution = %#v err=%v", resolution, err)
 	}
@@ -243,7 +243,7 @@ func TestComputerAccessCLIUsesPersonAuthenticatedL1Routes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolution, err = adminClients.resolvePersonComputerHandle(ctx, computer.ComputerID)
+	resolution, err = adminClients.resolvePersonComputerHandle(ctx, computer.ComputerID, false)
 	if err != nil || resolution.ComputerID != computer.ComputerID || resolution.ComputerID == collision.ComputerID ||
 		resolution.MatchedBy != "computer_id" {
 		t.Fatalf("exact person Computer ID precedence = %#v err=%v; colliding name belongs to %q",

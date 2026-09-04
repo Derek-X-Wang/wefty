@@ -262,7 +262,7 @@ func resolveComputerID(ctx context.Context, clients *apiClients, target string) 
 	}
 	var responseErr *apiResponseError
 	if errors.As(computerErr, &responseErr) && responseErr.APIError.Code == contract.ErrorPrincipalForbidden {
-		resolution, err := clients.resolvePersonComputerHandle(ctx, target)
+		resolution, err := clients.resolvePersonComputerHandle(ctx, target, false)
 		if err != nil {
 			return "", err
 		}
@@ -291,6 +291,14 @@ func resolveComputerID(ctx context.Context, clients *apiClients, target string) 
 		return computer.ComputerID, nil
 	}
 	return "", computerErr
+}
+
+func resolveAdminComputerID(ctx context.Context, clients *apiClients, target string) (string, error) {
+	resolution, err := clients.resolvePersonComputerHandle(ctx, target, true)
+	if err != nil {
+		return "", err
+	}
+	return resolution.ComputerID, nil
 }
 
 func writeComputerMutation(stdout io.Writer, computer l1.Computer, receipt mutationReceipt, jsonOutput bool) error {

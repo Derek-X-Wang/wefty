@@ -125,9 +125,12 @@ func (c *apiClients) listComputerGrants(ctx context.Context, computerID string) 
 	return grants, err
 }
 
-func (c *apiClients) resolvePersonComputerHandle(ctx context.Context, handle string) (l1.ComputerHandleResolution, error) {
+func (c *apiClients) resolvePersonComputerHandle(ctx context.Context, handle string, administratorRequired bool) (l1.ComputerHandleResolution, error) {
 	var resolution l1.ComputerHandleResolution
 	path := "/v1/computer-handle-resolutions/" + url.PathEscape(handle)
+	if administratorRequired {
+		path += "?administrator_required=true"
+	}
 	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &resolution, http.StatusOK)
 	return resolution, err
 }

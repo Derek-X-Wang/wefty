@@ -531,6 +531,7 @@ func (s *Store) ResolvePersonComputerHandle(
 	ctx context.Context,
 	identity fabric.Identity,
 	handle string,
+	administratorRequired bool,
 ) (ComputerHandleResolution, error) {
 	if err := validatePersonIdentity(identity); err != nil {
 		return ComputerHandleResolution{}, err
@@ -544,6 +545,10 @@ func (s *Store) ResolvePersonComputerHandle(
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
 		identity.FabricID, identity.UserID).Scan(&administrator); err != nil {
 		return ComputerHandleResolution{}, internalError(err, "read Computer handle administrator access")
+	}
+	if administratorRequired && !administrator {
+		return ComputerHandleResolution{}, protocolError(contract.ErrorAdminRequired,
+			"person %q is not a current administrator", identity.UserID)
 	}
 	var result ComputerHandleResolution
 	var currentJobID string
