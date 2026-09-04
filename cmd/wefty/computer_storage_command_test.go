@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -356,8 +357,8 @@ func assertComputerStorageCLIWaitPathsOverHelperSeam(t *testing.T) {
 	})
 }
 
-func TestCustodyImportWaitObservesDurableOrderingAndPreparationOutcome(t *testing.T) {
-	t.Run("completion recorded before observer subscribes", func(t *testing.T) {
+func TestCustodyImportWaitUsesDurableLedgerState(t *testing.T) {
+	t.Run("completed ledger row returns without another event", func(t *testing.T) {
 		h := newStorageCLIHarness(t)
 		manifest, manifestPath, manifestDigest := writeStorageCLICustodyManifest(t, h)
 		externalPath := t.TempDir()
@@ -384,7 +385,7 @@ func TestCustodyImportWaitObservesDurableOrderingAndPreparationOutcome(t *testin
 		}
 	})
 
-	t.Run("slow preparation completes within measured wait", func(t *testing.T) {
+	t.Run("reserved ledger row is polled until complete", func(t *testing.T) {
 		h := newStorageCLIHarness(t)
 		manifest, manifestPath, manifestDigest := writeStorageCLICustodyManifest(t, h)
 		done := h.startStorageCopyHelperDelayed("import", "", 50*time.Millisecond)
@@ -445,6 +446,31 @@ func TestCustodyImportWaitObservesDurableOrderingAndPreparationOutcome(t *testin
 			output.CustodyImport.FailureCode != "manifest_invalid" || output.Computer != nil ||
 			output.Observation == nil || output.Observation.Status != "failed" {
 			t.Fatalf("failed import stdout=%s stderr=%s err=%v", stdout.String(), stderr.String(), err)
+		}
+	})
+
+	t.Run("superseded ledger row returns typed outcome", func(t *testing.T) {
+		clients := custodyImportObservationClients(t, l1.ComputerCustodyImportObservation{
+			ImportID: "superseded-import", OperationRevision: 3, Status: "superseded", FailureCode: "aborted_dead_node",
+		})
+		observed, _, observation, err := waitForCustodyImport(t.Context(), clients, "superseded-import", 3,
+			storageWaitFlags{timeout: time.Second, pollInterval: time.Millisecond})
+		if observed.Status != "superseded" || observation.Status != "failed" ||
+			commandExitCodeForArgs(err, []string{"services", "custody", "import"}) != exitCustodyImportSuperseded ||
+			!strings.Contains(fmt.Sprint(err), "is superseded") {
+			t.Fatalf("superseded ledger observation=%#v wait=%#v err=%v", observed, observation, err)
+		}
+	})
+
+	t.Run("accepted revision must match ledger revision", func(t *testing.T) {
+		clients := custodyImportObservationClients(t, l1.ComputerCustodyImportObservation{
+			ImportID: "revision-mismatch-import", OperationRevision: 3, Status: "reserved",
+		})
+		observed, _, observation, err := waitForCustodyImport(t.Context(), clients, "revision-mismatch-import", 4,
+			storageWaitFlags{timeout: 100 * time.Millisecond, pollInterval: time.Millisecond})
+		if observed.OperationRevision != 3 || observation.Status != "failed" ||
+			!strings.Contains(fmt.Sprint(err), "does not match accepted revision") {
+			t.Fatalf("revision-mismatch ledger observation=%#v wait=%#v err=%v", observed, observation, err)
 		}
 	})
 }
@@ -664,6 +690,20 @@ type storageRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function storageRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)
+}
+
+func custodyImportObservationClients(t *testing.T, observation l1.ComputerCustodyImportObservation) *apiClients {
+	t.Helper()
+	payload, err := json.Marshal(observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &apiClients{l1: &apiClient{name: "L1", client: &http.Client{Transport: storageRoundTripFunc(
+		func(request *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+				Body: io.NopCloser(bytes.NewReader(payload)), Request: request}, nil
+		},
+	)}}}
 }
 
 func TestStorageMutationRenderingKeepsEveryResourceAndAppliedFactsOnReadFailure(t *testing.T) {

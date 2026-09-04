@@ -185,12 +185,35 @@ func TestCustodyImportValidatesReceiptCreatesNoGrantIdentityAndTaintsDescendants
 			t.Fatalf("tampered Custody import receipt row %d = %v", index, err)
 		}
 	}
+	recordedAt := time.Now().UTC()
+	preparation := ComputerStoragePreparationOutcome{Code: ComputerStoragePreparationInterrupted,
+		DestinationComputerID: operation.DestinationComputerID, DestinationStorageID: operation.DestinationStorageID,
+		DestinationGeneration: 1, IntentRevision: operation.OperationRevision, DiskBytes: operation.DestinationSize,
+		HelperGeneration: 4, Operation: "computer_storage_copy", Reason: "operation_failed", RecordedAt: &recordedAt}
+	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
+		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: "receipt-and-preparation",
+			Receipt: receipt, PreparationOutcome: &preparation}); errorCode(err) != contract.ErrorInvalidRequest {
+		t.Fatalf("receipt plus preparation outcome error = %v", err)
+	}
+	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
+		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: "preparation-before-success", PreparationOutcome: &preparation}); err != nil {
+		t.Fatalf("record preparation before successful import: %v", err)
+	}
 	imported, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
 		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
 			BootSessionID: node.BootSessionID, IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
 	if err != nil || imported.ComputerID == source.ComputerID || imported.StorageID == source.StorageID ||
 		len(imported.Grants) != 0 || imported.DesiredState != contract.ServiceDesiredStopped {
 		t.Fatalf("verified Custody import = %#v err=%v", imported, err)
+	}
+	var completedProvisionalFields int
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_storage_copy_operations
+		WHERE destination_computer_id=? AND (preparation_outcome_json IS NOT NULL OR
+		preparation_acknowledgement_key IS NOT NULL OR preparation_acknowledgement_hash IS NOT NULL)`,
+		operation.DestinationComputerID).Scan(&completedProvisionalFields); err != nil || completedProvisionalFields != 0 {
+		t.Fatalf("completed import retained provisional preparation fields: count=%d err=%v", completedProvisionalFields, err)
 	}
 
 	provenanceID, importedBackupID, importedCopyID := newID("storage-provenance"), newID("backup"), newID("backup-copy")
@@ -354,6 +377,7 @@ func TestCustodyImportFailureUsesStoredVerbAndReleasesName(t *testing.T) {
 		{name: "disk_bytes", mutate: func(value *ComputerStoragePreparationOutcome) { value.DiskBytes++ }},
 		{name: "helper_generation", mutate: func(value *ComputerStoragePreparationOutcome) { value.HelperGeneration = 0 }},
 		{name: "recorded_at", mutate: func(value *ComputerStoragePreparationOutcome) { value.RecordedAt = nil }},
+		{name: "unknown_code", mutate: func(value *ComputerStoragePreparationOutcome) { value.Code = "computer_storage_preparation_unknown" }},
 	} {
 		t.Run("rejects_"+test.name, func(t *testing.T) {
 			tampered := preparation
@@ -526,6 +550,16 @@ func TestCustodyExportAndImportAbortWhenTheirDestinationNodeDies(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		recordedAt := time.Now().UTC()
+		preparation := ComputerStoragePreparationOutcome{Code: ComputerStoragePreparationInterrupted,
+			DestinationComputerID: operation.DestinationComputerID, DestinationStorageID: operation.DestinationStorageID,
+			DestinationGeneration: 1, IntentRevision: operation.OperationRevision, DiskBytes: operation.DestinationSize,
+			HelperGeneration: 4, Operation: "computer_storage_copy", Reason: "operation_failed", RecordedAt: &recordedAt}
+		if _, err := h.store.AcknowledgeComputerStorageCopy(t.Context(), "fabric-computer-node",
+			operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
+				BootSessionID: node.BootSessionID, IdempotencyKey: "abort-import-preparation", PreparationOutcome: &preparation}); err != nil {
+			t.Fatalf("record preparation before superseding import: %v", err)
+		}
 		reserved, err := h.store.GetComputer(t.Context(), operation.DestinationComputerID)
 		if err != nil {
 			t.Fatal(err)
@@ -543,6 +577,13 @@ func TestCustodyExportAndImportAbortWhenTheirDestinationNodeDies(t *testing.T) {
 		if err := h.store.db.QueryRow(`SELECT status FROM computer_storage_copy_operations
 			WHERE destination_computer_id=?`, reserved.ComputerID).Scan(&status); err != nil || status != "superseded" {
 			t.Fatalf("aborted import status=%q err=%v", status, err)
+		}
+		var supersededProvisionalFields int
+		if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_storage_copy_operations
+			WHERE destination_computer_id=? AND (preparation_outcome_json IS NOT NULL OR
+			preparation_acknowledgement_key IS NOT NULL OR preparation_acknowledgement_hash IS NOT NULL)`,
+			reserved.ComputerID).Scan(&supersededProvisionalFields); err != nil || supersededProvisionalFields != 0 {
+			t.Fatalf("superseded import retained provisional preparation fields: count=%d err=%v", supersededProvisionalFields, err)
 		}
 	})
 }
