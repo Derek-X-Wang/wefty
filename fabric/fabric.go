@@ -1,5 +1,8 @@
 // Package fabric is wefty's only network-layer seam. Public types are owned by
-// wefty and do not expose implementation-specific networking types or names.
+// wefty and do not expose implementation-specific networking types. As the
+// exact #266 exception, a raw Fabric address may appear as a clearly labelled
+// secondary connection field behind a wefty-owned friendly name; it is never
+// the only handle and callers must not interpret it.
 package fabric
 
 import (
@@ -17,9 +20,10 @@ type Fabric interface {
 	Listen(network, address string) (net.Listener, error)
 	Dial(ctx context.Context, network, address string) (net.Conn, error)
 	WhoIs(ctx context.Context, remoteAddress string) (Identity, error)
-	// ConnectHost returns the Fabric-owned hostname an operator can combine
-	// with a published port. It is presentation data only: callers must never
-	// use it for identity, authorization, or scheduling.
+	// ConnectHost returns the raw Fabric-owned hostname an operator can combine
+	// with a published port. It is secondary presentation data behind a
+	// wefty-owned friendly name: callers must never use it for identity,
+	// authorization, or scheduling.
 	ConnectHost() string
 }
 

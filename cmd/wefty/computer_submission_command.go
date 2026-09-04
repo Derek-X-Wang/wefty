@@ -19,7 +19,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/l3"
 )
 
-const computerSubmissionUsage = "usage: wefty services submission enable|disable|set-inflight COMPUTER_ID [--max-inflight LIMIT] (--policy-revision REVISION --submit-intent-revision REVISION | --expect-current) [--idempotency-key KEY]"
+const computerSubmissionUsage = "usage: wefty services submission enable|disable|set-inflight COMPUTER [--max-inflight LIMIT] (--policy-revision REVISION --submit-intent-revision REVISION | --expect-current) [--idempotency-key KEY]"
 
 type optionalRevisionFlag struct {
 	value int64
@@ -101,7 +101,10 @@ func executeComputerSubmission(ctx context.Context, clients *apiClients, jsonOut
 		return usageError("Computer submission mutations require --policy-revision and --submit-intent-revision, or --expect-current")
 	}
 
-	computerID := flags.Arg(0)
+	computerID, err := resolveAdminComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
 	if expectCurrent {
 		current, err := clients.getComputerSubmission(ctx, computerID)
 		if err != nil {
@@ -122,7 +125,6 @@ func executeComputerSubmission(ctx context.Context, clients *apiClients, jsonOut
 	case "set-inflight":
 		request.SubmitMaxInflight = &maxInflight
 	}
-	var err error
 	idempotencyKey, err = ensureComputerSubmissionIdempotencyKey(idempotencyKey, computerID, request)
 	if err != nil {
 		return err

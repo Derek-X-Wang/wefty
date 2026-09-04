@@ -38,9 +38,8 @@ func (mutation *storageMutationFlags) bind(flags *flag.FlagSet, keyed bool) {
 }
 
 func (mutation storageMutationFlags) resolve(ctx context.Context, clients *apiClients, computerID string) (l1.ComputerMutationPrecondition, error) {
-	explicit := mutation.intentRevision.set || strings.TrimSpace(mutation.storageID) != "" || mutation.storageGeneration.set
-	if mutation.expectCurrent && explicit {
-		return l1.ComputerMutationPrecondition{}, usageError("--expect-current cannot be combined with explicit CAS flags")
+	if err := mutation.validate(); err != nil {
+		return l1.ComputerMutationPrecondition{}, err
 	}
 	if mutation.expectCurrent {
 		computer, err := clients.getComputerStorageAuthority(ctx, computerID)
@@ -50,12 +49,23 @@ func (mutation storageMutationFlags) resolve(ctx context.Context, clients *apiCl
 		return l1.ComputerMutationPrecondition{IntentRevision: computer.IntentRevision,
 			StorageID: computer.StorageID, StorageGeneration: computer.StorageGeneration}, nil
 	}
-	if !mutation.intentRevision.set || mutation.intentRevision.value < 1 || strings.TrimSpace(mutation.storageID) == "" ||
-		!mutation.storageGeneration.set || mutation.storageGeneration.value < 1 {
-		return l1.ComputerMutationPrecondition{}, usageError("mutation requires positive --intent-revision, --storage-id, and positive --storage-generation, or explicit --expect-current")
-	}
 	return l1.ComputerMutationPrecondition{IntentRevision: mutation.intentRevision.value,
 		StorageID: strings.TrimSpace(mutation.storageID), StorageGeneration: mutation.storageGeneration.value}, nil
+}
+
+func (mutation storageMutationFlags) validate() error {
+	explicit := mutation.intentRevision.set || strings.TrimSpace(mutation.storageID) != "" || mutation.storageGeneration.set
+	if mutation.expectCurrent && explicit {
+		return usageError("--expect-current cannot be combined with explicit CAS flags")
+	}
+	if mutation.expectCurrent {
+		return nil
+	}
+	if !mutation.intentRevision.set || mutation.intentRevision.value < 1 || strings.TrimSpace(mutation.storageID) == "" ||
+		!mutation.storageGeneration.set || mutation.storageGeneration.value < 1 {
+		return usageError("mutation requires positive --intent-revision, --storage-id, and positive --storage-generation, or explicit --expect-current")
+	}
+	return nil
 }
 
 func (mutation storageMutationFlags) key() (string, error) {
@@ -159,11 +169,15 @@ func executeComputerBackups(ctx context.Context, clients *apiClients, jsonOutput
 		if len(args) != 2 || strings.TrimSpace(args[1]) == "" {
 			return usageError("usage: wefty services backup list COMPUTER")
 		}
-		backups, err := clients.listComputerBackups(ctx, args[1])
+		computerID, err := resolveComputerID(ctx, clients, args[1])
 		if err != nil {
 			return err
 		}
-		provenance, err := clients.listComputerStorageProvenance(ctx, args[1])
+		backups, err := clients.listComputerBackups(ctx, computerID)
+		if err != nil {
+			return err
+		}
+		provenance, err := clients.listComputerStorageProvenance(ctx, computerID)
 		if err != nil {
 			return err
 		}
@@ -216,12 +230,18 @@ func executeComputerBackupCreate(ctx context.Context, clients *apiClients, jsonO
 	if err := wait.validate(flags); err != nil {
 		return err
 	}
-	computerID := flags.Arg(0)
-	precondition, err := mutation.resolve(ctx, clients, computerID)
-	if err != nil {
+	if err := mutation.validate(); err != nil {
 		return err
 	}
 	key, err := mutation.key()
+	if err != nil {
+		return err
+	}
+	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	precondition, err := mutation.resolve(ctx, clients, computerID)
 	if err != nil {
 		return err
 	}
@@ -257,12 +277,19 @@ func executeComputerBackupPrune(ctx context.Context, clients *apiClients, jsonOu
 	if err := wait.validate(flags); err != nil {
 		return err
 	}
-	computerID, backupID := flags.Arg(0), flags.Arg(1)
-	precondition, err := mutation.resolve(ctx, clients, computerID)
-	if err != nil {
+	if err := mutation.validate(); err != nil {
 		return err
 	}
 	key, err := mutation.key()
+	if err != nil {
+		return err
+	}
+	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	backupID := flags.Arg(1)
+	precondition, err := mutation.resolve(ctx, clients, computerID)
 	if err != nil {
 		return err
 	}
@@ -293,11 +320,18 @@ func executeComputerBackupSetCap(ctx context.Context, clients *apiClients, jsonO
 	if flags.NArg() != 1 || !capValue.set || capValue.value < 0 {
 		return usageError("usage: wefty services backup set-cap COMPUTER --cap NON_NEGATIVE [CAS flags | --expect-current]")
 	}
-	precondition, err := mutation.resolve(ctx, clients, flags.Arg(0))
+	if err := mutation.validate(); err != nil {
+		return err
+	}
+	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
 	if err != nil {
 		return err
 	}
-	computer, err := clients.setComputerBackupCap(ctx, flags.Arg(0), l1.ComputerBackupCapRequest{
+	precondition, err := mutation.resolve(ctx, clients, computerID)
+	if err != nil {
+		return err
+	}
+	computer, err := clients.setComputerBackupCap(ctx, computerID, l1.ComputerBackupCapRequest{
 		ComputerMutationPrecondition: precondition, BackupCap: capValue.value,
 	})
 	if err != nil {
@@ -325,12 +359,19 @@ func executeComputerRestore(ctx context.Context, clients *apiClients, jsonOutput
 	if err := wait.validate(flags); err != nil {
 		return err
 	}
-	computerID, backupID := flags.Arg(0), flags.Arg(1)
-	precondition, err := mutation.resolve(ctx, clients, computerID)
-	if err != nil {
+	if err := mutation.validate(); err != nil {
 		return err
 	}
 	key, err := mutation.key()
+	if err != nil {
+		return err
+	}
+	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	backupID := flags.Arg(1)
+	precondition, err := mutation.resolve(ctx, clients, computerID)
 	if err != nil {
 		return err
 	}
@@ -370,12 +411,19 @@ func executeComputerClone(ctx context.Context, clients *apiClients, jsonOutput b
 	if err := wait.validate(flags); err != nil {
 		return err
 	}
-	sourceComputerID, backupID := flags.Arg(0), flags.Arg(1)
-	precondition, err := mutation.resolve(ctx, clients, sourceComputerID)
-	if err != nil {
+	if err := mutation.validate(); err != nil {
 		return err
 	}
 	key, err := mutation.key()
+	if err != nil {
+		return err
+	}
+	sourceComputerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	backupID := flags.Arg(1)
+	precondition, err := mutation.resolve(ctx, clients, sourceComputerID)
 	if err != nil {
 		return err
 	}
@@ -430,12 +478,19 @@ func executeComputerCustodyExport(ctx context.Context, clients *apiClients, json
 	if err := wait.validate(flags); err != nil {
 		return err
 	}
-	computerID, backupID := flags.Arg(0), flags.Arg(1)
-	precondition, err := mutation.resolve(ctx, clients, computerID)
-	if err != nil {
+	if err := mutation.validate(); err != nil {
 		return err
 	}
 	key, err := mutation.key()
+	if err != nil {
+		return err
+	}
+	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	backupID := flags.Arg(1)
+	precondition, err := mutation.resolve(ctx, clients, computerID)
 	if err != nil {
 		return err
 	}

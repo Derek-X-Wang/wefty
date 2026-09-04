@@ -8,6 +8,24 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/computer-handle-resolutions/{computer}": {
+      "parameters": [
+        { "name": "computer", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "administrator_required", "in": "query", "schema": { "type": "boolean", "default": false }, "description": "Require current-administrator authority before resolving an admin-only command target." }
+      ],
+      "get": {
+        "operationId": "resolvePersonComputerHandle",
+        "summary": "Resolve a person-authorized Computer handle",
+        "description": "Accepts an exact Computer ID, current Job ID, or UNIQUE friendly name. Exact IDs take precedence over an ID-shaped friendly name. Administrators may resolve every live Computer; other people may resolve only Computers they can view or control, so the route does not expose an existence oracle.",
+        "responses": {
+          "200": { "description": "Canonical Computer ID and the matching handle class.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerHandleResolution" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/whoami": {
       "get": {
         "operationId": "observeAuthenticatedPerson",
@@ -637,7 +655,7 @@
       "get": {
         "operationId": "getComputerTakeoverAccess",
         "summary": "Discover person-authorized view-first Computer admission",
-        "description": "Returns the authenticated person/device, server-derived role, policy revision, and authorized front door. It never returns a session bearer or raw backend address, and no URL or option selects control.",
+        "description": "Returns the wefty-owned Computer friendly name, authenticated person/device, server-derived role, policy revision, and authorized front door. It never returns a session bearer or raw backend address, and no URL or option selects control.",
         "responses": {
           "200": { "description": "View-first admission projection; display_endpoint is null until ready.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerTakeoverAccess" } } } },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },

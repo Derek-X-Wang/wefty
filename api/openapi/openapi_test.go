@@ -207,6 +207,7 @@ func TestL1ClientPublishesPersonAdminBootstrapSurface(t *testing.T) {
 		"/v1/admin-policy",
 		"/v1/admin-policy/audit",
 		"/v1/admin-policy/admins/{user_id}",
+		"/v1/computer-handle-resolutions/{computer}",
 		"/v1/computers/{computer_id}/grants",
 		"/v1/computers/{computer_id}/grants/{user_id}",
 		"/v1/computers/{computer_id}/takeover",
@@ -234,6 +235,16 @@ func TestL1ClientPublishesPersonAdminBootstrapSurface(t *testing.T) {
 
 	common := readObject(t, "common.v1.json")
 	schemas := object(t, object(t, common["components"], "components")["schemas"], "components.schemas")
+	takeoverAccess := object(t, schemas["ComputerTakeoverAccess"], "ComputerTakeoverAccess")
+	takeoverRequired := stringSet(t, takeoverAccess["required"])
+	if !takeoverRequired["friendly_name"] {
+		t.Fatal("ComputerTakeoverAccess does not require the wefty-owned friendly name")
+	}
+	handleResolution := object(t, schemas["ComputerHandleResolution"], "ComputerHandleResolution")
+	handleRequired := stringSet(t, handleResolution["required"])
+	if !handleRequired["computer_id"] || !handleRequired["friendly_name"] || !handleRequired["matched_by"] {
+		t.Fatalf("ComputerHandleResolution required fields = %#v", handleRequired)
+	}
 	policy := object(t, schemas["AdminPolicy"], "AdminPolicy")
 	required := stringSet(t, policy["required"])
 	if !required["revision"] || required["admins"] {

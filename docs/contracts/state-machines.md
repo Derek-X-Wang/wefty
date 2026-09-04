@@ -509,12 +509,18 @@ The CLI's L1 discovery route returns durable availability only, never a live
 admission role; that URL always attempts view-first admission at the agent's
 current evaluator. `takeover view --session-token-file FILE` opens that live
 WebSocket and atomically retains its opaque bearer plus private dial endpoint
-in an owner-readable file. The CLI reads that file, sends the bearer only to
-the fixed sideband path on the same front door and same Fabric identity, and
-never prints or persists its contents itself. The sideband remains the
-authority: a copied file from another person, device, ended session, or
-Computer fails closed, and neither a CLI flag nor URL selects the control
-backend directly.
+in an owner-readable file. Its output presents the Computer's wefty-owned
+friendly name first and the raw Fabric `connect_host` second; the raw host is
+the exact host-and-port value accepted by Fabric dialing, not a rewritten or
+provider-aware alias. For one compatibility release, human and JSON output also
+retain `DISPLAY ENDPOINT` / `display_endpoint` as a deprecated alias equal to
+`connect_host`; the alias is scheduled for removal on 2026-10-04 and never
+contains the full private endpoint. The CLI reads that file, sends the bearer
+only to the fixed sideband path on the same front door and same Fabric
+identity, and never prints or persists its contents itself. The sideband
+remains the authority: a copied file from another person, device, ended
+session, or Computer fails closed, and neither a CLI flag nor URL selects the
+control backend directly.
 
 Service completion policy classifies the payload result independently from
 log finalization. Its finalization-related classifier rows are explicit:

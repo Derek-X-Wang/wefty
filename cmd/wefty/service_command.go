@@ -284,7 +284,7 @@ func executeServiceList(
 
 func executeServiceStatus(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
 	if len(args) != 1 {
-		return usageError("usage: wefty services status JOB_ID|COMPUTER_ID")
+		return usageError("usage: wefty services status JOB_ID|COMPUTER")
 	}
 	job, computer, err := resolveServiceTarget(ctx, clients, args[0])
 	if err != nil {
@@ -313,10 +313,42 @@ func resolveServiceTarget(ctx context.Context, clients *apiClients, target strin
 		return nil, nil, err
 	}
 	computer, computerErr := clients.getComputer(ctx, target)
-	if computerErr != nil {
+	if computerErr == nil {
+		return nil, &computer, nil
+	}
+	if !errors.As(computerErr, &responseErr) || responseErr.APIError.Code != contract.ErrorNotFound {
+		return nil, nil, computerErr
+	}
+	computer, found, lookupErr := findComputerByName(ctx, clients, target)
+	if lookupErr != nil {
+		return nil, nil, lookupErr
+	}
+	if !found {
 		return nil, nil, computerErr
 	}
 	return nil, &computer, nil
+}
+
+func findComputerByName(ctx context.Context, clients *apiClients, name string) (l1.Computer, bool, error) {
+	// Client principals cannot call the person-authorized handle route, so this
+	// O(n) fallback mirrors its final friendly-name arm after exact Computer and
+	// current Job lookups fail. ListComputers excludes removed Computers, and the
+	// database keeps friendly names unique.
+	for cursor := ""; ; {
+		page, err := clients.listComputers(ctx, cursor, l1.MaxJobPageLimit)
+		if err != nil {
+			return l1.Computer{}, false, err
+		}
+		for _, candidate := range page.Computers {
+			if candidate.Name == name {
+				return candidate, true, nil
+			}
+		}
+		if page.NextCursor == "" {
+			return l1.Computer{}, false, nil
+		}
+		cursor = page.NextCursor
+	}
 }
 
 func computerMutationFlagsSet(mutation computerMutationFlags) bool {

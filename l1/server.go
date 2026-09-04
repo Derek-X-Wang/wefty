@@ -334,6 +334,7 @@ func (s *Server) routes() http.Handler {
 	person.HandleFunc("GET /v1/admin-policy/audit", s.listAdminPolicyAudit)
 	person.HandleFunc("PUT /v1/admin-policy/admins/{user_id}", s.addAdmin)
 	person.HandleFunc("DELETE /v1/admin-policy/admins/{user_id}", s.removeAdmin)
+	person.HandleFunc("GET /v1/computer-handle-resolutions/{computer}", s.resolvePersonComputerHandle)
 	person.HandleFunc("GET /v1/computers/{computer_id}/grants", s.listComputerGrants)
 	person.HandleFunc("PUT /v1/computers/{computer_id}/grants/{user_id}", s.mutateComputerGrant)
 	person.HandleFunc("DELETE /v1/computers/{computer_id}/grants/{user_id}", s.deleteComputerGrant)
@@ -351,6 +352,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/jobs/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/computers", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/custody-exports/", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/computer-handle-resolutions/", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/grants", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/grants/", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/revocations/", s.authorize(personPrincipal, person))
@@ -687,6 +689,25 @@ func (s *Server) listComputerGrants(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, grants)
+}
+
+func (s *Server) resolvePersonComputerHandle(w http.ResponseWriter, r *http.Request) {
+	administratorRequired := false
+	if value := r.URL.Query().Get("administrator_required"); value != "" {
+		var err error
+		administratorRequired, err = strconv.ParseBool(value)
+		if err != nil {
+			writeError(w, protocolError(contract.ErrorInvalidRequest, "administrator_required must be true or false"))
+			return
+		}
+	}
+	resolution, err := s.store.ResolvePersonComputerHandle(r.Context(), identityFromRequest(r),
+		r.PathValue("computer"), administratorRequired)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resolution)
 }
 
 func (s *Server) mutateComputerGrant(w http.ResponseWriter, r *http.Request) {

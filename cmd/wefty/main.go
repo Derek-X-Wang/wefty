@@ -334,7 +334,7 @@ Commands:
   services <verb>            Create and operate service-class jobs
     create [--computer --name NAME --image IMAGE --node NODE_ID --argv ARG --working-directory PATH --mount SPEC --memory-bytes BYTES --cpu-millicores VALUE --runtime-handler NAME --disk-bytes BYTES --backup-cap COUNT --idempotency-key KEY]
     list [--limit COUNT --cursor CURSOR]
-    status JOB_ID|COMPUTER_ID
+    status JOB_ID|COMPUTER
     start|stop COMPUTER [--intent-revision REV --storage-id ID --storage-generation GENERATION | --expect-current]
     restart COMPUTER --idempotency-key KEY [CAS flags | --expect-current]
     remove COMPUTER [CAS flags | --expect-current]
@@ -344,6 +344,9 @@ Commands:
     abort COMPUTER --idempotency-key KEY [CAS flags | --expect-current]
     logs|forget JOB_ID
     grants|grant|revoke|takeover
+                             COMPUTER accepts an exact Computer ID or current Job ID before its unique friendly name
+                             Take-over view prints FRIENDLY NAME first and dialable CONNECT HOST second;
+                             DISPLAY ENDPOINT is a deprecated alias through 2026-10-04
   services submission <verb>
                              Enable, disable, or set Computer Run submission inflight capacity
     enable|disable COMPUTER [--policy-revision REV --submit-intent-revision REV | --expect-current] [--idempotency-key KEY]

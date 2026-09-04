@@ -59,10 +59,19 @@ type ComputerGrantList struct {
 	Grants         []ComputerGrant `json:"grants"`
 }
 
+// ComputerHandleResolution names how a person-authorized CLI handle mapped to
+// the durable Computer ID. Exact IDs win before the unique friendly name.
+type ComputerHandleResolution struct {
+	ComputerID   string `json:"computer_id"`
+	FriendlyName string `json:"friendly_name"`
+	MatchedBy    string `json:"matched_by"`
+}
+
 // ComputerTakeoverAvailability is durable discovery data, not a live
 // admission decision. The front door remains the sole admission authority.
 type ComputerTakeoverAvailability struct {
 	ComputerID      string  `json:"computer_id"`
+	FriendlyName    string  `json:"friendly_name"`
 	UserID          string  `json:"user_id"`
 	DeviceID        string  `json:"device_id"`
 	DisplayName     string  `json:"display_name,omitempty"`
@@ -501,9 +510,10 @@ func (s *Store) GetComputerTakeoverAvailability(
 	}
 	// Authorization precedes existence/endpoint discovery to avoid an oracle.
 	var endpoint sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT service_jobs.display_endpoint FROM computers
+	if err := tx.QueryRowContext(ctx, `SELECT computers.name, service_jobs.display_endpoint FROM computers
 		JOIN service_jobs ON service_jobs.job_id=computers.current_job_id
-		WHERE computers.computer_id=? AND computers.desired_state<>'removed'`, computerID).Scan(&endpoint); errors.Is(err, sql.ErrNoRows) {
+		WHERE computers.computer_id=? AND computers.desired_state<>'removed'`, computerID).
+		Scan(&access.FriendlyName, &endpoint); errors.Is(err, sql.ErrNoRows) {
 		return ComputerTakeoverAvailability{}, protocolError(contract.ErrorNotFound, "Computer %q not found", computerID)
 	} else if err != nil {
 		return ComputerTakeoverAvailability{}, internalError(err, "read Computer take-over endpoint")
@@ -515,6 +525,76 @@ func (s *Store) GetComputerTakeoverAvailability(
 		return ComputerTakeoverAvailability{}, internalError(err, "commit Computer take-over availability read")
 	}
 	return access, nil
+}
+
+func (s *Store) ResolvePersonComputerHandle(
+	ctx context.Context,
+	identity fabric.Identity,
+	handle string,
+	administratorRequired bool,
+) (ComputerHandleResolution, error) {
+	if err := validatePersonIdentity(identity); err != nil {
+		return ComputerHandleResolution{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return ComputerHandleResolution{}, internalError(err, "begin Computer handle resolution")
+	}
+	defer tx.Rollback()
+	var administrator bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
+		identity.FabricID, identity.UserID).Scan(&administrator); err != nil {
+		return ComputerHandleResolution{}, internalError(err, "read Computer handle administrator access")
+	}
+	if administratorRequired && !administrator {
+		return ComputerHandleResolution{}, protocolError(contract.ErrorAdminRequired,
+			"person %q is not a current administrator", identity.UserID)
+	}
+	var result ComputerHandleResolution
+	var currentJobID string
+	// Durable IDs continue to address retained take-over evidence after removal;
+	// the reusable friendly name is only actionable for a live Computer.
+	err = tx.QueryRowContext(ctx, `SELECT computer_id, name, current_job_id FROM computers
+		WHERE computer_id=? OR current_job_id=? OR (name=? AND desired_state<>'removed')
+		ORDER BY CASE WHEN computer_id=? THEN 0 WHEN current_job_id=? THEN 1 ELSE 2 END LIMIT 1`,
+		handle, handle, handle, handle, handle).Scan(&result.ComputerID, &result.FriendlyName, &currentJobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		if !administrator {
+			return ComputerHandleResolution{}, protocolError(contract.ErrorForbidden,
+				"person %q has no Computer access", identity.UserID)
+		}
+		return ComputerHandleResolution{}, protocolError(contract.ErrorNotFound, "Computer handle %q not found", handle)
+	}
+	if err != nil {
+		return ComputerHandleResolution{}, internalError(err, "resolve Computer handle")
+	}
+	if !administrator {
+		var permission ComputerGrantPermission
+		if err := tx.QueryRowContext(ctx, `SELECT permission FROM computer_grants
+			WHERE computer_id=? AND fabric_id=? AND user_id=?`, result.ComputerID, identity.FabricID, identity.UserID).
+			Scan(&permission); errors.Is(err, sql.ErrNoRows) {
+			return ComputerHandleResolution{}, protocolError(contract.ErrorForbidden,
+				"person %q has no Computer access", identity.UserID)
+		} else if err != nil {
+			return ComputerHandleResolution{}, internalError(err, "read Computer handle person access")
+		}
+		if permission != ComputerGrantView && permission != ComputerGrantControl {
+			return ComputerHandleResolution{}, protocolError(contract.ErrorForbidden,
+				"person %q has no Computer access", identity.UserID)
+		}
+	}
+	switch handle {
+	case result.ComputerID:
+		result.MatchedBy = "computer_id"
+	case currentJobID:
+		result.MatchedBy = "current_job_id"
+	default:
+		result.MatchedBy = "friendly_name"
+	}
+	if err := tx.Commit(); err != nil {
+		return ComputerHandleResolution{}, internalError(err, "commit Computer handle resolution")
+	}
+	return result, nil
 }
 
 func listComputerGrants(ctx context.Context, q queryer, computerID string) ([]ComputerGrant, error) {
