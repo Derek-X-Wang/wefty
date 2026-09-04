@@ -669,8 +669,8 @@
         "description": "A success/failure receipt binds source bytes and destination Storage authority. For Custody import only, a mutually exclusive preparation_outcome persists the helper's exact-generation interrupted, deferred, or quarantined result without granting publication authority.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
-		  "required": ["node_id", "boot_session_id", "idempotency_key"],
-		  "oneOf": [{ "required": ["receipt"] }, { "required": ["preparation_outcome"] }],
+      "required": ["node_id", "boot_session_id", "idempotency_key"],
+      "oneOf": [{ "required": ["receipt"] }, { "required": ["preparation_outcome"] }],
           "properties": {
             "node_id": { "type": "string", "minLength": 1 },
             "boot_session_id": { "type": "string", "minLength": 1 },
@@ -696,21 +696,21 @@
                 "destination_absent": { "type": "boolean" }
               }
             },
-			"preparation_outcome": {
-			  "type": "object", "additionalProperties": false,
-			  "required": ["code", "destination_computer_id", "destination_storage_id", "destination_generation", "intent_revision", "disk_bytes", "helper_generation", "recorded_at"],
-			  "properties": {
-				"code": { "enum": ["computer_storage_preparation_interrupted", "computer_storage_resume_deferred", "computer_storage_quarantined"] },
-				"destination_computer_id": { "type": "string", "minLength": 1 }, "destination_storage_id": { "type": "string", "minLength": 1 },
-				"destination_generation": { "type": "integer", "format": "int64", "minimum": 1 }, "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
-				"disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 }, "helper_generation": { "type": "integer", "minimum": 1 },
-				"sweep_epoch": { "type": "string", "minLength": 1 }, "disk_name": { "type": "string", "minLength": 1 },
-				"operation": { "type": "string", "minLength": 1 }, "reason": { "type": "string", "minLength": 1 },
-				"deferred_reason": { "type": "string", "minLength": 1 }, "attempts": { "type": "integer", "minimum": 1 },
-				"first_deferred_at": { "type": "string", "format": "date-time" }, "payload_dropped_at": { "type": "string", "format": "date-time" },
-				"recorded_at": { "type": "string", "format": "date-time" }
-			  }
-			},
+      "preparation_outcome": {
+        "type": "object", "additionalProperties": false,
+        "required": ["code", "destination_computer_id", "destination_storage_id", "destination_generation", "intent_revision", "disk_bytes", "helper_generation", "recorded_at"],
+        "properties": {
+        "code": { "enum": ["computer_storage_preparation_interrupted", "computer_storage_resume_deferred", "computer_storage_quarantined"] },
+        "destination_computer_id": { "type": "string", "minLength": 1 }, "destination_storage_id": { "type": "string", "minLength": 1 },
+        "destination_generation": { "type": "integer", "format": "int64", "minimum": 1 }, "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+        "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 }, "helper_generation": { "type": "integer", "minimum": 1 },
+        "sweep_epoch": { "type": "string", "minLength": 1 }, "disk_name": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 }, "reason": { "type": "string", "minLength": 1 },
+        "deferred_reason": { "type": "string", "minLength": 1 }, "attempts": { "type": "integer", "minimum": 1 },
+        "first_deferred_at": { "type": "string", "format": "date-time" }, "payload_dropped_at": { "type": "string", "format": "date-time" },
+        "recorded_at": { "type": "string", "format": "date-time" }
+        }
+      },
             "old_backup_receipt": { "type": "object", "description": "Exact Computer Backup copy receipt for the precommitted old generation; forbidden when keep_old_as_backup was false." }
           }
         } } } },
@@ -896,8 +896,8 @@
       ],
       "post": {
         "operationId": "acknowledgeComputerStorageReset",
-		"summary": "Publish one verified replacement Storage generation",
-		"description": "The authenticated current node submits a helper-derived preparation receipt bound to Computer, Storage, old/new generations, exact managed-root instance, Job, reset intent revision, cleanup fence, and helper generation. L1 commits verification before separately publishing generation+1; the old generation remains for shared removal afterward.",
+    "summary": "Publish one verified replacement Storage generation",
+    "description": "The authenticated current node submits a helper-derived preparation receipt bound to Computer, Storage, old/new generations, exact managed-root instance, Job, reset intent revision, cleanup fence, and helper generation. L1 commits verification before separately publishing generation+1; the old generation remains for shared removal afterward.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": {
@@ -913,7 +913,7 @@
                 "additionalProperties": false,
                 "required": [
                   "kind", "receipt_id", "computer_id", "storage_id", "old_generation",
-				  "new_generation", "node_id", "root_instance_id", "job_id", "intent_revision", "cleanup_fence",
+          "new_generation", "node_id", "root_instance_id", "job_id", "intent_revision", "cleanup_fence",
                   "helper_generation"
                 ],
                 "properties": {
@@ -923,8 +923,8 @@
                   "storage_id": { "type": "string", "minLength": 1 },
                   "old_generation": { "type": "integer", "format": "int64", "minimum": 1 },
                   "new_generation": { "type": "integer", "format": "int64", "minimum": 2 },
-				  "node_id": { "type": "string", "minLength": 1 },
-				  "root_instance_id": { "type": "string", "minLength": 1 },
+          "node_id": { "type": "string", "minLength": 1 },
+          "root_instance_id": { "type": "string", "minLength": 1 },
                   "job_id": { "type": "string", "minLength": 1 },
                   "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
                   "cleanup_fence": { "type": "string", "minLength": 1 },
@@ -936,7 +936,7 @@
         },
         "responses": {
           "200": {
-		  "description": "Successor preparation accepted or identically replayed; the returned stopped Computer has the successor published and predecessor retirement still pending.",
+      "description": "Successor preparation accepted or identically replayed; the returned stopped Computer has the successor published and predecessor retirement still pending.",
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
@@ -945,48 +945,48 @@
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
-	  }
-	}
-	},
-	"/v1/agent/computers/{computer_id}/storage-retirement-acknowledgement": {
-	  "parameters": [
-		{ "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
-	  ],
-	  "post": {
-		"operationId": "acknowledgeComputerStorageRetirement",
-		"summary": "Complete reset after shared predecessor removal",
-		"description": "After authority-bound Computer disk deletion and assertion-derived shared removal attestation, the authenticated current node submits the same cleanup authority shape used by service removal. L1 then completes the reset while leaving the Computer stopped.",
-		"requestBody": {
-		  "required": true,
-		  "content": { "application/json": { "schema": {
-			"type": "object",
-			"additionalProperties": false,
-			"required": ["node_id", "boot_session_id", "removal_generation", "cleanup_fence", "root_instance_id", "idempotency_key"],
-			"properties": {
-			  "node_id": { "type": "string", "minLength": 1 },
-			  "boot_session_id": { "type": "string", "minLength": 1 },
-			  "removal_generation": { "type": "integer", "minimum": 1 },
-			  "cleanup_fence": { "type": "string", "minLength": 1 },
-			  "root_instance_id": { "type": "string", "minLength": 1 },
-			  "idempotency_key": { "type": "string", "minLength": 1 },
-			  "cleanup_quarantine": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageCleanupQuarantine" }
-			}
-		  } } }
-		},
-		"responses": {
-		  "200": {
-			"description": "Predecessor absence accepted or replayed; the returned Computer is stable and stopped.",
-			"content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
-		  },
-		  "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
-		  "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
-		  "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
-		  "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
-		  "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
-		  "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
-		}
-	  }
-	}
+    }
+  }
+  },
+  "/v1/agent/computers/{computer_id}/storage-retirement-acknowledgement": {
+    "parameters": [
+    { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+    ],
+    "post": {
+    "operationId": "acknowledgeComputerStorageRetirement",
+    "summary": "Complete reset after shared predecessor removal",
+    "description": "After authority-bound Computer disk deletion and assertion-derived shared removal attestation, the authenticated current node submits the same cleanup authority shape used by service removal. L1 then completes the reset while leaving the Computer stopped.",
+    "requestBody": {
+      "required": true,
+      "content": { "application/json": { "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id", "boot_session_id", "removal_generation", "cleanup_fence", "root_instance_id", "idempotency_key"],
+      "properties": {
+        "node_id": { "type": "string", "minLength": 1 },
+        "boot_session_id": { "type": "string", "minLength": 1 },
+        "removal_generation": { "type": "integer", "minimum": 1 },
+        "cleanup_fence": { "type": "string", "minLength": 1 },
+        "root_instance_id": { "type": "string", "minLength": 1 },
+        "idempotency_key": { "type": "string", "minLength": 1 },
+        "cleanup_quarantine": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageCleanupQuarantine" }
+      }
+      } } }
+    },
+    "responses": {
+      "200": {
+      "description": "Predecessor absence accepted or replayed; the returned Computer is stable and stopped.",
+      "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
+      },
+      "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
+      "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+      "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+      "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+      "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+      "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+    }
+    }
+  }
   },
   "components": {
     "securitySchemes": {

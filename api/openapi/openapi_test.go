@@ -1,6 +1,7 @@
 package openapi_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -933,6 +934,28 @@ func TestAllOpenAPIFilesAreJSON(t *testing.T) {
 		t.Run(file, func(t *testing.T) {
 			t.Parallel()
 			_ = readObject(t, file)
+		})
+	}
+}
+
+func TestOpenAPIFilesUseSpaceIndentation(t *testing.T) {
+	t.Parallel()
+
+	files, err := filepath.Glob("*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		file := file
+		t.Run(file, func(t *testing.T) {
+			t.Parallel()
+			raw, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.ContainsRune(raw, '\t') {
+				t.Fatalf("%s contains tab indentation; use spaces", file)
+			}
 		})
 	}
 }
