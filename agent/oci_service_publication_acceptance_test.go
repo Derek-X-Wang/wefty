@@ -223,7 +223,10 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	}()
 
 	network := plain.NewNetwork()
-	l1Clock := newManualClock(time.Now())
+	var l1ClockOffset atomic.Int64
+	l1Clock := l1.ClockFunc(func() time.Time {
+		return time.Now().Add(time.Duration(l1ClockOffset.Load()))
+	})
 	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, l1Clock, map[string]l1.NodePolicy{
 		"native-service-node": {Tags: []string{"native-service"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	}, l1.DefaultLeaseDuration)
@@ -334,7 +337,7 @@ while :; do sleep 1; done
 		t.Fatalf("OCI controller stop=%+v err=%v", stopResponse, err)
 	}
 	cancelStop()
-	l1Clock.Advance(l1.DefaultLeaseDuration)
+	l1ClockOffset.Add(int64(l1.DefaultLeaseDuration))
 	// Advancing the configured production lease proves that local OCI intent stop is neither an
 	// execution failure nor a hidden service restart. L1's one-second
 	// background reconciler must record the attempt as lost before this
@@ -373,11 +376,11 @@ while :; do sleep 1; done
 			bindingPinAfter, intentStopped.BoundNodeID, nativeOCIJobDigest(intentStopped), intentStopped.RestartStreak, intentStopped.LifetimeRestartCount, intentStopped.LeaseLossCount, intentStopped.LastFailure, intentStopped.NextRestartAt, err)
 	}
 	// The production lease advance also moves L1 onto its randomized service
-	// restart backoff. Move the injected clock to that exact eligibility point
-	// before re-enabling OCI; otherwise the harness can remain queued forever
-	// even though the wall-clock agent and helper have recovered.
+	// restart backoff. Move the injected offset to that exact eligibility point
+	// before re-enabling OCI; the clock continues to follow wall time from there
+	// so later runtime-loss leases and restart backoffs remain production-like.
 	if restartDelay := intentStopped.NextRestartAt.Sub(l1Clock.Now()); restartDelay > 0 {
-		l1Clock.Advance(restartDelay)
+		l1ClockOffset.Add(int64(restartDelay))
 	}
 	if _, err := lima.SetOCIIntent(t.Context(), intentPath, 2, true, time.Now()); err != nil {
 		t.Fatal(err)
