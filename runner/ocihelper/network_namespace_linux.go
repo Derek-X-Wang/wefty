@@ -5,6 +5,7 @@ package ocihelper
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -132,6 +133,15 @@ type computerNetworkAttachment struct {
 	iptablesPath string
 	probePort    uint16
 	probe        net.Listener
+	dns          *computerDNSProxy
+}
+
+type computerDNSProxy struct {
+	udp       net.PacketConn
+	tcp       net.Listener
+	upstream  string
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func resolveRootOwnedNetworkTool(configured, name string, candidates ...string) (string, error) {
@@ -257,6 +267,16 @@ func setupComputerNetwork(ctx context.Context, namespace *pinnedNetworkNamespace
 	if err != nil {
 		return nil, err
 	}
+	resolverAddress, err := computerResolverAddress("/etc/resolv.conf")
+	if err != nil {
+		return nil, err
+	}
+	if net.ParseIP(resolverAddress).IsLoopback() {
+		attachment.dns, err = startComputerDNSProxy(namespace, net.JoinHostPort(resolverAddress, "53"), net.JoinHostPort(resolverAddress, "53"))
+		if err != nil {
+			return nil, fmt.Errorf("start Computer loopback resolver proxy: %w", err)
+		}
+	}
 	attachment.probe, err = net.Listen("tcp4", net.JoinHostPort(attachment.gateway, strconv.Itoa(int(port))))
 	if err != nil {
 		return nil, fmt.Errorf("listen on Computer egress probe: %w", err)
@@ -267,6 +287,145 @@ func setupComputerNetwork(ctx context.Context, namespace *pinnedNetworkNamespace
 	}
 	go serveComputerEgressProbe(attachment.probe)
 	return attachment, nil
+}
+
+func computerResolverAddress(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open Computer resolver configuration: %w", err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 || fields[0] != "nameserver" {
+			continue
+		}
+		address := net.ParseIP(fields[1])
+		if address == nil || address.To4() == nil {
+			continue
+		}
+		return address.String(), nil
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read Computer resolver configuration: %w", err)
+	}
+	return "", errors.New("Computer resolver configuration has no IPv4 nameserver")
+}
+
+func startComputerDNSProxy(namespace *pinnedNetworkNamespace, listenAddress, upstreamAddress string) (_ *computerDNSProxy, err error) {
+	if namespace == nil || listenAddress == "" || upstreamAddress == "" {
+		return nil, errors.New("Computer DNS proxy requires namespace, listener, and upstream")
+	}
+	proxy := &computerDNSProxy{upstream: upstreamAddress}
+	defer func() {
+		if err != nil {
+			_ = proxy.close()
+		}
+	}()
+	err = inNetworkNamespace(namespace, func() error {
+		var listenErr error
+		proxy.udp, listenErr = net.ListenPacket("udp4", listenAddress)
+		if listenErr != nil {
+			return listenErr
+		}
+		proxy.tcp, listenErr = net.Listen("tcp4", listenAddress)
+		return listenErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	go proxy.serveUDP()
+	go proxy.serveTCP()
+	return proxy, nil
+}
+
+func (proxy *computerDNSProxy) serveUDP() {
+	listener := proxy.udp
+	buffer := make([]byte, 65535)
+	for {
+		length, client, err := listener.ReadFrom(buffer)
+		if err != nil {
+			return
+		}
+		upstream, err := net.DialTimeout("udp4", proxy.upstream, 2*time.Second)
+		if err != nil {
+			continue
+		}
+		_ = upstream.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := upstream.Write(buffer[:length]); err != nil {
+			_ = upstream.Close()
+			continue
+		}
+		response := make([]byte, 65535)
+		length, err = upstream.Read(response)
+		_ = upstream.Close()
+		if err == nil {
+			_, _ = listener.WriteTo(response[:length], client)
+		}
+	}
+}
+
+func (proxy *computerDNSProxy) serveTCP() {
+	listener := proxy.tcp
+	for {
+		client, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		_ = proxy.forwardTCP(client)
+		_ = client.Close()
+	}
+}
+
+func (proxy *computerDNSProxy) forwardTCP(client net.Conn) error {
+	upstream, err := net.DialTimeout("tcp4", proxy.upstream, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer upstream.Close()
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = upstream.SetDeadline(time.Now().Add(5 * time.Second))
+	for {
+		header := make([]byte, 2)
+		if _, err := io.ReadFull(client, header); err != nil {
+			return err
+		}
+		query := make([]byte, int(binary.BigEndian.Uint16(header)))
+		if _, err := io.ReadFull(client, query); err != nil {
+			return err
+		}
+		if _, err := upstream.Write(append(header, query...)); err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(upstream, header); err != nil {
+			return err
+		}
+		response := make([]byte, int(binary.BigEndian.Uint16(header)))
+		if _, err := io.ReadFull(upstream, response); err != nil {
+			return err
+		}
+		if _, err := client.Write(append(header, response...)); err != nil {
+			return err
+		}
+	}
+}
+
+func (proxy *computerDNSProxy) close() error {
+	if proxy == nil {
+		return nil
+	}
+	proxy.closeOnce.Do(func() {
+		var errs []error
+		if proxy.udp != nil {
+			errs = append(errs, proxy.udp.Close())
+		}
+		if proxy.tcp != nil {
+			errs = append(errs, proxy.tcp.Close())
+		}
+		proxy.closeErr = errors.Join(errs...)
+	})
+	return proxy.closeErr
 }
 
 func serveComputerEgressProbe(listener net.Listener) {
@@ -288,6 +447,10 @@ func (attachment *computerNetworkAttachment) close() error {
 	if attachment.probe != nil {
 		_ = attachment.probe.Close()
 		attachment.probe = nil
+	}
+	if attachment.dns != nil {
+		_ = attachment.dns.close()
+		attachment.dns = nil
 	}
 	if attachment.iptablesPath != "" && attachment.probePort != 0 {
 		arguments := []string{"-w", "5", "-D", computerFirewallInput, "-i", attachment.hostLink, "-d", attachment.gateway, "-p", "tcp", "--dport", strconv.Itoa(int(attachment.probePort)), "-j", "ACCEPT"}

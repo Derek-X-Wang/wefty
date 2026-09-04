@@ -5,10 +5,13 @@ package ocihelper
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -122,6 +125,105 @@ func TestPinnedNamespaceObservesOwningThreadLoopbackListener(t *testing.T) {
 	}
 	if !found || inode == "" {
 		t.Fatalf("pinned namespace listener port %d was not observed from the owning thread", port)
+	}
+}
+
+func TestComputerDNSProxyForwardsLoopbackResolver(t *testing.T) {
+	requireRootNetworkNamespaceTest(t)
+	command := startIsolatedNetworkTask(t)
+	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.close()
+	upstream, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	port := upstream.LocalAddr().(*net.UDPAddr).Port
+	tcpUpstream, err := net.Listen("tcp4", upstream.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpUpstream.Close()
+	proxy, err := startComputerDNSProxy(namespace, net.JoinHostPort("127.0.0.53", strconv.Itoa(port)), upstream.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.close()
+	go func() {
+		buffer := make([]byte, 512)
+		length, client, readErr := upstream.ReadFrom(buffer)
+		if readErr == nil {
+			_, _ = upstream.WriteTo(append([]byte("reply:"), buffer[:length]...), client)
+		}
+	}()
+	go func() {
+		connection, acceptErr := tcpUpstream.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		header := make([]byte, 2)
+		if _, readErr := io.ReadFull(connection, header); readErr != nil {
+			return
+		}
+		query := make([]byte, int(binary.BigEndian.Uint16(header)))
+		if _, readErr := io.ReadFull(connection, query); readErr == nil {
+			response := append([]byte("reply:"), query...)
+			binary.BigEndian.PutUint16(header, uint16(len(response)))
+			_, _ = connection.Write(append(header, response...))
+		}
+	}()
+	var response string
+	err = inNetworkNamespace(namespace, func() error {
+		connection, dialErr := net.DialTimeout("udp4", net.JoinHostPort("127.0.0.53", strconv.Itoa(port)), time.Second)
+		if dialErr != nil {
+			return dialErr
+		}
+		defer connection.Close()
+		_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, writeErr := connection.Write([]byte("query")); writeErr != nil {
+			return writeErr
+		}
+		buffer := make([]byte, 512)
+		length, readErr := connection.Read(buffer)
+		response = string(buffer[:length])
+		return readErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response != "reply:query" {
+		t.Fatalf("Computer DNS proxy response = %q", response)
+	}
+	err = inNetworkNamespace(namespace, func() error {
+		connection, dialErr := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.53", strconv.Itoa(port)), time.Second)
+		if dialErr != nil {
+			return dialErr
+		}
+		defer connection.Close()
+		_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
+		header := []byte{0, 5}
+		if _, writeErr := connection.Write(append(header, []byte("query")...)); writeErr != nil {
+			return writeErr
+		}
+		if _, readErr := io.ReadFull(connection, header); readErr != nil {
+			return readErr
+		}
+		payload := make([]byte, int(binary.BigEndian.Uint16(header)))
+		if _, readErr := io.ReadFull(connection, payload); readErr != nil {
+			return readErr
+		}
+		response = string(payload)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response != "reply:query" {
+		t.Fatalf("Computer TCP DNS proxy response = %q", response)
 	}
 }
 

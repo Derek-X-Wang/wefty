@@ -75,7 +75,10 @@ and record the refusal through receipts.
 - #282 pulls the private-network tier from #109 forward for Computers without
   retracting #109's `outbound open` decision. Computer-to-Computer veth traffic,
   Computer-to-Node listeners, and unsolicited inbound are rejected; external
-  egress is routed and masqueraded. Ordinary OCI remains on shared networking.
+  egress is routed and masqueraded. A helper DNS proxy inside the Computer
+  namespace preserves a Node-loopback resolver without exposing that or any
+  other Node listener; routable resolvers use the veth. Ordinary OCI remains on
+  shared networking.
 - Runtime isolation evidence is observed after `task.Start`: the helper records
   both namespace inodes and scans its own `/proc/net/unix` for the exact X token.
   Serialized-profile inference cannot earn the doctor verdict.

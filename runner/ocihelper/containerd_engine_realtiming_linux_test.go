@@ -1490,6 +1490,7 @@ func exerciseNativeLinuxComputerCapacity(t *testing.T, ctx context.Context, barr
 		}
 		return ocihelper.RunRequest{
 			Authority: authority, InitialDeadman: l1.DefaultLeaseDuration, AllocateEndpoints: []string{"view", "control"},
+			EnableHostBridgeFallback: true, ActivateHostBridgeFallback: true,
 			Workload: ocihelper.WorkloadInput{ImageReference: reference, ImageDigest: digest, Computer: true,
 				Argv: []string{"/bin/sh", "-c", `
 WEFTY_SERVICE_PORT="$WEFTY_COMPUTER_VIEW_PORT" /usr/local/bin/wefty-echo-service &
@@ -1592,7 +1593,7 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 		authority.Class = contract.JobClassService
 		return ocihelper.RunRequest{
 			Authority: authority, InitialDeadman: l1.DefaultLeaseDuration,
-			AllocateEndpoints: []string{"view", "control"},
+			AllocateEndpoints: []string{"view", "control"}, EnableHostBridgeFallback: true, ActivateHostBridgeFallback: true,
 			Workload: ocihelper.WorkloadInput{
 				ImageReference: reference, ImageDigest: digest, Computer: true, Argv: argv,
 				Limits:         ocihelper.WorkloadLimits{MemoryBytes: 64 << 20},
