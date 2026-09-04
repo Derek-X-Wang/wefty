@@ -201,15 +201,16 @@ type BootBarrier struct {
 	request AcquireSessionRequest
 	config  BootBarrierConfig
 
-	ensureMu       sync.Mutex
-	mu             sync.RWMutex
-	session        *Session
-	prepared       bool
-	receipt        VerifiedSweepReceipt
-	loss           func(HelperSession, error)
-	reason         contract.CapabilityReasonCode
-	stalledWindows uint64
-	lastLossAt     time.Time
+	ensureMu        sync.Mutex
+	mu              sync.RWMutex
+	session         *Session
+	prepared        bool
+	receipt         VerifiedSweepReceipt
+	lastLossReceipt VerifiedSweepReceipt
+	loss            func(HelperSession, error)
+	reason          contract.CapabilityReasonCode
+	stalledWindows  uint64
+	lastLossAt      time.Time
 }
 
 func NewBootBarrier(client *Client, request AcquireSessionRequest) (*BootBarrier, error) {
@@ -265,6 +266,22 @@ func (barrier *BootBarrier) SweepReceipt() (VerifiedSweepReceipt, bool) {
 		return VerifiedSweepReceipt{}, false
 	}
 	return cloneVerifiedSweepReceipt(barrier.receipt), true
+}
+
+// LastLossSweepReceipt returns the latest successful sweep whose acquisition
+// began after this barrier observed a helper-session loss. It survives later
+// explicit acquisitions so incident evidence cannot be overwritten by a
+// follow-up capability refresh.
+func (barrier *BootBarrier) LastLossSweepReceipt() (VerifiedSweepReceipt, bool) {
+	if barrier == nil {
+		return VerifiedSweepReceipt{}, false
+	}
+	barrier.mu.RLock()
+	defer barrier.mu.RUnlock()
+	if barrier.lastLossReceipt.BarrierTimeline.HelperLossObservedAt.IsZero() {
+		return VerifiedSweepReceipt{}, false
+	}
+	return cloneVerifiedSweepReceipt(barrier.lastLossReceipt), true
 }
 
 // ExecutionSnapshot atomically captures the session and the sweep receipt
@@ -385,6 +402,9 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 	barrier.session = session
 	barrier.prepared = true
 	barrier.receipt = receipt
+	if !lossObservedAt.IsZero() {
+		barrier.lastLossReceipt = cloneVerifiedSweepReceipt(receipt)
+	}
 	if barrier.lastLossAt.Equal(lossObservedAt) {
 		barrier.lastLossAt = time.Time{}
 	}

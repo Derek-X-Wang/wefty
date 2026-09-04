@@ -1570,6 +1570,44 @@ func TestBootBarrierHandshakeElapsedBelongsToAdmittedConnection(t *testing.T) {
 	}
 }
 
+func TestBootBarrierRetainsLastLossRecoveryReceiptAcrossLaterAcquisition(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	barrier, err := NewBootBarrier(client, testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer barrier.Close()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	initialSession, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialReceipt, ok := barrier.SweepReceipt()
+	if !ok {
+		t.Fatal("initial barrier receipt is unavailable")
+	}
+	barrier.sessionLost(initialSession, initialReceipt.HelperSession, io.EOF)
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	lossReceipt, ok := barrier.LastLossSweepReceipt()
+	if !ok || lossReceipt.BarrierTimeline.HelperLossObservedAt.IsZero() || lossReceipt.HelperSession == initialReceipt.HelperSession {
+		t.Fatalf("loss recovery receipt = %+v present=%t initial=%+v", lossReceipt, ok, initialReceipt.HelperSession)
+	}
+	barrier.Invalidate()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	retained, ok := barrier.LastLossSweepReceipt()
+	if !ok || retained.HelperSession != lossReceipt.HelperSession || retained.BarrierTimeline.HelperLossObservedAt != lossReceipt.BarrierTimeline.HelperLossObservedAt {
+		t.Fatalf("later acquisition replaced loss recovery evidence: got=%+v present=%t want=%+v", retained, ok, lossReceipt)
+	}
+}
+
 func TestServerAndBootBarrierRefuseInconsistentResidueClassification(t *testing.T) {
 	for _, verification := range []VerifyResponse{
 		{Absent: true, Inventory: ResourceInventory{ComputerDiskAnomalies: []string{"disk:allocation_mismatch"}}, RuntimeResidue: ResourceInventory{ComputerDiskAnomalies: []string{"disk:allocation_mismatch"}}},

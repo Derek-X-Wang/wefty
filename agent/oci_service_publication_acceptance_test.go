@@ -223,11 +223,7 @@ func TestOCIServiceRestartStopStartThroughL1Agent(t *testing.T) {
 	}()
 
 	network := plain.NewNetwork()
-	var l1ClockOffset atomic.Int64
-	l1Clock := l1.ClockFunc(func() time.Time {
-		return time.Now().Add(time.Duration(l1ClockOffset.Load()))
-	})
-	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, l1Clock, map[string]l1.NodePolicy{
+	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{
 		"native-service-node": {Tags: []string{"native-service"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
 	}, l1.DefaultLeaseDuration)
 	defer stopServer()
@@ -337,12 +333,11 @@ while :; do sleep 1; done
 		t.Fatalf("OCI controller stop=%+v err=%v", stopResponse, err)
 	}
 	cancelStop()
-	l1ClockOffset.Add(int64(l1.DefaultLeaseDuration))
-	// Advancing the configured production lease proves that local OCI intent stop is neither an
+	// The real production lease proves that local OCI intent stop is neither an
 	// execution failure nor a hidden service restart. L1's one-second
 	// background reconciler must record the attempt as lost before this
 	// second, idempotent pass reports no duplicate transition.
-	intentStopped := waitNativeServiceState(t, store, primary.JobID, contract.JobQueued, 5*time.Second)
+	intentStopped := waitNativeServiceState(t, store, primary.JobID, contract.JobQueued, l1.DefaultLeaseDuration+5*time.Second)
 	if result, err := store.Reconcile(t.Context()); err != nil || result.ExpiredAttempts != 0 {
 		t.Fatalf("post-intent-stop idempotent reconciliation=%+v err=%v", result, err)
 	}
@@ -374,13 +369,6 @@ while :; do sleep 1; done
 		t.Fatalf("intent stop changed service binding/failure budget: before={binding_pin:%t BoundNodeID:%q digest:%q RestartStreak:%d LifetimeRestartCount:%d LeaseLossCount:%d LastFailure:%s NextRestartAt:%v} after={binding_pin:%t BoundNodeID:%q digest:%q RestartStreak:%d LifetimeRestartCount:%d LeaseLossCount:%d LastFailure:%s NextRestartAt:%v} pins_err=%v",
 			bindingPinBefore, firstRunning.BoundNodeID, nativeOCIJobDigest(firstRunning), firstRunning.RestartStreak, firstRunning.LifetimeRestartCount, firstRunning.LeaseLossCount, firstRunning.LastFailure, firstRunning.NextRestartAt,
 			bindingPinAfter, intentStopped.BoundNodeID, nativeOCIJobDigest(intentStopped), intentStopped.RestartStreak, intentStopped.LifetimeRestartCount, intentStopped.LeaseLossCount, intentStopped.LastFailure, intentStopped.NextRestartAt, err)
-	}
-	// The production lease advance also moves L1 onto its randomized service
-	// restart backoff. Move the injected offset to that exact eligibility point
-	// before re-enabling OCI; the clock continues to follow wall time from there
-	// so later runtime-loss leases and restart backoffs remain production-like.
-	if restartDelay := intentStopped.NextRestartAt.Sub(l1Clock.Now()); restartDelay > 0 {
-		l1ClockOffset.Add(int64(restartDelay))
 	}
 	if _, err := lima.SetOCIIntent(t.Context(), intentPath, 2, true, time.Now()); err != nil {
 		t.Fatal(err)
@@ -419,6 +407,9 @@ while :; do sleep 1; done
 	serviceRecoveryElapsed = time.Since(recoveryStarted)
 	newGeneration, ready := barrier.Generation()
 	sweepReceipt, sweepReceiptOK := barrier.SweepReceipt()
+	if runtime.GOOS == "linux" {
+		sweepReceipt, sweepReceiptOK = barrier.LastLossSweepReceipt()
+	}
 	retainedIdentity, retainedIdentityErr := ocihelper.DeterministicResourceIdentity(ocirunner.HelperAuthority(firstAuthority))
 	serviceResidueVerifiedAbsent = sweepReceiptOK && sweepReceipt.VerifiedAbsent && ocihelper.InventoryEmpty(sweepReceipt.VerifiedResidue)
 	serviceBarrierTimeline = sweepReceipt.BarrierTimeline
@@ -458,7 +449,7 @@ while :; do sleep 1; done
 		serviceBarrierTimeline.VerifiedReadyElapsed < serviceBarrierTimeline.SessionAdmissionElapsed || serviceBarrierTimeline.VerifiedReadyElapsed > serviceBarrierTimeline.VerifiedReadyBound {
 		t.Fatalf("runtime-loss barrier timeline is incomplete or outside its derived bound: %+v", serviceBarrierTimeline)
 	}
-	if runtime.GOOS == "linux" && (serviceBarrierTimeline.HelperLossObservedAt.IsZero() || !serviceBarrierTimeline.PrefacedDuringStartup) {
+	if runtime.GOOS == "linux" && (serviceBarrierTimeline.HelperLossObservedAt.Before(recoveryStarted) || !serviceBarrierTimeline.PrefacedDuringStartup) {
 		t.Fatalf("runtime-loss barrier did not naturally observe helper loss and preface startup: %+v", serviceBarrierTimeline)
 	}
 	newAuthority := authorities.wait(t, readmitted.CurrentAttemptID, 5*time.Second)
@@ -472,7 +463,7 @@ while :; do sleep 1; done
 		t.Fatalf("attempt %s did not retain typed runtime-loss evidence within production lease %s: l1=%+v outbox=%+v agent_status=%+v capability=%+v old_generation=%+v new_generation=%+v sweep=%+v",
 			firstAttempt, l1.DefaultLeaseDuration, stale, staleOutbox, nodeAgent.Status(), nodeAgent.CapabilitySnapshot(), oldGeneration, newGeneration, sweepReceipt)
 	}
-	serviceFreshAttemptReadmission = ready && newGeneration != oldGeneration &&
+	serviceFreshAttemptReadmission = ready && newGeneration != oldGeneration && sweepReceipt.HelperSession == newGeneration &&
 		readmitted.CurrentAttemptID != firstAttempt && newAuthority.FencingToken != firstAuthority.FencingToken &&
 		serviceFreshAttemptAdmissionElapsed <= serviceFreshAttemptAdmissionBound &&
 		serviceKillToFreshAttemptAdmissionElapsed <= serviceFreshAttemptAdmissionBound &&
