@@ -11,7 +11,9 @@ regardless of owner. A Computer may reach only:
 - its orchestrator channel: the helper-reserved `view` and `control`
   endpoints, plus the agent directive channel;
 - its own Storage; and
-- its own screen.
+- its own screen; and
+- outbound networks through the Node or Lima VM, as retained from the
+  [#109 networking ruling](https://github.com/Derek-X-Wang/wefty/issues/109#issuecomment-5376866417).
 
 A Computer may not reach any neighbour's screen, sockets, processes, or
 files. An attempted **crossover** must be refused; avoiding accidental name
@@ -20,7 +22,8 @@ collisions is not isolation.
 The boundary is a product invariant, while enforcement is delivered one
 mechanism at a time. The shared Node network namespace is the known gap at
 the time of this decision. Screen isolation is the first mechanism: each
-Computer receives a private network namespace, and the helper enters only
+Computer receives a private network namespace and point-to-point veth with
+masqueraded outbound access, and the helper enters only
 that namespace when bridging the Computer's authority-bound named display
 endpoints. Acceptance must attempt a real cross-Computer screen connection
 and record the refusal through receipts.
@@ -69,3 +72,10 @@ and record the refusal through receipts.
 - Acceptance evidence must be assertion-derived: the attempted peer socket
   address, display identity, and typed refusal outcome are recorded. A row
   that merely proves distinct names does not satisfy the decision.
+- #282 pulls the private-network tier from #109 forward for Computers without
+  retracting #109's `outbound open` decision. Computer-to-Computer veth traffic,
+  Computer-to-Node listeners, and unsolicited inbound are rejected; external
+  egress is routed and masqueraded. Ordinary OCI remains on shared networking.
+- Runtime isolation evidence is observed after `task.Start`: the helper records
+  both namespace inodes and scans its own `/proc/net/unix` for the exact X token.
+  Serialized-profile inference cannot earn the doctor verdict.

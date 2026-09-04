@@ -282,10 +282,8 @@ func BuildRuntimeSpec(ctx context.Context, input RuntimeSpecInput) (*RuntimeSpec
 	}
 	receipt := profileReceipt(input.Workload)
 	if input.Workload.Computer {
-		receipt.NetworkNamespacePresent = slices.ContainsFunc(spec.Linux.Namespaces, func(namespace specs.LinuxNamespace) bool {
-			return namespace.Type == specs.NetworkNamespace
-		})
-		receipt.HostAbstractSocketVisible = !receipt.NetworkNamespacePresent
+		// Kernel observations after task.Start fill the namespace and socket
+		// fields. The serialized profile cannot earn runtime isolation evidence.
 	}
 	return &RuntimeSpecDocument{payload: payload, mounts: retained, ownerUID: spec.Process.User.UID, ownerGID: spec.Process.User.GID, profile: receipt}, nil
 }

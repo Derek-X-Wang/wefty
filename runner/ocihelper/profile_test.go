@@ -283,6 +283,9 @@ func TestComputerProfileReceiptExposesTmpfsCeilingsWithoutAdmissionRejection(t *
 	if receipt.ComputerTmpfsCeilingBytes != 1600<<20 || receipt.LargestTmpfsTarget != "/dev/shm" || receipt.LargestTmpfsCeilingBytes != 1<<30 {
 		t.Fatalf("Computer profile receipt = %+v", receipt)
 	}
+	if receipt.NetworkNamespacePresent || receipt.HelperNetworkNamespaceInode != "" || receipt.TaskNetworkNamespaceInode != "" || receipt.HostAbstractSocketVisible {
+		t.Fatalf("serialized profile inferred runtime isolation facts: %+v", receipt)
+	}
 	if len(receipt.Warnings) != 2 || receipt.Warnings[0].Code != ProfileWarningTmpfsCeilingExceedsMemory || receipt.Warnings[1].Code != ProfileWarningTmpfsCombinedExceedsMemory {
 		t.Fatalf("typed profile warnings = %+v", receipt.Warnings)
 	}

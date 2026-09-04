@@ -2026,7 +2026,7 @@ func TestAttemptEndpointOwnershipRejectsWildcardListener(t *testing.T) {
 	}
 	defer wildcard.Close()
 	port := uint16(wildcard.Addr().(*net.TCPAddr).Port)
-	if inode, found, err := loopbackListenInode(0, port); err != nil || found || inode != "" {
+	if inode, found, err := loopbackListenInode(nil, port); err != nil || found || inode != "" {
 		t.Fatalf("wildcard listener was accepted as loopback ownership: inode=%q found=%t err=%v", inode, found, err)
 	}
 }
@@ -2122,7 +2122,7 @@ func TestAttemptPortRejectsAdversarialBindOutsidePayloadCgroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	engine := &ContainerdEngine{config: NativeEngineConfig{CgroupRoot: cgroupRoot}}
-	err = engine.waitAttemptPortOwnership(t.Context(), cgroupID, 0, port)
+	err = engine.waitAttemptPortOwnership(t.Context(), cgroupID, nil, port)
 	if err == nil || !strings.Contains(err.Error(), "outside the attempt cgroup") {
 		t.Fatalf("adversarial bind error = %v", err)
 	}
@@ -2152,7 +2152,7 @@ func TestAttemptPortAcceptsListenerInNestedPayloadCgroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	engine := &ContainerdEngine{config: NativeEngineConfig{CgroupRoot: cgroupRoot}}
-	if err := engine.waitAttemptPortOwnership(t.Context(), cgroupID, 0, port); err != nil {
+	if err := engine.waitAttemptPortOwnership(t.Context(), cgroupID, nil, port); err != nil {
 		t.Fatalf("nested payload listener ownership: %v", err)
 	}
 }

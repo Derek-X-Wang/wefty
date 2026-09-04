@@ -49,7 +49,9 @@ browser sandbox exception, font, locale, or D-Bus policy. Image labels,
 Every Computer is isolated from every other Computer on the same Node,
 regardless of owner. A Computer may reach its orchestrator channel -- the
 helper-reserved `view` and `control` endpoints and the agent directive channel
--- its own Storage, and its own screen. It may not reach any neighbour's
+-- its own Storage, its own screen, and outbound networks through the Node.
+Outbound stays open under the #109 profile ruling; the Fabric front door
+remains the only supported inbound path. A Computer may not reach any neighbour's
 screen, sockets, processes, or files. A real attempt to cross that boundary
 must be refused; distinct names or the absence of an accidental collision are
 not proof of isolation.
@@ -232,10 +234,26 @@ but its abstract `@/tmp/.X11-unix/X<n>` socket exists only in that Computer's
 private network namespace: a neighbour can neither enumerate nor connect to it.
 The Wayland compositor socket remains inside the Computer's private mount
 namespace, and both variants bind their RFB servers only to private loopback.
+The filesystem X socket under the attempt-private `/tmp/.X11-unix` is private
+by mount namespace; the abstract socket is private by network namespace.
 For `view`, `control`, and the agent's Computer submission bridge, the helper
 enters only the exact live Computer's network namespace and exposes the existing
 attempt-authority-bound stream; the Computer receives no new capability or
 privilege.
+
+The helper attaches one point-to-point `/30` veth to the private namespace,
+installs a default route, retains the helper-managed resolver and hosts mounts,
+and masquerades outbound traffic through the Node or Lima VM. Firewall policy
+rejects veth-to-veth forwarding, unsolicited traffic toward a Computer veth,
+and every Computer-originated Node-local listener except the exact helper-owned
+egress proof endpoint. That endpoint is bound only to the attempt's
+gateway/interface tuple and returns no tenant or Node data. The authority-bound
+view, control, and directive paths remain private loopback bridges. Ordinary OCI
+jobs keep shared networking unchanged.
+
+Computer submission uses the helper reverse bridge as its only transport on
+every platform. Exactly four bridge pumps may be active per Computer attempt;
+additional guest connections wait behind that fixed concurrency bound.
 
 This screen mechanism does not by itself prove the complete isolation boundary.
 Other neighbour socket surfaces, process interactions, and file paths retain

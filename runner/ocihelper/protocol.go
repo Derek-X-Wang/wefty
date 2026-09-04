@@ -680,17 +680,21 @@ type ProfileWarning struct {
 // to containerd. ComputerTmpfsCeilingBytes covers /dev/shm, /tmp, and
 // /var/tmp; ordinary baseline tmpfs mounts remain outside that product delta.
 type ProfileReceipt struct {
-	Computer                  bool             `json:"computer"`
-	NetworkNamespacePresent   bool             `json:"network_namespace_present"`
-	HostAbstractSocketVisible bool             `json:"host_abstract_socket_visible"`
-	MemoryLimitBytes          int64            `json:"memory_limit_bytes"`
-	MemoryMaxBytes            int64            `json:"memory_max_bytes"`
-	MemoryOOMGroup            bool             `json:"memory_oom_group"`
-	MemorySwapMaxBytes        int64            `json:"memory_swap_max_bytes"`
-	ComputerTmpfsCeilingBytes int64            `json:"computer_tmpfs_ceiling_bytes"`
-	LargestTmpfsTarget        string           `json:"largest_tmpfs_target,omitempty"`
-	LargestTmpfsCeilingBytes  int64            `json:"largest_tmpfs_ceiling_bytes"`
-	Warnings                  []ProfileWarning `json:"warnings"`
+	Computer                    bool             `json:"computer"`
+	NetworkNamespacePresent     bool             `json:"network_namespace_present"`
+	HelperNetworkNamespaceInode string           `json:"helper_network_namespace_inode,omitempty"`
+	TaskNetworkNamespaceInode   string           `json:"task_network_namespace_inode,omitempty"`
+	HostAbstractSocketVisible   bool             `json:"host_abstract_socket_visible"`
+	ComputerNetworkAddress      string           `json:"computer_network_address,omitempty"`
+	ComputerNetworkGateway      string           `json:"computer_network_gateway,omitempty"`
+	MemoryLimitBytes            int64            `json:"memory_limit_bytes"`
+	MemoryMaxBytes              int64            `json:"memory_max_bytes"`
+	MemoryOOMGroup              bool             `json:"memory_oom_group"`
+	MemorySwapMaxBytes          int64            `json:"memory_swap_max_bytes"`
+	ComputerTmpfsCeilingBytes   int64            `json:"computer_tmpfs_ceiling_bytes"`
+	LargestTmpfsTarget          string           `json:"largest_tmpfs_target,omitempty"`
+	LargestTmpfsCeilingBytes    int64            `json:"largest_tmpfs_ceiling_bytes"`
+	Warnings                    []ProfileWarning `json:"warnings"`
 }
 
 // ImageEvidence is produced from the local immutable image selected by the

@@ -153,9 +153,13 @@ type ProfileDoctorFacts struct {
 }
 
 type ComputerScreenIsolationDoctorFacts struct {
-	Outcome                   DiagnosticOutcome `json:"outcome"`
-	NetworkNamespacePresent   bool              `json:"network_namespace_present"`
-	HostAbstractSocketVisible bool              `json:"host_abstract_socket_visible"`
+	Outcome                     DiagnosticOutcome `json:"outcome"`
+	NetworkNamespacePresent     bool              `json:"network_namespace_present"`
+	HelperNetworkNamespaceInode string            `json:"helper_network_namespace_inode,omitempty"`
+	TaskNetworkNamespaceInode   string            `json:"task_network_namespace_inode,omitempty"`
+	HostAbstractSocketVisible   bool              `json:"host_abstract_socket_visible"`
+	ComputerNetworkAddress      string            `json:"computer_network_address,omitempty"`
+	ComputerNetworkGateway      string            `json:"computer_network_gateway,omitempty"`
 }
 
 type ConvergenceDoctorFacts struct {
@@ -638,17 +642,23 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 		}
 		report.Findings = append(report.Findings, finding("profile-ceilings", diagnosticReceipt{ran: true, passed: true, code: code, severity: severity, detail: detail}))
 		if profile.Computer {
-			enforced := profile.NetworkNamespacePresent && !profile.HostAbstractSocketVisible
+			enforced := profile.NetworkNamespacePresent && profile.HelperNetworkNamespaceInode != "" && profile.TaskNetworkNamespaceInode != "" &&
+				profile.HelperNetworkNamespaceInode != profile.TaskNetworkNamespaceInode && !profile.HostAbstractSocketVisible &&
+				profile.ComputerNetworkAddress != "" && profile.ComputerNetworkGateway != "" && profile.ComputerNetworkAddress != profile.ComputerNetworkGateway
 			report.ComputerScreenIsolation = ComputerScreenIsolationDoctorFacts{
-				Outcome:                   outcomeFor(true, enforced),
-				NetworkNamespacePresent:   profile.NetworkNamespacePresent,
-				HostAbstractSocketVisible: profile.HostAbstractSocketVisible,
+				Outcome:                     outcomeFor(true, enforced),
+				NetworkNamespacePresent:     profile.NetworkNamespacePresent,
+				HelperNetworkNamespaceInode: profile.HelperNetworkNamespaceInode,
+				TaskNetworkNamespaceInode:   profile.TaskNetworkNamespaceInode,
+				HostAbstractSocketVisible:   profile.HostAbstractSocketVisible,
+				ComputerNetworkAddress:      profile.ComputerNetworkAddress,
+				ComputerNetworkGateway:      profile.ComputerNetworkGateway,
 			}
 			isolationCode := "oci_computer_screen_isolation_enforced"
 			if !enforced {
 				isolationCode = "oci_computer_screen_isolation_not_enforced"
 			}
-			report.Findings = append(report.Findings, finding("computer-screen-isolation", diagnosticReceipt{ran: true, passed: enforced, code: isolationCode, detail: "the last assertion-derived Computer profile receipt proves a private network namespace and no host-visible abstract X11 socket"}))
+			report.Findings = append(report.Findings, finding("computer-screen-isolation", diagnosticReceipt{ran: true, passed: enforced, code: isolationCode, detail: "the last post-start Computer observation compares helper/task network namespace inodes and scans the helper namespace for the exact abstract X11 socket"}))
 		} else {
 			report.Findings = append(report.Findings, finding("computer-screen-isolation", diagnosticReceipt{code: "oci_computer_screen_isolation_not_recorded", notRunCause: NotRunNoProbeReceipt, detail: "the last completed runtime profile receipt was not for a Computer"}))
 		}
@@ -1056,7 +1066,7 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		fmt.Sprintf("RUNTIMES\t%s containerd=%s runc=%s runc_source=%s outside_tested_range=%t", report.Versions.Outcome, report.Versions.Containerd, report.Versions.Runc, report.Versions.RuncSource, report.Versions.OutsideTestedRange),
 		fmt.Sprintf("CACHE\t%s bytes=%d cap=%d within_bound=%t last_eviction=%s", report.Cache.Outcome, report.Cache.Bytes, report.Cache.CapBytes, report.Cache.WithinBound, lastEviction),
 		fmt.Sprintf("PROFILE\t%s memory_limit=%d memory_max=%d memory_oom_group=%t memory_swap_max=%d computer_tmpfs_ceiling=%d largest_tmpfs_ceiling=%d warnings=%d", report.Profile.Outcome, report.Profile.MemoryLimitBytes, report.Profile.MemoryMaxBytes, report.Profile.MemoryOOMGroup, report.Profile.MemorySwapMaxBytes, report.Profile.ComputerTmpfsCeilingBytes, report.Profile.LargestTmpfsCeilingBytes, len(report.Profile.Warnings)),
-		fmt.Sprintf("SCREEN ISOLATION\t%s network_namespace_present=%t host_abstract_socket_visible=%t", report.ComputerScreenIsolation.Outcome, report.ComputerScreenIsolation.NetworkNamespacePresent, report.ComputerScreenIsolation.HostAbstractSocketVisible),
+		fmt.Sprintf("SCREEN ISOLATION\t%s network_namespace_present=%t helper_inode=%s task_inode=%s host_abstract_socket_visible=%t address=%s gateway=%s", report.ComputerScreenIsolation.Outcome, report.ComputerScreenIsolation.NetworkNamespacePresent, report.ComputerScreenIsolation.HelperNetworkNamespaceInode, report.ComputerScreenIsolation.TaskNetworkNamespaceInode, report.ComputerScreenIsolation.HostAbstractSocketVisible, report.ComputerScreenIsolation.ComputerNetworkAddress, report.ComputerScreenIsolation.ComputerNetworkGateway),
 		fmt.Sprintf("MOUNTS\t%s roots=%s", report.Mounts.Outcome, strings.Join(report.Mounts.AllowedRoots, ",")),
 		fmt.Sprintf("CONVERGENCE\t%s class=%s current={%s} desired={%s}", report.Convergence.Outcome, report.Convergence.Class, convergenceState, desiredConvergenceState),
 	}

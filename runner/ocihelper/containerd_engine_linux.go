@@ -3,7 +3,6 @@
 package ocihelper
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -53,35 +52,36 @@ import (
 )
 
 type containerdAttempt struct {
-	authority           AttemptAuthority
-	resources           ResourceIdentity
-	computerDisk        *computerDiskAttachment
-	container           containerd.Container
-	task                containerd.Task
-	signaler            containerdTaskSignaler
-	releaseTask         func(context.Context) error
-	terminalReady       chan struct{}
-	terminalCode        uint32
-	terminalErr         error
-	stdout              string
-	stderr              string
-	oom                 bool
-	oomCancel           context.CancelFunc
-	cancel              context.CancelFunc
-	signal              Signal
-	signalCause         string
-	deleted             bool
-	logAcknowledged     map[string]uint64
-	hostBridge          net.Listener
-	endpoints           map[string]uint16
-	endpointHolds       map[string]net.Listener
-	controlDirectory    string
-	computerUID         uint32
-	computerGID         uint32
-	networkNamespacePID uint32
-	controlMu           sync.Mutex
-	lost                bool
-	mu                  sync.Mutex
+	authority        AttemptAuthority
+	resources        ResourceIdentity
+	computerDisk     *computerDiskAttachment
+	container        containerd.Container
+	task             containerd.Task
+	signaler         containerdTaskSignaler
+	releaseTask      func(context.Context) error
+	terminalReady    chan struct{}
+	terminalCode     uint32
+	terminalErr      error
+	stdout           string
+	stderr           string
+	oom              bool
+	oomCancel        context.CancelFunc
+	cancel           context.CancelFunc
+	signal           Signal
+	signalCause      string
+	deleted          bool
+	logAcknowledged  map[string]uint64
+	hostBridge       net.Listener
+	endpoints        map[string]uint16
+	endpointHolds    map[string]net.Listener
+	controlDirectory string
+	computerUID      uint32
+	computerGID      uint32
+	networkNamespace *pinnedNetworkNamespace
+	computerNetwork  *computerNetworkAttachment
+	controlMu        sync.Mutex
+	lost             bool
+	mu               sync.Mutex
 }
 
 type containerdTaskSignaler interface {
@@ -154,6 +154,9 @@ type ContainerdEngine struct {
 	cgroupRemove                func(string) error
 	afterLogSealObservation     func()
 	afterCgroupObservation      func()
+	computerFirewallOnce        sync.Once
+	computerFirewallErr         error
+	observeComputerIsolation    func(*pinnedNetworkNamespace, string) (string, string, bool, error)
 }
 
 const (
@@ -180,6 +183,11 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 	}
 	if config.RuncExecutable != "" && !filepath.IsAbs(config.RuncExecutable) {
 		return nil, errors.New("configured runc executable must be absolute")
+	}
+	for name, path := range map[string]string{"ip": config.IPExecutable, "iptables": config.IPTablesExecutable} {
+		if path != "" && !filepath.IsAbs(path) {
+			return nil, fmt.Errorf("configured %s executable must be absolute", name)
+		}
 	}
 	if config.ContainerdStateRoot == "" {
 		config.ContainerdStateRoot = "/run/containerd"
@@ -290,6 +298,7 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 		capacityReservations: make(map[string]*capacityReservation),
 		memoryFactsPath:      "/proc/meminfo",
 	}
+	engine.observeComputerIsolation = observeComputerNetworkIsolation
 	go engine.imageCacheLoop()
 	return engine, nil
 }
@@ -861,6 +870,8 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	var computerDisk *computerDiskAttachment
 	var hostBridge net.Listener
 	var hostBridgeEndpoint string
+	var networkNamespace *pinnedNetworkNamespace
+	var computerNetwork *computerNetworkAttachment
 	endpoints := make(map[string]uint16, len(request.AllocateEndpoints))
 	endpointHolds := make(map[string]net.Listener, len(request.AllocateEndpoints))
 	defer func() {
@@ -872,6 +883,12 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			engine.recordAdmissionFailure(admission, CodeInsufficientDisk)
 		}
 		if runErr != nil && created {
+			if computerNetwork != nil {
+				runErr = errors.Join(runErr, computerNetwork.close())
+			}
+			if networkNamespace != nil {
+				runErr = errors.Join(runErr, networkNamespace.close())
+			}
 			if hostBridge != nil {
 				_ = hostBridge.Close()
 			}
@@ -1078,15 +1095,22 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		return RunResponse{}, fmt.Errorf("create runc v2 task with binary-v2 logs: %w", err)
 	}
 	if computer {
-		if err := bringUpTaskLoopback(task.Pid()); err != nil {
+		networkNamespace, err = pinTaskNetworkNamespace(task.Pid())
+		if err != nil {
+			return RunResponse{}, fmt.Errorf("pin Computer network namespace: %w", err)
+		}
+		computerNetwork, err = engine.prepareComputerNetwork(leaseContext, networkNamespace, endpoints["view"])
+		if err != nil {
 			return RunResponse{}, fmt.Errorf("prepare Computer network namespace: %w", err)
 		}
+		profile.ComputerNetworkAddress = computerNetwork.guestAddress
+		profile.ComputerNetworkGateway = computerNetwork.gateway
 		for name, hold := range endpointHolds {
 			port := endpoints[name]
 			if err := hold.Close(); err != nil {
 				return RunResponse{}, fmt.Errorf("release host Computer endpoint reservation %q: %w", name, err)
 			}
-			privateHold, err := listenTaskLoopback(task.Pid(), port)
+			privateHold, err := listenTaskLoopback(networkNamespace, port)
 			if err != nil {
 				return RunResponse{}, fmt.Errorf("reserve private Computer endpoint %q: %w", name, err)
 			}
@@ -1100,7 +1124,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			if err := hostBridge.Close(); err != nil {
 				return RunResponse{}, fmt.Errorf("release host Computer bridge reservation: %w", err)
 			}
-			hostBridge, err = listenTaskLoopback(task.Pid(), uint16(address.Port))
+			hostBridge, err = listenTaskLoopback(networkNamespace, uint16(address.Port))
 			if err != nil {
 				return RunResponse{}, fmt.Errorf("reserve private Computer bridge: %w", err)
 			}
@@ -1115,9 +1139,6 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			return RunResponse{}, &RuntimeSpecRejectionError{err: verifyErr}
 		}
 	}
-	engine.mu.Lock()
-	engine.lastProfile = &profile
-	engine.mu.Unlock()
 	attemptContext, attemptCancel := context.WithCancel(leases.WithLease(engineContext(context.Background()), lease.ID))
 	wait, err := task.Wait(attemptContext)
 	if err != nil {
@@ -1130,10 +1151,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			return nil
 		}
 		return deleteErr
-	}, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID}
-	if computer {
-		attempt.networkNamespacePID = task.Pid()
-	}
+	}, stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID, networkNamespace: networkNamespace, computerNetwork: computerNetwork}
 	engine.watchOOM(attempt)
 	engine.mu.Lock()
 	engine.attempts[request.Authority.key()] = attempt
@@ -1156,14 +1174,38 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 	if err := task.Start(leaseContext); err != nil {
 		return RunResponse{}, fmt.Errorf("start runc v2 task: %w", err)
 	}
+	if computer {
+		observer := engine.observeComputerIsolation
+		if observer == nil {
+			observer = observeComputerNetworkIsolation
+		}
+		helperInode, taskInode, hostVisible, observeErr := observer(networkNamespace, "@/tmp/.X11-unix/X"+fmt.Sprint(endpoints["view"]))
+		profile.HelperNetworkNamespaceInode = helperInode
+		profile.TaskNetworkNamespaceInode = taskInode
+		profile.NetworkNamespacePresent = helperInode != "" && taskInode != "" && helperInode != taskInode
+		profile.HostAbstractSocketVisible = hostVisible
+		engine.mu.Lock()
+		engine.lastProfile = &profile
+		engine.mu.Unlock()
+		if observeErr != nil {
+			return RunResponse{}, fmt.Errorf("observe Computer network isolation: %w", observeErr)
+		}
+		if !profile.NetworkNamespacePresent || profile.HostAbstractSocketVisible {
+			return RunResponse{}, errors.New("Computer network isolation was not enforced")
+		}
+	} else {
+		engine.mu.Lock()
+		engine.lastProfile = &profile
+		engine.mu.Unlock()
+	}
 	startedAt := time.Now().UTC().Round(0)
 	created = false
 	return RunResponse{Started: true, StartedAt: startedAt, Image: &evidence, Endpoints: endpoints, HostBridgeReady: hostBridge != nil, HostBridgeEndpoint: hostBridgeEndpoint, Profile: profile, Admission: admission}, nil
 }
 
-func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cgroupID string, networkNamespacePID uint32, port uint16) error {
+func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cgroupID string, networkNamespace *pinnedNetworkNamespace, port uint16) error {
 	for {
-		inode, found, err := loopbackListenInode(networkNamespacePID, port)
+		inode, found, err := loopbackListenInode(networkNamespace, port)
 		if err != nil {
 			return err
 		}
@@ -1185,27 +1227,6 @@ func (engine *ContainerdEngine) waitAttemptPortOwnership(ctx context.Context, cg
 		case <-timer.C:
 		}
 	}
-}
-
-func loopbackListenInode(networkNamespacePID uint32, port uint16) (string, bool, error) {
-	path := "/proc/net/tcp"
-	if networkNamespacePID != 0 {
-		path = fmt.Sprintf("/proc/%d/net/tcp", networkNamespacePID)
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return "", false, err
-	}
-	defer file.Close()
-	want := fmt.Sprintf("0100007F:%04X", port)
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) > 9 && fields[1] == want && fields[3] == "0A" {
-			return fields[9], true, nil
-		}
-	}
-	return "", false, scanner.Err()
 }
 
 func cgroupSubtreeOwnsSocket(ctx context.Context, cgroupPath, inode string) (bool, error) {
@@ -2469,17 +2490,17 @@ func (engine *ContainerdEngine) finishSweep(ctx context.Context, inventory Resou
 }
 
 func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request DialAttemptPortRequest, stream io.ReadWriteCloser) error {
-	var networkNamespacePID uint32
+	var networkNamespace *pinnedNetworkNamespace
 	if request.Authority.validate() == nil {
 		attempt, err := engine.attempt(request.Authority)
 		if err != nil {
 			return err
 		}
-		networkNamespacePID = attempt.networkNamespacePID
+		networkNamespace = attempt.networkNamespace
 	}
 	if request.CgroupID != "" {
 		bindContext, cancelBind := context.WithTimeout(ctx, engine.config.AttemptPortBindTimeout)
-		err := engine.waitAttemptPortOwnership(bindContext, request.CgroupID, networkNamespacePID, request.Port)
+		err := engine.waitAttemptPortOwnership(bindContext, request.CgroupID, networkNamespace, request.Port)
 		cancelBind()
 		if err != nil {
 			return fmt.Errorf("verify payload attempt endpoint ownership: %w", err)
@@ -2487,8 +2508,8 @@ func (engine *ContainerdEngine) DialAttemptPort(ctx context.Context, request Dia
 	}
 	var backend net.Conn
 	var err error
-	if networkNamespacePID != 0 {
-		backend, err = dialTaskLoopback(ctx, networkNamespacePID, request.Port)
+	if networkNamespace != nil {
+		backend, err = dialTaskLoopback(ctx, networkNamespace, request.Port)
 	} else {
 		backend, err = (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(request.Port)))
 	}
@@ -2773,6 +2794,8 @@ func (engine *ContainerdEngine) releaseAttemptRuntimeState(authorityKey string) 
 			_ = hold.Close()
 			delete(attempt.endpointHolds, name)
 		}
+		_ = attempt.computerNetwork.close()
+		_ = attempt.networkNamespace.close()
 		attempt.mu.Unlock()
 	}
 	if attempt != nil {
@@ -2797,6 +2820,8 @@ func (engine *ContainerdEngine) releaseVerifiedNamespace() {
 		for _, hold := range attempt.endpointHolds {
 			_ = hold.Close()
 		}
+		_ = attempt.computerNetwork.close()
+		_ = attempt.networkNamespace.close()
 		attempt.mu.Unlock()
 	}
 	engine.attempts = make(map[string]*containerdAttempt)

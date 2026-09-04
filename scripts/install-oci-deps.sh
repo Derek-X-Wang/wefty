@@ -326,6 +326,7 @@ install_linux() {
   resolve_root_tool CURL_BIN curl; resolve_root_tool TAR_BIN tar; resolve_root_tool SHA256SUM_BIN sha256sum; resolve_root_tool INSTALL_BIN install
   resolve_root_tool GREP_BIN grep; resolve_root_tool MKTEMP_BIN mktemp; resolve_root_tool RM_BIN rm; resolve_root_tool MV_BIN mv
   resolve_root_tool MKDIR_BIN mkdir; resolve_root_tool LN_BIN ln; resolve_root_tool READLINK_BIN readlink; resolve_root_tool CHMOD_BIN chmod; resolve_root_tool CHOWN_BIN chown
+  resolve_root_tool IP_BIN ip; resolve_root_tool IPTABLES_BIN iptables
   trap cleanup EXIT
 	if ((dry_run)) && [[ -n ${WEFTY_OCI_INSTALL_TEST_PLATFORM+x} ]]; then SYSTEMD_ANALYZE_BIN=/usr/bin/systemd-analyze
 	else SYSTEMD_ANALYZE_BIN="$(type -P -- systemd-analyze || true)"; fi

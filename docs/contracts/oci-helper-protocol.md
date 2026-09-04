@@ -373,6 +373,9 @@ required instead.
 stream with one accepted connection on that attempt's helper-owned guest
 listener; the host agent dials only its already-created loopback run bridge.
 Neither direction accepts a caller-supplied network destination.
+The OCI adapter runs exactly four `DialHostBridge` pumps per Computer attempt;
+that fixed bound is the only Computer submission path on every platform, and
+additional guest connections wait for one of those pumps.
 
 For service stop, the agent keeps `Watch` independent from execution-context
 cancellation, sends `TERM`, waits the configured grace, and escalates to
@@ -498,8 +501,11 @@ workloads or read-only rootfs for Computers; and serializes
 cgroup-v2 memory/CPU limits when present. A memory limit also sets OCI swap to
 the same value, producing `memory.swap.max=0` on cgroup v2 rather than leaving a
 swap escape. `Resources.Pids` remains absent in M3; the missing PID limit is a
-known profile gap, not an implicit default. The helper brings the Computer
-namespace's loopback interface up before start. It creates the `view`,
+known profile gap, not an implicit default. The helper attaches a point-to-point
+veth, brings the Computer namespace's loopback and veth interfaces up, installs
+a default route, and masquerades external egress through the Node/VM. Its
+firewall rejects Computer-to-Computer, Node-local, and unsolicited inbound
+traffic except the attempt/interface-bound helper egress proof endpoint. It creates the `view`,
 `control`, and Computer submission listeners inside that namespace, then enters
 it only to create an exact-authority named-endpoint dial. The resulting socket
 returns to the helper namespace for relay; no helper thread or general guest
@@ -757,10 +763,11 @@ memory limit, and typed ceiling-over-limit warnings. These tmpfs values are
 caps rather than reservations, so the warnings do not reject admission; the
 memory cgroup remains the enforcement boundary. The node doctor repeats the
 last assertion-derived comparison as `WARN` when applicable and exposes the
-last atomic admission facts. The same exact-profile receipt records whether
-the Computer network namespace is present and whether its abstract X11 socket
-is visible from the host namespace. The node doctor reports those two screen
-isolation facts as `OK` only for `present=true` and `visible=false`; a missing
+last atomic admission facts. The post-start runtime receipt records the helper
+and task network namespace inodes, their observed inequality, the veth
+address/gateway, and whether the exact abstract X11 socket token is visible from
+the helper namespace. The node doctor reports screen isolation as `OK` only for
+distinct non-empty inodes, `present=true`, and `visible=false`; a missing
 Computer receipt remains `NOT-RUN`, and any other combination is `FAILED`.
 
 The helper holds an exclusive per-generation file lock for the attachment
