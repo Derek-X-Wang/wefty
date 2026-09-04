@@ -1,5 +1,17 @@
 # Computer image and boot contract
 
+Computer Storage recovery is fail-closed per generation. A valid interrupted
+grow or copy record that cannot yet resume remains in place as
+`resume_deferred` with an attempt count, first-deferred time, and closed reason.
+Only boot-barrier startup sweeps increment the attempt count; in-session reap
+sweeps do not. Recovery terminates as `resume_abandoned` only after both
+twenty-four failed agent boot-barrier sweeps and 24 elapsed hours, so a helper
+restart storm cannot consume the bound in minutes. Structural image/record
+mismatch and invalid authority quarantine immediately. Quarantine retains its
+payload for 24 hours and its typed tombstone thereafter, so N is never
+admissible again; the supported recovery path prepares and admits reset
+generation N+1 and clears N only through authorized removal.
+
 This contract defines the image-owned half of a `computer`-trait OCI service
 and the agent's all-or-nothing screen-door readiness verdict. The ratified
 authority is the agent-computer spec section 7; this document fixes the seam
@@ -171,6 +183,17 @@ identity and then rekey the copied identity before the destination can attach. A
 `Prepared` manifest is tenant-owned data, not fresh-root authority; its first
 attach verifies the existing disk-root owner and does not recursively re-own
 the copied bytes.
+
+Computer disk publication is crash-resumable across its image/manifest pair.
+Grow writes exact durable operation intent before resizing in place; copy
+retains its staged identity and phase before the staged image can replace the
+published image. Helper startup completes or rolls back only a matching record.
+An allocation or image/manifest anomaly without that authority quarantines the
+exact disk generation through `computer-disk-quarantine` and
+`ComputerQuarantines`. The quarantined Computer cannot attach, while its typed
+quarantine remains operator-visible and does not withdraw OCI service from
+unaffected Computers on the Node. Namespace absence remains verified for all
+non-quarantined generations.
 
 Computers share the Node network namespace even though PID, IPC, UTS, mount,
 and cgroup namespaces remain private. Image-side local or abstract socket names

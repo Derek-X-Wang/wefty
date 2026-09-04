@@ -45,13 +45,14 @@ func (state InstanceState) Valid() bool {
 
 // SupervisorFacts is the bounded supervisor observation exported to #128.
 type SupervisorFacts struct {
-	Instance    string                        `json:"instance"`
-	State       InstanceState                 `json:"state"`
-	Enabled     bool                          `json:"enabled"`
-	Recovering  bool                          `json:"recovering"`
-	ReasonCode  contract.CapabilityReasonCode `json:"reason_code,omitempty"`
-	ObservedAt  time.Time                     `json:"observed_at"`
-	RepairCount uint64                        `json:"repair_count"`
+	Instance       string                        `json:"instance"`
+	State          InstanceState                 `json:"state"`
+	Enabled        bool                          `json:"enabled"`
+	Recovering     bool                          `json:"recovering"`
+	ReasonCode     contract.CapabilityReasonCode `json:"reason_code,omitempty"`
+	ObservedAt     time.Time                     `json:"observed_at"`
+	RepairCount    uint64                        `json:"repair_count"`
+	StalledWindows uint64                        `json:"helper_handshake_stalled_windows"`
 }
 
 type timeoutContext func(context.Context, time.Duration) (context.Context, context.CancelFunc)
@@ -606,16 +607,31 @@ func lockSupervisorCycle(ctx context.Context, mutex *sync.Mutex) error {
 
 func (barrier *SupervisedBootBarrier) ensureHelperReady(ctx context.Context, expected OCIIntent) error {
 	backoff := barrier.Supervisor.config.InitialBackoff
+	lastReason := contract.CapabilityReasonCode("")
+	var lastErr error
 	for {
 		err := barrier.Barrier.Ensure(ctx)
 		if err == nil {
+			barrier.Supervisor.resetStalledWindows()
 			if intentErr := barrier.Supervisor.recheckEnabled(ctx, expected); intentErr != nil {
 				barrier.Barrier.Invalidate()
 				return barrier.Supervisor.cancelToStopped(ctx, InstanceRunning, intentErr)
 			}
 			return nil
 		}
+		// The RecoveryTimeout can expire inside the final takeover window.
+		// Preserve the preceding positive connected-without-handshake fact so
+		// the outer deadline reaches the persistent-stall repair path.
+		if ctx.Err() != nil && lastReason == contract.CapabilityReasonHelperHandshakeStalled {
+			lastErr = err
+			break
+		}
 		reason := classifyHelperBarrierError(err)
+		if reason == contract.CapabilityReasonHelperHandshakeStalled {
+			barrier.Supervisor.recordStalledWindow()
+		}
+		lastReason = reason
+		lastErr = err
 		if reason == contract.CapabilityReasonHelperVersionMismatch || reason == contract.CapabilityReasonLocalPermissionDenied ||
 			reason == contract.CapabilityReasonBootSweepFailed {
 			return err
@@ -632,12 +648,38 @@ func (barrier *SupervisedBootBarrier) ensureHelperReady(ctx context.Context, exp
 			backoff = maximumLimaRepairBackoff
 		}
 	}
+	if lastReason == contract.CapabilityReasonHelperHandshakeStalled {
+		barrier.Barrier.Invalidate()
+		stopContext, cancel := barrier.Supervisor.config.withTimeout(context.WithoutCancel(ctx), barrier.Supervisor.config.CommandTimeout)
+		defer cancel()
+		stopErr := barrier.Supervisor.forceStop(stopContext)
+		barrier.Supervisor.record(InstanceStopped, true, false, contract.CapabilityReasonHelperHandshakeStalledPersistent, true)
+		return errors.Join(&helperHandshakeStalledPersistentError{}, lastErr, ctx.Err(), stopErr)
+	}
 	barrier.Barrier.Invalidate()
 	stopContext, cancel := barrier.Supervisor.config.withTimeout(context.WithoutCancel(ctx), barrier.Supervisor.config.CommandTimeout)
 	defer cancel()
 	stopErr := barrier.Supervisor.forceStop(stopContext)
 	barrier.Supervisor.record(InstanceStopped, true, false, contract.CapabilityReasonLimaStartTimeout, true)
 	return errors.Join(errors.New("Lima helper readiness exceeded recovery deadline"), ctx.Err(), stopErr)
+}
+
+type helperHandshakeStalledPersistentError struct{}
+
+func (*helperHandshakeStalledPersistentError) Error() string {
+	return "helper_handshake_stalled_persistent: Lima helper handshake remained stalled across RecoveryTimeout"
+}
+
+func (supervisor *Supervisor) recordStalledWindow() {
+	supervisor.mu.Lock()
+	supervisor.facts.StalledWindows++
+	supervisor.mu.Unlock()
+}
+
+func (supervisor *Supervisor) resetStalledWindows() {
+	supervisor.mu.Lock()
+	supervisor.facts.StalledWindows = 0
+	supervisor.mu.Unlock()
 }
 
 func (barrier *SupervisedBootBarrier) Invalidate() {
@@ -716,6 +758,9 @@ func (barrier *SupervisedBootBarrier) CapabilityReasonCode() contract.Capability
 	if barrier == nil || barrier.Supervisor == nil {
 		return contract.CapabilityReasonBootSweepFailed
 	}
+	if barrier.Ready() {
+		return ""
+	}
 	if reason := barrier.Supervisor.Facts().ReasonCode; reason.Valid() {
 		return reason
 	}
@@ -740,6 +785,18 @@ func (barrier *SupervisedBootBarrier) setReason(reason contract.CapabilityReason
 func classifyHelperBarrierError(err error) contract.CapabilityReasonCode {
 	if err == nil {
 		return ""
+	}
+	var persistent *helperHandshakeStalledPersistentError
+	if errors.As(err, &persistent) {
+		return contract.CapabilityReasonHelperHandshakeStalledPersistent
+	}
+	var unavailable *ocihelper.HelperUnitUnavailableError
+	if errors.As(err, &unavailable) {
+		return contract.CapabilityReasonHelperUnitUnavailable
+	}
+	var stalled *ocihelper.HelperHandshakeStalledError
+	if errors.As(err, &stalled) {
+		return contract.CapabilityReasonHelperHandshakeStalled
 	}
 	var rpcErr *ocihelper.RPCError
 	if errors.As(err, &rpcErr) {

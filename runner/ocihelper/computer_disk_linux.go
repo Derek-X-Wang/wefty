@@ -142,12 +142,17 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 	if err != nil {
 		return nil, err
 	}
-	if quarantined, err := computerDiskCleanupQuarantined(engine.config.RuntimeRoot, name); err != nil {
+	if quarantined, err := computerDiskQuarantined(engine.config.RuntimeRoot, storage); err != nil {
 		return nil, err
 	} else if quarantined {
-		return nil, errors.New("Computer Storage generation is quarantined after cleanup failure")
+		return nil, &ComputerStorageQuarantinedError{Storage: storage}
 	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+	if pending, pendingErr := computerStorageResumePending(diskRoot); pendingErr != nil {
+		return nil, pendingErr
+	} else if pending {
+		return nil, &ComputerStorageResumeDeferredError{Storage: storage}
+	}
 	mountPath := filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)
 	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("create Computer disk root: %w", err)
@@ -342,14 +347,35 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 	return attachment, nil
 }
 
-func computerDiskCleanupQuarantined(runtimeRoot, name string) (bool, error) {
+func computerDiskQuarantined(runtimeRoot string, storage ComputerStorageReference) (bool, error) {
+	name, err := deterministicComputerDiskName(storage)
+	if err != nil {
+		return false, err
+	}
 	entries, err := readDirectoryIfPresent(filepath.Join(runtimeRoot, "computer-disk-quarantine"))
 	if err != nil {
 		return false, err
 	}
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), name+"-cleanup-") {
-			return true, nil
+		path := filepath.Join(runtimeRoot, "computer-disk-quarantine", entry.Name())
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), name+"-anomaly-") {
+			receipt, readErr := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(path, "quarantine.json"))
+			if readErr == nil && receipt.DiskName == name && entry.Name() == name+"-anomaly-"+receipt.ReceiptID {
+				if receipt.Kind == computerDiskQuarantineKindAuthority ||
+					receipt.Kind == computerDiskQuarantineKindGeneration && sameComputerStorageIdentity(receipt.Storage, storage) {
+					return true, nil
+				}
+			}
+		}
+		if !entry.IsDir() && strings.HasPrefix(entry.Name(), name+"-cleanup-") && strings.HasSuffix(entry.Name(), ".json") {
+			var receipt ManagedVolumeQuarantineReceipt
+			payload, readErr := os.ReadFile(path)
+			if readErr == nil && json.Unmarshal(payload, &receipt) == nil && receipt.Kind == "managed_volume_cleanup_quarantined" &&
+				receipt.ReceiptID != "" && receipt.VolumeKind == ManagedVolumeComputerDisk && receipt.Removal.RemovalGeneration > 0 &&
+				sameComputerStorageIdentity(receipt.ComputerStorage, storage) &&
+				entry.Name() == fmt.Sprintf("%s-cleanup-%d.json", name, receipt.Removal.RemovalGeneration) {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
@@ -573,8 +599,8 @@ func (engine *ContainerdEngine) detachComputerDisk(attachment *computerDiskAttac
 }
 
 func readComputerDiskManifest(path string) (computerDiskManifest, bool, error) {
-	payload, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	payload, present, err := readComputerRecoveryRecord(path)
+	if !present && err == nil {
 		return computerDiskManifest{}, false, nil
 	}
 	if err != nil {
@@ -888,6 +914,29 @@ func (engine *ContainerdEngine) inventoryComputerDiskResources(result *ResourceI
 			continue
 		}
 		root := filepath.Join(diskRoot, entry.Name())
+		if _, err := os.Lstat(filepath.Join(root, "quarantine.json")); err == nil {
+			receipt, receiptErr := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(root, "quarantine.json"))
+			if receiptErr != nil || receipt.DiskName != entry.Name() {
+				result.ComputerDiskAnomalies = append(result.ComputerDiskAnomalies, entry.Name()+":quarantine_authority_invalid")
+			} else {
+				result.ComputerQuarantines = append(result.ComputerQuarantines, entry.Name())
+				recovery := recoveryInventoryEntry(entry.Name(), "quarantine", receipt.Storage, computerStorageRecoveryDeferral{
+					Attempts: receipt.RecoveryAttempts, Reason: receipt.Reason, FirstDeferredAt: receipt.FirstDeferredAt,
+				})
+				recovery.DeferredReason = receipt.DeferredReason
+				if receipt.PayloadDroppedAt != nil {
+					recovery.PayloadDroppedAt = receipt.PayloadDroppedAt.UTC().Format(time.RFC3339Nano)
+				}
+				result.ComputerStorageQuarantined = append(result.ComputerStorageQuarantined, recovery)
+			}
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if recovery, deferred := engine.operationalComputerRecoveryDeferral(entry.Name()); deferred {
+			result.ComputerStorageDeferred = append(result.ComputerStorageDeferred, recovery)
+			continue
+		}
 		var imageInfo os.FileInfo
 		if info, err := os.Lstat(filepath.Join(root, "disk.ext4")); err == nil {
 			if !info.Mode().IsRegular() {
@@ -898,6 +947,11 @@ func (engine *ContainerdEngine) inventoryComputerDiskResources(result *ResourceI
 			result.ComputerDiskImages = append(result.ComputerDiskImages, entry.Name())
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
+		}
+		copyRecord, copyPresent, copyErr := readComputerStorageCopyManifest(filepath.Join(root, "storage-copy.json"))
+		if copyErr == nil && copyPresent && validComputerStorageCopyRecoveryForInventory(entry.Name(), copyRecord) {
+			result.ComputerStorageDeferred = append(result.ComputerStorageDeferred,
+				recoveryInventoryEntry(entry.Name(), "computer_storage_copy", copyRecord.Request.Destination, copyRecord.Recovery))
 		}
 		manifest, present, err := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
 		if err != nil {
@@ -914,13 +968,19 @@ func (engine *ContainerdEngine) inventoryComputerDiskResources(result *ResourceI
 				continue
 			}
 			if err := verifyComputerDiskAllocation(filepath.Join(root, "disk.ext4"), manifest.Storage.DiskBytes); err != nil {
-				result.ComputerDiskAnomalies = append(result.ComputerDiskAnomalies, entry.Name()+":allocation_mismatch")
-				continue
+				if !validComputerStorageGrowIntentForInventory(root, entry.Name(), manifest) {
+					result.ComputerDiskAnomalies = append(result.ComputerDiskAnomalies, entry.Name()+":allocation_mismatch")
+					continue
+				}
 			}
 			result.ComputerDiskAllocations = append(result.ComputerDiskAllocations, entry.Name())
 			// A Computer disk's current fully allocated image size is its
 			// writable filesystem budget; no host free space can expand it.
 			result.ComputerDiskQuotas = append(result.ComputerDiskQuotas, entry.Name())
+			if growRecord, growPresent, growErr := readComputerStorageGrowIntent(root); growErr == nil && growPresent {
+				result.ComputerStorageDeferred = append(result.ComputerStorageDeferred,
+					recoveryInventoryEntry(entry.Name(), "computer_storage_grow", growRecord.Request.Storage, growRecord.Recovery))
+			}
 		}
 	}
 	mountRoot := filepath.Join(engine.config.RuntimeRoot, "computer-mounts")
@@ -970,19 +1030,72 @@ func (engine *ContainerdEngine) inventoryComputerDiskResources(result *ResourceI
 		return err
 	}
 	for _, entry := range quarantineEntries {
-		name := entry.Name()
-		if !strings.HasPrefix(name, "wefty-computer-disk-") {
+		entryName := entry.Name()
+		if !strings.HasPrefix(entryName, "wefty-computer-disk-") {
 			continue
 		}
-		if base, _, found := strings.Cut(name, "-reset-"); found {
-			name = base
+		path := filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine", entryName)
+		valid := false
+		name := ""
+		if entry.IsDir() {
+			if resetAt := strings.LastIndex(entryName, "-reset-"); resetAt > len("wefty-computer-disk-") {
+				if _, parseErr := strconv.ParseUint(entryName[resetAt+len("-reset-"):], 10, 64); parseErr == nil {
+					name = entryName[:resetAt]
+					valid = validComputerDiskDirectoryName(name)
+					if valid {
+						result.ComputerStorageQuarantined = append(result.ComputerStorageQuarantined,
+							ComputerStorageRecoveryInventoryEntry{DiskName: name, Operation: "legacy_reset", Reason: "legacy_reset_quarantine"})
+					}
+				}
+			}
+		}
+		if entry.IsDir() && !valid {
+			receipt, readErr := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(path, "quarantine.json"))
+			if readErr == nil {
+				valid = entryName == receipt.DiskName+"-anomaly-"+receipt.ReceiptID
+				name = receipt.DiskName
+				if valid {
+					recovery := recoveryInventoryEntry(name, "quarantine", receipt.Storage, computerStorageRecoveryDeferral{Attempts: receipt.RecoveryAttempts, Reason: receipt.Reason, FirstDeferredAt: receipt.FirstDeferredAt})
+					recovery.DeferredReason = receipt.DeferredReason
+					if receipt.PayloadDroppedAt != nil {
+						recovery.PayloadDroppedAt = receipt.PayloadDroppedAt.UTC().Format(time.RFC3339Nano)
+					}
+					result.ComputerStorageQuarantined = append(result.ComputerStorageQuarantined, recovery)
+				}
+			}
+		} else if strings.HasSuffix(entryName, ".json") {
+			var receipt ManagedVolumeQuarantineReceipt
+			payload, readErr := os.ReadFile(path)
+			if readErr == nil && json.Unmarshal(payload, &receipt) == nil && receipt.Kind == "managed_volume_cleanup_quarantined" &&
+				receipt.ReceiptID != "" && receipt.VolumeKind == ManagedVolumeComputerDisk && receipt.Removal.RemovalGeneration > 0 {
+				expected, identityErr := deterministicComputerDiskName(receipt.ComputerStorage)
+				valid = identityErr == nil && entryName == fmt.Sprintf("%s-cleanup-%d.json", expected, receipt.Removal.RemovalGeneration)
+				name = expected
+				if valid {
+					result.ComputerStorageQuarantined = append(result.ComputerStorageQuarantined,
+						recoveryInventoryEntry(name, "authorized_removal", receipt.ComputerStorage, computerStorageRecoveryDeferral{Attempts: receipt.Attempts, Reason: string(receipt.FailureReason)}))
+				}
+			}
+		}
+		if !valid {
+			result.ComputerDiskAnomalies = append(result.ComputerDiskAnomalies, entryName+":quarantine_authority_invalid")
+			continue
 		}
 		result.ComputerQuarantines = append(result.ComputerQuarantines, name)
 	}
 	return nil
 }
 
-func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
+func (engine *ContainerdEngine) sweepComputerDisks(ctx context.Context, sweepEpoch string) error {
+	return engine.sweepComputerDisksWithRecoveryAttempt(ctx, sweepEpoch, true)
+}
+
+func (engine *ContainerdEngine) sweepComputerDisksWithRecoveryAttempt(ctx context.Context, sweepEpoch string, countRecoveryAttempt bool) error {
+	engine.computerDiskSweepEvidence = nil
+	engine.resetOperationalComputerRecoveryDeferrals()
+	if err := engine.expireComputerDiskQuarantinePayloads(ctx); err != nil {
+		return err
+	}
 	if sweepEpoch == "" {
 		var err error
 		sweepEpoch, err = randomCapability()
@@ -1081,27 +1194,123 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 			continue
 		}
 		root := filepath.Join(diskRoot, entry.Name())
-		staging, err := filepath.Glob(filepath.Join(root, ".disk.ext4.tmp-*"))
+		for _, pattern := range []string{".disk.ext4.tmp-*", ".storage-grow.json.tmp-*", ".quarantine.json.tmp-*"} {
+			staging, err := filepath.Glob(filepath.Join(root, pattern))
+			if err != nil {
+				return err
+			}
+			for _, path := range staging {
+				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+			}
+		}
+		recoveryLock, err := openComputerDiskLock(root)
 		if err != nil {
 			return err
 		}
-		for _, path := range staging {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
+		quarantineResumed, quarantineResumeErr := engine.resumeComputerDiskQuarantine(root, entry.Name())
+		if quarantineResumeErr != nil {
+			if quarantineErr := engine.quarantineComputerDiskAuthorityFailure(root, entry.Name(), "quarantine_authority_invalid"); quarantineErr != nil {
+				closeComputerDiskLock(recoveryLock)
+				return errors.Join(quarantineResumeErr, quarantineErr)
 			}
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+				Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionQuarantined, Method: "quarantine_authority_invalid",
+			})
+			closeComputerDiskLock(recoveryLock)
+			continue
+		}
+		if quarantineResumed {
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+				Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionQuarantined, Method: "quarantine_recovered",
+			})
+			closeComputerDiskLock(recoveryLock)
+			continue
 		}
 		manifest, present, err := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
 		if err != nil {
-			return err
+			if classifyComputerRecoveryFileFailure(err) == computerRecoveryFileOperational {
+				engine.rememberOperationalComputerRecoveryDeferral(entry.Name(), "computer_disk_manifest", ComputerStorageReference{}, err)
+				engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+					Class: RemovalResourceComputerDiskManifest, ID: entry.Name(), Action: SweepActionResumeDeferred, Method: "computer_disk_manifest",
+				})
+				closeComputerDiskLock(recoveryLock)
+				continue
+			}
+			reason := computerRecoveryStructuralReason(err, "manifest_invalid")
+			if quarantineErr := engine.quarantineComputerDiskAuthorityFailure(root, entry.Name(), reason); quarantineErr != nil {
+				closeComputerDiskLock(recoveryLock)
+				return errors.Join(err, quarantineErr)
+			}
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+				Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionQuarantined, Method: reason,
+			})
+			closeComputerDiskLock(recoveryLock)
+			continue
+		}
+		copyRecovery, resumeErr := engine.resumeComputerStorageCopy(ctx, root, entry.Name())
+		if resumeErr != nil {
+			fallback := ComputerStorageReference{}
+			if present {
+				fallback = manifest.Storage
+			}
+			evidence, resolveErr := engine.resolveComputerStorageRecoveryFailure(root, entry.Name(), "computer_storage_copy", fallback, resumeErr, countRecoveryAttempt)
+			if resolveErr != nil {
+				closeComputerDiskLock(recoveryLock)
+				return resolveErr
+			}
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, evidence)
+			closeComputerDiskLock(recoveryLock)
+			continue
+		}
+		if copyRecovery != "" {
+			action := SweepActionResumed
+			if copyRecovery == "computer_storage_copy_rolled_back" {
+				action = SweepActionRolledBack
+			}
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+				Class: RemovalResourceComputerDiskManifest, ID: entry.Name(), Action: action, Method: copyRecovery,
+			})
+			manifest, present, err = readComputerDiskManifest(filepath.Join(root, "attachment.json"))
+			if err != nil {
+				closeComputerDiskLock(recoveryLock)
+				return err
+			}
+			if !present {
+				// An earlier phase was rolled back and intentionally has no
+				// published disk generation.
+				closeComputerDiskLock(recoveryLock)
+				continue
+			}
 		}
 		if !present {
 			if err := os.Remove(filepath.Join(root, "disk.ext4")); err != nil && !errors.Is(err, os.ErrNotExist) {
+				closeComputerDiskLock(recoveryLock)
 				return err
 			}
 			if err := syncDirectory(root); err != nil {
+				closeComputerDiskLock(recoveryLock)
 				return err
 			}
+			closeComputerDiskLock(recoveryLock)
 			continue
+		}
+		resumedGrow, growErr := engine.resumeComputerStorageGrow(ctx, root, entry.Name(), &manifest)
+		if growErr != nil {
+			evidence, resolveErr := engine.resolveComputerStorageRecoveryFailure(root, entry.Name(), "computer_storage_grow", manifest.Storage, growErr, countRecoveryAttempt)
+			if resolveErr != nil {
+				closeComputerDiskLock(recoveryLock)
+				return resolveErr
+			}
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, evidence)
+			closeComputerDiskLock(recoveryLock)
+			continue
+		}
+		if resumedGrow {
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+				Class: RemovalResourceComputerDiskManifest, ID: entry.Name(), Action: SweepActionResumed, Method: "computer_storage_grow",
+			})
 		}
 		// A reset successor has no tenant bytes before its preparation receipt is
 		// durably published. If the helper died anywhere in that preparation, drop
@@ -1115,8 +1324,10 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 				// A preparation-shaped record with corrupted directory, image, or
 				// generation identity is retained as an inventory anomaly. It is not
 				// safe to reinterpret it as the exact disposable reset successor.
+				closeComputerDiskLock(recoveryLock)
 				continue
 			}
+			closeComputerDiskLock(recoveryLock)
 			lock, lockErr := os.OpenFile(filepath.Join(root, "attachment.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 			if lockErr != nil {
 				return lockErr
@@ -1136,6 +1347,35 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 			}
 			continue
 		}
+		if err := verifyComputerDiskAllocation(filepath.Join(root, "disk.ext4"), manifest.Storage.DiskBytes); err != nil {
+			if classifyComputerRecoveryFileFailure(err) == computerRecoveryFileOperational {
+				engine.rememberOperationalComputerRecoveryDeferral(entry.Name(), "computer_disk_allocation", manifest.Storage, err)
+				engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+					Class: RemovalResourceComputerDiskManifest, ID: entry.Name(), Action: SweepActionResumeDeferred, Method: "computer_disk_allocation",
+				})
+				closeComputerDiskLock(recoveryLock)
+				continue
+			}
+			expectedName, identityErr := deterministicComputerDiskName(manifest.Storage)
+			reason := "allocation_mismatch"
+			var quarantineErr error
+			if identityErr != nil || expectedName != entry.Name() {
+				reason = "identity_mismatch"
+				quarantineErr = engine.quarantineComputerDiskAuthorityFailure(root, entry.Name(), reason)
+			} else {
+				quarantineErr = engine.quarantineComputerDiskAnomaly(root, entry.Name(), manifest.Storage, reason)
+			}
+			if quarantineErr != nil {
+				closeComputerDiskLock(recoveryLock)
+				return errors.Join(err, quarantineErr)
+			}
+			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence, SweepEvidence{
+				Class: RemovalResourceComputerQuarantine, ID: entry.Name(), Action: SweepActionQuarantined, Method: reason,
+			})
+			closeComputerDiskLock(recoveryLock)
+			continue
+		}
+		closeComputerDiskLock(recoveryLock)
 		refreshDetachedReap := manifest.Attached == nil && manifest.Pending == nil &&
 			manifest.PreviousDetachment != nil && manifest.PreviousDetachment.Kind == computerDiskReapReceipt
 		if manifest.Attached == nil && manifest.Pending == nil && !refreshDetachedReap {
@@ -1212,4 +1452,11 @@ func (engine *ContainerdEngine) sweepComputerDisks(sweepEpoch string) error {
 		}
 	}
 	return nil
+}
+
+func recordErrStorage(err *computerDiskRecoveryRecordError) ComputerStorageReference {
+	if err == nil {
+		return ComputerStorageReference{}
+	}
+	return err.Storage
 }

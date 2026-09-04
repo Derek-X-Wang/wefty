@@ -4,15 +4,34 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const defaultTakeoverRetryInterval = 25 * time.Millisecond
 
-func takeoverTimeoutForReap(reapTimeout time.Duration) time.Duration {
+const (
+	HelperUnitUnavailable  = "helper_unit_unavailable"
+	HelperHandshakeStalled = "helper_handshake_stalled"
+)
+
+var errTakeoverWindowExpired = errors.New("OCI helper takeover window expired")
+
+// TakeoverTimeoutForReap is the exclusive-session window: one reap interval
+// for helper startup cleanup plus one for an incumbent authority to expire.
+func TakeoverTimeoutForReap(reapTimeout time.Duration) time.Duration {
 	return reapTimeout + reapTimeout
+}
+
+// VerifiedReadyTimeoutForReap composes takeover with the fresh admission
+// sweep-and-verify interval that begins only after the handshake succeeds.
+func VerifiedReadyTimeoutForReap(reapTimeout time.Duration) time.Duration {
+	return TakeoverTimeoutForReap(reapTimeout) + reapTimeout
 }
 
 type BootBarrierConfig struct {
@@ -29,6 +48,44 @@ type ReapTimeoutConfigurationError struct {
 
 func (err *ReapTimeoutConfigurationError) Error() string {
 	return fmt.Sprintf("OCI helper reap timeout configuration mismatch: advertised=%s takeover_derived_from=%s", err.AdvertisedReapTimeout, err.TakeoverReapTimeout)
+}
+
+// HelperUnitUnavailableError means no handshake completed and the final dial
+// in the complete takeover window positively proved the socket unit absent or
+// refusing/resetting.
+type HelperUnitUnavailableError struct {
+	DialAttempts int
+	Cause        error
+}
+
+type HelperHandshakeStalledError struct {
+	DialAttempts int
+	Cause        error
+}
+
+func (err *HelperHandshakeStalledError) Code() string { return HelperHandshakeStalled }
+func (err *HelperHandshakeStalledError) Error() string {
+	if err == nil || err.Cause == nil {
+		return HelperHandshakeStalled
+	}
+	return fmt.Sprintf("%s: OCI helper completed no handshake after %d takeover attempts: %v", HelperHandshakeStalled, err.DialAttempts, err.Cause)
+}
+func (err *HelperHandshakeStalledError) Unwrap() error { return err.Cause }
+
+func (err *HelperUnitUnavailableError) Code() string { return HelperUnitUnavailable }
+
+func (err *HelperUnitUnavailableError) Error() string {
+	if err == nil || err.Cause == nil {
+		return HelperUnitUnavailable
+	}
+	return fmt.Sprintf("%s: OCI helper completed no handshake after %d takeover attempts: %v", HelperUnitUnavailable, err.DialAttempts, err.Cause)
+}
+
+func (err *HelperUnitUnavailableError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
 }
 
 // NamespaceResidueError preserves the distinction between resources that
@@ -107,7 +164,8 @@ func inventoryIdentitySetsEqual(left, right ResourceInventory) bool {
 		slices.Equal(left.ComputerDiskQuotas, right.ComputerDiskQuotas) && slices.Equal(left.ComputerDiskManifests, right.ComputerDiskManifests) &&
 		slices.Equal(left.ComputerDiskMounts, right.ComputerDiskMounts) && slices.Equal(left.ComputerDiskLoops, right.ComputerDiskLoops) &&
 		slices.Equal(left.ComputerAttachments, right.ComputerAttachments) && slices.Equal(left.ComputerResetManifests, right.ComputerResetManifests) &&
-		slices.Equal(left.ComputerQuarantines, right.ComputerQuarantines) && slices.Equal(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
+		slices.Equal(left.ComputerQuarantines, right.ComputerQuarantines) && slices.Equal(left.ComputerStorageDeferred, right.ComputerStorageDeferred) &&
+		slices.Equal(left.ComputerStorageQuarantined, right.ComputerStorageQuarantined) && slices.Equal(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
 }
 
 func inventoryPartitionsDisjoint(left, right ResourceInventory) bool {
@@ -120,7 +178,7 @@ func inventoryIdentityCountPortable(inventory ResourceInventory) int {
 		len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ImageSpools) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) +
 		len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) +
 		len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) +
-		len(inventory.ComputerQuarantines) + len(inventory.ComputerDiskAnomalies)
+		len(inventory.ComputerQuarantines) + len(inventory.ComputerStorageDeferred) + len(inventory.ComputerStorageQuarantined) + len(inventory.ComputerDiskAnomalies)
 }
 
 func namespaceResidueError(operation string, verification VerifyResponse) error {
@@ -141,12 +199,14 @@ type BootBarrier struct {
 	request AcquireSessionRequest
 	config  BootBarrierConfig
 
-	ensureMu sync.Mutex
-	mu       sync.RWMutex
-	session  *Session
-	prepared bool
-	receipt  VerifiedSweepReceipt
-	loss     func(HelperSession, error)
+	ensureMu       sync.Mutex
+	mu             sync.RWMutex
+	session        *Session
+	prepared       bool
+	receipt        VerifiedSweepReceipt
+	loss           func(HelperSession, error)
+	reason         contract.CapabilityReasonCode
+	stalledWindows uint64
 }
 
 func NewBootBarrier(client *Client, request AcquireSessionRequest) (*BootBarrier, error) {
@@ -167,7 +227,7 @@ func NewBootBarrierWithConfig(client *Client, request AcquireSessionRequest, con
 		config.TakeoverReapTimeout = defaultReapTimeout
 	}
 	if config.TakeoverTimeout <= 0 {
-		config.TakeoverTimeout = takeoverTimeoutForReap(config.TakeoverReapTimeout)
+		config.TakeoverTimeout = TakeoverTimeoutForReap(config.TakeoverReapTimeout)
 	}
 	if config.TakeoverRetry <= 0 {
 		config.TakeoverRetry = defaultTakeoverRetryInterval
@@ -231,17 +291,18 @@ func (barrier *BootBarrier) SetLossHandler(handler func(HelperSession, error)) {
 	barrier.mu.Unlock()
 }
 
-func (barrier *BootBarrier) Ensure(ctx context.Context) error {
+func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 	if barrier == nil {
 		return errors.New("OCI boot barrier is unavailable")
 	}
+	defer func() { barrier.recordCapabilityReason(ensureErr) }()
 	barrier.ensureMu.Lock()
 	defer barrier.ensureMu.Unlock()
 	if barrier.Ready() {
 		return nil
 	}
 	barrier.detachSession()
-	takeoverContext, cancel := context.WithTimeout(ctx, barrier.config.TakeoverTimeout)
+	takeoverContext, cancel := context.WithTimeoutCause(ctx, barrier.config.TakeoverTimeout, errTakeoverWindowExpired)
 	defer cancel()
 	session, err := barrier.takeExclusiveSession(takeoverContext)
 	if err != nil {
@@ -277,17 +338,19 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 		return namespaceResidueError("verify OCI runtime namespace", verification)
 	}
 	receipt := VerifiedSweepReceipt{
-		SweepEpoch:            sweep.SweepEpoch,
-		HelperSession:         HelperSession{HelperInstanceID: handshake.HelperInstanceID, SessionGeneration: handshake.SessionGeneration},
-		PriorBootSessionsSeen: slices.Clone(sweep.PriorBootSessionsSeen),
-		SweptInventory:        cloneResourceInventory(sweep.Inventory),
-		VerifiedAbsent:        verification.Absent,
-		VerifiedInventory:     cloneResourceInventory(verification.Inventory),
-		VerifiedResidue:       cloneResourceInventory(verification.RuntimeResidue),
-		VerifiedRetained:      cloneResourceInventory(verification.DurableRetained),
-		DurableRetentions:     slices.Clone(verification.DurableRetentions),
-		SweepEvidence:         cloneSweepEvidence(sweep.Evidence),
-		Attempts:              slices.Clone(sweep.Attempts),
+		SweepEpoch:                      sweep.SweepEpoch,
+		HelperSession:                   HelperSession{HelperInstanceID: handshake.HelperInstanceID, SessionGeneration: handshake.SessionGeneration},
+		PriorBootSessionsSeen:           slices.Clone(sweep.PriorBootSessionsSeen),
+		SweptInventory:                  cloneResourceInventory(sweep.Inventory),
+		VerifiedAbsent:                  verification.Absent,
+		VerifiedInventory:               cloneResourceInventory(verification.Inventory),
+		VerifiedResidue:                 cloneResourceInventory(verification.RuntimeResidue),
+		VerifiedRetained:                cloneResourceInventory(verification.DurableRetained),
+		ComputerStorageDeferredCount:    len(verification.DurableRetained.ComputerStorageDeferred),
+		ComputerStorageQuarantinedCount: len(verification.DurableRetained.ComputerStorageQuarantined),
+		DurableRetentions:               slices.Clone(verification.DurableRetentions),
+		SweepEvidence:                   cloneSweepEvidence(sweep.Evidence),
+		Attempts:                        slices.Clone(sweep.Attempts),
 	}
 	if receipt.SweepEpoch == "" {
 		return errors.New("sweep all OCI runtime state: helper omitted sweep epoch")
@@ -305,21 +368,104 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) error {
 	return nil
 }
 
+// CapabilityReasonCode exposes the last Ensure outcome through the agent's
+// bounded capability-restriction surface. A healthy barrier has no reason.
+func (barrier *BootBarrier) CapabilityReasonCode() contract.CapabilityReasonCode {
+	if barrier == nil {
+		return contract.CapabilityReasonBootSweepFailed
+	}
+	barrier.mu.RLock()
+	defer barrier.mu.RUnlock()
+	return barrier.reason
+}
+
+// HandshakeStalledWindows is the consecutive bounded takeover windows that
+// connected to the helper socket without completing a handshake.
+func (barrier *BootBarrier) HandshakeStalledWindows() uint64 {
+	if barrier == nil {
+		return 0
+	}
+	barrier.mu.RLock()
+	defer barrier.mu.RUnlock()
+	return barrier.stalledWindows
+}
+
+func (barrier *BootBarrier) recordCapabilityReason(err error) {
+	reason := contract.CapabilityReasonCode("")
+	if err != nil {
+		var unavailable *HelperUnitUnavailableError
+		if errors.As(err, &unavailable) {
+			reason = contract.CapabilityReasonHelperUnitUnavailable
+		} else if errors.As(err, new(*HelperHandshakeStalledError)) {
+			reason = contract.CapabilityReasonHelperHandshakeStalled
+		} else {
+			reason = contract.CapabilityReasonBootSweepFailed
+		}
+	}
+	barrier.mu.Lock()
+	barrier.reason = reason
+	if reason == contract.CapabilityReasonHelperHandshakeStalled {
+		barrier.stalledWindows++
+	} else {
+		barrier.stalledWindows = 0
+	}
+	barrier.mu.Unlock()
+}
+
 func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context) (*Session, error) {
+	dialAttempts := 0
+	completedHandshakes := 0
+	lastDialConnected := false
+	var lastUnavailableError error
+	takeoverError := func(contextError error) error {
+		if dialAttempts > 0 && completedHandshakes == 0 && !lastDialConnected && lastUnavailableError != nil && errors.Is(context.Cause(ctx), errTakeoverWindowExpired) {
+			return &HelperUnitUnavailableError{
+				DialAttempts: dialAttempts,
+				Cause:        errors.Join(contextError, lastUnavailableError),
+			}
+		}
+		if dialAttempts > 0 && completedHandshakes == 0 && lastDialConnected && errors.Is(context.Cause(ctx), errTakeoverWindowExpired) {
+			return &HelperHandshakeStalledError{DialAttempts: dialAttempts, Cause: contextError}
+		}
+		return fmt.Errorf("acquire exclusive OCI helper session: %w", contextError)
+	}
 	for {
-		session, err := barrier.client.OpenSession(ctx, barrier.request)
+		if err := ctx.Err(); err != nil {
+			return nil, takeoverError(err)
+		}
+		dialAttempts++
+		lastDialConnected = false
+		lastUnavailableError = nil
+		session, err := barrier.client.openSession(ctx, barrier.request, &lastDialConnected)
 		if err == nil {
 			return session, nil
 		}
+		if contextError := ctx.Err(); contextError != nil {
+			return nil, takeoverError(contextError)
+		}
+		// A socket-backlog connection can reach its I/O deadline immediately
+		// before the context timer publishes Done. OpenSession applies this
+		// context's deadline to the connection, so synchronize that edge before
+		// classifying a handshake transport error.
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) && errors.Is(err, os.ErrDeadlineExceeded) {
+			<-ctx.Done()
+			return nil, takeoverError(ctx.Err())
+		}
 		var rpcErr *RPCError
-		if !errors.As(err, &rpcErr) || rpcErr.Code != CodeSessionBusy {
+		var dialErr *helperDialError
+		if errors.As(err, &dialErr) && (errors.Is(dialErr, os.ErrNotExist) || errors.Is(dialErr, syscall.ECONNREFUSED) || errors.Is(dialErr, syscall.ECONNRESET)) {
+			lastUnavailableError = err
+		} else if errors.As(err, &rpcErr) && rpcErr.Code == CodeSessionBusy {
+			completedHandshakes++
+			lastUnavailableError = nil
+		} else {
 			return nil, fmt.Errorf("acquire exclusive OCI helper session: %w", err)
 		}
 		timer := barrier.config.Clock.NewTimerAt(barrier.config.Clock.Now().Add(barrier.config.TakeoverRetry))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, fmt.Errorf("acquire exclusive OCI helper session: %w", ctx.Err())
+			return nil, takeoverError(ctx.Err())
 		case <-timer.C():
 		}
 	}
@@ -424,6 +570,8 @@ func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {
 	inventory.ComputerAttachments = slices.Clone(inventory.ComputerAttachments)
 	inventory.ComputerResetManifests = slices.Clone(inventory.ComputerResetManifests)
 	inventory.ComputerQuarantines = slices.Clone(inventory.ComputerQuarantines)
+	inventory.ComputerStorageDeferred = slices.Clone(inventory.ComputerStorageDeferred)
+	inventory.ComputerStorageQuarantined = slices.Clone(inventory.ComputerStorageQuarantined)
 	inventory.ComputerDiskAnomalies = slices.Clone(inventory.ComputerDiskAnomalies)
 	return inventory
 }
@@ -432,5 +580,5 @@ func cloneResourceInventory(inventory ResourceInventory) ResourceInventory {
 func InventoryEmpty(inventory ResourceInventory) bool {
 	return len(inventory.Leases)+len(inventory.Snapshots)+len(inventory.Containers)+len(inventory.Tasks)+
 		len(inventory.Shims)+len(inventory.Cgroups)+len(inventory.LogSegments)+len(inventory.ImageSpools)+len(inventory.ManagedVolumes)+len(inventory.ManagedVolumeRecords)+
-		len(inventory.ComputerDiskImages)+len(inventory.ComputerDiskAllocations)+len(inventory.ComputerDiskQuotas)+len(inventory.ComputerDiskManifests)+len(inventory.ComputerDiskMounts)+len(inventory.ComputerDiskLoops)+len(inventory.ComputerAttachments)+len(inventory.ComputerResetManifests)+len(inventory.ComputerQuarantines)+len(inventory.ComputerDiskAnomalies) == 0
+		len(inventory.ComputerDiskImages)+len(inventory.ComputerDiskAllocations)+len(inventory.ComputerDiskQuotas)+len(inventory.ComputerDiskManifests)+len(inventory.ComputerDiskMounts)+len(inventory.ComputerDiskLoops)+len(inventory.ComputerAttachments)+len(inventory.ComputerResetManifests)+len(inventory.ComputerQuarantines)+len(inventory.ComputerStorageDeferred)+len(inventory.ComputerStorageQuarantined)+len(inventory.ComputerDiskAnomalies) == 0
 }

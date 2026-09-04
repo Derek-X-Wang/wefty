@@ -284,6 +284,14 @@ func (engine *ContainerdEngine) ResetComputerStorage(ctx context.Context, reques
 		request.Authority.IntentRevision < 1 || strings.TrimSpace(request.Authority.CleanupFence) == "" {
 		return ResetComputerStorageResponse{}, errors.New("Computer Storage reset request is incomplete")
 	}
+	successor := request.Storage
+	successor.StorageGeneration = request.NewGeneration
+	successor.IntentRevision = request.Authority.IntentRevision
+	if quarantined, err := computerDiskQuarantined(engine.config.RuntimeRoot, successor); err != nil {
+		return ResetComputerStorageResponse{}, err
+	} else if quarantined {
+		return ResetComputerStorageResponse{}, &ComputerStorageQuarantinedError{Storage: successor}
+	}
 	if err := engine.fenceResetPredecessor(request.Storage, request.Authority); err != nil {
 		return ResetComputerStorageResponse{}, err
 	}

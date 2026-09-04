@@ -108,7 +108,7 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 		}
 	}
 	executablePaths := make(map[string]string)
-	for _, executable := range []string{"containerd", "runc", "systemctl", "groupadd", "usermod", "getent", "id"} {
+	for _, executable := range []string{"containerd", "runc", "systemctl", "groupadd", "usermod", "getent", "id", "e2fsck"} {
 		resolvedPath, err := exec.LookPath(executable)
 		if err != nil {
 			return missing(executable)
@@ -159,6 +159,14 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 	if err != nil {
 		return true, err
 	}
+	desired.SystemdVersion = receipt.SystemdVersion
+	desired.HelperRestartPolicy = receipt.RestartPolicy
+	class = ocicontrol.ConvergenceLiveSafe
+	if current, readErr := ocicontrol.ReadSetupState(*setupStatePath); readErr == nil {
+		class = ocicontrol.ClassifyConvergence(current, desired)
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return true, readErr
+	}
 	if err := ocicontrol.WriteSetupState(ocicontrol.DesiredSetupStatePath(*setupStatePath), desired); err != nil {
 		return true, err
 	}
@@ -169,7 +177,8 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 			if errors.As(err, &controlErr) {
 				reasonCode = string(controlErr.Code)
 			}
-			return true, writeJSON(stdout, map[string]any{"configured": true, "convergence": class, "reason_code": reasonCode, "systemctl_commands": receipt.Commands})
+			return true, writeJSON(stdout, map[string]any{"configured": true, "convergence": class, "reason_code": reasonCode, "systemctl_commands": receipt.Commands,
+				"systemd_version": receipt.SystemdVersion, "helper_restart_policy": receipt.RestartPolicy})
 		}
 		_, printErr := fmt.Fprintf(stdout, "OCI setup configured; convergence=%s reason=%v; rerun with the required convergence flag\n", class, err)
 		return true, printErr
@@ -184,7 +193,8 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 		receipt.Commands[len(receipt.Commands)-1] = []string{"systemctl", "restart", linuxunit.AgentUnit}
 	}
 	if options.jsonOutput {
-		return true, writeJSON(stdout, map[string]any{"configured": true, "convergence": class, "systemctl_commands": receipt.Commands})
+		return true, writeJSON(stdout, map[string]any{"configured": true, "convergence": class, "systemctl_commands": receipt.Commands,
+			"systemd_version": receipt.SystemdVersion, "helper_restart_policy": receipt.RestartPolicy})
 	}
 	for _, command := range receipt.Commands {
 		if _, err := fmt.Fprintln(stdout, strings.Join(command, " ")); err != nil {

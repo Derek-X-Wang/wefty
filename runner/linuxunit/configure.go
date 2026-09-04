@@ -2,10 +2,12 @@ package linuxunit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -19,9 +21,11 @@ type ConfigurePaths struct {
 }
 
 type ConfigureReceipt struct {
-	GroupCreated bool       `json:"group_created"`
-	UserAdded    bool       `json:"user_added"`
-	Commands     [][]string `json:"systemctl_commands"`
+	GroupCreated   bool       `json:"group_created"`
+	UserAdded      bool       `json:"user_added"`
+	Commands       [][]string `json:"systemctl_commands"`
+	SystemdVersion int        `json:"systemd_version"`
+	RestartPolicy  string     `json:"helper_restart_policy"`
 }
 
 type CommandRunner interface {
@@ -34,15 +38,53 @@ func (ExecRunner) Run(ctx context.Context, command string, arguments ...string) 
 	return exec.CommandContext(ctx, command, arguments...).CombinedOutput()
 }
 
+func InspectSystemdVersion(ctx context.Context, runner CommandRunner) (int, error) {
+	if runner == nil {
+		return 0, errors.New("inspect systemd version requires a command runner")
+	}
+	versionOutput, err := runner.Run(ctx, "systemctl", "--version")
+	if err != nil {
+		return 0, fmt.Errorf("inspect systemd version: %w", err)
+	}
+	fields := strings.Fields(string(versionOutput))
+	if len(fields) < 2 || fields[0] != "systemd" {
+		return 0, errors.New("inspect systemd version: unexpected output")
+	}
+	version, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0, fmt.Errorf("inspect systemd version: %w", err)
+	}
+	if version <= 0 {
+		return 0, errors.New("inspect systemd version: invalid version")
+	}
+	return version, nil
+}
+
+func InspectHelperServiceUnit(ctx context.Context, runner CommandRunner) (string, error) {
+	if runner == nil {
+		return "", errors.New("inspect helper service unit requires a command runner")
+	}
+	output, err := runner.Run(ctx, "systemctl", "cat", HelperServiceUnit)
+	if err != nil {
+		return "", fmt.Errorf("inspect helper service unit: %w", err)
+	}
+	return string(output), nil
+}
+
 func Configure(ctx context.Context, config Config, paths ConfigurePaths, runner CommandRunner) (ConfigureReceipt, error) {
 	if runner == nil || !filepath.IsAbs(paths.UnitDirectory) || !filepath.IsAbs(paths.NodeConfig) || !filepath.IsAbs(paths.ControlSocket) {
 		return ConfigureReceipt{}, fmt.Errorf("Linux OCI setup requires absolute install paths and a command runner")
+	}
+	var err error
+	config.SystemdVersion, err = InspectSystemdVersion(ctx, runner)
+	if err != nil {
+		return ConfigureReceipt{}, err
 	}
 	units, err := Render(config)
 	if err != nil {
 		return ConfigureReceipt{}, err
 	}
-	receipt := ConfigureReceipt{}
+	receipt := ConfigureReceipt{SystemdVersion: config.SystemdVersion, RestartPolicy: HelperRestartPolicyName(config.SystemdVersion)}
 	if paths.chown == nil {
 		paths.chown = os.Chown
 	}

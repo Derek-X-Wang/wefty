@@ -20,7 +20,8 @@ import (
 const (
 	defaultHeartbeatTimeout = 3 * time.Second
 	defaultMaximumDeadman   = 2 * time.Minute
-	defaultReapTimeout      = 10 * time.Second
+	DefaultReapTimeout      = 10 * time.Second
+	defaultReapTimeout      = DefaultReapTimeout
 	defaultConnectionLimit  = 64
 	maximumReapedBoots      = 256
 )
@@ -1125,6 +1126,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			var insufficientDisk *insufficientDiskError
 			var imageUnavailable *ImageUnavailableError
 			var storageRetired *computerStorageRetiredError
+			var storageDeferred *ComputerStorageResumeDeferredError
+			var storageQuarantined *ComputerStorageQuarantinedError
 			if errors.As(err, &rpcErr) {
 				_ = writeRPCError(wire, rpcErr)
 			} else if errors.Is(err, errComputerStorageAttachmentOwned) {
@@ -1141,6 +1144,18 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 					_ = writeFailure(wire, CodeComputerStorageRetired, storageRetired.Error())
 				} else {
 					_ = writeFailure(wire, CodeSessionStale, "retired Computer Storage refusal could not verify runtime absence")
+				}
+			} else if errors.As(err, &storageDeferred) {
+				if reapErr == nil {
+					_ = writeFailure(wire, CodeComputerStorageResumeDeferred, storageDeferred.Error())
+				} else {
+					_ = writeFailure(wire, CodeSessionStale, "deferred Computer Storage refusal could not verify runtime absence")
+				}
+			} else if errors.As(err, &storageQuarantined) {
+				if reapErr == nil {
+					_ = writeFailure(wire, CodeComputerStorageQuarantined, storageQuarantined.Error())
+				} else {
+					_ = writeFailure(wire, CodeSessionStale, "quarantined Computer Storage refusal could not verify runtime absence")
 				}
 			} else if errors.As(err, &specRejection) {
 				_ = writeFailure(wire, CodeOCISpecRejected, "OCI runtime spec was rejected")
@@ -1418,6 +1433,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
+		server.createSweep.RLock()
+		defer server.createSweep.RUnlock()
 		response, err := engine.GrowComputerStorage(operation.ctx, body)
 		var uncertain *ComputerStorageGrowUncertainError
 		if errors.As(err, &uncertain) {
@@ -1507,6 +1524,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			return
 		}
 		operation.monitorEOF()
+		server.createSweep.RLock()
+		defer server.createSweep.RUnlock()
 		response, err := engine.CopyComputerStorage(operation.ctx, body)
 		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodExportCustody:
@@ -1581,6 +1600,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		session.mu.Unlock()
 		sweepEpoch, err := randomCapability()
 		body.SweepEpoch = sweepEpoch
+		body.countComputerStorageRecoveryAttempt = true
 		var response SweepResponse
 		if err == nil {
 			response, err = server.engine.Sweep(operation.ctx, body)
@@ -1825,8 +1845,25 @@ func mergeResourceInventory(left, right ResourceInventory) ResourceInventory {
 	left.ComputerAttachments = mergeInventoryClass(left.ComputerAttachments, right.ComputerAttachments)
 	left.ComputerResetManifests = mergeInventoryClass(left.ComputerResetManifests, right.ComputerResetManifests)
 	left.ComputerQuarantines = mergeInventoryClass(left.ComputerQuarantines, right.ComputerQuarantines)
+	left.ComputerStorageDeferred = mergeRecoveryInventory(left.ComputerStorageDeferred, right.ComputerStorageDeferred)
+	left.ComputerStorageQuarantined = mergeRecoveryInventory(left.ComputerStorageQuarantined, right.ComputerStorageQuarantined)
 	left.ComputerDiskAnomalies = mergeInventoryClass(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
 	return left
+}
+
+func mergeRecoveryInventory(left, right []ComputerStorageRecoveryInventoryEntry) []ComputerStorageRecoveryInventoryEntry {
+	seen := make(map[ComputerStorageRecoveryInventoryEntry]struct{}, len(left)+len(right))
+	for _, entry := range append(slices.Clone(left), right...) {
+		seen[entry] = struct{}{}
+	}
+	merged := make([]ComputerStorageRecoveryInventoryEntry, 0, len(seen))
+	for entry := range seen {
+		merged = append(merged, entry)
+	}
+	slices.SortFunc(merged, func(left, right ComputerStorageRecoveryInventoryEntry) int {
+		return strings.Compare(recoveryInventoryEntryKey(left), recoveryInventoryEntryKey(right))
+	})
+	return merged
 }
 
 func mergeInventoryClass(left, right []string) []string {
@@ -1882,6 +1919,14 @@ func decodeRequest(connection *framedConn, raw json.RawMessage, target any) bool
 
 func writeEngineResponseWithMethod(connection *framedConn, method Method, response any, err error) error {
 	if err != nil {
+		var storageDeferred *ComputerStorageResumeDeferredError
+		if errors.As(err, &storageDeferred) {
+			return writeFailure(connection, CodeComputerStorageResumeDeferred, storageDeferred.Error())
+		}
+		var storageQuarantined *ComputerStorageQuarantinedError
+		if errors.As(err, &storageQuarantined) {
+			return writeFailure(connection, CodeComputerStorageQuarantined, storageQuarantined.Error())
+		}
 		var serviceDataRejection *ServiceDataRejectionError
 		if errors.As(err, &serviceDataRejection) {
 			return writeFailure(connection, CodeOCISpecRejected, serviceDataRejection.Error())

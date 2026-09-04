@@ -755,69 +755,66 @@ const (
 type CapabilityReasonCode string
 
 const (
-	CapabilityReasonOCIIntentDisabled         CapabilityReasonCode = "oci_intent_disabled"
-	CapabilityReasonPrerequisiteMissing       CapabilityReasonCode = "prerequisite_missing"
-	CapabilityReasonRuntimeVersionUnsupported CapabilityReasonCode = "runtime_version_unsupported"
-	CapabilityReasonHelperUnreachable         CapabilityReasonCode = "helper_unreachable"
-	CapabilityReasonHelperVersionMismatch     CapabilityReasonCode = "helper_version_mismatch"
-	CapabilityReasonHelperHandshakeFailed     CapabilityReasonCode = "helper_handshake_failed"
-	CapabilityReasonBootSweepFailed           CapabilityReasonCode = "boot_sweep_failed"
-	CapabilityReasonProbeFailed               CapabilityReasonCode = "probe_failed"
-	CapabilityReasonLimaStopped               CapabilityReasonCode = "lima_stopped"
-	CapabilityReasonLimaBroken                CapabilityReasonCode = "lima_broken"
-	CapabilityReasonLimaStartTimeout          CapabilityReasonCode = "lima_start_timeout"
-	CapabilityReasonTemplateRestartRequired   CapabilityReasonCode = "template_restart_required"
-	CapabilityReasonTemplateRecreateRequired  CapabilityReasonCode = "template_recreate_required"
-	CapabilityReasonMountRootUnavailable      CapabilityReasonCode = "mount_root_unavailable"
-	CapabilityReasonLocalPermissionDenied     CapabilityReasonCode = "local_permission_denied"
+	CapabilityReasonOCIIntentDisabled                CapabilityReasonCode = "oci_intent_disabled"
+	CapabilityReasonPrerequisiteMissing              CapabilityReasonCode = "prerequisite_missing"
+	CapabilityReasonRuntimeVersionUnsupported        CapabilityReasonCode = "runtime_version_unsupported"
+	CapabilityReasonHelperUnreachable                CapabilityReasonCode = "helper_unreachable"
+	CapabilityReasonHelperUnitUnavailable            CapabilityReasonCode = "helper_unit_unavailable"
+	CapabilityReasonHelperHandshakeStalled           CapabilityReasonCode = "helper_handshake_stalled"
+	CapabilityReasonHelperHandshakeStalledPersistent CapabilityReasonCode = "helper_handshake_stalled_persistent"
+	CapabilityReasonHelperVersionMismatch            CapabilityReasonCode = "helper_version_mismatch"
+	CapabilityReasonHelperHandshakeFailed            CapabilityReasonCode = "helper_handshake_failed"
+	CapabilityReasonBootSweepFailed                  CapabilityReasonCode = "boot_sweep_failed"
+	CapabilityReasonProbeFailed                      CapabilityReasonCode = "probe_failed"
+	CapabilityReasonLimaStopped                      CapabilityReasonCode = "lima_stopped"
+	CapabilityReasonLimaBroken                       CapabilityReasonCode = "lima_broken"
+	CapabilityReasonLimaStartTimeout                 CapabilityReasonCode = "lima_start_timeout"
+	CapabilityReasonTemplateRestartRequired          CapabilityReasonCode = "template_restart_required"
+	CapabilityReasonTemplateRecreateRequired         CapabilityReasonCode = "template_recreate_required"
+	CapabilityReasonMountRootUnavailable             CapabilityReasonCode = "mount_root_unavailable"
+	CapabilityReasonLocalPermissionDenied            CapabilityReasonCode = "local_permission_denied"
 )
 
+var capabilityReasonCodes = []CapabilityReasonCode{
+	CapabilityReasonOCIIntentDisabled,
+	CapabilityReasonPrerequisiteMissing,
+	CapabilityReasonRuntimeVersionUnsupported,
+	CapabilityReasonHelperUnreachable,
+	CapabilityReasonHelperUnitUnavailable,
+	CapabilityReasonHelperHandshakeStalled,
+	CapabilityReasonHelperHandshakeStalledPersistent,
+	CapabilityReasonHelperVersionMismatch,
+	CapabilityReasonHelperHandshakeFailed,
+	CapabilityReasonBootSweepFailed,
+	CapabilityReasonProbeFailed,
+	CapabilityReasonLimaStopped,
+	CapabilityReasonLimaBroken,
+	CapabilityReasonLimaStartTimeout,
+	CapabilityReasonTemplateRestartRequired,
+	CapabilityReasonTemplateRecreateRequired,
+	CapabilityReasonMountRootUnavailable,
+	CapabilityReasonLocalPermissionDenied,
+}
+
+// CapabilityReasonCodes returns the complete wire vocabulary accepted by
+// CapabilityReasonCode.Valid. Callers may modify the returned slice.
+func CapabilityReasonCodes() []CapabilityReasonCode {
+	return append([]CapabilityReasonCode(nil), capabilityReasonCodes...)
+}
+
 func (code CapabilityReasonCode) Valid() bool {
-	switch code {
-	case CapabilityReasonOCIIntentDisabled,
-		CapabilityReasonPrerequisiteMissing,
-		CapabilityReasonRuntimeVersionUnsupported,
-		CapabilityReasonHelperUnreachable,
-		CapabilityReasonHelperVersionMismatch,
-		CapabilityReasonHelperHandshakeFailed,
-		CapabilityReasonBootSweepFailed,
-		CapabilityReasonProbeFailed,
-		CapabilityReasonLimaStopped,
-		CapabilityReasonLimaBroken,
-		CapabilityReasonLimaStartTimeout,
-		CapabilityReasonTemplateRestartRequired,
-		CapabilityReasonTemplateRecreateRequired,
-		CapabilityReasonMountRootUnavailable,
-		CapabilityReasonLocalPermissionDenied:
-		return true
-	default:
-		return false
+	for _, valid := range capabilityReasonCodes {
+		if code == valid {
+			return true
+		}
 	}
+	return false
 }
 
 // ValidOCIRestriction reports whether code can explain an observation that
 // has atomically withdrawn kind:oci during registration or recovery.
 func (code CapabilityReasonCode) ValidOCIRestriction() bool {
-	switch code {
-	case CapabilityReasonOCIIntentDisabled,
-		CapabilityReasonPrerequisiteMissing,
-		CapabilityReasonRuntimeVersionUnsupported,
-		CapabilityReasonHelperUnreachable,
-		CapabilityReasonHelperVersionMismatch,
-		CapabilityReasonHelperHandshakeFailed,
-		CapabilityReasonBootSweepFailed,
-		CapabilityReasonProbeFailed,
-		CapabilityReasonLimaStopped,
-		CapabilityReasonLimaBroken,
-		CapabilityReasonLimaStartTimeout,
-		CapabilityReasonTemplateRestartRequired,
-		CapabilityReasonTemplateRecreateRequired,
-		CapabilityReasonMountRootUnavailable,
-		CapabilityReasonLocalPermissionDenied:
-		return true
-	default:
-		return false
-	}
+	return code.Valid()
 }
 
 // CapabilityObservation is one immutable, boot-scoped observation of the

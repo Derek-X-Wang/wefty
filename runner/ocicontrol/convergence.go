@@ -23,6 +23,8 @@ type SetupState struct {
 	ProbeDigest         string `json:"probe_digest"`
 	MemoryCapacityBytes int64  `json:"memory_capacity_bytes,omitempty"`
 	MemoryReserveBytes  int64  `json:"memory_reserve_bytes,omitempty"`
+	SystemdVersion      int    `json:"systemd_version,omitempty"`
+	HelperRestartPolicy string `json:"helper_restart_policy,omitempty"`
 }
 
 func DesiredSetupStatePath(currentPath string) string {
@@ -40,7 +42,8 @@ func ClassifyConvergence(current, desired SetupState) ConvergenceClass {
 		return ConvergenceRecreateRequired
 	}
 	if current.VMMemory != desired.VMMemory || current.VMCPUs != desired.VMCPUs || current.VMDisk != desired.VMDisk ||
-		current.MemoryCapacityBytes != desired.MemoryCapacityBytes || current.MemoryReserveBytes != desired.MemoryReserveBytes {
+		current.MemoryCapacityBytes != desired.MemoryCapacityBytes || current.MemoryReserveBytes != desired.MemoryReserveBytes ||
+		current.SystemdVersion != desired.SystemdVersion || current.HelperRestartPolicy != desired.HelperRestartPolicy {
 		return ConvergenceRestartRequired
 	}
 	return ConvergenceLiveSafe
@@ -110,5 +113,21 @@ func validateSetupState(state SetupState) error {
 	if state.MemoryCapacityBytes < 0 || state.MemoryReserveBytes < 0 {
 		return errors.New("invalid OCI setup state")
 	}
+	if state.SystemdVersion < 0 ||
+		state.SystemdVersion == 0 && state.HelperRestartPolicy != "" && state.HelperRestartPolicy != "conservative_fixed_1s" ||
+		state.SystemdVersion > 0 && state.HelperRestartPolicy != setupStateRestartPolicy(state.SystemdVersion) {
+		return errors.New("invalid OCI setup state")
+	}
 	return nil
+}
+
+func setupStateRestartPolicy(systemdVersion int) string {
+	switch {
+	case systemdVersion == 0:
+		return ""
+	case systemdVersion >= 254:
+		return "geometric_capped_1s"
+	default:
+		return "legacy_fixed_1s"
+	}
 }

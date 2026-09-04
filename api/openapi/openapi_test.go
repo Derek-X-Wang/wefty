@@ -632,6 +632,34 @@ func TestAgentProtocolCarriesFullCapabilityObservations(t *testing.T) {
 	}
 }
 
+func TestCapabilityReasonVocabularyMatchesOpenAPIEnums(t *testing.T) {
+	t.Parallel()
+
+	vocabulary := contract.CapabilityReasonCodes()
+	expected := make(map[string]bool, len(vocabulary))
+	for _, reason := range vocabulary {
+		if !reason.Valid() {
+			t.Fatalf("Go capability reason %q is not valid", reason)
+		}
+		expected[string(reason)] = true
+	}
+	for _, document := range []struct {
+		name string
+		enum any
+	}{
+		{name: "common.v1.json NodeRegistration", enum: object(t, object(t, object(t,
+			object(t, readObject(t, "common.v1.json")["components"], "common components")["schemas"], "common schemas")["NodeRegistration"], "NodeRegistration")["properties"], "NodeRegistration properties")["capability_reason_code"]},
+		{name: "l1-agent.v1.json heartbeat", enum: object(t, object(t, object(t, object(t, object(t,
+			object(t, object(t, object(t, readObject(t, "l1-agent.v1.json")["paths"], "agent paths")["/v1/agent/nodes/{node_id}/heartbeat"], "heartbeat path")["post"], "heartbeat post")["requestBody"], "heartbeat request body")["content"], "heartbeat content")["application/json"], "heartbeat media")["schema"], "heartbeat schema")["properties"], "heartbeat properties")["capability_reason_code"]},
+	} {
+		reasonSchema := object(t, document.enum, document.name+" capability reason")
+		actual := stringSet(t, reasonSchema["enum"])
+		if !reflect.DeepEqual(actual, expected) {
+			t.Errorf("%s capability reason enum = %#v, want exact Go vocabulary %#v", document.name, actual, expected)
+		}
+	}
+}
+
 func TestServiceOperatorRoutesRequireClassSelector(t *testing.T) {
 	t.Parallel()
 	doc := readObject(t, "l1-client.v1.json")

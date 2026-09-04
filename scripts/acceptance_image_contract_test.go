@@ -3,16 +3,22 @@ package scripts
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"os/exec"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/internal/computerconformance"
+	"github.com/Derek-X-Wang/wefty/runner/lima"
+	"github.com/Derek-X-Wang/wefty/runner/linuxunit"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 
 	"gopkg.in/yaml.v3"
 )
@@ -291,6 +297,11 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 		for _, required := range []string{
 			"StandardError=append:/tmp/wefty-oci-helper-realtiming.stderr",
+			"StartLimitIntervalSec=0",
+			"Restart=on-failure",
+			"RestartSec=250ms",
+			"RestartSteps=6",
+			"RestartMaxDelaySec=1s",
 			"if: ${{ always() && runner.os == 'Linux' }}",
 			"journalctl --boot --no-pager --utc --output=short-precise",
 			"-u wefty-oci-helper-realtiming.service",
@@ -322,10 +333,26 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 			"::error::Runner.Listener owner could not be read", "::error::Runner.Listener is unexpectedly running as root",
 			"runner_job_uid=%s\\nrunner_listener_uid=%s\\nrunner_listener_owner=%s\\n",
 			"WEFTY_OCI_PROVISION_RECEIPT=%s\\n",
+			"systemctl is-active --quiet wefty-oci-helper-realtiming.socket",
+			"reproduce-helper-start-burst:[1-9]*",
+			"manufacture-computer-allocation-mismatch:wefty-computer-disk-*",
+			"kill-helper:native-lost-attempt-sweep", "kill-helper:native-computer-helper-death",
+			"kill-helper:service-restart-survival", "kill-helper:service-reconfiguration-reset",
+			"assert-helper-units-active",
+			"stop-helper-topology",
+			`"/tmp/wefty-oci-faults/$action.failed"`,
+			"start-helper-topology",
 		} {
 			if !strings.Contains(fixture.text, required) {
 				t.Fatalf("%s realtiming provisioning is missing %q", name, required)
 			}
+		}
+		if strings.Contains(fixture.text, "systemctl reset-failed wefty-oci-helper-realtiming.service") {
+			t.Fatalf("%s helper fault path masks the service start counter", name)
+		}
+		if strings.Contains(fixture.text, "systemctl is-active --quiet wefty-oci-helper-realtiming.service && exit 1 || true") ||
+			strings.Contains(fixture.text, "systemctl is-active --quiet wefty-oci-helper-realtiming.socket && exit 1 || true") {
+			t.Fatalf("%s topology fault exits its long-lived supervisor instead of recording .failed", name)
 		}
 	}
 	for name, workflow := range map[string]workflowContract{"workflow-run": realtiming, "scheduled": scheduled} {
@@ -350,7 +377,9 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		resultText := marshalJob(t, result)
 		for _, required := range []string{"ARTIFACT_AVAILABLE", "$ARTIFACT_AVAILABLE", "= true",
 			"REALTIMING_RESULT", "$REALTIMING_RESULT", "= success", "check-linux-computer-receipt.sh", "linux-computer-matrix.json",
-			"check-native-linux-oci-receipt.sh", "native-linux-oci.txt", "oci-service-publication-linux.txt", "oci-service-l1-agent-linux.txt", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland"} {
+			"check-native-linux-oci-receipt.sh", "native-linux-oci.txt", "oci-service-publication-linux.txt", "oci-service-l1-agent-linux.txt", "linux-computer-receipt-xfce", "linux-computer-receipt-wayland", "xfce", "wayland",
+			"helper-restart-timeline.txt", "observed_startup_failures=6", "startup_failure_arm=6", "fault_1_kill_to_verified_ready_elapsed_ns", "fault_1_kill_to_verified_ready_bound_ns",
+			"capability_reason=helper_unit_unavailable", "lane_helper_kill_action_set", "lane_product_path_fault_actions=1", "disk_quarantine_action=quarantined", "elapsed <= bound"} {
 			if !strings.Contains(resultText, required) {
 				t.Fatalf("%s realtiming result does not fail closed on %q", name, required)
 			}
@@ -374,6 +403,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "exec /usr/local/bin/wefty-echo-service", "published-echo-service:", "clean-cache wefty node load-image")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "CodeImageUnavailable", "ImageFailureNetwork", "WEFTY_OCI_PROVISION_RECEIPT", `evidenceSource := os.Getenv("WEFTY_REALTIME_EVIDENCE_SOURCE")`, `registryEvidence := "pull_from_empty=true\npull_import_digest_equal=true\n"`, "pull_from_empty=NOT-RUN\\npull_from_empty_reason=pr-build: image not published")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "Start the archive row from an empty root", `requestRootFault(t, "reset-containerd")`, "wiped-cache binding reconciliation")
+	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "TestNativeLinuxHelperRestartsAcrossLaneFaultBudget", "historicalRapidStartupFailures = 6", "fault_1_kill_to_verified_ready_elapsed_ns", "CapabilityReasonHelperUnitUnavailable")
 	assertFileNotContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", `strings.Replace(evidence, "pull_from_empty=true\\n"`)
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_COMPUTER_REFERENCE", "exerciseNativeLinuxReferenceComputer", "ComputerStartupReadinessTimeout", "assertReferenceComputerWireNegatives")
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "WEFTY_OCI_WAYLAND_COMPUTER_REFERENCE", `exerciseNativeLinuxReferenceComputer(t, ctx, session, adapter, "wayland"`, "wayland_computer_reference_wire_negatives=true")
@@ -442,6 +472,193 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../runner/ocihelper/containerd_engine_realtiming_linux_test.go", "RunComputerServiceRealtiming", "computer_reference_publication_loss_recovery=%t", "computer_reference_helper_stop_start_profile_sign_in_rootfs=%t")
 	assertFileContains(t, "../docs/runbooks/oci-node.md", "wefty node load-image", "acceptance-image-index-digest.txt")
 	assertFileContains(t, "../docs/acceptance/m3-lima-transport.md", "acceptance-image-index-digest.txt", "computer-image-index-digest.txt", "wefty-computer-reference.oci.tar", "atomically within 60 seconds")
+}
+
+func TestHelperSystemdPolicyPlacementAndCrossSourceDrift(t *testing.T) {
+	modernWant := map[string]map[string]string{
+		"Unit": {
+			"StartLimitIntervalSec": "0",
+		},
+		"Service": {
+			"Restart":            "on-failure",
+			"RestartSec":         linuxunit.HelperRestartInitialDelay.String(),
+			"RestartSteps":       strconv.Itoa(linuxunit.HelperRestartSteps),
+			"RestartMaxDelaySec": linuxunit.HelperRestartMaximumDelay.String(),
+		},
+	}
+	for name, path := range map[string]string{
+		"pr-realtiming": "../.github/workflows/service-acceptance-realtiming.yml",
+		"scheduled":     "../.github/workflows/service-acceptance-realtiming-scheduled.yml",
+	} {
+		got := helperServicePolicySections(t, path)
+		if !maps.Equal(got["Unit"], modernWant["Unit"]) || !maps.Equal(got["Service"], modernWant["Service"]) {
+			t.Fatalf("%s helper policy sections = %#v, want %#v", name, got, modernWant)
+		}
+		assertHelperPolicyMutationRejected(t, name, string(mustReadFile(t, path)))
+	}
+	nativeConfig := linuxunit.Config{AgentPath: "/usr/local/bin/wefty-agent", OperatorUser: "wefty", OperatorGroup: "wefty", OperatorUID: 1000, OperatorGID: 1000,
+		WorkingDirectory: "/var/lib/wefty", ContainerdAddress: "/run/containerd/containerd.sock", ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci"}
+	for _, version := range []int{255, 252} {
+		nativeConfig.SystemdVersion = version
+		units, err := linuxunit.Render(nativeConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		limaUnit := lima.RenderGuestHelperServiceUnit(lima.GuestHelperInstallConfig{HostMountRoot: "/Users/operator/mounts", GuestUID: 1000, SystemdVersion: version})
+		for name, text := range map[string]string{fmt.Sprintf("native-systemd-%d", version): string(units.HelperService), fmt.Sprintf("lima-systemd-%d", version): string(limaUnit)} {
+			got, err := parseHelperServicePolicySections(text)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			wantService := map[string]string{"Restart": "on-failure", "RestartSec": "1s"}
+			if version >= 254 {
+				wantService = modernWant["Service"]
+			}
+			if !maps.Equal(got["Unit"], modernWant["Unit"]) || !maps.Equal(got["Service"], wantService) {
+				t.Fatalf("%s policy=%#v", name, got)
+			}
+			assertHelperPolicyMutationRejected(t, name, text)
+		}
+	}
+	if got := linuxunit.HelperRestartPolicy(255); got != "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n" {
+		t.Fatalf("modern systemd helper policy = %q", got)
+	}
+	if got := linuxunit.HelperRestartPolicy(252); got != "RestartSec=1s\n" || strings.Contains(got, "RestartSteps") {
+		t.Fatalf("legacy systemd helper policy = %q", got)
+	}
+	takeover := ocihelper.TakeoverTimeoutForReap(ocihelper.DefaultReapTimeout)
+	composed := linuxunit.HelperSaturatedRestartDelaySum + ocihelper.DefaultReapTimeout + linuxunit.HelperRestartTakeoverMargin
+	if composed > takeover || linuxunit.HelperSaturatedRestartDelaySum != 7*time.Second {
+		t.Fatalf("saturated helper restart derivation = delays %s + reap %s + margin %s = %s, takeover %s",
+			linuxunit.HelperSaturatedRestartDelaySum, ocihelper.DefaultReapTimeout, linuxunit.HelperRestartTakeoverMargin, composed, takeover)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func assertHelperPolicyMutationRejected(t *testing.T, name, text string) {
+	t.Helper()
+	needle := "RestartSec=250ms"
+	if !strings.Contains(text, needle) {
+		needle = "RestartSec=1s"
+	}
+	mutated := strings.Replace(text, needle, needle+"\nRestartSec=30s", 1)
+	if _, err := parseHelperServicePolicySections(mutated); err == nil {
+		t.Fatalf("%s late policy mutation was accepted", name)
+	}
+}
+
+func helperServicePolicySections(t *testing.T, path string) map[string]map[string]string {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sections, err := parseHelperServicePolicySections(string(payload))
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	return sections
+}
+
+func parseHelperServicePolicySections(text string) (map[string]map[string]string, error) {
+	description := strings.Index(text, "Description=Wefty privileged OCI helper")
+	if description < 0 {
+		description = strings.Index(text, "Description=Wefty OCI helper realtiming service")
+	}
+	if description < 0 {
+		return nil, errors.New("no privileged helper unit")
+	}
+	start := strings.LastIndex(text[:description], "[Unit]")
+	if start < 0 {
+		return nil, errors.New("helper policy bounds were not found")
+	}
+	sections := map[string]map[string]string{"Unit": {}, "Service": {}}
+	seen := map[string]map[string]int{"Unit": {}, "Service": {}}
+	seenSections := map[string]bool{}
+	installSeen := false
+	section := ""
+	for _, raw := range strings.Split(text[start:], "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "UNIT" || line == "`)" || line == "`)," {
+			break
+		}
+		if line == "[Install]" {
+			installSeen = true
+			section = "Install"
+			continue
+		}
+		if line == "[Unit]" || line == "[Service]" {
+			section = strings.Trim(line, "[]")
+			if seenSections[section] || installSeen {
+				return nil, fmt.Errorf("helper policy repeats or reopens [%s] after [Install]", section)
+			}
+			seenSections[section] = true
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || section == "" {
+			continue
+		}
+		switch key {
+		case "StartLimitIntervalSec", "StartLimitBurst", "Restart", "RestartSec", "RestartSteps", "RestartMaxDelaySec":
+			if installSeen {
+				return nil, fmt.Errorf("helper policy key %s appears after [Install]", key)
+			}
+			seen[section][key]++
+			if seen[section][key] != 1 {
+				return nil, fmt.Errorf("helper policy duplicates %s in [%s]", key, section)
+			}
+			sections[section][key] = value
+		}
+	}
+	return sections, nil
+}
+
+func TestHelperSystemdPolicyParserRejectsLateLastWinsOverrides(t *testing.T) {
+	_, err := parseHelperServicePolicySections(`[Unit]
+Description=Wefty privileged OCI helper
+StartLimitIntervalSec=0
+[Service]
+Restart=on-failure
+RestartSec=250ms
+RestartSteps=6
+RestartMaxDelaySec=1s
+RestartSec=30s
+StartLimitBurst=1
+[Install]
+WantedBy=multi-user.target
+`)
+	if err == nil || !strings.Contains(err.Error(), "duplicates RestartSec") {
+		t.Fatalf("late last-wins override was accepted: %v", err)
+	}
+}
+
+func TestHelperSystemdPolicyParserRejectsServiceReopenedAfterInstall(t *testing.T) {
+	_, err := parseHelperServicePolicySections(`[Unit]
+Description=Wefty privileged OCI helper
+StartLimitIntervalSec=0
+[Service]
+Restart=on-failure
+RestartSec=250ms
+RestartSteps=6
+RestartMaxDelaySec=1s
+[Install]
+WantedBy=multi-user.target
+[Service]
+RestartMaxDelaySec=9s
+UNIT
+`)
+	if err == nil || !strings.Contains(err.Error(), "after [Install]") {
+		t.Fatalf("post-install service override was accepted: %v", err)
+	}
 }
 
 func assertWaylandFurnitureInvocations(t *testing.T, workflowName string, workflow workflowContract) {

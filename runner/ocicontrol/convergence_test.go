@@ -51,6 +51,8 @@ func TestSetupStateFailsClosedOnIncompleteOrUnsafeState(t *testing.T) {
 		`{"vm_memory":"bad","vm_cpus":4,"vm_disk":"32GiB","vm_type":"vz","host_mount_root":"/srv/wefty","probe_digest":"sha256:a"}`,
 		`{"vm_memory":"4GiB","vm_cpus":4,"vm_disk":"32GiB","vm_type":"","host_mount_root":"/srv/wefty","probe_digest":"sha256:a"}`,
 		`{"vm_memory":"4GiB","vm_cpus":4,"vm_disk":"32GiB","vm_type":"vz","host_mount_root":"/srv/wefty","probe_digest":""}`,
+		`{"vm_memory":"4GiB","vm_cpus":4,"vm_disk":"32GiB","vm_type":"vz","host_mount_root":"/srv/wefty","probe_digest":"sha256:a","systemd_version":252,"helper_restart_policy":"geometric_capped_1s"}`,
+		`{"vm_memory":"4GiB","vm_cpus":4,"vm_disk":"32GiB","vm_type":"vz","host_mount_root":"/srv/wefty","probe_digest":"sha256:a","systemd_version":255,"helper_restart_policy":"legacy_fixed_1s"}`,
 	} {
 		if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
 			t.Fatal(err)
@@ -58,5 +60,36 @@ func TestSetupStateFailsClosedOnIncompleteOrUnsafeState(t *testing.T) {
 		if _, err := ReadSetupState(path); err == nil {
 			t.Fatalf("unsafe setup state was accepted: %s", payload)
 		}
+	}
+}
+
+func TestSetupStatePersistsSystemdRestartPolicyFacts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setup.json")
+	state := SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "native", HostMountRoot: "/srv/wefty", ProbeDigest: "sha256:probe",
+		SystemdVersion: 252, HelperRestartPolicy: "legacy_fixed_1s"}
+	if err := WriteSetupState(path, state); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadSetupState(path)
+	if err != nil || got != state {
+		t.Fatalf("setup state=%+v err=%v", got, err)
+	}
+	desired := state
+	desired.SystemdVersion = 255
+	desired.HelperRestartPolicy = "geometric_capped_1s"
+	if class := ClassifyConvergence(state, desired); class != ConvergenceRestartRequired {
+		t.Fatalf("policy drift class=%s", class)
+	}
+}
+
+func TestSetupStateAcceptsConservativeUnknownSystemdPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setup.json")
+	state := SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "native", HostMountRoot: "/srv/wefty", ProbeDigest: "sha256:probe",
+		HelperRestartPolicy: "conservative_fixed_1s"}
+	if err := WriteSetupState(path, state); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadSetupState(path); err != nil || got != state {
+		t.Fatalf("setup state=%+v err=%v", got, err)
 	}
 }

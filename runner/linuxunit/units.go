@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -19,6 +20,13 @@ const (
 	HelperServiceUnit = "wefty-oci-helper.service"
 	HelperSocketPath  = "/run/wefty-oci/oci-helper.sock"
 	HelperGroup       = "wefty-oci"
+
+	HelperRestartInitialDelay      = 250 * time.Millisecond
+	HelperRestartSteps             = 6
+	HelperStartupFailureBurst      = 6
+	HelperRestartMaximumDelay      = time.Second
+	HelperRestartTakeoverMargin    = 2 * time.Second
+	HelperSaturatedRestartDelaySum = (HelperStartupFailureBurst + 1) * HelperRestartMaximumDelay
 )
 
 var userPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]{0,63}$`)
@@ -38,12 +46,32 @@ type Config struct {
 	RuncExecutable      string
 	MemoryCapacityBytes int64
 	MemoryReserveBytes  int64
+	SystemdVersion      int
 }
 
 type Units struct {
 	Agent         []byte
 	HelperSocket  []byte
 	HelperService []byte
+}
+
+// HelperRestartPolicy returns the bounded service policy supported by the
+// installed systemd. Debian 12's systemd 252 lacks the geometric directives.
+func HelperRestartPolicy(systemdVersion int) string {
+	if systemdVersion >= 254 {
+		return "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n"
+	}
+	return "RestartSec=1s\n"
+}
+
+func HelperRestartPolicyName(systemdVersion int) string {
+	if systemdVersion == 0 {
+		return "conservative_fixed_1s"
+	}
+	if systemdVersion >= 254 {
+		return "geometric_capped_1s"
+	}
+	return "legacy_fixed_1s"
 }
 
 func Render(config Config) (Units, error) {
@@ -84,6 +112,7 @@ func Render(config Config) (Units, error) {
 	for _, root := range config.AllowedMountRoots {
 		helperArguments = append(helperArguments, "--oci-allowed-mount-root="+filepath.Clean(root))
 	}
+	restartPolicy := HelperRestartPolicy(config.SystemdVersion)
 	return Units{
 		Agent: []byte(`[Unit]
 Description=Wefty node agent
@@ -132,6 +161,7 @@ WantedBy=sockets.target
 Description=Wefty privileged OCI helper
 After=containerd.service
 Requires=containerd.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -141,7 +171,8 @@ Group=root
 ExecStart=` + quoteArguments(helperArguments) + `
 StandardOutput=journal
 StandardError=journal
-NoNewPrivileges=false
+Restart=on-failure
+` + restartPolicy + `NoNewPrivileges=false
 PrivateTmp=true
 ProtectHome=true
 `),

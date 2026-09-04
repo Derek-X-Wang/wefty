@@ -42,18 +42,19 @@ type computerStorageCopyFacts struct {
 }
 
 type computerStorageCopyManifest struct {
-	Version               int                         `json:"version"`
-	Request               CopyComputerStorageRequest  `json:"request"`
-	Phase                 computerStorageCopyPhase    `json:"phase"`
-	SourceDigest          string                      `json:"source_digest,omitempty"`
-	DestinationDigest     string                      `json:"destination_digest,omitempty"`
-	OSIdentityRekeyed     bool                        `json:"os_identity_rekeyed,omitempty"`
-	MachineIDBeforeDigest string                      `json:"machine_id_before_digest,omitempty"`
-	MachineIDAfterDigest  string                      `json:"machine_id_after_digest,omitempty"`
-	MachineIDRepaired     bool                        `json:"machine_id_repaired,omitempty"`
-	SourceUnchanged       bool                        `json:"source_unchanged,omitempty"`
-	FilesystemExpanded    bool                        `json:"filesystem_expanded,omitempty"`
-	Receipt               *ComputerStorageCopyReceipt `json:"receipt,omitempty"`
+	Version               int                             `json:"version"`
+	Request               CopyComputerStorageRequest      `json:"request"`
+	Phase                 computerStorageCopyPhase        `json:"phase"`
+	SourceDigest          string                          `json:"source_digest,omitempty"`
+	DestinationDigest     string                          `json:"destination_digest,omitempty"`
+	OSIdentityRekeyed     bool                            `json:"os_identity_rekeyed,omitempty"`
+	MachineIDBeforeDigest string                          `json:"machine_id_before_digest,omitempty"`
+	MachineIDAfterDigest  string                          `json:"machine_id_after_digest,omitempty"`
+	MachineIDRepaired     bool                            `json:"machine_id_repaired,omitempty"`
+	SourceUnchanged       bool                            `json:"source_unchanged,omitempty"`
+	FilesystemExpanded    bool                            `json:"filesystem_expanded,omitempty"`
+	Receipt               *ComputerStorageCopyReceipt     `json:"receipt,omitempty"`
+	Recovery              computerStorageRecoveryDeferral `json:"recovery,omitempty"`
 }
 
 func (engine *ContainerdEngine) storageCopyCheckpoint(phase computerStorageCopyPhase) error {
@@ -72,8 +73,8 @@ func writeComputerStorageCopyManifest(root string, manifest computerStorageCopyM
 }
 
 func readComputerStorageCopyManifest(path string) (computerStorageCopyManifest, bool, error) {
-	payload, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	payload, present, err := readComputerRecoveryRecord(path)
+	if !present && err == nil {
 		return computerStorageCopyManifest{}, false, nil
 	}
 	if err != nil {
@@ -371,6 +372,11 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		request.Authority.BootSessionID == "" || request.Authority.HelperGeneration == 0 || request.Authority.RootInstanceID == "" ||
 		request.Authority.JobID == "" || request.Authority.OperationRevision < 1 || request.Authority.CleanupFence == "" {
 		return CopyComputerStorageResponse{}, errors.New("Computer Storage copy request is incomplete")
+	}
+	if quarantined, err := computerDiskQuarantined(engine.config.RuntimeRoot, request.Destination); err != nil {
+		return CopyComputerStorageResponse{}, err
+	} else if quarantined {
+		return CopyComputerStorageResponse{}, &ComputerStorageQuarantinedError{Storage: request.Destination}
 	}
 	var sourcePath string
 	var err error

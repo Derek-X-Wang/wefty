@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -420,6 +421,40 @@ func TestComputerStorageCopyRequiresCurrentSessionAndReturnsBoundReceipt(t *test
 	}
 }
 
+func TestComputerStorageRecoveryStatesUseTypedWireCodes(t *testing.T) {
+	storage := ComputerStorageReference{ComputerID: "clone-computer", StorageID: "clone-storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 9 << 30}
+	for _, test := range []struct {
+		name      string
+		engineErr error
+		code      ErrorCode
+	}{
+		{name: "deferred", engineErr: &ComputerStorageResumeDeferredError{Storage: storage}, code: CodeComputerStorageResumeDeferred},
+		{name: "quarantined", engineErr: &ComputerStorageQuarantinedError{Storage: storage}, code: CodeComputerStorageQuarantined},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine := newFakeEngine()
+			engine.copyStorageErr = test.engineErr
+			client, stop := startTestServer(t, engine, ServerConfig{})
+			defer stop()
+			session, err := client.OpenSession(t.Context(), testSessionRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			requireSweep(t, session)
+			request := CopyComputerStorageRequest{Operation: "clone", BackupID: "backup", CopyID: "copy", SourceComputerID: "source", SourceStorageID: "source-storage",
+				SourceGeneration: 1, SourceSize: 8 << 30, SourceDigest: "sha256:" + strings.Repeat("a", 64), Destination: storage,
+				Authority: ComputerStorageCopyAuthority{NodeID: "node-1", BootSessionID: "boot-1", HelperGeneration: session.Handshake().SessionGeneration,
+					RootInstanceID: "root", JobID: "job", OperationRevision: 1, CleanupFence: "fence"}}
+			_, err = session.CopyComputerStorage(t.Context(), request)
+			var refusal *RPCError
+			if !errors.As(err, &refusal) || refusal.Code != test.code {
+				t.Fatalf("wire refusal=%+v err=%v", refusal, err)
+			}
+		})
+	}
+}
+
 func TestAttemptOutsideSessionIsDistinctFromNonLiveAttempt(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -732,6 +767,67 @@ func (engine *uncertainGrowTestEngine) GrowComputerStorage(context.Context, Grow
 	return GrowComputerStorageResponse{}, &ComputerStorageGrowUncertainError{Cause: errors.New("allocation reassertion failed")}
 }
 
+type blockingGrowTestEngine struct {
+	*fakeEngine
+	growEntered chan struct{}
+	releaseGrow chan struct{}
+	growRuns    atomic.Int32
+}
+
+func (engine *blockingGrowTestEngine) GrowComputerStorage(ctx context.Context, request GrowComputerStorageRequest) (GrowComputerStorageResponse, error) {
+	engine.growRuns.Add(1)
+	close(engine.growEntered)
+	select {
+	case <-engine.releaseGrow:
+		return GrowComputerStorageResponse{Receipt: ComputerStorageGrowReceipt{Kind: "computer_storage_grow_applied", Applied: true}}, nil
+	case <-ctx.Done():
+		return GrowComputerStorageResponse{}, ctx.Err()
+	}
+}
+
+func TestSweepCannotOverlapSameSessionGrow(t *testing.T) {
+	base := newFakeEngine()
+	engine := &blockingGrowTestEngine{fakeEngine: base, growEntered: make(chan struct{}), releaseGrow: make(chan struct{})}
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	// The admission sweep precedes the test overlap and must not use the probe channel.
+	requireSweep(t, session)
+	base.mu.Lock()
+	base.sweepEntered = make(chan struct{})
+	sweepEntered := base.sweepEntered
+	base.mu.Unlock()
+	handshake := session.Handshake()
+	request := GrowComputerStorageRequest{Storage: ComputerStorageReference{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, IntentRevision: 2, DiskBytes: 8 << 20}, NewDiskBytes: 16 << 20,
+		Authority: ComputerStorageGrowAuthority{NodeID: "node-1", BootSessionID: "boot-1", HelperGeneration: handshake.SessionGeneration, RootInstanceID: "root", JobID: "job", OperationRevision: 2, OperationFence: "fence"}}
+	growDone := make(chan error, 1)
+	go func() { _, err := session.GrowComputerStorage(t.Context(), request); growDone <- err }()
+	<-engine.growEntered
+	sweepDone := make(chan error, 1)
+	go func() { _, err := session.Sweep(t.Context(), SweepRequest{}); sweepDone <- err }()
+	select {
+	case <-sweepEntered:
+		t.Fatal("Sweep overlapped Grow")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(engine.releaseGrow)
+	if err := <-growDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sweepEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Sweep did not proceed after Grow")
+	}
+	if err := <-sweepDone; err != nil || engine.growRuns.Load() != 1 {
+		t.Fatalf("sweep err=%v grow runs=%d", err, engine.growRuns.Load())
+	}
+}
+
 func TestComputerStorageGrowUncertainIsTypedAndDoesNotInvalidateSession(t *testing.T) {
 	engine := &uncertainGrowTestEngine{fakeEngine: newFakeEngine()}
 	client, stop := startTestServer(t, engine, ServerConfig{})
@@ -1039,6 +1135,184 @@ func TestBootBarrierDefaultTakeoverReservesAStartupReapWindow(t *testing.T) {
 	if barrier.config.TakeoverTimeout != 2*defaultReapTimeout {
 		t.Fatalf("default takeover timeout = %s, want startup reap plus admission reap %s", barrier.config.TakeoverTimeout, 2*defaultReapTimeout)
 	}
+	if got := VerifiedReadyTimeoutForReap(defaultReapTimeout); got != 3*defaultReapTimeout {
+		t.Fatalf("verified-ready timeout = %s, want takeover plus fresh admission reap %s", got, 3*defaultReapTimeout)
+	}
+}
+
+func TestBootBarrierClassifiesRepeatedMissingSocketAsHelperUnitUnavailable(t *testing.T) {
+	dials := 0
+	client := &Client{
+		ExpectedChecksum: "checksum-test",
+		Dial: func(context.Context) (net.Conn, error) {
+			dials++
+			return nil, fmt.Errorf("socket activation: %w", syscall.ENOENT)
+		},
+	}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: 100 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var unavailable *HelperUnitUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.Code() != HelperUnitUnavailable || unavailable.DialAttempts < 2 || dials < 2 || barrier.Ready() {
+		t.Fatalf("missing helper socket outcome = %#v err=%v dials=%d ready=%t", unavailable, err, dials, barrier.Ready())
+	}
+	if reason := barrier.CapabilityReasonCode(); reason != contract.CapabilityReasonHelperUnitUnavailable {
+		t.Fatalf("missing helper socket capability reason = %q", reason)
+	}
+}
+
+func TestBootBarrierRetriesRefusedDialThenPublishesTypedUnavailable(t *testing.T) {
+	dials := 0
+	client := &Client{
+		ExpectedChecksum: "checksum-test",
+		Dial: func(context.Context) (net.Conn, error) {
+			dials++
+			return nil, syscall.ECONNREFUSED
+		},
+	}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: 50 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var unavailable *HelperUnitUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.DialAttempts < 2 || dials < 2 ||
+		barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperUnitUnavailable {
+		t.Fatalf("refused helper socket outcome = %#v err=%v dials=%d reason=%q", unavailable, err, dials, barrier.CapabilityReasonCode())
+	}
+}
+
+func TestBootBarrierClassifiesSocketBacklogWithoutCompletedHandshakeAsStalled(t *testing.T) {
+	dials := 0
+	client := &Client{
+		ExpectedChecksum: "checksum-test",
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			dials++
+			clientSide, serverSide := net.Pipe()
+			go func() {
+				<-ctx.Done()
+				_ = serverSide.Close()
+			}()
+			return clientSide, nil
+		},
+	}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: 50 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var stalled *HelperHandshakeStalledError
+	if !errors.As(err, &stalled) || stalled.DialAttempts != 1 || dials != 1 ||
+		barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperHandshakeStalled {
+		t.Fatalf("backlogged helper socket outcome = %#v err=%v dials=%d reason=%q", stalled, err, dials, barrier.CapabilityReasonCode())
+	}
+}
+
+func TestBootBarrierClassifiesLastDeadlineEdgeConnectionAsStalled(t *testing.T) {
+	dials := 0
+	client := &Client{ExpectedChecksum: "checksum-test", Dial: func(ctx context.Context) (net.Conn, error) {
+		dials++
+		if dials < 3 {
+			return nil, syscall.ENOENT
+		}
+		clientSide, serverSide := net.Pipe()
+		go func() { <-ctx.Done(); _ = serverSide.Close() }()
+		return clientSide, nil
+	}}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{TakeoverTimeout: 20 * time.Millisecond, TakeoverRetry: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var stalled *HelperHandshakeStalledError
+	if !errors.As(err, &stalled) || dials != 3 {
+		t.Fatalf("last connected dial classification = stalled=%#v err=%v dials=%d", stalled, err, dials)
+	}
+}
+
+func TestBootBarrierDoesNotReuseEarlierAbsenceForFinalUnknownDial(t *testing.T) {
+	dials := 0
+	client := &Client{ExpectedChecksum: "checksum-test", Dial: func(ctx context.Context) (net.Conn, error) {
+		dials++
+		if dials == 1 {
+			return nil, syscall.ENOENT
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{TakeoverTimeout: 20 * time.Millisecond, TakeoverRetry: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var unavailable *HelperUnitUnavailableError
+	var stalled *HelperHandshakeStalledError
+	if errors.As(err, &unavailable) || errors.As(err, &stalled) || dials != 2 {
+		t.Fatalf("final unknown dial reused stale classification: unavailable=%#v stalled=%#v err=%v dials=%d", unavailable, stalled, err, dials)
+	}
+}
+
+func TestBootBarrierDoesNotRetryProtocolRPCError(t *testing.T) {
+	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{})
+	defer stop()
+	dials := 0
+	originalDial := client.Dial
+	client.Dial = func(ctx context.Context) (net.Conn, error) {
+		dials++
+		return originalDial(ctx)
+	}
+	client.Version = ProtocolVersion + 1
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: 50 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(t.Context())
+	var rpcErr *RPCError
+	var unavailable *HelperUnitUnavailableError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != CodeVersionMismatch || errors.As(err, &unavailable) || dials != 1 {
+		t.Fatalf("protocol mismatch outcome = rpc=%#v unavailable=%#v err=%v dials=%d", rpcErr, unavailable, err, dials)
+	}
+}
+
+func TestBootBarrierDoesNotReclassifyCallerCancellationAsUnavailableUnit(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	dials := 0
+	client := &Client{
+		ExpectedChecksum: "checksum-test",
+		Dial: func(context.Context) (net.Conn, error) {
+			dials++
+			if dials == 2 {
+				cancel()
+			}
+			return nil, fmt.Errorf("socket activation: %w", syscall.ENOENT)
+		},
+	}
+	barrier, err := NewBootBarrierWithConfig(client, testSessionRequest(), BootBarrierConfig{
+		TakeoverTimeout: time.Second,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = barrier.Ensure(ctx)
+	var unavailable *HelperUnitUnavailableError
+	if errors.As(err, &unavailable) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("caller cancellation was reclassified: unavailable=%#v err=%v", unavailable, err)
+	}
 }
 
 func TestBootBarrierTakeoverIncludesSlowStartupAndAdmissionSweeps(t *testing.T) {
@@ -1053,7 +1327,7 @@ func TestBootBarrierTakeoverIncludesSlowStartupAndAdmissionSweeps(t *testing.T) 
 		wantReady       bool
 	}{
 		{name: "former one-reap window expires", takeoverTimeout: reapTimeout},
-		{name: "derived two-reap window passes", takeoverTimeout: takeoverTimeoutForReap(reapTimeout), wantReady: true},
+		{name: "derived two-reap window passes", takeoverTimeout: TakeoverTimeoutForReap(reapTimeout), wantReady: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			engine := newFakeEngine()
@@ -2977,6 +3251,7 @@ type fakeEngine struct {
 	createBackupResponse     CreateComputerBackupResponse
 	deleteBackupResponse     DeleteComputerBackupCopyResponse
 	copyStorageResponse      CopyComputerStorageResponse
+	copyStorageErr           error
 	exportCustodyResponse    ExportComputerCustodyResponse
 }
 
@@ -3579,7 +3854,7 @@ func (engine *fakeEngine) DeleteComputerBackupCopy(_ context.Context, _ DeleteCo
 	return engine.deleteBackupResponse, nil
 }
 func (engine *fakeEngine) CopyComputerStorage(_ context.Context, _ CopyComputerStorageRequest) (CopyComputerStorageResponse, error) {
-	return engine.copyStorageResponse, nil
+	return engine.copyStorageResponse, engine.copyStorageErr
 }
 func (engine *fakeEngine) ExportComputerCustody(_ context.Context, _ ExportComputerCustodyRequest) (ExportComputerCustodyResponse, error) {
 	return engine.exportCustodyResponse, nil

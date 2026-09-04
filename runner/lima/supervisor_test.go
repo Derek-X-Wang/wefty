@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -168,6 +170,151 @@ func TestRunningLimaWithUnreadyHelperIsBoundedAndForceStoppedOnce(t *testing.T) 
 	}
 	if facts := supervisor.Facts(); facts.State != InstanceStopped || facts.ReasonCode != contract.CapabilityReasonLimaStartTimeout {
 		t.Fatalf("stuck helper facts = %+v", facts)
+	}
+}
+
+type readyLimaHelperEngine struct{ ocihelper.UnavailableEngine }
+
+func (readyLimaHelperEngine) Sweep(_ context.Context, request ocihelper.SweepRequest) (ocihelper.SweepResponse, error) {
+	return ocihelper.SweepResponse{SweepEpoch: request.SweepEpoch}, nil
+}
+
+func (readyLimaHelperEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+	return ocihelper.VerifyResponse{Absent: true}, nil
+}
+
+func startReadyLimaHelper(t *testing.T, checksum string) string {
+	t.Helper()
+	temporary, err := os.CreateTemp("/tmp", "wefty-lima-helper-*.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := temporary.Name()
+	if err := temporary.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := ocihelper.NewServer(readyLimaHelperEngine{}, ocihelper.ServerConfig{
+		HelperVersion: "test", HelperChecksum: checksum, AllowedUIDs: []uint32{uint32(os.Getuid())},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, listener) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = listener.Close()
+		<-done
+		_ = os.Remove(path)
+	})
+	return path
+}
+
+func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	waits := 0
+	ready := false
+	checksum := "sha256:" + strings.Repeat("a", 64)
+	socketPath := startReadyLimaHelper(t, checksum)
+	supervisor.config.wait = func(context.Context, time.Duration) error {
+		waits++
+		ready = true
+		return nil
+	}
+	client := &ocihelper.Client{
+		Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum,
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			if !ready {
+				return nil, syscall.ECONNREFUSED
+			}
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		},
+	}
+	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{
+		TakeoverTimeout: 25 * time.Millisecond,
+		TakeoverRetry:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+	err = barrier.Ensure(t.Context())
+	if err != nil || !barrier.Ready() || barrier.CapabilityReasonCode() != "" || waits != 1 {
+		t.Fatalf("supervised repaired helper err=%v ready=%t reason=%q repair_waits=%d", err, barrier.Ready(), barrier.CapabilityReasonCode(), waits)
+	}
+}
+
+func TestSupervisedBarrierPersistentStalledHandshakeForceStopsAtRecoveryTimeout(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceRunning, InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	supervisor.config.RecoveryTimeout = 100 * time.Millisecond
+	supervisor.config.wait = func(ctx context.Context, _ time.Duration) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	client := &ocihelper.Client{Version: ocihelper.ProtocolVersion, ExpectedChecksum: "sha256:" + strings.Repeat("a", 64),
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			clientSide, serverSide := net.Pipe()
+			go func() { <-ctx.Done(); _ = serverSide.Close() }()
+			return clientSide, nil
+		}}
+	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{
+		TakeoverTimeout: 20 * time.Millisecond, TakeoverRetry: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+	err = barrier.Ensure(t.Context())
+	var stalled *ocihelper.HelperHandshakeStalledError
+	if !errors.As(err, &stalled) || barrier.CapabilityReasonCode() != contract.CapabilityReasonHelperHandshakeStalledPersistent || supervisor.Facts().StalledWindows == 0 {
+		t.Fatalf("stalled handshake err=%v reason=%q", err, barrier.CapabilityReasonCode())
+	}
+	stopped := false
+	for _, command := range runner.commandsSnapshot() {
+		if slices.Contains(command, "stop") {
+			stopped = true
+		}
+	}
+	if !stopped {
+		t.Fatalf("persistent stalled handshake did not force-stop Lima: %v", runner.commandsSnapshot())
+	}
+}
+
+func TestSupervisedBarrierStalledHandshakeRecoversBeforeRecoveryTimeout(t *testing.T) {
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	ready := false
+	checksum := "sha256:" + strings.Repeat("a", 64)
+	socketPath := startReadyLimaHelper(t, checksum)
+	supervisor.config.wait = func(context.Context, time.Duration) error { ready = true; return nil }
+	client := &ocihelper.Client{Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum, Dial: func(ctx context.Context) (net.Conn, error) {
+		if ready {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		}
+		clientSide, serverSide := net.Pipe()
+		go func() { <-ctx.Done(); _ = serverSide.Close() }()
+		return clientSide, nil
+	}}
+	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{TakeoverTimeout: 20 * time.Millisecond, TakeoverRetry: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+	if err := barrier.Ensure(t.Context()); err != nil || !barrier.Ready() || supervisor.Facts().StalledWindows != 0 {
+		t.Fatalf("stalled recovery err=%v ready=%t facts=%+v", err, barrier.Ready(), supervisor.Facts())
 	}
 }
 
@@ -345,6 +492,8 @@ func TestSupervisedBarrierReasonsStayInStableVocabulary(t *testing.T) {
 		{err: &ocihelper.RPCError{Code: ocihelper.CodeChecksumMismatch}, want: contract.CapabilityReasonHelperVersionMismatch},
 		{err: &ocihelper.RPCError{Code: ocihelper.CodeVersionMismatch}, want: contract.CapabilityReasonHelperVersionMismatch},
 		{err: &ocihelper.RPCError{Code: ocihelper.CodePeerUnauthenticated}, want: contract.CapabilityReasonLocalPermissionDenied},
+		{err: &ocihelper.HelperUnitUnavailableError{DialAttempts: 4, Cause: os.ErrNotExist}, want: contract.CapabilityReasonHelperUnitUnavailable},
+		{err: &ocihelper.HelperHandshakeStalledError{DialAttempts: 1, Cause: context.DeadlineExceeded}, want: contract.CapabilityReasonHelperHandshakeStalled},
 		{err: errors.New("acquire: dial OCI helper: connection refused at private path"), want: contract.CapabilityReasonHelperUnreachable},
 		{err: errors.New("send OCI helper handshake: reset"), want: contract.CapabilityReasonHelperHandshakeFailed},
 		{err: errors.New("verify OCI runtime namespace: residue"), want: contract.CapabilityReasonBootSweepFailed},

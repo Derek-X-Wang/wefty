@@ -177,6 +177,7 @@ type GuestHelperInstallConfig struct {
 	BootSessionID       string
 	MemoryCapacityBytes int64
 	MemoryReserveBytes  int64
+	SystemdVersion      int
 }
 
 type GuestHelperRemovalConfig struct {
@@ -272,9 +273,11 @@ func renderGuestServiceUnit(config GuestHelperInstallConfig) []byte {
 	for index := range arguments {
 		arguments[index] = systemdQuote(arguments[index])
 	}
+	restartPolicy := guestHelperRestartPolicy(config.SystemdVersion)
 	return []byte(`[Unit]
 Description=Wefty privileged OCI helper
 After=containerd.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -284,8 +287,32 @@ Environment=` + ocihelper.AllowedUIDsEnvironment + `=` + strconv.FormatUint(uint
 ExecStart=` + strings.Join(arguments, " ") + `
 StandardOutput=journal
 StandardError=journal
-NoNewPrivileges=false
+Restart=on-failure
+` + restartPolicy + `NoNewPrivileges=false
 `)
+}
+
+// RenderGuestHelperServiceUnit exposes the installed guest unit to contract
+// drift tests without duplicating its source template.
+func RenderGuestHelperServiceUnit(config GuestHelperInstallConfig) []byte {
+	return renderGuestServiceUnit(config)
+}
+
+func guestHelperRestartPolicy(systemdVersion int) string {
+	if systemdVersion >= 254 {
+		return "RestartSec=250ms\nRestartSteps=6\nRestartMaxDelaySec=1s\n"
+	}
+	return "RestartSec=1s\n"
+}
+
+func GuestHelperRestartPolicyName(systemdVersion int) string {
+	if systemdVersion == 0 {
+		return "conservative_fixed_1s"
+	}
+	if systemdVersion >= 254 {
+		return "geometric_capped_1s"
+	}
+	return "legacy_fixed_1s"
 }
 
 func systemdQuote(value string) string {

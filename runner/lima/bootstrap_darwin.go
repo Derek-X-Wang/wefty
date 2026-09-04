@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,36 @@ import (
 
 type guestHelperInstaller struct {
 	run commandRunner
+}
+
+func InspectGuestSystemdVersion(ctx context.Context, instance, limactl string) (int, error) {
+	if limactl == "" {
+		limactl = "limactl"
+	}
+	output, err := runCommand(ctx, limactl, "--tty=false", "shell", "--workdir=/", instance, "systemctl", "--version")
+	if err != nil {
+		return 0, errors.New("cannot inspect Lima guest systemd version")
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) < 2 || fields[0] != "systemd" {
+		return 0, errors.New("cannot parse Lima guest systemd version")
+	}
+	version, err := strconv.Atoi(fields[1])
+	if err != nil || version <= 0 {
+		return 0, errors.New("cannot parse Lima guest systemd version")
+	}
+	return version, nil
+}
+
+func InspectGuestHelperServiceUnit(ctx context.Context, instance, limactl string) (string, error) {
+	if limactl == "" {
+		limactl = "limactl"
+	}
+	output, err := runCommand(ctx, limactl, "--tty=false", "shell", "--workdir=/", instance, "systemctl", "cat", GuestHelperServiceUnit)
+	if err != nil {
+		return "", errors.New("cannot inspect Lima guest helper service unit")
+	}
+	return string(output), nil
 }
 
 func InstallGuestHelper(ctx context.Context, config GuestHelperInstallConfig) error {
@@ -35,11 +66,28 @@ func (installer guestHelperInstaller) install(ctx context.Context, config GuestH
 	if installer.run == nil {
 		installer.run = runCommand
 	}
+	if _, err := installer.run(ctx, config.Limactl, "--tty=false", "shell", "--workdir=/", config.Instance, "command", "-v", "e2fsck"); err != nil {
+		return errors.New("Lima guest requires e2fsprogs (e2fsck) before helper installation")
+	}
 	groups, err := installer.run(ctx, config.Limactl, "--tty=false", "shell", "--workdir=/", config.Instance, "id", "-nG", config.GuestUser)
 	if err != nil {
 		return errors.New("cannot inspect Lima guest helper group membership")
 	}
 	needsGroupRefresh := !slices.Contains(strings.Fields(string(groups)), "wefty-oci")
+	if config.SystemdVersion == 0 {
+		versionOutput, versionErr := installer.run(ctx, config.Limactl, "--tty=false", "shell", "--workdir=/", config.Instance, "systemctl", "--version")
+		if versionErr != nil {
+			return errors.New("cannot inspect Lima guest systemd version")
+		}
+		fields := strings.Fields(string(versionOutput))
+		if len(fields) < 2 || fields[0] != "systemd" {
+			return errors.New("cannot parse Lima guest systemd version")
+		}
+		config.SystemdVersion, err = strconv.Atoi(fields[1])
+		if err != nil {
+			return errors.New("cannot parse Lima guest systemd version")
+		}
+	}
 	staging, err := os.MkdirTemp("", "wefty-lima-helper-*")
 	if err != nil {
 		return err

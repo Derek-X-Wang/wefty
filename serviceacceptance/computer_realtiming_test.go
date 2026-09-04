@@ -275,6 +275,8 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		faultAction := action
 		if action == "kill-payload" || action == "kill-shim" {
 			faultAction += ":" + ready.CurrentJobID
+		} else if action == "kill-helper" {
+			faultAction += ":service-restart-survival"
 		}
 		triggerLinuxComputerFault(t, harness, faultAction)
 		if action == "stop-containerd" {
@@ -354,7 +356,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	resetIntent := reset.IntentRevision
 	resetCrashObserved := false
 	if !mutatingLinuxComputerRow("linux.reconfiguration") {
-		triggerLinuxComputerFault(t, harness, "kill-helper")
+		triggerLinuxComputerFault(t, harness, "kill-helper:service-reconfiguration-reset")
 		resetCrashObserved = true
 		if harness.agent.exited() {
 			harness.restartAgent(t)
@@ -707,18 +709,20 @@ func mergeAcceptanceInventory(left, right ocihelper.ResourceInventory) ocihelper
 		Containers: append(left.Containers, right.Containers...), Tasks: append(left.Tasks, right.Tasks...),
 		Shims: append(left.Shims, right.Shims...), Cgroups: append(left.Cgroups, right.Cgroups...),
 		LogSegments: append(left.LogSegments, right.LogSegments...), ManagedVolumes: append(left.ManagedVolumes, right.ManagedVolumes...),
-		ImageSpools:             append(left.ImageSpools, right.ImageSpools...),
-		ManagedVolumeRecords:    append(left.ManagedVolumeRecords, right.ManagedVolumeRecords...),
-		ComputerDiskImages:      append(left.ComputerDiskImages, right.ComputerDiskImages...),
-		ComputerDiskAllocations: append(left.ComputerDiskAllocations, right.ComputerDiskAllocations...),
-		ComputerDiskQuotas:      append(left.ComputerDiskQuotas, right.ComputerDiskQuotas...),
-		ComputerDiskManifests:   append(left.ComputerDiskManifests, right.ComputerDiskManifests...),
-		ComputerDiskMounts:      append(left.ComputerDiskMounts, right.ComputerDiskMounts...),
-		ComputerDiskLoops:       append(left.ComputerDiskLoops, right.ComputerDiskLoops...),
-		ComputerAttachments:     append(left.ComputerAttachments, right.ComputerAttachments...),
-		ComputerResetManifests:  append(left.ComputerResetManifests, right.ComputerResetManifests...),
-		ComputerQuarantines:     append(left.ComputerQuarantines, right.ComputerQuarantines...),
-		ComputerDiskAnomalies:   append(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies...),
+		ImageSpools:                append(left.ImageSpools, right.ImageSpools...),
+		ManagedVolumeRecords:       append(left.ManagedVolumeRecords, right.ManagedVolumeRecords...),
+		ComputerDiskImages:         append(left.ComputerDiskImages, right.ComputerDiskImages...),
+		ComputerDiskAllocations:    append(left.ComputerDiskAllocations, right.ComputerDiskAllocations...),
+		ComputerDiskQuotas:         append(left.ComputerDiskQuotas, right.ComputerDiskQuotas...),
+		ComputerDiskManifests:      append(left.ComputerDiskManifests, right.ComputerDiskManifests...),
+		ComputerDiskMounts:         append(left.ComputerDiskMounts, right.ComputerDiskMounts...),
+		ComputerDiskLoops:          append(left.ComputerDiskLoops, right.ComputerDiskLoops...),
+		ComputerAttachments:        append(left.ComputerAttachments, right.ComputerAttachments...),
+		ComputerResetManifests:     append(left.ComputerResetManifests, right.ComputerResetManifests...),
+		ComputerQuarantines:        append(left.ComputerQuarantines, right.ComputerQuarantines...),
+		ComputerStorageDeferred:    append(left.ComputerStorageDeferred, right.ComputerStorageDeferred...),
+		ComputerStorageQuarantined: append(left.ComputerStorageQuarantined, right.ComputerStorageQuarantined...),
+		ComputerDiskAnomalies:      append(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies...),
 	}
 }
 
@@ -1299,7 +1303,9 @@ func triggerLinuxComputerFault(t *testing.T, harness *acceptanceHarness, action 
 	fifo := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_FAULT_FIFO")
 	directory := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_FAULT_DIR")
 	done := filepath.Join(directory, action+".done")
+	failure := filepath.Join(directory, action+".failed")
 	_ = os.Remove(done)
+	_ = os.Remove(failure)
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, "sh", "-c", `printf '%s\n' "$1" > "$2"`, "wefty-fault", action, fifo)
@@ -1309,6 +1315,9 @@ func triggerLinuxComputerFault(t *testing.T, harness *acceptanceHarness, action 
 	for ctx.Err() == nil {
 		if _, err := os.Stat(done); err == nil {
 			return
+		}
+		if payload, err := os.ReadFile(failure); err == nil {
+			t.Fatalf("root assertion %s failed: %s", action, payload)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

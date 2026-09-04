@@ -254,7 +254,10 @@ func TestComputerStorageResetResumesEveryPreparationBoundaryThenUsesSharedRemova
 			}
 			before := ResourceInventory{}
 			if err := engine.inventoryComputerDiskResources(&before); err != nil ||
-				!slices.Contains(before.ComputerResetManifests, oldName) || !slices.Contains(before.ComputerQuarantines, oldName) {
+				!slices.Contains(before.ComputerResetManifests, oldName) || !slices.Contains(before.ComputerQuarantines, oldName) ||
+				!slices.ContainsFunc(before.ComputerStorageQuarantined, func(entry ComputerStorageRecoveryInventoryEntry) bool {
+					return entry.DiskName == oldName && entry.Operation == "legacy_reset" && entry.Reason == "legacy_reset_quarantine"
+				}) || len(before.ComputerDiskAnomalies) != 0 {
 				t.Fatalf("legacy reset residue was not inventoried: %+v err=%v", before, err)
 			}
 			if err := engine.deleteComputerDisk(storage, removal); err != nil {
@@ -262,7 +265,8 @@ func TestComputerStorageResetResumesEveryPreparationBoundaryThenUsesSharedRemova
 			}
 			after := ResourceInventory{}
 			if err := engine.inventoryComputerDiskResources(&after); err != nil ||
-				slices.Contains(after.ComputerResetManifests, oldName) || slices.Contains(after.ComputerQuarantines, oldName) {
+				slices.Contains(after.ComputerResetManifests, oldName) || slices.Contains(after.ComputerQuarantines, oldName) ||
+				slices.Contains(after.ComputerDiskAnomalies, oldName+"-reset-2:quarantine_authority_invalid") {
 				t.Fatalf("legacy reset residue survived shared removal: %+v err=%v", after, err)
 			}
 			resources := expectedComputerStorageRemovalResources(&storage)
@@ -326,7 +330,7 @@ func TestComputerStorageResetSweepDropsOnlyUnverifiedSuccessorPreparation(t *tes
 	if err := writeComputerDiskManifest(successorRoot, manifest); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.sweepComputerDisks("corrupted-preparation-sweep"); err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "corrupted-preparation-sweep"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(successorRoot); err != nil {
@@ -336,7 +340,7 @@ func TestComputerStorageResetSweepDropsOnlyUnverifiedSuccessorPreparation(t *tes
 	if err := writeComputerDiskManifest(successorRoot, manifest); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.sweepComputerDisks("replacement-sweep"); err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "replacement-sweep"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(successorRoot); !errors.Is(err, os.ErrNotExist) {
@@ -348,7 +352,7 @@ func TestComputerStorageResetSweepDropsOnlyUnverifiedSuccessorPreparation(t *tes
 	if err != nil || !response.Verified || response.Receipt.HelperGeneration != 2 {
 		t.Fatalf("reset did not recreate swept successor: %+v err=%v", response, err)
 	}
-	if err := engine.sweepComputerDisks("post-verification-sweep"); err != nil {
+	if err := engine.sweepComputerDisks(t.Context(), "post-verification-sweep"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(successorRoot); err != nil {

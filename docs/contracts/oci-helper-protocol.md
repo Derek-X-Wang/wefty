@@ -42,7 +42,31 @@ sidecar is installed because the authenticated handshake is the checksum
 authority. The socket unit creates
 `/run/wefty/oci-helper.sock` as exactly `0660 root:wefty-oci`; the Lima guest
 user is added to that group, while the service runs the private helper mode as
-root with a narrow UID allowlist. When setup adds that supplementary group for
+root with a narrow UID allowlist. Every shipped systemd helper service, native
+Linux and Lima, sets `StartLimitIntervalSec=0` under `[Unit]` and
+`Restart=on-failure`, `RestartSec=250ms`, `RestartSteps=6`, and
+`RestartMaxDelaySec=1s` under `[Service]`; systemd versions before 254 use a fixed
+`RestartSec=1s` because the geometric directives are unavailable. The workflow-written realtiming
+units use the same policy. `RestartSteps` and `RestartMaxDelaySec` require
+systemd 254; `ubuntu-latest` and the Lima `template:_images/ubuntu-24.04`
+baseline both provide systemd 255, and the Linux receipt records the executing
+version and selected rendering. The six steps are derived from the incident's six service starts in
+610 ms. At a saturated production restart counter, the kill plus six injected
+exits incur seven delays capped at one second: seven seconds total. Startup
+recovery is bounded by the enforced ten-second `ReapTimeout`; with the stated
+two-second margin, `7 s + 10 s + 2 s = 19 s`, within the unchanged
+`TakeoverTimeoutForReap(10 s)` window. The helper-exec-to-ready observation is
+reported as a measurement, not treated as a separate unenforced bound.
+This bounds saturated deterministic-failure churn at no more than 0.5 Hz
+instead of sustaining a four-Hz journal loop. Disabling the
+start-limit interval prevents service exhaustion from failing the triggering
+socket with `service-start-limit-hit`. The socket retains systemd's default
+trigger-limit policy; the current lane proves service recovery and active
+socket topology, but does not claim a separate trigger-limit proof. The lane
+records the exact helper-kill action-name set
+`{native-computer-helper-death,native-lost-attempt-sweep,service-reconfiguration-reset,service-restart-survival}`
+from the root fault-action journal. When
+setup adds that supplementary group for
 the first time, it performs one ordinary stop/start so Lima's guest agent picks
 up membership; an already-member rerun does not restart the VM. The host
 verifies socket ownership, protocol major, helper version, and checksum
@@ -180,6 +204,21 @@ takeover path and is re-observed by the lane's
 `startup_sweep_to_takeover_elapsed` receipt. The preferred design—answering
 handshakes during startup while gating admission on verified cleanup—is deferred
 to #301 because it changes startup concurrency and authority publication.
+While taking over, the client retries dial-time `ENOENT`, `ECONNREFUSED`, and
+`ECONNRESET` within that same fixed window. Protocol, authentication, and typed
+RPC errors after a completed handshake stay hard and immediate. Window expiry
+returns `helper_unit_unavailable` only when every dial positively observed
+`ENOENT`, `ECONNREFUSED`, or `ECONNRESET`. A connected socket backlog that never
+completes a handshake returns retryable `helper_handshake_stalled`; Lima
+rechecks and backs off but never force-stops the VM for that reason.
+`BootBarrier`
+publishes that distinct closed-vocabulary reason through the native agent
+capability receipt, and Lima preserves it while still running the same bounded
+automated repair loop as `helper_unreachable`. A fully missing socket therefore now costs the complete
+20-second takeover window before the typed failure is published; sweep and
+verification may then use one fresh ten-second reap window, so the composed
+kill-to-verified-ready success bound is 30 seconds. An earlier caller deadline
+or cancellation remains distinct.
 The takeover retry timer uses the injected helper clock. The heartbeat pump
 notifies the barrier synchronously when control authority is lost.
 
@@ -742,8 +781,13 @@ replay that receipt but cannot restamp it with a newer generation.
 `GrowComputerStorage` binds its receipt to Computer, Storage generation, Node,
 managed-root instance, Job, operation revision and fence, helper generation,
 and both byte counts. Grow serializes with reset, Backup, attach, detach, and
-removal. Its crash boundaries are capacity reservation, filesystem expansion,
-and manifest publication; retry inspects durable image and manifest facts and
+removal. Before filesystem expansion it durably writes `storage-grow.json`
+with the exact old and target sizes and operation authority. Startup reconciles
+that record before namespace verification: an untouched old-size image rolls
+back by removing the intent, while a target-size image is idempotently resized,
+allocation-verified, and published in `attachment.json`. Its crash boundaries
+are therefore capacity reservation, durable intent, filesystem expansion, and
+manifest publication; retry inspects durable image and manifest facts and
 never reports applied before full allocation plus filesystem expansion. The
 capacity decision includes unmaterialized admitted reservations under the same
 lock, so existing workloads retain their reservations and the newcomer pays.
@@ -759,6 +803,53 @@ receipt. `capacity.active_failure` separately projects current launch/runtime
 resource latches from `last_failure`. A pending, superseded, or absent grow
 receipt remains `NOT-RUN` with `grow_pending`, `grow_superseded`, or
 `grow_receipt_absent`, respectively.
+
+`CopyComputerStorage` records its staged identity and phases in
+`storage-copy.json`. Startup treats the `manifest_written` phase plus the exact
+staged or renamed image digest as resumable authority, completes the atomic
+rename when needed, verifies allocation, and publishes `attachment.json`
+before inventory admission; an earlier staged phase is rolled back because no
+destination generation was published. Grow and copy recovery emit typed
+`resumed` or `rolled_back` sweep evidence. Operational recovery failures with
+valid durable authority increment `attempts`, preserve `first_deferred_at` and
+a closed reason, emit `resume_deferred`, and keep that Computer generation
+unattachable. Only boot-barrier startup sweeps increment the durable attempt
+count; in-session `ReapSession` sweeps retain state without consuming it.
+Recovery becomes terminal only after both 24 failed helper-start sweeps and 24
+elapsed hours: `resume_abandoned` quarantines the
+generation while preserving its last deferral reason and original
+`first_deferred_at` timestamp in the receipt and typed inventory. The 24-attempt
+cap is a minimum repeated-observation bound, not an assumed hourly cadence; the
+independent wall-clock floor prevents rapid helper flaps or barrier retries from
+consuming that budget in minutes. Grow recovery preens
+ext4 with `e2fsck -f -p` before resizing, and exit 1 is recorded as corrected
+filesystem sweep evidence. A
+size/allocation mismatch without matching durable operation
+authority is never reinterpreted as a successful operation: startup moves the
+whole generation into `computer-disk-quarantine`, writes a typed
+`computer_disk_anomaly_quarantined` record, and emits `quarantined` sweep
+evidence with the closed reason. Quarantined generations remain visible in
+`ComputerQuarantines` and operator/removal surfaces but are durable retained
+state, not runnable namespace residue. Quarantine receipts retain the full
+payload for 24 hours. GC revalidates the complete receipt under the generation
+flock, records `payload_dropped_at` and typed evidence, and keeps the receipt
+and lock tombstone until authorized removal. Invalid authority never permits
+byte deletion, and GC failure does not fail helper startup, so generation N is
+never admissible again. The
+authorized recovery path is a reset that prepares and admits generation N+1,
+followed by normal removal authority for N. The affected Computer therefore stays
+fail-closed while the helper continues serving the rest of the Node. Startup's
+namespace-absence promise remains exact for every non-quarantined generation.
+
+Required-file recovery classification is exact:
+
+| Observation | Classification | Startup action |
+| --- | --- | --- |
+| `ENOENT` or `ENOTDIR` for a required file | structural absence | quarantine with a typed missing/authority reason |
+| non-absence read or stat error on a regular required file, including `EIO` or `EACCES` | operational | retain and emit `resume_deferred` |
+| required recovery record is a directory, symlink, or other non-regular file | structural invalidity | quarantine with `record_not_regular` |
+| bytes read completely but invalid JSON, version, or fields | structural invalidity | quarantine with typed authority-invalid evidence |
+| verified size, allocation, or digest mismatch | structural mismatch | quarantine the generation |
 
 `PreflightComputerReimage` runs only after the old Job is stopped and the disk
 manifest contains exact same-boot reap or prior-boot sweep evidence. Image

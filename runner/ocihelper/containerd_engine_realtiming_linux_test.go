@@ -834,7 +834,7 @@ func TestNativeLinuxSweepClearsLostAttemptLogSpoolAndPopulatedCgroup(t *testing.
 	requestRootFault(t, "save-attempt-record:"+identity.ContainerID)
 	sweepStarted := time.Now()
 	sweepBound := session.Handshake().ReapTimeout
-	requestRootFault(t, "kill-helper")
+	requestRootFault(t, "kill-helper:native-lost-attempt-sweep")
 	startupSweepToTakeoverStarted := time.Now()
 	barrier.Invalidate()
 	if err := barrier.Ensure(ctx); err != nil {
@@ -910,6 +910,160 @@ func TestNativeLinuxSweepClearsLostAttemptLogSpoolAndPopulatedCgroup(t *testing.
 			t.Fatal(err)
 		}
 	}
+}
+
+func TestNativeLinuxHelperRestartsAcrossLaneFaultBudget(t *testing.T) {
+	const historicalRapidStartupFailures = 6
+	helperSocket := os.Getenv("WEFTY_OCI_HELPER_SOCKET")
+	helperChecksum := os.Getenv("WEFTY_OCI_HELPER_CHECKSUM")
+	evidenceDirectory := os.Getenv("WEFTY_REALTIME_EVIDENCE_DIR")
+	if helperSocket == "" || helperChecksum == "" || evidenceDirectory == "" {
+		t.Fatal("Linux OCI helper restart provisioning is incomplete")
+	}
+	client := ocihelper.NewUnixClient(helperSocket, helperChecksum)
+	client.HeartbeatInterval = time.Second
+	barrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{
+		NodeID: "native-helper-restart-node", BootSessionID: "native-helper-restart-boot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer barrier.Close()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	previous, ok := barrier.Generation()
+	if !ok {
+		t.Fatal("initial helper generation was not published")
+	}
+	session, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reapTimeout := session.Handshake().ReapTimeout
+	readyBound := ocihelper.VerifiedReadyTimeoutForReap(reapTimeout)
+	stderrPath := "/tmp/wefty-oci-helper-realtiming.stderr"
+	beforeFailures := countHelperStartupFailureInjections(t, stderrPath)
+	faultStarted := time.Now()
+	requestRootFault(t, fmt.Sprintf("reproduce-helper-start-burst:%d", historicalRapidStartupFailures))
+	barrier.Invalidate()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatalf("helper did not recover from the measured rapid startup-failure sequence: %v", err)
+	}
+	killToReadyElapsed := time.Since(faultStarted)
+	helperExecPayload, err := os.ReadFile("/tmp/wefty-oci-faults/helper-exec-start-ns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperExecStartedNS, err := strconv.ParseInt(strings.TrimSpace(string(helperExecPayload)), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperExecToReadyElapsed := time.Since(time.Unix(0, helperExecStartedNS))
+	current, ok := barrier.Generation()
+	if !ok || current.HelperInstanceID == previous.HelperInstanceID {
+		t.Fatalf("rapid startup-failure sequence did not publish a replacement generation: previous=%+v current=%+v present=%t", previous, current, ok)
+	}
+	if killToReadyElapsed > readyBound {
+		t.Fatalf("kill to verified-ready took %s, exceeds composed takeover-plus-admission bound %s", killToReadyElapsed, readyBound)
+	}
+	requestRootFault(t, "assert-helper-units-active")
+	if info, err := os.Stat(helperSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("helper socket path is not active after burst recovery: info=%v err=%v", info, err)
+	}
+	afterFailures := countHelperStartupFailureInjections(t, stderrPath)
+	observedFailures := afterFailures - beforeFailures
+	if observedFailures != historicalRapidStartupFailures {
+		t.Fatalf("injected startup failure count = %d, want measured incident count %d", observedFailures, historicalRapidStartupFailures)
+	}
+
+	incidentStorage := ocihelper.ComputerStorageReference{ComputerID: "round2-crash", StorageID: "round2-storage",
+		StorageGeneration: 1, IntentRevision: 1, DiskBytes: 16 << 20}
+	incidentDiskName, err := ocihelper.DeterministicComputerDiskName(incidentStorage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incidentStarted := time.Now()
+	requestRootFault(t, "manufacture-computer-allocation-mismatch:"+incidentDiskName)
+	barrier.Invalidate()
+	if err := barrier.Ensure(t.Context()); err != nil {
+		t.Fatalf("helper did not quarantine the durable allocation mismatch: %v", err)
+	}
+	incidentElapsed := time.Since(incidentStarted)
+	if incidentElapsed > ocihelper.TakeoverTimeoutForReap(reapTimeout) {
+		t.Fatalf("durable mismatch quarantine admission took %s, exceeds takeover window %s", incidentElapsed, ocihelper.TakeoverTimeoutForReap(reapTimeout))
+	}
+	incidentReceipt, ok := barrier.SweepReceipt()
+	if !ok || !incidentReceipt.VerifiedAbsent || !slices.Contains(incidentReceipt.VerifiedRetained.ComputerQuarantines, incidentDiskName) {
+		t.Fatalf("durable mismatch quarantine receipt = %+v present=%t", incidentReceipt, ok)
+	}
+	var quarantineEvidence *ocihelper.SweepEvidence
+	for index := range incidentReceipt.SweepEvidence {
+		candidate := &incidentReceipt.SweepEvidence[index]
+		if candidate.ID == incidentDiskName && candidate.Action == ocihelper.SweepActionQuarantined {
+			quarantineEvidence = candidate
+			break
+		}
+	}
+	if quarantineEvidence == nil || quarantineEvidence.Method != "allocation_mismatch" {
+		t.Fatalf("durable mismatch quarantine evidence = %+v", incidentReceipt.SweepEvidence)
+	}
+	cleanupSession, err := barrier.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupResponse, err := cleanupSession.DeleteManagedVolume(t.Context(), ocihelper.DeleteManagedVolumeRequest{
+		Kind: ocihelper.ManagedVolumeComputerDisk, ComputerStorage: &incidentStorage,
+		Removal: &ocihelper.ManagedVolumeRemovalAuthority{NodeID: "native-helper-restart-node", BootSessionID: "native-helper-restart-boot",
+			JobID: "round3-quarantine-cleanup", PriorJobID: "round2-crash-job", RemovalGeneration: 1, CleanupFence: "round3-quarantine-cleanup"},
+	})
+	if err != nil || !cleanupResponse.Deleted {
+		t.Fatalf("authorized quarantine cleanup = %+v err=%v", cleanupResponse, err)
+	}
+
+	barrier.Invalidate()
+	requestRootFault(t, "stop-helper-topology")
+	topologyStopped := true
+	defer func() {
+		if topologyStopped {
+			requestRootFault(t, "start-helper-topology")
+		}
+	}()
+	unavailableBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{
+		NodeID: "native-helper-unavailable-node", BootSessionID: "native-helper-unavailable-boot",
+	}, ocihelper.BootBarrierConfig{TakeoverReapTimeout: reapTimeout})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailableStarted := time.Now()
+	err = unavailableBarrier.Ensure(t.Context())
+	unavailableElapsed := time.Since(unavailableStarted)
+	var unavailable *ocihelper.HelperUnitUnavailableError
+	if !errors.As(err, &unavailable) || unavailableBarrier.CapabilityReasonCode() != contract.CapabilityReasonHelperUnitUnavailable {
+		t.Fatalf("stopped helper topology outcome = %#v err=%v capability_reason=%q", unavailable, err, unavailableBarrier.CapabilityReasonCode())
+	}
+	_ = unavailableBarrier.Close()
+	requestRootFault(t, "start-helper-topology")
+	topologyStopped = false
+
+	var evidence strings.Builder
+	fmt.Fprintf(&evidence, "observed_startup_failures=%d\n", observedFailures)
+	fmt.Fprintf(&evidence, "fault_1_kill_to_verified_ready_elapsed_ns=%d\nfault_1_kill_to_verified_ready_bound_ns=%d\nfault_1_within_verified_ready_bound=true\nfault_1_helper_instance=%s\n", killToReadyElapsed.Nanoseconds(), readyBound.Nanoseconds(), current.HelperInstanceID)
+	fmt.Fprintf(&evidence, "helper_exec_to_handshake_ready_elapsed_ns=%d\n", helperExecToReadyElapsed.Nanoseconds())
+	fmt.Fprintf(&evidence, "disk_quarantine_action=%s\ndisk_quarantine_reason=%s\ndisk_quarantine_barrier_admitted=true\ndisk_quarantine_elapsed_ns=%d\ndisk_quarantine_bound_ns=%d\n", quarantineEvidence.Action, quarantineEvidence.Method, incidentElapsed.Nanoseconds(), ocihelper.TakeoverTimeoutForReap(reapTimeout).Nanoseconds())
+	fmt.Fprintf(&evidence, "unavailable_elapsed_ns=%d\nunavailable_takeover_window_ns=%d\ncapability_reason=%s\nsocket_and_service_active_after_recovery=true\n", unavailableElapsed.Nanoseconds(), ocihelper.TakeoverTimeoutForReap(reapTimeout).Nanoseconds(), unavailableBarrier.CapabilityReasonCode())
+	if err := os.WriteFile(filepath.Join(evidenceDirectory, "helper-restart-timeline.txt"), []byte(evidence.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func countHelperStartupFailureInjections(t *testing.T, path string) int {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(payload), "injected helper startup failure remaining=")
 }
 
 var nativeBarrierLossSequence atomic.Uint64
@@ -1462,7 +1616,7 @@ func exerciseNativeLinuxComputerDisk(t *testing.T, ctx context.Context, barrier 
 	if _, err := session.Run(ctx, contender); err == nil {
 		t.Fatal("real Computer attempt B attached while A owned the Storage generation")
 	}
-	requestRootFault(t, "kill-helper")
+	requestRootFault(t, "kill-helper:native-computer-helper-death")
 	barrier.Invalidate()
 	if err := barrier.Ensure(ctx); err != nil {
 		t.Fatalf("Computer helper-death sweep failed: %v", err)
@@ -1683,6 +1837,8 @@ func mergeNativeExpectedInventory(left, right ocihelper.ResourceInventory) ocihe
 	left.ComputerAttachments = mergeNativeIdentityClass(left.ComputerAttachments, right.ComputerAttachments)
 	left.ComputerResetManifests = mergeNativeIdentityClass(left.ComputerResetManifests, right.ComputerResetManifests)
 	left.ComputerQuarantines = mergeNativeIdentityClass(left.ComputerQuarantines, right.ComputerQuarantines)
+	left.ComputerStorageDeferred = append(left.ComputerStorageDeferred, right.ComputerStorageDeferred...)
+	left.ComputerStorageQuarantined = append(left.ComputerStorageQuarantined, right.ComputerStorageQuarantined...)
 	left.ComputerDiskAnomalies = mergeNativeIdentityClass(left.ComputerDiskAnomalies, right.ComputerDiskAnomalies)
 	return left
 }
@@ -1713,8 +1869,20 @@ func subtractNativeInventory(inventory, baseline ocihelper.ResourceInventory) oc
 	inventory.ComputerAttachments = subtractNativeIdentityClass(inventory.ComputerAttachments, baseline.ComputerAttachments)
 	inventory.ComputerResetManifests = subtractNativeIdentityClass(inventory.ComputerResetManifests, baseline.ComputerResetManifests)
 	inventory.ComputerQuarantines = subtractNativeIdentityClass(inventory.ComputerQuarantines, baseline.ComputerQuarantines)
+	inventory.ComputerStorageDeferred = subtractNativeRecoveryInventory(inventory.ComputerStorageDeferred, baseline.ComputerStorageDeferred)
+	inventory.ComputerStorageQuarantined = subtractNativeRecoveryInventory(inventory.ComputerStorageQuarantined, baseline.ComputerStorageQuarantined)
 	inventory.ComputerDiskAnomalies = subtractNativeIdentityClass(inventory.ComputerDiskAnomalies, baseline.ComputerDiskAnomalies)
 	return inventory
+}
+
+func subtractNativeRecoveryInventory(values, baseline []ocihelper.ComputerStorageRecoveryInventoryEntry) []ocihelper.ComputerStorageRecoveryInventoryEntry {
+	result := make([]ocihelper.ComputerStorageRecoveryInventoryEntry, 0, len(values))
+	for _, value := range values {
+		if !slices.Contains(baseline, value) {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func subtractNativeIdentityClass(inventory, baseline []string) []string {

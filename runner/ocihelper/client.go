@@ -14,6 +14,14 @@ import (
 
 type DialFunc func(context.Context) (net.Conn, error)
 
+// helperDialError keeps transport establishment failures distinct from
+// handshake and protocol failures. The boot barrier may retry only this
+// class while systemd is replacing a socket-activated helper.
+type helperDialError struct{ cause error }
+
+func (err *helperDialError) Error() string { return fmt.Sprintf("dial OCI helper: %v", err.cause) }
+func (err *helperDialError) Unwrap() error { return err.cause }
+
 type Client struct {
 	Dial                 DialFunc
 	Version              int
@@ -63,6 +71,10 @@ func (client *Client) protocolVersion() int {
 }
 
 func (client *Client) OpenSession(ctx context.Context, request AcquireSessionRequest) (*Session, error) {
+	return client.openSession(ctx, request, nil)
+}
+
+func (client *Client) openSession(ctx context.Context, request AcquireSessionRequest, connected *bool) (*Session, error) {
 	if client == nil || client.ExpectedChecksum == "" {
 		return nil, errors.New("OCI helper checksum verification is required")
 	}
@@ -74,7 +86,10 @@ func (client *Client) OpenSession(ctx context.Context, request AcquireSessionReq
 	}
 	connection, err := client.Dial(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("dial OCI helper: %w", err)
+		return nil, &helperDialError{cause: err}
+	}
+	if connected != nil {
+		*connected = true
 	}
 	stopCancellation := context.AfterFunc(ctx, func() { _ = connection.Close() })
 	defer stopCancellation()

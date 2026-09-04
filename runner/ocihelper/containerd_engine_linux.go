@@ -133,6 +133,14 @@ type ContainerdEngine struct {
 	computerGrowResize          func(context.Context, string, string, int64, int64) error
 	computerGrowFilesystemBytes func(context.Context, string) (int64, error)
 	computerGrowAllocate        func(string, int64) error
+	computerGrowPreen           func(context.Context, string) error
+	computerRecoveryDigest      func(context.Context, string) (string, error)
+	computerQuarantineHook      func(computerDiskQuarantinePhase) error
+	computerQuarantineRemoveAll func(string) error
+	computerDiskSweepMu         sync.Mutex
+	computerDiskSweepEvidence   []SweepEvidence
+	computerRecoveryMu          sync.Mutex
+	computerOperationalDeferred map[string]ComputerStorageRecoveryInventoryEntry
 	computerReimageImageInspect func(context.Context, PreflightComputerReimageRequest) (computerReimageImageFacts, error)
 	computerReimageDiskOwner    func(context.Context, string) (uint32, uint32, error)
 	lastProfile                 *ProfileReceipt
@@ -2233,8 +2241,12 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 			return SweepResponse{}, err
 		}
 	}
-	if err := engine.sweepComputerDisks(request.SweepEpoch); err != nil {
-		return SweepResponse{}, err
+	engine.computerDiskSweepMu.Lock()
+	sweepComputerDiskErr := engine.sweepComputerDisksWithRecoveryAttempt(ctx, request.SweepEpoch, request.countComputerStorageRecoveryAttempt)
+	computerDiskEvidence := slices.Clone(engine.computerDiskSweepEvidence)
+	engine.computerDiskSweepMu.Unlock()
+	if sweepComputerDiskErr != nil {
+		return SweepResponse{}, sweepComputerDiskErr
 	}
 	response, err := engine.finishSweep(ctx, inventory, prior, attempts)
 	if err != nil {
@@ -2259,7 +2271,8 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	response.Removed = inventoryCount(subtractResourceInventory(observedInventory, remaining))
 	response.Inventory = observedInventory
 	response.DurableRetentions = append(logRetentions, cgroupRetentions...)
-	response.Evidence = append(logEvidence, cgroupEvidence...)
+	response.Evidence = append(computerDiskEvidence, logEvidence...)
+	response.Evidence = append(response.Evidence, cgroupEvidence...)
 	if err := engine.removeQuiescentAttemptOwnershipRecords(ownership, remaining); err != nil {
 		return SweepResponse{}, err
 	}
@@ -3254,7 +3267,7 @@ func (engine *ContainerdEngine) watchOOM(attempt *containerdAttempt) {
 }
 
 func (engine *ContainerdEngine) inventory(ctx context.Context) (ResourceInventory, error) {
-	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ImageSpools: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerDiskAnomalies: []string{}}
+	result := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ImageSpools: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerStorageDeferred: []ComputerStorageRecoveryInventoryEntry{}, ComputerStorageQuarantined: []ComputerStorageRecoveryInventoryEntry{}, ComputerDiskAnomalies: []string{}}
 	leaseList, err := engine.client.LeasesService().List(ctx)
 	if err != nil {
 		return result, err
@@ -3387,6 +3400,12 @@ func sortResourceInventory(result *ResourceInventory) {
 	sort.Strings(result.ComputerAttachments)
 	sort.Strings(result.ComputerResetManifests)
 	sort.Strings(result.ComputerQuarantines)
+	sort.Slice(result.ComputerStorageDeferred, func(i, j int) bool {
+		return recoveryInventoryEntryKey(result.ComputerStorageDeferred[i]) < recoveryInventoryEntryKey(result.ComputerStorageDeferred[j])
+	})
+	sort.Slice(result.ComputerStorageQuarantined, func(i, j int) bool {
+		return recoveryInventoryEntryKey(result.ComputerStorageQuarantined[i]) < recoveryInventoryEntryKey(result.ComputerStorageQuarantined[j])
+	})
 	sort.Strings(result.ComputerDiskAnomalies)
 }
 
@@ -3422,7 +3441,7 @@ func inventoryManagedVolumeResources(runtimeRoot string, result *ResourceInvento
 }
 
 func filterInventory(inventory ResourceInventory, resources ResourceIdentity, attachment *computerDiskAttachment) ResourceInventory {
-	filtered := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ImageSpools: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerDiskAnomalies: []string{}}
+	filtered := ResourceInventory{Leases: []string{}, Snapshots: []string{}, Containers: []string{}, Tasks: []string{}, Shims: []string{}, Cgroups: []string{}, LogSegments: []string{}, ImageSpools: []string{}, ManagedVolumes: []string{}, ManagedVolumeRecords: []string{}, ComputerDiskImages: []string{}, ComputerDiskAllocations: []string{}, ComputerDiskQuotas: []string{}, ComputerDiskManifests: []string{}, ComputerDiskMounts: []string{}, ComputerDiskLoops: []string{}, ComputerAttachments: []string{}, ComputerResetManifests: []string{}, ComputerQuarantines: []string{}, ComputerStorageDeferred: []ComputerStorageRecoveryInventoryEntry{}, ComputerStorageQuarantined: []ComputerStorageRecoveryInventoryEntry{}, ComputerDiskAnomalies: []string{}}
 	for _, pair := range []struct {
 		values []string
 		target string
@@ -3449,6 +3468,16 @@ func filterInventory(inventory ResourceInventory, resources ResourceIdentity, at
 				if value == pair.target {
 					*pair.output = append(*pair.output, value)
 				}
+			}
+		}
+		for _, entry := range inventory.ComputerStorageDeferred {
+			if entry.DiskName == attachment.name {
+				filtered.ComputerStorageDeferred = append(filtered.ComputerStorageDeferred, entry)
+			}
+		}
+		for _, entry := range inventory.ComputerStorageQuarantined {
+			if entry.DiskName == attachment.name {
+				filtered.ComputerStorageQuarantined = append(filtered.ComputerStorageQuarantined, entry)
 			}
 		}
 	}
@@ -4505,12 +4534,34 @@ func projectRuntimeAbsenceInventory(inventory ResourceInventory, retainedService
 	retainedComputerDisk := func(name string) bool {
 		_, manifestPresent := manifestNames[name]
 		_, anomalous := anomalousNames[name]
-		return manifestPresent && !anomalous
+		if anomalous {
+			return false
+		}
+		if manifestPresent {
+			return true
+		}
+		for _, retained := range projected.ComputerStorageDeferred {
+			if retained.DiskName == name {
+				return true
+			}
+		}
+		for _, retained := range projected.ComputerStorageQuarantined {
+			if retained.DiskName == name {
+				return true
+			}
+		}
+		return false
 	}
 	projected.ComputerDiskImages = slices.DeleteFunc(projected.ComputerDiskImages, retainedComputerDisk)
 	projected.ComputerDiskAllocations = slices.DeleteFunc(projected.ComputerDiskAllocations, retainedComputerDisk)
 	projected.ComputerDiskQuotas = slices.DeleteFunc(projected.ComputerDiskQuotas, retainedComputerDisk)
 	projected.ComputerDiskManifests = slices.DeleteFunc(projected.ComputerDiskManifests, retainedComputerDisk)
+	// Quarantined generations are durable, operator-visible evidence. They do
+	// not represent runnable namespace state and therefore do not block the
+	// helper from serving unaffected Computers.
+	projected.ComputerQuarantines = nil
+	projected.ComputerStorageDeferred = nil
+	projected.ComputerStorageQuarantined = nil
 	return projected, nil
 }
 
@@ -4532,26 +4583,28 @@ func subtractResourceInventory(observed, residue ResourceInventory) ResourceInve
 		return result
 	}
 	return ResourceInventory{
-		Leases:                  subtract(observed.Leases, residue.Leases),
-		Snapshots:               subtract(observed.Snapshots, residue.Snapshots),
-		Containers:              subtract(observed.Containers, residue.Containers),
-		Tasks:                   subtract(observed.Tasks, residue.Tasks),
-		Shims:                   subtract(observed.Shims, residue.Shims),
-		Cgroups:                 subtract(observed.Cgroups, residue.Cgroups),
-		LogSegments:             subtract(observed.LogSegments, residue.LogSegments),
-		ImageSpools:             subtract(observed.ImageSpools, residue.ImageSpools),
-		ManagedVolumes:          subtract(observed.ManagedVolumes, residue.ManagedVolumes),
-		ManagedVolumeRecords:    subtract(observed.ManagedVolumeRecords, residue.ManagedVolumeRecords),
-		ComputerDiskImages:      subtract(observed.ComputerDiskImages, residue.ComputerDiskImages),
-		ComputerDiskAllocations: subtract(observed.ComputerDiskAllocations, residue.ComputerDiskAllocations),
-		ComputerDiskQuotas:      subtract(observed.ComputerDiskQuotas, residue.ComputerDiskQuotas),
-		ComputerDiskManifests:   subtract(observed.ComputerDiskManifests, residue.ComputerDiskManifests),
-		ComputerDiskMounts:      subtract(observed.ComputerDiskMounts, residue.ComputerDiskMounts),
-		ComputerDiskLoops:       subtract(observed.ComputerDiskLoops, residue.ComputerDiskLoops),
-		ComputerAttachments:     subtract(observed.ComputerAttachments, residue.ComputerAttachments),
-		ComputerResetManifests:  subtract(observed.ComputerResetManifests, residue.ComputerResetManifests),
-		ComputerQuarantines:     subtract(observed.ComputerQuarantines, residue.ComputerQuarantines),
-		ComputerDiskAnomalies:   subtract(observed.ComputerDiskAnomalies, residue.ComputerDiskAnomalies),
+		Leases:                     subtract(observed.Leases, residue.Leases),
+		Snapshots:                  subtract(observed.Snapshots, residue.Snapshots),
+		Containers:                 subtract(observed.Containers, residue.Containers),
+		Tasks:                      subtract(observed.Tasks, residue.Tasks),
+		Shims:                      subtract(observed.Shims, residue.Shims),
+		Cgroups:                    subtract(observed.Cgroups, residue.Cgroups),
+		LogSegments:                subtract(observed.LogSegments, residue.LogSegments),
+		ImageSpools:                subtract(observed.ImageSpools, residue.ImageSpools),
+		ManagedVolumes:             subtract(observed.ManagedVolumes, residue.ManagedVolumes),
+		ManagedVolumeRecords:       subtract(observed.ManagedVolumeRecords, residue.ManagedVolumeRecords),
+		ComputerDiskImages:         subtract(observed.ComputerDiskImages, residue.ComputerDiskImages),
+		ComputerDiskAllocations:    subtract(observed.ComputerDiskAllocations, residue.ComputerDiskAllocations),
+		ComputerDiskQuotas:         subtract(observed.ComputerDiskQuotas, residue.ComputerDiskQuotas),
+		ComputerDiskManifests:      subtract(observed.ComputerDiskManifests, residue.ComputerDiskManifests),
+		ComputerDiskMounts:         subtract(observed.ComputerDiskMounts, residue.ComputerDiskMounts),
+		ComputerDiskLoops:          subtract(observed.ComputerDiskLoops, residue.ComputerDiskLoops),
+		ComputerAttachments:        subtract(observed.ComputerAttachments, residue.ComputerAttachments),
+		ComputerResetManifests:     subtract(observed.ComputerResetManifests, residue.ComputerResetManifests),
+		ComputerQuarantines:        subtract(observed.ComputerQuarantines, residue.ComputerQuarantines),
+		ComputerStorageDeferred:    subtractRecoveryInventory(observed.ComputerStorageDeferred, residue.ComputerStorageDeferred),
+		ComputerStorageQuarantined: subtractRecoveryInventory(observed.ComputerStorageQuarantined, residue.ComputerStorageQuarantined),
+		ComputerDiskAnomalies:      subtract(observed.ComputerDiskAnomalies, residue.ComputerDiskAnomalies),
 	}
 }
 
@@ -4586,7 +4639,21 @@ func readDirectoryIfPresent(path string) ([]os.DirEntry, error) {
 }
 
 func inventoryCount(inventory ResourceInventory) int {
-	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ImageSpools) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) + len(inventory.ComputerQuarantines) + len(inventory.ComputerDiskAnomalies)
+	return len(inventory.Leases) + len(inventory.Snapshots) + len(inventory.Containers) + len(inventory.Tasks) + len(inventory.Shims) + len(inventory.Cgroups) + len(inventory.LogSegments) + len(inventory.ImageSpools) + len(inventory.ManagedVolumes) + len(inventory.ManagedVolumeRecords) + len(inventory.ComputerDiskImages) + len(inventory.ComputerDiskAllocations) + len(inventory.ComputerDiskQuotas) + len(inventory.ComputerDiskManifests) + len(inventory.ComputerDiskMounts) + len(inventory.ComputerDiskLoops) + len(inventory.ComputerAttachments) + len(inventory.ComputerResetManifests) + len(inventory.ComputerQuarantines) + len(inventory.ComputerStorageDeferred) + len(inventory.ComputerStorageQuarantined) + len(inventory.ComputerDiskAnomalies)
+}
+
+func subtractRecoveryInventory(values, excluded []ComputerStorageRecoveryInventoryEntry) []ComputerStorageRecoveryInventoryEntry {
+	excludedSet := make(map[ComputerStorageRecoveryInventoryEntry]struct{}, len(excluded))
+	for _, entry := range excluded {
+		excludedSet[entry] = struct{}{}
+	}
+	result := make([]ComputerStorageRecoveryInventoryEntry, 0, len(values))
+	for _, entry := range values {
+		if _, found := excludedSet[entry]; !found {
+			result = append(result, entry)
+		}
+	}
+	return result
 }
 
 func kernelRelease() string {
