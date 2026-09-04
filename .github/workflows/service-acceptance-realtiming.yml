@@ -422,7 +422,7 @@ jobs:
                   /usr/local/bin/ctr --address /run/wefty-containerd/containerd.sock version >/dev/null
                   chmod 0600 /run/wefty-containerd/containerd.sock
                   ;;
-                kill-helper:native-lost-attempt-sweep|kill-helper:native-computer-helper-death|kill-helper:service-restart-survival|kill-helper:service-reconfiguration-reset)
+                kill-helper:native-lost-attempt-sweep|kill-helper:native-computer-helper-death|kill-helper:service-restart-survival|kill-helper:service-reconfiguration-reset|kill-helper:service-l1-fresh-attempt)
                   systemctl kill --kill-who=all --signal=KILL wefty-oci-helper-realtiming.service
                   for _ in $(seq 1 300); do
                     if systemctl is-active --quiet wefty-oci-helper-realtiming.socket && systemctl is-active --quiet wefty-oci-helper-realtiming.service; then break; fi
@@ -612,7 +612,7 @@ jobs:
           go version >> "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
           go test -count=1 -p 1 -timeout=75m -v -tags=service_acceptance_realtiming ./...
           if [ "$RUNNER_OS" = Linux ]; then
-            expected_helper_kill_set='native-computer-helper-death,native-lost-attempt-sweep,service-reconfiguration-reset,service-restart-survival'
+            expected_helper_kill_set='native-computer-helper-death,native-lost-attempt-sweep,service-l1-fresh-attempt,service-reconfiguration-reset,service-restart-survival'
             lane_helper_kill_set="$(sed -n 's/^kill-helper://p' /tmp/wefty-oci-faults/actions.log | sort -u | paste -sd, -)"
             lane_reproduction_faults="$(grep -c '^reproduce-helper-start-burst:' /tmp/wefty-oci-faults/actions.log)"
             lane_product_path_faults="$(grep -c '^manufacture-computer-allocation-mismatch:' /tmp/wefty-oci-faults/actions.log)"
@@ -736,7 +736,7 @@ jobs:
             grep -Fx 'fault_1_within_verified_ready_bound=true' "$timeline"
             grep -Fx 'capability_reason=helper_unit_unavailable' "$timeline"
             grep -Fx 'socket_and_service_active_after_recovery=true' "$timeline"
-            grep -Fx 'lane_helper_kill_action_set=native-computer-helper-death,native-lost-attempt-sweep,service-reconfiguration-reset,service-restart-survival' "$timeline"
+            grep -Fx 'lane_helper_kill_action_set=native-computer-helper-death,native-lost-attempt-sweep,service-l1-fresh-attempt,service-reconfiguration-reset,service-restart-survival' "$timeline"
             grep -Fx 'lane_reproduction_fault_actions=1' "$timeline"
             grep -Fx 'lane_product_path_fault_actions=1' "$timeline"
             grep -Fx 'startup_failure_arm=6' "$timeline"

@@ -32,6 +32,17 @@ require_unique_boolean() {
   fi
 }
 
+require_unique_match() {
+  file=$1
+  key=$2
+  pattern=$3
+  count=$(awk -v prefix="$key=" 'index($0, prefix) == 1 { count++ } END { print count + 0 }' "$file")
+  if [ "$count" -ne 1 ] || ! grep -Eq "^${key}=${pattern}$" "$file"; then
+    printf 'receipt must contain exactly one valid %s fact\n' "$key" >&2
+    exit 1
+  fi
+}
+
 duration_within_bound() {
   duration_remaining=$1
   duration_limit_seconds=$2
@@ -204,7 +215,33 @@ case "$evidence_source" in
 esac
 
 require_unique_value "$l1_agent_receipt" service_fresh_attempt_readmission true
-require_duration_within "$l1_agent_receipt" service_recovery_elapsed 15
+require_unique_value "$l1_agent_receipt" service_helper_loss_injected true
+require_unique_value "$l1_agent_receipt" service_helper_loss_observed true
+require_unique_value "$l1_agent_receipt" service_barrier_advertised_reap_timeout 10s
+require_unique_value "$l1_agent_receipt" service_barrier_takeover_bound 20s
+require_unique_value "$l1_agent_receipt" service_barrier_verified_ready_bound 30s
+require_unique_value "$l1_agent_receipt" service_fresh_attempt_admission_bound 28s
+require_unique_value "$l1_agent_receipt" service_fresh_attempt_admission_margin 2s
+require_unique_value "$l1_agent_receipt" service_fresh_attempt_admission_margin_basis round4_cleanup_lt_600ms_ceil_1s_plus_preface_admission_ceil_1s
+require_unique_value "$l1_agent_receipt" service_recovery_bound 28s
+require_unique_value "$l1_agent_receipt" service_barrier_prefaced_during_startup true
+for timeline_key in service_helper_loss_observed_at service_barrier_started_at service_barrier_preface_completed_at service_barrier_session_admitted_at service_barrier_verified_ready_at service_fresh_attempt_admitted_at; do
+  require_unique_match "$l1_agent_receipt" "$timeline_key" '20[0-9]{2}-[0-9]{2}-[0-9]{2}T[^=]+Z'
+done
+require_duration_within_receipt_bound "$l1_agent_receipt" service_fresh_attempt_admission_elapsed service_fresh_attempt_admission_bound
+require_duration_within_receipt_bound "$l1_agent_receipt" service_kill_to_fresh_attempt_admission_elapsed service_fresh_attempt_admission_bound
+require_duration_within_receipt_bound "$l1_agent_receipt" service_recovery_elapsed service_recovery_bound
+require_duration_within_receipt_bound "$l1_agent_receipt" service_barrier_handshake_elapsed service_barrier_takeover_bound
+require_duration_within_receipt_bound "$l1_agent_receipt" service_barrier_session_admission_elapsed service_barrier_takeover_bound
+require_duration_within_receipt_bound "$l1_agent_receipt" service_barrier_sweep_elapsed service_barrier_advertised_reap_timeout
+require_duration_within_receipt_bound "$l1_agent_receipt" service_barrier_verify_elapsed service_barrier_advertised_reap_timeout
+require_duration_within_receipt_bound "$l1_agent_receipt" service_barrier_verified_ready_elapsed service_barrier_verified_ready_bound
+require_unique_value "$l1_agent_receipt" service_lost_log_typed true
+lost_log_disposition_count=$(grep -Ec '^service_lost_log_disposition=(swept|retained):[a-z_]+$' "$l1_agent_receipt" || true)
+if [ "$lost_log_disposition_count" -ne 1 ]; then
+  printf 'receipt must contain one typed lost-attempt log disposition\n' >&2
+  exit 1
+fi
 require_unique_value "$service_receipt" term_kill_escalation true
 require_unique_boolean "$service_receipt" term_kill_log_evidence_incomplete
 require_unique_value "$service_receipt" term_kill_log_seal_pairing true

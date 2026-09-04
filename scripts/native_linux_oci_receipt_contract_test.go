@@ -25,7 +25,7 @@ func TestNativeLinuxOCIReceiptDistinguishesPRDeviationFromPublishedProof(t *test
 			receipt:        publishedNativeOCIReceipt(),
 			serviceReceipt: servicePublicationReceipt(false),
 			l1Receipt:      serviceReadmissionReceipt(),
-			traceContains:  "key=service_recovery_elapsed value=127ms parsed_ns=127000000 bound_ns=15000000000 result=accepted",
+			traceContains:  "key=service_fresh_attempt_admission_elapsed value=127ms parsed_ns=127000000 bound_ns=28000000000 result=accepted",
 			wantOK:         true,
 		},
 		{
@@ -92,43 +92,64 @@ func TestNativeLinuxOCIReceiptDistinguishesPRDeviationFromPublishedProof(t *test
 			source:         "published-artifact",
 			receipt:        publishedNativeOCIReceipt(),
 			serviceReceipt: servicePublicationReceipt(false),
-			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=soon\n",
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_fresh_attempt_admission_elapsed=127ms", "service_fresh_attempt_admission_elapsed=soon", 1),
 		},
 		{
 			name:           "zero recovery duration fails closed",
 			source:         "published-artifact",
 			receipt:        publishedNativeOCIReceipt(),
 			serviceReceipt: servicePublicationReceipt(false),
-			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=0s\n",
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_fresh_attempt_admission_elapsed=127ms", "service_fresh_attempt_admission_elapsed=0s", 1),
 		},
 		{
 			name:           "nanosecond literal is not measured evidence",
 			source:         "published-artifact",
 			receipt:        publishedNativeOCIReceipt(),
 			serviceReceipt: servicePublicationReceipt(false),
-			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=1ns\n",
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_fresh_attempt_admission_elapsed=127ms", "service_fresh_attempt_admission_elapsed=1ns", 1),
 		},
 		{
 			name:           "recovery beyond production bound fails closed",
 			source:         "published-artifact",
 			receipt:        publishedNativeOCIReceipt(),
 			serviceReceipt: servicePublicationReceipt(false),
-			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=15.01s\n",
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_fresh_attempt_admission_elapsed=127ms", "service_fresh_attempt_admission_elapsed=30.01s", 1),
+		},
+		{
+			name:           "end-to-end recovery beyond receipt bound fails closed",
+			source:         "published-artifact",
+			receipt:        publishedNativeOCIReceipt(),
+			serviceReceipt: servicePublicationReceipt(false),
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_recovery_elapsed=183ms", "service_recovery_elapsed=28.01s", 1),
+		},
+		{
+			name:           "startup preface fact is gated",
+			source:         "published-artifact",
+			receipt:        publishedNativeOCIReceipt(),
+			serviceReceipt: servicePublicationReceipt(false),
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_barrier_prefaced_during_startup=true", "service_barrier_prefaced_during_startup=false", 1),
+		},
+		{
+			name:           "lost log disposition must be unique",
+			source:         "published-artifact",
+			receipt:        publishedNativeOCIReceipt(),
+			serviceReceipt: servicePublicationReceipt(false),
+			l1Receipt:      serviceReadmissionReceipt() + "service_lost_log_disposition=retained:log_spool_sealing\n",
 		},
 		{
 			name:           "composite Go duration beyond bound fails closed",
 			source:         "published-artifact",
 			receipt:        publishedNativeOCIReceipt(),
 			serviceReceipt: servicePublicationReceipt(false),
-			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=1m24.78s\n",
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_fresh_attempt_admission_elapsed=127ms", "service_fresh_attempt_admission_elapsed=1m24.78s", 1),
 		},
 		{
 			name:           "exact lane recovery duration beyond bound fails closed",
 			source:         "published-artifact",
 			receipt:        publishedNativeOCIReceipt(),
 			serviceReceipt: servicePublicationReceipt(false),
-			l1Receipt:      "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=1m24.782166924s\n",
-			traceContains:  "key=service_recovery_elapsed value=1m24.782166924s parsed_ns=84782166924 bound_ns=15000000000 result=rejected",
+			l1Receipt:      strings.Replace(serviceReadmissionReceipt(), "service_fresh_attempt_admission_elapsed=127ms", "service_fresh_attempt_admission_elapsed=1m24.782166924s", 1),
+			traceContains:  "key=service_fresh_attempt_admission_elapsed value=1m24.782166924s parsed_ns=84782166924 bound_ns=28000000000 result=rejected",
 		},
 		{
 			name:           "republication beyond receipt observation deadline fails closed",
@@ -189,7 +210,18 @@ func prNativeOCIReceipt() string {
 }
 
 func serviceReadmissionReceipt() string {
-	return "service_fresh_attempt_readmission=true\nservice_recovery_elapsed=127ms\n"
+	return "service_fresh_attempt_readmission=true\nservice_helper_loss_injected=true\nservice_helper_loss_observed=true\n" +
+		"service_helper_loss_observed_at=2026-09-04T12:00:00Z\nservice_recovery_elapsed=183ms\nservice_recovery_bound=28s\n" +
+		"service_fresh_attempt_admission_elapsed=127ms\nservice_kill_to_fresh_attempt_admission_elapsed=151ms\nservice_fresh_attempt_admission_bound=28s\n" +
+		"service_fresh_attempt_admission_margin=2s\nservice_fresh_attempt_admission_margin_basis=round4_cleanup_lt_600ms_ceil_1s_plus_preface_admission_ceil_1s\n" +
+		"service_fresh_attempt_admitted_at=2026-09-04T12:00:00.151Z\n" +
+		"service_barrier_advertised_reap_timeout=10s\nservice_barrier_takeover_bound=20s\nservice_barrier_verified_ready_bound=30s\n" +
+		"service_barrier_started_at=2026-09-04T12:00:00.024Z\nservice_barrier_preface_completed_at=2026-09-04T12:00:00.035Z\n" +
+		"service_barrier_session_admitted_at=2026-09-04T12:00:00.103Z\nservice_barrier_verified_ready_at=2026-09-04T12:00:00.136Z\n" +
+		"service_barrier_prefaced_during_startup=true\n" +
+		"service_barrier_handshake_elapsed=11ms\nservice_barrier_session_admission_elapsed=79ms\n" +
+		"service_barrier_sweep_elapsed=31ms\nservice_barrier_verify_elapsed=2ms\nservice_barrier_verified_ready_elapsed=112ms\n" +
+		"service_lost_log_typed=true\nservice_lost_log_disposition=swept:removed\n"
 }
 
 func servicePublicationReceipt(logEvidenceIncomplete bool) string {

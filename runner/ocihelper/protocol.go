@@ -259,6 +259,7 @@ type AcquireSessionResponse struct {
 	HeartbeatTimeout      time.Duration `json:"heartbeat_timeout"`
 	MaximumAttemptDeadman time.Duration `json:"maximum_attempt_deadman"`
 	ReapTimeout           time.Duration `json:"reap_timeout"`
+	StartupInProgress     bool          `json:"startup_in_progress"`
 }
 
 // HelperSession identifies one opaque helper process/session generation
@@ -1443,20 +1444,38 @@ type SweptAttemptAuthority struct {
 
 // VerifiedSweepReceipt joins the engine's sweep inventory with an independent
 // empty namespace observation and the exact helper session that performed it.
+type BootBarrierTimelineReceipt struct {
+	AdvertisedReapTimeout   time.Duration `json:"advertised_reap_timeout"`
+	TakeoverBound           time.Duration `json:"takeover_bound"`
+	VerifiedReadyBound      time.Duration `json:"verified_ready_bound"`
+	HelperLossObservedAt    time.Time     `json:"helper_loss_observed_at,omitempty"`
+	BarrierStartedAt        time.Time     `json:"barrier_started_at"`
+	PrefaceCompletedAt      time.Time     `json:"preface_completed_at"`
+	SessionAdmittedAt       time.Time     `json:"session_admitted_at"`
+	VerifiedReadyAt         time.Time     `json:"verified_ready_at"`
+	PrefacedDuringStartup   bool          `json:"prefaced_during_startup"`
+	HandshakeElapsed        time.Duration `json:"handshake_elapsed"`
+	SessionAdmissionElapsed time.Duration `json:"session_admission_elapsed"`
+	SweepElapsed            time.Duration `json:"sweep_elapsed"`
+	VerifyElapsed           time.Duration `json:"verify_elapsed"`
+	VerifiedReadyElapsed    time.Duration `json:"verified_ready_elapsed"`
+}
+
 type VerifiedSweepReceipt struct {
-	SweepEpoch                      string                  `json:"sweep_epoch"`
-	HelperSession                   HelperSession           `json:"helper_session"`
-	PriorBootSessionsSeen           []SessionIdentity       `json:"prior_boot_sessions_seen"`
-	SweptInventory                  ResourceInventory       `json:"swept_inventory"`
-	VerifiedAbsent                  bool                    `json:"verified_absent"`
-	VerifiedInventory               ResourceInventory       `json:"verified_inventory"`
-	VerifiedResidue                 ResourceInventory       `json:"verified_residue"`
-	VerifiedRetained                ResourceInventory       `json:"verified_retained"`
-	ComputerStorageDeferredCount    int                     `json:"computer_storage_deferred_count"`
-	ComputerStorageQuarantinedCount int                     `json:"computer_storage_quarantined_count"`
-	DurableRetentions               []DurableRetention      `json:"durable_retentions"`
-	SweepEvidence                   []SweepEvidence         `json:"sweep_evidence"`
-	Attempts                        []SweptAttemptAuthority `json:"attempts"`
+	SweepEpoch                      string                     `json:"sweep_epoch"`
+	HelperSession                   HelperSession              `json:"helper_session"`
+	PriorBootSessionsSeen           []SessionIdentity          `json:"prior_boot_sessions_seen"`
+	SweptInventory                  ResourceInventory          `json:"swept_inventory"`
+	VerifiedAbsent                  bool                       `json:"verified_absent"`
+	VerifiedInventory               ResourceInventory          `json:"verified_inventory"`
+	VerifiedResidue                 ResourceInventory          `json:"verified_residue"`
+	VerifiedRetained                ResourceInventory          `json:"verified_retained"`
+	ComputerStorageDeferredCount    int                        `json:"computer_storage_deferred_count"`
+	ComputerStorageQuarantinedCount int                        `json:"computer_storage_quarantined_count"`
+	DurableRetentions               []DurableRetention         `json:"durable_retentions"`
+	SweepEvidence                   []SweepEvidence            `json:"sweep_evidence"`
+	Attempts                        []SweptAttemptAuthority    `json:"attempts"`
+	BarrierTimeline                 BootBarrierTimelineReceipt `json:"barrier_timeline"`
 }
 
 type DialAttemptPortRequest struct {

@@ -60,6 +60,8 @@ type Server struct {
 	serveCtx              context.Context
 	fatalErr              error
 	fatalOnce             sync.Once
+	startupDone           chan struct{}
+	startupErr            error
 	nextSessionGeneration uint64
 	startupSweep          *SweepResponse
 	sessionReapSweep      *SweepResponse
@@ -225,6 +227,7 @@ func NewServer(engine Engine, config ServerConfig) (*Server, error) {
 		engine: engine, config: config,
 		instanceID:         instanceID,
 		connections:        make(chan struct{}, config.ConnectionLimit),
+		startupDone:        make(chan struct{}),
 		reapedBootSessions: make(map[SessionIdentity]uint64),
 	}, nil
 }
@@ -233,17 +236,24 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if listener == nil {
 		return errors.New("OCI helper listener is required")
 	}
-	// A restarted helper has no trustworthy in-memory session history. Sweep
-	// and verify before accepting even the first session; each acquired session
-	// must then repeat the same barrier before OCI operations are admitted.
-	if err := server.sweepAndVerifyStartup(ctx); err != nil {
-		_ = listener.Close()
-		return err
-	}
 	server.sessionMu.Lock()
 	server.listener = listener
 	server.serveCtx = ctx
 	server.sessionMu.Unlock()
+	// A restarted helper has no trustworthy in-memory session history. Accept
+	// connections while startup cleanup runs so an authenticated peer can learn
+	// the helper's configured reap bound, but do not mint session authority until
+	// the complete startup Sweep+Verify succeeds.
+	go func() {
+		err := server.sweepAndVerifyStartup(ctx)
+		server.sessionMu.Lock()
+		server.startupErr = err
+		close(server.startupDone)
+		server.sessionMu.Unlock()
+		if err != nil {
+			server.fail(err)
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		server.sessionMu.Lock()
@@ -377,6 +387,32 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 		_ = writeFailure(wire, CodeChecksumMismatch, "helper checksum does not match agent expectation")
 		return
 	}
+	startupInProgress := true
+	select {
+	case <-server.startupDone:
+		startupInProgress = false
+	default:
+	}
+	handshake := AcquireSessionResponse{
+		ProtocolVersion: ProtocolVersion, HelperVersion: server.config.HelperVersion,
+		HelperChecksum: server.config.HelperChecksum, HelperInstanceID: server.instanceID,
+		HeartbeatTimeout: server.config.HeartbeatTimeout, MaximumAttemptDeadman: server.config.MaximumAttemptDeadman,
+		ReapTimeout: server.config.ReapTimeout, StartupInProgress: startupInProgress,
+	}
+	if err := writeSuccess(wire, handshake); err != nil {
+		return
+	}
+	select {
+	case <-server.startupDone:
+		server.sessionMu.Lock()
+		startupErr := server.startupErr
+		server.sessionMu.Unlock()
+		if startupErr != nil {
+			return
+		}
+	case <-ctx.Done():
+		return
+	}
 	capability, err := randomCapability()
 	if err != nil {
 		_ = writeRPCError(wire, engineFailureRPC(MethodAcquireSession, "session capability generation failed", EngineFailureOperationFailed))
@@ -400,13 +436,9 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 	}
 	server.active = session
 	server.sessionMu.Unlock()
-	response := AcquireSessionResponse{
-		ProtocolVersion: ProtocolVersion, HelperVersion: server.config.HelperVersion,
-		HelperChecksum: server.config.HelperChecksum, SessionCapability: capability,
-		HelperInstanceID: server.instanceID, SessionGeneration: generation,
-		HeartbeatTimeout: server.config.HeartbeatTimeout, MaximumAttemptDeadman: server.config.MaximumAttemptDeadman,
-		ReapTimeout: server.config.ReapTimeout,
-	}
+	response := handshake
+	response.SessionCapability = capability
+	response.SessionGeneration = generation
 	if err := writeSuccess(wire, response); err != nil {
 		session.invalidate("session handshake response failed")
 		return

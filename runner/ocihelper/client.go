@@ -22,6 +22,13 @@ type helperDialError struct{ cause error }
 func (err *helperDialError) Error() string { return fmt.Sprintf("dial OCI helper: %v", err.cause) }
 func (err *helperDialError) Unwrap() error { return err.cause }
 
+type sessionAdmissionTransportError struct{ cause error }
+
+func (err *sessionAdmissionTransportError) Error() string {
+	return fmt.Sprintf("await OCI helper session admission: %v", err.cause)
+}
+func (err *sessionAdmissionTransportError) Unwrap() error { return err.cause }
+
 type Client struct {
 	Dial                 DialFunc
 	Version              int
@@ -71,10 +78,12 @@ func (client *Client) protocolVersion() int {
 }
 
 func (client *Client) OpenSession(ctx context.Context, request AcquireSessionRequest) (*Session, error) {
-	return client.openSession(ctx, request, nil)
+	return client.openSession(ctx, request, nil, time.Time{}, nil)
 }
 
-func (client *Client) openSession(ctx context.Context, request AcquireSessionRequest, connected *bool) (*Session, error) {
+type sessionHandshakeObserver func(AcquireSessionResponse) (time.Time, error)
+
+func (client *Client) openSession(ctx context.Context, request AcquireSessionRequest, connected *bool, initialDeadline time.Time, observe sessionHandshakeObserver) (*Session, error) {
 	if client == nil || client.ExpectedChecksum == "" {
 		return nil, errors.New("OCI helper checksum verification is required")
 	}
@@ -84,16 +93,23 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 	if request.ExpectedHelperChecksum == "" {
 		request.ExpectedHelperChecksum = client.ExpectedChecksum
 	}
-	connection, err := client.Dial(ctx)
+	dialContext := ctx
+	cancelDial := func() {}
+	if !initialDeadline.IsZero() {
+		dialContext, cancelDial = context.WithDeadline(ctx, initialDeadline)
+	}
+	connection, err := client.Dial(dialContext)
 	if err != nil {
+		cancelDial()
 		return nil, &helperDialError{cause: err}
 	}
+	defer cancelDial()
 	if connected != nil {
 		*connected = true
 	}
 	stopCancellation := context.AfterFunc(ctx, func() { _ = connection.Close() })
 	defer stopCancellation()
-	if err := applyContextDeadline(ctx, connection); err != nil {
+	if err := applyConnectionDeadline(ctx, connection, initialDeadline); err != nil {
 		_ = connection.Close()
 		return nil, err
 	}
@@ -107,21 +123,51 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 		_ = connection.Close()
 		return nil, fmt.Errorf("send OCI helper handshake: %w", err)
 	}
-	var response AcquireSessionResponse
-	if err := decodeResponse(wire, &response); err != nil {
+	var handshake AcquireSessionResponse
+	if err := decodeResponse(wire, &handshake); err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	if err := validateSessionHandshake(client, handshake, false); err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	if observe != nil {
+		deadline, err := observe(handshake)
+		if err != nil {
+			_ = connection.Close()
+			return nil, err
+		}
+		if err := applyConnectionDeadline(ctx, connection, deadline); err != nil {
+			_ = connection.Close()
+			return nil, err
+		}
+	}
+	response := handshake
+	if response.SessionCapability == "" && response.SessionGeneration == 0 {
+		if err := decodeResponse(wire, &response); err != nil {
+			_ = connection.Close()
+			if helperHandshakeTransportFailure(err) {
+				return nil, &sessionAdmissionTransportError{cause: err}
+			}
+			return nil, err
+		}
+		if err := validateSessionHandshake(client, response, true); err != nil {
+			_ = connection.Close()
+			return nil, err
+		}
+		if response.ProtocolVersion != handshake.ProtocolVersion || response.HelperVersion != handshake.HelperVersion ||
+			response.HelperChecksum != handshake.HelperChecksum || response.HelperInstanceID != handshake.HelperInstanceID ||
+			response.HeartbeatTimeout != handshake.HeartbeatTimeout || response.MaximumAttemptDeadman != handshake.MaximumAttemptDeadman ||
+			response.ReapTimeout != handshake.ReapTimeout || response.StartupInProgress != handshake.StartupInProgress {
+			_ = connection.Close()
+			return nil, errors.New("OCI helper changed handshake facts before session admission")
+		}
+	} else if err := validateSessionHandshake(client, response, true); err != nil {
 		_ = connection.Close()
 		return nil, err
 	}
 	_ = connection.SetDeadline(time.Time{})
-	if response.ProtocolVersion != client.protocolVersion() || response.SessionCapability == "" ||
-		response.HelperInstanceID == "" || response.SessionGeneration == 0 || response.ReapTimeout <= 0 {
-		_ = connection.Close()
-		return nil, errors.New("OCI helper returned an invalid handshake")
-	}
-	if client.ExpectedChecksum != "" && response.HelperChecksum != client.ExpectedChecksum {
-		_ = connection.Close()
-		return nil, &RPCError{Code: CodeChecksumMismatch, Message: "helper checksum does not match local expectation"}
-	}
 	pumpCtx, pumpCancel := context.WithCancel(context.Background())
 	session := &Session{
 		client: client, capability: response.SessionCapability, control: connection, controlWire: wire, response: response,
@@ -134,6 +180,29 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 		go session.heartbeatPump()
 	}
 	return session, nil
+}
+
+func validateSessionHandshake(client *Client, response AcquireSessionResponse, requireAuthority bool) error {
+	if response.ProtocolVersion != client.protocolVersion() || response.HelperInstanceID == "" || response.ReapTimeout <= 0 {
+		return errors.New("OCI helper returned an invalid handshake")
+	}
+	if requireAuthority && (response.SessionCapability == "" || response.SessionGeneration == 0) {
+		return errors.New("OCI helper returned an invalid session admission")
+	}
+	if !requireAuthority && (response.SessionCapability == "") != (response.SessionGeneration == 0) {
+		return errors.New("OCI helper returned partial session authority")
+	}
+	if client.ExpectedChecksum != "" && response.HelperChecksum != client.ExpectedChecksum {
+		return &RPCError{Code: CodeChecksumMismatch, Message: "helper checksum does not match local expectation"}
+	}
+	return nil
+}
+
+func applyConnectionDeadline(ctx context.Context, connection net.Conn, deadline time.Time) error {
+	if contextDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || contextDeadline.Before(deadline)) {
+		deadline = contextDeadline
+	}
+	return connection.SetDeadline(deadline)
 }
 
 func (session *Session) Handshake() AcquireSessionResponse {
