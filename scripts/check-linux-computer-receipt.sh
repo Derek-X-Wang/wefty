@@ -26,7 +26,7 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     "linux.removal"
   ];
   . as $root |
-  .version == 4 and
+  .version == 5 and
   .platform == "linux/amd64" and
   .candidate_sha == $candidate and
   .image.variant == $image and
@@ -65,13 +65,24 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows["linux.network_egress"].assertions.private_veth_address_present and
     .rows["linux.network_egress"].assertions.resolver_reachable and
     .rows["linux.network_egress"].assertions.helper_http_through_veth and
-    .rows["linux.network_egress"].assertions.node_loopback_refused and
+    .rows["linux.network_egress"].assertions.node_listener_ipv4_refused and
+    .rows["linux.network_egress"].assertions.node_listener_ipv6_refused and
+    (.rows["linux.network_egress"].evidence.computer_id | length > 0) and
+    (.rows["linux.network_egress"].evidence.attempt_id | length > 0) and
+    (.rows["linux.network_egress"].evidence.veth_address | test("^198\\.1[89]\\.[0-9]+\\.[0-9]+$")) and
+    (.rows["linux.network_egress"].evidence.veth_gateway | test("^198\\.1[89]\\.[0-9]+\\.[0-9]+$")) and
+    .rows["linux.network_egress"].evidence.veth_address != .rows["linux.network_egress"].evidence.veth_gateway and
     .rows["linux.network_egress"].evidence.resolved_name == "example.com" and
     (.rows["linux.network_egress"].evidence.resolved_address | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) and
     .rows["linux.network_egress"].evidence.helper_http_status == "200" and
     .rows["linux.network_egress"].evidence.helper_http_body == "wefty-computer-egress-v1" and
-    .rows["linux.network_egress"].evidence.node_loopback_outcome == "refused" and
-    .rows["linux.network_egress"].evidence.node_loopback_errno == "ECONNREFUSED"
+    (.rows["linux.network_egress"].evidence.node_listener_ipv4_address | test("^198\\.1[89]\\.[0-9]+\\.[0-9]+:[0-9]+$")) and
+    .rows["linux.network_egress"].evidence.node_listener_ipv4_address == (.rows["linux.network_egress"].evidence.veth_gateway + ":" + (.rows["linux.network_egress"].evidence.node_listener_ipv4_address | split(":")[-1])) and
+    .rows["linux.network_egress"].evidence.node_listener_ipv4_outcome == "refused" and
+    .rows["linux.network_egress"].evidence.node_listener_ipv4_errno == "ECONNREFUSED" and
+    (.rows["linux.network_egress"].evidence.node_listener_ipv6_address | test("^\\[fe80:.*%eth0\\]:[0-9]+$")) and
+    .rows["linux.network_egress"].evidence.node_listener_ipv6_outcome == "refused" and
+    (["ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"] | index($root.rows["linux.network_egress"].evidence.node_listener_ipv6_errno)) != null
    end) and
   (if $mutated == "linux.screen_crossover_refused" then
     .rows["linux.screen_crossover_refused"].status == "FAIL"
@@ -79,6 +90,23 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows["linux.screen_crossover_refused"].status == "PASS" and
     .rows["linux.screen_crossover_refused"].assertions.crossover_refused and
     .rows["linux.screen_crossover_refused"].assertions.target_alive_at_refusal_edge and
+    (.rows["linux.screen_crossover_refused"].evidence.source_computer_id | length > 0) and
+    (.rows["linux.screen_crossover_refused"].evidence.source_attempt_id | length > 0) and
+    (.rows["linux.screen_crossover_refused"].evidence.target_computer_id | length > 0) and
+    (.rows["linux.screen_crossover_refused"].evidence.target_attempt_id | length > 0) and
+    .rows["linux.screen_crossover_refused"].evidence.source_computer_id != .rows["linux.screen_crossover_refused"].evidence.target_computer_id and
+    .rows["linux.screen_crossover_refused"].evidence.source_attempt_id != .rows["linux.screen_crossover_refused"].evidence.target_attempt_id and
+    .rows["linux.screen_crossover_refused"].evidence.source_computer_id == .rows["linux.network_egress"].evidence.computer_id and
+    .rows["linux.screen_crossover_refused"].evidence.source_attempt_id == .rows["linux.network_egress"].evidence.attempt_id and
+    (.rows["linux.screen_crossover_refused"].evidence.target_egress_address | test("^198\\.1[89]\\.[0-9]+\\.[0-9]+$")) and
+    (.rows["linux.screen_crossover_refused"].evidence.target_veth_gateway | test("^198\\.1[89]\\.[0-9]+\\.[0-9]+$")) and
+    .rows["linux.screen_crossover_refused"].evidence.target_egress_address != .rows["linux.screen_crossover_refused"].evidence.target_veth_gateway and
+    (.rows["linux.screen_crossover_refused"].evidence.target_view_port | test("^[0-9]+$")) and
+    (.rows["linux.screen_crossover_refused"].evidence.target_control_port | test("^[0-9]+$")) and
+    (.rows["linux.screen_crossover_refused"].evidence.target_egress_port | test("^[0-9]+$")) and
+    .rows["linux.screen_crossover_refused"].evidence.view_read_address == (.rows["linux.screen_crossover_refused"].evidence.target_egress_address + ":" + .rows["linux.screen_crossover_refused"].evidence.target_view_port) and
+    .rows["linux.screen_crossover_refused"].evidence.control_inject_address == (.rows["linux.screen_crossover_refused"].evidence.target_egress_address + ":" + .rows["linux.screen_crossover_refused"].evidence.target_control_port) and
+    .rows["linux.screen_crossover_refused"].evidence.egress_address_target == (.rows["linux.screen_crossover_refused"].evidence.target_egress_address + ":" + .rows["linux.screen_crossover_refused"].evidence.target_egress_port) and
     .rows["linux.screen_crossover_refused"].evidence.target_liveness_view == "read_succeeded" and
     .rows["linux.screen_crossover_refused"].evidence.target_liveness_control == "inject_succeeded" and
     .rows["linux.screen_crossover_refused"].evidence.target_liveness_egress == "connected" and
@@ -88,6 +116,9 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows["linux.screen_crossover_refused"].evidence.control_inject_errno == "ECONNREFUSED" and
     .rows["linux.screen_crossover_refused"].evidence.egress_address_outcome == "refused" and
     .rows["linux.screen_crossover_refused"].evidence.egress_address_errno == "ECONNREFUSED" and
+    (.rows["linux.screen_crossover_refused"].evidence.node_listener_ipv6_address | test("^\\[fe80:.*%eth0\\]:[0-9]+$")) and
+    .rows["linux.screen_crossover_refused"].evidence.node_listener_ipv6_outcome == "refused" and
+    (["ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"] | index($root.rows["linux.screen_crossover_refused"].evidence.node_listener_ipv6_errno)) != null and
     (if .image.variant == "xfce" then
       .rows["linux.screen_crossover_refused"].evidence.abstract_socket_visible == "false" and
       .rows["linux.screen_crossover_refused"].evidence.abstract_socket_outcome == "refused" and

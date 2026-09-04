@@ -9,7 +9,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
-const linuxComputerMatrixVersion = 4
+const linuxComputerMatrixVersion = 5
 
 var linuxComputerMatrixRows = []struct {
 	ID, Proof string
