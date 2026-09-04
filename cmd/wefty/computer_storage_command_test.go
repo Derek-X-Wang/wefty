@@ -331,25 +331,7 @@ func assertComputerStorageCLIWaitPathsOverHelperSeam(t *testing.T) {
 
 	t.Run("import", func(t *testing.T) {
 		h := newStorageCLIHarness(t)
-		manifest := storageCLICustodyManifest(h)
-		encodedSpec, err := json.Marshal(manifest.JobSpec)
-		if err != nil {
-			t.Fatal(err)
-		}
-		specHash := sha256.Sum256(encodedSpec)
-		manifest.JobSpecHash = hex.EncodeToString(specHash[:])
-		manifestDigest, err := contract.DigestComputerCustodyManifest(manifest)
-		if err != nil {
-			t.Fatal(err)
-		}
-		manifestBytes, err := json.Marshal(manifest)
-		if err != nil {
-			t.Fatal(err)
-		}
-		manifestPath := filepath.Join(t.TempDir(), "custody.json")
-		if err := os.WriteFile(manifestPath, manifestBytes, 0o600); err != nil {
-			t.Fatal(err)
-		}
+		manifest, manifestPath, manifestDigest := writeStorageCLICustodyManifest(t, h)
 		done := h.startStorageCopyHelper("import", "")
 		payload := runStorageCLI(t, h.ctx, h.clients, true, "services", "custody", "import", manifest.ExportID,
 			"--name", "waited-import", "--disk-bytes", fmt.Sprint(2<<30), "--node", h.node.NodeID,
@@ -363,6 +345,97 @@ func assertComputerStorageCLIWaitPathsOverHelperSeam(t *testing.T) {
 			output.CustodyImport.OperationRevision < 1 || output.Observation == nil || output.Observation.Status != "observed" ||
 			output.StorageProvenance == nil || !output.StorageProvenance.CustodyTainted {
 			t.Fatalf("import wait = %s err=%v", payload, err)
+		}
+	})
+}
+
+func TestCustodyImportWaitObservesDurableOrderingAndPreparationOutcome(t *testing.T) {
+	t.Run("completion recorded before observer subscribes", func(t *testing.T) {
+		h := newStorageCLIHarness(t)
+		manifest, manifestPath, manifestDigest := writeStorageCLICustodyManifest(t, h)
+		externalPath := t.TempDir()
+		operation, _, err := h.store.BeginComputerCustodyImport(h.ctx, manifest.ExportID, l1.ComputerCustodyImportRequest{
+			Name: "early-complete-import", DiskBytes: 2 << 30, NodeID: h.node.NodeID, ExternalPath: externalPath,
+			Manifest: manifest, ManifestDigest: manifestDigest, IdempotencyKey: "early-complete-import", Actor: "operator",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := h.startStorageCopyHelper("import", operation.DestinationComputerID)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		payload := runStorageCLI(t, h.ctx, h.clients, true, "services", "custody", "import", manifest.ExportID,
+			"--name", "early-complete-import", "--disk-bytes", fmt.Sprint(2<<30), "--node", h.node.NodeID,
+			"--path", externalPath, "--manifest", manifestPath, "--manifest-digest", manifestDigest,
+			"--idempotency-key", "early-complete-import", "--wait", "2s", "--poll-interval", "1ms")
+		var output storageMutationOutput
+		if err := json.Unmarshal(payload, &output); err != nil || !output.IdempotentReplay || output.MutationApplied ||
+			output.CustodyImport == nil || output.CustodyImport.Status != "complete" || output.Computer == nil ||
+			output.Observation == nil || output.Observation.Status != "observed" {
+			t.Fatalf("early completion wait = %s err=%v", payload, err)
+		}
+	})
+
+	t.Run("slow preparation completes within measured wait", func(t *testing.T) {
+		h := newStorageCLIHarness(t)
+		manifest, manifestPath, manifestDigest := writeStorageCLICustodyManifest(t, h)
+		done := h.startStorageCopyHelperDelayed("import", "", 50*time.Millisecond)
+		payload := runStorageCLI(t, h.ctx, h.clients, true, "services", "custody", "import", manifest.ExportID,
+			"--name", "slow-import", "--disk-bytes", fmt.Sprint(2<<30), "--node", h.node.NodeID,
+			"--path", t.TempDir(), "--manifest", manifestPath, "--manifest-digest", manifestDigest,
+			"--idempotency-key", "slow-import", "--wait", "2s", "--poll-interval", "1ms")
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		var output storageMutationOutput
+		if err := json.Unmarshal(payload, &output); err != nil || output.CustodyImport == nil ||
+			output.CustodyImport.Status != "complete" || output.Observation == nil || output.Observation.Status != "observed" {
+			t.Fatalf("slow preparation wait = %s err=%v", payload, err)
+		}
+	})
+
+	t.Run("resume deferred fails fast with typed evidence", func(t *testing.T) {
+		h := newStorageCLIHarness(t)
+		manifest, manifestPath, manifestDigest := writeStorageCLICustodyManifest(t, h)
+		done := h.startStorageCopyPreparationOutcome(l1.ComputerStoragePreparationResumeDeferred)
+		var stdout, stderr bytes.Buffer
+		err := execute(h.ctx, h.clients, true, []string{"services", "custody", "import", manifest.ExportID,
+			"--name", "deferred-import", "--disk-bytes", fmt.Sprint(2 << 30), "--node", h.node.NodeID,
+			"--path", t.TempDir(), "--manifest", manifestPath, "--manifest-digest", manifestDigest,
+			"--idempotency-key", "deferred-import", "--wait", "2s", "--poll-interval", "1ms"}, &stdout, &stderr)
+		if helperErr := <-done; helperErr != nil {
+			t.Fatal(helperErr)
+		}
+		var observationErr *storageObservationError
+		var output storageMutationOutput
+		if !errors.As(err, &observationErr) || !strings.Contains(err.Error(), l1.ComputerStoragePreparationResumeDeferred) ||
+			json.Unmarshal(stdout.Bytes(), &output) != nil || output.CustodyImport == nil ||
+			output.CustodyImport.PreparationOutcome == nil ||
+			output.CustodyImport.PreparationOutcome.Code != l1.ComputerStoragePreparationResumeDeferred ||
+			output.Observation == nil || output.Observation.Status != "failed" {
+			t.Fatalf("deferred import stdout=%s stderr=%s err=%v", stdout.String(), stderr.String(), err)
+		}
+	})
+
+	t.Run("failed preparation remains observable after identity release", func(t *testing.T) {
+		h := newStorageCLIHarness(t)
+		manifest, manifestPath, manifestDigest := writeStorageCLICustodyManifest(t, h)
+		done := h.startStorageCopyFailure()
+		var stdout, stderr bytes.Buffer
+		err := execute(h.ctx, h.clients, true, []string{"services", "custody", "import", manifest.ExportID,
+			"--name", "failed-import", "--disk-bytes", fmt.Sprint(2 << 30), "--node", h.node.NodeID,
+			"--path", t.TempDir(), "--manifest", manifestPath, "--manifest-digest", manifestDigest,
+			"--idempotency-key", "failed-import", "--wait", "2s", "--poll-interval", "1ms"}, &stdout, &stderr)
+		if helperErr := <-done; helperErr != nil {
+			t.Fatal(helperErr)
+		}
+		var output storageMutationOutput
+		if !strings.Contains(fmt.Sprint(err), "manifest_invalid") || json.Unmarshal(stdout.Bytes(), &output) != nil ||
+			output.CustodyImport == nil || output.CustodyImport.Status != "failed" ||
+			output.CustodyImport.FailureCode != "manifest_invalid" || output.Computer != nil ||
+			output.Observation == nil || output.Observation.Status != "failed" {
+			t.Fatalf("failed import stdout=%s stderr=%s err=%v", stdout.String(), stderr.String(), err)
 		}
 	})
 }
@@ -595,6 +668,10 @@ func (h *storageCLIHarness) startPruneHelper(t *testing.T) {
 }
 
 func (h *storageCLIHarness) startStorageCopyHelper(operation, destinationComputerID string) <-chan error {
+	return h.startStorageCopyHelperDelayed(operation, destinationComputerID, 0)
+}
+
+func (h *storageCLIHarness) startStorageCopyHelperDelayed(operation, destinationComputerID string, delay time.Duration) <-chan error {
 	done := make(chan error, 1)
 	go func() {
 		deadline := time.Now().Add(2 * time.Second)
@@ -618,8 +695,11 @@ func (h *storageCLIHarness) startStorageCopyHelper(operation, destinationCompute
 				return
 			}
 			for _, directive := range directives {
-				if directive.Operation != operation {
+				if directive.Operation != operation || (destinationComputerID != "" && directive.DestinationComputerID != destinationComputerID) {
 					continue
+				}
+				if delay > 0 {
+					time.Sleep(delay)
 				}
 				destinationDigest := directive.SourceDigest
 				if operation == "clone" || operation == "import" {
@@ -681,6 +761,78 @@ func (h *storageCLIHarness) startStorageCopyHelper(operation, destinationCompute
 	return done
 }
 
+func (h *storageCLIHarness) startStorageCopyPreparationOutcome(code string) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			directives, err := h.store.ListNodeComputerStorageCopyDirectives(h.ctx, "fabric-storage-node", h.node.NodeID, h.node.BootSessionID)
+			if err != nil {
+				done <- err
+				return
+			}
+			for _, directive := range directives {
+				if directive.Operation != "import" {
+					continue
+				}
+				_, err = h.store.AcknowledgeComputerStorageCopy(h.ctx, "fabric-storage-node", directive.DestinationComputerID,
+					l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
+						IdempotencyKey: "preparation-outcome", PreparationOutcome: &l1.ComputerStoragePreparationOutcome{
+							Code: code, DestinationComputerID: directive.DestinationComputerID,
+							DestinationStorageID: directive.DestinationStorageID, DestinationGeneration: directive.DestinationGeneration,
+							IntentRevision: directive.OperationRevision, DiskBytes: directive.DestinationSize, HelperGeneration: 7,
+							SweepEpoch: "sweep-deferred", DiskName: "computer-deferred", Operation: "import",
+							Reason: "resume_deferred", DeferredReason: "recovery_attempt_budget", Attempts: 3,
+						},
+					})
+				done <- err
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		done <- errors.New("timed out waiting for Custody import directive")
+	}()
+	return done
+}
+
+func (h *storageCLIHarness) startStorageCopyFailure() <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			directives, err := h.store.ListNodeComputerStorageCopyDirectives(h.ctx, "fabric-storage-node", h.node.NodeID, h.node.BootSessionID)
+			if err != nil {
+				done <- err
+				return
+			}
+			for _, directive := range directives {
+				if directive.Operation != "import" {
+					continue
+				}
+				receipt := l1.ComputerStorageCopyReceipt{Kind: "computer_storage_copy_failed_absent",
+					ReceiptID: "failed-" + directive.DestinationComputerID, Operation: directive.Operation,
+					BackupID: directive.BackupID, CopyID: directive.CopyID, ExportID: directive.ExportID,
+					ExternalPath: directive.ExternalPath, ManifestDigest: directive.ManifestDigest,
+					SourceComputerID: directive.SourceComputerID, SourceStorageID: directive.SourceStorageID,
+					SourceGeneration: directive.SourceGeneration, DestinationComputerID: directive.DestinationComputerID,
+					DestinationStorageID: directive.DestinationStorageID, DestinationGeneration: directive.DestinationGeneration,
+					NodeID: directive.BoundNodeID, RootInstanceID: directive.RootInstanceID, JobID: directive.JobID,
+					OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence, HelperGeneration: 9,
+					SourceSize: directive.SourceSize, DestinationSize: directive.DestinationSize,
+					SourceDigest: directive.SourceDigest, FailureCode: "manifest_invalid", DestinationAbsent: true}
+				_, err = h.store.AcknowledgeComputerStorageCopy(h.ctx, "fabric-storage-node", directive.DestinationComputerID,
+					l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
+						IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+				done <- err
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		done <- errors.New("timed out waiting for failed Custody import directive")
+	}()
+	return done
+}
+
 func mustStorageComputer(t *testing.T, h *storageCLIHarness) l1.Computer {
 	t.Helper()
 	computer, err := h.store.GetComputer(h.ctx, h.computer.ComputerID)
@@ -723,4 +875,28 @@ func storageCLICustodyManifest(h *storageCLIHarness) contract.ComputerCustodyMan
 		OperationRevision: 2, CustodyFence: "custody-fence-portable", JobSpec: storageCLIComputerSpec("portable-source"),
 		JobSpecHash: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 		DiskFile:    "storage.ext4", Phase: "complete"}
+}
+
+func writeStorageCLICustodyManifest(t *testing.T, h *storageCLIHarness) (contract.ComputerCustodyManifest, string, string) {
+	t.Helper()
+	manifest := storageCLICustodyManifest(h)
+	encodedSpec, err := json.Marshal(manifest.JobSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specHash := sha256.Sum256(encodedSpec)
+	manifest.JobSpecHash = hex.EncodeToString(specHash[:])
+	manifestDigest, err := contract.DigestComputerCustodyManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(t.TempDir(), "custody.json")
+	if err := os.WriteFile(manifestPath, manifestBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return manifest, manifestPath, manifestDigest
 }

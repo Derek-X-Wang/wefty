@@ -1319,6 +1319,20 @@
         }
       }
     },
+	"/v1/custody-imports/{import_id}": {
+	  "parameters": [{ "name": "import_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }],
+	  "get": {
+		"operationId": "getComputerCustodyImport",
+		"summary": "Observe one accepted Custody import by its immutable operation identity",
+		"description": "Returns the durable import ledger outcome even if a failed import released its reserved Computer identity. Completion and helper preparation outcomes are revision-bound, so polling cannot lose an event recorded before observation begins.",
+		"responses": {
+		  "200": { "description": "Current durable import outcome.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerCustodyImportObservation" } } } },
+		  "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+		  "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+		  "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+		}
+	  }
+	},
     "/v1/computers/{computer_id}/projections": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }

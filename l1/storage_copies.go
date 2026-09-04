@@ -66,11 +66,39 @@ type ComputerStorageCopyDirective struct {
 type ComputerStorageCopyReceipt = contract.ComputerStorageCopyReceipt
 
 type ComputerStorageCopyAcknowledgementRequest struct {
-	NodeID           string                     `json:"node_id"`
-	BootSessionID    string                     `json:"boot_session_id"`
-	IdempotencyKey   string                     `json:"idempotency_key"`
-	Receipt          ComputerStorageCopyReceipt `json:"receipt"`
-	OldBackupReceipt *ComputerBackupCopyReceipt `json:"old_backup_receipt,omitempty"`
+	NodeID             string                             `json:"node_id"`
+	BootSessionID      string                             `json:"boot_session_id"`
+	IdempotencyKey     string                             `json:"idempotency_key"`
+	Receipt            ComputerStorageCopyReceipt         `json:"receipt"`
+	PreparationOutcome *ComputerStoragePreparationOutcome `json:"preparation_outcome,omitempty"`
+	OldBackupReceipt   *ComputerBackupCopyReceipt         `json:"old_backup_receipt,omitempty"`
+}
+
+const (
+	ComputerStoragePreparationResumeDeferred = "computer_storage_resume_deferred"
+	ComputerStoragePreparationQuarantined    = "computer_storage_quarantined"
+)
+
+// ComputerStoragePreparationOutcome carries the helper's closed recovery
+// result for one exact never-attached destination generation. L1 records the
+// time independently when it accepts this evidence.
+type ComputerStoragePreparationOutcome struct {
+	Code                  string     `json:"code"`
+	DestinationComputerID string     `json:"destination_computer_id"`
+	DestinationStorageID  string     `json:"destination_storage_id"`
+	DestinationGeneration int64      `json:"destination_generation"`
+	IntentRevision        int64      `json:"intent_revision"`
+	DiskBytes             int64      `json:"disk_bytes"`
+	HelperGeneration      uint64     `json:"helper_generation"`
+	SweepEpoch            string     `json:"sweep_epoch,omitempty"`
+	DiskName              string     `json:"disk_name,omitempty"`
+	Operation             string     `json:"operation,omitempty"`
+	Reason                string     `json:"reason,omitempty"`
+	DeferredReason        string     `json:"deferred_reason,omitempty"`
+	Attempts              int        `json:"attempts,omitempty"`
+	FirstDeferredAt       *time.Time `json:"first_deferred_at,omitempty"`
+	PayloadDroppedAt      string     `json:"payload_dropped_at,omitempty"`
+	RecordedAt            *time.Time `json:"recorded_at,omitempty"`
 }
 
 type computerStorageCopyRow struct {

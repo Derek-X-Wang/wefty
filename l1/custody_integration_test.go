@@ -336,6 +336,34 @@ func TestCustodyImportFailureUsesStoredVerbAndReleasesName(t *testing.T) {
 	if err != nil || len(directives) != 1 || directives[0].Operation != "import" {
 		t.Fatalf("import directive = %#v err=%v", directives, err)
 	}
+	preparation := ComputerStoragePreparationOutcome{Code: ComputerStoragePreparationResumeDeferred,
+		DestinationComputerID: operation.DestinationComputerID, DestinationStorageID: operation.DestinationStorageID,
+		DestinationGeneration: 1, IntentRevision: operation.OperationRevision, DiskBytes: operation.DestinationSize,
+		HelperGeneration: 4, SweepEpoch: "sweep-import", DiskName: "computer-import",
+		Operation: "computer_storage_copy", Reason: "resume_deferred", DeferredReason: "recovery_attempt_budget", Attempts: 3}
+	tampered := preparation
+	tampered.IntentRevision++
+	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
+		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: "tampered-preparation", PreparationOutcome: &tampered}); errorCode(err) != contract.ErrorStorageReferenceConflict {
+		t.Fatalf("foreign preparation outcome error = %v", err)
+	}
+	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
+		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
+			BootSessionID: node.BootSessionID, IdempotencyKey: "deferred-preparation", PreparationOutcome: &preparation}); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := h.store.GetComputerCustodyImport(context.Background(), operation.ImportID)
+	if err != nil || observed.OperationRevision != operation.OperationRevision || observed.Status != "reserved" ||
+		observed.PreparationOutcome == nil || observed.PreparationOutcome.RecordedAt == nil ||
+		observed.PreparationOutcome.Code != ComputerStoragePreparationResumeDeferred {
+		t.Fatalf("durable preparation outcome = %#v err=%v", observed, err)
+	}
+	directives, err = h.store.ListNodeComputerStorageCopyDirectives(context.Background(),
+		"fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("deferred import was not retryable: %#v err=%v", directives, err)
+	}
 	failure := successfulStorageCopyReceipt(directives[0])
 	failure.Kind = "computer_storage_copy_failed_absent"
 	failure.Operation = "clone"
@@ -366,6 +394,11 @@ func TestCustodyImportFailureUsesStoredVerbAndReleasesName(t *testing.T) {
 	}
 	if _, err := h.store.GetComputer(context.Background(), operation.DestinationComputerID); errorCode(err) != contract.ErrorNotFound {
 		t.Fatalf("failed import retained reserved identity: %v", err)
+	}
+	observed, err = h.store.GetComputerCustodyImport(context.Background(), operation.ImportID)
+	if err != nil || observed.Status != "failed" || observed.FailureCode != "manifest_invalid" ||
+		observed.PreparationOutcome != nil || observed.CompletedAt == nil {
+		t.Fatalf("failed import durable observation = %#v err=%v", observed, err)
 	}
 	if _, _, err := h.store.BeginComputerCustodyImport(context.Background(), export.ExportID,
 		ComputerCustodyImportRequest{Name: "reusable-import", DiskBytes: backup.AllocatedSize,

@@ -11,6 +11,13 @@ mismatch and invalid authority quarantine immediately. Quarantine retains its
 payload for 24 hours and its typed tombstone thereafter, so N is never
 admissible again; the supported recovery path prepares and admits reset
 generation N+1 and clears N only through authorized removal.
+For a never-attached Custody import generation, the agent persists an exact
+helper `resume_deferred` or quarantine result in L1's import ledger. The CLI
+observes that immutable import identity and revision directly; completion
+recorded before polling begins is still visible, while a retained helper
+outcome is returned immediately as typed evidence rather than a generic wait
+deadline. A later successful preparation receipt clears the provisional
+outcome and remains the only route to publication.
 
 This contract defines the image-owned half of a `computer`-trait OCI service
 and the agent's all-or-nothing screen-door readiness verdict. The ratified

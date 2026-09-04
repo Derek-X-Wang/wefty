@@ -885,6 +885,18 @@ followed by normal removal authority for N. The affected Computer therefore stay
 fail-closed while the helper continues serving the rest of the Node. Startup's
 namespace-absence promise remains exact for every non-quarantined generation.
 
+For a Custody import, the agent carries an exact-generation
+`resume_deferred` or `computer_storage_quarantined` helper result to L1 as a
+preparation outcome. Receipt-backed outcomes retain the helper generation,
+sweep epoch, disk name, closed reason, attempt count, and deferral timestamps;
+an outcome without full destination identity never attaches to an import.
+This evidence grants no publication or cleanup authority and does not consume
+the copy acknowledgement. A later successful copy receipt clears it. L1's
+import ledger remains the observation authority even when a terminal failed
+copy has released the reserved Computer identity, so `services custody import
+--wait` reports the typed helper or copy result instead of timing out on an
+unchanging Computer projection.
+
 Required-file recovery classification is exact:
 
 | Observation | Classification | Startup action |

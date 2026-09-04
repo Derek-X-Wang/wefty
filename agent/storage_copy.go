@@ -89,6 +89,24 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 		OperationRevision: directive.OperationRevision, CleanupFence: directive.CleanupFence,
 	})
 	if err != nil {
+		var preparation *workloadrunner.ComputerStoragePreparationError
+		if directive.Operation == "import" && errors.As(err, &preparation) {
+			outcome := preparation.Outcome
+			_, acknowledgeErr := controller.client.AcknowledgeComputerStorageCopy(ctx, directive.DestinationComputerID,
+				l1.ComputerStorageCopyAcknowledgementRequest{NodeID: controller.nodeID,
+					BootSessionID:  controller.bootSessionID,
+					IdempotencyKey: fmt.Sprintf("preparation-%s-%d-%s", outcome.Code, outcome.HelperGeneration, outcome.SweepEpoch),
+					PreparationOutcome: &l1.ComputerStoragePreparationOutcome{
+						Code: outcome.Code, DestinationComputerID: outcome.Storage.ComputerID,
+						DestinationStorageID: outcome.Storage.StorageID, DestinationGeneration: outcome.Storage.StorageGeneration,
+						IntentRevision: outcome.Storage.IntentRevision, DiskBytes: outcome.Storage.DiskBytes,
+						HelperGeneration: outcome.HelperGeneration, SweepEpoch: outcome.SweepEpoch, DiskName: outcome.DiskName,
+						Operation: outcome.Operation, Reason: outcome.Reason, DeferredReason: outcome.DeferredReason,
+						Attempts: outcome.Attempts, FirstDeferredAt: outcome.FirstDeferredAt, PayloadDroppedAt: outcome.PayloadDroppedAt,
+					},
+				})
+			return acknowledgeErr
+		}
 		return err
 	}
 	if directive.Operation == "import" && receipt.Kind == "computer_storage_copy_failed_absent" {

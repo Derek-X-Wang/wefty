@@ -85,16 +85,27 @@ type ComputerCustodyImportRequest struct {
 }
 
 type ComputerCustodyImport struct {
-	ImportID              string     `json:"import_id"`
-	ExportID              string     `json:"export_id"`
-	OperationRevision     int64      `json:"operation_revision"`
-	DestinationComputerID string     `json:"destination_computer_id"`
-	DestinationStorageID  string     `json:"destination_storage_id"`
-	DestinationName       string     `json:"destination_name"`
-	DestinationSize       int64      `json:"destination_size"`
-	Status                string     `json:"status"`
-	RequestedAt           time.Time  `json:"requested_at"`
-	CompletedAt           *time.Time `json:"completed_at,omitempty"`
+	ImportID              string                             `json:"import_id"`
+	ExportID              string                             `json:"export_id"`
+	OperationRevision     int64                              `json:"operation_revision"`
+	DestinationComputerID string                             `json:"destination_computer_id"`
+	DestinationStorageID  string                             `json:"destination_storage_id"`
+	DestinationName       string                             `json:"destination_name"`
+	DestinationSize       int64                              `json:"destination_size"`
+	Status                string                             `json:"status"`
+	FailureCode           string                             `json:"failure_code,omitempty"`
+	PreparationOutcome    *ComputerStoragePreparationOutcome `json:"preparation_outcome,omitempty"`
+	RequestedAt           time.Time                          `json:"requested_at"`
+	CompletedAt           *time.Time                         `json:"completed_at,omitempty"`
+}
+
+type ComputerCustodyImportObservation struct {
+	ImportID           string                             `json:"import_id"`
+	OperationRevision  int64                              `json:"operation_revision"`
+	Status             string                             `json:"status"`
+	FailureCode        string                             `json:"failure_code,omitempty"`
+	PreparationOutcome *ComputerStoragePreparationOutcome `json:"preparation_outcome,omitempty"`
+	CompletedAt        *time.Time                         `json:"completed_at,omitempty"`
 }
 
 func scanCustodyExport(scanner interface{ Scan(...any) error }) (ComputerCustodyExport, error) {
@@ -501,10 +512,31 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 		}
 		var name string
 		_ = tx.QueryRowContext(ctx, `SELECT name FROM computers WHERE computer_id=?`, replay.DestinationComputerID).Scan(&name)
-		return ComputerCustodyImport{ImportID: replay.DestinationComputerID, ExportID: replay.ExportID,
+		value := ComputerCustodyImport{ImportID: replay.DestinationComputerID, ExportID: replay.ExportID,
 			OperationRevision:     replay.OperationRevision,
 			DestinationComputerID: replay.DestinationComputerID, DestinationStorageID: replay.DestinationStorageID,
-			DestinationName: name, DestinationSize: replay.DestinationSize, Status: replay.Status}, true, nil
+			DestinationName: name, DestinationSize: replay.DestinationSize, Status: replay.Status}
+		var requested int64
+		var completed sql.NullInt64
+		var outcomeJSON []byte
+		if err := tx.QueryRowContext(ctx, `SELECT requested_ns, completed_ns, failure_code, preparation_outcome_json
+			FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?`,
+			replay.DestinationComputerID, replay.OperationRevision).Scan(&requested, &completed, &value.FailureCode, &outcomeJSON); err != nil {
+			return ComputerCustodyImport{}, false, internalError(err, "read Custody import replay outcome")
+		}
+		value.RequestedAt = time.Unix(0, requested).UTC()
+		if completed.Valid {
+			stamp := time.Unix(0, completed.Int64).UTC()
+			value.CompletedAt = &stamp
+		}
+		if len(outcomeJSON) != 0 {
+			var outcome ComputerStoragePreparationOutcome
+			if err := json.Unmarshal(outcomeJSON, &outcome); err != nil {
+				return ComputerCustodyImport{}, false, internalError(err, "decode Custody import replay preparation outcome")
+			}
+			value.PreparationOutcome = &outcome
+		}
+		return value, true, nil
 	} else if !errors.Is(replayErr, sql.ErrNoRows) {
 		return ComputerCustodyImport{}, false, internalError(replayErr, "read Custody import replay")
 	}
@@ -578,6 +610,51 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 	return value, false, nil
 }
 
+func (s *Store) GetComputerCustodyImport(ctx context.Context, importID string) (ComputerCustodyImportObservation, error) {
+	if strings.TrimSpace(importID) == "" {
+		return ComputerCustodyImportObservation{}, protocolError(contract.ErrorInvalidRequest, "import_id is required")
+	}
+	var observation ComputerCustodyImportObservation
+	var completed sql.NullInt64
+	var outcomeJSON []byte
+	err := s.db.QueryRowContext(ctx, `SELECT destination_computer_id, operation_revision, status, failure_code,
+		preparation_outcome_json, completed_ns FROM computer_storage_copy_operations
+		WHERE destination_computer_id=? AND operation='import' ORDER BY operation_revision DESC LIMIT 1`, importID).
+		Scan(&observation.ImportID, &observation.OperationRevision, &observation.Status,
+			&observation.FailureCode, &outcomeJSON, &completed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ComputerCustodyImportObservation{}, protocolError(contract.ErrorNotFound, "Custody import %q was not found", importID)
+	}
+	if err != nil {
+		return ComputerCustodyImportObservation{}, internalError(err, "read Custody import observation")
+	}
+	if completed.Valid {
+		stamp := time.Unix(0, completed.Int64).UTC()
+		observation.CompletedAt = &stamp
+	}
+	if len(outcomeJSON) != 0 {
+		var outcome ComputerStoragePreparationOutcome
+		if err := json.Unmarshal(outcomeJSON, &outcome); err != nil {
+			return ComputerCustodyImportObservation{}, internalError(err, "decode Custody import preparation outcome")
+		}
+		observation.PreparationOutcome = &outcome
+	}
+	return observation, nil
+}
+
+func validateCustodyImportPreparationOutcome(row computerStorageCopyRow, outcome *ComputerStoragePreparationOutcome) error {
+	if outcome == nil || (outcome.Code != ComputerStoragePreparationResumeDeferred && outcome.Code != ComputerStoragePreparationQuarantined) ||
+		outcome.DestinationComputerID != row.DestinationComputerID || outcome.DestinationStorageID != row.DestinationStorageID ||
+		outcome.DestinationGeneration != row.DestinationGeneration || outcome.IntentRevision != row.OperationRevision ||
+		outcome.DiskBytes != row.DestinationSize || outcome.HelperGeneration == 0 || outcome.RecordedAt != nil {
+		return protocolError(contract.ErrorStorageReferenceConflict, "Custody import preparation outcome does not bind the reserved destination generation")
+	}
+	if outcome.SweepEpoch != "" && (outcome.DiskName == "" || outcome.Operation == "" || outcome.Reason == "") {
+		return protocolError(contract.ErrorInvalidRequest, "receipt-backed Custody import preparation outcome is incomplete")
+	}
+	return nil
+}
+
 func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNodeID, destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest) (Computer, error) {
 	if destinationComputerID == "" || request.NodeID == "" || request.BootSessionID == "" || request.IdempotencyKey == "" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "complete Custody import acknowledgement is required")
@@ -610,6 +687,36 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 	if err := validateBackupAcknowledgementAuthority(ctx, tx, identityNodeID, request.NodeID, row.BoundNodeID, row.RootInstanceID); err != nil {
 		return Computer{}, err
 	}
+	if request.PreparationOutcome != nil {
+		if request.Receipt.Kind != "" || request.OldBackupReceipt != nil {
+			return Computer{}, protocolError(contract.ErrorInvalidRequest, "Custody import preparation outcome is mutually exclusive with copy receipts")
+		}
+		if row.Status != "reserved" {
+			return Computer{}, protocolError(contract.ErrorConflict, "Custody import is not awaiting preparation")
+		}
+		if err := validateCustodyImportPreparationOutcome(row, request.PreparationOutcome); err != nil {
+			return Computer{}, err
+		}
+		outcome := *request.PreparationOutcome
+		outcome.RecordedAt = &now
+		outcomeJSON, err := json.Marshal(outcome)
+		if err != nil {
+			return Computer{}, internalError(err, "encode Custody import preparation outcome")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET preparation_outcome_json=?
+			WHERE destination_computer_id=? AND operation_revision=? AND status='reserved'`, outcomeJSON,
+			destinationComputerID, row.OperationRevision); err != nil {
+			return Computer{}, internalError(err, "record Custody import preparation outcome")
+		}
+		computer, err := readComputerAuthority(ctx, tx, destinationComputerID, now)
+		if err != nil {
+			return Computer{}, internalError(err, "read deferred Custody import authority")
+		}
+		if err := tx.Commit(); err != nil {
+			return Computer{}, internalError(err, "commit Custody import preparation outcome")
+		}
+		return computer, nil
+	}
 	receipt := request.Receipt
 	if err := validateStorageCopyReceipt(row, receipt); err != nil {
 		return Computer{}, err
@@ -631,7 +738,7 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 		return Computer{}, internalError(err, "encode Custody import receipt")
 	}
 	if receipt.Kind == "computer_storage_copy_failed_absent" {
-		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='failed',
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='failed', preparation_outcome_json=NULL,
 			failure_code=?, verification_receipt_json=?, verification_receipt_hash=?, acknowledgement_key=?,
 			acknowledgement_hash=?, completed_ns=? WHERE destination_computer_id=? AND operation_revision=? AND status='reserved'`,
 			receipt.FailureCode, receiptJSON, bodyHash, request.IdempotencyKey, bodyHash, now.UnixNano(),
@@ -703,7 +810,7 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 	if err := requireComputerCAS(result, destinationComputerID, 1); err != nil {
 		return Computer{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='complete',
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='complete', preparation_outcome_json=NULL,
 		verification_receipt_json=?, verification_receipt_hash=?, acknowledgement_key=?, acknowledgement_hash=?,
 		verified_ns=?, published_ns=?, completed_ns=? WHERE destination_computer_id=? AND operation_revision=1 AND status='reserved'`,
 		receiptJSON, bodyHash, request.IdempotencyKey, bodyHash, now.UnixNano(), now.UnixNano(), now.UnixNano(),

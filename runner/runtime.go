@@ -692,6 +692,36 @@ type ComputerStorageCopyRequest struct {
 
 type ComputerStorageCopyReceipt = contract.ComputerStorageCopyReceipt
 
+const (
+	ComputerStoragePreparationResumeDeferred = "computer_storage_resume_deferred"
+	ComputerStoragePreparationQuarantined    = "computer_storage_quarantined"
+)
+
+// ComputerStoragePreparationOutcome is helper-authored evidence that a
+// detached destination cannot currently be prepared. Unlike an ordinary copy
+// error, these closed outcomes are safe for the agent to persist at L1.
+type ComputerStoragePreparationOutcome struct {
+	Code             string
+	Storage          ComputerStorage
+	HelperGeneration uint64
+	SweepEpoch       string
+	DiskName         string
+	Operation        string
+	Reason           string
+	DeferredReason   string
+	Attempts         int
+	FirstDeferredAt  *time.Time
+	PayloadDroppedAt string
+}
+
+type ComputerStoragePreparationError struct {
+	Outcome ComputerStoragePreparationOutcome
+}
+
+func (err *ComputerStoragePreparationError) Error() string {
+	return "Computer Storage preparation reported " + err.Outcome.Code
+}
+
 // ComputerCustodyExporter transfers one already-published Backup copy beyond
 // the managed root. L1 records the permanent custody event before calling it.
 type ComputerCustodyExporter interface {

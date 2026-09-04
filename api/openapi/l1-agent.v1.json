@@ -666,10 +666,11 @@
       "post": {
         "operationId": "acknowledgeComputerStorageCopy",
         "summary": "Publish an assertion-derived restore, clone, or Custody import destination",
-        "description": "The receipt binds source bytes and destination Storage authority. Custody import additionally binds the immutable export event, external path, and manifest digest, and requires clone-style OS identity rekeying.",
+        "description": "A success/failure receipt binds source bytes and destination Storage authority. For Custody import only, a mutually exclusive preparation_outcome persists the helper's exact-generation deferred or quarantined result without granting publication authority.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
-          "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
+		  "required": ["node_id", "boot_session_id", "idempotency_key"],
+		  "oneOf": [{ "required": ["receipt"] }, { "required": ["preparation_outcome"] }],
           "properties": {
             "node_id": { "type": "string", "minLength": 1 },
             "boot_session_id": { "type": "string", "minLength": 1 },
@@ -695,6 +696,20 @@
                 "destination_absent": { "type": "boolean" }
               }
             },
+			"preparation_outcome": {
+			  "type": "object", "additionalProperties": false,
+			  "required": ["code", "destination_computer_id", "destination_storage_id", "destination_generation", "intent_revision", "disk_bytes", "helper_generation"],
+			  "properties": {
+				"code": { "enum": ["computer_storage_resume_deferred", "computer_storage_quarantined"] },
+				"destination_computer_id": { "type": "string", "minLength": 1 }, "destination_storage_id": { "type": "string", "minLength": 1 },
+				"destination_generation": { "type": "integer", "format": "int64", "minimum": 1 }, "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+				"disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 }, "helper_generation": { "type": "integer", "minimum": 1 },
+				"sweep_epoch": { "type": "string", "minLength": 1 }, "disk_name": { "type": "string", "minLength": 1 },
+				"operation": { "type": "string", "minLength": 1 }, "reason": { "type": "string", "minLength": 1 },
+				"deferred_reason": { "type": "string", "minLength": 1 }, "attempts": { "type": "integer", "minimum": 1 },
+				"first_deferred_at": { "type": "string", "format": "date-time" }, "payload_dropped_at": { "type": "string", "format": "date-time" }
+			  }
+			},
             "old_backup_receipt": { "type": "object", "description": "Exact Computer Backup copy receipt for the precommitted old generation; forbidden when keep_old_as_backup was false." }
           }
         } } } },

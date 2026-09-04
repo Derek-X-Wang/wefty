@@ -616,7 +616,45 @@
           "custody_exports": { "type": "array", "items": { "type": "object" } }
         }
       },
-      "ComputerCustodyImport": {
+      "ComputerStoragePreparationOutcome": {
+		"type": "object",
+		"additionalProperties": false,
+		"required": ["code", "destination_computer_id", "destination_storage_id", "destination_generation", "intent_revision", "disk_bytes", "helper_generation", "recorded_at"],
+		"properties": {
+		  "code": { "enum": ["computer_storage_resume_deferred", "computer_storage_quarantined"] },
+		  "destination_computer_id": { "type": "string", "minLength": 1 },
+		  "destination_storage_id": { "type": "string", "minLength": 1 },
+		  "destination_generation": { "type": "integer", "format": "int64", "minimum": 1 },
+		  "intent_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+		  "disk_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
+		  "helper_generation": { "type": "integer", "minimum": 1 },
+		  "sweep_epoch": { "type": "string", "minLength": 1 },
+		  "disk_name": { "type": "string", "minLength": 1 },
+		  "operation": { "type": "string", "minLength": 1 },
+		  "reason": { "type": "string", "minLength": 1 },
+		  "deferred_reason": { "type": "string", "minLength": 1 },
+		  "attempts": { "type": "integer", "minimum": 1 },
+		  "first_deferred_at": { "type": "string", "format": "date-time" },
+		  "payload_dropped_at": { "type": "string", "format": "date-time" },
+		  "recorded_at": { "type": "string", "format": "date-time" }
+		},
+		"description": "Helper-authored, generation-bound reason why a Custody import destination is not currently preparable. Sweep fields are present when the outcome came from durable startup-recovery inventory."
+	  },
+	  "ComputerCustodyImportObservation": {
+		"type": "object",
+		"additionalProperties": false,
+		"required": ["import_id", "operation_revision", "status"],
+		"properties": {
+		  "import_id": { "type": "string", "minLength": 1 },
+		  "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+		  "status": { "enum": ["reserved", "complete", "failed", "superseded"] },
+		  "failure_code": { "enum": ["manifest_invalid", "digest_mismatch", "insufficient_disk", "cancelled", "aborted_dead_node"] },
+		  "preparation_outcome": { "$ref": "#/components/schemas/ComputerStoragePreparationOutcome" },
+		  "completed_at": { "type": "string", "format": "date-time" }
+		},
+		"description": "Durable revision-bound observation used by services custody import --wait."
+	  },
+	  "ComputerCustodyImport": {
         "type": "object",
         "additionalProperties": false,
         "required": ["import_id", "export_id", "operation_revision", "destination_computer_id", "destination_storage_id", "destination_name", "destination_size", "status", "requested_at"],
@@ -628,7 +666,9 @@
           "destination_storage_id": { "type": "string", "minLength": 1 },
           "destination_name": { "type": "string", "minLength": 1 },
           "destination_size": { "type": "integer", "format": "int64", "minimum": 1 },
-          "status": { "enum": ["reserved", "prepared", "complete", "failed"] },
+		  "status": { "enum": ["reserved", "prepared", "complete", "failed", "superseded"] },
+		  "failure_code": { "enum": ["manifest_invalid", "digest_mismatch", "insufficient_disk", "cancelled", "aborted_dead_node"] },
+		  "preparation_outcome": { "$ref": "#/components/schemas/ComputerStoragePreparationOutcome" },
           "requested_at": { "type": "string", "format": "date-time" },
           "completed_at": { "type": "string", "format": "date-time" }
         }

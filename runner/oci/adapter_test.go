@@ -22,6 +22,36 @@ import (
 
 const adapterTestDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+func TestComputerStoragePreparationOutcomeRequiresExactSweepIdentity(t *testing.T) {
+	storage := workloadrunner.ComputerStorage{ComputerID: "computer-import", StorageID: "storage-import",
+		StorageGeneration: 1, IntentRevision: 1, DiskBytes: 2 << 30}
+	receipt := ocihelper.VerifiedSweepReceipt{SweepEpoch: "sweep-import",
+		HelperSession: ocihelper.HelperSession{HelperInstanceID: "helper-import", SessionGeneration: 9}}
+	receipt.VerifiedRetained.ComputerStorageDeferred = []ocihelper.ComputerStorageRecoveryInventoryEntry{{
+		Storage: ocihelper.ComputerStorageReference{ComputerID: storage.ComputerID, StorageID: storage.StorageID,
+			StorageGeneration: storage.StorageGeneration, IntentRevision: storage.IntentRevision, DiskBytes: storage.DiskBytes},
+		DiskName: "computer-import-storage-import-1", Operation: "import", Reason: "resume_deferred",
+		DeferredReason: "recovery_attempt_budget", Attempts: 3,
+	}}
+	outcome, ok := computerStoragePreparationOutcome(storage, receipt)
+	if !ok || outcome.Code != workloadrunner.ComputerStoragePreparationResumeDeferred ||
+		outcome.HelperGeneration != 9 || outcome.SweepEpoch != "sweep-import" || outcome.Attempts != 3 {
+		t.Fatalf("deferred preparation outcome = %#v ok=%t", outcome, ok)
+	}
+	tampered := storage
+	tampered.IntentRevision++
+	if outcome, ok := computerStoragePreparationOutcome(tampered, receipt); ok {
+		t.Fatalf("foreign revision received preparation evidence: %#v", outcome)
+	}
+	_, err := (&Adapter{sessions: &adapterReceiptSource{receipt: receipt}}).CopyComputerStorage(t.Context(),
+		workloadrunner.ComputerStorageCopyRequest{Operation: "import", Destination: storage})
+	var preparation *workloadrunner.ComputerStoragePreparationError
+	if !errors.As(err, &preparation) || preparation.Outcome.Code != workloadrunner.ComputerStoragePreparationResumeDeferred ||
+		preparation.Outcome.Storage != storage {
+		t.Fatalf("adapter preparation error = %#v err=%v", preparation, err)
+	}
+}
+
 func TestRemovalResourceManifestNamesAllManagedResourcesWithoutBindSources(t *testing.T) {
 	request := adapterTestRequest()
 	request.Authority.WorkloadClass = contract.JobClassService

@@ -293,6 +293,7 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("GET /v1/computers/{computer_id}/custody-exports", s.listComputerCustodyExports)
 	client.HandleFunc("POST /v1/custody-exports/{export_id}/attest-deleted", s.attestComputerCustodyDeleted)
 	client.HandleFunc("POST /v1/custody-exports/{export_id}/import", s.importComputerCustody)
+	client.HandleFunc("GET /v1/custody-imports/{import_id}", s.getComputerCustodyImport)
 	client.HandleFunc("POST /v1/computers/{computer_id}/projections", s.installComputerProjection)
 	client.HandleFunc("POST /v1/computers/{computer_id}/remove", s.removeComputer)
 	client.HandleFunc("POST /v1/computers/{computer_id}/token-scope-proof", s.proveComputerTokenScope)
@@ -352,6 +353,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/jobs/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/computers", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/custody-exports/", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/custody-imports/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/computer-handle-resolutions/", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/grants", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/grants/", s.authorize(personPrincipal, person))
@@ -1221,6 +1223,15 @@ func (s *Server) importComputerCustody(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, status, operation)
+}
+
+func (s *Server) getComputerCustodyImport(w http.ResponseWriter, r *http.Request) {
+	operation, err := s.store.GetComputerCustodyImport(r.Context(), r.PathValue("import_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, operation)
 }
 
 func (s *Server) installComputerProjection(w http.ResponseWriter, r *http.Request) {
