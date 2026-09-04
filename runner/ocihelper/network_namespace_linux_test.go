@@ -102,6 +102,29 @@ func TestPinnedNamespaceCannotDialForeignLoopbackAfterTaskExit(t *testing.T) {
 	}
 }
 
+func TestPinnedNamespaceObservesOwningThreadLoopbackListener(t *testing.T) {
+	requireRootNetworkNamespaceTest(t)
+	command := startIsolatedNetworkTask(t)
+	namespace, err := pinTaskNetworkNamespace(uint32(command.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.close()
+	listener, err := listenTaskLoopback(namespace, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+	inode, found, err := loopbackListenInode(namespace, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || inode == "" {
+		t.Fatalf("pinned namespace listener port %d was not observed from the owning thread", port)
+	}
+}
+
 func TestComputerNetworkAddressesAreDisjointPerReservedPort(t *testing.T) {
 	hostA, guestA, err := computerNetworkAddresses(42000, 42000)
 	if err != nil {

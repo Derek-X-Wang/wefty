@@ -399,8 +399,8 @@ func dialTaskLoopback(ctx context.Context, namespace *pinnedNetworkNamespace, po
 }
 
 func loopbackListenInode(namespace *pinnedNetworkNamespace, port uint16) (inode string, found bool, err error) {
-	read := func() error {
-		file, openErr := os.Open("/proc/net/tcp")
+	read := func(path string) error {
+		file, openErr := os.Open(path)
 		if openErr != nil {
 			return openErr
 		}
@@ -417,9 +417,14 @@ func loopbackListenInode(namespace *pinnedNetworkNamespace, port uint16) (inode 
 		return scanner.Err()
 	}
 	if namespace == nil {
-		err = read()
+		err = read("/proc/net/tcp")
 	} else {
-		err = inNetworkNamespace(namespace, read)
+		// setns is scoped to the locked worker thread. /proc/net aliases the
+		// thread-group leader's namespace, so it can keep reporting the helper
+		// namespace after this thread enters the Computer. thread-self follows
+		// the actual reader and preserves the old /proc/<task>/net authority
+		// without re-resolving a raw task PID.
+		err = inNetworkNamespace(namespace, func() error { return read("/proc/thread-self/net/tcp") })
 	}
 	return inode, found, err
 }
