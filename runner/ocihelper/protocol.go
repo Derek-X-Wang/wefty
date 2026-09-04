@@ -687,7 +687,7 @@ type ComputerIPv6NATState string
 
 const (
 	// ComputerIPv6NATConfigured means the helper installed the IPv6 NAT chain.
-	ComputerIPv6NATConfigured              ComputerIPv6NATState = "configured"
+	ComputerIPv6NATConfigured ComputerIPv6NATState = "configured"
 	// ComputerIPv6NATUnavailableIPv6Disabled means the kernel has no IPv6 NAT
 	// table; IPv6 filter policy remains mandatory and Computer IPv6 is disabled.
 	ComputerIPv6NATUnavailableIPv6Disabled ComputerIPv6NATState = "unavailable_ipv6_disabled"
