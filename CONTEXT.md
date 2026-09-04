@@ -156,6 +156,19 @@ and grants persist across runtime attempts and image changes. Its tenant image
 may change without changing the Computer.
 _Avoid_: node, machine, VM, container, tenant, service job
 
+**Computer isolation boundary**:
+The invariant that a Computer may reach its orchestrator channel, its own
+Storage, and its own screen, but never a neighbour's screen, sockets,
+processes, or files on the same Node, regardless of owner.
+_Avoid_: single-tenant assumption, collision avoidance, owner-based trust,
+using screen isolation as the name of the whole boundary
+
+**Crossover**:
+An attempt by one Computer to address, observe, or affect another Computer's
+screen, sockets, processes, or files. A crossover must be refused, not merely
+made unlikely by distinct names.
+_Avoid_: collision, cross-talk, neighbour access as an owner exception
+
 **Storage generation**:
 One monotonically identified incarnation of a Computer's persistent storage.
 Exactly one generation may be current and attached.
