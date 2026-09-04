@@ -1602,9 +1602,11 @@ func TestBootBarrierRetainsLastLossRecoveryReceiptAcrossLaterAcquisition(t *test
 	if err := barrier.Ensure(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	current, ready := barrier.Generation()
 	retained, ok := barrier.LastLossSweepReceipt()
-	if !ok || retained.HelperSession != lossReceipt.HelperSession || retained.BarrierTimeline.HelperLossObservedAt != lossReceipt.BarrierTimeline.HelperLossObservedAt {
-		t.Fatalf("later acquisition replaced loss recovery evidence: got=%+v present=%t want=%+v", retained, ok, lossReceipt)
+	if !ok || !ready || retained.HelperSession != lossReceipt.HelperSession || retained.BarrierTimeline.HelperLossObservedAt != lossReceipt.BarrierTimeline.HelperLossObservedAt ||
+		current.HelperInstanceID != retained.HelperSession.HelperInstanceID || current.SessionGeneration <= retained.HelperSession.SessionGeneration {
+		t.Fatalf("later acquisition replaced or invalidated loss recovery evidence: retained=%+v present=%t current=%+v ready=%t want=%+v", retained, ok, current, ready, lossReceipt)
 	}
 }
 

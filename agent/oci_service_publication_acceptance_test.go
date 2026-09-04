@@ -463,7 +463,14 @@ while :; do sleep 1; done
 		t.Fatalf("attempt %s did not retain typed runtime-loss evidence within production lease %s: l1=%+v outbox=%+v agent_status=%+v capability=%+v old_generation=%+v new_generation=%+v sweep=%+v",
 			firstAttempt, l1.DefaultLeaseDuration, stale, staleOutbox, nodeAgent.Status(), nodeAgent.CapabilitySnapshot(), oldGeneration, newGeneration, sweepReceipt)
 	}
-	serviceFreshAttemptReadmission = ready && newGeneration != oldGeneration && sweepReceipt.HelperSession == newGeneration &&
+	// A follow-up capability refresh can advance the replacement helper's
+	// session generation after the loss-driven receipt was retained. Require
+	// the same helper instance and a monotonic generation instead of requiring
+	// the historical receipt to equal the current session exactly.
+	lossReceiptBelongsToCurrentHelper := sweepReceipt.HelperSession.HelperInstanceID != "" &&
+		sweepReceipt.HelperSession.HelperInstanceID == newGeneration.HelperInstanceID &&
+		newGeneration.SessionGeneration >= sweepReceipt.HelperSession.SessionGeneration
+	serviceFreshAttemptReadmission = ready && newGeneration != oldGeneration && lossReceiptBelongsToCurrentHelper &&
 		readmitted.CurrentAttemptID != firstAttempt && newAuthority.FencingToken != firstAuthority.FencingToken &&
 		serviceFreshAttemptAdmissionElapsed <= serviceFreshAttemptAdmissionBound &&
 		serviceKillToFreshAttemptAdmissionElapsed <= serviceFreshAttemptAdmissionBound &&
