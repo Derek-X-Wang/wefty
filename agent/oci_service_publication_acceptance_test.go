@@ -372,6 +372,13 @@ while :; do sleep 1; done
 			bindingPinBefore, firstRunning.BoundNodeID, nativeOCIJobDigest(firstRunning), firstRunning.RestartStreak, firstRunning.LifetimeRestartCount, firstRunning.LeaseLossCount, firstRunning.LastFailure, firstRunning.NextRestartAt,
 			bindingPinAfter, intentStopped.BoundNodeID, nativeOCIJobDigest(intentStopped), intentStopped.RestartStreak, intentStopped.LifetimeRestartCount, intentStopped.LeaseLossCount, intentStopped.LastFailure, intentStopped.NextRestartAt, err)
 	}
+	// The production lease advance also moves L1 onto its randomized service
+	// restart backoff. Move the injected clock to that exact eligibility point
+	// before re-enabling OCI; otherwise the harness can remain queued forever
+	// even though the wall-clock agent and helper have recovered.
+	if restartDelay := intentStopped.NextRestartAt.Sub(l1Clock.Now()); restartDelay > 0 {
+		l1Clock.Advance(restartDelay)
+	}
 	if _, err := lima.SetOCIIntent(t.Context(), intentPath, 2, true, time.Now()); err != nil {
 		t.Fatal(err)
 	}
