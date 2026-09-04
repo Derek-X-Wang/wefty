@@ -288,11 +288,11 @@ func executeComputerTakeoverAction(
 	if strings.TrimSpace(tokenFile) == "" {
 		return usageError("takeover " + action + " requires --session-token-file from the live view session")
 	}
-	computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
-	if err != nil {
-		return err
-	}
 	if action == "view" {
+		computerID, err := resolveComputerID(ctx, clients, flags.Arg(0))
+		if err != nil {
+			return err
+		}
 		availability, err := clients.getComputerTakeoverAvailability(ctx, computerID)
 		if err != nil {
 			return err

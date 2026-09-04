@@ -201,6 +201,54 @@ func TestComputerTakeoverViewProjectsAvailabilityAndSessionAddress(t *testing.T)
 	}
 }
 
+func TestComputerTakeoverActionUsesIssuedCapabilityAfterGrantRevocation(t *testing.T) {
+	const sessionToken = "revoked-session-token"
+	wantReceipt := contract.ComputerControlReceipt{
+		Action: "take", ComputerID: "computer-1", SessionEndReason: string(l1.ComputerTakeoverRevoked),
+	}
+	frontDoor := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != contract.ComputerControlTakePath || request.Header.Get(contract.ComputerControlTokenHeader) != sessionToken {
+			t.Errorf("control request path=%q token=%q", request.URL.Path, request.Header.Get(contract.ComputerControlTokenHeader))
+		}
+		writer.WriteHeader(http.StatusGone)
+		_ = json.NewEncoder(writer).Encode(contract.ComputerControlErrorResponse{
+			Error:   contract.APIError{Code: contract.ErrorTakeoverSessionEnded, Message: "session was revoked"},
+			Receipt: &wantReceipt,
+		})
+	}))
+	defer frontDoor.Close()
+	endpoint := "ws" + strings.TrimPrefix(frontDoor.URL, "http") + contract.ComputerDisplayWebSocketPath
+	tokenFile := filepath.Join(t.TempDir(), "revoked-session.json")
+	if err := writeTakeoverSessionCapability(tokenFile, takeoverSessionCapability{Endpoint: endpoint, Token: sessionToken}); err != nil {
+		t.Fatal(err)
+	}
+	l1Lookups := 0
+	l1Transport := forwardingRoundTripper(func(*http.Request) (*http.Response, error) {
+		l1Lookups++
+		body, err := json.Marshal(contract.APIError{Code: contract.ErrorForbidden, Message: "grant was revoked"})
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})
+	clients := &apiClients{
+		l1:     &apiClient{name: "L1", client: &http.Client{Transport: l1Transport}},
+		fabric: directDialFabric{},
+	}
+	var stdout, stderr bytes.Buffer
+	err := executeComputerTakeoverAction(t.Context(), clients, true, "take",
+		[]string{"computer-1", "--session-token-file", tokenFile}, &stdout, &stderr)
+	var actionErr *takeover.ActionError
+	if !errors.As(err, &actionErr) || actionErr.APIError.Code != contract.ErrorTakeoverSessionEnded ||
+		actionErr.Receipt == nil || actionErr.Receipt.SessionEndReason != string(l1.ComputerTakeoverRevoked) {
+		t.Fatalf("revoked capability result = %T %#v, want typed terminal receipt; L1 lookups=%d stderr=%s",
+			err, err, l1Lookups, stderr.String())
+	}
+	if l1Lookups != 0 {
+		t.Fatalf("take action performed %d L1 handle lookups before using its issued capability", l1Lookups)
+	}
+}
+
 type directDialFabric struct {
 	connectHost string
 }
